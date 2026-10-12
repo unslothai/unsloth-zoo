@@ -250,3 +250,34 @@ def test_messages_truncation_honours_keep_end_and_no_limit():
     assert list(tail) == list(full)[-64:]
     whole = sft_prepare_dataset(trainer(), rows, tokenizer, _prepare_args(max_length = None), False, None, "train")
     assert list(whole[0]["input_ids"]) == list(full)
+
+
+@pytest.mark.parametrize(
+    "repo", ["trl-internal-testing/tiny-Gemma3ForConditionalGeneration", "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration"]
+)
+def test_text_only_messages_dataset_with_a_processor(repo):
+    # Gemma 3 / Qwen-VL load with a processor; a text-only messages dataset used to demand a formatting_func.
+    try:
+        processor = transformers.AutoProcessor.from_pretrained(repo)
+    except Exception as e:  # offline runner
+        pytest.skip(f"cannot load {repo}: {e}")
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "What is 2 plus 2?"},
+        {"role": "assistant", "content": "FINALANS_5521"},
+    ]
+    trainer = SimpleNamespace(chat_template = None, data_collator = None)
+    args = SimpleNamespace(
+        max_length = 512, dataset_text_field = "text", dataset_num_proc = None,
+        assistant_only_loss = False, completion_only_loss = None, packing = False,
+    )
+    dataset = sft_prepare_dataset(
+        trainer, datasets.Dataset.from_list([{"messages": messages}] * 2), processor, args, False, None, "train"
+    )
+    parts = [{**m, "content": [{"type": "text", "text": m["content"]}]} for m in messages]
+    expected = processor.apply_chat_template(parts, tokenize = True, return_dict = True)["input_ids"]
+    if expected and isinstance(expected[0], list):
+        expected = expected[0]
+    assert dataset[0]["input_ids"] == list(expected)
+    assert "FINALANS_5521" in processor.tokenizer.decode(dataset[0]["input_ids"])
+    assert trainer.data_collator is None  # TRL's collator stays in place

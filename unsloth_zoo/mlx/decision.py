@@ -295,6 +295,10 @@ _TYPES = ("choice", "score", "noul")
 _MAX_IMAGES = 8
 # An image is refused by its size before its pixels are read, which the processor's own limit comes too late for.
 _MAX_IMAGE_PIXELS = 4096 * 4096
+_MAX_AUDIO = 8
+_AUDIO_RATE = 16000
+# Decoding stops here: about what the prompt has room for at 13 tokens a second.
+_MAX_AUDIO_SECONDS = 1200
 
 
 class DecisionRequestError(ValueError):
@@ -339,16 +343,60 @@ def _image_urls(state, images):
             if isinstance(part, dict) and part.get("type") == "image_url" and "image_url" in part:
                 url = part["image_url"]
                 found.append(url["url"] if isinstance(url, dict) and "url" in url else url)
+    return _data_urls(found, "image", _MAX_IMAGES)
+
+
+def _data_urls(found, kind, most):
+    """`found`, the base64 data URLs of a request's images or audio clips, checked without decoding them."""
+    field, many = ("images", "images") if kind == "image" else (kind, f"{kind} clips")
+    if found is not None and not isinstance(found, list):
+        raise DecisionRequestError(f'"{field}" must be an array')
     urls = []
-    for url in found:
-        # "data:image/<type>;base64,<payload>"; the payload itself is only decoded by a model that reads images.
+    for url in found or []:
+        # "data:<kind>/<type>;base64,<payload>"; the payload itself is only decoded by a model that reads it.
         header, comma, payload = url.partition(",") if isinstance(url, str) else ("", "", "")
-        if not (header.startswith("data:image/") and header.endswith("base64") and comma and "," not in payload):
-            raise DecisionRequestError("images must be data URLs (data:image/...;base64,...)")
-        if len(urls) >= _MAX_IMAGES:
-            raise DecisionRequestError(f"too many images, the maximum is {_MAX_IMAGES}")
+        if not (header.startswith(f"data:{kind}/") and header.endswith("base64") and comma and "," not in payload):
+            raise DecisionRequestError(f"{field} must be data URLs (data:{kind}/...;base64,...)")
+        if len(urls) >= most:
+            raise DecisionRequestError(f"too many {many}, the maximum is {most}")
         urls.append(url)
     return urls
+
+
+def _decode_audio(urls):
+    """The mono samples of each clip at the rate the models hear, resampled as they are decoded."""
+    import base64
+    import io
+    import itertools
+
+    # PyAV is optional: records without encoded clips must not need it.
+    if not urls:
+        return []
+    try:
+        import av
+    except ImportError as error:
+        raise DecisionUnsupportedError("audio is decoded with PyAV, which is not installed: pip install av") from error
+    clips, total = [], 0
+    for url in urls:
+        try:
+            with av.open(io.BytesIO(base64.b64decode(url.partition(",")[2], validate = True))) as container:
+                resampler, chunks = av.AudioResampler(format = "flt", layout = "mono", rate = _AUDIO_RATE), []
+                # A last empty frame hands over what the resampler still holds.
+                for frame in itertools.chain(container.decode(audio = 0), (None,)):
+                    parts = [part.to_ndarray().reshape(-1) for part in resampler.resample(frame)]
+                    chunks += parts
+                    total += sum(map(len, parts))
+                    if total > _MAX_AUDIO_SECONDS * _AUDIO_RATE:
+                        break
+            samples = np.concatenate(chunks)
+        except Exception as error:
+            raise DecisionRequestError("an audio clip could not be decoded") from error
+        if total > _MAX_AUDIO_SECONDS * _AUDIO_RATE:
+            raise DecisionRequestError(f"the audio is longer than {_MAX_AUDIO_SECONDS} seconds")
+        if not len(samples):
+            raise DecisionRequestError("an audio clip could not be decoded")
+        clips.append(samples)
+    return clips
 
 
 def _decode_images(urls):
@@ -419,18 +467,24 @@ class DecisionPipeline:
     max_options = 255
     noul_true_first = False
     choice_sorted = False
-    reads_images = False
+    reads_images = reads_audio = False
     temperatures = {}
 
-    def answer(self, state, questions, images = None):
-        """Answers keyed by question id, and the prompt tokens spent. Images are refused unless `reads_images`."""
+    def answer(self, state, questions, images = None, audio = None):
+        """Answers keyed by question id, and the prompt tokens spent.
+
+        Images are refused unless `reads_images`, and `audio`, an array of base64 data URLs, unless `reads_audio`."""
         if state is None:
             raise DecisionRequestError('"state" must be provided')
         parsed = self._parse_questions(questions)
-        urls = _image_urls(state, images)
-        if urls and not self.reads_images:
-            raise DecisionUnsupportedError("this model does not support images")
-        scores, tokens = self._scores(_without_image_parts(state), parsed, _decode_images(urls)) if urls else self._scores(state, parsed)
+        urls, clips = _image_urls(state, images), _data_urls(audio, "audio", _MAX_AUDIO)
+        for given, reads, name in ((urls, self.reads_images, "images"), (clips, self.reads_audio, "audio")):
+            if given and not reads:
+                raise DecisionUnsupportedError(f"this model does not support {name}")
+        if clips:
+            scores, tokens = self._scores(_without_image_parts(state), parsed, _decode_images(urls), _decode_audio(clips))
+        else:
+            scores, tokens = self._scores(_without_image_parts(state), parsed, _decode_images(urls)) if urls else self._scores(state, parsed)
         answers = {question.id: self._format_answer(question, variants) for question, variants in zip(parsed, scores)}
         return {"answers": answers, "usage": {"input_tokens": tokens, "output_tokens": 0}}
 
@@ -692,17 +746,43 @@ def _lora_key(name):
     return name[name.index("layers.") :] if "layers." in name else name.rsplit(".", 1)[-1]
 
 
+def _layers_owner(name):
+    """What holds a path's numbered layers: `encoder` for `apm.encoder.layers.0.fc1`, None without numbered layers."""
+    return name.partition("layers.")[0].rstrip(".").rsplit(".", 1)[-1] if "layers." in name else None
+
+
+def _off_decoder(stem, owners):
+    """Whether an adapter stem names a tower, a projector or the talker, which the prefix `_lora_key` drops would say.
+
+    `owners` are what holds the decoder's layers in this model; a checkpoint stores it as `model` or `language_model`.
+    """
+    from .loader import _OTHER_MODALITY_TOKENS, _STRONG_PROJECTOR_TOKENS, _VISION_ROLE_TOKENS, _role_tokens
+
+    prefix = stem.partition("layers.")[0] if "layers." in stem else stem.rpartition(".")[0]
+    if _role_tokens(prefix) & (_VISION_ROLE_TOKENS | _OTHER_MODALITY_TOKENS | _STRONG_PROJECTOR_TOKENS):
+        return True
+    return "layers." in stem and _layers_owner(stem) not in {"model", "language_model", *owners}
+
+
 def _attach_lora(model, folder):
     """Put a plain LoRA adapter on the modules it names, as adapters of their own, which a quantized base takes too."""
     from mlx_lm.tuner.lora import LoRALinear
 
+    from .utils import _get_text_model
+
     config, adapter = _plain_lora(folder), mx.load(str(folder / "adapter_model.safetensors"))
-    stems = {_lora_key(stem): stem for stem in {name.rsplit(".lora_", 1)[0] for name in adapter}}
+    named = {name.rsplit(".lora_", 1)[0] for name in adapter}
+    stems = {_lora_key(stem): stem for stem in named}
+    # An audio tower numbers its layers as the decoder does, whose adapter this is.
+    decoder, wrapped = {id(module) for _, module in _get_text_model(model).named_modules()}, []
+    owners = {_layers_owner(path) for path, module in model.named_modules() if id(module) in decoder} - {None}
+    # Keys drop the prefix that says which tower a layer is in: same-numbered layers would collapse or land on the decoder.
+    if len(stems) != len(named) or any(_off_decoder(stem, owners) for stem in named):
+        raise ValueError(f"The adapter in {folder} is on a tower besides the decoder; only the decoder's adapters can be put on a Clef")
     if "lm_head" in stems:
         raise ValueError(f"The adapter in {folder} is on the output embedding, which a Clef's joint head reads as stored")
-    wrapped = []
     for path, module in model.named_modules():
-        stem = stems.get(_lora_key(path)) if isinstance(module, (nn.Linear, nn.QuantizedLinear)) else None
+        stem = stems.get(_lora_key(path)) if id(module) in decoder and isinstance(module, (nn.Linear, nn.QuantizedLinear)) else None
         if stem is None:
             continue
         low = LoRALinear.from_base(module, r = config["r"], dropout = float(config.get("lora_dropout") or 0.0), scale = config["lora_alpha"] / config["r"])
@@ -779,32 +859,139 @@ def _output_rows(head, token_ids):
 class _QwenModel(DecisionPipeline):
     # Below this many shared tokens a second pass costs more than it saves.
     _MIN_SHARED = 16
-    takes_images = False
+    takes_images = takes_audio = False
+    # Where the towers of the architectures read here sit in the model: on it, or on this part of it.
+    _TOWERS = {"qwen3_5": "", "qwen3_omni_moe": "thinker"}
     _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
+    _AUDIO = "<|audio_start|><|audio_pad|><|audio_end|>"
     _AFTER_IMAGES = ""
-    # The images of a request may not reach this on their own; it is the prompt length Clef's reference serves.
+    # The images and audio of a request may not reach this on their own; it is the prompt length Clef's reference serves.
     _IMAGE_TOKENS = 16384
 
     @property
-    def reads_images(self):
-        # Tower-less conversions load vision_tower=None; the layout and forward here are Qwen3.5's only.
-        known = getattr(getattr(self.model, "config", None), "model_type", None) == "qwen3_5"
-        # Without its processor files a model loads with a bare tokenizer in the processor's place.
-        processor = getattr(getattr(self.model, "_processor", None), "image_processor", None)
-        return self.takes_images and known and getattr(self.model, "vision_tower", None) is not None and processor is not None
+    def _architecture(self):
+        return getattr(getattr(self.model, "config", None), "model_type", None)
 
-    def encode_images(self, images):
-        """The token ids that stand for `images` in the prompt, and the pixels behind them."""
-        if not self.reads_images:
-            raise DecisionUnsupportedError("this model does not support images")
+    @property
+    def _vlm_config(self):
+        # What the trainer prepares a batch with: the loader's config mapping, else the model's.
+        return getattr(self.model, "_config", None) or self.model.config
+
+    @property
+    def _trainer_family(self):
+        """The family of a model whose media the MLX trainer prepares and forwards, as it does when it trains that family."""
+        from .utils import _AUDIO_QUALIFIED_FAMILIES, _audio_family_from_processor
+
+        family = _audio_family_from_processor(getattr(self.model, "_processor", None))
+        return family if family in _AUDIO_QUALIFIED_FAMILIES and self._architecture not in self._TOWERS else None
+
+    def _reads(self, tower, part):
+        processor = getattr(self.model, "_processor", None)
+        if self._architecture in self._TOWERS:
+            # The layouts and forwards here are those of these architectures, as their references define them.
+            # Without its processor files a model loads with a bare tokenizer in the processor's place.
+            from .utils import _AUDIO_QUALIFIED_FAMILIES, _installed_mlx_vlm_version
+
+            owner = self._TOWERS[self._architecture]
+            # Audio only on the mlx-vlm releases the trainer qualifies for this architecture's processing.
+            qualified = _AUDIO_QUALIFIED_FAMILIES.get(self._architecture)
+            if tower == "audio_tower" and not (qualified and qualified.admits(_installed_mlx_vlm_version())):
+                return False
+            return getattr(processor, part, None) is not None and getattr(getattr(self.model, owner, None) if owner else self.model, tower, None) is not None
+        if not self._trainer_family:
+            return False
+        read = self.__dict__.setdefault("_media_checks", {})
+        if tower not in read:
+            read[tower] = self._trainer_reads(tower, processor)
+        return read[tower]
+
+    def _trainer_reads(self, tower, processor):
+        from .utils import _check_audio_family_gate, audio_extractor_sampling_rate, audio_input_capability
+
         try:
-            encoded = self.model._processor(text = [self._IMAGE * len(images) + self._AFTER_IMAGES], images = list(images), return_tensors = "np")
-        except ValueError as error:
-            raise DecisionRequestError(f"an image could not be read: {error}") from error
-        ids = np.asarray(encoded["input_ids"])[0].tolist()
+            if tower == "vision_tower":
+                return bool(getattr(self.model, "_unsloth_supports_images", False))
+            _check_audio_family_gate(processor)
+            sound = self._trainer_text(0, 1)
+            if audio_extractor_sampling_rate(processor) != _AUDIO_RATE or not audio_input_capability(self.model, processor, [sound]).capable:
+                return False
+            # A family whose rendering names no place for a clip fails the trainer's checks on its processor's output.
+            self._trainer_media([], [np.zeros(_AUDIO_RATE, np.float32)])
+        except (ValueError, RuntimeError):
+            return False
+        return True
+
+    def _trainer_text(self, images, audio):
+        """What the MLX trainer's rendering of a turn adds for this many images, then for this many clips."""
+        from .utils import _render_vlm_messages
+
+        processor, mark = self.model._processor, "STATE"
+        turn = lambda parts: _render_vlm_messages(processor, [{"role": "user", "content": [*parts, {"type": "text", "text": mark}]}]).partition(mark)
+        head, _, tail = turn([])
+
+        def added(parts):
+            # A family's rendering may put its media on either side of the text.
+            before, _, after = turn(parts)
+            return before.removeprefix(head) + after.removesuffix(tail)
+
+        # A rendering that adds nothing for a clip, as without a chat template, leaves its place to the token the processor names.
+        return added([{"type": "image"}] * images) + (added([{"type": "audio"}] * audio) or (getattr(processor, "audio_token", None) or "") * audio)
+
+    @property
+    def reads_images(self):
+        return self.takes_images and self._reads("vision_tower", "image_processor")
+
+    @property
+    def reads_audio(self):
+        return self.takes_audio and self._reads("audio_tower", "feature_extractor")
+
+    def _media_text(self, images, audio):
+        return self._IMAGE * images + self._AFTER_IMAGES
+
+    def _trainer_media(self, images, audio):
+        """`encode_media` as the MLX trainer collates a row, with its corrections for the family's processor."""
+        from .utils import (
+            _AudioClip, _assert_audio_runs_intact, _prepare_vlm_batch_for_compile, _processor_vlm_inputs, _to_mx_vlm_batch, audio_merge_patch_needed,
+            install_audio_merge_patch,
+        )
+
+        processor = self.model._processor
+        if audio and audio_merge_patch_needed(self.model.config) and not self._media_checks.get("merge"):
+            # Held for good: this model only ever merges audio for the decision engine.
+            self._media_checks["merge"] = install_audio_merge_patch(self.model, self.model.config.audio_token_id)
+        text = self._trainer_text(len(images), len(audio)) + "\n"
+        clips = [[_AudioClip(clip, _AUDIO_RATE) for clip in audio]] if audio else None
+        inputs = dict(_processor_vlm_inputs(processor, [text], [list(images)], None, truncation = False, all_audio = clips))
+        _assert_audio_runs_intact(inputs, [len(audio)], processor, None, truncated = False, clips = clips)
+        # The content half of the trainer's preparation, which may expand placeholders (Phi-4's per-image runs).
+        batch = _prepare_vlm_batch_for_compile(_to_mx_vlm_batch(inputs), self._vlm_config, phase = "content")
+        ids = batch.pop("input_ids")[0].tolist()
+        # `run` places what the processor aligned to these tokens once they sit in a prompt.
+        return ids, {"run": ids, **{name: value for name, value in batch.items() if name != "attention_mask" and not name.startswith("_unsloth_")}}
+
+    def encode_media(self, images = (), audio = ()):
+        """The token ids that stand for `images`, then for the `audio` clips, in the prompt, and what the processor made of them."""
+        for given, reads, name in ((images, self.reads_images, "images"), (audio, self.reads_audio, "audio")):
+            if given and not reads:
+                raise DecisionUnsupportedError(f"this model does not support {name}")
+        try:
+            if self._trainer_family:
+                ids, media = self._trainer_media(list(images), list(audio))
+            else:
+                clips = dict(audio = list(audio), sampling_rate = _AUDIO_RATE, padding = True, truncation = False, return_attention_mask = True) if audio else {}
+                encoded = self.model._processor(text = [self._media_text(len(images), len(audio))], images = list(images) or None, return_tensors = "np", **clips)
+                ids = np.asarray(encoded["input_ids"])[0].tolist()
+                tensors = ("pixel_values", "image_grid_thw", "input_features", "feature_attention_mask")
+                media = {name: mx.array(np.asarray(encoded[name])) for name in tensors if encoded.get(name) is not None}
+        except DecisionRequestError:
+            raise
+        except (ValueError, RuntimeError) as error:
+            # A clip shorter than the feature window fails inside the extractor.
+            raise DecisionRequestError(f"{' or '.join(name for name, given in (('an image', images), ('an audio clip', audio)) if given)} could not be read: {error}") from error
         if len(ids) >= self._IMAGE_TOKENS:
-            raise DecisionRequestError(f"the images take {len(ids)} tokens; the maximum is {self._IMAGE_TOKENS}, send fewer or smaller images")
-        return ids, {name: mx.array(np.asarray(encoded[name])) for name in ("pixel_values", "image_grid_thw")}
+            named = " and ".join(name for name, given in (("images", images), ("audio clips", audio)) if given)
+            raise DecisionRequestError(f"the {named} take {len(ids)} tokens; the maximum is {self._IMAGE_TOKENS}, send fewer or smaller {named}")
+        return ids, media
 
     def _load(self, source, revision, dtype, token, adapter = None, load_in_4bit = False):
         from .loader import FastMLXModel
@@ -816,10 +1003,20 @@ class _QwenModel(DecisionPipeline):
         if adapter is not None:
             _merge_lora(self.model, adapter)
         if load_in_4bit:
-            # The loader leaves the embeddings, the output head and the vision tower in 16-bit for the trainers that
+            # The loader leaves the embeddings, the output head and the towers in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
-            tower = "vision_tower" if self.reads_images else "\0"
-            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not path.startswith(tower) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
+            # A tower read and the projectors that embed its output keep their precision, named as the loader names them.
+            from .loader import _OTHER_MODALITY_TOKENS, _STRONG_PROJECTOR_TOKENS, _VISION_ROLE_TOKENS, _role_tokens
+            from .utils import _get_text_model
+
+            kept = (_VISION_ROLE_TOKENS if self.reads_images else frozenset()) | (_OTHER_MODALITY_TOKENS - {"talker"} if self.reads_audio else frozenset())
+            kept |= _STRONG_PROJECTOR_TOKENS if kept else frozenset()
+            # The decoder is quantized whatever its layers are called (Gemma 3n's `per_layer_projection`).
+            decoder = {id(module) for _, module in _get_text_model(self.model).named_modules()}
+            nn.quantize(
+                self.model, 64, 4,
+                class_predicate = lambda path, module: (id(module) in decoder or not _role_tokens(path) & kept) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0,
+            )
         self.model.eval()
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
@@ -846,12 +1043,29 @@ class _QwenModel(DecisionPipeline):
         # An image advances positions by its grid, not its token count.
         if media is None:
             return {}
-        merged = self.model.get_input_embeddings(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"])
-        return {"inputs_embeds": merged.inputs_embeds, "position_ids": merged.position_ids}
+        merged = self.model.get_input_embeddings(ids, media.get("pixel_values"), **{name: value for name, value in media.items() if name != "pixel_values"})
+        # Qwen3-Omni also adds features of its tower's inner layers to the image tokens after the first decoder layers.
+        names = ("inputs_embeds", "position_ids", "visual_pos_masks", "deepstack_visual_embeds")
+        return {name: getattr(merged, name) for name in names if getattr(merged, name, None) is not None}
 
     def _hidden(self, ids, media = None):
-        from .utils import _forward_text_hidden_states
+        from .utils import _VLM_PER_ROW_MEDIA_KEYS, _VLM_RELOCATABLE_SIDECAR_KEYS, _forward_text_hidden_states, _prepare_vlm_batch_for_compile, _vlm_hidden_states
 
+        if self._trainer_family and (self.reads_images or self.reads_audio):
+            # Text alone goes the same way, so that the records of one dataset are read alike.
+            batch = {"input_ids": mx.array(ids)[None], "attention_mask": mx.ones((1, len(ids)), mx.int32)}
+            if media is not None:
+                run, start = media["run"], ids.index(media["run"][0])
+                for name, value in media.items():
+                    if name in _VLM_RELOCATABLE_SIDECAR_KEYS and value.shape == (1, len(run)):
+                        value = mx.concatenate([mx.zeros((1, start), value.dtype), value, mx.zeros((1, len(ids) - start - len(run)), value.dtype)], axis = 1)
+                    elif name in _VLM_PER_ROW_MEDIA_KEYS and "bound" in name:
+                        # Spans a processor states are columns of its own output.
+                        value = [np.asarray(row) + start for row in value]
+                    if name != "run":
+                        batch[name] = value
+            # Its positions half sees the whole prompt, as the trainer's sees the padded batch.
+            return _vlm_hidden_states(self.model, _prepare_vlm_batch_for_compile(batch, self._vlm_config, phase = "positions"))[0]
         ids = mx.array(ids)[None]
         return _forward_text_hidden_states(self.model, ids, **self._merged(ids, media))[0]
 
@@ -882,7 +1096,7 @@ class _QwenModel(DecisionPipeline):
     def _scores(self, state, questions, images = ()):
         from .generate import generation_mode
 
-        image_ids, media = self.encode_images(images) if images else ([], None)
+        image_ids, media = self.encode_media(images) if images else ([], None)
         prompts = [[self._encode(prompt) for prompt in self._prompts(state, questions, question, *([len(images)] if images else []))] for question in questions]
         images_end = 0
         if media is not None:
@@ -1292,7 +1506,7 @@ class ClefModel(_QwenModel):
     """One prompt holds every question; a joint head scores all their options together."""
 
     family = "clef"
-    sources = ("Cloudflare/clef", "Cloudflare/clef-flash")
+    sources = ("Cloudflare/clef", "Cloudflare/clef-flash", "Cloudflare/clef-omni")
     needs = "the joint head (joint_head_config.json and joint_head.safetensors)"
 
     @staticmethod
@@ -1300,10 +1514,34 @@ class ClefModel(_QwenModel):
         return (folder / "joint_head_config.json").is_file() and (folder / "joint_head.safetensors").is_file()
     noul_true_first = True
     choice_sorted = True
-    takes_images = True
+    takes_images = takes_audio = True
     _AFTER_IMAGES = "\n"
     _SYSTEM = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options."
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
+    # Clef Omni resizes an image into these bounds, narrower than its processor's own.
+    _OMNI_PIXELS = (65536, 1048576)
+
+    def _load_beside(self, source, *args, **kwargs):
+        super()._load_beside(source, *args, **kwargs)
+        if self._architecture == "qwen3_omni_moe":
+            from .utils import _AudioVersions, _installed_mlx_vlm_version
+
+            # Before 0.6.5 its decoder has no hidden-state output, and the cacheless forward the engine falls back to fails.
+            if not _AudioVersions("0.6.5").admits(_installed_mlx_vlm_version()):
+                raise ValueError(f"Unsloth: a Qwen3-Omni Clef needs mlx-vlm 0.6.5 or newer, but {_installed_mlx_vlm_version() or 'an unknown version'} is installed.")
+        stacks = [path for path, _ in tree_flatten(self.model.parameters()) if ".switch_mlp." in path]
+        stored = _stored_tensors(source) if stacks else ()
+        # A mixture's experts stored apart load as one stack, which then has no tensor of its own to be saved to.
+        self._experts_apart = any(_decoder_tensor_name(self.model, path, stored) is None for path in stacks)
+        if self._architecture == "qwen3_omni_moe" and self.reads_images:
+            sizes = self.model._processor.image_processor
+            sizes.min_pixels, sizes.max_pixels = self._OMNI_PIXELS
+
+    def _media_text(self, images, audio):
+        # Clef Omni was trained with a line break after each image and clip, Clef with one after all its images.
+        if self._architecture == "qwen3_omni_moe":
+            return (self._IMAGE + "\n") * images + (self._AUDIO + "\n") * audio
+        return super()._media_text(images, audio)
 
     def __init__(self, folder, dtype, base_model, token, load_in_4bit = False):
         decoder = folder
@@ -1371,7 +1609,7 @@ class ClefModel(_QwenModel):
     def encode(self, state, questions, max_length = None, image_ids = ()):
         """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end.
 
-        `image_ids`, from `encode_images`, go between the prompt's opening and the state."""
+        `image_ids`, from `encode_media`, go between the prompt's opening and the state."""
         pieces = [(self._encode(text), mark) for text, mark in self._pieces(state, questions)]
         pieces[0] = (pieces[0][0] + list(image_ids), None)
         if max_length is not None:
@@ -1409,10 +1647,10 @@ class ClefModel(_QwenModel):
         lexical = [mx.stop_gradient(_output_rows(output, ids[start:end])) for spans in option_spans for start, end in spans]
         return self.head(hidden, lexical, question_spans, option_spans, types)
 
-    def _scores(self, state, questions, images = ()):
+    def _scores(self, state, questions, images = (), audio = ()):
         from .generate import generation_mode
 
-        image_ids, media = self.encode_images(images) if images else ((), None)
+        image_ids, media = self.encode_media(images, audio) if images or audio else ((), None)
         ids, question_spans, option_spans = self.encode(state, questions, image_ids = image_ids)
         # Found before generation mode, which swaps a quantized head's class.
         output = self._output_head()
@@ -1589,14 +1827,21 @@ def _stored_tensors(source):
 
 def _decoder_tensor_name(decoder, path, stored = ()):
     name = path
-    if "language_model" in decoder:
-        # transformers stores a decoder inside a vision-language wrapper under other names than it is loaded with.
-        name = None
-        for prefix, saved in (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")):
-            if path.startswith(prefix):
-                name = saved + path[len(prefix) :]
+    # transformers stores a decoder inside a vision-language or an omni wrapper under other names than it is loaded with.
+    # MiniCPM-o keeps its whole causal LM under `llm.`; the first name the checkpoint holds wins.
+    wrappers = {
+        "language_model": (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head."), ("language_model.", "llm.")),
+        "thinker": (("thinker.language_model.model.", "thinker.model."), ("thinker.language_model.lm_head.", "thinker.lm_head.")),
+    }
+    for wrapper, renamed in wrappers.items():
+        if wrapper in decoder:
+            names = [saved + path[len(prefix) :] for prefix, saved in renamed if path.startswith(prefix)]
+            name = next((found for found in names if found in stored), names[0] if names else None)
     # An MLX conversion keeps the names its weights are loaded with.
-    return path if name not in stored and path in stored else name
+    if name not in stored and path in stored:
+        return path
+    # transformers stores each expert of a mixture apart, with no one tensor for the stack they are loaded as.
+    return None if name and name not in stored and name.replace(".switch_mlp.", ".experts.0.") in stored else name
 
 
 def _require_clef_source(decoder, source):
@@ -2173,7 +2418,7 @@ class ClefNetwork(nn.Module):
         names = list(source["questions"])
         try:
             # The item already holds the images of the state, which a caller may have kept whole.
-            record = clef_training_item(self._pipeline, _without_image_parts(source["state"]), {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"), item.get("images"))
+            record = clef_training_item(self._pipeline, _without_image_parts(source["state"]), {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"), item.get("images"), item.get("audio"))
         except ValueError:
             return item
         return {**item, **record, "targets": [item["targets"][i] for i in order]}
@@ -2189,11 +2434,19 @@ def clef_training_network(
     A Clef loaded from adapters keeps training those, whatever `r`, `lora_alpha` and `target_modules` say.
     `origin` is the network's: what lets its checkpoints be written as loadable Clef adapters.
     """
-    from .loader import FastMLXModel
+    from .loader import FastMLXModel, _lora_name_matches_target, _mlx_language_layers
     from .utils import _get_text_model, describe_output_head
 
     if full_finetuning and any(path.endswith(".scales") for path, _ in tree_flatten(pipeline.model.parameters())):
         raise ValueError("Unsloth: a quantized decoder trains through LoRA adapters only; pass full_finetuning = False.")
+    # Layer-local, as the LoRA resolver matches targets: by leaf, parent, whole name or alias (`gate_proj` -> `gate_up_proj`).
+    stacked = {name for layer in _mlx_language_layers(pipeline.model) for name, module in layer.named_modules() if "SwitchLinear" in type(module).__name__}
+
+    def reaches(targets):
+        return sorted(name for name in stacked if _lora_name_matches_target(name, targets))
+
+    if full_finetuning and pipeline._experts_apart:
+        raise ValueError("Unsloth: this checkpoint stores each expert of its mixture apart, so it trains through LoRA adapters only; pass full_finetuning = False.")
     if any("lora_a" in module for _, module in pipeline.model.named_modules()):
         # Adapters the checkpoint was loaded with go on training as they are.
         if full_finetuning:
@@ -2208,8 +2461,15 @@ def clef_training_network(
             # The head reads the output embedding without training it.
             output.module.freeze()
     else:
-        if target_modules in (None, "all-linear"):
-            target_modules = list(_CLEF_LORA_TARGETS)
+        named = [target_modules] if isinstance(target_modules, str) else list(target_modules or ())
+        if target_modules is None or "all-linear" in named:
+            # Expanded here as the loader would, without the stacked experts; names given beside it are kept.
+            defaults = [name for name in _CLEF_LORA_TARGETS if not reaches({name})]
+            named = [name for name in named if name != "all-linear"]
+            target_modules = defaults + [name for name in named if name not in defaults]
+        if hit := reaches(set(named)):
+            # An adapter over the stacked experts of a mixture has no one checkpoint tensor to be merged into, in any layout.
+            raise ValueError(f"Unsloth: adapters on the stacked experts of a mixture cannot be saved; target_modules reaches {hit}.")
         # Checkpointing is applied around each run instead, so it is gone again when the model serves.
         FastMLXModel.get_peft_model(
             pipeline.model, r = r, lora_alpha = lora_alpha, target_modules = target_modules, use_gradient_checkpointing = False, **lora,
@@ -2327,10 +2587,11 @@ def clef_option_keys(pipeline, question):
     return [key for key, _ in pipeline._parse_questions({"question": question})[0].options]
 
 
-def clef_training_item(pipeline, state, questions, max_length = None, images = None):
+def clef_training_item(pipeline, state, questions, max_length = None, images = None, audio = None):
     """Tokenize one record as a Clef training item; the caller adds `targets`, a distribution per question over `clef_option_keys`.
 
     `images` are PIL images or data URLs; with the image parts of a chat-message state they are read as a request's are.
+    `audio` clips are data URLs or decoded `{"array", "sampling_rate"}` clips, mono at 16 kHz.
     `source` keeps the record, which `permute_fields` encodes again with its questions reordered."""
     parsed = pipeline._parse_questions(questions)
     given = list(images or ())
@@ -2341,13 +2602,16 @@ def clef_training_item(pipeline, state, questions, max_length = None, images = N
         raise DecisionRequestError(f"too many images, the maximum is {_MAX_IMAGES}")
     if urls:
         state = _without_image_parts(state)
-    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length, pipeline.encode_images(images)[0] if images else ())
+    audio = list(audio or ())
+    if len(audio) > _MAX_AUDIO:
+        raise DecisionRequestError(f"too many audio clips, the maximum is {_MAX_AUDIO}")
+    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length, pipeline.encode_media(images, _clips(audio))[0] if images or audio else ())
     item = {
         "input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed],
         "source": {"state": state, "questions": dict(questions), "max_length": max_length},
     }
-    # Kept as data URLs, decoded per read: stored pixels would outweigh the rest of a dataset.
-    return {**item, "images": kept} if kept else item
+    # Kept as given, data URLs decoded per read: stored pixels would outweigh the rest of a dataset.
+    return {**item, **({"images": kept} if kept else {}), **({"audio": audio} if audio else {})}
 
 
 def _pictures(images):
@@ -2355,8 +2619,24 @@ def _pictures(images):
     return [next(decoded) if isinstance(image, str) else image for image in images]
 
 
+def _clips(audio):
+    decoded, clips = iter(_decode_audio(_data_urls([clip for clip in audio if isinstance(clip, str)], "audio", _MAX_AUDIO))), []
+    for clip in audio:
+        if not isinstance(clip, str):
+            samples = np.asarray(clip.get("array") if isinstance(clip, dict) else None, np.float32)
+            # Without its rate a clip's length is unknown, and at another rate it is heard as other sounds.
+            if samples.ndim != 1 or not samples.size or clip.get("sampling_rate") != _AUDIO_RATE:
+                raise DecisionRequestError(f'a decoded audio clip must be {{"array", "sampling_rate"}} with mono samples at {_AUDIO_RATE} Hz')
+        clips.append(next(decoded) if isinstance(clip, str) else samples)
+    # The same budget as encoded clips, over both kinds together.
+    if sum(map(len, clips)) > _MAX_AUDIO_SECONDS * _AUDIO_RATE:
+        raise DecisionRequestError(f"the audio is longer than {_MAX_AUDIO_SECONDS} seconds")
+    return clips
+
+
 def _item_logits(pipeline, item, output = None):
-    media = pipeline.encode_images(_pictures(item["images"]))[1] if item.get("images") else None
+    images, audio = item.get("images") or (), item.get("audio") or ()
+    media = pipeline.encode_media(_pictures(images), _clips(audio))[1] if images or audio else None
     return pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"], output, media)
 
 

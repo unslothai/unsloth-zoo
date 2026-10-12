@@ -38,7 +38,7 @@ from mlx_simulation import mlx_is_simulated  # noqa: E402
 if mlx_is_simulated():
     pytest.skip("needs real MLX: mx.fast attention and RoPE", allow_module_level = True)
 
-from mlx.nn import Dropout, Embedding, LayerNorm, Linear, quantize  # noqa: E402
+from mlx.nn import Dropout, Embedding, LayerNorm, Linear, Sequential, quantize  # noqa: E402
 from mlx.utils import tree_flatten, tree_map  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402
 
@@ -851,16 +851,22 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
         asked, loaded = {}, [_decoder(), _decoder()]
         monkeypatch.setattr("unsloth_zoo.mlx.loader.FastMLXModel.from_pretrained", lambda *args, **kwargs: asked.update(kwargs) or (loaded[kwargs["load_in_4bit"]], None))
         for four in (False, True):
-            _QwenModel._load(SimpleNamespace(reads_images = False), tmp_path, None, None, None, None, four)
+            _QwenModel._load(SimpleNamespace(reads_images = False, reads_audio = False), tmp_path, None, None, None, None, four)
         assert (asked["load_in_4bit"], asked["load_in_16bit"]) == (True, False)
         # What the loader leaves in 16-bit for other trainers, the embedding and the output head, is quantized too.
         assert [["scales" in module for module in (model.language_model.model.embed_tokens, model.language_model.lm_head)] for model in loaded] == [[False, False], [True, True]]
-        # The vision tower keeps its precision only for a model that reads images through it.
-        for reads in (True, False):
+        # A tower keeps its precision only for a model that reads images or audio through it.
+        for reads in ((True, False), (False, True), (False, False)):
             loaded[True] = _decoder()
             loaded[True].vision_tower = Linear(64, 64)
-            _QwenModel._load(SimpleNamespace(reads_images = reads), tmp_path, None, None, None, None, True)
-            assert ("scales" in loaded[True].vision_tower) != reads
+            # Qwen3-Omni keeps its towers inside its thinker.
+            loaded[True].thinker = Sequential()
+            loaded[True].thinker.vision_tower, loaded[True].thinker.audio_tower = Linear(64, 64), Linear(64, 64)
+            # A projector between a tower and the decoder too, as other families name it; never the talker.
+            loaded[True].multi_modal_projector, loaded[True].thinker.talker = Linear(64, 64), Linear(64, 64)
+            _QwenModel._load(SimpleNamespace(reads_images = reads[0], reads_audio = reads[1]), tmp_path, None, None, None, None, True)
+            towers = (loaded[True].vision_tower, loaded[True].thinker.vision_tower, loaded[True].thinker.audio_tower, loaded[True].multi_modal_projector, loaded[True].thinker.talker)
+            assert ["scales" not in tower for tower in towers] == [reads[0], reads[0], reads[1], any(reads), False]
     network = clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
     if mode == "qlora":
         # Adapters over quantized layers receive gradients.
@@ -1061,7 +1067,7 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     text_only, questions = clef[0], {"ok": {"type": "noul", "instructions": "fine?"}}
     images = [Image.new("RGB", size, shade) for size, shade in (((96, 64), "black"), ((64, 64), "white"))]
     with pytest.raises(DecisionUnsupportedError):
-        text_only.encode_images(images)
+        text_only.encode_media(images)
     model = _vision_decoder()
     model._processor = _patches
     reader = copy.copy(text_only)
@@ -1082,13 +1088,13 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     assert not bare.reads_images
     monkeypatch.setattr(ClefModel, "_IMAGE_TOKENS", 15)
     with pytest.raises(DecisionRequestError, match = "the images take 15 tokens"):
-        reader.encode_images(images)
+        reader.encode_media(images)
     monkeypatch.setattr(ClefModel, "_IMAGE_TOKENS", 16)
     with pytest.raises(DecisionRequestError, match = "could not be read: too thin"):
-        reader.encode_images([Image.new("RGB", (16, 16))])
+        reader.encode_media([Image.new("RGB", (16, 16))])
 
     parsed = reader._parse_questions(questions)
-    image_ids, media = reader.encode_images(images)
+    image_ids, media = reader.encode_media(images)
     plain, with_images = reader.encode("state", parsed), reader.encode("state", parsed, image_ids = image_ids)
     opening = len(reader._encode(next(reader._pieces("state", parsed))[0]))
     assert image_ids == [501, *[500] * 6, 502, 501, *[500] * 4, 502, 10] and media["image_grid_thw"].tolist() == [[1, 4, 6], [1, 4, 4]] and with_images[0] == plain[0][:opening] + image_ids + plain[0][opening:]
@@ -1116,6 +1122,289 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     assert dark["usage"]["input_tokens"] == len(reader.encode([{"role": "user", "content": ["state"]}], parsed)[0]) + 9
     model._processor = None
     assert not reader.reads_images
+
+
+def _omni_ready(audio = False):
+    from unsloth_zoo.mlx.utils import _AUDIO_QUALIFIED_FAMILIES, _AudioVersions, _installed_mlx_vlm_version
+
+    floor = _AUDIO_QUALIFIED_FAMILIES["qwen3_omni_moe"] if audio else _AudioVersions("0.6.5")
+    if not floor.admits(_installed_mlx_vlm_version()):
+        pytest.skip(f"Qwen3-Omni {'audio ' if audio else ''}needs mlx-vlm {floor.minimum}")
+
+
+def _omni_decoder():
+    from mlx_vlm.models import qwen3_omni_moe
+
+    text = dict(model_type = "qwen3_omni_moe_text", hidden_size = 64, intermediate_size = 64, moe_intermediate_size = 64, num_hidden_layers = 4, num_attention_heads = 2, num_key_value_heads = 1, head_dim = 32, vocab_size = 512)
+    text.update(num_experts = 4, num_experts_per_tok = 2, decoder_sparse_step = 1, mlp_only_layers = [], rms_norm_eps = 1e-6, rope_theta = 1e6, max_position_embeddings = 4096, rope_scaling = {"mrope_section": [6, 5, 5]}, use_qk_norm = True)
+    vision = dict(depth = 2, deepstack_visual_indexes = [0], hidden_size = 32, intermediate_size = 64, num_heads = 2, out_hidden_size = 64)
+    audio = dict(d_model = 32, encoder_layers = 1, num_hidden_layers = 1, encoder_attention_heads = 2, encoder_ffn_dim = 64, downsample_hidden_size = 16, output_dim = 64)
+    thinker = dict(text_config = text, vision_config = vision, audio_config = audio, image_token_id = 500, vision_start_token_id = 501, vision_end_token_id = 502)
+    thinker.update(audio_token_id = 503, audio_start_token_id = 504, audio_end_token_id = 505)
+    mx.random.seed(7)
+    config = {"model_type": "qwen3_omni_moe", "enable_audio_output": False, "thinker_config": thinker, "talker_config": {"text_config": text}}
+    return qwen3_omni_moe.Model(qwen3_omni_moe.ModelConfig.from_dict(config))
+
+
+def _omni_processor(asked):
+    # As the Qwen3-Omni processor answers: an image as in `_patches`, a clip as the 13 placeholders of a second of features.
+    def processor(text, images, return_tensors, audio = (), **kwargs):
+        asked.append((text[0], [len(clip) for clip in audio], kwargs))
+        # The processor takes an empty list of images for images it then fails to find.
+        assert images is None or images
+        grids = [(1, image.height // 16, image.width // 16) for image in images or ()]
+        ids = [token for _, rows, columns in grids for token in (501, *[500] * (rows * columns // 4), 502, 10)] + [504, *[503] * 13, 505, 10] * len(audio)
+        encoded = {"input_ids": np.array([ids])}
+        if grids:
+            pixels = [np.full((rows * columns, 1536), np.asarray(image).mean() / 255, np.float32) for image, (_, rows, columns) in zip(images, grids)]
+            encoded.update(pixel_values = np.concatenate(pixels), image_grid_thw = np.array(grids))
+        if audio:
+            encoded.update(input_features = np.stack([np.resize(clip, (128, 100)) for clip in audio]), feature_attention_mask = np.ones((len(audio), 100), np.int32))
+        return encoded
+
+    processor.image_processor, processor.feature_extractor = SimpleNamespace(min_pixels = 1, max_pixels = 2), True
+    return processor
+
+
+def test_clef_omni_reads_images_through_its_thinker(clef, tmp_path, monkeypatch):
+    _omni_ready()
+    from PIL import Image
+
+    from unsloth_zoo.mlx.decision import ClefModel
+
+    reader, model, asked = copy.copy(clef[0]), _omni_decoder(), []
+    reader.model = model
+    model._processor = _omni_processor(asked)
+    images = [Image.new("RGB", size, shade) for size, shade in (((96, 64), "black"), ((64, 64), "white"))]
+    assert reader.reads_images
+    image_ids, media = reader.encode_media(images)
+    # A line break follows each image, not only the last.
+    assert asked[0][0] == (reader._IMAGE + "\n") * 2 and image_ids.count(500) == 10
+    ids = reader.encode("state", reader._parse_questions({"ok": {"type": "noul", "instructions": "fine?"}}), image_ids = image_ids)[0]
+    with generation_mode(model):
+        hidden = reader._hidden(ids, media)
+        # mlx-vlm's own forward places the image features, their positions and the features added after the first layers.
+        expected = model.thinker(mx.array(ids)[None], media["pixel_values"], image_grid_thw = media["image_grid_thw"]).logits[0]
+        np.testing.assert_allclose(np.array(model.language_model.lm_head(hidden).astype(mx.float32)), np.array(expected.astype(mx.float32)), atol = 1e-4)
+    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = model))
+    reader._load_beside(tmp_path, None, None, "joint_head")
+    assert (model._processor.image_processor.min_pixels, model._processor.image_processor.max_pixels) == (65536, 1048576)
+    model.thinker.vision_tower = None
+    assert not reader.reads_images
+
+
+def _wav(samples, rate):
+    import base64, io, wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as file:
+        file.setnchannels(1), file.setsampwidth(2), file.setframerate(rate)
+        file.writeframes((np.asarray(samples) * 32767).astype("<i2").tobytes())
+    return "data:audio/wav;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def test_clef_omni_hears_audio_after_its_images(clef, monkeypatch):
+    pytest.importorskip("av")
+    _omni_ready(audio = True)
+    from PIL import Image
+
+    from unsloth_zoo.mlx import decision
+    from unsloth_zoo.mlx.decision import DecisionRequestError, DecisionUnsupportedError
+
+    deaf, reader, model, asked = clef[0], copy.copy(clef[0]), _omni_decoder(), []
+    reader.model = model
+    model._processor = _omni_processor(asked)
+    questions = {"ok": {"type": "noul", "instructions": "fine?"}}
+    low, high = (np.sin(np.arange(8000) * hertz * 2 * np.pi / 8000).astype(np.float32) for hertz in (220, 1760))
+    assert reader.reads_audio and not deaf.reads_audio
+    with pytest.raises(DecisionUnsupportedError, match = "does not support audio"):
+        deaf.answer("state", questions, audio = [_wav(low, 8000)])
+    for audio, problem in (("x", "must be an array"), (["data:image/png;base64,AA=="], "must be data URLs"), ([_wav(low, 8000)] * 9, "too many audio clips"), (["data:audio/wav;base64,AAAA"], "could not be decoded")):
+        with pytest.raises(DecisionRequestError, match = problem):
+            reader.answer("state", questions, audio = audio)
+
+    image = Image.new("RGB", (96, 64), "white")
+    parsed = reader._parse_questions(questions)
+    for images, clips in (([image], [low, high]), ([], [high])):
+        media_ids, media = reader.encode_media(images, clips)
+        # Images come first, and each clip is followed by its own line break as each image is.
+        assert asked[-1][0] == (reader._IMAGE + "\n") * len(images) + (reader._AUDIO + "\n") * len(clips) and asked[-1][2]["sampling_rate"] == 16000
+        ids = reader.encode("state", parsed, image_ids = media_ids)[0]
+        with generation_mode(model):
+            # mlx-vlm's own forward places the features of both towers and their positions.
+            expected = model.thinker(mx.array(ids)[None], media.get("pixel_values"), **{name: value for name, value in media.items() if name != "pixel_values"}).logits[0]
+            np.testing.assert_allclose(np.array(model.language_model.lm_head(reader._hidden(ids, media)).astype(mx.float32)), np.array(expected.astype(mx.float32)), atol = 1e-4)
+
+    answers = [reader.answer("state", questions, audio = [_wav(clip, 8000)]) for clip in (low, high)]
+    # A clip is resampled to the rate the model hears.
+    assert asked[-1][1] == [16000] and answers[0]["usage"] == answers[1]["usage"] and answers[0]["answers"]["ok"]["noul"] != answers[1]["answers"]["ok"]["noul"]
+    monkeypatch.setattr(decision, "_MAX_AUDIO_SECONDS", 0.5)
+    with pytest.raises(DecisionRequestError, match = "longer than 0.5 seconds"):
+        reader.answer("state", questions, audio = [_wav(low[:2000], 8000), _wav(low[:2400], 8000)])
+    # Below the mlx-vlm release the trainer qualifies for Qwen3-Omni audio, audio is refused; images are not.
+    monkeypatch.setattr(sys.modules["unsloth_zoo.mlx.utils"], "_installed_mlx_vlm_version", lambda: "0.6.6")
+    assert not reader.reads_audio and reader.reads_images
+    monkeypatch.undo()
+    model.thinker.audio_tower = None
+    assert not reader.reads_audio
+
+
+def test_a_plain_omni_model_trains_as_a_clef_on_images_and_audio(clef, tmp_path, monkeypatch):
+    pytest.importorskip("av")
+    _omni_ready(audio = True)
+    from PIL import Image
+
+    from unsloth_zoo.mlx.decision import ClefModel, DecisionRequestError, _decoder_tensor_name, load_language_model_as_clef, save_clef_adapter
+
+    def load(self, *args):
+        self.model, self.tokenizer = _omni_decoder(), clef[0].tokenizer
+        self.model._processor = _omni_processor(asked)
+
+    monkeypatch.setattr(ClefModel, "_load", load)
+    source, out, tensors, asked = tmp_path / "omni", tmp_path / "out", {}, []
+    # As transformers stores it: the decoder under the thinker's own names, each expert of a layer apart.
+    for name, value in tree_flatten(_omni_decoder().parameters()):
+        name = name.replace("thinker.language_model.model.", "thinker.model.").replace("thinker.language_model.lm_head.", "thinker.lm_head.")
+        tensors.update({name.replace(".switch_mlp.", f".experts.{index}."): expert for index, expert in enumerate(value)} if ".switch_mlp." in name else {name: value})
+    source.mkdir()
+    mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    # Below mlx-vlm 0.6.5 the decoder's forward fails without a cache: refused at load, not at the first request.
+    with monkeypatch.context() as patch:
+        patch.setattr(sys.modules["unsloth_zoo.mlx.utils"], "_installed_mlx_vlm_version", lambda: "0.6.4")
+        with pytest.raises(ValueError, match = "mlx-vlm 0.6.5 or newer"):
+            load_language_model_as_clef(source, head_width = 64)
+    pipeline = load_language_model_as_clef(source, head_width = 64)
+    stacked = "thinker.language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+    # An MLX conversion stores the stack under the name it is loaded with.
+    assert _decoder_tensor_name(pipeline.model, stacked, tensors) is None and _decoder_tensor_name(pipeline.model, stacked, {stacked}) == stacked
+
+    questions = {"route": {"type": "choice", "instructions": "where", "criteria": {"a": "x", "b": None}}, "ok": {"type": "noul", "instructions": "fine?"}}
+    image, clip = Image.new("RGB", (96, 64), "white"), {"array": np.sin(np.arange(16000) / 9).astype(np.float32), "sampling_rate": 16000}
+    records = (([image], [clip]), ([], [_wav(clip["array"][:4000], 8000)]))
+    items = [{**clef_training_item(pipeline, "s", questions, None, images, audio), "targets": [[1.0, 0.0], [0.0, 1.0]]} for images, audio in records]
+    assert items[0]["audio"] == [clip] and [item["input_ids"].count(503) for item in items] == [13, 13] and "images" not in items[1]
+    for bad in ({**clip, "sampling_rate": 8000}, {**clip, "array": np.zeros((2, 8))}, clip["array"], {**clip, "array": []}, {"sampling_rate": 16000}):
+        with pytest.raises(DecisionRequestError, match = "mono samples at 16000 Hz"):
+            clef_training_item(pipeline, "s", questions, None, None, [bad])
+    with pytest.raises(DecisionRequestError, match = "too many audio clips"):
+        clef_training_item(pipeline, "s", questions, None, None, [clip] * 9)
+
+    # What could not be saved afterwards is refused before it trains.
+    stacks = ["q_proj", "up_proj"], ["mlp.switch_mlp.up_proj"], "switch_mlp", ["all-linear", "up_proj"]
+    for refused, why in (({"full_finetuning": True}, "each expert of its mixture apart"), *(({"target_modules": names}, "stacked experts") for names in stacks)):
+        with pytest.raises(ValueError, match = why):
+            clef_training_network(pipeline, **refused)
+    network = clef_training_network(pipeline, r = 4, lora_alpha = 4, target_modules = ["all-linear"])
+    adapted = [path for path, module in pipeline.model.named_modules() if "lora_a" in module]
+    # Not on the stacked experts, which have no one tensor in the checkpoint, nor on a tower.
+    assert {path.rsplit(".", 1)[-1] for path in adapted} == {"q_proj", "k_proj", "v_proj", "o_proj"} and all(path.startswith("thinker.language_model.") for path in adapted)
+    # A record is scored with its clip, which is decoded and resampled as it is read.
+    assert [_clef_record_loss(network, item).item() and asked[-1][1] for item in items] == [[16000], [8000]]
+    shuffled = network.permuted_item(items[0], random.Random(1))
+    assert shuffled["audio"] == [clip] and shuffled["input_ids"].count(503) == 13 and shuffled["targets"] == [[0.0, 1.0], [1.0, 0.0]]
+    towers = {name: np.array(value) for name, value in tree_flatten(pipeline.model.parameters()) if "_tower." in name}
+    MLXDecisionTrainer(network, MLXTrainingConfig(per_device_train_batch_size = 2, max_steps = 2, learning_rate = 1e-2, warmup_steps = 0, compile = False), items).train()
+    assert towers and all(np.array_equal(towers[name], np.array(value)) for name, value in tree_flatten(pipeline.model.parameters()) if name in towers)
+
+    save_clef_model(pipeline, out / "merged", source)
+    saved, low = mx.load(str(out / "merged" / "model.safetensors")), dict(pipeline.model.named_modules())["thinker.language_model.model.layers.1.self_attn.q_proj"]
+    name = "thinker.model.layers.1.self_attn.q_proj.weight"
+    np.testing.assert_allclose(np.array(saved[name] - tensors[name]), np.array(low.scale * low.lora_b.T @ low.lora_a.T), atol = 1e-5)
+    assert saved.keys() == tensors.keys() and mx.any(low.lora_b).item() and all(mx.array_equal(saved[key], tensors[key]).item() for key in tensors if ".experts." in key or "_tower" in key or "visual" in key)
+    # The merged checkpoint keeps its experts apart too, and says so when it is loaded.
+    with pytest.raises(ValueError, match = "each expert of its mixture apart"):
+        clef_training_network(load_decision_model(out / "merged"), full_finetuning = True)
+    save_clef_adapter(pipeline, out / "adapter", source, "org/omni")
+    assert f"base_model.model.{name[: -len('.weight')]}.lora_A.weight" in mx.load(str(out / "adapter" / "adapter_model.safetensors"))
+    # The adapters go back on the decoder's layers, not on the audio tower's of the same numbers.
+    served = load_decision_model(out / "adapter", base_model = source)
+    args = items[1]["input_ids"], items[1]["question_spans"], items[1]["option_spans"], items[1]["types"]
+    np.testing.assert_allclose(np.array(served.logits(*args)), np.array(pipeline.logits(*args)), atol = 3e-2)
+
+
+def test_an_omni_family_of_the_trainer_reads_media_as_the_trainer_does(clef, monkeypatch):
+    from unsloth_zoo.mlx import utils
+    from unsloth_zoo.mlx.decision import DecisionRequestError
+
+    asked, forwards, merges, checked = [], [], [], []
+    Processor = type("Gemma4Processor", (), {"__module__": "mlx_vlm.models.gemma4.processing_gemma4", "audio_token": "<A>", "feature_extractor": SimpleNamespace(sampling_rate = 16000)})
+    # A rendering that puts images before the text of a turn and clips after it.
+    render = lambda parts: "".join("<i>" for part in parts if part["type"] == "image") + parts[-1]["text"] + "".join("<a>" for part in parts if part["type"] == "audio")
+    monkeypatch.setattr(utils, "_render_vlm_messages", lambda processor, messages: "<turn>" + render(messages[0]["content"]) + "</turn>")
+
+    def reader(gate = lambda processor: "gemma4"):
+        made = copy.copy(clef[0])
+        made.__dict__.pop("_media_checks", None)
+        made.model = SimpleNamespace(config = SimpleNamespace(model_type = "gemma4", audio_token_id = 7), _processor = Processor(), _unsloth_supports_images = True)
+        monkeypatch.setattr(utils, "_check_audio_family_gate", gate)
+        return made
+
+    def inputs(processor, texts, images, max_seq_length, truncation, all_audio):
+        asked.append((texts, images, [clip.sampling_rate for clip in all_audio[0]]))
+        return {"input_ids": np.array([[7, 7, 9]]), "attention_mask": np.ones((1, 3), np.int32), "mm_token_type_ids": np.array([[2, 2, 0]]), "input_features": np.ones((1, 4, 2), np.float32), "audio_bounds": [np.array([[0, 2]])]}
+
+    # A checkpoint whose processor drops audio is deaf, whatever its family.
+    monkeypatch.setattr(utils, "audio_input_capability", lambda model, processor, texts: SimpleNamespace(capable = False))
+    assert not reader().reads_audio
+    monkeypatch.setattr(utils, "audio_input_capability", lambda model, processor, texts: SimpleNamespace(capable = texts == ["<a>"]))
+    monkeypatch.setattr(utils, "_processor_vlm_inputs", inputs)
+    monkeypatch.setattr(utils, "_assert_audio_runs_intact", lambda inputs, counts, processor, length, truncated, clips: checked.append(counts))
+    monkeypatch.setattr(utils, "install_audio_merge_patch", lambda model, token: merges.append(token) or True)
+    monkeypatch.setattr(utils, "_vlm_hidden_states", lambda model, batch: forwards.append(batch) or mx.zeros((1, batch["input_ids"].shape[1], 4)))
+
+    def unverified(processor):
+        raise NotImplementedError("not verified")
+
+    deaf = reader(unverified)
+    assert deaf.reads_images and not deaf.reads_audio
+    deaf = reader()
+    deaf.model._unsloth_supports_images = False
+    assert not deaf.reads_images
+    # The families are the trainer's own.
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_AUDIO_QUALIFIED_FAMILIES", {"gemma3n": None})
+        assert not reader().reads_images
+    # Nor does a model hear whose clip the trainer's checks find no place for in its processor's output.
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_assert_audio_runs_intact", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("no placeholder run")))
+        assert not reader().reads_audio
+    del asked[:], merges[:], checked[:]
+    made = reader()
+    assert made.reads_images and made.reads_audio
+    clip = np.zeros(1600, np.float32)
+    ids, media = made.encode_media(["image"], [clip])
+    made.encode_media([], [clip])
+    # A rendering with no place for a clip leaves it to the token the processor names.
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_render_vlm_messages", lambda processor, messages: "".join(part.get("text", "") for part in messages[0]["content"]))
+        assert made._trainer_text(1, 2) == "<A><A>"
+    # The marks the trainer renders for the media, the clips at their rate, and Gemma 4's audio merge corrected once.
+    assert asked[1] == (["<i><a>\n"], [["image"]], [16000]) and ids == [7, 7, 9] and merges == [7] and checked == [[1], [1], [1]]
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_assert_audio_runs_intact", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("keeps only the first")))
+        with pytest.raises(DecisionRequestError, match = "could not be read: keeps only the first"):
+            made.encode_media([], [clip])
+    made._hidden([1, 2, 7, 7, 9, 3], media)
+    made._hidden([1, 2], None)
+    # The trainer's preparation runs in its two halves: content on the media run, which may grow it (Phi-4 expands
+    # each image placeholder), positions on the whole prompt.
+    phases, prepare = [], utils._prepare_vlm_batch_for_compile
+
+    def grown(batch, config, phase = None):
+        phases.append(phase)
+        if phase == "content":
+            batch = {**batch, "input_ids": mx.array([[7, 7, 7, 9]]), "mm_token_type_ids": mx.array([[2, 2, 2, 0]])}
+        return prepare(batch, config, phase = phase)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_prepare_vlm_batch_for_compile", grown)
+        longer, more = made.encode_media(["image"], [clip])
+        made._hidden([1, *longer, 3], more)
+    assert longer == [7, 7, 7, 9] and phases == ["content", "positions"] and forwards[-1]["mm_token_type_ids"].tolist() == [[0, 2, 2, 2, 0, 0]]
+    # What the processor aligned to its tokens moves with them into the prompt; text alone is forwarded the same way.
+    assert forwards[0]["mm_token_type_ids"].tolist() == [[0, 0, 2, 2, 0, 0]] and forwards[0]["input_ids"].tolist() == [[1, 2, 7, 7, 9, 3]]
+    assert np.asarray(forwards[0]["audio_bounds"]).tolist() == [[[2, 4]]]
+    assert set(forwards[0]) == {"input_ids", "attention_mask", "mm_token_type_ids", "input_features", "audio_bounds"} and set(forwards[1]) == {"input_ids", "attention_mask"}
 
 
 def test_clef_trains_on_the_images_of_its_records(clef):
@@ -1169,7 +1458,7 @@ def test_prompts_that_share_their_images_read_them_once(monkeypatch):
     reader = _LabelModel.__new__(_LabelModel)
     reader.model, reader.takes_images = _vision_decoder(), True
     reader.model._processor = _patches
-    image_ids, media = reader.encode_images([Image.new("RGB", (96, 64), "gray"), Image.new("RGB", (64, 64), "white")])
+    image_ids, media = reader.encode_media([Image.new("RGB", (96, 64), "gray"), Image.new("RGB", (64, 64), "white")])
     shared = [3, 4, *image_ids, *range(40, 60)]
     prompts = [shared + [7, 8, 9], shared + [300], shared + [301, 302, 303, 304]]
     with generation_mode(reader.model):

@@ -3379,6 +3379,11 @@ if n_items is None:
                 if n_items is None: n_items = __kwargs.get("n_items", None)
                 break
 pass
+# Stock ForCausalLMLoss uses caller pre-shifted targets (context parallel, padding-free) as is.
+explicit_shift_labels = None
+if (\\9) != () and type(\\9) is dict:
+    explicit_shift_labels = (\\9).get("shift_labels", None)
+    if not torch.is_tensor(explicit_shift_labels): explicit_shift_labels = None
 
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
@@ -3402,7 +3407,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3416,14 +3421,15 @@ elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LO
 
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
+    _labels = labels if explicit_shift_labels is None else explicit_shift_labels
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(_labels, _labels.dim() - 1)
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
+        labels               = _labels,
         mask                 = None,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
@@ -3432,6 +3438,7 @@ elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LO
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
+        shift_labels         = explicit_shift_labels is None,
     )
 elif labels is not None and not NOT_RETURN_LOGITS:
     # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`

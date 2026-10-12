@@ -2706,7 +2706,7 @@ def sft_prepare_dataset(
         do_prompt_completion = True
         used_column_names.append("completion_mask")
     elif (dataset_text_field not in column_names or getattr(args, "assistant_only_loss", False)) and \
-        formatting_func is None and not is_vlm and "messages" in column_names and \
+        formatting_func is None and "messages" in column_names and \
         isinstance(_first_messages := next(iter(dataset))["messages"], list) and \
         len(_first_messages) != 0 and isinstance(_first_messages[0], dict) and \
         "role" in _first_messages[0]:
@@ -2900,6 +2900,13 @@ def sft_prepare_dataset(
                     if isinstance(message, dict) else message
                     for message in example["messages"]
                 ]
+                if is_vlm:
+                    # Processor templates index content parts, as TRL's prepare_multimodal_messages builds them.
+                    messages = [
+                        {**message, "content": [{"type": "text", "text": message["content"]}]}
+                        if isinstance(message, dict) and isinstance(message.get("content"), str) else message
+                        for message in messages
+                    ]
                 tools = example.get("tools")
                 if isinstance(tools, str):
                     import json as _json
@@ -2948,7 +2955,8 @@ def sft_prepare_dataset(
                 dataset = dataset.map(_tokenize, batched = True, remove_columns = list(column_names), **map_kwargs)
 
         # VLMs need .pad; switch the data collator
-        if is_vlm and not hasattr(processing_class, "pad") and not do_prompt_completion:
+        # transformers' collator rebuilds labels from input_ids, dropping assistant masks: keep TRL's for messages.
+        if is_vlm and not hasattr(processing_class, "pad") and not do_prompt_completion and not do_messages:
             data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
             self.data_collator = data_collator
         pass
