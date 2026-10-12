@@ -2752,7 +2752,8 @@ def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch
     upstream = lambda self, input_ids=None, pixel_values=None, **kwargs: kwargs
     model_cls = type("Model", (), {"get_input_embeddings": upstream,
                                    "__call__": lambda self, *a, **k: "thinker"})
-    backbone_cls = type("Backbone", (), {"__call__": lambda self, *a, **k: "original"})
+    backbone_cls = type("Backbone", (), {"__call__": lambda self, *a, **k: "original",
+                                         "_deepstack_process": lambda self, h, m, e: h + e})
     lm_cls = type("LanguageModel", (), {"__call__": lambda self, *a, **k: "upstream lm"})
     language = NS(Qwen3VLMoEModel=backbone_cls, create_attention_mask=lambda h, c: None,
                   LanguageModel=lm_cls, LanguageModelOutput=NS)
@@ -2761,7 +2762,7 @@ def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch
     features_cls = type("Features", (NS,), {"to_dict": lambda self: dict(vars(self))})
     thinker = NS(masked_scatter=None, InputEmbeddingsFeatures=features_cls)
     mc._install_qwen3_omni_compile_patches(
-        NS(Model=model_cls), thinker, vision, language, (upstream,) * 5, upstream)
+        NS(Model=model_cls), thinker, vision, language, (upstream,) * 5)
     assert thinker.masked_scatter is mc._masked_scatter_no_numpy
 
     vision_tower = lambda pixels, grid: (pixels, [pixels * 10])
@@ -2807,6 +2808,12 @@ def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch
         None, inputs_embeds=h, mask="m", visual_pos_masks=out.visual_pos_masks,
         deepstack_visual_embeds=out.deepstack_visual_embeds))
     assert trained(out.inputs_embeds).tolist() == [[[12.0], [1.0], [34.0], [23.0]]]
+    # Upstream's embedder hands full-length residuals: added in place, as upstream does,
+    # never gathered as rows (that would put row 0's residual on the first image token).
+    full = mx.array([[[0.0], [0.0], [5.0], [7.0]]])
+    assert backbone._deepstack_process(
+        mx.zeros((1, 4, 1)), mx.array([[False, False, True, True]]), full
+    ).tolist() == [[[0.0], [0.0], [5.0], [7.0]]]
 
 
 @pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])

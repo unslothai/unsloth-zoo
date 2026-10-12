@@ -3950,13 +3950,12 @@ def _install_qwen3_family_compile_patches():
                 patched_qwen3_fast_pos_embed_interpolate,
                 patched_qwen3_vision_call,
             ),
-            patched_qwen3_deepstack,
         )
     _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"})
 
 
 def _install_qwen3_omni_compile_patches(
-    module, thinker_module, vision_module, language_module, tower_patches, deepstack_patch
+    module, thinker_module, vision_module, language_module, tower_patches
 ):
     """Bind the Qwen3 VL patches to Qwen3-Omni's thinker, which carries the same
     vision tower and deepstack decoder under its own modules."""
@@ -3965,10 +3964,15 @@ def _install_qwen3_omni_compile_patches(
 
     attention, block, rot_pos_emb, pos_embed_interpolate, vision_call = tower_patches
 
+    backbone_cls = language_module.Qwen3VLMoEModel
+    original_deepstack = backbone_cls._deepstack_process
+
     def patched_deepstack(self, hidden_states, visual_pos_masks, visual_embeds):
         # The patched embedder hands over one mask and one row block per modality.
+        # Upstream's embedder (inference, audio) scatters full-length residuals,
+        # which the Qwen3 VL row gather would misplace: keep its own add.
         if not isinstance(visual_pos_masks, tuple):
-            return deepstack_patch(self, hidden_states, visual_pos_masks, visual_embeds)
+            return original_deepstack(self, hidden_states, visual_pos_masks, visual_embeds)
         for mask, rows in zip(visual_pos_masks, visual_embeds):
             hidden_states = _add_visual_embeds(hidden_states, mask, rows)
         return hidden_states
@@ -4029,7 +4033,6 @@ def _install_qwen3_omni_compile_patches(
             return h, selected_hidden_state
         return h
 
-    backbone_cls = language_module.Qwen3VLMoEModel
     original_backbone_call = backbone_cls.__call__
 
     @wraps(original_backbone_call)
