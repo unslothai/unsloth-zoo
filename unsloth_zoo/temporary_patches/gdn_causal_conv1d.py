@@ -18,8 +18,8 @@
 
 Replaces the transformers `F.conv1d` fallback (Qwen3.5/3.6, Qwen3-Next), reading and
 writing channel-last directly to skip the transpose copies. Layout follows fla's
-`causal_conv1d` (fla-org/flash-linear-attention, MIT), without initial state. Packed rows
-pass `seq_idx` (B, T): a tap only reads positions of the same sequence, as in `causal_conv1d`.
+`causal_conv1d` (fla-org/flash-linear-attention, MIT), without initial state; `seq_idx`
+(B, T) keeps taps inside one packed sequence.
 Numerics match torch: fp32 accumulate, pre-activation and SiLU grad rounded to input dtype.
 ``UNSLOTH_DISABLE_TRITON_CAUSAL_CONV1D=1`` keeps the torch fallback; a usable
 `causal_conv1d` package always wins.
@@ -84,8 +84,7 @@ def _is_marked(fn):
 
 
 def _build_kernels():
-    # `tl` is a module global: Triton 3.3 resolves the `tl.constexpr` annotations of these nested
-    # kernels through their globals, not this function's locals ("tl is not defined").
+    # Triton 3.3 resolves nested kernels' `tl.constexpr` via globals ("tl is not defined").
     global _kernels, tl
     if _kernels is not None:
         return _kernels
@@ -112,7 +111,6 @@ def _build_kernels():
         o_d64 = o_d.to(tl.int64)
         p_x = x + tl.cast(i_b, tl.int64) * stride_x_b
         if HAS_SEQ_IDX:
-            # seq_idx is (B, T) contiguous int32; a tap from another sequence reads zero.
             p_s = seq_idx + tl.cast(i_b, tl.int64) * T
             b_s = tl.load(p_s + o_t, mask = o_t < T, other = -1)
         acc = tl.zeros((BT, BD), dtype = tl.float32)
@@ -173,7 +171,6 @@ def _build_kernels():
             r_t = o_t + k
             m_r = r_t < T
             if HAS_SEQ_IDX:
-                # Sequence of output r: its pre-activation only reads its own sequence.
                 b_sr = tl.load(p_s + r_t, mask = m_r, other = -1)
             b_g = tl.load(
                 p_dy + r_t.to(tl.int64)[:, None] * stride_dy_t + o_d64[None, :] * stride_dy_d,
@@ -223,7 +220,6 @@ def _build_kernels():
             if NEED_DX:
                 b_wk = tl.load(weight + o_d * W + (W - 1 - k), mask = m_d, other = 0).to(tl.float32)
                 if HAS_SEQ_IDX:
-                    # x[s] feeds output r = s + k only inside one sequence.
                     b_g = tl.where((b_sr == b_s)[:, None], b_g, 0.0)
                 b_dx += b_g * b_wk[None, :]
         if NEED_DX:
@@ -338,7 +334,7 @@ def causal_conv1d_reference(x, weight, bias = None, activation = None):
 
 
 def _check_seq_idx(x, seq_idx):
-    """seq_idx as int32 contiguous (B, T), or a ValueError: a mis-shaped one must not be dropped."""
+    """Validate seq_idx (B, T); raise rather than silently drop a mis-shaped one."""
     if seq_idx is None:
         return None
     if (
@@ -372,7 +368,7 @@ def _eligible(x, weight, bias, activation, seq_idx = None):
 
 
 def triton_causal_conv1d(x, weight, bias = None, activation = None, seq_idx = None):
-    """x (B, D, T), weight (D, W), seq_idx (B, T) or None -> (B, D, T) stored channel-last."""
+    """x (B, D, T), weight (D, W), seq_idx (B, T) -> (B, D, T) stored channel-last."""
     if seq_idx is not None:
         seq_idx = _check_seq_idx(x, seq_idx).to(torch.int32).contiguous()
     return _CausalConv1dFunction.apply(x, weight, bias, activation, seq_idx)
@@ -405,7 +401,6 @@ def _count_fallback():
 
 
 def _causal_conv1d_any(x, weight, bias, activation, seq_idx):
-    """Triton when eligible, else the torch path honouring seq_idx (packed rows never leak)."""
     seq_idx = _check_seq_idx(x, seq_idx)
     out = _try_fast(x, weight, bias, activation, seq_idx)
     if out is not None:
@@ -415,15 +410,13 @@ def _causal_conv1d_any(x, weight, bias, activation, seq_idx):
 
 
 def _own_signature(fn):
-    # functools.wraps sets __wrapped__, so inspect.signature would report the wrapped torch
-    # function and the transformers hub wrapper would drop `seq_idx` as not applicable.
+    # Else signature follows __wrapped__ and the hub wrapper drops `seq_idx`.
     fn.__signature__ = inspect.signature(fn, follow_wrapped = False)
     return fn
 
 
 def _make_hub_dispatch(torch_function):
-    """Wrap the transformers torch fallback (which ignores its kwargs). Names `seq_idx` so the
-    hub wrapper forwards it and Unsloth's hybrid packing gate can key on it."""
+    """Wrap the transformers torch fallback; names `seq_idx` for the hub wrapper and packing gate."""
     @functools.wraps(torch_function)
     def causal_conv1d_fn(hidden_states, weight, bias = None, activation = None, seq_idx = None, **kwargs):
         if seq_idx is not None:
@@ -461,9 +454,7 @@ def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
 
 
 def _legacy_causal_conv1d_fn(x, weight, bias = None, activation = None, seq_idx = None, **kwargs):
-    """`causal_conv1d_fn` stand-in for transformers < 5.15 (used only when not None).
-    `seq_idx` is named and honoured (Triton, or the torch path off-GPU), so Unsloth's hybrid
-    packing gate can enable packed rows on it."""
+    """`causal_conv1d_fn` stand-in for transformers < 5.15; names `seq_idx` for the packing gate."""
     unsupported = sorted(k for k, v in kwargs.items() if v is not None and v is not False)
     if unsupported:
         raise NotImplementedError(

@@ -40,7 +40,6 @@ def _seq_idx_from_lengths(rows, device = "cpu"):
 
 def _inputs(B, D, T, W, dtype, bias, seed = 0, device = "cuda"):
     g = torch.Generator(device = device).manual_seed(seed)
-    # Channel-last storage, as the GatedDeltaNet passes it (transposed (B, T, D)).
     x = torch.randn(B, T, D, device = device, generator = g).to(dtype).transpose(1, 2)
     w = (torch.randn(D, W, device = device, generator = g) * 0.5).to(dtype)
     b = (torch.randn(D, device = device, generator = g) * 0.1).to(dtype) if bias else None
@@ -86,8 +85,7 @@ def _to64(t):
     return t.double() if t is not None else None
 
 
-# (D, W, rows of document lengths). Covers documents shorter than W, 1-token documents,
-# a trailing pad segment (one long last "document"), tile-boundary crossings and B > 1.
+# (D, W, rows of document lengths): docs shorter than W, 1-token docs, trailing pad, tile edges, B > 1.
 CASES = [
     (64, 4, [[5, 1, 7]]),
     (64, 4, [[1, 1, 1, 1, 1, 1, 1, 1]]),
@@ -119,7 +117,7 @@ def test_seq_idx_matches_reference_and_per_document(D, W, rows, dtype, bias, act
         e_ours, e_torch = _rel(o, r), _rel(t, r)
         if dtype == torch.float32:
             assert e_ours < 1e-5, (name, e_ours)
-            # The fp32 torch conv may run on cuDNN TF32 (torch < 2.9 default): allow its own error.
+            # fp32 torch conv may use cuDNN TF32 (torch < 2.9).
             assert _rel(o, p) < 1e-5 + 2 * _rel(p, r), (name, _rel(o, p), _rel(p, r))
         else:
             floor = 4e-3 if dtype == torch.bfloat16 else 5e-4
@@ -130,7 +128,6 @@ def test_seq_idx_matches_reference_and_per_document(D, W, rows, dtype, bias, act
 @requires_cuda
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_seq_idx_forward_exact_per_document(dtype):
-    # The forward reads exactly the same values a lone document would: bitwise in fp32 / bf16.
     rows = [[5, 1, 7, 2, 1, 48]]
     x, w, b, _ = _inputs(1, 192, 64, 4, dtype, True)
     seq_idx = _seq_idx_from_lengths(rows, "cuda")
@@ -155,7 +152,7 @@ def test_single_sequence_seq_idx_is_bitwise_no_seq_idx(dtype):
 
 @requires_cuda
 def test_seq_idx_leak_is_visible_without_the_mask():
-    # Flip check: dropping seq_idx must fail the per-document oracle by a wide margin.
+    # Flip check: without seq_idx the oracle must fail.
     rows = [[5, 1, 7, 3, 48]]
     x, w, b, dy = _inputs(1, 64, 64, 4, torch.float32, True)
     seq_idx = _seq_idx_from_lengths(rows, "cuda")
@@ -164,7 +161,7 @@ def test_seq_idx_leak_is_visible_without_the_mask():
     ours = _run(_triton, x, w, b, dy, "silu", seq_idx)
     for name, l, o, p in zip(("y", "dx", "dw", "db"), leaky, ours, per_doc):
         if name == "db":
-            continue  # the bias gradient does not depend on the taps
+            continue
         assert _rel(l, p) > 1e-2, name
         assert _rel(o, p) < 1e-5, name
 
@@ -178,7 +175,6 @@ def test_seq_idx_dtypes_and_layouts():
         seq_idx = _seq_idx_from_lengths(rows, "cuda").to(dtype)
         y = gcc.triton_causal_conv1d(x, w, b, "silu", seq_idx)
         assert _rel(y, ref) < 4e-3
-    # Channel-first storage too.
     y = gcc.triton_causal_conv1d(x.contiguous(), w, b, "silu", _seq_idx_from_lengths(rows, "cuda"))
     assert _rel(y, ref) < 4e-3
 
@@ -192,7 +188,6 @@ def test_seq_idx_shape_mismatch_raises():
 
 
 def test_dispatch_signatures_name_seq_idx():
-    # Unsloth's hybrid packing gate and the transformers hub filter key on the named parameter.
     assert "seq_idx" in inspect.signature(gcc._legacy_causal_conv1d_fn).parameters
 
     def causal_conv1d_fn(hidden_states, weight, bias = None, activation = None, **kwargs):
@@ -202,7 +197,6 @@ def test_dispatch_signatures_name_seq_idx():
     assert gcc._is_marked(dispatch)
     assert dispatch.__wrapped__ is causal_conv1d_fn
     assert "seq_idx" in inspect.signature(dispatch).parameters
-    # CPU: the torch path honours seq_idx and equals per-document runs.
     g = torch.Generator().manual_seed(0)
     x = torch.randn(2, 8, 10, generator = g, dtype = torch.float64)
     w = torch.randn(8, 4, generator = g, dtype = torch.float64)
@@ -237,7 +231,6 @@ def test_hub_wrapper_forwards_seq_idx(monkeypatch):
     seq_idx = _seq_idx_from_lengths([[2, 4]])
     hub_fn(x, w, None, activation = "silu", seq_idx = seq_idx, cu_seq_lens_q = None, position_ids = None)
     assert seen and seen[-1] is seq_idx
-    # The real dispatch through the hub wrapper matches per-document runs.
     hub_fn = original("causal_conv1d_fn", "causal_conv1d")(dispatch)
     torch.testing.assert_close(
         hub_fn(x, w, None, activation = "silu", seq_idx = seq_idx, max_length_q = 4),
