@@ -139,3 +139,28 @@ def test_patched_loss_fuses_but_custom_wraps_does_not(torch_compile):
         assert _can_fuse_loss(patched)
     finally:
         _restore(lu.LOSS_MAPPING, saved)
+
+
+def test_compiled_patched_loss_fuses_inside_dynamo():
+    torch = pytest.importorskip("torch")
+    lu = pytest.importorskip("transformers.loss.loss_utils")
+    from unsloth_zoo import loss_utils as zoo_loss
+    from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+
+    saved = dict(lu.LOSS_MAPPING)
+    try:
+        zoo_loss.patch_loss_functions(lambda *a, **k: None, torch_compile = True)
+        patched = lu.LOSS_MAPPING["ForCausalLM"]
+
+        def custom(*args, **kwargs):
+            return 3 * patched(*args, **kwargs)
+
+        # Dynamo traces the torch.compile wrapper as the raw function, so the guard
+        # must still see the patched loss as fusable inside a compiled forward.
+        for loss_function, expected in ((patched, True), (lu.ForCausalLMLoss, True), (custom, False)):
+            torch._dynamo.reset()
+            traced = torch.compile(lambda: _can_fuse_loss(loss_function), backend = "eager", fullgraph = True)
+            assert traced() is expected
+    finally:
+        _restore(lu.LOSS_MAPPING, saved)
+        torch._dynamo.reset()

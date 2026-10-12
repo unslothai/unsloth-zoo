@@ -213,6 +213,8 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         loss = unsloth_fixed_cross_entropy(shift_logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
         return loss
     pass
+    # Dynamo traces a torch.compile wrapper as the raw function, so both carry the marker.
+    UnslothForCausalLMLoss._unsloth_fused_loss = UnslothForCausalLMLoss
 
     if (Version(torch.__version__) < Version("2.4.0")):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
