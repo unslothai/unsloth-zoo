@@ -149,12 +149,12 @@ class _FakeLLM:
 def _make_model(
     target_modules = ("q_proj", "k_proj", "v_proj", "o_proj", "down_proj"),
     extra = None, alias = True, wrap = True, base_dtype = DTYPE, adapter_name = "default",
-    fail = False, randomize_B = True, **lora_kwargs,
+    fail = False, randomize_B = True, device = "cpu", **lora_kwargs,
 ):
     torch.manual_seed(0)
     base = _Tiny(extra = extra)
     n_layers = len(base.model.layers)
-    vllm_model = _FakeVllmModel(n_layers)
+    vllm_model = _FakeVllmModel(n_layers).to(device)
     for i, layer in enumerate(base.model.layers):
         a = layer.self_attn
         if alias:
@@ -180,6 +180,9 @@ def _make_model(
             if isinstance(lora_B, nn.ModuleDict):
                 for lin in lora_B.values():
                     lin.weight.data = torch.randn(lin.weight.shape, generator = g) * 0.05
+    # Only the adapters move: model.to(device) would copy the base weights off the vLLM storage.
+    for module in _lora_modules(model):
+        module.lora_A.to(device); module.lora_B.to(device)
     llm = _FakeLLM(vllm_model, fail = fail)
     if wrap: install_merged_rollout_engine_wrapper(llm)
     model.vllm_engine = llm
@@ -225,7 +228,7 @@ def _perturb_adapter(model, step):
     for m in _lora_modules(model):
         for d in (m.lora_A, m.lora_B):
             w = d["default"].weight
-            w.data += torch.randn(w.shape, generator = g) * 0.02
+            w.data += (torch.randn(w.shape, generator = g) * 0.02).to(w.device)
 
 
 def _naive_cycle(model):
@@ -837,8 +840,68 @@ def test_synchronize_runs_after_fold_and_before_restore(monkeypatch):
     state = prepare_merged_rollout(model)
     with merged_rollout(state):
         events.append("generate")
-    # The last sync lands the restore before the lock is released.
-    assert events == ["sync", "generate", "sync", "sync"]
+    # No host sync after the restore: it is ordered by wait_stream (see the CUDA tests).
+    assert events == ["sync", "generate", "sync"]
+
+
+def test_pristine_copy_is_a_separate_host_tensor():
+    model, llm, vllm_model = _make_model()
+    state = prepare_merged_rollout(model)
+    for _, W, P in state.entries:
+        assert P.device.type == "cpu" and torch.equal(W, P)
+        assert P.untyped_storage().data_ptr() != W.untyped_storage().data_ptr()
+
+
+_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+
+
+@_cuda
+def test_cuda_pristine_copy_is_pinned_host_memory_not_gpu():
+    model, llm, vllm_model = _make_model(device = "cuda")
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    state = prepare_merged_rollout(model)
+    assert state is not None
+    assert torch.cuda.memory_allocated() == before
+    for _, W, P in state.entries:
+        assert W.device.type == "cuda" and P.device.type == "cpu" and P.is_pinned()
+        assert torch.equal(W.cpu(), P)
+
+
+@_cuda
+def test_cuda_fold_restore_is_bit_exact_over_100_cycles():
+    model, llm, vllm_model = _make_model(device = "cuda")
+    _run_cycles(model, vllm_model, _safe_cycle)
+    assert model._unsloth_merged_rollout_state.stream is not None
+
+
+@_cuda
+def test_cuda_folded_value_matches_single_rounding():
+    model, llm, vllm_model = _make_model(device = "cuda")
+    state = prepare_merged_rollout(model)
+    expected = []
+    for module, W, P in state.entries:
+        A = module.lora_A["default"].weight.to(DTYPE).float()
+        B = module.lora_B["default"].weight.to(DTYPE).float()
+        expected.append((P.cuda().float() + module.scaling["default"] * (B @ A)).to(DTYPE))
+    for _ in range(3):
+        with merged_rollout(state):
+            for (module, W, P), want in zip(state.entries, expected):
+                ulp = (want.float().abs() * 2 ** -7).clamp_min(2 ** -133)
+                assert ((W.float() - want.float()).abs() <= ulp).all()
+                assert not torch.equal(W.cpu(), P)
+        # Read on the current stream with no host sync: it must see the restored weights.
+        for _, W, P in state.entries:
+            assert torch.equal(W, P.cuda(non_blocking = True))
+
+
+@_cuda
+def test_cuda_falls_back_when_host_ram_is_short(monkeypatch, capsys):
+    import unsloth_zoo.block_swap as block_swap
+    monkeypatch.setattr(block_swap, "_pin_budget", lambda: 0)
+    model, llm, vllm_model = _make_model(device = "cuda")
+    assert prepare_merged_rollout(model) is None
+    assert "does not fit in free host RAM" in capsys.readouterr().out
 
 
 def test_sentinel_keeps_the_probe_marker():

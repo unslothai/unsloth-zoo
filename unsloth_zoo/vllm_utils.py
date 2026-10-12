@@ -4663,7 +4663,6 @@ _MERGED_ROLLOUT_NON_LANGUAGE = re.compile(
 _MERGED_ROLLOUT_EMBEDDING_LEAVES = frozenset((
     "embed_tokens", "lm_head", "wte", "wpe", "embed_in", "embed_out", "word_embeddings", "output",
 ))
-_MERGED_ROLLOUT_OOM = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
 # Covers every wrapped engine call, so no call (merged or not) can see folded weights.
 _MERGED_ROLLOUT_LOCK = threading.RLock()
 
@@ -4747,10 +4746,12 @@ pass
 
 class _MergedRolloutState(_MergedRolloutVerdict):
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = ("entries", "depth", "poisoned", "model_ref", "engine_ref")
+    __slots__ = ("entries", "depth", "poisoned", "model_ref", "engine_ref", "stream", "host")
 
     def __init__(self, model, entries):
-        self.entries = entries   # (lora module, W the shared base weight, P its pristine copy)
+        self.entries = entries   # (lora module, W the shared base weight, P its pristine copy on the host)
+        self.stream = None       # side stream for the host to device restore
+        self.host = None         # P's arena and its page-lock (unregistered before the arena is freed)
         self.depth = 0
         self.poisoned = None     # set when the restore failed twice
         self.model_ref = weakref.ref(model)
@@ -4912,13 +4913,7 @@ def _prepare_merged_rollout_locked(model):
     else:
         targets, reason = _merged_rollout_targets(model)
     if reason is None:
-        try:
-            with torch.no_grad():
-                entries = [(module, W, W.detach().clone()) for _, module, W in targets]
-        except _MERGED_ROLLOUT_OOM:
-            entries = None
-            _device_empty_cache()
-            reason = "the pristine copy of the targeted weights does not fit on the GPU"
+        entries, reason = _merged_rollout_host_copies(targets)
     if reason is not None:
         modules = _merged_rollout_lora_layers(model)
         model._unsloth_merged_rollout_state = _MergedRolloutVerdict(model, modules, reason)
@@ -4926,14 +4921,54 @@ def _prepare_merged_rollout_locked(model):
             f"Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT is on but falling back to vLLM LoRA (punica) because {reason}."
         )
         return None
+    entries, host = entries
     state = _MergedRolloutState(model, entries)
+    state.host = host
     model._unsloth_merged_rollout_state = state
     nbytes = sum(P.numel() * P.element_size() for _, _, P in entries)
+    pinned = "pinned" if getattr(entries[0][2], "is_pinned", lambda: False)() else "pageable"
     _merged_rollout_log_once(
         f"Unsloth: Merged-weight rollouts on: folding the adapter into {len(entries)} shared weights; "
-        f"pristine copy is {nbytes / 1024**3:.2f} GB."
+        f"pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)."
     )
     return state
+pass
+
+
+def _merged_rollout_host_copies(targets):
+    """P for each W in one exact-size host arena, page-locked in place when RAM allows.
+    Host, not GPU: a GPU copy would come out of the training headroom vLLM leaves."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    from .block_swap import _Registered, _pin_budget
+    align = 64
+    layout, total = [], 0
+    for _, module, W in targets:
+        layout.append((module, W, total))
+        total += -(-W.numel() * W.element_size() // align) * align
+    on_host = all(W.device.type == "cpu" for _, W, _ in layout)
+    budget = _pin_budget()
+    if not on_host and total > budget:
+        return None, (
+            f"the pristine host copy ({total / 1024**3:.2f} GB) does not fit in free host RAM "
+            f"({max(budget, 0) / 1024**3:.2f} GB after the reserve)"
+        )
+    try:
+        arena = torch.empty(total, dtype = torch.uint8, device = "cpu")
+    except (RuntimeError, MemoryError):
+        return None, f"the pristine host copy ({total / 1024**3:.2f} GB) could not be allocated"
+    keep = [arena]
+    if not on_host and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1":
+        # Pageable P still restores exactly, only synchronously.
+        try: keep.append(_Registered(arena, total))
+        except Exception: pass
+    entries = []
+    with torch.no_grad():
+        for module, W, offset in layout:
+            nbytes = W.numel() * W.element_size()
+            P = arena[offset:offset + nbytes].view(W.dtype).view(W.shape)
+            P.copy_(W.detach())
+            entries.append((module, W, P))
+    return (entries, keep), None
 pass
 
 
@@ -4963,7 +4998,7 @@ def _merged_rollout_refresh_pristine(state):
     for _, W, P in state.entries:
         sample_W.extend(_merged_rollout_sample(W))
         sample_P.extend(_merged_rollout_sample(P))
-    if torch.equal(torch.cat(sample_W), torch.cat(sample_P)): return False
+    if torch.equal(torch.cat(sample_W).cpu(), torch.cat(sample_P)): return False
     for _, W, P in state.entries: P.copy_(W)
     _merged_rollout_log_once(
         "Unsloth: the base weights were rewritten outside autograd (e.g. a vLLM weight reload); "
@@ -4973,16 +5008,68 @@ def _merged_rollout_refresh_pristine(state):
 pass
 
 
+_MERGED_ROLLOUT_FOLD_CHUNK_BYTES = 64 << 20
+
+
+def _merged_rollout_fold(W, module, adapter):
+    """W = round(W + s * B @ A) once: fp32 row chunks, because CUDA bf16 addmm rounds
+    s * B @ A to bf16 before adding W (two roundings)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    A = module.lora_A[adapter].weight.to(W.dtype).float()
+    B = module.lora_B[adapter].weight.to(W.dtype).float()
+    s = module.scaling[adapter]
+    rows = max(1, _MERGED_ROLLOUT_FOLD_CHUNK_BYTES // (4 * W.shape[1]))
+    for start in range(0, W.shape[0], rows):
+        part = W[start:start + rows]
+        part.copy_(torch.addmm(part.float(), B[start:start + rows], A, alpha = s))
+pass
+
+
+def _merged_rollout_device_module(device):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if device.type == "cpu": return None
+    module = getattr(torch, device.type, None)
+    if all(hasattr(module, name) for name in ("Stream", "current_stream", "stream")): return module
+    return None
+pass
+
+
+def _merged_rollout_copy_back(state):
+    """Streams P host -> W on a side stream; the current stream waits on it, the host does not.
+    A copy, never W -= s * B @ A, so the restore is bit exact."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    device = state.entries[0][1].device
+    module = _merged_rollout_device_module(device)
+    if module is None:
+        for _, W, P in state.entries: W.copy_(P)
+        return
+    if state.stream is None: state.stream = module.Stream(device = device)
+    current = module.current_stream(device)
+    state.stream.wait_stream(current)
+    with module.stream(state.stream):
+        for _, W, P in state.entries: W.copy_(P, non_blocking = True)
+    current.wait_stream(state.stream)
+pass
+
+
+def _merged_rollout_wait_restore(state):
+    # A fold on another thread's stream must not start before the last restore lands.
+    # All Unsloth Zoo code licensed under LGPLv3
+    if state.stream is None: return
+    device = state.entries[0][1].device
+    _merged_rollout_device_module(device).current_stream(device).wait_stream(state.stream)
+pass
+
+
 def _merged_rollout_restore(state):
-    """W.copy_(P), retried once (idempotent); two failures poison the state."""
+    """Copy W back from P, retried once (idempotent); two failures poison the state."""
     # All Unsloth Zoo code licensed under LGPLv3
     first_error = None
     for _ in range(2):
         try:
             _merged_rollout_synchronize(state)
             with torch.inference_mode():
-                for module, W, P in state.entries: W.copy_(P)
-            _merged_rollout_synchronize(state)
+                _merged_rollout_copy_back(state)
             state.record()
             break
         except BaseException as error:
@@ -5013,11 +5100,11 @@ def merged_rollout(state):
         try:
             if outermost:
                 with torch.inference_mode():
+                    _merged_rollout_wait_restore(state)
                     _merged_rollout_refresh_pristine(state)
+                    # W == P bit for bit here (restored, and sample-checked above).
                     for module, W, P in state.entries:
-                        A = module.lora_A[adapter].weight.to(W.dtype)
-                        B = module.lora_B[adapter].weight.to(W.dtype)
-                        torch.addmm(P, B, A, alpha = module.scaling[adapter], out = W)
+                        _merged_rollout_fold(W, module, adapter)
                 _merged_rollout_synchronize(state)
             yield
         finally:
@@ -5096,6 +5183,7 @@ def _merged_rollout_call(request, llm, call, cache_was_reset = False):
     pass
     if not cache_was_reset and not _reset_merged_rollout_prefix_cache(llm):
         return call(_merged_rollout_lora_fallback(request, "vLLM did not reset its prefix cache before the fold"))
+    llm._unsloth_merged_rollout_last = weakref.ref(state)
     try:
         with merged_rollout(state): return call(None)
     finally:
@@ -5141,7 +5229,10 @@ def _wrap_merged_rollout_call(bound, llm):
             position = None
             if not _merged_rollout_has_sentinel(request):
                 position = next((i for i, x in enumerate(args) if _merged_rollout_has_sentinel(x)), None)
-                if position is None: return bound(*args, **kwargs)
+                if position is None:
+                    last = getattr(llm, "_unsloth_merged_rollout_last", lambda: None)()
+                    if last is not None: _merged_rollout_wait_restore(last)
+                    return bound(*args, **kwargs)
                 request = args[position]
             def call(lora_request):
                 if position is None: return bound(*args, **{**kwargs, "lora_request": lora_request})
