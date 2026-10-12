@@ -8141,11 +8141,8 @@ def _audio_clip_limit_samples(processor):
 
 
 def _split_audio_past_the_window(messages, clips, processor):
-    """Give each clip longer than the processor keeps a placeholder per piece.
-
-    Pieces are near-equal rather than window-sized with a remainder, so none is
-    too short to frame. Returns its arguments when there is nothing to split.
-    """
+    """Split clips past the processor's limit into near-equal pieces (none too
+    short to frame), one placeholder each. Returns its arguments unchanged otherwise."""
     if not clips:
         return messages, clips
     limit = _audio_clip_limit_samples(processor)
@@ -8259,14 +8256,9 @@ _reported_cut_audio = set()
 
 
 def _assert_audio_runs_cover_their_clips(clips, processor):
-    """Reject clips a capped placeholder run cannot cover; warn where audio is cut.
-
-    Gemma 4 unified caps the run but keeps every frame, so the surplus is merged
-    into the next clip's positions; the batch's last clip has no next one. A cut
-    that keeps the row aligned is not refused: a row may validly ask about the
-    start of a clip. Only rows rendered by the dataset get here with a long
-    clip; message rows are split first.
-    """
+    """Refuse a long clip whose surplus frames would land on the next clip's
+    positions (Gemma 4 unified caps the run, keeps every frame); warn once on a
+    plain cut. Message rows are split before this."""
     if not any(clips or ()):
         return
     advice = "Split the clip, or give the row as messages."

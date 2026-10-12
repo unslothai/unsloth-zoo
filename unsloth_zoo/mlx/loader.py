@@ -4130,13 +4130,8 @@ def _encode_audio_clips_one_at_a_time(get_audio_features):
 
 
 def _ensure_qwen3_omni_audio_per_clip(model_type: str) -> None:
-    """Keep each clip's own audio when Qwen3-Omni encodes several at once.
-
-    mlx-vlm up to 0.7.4 masks the audio tower's chunks by clip index, which is
-    right for one clip only: a second clip's positions are filled from the
-    first clip's chunks. Encoding the clips one at a time gives each the output
-    it has alone. Patched by the tower's source, so a fixed mlx-vlm is left as is.
-    """
+    """mlx-vlm <= 0.7.4 masks audio chunks by clip index, so later clips read the
+    first clip's chunks; encode clips one at a time. Gated on the tower's source."""
     cls = _resolve_mlx_vlm_model_class(model_type)
     if cls is None or cls.__module__ != "mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe":
         return
