@@ -4058,11 +4058,32 @@ def _save_pretrained_argument(name, default, args, kwargs):
     return default
 
 
+def _stamp_fused_expert_lora_layout(peft_model, selected_adapters):
+    """Put the layout in `auto_mapping` too, which PEFT writes with the config itself: the
+    post-save marker write can fail, and a marker-less Unsloth adapter reads as pre-2026.9.6."""
+    try:
+        names = selected_adapters or list(peft_model.peft_config.keys())
+        for adapter_name in names:
+            auto_mapping = getattr(peft_model.peft_config.get(adapter_name), "auto_mapping", None)
+            if not isinstance(auto_mapping, dict):
+                continue
+            layout = (fused_expert_lora_layout(peft_model, adapter_name) or {}).get("lora_B_layout")
+            if layout is None:
+                auto_mapping.pop(FUSED_EXPERT_LORA_LAYOUT_KEY, None)
+            else:
+                auto_mapping[FUSED_EXPERT_LORA_LAYOUT_KEY] = layout
+    except Exception:
+        pass
+
+
 def _patched_peft_model_save_pretrained(self, save_directory, *args, **kwargs):
     """Add the fused expert layout marker to what PEFT saved. Never fails a save: the
     adapter itself is already on disk by the time this runs."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    _stamp_fused_expert_lora_layout(
+        self, _save_pretrained_argument("selected_adapters", None, args, kwargs),
+    )
     result = _original_peft_model_save_pretrained(self, save_directory, *args, **kwargs)
     if _save_pretrained_argument("is_main_process", True, args, kwargs):
         try:
@@ -4162,10 +4183,14 @@ def saved_lora_b_layouts(config) -> dict:
     marker = config.get(FUSED_EXPERT_LORA_LAYOUT_KEY)
     if marker in _LORA_B_LAYOUTS:
         return {name: marker for name in _SEPARATED_MOE_LORA_PARAMETER_NAMES}
-    if marker is None and config.get("target_parameters"):
-        auto_mapping = config.get("auto_mapping")
-        if isinstance(auto_mapping, dict) and auto_mapping.get("unsloth_fixed"):
-            return {None: LORA_B_LAYOUT_GROUPED_BY_EXPERT}
+    auto_mapping = config.get("auto_mapping")
+    if not isinstance(auto_mapping, dict):
+        return {}
+    marker = auto_mapping.get(FUSED_EXPERT_LORA_LAYOUT_KEY)
+    if marker in _LORA_B_LAYOUTS:
+        return {name: marker for name in _SEPARATED_MOE_LORA_PARAMETER_NAMES}
+    if config.get("target_parameters") and auto_mapping.get("unsloth_fixed"):
+        return {None: LORA_B_LAYOUT_GROUPED_BY_EXPERT}
     return {}
 
 
@@ -4206,15 +4231,31 @@ def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
     return converted
 
 
+def _has_fused_expert_lora(peft_model, adapter_name) -> bool:
+    return any(
+        getattr(module, "parameter_name", None) in _SEPARATED_MOE_LORA_PARAMETER_NAMES
+        and int(getattr(module, "num_experts", 1) or 1) > 1
+        and _wrapper_has_adapter(module, adapter_name)
+        for module in peft_model.modules()
+    )
+
+
 def _read_adapter_config(model_id, kwargs):
     subfolder = kwargs.get("subfolder") or ""
     path = os.path.join(str(model_id), subfolder, "adapter_config.json")
     if not os.path.isfile(path):
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download(
-            str(model_id), "adapter_config.json", subfolder = subfolder or None,
-            revision = kwargs.get("revision"), token = kwargs.get("token"),
-        )
+        # The Hub options PEFT was given (cache_dir, local_files_only, ...), so this finds
+        # the same file PEFT just loaded.
+        accepted = inspect.signature(hf_hub_download).parameters
+        download = {k: v for k, v in kwargs.items() if k in accepted}
+        if download.get("token") is None and kwargs.get("use_auth_token") is not None:
+            download["token"] = kwargs["use_auth_token"]
+        download.update(repo_id = str(model_id), filename = "adapter_config.json", subfolder = subfolder or None)
+        try:
+            path = hf_hub_download(**{**download, "local_files_only": True})
+        except Exception:
+            path = hf_hub_download(**download)
     with open(path, "r", encoding = "utf-8") as f:
         return json.load(f)
 
@@ -4226,7 +4267,7 @@ def _patched_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwar
     # This Unsloth Zoo code section is licensed under AGPL3
 
     result = _original_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs)
-    if os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT"):
+    if os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") or not _has_fused_expert_lora(self, adapter_name):
         return result
     try:
         converted = convert_legacy_lora_b(self, adapter_name, _read_adapter_config(model_id, kwargs))

@@ -64,7 +64,11 @@ def _delta(model):
 
 @pytest.fixture
 def patched_load(monkeypatch):
-    monkeypatch.setattr(PeftModel, "load_adapter", PeftModel.load_adapter)
+    # Unwrap any copy installed at import (the compiled cache's), so this module's own runs.
+    original = PeftModel.load_adapter
+    while hasattr(original, "__wrapped__"):
+        original = original.__wrapped__
+    monkeypatch.setattr(PeftModel, "load_adapter", original)
     monkeypatch.setattr(MU, "_original_peft_model_load_adapter", None)
     monkeypatch.delenv("UNSLOTH_MOE_LORA_B_LAYOUT", raising = False)
     assert MU._patch_peft_load_adapter_for_moe_layout()
@@ -170,3 +174,54 @@ def test_inference_is_limited_to_families_the_old_forward_owned():
     class OlmoeLikeExperts(torch.nn.Module):
         pass
     assert MU._experts_family(OlmoeLikeExperts()) not in MU._LEGACY_GROUPED_LORA_B_FAMILIES
+
+
+def test_adapter_without_fused_experts_never_reads_its_config(tmp_path, patched_load, monkeypatch):
+    model = get_peft_model(_base(), LoraConfig(r = R, target_modules = ["q_proj"]))
+    model.save_pretrained(str(tmp_path))
+
+    reads = []
+    monkeypatch.setattr(MU, "_read_adapter_config", lambda *args: reads.append(args) or {})
+    PeftModel.from_pretrained(_base(), str(tmp_path))
+    assert reads == []
+
+
+def test_current_save_with_a_failed_marker_write_is_not_mistaken_for_legacy(tmp_path, patched_load, monkeypatch):
+    model = get_peft_model(_base(), LoraConfig(r = R, lora_alpha = 2 * R, target_parameters = EXPERTS, task_type = "CAUSAL_LM"))
+    model.peft_config["default"].auto_mapping = {"base_model_class": "Qwen3MoeForCausalLM", "unsloth_fixed": True}
+    g = torch.Generator().manual_seed(2)
+    for name, p in model.named_parameters():
+        if "lora_B" in name:
+            with torch.no_grad():
+                p.copy_(torch.randn(p.shape, generator = g))
+    expected_B = _expert_lora_B(model)
+    monkeypatch.setattr(PeftModel, "save_pretrained", PeftModel.save_pretrained)
+    assert MU._patch_peft_save_pretrained_for_moe_layout()
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+    monkeypatch.setattr(MU, "write_fused_expert_lora_layout", fail)
+    model.save_pretrained(str(tmp_path))
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert MU.FUSED_EXPERT_LORA_LAYOUT_KEY not in config
+    assert config["auto_mapping"][MU.FUSED_EXPERT_LORA_LAYOUT_KEY] == MU.LORA_B_LAYOUT_RANK_MAJOR
+    loaded = PeftModel.from_pretrained(_base(), str(tmp_path))
+    for name, value in _expert_lora_B(loaded).items():
+        assert torch.equal(value, expected_B[name]), name
+
+
+def test_hub_reread_uses_the_options_peft_was_given(monkeypatch):
+    import huggingface_hub
+    calls = []
+
+    def fake_download(repo_id, filename, subfolder = None, revision = None, cache_dir = None,
+                      token = None, local_files_only = False):
+        calls.append(dict(cache_dir = cache_dir, revision = revision, token = token))
+        raise FileNotFoundError
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    with pytest.raises(FileNotFoundError):
+        MU._read_adapter_config("org/legacy-adapter", {
+            "cache_dir": "/custom/cache", "revision": "abc", "use_auth_token": "hf_x", "is_trainable": True,
+        })
+    assert calls[-1]["cache_dir"] == "/custom/cache" and calls[-1]["revision"] == "abc"
+    assert calls[-1]["token"] == "hf_x" and "is_trainable" not in calls[-1]
