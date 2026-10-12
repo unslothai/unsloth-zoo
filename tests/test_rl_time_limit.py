@@ -262,6 +262,32 @@ def test_catch_all_strategy_still_returns_and_raises(tmp_path, monkeypatch):
     assert helper.poll() is not None
 
 
+def test_catch_all_instances_keep_separate_globals(tmp_path, monkeypatch):
+    from unsloth_zoo.rl_environments import create_locked_down_function
+
+    (tmp_path / "rl_count.py").write_text(textwrap.dedent("""
+        from unsloth_zoo.rl_environments import execute_with_time_limit
+
+        @execute_with_time_limit(5)
+        def call(strategy):
+            return strategy()
+    """))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    from rl_count import call
+
+    source = (
+        "def counter():\n"
+        "    global n\n"
+        "    try:\n"
+        "        n = n + 1\n"
+        "    except:\n"
+        "        n = 1\n"
+        "    return n\n"
+    )
+    first, second = create_locked_down_function(source), create_locked_down_function(source)
+    assert [call(first), call(first), call(second), call(first)] == [1, 2, 1, 3]
+
+
 @pytest.mark.parametrize("handler", ["except Exception:", "except (ValueError, IndexError) as e:", "except KeyError:"])
 def test_ordinary_strategy_stays_in_process(handler):
     from unsloth_zoo.rl_environments import create_locked_down_function

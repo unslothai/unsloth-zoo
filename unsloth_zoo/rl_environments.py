@@ -37,6 +37,7 @@ import builtins as _py_builtins
 import unicodedata
 import os, gc, time, statistics
 import collections
+import itertools
 import numpy as np
 import signal
 import contextlib
@@ -926,7 +927,8 @@ def create_locked_down_function(function, *, builtins_policy: str = "allowlist")
     locked.__kwdefaults__ = f.__kwdefaults__
     # Full builtins can reach signal itself, so only a separate process bounds them.
     if builtins_policy == "full" or _catches_everything(ast.parse(function)):
-        locked._unsloth_catch_all = (function, builtins_policy)
+        # The id keeps each instance's globals separate in the helper, as they are in-process.
+        locked._unsloth_catch_all = (function, builtins_policy, next(_catch_all_ids))
     return locked
 pass
 
@@ -1159,24 +1161,28 @@ spec.loader.exec_module(module)
 module._catch_all_helper_main(Connection(int(sys.argv[2]), writable = False), Connection(int(sys.argv[3]), readable = False))
 """
 
+_catch_all_ids = itertools.count()
+
 # (process, request connection, reply connection, owner pid), reused across calls and
 # replaced only after a timeout kills it.
 _catch_all_helper = None
 
 def _catch_all_helper_main(requests_conn, replies_conn):
     replies_conn.send(None)  # ready: imports done, so the first call is not charged for them
-    compiled = {}
+    compiled = collections.OrderedDict()
     while True:
         try:
-            source, policy, args, kwargs = requests_conn.recv()
+            (source, policy, key), args, kwargs = requests_conn.recv()
         except (EOFError, OSError):
             return
         try:
-            fn = compiled.get((source, policy))
+            fn = compiled.get(key)
             if fn is None:
                 if len(compiled) >= 256:
-                    compiled.clear()
-                fn = compiled[(source, policy)] = create_locked_down_function(source, builtins_policy = policy)
+                    compiled.popitem(last = False)
+                fn = compiled[key] = create_locked_down_function(source, builtins_policy = policy)
+            else:
+                compiled.move_to_end(key)
             reply = (True, fn(*args, **kwargs))
         except BaseException as e:
             reply = (False, e)
@@ -1230,7 +1236,6 @@ def _ensure_catch_all_helper():
 pass
 
 def _call_in_catch_all_helper(fn, deadline, seconds, args, kwargs):
-    source, policy = fn._unsloth_catch_all
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError(f"Timed out after {seconds:g}s")
@@ -1238,7 +1243,7 @@ def _call_in_catch_all_helper(fn, deadline, seconds, args, kwargs):
         if not _ensure_catch_all_helper():
             raise RuntimeError("Unsloth: could not start the strategy helper process")
         _, requests_conn, replies_conn, _ = _catch_all_helper
-        requests_conn.send((source, policy, args, kwargs))
+        requests_conn.send((fn._unsloth_catch_all, args, kwargs))
         if not replies_conn.poll(max(deadline - time.monotonic(), 0.0)):
             raise TimeoutError(f"Timed out after {seconds:g}s")
         ok, value = replies_conn.recv()
