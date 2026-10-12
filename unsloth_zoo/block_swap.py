@@ -70,11 +70,21 @@ def _pow2_ceil(n):
     return 1 << max(0, (int(n) - 1).bit_length())
 
 
+def _local_world_size():
+    # Ranks on this host (torchrun / accelerate set LOCAL_WORLD_SIZE); each pins its own copy.
+    try:
+        return max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+    except ValueError:
+        return 1
+
+
 def _pin_budget():
+    # Split across the ranks on this host: each reads the same free RAM, and would otherwise claim all of it.
     try:
         import psutil
         vm = psutil.virtual_memory()
-        return vm.available - max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+        spare = vm.available - max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+        return spare // _local_world_size()
     except Exception:
         return 0
 
