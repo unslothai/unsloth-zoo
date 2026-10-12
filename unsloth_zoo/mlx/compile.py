@@ -4597,8 +4597,7 @@ def _install_ernie4_5_moe_vl_compile_patches():
     _PATCHED_ARCHES.add("ernie4_5_moe_vl")
 
 
-# glm4v_moe ships glm4v's tower under other class names; its attention already
-# builds the block mask from host values, so only glm4v's is replaced.
+# glm4v_moe's attention already builds its block mask from host values.
 _GLM4V_COMPILE_FAMILIES = {
     "glm4v": ("Glm4vVisionRotaryEmbedding", "Glm4vVisionAttention"),
     "glm4v_moe": ("Glm4vMoeVisionRotaryEmbedding", None),
@@ -4606,11 +4605,7 @@ _GLM4V_COMPILE_FAMILIES = {
 
 
 def _install_glm4v_family_compile_patches(arch):
-    """Install compile-safe glm4v / glm4v_moe vision and embedding patches.
-
-    The tower reads the grid on the host and reduces the same array with
-    `mx.max`; the merge counts placeholders per row on the device.
-    """
+    """Compile-safe glm4v / glm4v_moe tower, merge and embedder (grid as host tuples)."""
 
     module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
     vision_module = _try_import_module(f"mlx_vlm.models.{arch}.vision")
@@ -4659,7 +4654,7 @@ def _install_glm4v_family_compile_patches(arch):
         rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_spec)
 
         cu_seqlens = _build_cu_seqlens(grid_spec)
-        # A tuple, not a list, so the embeddings keep the lengths on the host.
+        # A tuple keeps the lengths on the host inside the embeddings.
         seqlens = tuple(end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]))
         hidden_states = self.embeddings(
             hidden_states, seqlens, grid_spec, image_type_ids[:, 0], image_type_ids[:, 1]
@@ -4689,9 +4684,7 @@ def _install_glm4v_family_compile_patches(arch):
         k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
         q, k, v = (tensor.transpose(0, 2, 1, 3) for tensor in (q, k, v))
 
-        # Upstream splits at its first two boundaries only, which leaves empty
-        # segments for one or two images; an empty segment crashes the compiled
-        # attention kernel, so those are dropped and the rest kept as upstream has them.
+        # Upstream's first-two-boundary split, minus the empty segments that crash compiled SDPA.
         lengths = [end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])]
         split_points = sorted(
             {point for point in (lengths[0], sum(lengths[:2])) if 0 < point < seq_length}
@@ -4720,8 +4713,7 @@ def _install_glm4v_family_compile_patches(arch):
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         cached = kwargs.get("cached_image_features", None)
-        # glm4v's upstream splits the tower output and concatenates it straight
-        # back, which returns the same rows.
+        # Upstream's split + concatenate of the tower output is the identity.
         hidden_states = (
             cached
             if cached is not None
@@ -4752,12 +4744,7 @@ def _install_glm4v_family_compile_patches(arch):
 
 
 def _install_glm5_next_compile_patches():
-    """Install compile-safe glm5_next vision patches.
-
-    Its tower reads the grid on the host (`grid_thw.tolist()`) and then reduces
-    the same array with `mx.max`, so neither form of the argument survives a
-    trace. These replacements take the grid as Python tuples throughout.
-    """
+    """Compile-safe glm5_next tower, video grid and merge (grid as host tuples)."""
 
     module = _try_import_module("mlx_vlm.models.glm5_next.glm5_next")
     vision_module = _try_import_module("mlx_vlm.models.glm5_next.vision")
@@ -4807,16 +4794,13 @@ def _install_glm5_next_compile_patches():
         return self.merger(hidden_states)
 
     def patched_video_grid(self, video_grid_thw):
-        # Python rows rather than upstream's array: the tower below reads them
-        # back, and the array's dtype came from a grid that is now a tuple.
+        # Host rows, not upstream's array: the patched tower reads them back.
         flattened = []
         for t, h, w in _grid_to_tuple(video_grid_thw):
             flattened.extend([(1, h, w)] * t)
         return tuple(flattened)
 
     def patched_replace_features(inputs_embeds, positions, features, label):
-        # Upstream slices the features row by row off a host count; the
-        # cumulative-sum index needs no host value.
         del label
         _raise_on_feature_count_mismatch(positions, features, inputs_embeds)
         merged, _ = _merge_sequence_mask_features(
