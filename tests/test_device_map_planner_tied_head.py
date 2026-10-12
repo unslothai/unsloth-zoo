@@ -120,3 +120,31 @@ def test_multimodal_tied_head_sized_from_text_config(tied):
 
     meta, quantizer, _ = planner.build_meta_model("org/unused", config = config, dtype = torch.bfloat16)
     assert planner._compute_module_sizes(meta, quantizer)[""] == true_total
+
+
+def test_outer_config_untie_keeps_the_head_charged():
+    """Outer tie_word_embeddings = False with a tied text config (Qwen2.5-Omni Thinker shape): the head
+    stays charged, so the plan can only overestimate, never drop a resident head."""
+    from transformers import AutoModelForImageTextToText, Gemma3Config
+    config = Gemma3Config(
+        text_config = dict(
+            vocab_size = 512, hidden_size = 64, intermediate_size = 128, num_hidden_layers = 2,
+            num_attention_heads = 2, num_key_value_heads = 1, head_dim = 32,
+        ),
+        vision_config = dict(
+            hidden_size = 64, intermediate_size = 128, num_hidden_layers = 2, num_attention_heads = 2,
+            image_size = 32, patch_size = 16,
+        ),
+        mm_tokens_per_image = 4,
+        tie_word_embeddings = False,
+    )
+    config.text_config.tie_word_embeddings = True
+    real = AutoModelForImageTextToText.from_config(config, torch_dtype = torch.bfloat16)
+    head = real.get_output_embeddings().weight
+    tensors = {id(t): t for t in list(real.parameters()) + list(real.buffers())}
+    unique_total = sum(t.numel() * t.element_size() for t in tensors.values())
+    head_bytes = head.numel() * head.element_size()
+    charged_total = unique_total + (head_bytes if head is real.get_input_embeddings().weight else 0)
+
+    meta, quantizer, _ = planner.build_meta_model("org/unused", config = config, dtype = torch.bfloat16)
+    assert planner._compute_module_sizes(meta, quantizer)[""] == charged_total

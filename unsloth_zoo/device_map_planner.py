@@ -786,7 +786,13 @@ def _drop_tied_head_bytes(model: nn.Module, sizes: dict[str, int]) -> dict[str, 
     head and an already deduplicated table are left alone.
     """
     head_name, head = resolve_output_head(model)
-    if not head_name or head is None or not head_is_tied(model, head):
+    if not head_name or head is None:
+        return sizes
+    # Any explicit False wins: a composite model's outer config can untie a head its text config
+    # marks tied (Qwen2.5-Omni Thinker), and dropping a resident head would underestimate.
+    cfg = _config_attr(model, "config")
+    flags = [_config_attr(h, "tie_word_embeddings") for h in (cfg, _config_attr(cfg, "text_config"))]
+    if any(f is False for f in flags) or not any(f is True for f in flags):
         return sizes
     getter = getattr(model, "get_input_embeddings", None)
     try:
