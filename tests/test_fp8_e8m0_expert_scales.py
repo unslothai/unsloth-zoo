@@ -144,3 +144,35 @@ def test_per_expert_fallback_agrees_with_the_vectorized_dequant(e8m0):
     for e in range(2):
         got = F._dequantize_expert_slice(q[e], s[e], torch.float32, quant_kind = "weight_scale_inv")
         assert torch.equal(got, want[e])
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks = needs_cuda)])
+@pytest.mark.parametrize("scale", [1e-8, 1e-7])
+@pytest.mark.parametrize("batched, scale_shape", [
+    (False, (1,)),
+    (False, (2, 1)),
+    (False, (4, 1)),
+    (False, (1, 2)),
+    (True, (1,)),
+    (True, (2, 1, 1)),
+    (True, (2, 1, 2)),
+    (True, (2, 1)),
+    (True, (2, 2)),
+    (True, (2, 4)),
+    (True, (2,)),
+    (True, (4,)),
+])
+def test_fp16_dequant_preserves_small_scales_and_input_gradients(device, scale, batched, scale_shape):
+    q = torch.full((2, 2, 4) if batched else (2, 4), 448.0, device = device).to(torch.float8_e4m3fn)
+    s = torch.full(scale_shape, scale, dtype = torch.float32, device = device)
+    dequant = F._dequantize_full_expert_weights_vectorized if batched else F._dequantize_expert_slice
+    got = dequant(q, s, torch.float16)
+    want = (q.float() * scale).half()
+    torch.testing.assert_close(got, want, rtol = 0, atol = 0)
+
+    x = torch.ones((1, 2), device = device, dtype = torch.float16, requires_grad = True)
+    ref_x = x.detach().clone().requires_grad_()
+    (x @ (got[0] if batched else got)).sum().backward()
+    (ref_x @ (want[0] if batched else want)).sum().backward()
+    assert torch.count_nonzero(ref_x.grad) == ref_x.numel()
+    torch.testing.assert_close(x.grad, ref_x.grad, rtol = 0, atol = 0)
