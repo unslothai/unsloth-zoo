@@ -266,9 +266,7 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
         else:
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
-        # Expand block scales (E, p, q) -> (E, p*bm, q*bn), trimmed to (E, M, N), a few experts at a
-        # time into one preallocated result: the whole-stack version held the converted weight, the
-        # expanded scale and the result at once (3x the dequantized size).
+        # Chunk over experts: whole-stack expansion peaked at 3x the dequantized size.
         del w
         out = torch.empty((E, M, N), dtype=target_dtype, device=weight.device)
         per_expert = M * N * out.element_size()
@@ -323,8 +321,7 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
         from unsloth.kernels.fp8 import _fp8_kernel_unsupported
     except ImportError:
         _fp8_kernel_unsupported = None
-    # The kernel loads fp8e4nv, which triton cannot compile on pre-sm89 CUDA or on ROCm archs
-    # without OCP fp8 (gfx90a, gfx11xx): let the torch fallback in the caller dequantize instead.
+    # fp8e4nv does not compile on pre-sm89 CUDA or ROCm without OCP fp8 (gfx90a, gfx11xx).
     if _fp8_kernel_unsupported is not None and _fp8_kernel_unsupported(weight):
         return None
 

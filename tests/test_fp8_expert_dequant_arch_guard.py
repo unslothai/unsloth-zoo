@@ -14,16 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FP8 MoE expert dequant must not launch the fp8e4nv Triton kernel on a GPU
-that cannot compile it.
-
-unsloth.kernels.fp8.weight_dequant_block loads float8_e4m3fn (triton fp8e4nv).
-Triton rejects that dtype on pre-sm89 CUDA and on ROCm archs without OCP fp8
-(gfx90a, gfx11xx such as Strix Halo gfx1151), and ROCm reports a gfx-derived
-capability (gfx1151 -> 11.5), so transformers keeps the fp8 weights there. The
-unsloth helper must consult unsloth's own guard and decline, so the caller's
-vectorized torch fallback dequantizes with identical values.
-"""
+"""FP8 expert dequant must skip the fp8e4nv Triton kernel on pre-sm89 CUDA and ROCm
+without OCP fp8 (gfx1151 reports capability 11.5), falling back to torch dequant."""
 
 from __future__ import annotations
 
@@ -65,7 +57,6 @@ def test_unsupported_device_declines_and_fallback_dequantizes(monkeypatch):
 
     out = F._dequantize_full_expert_weights(w, s, torch.bfloat16)
     assert out is not None
-    # Exactly the existing vectorized fallback, and the right values to bf16 precision.
     assert torch.equal(out, F._dequantize_full_expert_weights_vectorized(w, s, torch.bfloat16))
     ref = w.float() * s.repeat_interleave(128, 1).repeat_interleave(128, 2)
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
@@ -102,8 +93,7 @@ def test_vectorized_block_dequant_in_chunks_matches_one_shot(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA for the peak memory check")
 def test_vectorized_block_dequant_peak_stays_near_the_result(monkeypatch):
-    # The guarded GPUs land here: the whole-stack version peaked at about 3x the result
-    # (converted weight + expanded scale + result).
+    # Whole-stack version peaked at ~3x the result size.
     w, s = _block_scaled(32, 1024, 1024, "cuda")
     monkeypatch.setattr(F, "_VECTORIZED_DEQUANT_CHUNK_BYTES", 4 * 1024 * 1024 * 2)
     result_bytes = 32 * 1024 * 1024 * 2
