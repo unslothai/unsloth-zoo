@@ -952,6 +952,18 @@ class _TimeLimitExceeded(BaseException):
     # first TimeoutError but not this. time_limit turns it into TimeoutError.
     pass
 
+def _timeout_unwinding():
+    # True while a timeout is still running finally / except / __exit__ blocks
+    # on its way out: re-fires must not cut that cleanup short.
+    exc = sys.exc_info()[1]
+    for _ in range(32):
+        if exc is None:
+            return False
+        if isinstance(exc, (TimeoutError, _TimeLimitExceeded)):
+            return True
+        exc = exc.__context__
+    return False
+
 @contextmanager
 def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
     """
@@ -993,6 +1005,8 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
         if frame is not None and frame.f_code in _CONTEXTMANAGER_FRAMES:
             return
         if fired:
+            if _timeout_unwinding():
+                return
             raise _TimeLimitExceeded()
         fired = True
         # include the intended arming deadline for debugging

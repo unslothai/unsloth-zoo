@@ -131,6 +131,25 @@ def test_state_restored_after_repeated_swallowed_timeouts():
     _run(SWALLOW_ONCE, repeats = 5)
 
 
+def test_cleanup_after_timeout_runs_to_completion():
+    from unsloth_zoo.rl_environments import time_limit
+    import time
+
+    done = []
+    with pytest.raises(TimeoutError):
+        with time_limit(0.05):
+            try:
+                while True:
+                    pass
+            finally:
+                end = time.monotonic() + 0.2  # several re-fire periods
+                while time.monotonic() < end:
+                    pass
+                done.append(True)
+    assert done == [True]
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
 def test_fast_body_unchanged():
     from unsloth_zoo.rl_environments import execute_with_time_limit, time_limit
 
