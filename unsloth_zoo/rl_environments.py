@@ -1137,7 +1137,6 @@ _NARROW_EXCEPTIONS = frozenset(
 )
 
 def _catches_everything(tree):
-    # Conservative: anything not provably unable to absorb the re-fires counts.
     bound = _bound_names(tree)[0]
     for node in ast.walk(tree):
         if isinstance(node, ast.ExceptHandler):
@@ -1152,8 +1151,7 @@ def _catches_everything(tree):
     return False
 pass
 
-# Runs in a fresh interpreter: loads only this file, so the helper neither copies the
-# training process (forking one holding a model costs ~100 ms each way) nor pins its pages.
+# A fresh interpreter, not a fork: forking a process holding a model costs ~100 ms each way and pins its pages.
 _CATCH_ALL_HELPER = """
 import importlib.util, sys
 from multiprocessing.connection import Connection
@@ -1174,12 +1172,10 @@ def _runs_in_helper(value):
     )
 pass
 
-# (process, request connection, reply connection, owner pid), reused across calls and
-# replaced only after a timeout kills it.
+# (process, request conn, reply conn, owner pid); replaced only after a timeout kills it.
 _catch_all_helper = None
 
-# The helper runs untrusted code and can write any bytes to the reply pipe, so the parent
-# only rebuilds plain data and builtin exceptions: pickle's "Restricting Globals" recipe.
+# The helper can write any bytes to the reply pipe: rebuild only plain data (pickle's "Restricting Globals").
 _INERT_GLOBALS = _NARROW_EXCEPTIONS | {"complex", "set", "frozenset", "bytearray", "range", "slice"}
 
 class _InertUnpickler(pickle.Unpickler):
@@ -1294,8 +1290,7 @@ def _stop_generated_code_at_deadline(value, deadline, seconds):
     # Generated code can swallow the TimeoutError raised inside it; re-raise it in the caller.
     if not (isinstance(value, types.FunctionType) and value.__code__.co_filename == "<user_code>"):
         return value
-    # A bare except / except BaseException can absorb every in-process signal, so
-    # that code runs in a helper process the deadline can kill (in-process if none started).
+    # Code that may absorb any exception runs in the killable helper (in-process if none started).
     if _runs_in_helper(value) and _catch_all_helper is not None:
         @wraps(value)
         def in_helper(*args, **kwargs):
