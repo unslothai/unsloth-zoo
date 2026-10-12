@@ -109,7 +109,6 @@ def test_ast_rewriter_matches_keyword_form():
     assert cap.logits_name == "logits"
     assert "unsloth_fused_lm_head_loss" in new_src
     assert "EMPTY_LOGITS" in new_src
-    # The guard reads the callable; only the materialized-logits branch calls it.
     assert sum(
         isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         and node.func.attr == "loss_function"
@@ -450,7 +449,6 @@ def test_rewritten_forward_tracks_runtime_custom_loss(
 
     if wrapped:
         custom_loss = functools.wraps(ForCausalLMLoss)(custom_loss)
-    # One installed instance must re-check the callable after each replacement.
     for loss_function in (ForCausalLMLoss, custom_loss, ForCausalLMLoss):
         model.loss_function = loss_function
         actual, logits = model.forward(hidden, labels = labels, num_items_in_batch = 13)

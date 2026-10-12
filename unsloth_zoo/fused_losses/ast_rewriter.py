@@ -648,10 +648,8 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
-    # Check the current loss on every call: it can be replaced after installation.
-    # A custom loss or UNSLOTH_RETURN_LOGITS=1 runs the full lm_head matmul once and
-    # routes loss through self.loss_function on those logits (avoids the double
-    # matmul of fused-kernel + separate logits_rhs).
+    # The loss is re-checked per call (it can be swapped after install); a custom one or
+    # UNSLOTH_RETURN_LOGITS=1 runs lm_head once and calls self.loss_function on those logits.
     if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
         scale_extra += f", logit_scale_multiply={ast.unparse(cap.guarded_scale_expr)}"
     if cap.softcap_expr is not None and "logit_softcapping" not in already:

@@ -155,9 +155,7 @@ def test_compiled_patched_loss_fuses_inside_dynamo():
         def custom(*args, **kwargs):
             return 3 * patched(*args, **kwargs)
 
-        # Dynamo traces the torch.compile wrapper as the raw function, so the guard
-        # must still see the patched loss as fusable inside a compiled forward
-        # (torch 2.6 graph-breaks on the getattr instead; the value must hold either way).
+        # Dynamo traces the compile wrapper as the raw function (torch 2.6 graph-breaks instead).
         for loss_function, expected in ((patched, True), (lu.ForCausalLMLoss, True), (custom, False)):
             torch._dynamo.reset()
             traced = torch.compile(lambda x: x * 2 if _can_fuse_loss(loss_function) else x * 3, backend = "eager")
