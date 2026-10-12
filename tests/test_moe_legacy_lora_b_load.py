@@ -251,3 +251,11 @@ def test_mixed_layouts_survive_in_the_auto_mapping_copy():
     assert MU.saved_lora_b_layouts(config) == {
         "gate_up_proj": MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT, "down_proj": MU.LORA_B_LAYOUT_RANK_MAJOR,
     }
+
+
+def test_merged_lora_mode_is_not_inferred_as_grouped(monkeypatch):
+    config = {"target_parameters": EXPERTS, "auto_mapping": {"unsloth_fixed": True}}
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_MERGED", "1")
+    assert MU.saved_lora_b_layouts(config) == {}
+    monkeypatch.delenv("UNSLOTH_MOE_LORA_MERGED")
+    assert MU.saved_lora_b_layouts(config) == {None: MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT}

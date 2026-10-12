@@ -4195,7 +4195,9 @@ def saved_lora_b_layouts(config) -> dict:
         declared = _declared_lora_b_layouts(source)
         if declared is not None:
             return declared
-    if config.get("target_parameters") and auto_mapping.get("unsloth_fixed"):
+    # UNSLOTH_MOE_LORA_MERGED=1 trained on PEFT's own forward (rank_major); a process
+    # still set that way most likely loads such an adapter.
+    if config.get("target_parameters") and auto_mapping.get("unsloth_fixed") and _should_use_separated_lora():
         return {None: LORA_B_LAYOUT_GROUPED_BY_EXPERT}
     return {}
 
