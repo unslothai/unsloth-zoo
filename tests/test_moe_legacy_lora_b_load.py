@@ -204,7 +204,7 @@ def test_current_save_with_a_failed_marker_write_is_not_mistaken_for_legacy(tmp_
     model.save_pretrained(str(tmp_path))
     config = json.loads((tmp_path / "adapter_config.json").read_text())
     assert MU.FUSED_EXPERT_LORA_LAYOUT_KEY not in config
-    assert config["auto_mapping"][MU.FUSED_EXPERT_LORA_LAYOUT_KEY] == MU.LORA_B_LAYOUT_RANK_MAJOR
+    assert config["auto_mapping"][MU.FUSED_EXPERT_LORA_DETAIL_KEY]["lora_B_layout"] == MU.LORA_B_LAYOUT_RANK_MAJOR
     loaded = PeftModel.from_pretrained(_base(), str(tmp_path))
     for name, value in _expert_lora_B(loaded).items():
         assert torch.equal(value, expected_B[name]), name
@@ -240,3 +240,14 @@ def test_offloaded_lora_b_is_refused_not_half_repacked(tmp_path, patched_load, m
         MU.convert_legacy_lora_b(loaded, "default", config)
     for m in wrappers[1:]:
         assert torch.equal(m.lora_B["default"].weight, before[id(m)])
+
+
+def test_mixed_layouts_survive_in_the_auto_mapping_copy():
+    detail = {"parameters": {
+        "gate_up_proj": {"lora_B_layout": MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT, "num_experts": E},
+        "down_proj": {"lora_B_layout": MU.LORA_B_LAYOUT_RANK_MAJOR, "num_experts": E},
+    }}
+    config = {"target_parameters": EXPERTS, "auto_mapping": {"unsloth_fixed": True, MU.FUSED_EXPERT_LORA_DETAIL_KEY: detail}}
+    assert MU.saved_lora_b_layouts(config) == {
+        "gate_up_proj": MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT, "down_proj": MU.LORA_B_LAYOUT_RANK_MAJOR,
+    }

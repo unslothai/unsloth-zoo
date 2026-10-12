@@ -4067,11 +4067,11 @@ def _stamp_fused_expert_lora_layout(peft_model, selected_adapters):
             auto_mapping = getattr(peft_model.peft_config.get(adapter_name), "auto_mapping", None)
             if not isinstance(auto_mapping, dict):
                 continue
-            layout = (fused_expert_lora_layout(peft_model, adapter_name) or {}).get("lora_B_layout")
-            if layout is None:
-                auto_mapping.pop(FUSED_EXPERT_LORA_LAYOUT_KEY, None)
-            else:
-                auto_mapping[FUSED_EXPERT_LORA_LAYOUT_KEY] = layout
+            detail = fused_expert_lora_layout(peft_model, adapter_name)
+            auto_mapping.pop(FUSED_EXPERT_LORA_LAYOUT_KEY, None)
+            auto_mapping.pop(FUSED_EXPERT_LORA_DETAIL_KEY, None)
+            if detail is not None:
+                auto_mapping[FUSED_EXPERT_LORA_DETAIL_KEY] = detail
     except Exception:
         pass
 
@@ -4168,28 +4168,33 @@ def _experts_family(module):
     return None
 
 
-def saved_lora_b_layouts(config) -> dict:
-    """{parameter_name: layout} from the #1232 marker, else {None: grouped_by_expert} for a
-    marker-less Unsloth save (`unsloth_fixed`) with fused expert targets: Unsloth only wrote
-    `target_parameters` from #450 (2026-02-05), so that is the 2026.9.5-or-older window."""
-    if not isinstance(config, dict):
-        return {}
-    detail = config.get(FUSED_EXPERT_LORA_DETAIL_KEY)
+def _declared_lora_b_layouts(source) -> Optional[dict]:
+    detail = source.get(FUSED_EXPERT_LORA_DETAIL_KEY)
     if isinstance(detail, dict) and isinstance(detail.get("parameters"), dict):
         return {
             name: entry.get("lora_B_layout")
             for name, entry in detail["parameters"].items()
             if isinstance(entry, dict) and entry.get("lora_B_layout") in _LORA_B_LAYOUTS
         }
-    marker = config.get(FUSED_EXPERT_LORA_LAYOUT_KEY)
+    marker = source.get(FUSED_EXPERT_LORA_LAYOUT_KEY)
     if marker in _LORA_B_LAYOUTS:
         return {name: marker for name in _SEPARATED_MOE_LORA_PARAMETER_NAMES}
-    auto_mapping = config.get("auto_mapping")
-    if not isinstance(auto_mapping, dict):
+    return None
+
+
+def saved_lora_b_layouts(config) -> dict:
+    """{parameter_name: layout} from the #1232 marker (top level, or the copy in
+    `auto_mapping`), else {None: grouped_by_expert} for a marker-less Unsloth save
+    (`unsloth_fixed`) with fused expert targets: Unsloth only wrote `target_parameters`
+    from #450 (2026-02-05), so that is the 2026.9.5-or-older window."""
+    if not isinstance(config, dict):
         return {}
-    marker = auto_mapping.get(FUSED_EXPERT_LORA_LAYOUT_KEY)
-    if marker in _LORA_B_LAYOUTS:
-        return {name: marker for name in _SEPARATED_MOE_LORA_PARAMETER_NAMES}
+    auto_mapping = config.get("auto_mapping")
+    auto_mapping = auto_mapping if isinstance(auto_mapping, dict) else {}
+    for source in (config, auto_mapping):
+        declared = _declared_lora_b_layouts(source)
+        if declared is not None:
+            return declared
     if config.get("target_parameters") and auto_mapping.get("unsloth_fixed"):
         return {None: LORA_B_LAYOUT_GROUPED_BY_EXPERT}
     return {}
