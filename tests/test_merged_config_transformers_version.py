@@ -52,7 +52,7 @@ def _write(path, version):
     return path
 
 
-@pytest.mark.parametrize("version", ["4.57.3", "4.57.3.dev0", "4.57.6", "5.0.0.dev0", "5.17.0"])
+@pytest.mark.parametrize("version", ["4.57.2.post1", "4.57.3", "4.57.3.dev0", "4.57.6", "5.0.0.dev0", "5.17.0"])
 def test_version_without_the_4_57_2_crash_is_kept(tmp_path, version):
     path = _write(tmp_path / "config.json", version)
     _remove_transformers_version(path)
