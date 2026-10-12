@@ -225,6 +225,18 @@ def _config_declared_pad(inner, cfg, eos_token, eos_token_ids, vocab_size):
     return candidate
 
 
+def _encoder_decoder_pads_with_eos(cfg, vocab_size):
+    """True when an encoder-decoder config itself declares a valid pad_token_id equal to its own EOS."""
+    if cfg is None or not getattr(cfg, "is_encoder_decoder", False):
+        return False
+    pad_token_id = getattr(cfg, "pad_token_id", None)
+    if type(pad_token_id) is not int or pad_token_id < 0:
+        return False
+    if vocab_size is not None and pad_token_id >= vocab_size:
+        return False
+    return pad_token_id in _eos_id_set(getattr(cfg, "eos_token_id", None))
+
+
 def _single_token_id(inner, token, vocab_size, eos_token_ids=frozenset()):
     """Return token's id if it encodes to exactly one in-vocab, non-EOS id, else None."""
     try:
@@ -286,6 +298,18 @@ def _unk_fallback(inner, eos_token, vocab_size, eos_token_ids=frozenset()):
     if _single_token_id(inner, unk, vocab_size, eos_token_ids) is not None:
         return unk
     return None
+
+
+def _fits_embedding_rows(model, token_id, vocab_size):
+    """True when a newly added token id already has a row in the model's (padded) embedding
+    matrix, so no resize is needed (Phi-4-mini / Phi-4-multimodal pad 200029 into 200064 rows)."""
+    if model is None or type(token_id) is not int:
+        return False
+    try:
+        rows = model.get_input_embeddings().weight.shape[0]
+    except Exception:
+        return False
+    return token_id < rows and (vocab_size is None or token_id < vocab_size)
 
 
 def fix_pad_token(
@@ -362,6 +386,16 @@ def fix_pad_token(
             )
             return result
 
+    if (
+        new_pad is None
+        and reason == "equals_eos"
+        and _encoder_decoder_pads_with_eos(cfg, vocab_size)
+        and getattr(inner, "pad_token_id", None) == cfg.pad_token_id
+    ):
+        # Whisper's own config sets pad == eos; seq2seq collators mask labels by attention mask.
+        result["reason"] = None
+        return result
+
     added = False
     if new_pad is None:
         if not allow_add:
@@ -377,6 +411,7 @@ def fix_pad_token(
     inner.pad_token = new_pad
     result.update(changed=True, new_pad=new_pad, added=added)
 
+    fits = added and _fits_embedding_rows(model, inner.pad_token_id, vocab_size)
     if model is not None:
         if added and hasattr(model, "resize_token_embeddings"):
             try:
@@ -394,7 +429,7 @@ def fix_pad_token(
     verb = "has no pad_token" if reason == "missing" else f"had a bad pad_token ({result['old_pad']})"
     print(f"Unsloth: {name} {verb}. Using pad_token = {new_pad}.")
 
-    if added:
+    if added and not fits:
         raise RuntimeError(
             f"Unsloth: Could not find a valid pad token for {name} - please inspect "
             f"the tokenizer. A temporary {new_pad!r} was added."

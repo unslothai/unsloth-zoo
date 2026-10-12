@@ -100,6 +100,7 @@ def chunk_local_cumsum_vector_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -109,6 +110,8 @@ def chunk_local_cumsum_vector_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     if HEAD_FIRST:
         p_s = tl.make_block_ptr(s + (bos * H + i_h*T)*S, (T, S), (S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
@@ -323,6 +326,7 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        LONG_INDEXING=g_org.numel() > 2**31,
     )
     return g
 

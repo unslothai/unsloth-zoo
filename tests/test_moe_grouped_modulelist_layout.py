@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML
+from unsloth_zoo.temporary_patches import moe_ready_epoch
 
 import test_moe_grouped_modulelist_lora as L  # noqa: E402  (pytest puts tests/ on sys.path)
 
@@ -253,10 +254,12 @@ def _engages(blk, x):
     return ML.CALLS["grouped"] - before == 1
 
 
-def test_signature_tracks_lora_rank_change_via_data(monkeypatch):
+@pytest.mark.parametrize("fast", ["1", "0"])
+def test_signature_tracks_lora_rank_change_via_data(fast, monkeypatch):
     """`.data =` keeps the Parameter, so only the shape shows a new rank on one expert. Per-expert
     Parameters only: a stacked expert's `weight` is a fresh view, so `.data =` does not reach it."""
     monkeypatch.setenv("UNSLOTH_MOE_STACKED_LORA", "0")
+    monkeypatch.setenv("UNSLOTH_MOE_FAST_READY", fast)
     model, blk = L.build("qwen3")
     L.enable(model, blk)
     x = torch.randn(1, 64, L.H, device = "cuda", dtype = L.DT)
@@ -265,6 +268,9 @@ def test_signature_tracks_lora_rank_change_via_data(monkeypatch):
     A, B = p.lora_A["default"].weight, p.lora_B["default"].weight
     A.data = torch.zeros(4, A.shape[1], device = A.device, dtype = A.dtype)
     B.data = torch.zeros(B.shape[0], 4, device = B.device, dtype = B.dtype)
+    # A hook-less edit of one interior expert: seen per call with UNSLOTH_MOE_FAST_READY=0, else at the next bump.
+    if fast == "1":
+        moe_ready_epoch.bump()
     assert not _engages(blk, x)
     assert ML.LAST_DECLINE["reason"] == "up_proj LoRA: scaling / rank differ across experts"
 
@@ -278,8 +284,11 @@ def test_signature_tracks_base_weight_shape():
     assert ML._ready_signature(blk.experts, spec)[0] != key
 
 
-def test_signature_tracks_lora_variant_entry():
+@pytest.mark.parametrize("fast", ["1", "0"])
+def test_signature_tracks_lora_variant_entry(fast, monkeypatch):
     """Setting an existing variant entry from None to a variant keeps the dict's length."""
+    monkeypatch.setenv("UNSLOTH_MOE_FAST_READY", fast)
+    bump = moe_ready_epoch.bump if fast == "1" else (lambda: None)
     model, blk = L.build("qwen3")
     for ex in blk.experts:
         for n in ("gate_proj", "up_proj", "down_proj"):
@@ -289,6 +298,9 @@ def test_signature_tracks_lora_variant_entry():
     assert _engages(blk, x)
     state = lambda: ML._cached_state(blk, blk.experts, blk._unsloth_moe_spec, x.device, x.dtype)
     blk.experts[6].gate_proj.lora_variant["default"] = object()   # the loop would now call it
+    # A hook-less edit of one interior expert: seen per call with UNSLOTH_MOE_FAST_READY=0, else at the next bump.
+    bump()
     assert state() == "gate_proj LoRA: DoRA / LoRA variant"
     blk.experts[6].gate_proj.lora_variant["default"] = None
+    bump()
     assert isinstance(state(), dict) and _engages(blk, x)

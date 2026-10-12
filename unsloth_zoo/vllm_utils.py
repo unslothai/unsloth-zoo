@@ -2284,6 +2284,24 @@ def approximate_vllm_memory_usage(
 pass
 
 
+def _fit_max_seq_length_to_kv_cache(max_seq_length, kv_cache_tokens):
+    # Report the requested length, not the clamped one: printing 256 twice hid why prompts failed (#2666).
+    requested = max_seq_length
+    if kv_cache_tokens <= 0:
+        max_seq_length = kv_cache_tokens = 256
+    if kv_cache_tokens <= max_seq_length:
+        if kv_cache_tokens < requested:
+            print(
+                f"Unsloth: Your GPU cannot handle sequence lengths of {requested} due to limited GPU memory.\n"\
+                f"Unsloth: Your GPU can only handle approximately the maximum sequence length of {kv_cache_tokens}.\n"\
+                "Unsloth: vLLM will reject prompts longer than this. Increase `gpu_memory_utilization`, "\
+                "lower `max_seq_length` or use a smaller model to allow longer sequences."
+            )
+        max_seq_length = kv_cache_tokens
+    return max_seq_length
+pass
+
+
 @functools.cache
 def get_lora_supported_ranks():
     possible_max_ranks = [8, 16, 32, 64, 128, 256, 320, 512]
@@ -3149,6 +3167,7 @@ def load_vllm(
     return_args            : bool = False, # Just return args
     max_num_seqs           : int = 256, # how many seqs to process in parallel. Default vLLM 256
     fp8_mode               : Optional[str] = None,
+    rope_scaling           : Optional[dict] = None, # caller's RoPE scaling, e.g. YaRN past the native window
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -3325,18 +3344,7 @@ def load_vllm(
         assert max_seq_length >= 8192, "Unsloth: MLLama requires max_seq_length >= 8192 for fast inference"
 
     else:
-        # max_num_batched_tokens must be >= max_seq_length
-        if max_num_batched_tokens <= 0:
-            max_seq_length = 256
-            max_num_batched_tokens = 256
-
-        if max_num_batched_tokens <= max_seq_length:
-            print(
-                f"Unsloth: Your GPU cannot handle sequence lengths of {max_seq_length} due to limited GPU memory.\n"\
-                f"Unsloth: Your GPU can only handle approximately the maximum sequence length of {max_seq_length}."
-            )
-            max_seq_length = max_num_batched_tokens
-        pass
+        max_seq_length = _fit_max_seq_length_to_kv_cache(max_seq_length, max_num_batched_tokens)
 
     # Get correct dtype
     if DEVICE_TYPE == "cuda" and major_version >= 8: _dtype = torch.bfloat16
@@ -3789,6 +3797,19 @@ def load_vllm(
             engine_args["quantization"] = "torchao"
             engine_args["hf_overrides"] = hf_overrides
 
+        # vLLM reads config.json itself, so the caller's RoPE scaling only reaches it as an
+        # override; without it positions past the native window index out of the cos/sin cache.
+        if rope_scaling:
+            rope_overrides = {"rope_scaling": dict(rope_scaling)}
+            # Newer vLLM reads a YaRN max_position_embeddings as already scaled, so raise it to
+            # max_seq_length when the scaled window covers it; else VLLM_ALLOW_LONG_MAX_MODEL_LEN.
+            native_max = getattr(getattr(config, "text_config", config), "max_position_embeddings", None)
+            original_max = rope_scaling.get("original_max_position_embeddings", None)
+            factor = rope_scaling.get("factor", None)
+            if native_max and original_max and factor and native_max < max_seq_length <= original_max * factor:
+                rope_overrides["max_position_embeddings"] = max_seq_length
+            engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **rope_overrides}
+
         # Pin the backend for the worker, which the sys.modules block only reaches under
         # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is
         # not valid for this configuration" instead of falling through, and FLASH_ATTN
@@ -4017,11 +4038,48 @@ def save_lora(model, save_directory, *args, **kwargs):
 pass
 
 
-@functools.cache
+# Uncached: a directory can be re-saved with another r / lora_alpha mid-process (#2097).
 def get_peft_config(save_directory):
     with open(os.path.join(save_directory, "adapter_config.json"), encoding = "utf-8") as f:
         config = json.load(f)
     return config
+pass
+
+
+_LIVE_LORA_CONFIGS = {}
+def _live_lora_config(model, save_directory):
+    """Live config, written once per process: a stale adapter_config.json means wrong r / lora_alpha (#2097)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    config = model.peft_config["default"]
+    # Raw path key: os.path.abspath would cost a getcwd syscall per GRPO step.
+    cached = _LIVE_LORA_CONFIGS.get(save_directory)
+    if cached is None or cached[0] is not config:
+        config.save_pretrained(save_directory)
+        cached = (config, get_peft_config(save_directory))
+        _LIVE_LORA_CONFIGS[save_directory] = cached
+    return cached[1]
+pass
+
+
+def _check_lora_rank_fits(model, save_directory):
+    """vLLM raises this inside its step and keeps the request scheduled, failing every later generate."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        # Only r, as vLLM's validate_legal: a rank_pattern entry may match no saved tensor.
+        r = get_peft_config(save_directory).get("r", None)
+        engine = model.vllm_engine.llm_engine
+        lora_config = getattr(getattr(engine, "vllm_config", None), "lora_config", None) \
+            or getattr(engine, "lora_config", None)
+        max_lora_rank = lora_config.max_lora_rank
+    except Exception:
+        return
+    if isinstance(r, int) and isinstance(max_lora_rank, int) and r > max_lora_rank:
+        raise ValueError(
+            f"Unsloth: The LoRA adapter in {save_directory} has r = {r} (its adapter_config.json), "
+            f"but vLLM was started with max_lora_rank = {max_lora_rank}.\n"
+            "That folder may be from an earlier run with a larger rank: re-save it with "
+            f"model.save_lora, or load the model with max_lora_rank >= {r}."
+        )
 pass
 
 
@@ -4607,19 +4665,13 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
     if lora_request_id is None:
         lora_request_id = LORA_REQUEST_ID
 
-    # Check if path exists
-    if not os.path.exists(save_directory) or lora_request_id == 1:
-        if load_tensors:
-            # We need to save and load the config file once!
-            model.peft_config["default"].save_pretrained(save_directory)
-        elif not os.path.exists(save_directory):
-            raise OSError(f"Unsloth: LoRA filepath = {save_directory} does not exist!")
-    pass
+    if not load_tensors and not os.path.exists(save_directory):
+        raise OSError(f"Unsloth: LoRA filepath = {save_directory} does not exist!")
 
     from vllm.lora.request import LoRARequest
     if load_tensors:
         # We extract it directly from the model's state_dict
-        peft_config = get_peft_config(save_directory)
+        peft_config = _live_lora_config(model, save_directory)
         state_dict = model.state_dict()
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
@@ -4638,6 +4690,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         # vllm_lora_already_loaded(model)
             # model.saved_vllm_lora_request = lora_request
     else:
+        _check_lora_rank_fits(model, save_directory)
         # Same checks on the path branch, read off the checkpoint header.
         _saved_keys = _saved_adapter_lora_keys(save_directory)
         _saved_peft_config = None

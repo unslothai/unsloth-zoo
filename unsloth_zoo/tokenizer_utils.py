@@ -21,6 +21,8 @@ except ImportError:
     # torch and they are never called on MLX, so keep the module importable so the
     # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
     torch = None
+import copy
+import copyreg
 import functools
 import gc
 import inspect
@@ -108,6 +110,10 @@ def add_new_tokens(
     assert(method == "mean" or method == "interpolation")
     assert(interpolation >= 0 and interpolation <= 1)
 
+    # Vision models hand back a processor; its inner tokenizer owns the vocab.
+    if not hasattr(tokenizer, "add_tokens") and hasattr(tokenizer, "tokenizer"):
+        tokenizer = tokenizer.tokenizer
+
     # Check if tokens already exist
     overlapping_tokens = set(new_tokens) & set(tokenizer.vocab.keys())
     if len(overlapping_tokens) != 0:
@@ -132,7 +138,8 @@ def add_new_tokens(
     old_output_embedding = model.get_output_embeddings().weight
     old_input_length  = old_input_embedding .shape[0]
     old_output_length = old_output_embedding.shape[0]
-    old_config_size   = model.config.vocab_size
+    # Composite configs (Gemma3Config) keep vocab_size on text_config.
+    text_config       = model.config.get_text_config()
 
     # Check for tied weights as well
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \
@@ -176,7 +183,7 @@ def add_new_tokens(
         raise RuntimeError(
             "Unsloth: LM Head matrix size did not get resized properly. Please file a bug report!"
         )
-    if model.config.vocab_size   != resize_target:
+    if text_config.vocab_size    != resize_target:
         raise RuntimeError(
             "Unsloth: Model's config vocab_size did not get resized properly. Please file a bug report!"
         )
@@ -683,6 +690,35 @@ def _is_conversation_format(text):
 pass
 
 
+def _patched_processor_reduce_ex(self, protocol):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Patched class is not importable by name, so pickle as the stock class (spawn workers, AsyncGRPO).
+    state = dict(self.__dict__)
+    state.pop("_unsloth_patched_call", None)
+    # copyreg.__newobj__ insists on the instance's own class; _reconstructor does not.
+    return (copyreg._reconstructor, (type(self)._unsloth_original_class, object, None), state)
+pass
+
+
+def _patched_processor_copy(self):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # In-process copies keep the patched class (__reduce_ex__ would drop it).
+    new = type(self).__new__(type(self))
+    new.__dict__.update(self.__dict__)
+    return new
+pass
+
+
+def _patched_processor_deepcopy(self, memo):
+    # All Unsloth Zoo code licensed under LGPLv3
+    new = type(self).__new__(type(self))
+    memo[id(self)] = new
+    for key, value in self.__dict__.items():
+        new.__dict__[key] = copy.deepcopy(value, memo)
+    return new
+pass
+
+
 def patch_processor_call(processor):
     """
     Patch processor's __call__ to auto-apply the chat template when text is in
@@ -736,6 +772,10 @@ def patch_processor_call(processor):
             "__call__": patched_call,
             "__module__": original_class.__module__,
             "__qualname__": original_class.__qualname__,
+            "_unsloth_original_class": original_class,
+            "__reduce_ex__": _patched_processor_reduce_ex,
+            "__copy__": _patched_processor_copy,
+            "__deepcopy__": _patched_processor_deepcopy,
         }
     )
     processor.__class__ = patched_class

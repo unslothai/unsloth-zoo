@@ -629,6 +629,54 @@ def _raise_if_incomplete_mlx_config(
     ) from error
 
 
+def _hf_config_default(model_type, key):
+    try:
+        from transformers import CONFIG_MAPPING
+        return getattr(CONFIG_MAPPING[model_type](), key, None)
+    except Exception:
+        return None
+
+
+# Re-saves through transformers drop keys mlx-lm requires (unsloth#8126): v5 moves rope_theta
+# into rope_parameters, to_diff_dict drops class defaults, lfm2's block_ff_dim is intermediate_size.
+# Each value is what transformers itself loads; anything else keeps the incomplete-config error.
+_MLX_LM_CONFIG_BACKFILLS = {
+    "rope_theta": lambda config: (
+        config["rope_parameters"].get("rope_theta")
+        if isinstance(config.get("rope_parameters"), dict) else None
+    ),
+    "block_ff_dim": lambda config: config.get("intermediate_size"),
+    "tie_word_embeddings": lambda config: _hf_config_default(config.get("model_type"), "tie_word_embeddings"),
+}
+
+
+def _mlx_lm_config_backfill(model_name, model_path, model_config):
+    """model_config plus the required mlx-lm ModelArgs fields config.json lacks but implies."""
+    try:
+        from mlx_lm.utils import _get_classes
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as file:
+            config = {**json.load(file), **model_config}
+        if config.get("model_file") is not None:
+            return model_config
+        _, args_class = _get_classes(config=config)
+        parameters = inspect.signature(args_class).parameters
+    except Exception:
+        return model_config
+    filled = {}
+    for key, derive in _MLX_LM_CONFIG_BACKFILLS.items():
+        parameter = parameters.get(key)
+        if parameter is None or parameter.default is not inspect.Parameter.empty or key in config:
+            continue
+        value = derive(config)
+        if value is not None:
+            filled[key] = value
+    if not filled:
+        return model_config
+    listed = ", ".join(f"{key}={value!r}" for key, value in filled.items())
+    print(f"Unsloth: {model_name}'s config.json is missing {listed}; filled in as transformers reads it.")
+    return {**model_config, **filled}
+
+
 def _raise_if_qk_norm_version_gap(model_type, message, error):
     """A strict load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too old for
     this QK-norm arch; dropping those weights breaks the model, so raise instead."""
@@ -1237,6 +1285,7 @@ def _load_mlx_lm_with_strict_fallback(
 
     with _temporary_hf_token_env(hf_token):
         model_path = _download(model_name, revision=revision)
+    model_config = _mlx_lm_config_backfill(model_name, model_path, model_config)
 
     try:
         model, config = load_model(
@@ -1403,6 +1452,7 @@ def _load_mlx_lm_distributed(
             revision=revision,
             allow_patterns=_mlx_lm_metadata_allow_patterns(),
         )
+        model_config = _mlx_lm_config_backfill(model_name, model_path, model_config)
         with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
             try:
                 model, config = load_model(

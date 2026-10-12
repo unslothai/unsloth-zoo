@@ -114,6 +114,8 @@ def census():
                     route = fused_lm_head_forward(attr, cls, name, source)[1]
                 except Exception:
                     route = None
+                if route == "count":
+                    route = None
             if route is not None:
                 routes[attr] = route
             elif _computes_lm_loss(source):

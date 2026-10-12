@@ -24,6 +24,7 @@ import shutil
 import stat
 import tempfile
 import sys
+import threading
 import time
 import warnings
 import importlib
@@ -1187,12 +1188,67 @@ def _check_torch_grouped_mm_supported():
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
 
+# Some ROCm GPUs segfault in grouped_mm instead of raising (unsloth#12391): run the kernels in a throwaway interpreter first.
+_GROUPED_MM_CRASH_PROBE = r"""
+import sys
+if sys.platform == "win32":   # no "python.exe has stopped working" dialog when the kernel faults
+    import ctypes; ctypes.windll.kernel32.SetErrorMode(0x0003)
+import torch
+d = torch.device("cuda", int(sys.argv[1]))
+def probe(x, w, offs):
+    offs = torch.tensor(offs, device = d, dtype = torch.int32)
+    try: torch._grouped_mm(x, w, offs = offs); torch.cuda.synchronize(d)
+    except Exception: pass   # a Python error is caught in-process too; only a crash or hang matters here
+half = dict(device = d, dtype = torch.float16)
+bf16 = dict(device = d, dtype = torch.bfloat16)
+w_t  = torch.ones(4, 64, 32, **bf16).transpose(-2, -1)
+probe(torch.ones(1, 8, **half), torch.ones(1, 8, 8, **half), [1])
+probe(torch.ones(32, 32, **bf16), w_t, [8, 16, 24, 32])
+probe(torch.ones(32, 32, **bf16), w_t.contiguous(), [8, 16, 24, 32])
+"""
+_GROUPED_MM_SURVIVES = None
+_GROUPED_MM_SURVIVES_LOCK = threading.Lock()
+
+
+def _grouped_mm_survives_out_of_process(device):
+    global _GROUPED_MM_SURVIVES
+    if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
+    # Publish once known: concurrent first callers wait for the child, never run the kernel.
+    with _GROUPED_MM_SURVIVES_LOCK:
+        if _GROUPED_MM_SURVIVES is None: _GROUPED_MM_SURVIVES = _run_grouped_mm_crash_probe(device)
+    return _GROUPED_MM_SURVIVES
+
+
+def _run_grouped_mm_crash_probe(device):
+    # AMD only: CUDA and XPU keep the in-process probe.
+    if getattr(torch.version, "hip", None) is None or device.type != "cuda": return True
+    # Studio's Python _grouped_mm fallback (gfx120X) is active: this process never runs the native kernel.
+    try:
+        dump = torch._C._dispatch_dump("aten::_grouped_mm").splitlines()
+        if any(l.startswith("CUDA:") and ".cpp:" not in l for l in dump): return True
+    except Exception:
+        pass
+    import subprocess
+    # Not multiprocessing: spawn re-imports the caller's __main__.
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _GROUPED_MM_CRASH_PROBE, str(device.index)],
+            stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL, timeout = 180,
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).returncode
+    except Exception as e:
+        result = type(e).__name__
+    if result == 0: return True
+    _log_info(f"Unsloth: torch._grouped_mm probe crashed on this ROCm GPU ({result}); disabling grouped_mm.")
+    return False
+
+
 def _probe_torch_grouped_mm_supported():
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
     device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
-    if device is None:
+    if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -1237,7 +1293,7 @@ def _probe_transposed_view_grouped_mm_is_safe():
     safe = False
     try:
         device = _grouped_mm_probe_device()
-        if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
+        if _TORCH_GROUPED_MM_AVAILABLE and device is not None and _grouped_mm_survives_out_of_process(device):
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
             gen = torch.Generator(device=device).manual_seed(0)
@@ -3815,13 +3871,53 @@ def _target_regex_for(names, all_names):
     return "(?:" + "|".join(re.escape(n) for n in sorted(wanted)) + ")"
 
 
+# Pre-fusion expert names PEFT's v5 MoE conversion probes under a fused expert container.
+_PRE_FUSION_EXPERT_NAMES = ("gate_proj", "up_proj", "down_proj", "w1", "w2", "w3")
+
+
+def _all_target_names(base_model):
+    return [
+        n for n, _ in base_model.named_modules()
+        if n and not (set(n.split(".")) & _LORA_INTERNAL_NAMES)
+    ]
+
+
+def _portable_regex_target_modules(base_model, adapter_name, regex):
+    """Exact regex over the wrapped modules when `regex` also fullmatches `<experts>.gate_proj`.
+
+    Unsloth's get_peft_regex matches `mlp.experts.gate_proj` / `up_proj`, which PEFT's v5 MoE conversion
+    reads as a v4 adapter and doubles gate_up_proj's rank, so plain PEFT fails to load (unsloth#6930).
+    """
+    import re
+    wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
+    if not has_param_lora:
+        return None
+    containers = set()
+    for name, module in base_model.named_modules():
+        if getattr(module, "parameter_name", None):
+            while name.endswith(".base_layer"):
+                name = name[: -len(".base_layer")]
+            containers.add(name)
+    try:
+        if not any(
+            re.fullmatch(regex, f"{container}.{leaf}")
+            for container in containers for leaf in _PRE_FUSION_EXPERT_NAMES
+        ):
+            return None
+    except re.error:
+        return None
+    if not wrapped:
+        return []
+    return _target_regex_for(wrapped, _all_target_names(base_model))
+
+
 def portable_lora_target_modules(peft_model, adapter_name, target_modules):
-    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine (list form only).
+    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine.
 
     Gemma 4: LoRA sits on the inner `.linear`; plain PEFT would pick the unsupported wrapper, so write a regex.
     Fused experts: unmatched gate_proj / up_proj make PEFT's v5 MoE conversion double gate_up_proj's rank; drop them.
     """
-    if not isinstance(target_modules, (list, tuple, set)) or not target_modules:
+    if not target_modules or not isinstance(target_modules, (str, list, tuple, set)):
         return None
     try:
         base_model = peft_model.get_base_model()
@@ -3829,6 +3925,8 @@ def portable_lora_target_modules(peft_model, adapter_name, target_modules):
         base_model = getattr(getattr(peft_model, "base_model", None), "model", None)
     if base_model is None:
         return None
+    if isinstance(target_modules, str):
+        return _portable_regex_target_modules(base_model, adapter_name, target_modules)
     wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
     targets = [t for t in target_modules if isinstance(t, str)]
     if len(targets) != len(target_modules):
@@ -3842,11 +3940,7 @@ def portable_lora_target_modules(peft_model, adapter_name, target_modules):
         if n.endswith(".linear") and any(hit(n[: -len(".linear")], t) for t in targets)
     ]
     if redirected:
-        all_names = [
-            n for n, _ in base_model.named_modules()
-            if n and not (set(n.split(".")) & _LORA_INTERNAL_NAMES)
-        ]
-        return _target_regex_for(wrapped, all_names)
+        return _target_regex_for(wrapped, _all_target_names(base_model))
     if has_param_lora:
         kept = [t for t in targets if any(hit(n, t) for n in wrapped)]
         if len(kept) != len(targets):
@@ -3964,11 +4058,32 @@ def _save_pretrained_argument(name, default, args, kwargs):
     return default
 
 
+def _stamp_fused_expert_lora_layout(peft_model, selected_adapters):
+    """Put the layout in `auto_mapping` too, which PEFT writes with the config itself: the
+    post-save marker write can fail, and a marker-less Unsloth adapter reads as pre-2026.9.6."""
+    try:
+        names = selected_adapters or list(peft_model.peft_config.keys())
+        for adapter_name in names:
+            auto_mapping = getattr(peft_model.peft_config.get(adapter_name), "auto_mapping", None)
+            if not isinstance(auto_mapping, dict):
+                continue
+            detail = fused_expert_lora_layout(peft_model, adapter_name)
+            auto_mapping.pop(FUSED_EXPERT_LORA_LAYOUT_KEY, None)
+            auto_mapping.pop(FUSED_EXPERT_LORA_DETAIL_KEY, None)
+            if detail is not None:
+                auto_mapping[FUSED_EXPERT_LORA_DETAIL_KEY] = detail
+    except Exception:
+        pass
+
+
 def _patched_peft_model_save_pretrained(self, save_directory, *args, **kwargs):
     """Add the fused expert layout marker to what PEFT saved. Never fails a save: the
     adapter itself is already on disk by the time this runs."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    _stamp_fused_expert_lora_layout(
+        self, _save_pretrained_argument("selected_adapters", None, args, kwargs),
+    )
     result = _original_peft_model_save_pretrained(self, save_directory, *args, **kwargs)
     if _save_pretrained_argument("is_main_process", True, args, kwargs):
         try:
@@ -4028,6 +4143,259 @@ def _patch_peft_save_pretrained_for_moe_layout():
     return True
 
 
+# Families whose experts forward read lora_B grouped by expert from #450 to #1269 (2026.9.6);
+# every other family stayed on PEFT's forward, i.e. rank_major.
+_LEGACY_GROUPED_LORA_B_FAMILIES = frozenset((
+    "deepseek_v3", "ernie4_5_moe", "ernie4_5_vl_moe", "gemma4", "glm4_moe", "glm4_moe_lite",
+    "gpt_oss", "lfm2_moe", "mixtral", "qwen3_5_moe", "qwen3_moe", "qwen3_next", "qwen3_vl_moe",
+))
+_legacy_lora_b_converted_logged = set()
+_original_peft_model_load_adapter = None
+
+
+def _experts_family(module):
+    """`qwen3_moe` for Qwen3MoeExperts from `transformers.models.qwen3_moe.modeling_qwen3_moe`
+    or from Unsloth's compiled copy, `unsloth_compiled_module_qwen3_moe`."""
+    if type(module).__name__ == "Mxfp4GptOssExperts":
+        return "gpt_oss"
+    name = type(module).__module__
+    leaf = name.rsplit(".", 1)[-1]
+    if leaf.startswith("unsloth_compiled_module_"):
+        return leaf[len("unsloth_compiled_module_"):]
+    parts = name.split(".")
+    if len(parts) > 2 and parts[:2] == ["transformers", "models"]:
+        return parts[2]
+    return None
+
+
+def _declared_lora_b_layouts(source) -> Optional[dict]:
+    detail = source.get(FUSED_EXPERT_LORA_DETAIL_KEY)
+    if isinstance(detail, dict) and isinstance(detail.get("parameters"), dict):
+        return {
+            name: entry.get("lora_B_layout")
+            for name, entry in detail["parameters"].items()
+            if isinstance(entry, dict) and entry.get("lora_B_layout") in _LORA_B_LAYOUTS
+        }
+    marker = source.get(FUSED_EXPERT_LORA_LAYOUT_KEY)
+    if marker in _LORA_B_LAYOUTS:
+        return {name: marker for name in _SEPARATED_MOE_LORA_PARAMETER_NAMES}
+    return None
+
+
+def saved_lora_b_layouts(config) -> dict:
+    """{parameter_name: layout} from the #1232 marker (top level, or the copy in
+    `auto_mapping`), else {None: grouped_by_expert} for a marker-less Unsloth save
+    (`unsloth_fixed`) with fused expert targets: Unsloth only wrote `target_parameters`
+    from #450 (2026-02-05), so that is the 2026.9.5-or-older window."""
+    if not isinstance(config, dict):
+        return {}
+    auto_mapping = config.get("auto_mapping")
+    auto_mapping = auto_mapping if isinstance(auto_mapping, dict) else {}
+    for source in (config, auto_mapping):
+        declared = _declared_lora_b_layouts(source)
+        if declared is not None:
+            return declared
+    # UNSLOTH_MOE_LORA_MERGED=1 trained on PEFT's own forward (rank_major); a process
+    # still set that way most likely loads such an adapter.
+    if config.get("target_parameters") and auto_mapping.get("unsloth_fixed") and _should_use_separated_lora():
+        return {None: LORA_B_LAYOUT_GROUPED_BY_EXPERT}
+    return {}
+
+
+def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
+    """Repack `adapter_name`'s grouped-by-expert fused expert lora_B into PEFT's rank_major,
+    in place, per `saved_lora_b_layouts(config)`. Lossless: column `e * r + j` moves to
+    `j * num_experts + e`. Returns how many tensors moved."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    layouts = saved_lora_b_layouts(config)
+    if not layouts:
+        return 0
+    targets = []
+    for module in peft_model.modules():
+        parameter_name = getattr(module, "parameter_name", None)
+        if parameter_name not in _SEPARATED_MOE_LORA_PARAMETER_NAMES:
+            continue
+        num_experts = int(getattr(module, "num_experts", 1) or 1)
+        if num_experts <= 1 or not _wrapper_has_adapter(module, adapter_name):
+            continue
+        layout = layouts.get(parameter_name)
+        if layout is None and None in layouts:
+            experts = module.get_base_layer()
+            while hasattr(experts, "base_layer"):
+                experts = experts.base_layer
+            if _experts_family(experts) in _LEGACY_GROUPED_LORA_B_FAMILIES:
+                layout = layouts[None]
+        if layout != LORA_B_LAYOUT_GROUPED_BY_EXPERT:
+            continue
+        weight = module.lora_B[adapter_name].weight
+        rank = weight.shape[1] // num_experts
+        if rank <= 1 or rank * num_experts != weight.shape[1]:
+            continue
+        targets.append((weight, num_experts, rank))
+    if any(weight.device.type == "meta" for weight, _, _ in targets):
+        # Accelerate holds disk-offloaded weights elsewhere; repacking only some would mix layouts.
+        raise RuntimeError(
+            "fused expert lora_B is offloaded, so it cannot be repacked in place; set "
+            "UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert to load this pre-2026.9.6 adapter"
+        )
+    for weight, num_experts, rank in targets:
+        permutation = _moe_lora_b_column_permutation(num_experts, rank, weight.device, invert = True)
+        with torch.no_grad():
+            weight.copy_(weight.index_select(1, permutation))
+        # A resumed Trainer restores optimizer state in the old column order after this.
+        weight._unsloth_lora_b_repacked = (num_experts, rank)
+    return len(targets)
+
+
+def repack_optimizer_state_for_legacy_lora_b(optimizer) -> Tuple[int, int]:
+    """Move the optimizer state of lora_B tensors `convert_legacy_lora_b` repacked into the
+    same column order; state that cannot be permuted (8-bit blockwise) is dropped and
+    re-initialised on the next step. Returns (moved, reset)."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    moved = reset = 0
+    for group in getattr(optimizer, "param_groups", ()):
+        for param in group["params"]:
+            repacked = getattr(param, "_unsloth_lora_b_repacked", None)
+            if repacked is None:
+                continue
+            del param._unsloth_lora_b_repacked
+            state = optimizer.state.get(param)
+            if not state:
+                continue
+            permutation = _moe_lora_b_column_permutation(*repacked, param.device, invert = True)
+            tensors = [v for v in state.values() if torch.is_tensor(v) and v.shape == param.shape]
+            if tensors and all(v.is_floating_point() for v in tensors) and not any(
+                torch.is_tensor(v) and v.dim() > 0 and v.shape != param.shape for v in state.values()
+            ):
+                with torch.no_grad():
+                    for value in tensors:
+                        value.copy_(value.index_select(1, permutation.to(value.device)))
+                moved += 1
+            else:
+                optimizer.state.pop(param, None)
+                reset += 1
+    return moved, reset
+
+
+_original_trainer_load_optimizer_and_scheduler = None
+
+
+def _patched_trainer_load_optimizer_and_scheduler(self, checkpoint, *args, **kwargs):
+    result = _original_trainer_load_optimizer_and_scheduler(self, checkpoint, *args, **kwargs)
+    try:
+        moved, reset = repack_optimizer_state_for_legacy_lora_b(self.optimizer) if checkpoint else (0, 0)
+    except Exception:
+        moved = reset = 0
+    if moved or reset:
+        print(
+            f"Unsloth: resumed optimizer state for repacked fused MoE expert lora_B: {moved} "
+            f"tensors moved to the new column order, {reset} reset (8-bit state cannot be permuted)."
+        )
+    return result
+
+
+def _patch_trainer_resume_for_legacy_lora_b():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_trainer_load_optimizer_and_scheduler
+    try:
+        from transformers import Trainer
+    except Exception:
+        return False
+    method = getattr(Trainer, "_load_optimizer_and_scheduler", None)
+    if method is None or getattr(method, "_unsloth_moe_layout_patched", False):
+        return method is not None
+    if _original_trainer_load_optimizer_and_scheduler is None:
+        _original_trainer_load_optimizer_and_scheduler = method
+    patched = wraps(method)(_patched_trainer_load_optimizer_and_scheduler)
+    patched._unsloth_moe_layout_patched = True
+    Trainer._load_optimizer_and_scheduler = patched
+    return True
+
+
+def _has_fused_expert_lora(peft_model, adapter_name) -> bool:
+    return any(
+        getattr(module, "parameter_name", None) in _SEPARATED_MOE_LORA_PARAMETER_NAMES
+        and int(getattr(module, "num_experts", 1) or 1) > 1
+        and _wrapper_has_adapter(module, adapter_name)
+        for module in peft_model.modules()
+    )
+
+
+def _read_adapter_config(model_id, kwargs):
+    subfolder = kwargs.get("subfolder") or ""
+    path = os.path.join(str(model_id), subfolder, "adapter_config.json")
+    if not os.path.isfile(path):
+        from huggingface_hub import hf_hub_download
+        # The Hub options PEFT was given (cache_dir, local_files_only, ...), so this finds
+        # the same file PEFT just loaded.
+        accepted = inspect.signature(hf_hub_download).parameters
+        download = {k: v for k, v in kwargs.items() if k in accepted}
+        if download.get("token") is None and kwargs.get("use_auth_token") is not None:
+            download["token"] = kwargs["use_auth_token"]
+        download.update(repo_id = str(model_id), filename = "adapter_config.json", subfolder = subfolder or None)
+        try:
+            path = hf_hub_download(**{**download, "local_files_only": True})
+        except Exception:
+            path = hf_hub_download(**download)
+    with open(path, "r", encoding = "utf-8") as f:
+        return json.load(f)
+
+
+def _patched_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs):
+    """PEFT's load_adapter, then repack a pre-2026.9.6 Unsloth fused expert lora_B into
+    rank_major so the forward, merge and the next save all agree (unsloth#6930). An explicit
+    `UNSLOTH_MOE_LORA_B_LAYOUT` keeps the caller's setting and skips this."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    result = _original_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs)
+    if os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") or not _has_fused_expert_lora(self, adapter_name):
+        return result
+    try:
+        converted = convert_legacy_lora_b(self, adapter_name, _read_adapter_config(model_id, kwargs))
+    except Exception as exception:
+        converted = 0
+        logger = _moe_utils_logger()
+        if logger is not None:
+            logger.warning(
+                f"Unsloth: could not check {model_id}'s fused MoE expert LoRA layout "
+                f"({type(exception).__name__}: {exception})."
+            )
+    if converted and (str(model_id), adapter_name) not in _legacy_lora_b_converted_logged:
+        _legacy_lora_b_converted_logged.add((str(model_id), adapter_name))
+        print(
+            f"Unsloth: {model_id} was trained before unsloth_zoo 2026.9.6 with the old fused "
+            f"MoE expert LoRA packing; repacked {converted} lora_B tensors to PEFT's layout. "
+            f"Save it again to update the file (UNSLOTH_MOE_LORA_B_LAYOUT=rank_major loads "
+            f"it unchanged)."
+        )
+    return result
+
+
+def _patch_peft_load_adapter_for_moe_layout():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_peft_model_load_adapter
+
+    try:
+        from peft import PeftModel
+    except Exception:
+        return False
+
+    if getattr(PeftModel.load_adapter, "_unsloth_moe_layout_patched", False):
+        return True
+
+    if _original_peft_model_load_adapter is None:
+        _original_peft_model_load_adapter = PeftModel.load_adapter
+
+    patched = wraps(_original_peft_model_load_adapter)(_patched_peft_model_load_adapter)
+    patched._unsloth_moe_layout_patched = True
+    PeftModel.load_adapter = patched
+    return True
+
+
 def patch_param_wrapper_for_moe():
     """Patch PEFT's ParamWrapper.forward for MoE separated LoRA (call after PEFT import)."""
     # This Unsloth Zoo code section is licensed under AGPL3
@@ -4062,6 +4430,8 @@ def patch_param_wrapper_for_moe():
             ParamWrapper.get_delta_weight = patched
 
         _patch_peft_save_pretrained_for_moe_layout()
+        _patch_peft_load_adapter_for_moe_layout()
+        _patch_trainer_resume_for_legacy_lora_b()
         _patch_peft_get_peft_model_for_moe()
 
         return True
