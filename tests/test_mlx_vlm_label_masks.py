@@ -4327,6 +4327,19 @@ def test_nemotron_sound_modules_are_frozen_and_not_quantized():
     assert all(not predicate(name, object()) for name in names)
 
 
+def test_connectors_between_a_tower_and_the_decoder_are_not_quantized():
+    import unsloth_zoo.mlx.loader as mlx_loader
+    predicate = mlx_loader._compose_mlx_quant_predicate(object(), mlx_loader._MLXQuantizationSpec(), is_vlm=True)
+    kept = ("resampler.attn.q_proj", "audio_projection_layer.linear1", "resampler_model.mlp", "mlp1.layers.1", "mlp1.3", "model.mlp1.1")
+    assert [path for path in kept if predicate(path, object())] == []
+    # Whole path components only: a decoder layer whose name merely contains one is still quantized.
+    quantized = ("language_model.model.layers.0.mlp.down_proj", "language_model.model.layers.0.mlp1x.proj", "language_model.upsampler.proj")
+    assert all(predicate(path, object()) for path in quantized)
+    # A text model's own layers of the same names are still quantized.
+    text = mlx_loader._compose_mlx_quant_predicate(object(), mlx_loader._MLXQuantizationSpec(), is_vlm=False)
+    assert all(text(path, object()) for path in kept)
+
+
 def test_qwen3_omni_nested_audio_tower_is_frozen():
     from unsloth_zoo.mlx.utils import freeze_audio_modules
     audio_tower = _FrozenAudioModule()

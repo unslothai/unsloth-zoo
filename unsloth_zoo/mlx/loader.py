@@ -4256,6 +4256,8 @@ _MULTIMODAL_SKIP_FRAGMENTS = (
     "vision_tower", "vision_model", "vision_encoder", "visual",
     "embed_vision", "vision_embed_tokens", "img_processor", "img_projection",
     "audio_encoder", "audio_projection", "embed_audio", "sound_encoder", "sound_projection",
+    # Connectors no name above matches: MiniCPM-o's two, ERNIE 4.5's, and the one of InternVL-style models.
+    "resampler", "audio_projection_layer", "resampler_model", "mlp1",
 )
 
 _MLX_QUANT_MODE_DEFAULTS = {
