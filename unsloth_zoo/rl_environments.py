@@ -37,6 +37,8 @@ import builtins as _py_builtins
 import unicodedata
 import os, gc, time, statistics
 import collections
+import io
+import pickle
 import itertools
 import numpy as np
 import signal
@@ -1176,8 +1178,34 @@ pass
 # replaced only after a timeout kills it.
 _catch_all_helper = None
 
+# The helper runs untrusted code and can write any bytes to the reply pipe, so the parent
+# only rebuilds plain data and builtin exceptions: pickle's "Restricting Globals" recipe.
+_INERT_GLOBALS = _NARROW_EXCEPTIONS | {"complex", "set", "frozenset", "bytearray", "range", "slice"}
+
+class _InertUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "builtins" and name in _INERT_GLOBALS:
+            return getattr(_py_builtins, name)
+        raise pickle.UnpicklingError(f"Unsloth: strategy helper replied with {module}.{name}")
+pass
+
+def _inert_loads(data):
+    return _InertUnpickler(io.BytesIO(data)).load()
+pass
+
+def _send_inert(conn, reply):
+    try:
+        data = pickle.dumps(reply)
+        _inert_loads(data)
+    except Exception as e:
+        data = pickle.dumps((False, RuntimeError(
+            f"Unsloth: a strategy may only return or raise plain data and builtin exceptions: {e!r}"
+        )))
+    conn.send_bytes(data)
+pass
+
 def _catch_all_helper_main(requests_conn, replies_conn):
-    replies_conn.send(None)  # ready: imports done, so the first call is not charged for them
+    _send_inert(replies_conn, None)  # ready: imports done, so the first call is not charged for them
     compiled = collections.OrderedDict()
     while True:
         try:
@@ -1195,10 +1223,7 @@ def _catch_all_helper_main(requests_conn, replies_conn):
             reply = (True, fn(*args, **kwargs))
         except BaseException as e:
             reply = (False, e)
-        try:
-            replies_conn.send(reply)
-        except Exception as e:
-            replies_conn.send((False, RuntimeError(f"Unsloth: could not send the strategy result back: {e!r}")))
+        _send_inert(replies_conn, reply)
 pass
 
 def _stop_catch_all_helper():
@@ -1236,9 +1261,9 @@ def _ensure_catch_all_helper():
     _catch_all_helper = (process, Connection(request_w, readable = False), Connection(reply_r, writable = False), os.getpid())
     try:
         if _catch_all_helper[2].poll(60):
-            _catch_all_helper[2].recv()
+            _inert_loads(_catch_all_helper[2].recv_bytes())
             return True
-    except (EOFError, OSError):
+    except (EOFError, OSError, pickle.UnpicklingError):
         pass
     _stop_catch_all_helper()
     return False
@@ -1255,7 +1280,7 @@ def _call_in_catch_all_helper(fn, deadline, seconds, args, kwargs):
         requests_conn.send((fn._unsloth_catch_all, args, kwargs))
         if not replies_conn.poll(max(deadline - time.monotonic(), 0.0)):
             raise TimeoutError(f"Timed out after {seconds:g}s")
-        ok, value = replies_conn.recv()
+        ok, value = _inert_loads(replies_conn.recv_bytes())
     except BaseException:
         # Interrupted mid-call, its next reply would answer the wrong request.
         _stop_catch_all_helper()

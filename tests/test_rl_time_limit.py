@@ -288,6 +288,40 @@ def test_catch_all_instances_keep_separate_globals(tmp_path, monkeypatch):
     assert [call(first), call(first), call(second), call(first)] == [1, 2, 1, 3]
 
 
+def test_catch_all_reply_cannot_run_code_in_the_parent(tmp_path, monkeypatch, capfd):
+    import pickle
+    from unsloth_zoo.rl_environments import _inert_loads, create_locked_down_function
+
+    (tmp_path / "rl_reply.py").write_text(textwrap.dedent("""
+        from unsloth_zoo.rl_environments import execute_with_time_limit
+
+        @execute_with_time_limit(5)
+        def call(strategy):
+            return strategy()
+    """))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    from rl_reply import call
+
+    # __reduce__ in a string key escapes the AST dunder check; unpickling it would call print here.
+    strategy = create_locked_down_function(
+        "def strategy():\n"
+        "    try:\n"
+        "        Evil = type('Evil', (), {'__reduce__': lambda self: (print, ('PWNED',))})\n"
+        "        return Evil()\n"
+        "    except:\n"
+        "        pass\n"
+    )
+    with pytest.raises(RuntimeError, match = "plain data"):
+        call(strategy)
+    assert "PWNED" not in capfd.readouterr().out
+    # Raw bytes from a helper running full builtins are decoded the same way.
+    with pytest.raises(pickle.UnpicklingError):
+        _inert_loads(b"cos\nsystem\n(S'echo PWNED'\ntR.")
+    assert _inert_loads(pickle.dumps((True, [1, 2.5, "W", {"a": (None, b"x")}, {3}, frozenset()]))) == (
+        True, [1, 2.5, "W", {"a": (None, b"x")}, {3}, frozenset()]
+    )
+
+
 @pytest.mark.parametrize("prefix, body", [("async def", "return 'W'"), ("def", "yield 'W'")])
 def test_catch_all_async_and_generator_stay_in_process(prefix, body):
     from unsloth_zoo.rl_environments import _stop_generated_code_at_deadline, create_locked_down_function
