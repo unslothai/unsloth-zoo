@@ -4592,16 +4592,10 @@ _MOE_STACKED_LORA_KEY = re.compile(r"^(.*)\.(lora_A|lora_B)\.weight$")
 
 
 def _moe_lone_expert_lora_prefixes(keys):
-    """Stacked expert prefixes that carry only ONE of the gate_up / down_proj LoRA pairs.
-
-    PEFT nests a ParamWrapper per target: gate_up at `<experts>.base_layer.lora_*`, down_proj at
-    `<experts>.lora_*`. vLLM's `_stack_moe_lora_weights` asserts the `.base_layer` half exists and
-    reads the outer half as down_proj, so a lone pair breaks it.
-    """
+    """Expert prefixes with only one of gate_up (`.base_layer.lora_*`) / down_proj (`.lora_*`); vLLM needs both."""
     # All Unsloth Zoo code licensed under LGPLv3
     outer, base = set(), set()
     for key in keys:
-        # Every expert segment contains "experts" or "moe": dense adapters skip the per-key split.
         if "experts" not in key and "moe" not in key: continue
         if not _is_moe_expert_lora_key(key): continue
         match = _MOE_STACKED_LORA_KEY.match(key)
@@ -4614,14 +4608,7 @@ pass
 
 
 def _pad_lone_moe_expert_lora(model, state_dict):
-    """Give a gate_up-only or down_proj-only stacked expert adapter the zero half vLLM expects.
-
-    The missing projection gets A = 0 and B = 0, so its delta is exactly zero and the
-    served adapter equals the trained one. Which half is present is read off the tensor
-    shapes against the live FusedMoE3DWithLoRA buffers (gate_up: A in = hidden, B out =
-    2 * intermediate; down: A in = intermediate, B out = hidden), which cannot both match.
-    Anything that does not match is left alone for vLLM to reject.
-    """
+    """Add a zero A/B for the missing expert half; which half is present comes from shapes vs FusedMoE3DWithLoRA buffers."""
     # All Unsloth Zoo code licensed under LGPLv3
     lone = _moe_lone_expert_lora_prefixes(state_dict)
     if len(lone) == 0: return state_dict
@@ -4760,8 +4747,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
                 _saved_peft_config = get_peft_config(save_directory)
             except Exception:
                 _saved_peft_config = None
-        # Loading by path skips the Gemma-4 expert rename and the lone expert pair padding,
-        # so pass tensors only when one of them applies.
+        # Path loading skips the expert rename and lone-pair padding: pass tensors when either applies.
         _remapped_keys = list(_remap_moe_expert_lora_keys(model, dict.fromkeys(_saved_keys)))
         _lone_expert_pairs = len(_moe_lone_expert_lora_prefixes(_remapped_keys)) != 0
         if _saved_peft_config is not None and (_remapped_keys != _saved_keys or _lone_expert_pairs):
