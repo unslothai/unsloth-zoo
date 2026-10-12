@@ -2070,11 +2070,15 @@ def create_new_function(
             new_source = _insert_kwargs_alias(new_source, name, kwargs_alias)
     pass
 
-    # Import items to make the function executable
+    # Import items to make the function executable; a same-named method is not a local def
     items = [
         x
         for x in functions
-        if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))
+        if (
+            (x in new_source)
+            and (x != name)
+            and not re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE)
+        )
     ]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
@@ -2132,6 +2136,9 @@ def create_new_function(
         # upstream source can reference functools too. Neither the license header
         # nor the model module's own imports are guaranteed to provide it.
         imports += "import functools\n"
+    if "transformers." in new_source:
+        # The signature fix-up spells annotations fully qualified (`transformers.cache_utils.Cache`).
+        imports += "import transformers\n"
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
@@ -3409,6 +3416,11 @@ if n_items is None:
                 if n_items is None: n_items = __kwargs.get("n_items", None)
                 break
 pass
+# Stock ForCausalLMLoss uses caller pre-shifted targets (context parallel, padding-free) as is.
+explicit_shift_labels = None
+if (\\9) != () and type(\\9) is dict:
+    explicit_shift_labels = (\\9).get("shift_labels", None)
+    if not torch.is_tensor(explicit_shift_labels): explicit_shift_labels = None
 
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
@@ -3432,7 +3444,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3446,14 +3458,15 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
 
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
+    _labels = labels if explicit_shift_labels is None else explicit_shift_labels
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(_labels, _labels.dim() - 1)
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
+        labels               = _labels,
         mask                 = None,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
@@ -3462,6 +3475,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
+        shift_labels         = explicit_shift_labels is None,
     )
 elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
     # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
@@ -7061,7 +7075,8 @@ def unsloth_compile_transformers(
                 continue
             else:
                 try:
-                    parameters = inspect.signature(function)
+                    # Match inspect.getsource, which unwraps past a wrapper's own __signature__.
+                    parameters = inspect.signature(inspect.unwrap(function))
                 except Exception as e:
                     print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
                     continue
@@ -7072,6 +7087,9 @@ def unsloth_compile_transformers(
                 source = inspect.getsource(function)
             except Exception as e:
                 print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
+                continue
+            # A wrapper borrowing the original's __signature__ would be emitted with its closure body (unsloth#13245).
+            if re.search(rf"^\s*def\s+{re.escape(module)}\s*\(", source, flags = re.MULTILINE) is None:
                 continue
 
             # str(inspect.signature) can disagree with source on quote

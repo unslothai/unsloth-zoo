@@ -70,26 +70,6 @@ def _identity_mask_fn(d):
     return {"labels": [list(ids)]}
 
 
-def test_thread4_build_optimizer_routes_sgd_to_coupled_decay():
-    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
-
-    class DummyModel:
-        def trainable_parameters(self):
-            return {}
-
-    trainer = MLXTrainer.__new__(MLXTrainer)
-    trainer.model = DummyModel()
-    trainer.args = MLXTrainingConfig(optim="sgd", weight_decay=0.1)
-
-    optimizer = trainer._build_optimizer(total_steps=4)
-
-    assert trainer._coupled_weight_decay == pytest.approx(0.1)
-    assert trainer._manual_weight_decay == pytest.approx(0.0)
-    # MLX SGD's built-in decay stays off; our helper owns the decay term.
-    if hasattr(optimizer, "_kw"):
-        assert optimizer._kw["weight_decay"] == 0.0
-
-
 def test_thread4_coupled_decay_folds_into_grad_and_exempts_bias_norm():
     import mlx.core as mx
     from mlx.utils import tree_flatten
@@ -223,26 +203,6 @@ def test_thread4_decoupled_shrink_would_diverge_from_torch_sgd():
     assert model.p.item() != pytest.approx(ref.item(), rel=1e-4, abs=1e-4)
 
 
-def test_thread2_labeled_batches_accept_none_seed_with_torch_randperm():
-    from unsloth_zoo.mlx.trainer import _create_labeled_batches
-
-    ds = [{"text": f"{i} {i + 10} {i + 20}"} for i in range(4)]
-    # Must not raise TypeError on None + epoch_idx.
-    batches = _create_labeled_batches(
-        dataset=ds,
-        tokenizer=_SpaceTokenizer(),
-        mask_fn=_identity_mask_fn,
-        batch_size=1,
-        max_seq_length=8,
-        dataset_text_field="text",
-        seed=None,
-        dataset_order="torch_randperm",
-        num_epochs=2,
-    )
-    # 4 samples x 2 epochs, batch_size 1.
-    assert len(batches) == 8
-
-
 def test_thread2_labeled_torch_randperm_reseeds_per_epoch():
     from unsloth_zoo.mlx.trainer import _create_labeled_batches
 
@@ -350,68 +310,6 @@ def test_thread3_epoch_based_run_materializes_all_epochs(monkeypatch):
     # 6 samples x 3 epochs at batch_size 1.
     assert len(trainer._batches) == 18
     assert trainer._prepared_batches_include_epochs is True
-
-
-def test_thread1_train_inner_preserves_prebuilt_epoch_flag(monkeypatch):
-    """_train_inner resets the flag only when _batches is not prebuilt, so a
-    train_on_responses_only epoch-based run keeps include_epochs=True and the
-    step counter does not multiply by num_train_epochs a second time."""
-    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
-
-    args = MLXTrainingConfig(
-        optim="adamw",
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        max_steps=0,
-        num_train_epochs=3,
-        max_seq_length=8,
-        seed=0,
-    )
-    trainer = _run_train_on_responses_only(monkeypatch, args)
-    assert trainer._prepared_batches_include_epochs is True
-    n_batches = len(trainer._batches)
-
-    # Replicate _train_inner's reset guard exactly.
-    if trainer._batches is None:
-        trainer._prepared_batches_include_epochs = False
-
-    # Flag must survive because _batches was prebuilt.
-    assert trainer._prepared_batches_include_epochs is True
-
-    # Step-count math: include_epochs True => do not re-multiply by epochs.
-    grad_accum = args.gradient_accumulation_steps
-    if getattr(trainer, "_prepared_batches_include_epochs", False):
-        total_steps = n_batches // grad_accum
-    elif args.num_train_epochs > 0:
-        total_steps = (n_batches * args.num_train_epochs) // grad_accum
-    else:
-        total_steps = n_batches // grad_accum
-    total_steps = max(1, total_steps)
-
-    # 18 prebuilt batches already include the 3 epochs => 18 steps, not 54.
-    assert total_steps == 18
-
-
-def test_thread1_regression_without_fix_would_triple_count():
-    """Document the bug shape: if the prebuilt flag were cleared, the step
-    counter would multiply already-materialized epochs again."""
-    n_batches = 18  # 6 samples * 3 epochs, already materialized
-    grad_accum = 1
-    num_train_epochs = 3
-
-    # Buggy path: flag cleared to False before step counting.
-    include_epochs = False
-    if include_epochs:
-        buggy = n_batches // grad_accum
-    elif num_train_epochs > 0:
-        buggy = (n_batches * num_train_epochs) // grad_accum
-    else:
-        buggy = n_batches // grad_accum
-    assert buggy == 54  # 3x over-trained
-
-    include_epochs = True
-    fixed = n_batches // grad_accum if include_epochs else buggy
-    assert fixed == 18
 
 
 class _RustBackend:

@@ -40,8 +40,9 @@ def _local_count(labels, attention_mask, loss_kwargs, model):
     unshifted = (convention == "unshifted") if convention is not None else counts_unshifted_labels(model)
     if not (isinstance(attention_mask, torch.Tensor) and attention_mask.shape == labels.shape):
         attention_mask = None
-    packed_seq_lengths = loss_kwargs.get("packed_seq_lengths", None) if isinstance(loss_kwargs, dict) else None
-    count, _, _ = count_batch_items(labels, attention_mask, None, packed_seq_lengths, unshifted = unshifted)
+    loss_kwargs = loss_kwargs if isinstance(loss_kwargs, dict) else {}
+    count, _, _ = count_batch_items(labels, attention_mask, None, loss_kwargs.get("packed_seq_lengths", None),
+                                    unshifted = unshifted, shift_labels = loss_kwargs.get("shift_labels", None))
     return count
 
 
