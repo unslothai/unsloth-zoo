@@ -753,7 +753,11 @@ def _attach_lora(model, folder):
     from .utils import _get_text_model
 
     config, adapter = _plain_lora(folder), mx.load(str(folder / "adapter_model.safetensors"))
-    stems = {_lora_key(stem): stem for stem in {name.rsplit(".lora_", 1)[0] for name in adapter}}
+    named = {name.rsplit(".lora_", 1)[0] for name in adapter}
+    stems = {_lora_key(stem): stem for stem in named}
+    if len(stems) != len(named):
+        # Same-numbered layers of two towers would collapse into one key and one of them be dropped or misapplied.
+        raise ValueError(f"The adapter in {folder} is on more than one tower; only the decoder's adapters can be put on a Clef")
     if "lm_head" in stems:
         raise ValueError(f"The adapter in {folder} is on the output embedding, which a Clef's joint head reads as stored")
     # An audio tower numbers its layers as the decoder does, whose adapter this is.
