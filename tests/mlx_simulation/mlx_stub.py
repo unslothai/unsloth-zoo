@@ -875,12 +875,18 @@ def save_safetensors(path, arrays, metadata=None, **kw):
     from safetensors.torch import save_file
     if not isinstance(arrays, dict):
         raise TypeError("save_safetensors expects a dict of name -> array")
-    # Real MLX has no contiguity constraint; safetensors.torch does, so normalize.
-    arrays = {
-        key: value.contiguous() if isinstance(value, torch.Tensor) else value
-        for key, value in arrays.items()
-    }
-    save_file(arrays, path, metadata=metadata)
+    # Real MLX has no contiguity constraint and writes each entry by value, so one array may sit
+    # under several keys; safetensors.torch refuses both non-contiguous and shared storage.
+    seen = set()
+    out = {}
+    for key, value in arrays.items():
+        if isinstance(value, torch.Tensor):
+            value = value.contiguous()
+            if value.untyped_storage().data_ptr() in seen:
+                value = value.clone()
+            seen.add(value.untyped_storage().data_ptr())
+        out[key] = value
+    save_file(out, path, metadata=metadata)
 
 
 def load(path, **kw):
