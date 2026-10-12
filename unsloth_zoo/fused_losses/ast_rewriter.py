@@ -15,9 +15,9 @@ not None:`` branch computing ``self.loss_function(<LOGITS>, labels,
 vocab_size=..., **kwargs)``. Any other wrapper bails out of the rewrite.
 
 Rewrites the labels branch to two paths:
-  - default (``UNSLOTH_RETURN_LOGITS`` unset): ``unsloth_fused_lm_head_loss``
+  - standard causal loss (``UNSLOTH_RETURN_LOGITS`` unset): ``unsloth_fused_lm_head_loss``
     (no lm_head matmul on the hot path); ``logits = EMPTY_LOGITS``.
-  - opt-in (``UNSLOTH_RETURN_LOGITS=1``): materialise logits once via the
+  - custom loss or ``UNSLOTH_RETURN_LOGITS=1``: materialise logits once via the
     original head expr, then route loss through ``self.loss_function`` on
     them. One lm_head matmul total.
 
@@ -65,6 +65,10 @@ class TripletCapture:
     softcap_expr: ast.AST | None = None
     # Compiler fallback only (extended=True); defaults keep the hook's output unchanged.
     labels_src: str = "labels"
+    # Captured loss-call form, replayed on the custom-loss path.
+    logits_kw: bool = False
+    labels_kw: bool = False
+    loss_pos_tail: list = field(default_factory = list)
     guarded_scale_idx: int | None = None
     guarded_scale_stmt: ast.stmt | None = None
     guarded_scale_expr: ast.AST | None = None
@@ -362,6 +366,8 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         vocab_expr, kwargs_name = None, None
         legacy_body = list(if_node.body)
         aligned_target = aligned is not None
+        logits_kw = labels_kw = False
+        loss_pos_tail = []
         kwargs_name = fn.args.kwarg.arg if fn.args.kwarg is not None else "kwargs"
         add_kwargs = fn.args.kwarg is None
     else:
@@ -425,6 +431,9 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         if labels_arg != "labels":
             return None
         aligned_target = aligned_target or bool(fused_pre)
+        logits_kw = not loss_call.args
+        labels_kw = len(loss_call.args) < 2
+        loss_pos_tail = [ast.unparse(a) for a in loss_call.args[2:]]
 
         # vocab_size: keyword preferred, else 3rd positional.
         vocab_expr = None
@@ -564,6 +573,9 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         softcap_stmt=body[softcap_idx] if softcap_idx is not None else None,
         softcap_expr=softcap_expr,
         labels_src=labels_src,
+        logits_kw=logits_kw,
+        labels_kw=labels_kw,
+        loss_pos_tail=loss_pos_tail,
         guarded_scale_idx=guarded_idx,
         guarded_scale_stmt=body[guarded_idx] if guarded_idx is not None else None,
         guarded_scale_expr=guarded_expr,
@@ -630,6 +642,11 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     extra = "".join(
         f", {name}={ast.unparse(value)}" for name, value in cap.extra_loss_kws
     )
+    lf_args = (f"logits={logits}" if cap.logits_kw else logits) + ", " + (
+        f"labels={cap.labels_src}" if cap.labels_kw else cap.labels_src
+    ) + "".join(f", {a}" for a in cap.loss_pos_tail)
+    if not cap.loss_pos_tail and cap.vocab_expr is not None:
+        lf_args += f", vocab_size={vocab}"
     lf_extra = extra
     if cap.count_injected:
         lf_extra = "".join(
@@ -648,10 +665,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
-    # Labels branch. Default: fused kernel, logits = EMPTY_LOGITS (no lm_head
-    # matmul). UNSLOTH_RETURN_LOGITS=1: run the full lm_head matmul once and
-    # route loss through self.loss_function on those logits (avoids the double
-    # matmul of fused-kernel + separate logits_rhs).
+    # Re-checked per call: the loss can be swapped after install.
     if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
         scale_extra += f", logit_scale_multiply={ast.unparse(cap.guarded_scale_expr)}"
     if cap.softcap_expr is not None and "logit_softcapping" not in already:
@@ -661,9 +675,9 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
             or cap.logits_bias_src is not None):
         template = textwrap.dedent(f"""
             if labels is not None:
-                if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':
+                if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function):
                     {logits} = {logits_rhs}
-                    {loss} = self.loss_function({logits}, labels, vocab_size={vocab}{lf_extra}{kwargs_unpack})
+                    {loss} = self.loss_function({lf_args}{lf_extra}{kwargs_unpack})
                 else:
                     {loss} = unsloth_fused_lm_head_loss(
                         {hidden_src}, self.{head_attr}, labels,
@@ -700,7 +714,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     else:
         unfused = [
             f"{logits} = {logits_rhs}", *softcap, *pre,
-            f"{loss} = self.loss_function({logits}, {cap.labels_src}, vocab_size={vocab}{lf_extra}{kwargs_unpack})",
+            f"{loss} = self.loss_function({lf_args}{lf_extra}{kwargs_unpack})",
             *post,
         ]
         fused_call = (
@@ -719,9 +733,11 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     # The kernel computes no gradient for the extra bias: a trainable one takes the exact path.
     if cap.logits_bias_src is not None:
         zero_scale += f" or {cap.logits_bias_src}.requires_grad"
+    # Legacy CE blocks never call self.loss_function.
+    custom_loss = "" if cap.legacy_body else " or not _can_fuse_loss(self.loss_function)"
     template = (
         "if labels is not None:\n"
-        f"    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1'{zero_scale}:\n"
+        f"    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1'{custom_loss}{zero_scale}:\n"
         f"{ind(unfused, 8)}\n"
         f"    else:\n{ind(fused, 8)}\n"
         f"else:\n{ind([f'{logits} = {logits_rhs}', *softcap, f'{loss} = None'], 4)}"

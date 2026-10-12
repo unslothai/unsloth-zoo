@@ -560,6 +560,7 @@ from unsloth_zoo.loss_utils import (
     unsloth_fused_ce_loss,
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
 from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
@@ -3344,7 +3345,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3444,7 +3445,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3452,7 +3453,7 @@ elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENT
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and NOT_RETURN_LOGITS:
+elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LOGITS:
     lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
@@ -3477,7 +3478,7 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_softcapping    = (\\4) if (\\4) != () else 0,
         shift_labels         = explicit_shift_labels is None,
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+elif _can_fuse_loss(self.loss_function) and labels is not None and not NOT_RETURN_LOGITS:
     # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
     # already materialised the full lm_head matmul; apply the captured logit
     # scale/softcap transforms and route loss through self.loss_function on
@@ -3735,8 +3736,6 @@ def _guard_loss_function_replacement(replacement, condition, block):
             ("and not requires_grad_:", 'getattr(self.lm_head, "bias", None) is None:', "and NOT_RETURN_LOGITS:")
         ):
             line = f"{line[:-1]} and not ({condition}):"
-        elif stripped == 'elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:':
-            line = f"{line[:-1]} and not NOT_RETURN_LOGITS:"
         lines.append(line)
         if stripped.startswith("loss = self.loss_function(logits, labels.to("):
             lines.extend(indent + x if x.strip() else x for x in block.rstrip("\n").split("\n"))

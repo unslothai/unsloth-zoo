@@ -27,6 +27,7 @@ gemma3 = pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
 from transformers.loss.loss_utils import ForCausalLMLoss  # noqa: E402
 from unsloth_zoo import compiler  # noqa: E402
 from unsloth_zoo.fused_losses import unsloth_fused_ce_loss  # noqa: E402
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss  # noqa: E402
 
 
 def _fused_forward():
@@ -41,6 +42,7 @@ def _fused_forward():
         HAS_CUT_CROSS_ENTROPY = False,
         UNSLOTH_COMPILE_DISABLE = True,
         unsloth_fused_ce_loss = unsloth_fused_ce_loss,
+        _can_fuse_loss = _can_fuse_loss,
         unsloth_training_stance = lambda: None,
         EMPTY_LOGITS = None,
     )

@@ -32,6 +32,7 @@ if not hasattr(torch.compiler, "set_stance"):
     pytest.skip("torch < 2.6 has no torch.compiler.set_stance, so Unsloth never switches the stance", allow_module_level = True)
 
 from unsloth_zoo import compiler
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 from unsloth_zoo.temporary_patches.utils import (
     UNSLOTH_DECODE_COMPILE,
     UNSLOTH_EAGER_STANCE_OWNED,
@@ -62,6 +63,9 @@ def ForCausalLMLoss(logits, labels, vocab_size = None, **kwargs):
     return torch.nn.functional.cross_entropy(
         logits[:, :-1].reshape(-1, logits.shape[-1]).float(), labels[:, 1:].reshape(-1), ignore_index = -100,
     )
+
+
+ForCausalLMLoss._unsloth_fused_loss = ForCausalLMLoss
 
 
 def _fused_ce(hidden_states, lm_head_weight, labels, **kwargs):
@@ -102,6 +106,7 @@ def _generated_module(compiled, name = "unsloth_compiled_module_test"):
         "HAS_CUT_CROSS_ENTROPY": False,
         "UNSLOTH_COMPILE_DISABLE": True,
         "unsloth_fused_ce_loss": _fused_ce,
+        "_can_fuse_loss": _can_fuse_loss,
         "UNSLOTH_DECODE_COMPILE": UNSLOTH_DECODE_COMPILE,
         "UNSLOTH_ENABLE_LOGGING": False,
         "logger_compiler": logging.getLogger(__name__),
