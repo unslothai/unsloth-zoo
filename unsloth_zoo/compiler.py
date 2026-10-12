@@ -7028,7 +7028,10 @@ def unsloth_compile_transformers(
                 continue
             else:
                 try:
-                    parameters = inspect.signature(function)
+                    # The signature of the function whose source is copied: inspect.getsource unwraps
+                    # fully, while inspect.signature stops at a wrapper's own __signature__ (the hub
+                    # dispatch for the GatedDeltaNet conv names seq_idx, the copied source does not).
+                    parameters = inspect.signature(inspect.unwrap(function))
                 except Exception as e:
                     print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
                     continue
