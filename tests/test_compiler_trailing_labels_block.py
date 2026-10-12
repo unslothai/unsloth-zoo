@@ -105,12 +105,20 @@ def test_custom_loss_copying_stock_attributes_is_not_fused():
     def custom(*args, **kwargs):
         return 3 * ForCausalLMLoss(*args, **kwargs)
 
-    new, fused = compiler.apply_fused_lm_head(FORWARD, "BambaForCausalLM")
-    assert fused
-    expected, _ = _run(FORWARD, 0.0, False, custom)
-    got, n_fused = _run(new, 0.0, False, custom)
-    torch.testing.assert_close(got, expected)
-    assert n_fused == 0
+    # Without the trailing block the regex route has no z-loss guard around its logits branch.
+    plain = FORWARD.replace(
+        "\n            if self.z_loss_coefficient > 0:\n"
+        "                z_loss = logits.logsumexp(dim=-1).to(dtype=loss.dtype).pow(2).mean()\n"
+        "                loss = loss + self.z_loss_coefficient * z_loss\n",
+        "",
+    )
+    for source in (FORWARD, plain):
+        new, fused = compiler.apply_fused_lm_head(source, "BambaForCausalLM")
+        assert fused
+        expected, _ = _run(source, 0.0, False, custom)
+        got, n_fused = _run(new, 0.0, False, custom)
+        torch.testing.assert_close(got, expected)
+        assert n_fused == 0
 
 
 def test_other_trailing_statements_are_not_fused():
@@ -131,5 +139,5 @@ def test_real_bamba_forward_is_guarded():
     new, fused = compiler.apply_fused_lm_head(source, "BambaForCausalLM")
     assert fused
     assert new.count("and not (self.z_loss_coefficient > 0):") == 2
-    assert "and labels is not None and not NOT_RETURN_LOGITS:" in new
+    assert "elif labels is not None and not NOT_RETURN_LOGITS:" in new
     assert new.count("z_loss = logits.logsumexp(") == 2

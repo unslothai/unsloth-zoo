@@ -267,7 +267,7 @@ def test_compiler_review_guards_are_present():
     mlx_compile_source = inspect.getsource(mlx_compile)
 
     assert (
-        'self.loss_function.__name__.endswith("ForCausalLMLoss") '
+        "_can_fuse_loss(self.loss_function) "
         "and labels is not None and NOT_RETURN_LOGITS"
     ) in compiler_source
     assert '"weight" in norm' not in mlx_compile_source

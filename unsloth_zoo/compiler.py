@@ -3433,7 +3433,7 @@ elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LO
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+elif labels is not None and not NOT_RETURN_LOGITS:
     # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
     # already materialised the full lm_head matmul; apply the captured logit
     # scale/softcap transforms and route loss through self.loss_function on
@@ -3691,8 +3691,6 @@ def _guard_loss_function_replacement(replacement, condition, block):
             ("and not requires_grad_:", 'getattr(self.lm_head, "bias", None) is None:', "and NOT_RETURN_LOGITS:")
         ):
             line = f"{line[:-1]} and not ({condition}):"
-        elif stripped == 'elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:':
-            line = f"{line[:-1]} and not NOT_RETURN_LOGITS:"
         lines.append(line)
         if stripped.startswith("loss = self.loss_function(logits, labels.to("):
             lines.extend(indent + x if x.strip() else x for x in block.rstrip("\n").split("\n"))
