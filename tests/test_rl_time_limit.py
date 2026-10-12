@@ -164,6 +164,14 @@ def strategy(board):
         except ValueError:
             pass
 """,
+    "type_built_exit": """
+def strategy(board):
+    Quiet = type("Quiet", (), {"__enter__": lambda self: self, "__exit__": lambda self, *exc: True})
+    while True:
+        with Quiet():
+            while True:
+                pass
+""",
     "suppressing_exit": """
 def strategy(board):
     class Quiet:

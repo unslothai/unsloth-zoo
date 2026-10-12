@@ -1143,7 +1143,7 @@ def _catches_everything(tree):
         elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
             if node.finalbody:  # can return / continue, or raise something an outer handler eats
                 return True
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__exit__":
+        elif isinstance(node, (ast.With, ast.AsyncWith)):  # __exit__ can return True, even one built by type()
             return True
     return False
 pass
