@@ -206,8 +206,7 @@ except ImportError:
 
 
 def _can_fuse_loss(loss_function):
-    # A self-reference, rather than a bool, rejects custom functools.wraps wrappers
-    # which copy the original function's attributes but can change its loss.
+    # A self-reference, not a bool: functools.wraps copies attributes onto custom wrappers.
     return loss_function is not None and getattr(loss_function, "_unsloth_fused_loss", _STOCK_CAUSAL_LM_LOSS) is loss_function
 
 

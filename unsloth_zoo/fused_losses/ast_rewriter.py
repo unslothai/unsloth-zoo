@@ -65,10 +65,9 @@ class TripletCapture:
     softcap_expr: ast.AST | None = None
     # Compiler fallback only (extended=True); defaults keep the hook's output unchanged.
     labels_src: str = "labels"
-    # The captured call passed logits / labels by keyword; a runtime custom loss may require it.
+    # Captured loss-call form, replayed on the custom-loss path.
     logits_kw: bool = False
     labels_kw: bool = False
-    # Positional vocab_size and later positionals, replayed as captured: [] = vocab_size by keyword.
     loss_pos_tail: list = field(default_factory = list)
     guarded_scale_idx: int | None = None
     guarded_scale_stmt: ast.stmt | None = None
@@ -666,8 +665,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
-    # The loss is re-checked per call (it can be swapped after install); a custom one or
-    # UNSLOTH_RETURN_LOGITS=1 runs lm_head once and calls self.loss_function on those logits.
+    # Re-checked per call: the loss can be swapped after install.
     if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
         scale_extra += f", logit_scale_multiply={ast.unparse(cap.guarded_scale_expr)}"
     if cap.softcap_expr is not None and "logit_softcapping" not in already:
