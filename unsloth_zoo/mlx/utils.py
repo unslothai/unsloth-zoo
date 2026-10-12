@@ -1076,7 +1076,13 @@ def _get_text_model(model):
 def _get_text_backbone(model):
     """Get a separable hidden-state backbone when the model exposes one."""
     tm = _get_text_model(model)
-    return getattr(tm, "model", None)
+    backbone = getattr(tm, "model", None)
+    if backbone is None and getattr(tm, "lm_head", None) is not None:
+        # The Mamba lineage (Nemotron-H) names its stack `backbone`.
+        backbone = getattr(tm, "backbone", None)
+        if not callable(backbone):
+            return None
+    return backbone
 
 
 def _get_encoder_decoder_backbone(model):
@@ -1594,13 +1600,13 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
         return hidden
     tm = _get_text_model(model)
     if (inputs_embeds is None and getattr(model, "_unsloth_text_only_vlm", False)
-            and _get_backbone_embed_kwarg(getattr(tm, "model", tm)) is not None
+            and _get_backbone_embed_kwarg(_get_text_backbone(model) or tm) is not None
             and callable(getattr(model, "get_input_embeddings", None))):
         inputs_embeds, embed_kwargs = _unpack_embed_result(
             model.get_input_embeddings(inputs, None), model, input_ids=inputs,
         )
         kwargs = {**embed_kwargs, **kwargs}
-    backbone = getattr(tm, "model", None)
+    backbone = _get_text_backbone(model)
     if backbone is not None:
         if (
             inputs_embeds is not None
@@ -2299,8 +2305,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     # Backboneless models (e.g. a stack not exposed as `.model` or as direct
     # embed_tokens/layers/norm attributes) cannot yield pre-head hidden states,
     # so the full model forward is the only faithful loss.
-    tm = _get_text_model(model)
-    if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
+    if _get_text_backbone(model) is None and not _has_direct_hidden_stack(model):
         print("Unsloth: text model does not expose a separable hidden-state "
               "backbone for CCE; falling back to standard cross-entropy.")
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
@@ -4536,8 +4541,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
-    tm = _get_text_model(model)
-    if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
+    if _get_text_backbone(model) is None and not _has_direct_hidden_stack(model):
         import warnings
         warnings.warn(
             "VLM text stack does not expose a separable hidden-state backbone for CCE; "
@@ -4546,7 +4550,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
-    backbone = getattr(tm, "model", None)
+    backbone = _get_text_backbone(model)
     token_ids_only = (
         backbone is not None and _get_backbone_embed_kwarg(backbone) is None
         and _get_encoder_decoder_backbone(model) is None
