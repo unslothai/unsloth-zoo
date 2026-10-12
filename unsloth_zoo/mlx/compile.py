@@ -84,7 +84,8 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "dots_ocr",
     "ernie4_5_moe_vl",
     "glm4v",
-    "glm4v_moe",
+    # glm4v_moe stays eager: MLX 0.32 raises IndexError (_Map_base::at) compiling its
+    # decoder, which re-sections one cos/sin array per layer; the fallback misses it.
     "glm5_next",
     "glm_ocr",
     "idefics2",
@@ -247,7 +248,6 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "dots_ocr": "verify_dots_ocr",
     "ernie4_5_moe_vl": "verify_ernie4_5_moe_vl",
     "glm4v": "verify_glm4v",
-    "glm4v_moe": "verify_glm4v_moe",
     "glm5_next": "verify_glm5_next",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",

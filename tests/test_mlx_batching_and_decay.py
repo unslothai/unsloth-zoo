@@ -2644,8 +2644,7 @@ HOST_GRID_FAMILIES = [
          "_merge_exclusive_special_token_features")],
        ("Model", "merge_input_ids_with_image_features", False))
       for arch, prefix, attention in (
-          ("glm4v", "Glm4v", [("vision", "Glm4vVisionAttention", "__call__")]),
-          ("glm4v_moe", "Glm4vMoe", []))],
+          ("glm4v", "Glm4v", [("vision", "Glm4vVisionAttention", "__call__")]),)],
 ]
 
 
@@ -2773,6 +2772,26 @@ def test_the_glm5_next_merge_really_refuses_a_count_mismatch():
         merged = replace(mx.zeros((1, 3, 2)), mx.array([[True, False, True]]),
                          features, "Image")
         assert merged[0, 0].tolist() == [1.0, 1.0]
+
+
+def test_glm4v_moe_is_patched_but_not_qualified_for_compiled_training():
+    """Its decoder does not compile on MLX 0.32 (IndexError the runtime fallback
+    does not catch), so it must stay eager even though its tower is patched."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import MLXVLMCompilePolicy, resolve_training_compile
+
+    with _installer_patches_restored("glm4v_moe") as (mc, modules):
+        assert "glm4v_moe" not in mc._VERIFIED_TRAINING_ARCHES
+        tower = modules["vision"].VisionModel.__call__
+        mc._runtime_patch_primitive_installers()["glm4v_moe_vision_compile_runtime"]()
+        assert modules["vision"].VisionModel.__call__ is not tower
+        model = type("Model", (), {"__module__": "mlx_vlm.models.glm4v_moe.glm4v_moe"})()
+        model.config = SimpleNamespace(model_type="glm4v_moe")
+        decision = resolve_training_compile(
+            model, policy=MLXVLMCompilePolicy(mode="best_effort"))
+        assert not decision.enabled
 
 
 def test_glm5_next_on_an_older_tower_contract_stays_eager(monkeypatch):
