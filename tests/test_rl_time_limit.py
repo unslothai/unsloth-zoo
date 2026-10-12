@@ -215,7 +215,7 @@ def test_an_outer_timer_and_handler_survive_a_timeout():
         raise AssertionError("the outer timer fired during the test")
 
     saved_handler = signal.getsignal(signal.SIGALRM)
-    saved_timer = signal.getitimer(signal.ITIMER_REAL)
+    (saved_remaining, saved_interval), saved_at = _outer_timer()
     signal.signal(signal.SIGALRM, outer)
     signal.setitimer(signal.ITIMER_REAL, 100.0, 7.0)
     armed_at = time.monotonic()
@@ -232,5 +232,10 @@ def test_an_outer_timer_and_handler_survive_a_timeout():
         assert elapsed >= 0.3
         assert abs(remaining - (100.0 - elapsed)) < _RESTORE_TOLERANCE_S, (remaining, elapsed)
     finally:
-        signal.setitimer(signal.ITIMER_REAL, *saved_timer)
+        # Hand pytest-timeout (or whoever armed it) its timer back without the time
+        # this test spent, the same rule the test holds time_limit to.
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, saved_handler)
+        if (saved_remaining, saved_interval) != (0.0, 0.0):
+            left = max(saved_remaining - (time.monotonic() - saved_at), 1e-3)
+            signal.setitimer(signal.ITIMER_REAL, left, saved_interval)
