@@ -951,16 +951,19 @@ class _QwenModel(DecisionPipeline):
     def _trainer_media(self, images, audio):
         """`encode_media` as the MLX trainer collates a row, with its corrections for the family's processor."""
         from .utils import (
-            _AudioClip, _assert_audio_runs_intact, _prepare_vlm_batch_for_compile, _processor_vlm_inputs, _to_mx_vlm_batch, audio_merge_patch_needed,
-            install_audio_merge_patch,
+            _AudioClip, _assert_audio_runs_intact, _prepare_vlm_batch_for_compile, _processor_vlm_inputs, _split_audio_past_the_window, _to_mx_vlm_batch,
+            audio_merge_patch_needed, install_audio_merge_patch,
         )
 
         processor = self.model._processor
         if audio and audio_merge_patch_needed(self.model.config) and not self._media_checks.get("merge"):
             # Held for good: this model only ever merges audio for the decision engine.
             self._media_checks["merge"] = install_audio_merge_patch(self.model, self.model.config.audio_token_id)
+        # A clip longer than the processor keeps is heard in pieces, as the trainer splits a row's.
+        turn = [{"role": "user", "content": [{"type": "audio"}] * len(audio)}]
+        audio = _split_audio_past_the_window(turn, [_AudioClip(clip, _AUDIO_RATE) for clip in audio], processor)[1]
         text = self._trainer_text(len(images), len(audio)) + "\n"
-        clips = [[_AudioClip(clip, _AUDIO_RATE) for clip in audio]] if audio else None
+        clips = [audio] if audio else None
         inputs = dict(_processor_vlm_inputs(processor, [text], [list(images)], None, truncation = False, all_audio = clips))
         _assert_audio_runs_intact(inputs, [len(audio)], processor, None, truncated = False, clips = clips)
         # The content half of the trainer's preparation, which may expand placeholders (Phi-4's per-image runs).
