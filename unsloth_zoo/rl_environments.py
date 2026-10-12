@@ -39,7 +39,6 @@ import os, gc, time, statistics
 import collections
 import numpy as np
 import signal
-import warnings
 import contextlib
 from contextlib import contextmanager
 from functools import wraps
@@ -1142,67 +1141,95 @@ def _catches_everything(tree):
     return False
 pass
 
-# (process, connection, owner pid): the forked child running catch-all strategy calls
-# for one execute_with_time_limit call. Killed when that call ends, so it never pins
-# copy-on-write pages of a long training run.
-_catch_all_worker = None
+# Runs in a fresh interpreter: loads only this file, so the helper neither copies the
+# training process (forking one holding a model costs ~100 ms each way) nor pins its pages.
+_CATCH_ALL_HELPER = """
+import importlib.util, sys
+from multiprocessing.connection import Connection
+spec = importlib.util.spec_from_file_location("_unsloth_rl_sandbox", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._catch_all_helper_main(Connection(int(sys.argv[2]), writable = False), Connection(int(sys.argv[3]), readable = False))
+"""
 
-def _catch_all_worker_main(conn):
+# (process, request connection, reply connection, owner pid), reused across calls and
+# replaced only after a timeout kills it.
+_catch_all_helper = None
+
+def _catch_all_helper_main(requests_conn, replies_conn):
     compiled = {}
     while True:
         try:
-            source, policy, args, kwargs = conn.recv()
+            source, policy, args, kwargs = requests_conn.recv()
         except (EOFError, OSError):
             return
         try:
             fn = compiled.get((source, policy))
             if fn is None:
+                if len(compiled) >= 256:
+                    compiled.clear()
                 fn = compiled[(source, policy)] = create_locked_down_function(source, builtins_policy = policy)
             reply = (True, fn(*args, **kwargs))
         except BaseException as e:
             reply = (False, e)
         try:
-            conn.send(reply)
+            replies_conn.send(reply)
         except Exception as e:
-            conn.send((False, RuntimeError(f"Unsloth: could not send the strategy result back: {e!r}")))
+            replies_conn.send((False, RuntimeError(f"Unsloth: could not send the strategy result back: {e!r}")))
 pass
 
-def _stop_catch_all_worker():
-    global _catch_all_worker
-    worker, _catch_all_worker = _catch_all_worker, None
-    if worker is None or worker[2] != os.getpid():
+def _stop_catch_all_helper():
+    global _catch_all_helper
+    helper, _catch_all_helper = _catch_all_helper, None
+    if helper is None or helper[3] != os.getpid():
         return
-    process, conn, _ = worker
+    process, requests_conn, replies_conn, _ = helper
     process.kill()
-    process.join()
-    conn.close()
+    process.wait()
+    requests_conn.close()
+    replies_conn.close()
 pass
 
-def _call_in_catch_all_worker(fn, deadline, seconds, args, kwargs):
-    global _catch_all_worker
+def _ensure_catch_all_helper():
+    global _catch_all_helper
+    helper = _catch_all_helper
+    if helper is not None and helper[3] == os.getpid() and helper[0].poll() is None:
+        return True
+    _stop_catch_all_helper()
+    from multiprocessing.connection import Connection
+    request_r, request_w = os.pipe()
+    reply_r, reply_w = os.pipe()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _CATCH_ALL_HELPER, os.path.abspath(__file__), str(request_r), str(reply_w)],
+            pass_fds = (request_r, reply_w), stdin = subprocess.DEVNULL,
+        )
+    except OSError:
+        for fd in (request_r, request_w, reply_r, reply_w):
+            os.close(fd)
+        return False
+    os.close(request_r)
+    os.close(reply_w)
+    _catch_all_helper = (process, Connection(request_w, readable = False), Connection(reply_r, writable = False), os.getpid())
+    return True
+pass
+
+def _call_in_catch_all_helper(fn, deadline, seconds, args, kwargs):
     source, policy = fn._unsloth_catch_all
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError(f"Timed out after {seconds:g}s")
     try:
-        if _catch_all_worker is None or _catch_all_worker[2] != os.getpid() or not _catch_all_worker[0].is_alive():
-            ctx = mp.get_context("fork")
-            conn, child_conn = ctx.Pipe()
-            with warnings.catch_warnings():
-                # Python 3.12+ warns on fork with threads; the child only runs pure Python.
-                warnings.simplefilter("ignore", DeprecationWarning)
-                process = ctx.Process(target = _catch_all_worker_main, args = (child_conn,), daemon = True)
-                process.start()
-            child_conn.close()
-            _catch_all_worker = (process, conn, os.getpid())
-        conn = _catch_all_worker[1]
-        conn.send((source, policy, args, kwargs))
-        if not conn.poll(max(deadline - time.monotonic(), 0.0)):
+        if not _ensure_catch_all_helper():
+            raise RuntimeError("Unsloth: could not start the strategy helper process")
+        _, requests_conn, replies_conn, _ = _catch_all_helper
+        requests_conn.send((source, policy, args, kwargs))
+        if not replies_conn.poll(max(deadline - time.monotonic(), 0.0)):
             raise TimeoutError(f"Timed out after {seconds:g}s")
-        ok, value = conn.recv()
+        ok, value = replies_conn.recv()
     except BaseException:
-        # Killed mid-call, its next reply would answer the wrong request.
-        _stop_catch_all_worker()
+        # Interrupted mid-call, its next reply would answer the wrong request.
+        _stop_catch_all_helper()
         raise
     if not ok:
         raise value
@@ -1214,12 +1241,12 @@ def _stop_generated_code_at_deadline(value, deadline, seconds):
     if not (isinstance(value, types.FunctionType) and value.__code__.co_filename == "<user_code>"):
         return value
     # A bare except / except BaseException can absorb every in-process signal, so
-    # that code runs in a child the deadline can kill.
-    if getattr(value, "_unsloth_catch_all", None) is not None and "fork" in mp.get_all_start_methods():
+    # that code runs in a helper process the deadline can kill.
+    if getattr(value, "_unsloth_catch_all", None) is not None:
         @wraps(value)
-        def in_child(*args, **kwargs):
-            return _call_in_catch_all_worker(value, deadline, seconds, args, kwargs)
-        return in_child
+        def in_helper(*args, **kwargs):
+            return _call_in_catch_all_helper(value, deadline, seconds, args, kwargs)
+        return in_helper
 
     @wraps(value)
     def guarded(*args, **kwargs):
@@ -1281,14 +1308,13 @@ def execute_with_time_limit(
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
             if effective_backend == "signal":
+                if any(getattr(v, "_unsloth_catch_all", None) is not None for v in (*args, *kwargs.values())):
+                    _ensure_catch_all_helper()  # started before the clock, not on the strategy's time
                 deadline = time.monotonic() + seconds
                 args = tuple(_stop_generated_code_at_deadline(a, deadline, seconds) for a in args)
                 kwargs = {k: _stop_generated_code_at_deadline(v, deadline, seconds) for k, v in kwargs.items()}
-                try:
-                    with time_limit(seconds):
-                        return func(*args, **kwargs)
-                finally:
-                    _stop_catch_all_worker()
+                with time_limit(seconds):
+                    return func(*args, **kwargs)
             elif effective_backend == "process":
                 return _run_in_subprocess(func, seconds, args, kwargs,
                                           start_method=start_method, kill_grace=kill_grace)

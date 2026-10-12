@@ -36,7 +36,7 @@ RL_ENVIRONMENTS = os.path.join(
 )
 
 HARNESS = textwrap.dedent('''
-    import importlib.util, multiprocessing, signal, sys, time
+    import importlib.util, signal, sys, time
     # Loaded by path: importing the unsloth_zoo package pulls in torch.
     spec = importlib.util.spec_from_file_location("rl_environments", sys.argv[3])
     R = importlib.util.module_from_spec(spec)
@@ -65,7 +65,7 @@ HARNESS = textwrap.dedent('''
         assert signal.getsignal(signal.SIGALRM) is signal.SIG_DFL
         assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
         assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
-        assert R._catch_all_worker is None and not multiprocessing.active_children()
+        assert R._catch_all_helper is None  # a timed-out helper is killed, not reused
     time.sleep(0.2)  # a leftover alarm would kill the process here
     print("OK", round(elapsed, 2))
 ''')
@@ -217,10 +217,12 @@ def test_catch_all_strategy_still_returns_and_raises(tmp_path, monkeypatch):
     import unsloth_zoo.rl_environments as R
 
     assert play(strategy, [[1, 2], [3, 4]]) == ["D"] * 200
-    assert R._catch_all_worker is None  # the child does not outlive the call
+    helper = R._catch_all_helper[0]
     with pytest.raises(ValueError, match = "negative tile"):
         play(strategy, [[-1, 2], [3, 4]])
-    assert R._catch_all_worker is None
+    assert R._catch_all_helper[0] is helper and helper.poll() is None  # reused, not respawned
+    R._stop_catch_all_helper()
+    assert helper.poll() is not None
 
 
 def test_ordinary_strategy_stays_in_process():
