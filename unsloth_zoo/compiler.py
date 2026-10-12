@@ -7075,7 +7075,8 @@ def unsloth_compile_transformers(
                 continue
             else:
                 try:
-                    parameters = inspect.signature(function)
+                    # Match inspect.getsource, which unwraps past a wrapper's own __signature__.
+                    parameters = inspect.signature(inspect.unwrap(function))
                 except Exception as e:
                     print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
                     continue
