@@ -46,7 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 GENUINE_CONVERTER = FIXTURES / "convert_hf_to_gguf_master.py.txt"
 CONVERTER_URL = (
-    "https://github.com/ggerganov/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
+    "https://github.com/unslothai/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
 )
 
 

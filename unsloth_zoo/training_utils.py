@@ -26,7 +26,7 @@ import time
 from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
-from .device_type import DEVICE_TYPE
+from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
@@ -677,7 +677,7 @@ def unsloth_train(trainer):
     #     .to(device = "cuda:0", non_blocking = True)[0]
 
     # Mixed precision scaling
-    _amp_device = "npu" if DEVICE_TYPE == "npu" else "cuda"
+    _amp_device = DEVICE_TYPE_TORCH if DEVICE_TYPE in ("xpu", "npu") else "cuda"
     torch_version = torch.__version__
     config_dtype = dtype_from_config(model.config)
     if config_dtype == torch.float16:

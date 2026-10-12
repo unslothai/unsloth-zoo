@@ -44,11 +44,11 @@ from .moe_routed import (
     routed_mode,
     triton,
 )
+from .moe_grouped_modulelist import _StackedLoraLinear, _lora_stacks
 
 
 def _mixed_adapter_batch(module):
-    # PEFT mixed-adapter batches inject adapter_names through a pre-hook on each LoRA layer;
-    # the routed kernels never call those layers, so they must leave such batches alone.
+    # Mixed-adapter batches route adapter_names via LoRA-layer pre-hooks the kernels never call.
     return any("adapter_names" in getattr(h, "keywords", ()) for h in getattr(module, "_forward_pre_hooks", {}).values())
 
 
@@ -298,6 +298,8 @@ def _lora(projs):
     if first.merged or (first.training and getattr(first.lora_dropout[name], "p", 0) > 0):
         return False
     cache = getattr(projs, "_unsloth_routed_lora", None)
+    if type(first._modules["lora_A"]._modules.get(name)) is _StackedLoraLinear:
+        return _stacked_lora(projs, name, first, cache)
     try:
         A = [proj._modules["lora_A"]._modules[name]._parameters["weight"] for proj in projs]
         B = [proj._modules["lora_B"]._modules[name]._parameters["weight"] for proj in projs]
@@ -307,17 +309,50 @@ def _lora(projs):
         cache is None or cache["name"] != name
         or not all(map(is_, cache["A"], A)) or not all(map(is_, cache["B"], B))
     ):
-        for proj in projs:
-            if (
-                name not in proj.lora_A or proj.scaling[name] != first.scaling[name]
-                or proj.use_dora.get(name, False) or getattr(proj, "lora_variant", {}).get(name) is not None
-                # lora_bias=True: the kernels add only B @ A @ x, not lora_B's bias.
-                or getattr(proj.lora_B[name], "bias", None) is not None
-            ):
-                return False
+        if not _lora_modules_ok(projs, name, first):
+            return False
         cache = {"name": name, "A": A, "B": B}
         if not torch.compiler.is_compiling():
             projs._unsloth_routed_lora = cache
+    return cache["A"], cache["B"], first.scaling[name]
+
+
+def _lora_modules_ok(projs, name, first):
+    for proj in projs:
+        if (
+            name not in proj.lora_A or proj.scaling[name] != first.scaling[name]
+            or proj.use_dora.get(name, False) or getattr(proj, "lora_variant", {}).get(name) is not None
+            # lora_bias=True: the kernels add only B @ A @ x, not lora_B's bias.
+            or getattr(proj.lora_B[name], "bias", None) is not None
+        ):
+            return False
+    return True
+
+
+def _stacked_lora(projs, name, first, cache):
+    """_lora for experts whose adapter is one stacked Parameter per projection
+    (moe_grouped_modulelist._StackedLoraLinear): the per-expert lists are the stack's slices,
+    the same storage and addresses the per-expert weights' pointer tables read."""
+    stacks = _lora_stacks(projs, name)
+    if stacks is None:
+        return False
+    A_st, B_st = stacks
+    if torch.compiler.is_compiling():
+        if not (isinstance(cache, dict) and cache["name"] == name and cache.get("stacks") is not None
+                and cache["stacks"][0] is A_st and cache["stacks"][1] is B_st) \
+                and not _lora_modules_ok(projs, name, first):
+            return False
+        return list(A_st.unbind(0)), list(B_st.unbind(0)), first.scaling[name]
+    # Slices are views: cached while the stacks keep their identity and storage (.data = rebuilds).
+    key = (A_st, B_st, A_st.data_ptr(), B_st.data_ptr())
+    hit = isinstance(cache, dict) and cache["name"] == name and cache.get("stacks") is not None \
+        and all(map(is_, cache["stacks"][:2], key[:2])) and cache["stacks"][2:] == key[2:]
+    if not hit:
+        if not _lora_modules_ok(projs, name, first):
+            return False
+        with torch.no_grad():
+            cache = {"name": name, "A": list(A_st.unbind(0)), "B": list(B_st.unbind(0)), "stacks": key}
+        projs._unsloth_routed_lora = cache
     return cache["A"], cache["B"], first.scaling[name]
 
 
@@ -435,9 +470,10 @@ def routed_bf16_forward(experts, hidden_states, router_indices, routing_weights)
         x, idx, routing_weights, _expert_weight_3d(base.gate_up_proj), _expert_weight_3d(base.down_proj),
         base.gate_up_proj_bias, base.down_proj_bias, ACT_GPTOSS, True,
         lora.get("gate_up_proj", ()), lora.get("down_proj", ()),
-        getattr(base, "alpha", 1.702), getattr(base, "limit", 7.0), out_dtype = torch.float32,
+        # fp32 accumulation, one rounding to the output dtype (in the top-k sum kernel when fused).
+        getattr(base, "alpha", 1.702), getattr(base, "limit", 7.0), out_dtype = hidden_states.dtype,
     )
-    return out.view(shape).to(hidden_states.dtype)
+    return out.view(shape)
 
 
 def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
@@ -457,8 +493,7 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
         return None
     if not nf4 and not routed_bf16_eligible(experts, hidden_states):
         return None
-    # The router takes [tokens, hidden]: transformers 5 normalizes the top-k scores with
-    # softmax(dim=1), which on a [batch, seq, k] input would run over the sequence instead.
+    # [tokens, hidden]: the router's softmax(dim=1) on [batch, seq, k] would run over the sequence.
     router_out = mlp.router(hidden_states.reshape(-1, hidden_states.shape[-1]))
     scores, indices = router_out[-2], router_out[-1]
     if nf4:

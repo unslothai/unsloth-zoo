@@ -481,6 +481,33 @@ except:
     torch_compiler_set_stance = None
 pass
 
+# The stance is process wide, so whether Unsloth owns it lives in unsloth_zoo, shared by
+# every generated module: inference in one model's module, training in another's.
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED, unsloth_claim_eager_stance, unsloth_owns_stance, unsloth_release_stance
+
+def unsloth_training_stance():
+    # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
+    # in a later training step (new sequence length, model.train() without for_training)
+    # would silently run the eager body. Training forwards restore the default stance,
+    # unless the user chose eager_on_recompile themselves. Every set_stance call installs a
+    # fresh stance object, so ours is still active only if the current one `is` it; a user
+    # set_stance since then (even to eager_on_recompile again) is theirs and stays.
+    global INFERENCE_RUNS
+    INFERENCE_RUNS = 0
+    if len(UNSLOTH_EAGER_STANCE_OWNED) != 0 and torch_dynamo_eval_frame is not None:
+        current = torch_dynamo_eval_frame._stance
+        # Ownership is only dropped once ours is reset: a temporary stance scope's exit restores
+        # one of our exact objects, which a later training forward must still recognise.
+        if current.stance == "eager_on_recompile" and unsloth_owns_stance(current):
+            # Only the reset object: an outer scope may still restore another one of ours.
+            # Put back what the caller had before Unsloth switched (force_eager, a backend, ...).
+            previous = unsloth_release_stance(current)
+            if previous is not None and hasattr(torch_dynamo_eval_frame, "_set_stance"):
+                torch_dynamo_eval_frame._set_stance(previous)
+            else:
+                torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+pass
+
 from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
 from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
 """
@@ -500,6 +527,8 @@ from unsloth_zoo.loss_utils import (
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
+from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
 @torch.compiler.disable(recursive = False)
@@ -2070,6 +2099,9 @@ def create_new_function(
         # upstream source can reference functools too. Neither the license header
         # nor the model module's own imports are guaranteed to provide it.
         imports += "import functools\n"
+    if "transformers." in new_source:
+        # The signature fix-up spells annotations fully qualified (`transformers.cache_utils.Cache`).
+        imports += "import transformers\n"
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
@@ -2937,9 +2969,20 @@ def create_standalone_class(
 
     # Add **loss_kwargs
     if add_loss_kwargs and "**" not in parameters:
-        parameters += ", **loss_kwargs"
-        definition = re.sub(r"(\,[\n][\s]{1,}\))", r",**loss_kwargs\1", definition)
-        source = re.sub(r"(\,[\n]\) \-\>)", r",**loss_kwargs\1", source)
+        # Reuse a var-keyword the count-aware rewrite already spliced in: a second one is a SyntaxError.
+        spliced = None
+        try:
+            for node in ast.walk(ast.parse(textwrap.dedent(source))):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    spliced = node.args.kwarg.arg if node.args.kwarg is not None else None
+                    break
+        except SyntaxError:
+            spliced = None
+        name = spliced or "loss_kwargs"
+        parameters += f", **{name}"
+        definition = re.sub(r"(\,[\n][\s]{1,}\))", rf",**{name}\1", definition)
+        if spliced is None:
+            source = re.sub(r"(\,[\n]\) \-\>)", r",**loss_kwargs\1", source)
     pass
 
     source = f"{compile}\n{source}\n"
@@ -3134,7 +3177,13 @@ __DYNAMO__RECOMPILING__ = """
             old_stance = None
         if old_stance is not None and INFERENCE_RUNS == 1:
             # Skip guards and return to eager -> we still need guards!
-            torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+            # Already eager (another model's inference, or the user's choice): leave that stance
+            # object, and so its ownership, as it is. Otherwise switch and claim the new object.
+            if old_stance != "eager_on_recompile":
+                previous = getattr(torch_dynamo_eval_frame, "_stance", None)
+                torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+                # The stance object itself, or True where torch keeps no such object.
+                unsloth_claim_eager_stance(getattr(torch_dynamo_eval_frame, "_stance", True), previous)
             if UNSLOTH_ENABLE_LOGGING:
                 logger_compiler.info(
                     f"Unsloth: Removing compiler guards after 1 inference run. "\\
@@ -3155,6 +3204,41 @@ __DYNAMO__RECOMPILING__ = """
             INFERENCE_RUNS = 0
         INFERENCE_RUNS += 1
 """
+
+# is_compiling() first: Dynamo folds it to True, so traced forwards skip the call.
+__DYNAMO__TRAINING_STANCE__ = """if not torch.compiler.is_compiling() and torch.is_grad_enabled() and getattr(self, "training", False):
+    unsloth_training_stance()"""
+
+_TRAINING_STANCE_MARKER = "__UNSLOTH_TRAINING_STANCE_MARKER__"
+_TRAINING_STANCE_MARKER_LINE = re.compile(r"^([ \t]*)" + _TRAINING_STANCE_MARKER + r"[ \t]*\n", re.MULTILINE)
+
+
+def _place_training_stance(forward):
+    """Reset at forward entry: at the logits site the decoder body already ran eager."""
+    def at_marker(match):
+        return textwrap.indent(__DYNAMO__TRAINING_STANCE__, match.group(1)) + "\n"
+    try:
+        dedented = textwrap.dedent(forward)
+        tree = ast.parse(dedented)
+        function = next(x for x in tree.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        body = function.body
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant) \
+            and isinstance(first.value.value, str):
+            first = body[1]  # after the docstring
+        lines = forward.split("\n")
+        line = lines[first.lineno - 1]
+        indent = line[: len(line) - len(line.lstrip())]
+        shift = len(line) - len(dedented.split("\n")[first.lineno - 1])
+        if first.lineno == function.lineno or first.col_offset + shift != len(indent) or not indent:
+            raise ValueError("forward body does not start on its own line")
+        lines.insert(first.lineno - 1, textwrap.indent(__DYNAMO__TRAINING_STANCE__, indent))
+        placed = "\n".join(lines)
+        placed = _TRAINING_STANCE_MARKER_LINE.sub("", placed)
+        ast.parse(textwrap.dedent(placed))
+        return placed
+    except Exception:
+        return _TRAINING_STANCE_MARKER_LINE.sub(at_marker, forward)
 
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
@@ -3204,6 +3288,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3298,6 +3383,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3371,7 +3457,7 @@ else:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-    loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
+    loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9__UNSLOTH_NON_CAUSAL__)
 """.replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_3 = """
@@ -3421,6 +3507,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3886,10 +3973,16 @@ def _apply_fused_lm_head(forward, module=None):
             "vocab_size = (",
             forward,
         )
-        # Fix , **
-        forward = forward.replace(", **)", ")")
-        forward = forward.replace(",**)", ")")
-        forward = forward.replace(",** )", ")")
+        # Stock call took no kwargs: the fallbacks get the count too, but only for a loss that accepts it.
+        forward = forward.replace(
+            ", **__UNSLOTH_NON_CAUSAL__)",
+            ", **unsloth_loss_count_kwargs(self.loss_function, n_items))",
+        )
+        forward = forward.replace("__UNSLOTH_NON_CAUSAL__)", ")")
+        forward = forward.replace(", **)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = forward.replace(",**)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = forward.replace(",** )", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = _place_training_stance(forward)
         # print(forward)
         return forward, True
     pass
@@ -4635,12 +4728,22 @@ pass
 COMPILED_LORA_FORWARD = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
+torch_is_compiling = torch.compiler.is_compiling
+# torch 2.8 / 2.9 inductor miscompiles addmm(alpha = scaling, beta = 1) traced inside a
+# compiled block (e.g. the VLM decoder MLP), forward and backward; fixed in 2.10 (unsloth#3271).
+torch_lora_no_compiled_addmm = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 10)
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     # Use result.dtype (bfloat16 from base layer) since x may have been cast to float32
     # by _cast_input_dtype when autocast is disabled
     target_dtype = result.dtype
     xA = dropout(x).to(target_dtype) @ lora_A.weight.to(target_dtype).t()
+    if torch_lora_no_compiled_addmm and torch_is_compiling():
+        output = result + scaling * (xA @ lora_B.weight.to(target_dtype).t())
+        bias = lora_B.bias
+        if bias is not None:
+            output = output + scaling * bias.to(target_dtype)
+        return output
     # output = result + scaling * xA @ lora_B.weight.t()
     shape = result.shape
     output = torch_addmm(
@@ -4667,6 +4770,9 @@ COMPILED_LORA_FORWARD_forced_float32 = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
 torch_float16 = torch.float16
+torch_is_compiling = torch.compiler.is_compiling
+# See COMPILED_LORA_FORWARD (unsloth#3271).
+torch_lora_no_compiled_addmm = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 10)
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
@@ -4675,6 +4781,12 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     # 66795) overflows if rounded to float16 here. Float16 results take the same kernel.
     shape = result.shape
     result_dtype = result.dtype
+    if torch_lora_no_compiled_addmm and torch_is_compiling():
+        output = result + scaling * (xA.to(result_dtype) @ lora_B.weight.to(result_dtype).t())
+        bias = lora_B.bias
+        if bias is not None:
+            output = output + scaling * bias.to(result_dtype)
+        return output
     output = torch_addmm(
         result.view(-1, shape[-1]),
         xA.view(-1, xA.shape[-1]).to(result_dtype),
@@ -5066,7 +5178,73 @@ def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
         return None
     if module_class is not None and not _head_built_as_linear(module_class, cap.head_attr):
         return None
+    if cap.aligned or cap.aligned_target:
+        _mark_counts_unshifted_labels(module_class)
     return new_source
+
+
+def _mark_counts_unshifted_labels(module_class):
+    if module_class is None:
+        return
+    try:
+        module_class._unsloth_counts_unshifted_labels = True
+    except Exception:
+        pass
+
+
+def _count_aware_ce_fallback(source, module = None, module_class = None):
+    """A forward no fused route took whose own mean token CE becomes count-aware, else None."""
+    if "unsloth_fused_lm_head_loss" in source or "unsloth_count_aware_cross_entropy" in source:
+        return None
+    try:
+        from unsloth_zoo.fused_losses.ast_rewriter import rewrite_count_aware_ce_spliced
+        new_source, shifted = rewrite_count_aware_ce_spliced(source)
+    except Exception as e:
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print(f"Unsloth: count aware cross entropy rewrite failed for {module}: {e}")
+        return None
+    if new_source is None:
+        return None
+    # A term the aux rewrite cannot weight would get G times its weight once Trainer stops dividing.
+    from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms
+    new_source = rewrite_aux_loss_ga(new_source)
+    if unscaled_extra_loss_terms(new_source):
+        return None
+    if not shifted:
+        _mark_counts_unshifted_labels(module_class)
+    return new_source
+
+
+def fused_lm_head_forward(module, module_class, modeling_module_name, source):
+    """Fused-CE rewrite of one forward: (new_source, "regex" | "ast" | None, supports_return_hidden_states)."""
+    # Fix some arguments up like for Gemma 3N
+    new_source = fixup_fused_lm_head(source)
+    new_source = fixup_dropped_logit_scale(new_source, module)
+    # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
+    from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
+    defined_here = getattr(module_class, "__module__", None) == modeling_module_name
+    if not _head_built_as_linear(module_class, "lm_head"):
+        count_source = _count_aware_ce_fallback(new_source, module, module_class) if defined_here else None
+        if count_source is not None:
+            from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
+            return rewrite_aux_loss_ga(count_source), "count", False
+        return new_source, None, False
+    fused_source, supports_return_hidden_states = apply_fused_lm_head(new_source, module)
+    route = "regex" if supports_return_hidden_states else None
+    if not supports_return_hidden_states and defined_here:
+        # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
+        ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
+        if ast_source is not None:
+            fused_source, route = ast_source, "ast"
+        else:
+            count_source = _count_aware_ce_fallback(new_source, module, module_class)
+            if count_source is not None:
+                fused_source, route = count_source, "count"
+    if route is not None:
+        from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
+        fused_source = rewrite_aux_loss_ga(fused_source)
+    return fused_source, route, supports_return_hidden_states
 
 
 def fixup_dropped_logit_scale(source, module = None):
@@ -6576,25 +6754,9 @@ def unsloth_compile_transformers(
                     source = inspect.getsource(module_class.forward)
                 except:
                     continue
-                # Fix some arguments up like for Gemma 3N
-                new_source = fixup_fused_lm_head(source)
-                new_source = fixup_dropped_logit_scale(new_source, module)
-                # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
-                from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
-                if _head_built_as_linear(module_class, "lm_head"):
-                    fused_source, supports_return_hidden_states = apply_fused_lm_head(
-                        new_source, module
-                    )
-                    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
-                    if not supports_return_hidden_states and \
-                            getattr(module_class, "__module__", None) == modeling_file.__name__:
-                        # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
-                        ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
-                        if ast_source is not None:
-                            fused_source = ast_source
-                    new_source = fused_source
-                else:
-                    supports_return_hidden_states = False
+                new_source, _, supports_return_hidden_states = fused_lm_head_forward(
+                    module, module_class, modeling_file.__name__, source,
+                )
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
@@ -6879,6 +7041,9 @@ def unsloth_compile_transformers(
             except Exception as e:
                 print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
                 continue
+            # A wrapper borrowing the original's __signature__ would be emitted with its closure body (unsloth#13245).
+            if re.search(rf"^\s*def\s+{re.escape(module)}\s*\(", source, flags = re.MULTILINE) is None:
+                continue
 
             # str(inspect.signature) can disagree with source on quote
             # style or fully-qualified annotations, so find() may return
@@ -7064,6 +7229,14 @@ def unsloth_compile_transformers(
         pass
     pass
 
+    # torch modules were dropped from the import list because a standalone copy was expected. One whose copy
+    # failed (e.g. a forward replaced by a temporary patch whose source the rewriter cannot parse, as
+    # Qwen3MoeRMSNorm under the float16 FORCE_FLOAT32 patches on transformers 4.x) would be neither defined
+    # nor imported, and the first class that builds it raised NameError. Import the (patched) original.
+    for module in torch_modules:
+        if module not in all_standalone_classes and module not in functions and hasattr(modeling_file, module):
+            functions.append(module)
+
     # Order all components
     final_all_standalone_classes = []
     for module in ordered_functions:
@@ -7111,6 +7284,13 @@ def unsloth_compile_transformers(
     # Import and replace with new module
     replacement_classes = {}
     for module in all_standalone_classes.keys():
+        try:
+            # The compiled replacement class must keep the counting convention the rewrite marked.
+            original = getattr(modeling_file, module, None)
+            if getattr(original, "_unsloth_counts_unshifted_labels", False) is True:
+                _mark_counts_unshifted_labels(getattr(combined_module, module, None))
+        except Exception:
+            pass
         try:
             exec(
                 f"{model_location}.{module} = combined_module.{module}",

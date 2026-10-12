@@ -36,10 +36,11 @@ llama_cpp = _load_llama_cpp_module()
 
 
 def _fake_torch(hip, gfx = "gfx1100:sramecc+:xnack-", cuda_available = True):
-    props = types.SimpleNamespace(gcnArchName = gfx)
+    gfxs = gfx if isinstance(gfx, list) else [gfx]
     cuda = types.SimpleNamespace(
         is_available = lambda: cuda_available,
-        get_device_properties = lambda i: props,
+        device_count = lambda: len(gfxs),
+        get_device_properties = lambda i: types.SimpleNamespace(gcnArchName = gfxs[i]),
         get_device_capability = lambda i: (9, 0),
     )
     return types.SimpleNamespace(version = types.SimpleNamespace(hip = hip, cuda = None if hip else "12.8"), cuda = cuda)
@@ -97,6 +98,12 @@ def test_rocm_source_build_uses_hip(monkeypatch, tmp_path):
     assert "-DGPU_TARGETS=gfx1100" in cmd
     assert f"-DCMAKE_HIP_COMPILER={clang}" in cmd
     assert "GGML_CUDA" not in cmd
+
+
+def test_rocm_mixed_arch_host_targets_every_card(monkeypatch, tmp_path):
+    torch_stub = _fake_torch(hip = "7.1", gfx = ["gfx1100", "gfx1030:xnack-", "gfx1100"])
+    cmd = _source_build(monkeypatch, tmp_path, torch_stub, gpu_support = True)
+    assert "'-DGPU_TARGETS=gfx1100;gfx1030'" in cmd
 
 
 def test_rocm_without_visible_device_still_builds_hip(monkeypatch, tmp_path):

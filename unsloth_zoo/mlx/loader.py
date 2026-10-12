@@ -629,6 +629,54 @@ def _raise_if_incomplete_mlx_config(
     ) from error
 
 
+def _hf_config_default(model_type, key):
+    try:
+        from transformers import CONFIG_MAPPING
+        return getattr(CONFIG_MAPPING[model_type](), key, None)
+    except Exception:
+        return None
+
+
+# Re-saves through transformers drop keys mlx-lm requires (unsloth#8126): v5 moves rope_theta
+# into rope_parameters, to_diff_dict drops class defaults, lfm2's block_ff_dim is intermediate_size.
+# Each value is what transformers itself loads; anything else keeps the incomplete-config error.
+_MLX_LM_CONFIG_BACKFILLS = {
+    "rope_theta": lambda config: (
+        config["rope_parameters"].get("rope_theta")
+        if isinstance(config.get("rope_parameters"), dict) else None
+    ),
+    "block_ff_dim": lambda config: config.get("intermediate_size"),
+    "tie_word_embeddings": lambda config: _hf_config_default(config.get("model_type"), "tie_word_embeddings"),
+}
+
+
+def _mlx_lm_config_backfill(model_name, model_path, model_config):
+    """model_config plus the required mlx-lm ModelArgs fields config.json lacks but implies."""
+    try:
+        from mlx_lm.utils import _get_classes
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as file:
+            config = {**json.load(file), **model_config}
+        if config.get("model_file") is not None:
+            return model_config
+        _, args_class = _get_classes(config=config)
+        parameters = inspect.signature(args_class).parameters
+    except Exception:
+        return model_config
+    filled = {}
+    for key, derive in _MLX_LM_CONFIG_BACKFILLS.items():
+        parameter = parameters.get(key)
+        if parameter is None or parameter.default is not inspect.Parameter.empty or key in config:
+            continue
+        value = derive(config)
+        if value is not None:
+            filled[key] = value
+    if not filled:
+        return model_config
+    listed = ", ".join(f"{key}={value!r}" for key, value in filled.items())
+    print(f"Unsloth: {model_name}'s config.json is missing {listed}; filled in as transformers reads it.")
+    return {**model_config, **filled}
+
+
 def _raise_if_qk_norm_version_gap(model_type, message, error):
     """A strict load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too old for
     this QK-norm arch; dropping those weights breaks the model, so raise instead."""
@@ -1237,6 +1285,7 @@ def _load_mlx_lm_with_strict_fallback(
 
     with _temporary_hf_token_env(hf_token):
         model_path = _download(model_name, revision=revision)
+    model_config = _mlx_lm_config_backfill(model_name, model_path, model_config)
 
     try:
         model, config = load_model(
@@ -1403,6 +1452,7 @@ def _load_mlx_lm_distributed(
             revision=revision,
             allow_patterns=_mlx_lm_metadata_allow_patterns(),
         )
+        model_config = _mlx_lm_config_backfill(model_name, model_path, model_config)
         with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
             try:
                 model, config = load_model(
@@ -3408,6 +3458,8 @@ def _call_restoring_module_state(model, call):
         return call()
 
     with _mlx_module_state_restored(modules):
+        # Eval mode: dropout would draw from the global RNG a seeded run relies on.
+        model.eval()
         return call()
 
 
@@ -3437,7 +3489,7 @@ def _bind_text_only_modality_arguments(model, extra: int) -> None:
     )
 
 
-def _verify_text_only_wrapper(model, model_type: str) -> int:
+def _verify_text_only_wrapper(model, model_type: str, *, check_causality=True) -> int:
     """Establish, by asking, that the wrapper is a causal LM over token ids, and
     return how many empty modality arguments its call needs. Nothing about the class
     settles it: these wrappers take token ids and then demand pixels, answer a
@@ -3476,6 +3528,9 @@ def _verify_text_only_wrapper(model, model_type: str) -> int:
         extra = _call_restoring_module_state(model, discover_arity)
     except Exception as exc:
         raise refuse(exc) from exc
+
+    if not check_causality:
+        return extra
 
     for tokens, perturbed_tokens in _PROBE_TOKEN_PAIRS:
         try:
@@ -7004,6 +7059,8 @@ def _mlx_generate_vlm(self, *args, **kwargs):
                 "not both."
             )
     inputs.update(kwargs)
+    from .utils import _row_has_images, _validate_mlx_image_input
+    _validate_mlx_image_input(self, _row_has_images(inputs))
 
     int8_prefill = inputs.pop("int8_prefill", None)
     streamer = inputs.pop("streamer", None)
@@ -7491,6 +7548,14 @@ def _feeds_text_width(name, module, text_hidden_size):
     return changes or _reads_as(name, module, _STRONG_PROJECTOR_TOKENS)
 
 
+def _model_supports_images(model):
+    # Pixel projections can live inside the decoder rather than a separate tower.
+    return any(
+        _reads_as(name, module, _VISION_ROLE_TOKENS)
+        for name, module in model.named_modules() if name
+    )
+
+
 def _resolve_vision_group(model):
     import mlx.nn as nn
     from .utils import _get_text_model
@@ -7954,11 +8019,16 @@ def _language_layer_keys(model, attention, mlp):
             for root in _mlx_language_layers(model)]
 
 
-def _raise_no_lora_targets(target_modules):
+def _raise_no_lora_targets(target_modules, model=None, requested=None):
+    supported = tuple(cls for spec in _mlx_lora_type_specs() for cls in spec.base_types)
+    found = sorted({type(module).__name__ for _, module in model.named_modules()}) if model is not None else []
     raise ValueError(
         "Unsloth: No MLX LoRA target modules were found for "
-        f"target_modules={target_modules!r}. Check the module names or use "
-        "target_modules='all-linear'."
+        f"target_modules={requested if requested is not None else target_modules!r}. "
+        f"Searched names {target_modules!r} for supported types "
+        f"{', '.join(cls.__name__ for cls in supported)}. "
+        f"Found module types: {', '.join(found) or 'none'}. "
+        "SparseLinear is not supported by MLX LoRA."
     )
 
 
@@ -9403,6 +9473,12 @@ class FastMLXModel:
                 )
                 _mark_text_only_vlm(model, model_type)
             model._is_vlm_model = True
+            model._unsloth_supports_images = _model_supports_images(model)
+            model._unsloth_modality_model_type = model_type
+            from .utils import _get_processor_tokenizer
+            for target in (processor, _get_processor_tokenizer(processor)):
+                target._unsloth_supports_images = model._unsloth_supports_images
+                target._unsloth_modality_model_type = model_type
             model._processor = processor
             for fixup in _VLM_MODEL_FIXUPS:
                 _run_with_vlm_config_view(fixup, model)
@@ -9659,6 +9735,7 @@ class FastMLXModel:
         # spells continued pretraining as target_modules=["all-linear",
         # "embed_tokens", "lm_head"], and a literal "all-linear" left in that
         # list matches no module, so every layer adapter would be dropped.
+        _requested_target_modules = target_modules
         if isinstance(target_modules, str):
             _expand_all_linear = target_modules == "all-linear"
             _kept_targets = []
@@ -9878,7 +9955,7 @@ class FastMLXModel:
                     )
                 if isinstance(target_modules, list) and len(target_modules) == 0:
                     _raise_empty_target_modules()
-                _raise_no_lora_targets(target_modules)
+                _raise_no_lora_targets(target_modules, model, _requested_target_modules)
 
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
             if use_dora:
@@ -9932,7 +10009,7 @@ class FastMLXModel:
                 # Non-CPT: keys=None still means mlx-lm auto-discovery.
                 if (finetune_language_layers and language_lora_keys is not None
                         and len(language_lora_keys) == 0):
-                    _raise_no_lora_targets(target_modules)
+                    _raise_no_lora_targets(target_modules, model, _requested_target_modules)
                 _apply_layer_lora = finetune_language_layers and (
                     language_lora_keys is None or len(language_lora_keys) > 0
                 )
@@ -9952,7 +10029,7 @@ class FastMLXModel:
                             "layer_keys": language_layer_keys},
                 )
                 if language_lora_count == 0:
-                    _raise_no_lora_targets(target_modules)
+                    _raise_no_lora_targets(target_modules, model, _requested_target_modules)
             elif not _cpt_full_specs and not finetune_language_layers:
                 warnings.warn(
                     "Unsloth: finetune_language_layers=False on a text-only "
