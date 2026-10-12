@@ -3474,6 +3474,11 @@ def _config_get(config, key, default=None):
     return getattr(config, key, default)
 
 
+def _multimodal_config(config):
+    # Qwen3-Omni keeps its multimodal settings under the thinker.
+    return _config_get(config, "thinker_config", None) or config
+
+
 def _config_to_mapping(config):
     if isinstance(config, dict):
         return config
@@ -4003,6 +4008,7 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen4_exp",
     "prism_hadamard_qwen35",
     # Their upstream `get_rope_index` computes the same positions.
+    "qwen3_omni_moe",
     "glm4v",
     "glm4v_moe",
 })
@@ -4454,6 +4460,7 @@ def _vlm_positions_for_compile(batch_dict, config):
     expansion and planned padding, whose tails never shift a content
     position)."""
     model_type = _config_get(config, "model_type")
+    config = _multimodal_config(config)
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
