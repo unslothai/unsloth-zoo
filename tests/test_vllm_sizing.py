@@ -53,7 +53,6 @@ def _tokens(kv_gb, bytes_per_token):
 
 
 def test_kv_estimate_uses_config_head_dim(monkeypatch):
-    # Qwen3-4B: head_dim 128, not 2560 / 32 = 80.
     tokens, _, _, kv_gb = _estimate(monkeypatch, _config(head_dim = 128))
     assert tokens == _tokens(kv_gb, 36 * 2 * 8 * 128 * 2)
 
@@ -75,7 +74,6 @@ def test_kv_estimate_float8(monkeypatch):
 
 
 def test_mla_caches_one_latent(monkeypatch):
-    # DeepSeek-V2-Lite: kv_lora_rank 512 + qk_rope_head_dim 64 per layer, no separate K and V.
     config = _config(hidden_size = 2048, num_hidden_layers = 27, num_attention_heads = 16,
                      num_key_value_heads = 16, kv_lora_rank = 512, qk_rope_head_dim = 64)
     tokens, _, _, kv_gb = _estimate(monkeypatch, config)
@@ -117,7 +115,6 @@ def test_sliding_layers_hold_the_whole_prefill_budget(monkeypatch):
 
 
 def test_linear_attention_layers_hold_no_per_token_cache(monkeypatch):
-    # Qwen3.5 / Qwen3-Next: 3 of every 4 layers are linear attention.
     layer_types = ["linear_attention"] * 3 + ["full_attention"]
     config = _config(num_hidden_layers = 32, head_dim = 256, num_key_value_heads = 4,
                      layer_types = layer_types * 8)
@@ -132,7 +129,6 @@ def test_kv_shared_layers_hold_no_cache(monkeypatch):
 
 
 def test_sliding_layers_stop_growing_at_their_window(monkeypatch):
-    # Gemma-3-4B: 29 sliding (window 1024) + 5 full layers, head_dim 256, 4 KV heads.
     layer_types = (["sliding_attention"] * 5 + ["full_attention"]) * 5 + ["sliding_attention"] * 4
     config = _config(num_hidden_layers = 34, num_attention_heads = 8, num_key_value_heads = 4,
                      head_dim = 256, sliding_window = 1024, layer_types = layer_types)
@@ -153,7 +149,6 @@ def test_kv_cache_tokens_short_memory_counts_every_layer():
 
 
 def test_per_layer_config_shapes(monkeypatch):
-    # Gemma-4 style: per-layer head_dim / KV heads, the flat attributes are ambiguous.
     class Ambiguous(AttributeError): pass
     sliding = SimpleNamespace(head_dim = 256, num_key_value_heads = 16, sliding_window = 1024)
     full    = SimpleNamespace(head_dim = 512, num_key_value_heads = 4, sliding_window = 1024)

@@ -2147,7 +2147,6 @@ def _kv_cache_elements_per_token(config):
     hd       = config.hidden_size
     n_layers = config.num_hidden_layers
     n_heads  = _config_get(config, "num_attention_heads", 1) or 1
-    # MLA (DeepSeek-V2/V3) caches one latent + rope key per token, not K and V per head.
     kv_lora_rank = getattr(config, "kv_lora_rank", None)
     rope_dim = getattr(config, "qk_rope_head_dim", None) or 0
     mla_head_dim = None
@@ -2165,7 +2164,6 @@ def _kv_cache_elements_per_token(config):
     except Exception:
         per_layer = []
     if len(per_layer) != n_layers: per_layer = [None] * n_layers
-    # Gemma-3n / Gemma-4: the last num_kv_shared_layers reuse earlier layers' cache.
     n_shared = getattr(config, "num_kv_shared_layers", None) or 0
     sliding_window = getattr(config, "sliding_window", None)
 
@@ -3680,7 +3678,6 @@ def load_vllm(
         reachable_tokens = approx_max_num_seqs * max_seq_length
         if max_num_batched_tokens > reachable_tokens and requested_max_num_batched_tokens is None:
             max_num_batched_tokens = reachable_tokens
-        # vLLM rejects a token budget below max_num_seqs.
         if max_num_batched_tokens < approx_max_num_seqs:
             if requested_max_num_batched_tokens is None:
                 max_num_batched_tokens = approx_max_num_seqs
