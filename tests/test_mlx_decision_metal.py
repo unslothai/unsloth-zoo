@@ -1124,6 +1124,14 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     assert not reader.reads_images
 
 
+def _omni_ready(audio = False):
+    from unsloth_zoo.mlx.utils import _AUDIO_QUALIFIED_FAMILIES, _AudioVersions, _installed_mlx_vlm_version
+
+    floor = _AUDIO_QUALIFIED_FAMILIES["qwen3_omni_moe"] if audio else _AudioVersions("0.6.5")
+    if not floor.admits(_installed_mlx_vlm_version()):
+        pytest.skip(f"Qwen3-Omni {'audio ' if audio else ''}needs mlx-vlm {floor.minimum}")
+
+
 def _omni_decoder():
     from mlx_vlm.models import qwen3_omni_moe
 
@@ -1159,6 +1167,7 @@ def _omni_processor(asked):
 
 
 def test_clef_omni_reads_images_through_its_thinker(clef, tmp_path, monkeypatch):
+    _omni_ready()
     from PIL import Image
 
     from unsloth_zoo.mlx.decision import ClefModel
@@ -1196,6 +1205,7 @@ def _wav(samples, rate):
 
 def test_clef_omni_hears_audio_after_its_images(clef, monkeypatch):
     pytest.importorskip("av")
+    _omni_ready(audio = True)
     from PIL import Image
 
     from unsloth_zoo.mlx import decision
@@ -1241,6 +1251,7 @@ def test_clef_omni_hears_audio_after_its_images(clef, monkeypatch):
 
 def test_a_plain_omni_model_trains_as_a_clef_on_images_and_audio(clef, tmp_path, monkeypatch):
     pytest.importorskip("av")
+    _omni_ready(audio = True)
     from PIL import Image
 
     from unsloth_zoo.mlx.decision import ClefModel, DecisionRequestError, _decoder_tensor_name, load_language_model_as_clef, save_clef_adapter
@@ -1257,6 +1268,11 @@ def test_a_plain_omni_model_trains_as_a_clef_on_images_and_audio(clef, tmp_path,
         tensors.update({name.replace(".switch_mlp.", f".experts.{index}."): expert for index, expert in enumerate(value)} if ".switch_mlp." in name else {name: value})
     source.mkdir()
     mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    # Below mlx-vlm 0.6.5 the decoder's forward fails without a cache: refused at load, not at the first request.
+    with monkeypatch.context() as patch:
+        patch.setattr(sys.modules["unsloth_zoo.mlx.utils"], "_installed_mlx_vlm_version", lambda: "0.6.4")
+        with pytest.raises(ValueError, match = "mlx-vlm 0.6.5 or newer"):
+            load_language_model_as_clef(source, head_width = 64)
     pipeline = load_language_model_as_clef(source, head_width = 64)
     stacked = "thinker.language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
     # An MLX conversion stores the stack under the name it is loaded with.

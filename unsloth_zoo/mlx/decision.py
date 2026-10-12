@@ -1523,6 +1523,12 @@ class ClefModel(_QwenModel):
 
     def _load_beside(self, source, *args, **kwargs):
         super()._load_beside(source, *args, **kwargs)
+        if self._architecture == "qwen3_omni_moe":
+            from .utils import _AudioVersions, _installed_mlx_vlm_version
+
+            # Before 0.6.5 its decoder has no hidden-state output, and the cacheless forward the engine falls back to fails.
+            if not _AudioVersions("0.6.5").admits(_installed_mlx_vlm_version()):
+                raise ValueError(f"Unsloth: a Qwen3-Omni Clef needs mlx-vlm 0.6.5 or newer, but {_installed_mlx_vlm_version() or 'an unknown version'} is installed.")
         stacks = [path for path, _ in tree_flatten(self.model.parameters()) if ".switch_mlp." in path]
         stored = _stored_tensors(source) if stacks else ()
         # A mixture's experts stored apart load as one stack, which then has no tensor of its own to be saved to.
