@@ -145,10 +145,23 @@ def test_state_restored_after_repeated_swallowed_timeouts():
     _run(SWALLOW_ONCE, repeats = 5)
 
 
+def _assert_outer_timer_restored(before):
+    # time_limit puts back whatever ITIMER_REAL was armed before it, less the time
+    # it spent, so the end state is the caller's timer, not (0, 0). pytest-timeout's
+    # signal method arms one around every test (Core zoo runs with PYTEST_TIMEOUT).
+    remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+    if before == (0.0, 0.0):
+        assert (remaining, interval) == (0.0, 0.0)
+    else:
+        assert interval == before[1]
+        assert 0.0 < remaining <= before[0]
+
+
 def test_cleanup_after_timeout_runs_to_completion():
     from unsloth_zoo.rl_environments import time_limit
     import time
 
+    before = signal.getitimer(signal.ITIMER_REAL)
     done = []
     with pytest.raises(TimeoutError):
         with time_limit(0.05):
@@ -161,11 +174,13 @@ def test_cleanup_after_timeout_runs_to_completion():
                     pass
                 done.append(True)
     assert done == [True]
-    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    _assert_outer_timer_restored(before)
 
 
 def test_fast_body_unchanged():
     from unsloth_zoo.rl_environments import execute_with_time_limit, time_limit
+
+    before = signal.getitimer(signal.ITIMER_REAL)
 
     @execute_with_time_limit(5)
     def add(a, b):
@@ -176,4 +191,28 @@ def test_fast_body_unchanged():
         with time_limit(0.05):
             while True:
                 pass
-    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    _assert_outer_timer_restored(before)
+
+
+def test_an_outer_timer_and_handler_survive_a_timeout():
+    from unsloth_zoo.rl_environments import time_limit
+
+    def outer(signum, frame):
+        raise AssertionError("the outer timer fired during the test")
+
+    saved_handler = signal.getsignal(signal.SIGALRM)
+    saved_timer = signal.getitimer(signal.ITIMER_REAL)
+    signal.signal(signal.SIGALRM, outer)
+    signal.setitimer(signal.ITIMER_REAL, 100.0, 7.0)
+    try:
+        with pytest.raises(TimeoutError):
+            with time_limit(0.05):
+                while True:
+                    pass
+        assert signal.getsignal(signal.SIGALRM) is outer
+        remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+        assert interval == 7.0
+        assert 95.0 < remaining <= 100.0
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *saved_timer)
+        signal.signal(signal.SIGALRM, saved_handler)
