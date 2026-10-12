@@ -396,3 +396,15 @@ def test_folder_keyword_still_loads(tmp_path):
     # Callers written against the Laya-only loader pass the checkpoint as folder=.
     with pytest.raises(ValueError, match = "not a decision model"):
         load_decision_model(folder = tmp_path)
+
+
+def test_records_without_encoded_clips_do_not_need_pyav(monkeypatch):
+    import sys
+
+    # As if PyAV were not installed: image-only and already decoded clips are read without it.
+    monkeypatch.setitem(sys.modules, "av", None)
+    clip = {"array": np.zeros(1600, np.float32), "sampling_rate": 16000}
+    assert decision._decode_audio([]) == [] and decision._clips(()) == []
+    assert [samples.shape for samples in decision._clips([clip])] == [(1600,)]
+    with pytest.raises(DecisionUnsupportedError, match = "PyAV"):
+        decision._clips(["data:audio/wav;base64,AAAA"])

@@ -369,6 +369,9 @@ def _decode_audio(urls):
     import io
     import itertools
 
+    # PyAV is optional: records without encoded clips must not need it.
+    if not urls:
+        return []
     try:
         import av
     except ImportError as error:
@@ -2375,12 +2378,17 @@ def clef_training_network(
     A Clef loaded from adapters keeps training those, whatever `r`, `lora_alpha` and `target_modules` say.
     `origin` is the network's: what lets its checkpoints be written as loadable Clef adapters.
     """
-    from .loader import FastMLXModel
+    from .loader import FastMLXModel, _lora_name_matches_target, _mlx_language_layers
     from .utils import _get_text_model, describe_output_head
 
     if full_finetuning and any(path.endswith(".scales") for path, _ in tree_flatten(pipeline.model.parameters())):
         raise ValueError("Unsloth: a quantized decoder trains through LoRA adapters only; pass full_finetuning = False.")
-    stacked = {path.rsplit(".", 1)[-1] for path, module in pipeline.model.named_modules() if "SwitchLinear" in type(module).__name__}
+    # Layer-local, as the LoRA resolver matches targets: by leaf, parent, whole name or alias (`gate_proj` -> `gate_up_proj`).
+    stacked = {name for layer in _mlx_language_layers(pipeline.model) for name, module in layer.named_modules() if "SwitchLinear" in type(module).__name__}
+
+    def reaches(targets):
+        return sorted(name for name in stacked if _lora_name_matches_target(name, targets))
+
     if full_finetuning and pipeline._experts_apart:
         raise ValueError("Unsloth: this checkpoint stores each expert of its mixture apart, so it trains through LoRA adapters only; pass full_finetuning = False.")
     if any("lora_a" in module for _, module in pipeline.model.named_modules()):
@@ -2398,10 +2406,10 @@ def clef_training_network(
             output.module.freeze()
     else:
         if target_modules in (None, "all-linear"):
-            target_modules = [name for name in _CLEF_LORA_TARGETS if name not in stacked]
-        elif stacked & set([target_modules] if isinstance(target_modules, str) else target_modules):
+            target_modules = [name for name in _CLEF_LORA_TARGETS if not reaches({name})]
+        elif hit := reaches({target_modules} if isinstance(target_modules, str) else set(target_modules)):
             # An adapter over the stacked experts of a mixture has no one checkpoint tensor to be merged into, in any layout.
-            raise ValueError(f"Unsloth: adapters on the stacked experts of a mixture cannot be saved; leave {sorted(stacked)} out of target_modules.")
+            raise ValueError(f"Unsloth: adapters on the stacked experts of a mixture cannot be saved; target_modules reaches {hit}.")
         # Checkpointing is applied around each run instead, so it is gone again when the model serves.
         FastMLXModel.get_peft_model(
             pipeline.model, r = r, lora_alpha = lora_alpha, target_modules = target_modules, use_gradient_checkpointing = False, **lora,

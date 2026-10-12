@@ -1234,6 +1234,7 @@ def test_clef_omni_hears_audio_after_its_images(clef, monkeypatch):
 
 
 def test_a_plain_omni_model_trains_as_a_clef_on_images_and_audio(clef, tmp_path, monkeypatch):
+    pytest.importorskip("av")
     from PIL import Image
 
     from unsloth_zoo.mlx.decision import ClefModel, DecisionRequestError, _decoder_tensor_name, load_language_model_as_clef, save_clef_adapter
@@ -1267,7 +1268,8 @@ def test_a_plain_omni_model_trains_as_a_clef_on_images_and_audio(clef, tmp_path,
         clef_training_item(pipeline, "s", questions, None, None, [clip] * 9)
 
     # What could not be saved afterwards is refused before it trains.
-    for refused, why in (({"full_finetuning": True}, "each expert of its mixture apart"), ({"target_modules": ["q_proj", "up_proj"]}, "stacked experts")):
+    stacks = ["q_proj", "up_proj"], ["mlp.switch_mlp.up_proj"], "switch_mlp"
+    for refused, why in (({"full_finetuning": True}, "each expert of its mixture apart"), *(({"target_modules": names}, "stacked experts") for names in stacks)):
         with pytest.raises(ValueError, match = why):
             clef_training_network(pipeline, **refused)
     network = clef_training_network(pipeline, r = 4, lora_alpha = 4)
