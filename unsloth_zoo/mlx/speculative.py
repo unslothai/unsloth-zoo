@@ -1296,16 +1296,16 @@ class DraftRow:
         return self.last is not None or bool(self.tokens)
 
 
-_SHORTLIST_BITS, _SHORTLIST_KEEP, _SHORTLIST_GROUP, _SHORTLIST_CHUNK = 2, 8, 64, 1 << 14
+_SHORTLIST_BITS, _SHORTLIST_KEEP, _SHORTLIST_GROUP, _SHORTLIST_CHUNK, _SHORTLIST_COLUMNS = 2, 128, 64, 1 << 14, 2048
 
 
 class _ShortlistHead:
-    """Greedy tokens for drafting without a full pass over the target's output table: a 2-bit copy of the table
+    """Greedy tokens for drafting without a full pass over the target's output table: a 2-bit copy of its leading columns
     picks a few candidates and the table's own rows choose among them. A draft is only a proposal, so a pick the
     full head would not have made costs acceptance, never output."""
 
-    def __init__(self, table: nn.Module, nbytes: int):
-        self.table, self.nbytes, self._source, self._scan = table, nbytes, None, None
+    def __init__(self, table: nn.Module, columns: int, nbytes: int):
+        self.table, self.columns, self.nbytes, self._source, self._scan = table, columns, nbytes, None, None
 
     @classmethod
     def of(cls, lm: nn.Module) -> "_ShortlistHead | None":
@@ -1322,7 +1322,10 @@ class _ShortlistHead:
         width = sides.shape[1] * (1 if bits is None else table.group_size)
         if width % _SHORTLIST_GROUP:
             return None
-        return cls(table, sides.shape[0] * (width // _SHORTLIST_GROUP) * (_SHORTLIST_GROUP * _SHORTLIST_BITS // 8 + 2 * sides.dtype.size))
+        if sides.shape[0] <= _SHORTLIST_KEEP:
+            return None
+        columns = min(width, _SHORTLIST_COLUMNS)
+        return cls(table, columns, sides.shape[0] * (columns // _SHORTLIST_GROUP) * (_SHORTLIST_GROUP * _SHORTLIST_BITS // 8 + 2 * sides.dtype.size))
 
     def _rows(self, rows) -> mx.array:
         table = self.table
@@ -1336,14 +1339,14 @@ class _ShortlistHead:
             return
         parts = []
         for start in range(0, self.table.weight.shape[0], _SHORTLIST_CHUNK):
-            parts.append(mx.quantize(self._rows(slice(start, start + _SHORTLIST_CHUNK)), _SHORTLIST_GROUP, _SHORTLIST_BITS))
+            parts.append(mx.quantize(self._rows(slice(start, start + _SHORTLIST_CHUNK))[:, :self.columns], _SHORTLIST_GROUP, _SHORTLIST_BITS))
             mx.eval(parts[-1])
         self._scan = tuple(mx.concatenate(column) for column in zip(*parts))
         mx.eval(self._scan)
         self._source = self.table.weight
 
     def __call__(self, hidden: mx.array) -> mx.array:
-        coarse = mx.quantized_matmul(hidden, *self._scan, True, _SHORTLIST_GROUP, _SHORTLIST_BITS)
+        coarse = mx.quantized_matmul(hidden[..., :self.columns], *self._scan, True, _SHORTLIST_GROUP, _SHORTLIST_BITS)
         best = mx.argpartition(-coarse, _SHORTLIST_KEEP, axis = -1)[..., :_SHORTLIST_KEEP]
         rows = self._rows(best.reshape(-1)).reshape(*best.shape, -1)
         exact = (rows @ hidden[..., None].astype(rows.dtype)).squeeze(-1)
