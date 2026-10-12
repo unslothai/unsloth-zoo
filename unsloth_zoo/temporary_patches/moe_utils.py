@@ -4122,6 +4122,161 @@ def _patch_peft_save_pretrained_for_moe_layout():
     return True
 
 
+# Transformers families whose experts forward read a fused expert lora_B grouped by expert
+# from unsloth_zoo#450 until the packing fix (#1269, unsloth_zoo 2026.9.6). Any other
+# family stayed on PEFT's own forward and was trained rank_major.
+_LEGACY_GROUPED_LORA_B_FAMILIES = frozenset((
+    "deepseek_v3", "ernie4_5_moe", "ernie4_5_vl_moe", "gemma4", "glm4_moe", "glm4_moe_lite",
+    "gpt_oss", "lfm2_moe", "mixtral", "qwen3_5_moe", "qwen3_moe", "qwen3_next", "qwen3_vl_moe",
+))
+_legacy_lora_b_converted_logged = set()
+_original_peft_model_load_adapter = None
+
+
+def _experts_family(module):
+    """`qwen3_moe` for Qwen3MoeExperts from `transformers.models.qwen3_moe.modeling_qwen3_moe`
+    or from Unsloth's compiled copy, `unsloth_compiled_module_qwen3_moe`."""
+    if type(module).__name__ == "Mxfp4GptOssExperts":
+        return "gpt_oss"
+    name = type(module).__module__
+    leaf = name.rsplit(".", 1)[-1]
+    if leaf.startswith("unsloth_compiled_module_"):
+        return leaf[len("unsloth_compiled_module_"):]
+    parts = name.split(".")
+    if len(parts) > 2 and parts[:2] == ["transformers", "models"]:
+        return parts[2]
+    return None
+
+
+def saved_lora_b_layouts(config) -> dict:
+    """{parameter_name or None: layout} a saved adapter_config.json declares or implies.
+
+    The marker (#1232) decides when present. Without it, an adapter Unsloth saved
+    (`auto_mapping.unsloth_fixed`) with fused expert `target_parameters` predates 2026.9.6
+    and was packed grouped by expert; the None key carries that inference, which the
+    caller limits to `_LEGACY_GROUPED_LORA_B_FAMILIES`. Anything else is PEFT's rank_major.
+    """
+    if not isinstance(config, dict):
+        return {}
+    detail = config.get(FUSED_EXPERT_LORA_DETAIL_KEY)
+    if isinstance(detail, dict) and isinstance(detail.get("parameters"), dict):
+        return {
+            name: entry.get("lora_B_layout")
+            for name, entry in detail["parameters"].items()
+            if isinstance(entry, dict) and entry.get("lora_B_layout") in _LORA_B_LAYOUTS
+        }
+    marker = config.get(FUSED_EXPERT_LORA_LAYOUT_KEY)
+    if marker in _LORA_B_LAYOUTS:
+        return {name: marker for name in _SEPARATED_MOE_LORA_PARAMETER_NAMES}
+    if marker is None and config.get("target_parameters"):
+        auto_mapping = config.get("auto_mapping")
+        if isinstance(auto_mapping, dict) and auto_mapping.get("unsloth_fixed"):
+            return {None: LORA_B_LAYOUT_GROUPED_BY_EXPERT}
+    return {}
+
+
+def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
+    """Repack `adapter_name`'s grouped-by-expert fused expert lora_B into PEFT's rank_major,
+    in place, per `saved_lora_b_layouts(config)`. Lossless: column `e * r + j` moves to
+    `j * num_experts + e`. Returns how many tensors moved."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    layouts = saved_lora_b_layouts(config)
+    if not layouts:
+        return 0
+    converted = 0
+    for module in peft_model.modules():
+        parameter_name = getattr(module, "parameter_name", None)
+        if parameter_name not in _SEPARATED_MOE_LORA_PARAMETER_NAMES:
+            continue
+        num_experts = int(getattr(module, "num_experts", 1) or 1)
+        if num_experts <= 1 or not _wrapper_has_adapter(module, adapter_name):
+            continue
+        layout = layouts.get(parameter_name)
+        if layout is None and None in layouts:
+            experts = module.get_base_layer()
+            while hasattr(experts, "base_layer"):
+                experts = experts.base_layer
+            if _experts_family(experts) in _LEGACY_GROUPED_LORA_B_FAMILIES:
+                layout = layouts[None]
+        if layout != LORA_B_LAYOUT_GROUPED_BY_EXPERT:
+            continue
+        weight = module.lora_B[adapter_name].weight
+        rank = weight.shape[1] // num_experts
+        if rank <= 1 or rank * num_experts != weight.shape[1]:
+            continue
+        permutation = _moe_lora_b_column_permutation(num_experts, rank, weight.device, invert = True)
+        with torch.no_grad():
+            weight.copy_(weight.index_select(1, permutation))
+        converted += 1
+    return converted
+
+
+def _read_adapter_config(model_id, kwargs):
+    subfolder = kwargs.get("subfolder") or ""
+    path = os.path.join(str(model_id), subfolder, "adapter_config.json")
+    if not os.path.isfile(path):
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(
+            str(model_id), "adapter_config.json", subfolder = subfolder or None,
+            revision = kwargs.get("revision"), token = kwargs.get("token"),
+        )
+    with open(path, "r", encoding = "utf-8") as f:
+        return json.load(f)
+
+
+def _patched_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs):
+    """PEFT's load_adapter, then repack a pre-2026.9.6 Unsloth fused expert lora_B into
+    rank_major so the forward, merge and the next save all agree (unsloth#6930). An explicit
+    `UNSLOTH_MOE_LORA_B_LAYOUT` keeps the caller's setting and skips this."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    result = _original_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs)
+    if os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT"):
+        return result
+    try:
+        converted = convert_legacy_lora_b(self, adapter_name, _read_adapter_config(model_id, kwargs))
+    except Exception as exception:
+        converted = 0
+        logger = _moe_utils_logger()
+        if logger is not None:
+            logger.warning(
+                f"Unsloth: could not check {model_id}'s fused MoE expert LoRA layout "
+                f"({type(exception).__name__}: {exception})."
+            )
+    if converted and (str(model_id), adapter_name) not in _legacy_lora_b_converted_logged:
+        _legacy_lora_b_converted_logged.add((str(model_id), adapter_name))
+        print(
+            f"Unsloth: {model_id} was trained before unsloth_zoo 2026.9.6 with the old fused "
+            f"MoE expert LoRA packing; repacked {converted} lora_B tensors to PEFT's layout. "
+            f"Save it again to update the file (UNSLOTH_MOE_LORA_B_LAYOUT=rank_major loads "
+            f"it unchanged)."
+        )
+    return result
+
+
+def _patch_peft_load_adapter_for_moe_layout():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_peft_model_load_adapter
+
+    try:
+        from peft import PeftModel
+    except Exception:
+        return False
+
+    if getattr(PeftModel.load_adapter, "_unsloth_moe_layout_patched", False):
+        return True
+
+    if _original_peft_model_load_adapter is None:
+        _original_peft_model_load_adapter = PeftModel.load_adapter
+
+    patched = wraps(_original_peft_model_load_adapter)(_patched_peft_model_load_adapter)
+    patched._unsloth_moe_layout_patched = True
+    PeftModel.load_adapter = patched
+    return True
+
+
 def patch_param_wrapper_for_moe():
     """Patch PEFT's ParamWrapper.forward for MoE separated LoRA (call after PEFT import)."""
     # This Unsloth Zoo code section is licensed under AGPL3
@@ -4156,6 +4311,7 @@ def patch_param_wrapper_for_moe():
             ParamWrapper.get_delta_weight = patched
 
         _patch_peft_save_pretrained_for_moe_layout()
+        _patch_peft_load_adapter_for_moe_layout()
         _patch_peft_get_peft_model_for_moe()
 
         return True
