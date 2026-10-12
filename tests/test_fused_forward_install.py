@@ -411,7 +411,7 @@ def forward(self, hidden_states, labels=None, **kwargs):
 
 
 @pytest.mark.parametrize("shape", ["plain", "scaled", "cast_wrapped"])
-@pytest.mark.parametrize("wrapped", [False, True, "kwargs_only"])
+@pytest.mark.parametrize("wrapped", [False, True, "kwargs_only", "positional_only"])
 def test_rewritten_forward_tracks_runtime_custom_loss(
     fresh_install, enable_env, monkeypatch, shape, wrapped,
 ):
@@ -431,6 +431,11 @@ def test_rewritten_forward_tracks_runtime_custom_loss(
             "        logits = logits.float()\n"
             "        loss = self.loss_function",
         ).replace("    return (loss, logits)", "        loss = loss.to(hidden_states.dtype)\n    return (loss, logits)")
+    if wrapped == "positional_only":
+        source = source.replace(
+            "self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)",
+            "self.loss_function(logits, labels, self.config.vocab_size, **kwargs)",
+        )
     cls = _make_synthetic_class(source)
     original = cls.forward
     assert fresh_install.install_for_class(cls)
@@ -447,7 +452,11 @@ def test_rewritten_forward_tracks_runtime_custom_loss(
         calls.append(kwargs["num_items_in_batch"])
         return 3 * ForCausalLMLoss(*args, **kwargs)
 
-    if wrapped == "kwargs_only":
+    if wrapped == "positional_only":
+        def custom_loss(logits, labels, size, /, **kwargs):
+            calls.append(kwargs["num_items_in_batch"])
+            return 3 * ForCausalLMLoss(logits, labels, size, **kwargs)
+    elif wrapped == "kwargs_only":
         def custom_loss(**kwargs):
             calls.append(kwargs["num_items_in_batch"])
             return 3 * ForCausalLMLoss(**kwargs)
