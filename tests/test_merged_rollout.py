@@ -936,11 +936,18 @@ def test_load_vllm_only_wraps_when_enabled():
     ]
     assert any(
         isinstance(n.test, ast.Call) and getattr(n.test.func, "id", None) == "_merged_rollout_enabled" and
-        len(n.body) == 1 and getattr(n.body[0].value.func, "id", None) == "install_merged_rollout_engine_wrapper"
+        getattr(n.body[-1].value.func, "id", None) == "install_merged_rollout_engine_wrapper"
         for n in guards
     )
     assert source.count("install_merged_rollout_engine_wrapper") == 1
-    assert source.count("_merged_rollout") == 2
+    # The only other touch: attention mode restricts vLLM's LoRA modules, nothing else.
+    mode_guards = [
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.If) and "_merged_rollout_mode" in ast.unparse(node.test)
+    ]
+    assert len(mode_guards) == 1 and ast.unparse(mode_guards[0].test).endswith("_merged_rollout_mode() == 'attention'")
+    assert [ast.unparse(t) for t in mode_guards[0].body] == ["engine_args['lora_target_modules'] = list(_MERGED_ROLLOUT_PUNICA_MODULES)"]
+    assert source.count("_merged_rollout") == 3
 
 
 # 12. Round 2: untracked reloads, per-prompt lists, one lock, current modules, engine, dirty cache.
@@ -1117,3 +1124,73 @@ def test_async_engine_is_not_wrapped_and_keeps_vllm_lora(monkeypatch, _isolate):
     assert llm.generate is generate
     assert not getattr(llm, "_unsloth_merged_rollout_wrapped", False)
     assert type(load_lora(model, _ADAPTER_DIR, load_tensors = True)) is _isolate.LoRARequest
+
+
+# 13. Attention-only mode: fold attention, keep the rest on vLLM LoRA, never send a folded layer twice.
+@pytest.fixture
+def _attention_mode(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "attention")
+
+
+def _is_attention(name):
+    return ".self_attn." in name + "."
+
+
+def test_mode_parsing(monkeypatch):
+    for value, mode in (("1", "all"), ("attention", "attention"), ("ATTN", "attention"), ("0", None), ("", None), ("yes", None)):
+        monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", value)
+        assert vllm_utils._merged_rollout_mode() == mode
+        assert vllm_utils._merged_rollout_enabled() == (mode is not None)
+
+
+def test_attention_mode_folds_only_attention_and_sends_the_rest(_attention_mode, _isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    down_before = [layer.mlp.down_proj.base_layer.weight.detach().clone() for layer in model.base_model.model.model.layers]
+    state = prepare_merged_rollout(model)
+    assert state is not None and state.rest
+    assert {_is_attention(n) for n in state.folded} == {True}
+    assert len(state.entries) == 2 * 4   # 2 layers x q, k, v, o
+    llm.generate(["hi"], lora_request = load_lora(model, _ADAPTER_DIR, load_tensors = True))
+    kind, sent, seen = llm.calls[-1]
+    assert type(sent) is _isolate.LoRARequest
+    keys = list(sent.lora_tensors)
+    assert keys and all(".mlp.down_proj." in k for k in keys)
+    assert not any("self_attn" in k for k in keys)
+    # Attention was folded while vLLM ran, down_proj was not; everything is restored after.
+    assert not all(torch.equal(a, b) for a, b in zip(before, seen))
+    assert all(
+        torch.equal(layer.mlp.down_proj.base_layer.weight, d)
+        for layer, d in zip(model.base_model.model.model.layers, down_before)
+    )
+    _assert_bitwise(before, vllm_model)
+
+
+def test_attention_mode_bit_exact_over_cycles(_attention_mode):
+    model, llm, vllm_model = _make_model()
+    _run_cycles(model, vllm_model, _safe_cycle, n = 30)
+
+
+def test_attention_mode_with_only_mlp_lora_uses_plain_lora(_attention_mode, _isolate):
+    model, llm, vllm_model = _make_model(target_modules = ("down_proj",))
+    request = load_lora(model, _ADAPTER_DIR, load_tensors = True)
+    assert type(request) is _isolate.LoRARequest
+    assert all(".mlp.down_proj." in k for k in request.lora_tensors)
+
+
+def test_attention_mode_with_only_attention_lora_sends_no_request(_attention_mode):
+    model, llm, vllm_model = _make_model(target_modules = ("q_proj", "o_proj"))
+    state = prepare_merged_rollout(model)
+    assert state is not None and not state.rest
+    llm.generate(["hi"], lora_request = load_lora(model, _ADAPTER_DIR, load_tensors = True))
+    assert llm.calls[-1][1] is None
+
+
+def test_target_parameters_refused_only_when_folding_everything(monkeypatch):
+    model, llm, vllm_model = _make_model()
+    model.peft_config["default"].target_parameters = ["mlp.experts.gate_up_proj"]
+    targets, reason = _merged_rollout_targets(model)
+    assert targets is None and "target_parameters" in reason
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "attention")
+    targets, reason = _merged_rollout_targets(model)
+    assert reason is None and {_is_attention(n) for n, _, _ in targets} == {True}

@@ -3751,6 +3751,10 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
+        if enable_lora and _merged_rollout_mode() == "attention":
+            # Attention is folded, so vLLM wraps only the rest: no punica kernels on attention.
+            # vLLM < 0.20 lacks the arg and the filter below drops it (still exact, just no gain).
+            engine_args["lora_target_modules"] = list(_MERGED_ROLLOUT_PUNICA_MODULES)
         if _is_gemma4_config(config) and use_bitsandbytes:
             gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
                 getattr(config, "quantization_config", None)
@@ -3984,6 +3988,7 @@ def load_vllm(
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
         llm.approx_max_num_seqs = approx_max_num_seqs
         if _merged_rollout_enabled():
+            llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)
         if _UNSLOTH_FLASHINFER_UNUSABLE:
             # This engine now depends on the block for its lazy run time imports.
@@ -4645,7 +4650,12 @@ def _check_lora_is_servable(model, keys, source, peft_config):
         "This is usually a checkpoint-name against vLLM-module-name mismatch for the "
         "architecture (see vllm-project/vllm#34186 and #41754), not a problem with "
         "training. Use fast_inference=False, or target modules vLLM serves.\n"
-        "Set UNSLOTH_DISABLE_LORA_NAME_CHECK=1 to load anyway."
+        + (
+            "UNSLOTH_VLLM_MERGED_ROLLOUT=attention builds vLLM with LoRA only on non-attention modules, "
+            "so attention LoRA must be foldable (16-bit, plain LoRA); set it to 1 or unset it.\n"
+            if _merged_rollout_mode() == "attention" else ""
+        )
+        + "Set UNSLOTH_DISABLE_LORA_NAME_CHECK=1 to load anyway."
     )
 pass
 
@@ -4663,13 +4673,31 @@ _MERGED_ROLLOUT_NON_LANGUAGE = re.compile(
 _MERGED_ROLLOUT_EMBEDDING_LEAVES = frozenset((
     "embed_tokens", "lm_head", "wte", "wpe", "embed_in", "embed_out", "word_embeddings", "output",
 ))
+_MERGED_ROLLOUT_ATTENTION = re.compile(r"(?:^|\.)(?:self_attn|attn|attention|self_attention)(?:\.|$)")
+# vLLM module suffixes left on LoRA in attention mode (MLP, MoE experts, linear attention, conv).
+# Over-inclusion only wraps a module with no LoRA; a missing suffix fails loudly in _check_lora_is_servable.
+_MERGED_ROLLOUT_PUNICA_MODULES = (
+    "gate_up_proj", "gate_proj", "up_proj", "down_proj", "experts",
+    "w1", "w2", "w3", "w13", "fc1", "fc2", "c_fc", "dense_h_to_4h", "dense_4h_to_h",
+    "in_proj", "out_proj", "in_proj_qkvz", "in_proj_ba", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
+)
 # Covers every wrapped engine call, so no call (merged or not) can see folded weights.
 _MERGED_ROLLOUT_LOCK = threading.RLock()
 
 
+def _merged_rollout_mode():
+    """"all" (=1): fold every LoRA layer. "attention": fold attention only, the rest stays on vLLM LoRA."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    value = os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "0").strip().lower()
+    if value == "1": return "all"
+    if value in ("attention", "attn"): return "attention"
+    return None
+pass
+
+
 def _merged_rollout_enabled():
     # All Unsloth Zoo code licensed under LGPLv3
-    return os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "0") == "1"
+    return _merged_rollout_mode() is not None
 pass
 
 
@@ -4746,17 +4774,20 @@ pass
 
 class _MergedRolloutState(_MergedRolloutVerdict):
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = ("entries", "depth", "poisoned", "model_ref", "engine_ref", "stream", "host")
+    __slots__ = ("entries", "depth", "poisoned", "model_ref", "engine_ref", "stream", "host", "folded", "rest")
 
     def __init__(self, model, entries):
         self.entries = entries   # (lora module, W the shared base weight, P its pristine copy on the host)
         self.stream = None       # side stream for the host to device restore
         self.host = None         # P's arena and its page-lock (unregistered before the arena is freed)
+        self.folded = frozenset()  # module names folded; their LoRA tensors never go to vLLM
+        self.rest = False        # other LoRA layers exist and are served by vLLM LoRA (attention mode)
         self.depth = 0
         self.poisoned = None     # set when the restore failed twice
         self.model_ref = weakref.ref(model)
         self.engine_ref = _merged_rollout_ref(getattr(model, "vllm_engine", None))
-        super().__init__(model, [module for module, _, _ in entries])
+        # Every LoRA layer, folded or not: is_valid_for compares against all of them.
+        super().__init__(model, _merged_rollout_lora_layers(model))
     pass
 pass
 
@@ -4796,8 +4827,9 @@ def _merged_rollout_targets(model):
     config = peft_config[_MERGED_ROLLOUT_ADAPTER]
     if getattr(config, "trainable_token_indices", None):
         return None, "trainable_token_indices adapts the embeddings"
-    if getattr(config, "target_parameters", None):
-        return None, "target_parameters (MoE expert LoRA) is not folded yet"
+    attention_only = _merged_rollout_mode() == "attention"
+    if getattr(config, "target_parameters", None) and not attention_only:
+        return None, "target_parameters (MoE expert LoRA) is not folded (try UNSLOTH_VLLM_MERGED_ROLLOUT=attention)"
 
     adapter = _MERGED_ROLLOUT_ADAPTER
     targets = []
@@ -4808,6 +4840,9 @@ def _merged_rollout_targets(model):
             return None, f"{name} has an embedding LoRA"
         lora_A = getattr(module, "lora_A", None)
         if not isinstance(lora_A, torch.nn.ModuleDict) or len(lora_A) == 0: continue
+        # Attention mode: everything else is served by vLLM LoRA, so it is not checked here.
+        if attention_only and (not _MERGED_ROLLOUT_ATTENTION.search(name) or _MERGED_ROLLOUT_NON_LANGUAGE.search(name)):
+            continue
 
         if _is_moe_expert_lora_key(name + ".lora_A.weight"):
             return None, f"{name} is a MoE expert LoRA"
@@ -4853,7 +4888,7 @@ def _merged_rollout_targets(model):
         targets.append((name, module, W))
     pass
     if len(targets) == 0:
-        return None, "there are no LoRA Linear layers"
+        return None, "there are no attention LoRA layers" if attention_only else "there are no LoRA Linear layers"
 
     # Each fold starts from P: two LoRA layers sharing a base weight would overwrite each other.
     seen = set()
@@ -4924,12 +4959,16 @@ def _prepare_merged_rollout_locked(model):
     entries, host = entries
     state = _MergedRolloutState(model, entries)
     state.host = host
+    state.folded = frozenset(name for name, _, _ in targets)
+    folded_ids = {id(module) for _, module, _ in targets}
+    state.rest = any(id(module) not in folded_ids for module in _merged_rollout_lora_layers(model))
     model._unsloth_merged_rollout_state = state
     nbytes = sum(P.numel() * P.element_size() for _, _, P in entries)
     pinned = "pinned" if getattr(entries[0][2], "is_pinned", lambda: False)() else "pageable"
+    rest = "; the other LoRA layers stay on vLLM LoRA" if state.rest else ""
     _merged_rollout_log_once(
-        f"Unsloth: Merged-weight rollouts on: folding the adapter into {len(entries)} shared weights; "
-        f"pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)."
+        f"Unsloth: Merged-weight rollouts on ({_merged_rollout_mode()}): folding the adapter into {len(entries)} "
+        f"shared weights{rest}; pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)."
     )
     return state
 pass
@@ -5162,6 +5201,21 @@ def _merged_rollout_lora_fallback(request, reason):
 pass
 
 
+def _merged_rollout_rest_request(request):
+    """vLLM LoRA for the layers not folded (attention mode), or None when everything is folded."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    global LORA_REQUEST_ID
+    state = request.state
+    if not state.rest: return None
+    model = state.model_ref()
+    if model is None:
+        raise RuntimeError("Unsloth: the model behind this merged-rollout LoRA request was freed.")
+    if LORA_REQUEST_ID is None: LORA_REQUEST_ID = 1
+    with torch.inference_mode():
+        return _build_lora_request(model, request.save_directory, True, LORA_REQUEST_ID, exclude = state.folded)
+pass
+
+
 def _merged_rollout_call(request, llm, call, cache_was_reset = False):
     # All Unsloth Zoo code licensed under LGPLv3
     state = request.state
@@ -5169,7 +5223,7 @@ def _merged_rollout_call(request, llm, call, cache_was_reset = False):
         # Folding here would change another engine's weights and sample this one's base.
         return call(_merged_rollout_lora_fallback(request, "the request was passed to a different vLLM engine"))
     if state.depth != 0:
-        with merged_rollout(state): return call(None)
+        with merged_rollout(state): return call(_merged_rollout_rest_request(request))
     model = state.model_ref()
     if state.poisoned is None and (model is None or not state.is_valid_for(model)):
         # Adapter or base changed while held: rebuild, never fold a stale P.
@@ -5184,8 +5238,9 @@ def _merged_rollout_call(request, llm, call, cache_was_reset = False):
     if not cache_was_reset and not _reset_merged_rollout_prefix_cache(llm):
         return call(_merged_rollout_lora_fallback(request, "vLLM did not reset its prefix cache before the fold"))
     llm._unsloth_merged_rollout_last = weakref.ref(state)
+    rest_request = _merged_rollout_rest_request(request)
     try:
-        with merged_rollout(state): return call(None)
+        with merged_rollout(state): return call(rest_request)
     finally:
         if not _reset_merged_rollout_prefix_cache(llm):
             llm._unsloth_merged_rollout_dirty = True
@@ -5287,7 +5342,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
 pass
 
 
-def _build_lora_request(model, save_directory, load_tensors, lora_request_id):
+def _build_lora_request(model, save_directory, load_tensors, lora_request_id, exclude = None):
     # All Unsloth Zoo code licensed under LGPLv3
     global LORA_REQUEST_ID
     if not load_tensors and not os.path.exists(save_directory):
@@ -5300,6 +5355,10 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id):
         state_dict = model.state_dict()
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
+        if exclude:
+            # Folded into the base weights already: sending them too would apply the delta twice.
+            state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}
+            if len(state_dict) == 0: return None
 
         state_dict = _remap_moe_expert_lora_keys(model, state_dict)
         _check_lora_is_servable(model, list(state_dict), "the training model", peft_config)
