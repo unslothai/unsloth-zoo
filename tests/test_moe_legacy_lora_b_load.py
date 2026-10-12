@@ -225,3 +225,18 @@ def test_hub_reread_uses_the_options_peft_was_given(monkeypatch):
         })
     assert calls[-1]["cache_dir"] == "/custom/cache" and calls[-1]["revision"] == "abc"
     assert calls[-1]["token"] == "hf_x" and "is_trainable" not in calls[-1]
+
+
+def test_offloaded_lora_b_is_refused_not_half_repacked(tmp_path, patched_load, monkeypatch):
+    _legacy_adapter(tmp_path, _keep)
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT)
+    loaded = PeftModel.from_pretrained(_base(), str(tmp_path))
+    wrappers = [m for m in loaded.modules() if getattr(m, "parameter_name", None) in ("gate_up_proj", "down_proj")]
+    before = {id(m): m.lora_B["default"].weight.detach().clone() for m in wrappers[1:]}
+    offloaded = wrappers[0].lora_B["default"]
+    offloaded.weight = torch.nn.Parameter(torch.empty_like(offloaded.weight, device = "meta"))
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    with pytest.raises(RuntimeError, match = "offloaded"):
+        MU.convert_legacy_lora_b(loaded, "default", config)
+    for m in wrappers[1:]:
+        assert torch.equal(m.lora_B["default"].weight, before[id(m)])

@@ -4170,7 +4170,8 @@ def _experts_family(module):
 
 def saved_lora_b_layouts(config) -> dict:
     """{parameter_name: layout} from the #1232 marker, else {None: grouped_by_expert} for a
-    marker-less Unsloth save (`unsloth_fixed`) with fused expert targets, i.e. pre-2026.9.6."""
+    marker-less Unsloth save (`unsloth_fixed`) with fused expert targets: Unsloth only wrote
+    `target_parameters` from #450 (2026-02-05), so that is the 2026.9.5-or-older window."""
     if not isinstance(config, dict):
         return {}
     detail = config.get(FUSED_EXPERT_LORA_DETAIL_KEY)
@@ -4203,7 +4204,7 @@ def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
     layouts = saved_lora_b_layouts(config)
     if not layouts:
         return 0
-    converted = 0
+    targets = []
     for module in peft_model.modules():
         parameter_name = getattr(module, "parameter_name", None)
         if parameter_name not in _SEPARATED_MOE_LORA_PARAMETER_NAMES:
@@ -4224,11 +4225,18 @@ def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
         rank = weight.shape[1] // num_experts
         if rank <= 1 or rank * num_experts != weight.shape[1]:
             continue
+        targets.append((weight, num_experts, rank))
+    if any(weight.device.type == "meta" for weight, _, _ in targets):
+        # Accelerate holds disk-offloaded weights elsewhere; repacking only some would mix layouts.
+        raise RuntimeError(
+            "fused expert lora_B is offloaded, so it cannot be repacked in place; set "
+            "UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert to load this pre-2026.9.6 adapter"
+        )
+    for weight, num_experts, rank in targets:
         permutation = _moe_lora_b_column_permutation(num_experts, rank, weight.device, invert = True)
         with torch.no_grad():
             weight.copy_(weight.index_select(1, permutation))
-        converted += 1
-    return converted
+    return len(targets)
 
 
 def _has_fused_expert_lora(peft_model, adapter_name) -> bool:
