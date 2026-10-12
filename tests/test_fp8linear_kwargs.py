@@ -25,7 +25,6 @@ KWARGS = dict(in_features = 0, out_features = 0, has_bias = False, dtype = "bf16
 
 
 def test_real_fp8linear_builds_with_the_filtered_kwargs():
-    # transformers 5.10+ FP8Linear.__init__ has no `dtype`; passing it raised TypeError.
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     layer = fp8.FP8Linear(**_accepted_kwargs(fp8.FP8Linear, KWARGS))
     assert layer.block_size == (128, 128)
@@ -51,7 +50,6 @@ def test_dtype_is_kept_where_the_signature_takes_it():
 
 
 def test_real_fbgemm_fp8linear_builds_with_the_filtered_kwargs():
-    # transformers 5.x FbgemmFp8Linear takes `dtype`; 4.x took `weight_dtype`.
     fbgemm = pytest.importorskip("transformers.integrations.fbgemm_fp8")
     import torch
     kwargs = dict(in_features = 0, out_features = 0, bias = False, weight_dtype = torch.bfloat16, dtype = torch.bfloat16)

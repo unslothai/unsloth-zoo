@@ -925,14 +925,11 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
     """
     if not torch.is_grad_enabled() or not isinstance(output, torch.Tensor) or output.grad_fn is None:
         return
-    # A forward running inside backward is a gradient checkpointing recompute (Unsloth's and reentrant
-    # checkpointing): this layer's backward follows at once, so releasing would only re-dequantize.
+    # A forward inside backward is a checkpoint recompute: releasing would only re-dequantize.
     _graph_task_id = getattr(torch._C, "_current_graph_task_id", None)
     if _graph_task_id is not None and _graph_task_id() != -1:
         return
-    # Non-reentrant checkpointing recomputes the banks in backward; refilling the originals would hold two.
-    # torch < 2.8 has no way to read the active saved-tensor hooks, so keep the bank there rather than
-    # risk two of them under a checkpoint we cannot see.
+    # Non-reentrant checkpointing recomputes banks (refill would hold two); torch < 2.8 cannot detect it, so keep.
     _top_hooks = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
     if _top_hooks is None:
         return
@@ -961,8 +958,7 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
             storage.resize_(0)
 
     def refill(*args):
-        # Grad mode is on inside backward only for create_graph=True: the new graph saves these banks
-        # for the next derivative, so from then on they stay allocated, as without the release.
+        # Grad mode in backward means create_graph=True: the new graph keeps these banks anyway.
         if torch.is_grad_enabled():
             keep.append(True)
         with torch.no_grad():
@@ -978,8 +974,7 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
                 for start in range(0, base.shape[0], step):
                     end = min(start + step, base.shape[0])
                     piece_base = base[start:end]
-                    # Scales indexed by expert ((E, 1), (E, M), (E, N), 3-D block grids) follow the chunk;
-                    # a scalar or a 1-D scale shared by every expert does not.
+                    # Per-expert scales follow the chunk; scalar / 1-D shared scales do not.
                     expert_indexed = isinstance(quant, torch.Tensor) and quant.ndim >= 2 and quant.shape[0] == base.shape[0]
                     piece_quant = quant[start:end] if expert_indexed else quant
                     if block_size is not None:
@@ -988,8 +983,7 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
                     piece = _dequantize_full_expert_weights(piece_base, piece_quant, target.dtype, quant_kind = quant_kind)
                     target[start:end].copy_(piece)
                     del piece
-        # Always free once this backward pass ends: the input hook below frees earlier, but it never
-        # runs when the inputs are frozen or autograd prunes their gradient (autograd.grad / inputs=).
+        # Fallback free at backward end: the input hook never runs for frozen / pruned inputs.
         torch.autograd.Variable._execution_engine.queue_callback(free)
         return None
 

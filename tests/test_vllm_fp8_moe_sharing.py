@@ -269,9 +269,7 @@ def test_missing_fp8_experts_is_refused_cleanly(monkeypatch):
     dict(ignore = ["re:.*experts.*"]),
 ])
 def test_unquantized_experts_are_left_to_the_16bit_path(skip):
-    # FP8 attention with 16-bit experts: vLLM keeps the experts 16-bit, which are shared as before.
     assert fp8_moe_checkpoint_scheme(_qcfg(weight_block_size = None, **skip)) is None
-    # A shareable block checkpoint keeps its verdict (Unsloth still pins the Triton FP8 MoE kernel).
     assert fp8_moe_checkpoint_scheme(_qcfg(**skip)) == (True, None)
 
 

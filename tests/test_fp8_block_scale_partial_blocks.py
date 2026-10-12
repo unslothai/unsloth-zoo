@@ -48,20 +48,15 @@ def _slices(widths, block):
 
 
 def test_aligned_fused_slices_are_disjoint():
-    # qkv [4096, 1024, 1024] at block 128: exactly the old floor offsets.
     assert _slices([4096, 1024, 1024], 128) == [(0, 32), (32, 40), (40, 48)]
 
 
 def test_small_projections_inside_one_block_share_it():
-    # Three 16-row projections in one 128-row block: one scale covers every row of each.
     assert _slices([16, 16, 16], 128) == [(0, 1), (0, 1), (0, 1)]
-    # Aligned start, partial end: local row 0 is a block start, so local block indexing is right.
     assert _slices([200], 128) == [(0, 2)]
 
 
 def test_a_slice_starting_mid_block_and_crossing_a_boundary_is_refused():
-    # [200, 100]: the second slice covers rows 200-299 = 56 rows of block 1 then 44 of block 2,
-    # but the rebuilt layer would apply its first scale to local rows 0-127.
     with pytest.raises(ValueError, match = "crosses into the next"):
         _slices([200, 100], 128)
 

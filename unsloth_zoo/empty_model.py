@@ -1726,8 +1726,7 @@ def fp8_moe_checkpoint_scheme(config):
     if not is_fp8: return None
     verdict = _fp8_moe_block_verdict(method, quant, text_config)
     if not verdict[0] and _quant_config_skips_experts(quant):
-        # The checkpoint keeps its experts unquantized, so vLLM holds them in 16-bit and they are
-        # shared like a BF16 checkpoint's; vllm_moe_expert_descriptor checks the runtime tensors.
+        # Unquantized experts stay 16-bit in vLLM and are shared like BF16.
         return None
     return verdict
 pass
@@ -2036,7 +2035,6 @@ def extract_moe_layers(
     for key, name in (("w13", "gate_up_proj"), ("w2", "down_proj")):
         found[key].requires_grad_(False)
         store(f"{prefix}.experts.{name}", found[key].data)
-        # FP8: the dequant multipliers vLLM's Triton kernel reads, aliased the same way.
         scale = found[f"{key}_scale_inv"]
         if scale is not None:
             scale.requires_grad_(False)

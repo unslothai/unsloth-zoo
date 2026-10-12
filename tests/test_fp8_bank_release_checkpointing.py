@@ -70,7 +70,6 @@ def test_reentrant_checkpoint_recompute_keeps_the_bank(bank):
     seen = []
     out = tuc.checkpoint(lambda h: _layer(h, base, quant, seen), x, use_reentrant = True)
     out.float().square().sum().backward()
-    # First forward under no_grad, recompute inside backward: neither releases, nothing is re-dequantized.
     assert len(seen) == 2 and all(nbytes > 0 for nbytes in seen), seen
     assert refills == []
     ref_x = x.detach().clone().requires_grad_(True)
@@ -79,7 +78,6 @@ def test_reentrant_checkpoint_recompute_keeps_the_bank(bank):
 
 
 def test_refill_keeps_the_block_size_of_a_non_aligned_bank():
-    # H = 192 is not a multiple of 128: a sliced bank without block_size would infer 96-wide blocks.
     torch.manual_seed(0)
     experts, rows, hidden = 2, 256, 192
     base = torch.randn(experts, rows, hidden).to(torch.float8_e4m3fn)
@@ -88,7 +86,6 @@ def test_refill_keeps_the_block_size_of_a_non_aligned_bank():
     dequantized = M._dequantize_full_expert_weights(base, scale, torch.float32, quant_kind = "weight_scale_inv")
     reference = dequantized.clone()
     x = torch.randn(3, hidden, requires_grad = True)
-    # F.linear saves the bank's own storage (a view), so the input gradient reads the refilled values.
     out = torch.nn.functional.linear(x, dequantized.view(-1, hidden))
     M._release_dequantized_banks_until_backward(out, x, ((dequantized, base, scale, "weight_scale_inv"),))
     out.square().sum().backward()
@@ -115,7 +112,6 @@ def test_non_reentrant_checkpoint_does_not_refill_the_discarded_bank(bank):
     seen = []
     out = tuc.checkpoint(lambda h: _layer(h, base, quant, seen), x, use_reentrant = False)
     out.float().square().sum().backward()
-    # The first forward under checkpoint hooks keeps its bank (the recompute may stop before this hook).
     assert seen and all(nbytes > 0 for nbytes in seen), seen
     assert refills == []
     ref_x = x.detach().clone().requires_grad_(True)
@@ -124,8 +120,7 @@ def test_non_reentrant_checkpoint_does_not_refill_the_discarded_bank(bank):
 
 
 def test_bank_is_kept_when_checkpoint_hooks_cannot_be_inspected(bank, monkeypatch):
-    # torch 2.6 has no _top_saved_tensors_default_hooks: a non-reentrant checkpoint would be invisible,
-    # so the bank must stay (no release, no refill) rather than risk holding two.
+    # torch 2.6 cannot see a non-reentrant checkpoint, so the bank must stay.
     base, quant, refills = bank
     monkeypatch.delattr(torch._C._autograd, "_top_saved_tensors_default_hooks", raising = False)
     x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
@@ -138,8 +133,6 @@ def test_bank_is_kept_when_checkpoint_hooks_cannot_be_inspected(bank, monkeypatc
 
 @pytest.mark.parametrize("scale_shape", [(16, 1), (16, N)])
 def test_refill_slices_per_expert_2d_scales(scale_shape):
-    # Real dequantizer, 16 experts so the refill runs in 8 chunks; (E, 1) / (E, M) scales must be
-    # chunked with the weight or the dequantizer sees a short weight with all E scale rows.
     torch.manual_seed(0)
     base = torch.randn(16, N, K).to(torch.float8_e4m3fn)
     scale = torch.rand(*scale_shape) + 0.5
@@ -157,8 +150,7 @@ def test_refill_slices_per_expert_2d_scales(scale_shape):
 
 
 def test_refilled_bank_is_released_when_autograd_prunes_the_input_gradient(bank):
-    # The output node also depends on routing weights r. Asking only for r's gradient runs that node
-    # (so the bank is refilled) but prunes the x branch, so x's release hook never fires.
+    # Asking only for r's gradient refills the bank but prunes x, so x's release hook never fires.
     base, quant, refills = bank
     x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
     r = torch.rand(3, N, dtype = torch.bfloat16, requires_grad = True)
@@ -171,7 +163,6 @@ def test_refilled_bank_is_released_when_autograd_prunes_the_input_gradient(bank)
 
 
 def test_create_graph_backward_keeps_the_bank_for_the_second_derivative(bank):
-    # A plain matmul on a view saves the bank's own storage in the higher-order graph.
     base, quant, refills = bank
     x = torch.randn(3, K, dtype = torch.float32, requires_grad = True)
     dequantized = (base.to(torch.float32) * quant).contiguous()
