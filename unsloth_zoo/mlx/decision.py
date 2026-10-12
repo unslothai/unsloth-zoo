@@ -746,6 +746,14 @@ def _lora_key(name):
     return name[name.index("layers.") :] if "layers." in name else name.rsplit(".", 1)[-1]
 
 
+def _off_decoder(stem):
+    """Whether an adapter stem's prefix, which `_lora_key` drops, names a tower, a projector or the talker."""
+    from .loader import _OTHER_MODALITY_TOKENS, _STRONG_PROJECTOR_TOKENS, _VISION_ROLE_TOKENS, _role_tokens
+
+    prefix = stem.partition("layers.")[0] if "layers." in stem else stem.rpartition(".")[0]
+    return bool(_role_tokens(prefix) & (_VISION_ROLE_TOKENS | _OTHER_MODALITY_TOKENS | _STRONG_PROJECTOR_TOKENS))
+
+
 def _attach_lora(model, folder):
     """Put a plain LoRA adapter on the modules it names, as adapters of their own, which a quantized base takes too."""
     from mlx_lm.tuner.lora import LoRALinear
@@ -755,9 +763,9 @@ def _attach_lora(model, folder):
     config, adapter = _plain_lora(folder), mx.load(str(folder / "adapter_model.safetensors"))
     named = {name.rsplit(".lora_", 1)[0] for name in adapter}
     stems = {_lora_key(stem): stem for stem in named}
-    if len(stems) != len(named):
-        # Same-numbered layers of two towers would collapse into one key and one of them be dropped or misapplied.
-        raise ValueError(f"The adapter in {folder} is on more than one tower; only the decoder's adapters can be put on a Clef")
+    # Keys drop the prefix that says which tower a layer is in: same-numbered layers would collapse or land on the decoder.
+    if len(stems) != len(named) or any(_off_decoder(stem) for stem in named):
+        raise ValueError(f"The adapter in {folder} is on a tower besides the decoder; only the decoder's adapters can be put on a Clef")
     if "lm_head" in stems:
         raise ValueError(f"The adapter in {folder} is on the output embedding, which a Clef's joint head reads as stored")
     # An audio tower numbers its layers as the decoder does, whose adapter this is.
@@ -971,9 +979,18 @@ class _QwenModel(DecisionPipeline):
         if load_in_4bit:
             # The loader leaves the embeddings, the output head and the towers in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
-            # A tower and what embeds its output are named for what they read.
-            read = [kind for kind, reads in (("vision", self.reads_images), ("audio", self.reads_audio)) if reads]
-            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not any(kind in path for kind in read) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
+            # A tower read and the projectors that embed its output keep their precision, named as the loader names them.
+            from .loader import _OTHER_MODALITY_TOKENS, _STRONG_PROJECTOR_TOKENS, _VISION_ROLE_TOKENS, _role_tokens
+            from .utils import _get_text_model
+
+            kept = (_VISION_ROLE_TOKENS if self.reads_images else frozenset()) | (_OTHER_MODALITY_TOKENS - {"talker"} if self.reads_audio else frozenset())
+            kept |= _STRONG_PROJECTOR_TOKENS if kept else frozenset()
+            # The decoder is quantized whatever its layers are called (Gemma 3n's `per_layer_projection`).
+            decoder = {id(module) for _, module in _get_text_model(self.model).named_modules()}
+            nn.quantize(
+                self.model, 64, 4,
+                class_predicate = lambda path, module: (id(module) in decoder or not _role_tokens(path) & kept) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0,
+            )
         self.model.eval()
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
@@ -2409,9 +2426,13 @@ def clef_training_network(
             # The head reads the output embedding without training it.
             output.module.freeze()
     else:
-        if target_modules in (None, "all-linear"):
-            target_modules = [name for name in _CLEF_LORA_TARGETS if not reaches({name})]
-        elif hit := reaches({target_modules} if isinstance(target_modules, str) else set(target_modules)):
+        named = [target_modules] if isinstance(target_modules, str) else list(target_modules or ())
+        if target_modules is None or "all-linear" in named:
+            # Expanded here as the loader would, without the stacked experts; names given beside it are kept.
+            defaults = [name for name in _CLEF_LORA_TARGETS if not reaches({name})]
+            named = [name for name in named if name != "all-linear"]
+            target_modules = defaults + [name for name in named if name not in defaults]
+        if hit := reaches(set(named)):
             # An adapter over the stacked experts of a mixture has no one checkpoint tensor to be merged into, in any layout.
             raise ValueError(f"Unsloth: adapters on the stacked experts of a mixture cannot be saved; target_modules reaches {hit}.")
         # Checkpointing is applied around each run instead, so it is gone again when the model serves.

@@ -862,9 +862,11 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
             # Qwen3-Omni keeps its towers inside its thinker.
             loaded[True].thinker = Sequential()
             loaded[True].thinker.vision_tower, loaded[True].thinker.audio_tower = Linear(64, 64), Linear(64, 64)
+            # A projector between a tower and the decoder too, as other families name it; never the talker.
+            loaded[True].multi_modal_projector, loaded[True].thinker.talker = Linear(64, 64), Linear(64, 64)
             _QwenModel._load(SimpleNamespace(reads_images = reads[0], reads_audio = reads[1]), tmp_path, None, None, None, None, True)
-            kept = ["scales" not in tower for tower in (loaded[True].vision_tower, loaded[True].thinker.vision_tower, loaded[True].thinker.audio_tower)]
-            assert kept == [reads[0], reads[0], reads[1]]
+            towers = (loaded[True].vision_tower, loaded[True].thinker.vision_tower, loaded[True].thinker.audio_tower, loaded[True].multi_modal_projector, loaded[True].thinker.talker)
+            assert ["scales" not in tower for tower in towers] == [reads[0], reads[0], reads[1], any(reads), False]
     network = clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
     if mode == "qlora":
         # Adapters over quantized layers receive gradients.
@@ -1268,11 +1270,11 @@ def test_a_plain_omni_model_trains_as_a_clef_on_images_and_audio(clef, tmp_path,
         clef_training_item(pipeline, "s", questions, None, None, [clip] * 9)
 
     # What could not be saved afterwards is refused before it trains.
-    stacks = ["q_proj", "up_proj"], ["mlp.switch_mlp.up_proj"], "switch_mlp"
+    stacks = ["q_proj", "up_proj"], ["mlp.switch_mlp.up_proj"], "switch_mlp", ["all-linear", "up_proj"]
     for refused, why in (({"full_finetuning": True}, "each expert of its mixture apart"), *(({"target_modules": names}, "stacked experts") for names in stacks)):
         with pytest.raises(ValueError, match = why):
             clef_training_network(pipeline, **refused)
-    network = clef_training_network(pipeline, r = 4, lora_alpha = 4)
+    network = clef_training_network(pipeline, r = 4, lora_alpha = 4, target_modules = ["all-linear"])
     adapted = [path for path, module in pipeline.model.named_modules() if "lora_a" in module]
     # Not on the stacked experts, which have no one tensor in the checkpoint, nor on a tower.
     assert {path.rsplit(".", 1)[-1] for path in adapted} == {"q_proj", "k_proj", "v_proj", "o_proj"} and all(path.startswith("thinker.language_model.") for path in adapted)

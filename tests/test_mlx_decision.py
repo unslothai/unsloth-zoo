@@ -416,7 +416,10 @@ def test_an_adapter_on_two_towers_of_the_same_layer_numbers_is_refused(tmp_path)
 
     (tmp_path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 2}))
     pair = {"lora_A.weight": mx.zeros((2, 4)), "lora_B.weight": mx.zeros((4, 2))}
-    stems = ("base_model.model.thinker.model.layers.0.self_attn.q_proj", "base_model.model.thinker.audio_tower.layers.0.self_attn.q_proj")
-    mx.save_safetensors(str(tmp_path / "adapter_model.safetensors"), {f"{stem}.{name}": value for stem in stems for name, value in pair.items()})
-    with pytest.raises(ValueError, match = "more than one tower"):
-        decision._attach_lora(None, tmp_path)
+    decoder, audio = "base_model.model.thinker.model.layers.0.self_attn.q_proj", "base_model.model.thinker.audio_tower.layers.0.self_attn.q_proj"
+    # Together they collapse into one key; alone the tower's would land on the decoder's layer of its number.
+    for stems in ((decoder, audio), (audio,), ("base_model.model.thinker.talker.model.layers.1.mlp.up_proj",), ("base_model.model.multi_modal_projector.linear_1",)):
+        mx.save_safetensors(str(tmp_path / "adapter_model.safetensors"), {f"{stem}.{name}": value for stem in stems for name, value in pair.items()})
+        with pytest.raises(ValueError, match = "tower besides the decoder"):
+            decision._attach_lora(None, tmp_path)
+    assert not any(map(decision._off_decoder, (decoder, "base_model.model.model.language_model.layers.3.mlp.down_proj", "base_model.model.model.layers.2.self_attn.o_proj")))
