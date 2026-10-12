@@ -435,3 +435,21 @@ def test_an_adapter_on_two_towers_of_the_same_layer_numbers_is_refused(tmp_path)
             decision._attach_lora(model, tmp_path)
     kept = (decoder, "base_model.model.model.language_model.layers.3.mlp.down_proj", "base_model.model.llm.model.layers.2.self_attn.o_proj", "language_model.model.layers.0")
     assert not any(decision._off_decoder(stem, {"model"}) for stem in kept)
+
+
+def test_decoded_clips_share_the_audio_duration_budget(monkeypatch):
+    monkeypatch.setattr(decision, "_MAX_AUDIO_SECONDS", 1)
+    clip = {"array": np.zeros(12000, np.float32), "sampling_rate": 16000}
+    assert len(decision._clips([clip])) == 1
+    with pytest.raises(DecisionRequestError, match = "longer than 1 seconds"):
+        decision._clips([clip, clip])
+
+
+def test_minicpm_decoder_weights_map_back_to_its_llm_namespace():
+    wrapper = {"language_model": None}
+    path = "language_model.model.layers.0.self_attn.q_proj.weight"
+    # A checkpoint that keeps the causal LM under `llm.`, as MiniCPM-o's does; others keep the vision-language names.
+    assert decision._decoder_tensor_name(wrapper, path, {"llm.model.layers.0.self_attn.q_proj.weight"}) == "llm.model.layers.0.self_attn.q_proj.weight"
+    assert decision._decoder_tensor_name(wrapper, "language_model.lm_head.weight", {"llm.lm_head.weight"}) == "llm.lm_head.weight"
+    assert decision._decoder_tensor_name(wrapper, path, {"model.language_model.layers.0.self_attn.q_proj.weight"}) == "model.language_model.layers.0.self_attn.q_proj.weight"
+    assert decision._decoder_tensor_name(wrapper, path) == "model.language_model.layers.0.self_attn.q_proj.weight"

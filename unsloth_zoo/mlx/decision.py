@@ -1828,13 +1828,15 @@ def _stored_tensors(source):
 def _decoder_tensor_name(decoder, path, stored = ()):
     name = path
     # transformers stores a decoder inside a vision-language or an omni wrapper under other names than it is loaded with.
+    # MiniCPM-o keeps its whole causal LM under `llm.`; the first name the checkpoint holds wins.
     wrappers = {
-        "language_model": (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")),
+        "language_model": (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head."), ("language_model.", "llm.")),
         "thinker": (("thinker.language_model.model.", "thinker.model."), ("thinker.language_model.lm_head.", "thinker.lm_head.")),
     }
     for wrapper, renamed in wrappers.items():
         if wrapper in decoder:
-            name = next((saved + path[len(prefix) :] for prefix, saved in renamed if path.startswith(prefix)), None)
+            names = [saved + path[len(prefix) :] for prefix, saved in renamed if path.startswith(prefix)]
+            name = next((found for found in names if found in stored), names[0] if names else None)
     # An MLX conversion keeps the names its weights are loaded with.
     if name not in stored and path in stored:
         return path
@@ -2626,6 +2628,9 @@ def _clips(audio):
             if samples.ndim != 1 or not samples.size or clip.get("sampling_rate") != _AUDIO_RATE:
                 raise DecisionRequestError(f'a decoded audio clip must be {{"array", "sampling_rate"}} with mono samples at {_AUDIO_RATE} Hz')
         clips.append(next(decoded) if isinstance(clip, str) else samples)
+    # The same budget as encoded clips, over both kinds together.
+    if sum(map(len, clips)) > _MAX_AUDIO_SECONDS * _AUDIO_RATE:
+        raise DecisionRequestError(f"the audio is longer than {_MAX_AUDIO_SECONDS} seconds")
     return clips
 
 
