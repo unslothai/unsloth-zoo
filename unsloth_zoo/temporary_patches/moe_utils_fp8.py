@@ -234,6 +234,9 @@ def _dequantize_expert_slice(
     return expert_weight.to(target_dtype)
 
 
+# Budget for one chunk's temporaries in the block-scaled vectorized dequant (converted weight + expanded scale).
+_VECTORIZED_DEQUANT_CHUNK_BYTES = 256 * 1024 * 1024
+
 def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state, target_dtype: torch.dtype,) -> Optional[torch.Tensor]:
     """Dequantize all experts in one batched op."""
     if weight.ndim != 3 or weight.dtype != torch.float8_e4m3fn:
@@ -244,13 +247,12 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
     E, M, N = weight.shape
     s = quant_state
 
-    w = weight.to(target_dtype)
-    # FP16 flushes small scales: multiply in FP32, mul_ rounds once into w.
+    # FP16 flushes small scales: multiply in FP32 and round once into the target dtype.
     scale_dtype = torch.float32 if target_dtype == torch.float16 else target_dtype
 
     # Per-tensor scalar
     if s.numel() == 1:
-        return w.mul_(s.to(scale_dtype).view(1, 1, 1))
+        return weight.to(target_dtype).mul_(s.to(scale_dtype).view(1, 1, 1))
 
     # 3D block scales: (E, ceil(M/bm), ceil(N/bn))
     if s.ndim == 3 and s.shape[0] == E:
@@ -258,19 +260,29 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
         p, q = s.shape[1], s.shape[2]
         if p == 1 and q == 1:
             # One scale per expert already broadcasts over (E, M, N).
-            return w.mul_(s.to(scale_dtype))
+            return weight.to(target_dtype).mul_(s.to(scale_dtype))
         if block_size is not None and len(block_size) == 2:
             bm, bn = block_size
         else:
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
-        # Expand block scales (E, p, q) -> (E, p*bm, q*bn), trim to (E, M, N)
-        s_expanded = (
-            s.to(scale_dtype)
-            .repeat_interleave(bm, dim=1)[:, :M, :]
-            .repeat_interleave(bn, dim=2)[:, :, :N]
-        )
-        return w.mul_(s_expanded)
+        # Chunk over experts: whole-stack expansion peaked at 3x the dequantized size.
+        out = torch.empty((E, M, N), dtype=target_dtype, device=weight.device)
+        # A chunk holds the converted weight and the expanded scale (FP32 when the target is FP16).
+        per_expert = M * N * (out.element_size() + torch.finfo(scale_dtype).bits // 8)
+        step = max(1, _VECTORIZED_DEQUANT_CHUNK_BYTES // max(per_expert, 1))
+        for e0 in range(0, E, step):
+            e1 = min(E, e0 + step)
+            s_expanded = (
+                s[e0:e1].to(scale_dtype)
+                .repeat_interleave(bm, dim=1)[:, :M, :]
+                .repeat_interleave(bn, dim=2)[:, :, :N]
+            )
+            # In place, not mul(out=): autograd rejects out= when the scale requires grad (FP8Experts parameters).
+            out[e0:e1].copy_(weight[e0:e1]).mul_(s_expanded)
+        return out
+
+    w = weight.to(target_dtype)
 
     # 2D per-row scales: (E, M) or (E, 1)
     if s.ndim == 2 and s.shape[0] == E:
@@ -307,6 +319,13 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
     try:
         from unsloth.kernels.fp8 import weight_dequant_block
     except ImportError:
+        return None
+    try:
+        from unsloth.kernels.fp8 import _fp8_kernel_unsupported
+    except ImportError:
+        _fp8_kernel_unsupported = None
+    # fp8e4nv does not compile on pre-sm89 CUDA, nor on most AMD archs with triton < 3.5 (unsloth's guard).
+    if _fp8_kernel_unsupported is not None and _fp8_kernel_unsupported(weight):
         return None
 
     E, M, N = weight.shape
