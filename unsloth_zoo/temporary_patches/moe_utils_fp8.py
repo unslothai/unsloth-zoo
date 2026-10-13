@@ -245,11 +245,9 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
     E, M, N = weight.shape
     s = quant_state
 
-    w = weight.to(target_dtype)
-
     # Per-tensor scalar
     if s.numel() == 1:
-        return w * s.to(target_dtype).view(1, 1, 1)
+        return weight.to(target_dtype) * s.to(target_dtype).view(1, 1, 1)
 
     # 3D block scales: (E, ceil(M/bm), ceil(N/bn))
     if s.ndim == 3 and s.shape[0] == E:
@@ -260,14 +258,13 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
             # it first allocates a second full-size tensor: +4.00 GiB measured
             # on the (128, 4096, 4096) Mistral-Small-4-119B layout, on top of
             # the 8 GiB the converted weight and the result already need.
-            return w * s.to(target_dtype)
+            return weight.to(target_dtype) * s.to(target_dtype)
         if block_size is not None and len(block_size) == 2:
             bm, bn = block_size
         else:
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
-        # Chunk over experts: whole-stack expansion peaked at 3x the dequantized size.
-        del w
+        # Chunk over experts (each chunk converted once): whole-stack expansion peaked at 3x the dequantized size.
         out = torch.empty((E, M, N), dtype=target_dtype, device=weight.device)
         per_expert = M * N * out.element_size()
         # Two full-size temporaries live per chunk: weight[e0:e1].to(dtype) and s_expanded.
@@ -281,6 +278,8 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
             )
             torch.mul(weight[e0:e1].to(target_dtype), s_expanded, out=out[e0:e1])
         return out
+
+    w = weight.to(target_dtype)
 
     # 2D per-row scales: (E, M) or (E, 1)
     if s.ndim == 2 and s.shape[0] == E:

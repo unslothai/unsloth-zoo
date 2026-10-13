@@ -117,3 +117,20 @@ def test_real_device_full_expert_dequant_matches_reference():
     torch.cuda.synchronize()
     ref = w.float() * s.repeat_interleave(128, 1).repeat_interleave(128, 2)
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
+
+
+def test_block_scaled_dequant_converts_each_expert_once(monkeypatch):
+    # The block-scaled branch converts chunk by chunk; a whole-stack conversion first would be wasted work.
+    w, s = _block_scaled(4, 256, 256, "cpu")
+    seen = []
+    real_to = torch.Tensor.to
+
+    def counting_to(self, *args, **kwargs):
+        if self.dtype == torch.float8_e4m3fn:
+            seen.append(self.shape[0])
+        return real_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", counting_to)
+    F._dequantize_full_expert_weights_vectorized(w, s, torch.bfloat16)
+    monkeypatch.undo()
+    assert sum(seen) == 4, seen
