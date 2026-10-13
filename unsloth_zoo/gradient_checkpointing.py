@@ -943,9 +943,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         device = arg.device
                         device_index = device.index
                         GPU_BUFFER   = GPU_BUFFERS  [device_index]
-                        # The stream compute runs on, not the default one: an in-process vLLM engine
-                        # (fast_inference) switches the current stream, and syncing the offload copies
-                        # with the idle default stream races them against the forward / backward.
+                        # Current, not default stream: in-process vLLM (fast_inference) switches it, and the idle default stream would race the copies.
                         MAIN_STREAM  = _current_gpu_stream(device)
                         EXTRA_STREAM = EXTRA_STREAMS[device_index]
 
