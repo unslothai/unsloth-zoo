@@ -1340,3 +1340,14 @@ def test_moe_experts_refused_without_the_exact_fold(monkeypatch):
     monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "copy")
     targets, reason = _merged_rollout_targets(model)
     assert targets is None and "exact fold" in reason
+
+
+@_cuda
+def test_cuda_failed_self_check_falls_back_to_copy(monkeypatch, capsys):
+    import unsloth_zoo.merged_rollout_exact as ex
+    monkeypatch.setattr(ex, "_SELF_CHECK", {})
+    monkeypatch.setattr(ex, "_self_check", lambda device, dtype: "fold is 3 ulp from the reference")
+    model, llm, vllm_model = _make_model(device = "cuda")
+    state = prepare_merged_rollout(model)
+    assert state is not None and all(P is not None for _, _, P in state.entries)
+    assert "self-check failed" in capsys.readouterr().out

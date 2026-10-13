@@ -157,3 +157,16 @@ def test_changed_adapter_between_fold_and_unfold_is_caught():
     B.add_(0.5)   # flip: d differs at unfold, so the round trip is wrong and must be detected
     with pytest.raises(RuntimeError, match = "checksum mismatch"):
         ex.exact_unfold([t])
+
+
+def test_self_check_passes_and_is_cached():
+    assert ex.exact_merge_available(torch.device("cuda"), torch.bfloat16)
+    assert ex.exact_merge_available(torch.device("cuda"), torch.float16)
+    assert ex.exact_merge_failure(torch.device("cuda"), torch.bfloat16) is None
+
+
+def test_failed_self_check_disables_exact(monkeypatch):
+    monkeypatch.setattr(ex, "_SELF_CHECK", {})
+    monkeypatch.setattr(ex, "_self_check", lambda device, dtype: "unfold is not bit exact")
+    assert not ex.exact_merge_available(torch.device("cuda"), torch.bfloat16)
+    assert ex.exact_merge_failure(torch.device("cuda"), torch.bfloat16) == "unfold is not bit exact"

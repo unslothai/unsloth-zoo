@@ -46,9 +46,50 @@ _COUNT, _FOLD, _UNFOLD = 0, 1, 2
 _BLOCK_N, _BLOCK_K = 32, 128
 
 
-def exact_merge_available(device):
+_SELF_CHECK = {}
+
+
+def exact_merge_available(device, dtype = torch.bfloat16):
+    """Triton + CUDA, and a one-time fold / unfold self-check on this device and dtype passed."""
     # All Unsloth Zoo code licensed under LGPLv3
-    return triton is not None and getattr(device, "type", None) == "cuda" and torch.cuda.is_available()
+    if triton is None or getattr(device, "type", None) != "cuda" or not torch.cuda.is_available():
+        return False
+    key = (torch.device(device).index if torch.device(device).index is not None else torch.cuda.current_device(), dtype)
+    if key not in _SELF_CHECK:
+        try:
+            _SELF_CHECK[key] = _self_check(torch.device("cuda", key[0]), dtype)
+        except Exception as error:
+            _SELF_CHECK[key] = repr(error)
+    return _SELF_CHECK[key] is True
+pass
+
+
+def exact_merge_failure(device, dtype = torch.bfloat16):
+    # All Unsloth Zoo code licensed under LGPLv3
+    index = torch.device(device).index if torch.device(device).index is not None else torch.cuda.current_device()
+    result = _SELF_CHECK.get((index, dtype), None)
+    return None if result is True else result
+pass
+
+
+def _self_check(device, dtype):
+    # Bit-exact restore (incl. -0.0 under a zero delta row) and a fold within 1 ulp of torch.
+    g = torch.Generator(device = device).manual_seed(0)
+    W = (torch.randn(80, 300, device = device, generator = g) * 0.02).to(dtype)
+    A = torch.randn(1, 4, 300, device = device, generator = g).to(dtype)
+    B = torch.randn(1, 80, 4, device = device, generator = g).to(dtype)
+    B[0, 0] = 0
+    W[0, :16] = -0.0
+    W0 = W.clone()
+    t = ExactFoldTarget(W.unsqueeze(0), A, B, 0.37)
+    with torch.cuda.device(device):
+        exact_fold([t])
+        want = (W0.float() + (B[0].double() @ A[0].double() * 0.37).float()).to(dtype)
+        ulps = (W.view(torch.int16).int() - want.view(torch.int16).int()).abs().max().item()
+        exact_unfold([t])
+    if ulps > 1: return f"fold is {ulps} ulp from the reference"
+    if not torch.equal(W.view(torch.int16), W0.view(torch.int16)): return "unfold is not bit exact"
+    return True
 pass
 
 
