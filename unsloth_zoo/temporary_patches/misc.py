@@ -3395,24 +3395,44 @@ def _list_main_input_numel(value):
     return None
 
 
-def _cached_flops_per_token(trainer, original, model, main_input, inputs, value):
-    # Trainer calls floating_point_ops every step, and it walks every module and parameter
-    # (num_parameters) to count FLOPs for the total_flos statistic: 10-30 ms of host time per
-    # step on a 2B LoRA model. The count per token is fixed for one model, so take it from the
-    # first call and scale by the token count after. trainer.state is rebuilt by every train()
-    # call, so a later run (or a different model) measures again.
-    numel = value.numel()
+def _stock_flops_owner(trainer, model, delegates):
+    # The model whose num_parameters the stock formula 6 * tokens * num_parameters(exclude_embeddings=True)
+    # uses, or None when the count is customised. transformers 5.x computes it in Trainer itself; 4.x
+    # delegates to model.floating_point_ops, which a model may override with a nonlinear count.
+    if not delegates:
+        return model if hasattr(model, "num_parameters") else None
+    try:
+        from transformers.modeling_utils import ModuleUtilsMixin
+    except Exception:
+        return None
+    flops = getattr(model, "floating_point_ops", None)
+    owner = getattr(flops, "__self__", None)
+    if getattr(flops, "__func__", None) is not ModuleUtilsMixin.floating_point_ops or owner is None:
+        return None
+    tokens = getattr(owner, "estimate_tokens", None)
+    if getattr(tokens, "__func__", None) is not ModuleUtilsMixin.estimate_tokens:
+        return None
+    return owner
+
+
+def _cached_flops(trainer, original, delegates, model, inputs):
+    # floating_point_ops runs every step and num_parameters walks every module and parameter, milliseconds
+    # of host time per step for the total_flos statistic. Count the parameters once per train() call
+    # (trainer.state is rebuilt by each) for the stock formula only.
+    owner = _stock_flops_owner(trainer, model, delegates)
+    main_input = getattr(owner, "main_input_name", None)
+    value = inputs.get(main_input, None) if owner is not None and hasattr(inputs, "get") else None
+    if not isinstance(value, torch.Tensor):
+        return original(trainer, inputs)
     state = getattr(trainer, "state", None)
-    cache = getattr(trainer, "_unsloth_flops_per_token", None)
-    if cache is not None and cache[0] is model and cache[1] is state and cache[2] == main_input:
-        return cache[3] * numel
-    flops = original(trainer, inputs)
-    if numel > 0 and isinstance(flops, int) and flops % numel == 0:
+    cache = getattr(trainer, "_unsloth_flops_params", None)
+    if cache is None or cache[0] is not owner or cache[1] is not state:
+        cache = (owner, state, owner.num_parameters(exclude_embeddings = True))
         try:
-            trainer._unsloth_flops_per_token = (model, state, main_input, flops // numel)
+            trainer._unsloth_flops_params = cache
         except Exception:
             pass
-    return flops
+    return 6 * value.numel() * cache[2]
 
 
 def patch_trainer_flops_list_main_input():
@@ -3424,6 +3444,10 @@ def patch_trainer_flops_list_main_input():
     original = Trainer.__dict__.get("floating_point_ops")
     if original is None or getattr(original, "_unsloth_list_main_input", False):
         return
+    try:
+        delegates = "model.floating_point_ops" in inspect.getsource(original)
+    except Exception:
+        delegates = True
 
     @functools.wraps(original)
     def floating_point_ops(self, inputs):
@@ -3437,7 +3461,7 @@ def patch_trainer_flops_list_main_input():
                 return 0
             return 6 * numel * model.num_parameters(exclude_embeddings = True)
         if isinstance(value, torch.Tensor):
-            return _cached_flops_per_token(self, original, model, main_input, inputs, value)
+            return _cached_flops(self, original, delegates, model, inputs)
         return original(self, inputs)
 
     floating_point_ops._unsloth_list_main_input = True

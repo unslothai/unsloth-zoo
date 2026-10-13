@@ -95,3 +95,17 @@ def test_flops_walk_the_model_once_per_train_call(trainer, monkeypatch):
     text.state = object()
     assert text.floating_point_ops({"input_ids": torch.zeros(1, 3, dtype = torch.long)}) == 6 * 3 * n_params
     assert len(calls) == 2
+
+
+def test_a_model_with_its_own_flop_count_is_never_cached(trainer):
+    # transformers 4.x delegates to model.floating_point_ops, which may be nonlinear in the token count.
+    class QuadraticFlops(LlamaForCausalLM):
+        def floating_point_ops(self, input_dict, exclude_embeddings = True):
+            return 6 * input_dict["input_ids"].numel() ** 2
+
+    text = _text_trainer()
+    text.model = QuadraticFlops(text.model.config)
+    unpatched = Trainer.floating_point_ops.__wrapped__
+    for tokens in (8, 24, 5):
+        inputs = {"input_ids": torch.zeros(1, tokens, dtype = torch.long)}
+        assert text.floating_point_ops(inputs) == unpatched(text, inputs)
