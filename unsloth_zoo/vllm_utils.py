@@ -5150,6 +5150,8 @@ def _merged_rollout_use_exact(targets):
     # All Unsloth Zoo code licensed under LGPLv3
     if os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "auto").strip().lower() == "copy": return False
     from .merged_rollout_exact import exact_merge_available, exact_merge_failure
+    # One stream, one host sync per fold: the kernel path assumes a single device.
+    if len({W.device for _, _, W in targets}) != 1: return False
     for _, _, W in targets:
         if not exact_merge_available(W.device, W.dtype):
             failure = exact_merge_failure(W.device, W.dtype) if W.device.type == "cuda" else None

@@ -1420,3 +1420,13 @@ def test_cuda_failed_self_check_falls_back_to_copy(monkeypatch, capsys):
     state = prepare_merged_rollout(model)
     assert state is not None and all(P is not None for _, _, P in state.entries)
     assert "self-check failed" in capsys.readouterr().out
+
+
+def test_exact_mode_needs_one_device(monkeypatch):
+    # Targets split across devices (a model-parallel training model) take the copy path.
+    import unsloth_zoo.merged_rollout_exact as ex
+    monkeypatch.setattr(ex, "exact_merge_available", lambda device, dtype = None: True)
+    one = [(None, None, torch.empty(2, dtype = DTYPE)), (None, None, torch.empty(2, dtype = DTYPE))]
+    two = [one[0], (None, None, torch.empty(2, dtype = DTYPE, device = "meta"))]
+    assert vllm_utils._merged_rollout_use_exact(one) is True
+    assert vllm_utils._merged_rollout_use_exact(two) is False
