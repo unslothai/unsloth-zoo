@@ -1313,7 +1313,8 @@ def _expert_oracle(module, W0):
     B = module.lora_B["default"].weight.to(W0.dtype).double()
     A = A.reshape(E, -1, A.shape[-1])
     B = B.reshape(B.shape[0], -1, E)
-    eq = "o r e, e r i -> e o i" if module._did_swap_in_out_features else "o r e, e r i -> e i o"
+    # PEFT 0.18 has no swap flag: its param is always [E, in, out].
+    eq = "o r e, e r i -> e o i" if getattr(module, "_did_swap_in_out_features", False) else "o r e, e r i -> e i o"
     delta = torch.einsum(eq.replace(" ", ""), B, A) * module.scaling["default"]
     return (W0.float() + delta.float()).to(W0.dtype)
 
