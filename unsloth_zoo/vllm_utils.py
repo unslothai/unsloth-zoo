@@ -619,11 +619,7 @@ _VLLM_STACKED_MOE_LORA_CLASSES = {
 }
 
 def patch_vllm_stacked_moe_lora(config):
-    """Route Unsloth's stacked expert adapter to vLLM's FusedMoE3DWithLoRA for MoE classes that lack is_3d_moe_weight.
-
-    Without the flag vLLM wraps the experts in the 2D FusedMoEWithLoRA, which cannot read a stacked
-    adapter (vllm-project/vllm#41754), so _check_lora_is_servable refuses expert LoRA for GRPO.
-    """
+    """Set is_3d_moe_weight so vLLM serves the stacked expert adapter; its 2D wrapper cannot (vllm-project/vllm#41754)."""
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
     entry = _VLLM_STACKED_MOE_LORA_CLASSES.get(model_type)

@@ -13,13 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Qwen3-MoE expert LoRA with fast_inference (unslothai/unsloth#2741).
-
-vLLM's Qwen3MoeForCausalLM leaves is_3d_moe_weight False, so it wraps the experts in the 2D
-FusedMoEWithLoRA and the stacked adapter Unsloth trains is refused at the first GRPO rollout.
-patch_vllm_stacked_moe_lora sets the flag only when vLLM has the 3D wrapper and transformers
-stacks the experts; these pin both gates and that other model types are untouched.
-"""
+"""Qwen3-MoE expert LoRA under fast_inference (unslothai/unsloth#2741): vLLM must use its 3D MoE LoRA wrapper."""
 import sys
 import types
 
@@ -64,7 +58,6 @@ def test_qwen3_moe_is_marked_3d(monkeypatch):
     assert patch_vllm_stacked_moe_lora(_config("qwen3_moe")) is True
     assert vllm_cls.is_3d_moe_weight is True
     assert _FakeQwen3Moe.is_3d_moe_weight is False
-    # Idempotent: a second engine load keeps it set.
     assert patch_vllm_stacked_moe_lora(_config("qwen3_moe")) is True
     assert vllm_cls.is_3d_moe_weight is True
 
