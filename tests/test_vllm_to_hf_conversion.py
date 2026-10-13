@@ -794,11 +794,11 @@ def test_assert_same_state_dict_uses_tight_tolerance_for_same_dtype():
 
 
 def test_conv1d_branch_requires_linear_attn_in_layer_name():
-    # Regression: bare `endswith(".conv1d")` would rebuild any non-GDN .conv1d
-    # as depthwise; the branch must require linear_attn.
+    # Regression: bare `endswith(".conv1d")` would rebuild any .conv1d as
+    # depthwise; the branch must require a GDN linear_attn or (#1733) a Mamba-2 mixer.
     from unsloth_zoo import vllm_utils
     src = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
-    assert 'endswith(".conv1d") and "linear_attn" in layer_name' in src
+    assert 'endswith(".conv1d") and ("linear_attn" in layer_name or ".mixer." in layer_name)' in src
 
 
 def test_gemma4_lora_patch_covers_both_classes():
