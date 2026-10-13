@@ -437,7 +437,10 @@ def test_prenorm_layers_keep_native_when_the_kernel_disagrees(monkeypatch):
 
 
 from mlx_lm.models import cache as lm_cache, gated_delta as lm_gated_delta, qwen3_5 as lm_qwen3_5
-from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
+try:
+    from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
+except ImportError:  # mlx-vlm < 0.6 layers call mlx-lm's module
+    vlm_gated_delta = lm_gated_delta
 
 _PACKED_SOURCES = [(native, vlm_gated_delta, native.Qwen3_5GatedDeltaNet, native.ArraysCache),
                    (lm_qwen3_5, lm_gated_delta, lm_qwen3_5.GatedDeltaNet, lm_cache.ArraysCache)]
