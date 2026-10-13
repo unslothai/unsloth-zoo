@@ -13,7 +13,6 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Qwen3-MoE expert LoRA under fast_inference (unslothai/unsloth#2741): vLLM must use its 3D MoE LoRA wrapper."""
 import sys
 import types
 
