@@ -3396,9 +3396,7 @@ def _list_main_input_numel(value):
 
 
 def _stock_flops_owner(trainer, model, delegates):
-    # The model whose num_parameters the stock formula 6 * tokens * num_parameters(exclude_embeddings=True)
-    # uses, or None when the count is customised. transformers 5.x computes it in Trainer itself; 4.x
-    # delegates to model.floating_point_ops, which a model may override with a nonlinear count.
+    # Whose num_parameters the stock 6 * tokens * num_parameters uses; None if 4.x's model.floating_point_ops is overridden.
     if not delegates:
         return model if hasattr(model, "num_parameters") else None
     try:
@@ -3416,9 +3414,7 @@ def _stock_flops_owner(trainer, model, delegates):
 
 
 def _cached_flops(trainer, original, delegates, model, inputs):
-    # floating_point_ops runs every step and num_parameters walks every module and parameter, milliseconds
-    # of host time per step for the total_flos statistic. Count the parameters once per train() call
-    # (trainer.state is rebuilt by each) for the stock formula only.
+    # num_parameters walks the whole model every step: count once per train() (each rebuilds trainer.state).
     owner = _stock_flops_owner(trainer, model, delegates)
     main_input = getattr(owner, "main_input_name", None)
     value = inputs.get(main_input, None) if owner is not None and hasattr(inputs, "get") else None
