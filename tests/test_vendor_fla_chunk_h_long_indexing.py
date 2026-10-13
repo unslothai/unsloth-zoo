@@ -73,7 +73,7 @@ _SUBPROCESS = textwrap.dedent(
     torch.manual_seed(0)
     dev = "cuda"
     g = torch.full((B, T, H), -0.05, device=dev, dtype=torch.float32)
-    k = torch.randn(B, T, H, K, device=dev, dtype=torch.bfloat16) * 0.05
+    k = torch.randn(B, T, H, K, device=dev, dtype=torch.bfloat16).mul_(0.05)
     v = torch.randn(B, T, H, V, device=dev, dtype=torch.bfloat16)
     _, ht = chunk_fwd_h(k=k, v=v, g=g, output_final_state=True)
     _, ht1 = chunk_fwd_h(k=k[1:].contiguous(), v=v[1:].contiguous(), g=g[1:].contiguous(), output_final_state=True)
@@ -81,7 +81,7 @@ _SUBPROCESS = textwrap.dedent(
     del k, v, ht, ht1
     torch.cuda.empty_cache()
 
-    q = torch.randn(B, T, H, K, device=dev, dtype=torch.bfloat16) * 0.05
+    q = torch.randn(B, T, H, K, device=dev, dtype=torch.bfloat16).mul_(0.05)
     do = torch.randn(B, T, H, V, device=dev, dtype=torch.bfloat16)
     dht = torch.randn(B, H, K, V, device=dev, dtype=torch.float32)
     kw = dict(k=q, v=do, h0=None, scale=K ** -0.5)
@@ -92,7 +92,7 @@ _SUBPROCESS = textwrap.dedent(
     q1, do1, g1 = q[1:].contiguous(), do[1:].contiguous(), g[1:].contiguous()
     dh1, _ = chunk_bwd_dh(q=q1, do=do1, dht=dht[1:].contiguous(), g=g1, k=q1, v=do1, h0=None, scale=K ** -0.5)
     bwd = (dh_first - dh1[0, 0].float()).abs().max().item()
-    print(f"fwd {fwd} bwd {bwd}")
+    print(f"fwd {fwd} bwd {bwd} peak_gib {torch.cuda.max_memory_allocated() / 2**30:.2f}")
     assert fwd == 0.0 and bwd == 0.0, (fwd, bwd)
     print("CHUNK_H_LONG_OK")
     """
