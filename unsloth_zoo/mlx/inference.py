@@ -16,7 +16,8 @@
 
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
-small-batch quantized projections on the neural accelerators, and the pre-norm residual handoff."""
+small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
+and Qwen exact speculative verify blocks."""
 
 import ast
 import functools
@@ -33,7 +34,7 @@ import sys
 import textwrap
 from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
+from threading import RLock, local
 from types import FunctionType
 from typing import NamedTuple
 
@@ -2656,8 +2657,8 @@ def fused_moe_routed_experts(model, *, _modules = None):
     Gate/up with SwiGLU, and down with the routing-weight combine and shared-expert add, serve
     calls whose routes MLX gathers unsorted, each checked bitwise against the native experts at
     first use; where they serve a call, the routing launch also writes the shared-expert gate's
-    sigmoid. The kernels run from `fused_moe_router`'s fused call, so without that scope the
-    blocks stay native. Training and distributed models keep the native experts, and so does
+    sigmoid. The kernels run from `fused_moe_router`'s fused call and from `exact_speculative_verify`'s
+    verify blocks, so without either scope the blocks stay native. Training and distributed models keep the native experts, and so does
     every model while UNSLOTH_MLX_ROUTED_EXPERTS=0.
     """
     changed = []
@@ -3276,3 +3277,181 @@ def dense_prefill_linear(model, *, _modules = None):
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
 
+
+# The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
+# 0.7.1 added the verifier's `verify` entry; earlier releases miss it and stay native.
+_EXACT_VERIFY_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.speculative_verifier": {
+        "Qwen3_5BatchInvariantForward.verify": "14bdd46f35e8adfa",
+        "Qwen3_5BatchInvariantForward._linear": "6e38296bd3f89d5a",
+        "Qwen3_5BatchInvariantForward._linears": "1f44efb5714938af",
+        "Qwen3_5BatchInvariantForward._layer": "f3f59ff9d0b68a50",
+        "Qwen3_5BatchInvariantForward._model": "142df8a42c27c4f7",
+        "Qwen3_5BatchInvariantForward._feed_forward": "d1c424074fbf0c21",
+        "Qwen3_5BatchInvariantForward._switch_glu": "6aa1f4defb45f54a",
+        "_target_verify_linear": "190517e318ba4d7b",
+        "_target_verify_linears": "2d4c9adbc50be66e",
+    },
+    "mlx_vlm.speculative.ops.linear": {
+        "_target_verify_quantized_linear": "539dce1a6026f87e",
+        "_target_verify_optimized_affine_linear": "44955d8d8dd32a15",
+        "_target_verify_quantized_linears": "447c68b85e4e7dda",
+    },
+    "mlx_vlm.models.quantized_verifier": {
+        "_can_optimized_affine_linear": "22c2675d5a30e1f4",
+        "supports_optimized_affine_head": "b0611c0de3000a20",
+    },
+}
+# mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
+_VERIFY_FUSED_ROWS = 8
+_VERIFY_METHODS = ("verify", "_linear", "_linears", "_layer", "_feed_forward")
+_VERIFY_LOCK = RLock()
+_VERIFY_VERDICTS = {}
+# The verifier is one object per process: whether a call is served is kept per thread, not on it.
+_VERIFY_STATE = local()
+
+
+def _verify_admitted(key, native, fused):
+    """`fused()` once `key`'s first block matched `native()` bit for bit; that block, a failed key and a `fused()` of None take `native()`."""
+    verdict = _VERIFY_VERDICTS.get(key)
+    served = fused() if verdict else None
+    if served is not None:
+        return served
+    reference = native()
+    if verdict is None and (candidate := fused()) is not None:
+        pairs = zip(reference, candidate) if isinstance(reference, tuple) else ((reference, candidate),)
+        try:
+            verdict = all(a.dtype == b.dtype and a.shape == b.shape
+                          and mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item() for a, b in pairs)
+        except (RuntimeError, ValueError):
+            return reference  # inside a function transformation, which cannot evaluate; checked later
+        _VERIFY_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("a verify block differs from mlx-vlm's verifier for %s; the native verifier "
+                           "stays in use there", key)
+    return reference
+
+
+def _verify_sliced(project, linears, x, eligible):
+    """`project(x)`, over balanced row slices when the block is wider than mlx-vlm's fused verify bound."""
+    if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] <= _VERIFY_FUSED_ROWS
+            or not all(eligible(linear, x) and not linear.trainable_parameters() for linear in linears)):
+        return project(x)
+    # As few slices as the bound allows and as equal as possible, so none is a one- or two-row tail.
+    count = -(-x.shape[1] // _VERIFY_FUSED_ROWS)
+    size, extra = divmod(x.shape[1], count)
+    stops = [(i + 1) * size + min(i + 1, extra) for i in range(count)]
+
+    def sliced():
+        outs = [project(x[:, start:stop]) for start, stop in zip([0, *stops], stops)]
+        if isinstance(outs[0], tuple):
+            return tuple(mx.concatenate(column, axis = 1) for column in zip(*outs))
+        return mx.concatenate(outs, axis = 1)
+
+    key = (x.shape[:2], x.dtype, *((p.weight.shape, p.bits, p.group_size, p.mode, "bias" in p) for p in linears))
+    return _verify_admitted(key, lambda: project(x), sliced)
+
+
+@functools.cache
+def _exact_verify_class(base, *cache_key):
+    bindings = _resolved_bindings(_EXACT_VERIFY_CONTRACT)
+    eligible = getattr(sys.modules.get("mlx_vlm.models.quantized_verifier"), "_can_optimized_affine_linear", None)
+    if bindings is None or eligible is None:
+        return None
+
+    def verify(self, language_model, inputs, *, cache = None, **kwargs):
+        outer = getattr(_VERIFY_STATE, "serving", False)
+        _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
+                                     and not language_model.training and _bindings_intact(bindings))
+        try:
+            return base.verify(self, language_model, inputs, cache = cache, **kwargs)
+        finally:
+            _VERIFY_STATE.serving = outer
+
+    def sliced_linear(self, linear, x):
+        return _verify_sliced(lambda rows: base._linear(self, linear, rows), (linear,), x, eligible)
+
+    def sliced_linears(self, linears, x):
+        return _verify_sliced(lambda rows: base._linears(self, linears, rows), linears, x, eligible)
+
+    def submitted_layer(self, *args, **kwargs):
+        hidden = base._layer(self, *args, **kwargs)
+        if getattr(_VERIFY_STATE, "serving", False):
+            try:
+                mx.async_eval(hidden)
+            except ValueError:  # not allowed inside a function transformation
+                pass
+        return hidden
+
+    def routed_feed_forward(self, feed_forward, x):
+        experts, mlp = getattr(feed_forward, "_unsloth_moe_routed", None), getattr(feed_forward, "switch_mlp", None)
+        projections = [getattr(mlp, name, None) for name in ("gate_proj", "up_proj", "down_proj")]
+        # The routed object refuses projections it was not built for; only quantized, frozen ones reach it.
+        if (experts is None or x.ndim != 3 or not getattr(_VERIFY_STATE, "serving", False)
+                or any(getattr(p, "bits", None) is None or p.trainable_parameters() for p in projections)):
+            return base._feed_forward(self, feed_forward, x)
+
+        def routed():
+            # The verifier's own routing, shared expert and shared gate; the routed kernels take every row at once.
+            gates = mx.softmax(self._linear(feed_forward.gate, x), axis = -1, precise = True)
+            indices = mx.argpartition(gates, kth = -feed_forward.top_k, axis = -1)[..., -feed_forward.top_k:]
+            scores = mx.take_along_axis(gates, indices, axis = -1)
+            scores = scores / scores.sum(axis = -1, keepdims = True)
+            shared = self._feed_forward(feed_forward.shared_expert, x)
+            scale = mx.sigmoid(self._linear(feed_forward.shared_expert_gate, x))
+            rows = (x.shape[0] * x.shape[1], 1, -1)
+            out = experts(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale, shared)))
+            return None if out is None else out.reshape(*x.shape[:2], -1)
+
+        key = (x.shape[:2], x.dtype, feed_forward.top_k,
+               *((p.weight.shape, p.bits, p.group_size, p.mode) for p in projections))
+        return _verify_admitted(key, lambda: base._feed_forward(self, feed_forward, x), routed)
+
+    return type(f"_ScopedVerify{base.__name__}", (base,), {
+        "verify": verify, "_linear": sliced_linear, "_linears": sliced_linears, "_layer": submitted_layer,
+        "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base})
+
+
+@contextmanager
+def exact_speculative_verify(model, *, _modules = None):
+    """Speed up mlx-vlm's exact speculative verifier for Qwen3.5 language models during serialized inference.
+
+    Each layer of a verify block is submitted for evaluation as it is built, so the GPU runs while the host builds on.
+    A verify block wider than the eight rows mlx-vlm's fused verify kernels serve runs each frozen
+    quantized projection over balanced row slices, once its first block of that shape matched the
+    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition. Only verify calls of the language models found here are served; other,
+    training and distributed models, and an mlx-vlm whose verifier drifted, keep the native methods.
+    """
+    owners, verifier = [], None
+    try:
+        with _VERIFY_LOCK:
+            language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
+            native = getattr(sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier"),
+                             "Qwen3_5BatchInvariantForward", None)
+            call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
+            target = getattr(language, "_EXACT_SPECULATIVE_VERIFIER", None)
+            if (call is not None and native is not None
+                    and getattr(type(target), "_unsloth_verify_native", type(target)) is native
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and mx.metal.is_available()):
+                # qwen3_5_moe inherits the call; a shared module is yielded once per path.
+                found = {id(module): module for _, module in _fusion_modules(model, _modules)
+                         if getattr(type(module), "__call__", None) is call}
+                methods = [vars(native).get(name) for name in _VERIFY_METHODS]
+                patched = _exact_verify_class(native, *methods) if found else None
+                if patched is not None:
+                    target.__class__ = patched
+                    target._unsloth_verify_scopes = getattr(target, "_unsloth_verify_scopes", 0) + 1
+                    verifier = target
+                    for module in found.values():
+                        module._unsloth_verify_scopes = getattr(module, "_unsloth_verify_scopes", 0) + 1
+                        owners.append(module)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for owner in owners + ([verifier] if verifier is not None else []):
+                owner._unsloth_verify_scopes -= 1
+                if not owner._unsloth_verify_scopes:
+                    owner.__dict__.pop("_unsloth_verify_scopes", None)
+                    if owner is verifier:
+                        verifier.__class__ = type(verifier)._unsloth_verify_native

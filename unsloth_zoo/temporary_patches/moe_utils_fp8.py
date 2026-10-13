@@ -182,10 +182,12 @@ def _dequantize_expert_slice(
         return expert_weight.to(target_dtype)
 
     w = expert_weight.to(target_dtype)
+    # FP16 flushes small scales: multiply in FP32, mul_ rounds once into w.
+    scale_dtype = torch.float32 if target_dtype == torch.float16 else target_dtype
 
     # Per-tensor scale
     if s.numel() == 1:
-        return w * s.view(1, 1).to(target_dtype)
+        return w.mul_(s.view(1, 1).to(scale_dtype))
 
     if s.ndim == 1:
         s = s.view(-1, 1)
@@ -202,10 +204,10 @@ def _dequantize_expert_slice(
             s = s.repeat_interleave(repeat_factor, dim=0)
 
         if w.shape[0] == s.shape[0]:
-            return w * s.to(target_dtype)
+            return w.mul_(s.to(scale_dtype))
         elif w.shape[1] == s.shape[0]:
-            return (w.t() * s.to(target_dtype)).t()
-        return w * s.to(target_dtype)
+            return w.t().mul_(s.to(scale_dtype)).t()
+        return w.mul_(s.to(scale_dtype))
 
     # Block scale: (ceil(m/bm), ceil(n/bn)) — expand to weight shape
     if s.ndim == 2:
@@ -226,8 +228,8 @@ def _dequantize_expert_slice(
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
 
-        s_expanded = s.to(target_dtype).repeat_interleave(bm, dim=0)[:M].repeat_interleave(bn, dim=1)[:, :N]
-        return w * s_expanded
+        s_expanded = s.to(scale_dtype).repeat_interleave(bm, dim=0)[:M].repeat_interleave(bn, dim=1)[:, :N]
+        return w.mul_(s_expanded)
 
     return expert_weight.to(target_dtype)
 
@@ -245,20 +247,20 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
     E, M, N = weight.shape
     s = quant_state
 
+    # FP16 flushes small scales: multiply in FP32 and round once into the target dtype.
+    scale_dtype = torch.float32 if target_dtype == torch.float16 else target_dtype
+
     # Per-tensor scalar
     if s.numel() == 1:
-        return weight.to(target_dtype) * s.to(target_dtype).view(1, 1, 1)
+        return weight.to(target_dtype).mul_(s.to(scale_dtype).view(1, 1, 1))
 
     # 3D block scales: (E, ceil(M/bm), ceil(N/bn))
     if s.ndim == 3 and s.shape[0] == E:
         block_size = getattr(weight, "block_size", None) or getattr(s, "block_size", None)
         p, q = s.shape[1], s.shape[2]
         if p == 1 and q == 1:
-            # One scale per expert already broadcasts over (E, M, N). Expanding
-            # it first allocates a second full-size tensor: +4.00 GiB measured
-            # on the (128, 4096, 4096) Mistral-Small-4-119B layout, on top of
-            # the 8 GiB the converted weight and the result already need.
-            return weight.to(target_dtype) * s.to(target_dtype)
+            # One scale per expert already broadcasts over (E, M, N).
+            return weight.to(target_dtype).mul_(s.to(scale_dtype))
         if block_size is not None and len(block_size) == 2:
             bm, bn = block_size
         else:
@@ -266,12 +268,13 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
             bn = _ceil_div(N, q)
         # Chunk over experts: whole-stack expansion peaked at 3x the dequantized size.
         out = torch.empty((E, M, N), dtype=target_dtype, device=weight.device)
-        per_expert = M * N * out.element_size()
-        step = max(1, _VECTORIZED_DEQUANT_CHUNK_BYTES // max(2 * per_expert, 1))
+        # A chunk holds the converted weight and the expanded scale (FP32 when the target is FP16).
+        per_expert = M * N * (out.element_size() + torch.finfo(scale_dtype).bits // 8)
+        step = max(1, _VECTORIZED_DEQUANT_CHUNK_BYTES // max(per_expert, 1))
         for e0 in range(0, E, step):
             e1 = min(E, e0 + step)
             s_expanded = (
-                s[e0:e1].to(target_dtype)
+                s[e0:e1].to(scale_dtype)
                 .repeat_interleave(bm, dim=1)[:, :M, :]
                 .repeat_interleave(bn, dim=2)[:, :, :N]
             )
@@ -283,18 +286,18 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
     # 2D per-row scales: (E, M) or (E, 1)
     if s.ndim == 2 and s.shape[0] == E:
         if s.shape[1] == 1:
-            return w * s.to(target_dtype).unsqueeze(-1)
+            return w.mul_(s.to(scale_dtype).unsqueeze(-1))
         if s.shape[1] == M:
-            return w * s.to(target_dtype).unsqueeze(-1)
+            return w.mul_(s.to(scale_dtype).unsqueeze(-1))
         if s.shape[1] == N:
-            return w * s.to(target_dtype).unsqueeze(1)
+            return w.mul_(s.to(scale_dtype).unsqueeze(1))
 
     # 1D: single per-row scale shared across experts
     if s.ndim == 1:
         if s.shape[0] == M:
-            return w * s.to(target_dtype).view(1, -1, 1)
+            return w.mul_(s.to(scale_dtype).view(1, -1, 1))
         if s.shape[0] == N:
-            return w * s.to(target_dtype).view(1, 1, -1)
+            return w.mul_(s.to(scale_dtype).view(1, 1, -1))
 
     return None
 

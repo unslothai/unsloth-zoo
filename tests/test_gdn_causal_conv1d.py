@@ -186,8 +186,8 @@ def test_legacy_keeps_configured_activation_cpu():
 
 def test_legacy_seq_idx_cpu():
     import inspect
-    # Not advertised: unsloth's hybrid packing gate keys on a named `seq_idx`.
-    assert "seq_idx" not in inspect.signature(gcc._legacy_causal_conv1d_fn).parameters
+    # Named and honoured: unsloth's hybrid packing gate keys on a named `seq_idx`.
+    assert "seq_idx" in inspect.signature(gcc._legacy_causal_conv1d_fn).parameters
     g = torch.Generator().manual_seed(0)
     x = torch.randn(1, 8, 10, generator = g, dtype = torch.float64)
     w = torch.randn(8, 4, generator = g, dtype = torch.float64)

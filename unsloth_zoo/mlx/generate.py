@@ -161,7 +161,10 @@ class SamplingParams:
 
 @dataclass(frozen=True)
 class GenerationDefaults:
-    """Batch-wide defaults used when a request does not override a value."""
+    """Batch-wide defaults used when a request does not override a value.
+
+    ``stop_token_ids`` (text models) replaces the tokenizer's EOS set as the stop ids.
+    """
 
     max_tokens: int = 256
     sampling: SamplingParams = field(default_factory=SamplingParams)
@@ -173,6 +176,7 @@ class GenerationDefaults:
     kv_group_size: int | None = None
     kv_quant_scheme: str | None = None
     quantized_kv_start: int | None = None
+    stop_token_ids: tuple[int, ...] | None = None
 
     def __post_init__(self):
         _validate_positive_int(self.max_tokens, "defaults.max_tokens")
@@ -205,6 +209,23 @@ class GenerationDefaults:
         if not isinstance(self.sampling, SamplingParams):
             raise TypeError("defaults.sampling must be SamplingParams.")
         stops = _normalize_stop_strings(self.stop_strings)
+        if self.stop_token_ids is not None:
+            try:
+                stop_ids = tuple(self.stop_token_ids)
+            except TypeError as exc:
+                raise TypeError(
+                    "defaults.stop_token_ids must be a sequence of token ids."
+                ) from exc
+            if any(
+                isinstance(token, bool) or not isinstance(token, Integral) or token < 0
+                for token in stop_ids
+            ):
+                raise ValueError(
+                    "defaults.stop_token_ids must hold non-negative integer ids."
+                )
+            object.__setattr__(
+                self, "stop_token_ids", tuple(dict.fromkeys(map(int, stop_ids))),
+            )
         object.__setattr__(self, "max_tokens", int(self.max_tokens))
         object.__setattr__(self, "prefill_batch_size", int(self.prefill_batch_size))
         object.__setattr__(
@@ -557,6 +578,11 @@ def _validate_vlm_requests(
 
 
 def _validate_vlm_defaults(defaults: GenerationDefaults) -> None:
+    if defaults.stop_token_ids is not None:
+        raise ValueError(
+            "stop_token_ids is not supported for batched vision generation; "
+            "mlx-vlm stops on its processor's own criteria."
+        )
     if defaults.prefill_batch_size > defaults.completion_batch_size:
         # An inverted pair never admits anything on mlx-vlm, so generation would
         # hang. mlx-lm normalizes the two, so this is vision-specific.
@@ -946,9 +972,10 @@ def generation_mode(model, int8_prefill = None):
     try:
         if _GENERATION_MODE_DEPTH == 0:
             _GENERATION_LIMIT_SNAPSHOT = _snapshot_metal_limits()
-        from .inference import (_fusion_modules, dense_prefill_linear, fused_decode_conv_silu, fused_moe_gate_up,
-                                fused_moe_routed_experts, fused_moe_router, fused_residual_norm,
-                                fused_residual_norm_handoff, nax_quantized_linear)
+        from .inference import (_fusion_modules, dense_prefill_linear, exact_speculative_verify,
+                                fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
+                                fused_moe_router, fused_residual_norm, fused_residual_norm_handoff,
+                                nax_quantized_linear)
         # One walk serves the flags and every scope: eval and the scopes leave the module graph alone.
         modules = tuple(_fusion_modules(model, None))
         training_states = _snapshot_training_flags([module for _, module in modules] or [model])
@@ -959,7 +986,8 @@ def generation_mode(model, int8_prefill = None):
                 fused_residual_norm(model, _modules = modules), fused_moe_router(model, _modules = modules), \
                 fused_moe_routed_experts(model, _modules = modules), nax_quantized_linear(model, int8_prefill, _modules = modules), \
                 dense_prefill_linear(model, _modules = modules), \
-                fused_residual_norm_handoff(model, _modules = modules):
+                fused_residual_norm_handoff(model, _modules = modules), \
+                exact_speculative_verify(model, _modules = modules):
             yield model
     except BaseException as exc:
         active_error = exc
@@ -1546,7 +1574,11 @@ class _TextBatchSession:
         self.generator = adapter.batch_generator_type(
             adapter.model,
             max_tokens=defaults.max_tokens,
-            stop_tokens=_eos_stop_tokens(adapter.tokenizer),
+            stop_tokens=(
+                _eos_stop_tokens(adapter.tokenizer)
+                if defaults.stop_token_ids is None
+                else [[token] for token in defaults.stop_token_ids]
+            ),
             prefill_batch_size=defaults.prefill_batch_size,
             completion_batch_size=defaults.completion_batch_size,
             max_kv_size=defaults.max_kv_size,
