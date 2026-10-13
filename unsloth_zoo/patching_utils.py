@@ -766,8 +766,11 @@ def patch_model_and_tokenizer(
     except: old_output_embedding = torch.zeros(0)
 
     # DeepSpeed ZeRO-3 partitioned the weights at load (1-D empty placeholders, real shape in ds_shape):
-    # rebuilding the modules around them asserts 2-D (unsloth#225), and resize_token_embeddings handles ZeRO-3.
+    # rebuilding the modules around them asserts 2-D (unsloth#225); resize_token_embeddings is ZeRO-3 aware.
     zero3_partitioned = hasattr(old_input_embedding, "ds_shape")
+    if is_torch_embedding and zero3_partitioned and (tokenizer is not None) and \
+        (len(tokenizer) > old_input_embedding.ds_shape[0]):
+        model.resize_token_embeddings(len(tokenizer))
 
     # Check for tied weights as well
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \

@@ -50,18 +50,24 @@ class _Tokenizer:
         return [f"<|extra_{i}|>" for i in range(len(ids))]
 
 
-def test_patch_keeps_partitioned_embedding_modules():
+@pytest.mark.parametrize("tokenizer_len, resized", [(12, [12]), (8, [])])
+def test_patch_keeps_partitioned_embedding_modules(monkeypatch, tokenizer_len, resized):
     model = _tiny_llama()
     embed, head = model.model.embed_tokens, model.lm_head
     _partition(embed.weight)
     _partition(head.weight)
+    # transformers' resize_token_embeddings gathers and re-partitions under ZeRO-3; record the call.
+    calls = []
+    monkeypatch.setattr(model, "resize_token_embeddings", lambda n: calls.append(n))
+    tokenizer = _Tokenizer()
+    monkeypatch.setattr(_Tokenizer, "__len__", lambda self: tokenizer_len)
 
-    # A tokenizer longer than the vocab used to route into resize_ on the empty placeholder.
-    patch_model_and_tokenizer(model, _Tokenizer(), downcast_rope = False)
+    patch_model_and_tokenizer(model, tokenizer, downcast_rope = False)
 
+    # Sized from ds_shape, not the empty placeholder, and only when the tokenizer is longer.
+    assert calls == resized
     assert model.model.embed_tokens is embed and model.lm_head is head
     assert embed.weight.shape == (0,) and head.weight.shape == (0,)
-    assert model.config.vocab_size == 8
 
 
 @pytest.fixture
