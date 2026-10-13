@@ -23,7 +23,6 @@ from unsloth_zoo.vllm_utils import _get_vllm_online_fp8_quantization, _vllm_onli
 from unsloth_zoo.empty_model import _cast_unquantized_, _has_quantized_tensors
 
 
-# QUANTIZATION_METHODS shorthands per vLLM release (vllm/model_executor/layers/quantization/__init__.py).
 _BASE = ["fp8", "torchao", "bitsandbytes", "compressed-tensors"]
 VLLM_METHODS = {
     "0.11.2": _BASE,
@@ -41,7 +40,6 @@ VLLM_METHODS = {
         ("0.11.2", "block", None),
         ("0.19.0", "block", None),
         ("0.20.0", "block", "fp8_per_block"),
-        # Row-wise is never silently swapped for per-tensor or per-block: torchao keeps it.
         ("0.20.0", "row", None),
         ("0.24.0", "row", "fp8_per_channel"),
         ("0.24.0", "block", "fp8_per_block"),
@@ -56,8 +54,7 @@ def test_routing_table(version, mode, expected, monkeypatch):
 
 @pytest.mark.parametrize("version", ["0.24.0", "0.31.0"])
 def test_blackwell_block_keeps_torchao(version, monkeypatch, capsys):
-    # vLLM's online per-block FP8 crashes on SM100 (DeepGEMM UE8M0 assert): block keeps the
-    # torchao route it had before, row is native there.
+    # Online per-block FP8 crashes on SM100 (DeepGEMM UE8M0): block stays on torchao.
     monkeypatch.delenv("UNSLOTH_VLLM_ONLINE_FP8", raising = False)
     assert _get_vllm_online_fp8_quantization("block", VLLM_METHODS[version], (10, 0)) is None
     assert "cannot backprop" in capsys.readouterr().out
@@ -95,7 +92,6 @@ def test_moe_online_ignore_keeps_routers_and_experts_16bit(config, expected):
 
 
 def test_never_legacy_fp8_online():
-    # vLLM 0.31 rejects quantization="fp8" for a 16-bit checkpoint.
     for methods in VLLM_METHODS.values():
         for mode in ("row", "block"):
             assert _get_vllm_online_fp8_quantization(mode, methods, (9, 0)) != "fp8"
@@ -137,7 +133,6 @@ def test_finalize_cast_keeps_float8_and_ties():
     assert model.emb.weight.dtype == torch.bfloat16 and model.norm.weight.dtype == torch.bfloat16
     assert model.head.weight is model.emb.weight
     assert model.pos.dtype == torch.int64
-    # The fp32 scale is shared with vLLM: never downcast.
     assert model.q.weight_scale.dtype == torch.float32
 
 
