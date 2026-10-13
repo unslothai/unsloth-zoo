@@ -15,7 +15,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""convert_vllm_to_huggingface builds FP8Linear with the kwargs this transformers accepts."""
 import pytest
 
 from unsloth_zoo.vllm_utils import _accepted_kwargs
@@ -31,11 +30,11 @@ def test_real_fp8linear_builds_with_the_filtered_kwargs():
 
 
 def test_dtype_is_kept_where_the_signature_takes_it():
-    class OldFP8Linear:  # transformers 5.0 to 5.5 layout
+    class OldFP8Linear:
         def __init__(self, in_features, out_features, block_size = None, activation_scheme = "dynamic", has_bias = False, dtype = None):
             self.dtype = dtype
 
-    class NewFP8Linear:  # transformers 5.10+ layout
+    class NewFP8Linear:
         def __init__(self, in_features, out_features, block_size = None, activation_scheme = "dynamic", scale_fmt = "float", has_bias = False):
             pass
 

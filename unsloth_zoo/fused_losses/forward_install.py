@@ -198,6 +198,18 @@ def _head_built_as_linear(cls, head_attr) -> bool:
     return True
 
 
+# Pinned at import: a later rebinding of the module symbol must not pass as stock.
+try:
+    from transformers.loss.loss_utils import ForCausalLMLoss as _STOCK_CAUSAL_LM_LOSS
+except ImportError:
+    _STOCK_CAUSAL_LM_LOSS = None
+
+
+def _can_fuse_loss(loss_function):
+    # A self-reference, not a bool: functools.wraps copies attributes onto custom wrappers.
+    return loss_function is not None and getattr(loss_function, "_unsloth_fused_loss", _STOCK_CAUSAL_LM_LOSS) is loss_function
+
+
 def install_for_class(cls) -> bool:
     """Try to install the fused forward on `cls`. Returns True on success."""
     if not is_enabled():
@@ -277,6 +289,7 @@ def install_for_class(cls) -> bool:
         for _name, _value in (getattr(forward, "__globals__", {}) or {}).items():
             ns.setdefault(_name, _value)
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
+    ns["_can_fuse_loss"] = _can_fuse_loss
     ns["unsloth_count_aware_cross_entropy"] = unsloth_count_aware_cross_entropy
     ns["unsloth_loss_count_kwargs"] = unsloth_loss_count_kwargs
     ns["EMPTY_LOGITS"] = EMPTY_LOGITS

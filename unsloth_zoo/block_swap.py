@@ -70,11 +70,20 @@ def _pow2_ceil(n):
     return 1 << max(0, (int(n) - 1).bit_length())
 
 
+def _local_world_size():
+    try:
+        return max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+    except ValueError:
+        return 1
+
+
 def _pin_budget():
+    # Each local rank sees the same free RAM, so it may only claim its share.
     try:
         import psutil
         vm = psutil.virtual_memory()
-        return vm.available - max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+        spare = vm.available - max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+        return spare // _local_world_size()
     except Exception:
         return 0
 

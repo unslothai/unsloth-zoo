@@ -21,6 +21,7 @@ __all__ = [
     "patch_gemma4_vllm_lora_support",
     "patch_gemma4_vllm_k_eq_v_support",
     "extract_gdn_layers",
+    "extract_nemotron_h_mixer",
     "extract_moe_layers",
     "vllm_moe_expert_weights",
     "vllm_moe_expert_descriptor",
@@ -844,7 +845,8 @@ def set_additional_modules(new_model, quant_state_dict, config):
         language_model_prefix = "model"
         language_model = new_model.model
 
-    embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
+    embed_name = "embed_tokens" if hasattr(language_model, "embed_tokens") else "embeddings"
+    embed_tokens_key = f"{language_model_prefix}.{embed_name}.weight"
     # Explicit None check: pad_token_id=0 is valid.
     pad_token_id = getattr(config, "pad_token_id", None)
     if pad_token_id is None:
@@ -866,14 +868,14 @@ def set_additional_modules(new_model, quant_state_dict, config):
         module.num_embeddings = num_embeddings
         module.embedding_dim = embedding_dim
 
-    set_embedding(language_model.embed_tokens, embed_tokens_key, pad_token_id)
+    set_embedding(getattr(language_model, embed_name), embed_tokens_key, pad_token_id)
 
     if 'model.visual.pos_embed.weight' in quant_state_dict:
         # Qwen 3 VL visual embeddings
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
-    # LFM2 calls its final norm embedding_norm
-    norm_name = "norm" if hasattr(language_model, "norm") else "embedding_norm"
+    # LFM2 calls its final norm embedding_norm, Nemotron-H norm_f
+    norm_name = next(x for x in ("norm", "embedding_norm", "norm_f") if hasattr(language_model, x))
     norm_key = f"{language_model_prefix}.{norm_name}.weight"
     norm = quant_state_dict[norm_key]
     norm = _unwrap_tensor(norm)
@@ -885,7 +887,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
     # text_config.
     text_config = getattr(config, "text_config", config)
     if getattr(text_config, "tie_word_embeddings", False):
-        lmhead_key = f"{language_model_prefix}.embed_tokens.weight"
+        lmhead_key = embed_tokens_key
     else:
         lmhead_key = "lm_head.weight"
 
@@ -1225,6 +1227,28 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.feed_forward.gate.weight",
             "model.layers.{kk}.feed_forward.expert_bias",
 
+            # Nemotron-H: every block is a mixer; A_log / D / dt_bias / experts are bare Parameters
+            "model.layers.{kk}.mixer.in_proj",
+            "model.layers.{kk}.mixer.conv1d",
+            "model.layers.{kk}.mixer.out_proj",
+            "model.layers.{kk}.mixer.A_log",
+            "model.layers.{kk}.mixer.D",
+            "model.layers.{kk}.mixer.dt_bias",
+            "model.layers.{kk}.mixer.q_proj",
+            "model.layers.{kk}.mixer.k_proj",
+            "model.layers.{kk}.mixer.v_proj",
+            "model.layers.{kk}.mixer.o_proj",
+            "model.layers.{kk}.mixer.up_proj",
+            "model.layers.{kk}.mixer.down_proj",
+            "model.layers.{kk}.mixer.gate.weight",
+            "model.layers.{kk}.mixer.gate.e_score_correction_bias",
+            "model.layers.{kk}.mixer.shared_experts.up_proj",
+            "model.layers.{kk}.mixer.shared_experts.down_proj",
+            "model.layers.{kk}.mixer.fc1_latent_proj",
+            "model.layers.{kk}.mixer.fc2_latent_proj",
+            "model.layers.{kk}.mixer.experts.up_proj",
+            "model.layers.{kk}.mixer.experts.down_proj",
+
             # Sparse MoE: experts.{gate_up,down}_proj are bare Parameters (no ".weight").
             "model.language_model.layers.{kk}.mlp.gate.weight",
             "model.language_model.layers.{kk}.mlp.shared_expert_gate",
@@ -1321,6 +1345,10 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.deepstack_merger_list.{kk}.norm",
             "model.language_model.layers.{kk}.linear_attn.norm",
             "model.layers.{kk}.linear_attn.norm",
+
+            # Nemotron-H
+            "model.layers.{kk}.norm",
+            "model.layers.{kk}.mixer.norm",
 
             # LFM2
             "model.layers.{kk}.operator_norm",
@@ -1652,9 +1680,12 @@ def vision_tower_census(new_model, reference_model, tower_paths):
     return problems
 
 
-def vllm_moe_expert_weights(experts, where, config = None):
-    """A vLLM FusedMoE's (w13, w2) when exactly HF's stacked 16/32-bit expert tensors, else refuse."""
-    found = _vllm_moe_routed_weights(experts, where, config)
+def vllm_moe_expert_weights(experts, where, config = None, gated = True):
+    """A vLLM FusedMoE's (w13, w2) when exactly HF's stacked 16/32-bit expert tensors, else refuse.
+
+    gated = False: non-gated experts (Nemotron-H relu2), where w13 holds only up_proj.
+    """
+    found = _vllm_moe_routed_weights(experts, where, config, gated)
     w13, w2 = found["w13"], found["w2"]
     for name, value in (("w13", w13), ("w2", w2)):
         if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -1826,7 +1857,7 @@ def _vllm_fp8_moe_contract(routed, w13, w2, where):
 pass
 
 
-def _vllm_moe_routed_weights(experts, where, config = None):
+def _vllm_moe_routed_weights(experts, where, config = None, gated = True):
     """Shape / backend checks shared by every scheme. Only TRITON / BATCHED_TRITON keep HF's layout for
     16-bit experts; some rewrites keep the shape (TRT-LLM padding, AITER)."""
     experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
@@ -1857,12 +1888,13 @@ def _vllm_moe_routed_weights(experts, where, config = None):
     if config is not None:
         n_experts = getattr(config, "num_experts", None) or getattr(config, "num_local_experts", None)
         inter = getattr(config, "moe_intermediate_size", None) or getattr(config, "expert_intermediate_size", None)
-        hidden = getattr(config, "hidden_size", None)
+        # Latent MoE (Nemotron-3 Super / Ultra) runs the experts at moe_latent_size
+        hidden = getattr(config, "moe_latent_size", None) or getattr(config, "hidden_size", None)
         if isinstance(n_experts, int) and isinstance(inter, int) and isinstance(hidden, int):
-            expected = (n_experts, 2 * inter, hidden)
+            expected = (n_experts, (2 if gated else 1) * inter, hidden)
     if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \
         or w13.shape[0] != w2.shape[0] \
-        or w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1] \
+        or w13.shape[1] != (2 if gated else 1) * w2.shape[2] or w13.shape[2] != w2.shape[1] \
         or (expected is not None and tuple(w13.shape) != expected):
         raise NotImplementedError(
             f"Unsloth: fast_inference cannot rebuild MoE experts from vLLM's {backend} layout "
@@ -2039,6 +2071,46 @@ def extract_moe_layers(
         if scale is not None:
             scale.requires_grad_(False)
             store(f"{prefix}.experts.{name}_scale_inv", scale.data)
+pass
+
+
+def extract_nemotron_h_mixer(mixer, prefix, state_dict, quant_state_dict, get_state_dict, config = None):
+    """Alias one vLLM Nemotron-H mixer (Mamba-2, attention, MLP or MoE) onto HF names; layouts match HF at TP = 1."""
+    def store(name, value):
+        state_dict[name] = value
+        quant_state_dict[name] = value
+
+    if hasattr(mixer, "A"):
+        # in_proj / conv1d stay fused as in HF (conv1d already [C, 1, K]); mixer.norm comes via layernorms
+        for name in ("in_proj", "conv1d", "out_proj"):
+            get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(mixer, name), slice_weights = False)
+        # vLLM loads A = -exp(A_log) in float32, so A_log is a (num_heads,) copy
+        store(f"{prefix}.A_log", torch.log(-mixer.A.data.float()))
+        store(f"{prefix}.D", mixer.D.data)
+        store(f"{prefix}.dt_bias", mixer.dt_bias.data)
+    elif hasattr(mixer, "qkv_proj"):
+        get_state_dict(f"{prefix}.q_proj", 0, state_dict, mixer.qkv_proj)
+        get_state_dict(f"{prefix}.k_proj", 1, state_dict, mixer.qkv_proj)
+        get_state_dict(f"{prefix}.v_proj", 2, state_dict, mixer.qkv_proj)
+        get_state_dict(f"{prefix}.o_proj", 0, state_dict, mixer.o_proj)
+    elif hasattr(mixer, "experts"):
+        gate = getattr(mixer.gate, "base_layer", mixer.gate)
+        store(f"{prefix}.gate.weight", gate.weight.data)
+        store(f"{prefix}.gate.e_score_correction_bias", mixer.gate.e_score_correction_bias.data)
+        if mixer.shared_experts is not None:
+            for name in ("up_proj", "down_proj"):
+                get_state_dict(f"{prefix}.shared_experts.{name}", 0, state_dict, getattr(mixer.shared_experts, name), slice_weights = False)
+        for name in ("fc1_latent_proj", "fc2_latent_proj"):
+            if getattr(mixer, name, None) is not None:
+                get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(mixer, name), slice_weights = False)
+        w13, w2 = vllm_moe_expert_weights(mixer.experts, prefix, config, gated = False)
+        w13.requires_grad_(False)
+        w2 .requires_grad_(False)
+        store(f"{prefix}.experts.up_proj",   w13.data)
+        store(f"{prefix}.experts.down_proj", w2 .data)
+    else:
+        for name in ("up_proj", "down_proj"):
+            get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(mixer, name), slice_weights = False)
 pass
 
 

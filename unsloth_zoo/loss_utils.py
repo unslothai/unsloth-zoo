@@ -199,20 +199,28 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     
     # Causal LM loss
     def UnslothForCausalLMLoss(
-        logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
+        logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100,
+        shift_labels: Optional[torch.Tensor] = None, **kwargs
     ):
-        if labels is None: return None
-        # Flat (tokens, vocab) logits (Ling-2.6-flash MTP head): take the labels' rows, as stock shifts per label row.
-        if logits.dim() == 2:
-            labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
-            logits = logits.view(*labels.shape, logits.shape[-1])
-        shift_logits = logits
-        shift_labels = torch.empty_like(labels, device = shift_logits.device)
-        shift_labels[..., :-1] = labels[..., 1:]
-        shift_labels[..., -1] = ignore_index
-        loss = unsloth_fixed_cross_entropy(shift_logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
+        if shift_labels is None:
+            if labels is None: return None
+            # Flat (tokens, vocab) logits (Ling-2.6-flash MTP head): take the labels' rows, as stock shifts per label row.
+            if logits.dim() == 2:
+                labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
+                logits = logits.view(*labels.shape, logits.shape[-1])
+            shift_labels = torch.empty_like(labels, device = logits.device)
+            shift_labels[..., :-1] = labels[..., 1:]
+            shift_labels[..., -1] = ignore_index
+        else:
+            # Explicit targets are already aligned to logits.
+            if logits.dim() == 2:
+                logits = logits.unsqueeze(0)
+            shift_labels = shift_labels.reshape(logits.shape[:-1]).to(logits.device).contiguous()
+        loss = unsloth_fixed_cross_entropy(logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
         return loss
     pass
+    # Dynamo traces a torch.compile wrapper as the raw function, so both carry the marker.
+    UnslothForCausalLMLoss._unsloth_fused_loss = UnslothForCausalLMLoss
 
     if (Version(torch.__version__) < Version("2.4.0")):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
@@ -227,6 +235,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     pass
 
     # Now patch the losses!
+    UnslothForCausalLMLoss._unsloth_fused_loss = UnslothForCausalLMLoss
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
     # Patch every key still aliased to the stock ForCausalLMLoss. PreTrainedModel
@@ -497,14 +506,16 @@ pass
 
 
 def count_batch_items(labels, attention_mask = None, input_ids = None, packed_seq_lengths = None,
-                      unshifted = False):
+                      unshifted = False, shift_labels = None):
     # All Unsloth Zoo code licensed under LGPLv3
     """Counted targets of one micro-batch, as `(count, short, degenerate)`, without a device sync.
 
-    Shared by the batch counter and the MoE aux weighting. Counts `labels`, not a collator's
-    `shift_labels`: the fused losses train on `labels`.
+    Shared by the batch counter and the MoE aux weighting. A caller's `shift_labels` are the losses'
+    targets as given (stock counts them too): never re-shifted or re-masked.
     """
     degenerate = input_ids is not None and labels.ndim != input_ids.ndim
+    if isinstance(shift_labels, torch.Tensor):
+        return (shift_labels != -100).sum(), shift_labels.shape[-1] < 1, degenerate
     if unshifted:
         return (labels != -100).sum(), labels.shape[-1] < 1, degenerate
     short = labels.shape[-1] < 2
@@ -657,6 +668,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                 count, short, bad = count_batch_items(
                     labels, attention_mask, input_ids,
                     None if unshifted else x.get("packed_seq_lengths"), unshifted = unshifted,
+                    shift_labels = x.get("shift_labels"),
                 )
                 if not short: all_short = False
                 if bad: degenerate = True
