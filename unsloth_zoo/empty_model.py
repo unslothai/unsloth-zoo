@@ -24,6 +24,8 @@ __all__ = [
     "extract_nemotron_h_mixer",
     "extract_moe_layers",
     "vllm_moe_expert_weights",
+    "vllm_moe_expert_descriptor",
+    "fp8_moe_checkpoint_scheme",
     "verify_vllm_moe_experts_match_checkpoint",
     "extract_vision_layers",
     "align_vision_tower_names",
@@ -38,6 +40,7 @@ import torch
 import re
 import os
 import functools
+import itertools
 import inspect
 from copy import deepcopy
 from .utils import get_quant_type
@@ -950,6 +953,54 @@ def set_additional_modules(new_model, quant_state_dict, config):
     pass
 pass
 
+_FLOAT8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu")
+    if hasattr(torch, name)
+)
+
+
+def _is_quantized_tensor(tensor):
+    """float8 storage, or a tensor subclass (torchao Float8Tensor) whose dtype reports the 16-bit compute dtype."""
+    if tensor.dtype in _FLOAT8_DTYPES:
+        return True
+    data = tensor.data if isinstance(tensor, torch.nn.Parameter) else tensor
+    return type(data) not in (torch.Tensor, torch.nn.Parameter)
+
+
+def _has_quantized_tensors(model):
+    return any(
+        _is_quantized_tensor(t)
+        for t in itertools.chain(model.parameters(), model.buffers())
+    )
+
+
+def _cast_unquantized_(model, device, dtype):
+    """In-place model.to(device, dtype) that leaves quantized modules untouched: their float8 /
+    tensor-subclass weights and fp32 scales are the vLLM-shared tensors."""
+    for module in model.modules():
+        own = itertools.chain(module._parameters.values(), module._buffers.values())
+        if any(t is not None and _is_quantized_tensor(t) for t in own):
+            continue
+        for name, param in list(module._parameters.items()):
+            if param is None or _is_quantized_tensor(param):
+                continue
+            if param.is_floating_point() or param.is_complex():
+                new = param.data.to(device = device, dtype = dtype)
+            else:
+                new = param.data.to(device)
+            if new is not param.data:
+                param.data = new  # in place, like Module.to: keeps tied weights tied
+        for name, buffer in list(module._buffers.items()):
+            if buffer is None or _is_quantized_tensor(buffer):
+                continue
+            if buffer.is_floating_point() or buffer.is_complex():
+                module._buffers[name] = buffer.to(device = device, dtype = dtype)
+            else:
+                module._buffers[name] = buffer.to(device)
+    return model
+
+
 @torch.inference_mode
 def finalize_huggingface_model(
     new_model,
@@ -1097,7 +1148,11 @@ def finalize_huggingface_model(
     _copy_rotary_buffers(original_meta_model, new_model)
 
     if (quantization_config or {}) == {} and bnb_config is None:
-        new_model = new_model.to(device = target_device, dtype = dtype)
+        # Online FP8 leaves no quantization_config but float8 / torchao weights: cast only plain tensors.
+        if _has_quantized_tensors(new_model):
+            _cast_unquantized_(new_model, target_device, dtype)
+        else:
+            new_model = new_model.to(device = target_device, dtype = dtype)
         _reinit_rotary_embeddings(new_model)
         _copy_rotary_buffers(original_meta_model, new_model)
         for module in new_model.modules():
@@ -1167,6 +1222,8 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.feed_forward.w3",
             "model.layers.{kk}.feed_forward.experts.gate_up_proj",
             "model.layers.{kk}.feed_forward.experts.down_proj",
+            "model.layers.{kk}.feed_forward.experts.gate_up_proj_scale_inv", # FP8 experts (block dequant multipliers)
+            "model.layers.{kk}.feed_forward.experts.down_proj_scale_inv",
             "model.layers.{kk}.feed_forward.gate.weight",
             "model.layers.{kk}.feed_forward.expert_bias",
 
@@ -1200,6 +1257,8 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.mlp.shared_expert.down_proj",
             "model.language_model.layers.{kk}.mlp.experts.gate_up_proj",
             "model.language_model.layers.{kk}.mlp.experts.down_proj",
+            "model.language_model.layers.{kk}.mlp.experts.gate_up_proj_scale_inv", # FP8 experts (block dequant multipliers)
+            "model.language_model.layers.{kk}.mlp.experts.down_proj_scale_inv",
 
             "model.layers.{kk}.mlp.gate.weight",
             "model.layers.{kk}.mlp.shared_expert_gate",
@@ -1208,16 +1267,22 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.shared_expert.down_proj",
             "model.layers.{kk}.mlp.experts.gate_up_proj",
             "model.layers.{kk}.mlp.experts.down_proj",
+            "model.layers.{kk}.mlp.experts.gate_up_proj_scale_inv", # FP8 experts (block dequant multipliers)
+            "model.layers.{kk}.mlp.experts.down_proj_scale_inv",
 
             # Gemma-4: experts and router are siblings of mlp, else left as 1-wide placeholders.
             "model.language_model.layers.{kk}.experts.gate_up_proj",
             "model.language_model.layers.{kk}.experts.down_proj",
+            "model.language_model.layers.{kk}.experts.gate_up_proj_scale_inv", # FP8 experts (block dequant multipliers)
+            "model.language_model.layers.{kk}.experts.down_proj_scale_inv",
             "model.language_model.layers.{kk}.router.proj",
             "model.language_model.layers.{kk}.router.scale",
             "model.language_model.layers.{kk}.router.per_expert_scale",
 
             "model.layers.{kk}.experts.gate_up_proj",
             "model.layers.{kk}.experts.down_proj",
+            "model.layers.{kk}.experts.gate_up_proj_scale_inv", # FP8 experts (block dequant multipliers)
+            "model.layers.{kk}.experts.down_proj_scale_inv",
             "model.layers.{kk}.router.proj",
             "model.layers.{kk}.router.scale",
             "model.layers.{kk}.router.per_expert_scale",
@@ -1616,12 +1681,185 @@ def vision_tower_census(new_model, reference_model, tower_paths):
 
 
 def vllm_moe_expert_weights(experts, where, config = None, gated = True):
-    """A vLLM FusedMoE's (w13, w2) when exactly HF's stacked expert tensors, else refuse.
+    """A vLLM FusedMoE's (w13, w2) when exactly HF's stacked 16/32-bit expert tensors, else refuse.
 
     gated = False: non-gated experts (Nemotron-H relu2), where w13 holds only up_proj.
-
-    Only TRITON / BATCHED_TRITON keep HF's layout; some rewrites keep the shape (TRT-LLM padding, AITER).
     """
+    found = _vllm_moe_routed_weights(experts, where, config, gated)
+    w13, w2 = found["w13"], found["w2"]
+    for name, value in (("w13", w13), ("w2", w2)):
+        if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise NotImplementedError(
+                f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({where} {name} is "
+                f"{value.dtype}); load_in_4bit = False does not change a checkpoint's own quantization. "
+                "Load the 16-bit (BF16) checkpoint, or set fast_inference = False."
+            )
+    return w13, w2
+pass
+
+
+# The one FP8 MoE runtime format training can alias: vLLM's Triton experts over canonical
+# [E, 2I, H] / [E, H, I] float8_e4m3fn weights with fp32 128x128 block dequant multipliers.
+FP8_MOE_SHARED_BLOCK = (128, 128)
+
+
+def vllm_moe_expert_descriptor(experts, where, config = None):
+    """vLLM's finalized routed-expert tensors as a dict HF can alias without copying.
+
+    {"scheme": "16bit" | "fp8_block", "w13", "w2", "w13_scale_inv", "w2_scale_inv", "block_size"}.
+    16-bit experts pass the same checks as `vllm_moe_expert_weights`. float8 experts are accepted only for
+    vLLM's Triton FP8 MoE kernel with 128x128 fp32 block scales and dynamic activations at TP=1 without EP;
+    every other FP8 runtime (per-tensor, static activations, E8M0, FlashInfer / CUTLASS / DeepGEMM / Marlin /
+    TRT-LLM repacks, refined or TP-sharded blocks) is refused.
+    """
+    found = _vllm_moe_routed_weights(experts, where, config)
+    w13, w2, routed = found["w13"], found["w2"], found["routed"]
+    if w13.dtype in (torch.float16, torch.bfloat16, torch.float32) and w2.dtype == w13.dtype:
+        return dict(scheme = "16bit", w13 = w13, w2 = w2, w13_scale_inv = None, w2_scale_inv = None, block_size = None)
+    if w13.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        raise NotImplementedError(
+            f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({where} w13 is {w13.dtype}, "
+            f"w2 is {w2.dtype}); only 16-bit and block FP8 (float8_e4m3fn) experts can be shared. "
+            "Load the 16-bit checkpoint or set fast_inference = False."
+        )
+    w13_scale, w2_scale = _vllm_fp8_moe_contract(routed, w13, w2, where)
+    return dict(
+        scheme = "fp8_block", w13 = w13, w2 = w2, w13_scale_inv = w13_scale, w2_scale_inv = w2_scale,
+        block_size = list(FP8_MOE_SHARED_BLOCK),
+    )
+pass
+
+
+def fp8_moe_checkpoint_scheme(config):
+    """For a sparse MoE checkpoint quantized to FP8: (shareable, reason). None for any other checkpoint.
+
+    Read from config only, so callers can refuse before vLLM allocates anything; the runtime tensors are
+    checked again by `vllm_moe_expert_descriptor` after vLLM processed the weights.
+    """
+    text_config = getattr(config, "text_config", None) or config
+    n_experts = None
+    for key in ("num_experts", "num_local_experts", "n_routed_experts"):
+        value = getattr(text_config, key, None)
+        if isinstance(value, int) and value > 1:
+            n_experts = value
+            break
+    if n_experts is None: return None
+    quant = getattr(config, "quantization_config", None) or getattr(text_config, "quantization_config", None)
+    if not quant: return None
+    if not isinstance(quant, dict):
+        quant = quant.to_dict() if hasattr(quant, "to_dict") else dict(vars(quant))
+    method = str(quant.get("quant_method", "")).lower()
+    is_fp8 = "fp8" in method
+    if method == "compressed-tensors":
+        is_fp8 = '"num_bits": 8' in str(quant).replace("'", '"') and '"type": "float"' in str(quant).replace("'", '"')
+    if method == "modelopt":
+        is_fp8 = "FP8" in str(quant.get("quant_algo", "")).upper()
+    if not is_fp8: return None
+    verdict = _fp8_moe_block_verdict(method, quant, text_config)
+    if not verdict[0] and _quant_config_skips_experts(quant):
+        # Unquantized experts stay 16-bit in vLLM and are shared like BF16.
+        return None
+    return verdict
+pass
+
+
+def _quant_config_skips_experts(quant):
+    """Whether an FP8 quantization_config leaves routed experts unquantized (skip / ignore lists)."""
+    for key in ("modules_to_not_convert", "ignore", "ignored_layers", "exclude_modules"):
+        for entry in quant.get(key, None) or ():
+            if isinstance(entry, str) and re.search(r"(^|[.:*])experts($|[.$*])", entry):
+                return True
+    return False
+pass
+
+
+def _fp8_moe_block_verdict(method, quant, text_config):
+    if method != "fp8":
+        return False, f"its {method} FP8 format is not vLLM's block FP8 (quant_method = 'fp8')"
+    block = quant.get("weight_block_size", None)
+    if block is None or tuple(block) != FP8_MOE_SHARED_BLOCK:
+        return False, f"weight_block_size is {block}, not {list(FP8_MOE_SHARED_BLOCK)} (per-tensor FP8 is requantized by vLLM)"
+    if quant.get("activation_scheme", "dynamic") != "dynamic":
+        return False, f"activation_scheme is {quant.get('activation_scheme')!r}, not 'dynamic'"
+    scale_fmt = quant.get("scale_fmt", None)
+    if scale_fmt not in (None, "float"):
+        return False, f"scale_fmt is {scale_fmt!r} (E8M0 / packed scales), not float32"
+    inter = getattr(text_config, "moe_intermediate_size", None) or getattr(text_config, "expert_intermediate_size", None)
+    if isinstance(inter, int) and inter % FP8_MOE_SHARED_BLOCK[0] != 0:
+        return False, f"moe_intermediate_size {inter} is not a multiple of {FP8_MOE_SHARED_BLOCK[0]}"
+    return True, None
+pass
+
+
+def _vllm_fp8_moe_contract(routed, w13, w2, where):
+    """(w13_scale_inv, w2_scale_inv) when vLLM's FP8 experts are in the one shareable format, else refuse."""
+    def refuse(reason):
+        raise NotImplementedError(
+            f"Unsloth: fast_inference cannot share vLLM's FP8 MoE experts for {where}: {reason}. "
+            "Only block FP8 checkpoints (128x128 fp32 scales, dynamic activations) on vLLM's Triton "
+            "FP8 MoE kernel at tensor_parallel_size = 1 can be shared; load the 16-bit (BF16) checkpoint "
+            "or set fast_inference = False."
+        )
+    quant_method = getattr(routed, "quant_method", None)
+    quant_method = getattr(quant_method, "old_quant_method", quant_method)  # FusedMoEModularMethod
+    if quant_method is None or "Fp8MoEMethod" not in [c.__name__ for c in type(quant_method).__mro__]:
+        refuse(f"its quantization method is {type(quant_method).__name__}, not vLLM's Fp8MoEMethod")
+    if not getattr(quant_method, "block_quant", False):
+        refuse("the checkpoint is per-tensor / per-channel FP8, not block FP8")
+    block = getattr(quant_method, "weight_block_size", None)
+    if block is None or tuple(block) != FP8_MOE_SHARED_BLOCK:
+        refuse(f"weight_block_size is {block}, not {list(FP8_MOE_SHARED_BLOCK)}")
+    moe_block = getattr(quant_method, "moe_block_shape", block)
+    if moe_block is None or tuple(moe_block) != FP8_MOE_SHARED_BLOCK \
+        or getattr(quant_method, "weight_scale_refine", None) is not None:
+        refuse(f"vLLM refined the block scales to {moe_block}")
+    quant_config = getattr(quant_method, "quant_config", None)
+    activation_scheme = getattr(quant_config, "activation_scheme", None)
+    if activation_scheme != "dynamic":
+        refuse(f"activation_scheme is {activation_scheme!r}, not 'dynamic'")
+    backend = getattr(quant_method, "fp8_backend", None)
+    backend = getattr(backend, "name", backend)
+    experts_cls = getattr(quant_method, "experts_cls", None)
+    experts_cls = getattr(experts_cls, "__name__", type(experts_cls).__name__)
+    if backend != "TRITON" or experts_cls != "TritonExperts":
+        refuse(
+            f"vLLM selected the {backend} FP8 MoE backend ({experts_cls}), whose weight layout is not "
+            "the checkpoint's; Unsloth asks vLLM for moe_backend = 'triton'"
+        )
+    moe = getattr(quant_method, "moe", None) or getattr(routed, "moe_config", None)
+    parallel = getattr(moe, "moe_parallel_config", None)
+    if parallel is None:
+        refuse("vLLM's MoE parallel config is unavailable")
+    tp, ep = getattr(parallel, "tp_size", 1), getattr(parallel, "ep_size", 1)
+    if tp != 1 or ep != 1 or getattr(parallel, "use_ep", False):
+        refuse(f"vLLM shards the experts (tp_size = {tp}, ep_size = {ep})")
+    if getattr(routed, "w13_bias", None) is not None or getattr(routed, "w2_bias", None) is not None:
+        refuse("its experts carry biases, which the FP8Experts training copy cannot hold")
+    w13_scale = getattr(routed, "w13_weight_scale_inv", None)
+    w2_scale = getattr(routed, "w2_weight_scale_inv", None)
+    if w13_scale is None or w2_scale is None:
+        refuse("vLLM holds no w13_weight_scale_inv / w2_weight_scale_inv")
+    E, two_i, H = w13.shape
+    inter = two_i // 2
+    bn, bk = FP8_MOE_SHARED_BLOCK
+    if inter % bn != 0:
+        refuse(f"moe_intermediate_size {inter} is not a multiple of {bn}, so gate and up share scale blocks")
+    cdiv = lambda a, b: (a + b - 1) // b
+    for name, weight, scale in (("w13", w13, w13_scale), ("w2", w2, w2_scale)):
+        expected = (weight.shape[0], cdiv(weight.shape[1], bn), cdiv(weight.shape[2], bk))
+        if scale.dtype != torch.float32:
+            refuse(f"{name} scales are {scale.dtype}, not float32 (E8M0 / packed scales are not shareable)")
+        if tuple(scale.shape) != expected:
+            refuse(f"{name} scale grid is {tuple(scale.shape)}, expected {expected}")
+        if not weight.is_contiguous() or not scale.is_contiguous():
+            refuse(f"{name} is not stored contiguously")
+    return w13_scale, w2_scale
+pass
+
+
+def _vllm_moe_routed_weights(experts, where, config = None, gated = True):
+    """Shape / backend checks shared by every scheme. Only TRITON / BATCHED_TRITON keep HF's layout for
+    16-bit experts; some rewrites keep the shape (TRT-LLM padding, AITER)."""
     experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
     routed = getattr(experts, "routed_experts", experts)  # vLLM >= 0.24: MoERunner.routed_experts
     trtllm = _find_trtllm_moe_kernel(experts, routed)
@@ -1662,14 +1900,7 @@ def vllm_moe_expert_weights(experts, where, config = None, gated = True):
             f"Unsloth: fast_inference cannot rebuild MoE experts from vLLM's {backend} layout "
             f"(w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}); set fast_inference = False."
         )
-    for name, value in (("w13", w13), ("w2", w2)):
-        if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise NotImplementedError(
-                f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({where} {name} is "
-                f"{value.dtype}); load the model in 16-bit (load_in_4bit = False) or set "
-                "fast_inference = False."
-            )
-    return w13, w2
+    return dict(w13 = w13, w2 = w2, routed = routed)
 pass
 
 
@@ -1832,11 +2063,14 @@ def extract_moe_layers(
 
     experts = getattr(moe_block, "experts", None)
     if experts is None: return
-    w13, w2 = vllm_moe_expert_weights(experts, prefix, config)
-    w13.requires_grad_(False)
-    w2 .requires_grad_(False)
-    store(f"{prefix}.experts.gate_up_proj", w13.data)
-    store(f"{prefix}.experts.down_proj",    w2 .data)
+    found = vllm_moe_expert_descriptor(experts, prefix, config)
+    for key, name in (("w13", "gate_up_proj"), ("w2", "down_proj")):
+        found[key].requires_grad_(False)
+        store(f"{prefix}.experts.{name}", found[key].data)
+        scale = found[f"{key}_scale_inv"]
+        if scale is not None:
+            scale.requires_grad_(False)
+            store(f"{prefix}.experts.{name}_scale_inv", scale.data)
 pass
 
 
