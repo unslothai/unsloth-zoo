@@ -182,8 +182,7 @@ def _dequantize_expert_slice(
         return expert_weight.to(target_dtype)
 
     w = expert_weight.to(target_dtype)
-    # Keep small scales in FP32 until multiplication; mul_ casts the product
-    # back into w without allocating a full FP32 weight/result tensor.
+    # FP16 flushes small scales: multiply in FP32, mul_ rounds once into w.
     scale_dtype = torch.float32 if target_dtype == torch.float16 else target_dtype
 
     # Per-tensor scale
@@ -246,8 +245,7 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
     s = quant_state
 
     w = weight.to(target_dtype)
-    # FP8 values are exactly representable in FP16, but their scales may not be.
-    # Promote the multiplication, then cast its result directly into w.
+    # FP16 flushes small scales: multiply in FP32, mul_ rounds once into w.
     scale_dtype = torch.float32 if target_dtype == torch.float16 else target_dtype
 
     # Per-tensor scalar
