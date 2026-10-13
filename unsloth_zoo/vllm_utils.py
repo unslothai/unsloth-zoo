@@ -610,6 +610,25 @@ def patch_vllm_untiled_moe_experts():
 pass
 
 
+def patch_vllm_stacked_moe_lora(config):
+    """Set is_3d_moe_weight so vLLM serves the stacked expert adapter; its 2D wrapper cannot (vllm-project/vllm#41754)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+    if model_type != "qwen3_moe": return False
+    try:
+        from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA  # noqa: F401
+        from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
+        # Only transformers >= 5 stacks the experts into 3D tensors.
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts  # noqa: F401
+    except Exception as e:
+        logger.info(f"Unsloth: not marking {model_type} as a 3D MoE LoRA model in vLLM: {e}")
+        return False
+    if getattr(Qwen3MoeForCausalLM, "is_3d_moe_weight", False) is not True:
+        Qwen3MoeForCausalLM.is_3d_moe_weight = True
+    return True
+pass
+
+
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
     try:
@@ -3297,6 +3316,8 @@ def load_vllm(
             patch_gemma4_vllm_lora_support()
         if use_bitsandbytes:
             patch_gemma4_vllm_k_eq_v_support()
+    if enable_lora:
+        patch_vllm_stacked_moe_lora(config)
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
