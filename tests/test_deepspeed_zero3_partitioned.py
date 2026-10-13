@@ -121,3 +121,61 @@ def test_fix_untrained_tokens_does_not_gather_unpartitioned_weights(fake_gather)
     model = _tiny_llama()
     tokenizer_utils.fix_untrained_tokens(model, _Tokenizer(), [{"input_ids" : [1]}])
     assert fake_gather == []
+
+
+@pytest.fixture
+def live_zero3(monkeypatch):
+    """Make transformers report a live ZeRO-3 config (or none) the way TrainingArguments does."""
+    import weakref
+    from transformers.integrations import deepspeed as hf_deepspeed
+
+    class _Config:
+        def __init__(self, zero3): self.zero3 = zero3
+        def is_zero3(self): return self.zero3
+
+    held = []
+
+    def set_state(zero3):
+        if zero3 is None:
+            monkeypatch.setattr(hf_deepspeed, "_hf_deepspeed_config_weak_ref", None)
+            return
+        held.append(_Config(zero3))
+        monkeypatch.setattr(hf_deepspeed, "_hf_deepspeed_config_weak_ref", weakref.ref(held[-1]))
+
+    return set_state
+
+
+@pytest.mark.parametrize("factory", ["_eager_during_decode", "eager_under_zero3"])
+def test_compiled_regions_run_eager_under_zero3(live_zero3, factory):
+    """Inside torch.compile ZeRO-3's parameter getter returns the empty placeholder, so Unsloth's
+    compiled regions (generated modules, patch_function, temporary patches) run eager under it."""
+    from unsloth_zoo.temporary_patches import utils
+
+    calls = []
+    dispatch = getattr(utils, factory)(lambda: calls.append("eager"), lambda: calls.append("compiled"))
+    for state in (None, False, True, None):
+        live_zero3(state)
+        dispatch()
+    assert calls == ["compiled", "compiled", "eager", "compiled"]
+    assert dispatch._unsloth_compiled_func is not None
+
+
+def test_patch_function_compiled_patch_runs_eager_under_zero3(live_zero3):
+    from unsloth_zoo.temporary_patches.utils import patch_function
+
+    class _Target:
+        def forward(self, x):
+            return x
+
+    traced = []
+
+    def forward(self, x):
+        # Runs at trace time under torch.compile (True), on every call when eager (False).
+        traced.append(torch.compiler.is_compiling())
+        return x + 1
+
+    patch_function(_Target, "forward", forward, fullgraph = True)
+    live_zero3(True)
+    for _ in range(2):
+        assert _Target.forward(_Target(), torch.tensor(1.0)).item() == 2.0
+    assert traced == [False, False], traced
