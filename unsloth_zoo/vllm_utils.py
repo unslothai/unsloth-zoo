@@ -610,30 +610,21 @@ def patch_vllm_untiled_moe_experts():
 pass
 
 
-# model_type -> (vLLM class, transformers class that exists only when HF stacks the experts in 3D).
-_VLLM_STACKED_MOE_LORA_CLASSES = {
-    "qwen3_moe": (
-        ("vllm.model_executor.models.qwen3_moe", "Qwen3MoeForCausalLM"),
-        ("transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeExperts"),
-    ),
-}
-
 def patch_vllm_stacked_moe_lora(config):
     """Set is_3d_moe_weight so vLLM serves the stacked expert adapter; its 2D wrapper cannot (vllm-project/vllm#41754)."""
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
-    entry = _VLLM_STACKED_MOE_LORA_CLASSES.get(model_type)
-    if entry is None: return False
-    (vllm_module, vllm_name), (hf_module, hf_name) = entry
+    if model_type != "qwen3_moe": return False
     try:
         from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA  # noqa: F401
-        vllm_cls = getattr(importlib.import_module(vllm_module), vllm_name)
-        getattr(importlib.import_module(hf_module), hf_name)
+        from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
+        # Only transformers >= 5 stacks the experts into 3D tensors.
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts  # noqa: F401
     except Exception as e:
         logger.info(f"Unsloth: not marking {model_type} as a 3D MoE LoRA model in vLLM: {e}")
         return False
-    if getattr(vllm_cls, "is_3d_moe_weight", False) is not True:
-        vllm_cls.is_3d_moe_weight = True
+    if getattr(Qwen3MoeForCausalLM, "is_3d_moe_weight", False) is not True:
+        Qwen3MoeForCausalLM.is_3d_moe_weight = True
     return True
 pass
 
