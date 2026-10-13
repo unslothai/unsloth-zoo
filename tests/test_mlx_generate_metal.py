@@ -1822,6 +1822,7 @@ def test_nax_sorted_gather_stays_off_unmeasured_gpu_generations(monkeypatch):
     monkeypatch.setattr(nax, "_gpu_generation", lambda: 17)
     assert nax.sorted_gather_row_range(256, 8) == (1024, 32768) and nax.sorted_gather_row_range(2, 4) == (16, 256)
     assert nax.sorted_gather_row_range(256, 5) == (1024, -256)
+    assert nax.sorted_gather_row_range(512, 8) == (2048, 32768)
     assert nax.sorted_gather_qmm_supported(1024, 2048, 64, 8, "affine")
     for shape in ((1024, 2080, 32, 8, "affine"), (1056, 2048, 64, 8, "affine"), (1024, 2048, 64, 6, "affine"),
                   (1024, 2048, 32, 4, "mxfp4")):

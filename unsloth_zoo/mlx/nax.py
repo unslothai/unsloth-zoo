@@ -1073,11 +1073,15 @@ def _sorted_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_ro
 _SORTED_GATHER_ROWS_BY_GPU = {17: {4: (4, 128), 8: (4, 128)}}
 # Below these rows per expert and per call MLX runs per-row kernels, which round differently.
 _SORTED_GATHER_STOCK_MIN_ROWS, _SORTED_GATHER_STOCK_MIN_CALL = 4, 16
+# Past this many rows the stock sorted kernel corrupts (ml-explore/mlx#3856) and the gather guard
+# drops `sorted_indices`, so the first-use check of a shape would not cover longer calls.
+_SORTED_GATHER_MAX_CALL = 32768
 
 
 def sorted_gather_row_range(E, bits):
     low, high = _SORTED_GATHER_ROWS_BY_GPU.get(_gpu_generation(), {}).get(bits, (0, -1))
-    return max(max(low, _SORTED_GATHER_STOCK_MIN_ROWS) * E, _SORTED_GATHER_STOCK_MIN_CALL), high * E
+    return (max(max(low, _SORTED_GATHER_STOCK_MIN_ROWS) * E, _SORTED_GATHER_STOCK_MIN_CALL),
+            min(high * E, _SORTED_GATHER_MAX_CALL))
 
 
 def probe_sorted_gather_qmm():
