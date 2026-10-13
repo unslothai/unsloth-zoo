@@ -780,7 +780,6 @@ def _packed_gated_delta(q, k, v, g, beta, state):
 
 def _packed_gated_delta_route(native, bindings):
     def gated_delta_kernel(q, k, v, g, beta, state, mask = None):
-        # One-token decode, masks, vector gates and other key widths keep the generic kernel.
         if (mask is not None or g.ndim != 3 or k.shape[1] < 2 or k.shape[3] != 128 or v.shape[3] % 8
                 or g.dtype != mx.float32 or state.dtype != mx.float32 or not _bindings_intact(bindings)):
             return native(q, k, v, g, beta, state, mask)
@@ -819,14 +818,10 @@ def _gated_delta_sources(modules):
 
 @contextmanager
 def fused_packed_gated_delta(model, *, _modules = None):
-    """Run multi-token gated-delta recurrences with eight value rows per SIMD group instead of one.
+    """Run multi-token gated-delta calls on a packed kernel, bit-identical to the generic one.
 
-    Covers calls of two or more tokens with 128-wide keys, a scalar float32 gate, float32 state, no mask and
-    a value width divisible by eight, bit-identical to the generic kernel; each head layout and dtype is
-    compared bit for bit on its first use and keeps the generic kernel if it differs. One-token decode and
-    every other shape take the generic kernel. The gated-delta module's `gated_delta_kernel` is rebound for
-    as long as any scope is open, so it is restored when the last one exits. An mlx-lm or mlx-vlm that
-    ships its own packed kernel is left alone. `UNSLOTH_MLX_PACKED_GATED_DELTA=0` turns the route off.
+    Each head layout and dtype is compared bit for bit on first use. `gated_delta_kernel` is rebound
+    process-wide while any scope is open. `UNSLOTH_MLX_PACKED_GATED_DELTA=0` turns the route off.
     """
     entered = []
     try:
