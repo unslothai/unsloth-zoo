@@ -14,27 +14,13 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Skip bitsandbytes' per-parameter device sync in non-paged 8-bit / 32-bit optimizer steps.
+"""Skip bitsandbytes' per-parameter device sync in non-paged optimizer steps.
 
-`Optimizer8bit.step` calls `torch.cuda.synchronize()` (0.45 / 0.46) or `sync_gpu(p)`
-(0.47+) after every parameter's update. It arrived with paged optimizers (commit 41a9c70,
-"Changed prefetching.", May 2023) next to the per-parameter `prefetch_state`: paged state
-lives in managed memory and `cprefetch` / `cudaMemPrefetchAsync` run on stream 0 without
-ordering against the host. Non-paged optimizers never prefetch, and their update kernels
-(`kOptimizer32bit*`, `kOptimizerStatic8bit*Blockwise`) are launched without a stream
-argument, i.e. on the legacy default stream, which is also torch's default stream. When the
-parameter's device runs torch on that default stream, stream order already serialises the
-update after backward and before the next forward, and the caching allocator's reuse of
-freed gradients is stream ordered too. The host-side sync then only blocks the CPU, which
-costs one full device drain per parameter (192 per step for a 4-bit LoRA on Qwen3.5-2B).
-
-Scope, deliberately narrow:
-  * paged optimizers (`self.is_paged`) run bitsandbytes' own `step` untouched;
-  * the sync is kept for non-CUDA params (XPU, CPU, ...) and whenever the param's device has
-    a non-default current stream (side streams are non-blocking against the legacy stream);
-  * only applied when the installed `Optimizer8bit.step` is AST-identical to one of the two
-    known shapes, inside the version window below;
-  * `UNSLOTH_BNB_OPTIMIZER_SYNC=1` restores the per-parameter sync (read every step).
+The sync came with paged optimizers (bitsandbytes 41a9c70), whose managed-memory prefetch is async.
+Non-paged update kernels launch on the legacy default stream, which torch also uses, so stream order
+already serialises them; the sync only blocks the host (one device drain per LoRA tensor).
+Paged optimizers, non-CUDA params and side streams keep every sync; unknown step shapes are left alone;
+UNSLOTH_BNB_OPTIMIZER_SYNC=1 restores the original step.
 """
 
 import ast
