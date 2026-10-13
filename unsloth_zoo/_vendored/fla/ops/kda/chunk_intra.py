@@ -14,7 +14,7 @@ from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2, gather
-from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
+from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, LONG_INDEXING_THRESHOLD, autotune_cache_kwargs
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
@@ -822,7 +822,7 @@ def chunk_kda_fwd_intra(
             BC=BC,
             BK=BK,
             USE_GATHER=IS_GATHER_SUPPORTED,
-            LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > 2**31,
+            LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > LONG_INDEXING_THRESHOLD,
         )
     else:
         Aqk, Akkd = chunk_kda_fwd_intra_token_parallel(
@@ -859,7 +859,7 @@ def chunk_kda_fwd_intra(
         BC=BC,
         NC=NC,
         USE_SAFE_GATE=safe_gate,
-        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > 2**31,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > LONG_INDEXING_THRESHOLD,
     )
     w, u, qg, kg = recompute_w_u_fwd(
         k=k,
@@ -933,7 +933,7 @@ def chunk_kda_bwd_intra(
         NC=NC,
         SAFE_GATE=safe_gate,
         USE_GATHER=IS_GATHER_SUPPORTED,
-        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > 2**31,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > LONG_INDEXING_THRESHOLD,
     )
     dq = dq2
     dk = dk2

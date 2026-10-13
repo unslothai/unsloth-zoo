@@ -12,7 +12,7 @@ import triton.language as tl
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
-from fla.utils import autotune_cache_kwargs, check_shared_mem
+from fla.utils import LONG_INDEXING_THRESHOLD, autotune_cache_kwargs, check_shared_mem
 
 
 @triton.heuristics({
@@ -296,7 +296,7 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
-        LONG_INDEXING=B * T * max(H, HV) * max(K, V, BT) > 2**31,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, V, BT) > LONG_INDEXING_THRESHOLD,
     )
     return w, u, qg, kg
 
@@ -354,7 +354,7 @@ def prepare_wy_repr_bwd(
         BT=BT,
         BK=BK,
         BV=BV,
-        LONG_INDEXING=B * T * max(H, HV) * max(K, V, BT) > 2**31,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, V, BT) > LONG_INDEXING_THRESHOLD,
     )
     dk = dk2
     dg = dg2
