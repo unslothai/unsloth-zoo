@@ -257,9 +257,11 @@ class _PackedMoEGateUp:
     def project(self, x, indices, sorted_indices, token_rows = None):
         """`x` holds one row per token when `token_rows` maps each sorted row to its token."""
         group_size, bits, mode = self.metadata
-        result = _nax_int8_prefill_gather(self.gate, x, self.arrays["weight"], self.arrays["scales"],
-                                  self.arrays.get("biases"), indices, sorted_indices, group_size, bits, mode, None,
-                                  token_rows)
+        call = (self.gate, x, self.arrays["weight"], self.arrays["scales"], self.arrays.get("biases"), indices,
+                sorted_indices, group_size, bits, mode, None, token_rows)
+        result = _nax_int8_prefill_gather(*call)
+        if result is None:
+            result = _nax_sorted_gather(*call)
         if result is None:
             result = mx.gather_qmm(
                 x if token_rows is None else x[token_rows],
@@ -2706,6 +2708,7 @@ _NAX_QMM_CONTRACT = {"mlx.nn.layers.quantized": {
 _NAX_QMM_LOCK = RLock()
 _NAX_QMM_VERIFIED = {}
 _NAX_INT8_QMM_VERIFIED = {}
+_NAX_SORTED_GATHER_VERIFIED = {}
 
 
 def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
@@ -2770,9 +2773,9 @@ def _nax_small_m_qmm(module, x, bindings):
     return routed.reshape(*x.shape[:-1], N) if verified else None
 
 
-def _nax_int8_qmm_eligible(K, dtype, w, scales, biases, group_size, bits, mode):
+def _nax_qmm_eligible(supported, K, dtype, w, scales, biases, group_size, bits, mode):
     return (all(isinstance(a, mx.array) for a in (w, scales, biases))
-            and nax.int8_qmm_supported(w.shape[-2], K, group_size, bits, mode)
+            and supported(w.shape[-2], K, group_size, bits, mode)
             and dtype in (mx.bfloat16, mx.float16) and dtype == scales.dtype == biases.dtype
             and w.dtype == mx.uint32 and w.shape[-1] == K * bits // 32
             and scales.shape == (*w.shape[:-1], K // group_size) and biases.shape == scales.shape)
@@ -2842,7 +2845,8 @@ def _nax_int8_prefill_dense(module, x, bindings):
     if module.training or not _bindings_intact(bindings):
         return None
     w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
-    if (not _nax_int8_qmm_eligible(x.shape[-1], x.dtype, w, scales, biases, module.group_size, module.bits, module.mode)
+    if (not _nax_qmm_eligible(nax.int8_qmm_supported, x.shape[-1], x.dtype, w, scales, biases, module.group_size,
+                              module.bits, module.mode)
             or w.ndim != 2):
         return None
     N, K = w.shape[0], x.shape[-1]
@@ -2851,21 +2855,29 @@ def _nax_int8_prefill_dense(module, x, bindings):
     return None if routed is None else routed.reshape(*x.shape[:-1], N)
 
 
+def _nax_gather_rows(owner, flag, x, w, indices, sorted_indices, bindings, token_rows):
+    """The sorted rows of a gathered call that the NAX route `flag` enables on `owner` may take, or 0."""
+    if not sorted_indices or not isinstance(x, mx.array) or x.ndim != 3 or x.shape[1] != 1:
+        return 0
+    if not getattr(owner, flag, False) or owner.training:
+        return 0
+    if bindings is not None and not _bindings_intact(bindings):
+        return 0
+    T = x.shape[0] if token_rows is None else token_rows.shape[0]
+    if (not isinstance(indices, mx.array) or indices.shape != (T,)
+            or indices.dtype not in (mx.uint32, mx.int32) or not isinstance(w, mx.array) or w.ndim != 3):
+        return 0
+    return T
+
+
 def _nax_int8_prefill_gather(owner, x, w, scales, biases, indices, sorted_indices, group_size, bits, mode, bindings,
                      token_rows = None):
     """The gathered int8 kernel's result for x of shape [T, 1, K] sorted by expert, or None for the
     native call. `owner` enabled the route; `w` may pack several projections. With `token_rows`, x
     holds one row per token and sorted row i is `x[token_rows[i]]`."""
-    if not sorted_indices or not isinstance(x, mx.array) or x.ndim != 3 or x.shape[1] != 1:
-        return None
-    if not getattr(owner, "_unsloth_nax_int8_prefill", False) or owner.training:
-        return None
-    if bindings is not None and not _bindings_intact(bindings):
-        return None
-    T = x.shape[0] if token_rows is None else token_rows.shape[0]
-    if (not isinstance(indices, mx.array) or indices.shape != (T,)
-            or indices.dtype not in (mx.uint32, mx.int32) or not isinstance(w, mx.array) or w.ndim != 3
-            or not _nax_int8_qmm_eligible(x.shape[-1], x.dtype, w, scales, biases, group_size, bits, mode)):
+    T = _nax_gather_rows(owner, "_unsloth_nax_int8_prefill", x, w, indices, sorted_indices, bindings, token_rows)
+    if not T or not _nax_qmm_eligible(nax.int8_qmm_supported, x.shape[-1], x.dtype, w, scales, biases, group_size,
+                                      bits, mode):
         return None
     (E, N, _), K = w.shape, x.shape[-1]
     low = nax.int8_prefill_expert_min_rows(E, bits, token_rows is not None)
@@ -2874,6 +2886,49 @@ def _nax_int8_prefill_gather(owner, x, w, scales, biases, indices, sorted_indice
     routed = _nax_verified_int8_qmm(("gather", E, N, K, group_size, bits, x.dtype, token_rows is not None),
                                     x.reshape(-1, K), w, scales, biases, group_size, bits, indices, token_rows)
     return None if routed is None else routed.reshape(T, 1, N)
+
+
+def _nax_sorted_gather(owner, x, w, scales, biases, indices, sorted_indices, group_size, bits, mode, bindings,
+                       token_rows = None):
+    """The sorted gather kernel's result, or None for the native call."""
+    T = _nax_gather_rows(owner, "_unsloth_nax_sorted_gather", x, w, indices, sorted_indices, bindings, token_rows)
+    if not T or not _nax_qmm_eligible(nax.sorted_gather_qmm_supported, x.shape[-1], x.dtype, w, scales, biases,
+                                      group_size, bits, mode):
+        return None
+    (E, N, _), K = w.shape, x.shape[-1]
+    low, high = nax.sorted_gather_row_range(E, bits)
+    if not low <= T <= high or (token_rows is not None and token_rows.dtype not in (mx.uint32, mx.int32)):
+        return None
+    key = (E, N, K, group_size, bits, x.dtype, token_rows is not None)
+    verified = _NAX_SORTED_GATHER_VERIFIED.get(key)
+    if verified is False:
+        return None
+    routed = nax.sorted_gather_qmm(x.reshape(-1, K), w, scales, biases, indices, bits, token_rows).reshape(T, 1, N)
+    if verified is None:
+        try:
+            native = mx.gather_qmm(x if token_rows is None else x[token_rows], w, scales, biases, rhs_indices = indices,
+                                   transpose = True, group_size = group_size, bits = bits, sorted_indices = True)
+            verified = mx.array_equal(routed.view(mx.uint16), native.view(mx.uint16)).item()
+        except (RuntimeError, ValueError):
+            return None  # inside a function transformation, which cannot evaluate; checked later
+        if verified and not any(_NAX_SORTED_GATHER_VERIFIED.values()):
+            logger.info("sorted routed-expert projections now run on the NAX gather kernel; "
+                        "UNSLOTH_MLX_NAX_SORTED_GATHER=0 keeps the native call")
+        _NAX_SORTED_GATHER_VERIFIED[key] = verified
+        if not verified:
+            logger.warning("the NAX sorted gather kernel does not reproduce the native one for %s; "
+                           "the native call stays in use", key)
+    return routed if verified else None
+
+
+def _nax_sorted_gather_route(module):
+    w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
+    if not isinstance(w, mx.array) or w.ndim != 3:
+        return False
+    low, high = nax.sorted_gather_row_range(w.shape[0], module.bits)
+    return low <= high and _nax_qmm_eligible(
+        nax.sorted_gather_qmm_supported, w.shape[-1] * 32 // module.bits, getattr(scales, "dtype", None), w, scales,
+        biases, module.group_size, module.bits, module.mode)
 
 
 # Keyed by the current methods: a transient wrapper, such as the training patches', misses only
@@ -2906,32 +2961,35 @@ def _nax_qmm_classes(*cache_key):
     }
 
 
-_NAX_INT8_PREFILL_SWITCH_CONTRACT = {path: {"QuantizedSwitchLinear.__call__": "59bbb193612cbe06"}
-                           for path in ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers")}
+_NAX_SWITCH_CONTRACT = {path: {"QuantizedSwitchLinear.__call__": "59bbb193612cbe06"}
+                        for path in ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers")}
 
 
 @functools.cache
-def _nax_int8_prefill_switch_class(base, call, path):
-    bindings = _resolved_bindings({path: _NAX_INT8_PREFILL_SWITCH_CONTRACT[path]})
+def _nax_switch_class(base, call, path):
+    bindings = _resolved_bindings({path: _NAX_SWITCH_CONTRACT[path]})
     if bindings is None:
         return None
 
     def switch(self, x, indices, sorted_indices = False):
-        routed = _nax_int8_prefill_gather(self, x, self.get("weight"), self.get("scales"), self.get("biases"), indices,
-                                  sorted_indices, self.group_size, self.bits, self.mode, bindings)
+        call = (self, x, self.get("weight"), self.get("scales"), self.get("biases"), indices, sorted_indices,
+                self.group_size, self.bits, self.mode, bindings)
+        routed = _nax_int8_prefill_gather(*call)
+        if routed is None:
+            routed = _nax_sorted_gather(*call)
         if routed is None:
             return base.__call__(self, x, indices, sorted_indices = sorted_indices)
         return routed + mx.expand_dims(self["bias"][indices], -2) if "bias" in self else routed
 
-    return type(f"_NaxInt8Prefill{base.__name__}", (base,), {"__call__": switch, "_unsloth_nax_qmm_native": base})
+    return type(f"_NaxGather{base.__name__}", (base,), {"__call__": switch, "_unsloth_nax_qmm_native": base})
 
 
-def _nax_int8_prefill_switch_classes():
+def _nax_switch_classes():
     classes = {}
-    for path in _NAX_INT8_PREFILL_SWITCH_CONTRACT:
+    for path in _NAX_SWITCH_CONTRACT:
         base = getattr(sys.modules.get(path), "QuantizedSwitchLinear", None)
         if isinstance(base, type) and base not in classes:
-            swapped = _nax_int8_prefill_switch_class(base, base.__call__, path)
+            swapped = _nax_switch_class(base, base.__call__, path)
             if swapped is not None:
                 classes[base] = swapped
     return classes
@@ -2974,7 +3032,8 @@ def _nax_int8_prefill_route(module, classes, switches, packed):
         return 0
     N, K = w.shape[-2], w.shape[-1] * 32 // module.bits
     dtype = getattr(scales, "dtype", None)
-    if not _nax_int8_qmm_eligible(K, dtype, w, scales, biases, module.group_size, module.bits, module.mode):
+    if not _nax_qmm_eligible(nax.int8_qmm_supported, K, dtype, w, scales, biases, module.group_size, module.bits,
+                             module.mode):
         return 0
     if dense:
         return nax.int8_prefill_min_rows(N, K)
@@ -3006,7 +3065,7 @@ def int8_prefill_available(model):
     if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
         return Int8PrefillStatus(False, "distributed", 0)
     classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
-    switches, packed = _nax_int8_prefill_switch_classes(), _nax_int8_prefill_packed(model)
+    switches, packed = _nax_switch_classes(), _nax_int8_prefill_packed(model)
     modules = {id(module): module for _, module in model.named_modules()} if hasattr(model, "named_modules") else {}
     return _int8_prefill_status(sum(bool(_nax_int8_prefill_route(module, classes, switches, packed))
                                     for module in modules.values()))
@@ -3076,6 +3135,9 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     loss of precision-sensitive checkpoints. Linears route from 17 rows, so batched decoding of 17
     or more sequences and wider speculative verification also run int8. The outermost scope
     decides; `int8_prefill_available(model)` says whether it takes effect here.
+
+    Sorted routed-expert projections run on a NAX gather kernel that reproduces `mx.gather_qmm`
+    bit for bit where it is measured faster; `UNSLOTH_MLX_NAX_SORTED_GATHER=0` turns it off.
     """
     changed, tracked = [], hasattr(model, "__dict__")
     try:
@@ -3088,10 +3150,12 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
             if tracked:
                 model.__dict__["_unsloth_nax_int8_prefill_scope"] = (depth + 1, bool(int8_prefill))
             small_m = os.environ.get("UNSLOTH_MLX_NAX_QMM", "1") != "0" and nax.gap_open("small_m_qmm")
-            if ((small_m or int8_prefill) and nax.nax_available()
+            sorted_gather = (os.environ.get("UNSLOTH_MLX_NAX_SORTED_GATHER", "1") != "0"
+                             and nax.gap_open("sorted_gather_qmm"))
+            if ((small_m or int8_prefill or sorted_gather) and nax.nax_available()
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
-                switches = _nax_int8_prefill_switch_classes() if int8_prefill else {}
+                switches = _nax_switch_classes() if int8_prefill or sorted_gather else {}
                 packed = _nax_int8_prefill_packed(model) if int8_prefill else set()
                 nested, fresh, seen = [], [], set()
                 for _, module in _fusion_modules(model, _modules):
@@ -3107,27 +3171,35 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         int8_prefill_rows = (int8_prefill and not module.training
                                      and _nax_int8_prefill_route(module, classes, switches, packed))
                         if rows is not None or int8_prefill_rows:
-                            fresh.append((module, rows, int8_prefill_rows))
-                    elif (base in switches and not module.training
-                          and _nax_int8_prefill_route(module, classes, switches, packed)):
-                        fresh.append((module, None, True))
-                if any(rows is not None for _, rows, _ in fresh) and not nax.kernel_probe_passed(
+                            fresh.append((module, rows, int8_prefill_rows, False))
+                    elif base in switches and not module.training:
+                        int8 = bool(int8_prefill and _nax_int8_prefill_route(module, classes, switches, packed))
+                        gather = sorted_gather and _nax_sorted_gather_route(module)
+                        if int8 or gather:
+                            fresh.append((module, None, int8, gather))
+                if any(rows is not None for _, rows, _, _ in fresh) and not nax.kernel_probe_passed(
                         nax.QMM_PROBE_KEY, nax.__name__, "probe_small_m_qmm"):
-                    fresh = [(module, None, int8_prefill_rows)
-                             for module, _, int8_prefill_rows in fresh if int8_prefill_rows]
-                if any(int8_prefill_rows for _, _, int8_prefill_rows in fresh) and not nax.kernel_probe_passed(
+                    fresh = [(module, None, int8, gather) for module, _, int8, gather in fresh]
+                if any(int8 for _, _, int8, _ in fresh) and not nax.kernel_probe_passed(
                         nax.INT8_QMM_PROBE_KEY, nax.__name__, "probe_int8_qmm"):
-                    fresh = [(module, rows, 0) for module, rows, _ in fresh if rows is not None]
-                for module, rows, int8_prefill_rows in fresh:
+                    fresh = [(module, rows, 0, gather) for module, rows, _, gather in fresh]
+                if any(gather for *_, gather in fresh) and not nax.kernel_probe_passed(
+                        nax.SORTED_GATHER_PROBE_KEY, nax.__name__, "probe_sorted_gather_qmm"):
+                    fresh = [(module, rows, int8, False) for module, rows, int8, _ in fresh]
+                fresh = [entry for entry in fresh if entry[1] is not None or entry[2] or entry[3]]
+                for module, rows, int8_prefill_rows, gather in fresh:
                     if type(module) in switches:
-                        module._unsloth_nax_int8_prefill = True
+                        if int8_prefill_rows:
+                            module._unsloth_nax_int8_prefill = True
+                        if gather:
+                            module._unsloth_nax_sorted_gather = True
                         module.__class__ = switches[type(module)]
                         continue
                     module._unsloth_nax_qmm_rows = (0, -1) if rows is None else rows
                     if int8_prefill_rows:
                         module._unsloth_nax_int8_prefill_rows = int8_prefill_rows
                     module.__class__ = classes[type(module)]
-                for module in nested + [module for module, _, _ in fresh]:
+                for module in nested + [entry[0] for entry in fresh]:
                     module._unsloth_nax_qmm_scopes = getattr(module, "_unsloth_nax_qmm_scopes", 0) + 1
                     changed.append(module)
         yield model
@@ -3145,7 +3217,8 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 native = getattr(type(module), "_unsloth_nax_qmm_native", None)
                 if native is not None:
                     module.__class__ = native
-                for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_int8_prefill_rows", "_unsloth_nax_int8_prefill"):
+                for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_int8_prefill_rows", "_unsloth_nax_int8_prefill",
+                             "_unsloth_nax_sorted_gather"):
                     module.__dict__.pop(name, None)
                 module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
 
