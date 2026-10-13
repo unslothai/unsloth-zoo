@@ -154,7 +154,30 @@ _KERNEL_SUBPROCESS = textwrap.dedent(
             steps.append(y_t)
     decode = rel(torch.cat(steps, 1), y_full)
     assert decode < 1e-2, ("decode", decode)
-    print("errs", [round(e, 5) for e in dense + [varlen, decode]])
+
+    # A packed batch whose token count equals its sequence count is not a decode step unless
+    # every sequence has one token (fla #1203): [0, 0, 2] is one empty and one 2-token sequence.
+    xz = torch.randn(1, 2, D, device=dev, dtype=dtype)
+    with torch.no_grad():
+        yz, _ = conv(xz, cu_seqlens=torch.tensor([0, 0, 2], device=dev, dtype=torch.long))
+    packed_empty = rel(yz[0], reference(xz[0], w, conv.bias))
+    assert packed_empty < 2e-2, ("packed_empty", packed_empty)
+
+    # FLA_CONV_BACKEND overrides the constructor and must be validated the same way (fla #1257).
+    import fla.modules.conv.short_conv as short_conv
+    os.environ["FLA_CONV_BACKEND"] = "bogus"
+    try:
+        ShortConvolution(hidden_size=D, kernel_size=W)
+        raise AssertionError("invalid FLA_CONV_BACKEND accepted")
+    except ValueError:
+        pass
+    if short_conv.causal_conv1d_fn_cuda is None:
+        os.environ["FLA_CONV_BACKEND"] = "cuda"
+        env_conv = ShortConvolution(hidden_size=D, kernel_size=W, activation="silu").to(dev, dtype)
+        assert env_conv.backend == "triton", env_conv.backend
+        env_conv(xs)
+    del os.environ["FLA_CONV_BACKEND"]
+    print("errs", [round(e, 5) for e in dense + [varlen, decode, packed_empty]])
     print("SHORT_CONV_OK")
     """
 )
