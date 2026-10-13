@@ -97,7 +97,12 @@ modifications =
       (`from fla.modules import FusedRMSNormGated, ShortConvolution`):
       modules/conv/{short_conv,causal_conv1d}.py, modules/conv/triton/{__init__,
       kernels,ops}.py, modules/conv/cp/{__init__,ops}.py and
-      modules/conv/cuda/{__init__,ops}.py verbatim from fla-core 0.5.1.
+      modules/conv/cuda/{__init__,ops}.py verbatim from fla-core 0.5.1, plus
+      two upstream fixes in short_conv.py: fla PR #1257 (FLA_CONV_BACKEND=cuda
+      without causal-conv1d installed now falls back to Triton instead of
+      calling the missing function) and the short_conv hunk of fla PR #1203
+      (a packed batch takes the single-token decode shortcut only when every
+      sequence has exactly one token).
       modules/conv/__init__.py is narrowed to ShortConvolution and
       causal_conv1d (long_conv.py is not vendored), and modules/backends/
       __init__.py registers no backend, since the Triton-Ascend NPU kernels
@@ -106,10 +111,8 @@ modifications =
       files import einops, which the gated-deltanet path does not need. Later
       upstream conv fixes are not backported, as none reaches Ling 3.0's
       training or decode path: #1097 (more than 65535 sequences per decode
-      launch), #1139 / #1141 (initial-state and final-state gradients) and
-      #1203 (a packed batch whose token count equals its sequence count while
-      some sequence has zero or several tokens takes the single-token decode
-      shortcut; Ling 3.0's generate decodes exactly one token per row). The
+      launch) and #1139 / #1141 (gradients into a conv cache state, which
+      training never builds). The
       conv kernels already load varlen sequence starts as int64; offsets
       inside one sequence stay int32 as in 0.5.1 (upstream #1082), as for KDA
       above.
