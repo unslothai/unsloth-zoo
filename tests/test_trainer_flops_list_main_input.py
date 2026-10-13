@@ -64,3 +64,34 @@ def test_tensor_main_input_unchanged(trainer):
 
 def test_list_of_non_tensors_counts_zero(trainer):
     assert trainer.floating_point_ops({"pixel_values": ["a.png", "b.png"]}) == 0
+
+
+def _text_trainer():
+    config = LlamaConfig(
+        vocab_size = 32, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 1,
+        num_attention_heads = 2, num_key_value_heads = 1, max_position_embeddings = 64,
+    )
+    trainer = Trainer.__new__(Trainer)
+    trainer.model = LlamaForCausalLM(config)
+    trainer.state = object()
+    return trainer
+
+
+def test_flops_walk_the_model_once_per_train_call(trainer, monkeypatch):
+    # floating_point_ops runs every step; num_parameters walks every module and parameter.
+    text = _text_trainer()
+    n_params = text.model.num_parameters(exclude_embeddings = True)
+    calls = []
+    original = type(text.model).num_parameters
+    monkeypatch.setattr(
+        type(text.model), "num_parameters",
+        lambda self, *a, **k: calls.append(1) or original(self, *a, **k),
+    )
+    for tokens in (8, 24, 5, 24):
+        ids = torch.zeros(1, tokens, dtype = torch.long)
+        assert text.floating_point_ops({"input_ids": ids}) == 6 * tokens * n_params
+    assert len(calls) == 1
+    # trainer.state is rebuilt by every train() call, which measures again.
+    text.state = object()
+    assert text.floating_point_ops({"input_ids": torch.zeros(1, 3, dtype = torch.long)}) == 6 * 3 * n_params
+    assert len(calls) == 2
