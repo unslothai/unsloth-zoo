@@ -610,6 +610,38 @@ def patch_vllm_untiled_moe_experts():
 pass
 
 
+# model_type -> (vLLM class, transformers class that exists only when HF stacks the experts in 3D).
+_VLLM_STACKED_MOE_LORA_CLASSES = {
+    "qwen3_moe": (
+        ("vllm.model_executor.models.qwen3_moe", "Qwen3MoeForCausalLM"),
+        ("transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeExperts"),
+    ),
+}
+
+def patch_vllm_stacked_moe_lora(config):
+    """Route Unsloth's stacked expert adapter to vLLM's FusedMoE3DWithLoRA for MoE classes that lack is_3d_moe_weight.
+
+    Without the flag vLLM wraps the experts in the 2D FusedMoEWithLoRA, which cannot read a stacked
+    adapter (vllm-project/vllm#41754), so _check_lora_is_servable refuses expert LoRA for GRPO.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+    entry = _VLLM_STACKED_MOE_LORA_CLASSES.get(model_type)
+    if entry is None: return False
+    (vllm_module, vllm_name), (hf_module, hf_name) = entry
+    try:
+        from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA  # noqa: F401
+        vllm_cls = getattr(importlib.import_module(vllm_module), vllm_name)
+        getattr(importlib.import_module(hf_module), hf_name)
+    except Exception as e:
+        logger.info(f"Unsloth: not marking {model_type} as a 3D MoE LoRA model in vLLM: {e}")
+        return False
+    if getattr(vllm_cls, "is_3d_moe_weight", False) is not True:
+        vllm_cls.is_3d_moe_weight = True
+    return True
+pass
+
+
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
     try:
@@ -3297,6 +3329,8 @@ def load_vllm(
             patch_gemma4_vllm_lora_support()
         if use_bitsandbytes:
             patch_gemma4_vllm_k_eq_v_support()
+    if enable_lora:
+        patch_vllm_stacked_moe_lora(config)
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
