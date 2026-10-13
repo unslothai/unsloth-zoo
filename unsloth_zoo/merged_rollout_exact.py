@@ -34,6 +34,7 @@ __all__ = [
     "exact_unfold",
 ]
 
+import os
 import torch
 
 try:
@@ -156,7 +157,7 @@ class ExactFoldTarget:
     `a` / `b` are [E, R, K] / [E, N, R] (any strides), `scale` the LoRA scaling.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = ("w", "a", "b", "scale", "counts", "checksum", "idx", "val", "host_idx", "host_val")
+    __slots__ = ("w", "a", "b", "scale", "counts", "checksum", "idx", "val", "host_idx", "host_val", "folded")
 
     def __init__(self, w_view, a, b, scale):
         assert w_view.dim() == 3 and a.dim() == 3 and b.dim() == 3
@@ -165,6 +166,7 @@ class ExactFoldTarget:
         assert w_view.dtype in (torch.bfloat16, torch.float16)
         self.w, self.a, self.b, self.scale = w_view, a, b, float(scale)
         self.counts = self.checksum = self.idx = self.val = self.host_idx = self.host_val = None
+        self.folded = False
     pass
 
     def grid(self):
@@ -210,25 +212,44 @@ def exact_fold(targets, stream = None):
             t.launch(_COUNT)
     # One host sync for every target's fix-up store size.
     sizes = torch.stack([t.counts.sum(dtype = torch.int64) for t in targets]).tolist()
+    # Host stores before any weight changes: an allocation failure leaves W untouched.
+    _host_buffers(targets, sizes)
     for t, n_bad in zip(targets, sizes):
         with _device_ctx(t.w):
             offsets = torch.cumsum(t.counts, 0, dtype = torch.int64) - t.counts
-            numel = t.w.numel()
-            t.idx = torch.empty(n_bad, dtype = torch.int32 if numel < 2**31 else torch.int64, device = t.w.device)
+            t.idx = torch.empty(n_bad, dtype = t.host_idx.dtype, device = t.w.device)
             t.val = torch.empty(n_bad, dtype = t.w.dtype, device = t.w.device)
             t.launch(_FOLD, offsets = offsets, idx = t.idx, val = t.val)
+            t.folded = True
             total_bad += n_bad
-            total_elements += numel
+            total_elements += t.w.numel()
     _offload(targets, stream)
     return {"bad": total_bad, "elements": total_elements}
 pass
 
 
+def _host_buffers(targets, sizes):
+    # Pinned unless UNSLOTH_DISABLE_PINNED_MEMORY=1, over the pin budget, or pinning fails
+    # (WSL2 caps page-locked memory); pageable stores still restore exactly, only synchronously.
+    from .block_swap import _pin_budget
+    idx_types = [torch.int32 if t.w.numel() < 2**31 else torch.int64 for t in targets]
+    nbytes = sum(n * (d.itemsize + t.w.element_size()) for t, n, d in zip(targets, sizes, idx_types))
+    pin = os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1" and nbytes <= _pin_budget()
+    for t, n, d in zip(targets, sizes, idx_types):
+        if pin:
+            try:
+                t.host_idx = torch.empty(n, dtype = d, pin_memory = True)
+                t.host_val = torch.empty(n, dtype = t.w.dtype, pin_memory = True)
+                continue
+            except RuntimeError:
+                pin = False
+        t.host_idx = torch.empty(n, dtype = d)
+        t.host_val = torch.empty(n, dtype = t.w.dtype)
+pass
+
+
 def _offload(targets, stream):
-    # Fix-up stores to pinned host on a side stream, so they hold no GPU memory during generation.
-    for t in targets:
-        t.host_idx = torch.empty(t.idx.shape, dtype = t.idx.dtype, pin_memory = True)
-        t.host_val = torch.empty(t.val.shape, dtype = t.val.dtype, pin_memory = True)
+    # Fix-up stores to host on a side stream, so they hold no GPU memory during generation.
     if stream is None:
         for t in targets:
             t.host_idx.copy_(t.idx); t.host_val.copy_(t.val)
@@ -247,17 +268,21 @@ pass
 def exact_unfold(targets, stream = None):
     """Undo exact_fold bit for bit; raises if any checksum disagrees."""
     # All Unsloth Zoo code licensed under LGPLv3
+    # A fold that failed part way: undo only what was folded, from wherever its store is.
+    targets = [t for t in targets if t.folded]
+    if not targets: return
     current = torch.cuda.current_stream(targets[0].w.device)
     # Prefetch the fix-up stores while the unfold kernels run.
     if stream is not None:
         stream.wait_stream(current)
         with torch.cuda.stream(stream):
             for t in targets:
-                t.idx = t.host_idx.to(t.w.device, non_blocking = True)
-                t.val = t.host_val.to(t.w.device, non_blocking = True)
+                if t.idx is None:
+                    t.idx = t.host_idx.to(t.w.device, non_blocking = True)
+                    t.val = t.host_val.to(t.w.device, non_blocking = True)
     else:
         for t in targets:
-            t.idx = t.host_idx.to(t.w.device); t.val = t.host_val.to(t.w.device)
+            if t.idx is None: t.idx = t.host_idx.to(t.w.device); t.val = t.host_val.to(t.w.device)
     folded_sums = []
     for t in targets:
         with _device_ctx(t.w):
@@ -282,6 +307,7 @@ def exact_unfold(targets, stream = None):
     pairs = torch.stack(checks).tolist()
     for t in targets:
         t.idx = t.val = t.host_idx = t.host_val = t.counts = None
+        t.folded = False
     bad = [i for i, (x, y) in enumerate(pairs) if x != y]
     if bad:
         raise RuntimeError(

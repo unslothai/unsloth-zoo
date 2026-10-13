@@ -170,3 +170,56 @@ def test_failed_self_check_disables_exact(monkeypatch):
     monkeypatch.setattr(ex, "_self_check", lambda device, dtype: "unfold is not bit exact")
     assert not ex.exact_merge_available(torch.device("cuda"), torch.bfloat16)
     assert ex.exact_merge_failure(torch.device("cuda"), torch.bfloat16) == "unfold is not bit exact"
+
+
+def test_disable_pinned_memory_uses_pageable_stores(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
+    W, A, B, scale = _dense(256, 1024, 16, 1e-2)
+    W0 = W.clone()
+    t = _target(W, A, B, scale)
+    ex.exact_fold([t], stream = torch.cuda.Stream())
+    assert t.host_val.numel() > 0 and not t.host_val.is_pinned() and not t.host_idx.is_pinned()
+    ex.exact_unfold([t], stream = torch.cuda.Stream())
+    assert torch.equal(_bits(W), _bits(W0))
+
+
+def test_pinning_failure_falls_back_to_pageable(monkeypatch):
+    # WSL2 caps page-locked memory: the pinned allocation raises, the fold must still restore.
+    real_empty = torch.empty
+    def empty(*args, pin_memory = False, **kwargs):
+        if pin_memory: raise RuntimeError("CUDA error: out of memory")
+        return real_empty(*args, **kwargs)
+    monkeypatch.setattr(torch, "empty", empty)
+    W, A, B, scale = _dense(256, 1024, 16, 1e-2)
+    W0 = W.clone()
+    t = _target(W, A, B, scale)
+    ex.exact_fold([t], stream = torch.cuda.Stream())
+    assert not t.host_val.is_pinned()
+    ex.exact_unfold([t], stream = torch.cuda.Stream())
+    assert torch.equal(_bits(W), _bits(W0))
+
+
+def test_host_allocation_failure_leaves_weights_untouched(monkeypatch):
+    def fail(targets, sizes): raise MemoryError("no host RAM")
+    monkeypatch.setattr(ex, "_host_buffers", fail)
+    W, A, B, scale = _dense(256, 1024, 16, 1e-2)
+    W0 = W.clone()
+    t = _target(W, A, B, scale)
+    with pytest.raises(MemoryError):
+        ex.exact_fold([t])
+    assert torch.equal(_bits(W), _bits(W0))
+    ex.exact_unfold([t])   # nothing was folded: a no-op, not a checksum failure
+    assert torch.equal(_bits(W), _bits(W0))
+
+
+def test_offload_failure_after_fold_restores_from_device_stores(monkeypatch):
+    def fail(targets, stream): raise RuntimeError("copy failed")
+    monkeypatch.setattr(ex, "_offload", fail)
+    W, A, B, scale = _dense(256, 1024, 16, 1e-2)
+    W0 = W.clone()
+    t = _target(W, A, B, scale)
+    with pytest.raises(RuntimeError, match = "copy failed"):
+        ex.exact_fold([t], stream = torch.cuda.Stream())
+    assert not torch.equal(_bits(W), _bits(W0))
+    ex.exact_unfold([t], stream = torch.cuda.Stream())
+    assert torch.equal(_bits(W), _bits(W0))
