@@ -816,7 +816,9 @@ def _encode_grpo_prompts(dataset, tokenizer, sampling, max_seq_length, max_promp
             raise ValueError(
                 f"Unsloth MLX GRPO: dataset row {index} has no prompt column."
             )
-        ids = tuple(int(token) for token in encode_mlx_text(tokenizer, render_grpo_prompt(tokenizer, row)))
+        # TRL tokenizes prompts with add_special_tokens=False: a chat template supplies its own BOS.
+        text = render_grpo_prompt(tokenizer, row)
+        ids = tuple(int(token) for token in encode_mlx_text(tokenizer, text, add_special_tokens=False))
         if not ids or len(ids) >= max_seq_length:
             raise ValueError(
                 f"Unsloth MLX GRPO: dataset row {index} encodes to a {len(ids)}-token "

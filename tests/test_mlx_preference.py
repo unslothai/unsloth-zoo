@@ -3471,6 +3471,28 @@ def test_grpo_prompts_render_as_trl_and_unsloth_pass_them(monkeypatch):
     assert orders[0] == orders[1] == ((3,), (1,), (2,), (0,))
 
 
+def test_grpo_prompts_are_tokenized_without_special_tokens_as_trl():
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan
+
+    class SpecialTokenizer(Tokenizer):
+        bos_token = "<s>"
+
+        def encode(self, text, add_special_tokens=True):
+            ids = super().encode(text)
+            return [1, *ids, 2] if add_special_tokens else ids
+
+    tokenizer = SpecialTokenizer()
+    plan = create_grpo_batch_plan(
+        [{"prompt": "ab"}, {"prompt": [{"role": "user", "content": "c"}]}], tokenizer,
+        num_generations=2, batch_size=2, steps_per_generation=1, num_iterations=1, grad_accum=1,
+        sampling=GRPOSampling(max_tokens=2), max_seq_length=64,
+    )
+    assert plan._prompt_ids == [
+        tuple(tokenizer.encode("ab", add_special_tokens=False)),
+        tuple(tokenizer.encode("<user>c<assistant>", add_special_tokens=False)),
+    ]
+
+
 def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     import numpy as np
     import mlx.core as mx
