@@ -60,6 +60,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.common",
     "unsloth_zoo.temporary_patches.bitsandbytes",
     "unsloth_zoo.temporary_patches.bitsandbytes_large_tensors",
+    "unsloth_zoo.temporary_patches.bitsandbytes_optimizer_sync",
     "unsloth_zoo.temporary_patches.compiled_model_identity",
     "unsloth_zoo.temporary_patches.conversion_mapping_rescope",
     "unsloth_zoo.temporary_patches.datasets_folder_metadata",

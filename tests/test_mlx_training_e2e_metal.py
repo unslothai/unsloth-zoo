@@ -1778,6 +1778,51 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
 
 
 @metal_only
+@pytest.mark.parametrize("family,tied", [("nemotron_h", False), ("mamba2", False), ("mamba2", True)])
+def test_backbone_stack_hidden_states_and_cce_match_the_logits(family, tied):
+    import importlib
+
+    mod = importlib.import_module(f"mlx_lm.models.{family}")
+    common = dict(model_type=family, vocab_size=128, hidden_size=64, intermediate_size=128,
+                  layer_norm_epsilon=1e-5, conv_kernel=4, n_groups=1, use_bias=False,
+                  use_conv_bias=True)
+    if family == "nemotron_h":
+        args = mod.ModelArgs(
+            **common, max_position_embeddings=256, num_attention_heads=4,
+            num_key_value_heads=2, attention_bias=False, mamba_num_heads=4, mamba_head_dim=16,
+            mamba_proj_bias=False, ssm_state_size=16, mlp_bias=False, head_dim=16,
+            hybrid_override_pattern=["M", "*", "-", "M"], num_hidden_layers=4,
+        )
+    else:
+        args = mod.ModelArgs(
+            **common, num_heads=4, head_dim=16, state_size=16, num_hidden_layers=2,
+            tie_word_embeddings=tied, time_step_limit=(0.0, float("inf")), time_step_rank="auto",
+        )
+    mx.random.seed(0)
+    model = mod.Model(args)
+    mx.eval(model.parameters())
+    ids = mx.random.randint(0, 128, (2, 24))
+    lengths = mx.array([[0, 24], [0, 20]])
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    if tied:
+        # No lm_head to split from: the full forward stays the loss.
+        assert mlx_utils._get_text_backbone(model) is None
+        assert loss_fn._unsloth_cce_backend == "baseline-fallback"
+        return
+    hidden = mlx_utils._forward_text_hidden_states(model, ids)
+    assert mx.array_equal(model.lm_head(hidden), model(ids))
+    assert loss_fn._unsloth_cce_backend != "baseline-fallback"
+    def first(r):
+        return r[0] if isinstance(r, tuple) else r
+
+    cce = nn.value_and_grad(model, lambda m: first(loss_fn(m, ids, lengths)))(model)
+    ce = nn.value_and_grad(model, lambda m: first(make_baseline_loss_fn()(m, ids, lengths)))(model)
+    assert abs(cce[0].item() - ce[0].item()) <= 1e-5
+    for (key, got), (_, ref) in zip(tree_flatten(cce[1]), tree_flatten(ce[1])):
+        assert mx.allclose(got, ref, rtol=1e-4, atol=1e-6), key
+
+
+@metal_only
 @pytest.mark.parametrize("frozen", [False, True])
 def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
     """A trainable-declared head may compute its weight gradient despite stop_gradient."""
@@ -1833,6 +1878,26 @@ def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
     calls.clear()
     got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=scorer)
     assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
+
+
+
+@metal_only
+@pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
+def test_grpo_cce_scores_like_the_logits(head):
+    from unsloth_zoo.mlx import grpo as g
+    mx.random.seed(947)
+    calls, objective = [], g.GRPOObjective(beta=0.04, temperature=0.7, max_completion_length=40)
+    model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls, softcap=0.5 if head == "softcap" else 0.0)
+    tokens = (mx.arange(4 * 48).reshape(4, 48) * 7 + 3) % 2053
+    old = g.completion_logps(model, tokens, 0.7) + 0.05
+    batch = (tokens, mx.array([[5, 48], [9, 40], [13, 33], [3, 48]]), mx.array([2.0, 100.0]), mx.array([1.0, -1.0, 0.5, -0.5]), mx.array([1, 1, 0, 1]), old, old - 0.1)  # noqa: E501
+    mx.eval(expected := nn.value_and_grad(model, g.make_grpo_loss_fn(objective))(model, *batch))
+    calls.clear()
+    cce = g.make_grpo_cce_loss_fn(model, objective)
+    mx.eval(actual := mx.compile(lambda *b: nn.value_and_grad(model, cce)(model, *b), inputs=model.state, outputs=model.state)(*batch))
+    assert ("model" in calls) is (head == "softcap") is (cce._unsloth_grpo_scorer is None)  # a softcap keeps the logits
+    flat = lambda out: [*out[0], *(value for _, value in tree_flatten(out[1]))]
+    assert all(mx.allclose(want, got, atol=1e-4, rtol=2e-4).item() for want, got in zip(flat(expected), flat(actual)))
 
 
 @metal_only

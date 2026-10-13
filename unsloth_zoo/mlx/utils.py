@@ -1076,7 +1076,13 @@ def _get_text_model(model):
 def _get_text_backbone(model):
     """Get a separable hidden-state backbone when the model exposes one."""
     tm = _get_text_model(model)
-    return getattr(tm, "model", None)
+    backbone = getattr(tm, "model", None)
+    if backbone is None and getattr(tm, "lm_head", None) is not None:
+        # The Mamba lineage (Nemotron-H) names its stack `backbone`.
+        backbone = getattr(tm, "backbone", None)
+        if not callable(backbone):
+            return None
+    return backbone
 
 
 def _get_encoder_decoder_backbone(model):
@@ -1594,13 +1600,13 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
         return hidden
     tm = _get_text_model(model)
     if (inputs_embeds is None and getattr(model, "_unsloth_text_only_vlm", False)
-            and _get_backbone_embed_kwarg(getattr(tm, "model", tm)) is not None
+            and _get_backbone_embed_kwarg(_get_text_backbone(model) or tm) is not None
             and callable(getattr(model, "get_input_embeddings", None))):
         inputs_embeds, embed_kwargs = _unpack_embed_result(
             model.get_input_embeddings(inputs, None), model, input_ids=inputs,
         )
         kwargs = {**embed_kwargs, **kwargs}
-    backbone = getattr(tm, "model", None)
+    backbone = _get_text_backbone(model)
     if backbone is not None:
         if (
             inputs_embeds is not None
@@ -2299,8 +2305,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     # Backboneless models (e.g. a stack not exposed as `.model` or as direct
     # embed_tokens/layers/norm attributes) cannot yield pre-head hidden states,
     # so the full model forward is the only faithful loss.
-    tm = _get_text_model(model)
-    if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
+    if _get_text_backbone(model) is None and not _has_direct_hidden_stack(model):
         print("Unsloth: text model does not expose a separable hidden-state "
               "backbone for CCE; falling back to standard cross-entropy.")
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
@@ -3469,6 +3474,11 @@ def _config_get(config, key, default=None):
     return getattr(config, key, default)
 
 
+def _multimodal_config(config):
+    # Qwen3-Omni keeps its multimodal settings under the thinker.
+    return _config_get(config, "thinker_config", None) or config
+
+
 def _config_to_mapping(config):
     if isinstance(config, dict):
         return config
@@ -3553,6 +3563,7 @@ _VLM_STATIC_METADATA_MODEL_TYPES = {
     "muse_glimmer": ("image_grid_thw", "video_grid_thw"),
     "kimi_k3": ("grid_thws", "image_grid_hws", "video_grid_hws"),
     "ernie4_5_moe_vl": ("image_grid_thw", "video_grid_thw"),
+    "glm5_next": ("image_grid_thw", "video_grid_thw"),
     # One `_as_grid_list` call reads whichever of the two the batch carries.
     "mage_vl": ("image_grid_thw", "video_grid_thw"),
     # Pixtral's vision tower, which mistral3 and mistral4 checkpoints also load.
@@ -3996,6 +4007,10 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_5_moe",
     "qwen4_exp",
     "prism_hadamard_qwen35",
+    # Their upstream `get_rope_index` computes the same positions.
+    "qwen3_omni_moe",
+    "glm4v",
+    "glm4v_moe",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
@@ -4445,6 +4460,7 @@ def _vlm_positions_for_compile(batch_dict, config):
     expansion and planned padding, whose tails never shift a content
     position)."""
     model_type = _config_get(config, "model_type")
+    config = _multimodal_config(config)
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
@@ -4532,8 +4548,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
-    tm = _get_text_model(model)
-    if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
+    if _get_text_backbone(model) is None and not _has_direct_hidden_stack(model):
         import warnings
         warnings.warn(
             "VLM text stack does not expose a separable hidden-state backbone for CCE; "
@@ -4542,7 +4557,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
-    backbone = getattr(tm, "model", None)
+    backbone = _get_text_backbone(model)
     token_ids_only = (
         backbone is not None and _get_backbone_embed_kwarg(backbone) is None
         and _get_encoder_decoder_backbone(model) is None
@@ -5127,7 +5142,14 @@ def _collapse_vlm_assistant_content(messages):
     return collapsed
 
 
-def _flatten_vlm_content_for_text_template(messages, image_token=None):
+def _vlm_numbered_audio_stem(processor):
+    # mlx-vlm states the stem where its processor expands `<|audio_N|>` (Phi-4).
+    module = sys.modules.get(type(processor).__module__)
+    stem = getattr(module, "AUDIO_PLACEHOLDER_PATTERN", None)
+    return stem if isinstance(stem, str) and stem.startswith("<|") else None
+
+
+def _flatten_vlm_content_for_text_template(messages, image_token=None, audio_stem=None):
     """Render list-style VLM content as text for text-only chat templates.
 
     Rebuilt shallowly rather than deep-copied: only `content` is replaced, and a
@@ -5135,6 +5157,7 @@ def _flatten_vlm_content_for_text_template(messages, image_token=None):
     sample, so that cost is the whole collator's.
     """
     flattened = []
+    clips = 0
     for message in messages:
         content = message.get("content", "")
         if not isinstance(content, list):
@@ -5146,6 +5169,12 @@ def _flatten_vlm_content_for_text_template(messages, image_token=None):
                 texts.append(str(part.get("text", "")))
             elif isinstance(part, dict) and part.get("type") == "image" and image_token:
                 texts.append(image_token)
+            elif audio_stem and _is_vlm_audio_part(part):
+                # Back-to-back runs of one soft token would count as one clip.
+                if clips and "".join(texts).endswith(f"{audio_stem}{clips}|>"):
+                    texts.append("\n")
+                clips += 1
+                texts.append(f"{audio_stem}{clips}|>")
             elif isinstance(part, str):
                 texts.append(part)
         flattened.append({**message, "content": "".join(texts)})
@@ -5320,10 +5349,13 @@ def _render_vlm_messages(
     tokenizer = _get_processor_tokenizer(processor)
     renderer = processor if callable(getattr(processor, "apply_chat_template", None)) else tokenizer
     image_token = _vlm_image_token(processor)
+    audio_stem = _vlm_numbered_audio_stem(processor)
     if not _has_chat_template(renderer):
         return "\n".join(
             message.get("content", "")
-            for message in _flatten_vlm_content_for_text_template(messages, image_token)
+            for message in _flatten_vlm_content_for_text_template(
+                messages, image_token, audio_stem,
+            )
         )
 
     render_messages = _vlm_token_messages(processor, messages)
@@ -5339,7 +5371,7 @@ def _render_vlm_messages(
         yield render_messages
         marked = _mark_vlm_image_parts(render_messages, image_token)
         yield marked
-        yield _flatten_vlm_content_for_text_template(messages, image_token)
+        yield _flatten_vlm_content_for_text_template(messages, image_token, audio_stem)
         yield _flatten_vlm_messages_to_content_parts(marked)
         if rendered is None:
             yield messages
@@ -7746,6 +7778,15 @@ def _normalize_audio_clip(clip, expected_rate):
     return _AudioClip(np.asarray(samples, dtype=np.float32), int(rate))
 
 
+def _is_vlm_audio_part(part):
+    # Key-only `{"audio": clip}` too: the template renders a placeholder for
+    # it, so skipping it left the row a waveform short.
+    return isinstance(part, dict) and (
+        part.get("type") in _AUDIO_PART_TYPES
+        or any(key in part for key in _AUDIO_PART_TYPES)
+    )
+
+
 def _vlm_audio_part_state(messages):
     bare_placeholders = False
     payloads = []
@@ -7758,13 +7799,7 @@ def _vlm_audio_part_state(messages):
         if not isinstance(content, list):
             continue
         for part in content:
-            if not isinstance(part, dict):
-                continue
-            # Key-only `{"audio": clip}` too: the template renders a
-            # placeholder for it, so skipping it left the row a waveform short.
-            if part.get("type") not in _AUDIO_PART_TYPES and not any(
-                key in part for key in _AUDIO_PART_TYPES
-            ):
+            if not _is_vlm_audio_part(part):
                 continue
             payload = None
             for key in _AUDIO_PART_TYPES:
@@ -8094,9 +8129,64 @@ def _extractor_window_samples(processor):
     )
     samples = getattr(extractor, "n_samples", None)
     try:
+        if samples is None:
+            # Gemma's extractors state the window as call defaults instead.
+            defaults = inspect.signature(extractor.__call__).parameters
+            if defaults["truncation"].default is True:
+                samples = defaults["max_length"].default
         return int(samples) if samples is not None else None
-    except (TypeError, ValueError):
+    except (AttributeError, KeyError, TypeError, ValueError):
         return None
+
+
+def _audio_run_cap_samples(processor):
+    length = getattr(processor, "audio_seq_length", None)
+    period = getattr(processor, "audio_ms_per_token", None)
+    rate = audio_extractor_sampling_rate(processor)
+    # A corrected count follows the audio the extractor keeps, not the cap.
+    corrected = _audio_family_from_processor(processor) in _AUDIO_PROCESSOR_REPAIRS
+    if corrected or not (length and period and rate):
+        return None
+    return int(length) * int(period) * int(rate) // 1000
+
+
+def _audio_clip_limit_samples(processor):
+    limits = (_extractor_window_samples(processor), _audio_run_cap_samples(processor))
+    return min((limit for limit in limits if limit), default=None)
+
+
+def _split_audio_past_the_window(messages, clips, processor):
+    """Split clips past the processor's limit into near-equal pieces (none too
+    short to frame), one placeholder each. Returns its arguments unchanged otherwise."""
+    if not clips:
+        return messages, clips
+    limit = _audio_clip_limit_samples(processor)
+    counts = [max(1, -(-len(clip) // limit)) if limit else 1 for clip in clips]
+    # Rows the dataset rendered itself reach here as a string.
+    if max(counts, default=1) < 2 or not isinstance(messages, list):
+        return messages, clips
+    parts = sum(
+        _is_vlm_audio_part(part) for message in messages
+        if isinstance(message.get("content"), list) for part in message["content"]
+    )
+    if parts != len(clips):
+        return messages, clips
+    repeats = iter(counts)
+    split = [
+        {**message, "content": [
+            copy for part in message["content"]
+            for copy in [part] * (next(repeats) if _is_vlm_audio_part(part) else 1)
+        ]} if isinstance(message.get("content"), list) else message
+        for message in messages
+    ]
+    pieces = []
+    for clip, count in zip(clips, counts):
+        if count == 1:
+            pieces.append(clip)
+            continue
+        size = -(-len(clip) // count)
+        pieces.extend(clip[start:start + size] for start in range(0, len(clip), size))
+    return split, pieces
 
 
 def _audio_delimiter_strings(processor):
@@ -8180,6 +8270,46 @@ def _assert_audio_clips_fit_the_extractor(clips, processor):
             )
 
 
+_reported_cut_audio = set()
+
+
+def _assert_audio_runs_cover_their_clips(clips, processor):
+    """Refuse a long clip whose surplus frames would land on the next clip's
+    positions (Gemma 4 unified caps the run, keeps every frame); warn once on a
+    plain cut. Message rows are split before this."""
+    if not any(clips or ()):
+        return
+    advice = "Split the clip, or give the row as messages."
+    limit = _audio_clip_limit_samples(processor)
+    cut = limit == _extractor_window_samples(processor)
+    name = type(processor).__name__
+    if not limit:
+        return
+    rate = audio_extractor_sampling_rate(processor)
+    seconds = f" ({limit / rate:.0f}s)" if rate else ""
+    batch = [(index, clip) for index, row in enumerate(clips) for clip in row or ()]
+    for position, (index, clip) in enumerate(batch):
+        length = int(np.asarray(clip).shape[0])
+        if length <= limit:
+            continue
+        if not cut and position + 1 < len(batch):
+            raise ValueError(
+                f"Unsloth MLX: row {index} carries a {length}-sample audio "
+                f"clip but {name} writes placeholders for at most {limit} "
+                f"samples of one clip{seconds} while keeping all of its "
+                f"audio, so the surplus lands on the next clip's positions. "
+                f"{advice}"
+            )
+        if name not in _reported_cut_audio:
+            _reported_cut_audio.add(name)
+            warnings.warn(
+                f"Unsloth MLX: {name} uses only the first {limit} samples of "
+                f"an audio clip{seconds} and this dataset has a longer one "
+                f"({length} samples), so the rest is not trained on. {advice}",
+                stacklevel=2,
+            )
+
+
 def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
                               truncated=True, clips=None):
     """Reject rows whose audio placeholder runs did not survive tokenization.
@@ -8197,9 +8327,9 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
 
     Processors that state their spans take a different route, since their run
     carries no identifying token. Those rows are held to the conditions in
-    ``_assert_audio_bounds_intact`` instead of the two above, and additionally
-    to one the run path has no equivalent of: a clip may not be longer than the
-    window its feature extractor keeps.
+    ``_assert_audio_bounds_intact`` instead of the two above, and their clips
+    may not be longer than the window the feature extractor keeps. On the run
+    path a clip may not be longer than a cap on its run that its audio ignores.
     """
     ids = inputs.get("input_ids") if isinstance(inputs, Mapping) else None
     if ids is None:
@@ -8237,6 +8367,7 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
     # Placeholders with nothing behind them misalign the sequence however they
     # got there -- e.g. a formatter that kept the text but dropped the clip.
     _assert_audio_features_present(inputs, total_runs, processor)
+    _assert_audio_runs_cover_their_clips(clips, processor)
 
 
 def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
@@ -9423,6 +9554,19 @@ def _collate_vlm_prompt_completion_batch(
             prompt = [{"role": "user", "content": prompt}]
         prompt_messages = prompt if isinstance(prompt, list) else None
         completion_messages = completion if isinstance(completion, list) else None
+        # Audio conditions the response, so it belongs to the prompt half;
+        # scanning the completion keeps a misplaced clip from passing the gate.
+        if any(_vlm_audio_part_state(completion_messages or [])):
+            raise ValueError(
+                "Unsloth MLX: audio in the completion half is not supported; "
+                "put the audio in the prompt so it conditions the response."
+            )
+        audio = _extract_vlm_audio(item, prompt_messages or [], processor)
+        if prompt_messages is not None:
+            prompt_messages, audio = _split_audio_past_the_window(
+                prompt_messages, audio, processor,
+            )
+        all_audio.append(audio)
 
         if prompt_messages is not None:
             prompt_text = _render_vlm_messages(
@@ -9452,16 +9596,6 @@ def _collate_vlm_prompt_completion_batch(
         prompt_texts.append(prompt_text)
         completion_texts.append(completion_text)
         all_images.append(images)
-        # Audio conditions the response, so it belongs to the prompt half;
-        # scanning the completion keeps a misplaced clip from passing the gate.
-        if any(_vlm_audio_part_state(completion_messages or [])):
-            raise ValueError(
-                "Unsloth MLX: audio in the completion half is not supported; "
-                "put the audio in the prompt so it conditions the response."
-            )
-        all_audio.append(
-            _extract_vlm_audio(item, prompt_messages or [], processor)
-        )
 
     prompt_inputs = _processor_vlm_inputs(
         processor,
@@ -9491,6 +9625,7 @@ def _collate_vlm_prompt_completion_batch(
         )
     _assert_audio_runs_intact(
         prompt_inputs, audio_counts, processor, None, truncated=False,
+        clips=all_audio,
     )
     audio_budget = _audio_fixed_budget(processor)
     audio_soft_ids = (
@@ -9723,6 +9858,12 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             )
         images = _extract_vlm_images(item, messages, image_size)
         audio = _extract_vlm_audio(item, messages, processor)
+        if raw is not item or isinstance(item, list):
+            split, audio = _split_audio_past_the_window(messages, audio, processor)
+            if split is not messages and raw is item:
+                text = render_mlx_chat_example(processor, split, is_vlm=True)
+            elif split is not messages:
+                text = _render_vlm_messages(processor, split)
         all_texts.append(text)
         all_images.append(images)
         all_audio.append(audio)
