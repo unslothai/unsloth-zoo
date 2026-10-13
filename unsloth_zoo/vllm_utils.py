@@ -3754,7 +3754,6 @@ def load_vllm(
         if (enable_lora and not use_async and not use_engine and not use_bitsandbytes and not is_fp8
                 and _merged_rollout_mode() == "attention"):
             # Attention is folded, so vLLM wraps only the rest: no punica kernels on attention.
-            # Async / raw engines and quantized weights never fold, so they keep attention LoRA in vLLM.
             # vLLM < 0.20 lacks the arg and the filter below drops it (still exact, just no gain).
             engine_args["lora_target_modules"] = list(_MERGED_ROLLOUT_PUNICA_MODULES)
         if _is_gemma4_config(config) and use_bitsandbytes:
@@ -4662,9 +4661,8 @@ def _check_lora_is_servable(model, keys, source, peft_config):
 pass
 
 
-# Merged-weight rollouts (UNSLOTH_VLLM_MERGED_ROLLOUT=1): fold W = P + s * B @ A into vLLM's
-# shared weights for generate, then W.copy_(P). Folding from a pristine copy P, not
-# `W += sBA; W -= sBA`, because add/subtract drifts in bf16. Ineligible models keep vLLM LoRA.
+# Merged-weight rollouts (UNSLOTH_VLLM_MERGED_ROLLOUT=1): fold s * B @ A into vLLM's shared weights for
+# generate, then copy back a pristine P; never `W += sBA; W -= sBA`, which drifts in bf16.
 
 _MERGED_ROLLOUT_ADAPTER = "default"
 _MERGED_ROLLOUT_LOGGED = set()
@@ -4959,7 +4957,6 @@ pass
 def prepare_merged_rollout(model):
     # All Unsloth Zoo code licensed under LGPLv3
     if not _merged_rollout_enabled(): return None
-    # Under the lock, so P is never cloned while another thread has the weights folded.
     with _MERGED_ROLLOUT_LOCK:
         return _prepare_merged_rollout_locked(model)
 pass
@@ -5044,7 +5041,6 @@ def _merged_rollout_host_copies(targets):
         return None, f"the pristine host copy ({total / 1024**3:.2f} GB) could not be allocated"
     keep = [arena]
     if not on_host and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1":
-        # Pageable P still restores exactly, only synchronously.
         try: keep.append(_Registered(arena, total))
         except Exception: pass
     entries = []
@@ -5276,7 +5272,6 @@ def _merged_rollout_restore(state):
             "Unsloth: a merged-weight rollout could not restore the base weights; "
             "the training weights may still hold the folded adapter."
         ) from first_error
-    # Restored on the retry: still surface what interrupted the first pass.
     if first_error is not None: raise first_error
 pass
 
@@ -5314,8 +5309,7 @@ pass
 
 
 def _reset_merged_rollout_prefix_cache(llm):
-    # lora_request = None makes folded KV hash as base KV: reset the prefix cache before the
-    # fold and after the restore. Unconfirmed reset = False, and the caller uses vLLM LoRA.
+    # lora_request = None makes folded KV hash as base KV, so reset around the fold; unconfirmed = False.
     # All Unsloth Zoo code licensed under LGPLv3
     reset = getattr(llm, "reset_prefix_cache", None)
     if reset is None: return False
