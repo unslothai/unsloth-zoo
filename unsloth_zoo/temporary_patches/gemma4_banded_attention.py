@@ -82,7 +82,8 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
     extra segment boundaries neither path can honour, are always rejected. Per-head
     (shape[1] > 1) masks are rejected as well: the banded kernel applies one block
     mask to every head, so it cannot honour them. The verdict is stashed on the
-    tensor itself, so it can never collide with a recycled object id.
+    tensor itself and keyed by its version and the band parameters, so it cannot
+    outlive an in-place edit or collide with a recycled object id.
     A mask-free packed row of several documents is not a plain band.
     """
     if mask is None:
@@ -95,9 +96,13 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
     # while compiling so the graph stays intact; correctness is unchanged.
     if torch.compiler.is_compiling():
         return False
+    try:
+        key = (S, w, mask._version)
+    except RuntimeError:
+        key = None  # inference tensors have no version: always recheck
     cached = getattr(mask, "_unsloth_plain_band", None)
-    if cached is not None:
-        return cached
+    if key is not None and cached is not None and cached[0] == key:
+        return cached[1]
     # Reject per-head masks (shape[1] > 1): a single block mask / window is
     # applied to every head, so a distinct per-head mask cannot be honoured.
     if mask.shape[1] != 1 or mask.shape[-2] != S or mask.shape[-1] != S:
@@ -124,10 +129,11 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
             if not bool(match.all().item()):
                 ok = False
                 break
-    try:
-        mask._unsloth_plain_band = ok
-    except Exception:
-        pass
+    if key is not None:
+        try:
+            mask._unsloth_plain_band = (key, ok)
+        except Exception:
+            pass
     return ok
 
 
