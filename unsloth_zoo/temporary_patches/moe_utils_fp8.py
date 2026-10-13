@@ -321,7 +321,7 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
         from unsloth.kernels.fp8 import _fp8_kernel_unsupported
     except ImportError:
         _fp8_kernel_unsupported = None
-    # fp8e4nv does not compile on pre-sm89 CUDA or ROCm without OCP fp8 (gfx90a, gfx11xx).
+    # fp8e4nv does not compile on pre-sm89 CUDA, nor on most AMD archs with triton < 3.5 (unsloth's guard).
     if _fp8_kernel_unsupported is not None and _fp8_kernel_unsupported(weight):
         return None
 

@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FP8 expert dequant must skip the fp8e4nv Triton kernel on pre-sm89 CUDA and ROCm
-without OCP fp8 (gfx1151 reports capability 11.5), falling back to torch dequant."""
+"""FP8 expert dequant must skip the fp8e4nv Triton kernel where unsloth's guard says it cannot compile
+(pre-sm89 CUDA; AMD archs without fp8e4nv on triton < 3.5), falling back to torch dequant."""
 
 from __future__ import annotations
 
@@ -103,3 +103,15 @@ def test_vectorized_block_dequant_peak_stays_near_the_result(monkeypatch):
     torch.cuda.synchronize()
     assert out.shape == (32, 1024, 1024)
     assert torch.cuda.max_memory_allocated() - base < 1.5 * result_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_real_device_full_expert_dequant_matches_reference():
+    # Unmocked: on this GPU, whichever path the guard picks must run and match the float32 reference.
+    # On pre-sm89 CUDA the Triton kernel cannot compile, so only the guard keeps this alive.
+    _fp8_module()
+    w, s = _expert_stack()
+    out = F._dequantize_full_expert_weights(w, s, torch.bfloat16)
+    torch.cuda.synchronize()
+    ref = w.float() * s.repeat_interleave(128, 1).repeat_interleave(128, 2)
+    torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
