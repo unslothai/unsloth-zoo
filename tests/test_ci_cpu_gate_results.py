@@ -91,14 +91,31 @@ python() {
         stderr = subprocess.DEVNULL,
         start_new_session = True,
     )
+    logs = tmp_path / "zoo-cpu-gates"
+
+    def hang_reached():
+        # The other lane is done AND the behavioral lane is inside the hanging call. The
+        # log file exists from the redirect onward, before the stub writes its line, so
+        # waiting for the other lane alone kills the step too early on a loaded runner.
+        log = logs / "behavioral.log"
+        return (
+            (logs / "cpu-advisory.status").exists()
+            and log.exists()
+            and "tests/test_ci_cpu_gate_results.py" in log.read_text()
+        )
+
+    reached = False
     try:
-        for _ in range(500):
-            if (tmp_path / "zoo-cpu-gates" / "cpu-advisory.status").exists():
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if hang_reached():
+                reached = True
                 break
             time.sleep(0.02)
     finally:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
+    assert reached, "the gates never reached the hanging behavioral call"
 
 
 def print_logs_after_timeout(tmp_path):

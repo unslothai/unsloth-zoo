@@ -2399,16 +2399,16 @@ def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
     return total if softcap else hidden.astype(mx.float32) @ total
 
 
-def _make_preference_cce_scorer(model):
+def _make_preference_cce_scorer(model, *, temperature=1.0):
     """Score preference positions from hidden states through runtime CCE.
 
     Returns None unless the hidden states are reachable and the head is an
-    unwrapped, bias-free dense or frozen quantized projection.
+    unwrapped, bias-free dense or frozen quantized projection. ``temperature``
+    divides the logits; a softcapped head cannot take it through the hidden states.
     """
     from . import utils
 
-    tm = utils._get_text_model(model)
-    if getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model):
+    if utils._get_text_backbone(model) is None and not utils._has_direct_hidden_stack(model):
         return None
     if utils._is_vlm_model(model) and not hasattr(model, "get_input_embeddings"):
         return None
@@ -2417,7 +2417,7 @@ def _make_preference_cce_scorer(model):
         return None
     scale, problem = utils._detect_head_transform(model, desc.status)
     softcap, softcap_problem = utils._detect_logit_softcap(model)
-    if problem is not None or softcap_problem is not None:
+    if problem is not None or softcap_problem is not None or (softcap and temperature != 1.0):
         return None
     quantization = {}
     if desc.quantized:
@@ -2432,12 +2432,12 @@ def _make_preference_cce_scorer(model):
                                     quantized=desc.quantized, weight_is_frozen=frozen,
                                     **quantization)
 
-    def score(model, batch, supervised, indices=None, *, every_position=False):
+    def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True):
         """Token cross entropy and logit sums per position, as float32 grids.
 
         Cross entropy is zero outside ``supervised``. ``indices`` limits the
         kernel to those rows, which then also limits the logit sums unless
-        ``every_position``.
+        ``every_position``. Without ``logit_sums`` the sums are None.
         """
         targets = _preference_ids(batch)[:, 1:]
         hidden = _preference_hidden(model, batch)
@@ -2446,6 +2446,8 @@ def _make_preference_cce_scorer(model):
         hidden = utils._rotate_head_input(head, hidden.reshape((-1, hidden.shape[-1])))
         if scale is not None:
             hidden = hidden * scale
+        if temperature != 1.0:
+            hidden = hidden / temperature
         labels = utils._normalize_cce_label_dtype(targets)
         labels = mx.where(supervised, labels, mx.array(-100, labels.dtype))
         rows, labels = utils._compact_cce_inputs(hidden, labels.reshape((-1,)), indices)
@@ -2458,12 +2460,14 @@ def _make_preference_cce_scorer(model):
             ce = kernel(rows, weight, scales, biases, labels)
         else:
             ce = kernel(rows, weight, labels)
-        summed = hidden if every_position or indices is None else rows
-        sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
         if indices is not None:
             ce = _scatter_rows(ce, indices, targets.size)
-            if summed is rows:
-                sums = _scatter_rows(sums, indices, targets.size)
+        if not logit_sums:
+            return ce.reshape(targets.shape), None
+        summed = hidden if every_position or indices is None else rows
+        sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
+        if indices is not None and summed is rows:
+            sums = _scatter_rows(sums, indices, targets.size)
         return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape))
 
     score.vocab = desc.module.weight.shape[0]

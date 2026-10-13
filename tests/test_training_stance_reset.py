@@ -454,3 +454,24 @@ def test_owned_entry_is_dropped_when_the_caller_replaces_the_stance():
     torch.compiler.set_stance("default")
     gc.collect()
     assert UNSLOTH_EAGER_STANCE_OWNED == []
+
+
+def test_a_stance_freed_at_interpreter_shutdown_does_not_raise(monkeypatch):
+    # Module teardown sets globals to None before the weakref callback of a still-claimed stance runs.
+    from unsloth_zoo.temporary_patches import utils as stance_utils
+
+    class Stance:
+        pass
+
+    raised = []
+    monkeypatch.setattr(sys, "unraisablehook", raised.append)
+    # Our own reference keeps the claimed weakref alive past the teardown, so its callback runs.
+    owned = []
+    monkeypatch.setattr(stance_utils, "UNSLOTH_EAGER_STANCE_OWNED", owned)
+    stance = Stance()
+    stance_utils.unsloth_claim_eager_stance(stance)
+    assert len(owned) == 1
+    monkeypatch.setattr(stance_utils, "UNSLOTH_EAGER_STANCE_OWNED", None)
+    del stance
+    gc.collect()
+    assert not raised, [str(r.exc_value) for r in raised]
