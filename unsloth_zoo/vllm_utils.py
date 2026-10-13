@@ -3751,8 +3751,9 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
-        if enable_lora and _merged_rollout_mode() == "attention":
+        if enable_lora and not use_async and _merged_rollout_mode() == "attention":
             # Attention is folded, so vLLM wraps only the rest: no punica kernels on attention.
+            # Async engines are never wrapped (no fold), so they keep attention LoRA in vLLM.
             # vLLM < 0.20 lacks the arg and the filter below drops it (still exact, just no gain).
             engine_args["lora_target_modules"] = list(_MERGED_ROLLOUT_PUNICA_MODULES)
         if _is_gemma4_config(config) and use_bitsandbytes:
