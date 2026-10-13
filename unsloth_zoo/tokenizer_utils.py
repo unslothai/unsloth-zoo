@@ -110,6 +110,10 @@ def add_new_tokens(
     assert(method == "mean" or method == "interpolation")
     assert(interpolation >= 0 and interpolation <= 1)
 
+    # Vision models hand back a processor; its inner tokenizer owns the vocab.
+    if not hasattr(tokenizer, "add_tokens") and hasattr(tokenizer, "tokenizer"):
+        tokenizer = tokenizer.tokenizer
+
     # Check if tokens already exist
     overlapping_tokens = set(new_tokens) & set(tokenizer.vocab.keys())
     if len(overlapping_tokens) != 0:
@@ -134,7 +138,8 @@ def add_new_tokens(
     old_output_embedding = model.get_output_embeddings().weight
     old_input_length  = old_input_embedding .shape[0]
     old_output_length = old_output_embedding.shape[0]
-    old_config_size   = model.config.vocab_size
+    # Composite configs (Gemma3Config) keep vocab_size on text_config.
+    text_config       = model.config.get_text_config()
 
     # Check for tied weights as well
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \
@@ -178,7 +183,7 @@ def add_new_tokens(
         raise RuntimeError(
             "Unsloth: LM Head matrix size did not get resized properly. Please file a bug report!"
         )
-    if model.config.vocab_size   != resize_target:
+    if text_config.vocab_size    != resize_target:
         raise RuntimeError(
             "Unsloth: Model's config vocab_size did not get resized properly. Please file a bug report!"
         )

@@ -59,7 +59,8 @@ from .compile import (
 )
 from .attention import install_quantized_attention
 from .inference import (dense_prefill_linear, fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                        fused_moe_router, fused_residual_norm, fused_residual_norm_handoff, nax_quantized_linear)
+                        fused_moe_router, fused_packed_gated_delta, fused_residual_norm, fused_residual_norm_handoff,
+                        nax_quantized_linear)
 
 _vlm_model_types_cache = None
 _VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
@@ -4104,6 +4105,50 @@ def _ensure_audio_conv_sanitize(model_type: str) -> None:
     _AUDIO_CONV_SANITIZE_PATCHED.add(model_type)
 
 
+def _encode_audio_clips_one_at_a_time(get_audio_features):
+    @wraps(get_audio_features)
+    def per_clip(self, input_features, feature_attention_mask=None,
+                 audio_feature_lengths=None):
+        if input_features.ndim != 3 or input_features.shape[0] < 2:
+            return get_audio_features(
+                self, input_features, feature_attention_mask, audio_feature_lengths,
+            )
+        import mlx.core as mx
+
+        return mx.concatenate([
+            get_audio_features(
+                self,
+                input_features[index:index + 1],
+                None if feature_attention_mask is None
+                else feature_attention_mask[index:index + 1],
+                None if audio_feature_lengths is None
+                else audio_feature_lengths[index:index + 1],
+            )
+            for index in range(input_features.shape[0])
+        ], axis=0)
+
+    return per_clip
+
+
+def _ensure_qwen3_omni_audio_per_clip(model_type: str) -> None:
+    """mlx-vlm <= 0.7.4 masks audio chunks by clip index, so later clips read the
+    first clip's chunks; encode clips one at a time. Gated on the tower's source."""
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if cls is None or cls.__module__ != "mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe":
+        return
+    thinker = importlib.import_module("mlx_vlm.models.qwen3_omni_moe.thinker").Thinker
+    audio = importlib.import_module("mlx_vlm.models.qwen3_omni_moe.audio")
+    source = _safe_getsource(audio.AudioModel.__call__) or ""
+    if (
+        "enumerate(feature_lens_after_cnn)" not in source
+        or getattr(thinker.get_audio_features, "__wrapped__", None) is not None
+    ):
+        return
+    thinker.get_audio_features = _encode_audio_clips_one_at_a_time(
+        thinker.get_audio_features,
+    )
+
+
 def _fp16_needs_bf16_modules(model):
     """Modules that should stay bf16 under fp16 training.
 
@@ -7132,6 +7177,7 @@ def _mlx_generate_vlm(self, *args, **kwargs):
     with fused_moe_gate_up(self), fused_decode_conv_silu(self), fused_residual_norm(self), \
             fused_moe_router(self), fused_moe_routed_experts(self), nax_quantized_linear(self, int8_prefill), \
             dense_prefill_linear(self), \
+            fused_packed_gated_delta(self), \
             fused_residual_norm_handoff(self):
         for response in stream_generate(
             self,
@@ -7259,6 +7305,7 @@ def _mlx_generate(self, *args, **kwargs):
         with fused_moe_gate_up(self), fused_decode_conv_silu(self), fused_residual_norm(self), \
                 fused_moe_router(self), fused_moe_routed_experts(self), nax_quantized_linear(self, int8_prefill), \
                 dense_prefill_linear(self), \
+                fused_packed_gated_delta(self), \
                 fused_residual_norm_handoff(self):
             for response in stream_generate(
                 self,
@@ -9307,6 +9354,7 @@ class FastMLXModel:
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
             _ensure_audio_conv_sanitize(model_type)
+            _ensure_qwen3_omni_audio_per_clip(model_type)
             _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(

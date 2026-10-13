@@ -16,7 +16,8 @@
 
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
-small-batch quantized projections on the neural accelerators, and the pre-norm residual handoff."""
+small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
+and Qwen exact speculative verify blocks."""
 
 import ast
 import functools
@@ -33,7 +34,7 @@ import sys
 import textwrap
 from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
+from threading import RLock, local
 from types import FunctionType
 from typing import NamedTuple
 
@@ -256,9 +257,11 @@ class _PackedMoEGateUp:
     def project(self, x, indices, sorted_indices, token_rows = None):
         """`x` holds one row per token when `token_rows` maps each sorted row to its token."""
         group_size, bits, mode = self.metadata
-        result = _nax_int8_prefill_gather(self.gate, x, self.arrays["weight"], self.arrays["scales"],
-                                  self.arrays.get("biases"), indices, sorted_indices, group_size, bits, mode, None,
-                                  token_rows)
+        call = (self.gate, x, self.arrays["weight"], self.arrays["scales"], self.arrays.get("biases"), indices,
+                sorted_indices, group_size, bits, mode, None, token_rows)
+        result = _nax_int8_prefill_gather(*call)
+        if result is None:
+            result = _nax_sorted_gather(*call)
         if result is None:
             result = mx.gather_qmm(
                 x if token_rows is None else x[token_rows],
@@ -655,6 +658,204 @@ def fused_decode_conv_silu(model, *, _modules = None):
             for name in ("_unsloth_decode_scopes", "_unsloth_decode_native",
                          "_unsloth_decode_patched"):
                 module.__dict__.pop(name, None)
+
+
+# The generic kernel builder is pinned because the packed kernel repeats its arithmetic.
+_GATED_DELTA_BODIES = {"gated_delta_kernel": "84cd89879cc05264", "_make_gated_delta_kernel": "d3141d83bfd26d47",
+                       "_gated_delta_kernel": None}
+_GATED_DELTA_CONTRACT = {"mlx_vlm.models.qwen3_5.gated_delta": _GATED_DELTA_BODIES,
+                         "mlx_lm.models.gated_delta": _GATED_DELTA_BODIES}
+_GATED_DELTA_LOCK = RLock()
+_GATED_DELTA_SCOPES = {}
+_GATED_DELTA_VERDICTS = {}
+
+
+@functools.cache
+def _packed_gated_delta_kernel():
+    # The layout and reduction order of mlx-lm's packed kernel (ml-explore/mlx-lm#1559): four lanes own
+    # a value row and hold 32 state elements each, and the sums follow the tree simd_sum lowers to.
+    try:
+        if not mx.metal.is_available():
+            return None
+        return mx.fast.metal_kernel(
+            name = "unsloth_gated_delta_packed",
+            input_names = ["q", "k", "v", "g", "beta", "state_in", "T"], output_names = ["y", "state_out"],
+            source = """
+                constexpr int lanes_per_row = 4;
+                constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+                constexpr int values_per_lane = Dk / lanes_per_row;
+                constexpr int partials_per_lane = values_per_lane / 4;
+
+                auto n = thread_position_in_grid.z;
+                auto b_idx = n / Hv;
+                auto hv_idx = n % Hv;
+                auto hk_idx = hv_idx / (Hv / Hk);
+
+                auto lane = thread_index_in_simdgroup;
+                auto row_in_simdgroup = lane / lanes_per_row;
+                auto lane_in_row = lane & (lanes_per_row - 1);
+                auto dv_idx = thread_position_in_grid.y * rows_per_simdgroup + row_in_simdgroup;
+
+                auto q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+                auto k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+                auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
+                y += (b_idx * T * Hv + hv_idx) * Dv;
+                auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+                auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+
+                float state[values_per_lane];
+                for (int i = 0; i < values_per_lane; ++i) {
+                    state[i] = static_cast<float>(i_state[i]);
+                }
+
+                auto g_ = g + b_idx * T * Hv;
+                auto beta_ = beta + b_idx * T * Hv;
+
+                for (int t = 0; t < T; ++t) {
+                    float gt = static_cast<float>(g_[hv_idx]);
+
+                    // Each 4-element chain is one lane's sequential accumulation in the generic kernel.
+                    float part[partials_per_lane];
+                    for (int pb = 0; pb < partials_per_lane; ++pb) {
+                        float acc = 0.0f;
+                        for (int i = 0; i < 4; ++i) {
+                            int e = pb * 4 + i;
+                            state[e] = state[e] * gt;
+                            acc += state[e] * static_cast<float>(k_[e]);
+                        }
+                        part[pb] = acc;
+                    }
+                    // Butterfly levels xor 1, 2, 4 fall inside this lane; 8 and 16 are the row shuffles.
+                    float kv_mem =
+                        ((part[0] + part[1]) + (part[2] + part[3])) +
+                        ((part[4] + part[5]) + (part[6] + part[7]));
+                    kv_mem += simd_shuffle_xor(kv_mem, 1);
+                    kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+                    auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+
+                    for (int pb = 0; pb < partials_per_lane; ++pb) {
+                        float acc = 0.0f;
+                        for (int i = 0; i < 4; ++i) {
+                            int e = pb * 4 + i;
+                            state[e] = state[e] + static_cast<float>(k_[e]) * delta;
+                            acc += state[e] * static_cast<float>(q_[e]);
+                        }
+                        part[pb] = acc;
+                    }
+                    float out =
+                        ((part[0] + part[1]) + (part[2] + part[3])) +
+                        ((part[4] + part[5]) + (part[6] + part[7]));
+                    out += simd_shuffle_xor(out, 1);
+                    out += simd_shuffle_xor(out, 2);
+                    if (lane_in_row == 0) {
+                        y[dv_idx] = static_cast<InT>(out);
+                    }
+
+                    q_ += Hk * Dk;
+                    k_ += Hk * Dk;
+                    v_ += Hv * Dv;
+                    y += Hv * Dv;
+                    g_ += Hv;
+                    beta_ += Hv;
+                }
+
+                for (int i = 0; i < values_per_lane; ++i) {
+                    o_state[i] = static_cast<StT>(state[i]);
+                }
+            """,
+        )
+    except (AttributeError, TypeError):
+        return None
+
+
+def _packed_gated_delta(q, k, v, g, beta, state):
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    return _packed_gated_delta_kernel()(
+        inputs = [q, k, v, g, beta, state, T],
+        template = [("InT", q.dtype), ("StT", state.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+        grid = (32, Dv // 8, B * Hv), threadgroup = (32, 2, 1),
+        output_shapes = [(B, T, Hv, Dv), state.shape], output_dtypes = [q.dtype, state.dtype],
+    )
+
+
+def _packed_gated_delta_route(native, bindings):
+    def gated_delta_kernel(q, k, v, g, beta, state, mask = None):
+        if (mask is not None or g.ndim != 3 or k.shape[1] < 2 or k.shape[3] != 128 or v.shape[3] % 8
+                or g.dtype != mx.float32 or state.dtype != mx.float32 or not _bindings_intact(bindings)):
+            return native(q, k, v, g, beta, state, mask)
+        key = (k.shape[2], *v.shape[2:], q.dtype, k.dtype, v.dtype, beta.dtype)
+        verdict = _GATED_DELTA_VERDICTS.get(key)
+        if verdict:
+            return _packed_gated_delta(q, k, v, g, beta, state)
+        stock = native(q, k, v, g, beta, state, mask)
+        if verdict is None:
+            try:
+                verdict = all(bool(mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item())
+                              for a, b in zip(_packed_gated_delta(q, k, v, g, beta, state), stock))
+            except (RuntimeError, ValueError):
+                return stock  # inside a function transformation, which cannot evaluate; checked later
+            _GATED_DELTA_VERDICTS[key] = verdict
+            if not verdict:
+                logger.warning("the packed gated-delta kernel differs from the generic one for %d key heads, "
+                               "%d value heads of width %d and %s inputs; the generic kernel stays in use",
+                               *key[:4])
+        return stock
+
+    return gated_delta_kernel
+
+
+def _gated_delta_sources(modules):
+    """The pinned gated-delta modules whose `gated_delta_update` a layer of these modules calls."""
+    updates = set()
+    for cls in {type(module) for _, module in modules}:
+        for base in cls.__mro__:
+            update = getattr(sys.modules.get(base.__module__), "gated_delta_update", None)
+            if update is not None:
+                updates.add(id(update))
+    return [name for name in _GATED_DELTA_CONTRACT
+            if id(getattr(sys.modules.get(name), "gated_delta_update", None)) in updates]
+
+
+@contextmanager
+def fused_packed_gated_delta(model, *, _modules = None):
+    """Run multi-token gated-delta calls on a packed kernel, bit-identical to the generic one.
+
+    Each head layout and dtype is compared bit for bit on first use. `gated_delta_kernel` is rebound
+    process-wide while any scope is open. `UNSLOTH_MLX_PACKED_GATED_DELTA=0` turns the route off.
+    """
+    entered = []
+    try:
+        with _GATED_DELTA_LOCK:
+            if (os.environ.get("UNSLOTH_MLX_PACKED_GATED_DELTA", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and _packed_gated_delta_kernel() is not None):
+                for name in _gated_delta_sources(_fusion_modules(model, _modules)):
+                    namespace = vars(sys.modules[name])
+                    held = _GATED_DELTA_SCOPES.get(name)
+                    if held is None:
+                        if "_gated_delta_kernel_packed" in namespace:
+                            continue
+                        bindings = _resolved_bindings({name: _GATED_DELTA_BODIES})
+                        if bindings is None:
+                            continue
+                        native = namespace["gated_delta_kernel"]
+                        route = _packed_gated_delta_route(native, [b for b in bindings if b[2] is not native])
+                        namespace["gated_delta_kernel"] = route
+                        held = _GATED_DELTA_SCOPES[name] = [0, name, namespace, native, route]
+                    held[0] += 1
+                    entered.append(held)
+        yield model
+    finally:
+        with _GATED_DELTA_LOCK:
+            for held in entered:
+                held[0] -= 1
+                if not held[0]:
+                    _, name, namespace, native, route = held
+                    del _GATED_DELTA_SCOPES[name]
+                    if namespace.get("gated_delta_kernel") is route:
+                        namespace["gated_delta_kernel"] = native
 
 def _single_row(x):
     # The fused kernel reduces one row per launch, so anything wider keeps the native path.
@@ -2656,8 +2857,8 @@ def fused_moe_routed_experts(model, *, _modules = None):
     Gate/up with SwiGLU, and down with the routing-weight combine and shared-expert add, serve
     calls whose routes MLX gathers unsorted, each checked bitwise against the native experts at
     first use; where they serve a call, the routing launch also writes the shared-expert gate's
-    sigmoid. The kernels run from `fused_moe_router`'s fused call, so without that scope the
-    blocks stay native. Training and distributed models keep the native experts, and so does
+    sigmoid. The kernels run from `fused_moe_router`'s fused call and from `exact_speculative_verify`'s
+    verify blocks, so without either scope the blocks stay native. Training and distributed models keep the native experts, and so does
     every model while UNSLOTH_MLX_ROUTED_EXPERTS=0.
     """
     changed = []
@@ -2705,6 +2906,7 @@ _NAX_QMM_CONTRACT = {"mlx.nn.layers.quantized": {
 _NAX_QMM_LOCK = RLock()
 _NAX_QMM_VERIFIED = {}
 _NAX_INT8_QMM_VERIFIED = {}
+_NAX_SORTED_GATHER_VERIFIED = {}
 
 
 def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
@@ -2769,9 +2971,9 @@ def _nax_small_m_qmm(module, x, bindings):
     return routed.reshape(*x.shape[:-1], N) if verified else None
 
 
-def _nax_int8_qmm_eligible(K, dtype, w, scales, biases, group_size, bits, mode):
+def _nax_qmm_eligible(supported, K, dtype, w, scales, biases, group_size, bits, mode):
     return (all(isinstance(a, mx.array) for a in (w, scales, biases))
-            and nax.int8_qmm_supported(w.shape[-2], K, group_size, bits, mode)
+            and supported(w.shape[-2], K, group_size, bits, mode)
             and dtype in (mx.bfloat16, mx.float16) and dtype == scales.dtype == biases.dtype
             and w.dtype == mx.uint32 and w.shape[-1] == K * bits // 32
             and scales.shape == (*w.shape[:-1], K // group_size) and biases.shape == scales.shape)
@@ -2841,7 +3043,8 @@ def _nax_int8_prefill_dense(module, x, bindings):
     if module.training or not _bindings_intact(bindings):
         return None
     w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
-    if (not _nax_int8_qmm_eligible(x.shape[-1], x.dtype, w, scales, biases, module.group_size, module.bits, module.mode)
+    if (not _nax_qmm_eligible(nax.int8_qmm_supported, x.shape[-1], x.dtype, w, scales, biases, module.group_size,
+                              module.bits, module.mode)
             or w.ndim != 2):
         return None
     N, K = w.shape[0], x.shape[-1]
@@ -2850,21 +3053,29 @@ def _nax_int8_prefill_dense(module, x, bindings):
     return None if routed is None else routed.reshape(*x.shape[:-1], N)
 
 
+def _nax_gather_rows(owner, flag, x, w, indices, sorted_indices, bindings, token_rows):
+    """The sorted rows of a gathered call that the NAX route `flag` enables on `owner` may take, or 0."""
+    if not sorted_indices or not isinstance(x, mx.array) or x.ndim != 3 or x.shape[1] != 1:
+        return 0
+    if not getattr(owner, flag, False) or owner.training:
+        return 0
+    if bindings is not None and not _bindings_intact(bindings):
+        return 0
+    T = x.shape[0] if token_rows is None else token_rows.shape[0]
+    if (not isinstance(indices, mx.array) or indices.shape != (T,)
+            or indices.dtype not in (mx.uint32, mx.int32) or not isinstance(w, mx.array) or w.ndim != 3):
+        return 0
+    return T
+
+
 def _nax_int8_prefill_gather(owner, x, w, scales, biases, indices, sorted_indices, group_size, bits, mode, bindings,
                      token_rows = None):
     """The gathered int8 kernel's result for x of shape [T, 1, K] sorted by expert, or None for the
     native call. `owner` enabled the route; `w` may pack several projections. With `token_rows`, x
     holds one row per token and sorted row i is `x[token_rows[i]]`."""
-    if not sorted_indices or not isinstance(x, mx.array) or x.ndim != 3 or x.shape[1] != 1:
-        return None
-    if not getattr(owner, "_unsloth_nax_int8_prefill", False) or owner.training:
-        return None
-    if bindings is not None and not _bindings_intact(bindings):
-        return None
-    T = x.shape[0] if token_rows is None else token_rows.shape[0]
-    if (not isinstance(indices, mx.array) or indices.shape != (T,)
-            or indices.dtype not in (mx.uint32, mx.int32) or not isinstance(w, mx.array) or w.ndim != 3
-            or not _nax_int8_qmm_eligible(x.shape[-1], x.dtype, w, scales, biases, group_size, bits, mode)):
+    T = _nax_gather_rows(owner, "_unsloth_nax_int8_prefill", x, w, indices, sorted_indices, bindings, token_rows)
+    if not T or not _nax_qmm_eligible(nax.int8_qmm_supported, x.shape[-1], x.dtype, w, scales, biases, group_size,
+                                      bits, mode):
         return None
     (E, N, _), K = w.shape, x.shape[-1]
     low = nax.int8_prefill_expert_min_rows(E, bits, token_rows is not None)
@@ -2873,6 +3084,49 @@ def _nax_int8_prefill_gather(owner, x, w, scales, biases, indices, sorted_indice
     routed = _nax_verified_int8_qmm(("gather", E, N, K, group_size, bits, x.dtype, token_rows is not None),
                                     x.reshape(-1, K), w, scales, biases, group_size, bits, indices, token_rows)
     return None if routed is None else routed.reshape(T, 1, N)
+
+
+def _nax_sorted_gather(owner, x, w, scales, biases, indices, sorted_indices, group_size, bits, mode, bindings,
+                       token_rows = None):
+    """The sorted gather kernel's result, or None for the native call."""
+    T = _nax_gather_rows(owner, "_unsloth_nax_sorted_gather", x, w, indices, sorted_indices, bindings, token_rows)
+    if not T or not _nax_qmm_eligible(nax.sorted_gather_qmm_supported, x.shape[-1], x.dtype, w, scales, biases,
+                                      group_size, bits, mode):
+        return None
+    (E, N, _), K = w.shape, x.shape[-1]
+    low, high = nax.sorted_gather_row_range(E, bits)
+    if not low <= T <= high or (token_rows is not None and token_rows.dtype not in (mx.uint32, mx.int32)):
+        return None
+    key = (E, N, K, group_size, bits, x.dtype, token_rows is not None)
+    verified = _NAX_SORTED_GATHER_VERIFIED.get(key)
+    if verified is False:
+        return None
+    routed = nax.sorted_gather_qmm(x.reshape(-1, K), w, scales, biases, indices, bits, token_rows).reshape(T, 1, N)
+    if verified is None:
+        try:
+            native = mx.gather_qmm(x if token_rows is None else x[token_rows], w, scales, biases, rhs_indices = indices,
+                                   transpose = True, group_size = group_size, bits = bits, sorted_indices = True)
+            verified = mx.array_equal(routed.view(mx.uint16), native.view(mx.uint16)).item()
+        except (RuntimeError, ValueError):
+            return None  # inside a function transformation, which cannot evaluate; checked later
+        if verified and not any(_NAX_SORTED_GATHER_VERIFIED.values()):
+            logger.info("sorted routed-expert projections now run on the NAX gather kernel; "
+                        "UNSLOTH_MLX_NAX_SORTED_GATHER=0 keeps the native call")
+        _NAX_SORTED_GATHER_VERIFIED[key] = verified
+        if not verified:
+            logger.warning("the NAX sorted gather kernel does not reproduce the native one for %s; "
+                           "the native call stays in use", key)
+    return routed if verified else None
+
+
+def _nax_sorted_gather_route(module):
+    w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
+    if not isinstance(w, mx.array) or w.ndim != 3:
+        return False
+    low, high = nax.sorted_gather_row_range(w.shape[0], module.bits)
+    return low <= high and _nax_qmm_eligible(
+        nax.sorted_gather_qmm_supported, w.shape[-1] * 32 // module.bits, getattr(scales, "dtype", None), w, scales,
+        biases, module.group_size, module.bits, module.mode)
 
 
 # Keyed by the current methods: a transient wrapper, such as the training patches', misses only
@@ -2905,32 +3159,35 @@ def _nax_qmm_classes(*cache_key):
     }
 
 
-_NAX_INT8_PREFILL_SWITCH_CONTRACT = {path: {"QuantizedSwitchLinear.__call__": "59bbb193612cbe06"}
-                           for path in ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers")}
+_NAX_SWITCH_CONTRACT = {path: {"QuantizedSwitchLinear.__call__": "59bbb193612cbe06"}
+                        for path in ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers")}
 
 
 @functools.cache
-def _nax_int8_prefill_switch_class(base, call, path):
-    bindings = _resolved_bindings({path: _NAX_INT8_PREFILL_SWITCH_CONTRACT[path]})
+def _nax_switch_class(base, call, path):
+    bindings = _resolved_bindings({path: _NAX_SWITCH_CONTRACT[path]})
     if bindings is None:
         return None
 
     def switch(self, x, indices, sorted_indices = False):
-        routed = _nax_int8_prefill_gather(self, x, self.get("weight"), self.get("scales"), self.get("biases"), indices,
-                                  sorted_indices, self.group_size, self.bits, self.mode, bindings)
+        call = (self, x, self.get("weight"), self.get("scales"), self.get("biases"), indices, sorted_indices,
+                self.group_size, self.bits, self.mode, bindings)
+        routed = _nax_int8_prefill_gather(*call)
+        if routed is None:
+            routed = _nax_sorted_gather(*call)
         if routed is None:
             return base.__call__(self, x, indices, sorted_indices = sorted_indices)
         return routed + mx.expand_dims(self["bias"][indices], -2) if "bias" in self else routed
 
-    return type(f"_NaxInt8Prefill{base.__name__}", (base,), {"__call__": switch, "_unsloth_nax_qmm_native": base})
+    return type(f"_NaxGather{base.__name__}", (base,), {"__call__": switch, "_unsloth_nax_qmm_native": base})
 
 
-def _nax_int8_prefill_switch_classes():
+def _nax_switch_classes():
     classes = {}
-    for path in _NAX_INT8_PREFILL_SWITCH_CONTRACT:
+    for path in _NAX_SWITCH_CONTRACT:
         base = getattr(sys.modules.get(path), "QuantizedSwitchLinear", None)
         if isinstance(base, type) and base not in classes:
-            swapped = _nax_int8_prefill_switch_class(base, base.__call__, path)
+            swapped = _nax_switch_class(base, base.__call__, path)
             if swapped is not None:
                 classes[base] = swapped
     return classes
@@ -2973,7 +3230,8 @@ def _nax_int8_prefill_route(module, classes, switches, packed):
         return 0
     N, K = w.shape[-2], w.shape[-1] * 32 // module.bits
     dtype = getattr(scales, "dtype", None)
-    if not _nax_int8_qmm_eligible(K, dtype, w, scales, biases, module.group_size, module.bits, module.mode):
+    if not _nax_qmm_eligible(nax.int8_qmm_supported, K, dtype, w, scales, biases, module.group_size, module.bits,
+                             module.mode):
         return 0
     if dense:
         return nax.int8_prefill_min_rows(N, K)
@@ -3005,7 +3263,7 @@ def int8_prefill_available(model):
     if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
         return Int8PrefillStatus(False, "distributed", 0)
     classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
-    switches, packed = _nax_int8_prefill_switch_classes(), _nax_int8_prefill_packed(model)
+    switches, packed = _nax_switch_classes(), _nax_int8_prefill_packed(model)
     modules = {id(module): module for _, module in model.named_modules()} if hasattr(model, "named_modules") else {}
     return _int8_prefill_status(sum(bool(_nax_int8_prefill_route(module, classes, switches, packed))
                                     for module in modules.values()))
@@ -3075,6 +3333,9 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     loss of precision-sensitive checkpoints. Linears route from 17 rows, so batched decoding of 17
     or more sequences and wider speculative verification also run int8. The outermost scope
     decides; `int8_prefill_available(model)` says whether it takes effect here.
+
+    Sorted routed-expert projections run on a NAX gather kernel that reproduces `mx.gather_qmm`
+    bit for bit where it is measured faster; `UNSLOTH_MLX_NAX_SORTED_GATHER=0` turns it off.
     """
     changed, tracked = [], hasattr(model, "__dict__")
     try:
@@ -3087,10 +3348,12 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
             if tracked:
                 model.__dict__["_unsloth_nax_int8_prefill_scope"] = (depth + 1, bool(int8_prefill))
             small_m = os.environ.get("UNSLOTH_MLX_NAX_QMM", "1") != "0" and nax.gap_open("small_m_qmm")
-            if ((small_m or int8_prefill) and nax.nax_available()
+            sorted_gather = (os.environ.get("UNSLOTH_MLX_NAX_SORTED_GATHER", "1") != "0"
+                             and nax.gap_open("sorted_gather_qmm"))
+            if ((small_m or int8_prefill or sorted_gather) and nax.nax_available()
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
-                switches = _nax_int8_prefill_switch_classes() if int8_prefill else {}
+                switches = _nax_switch_classes() if int8_prefill or sorted_gather else {}
                 packed = _nax_int8_prefill_packed(model) if int8_prefill else set()
                 nested, fresh, seen = [], [], set()
                 for _, module in _fusion_modules(model, _modules):
@@ -3106,27 +3369,35 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         int8_prefill_rows = (int8_prefill and not module.training
                                      and _nax_int8_prefill_route(module, classes, switches, packed))
                         if rows is not None or int8_prefill_rows:
-                            fresh.append((module, rows, int8_prefill_rows))
-                    elif (base in switches and not module.training
-                          and _nax_int8_prefill_route(module, classes, switches, packed)):
-                        fresh.append((module, None, True))
-                if any(rows is not None for _, rows, _ in fresh) and not nax.kernel_probe_passed(
+                            fresh.append((module, rows, int8_prefill_rows, False))
+                    elif base in switches and not module.training:
+                        int8 = bool(int8_prefill and _nax_int8_prefill_route(module, classes, switches, packed))
+                        gather = sorted_gather and _nax_sorted_gather_route(module)
+                        if int8 or gather:
+                            fresh.append((module, None, int8, gather))
+                if any(rows is not None for _, rows, _, _ in fresh) and not nax.kernel_probe_passed(
                         nax.QMM_PROBE_KEY, nax.__name__, "probe_small_m_qmm"):
-                    fresh = [(module, None, int8_prefill_rows)
-                             for module, _, int8_prefill_rows in fresh if int8_prefill_rows]
-                if any(int8_prefill_rows for _, _, int8_prefill_rows in fresh) and not nax.kernel_probe_passed(
+                    fresh = [(module, None, int8, gather) for module, _, int8, gather in fresh]
+                if any(int8 for _, _, int8, _ in fresh) and not nax.kernel_probe_passed(
                         nax.INT8_QMM_PROBE_KEY, nax.__name__, "probe_int8_qmm"):
-                    fresh = [(module, rows, 0) for module, rows, _ in fresh if rows is not None]
-                for module, rows, int8_prefill_rows in fresh:
+                    fresh = [(module, rows, 0, gather) for module, rows, _, gather in fresh]
+                if any(gather for *_, gather in fresh) and not nax.kernel_probe_passed(
+                        nax.SORTED_GATHER_PROBE_KEY, nax.__name__, "probe_sorted_gather_qmm"):
+                    fresh = [(module, rows, int8, False) for module, rows, int8, _ in fresh]
+                fresh = [entry for entry in fresh if entry[1] is not None or entry[2] or entry[3]]
+                for module, rows, int8_prefill_rows, gather in fresh:
                     if type(module) in switches:
-                        module._unsloth_nax_int8_prefill = True
+                        if int8_prefill_rows:
+                            module._unsloth_nax_int8_prefill = True
+                        if gather:
+                            module._unsloth_nax_sorted_gather = True
                         module.__class__ = switches[type(module)]
                         continue
                     module._unsloth_nax_qmm_rows = (0, -1) if rows is None else rows
                     if int8_prefill_rows:
                         module._unsloth_nax_int8_prefill_rows = int8_prefill_rows
                     module.__class__ = classes[type(module)]
-                for module in nested + [module for module, _, _ in fresh]:
+                for module in nested + [entry[0] for entry in fresh]:
                     module._unsloth_nax_qmm_scopes = getattr(module, "_unsloth_nax_qmm_scopes", 0) + 1
                     changed.append(module)
         yield model
@@ -3144,7 +3415,8 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 native = getattr(type(module), "_unsloth_nax_qmm_native", None)
                 if native is not None:
                     module.__class__ = native
-                for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_int8_prefill_rows", "_unsloth_nax_int8_prefill"):
+                for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_int8_prefill_rows", "_unsloth_nax_int8_prefill",
+                             "_unsloth_nax_sorted_gather"):
                     module.__dict__.pop(name, None)
                 module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
 
@@ -3276,3 +3548,181 @@ def dense_prefill_linear(model, *, _modules = None):
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
 
+
+# The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
+# 0.7.1 added the verifier's `verify` entry; earlier releases miss it and stay native.
+_EXACT_VERIFY_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.speculative_verifier": {
+        "Qwen3_5BatchInvariantForward.verify": "14bdd46f35e8adfa",
+        "Qwen3_5BatchInvariantForward._linear": "6e38296bd3f89d5a",
+        "Qwen3_5BatchInvariantForward._linears": "1f44efb5714938af",
+        "Qwen3_5BatchInvariantForward._layer": "f3f59ff9d0b68a50",
+        "Qwen3_5BatchInvariantForward._model": "142df8a42c27c4f7",
+        "Qwen3_5BatchInvariantForward._feed_forward": "d1c424074fbf0c21",
+        "Qwen3_5BatchInvariantForward._switch_glu": "6aa1f4defb45f54a",
+        "_target_verify_linear": "190517e318ba4d7b",
+        "_target_verify_linears": "2d4c9adbc50be66e",
+    },
+    "mlx_vlm.speculative.ops.linear": {
+        "_target_verify_quantized_linear": "539dce1a6026f87e",
+        "_target_verify_optimized_affine_linear": "44955d8d8dd32a15",
+        "_target_verify_quantized_linears": "447c68b85e4e7dda",
+    },
+    "mlx_vlm.models.quantized_verifier": {
+        "_can_optimized_affine_linear": "22c2675d5a30e1f4",
+        "supports_optimized_affine_head": "b0611c0de3000a20",
+    },
+}
+# mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
+_VERIFY_FUSED_ROWS = 8
+_VERIFY_METHODS = ("verify", "_linear", "_linears", "_layer", "_feed_forward")
+_VERIFY_LOCK = RLock()
+_VERIFY_VERDICTS = {}
+# The verifier is one object per process: whether a call is served is kept per thread, not on it.
+_VERIFY_STATE = local()
+
+
+def _verify_admitted(key, native, fused):
+    """`fused()` once `key`'s first block matched `native()` bit for bit; that block, a failed key and a `fused()` of None take `native()`."""
+    verdict = _VERIFY_VERDICTS.get(key)
+    served = fused() if verdict else None
+    if served is not None:
+        return served
+    reference = native()
+    if verdict is None and (candidate := fused()) is not None:
+        pairs = zip(reference, candidate) if isinstance(reference, tuple) else ((reference, candidate),)
+        try:
+            verdict = all(a.dtype == b.dtype and a.shape == b.shape
+                          and mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item() for a, b in pairs)
+        except (RuntimeError, ValueError):
+            return reference  # inside a function transformation, which cannot evaluate; checked later
+        _VERIFY_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("a verify block differs from mlx-vlm's verifier for %s; the native verifier "
+                           "stays in use there", key)
+    return reference
+
+
+def _verify_sliced(project, linears, x, eligible):
+    """`project(x)`, over balanced row slices when the block is wider than mlx-vlm's fused verify bound."""
+    if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] <= _VERIFY_FUSED_ROWS
+            or not all(eligible(linear, x) and not linear.trainable_parameters() for linear in linears)):
+        return project(x)
+    # As few slices as the bound allows and as equal as possible, so none is a one- or two-row tail.
+    count = -(-x.shape[1] // _VERIFY_FUSED_ROWS)
+    size, extra = divmod(x.shape[1], count)
+    stops = [(i + 1) * size + min(i + 1, extra) for i in range(count)]
+
+    def sliced():
+        outs = [project(x[:, start:stop]) for start, stop in zip([0, *stops], stops)]
+        if isinstance(outs[0], tuple):
+            return tuple(mx.concatenate(column, axis = 1) for column in zip(*outs))
+        return mx.concatenate(outs, axis = 1)
+
+    key = (x.shape[:2], x.dtype, *((p.weight.shape, p.bits, p.group_size, p.mode, "bias" in p) for p in linears))
+    return _verify_admitted(key, lambda: project(x), sliced)
+
+
+@functools.cache
+def _exact_verify_class(base, *cache_key):
+    bindings = _resolved_bindings(_EXACT_VERIFY_CONTRACT)
+    eligible = getattr(sys.modules.get("mlx_vlm.models.quantized_verifier"), "_can_optimized_affine_linear", None)
+    if bindings is None or eligible is None:
+        return None
+
+    def verify(self, language_model, inputs, *, cache = None, **kwargs):
+        outer = getattr(_VERIFY_STATE, "serving", False)
+        _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
+                                     and not language_model.training and _bindings_intact(bindings))
+        try:
+            return base.verify(self, language_model, inputs, cache = cache, **kwargs)
+        finally:
+            _VERIFY_STATE.serving = outer
+
+    def sliced_linear(self, linear, x):
+        return _verify_sliced(lambda rows: base._linear(self, linear, rows), (linear,), x, eligible)
+
+    def sliced_linears(self, linears, x):
+        return _verify_sliced(lambda rows: base._linears(self, linears, rows), linears, x, eligible)
+
+    def submitted_layer(self, *args, **kwargs):
+        hidden = base._layer(self, *args, **kwargs)
+        if getattr(_VERIFY_STATE, "serving", False):
+            try:
+                mx.async_eval(hidden)
+            except ValueError:  # not allowed inside a function transformation
+                pass
+        return hidden
+
+    def routed_feed_forward(self, feed_forward, x):
+        experts, mlp = getattr(feed_forward, "_unsloth_moe_routed", None), getattr(feed_forward, "switch_mlp", None)
+        projections = [getattr(mlp, name, None) for name in ("gate_proj", "up_proj", "down_proj")]
+        # The routed object refuses projections it was not built for; only quantized, frozen ones reach it.
+        if (experts is None or x.ndim != 3 or not getattr(_VERIFY_STATE, "serving", False)
+                or any(getattr(p, "bits", None) is None or p.trainable_parameters() for p in projections)):
+            return base._feed_forward(self, feed_forward, x)
+
+        def routed():
+            # The verifier's own routing, shared expert and shared gate; the routed kernels take every row at once.
+            gates = mx.softmax(self._linear(feed_forward.gate, x), axis = -1, precise = True)
+            indices = mx.argpartition(gates, kth = -feed_forward.top_k, axis = -1)[..., -feed_forward.top_k:]
+            scores = mx.take_along_axis(gates, indices, axis = -1)
+            scores = scores / scores.sum(axis = -1, keepdims = True)
+            shared = self._feed_forward(feed_forward.shared_expert, x)
+            scale = mx.sigmoid(self._linear(feed_forward.shared_expert_gate, x))
+            rows = (x.shape[0] * x.shape[1], 1, -1)
+            out = experts(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale, shared)))
+            return None if out is None else out.reshape(*x.shape[:2], -1)
+
+        key = (x.shape[:2], x.dtype, feed_forward.top_k,
+               *((p.weight.shape, p.bits, p.group_size, p.mode) for p in projections))
+        return _verify_admitted(key, lambda: base._feed_forward(self, feed_forward, x), routed)
+
+    return type(f"_ScopedVerify{base.__name__}", (base,), {
+        "verify": verify, "_linear": sliced_linear, "_linears": sliced_linears, "_layer": submitted_layer,
+        "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base})
+
+
+@contextmanager
+def exact_speculative_verify(model, *, _modules = None):
+    """Speed up mlx-vlm's exact speculative verifier for Qwen3.5 language models during serialized inference.
+
+    Each layer of a verify block is submitted for evaluation as it is built, so the GPU runs while the host builds on.
+    A verify block wider than the eight rows mlx-vlm's fused verify kernels serve runs each frozen
+    quantized projection over balanced row slices, once its first block of that shape matched the
+    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition. Only verify calls of the language models found here are served; other,
+    training and distributed models, and an mlx-vlm whose verifier drifted, keep the native methods.
+    """
+    owners, verifier = [], None
+    try:
+        with _VERIFY_LOCK:
+            language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
+            native = getattr(sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier"),
+                             "Qwen3_5BatchInvariantForward", None)
+            call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
+            target = getattr(language, "_EXACT_SPECULATIVE_VERIFIER", None)
+            if (call is not None and native is not None
+                    and getattr(type(target), "_unsloth_verify_native", type(target)) is native
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and mx.metal.is_available()):
+                # qwen3_5_moe inherits the call; a shared module is yielded once per path.
+                found = {id(module): module for _, module in _fusion_modules(model, _modules)
+                         if getattr(type(module), "__call__", None) is call}
+                methods = [vars(native).get(name) for name in _VERIFY_METHODS]
+                patched = _exact_verify_class(native, *methods) if found else None
+                if patched is not None:
+                    target.__class__ = patched
+                    target._unsloth_verify_scopes = getattr(target, "_unsloth_verify_scopes", 0) + 1
+                    verifier = target
+                    for module in found.values():
+                        module._unsloth_verify_scopes = getattr(module, "_unsloth_verify_scopes", 0) + 1
+                        owners.append(module)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for owner in owners + ([verifier] if verifier is not None else []):
+                owner._unsloth_verify_scopes -= 1
+                if not owner._unsloth_verify_scopes:
+                    owner.__dict__.pop("_unsloth_verify_scopes", None)
+                    if owner is verifier:
+                        verifier.__class__ = type(verifier)._unsloth_verify_native

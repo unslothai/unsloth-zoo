@@ -2105,6 +2105,51 @@ def test_minicpmo_vision_dtype_adapter_is_scoped_and_fail_closed(monkeypatch):
     assert loader._minicpmo_vision_dtype_adapter(_test_minicpmo_legacy_vision) is _test_minicpmo_legacy_vision
 
 
+def test_qwen3_omni_audio_clips_are_encoded_one_at_a_time(monkeypatch):
+    """mlx-vlm 0.7.4 fills a second clip's positions from the first clip's chunks."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as loader
+
+    calls = []
+
+    def get_audio_features(self, input_features, feature_attention_mask=None,
+                           audio_feature_lengths=None):
+        calls.append((input_features.shape[0], feature_attention_mask.tolist()))
+        if input_features.shape[0] > 1:
+            return mx.zeros((5, 1))
+        return input_features[0].T[:int(audio_feature_lengths[0])]
+
+    per_clip = loader._encode_audio_clips_one_at_a_time(get_audio_features)
+    features = mx.array([[[1.0, 2.0, 3.0]], [[4.0, 5.0, 0.0]]])
+    mask, lengths = mx.array([[1, 1, 1], [1, 1, 0]]), mx.array([3, 2])
+    assert per_clip(None, features, mask, lengths).tolist() == [[1.0], [2.0], [3.0], [4.0], [5.0]]
+    assert calls == [(1, [[1, 1, 1]]), (1, [[1, 1, 0]])]
+    assert per_clip(None, features[1:], mask[1:], lengths[1:]).tolist() == [[4.0], [5.0]]
+
+    Thinker = type("Thinker", (), {"get_audio_features": get_audio_features})
+
+    class Model:
+        __module__ = "mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe"
+
+    package = "mlx_vlm.models.qwen3_omni_moe"
+    audio = types.SimpleNamespace(AudioModel=type("AudioModel", (), {"__call__": lambda self: None}))
+    monkeypatch.setitem(sys.modules, f"{package}.thinker", types.SimpleNamespace(Thinker=Thinker))
+    monkeypatch.setitem(sys.modules, f"{package}.audio", audio)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda name: Model if name == "qwen" else object)
+    source = {"text": "for i, length in enumerate(chunk_lens_after_cnn):"}
+    monkeypatch.setattr(loader, "_safe_getsource", lambda _: source["text"])
+    loader._ensure_qwen3_omni_audio_per_clip("qwen")  # a fixed tower is left alone
+    assert Thinker.get_audio_features is get_audio_features
+    source["text"] = "for i, length in enumerate(feature_lens_after_cnn):"
+    loader._ensure_qwen3_omni_audio_per_clip("other")
+    assert Thinker.get_audio_features is get_audio_features
+    loader._ensure_qwen3_omni_audio_per_clip("qwen")
+    repaired = Thinker.get_audio_features
+    assert repaired.__wrapped__ is get_audio_features
+    loader._ensure_qwen3_omni_audio_per_clip("qwen")
+    assert Thinker.get_audio_features is repaired
+
+
 def test_read_json_file_returns_empty_for_missing_or_malformed_files(tmp_path):
     import unsloth_zoo.mlx.loader as loader
 
