@@ -264,10 +264,9 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
         else:
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
-        # Chunk over experts (each chunk converted once): whole-stack expansion peaked at 3x the dequantized size.
+        # Chunk over experts: whole-stack expansion peaked at 3x the dequantized size.
         out = torch.empty((E, M, N), dtype=target_dtype, device=weight.device)
         per_expert = M * N * out.element_size()
-        # Two full-size temporaries live per chunk: weight[e0:e1].to(dtype) and s_expanded.
         step = max(1, _VECTORIZED_DEQUANT_CHUNK_BYTES // max(2 * per_expert, 1))
         for e0 in range(0, E, step):
             e1 = min(E, e0 + step)

@@ -109,8 +109,7 @@ def test_vectorized_block_dequant_peak_stays_near_the_result(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_real_device_full_expert_dequant_matches_reference():
-    # Unmocked: on this GPU, whichever path the guard picks must run and match the float32 reference.
-    # On pre-sm89 CUDA the Triton kernel cannot compile, so only the guard keeps this alive.
+    # Unmocked: whichever path the guard picks on this GPU must run and match the float32 reference.
     _fp8_module()
     w, s = _expert_stack()
     out = F._dequantize_full_expert_weights(w, s, torch.bfloat16)
@@ -120,7 +119,6 @@ def test_real_device_full_expert_dequant_matches_reference():
 
 
 def test_block_scaled_dequant_converts_each_expert_once(monkeypatch):
-    # The block-scaled branch converts chunk by chunk; a whole-stack conversion first would be wasted work.
     w, s = _block_scaled(4, 256, 256, "cpu")
     seen = []
     real_to = torch.Tensor.to
