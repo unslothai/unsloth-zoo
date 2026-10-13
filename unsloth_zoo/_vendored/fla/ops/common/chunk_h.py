@@ -11,7 +11,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_offsets
 from fla.ops.utils.op import exp2
-from fla.utils import autotune_cache_kwargs, check_shared_mem
+from fla.utils import LONG_INDEXING_THRESHOLD, autotune_cache_kwargs, check_shared_mem
 
 BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -351,7 +351,7 @@ def chunk_fwd_h(
         USE_GK=gk is not None,
         USE_GV=gv is not None,
         STATE_V_FIRST=state_v_first,
-        LONG_INDEXING=max(k.numel(), v.numel()) > 2**31,
+        LONG_INDEXING=max(k.numel(), v.numel()) > LONG_INDEXING_THRESHOLD,
     )
     return h, ht
 
@@ -420,6 +420,6 @@ def chunk_bwd_dh(
         USE_GK=gk is not None,
         USE_GV=gv is not None,
         STATE_V_FIRST=state_v_first,
-        LONG_INDEXING=max(q.numel(), do.numel()) > 2**31,
+        LONG_INDEXING=max(q.numel(), do.numel()) > LONG_INDEXING_THRESHOLD,
     )
     return dh, dh0

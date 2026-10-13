@@ -27,8 +27,22 @@ def test_chunk_h_launchers_pass_long_indexing():
     src = CHUNK_H.read_text()
     assert src.count("LONG_INDEXING: tl.constexpr = False,") == 2
     assert src.count("if LONG_INDEXING:\n        bos = bos.to(tl.int64)") == 2
-    assert "LONG_INDEXING=max(k.numel(), v.numel()) > 2**31," in src
-    assert "LONG_INDEXING=max(q.numel(), do.numel()) > 2**31," in src
+    assert "LONG_INDEXING=max(k.numel(), v.numel()) > LONG_INDEXING_THRESHOLD," in src
+    assert "LONG_INDEXING=max(q.numel(), do.numel()) > LONG_INDEXING_THRESHOLD," in src
+
+
+def test_every_long_indexing_launcher_uses_the_shared_threshold():
+    vendored = ZOO_ROOT / "unsloth_zoo" / "_vendored" / "fla"
+    config = (vendored / "utils" / "_config.py").read_text()
+    assert "\nLONG_INDEXING_THRESHOLD = 2**31\n" in config
+    assert "LONG_INDEXING_THRESHOLD," in (vendored / "utils" / "__init__.py").read_text()
+    sites = 0
+    for path in sorted(vendored.rglob("*.py")):
+        for line in path.read_text().splitlines():
+            if "LONG_INDEXING=" in line:
+                sites += 1
+                assert line.rstrip().endswith("> LONG_INDEXING_THRESHOLD,"), f"{path.name}: {line.strip()}"
+    assert sites >= 14, sites
 
 
 def _free_gib():
