@@ -1287,7 +1287,6 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         raise RuntimeError(f'Unsloth: Cannot find vllm_internal_model!')
 
     embed_tokens = vllm_text_model.embed_tokens
-    # Nemotron-H calls the HF embedding `embeddings`
     embed_name = "embeddings" if model_type == "nemotron_h" else "embed_tokens"
     get_state_dict(f"{vllm_text_model_prefix}.{embed_name}", 0, state_dict, embed_tokens, slice_weights=False)
 
@@ -1353,7 +1352,6 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             for name in ("in_proj", "out_proj", "conv"):
                 get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(layer.short_conv, name), slice_weights=False)
         elif hasattr(layer, "mixer"):
-            # Nemotron-H: every block is a `mixer` (Mamba-2, attention, MLP or MoE)
             extract_nemotron_h_mixer(
                 layer.mixer, f"{vllm_text_model_prefix}.layers.{kk}.mixer",
                 state_dict, quant_state_dict, get_state_dict, config = text_config,
@@ -1748,11 +1746,7 @@ pass
 
 
 def _native_config_for_vllm_rebuild(config):
-    """Native transformers config for a trust_remote_code Nemotron-H config.
-
-    vLLM's names are the native model's, and AutoModelForCausalLM.from_config builds the native
-    class from a remote NemotronHConfig, which then fails on the remote block names ("mamba").
-    """
+    """Native config for a trust_remote_code Nemotron-H: vLLM uses native names, and from_config on the remote config fails on its block names ("mamba")."""
     if getattr(config, "model_type", None) != "nemotron_h": return config
     if not str(type(config).__module__).startswith("transformers_modules"): return config
     try:

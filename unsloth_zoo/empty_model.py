@@ -842,7 +842,6 @@ def set_additional_modules(new_model, quant_state_dict, config):
         language_model_prefix = "model"
         language_model = new_model.model
 
-    # Nemotron-H calls the embedding `embeddings`
     embed_name = "embed_tokens" if hasattr(language_model, "embed_tokens") else "embeddings"
     embed_tokens_key = f"{language_model_prefix}.{embed_name}.weight"
     # Explicit None check: pad_token_id=0 is valid.
