@@ -27,7 +27,7 @@ VENDORED = ZOO_ROOT / "unsloth_zoo" / "_vendored" / "fla"
 def test_no_block_pointer_calls():
     hits = []
     for path in sorted(VENDORED.rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text())):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.Attribute) and node.attr in ("make_block_ptr", "advance"):
                 hits.append(f"{path.relative_to(VENDORED)}:{node.lineno} {node.attr}")
     assert not hits, hits
@@ -38,7 +38,7 @@ def test_autotune_keys_are_kernel_arguments():
     # made the whole vendored tree fail to inject (fla #1330 dropped the stale BT key).
     bad = []
     for path in sorted(VENDORED.rglob("*.py")):
-        for fn in ast.walk(ast.parse(path.read_text())):
+        for fn in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if not isinstance(fn, ast.FunctionDef):
                 continue
             args = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
