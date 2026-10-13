@@ -3395,6 +3395,26 @@ def _list_main_input_numel(value):
     return None
 
 
+def _cached_flops_per_token(trainer, original, model, main_input, inputs, value):
+    # Trainer calls floating_point_ops every step, and it walks every module and parameter
+    # (num_parameters) to count FLOPs for the total_flos statistic: 10-30 ms of host time per
+    # step on a 2B LoRA model. The count per token is fixed for one model, so take it from the
+    # first call and scale by the token count after. trainer.state is rebuilt by every train()
+    # call, so a later run (or a different model) measures again.
+    numel = value.numel()
+    state = getattr(trainer, "state", None)
+    cache = getattr(trainer, "_unsloth_flops_per_token", None)
+    if cache is not None and cache[0] is model and cache[1] is state and cache[2] == main_input:
+        return cache[3] * numel
+    flops = original(trainer, inputs)
+    if numel > 0 and isinstance(flops, int) and flops % numel == 0:
+        try:
+            trainer._unsloth_flops_per_token = (model, state, main_input, flops // numel)
+        except Exception:
+            pass
+    return flops
+
+
 def patch_trainer_flops_list_main_input():
     # Nemotron-3-Nano-Omni's main_input_name is pixel_values, a list of ragged tiles: Trainer's `.numel()` crashes.
     try:
@@ -3416,6 +3436,8 @@ def patch_trainer_flops_list_main_input():
             if numel is None:
                 return 0
             return 6 * numel * model.num_parameters(exclude_embeddings = True)
+        if isinstance(value, torch.Tensor):
+            return _cached_flops_per_token(self, original, model, main_input, inputs, value)
         return original(self, inputs)
 
     floating_point_ops._unsloth_list_main_input = True
