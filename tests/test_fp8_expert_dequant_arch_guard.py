@@ -128,7 +128,23 @@ def test_block_scaled_dequant_converts_each_expert_once(monkeypatch):
             seen.append(self.shape[0])
         return real_to(self, *args, **kwargs)
 
+    real_copy = torch.Tensor.copy_
+
+    def counting_copy(self, src, *args, **kwargs):
+        if src.dtype == torch.float8_e4m3fn:
+            seen.append(src.shape[0])
+        return real_copy(self, src, *args, **kwargs)
+
     monkeypatch.setattr(torch.Tensor, "to", counting_to)
+    monkeypatch.setattr(torch.Tensor, "copy_", counting_copy)
     F._dequantize_full_expert_weights_vectorized(w, s, torch.bfloat16)
     monkeypatch.undo()
     assert sum(seen) == 4, seen
+
+
+def test_block_dequant_accepts_scales_that_require_grad():
+    # FP8Experts holds its scales as Parameters; the dequant must run under autograd like main's mul_.
+    w, s = _block_scaled(3, 256, 256, "cpu")
+    out = F._dequantize_full_expert_weights_vectorized(w, torch.nn.Parameter(s), torch.bfloat16)
+    ref = w.to(torch.bfloat16) * s.to(torch.bfloat16).repeat_interleave(128, 1).repeat_interleave(128, 2)
+    torch.testing.assert_close(out.detach(), ref, rtol = 0, atol = 0)

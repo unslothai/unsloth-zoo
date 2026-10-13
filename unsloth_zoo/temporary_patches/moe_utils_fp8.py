@@ -278,7 +278,8 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
                 .repeat_interleave(bm, dim=1)[:, :M, :]
                 .repeat_interleave(bn, dim=2)[:, :, :N]
             )
-            torch.mul(weight[e0:e1].to(target_dtype), s_expanded, out=out[e0:e1])
+            # In place, not mul(out=): autograd rejects out= when the scale requires grad (FP8Experts parameters).
+            out[e0:e1].copy_(weight[e0:e1]).mul_(s_expanded)
         return out
 
     w = weight.to(target_dtype)
