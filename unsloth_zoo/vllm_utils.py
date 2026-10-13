@@ -4988,6 +4988,8 @@ def _prepare_merged_rollout_locked(model):
     if reason is None:
         if _merged_rollout_use_exact(targets):
             entries = ([(module, W, None) for _, module, W in targets], None)
+        elif any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
+            reason = "MoE expert LoRA folds only with the exact fold, which needs every folded weight on one CUDA device"
         else:
             entries, reason = _merged_rollout_host_copies(targets)
     if reason is not None:
@@ -5198,7 +5200,8 @@ def _merged_rollout_exact_target(ExactFoldTarget, module, W, adapter):
     """[E, N, K] view of W with per-expert A_e [R, K] and B_e [N, R].
 
     Dense: E = 1. PEFT target_parameters (ParamWrapper): A is [r * E, in] grouped by expert,
-    B is [out, r * E] interleaved (B.reshape(out, r, E)[:, :, e] is B_e), and W is
+    B is [out, r * E] rank-major (B.reshape(out, r, E)[:, :, e] is B_e) or, under
+    UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert, B.reshape(out, E, r)[:, e]; W is
     [E, out, in] when PEFT swapped its in / out features, else [E, in, out].
     """
     # All Unsloth Zoo code licensed under LGPLv3
@@ -5208,8 +5211,12 @@ def _merged_rollout_exact_target(ExactFoldTarget, module, W, adapter):
         return ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), module.scaling[adapter])
     E = W.shape[0]
     rank = A.shape[0] // E
+    from .temporary_patches.moe_utils import moe_lora_b_layout_for_wrapper, LORA_B_LAYOUT_RANK_MAJOR
     a = A.reshape(E, rank, A.shape[1])
-    b = B.reshape(B.shape[0], rank, E).permute(2, 0, 1)
+    if moe_lora_b_layout_for_wrapper(module, adapter) == LORA_B_LAYOUT_RANK_MAJOR:
+        b = B.reshape(B.shape[0], rank, E).permute(2, 0, 1)
+    else:
+        b = B.reshape(B.shape[0], E, rank).permute(1, 0, 2)
     w = W if getattr(module, "_did_swap_in_out_features", False) else W.transpose(1, 2)
     return ExactFoldTarget(w, a, b, module.scaling[adapter])
 pass

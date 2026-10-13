@@ -1372,13 +1372,14 @@ def _make_moe(transposed = False):
     return model, llm, vllm_model
 
 
-def _expert_oracle(module, W0):
+def _expert_oracle(module, W0, grouped = False):
     # PEFT's own per-expert delta formula, fp64, from the W-dtype-cast factors the fold uses.
     E = W0.shape[0]
     A = module.lora_A["default"].weight.to(W0.dtype).double()
     B = module.lora_B["default"].weight.to(W0.dtype).double()
     A = A.reshape(E, -1, A.shape[-1])
-    B = B.reshape(B.shape[0], -1, E)
+    # grouped_by_expert (UNSLOTH_MOE_LORA_B_LAYOUT): B_e is the e-th block of r columns.
+    B = B.reshape(B.shape[0], E, -1).permute(0, 2, 1) if grouped else B.reshape(B.shape[0], -1, E)
     # PEFT 0.18 has no swap flag: its param is always [E, in, out].
     eq = "o r e, e r i -> e o i" if getattr(module, "_did_swap_in_out_features", False) else "o r e, e r i -> e i o"
     delta = torch.einsum(eq.replace(" ", ""), B, A) * module.scaling["default"]
@@ -1386,8 +1387,11 @@ def _expert_oracle(module, W0):
 
 
 @_cuda
+@pytest.mark.parametrize("layout", ["rank_major", "grouped_by_expert"])
 @pytest.mark.parametrize("transposed", [False, True])
-def test_cuda_exact_folds_moe_experts(transposed):
+def test_cuda_exact_folds_moe_experts(transposed, layout, monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_utils
+    monkeypatch.setattr(moe_utils, "moe_lora_b_layout_for_wrapper", lambda wrapper, adapter_name = None: layout)
     model, llm, vllm_model = _make_moe(transposed)
     state = prepare_merged_rollout(model)
     assert state is not None, model._unsloth_merged_rollout_state.reason
@@ -1397,10 +1401,19 @@ def test_cuda_exact_folds_moe_experts(transposed):
     W0 = [W.detach().clone() for _, W in experts]
     with merged_rollout(state):
         for (m, W), w0 in zip(experts, W0):
-            want = _expert_oracle(m, w0)
+            want = _expert_oracle(m, w0, grouped = layout == "grouped_by_expert")
             assert (W.view(torch.int16).int() - want.view(torch.int16).int()).abs().max().item() <= 1
             assert not torch.equal(W, w0)
     _assert_bitwise(before, vllm_model)
+
+
+@_cuda
+def test_moe_experts_refused_when_exact_mode_is_off_for_the_targets(monkeypatch):
+    # e.g. folded weights on two devices: the copy fold is 2-D only, so experts stay on vLLM LoRA.
+    model, llm, vllm_model = _make_moe()
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_use_exact", lambda targets: False)
+    assert prepare_merged_rollout(model) is None
+    assert "exact fold" in model._unsloth_merged_rollout_state.reason
 
 
 @_cuda
