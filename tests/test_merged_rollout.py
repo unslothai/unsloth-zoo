@@ -945,7 +945,9 @@ def test_load_vllm_only_wraps_when_enabled():
         node for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.If) and "_merged_rollout_mode" in ast.unparse(node.test)
     ]
-    assert len(mode_guards) == 1 and ast.unparse(mode_guards[0].test).endswith("_merged_rollout_mode() == 'attention'")
+    assert len(mode_guards) == 1 and ast.unparse(mode_guards[0].test) == (
+        "enable_lora and (not use_async) and (_merged_rollout_mode() == 'attention')"
+    )
     assert [ast.unparse(t) for t in mode_guards[0].body] == ["engine_args['lora_target_modules'] = list(_MERGED_ROLLOUT_PUNICA_MODULES)"]
     assert source.count("_merged_rollout") == 3
 
