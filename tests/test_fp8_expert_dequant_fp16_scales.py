@@ -37,7 +37,9 @@ def _reference(q, s_broadcast, dtype):
 
 
 def _layouts(device, scale):
-    full = lambda *shape: torch.full(shape, scale, dtype = torch.float32, device = device)
+    def full(*shape):
+        return torch.full(shape, scale, dtype = torch.float32, device = device)
+
     return {
         "per_tensor": (full(1), lambda s: s.view(1, 1, 1)),
         "per_expert": (full(E, 1, 1), lambda s: s),
