@@ -891,10 +891,8 @@ def probe_int8_qmm():
                         assert error <= 0.05 * mx.abs(native).max().item(), (bits, group_size, M, error)
 
 
-# Sorted routed-expert `gather_qmm`, bit-identical to MLX's sorted NAX kernel: the same dequantization
-# and tensor ops in the same K order, on MLX's own NAX tile types. It differs in schedule only:
-# 64-row single-expert tiles, double-buffered weight tiles, empty row fragments skipped, a tile's
-# columns on one grid x coordinate. MAP reads row i from row `rmap[i]` of x.
+# Bit-identical to MLX's sorted NAX gather (same ops, same K order); only the schedule differs.
+# MAP reads row i from row `rmap[i]` of x.
 _SORTED_GATHER_BITS = (4, 8)
 _SORTED_GATHER_GROUP_SIZES = (32, 64, 128)
 _SORTED_GATHER_TILE = 64
@@ -1073,8 +1071,7 @@ def _sorted_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_ro
 _SORTED_GATHER_ROWS_BY_GPU = {17: {4: (4, 128), 8: (4, 128)}}
 # Below these rows per expert and per call MLX runs per-row kernels, which round differently.
 _SORTED_GATHER_STOCK_MIN_ROWS, _SORTED_GATHER_STOCK_MIN_CALL = 4, 16
-# Past this many rows the stock sorted kernel corrupts (ml-explore/mlx#3856) and the gather guard
-# drops `sorted_indices`, so the first-use check of a shape would not cover longer calls.
+# Past this the stock reference drops `sorted_indices` (ml-explore/mlx#3856): first-use checks would not cover it.
 _SORTED_GATHER_MAX_CALL = 32768
 
 
