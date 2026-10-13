@@ -31,6 +31,7 @@ Protocol (matches diffusion-gemma-visual-server.cpp):
   'QUIT' exits.
 """
 import ctypes
+import io
 import json
 import os
 import shutil
@@ -259,6 +260,8 @@ class VisualServer:
         self.p = subprocess.Popen([self.server_bin, self.gguf], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   env=self.env, bufsize=1, text=True,
                                   preexec_fn=_set_pdeathsig if os.name == "posix" else None)
+        # Only stdout is UTF-8: the server fopen()s the stdin request path, which is ANSI on Windows.
+        self.p.stdout = io.TextIOWrapper(self.p.stdout.detach(), encoding="utf-8")
         line = self.p.stdout.readline().strip()
         if not line.startswith("READY"):
             raise RuntimeError(f"visual server failed to start: {line!r}")

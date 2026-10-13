@@ -20,6 +20,7 @@ except Exception:
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason = "Requires Metal")
 
 MODEL = "mlx-community/Qwen3.5-0.8B-bf16"
+QUANTIZED = "mlx-community/Qwen3.5-0.8B-4bit"
 MTP_MODEL = "Qwen/Qwen3.5-0.8B"
 GEMMA, GEMMA_ASSISTANT = "mlx-community/gemma-4-e4b-it-bf16", "mlx-community/gemma-4-E4B-it-assistant-bf16"
 CODE = (
@@ -49,6 +50,15 @@ def qwen():
 @pytest.fixture(scope = "module")
 def qwen_mtp():
     return _load(MTP_MODEL)
+
+
+@pytest.fixture(scope = "module")
+def qwen_4bit():
+    from mlx_vlm.models.cache import make_prompt_cache
+    model, ids = _load(QUANTIZED)
+    cache = make_prompt_cache(model.language_model)
+    mx.eval(model.language_model(mx.array([ids[0][:24]]), cache = cache).logits)
+    return model, ids, cache
 
 
 @pytest.fixture(scope = "module")
@@ -211,16 +221,250 @@ def test_verify_that_replaces_caches_is_refused_and_decoding_continues(qwen):
     assert out == _solo(model, ids[0], 48, SamplingParams())
 
 
-def test_mtp_rounds_match_solo_decoding(qwen_mtp):
+def _clone(cache):
+    import copy
+    from mlx.utils import tree_map
+    copies = [copy.copy(entry) for entry in cache]
+    for entry in copies:
+        entry.__dict__.update(tree_map(lambda leaf: mx.array(leaf) if isinstance(leaf, mx.array) else leaf, vars(entry)))
+    return copies
+
+
+def _state(out, cache):
+    """Output tensors, then every cache entry's state and bookkeeping."""
+    from mlx.utils import tree_flatten
+    found = tree_flatten((out.logits, out.hidden_states))
+    for i, entry in enumerate(cache):
+        found += [(f"{i}.{key}", leaf) for key, leaf in tree_flatten(entry.state)]
+        found += [(f"{i}.{name}", getattr(entry, name, None)) for name in ("meta_state", "lengths", "left_padding")]
+    return found
+
+
+def _same(a, b):
+    return [key for key, _ in a] == [key for key, _ in b] and all(
+        (x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item())
+        if isinstance(x, mx.array) else x == y for (_, x), (_, y) in zip(a, b))
+
+
+def _captured(lm):
+    return dict(capture_layer_ids = [0, len(lm.layers) // 2], return_hidden = True, rope_deltas = mx.array([[3]]))
+
+
+def _verified(lm, cache, block, keep):
+    """A verify block on a copy of `cache`, aborted or committed at `keep` rows."""
+    run = _clone(cache)
+    out = lm(block, cache = run, speculative_verify = True, **_captured(lm))
+    out.gdn_states.commit(keep) if keep else out.gdn_states.abort()
+    return _state(out, run)
+
+
+def _serving(monkeypatch):
+    """Keys whose replacement ran, in order."""
+    from unsloth_zoo.mlx import inference
+    served, admitted = [], inference._verify_admitted
+    monkeypatch.setattr(inference, "_verify_admitted", lambda key, native, fused: admitted(key, native, lambda: served.append(key) or fused()))
+    inference._VERIFY_VERDICTS.clear()
+    return served
+
+
+def test_verify_admission_serves_a_key_only_after_its_first_block_matched_bit_for_bit(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
+    admit, (a, b) = inference._verify_admitted, (mx.ones((1, 2), dtype = mx.float16) for _ in range(2))
+    zero, minus = mx.array([0.0], dtype = mx.float16), mx.array([-0.0], dtype = mx.float16)
+    assert admit("one", lambda: a, lambda: b) is a and admit("one", lambda: a, lambda: b) is b
+    assert admit("pair", lambda: (a, zero), lambda: (b, zero))[0] is a and admit("pair", lambda: (a, zero), lambda: (b, zero))[0] is b
+    # The second output differs in its sign bit only.
+    assert all(admit("signed", lambda: (a, zero), lambda: (b, minus))[0] is a for _ in range(2))
+    assert admit("refused", lambda: a, lambda: None) is a and admit("one", lambda: a, lambda: None) is a
+    assert inference._VERIFY_VERDICTS == {"one": True, "pair": True, "signed": False}
+
+
+def test_wide_verify_blocks_are_cut_into_balanced_slices_within_the_fused_bound(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference
+    monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
+    monkeypatch.setattr(inference._VERIFY_STATE, "serving", True, raising = False)
+    linears, widths = (nn.QuantizedLinear(64, 8, bias = False),) * 2, []
+
+    def cut(width, eligible = True):
+        x = mx.arange(2 * width * 4).reshape(2, width, 4).astype(mx.float16)
+        widths.clear()
+        for _ in range(2):
+            out = inference._verify_sliced(lambda rows: widths.append(rows.shape[1]) or (rows, rows * 2), linears, x, lambda linear, rows: eligible)
+        assert mx.array_equal(out[0], x).item() and mx.array_equal(out[1], x * 2).item()
+        return list(widths)
+    assert cut(17) == [17, 6, 6, 5, 6, 6, 5] and cut(9) == [9, 5, 4, 5, 4] and cut(16) == [16, 8, 8, 8, 8]
+    assert cut(8) == [8, 8] and cut(17, eligible = False) == [17, 17]
+
+
+@pytest.mark.parametrize("width", [9, 17])
+def test_wide_verify_blocks_in_slices_match_the_native_verifier(qwen_4bit, monkeypatch, width):
+    from unsloth_zoo.mlx import inference
+    (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)
+    lm, block = model.language_model, mx.array([ids[0][24 : 24 + width]])
+    first = -(-width // -(-width // 8))
+    native = {keep: _verified(lm, cache, block, keep) for keep in (0, 1, first, first + 1, width)}
+    with inference.exact_speculative_verify(model):
+        assert _same(native[0], _verified(lm, cache, block, 0))
+        verdicts = [verdict for key, verdict in inference._VERIFY_VERDICTS.items() if key[0] == (1, width)]
+        assert verdicts and all(verdicts) and not served.clear()
+        assert all(_same(expected, _verified(lm, cache, block, keep)) for keep, expected in native.items())
+    assert len(served) >= len(native) * len(verdicts)
+
+
+def test_a_sliced_verify_block_matches_one_token_decode_steps(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)
+    lm, block = model.language_model, mx.array([ids[0][24:39]])
+    steps, snapshots, decoded = _clone(cache), {0: cache}, []
+    for t in range(block.shape[1]):
+        decoded.append(lm(block[:, t : t + 1], cache = steps, **_captured(lm)))
+        if t + 1 in (1, 8, 15):
+            snapshots[t + 1] = _clone(steps)
+    stepped = SimpleNamespace(logits = mx.concatenate([out.logits for out in decoded], axis = 1), hidden_states = [mx.concatenate(parts, axis = 1) for parts in zip(*(out.hidden_states for out in decoded))])
+    with inference.exact_speculative_verify(model):
+        _verified(lm, cache, block, 0)
+        assert not served.clear() and all(_same(_state(stepped, entries), _verified(lm, cache, block, keep)) for keep, entries in snapshots.items())
+    assert served
+
+
+def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(qwen_4bit, monkeypatch):
+    import copy
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5 import language, speculative_verifier
+    from mlx_vlm.speculative.ops import linear as linear_ops
+    from unsloth_zoo.mlx import inference
+    (model, ids, cache), verdicts = qwen_4bit, inference._VERIFY_VERDICTS
+    lm, verifier, native = model.language_model, language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
+    unscoped, block = copy.copy(lm), mx.array([ids[0][24:36]])
+    quantized = [module for _, module in lm.named_modules() if isinstance(module, nn.QuantizedLinear)]
+    verdicts.clear()
+    with inference.exact_speculative_verify(model):
+        with pytest.raises(ZeroDivisionError), inference.exact_speculative_verify(model):
+            assert type(verifier) is not native and (lm._unsloth_verify_scopes, verifier._unsloth_verify_scopes) == (2, 2)
+            1 / 0
+        assert type(verifier) is not native and lm._unsloth_verify_scopes == 1
+        layer, pending = lm.model.layers[0], [block[:, :11]]
+        norm = layer.input_layernorm
+
+        def nested(x):
+            if pending:
+                _verified(unscoped, cache, pending.pop(), 0)
+            return norm(x)
+        with monkeypatch.context() as patch:
+            # An unscoped model's verify call made inside a served one stays native, and the served one goes on.
+            patch.setattr(layer, "input_layernorm", nested)
+            assert _verified(lm, cache, block, 0) and {key[0][1] for key in verdicts} == {12} and not verdicts.clear()
+        # Native: an unscoped model, a block inside mlx-vlm's fused bound, training, thawed projections, a drifted binding.
+        _verified(unscoped, cache, block, 0)
+        _verified(lm, cache, block[:, :8], 0)
+        assert lm.train() and _verified(lm, cache, block, 0) and lm.eval()
+        assert [module.unfreeze() for module in quantized] and _verified(lm, cache, block, 0) and [module.freeze() for module in quantized]
+        with monkeypatch.context() as patch:
+            patch.setattr(linear_ops, "_target_verify_quantized_linear", lambda linear, x: None)
+            _verified(lm, cache, block, 0)
+        assert not verdicts and _verified(lm, cache, block, 0) and verdicts
+    assert type(verifier) is native and not any("_unsloth_verify_scopes" in vars(owner) for owner in (verifier, lm))
+    with monkeypatch.context() as patch:
+        patch.setattr(model, "_unsloth_mlx_distributed_parallel_mode", True, raising = False)
+        with inference.exact_speculative_verify(model):
+            assert type(verifier) is native
+    for name in ("_linears", "_layer", "_feed_forward"):
+        with monkeypatch.context() as patch:
+            patch.setattr(native, name, lambda self, *args: None)
+            with inference.exact_speculative_verify(model):
+                assert type(verifier) is native
+
+
+def _submissions(monkeypatch):
+    submitted, submit = [], mx.async_eval
+    monkeypatch.setattr(mx, "async_eval", lambda *arrays: (submit(*arrays), submitted.append(arrays))[0])
+    return submitted
+
+
+def test_a_served_verify_call_submits_each_layer_as_it_is_built(qwen_4bit, monkeypatch):
+    import copy
+    from unsloth_zoo.mlx import inference
+    model, ids, cache = qwen_4bit
+    lm, block = model.language_model, mx.array([ids[0][24:29]])
+    unscoped, native = copy.copy(lm), {keep: _verified(lm, cache, block, keep) for keep in (0, 3)}
+    submitted = _submissions(monkeypatch)
+    with inference.exact_speculative_verify(model):
+        assert _verified(unscoped, cache, block, 0) and not submitted
+        assert all(_same(expected, _verified(lm, cache, block, keep)) for keep, expected in native.items())
+        assert len(submitted) == 2 * len(lm.model.layers) and not submitted.clear()
+        # Each submission is that layer's own output: the captured layers sit at their own positions.
+        out = lm(block, cache = _clone(cache), speculative_verify = True, **_captured(lm))
+        assert [index for index, (layer,) in enumerate(submitted) if any(layer is hidden for hidden in out.hidden_states)] == _captured(lm)["capture_layer_ids"]
+        # A function transformation cannot evaluate: the layers are built and nothing is submitted.
+        assert mx.compile(lambda x: lm(x, cache = _clone(cache), speculative_verify = True).logits)(block).shape[1] == 5
+    assert len(submitted) == len(lm.model.layers)
+
+
+def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ragged_rounds(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx import inference
     from unsloth_zoo.mlx.generate import SamplingParams
-    from unsloth_zoo.mlx.speculative import DraftController
+    (model, ids, _), served = qwen_4bit, _serving(monkeypatch)
+    ban = lambda history, logits: logits + mx.where(mx.arange(logits.shape[-1]) == 13, -1e9, 0)
+
+    def run():
+        scores = []
+        def scored(engine):
+            engine.logprobs, step = True, engine.step
+            engine.step = lambda *args: (scores.append(out.logprobs) or out for out in step(*args))
+        out, drafted, _ = _run(model, [ids[0], ids[1], ids[0]], 96, _script(("copy", 16)), SamplingParams(), processors = {2: [ban]}, patch = scored)
+        return out, scores, drafted
+    closed, scores, drafted = run()
+    inference._VERIFY_VERDICTS.clear()
+    with inference.exact_speculative_verify(model):
+        opened = run()
+    assert opened[:2] == (closed, scores) and any(scores) and drafted[0][1] > 8 and len({accepted for _, accepted in drafted.values()}) > 1
+    wide = [key for key, verdict in inference._VERIFY_VERDICTS.items() if key[0][0] == 3 and key[0][1] > 8 and verdict]
+    # Each admitted key's replacement ran once for the comparison, then again for every later round it served.
+    assert any(served.count(key) > 1 for key in wide)
+
+
+def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.inference import exact_speculative_verify
+    from unsloth_zoo.mlx.speculative import DraftController, _ShortlistHead, tree_flatten
     model, ids = qwen_mtp
     greedy = SamplingParams()
     solo = [_solo(model, prompt, 96, greedy) for prompt in ids]
+    submitted = _submissions(monkeypatch)
     out, drafted, _ = _run(model, ids, 96, _script(("draft", 3), ("copy", 4)), greedy, drafter = _drafter(model))
     assert out == solo and all(accepted >= 0.6 * count for count, accepted in drafted.values())
+    unscoped = len(submitted)
+    with exact_speculative_verify(model):
+        assert _run(model, ids, 96, _script(("draft", 3), ("copy", 4)), greedy, drafter = _drafter(model))[0] == solo
+    assert len(submitted) > 2 * unscoped + len(model.language_model.model.layers)
+    picked, pick = [], _ShortlistHead.__call__
+    monkeypatch.setattr(_ShortlistHead, "__call__", lambda self, hidden: picked.append(self._source is self.table.weight) or pick(self, hidden))
     (out,), drafted, _ = _run(model, ids[:1], 96, DraftController(max_depth = 4, max_copy = 16), greedy, drafter = _drafter(model))
-    assert out == solo[0] and drafted[0][1] > 0
+    assert out == solo[0] and drafted[0][1] > 0 and picked and all(picked)
+    built = _drafter(model)
+    assert built.weight_bytes == sum(a.nbytes for _, a in tree_flatten(built.model.parameters())) + built._shortlist.nbytes
+
+
+def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(monkeypatch):
+    from unsloth_zoo.mlx import speculative
+    [monkeypatch.setattr(speculative, name, value) for name, value in (("_SHORTLIST_CHUNK", 100), ("_SHORTLIST_KEEP", 8), ("_SHORTLIST_COLUMNS", 128))]
+    nn, _, hidden = speculative.nn, mx.random.seed(0), mx.random.normal((6, 1, 192))
+    dense, narrow, packed = nn.Linear(192, 512, bias = False), nn.Linear(96, 512, bias = False), lambda linear: nn.QuantizedLinear.from_linear(linear, group_size = 32, bits = 8)
+    lm = lambda table, tied: SimpleNamespace(args = SimpleNamespace(tie_word_embeddings = tied), lm_head = None if tied else table, model = SimpleNamespace(embed_tokens = table if tied else None))
+    for tied, (group, table) in enumerate(((64, dense), (32, packed(dense)))):
+        (head := speculative._ShortlistHead.of(lm(table, bool(tied)))).prepare()
+        table.update({name: table[name][::-1] for name in ("weight", "scales", "biases") if name in table})
+        head.prepare()
+        rows = mx.dequantize(table.weight, table.scales, table.biases, group, 8) if tied else table.weight
+        scan = mx.quantize(rows[:, :128], 64, 2)
+        assert all(mx.array_equal(a, b) for a, b in zip(head._scan, scan)) and head.nbytes == sum(a.nbytes for a in scan)
+        coarse, logits = mx.quantized_matmul(hidden[..., :128], *scan, True, 64, 2), hidden @ rows.T
+        few = mx.argsort(-coarse, axis = -1)[..., :8]
+        best = mx.take_along_axis(few, mx.argmax(mx.take_along_axis(logits, few, axis = -1), axis = -1, keepdims = True), axis = -1)
+        assert head(hidden).tolist() == best.squeeze(-1).tolist() != mx.argmax(coarse, axis = -1).tolist()
+    assert (small := speculative._ShortlistHead.of(lm(nn.Linear(64, 512, bias = False), False))).prepare() is None and small.nbytes == sum(a.nbytes for a in small._scan) and speculative._ShortlistHead.of(lm(packed(dense), False)).nbytes == speculative._ShortlistHead.of(lm(dense, False)).nbytes and all(speculative._ShortlistHead.of(lm(uncovered, False)) is None for uncovered in (nn.Linear(192, 512), narrow, packed(narrow), nn.Linear(192, 8, bias = False), nn.QuantizedLinear(192, 512, bias = False, bits = 2)))
 
 
 @pytest.mark.parametrize("max_lag", [128, 4])

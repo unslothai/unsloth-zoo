@@ -396,3 +396,60 @@ def test_folder_keyword_still_loads(tmp_path):
     # Callers written against the Laya-only loader pass the checkpoint as folder=.
     with pytest.raises(ValueError, match = "not a decision model"):
         load_decision_model(folder = tmp_path)
+
+
+def test_records_without_encoded_clips_do_not_need_pyav(monkeypatch):
+    import sys
+
+    # As if PyAV were not installed: image-only and already decoded clips are read without it.
+    monkeypatch.setitem(sys.modules, "av", None)
+    clip = {"array": np.zeros(1600, np.float32), "sampling_rate": 16000}
+    assert decision._decode_audio([]) == [] and decision._clips(()) == []
+    assert [samples.shape for samples in decision._clips([clip])] == [(1600,)]
+    with pytest.raises(DecisionUnsupportedError, match = "PyAV"):
+        decision._clips(["data:audio/wav;base64,AAAA"])
+
+
+def test_an_adapter_on_two_towers_of_the_same_layer_numbers_is_refused(tmp_path):
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    pytest.importorskip("mlx_lm")
+
+    # A decoder under `language_model.model.layers`, as the vision-language wrappers hold it.
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    model.language_model.model.layers = [nn.Linear(4, 4)]
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 2}))
+    pair = {"lora_A.weight": mx.zeros((2, 4)), "lora_B.weight": mx.zeros((4, 2))}
+    decoder, audio = "base_model.model.thinker.model.layers.0.self_attn.q_proj", "base_model.model.thinker.audio_tower.layers.0.self_attn.q_proj"
+    # Together they collapse into one key; alone the tower's would land on the decoder's layer of its number. MiniCPM
+    # names its towers `vpm` and `apm`, which say nothing of what they read.
+    towers = (
+        (decoder, audio), (audio,), ("base_model.model.thinker.talker.model.layers.1.mlp.up_proj",), ("base_model.model.multi_modal_projector.linear_1",),
+        ("base_model.model.apm.encoder.layers.0.self_attn.q_proj",), ("base_model.model.vpm.encoder.layers.0.mlp.fc1",),
+    )
+    for stems in towers:
+        mx.save_safetensors(str(tmp_path / "adapter_model.safetensors"), {f"{stem}.{name}": value for stem in stems for name, value in pair.items()})
+        with pytest.raises(ValueError, match = "tower besides the decoder"):
+            decision._attach_lora(model, tmp_path)
+    kept = (decoder, "base_model.model.model.language_model.layers.3.mlp.down_proj", "base_model.model.llm.model.layers.2.self_attn.o_proj", "language_model.model.layers.0")
+    assert not any(decision._off_decoder(stem, {"model"}) for stem in kept)
+
+
+def test_decoded_clips_share_the_audio_duration_budget(monkeypatch):
+    monkeypatch.setattr(decision, "_MAX_AUDIO_SECONDS", 1)
+    clip = {"array": np.zeros(12000, np.float32), "sampling_rate": 16000}
+    assert len(decision._clips([clip])) == 1
+    with pytest.raises(DecisionRequestError, match = "longer than 1 seconds"):
+        decision._clips([clip, clip])
+
+
+def test_minicpm_decoder_weights_map_back_to_its_llm_namespace():
+    wrapper = {"language_model": None}
+    path = "language_model.model.layers.0.self_attn.q_proj.weight"
+    # A checkpoint that keeps the causal LM under `llm.`, as MiniCPM-o's does; others keep the vision-language names.
+    assert decision._decoder_tensor_name(wrapper, path, {"llm.model.layers.0.self_attn.q_proj.weight"}) == "llm.model.layers.0.self_attn.q_proj.weight"
+    assert decision._decoder_tensor_name(wrapper, "language_model.lm_head.weight", {"llm.lm_head.weight"}) == "llm.lm_head.weight"
+    assert decision._decoder_tensor_name(wrapper, path, {"model.language_model.layers.0.self_attn.q_proj.weight"}) == "model.language_model.layers.0.self_attn.q_proj.weight"
+    assert decision._decoder_tensor_name(wrapper, path) == "model.language_model.layers.0.self_attn.q_proj.weight"
