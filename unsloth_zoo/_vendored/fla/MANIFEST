@@ -162,7 +162,10 @@ modifications =
       i_t_int64 rather than retyping the loop variable, which torch 2.7 /
       triton 3.3 rejects) and the #1082 o_t lines in
       modules/conv/triton/kernels.py. Without them one sequence longer than
-      2**31 / (heads * head_dim) tokens hit an illegal memory access.
+      2**31 / (heads * head_dim) tokens hit an illegal memory access. Also
+      fla PR #1330 in ops/cp/chunk_delta_h.py: merge_fwd_bwd_kernel's autotune
+      key named BT, which is not a kernel argument; triton main rejects that at
+      import, which made the whole vendored tree fail to inject.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files

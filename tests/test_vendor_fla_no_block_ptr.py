@@ -33,6 +33,28 @@ def test_no_block_pointer_calls():
     assert not hits, hits
 
 
+def test_autotune_keys_are_kernel_arguments():
+    # triton main rejects an autotune key that is not a kernel argument at import, which
+    # made the whole vendored tree fail to inject (fla #1330 dropped the stale BT key).
+    bad = []
+    for path in sorted(VENDORED.rglob("*.py")):
+        for fn in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            args = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+            for deco in fn.decorator_list:
+                if not isinstance(deco, ast.Call):
+                    continue
+                for kw in deco.keywords:
+                    if kw.arg == "key" and isinstance(kw.value, ast.List):
+                        bad += [
+                            f"{path.relative_to(VENDORED)}:{deco.lineno} {fn.name} {e.value!r}"
+                            for e in kw.value.elts
+                            if isinstance(e, ast.Constant) and e.value not in args
+                        ]
+    assert not bad, bad
+
+
 def _free_gib():
     try:
         import torch
