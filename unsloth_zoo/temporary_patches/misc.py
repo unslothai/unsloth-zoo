@@ -3395,6 +3395,42 @@ def _list_main_input_numel(value):
     return None
 
 
+def _stock_flops_owner(trainer, model, delegates):
+    # Whose num_parameters the stock 6 * tokens * num_parameters uses; None if 4.x's model.floating_point_ops is overridden.
+    if not delegates:
+        return model if hasattr(model, "num_parameters") else None
+    try:
+        from transformers.modeling_utils import ModuleUtilsMixin
+    except Exception:
+        return None
+    flops = getattr(model, "floating_point_ops", None)
+    owner = getattr(flops, "__self__", None)
+    if getattr(flops, "__func__", None) is not ModuleUtilsMixin.floating_point_ops or owner is None:
+        return None
+    tokens = getattr(owner, "estimate_tokens", None)
+    if getattr(tokens, "__func__", None) is not ModuleUtilsMixin.estimate_tokens:
+        return None
+    return owner
+
+
+def _cached_flops(trainer, original, delegates, model, inputs):
+    # num_parameters walks the whole model every step: count once per train() (each rebuilds trainer.state).
+    owner = _stock_flops_owner(trainer, model, delegates)
+    main_input = getattr(owner, "main_input_name", None)
+    value = inputs.get(main_input, None) if owner is not None and hasattr(inputs, "get") else None
+    if not isinstance(value, torch.Tensor):
+        return original(trainer, inputs)
+    state = getattr(trainer, "state", None)
+    cache = getattr(trainer, "_unsloth_flops_params", None)
+    if cache is None or cache[0] is not owner or cache[1] is not state:
+        cache = (owner, state, owner.num_parameters(exclude_embeddings = True))
+        try:
+            trainer._unsloth_flops_params = cache
+        except Exception:
+            pass
+    return 6 * value.numel() * cache[2]
+
+
 def patch_trainer_flops_list_main_input():
     # Nemotron-3-Nano-Omni's main_input_name is pixel_values, a list of ragged tiles: Trainer's `.numel()` crashes.
     try:
@@ -3404,6 +3440,10 @@ def patch_trainer_flops_list_main_input():
     original = Trainer.__dict__.get("floating_point_ops")
     if original is None or getattr(original, "_unsloth_list_main_input", False):
         return
+    try:
+        delegates = "model.floating_point_ops" in inspect.getsource(original)
+    except Exception:
+        delegates = True
 
     @functools.wraps(original)
     def floating_point_ops(self, inputs):
@@ -3416,6 +3456,8 @@ def patch_trainer_flops_list_main_input():
             if numel is None:
                 return 0
             return 6 * numel * model.num_parameters(exclude_embeddings = True)
+        if isinstance(value, torch.Tensor):
+            return _cached_flops(self, original, delegates, model, inputs)
         return original(self, inputs)
 
     floating_point_ops._unsloth_list_main_input = True
