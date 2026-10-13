@@ -148,6 +148,30 @@ modifications =
       gradients (KDA: non-finite). Offsets inside one sequence are unchanged:
       a single KDA sequence past 2**31 / (heads * 128) tokens still indexes
       in-chunk raw pointers in int32, as in 0.5.1.
+    - Block pointers removed (fla PR #1062, after 0.5.1): triton main deleted
+      tl.make_block_ptr / tl.advance (triton-lang/triton#10833; both raise
+      NotImplementedError), so every kernel in the 19 files that used them
+      (modules/{fused_norm_gate,l2norm}.py, modules/conv/triton/kernels.py,
+      ops/common/{chunk_delta_h,chunk_h,chunk_o}.py, ops/cp/chunk_delta_h.py,
+      ops/gated_delta_rule/{chunk_fwd,gate,wy_fast}.py, ops/gla/chunk.py,
+      ops/kda/{chunk_bwd,chunk_intra,chunk_intra_token_parallel,gate,wy_fast}.py,
+      ops/utils/{cumsum,pooling,solve_tril}.py) loads and stores through plain
+      pointer arithmetic with explicit masks instead. #1062 was applied as a
+      three-way merge (base fla 7e46dffc, theirs fla 02e27033) so every
+      Unsloth change above stays in place. Plain pointers compile on every
+      triton, old and new. Block pointers computed offsets in int64, so the
+      loop-derived in-chunk offsets are kept int64 as upstream did afterwards:
+      fla PRs #1173 / #1188 in ops/common/{chunk_delta_h,chunk_h}.py (a fresh
+      i_t_int64 rather than retyping the loop variable, which torch 2.7 /
+      triton 3.3 rejects) and the #1082 o_t lines in
+      modules/conv/triton/kernels.py, plus the same widening of the loop-derived
+      o_t / last_idx in ops/cp/chunk_delta_h.py and of o_t in the
+      chunk_global_cumsum kernels of ops/utils/cumsum.py (neither fixed
+      upstream; bitwise neutral at normal sizes). Without them one sequence longer than
+      2**31 / (heads * head_dim) tokens hit an illegal memory access. Also
+      fla PR #1330 in ops/cp/chunk_delta_h.py: merge_fwd_bwd_kernel's autotune
+      key named BT, which is not a kernel argument; triton main rejects that at
+      import, which made the whole vendored tree fail to inject.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
