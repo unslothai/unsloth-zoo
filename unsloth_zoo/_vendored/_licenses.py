@@ -247,7 +247,10 @@ modifications =
       fla PRs #1173 / #1188 in ops/common/{chunk_delta_h,chunk_h}.py (a fresh
       i_t_int64 rather than retyping the loop variable, which torch 2.7 /
       triton 3.3 rejects) and the #1082 o_t lines in
-      modules/conv/triton/kernels.py. Without them one sequence longer than
+      modules/conv/triton/kernels.py, plus the same widening of the loop-derived
+      o_t / last_idx in ops/cp/chunk_delta_h.py (not fixed upstream; the
+      context-parallel kernels are not on a single-GPU path, and the change is
+      bitwise neutral at normal sizes). Without them one sequence longer than
       2**31 / (heads * head_dim) tokens hit an illegal memory access. Also
       fla PR #1330 in ops/cp/chunk_delta_h.py: merge_fwd_bwd_kernel's autotune
       key named BT, which is not a kernel argument; triton main rejects that at

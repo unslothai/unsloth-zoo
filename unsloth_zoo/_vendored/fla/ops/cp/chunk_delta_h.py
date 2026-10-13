@@ -130,7 +130,7 @@ def pre_process_fwd_kernel_merged(
 
         # Main recurrence for h
         for i_t in range(NT):
-            o_t = i_t * BT + tl.arange(0, BT)
+            o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
             m_t = o_t < T
             # Compute decayed v
             p_w = w + o_t[:, None] * stride_w + o_k1[None, :]
@@ -159,7 +159,7 @@ def pre_process_fwd_kernel_merged(
                 # GDN/KDA mode: v_new = v - w @ h
                 b_v = tl.load(p_v, mask=m_t[:, None] & m_vb[None, :], other=0.0) - b_v_decay
 
-            last_idx = min((i_t + 1) * BT, T) - 1
+            last_idx = min((i_t.to(tl.int64) + 1) * BT, T) - 1
 
             # Apply g decay
             if USE_G:
@@ -269,7 +269,7 @@ def pre_process_fwd_kernel_merged(
         b_m = tl.where(row[:, None] == col[None, :], 1.0, 0.0)
 
         for i_t in range(NT):
-            o_t = i_t * BT + tl.arange(0, BT)
+            o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
             m_t = o_t < T
             # Load k and w with full BK1 rows
             if USE_BG:
@@ -282,7 +282,7 @@ def pre_process_fwd_kernel_merged(
             p_w = w + o_t[:, None] * stride_w + row[None, :]
             b_w = tl.load(p_w, mask=m_t[:, None] & (row < K)[None, :], other=0.0)
 
-            last_idx = min((i_t + 1) * BT, T) - 1
+            last_idx = min((i_t.to(tl.int64) + 1) * BT, T) - 1
 
             if USE_G:
                 b_g_last = tl.load(g + last_idx * HV).to(tl.float32)
@@ -568,8 +568,8 @@ def pre_process_bwd_kernel_merged(
 
         # Main recurrence for dh (reverse order)
         for i_t in range(NT - 1, -1, -1):
-            last_idx = min((i_t + 1) * BT, T) - 1
-            o_t = i_t * BT + tl.arange(0, BT)
+            last_idx = min((i_t.to(tl.int64) + 1) * BT, T) - 1
+            o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
             m_t = o_t < T
 
             if USE_G:
@@ -706,7 +706,7 @@ def pre_process_bwd_kernel_merged(
         for _i_t in range(NT):
             # Reverse order for backward
             i_t = NT - 1 - _i_t
-            o_t = i_t * BT + tl.arange(0, BT)
+            o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
             m_t = o_t < T
 
             # Load k and w with full BK1 rows
@@ -715,7 +715,7 @@ def pre_process_bwd_kernel_merged(
             p_w = w + o_t[:, None] * stride_w + row[None, :]
             b_w = tl.load(p_w, mask=m_t[:, None] & (row < K)[None, :], other=0.0)
 
-            last_idx = min((i_t + 1) * BT, T) - 1
+            last_idx = min((i_t.to(tl.int64) + 1) * BT, T) - 1
 
             if USE_G:
                 b_g_last = tl.load(g + last_idx * HV).to(tl.float32)
