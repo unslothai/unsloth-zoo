@@ -31,13 +31,19 @@ def _linear(weight, output_sizes = None, bias = None):
     return module
 
 
+def _pad_vocab(weight, multiple = 64):
+    # vLLM pads embed_tokens / lm_head rows to a multiple of 64 even at TP = 1
+    rows = -(-weight.shape[0] // multiple) * multiple
+    return torch.cat([weight, weight.new_zeros(rows - weight.shape[0], *weight.shape[1:])])
+
+
 def _vllm_nemotron_h_from_hf(hf, backend = "TRITON"):
     """Mirrors vllm/model_executor/models/nemotron_h.py and mamba_mixer2.py at TP = 1."""
     sd = hf.state_dict()
     config = hf.config
     root = torch.nn.Module()
     model = torch.nn.Module()
-    model.embed_tokens = _linear(sd["model.embeddings.weight"])
+    model.embed_tokens = _linear(_pad_vocab(sd["model.embeddings.weight"]))
     model.norm_f = _linear(sd["model.norm_f.weight"])
     layers = torch.nn.ModuleList()
     for kk, block in enumerate(config.hybrid_override_pattern):
@@ -66,6 +72,9 @@ def _vllm_nemotron_h_from_hf(hf, backend = "TRITON"):
             mixer.shared_experts.up_proj = _linear(sd[f"{p}.shared_experts.up_proj.weight"])
             mixer.shared_experts.down_proj = _linear(sd[f"{p}.shared_experts.down_proj.weight"])
             mixer.fc1_latent_proj = mixer.fc2_latent_proj = None
+            if f"{p}.fc1_latent_proj.weight" in sd:
+                mixer.fc1_latent_proj = _linear(sd[f"{p}.fc1_latent_proj.weight"])
+                mixer.fc2_latent_proj = _linear(sd[f"{p}.fc2_latent_proj.weight"])
             routed = torch.nn.Module()
             # Non-gated relu2 experts: w13 holds only up_proj
             routed.w13_weight = torch.nn.Parameter(sd[f"{p}.experts.up_proj"].clone(), requires_grad = False)
@@ -80,20 +89,20 @@ def _vllm_nemotron_h_from_hf(hf, backend = "TRITON"):
         layers.append(layer)
     model.layers = layers
     root.model = model
-    root.lm_head = _linear(sd["lm_head.weight"])
+    root.lm_head = _linear(_pad_vocab(sd["lm_head.weight"]))
     root.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
     engine = types.SimpleNamespace(model_executor = types.SimpleNamespace(
         driver_worker = types.SimpleNamespace(model_runner = types.SimpleNamespace(model = root))))
     return types.SimpleNamespace(llm_engine = engine)
 
 
-def _tiny_nemotron_h(monkeypatch):
+def _tiny_nemotron_h(monkeypatch, vocab_size = 64, moe_latent_size = None):
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "NemotronHConfig"):
         pytest.skip("transformers has no Nemotron-H")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (8, 0))
     config = transformers.NemotronHConfig(
-        vocab_size = 64, hidden_size = 16, intermediate_size = 32, num_attention_heads = 4,
+        vocab_size = vocab_size, moe_latent_size = moe_latent_size, hidden_size = 16, intermediate_size = 32, num_attention_heads = 4,
         num_key_value_heads = 2, head_dim = 4, mamba_num_heads = 4, mamba_head_dim = 4, n_groups = 1,
         ssm_state_size = 8, conv_kernel = 4, expand = 1, n_routed_experts = 4, num_experts_per_tok = 2,
         moe_intermediate_size = 8, moe_shared_expert_intermediate_size = 8, n_shared_experts = 1,
@@ -109,9 +118,11 @@ def _tiny_nemotron_h(monkeypatch):
     return hf, config
 
 
-def test_nemotron_h_vllm_state_dict_matches_hf(monkeypatch):
+# vocab 60: vLLM's padded rows must be trimmed; moe_latent_size: Super / Ultra experts run at the latent width
+@pytest.mark.parametrize("vocab_size, moe_latent_size", [(64, None), (60, None), (64, 12)])
+def test_nemotron_h_vllm_state_dict_matches_hf(monkeypatch, vocab_size, moe_latent_size):
     from unsloth_zoo import vllm_utils
-    hf, config = _tiny_nemotron_h(monkeypatch)
+    hf, config = _tiny_nemotron_h(monkeypatch, vocab_size, moe_latent_size)
     state_dict, _ = vllm_utils._get_vllm_state_dict(
         _vllm_nemotron_h_from_hf(hf), return_state_dict = True, config = config,
     )

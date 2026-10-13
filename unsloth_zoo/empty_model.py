@@ -1651,7 +1651,8 @@ def vllm_moe_expert_weights(experts, where, config = None, gated = True):
     if config is not None:
         n_experts = getattr(config, "num_experts", None) or getattr(config, "num_local_experts", None)
         inter = getattr(config, "moe_intermediate_size", None) or getattr(config, "expert_intermediate_size", None)
-        hidden = getattr(config, "hidden_size", None)
+        # Latent MoE (Nemotron-3 Super / Ultra) runs the experts at moe_latent_size
+        hidden = getattr(config, "moe_latent_size", None) or getattr(config, "hidden_size", None)
         if isinstance(n_experts, int) and isinstance(inter, int) and isinstance(hidden, int):
             expected = (n_experts, (2 if gated else 1) * inter, hidden)
     if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \

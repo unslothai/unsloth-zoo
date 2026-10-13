@@ -1231,7 +1231,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         # org_vocab_size (= text_config.vocab_size + 8).
         # https://github.com/huggingface/transformers/blob/1cea763ba422b83778a8db0374ea90f43b09992b/src/transformers/models/mllama/modeling_mllama.py#L1147
         shrink_size = getattr(proj,"org_vocab_size", vocab_size)
-        if shrink_size and ("embed_tokens" in prefix or "lm_head" in prefix):
+        # Nemotron-H's HF name is model.embeddings
+        is_vocab = "embed_tokens" in prefix or "lm_head" in prefix or prefix.endswith(".embeddings")
+        if shrink_size and is_vocab:
             if weight.shape[0] > shrink_size:
                 weight = weight[:shrink_size]
 
@@ -1248,7 +1250,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 bias_tensor = bias
 
             # Apply vocab_size truncation for bias as well
-            if shrink_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
+            if shrink_size is not None and is_vocab:
                 if bias_tensor.shape[0] > shrink_size:
                     bias_tensor = bias_tensor[:shrink_size]
 
