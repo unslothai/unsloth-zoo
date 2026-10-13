@@ -1021,6 +1021,8 @@ class _QwenModel(DecisionPipeline):
                 class_predicate = lambda path, module: (id(module) in decoder or not _role_tokens(path) & kept) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0,
             )
         self.model.eval()
+        # What a module keeps outside its parameters (Gemma's audio position scales) is still lazy on this thread's stream, which no other thread can evaluate.
+        mx.eval(_held_arrays(self.model))
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
         # The decoder is loaded from a view of the folder without the head's files, which a model loader would read as decoder weights.
@@ -1845,6 +1847,17 @@ def _decoder_tensor_name(decoder, path, stored = ()):
         return path
     # transformers stores each expert of a mixture apart, with no one tensor for the stack they are loaded as.
     return None if name and name not in stored and name.replace(".switch_mlp.", ".experts.0.") in stored else name
+
+
+def _held_arrays(tree):
+    """Every array a module tree holds, with those under a leading underscore that `parameters()` leaves out."""
+    found = []
+    for value in tree.values() if isinstance(tree, dict) else tree:
+        if isinstance(value, mx.array):
+            found.append(value)
+        elif isinstance(value, (dict, list, tuple)):
+            found += _held_arrays(value)
+    return found
 
 
 def _require_clef_source(decoder, source):

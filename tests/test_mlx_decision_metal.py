@@ -38,7 +38,7 @@ from mlx_simulation import mlx_is_simulated  # noqa: E402
 if mlx_is_simulated():
     pytest.skip("needs real MLX: mx.fast attention and RoPE", allow_module_level = True)
 
-from mlx.nn import Dropout, Embedding, LayerNorm, Linear, Sequential, quantize  # noqa: E402
+from mlx.nn import Dropout, Embedding, LayerNorm, Linear, Module, Sequential, quantize  # noqa: E402
 from mlx.utils import tree_flatten, tree_map  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402
 
@@ -209,6 +209,35 @@ def test_load_drains_generation_streams_before_clearing_the_cache(checkpoint, mo
     load_decision_model(checkpoint[1])
     clear = calls.index(("clear", ()))
     assert ("sync", (stream,)) in calls[:clear] and ("sync", ()) in calls[:clear]
+
+
+def test_arrays_kept_outside_the_parameters_are_evaluated_for_other_threads(monkeypatch):
+    import threading
+
+    from unsloth_zoo.mlx.decision import ClefModel
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    class Positions(Module):
+        def __init__(self):
+            super().__init__()
+            self._scales = mx.arange(3) * 2.0
+
+    class Tower(Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = Linear(2, 2)
+            self._positions = Positions()
+            self._tables = [mx.ones(2) * 3.0]
+
+    monkeypatch.setattr(FastMLXModel, "from_pretrained", staticmethod(lambda *args, **kwargs: (Tower(), None)))
+    pipeline = ClefModel.__new__(ClefModel)
+    loader = threading.Thread(target = pipeline._load, args = ("source", None, None, None))
+    loader.start()
+    loader.join()
+    # MLX evaluates a lazy array only on the thread that made it.
+    tower = pipeline.model
+    assert (tower._positions._scales + 1).tolist() == [1.0, 3.0, 5.0]
+    assert (tower._tables[0] + tower.proj.bias * 0).tolist() == [3.0, 3.0]
 
 
 def _decoder(quantized = False, bits = 8):
