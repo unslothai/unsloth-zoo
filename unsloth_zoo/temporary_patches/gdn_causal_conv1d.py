@@ -340,13 +340,15 @@ def _check_seq_idx(x, seq_idx):
     if (
         not isinstance(seq_idx, torch.Tensor) or seq_idx.dim() != 2
         or tuple(seq_idx.shape) != (x.shape[0], x.shape[-1])
-        or seq_idx.dtype.is_floating_point or seq_idx.dtype == torch.bool
+        or seq_idx.dtype.is_floating_point or seq_idx.dtype.is_complex or seq_idx.dtype == torch.bool
     ):
         raise ValueError(
             "Unsloth: causal_conv1d seq_idx must be an integer tensor of shape (batch, seqlen) = "
-            f"{(x.shape[0], x.shape[-1])}, got {getattr(seq_idx, 'shape', type(seq_idx))}."
+            f"{(x.shape[0], x.shape[-1])}, got {getattr(seq_idx, 'dtype', type(seq_idx))} "
+            f"{getattr(seq_idx, 'shape', '')}."
         )
-    return seq_idx
+    # Collators may leave it on CPU; a host to device copy can be async, the reverse cannot.
+    return seq_idx.to(device = x.device, non_blocking = x.device.type != "cpu")
 
 
 def _eligible(x, weight, bias, activation, seq_idx = None):
@@ -370,7 +372,12 @@ def _eligible(x, weight, bias, activation, seq_idx = None):
 def triton_causal_conv1d(x, weight, bias = None, activation = None, seq_idx = None):
     """x (B, D, T), weight (D, W), seq_idx (B, T) -> (B, D, T) stored channel-last."""
     if seq_idx is not None:
-        seq_idx = _check_seq_idx(x, seq_idx).to(torch.int32).contiguous()
+        seq_idx = _check_seq_idx(x, seq_idx)
+        # Kernels only compare IDs for equality in the loaded dtype: never narrow (0 == 2**32 in
+        # int32); widen the rest (int8/16, uint*) to int64, a bijection for uint64.
+        if seq_idx.dtype not in (torch.int32, torch.int64):
+            seq_idx = seq_idx.to(torch.int64)
+        seq_idx = seq_idx.contiguous()
     return _CausalConv1dFunction.apply(x, weight, bias, activation, seq_idx)
 
 
@@ -400,7 +407,7 @@ def _count_fallback():
         GDN_CAUSAL_CONV1D_STATS["fallback"] += 1
 
 
-def _causal_conv1d_any(x, weight, bias, activation, seq_idx):
+def _causal_conv1d_any(x, weight, bias = None, activation = None, seq_idx = None):
     seq_idx = _check_seq_idx(x, seq_idx)
     out = _try_fast(x, weight, bias, activation, seq_idx)
     if out is not None:
@@ -410,7 +417,9 @@ def _causal_conv1d_any(x, weight, bias, activation, seq_idx):
 
 
 def _own_signature(fn):
-    # Else signature follows __wrapped__ and the hub wrapper drops `seq_idx`.
+    # Else signature follows __wrapped__ (or a __signature__ functools.wraps copied) and the
+    # hub wrapper drops `seq_idx`.
+    fn.__dict__.pop("__signature__", None)
     fn.__signature__ = inspect.signature(fn, follow_wrapped = False)
     return fn
 
@@ -434,16 +443,18 @@ def _make_hub_dispatch(torch_function):
 def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
     """Torch causal conv whose taps do not cross `seq_idx` (B, T) boundaries."""
     import torch.nn.functional as F
+    seq_idx = _check_seq_idx(x, seq_idx)
     if seq_idx is None:
         return causal_conv1d_reference(x, weight, bias, activation)
     W, T = weight.shape[-1], x.shape[-1]
     acc = torch.promote_types(weight.dtype, torch.float32)
     xp = F.pad(x.to(acc), (W - 1, 0))
+    # int64 on both sides: torch has no promotion for uint16/32/64.
     sp = F.pad(seq_idx.to(torch.int64), (W - 1, 0), value = -1)
     w = weight.to(acc)
     out = torch.zeros_like(xp[:, :, :T])
     for j in range(W):
-        same = (sp[:, j:j + T] == seq_idx).unsqueeze(1)
+        same = (sp[:, j:j + T] == sp[:, W - 1:]).unsqueeze(1)
         out = out + xp[:, :, j:j + T] * w[:, j].view(1, -1, 1) * same
     if bias is not None:
         out = out + bias.to(acc).view(1, -1, 1)

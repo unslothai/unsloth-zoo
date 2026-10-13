@@ -185,6 +185,11 @@ def test_seq_idx_shape_mismatch_raises():
         gcc._legacy_causal_conv1d_fn(x = x, weight = w, seq_idx = torch.zeros(1, 9, dtype = torch.int32))
     with pytest.raises(ValueError, match = "seq_idx"):
         gcc._legacy_causal_conv1d_fn(x = x, weight = w, seq_idx = torch.zeros(1, 10))
+    for dtype in (torch.bool, torch.complex64):
+        with pytest.raises(ValueError, match = "seq_idx"):
+            gcc._legacy_causal_conv1d_fn(x = x, weight = w, seq_idx = torch.zeros(1, 10, dtype = dtype))
+    # Optional inputs default like the public entry points.
+    torch.testing.assert_close(gcc._causal_conv1d_any(x, w), gcc.causal_conv1d_reference(x, w))
 
 
 def test_dispatch_signatures_name_seq_idx():
@@ -204,6 +209,17 @@ def test_dispatch_signatures_name_seq_idx():
     seq_idx = _seq_idx_from_lengths([[3, 1, 6], [1, 9]])
     torch.testing.assert_close(dispatch(x, w, b, activation = "silu", seq_idx = seq_idx), _per_document(x, w, b, "silu", seq_idx))
     torch.testing.assert_close(dispatch(x, w, b, activation = "silu"), causal_conv1d_fn(x, w, b, "silu"))
+
+
+def test_dispatch_signature_ignores_copied_signature():
+    # functools.wraps copies an explicit __signature__; the dispatch must still name seq_idx.
+    def causal_conv1d_fn(hidden_states, weight, bias = None, activation = None, **kwargs):
+        return gcc.causal_conv1d_reference(hidden_states, weight, bias, activation)
+
+    causal_conv1d_fn.__signature__ = inspect.signature(causal_conv1d_fn)
+    dispatch = gcc._make_hub_dispatch(causal_conv1d_fn)
+    assert "seq_idx" in inspect.signature(dispatch).parameters
+    assert "seq_idx" not in inspect.signature(causal_conv1d_fn).parameters
 
 
 def test_hub_wrapper_forwards_seq_idx(monkeypatch):
@@ -236,3 +252,89 @@ def test_hub_wrapper_forwards_seq_idx(monkeypatch):
         hub_fn(x, w, None, activation = "silu", seq_idx = seq_idx, max_length_q = 4),
         _per_document(x, w, None, "silu", seq_idx),
     )
+
+
+def _wide_ids(lengths, labels, dtype, device):
+    return torch.repeat_interleave(
+        torch.tensor(labels, dtype = torch.int64), torch.tensor(lengths),
+    ).view(1, -1).to(device = device, dtype = dtype)
+
+
+@requires_cuda
+def test_seq_idx_wide_int64_ids_stay_distinct():
+    # 0, 2**32, -2**32 and 2**33 + 1 collapse to {0, 1} in int32: taps must still stop at each boundary.
+    lengths, labels = [3, 4, 2, 5, 6], [0, 2**32, -2**32, 2**33 + 1, 1]
+    x, w, b, dy = _inputs(1, 64, sum(lengths), 4, torch.float32, True)
+    seq_idx = _wide_ids(lengths, labels, torch.int64, "cuda")
+    oracle = _run(_per_document, _to64(x), _to64(w), _to64(b), _to64(dy), "silu", seq_idx)
+    for fn in (_triton, _reference, gcc._legacy_causal_conv1d_fn):
+        for name, o, r in zip(("y", "dx", "dw", "db"), _run(fn, x, w, b, dy, "silu", seq_idx), oracle):
+            assert _rel(o, r) < 1e-5, (fn, name, _rel(o, r))
+
+
+@requires_cuda
+def test_seq_idx_small_and_unsigned_dtypes_match_int32():
+    lengths, labels = [3, 1, 6, 6], [0, 1, 2, 3]
+    x, w, b, _ = _inputs(1, 64, sum(lengths), 4, torch.bfloat16, True)
+    ref = gcc.triton_causal_conv1d(x, w, b, "silu", _wide_ids(lengths, labels, torch.int32, "cuda"))
+    dtypes = [torch.int8, torch.uint8, torch.int16, torch.int64]
+    dtypes += [getattr(torch, n) for n in ("uint16", "uint32", "uint64") if hasattr(torch, n)]
+    for dtype in dtypes:
+        seq_idx = _wide_ids(lengths, labels, dtype, "cuda")
+        assert torch.equal(gcc.triton_causal_conv1d(x, w, b, "silu", seq_idx), ref), dtype
+        y = gcc._causal_conv1d_reference_seq_idx(x, w, b, "silu", seq_idx)
+        assert _rel(y, ref) < 4e-3, dtype
+
+
+@requires_cuda
+def test_seq_idx_on_cpu_with_cuda_activations(monkeypatch):
+    rows = [[3, 1, 12], [16]]
+    x, w, b, dy = _inputs(2, 64, 16, 4, torch.float32, True)
+    seq_idx = _seq_idx_from_lengths(rows, "cuda")
+    oracle = _run(_per_document, _to64(x), _to64(w), _to64(b), _to64(dy), "silu", seq_idx)
+    assert gcc._check_seq_idx(x, seq_idx.cpu()).device == x.device
+    before = gcc.GDN_CAUSAL_CONV1D_STATS["triton_seq_idx"]
+    for fn in (_triton, _reference, gcc._legacy_causal_conv1d_fn):
+        for name, o, r in zip(("y", "dx", "dw", "db"), _run(fn, x, w, b, dy, "silu", seq_idx.cpu()), oracle):
+            assert _rel(o, r) < 1e-5, (fn, name, _rel(o, r))
+    # Direct entry and dispatch both ran the kernel, not the fallback.
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_seq_idx"] - before == 2
+    monkeypatch.setenv(gcc._KILL_SWITCH, "1")
+    y = gcc._legacy_causal_conv1d_fn(x, w, b, "silu", seq_idx = seq_idx.cpu())
+    assert _rel(y, oracle[0]) < 1e-5
+
+
+def _random_seq_idx(g, T, W, dtype):
+    """Random document lengths (many shorter than W); IDs gapped, negative, huge, and reused
+    once at least W - 1 tokens away (equal IDs inside one window would join the runs)."""
+    pool = [-7, -1, 0, 3, 5, 11, 2**31 - 1, 2**32, 2**32 + 3, -2**40]
+    pool = [v for v in pool if torch.iinfo(dtype).min <= v <= torch.iinfo(dtype).max]
+    n_docs = int(torch.randint(1, min(12, T) + 1, (), generator = g))
+    cuts = (torch.randperm(T - 1, generator = g)[:n_docs - 1] + 1).sort().values.tolist()
+    ids = []
+    for s, e in zip([0] + cuts, cuts + [T]):
+        recent = set(ids[max(0, s - (W - 1)):])
+        label = pool[int(torch.randint(len(pool), (), generator = g))]
+        while label in recent:
+            label = pool[int(torch.randint(len(pool), (), generator = g))]
+        ids += [label] * (e - s)
+    return ids
+
+
+@requires_cuda
+def test_seq_idx_randomized_against_per_document():
+    g = torch.Generator().manual_seed(1234)
+    for case in range(50):
+        B, T, W = 1 + case % 3, int(torch.randint(8, 100, (), generator = g)), 2 + case % 7
+        dtype = (torch.int64, torch.int32)[case % 2]
+        x, w, b, dy = _inputs(B, 64, T, W, torch.float32, True, seed = case)
+        rows = [_random_seq_idx(g, T, W, dtype) for _ in range(B)]
+        # Strided (B, T) view of a wider buffer.
+        storage = torch.full((B, 2 * T), 99, dtype = dtype, device = "cuda")
+        seq_idx = storage[:, ::2]
+        seq_idx.copy_(torch.tensor(rows, dtype = dtype))
+        assert not seq_idx.is_contiguous()
+        ours = _run(_triton, x, w, b, dy, "silu", seq_idx)
+        oracle = _run(_per_document, _to64(x), _to64(w), _to64(b), _to64(dy), "silu", seq_idx)
+        for name, o, r in zip(("y", "dx", "dw", "db"), ours, oracle):
+            assert _rel(o, r) < 2e-5, (case, name, _rel(o, r), rows)
