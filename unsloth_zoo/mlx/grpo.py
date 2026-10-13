@@ -339,7 +339,6 @@ def make_grpo_eval_fn(objective, *, scorer=None):
     eval_fn.__dict__.update(loss_fn.__dict__)
     return eval_fn
 
-# Columns Unsloth never forwards to the chat template as keyword arguments.
 _TEMPLATE_RESERVED_COLUMNS = frozenset((
     "prompt", "chosen", "rejected", "completion", "messages", "label",
     "images", "image", "videos", "video", "audios", "audio",
@@ -389,7 +388,6 @@ class GRPOSampling:
     repetition_penalty: float = 1.0
 
     def __post_init__(self):
-        # The ranges Hugging Face's sampling processors accept.
         valid = {
             "max_tokens": self.max_tokens >= 1,
             "temperature": self.temperature > 0,
