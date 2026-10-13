@@ -16,6 +16,7 @@ from fla.ops.utils.op import exp2
 from fla.utils import (
     IS_NVIDIA_BLACKWELL,
     IS_NVIDIA_HOPPER,
+    LONG_INDEXING_THRESHOLD,
     USE_CUDA_GRAPH,
     autotune_cache_kwargs,
     check_shared_mem,
@@ -684,7 +685,7 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
-        LONG_INDEXING=B * T * HV * (K if gk is not None else 1) > 2**31,
+        LONG_INDEXING=B * T * HV * (K if gk is not None else 1) > LONG_INDEXING_THRESHOLD,
     )
     return h, v_new, final_state
 
@@ -747,6 +748,6 @@ def chunk_gated_delta_rule_bwd_dhu(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
-        LONG_INDEXING=B * T * HV * (K if gk is not None else 1) > 2**31,
+        LONG_INDEXING=B * T * HV * (K if gk is not None else 1) > LONG_INDEXING_THRESHOLD,
     )
     return dh, dh0, dv2
