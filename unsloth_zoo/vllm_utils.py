@@ -2307,6 +2307,83 @@ def vision_max_num_seqs(
 pass
 
 
+def _kv_cache_elements_per_token(config):
+    """KV cache elements per token: (layers growing with the sequence, [(sliding_window, elements)]).
+    Uses the real head_dim / KV heads per layer, MLA's latent cache, and skips linear-attention
+    (constant state) and KV-shared layers. Unknown layouts count as full attention."""
+    hd       = config.hidden_size
+    n_layers = config.num_hidden_layers
+    n_heads  = _config_get(config, "num_attention_heads", 1) or 1
+    kv_lora_rank = getattr(config, "kv_lora_rank", None)
+    rope_dim = getattr(config, "qk_rope_head_dim", None) or 0
+    mla_head_dim = None
+    if kv_lora_rank:
+        if os.environ.get("VLLM_MLA_DISABLE", "0") in ("0", ""):
+            return (kv_lora_rank + rope_dim) * n_layers, []
+        mla_head_dim = (getattr(config, "qk_nope_head_dim", None) or 0) + rope_dim or None
+
+    layer_types = getattr(config, "layer_types", None)
+    layer_types = list(layer_types) if layer_types is not None else []
+    if len(layer_types) != n_layers: layer_types = ["full_attention"] * n_layers
+    per_layer = getattr(config, "per_layer_config", None)
+    try:
+        per_layer = list(per_layer) if per_layer is not None else []
+    except Exception:
+        per_layer = []
+    if len(per_layer) != n_layers: per_layer = [None] * n_layers
+    n_shared = getattr(config, "num_kv_shared_layers", None) or 0
+    sliding_window = getattr(config, "sliding_window", None)
+
+    def _get(layer, name):
+        value = getattr(layer, name, None) if layer is not None else None
+        if value is None:
+            try:
+                value = getattr(config, name, None)
+            except Exception:
+                value = None
+        return value
+
+    full, sliding = 0, {}
+    for i, (layer_type, layer) in enumerate(zip(layer_types, per_layer)):
+        if i >= n_layers - n_shared: break
+        if layer_type in ("linear_attention", "mamba", "conv"): continue
+        head_dim   = mla_head_dim or _get(layer, "head_dim")
+        n_kv_heads = _get(layer, "num_key_value_heads")
+        if layer is None and layer_type == "full_attention":
+            # Older Gemma-4 configs spell the full-attention shape as global_*.
+            head_dim   = _get(None, "global_head_dim") or head_dim
+            n_kv_heads = _get(None, "num_global_key_value_heads") or n_kv_heads
+        if not head_dim: head_dim = hd // n_heads
+        if not n_kv_heads: n_kv_heads = n_heads
+        # vLLM caches head_size + head_size_v (MiMo-V2: v_head_dim != head_dim).
+        v_head_dim = _get(layer, "v_head_dim") or head_dim
+        elements = (head_dim + v_head_dim) * n_kv_heads
+        window = _get(layer, "sliding_window") or sliding_window
+        if layer_type == "sliding_attention" and window:
+            sliding[window] = sliding.get(window, 0) + elements
+        else:
+            full += elements
+    return full, sorted(sliding.items())
+pass
+
+
+def _kv_cache_tokens(memory_bytes, full_bytes, sliding_bytes, context_length, in_flight_tokens = 2 * 8192):
+    """Longest single sequence the KV cache holds. vLLM keeps window - 1 + in-flight tokens per
+    sliding layer (kv_cache_interface.SlidingWindowSpec); full layers grow with the sequence."""
+    if memory_bytes <= 0: return 0
+    caps = sorted((window + in_flight_tokens, b) for window, b in sliding_bytes)
+    growing = full_bytes + sum(b for _, b in caps)
+    used, start = 0, 0
+    for cap, b in caps:
+        if growing <= 0: break
+        if used + (cap - start) * growing >= memory_bytes: break
+        used += (cap - start) * growing
+        start, growing = cap, growing - b
+    if growing <= 0: return max(context_length, start)
+    return int(start + (memory_bytes - used) / growing)
+pass
+
+
 def approximate_vllm_memory_usage(
     config,
     load_in_4bit = False,
@@ -2321,6 +2398,7 @@ def approximate_vllm_memory_usage(
     parallel_sequences = 64,
     cuda_graph_overhead = True,
     weight_bytes = None,
+    max_num_batched_tokens = 8192, # chunked prefill budget; sliding-window layers keep window + 2x this
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -2343,11 +2421,17 @@ def approximate_vllm_memory_usage(
     n_layers = config.num_hidden_layers
     n_kv_heads = _config_get(config, "num_key_value_heads", 1)
     n_heads    = _config_get(config, "num_attention_heads", 1)
-    # Group Query Attention
-    kv_size = hd // n_heads * n_kv_heads
+    # Real head_dim (Qwen3 / Gemma-3 / gpt-oss); MLA's is rope-only and Gemma-4's raises, so both keep hidden_size / heads.
+    try:
+        head_dim = None if getattr(config, "kv_lora_rank", None) else getattr(config, "head_dim", None)
+    except Exception:
+        head_dim = None
+    head_dim = head_dim or hd // n_heads
+    q_size  = head_dim * n_heads
+    kv_size = head_dim * n_kv_heads
 
     # Modules
-    qkvo = hd + kv_size + kv_size + hd
+    qkvo = q_size + kv_size + kv_size + q_size
     qkvo = qkvo * hd
     if is_moe:
         mlp = n_experts * (hd * moe_size) * 3 + (hd * shared_size) * 3 + hd * n_experts
@@ -2362,8 +2446,8 @@ def approximate_vllm_memory_usage(
     lm_head = 0 if getattr(config, "tie_word_embeddings", True) else vocab_size * hd
 
     # LoRA modules on all QKVO, MLP
-    qkvo_A = hd * max_lora_rank * 4
-    qkvo_B = max_lora_rank * (hd + kv_size + kv_size + hd)
+    qkvo_A = max_lora_rank * (hd * 3 + q_size) # o_proj reads the attention width
+    qkvo_B = max_lora_rank * (q_size + kv_size + kv_size + hd)
     mlp_A  = hd * max_lora_rank * 2 + mlp_size * max_lora_rank
     mlp_B  = max_lora_rank * (mlp_size + mlp_size) + max_lora_rank * hd
     if is_moe:
@@ -2391,7 +2475,9 @@ def approximate_vllm_memory_usage(
 
     # Activation memory - assume bsz=2
     bsz = 2
-    activation_qkv  = max_seq_length * bsz * (hd + kv_size + kv_size)
+    # Stays on hidden_size / heads: it sets vLLM's gpu_memory_utilization, and the real head_dim broke long-context loads.
+    kv_size_hidden  = hd // n_heads * n_kv_heads
+    activation_qkv  = max_seq_length * bsz * (hd + kv_size_hidden + kv_size_hidden)
     residual_memory = (max_seq_length * bsz)*2
     activation_mlp  = max_seq_length * bsz * (mlp_size + mlp_size)
     weights = mlp_size * hd
@@ -2418,7 +2504,7 @@ def approximate_vllm_memory_usage(
 
     # KV cache size (float16 is 2 bytes. float8 is 1.25 bytes)
     float_bytes = 1.25 if float8_kv_cache else 2
-    kv_elements = (kv_size * 2 * n_layers) * float_bytes
+    full_kv_elements, sliding_kv_elements = _kv_cache_elements_per_token(config)
     memory_left_for_kv_cache = free_memory - bytes_for_model
 
     # Account for CUDA graph capture overhead.
@@ -2435,8 +2521,13 @@ def approximate_vllm_memory_usage(
 
     if memory_left_for_kv_cache <= 0: memory_left_for_kv_cache = 0
 
-    # Approx maximum # of KV cache elements
-    max_num_batched_tokens = int(0.95*(memory_left_for_kv_cache / kv_elements))
+    max_num_batched_tokens = _kv_cache_tokens(
+        0.95 * memory_left_for_kv_cache,
+        full_kv_elements * float_bytes,
+        [(window, elements * float_bytes) for window, elements in sliding_kv_elements],
+        context_length,
+        in_flight_tokens = 2 * max(int(max_num_batched_tokens or 0), 8192),
+    )
     # Round by 256
     max_num_batched_tokens = (max_num_batched_tokens // 256) * 256
     # Assuming all requests output max_seq_length, get theoretical max requests
@@ -3388,8 +3479,9 @@ def load_vllm(
     unsloth_vllm_standby   : bool = False,
     is_vision_model        : bool = False,
     return_args            : bool = False, # Just return args
-    max_num_seqs           : int = 256, # how many seqs to process in parallel. Default vLLM 256
+    max_num_seqs           : int = 256, # how many seqs to process in parallel. 256 / None = pick from free memory
     fp8_mode               : Optional[str] = None,
+    max_num_batched_tokens : Optional[int] = None, # chunked prefill budget. None = pick from free memory
     rope_scaling           : Optional[dict] = None, # caller's RoPE scaling, e.g. YaRN past the native window
 ):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -3547,6 +3639,7 @@ def load_vllm(
                 "fast_inference = False."
             )
 
+    requested_max_num_batched_tokens = max_num_batched_tokens
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
@@ -3562,6 +3655,12 @@ def load_vllm(
         account_for_gradients = training,
         weight_bytes = vllm_weights_memory_usage(
             config, load_in_4bit = use_bitsandbytes, load_in_8bit = is_fp8,
+        ),
+        # Sliding layers hold the prefill budget past their window: max(8192, max_seq_length) for vision models.
+        max_num_batched_tokens = max(
+            8192,
+            max_seq_length if is_vision_model else 0,
+            int(requested_max_num_batched_tokens or 0),
         ),
     )
 
@@ -3779,10 +3878,18 @@ def load_vllm(
         elif memory_left_for_kv_cache_gb <= 80: max_num_batched_tokens, approx_max_num_seqs = 8192, 128 # + 16
         elif memory_left_for_kv_cache_gb >  80: max_num_batched_tokens, approx_max_num_seqs = 8192, 256 # + 16
 
+        # 256 is the signature default, so only another value is an explicit request (as for vision).
+        explicit_max_num_seqs = max_num_seqs not in (None, 256)
+        if explicit_max_num_seqs: approx_max_num_seqs = max(int(max_num_seqs), 1)
+
+        if requested_max_num_batched_tokens is not None:
+            max_num_batched_tokens = max(int(requested_max_num_batched_tokens), 1)
+
         vision_seq_cap = None
         if is_vision_model:
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
-            max_num_batched_tokens = max(8192, max_seq_length)
+            if requested_max_num_batched_tokens is None:
+                max_num_batched_tokens = max(8192, max_seq_length)
             approx_max_num_seqs = vision_max_num_seqs(
                 approx_max_num_seqs, max_num_seqs, config, max_num_batched_tokens,
                 memory_left_for_kv_cache_gb, vllm_version,
@@ -3798,19 +3905,23 @@ def load_vllm(
         if not enable_chunked_prefill:
             max_num_batched_tokens = max(max_num_batched_tokens, max_seq_length)
 
-        # float8 KV cache fits more sequences -> more throughput
-        if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
+        if not explicit_max_num_seqs:
+            if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
 
-        # Scale num_seqs by conservativeness
-        approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
-        approx_max_num_seqs = max(approx_max_num_seqs, 1)
-        if vision_seq_cap is not None:
-            approx_max_num_seqs = min(approx_max_num_seqs, vision_seq_cap)
+            approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
+            approx_max_num_seqs = max(approx_max_num_seqs, 1)
+            if vision_seq_cap is not None:
+                approx_max_num_seqs = min(approx_max_num_seqs, vision_seq_cap)
 
         # Larger warmup batches crash Gemma-4 on B200 (illegal memory access, plain vLLM too).
         reachable_tokens = approx_max_num_seqs * max_seq_length
-        if max_num_batched_tokens > reachable_tokens:
+        if max_num_batched_tokens > reachable_tokens and requested_max_num_batched_tokens is None:
             max_num_batched_tokens = reachable_tokens
+        if max_num_batched_tokens < approx_max_num_seqs:
+            if requested_max_num_batched_tokens is None:
+                max_num_batched_tokens = approx_max_num_seqs
+            elif not explicit_max_num_seqs:
+                approx_max_num_seqs = max_num_batched_tokens
 
         # Check max RAM usage for vLLM (swap space) default is 4GB
         memory = psutil.virtual_memory()
