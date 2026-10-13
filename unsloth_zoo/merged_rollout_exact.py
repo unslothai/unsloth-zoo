@@ -155,7 +155,7 @@ class ExactFoldTarget:
     `a` / `b` are [E, R, K] / [E, N, R] (any strides), `scale` the LoRA scaling.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = ("w", "a", "b", "scale", "counts", "checksum", "idx", "val", "host_idx", "host_val", "folded")
+    __slots__ = ("w", "a", "b", "scale", "counts", "checksum", "idx", "val", "host_idx", "host_val", "folded", "ready")
 
     def __init__(self, w_view, a, b, scale):
         assert w_view.dim() == 3 and a.dim() == 3 and b.dim() == 3
@@ -165,6 +165,7 @@ class ExactFoldTarget:
         self.w, self.a, self.b, self.scale = w_view, a, b, float(scale)
         self.counts = self.checksum = self.idx = self.val = self.host_idx = self.host_val = None
         self.folded = False
+        self.ready = None
     pass
 
     def grid(self):
@@ -258,6 +259,10 @@ def _offload(targets, stream):
             t.host_val.copy_(t.val, non_blocking = True)
             t.idx.record_stream(stream); t.val.record_stream(stream)
             t.idx = t.val = None
+        # The unfold may run on another stream: it waits on this before reading the host stores.
+        ready = torch.cuda.Event()
+        ready.record(stream)
+        for t in targets: t.ready = ready
 pass
 
 
@@ -268,6 +273,8 @@ def exact_unfold(targets, stream = None):
     targets = [t for t in targets if t.folded]
     if not targets: return
     current = torch.cuda.current_stream(targets[0].w.device)
+    for ready in {id(t.ready): t.ready for t in targets if t.ready is not None}.values():
+        (stream or current).wait_event(ready)
     if stream is not None:
         stream.wait_stream(current)
         with torch.cuda.stream(stream):
@@ -301,7 +308,7 @@ def exact_unfold(targets, stream = None):
             checks.append(torch.stack([before[0], after[0]]))
     pairs = torch.stack(checks).tolist()
     for t in targets:
-        t.idx = t.val = t.host_idx = t.host_val = t.counts = None
+        t.idx = t.val = t.host_idx = t.host_val = t.counts = t.ready = None
         t.folded = False
     bad = [i for i, (x, y) in enumerate(pairs) if x != y]
     if bad:

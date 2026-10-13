@@ -223,3 +223,17 @@ def test_offload_failure_after_fold_restores_from_device_stores(monkeypatch):
     assert not torch.equal(_bits(W), _bits(W0))
     ex.exact_unfold([t], stream = torch.cuda.Stream())
     assert torch.equal(_bits(W), _bits(W0))
+
+
+def test_unfold_on_another_stream_waits_for_the_offload():
+    # The offload's device-to-host copies are held back on their stream; an unfold on the
+    # default stream must not read the host stores before they land.
+    W, A, B, scale = _dense(1024, 4096, 16, 1e-2)
+    W0 = W.clone()
+    t = _target(W, A, B, scale)
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(200_000_000)
+    ex.exact_fold([t], stream = side)
+    ex.exact_unfold([t])
+    assert torch.equal(_bits(W), _bits(W0))
