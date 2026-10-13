@@ -288,6 +288,40 @@ def calls_disable_compile_function(source, disable_compile_functions):
     )
 
 
+def function_defined_elsewhere(modeling_file, name):
+    """True if `modeling_file.<name>` is imported from another file (a same-named method can match `def <name>`)."""
+    try:
+        function = inspect.unwrap(getattr(modeling_file, name))
+        if not inspect.isfunction(function):
+            return False
+        function_file = inspect.getsourcefile(function)
+        modeling_source_file = inspect.getsourcefile(modeling_file)
+    except Exception:
+        return False
+    if function_file is None or modeling_source_file is None:
+        return False
+    return os.path.realpath(function_file) != os.path.realpath(modeling_source_file)
+
+
+def signature_with_string_annotations(signature):
+    """Quote annotations: module-path names the generated file never imports raise NameError."""
+    empty = inspect.Parameter.empty
+    def stringify(annotation):
+        if annotation is empty or isinstance(annotation, str):
+            return annotation
+        return inspect.formatannotation(annotation)
+    try:
+        return signature.replace(
+            parameters = [
+                parameter.replace(annotation = stringify(parameter.annotation))
+                for parameter in signature.parameters.values()
+            ],
+            return_annotation = stringify(signature.return_annotation),
+        )
+    except Exception:
+        return signature
+
+
 def function_has_tensor_inputs(source: str) -> bool:
     """False when every parameter has a non-tensor annotation: nothing for Dynamo to trace."""
     try:
@@ -526,6 +560,7 @@ from unsloth_zoo.loss_utils import (
     unsloth_fused_ce_loss,
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
 from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
@@ -2036,11 +2071,15 @@ def create_new_function(
             new_source = _insert_kwargs_alias(new_source, name, kwargs_alias)
     pass
 
-    # Import items to make the function executable
+    # Import items to make the function executable; a same-named method is not a local def
     items = [
         x
         for x in functions
-        if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))
+        if (
+            (x in new_source)
+            and (x != name)
+            and not re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE)
+        )
     ]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
@@ -2098,6 +2137,9 @@ def create_new_function(
         # upstream source can reference functools too. Neither the license header
         # nor the model module's own imports are guaranteed to provide it.
         imports += "import functools\n"
+    if "transformers." in new_source:
+        # The signature fix-up spells annotations fully qualified (`transformers.cache_utils.Cache`).
+        imports += "import transformers\n"
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
@@ -3303,7 +3345,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3375,6 +3417,11 @@ if n_items is None:
                 if n_items is None: n_items = __kwargs.get("n_items", None)
                 break
 pass
+# Stock ForCausalLMLoss uses caller pre-shifted targets (context parallel, padding-free) as is.
+explicit_shift_labels = None
+if (\\9) != () and type(\\9) is dict:
+    explicit_shift_labels = (\\9).get("shift_labels", None)
+    if not torch.is_tensor(explicit_shift_labels): explicit_shift_labels = None
 
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
@@ -3398,7 +3445,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3406,20 +3453,21 @@ elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENT
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and NOT_RETURN_LOGITS:
+elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LOGITS:
     lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
+    _labels = labels if explicit_shift_labels is None else explicit_shift_labels
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(_labels, _labels.dim() - 1)
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
+        labels               = _labels,
         mask                 = None,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
@@ -3428,8 +3476,9 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
+        shift_labels         = explicit_shift_labels is None,
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+elif _can_fuse_loss(self.loss_function) and labels is not None and not NOT_RETURN_LOGITS:
     # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
     # already materialised the full lm_head matmul; apply the captured logit
     # scale/softcap transforms and route loss through self.loss_function on
@@ -3687,8 +3736,6 @@ def _guard_loss_function_replacement(replacement, condition, block):
             ("and not requires_grad_:", 'getattr(self.lm_head, "bias", None) is None:', "and NOT_RETURN_LOGITS:")
         ):
             line = f"{line[:-1]} and not ({condition}):"
-        elif stripped == 'elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:':
-            line = f"{line[:-1]} and not NOT_RETURN_LOGITS:"
         lines.append(line)
         if stripped.startswith("loss = self.loss_function(logits, labels.to("):
             lines.extend(indent + x if x.strip() else x for x in block.rstrip("\n").split("\n"))
@@ -6291,6 +6338,8 @@ def unsloth_compile_transformers(
             r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags=re.DOTALL
         )
         if len(defined) != 0 and len(called) != 0:
+            if function_defined_elsewhere(modeling_file, function):
+                continue
             called_functions.append(function)
     pass
 
@@ -7025,7 +7074,8 @@ def unsloth_compile_transformers(
                 continue
             else:
                 try:
-                    parameters = inspect.signature(function)
+                    # Match inspect.getsource, which unwraps past a wrapper's own __signature__.
+                    parameters = inspect.signature(inspect.unwrap(function))
                 except Exception as e:
                     print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
                     continue
@@ -7036,6 +7086,9 @@ def unsloth_compile_transformers(
                 source = inspect.getsource(function)
             except Exception as e:
                 print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
+                continue
+            # A wrapper borrowing the original's __signature__ would be emitted with its closure body (unsloth#13245).
+            if re.search(rf"^\s*def\s+{re.escape(module)}\s*\(", source, flags = re.MULTILINE) is None:
                 continue
 
             # str(inspect.signature) can disagree with source on quote
@@ -7060,6 +7113,7 @@ def unsloth_compile_transformers(
             if len(bad_params) == 0:
                 continue
 
+            parameters = signature_with_string_annotations(parameters)
             for bad_param in bad_params:
                 parameters = re.sub(
                     re.escape(bad_param) + r"[\s]{0,}\=[\s]{0,}None[\s]{0,}\,",

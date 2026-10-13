@@ -187,3 +187,44 @@ def test_interpolation_token_with_no_pieces_gets_the_trained_mean():
     new_id = tokenizer.convert_tokens_to_ids("  ")
     expected = torch.full((model.config.hidden_size,), 4.5)
     torch.testing.assert_close(model.get_input_embeddings().weight[new_id], expected)
+
+
+class _Processor:
+    """Stands in for a vision processor: no add_tokens, the tokenizer is an attribute."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+
+def test_processor_and_composite_config():
+    # Gemma 3 vision loads as a processor + Gemma3Config, whose vocab_size lives on text_config.
+    from transformers import Gemma3Config, Gemma3ForConditionalGeneration
+
+    _, tokenizer = _build(VOCAB_TOK, PADDED)
+    torch.manual_seed(0)
+    cfg = Gemma3Config(
+        text_config=dict(
+            vocab_size=PADDED, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+            num_attention_heads=2, num_key_value_heads=1, head_dim=8,
+        ),
+        vision_config=dict(
+            hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2,
+            image_size=28, patch_size=14,
+        ),
+        mm_tokens_per_image=1,
+    )
+    model = Gemma3ForConditionalGeneration(cfg).eval()
+    assert not hasattr(model.config, "vocab_size")
+    trained_rows = model.get_input_embeddings().weight.detach()[:VOCAB_TOK].clone()
+
+    processor = _Processor(tokenizer)
+    add_new_tokens(model, processor, new_tokens=["<newA>", "<newB>"])
+
+    emb = model.get_input_embeddings().weight
+    assert emb.shape[0] == PADDED
+    assert model.config.get_text_config().vocab_size == PADDED
+    assert torch.equal(emb.detach()[:VOCAB_TOK], trained_rows)
+    ids = processor.tokenizer.convert_tokens_to_ids(["<newA>", "<newB>"])
+    assert ids == [VOCAB_TOK, VOCAB_TOK + 1]
+    out = model(input_ids=torch.tensor([ids]))
+    assert torch.isfinite(out.logits).all()

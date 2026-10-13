@@ -610,6 +610,25 @@ def patch_vllm_untiled_moe_experts():
 pass
 
 
+def patch_vllm_stacked_moe_lora(config):
+    """Set is_3d_moe_weight so vLLM serves the stacked expert adapter; its 2D wrapper cannot (vllm-project/vllm#41754)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+    if model_type != "qwen3_moe": return False
+    try:
+        from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA  # noqa: F401
+        from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
+        # Only transformers >= 5 stacks the experts into 3D tensors.
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts  # noqa: F401
+    except Exception as e:
+        logger.info(f"Unsloth: not marking {model_type} as a 3D MoE LoRA model in vLLM: {e}")
+        return False
+    if getattr(Qwen3MoeForCausalLM, "is_3d_moe_weight", False) is not True:
+        Qwen3MoeForCausalLM.is_3d_moe_weight = True
+    return True
+pass
+
+
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
     try:
@@ -1231,7 +1250,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         # org_vocab_size (= text_config.vocab_size + 8).
         # https://github.com/huggingface/transformers/blob/1cea763ba422b83778a8db0374ea90f43b09992b/src/transformers/models/mllama/modeling_mllama.py#L1147
         shrink_size = getattr(proj,"org_vocab_size", vocab_size)
-        if shrink_size and ("embed_tokens" in prefix or "lm_head" in prefix):
+        # Nemotron-H's HF name is model.embeddings
+        is_vocab = "embed_tokens" in prefix or "lm_head" in prefix or prefix.endswith(".embeddings")
+        if shrink_size and is_vocab:
             if weight.shape[0] > shrink_size:
                 weight = weight[:shrink_size]
 
@@ -1248,7 +1269,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 bias_tensor = bias
 
             # Apply vocab_size truncation for bias as well
-            if shrink_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
+            if shrink_size is not None and is_vocab:
                 if bias_tensor.shape[0] > shrink_size:
                     bias_tensor = bias_tensor[:shrink_size]
 
@@ -1285,7 +1306,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         raise RuntimeError(f'Unsloth: Cannot find vllm_internal_model!')
 
     embed_tokens = vllm_text_model.embed_tokens
-    get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
+    embed_name = "embeddings" if model_type == "nemotron_h" else "embed_tokens"
+    get_state_dict(f"{vllm_text_model_prefix}.{embed_name}", 0, state_dict, embed_tokens, slice_weights=False)
 
     layer_config = get_model_layer_config()
 
@@ -1348,6 +1370,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.conv"
             for name in ("in_proj", "out_proj", "conv"):
                 get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(layer.short_conv, name), slice_weights=False)
+        elif hasattr(layer, "mixer"):
+            extract_nemotron_h_mixer(
+                layer.mixer, f"{vllm_text_model_prefix}.layers.{kk}.mixer",
+                state_dict, quant_state_dict, get_state_dict, config = text_config,
+            )
         pass
 
         if getattr(layer, "per_layer_input_gate", None) is not None:
@@ -1459,8 +1486,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     if is_vision_model:
         extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-    # Final norm: model.norm, or model.embedding_norm on LFM2
-    norm_name = "norm" if hasattr(vllm_text_model, "norm") else "embedding_norm"
+    # Final norm: model.norm, model.embedding_norm on LFM2, model.norm_f on Nemotron-H
+    norm_name = next(x for x in ("norm", "embedding_norm", "norm_f") if hasattr(vllm_text_model, x))
     norm_prefix = f"{vllm_text_model_prefix}.{norm_name}.weight"
     state_dict[norm_prefix] = getattr(vllm_text_model, norm_name).weight.data
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
@@ -1487,7 +1514,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         get_state_dict("lm_head", 0, state_dict, lm_layer, slice_weights=False)
     else:
         # Fallback to embed_tokens for tied embeddings
-        embed_key = f"{vllm_text_model_prefix}.embed_tokens.weight"
+        embed_key = f"{vllm_text_model_prefix}.{embed_name}.weight"
         if embed_key in state_dict:
             lm_weight = state_dict[embed_key]
             state_dict["lm_head.weight"] = lm_weight
@@ -1737,6 +1764,23 @@ def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, che
 pass
 
 
+def _native_config_for_vllm_rebuild(config):
+    """Native config for a trust_remote_code Nemotron-H: vLLM uses native names, and from_config on the remote config fails on its block names ("mamba")."""
+    if getattr(config, "model_type", None) != "nemotron_h": return config
+    if not str(type(config).__module__).startswith("transformers_modules"): return config
+    try:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        native_class = CONFIG_MAPPING["nemotron_h"]
+    except Exception:
+        return config
+    kwargs = {k: v for k, v in config.to_dict().items() if k not in ("auto_map", "model_type", "layers_block_type")}
+    native = native_class(**kwargs)
+    for attr in ("_name_or_path", "model_name"):
+        if hasattr(config, attr): setattr(native, attr, getattr(config, attr))
+    return native
+pass
+
+
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1744,6 +1788,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     def _unwrap_tensor(value):
         return getattr(value, "data", value)
 
+    config = _native_config_for_vllm_rebuild(config)
     set_dtype_in_config(config, dtype)
     for subconfig_name in ("text_config", "vision_config", "audio_config"):
         subconfig = getattr(config, subconfig_name, None)
@@ -1921,8 +1966,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.to = partial(_override_to, layer)
                 layer.weight.to = partial(_override_to, layer.weight)
 
-            elif (layer_name.endswith(".conv1d") and "linear_attn" in layer_name) or layer_name.endswith(".conv.conv"):
-                # Qwen3.5 GDN / LFM2 depthwise Conv1d: rebuild with real channels/kernel/groups.
+            elif (layer_name.endswith(".conv1d") and ("linear_attn" in layer_name or ".mixer." in layer_name)) or layer_name.endswith(".conv.conv"):
+                # Qwen3.5 GDN / Nemotron-H Mamba / LFM2 depthwise Conv1d: rebuild with real channels/kernel/groups.
                 from torch.nn import Conv1d
                 conv_weight = _unwrap_tensor(weight)
                 channels = conv_weight.shape[0]
@@ -3259,6 +3304,7 @@ def load_vllm(
     max_num_seqs           : int = 256, # how many seqs to process in parallel. 256 / None = pick from free memory
     fp8_mode               : Optional[str] = None,
     max_num_batched_tokens : Optional[int] = None, # chunked prefill budget. None = pick from free memory
+    rope_scaling           : Optional[dict] = None, # caller's RoPE scaling, e.g. YaRN past the native window
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -3388,6 +3434,8 @@ def load_vllm(
             patch_gemma4_vllm_lora_support()
         if use_bitsandbytes:
             patch_gemma4_vllm_k_eq_v_support()
+    if enable_lora:
+        patch_vllm_stacked_moe_lora(config)
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
@@ -3906,6 +3954,19 @@ def load_vllm(
             }
             engine_args["quantization"] = "torchao"
             engine_args["hf_overrides"] = hf_overrides
+
+        # vLLM reads config.json itself, so the caller's RoPE scaling only reaches it as an
+        # override; without it positions past the native window index out of the cos/sin cache.
+        if rope_scaling:
+            rope_overrides = {"rope_scaling": dict(rope_scaling)}
+            # Newer vLLM reads a YaRN max_position_embeddings as already scaled, so raise it to
+            # max_seq_length when the scaled window covers it; else VLLM_ALLOW_LONG_MAX_MODEL_LEN.
+            native_max = getattr(getattr(config, "text_config", config), "max_position_embeddings", None)
+            original_max = rope_scaling.get("original_max_position_embeddings", None)
+            factor = rope_scaling.get("factor", None)
+            if native_max and original_max and factor and native_max < max_seq_length <= original_max * factor:
+                rope_overrides["max_position_embeddings"] = max_seq_length
+            engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **rope_overrides}
 
         # Pin the backend for the worker, which the sys.modules block only reaches under
         # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is
