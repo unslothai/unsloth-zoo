@@ -946,7 +946,8 @@ def test_load_vllm_only_wraps_when_enabled():
         if isinstance(node, ast.If) and "_merged_rollout_mode" in ast.unparse(node.test)
     ]
     assert len(mode_guards) == 1 and ast.unparse(mode_guards[0].test) == (
-        "enable_lora and (not use_async) and (_merged_rollout_mode() == 'attention')"
+        "enable_lora and (not use_async) and (not use_engine) and (not use_bitsandbytes) and (not is_fp8) and "
+        "(_merged_rollout_mode() == 'attention')"
     )
     assert [ast.unparse(t) for t in mode_guards[0].body] == ["engine_args['lora_target_modules'] = list(_MERGED_ROLLOUT_PUNICA_MODULES)"]
     assert source.count("_merged_rollout") == 3
@@ -1128,6 +1129,19 @@ def test_async_engine_is_not_wrapped_and_keeps_vllm_lora(monkeypatch, _isolate):
     assert type(load_lora(model, _ADAPTER_DIR, load_tensors = True)) is _isolate.LoRARequest
 
 
+def test_engine_without_generate_or_chat_is_not_marked_wrapped(_isolate):
+    # load_vllm(use_engine = True) returns an LLMEngine (add_request / step): nothing to wrap.
+    model, llm, vllm_model = _make_model(wrap = False)
+    class _Engine:
+        def add_request(self, *args, **kwargs): pass
+        def step(self): return []
+    engine = _Engine()
+    model.vllm_engine = engine
+    install_merged_rollout_engine_wrapper(engine)
+    assert not getattr(engine, "_unsloth_merged_rollout_wrapped", False)
+    assert type(load_lora(model, _ADAPTER_DIR, load_tensors = True)) is _isolate.LoRARequest
+
+
 # 13. Attention-only mode: fold attention, keep the rest on vLLM LoRA, never send a folded layer twice.
 @pytest.fixture
 def _attention_mode(monkeypatch):
@@ -1186,6 +1200,38 @@ def test_attention_mode_with_only_attention_lora_sends_no_request(_attention_mod
     assert state is not None and not state.rest
     llm.generate(["hi"], lora_request = load_lora(model, _ADAPTER_DIR, load_tensors = True))
     assert llm.calls[-1][1] is None
+
+
+@pytest.mark.parametrize("cause", ["refused", "reset_failed", "mixed_list"])
+@pytest.mark.parametrize("name_check", ["on", "off"])
+def test_attention_engine_never_gets_attention_lora_it_cannot_serve(cause, name_check, monkeypatch, _attention_mode):
+    # vLLM was started without attention LoRA: every path that would hand it attention tensors
+    # (refused model, failed pre-fold cache reset, mixed per-prompt list) must raise, never let
+    # vLLM drop them, even with the name check disabled.
+    if name_check == "off": monkeypatch.setenv("UNSLOTH_DISABLE_LORA_NAME_CHECK", "1")
+    model, llm, vllm_model = _make_model(lora_bias = True) if cause == "refused" else _make_model()
+    llm._unsloth_lora_without_attention = True
+    before = _snapshot(vllm_model)
+    with pytest.raises(RuntimeError, match = "without LoRA on attention"):
+        if cause == "refused":
+            load_lora(model, _ADAPTER_DIR, load_tensors = True)
+        else:
+            request = load_lora(model, _ADAPTER_DIR, load_tensors = True)
+            assert isinstance(request, _MergedLoRARequest)
+            if cause == "reset_failed":
+                _failing_reset(llm, "false", when = {1})
+                llm.generate(["hi"], lora_request = request)
+            else:
+                llm.generate(["hi", "ho"], lora_request = [request, None])
+    _assert_bitwise(before, vllm_model)
+
+
+def test_attention_engine_still_serves_the_unfolded_rest(_attention_mode, _isolate):
+    model, llm, vllm_model = _make_model()
+    llm._unsloth_lora_without_attention = True
+    llm.generate(["hi"], lora_request = load_lora(model, _ADAPTER_DIR, load_tensors = True))
+    sent = llm.calls[-1][1]
+    assert type(sent) is _isolate.LoRARequest and all(".mlp.down_proj." in k for k in sent.lora_tensors)
 
 
 def test_target_parameters_refused_only_when_folding_everything(monkeypatch):
