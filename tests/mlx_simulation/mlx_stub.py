@@ -961,7 +961,9 @@ def grad(fn, argnums=0, **kw):
 
 
 def value_and_grad(fn, argnums=0, **kw):
-    return torch.func.grad_and_value(fn, argnums=argnums)
+    split = lambda *args: (lambda out: (out[0], out) if isinstance(out, (tuple, list)) else (out, out))(fn(*args))  # noqa: E501
+    grad_and_value = torch.func.grad_and_value(split, argnums=argnums, has_aux=True)
+    return lambda *args: (lambda grads, value: (value[1], grads))(*grad_and_value(*args))
 
 
 def vmap(fn, in_axes=0, out_axes=0, **kw):
