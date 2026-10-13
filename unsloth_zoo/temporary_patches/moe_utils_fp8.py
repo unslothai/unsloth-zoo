@@ -232,7 +232,7 @@ def _dequantize_expert_slice(
     return expert_weight.to(target_dtype)
 
 
-# Temporaries per chunk in the block-scaled vectorized dequant (converted weight + expanded scale).
+# Budget for one chunk's temporaries in the block-scaled vectorized dequant (converted weight + expanded scale).
 _VECTORIZED_DEQUANT_CHUNK_BYTES = 256 * 1024 * 1024
 
 def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state, target_dtype: torch.dtype,) -> Optional[torch.Tensor]:
@@ -270,7 +270,8 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
         del w
         out = torch.empty((E, M, N), dtype=target_dtype, device=weight.device)
         per_expert = M * N * out.element_size()
-        step = max(1, _VECTORIZED_DEQUANT_CHUNK_BYTES // max(per_expert, 1))
+        # Two full-size temporaries live per chunk: weight[e0:e1].to(dtype) and s_expanded.
+        step = max(1, _VECTORIZED_DEQUANT_CHUNK_BYTES // max(2 * per_expert, 1))
         for e0 in range(0, E, step):
             e1 = min(E, e0 + step)
             s_expanded = (

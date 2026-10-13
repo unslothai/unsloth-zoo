@@ -87,7 +87,7 @@ def _block_scaled(E, M, N, device):
 def test_vectorized_block_dequant_in_chunks_matches_one_shot(monkeypatch):
     w, s = _block_scaled(5, 256, 384, "cpu")
     ref = w.to(torch.bfloat16) * s.to(torch.bfloat16).repeat_interleave(128, 1).repeat_interleave(128, 2)
-    monkeypatch.setattr(F, "_VECTORIZED_DEQUANT_CHUNK_BYTES", 2 * 256 * 384 * 2)  # 2 experts per chunk
+    monkeypatch.setattr(F, "_VECTORIZED_DEQUANT_CHUNK_BYTES", 2 * 2 * 256 * 384 * 2)  # 2 experts per chunk, 2 temporaries each
     torch.testing.assert_close(F._dequantize_full_expert_weights_vectorized(w, s, torch.bfloat16), ref, rtol = 0, atol = 0)
 
 
@@ -103,6 +103,8 @@ def test_vectorized_block_dequant_peak_stays_near_the_result(monkeypatch):
     torch.cuda.synchronize()
     assert out.shape == (32, 1024, 1024)
     assert torch.cuda.max_memory_allocated() - base < 1.5 * result_bytes
+    # Both chunk temporaries together stay within the budget (small repeat_interleave intermediates aside).
+    assert torch.cuda.max_memory_allocated() - base - result_bytes <= 1.25 * F._VECTORIZED_DEQUANT_CHUNK_BYTES
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
