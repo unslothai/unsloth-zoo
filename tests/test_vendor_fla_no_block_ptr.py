@@ -113,14 +113,61 @@ _SUBPROCESS = textwrap.dedent(
 )
 
 
-@pytest.mark.skipif(
+# chunk_global_cumsum scans one sequence in a loop: zeros with ones on the last 4 tokens give
+# exact small integers, so the tail past 2**31 elements must read back [1, 2, 3, 4] / [4, 3, 2, 1].
+_CUMSUM_SUBPROCESS = textwrap.dedent(
+    """
+    import os
+    os.environ["UNSLOTH_IS_PRESENT"] = "1"
+    os.environ["UNSLOTH_VENDORED_FLA_NO_AUTORUN"] = "1"
+    import torch
+    from unsloth_zoo.temporary_patches.fla_vendor import patch_vendor_fla, _vendored_fla_dir
+    patch_vendor_fla()
+    import fla
+    assert os.path.realpath(fla.__file__).startswith(os.path.realpath(_vendored_fla_dir()))
+    from fla.ops.utils import chunk_global_cumsum
+
+    H, S = 32, 128
+    T = 2**19 + 2**16
+    s = torch.zeros(1, T, H, S, device="cuda", dtype=torch.bfloat16)
+    s[:, -4:] = 1
+    for reverse, tail, rest in ((False, [1, 2, 3, 4], 0), (True, [4, 3, 2, 1], 4)):
+        o = chunk_global_cumsum(s, reverse=reverse, output_dtype=torch.bfloat16)
+        torch.cuda.synchronize()
+        got = o[0, -4:, :, :].float().amax(dim=(1, 2)).tolist(), o[0, -4:, :, :].float().amin(dim=(1, 2)).tolist()
+        assert got == (tail, tail), (reverse, got)
+        head = o[0, :-4]
+        assert head.amax().item() == rest and head.amin().item() == rest, reverse
+        del head
+        del o
+    print(f"peak_gib {torch.cuda.max_memory_reserved() / 2**30:.2f}")
+    print("GLOBAL_CUMSUM_OK")
+    """
+)
+
+
+def _run(script, marker):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
+    assert marker in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr[-4000:]}"
+
+
+_needs_vendored_gpu = pytest.mark.skipif(
     not fla_vendor._vendored_injection_supported() or fla_vendor._gpu_lacks_dot_instructions(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3 (never on RDNA1)",
 )
+
+
+@_needs_vendored_gpu
 def test_single_sequence_past_2_31_matches_split():
     if _free_gib() < 20:
         pytest.skip("needs about 20 GiB of free GPU memory")
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    proc = subprocess.run([sys.executable, "-c", _SUBPROCESS], env=env, capture_output=True, text=True)
-    assert "LONG_SEQUENCE_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr[-4000:]}"
+    _run(_SUBPROCESS, "LONG_SEQUENCE_OK")
+
+
+@_needs_vendored_gpu
+def test_global_cumsum_single_sequence_past_2_31():
+    if _free_gib() < 14:
+        pytest.skip("needs about 14 GiB of free GPU memory")
+    _run(_CUMSUM_SUBPROCESS, "GLOBAL_CUMSUM_OK")

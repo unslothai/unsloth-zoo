@@ -176,7 +176,7 @@ def chunk_global_cumsum_scalar_kernel(
     NT = tl.cdiv(T, BT)
     for i_c in range(NT):
         i_t = NT - 1 - i_c if REVERSE else i_c
-        o_t = i_t * BT + tl.arange(0, BT)
+        o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
         m_t = o_t < T
         if HEAD_FIRST:
             p_s = s + bos*H + i_h*T + o_t
@@ -240,7 +240,7 @@ def chunk_global_cumsum_vector_kernel(
     NT = tl.cdiv(T, BT)
     for i_c in range(NT):
         i_t = NT - 1 - i_c if REVERSE else i_c
-        o_t = i_t * BT + tl.arange(0, BT)
+        o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
         o_s = i_s * BS + tl.arange(0, BS)
         m_s = (o_t[:, None] < T) & (o_s[None, :] < S)
         if HEAD_FIRST:
