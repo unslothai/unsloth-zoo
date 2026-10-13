@@ -4728,9 +4728,33 @@ def _merged_rollout_lora_params(module):
 pass
 
 
+def _merged_rollout_is_param_wrapper(module):
+    """PEFT target_parameters LoRA (ParamWrapper): stacked MoE expert weights."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return isinstance(getattr(module, "parameter_name", None), str) and callable(getattr(module, "get_param", None))
+pass
+
+
+def _merged_rollout_base_weight(module):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if _merged_rollout_is_param_wrapper(module):
+        try: return module.get_param()
+        except Exception: return None
+    return getattr(getattr(module, "base_layer", None), "weight", None)
+pass
+
+
+def _merged_rollout_exact_possible():
+    # All Unsloth Zoo code licensed under LGPLv3
+    if os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "auto").strip().lower() == "copy": return False
+    from .merged_rollout_exact import triton as _triton
+    return _triton is not None and torch.cuda.is_available()
+pass
+
+
 def _merged_rollout_layer_key(module):
     # All Unsloth Zoo code licensed under LGPLv3
-    W = getattr(getattr(module, "base_layer", None), "weight", None)
+    W = _merged_rollout_base_weight(module)
     lora_A = getattr(module, "lora_A", None)
     key = (
         id(module),
@@ -4774,7 +4798,8 @@ pass
 
 class _MergedRolloutState(_MergedRolloutVerdict):
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = ("entries", "depth", "poisoned", "model_ref", "engine_ref", "stream", "host", "folded", "rest")
+    __slots__ = ("entries", "depth", "poisoned", "model_ref", "engine_ref", "stream", "host", "folded", "rest",
+                 "exact_targets", "fixup")
 
     def __init__(self, model, entries):
         self.entries = entries   # (lora module, W the shared base weight, P its pristine copy on the host)
@@ -4782,6 +4807,8 @@ class _MergedRolloutState(_MergedRolloutVerdict):
         self.host = None         # P's arena and its page-lock (unregistered before the arena is freed)
         self.folded = frozenset()  # module names folded; their LoRA tensors never go to vLLM
         self.rest = False        # other LoRA layers exist and are served by vLLM LoRA (attention mode)
+        self.exact_targets = None  # exact mode (P is None): the folded targets until the unfold
+        self.fixup = None        # exact mode: {"bad", "elements"} of the last fold
         self.depth = 0
         self.poisoned = None     # set when the restore failed twice
         self.model_ref = weakref.ref(model)
@@ -4828,8 +4855,12 @@ def _merged_rollout_targets(model):
     if getattr(config, "trainable_token_indices", None):
         return None, "trainable_token_indices adapts the embeddings"
     attention_only = _merged_rollout_mode() == "attention"
-    if getattr(config, "target_parameters", None) and not attention_only:
-        return None, "target_parameters (MoE expert LoRA) is not folded (try UNSLOTH_VLLM_MERGED_ROLLOUT=attention)"
+    fold_experts = not attention_only and _merged_rollout_exact_possible()
+    if getattr(config, "target_parameters", None) and not attention_only and not fold_experts:
+        return None, (
+            "target_parameters (MoE expert LoRA) is only folded by the exact fold (CUDA + Triton); "
+            "try UNSLOTH_VLLM_MERGED_ROLLOUT=attention"
+        )
 
     adapter = _MERGED_ROLLOUT_ADAPTER
     targets = []
@@ -4844,6 +4875,11 @@ def _merged_rollout_targets(model):
         if attention_only and (not _MERGED_ROLLOUT_ATTENTION.search(name) or _MERGED_ROLLOUT_NON_LANGUAGE.search(name)):
             continue
 
+        if _merged_rollout_is_param_wrapper(module):
+            reason = _merged_rollout_expert_refusal(name, module, adapter, fold_experts)
+            if reason is not None: return None, reason
+            targets.append((name, module, module.get_param()))
+            continue
         if _is_moe_expert_lora_key(name + ".lora_A.weight"):
             return None, f"{name} is a MoE expert LoRA"
         if _MERGED_ROLLOUT_NON_LANGUAGE.search(name):
@@ -4948,7 +4984,10 @@ def _prepare_merged_rollout_locked(model):
     else:
         targets, reason = _merged_rollout_targets(model)
     if reason is None:
-        entries, reason = _merged_rollout_host_copies(targets)
+        if _merged_rollout_use_exact(targets):
+            entries = ([(module, W, None) for _, module, W in targets], None)
+        else:
+            entries, reason = _merged_rollout_host_copies(targets)
     if reason is not None:
         modules = _merged_rollout_lora_layers(model)
         model._unsloth_merged_rollout_state = _MergedRolloutVerdict(model, modules, reason)
@@ -4963,12 +5002,16 @@ def _prepare_merged_rollout_locked(model):
     folded_ids = {id(module) for _, module, _ in targets}
     state.rest = any(id(module) not in folded_ids for module in _merged_rollout_lora_layers(model))
     model._unsloth_merged_rollout_state = state
-    nbytes = sum(P.numel() * P.element_size() for _, _, P in entries)
-    pinned = "pinned" if getattr(entries[0][2], "is_pinned", lambda: False)() else "pageable"
     rest = "; the other LoRA layers stay on vLLM LoRA" if state.rest else ""
+    if entries[0][2] is None:
+        how = "exact fold / unfold, no pristine copy (only non-round-tripping elements are kept, in pinned host memory)"
+    else:
+        nbytes = sum(P.numel() * P.element_size() for _, _, P in entries)
+        pinned = "pinned" if getattr(entries[0][2], "is_pinned", lambda: False)() else "pageable"
+        how = f"pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)"
     _merged_rollout_log_once(
         f"Unsloth: Merged-weight rollouts on ({_merged_rollout_mode()}): folding the adapter into {len(entries)} "
-        f"shared weights{rest}; pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)."
+        f"shared weights{rest}; {how}."
     )
     return state
 pass
@@ -5033,6 +5076,7 @@ def _merged_rollout_refresh_pristine(state):
     """Bit-exact sample check of W vs P: catches base reloads that skip _version
     (load_weights into inference tensors, .data writes), then re-copies P from W."""
     # All Unsloth Zoo code licensed under LGPLv3
+    if state.entries[0][2] is None: return False   # exact mode folds whatever W is
     sample_W, sample_P = [], []
     for _, W, P in state.entries:
         sample_W.extend(_merged_rollout_sample(W))
@@ -5100,9 +5144,100 @@ def _merged_rollout_wait_restore(state):
 pass
 
 
-def _merged_rollout_restore(state):
-    """Copy W back from P, retried once (idempotent); two failures poison the state."""
+def _merged_rollout_use_exact(targets):
     # All Unsloth Zoo code licensed under LGPLv3
+    if os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "auto").strip().lower() == "copy": return False
+    from .merged_rollout_exact import exact_merge_available
+    return all(exact_merge_available(W.device) for _, _, W in targets)
+pass
+
+
+def _merged_rollout_expert_refusal(name, module, adapter, fold_experts):
+    """Why a ParamWrapper (stacked expert) LoRA cannot be folded, or None."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not fold_experts:
+        return f"{name} is a MoE expert LoRA, only folded by the exact fold (CUDA + Triton)"
+    if tuple(module.lora_A.keys()) != (adapter,):
+        return f"{name} holds adapters {list(module.lora_A.keys())}"
+    if len(getattr(module, "merged_adapters", None) or ()) != 0:
+        return f"{name} already has a PEFT-merged adapter"
+    if getattr(module, "disable_adapters", False):
+        return f"{name} has its adapters disabled"
+    if getattr(module, "lora_bias", {}).get(adapter, False):
+        return f"{name} uses lora_bias, which adds a bias term"
+    scaling = getattr(module, "scaling", {}).get(adapter, None)
+    if isinstance(scaling, bool) or not isinstance(scaling, (int, float)):
+        return f"{name} has a non-scalar LoRA scaling"
+    W = _merged_rollout_base_weight(module)
+    if not isinstance(W, torch.Tensor) or W.dim() != 3 or getattr(module, "num_experts", 1) != W.shape[0]:
+        return f"{name} is not a stacked [experts, out, in] weight"
+    if W.dtype not in (torch.bfloat16, torch.float16):
+        return f"{name} base weight is {W.dtype}, not 16-bit"
+    if W.requires_grad:
+        return f"{name} base weight is trainable"
+    if W.device.type != "cuda":
+        return f"{name} is on {W.device.type}, and experts are only folded on CUDA"
+    return None
+pass
+
+
+def _merged_rollout_exact_target(ExactFoldTarget, module, W, adapter):
+    """[E, N, K] view of W with per-expert A_e [R, K] and B_e [N, R].
+
+    Dense: E = 1. PEFT target_parameters (ParamWrapper): A is [r * E, in] grouped by expert,
+    B is [out, r * E] interleaved (B.reshape(out, r, E)[:, :, e] is B_e), and W is
+    [E, out, in] when PEFT swapped its in / out features, else [E, in, out].
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    A = module.lora_A[adapter].weight.to(W.dtype)
+    B = module.lora_B[adapter].weight.to(W.dtype)
+    if not _merged_rollout_is_param_wrapper(module):
+        return ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), module.scaling[adapter])
+    E = W.shape[0]
+    rank = A.shape[0] // E
+    a = A.reshape(E, rank, A.shape[1])
+    b = B.reshape(B.shape[0], rank, E).permute(2, 0, 1)
+    w = W if getattr(module, "_did_swap_in_out_features", False) else W.transpose(1, 2)
+    return ExactFoldTarget(w, a, b, module.scaling[adapter])
+pass
+
+
+def _merged_rollout_exact_fold(state, adapter):
+    """Fold in place with the exact kernel; the fix-up store streams to pinned host memory."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    from .merged_rollout_exact import ExactFoldTarget, exact_fold
+    device = state.entries[0][1].device
+    if state.stream is None: state.stream = torch.cuda.Stream(device = device)
+    # A / B are cast once and held until the unfold, so the delta is recomputed from the same bits.
+    targets = [_merged_rollout_exact_target(ExactFoldTarget, module, W, adapter) for module, W, _ in state.entries]
+    state.exact_targets = targets
+    state.fixup = exact_fold(targets, stream = state.stream)
+    _merged_rollout_log_once(
+        f"Unsloth: exact merged rollout keeps {state.fixup['bad']:,} of {state.fixup['elements']:,} weights "
+        f"({100 * state.fixup['bad'] / max(state.fixup['elements'], 1):.2f}%) for the restore."
+    )
+pass
+
+
+def _merged_rollout_restore(state):
+    """Copy W back from P, retried once (idempotent); two failures poison the state.
+    Exact mode unfolds once: an unfold is not idempotent, so any failure poisons."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if state.exact_targets is not None:
+        from .merged_rollout_exact import exact_unfold
+        targets, state.exact_targets = state.exact_targets, None
+        try:
+            _merged_rollout_synchronize(state)
+            with torch.inference_mode():
+                exact_unfold(targets, stream = state.stream)
+            state.record()
+        except BaseException as error:
+            state.poisoned = repr(error)
+            raise RuntimeError(
+                "Unsloth: an exact merged-weight rollout could not restore the base weights; "
+                "the training weights may still hold the folded adapter. Reload the model."
+            ) from error
+        return
     first_error = None
     for _ in range(2):
         try:
@@ -5140,10 +5275,13 @@ def merged_rollout(state):
             if outermost:
                 with torch.inference_mode():
                     _merged_rollout_wait_restore(state)
-                    _merged_rollout_refresh_pristine(state)
-                    # W == P bit for bit here (restored, and sample-checked above).
-                    for module, W, P in state.entries:
-                        _merged_rollout_fold(W, module, adapter)
+                    if state.entries[0][2] is None:
+                        _merged_rollout_exact_fold(state, adapter)
+                    else:
+                        _merged_rollout_refresh_pristine(state)
+                        # W == P bit for bit here (restored, and sample-checked above).
+                        for module, W, P in state.entries:
+                            _merged_rollout_fold(W, module, adapter)
                 _merged_rollout_synchronize(state)
             yield
         finally:
