@@ -38,8 +38,7 @@ _spec.loader.exec_module(bc)
 
 @pytest.fixture(autouse = True)
 def _no_stashed_pristine_checkpoint(monkeypatch):
-    # The stash is process-global and set once by any real patch_unsloth_gradient_checkpointing, so a file run
-    # earlier in the same xdist worker would route _TorchCheckpoint past the checkpoint these tests patch.
+    # Process-global, set once by any real patch_unsloth_gradient_checkpointing in this xdist worker.
     monkeypatch.delattr(torch.utils.checkpoint, "_unsloth_pristine_checkpoint", raising = False)
 
 
@@ -449,8 +448,7 @@ def test_re_enabling_a_transformers_model_keeps_one_embedding_hook():
         num_attention_heads = 2, num_key_value_heads = 2, max_position_embeddings = 16,
     )
     model = transformers.LlamaForCausalLM(config).train()
-    # As PEFT marks it: every transformers version wires the input-grads hook then (4.57 only then), so a re-enable
-    # that stacked hooks would show on both.
+    # As PEFT marks it: transformers 4.57 wires the input-grads hook only then, 5.x always.
     model._hf_peft_config_loaded = True
     for every_n in (1, 2, 1):
         bc.enable_block_gradient_checkpointing(model, every_n)
