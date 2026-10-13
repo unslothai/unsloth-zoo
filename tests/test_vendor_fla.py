@@ -171,7 +171,7 @@ def test_pruned_and_kept_files():
 def test_all_vendored_python_compiles():
     import py_compile
     py_files = sorted(VENDORED.rglob("*.py"))
-    assert len(py_files) == 62, f"expected 62 vendored .py files, got {len(py_files)}"
+    assert len(py_files) == 73, f"expected 73 vendored .py files, got {len(py_files)}"
     for p in py_files:
         py_compile.compile(str(p), doraise=True)
 
@@ -487,8 +487,8 @@ def test_probe_covers_only_vendor_complete_models():
     assert call_as("transformers.models.qwen3_5.modeling_qwen3_5") is True
     assert call_as("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe") is True
     assert call_as("transformers.models.qwen3_next.modeling_qwen3_next") is True
-    # olmo_hybrid needs ShortConvolution (not vendored): must answer False so its
-    # modeling module falls back to pure torch instead of crashing on import.
+    # olmo_hybrid is not validated on the vendored tree: must answer False so its
+    # modeling module keeps the pure torch fallback.
     assert call_as("transformers.models.olmo_hybrid.modeling_olmo_hybrid") is False
     # Non-modeling callers see the vendored fla as available.
     assert call_as("unsloth.models.loader") is True

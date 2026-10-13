@@ -54,7 +54,7 @@ _KDA_MODELING = ("glm5_next", "kimi_linear")
 # Modules whose kernel-hub wrappers are re-resolved against the live fla.
 _HUB_REPAIR_MODELING = _REPAIR_MODELING + _KDA_MODELING
 
-# olmo_hybrid also needs ShortConvolution (not vendored), so it is not covered.
+# olmo_hybrid is not covered: it has not been validated on the vendored tree.
 _VENDOR_COVERED_MODELS = frozenset(_HUB_REPAIR_MODELING)
 
 # All gated-delta consumers; olmo_hybrid can bind an installed fla's #640 kernel.
@@ -485,7 +485,7 @@ def _inject_vendored_fla():
 
 
 def _vendored_availability_probe():
-    """True only for callers the pruned exports cover (olmo_hybrid needs ShortConvolution)."""
+    """True only for callers the vendored tree covers (olmo_hybrid is not validated on it)."""
     try:
         caller = sys._getframe(1).f_globals.get("__name__", "")
     except Exception:

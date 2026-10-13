@@ -97,11 +97,13 @@ description =
     Minimal, pinned, pruned snapshot of fla-core 0.5.1. Only the transitive file
     closure needed by the gated-delta-rule fast path is vendored, so Unsloth can
     enable the Triton kernels for the Qwen3.5 / Qwen3.6 / Qwen3-Next
-    gated-deltanet models and the GLM-5.3-Flash / Kimi-Linear Kimi delta
-    attention models without requiring `pip install flash-linear-attention`.
+    gated-deltanet models, the GLM-5.3-Flash / Kimi-Linear Kimi delta
+    attention models and the Ling 2.5 / 2.6 / 3.0 remote-code models without
+    requiring `pip install flash-linear-attention`.
 
 exported_api =
     fla.modules.FusedRMSNormGated
+    fla.modules.ShortConvolution
     fla.ops.gated_delta_rule.chunk_gated_delta_rule
     fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule
     fla.ops.kda.chunk_kda
@@ -176,6 +178,30 @@ modifications =
       (reference implementations; the first needs einops). The KDA files share
       the vendored ops/common/chunk_delta_h.py, ops/cp and ops/utils, so they
       run on the #953 fix above.
+    - Added the fla.modules ShortConvolution closure for Ling 3.0
+      (BailingMoeV3) remote code, which imports it beside the KDA ops
+      (`from fla.modules import FusedRMSNormGated, ShortConvolution`):
+      modules/conv/{short_conv,causal_conv1d}.py, modules/conv/triton/{__init__,
+      kernels,ops}.py, modules/conv/cp/{__init__,ops}.py and
+      modules/conv/cuda/{__init__,ops}.py verbatim from fla-core 0.5.1, plus
+      two upstream fixes in short_conv.py: fla PR #1257 (FLA_CONV_BACKEND=cuda
+      without causal-conv1d installed now falls back to Triton instead of
+      calling the missing function) and the short_conv hunk of fla PR #1203
+      (a packed batch takes the single-token decode shortcut only when every
+      sequence has exactly one token).
+      modules/conv/__init__.py is narrowed to ShortConvolution and
+      causal_conv1d (long_conv.py is not vendored), and modules/backends/
+      __init__.py registers no backend, since the Triton-Ascend NPU kernels
+      under modules/backends/triton_ascend are not vendored and the tree is
+      only injected on CUDA. fla.modules resolves ShortConvolution lazily: its
+      files import einops, which the gated-deltanet path does not need. Later
+      upstream conv fixes are not backported, as none reaches Ling 3.0's
+      training or decode path: #1097 (more than 65535 sequences per decode
+      launch) and #1139 / #1141 (gradients into a conv cache state, which
+      training never builds). The
+      conv kernels already load varlen sequence starts as int64; offsets
+      inside one sequence stay int32 as in 0.5.1 (upstream #1082), as for KDA
+      above.
     - Backported fla PR #1109 in ops/kda/chunk_bwd.py (+ IS_NVIDIA_SM100 in
       utils/_device.py and utils/__init__.py, each marked with an inline
       "Unsloth: backported from fla PR #1109" comment): on SM100 the
@@ -214,11 +240,12 @@ modifications =
       its lazy imports of those files execute only when the optional `tilelang`
       package is installed and its backend is selected (not the default path).
 
-file_count = 62 python modules + this MANIFEST + LICENSE
+file_count = 73 python modules + this MANIFEST + LICENSE
 closure_measured = 43 python modules for gated_delta_rule (includes naive.py);
     vendored set drops naive.py, leaving 42, plus 5 for simple_gla (its __init__,
     chunk.py, fused_recurrent.py, common/chunk_h.py, common/fused_recurrent.py),
-    plus 15 for kda (11 under ops/kda, 4 under ops/gla).
+    plus 15 for kda (11 under ops/kda, 4 under ops/gla), plus 11 for
+    ShortConvolution (10 under modules/conv, modules/backends/__init__.py).
 
 vendored_by = Unsloth (unsloth_zoo/_vendored/fla)
 """
