@@ -1027,6 +1027,58 @@ def _normalizer():
     return fn
 
 
+@pytest.mark.parametrize("metadata", [None, "attention_mask", "packed_seq_lengths"])
+@pytest.mark.parametrize("width", [1, 6])
+def test_explicit_shift_labels_are_the_authoritative_count(metadata, width):
+    torch = pytest.importorskip("torch")
+    labels = torch.tensor([[0, 1, 2, 3, 4, 5]])[:, :width]
+    targets = torch.tensor([[1, 2, -100, 4, 5, -100]])[:, :width]
+    batch = {"input_ids": labels.clone(), "labels": labels, "shift_labels": targets}
+    if metadata == "attention_mask":
+        batch[metadata] = torch.zeros_like(labels)
+    elif metadata == "packed_seq_lengths":
+        batch[metadata] = [3, 3]
+    before = targets.clone()
+    assert _counted(batch) == (1 if width == 1 else 4)
+    torch.testing.assert_close(targets, before)
+
+
+@pytest.mark.parametrize("microbatches", [1, 2])
+def test_explicit_target_count_preserves_fused_loss_and_gradients(microbatches):
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
+
+    mod = _loss_utils()
+    trainer = _fake_trainer(_tiny_model(), True)
+    batches = [
+        {"labels": torch.tensor([[0, 1, 2, 3, 4, 5]]),
+         "shift_labels": torch.tensor([[1, 2, -100, 4, 5, -100]])}
+        for _ in range(microbatches)
+    ]
+    if microbatches > 1: batches[1]["shift_labels"][0, 0] = -100
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+    _, count = mod._unsloth_get_batch_samples(trainer, iter(batches), microbatches)
+    assert int(count) == (4 if microbatches == 1 else 7)
+    head = torch.nn.Linear(4, 8)
+    hidden = torch.randn(microbatches, 6, 4, requires_grad = True)
+    targets = torch.cat([batch["shift_labels"] for batch in batches])
+    reference = torch.nn.functional.cross_entropy(
+        head(hidden).reshape(-1, 8), targets.reshape(-1),
+    )
+    actual = sum(
+        unsloth_fused_lm_head_loss(
+            hidden[i:i + 1], head, batch["labels"],
+            shift_labels = batch["shift_labels"], num_items_in_batch = count,
+            torch_compile = False, n_chunks = 2,
+        )
+        for i, batch in enumerate(batches)
+    )
+    params = (hidden, head.weight, head.bias)
+    torch.testing.assert_close(actual, reference)
+    for got, expected in zip(torch.autograd.grad(actual, params), torch.autograd.grad(reference, params)):
+        torch.testing.assert_close(got, expected)
+
+
 def test_normalize_accepts_every_shape_a_collator_can_emit():
     torch = pytest.importorskip("torch")
     normalize = _normalizer()

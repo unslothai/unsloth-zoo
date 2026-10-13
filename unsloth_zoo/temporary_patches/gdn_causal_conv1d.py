@@ -18,7 +18,8 @@
 
 Replaces the transformers `F.conv1d` fallback (Qwen3.5/3.6, Qwen3-Next), reading and
 writing channel-last directly to skip the transpose copies. Layout follows fla's
-`causal_conv1d` (fla-org/flash-linear-attention, MIT), without varlen / initial state.
+`causal_conv1d` (fla-org/flash-linear-attention, MIT), without initial state; `seq_idx`
+(B, T) keeps taps inside one packed sequence.
 Numerics match torch: fp32 accumulate, pre-activation and SiLU grad rounded to input dtype.
 ``UNSLOTH_DISABLE_TRITON_CAUSAL_CONV1D=1`` keeps the torch fallback; a usable
 `causal_conv1d` package always wins.
@@ -53,7 +54,7 @@ _GDN_LEAVES = frozenset(
     for prefix in ("modeling", "unsloth_compiled_module")
 )
 
-GDN_CAUSAL_CONV1D_STATS = {"triton_fwd": 0, "triton_bwd": 0, "fallback": 0}
+GDN_CAUSAL_CONV1D_STATS = {"triton_fwd": 0, "triton_bwd": 0, "triton_seq_idx": 0, "fallback": 0}
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MAX_WIDTH = 8
@@ -83,7 +84,8 @@ def _is_marked(fn):
 
 
 def _build_kernels():
-    global _kernels
+    # Triton 3.3 resolves nested kernels' `tl.constexpr` via globals ("tl is not defined").
+    global _kernels, tl
     if _kernels is not None:
         return _kernels
     import triton
@@ -91,7 +93,7 @@ def _build_kernels():
 
     @triton.jit
     def _causal_conv1d_fwd_kernel(
-        x, weight, bias, y,
+        x, weight, bias, y, seq_idx,
         T, D,
         stride_x_b, stride_x_t, stride_x_d,
         W: tl.constexpr,
@@ -99,6 +101,7 @@ def _build_kernels():
         BD: tl.constexpr,
         HAS_BIAS: tl.constexpr,
         ACTIVATION: tl.constexpr,
+        HAS_SEQ_IDX: tl.constexpr,
     ):
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
@@ -107,11 +110,17 @@ def _build_kernels():
         # int64: channel-first x / dy has stride_d = T, and (D - 1) * T can pass 2**31.
         o_d64 = o_d.to(tl.int64)
         p_x = x + tl.cast(i_b, tl.int64) * stride_x_b
+        if HAS_SEQ_IDX:
+            p_s = seq_idx + tl.cast(i_b, tl.int64) * T
+            b_s = tl.load(p_s + o_t, mask = o_t < T, other = -1)
         acc = tl.zeros((BT, BD), dtype = tl.float32)
         for i_w in tl.static_range(W):
             # Output t sees x[t - (W - 1) + i_w] (left zero padding of W - 1).
             s_t = o_t - (W - 1) + i_w
-            m = ((s_t >= 0) & (s_t < T))[:, None] & m_d[None, :]
+            m_t = (s_t >= 0) & (s_t < T)
+            if HAS_SEQ_IDX:
+                m_t = m_t & (tl.load(p_s + s_t, mask = m_t, other = -2) == b_s)
+            m = m_t[:, None] & m_d[None, :]
             b_x = tl.load(
                 p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
                 mask = m, other = 0,
@@ -129,7 +138,7 @@ def _build_kernels():
 
     @triton.jit
     def _causal_conv1d_bwd_kernel(
-        x, weight, bias, dy, dx, dw, db,
+        x, weight, bias, dy, dx, dw, db, seq_idx,
         T, D, NT,
         stride_x_b, stride_x_t, stride_x_d,
         stride_dy_b, stride_dy_t, stride_dy_d,
@@ -141,6 +150,7 @@ def _build_kernels():
         NEED_DX: tl.constexpr,
         NEED_DW: tl.constexpr,
         NEED_DB: tl.constexpr,
+        HAS_SEQ_IDX: tl.constexpr,
     ):
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
@@ -149,6 +159,9 @@ def _build_kernels():
         o_d64 = o_d.to(tl.int64)
         p_x = x + tl.cast(i_b, tl.int64) * stride_x_b
         p_dy = dy + tl.cast(i_b, tl.int64) * stride_dy_b
+        if HAS_SEQ_IDX:
+            p_s = seq_idx + tl.cast(i_b, tl.int64) * T
+            b_s = tl.load(p_s + o_t, mask = o_t < T, other = -1)
         if HAS_BIAS:
             b_bias = tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)
 
@@ -157,6 +170,8 @@ def _build_kernels():
         for k in tl.static_range(W):
             r_t = o_t + k
             m_r = r_t < T
+            if HAS_SEQ_IDX:
+                b_sr = tl.load(p_s + r_t, mask = m_r, other = -1)
             b_g = tl.load(
                 p_dy + r_t.to(tl.int64)[:, None] * stride_dy_t + o_d64[None, :] * stride_dy_d,
                 mask = m_r[:, None] & m_d[None, :], other = 0,
@@ -165,7 +180,10 @@ def _build_kernels():
                 b_pre = tl.zeros((BT, BD), dtype = tl.float32)
                 for j in tl.static_range(W):
                     s_t = r_t - (W - 1) + j
-                    m = ((s_t >= 0) & (s_t < T))[:, None] & m_d[None, :]
+                    m_t = (s_t >= 0) & (s_t < T)
+                    if HAS_SEQ_IDX:
+                        m_t = m_t & (tl.load(p_s + s_t, mask = m_t, other = -2) == b_sr)
+                    m = m_t[:, None] & m_d[None, :]
                     b_xs = tl.load(
                         p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
                         mask = m, other = 0,
@@ -187,7 +205,10 @@ def _build_kernels():
                     # dw[j] = sum_t g[t] * x[t - (W - 1) + j] over this tile's rows.
                     for j in tl.static_range(W):
                         s_t = o_t - (W - 1) + j
-                        m = ((s_t >= 0) & (s_t < T))[:, None] & m_d[None, :]
+                        m_t = (s_t >= 0) & (s_t < T)
+                        if HAS_SEQ_IDX:
+                            m_t = m_t & (tl.load(p_s + s_t, mask = m_t, other = -2) == b_s)
+                        m = m_t[:, None] & m_d[None, :]
                         b_xs = tl.load(
                             p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
                             mask = m, other = 0,
@@ -198,6 +219,8 @@ def _build_kernels():
                         )
             if NEED_DX:
                 b_wk = tl.load(weight + o_d * W + (W - 1 - k), mask = m_d, other = 0).to(tl.float32)
+                if HAS_SEQ_IDX:
+                    b_g = tl.where((b_sr == b_s)[:, None], b_g, 0.0)
                 b_dx += b_g * b_wk[None, :]
         if NEED_DX:
             p_dx = dx + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
@@ -214,7 +237,7 @@ _BWD_CONFIG = (16, 64, 2)
 _MAX_GRID_YZ = 65535
 
 
-def _launch_fwd(x_btd, weight, bias, activation):
+def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None):
     fwd, _ = _build_kernels()
     _BT, _BD, _NUM_WARPS = _FWD_CONFIG
     B, T, D = x_btd.shape
@@ -224,17 +247,19 @@ def _launch_fwd(x_btd, weight, bias, activation):
     with torch.cuda.device(x_btd.device):
         fwd[grid](
             x_btd, weight, bias if bias is not None else weight, y,
+            seq_idx if seq_idx is not None else weight,
             T, D,
             x_btd.stride(0), x_btd.stride(1), x_btd.stride(2),
             W = W, BT = _BT, BD = _BD,
             HAS_BIAS = bias is not None,
             ACTIVATION = activation is not None,
+            HAS_SEQ_IDX = seq_idx is not None,
             num_warps = _NUM_WARPS,
         )
     return y
 
 
-def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_db):
+def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_db, seq_idx = None):
     _, bwd = _build_kernels()
     _BT, _BD, _NUM_WARPS = _BWD_CONFIG
     B, T, D = x_btd.shape
@@ -250,6 +275,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
             dx if dx is not None else x_btd,
             dw if dw is not None else weight,
             db if db is not None else weight,
+            seq_idx if seq_idx is not None else weight,
             T, D, NT,
             x_btd.stride(0), x_btd.stride(1), x_btd.stride(2),
             dy_btd.stride(0), dy_btd.stride(1), dy_btd.stride(2),
@@ -257,6 +283,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
             HAS_BIAS = bias is not None,
             ACTIVATION = activation is not None,
             NEED_DX = need_dx, NEED_DW = need_dw, NEED_DB = need_db,
+            HAS_SEQ_IDX = seq_idx is not None,
             num_warps = _NUM_WARPS,
         )
     if dw is not None:
@@ -268,22 +295,24 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
 
 class _CausalConv1dFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x_bdt, weight, bias, activation):
-        y_btd = _launch_fwd(x_bdt.transpose(1, 2), weight, bias, activation)
-        ctx.save_for_backward(x_bdt, weight, bias)
+    def forward(ctx, x_bdt, weight, bias, activation, seq_idx = None):
+        y_btd = _launch_fwd(x_bdt.transpose(1, 2), weight, bias, activation, seq_idx)
+        ctx.save_for_backward(x_bdt, weight, bias, seq_idx)
         ctx.activation = activation
         GDN_CAUSAL_CONV1D_STATS["triton_fwd"] += 1
+        if seq_idx is not None:
+            GDN_CAUSAL_CONV1D_STATS["triton_seq_idx"] += 1
         return y_btd.transpose(1, 2)
 
     @staticmethod
     def backward(ctx, dy_bdt):
-        x_bdt, weight, bias = ctx.saved_tensors
+        x_bdt, weight, bias, seq_idx = ctx.saved_tensors
         dx, dw, db = _launch_bwd(
             x_bdt.transpose(1, 2), weight, bias, dy_bdt.transpose(1, 2),
-            ctx.activation, *ctx.needs_input_grad[:3],
+            ctx.activation, *ctx.needs_input_grad[:3], seq_idx = seq_idx,
         )
         GDN_CAUSAL_CONV1D_STATS["triton_bwd"] += 1
-        return (dx.transpose(1, 2) if dx is not None else None), dw, db, None
+        return (dx.transpose(1, 2) if dx is not None else None), dw, db, None, None
 
 
 def _act(activation):
@@ -304,7 +333,25 @@ def causal_conv1d_reference(x, weight, bias = None, activation = None):
     return out.to(x.dtype)
 
 
-def _eligible(x, weight, bias, activation):
+def _check_seq_idx(x, seq_idx):
+    """Validate seq_idx (B, T); raise rather than silently drop a mis-shaped one."""
+    if seq_idx is None:
+        return None
+    if (
+        not isinstance(seq_idx, torch.Tensor) or seq_idx.dim() != 2
+        or tuple(seq_idx.shape) != (x.shape[0], x.shape[-1])
+        or seq_idx.dtype.is_floating_point or seq_idx.dtype.is_complex or seq_idx.dtype == torch.bool
+    ):
+        raise ValueError(
+            "Unsloth: causal_conv1d seq_idx must be an integer tensor of shape (batch, seqlen) = "
+            f"{(x.shape[0], x.shape[-1])}, got {getattr(seq_idx, 'dtype', type(seq_idx))} "
+            f"{getattr(seq_idx, 'shape', '')}."
+        )
+    # Collators may leave it on CPU; a host to device copy can be async, the reverse cannot.
+    return seq_idx.to(device = x.device, non_blocking = x.device.type != "cpu")
+
+
+def _eligible(x, weight, bias, activation, seq_idx = None):
     if not (
         x.is_cuda and x.dim() == 3 and x.numel() > 0 and x.dtype in _SUPPORTED_DTYPES
         and weight.dim() == 2 and weight.dtype == x.dtype and weight.device == x.device
@@ -314,6 +361,7 @@ def _eligible(x, weight, bias, activation):
             bias.dtype == x.dtype and bias.device == x.device
             and bias.shape == (x.shape[1],) and bias.is_contiguous()
         ))
+        and (seq_idx is None or seq_idx.device == x.device)
     ):
         return False
     # Both launches must fit the grid: the backward tiles T finer and has no fallback.
@@ -321,21 +369,28 @@ def _eligible(x, weight, bias, activation):
     return x.shape[0] <= _MAX_GRID_YZ and (x.shape[2] + min_bt - 1) // min_bt <= _MAX_GRID_YZ
 
 
-def triton_causal_conv1d(x, weight, bias = None, activation = None):
-    """x (B, D, T), weight (D, W) -> (B, D, T) stored channel-last."""
-    return _CausalConv1dFunction.apply(x, weight, bias, activation)
+def triton_causal_conv1d(x, weight, bias = None, activation = None, seq_idx = None):
+    """x (B, D, T), weight (D, W), seq_idx (B, T) -> (B, D, T) stored channel-last."""
+    if seq_idx is not None:
+        seq_idx = _check_seq_idx(x, seq_idx)
+        # Kernels only compare IDs for equality in the loaded dtype: never narrow (0 == 2**32 in
+        # int32); widen the rest (int8/16, uint*) to int64, a bijection for uint64.
+        if seq_idx.dtype not in (torch.int32, torch.int64):
+            seq_idx = seq_idx.to(torch.int64)
+        seq_idx = seq_idx.contiguous()
+    return _CausalConv1dFunction.apply(x, weight, bias, activation, seq_idx)
 
 
-def _try_fast(x, weight, bias, activation):
+def _try_fast(x, weight, bias, activation, seq_idx = None):
     """Run the Triton kernel, or return None to use the torch fallback."""
     global _broken
     # Under torch.compile (decode regions) trace the torch path, never the launcher.
     if _broken or torch.compiler.is_compiling() or _disabled():
         return None
-    if not _eligible(x, weight, bias, activation):
+    if not _eligible(x, weight, bias, activation, seq_idx):
         return None
     try:
-        return triton_causal_conv1d(x, weight, bias, activation)
+        return triton_causal_conv1d(x, weight, bias, activation, seq_idx)
     except torch.cuda.OutOfMemoryError:
         # Not a kernel fault: a caught OOM (batch size finders) must not disable it for good.
         raise
@@ -352,10 +407,29 @@ def _count_fallback():
         GDN_CAUSAL_CONV1D_STATS["fallback"] += 1
 
 
+def _causal_conv1d_any(x, weight, bias = None, activation = None, seq_idx = None):
+    seq_idx = _check_seq_idx(x, seq_idx)
+    out = _try_fast(x, weight, bias, activation, seq_idx)
+    if out is not None:
+        return out
+    _count_fallback()
+    return _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx)
+
+
+def _own_signature(fn):
+    # Else signature follows __wrapped__ (or a __signature__ functools.wraps copied) and the
+    # hub wrapper drops `seq_idx`.
+    fn.__dict__.pop("__signature__", None)
+    fn.__signature__ = inspect.signature(fn, follow_wrapped = False)
+    return fn
+
+
 def _make_hub_dispatch(torch_function):
-    """Wrap the transformers torch fallback (which ignores its kwargs)."""
+    """Wrap the transformers torch fallback; names `seq_idx` for the hub wrapper and packing gate."""
     @functools.wraps(torch_function)
-    def causal_conv1d_fn(hidden_states, weight, bias = None, activation = None, **kwargs):
+    def causal_conv1d_fn(hidden_states, weight, bias = None, activation = None, seq_idx = None, **kwargs):
+        if seq_idx is not None:
+            return _causal_conv1d_any(hidden_states, weight, bias, activation, seq_idx)
         out = _try_fast(hidden_states, weight, bias, activation)
         if out is not None:
             return out
@@ -363,20 +437,24 @@ def _make_hub_dispatch(torch_function):
         return torch_function(hidden_states, weight, bias, activation, **kwargs)
 
     setattr(causal_conv1d_fn, _MARK, True)
-    return causal_conv1d_fn
+    return _own_signature(causal_conv1d_fn)
 
 
 def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
     """Torch causal conv whose taps do not cross `seq_idx` (B, T) boundaries."""
     import torch.nn.functional as F
+    seq_idx = _check_seq_idx(x, seq_idx)
+    if seq_idx is None:
+        return causal_conv1d_reference(x, weight, bias, activation)
     W, T = weight.shape[-1], x.shape[-1]
     acc = torch.promote_types(weight.dtype, torch.float32)
     xp = F.pad(x.to(acc), (W - 1, 0))
+    # int64 on both sides: torch has no promotion for uint16/32/64.
     sp = F.pad(seq_idx.to(torch.int64), (W - 1, 0), value = -1)
     w = weight.to(acc)
     out = torch.zeros_like(xp[:, :, :T])
     for j in range(W):
-        same = (sp[:, j:j + T] == seq_idx).unsqueeze(1)
+        same = (sp[:, j:j + T] == sp[:, W - 1:]).unsqueeze(1)
         out = out + xp[:, :, j:j + T] * w[:, j].view(1, -1, 1) * same
     if bias is not None:
         out = out + bias.to(acc).view(1, -1, 1)
@@ -386,24 +464,14 @@ def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
     return out.to(x.dtype)
 
 
-def _legacy_causal_conv1d_fn(x, weight, bias = None, activation = None, **kwargs):
-    """`causal_conv1d_fn` stand-in for transformers < 5.15 (used only when not None).
-    `seq_idx` is deliberately not named: the hybrid packing gate enables packing when the
-    signature names it. If passed (5.9 to 5.14), a per-segment torch path honours it."""
-    seq_idx = kwargs.pop("seq_idx", None)
+def _legacy_causal_conv1d_fn(x, weight, bias = None, activation = None, seq_idx = None, **kwargs):
+    """`causal_conv1d_fn` stand-in for transformers < 5.15; names `seq_idx` for the packing gate."""
     unsupported = sorted(k for k, v in kwargs.items() if v is not None and v is not False)
     if unsupported:
         raise NotImplementedError(
             f"Unsloth: the torch causal_conv1d fallback does not support {unsupported}."
         )
-    if seq_idx is None:
-        out = _try_fast(x, weight, bias, activation)
-        if out is not None:
-            return out
-    _count_fallback()
-    if seq_idx is not None:
-        return _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx)
-    return causal_conv1d_reference(x, weight, bias, activation)
+    return _causal_conv1d_any(x, weight, bias, activation, seq_idx)
 
 
 setattr(_legacy_causal_conv1d_fn, _MARK, True)

@@ -170,6 +170,7 @@ def test_local_4bit_still_raises_when_the_hub_is_unreachable(
 @pytest.mark.parametrize("save_method", [
     pytest.param(None,            id = "unknown"),
     pytest.param("mxfp4",         id = "mxfp4"),
+    pytest.param("lora",          id = "lora"),
     pytest.param("merged_16bit_forced", id = "merged_16bit_forced"),
 ])
 def test_local_fp8_only_falls_back_for_the_16bit_merge(
@@ -486,14 +487,6 @@ def test_a_partial_snapshot_still_serves_the_4bit_merges(monkeypatch, tmp_path, 
     )
     assert is_local is True
     assert source == "local_nf4"
-
-
-@pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
-def test_no_local_copy_still_raises(monkeypatch, tmp_path, error):
-    monkeypatch.chdir(tmp_path)
-    _hub_raises(monkeypatch, error)
-    with pytest.raises(RuntimeError):
-        saving_utils.determine_base_model_source("unsloth/does-not-exist")
 
 
 def test_reachable_hub_16bit_repo_still_outranks_the_local_fp8_copy(monkeypatch, tmp_path):

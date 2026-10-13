@@ -54,8 +54,14 @@ def chunked_selective_log_softmax(
     temperature: float = 1.0,
     chunks: int = 4,
 ):
-    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = chunks, dim = 0)
-    chunked_index  = torch.chunk(index.reshape(-1), chunks = chunks, dim = 0)
+    # Fixed `chunks` row ranges; see chunked_hidden_states_selective_log_softmax.
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_index = index.reshape(-1)
+    # Fewer rows than chunks: one row per range, as torch.chunk did, never empty ranges.
+    chunks = max(1, min(chunks, flat_logits.shape[0]))
+    bounds = [(i * flat_logits.shape[0]) // chunks for i in range(chunks + 1)]
+    chunked_logits = [flat_logits[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+    chunked_index  = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
     all_per_token_logps = []
     # Per-chunk selective_log_softmax.
     for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
@@ -101,6 +107,7 @@ def chunked_hidden_states_selective_log_softmax(
         if os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip().isdigit()
         else 0
     ),
+    lm_head_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
     # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
@@ -127,18 +134,18 @@ def chunked_hidden_states_selective_log_softmax(
 
     # A one-row chunk's head gradient is a K=1 matmul Inductor mis-lowers under dynamic shapes (illegal
     # memory access or NaN head gradients, torch 2.13), so keep chunks at 2+ rows when the head trains.
+    # Exactly `chunks` row ranges, so the unrolled loop length never depends on T: torch.chunk
+    # returns ceil(T / ceil(T / chunks)) pieces and recompiled per new count; tensor_split guards
+    # on T % chunks. At most rows // 2 chunks when the head trains keeps every piece at 2+ rows.
     lm_head_grad = torch.is_grad_enabled() and lm_head.requires_grad
-    if lm_head_grad and chunks >= flat_hidden_states.shape[0]:
+    if lm_head_grad and flat_hidden_states.shape[0] < 2 * chunks:
         chunks = max(flat_hidden_states.shape[0] // 2, 1)
 
-    chunked_hidden_states = list(torch.chunk(flat_hidden_states, chunks=chunks, dim=0))
-    chunked_index = list(torch.chunk(flat_index, chunks=chunks, dim=0))
-    if lm_head_grad and len(chunked_hidden_states) > 1 and chunked_hidden_states[-1].shape[0] == 1:
-        # Re-split with the previous chunk: max_rows_per_chunk then only breaks for a cap of 2 over odd rows.
-        for chunked in (chunked_hidden_states, chunked_index):
-            pair = torch.cat(chunked[-2:])
-            half = (pair.shape[0] + 1) // 2
-            chunked[-2:] = [pair[:half], pair[half:]] if pair.shape[0] >= 4 else [pair]
+    n_rows = flat_hidden_states.shape[0]
+    chunks = max(1, min(chunks, n_rows))
+    bounds = [(i * n_rows) // chunks for i in range(chunks + 1)]
+    chunked_hidden_states = [flat_hidden_states[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+    chunked_index = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
 
     all_per_token_logps = []
 
@@ -153,7 +160,10 @@ def chunked_hidden_states_selective_log_softmax(
         # bit-identical to before.
         chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
         chunk_index = chunk_index.to(lm_head.device)
-        chunk_logits = chunk_hidden_states @ lm_head.t()
+        if lm_head_bias is None:
+            chunk_logits = chunk_hidden_states @ lm_head.t()
+        else:
+            chunk_logits = torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
@@ -1414,6 +1424,7 @@ def grpo_accumulated_loss(
     from unsloth_zoo.rl_replacements import (
         grpo_shared_vision_inputs as _grpo_get_vision_inputs,
         grpo_vision_chunks as _grpo_vision_chunks,
+        chunked_hidden_states_selective_log_softmax,
     )
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
@@ -1543,7 +1554,14 @@ def grpo_accumulated_loss(
     _unsloth_prior_hidden_states = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES")
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
     try:
-        lm_head = trainer.model.get_output_embeddings().weight
+        output_embeddings = trainer.model.get_output_embeddings()
+        lm_head = output_embeddings.weight
+        lm_head_bias = getattr(output_embeddings, "bias", None)
+        if lm_head_bias is not None:
+            from functools import partial
+            chunked_hidden_states_selective_log_softmax = partial(
+                chunked_hidden_states_selective_log_softmax, lm_head_bias = lm_head_bias,
+            )
         # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
         _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
         dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
@@ -2060,7 +2078,7 @@ def grpo_accumulated_loss(
             @staticmethod
             def forward(ctx, hidden_states, lm_head, index, chunks,
                         logit_scale_multiply, logit_scale_divide,
-                        logit_softcapping, temperature):
+                        logit_softcapping, temperature, lm_head_bias = None):
                 # Detach so we don't keep the graph (and extra memory) on CPU.
                 detached_hidden_states = hidden_states.detach().contiguous()
                 ctx.device = hidden_states.device
@@ -2112,12 +2130,15 @@ def grpo_accumulated_loss(
 
                 ctx.lm_head = lm_head
                 ctx.lm_head_requires_grad = lm_head.requires_grad
+                ctx.lm_head_bias = lm_head_bias
+                ctx.bias_requires_grad = lm_head_bias is not None and lm_head_bias.requires_grad
                 ctx.index = index
                 ctx.args = (chunks, logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature)
 
+                bias_kwargs = {} if lm_head_bias is None else {"lm_head_bias": lm_head_bias}
                 with torch.no_grad():
                     output = chunked_hidden_states_selective_log_softmax(
-                        hidden_states, lm_head, index, *ctx.args
+                        hidden_states, lm_head, index, *ctx.args, **bias_kwargs,
                     )
 
                 return output
@@ -2138,20 +2159,25 @@ def grpo_accumulated_loss(
                     # it here would run a user's grad mask / scaler once on this local
                     # gradient and again when the returned gradient reaches lm_head.
                     lm_head = lm_head.detach().requires_grad_(True)
+                lm_head_bias = ctx.lm_head_bias
+                if ctx.bias_requires_grad:
+                    lm_head_bias = lm_head_bias.detach().requires_grad_(True)
                 index = ctx.index
 
+                bias_kwargs = {} if lm_head_bias is None else {"lm_head_bias": lm_head_bias}
                 with torch.enable_grad(), torch.autocast(**ctx.autocast_kwargs):
                     output = chunked_hidden_states_selective_log_softmax(
-                        hidden_states, lm_head, index, *ctx.args
+                        hidden_states, lm_head, index, *ctx.args, **bias_kwargs,
                     )
 
                 # autograd.grad, not backward: backward writes into leaf .grad, which the
                 # outer AccumulateGrad would then double-count.
-                grad_inputs = torch.autograd.grad(
-                    output,
-                    (hidden_states, lm_head) if ctx.lm_head_requires_grad else (hidden_states,),
-                    grad_output,
-                )
+                inputs = [hidden_states]
+                if ctx.lm_head_requires_grad:
+                    inputs.append(lm_head)
+                if ctx.bias_requires_grad:
+                    inputs.append(lm_head_bias)
+                grad_inputs = torch.autograd.grad(output, inputs, grad_output)
 
                 return (
                     grad_inputs[0],
@@ -2162,11 +2188,13 @@ def grpo_accumulated_loss(
                     None,
                     None,
                     None,
+                    grad_inputs[-1] if ctx.bias_requires_grad else None,
                 )
 
         def efficient_log_softmax(hidden_states, lm_head, index, chunks=32,
                                 logit_scale_multiply=0.0, logit_scale_divide=0.0,
-                                logit_softcapping=0.0, temperature=1, batch_size=8):
+                                logit_softcapping=0.0, temperature=1, batch_size=8,
+                                lm_head_bias=None):
             if (index.shape[1] <= 1024 and batch_size <= 8) or batch_size==1:
                 # Normal path is faster / saves a GB under these conditions.
                 return chunked_hidden_states_selective_log_softmax(
@@ -2177,13 +2205,14 @@ def grpo_accumulated_loss(
                     logit_scale_multiply,
                     logit_scale_divide,
                     logit_softcapping,
-                    temperature
+                    temperature,
+                    lm_head_bias = lm_head_bias,
                 )
             else:
                 return Unsloth_Offloaded_Log_Softmax.apply(
                     hidden_states, lm_head, index, chunks,
                     logit_scale_multiply, logit_scale_divide,
-                    logit_softcapping, temperature
+                    logit_softcapping, temperature, lm_head_bias,
                 )
 
         def compute_logprobs_chunk(new_hidden_states_chunk, completion_ids, input_ids_chunk):
@@ -2201,6 +2230,7 @@ def grpo_accumulated_loss(
                     logit_softcapping = logit_softcapping,
                     temperature = temperature,
                     batch_size = B,
+                    lm_head_bias = lm_head_bias,
                 )
             return chunked_selective_log_softmax(
                 new_hidden_states_chunk,

@@ -32,6 +32,7 @@ if not hasattr(torch.compiler, "set_stance"):
     pytest.skip("torch < 2.6 has no torch.compiler.set_stance, so Unsloth never switches the stance", allow_module_level = True)
 
 from unsloth_zoo import compiler
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 from unsloth_zoo.temporary_patches.utils import (
     UNSLOTH_DECODE_COMPILE,
     UNSLOTH_EAGER_STANCE_OWNED,
@@ -62,6 +63,9 @@ def ForCausalLMLoss(logits, labels, vocab_size = None, **kwargs):
     return torch.nn.functional.cross_entropy(
         logits[:, :-1].reshape(-1, logits.shape[-1]).float(), labels[:, 1:].reshape(-1), ignore_index = -100,
     )
+
+
+ForCausalLMLoss._unsloth_fused_loss = ForCausalLMLoss
 
 
 def _fused_ce(hidden_states, lm_head_weight, labels, **kwargs):
@@ -102,6 +106,7 @@ def _generated_module(compiled, name = "unsloth_compiled_module_test"):
         "HAS_CUT_CROSS_ENTROPY": False,
         "UNSLOTH_COMPILE_DISABLE": True,
         "unsloth_fused_ce_loss": _fused_ce,
+        "_can_fuse_loss": _can_fuse_loss,
         "UNSLOTH_DECODE_COMPILE": UNSLOTH_DECODE_COMPILE,
         "UNSLOTH_ENABLE_LOGGING": False,
         "logger_compiler": logging.getLogger(__name__),
@@ -449,3 +454,24 @@ def test_owned_entry_is_dropped_when_the_caller_replaces_the_stance():
     torch.compiler.set_stance("default")
     gc.collect()
     assert UNSLOTH_EAGER_STANCE_OWNED == []
+
+
+def test_a_stance_freed_at_interpreter_shutdown_does_not_raise(monkeypatch):
+    # Module teardown sets globals to None before the weakref callback of a still-claimed stance runs.
+    from unsloth_zoo.temporary_patches import utils as stance_utils
+
+    class Stance:
+        pass
+
+    raised = []
+    monkeypatch.setattr(sys, "unraisablehook", raised.append)
+    # Our own reference keeps the claimed weakref alive past the teardown, so its callback runs.
+    owned = []
+    monkeypatch.setattr(stance_utils, "UNSLOTH_EAGER_STANCE_OWNED", owned)
+    stance = Stance()
+    stance_utils.unsloth_claim_eager_stance(stance)
+    assert len(owned) == 1
+    monkeypatch.setattr(stance_utils, "UNSLOTH_EAGER_STANCE_OWNED", None)
+    del stance
+    gc.collect()
+    assert not raised, [str(r.exc_value) for r in raised]
