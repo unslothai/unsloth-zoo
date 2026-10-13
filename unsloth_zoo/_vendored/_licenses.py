@@ -196,8 +196,9 @@ modifications =
     - Sequence start offsets past 2**31 elements (fixed upstream after 0.5.1 by
       fla PR #1329, which forces int64 program ids everywhere). In
       ops/gated_delta_rule/chunk_fwd.py, ops/kda/{chunk_bwd,chunk_intra,
-      chunk_intra_token_parallel,gate,wy_fast}.py, ops/utils/cumsum.py and
-      ops/common/chunk_delta_h.py, kernels that add `bos * H * K`-style
+      chunk_intra_token_parallel,gate,wy_fast}.py, ops/utils/cumsum.py,
+      ops/common/chunk_delta_h.py and ops/common/chunk_h.py (the simple_gla /
+      GLA state kernels), kernels that add `bos * H * K`-style
       sequence start offsets in int32 take a LONG_INDEXING constexpr that
       widens `bos` to int64 only when the launcher's shapes can pass 2**31
       elements, so normal sizes keep the int32 code (forced int64 is slower).

@@ -61,6 +61,7 @@ def chunk_fwd_kernel_h(
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_h = i_nh // H, i_nh % H
@@ -73,6 +74,8 @@ def chunk_fwd_kernel_h(
         bos, eos = i_n * T, i_n * T + T
         NT, NS = tl.cdiv(T, BT), tl.cdiv(T, BS)
         boh = i_n * NS
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
     NTS = BS // BT
 
     if USE_G_GAMMA:
@@ -201,6 +204,7 @@ def chunk_bwd_kernel_dh(
     USE_FINAL_STATE_GRADIENT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hq = i_nh // HQ, i_nh % HQ
@@ -216,6 +220,8 @@ def chunk_bwd_kernel_dh(
         NT = tl.cdiv(T, BT)
         NS = tl.cdiv(T, BS)
         boh = i_n * NS
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     if USE_G_GAMMA:
         b_gamma = tl.load(g_gamma + i_h)
@@ -345,6 +351,7 @@ def chunk_fwd_h(
         USE_GK=gk is not None,
         USE_GV=gv is not None,
         STATE_V_FIRST=state_v_first,
+        LONG_INDEXING=max(k.numel(), v.numel()) > 2**31,
     )
     return h, ht
 
@@ -413,5 +420,6 @@ def chunk_bwd_dh(
         USE_GK=gk is not None,
         USE_GV=gv is not None,
         STATE_V_FIRST=state_v_first,
+        LONG_INDEXING=max(q.numel(), do.numel()) > 2**31,
     )
     return dh, dh0
