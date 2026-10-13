@@ -512,6 +512,10 @@ def resolve_no_split_classes(model: nn.Module) -> list[str]:
     # Only `None`, the base-class default, means "not declared, go and detect".
     if classes is not None:
         declared = {str(c) for c in classes}
+        # transformers 4.x declares a composite's blocks on its sub-models, not the root (unsloth#2864).
+        for _, module in model.named_modules():
+            if module is not model:
+                declared |= {str(c) for c in (getattr(module, "_no_split_modules", None) or ())}
         return sorted(declared | _undeclared_sibling_blocks(model, declared))
     # Fallback: every distinct child class of every nn.ModuleList that holds
     # more than one entry. That is where repeated transformer blocks live.
