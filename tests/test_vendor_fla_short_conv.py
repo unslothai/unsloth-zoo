@@ -36,7 +36,7 @@ def _injection_supported() -> bool:
 
 def _code(path):
     return "\n".join(
-        ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#")
+        ln for ln in path.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")
     )
 
 
