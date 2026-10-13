@@ -3382,6 +3382,15 @@ def _remove_transformers_version(config_path: Path):
         return
     if "transformers_version" not in config:
         return
+    # Drop only <= 4.57.2 (transformers 4.57.2 crashes on `_config.model_type`); a missing field makes
+    # >= 4.57.3 tell every merged model to set `fix_mistral_regex=True` (unsloth#4996).
+    # Same packaging comparison 4.57.2 makes; utils.Version maps 4.57.2.dev0 to 4.57.2.1.
+    from packaging.version import Version as PackagingVersion
+    try:
+        if PackagingVersion(str(config["transformers_version"])) > PackagingVersion("4.57.2"):
+            return
+    except Exception:
+        pass
     del config["transformers_version"]
     with open(config_path, "w", encoding = "utf-8") as f:
         json.dump(config, f, indent = 4)

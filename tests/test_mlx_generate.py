@@ -352,6 +352,15 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
     Generator.eos = True
     eos = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
     assert eos.token_ids == [1] and eos.finish_reason == "stop"
+    tokenizer.eos_token_ids = (2, 3)
+    for chosen, stops in ((None, [[2], [3]]), ([5, 6, 5], [[5], [6]])):
+        adapter.defaults = GenerationDefaults(stop_token_ids=chosen)
+        _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
+        assert Generator.instances[-1].kwargs["stop_tokens"] == stops
+    assert GenerationDefaults(256, SamplingParams(), (), 2, 3, 16).max_kv_size == 16
+    for bad in ([True], [-1], [1.5]):
+        with pytest.raises(ValueError, match="non-negative integer"):
+            GenerationDefaults(stop_token_ids=bad)
     Generator.eos = False
     Generator.fail = True
     Generator.close_fail = True
@@ -1616,7 +1625,7 @@ def test_kv_quant_controls_and_processor_rows_are_refused_before_they_reach_a_ca
 
 def test_the_preflight_refuses_defaults_every_add_would():
     from unsloth_zoo.mlx.generate import stream_unavailable_reason
-    assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed")))  # noqa: E501
+    assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed"), ({"_is_vlm_model": True, "language_model": object()}, {"stop_token_ids": (5,)}, "stop_token_ids")))  # noqa: E501
 
 
 def test_a_cache_with_model_specific_state_refuses_a_quantized_batch_before_it_starts():
@@ -1649,8 +1658,9 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     # these tests hand it plain stand-ins. The decode scope reads a module's own dict
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
-    from unsloth_zoo.mlx.inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                                           fused_moe_router, fused_residual_norm, fused_residual_norm_handoff)
+    from unsloth_zoo.mlx.inference import (exact_speculative_verify, fused_decode_conv_silu, fused_moe_gate_up,
+                                           fused_moe_routed_experts, fused_moe_router, fused_packed_gated_delta,
+                                           fused_residual_norm, fused_residual_norm_handoff)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1659,7 +1669,8 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
             named_modules = lambda: [("plain", stub)],
         )
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
-                fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model):
+                fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model), \
+                exact_speculative_verify(model), fused_packed_gated_delta(model):
             pass
 
 
@@ -1668,8 +1679,9 @@ def test_generation_paths_enter_every_inference_fusion(monkeypatch):
     import ast
 
     from unsloth_zoo.mlx import generate as generate_module, inference, loader
+    prefixes = ("fused_", "nax_", "dense_", "exact_")
     scopes = {name for name, value in vars(inference).items()
-              if name.startswith(("fused_", "nax_", "dense_")) and getattr(value, "__module__", None) == inference.__name__}
+              if name.startswith(prefixes) and getattr(value, "__module__", None) == inference.__name__}
     entered = []
     for name in scopes:
         monkeypatch.setattr(inference, name, lambda model, *args, name=name, **kwargs: entered.append(name) or contextlib.nullcontext(model))
@@ -1679,8 +1691,9 @@ def test_generation_paths_enter_every_inference_fusion(monkeypatch):
     sites = [{item.context_expr.func.id for item in node.items
               if isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name)}
              for node in ast.walk(ast.parse(inspect.getsource(loader))) if isinstance(node, ast.With)]
-    sites = [site for site in sites if any(name.startswith(("fused_", "nax_", "dense_")) for name in site)]
-    assert len(sites) == 2 and all(site == scopes for site in sites)
+    sites = [site for site in sites if any(name.startswith(prefixes) for name in site)]
+    # The loader's generate sites run no speculative verify rounds.
+    assert len(sites) == 2 and all(site == scopes - {"exact_speculative_verify"} for site in sites)
 
 
 def test_cache_layout_tells_quantized_packings_apart():

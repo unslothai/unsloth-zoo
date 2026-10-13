@@ -875,3 +875,19 @@ def test_host_arena_is_registered_portable(monkeypatch):
     reg = _mod._Registered(torch.empty(1024, dtype = torch.uint8), 1024)
     assert calls == [1]  # cudaHostRegisterPortable
     del reg
+
+
+def test_pin_budget_is_split_across_the_ranks_on_this_host(monkeypatch):
+    import sys
+    import types
+    gib = 1 << 30
+    vm = types.SimpleNamespace(available = 64 * gib, total = 128 * gib)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(virtual_memory = lambda: vm))
+    spare = 64 * gib - max(_mod._PIN_RESERVE_MIN_BYTES, int(128 * gib * _mod._PIN_RESERVE_FRACTION))
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    assert _mod._pin_budget() == spare
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+    assert _mod._pin_budget() == spare // 4
+    for bad in ("0", "-2", "x"):
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", bad)
+        assert _mod._pin_budget() == spare

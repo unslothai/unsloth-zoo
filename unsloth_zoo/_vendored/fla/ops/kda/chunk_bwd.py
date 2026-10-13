@@ -20,7 +20,7 @@ from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.op import exp2
-from fla.utils import IS_NVIDIA_HOPPER, IS_NVIDIA_SM100, TRITON_ABOVE_3_4_0, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_NVIDIA_HOPPER, IS_NVIDIA_SM100, LONG_INDEXING_THRESHOLD, TRITON_ABOVE_3_4_0, autotune_cache_kwargs, check_shared_mem
 
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BV_LIST = [64, 128] if check_shared_mem('ampere') else [16, 32]
@@ -351,7 +351,7 @@ def chunk_kda_bwd_dAv(
         BT=BT,
         BK=BK,
         BV=BV,
-        LONG_INDEXING=B * T * max(H, HV) * max(K, V, BT) > 2**31,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, V, BT) > LONG_INDEXING_THRESHOLD,
     )
     return dA, dv
 

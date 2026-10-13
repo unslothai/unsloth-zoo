@@ -11,7 +11,7 @@ import triton.language as tl
 
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.index import prepare_chunk_indices
-from fla.utils import autotune_cache_kwargs, check_shared_mem, input_guard
+from fla.utils import LONG_INDEXING_THRESHOLD, autotune_cache_kwargs, check_shared_mem, input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -326,7 +326,7 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
-        LONG_INDEXING=g_org.numel() > 2**31,
+        LONG_INDEXING=g_org.numel() > LONG_INDEXING_THRESHOLD,
     )
     return g
 

@@ -394,14 +394,15 @@ def test_moonshine_stock_source_is_marked_and_unshifted_is_its_divisor():
 
 
 
-def test_collator_shift_labels_do_not_change_the_count():
-    # The fused losses train on `labels`, so the divisor counts `labels[..., 1:]`, not `shift_labels`.
+def test_collator_shift_labels_are_the_counted_targets():
+    # The losses train on a caller's `shift_labels` as given, so the local share counts them, unshifted.
     count_batch_items = _loss_utils().count_batch_items
     labels = torch.randint(0, 13, (2, 8))
     shift_labels = torch.full((2, 8), -100)
     shift_labels[0, :3] = 1
     share = aux_mod.unsloth_ga_scale_aux_loss(
-        torch.tensor(1.0), labels, None, {"num_items_in_batch": torch.tensor(28), "shift_labels": shift_labels},
+        torch.tensor(1.0), labels, None, {"num_items_in_batch": torch.tensor(6), "shift_labels": shift_labels},
     )
     assert int(count_batch_items(labels)[0]) == 14
+    assert int(count_batch_items(labels, shift_labels = shift_labels)[0]) == 3
     torch.testing.assert_close(share, torch.tensor(0.5))

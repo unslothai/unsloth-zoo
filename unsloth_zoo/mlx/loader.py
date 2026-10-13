@@ -59,7 +59,8 @@ from .compile import (
 )
 from .attention import install_quantized_attention
 from .inference import (dense_prefill_linear, fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                        fused_moe_router, fused_residual_norm, fused_residual_norm_handoff, nax_quantized_linear)
+                        fused_moe_router, fused_packed_gated_delta, fused_residual_norm, fused_residual_norm_handoff,
+                        nax_quantized_linear)
 
 _vlm_model_types_cache = None
 _VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
@@ -627,6 +628,54 @@ def _raise_if_incomplete_mlx_config(
         f"against the upstream repo this model was mirrored from and add the "
         f"missing {plural}."
     ) from error
+
+
+def _hf_config_default(model_type, key):
+    try:
+        from transformers import CONFIG_MAPPING
+        return getattr(CONFIG_MAPPING[model_type](), key, None)
+    except Exception:
+        return None
+
+
+# Re-saves through transformers drop keys mlx-lm requires (unsloth#8126): v5 moves rope_theta
+# into rope_parameters, to_diff_dict drops class defaults, lfm2's block_ff_dim is intermediate_size.
+# Each value is what transformers itself loads; anything else keeps the incomplete-config error.
+_MLX_LM_CONFIG_BACKFILLS = {
+    "rope_theta": lambda config: (
+        config["rope_parameters"].get("rope_theta")
+        if isinstance(config.get("rope_parameters"), dict) else None
+    ),
+    "block_ff_dim": lambda config: config.get("intermediate_size"),
+    "tie_word_embeddings": lambda config: _hf_config_default(config.get("model_type"), "tie_word_embeddings"),
+}
+
+
+def _mlx_lm_config_backfill(model_name, model_path, model_config):
+    """model_config plus the required mlx-lm ModelArgs fields config.json lacks but implies."""
+    try:
+        from mlx_lm.utils import _get_classes
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as file:
+            config = {**json.load(file), **model_config}
+        if config.get("model_file") is not None:
+            return model_config
+        _, args_class = _get_classes(config=config)
+        parameters = inspect.signature(args_class).parameters
+    except Exception:
+        return model_config
+    filled = {}
+    for key, derive in _MLX_LM_CONFIG_BACKFILLS.items():
+        parameter = parameters.get(key)
+        if parameter is None or parameter.default is not inspect.Parameter.empty or key in config:
+            continue
+        value = derive(config)
+        if value is not None:
+            filled[key] = value
+    if not filled:
+        return model_config
+    listed = ", ".join(f"{key}={value!r}" for key, value in filled.items())
+    print(f"Unsloth: {model_name}'s config.json is missing {listed}; filled in as transformers reads it.")
+    return {**model_config, **filled}
 
 
 def _raise_if_qk_norm_version_gap(model_type, message, error):
@@ -1237,6 +1286,7 @@ def _load_mlx_lm_with_strict_fallback(
 
     with _temporary_hf_token_env(hf_token):
         model_path = _download(model_name, revision=revision)
+    model_config = _mlx_lm_config_backfill(model_name, model_path, model_config)
 
     try:
         model, config = load_model(
@@ -1403,6 +1453,7 @@ def _load_mlx_lm_distributed(
             revision=revision,
             allow_patterns=_mlx_lm_metadata_allow_patterns(),
         )
+        model_config = _mlx_lm_config_backfill(model_name, model_path, model_config)
         with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
             try:
                 model, config = load_model(
@@ -4052,6 +4103,50 @@ def _ensure_audio_conv_sanitize(model_type: str) -> None:
 
     cls.sanitize = patched_sanitize
     _AUDIO_CONV_SANITIZE_PATCHED.add(model_type)
+
+
+def _encode_audio_clips_one_at_a_time(get_audio_features):
+    @wraps(get_audio_features)
+    def per_clip(self, input_features, feature_attention_mask=None,
+                 audio_feature_lengths=None):
+        if input_features.ndim != 3 or input_features.shape[0] < 2:
+            return get_audio_features(
+                self, input_features, feature_attention_mask, audio_feature_lengths,
+            )
+        import mlx.core as mx
+
+        return mx.concatenate([
+            get_audio_features(
+                self,
+                input_features[index:index + 1],
+                None if feature_attention_mask is None
+                else feature_attention_mask[index:index + 1],
+                None if audio_feature_lengths is None
+                else audio_feature_lengths[index:index + 1],
+            )
+            for index in range(input_features.shape[0])
+        ], axis=0)
+
+    return per_clip
+
+
+def _ensure_qwen3_omni_audio_per_clip(model_type: str) -> None:
+    """mlx-vlm <= 0.7.4 masks audio chunks by clip index, so later clips read the
+    first clip's chunks; encode clips one at a time. Gated on the tower's source."""
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if cls is None or cls.__module__ != "mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe":
+        return
+    thinker = importlib.import_module("mlx_vlm.models.qwen3_omni_moe.thinker").Thinker
+    audio = importlib.import_module("mlx_vlm.models.qwen3_omni_moe.audio")
+    source = _safe_getsource(audio.AudioModel.__call__) or ""
+    if (
+        "enumerate(feature_lens_after_cnn)" not in source
+        or getattr(thinker.get_audio_features, "__wrapped__", None) is not None
+    ):
+        return
+    thinker.get_audio_features = _encode_audio_clips_one_at_a_time(
+        thinker.get_audio_features,
+    )
 
 
 def _fp16_needs_bf16_modules(model):
@@ -7082,6 +7177,7 @@ def _mlx_generate_vlm(self, *args, **kwargs):
     with fused_moe_gate_up(self), fused_decode_conv_silu(self), fused_residual_norm(self), \
             fused_moe_router(self), fused_moe_routed_experts(self), nax_quantized_linear(self, int8_prefill), \
             dense_prefill_linear(self), \
+            fused_packed_gated_delta(self), \
             fused_residual_norm_handoff(self):
         for response in stream_generate(
             self,
@@ -7209,6 +7305,7 @@ def _mlx_generate(self, *args, **kwargs):
         with fused_moe_gate_up(self), fused_decode_conv_silu(self), fused_residual_norm(self), \
                 fused_moe_router(self), fused_moe_routed_experts(self), nax_quantized_linear(self, int8_prefill), \
                 dense_prefill_linear(self), \
+                fused_packed_gated_delta(self), \
                 fused_residual_norm_handoff(self):
             for response in stream_generate(
                 self,
@@ -9257,6 +9354,7 @@ class FastMLXModel:
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
             _ensure_audio_conv_sanitize(model_type)
+            _ensure_qwen3_omni_audio_per_clip(model_type)
             _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(

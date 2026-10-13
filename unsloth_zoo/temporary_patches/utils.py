@@ -2107,7 +2107,11 @@ def _owned_stance(entry):
 
 
 def _drop_dead_stance(ref):
-    UNSLOTH_EAGER_STANCE_OWNED[:] = [e for e in UNSLOTH_EAGER_STANCE_OWNED if e[0] is not ref]
+    owned = UNSLOTH_EAGER_STANCE_OWNED
+    # At interpreter shutdown module globals are cleared (None) before this weakref callback runs.
+    if owned is None:
+        return
+    owned[:] = [e for e in owned if e[0] is not ref]
 
 
 def unsloth_claim_eager_stance(stance, previous = None):
