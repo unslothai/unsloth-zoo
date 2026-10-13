@@ -5254,7 +5254,7 @@ def _merged_rollout_exact_target(ExactFoldTarget, module, W, adapter):
         return ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), module.scaling[adapter])
     E = W.shape[0]
     rank = A.shape[0] // E
-    from .temporary_patches.moe_utils import moe_lora_b_layout_for_wrapper, LORA_B_LAYOUT_RANK_MAJOR
+    from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_layout_for_wrapper, LORA_B_LAYOUT_RANK_MAJOR
     a = A.reshape(E, rank, A.shape[1])
     if moe_lora_b_layout_for_wrapper(module, adapter) == LORA_B_LAYOUT_RANK_MAJOR:
         b = B.reshape(B.shape[0], rank, E).permute(2, 0, 1)
