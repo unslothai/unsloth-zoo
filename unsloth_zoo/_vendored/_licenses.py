@@ -193,7 +193,9 @@ modifications =
       upstream conv fixes are not backported, as none reaches Ling 3.0's
       training or decode path: #1097 (more than 65535 sequences per decode
       launch), #1139 / #1141 (initial-state and final-state gradients) and
-      #1203 (packed batches of single-token sequences).
+      #1203 (packed batches of single-token sequences). The conv kernels
+      already load varlen sequence starts as int64; offsets inside one
+      sequence stay int32 as in 0.5.1 (upstream #1082), as for KDA above.
     - Backported fla PR #1109 in ops/kda/chunk_bwd.py (+ IS_NVIDIA_SM100 in
       utils/_device.py and utils/__init__.py, each marked with an inline
       "Unsloth: backported from fla PR #1109" comment): on SM100 the
