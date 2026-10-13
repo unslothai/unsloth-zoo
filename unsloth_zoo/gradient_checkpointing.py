@@ -723,6 +723,12 @@ elif DEVICE_TYPE == "xpu":
 elif DEVICE_TYPE == "npu":
     torch_gpu_stream = torch.npu.stream
 
+def _current_gpu_stream(device):
+    if DEVICE_TYPE == "xpu": return torch.xpu.current_stream(device)
+    if DEVICE_TYPE == "npu": return torch.npu.current_stream(device)
+    return torch.cuda.current_stream(device)
+pass
+
 CPU_BUFFERS = []
 CPU_INDEX = None
 
@@ -937,7 +943,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         device = arg.device
                         device_index = device.index
                         GPU_BUFFER   = GPU_BUFFERS  [device_index]
-                        MAIN_STREAM  = MAIN_STREAMS [device_index]
+                        # The stream compute runs on, not the default one: an in-process vLLM engine
+                        # (fast_inference) switches the current stream, and syncing the offload copies
+                        # with the idle default stream races them against the forward / backward.
+                        MAIN_STREAM  = _current_gpu_stream(device)
                         EXTRA_STREAM = EXTRA_STREAMS[device_index]
 
                         # Handle interrupted training runs
