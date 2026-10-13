@@ -25,10 +25,11 @@ VENDORED = ZOO_ROOT / "unsloth_zoo" / "_vendored" / "fla"
 
 def _injection_supported() -> bool:
     try:
-        from unsloth_zoo.temporary_patches.fla_vendor import (
-            _vendored_injection_supported,
+        from unsloth_zoo.temporary_patches import fla_vendor
+        return bool(
+            fla_vendor._vendored_injection_supported()
+            and not fla_vendor._gpu_lacks_dot_instructions()
         )
-        return bool(_vendored_injection_supported())
     except Exception:
         return False
 
@@ -95,7 +96,8 @@ _KERNEL_SUBPROCESS = textwrap.dedent(
     assert os.path.realpath(fla.__file__).startswith(os.path.realpath(_vendored_fla_dir()))
     # The exact import lines the Ling 3.0 remote code uses.
     from fla.modules import FusedRMSNormGated, ShortConvolution
-    from fla.ops.kda import chunk_kda, fused_recurrent_kda
+    if torch.version.hip is None:  # ROCm withholds fla.ops.kda on purpose
+        from fla.ops.kda import chunk_kda, fused_recurrent_kda
     from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
     from fla.utils import tensor_cache
     from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
@@ -168,7 +170,7 @@ def _run(code, marker):
 
 @pytest.mark.skipif(
     not _injection_supported(),
-    reason="vendored fla is injected only with CUDA + torch>=2.7 + triton>=3.3",
+    reason="vendored fla is injected only with CUDA + torch>=2.7 + triton>=3.3 (never on RDNA1)",
 )
 def test_short_conv_resolves_lazily_subprocess():
     _run(_LAZY_SUBPROCESS, "LAZY_OK")
@@ -176,7 +178,7 @@ def test_short_conv_resolves_lazily_subprocess():
 
 @pytest.mark.skipif(
     not _injection_supported(),
-    reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
+    reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3 (never on RDNA1)",
 )
 def test_short_conv_matches_reference_subprocess():
     _run(_KERNEL_SUBPROCESS, "SHORT_CONV_OK")
