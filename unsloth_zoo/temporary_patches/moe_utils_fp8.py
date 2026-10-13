@@ -932,6 +932,91 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
     return final_hidden_states.view(original_shape)
 
 
+def _release_dequantized_banks_until_backward(output, inputs, banks):
+    """Free the BF16 dequantization of frozen FP8 experts between forward and backward.
+
+    The experts get no gradient, but the input gradient needs the dequantized weights, which the
+    backends keep (saved tensors, recompute closures, views), so every MoE layer would hold a BF16 copy
+    of its experts until backward: the memory FP8 was loaded to save. The storage is emptied after
+    forward and refilled from the FP8 weights + scales just before this call's backward (a prehook on
+    the node producing `output`), then emptied again once the input gradient exists. Every holder keeps
+    the same storage, and the values are bit-identical because the same dequantization runs again.
+    """
+    if not torch.is_grad_enabled() or not isinstance(output, torch.Tensor) or output.grad_fn is None:
+        return
+    # A forward inside backward is a checkpoint recompute: releasing would only re-dequantize.
+    _graph_task_id = getattr(torch._C, "_current_graph_task_id", None)
+    if _graph_task_id is not None and _graph_task_id() != -1:
+        return
+    # Non-reentrant checkpointing recomputes banks (refill would hold two); torch < 2.8 cannot detect it, so keep.
+    _top_hooks = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+    if _top_hooks is None:
+        return
+    hooks = _top_hooks(False)
+    if hooks is not None and getattr(hooks[0], "__qualname__", "").startswith("_checkpoint_hook"):
+        return
+    tracked = []
+    for dequantized, base, quant, quant_kind in banks:
+        if (
+            dequantized is None or base is None or getattr(base, "requires_grad", False)
+            or dequantized.requires_grad or not dequantized.is_contiguous()
+            or dequantized.storage_offset() != 0 or dequantized.data_ptr() == base.data_ptr()
+        ):
+            continue
+        storage = dequantized.untyped_storage()
+        tracked.append((dequantized, storage, storage.nbytes(), base, quant, quant_kind))
+    if not tracked:
+        return
+
+    keep = []  # set once a backward builds a higher-order graph that saves the refilled banks
+
+    def free():
+        if keep:
+            return
+        for _, storage, _, _, _, _ in tracked:
+            storage.resize_(0)
+
+    def refill(*args):
+        # Grad mode in backward means create_graph=True: the new graph keeps these banks anyway.
+        if torch.is_grad_enabled():
+            keep.append(True)
+        with torch.no_grad():
+            for dequantized, storage, nbytes, base, quant, quant_kind in tracked:
+                if storage.nbytes() == nbytes:
+                    continue
+                storage.resize_(nbytes)
+                # .data: a fresh version counter, so the refill does not count as an in-place edit
+                target = dequantized.data
+                # Slices drop the block_size attribute; without it a non-128-aligned dim infers another block.
+                block_size = getattr(base, "block_size", None) or getattr(quant, "block_size", None)
+                step = max(1, base.shape[0] // 8)  # bounded transient: an eighth of the bank at a time
+                for start in range(0, base.shape[0], step):
+                    end = min(start + step, base.shape[0])
+                    piece_base = base[start:end]
+                    # Per-expert scales follow the chunk; scalar / 1-D shared scales do not.
+                    expert_indexed = isinstance(quant, torch.Tensor) and quant.ndim >= 2 and quant.shape[0] == base.shape[0]
+                    piece_quant = quant[start:end] if expert_indexed else quant
+                    if block_size is not None:
+                        _try_attach_block_size(piece_base, block_size)
+                        if isinstance(piece_quant, torch.Tensor): _try_attach_block_size(piece_quant, block_size)
+                    piece = _dequantize_full_expert_weights(piece_base, piece_quant, target.dtype, quant_kind = quant_kind)
+                    target[start:end].copy_(piece)
+                    del piece
+        # Fallback free at backward end: the input hook never runs for frozen / pruned inputs.
+        torch.autograd.Variable._execution_engine.queue_callback(free)
+        return None
+
+    def release(grad):
+        free()
+        return None
+
+    input_hooked = isinstance(inputs, torch.Tensor) and inputs.requires_grad
+    output.grad_fn.register_prehook(refill)
+    if input_hooked:
+        inputs.register_hook(release)
+    free()
+
+
 def _fp8_experts_own_gate(module) -> bool:
     if not getattr(module, "has_gate", True) or "GptOss" in type(module).__name__:
         return False
@@ -1007,18 +1092,24 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-native_torch loop.")
             forward_fn = forward_native_moe_loop
 
+        expert_inputs = hidden_states.to(target_dtype)
         output = swap_moe_weights_for_call(
             self,
             gate_up_weight,
             down_weight,
             forward_fn,
-            hidden_states.to(target_dtype),
+            expert_inputs,
             top_k_index,
             top_k_weights,
         )
         # Caller's dtype back, as the eager experts' index_add_ into zeros_like(hidden_states).
         if isinstance(output, torch.Tensor) and output.dtype != hidden_states.dtype:
             output = output.to(hidden_states.dtype)
+        _release_dequantized_banks_until_backward(
+            output, expert_inputs,
+            ((gate_up_weight, gate_up_base, gate_up_quant, gate_up_qkind),
+             (down_weight, down_base, down_quant, down_qkind)),
+        )
         return output
 
     # 3. Last resort: per-expert fp8_linear loop

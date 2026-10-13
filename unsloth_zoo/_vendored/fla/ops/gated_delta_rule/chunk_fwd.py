@@ -13,7 +13,7 @@ from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
-from fla.utils import IS_TF32_SUPPORTED, autotune_cache_kwargs
+from fla.utils import IS_TF32_SUPPORTED, LONG_INDEXING_THRESHOLD, autotune_cache_kwargs
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
@@ -381,7 +381,7 @@ def chunk_gated_delta_rule_fwd_intra(
         K=K,
         BT=BT,
         BC=BC,
-        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > 2**31,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > LONG_INDEXING_THRESHOLD,
     )
 
     # Step 2: recompute_w_u

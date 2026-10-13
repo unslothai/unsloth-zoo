@@ -36,6 +36,9 @@ dependencies = [
     "trl>=0.18.2,!=0.19.0,<=1.15.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "peft>=0.18.0,!=0.11.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "cut_cross_entropy ; python_version >= '3.10' and (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    # Imported by the vendored fla ShortConvolution, and at module level by remote code that uses
+    # it (Ling 3.0). fla-core brought it in before fla was vendored.
+    "einops ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     # --- MLX-only deps (macOS arm64) ---
     # Pinned, not floored. mlx ships breaking changes in PATCH releases: 0.32.1
     # replaced mx.random.state with a sentinel that refuses item assignment and

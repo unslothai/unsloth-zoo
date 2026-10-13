@@ -13,7 +13,7 @@ import triton.language as tl
 
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
-from fla.utils import autotune_cache_kwargs
+from fla.utils import LONG_INDEXING_THRESHOLD, autotune_cache_kwargs
 
 
 @triton.heuristics({
@@ -177,6 +177,6 @@ def chunk_kda_fwd_intra_token_parallel(
         K=K,
         BT=BT,
         BC=BC,
-        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > 2**31,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > LONG_INDEXING_THRESHOLD,
     )
     return Aqk, Akk
