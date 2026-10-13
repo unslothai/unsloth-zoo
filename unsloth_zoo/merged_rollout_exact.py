@@ -20,11 +20,9 @@ fold:   W <- round(W + d),  d = s * B @ A in fp32
 unfold: W <- round(W - d), then the elements where that round trip is not exact are
         overwritten with their original bits, recorded during the fold.
 
-Only those elements are stored (about 0.2 to 1.3% for typical LoRA deltas), streamed to
-pinned host memory while vLLM generates. d must be bit-identical in fold and unfold, so all
-three modes are one kernel binary (mode is a runtime argument), the rank-r sum is explicit
-fma in a fixed order, and fp fusion is off. A checksum over the weight bits proves each
-restore; a mismatch raises instead of training on corrupted weights.
+Only those elements are kept, in host memory while vLLM generates. d must be bit-identical
+in fold and unfold: one kernel binary for all modes, explicit fma in a fixed order, fp fusion
+off. A checksum over the weight bits proves each restore; a mismatch raises.
 """
 
 __all__ = [
@@ -210,7 +208,6 @@ def exact_fold(targets, stream = None):
             t.counts = torch.empty(n_prog, dtype = torch.int32, device = t.w.device)
             t.checksum = torch.zeros(1, dtype = torch.int64, device = t.w.device)
             t.launch(_COUNT)
-    # One host sync for every target's fix-up store size.
     sizes = torch.stack([t.counts.sum(dtype = torch.int64) for t in targets]).tolist()
     # Host stores before any weight changes: an allocation failure leaves W untouched.
     _host_buffers(targets, sizes)
@@ -229,8 +226,7 @@ pass
 
 
 def _host_buffers(targets, sizes):
-    # Pinned unless UNSLOTH_DISABLE_PINNED_MEMORY=1, over the pin budget, or pinning fails
-    # (WSL2 caps page-locked memory); pageable stores still restore exactly, only synchronously.
+    # Pageable when pinning is disabled, over budget or refused (WSL2): still exact, only synchronous.
     from .block_swap import _pin_budget
     idx_types = [torch.int32 if t.w.numel() < 2**31 else torch.int64 for t in targets]
     nbytes = sum(n * (d.itemsize + t.w.element_size()) for t, n, d in zip(targets, sizes, idx_types))
@@ -272,7 +268,6 @@ def exact_unfold(targets, stream = None):
     targets = [t for t in targets if t.folded]
     if not targets: return
     current = torch.cuda.current_stream(targets[0].w.device)
-    # Prefetch the fix-up stores while the unfold kernels run.
     if stream is not None:
         stream.wait_stream(current)
         with torch.cuda.stream(stream):
