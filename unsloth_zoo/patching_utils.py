@@ -765,12 +765,16 @@ def patch_model_and_tokenizer(
     try: old_output_embedding = model.get_output_embeddings().weight
     except: old_output_embedding = torch.zeros(0)
 
+    # DeepSpeed ZeRO-3 partitioned the weights at load (1-D empty placeholders, real shape in ds_shape):
+    # rebuilding the modules around them asserts 2-D (unsloth#225), and resize_token_embeddings handles ZeRO-3.
+    zero3_partitioned = hasattr(old_input_embedding, "ds_shape")
+
     # Check for tied weights as well
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \
         or (model.config.tie_word_embeddings)
 
     # Check pad token's id -> we need to expand the embedding
-    if is_torch_embedding and (tokenizer is not None) and (len(tokenizer) > old_input_embedding.shape[0]):
+    if is_torch_embedding and not zero3_partitioned and (tokenizer is not None) and (len(tokenizer) > old_input_embedding.shape[0]):
         # Workaround randomnly fixes it for torch versions < 2.
         requires_grad = old_input_embedding.requires_grad
         old_input_embedding.requires_grad_(False)
@@ -791,7 +795,7 @@ def patch_model_and_tokenizer(
         pass
     pass
 
-    if is_torch_embedding:
+    if is_torch_embedding and not zero3_partitioned:
         model.set_input_embeddings(
             torch.nn.Embedding.from_pretrained(
                 old_input_embedding,
@@ -801,7 +805,7 @@ def patch_model_and_tokenizer(
     pass
 
     # We also do this for the lm_head
-    if old_output_embedding.numel() != 0:
+    if old_output_embedding.numel() != 0 and not zero3_partitioned:
 
         requires_grad = old_output_embedding.requires_grad
         lm_head = torch.nn.Linear(1, 1, bias = None)
@@ -818,7 +822,7 @@ def patch_model_and_tokenizer(
 
     # Must tie lm_head and embed_tokens if they are tied!
     # Otherwise error will occur on saving models ie use save_model
-    if is_tied: model.tie_weights()
+    if is_tied and not zero3_partitioned: model.tie_weights()
 
     # For pipeline parallel models, we need to set the device for each layer for easier access later
     x, found_layers = get_model(model)
