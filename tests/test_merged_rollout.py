@@ -1254,6 +1254,26 @@ def test_cuda_exact_failed_unfold_poisons(monkeypatch):
         prepare_merged_rollout(model)
 
 
+@_cuda
+def test_cuda_exact_failed_target_build_keeps_state_usable(monkeypatch):
+    # e.g. an OOM casting the adapter factors: nothing was folded, so the original error
+    # surfaces, the weights are untouched and the next rollout works.
+    import unsloth_zoo.vllm_utils as vu
+    model, llm, vllm_model = _make_model(device = "cuda")
+    state = prepare_merged_rollout(model)
+    before = _snapshot(vllm_model)
+    real = vu._merged_rollout_exact_target
+    def oom(*args, **kwargs): raise torch.OutOfMemoryError("CUDA out of memory")
+    monkeypatch.setattr(vu, "_merged_rollout_exact_target", oom)
+    with pytest.raises(torch.OutOfMemoryError):
+        with merged_rollout(state): pass
+    assert state.poisoned is None
+    _assert_bitwise(before, vllm_model)
+    monkeypatch.setattr(vu, "_merged_rollout_exact_target", real)
+    with merged_rollout(state): pass
+    _assert_bitwise(before, vllm_model)
+
+
 # 15. MoE expert LoRA (PEFT target_parameters) folded by the exact kernel.
 class _Experts(nn.Module):
     def __init__(self, E, H, I, transposed):

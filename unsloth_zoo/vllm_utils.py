@@ -5233,9 +5233,11 @@ def _merged_rollout_restore(state):
     """Copy W back from P, retried once (idempotent); two failures poison the state.
     Exact mode unfolds once: an unfold is not idempotent, so any failure poisons."""
     # All Unsloth Zoo code licensed under LGPLv3
-    if state.exact_targets is not None:
+    if state.entries and state.entries[0][2] is None:
         from .merged_rollout_exact import exact_unfold
         targets, state.exact_targets = state.exact_targets, None
+        # Failed while building the targets: no kernel ran, nothing to undo.
+        if targets is None: return
         try:
             _merged_rollout_synchronize(state)
             with torch.inference_mode():
