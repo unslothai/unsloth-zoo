@@ -4012,14 +4012,16 @@ def _install_qwen3_omni_compile_patches(
         ):
             position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
+        levels = deepstack_visual_embeds
+        if isinstance(levels, mx.array):
+            # Upstream's embedder hands one array holding a level per column.
+            levels = [levels[:, :, level] for level in range(levels.shape[2])]
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             if output_hidden_states:
                 all_hidden_states.append(h)
             h = layer(h, mask, c, position_ids, position_embeddings)
-            if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
-                h = self._deepstack_process(
-                    h, visual_pos_masks, deepstack_visual_embeds[layer_idx]
-                )
+            if levels is not None and layer_idx < len(levels):
+                h = self._deepstack_process(h, visual_pos_masks, levels[layer_idx])
             if output_hidden_state_idx == layer_idx + 1:
                 selected_hidden_state = h
 
