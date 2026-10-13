@@ -3751,9 +3751,10 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
-        if enable_lora and not use_async and _merged_rollout_mode() == "attention":
+        if (enable_lora and not use_async and not use_engine and not use_bitsandbytes and not is_fp8
+                and _merged_rollout_mode() == "attention"):
             # Attention is folded, so vLLM wraps only the rest: no punica kernels on attention.
-            # Async engines are never wrapped (no fold), so they keep attention LoRA in vLLM.
+            # Async / raw engines and quantized weights never fold, so they keep attention LoRA in vLLM.
             # vLLM < 0.20 lacks the arg and the filter below drops it (still exact, just no gain).
             engine_args["lora_target_modules"] = list(_MERGED_ROLLOUT_PUNICA_MODULES)
         if _is_gemma4_config(config) and use_bitsandbytes:
@@ -5336,6 +5337,22 @@ def _merged_rollout_clean_cache(llm):
 pass
 
 
+def _merged_rollout_require_attention_folded(keys):
+    """Attention mode built vLLM without attention LoRA: a request carrying it would be ignored."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    attention = [
+        k for k in keys
+        if _MERGED_ROLLOUT_ATTENTION.search(re.split(r"\.lora_[AB]\.", k)[0]) and not _MERGED_ROLLOUT_NON_LANGUAGE.search(k)
+    ]
+    if attention:
+        raise RuntimeError(
+            "Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT=attention started vLLM without LoRA on attention, so attention "
+            f"LoRA must be folded, but this call could not fold it (e.g. '{attention[0]}'; the reason is logged "
+            "above). Set UNSLOTH_VLLM_MERGED_ROLLOUT=1 or unset it."
+        )
+pass
+
+
 def _merged_rollout_lora_fallback(request, reason):
     # All Unsloth Zoo code licensed under LGPLv3
     global LORA_REQUEST_ID
@@ -5458,9 +5475,16 @@ def install_merged_rollout_engine_wrapper(llm):
     ):
         _merged_rollout_log_once("Unsloth: merged-weight rollouts need the synchronous vLLM LLM; using vLLM LoRA.")
         return llm
+    wrapped = False
     for name in ("generate", "chat"):
         bound = getattr(llm, name, None)
-        if bound is not None: setattr(llm, name, _wrap_merged_rollout_call(bound, llm))
+        if bound is not None:
+            setattr(llm, name, _wrap_merged_rollout_call(bound, llm))
+            wrapped = True
+    # LLMEngine (use_engine) has only request / step APIs: nothing to fold around, keep vLLM LoRA.
+    if not wrapped:
+        _merged_rollout_log_once("Unsloth: merged-weight rollouts need vLLM's LLM generate / chat; using vLLM LoRA.")
+        return llm
     llm._unsloth_merged_rollout_wrapped = True
     return llm
 pass
@@ -5509,6 +5533,8 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
             # Folded into the base weights already: sending them too would apply the delta twice.
             state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}
             if len(state_dict) == 0: return None
+        if getattr(getattr(model, "vllm_engine", None), "_unsloth_lora_without_attention", False):
+            _merged_rollout_require_attention_folded(state_dict)
 
         state_dict = _remap_moe_expert_lora_keys(model, state_dict)
         _check_lora_is_servable(model, list(state_dict), "the training model", peft_config)
