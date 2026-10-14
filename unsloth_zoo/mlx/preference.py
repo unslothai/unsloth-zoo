@@ -102,7 +102,8 @@ TRUNCATION_MODES = ("keep_end", "keep_start")
 class PreferenceLengthPolicy:
     """Resolved length budget for one preference objective.
 
-    ``kind`` picks the truncation algorithm; DPO's and ORPO's differ.
+    ``kind`` picks the truncation algorithm; DPO's and ORPO's differ, and CPO
+    uses ORPO's.
     """
 
     kind: str
@@ -129,9 +130,9 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
     """Resolve the four length bounds the way the matching TRL trainer does.
 
     max_seq_length has no TRL counterpart: it is the width a batch can hold, so
-    it caps max_length, and for ORPO it can pull max_prompt_length down with it.
-    KTO needs ``tokenizer``: its special tokens decide how far a row can run
-    past max_length.
+    it caps max_length, and for ORPO and CPO it can pull max_prompt_length down
+    with it. KTO needs ``tokenizer``: its special tokens decide how far a row can
+    run past max_length.
     """
     truncation_mode = getattr(args, "truncation_mode", "keep_end")
     if truncation_mode not in TRUNCATION_MODES:
@@ -148,8 +149,8 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
         getattr(args, "max_completion_length", None), "max_completion_length",
     )
     name = kind.upper()
-    if kind in ("orpo", "kto"):
-        # Both split the budget between prompt and answer, so neither may be open.
+    if kind != "dpo":
+        # They split the budget between prompt and answer, so neither may be open.
         if max_length is None:
             max_length = 512
             warnings.warn(
@@ -163,9 +164,14 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
                 "to 128.",
                 RuntimeWarning, stacklevel=2,
             )
+        if kind == "cpo" and not max_prompt_length < max_length:
+            raise ValueError(
+                f"Unsloth MLX CPO: max_prompt_length ({max_prompt_length}) must "
+                f"be strictly less than max_length ({max_length})."
+            )
         if max_completion_length is not None:
             overrun = "branch whose capped prompt plus the longer answer" \
-                if kind == "orpo" else "row whose capped prompt plus answer"
+                if kind != "kto" else "row whose capped prompt plus answer"
             warnings.warn(
                 f"Unsloth MLX {name}: max_completion_length only applies to "
                 f"encoder-decoder models and is ignored here. A {overrun} still "
@@ -199,7 +205,7 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
         )
         before_clamp = max_length
         max_length = limit
-        if kind in ("orpo", "kto") and before_clamp > max_prompt_length >= max_length:
+        if kind != "dpo" and before_clamp > max_prompt_length >= max_length:
             # The answer gets max_length minus max_prompt_length, so clamping to the
             # prompt bound leaves none. A bound the caller set themselves stands.
             max_prompt_length = max(1, max_length // 2)
@@ -212,8 +218,9 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
     # A config predating max_length carries the default, not a choice, so the same
     # call now trains on less. No marker means duck-typed, so take the value as meant.
     max_length_explicit = getattr(args, "_unsloth_mlx_max_length_explicit", True)
-    # KTO is newer than max_length, so no earlier run of it had a wider budget.
-    if max_seq_length > max_length and not max_length_explicit and kind != "kto":
+    # CPO and KTO are newer than max_length, so no earlier run had a wider budget.
+    if max_seq_length > max_length and not max_length_explicit \
+            and kind not in ("cpo", "kto"):
         # DPO reads an open prompt bound as no cap; ORPO already made it 128 above.
         restore = (
             "Pass max_length=max_seq_length, max_prompt_length=None"
@@ -283,7 +290,7 @@ def _truncate_orpo(
     if keep is None and not (fits(chosen_prompt) and fits(rejected_prompt)):
         # Only an overflowing row reads the bound; name it rather than negate a None.
         raise ValueError(
-            "Unsloth MLX ORPO: this row overruns max_length="
+            f"Unsloth MLX {policy.kind.upper()}: this row overruns max_length="
             f"{policy.max_length}, and max_prompt_length is the room reserved "
             "for the prompt inside it, so it cannot be left open here."
         )
@@ -541,8 +548,8 @@ def _encode_dpo_branches(
     return prompt_ids, response(chosen_text), response(rejected_text), arrays
 
 
-def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids):
-    """Refuse an ORPO row whose two prompt encodings disagree beyond a merge.
+def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids, kind):
+    """Refuse an ORPO or CPO row whose two prompt encodings disagree beyond a merge.
 
     ORPOTrainer.tokenize_row lets only the last prompt token move, since a
     tokenizer may merge it with the answer's first. Comparing over the overlap and
@@ -557,8 +564,8 @@ def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids):
     length_gap = abs(len(chosen_prompt_ids) - len(rejected_prompt_ids))
     if different > 1 or length_gap > 1:
         raise ValueError(
-            "Unsloth MLX ORPO: the chosen and rejected branches tokenized the "
-            "same prompt differently in "
+            f"Unsloth MLX {kind.upper()}: the chosen and rejected branches "
+            "tokenized the same prompt differently in "
             f"{different} position(s) with a length gap of {length_gap}, and "
             "only the last prompt token may move that way through a tokenizer "
             "merge. Training the row would compare two responses written "
@@ -569,7 +576,7 @@ def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids):
 def _require_preference_fields(row):
     if not isinstance(row, Mapping):
         raise ValueError("Unsloth MLX preference: each dataset row must be a mapping.")
-    # prompt is optional: TRL's DPO and ORPO both maybe_extract_prompt first, so a
+    # prompt is optional: TRL's DPO, ORPO and CPO all maybe_extract_prompt first, so a
     # row naming only its completions recovers a prompt instead of being refused.
     missing = {"chosen", "rejected"} - set(row)
     if missing:
@@ -631,7 +638,9 @@ def tokenize_preference_row(
         rejected_response = list(rejected.input_ids[boundaries[1]:])
         # Without this two different prefixes reach the loss as one context. On the
         # resolved boundaries: judging before the clip refuses rows that agree.
-        _reject_diverging_orpo_prompts(chosen_prompt, rejected_prompt)
+        _reject_diverging_orpo_prompts(
+            chosen_prompt, rejected_prompt, length_policy.kind,
+        )
     return TokenizedPreferenceRow(*(tuple(ids) for ids in _truncate_preference_row(
         chosen_prompt, chosen_response, rejected_prompt, rejected_response,
         length_policy,
@@ -649,7 +658,7 @@ def _truncate_preference_row(
             "Unsloth MLX preference: chosen and rejected must each contain at "
             "least one response token."
         )
-    if length_policy.kind == "orpo":
+    if length_policy.kind != "dpo":
         (
             chosen_prompt, chosen_response, rejected_prompt, rejected_response,
         ) = _truncate_orpo(
@@ -663,7 +672,7 @@ def _truncate_preference_row(
         rejected_prompt, rejected_response = _truncate_dpo_branch(
             rejected_prompt, rejected_response, length_policy,
         )
-    # A response token needs something before it. ORPO averages per branch, so one
+    # A response token needs something before it. ORPO and CPO score each branch, so one
     # bad branch voids the row; DPO sums and it cancels against the reference.
     unscoreable = [
         len(prompt) + len(response) < 2 or not response
@@ -1255,11 +1264,17 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
     return table
 
 
-def _window_normalizers(rows, schedule, cycle_length, grad_accum, *, nll=True):
-    """Per batch: its window's chosen tokens (ORPO's NLL; 0 without ``nll``),
-    rows, and micro-batches."""
+def _window_normalizers(rows, schedule, cycle_length, grad_accum, kind):
+    """Per batch: its window's chosen NLL tokens (0 for an objective without
+    one), rows, and micro-batches."""
     values = []
     accum = max(1, int(grad_accum or 1))
+
+    def nll_tokens(row):
+        # CPO's NLL masks the prompt; ORPO's spans the whole chosen sequence.
+        start = max(1, len(row.chosen_prompt_ids)) if kind == "cpo" else 1
+        return max(0, len(row.chosen) - start)
+
     for position in range(len(schedule)):
         epoch_start = (position // cycle_length) * cycle_length
         epoch_end = min(epoch_start + cycle_length, len(schedule))
@@ -1268,9 +1283,8 @@ def _window_normalizers(rows, schedule, cycle_length, grad_accum, *, nll=True):
         batches = schedule[window_start:window_end]
         pair_count = sum(len(batch) for batch in batches)
         chosen_tokens = sum(
-            max(0, len(rows[index].chosen) - 1)
-            for batch in batches for index in batch
-        ) if nll else 0
+            nll_tokens(rows[index]) for batch in batches for index in batch
+        ) if kind != "kto" else 0
         values.append((chosen_tokens, pair_count, window_end - window_start))
     return values
 
@@ -1294,7 +1308,7 @@ def create_preference_batch_plan(
     model_config=None,
     image_size=None,
 ):
-    """Build the finite preference plan consumed by both objectives.
+    """Build the finite preference plan consumed by every objective.
 
     ``prompt_sink`` receives each row's rendered prompt text as the plan is
     built, so a caller wanting it does not render the row a second time. A
@@ -1387,7 +1401,9 @@ def create_preference_batch_plan(
     )
     return (FiniteVisionPreferenceBatchPlan if vision else FinitePreferenceBatchPlan)(
         rows, schedule,
-        normalizers=_window_normalizers(rows, schedule, cycle_length, grad_accum),
+        normalizers=_window_normalizers(
+            rows, schedule, cycle_length, grad_accum, length_policy.kind,
+        ),
         cycle_length=cycle_length,
         max_seq_length=length_policy.max_seq_length,
         pad_id=0 if pad_id is None else pad_id,
@@ -1642,7 +1658,7 @@ def create_kto_batch_plan(
         rows, schedule,
         with_kl=with_kl,
         normalizers=_window_normalizers(
-            rows, schedule, cycle_length, grad_accum, nll=False,
+            rows, schedule, cycle_length, grad_accum, "kto",
         ),
         cycle_length=cycle_length,
         max_seq_length=length_policy.max_seq_length,
@@ -2194,6 +2210,29 @@ _DPO_VARIANTS = {
 }
 
 
+def _cpo_hinge(objective, delta):
+    value = 1.0 - objective.beta * delta
+    return mx.maximum(value, mx.array(0.0, dtype=value.dtype))
+
+
+# CPOTrainer.cpo_loss, on the chosen-minus-rejected difference.
+_CPO_VARIANTS = {
+    "sigmoid": _dpo_smoothed_sigmoid,
+    "simpo": lambda objective, delta: _dpo_smoothed_sigmoid(
+        objective, delta - objective.simpo_gamma / objective.beta,
+    ),
+    "hinge": _cpo_hinge,
+    "ipo": lambda objective, delta: (delta - 1.0 / (2.0 * objective.beta)) ** 2,
+}
+
+
+def _cpo_rewards(objective, logps):
+    """AlphaPO's (1 - p ** -alpha) / alpha, without underflowing p = exp(logps)."""
+    if objective.alpha == 0:
+        return logps
+    return -mx.expm1(-objective.alpha * logps) / objective.alpha
+
+
 @dataclass(frozen=True)
 class PreferenceObjective:
     kind: str
@@ -2205,11 +2244,14 @@ class PreferenceObjective:
     reference_free: bool = False
     desirable_weight: float = 1.0
     undesirable_weight: float = 1.0
+    cpo_alpha: float = 1.0
+    simpo_gamma: float = 0.5
+    alpha: float = 0.0
 
     def __post_init__(self):
         object.__setattr__(self, "loss_types", tuple(self.loss_types))
         object.__setattr__(self, "weights", tuple(self.weights))
-        if self.kind not in ("dpo", "orpo", "kto"):
+        if self.kind not in ("dpo", "orpo", "cpo", "kto"):
             raise ValueError(
                 f"Unsloth MLX preference: unknown objective kind '{self.kind}'."
             )
@@ -2230,6 +2272,8 @@ class PreferenceObjective:
                     "Unsloth MLX KTO: desirable_weight and undesirable_weight "
                     f"must be finite, not {list(weights)}."
                 )
+        if self.kind == "cpo":
+            _validate_cpo_objective(self)
         if self.kind != "dpo":
             return
         if len(self.weights) != len(self.loss_types):
@@ -2288,18 +2332,60 @@ class PreferenceObjective:
 
     @property
     def length_normalized(self):
-        """TRL divides before any variant runs, so ipo normalizes the whole list."""
-        return "ipo" in self.loss_types
+        """TRL divides before any variant runs, so DPO's ipo normalizes the whole
+        list; CPO averages under ipo and simpo."""
+        return any(name in ("ipo", "simpo") for name in self.loss_types)
 
     @property
     def with_kl(self):
         return self.kind == "kto" and self.loss_types == ("kto",)
 
 
+def _validate_cpo_objective(objective):
+    names = objective.loss_types
+    if len(names) != 1:
+        raise ValueError(
+            f"Unsloth MLX CPO: loss_type must name exactly one loss, not {list(names)}."
+        )
+    if names[0] == "kto_pair":
+        raise ValueError(
+            "Unsloth MLX CPO: loss_type 'kto_pair' is not supported because TRL "
+            "removed it from CPO training in favour of a KTO trainer."
+        )
+    if names[0] not in _CPO_VARIANTS:
+        raise ValueError(
+            f"Unsloth MLX CPO: unknown loss_type '{names[0]}'. Supported: "
+            f"{', '.join(sorted(_CPO_VARIANTS))}."
+        )
+    if names[0] in ("ipo", "simpo") and objective.beta == 0:
+        raise ValueError(
+            f"Unsloth MLX CPO: {names[0]} divides by beta, so beta must be above zero."
+        )
+    if not 0 <= objective.label_smoothing <= 1:
+        # Outside [0, 1] one smoothed term has a negative weight, unbounded below.
+        raise ValueError(
+            "Unsloth MLX CPO: label_smoothing must be in [0, 1], not "
+            f"{objective.label_smoothing}."
+        )
+    for name in ("cpo_alpha", "simpo_gamma", "alpha"):
+        if not math.isfinite(getattr(objective, name)):
+            raise ValueError(
+                f"Unsloth MLX CPO: {name} must be finite, not "
+                f"{getattr(objective, name)}."
+            )
+    if objective.cpo_alpha < 0:
+        # A negative NLL weight pays for lowering the chosen likelihood, unbounded below.
+        raise ValueError(
+            "Unsloth MLX CPO: cpo_alpha must be non-negative, not "
+            f"{objective.cpo_alpha}."
+        )
+
+
 def resolve_preference_objective(
     kind, *, beta, label_smoothing=0.0, loss_type="sigmoid",
     loss_weights=None, discopop_tau=0.05, reference_free=False,
     desirable_weight=1.0, undesirable_weight=1.0,
+    cpo_alpha=1.0, simpo_gamma=0.5, alpha=0.0,
 ):
     beta = float(beta)
     if kind == "orpo":
@@ -2311,20 +2397,29 @@ def resolve_preference_objective(
             desirable_weight=float(desirable_weight),
             undesirable_weight=float(undesirable_weight),
         )
-    if loss_weights is None:
-        weights = (1.0,) * len(names)
+    if kind == "cpo":
+        objective = PreferenceObjective(
+            kind=kind, beta=beta, label_smoothing=float(label_smoothing),
+            loss_types=names, cpo_alpha=float(cpo_alpha),
+            simpo_gamma=float(simpo_gamma), alpha=float(alpha),
+        )
+        ignoring = ("hinge", "ipo")
     else:
-        weights = tuple(float(weight) for weight in loss_weights)
-    objective = PreferenceObjective(
-        kind=kind, beta=beta, label_smoothing=float(label_smoothing),
-        loss_types=names, weights=weights,
-        discopop_tau=float(discopop_tau), reference_free=bool(reference_free),
-    )
-    ignored = [name for name in names if name in _DPO_SMOOTHING_WARNINGS]
+        if loss_weights is None:
+            weights = (1.0,) * len(names)
+        else:
+            weights = tuple(float(weight) for weight in loss_weights)
+        objective = PreferenceObjective(
+            kind=kind, beta=beta, label_smoothing=float(label_smoothing),
+            loss_types=names, weights=weights,
+            discopop_tau=float(discopop_tau), reference_free=bool(reference_free),
+        )
+        ignoring = _DPO_SMOOTHING_WARNINGS
+    ignored = [name for name in names if name in ignoring]
     if float(label_smoothing) > 0 and ignored:
         warnings.warn(
-            f"Unsloth MLX DPO: {', '.join(ignored)} ignore label_smoothing; "
-            "pass label_smoothing=0.0 to silence this.",
+            f"Unsloth MLX {kind.upper()}: {', '.join(ignored)} ignore "
+            "label_smoothing; pass label_smoothing=0.0 to silence this.",
             RuntimeWarning,
         )
     return objective
@@ -2366,6 +2461,43 @@ def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
     loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["dpo"]
     loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["dpo"]
     return loss_fn
+
+
+def _cpo_loss(objective, nll_sum, nll_tokens, pair_loss, pairs):
+    loss = pair_loss.sum() / mx.maximum(pairs, mx.array(1)).astype(mx.float32)
+    if objective.cpo_alpha == 0:
+        # TRL skips the NLL rather than weighting it by zero.
+        return loss
+    return loss + objective.cpo_alpha * nll_sum / mx.maximum(
+        nll_tokens, mx.array(1),
+    ).astype(mx.float32)
+
+
+def make_cpo_loss_fn(objective, *, _scorer=None):
+    """Create a CPO loss with exact logical-window normalization."""
+    _require_kind(objective, "cpo")
+
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
+        nll_sum, _batch_nll_tokens, pair_loss, stats = _cpo_scores(
+            model, batch, lengths, objective, scorer=_scorer,
+            cce_indices=cce_indices,
+        )
+        nll_tokens, window_pairs, window_microbatches = normalizers
+        loss = window_microbatches.astype(mx.float32) * _cpo_loss(
+            objective, nll_sum, nll_tokens, pair_loss, window_pairs,
+        )
+        return loss, mx.array(1, dtype=mx.int32), stats
+
+    loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["cpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["cpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["cpo"]
+    return loss_fn
+
+
+def make_cpo_cce_loss_fn(model, objective):
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_cpo_loss_fn(objective, _scorer=scorer), scorer)
 
 
 def _scatter_rows(values, indices, size):
@@ -2507,6 +2639,7 @@ PREFERENCE_EVAL_METRICS = {
     "orpo": _SHARED_EVAL_METRICS + (
         "nll_loss", "log_odds_ratio", "log_odds_chosen",
     ),
+    "cpo": _SHARED_EVAL_METRICS + ("nll_loss",),
 }
 
 
@@ -2539,6 +2672,7 @@ def _orpo_logit_sum(logits):
 _PREFERENCE_DENOMINATOR_NAMES = {
     "dpo": ("chosen_logits", "rejected_logits", "pairs"),
     "orpo": ("chosen_logits", "rejected_logits", "nll_tokens", "pairs"),
+    "cpo": ("chosen_logits", "rejected_logits", "nll_tokens", "pairs"),
 }
 
 # Token means, unlike TRL, which weights per-micro-batch means equally and so
@@ -2549,6 +2683,11 @@ _PREFERENCE_TOKEN_DENOMINATORS = {
         "logits/rejected": "rejected_logits",
     },
     "orpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+        "nll_loss": "nll_tokens",
+    },
+    "cpo": {
         "logits/chosen": "chosen_logits",
         "logits/rejected": "rejected_logits",
         "nll_loss": "nll_tokens",
@@ -2587,10 +2726,11 @@ def _preference_stats(
     """Numerators then denominators, all sums, so a window average is exact."""
     pairs = chosen.shape[0]
     # TRL is inconsistent between its trainers: DPOTrainer averages its logit
-    # metric over completion positions, ORPOTrainer over the whole sequence.
+    # metric over completion positions, ORPOTrainer and CPOTrainer over every
+    # padded position, so those two follow each backend's padding width.
     if logit_totals is not None:
         chosen_logits, rejected_logits, chosen_count, rejected_count = logit_totals
-    elif kind == "orpo":
+    elif kind != "dpo":
         chosen_logits, chosen_count = _orpo_logit_sum(logits[:pairs])
         rejected_logits, rejected_count = _orpo_logit_sum(logits[pairs:])
     else:
@@ -2656,6 +2796,39 @@ def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
         extra_denominators=(nll_tokens,),
     )
     return nll_sum, nll_tokens, ratio, stats
+
+
+def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=None):
+    """Unreduced: training normalizes over its window, evaluation over the batch."""
+    pairs = lengths.shape[0] // 2
+    logits = logit_totals = None
+    mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
+    if scorer is None:
+        logits, ce = _preference_forward(model, batch, mask)
+    else:
+        ce, sums = scorer(model, batch, mask > 0, cce_indices, every_position=True)
+        logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
+    logps = -(ce * mask).sum(axis=1)
+    if objective.length_normalized:
+        logps = logps / mx.maximum(mask.sum(axis=1), mx.array(1.0))
+    chosen, rejected = logps[:pairs], logps[pairs:]
+    # Unlike ORPO's, the chosen NLL covers the response only.
+    nll_tokens = mask[:pairs].sum()
+    nll_sum = (ce[:pairs] * mask[:pairs]).sum()
+    chosen_rewards = _cpo_rewards(objective, chosen)
+    rejected_rewards = _cpo_rewards(objective, rejected)
+    pair_loss = _CPO_VARIANTS[objective.loss_types[0]](
+        objective, chosen_rewards - rejected_rewards,
+    )
+    stats = _preference_stats(
+        "cpo", logits, mask, logit_totals=logit_totals,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=objective.beta * chosen_rewards,
+        rejected_rewards=objective.beta * rejected_rewards,
+        extra=(mx.zeros_like(nll_sum) if objective.cpo_alpha == 0 else nll_sum,),
+        extra_denominators=(nll_tokens,),
+    )
+    return nll_sum, nll_tokens, pair_loss, stats
 
 
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
@@ -2730,6 +2903,14 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
             loss = (
                 nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
                 - beta * ratio.mean()
+            )
+        elif kind == "cpo":
+            nll_sum, nll_tokens, pair_loss, stats = _cpo_scores(
+                model, batch, lengths, objective, scorer=scorer,
+                cce_indices=cce_indices,
+            )
+            loss = _cpo_loss(
+                objective, nll_sum, nll_tokens, pair_loss, mx.array(pairs),
             )
         else:
             terms, stats = _dpo_scores(
