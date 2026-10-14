@@ -241,6 +241,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         torch_compile  : Optional[bool] = True,
         overwrite      : Optional[bool] = False,
         extra_kwargs   : Optional[Dict] = None,
+        compute_gradients : bool = True,
     ):
         """
         Computes chunked fused loss_function(chunk(X) @ W + b, chunk(labels))
@@ -288,9 +289,11 @@ class UnslothFusedLoss(torch.autograd.Function):
         vocab_size = lm_head_weight.shape[0]
 
         # Create backwards output
-        grad_inputs = torch.empty_like(hidden_states, device = device) if not overwrite else hidden_states
-        grad_lm_head = torch.zeros_like(lm_head_weight, device = device) if lm_head_requires_grad else None
-        grad_lm_head_bias = torch.zeros_like(lm_head_bias, device = device) if lm_head_bias_requires_grad else None
+        grad_inputs = None
+        if compute_gradients:
+            grad_inputs = torch.empty_like(hidden_states, device = device) if not overwrite else hidden_states
+        grad_lm_head = torch.zeros_like(lm_head_weight, device = device) if compute_gradients and lm_head_requires_grad else None
+        grad_lm_head_bias = torch.zeros_like(lm_head_bias, device = device) if compute_gradients and lm_head_bias_requires_grad else None
 
         bsz, qlen, hd = hidden_states.shape
         # 0-dim, not a [0] view: MoE forwards on transformers 4.x add their aux loss in place.
@@ -302,7 +305,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             # Memory no chunk count can shrink. Under overwrite grad_inputs
             # aliases hidden_states; the head gradient counts twice (per chunk).
             fixed_bytes = 0
-            if not overwrite:
+            if grad_inputs is not None and not overwrite:
                 fixed_bytes += grad_inputs.numel() * grad_inputs.element_size()
             if grad_lm_head is not None:
                 fixed_bytes += 2 * grad_lm_head.numel() * grad_lm_head.element_size()
@@ -316,7 +319,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
         __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
-        __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
+        __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd), n_chunks, dim = 0) if compute_gradients else (None,) * len(__shift_states)
 
         def accumulate_chunk(
             n_chunks,
@@ -332,7 +335,18 @@ class UnslothFusedLoss(torch.autograd.Function):
             shift_labels = False,
             **kwargs,
         ):
-            if lm_head_requires_grad and lm_head_bias_requires_grad:
+            if not compute_gradients:
+                chunk_loss, (unscaled_loss,) = loss_function(
+                    hidden_states_j,
+                    lm_head_weight,
+                    lm_head_bias,
+                    labels_j,
+                    divisor,
+                    scaling,
+                    False,
+                    **kwargs,
+                )
+            elif lm_head_requires_grad and lm_head_bias_requires_grad:
                 (chunk_grad_input, chunk_grad_lm_head, chunk_grad_lm_head_bias,), \
                 (chunk_loss, (unscaled_loss,)) = \
                 torch.func.grad_and_value(
@@ -403,7 +417,8 @@ class UnslothFusedLoss(torch.autograd.Function):
                 )
             pass
             accumulated_loss.add_(unscaled_loss)
-            grad_inputs_j[:] = chunk_grad_input
+            if compute_gradients:
+                grad_inputs_j[:] = chunk_grad_input
         pass
         global _FUSED_CE_COMPILE_SUPPORTED
         uncompiled_accumulate_chunk = accumulate_chunk
@@ -446,7 +461,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                 _FUSED_CE_COMPILE_SUPPORTED = False
                 torch._dynamo.reset()
                 accumulated_loss.zero_()
-                if not overwrite:
+                if grad_inputs is not None and not overwrite:
                     grad_inputs.zero_()
                 if grad_lm_head is not None: grad_lm_head.zero_()
                 if grad_lm_head_bias is not None: grad_lm_head_bias.zero_()
@@ -500,8 +515,9 @@ class UnslothFusedLoss(torch.autograd.Function):
                     **extra_kwargs,
                 )
         pass
-        ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
-        ctx.scaling = scaling
+        if compute_gradients:
+            ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
+            ctx.scaling = scaling
         return accumulated_loss
     pass
 
@@ -544,7 +560,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                 )
             return (
                 None, grad_inputs, grad_lm_head, grad_lm_head_bias,
-                None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None,
             )
 
         if torch.is_tensor(grad_output):
@@ -589,7 +605,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         if grad_lm_head is not None: grad_lm_head = grad_lm_head * scale_factor
         if grad_lm_head_bias is not None: grad_lm_head_bias = grad_lm_head_bias * scale_factor
 
-        return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None, None,)
+        return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None, None, None,)
     pass
 pass
 
@@ -660,6 +676,8 @@ def unsloth_fused_ce_loss(
         torch_compile = torch_compile,
         overwrite = overwrite,
         extra_kwargs = kwargs,
+        # autograd.Function.forward disables grad mode even during training.
+        compute_gradients = torch.is_grad_enabled(),
     )
     apply = _fused_loss_opaque if _FUSED_LOSS_OPAQUE else UnslothFusedLoss.apply
     return apply(*(
