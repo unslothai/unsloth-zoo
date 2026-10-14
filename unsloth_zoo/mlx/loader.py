@@ -3589,6 +3589,29 @@ def _freeze_text_only_full_finetune(model) -> None:
         _freeze_outside_language_model(model)
 
 
+def _fix_full_finetune_modality_weights(model) -> None:
+    """Phi-4-multimodal sets its decoder weights from frozen copies for each input's modality, over what full
+    fine-tuning changed; it keeps one set with every adapter merged instead, as its quantized load does."""
+    if not getattr(model, "_base_weights", None):
+        return
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    # The copies keep the checkpoint's dtype; the decoder they are written over may since have been cast to the requested one.
+    current = dict(tree_flatten(model.parameters()))
+    tables = [getattr(model, name, None) or {} for name in ("_base_weights", "_vision_lora_a", "_vision_lora_b", "_speech_lora_a", "_speech_lora_b")]
+    for table in tables:
+        for key, value in table.items():
+            if key in current and mx.issubdtype(current[key].dtype, mx.floating) and value.dtype != current[key].dtype:
+                table[key] = value.astype(current[key].dtype)
+    if getattr(model, "_unsloth_full_finetuning", False):
+        model.apply_both_loras()
+        model._base_weights = {}
+    else:
+        # Lazy on this thread's stream, which a model served from another thread cannot evaluate.
+        mx.eval([value for table in tables for value in table.values()])
+
+
 def _freeze_outside_language_model(model) -> None:
     """Text batches never reach the towers, so train only the language model, as mlx-lm does."""
     language_model = getattr(model, "language_model", None)
@@ -8483,6 +8506,7 @@ def _finish_load(model, tokenizer):
     # A call, not an if: tests/test_mlx_attention_metal.py keeps this body straight-line so the
     # attention patch above can never sit behind a branch.
     _freeze_text_only_full_finetune(model)
+    _fix_full_finetune_modality_weights(model)
     _materialize_weights(model)
     return model, tokenizer
 

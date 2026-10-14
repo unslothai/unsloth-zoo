@@ -818,6 +818,9 @@ def _merge_lora(model, folder):
     weights = dict(tree_flatten(decoder.parameters()))
     # PEFT prefixes differ with the class the adapter was trained on; names agree from the layer index on.
     targets = {name[name.index("layers.") :]: name for name in weights if "layers." in name}
+    # Phi-4-multimodal sets its weights back from these for each input's modality, so the adapter is folded into them too.
+    swapped = getattr(model, "_base_weights", None) or {}
+    held = {name[name.index("layers.") :]: name for name in swapped if "layers." in name}
     merged = []
     for stem in sorted({name.rsplit(".lora_", 1)[0] for name in adapter}):
         down, up = adapter[f"{stem}.lora_A.weight"], adapter[f"{stem}.lora_B.weight"]
@@ -827,8 +830,10 @@ def _merge_lora(model, folder):
             raise ValueError(f"LoRA tensor {stem} has no float weight of its shape in the base model; adapters need an unquantized base")
         delta = (up.astype(mx.float32) @ down.astype(mx.float32)) * scale
         merged.append((target, (weight.astype(mx.float32) + delta).astype(weight.dtype)))
+        if (key := held.get(target[target.index("layers.") :])) is not None:
+            swapped[key] = (swapped[key].astype(mx.float32) + delta).astype(swapped[key].dtype)
     decoder.update(tree_unflatten(merged))
-    mx.eval(decoder.parameters())
+    mx.eval(decoder.parameters(), list(swapped.values()))
 
 
 def _head_scores(model, hidden, token_ids):
@@ -1025,6 +1030,8 @@ class _QwenModel(DecisionPipeline):
                 class_predicate = lambda path, module: not kept(path) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0,
             )
         self.model.eval()
+        # What a module keeps outside its parameters (Gemma's audio position scales) is still lazy on this thread's stream, which no other thread can evaluate.
+        mx.eval(_held_arrays(self.model))
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
         # The decoder is loaded from a view of the folder without the head's files, which a model loader would read as decoder weights.
@@ -1835,20 +1842,41 @@ def _stored_tensors(source):
 def _decoder_tensor_name(decoder, path, stored = ()):
     name = path
     # transformers stores a decoder inside a vision-language or an omni wrapper under other names than it is loaded with.
-    # MiniCPM-o keeps its whole causal LM under `llm.`; the first name the checkpoint holds wins.
+    # MiniCPM-o keeps its whole causal LM under `llm.` and Phi-4-multimodal under `model.`; the first name the checkpoint holds wins.
     wrappers = {
-        "language_model": (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head."), ("language_model.", "llm.")),
+        "language_model": (
+            ("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head."), ("language_model.", "llm."), ("language_model.model.", "model."),
+        ),
         "thinker": (("thinker.language_model.model.", "thinker.model."), ("thinker.language_model.lm_head.", "thinker.lm_head.")),
     }
     for wrapper, renamed in wrappers.items():
         if wrapper in decoder:
             names = [saved + path[len(prefix) :] for prefix, saved in renamed if path.startswith(prefix)]
-            name = next((found for found in names if found in stored), names[0] if names else None)
+            # Phi-4-multimodal keeps each linear its built-in adapters wrap as `base_layer`, which MLX loads them merged into.
+            wrapped = [found.removesuffix(".weight") + ".base_layer.weight" for found in names if found.endswith(".weight")]
+            name = next((found for found in names + wrapped if found in stored), names[0] if names else None)
     # An MLX conversion keeps the names its weights are loaded with.
     if name not in stored and path in stored:
         return path
     # transformers stores each expert of a mixture apart, with no one tensor for the stack they are loaded as.
     return None if name and name not in stored and name.replace(".switch_mlp.", ".experts.0.") in stored else name
+
+
+def _adapter_stem(decoder, path, stored):
+    """The PEFT name of the adapter on the linear at `path`, which names a linear the checkpoint keeps as `base_layer` by the linear itself."""
+    name = _decoder_tensor_name(decoder, f"{path}.weight", stored)
+    return None if name is None else "base_model.model." + name.removesuffix(".weight").removesuffix(".base_layer")
+
+
+def _held_arrays(tree):
+    """Every array a module tree holds, with those under a leading underscore that `parameters()` leaves out."""
+    found = []
+    for value in tree.values() if isinstance(tree, dict) else tree if isinstance(tree, (list, tuple)) else ():
+        if isinstance(value, mx.array):
+            found.append(value)
+        elif isinstance(value, (dict, list, tuple)):
+            found += _held_arrays(value)
+    return found
 
 
 def _require_clef_source(decoder, source):
@@ -2032,10 +2060,9 @@ def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None
     (rank, scale, dropout), = shapes
     tensors = {}
     for path, module in adapters:
-        name = _decoder_tensor_name(decoder, f"{path}.weight", stored)
-        if type(module).__name__ != "LoRALinear" or name is None:
+        stem = _adapter_stem(decoder, path, stored)
+        if type(module).__name__ != "LoRALinear" or stem is None:
             raise ValueError(f"Unsloth: the adapter on {path} cannot be saved as a PEFT adapter.")
-        stem = "base_model.model." + name[: -len(".weight")]
         tensors[f"{stem}.lora_A.weight"], tensors[f"{stem}.lora_B.weight"] = module.lora_a.T, module.lora_b.T
     adapter = {
         "peft_type": "LORA", "task_type": None, "base_model_name_or_path": str(base_model), "revision": base_revision,
@@ -2378,7 +2405,7 @@ class ClefNetwork(nn.Module):
             raise ValueError(f"Unsloth: {folder} holds LoRA adapters, which resume on a Clef loaded with the checkpoint they were trained on.")
         adapter, stored = mx.load(str(folder / "adapter_model.safetensors")), _stored_tensors(Path(self._origin[0]))
         for path, module in self._adapters():
-            stem = "base_model.model." + _decoder_tensor_name(self.encoder, f"{path}.weight", stored)[: -len(".weight")]
+            stem = _adapter_stem(self.encoder, path, stored)
             module.lora_a, module.lora_b = adapter[f"{stem}.lora_A.weight"].T, adapter[f"{stem}.lora_B.weight"].T
         head = mx.load(str(folder / "joint_head.safetensors"))
         self.head.update(tree_unflatten([(name, value.astype(mx.float32)) for name, value in head.items()]))
@@ -2446,6 +2473,9 @@ def clef_training_network(
 
     if full_finetuning and any(path.endswith(".scales") for path, _ in tree_flatten(pipeline.model.parameters())):
         raise ValueError("Unsloth: a quantized decoder trains through LoRA adapters only; pass full_finetuning = False.")
+    if full_finetuning and getattr(pipeline.model, "_base_weights", None):
+        # Phi-4-multimodal sets its decoder weights for each input's modality, over what training changed.
+        raise ValueError("Unsloth: this model swaps its decoder weights for each input's modality, so it trains through LoRA adapters only; pass full_finetuning = False.")
     # Layer-local, as the LoRA resolver matches targets: by leaf, parent, whole name or alias (`gate_proj` -> `gate_up_proj`).
     stacked = {name for layer in _mlx_language_layers(pipeline.model) for name, module in layer.named_modules() if "SwitchLinear" in type(module).__name__}
 

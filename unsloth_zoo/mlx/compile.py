@@ -6951,8 +6951,8 @@ def _install_phi4_multimodal_patches():
 
         has_images = pixel_values is not None
         has_audio = input_audio_embeds is not None and input_audio_embeds.size > 0
-        if has_images or has_audio:
-            self.set_modality(has_image=has_images, has_audio=has_audio)
+        # Text alone runs on the base weights, as the reference does; upstream skips the switch and keeps the last input's.
+        self.set_modality(has_image=has_images, has_audio=has_audio)
 
         if not has_images and not has_audio:
             return InputEmbeddingsFeatures(
@@ -7018,7 +7018,18 @@ def _install_phi4_multimodal_patches():
             )
         return InputEmbeddingsFeatures(inputs_embeds=outputs)
 
+    def patched_phi4mm_set_weight_by_key(self, key, value):
+        # `set_modality` swaps the decoder between its vision and speech weights; under a LoRA adapter the wrapped linear computes.
+        *parents, name = key.split(".")
+        target = self
+        for part in parents:
+            target = target[int(part)] if part.isdigit() else getattr(target, part)
+        if "lora_a" in target and "linear" in target:
+            target = target.linear
+        setattr(target, name, value)
+
     _patch_method(phi4mm_vision_module.VisionTower, "__call__", patched_phi4mm_vision_tower_call)
+    _patch_method(phi4mm_module.Model, "_set_weight_by_key", patched_phi4mm_set_weight_by_key)
     patched_phi4mm_get_input_embeddings._unsloth_static_vlm_metadata = ("spatial_shapes",)
     _patch_method(phi4mm_module.Model, "get_input_embeddings", patched_phi4mm_get_input_embeddings)
     _PATCHED_ARCHES.add("phi4mm")
