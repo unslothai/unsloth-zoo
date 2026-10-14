@@ -1167,6 +1167,8 @@ class EngineRow:
     last N prompt positions, which a drafter starts from. A row speculates only if ``drafts`` and
     each of its ``processors`` sets ``history_only = True``: after its first call its output depends
     only on the ``(tokens, logits)`` it is given, so it can be asked about positions that are then
+    rejected; or defines ``settle(tokens)``, which is given the row's committed history when the row
+    joins and after every token taken, while its calls may run ahead of it by tokens that are then
     rejected.
     """
 
@@ -1206,8 +1208,10 @@ class _Row:
         self.stop_tokens = frozenset(row.stop_tokens)
         self.processors = list(row.processors)
         self.history_only = all(getattr(processor, "history_only", False) for processor in self.processors)
-        self.speculates = row.drafts and self.history_only
+        self.settles = [processor.settle for processor in self.processors if hasattr(processor, "settle")]
+        self.speculates = row.drafts and all(getattr(processor, "history_only", False) or hasattr(processor, "settle") for processor in self.processors)
         self.history = mx.array(self.tokens) if self.processors else None
+        self.settle()
         self.rope_delta = int(row.rope_delta)
         self.sample = _RowSampler(row.sampling)
         self.proposer = NgramProposer(row.prompt)
@@ -1261,7 +1265,12 @@ class _Row:
                 self.history = mx.concatenate([self.history, mx.array(taken)])
             if self.scores is not None:
                 self.scores.extend(scores[: len(taken)])
+            self.settle()
         return taken
+
+    def settle(self) -> None:
+        for settle in self.settles:
+            settle(self.history)
 
 
 def _capture(drafter) -> dict:
@@ -1828,6 +1837,8 @@ def _shown_from(processor: Callable, start: int) -> Callable:
         return processor(tokens[start:], logits)
 
     shown.history_only = getattr(processor, "history_only", False)
+    if hasattr(processor, "settle"):
+        shown.settle = lambda tokens: processor.settle(tokens[start:])
     return shown
 
 

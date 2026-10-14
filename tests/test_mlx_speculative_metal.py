@@ -226,6 +226,18 @@ def _presence():
     return penalty
 
 
+def _parity():
+    """Settles: favours half the vocabulary by the parity of the reply's token sum, and keeps each committed history it is told."""
+    def favour(tokens, logits):
+        start = favour.__dict__.setdefault("start", tokens.shape[0])
+        if favour.committed:
+            favour.ahead = max(favour.ahead, tokens.shape[0] - start - len(favour.committed[-1]))
+        return logits + 4 * (mx.arange(logits.shape[-1]) % 2 == sum(tokens[start:].tolist()) % 2)
+    favour.committed, favour.ahead = [], 0
+    favour.settle = lambda tokens: favour.committed.append(tokens[favour.start :].tolist())
+    return favour
+
+
 def _head_in_step(engine):
     offset = mx.array(engine.draft_cache[0].offset).reshape(-1).tolist()
     for i, row in enumerate(engine._rows):
@@ -304,6 +316,35 @@ def test_ragged_rounds_match_each_row_decoded_alone(qwen):
     short = lambda e: setattr(e, "add", lambda row, add = e.add: add(__import__("dataclasses").replace(row, max_tokens = 3) if row.uid else row)) or setattr(e, "step", lambda step = e.step: seen.append(len(e._rows)) or step())
     out, _, _ = _run(model, ids[:2], 12, window, SamplingParams(), patch = short)
     assert seen == [2, 1] and out == [_solo(model, ids[0], 12, SamplingParams()), _solo(model, ids[1], 3, SamplingParams())]
+
+
+def test_a_batch_row_settles_on_the_history_its_processor_is_shown():
+    from unsloth_zoo.mlx.generate import _sequential_history
+    settled = []
+    processor = lambda tokens, logits: logits
+    processor.settle = lambda tokens: settled.append(tokens.tolist())
+    shown = _sequential_history(processor)
+    shown(mx.array([1, 2, 3]), mx.zeros((1, 4)))
+    shown.settle(mx.array([1, 2, 3, 4]))
+    assert settled == [[3, 4]] and not shown.history_only
+
+
+def test_a_processor_that_settles_speculates_and_is_told_each_committed_history(qwen, monkeypatch):
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids = qwen
+    take, lengths = speculative._Row.take, []
+    monkeypatch.setattr(speculative._Row, "take", lambda row, *a: (taken := take(row, *a)) and lengths.append(len(row.tokens) - len(ids[0])) or taken)
+    step, plain_ahead = speculative.SpeculativeEngine._step, []
+    monkeypatch.setattr(speculative.SpeculativeEngine, "_step", lambda engine, inputs, ahead = 0: plain_ahead.append(ahead) or step(engine, inputs, ahead))
+    (out,), drafted, _ = _run(model, ids[:1], 96, _script(("copy", 8), ("plain", 4)), SamplingParams(), processors = {0: [favour := _parity()]})
+    assert out == _solo(model, ids[0], 96, SamplingParams(), [_parity()])
+    # A plain window takes each token before the next step, so a settling matcher is never left behind.
+    assert plain_ahead and not any(plain_ahead)
+    assert drafted[0][1] > 0 and favour.ahead > 1
+    committed = favour.committed
+    assert committed[0] == out[:1] and committed[-1] == out and [len(c) for c in committed] == [1, *lengths]
+    assert all(len(a) < len(b) and b[: len(a)] == a for a, b in zip(committed, committed[1:]))
 
 
 def test_verify_that_replaces_caches_is_refused_and_decoding_continues(qwen):
@@ -2040,11 +2081,14 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size) == plain
         draft.prepare(ids[0], SamplingParams(), [penalty := _presence()])
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size, logits_processors = [penalty]) == penalized != plain
-    # A row primes on the prompt's last prompt_tail positions, in max_lag pieces that drop none of them.
-    assert rounds and [hidden.shape[1] for hidden in started] == ([48] * 4 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+        favoured = generate(prefill_step_size = prefill_step_size, logits_processors = [_parity()])
+        draft.prepare(ids[0], SamplingParams(), [favour := _parity()])
+        assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size, logits_processors = [favour]) == favoured != plain
+        assert favour.committed[-1] == favoured
+    assert rounds and [hidden.shape[1] for hidden in started] == ([48] * 6 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
     assert not native or (len(ids[0]) > max(kept) == 48 and not any(draft.drafter.dropped.values()))
     # The same positions from six chunks as from one forward: chunking moves them ~0.07 on average, a one-position shift ~3.3.
-    assert not native or (started[0] - started[2]).abs().mean().item() < 0.5
+    assert not native or (started[0] - started[3]).abs().mean().item() < 0.5
     with pytest.raises(RuntimeError, match = "prepare"):
         generate(draft_model = draft, draft_kind = draft.draft_kind)
 

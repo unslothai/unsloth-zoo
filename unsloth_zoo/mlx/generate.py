@@ -942,6 +942,8 @@ def _sequential_history(processor):
         return processor(tokens[state["offset"] :], logits)
 
     _shown.history_only = getattr(processor, "history_only", False)
+    if hasattr(processor, "settle"):
+        _shown.settle = lambda tokens: processor.settle(tokens[state["offset"] :])
     return _shown
 
 
