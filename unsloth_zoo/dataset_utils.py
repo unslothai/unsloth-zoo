@@ -1016,20 +1016,11 @@ def train_on_responses_only(
     if return_function:
         return _train_on_responses_only
 
-    import multiprocessing as _mp
     _num_proc_was_auto = num_proc is None or type(num_proc) is not int
     if _num_proc_was_auto:
-        if _mp.get_start_method() != 'fork':
-            num_proc = None
-        else:
-            import psutil
-            num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
-            # Cap by available memory to avoid OOM (1 proc per GB; 1 if <=2GB)
-            memory_gb_left = psutil.virtual_memory().available / (1024**3)
-            if memory_gb_left <= 2:
-                num_proc = 1
-            else:
-                num_proc = min(num_proc, int(memory_gb_left))
+        # Shared policy (affinity, cgroup CPU and memory, datasets' start method); cpu_count + 4 counted the whole host.
+        from .dataset_num_proc import get_dataset_num_proc
+        num_proc = get_dataset_num_proc(None)
 
     # Single-process small datasets (workers cost more than they save, and large auto
     # num_proc caused Windows spawn loops #3211/#3397); keep explicit user values.
@@ -2785,21 +2776,15 @@ def sft_prepare_dataset(
             )
         pass
 
+        # Worker count via the shared policy; spelled exactly as the edit unsloth applies here, so unsloth sees it as done.
         if not isinstance(dataset, IterableDataset):
-            import multiprocessing as _mp
-            dataset_num_proc = getattr(args, "dataset_num_proc", None)
-            if dataset_num_proc is None:
-                if _mp.get_start_method() != 'fork':
-                    dataset_num_proc = None
-                else:
-                    import psutil
-                    dataset_num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
-                    memory_gb_left = psutil.virtual_memory().available / (1024**3)
-                    if memory_gb_left <= 2:
-                        dataset_num_proc = 1
-                    else:
-                        dataset_num_proc = min(dataset_num_proc, int(memory_gb_left))
-            map_kwargs["num_proc"] = dataset_num_proc
+            try:
+                from unsloth_zoo.dataset_num_proc import get_dataset_num_proc as _unsloth_get_dataset_num_proc
+            except ImportError:
+                from unsloth.dataset_num_proc import get_dataset_num_proc as _unsloth_get_dataset_num_proc
+            map_kwargs["num_proc"] = _unsloth_get_dataset_num_proc(
+                getattr(args, "dataset_num_proc", None)
+            )
         else:
             map_kwargs["batch_size"] = _iterable_batch_size(dataset)
 

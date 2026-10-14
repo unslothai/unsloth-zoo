@@ -15,3 +15,7 @@ try:
     FLA_TENSOR_CACHE_SIZE = int(os.getenv('FLA_TENSOR_CACHE_SIZE', "4"))
 except ValueError:
     FLA_TENSOR_CACHE_SIZE = 4
+
+# Unsloth: element count above which launchers set LONG_INDEXING, widening sequence
+# start offsets (`bos * H * K`) to int64; the largest int32 offset is 2**31 - 1.
+LONG_INDEXING_THRESHOLD = 2**31

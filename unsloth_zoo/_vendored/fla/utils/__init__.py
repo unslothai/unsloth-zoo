@@ -20,6 +20,7 @@ from ._config import (  # noqa: F401
     FLA_CI_ENV,
     FLA_DISABLE_TENSOR_CACHE,
     FLA_TENSOR_CACHE_SIZE,
+    LONG_INDEXING_THRESHOLD,
 )
 from ._decorators import (  # noqa: F401
     Action,
