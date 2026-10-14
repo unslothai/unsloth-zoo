@@ -3668,8 +3668,17 @@ _LFM2_PROJECTOR_INIT_TOKEN_SHA256 = (
 _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
     "4405529c372e5bc69cf782c1038b674b55b46434e9a515d9db46a2a92e0414fa"
 )
+_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256 = (
+    "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576"
+)
+_MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256 = (
+    "f995c993dd959cc55a43f70f8f87c115d18833179e464426d63153022f4770ec"
+)
 _GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 = (
     "e859b50eb966089f8966a38ca2e69c3b68ccf48c5b4a264fbc01f415be60003f"
+)
+_XING4_0_HYPER_CONNECTION_CALL_TOKEN_SHA256 = (
+    "d33c41e769c36a1d01595314a684092576323fb12077090b3caf83325cf7bf64"
 )
 
 
@@ -3782,6 +3791,59 @@ def _ensure_lfm2_projector_layernorm(model_type) -> None:
 
     patched._unsloth_disabled_layernorm = True
     projector.__init__ = patched
+
+
+def _ensure_xing4_0_sliced_hyper_connection_base(model_type) -> None:
+    """Slice Xing4.0's hyper-connection base where the installed forward splits it."""
+
+    if model_type != "xing4_0":
+        return
+    try:
+        module = importlib.import_module("mlx_vlm.models.xing4_0.language")
+    except Exception:
+        return
+    connection = getattr(module, "HyperConnection", None)
+    if not isinstance(connection, type) or connection.__module__ != module.__name__:
+        return
+    installed_call = connection.__call__
+    if (
+        getattr(installed_call, "_unsloth_sliced_base", False)
+        or _source_token_sha256(_safe_getsource(installed_call))
+        != _XING4_0_HYPER_CONNECTION_CALL_TOKEN_SHA256
+    ):
+        return
+    import mlx.core as mx
+
+    # mx.compile raises `unordered_map::at` when a gradient-checkpointed layer
+    # splits a frozen parameter; the three parts as slices trace cleanly.
+    @wraps(installed_call)
+    def patched(self, x):
+        config = self.config
+        hc = config.hc_mult
+        flat = x.reshape(*x.shape[:2], -1).astype(mx.float32)
+        flat = flat * mx.rsqrt(
+            mx.mean(flat * flat, axis=-1, keepdims=True) + config.rms_norm_eps
+        )
+        mix = (flat.astype(x.dtype) @ self.hc_fn.astype(x.dtype).T).astype(mx.float32)
+        pre, post, comb = mx.split(mix, [hc, 2 * hc], axis=-1)
+        pre_b = self.hc_base[:hc]
+        post_b = self.hc_base[hc : 2 * hc]
+        comb_b = self.hc_base[2 * hc :]
+        pre = mx.sigmoid(pre * self.hc_scale[0] + pre_b)
+        post = 2 * mx.sigmoid(post * self.hc_scale[1] + post_b)
+        comb = comb.reshape(*comb.shape[:-1], hc, hc) * self.hc_scale[
+            2
+        ] + comb_b.reshape(hc, hc)
+        comb = mx.clip(comb, config.mhc_h_res_clamp_min, config.mhc_h_res_clamp_max)
+        comb = mx.exp(comb - comb.max(axis=-1, keepdims=True))
+        for _ in range(config.hc_sinkhorn_iters):
+            comb = comb / (comb.sum(axis=-1, keepdims=True) + config.hc_eps)
+            comb = comb / (comb.sum(axis=-2, keepdims=True) + config.hc_eps)
+        collapsed = (pre[..., None].astype(x.dtype) * x).sum(axis=2)
+        return post.astype(x.dtype), comb.astype(x.dtype), collapsed
+
+    patched._unsloth_sliced_base = True
+    connection.__call__ = patched
 
 
 def _gemma4_unused_shared_kv_weight(model, key) -> bool:
@@ -4046,6 +4108,81 @@ def _ensure_minicpmo_vision_dtype(model_type: str) -> None:
     adapted = _minicpmo_vision_dtype_adapter(cls.get_vision_embedding)
     if adapted is not cls.get_vision_embedding:
         cls.get_vision_embedding = adapted
+
+
+def _minicpmv4_7_text_positions_adapter(cls):
+    """Lay out MiniCPM-V 4.7 positions on device for a training batch without visuals.
+
+    The installed method builds canvas M-RoPE positions on the host for every
+    batch, which mx.compile cannot trace. Without visual input the canvas holds
+    only text, where each attended token's position is its rank among them.
+    """
+
+    original = cls.__dict__.get("get_input_embeddings")
+    rope = getattr(sys.modules.get(cls.__module__), "CanvasRoPE", None)
+    if (
+        getattr(original, "_unsloth_minicpmv4_7_text_positions", False)
+        or _source_token_sha256(_safe_getsource(original))
+        != _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
+        or _source_token_sha256(_safe_getsource(getattr(rope, "get_rope_index", None)))
+        != _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256
+    ):
+        return original
+    import mlx.core as mx
+
+    features_cls = original.__globals__["InputEmbeddingsFeatures"]
+
+    @wraps(original)
+    def patched(self, input_ids, pixel_values=None, **kwargs):
+        mask = kwargs.get("attention_mask", kwargs.get("mask"))
+        if (
+            not getattr(self, "training", False)
+            or pixel_values is not None
+            or kwargs.get("cached_image_features") is not None
+            or kwargs.get("tgt_sizes") is not None
+            or kwargs.get("downsample_mode", self.config.downsample_mode)
+            not in ("4x", "16x")
+            or not isinstance(input_ids, mx.array)
+            or input_ids.ndim != 2
+            or mask is not None
+            and (not isinstance(mask, mx.array) or mask.shape != input_ids.shape)
+        ):
+            return original(self, input_ids, pixel_values, **kwargs)
+        # A traced step cannot read token values, so a literal visual placeholder in a text row trains as a token.
+        embeddings = super(cls, self).get_input_embeddings(
+            input_ids, pixel_values=None, **kwargs
+        )
+        batch, width = input_ids.shape
+        if mask is None:
+            positions = mx.arange(width, dtype=mx.int32)
+        else:
+            valid = mask.astype(mx.bool_)
+            positions = mx.where(
+                valid, mx.cumsum(valid.astype(mx.int32), axis=-1) - 1, 0
+            )
+        positions = mx.broadcast_to(positions, (3, batch, width))
+        deltas = positions.max(axis=(0, 2))[:, None] + 1 - width
+        self.language_model._position_ids = positions
+        self.language_model._rope_deltas = deltas
+        return features_cls(
+            inputs_embeds=embeddings.inputs_embeds,
+            position_ids=positions,
+            rope_deltas=deltas,
+        )
+
+    patched._unsloth_minicpmv4_7_text_positions = True
+    return patched
+
+
+def _ensure_minicpmv4_7_text_positions(model_type: str) -> None:
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if (
+        cls is None
+        or cls.__module__ != "mlx_vlm.models.minicpmv4_7.minicpmv4_7"
+        or "get_input_embeddings" not in cls.__dict__
+    ):
+        return
+    cls.get_input_embeddings = _minicpmv4_7_text_positions_adapter(cls)
 
 
 def _lookup_module_array(root, dotted_key):
@@ -9410,8 +9547,10 @@ class FastMLXModel:
                 install_mlx_compile_patches()
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_xing4_0_sliced_hyper_connection_base(model_type)
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
+            _ensure_minicpmv4_7_text_positions(model_type)
             _ensure_audio_conv_sanitize(model_type)
             _ensure_qwen3_omni_audio_per_clip(model_type)
             _ensure_native_vlm_weight_names(model_type)

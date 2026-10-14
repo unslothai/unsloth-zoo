@@ -95,6 +95,68 @@ def test_cached_position_attribute_does_not_imply_multiaxis_rope():
 
 
 @metal_only
+def test_minicpmv4_7_text_batch_matches_upstream_and_compiles(monkeypatch):
+    import importlib
+    from unsloth_zoo.mlx import loader
+
+    try:
+        module = importlib.import_module("mlx_vlm.models.minicpmv4_7.minicpmv4_7")
+    except ImportError:
+        pytest.skip("mlx-vlm has no MiniCPM-V 4.7")
+    text = dict(model_type="qwen3_5_text", hidden_size=64, intermediate_size=64, num_hidden_layers=2,
+                num_attention_heads=2, num_key_value_heads=1, head_dim=32, rms_norm_eps=1e-6,
+                vocab_size=64, full_attention_interval=2, linear_num_key_heads=1,
+                linear_num_value_heads=1, linear_key_head_dim=32, linear_value_head_dim=32,
+                rope_parameters={"mrope_interleaved": True, "mrope_section": [2, 1, 1],
+                                 "rope_theta": 1e7, "partial_rotary_factor": 0.25})
+    vision = dict(hidden_size=32, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2)
+    config = module.ModelConfig.from_dict(dict(
+        model_type="minicpmv4_7", text_config=text, vision_config=vision, insert_layer_id=0,
+        image_token_id=56, video_token_id=57, image_start_id=58, image_end_id=59,
+        slice_start_id=60, slice_end_id=61, newline_id=62))
+    installed = module.Model.get_input_embeddings
+    upstream = getattr(installed, "__wrapped__", installed)
+    monkeypatch.setattr(module.Model, "get_input_embeddings", upstream)
+    with monkeypatch.context() as changed:
+        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", "0" * 64)
+        assert loader._minicpmv4_7_text_positions_adapter(module.Model) is upstream
+    loader._ensure_minicpmv4_7_text_positions("minicpmv4_7")
+    patched = module.Model.get_input_embeddings
+    mx.random.seed(0)
+    model = module.Model(config)
+    model.train()
+    lm, ids = model.language_model, mx.array([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]])
+    for kwargs in ({}, {"mask": mx.array([[1, 1, 1, 1, 0, 0], [0, 0, 1, 1, 1, 1]])},
+                   {"attention_mask": mx.array([[0] * 6, [1, 0, 1, 0, 1, 1]], dtype=mx.bool_)}):
+        expected = upstream(model, ids, **kwargs)
+        expected = (expected.inputs_embeds, expected.position_ids, expected.rope_deltas,
+                    lm._position_ids, lm._rope_deltas)
+        lm._position_ids = lm._rope_deltas = mx.full((3, 1, 1), 97)
+        actual = patched(model, ids, **kwargs)
+        actual = (actual.inputs_embeds, actual.position_ids, actual.rope_deltas,
+                  lm._position_ids, lm._rope_deltas)
+        for a, e in zip(actual, expected):
+            assert a.dtype == e.dtype and mx.array_equal(a, e).item()
+    model.eval()
+    with pytest.raises(ValueError, match="placeholder"):
+        patched(model, mx.array([[config.image_token_id, 1]]))
+    model.train()
+
+    def loss(model, ids):
+        return nn.losses.cross_entropy(model(ids[:, :-1]).logits, ids[:, 1:]).mean()
+
+    step = nn.value_and_grad(model, loss)
+    eager, eager_grad = step(model, ids)
+    compiled, compiled_grad = mx.compile(lambda x: step(model, x), inputs=[model.state], outputs=[model.state])(ids)
+    assert compiled.item() == eager.item()
+    eager_grad, compiled_grad = dict(tree_flatten(eager_grad)), dict(tree_flatten(compiled_grad))
+    assert compiled_grad.keys() == eager_grad.keys()
+    assert float(mx.abs(eager_grad["language_model.model.embed_tokens.weight"]).max()) > 0
+    for name, grad in eager_grad.items():
+        assert mx.allclose(compiled_grad[name], grad, atol=1e-5, rtol=1e-3).item(), name
+
+
+@metal_only
 def test_qwen3_vl_pos_embed_interpolation_with_quantized_table():
     from types import SimpleNamespace
     from mlx_vlm.models.qwen3_vl.vision import VisionModel
@@ -3203,3 +3265,52 @@ def test_self_routed_vlm_merges_images_inside_loss(use_cce):
         assert float(mx.abs(grad["vision"]["weight"]).max()) > 0
         assert mx.array_equal(actual, expected).item()
         assert mx.array_equal(grad["vision"]["weight"], expected_grad["vision"]["weight"]).item()
+
+
+@metal_only
+def test_xing4_0_checkpointed_layers_compile(monkeypatch, request):
+    from unsloth_zoo.mlx import loader
+
+    mlx_utils.acquire_mlx_training_patches()
+    request.addfinalizer(mlx_utils.release_mlx_training_patches)
+    config = pytest.importorskip("mlx_vlm.models.xing4_0.config")
+    language = pytest.importorskip("mlx_vlm.models.xing4_0.language")
+    upstream = language.HyperConnection.__call__
+    upstream = getattr(upstream, "__wrapped__", upstream)
+    monkeypatch.setattr(language.HyperConnection, "__call__", upstream)
+    loader._ensure_xing4_0_sliced_hyper_connection_base("xing4_0")
+    assert language.HyperConnection.__call__ is not upstream
+
+    mx.random.seed(5)
+    model = language.LanguageModel(config.ModelConfig(
+        vocab_size=64, hidden_size=64, intermediate_size=128, moe_intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+        n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=1, first_k_dense_replace=1,
+        kv_lora_rank=16, q_lora_rank=16, qk_rope_head_dim=16, qk_nope_head_dim=32, v_head_dim=32,
+        hc_sinkhorn_iters=3, max_position_embeddings=128))
+    for layer in model.model.layers:
+        for hyper in (layer.attn_hc, layer.ffn_hc):
+            hyper.hc_fn = mx.random.normal(hyper.hc_fn.shape) * 0.1
+            hyper.hc_base = mx.random.normal(hyper.hc_base.shape)
+    model.freeze()
+    for layer in model.model.layers:
+        layer.self_attn.o_proj.unfreeze()
+    mx.eval(model.parameters())
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    hidden = mx.random.normal((1, 5, 4, 64))
+    hyper = model.model.layers[1].ffn_hc
+    for actual, expected in zip(hyper(hidden), upstream(hyper, hidden)):
+        assert mx.array_equal(actual, expected).item()
+
+    grad = nn.value_and_grad(model, lambda m, i: m(i).logits.sum())
+    expected, expected_grad = grad(model, ids)
+    mx.eval(expected, expected_grad)
+    layer_cls = type(model.model.layers[0])
+    mlx_utils._patch_layer_class_for_gc(layer_cls)
+    request.addfinalizer(lambda: mlx_utils._unpatch_layer_class_gc(layer_cls))
+    step = mx.compile(lambda i: grad(model, i), inputs=model.state, outputs=model.state)
+    actual, actual_grad = step(ids)
+    assert mx.allclose(actual, expected, rtol=1e-4).item()
+    for (name, a), (_, b) in zip(tree_flatten(actual_grad), tree_flatten(expected_grad)):
+        assert float(mx.abs(b).max()) > 0, name
+        assert mx.allclose(a, b, atol=1e-5, rtol=1e-3).item(), name
