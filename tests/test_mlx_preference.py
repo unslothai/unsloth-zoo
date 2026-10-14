@@ -3716,6 +3716,8 @@ def test_grpo_rewards_advantages_and_reward_inputs_follow_trl():
     prompts, completions = reward_prompts_and_completions([prompt] * 4, ["4", "5", "4", "4"])
     assert prompts[0] == prompt[:1] and len(prompt) == 2 and completions[1][0]["content"] == "It is 5"
     assert reward_prompts_and_completions(["2+2?"], ["4"]) == (["2+2?"], ["4"])
+    structured = [prompt[0], {"role": "assistant", "content": [{"type": "text", "text": "It is "}]}]
+    assert reward_prompts_and_completions([structured], ["4"])[1] == [[{"role": "assistant", "content": "It is 4"}]]
     rows = [{"prompt": prompt, "answer": "4", "level": i} for i in range(4)]
     with pytest.warns(UserWarning, match="every reward function returned None"):
         rewards = calculate_rewards(
@@ -3763,7 +3765,11 @@ def test_grpo_rollout_warper_matches_hf_sampling_processors(settings):
     ])(torch.tensor([prompt + generated]), logits.clone())
     assert torch.equal(torch.isinf(ours), torch.isinf(expected)) and 0 < torch.isinf(ours).sum() < 12
     assert torch.allclose(ours[~torch.isinf(ours)], expected[~torch.isinf(expected)], rtol=1e-5)
-    tied = hf_logits_warper(GRPOSampling(top_p=0.5), [1])(torch.tensor([1]), torch.tensor([[0.0, 1.0, 1.0, 1.0]]))
+    penalized, scores = GRPOSampling(repetition_penalty=2.0), torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    plain = hf_logits_warper(penalized, [1, 2])(torch.tensor([2]), scores.clone())
+    for placeholder in (-2, 9):  # image ids outside the head penalize nothing, in the prefix or last
+        assert torch.equal(hf_logits_warper(penalized, [placeholder, 1, placeholder])(torch.tensor([placeholder, 2]), scores.clone()), plain)
+    tied =hf_logits_warper(GRPOSampling(top_p=0.5), [1])(torch.tensor([1]), torch.tensor([[0.0, 1.0, 1.0, 1.0]]))
     assert torch.isfinite(tied).sum() == 2  # HF keeps two of the three tied logits
 
 
@@ -3908,6 +3914,101 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     planned = plan[6]  # an eager fetch, as after a compile fallback
     assert len(calls) == 3 and calls[2][0][0].sampling.seed != calls[1][0][0].sampling.seed and plan.width_rungs(6) == (6,)
     assert planned[0].shape == (2, 8) and planned[5].shape == planned[6].shape == (2, 7) and seen["width"] == 8
+
+
+def _grpo_vision_processor():
+    processor = VisionProcessor()  # a string content renders apart from a text part, as real templates may
+    processor.apply_chat_template = lambda messages, **kwargs: VisionProcessor.apply_chat_template(processor, [
+        {**m, "content": "!" + m["content"] if isinstance(m["content"], str) else m["content"]} for m in messages], **kwargs)
+    processor.tokenizer = DecodingTokenizer()
+    processor.tokenizer.image_token_id = 60
+    return processor
+
+
+class _VisionLanguageModel(TinyModel):
+    _is_vlm_model = True
+
+    def __call__(self, tokens, pixel_values, mask, **kwargs):  # required, as LLaVA's are
+        import mlx.core as mx
+        logits = super().__call__(mx.where(tokens >= 60, 0, tokens))
+        return logits if pixel_values is None else logits * (1 + pixel_values.sum() / 100)
+
+
+def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
+    import numpy as np
+    import mlx.core as mx
+    from PIL import Image
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.grpo import (
+        GRPOObjective, GRPOSampling, _grpo_vision_batch, completion_logps, create_grpo_batch_plan, make_grpo_loss_fn)
+
+    calls, seen, reads = [], {}, []
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: calls.append(
+        (processor, requests)) or [types.SimpleNamespace(token_ids=[1] * (1 + row % 3), finish_reason="stop") for row in range(len(requests))])
+    Rows = type("Rows", (list,), {"__getitem__": lambda self, index: reads.append(index) or list.__getitem__(self, index)})
+    user = lambda text: [{"role": "user", "content": text}]
+    image = lambda width: Image.new("RGB", (width, 4))
+    data = Rows([{"prompt": user("hi"), "image": image(4)}, {"prompt": user("yo"), "image": None},
+                 {"prompt": user("ok"), "image": [image(6), image(8)]}])
+    processor, encode = _grpo_vision_processor(), Tokenizer().encode
+    build = lambda rows: create_grpo_batch_plan(
+        rows, None, num_generations=2, batch_size=2, steps_per_generation=3, num_iterations=1, grad_accum=1,
+        sampling=GRPOSampling(max_tokens=3), max_seq_length=64, shuffle=False, num_batches=3, processor=processor, model_config={})
+    plan, model = build(data), _VisionLanguageModel()
+    assert plan._prompt_ids[:2] == [tuple(encode("<user>") + [60, 61] + encode("hi<assistant>")), tuple(encode("<user>yo<assistant>"))]
+    plan.bind(model, [lambda prompts, completions, **_: seen.update(prompts=prompts) or [float(len(c)) for c in completions]],
+              trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))
+    reads.clear()
+    micros = [plan.materialize(index) for index in range(3)]
+    assert reads == [0, 1, 2] and calls[0][0] is processor  # one read per prompt, none retained
+    assert [None if r.vision_inputs is None else r.vision_inputs["pixel_values"].tolist() for r in calls[0][1][::2]] == [[[4.0]], None, [[6.0], [8.0]]]
+    parts = lambda count, text: [{"role": "user", "content": [{"type": "image"}] * count + [{"type": "text", "text": text}]}]
+    assert seen["prompts"][::2] == [parts(1, "hi"), parts(0, "yo"), parts(2, "ok")]  # TRL's placeholders reach rewards
+    for batch, lengths, *rest in micros:
+        ids = batch["input_ids"]
+        prompts = [plan._prompt_ids.index(tuple(row[:start])) for row, (start, _) in zip(ids.tolist(), lengths.tolist())]
+        widths = {0: [[4.0]], 1: [], 2: [[6.0], [8.0]]}
+        pixels = [] if batch.get("pixel_values") is None else batch["pixel_values"].tolist()
+        assert pixels == [w for prompt in prompts for w in widths[prompt]]
+        assert batch["token_type_ids"].tolist() == (np.array(ids) >= 60).astype(int).tolist()  # zero over completions
+        scored = np.arange(ids.shape[1] - 1)[None, :] < np.array(lengths[:, 1:]) - 1
+        assert np.allclose(np.array(rest[3])[scored], np.array(mx.stop_gradient(completion_logps(model, batch, 1.0)))[scored], atol=1e-6)
+        assert make_grpo_loss_fn(GRPOObjective(beta=0.0))(model, batch, lengths, *rest[:4])[2][4].item() == 0  # ratio 1
+    text = plan._inputs(np.array(micros[0][0]["input_ids"]), np.array(micros[0][1]), [("yo", ())] * 2)
+    assert text.get("pixel_values") is None and completion_logps(model, text, 1.0).shape[0] == 2  # bare ids fail the stub
+    data[2]["prompt"] = user("changed")
+    with pytest.raises(ValueError, match="row 2 encodes to a different prompt"):
+        plan.materialize(3)
+    blank = build([{"prompt": user("yo"), "images": []}] * 3)
+    assert blank.vision is False and blank._prompt_ids[0] == tuple(encode("<user>!yo<assistant>"))
+    assert completion_logps(model, {"input_ids": mx.array([[1, 64, 2]])}, 1.0).shape == (1, 2)  # a placeholder past the head
+    index = next(index for index, micro in enumerate(micros) if micro[0].get("pixel_values") is not None)
+    shifted = np.array(micros[index][0]["input_ids"])
+    shifted[1] += 1  # only the second row
+    with pytest.raises(ValueError, match="differently beside others"):
+        _grpo_vision_batch(processor, {}, shifted, np.array(micros[index][1]), plan._current.media[2 * index:2 * index + 2])
+
+
+def test_grpo_trains_and_evaluates_image_prompts_on_a_vision_language_model(tmp_path, monkeypatch):
+    from mlx_vlm import prompt_utils
+    from PIL import Image
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+    monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_a, **_k: None, raising=False)
+    data = [{"prompt": [{"role": "user", "content": f"q{index}"}], "image": Image.new("RGB", (4 + index, 4))} for index in range(4)]
+    class Model(type(_tiny_model())):
+        _is_vlm_model, forwards = True, []
+        def __call__(self, tokens, pixel_values=None, mask=None, **kwargs):
+            return Model.forwards.append((tokens.shape[0], pixel_values is None)) or super().__call__(tokens)
+    model, calls = Model(), []
+    trainer = MLXGRPOTrainer(model, Tokenizer(), data, eval_dataset=data[:2], processor=_grpo_vision_processor(),
+                             args=_grpo_config(tmp_path, eval_steps=1, per_device_eval_batch_size=2),
+                             reward_funcs=lambda completions, **_: [0.0] * len(completions))
+    _run_generation_trainer(trainer, monkeypatch, calls)
+    guard = trainer._compile_shape_guard_report
+    assert (guard.action, guard.reason) == ("not_applicable", "grpo_vision_eager") and trainer._global_step == 2
+    assert all(r.vision_inputs["pixel_values"].shape == (1, 1) for call in calls for r in call["requests"])
+    # Every batch forward carries pixels (the loader's one-row arity probes carry none); 2 train, 2x2 eval generations.
+    assert {missing for rows, missing in model.forwards if rows == 2} == {False} and len(calls) == 6
 
 
 @pytest.mark.parametrize("overrides,expected,warns", [

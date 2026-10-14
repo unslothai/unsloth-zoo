@@ -2505,6 +2505,11 @@ def _plan_single_process_text_shapes(
             return None, _shape_guard_report(
                 "not_applicable", "compile_ineligible_global_norm", cap,
             ), False, None
+    elif is_vlm and isinstance(batches, GRPOBatchPlan):
+        # Its vision inputs come only with each rollout, so no family is named ahead.
+        return None, _shape_guard_report(
+            "not_applicable", "grpo_vision_eager", cap,
+        ), False, None
     elif is_vlm:
         return _plan_single_process_vlm_shapes(
             batches,
@@ -7367,6 +7372,7 @@ class MLXTrainer:
                             mask_truncated_completions=args.mask_truncated_completions,
                             with_reference=self._uses_reference(args),
                             max_prompt_length=args.max_prompt_length, seed=args.seed,
+                            **self._grpo_vision_options(),
                         )
                         plan.bind(
                             model, self.reward_funcs, trainer_state=self.state,
@@ -10291,6 +10297,11 @@ class MLXGRPOTrainer(MLXTrainer):
         adapted = next(iter_mlx_lora_modules(self.model), None) is not None
         return super()._syncs_reference(args) and not adapted
 
+    def _grpo_vision_options(self):
+        options = self._preference_vision_options()
+        options.pop("image_size", None)  # TRL's GRPO hands the processor its images as given
+        return options
+
     def _create_grpo_plan(self, dataset, num_batches, num_epochs):
         args = self.args
         if args.dataset_order != "default" or args.preserve_dataset_order:
@@ -10310,6 +10321,7 @@ class MLXGRPOTrainer(MLXTrainer):
             with_reference=self._uses_reference(args),
             max_prompt_length=args.max_prompt_length, shuffle=args.shuffle_dataset,
             seed=args.seed, num_batches=num_batches, num_epochs=num_epochs,
+            **self._grpo_vision_options(),
         )
         # A resumed run generates at once, so its widths are planned from there.
         resume = getattr(self, "_resume_from_checkpoint", None)
