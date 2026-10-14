@@ -637,24 +637,25 @@ pass
 
 
 def patch_vllm_enable_sleep_mode():
-    if DEVICE_TYPE in ("cuda", "hip"):
+    if DEVICE_TYPE == "xpu":
+        # Probe the module, not the version: nightly XPU builds before 0.23.0 ship it.
+        try:
+            from vllm.device_allocator.xpumem import (
+                XpuMemAllocator as MemAllocator, AllocationData, unmap_and_release,
+                create_and_allocate as create_and_map, _xpu_memcpy_sync,
+                MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                f"Unsloth: vLLM standby mode on XPU requires vLLM >= 0.23.0, but found {vllm_version}.\n"
+                "Please update vLLM, or disable UNSLOTH_VLLM_STANDBY."
+            ) from e
+    else:
+        # Every other device (incl. Ascend NPU) keeps the CUDA route it always took.
         from vllm.device_allocator.cumem import (
             CuMemAllocator as MemAllocator, AllocationData, unmap_and_release,
             create_and_map, libcudart,
         )
-    elif DEVICE_TYPE == "xpu":
-        if Version(vllm_version) < Version("0.23.0"):
-            raise RuntimeError(
-                f"Unsloth: vLLM standby mode on XPU requires vLLM >= 0.23.0, but found {vllm_version}.\n"
-                "Please update vLLM, or disable UNSLOTH_VLLM_STANDBY."
-            )
-        from vllm.device_allocator.xpumem import (
-            XpuMemAllocator as MemAllocator, AllocationData, unmap_and_release,
-            create_and_allocate as create_and_map, _xpu_memcpy_sync,
-            MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
-        )
-    else:
-        raise ValueError(f"Unsupported DEVICE_TYPE: {DEVICE_TYPE} for UNSLOTH_VLLM_STANDBY mode")
     try:
         from vllm.utils import is_pin_memory_available
     except:
