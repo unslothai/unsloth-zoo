@@ -17677,8 +17677,7 @@ def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
 
 
 def _confirmed_mlx_moe_merge_recipe(sanitizers, staged, groups, recipes):
-    """The first recipe a sanitizer reproduces every part under, and the name of a
-    tensor some replay wanted and did not find."""
+    """(first natively confirmed recipe, a tensor name some replay wanted)."""
     wanted = None
     for width in _MOE_MERGE_PROBE_WIDTHS:
         for sanitizer in sanitizers:
@@ -17705,9 +17704,8 @@ def _mlx_moe_restored_module(name):
 
 def _completed_mlx_moe_merge_plan(sanitizers, staged, arrivals, groups, substitutions,
                                   recipe):
-    """Restore as much as the sanitizer still proves. mlx-vlm's expert helpers skip a
-    missing sibling and read `<name>.weight` as `<name>`, so a plan leaving a sibling
-    staged, or the suffix on, replays as well; llama.cpp reads neither."""
+    """mlx-vlm 0.7.8 expert helpers skip a missing sibling and accept `<name>.weight`,
+    so extend the plan to siblings and drop `.weight` while replay still proves it."""
     modules = {_mlx_moe_restored_module(target) for target in groups}
     claimed = {part for parts in groups.values() for part in parts}
     tried = set(substitutions)

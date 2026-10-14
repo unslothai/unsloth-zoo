@@ -2755,8 +2755,7 @@ def _gemma4_router_call(native):
 _MOE_ROUTER_BODIES = {
     # mlx_vlm qwen3_5_moe: 0.4.4-0.5.0 and 0.6.16-0.7.0; 0.6.0-0.6.15 takes a target-verify
     # argument; 0.7.1 scales the shared expert. qwen4_exp reuses the block, subclassing it in 0.7.1.
-    # mlx_vlm 0.7.5 stops the gradient on the selected indices in all three families below;
-    # 0.7.8's qwen3_5_moe honours `norm_topk_prob`.
+    # mlx_vlm 0.7.5 adds stop_gradient on the indices below; 0.7.8 qwen3_5_moe honours norm_topk_prob.
     "903a5a99afcad95a": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
     "0ca80e0451802015": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
     "b948b94a9d18333f": (functools.partial(_qwen3_5_moe_call, scaled_shared = True, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
