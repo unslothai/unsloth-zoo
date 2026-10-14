@@ -3202,3 +3202,52 @@ def test_self_routed_vlm_merges_images_inside_loss(use_cce):
         assert float(mx.abs(grad["vision"]["weight"]).max()) > 0
         assert mx.array_equal(actual, expected).item()
         assert mx.array_equal(grad["vision"]["weight"], expected_grad["vision"]["weight"]).item()
+
+
+@metal_only
+def test_xing4_0_checkpointed_layers_compile(monkeypatch, request):
+    from unsloth_zoo.mlx import loader
+
+    mlx_utils.acquire_mlx_training_patches()
+    request.addfinalizer(mlx_utils.release_mlx_training_patches)
+    config = pytest.importorskip("mlx_vlm.models.xing4_0.config")
+    language = pytest.importorskip("mlx_vlm.models.xing4_0.language")
+    upstream = language.HyperConnection.__call__
+    upstream = getattr(upstream, "__wrapped__", upstream)
+    monkeypatch.setattr(language.HyperConnection, "__call__", upstream)
+    loader._ensure_xing4_0_sliced_hyper_connection_base("xing4_0")
+    assert language.HyperConnection.__call__ is not upstream
+
+    mx.random.seed(5)
+    model = language.LanguageModel(config.ModelConfig(
+        vocab_size=64, hidden_size=64, intermediate_size=128, moe_intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+        n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=1, first_k_dense_replace=1,
+        kv_lora_rank=16, q_lora_rank=16, qk_rope_head_dim=16, qk_nope_head_dim=32, v_head_dim=32,
+        hc_sinkhorn_iters=3, max_position_embeddings=128))
+    for layer in model.model.layers:
+        for hyper in (layer.attn_hc, layer.ffn_hc):
+            hyper.hc_fn = mx.random.normal(hyper.hc_fn.shape) * 0.1
+            hyper.hc_base = mx.random.normal(hyper.hc_base.shape)
+    model.freeze()
+    for layer in model.model.layers:
+        layer.self_attn.o_proj.unfreeze()
+    mx.eval(model.parameters())
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    hidden = mx.random.normal((1, 5, 4, 64))
+    hyper = model.model.layers[1].ffn_hc
+    for actual, expected in zip(hyper(hidden), upstream(hyper, hidden)):
+        assert mx.array_equal(actual, expected).item()
+
+    grad = nn.value_and_grad(model, lambda m, i: m(i).logits.sum())
+    expected, expected_grad = grad(model, ids)
+    mx.eval(expected, expected_grad)
+    layer_cls = type(model.model.layers[0])
+    mlx_utils._patch_layer_class_for_gc(layer_cls)
+    request.addfinalizer(lambda: mlx_utils._unpatch_layer_class_gc(layer_cls))
+    step = mx.compile(lambda i: grad(model, i), inputs=model.state, outputs=model.state)
+    actual, actual_grad = step(ids)
+    assert mx.allclose(actual, expected, rtol=1e-4).item()
+    for (name, a), (_, b) in zip(tree_flatten(actual_grad), tree_flatten(expected_grad)):
+        assert float(mx.abs(b).max()) > 0, name
+        assert mx.allclose(a, b, atol=1e-5, rtol=1e-3).item(), name

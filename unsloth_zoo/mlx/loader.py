@@ -3642,6 +3642,9 @@ _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
 _GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 = (
     "e859b50eb966089f8966a38ca2e69c3b68ccf48c5b4a264fbc01f415be60003f"
 )
+_XING4_0_HYPER_CONNECTION_CALL_TOKEN_SHA256 = (
+    "d33c41e769c36a1d01595314a684092576323fb12077090b3caf83325cf7bf64"
+)
 
 
 def _source_token_sha256(source: str) -> str:
@@ -3753,6 +3756,59 @@ def _ensure_lfm2_projector_layernorm(model_type) -> None:
 
     patched._unsloth_disabled_layernorm = True
     projector.__init__ = patched
+
+
+def _ensure_xing4_0_sliced_hyper_connection_base(model_type) -> None:
+    """Slice Xing4.0's hyper-connection base where the installed forward splits it."""
+
+    if model_type != "xing4_0":
+        return
+    try:
+        module = importlib.import_module("mlx_vlm.models.xing4_0.language")
+    except Exception:
+        return
+    connection = getattr(module, "HyperConnection", None)
+    if not isinstance(connection, type) or connection.__module__ != module.__name__:
+        return
+    installed_call = connection.__call__
+    if (
+        getattr(installed_call, "_unsloth_sliced_base", False)
+        or _source_token_sha256(_safe_getsource(installed_call))
+        != _XING4_0_HYPER_CONNECTION_CALL_TOKEN_SHA256
+    ):
+        return
+    import mlx.core as mx
+
+    # mx.compile raises `unordered_map::at` when a gradient-checkpointed layer
+    # splits a frozen parameter; the three parts as slices trace cleanly.
+    @wraps(installed_call)
+    def patched(self, x):
+        config = self.config
+        hc = config.hc_mult
+        flat = x.reshape(*x.shape[:2], -1).astype(mx.float32)
+        flat = flat * mx.rsqrt(
+            mx.mean(flat * flat, axis=-1, keepdims=True) + config.rms_norm_eps
+        )
+        mix = (flat.astype(x.dtype) @ self.hc_fn.astype(x.dtype).T).astype(mx.float32)
+        pre, post, comb = mx.split(mix, [hc, 2 * hc], axis=-1)
+        pre_b = self.hc_base[:hc]
+        post_b = self.hc_base[hc : 2 * hc]
+        comb_b = self.hc_base[2 * hc :]
+        pre = mx.sigmoid(pre * self.hc_scale[0] + pre_b)
+        post = 2 * mx.sigmoid(post * self.hc_scale[1] + post_b)
+        comb = comb.reshape(*comb.shape[:-1], hc, hc) * self.hc_scale[
+            2
+        ] + comb_b.reshape(hc, hc)
+        comb = mx.clip(comb, config.mhc_h_res_clamp_min, config.mhc_h_res_clamp_max)
+        comb = mx.exp(comb - comb.max(axis=-1, keepdims=True))
+        for _ in range(config.hc_sinkhorn_iters):
+            comb = comb / (comb.sum(axis=-1, keepdims=True) + config.hc_eps)
+            comb = comb / (comb.sum(axis=-2, keepdims=True) + config.hc_eps)
+        collapsed = (pre[..., None].astype(x.dtype) * x).sum(axis=2)
+        return post.astype(x.dtype), comb.astype(x.dtype), collapsed
+
+    patched._unsloth_sliced_base = True
+    connection.__call__ = patched
 
 
 def _gemma4_unused_shared_kv_weight(model, key) -> bool:
@@ -9351,6 +9407,7 @@ class FastMLXModel:
                 install_mlx_compile_patches()
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_xing4_0_sliced_hyper_connection_base(model_type)
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
             _ensure_audio_conv_sanitize(model_type)
