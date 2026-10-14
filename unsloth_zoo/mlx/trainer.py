@@ -7403,6 +7403,7 @@ class MLXTrainer:
                             append_eos=bool(args.append_eos),
                             formatting_func=None,
                             prompt_sink=prompt_sink,
+                            images_from=(eval_dataset, self.formatting_func),
                             **self._preference_vision_options(),
                         )
                     if is_vlm:

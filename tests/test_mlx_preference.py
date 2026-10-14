@@ -3320,6 +3320,127 @@ def test_a_vision_plan_repeats_the_pixels_for_both_branches():
     assert seen == [True, False]
 
 
+def test_a_vision_plan_reads_its_images_back_instead_of_holding_them(tmp_path):
+    import io
+    import mlx.core as mx
+    import numpy as np
+    from PIL import Image
+    from unsloth_zoo.mlx.preference import create_preference_batch_plan, precompute_reference_logps
+    from datasets import Dataset, Image as ImageFeature, Sequence
+
+    class Sized(VisionProcessor):  # left-pads; pixels report red and green; a wider image takes one more token
+        def __call__(self, text=None, images=None, **kwargs):
+            out = super().__call__(text=text, images=images, **kwargs)
+            rows = []
+            for ids, mask, group in zip(out["input_ids"], out["attention_mask"], images):
+                widths, expanded = iter(image.width for image in group), []
+                for token in ids[:mask.sum()].tolist():
+                    expanded += [token, 62] if token == 61 and next(widths) > 4 else [token]
+                rows.append(expanded)
+            pad = lambda values: [0] * (max(map(len, rows)) - len(values)) + values
+            return {"input_ids": np.array([pad(ids) for ids in rows]),
+                    "attention_mask": np.array([pad([1] * len(ids)) for ids in rows], np.float32),
+                    "token_type_ids": np.array([pad([int(token >= 60) for token in ids]) for ids in rows]),
+                    "pixel_values": np.array([[float(np.asarray(image)[0, 0, :2] @ (10, 1))]
+                                              for group in images for image in group])}
+
+    def paint(index, shade=0, width=4):
+        Image.new("RGB", (width, 4), (shade, index, 0)).save(tmp_path / f"{index}.png")
+
+    def decoding():  # a Hugging Face dataset decoding its image files on every read
+        for index in (0, 1):
+            paint(index)
+        return Dataset.from_dict({
+            "images": [[str(tmp_path / f"{index}.png")] for index in (0, 1)],
+            **{key: [vision_row()[key]] * 2 for key in ("prompt", "chosen", "rejected")},
+        }).cast_column("images", Sequence(ImageFeature()))
+
+    def plan_for(data, size=2, **kwargs):
+        return create_preference_batch_plan(
+            data, None, batch_size=size, length_policy=policy(), dataset_order="sequential",
+            grad_accum=1, processor=Sized(), model_config={}, **kwargs)
+
+    class Reference:
+        def forward(self, model, batch, lengths, **options):
+            return mx.zeros(lengths.shape[0])
+
+    plan = plan_for(decoding())
+    assert plan[0][0]["pixel_values"].tolist() == [[0.0], [1.0]] * 2
+    paint(0, 9), paint(1, 9)  # fresh pixels of the same size reach the batch, as on TRL
+    assert plan[0][0]["pixel_values"].tolist() == [[90.0], [91.0]] * 2
+    paint(0)  # only the later row differs, so a check of the first alone misses it
+    with pytest.raises(ValueError, match="other pixels than the policy"):
+        precompute_reference_logps(plan, None, Reference(), batch_size=2)
+    paint(1)
+    precompute_reference_logps(plan, None, Reference(), batch_size=2)
+    paint(1, 9)
+    with pytest.raises(ValueError, match="other pixels than the policy"):
+        plan[0]
+    plan = plan_for(decoding())
+    paint(1, width=8)
+    with pytest.raises(ValueError, match="different tokens"):
+        plan[0]
+    data = decoding()
+    paint(1, width=8)  # unequal prompt lengths, padded on the left, are not a change
+    assert plan_for(data)[0][0]["pixel_values"].tolist() == [[0.0], [1.0]] * 2
+    paint(0, width=8), paint(1)  # two images trading sizes keep the count, not the layout
+    pair = Dataset.from_dict({
+        "images": [[str(tmp_path / "0.png"), str(tmp_path / "1.png")]],
+        "prompt": [[{"role": "user", "content": [{"type": "image", "text": None}] * 2}]],
+        **{key: [vision_row()[key]] for key in ("chosen", "rejected")},
+    }).cast_column("images", Sequence(ImageFeature()))
+    plan = plan_for(pair, size=1)
+    paint(0), paint(1, width=8)
+    with pytest.raises(ValueError, match="different tokens"):
+        plan[0]
+
+    def encoded(shade):
+        buffer = io.BytesIO()
+        Image.new("RGB", (4, 4), (shade, 0, 0)).save(buffer, format="PNG")
+        return buffer.getvalue()
+    def cache():  # images the caller owns, and closes once the plan is built
+        return [vision_row(images=[Image.open(io.BytesIO(encoded(shade)))], index=index)
+                for index, shade in enumerate((1, 2))]
+    cached = cache()
+    class Stored:  # hands back the rows it stores
+        def __len__(self):
+            return 2
+        def __getitem__(self, index):
+            return cached[index]
+    class Formatted(list):  # only a Hugging Face dataset's format is read
+        format = "pil"
+    transformed = Dataset.from_dict({"index": [0, 1]}).with_transform(
+        lambda batch: {key: [cached[index][key] for index in batch["index"]] for key in cached[0]})
+    for data, formatting_func in (  # each holds its rows, as the caller may close them
+            (Stored, None), (lambda: Formatted(cached), None), (lambda: transformed, None),
+            (lambda: Dataset.from_dict({"index": [0, 1]}), lambda row: cached[row["index"]])):
+        plan = plan_for(data(), formatting_func=formatting_func)
+        for row in cached:
+            row["images"][0].close()
+        assert plan[0][0]["pixel_values"].tolist() == [[10.0], [20.0]] * 2, data
+        cached[:] = cache()
+
+    def rewritten():  # one row object, rewritten per row
+        row = vision_row()
+        for shade in (3, 5):
+            row["images"] = [encoded(shade)]
+            yield row
+    assert plan_for(rewritten())[0][0]["pixel_values"].tolist() == [[30.0], [50.0]] * 2
+    image = Image.new("RGB", (4, 4))
+    def repainted():  # one image, repainted per row: decoded rows keep their copies
+        for shade in (3, 5):
+            image.paste((shade, 0, 0), (0, 0, 4, 4))
+            yield vision_row(images=[image])
+    assert plan_for(repainted())[0][0]["pixel_values"].tolist() == [[30.0], [50.0]] * 2
+
+    path = tmp_path / "scratch.png"
+    def scratch():  # one file, rewritten per row: rows outside a Hugging Face dataset keep copies
+        for shade in (3, 5):
+            Image.new("RGB", (4, 4), (shade, 0, 0)).save(path)
+            yield vision_row(images=[Image.open(path)])
+    assert plan_for(scratch())[0][0]["pixel_values"].tolist() == [[30.0], [50.0]] * 2
+
+
 @pytest.mark.parametrize("kind,row,message", [
     ("orpo", vision_row(), "ORPOTrainer has no vision path"),
     ("dpo", vision_row(chosen=[{"role": "assistant", "content": [
@@ -3352,13 +3473,20 @@ def test_dpo_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
         _is_vlm_model, pixels = True, []
         def __call__(self, tokens, pixel_values=None, mask=None, **kwargs):
             return Model.pixels.append(pixel_values is not None) or super().__call__(tokens)
+    from datasets import Dataset
+    from unsloth_zoo.mlx import preference
+    readers, read_from = [], preference._dataset_image_reader
+    monkeypatch.setattr(preference, "_dataset_image_reader",
+                        lambda *args: readers.append(read_from(*args)) or readers[-1])
     data = [vision_row(), rows(1)[0]]
-    run = MLXDPOTrainer(Model(), Tokenizer(), data, eval_dataset=data, processor=VisionProcessor(),
+    split = Dataset.from_list([vision_row()])  # read back by eval; the train list is held
+    run = MLXDPOTrainer(Model(), Tokenizer(), data, eval_dataset=split, processor=VisionProcessor(),
                         args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)))
     with pytest.raises(ValueError, match="lose their images"):
         run._prepare_data(True)
     run.args.generate_during_eval, run.args.include_num_input_tokens_seen = False, "non_padding"
     assert _run_generation_trainer(run, monkeypatch, [])["train_steps"] == 1 and sum(Model.pixels) == 2
+    assert [reader is not None for reader in readers] == [False, True]
     guard, tokens = run._compile_shape_guard_report, run.state.num_input_tokens_seen
     assert (guard.action, guard.reason) == ("not_applicable", "vlm_compile_unqualified")
     assert tokens > 0 and run._compile_decision is not None

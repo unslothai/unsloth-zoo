@@ -7,6 +7,7 @@ import warnings
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -52,6 +53,7 @@ from .utils import (
     _vlm_family_divergence,
     _vlm_forward_logits,
     _vlm_hidden_states,
+    _vlm_media_bytes_digest,
     _vlm_pipeline_disposable_keys,
     _vlm_token_aligned_sidecars,
     _vlm_vision_part_state,
@@ -86,13 +88,77 @@ class VisionPreferenceRow(TokenizedPreferenceRow):
     """A row encoded through a processor; its images belong to the prompt.
 
     Each branch's arrays pair a processor field name with the values aligned to
-    that branch's kept prompt ids.
+    that branch's kept prompt ids. ``images`` is empty for a text row and a
+    ``PromptImages`` otherwise.
     """
 
     prompt_text: str = ""
-    images: tuple = ()
+    images: object = ()
     chosen_prompt_arrays: tuple = ()
     rejected_prompt_arrays: tuple = ()
+
+
+class PromptImages:
+    """A row's prompt images: read from the dataset again for each batch when it
+    builds its rows afresh, so a decode made for a batch does not outlive it, or
+    else the copies extracted when the row was tokenized.
+
+    ``prompt_ids`` are the processor's prompt ids with these images, which every
+    batch checks, since the row's ids were fixed when it was tokenized;
+    ``digest`` fingerprints the pixels it was tokenized with.
+    """
+
+    __slots__ = ("read", "count", "prompt_ids", "digest")
+
+    def __init__(self, read, count, prompt_ids, digest):
+        self.read = read
+        self.count = count
+        self.prompt_ids = prompt_ids
+        self.digest = digest
+
+    def __len__(self):
+        return self.count
+
+    def load(self, same_pixels=False):
+        """The images; ``same_pixels`` requires the tokenized ones."""
+        images = list(self.read())
+        if len(images) != self.count:
+            raise ValueError(
+                f"Unsloth MLX preference: a row tokenized with {self.count} image(s) "
+                f"read back {len(images)}. The dataset must return the same "
+                "images for a row on every read."
+            )
+        if same_pixels and self.digest is not None and _pixel_digest(images) != self.digest:
+            raise ValueError(
+                "Unsloth MLX preference: a row's images differ from the ones it "
+                "was tokenized with, so precomputed reference log probabilities "
+                "would score other pixels than the policy. A random transform "
+                "does this; turn precompute_ref_log_probs off, or fix the images."
+            )
+        return images
+
+
+def _prompt_ids(inputs):
+    """Each processed prompt's ids, padding on either side excluded; None without a mask."""
+    if "attention_mask" not in inputs:
+        return None
+    return [
+        tuple(int(token) for token in ids[np.asarray(mask) > 0])
+        for ids, mask in zip(
+            _as_numpy_vlm_field(inputs, "input_ids"),
+            _as_numpy_vlm_field(inputs, "attention_mask"),
+        )
+    ]
+
+
+def _pixel_digest(images):
+    try:
+        return tuple(
+            (array.shape, _vlm_media_bytes_digest(array))
+            for array in (np.asarray(image) for image in images)
+        )
+    except Exception:
+        return None
 
 
 TRUNCATION_MODES = ("keep_end", "keep_start")
@@ -804,14 +870,15 @@ def _vision_prompt_images(row, image_size):
 
 def tokenize_vision_preference_row(
     processor, row, *, length_policy, append_eos=True, image_size=None,
-    media_token_ids=(), rendered=None,
+    media_token_ids=(), rendered=None, image_reader=None,
 ):
     """Tokenize one row for a vision-language model, as unsloth's CUDA DPO does.
 
     The processor renders every row and encodes an image row's prompt with its
     images; completions, and every text-only row, tokenize through its inner
     tokenizer exactly as on a text model. ``media_token_ids`` are the tokens a
-    truncation may not cut from an image row's prompt.
+    truncation may not cut from an image row's prompt. ``image_reader`` returns
+    the row's images again when a batch needs them; without it they are held.
     """
     tokenizer = _get_processor_tokenizer(processor)
     _require_preference_fields(row)
@@ -838,12 +905,15 @@ def tokenize_vision_preference_row(
             "ORPOTrainer has no vision path; train text-only rows, or use DPO."
         )
 
+    processed_ids = []
+
     def encode_prompt(text):
         inputs = _processor_vlm_inputs(
             processor, [text], [list(images)], None,
             truncation=False, padding_side="right",
         )
         ids = _as_numpy_vlm_field(inputs, "input_ids")
+        processed_ids.append((_prompt_ids(inputs) or [None])[0])
         arrays = _vlm_token_aligned_sidecars(inputs, ids.shape)
         return (
             [int(token) for token in ids[0]],
@@ -876,7 +946,11 @@ def tokenize_vision_preference_row(
         ))
     return VisionPreferenceRow(
         *(tuple(ids) for ids in truncated),
-        prompt_text=prompt_text, images=images,
+        prompt_text=prompt_text,
+        images=PromptImages(
+            image_reader or partial(tuple, images),
+            len(images), processed_ids[0], _pixel_digest(images),
+        ),
         chosen_prompt_arrays=kept_arrays[0], rejected_prompt_arrays=kept_arrays[1],
     )
 
@@ -901,7 +975,7 @@ _VLM_TOKEN_SPAN_KEYS = ("image_bound", "audio_bounds")
 _PIXEL_COMPONENT_MODEL_TYPES = ("deepseekocr", "deepseekocr_2")
 
 
-def _vision_batch(processor, model_config, rows, ids, lengths):
+def _vision_batch(processor, model_config, rows, ids, lengths, *, same_pixels=False):
     """A vision batch dict for packed rows: chosen rows first, then rejected."""
     pairs = len(rows)
     width = ids.shape[1]
@@ -922,10 +996,22 @@ def _vision_batch(processor, model_config, rows, ids, lengths):
     if any(row.images for row in rows):
         outputs = _processor_vlm_inputs(
             processor, [row.prompt_text for row in rows],
-            [list(row.images) for row in rows], None,
+            [row.images.load(same_pixels) if row.images else [] for row in rows], None,
             truncation=False, padding_side="right",
         )
         text_shape = _as_numpy_vlm_field(outputs, "input_ids").shape
+        encoded = _prompt_ids(outputs)
+        if encoded is not None and any(
+            row.images and row.images.prompt_ids not in (None, ids)
+            for row, ids in zip(rows, encoded)
+        ):
+            raise ValueError(
+                "Unsloth MLX preference: a row's images now encode to "
+                "different tokens than when the row was tokenized, so its ids "
+                "no longer place them. The dataset must return images of the "
+                "same size for a row on every read; a random resize or crop "
+                "changes it."
+            )
         model_type = _config_get(model_config, "model_type")
         rebuilt = (
             _VLM_WIDTH_GENERATED_KEYS
@@ -1160,7 +1246,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     def materialize_all(self):
         return [self[index] for index in range(len(self))]
 
-    def _inputs(self, rows, batch, lengths):
+    def _inputs(self, rows, batch, lengths, *, reference=False):
         """The model input for packed rows; a vision plan returns a batch dict."""
         return mx.array(batch)
 
@@ -1176,8 +1262,11 @@ class FiniteVisionPreferenceBatchPlan(FinitePreferenceBatchPlan):
         self._model_config = model_config
         self._families = self._event_widths = None
 
-    def _inputs(self, rows, batch, lengths):
-        return _vision_batch(self._processor, self._model_config, rows, batch, lengths)
+    def _inputs(self, rows, batch, lengths, *, reference=False):
+        return _vision_batch(
+            self._processor, self._model_config, rows, batch, lengths,
+            same_pixels=reference or self._reference is not None,
+        )
 
     def _survey(self, inputs):
         _width, axes, padable, forbidden = _vlm_width_survey(
@@ -1245,7 +1334,8 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
     for start in range(0, len(rows), batch_size):
         chunk = rows[start:start + batch_size]
         batch, lengths = plan.pack(chunk)
-        batch, lengths = plan._inputs(chunk, batch, lengths), mx.array(lengths)
+        batch = plan._inputs(chunk, batch, lengths, reference=True)
+        lengths = mx.array(lengths)
         options = {}
         # The live forward scores through CCE too; full logits would defeat it.
         if scorer is not None and reference_policy.model is None:
@@ -1289,6 +1379,39 @@ def _window_normalizers(rows, schedule, cycle_length, grad_accum, kind):
     return values
 
 
+def _reads_rows_by_index(dataset):
+    """A Hugging Face ``Dataset`` decoding its own rows, so ``dataset[i]`` builds the
+    i-th iterated row afresh.
+
+    Any other dataset, or a user transform, may hand back stored objects that a
+    caller consumes or closes, so those rows are held.
+    """
+    return all(
+        f"{owner.__module__}.{owner.__qualname__}" == "datasets.arrow_dataset.Dataset"
+        for owner in (
+            next((base for base in type(dataset).__mro__ if name in base.__dict__), object)
+            for name in ("__iter__", "__getitem__")
+        )
+    ) and dataset.format["type"] != "custom"
+
+
+def _dataset_image_reader(dataset, formatting_func, image_size):
+    """``index -> that row's prompt images``, read from ``dataset`` again, or None.
+
+    Only rows straight from Hugging Face's decoding are read again: a
+    formatting_func, like a transform, may return images the caller owns.
+    """
+    if formatting_func is not None or not _reads_rows_by_index(dataset):
+        return None
+
+    def read(index):
+        row = dataset[index]
+        _require_preference_fields(row)
+        return _vision_prompt_images(_maybe_extract_prompt(row)[0], image_size)
+
+    return read
+
+
 def create_preference_batch_plan(
     dataset,
     tokenizer,
@@ -1307,19 +1430,27 @@ def create_preference_batch_plan(
     processor=None,
     model_config=None,
     image_size=None,
+    images_from=None,
 ):
     """Build the finite preference plan consumed by every objective.
 
     ``prompt_sink`` receives each row's rendered prompt text as the plan is
     built, so a caller wanting it does not render the row a second time. A
     ``processor`` builds a vision plan for a vision-language model, encoding image
-    prompts through it and all other text through its inner tokenizer.
+    prompts through it and all other text through its inner tokenizer. Image rows
+    read their images back for each batch instead of holding them when
+    ``images_from``, a ``(dataset, formatting_func)`` pair yielding these rows in
+    order (by default ``dataset`` and ``formatting_func``), is a Hugging Face
+    dataset without a formatting_func.
     """
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
         media_token_ids = frozenset(_image_truncation_token_ids(
             processor, _get_vlm_ignore_token_ids(processor, model_config),
         ))
+        image_reader = _dataset_image_reader(
+            *(images_from or (dataset, formatting_func)), image_size,
+        )
     rows = []
     for index, raw in enumerate(dataset):
         row = formatting_func(raw) if formatting_func is not None else raw
@@ -1343,6 +1474,7 @@ def create_preference_batch_plan(
                     processor, row, length_policy=length_policy,
                     append_eos=append_eos, image_size=image_size,
                     media_token_ids=media_token_ids, rendered=rendered,
+                    image_reader=image_reader and partial(image_reader, index),
                 )
             )
         except ValueError as exc:
