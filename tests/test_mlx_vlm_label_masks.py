@@ -3872,6 +3872,36 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
     assert _phi4mm_token_ids({"audio_token_index": 11}) == (expected[0], 11)
 
 
+def test_phi4mm_switches_to_its_speech_weights_under_lora_adapters():
+    from types import SimpleNamespace
+
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import compile as patches
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_speech_lora, apply_base_weights = phi4mm.set_modality, phi4mm.apply_speech_lora, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.layers = [nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)]
+    model.layers[0] = LoRALinear.from_base(model.layers[0], r=1)
+    keys = [f"layers.{index}.weight" for index in range(2)]
+    model._base_weights = {key: mx.ones((2, 2)) for key in keys}
+    model._speech_lora_a = {key: mx.ones((1, 2)) for key in keys}
+    model._speech_lora_b = {key: mx.ones((2, 1)) for key in keys}
+    model._speech_lora_scale, model._active_lora = 2.0, "vision"
+    model.set_modality(has_audio=True)
+    # A fresh adapter adds nothing, so either linear computes with base + scale * B @ A = 3 everywhere.
+    assert [layer(mx.ones((1, 2))).tolist() for layer in model.layers] == [[[6.0, 6.0]]] * 2
+    # A row of text alone switches back to the base weights, as the reference model's does.
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert [layer(mx.ones((1, 2))).tolist() for layer in model.layers] == [[[2.0, 2.0]]] * 2
+
+
 def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
     """The regression this guards is in the compile-preparation branch, not the
     helper: training threads the checkpoint mapping, which declares neither
