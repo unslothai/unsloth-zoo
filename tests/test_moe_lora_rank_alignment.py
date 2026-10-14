@@ -110,10 +110,16 @@ def test_pad_skipped_only_when_both_lora_gemms_take_triton(monkeypatch, rank):
     first = torch.randn(3, 16, rank, dtype=torch.bfloat16)
     second = torch.randn(3, rank, 24, dtype=torch.bfloat16)
     x = torch.randn(5, 16, dtype=torch.bfloat16)
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
     monkeypatch.delenv("UNSLOTH_MOE_LORA_PAD_ALWAYS", raising=False)
     monkeypatch.setattr(M, "_triton_grouped_mm_wanted", lambda inputs, weight: True)
+    monkeypatch.setattr(mg, "triton_grouped_available", lambda device: True)
     pf, ps = M._pad_lora_rank_for_grouped_mm(first, second, x)
     assert pf is first and ps is second
+    # a Triton kernel that failed its self-check falls back to torch._grouped_mm: keep the pad
+    monkeypatch.setattr(mg, "triton_grouped_available", lambda device: False)
+    assert M._pad_lora_rank_for_grouped_mm(first, second, x)[0].shape[-1] == 8
+    monkeypatch.setattr(mg, "triton_grouped_available", lambda device: True)
     # no inputs = the caller cannot tell the route: keep the pad
     assert M._pad_lora_rank_for_grouped_mm(first, second)[0].shape[-1] == 8
     monkeypatch.setenv("UNSLOTH_MOE_LORA_PAD_ALWAYS", "1")

@@ -2327,7 +2327,14 @@ def _lora_rank_pad_needed(inputs, first_weight) -> bool:
         return True
     if os.environ.get("UNSLOTH_MOE_LORA_PAD_ALWAYS", "0") == "1":
         return True
-    return not _triton_grouped_mm_wanted(inputs, first_weight)
+    if not _triton_grouped_mm_wanted(inputs, first_weight):
+        return True
+    # A Triton kernel that failed its self-check falls back to torch._grouped_mm, which needs the pad.
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+    if torch.compiler.is_compiling():
+        # Never run the self-check while tracing: skip the pad only once it has passed.
+        return not (mg._GENERIC_DISABLED_REASON is None and mg._GENERIC_SELF_CHECKED.get(inputs.device.index) is True)
+    return not mg.triton_grouped_available(inputs.device)
 
 
 def _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inputs = None):
