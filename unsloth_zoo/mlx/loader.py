@@ -3784,6 +3784,28 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
     _SAFE_TEXT_SANITIZE_PATCHED.add(module_name)
 
 
+def _ensure_qwen3_5_mtp_norm_sanitize() -> None:
+    """mlx-lm < 0.32 shifts RMSNorm weights by +1 whenever `mtp.*` keys exist, so a
+    converted checkpoint bundling its MTP head loads with doubled norms
+    (ml-explore/mlx-lm#1623). Sanitize drops those keys anyway; drop them first."""
+    try:
+        module = importlib.import_module("mlx_lm.models.qwen3_5")
+    except (Exception, SystemExit):
+        return
+    cls = getattr(module, "TextModel", None)
+    sanitize = getattr(cls, "sanitize", None)
+    if sanitize is None or hasattr(sanitize, "__wrapped__"):
+        return
+    if "has_mtp_weights" not in _safe_getsource(sanitize):
+        return
+
+    @wraps(sanitize)
+    def patched_sanitize(self, weights):
+        return sanitize(self, {k: v for k, v in weights.items() if "mtp." not in k})
+
+    cls.sanitize = patched_sanitize
+
+
 # No installed mlx-vlm wrapper demands more than two.
 _MODALITY_ARGUMENT_LIMIT = 3
 
@@ -10842,6 +10864,7 @@ class FastMLXModel:
                         stacklevel=2,
                     )
             _ensure_safe_text_wrapper_sanitize(model_type)
+            _ensure_qwen3_5_mtp_norm_sanitize()
 
             mlx_load_kwargs = dict(
                 tokenizer_config=extra_kwargs if extra_kwargs else None,

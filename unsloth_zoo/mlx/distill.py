@@ -341,10 +341,15 @@ def load_teacher(model_name_or_path):
     from mlx.utils import tree_flatten
     from mlx_lm import load
 
-    from .loader import _MLX_MODEL_FILE_TRUST, _install_mlx_model_file_guard
+    from .loader import (
+        _MLX_MODEL_FILE_TRUST,
+        _ensure_qwen3_5_mtp_norm_sanitize,
+        _install_mlx_model_file_guard,
+    )
 
     # Teachers never opt into repository code, even inside a trusted student load.
     _install_mlx_model_file_guard()
+    _ensure_qwen3_5_mtp_norm_sanitize()
     token = _MLX_MODEL_FILE_TRUST.set(False)
     try:
         teacher, teacher_tokenizer = load(model_name_or_path)
