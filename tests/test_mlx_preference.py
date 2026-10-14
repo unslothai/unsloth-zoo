@@ -3443,6 +3443,7 @@ def test_a_vision_plan_reads_its_images_back_instead_of_holding_them(tmp_path):
 
 @pytest.mark.parametrize("kind,row,message", [
     ("orpo", vision_row(), "ORPOTrainer has no vision path"),
+    ("cpo", vision_row(), "CPO: .* CPOTrainer has no vision path"),
     ("dpo", vision_row(chosen=[{"role": "assistant", "content": [
         {"type": "image"}, {"type": "text", "text": "yes"}]}]), "belong to the prompt"),
     ("dpo", vision_row(audio=__import__("numpy").zeros(4)), "audio rows"),
@@ -3492,19 +3493,38 @@ def test_dpo_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
     assert tokens > 0 and run._compile_decision is not None
 
 
-@pytest.mark.parametrize("kind", ["kto", "cpo"])
-def test_the_kto_and_cpo_trainers_refuse_a_vision_language_model(tmp_path, kind):
-    from unsloth_zoo.mlx import trainer as trainer_module
+def test_the_kto_trainer_still_refuses_a_vision_language_model(tmp_path):
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
     class Model(type(_tiny_model())):
         _is_vlm_model = True
-    trainer = getattr(trainer_module, f"MLX{kind.upper()}Trainer")(
-        Model(), Tokenizer(), kto_rows(4) if kind == "kto" else rows(4),
-        processor=VisionProcessor(),
-        args=getattr(trainer_module, f"MLX{kind.upper()}Config")(
-            **_generation_common(tmp_path, generate_during_eval=False)))
-    with pytest.raises(
-            ValueError, match=f"{kind.upper()}: vision-language models are not supported"):
+    trainer = MLXKTOTrainer(
+        Model(), Tokenizer(), kto_rows(4), processor=VisionProcessor(),
+        args=MLXKTOConfig(**_generation_common(tmp_path, generate_during_eval=False)))
+    with pytest.raises(ValueError, match="KTO: vision-language models are not supported"):
         trainer._prepare_data(True)
+
+
+def test_cpo_trains_and_evaluates_text_rows_on_a_vision_language_model(monkeypatch, tmp_path):
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.trainer import MLXCPOConfig, MLXCPOTrainer
+    monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_a, **_k: None, raising=False)
+    class Model(type(_tiny_model())):
+        _is_vlm_model = True
+        def __call__(self, tokens, pixel_values=None, mask=None, **kwargs):
+            return super().__call__(tokens)
+    class Bypassed(Tokenizer):  # rows must tokenize through the processor's own tokenizer
+        def encode(self, *args, **kwargs):
+            raise AssertionError("tokenized outside the processor")
+    def run(data):
+        trainer = MLXCPOTrainer(
+            Model(), Bypassed(), data, eval_dataset=data, processor=VisionProcessor(),
+            args=MLXCPOConfig(**_generation_common(tmp_path, generate_during_eval=False)))
+        return trainer, _run_generation_trainer(trainer, monkeypatch, [])
+    trainer, result = run(rows(2))
+    assert result["train_steps"] == 1
+    assert any("eval_loss" in entry for entry in trainer.state.log_history)
+    with pytest.raises(ValueError, match="CPOTrainer has no vision path"):
+        run([vision_row(), rows(1)[0]])
 
 
 @pytest.mark.parametrize("loss_type", ["grpo", "bnpo", "dr_grpo", "dapo"])

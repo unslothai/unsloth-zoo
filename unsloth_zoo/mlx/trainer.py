@@ -9471,10 +9471,9 @@ class MLXTrainer:
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
 
-        if self.preference_kind in ("kto", "cpo") and is_vlm:
+        if self.preference_kind == "kto" and is_vlm:
             raise ValueError(
-                f"Unsloth MLX {self.preference_kind.upper()}: vision-language "
-                "models are not supported."
+                "Unsloth MLX KTO: vision-language models are not supported."
             )
 
         if is_vlm:

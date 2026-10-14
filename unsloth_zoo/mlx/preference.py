@@ -900,9 +900,10 @@ def tokenize_vision_preference_row(
             prompt_text=prompt_text,
         )
     if length_policy.kind != "dpo":
+        name = length_policy.kind.upper()
         raise ValueError(
-            "Unsloth MLX ORPO: rows with images are not supported. TRL's "
-            "ORPOTrainer has no vision path; train text-only rows, or use DPO."
+            f"Unsloth MLX {name}: rows with images are not supported. TRL's "
+            f"{name}Trainer has no vision path; train text-only rows, or use DPO."
         )
 
     processed_ids = []
