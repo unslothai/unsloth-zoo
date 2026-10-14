@@ -240,6 +240,15 @@ def test_arrays_kept_outside_the_parameters_are_evaluated_for_other_threads(monk
     assert (tower._tables[0] + tower.proj.bias * 0).tolist() == [3.0, 3.0]
 
 
+def test_a_decoder_that_swaps_its_weights_per_modality_trains_through_adapters_only():
+    decoder = Module()
+    decoder.proj = Linear(2, 2)
+    # Phi-4-multimodal's table of the weights it sets back for each input's modality.
+    decoder._base_weights = {"proj.weight": mx.ones((2, 2))}
+    with pytest.raises(ValueError, match = "swaps its decoder weights"):
+        clef_training_network(SimpleNamespace(model = decoder), full_finetuning = True)
+
+
 def _decoder(quantized = False, bits = 8):
     from mlx_lm.models import qwen3_5
 

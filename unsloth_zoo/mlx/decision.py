@@ -2464,6 +2464,9 @@ def clef_training_network(
 
     if full_finetuning and any(path.endswith(".scales") for path, _ in tree_flatten(pipeline.model.parameters())):
         raise ValueError("Unsloth: a quantized decoder trains through LoRA adapters only; pass full_finetuning = False.")
+    if full_finetuning and getattr(pipeline.model, "_base_weights", None):
+        # Phi-4-multimodal sets its decoder weights for each input's modality, over what training changed.
+        raise ValueError("Unsloth: this model swaps its decoder weights for each input's modality, so it trains through LoRA adapters only; pass full_finetuning = False.")
     # Layer-local, as the LoRA resolver matches targets: by leaf, parent, whole name or alias (`gate_proj` -> `gate_up_proj`).
     stacked = {name for layer in _mlx_language_layers(pipeline.model) for name, module in layer.named_modules() if "SwitchLinear" in type(module).__name__}
 
