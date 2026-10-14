@@ -3583,6 +3583,14 @@ def _freeze_text_only_full_finetune(model) -> None:
         _freeze_outside_language_model(model)
 
 
+def _fix_full_finetune_modality_weights(model) -> None:
+    """Phi-4-multimodal sets its decoder weights from frozen copies for each input's modality, over what full
+    fine-tuning changed; it keeps one set with every adapter merged instead, as its quantized load does."""
+    if getattr(model, "_unsloth_full_finetuning", False) and getattr(model, "_base_weights", None):
+        model.apply_both_loras()
+        model._base_weights = {}
+
+
 def _freeze_outside_language_model(model) -> None:
     """Text batches never reach the towers, so train only the language model, as mlx-lm does."""
     language_model = getattr(model, "language_model", None)
@@ -8448,6 +8456,7 @@ def _finish_load(model, tokenizer):
     # A call, not an if: tests/test_mlx_attention_metal.py keeps this body straight-line so the
     # attention patch above can never sit behind a branch.
     _freeze_text_only_full_finetune(model)
+    _fix_full_finetune_modality_weights(model)
     _materialize_weights(model)
     return model, tokenizer
 

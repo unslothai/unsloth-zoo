@@ -3902,6 +3902,39 @@ def test_phi4mm_switches_to_its_speech_weights_under_lora_adapters():
     assert [layer(mx.ones((1, 2))).tolist() for layer in model.layers] == [[[2.0, 2.0]]] * 2
 
 
+@pytest.mark.parametrize("full_finetuning", [True, False])
+def test_phi4mm_full_finetuning_keeps_one_set_of_decoder_weights(full_finetuning):
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_both_loras, apply_base_weights = phi4mm.set_modality, phi4mm.apply_both_loras, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.layers = [nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)]
+    keys = [f"layers.{index}.weight" for index in range(2)]
+    model._base_weights = {key: mx.ones((2, 2)) for key in keys}
+    for kind, scale in (("vision", 1.0), ("speech", 2.0)):
+        setattr(model, f"_{kind}_lora_a", {key: mx.ones((1, 2)) for key in keys})
+        setattr(model, f"_{kind}_lora_b", {key: mx.ones((2, 1)) for key in keys})
+        setattr(model, f"_{kind}_lora_scale", scale)
+    model._active_lora, model._unsloth_full_finetuning = "vision", full_finetuning
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    _finish_load(model, None)
+    # What training changed, then a row of text alone.
+    model.layers[1].weight = model.layers[1].weight + 1
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    outputs = [layer(mx.ones((1, 2))).tolist() for layer in model.layers]
+    # Base 1 with both adapters merged (+1, +2) is 4 everywhere; swapping sets the base 1 back.
+    assert outputs == ([[[8.0, 8.0]], [[10.0, 10.0]]] if full_finetuning else [[[2.0, 2.0]]] * 2)
+
+
 def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
     """The regression this guards is in the compile-preparation branch, not the
     helper: training threads the checkpoint mapping, which declares neither
