@@ -3935,6 +3935,46 @@ def test_phi4mm_full_finetuning_keeps_one_set_of_decoder_weights(full_finetuning
     assert outputs == ([[[8.0, 8.0]], [[10.0, 10.0]]] if full_finetuning else [[[2.0, 2.0]]] * 2)
 
 
+def test_phi4mm_keeps_a_merged_decision_adapter_across_its_weight_swaps(tmp_path):
+    import json
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.decision import _merge_lora
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_vision_lora, apply_base_weights = phi4mm.set_modality, phi4mm.apply_vision_lora, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    model.language_model.model.layers = [nn.Linear(2, 2, bias=False)]
+    model.language_model.model.embed_tokens = lambda ids: mx.zeros((1, 2, 2))
+    key = "language_model.model.layers.0.weight"
+    model._base_weights = {key: mx.ones((2, 2))}
+    model._vision_lora_a, model._vision_lora_b, model._vision_lora_scale = {key: mx.ones((1, 2))}, {key: mx.ones((2, 1))}, 1.0
+    model.language_model.model.layers[0].weight = mx.ones((2, 2)) * 2
+    model._active_lora = "vision"
+    mx.save_safetensors(str(tmp_path / "adapter_model.safetensors"), {
+        "base_model.model.model.layers.0.lora_A.weight": mx.ones((1, 2)), "base_model.model.model.layers.0.lora_B.weight": mx.ones((2, 1)) * 5,
+    })
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 1, "lora_alpha": 1, "target_modules": ["layers.0"]}))
+    _merge_lora(model, tmp_path)
+
+    def layer():
+        return model.language_model.model.layers[0](mx.ones((1, 2))).tolist()
+
+    # Base 1, vision +1, adapter +5: a row of text runs on base and adapter, an image adds the vision weights back.
+    assert layer() == [[14.0, 14.0]]
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert layer() == [[12.0, 12.0]]
+    model.set_modality(has_image=True)
+    assert layer() == [[14.0, 14.0]]
+
+
 def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
     """The regression this guards is in the compile-preparation branch, not the
     helper: training threads the checkpoint mapping, which declares neither

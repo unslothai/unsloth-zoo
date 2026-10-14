@@ -818,6 +818,9 @@ def _merge_lora(model, folder):
     weights = dict(tree_flatten(decoder.parameters()))
     # PEFT prefixes differ with the class the adapter was trained on; names agree from the layer index on.
     targets = {name[name.index("layers.") :]: name for name in weights if "layers." in name}
+    # Phi-4-multimodal sets its weights back from these for each input's modality, so the adapter is folded into them too.
+    swapped = getattr(model, "_base_weights", None) or {}
+    held = {name[name.index("layers.") :]: name for name in swapped if "layers." in name}
     merged = []
     for stem in sorted({name.rsplit(".lora_", 1)[0] for name in adapter}):
         down, up = adapter[f"{stem}.lora_A.weight"], adapter[f"{stem}.lora_B.weight"]
@@ -827,8 +830,10 @@ def _merge_lora(model, folder):
             raise ValueError(f"LoRA tensor {stem} has no float weight of its shape in the base model; adapters need an unquantized base")
         delta = (up.astype(mx.float32) @ down.astype(mx.float32)) * scale
         merged.append((target, (weight.astype(mx.float32) + delta).astype(weight.dtype)))
+        if (key := held.get(target[target.index("layers.") :])) is not None:
+            swapped[key] = (swapped[key].astype(mx.float32) + delta).astype(swapped[key].dtype)
     decoder.update(tree_unflatten(merged))
-    mx.eval(decoder.parameters())
+    mx.eval(decoder.parameters(), list(swapped.values()))
 
 
 def _head_scores(model, hidden, token_ids):
