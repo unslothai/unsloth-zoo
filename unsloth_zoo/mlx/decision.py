@@ -1833,20 +1833,30 @@ def _stored_tensors(source):
 def _decoder_tensor_name(decoder, path, stored = ()):
     name = path
     # transformers stores a decoder inside a vision-language or an omni wrapper under other names than it is loaded with.
-    # MiniCPM-o keeps its whole causal LM under `llm.`; the first name the checkpoint holds wins.
+    # MiniCPM-o keeps its whole causal LM under `llm.` and Phi-4-multimodal under `model.`; the first name the checkpoint holds wins.
     wrappers = {
-        "language_model": (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head."), ("language_model.", "llm.")),
+        "language_model": (
+            ("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head."), ("language_model.", "llm."), ("language_model.model.", "model."),
+        ),
         "thinker": (("thinker.language_model.model.", "thinker.model."), ("thinker.language_model.lm_head.", "thinker.lm_head.")),
     }
     for wrapper, renamed in wrappers.items():
         if wrapper in decoder:
             names = [saved + path[len(prefix) :] for prefix, saved in renamed if path.startswith(prefix)]
-            name = next((found for found in names if found in stored), names[0] if names else None)
+            # Phi-4-multimodal keeps each linear its built-in adapters wrap as `base_layer`, which MLX loads them merged into.
+            wrapped = [found.removesuffix(".weight") + ".base_layer.weight" for found in names if found.endswith(".weight")]
+            name = next((found for found in names + wrapped if found in stored), names[0] if names else None)
     # An MLX conversion keeps the names its weights are loaded with.
     if name not in stored and path in stored:
         return path
     # transformers stores each expert of a mixture apart, with no one tensor for the stack they are loaded as.
     return None if name and name not in stored and name.replace(".switch_mlp.", ".experts.0.") in stored else name
+
+
+def _adapter_stem(decoder, path, stored):
+    """The PEFT name of the adapter on the linear at `path`, which names a linear the checkpoint keeps as `base_layer` by the linear itself."""
+    name = _decoder_tensor_name(decoder, f"{path}.weight", stored)
+    return None if name is None else "base_model.model." + name.removesuffix(".weight").removesuffix(".base_layer")
 
 
 def _held_arrays(tree):
@@ -2041,10 +2051,9 @@ def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None
     (rank, scale, dropout), = shapes
     tensors = {}
     for path, module in adapters:
-        name = _decoder_tensor_name(decoder, f"{path}.weight", stored)
-        if type(module).__name__ != "LoRALinear" or name is None:
+        stem = _adapter_stem(decoder, path, stored)
+        if type(module).__name__ != "LoRALinear" or stem is None:
             raise ValueError(f"Unsloth: the adapter on {path} cannot be saved as a PEFT adapter.")
-        stem = "base_model.model." + name[: -len(".weight")]
         tensors[f"{stem}.lora_A.weight"], tensors[f"{stem}.lora_B.weight"] = module.lora_a.T, module.lora_b.T
     adapter = {
         "peft_type": "LORA", "task_type": None, "base_model_name_or_path": str(base_model), "revision": base_revision,
@@ -2387,7 +2396,7 @@ class ClefNetwork(nn.Module):
             raise ValueError(f"Unsloth: {folder} holds LoRA adapters, which resume on a Clef loaded with the checkpoint they were trained on.")
         adapter, stored = mx.load(str(folder / "adapter_model.safetensors")), _stored_tensors(Path(self._origin[0]))
         for path, module in self._adapters():
-            stem = "base_model.model." + _decoder_tensor_name(self.encoder, f"{path}.weight", stored)[: -len(".weight")]
+            stem = _adapter_stem(self.encoder, path, stored)
             module.lora_a, module.lora_b = adapter[f"{stem}.lora_A.weight"].T, adapter[f"{stem}.lora_B.weight"].T
         head = mx.load(str(folder / "joint_head.safetensors"))
         self.head.update(tree_unflatten([(name, value.astype(mx.float32)) for name, value in head.items()]))
