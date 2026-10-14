@@ -91,6 +91,7 @@ def test_stop_scanner_trims_to_token_boundary():
         (GenerationRequest(prompt_token_ids=[]), "must not be empty"),
         (GenerationRequest(prompt=""), "must not be empty"),
         (GenerationRequest(prompt="x", image=object()), "text prompts only"),
+        (GenerationRequest(prompt="x", vision_inputs={}), "text prompts only"),
         (GenerationRequest(prompt="x", max_tokens=0), "must be positive"),
     ],
 )
@@ -513,6 +514,8 @@ def test_vlm_requests_reject_token_ids_with_media_and_unsupported_controls():
     assert _validate_vlm_requests([GenerationRequest(prompt_token_ids=iter((1, 2)))], GenerationDefaults())[0].prompt_token_ids == (1, 2)  # noqa: E501
     cases = ((GenerationRequest(prompt_token_ids=[1], image="i.png"), GenerationDefaults(), "token ids with media"),
         (GenerationRequest(prompt="a", prompt_token_ids=[1]), GenerationDefaults(), "exactly one"),
+        (GenerationRequest(prompt_token_ids=[1], vision_inputs={}), GenerationDefaults(), "generate_batch or stream_batch only"),
+        (GenerationRequest(prompt="a", vision_inputs={}), GenerationDefaults(), "given as prompt_token_ids"),
         (GenerationRequest(prompt=""), GenerationDefaults(), "must not be empty"),
         (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
         # One mlx-vlm would drop rather than apply is refused: an inert start or bogus scheme,
@@ -528,6 +531,27 @@ def test_vlm_requests_reject_token_ids_with_media_and_unsupported_controls():
     # Path images normalize to str once: mlx-vlm's loader opens str only, and
     # grouping and preprocessing must see the same value.
     assert _validate_vlm_requests([GenerationRequest(prompt="a", image=pathlib.Path("/tmp/i.png"))], GenerationDefaults())[0].image == "/tmp/i.png"  # noqa: E501
+    # A prepared prompt (generate_batch / stream_batch) groups only with rows its vision inputs concatenate with.
+    import numpy as np
+    from dataclasses import replace
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _stream_batch
+    prepared = GenerationRequest(prompt_token_ids=[1, 2], vision_inputs={"pixel_values": np.zeros((2, 3))})
+    assert _validate_vlm_requests([prepared], GenerationDefaults(), prepared=True)[0].prompt_token_ids == (1, 2)
+    for request, message in ((replace(prepared, image="i.png"), "token ids with media"), (replace(prepared, vision_inputs={"input_ids": 1}), "other than input_ids")):
+        with pytest.raises(ValueError, match=message):
+            _validate_vlm_requests([request], GenerationDefaults(), prepared=True)
+    adapter = types.SimpleNamespace(batches_observable=True)
+    key = lambda **change: _VLMBatchAdapter._group_key(adapter, replace(prepared, **change))
+    assert key() == key(vision_inputs={"pixel_values": np.ones((2, 3))}) != key(vision_inputs={"pixel_values": np.ones((4, 3))})
+    assert key() != key(prompt_token_ids=(1, 2, 3))
+    assert key() not in (key(vision_inputs={"images": np.zeros((2, 3))}), key(vision_inputs={"pixel_values": np.zeros((2, 3), np.float16)}))
+    assert key(vision_inputs={"token": 9}) == key(vision_inputs={"token": np.int64(9)}) != key(vision_inputs={"token": 8})
+    listed = [replace(prepared, vision_inputs={"grid": [(1,)]}) for _ in range(2)]
+    assert len({_VLMBatchAdapter._group_key(adapter, request) for request in listed}) == 2
+    with pytest.raises(ValueError, match="no vision path"):
+        list(_stream_batch(types.SimpleNamespace(_is_vlm_model=True, language_model=None, _unsloth_supports_images=False), object(), [prepared]))  # noqa: E501
+    with pytest.raises(TypeError, match="model with eval"):
+        list(_stream_batch(types.SimpleNamespace(_is_vlm_model=True, language_model=None, _unsloth_supports_images=False), object(), [replace(prepared, vision_inputs={"mm_token_type_ids": np.zeros((1, 2)), "pixel_values": None})]))  # noqa: E501
 
 
 def test_a_prompt_cache_state_is_taken_only_by_a_vision_stream_row():
@@ -670,6 +694,14 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     adapter._chunked_prefill_kwargs = lambda **kw: {"prefill_step_size": None}
     list(adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1]))
     assert seen["ctor"]["prefill_step_size"] is None
+    # A prepared chunk prefills its own ids and vision inputs, never re-encoded.
+    import numpy as np
+    adapter.prepare_inputs = None
+    adapter.model.get_input_embeddings = lambda ids, pixels, mask, **k: (seen.update(embed=(ids.tolist(), pixels.tolist(), mask.tolist(), k)), embeds)[1]
+    list(adapter._run_chunk([GenerationRequest(prompt_token_ids=(1, i), vision_inputs={"pixel_values": np.full((1, 2), i), "token": 9}) for i in (7, 8)], [0, 1]))
+    assert seen["embed"] == ([[1, 7], [1, 8]], [[7, 7], [8, 8]], [[1, 1]] * 2, {"token": 9})
+    list(adapter._run_chunk([GenerationRequest(prompt_token_ids=(1, 7), vision_inputs={"images": np.full((1, 2), 7), "grid": [(7,), (8,)]})], [0]))
+    assert seen["embed"] == ([[1, 7]], [[7, 7]], [[1, 1]], {"grid": [(7,), (8,)]})
 
 
 @pytest.mark.parametrize("nested", (True, False))

@@ -247,13 +247,20 @@ class GenerationRequest:
     """One generation request.
 
     Exactly one of ``prompt`` and ``prompt_token_ids`` must be provided, and a
-    vision request with media must use ``prompt``. Rendered prompt strings are
+    vision request with ``image`` or ``audio`` must use ``prompt``. Rendered prompt strings are
     encoded as-is; chat templating belongs to the caller. ``image`` (vision models, and image models
     loaded through mlx-lm) accepts a PIL image, an array, or a
     str/os.PathLike filesystem path or URL, decoded once before grouping; raw
     bytes and file-like objects are rejected. ``audio`` (vision models only) is
     accepted but decodes one request at a time, since no supported mlx-vlm
     release batches it. At most one of ``image`` and ``audio`` per request.
+
+    A vision prompt given as ``prompt_token_ids`` to ``generate_batch`` or
+    ``stream_batch`` may carry its media prepared: ``vision_inputs`` holds the
+    processor's other outputs for this prompt alone (such as ``pixel_values`` or
+    ``image_grid_thw``), prefilled as given instead of re-encoded. Rows batch
+    together by concatenating them along the first axis; a row with a
+    list-valued input runs alone.
 
     ``logits_processors`` are this row's own ``(tokens, logits) -> logits`` callables,
     run in order on its slice before it draws, and shown the same history on every path
@@ -276,6 +283,7 @@ class GenerationRequest:
     sampling: SamplingParams | None = None
     logits_processors: Sequence[Callable[[Any, Any], Any]] | None = None
     prompt_cache_state: Any | None = None
+    vision_inputs: Mapping[str, Any] | None = None
 
     def __post_init__(self):
         state = self.prompt_cache_state
@@ -393,7 +401,7 @@ def _validate_text_requests(
             request.sampling, SamplingParams
         ):
             raise TypeError(f"requests[{index}].sampling must be SamplingParams.")
-        if request.audio is not None or request.image is not None and not takes_images:
+        if request.audio is not None or (request.image is not None and not takes_images) or request.vision_inputs is not None:
             raise ValueError(
                 f"requests[{index}] includes media, but text models accept "
                 "text prompts only."
@@ -582,6 +590,8 @@ VLM_TOKEN_ID_PROMPTS = True
 def _validate_vlm_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
+    *,
+    prepared: bool = False,
 ) -> list[GenerationRequest]:
     validated = list(requests)
     for index, request in enumerate(validated):
@@ -593,11 +603,28 @@ def _validate_vlm_requests(
                 f"requests[{index}] must provide exactly one of prompt or "
                 "prompt_token_ids."
             )
+        if request.vision_inputs is not None:
+            if not has_ids:
+                raise ValueError(
+                    f"requests[{index}].vision_inputs belong to a prompt given as "
+                    "prompt_token_ids."
+                )
+            if not prepared:
+                raise ValueError(
+                    f"requests[{index}] gives vision_inputs, which a vision model "
+                    "takes through generate_batch or stream_batch only."
+                )
+            if not isinstance(request.vision_inputs, Mapping) or {"input_ids", "attention_mask"} & set(request.vision_inputs):
+                raise ValueError(
+                    f"requests[{index}].vision_inputs must map the processor's "
+                    "outputs other than input_ids and attention_mask."
+                )
         if has_ids:
             if request.image is not None or request.audio is not None:
                 raise ValueError(
                     f"requests[{index}] gives token ids with media; only the "
-                    "processor can place media tokens, so send a rendered prompt."
+                    "processor can place media tokens, so send a rendered prompt"
+                    + (" or the processor's outputs as vision_inputs." if prepared else ".")
                 )
             validated[index] = replace(
                 request,
@@ -628,6 +655,37 @@ def _validate_vlm_requests(
             validated[index] = replace(request, image=os.fspath(request.image))
     _validate_vlm_defaults(defaults)
     return validated
+
+
+def _vision_inputs_layout(inputs):
+    def layout(value):
+        if isinstance(value, (list, tuple)):
+            return "list"
+        shape = tuple(getattr(value, "shape", ()))
+        if not shape:  # batch-wide metadata, such as an image token id: rows batch only when it agrees
+            return (), value.item() if hasattr(value, "item") else value
+        return shape, str(getattr(value, "dtype", type(value).__name__))
+
+    return tuple(sorted((name, layout(value)) for name, value in (inputs or {}).items()))
+
+
+def _prepared_vlm_inputs(chunk):
+    """A group of prepared prompts as ``prepare_inputs`` returns a batch: their
+    equal-length ids unpadded, each array input joined along the first axis, and
+    each scalar or list input kept as given (the group key makes it agree)."""
+    import mlx.core as mx
+
+    input_ids = mx.array([list(request.prompt_token_ids) for request in chunk])
+    inputs = {"input_ids": input_ids, "attention_mask": mx.ones(input_ids.shape, dtype=mx.int32)}
+    for name, first in (chunk[0].vision_inputs or {}).items():
+        values = [request.vision_inputs[name] for request in chunk]
+        if not getattr(first, "shape", ()):
+            inputs[name] = first
+        else:
+            inputs[name] = mx.concatenate([mx.array(value) for value in values], axis=0)
+    if "images" in inputs:  # as prepare_inputs renames it
+        inputs["pixel_values"] = inputs.pop("images")
+    return inputs
 
 
 class _StopIdsCriteria:
@@ -2939,23 +2997,25 @@ class _VLMBatchAdapter:
         # Prompt length is part of the key: preprocessing stacks a group without
         # padding, so mixing lengths raises instead of generating. Grouping by
         # length keeps varied batches working, at the cost of smaller groups.
-        shape = self._image_shape(request.image)
-        tokenizer = getattr(self.processor, "tokenizer", self.processor)
         ids = request.prompt_token_ids
-        width = len(ids) if ids is not None else len(tokenizer.encode(request.prompt))
-        key = (request.image is None, ids is not None, shape, width)
+        if ids is not None:
+            # Rows join only when their inputs concatenate as one processor call; processors batch lists by their own conventions.
+            inputs = request.vision_inputs or {}
+            alone = id(request) if any(isinstance(value, (list, tuple)) for value in inputs.values()) else None
+            key = ("ids", _vision_inputs_layout(inputs), len(ids), alone)
+        else:
+            shape = self._image_shape(request.image)
+            tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            key = (request.image is None, shape, len(tokenizer.encode(request.prompt)))
         if self.batches_observable:
             return key
         sampling = request.sampling or self.defaults.sampling
         return (_sampler_key(sampling), *key)
 
     def _prompt_inputs(self, requests: Sequence[GenerationRequest]) -> dict:
-        """``prepare_inputs`` for rows grouped alike; token-id rows are their own input ids."""
+        """``prepare_inputs`` for rows grouped alike; token-id rows are their own input ids and vision inputs."""
         if requests[0].prompt_token_ids is not None:
-            import mlx.core as mx
-
-            input_ids = mx.array([list(request.prompt_token_ids) for request in requests])
-            return {"input_ids": input_ids, "attention_mask": mx.ones(input_ids.shape, dtype=mx.int32)}
+            return _prepared_vlm_inputs(requests)
         images = [request.image for request in requests if request.image is not None]
         return self.prepare_inputs(
             self.processor,
@@ -4384,12 +4444,19 @@ def _stream_batch(
         raise TypeError("defaults must be GenerationDefaults.")
     is_vlm = bool(getattr(model, "_is_vlm_model", False))
     validated = (
-        _validate_vlm_requests(requests, defaults)
+        _validate_vlm_requests(requests, defaults, prepared=True)
         if is_vlm
         else _validate_text_requests(requests, defaults, _serves_text_images(model))
     )
     from .utils import _validate_mlx_image_input
-    _validate_mlx_image_input(model, any(request.image is not None for request in validated))
+    _validate_mlx_image_input(model, any(
+        request.image is not None
+        or any(
+            value is not None and (name == "images" or name.startswith("pixel_values"))
+            for name, value in (request.vision_inputs or {}).items()
+        )
+        for request in validated
+    ))
     if is_vlm and (gap := _vlm_quantized_cache_gap(model, defaults)) is not None:
         raise ValueError(gap)
     if any(request.prompt_cache_state is not None for request in validated):
