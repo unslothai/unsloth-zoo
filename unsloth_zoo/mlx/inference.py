@@ -2755,13 +2755,19 @@ def _gemma4_router_call(native):
 _MOE_ROUTER_BODIES = {
     # mlx_vlm qwen3_5_moe: 0.4.4-0.5.0 and 0.6.16-0.7.0; 0.6.0-0.6.15 takes a target-verify
     # argument; 0.7.1 scales the shared expert. qwen4_exp reuses the block, subclassing it in 0.7.1.
+    # mlx_vlm 0.7.5 stops the gradient on the selected indices in all three families below;
+    # 0.7.8's qwen3_5_moe honours `norm_topk_prob`.
     "903a5a99afcad95a": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
     "0ca80e0451802015": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
     "b948b94a9d18333f": (functools.partial(_qwen3_5_moe_call, scaled_shared = True, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
+    "10bab29b882b810a": (functools.partial(_qwen3_5_moe_call, scaled_shared = True, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
+    "bc11d59e3b1a7d5f": (functools.partial(_qwen3_5_moe_call, scaled_shared = True, top_k_norm = True), _QWEN_ROUTING, "num_experts", "top_k"),
     # qwen3_next in mlx_lm and mlx_vlm, reused by mlx_lm qwen3_5
     "6d29bc869fdde5aa": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = True), _QWEN_ROUTING, "num_experts", "top_k"),
+    "6b15c950ad0c22a1": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = True), _QWEN_ROUTING, "num_experts", "top_k"),
     # gemma4 Router in mlx_vlm gemma4_text, gemma4 and mlx_lm gemma4_text
     "c64fed4e7e7514ea": (_gemma4_router_call, _GEMMA_ROUTING, "config.num_experts", "config.top_k_experts"),
+    "09b6eefdbdfb7f24": (_gemma4_router_call, _GEMMA_ROUTING, "config.num_experts", "config.top_k_experts"),
 }
 
 
@@ -3558,7 +3564,8 @@ _EXACT_VERIFY_CONTRACT = {
         "Qwen3_5BatchInvariantForward._linears": "1f44efb5714938af",
         "Qwen3_5BatchInvariantForward._layer": "f3f59ff9d0b68a50",
         "Qwen3_5BatchInvariantForward._model": "142df8a42c27c4f7",
-        "Qwen3_5BatchInvariantForward._feed_forward": "d1c424074fbf0c21",
+        # 0.7.5 stops the gradient on the routed indices, which inference never reads.
+        "Qwen3_5BatchInvariantForward._feed_forward": ("d1c424074fbf0c21", "b04b66c926777a23"),
         "Qwen3_5BatchInvariantForward._switch_glu": "6aa1f4defb45f54a",
         "_target_verify_linear": "190517e318ba4d7b",
         "_target_verify_linears": "2d4c9adbc50be66e",
