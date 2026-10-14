@@ -2596,6 +2596,56 @@ def determine_max_lora_rank(lora_rank = 16):
 pass
 
 
+def _config_has_gdn_layers(config) -> bool:
+    # All Unsloth Zoo code licensed under LGPLv3
+    text_config = getattr(config, "text_config", None) or config
+    if getattr(text_config, "linear_key_head_dim", None) is not None: return True
+    return "linear_attention" in (getattr(text_config, "layer_types", None) or ())
+pass
+
+
+def _gdn_prefill_kwarg_mismatch(vllm_caller, flashinfer_fn, callee = "chunk_gated_delta_rule_fi"):
+    """Keywords `vllm_caller` passes to `callee` that `flashinfer_fn` does not accept, or None."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        tree = ast.parse(inspect.getsource(vllm_caller))
+        params = inspect.signature(inspect.unwrap(flashinfer_fn)).parameters
+    except (OSError, TypeError, ValueError, SyntaxError):
+        return None
+    passed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == callee:
+            passed.update(k.arg for k in node.keywords if k.arg is not None)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()): return None
+    missing = sorted(passed - set(params))
+    return missing or None
+pass
+
+
+def _flashinfer_gdn_prefill_mismatch():
+    """Why vLLM's FlashInfer GDN prefill call cannot run here, or None.
+
+    vLLM picks FlashInfer for GDN prefill from the GPU alone, then calls
+    flashinfer.gdn_prefill.chunk_gated_delta_rule with its own release's keywords
+    (vLLM 0.31 passes backend=, which flashinfer 0.6.x lacks), so probe the call.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+        caller = gdn.fi_chunk_gated_delta_rule
+    except Exception:
+        return None
+    try:
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+    except Exception as error:
+        return f"flashinfer.gdn_prefill is not importable ({type(error).__name__})"
+    missing = _gdn_prefill_kwarg_mismatch(caller, chunk_gated_delta_rule)
+    if missing:
+        return f"the installed flashinfer's chunk_gated_delta_rule lacks {missing}"
+    return None
+pass
+
+
 def vllm_supports_flashinfer(config) -> bool:
     """Approximate check for vLLM FLASHINFER support: looks up the model in
     ModelRegistry, then inspects for an `attn_backend not in {...}` guard that
@@ -4200,6 +4250,11 @@ def load_vllm(
         # supports_compute_capability() returns True unconditionally, and it is the last
         # entry in the MLA priority list, which is exactly what vLLM would fall back to
         # once the FlashInfer-backed ones are excluded.
+        if _config_has_gdn_layers(config) and "gdn_prefill_backend" not in engine_args:
+            gdn_mismatch = _flashinfer_gdn_prefill_mismatch()
+            if gdn_mismatch is not None:
+                print(f"Unsloth: vLLM GDN prefill uses Triton since {gdn_mismatch}.")
+                engine_args["gdn_prefill_backend"] = "triton"
         if _UNSLOTH_FLASHINFER_UNUSABLE:
             if _config_uses_mla(config):
                 engine_args["attention_backend"] = "TRITON_MLA"
