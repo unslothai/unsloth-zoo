@@ -96,12 +96,9 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
     # while compiling so the graph stays intact; correctness is unchanged.
     if torch.compiler.is_compiling():
         return False
-    try:
-        key = (S, w, mask._version)
-    except RuntimeError:
-        # Inference tensors have no version counter: keyed by (S, w) only, else
-        # every sliding layer re-scans the shared mask during prefill.
-        key = (S, w, None)
+    # Inference tensors have no version counter: keyed by (S, w) only, else
+    # every sliding layer re-scans the shared mask during prefill.
+    key = (S, w, None if mask.is_inference() else mask._version)
     cached = getattr(mask, "_unsloth_plain_band", None)
     if cached is not None and cached[0] == key:
         return cached[1]
