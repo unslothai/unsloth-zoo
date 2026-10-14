@@ -229,7 +229,13 @@ def _mlx_lora_type_specs(*, include_convolutions=False):
     ]
     vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
     if vlm_switch_module is not None:
-        vlm_lora_module = importlib.import_module("mlx_vlm.trainer.lora_layers")
+        try:
+            vlm_lora_module = importlib.import_module("mlx_vlm.trainer.peft.lora_layers")
+        except ModuleNotFoundError as exc:
+            # mlx-vlm moved its LoRA layers into trainer.peft in 0.7.8.
+            if exc.name not in ("mlx_vlm.trainer.peft", "mlx_vlm.trainer.peft.lora_layers"):
+                raise
+            vlm_lora_module = importlib.import_module("mlx_vlm.trainer.lora_layers")
         specs.append(
             _MLXLoRATypeSpec(
                 (
@@ -4393,7 +4399,14 @@ _MULTIMODAL_SKIP_FRAGMENTS = (
     "vision_tower", "vision_model", "vision_encoder", "visual",
     "embed_vision", "vision_embed_tokens", "img_processor", "img_projection",
     "audio_encoder", "audio_projection", "embed_audio", "sound_encoder", "sound_projection",
+    # Connectors no name above matches: MiniCPM-o's two, ERNIE 4.5's, and the one of InternVL-style models.
+    "resampler", "audio_projection_layer", "resampler_model", "mlp1",
+    # Molmo Point's, whose decoder is not a module of its own to tell it from.
+    "build_vit_embedding",
 )
+
+# Speech generators beside the decoder are language models of their own, quantized like it.
+_SPEECH_OUTPUT_MODULES = ("talker", "code2wav", "tts")
 
 _MLX_QUANT_MODE_DEFAULTS = {
     "affine": (64, 4),
@@ -5751,6 +5764,24 @@ def _path_matches_any(path, patterns):
     )
 
 
+def _text_decoder_paths(model):
+    """Where the text decoder sits in ``model``; empty when it is not a module of its own."""
+    from .utils import _get_text_model
+    text_model = _get_text_model(model)
+    if text_model is model or not hasattr(model, "named_modules"):
+        return ()
+    return tuple(path for path, module in model.named_modules() if module is text_model)
+
+
+def _beside_text_decoder(path, decoder_paths):
+    """Whether ``path`` is a tower, a connector or a head on one: outside the decoder, and no speech generator."""
+    return (
+        bool(decoder_paths)
+        and not _under_any(path, decoder_paths)
+        and not any(name in path.split(".") for name in _SPEECH_OUTPUT_MODULES)
+    )
+
+
 def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
     model_predicate = getattr(model, "quant_predicate", None)
     include_patterns = spec.quantize_modules
@@ -5758,6 +5789,8 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
         from mlx_vlm.utils import skip_multimodal_module
     except ImportError:
         skip_multimodal_module = None
+    # By path, not identity: a forced requantize replaces the decoder's modules first.
+    decoder_paths = _text_decoder_paths(model)
 
     def predicate(path: str, module):
         path_parts = path.split(".")
@@ -5769,6 +5802,8 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
             if skip_multimodal_module is not None and skip_multimodal_module(path):
                 return False
             if any(fragment in path_parts for fragment in _MULTIMODAL_SKIP_FRAGMENTS):
+                return False
+            if _beside_text_decoder(path, decoder_paths):
                 return False
 
         if not explicitly_included:

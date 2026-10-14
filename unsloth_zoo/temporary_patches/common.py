@@ -292,7 +292,8 @@ def _compile_or_fall_back(*args, **kwargs):
         _compile = torch_compile_with_fallback(**kwargs)
     else:
         def _compile(function):
-            return torch.compile(function, **kwargs)
+            from .utils import eager_under_zero3
+            return eager_under_zero3(function, torch.compile(function, **kwargs))
 
     def decorate(function):
         function = unwrap_already_compiled(function)

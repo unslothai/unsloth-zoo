@@ -2596,6 +2596,56 @@ def determine_max_lora_rank(lora_rank = 16):
 pass
 
 
+def _config_has_gdn_layers(config) -> bool:
+    # All Unsloth Zoo code licensed under LGPLv3
+    text_config = getattr(config, "text_config", None) or config
+    if getattr(text_config, "linear_key_head_dim", None) is not None: return True
+    return "linear_attention" in (getattr(text_config, "layer_types", None) or ())
+pass
+
+
+def _gdn_prefill_kwarg_mismatch(vllm_caller, flashinfer_fn, callee = "chunk_gated_delta_rule_fi"):
+    """Keywords `vllm_caller` passes to `callee` that `flashinfer_fn` does not accept, or None."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        tree = ast.parse(inspect.getsource(vllm_caller))
+        params = inspect.signature(inspect.unwrap(flashinfer_fn)).parameters
+    except (OSError, TypeError, ValueError, SyntaxError):
+        return None
+    passed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == callee:
+            passed.update(k.arg for k in node.keywords if k.arg is not None)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()): return None
+    missing = sorted(passed - set(params))
+    return missing or None
+pass
+
+
+def _flashinfer_gdn_prefill_mismatch():
+    """Why vLLM's FlashInfer GDN prefill call cannot run here, or None.
+
+    vLLM picks FlashInfer for GDN prefill from the GPU alone, then calls
+    flashinfer.gdn_prefill.chunk_gated_delta_rule with its own release's keywords
+    (vLLM 0.31 passes backend=, which flashinfer 0.6.x lacks), so probe the call.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+        caller = gdn.fi_chunk_gated_delta_rule
+    except Exception:
+        return None
+    try:
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+    except Exception as error:
+        return f"flashinfer.gdn_prefill is not importable ({type(error).__name__})"
+    missing = _gdn_prefill_kwarg_mismatch(caller, chunk_gated_delta_rule)
+    if missing:
+        return f"the installed flashinfer's chunk_gated_delta_rule lacks {missing}"
+    return None
+pass
+
+
 def vllm_supports_flashinfer(config) -> bool:
     """Approximate check for vLLM FLASHINFER support: looks up the model in
     ModelRegistry, then inspects for an `attn_backend not in {...}` guard that
@@ -3299,6 +3349,30 @@ _OUT_OF_MEMORY_MARKERS = (
     "cannot allocate memory",
     "unable to allocate",
 )
+
+
+# vLLM ReplaySSM (vllm-project/vllm#48018): Mamba2 decode reads a checkpointed
+# state plus the last few tokens' inputs and writes the state back once per
+# window instead of every token. Opt-in with UNSLOTH_VLLM_REPLAYSSM=1; vLLM only
+# accepts it for architectures that declare SupportsReplaySSM.
+_REPLAYSSM_MODEL_TYPES = ("nemotron_h",)
+
+
+def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
+    # None when ReplaySSM should be requested, else why it is not.
+    model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+    if model_type not in _REPLAYSSM_MODEL_TYPES:
+        return f"model type {model_type!r} has no ReplaySSM support in vLLM"
+    if device_type != "cuda":
+        return f"ReplaySSM is CUDA only, this is {device_type}"
+    if "use_replayssm" not in engine_arg_keys:
+        return "this vLLM has no `use_replayssm` engine arg"
+    return None
+
+
+def _is_vllm_replayssm_refusal(error_text):
+    # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2).
+    return "replayssm" in str(error_text).lower()
 
 
 def _is_memory_profiling_race_error(error_text):
@@ -4200,6 +4274,11 @@ def load_vllm(
         # supports_compute_capability() returns True unconditionally, and it is the last
         # entry in the MLA priority list, which is exactly what vLLM would fall back to
         # once the FlashInfer-backed ones are excluded.
+        if _config_has_gdn_layers(config) and "gdn_prefill_backend" not in engine_args:
+            gdn_mismatch = _flashinfer_gdn_prefill_mismatch()
+            if gdn_mismatch is not None:
+                print(f"Unsloth: vLLM GDN prefill uses Triton since {gdn_mismatch}.")
+                engine_args["gdn_prefill_backend"] = "triton"
         if _UNSLOTH_FLASHINFER_UNUSABLE:
             if _config_uses_mla(config):
                 engine_args["attention_backend"] = "TRITON_MLA"
@@ -4246,6 +4325,23 @@ def load_vllm(
                 _UNSLOTH_FLASHINFER_UNUSABLE = False
             return engine_args
 
+        # Only for engines built here: return_args callers (e.g. `vllm serve`) start
+        # their own process without the runner setting below.
+        replayssm_set_runner = False
+        if os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "0") == "1":
+            replayssm_skip = _vllm_replayssm_skip_reason(config, good_keys, DEVICE_TYPE)
+            if replayssm_skip is None:
+                engine_args["use_replayssm"] = True
+                print("Unsloth: vLLM ReplaySSM decode enabled (UNSLOTH_VLLM_REPLAYSSM=1).")
+                # vLLM 0.31's Triton ReplaySSM path only runs on Model Runner V1, no longer
+                # the CUDA default. Left set: vLLM caches env reads once the engine is up.
+                if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
+                    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+                    replayssm_set_runner = True
+            else:
+                print(f"Unsloth: UNSLOTH_VLLM_REPLAYSSM=1 ignored: {replayssm_skip}.")
+        pass
+
         # Keep trying until success (2 times)
         trials = 0
         race_trials = 0
@@ -4274,6 +4370,13 @@ def load_vllm(
                 # reported it as an OOM and sent users to fixes that cannot work.
                 if _is_expandable_segments_error(error):
                     raise RuntimeError(_expandable_segments_standby_message(error))
+                # Config validation, before any allocation: load once more without it.
+                if engine_args.get("use_replayssm") and _is_vllm_replayssm_refusal(error):
+                    engine_args.pop("use_replayssm")
+                    if replayssm_set_runner:
+                        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                    print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
+                    continue
                 # A transient race: retry the *identical* load rather than fall
                 # through to the generic "memory" branch below, which would shrink
                 # gpu_memory_utilization and max_num_seqs for the rest of the run

@@ -864,9 +864,13 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
             loaded[True].thinker.vision_tower, loaded[True].thinker.audio_tower = Linear(64, 64), Linear(64, 64)
             # A projector between a tower and the decoder too, as other families name it; never the talker.
             loaded[True].multi_modal_projector, loaded[True].thinker.talker = Linear(64, 64), Linear(64, 64)
+            # A connector whose name says nothing, or names both, serves whichever tower is read; one named for a modality, only that one.
+            loaded[True].mlp1x, loaded[True].audio_image_proj, loaded[True].audio_projection, loaded[True].language_model.vision_bias = (Linear(64, 64) for _ in range(4))
             _QwenModel._load(SimpleNamespace(reads_images = reads[0], reads_audio = reads[1]), tmp_path, None, None, None, None, True)
             towers = (loaded[True].vision_tower, loaded[True].thinker.vision_tower, loaded[True].thinker.audio_tower, loaded[True].multi_modal_projector, loaded[True].thinker.talker)
             assert ["scales" not in tower for tower in towers] == [reads[0], reads[0], reads[1], any(reads), False]
+            others = (loaded[True].mlp1x, loaded[True].audio_image_proj, loaded[True].audio_projection, loaded[True].language_model.vision_bias)
+            assert ["scales" not in module for module in others] == [any(reads), any(reads), reads[1], False]
     network = clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
     if mode == "qlora":
         # Adapters over quantized layers receive gradients.

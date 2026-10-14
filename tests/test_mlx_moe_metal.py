@@ -396,6 +396,15 @@ def test_accepted_switch_glu_bodies_cover_the_installed_packages():
         assert fusion._ast_fingerprint(native.SwitchGLU.__call__) in accepted
 
 
+def test_routing_bodies_cover_the_installed_packages():
+    # an unlisted routing body keeps its native call without a word, so it has to fail here
+    from mlx_vlm.models.gemma4_text import language as vlm_gemma_text
+    from mlx_vlm.models.qwen3_next import language as vlm_next
+    for router in (vlm_qwen.Qwen3_5MoeSparseMoeBlock, vlm_next.Qwen3NextSparseMoeBlock,
+                   lm_qwen.Qwen3NextSparseMoeBlock, vlm_gemma.Router, vlm_gemma_text.Router, lm_gemma.Router):
+        assert fusion._moe_router_class(router) is not None, router.__module__
+
+
 @pytest.mark.skipif("weights" not in vlm.SwitchGLU.__call__.__code__.co_varnames,
                     reason = "Requires an mlx-vlm that combines routing weights")
 @pytest.mark.parametrize("with_shared", [False, True])
@@ -528,7 +537,8 @@ def test_unnormalized_top_k_and_subclass_bodies_are_fused(monkeypatch):
             return 2 * super()._shared_expert_scale(x)
 
     partitions = _counting_argpartition(monkeypatch)
-    for block in (_block(lm_qwen, norm_topk_prob = False), _block(vlm_qwen, cls = Scaled)):
+    for block in (_block(lm_qwen, norm_topk_prob = False), _block(vlm_qwen, norm_topk_prob = False),
+                  _block(vlm_qwen, cls = Scaled)):
         samples = _routing_samples(block)
         base = type(block)
         with fusion.fused_moe_router(block):

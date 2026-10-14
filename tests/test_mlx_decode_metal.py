@@ -442,11 +442,14 @@ try:
 except ImportError:  # mlx-vlm < 0.6 layers call mlx-lm's module
     vlm_gated_delta = lm_gated_delta
 
-_PACKED_SOURCES = [(native, vlm_gated_delta, native.Qwen3_5GatedDeltaNet, native.ArraysCache),
-                   (lm_qwen3_5, lm_gated_delta, lm_qwen3_5.GatedDeltaNet, lm_cache.ArraysCache)]
+# The scope leaves a module that packs on its own (mlx-vlm 0.7.8) alone, so the route is exercised on one that does not.
+_PACKED_SOURCES = [case for case in [(native, vlm_gated_delta, native.Qwen3_5GatedDeltaNet, native.ArraysCache),
+                                     (lm_qwen3_5, lm_gated_delta, lm_qwen3_5.GatedDeltaNet, lm_cache.ArraysCache)]
+                   if not hasattr(case[1], "_gated_delta_kernel_packed")]
+_, routed_gated_delta, _ROUTED_LAYER, _ = _PACKED_SOURCES[0]
 
 
-def _packable_model(layer = native.Qwen3_5GatedDeltaNet):
+def _packable_model(layer = _ROUTED_LAYER):
     model = layer(SimpleNamespace(
         hidden_size = 64, linear_num_value_heads = 4, linear_num_key_heads = 2,
         linear_key_head_dim = 128, linear_value_head_dim = 24,
@@ -508,10 +511,10 @@ def test_packed_scope_preserves_prefill_and_decode_and_restores(consumer, source
 
 
 def test_packed_route_keeps_other_shapes_and_a_differing_kernel_on_the_generic_kernel(monkeypatch, caplog):
-    stock, packed = vlm_gated_delta.gated_delta_kernel, decode._packed_gated_delta
+    stock, packed = routed_gated_delta.gated_delta_kernel, decode._packed_gated_delta
     monkeypatch.setattr(decode, "_GATED_DELTA_VERDICTS", {})
     with decode.fused_packed_gated_delta(_packable_model()):
-        route = vlm_gated_delta.gated_delta_kernel
+        route = routed_gated_delta.gated_delta_kernel
         args = _recurrence(mx.bfloat16)
         route(*args)
         monkeypatch.setattr(decode, "_packed_gated_delta", lambda *a: ("packed",))
@@ -532,19 +535,19 @@ def test_packed_route_keeps_other_shapes_and_a_differing_kernel_on_the_generic_k
                 monkeypatch.setattr(decode, "_packed_gated_delta", lambda *a: pytest.fail("rejected layout was packed"))
             assert caplog.text.count("packed gated-delta kernel differs") == y + 1
         monkeypatch.setattr(decode, "_packed_gated_delta", lambda *a: pytest.fail("drifted binding was packed"))
-        monkeypatch.setattr(vlm_gated_delta, "_gated_delta_kernel", vlm_gated_delta._make_gated_delta_kernel())
+        monkeypatch.setattr(routed_gated_delta, "_gated_delta_kernel", routed_gated_delta._make_gated_delta_kernel())
         route(*_recurrence(mx.bfloat16))
 
 
 @pytest.mark.parametrize("reason", ["switch", "upstream", "body", "kernel", "distributed", "model"])
 def test_packed_scope_steps_aside(reason, monkeypatch, caplog):
-    stock, model = vlm_gated_delta.gated_delta_kernel, _packable_model()
+    stock, model = routed_gated_delta.gated_delta_kernel, _packable_model()
     if reason == "switch":
         monkeypatch.setenv("UNSLOTH_MLX_PACKED_GATED_DELTA", "0")
     elif reason == "upstream":
-        monkeypatch.setattr(vlm_gated_delta, "_gated_delta_kernel_packed", object(), raising = False)
+        monkeypatch.setattr(routed_gated_delta, "_gated_delta_kernel_packed", object(), raising = False)
     elif reason == "body":
-        monkeypatch.setattr(vlm_gated_delta, "_make_gated_delta_kernel", lambda *args, **kwargs: None)
+        monkeypatch.setattr(routed_gated_delta, "_make_gated_delta_kernel", lambda *args, **kwargs: None)
     elif reason == "kernel":
         monkeypatch.setattr(decode, "_packed_gated_delta_kernel", lambda: None)
     elif reason == "distributed":
@@ -552,18 +555,18 @@ def test_packed_scope_steps_aside(reason, monkeypatch, caplog):
     else:
         model = _model().in_proj_qkv
     with caplog.at_level("WARNING"), decode.fused_packed_gated_delta(model):
-        assert vlm_gated_delta.gated_delta_kernel is stock
+        assert routed_gated_delta.gated_delta_kernel is stock
     assert ("differs from the version" in caplog.text) == (reason == "body")
 
 
 def test_packed_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
-    stock, model, foreign = vlm_gated_delta.gated_delta_kernel, _packable_model(), lambda *args: None
+    stock, model, foreign = routed_gated_delta.gated_delta_kernel, _packable_model(), lambda *args: None
     with decode.fused_packed_gated_delta(model):
-        monkeypatch.setattr(vlm_gated_delta, "gated_delta_kernel", foreign)
+        monkeypatch.setattr(routed_gated_delta, "gated_delta_kernel", foreign)
         with decode.fused_packed_gated_delta(model):
             pass
-    assert vlm_gated_delta.gated_delta_kernel is foreign
-    monkeypatch.setattr(vlm_gated_delta, "gated_delta_kernel", stock)
+    assert routed_gated_delta.gated_delta_kernel is foreign
+    monkeypatch.setattr(routed_gated_delta, "gated_delta_kernel", stock)
     with decode.fused_packed_gated_delta(model):
-        assert vlm_gated_delta.gated_delta_kernel is not stock
-    assert vlm_gated_delta.gated_delta_kernel is stock
+        assert routed_gated_delta.gated_delta_kernel is not stock
+    assert routed_gated_delta.gated_delta_kernel is stock

@@ -1777,7 +1777,7 @@ def _record_cce_rows(monkeypatch):
 @pytest.mark.parametrize("reference", [False, True])
 @pytest.mark.parametrize("prompt_share", ["low", "high"])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-@pytest.mark.parametrize("kind", ["dpo", "orpo"])
+@pytest.mark.parametrize("kind", ["dpo", "orpo", "cpo"])
 def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, reference, prompt_share, dtype, kind):
     from unsloth_zoo.mlx import preference as p
     from mlx_lm.tuner.lora import LoRAEmbedding
@@ -1810,8 +1810,9 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
         dense = p.make_dpo_loss_fn(objective, reference_policy=policy)
         loss = p.make_dpo_cce_loss_fn(model, objective, reference_policy=policy)
     else:
-        objective = p.resolve_preference_objective("orpo", beta=0.2)
-        dense, loss = p.make_orpo_loss_fn(objective), p.make_orpo_cce_loss_fn(model, objective)
+        objective = p.resolve_preference_objective(kind, beta=0.2,
+            **({"loss_type": "simpo", "alpha": 0.1} if kind == "cpo" else {}))
+        dense, loss = (getattr(p, f"make_{kind}{cce}_loss_fn")(*args) for cce, args in (("", (objective,)), ("_cce", (model, objective))))
     grad = nn.value_and_grad(model, loss)
     run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
     for index in range(2):
@@ -2051,7 +2052,7 @@ def test_preference_logit_sums_keep_float32_precision(quantized):
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("reference", [False, True])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-@pytest.mark.parametrize("kind", ["dpo", "orpo"])
+@pytest.mark.parametrize("kind", ["dpo", "orpo", "cpo"])
 def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, reference, dtype, kind):
     from types import SimpleNamespace
     from mlx_lm.tuner.lora import LoRAEmbedding
@@ -2096,7 +2097,7 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
     kernel_rows.clear()
     actual = MLXTrainer._evaluate_batch_totals(trainer, plan, candidate)
     mx.eval(expected, actual)
-    capacity = 256 if kind == "dpo" else 768
+    capacity = 768 if kind == "orpo" else 256
     assert kernel_rows == [capacity] * (4 if kind == "dpo" and reference else 2)
     assert len(calls) == 4 and actual[1].item() == 7
     for want, got in zip(expected, actual):

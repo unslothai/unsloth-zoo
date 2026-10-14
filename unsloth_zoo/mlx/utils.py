@@ -17676,6 +17676,65 @@ def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
             return
 
 
+def _confirmed_mlx_moe_merge_recipe(sanitizers, staged, groups, recipes):
+    """(first natively confirmed recipe, a tensor name some replay wanted)."""
+    wanted = None
+    for width in _MOE_MERGE_PROBE_WIDTHS:
+        for sanitizer in sanitizers:
+            for recipe, missing in _proved_mlx_moe_merge_recipe(
+                sanitizer, staged, groups, recipes, width
+            ):
+                if recipe is None:
+                    wanted = wanted or missing
+                    continue
+                # A float32 corner can support a recipe the tensor contradicts: confirm natively.
+                if any(
+                    confirmed is not None
+                    for confirmed, _ in _proved_mlx_moe_merge_recipe(
+                        sanitizer, staged, groups, [recipe], None, native=True
+                    )
+                ):
+                    return recipe, wanted
+    return None, wanted
+
+
+def _mlx_moe_restored_module(name):
+    return name.removesuffix(".weight").rsplit(".", 1)[0]
+
+
+def _completed_mlx_moe_merge_plan(sanitizers, staged, arrivals, groups, substitutions,
+                                  recipe):
+    """mlx-vlm 0.7.8 expert helpers skip a missing sibling and accept `<name>.weight`,
+    so extend the plan to siblings and drop `.weight` while replay still proves it."""
+    modules = {_mlx_moe_restored_module(target) for target in groups}
+    claimed = {part for parts in groups.values() for part in parts}
+    tried = set(substitutions)
+    for name in staged:
+        if name in claimed:
+            continue
+        for target, companion in arrivals.get(name, {}).items():
+            if companion in tried or _mlx_moe_restored_module(target) not in modules:
+                continue
+            tried.add(companion)
+            extended = _mlx_moe_merge_groups(staged, substitutions + [companion])
+            if (any(extended.get(t) != parts for t, parts in groups.items())
+                    or set(extended) & set(staged)):
+                continue
+            if _confirmed_mlx_moe_merge_recipe(
+                sanitizers, staged, extended, [recipe]
+            )[0] is not None:
+                groups, substitutions = extended, substitutions + [companion]
+                claimed = {part for parts in groups.values() for part in parts}
+    bare = {target.removesuffix(".weight"): parts for target, parts in groups.items()}
+    if (bare.keys() != groups.keys() and len(bare) == len(groups)
+            and not set(bare) & set(staged)
+            and _confirmed_mlx_moe_merge_recipe(
+                sanitizers, staged, bare, [recipe])[0] is not None):
+        groups = bare
+    return {merged: _mlx_moe_group_recipe(group, recipe)
+            for merged, group in groups.items()}
+
+
 def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutions,
                                attempted):
     """The rewrite one set of substitutions proves, completed from what it fails on."""
@@ -17699,27 +17758,11 @@ def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutio
         if grouping in attempted:
             return None
         attempted.add(grouping)
-        wanted = None
-        for width in _MOE_MERGE_PROBE_WIDTHS:
-            for sanitizer in sanitizers:
-                for recipe, missing in _proved_mlx_moe_merge_recipe(
-                    sanitizer, staged, groups, _mlx_moe_merge_recipes(shapes), width
-                ):
-                    if recipe is None:
-                        wanted = wanted or missing
-                        continue
-                    # A float32 corner can support a recipe the tensor contradicts: confirm natively.
-                    if not any(
-                        confirmed is not None
-                        for confirmed, _ in _proved_mlx_moe_merge_recipe(
-                            sanitizer, staged, groups, [recipe], None, native=True
-                        )
-                    ):
-                        continue
-                    return {
-                        merged: _mlx_moe_group_recipe(group, recipe)
-                        for merged, group in groups.items()
-                    }
+        recipe, wanted = _confirmed_mlx_moe_merge_recipe(
+            sanitizers, staged, groups, list(_mlx_moe_merge_recipes(shapes)))
+        if recipe is not None:
+            return _completed_mlx_moe_merge_plan(
+                sanitizers, staged, arrivals, groups, substitutions, recipe)
         # A sanitizer popping a sibling throws naming what it wanted: read the companion off it.
         claimed = {part for group in groups.values() for part in group}
         companion = next(

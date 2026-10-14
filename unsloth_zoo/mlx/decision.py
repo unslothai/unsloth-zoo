@@ -1008,17 +1008,21 @@ class _QwenModel(DecisionPipeline):
         if load_in_4bit:
             # The loader leaves the embeddings, the output head and the towers in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
-            # A tower read and the projectors that embed its output keep their precision, named as the loader names them.
-            from .loader import _OTHER_MODALITY_TOKENS, _STRONG_PROJECTOR_TOKENS, _VISION_ROLE_TOKENS, _role_tokens
-            from .utils import _get_text_model
+            # What a tower read needs keeps its precision: beside the decoder, as the loader tells it, everything but the
+            # modules named for a modality left unread.
+            from .loader import _OTHER_MODALITY_TOKENS, _VISION_ROLE_TOKENS, _beside_text_decoder, _role_tokens, _text_decoder_paths
 
-            kept = (_VISION_ROLE_TOKENS if self.reads_images else frozenset()) | (_OTHER_MODALITY_TOKENS - {"talker"} if self.reads_audio else frozenset())
-            kept |= _STRONG_PROJECTOR_TOKENS if kept else frozenset()
-            # The decoder is quantized whatever its layers are called (Gemma 3n's `per_layer_projection`).
-            decoder = {id(module) for _, module in _get_text_model(self.model).named_modules()}
+            read = (_VISION_ROLE_TOKENS if self.reads_images else frozenset()) | (_OTHER_MODALITY_TOKENS if self.reads_audio else frozenset())
+            unread = (_VISION_ROLE_TOKENS | _OTHER_MODALITY_TOKENS) - read
+            decoder_paths = _text_decoder_paths(self.model)
+
+            def kept(path):
+                tokens = _role_tokens(path)
+                return bool(read) and _beside_text_decoder(path, decoder_paths) and bool(tokens & read or not tokens & unread)
+
             nn.quantize(
                 self.model, 64, 4,
-                class_predicate = lambda path, module: (id(module) in decoder or not _role_tokens(path) & kept) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0,
+                class_predicate = lambda path, module: not kept(path) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0,
             )
         self.model.eval()
 
