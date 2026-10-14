@@ -287,7 +287,8 @@ def _append_mtp_shard(directory, layout, has_index, head, prefix, dtype):
 
 
 def write_mtp_tensors(save_directory, head_state_dict, prefix = None, strict = True, verify = False,
-                      append_prefix = "mtp.", is_mtp_name = None, config_key = None, num_layers = None):
+                      append_prefix = "mtp.", is_mtp_name = None, config_key = None, num_layers = None,
+                      append_extra = None):
     """Replace (or add) a checkpoint's `mtp.*` tensors with `head_state_dict`.
 
     `head_state_dict` uses head-relative names (`fc.weight`, `layers.0.mlp.up_proj.weight`);
@@ -299,12 +300,13 @@ def write_mtp_tensors(save_directory, head_state_dict, prefix = None, strict = T
     and after to the report.
 
     Families other than Qwen3.5 (NextNHead.stitch_kwargs()) pass full checkpoint names plus
-    `is_mtp_name` (which stored tensors are the head's), `config_key` and `num_layers`.
+    `is_mtp_name` (which stored tensors are the head's), `config_key` and `num_layers`;
+    `append_extra` is written only when the checkpoint has no MTP tensors yet (a head's own frozen copies).
     """
     directory = Path(save_directory)
     if is_mtp_name is not None:
         return _write_named_mtp_tensors(directory, dict(head_state_dict), is_mtp_name, config_key,
-                                        num_layers, strict, verify)
+                                        num_layers, strict, verify, append_extra)
     head = _relative_head_state_dict(head_state_dict)
     if not head:
         raise ValueError("Unsloth: the MTP head state dict is empty.")
@@ -385,7 +387,8 @@ def write_mtp_tensors(save_directory, head_state_dict, prefix = None, strict = T
     return report
 
 
-def _write_named_mtp_tensors(directory, head, is_mtp_name, config_key, num_layers, strict, verify):
+def _write_named_mtp_tensors(directory, head, is_mtp_name, config_key, num_layers, strict, verify,
+                             append_extra = None):
     if not head:
         raise ValueError("Unsloth: the MTP head state dict is empty.")
     layout, has_index = _checkpoint_layout(directory)
@@ -428,7 +431,7 @@ def _write_named_mtp_tensors(directory, head, is_mtp_name, config_key, num_layer
         float_dtypes = [entry["dtype"] for key, entry in header.items()
                         if key != "__metadata__" and entry["dtype"] in ("BF16", "F16", "F32")]
         dtype = _SAFETENSORS_DTYPES[max(set(float_dtypes), key = float_dtypes.count)] if float_dtypes else torch.bfloat16
-        shard_name, written = _append_mtp_shard(directory, layout, has_index, head, "", dtype)
+        shard_name, written = _append_mtp_shard(directory, layout, has_index, {**head, **(append_extra or {})}, "", dtype)
         report["files_touched"].extend([shard_name, _INDEX_NAME])
         report["tensors_written"].extend(sorted(written))
         report["mode"] = "appended"

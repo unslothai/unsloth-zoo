@@ -211,6 +211,31 @@ def test_stitch_replace_and_append(tmp_path):
     assert all(index["weight_map"][k] == "model-mtp.safetensors" for k in trained.mtp_state_dict())
 
 
+def test_stitch_append_keeps_owned_copies(tmp_path):
+    """A full-model save drops the MTP layer: appending writes owned copies back, never duplicates."""
+    config = _glm_config()
+    head = build_nextn_head(config)
+    sd = {k: v.clone() for k, v in _randomise(head).state_dict().items()}
+    embed, lm, own_head = torch.randn(VOCAB, HIDDEN), torch.randn(VOCAB, HIDDEN), torch.randn(VOCAB, HIDDEN)
+    sd["heads.0.embed_tokens.weight"] = embed.clone()
+    sd["heads.0.shared_head_head.weight"] = own_head.clone()
+    built = build_nextn_head(config, state_dict = sd, target_embed = embed, target_lm_head = lm)
+    bare = _write_target_checkpoint(tmp_path / "bare", config)
+    report = write_mtp_tensors(str(bare), built.mtp_state_dict(), **built.stitch_kwargs())
+    assert report["mode"] == "appended"
+    on_disk = load_file(str(bare / "model-mtp.safetensors"))
+    assert torch.equal(on_disk["model.layers.2.shared_head.head.weight"], own_head)
+    assert "model.layers.2.embed_tokens.weight" not in on_disk
+    # Saving again over it replaces only the trained tensors and leaves the copy as written.
+    report = write_mtp_tensors(str(bare), built.mtp_state_dict(), **built.stitch_kwargs())
+    assert report["mode"] == "replaced"
+    assert torch.equal(load_file(str(bare / "model-mtp.safetensors"))["model.layers.2.shared_head.head.weight"], own_head)
+    state_dict, info = load_mtp_state_dict(str(bare))
+    again = build_mtp_head(config, state_dict = state_dict, target_embed = embed, target_lm_head = lm,
+                           ckpt_prefix = info.get("ckpt_prefix"))
+    assert again._frozen_kinds == {"heads.0.shared_head_head.weight": "owned"}
+
+
 def _greedy_consistency(head, steps = 3):
     """forward_train on a sequence built from the head's own greedy drafts reproduces them."""
     torch.manual_seed(0)

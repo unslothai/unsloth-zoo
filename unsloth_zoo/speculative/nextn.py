@@ -206,10 +206,21 @@ class NextNHead(nn.Module):
             mapped = self.family.from_ckpt(name, n)
             return mapped is not None and mapped[1].split(".")[2] not in frozen
 
+        # A full-model save drops the MTP layer, so owned copies (unlike duplicates, which
+        # llama.cpp and the loader replace with the target's matrices) must be appended back.
+        prefix = getattr(self, "_ckpt_prefix", None)
+        prefix = self.family.default_prefix() if prefix is None else prefix
+        owned = {}
+        for i, head in enumerate(self.heads):
+            for canon, tensor in ((f"heads.{i}.embed_tokens.weight", head.embed_weight),
+                                  (f"heads.{i}.shared_head_head.weight", head.lm_head_weight)):
+                if tensor is not None:
+                    owned[self.family.to_ckpt(canon, prefix, n)] = tensor
         return {
             "is_mtp_name": is_trainable_mtp_name,
             "config_key": self.family.count_keys[0],
             "num_layers": len(self.heads),
+            "append_extra": owned,
         }
 
     @property
