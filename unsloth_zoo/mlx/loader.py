@@ -3586,7 +3586,19 @@ def _freeze_text_only_full_finetune(model) -> None:
 def _fix_full_finetune_modality_weights(model) -> None:
     """Phi-4-multimodal sets its decoder weights from frozen copies for each input's modality, over what full
     fine-tuning changed; it keeps one set with every adapter merged instead, as its quantized load does."""
-    if getattr(model, "_unsloth_full_finetuning", False) and getattr(model, "_base_weights", None):
+    if not getattr(model, "_base_weights", None):
+        return
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    # The copies keep the checkpoint's dtype; the decoder they are written over may since have been cast to the requested one.
+    current = dict(tree_flatten(model.parameters()))
+    for name in ("_base_weights", "_vision_lora_a", "_vision_lora_b", "_speech_lora_a", "_speech_lora_b"):
+        table = getattr(model, name, None) or {}
+        for key, value in table.items():
+            if key in current and mx.issubdtype(current[key].dtype, mx.floating) and value.dtype != current[key].dtype:
+                table[key] = value.astype(current[key].dtype)
+    if getattr(model, "_unsloth_full_finetuning", False):
         model.apply_both_loras()
         model._base_weights = {}
 

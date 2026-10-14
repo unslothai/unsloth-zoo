@@ -3935,6 +3935,40 @@ def test_phi4mm_full_finetuning_keeps_one_set_of_decoder_weights(full_finetuning
     assert outputs == ([[[8.0, 8.0]], [[10.0, 10.0]]] if full_finetuning else [[[2.0, 2.0]]] * 2)
 
 
+@pytest.mark.parametrize("full_finetuning", [True, False])
+def test_phi4mm_weight_swaps_keep_the_requested_dtype(full_finetuning):
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_both_loras, apply_base_weights = phi4mm.set_modality, phi4mm.apply_both_loras, phi4mm.apply_base_weights
+        apply_speech_lora = phi4mm.apply_speech_lora
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    # The loader has cast the decoder to float32; the copies the sanitizer kept are the checkpoint's bfloat16.
+    model.layers = [nn.Linear(2, 2, bias=False)]
+    model.layers[0].weight = mx.ones((2, 2), dtype=mx.float32)
+    key = "layers.0.weight"
+    model._base_weights = {key: mx.ones((2, 2), dtype=mx.bfloat16)}
+    for kind in ("vision", "speech"):
+        setattr(model, f"_{kind}_lora_a", {key: mx.ones((1, 2), dtype=mx.bfloat16)})
+        setattr(model, f"_{kind}_lora_b", {key: mx.ones((2, 1), dtype=mx.bfloat16)})
+        setattr(model, f"_{kind}_lora_scale", 1.0)
+    model._active_lora, model._unsloth_full_finetuning = "vision", full_finetuning
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    _finish_load(model, None)
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert model.layers[0].weight.dtype == mx.float32
+    model.set_modality(has_audio=True)
+    assert model.layers[0].weight.dtype == mx.float32
+
+
 def test_phi4mm_keeps_a_merged_decision_adapter_across_its_weight_swaps(tmp_path):
     import json
 
