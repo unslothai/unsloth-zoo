@@ -147,8 +147,8 @@ jobs:
                 retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
                   "torch>=2.4.0,<2.11.0" &&
                 retry "$venv/bin/pip" install -e .[core] &&
-                { "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
                 retry "$venv/bin/pip" install pytest==9.0.3
               } > "$log" 2>&1 || rc=$?
               echo "$rc" > ".lanes/$version.install"
@@ -243,7 +243,13 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
-          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          # Retried, then fatal: with `|| true` a failed install left unsloth absent, and every
+          # test that needs it skipped while the job stayed green.
+          for attempt in 1 2 3; do
+            pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" && break
+            if [ "$attempt" = 3 ]; then echo "::error::installing unsloth@main failed 3 times"; exit 1; fi
+            echo "unsloth install attempt $attempt failed, retrying in 15s"; sleep 15
+          done
           pip install pytest==9.0.3 pyyaml==6.0.2
           # gguf is not a dependency of the zoo, and unsloth goes in --no-deps, so
           # without this every test that reads a GGUF back skips at
@@ -657,8 +663,8 @@ jobs:
               retry .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-numerics/bin/pip install -e .[core] &&
-              { .lanes/venv-numerics/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+              retry .lanes/venv-numerics/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
               retry .lanes/venv-numerics/bin/pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
             } > .lanes/numerics-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/numerics.install
@@ -680,8 +686,8 @@ jobs:
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
                 "mlx>=0.22.0" mlx-cpu "mlx-lm==0.31.3" "mlx-vlm>=0.4.4,<=0.7.8" &&
-              { .lanes/venv-suites/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+              retry .lanes/venv-suites/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
             } > .lanes/suites-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/suites.install
@@ -1134,8 +1140,8 @@ jobs:
                 retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
                   "torch>=2.4.0,<2.11.0" "torchvision<0.26" &&
                 retry "$venv/bin/pip" install -e .[core] &&
-                { "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
                 retry "$venv/bin/pip" install -U "$spec_t" "$spec_r" "$spec_p" &&
                 # bitsandbytes: imported at module scope in saving_utils.py.
                 # IPython + ipywidgets: logging_utils.py:50 imports

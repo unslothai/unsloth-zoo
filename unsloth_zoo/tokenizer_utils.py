@@ -355,6 +355,18 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             f"embedding."
         )
         return
+    # DeepSpeed ZeRO-3 partitioned the weights to empty placeholders: gather them outside inference mode
+    # (all-gather writes param.data) and let rank 0's reset reach every partition (unsloth#225).
+    partitioned = []
+    for weight in (embeddings.weight, lm_head.weight):
+        status = getattr(getattr(weight, "ds_status", None), "name", None)
+        if status == "NOT_AVAILABLE" and all(weight is not w for w in partitioned):
+            partitioned.append(weight)
+    if partitioned:
+        import deepspeed
+        with torch.inference_mode(False), \
+            deepspeed.zero.GatheredParameters(partitioned, modifier_rank = 0), torch.inference_mode():
+            return fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES, eps)
     embedding_matrix = embeddings.weight
     lm_head_matrix   = lm_head.weight
     chat_template = getattr(tokenizer, "chat_template", None)
