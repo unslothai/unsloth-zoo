@@ -3450,6 +3450,60 @@ def test_grpo_loss_and_metrics_leave_out_truncated_rows():
     assert np.allclose(np.array(completion_logps(Model(), batch, 0.7)), expected, atol=1e-5)
 
 
+def test_grpo_reward_models_are_scored_as_trl_scores_them(monkeypatch):
+    import numpy as np
+    import torch
+    import transformers
+    from unsloth_zoo.mlx.grpo import calculate_rewards, grpo_reward_funcs, reward_function_name, reward_prompts_and_completions
+
+    class Judge(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(128, 2, _weight=torch.linspace(-1, 1, 256).reshape(128, 2))
+            self.config = types.SimpleNamespace(_name_or_path="org/judge", pad_token_id=None)
+
+        def forward(self, input_ids, attention_mask):
+            assert torch.is_inference_mode_enabled()
+            return types.SimpleNamespace(logits=(self.embed(input_ids) * attention_mask[..., None]).sum(1))
+
+    class JudgeTokenizer:
+        pad_token_id, eos_token, calls = None, "~", []
+        pad_token = property(lambda self: None, lambda self, token: setattr(self, "pad_token_id", ord(token)))
+
+        def apply_chat_template(self, messages, tools, tokenize):
+            assert tools is None and tokenize is False
+            return "|".join(f"{message['role']}:{message['content']}" for message in messages)
+
+        def __call__(self, text, **kwargs):
+            self.calls.append(kwargs)
+            width = max(map(len, text))
+            ids = torch.tensor([[ord(c) for c in row] + [self.pad_token_id] * (width - len(row)) for row in text])
+            return {"input_ids": ids, "attention_mask": torch.tensor([[1] * len(row) + [0] * (width - len(row)) for row in text])}
+
+    loaded = []
+    monkeypatch.setattr(transformers.AutoModelForSequenceClassification, "from_pretrained", lambda name, **kw: loaded.append((name, kw)) or Judge())
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda name: loaded.append(name) or JudgeTokenizer())
+    judge, tokenizer = Judge(), JudgeTokenizer()
+    funcs = grpo_reward_funcs([lambda completions, **_: [1.0] * len(completions), judge], [None, tokenizer])
+    assert reward_function_name(funcs[1]) == "judge" and judge.config.pad_token_id == tokenizer.pad_token_id == ord("~")
+    by_id = grpo_reward_funcs("org/judge")[0]
+    assert loaded == [("org/judge", {"num_labels": 1}), "org/judge"] and by_id.model.config.pad_token_id == ord("~")
+
+    chat = [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "It is "}]
+    for raw, texts in (
+        ([chat, chat], ["user:2+2?|assistant:It is 4", "user:2+2?|assistant:It is seven"]),
+        (["2+2?", "1+1 is"], ["2+2?4", "1+1 isseven"]),
+    ):
+        prompts, completions = reward_prompts_and_completions(raw, ["4", "seven"])
+        rewards = calculate_rewards(
+            funcs, [{"prompt": prompt} for prompt in raw], prompts=prompts, completions=completions,
+            completion_ids=[[1], [2]], trainer_state=None)
+        with torch.inference_mode():
+            expected = judge(**tokenizer(texts)).logits[:, 0]
+        assert np.allclose(rewards, np.stack([np.ones(2), expected.numpy()], axis=1)) and expected[0] != expected[1]
+    assert set(map(repr, tokenizer.calls[:-1:2])) == {repr(dict(return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False))}
+
+
 def test_grpo_rewards_advantages_and_reward_inputs_follow_trl():
     import numpy as np
     from unsloth_zoo.mlx.grpo import GRPOObjective, calculate_rewards, cut_completion, group_advantages, reward_prompts_and_completions  # noqa: E501
@@ -3725,10 +3779,10 @@ def _grpo_rows(count=6):
 
 
 @pytest.mark.parametrize("overrides,trainer_kwargs,match", [
-    ({}, {"reward_processing_classes": [Tokenizer()]}, "reward_processing_classes"),
-    ({}, {"reward_funcs": "org/reward-model"}, "not a plain callable"),
+    ({}, {"reward_processing_classes": [Tokenizer(), Tokenizer()]}, "2 reward_processing_classes for 1"),
+    ({}, {"reward_funcs": 3}, "neither a callable nor a torch reward model"),
     ({}, {"reward_funcs": []}, "at least one"),
-    ({}, {"reward_funcs": type("RewardModel", (), {"__call__": print, "parameters": print})()}, "reward models are not supported"),
+    ({}, {"reward_funcs": type("MLXModel", (), {"__call__": print, "parameters": print})()}, "Wrap an MLX model in a function"),
     ({"reward_weights": [1.0, 2.0]}, {}, "2 reward_weights for 1"),
     ({"per_device_eval_batch_size": 3}, {"eval_dataset": _grpo_rows(2)}, "per_device_eval_batch_size=3 must be divisible"),
     ({"max_completion_length": 64}, {}, "leave no room"),
