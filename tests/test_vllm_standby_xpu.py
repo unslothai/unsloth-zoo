@@ -90,6 +90,8 @@ def _install_fake_vllm(vllm_utils, monkeypatch, device_type, with_xpumem = True)
         sys.modules, "vllm.device_allocator.xpumem", xpumem if with_xpumem else None
     )
     monkeypatch.setattr(vllm_utils, "vllm", fake_vllm, raising = False)
+    # Unset at import when vLLM is not installed.
+    monkeypatch.setattr(vllm_utils, "vllm_version", "0.22.0", raising = False)
     monkeypatch.setattr(vllm_utils, "DEVICE_TYPE", device_type)
     monkeypatch.setattr(vllm_utils, "_device_empty_cache", lambda: calls.append("empty_cache"))
     return calls, cumem.CuMemAllocator, xpumem.XpuMemAllocator
