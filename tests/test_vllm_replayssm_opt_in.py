@@ -96,51 +96,56 @@ def test_requested_only_for_engines_load_vllm_builds():
     assert '"VLLM_USE_V2_MODEL_RUNNER" not in os.environ' in src
 
 
-# Drift guards against the installed vLLM; skipped where vLLM is absent or predates ReplaySSM.
-def _vllm_file(*parts):
+# Drift guards against the installed vLLM, run whenever it has the engine arg load_vllm keys on.
+def _vllm_root():
     spec = importlib.util.find_spec("vllm")
     if spec is None or not spec.submodule_search_locations:
-        pytest.skip("vLLM not installed")
-    path = pathlib.Path(list(spec.submodule_search_locations)[0]).joinpath(*parts)
-    if not path.exists():
-        pytest.skip(f"{path} not in this vLLM")
-    return ast.parse(path.read_text(encoding = "utf-8"))
+        return None
+    return pathlib.Path(list(spec.submodule_search_locations)[0])
 
 
+def _vllm_has_replayssm():
+    if _vllm_root() is None:
+        return False
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+    except Exception:
+        return False
+    return "use_replayssm" in inspect.signature(EngineArgs).parameters
+
+
+needs_replayssm_vllm = pytest.mark.skipif(
+    not _vllm_has_replayssm(),
+    reason = "needs a vLLM with use_replayssm (vllm-project/vllm#48018); load_vllm never requests it on older vLLM",
+)
+
+
+def _vllm_ast(*parts):
+    return ast.parse(_vllm_root().joinpath(*parts).read_text(encoding = "utf-8"))
+
+
+@needs_replayssm_vllm
 def test_refusal_matcher_matches_vllm_replayssm_errors():
-    tree = _vllm_file("config", "vllm.py")
     messages = []
-    for node in ast.walk(tree):
+    for node in ast.walk(_vllm_ast("config", "vllm.py")):
         if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
             text = "".join(
                 c.value for a in node.exc.args for c in ast.walk(a)
                 if isinstance(c, ast.Constant) and isinstance(c.value, str)
             )
-            if "ReplaySSM" in text:
+            if "replayssm" in text.lower():
                 messages.append(text)
-    if not messages:
-        pytest.skip("this vLLM has no ReplaySSM validation")
+    assert messages, "vLLM's ReplaySSM config validation moved; re-check _is_vllm_replayssm_refusal"
+    assert any("Model Runner V1" in m for m in messages)
     assert all(NS["_is_vllm_replayssm_refusal"](m) for m in messages)
 
 
+@needs_replayssm_vllm
 @pytest.mark.parametrize("model_type", NS["_REPLAYSSM_MODEL_TYPES"])
 def test_model_types_declare_supports_replayssm(model_type):
-    tree = _vllm_file("model_executor", "models", f"{model_type}.py")
+    tree = _vllm_ast("model_executor", "models", f"{model_type}.py")
     bases = {
         getattr(b, "id", getattr(b, "attr", None))
         for n in ast.walk(tree) if isinstance(n, ast.ClassDef) for b in n.bases
     }
-    if "SupportsReplaySSM" not in bases and "SupportsReplaySSM" not in ast.dump(tree):
-        pytest.skip("this vLLM predates ReplaySSM")
     assert "SupportsReplaySSM" in bases
-
-
-def test_engine_arg_name_matches_vllm():
-    try:
-        from vllm.engine.arg_utils import EngineArgs
-    except Exception as e:
-        pytest.skip(f"vLLM EngineArgs unavailable: {e}")
-    params = inspect.signature(EngineArgs).parameters
-    if not any("replayssm" in p for p in params):
-        pytest.skip("this vLLM predates ReplaySSM")
-    assert "use_replayssm" in params

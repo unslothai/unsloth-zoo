@@ -4317,7 +4317,7 @@ def load_vllm(
                     raise RuntimeError(_expandable_segments_standby_message(error))
                 # Config validation, before any allocation: load once more without it.
                 if engine_args.get("use_replayssm") and _is_vllm_replayssm_refusal(error):
-                    del engine_args["use_replayssm"]
+                    engine_args.pop("use_replayssm")
                     if replayssm_set_runner:
                         os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
                     print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
