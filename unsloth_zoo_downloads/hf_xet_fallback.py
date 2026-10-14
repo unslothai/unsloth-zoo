@@ -38,8 +38,9 @@ the HTTP branch uses, so the file is rebuilt from offset zero. It keeps everythi
 into a blob (for a snapshot, every completed shard), so the cost is replaying the in-flight file.
 ``snapshot_download_with_xet_fallback`` warms a whole repo in a killable child before Unsloth's
 in-process load; ``hf_hub_download_with_xet_fallback`` does a single file. Unsloth cache / secret /
-process helpers are used best-effort (imported only if present) or injected. The child sets
-``UNSLOTH_ZOO_DISABLE_GPU_INIT=1`` for unsloth_zoo's lightweight import path (no torch / transformers).
+process helpers are used best-effort (imported only if present) or injected. The child imports only
+this package; it still inherits ``UNSLOTH_ZOO_DISABLE_GPU_INIT=1`` so any ``unsloth_zoo`` import there
+takes the lightweight path (no torch / transformers).
 """
 
 from __future__ import annotations
@@ -61,7 +62,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from unsloth_zoo.hf_cache_state import (
+from unsloth_zoo_downloads.hf_cache_state import (
     INCOMPLETE_SUFFIX,
     _ROOT_MODEL_SHARD_INDEX_RE,
     _ROOT_MODEL_VARIANT_WEIGHT_RE,
@@ -330,7 +331,7 @@ def _xet_health_or_none():
     download starting, so any failure degrades to "no opinion" and the Xet-first ladder runs.
     """
     try:
-        from .hf_xet_health import xet_health
+        from unsloth_zoo_downloads.hf_xet_health import xet_health
 
         return xet_health(probe = False)
     except Exception as e:
@@ -346,7 +347,7 @@ def _xet_log_dir() -> Optional[str]:
         # An empty value means "log to console"; a file path is not a directory we can scan.
         return dest if os.path.isdir(dest) else None
     try:
-        from .hf_cache import _active_caches
+        from unsloth_zoo_downloads.hf_cache import _active_caches
 
         _, _, xet_cache = _active_caches()
         return str(xet_cache / "logs") if xet_cache is not None else None
@@ -357,7 +358,7 @@ def _xet_log_dir() -> Optional[str]:
 def _xet_failure_reason(summary: str) -> str:
     """Attach hf_xet's own ERROR/WARN lines to *summary* so the recorded verdict says WHY."""
     try:
-        from .hf_xet_tuning import scan_xet_log
+        from unsloth_zoo_downloads.hf_xet_tuning import scan_xet_log
 
         # Scrubbed like any other child error: a reqwest failure Displays the full URL, and CAS/S3
         # reads use presigned URLs carrying an X-Amz-Signature. This reason is persisted to the
@@ -374,7 +375,7 @@ def _xet_failure_reason(summary: str) -> str:
 def _record_xet_outcome(ok: bool, reason: str = "") -> None:
     """Report a finished Xet attempt to the health tracker; never raises."""
     try:
-        from .hf_xet_health import record_xet_outcome
+        from unsloth_zoo_downloads.hf_xet_health import record_xet_outcome
 
         record_xet_outcome(ok, reason)
     except Exception as e:
@@ -2396,7 +2397,7 @@ def _download_child_entry(
         # Defensive: the parent already seeded these around the spawn, but a child launched by any
         # other path must not inherit hf_xet's unbounded multi-GB buffer defaults.
         try:
-            from unsloth_zoo.hf_xet_tuning import resize_for_cache_dir
+            from unsloth_zoo_downloads.hf_xet_tuning import resize_for_cache_dir
 
             # A supervised child, so the shortened Xet timeouts belong here: a failure surfaces to
             # the ladder instead of being retried for ~6 minutes. resize, not apply: our own
@@ -2535,7 +2536,7 @@ def _run_download_attempt(
             # hf_xet reads its config natively at import, so the buffer caps must be in the
             # environment BEFORE the child starts; setting them inside the child is too late.
             try:
-                from .hf_xet_tuning import resize_for_cache_dir
+                from unsloth_zoo_downloads.hf_xet_tuning import resize_for_cache_dir
 
                 # Decide against a COPY of the real environment so the child is tuned exactly the
                 # way this process was at import: setdefault semantics keep every explicit user

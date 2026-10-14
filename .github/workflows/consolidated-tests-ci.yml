@@ -455,6 +455,7 @@ jobs:
               tests/test_mlx_optimizer_torch_parity.py \
               tests/test_hf_xet_fallback.py \
               tests/test_hf_xet_fallback_blob_scoped_redownload.py \
+              tests/test_download_helpers_import_without_zoo_init.py \
               tests/test_llama_cpp_install_consent.py \
               tests/test_llama_cpp_consent_platforms.py \
               tests/test_converter_source_staging.py \
