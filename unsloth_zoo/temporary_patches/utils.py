@@ -1445,8 +1445,8 @@ def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
     compiled = _raw_torch_compile(fullgraph = fullgraph, dynamic = dynamic)(func)
     # Without fullgraph Dynamo already falls back by itself.
     if not fullgraph:
-        return compiled
-    return _fall_back_to_eager_on_recompile_limit(compiled, func, label)
+        return eager_under_zero3(func, compiled)
+    return eager_under_zero3(func, _fall_back_to_eager_on_recompile_limit(compiled, func, label))
 
 
 # Call sites that have already given up, by label. Outlives the wrappers, which
@@ -2197,6 +2197,34 @@ def unsloth_eager_decode():
         _EAGER_DECODE_STATE.active = previous
 
 
+_SYS_MODULES = __import__("sys").modules
+
+
+def zero3_partitioned_training():
+    """True while a DeepSpeed ZeRO-3 config is live. ZeRO-3 gathers a partitioned weight when eager
+    code reads it, but inside torch.compile the parameter getter hands back the empty placeholder
+    (deepspeed/runtime/zero/parameter_offload.py), so a compiled region reading a child module's
+    weight (the compiled LoRA forward reads lora_A.weight) sees shape (0,) (unsloth#225)."""
+    module = _SYS_MODULES.get("transformers.integrations.deepspeed")
+    ref = getattr(module, "_hf_deepspeed_config_weak_ref", None)
+    config = ref() if ref is not None else None
+    return config is not None and config.is_zero3()
+
+
+def eager_under_zero3(func, compiled):
+    """`compiled`, except under DeepSpeed ZeRO-3 where `func` runs. For the compile paths that
+    do not go through `_eager_during_decode`; carries the same markers. The answer is fixed for a
+    whole run, so a checkpointed pack and its recompute always take the same side."""
+    @functools.wraps(compiled)
+    def zero3_dispatch(*args, **kwargs):
+        if zero3_partitioned_training():
+            return func(*args, **kwargs)
+        return compiled(*args, **kwargs)
+    zero3_dispatch.__wrapped__ = func
+    zero3_dispatch._unsloth_compiled_func = compiled
+    return zero3_dispatch
+
+
 def _eager_during_decode(func, compiled):
     """`compiled`, except inside `unsloth_eager_decode()` where `func` runs directly. Carries
     the compiled markers so "is this compiled?" checks and `unwrap_already_compiled` behave
@@ -2204,7 +2232,7 @@ def _eager_during_decode(func, compiled):
     policy governs: a nested fullgraph region made accelerate >= 1.13's disabled hooks fatal."""
     @functools.wraps(compiled)
     def dispatch(*args, **kwargs):
-        if torch.compiler.is_compiling() or eager_decode_active():
+        if torch.compiler.is_compiling() or eager_decode_active() or zero3_partitioned_training():
             return func(*args, **kwargs)
         return compiled(*args, **kwargs)
     dispatch.__wrapped__ = func
@@ -2474,6 +2502,7 @@ def patch_function(
                     new_func, _eager_func,
                     f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}",
                 )
+            new_func = eager_under_zero3(_eager_func, new_func)
     pass
 
     # Stash original under a unique name for later restoration.
