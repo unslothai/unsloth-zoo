@@ -6146,9 +6146,6 @@ def _install_gemma4_compile_patches():
     from .utils import _SharedKVSlot
 
     def patched_make_masks(self, h, cache, mm_token_type_ids=None):
-        # Only generation caches keep upstream's masks.
-        if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
-            return original_make_masks(self, h, cache, mm_token_type_ids)
         masks = original_make_masks(self, h, cache, None)
         n = h.shape[1]
         if (
@@ -6157,6 +6154,14 @@ def _install_gemma4_compile_patches():
             or n <= 1
         ):
             return masks
+        if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
+            # Generation caches keep upstream's sliding masks (offsets, padding);
+            # upstream also overlays full attention, which the reference keeps causal.
+            overlaid = original_make_masks(self, h, cache, mm_token_type_ids)
+            return [
+                sliding if layer.layer_type == "sliding_attention" else mask
+                for layer, sliding, mask in zip(self.layers, overlaid, masks)
+            ]
         positions = mx.arange(n)
         in_window = mx.abs(positions[:, None] - positions[None]) < self.window_size
         sliding = in_window & self._apply_blockwise_bidirectional_overlay(
@@ -7181,7 +7186,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
         ),
         CompilePatternBundle(
             name="gemma4_vision_masks",
-            description="Gemma 4 vision attention masks for cache-free forwards, built as the reference does without a host read.",
+            description="Gemma 4 vision attention masks as the reference builds them (overlay on sliding layers only), without a host read in cache-free forwards.",
             matcher=lambda arch, report: arch == "gemma4",
             primitive_names=("presence_check_bypass",),
             runtime_primitive_names=("gemma4_vision_masks_runtime",),

@@ -3037,9 +3037,11 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
     assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
     prefix = KVCache()
     prefix.update_and_fetch(mx.zeros((2, 1, 3, 1)), mx.zeros((2, 1, 3, 1)))
-    for held in ([KVCache(), None], [prefix, None], [BatchKVCache([1, 0]), None]):
-        assert arrays(patched(stack("vision"), h, held, ids)) == arrays(
-            upstream(stack("vision"), h, held, ids))
+    for held in ([KVCache(), None], [prefix, None], [BatchKVCache([1, 0]), None],
+                 [BatchKVCache([1, 0]), BatchKVCache([0, 2])]):
+        sliding, _ = arrays(upstream(stack("vision"), h, held, ids))
+        _, full = arrays(upstream(stack("vision"), h, held, None))
+        assert arrays(patched(stack("vision"), h, held, ids)) == [sliding, full]
 
 
 def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
