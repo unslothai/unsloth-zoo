@@ -106,7 +106,6 @@ def test_rank4_lora_grouped_mm_compiles_fullgraph(rank):
 
 @pytest.mark.parametrize("rank", [1, 2, 4, 6])
 def test_pad_skipped_only_when_both_lora_gemms_take_triton(monkeypatch, rank):
-    """The Triton grouped GEMM masks any K / N, so the pad there is two copies for nothing."""
     first = torch.randn(3, 16, rank, dtype=torch.bfloat16)
     second = torch.randn(3, rank, 24, dtype=torch.bfloat16)
     x = torch.randn(5, 16, dtype=torch.bfloat16)
@@ -116,11 +115,9 @@ def test_pad_skipped_only_when_both_lora_gemms_take_triton(monkeypatch, rank):
     monkeypatch.setattr(mg, "triton_grouped_available", lambda device: True)
     pf, ps = M._pad_lora_rank_for_grouped_mm(first, second, x)
     assert pf is first and ps is second
-    # a Triton kernel that failed its self-check falls back to torch._grouped_mm: keep the pad
     monkeypatch.setattr(mg, "triton_grouped_available", lambda device: False)
     assert M._pad_lora_rank_for_grouped_mm(first, second, x)[0].shape[-1] == 8
     monkeypatch.setattr(mg, "triton_grouped_available", lambda device: True)
-    # no inputs = the caller cannot tell the route: keep the pad
     assert M._pad_lora_rank_for_grouped_mm(first, second)[0].shape[-1] == 8
     monkeypatch.setenv("UNSLOTH_MOE_LORA_PAD_ALWAYS", "1")
     assert M._pad_lora_rank_for_grouped_mm(first, second, x)[0].shape[-1] == 8
@@ -143,7 +140,7 @@ def test_pad_kept_above_the_lora_row_class(monkeypatch):
 @pytest.mark.parametrize("rank", [1, 2, 3, 4, 5, 6, 7, 12, 31])
 def test_unpadded_rank_on_triton_matches_fp32_reference(monkeypatch, dtype, rank):
     from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
-    monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "1")   # Triton on any sm80+ card
+    monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "1")
     if M._triton_grouped_mm_max_rows(torch.cuda.current_device(), "lora") == 0 \
             or not mg.triton_grouped_available(torch.device("cuda")):
         pytest.skip("Triton grouped GEMM unavailable")
@@ -170,7 +167,6 @@ def test_unpadded_rank_on_triton_matches_fp32_reference(monkeypatch, dtype, rank
 
 
 def test_every_pad_call_site_passes_the_gemm_input():
-    """Without the input the pad cannot see the Triton route and always copies."""
     import ast
     import inspect
     from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML

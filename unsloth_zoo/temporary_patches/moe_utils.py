@@ -2319,20 +2319,18 @@ def native_moe_grouped_mm(
 
 
 def _lora_rank_pad_needed(inputs, first_weight) -> bool:
-    """False when both LoRA GEMMs take the Triton grouped GEMM, which masks any K / N and has
-    no 16-byte stride rule: there the pad only adds two copies and two grad slices. Both
-    GEMMs have min(K, N) = rank, so rank <= 32 puts them in the same "lora" row class.
-    UNSLOTH_MOE_LORA_PAD_ALWAYS=1 restores the unconditional pad."""
+    """False when both LoRA GEMMs take Triton (masks any K / N, no 16-byte stride rule).
+    rank <= 32 keeps both GEMMs (min(K, N) = rank) in the same "lora" row class."""
     if inputs is None or first_weight.shape[-1] > 32:
         return True
     if os.environ.get("UNSLOTH_MOE_LORA_PAD_ALWAYS", "0") == "1":
         return True
     if not _triton_grouped_mm_wanted(inputs, first_weight):
         return True
-    # A Triton kernel that failed its self-check falls back to torch._grouped_mm, which needs the pad.
+    # A failed self-check falls back to torch._grouped_mm, which needs the pad.
     from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
     if torch.compiler.is_compiling():
-        # Never run the self-check while tracing: skip the pad only once it has passed.
+        # Never run the self-check while tracing; skip the pad only if it already passed.
         return not (mg._GENERIC_DISABLED_REASON is None and mg._GENERIC_SELF_CHECKED.get(inputs.device.index) is True)
     return not mg.triton_grouped_available(inputs.device)
 
@@ -2341,7 +2339,7 @@ def _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inputs = None):
     """Zero-pad the LoRA rank of (E, in, R) / (E, R, out) so torch._grouped_mm gets 16-byte
     aligned rows (bf16 rank 4 or 6 fell back to the per-expert loop, and aborted compile).
     Zero columns meet zero rows, so the product is exact. Minimum 8 even for fp32: autocast
-    lowers grouped_mm operands to bf16. Given `inputs`, skipped when the Triton path runs."""
+    lowers grouped_mm operands to bf16."""
     align = max(8, 16 // first_weight.element_size())
     rank = first_weight.shape[-1]
     pad = (-rank) % align
