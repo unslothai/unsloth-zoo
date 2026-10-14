@@ -3639,6 +3639,12 @@ _LFM2_PROJECTOR_INIT_TOKEN_SHA256 = (
 _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
     "4405529c372e5bc69cf782c1038b674b55b46434e9a515d9db46a2a92e0414fa"
 )
+_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256 = (
+    "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576"
+)
+_MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256 = (
+    "f995c993dd959cc55a43f70f8f87c115d18833179e464426d63153022f4770ec"
+)
 _GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 = (
     "e859b50eb966089f8966a38ca2e69c3b68ccf48c5b4a264fbc01f415be60003f"
 )
@@ -4073,6 +4079,81 @@ def _ensure_minicpmo_vision_dtype(model_type: str) -> None:
     adapted = _minicpmo_vision_dtype_adapter(cls.get_vision_embedding)
     if adapted is not cls.get_vision_embedding:
         cls.get_vision_embedding = adapted
+
+
+def _minicpmv4_7_text_positions_adapter(cls):
+    """Lay out MiniCPM-V 4.7 positions on device for a training batch without visuals.
+
+    The installed method builds canvas M-RoPE positions on the host for every
+    batch, which mx.compile cannot trace. Without visual input the canvas holds
+    only text, where each attended token's position is its rank among them.
+    """
+
+    original = cls.__dict__.get("get_input_embeddings")
+    rope = getattr(sys.modules.get(cls.__module__), "CanvasRoPE", None)
+    if (
+        getattr(original, "_unsloth_minicpmv4_7_text_positions", False)
+        or _source_token_sha256(_safe_getsource(original))
+        != _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
+        or _source_token_sha256(_safe_getsource(getattr(rope, "get_rope_index", None)))
+        != _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256
+    ):
+        return original
+    import mlx.core as mx
+
+    features_cls = original.__globals__["InputEmbeddingsFeatures"]
+
+    @wraps(original)
+    def patched(self, input_ids, pixel_values=None, **kwargs):
+        mask = kwargs.get("attention_mask", kwargs.get("mask"))
+        if (
+            not getattr(self, "training", False)
+            or pixel_values is not None
+            or kwargs.get("cached_image_features") is not None
+            or kwargs.get("tgt_sizes") is not None
+            or kwargs.get("downsample_mode", self.config.downsample_mode)
+            not in ("4x", "16x")
+            or not isinstance(input_ids, mx.array)
+            or input_ids.ndim != 2
+            or mask is not None
+            and (not isinstance(mask, mx.array) or mask.shape != input_ids.shape)
+        ):
+            return original(self, input_ids, pixel_values, **kwargs)
+        # A traced step cannot read token values, so a literal visual placeholder in a text row trains as a token.
+        embeddings = super(cls, self).get_input_embeddings(
+            input_ids, pixel_values=None, **kwargs
+        )
+        batch, width = input_ids.shape
+        if mask is None:
+            positions = mx.arange(width, dtype=mx.int32)
+        else:
+            valid = mask.astype(mx.bool_)
+            positions = mx.where(
+                valid, mx.cumsum(valid.astype(mx.int32), axis=-1) - 1, 0
+            )
+        positions = mx.broadcast_to(positions, (3, batch, width))
+        deltas = positions.max(axis=(0, 2))[:, None] + 1 - width
+        self.language_model._position_ids = positions
+        self.language_model._rope_deltas = deltas
+        return features_cls(
+            inputs_embeds=embeddings.inputs_embeds,
+            position_ids=positions,
+            rope_deltas=deltas,
+        )
+
+    patched._unsloth_minicpmv4_7_text_positions = True
+    return patched
+
+
+def _ensure_minicpmv4_7_text_positions(model_type: str) -> None:
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if (
+        cls is None
+        or cls.__module__ != "mlx_vlm.models.minicpmv4_7.minicpmv4_7"
+        or "get_input_embeddings" not in cls.__dict__
+    ):
+        return
+    cls.get_input_embeddings = _minicpmv4_7_text_positions_adapter(cls)
 
 
 def _lookup_module_array(root, dotted_key):
@@ -9410,6 +9491,7 @@ class FastMLXModel:
             _ensure_xing4_0_sliced_hyper_connection_base(model_type)
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
+            _ensure_minicpmv4_7_text_positions(model_type)
             _ensure_audio_conv_sanitize(model_type)
             _ensure_qwen3_omni_audio_per_clip(model_type)
             _ensure_native_vlm_weight_names(model_type)
