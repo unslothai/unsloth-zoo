@@ -3351,6 +3351,30 @@ _OUT_OF_MEMORY_MARKERS = (
 )
 
 
+# vLLM ReplaySSM (vllm-project/vllm#48018): Mamba2 decode reads a checkpointed
+# state plus the last few tokens' inputs and writes the state back once per
+# window instead of every token. Opt-in with UNSLOTH_VLLM_REPLAYSSM=1; vLLM only
+# accepts it for architectures that declare SupportsReplaySSM.
+_REPLAYSSM_MODEL_TYPES = ("nemotron_h",)
+
+
+def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
+    # None when ReplaySSM should be requested, else why it is not.
+    model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+    if model_type not in _REPLAYSSM_MODEL_TYPES:
+        return f"model type {model_type!r} has no ReplaySSM support in vLLM"
+    if device_type != "cuda":
+        return f"ReplaySSM is CUDA only, this is {device_type}"
+    if "use_replayssm" not in engine_arg_keys:
+        return "this vLLM has no `use_replayssm` engine arg"
+    return None
+
+
+def _is_vllm_replayssm_refusal(error_text):
+    # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2).
+    return "replayssm" in str(error_text).lower()
+
+
 def _is_memory_profiling_race_error(error_text):
     # Another process on a shared GPU freed memory mid-profile. Transient, and
     # retryable by repeating the identical load.
@@ -4301,6 +4325,23 @@ def load_vllm(
                 _UNSLOTH_FLASHINFER_UNUSABLE = False
             return engine_args
 
+        # Only for engines built here: return_args callers (e.g. `vllm serve`) start
+        # their own process without the runner setting below.
+        replayssm_set_runner = False
+        if os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "0") == "1":
+            replayssm_skip = _vllm_replayssm_skip_reason(config, good_keys, DEVICE_TYPE)
+            if replayssm_skip is None:
+                engine_args["use_replayssm"] = True
+                print("Unsloth: vLLM ReplaySSM decode enabled (UNSLOTH_VLLM_REPLAYSSM=1).")
+                # vLLM 0.31's Triton ReplaySSM path only runs on Model Runner V1, no longer
+                # the CUDA default. Left set: vLLM caches env reads once the engine is up.
+                if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
+                    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+                    replayssm_set_runner = True
+            else:
+                print(f"Unsloth: UNSLOTH_VLLM_REPLAYSSM=1 ignored: {replayssm_skip}.")
+        pass
+
         # Keep trying until success (2 times)
         trials = 0
         race_trials = 0
@@ -4329,6 +4370,13 @@ def load_vllm(
                 # reported it as an OOM and sent users to fixes that cannot work.
                 if _is_expandable_segments_error(error):
                     raise RuntimeError(_expandable_segments_standby_message(error))
+                # Config validation, before any allocation: load once more without it.
+                if engine_args.get("use_replayssm") and _is_vllm_replayssm_refusal(error):
+                    engine_args.pop("use_replayssm")
+                    if replayssm_set_runner:
+                        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                    print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
+                    continue
                 # A transient race: retry the *identical* load rather than fall
                 # through to the generic "memory" branch below, which would shrink
                 # gpu_memory_utilization and max_num_seqs for the rest of the run
