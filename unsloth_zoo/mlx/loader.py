@@ -3593,14 +3593,17 @@ def _fix_full_finetune_modality_weights(model) -> None:
 
     # The copies keep the checkpoint's dtype; the decoder they are written over may since have been cast to the requested one.
     current = dict(tree_flatten(model.parameters()))
-    for name in ("_base_weights", "_vision_lora_a", "_vision_lora_b", "_speech_lora_a", "_speech_lora_b"):
-        table = getattr(model, name, None) or {}
+    tables = [getattr(model, name, None) or {} for name in ("_base_weights", "_vision_lora_a", "_vision_lora_b", "_speech_lora_a", "_speech_lora_b")]
+    for table in tables:
         for key, value in table.items():
             if key in current and mx.issubdtype(current[key].dtype, mx.floating) and value.dtype != current[key].dtype:
                 table[key] = value.astype(current[key].dtype)
     if getattr(model, "_unsloth_full_finetuning", False):
         model.apply_both_loras()
         model._base_weights = {}
+    else:
+        # Lazy on this thread's stream, which a model served from another thread cannot evaluate.
+        mx.eval([value for table in tables for value in table.values()])
 
 
 def _freeze_outside_language_model(model) -> None:

@@ -3969,6 +3969,42 @@ def test_phi4mm_weight_swaps_keep_the_requested_dtype(full_finetuning):
     assert model.layers[0].weight.dtype == mx.float32
 
 
+def test_phi4mm_weight_swaps_run_on_a_thread_other_than_the_loader():
+    import threading
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_speech_lora, apply_base_weights = phi4mm.set_modality, phi4mm.apply_speech_lora, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.layers = [nn.Linear(2, 2, bias=False)]
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    key = "layers.0.weight"
+
+    def load():
+        # The tables a checkpoint load leaves lazy on the loading thread's stream.
+        model.layers[0].weight = mx.ones((2, 2), dtype=mx.float32)
+        model._base_weights = {key: mx.ones((2, 2), dtype=mx.bfloat16) * 1}
+        model._speech_lora_a, model._speech_lora_b = {key: mx.ones((1, 2), dtype=mx.bfloat16) * 1}, {key: mx.ones((2, 1), dtype=mx.bfloat16) * 1}
+        model._speech_lora_scale, model._active_lora = 1.0, "vision"
+        _finish_load(model, None)
+
+    loader = threading.Thread(target=load)
+    loader.start()
+    loader.join()
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert model.layers[0](mx.ones((1, 2))).tolist() == [[2.0, 2.0]]
+    model.set_modality(has_audio=True)
+    assert model.layers[0](mx.ones((1, 2))).tolist() == [[4.0, 4.0]]
+
+
 def test_phi4mm_keeps_a_merged_decision_adapter_across_its_weight_swaps(tmp_path):
     import json
 
