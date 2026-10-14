@@ -99,9 +99,11 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
     try:
         key = (S, w, mask._version)
     except RuntimeError:
-        key = None  # inference tensors have no version: always recheck
+        # Inference tensors have no version counter: keyed by (S, w) only, else
+        # every sliding layer re-scans the shared mask during prefill.
+        key = (S, w, None)
     cached = getattr(mask, "_unsloth_plain_band", None)
-    if key is not None and cached is not None and cached[0] == key:
+    if cached is not None and cached[0] == key:
         return cached[1]
     # Reject per-head masks (shape[1] > 1): a single block mask / window is
     # applied to every head, so a distinct per-head mask cannot be honoured.
@@ -129,11 +131,10 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
             if not bool(match.all().item()):
                 ok = False
                 break
-    if key is not None:
-        try:
-            mask._unsloth_plain_band = (key, ok)
-        except Exception:
-            pass
+    try:
+        mask._unsloth_plain_band = (key, ok)
+    except Exception:
+        pass
     return ok
 
 

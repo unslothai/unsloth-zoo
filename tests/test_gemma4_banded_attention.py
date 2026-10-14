@@ -223,13 +223,16 @@ def test_mask_is_plain_band_rechecks_other_window():
     assert not _mask_is_plain_band(mask, S, 16)
 
 
-def test_mask_is_plain_band_inference_tensor_not_stale():
+def test_mask_is_plain_band_inference_tensor_cached_per_window(monkeypatch):
+    # No version counter: one scan per (S, w), not one per sliding layer.
     S, w = 128, 32
     with torch.inference_mode():
         mask = _band_mask_full(S, w)[None, None].clone()
         assert _mask_is_plain_band(mask, S, w)
-        mask[..., 64:, 40:64] = False
-        assert not _mask_is_plain_band(mask, S, w)
+        monkeypatch.setattr(torch, "arange", lambda *a, **k: pytest.fail("rescanned"))
+        assert _mask_is_plain_band(mask, S, w)
+        monkeypatch.undo()
+        assert not _mask_is_plain_band(mask, S, 16)
 
 
 class Gemma4SlidingFake:
