@@ -342,8 +342,9 @@ jobs:
         # so a 3.10-only `match` and a module-level `str | Path` both reached main and
         # made the package un-importable on 3.9. It reads the floor from pyproject, so
         # raising requires-python relaxes it rather than making it lie.
-        # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
-        # nothing else; collect-only would let the packaging config regress.
+        # test_wheel_top_level_packages pins that discovery ships unsloth_zoo,
+        # unsloth_zoo_downloads and nothing else; collect-only would let the
+        # packaging config regress.
         # test_safe_serialization_none pins that `safe_serialization = None` means the
         # safetensors default rather than a pickle, and carries a drift gate over the whole
         # package for any future save entry point that forwards the argument unnormalised.

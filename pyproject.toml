@@ -100,7 +100,7 @@ unsloth_zoo = ["diffusion_studio/*.html"]
 # site-packages, where they collide with every other wheel using those names.
 # Dotted rather than "unsloth_zoo*", which also matches a sibling like
 # unsloth_zoo_cache/ and would ship it as another top-level package.
-include = ["unsloth_zoo", "unsloth_zoo.*", "unsloth_zoo_downloads"]
+include = ["unsloth_zoo", "unsloth_zoo.*", "unsloth_zoo_downloads", "unsloth_zoo_downloads.*"]
 exclude = ["images*", "tests*", "scripts*"]
 
 [project.optional-dependencies]

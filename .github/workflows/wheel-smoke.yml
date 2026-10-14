@@ -141,6 +141,12 @@ jobs:
           ")
           echo "installed unsloth_zoo version: $WHEEL_VERSION"
           test -n "$WHEEL_VERSION" && test "$WHEEL_VERSION" != "0.0.0"
+          /tmp/v/bin/python -c "
+          import sys
+          import unsloth_zoo_downloads.hf_xet_fallback
+          import unsloth_zoo_downloads.hf_xet_health
+          assert 'unsloth_zoo' not in sys.modules, 'the light package ran the heavy init'
+          "
 
       - name: Upload wheel on failure
         if: failure()

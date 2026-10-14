@@ -94,19 +94,49 @@ def test_the_old_file_still_serves_a_loader_that_executes_it_by_path():
     assert "unsloth_zoo._early_hf_cache" not in sys.modules
 
 
+def _package_init_statements():
+    tree = ast.parse((REPO_ROOT / "unsloth_zoo" / "__init__.py").read_text(encoding = "utf-8"))
+    pending = list(tree.body)
+    while pending:
+        node = pending.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            pending.extend(getattr(node, field, None) or [])
+
+
+def _imports_a_package(node, stdlib) -> bool:
+    if isinstance(node, ast.ImportFrom):
+        return node.level > 0 or (node.module or "").split(".")[0] not in stdlib
+    if isinstance(node, ast.Import):
+        return any(alias.name.split(".")[0] not in stdlib for alias in node.names)
+    return False
+
+
 def test_the_package_init_registers_the_old_names_before_anything_heavy():
     """A late failure of unsloth_zoo/__init__ must still leave unsloth_zoo.hf_cache and
     unsloth_zoo.hf_xet_tuning in sys.modules: Unsloth's backend and unsloth.dataset_num_proc read
     them from there when the package itself cannot import."""
-    tree = ast.parse((REPO_ROOT / "unsloth_zoo" / "__init__.py").read_text(encoding = "utf-8"))
-    relative = sorted(
-        node.module
-        for node in ast.walk(tree)
+    stdlib = getattr(sys, "stdlib_module_names", None)
+    if stdlib is None:
+        pytest.skip("needs sys.stdlib_module_names (Python 3.10+)")
+    statements = list(_package_init_statements())
+    registering = [
+        node.lineno
+        for node in statements
         if isinstance(node, ast.ImportFrom)
         and node.level == 1
         and node.module in {"hf_cache", "hf_xet_tuning"}
-    )
-    assert relative == ["hf_cache", "hf_xet_tuning"]
+    ]
+    assert len(registering) == 2
+    later = [
+        node.lineno
+        for node in statements
+        if (isinstance(node, ast.Raise) or _imports_a_package(node, stdlib))
+        and node.lineno not in registering
+    ]
+    assert later and max(registering) < min(later)
 
 
 def test_the_fallback_file_runs_as_the_spawn_childs_main_module():

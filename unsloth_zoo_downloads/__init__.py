@@ -22,6 +22,6 @@ is stdlib-only at import time, so a backend can take the Xet health verdict, the
 buffer caps and the stall watchdog without that init, and so can the download child it spawns.
 The ``unsloth_zoo.<module>`` names stay importable and resolve to these same module objects.
 Importing from here also skips the init's environment steps (the read-only cache redirect,
-``apply_xet_env``, the offline and stable-download flags), so a process that never imports
-``unsloth_zoo`` applies the ones it needs itself.
+``apply_xet_env``, the offline and stable-download flags, the hf_transfer default), so a
+process that never imports ``unsloth_zoo`` applies the ones it needs itself.
 """
