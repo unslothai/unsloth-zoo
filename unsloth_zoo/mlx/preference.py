@@ -388,7 +388,7 @@ def _is_messages(value):
         and all(
             isinstance(message, Mapping)
             and "role" in message
-            and "content" in message
+            and ("content" in message or "tool_calls" in message)
             for message in value
         )
     )
@@ -470,9 +470,13 @@ def _append_to_assistant(prompt, completion):
     return merged
 
 
-def _render_completions(tokenizer, row, names, *, extracted=False, is_vlm=False):
+def _render_completions(
+    tokenizer, row, names, *, extracted=False, is_vlm=False, trl_vision=False,
+):
     """Render the prompt and, per completion field in ``names``, the prompt
-    followed by that completion."""
+    followed by that completion. ``trl_vision`` follows TRL 1.13's vision
+    collators: a tool turn may end the prompt, and a completion never joins
+    an assistant turn that ends it."""
     prompt = row["prompt"]
     completions = [row[name] for name in names]
     fields = ("prompt", *names)
@@ -516,7 +520,7 @@ def _render_completions(tokenizer, row, names, *, extracted=False, is_vlm=False)
     role = prompt[-1].get("role")
     if role == "assistant":
         prompt_text = render(prompt, continue_final_message=True)
-        if not extracted and _continues_assistant(*completions):
+        if not (extracted or trl_vision) and _continues_assistant(*completions):
             # The completions finish this partial turn, so they join its message.
             conversations = [
                 _append_to_assistant(prompt, completion)
@@ -525,13 +529,13 @@ def _render_completions(tokenizer, row, names, *, extracted=False, is_vlm=False)
         else:
             # A whole turn instead, so its closing marker falls to the response.
             conversations = [prompt + completion for completion in completions]
-    elif role == "user":
+    elif role == "user" or (trl_vision and role == "tool"):
         prompt_text = render(prompt, add_generation_prompt=True)
         conversations = [prompt + completion for completion in completions]
     else:
         raise ValueError(
             "Unsloth MLX preference: a conversational prompt must end with a "
-            "user or assistant message."
+            f"user{', tool,' if trl_vision else ''} or assistant message."
         )
     return prompt_text, [
         render(messages, add_generation_prompt=False) for messages in conversations
@@ -825,9 +829,11 @@ def _vision_prompt_images(row, image_size):
         item.get(key) is not None and (not isinstance(item[key], list) or item[key])
         for key in keys
     )
+    completions = [key for key in ("chosen", "rejected", "completion") if key in row]
+    fields = ("prompt", *completions)
     if (
         filled(row, "audio", "audios")
-        or any(_media_in(row[key], "audio") for key in ("prompt", "chosen", "rejected"))
+        or any(_media_in(row[key], "audio") for key in fields)
     ):
         raise ValueError(
             "Unsloth MLX preference: audio rows are not supported for preference "
@@ -836,7 +842,7 @@ def _vision_prompt_images(row, image_size):
     if filled(row, *_VIDEO_KEYS) or any(
         isinstance(part, dict)
         and (part.get("type") in _VIDEO_KEYS or filled(part, *_VIDEO_KEYS))
-        for key in ("prompt", "chosen", "rejected") if _is_messages(row[key])
+        for key in fields if _is_messages(row[key])
         for message in _normalize_mlx_messages(row[key], is_vlm=True)
         if isinstance(message.get("content"), list)
         for part in message["content"]
@@ -845,11 +851,11 @@ def _vision_prompt_images(row, image_size):
             "Unsloth MLX preference: video rows are not supported for preference "
             "training."
         )
-    if any(_media_in(row[key], "image") for key in ("chosen", "rejected")):
+    if any(_media_in(row[key], "image") for key in completions):
         raise ValueError(
             "Unsloth MLX preference: images belong to the prompt. TRL tokenizes "
-            "chosen and rejected as plain text, so an image in a completion "
-            "would never reach the model."
+            "completions as plain text, so an image in one would never reach "
+            "the model."
         )
     prompt = row["prompt"]
     messages = (
@@ -857,8 +863,7 @@ def _vision_prompt_images(row, image_size):
     )
     images = tuple(_extract_vlm_images(row, messages, image_size))
     if not images and (
-        filled(row, *_IMAGE_KEYS)
-        or _row_has_images([row[key] for key in ("prompt", "chosen", "rejected")])
+        filled(row, *_IMAGE_KEYS) or _row_has_images([row[key] for key in fields])
     ):
         raise ValueError(
             "Unsloth MLX preference: this row carries an image its prompt does not "
@@ -956,15 +961,15 @@ def tokenize_vision_preference_row(
     )
 
 
-def _repeated_for_both_branches(value):
-    """Chosen rows then rejected rows share the images, as TRL concatenates them."""
+def _repeated_per_branch(value, branches):
+    """Every branch's rows share the images, as TRL concatenates chosen and rejected."""
     if isinstance(value, mx.array):
-        return mx.concatenate([value, value]) if value.ndim else value
+        return mx.concatenate([value] * branches) if value.ndim else value
     if hasattr(value, "shape"):
         value = np.asarray(value)
-        return np.concatenate([value, value]) if value.ndim else value
+        return np.concatenate([value] * branches) if value.ndim else value
     if isinstance(value, (list, tuple)):
-        return [*value, *value]
+        return list(value) * branches
     return value
 
 
@@ -976,19 +981,20 @@ _VLM_TOKEN_SPAN_KEYS = ("image_bound", "audio_bounds")
 _PIXEL_COMPONENT_MODEL_TYPES = ("deepseekocr", "deepseekocr_2")
 
 
-def _vision_batch(processor, model_config, rows, ids, lengths, *, same_pixels=False):
-    """A vision batch dict for packed rows: chosen rows first, then rejected."""
-    pairs = len(rows)
+def _vision_batch(
+    processor, model_config, rows, prompt_arrays, ids, lengths, *, same_pixels=False,
+):
+    """A vision batch dict for packed rows, each branch's rows in turn; ``prompt_arrays``
+    holds each row's prompt arrays per branch."""
+    branches = len(prompt_arrays[0])
     width = ids.shape[1]
     inputs = {
         "input_ids": ids,
         "attention_mask": (np.arange(width)[None, :] < lengths[:, 1:]).astype(np.int32),
     }
-    for offset, row in enumerate(rows):
-        for output_row, arrays in (
-            (offset, row.chosen_prompt_arrays),
-            (offset + pairs, row.rejected_prompt_arrays),
-        ):
+    for offset, branch_arrays in enumerate(prompt_arrays):
+        for branch, arrays in enumerate(branch_arrays):
+            output_row = offset + branch * len(rows)
             for name, values in arrays:
                 if name not in inputs:
                     inputs[name] = np.zeros(ids.shape, dtype=np.int32)
@@ -1041,9 +1047,9 @@ def _vision_batch(processor, model_config, rows, ids, lengths, *, same_pixels=Fa
                 key in ("images", "pixel_values") and isinstance(value, (list, tuple))
                 and model_type in _PIXEL_COMPONENT_MODEL_TYPES
             ):
-                inputs[key] = [_repeated_for_both_branches(part) for part in value]
+                inputs[key] = [_repeated_per_branch(part, branches) for part in value]
             else:
-                inputs[key] = _repeated_for_both_branches(value)
+                inputs[key] = _repeated_per_branch(value, branches)
     batch = _to_mx_vlm_batch(inputs)
     batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
     batch = _prepare_vlm_batch_for_compile(batch, model_config)
@@ -1252,10 +1258,10 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         return mx.array(batch)
 
 
-class FiniteVisionPreferenceBatchPlan(FinitePreferenceBatchPlan):
-    """Preference plan whose batches carry the processor's vision inputs."""
+class VisionPreferenceBatches:
+    """Vision inputs for a preference plan's batches; a mixin, as those plans declare slots."""
 
-    __slots__ = ("_processor", "_model_config", "_families", "_event_widths")
+    __slots__ = ()
 
     def __init__(self, rows, schedule, *, processor, model_config, **kwargs):
         super().__init__(rows, schedule, **kwargs)
@@ -1263,9 +1269,13 @@ class FiniteVisionPreferenceBatchPlan(FinitePreferenceBatchPlan):
         self._model_config = model_config
         self._families = self._event_widths = None
 
+    def _prompt_arrays(self, row):
+        return row.chosen_prompt_arrays, row.rejected_prompt_arrays
+
     def _inputs(self, rows, batch, lengths, *, reference=False):
         return _vision_batch(
-            self._processor, self._model_config, rows, batch, lengths,
+            self._processor, self._model_config, rows,
+            [self._prompt_arrays(row) for row in rows], batch, lengths,
             same_pixels=reference or self._reference is not None,
         )
 
@@ -1325,6 +1335,15 @@ class FiniteVisionPreferenceBatchPlan(FinitePreferenceBatchPlan):
                     "train this pipeline with compile disabled."
                 )
         return materialized
+
+
+_VISION_PLAN_SLOTS = ("_processor", "_model_config", "_families", "_event_widths")
+
+
+class FiniteVisionPreferenceBatchPlan(VisionPreferenceBatches, FinitePreferenceBatchPlan):
+    """Preference plan whose batches carry the processor's vision inputs."""
+
+    __slots__ = _VISION_PLAN_SLOTS
 
 
 def precompute_reference_logps(plan, model, reference_policy, *, batch_size, scorer=None):
@@ -1396,21 +1415,20 @@ def _reads_rows_by_index(dataset):
     ) and dataset.format["type"] != "custom"
 
 
-def _dataset_image_reader(dataset, formatting_func, image_size):
-    """``index -> that row's prompt images``, read from ``dataset`` again, or None.
+def _dataset_image_reader(dataset, formatting_func, row_images):
+    """``index -> row_images(dataset[index])``, reading the row again, or None.
 
     Only rows straight from Hugging Face's decoding are read again: a
     formatting_func, like a transform, may return images the caller owns.
     """
     if formatting_func is not None or not _reads_rows_by_index(dataset):
         return None
+    return lambda index: row_images(dataset[index])
 
-    def read(index):
-        row = dataset[index]
-        _require_preference_fields(row)
-        return _vision_prompt_images(_maybe_extract_prompt(row)[0], image_size)
 
-    return read
+def _preference_row_images(row, image_size):
+    _require_preference_fields(row)
+    return _vision_prompt_images(_maybe_extract_prompt(row)[0], image_size)
 
 
 def create_preference_batch_plan(
@@ -1450,7 +1468,8 @@ def create_preference_batch_plan(
             processor, _get_vlm_ignore_token_ids(processor, model_config),
         ))
         image_reader = _dataset_image_reader(
-            *(images_from or (dataset, formatting_func)), image_size,
+            *(images_from or (dataset, formatting_func)),
+            partial(_preference_row_images, image_size=image_size),
         )
     rows = []
     for index, raw in enumerate(dataset):
@@ -1563,6 +1582,15 @@ class TokenizedKTORow:
         return self.kl_prompt_ids + self.kl_completion_ids
 
 
+@dataclass(frozen=True)
+class VisionKTORow(TokenizedKTORow):
+    """A KTO row for a vision-language model; its KL pair shares its prompt and images."""
+
+    prompt_text: str = ""
+    images: object = ()
+    prompt_arrays: tuple = ()
+
+
 # TRL unpairs through datasets.map(batched=True) at its default batch size, so
 # each block of pairs yields its chosen rows, then its rejected rows.
 _UNPAIR_BLOCK = 1000
@@ -1630,10 +1658,11 @@ def _unpaired_kto_rows(dataset, formatting_func):
     yield from unpair()
 
 
-def _encode_kto_row(tokenizer, row, *, extracted):
+def _encode_kto_row(tokenizer, row, *, extracted, processor=None):
     """TRL KTO's _tokenize: returns the rendered prompt, prompt ids, answer ids."""
     prompt_text, (full_text,) = _render_completions(
-        tokenizer, row, ("completion",), extracted=extracted,
+        processor or tokenizer, row, ("completion",), extracted=extracted,
+        is_vlm=processor is not None,
     )
     prompt_ids, full_ids = (
         [int(x) for x in encode_mlx_text(tokenizer, text, add_special_tokens=False)]
@@ -1643,6 +1672,82 @@ def _encode_kto_row(tokenizer, row, *, extracted):
         prompt_ids, full_ids, step_back=True,
     )
     return prompt_text, full_ids[:boundary], full_ids[boundary:]
+
+
+def _with_trl_image_parts(row):
+    """TRL's vision KTO collator: `image` becomes `images`, and through
+    prepare_multimodal_messages every string content becomes a text part, a prompt
+    placing none of the images getting one image part each ahead of its first
+    user turn's text."""
+    if "image" in row:
+        image = row["image"]
+        row = {key: value for key, value in row.items() if key != "image"}
+        row["images"] = [] if image is None else image if isinstance(image, list) else [image]
+    images = row.get("images")
+    count = len(images) if isinstance(images, (list, tuple)) else int(images is not None)
+
+    def structured(messages, count):
+        placed, out = False, []
+        for message in messages:
+            if isinstance(message.get("content"), str):
+                content = [{"type": "text", "text": message["content"]}]
+                if message.get("role") == "user" and not placed:
+                    content[:0], placed = [{"type": "image"} for _ in range(count)], True
+                message = {**message, "content": content}
+            out.append(message)
+        return out
+
+    row = dict(row)
+    for key, places in (("prompt", count), ("completion", 0)):
+        if _is_messages(row.get(key)):
+            places = 0 if _media_in(row[key], "image") else places
+            row[key] = structured(row[key], places)
+    return row
+
+
+def _kto_row_images(row, image_size):
+    if "chosen" in row or "rejected" in row:
+        row = _maybe_extract_prompt(row)[0]
+    return _vision_prompt_images(_with_trl_image_parts(row), image_size)
+
+
+def _encode_vision_kto_row(processor, row, *, extracted, image_size, image_reader):
+    """TRL's vision KTO collator: the prompt through the processor with its
+    images, the completion as plain text, neither adding special tokens."""
+    tokenizer = _get_processor_tokenizer(processor)
+    row = _with_trl_image_parts(row)
+    images = _vision_prompt_images(row, image_size)
+    prompt_text, (full_text,) = _render_completions(
+        processor, row, ("completion",), extracted=extracted, is_vlm=True, trl_vision=True,
+    )
+    prompt_text = _shared_prefix(prompt_text, full_text)
+
+    def encode(text):
+        return tuple(
+            int(token)
+            for token in encode_mlx_text(tokenizer, text, add_special_tokens=False)
+        )
+
+    completion_ids = encode(full_text[len(prompt_text):])
+    if not images:
+        return prompt_text, encode(prompt_text), completion_ids, (), ()
+    inputs = _processor_vlm_inputs(
+        processor, [prompt_text], [list(images)], None,
+        truncation=False, padding_side="right",
+    )
+    ids = _as_numpy_vlm_field(inputs, "input_ids")
+    arrays = _vlm_token_aligned_sidecars(inputs, ids.shape)
+    return (
+        prompt_text, tuple(int(token) for token in ids[0]), completion_ids,
+        PromptImages(
+            image_reader or partial(tuple, images), len(images),
+            (_prompt_ids(inputs) or [None])[0], _pixel_digest(images),
+        ),
+        tuple(
+            (name, tuple(int(value) for value in values[0]))
+            for name, values in arrays.items()
+        ),
+    )
 
 
 def _truncate_kto(prompt_ids, answer_ids, policy, *, bos_id, eos_id):
@@ -1699,6 +1804,10 @@ def create_kto_batch_plan(
     dataset_order="default",
     preserve_dataset_order=False,
     seed=None,
+    processor=None,
+    model_config=None,
+    image_size=None,
+    images_from=None,
 ):
     """Build a finite KTO plan over TRL's unpaired rows, visited in dataset order.
     ``dataset_order="torch_randperm"`` reorders whole batches each epoch, keeping
@@ -1707,7 +1816,19 @@ def create_kto_batch_plan(
     Each row's KL pair joins its prompt to the previous row's completion within
     ``kl_batch_size`` chunks (TRL's per_device_train_batch_size, for evaluation
     too). ``prompt_sink`` receives each undesirable row's rendered prompt.
+
+    A ``processor`` builds a vision plan. If the first row, which decides as in
+    TRL, has an ``image`` or ``images`` field or prompt images, every row follows
+    TRL's vision collator: no special tokens added, the whole sequence cut at
+    max_length, KL pairs within each batch, ``images_from`` as for
+    ``create_preference_batch_plan``. Otherwise rows tokenize as on a text model.
     """
+    if processor is not None:
+        tokenizer = _get_processor_tokenizer(processor)
+        image_reader = _dataset_image_reader(
+            *(images_from or (dataset, formatting_func)),
+            partial(_kto_row_images, image_size=image_size),
+        )
     bos_id = getattr(tokenizer, "bos_token_id", None)
     bos_id = None if bos_id is None else int(bos_id)
     eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
@@ -1720,21 +1841,45 @@ def create_kto_batch_plan(
             f"{carry} special token(s) a row can carry past it; resolve the "
             "length policy with this tokenizer and append_eos."
         )
+    vision = None
+    max_length = length_policy.max_length
     tokenized = []
     for index, row, extracted in _unpaired_kto_rows(dataset, formatting_func):
+        fields = {}
         try:
             label = _kto_label(row)
-            prompt_text, prompt_ids, answer_ids = _encode_kto_row(
-                tokenizer, row, extracted=extracted,
-            )
-            prompt, answer = _truncate_kto(
-                prompt_ids, answer_ids, length_policy, bos_id=bos_id, eos_id=eos_id,
-            )
+            if vision is None:
+                vision = processor is not None and (
+                    "image" in row or "images" in row
+                    or bool(_kto_row_images(row, image_size))
+                )
+            if vision:
+                prompt_text, prompt, answer_ids, images, arrays = _encode_vision_kto_row(
+                    processor, row, extracted=extracted, image_size=image_size,
+                    image_reader=image_reader and partial(image_reader, index),
+                )
+                answer = answer_ids[:max(0, max_length - len(prompt))]
+                fields = dict(prompt_text=prompt_text, images=images, prompt_arrays=arrays)
+            else:
+                if processor is not None and _kto_row_images(row, image_size):
+                    raise ValueError(
+                        "it carries images, but the first row has no `image` or "
+                        "`images` field, and TRL's KTOTrainer decides from the "
+                        "first row whether a dataset is text or vision. Give the "
+                        "first row an `images` field, empty if it has none."
+                    )
+                prompt_text, prompt_ids, answer_ids = _encode_kto_row(
+                    tokenizer, row, extracted=extracted, processor=processor,
+                )
+                prompt, answer = _truncate_kto(
+                    prompt_ids, answer_ids, length_policy, bos_id=bos_id, eos_id=eos_id,
+                )
             if not answer or len(prompt) + len(answer) < 2:
                 raise ValueError(
                     "this row leaves no completion token with anything before "
-                    "it to predict from. Raise max_length or lower "
-                    "max_prompt_length if the length budget cut it down."
+                    "it to predict from. Raise max_length"
+                    + ("" if vision else " or lower max_prompt_length")
+                    + " if the length budget cut it down."
                 )
             _require_kto_fit(prompt, answer, length_policy)
         except ValueError as exc:
@@ -1744,18 +1889,24 @@ def create_kto_batch_plan(
             ) from exc
         if prompt_sink is not None and not label:
             prompt_sink(prompt_text)
-        tokenized.append((prompt, answer, answer_ids, label))
+        tokenized.append((prompt, answer, answer_ids, label, fields))
     if not tokenized:
         raise ValueError("Unsloth MLX KTO: the dataset is empty.")
     order_mode = "sequential" if preserve_dataset_order else dataset_order
     if order_mode not in ("default", "sequential", "torch_randperm"):
         raise ValueError(f"Unsloth MLX KTO: unsupported dataset_order {order_mode!r}.")
+    # TRL's vision collator rolls completions within the batch it collates.
+    kl_size = batch_size if vision else kl_batch_size
+    row_type = TokenizedKTORow if processor is None else VisionKTORow
     rows = []
-    for start in range(0, len(tokenized), kl_batch_size):
-        chunk = tokenized[start:start + kl_batch_size]
-        for offset, (prompt, answer, _, label) in enumerate(chunk):
+    for start in range(0, len(tokenized), kl_size):
+        chunk = tokenized[start:start + kl_size]
+        for offset, (prompt, answer, _, label, fields) in enumerate(chunk):
             kl_prompt = kl_answer = ()
-            if with_kl:
+            if with_kl and vision:
+                kl_prompt = prompt
+                kl_answer = chunk[offset - 1][2][:max_length - len(prompt)]
+            elif with_kl:
                 # The prompt as processed, so one already cut by its own answer stays cut.
                 kl_prompt, kl_answer = _truncate_kto(
                     prompt, chunk[offset - 1][2], length_policy,
@@ -1768,7 +1919,7 @@ def create_kto_batch_plan(
                         f"Unsloth MLX KTO: the KL pair of unpaired row "
                         f"{start + offset} could not be formed. {exc}"
                     ) from exc
-            rows.append(TokenizedKTORow(prompt, answer, label, kl_prompt, kl_answer))
+            rows.append(row_type(prompt, answer, label, kl_prompt, kl_answer, **fields))
     batches = [
         tuple(range(start, min(start + batch_size, len(rows))))
         for start in range(0, len(rows), batch_size)
@@ -1787,7 +1938,10 @@ def create_kto_batch_plan(
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = getattr(tokenizer, "eos_token_id", 0)
-    return FiniteKTOBatchPlan(
+    vision_options = {} if processor is None else dict(
+        processor=processor, model_config=model_config,
+    )
+    return (FiniteVisionKTOBatchPlan if vision_options else FiniteKTOBatchPlan)(
         rows, schedule,
         with_kl=with_kl,
         normalizers=_window_normalizers(
@@ -1796,6 +1950,7 @@ def create_kto_batch_plan(
         cycle_length=cycle_length,
         max_seq_length=length_policy.max_seq_length,
         pad_id=0 if pad_id is None else pad_id,
+        **vision_options,
     )
 
 
@@ -1842,13 +1997,22 @@ class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
         rows = [self._rows[item] for item in indices]
         batch, lengths = self.pack(rows, self._materialized_width(index, phase))
         materialized = (
-            mx.array(batch), mx.array(lengths),
+            self._inputs(rows, batch, lengths), mx.array(lengths),
             mx.array(self._normalizers[index], dtype=mx.int32),
             mx.array([row.label for row in rows]),
         )
         if self._reference is None:
             return materialized
         return materialized + (self._held_reference(indices),)
+
+
+class FiniteVisionKTOBatchPlan(VisionPreferenceBatches, FiniteKTOBatchPlan):
+    """KTO plan whose batches carry the processor's vision inputs."""
+
+    __slots__ = _VISION_PLAN_SLOTS
+
+    def _prompt_arrays(self, row):
+        return (row.prompt_arrays,) * len(self._branches(row))
 
 
 def warn_kto_weight_balance(labels, desirable_weight, undesirable_weight):
@@ -3091,31 +3255,35 @@ def kto_metric_values(summed):
 
 def _kto_supervised_tokens(batch_data):
     rows = batch_data[3].shape[0]
-    return _supervised_tokens((batch_data[0][:rows], batch_data[1][:rows]))
+    return _supervised_tokens((batch_data[0], batch_data[1][:rows]))
 
 
 def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
                 scorer=None, reference=None, kl_mean=None):
     """Per-row weighted losses and the batch's metric sums."""
     rows = labels.shape[0]
-    completions, completion_lengths = batch[:rows], lengths[:rows]
-    mask = _response_mask(completions[:, 1:], completion_lengths)
+    # A vision batch's halves share images only the whole dict carries: one forward.
+    whole = isinstance(batch, Mapping)
+    scored, scored_lengths = (batch, lengths) if whole else (batch[:rows], lengths[:rows])
+    targets = _preference_ids(scored)[:, 1:]
+    mask = _response_mask(targets, scored_lengths)
     # Real-token positions only; TRL's sum also counts its collator's padding.
     positions = (
-        mx.arange(1, completions.shape[1]) < completion_lengths[:, 1:]
+        mx.arange(1, targets.shape[1] + 1) < scored_lengths[:, 1:]
     ).astype(mx.float32)
     if scorer is None:
-        logits, ce = _preference_forward(model, completions, mask)
+        logits, ce = _preference_forward(model, scored, mask)
         logit_sums = (_row_logit_sum(logits) * positions).sum(axis=1)
     else:
-        ce, sums = scorer(model, completions, mask > 0, every_position=True)
+        ce, sums = scorer(model, scored, mask > 0, every_position=True)
         logit_sums = (sums * positions).sum(axis=1)
-    logps = -(ce * mask).sum(axis=1)
+    scored_logps = -(ce * mask).sum(axis=1)
+    logps, logit_sums = scored_logps[:rows], logit_sums[:rows]
 
     def score(model, batch, lengths):
         if scorer is None:
             return _response_logps(model, batch, lengths)
-        batch_mask = _response_mask(batch[:, 1:], lengths)
+        batch_mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
         return -(scorer(model, batch, batch_mask > 0)[0] * batch_mask).sum(axis=1)
 
     if reference is None:
@@ -3131,7 +3299,9 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
     kl = zero
     if objective.with_kl:
         # TRL scores KL rows under no_grad: a separate, undifferentiated forward.
-        policy_kl = mx.stop_gradient(score(model, batch[rows:], lengths[rows:]))
+        policy_kl = mx.stop_gradient(
+            scored_logps[rows:] if whole else score(model, batch[rows:], lengths[rows:])
+        )
         kl = (policy_kl.astype(mx.float32) - reference[rows:]).mean()
         if kl_mean is not None:
             kl = kl_mean(kl)

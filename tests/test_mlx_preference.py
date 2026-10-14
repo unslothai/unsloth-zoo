@@ -3170,6 +3170,7 @@ class VisionProcessor:
     def __init__(self):
         self.tokenizer = Tokenizer()
         self.tokenizer.image_token_id = 60
+        self.tokenizer.bos_token_id = 1  # declared, never emitted
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False,
                             continue_final_message=False, **kwargs):
@@ -3419,6 +3420,11 @@ def test_a_vision_plan_reads_its_images_back_instead_of_holding_them(tmp_path):
             row["images"][0].close()
         assert plan[0][0]["pixel_values"].tolist() == [[10.0], [20.0]] * 2, data
         cached[:] = cache()
+    from unsloth_zoo.mlx.preference import create_kto_batch_plan
+    kto = create_kto_batch_plan(decoding(), None, batch_size=4, kl_batch_size=4, with_kl=False, num_epochs=1,
+                                dataset_order="sequential", length_policy=policy("kto", max_seq_length=66), processor=Sized(), model_config={})
+    paint(0, 9), paint(1, 9)  # chosen rows, then rejected; each reads its source row back, sent once
+    assert kto[0][0]["pixel_values"].tolist() == [[90.0], [91.0]] * 2
 
     def rewritten():  # one row object, rewritten per row
         row = vision_row()
@@ -3493,15 +3499,113 @@ def test_dpo_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
     assert tokens > 0 and run._compile_decision is not None
 
 
-def test_the_kto_trainer_still_refuses_a_vision_language_model(tmp_path):
+def kto_vision_row(completion, label=True):
+    from PIL import Image
+    return {"images": [Image.new("RGB", (4, 4))], "prompt": [{"role": "user", "content": "hi"}],
+            "completion": [{"role": "assistant", "content": completion}], "label": label}
+
+
+def test_a_vision_kto_plan_follows_trls_vision_collator():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.preference import _with_trl_image_parts, create_kto_batch_plan, precompute_reference_logps
+
+    encode = lambda text: tuple(Tokenizer().encode(text))
+    prompt = (*encode("<user>"), 60, 61, *encode("hi<assistant>"))  # placed as TRL does
+    answers = [encode("yes"), encode("plain"), encode("noooo")]
+    text = {"images": [], "prompt": "q", "completion": "plain", "label": False}
+
+    def plan(dataset, max_length=len(prompt) + 3, **options):
+        return create_kto_batch_plan(
+            dataset, None, batch_size=3, kl_batch_size=2, num_epochs=1, grad_accum=1,
+            length_policy=policy("kto", max_length=max_length, max_prompt_length=4, max_seq_length=max_length + 2),
+            processor=VisionProcessor(), model_config={}, **options)
+
+    made = plan([kto_vision_row("yes"), text, kto_vision_row("noooo", False)])
+    # No BOS or EOS is added; the whole sequence is cut at max_length, keeping its start.
+    assert [(row.prompt_ids, row.completion_ids) for row in made.rows] == [
+        (prompt, answers[0]), (encode("q"), answers[1]), (prompt, answers[2][:3])]
+    # KL pairs roll within the batch, not within kl_batch_size chunks.
+    assert [row.kl for row in made.rows] == [
+        prompt + answers[2][:3], encode("q") + answers[0], prompt + answers[1][:3]]
+    batch, _, _, labels = made[0]
+    assert batch["pixel_values"].tolist() == [[4.0]] * 4 and labels.tolist() == [True, False, False]
+    assert [sum(row) for row in batch["token_type_ids"].tolist()] == [2, 0, 2, 2, 0, 2]
+    single = plan([{**text, "image": kto_vision_row("")["images"][0], "prompt": "<img>q"}], with_kl=False)
+    assert single.rows[0].prompt_ids == (60, 61, *encode("q")) and single[0][0]["pixel_values"].size
+    turns = plan([{**kto_vision_row("yes"), "prompt": [{"role": "user", "content": "hi"}, *tail]} for tail in (  # as TRL 1.13
+        [{"role": "assistant", "content": "r"}], [{"role": "assistant", "tool_calls": []}, {"role": "tool", "content": "r"}])],
+        max_length=64, with_kl=False)
+    assert [row.completion_ids for row in turns.rows] == [encode("<assistant>yes"), encode("yes")]
+    text_part = lambda text: {"type": "text", "text": text}  # every string content, as prepare_multimodal_messages does
+    parts = _with_trl_image_parts({**kto_vision_row("yes"), "prompt": [{"role": "system", "content": "s"}, *({"role": "user", "content": t} for t in ("hi", "u"))]})
+    assert [m["content"] for m in parts["prompt"] + parts["completion"]] == [
+        [text_part("s")], [{"type": "image"}, text_part("hi")], [text_part("u")], [text_part("yes")]]
+    scorer = types.SimpleNamespace(forward=lambda _, batch, n: mx.full(n.shape[:1], float("pixel_values" in batch)))
+    assert precompute_reference_logps(made, None, scorer, batch_size=3).tolist() == [[1, 1]] * 3
+    with pytest.raises(ValueError, match="row 0 .* no completion token"):
+        plan([kto_vision_row("yes")], max_length=len(prompt))
+    with pytest.raises(ValueError, match="row 1 .* decides from the first row"):
+        plan([{key: value for key, value in text.items() if key != "images"}, kto_vision_row("yes")])
+
+
+def test_a_vision_kto_batch_scores_its_kl_rows_in_the_same_forward():
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx.preference import (
+        ReferencePolicy, make_kto_loss_fn, resolve_preference_objective)
+
+    objective = resolve_preference_objective("kto", beta=0.5, loss_type="kto")
+    ids, *rest = kto_plan([{"prompt": f"p{i}", "completion": ("a", "bc", "def")[i],
+                            "label": i != 1} for i in range(3)])[0]
+
+    class Scaled(TinyModel):
+        scale = 1.0
+        def __call__(self, tokens):
+            return super().__call__(tokens) * self.scale
+
+    models = [(Scaled(), type("ScaledVision", (VisionModel, Scaled), {})()) for _ in range(2)]
+    for text, vision in models:
+        vision.embedding, vision.output = text.embedding, text.output
+
+    def run(side, batch):
+        policy, reference = (pair[side] for pair in models)
+        fn = make_kto_loss_fn(objective, reference_policy=ReferencePolicy(model=reference))
+
+        def loss(scale):
+            policy.scale = scale
+            return fn(policy, batch, *rest)[0]
+
+        # The KL rows add nothing to the gradient, as under TRL's no_grad.
+        gradient = mx.grad(loss)(mx.array(1.5))
+        policy.scale = 1.5
+        return [*fn(policy, batch, *rest)[::2], gradient]
+
+    text, vision = run(0, ids), run(1, {"input_ids": ids, "pixel_values": "pixels"})
+    for expected, got in zip(text, vision):
+        assert np.allclose(np.asarray(got.tolist()), np.asarray(expected.tolist()), rtol=1e-5)
+    assert float(text[-1]) != 0
+
+
+def test_kto_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypatch, tmp_path):
+    from mlx_vlm import prompt_utils
     from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
+    monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_a, **_k: None, raising=False)
     class Model(type(_tiny_model())):
-        _is_vlm_model = True
-    trainer = MLXKTOTrainer(
-        Model(), Tokenizer(), kto_rows(4), processor=VisionProcessor(),
-        args=MLXKTOConfig(**_generation_common(tmp_path, generate_during_eval=False)))
-    with pytest.raises(ValueError, match="KTO: vision-language models are not supported"):
-        trainer._prepare_data(True)
+        _is_vlm_model, pixels = True, []
+        def __call__(self, tokens, pixel_values=None, mask=None, **kwargs):
+            return Model.pixels.append(pixel_values is not None) or super().__call__(tokens)
+    from datasets import Dataset
+    from unsloth_zoo.mlx import preference
+    readers, read_from = [], preference._dataset_image_reader
+    monkeypatch.setattr(preference, "_dataset_image_reader", lambda *a: readers.append(read_from(*a)) or readers[-1])
+    split = Dataset.from_list([vision_row()])  # paired; unpaired, then read back by eval
+    run = MLXKTOTrainer(  # the processor as the tokenizer; KTO's length budget reads its inner one
+        Model(), VisionProcessor(), [kto_vision_row("yes"), kto_vision_row("no", False)],
+        eval_dataset=split, args=MLXKTOConfig(**_generation_common(
+            tmp_path, generate_during_eval=False, precompute_ref_log_probs=True)))
+    assert _run_generation_trainer(run, monkeypatch, [])["train_steps"] == 1
+    # Training, evaluation, and the reference precomputed for each; the rest are probes.
+    assert sum(Model.pixels) == 4 and [reader is not None for reader in readers] == [False, True]
 
 
 def test_cpo_trains_and_evaluates_text_rows_on_a_vision_language_model(monkeypatch, tmp_path):
@@ -4046,3 +4150,4 @@ def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, 
     assert [entry["kl"] for entry in trainer.state.log_history if "kl" in entry] == [0.0] * 4 == [evaluated[f"eval_{s}_kl"] for s in "aabb"]
     # One table per training log and per evaluated split.
     assert "| a_Reward: 1.0000 | b_Reward: 1.0000" in printed and printed.count("Prompt | Completion | <lambda> | Advantage") == 4 + 4
+

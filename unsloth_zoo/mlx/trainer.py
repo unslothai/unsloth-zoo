@@ -625,6 +625,7 @@ from .utils import (
     restore_mlx_norm_output_cast_state,
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
+    _get_processor_tokenizer,
     _get_text_model,
     _neftune_embed_scale,
     _probe_vlm_embedding_module,
@@ -635,8 +636,8 @@ from .utils import (
 )
 from .preference import (
     FinitePreferenceBatchPlan,
-    FiniteVisionPreferenceBatchPlan,
     PreferenceRunContext,
+    VisionPreferenceBatches,
     build_reference_policy,
     create_kto_batch_plan,
     create_preference_batch_plan,
@@ -715,7 +716,7 @@ _EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan,
 def _eager_refetchable(batches):
     # A vision preference plan reruns the processor like the VLM plan.
     return isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES) and not isinstance(
-        batches, FiniteVisionPreferenceBatchPlan,
+        batches, VisionPreferenceBatches,
     )
 
 
@@ -2482,7 +2483,7 @@ def _plan_single_process_text_shapes(
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
-    vision_preference = isinstance(batches, FiniteVisionPreferenceBatchPlan)
+    vision_preference = isinstance(batches, VisionPreferenceBatches)
     strict = compile_policy.mode == "strict"
     if vision_preference:
         # The vision SFT planner's gates; the trainer reports an unqualified arch.
@@ -2772,9 +2773,16 @@ class MLXTrainer:
         """
         policy = getattr(self, "_resolved_preference_length_policy", None)
         if policy is None:
+            tokenizer = None
+            if self.preference_kind == "kto":
+                # The tokenizer the plan encodes with, whose special tokens KTO adds.
+                tokenizer = (
+                    _get_processor_tokenizer(self._resolve_vlm_processor())
+                    if self._is_vlm else self.tokenizer
+                )
             policy = resolve_preference_length_policy(
                 self.preference_kind, args, max_seq_length=args.max_seq_length,
-                tokenizer=self.tokenizer if self.preference_kind == "kto" else None,
+                tokenizer=tokenizer,
             )
             self._resolved_preference_length_policy = policy
         return policy
@@ -7386,6 +7394,8 @@ class MLXTrainer:
                             grad_accum=1,
                             append_eos=bool(args.append_eos),
                             prompt_sink=prompt_sink,
+                            images_from=(eval_dataset, self.formatting_func),
+                            **self._preference_vision_options(),
                         )
                     if self.preference_kind:
                         # Sequential, so every evaluation scores the same
@@ -9471,11 +9481,6 @@ class MLXTrainer:
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
 
-        if self.preference_kind == "kto" and is_vlm:
-            raise ValueError(
-                "Unsloth MLX KTO: vision-language models are not supported."
-            )
-
         if is_vlm:
             processor = self._resolve_vlm_processor()
         else:
@@ -9715,6 +9720,7 @@ class MLXTrainer:
                     dataset_order=args.dataset_order,
                     preserve_dataset_order=args.preserve_dataset_order,
                     seed=args.seed,
+                    **self._preference_vision_options(),
                 ), None
             return create_preference_batch_plan(
                 train_dataset,
