@@ -14,7 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Native Qwen3.5 / Qwen3.6 MTP head, trainable outside the target model.
+"""Native MTP heads, trainable outside the target model.
+
+Qwen3.5 / Qwen3.6 use the hand-written Qwen35MTPHead below; every other family in
+mtp_families (GLM, DeepSeek, Qwen3-Next, Nemotron-H, Step, ...) uses nextn.NextNHead.
 
 The forward follows llama.cpp's `graph_mtp` (src/models/qwen35.cpp) and its
 `draft-mtp` driver (common/speculative.cpp): MTP position p consumes the target's
@@ -25,6 +28,7 @@ pairs, and recursive draft steps feed the head's own normed output back as h.
 
 __all__ = [
     "MTP_PREFIX_RE",
+    "mtp_family_name",
     "find_mtp_tensor_names",
     "load_mtp_state_dict",
     "Qwen35MTPHead",
@@ -67,9 +71,39 @@ def _weight_map(source, revision = None):
     return weight_map, None
 
 
-def find_mtp_tensor_names(source, revision = None):
+def _source_text_config(source, revision = None):
+    """The text config of a local folder or Hub repo, or None when it cannot be read."""
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(str(source), revision = revision)
+    except Exception:
+        return None
+    return config.get_text_config() if hasattr(config, "get_text_config") else config
+
+
+def _nextn_family(config):
+    if config is None or getattr(config, "model_type", None) in _SUPPORTED_MODEL_TYPES + _MOE_MODEL_TYPES:
+        return None
+    from .mtp_families import mtp_family_for_config
+    return mtp_family_for_config(config)
+
+
+def mtp_family_name(config):
+    """`"qwen3_5"` for Qwen3.5 / 3.6, the NextN family name, or None when unsupported."""
+    config = _text_config(config) if config is not None else None
+    if getattr(config, "model_type", None) in _SUPPORTED_MODEL_TYPES + _MOE_MODEL_TYPES:
+        return "qwen3_5"
+    family = _nextn_family(config)
+    return family.name if family is not None else None
+
+
+def find_mtp_tensor_names(source, revision = None, config = None):
     """{full tensor name: shard file} for every MTP tensor in the checkpoint."""
     weight_map, _ = _weight_map(source, revision = revision)
+    family = _nextn_family(_text_config(config) if config is not None else None)
+    if family is not None:
+        n = int(_text_config(config).num_hidden_layers)
+        return {name: shard for name, shard in weight_map.items() if family.is_mtp_name(name, n)}
     return {name: shard for name, shard in weight_map.items() if MTP_PREFIX_RE.match(name)}
 
 
@@ -91,13 +125,24 @@ def _declared_mtp_layers(source, revision = None):
     return None
 
 
-def load_mtp_state_dict(source, revision = None):
+def load_mtp_state_dict(source, revision = None, config = None):
     """Read only the MTP tensors of a checkpoint (transformers drops them on load).
 
-    Returns (state_dict with head-relative names, info). Only the shards that hold
-    `mtp.*` are downloaded or opened.
+    Returns (state_dict, info). Qwen3.5 names are head-relative (`fc.weight`); other families
+    keep full checkpoint names (info["prefix"] is then ""). Only the shards that hold the head
+    are downloaded or opened. `config` (the target's) picks the family; read from `source`
+    when omitted.
     """
     from safetensors import safe_open
+    text = _text_config(config) if config is not None else _source_text_config(source, revision)
+    family = _nextn_family(text)
+    if family is not None:
+        from .nextn import load_nextn_state_dict
+        canonical, info = load_nextn_state_dict(source, text, revision = revision)
+        mapping = info.pop("ckpt_names")
+        state_dict = {mapping[k]: v for k, v in canonical.items()}
+        info["ckpt_prefix"], info["prefix"] = info["prefix"], ""
+        return state_dict, info
     names = find_mtp_tensor_names(source, revision = revision)
     if not names:
         declared = _declared_mtp_layers(source, revision = revision)
@@ -382,9 +427,37 @@ def _init_unset_parameters(head, std):
                 param.normal_(0.0, std)
 
 
-def build_mtp_head(target_model_or_config, state_dict = None, dtype = None, device = None, strict = True):
-    """Build a Qwen3.5 MTP head for a target; load `state_dict` (head-relative names) if given."""
+def build_mtp_head(target_model_or_config, state_dict = None, dtype = None, device = None, strict = True,
+                   target_embed = None, target_lm_head = None, ckpt_prefix = None):
+    """Build the MTP head for a target; load `state_dict` (as returned by load_mtp_state_dict).
+
+    target_embed / target_lm_head: the target's matrices, so head-serialized copies equal to
+    them are not held twice.
+    """
     config = _text_config(target_model_or_config)
+    family = _nextn_family(config)
+    if family is not None:
+        from .nextn import build_nextn_head
+        canonical = None
+        prefixes = set()
+        if state_dict is not None:
+            n = int(config.num_hidden_layers)
+            canonical = {}
+            for name, tensor in state_dict.items():
+                if name.startswith("heads."):
+                    canonical[name] = tensor
+                    continue
+                mapped = family.from_ckpt(name, n)
+                if mapped is None:
+                    raise ValueError(f"Unsloth: `{name}` is not a {family.name} MTP tensor.")
+                prefixes.add(mapped[0])
+                canonical[mapped[1]] = tensor
+        head = build_nextn_head(
+            config, state_dict = canonical, dtype = dtype, device = device, strict = strict, family = family,
+            target_embed = target_embed, target_lm_head = target_lm_head,
+        )
+        head._ckpt_prefix = ckpt_prefix or (prefixes.pop() if len(prefixes) == 1 else family.default_prefix())
+        return head
     with torch.device("meta" if state_dict is not None else (device or "cpu")):
         head = Qwen35MTPHead(config)
     if state_dict is None:

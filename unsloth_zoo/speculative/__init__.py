@@ -16,6 +16,9 @@
 
 """Training speculative-decoding drafters (native MTP heads) against a frozen target.
 
+Native heads: Qwen3.5 / 3.6 (mtp.Qwen35MTPHead) and every DeepSeek-V3 style NextN family in
+mtp_families (GLM-4.5 / 4.7 / 5, Hunyuan 3, Qwen3-Next, Nemotron-H, Step-3.5 / 3.7, ...).
+
 Submodules import transformers lazily so `import unsloth_zoo` stays unchanged.
 """
 
@@ -26,6 +29,9 @@ __all__ = [
     "chunked_lm_loss",
     "fastmtp_step_weights",
     "Qwen35MTPHead",
+    "NextNHead",
+    "MTP_FAMILIES",
+    "mtp_family_name",
     "build_mtp_head",
     "load_mtp_state_dict",
     "find_mtp_tensor_names",
@@ -47,6 +53,9 @@ _LOCATIONS = {
     "chunked_lm_loss": "losses",
     "fastmtp_step_weights": "losses",
     "Qwen35MTPHead": "mtp",
+    "NextNHead": "nextn",
+    "MTP_FAMILIES": "mtp_families",
+    "mtp_family_name": "mtp",
     "build_mtp_head": "mtp",
     "load_mtp_state_dict": "mtp",
     "find_mtp_tensor_names": "mtp",

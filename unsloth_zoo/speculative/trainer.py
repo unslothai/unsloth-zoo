@@ -80,7 +80,8 @@ def _shift_window(tensor, start, length, fill):
     return out
 
 
-def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_labels, args, normalizer = None):
+def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_labels, args, normalizer = None,
+                    head_hidden = None):
     """Weighted MTP loss plus per-step (loss, n_tokens, n_correct).
 
     normalizer: supervised tokens in the whole accumulated batch (Trainer's num_items_in_batch),
@@ -88,21 +89,26 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
 
     Chain p starts from (final_hidden[p-1], x[p]); step k predicts x[p+k+1], whose
     teacher distribution is the target's own prediction at p+k, final_hidden[:, p+k].
+    head_hidden: what the head consumes when it is not the post-norm hidden (pre-norm families).
     """
     steps = head(
-        final_hidden,
+        final_hidden if head_hidden is None else head_hidden,
         input_ids,
         parts["embed_tokens"],
         attention_mask = attention_mask,
         num_steps = args.mtp_num_steps,
     )
     weights = fastmtp_step_weights(args.mtp_step_beta, len(steps))
-    lm_head_weight = parts["lm_head"].weight
+    target_lm_head_weight = parts["lm_head"].weight
     supervised = data_labels != -100
     total = final_hidden.new_zeros((), dtype = torch.float32)
     stats = []
     for k, (step, weight) in enumerate(zip(steps, weights)):
         hidden, labels = step["hidden"], step["labels"]
+        # Heads that ship their own lm_head copy draft with it (llama.cpp does); the teacher stays the target's.
+        lm_head_weight = step.get("lm_head_weight")
+        if lm_head_weight is None:
+            lm_head_weight = target_lm_head_weight
         length = labels.shape[1]
         keep = _shift_window(supervised, k + 1, length, False)
         labels = torch.where(keep, labels, torch.full_like(labels, -100))
@@ -112,7 +118,7 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
         if args.mtp_label_source == "teacher":
             with torch.no_grad():
                 teacher_ids = torch.cat([
-                    (chunk.to(lm_head_weight.dtype) @ lm_head_weight.T).argmax(-1)
+                    (chunk.to(target_lm_head_weight.dtype) @ target_lm_head_weight.T).argmax(-1)
                     for chunk in teacher_hidden.split(args.mtp_chunk_size)
                 ]).view_as(labels)
             labels = torch.where(labels != -100, teacher_ids, labels)
@@ -122,6 +128,7 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
             labels.reshape(-1),
             loss_type = args.mtp_loss_type,
             teacher_hidden = teacher_hidden,
+            teacher_lm_head_weight = None if lm_head_weight is target_lm_head_weight else target_lm_head_weight,
             chunk_size = args.mtp_chunk_size,
         )
         n = max(int(n_tokens), 1)
@@ -170,15 +177,20 @@ class UnslothMTPTrainer(Trainer):
         data_labels = inputs.get("labels", input_ids)
         if attention_mask is not None and bool((attention_mask[:, 0] == 0).any()):
             raise ValueError("Unsloth: UnslothMTPTrainer needs right-padded batches (left padding misaligns MTP positions).")
-        captured = run_frozen_target(self.target_model, input_ids, attention_mask = attention_mask)
+        head_module = getattr(model, "module", model)
+        pre_norm = getattr(head_module, "h_source", "final") == "last_layer"
+        captured = run_frozen_target(
+            self.target_model, input_ids, attention_mask = attention_mask, layer_ids = [-1] if pre_norm else (),
+        )
         param = next(model.parameters())
         final_hidden = captured["final"].to(device = param.device, dtype = param.dtype)
+        head_hidden = captured[-1].to(device = param.device, dtype = param.dtype) if pre_norm else None
         normalizer = None
         if num_items_in_batch is not None:
             normalizer = torch.as_tensor(num_items_in_batch, device = param.device, dtype = torch.float32).clamp(min = 1)
         loss, stats = mtp_step_losses(
             model, self.target_parts, final_hidden, input_ids, attention_mask, data_labels, self.args,
-            normalizer = normalizer,
+            normalizer = normalizer, head_hidden = head_hidden,
         )
         if model.training:
             self._mtp_log.append(stats)

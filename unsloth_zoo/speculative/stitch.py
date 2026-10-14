@@ -213,7 +213,7 @@ def _write_json_atomically(path, payload, mode_from = None):
         raise
 
 
-def _declare_mtp_layers(directory, num_layers):
+def _declare_mtp_layers(directory, num_layers, config_key = _MTP_CONFIG_KEY):
     """Make config.json declare the head, in the container holding `num_hidden_layers`."""
     config_path = directory / "config.json"
     if not config_path.is_file() or num_layers <= 0:
@@ -224,9 +224,9 @@ def _declare_mtp_layers(directory, num_layers):
     text_config = config.get("text_config")
     if isinstance(text_config, dict) and "num_hidden_layers" in text_config:
         container = text_config
-    if container.get(_MTP_CONFIG_KEY) == num_layers:
+    if container.get(config_key) == num_layers:
         return False
-    container[_MTP_CONFIG_KEY] = num_layers
+    container[config_key] = num_layers
     _write_json_atomically(config_path, config)
     return True
 
@@ -287,7 +287,7 @@ def _append_mtp_shard(directory, layout, has_index, head, prefix, dtype):
 
 
 def write_mtp_tensors(save_directory, head_state_dict, prefix = None, strict = True, verify = False,
-                      append_prefix = "mtp."):
+                      append_prefix = "mtp.", is_mtp_name = None, config_key = None, num_layers = None):
     """Replace (or add) a checkpoint's `mtp.*` tensors with `head_state_dict`.
 
     `head_state_dict` uses head-relative names (`fc.weight`, `layers.0.mlp.up_proj.weight`);
@@ -297,8 +297,14 @@ def write_mtp_tensors(save_directory, head_state_dict, prefix = None, strict = T
     config.json. `prefix` picks the stored spelling (autodetected when None); `append_prefix` is
     the spelling for a head that is added. `verify` adds sha256 of every untouched shard before
     and after to the report.
+
+    Families other than Qwen3.5 (NextNHead.stitch_kwargs()) pass full checkpoint names plus
+    `is_mtp_name` (which stored tensors are the head's), `config_key` and `num_layers`.
     """
     directory = Path(save_directory)
+    if is_mtp_name is not None:
+        return _write_named_mtp_tensors(directory, dict(head_state_dict), is_mtp_name, config_key,
+                                        num_layers, strict, verify)
     head = _relative_head_state_dict(head_state_dict)
     if not head:
         raise ValueError("Unsloth: the MTP head state dict is empty.")
@@ -369,6 +375,66 @@ def write_mtp_tensors(save_directory, head_state_dict, prefix = None, strict = T
         report["files_touched"].append("config.json")
         report["config_declared"] = True
 
+    for shard in shards:
+        if shard in report["files_touched"]:
+            continue
+        after = _sha256(directory / shard) if verify else _file_signature(directory / shard)
+        if after != before[shard]:
+            raise RuntimeError(f"Unsloth: {shard} changed while only the MTP head was being written.")
+        report["untouched"][shard] = {"before": before[shard], "after": after}
+    return report
+
+
+def _write_named_mtp_tensors(directory, head, is_mtp_name, config_key, num_layers, strict, verify):
+    if not head:
+        raise ValueError("Unsloth: the MTP head state dict is empty.")
+    layout, has_index = _checkpoint_layout(directory)
+    if layout is None:
+        raise FileNotFoundError(f"Unsloth: no safetensors checkpoint in {directory} to write an MTP head into.")
+    existing = {name: shard for name, shard in layout.items() if is_mtp_name(name)}
+    shards = sorted(set(layout.values()))
+    before = {s: (_sha256(directory / s) if verify else _file_signature(directory / s)) for s in shards}
+    report = {
+        "directory": str(directory), "mode": None, "prefix": "", "num_layers": int(num_layers or 0),
+        "files_touched": [], "tensors_written": [], "untouched": {}, "config_declared": False,
+    }
+    if existing:
+        missing = sorted(set(existing) - set(head))
+        extra = sorted(set(head) - set(existing))
+        if strict and (missing or extra):
+            raise ValueError(
+                f"Unsloth: the trained MTP head does not match the checkpoint's MTP tensors "
+                f"(missing {missing[:5]}, unexpected {extra[:5]})."
+            )
+        by_shard = {}
+        for name, tensor in head.items():
+            if name in existing:
+                by_shard.setdefault(existing[name], {})[name] = tensor
+        for shard, replacements in by_shard.items():
+            header, _ = _read_header(directory / shard)
+            for name, tensor in replacements.items():
+                if list(header[name]["shape"]) != list(tensor.shape):
+                    raise ValueError(
+                        f"Unsloth: `{name}` is {header[name]['shape']} in the checkpoint "
+                        f"but {list(tensor.shape)} in the trained head."
+                    )
+        for shard, replacements in sorted(by_shard.items()):
+            _patch_shard(directory / shard, replacements)
+            report["files_touched"].append(shard)
+            report["tensors_written"].extend(sorted(replacements))
+        report["mode"] = "replaced"
+    else:
+        header, _ = _read_header(directory / shards[0])
+        float_dtypes = [entry["dtype"] for key, entry in header.items()
+                        if key != "__metadata__" and entry["dtype"] in ("BF16", "F16", "F32")]
+        dtype = _SAFETENSORS_DTYPES[max(set(float_dtypes), key = float_dtypes.count)] if float_dtypes else torch.bfloat16
+        shard_name, written = _append_mtp_shard(directory, layout, has_index, head, "", dtype)
+        report["files_touched"].extend([shard_name, _INDEX_NAME])
+        report["tensors_written"].extend(sorted(written))
+        report["mode"] = "appended"
+    if config_key and _declare_mtp_layers(directory, report["num_layers"], config_key):
+        report["files_touched"].append("config.json")
+        report["config_declared"] = True
     for shard in shards:
         if shard in report["files_touched"]:
             continue
