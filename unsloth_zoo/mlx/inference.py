@@ -1211,6 +1211,249 @@ def fused_packed_gated_delta(model, *, _modules = None):
                     if namespace.get("gated_delta_kernel") is route:
                         namespace["gated_delta_kernel"] = native
 
+
+# Qwen4-Exp prefill hyper-connection read. Each kernel repeats mlx-vlm's arithmetic bit for bit: reductions keep the
+# native kernels' lane assignment and order, and the sigmoid of a 16-bit gate is read from a 65,536-entry table MLX
+# computes with the native op.
+# The exported classes the eligibility checks compare against are pinned by name too.
+_QWEN4_PREFILL_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.language": {
+        "Qwen4ExpGatedResidual": None,
+        "Qwen4ExpRMSNorm": None,
+        "Qwen4ExpGatedResidual.__call__": "04cef0824dc1add0",
+        "Qwen4ExpRMSNorm.__call__": "b47a270c1b0eade5",
+        "_row_invariant_quantized_projection": "75dc4975ef847716",
+    },
+}
+# Builders behind an lru_cache, pinned through the cached function.
+_QWEN4_PREFILL_CACHED = {"_qwen4_rms_norm": "4474fbab75e313c3", "_qwen4_hyper_pointwise": "5a6f9a76f981f7c0"}
+_QWEN4_PREFILL_LOCK = RLock()
+_QWEN4_PREFILL_VERDICTS = {}
+_QWEN4_PREFILL_BINDINGS = [None]
+# Below this many token rows MLX picks other reduction kernels; decode and verify widths stay native.
+_QWEN4_PREFILL_MIN_ROWS = 32
+_QWEN4_SAFE_MATH = {"math_mode": "safe"}
+
+
+def _qwen4_prefill_bindings():
+    language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+    bindings = None if language is None else _resolved_bindings(_QWEN4_PREFILL_CONTRACT)
+    if bindings is None:
+        return None
+    for name, expected in _QWEN4_PREFILL_CACHED.items():
+        cached = getattr(language, name, None)
+        builder = getattr(cached, "__wrapped__", None)
+        try:
+            # The lru_cache wrapper itself, not another wrapper around it.
+            held = (hasattr(cached, "cache_info") and not hasattr(builder, "__wrapped__")
+                    and _ast_fingerprint(builder) == expected)
+        except (OSError, TypeError, SyntaxError, AttributeError):
+            held = False
+        if not held:
+            if (language.__name__, name) not in _CONTRACT_MISSES:
+                _CONTRACT_MISSES.add((language.__name__, name))
+                logger.warning("%s.%s differs from the version the MLX fusions were written against; "
+                               "the native method stays in use", language.__name__, name)
+            return None
+        bindings.append((vars(language), name, cached))
+    return bindings
+
+
+@functools.cache
+def _qwen4_table(fn, dtype):
+    return fn(mx.arange(1 << 16, dtype = mx.uint32).astype(mx.uint16).view(dtype))
+
+
+@functools.cache
+def _qwen4_scalar(value, dtype):
+    return mx.array(value, dtype)
+
+
+@functools.cache
+def _qwen4_kernels():
+    if not mx.metal.is_available():
+        return None
+    pragma = "#pragma clang fp contract(off) reassociate(off)\n"
+    try:
+        # _qwen4_rms_norm on one group: MLX's simple row reduction gives thread i elements 4i..4i+3, summed
+        # from +0, then simd_sums the threads and the per-simdgroup partials.
+        norm = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_hc_norm", input_names = ["x", "w", "inv_n", "eps"], output_names = ["out"],
+            compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint t = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint weights = (row % STREAMS) * G + t * 4;
+            threadgroup float partial[32];
+            float y[4];
+            float total = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                y[i] = float(x[size_t(row) * G + t * 4 + i]);
+                total = y[i] * y[i] + total;
+            }
+            total = simd_sum(total);
+            if (sg == 0) partial[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) partial[sg] = total;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            total = simd_sum(partial[lane]);
+            const float r = metal::precise::rsqrt(total * inv_n + eps);
+            for (uint i = 0; i < 4; ++i) {
+                const float gain = 1.0f + float(w[weights + i]);
+                out[size_t(row) * G + t * 4 + i] = T((y[i] * r) * gain);
+            }
+            """)
+        # mix_streams: the sigmoid gate times each stream, then the native small column reduction (each
+        # stream from +0, added in stream order) and the mean's reciprocal rounded to the input dtype.
+        mix = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_hc_mix", input_names = ["up", "normed", "sigmoid", "inv_n"],
+            output_names = ["out"], compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            const uint i = thread_position_in_grid.x;
+            const size_t base = size_t(i / G) * STREAMS * G + i % G;
+            T total = T(0);
+            for (uint h = 0; h < STREAMS; ++h) {
+                const T gate = sigmoid[as_type<ushort>(up[base + h * G])];
+                const T product = gate * normed[base + h * G];
+                const T partial = product + T(0);
+                total = h == 0 ? partial : T(partial + total);
+            }
+            out[i] = total * inv_n;
+            """)
+        return norm, mix
+    except (AttributeError, TypeError, RuntimeError):
+        return None
+
+
+def _qwen4_rows(x):
+    return x.size // x.shape[-1] if x.ndim and x.shape[-1] else 0
+
+
+def _qwen4_hc_norm(x, weight, group, eps):
+    streams = weight.size // group
+    return _qwen4_kernels()[0](
+        inputs = [x, weight, _qwen4_scalar(1.0 / group, mx.float32), _qwen4_scalar(eps, mx.float32)],
+        template = [("T", x.dtype), ("G", group), ("STREAMS", streams)],
+        grid = (x.size // 4, 1, 1), threadgroup = (group // 4, 1, 1),
+        output_shapes = [x.shape], output_dtypes = [x.dtype])[0]
+
+
+def _qwen4_hc_mix(up, normed, streams, group):
+    return _qwen4_kernels()[1](
+        inputs = [up, normed, _qwen4_table(mx.sigmoid, up.dtype), _qwen4_scalar(1.0 / streams, up.dtype)],
+        template = [("T", up.dtype), ("STREAMS", streams), ("G", group)],
+        grid = (up.size // streams, 1, 1), threadgroup = (256, 1, 1),
+        output_shapes = [(*up.shape[:-1], group)], output_dtypes = [up.dtype])[0]
+
+
+def _qwen4_verified(key, fused, native, what):
+    """`fused()` once `key`'s first call matched `native()` bit for bit; that call and a failed key take `native()`."""
+    verdict = _QWEN4_PREFILL_VERDICTS.get(key)
+    if verdict:
+        return fused()
+    reference = native()
+    if verdict is None:
+        candidate = fused()
+        outputs = [out if isinstance(out, tuple) else (out,) for out in (reference, candidate)]
+        try:
+            verdict = _settled(len(outputs[0]) == len(outputs[1]) and all(
+                a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item()
+                for a, b in zip(*outputs)))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return reference  # inside a function transformation, which cannot evaluate; checked later
+        _QWEN4_PREFILL_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("the fused Qwen4-Exp %s differs from mlx-vlm's for %s; the native path stays in use",
+                           what, key)
+    return reference
+
+
+def _qwen4_hc_eligible(language, module):
+    norm, group, streams = module.hc_norm, module.hidden_size, module.hc_count
+    # MLX reduces a group of 1025 to 4096 with one pass of ceil(group / 4) threads, which the norm kernel repeats;
+    # its small column reduction gives each of up to 8 streams its own lane, which the mix kernel repeats.
+    return (not module.training and type(norm).__call__ is language.Qwen4ExpRMSNorm.__call__ and 1 < streams <= 8
+            and norm.group_size == group and 1024 < group <= 4096 and not group % 128
+            and norm.weight.shape == (group * streams,))
+
+
+def _qwen4_hc_read(module, x, native):
+    group, streams = module.hidden_size, module.hc_count
+    if (x.ndim != 3 or _qwen4_rows(x) < _QWEN4_PREFILL_MIN_ROWS or x.dtype not in _HALF
+            or x.shape[-1] != group * streams):
+        return native(module, x)
+    language, norm = sys.modules["mlx_vlm.models.qwen4_exp.language"], module.hc_norm
+    combine = "block_inject_weight" in module
+
+    def fused():
+        normed = _qwen4_hc_norm(x, norm.weight, group, norm.eps)
+        activate, mix_streams, injection_gate = language._qwen4_hyper_pointwise(streams, group)
+        up = module.input_mix_weight_up(activate(module.input_mix_weight_down(normed)))
+        # The sigmoid table is indexed by the 16-bit gate and the kernel does not broadcast; any other projection
+        # result keeps mlx-vlm's mix.
+        mixed = (_qwen4_hc_mix(up, normed, streams, group) if up.dtype == normed.dtype and up.shape == normed.shape
+                 else mix_streams(up, normed))
+        if not combine:
+            return mixed
+        injection = language._row_invariant_quantized_projection(module.block_inject_weight, normed)
+        return mixed, x, injection_gate(injection)
+
+    key = ("hyper-connection read", streams, group, x.dtype, norm.weight.dtype, combine)
+    return _qwen4_verified(key, fused, lambda: native(module, x), "hyper-connection read")
+
+
+@functools.cache
+def _qwen4_prefill_class(base):
+    def call(self, hyper_input):
+        return _qwen4_hc_read(self, hyper_input, base.__call__)
+    return type(f"_Qwen4Prefill{base.__name__}", (base,), {"__call__": call, "_unsloth_qwen4_prefill_native": base})
+
+
+@contextmanager
+def fused_qwen4_prefill(model, *, _modules = None):
+    """Run Qwen4-Exp prefill's hyper-connection reads (norm and stream mix) as fused kernels.
+
+    Calls of 32 or more token rows take kernels bit-identical to mlx-vlm, each layout and dtype compared on
+    its first use; decode, verify, training and any drifted mlx-vlm body keep the native calls. Eligibility is
+    settled when the scope opens. `UNSLOTH_MLX_QWEN4_PREFILL=0` turns the route off.
+    """
+    changed = []
+    try:
+        with _QWEN4_PREFILL_LOCK:
+            language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+            if (language is not None and os.environ.get("UNSLOTH_MLX_QWEN4_PREFILL", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and mx.default_device() == mx.gpu and _qwen4_kernels() is not None):
+                if _QWEN4_PREFILL_BINDINGS[0] is None or not _bindings_intact(_QWEN4_PREFILL_BINDINGS[0]):
+                    _QWEN4_PREFILL_BINDINGS[0] = _qwen4_prefill_bindings()
+                seen = set()
+                for _, module in _fusion_modules(model, _modules) if _QWEN4_PREFILL_BINDINGS[0] is not None else ():
+                    if id(module) in seen or not isinstance(module, language.Qwen4ExpGatedResidual):
+                        continue
+                    seen.add(id(module))
+                    if module.__dict__.get("_unsloth_qwen4_prefill_scopes"):
+                        module._unsloth_qwen4_prefill_scopes += 1
+                        changed.append(module)
+                        continue
+                    if (type(module).__call__ is not language.Qwen4ExpGatedResidual.__call__
+                            or not _qwen4_hc_eligible(language, module)):
+                        continue
+                    module.__class__ = _qwen4_prefill_class(type(module))
+                    module._unsloth_qwen4_prefill_scopes = 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _QWEN4_PREFILL_LOCK:
+            for module in reversed(changed):
+                module._unsloth_qwen4_prefill_scopes -= 1
+                if not module._unsloth_qwen4_prefill_scopes:
+                    native = getattr(type(module), "_unsloth_qwen4_prefill_native", None)
+                    if native is not None:
+                        module.__class__ = native
+                    module.__dict__.pop("_unsloth_qwen4_prefill_scopes", None)
+
+
 def _single_row(x):
     # The fused kernel reduces one row per launch, so anything wider keeps the native path.
     return x.size == x.shape[-1]
@@ -5725,6 +5968,7 @@ INFERENCE_SCOPES = [
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_qsa_attention),
     InferenceScope(fast_qsa_prefill),
+    InferenceScope(fused_qwen4_prefill),
     InferenceScope(fused_residual_norm_handoff),
     # qwen4_exp decodes on the forward its verify blocks run on, so every generation holds this one.
     InferenceScope(exact_batch_invariant_decode),

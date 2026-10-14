@@ -1888,6 +1888,7 @@ def _first_use_checks():
         "combine": (lambda: I._moe_combine_verified(mx.bfloat16, 2, 64), None),
         "gated_delta": (lambda: I._packed_gated_delta_route(gated_delta_kernel, [])(*delta), "_GATED_DELTA_VERDICTS"),
         "verify": (lambda: I._verify_admitted("key", lambda: rows(2, 4), lambda: rows(2, 4)), "_VERIFY_VERDICTS"),
+        "qwen4": (lambda: I._qwen4_verified("key", lambda: rows(2, 4), lambda: rows(2, 4), "read"), "_QWEN4_PREFILL_VERDICTS"),
         "dense": (dense, "_DENSE_QMM_VERIFIED"),
         "tape": (tape, "_TAPE_VERDICTS"),
     }
@@ -1895,7 +1896,7 @@ def _first_use_checks():
 
 @real_mlx_only
 @metal_only
-@pytest.mark.parametrize("site", ["add_norm", "router", "router_shared", "combine", "gated_delta", "verify", "dense", "tape"])
+@pytest.mark.parametrize("site", ["add_norm", "router", "router_shared", "combine", "gated_delta", "verify", "qwen4", "dense", "tape"])
 def test_a_first_use_mismatch_from_a_failed_command_buffer_raises_instead_of_recording(monkeypatch, site):
     from unsloth_zoo.mlx import inference
 
