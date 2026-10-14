@@ -112,6 +112,8 @@ def get_target_device(index = 0):
 def _device_empty_cache():
     if DEVICE_TYPE == "npu":
         torch.npu.empty_cache()
+    elif DEVICE_TYPE == "xpu":
+        torch.xpu.empty_cache()
     else:
         torch.cuda.empty_cache()
 pass
@@ -635,7 +637,24 @@ pass
 
 
 def patch_vllm_enable_sleep_mode():
-    from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
+    if DEVICE_TYPE in ("cuda", "hip"):
+        from vllm.device_allocator.cumem import (
+            CuMemAllocator as MemAllocator, AllocationData, unmap_and_release,
+            create_and_map, libcudart,
+        )
+    elif DEVICE_TYPE == "xpu":
+        if Version(vllm_version) < Version("0.23.0"):
+            raise RuntimeError(
+                f"Unsloth: vLLM standby mode on XPU requires vLLM >= 0.23.0, but found {vllm_version}.\n"
+                "Please update vLLM, or disable UNSLOTH_VLLM_STANDBY."
+            )
+        from vllm.device_allocator.xpumem import (
+            XpuMemAllocator as MemAllocator, AllocationData, unmap_and_release,
+            create_and_allocate as create_and_map, _xpu_memcpy_sync,
+            MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
+        )
+    else:
+        raise ValueError(f"Unsupported DEVICE_TYPE: {DEVICE_TYPE} for UNSLOTH_VLLM_STANDBY mode")
     try:
         from vllm.utils import is_pin_memory_available
     except:
@@ -644,6 +663,14 @@ def patch_vllm_enable_sleep_mode():
     from typing import Optional, Union, Tuple, Any
 
     logger.info(f"Unsloth: Enabling vLLM standby mode")
+
+
+    def _memcpy(dst_ptr, src_ptr, size_in_bytes, device, to_device):
+        if DEVICE_TYPE == "xpu":
+            kind = MEMCPY_HOST_TO_DEVICE if to_device else MEMCPY_DEVICE_TO_HOST
+            _xpu_memcpy_sync(dst_ptr, src_ptr, size_in_bytes, kind, device)
+        else:
+            libcudart.cudaMemcpy(dst_ptr, src_ptr, size_in_bytes)
 
     def __init__(self):
         # Replica of CuMemAllocator.__init__() with a clearer error message only.
@@ -655,7 +682,7 @@ def patch_vllm_enable_sleep_mode():
                 )
 
         self.pointer_to_data: dict[int, AllocationData] = {}
-        self.current_tag: str = CuMemAllocator.default_tag
+        self.current_tag: str = MemAllocator.default_tag
         self.allocator_and_pools: dict[str, Any] = {}
         if hasattr(self, '_python_malloc_callback'):
             # Newer vLLM exposes _python_malloc/free and assigns them to
@@ -672,7 +699,7 @@ def patch_vllm_enable_sleep_mode():
         """Sleep mode: offload allocations with offload_tags to CPU, discard the rest."""
         if offload_tags is None:
             # by default, allocated tensors are offloaded on sleep
-            offload_tags = (CuMemAllocator.default_tag, )
+            offload_tags = (MemAllocator.default_tag, )
         elif isinstance(offload_tags, str):
             offload_tags = (offload_tags, )
 
@@ -701,7 +728,7 @@ def patch_vllm_enable_sleep_mode():
                     device='cpu',
                     pin_memory=is_pin_memory_available())
                 cpu_ptr = cpu_backup_tensor.data_ptr()
-                libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+                _memcpy(cpu_ptr, ptr, size_in_bytes, handle[0], to_device = False)
                 data.cpu_backup_tensor = cpu_backup_tensor
                 cpu_offloads += 1
             logger.debug(f"data's tag is {data.tag} and is offloaded to cpu? {data.tag in offload_tags}")
@@ -731,7 +758,7 @@ def patch_vllm_enable_sleep_mode():
                         size_in_bytes = cpu_backup_tensor.numel(
                         ) * cpu_backup_tensor.element_size()
                         cpu_ptr = cpu_backup_tensor.data_ptr()
-                        libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
+                        _memcpy(ptr, cpu_ptr, size_in_bytes, handle[0], to_device = True)
                         data.cpu_backup_tensor = None
             pass
         pass
@@ -780,10 +807,10 @@ def patch_vllm_enable_sleep_mode():
     vllm.LLM.generate = get_patched_generate(vllm.LLM.generate)
     vllm.AsyncLLMEngine.generate = get_patched_generate(vllm.AsyncLLMEngine.generate)
 
-    CuMemAllocator.__init__ = __init__
-    CuMemAllocator.sleep = sleep
-    CuMemAllocator.wake_up = wake_up
-    CuMemAllocator.print_memory_summary = print_memory_summary
+    MemAllocator.__init__ = __init__
+    MemAllocator.sleep = sleep
+    MemAllocator.wake_up = wake_up
+    MemAllocator.print_memory_summary = print_memory_summary
 pass
 
 
