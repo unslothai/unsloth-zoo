@@ -1862,7 +1862,7 @@ def _adapter_stem(decoder, path, stored):
 def _held_arrays(tree):
     """Every array a module tree holds, with those under a leading underscore that `parameters()` leaves out."""
     found = []
-    for value in tree.values() if isinstance(tree, dict) else tree:
+    for value in tree.values() if isinstance(tree, dict) else tree if isinstance(tree, (list, tuple)) else ():
         if isinstance(value, mx.array):
             found.append(value)
         elif isinstance(value, (dict, list, tuple)):
