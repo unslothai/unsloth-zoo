@@ -570,3 +570,119 @@ def test_packed_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
     with decode.fused_packed_gated_delta(model):
         assert routed_gated_delta.gated_delta_kernel is not stock
     assert routed_gated_delta.gated_delta_kernel is stock
+
+
+def _attention_block(gqa, rows, keys, dtype = mx.bfloat16, heads = 8):
+    # Keys and values as a KVCache returns them: a strided slice of a longer buffer.
+    mx.random.seed(gqa * 100 + rows)
+    buffer = mx.random.normal((2, 1, heads // gqa, keys + 256, 512)).astype(dtype)
+    queries = (mx.random.normal((1, rows, heads, 512)) * 0.05).astype(dtype).transpose(0, 2, 1, 3)
+    return queries, buffer[0, ..., :keys, :] * 0.5, buffer[1, ..., :keys, :]
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("gqa", [4, 8])
+@pytest.mark.parametrize("rows", [2, 3, 5, 8])
+def test_verify_attention_matches_mlx_vector_kernel_and_decode_rows_bitwise(gqa, rows, dtype, monkeypatch):
+    queries, keys, values = _attention_block(gqa, rows, 4500, dtype)
+    if gqa == 4:   # decode stays unfused there, so the kernel only serves it when asked
+        assert decode._verify_attention(queries, keys, values, None, 1.0, "causal", None) is None
+        monkeypatch.setenv("UNSLOTH_MLX_VERIFY_ATTENTION", "1")
+    out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None)
+    _equal(out, decode._decode_attention(queries, keys, values, 1.0))
+    if gqa == 8:   # unpaired heads: exactly what each decode step computes
+        horizon = lambda i: 4500 - rows + i + 1
+        _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
+            queries[:, :, i : i + 1], keys[..., : horizon(i), :], values[..., : horizon(i), :], scale = 1.0)
+            for i in range(rows)], axis = 2))
+    monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # MLX's own vector kernel over each launch's rows
+    step = 32 // gqa
+    _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
+        queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
+        values[..., : 4500 - rows + min(i + step, rows), :], scale = 1.0, mask = "causal")
+        for i in range(0, rows, step)], axis = 2))
+    assert not mx.array_equal(out[:, :, :1], out[:, :, 1:2]).item()
+
+
+def _gemma4_attention(gqa):
+    from mlx_vlm.models.gemma4 import language as gemma4
+    from mlx_vlm.models.gemma4.config import TextConfig
+    config = TextConfig(hidden_size = 64, num_hidden_layers = 2, num_attention_heads = 8, num_key_value_heads = 8 // gqa,
+                        num_kv_shared_layers = 0, layer_types = ["sliding_attention", "full_attention"])
+    layers = nn.Sequential(gemma4.Attention(config, 0), gemma4.Attention(config, 1))
+    layers.set_dtype(mx.bfloat16)
+    layers.eval()
+    return gemma4, layers
+
+
+def _filled(gemma4, keys, kv_heads):
+    mx.random.seed(keys)
+    cache = gemma4.KVCache()
+    for _ in range(2):
+        cache.update_and_fetch(*(mx.random.normal((1, kv_heads, keys // 2, 512)).astype(mx.bfloat16) for _ in range(2)))
+    return cache
+
+
+def _attend(gemma4, module, x, keys = 4096, mask = "causal", call = None):
+    out = (call or module)(*([module] if call else []), x, mask = mask, cache = _filled(gemma4, keys, module.n_kv_heads))[0]
+    mx.eval(out)
+    return out
+
+
+def test_verify_scope_serves_only_marked_global_blocks_and_restores(monkeypatch):
+    gemma4, layers = _gemma4_attention(gqa = 8)
+    sliding, full = layers.layers
+    x = mx.random.normal((1, 4, 64)).astype(mx.bfloat16)
+    launched, kernel = [], decode._vector_attention
+    monkeypatch.setattr(decode, "_vector_attention", lambda *args: launched.append(args[0].shape[2]) or kernel(*args))
+    native = lambda *args: _attend(gemma4, full, *args, call = gemma4.Attention.__call__)
+    with monkeypatch.context() as patch:
+        patch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # the native call on MLX's vector kernel
+        vector = native(x)
+    with decode.fused_verify_attention(layers):
+        assert type(sliding) is gemma4.Attention and type(full) is not gemma4.Attention
+        _equal(_attend(gemma4, full, x), native(x))
+        with decode.verify_block_attention():
+            _equal(_attend(gemma4, full, x), vector)
+            assert launched == [4]
+            # A decode step, an unmasked block, and too few keys for MLX's two-pass kernel stay native.
+            for args in [(x[:, :1],), (x, 4096, None), (x, 600)]:
+                _equal(_attend(gemma4, full, *args), native(*args))
+            full.train()
+            _equal(_attend(gemma4, full, x), native(x))
+            full.eval()
+        assert launched == [4]
+    assert type(full) is gemma4.Attention
+    with pytest.raises(RuntimeError, match = "cancel"):
+        with decode.fused_verify_attention(layers):
+            with decode.fused_verify_attention(layers):
+                pass
+            assert type(full) is not gemma4.Attention   # the outer scope still holds it
+            with decode.verify_block_attention():
+                raise RuntimeError("cancel")
+    assert type(full) is gemma4.Attention and not decode._VERIFY_STATE.attention
+
+
+def test_verify_scope_keeps_native_when_the_first_launch_differs_from_decode(monkeypatch, caplog):
+    gemma4, layers = _gemma4_attention(gqa = 8)
+    full = layers.layers[1]
+    x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    monkeypatch.setattr(decode, "_VERIFY_ATTENTION_VERDICTS", {})
+    monkeypatch.setattr(decode, "_decode_attention", lambda queries, *args: queries)
+    expected = _attend(gemma4, full, x, call = gemma4.Attention.__call__)
+    with decode.fused_verify_attention(layers), decode.verify_block_attention():
+        _equal(_attend(gemma4, full, x), expected)
+        monkeypatch.setattr(decode, "_vector_attention", lambda *args: pytest.fail("a refused shape launched again"))
+        _equal(_attend(gemma4, full, x), expected)
+    assert list(decode._VERIFY_ATTENTION_VERDICTS.values()) == [False] and "differs" in caplog.text
+
+
+def test_a_launch_straddling_a_block_count_boundary_is_not_judged(monkeypatch):
+    keys = next((n for n in (8194, 16386, 32770, 65538) if decode._vector_blocks(8, n - 3) != decode._vector_blocks(32, n)), None)
+    if keys is None:
+        pytest.skip("this GPU class interleaves keys alike on both sides of every boundary")
+    for admitted in ({}, {(mx.bfloat16, 8, 4, decode._vector_blocks(32, keys)): True}):
+        monkeypatch.setattr(decode, "_VERIFY_ATTENTION_VERDICTS", dict(admitted))
+        monkeypatch.setattr(decode, "_vector_attention", lambda *args: pytest.fail("a straddling launch ran"))
+        assert decode._verify_attention(*_attention_block(8, 4, keys), None, 1.0, "causal", None) is None
+        assert decode._VERIFY_ATTENTION_VERDICTS == admitted
