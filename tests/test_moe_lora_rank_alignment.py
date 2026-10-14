@@ -167,3 +167,18 @@ def test_unpadded_rank_on_triton_matches_fp32_reference(monkeypatch, dtype, rank
     tol = 2e-2 if dtype == torch.bfloat16 else 5e-3
     for got, want in ((out.float(), ref), (x.grad.float(), xr.grad), (B.grad, Br.grad), (A.grad, Ar.grad)):
         assert ((got - want).abs().max() / want.abs().max()).item() < tol
+
+
+def test_every_pad_call_site_passes_the_gemm_input():
+    """Without the input the pad cannot see the Triton route and always copies."""
+    import ast
+    import inspect
+    from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML
+
+    calls = 0
+    for module in (M, ML):
+        for node in ast.walk(ast.parse(inspect.getsource(module))):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", None)) == "_pad_lora_rank_for_grouped_mm":
+                calls += 1
+                assert len(node.args) + len(node.keywords) == 3, ast.unparse(node)
+    assert calls >= 6

@@ -4733,7 +4733,7 @@ def forward_native_grouped_mm(
                 if w1_lora is not None:
                     lora_A, lora_B, scaling = w1_lora
                     lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
-                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1), permuted_input
                     )
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
@@ -4746,7 +4746,7 @@ def forward_native_grouped_mm(
                 if w3_lora is not None:
                     lora_A, lora_B, scaling = w3_lora
                     lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
-                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1), permuted_input
                     )
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
@@ -4888,7 +4888,7 @@ def forward_native_grouped_mm(
             if w2_lora is not None:
                 lora_A, lora_B, scaling = w2_lora
                 lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
-                    lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                    lora_A.transpose(-2, -1), lora_B.transpose(-2, -1), inter
                 )
                 lora_A_out = _grouped_mm_with_backward_fix(inter, lora_A_t.contiguous(), offsets)
                 lora_B_t = lora_B_t.contiguous()
