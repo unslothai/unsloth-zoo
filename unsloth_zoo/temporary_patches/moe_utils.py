@@ -2318,7 +2318,24 @@ def native_moe_grouped_mm(
     return _grouped_mm_with_backward_fix(inputs, weight, offsets)
 
 
-def _pad_lora_rank_for_grouped_mm(first_weight, second_weight):
+def _lora_rank_pad_needed(inputs, first_weight) -> bool:
+    """False when both LoRA GEMMs take Triton (masks any K / N, no 16-byte stride rule).
+    rank <= 32 keeps both GEMMs (min(K, N) = rank) in the same "lora" row class."""
+    if inputs is None or first_weight.shape[-1] > 32:
+        return True
+    if os.environ.get("UNSLOTH_MOE_LORA_PAD_ALWAYS", "0") == "1":
+        return True
+    if not _triton_grouped_mm_wanted(inputs, first_weight):
+        return True
+    # A failed self-check falls back to torch._grouped_mm, which needs the pad.
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+    if torch.compiler.is_compiling():
+        # Never run the self-check while tracing; skip the pad only if it already passed.
+        return not (mg._GENERIC_DISABLED_REASON is None and mg._GENERIC_SELF_CHECKED.get(inputs.device.index) is True)
+    return not mg.triton_grouped_available(inputs.device)
+
+
+def _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inputs = None):
     """Zero-pad the LoRA rank of (E, in, R) / (E, R, out) so torch._grouped_mm gets 16-byte
     aligned rows (bf16 rank 4 or 6 fell back to the per-expert loop, and aborted compile).
     Zero columns meet zero rows, so the product is exact. Minimum 8 even for fp32: autocast
@@ -2326,7 +2343,7 @@ def _pad_lora_rank_for_grouped_mm(first_weight, second_weight):
     align = max(8, 16 // first_weight.element_size())
     rank = first_weight.shape[-1]
     pad = (-rank) % align
-    if pad == 0:
+    if pad == 0 or not _lora_rank_pad_needed(inputs, first_weight):
         return first_weight, second_weight
     first_weight = F.pad(first_weight, (0, pad))
     second_weight = F.pad(second_weight, (0, 0, 0, pad))
@@ -2347,7 +2364,7 @@ def _apply_lora_grouped_mm(
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    lora_B, lora_A = _pad_lora_rank_for_grouped_mm(lora_B, lora_A)
+    lora_B, lora_A = _pad_lora_rank_for_grouped_mm(lora_B, lora_A, inputs)
     # X @ B then result @ A; both already in native (E, ...) layout, no transpose.
     lora_intermediate = grouped_mm_func(inputs, lora_B.contiguous(), offsets)
     lora_delta = grouped_mm_func(lora_intermediate, lora_A.contiguous(), offsets)
@@ -4638,7 +4655,7 @@ def forward_native_grouped_mm(
             # Cast to input dtype (LoRA is float32) and make contiguous for grouped_mm.
             first_weight = first_weight.to(permuted_input.dtype).contiguous()
             second_weight = second_weight.to(permuted_input.dtype).contiguous()
-            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight)
+            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight, permuted_input)
 
             try:
                 lora_out = _grouped_mm_with_backward_fix(permuted_input, first_weight, offsets)
@@ -4714,7 +4731,7 @@ def forward_native_grouped_mm(
                 if w1_lora is not None:
                     lora_A, lora_B, scaling = w1_lora
                     lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
-                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1), permuted_input
                     )
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
@@ -4727,7 +4744,7 @@ def forward_native_grouped_mm(
                 if w3_lora is not None:
                     lora_A, lora_B, scaling = w3_lora
                     lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
-                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1), permuted_input
                     )
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
@@ -4826,7 +4843,7 @@ def forward_native_grouped_mm(
             # Cast to input dtype (LoRA is float32) and make contiguous for grouped_mm.
             first_weight = first_weight.to(inter.dtype).contiguous()
             second_weight = second_weight.to(inter.dtype).contiguous()
-            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight)
+            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inter)
 
             lora_out = _grouped_mm_with_backward_fix(inter, first_weight, offsets)
             lora_out = lora_out.contiguous()
@@ -4869,7 +4886,7 @@ def forward_native_grouped_mm(
             if w2_lora is not None:
                 lora_A, lora_B, scaling = w2_lora
                 lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
-                    lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                    lora_A.transpose(-2, -1), lora_B.transpose(-2, -1), inter
                 )
                 lora_A_out = _grouped_mm_with_backward_fix(inter, lora_A_t.contiguous(), offsets)
                 lora_B_t = lora_B_t.contiguous()
