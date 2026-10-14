@@ -163,7 +163,7 @@ class SamplingParams:
 class GenerationDefaults:
     """Batch-wide defaults used when a request does not override a value.
 
-    ``stop_token_ids`` (text models) replaces the tokenizer's EOS set as the stop ids.
+    ``stop_token_ids`` replaces the tokenizer's EOS set as the stop ids.
     """
 
     max_tokens: int = 256
@@ -612,6 +612,11 @@ def _validate_vlm_requests(
                 f"requests[{index}] carries both an image and audio; batched "
                 "vision generation takes at most one medium per request."
             )
+        if request.audio is not None and defaults.stop_token_ids is not None:
+            raise ValueError(
+                f"requests[{index}] carries audio, which mlx-vlm decodes on its "
+                "own stopping criteria; omit stop_token_ids."
+            )
         if request.max_tokens is not None:
             _validate_positive_int(request.max_tokens, f"requests[{index}].max_tokens")
         if request.sampling is not None and not isinstance(
@@ -625,12 +630,44 @@ def _validate_vlm_requests(
     return validated
 
 
+class _StopIdsCriteria:
+    """Stops on exactly the given ids; mlx-vlm's criteria can only add to the EOS set."""
+
+    def __init__(self, ids):
+        self.eos_token_ids = list(ids)
+
+    def __call__(self, token) -> bool:
+        return token in self.eos_token_ids
+
+    def add_eos_token_ids(self, ids=None):
+        if ids is not None:
+            self.eos_token_ids.extend([ids] if isinstance(ids, int) else ids)
+
+
+class _Delegate:
+    def __init__(self, target):
+        self._target = target
+
+    def __getattr__(self, name):
+        if name == "_target":
+            raise AttributeError(name)
+        return getattr(self._target, name)
+
+
+def _generation_processor(adapter):
+    """The processor mlx-vlm's generator stops through: with ``stop_token_ids``, a view
+    stopping on those alone, leaving the shared tokenizer's criteria untouched."""
+    processor, stop_ids = adapter.processor, adapter.defaults.stop_token_ids
+    if stop_ids is None:
+        return processor
+    tokenizer = _Delegate(getattr(processor, "tokenizer", processor))
+    tokenizer.stopping_criteria = _StopIdsCriteria(stop_ids)
+    view = _Delegate(processor)
+    view.tokenizer = tokenizer
+    return view
+
+
 def _validate_vlm_defaults(defaults: GenerationDefaults) -> None:
-    if defaults.stop_token_ids is not None:
-        raise ValueError(
-            "stop_token_ids is not supported for batched vision generation; "
-            "mlx-vlm stops on its processor's own criteria."
-        )
     if defaults.prefill_batch_size > defaults.completion_batch_size:
         # An inverted pair never admits anything on mlx-vlm, so generation would
         # hang. mlx-lm normalizes the two, so this is vision-specific.
@@ -3186,7 +3223,7 @@ class _VLMBatchAdapter:
                 }
                 generator = self.generator_type(
                     self.model.language_model,
-                    self.processor,
+                    _generation_processor(self),
                     **options,
                 )
                 token_ids = input_ids.tolist()
@@ -3781,7 +3818,7 @@ class _VLMBatchSession:
         }
         generator = adapter.generator_type(
             adapter.model.language_model,
-            adapter.processor,
+            _generation_processor(adapter),
             **{
                 key: value
                 for key, value in options.items()
@@ -3853,7 +3890,8 @@ class _SpeculativeBatchSession:
         self.speculative = speculative
         self.tokenizer = getattr(adapter.processor, "tokenizer", adapter.processor)
         criteria = getattr(self.tokenizer, "stopping_criteria", None)
-        self.stop_tokens = frozenset(getattr(criteria, "eos_token_ids", None) or (ids[0] for ids in _eos_stop_tokens(self.tokenizer)))
+        stop_ids = adapter.defaults.stop_token_ids
+        self.stop_tokens = frozenset(stop_ids) if stop_ids is not None else frozenset(getattr(criteria, "eos_token_ids", None) or (ids[0] for ids in _eos_stop_tokens(self.tokenizer)))
         self.engine = SpeculativeEngine(adapter.model, speculative.controller, speculative.drafter, logprobs = True)
         self._pending: dict[int, _PendingResult] = {}
         # Rows whose prefill drew tokens the next step reports.

@@ -632,9 +632,9 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     ids, embeds = (types.SimpleNamespace(tolist=lambda: [[1], [2]]),
                    types.SimpleNamespace(to_dict=lambda: {"inputs_embeds": "E", "position_ids": None}))
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
-    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant", prefill_step_size=8192)
+    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant", prefill_step_size=8192, stop_token_ids=(5,))
     adapter.per_row_prompt_kwargs = True
-    adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
+    adapter.processor = types.SimpleNamespace(tokenizer=_CriteriaTokenizer())
     adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens", "kv_bits", "kv_quant_scheme", "quantized_kv_start", "prefill_step_size"}  # noqa: E501
     adapter.prepare_inputs = lambda *a, **k: {"input_ids": ids, "extra": "D", "position_ids": "P"}  # noqa: E501
     adapter.make_sampler = lambda **k: object()
@@ -651,7 +651,7 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
         config=types.SimpleNamespace(image_token_index=None), language_model=object(),
         get_input_embeddings=lambda *a, **k: (order.append("embed"), embeds)[1])
     adapter.generator_type = lambda *a, **k: (order.append("construct"),
-        seen.update(ctor=k), _vlm_stub(True, events=[[(0, 1, "stop")]])(*a[:2]))[2]
+        seen.update(ctor=k, stops=a[1].tokenizer.stopping_criteria), _vlm_stub(True, events=[[(0, 1, "stop")]])(*a[:2]))[2]
     assert [event.result for event in
             adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])] == [1, 1]
     assert order == ["wired", "embed", "policy", "construct"]
@@ -664,6 +664,7 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     # Per-row keeps configured sizes; EOS stays with the processor.
     assert (seen["ctor"]["prefill_batch_size"], seen["ctor"]["completion_batch_size"]) == (8, 32)
     assert "stop_tokens" not in seen["ctor"]
+    assert [seen["stops"](token) for token in (3, 5)] == [False, True] and adapter.processor.tokenizer.stopping_criteria(3)
     assert seen["ctor"]["prefill_step_size"] == 8192
     # A model that must not chunk its prefill still prefills whole.
     adapter._chunked_prefill_kwargs = lambda **kw: {"prefill_step_size": None}
@@ -1337,7 +1338,7 @@ class _OpenVLMGenerator:
     """mlx-vlm's open-batch surface: insert answers with uids, next reports."""
 
     def __init__(self, *args, **kwargs):
-        self.kwargs = kwargs
+        self.args, self.kwargs = args, kwargs
         self.inserted, self.removed, self.events = [], [], []
         self.closed = False
         self._next_uid = 0
@@ -1426,6 +1427,8 @@ def test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given():
         assert session.generator.kwargs["quantized_kv_start"] == 0  # from the first token, not mlx-vlm's 5000
     with contextlib.closing(_vlm_session(prefill_step_size = 8192)) as session:
         assert session.generator.kwargs["prefill_step_size"] == 8192
+    with contextlib.closing(_vlm_session(stop_token_ids = ())) as session:  # stops on nothing, not the EOS
+        assert session.generator.args[1].tokenizer.stopping_criteria.eos_token_ids == []
 
 
 def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
@@ -1670,7 +1673,16 @@ def test_kv_quant_controls_and_processor_rows_are_refused_before_they_reach_a_ca
 
 def test_the_preflight_refuses_defaults_every_add_would():
     from unsloth_zoo.mlx.generate import stream_unavailable_reason
-    assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed"), ({"_is_vlm_model": True, "language_model": object()}, {"stop_token_ids": (5,)}, "stop_token_ids")))  # noqa: E501
+    assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed")))  # noqa: E501
+
+
+def test_speculative_vision_rows_stop_on_the_callers_ids_and_audio_refuses_them(monkeypatch):
+    from unsloth_zoo.mlx import generate, speculative
+    monkeypatch.setattr(speculative, "install_speculative_seam", lambda: None)
+    monkeypatch.setattr(speculative, "SpeculativeEngine", lambda *a, **k: None)
+    adapter = dict(processor=types.SimpleNamespace(tokenizer=_CriteriaTokenizer()), model=None, _wired_limit=contextlib.nullcontext)
+    assert [generate._SpeculativeBatchSession(types.SimpleNamespace(**adapter, defaults=GenerationDefaults(stop_token_ids=stops)), types.SimpleNamespace(controller=None, drafter=None)).stop_tokens for stops in ((5, 7), ())] == [{5, 7}, set()]
+    assert pytest.raises(ValueError, generate._validate_vlm_requests, [GenerationRequest(prompt="p", audio="a.wav")], GenerationDefaults(stop_token_ids=(5,))).match("omit stop_token_ids")
 
 
 def test_a_cache_with_model_specific_state_refuses_a_quantized_batch_before_it_starts():
