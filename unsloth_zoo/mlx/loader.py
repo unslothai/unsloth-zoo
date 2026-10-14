@@ -229,7 +229,13 @@ def _mlx_lora_type_specs(*, include_convolutions=False):
     ]
     vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
     if vlm_switch_module is not None:
-        vlm_lora_module = importlib.import_module("mlx_vlm.trainer.lora_layers")
+        try:
+            vlm_lora_module = importlib.import_module("mlx_vlm.trainer.peft.lora_layers")
+        except ModuleNotFoundError as exc:
+            # mlx-vlm moved its LoRA layers into trainer.peft in 0.7.8.
+            if exc.name not in ("mlx_vlm.trainer.peft", "mlx_vlm.trainer.peft.lora_layers"):
+                raise
+            vlm_lora_module = importlib.import_module("mlx_vlm.trainer.lora_layers")
         specs.append(
             _MLXLoRATypeSpec(
                 (
