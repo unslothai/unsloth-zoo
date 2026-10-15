@@ -569,3 +569,17 @@ def test_routing_follows_the_copy_the_patched_forward_launches(fresh):
     assert go._triton_kernels_root(module) == "vllm.third_party.triton_kernels"
     module.__dict__["_unsloth_tk_root"] = "triton_kernels"
     assert go._triton_kernels_root(module) == "triton_kernels"
+
+
+def test_dense_training_follows_the_copy_the_patched_forward_launches(fresh):
+    _install(fresh, "triton_kernels", tkc.API_MATMUL_RAGGED)
+    vendored = _install(fresh, "vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
+    fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
+    fresh.setenv("UNSLOTH_TRITON_KERNELS_SOURCE", "vllm")
+    weight = torch.zeros(1)  # dense projection: no copy to read from the weight
+    routing_data = type("RoutingData", (), {})()  # built locally for matmul+ragged, no copy in its module
+    module = torch.nn.Module()
+    assert go._ogs_root_for(weight, routing_data, module) == "vllm.third_party.triton_kernels"
+    module.__dict__["_unsloth_tk_root"] = "triton_kernels"
+    assert go._ogs_root_for(weight, routing_data, module) == "triton_kernels"
+    assert go._ogs_backend_for(weight, routing_data, module).name == "triton_kernels"
