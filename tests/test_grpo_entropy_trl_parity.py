@@ -89,7 +89,6 @@ def _inputs(rows, cols, seed):
     logps = (-torch.rand(rows, cols, generator = gen, dtype = torch.float64) * 3).requires_grad_(True)
     old = logps.detach() + torch.randn(rows, cols, generator = gen, dtype = torch.float64) * 0.1
     ref = logps.detach() + torch.randn(rows, cols, generator = gen, dtype = torch.float64) * 0.1
-    # Rounded so the quantile threshold lands on ties.
     entropies = (torch.rand(rows, cols, generator = gen, dtype = torch.float64) * 4).round(decimals = 1).requires_grad_(True)
     mask = (torch.rand(rows, cols, generator = gen) > 0.25).long()
     mask[0] = 0  # a fully masked row
@@ -234,7 +233,6 @@ def test_grpo_accumulated_loss_wires_mask_and_bonus():
     assert "trainer.get_high_entropy_mask(new_entropies.detach(), completion_mask, 1 - _entropy_quantile)" in source
     assert 'kwargs["entropy_mask"] = entropy_mask' in source
     assert "_UnslothGRPOEntropyBonus.apply(" in source
-    # PrefixGrouper returns no entropies, so it must stand down when they are needed.
     assert "and not _need_entropy" in source
     assert "entropy_mask = kwargs.get(\"entropy_mask\", None)" in inspect.getsource(rr.grpo_compute_loss)
 
