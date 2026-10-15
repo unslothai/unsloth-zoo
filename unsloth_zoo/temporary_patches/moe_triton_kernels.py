@@ -211,8 +211,9 @@ def _launch_device(device):
     return torch.cuda.device(device)
 
 
-def nf4_dequant_triton(packed, quant_state, out_shape = None):
-    """NF4 blocksize-64 dequant in quant_state.dtype; None for any other state so bitsandbytes takes over."""
+def nf4_dequant_triton(packed, quant_state, out_shape = None, out = None):
+    """NF4 blocksize-64 dequant in quant_state.dtype; None for any other state so bitsandbytes takes over.
+    out: a contiguous tensor of that dtype and size to decode into."""
     if not moe_triton_kernels_available(packed.device):
         return None
     if (getattr(quant_state, "quant_type", None) != "nf4" or quant_state.blocksize != 64
@@ -229,6 +230,10 @@ def nf4_dequant_triton(packed, quant_state, out_shape = None):
     if numel != 2 * n_bytes:
         return None
     device = packed.device
+    if out is not None and (
+        out.numel() != numel or out.dtype != quant_state.dtype or out.device != device or not out.is_contiguous()
+    ):
+        return None
     code = quant_state.code
     absmax = quant_state.absmax
     nested = bool(quant_state.nested)
@@ -252,7 +257,7 @@ def nf4_dequant_triton(packed, quant_state, out_shape = None):
     BLOCK = 1024
     try:
         triton, kernel, _, _, _ = _get_kernels()
-        out = torch.empty(numel, dtype = quant_state.dtype, device = device)
+        out = torch.empty(numel, dtype = quant_state.dtype, device = device) if out is None else out.view(-1)
         with _launch_device(device):
             kernel[(triton.cdiv(n_bytes, BLOCK),)](
                 q, out, code, absmax, code2, absmax2, offset, n_bytes,
