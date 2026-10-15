@@ -8,7 +8,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 # The visual-server env builder must keep an inherited CUDA_VISIBLE_DEVICES when no
-# gpu is given (it used to force "0"), and replace it verbatim when one is.
+# gpu is given (it used to force "0"), pin GPU 0 when none is inherited, and replace
+# it verbatim when a gpu is given.
 
 from __future__ import annotations
 
@@ -31,13 +32,9 @@ def test_inherited_mask_kept_by_default(mask):
     assert _env({"PATH": "/usr/bin", "CUDA_VISIBLE_DEVICES": mask})["CUDA_VISIBLE_DEVICES"] == mask
 
 
-def test_unset_mask_stays_unset_by_default():
-    assert "CUDA_VISIBLE_DEVICES" not in _env({"PATH": "/usr/bin"})
-
-
-def test_gpu_none_keeps_inherited_mask():
-    env = _env({"PATH": "/usr/bin", "CUDA_VISIBLE_DEVICES": "2,1"}, gpu = None)
-    assert env["CUDA_VISIBLE_DEVICES"] == "2,1"
+def test_unset_mask_keeps_gpu_0_by_default():
+    # As before: no inherited mask still pins one card, not every GPU.
+    assert _env({"PATH": "/usr/bin"})["CUDA_VISIBLE_DEVICES"] == "0"
 
 
 @pytest.mark.parametrize("gpu", ["0", "3", "", "2,1", "GPU-8a1b2c3d", 1])

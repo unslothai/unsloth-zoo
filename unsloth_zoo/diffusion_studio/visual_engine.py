@@ -169,12 +169,11 @@ def _build_subprocess_env(server_bin, gpu = None, maxtok = 0, ngl = None, base_e
     (``cudart64_*.dll``) is prepended to ``PATH`` (#6273). Linux/WSL: the bundled ``nvidia-*`` dirs
     are prepended to ``LD_LIBRARY_PATH`` ahead of any inherited system CUDA (#6303). macOS / no GPU
     wheels: only the binary dir is added (unchanged). Pure/injectable for cross-platform tests.
-    ``gpu=None`` keeps the inherited ``CUDA_VISIBLE_DEVICES`` (set or unset); any other value,
-    including ``""`` (CPU only), replaces it."""
+    ``gpu=None`` keeps an inherited ``CUDA_VISIBLE_DEVICES`` (else GPU 0, as before); any other
+    value, including ``""`` (CPU only), replaces it."""
     name = os.name if os_name is None else os_name
     env = dict(os.environ if base_env is None else base_env)
-    if gpu is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else env.get("CUDA_VISIBLE_DEVICES", "0")
     env["NGL"] = str(_resolve_ngl(ngl, base_env))
     env["MAXTOK"] = str(maxtok)
 
