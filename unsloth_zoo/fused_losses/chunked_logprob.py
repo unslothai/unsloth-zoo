@@ -50,7 +50,7 @@ _CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 2.0)
 _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 
 
-def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None):
+def chunked_logprob_rows(vocab_size, target_gb=None, n_rows=None):
     """Rows per chunk so that one chunk's logits stay near `target_gb`, and with `n_rows` at most an eighth of them
     (min `UNSLOTH_LOGPROB_MIN_ROWS`, 512), so a short batch is not projected in one or two
     near-full chunks. At least 2: a one-row head gradient
@@ -73,16 +73,34 @@ def _transform(z, scalars, has_mul: bool, has_div: bool, has_cap: bool):
     return z
 
 
-def _forward_stats(logits, targets, scalars, has_mul: bool, has_div: bool, has_cap: bool, want_mean: bool):
+def _forward_stats(
+    logits,
+    targets,
+    scalars,
+    has_mul: bool,
+    has_div: bool,
+    has_cap: bool,
+    want_mean: bool,
+):
     z = _transform(logits.float(), scalars, has_mul, has_div, has_cap)
     mean_logits = z.mean(-1) if want_mean else None
     z = z * scalars[0]
-    lse = torch.logsumexp(z, dim = -1)
+    lse = torch.logsumexp(z, dim=-1)
     selected = z.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     return selected - lse, lse, mean_logits
 
 
-def _logits_grad(logits, targets, lse, grad, scalars, has_mul: bool, has_div: bool, has_cap: bool, out_dtype):
+def _logits_grad(
+    logits,
+    targets,
+    lse,
+    grad,
+    scalars,
+    has_mul: bool,
+    has_div: bool,
+    has_cap: bool,
+    out_dtype,
+):
     # d logp_t / d z_v = onehot(t)_v - softmax(z)_v, chained back through temperature, softcap and scale.
     x = logits.float()
     if has_mul:
@@ -95,7 +113,9 @@ def _logits_grad(logits, targets, lse, grad, scalars, has_mul: bool, has_div: bo
     else:
         z = x
     p = torch.exp(z * scalars[0] - lse.unsqueeze(-1))
-    onehot = torch.arange(z.shape[-1], device = z.device).unsqueeze(0) == targets.unsqueeze(-1)
+    onehot = torch.arange(z.shape[-1], device=z.device).unsqueeze(
+        0
+    ) == targets.unsqueeze(-1)
     dz = (onehot.to(p.dtype) - p) * (grad.unsqueeze(-1) * scalars[0])
     if has_cap:
         dz = dz * (1.0 - t * t)
@@ -118,7 +138,9 @@ def _run(name, fn, *args):
     compiled = _compiled.get(name)
     if compiled is None:
         # Only rows are dynamic: a symbolic vocab makes Inductor's row reductions ~3x slower.
-        compiled = _compiled[name] = torch.compile(fn, dynamic = None, fullgraph = True, options = torch_compile_options)
+        compiled = _compiled[name] = torch.compile(
+            fn, dynamic=None, fullgraph=True, options=torch_compile_options
+        )
     for x in args:
         # Else the second row count recompiles each body.
         if torch.is_tensor(x) and x.dim() >= 1 and x.shape[0] > 1:
@@ -133,11 +155,15 @@ def _run(name, fn, *args):
         return fn(*args)
 
 
+# ROCm's half-in / fp32-out GEMM is a slow fallback (gfx1151: 6-14x a bf16-out GEMM), so HIP keeps half outputs.
+_FP32_OUT_GEMM = torch.version.hip is None
+
+
 def _mm_fp32(a, b):
     """a @ b with an fp32 result for half inputs, so a vocab-long sum is rounded once, when cast to the grad dtype."""
-    if a.dtype in (torch.float16, torch.bfloat16) and a.is_cuda:
+    if _FP32_OUT_GEMM and a.dtype in (torch.float16, torch.bfloat16) and a.is_cuda:
         try:
-            return torch.mm(a, b, out_dtype = torch.float32)
+            return torch.mm(a, b, out_dtype=torch.float32)
         except (TypeError, RuntimeError):
             pass
     return a @ b
@@ -146,13 +172,19 @@ def _mm_fp32(a, b):
 _FP32_LOGITS = os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") != "0"
 
 
-def _project(hidden, weight, bias, compute_dtype, fp32_out = False):
+def _project(hidden, weight, bias, compute_dtype, fp32_out=False):
     h = hidden.to(compute_dtype)
     w = weight.to(compute_dtype)
-    if fp32_out and _FP32_LOGITS and compute_dtype in (torch.float16, torch.bfloat16) and h.is_cuda:
+    if (
+        fp32_out
+        and _FP32_LOGITS
+        and _FP32_OUT_GEMM
+        and compute_dtype in (torch.float16, torch.bfloat16)
+        and h.is_cuda
+    ):
         # bf16 logits bias a sequence's summed log-prob, which preference losses take differences of.
         try:
-            out = torch.mm(h, w.t(), out_dtype = torch.float32)
+            out = torch.mm(h, w.t(), out_dtype=torch.float32)
             return out if bias is None else out + bias.float()
         except (TypeError, RuntimeError):
             pass
@@ -170,29 +202,59 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, hidden, weight, bias, targets, rows_per_chunk, temperature,
-        logit_scale_multiply, logit_scale_divide, logit_softcapping, want_mean,
+        ctx,
+        hidden,
+        weight,
+        bias,
+        targets,
+        rows_per_chunk,
+        temperature,
+        logit_scale_multiply,
+        logit_scale_divide,
+        logit_softcapping,
+        want_mean,
     ):
         ctx.set_materialize_grads(False)
         device = hidden.device
         if torch.is_autocast_enabled(device.type):
             compute_dtype = torch.get_autocast_dtype(device.type)
         else:
-            compute_dtype = weight.dtype if weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else hidden.dtype
+            compute_dtype = (
+                weight.dtype
+                if weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                else hidden.dtype
+            )
         n = hidden.shape[0]
-        mul, div, cap = float(logit_scale_multiply), float(logit_scale_divide), float(logit_softcapping)
-        scalars = torch.tensor([1.0 / float(temperature), mul, div, cap], device = device, dtype = torch.float32)
+        mul, div, cap = (
+            float(logit_scale_multiply),
+            float(logit_scale_divide),
+            float(logit_softcapping),
+        )
+        scalars = torch.tensor(
+            [1.0 / float(temperature), mul, div, cap],
+            device=device,
+            dtype=torch.float32,
+        )
         flags = (mul != 0.0, div != 0.0, cap != 0.0)
-        logps = torch.empty(n, device = device, dtype = torch.float32)
-        lse = torch.empty(n, device = device, dtype = torch.float32)
-        mean_logits = torch.empty(n, device = device, dtype = torch.float32) if want_mean else None
-        with torch.autocast(device.type, enabled = False):
+        logps = torch.empty(n, device=device, dtype=torch.float32)
+        lse = torch.empty(n, device=device, dtype=torch.float32)
+        mean_logits = (
+            torch.empty(n, device=device, dtype=torch.float32) if want_mean else None
+        )
+        with torch.autocast(device.type, enabled=False):
             for a in range(0, n, rows_per_chunk):
                 b = min(a + rows_per_chunk, n)
-                logits = _project(hidden[a:b], weight, bias, compute_dtype, fp32_out = True)
+                logits = _project(
+                    hidden[a:b], weight, bias, compute_dtype, fp32_out=True
+                )
                 lp, ls, mean = _run(
-                    "fwd_mean" if want_mean else "fwd", _forward_stats,
-                    logits, targets[a:b], scalars, *flags, bool(want_mean),
+                    "fwd_mean" if want_mean else "fwd",
+                    _forward_stats,
+                    logits,
+                    targets[a:b],
+                    scalars,
+                    *flags,
+                    bool(want_mean),
                 )
                 logps[a:b] = lp
                 lse[a:b] = ls
@@ -210,24 +272,43 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_logps, grad_mean):
         hidden, weight, bias, targets, lse, scalars = ctx.saved_tensors
-        need_h, need_w, need_b = ctx.needs_input_grad[0], ctx.needs_input_grad[1], ctx.needs_input_grad[2]
+        need_h, need_w, need_b = (
+            ctx.needs_input_grad[0],
+            ctx.needs_input_grad[1],
+            ctx.needs_input_grad[2],
+        )
         if grad_logps is None or not (need_h or need_w or need_b):
             return (None,) * 10
         compute_dtype = ctx.compute_dtype
         grad_logps = grad_logps.float()
         n = hidden.shape[0]
         grad_hidden = torch.empty_like(hidden) if need_h else None
-        grad_weight = torch.zeros(weight.shape, device = weight.device, dtype = torch.float32) if need_w else None
-        grad_bias = torch.zeros(bias.shape, device = bias.device, dtype = torch.float32) if need_b else None
+        grad_weight = (
+            torch.zeros(weight.shape, device=weight.device, dtype=torch.float32)
+            if need_w
+            else None
+        )
+        grad_bias = (
+            torch.zeros(bias.shape, device=bias.device, dtype=torch.float32)
+            if need_b
+            else None
+        )
         w = weight.to(compute_dtype)
-        with torch.autocast(hidden.device.type, enabled = False):
+        with torch.autocast(hidden.device.type, enabled=False):
             for a in range(0, n, ctx.rows_per_chunk):
                 b = min(a + ctx.rows_per_chunk, n)
                 h = hidden[a:b].to(compute_dtype)
-                logits = _project(h, w, bias, compute_dtype, fp32_out = True)
+                logits = _project(h, w, bias, compute_dtype, fp32_out=True)
                 dz = _run(
-                    "bwd", _logits_grad,
-                    logits, targets[a:b], lse[a:b], grad_logps[a:b], scalars, *ctx.flags, compute_dtype,
+                    "bwd",
+                    _logits_grad,
+                    logits,
+                    targets[a:b],
+                    lse[a:b],
+                    grad_logps[a:b],
+                    scalars,
+                    *ctx.flags,
+                    compute_dtype,
                 )
                 del logits
                 if need_h:
@@ -241,18 +322,29 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
             grad_weight = grad_weight.to(weight.dtype)
         if grad_bias is not None:
             grad_bias = grad_bias.to(bias.dtype)
-        return grad_hidden, grad_weight, grad_bias, None, None, None, None, None, None, None
+        return (
+            grad_hidden,
+            grad_weight,
+            grad_bias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def unsloth_chunked_logprobs(
-    hidden_states : torch.Tensor,
-    lm_head       : torch.Tensor,
-    index         : torch.Tensor,
-    temperature   : float = 1.0,
-    logit_scale_multiply : float = 0.0,
-    logit_scale_divide   : float = 0.0,
-    logit_softcapping    : float = 0.0,
-    lm_head_bias  : Optional[torch.Tensor] = None,
+    hidden_states: torch.Tensor,
+    lm_head: torch.Tensor,
+    index: torch.Tensor,
+    temperature: float = 1.0,
+    logit_scale_multiply: float = 0.0,
+    logit_scale_divide: float = 0.0,
+    logit_softcapping: float = 0.0,
+    lm_head_bias: Optional[torch.Tensor] = None,
     rows_per_chunk: Optional[int] = None,
     return_mean_logits: bool = False,
 ):
@@ -265,10 +357,17 @@ def unsloth_chunked_logprobs(
     hidden = hidden_states.reshape(-1, hidden_states.shape[-1]).to(lm_head.device)
     targets = index.reshape(-1).to(lm_head.device)
     if rows_per_chunk is None:
-        rows_per_chunk = chunked_logprob_rows(lm_head.shape[0], n_rows = hidden.shape[0])
+        rows_per_chunk = chunked_logprob_rows(lm_head.shape[0], n_rows=hidden.shape[0])
     logps, mean_logits = UnslothChunkedLogProbs.apply(
-        hidden, lm_head, lm_head_bias, targets, int(rows_per_chunk), float(temperature),
-        float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
+        hidden,
+        lm_head,
+        lm_head_bias,
+        targets,
+        int(rows_per_chunk),
+        float(temperature),
+        float(logit_scale_multiply or 0.0),
+        float(logit_scale_divide or 0.0),
+        float(logit_softcapping or 0.0),
         bool(return_mean_logits),
     )
     logps = logps.reshape(lead_shape).to(hidden_states.device)
@@ -277,13 +376,17 @@ def unsloth_chunked_logprobs(
     return logps
 
 
-def unsloth_masked_logprobs(hidden_states, lm_head, labels, mask = None, ignore_index = -100, **kwargs):
+def unsloth_masked_logprobs(
+    hidden_states, lm_head, labels, mask=None, ignore_index=-100, **kwargs
+):
     """Like unsloth_chunked_logprobs, but only rows where `mask` (default labels != ignore_index) is set reach the head;
     the rest are 0. `masked_scatter` keeps an all-masked batch connected to the graph as a differentiable zero."""
     if mask is None:
         mask = labels != ignore_index
     mask = mask.to(hidden_states.device)
-    out = unsloth_chunked_logprobs(hidden_states[mask], lm_head, labels.to(mask.device)[mask], **kwargs)
+    out = unsloth_chunked_logprobs(
+        hidden_states[mask], lm_head, labels.to(mask.device)[mask], **kwargs
+    )
     if isinstance(out, tuple):
         return tuple(x.new_zeros(mask.shape).masked_scatter(mask, x) for x in out)
     return out.new_zeros(mask.shape).masked_scatter(mask, out)
@@ -300,37 +403,74 @@ class UnslothChunkedCE(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, hidden, weight, bias, targets, divisor, scaling, rows_per_chunk,
-        logit_scale_multiply, logit_scale_divide, logit_softcapping,
+        ctx,
+        hidden,
+        weight,
+        bias,
+        targets,
+        divisor,
+        scaling,
+        rows_per_chunk,
+        logit_scale_multiply,
+        logit_scale_divide,
+        logit_softcapping,
     ):
         device = hidden.device
         if torch.is_autocast_enabled(device.type):
             compute_dtype = torch.get_autocast_dtype(device.type)
         else:
-            compute_dtype = weight.dtype if weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else hidden.dtype
-        mul, div, cap = float(logit_scale_multiply), float(logit_scale_divide), float(logit_softcapping)
-        scalars = torch.tensor([1.0, mul, div, cap], device = device, dtype = torch.float32)
+            compute_dtype = (
+                weight.dtype
+                if weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                else hidden.dtype
+            )
+        mul, div, cap = (
+            float(logit_scale_multiply),
+            float(logit_scale_divide),
+            float(logit_softcapping),
+        )
+        scalars = torch.tensor([1.0, mul, div, cap], device=device, dtype=torch.float32)
         flags = (mul != 0.0, div != 0.0, cap != 0.0)
         need_h = hidden.requires_grad
         need_w = weight.requires_grad
         need_b = bias is not None and bias.requires_grad
         n = hidden.shape[0]
-        divisor = divisor.to(device = device, dtype = torch.float32).reshape(())
-        loss = torch.zeros((), device = device, dtype = torch.float32)
+        divisor = divisor.to(device=device, dtype=torch.float32).reshape(())
+        loss = torch.zeros((), device=device, dtype=torch.float32)
         grad_hidden = torch.empty_like(hidden) if need_h else None
-        grad_weight = torch.zeros(weight.shape, device = weight.device, dtype = torch.float32) if need_w else None
-        grad_bias = torch.zeros(bias.shape, device = bias.device, dtype = torch.float32) if need_b else None
+        grad_weight = (
+            torch.zeros(weight.shape, device=weight.device, dtype=torch.float32)
+            if need_w
+            else None
+        )
+        grad_bias = (
+            torch.zeros(bias.shape, device=bias.device, dtype=torch.float32)
+            if need_b
+            else None
+        )
         w = weight.to(compute_dtype)
         g_row = (-float(scaling) / divisor).expand(min(rows_per_chunk, max(n, 1)))
-        with torch.autocast(device.type, enabled = False):
+        with torch.autocast(device.type, enabled=False):
             for a in range(0, n, rows_per_chunk):
                 b = min(a + rows_per_chunk, n)
                 h = hidden[a:b].to(compute_dtype)
                 logits = _project(h, w, bias, compute_dtype)
-                lp, lse, _ = _run("fwd", _forward_stats, logits, targets[a:b], scalars, *flags, False)
+                lp, lse, _ = _run(
+                    "fwd", _forward_stats, logits, targets[a:b], scalars, *flags, False
+                )
                 loss -= lp.sum()
                 if need_h or need_w or need_b:
-                    dz = _run("bwd", _logits_grad, logits, targets[a:b], lse, g_row[: b - a], scalars, *flags, compute_dtype)
+                    dz = _run(
+                        "bwd",
+                        _logits_grad,
+                        logits,
+                        targets[a:b],
+                        lse,
+                        g_row[: b - a],
+                        scalars,
+                        *flags,
+                        compute_dtype,
+                    )
                     del logits
                     if need_h:
                         grad_hidden[a:b] = (dz @ w).to(grad_hidden.dtype)
@@ -343,7 +483,9 @@ class UnslothChunkedCE(torch.autograd.Function):
             grad_weight = grad_weight.to(weight.dtype)
         if grad_bias is not None:
             grad_bias = grad_bias.to(bias.dtype)
-        ctx.save_for_backward(*(x for x in (grad_hidden, grad_weight, grad_bias) if x is not None))
+        ctx.save_for_backward(
+            *(x for x in (grad_hidden, grad_weight, grad_bias) if x is not None)
+        )
         ctx.has = (need_h, need_w, need_b)
         ctx.scaling = float(scaling)
         return loss / divisor
@@ -357,9 +499,19 @@ class UnslothChunkedCE(torch.autograd.Function):
 
 
 def unsloth_chunked_ce_loss(
-    hidden_states, lm_head_weight, lm_head_bias, labels, mask = None, n_items = None, scaling = None,
-    shift_labels = True, ignore_index = -100, logit_scale_multiply = 0.0, logit_scale_divide = 0.0,
-    logit_softcapping = 0.0, rows_per_chunk = None,
+    hidden_states,
+    lm_head_weight,
+    lm_head_bias,
+    labels,
+    mask=None,
+    n_items=None,
+    scaling=None,
+    shift_labels=True,
+    ignore_index=-100,
+    logit_scale_multiply=0.0,
+    logit_scale_divide=0.0,
+    logit_softcapping=0.0,
+    rows_per_chunk=None,
 ):
     """Drop-in for the chunked fused CE (same shift / mask / n_items / scaling contract), scoring only labelled rows.
     A zero `scaling` stores unscaled gradients, so a collapsed GradScaler gives zeros rather than 0 * inf."""
@@ -376,17 +528,28 @@ def unsloth_chunked_ce_loss(
     keep = labels != ignore_index
     divisor = n_items if n_items is not None else keep.sum()
     if not torch.is_tensor(divisor):
-        divisor = torch.tensor(divisor, dtype = torch.float32)
+        divisor = torch.tensor(divisor, dtype=torch.float32)
     if divisor.numel() != 1:
         divisor = divisor.ravel()[0]
-    divisor = divisor.to(device = device, dtype = torch.float32)
-    divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)  # all-masked batch: loss 0, not 0 / 0
+    divisor = divisor.to(device=device, dtype=torch.float32)
+    divisor = torch.where(
+        divisor == 0, torch.ones_like(divisor), divisor
+    )  # all-masked batch: loss 0, not 0 / 0
     # Unlabelled rows (prompts in completion-only training) never reach the head.
     hidden = hidden[keep.to(hidden.device)].to(device)
     if rows_per_chunk is None:
-        rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0], n_rows = hidden.shape[0])
+        rows_per_chunk = chunked_logprob_rows(
+            lm_head_weight.shape[0], n_rows=hidden.shape[0]
+        )
     return UnslothChunkedCE.apply(
-        hidden, lm_head_weight, lm_head_bias, labels[keep], divisor, float(scaling or 1.0),
-        int(rows_per_chunk), float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0),
+        hidden,
+        lm_head_weight,
+        lm_head_bias,
+        labels[keep],
+        divisor,
+        float(scaling or 1.0),
+        int(rows_per_chunk),
+        float(logit_scale_multiply or 0.0),
+        float(logit_scale_divide or 0.0),
         float(logit_softcapping or 0.0),
     )
