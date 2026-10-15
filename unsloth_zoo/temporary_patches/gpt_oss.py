@@ -456,6 +456,8 @@ def _triton_kernels_root(module):
     weight = module.__dict__.get("_gate_up_proj", module.__dict__.get("gate_up_proj"))
     if weight is not None and not isinstance(weight, torch.Tensor):
         return type(weight).__module__.rsplit(".tensor", 1)[0]
+    if module.__dict__.get("_unsloth_tk_root"):  # the copy the patched expert forward launches with
+        return module.__dict__["_unsloth_tk_root"]
     from unsloth_zoo.triton_kernels_compat import get_triton_kernels
     tk = get_triton_kernels()
     return tk.__name__ if tk is not None else "triton_kernels"
@@ -728,6 +730,7 @@ def patch_gpt_oss():
             self, hidden_states: torch.Tensor, routing_data = None, gather_idx = None, scatter_idx = None,
             router_indices = None, routing_weights = None,
         ) -> torch.Tensor:
+            self.__dict__["_unsloth_tk_root"] = tk_backend.name
             hidden_states, routing_data, gather_idx, scatter_idx, leading_shape = _mxfp4_experts_routing(
                 self, hidden_states, routing_data, gather_idx, scatter_idx, router_indices, routing_weights,
             )

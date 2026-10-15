@@ -557,3 +557,15 @@ def test_real_routing_matches_a_dense_moe_across_experts():
     ref = torch.einsum("tk,tkn->tn", torch.softmax(vals, dim = 1), torch.einsum("tc,tknc->tkn", x.float(), dense[idx]))
     assert ((out - ref).norm() / ref.norm()).item() < 1e-2
 
+
+
+def test_routing_follows_the_copy_the_patched_forward_launches(fresh):
+    _install(fresh, "triton_kernels", tkc.API_MATMUL_RAGGED)
+    vendored = _install(fresh, "vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
+    fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
+    fresh.setenv("UNSLOTH_TRITON_KERNELS_SOURCE", "vllm")
+    module = torch.nn.Module()
+    module.__dict__["gate_up_proj"] = torch.zeros(1)  # dequantized: no copy to read from the weight
+    assert go._triton_kernels_root(module) == "vllm.third_party.triton_kernels"
+    module.__dict__["_unsloth_tk_root"] = "triton_kernels"
+    assert go._triton_kernels_root(module) == "triton_kernels"
