@@ -18,6 +18,7 @@
 
 Native heads: Qwen3.5 / 3.6 (mtp.Qwen35MTPHead) and every DeepSeek-V3 style NextN family in
 mtp_families (GLM-4.5 / 4.7 / 5, Hunyuan 3, Qwen3-Next, Nemotron-H, Step-3.5 / 3.7, ...).
+Separate drafters: DSpark for Qwen3 (dspark) and EAGLE-3 for targets without MTP (eagle3).
 
 Submodules import transformers lazily so `import unsloth_zoo` stays unchanged.
 """
@@ -44,6 +45,15 @@ __all__ = [
     "Qwen3DSparkDrafter",
     "DSparkTrainingArguments",
     "UnslothDSparkTrainer",
+    "eagle3_supported",
+    "build_eagle3_vocab_map",
+    "Eagle3Drafter",
+    "build_eagle3_drafter",
+    "save_eagle3_drafter",
+    "load_eagle3_drafter",
+    "convert_eagle3_to_gguf",
+    "Eagle3TrainingArguments",
+    "UnslothEagle3Trainer",
 ]
 
 _LOCATIONS = {
@@ -68,6 +78,15 @@ _LOCATIONS = {
     "Qwen3DSparkDrafter": "dspark",
     "DSparkTrainingArguments": "dspark",
     "UnslothDSparkTrainer": "dspark",
+    "eagle3_supported": "eagle3",
+    "build_eagle3_vocab_map": "eagle3",
+    "Eagle3Drafter": "eagle3",
+    "build_eagle3_drafter": "eagle3",
+    "save_eagle3_drafter": "eagle3",
+    "load_eagle3_drafter": "eagle3",
+    "convert_eagle3_to_gguf": "eagle3",
+    "Eagle3TrainingArguments": "eagle3",
+    "UnslothEagle3Trainer": "eagle3",
 }
 
 
