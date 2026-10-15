@@ -54,6 +54,7 @@ import torch.nn.functional as F
 ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 _MAX_ROLLOUTS = 2
+_MAX_PENDING = 64
 
 
 def routing_replay_requested():
@@ -111,6 +112,12 @@ class _ReplayState:
         self.forwarded_since_record = True
         self.pad_token_id = None
         self.current = None
+        # Gradient checkpointing: routes each decoder forward forced per layer, so the recompute
+        # in backward replays its own forward even after later forwards (chunked GRPO losses).
+        self.in_forward = False
+        self.record = None
+        self.pending = []
+        self.recomputed = False
         self.stats = dict(
             recorded = 0,
             forwards = 0,
@@ -118,6 +125,7 @@ class _ReplayState:
             unmatched_tokens = 0,
             router_calls_replayed = 0,
             router_calls_natural = 0,
+            router_calls_recomputed = 0,
         )
         self.changed = None
         self.warned_invalid = False
@@ -285,6 +293,15 @@ def _decoder_pre_hook(module, args, kwargs):
         input_ids = args[0]
     _STATE.stats["forwards"] += 1
     _STATE.forwarded_since_record = True
+    _STATE.in_forward = True
+    _STATE.record = None
+    if torch.is_grad_enabled() and _uses_checkpointing(module):
+        if _STATE.recomputed:
+            _STATE.pending.clear()
+            _STATE.recomputed = False
+        _STATE.record = {}
+        _STATE.pending.append(_STATE.record)
+        del _STATE.pending[:-_MAX_PENDING]
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
         return None
@@ -294,6 +311,42 @@ def _decoder_pre_hook(module, args, kwargs):
         input_ids, kwargs.get("position_ids", None), kwargs.get("attention_mask", None),
     )
     return None
+
+
+def _decoder_post_hook(module, args, output):
+    _STATE.in_forward = False
+    _STATE.record = None
+    return None
+
+
+def _uses_checkpointing(decoder):
+    if getattr(decoder, "gradient_checkpointing", False):
+        return True
+    return any(getattr(layer, "gradient_checkpointing", False) for layer in getattr(decoder, "layers", None) or ())
+
+
+def _fingerprint(ids):
+    # Order-free per token, position-weighted int64 hash of the natural top-k ids (wraps on overflow).
+    ids = ids.long().sort(-1).values
+    weights = torch.arange(1, ids.numel() + 1, device = ids.device, dtype = torch.long).view(ids.shape)
+    return ((ids + 1) * (weights * 2654435761)).sum()
+
+
+def _recomputed_routes(layer_index, ids2):
+    # A router call outside a decoder forward is a checkpoint recompute: pick the recorded forward
+    # whose natural routing it reproduces, without a host sync. None when no forward was recorded.
+    if not _STATE.pending:
+        return None
+    _STATE.recomputed = True
+    candidates = [r[layer_index] for r in _STATE.pending if layer_index in r and r[layer_index][1].shape == ids2.shape]
+    if not candidates:
+        return ids2.long(), torch.zeros((ids2.shape[0], 1), dtype = torch.bool, device = ids2.device)
+    fp = _fingerprint(ids2)
+    match = torch.stack([c[0] == fp for c in candidates])
+    pick = match.to(torch.int32).argmax()
+    forced = torch.stack([c[1] for c in candidates])[pick]
+    valid = torch.stack([c[2] for c in candidates])[pick] & match.any()
+    return forced, valid
 
 
 def _softmax_gather(logits, ids, renorm):
@@ -330,7 +383,7 @@ def _router_hook(layer_index):
     def hook(module, args, output):
         replay = _STATE.current
         positions = _split_router_output(output)
-        if replay is None or positions is None:
+        if positions is None:
             _STATE.stats["router_calls_natural"] += 1
             return None
         li, wi, ii = positions
@@ -339,7 +392,13 @@ def _router_hook(layer_index):
         logits2 = logits.reshape(-1, num_experts)
         ids2 = ids.reshape(-1, ids.shape[-1])
         weights2 = weights.reshape(ids2.shape)
-        if (
+        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2)
+        if recomputed is not None:
+            _STATE.stats["router_calls_recomputed"] += 1
+        if recomputed is None and replay is None:
+            _STATE.stats["router_calls_natural"] += 1
+            return None
+        if recomputed is None and (
             replay.shape[0] != ids2.shape[0]
             or layer_index >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
@@ -367,9 +426,16 @@ def _router_hook(layer_index):
             _STATE.stats["router_calls_natural"] += 1
             return None
 
-        forced = replay[:, layer_index, :]
-        valid = (forced >= 0).all(dim = -1, keepdim = True)
-        forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
+        if recomputed is None:
+            forced = replay[:, layer_index, :]
+            valid = (forced >= 0).all(dim = -1, keepdim = True)
+            forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
+            if _STATE.record is not None:
+                # A copy: the output ids may alias forced, and MoE blocks can reuse them in place.
+                _STATE.record[layer_index] = (_fingerprint(ids2), forced.clone(), valid)
+        else:
+            forced, valid = recomputed
+            forced = torch.where(valid, forced, ids2.long())
         new_weights = _formulas()[formula](logits2, forced).to(weights2.dtype)
         new_weights = torch.where(valid, new_weights, weights2)
         with torch.no_grad():
@@ -421,6 +487,7 @@ def install_routing_replay(model, llm = None, tokenizer = None):
     for layer_index, module in routers:
         module.register_forward_hook(_router_hook(layer_index))
     decoder.register_forward_pre_hook(_decoder_pre_hook, with_kwargs = True)
+    decoder.register_forward_hook(_decoder_post_hook, always_call = True)
     model._unsloth_routing_replay_installed = True
     print(f"Unsloth: MoE routing replay is on for {len(routers)} routers.")
     return len(routers)

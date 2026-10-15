@@ -284,6 +284,34 @@ def test_gradient_checkpointing_recompute_uses_replay(replay):
     torch.testing.assert_close(grad_gc, grad_plain, rtol = 1e-4, atol = 1e-6)
 
 
+def test_recompute_replays_each_forward_of_a_chunked_loss(replay):
+    # Two equal-shape forwards before one backward, as the padded GRPO chunk loop does: each
+    # checkpoint recompute must replay its own forward's routes, not the last forward's.
+    sequences = [([5, 6, 7], [30, 31, 32, 33]), ([8, 9, 10], [40, 41, 42, 43])]
+    model = _model()
+    forced = _forced_rows(model, sequences, shift = 2)
+
+    def run(checkpointing):
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        m.model.embed_tokens.weight.requires_grad_(True)
+        rr.reset_routing_replay()
+        _install(m)
+        rr.record_routed_experts([_request(p, c, f.numpy()) for (p, c), f in zip(sequences, forced)])
+        losses = [m(input_ids = torch.tensor([p + c])).logits.float().pow(2).mean() for p, c in sequences]
+        sum(losses).backward()
+        return torch.stack([l.detach() for l in losses]), [l.mlp.gate.weight.grad.clone() for l in m.model.layers]
+
+    losses_plain, grads_plain = run(False)
+    losses_gc, grads_gc = run(True)
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 4 * NUM_LAYERS
+    torch.testing.assert_close(losses_gc, losses_plain, rtol = 1e-5, atol = 1e-6)
+    for got, want in zip(grads_gc, grads_plain):
+        torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
+
+
 def test_topk_softmax_router_is_covered_by_softmax_renorm(replay):
     class GptOssLikeRouter(torch.nn.Module):
         def __init__(self):
