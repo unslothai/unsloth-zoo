@@ -1091,20 +1091,41 @@ def _fetch_release_json_asset(assets, asset_name):
 
 def _detect_gpu_target():
     """Return ("cuda", sm, "cuda12"/"cuda13"/None) or ("rocm", "gfxNNNN")
-    from torch, or None when no GPU target is detectable."""
+    from torch, or None when no GPU target is detectable.
+
+    The bundle serves every visible device, not just device 0. CUDA: sm is the minimum
+    visible SM, and a mixed host appends the sorted visible SMs as a 4th element so
+    _select_gpu_assets only offers bundles covering all of them. ROCm: the current
+    device's arch when every visible card shares its bundle family, else None (a
+    source build, which _gpu_cmake_flags targets at every visible arch)."""
     if torch is None:
         return None
     try:
         if not torch.cuda.is_available():
             return None
+        count = max(1, torch.cuda.device_count())
         if getattr(torch.version, "hip", None):
-            gfx = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "") or ""
-            gfx = gfx.split(":")[0]
-            return ("rocm", gfx) if gfx.startswith("gfx") else None
-        major, minor = torch.cuda.get_device_capability(0)
+            archs = [
+                (getattr(torch.cuda.get_device_properties(i), "gcnArchName", "") or "").split(":")[0]
+                for i in range(count)
+            ]
+            try:
+                current = torch.cuda.current_device()
+            except Exception:
+                current = 0
+            gfx = archs[current] if 0 <= current < count else archs[0]
+            if not gfx.startswith("gfx"):
+                return None
+            if any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in archs if a.startswith("gfx")):
+                return None
+            return ("rocm", gfx)
+        sms = sorted({major * 10 + minor for major, minor in
+                      (torch.cuda.get_device_capability(i) for i in range(count))})
         cuda_version = getattr(torch.version, "cuda", None)
         line = f"cuda{cuda_version.split('.')[0]}" if cuda_version else None
-        return ("cuda", major * 10 + minor, line)
+        if len(sms) > 1:
+            return ("cuda", sms[0], line, tuple(sms))
+        return ("cuda", sms[0], line)
     except Exception:
         return None
 
@@ -1185,7 +1206,9 @@ def _select_gpu_assets(tag, assets, manifest, target = None):
             and a.get("asset_name") in assets
         ]
 
-    _, sm, preferred_line = target
+    _, sm, preferred_line = target[:3]
+    # Mixed host: every visible SM must be covered, not just the minimum.
+    required = set(target[3]) if len(target) > 3 else {sm}
     if system == "Windows":
         kind = "windows-cuda"
     elif system == "Linux":
@@ -1205,7 +1228,7 @@ def _select_gpu_assets(tag, assets, manifest, target = None):
         portable = None
         for a in (a for a in kind_artifacts if a.get("runtime_line") == line):
             supported = {int(s) for s in a.get("supported_sms", []) if str(s).isdigit()}
-            if sm not in supported:
+            if not required <= supported:
                 continue
             if a.get("coverage_class") == "portable":
                 portable = a

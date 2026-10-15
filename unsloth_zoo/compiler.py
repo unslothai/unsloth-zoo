@@ -103,7 +103,12 @@ OLD_CUDA_ARCH_VERSION = False
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
-        OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+        # Any visible pre-Turing card, not just the current one: a device_map can place
+        # layers on it, and Inductor fails there.
+        from .device_type import _visible_cuda_capabilities
+        OLD_CUDA_ARCH_VERSION = any(
+            (_major <= 7) and (_minor < 5) for _major, _minor in _visible_cuda_capabilities()
+        )
     else:
         # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
         # ask whether a device is present before asking what it can do. There is
