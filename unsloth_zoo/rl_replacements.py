@@ -1674,9 +1674,7 @@ def grpo_accumulated_loss(
         from unsloth_zoo.rl_replacements import (
             chunked_hidden_states_selective_log_softmax_recompute as chunked_hidden_states_selective_log_softmax,
         )
-    # TRL entropy masking (top_entropy_quantile) and the fixed entropy bonus (entropy_coef, TRL >= 1.8),
-    # both detected off the trainer. The entropies come out of the logprob pass itself; adaptive
-    # entropy control is not implemented, so it disables the bonus (and warns).
+    # Adaptive entropy control is not implemented, so it disables the bonus (and warns).
     _entropy_quantile = getattr(trainer.args, "top_entropy_quantile", 1.0)
     _entropy_mask_on = (
         _entropy_quantile is not None and _entropy_quantile < 1.0
@@ -1901,8 +1899,8 @@ def grpo_accumulated_loss(
         all_logprobs_list = []
         all_entropies_list = []
 
-        # Entropies come out of the logprob pass itself. No width dispatch of their own here: unsloth
-        # rewrites every `if <x>.shape[-1] == lm_head.shape[1]:` in this function and refuses others.
+        # No width dispatch in these helpers: unsloth rewrites every
+        # `if <x>.shape[-1] == lm_head.shape[1]:` in this function and refuses any other spelling.
         def _hidden_logps_and_entropies(hidden_states, ids, chunks):
             return _entropy_log_softmax(
                 hidden_states, lm_head, ids, chunks,
@@ -2582,8 +2580,7 @@ def grpo_accumulated_loss(
         if _need_entropy:
             new_entropies = torch.cat(all_entropies_list, dim = 0)
             if _entropy_mask_on:
-                # TRL's own method: its quantile population (valid tokens of every process), ties
-                # (>= threshold) and empty-batch rule, whichever TRL version is installed.
+                # TRL's own method, so its quantile population, ties and empty-batch rule match per version.
                 entropy_mask = trainer.get_high_entropy_mask(new_entropies.detach(), completion_mask, 1 - _entropy_quantile)
                 kwargs["entropy_mask"] = entropy_mask
 
@@ -2618,8 +2615,7 @@ def grpo_accumulated_loss(
                 upstream_scale,
             )
         if _entropy_bonus_on:
-            # TRL: loss - entropy_coef * mean entropy over the tokens the policy term acts on,
-            # divided only by the accumulation steps (1 in eval), whatever the loss_type.
+            # As TRL: a masked token mean divided only by the accumulation steps, whatever the loss_type.
             _entropy_weights = completion_mask.to(torch.float32)
             if entropy_mask is not None:
                 _entropy_weights = _entropy_weights * entropy_mask
