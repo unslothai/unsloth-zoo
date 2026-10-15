@@ -4678,11 +4678,12 @@ pass
 
 
 def _float32_merge_peak_bytes(total_16bit_bytes, max_shard_16bit_bytes, uploads_as_it_goes = False):
-    # Local: earlier shards stay widened, so the last rewrite peaks at 2 x total + one shard.
-    # Streamed to the Hub: widened shards are uploaded and removed, so 16-bit total + 2 x shard.
+    # A widened shard can be rewritten once more (grown vocab), holding two float32 copies.
+    # Local: earlier shards stay widened, so 2 x total + one more 16-bit shard's worth.
+    # Streamed to the Hub: widened shards are uploaded and removed, so total + 3 x shard.
     if uploads_as_it_goes:
-        return total_16bit_bytes + 2 * max_shard_16bit_bytes
-    return 2 * total_16bit_bytes + max_shard_16bit_bytes
+        return total_16bit_bytes + 3 * max_shard_16bit_bytes
+    return 2 * total_16bit_bytes + 2 * max_shard_16bit_bytes
 pass
 
 
