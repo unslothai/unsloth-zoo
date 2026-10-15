@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The automatic tile / fused CE memory budget must be read from the operand's device.
-
-`_default_target_gb` used to ask `mem_get_info(0)`, so under torchrun every rank sized its
-chunks from GPU 0's free memory and opened a CUDA context on GPU 0. The fused CE multiplier
-was also `functools.cache`d with the measurement inside, so the first reading (taken before
-optimizer states exist) was reused for the rest of training.
-
-CPU only: the accelerator namespace is mocked with one free-memory figure per device index
-and a current device that is not 0.
-"""
+"""Tile / fused CE memory budgets must be read from the operand's device, not GPU 0, and not cached."""
 import importlib
 import types
 
@@ -62,7 +53,6 @@ class _FakeCuda:
         return self.current
 
     def mem_get_info(self, device = None):
-        # torch resolves None to the current device, as torch.cuda.mem_get_info does.
         if device is None:
             index = self.current
         elif isinstance(device, int):
