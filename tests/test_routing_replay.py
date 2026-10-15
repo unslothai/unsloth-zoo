@@ -305,3 +305,55 @@ def test_wrap_vllm_generate_records_and_is_idempotent(replay):
     assert llm.generate is first
     llm.generate([])
     assert rr.routing_replay_stats()["recorded"] == 1
+
+
+def test_rollout_split_into_many_generate_calls_is_kept_whole(replay):
+    # generate_batches splits one rollout into several llm.generate calls before any training forward.
+    model = _model()
+    sequences = [([5, 6, 7], [30, 31, 32]), ([8, 9], [40, 41, 42]), ([10, 11], [50, 51]), ([12], [60, 61, 62])]
+    forced = _forced_rows(model, sequences, shift = 1)
+    _install(model)
+    llm = SimpleNamespace(calls = iter([[_request(p, c, f.numpy())] for (p, c), f in zip(sequences, forced)]))
+    llm.generate = lambda *a, **k: next(llm.calls)
+    rr.wrap_vllm_generate(llm)
+    for _ in sequences:
+        llm.generate([])
+    for (p, c), f in zip(sequences, forced):
+        with torch.no_grad():
+            out = model(input_ids = torch.tensor([p + c])).logits
+            expected = _reference_forced_forward(model, p + c, f)
+        torch.testing.assert_close(out, expected, rtol = 1e-5, atol = 1e-6)
+    assert rr.routing_replay_stats()["unmatched_tokens"] == 0
+
+    # The next rollout opens after the training forwards; the one before it is still kept.
+    rr.record_routed_experts([_request([13], [14, 15], np.zeros((3, NUM_LAYERS, TOP_K)))])
+    rr.record_routed_experts([_request([16], [17, 18], np.zeros((3, NUM_LAYERS, TOP_K)))])
+    assert len(rr._STATE.generations) == 2
+    assert rr._lookup(tuple(sequences[0][0] + sequences[0][1])) is not None
+    rr._decoder_pre_hook(None, (), {})
+    rr.record_routed_experts([_request([19], [20, 21], np.zeros((3, NUM_LAYERS, TOP_K)))])
+    assert rr._lookup(tuple(sequences[0][0] + sequences[0][1])) is None
+    assert rr._lookup((13, 14, 15)) is not None
+
+
+def test_real_pad_id_token_keeps_replay_under_attention_mask(replay):
+    # pad == eos: a chat separator inside the prompt carries the pad id but is attended.
+    model = _model()
+    prompt, completion = [5, PAD, 6, 7], [30, 31, 32, PAD]
+    ids = prompt + completion
+    forced = _forced_rows(model, [(prompt, completion)], shift = 2)[0]
+    with torch.no_grad():
+        expected = _reference_forced_forward(model, ids, forced)
+
+    _install(model)
+    rr.record_routed_experts([_request(prompt, completion, forced.numpy())])
+    # Left padded, the trailing eos attended, as the GRPO completion mask keeps it.
+    padded = torch.tensor([[PAD, PAD] + ids])
+    mask = torch.tensor([[0, 0] + [1] * len(ids)])
+    position_ids = (mask.cumsum(-1) - 1).clamp(min = 0)
+    with torch.no_grad():
+        out = model(input_ids = padded, attention_mask = mask, position_ids = position_ids).logits
+    torch.testing.assert_close(out[0, 2:], expected[0], rtol = 1e-4, atol = 1e-5)
+    stats = rr.routing_replay_stats()
+    assert stats["replayed_tokens"] == len(ids)
+    assert stats["unmatched_tokens"] == 0

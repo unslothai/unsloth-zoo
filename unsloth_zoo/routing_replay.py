@@ -22,9 +22,11 @@ those expert ids in its own forwards (old / ref / new logprobs, the loss forward
 gradient checkpointing recompute), while the routing weights are still recomputed from the
 trainer's router logits over the forced ids, so the router keeps its gradient.
 
-Rows are matched by content: the key is the row's token ids with pad ids dropped, the same
-filter on both sides, so any reordering, chunking, left packing or sequence packing of the
-batch still finds its rollout. A row or token with no match keeps its natural routing.
+Rows are matched by content: the key is the row's attended token ids (the training attention
+mask, else the token ids with pad ids dropped on both sides), so any reordering, chunking, left
+packing or sequence packing of the batch still finds its rollout. Every `llm.generate` call
+between two training forwards belongs to one rollout, so a rollout split into sub-batches is
+kept whole. A row or token with no match keeps its natural routing.
 """
 
 __all__ = [
@@ -51,7 +53,7 @@ import torch.nn.functional as F
 
 ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
-_MAX_GENERATIONS = 2
+_MAX_ROLLOUTS = 2
 
 
 def routing_replay_requested():
@@ -97,8 +99,10 @@ def routing_replay_engine_args(config):
 
 class _ReplayState:
     def __init__(self):
+        # rollout id -> [(store, unpadded)], one entry per llm.generate call of that rollout.
         self.generations = OrderedDict()
         self.generation_id = 0
+        self.forwarded_since_record = True
         self.pad_token_id = None
         self.current = None
         self.stats = dict(
@@ -137,6 +141,7 @@ def record_routed_experts(request_outputs, pad_token_id = None):
     if pad_token_id is None:
         pad_token_id = _STATE.pad_token_id
     store = {}
+    unpadded = {}
     for request_output in request_outputs:
         prompt_ids = list(getattr(request_output, "prompt_token_ids", None) or [])
         for completion in getattr(request_output, "outputs", None) or []:
@@ -149,24 +154,37 @@ def record_routed_experts(request_outputs, pad_token_id = None):
             rows = torch.full((len(full),) + tuple(routed.shape[1:]), -1, dtype = torch.int16)
             n = min(len(full), routed.shape[0])
             rows[:n] = routed[:n]
+            # Keyed by every token: a pad id inside the sequence (pad == eos) can be real.
+            key = tuple(full)
+            store[key] = rows
             if pad_token_id is not None:
-                keep = torch.tensor([t != pad_token_id for t in full], dtype = torch.bool)
-                rows = rows[keep]
-            store[_make_key(full, pad_token_id)] = rows
+                unpadded[_make_key(full, pad_token_id)] = key
             _STATE.stats["recorded"] += 1
     if store:
-        _STATE.generation_id += 1
-        _STATE.generations[_STATE.generation_id] = store
-        while len(_STATE.generations) > _MAX_GENERATIONS:
+        # A training forward closes the rollout; generate calls before the next one join it.
+        if _STATE.forwarded_since_record or not _STATE.generations:
+            _STATE.generation_id += 1
+            _STATE.generations[_STATE.generation_id] = []
+            _STATE.forwarded_since_record = False
+        next(reversed(_STATE.generations.values())).append((store, unpadded, pad_token_id))
+        while len(_STATE.generations) > _MAX_ROLLOUTS:
             _STATE.generations.popitem(last = False)
     return len(store)
 
 
-def _lookup(key):
-    for store in reversed(_STATE.generations.values()):
-        rows = store.get(key, None)
-        if rows is not None:
-            return rows
+def _lookup(key, exact = False):
+    """Rows for `key`: all attended tokens when `exact`, else the tokens with pad ids dropped."""
+    for rollout in reversed(_STATE.generations.values()):
+        for store, unpadded, pad in reversed(rollout):
+            if exact or pad is None:
+                rows = store.get(key, None)
+            else:
+                full = unpadded.get(key, None)
+                rows = None
+                if full is not None:
+                    rows = store[full][torch.tensor([t != pad for t in full], dtype = torch.bool)]
+            if rows is not None:
+                return rows
     return None
 
 
@@ -202,7 +220,7 @@ def _segments(input_ids, position_ids):
     return [(r, 0, T) for r in range(rows)]
 
 
-def _build_replay(input_ids, position_ids):
+def _build_replay(input_ids, position_ids, attention_mask = None):
     if not _STATE.generations:
         return None
     pad = _STATE.pad_token_id
@@ -211,12 +229,22 @@ def _build_replay(input_ids, position_ids):
     out = None
     replayed = unmatched = 0
     ids_list = ids.tolist()
+    mask_list = None
+    if torch.is_tensor(attention_mask) and tuple(attention_mask.shape) == (rows, T):
+        mask_list = attention_mask.detach().to("cpu").bool().tolist()
     for row, start, end in _segments(ids, position_ids):
         tokens = ids_list[row][start:end]
-        cols = [start + i for i, t in enumerate(tokens) if pad is None or t != pad]
-        if not cols:
-            continue
-        routed = _lookup(_make_key(tokens, pad))
+        routed = None
+        if mask_list is not None:
+            # Padding is what the mask leaves out, so real pad id tokens keep their routing.
+            cols = [start + i for i in range(end - start) if mask_list[row][start + i]]
+            if cols:
+                routed = _lookup(tuple(ids_list[row][c] for c in cols), exact = True)
+        if routed is None:
+            cols = [start + i for i, t in enumerate(tokens) if pad is None or t != pad]
+            if not cols:
+                continue
+            routed = _lookup(_make_key(tokens, pad))
         if routed is None or routed.shape[0] != len(cols):
             unmatched += len(cols)
             continue
@@ -236,12 +264,15 @@ def _decoder_pre_hook(module, args, kwargs):
     if input_ids is None and len(args) > 0 and torch.is_tensor(args[0]) and not args[0].is_floating_point():
         input_ids = args[0]
     _STATE.stats["forwards"] += 1
+    _STATE.forwarded_since_record = True
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
         return None
     # Left set after the forward on purpose: the gradient checkpointing recompute in
     # backward must see the same routing as the forward it replays.
-    _STATE.current = _build_replay(input_ids, kwargs.get("position_ids", None))
+    _STATE.current = _build_replay(
+        input_ids, kwargs.get("position_ids", None), kwargs.get("attention_mask", None),
+    )
     return None
 
 
