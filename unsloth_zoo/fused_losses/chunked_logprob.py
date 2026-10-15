@@ -52,23 +52,27 @@ _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 
 
 @functools.cache
-def _default_chunk_gb():
-    # Like the fused CE it replaces: at most half the free memory, read once, so a nearly full device gets small chunks.
+def _default_chunk_gb(device = None):
+    # Like the fused CE it replaces: at most half the free memory, read once per device, so a nearly full device
+    # (the head's, which may not be GPU 0 under device_map) gets small chunks.
     try:
-        from unsloth_zoo.tiled_mlp import _default_target_gb
+        if device is not None and device.type == "cuda" and torch.cuda.is_available():
+            free = torch.cuda.mem_get_info(device)[0] / 1024**3 * 0.5
+        else:
+            from unsloth_zoo.tiled_mlp import _default_target_gb
 
-        free = float(_default_target_gb())
+            free = float(_default_target_gb())
     except Exception:
         return _CHUNK_GB
     return min(_CHUNK_GB, free) if free > 0 else _CHUNK_GB
 
 
-def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None):
+def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None, device = None):
     """Rows per chunk so that one chunk's logits stay near `target_gb`, and with `n_rows` at most an eighth of them
     (min `UNSLOTH_LOGPROB_MIN_ROWS`, 512), so a short batch is not projected in one or two
     near-full chunks. At least 2: a one-row head gradient
     is a K=1 matmul Inductor mis-lowers under dynamic shapes (see chunked_hidden_states_selective_log_softmax)."""
-    target_gb = _default_chunk_gb() if target_gb is None else target_gb
+    target_gb = _default_chunk_gb(device) if target_gb is None else target_gb
     rows = int(target_gb * (1024**3) / (max(int(vocab_size), 1) * _BYTES_PER_LOGIT))
     if n_rows is not None:
         rows = min(rows, max(_MIN_ROWS, -(-int(n_rows) // 8)))
@@ -203,10 +207,11 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
         logps = torch.empty(n, device = device, dtype = torch.float32)
         lse = torch.empty(n, device = device, dtype = torch.float32)
         mean_logits = torch.empty(n, device = device, dtype = torch.float32) if want_mean else None
+        w = weight.to(compute_dtype)
         with torch.autocast(device.type, enabled = False):
             for a in range(0, n, rows_per_chunk):
                 b = min(a + rows_per_chunk, n)
-                logits = _project(hidden[a:b], weight, bias, compute_dtype, fp32_out = True)
+                logits = _project(hidden[a:b], w, bias, compute_dtype, fp32_out = True)
                 lp, ls, mean = _run(
                     "fwd_mean" if want_mean else "fwd", _forward_stats,
                     logits, targets[a:b], scalars, *flags, bool(want_mean),
@@ -234,7 +239,8 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
         grad_logps = grad_logps.float()
         n = hidden.shape[0]
         grad_hidden = torch.empty_like(hidden) if need_h else None
-        grad_weight = torch.zeros(weight.shape, device = weight.device, dtype = torch.float32) if need_w else None
+        # In the head's dtype, like the fused CE path: an fp32 [V, H] buffer costs GiBs on a trainable half head.
+        grad_weight = torch.zeros_like(weight) if need_w else None
         grad_bias = torch.zeros(bias.shape, device = bias.device, dtype = torch.float32) if need_b else None
         w = weight.to(compute_dtype)
         with torch.autocast(hidden.device.type, enabled = False):
@@ -250,7 +256,7 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
                 if need_h:
                     grad_hidden[a:b] = _mm_fp32(dz, w).to(grad_hidden.dtype)
                 if need_w:
-                    grad_weight.add_((dz.t() @ h).float())
+                    grad_weight.add_(dz.t() @ h)
                 if need_b:
                     grad_bias.add_(dz.float().sum(0))
                 del dz
@@ -282,7 +288,7 @@ def unsloth_chunked_logprobs(
     hidden = hidden_states.reshape(-1, hidden_states.shape[-1]).to(lm_head.device)
     targets = index.reshape(-1).to(lm_head.device)
     if rows_per_chunk is None:
-        rows_per_chunk = chunked_logprob_rows(lm_head.shape[0], n_rows = hidden.shape[0])
+        rows_per_chunk = chunked_logprob_rows(lm_head.shape[0], n_rows = hidden.shape[0], device = lm_head.device)
     logps, mean_logits = UnslothChunkedLogProbs.apply(
         hidden, lm_head, lm_head_bias, targets, int(rows_per_chunk), float(temperature),
         float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
@@ -335,7 +341,7 @@ class UnslothChunkedCE(torch.autograd.Function):
         divisor = divisor.to(device = device, dtype = torch.float32).reshape(())
         loss = torch.zeros((), device = device, dtype = torch.float32)
         grad_hidden = torch.empty_like(hidden) if need_h else None
-        grad_weight = torch.zeros(weight.shape, device = weight.device, dtype = torch.float32) if need_w else None
+        grad_weight = torch.zeros_like(weight) if need_w else None
         grad_bias = torch.zeros(bias.shape, device = bias.device, dtype = torch.float32) if need_b else None
         w = weight.to(compute_dtype)
         g_row = (-float(scaling) / divisor).expand(min(rows_per_chunk, max(n, 1)))
@@ -352,7 +358,7 @@ class UnslothChunkedCE(torch.autograd.Function):
                     if need_h:
                         grad_hidden[a:b] = (dz @ w).to(grad_hidden.dtype)
                     if need_w:
-                        grad_weight.add_((dz.t() @ h).float())
+                        grad_weight.add_(dz.t() @ h)
                     if need_b:
                         grad_bias.add_(dz.float().sum(0))
                     del dz
@@ -401,7 +407,7 @@ def unsloth_chunked_ce_loss(
     # Unlabelled rows (prompts in completion-only training) never reach the head.
     hidden = hidden[keep.to(hidden.device)].to(device)
     if rows_per_chunk is None:
-        rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0], n_rows = hidden.shape[0])
+        rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0], n_rows = hidden.shape[0], device = device)
     return UnslothChunkedCE.apply(
         hidden, lm_head_weight, lm_head_bias, labels[keep], divisor, float(scaling or 1.0),
         int(rows_per_chunk), float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0),

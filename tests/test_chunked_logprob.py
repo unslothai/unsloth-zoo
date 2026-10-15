@@ -244,3 +244,41 @@ def test_default_chunk_budget_shrinks_with_free_memory(monkeypatch):
         assert cl._default_chunk_gb() == want
         assert cl.chunked_logprob_rows(1000) == cl.chunked_logprob_rows(1000, target_gb = want)
     cl._default_chunk_gb.cache_clear()
+
+
+def test_chunk_budget_reads_the_head_device(monkeypatch):
+    seen = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda d: seen.append(d) or (int(0.5 * 1024**3), 0))
+    cl._default_chunk_gb.cache_clear()
+    dev = torch.device("cuda", 1)
+    assert cl._default_chunk_gb(dev) == 0.25 and seen == [dev]
+    cl._default_chunk_gb.cache_clear()
+
+
+def test_forward_casts_the_head_once(monkeypatch):
+    weights = []
+    project = cl._project
+
+    def spy(hidden, weight, *args, **kwargs):
+        weights.append(weight)
+        return project(hidden, weight, *args, **kwargs)
+
+    monkeypatch.setattr(cl, "_project", spy)
+    head = torch.randn(32, 16)
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        unsloth_chunked_logprobs(torch.randn(10, 16), head, torch.randint(0, 32, (10,)), rows_per_chunk = 3)
+    assert len(weights) == 4 and all(w.dtype == torch.bfloat16 for w in weights)
+    assert len({w.data_ptr() for w in weights}) == 1
+
+
+def test_half_trainable_head_gradient_keeps_its_dtype():
+    torch.manual_seed(0)
+    hidden = torch.randn(12, 16, requires_grad = True)
+    head = torch.randn(32, 16).bfloat16().requires_grad_(True)
+    targets = torch.randint(0, 32, (12,))
+    unsloth_chunked_logprobs(hidden.bfloat16(), head, targets, rows_per_chunk = 5).sum().backward()
+    hd, wd = hidden.detach().double(), head.detach().double().requires_grad_(True)
+    torch.log_softmax(hd.bfloat16().double() @ wd.t(), -1).gather(-1, targets[:, None]).sum().backward()
+    assert head.grad.dtype == torch.bfloat16
+    torch.testing.assert_close(head.grad.double(), wd.grad, rtol = 3e-2, atol = 3e-2)

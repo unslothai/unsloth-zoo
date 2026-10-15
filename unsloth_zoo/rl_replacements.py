@@ -222,7 +222,7 @@ def grpo_chunked_hidden_states_logprobs(
     if max_rows_per_chunk is None:
         env_rows = os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip()
         max_rows_per_chunk = int(env_rows) if env_rows.isdigit() else 0
-    rows_per_chunk = chunked_logprob_rows(lm_head.shape[0], n_rows = index.numel())
+    rows_per_chunk = chunked_logprob_rows(lm_head.shape[0], n_rows = index.numel(), device = lm_head.device)
     if max_rows_per_chunk > 0:
         rows_per_chunk = min(rows_per_chunk, max_rows_per_chunk)
     return unsloth_chunked_logprobs(
