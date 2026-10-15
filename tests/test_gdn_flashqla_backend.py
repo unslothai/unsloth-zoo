@@ -174,9 +174,13 @@ def _qla_chunk_011(
     return "flashqla-0.1.1"
 
 
-@pytest.mark.parametrize("chunk, accepted", [(_qla_chunk_010, False), (_qla_chunk_011, True)])
-def test_load_rejects_flashqla_without_state_v_first(monkeypatch, chunk, accepted):
+@pytest.mark.parametrize("chunk, version, accepted", [
+    (_qla_chunk_010, None, False), (_qla_chunk_011, None, True),
+    (_qla_chunk_011, "0.1.1", False), (_qla_chunk_011, "0.1.2", True), (_qla_chunk_011, "0.1.3", True),
+])
+def test_load_rejects_flashqla_before_0_1_2(monkeypatch, chunk, version, accepted):
     import torch
+    monkeypatch.setattr(fv, "_flashqla_version", lambda module: version)
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
@@ -192,6 +196,7 @@ def test_load_rejects_flashqla_without_state_v_first(monkeypatch, chunk, accepte
 ])
 def test_load_keeps_fla_on_sm120_unless_allowed(monkeypatch, capability, allow, accepted):
     import torch
+    monkeypatch.setattr(fv, "_flashqla_version", lambda module: "0.1.3")
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)

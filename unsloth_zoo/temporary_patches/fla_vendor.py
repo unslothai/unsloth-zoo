@@ -902,6 +902,14 @@ def _gdn_backend():
     return os.environ.get("UNSLOTH_GDN_BACKEND", "").strip().lower()
 
 
+def _flashqla_version(flash_qla):
+    try:
+        import importlib.metadata as _md
+        return _md.version("flash-qla")
+    except Exception:
+        return getattr(flash_qla, "__version__", None)
+
+
 def _load_flashqla():
     """flash_qla, or None. Its import picks kernels for the current device and raises on others."""
     if _flashqla_state["module"] is not None:
@@ -923,9 +931,13 @@ def _load_flashqla():
                 "set UNSLOTH_FLASHQLA_ALLOW_SM120=1 to use it anyway"
             )
         import flash_qla
-        # state_v_first (always forwarded below) first appeared in FlashQLA 0.1.1.
-        if "state_v_first" not in inspect.signature(flash_qla.chunk_gated_delta_rule).parameters:
-            raise RuntimeError("flash-qla >= 0.1.1 is required")
+        # state_v_first (always forwarded below) first appeared in FlashQLA 0.1.1, and 0.1.1's
+        # id()-keyed tensor cache can reuse stale chunk indices for packed batches (fixed in 0.1.2).
+        installed = _flashqla_version(flash_qla)
+        if "state_v_first" not in inspect.signature(flash_qla.chunk_gated_delta_rule).parameters or (
+            installed is not None and not _version_at_least(installed, "0.1.2")
+        ):
+            raise RuntimeError(f"flash-qla >= 0.1.2 is required (found {installed or 'an older build'})")
     except Exception as e:
         _flashqla_state["failed"] = True
         logger.warning(
