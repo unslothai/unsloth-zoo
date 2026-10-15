@@ -4327,6 +4327,9 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
+        if not use_async and not use_engine:
+            from .routing_replay import routing_replay_engine_args
+            engine_args.update(routing_replay_engine_args(config))
         if fp8_moe is not None:
             # Only the Triton FP8 MoE kernel keeps the expert layout training aliases.
             engine_args["moe_backend"] = "triton"
@@ -4620,6 +4623,9 @@ def load_vllm(
         pass
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
         llm.approx_max_num_seqs = approx_max_num_seqs
+        if engine_args.get("enable_return_routed_experts", False):
+            from .routing_replay import wrap_vllm_generate
+            wrap_vllm_generate(llm)
         if _merged_rollout_enabled():
             llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)
