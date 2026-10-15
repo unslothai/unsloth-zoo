@@ -28,6 +28,7 @@ import torch
 from transformers import Trainer, TrainingArguments
 
 from .capture import resolve_text_parts, run_frozen_target
+from . import losses
 from .losses import chunked_lm_loss, fastmtp_step_weights
 
 
@@ -116,10 +117,13 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
         if args.mtp_loss_type != "ce" or args.mtp_label_source == "teacher":
             teacher_hidden = _shift_window(final_hidden, k, length, 0).reshape(-1, final_hidden.shape[-1])
         if args.mtp_label_source == "teacher":
+            # Same logits budget as chunked_lm_loss: one [rows, V] projection per chunk.
+            per_row = target_lm_head_weight.shape[0] * target_lm_head_weight.element_size()
+            rows = max(1, min(args.mtp_chunk_size, losses.LOGITS_BUDGET_BYTES // per_row))
             with torch.no_grad():
                 teacher_ids = torch.cat([
                     (chunk.to(target_lm_head_weight.dtype) @ target_lm_head_weight.T).argmax(-1)
-                    for chunk in teacher_hidden.split(args.mtp_chunk_size)
+                    for chunk in teacher_hidden.split(rows)
                 ]).view_as(labels)
             labels = torch.where(labels != -100, teacher_ids, labels)
         loss_sum, n_tokens, n_correct = chunked_lm_loss(

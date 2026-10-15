@@ -497,7 +497,12 @@ class UnslothDSparkTrainer(Trainer):
         if attention_mask is not None:
             loss_mask = loss_mask & attention_mask.bool()
         drafter = self.accelerator.unwrap_model(model)
-        captured = run_frozen_target(self.target_model, input_ids, attention_mask = attention_mask, layer_ids = drafter.target_layer_ids)
+        # DeepSpec's -1 is the embedding output, not the last layer (a Python index to the capture).
+        ids = drafter.target_layer_ids
+        captured = run_frozen_target(self.target_model, input_ids, attention_mask = attention_mask,
+                                     layer_ids = [i for i in ids if i >= 0], embed = -1 in ids)
+        if -1 in ids:
+            captured[-1] = captured.pop("embed")
         dtype = next(p for p in drafter.parameters()).dtype
         out = model(drafter.context_states(captured).to(dtype), input_ids, loss_mask, self.args.dspark_num_anchors)
         loss, stats = dspark_loss(

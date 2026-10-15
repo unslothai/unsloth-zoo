@@ -118,8 +118,9 @@ def _store(tensor):
 
 
 @contextlib.contextmanager
-def capture_hidden_states(model, layer_ids = (), final = True):
-    """Record the post-norm final hidden state (`"final"`) and decoder layer outputs (`i`)."""
+def capture_hidden_states(model, layer_ids = (), final = True, embed = False):
+    """Record the post-norm final hidden state (`"final"`), decoder layer outputs (`i`) and, with
+    `embed`, the embedding output (`"embed"`)."""
     parts = resolve_text_parts(model)
     backbone, layers = parts["backbone"], parts["backbone"].layers
     n_layers = len(layers)
@@ -156,6 +157,8 @@ def capture_hidden_states(model, layer_ids = (), final = True):
                 captured["final"] = _store(tensor)
 
     try:
+        if embed:
+            handles.append(parts["embed_tokens"].register_forward_hook(layer_hook("embed")))
         for i in layer_ids:
             handles.append(layers[i].register_forward_hook(layer_hook(i)))
         if final:
@@ -174,11 +177,11 @@ _MULTIMODAL_KWARGS = (
 )
 
 
-def run_frozen_target(model, input_ids, attention_mask = None, layer_ids = (), **kwargs):
+def run_frozen_target(model, input_ids, attention_mask = None, layer_ids = (), embed = False, **kwargs):
     """No-grad target pass returning the capture dict, skipping the lm_head when possible."""
     parts = resolve_text_parts(model)
     multimodal = any(kwargs.get(name) is not None for name in _MULTIMODAL_KWARGS)
-    with torch.no_grad(), capture_hidden_states(model, layer_ids = layer_ids) as captured:
+    with torch.no_grad(), capture_hidden_states(model, layer_ids = layer_ids, embed = embed) as captured:
         if not multimodal:
             try:
                 parts["backbone"](
