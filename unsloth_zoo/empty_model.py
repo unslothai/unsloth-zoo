@@ -48,7 +48,10 @@ from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
 # get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
-QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5", "qwen3_5_moe")
+QWEN_VL_MERGED_QKV_TYPES = (
+    "qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision",
+    "qwen3_5", "qwen3_5_vision", "qwen3_5_moe", "qwen3_5_moe_vision",
+)
 
 
 def _is_gemma4_config(config):
@@ -57,7 +60,9 @@ def _is_gemma4_config(config):
     model_type = getattr(config, "model_type", None)
     text_config = getattr(config, "text_config", config)
     text_model_type = getattr(text_config, "model_type", None)
-    return model_type == "gemma4" or text_model_type in ("gemma4", "gemma4_text")
+    # gemma4_unified (encoder-free vision) shares Gemma-4's text stack and vLLM language model.
+    return model_type in ("gemma4", "gemma4_unified") or \
+        text_model_type in ("gemma4", "gemma4_text", "gemma4_unified_text")
 pass
 
 def is_comparable(val):
@@ -400,6 +405,12 @@ def patch_gemma4_vllm_lora_support():
         from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
         classes_to_patch.append(Gemma4ForConditionalGeneration)
         gemma4_lora_classes.append("Gemma4ForConditionalGeneration")
+    except Exception:
+        pass
+    try:
+        from vllm.model_executor.models.gemma4_unified import Gemma4UnifiedForConditionalGeneration
+        classes_to_patch.append(Gemma4UnifiedForConditionalGeneration)
+        gemma4_lora_classes.append("Gemma4UnifiedForConditionalGeneration")
     except Exception:
         pass
     try:
@@ -1287,6 +1298,9 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.router.scale",
             "model.layers.{kk}.router.per_expert_scale",
 
+            # MuseGlimmer attention output gate (vLLM self_attn.output_gate_proj)
+            "model.language_model.layers.{kk}.self_attn.gate_proj",
+
             # Gemma4 per-layer input modules
             "model.language_model.layers.{kk}.per_layer_input_gate",
             "model.language_model.layers.{kk}.per_layer_projection",
@@ -1359,6 +1373,10 @@ def get_model_layer_config(return_non_layered=True):
             # Gemma4 per-layer input norm
             "model.language_model.layers.{kk}.post_per_layer_input_norm",
             "model.layers.{kk}.post_per_layer_input_norm",
+
+            # MuseGlimmer vision
+            "model.vision_tower.layers.{kk}.norm1",
+            "model.vision_tower.layers.{kk}.norm2",
 
             # Idefics3
             "model.text_model.layers.{kk}.input_layernorm",
@@ -1449,6 +1467,22 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_model.encoder.layers.{kk}.mlp.fc1",
             "model.vision_model.encoder.layers.{kk}.mlp.fc2",
 
+            # MuseGlimmer (filled by _extract_muse_glimmer_vision, not resolved on vLLM)
+            "model.vision_tower.layers.{kk}.attn.q_proj",
+            "model.vision_tower.layers.{kk}.attn.k_proj",
+            "model.vision_tower.layers.{kk}.attn.v_proj",
+            "model.vision_tower.layers.{kk}.attn.proj",
+            "model.vision_tower.layers.{kk}.mlp.fc1",
+            "model.vision_tower.layers.{kk}.mlp.fc2",
+
+        } | {
+            # Gemma4 use_clipped_linears (dense E2B / E4B): clamp bounds are checkpoint buffers.
+            f"model.vision_tower.encoder.layers.{{kk}}.{proj}.{bound}"
+            for proj in (
+                "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+            )
+            for bound in ("input_min", "input_max", "output_min", "output_max")
         },
         'additional_layers': {
             # Primarily for layers that are neither language decoder layers or vision transformer layers/blocks.
@@ -1560,6 +1594,11 @@ def get_model_layer_counts(config):
             "vision_layers": getattr(vision_config, "depth", 27),
             "deepstack_layers": getattr(vision_config, "deepstack_depth", 3),
         }
+    elif model_type in ("qwen3_5", "qwen3_5_vision", "qwen3_5_moe", "qwen3_5_moe_vision"):
+        return {
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "depth", 27),
+        }
     elif model_type in ("gemma4", "gemma4_vision", "gemma4_unified", "gemma4_unified_vision"):
         return {
             "text_layers": getattr(text_config, "num_hidden_layers", 32),
@@ -1569,6 +1608,11 @@ def get_model_layer_counts(config):
         return {
             "text_layers": getattr(text_config, "num_hidden_layers", 32),
             "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
+        }
+    elif model_type in ("muse_glimmer", "muse_glimmer_vision"):
+        return {
+            "text_layers": getattr(text_config, "num_hidden_layers", 52),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 50),
         }
     elif model_type in ("idefics3", "idefics3_vision"):
         return {
@@ -2114,6 +2158,28 @@ def extract_nemotron_h_mixer(mixer, prefix, state_dict, quant_state_dict, get_st
 pass
 
 
+def _dequantize_bnb_shards(raw_weight, weight, quant_states, total_rows):
+    """Dense rows of a vLLM in-flight BnB weight: each loaded shard is packed at
+    `bnb_shard_offsets` with its own quant state, and the shards need not match the
+    module's output_sizes (vLLM loads HF in_proj_qkv as one shard). None if not that layout."""
+    offsets = getattr(raw_weight, "bnb_shard_offsets", getattr(weight, "bnb_shard_offsets", None))
+    if not isinstance(quant_states, dict) or offsets is None or len(quant_states) == 0:
+        return None
+    if len(offsets) != len(quant_states) + 1:
+        return None
+    from bitsandbytes.functional import dequantize_4bit
+    # Extraction runs under vLLM's inference_mode; the dense copy is a training weight.
+    with torch.inference_mode(False), torch.no_grad():
+        parts = [
+            dequantize_4bit(weight[offsets[i]:offsets[i + 1]], quant_state = quant_states[i])
+            for i in range(len(quant_states))
+        ]
+        full = torch.cat(parts, dim = 0)
+    if total_rows is not None and full.shape[0] != total_rows:
+        return None
+    return full
+
+
 def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_state_dict):
     gdn = gdn_module
 
@@ -2174,7 +2240,11 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
                     fused_full_qs = qs
                 break
 
-        if fused_full_qs is not None:
+        full = _dequantize_bnb_shards(raw_weight, weight, qs_attr, offsets[4])
+        if full is not None:
+            store(f"{prefix}.in_proj_qkv.weight", full[offsets[0]:offsets[3]])
+            store(f"{prefix}.in_proj_z.weight", full[offsets[3]:offsets[4]])
+        elif fused_full_qs is not None:
             try:
                 from bitsandbytes.functional import dequantize_4bit
             except Exception:
@@ -2237,7 +2307,12 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
 
     ba_qs = getattr(raw_ba_weight, "bnb_quant_state", getattr(ba_weight, "bnb_quant_state", None))
     ba_states = [ba_qs.get(i) for i in (0, 1)] if isinstance(ba_qs, dict) else [None, None]
-    if isinstance(ba_qs, dict) and ba_states[0] is not None and ba_states[1] is None:
+    full_ba = _dequantize_bnb_shards(raw_ba_weight, ba_weight, ba_qs, None)
+    if full_ba is not None:
+        full_mid = full_ba.shape[0] // 2
+        store(f"{prefix}.in_proj_b.weight", full_ba[:full_mid])
+        store(f"{prefix}.in_proj_a.weight", full_ba[full_mid:])
+    elif isinstance(ba_qs, dict) and ba_states[0] is not None and ba_states[1] is None:
         try:
             from bitsandbytes.functional import dequantize_4bit
         except Exception:
@@ -2288,6 +2363,10 @@ pass
 def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict):
     """Extract vision layers via the model-specific layer config."""
     model_type = get_model_type(vllm_internals.config)
+    if model_type in ("muse_glimmer", "muse_glimmer_vision"):
+        # vLLM's root keeps the text model at .model, so the generic "model.layers.*" templates
+        # would match text norms under the wrong prefix; every vision name differs anyway.
+        return _extract_muse_glimmer_vision(vllm_internals, state_dict, quant_state_dict, get_state_dict)
     layer_config = get_model_layer_config()
 
     all_layered_templates = (
@@ -2310,7 +2389,11 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 layer_path = layer_path.replace('language_model.model', 'language_model')
 
 
-            if layer_module is not None:
+            if isinstance(layer_module, torch.Tensor):
+                # Parameters / buffers (e.g. Gemma4 clip bounds named *_proj.input_min)
+                state_dict[f"{layer_path}"] = layer_module.data
+                quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
+            elif layer_module is not None:
                 if "qkv" in layer_path:
                     if model_type in QWEN_VL_MERGED_QKV_TYPES:
                         # HF keeps merged qkv for these (qwen-2.5-vl, qwen-3-vl)
@@ -2378,3 +2461,85 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
         weight = component.weight
         state_dict[f'{path}.weight'] = weight.reshape(vision_config.hidden_size, vision_config.in_channels, vision_config.temporal_patch_size, vision_config.patch_size, vision_config.patch_size)
         quant_state_dict[f'{path}.weight'] = state_dict[f'{path}.weight']
+
+    if model_type in ("gemma4_unified", "gemma4_unified_vision"):
+        _extract_gemma4_unified_vision(vllm_internals, state_dict, quant_state_dict, get_state_dict)
+pass
+
+
+def _store_vision_module(vllm_module, hf_name, state_dict, quant_state_dict, get_state_dict, kk = 0):
+    if vllm_module is None:
+        return
+    if isinstance(vllm_module, torch.Tensor):
+        state_dict[hf_name] = vllm_module.data
+        quant_state_dict[hf_name] = vllm_module.data
+        return
+    vllm_module = getattr(vllm_module, "base_layer", vllm_module)
+    quant_states = getattr(getattr(vllm_module, "weight", None), "bnb_quant_state", None)
+    if quant_states is not None and ".layers." not in hf_name:
+        # Non-layered keys are installed as plain tensors (set_additional_modules), so a
+        # bitsandbytes-packed weight is dequantized (a small projection, e.g. Gemma-4 unified patch_dense).
+        import bitsandbytes.functional as bnb_functional
+        weight = bnb_functional.dequantize_4bit(vllm_module.weight.data, quant_states[0])
+        state_dict[f"{hf_name}.weight"] = weight
+        quant_state_dict[f"{hf_name}.weight"] = weight
+        bias = getattr(vllm_module, "bias", None)
+        if bias is not None:
+            state_dict[f"{hf_name}.bias"] = bias.data
+            quant_state_dict[f"{hf_name}.bias"] = bias.data
+        return
+    get_state_dict(hf_name, kk, state_dict, vllm_module)
+pass
+
+
+def _extract_gemma4_unified_vision(vllm_internals, state_dict, quant_state_dict, get_state_dict):
+    """Encoder-free Gemma-4: vLLM vision_embedder.* / embed_vision.embedding_projection are HF
+    model.embed_vision.* / model.embed_vision.multimodal_embedder.embedding_projection
+    (transformers conversion_mapping["gemma4_unified"])."""
+    stale = "model.embed_vision.embedding_projection."
+    for d in (state_dict, quant_state_dict):
+        for key in [k for k in d if k.startswith(stale)]:
+            del d[key]
+    embed_vision = getattr(vllm_internals, "embed_vision", None)
+    _store_vision_module(
+        getattr(embed_vision, "embedding_projection", None),
+        "model.embed_vision.multimodal_embedder.embedding_projection",
+        state_dict, quant_state_dict, get_state_dict,
+    )
+    embedder = getattr(vllm_internals, "vision_embedder", None)
+    if embedder is None:
+        return
+    for name in ("patch_ln1", "patch_dense", "patch_ln2", "pos_norm", "pos_embedding"):
+        _store_vision_module(
+            getattr(embedder, name, None), f"model.embed_vision.{name}",
+            state_dict, quant_state_dict, get_state_dict,
+        )
+pass
+
+
+def _extract_muse_glimmer_vision(vllm_internals, state_dict, quant_state_dict, get_state_dict):
+    """MuseGlimmer: inverse of vLLM's hf_to_vllm_mapper (vllm/model_executor/models/muse_glimmer.py)."""
+    def store(module, name, kk = 0):
+        _store_vision_module(module, name, state_dict, quant_state_dict, get_state_dict, kk)
+    encoder = getattr(vllm_internals, "vision_encoder", None)
+    if encoder is not None:
+        tower = "model.vision_tower"
+        store(encoder.conv1_linear, f"{tower}.patch_embedder.patch_embedding")
+        store(encoder.positional_embedding_vlm, f"{tower}.patch_embedder.position_embedding_table.weight")
+        store(encoder.ln_pre, f"{tower}.ln_pre")
+        store(encoder.ln_post, f"{tower}.ln_post")
+        for kk, block in enumerate(encoder.transformer):
+            prefix = f"{tower}.layers.{kk}"
+            store(block.ln_1, f"{prefix}.norm1")
+            store(block.ln_2, f"{prefix}.norm2")
+            for index, name in enumerate(("q_proj", "k_proj", "v_proj")):
+                store(block.attn.qkv_proj, f"{prefix}.attn.{name}", index)
+            store(block.attn.o_proj, f"{prefix}.attn.proj")
+            store(block.mlp.c_fc, f"{prefix}.mlp.fc1")
+            store(block.mlp.c_proj, f"{prefix}.mlp.fc2")
+    adapter = getattr(vllm_internals, "vision_adapter", None)
+    if adapter is not None:
+        store(adapter.c_fc, "model.vision_adapter.fc1")
+        store(adapter.c_proj, "model.vision_adapter.fc2")
+    store(getattr(vllm_internals, "vision_projection", None), "model.vision_projection")
+pass
