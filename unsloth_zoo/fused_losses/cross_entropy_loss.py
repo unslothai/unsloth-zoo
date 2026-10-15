@@ -613,7 +613,9 @@ def _use_chunked_ce(kwargs, target_gb):
     # Plain token CE only: label smoothing, logits_bias, n_chunks and explicit memory targets keep the old path.
     if not _CHUNKED_CE or target_gb is not None or TARGET_GB or N_CHUNKS:
         return False
-    return all(k in _CHUNKED_CE_KWARGS for k in kwargs)
+    if float(kwargs.get("label_smoothing", 0.0) or 0.0) != 0.0:
+        return False
+    return all(k in _CHUNKED_CE_KWARGS or k == "label_smoothing" for k in kwargs)
 
 
 @torch.compiler.disable
