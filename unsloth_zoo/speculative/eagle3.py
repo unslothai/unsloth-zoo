@@ -379,8 +379,10 @@ def _aux_capture_ids(aux_layer_ids, num_layers):
     return ids
 
 
-def aux_hidden_states(captured, aux_layer_ids):
-    return torch.cat([captured[k - 1] for k in aux_layer_ids], dim = -1)
+def aux_hidden_states(captured, aux_layer_ids, device = None):
+    # A target split over GPUs (device_map) leaves each captured layer on its own device.
+    device = device or captured[aux_layer_ids[0] - 1].device
+    return torch.cat([captured[k - 1].to(device) for k in aux_layer_ids], dim = -1)
 
 
 def _default_aux_ids(num_layers):
@@ -639,7 +641,9 @@ class UnslothEagle3Trainer(Trainer):
         drafter = self.accelerator.unwrap_model(model)
         ids = _aux_capture_ids(drafter.aux_layer_ids, self._num_layers)
         captured = run_frozen_target(self.target_model, input_ids, attention_mask = attention_mask, layer_ids = ids)
-        aux = aux_hidden_states(captured, drafter.aux_layer_ids)
+        device = drafter.fc.weight.device
+        aux = aux_hidden_states(captured, drafter.aux_layer_ids, device = device)
+        captured["final"] = captured["final"].to(device)
         # speculators `shift_batch` pairs row t = (g_t, x_{t+1}) with loss_mask[t + 1].
         loss_mask = (labels[:, 1:] != -100)
         if attention_mask is not None:

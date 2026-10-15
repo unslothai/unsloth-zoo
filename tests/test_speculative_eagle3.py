@@ -386,3 +386,12 @@ def test_gemma4_per_layer_head_dim_does_not_break_the_draft_config():
                                    num_attention_heads = 4, num_key_value_heads = 2)
     config = _draft_layer_config(text)
     assert config.num_attention_heads * config.head_dim == config.hidden_size or config.head_dim > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU to put layers on two devices")
+def test_aux_states_from_layers_on_different_devices():
+    from unsloth_zoo.speculative.eagle3 import aux_hidden_states
+
+    captured = {0: torch.ones(1, 2, 4), 1: torch.ones(1, 2, 4, device = "cuda"), 2: torch.ones(1, 2, 4)}
+    out = aux_hidden_states(captured, [1, 2, 3], device = torch.device("cuda"))
+    assert out.device.type == "cuda" and out.shape == (1, 2, 12)
