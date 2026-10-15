@@ -243,13 +243,19 @@ pass
 
 def _visible_cuda_capabilities():
     """(major, minor) of every visible CUDA device, so a gate holds for the weakest card
-    a device_map can use, not just device 0. Any unreadable card falls back to the current
-    device, as core's cuda_gate_capabilities does, so both pick the same dtype."""
+    a device_map can use, not just device 0. An unreadable card is skipped; the readable ones
+    include the current device, so a gate is never less strict than before. Matches core's
+    cuda_gate_capabilities, so both pick the same dtype."""
+    capabilities = []
     try:
-        return [tuple(torch.cuda.get_device_capability(i)) for i in range(torch.cuda.device_count())] \
-            or [tuple(torch.cuda.get_device_capability())]
+        for index in range(torch.cuda.device_count()):
+            try:
+                capabilities.append(tuple(torch.cuda.get_device_capability(index)))
+            except Exception:
+                continue
     except Exception:
-        return [tuple(torch.cuda.get_device_capability())]
+        pass
+    return capabilities or [tuple(torch.cuda.get_device_capability())]
 pass
 
 

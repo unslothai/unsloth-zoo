@@ -112,9 +112,10 @@ def test_visible_cuda_capabilities_lists_every_device(cuda_caps):
     assert device_type._visible_cuda_capabilities() == [(8, 6), (6, 1), (9, 0)]
 
 
-@pytest.mark.parametrize("current,expected", [(0, [(8, 0)]), (2, [(7, 5)])])
-def test_visible_cuda_capabilities_partial_scan_uses_current_device(monkeypatch, cuda_caps, current, expected):
-    # Matches core: a partial list could hide the weakest card, so judge the current device.
+@pytest.mark.parametrize("current", [0, 2])
+def test_visible_cuda_capabilities_partial_scan_keeps_readable_cards(monkeypatch, cuda_caps, current):
+    # Matches core: the readable cards (current device included) are judged, so a known old card counts.
+    expected = [(8, 0), (7, 5)]
     caps = [(8, 0), (8, 0), (7, 5)]
     cuda_caps(caps, current = current)
 
