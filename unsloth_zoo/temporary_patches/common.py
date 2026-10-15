@@ -29,6 +29,8 @@ __all__ = [
     "unwrap_already_compiled",
     "flatten_for_elementwise_norm",
     "unwrap_norm_weight",
+    "CHUNK_ALIGN_ROWS",
+    "chunk_row_bounds",
     "publish_to_modeling_module",
     "RESCOPE_PATCH_FLAG",
     "WRAPPER_INNER_ATTR",
@@ -346,6 +348,32 @@ def flatten_for_elementwise_norm(hidden_states):
     """
     shape = hidden_states.shape
     return hidden_states.reshape(-1, shape[-1]), shape
+pass
+
+
+# Row alignment for the chunked lm_head losses. A chunk of 683 rows runs the
+# GEMM as 6 row tiles of 128, 85 of them padding; aligned boundaries waste
+# padding only in the last chunk. Opt-in with UNSLOTH_CE_CHUNK_ALIGN=1: it
+# reorders the float32 per-chunk sums. Unset keeps the previous boundaries exactly.
+CHUNK_ALIGN_ROWS = 128 if os.environ.get("UNSLOTH_CE_CHUNK_ALIGN", "0").strip() == "1" else 0
+
+def chunk_row_bounds(n_rows, chunks, align = CHUNK_ALIGN_ROWS):
+    """``chunks + 1`` row boundaries splitting ``n_rows`` into exactly ``chunks`` ranges.
+
+    Proportional boundaries ``i * n_rows // chunks`` rounded down to a multiple of
+    ``align`` when every range holds ``align``+ rows, so all ranges but the last are
+    multiples of ``align`` and the last takes the remainder. Rounding down a sequence
+    whose steps are ``align``+ keeps every range non-empty and at most ``align - 1``
+    rows over ``ceil(n_rows / chunks)``. Fewer rows than that keeps the plain
+    proportional boundaries (unit 1). The unit is chosen with ``torch.sym_min``, not
+    ``min`` or ``if``, so a symbolic ``n_rows`` under Dynamo adds no guard.
+    """
+    if align <= 1:
+        return [(i * n_rows) // chunks for i in range(chunks + 1)]
+    unit = 1 + (align - 1) * torch.sym_min(1, (n_rows // chunks) // align)
+    bounds = [unit * (((i * n_rows) // chunks) // unit) for i in range(chunks)]
+    bounds.append(n_rows)
+    return bounds
 pass
 
 
