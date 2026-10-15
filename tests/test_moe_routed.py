@@ -1360,7 +1360,6 @@ def test_routed_lora_cuda_graph_reads_live_adapters():
 @pytest.mark.parametrize("nested", [True, False])
 @pytest.mark.parametrize("h, i", [(512, 256), (2048, 512)])
 def test_even_k_skips_masks_bit_for_bit(nested, h, i, monkeypatch):
-    # K a multiple of BLOCK_K drops the K masks: outputs must equal the masked kernel bit for bit.
     gu_w, dn_w = _weights(11, h = h, i = i)
     gu_p, dn_p = _q4(gu_w, nested = nested), _q4(dn_w, nested = nested)
     gu, dn = MR._nf4_table(gu_p, gu_p.device), MR._nf4_table(dn_p, dn_p.device)

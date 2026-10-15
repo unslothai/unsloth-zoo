@@ -451,8 +451,7 @@ def _block_k(K, blocksize):
 
 
 def _even_k(K, block_k):
-    # K a multiple of BLOCK_K drops the K masks (same values, 4-9% faster gate_up / down on L4 for
-    # Qwen3 / Qwen3.5 experts). HIP keeps the masked kernel (unmeasured there).
+    # Same values without the K masks; HIP keeps the masked kernel (unmeasured there).
     return K % block_k == 0 and torch.version.hip is None
 
 
