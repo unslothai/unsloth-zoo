@@ -14,9 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""distributed_function(): a raise on rank 0 must reach every rank promptly,
-not leave the peers blocked in broadcast_object_list until the PG timeout."""
-
 from __future__ import annotations
 
 import json
@@ -99,13 +96,11 @@ def test_rank0_raise_reaches_every_rank(tmp_path):
 
     for rank in (0, 1):
         r = results[rank]
-        # Success path: same shapes as before (n == 1 the value, n > 1 a list).
         assert r["one"] == {"a": 1}
         assert r["two"] == [3, "x"]
         assert r["args"] == 9
         assert r["after"] == 11
         assert r["raised"] is not None, f"rank {rank} did not raise"
-    # Rank 0 re-raises the original exception; peers get the message.
     assert results[0]["raised"] == ["ValueError", "disk full at /cache/x.py"]
     assert results[1]["raised"][0] == "RuntimeError"
     assert "ValueError: disk full at /cache/x.py" in results[1]["raised"][1]

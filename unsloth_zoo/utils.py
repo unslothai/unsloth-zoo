@@ -181,9 +181,7 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
         out = function(*args, **kwargs)
         return out if n == 1 else out
 
-    # Multi-process: only main executes the function. Its result travels in an
-    # (ok, value) envelope so a raise on main reaches every rank; otherwise the
-    # peers sit in broadcast_object_list until the process group timeout.
+    # (ok, value) envelope: a raise on main must reach peers, else they hang until PG timeout.
     error = None
     if is_main_process():
         try:
@@ -201,17 +199,15 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
     dist.broadcast_object_list(obj_list, src = 0, device = device)
     ok, value = obj_list[0]
     if not ok:
-        # Every rank raises; no barrier since all ranks skip it together.
         if error is not None: raise error
         raise RuntimeError(
             f"Unsloth: distributed_function `{getattr(function, '__name__', function)}` "
             f"failed on rank 0: {value}"
         )
-    # barrier() also defaults to the current device, so name this rank's GPU.
     if device.type == "cuda" and device.index is not None:
-        dist.barrier(device_ids = [device.index])  # wait until main is done
+        dist.barrier(device_ids = [device.index])
     else:
-        dist.barrier()  # wait until main is done
+        dist.barrier()
 
     return value
 pass
