@@ -107,6 +107,28 @@ def test_decode_mode_dispatch_and_off_switch(monkeypatch):
     assert mg._asm_ok(torch.device("cuda", index)) is False
 
 
+def test_cold_compiled_region_bakes_in_the_probed_decode_mode(monkeypatch):
+    # The op body is traced on FakeTensors and its ASM constexpr is frozen into the graph: probe before it.
+    import unsloth_zoo.mxfp4_gemm as mg
+    _need_cvt(2)
+    if mg.mxfp4_grouped_mm_op is None:
+        pytest.skip("needs torch.library.triton_op")
+    monkeypatch.setenv("UNSLOTH_MXFP4_CVT", "1")
+    monkeypatch.setattr(mg, "_ASM_OK", {})
+    traced, real_asm_ok = [], mg._asm_ok
+    monkeypatch.setattr(mg, "_asm_ok", lambda device, *a, **k: traced.append(real_asm_ok(device, *a, **k)) or traced[-1])
+    E, R, C = 4, 256, 256
+    blocks, scales = _stack(E, R, C, seed = 3)
+    counts = torch.full((E,), 16, dtype = torch.int32, device = "cuda")
+    x = torch.randn(64, C, dtype = torch.bfloat16, device = "cuda")
+    torch._dynamo.reset()
+    got = torch.compile(lambda t: mg.mxfp4_grouped_mm_compiled(t, blocks, scales, counts, True), fullgraph = True)(x)
+    torch._dynamo.reset()
+    assert traced and all(mode == 2 for mode in traced), traced
+    want = _reference(x, mxfp4_dequantize_torch(blocks, scales), counts, True)
+    torch.testing.assert_close(got.float(), want, rtol = 1e-2, atol = 1e-2 * want.abs().max().item())
+
+
 @pytest.mark.parametrize("big_tiles", [True, False])
 @pytest.mark.parametrize("asm", [2, True, False])
 @pytest.mark.parametrize("E,M_per_expert", [(4, 1), (4, 12), (4, 40), (4, 80), (4, 150), (4, 300), (300, 1), (300, 3)])

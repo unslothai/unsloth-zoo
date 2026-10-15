@@ -466,7 +466,7 @@ def _big_tiles(device):
 _ASM_OK = {}
 
 
-def _asm_ok(device):
+def _asm_ok(device, eager = False):
     """Decode mode (the kernels' ASM constexpr): 0 plain Triton, 1 inline-PTX bf16x2 fma decode (Kimi-K3 port, sm_80+
     CUDA; UNSLOTH_MXFP4_ASM=0 turns it off), 2 the hardware e2m1 convert where ``_cvt_ok`` passes."""
     ok = _ASM_OK.get(device.index)
@@ -479,7 +479,7 @@ def _asm_ok(device):
             and os.environ.get("UNSLOTH_MXFP4_ASM", "1") != "0"
         )
         if ok:
-            cvt = _cvt_ok(index)
+            cvt = _cvt_ok(index, eager)
             if cvt is None:
                 return True  # traced before any eager call: decide (and cache) on the next eager launch
             ok = 2 if cvt else True
@@ -487,24 +487,25 @@ def _asm_ok(device):
     return ok
 
 
-def _cvt_ok(index):
+def _cvt_ok(index, eager = False):
     """The hardware convert decode: needs ptxas with PTX 9.2 (CUDA 13.2+, e.g. Triton 3.8's ptxas-blackwell) and
     sm_100f / sm_120f; compiled and checked bit for bit against the fma decode on every (byte, scale) once.
     Timed faster on sm_120 (RTX PRO 6000); sm_100 is untimed, so it only takes it with UNSLOTH_MXFP4_CVT=1.
-    UNSLOTH_MXFP4_CVT=0 turns it off. None = cannot probe here (inside a trace)."""
+    UNSLOTH_MXFP4_CVT=0 turns it off. None = cannot probe here (inside a trace; ``eager``: real tensors anyway)."""
     import os
     mode = os.environ.get("UNSLOTH_MXFP4_CVT", "auto").strip().lower()
     major = torch.cuda.get_device_capability(index)[0]
     if mode == "0" or major < 10 or (mode != "1" and major != 12):
         return False
-    try:
-        if torch.compiler.is_compiling():
-            return None
-        from torch._guards import detect_fake_mode
-        if detect_fake_mode() is not None:
-            return None
-    except Exception:
-        pass
+    if not eager:
+        try:
+            if torch.compiler.is_compiling():
+                return None
+            from torch._guards import detect_fake_mode
+            if detect_fake_mode() is not None:
+                return None
+        except Exception:
+            pass
     try:
         device = torch.device("cuda", index)
         rows = torch.arange(65536, device = device)
@@ -618,9 +619,22 @@ if _HAS_TRITON:
         mxfp4_grouped_mm_op = mxfp4_grouped_gemv_op = None
 
 
+_assume_constant_result = getattr(torch.compiler, "assume_constant_result", None) or \
+    getattr(torch._dynamo, "assume_constant_result", lambda fn: fn)
+
+
+@_assume_constant_result
+def _resolve_decode_mode(index):
+    # Dynamo runs this eagerly on real tensors at trace time, so a cold compiled region bakes in the probed mode
+    # instead of the fma fallback the op body (traced on FakeTensors) would see.
+    return _asm_ok(torch.device("cuda", index), eager = True)
+
+
 def mxfp4_grouped_mm_compiled(x, blocks, scales, counts, transpose_b):
     """``mxfp4_grouped_mm_op`` for compiled regions. The GEMV / tile choice is made here, where dynamo guards on the
     row count; inside the op the trace-time shape would freeze it for every later size."""
+    if x.is_cuda and torch.version.hip is None:
+        _resolve_decode_mode(x.device.index)
     if mxfp4_grouped_gemv_op is not None and _gemv_rows(x.shape[0], blocks.shape[0], transpose_b):
         return mxfp4_grouped_gemv_op(x, blocks, scales, counts)
     return mxfp4_grouped_mm_op(x, blocks, scales, counts, transpose_b)
