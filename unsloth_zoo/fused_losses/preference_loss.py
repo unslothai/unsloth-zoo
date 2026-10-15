@@ -222,7 +222,8 @@ def linear_mean_logits(
     flat = hidden_states.reshape(-1, hidden_states.shape[-1])
     if logit_softcapping == 0.0:
         dtype = torch.promote_types(lm_head_weight.dtype, torch.float32)
-        weight_mean = lm_head_weight.to(dtype).mean(0)
+        # Accumulate in float32 without a float32 copy of the whole head.
+        weight_mean = lm_head_weight.sum(0, dtype = dtype) / lm_head_weight.shape[0]
         out = flat.to(device = weight_mean.device, dtype = dtype) @ weight_mean
         if lm_head_bias is not None:
             out = out + lm_head_bias.to(dtype).mean()
