@@ -134,6 +134,31 @@ def test_extra_flags_reach_the_verifier(monkeypatch, fake_env):
     assert out[0] == "fla" and seen["allow_neg_eigval"] is True
 
 
+def _fla_chunk_named(
+    q, k, v, g, beta, scale = None, initial_state = None, output_final_state = False,
+    use_qk_l2norm_in_kernel = False, use_gate_in_kernel = False, head_first = False,
+    cu_seqlens = None, **kwargs,
+):
+    return ("fla", kwargs)
+
+
+@pytest.mark.parametrize("flag", ["use_gate_in_kernel", "head_first"])
+def test_named_flags_of_the_original_reach_the_verifier(monkeypatch, fake_env, flag):
+    gdr, _, calls = fake_env
+    gdr.chunk_gated_delta_rule = _fla_chunk_named
+    monkeypatch.setenv("UNSLOTH_GDN_BACKEND", "flashqla")
+    seen = {}
+
+    def verifier(q, k, v, g, beta, initial_state, cu_seqlens, cp_context, extra):
+        seen.update(extra)
+        return "flag" if extra.get(flag) else None
+
+    monkeypatch.setattr(fv, "_flashqla_unsupported", verifier)
+    fv._install_gdn_backend()
+    out = gdr.chunk_gated_delta_rule("q", "k", "v", "g", "beta", **{flag: True})
+    assert out[0] == "fla" and seen[flag] is True and calls == []
+
+
 def test_verifier_rejects_what_flashqla_cannot_run():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():

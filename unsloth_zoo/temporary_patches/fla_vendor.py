@@ -1007,7 +1007,11 @@ def _make_flashqla_chunk_gated_delta_rule(original):
             return original(*args, **kwargs)
         a = bound.arguments
         extra = dict(a.get("kwargs", {}))
-        for name in ("use_beta_sigmoid_in_kernel", "allow_neg_eigval"):
+        # Named parameters of the original land in `a`, not in its **kwargs: the verifier sees both.
+        for name in (
+            "use_gate_in_kernel", "use_beta_sigmoid_in_kernel", "allow_neg_eigval",
+            "head_first", "transpose_state_layout",
+        ):
             if name in a:
                 extra[name] = a[name]
         q, k, v, g, beta = (a.get(name) for name in ("q", "k", "v", "g", "beta"))
