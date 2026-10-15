@@ -255,6 +255,7 @@ def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None):
             ACTIVATION = activation is not None,
             HAS_SEQ_IDX = seq_idx is not None,
             num_warps = _NUM_WARPS,
+            enable_fp_fusion = True,
         )
     return y
 
@@ -285,6 +286,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
             NEED_DX = need_dx, NEED_DW = need_dw, NEED_DB = need_db,
             HAS_SEQ_IDX = seq_idx is not None,
             num_warps = _NUM_WARPS,
+            enable_fp_fusion = True,
         )
     if dw is not None:
         dw = dw.sum(0).to(weight.dtype)

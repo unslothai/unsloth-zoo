@@ -527,6 +527,7 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
             A_MODE = a_mode, ROW_SCALE = row_scale is not None, HAS_BIAS = bias is not None, IEEE = ieee,
             E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, ENDS = bool(ends),
             num_warps = warps, num_stages = stages, **extra,
+            enable_fp_fusion = True,
         )
     CALLS["gemm"] += 1
     return out
@@ -564,6 +565,7 @@ def grouped_wgrad(g, x, counts, out_dtype, num_experts = None, backend = None, c
             g.stride(0), x.stride(0), dw.stride(0), dw.stride(1), dw.stride(2),
             IEEE = ieee, E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, ENDS = bool(ends),
             num_warps = warps, num_stages = stages,
+            enable_fp_fusion = True,
         )
     CALLS["wgrad"] += 1
     return dw

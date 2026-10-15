@@ -1660,7 +1660,7 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     # than raising TypeError out of the generation path.
     from unsloth_zoo.mlx.inference import (exact_speculative_verify, fused_decode_conv_silu, fused_moe_gate_up,
                                            fused_moe_routed_experts, fused_moe_router, fused_packed_gated_delta,
-                                           fused_residual_norm, fused_residual_norm_handoff)
+                                           fused_residual_norm, fused_residual_norm_handoff, fused_verify_attention)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1670,7 +1670,7 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
         )
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
                 fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model), \
-                exact_speculative_verify(model), fused_packed_gated_delta(model):
+                exact_speculative_verify(model), fused_packed_gated_delta(model), fused_verify_attention(model):
             pass
 
 
@@ -1693,7 +1693,7 @@ def test_generation_paths_enter_every_inference_fusion(monkeypatch):
              for node in ast.walk(ast.parse(inspect.getsource(loader))) if isinstance(node, ast.With)]
     sites = [site for site in sites if any(name.startswith(prefixes) for name in site)]
     # The loader's generate sites run no speculative verify rounds.
-    assert len(sites) == 2 and all(site == scopes - {"exact_speculative_verify"} for site in sites)
+    assert len(sites) == 2 and all(site == scopes - {"exact_speculative_verify", "fused_verify_attention"} for site in sites)
 
 
 def test_cache_layout_tells_quantized_packings_apart():

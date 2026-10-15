@@ -17,7 +17,7 @@
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
 small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
-and Qwen exact speculative verify blocks."""
+Qwen exact speculative verify blocks, and Gemma 4 verify-block attention."""
 
 import ast
 import functools
@@ -4031,3 +4031,359 @@ def exact_speculative_verify(model, *, _modules = None):
                     owner.__dict__.pop("_unsloth_verify_scopes", None)
                     if owner is verifier:
                         verifier.__class__ = type(verifier)._unsloth_verify_native
+
+
+# MLX's sdpa_vector_2pass_1/2 (mlx/backend/metal/kernels/sdpa_vector.h, Copyright © 2024 Apple Inc., MIT),
+# reading strided keys and values in place. Rows attend end-aligned causally, as MLX's kernel does for a block.
+_VECTOR_ATTENTION_PASS1 = """
+    constexpr int BD = 32;
+    constexpr int per_thread = D / BD;
+    typedef float U;
+    thread U q[per_thread];
+    thread U o[per_thread] = {0};
+
+    const int kv_head = threadgroup_position_in_grid.x;
+    const int batch = threadgroup_position_in_grid.y;
+    const int block = threadgroup_position_in_grid.z;
+    const int gqa = threads_per_threadgroup.y;
+    const int rows = threads_per_threadgroup.z;
+    const int row = thread_position_in_threadgroup.z;
+    const int head = gqa * kv_head + thread_position_in_threadgroup.y;
+    const int out_row = (batch * threadgroups_per_grid.x * gqa + head) * rows + row;
+    const uint lane = thread_index_in_simdgroup;
+    const int N = keys_shape[2];
+
+    const device T* qp = queries + batch * queries_strides[0] + head * queries_strides[1]
+        + row * queries_strides[2] + lane * per_thread;
+    const device T* kp = keys + batch * keys_strides[0] + kv_head * keys_strides[1]
+        + block * keys_strides[2] + lane * per_thread;
+    const device T* vp = values + batch * values_strides[0] + kv_head * values_strides[1]
+        + block * values_strides[2] + lane * per_thread;
+    for (int i = 0; i < per_thread; i++) {
+        q[i] = static_cast<U>(scale) * qp[i];
+    }
+
+    U max_score = -metal::numeric_limits<U>::max();
+    U sum_exp_score = 0;
+    const int horizon = N - rows + row;
+    for (int i = block; i < N; i += BLOCKS) {
+        if (i <= horizon) {
+            U score = 0;
+            for (int j = 0; j < per_thread; j++) {
+                score += q[j] * kp[j];
+            }
+            score = simd_sum(score);
+            U new_max = max(max_score, score);
+            U factor = metal::fast::exp(max_score - new_max);
+            U exp_score = metal::fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+            for (int j = 0; j < per_thread; j++) {
+                o[j] = o[j] * factor + exp_score * vp[j];
+            }
+        }
+        kp += BLOCKS * keys_strides[2];
+        vp += BLOCKS * values_strides[2];
+    }
+
+    if (lane == 0) {
+        sums[out_row * BLOCKS + block] = sum_exp_score;
+        maxs[out_row * BLOCKS + block] = max_score;
+    }
+    device T* op = partials + (out_row * BLOCKS + block) * D + lane * per_thread;
+    for (int i = 0; i < per_thread; i++) {
+        op[i] = static_cast<T>(o[i]);
+    }
+"""
+
+_VECTOR_ATTENTION_PASS2 = """
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int per_thread = D / BD;
+    typedef float U;
+    thread U o[per_thread] = {0};
+    threadgroup U outputs[BN * BD];
+
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const int out_row = threadgroup_position_in_grid.x * threadgroups_per_grid.y + threadgroup_position_in_grid.y;
+    const device T* pp = partials + out_row * BLOCKS * D + simd_gid * D + lane * per_thread;
+    const device float* sp = sums + out_row * BLOCKS;
+    const device float* mp = maxs + out_row * BLOCKS;
+
+    U sum_exp_score = 0.0;
+    U max_score = -metal::numeric_limits<U>::max();
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        max_score = max(max_score, mp[lane + BN * b]);
+    }
+    max_score = simd_max(max_score);
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = metal::fast::exp(mp[lane + BN * b] - max_score);
+        sum_exp_score += factor * sp[lane + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = metal::fast::exp(mp[simd_gid] - max_score);
+        for (int i = 0; i < per_thread; i++) {
+            o[i] += factor * static_cast<U>(pp[i]);
+        }
+        mp += BN;
+        sp += BN;
+        pp += BN * D;
+    }
+    for (int i = 0; i < per_thread; i++) {
+        outputs[lane * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + lane]);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        device T* op = out + out_row * D + simd_gid * per_thread;
+        for (int i = 0; i < per_thread; i++) {
+            op[i] = static_cast<T>(o[i]);
+        }
+    }
+"""
+
+
+@functools.cache
+def _vector_attention_kernels():
+    try:
+        if not mx.metal.is_available():
+            return None
+        return (
+            mx.fast.metal_kernel(name = "unsloth_vector_attention_pass1",
+                                 input_names = ["queries", "keys", "values", "scale"],
+                                 output_names = ["partials", "sums", "maxs"],
+                                 source = _VECTOR_ATTENTION_PASS1, ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_vector_attention_pass2",
+                                 input_names = ["partials", "sums", "maxs"], output_names = ["out"],
+                                 source = _VECTOR_ATTENTION_PASS2),
+        )
+    except (AttributeError, TypeError):
+        return None
+
+
+@functools.cache
+def _gpu_class():
+    info = (getattr(mx, "device_info", None) or mx.metal.device_info)()
+    return str(info.get("architecture", ""))[-1:]
+
+
+@functools.cache
+def _gpu_generation():
+    info = (getattr(mx, "device_info", None) or mx.metal.device_info)()
+    match = re.match(r"applegpu_g(\d+)", str(info.get("architecture", "")))
+    return int(match.group(1)) if match else 0
+
+
+def _launch_simds():
+    # Before M3 (no dynamic caching), this kernel's pipeline allows 832 threads per threadgroup, not 1024.
+    return 32 if _gpu_generation() >= 15 else 24
+
+
+def _vector_blocks(simds, keys):
+    """The key-interleave count MLX 0.32.3's sdpa_vector_2pass picks for this launch."""
+    forced = int(os.environ.get("MLX_SDPA_BLOCKS", "0") or 0)
+    if forced > 0:
+        return (forced + 31) // 32 * 32
+    gpu = _gpu_class()
+    if gpu == "s":
+        if keys > 1024 and simds > 4:
+            return 128 if keys <= 8192 else 256 if keys <= 32768 else 512 if keys <= 65536 else 1024
+        return 64
+    if gpu == "d":
+        if simds <= 2 and keys > 8192:
+            return 256
+        if simds >= 6 and keys >= 16384:
+            return 512 if keys < 65536 else 1024
+        return 128
+    return 64 if simds >= 4 else 32
+
+
+def _vector_attention(queries, keys, values, scale, blocks):
+    pass1, pass2 = _vector_attention_kernels()
+    batch, heads, rows, dim = queries.shape
+    kv_heads = keys.shape[1]
+    gqa, partial_rows = heads // kv_heads, batch * heads * rows * blocks
+    partials, sums, maxs = pass1(
+        inputs = [queries, keys, values, mx.array(scale, mx.float32)],
+        template = [("T", queries.dtype), ("D", dim), ("BLOCKS", blocks)],
+        grid = (32 * kv_heads, gqa * batch, rows * blocks), threadgroup = (32, gqa, rows),
+        output_shapes = [(partial_rows, dim), (partial_rows,), (partial_rows,)],
+        output_dtypes = [queries.dtype, mx.float32, mx.float32])
+    return pass2(inputs = [partials, sums, maxs], template = [("T", queries.dtype), ("D", dim), ("BLOCKS", blocks)],
+                 grid = (1024 * batch * heads, rows, 1), threadgroup = (1024, 1, 1),
+                 output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
+
+
+def _decode_attention(queries, keys, values, scale):
+    """Each row as a decode step attends it; at head dim 512 MLX puts a lone query on its vector kernel for
+    GQA 8 only, so GQA-4 heads are paired up first and that row is MLX's vector kernel rather than decode."""
+    _, heads, rows, dim = queries.shape
+    kv_heads = keys.shape[1]
+    repeat = 8 // (heads // kv_heads)
+    outs = []
+    for row in range(rows):
+        query = queries[:, :, row : row + 1].reshape(1, kv_heads, -1, 1, dim)
+        query = mx.concatenate([query] * repeat, axis = 2).reshape(1, -1, 1, dim)
+        end = keys.shape[2] - rows + row + 1
+        out = mx.fast.scaled_dot_product_attention(query, keys[..., :end, :], values[..., :end, :], scale = scale)
+        outs.append(out.reshape(1, kv_heads, repeat, -1, 1, dim)[:, :, 0].reshape(1, heads, 1, dim))
+    return mx.concatenate(outs, axis = 2)
+
+
+# Query heads per KV head served by default: at 8 (E2B, 26B-A4B, 31B) MLX decodes a lone query on the same
+# vector kernel, so each verify row is the attention a decode step computes. At 4 (E4B) decode stays unfused
+# and the kernel only changes rounding, so it is opt-in with UNSLOTH_MLX_VERIFY_ATTENTION=1. At 16 (12B) the
+# unfused attention is already as fast.
+_VERIFY_ATTENTION_GQA = (8,)
+_VERIFY_ATTENTION_OPT_IN_GQA = (4,)
+_VERIFY_ATTENTION_DIM = 512
+_VERIFY_ATTENTION_ROWS = 8
+_VERIFY_ATTENTION_LOCK = RLock()
+_VERIFY_ATTENTION_VERDICTS = {}
+
+
+def _verify_attention_serves(gqa):
+    return gqa in _VERIFY_ATTENTION_GQA or (
+        gqa in _VERIFY_ATTENTION_OPT_IN_GQA and os.environ.get("UNSLOTH_MLX_VERIFY_ATTENTION", "0") == "1")
+
+
+def _two_pass_keys(keys):
+    # MLX's single-pass vector kernel serves fewer keys and computes them in another order.
+    return keys >= (1024 if _gpu_class() in ("s", "d") else 4096)
+
+
+def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
+    """A verify block's head-dim-512 causal attention on MLX's vector kernel, or None for the native call."""
+    if not (isinstance(mask, str) and mask == "causal" and (cache is None or type(cache) is kv_cache)
+            and queries.ndim == 4 and queries.shape[0] == 1 and keys.shape == values.shape
+            and queries.shape[-1] == keys.shape[-1] == _VERIFY_ATTENTION_DIM
+            and queries.dtype in (mx.bfloat16, mx.float16) and queries.dtype == keys.dtype == values.dtype
+            and 2 <= queries.shape[2] <= min(_VERIFY_ATTENTION_ROWS, keys.shape[2])
+            and keys.shape[1] and queries.shape[1] % keys.shape[1] == 0
+            and _verify_attention_serves(queries.shape[1] // keys.shape[1])
+            and _two_pass_keys(keys.shape[2] - queries.shape[2] + 1)
+            and _vector_attention_kernels() is not None):
+        return None
+    rows, gqa = queries.shape[2], queries.shape[1] // keys.shape[1]
+    step = _launch_simds() // gqa   # a launch holds gqa * rows simdgroups
+    outs = []
+    for start in range(0, rows, step):
+        stop = min(start + step, rows)
+        horizon = keys.shape[2] - rows + stop
+        chunk = (queries[:, :, start:stop], keys[..., :horizon, :], values[..., :horizon, :])
+        blocks = _vector_blocks(gqa * (stop - start), horizon)
+        if _vector_blocks(8, horizon - (stop - start) + 1) != blocks:
+            return None   # decode steps on either side of this context interleave their keys differently
+        key = (queries.dtype, gqa, stop - start, blocks)
+        verdict = _VERIFY_ATTENTION_VERDICTS.get(key)
+        if verdict is False:
+            return None
+        out = _vector_attention(*chunk, scale, blocks)
+        if verdict is None:
+            with _VERIFY_ATTENTION_LOCK:
+                try:
+                    verdict = mx.array_equal(out.view(mx.uint16), _decode_attention(*chunk, scale).view(mx.uint16)).item()
+                except (RuntimeError, ValueError):
+                    return None   # inside a function transformation, which cannot evaluate; checked later
+                _VERIFY_ATTENTION_VERDICTS[key] = verdict
+            if not verdict:
+                logger.warning("verify attention differs from MLX's decode attention for %s; the native attention "
+                               "stays in use there", key)
+                return None
+        outs.append(out)
+    return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis = 2)
+
+
+# The gemma4 attention body whose call into mlx-vlm's attention helper the scope reroutes for verify blocks.
+_VERIFY_ATTENTION_CONTRACT = {"mlx_vlm.models.gemma4.language": {"Attention.__call__": "7a040b99424f57fd"}}
+
+
+@functools.cache
+def _verify_attention_class(base):
+    bindings = _resolved_bindings(_VERIFY_ATTENTION_CONTRACT)
+    call = vars(base).get("__call__")
+    if bindings is None or not any(target is call for _, _, target in bindings):
+        return None
+    namespace = call.__globals__
+    native, kv_cache = namespace.get("scaled_dot_product_attention"), namespace.get("KVCache")
+    if native is None or kv_cache is None:
+        return None
+
+    def attention(queries, keys, values, cache, scale, mask, sinks = None):
+        out = None if sinks is not None else _verify_attention(queries, keys, values, cache, scale, mask, kv_cache)
+        return native(queries, keys, values, cache = cache, scale = scale, mask = mask) if out is None else out
+
+    routed = FunctionType(call.__code__, {**namespace, "scaled_dot_product_attention": attention},
+                          call.__name__, call.__defaults__, call.__closure__)
+    routed.__kwdefaults__ = call.__kwdefaults__
+
+    def verify_call(self, *args, **kwargs):
+        if (getattr(_VERIFY_STATE, "attention", False) and not self.training
+                and namespace.get("scaled_dot_product_attention") is native and _bindings_intact(bindings)):
+            return routed(self, *args, **kwargs)
+        return call(self, *args, **kwargs)
+
+    return type(f"_VerifyAttention{base.__name__}", (base,),
+                {"__call__": verify_call, "_unsloth_verify_attention_native": base})
+
+
+@contextmanager
+def verify_block_attention():
+    """Mark the forwards built inside as a speculative verify block for `fused_verify_attention`."""
+    outer = getattr(_VERIFY_STATE, "attention", False)
+    _VERIFY_STATE.attention = True
+    try:
+        yield
+    finally:
+        _VERIFY_STATE.attention = outer
+
+
+@contextmanager
+def fused_verify_attention(model, *, _modules = None):
+    """Run Gemma 4's head-dim-512 attention for a speculative verify block on MLX's vector kernel.
+
+    MLX 0.32.3 sends 2 to 8 query rows at head dim 512 to an unfused attention whose cost dwarfs a decode
+    step's at long context. Inside `verify_block_attention`, an eligible single-sequence causal block with 8
+    query heads per KV head runs on a copy of MLX's own two-pass vector kernel instead, once its first launch
+    of that shape matched, row by row and bit for bit, the attention a decode step computes; 4 query heads per
+    KV head join with `UNSLOTH_MLX_VERIFY_ATTENTION=1`. Other calls, training and distributed models keep the
+    native attention. Instance classes are restored when the context exits.
+    """
+    changed = []
+    try:
+        with _VERIFY_ATTENTION_LOCK:
+            if (not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and _vector_attention_kernels() is not None):
+                for _, module in _fusion_modules(model, _modules):
+                    # Type before `training`: named_modules() may yield plain stand-ins.
+                    if not isinstance(module, dict) or module.training:
+                        continue
+                    base = type(module)
+                    if getattr(base, "_unsloth_verify_attention_native", None) is not None:
+                        if module.__dict__.get("_unsloth_verify_attention_scopes", 0):
+                            module._unsloth_verify_attention_scopes += 1
+                            changed.append(module)
+                        continue
+                    if getattr(module, "head_dim", None) != _VERIFY_ATTENTION_DIM:
+                        continue
+                    patched = _verify_attention_class(base)
+                    if patched is not None:
+                        module.__class__ = patched
+                        module._unsloth_verify_attention_scopes = 1
+                        changed.append(module)
+        yield model
+    finally:
+        with _VERIFY_ATTENTION_LOCK:
+            for module in reversed(changed):
+                scopes = module.__dict__.get("_unsloth_verify_attention_scopes", 0)
+                if scopes > 1:
+                    module._unsloth_verify_attention_scopes = scopes - 1
+                    continue
+                module.__dict__.pop("_unsloth_verify_attention_scopes", None)
+                native = getattr(type(module), "_unsloth_verify_attention_native", None)
+                if native is not None:
+                    module.__class__ = native

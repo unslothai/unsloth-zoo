@@ -975,7 +975,7 @@ def generation_mode(model, int8_prefill = None):
         from .inference import (_fusion_modules, dense_prefill_linear, exact_speculative_verify,
                                 fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
                                 fused_moe_router, fused_packed_gated_delta, fused_residual_norm,
-                                fused_residual_norm_handoff, nax_quantized_linear)
+                                fused_residual_norm_handoff, fused_verify_attention, nax_quantized_linear)
         # One walk serves the flags and every scope: eval and the scopes leave the module graph alone.
         modules = tuple(_fusion_modules(model, None))
         training_states = _snapshot_training_flags([module for _, module in modules] or [model])
@@ -988,7 +988,7 @@ def generation_mode(model, int8_prefill = None):
                 dense_prefill_linear(model, _modules = modules), \
                 fused_packed_gated_delta(model, _modules = modules), \
                 fused_residual_norm_handoff(model, _modules = modules), \
-                exact_speculative_verify(model, _modules = modules):
+                exact_speculative_verify(model, _modules = modules), fused_verify_attention(model, _modules = modules):
             yield model
     except BaseException as exc:
         active_error = exc

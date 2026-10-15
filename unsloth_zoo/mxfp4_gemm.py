@@ -322,7 +322,7 @@ def _decode_for_test(blocks, scales):
     *prefix, G, _ = blocks.shape
     rows = blocks.numel() // (G * 16)
     out = torch.empty((*prefix, G * 32), dtype = torch.bfloat16, device = blocks.device)
-    _decode_only_kernel[(triton.cdiv(rows, 32), G)](blocks.contiguous(), scales.contiguous(), out, rows, ROWS = 32, COLS = 32)
+    _decode_only_kernel[(triton.cdiv(rows, 32), G)](blocks.contiguous(), scales.contiguous(), out, rows, ROWS = 32, COLS = 32, enable_fp_fusion = True)
     return out
 
 
@@ -422,6 +422,7 @@ def _launch_gemv(x, blocks, scales, counts, out, launcher):
         x, blocks, scales, out, counts, E, R, G, x.stride(0), out.stride(0),
         E_POW2 = 1 << (E - 1).bit_length(), BLOCK_N = BN, BLOCK_K = BK, ASM = _asm_ok(x.device),
         num_warps = 4, num_stages = 2,
+        enable_fp_fusion = True,
     )
     return out
 
@@ -454,6 +455,7 @@ def _launch(x, blocks, scales, counts, out, transpose_b, config, launcher, bias 
         BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, SPLIT = split,
         GROUPED = grouped, HAS_BIAS = bias is not None, ASM = asm,
         num_warps = warps, num_stages = stages,
+        enable_fp_fusion = True,
     )
     return out
 
