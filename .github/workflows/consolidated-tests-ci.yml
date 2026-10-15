@@ -280,7 +280,9 @@ jobs:
         # pins that the same transition clears the blob at fault instead of
         # every completed shard (#9094). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
-        # no weights). The preference suite pins token boundaries, scheduling,
+        # no weights); test_train_on_responses_mask_out_tokens pins mask_out_tokens on
+        # the list, tensor, vision-collator and MLX routes (unsloth#6695).
+        # The preference suite pins token boundaries, scheduling,
         # objective normalization, and reference lifecycle without model weights.
         # test_mlx_quantized_optimizer_routing pins which optim
         # names reach the 8-bit path; it runs under the torch shim so it
@@ -466,6 +468,7 @@ jobs:
               tests/test_converter_source_staging.py \
               tests/test_get_transformers_model_type_empty.py \
               tests/test_train_on_responses_list_labels.py \
+              tests/test_train_on_responses_mask_out_tokens.py \
               tests/test_mlx_preference.py \
               tests/test_mlx_trainer_internals.py \
               tests/test_mlx_arrays_cache_advance.py \
