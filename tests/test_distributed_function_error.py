@@ -74,6 +74,7 @@ def test_rank0_raise_reaches_every_rank(tmp_path):
             WORLD_SIZE = "2", LOCAL_WORLD_SIZE = "2",
             MASTER_ADDR = "127.0.0.1", MASTER_PORT = str(port),
             UNSLOTH_IS_PRESENT = "1",
+            UNSLOTH_ZOO_DISABLE_GPU_INIT = "1",
             CUDA_VISIBLE_DEVICES = "",
             PYTHONPATH = os.pathsep.join([ROOT, os.environ.get("PYTHONPATH", "")]),
         )
