@@ -823,11 +823,8 @@ pass
 class _PerDeviceSlots(list):
     """One slot per visible device, created on first access to that device.
 
-    Allocating a staging buffer and side stream on every visible card at init made each
-    torchrun rank open a context (and buffers) on every GPU, not only its own. Indexing
-    still works as before, so single process model parallel (device_map across cards)
-    gets each card's slot the first time a layer on that card offloads. Iteration yields
-    None for untouched devices and never allocates.
+    Eager allocation on every GPU made each torchrun rank open a context on every card.
+    Iteration yields None for untouched devices and never allocates.
     """
     def __init__(self, n, factory):
         super().__init__([None] * n)
@@ -987,13 +984,12 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             CPU_BUFFERS.append(x)
     pass
 
-    # One slot per GPU, each allocated the first time a layer on that GPU offloads
     global GPU_BUFFER_DTYPE
     GPU_BUFFER_DTYPE = dtype
     n_gpus = _visible_device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
     GPU_BUFFERS = _PerDeviceSlots(n_gpus, _new_gpu_buffer)
-    # Double buffering: buffer B per device (auto-off on unified memory, or via env var)
+    # Double buffering: auto-off on unified memory, or via env var
     if _double_buffer_disabled():
         GPU_BUFFERS_B = None
         USE_DOUBLE_BUFFER = False
@@ -1633,7 +1629,6 @@ def reset_unsloth_gradient_checkpointing_buffers():
         USE_DOUBLE_BUFFER = False
     else:
         try:
-            # Re-created lazily per device, like at init.
             global GPU_BUFFER_DTYPE
             if GPU_BUFFER_DTYPE is None and _allocated_slots(GPU_BUFFERS):
                 GPU_BUFFER_DTYPE = _allocated_slots(GPU_BUFFERS)[0].dtype

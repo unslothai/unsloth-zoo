@@ -77,7 +77,6 @@ def test_only_the_used_device_is_allocated(spied):
     assert sorted(kind for kind, _ in touched) == ["buffer", "buffer", "stream"], touched
     assert gc_module.GPU_BUFFERS[2].dtype == torch.bfloat16
     assert gc_module.EXTRA_STREAMS[2].device == torch.device("cuda:2")
-    # Second use of the same device creates nothing new.
     gc_module._ensure_device_buffers(2)
     assert len(touched) == 3, touched
     assert len(gc_module.GPU_BUFFERS) == 4 and len(gc_module.NEXT_BUFFER_SLOT) == 4
