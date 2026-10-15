@@ -290,7 +290,7 @@ class Eagle3Drafter(nn.Module):
         weight = self._embed_weight
         if weight is None:
             raise ValueError("Unsloth: call `set_embeddings(target_embedding_weight)` before running the drafter.")
-        return F.embedding(ids.to(weight.device), weight).to(self.fc.weight.dtype)
+        return F.embedding(ids.to(weight.device), weight).to(device = self.fc.weight.device, dtype = self.fc.weight.dtype)
 
     def draft_to_target(self, draft_ids):
         return draft_ids + self.d2t[draft_ids] if self.uses_draft_vocab else draft_ids

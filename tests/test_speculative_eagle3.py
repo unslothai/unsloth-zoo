@@ -395,3 +395,13 @@ def test_aux_states_from_layers_on_different_devices():
     captured = {0: torch.ones(1, 2, 4), 1: torch.ones(1, 2, 4, device = "cuda"), 2: torch.ones(1, 2, 4)}
     out = aux_hidden_states(captured, [1, 2, 3], device = torch.device("cuda"))
     assert out.device.type == "cuda" and out.shape == (1, 2, 12)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU to put the embedding on another device")
+def test_embedding_on_another_device_lands_on_the_drafter():
+    target = _target()
+    drafter = _drafter(target).cuda()
+    drafter.set_embeddings(target.model.embed_tokens.weight)
+    out = drafter.embed(torch.tensor([[1, 2, 3]]))
+    assert out.device == drafter.fc.weight.device
+    assert torch.equal(out.cpu(), target.model.embed_tokens.weight[[1, 2, 3]][None].to(out.dtype))
