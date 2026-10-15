@@ -171,3 +171,28 @@ def test_teacher_labels_are_chunk_budget_invariant(tmp_path, monkeypatch):
     monkeypatch.setattr(losses, "LOGITS_BUDGET_BYTES", 3 * VOCAB * element)
     small, _ = mtp_step_losses(head, parts, final, input_ids, torch.ones_like(input_ids), labels, args)
     assert torch.allclose(full, small)
+
+
+@pytest.mark.parametrize(
+    "average, processes, n_gpu, items, expected",
+    [(True, 2, 1, 10, 2), (True, 1, 1, 10, 1), (False, 2, 1, 10, 1), (True, 2, 1, None, 1), (True, 1, 3, 10, 3)],
+)
+def test_token_average_scale_matches_trainer(average, processes, n_gpu, items, expected):
+    """Trainer.compute_loss multiplies a cross-rank token-normalised loss by the rank count."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.speculative.trainer import token_average_scale
+
+    trainer = SimpleNamespace(
+        args = SimpleNamespace(average_tokens_across_devices = average, n_gpu = n_gpu),
+        accelerator = SimpleNamespace(num_processes = processes),
+    )
+    assert token_average_scale(trainer, items) == expected
+
+
+def test_mtp_compute_loss_applies_the_scale():
+    import inspect
+
+    from unsloth_zoo.speculative.trainer import UnslothMTPTrainer
+
+    assert "token_average_scale(self, num_items_in_batch)" in inspect.getsource(UnslothMTPTrainer.compute_loss)

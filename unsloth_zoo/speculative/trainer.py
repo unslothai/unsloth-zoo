@@ -142,6 +142,15 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
     return total, stats
 
 
+def token_average_scale(trainer, num_items_in_batch):
+    """What Trainer.compute_loss multiplies a loss by when num_items_in_batch is the token count over
+    every rank (DDP's gradient mean then cancels it); compute_loss overrides must do the same."""
+    args = trainer.args
+    if num_items_in_batch is None or not getattr(args, "average_tokens_across_devices", False):
+        return 1
+    return trainer.accelerator.num_processes if args.n_gpu <= 1 else args.n_gpu
+
+
 class UnslothMTPTrainer(Trainer):
     """Trains a draft MTP head against a frozen target, one target pass per batch.
 
@@ -199,6 +208,7 @@ class UnslothMTPTrainer(Trainer):
         )
         if model.training:
             self._mtp_log.append(stats)
+        loss = loss * token_average_scale(self, num_items_in_batch)
         return (loss, None) if return_outputs else loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys = None):
