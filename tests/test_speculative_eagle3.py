@@ -34,6 +34,7 @@ from unsloth_zoo.speculative.eagle3 import (  # noqa: E402
     aux_hidden_states,
     build_eagle3_drafter,
     build_eagle3_vocab_map,
+    eagle3_chunked_loss,
     eagle3_loss,
     eagle3_supported,
     load_eagle3_drafter,
@@ -272,3 +273,39 @@ def test_save_load_round_trip_and_config_contract(tmp_path):
     SpeculatorsConfig.validate_speculators_config(config)
     vllm_cfg = SpeculatorsConfig.extract_transformers_pre_trained_config(json.loads(json.dumps(config)))
     assert vllm_cfg["architectures"] == ["Eagle3LlamaForCausalLM"] and vllm_cfg["norm_before_residual"] is False
+
+
+def test_chunked_loss_equals_full_loss_and_gradients():
+    """The trainer's chunked, supervised-rows-only loss is the same objective as `eagle3_loss`."""
+    target = _target()
+    from unsloth_zoo.speculative.capture import resolve_text_parts
+    lm = resolve_text_parts(target)["lm_head"].weight
+    ids = torch.randint(0, VOCAB, (2, 24))
+    mask = torch.ones(2, 24, dtype = torch.long)
+    mask[1, 18:] = 0
+    labels = ids.clone()
+    labels[:, :6] = -100
+    loss_mask = (labels[:, 1:] != -100) & mask[:, 1:].bool()
+    import copy
+    base = _drafter(target).train()
+    results = []
+    for chunked in (False, True):
+        drafter = copy.deepcopy(base)
+        aux, cap = _aux(target, drafter, ids, mask)
+        if chunked:
+            hidden = drafter.forward_train(aux, ids, mask, 3, return_hidden = True)
+            loss, stats = eagle3_chunked_loss(drafter, hidden, cap["final"][:, 1:], lm, loss_mask, chunk_rows = 7)
+        else:
+            logits = drafter.forward_train(aux, ids, mask, 3)
+            teacher = drafter.target_logits(cap["final"][:, 1:], lm)
+            loss, stats = eagle3_loss(logits, teacher.to(logits[0].dtype), loss_mask)
+        loss.backward()
+        grads = {n: p.grad.clone() for n, p in drafter.named_parameters() if p.grad is not None}
+        results.append((loss.detach(), stats, grads))
+    (l0, s0, g0), (l1, s1, g1) = results
+    assert torch.allclose(l0, l1, rtol = 1e-5, atol = 1e-6)
+    assert s0["count"] == s1["count"]
+    assert all(abs(a - b) < 1e-6 for a, b in zip(s0["acc"], s1["acc"]))
+    assert g0.keys() == g1.keys() and g0
+    for name in g0:
+        assert torch.allclose(g0[name], g1[name], rtol = 1e-4, atol = 1e-6), name

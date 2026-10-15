@@ -287,7 +287,7 @@ class Eagle3Drafter(nn.Module):
         position_embeddings = self.rotary_emb(hidden, positions)
         return self.layers[0](embeds, hidden, mask, position_embeddings, cache)
 
-    def forward_train(self, aux_hidden, input_ids, attention_mask = None, ttt_steps = 3):
+    def forward_train(self, aux_hidden, input_ids, attention_mask = None, ttt_steps = 3, return_hidden = False):
         """Training-time test over full sequences (speculators `Eagle3DraftModel.forward` after
         `shift_batch`). aux_hidden [B, S, 3Ht] from the target pass over input_ids [B, S].
         Returns per-step logits [B, S-1, Vd]; step k row t predicts x_{t+2+k}."""
@@ -314,7 +314,7 @@ class Eagle3Drafter(nn.Module):
                 allowed = torch.cat([allowed, diag], dim = -1)
             mask = _additive(allowed.unsqueeze(1), dtype)
             hidden = self._run(self.embed(ids), hidden, mask, positions + k, cache)
-            out.append(self.logits(hidden))
+            out.append(hidden if return_hidden else self.logits(hidden))
         return out
 
     @torch.no_grad()
@@ -522,6 +522,47 @@ def eagle3_loss(step_logits, teacher_logits, loss_mask, decay = 1.0):
     return total, stats
 
 
+def eagle3_chunked_loss(drafter, step_hidden, final_hidden, lm_head_weight, loss_mask, decay = 1.0,
+                        chunk_rows = 1024):
+    """`eagle3_loss` from the drafter's hidden states, on supervised rows only, in checkpointed chunks:
+    draft and teacher logits never exist for the whole batch ([B, T, Vd] fp32 per step OOMs 24 GB cards)."""
+    from torch.utils.checkpoint import checkpoint
+
+    weight = lm_head_weight[drafter.t2d.to(lm_head_weight.device)] if drafter.uses_draft_vocab else lm_head_weight
+
+    def chunk_kl(h, th):
+        logp = F.log_softmax(drafter.logits(h).float(), dim = -1)
+        with torch.no_grad():
+            teacher = F.linear(th.to(weight.dtype), weight).to(logp.dtype)
+            p = F.softmax(teacher.float(), dim = -1)
+            hits = (logp.argmax(-1) == teacher.argmax(-1)).sum()
+        return F.kl_div(logp, p, reduction = "sum"), hits
+
+    total = 0.0
+    stats = {"loss": [], "acc": [], "count": []}
+    for k, hidden in enumerate(step_hidden):
+        T = hidden.shape[1]
+        h = hidden[:, :T - k] if k else hidden
+        th = final_hidden[:, k:]
+        mask = loss_mask[:, k:].bool()
+        rows, trows = h[mask], th[mask]
+        n = int(rows.shape[0])
+        kl_sum = rows.new_zeros((), dtype = torch.float32) + 0.0 * hidden.sum()
+        hit_sum = 0
+        for start in range(0, n, chunk_rows):
+            kl, hits = checkpoint(chunk_kl, rows[start:start + chunk_rows], trows[start:start + chunk_rows],
+                                  use_reentrant = False)
+            kl_sum = kl_sum + kl
+            hit_sum += int(hits)
+        denom = n + 1e-5
+        step_loss = kl_sum / denom
+        total = total + (decay ** k) * step_loss
+        stats["loss"].append(float(step_loss.detach()))
+        stats["acc"].append(hit_sum / denom)
+        stats["count"].append(float(n))
+    return total, stats
+
+
 @dataclass
 class Eagle3TrainingArguments(TrainingArguments):
     eagle3_ttt_steps: int = field(default = 3, metadata = {"help": "Training-time-test steps unrolled per batch."})
@@ -573,15 +614,14 @@ class UnslothEagle3Trainer(Trainer):
         ids = _aux_capture_ids(drafter.aux_layer_ids, self._num_layers)
         captured = run_frozen_target(self.target_model, input_ids, attention_mask = attention_mask, layer_ids = ids)
         aux = aux_hidden_states(captured, drafter.aux_layer_ids)
-        with torch.no_grad():
-            teacher = drafter.target_logits(captured["final"][:, 1:], self._lm_head_weight)
         # speculators `shift_batch` pairs row t = (g_t, x_{t+1}) with loss_mask[t + 1].
         loss_mask = (labels[:, 1:] != -100)
         if attention_mask is not None:
             loss_mask = loss_mask & attention_mask[:, 1:].bool()
-        step_logits = drafter.forward_train(aux, input_ids, attention_mask, self.args.eagle3_ttt_steps)
-        loss, stats = eagle3_loss(step_logits, teacher.to(step_logits[0].dtype), loss_mask,
-                                  self.args.eagle3_step_decay)
+        step_hidden = drafter.forward_train(aux, input_ids, attention_mask, self.args.eagle3_ttt_steps,
+                                            return_hidden = True)
+        loss, stats = eagle3_chunked_loss(drafter, step_hidden, captured["final"][:, 1:], self._lm_head_weight,
+                                          loss_mask, self.args.eagle3_step_decay)
         if model.training:
             self._eagle3_log.append(stats)
         return (loss, None) if return_outputs else loss
