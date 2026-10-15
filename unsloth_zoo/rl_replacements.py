@@ -108,6 +108,11 @@ def chunked_hidden_states_selective_log_softmax(
         else 0
     ),
     lm_head_bias: Optional[torch.Tensor] = None,
+    # Read in the default for the same Dynamo reason as max_rows_per_chunk. Pairs with vLLM's
+    # head_dtype=float32 that load_vllm requests under the same flag.
+    fp32_lm_head: bool = (
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+    ),
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
     # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
@@ -147,6 +152,12 @@ def chunked_hidden_states_selective_log_softmax(
     chunked_hidden_states = [flat_hidden_states[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
     chunked_index = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
 
+    # Cast once, outside the loop, so every chunk shares one fp32 head copy (also for autograd).
+    if fp32_lm_head:
+        lm_head = lm_head.to(torch.float32)
+        if lm_head_bias is not None:
+            lm_head_bias = lm_head_bias.to(torch.float32)
+
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
@@ -160,7 +171,11 @@ def chunked_hidden_states_selective_log_softmax(
         # bit-identical to before.
         chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
         chunk_index = chunk_index.to(lm_head.device)
-        if lm_head_bias is None:
+        if fp32_lm_head:
+            # The GRPO loss runs this under bf16 / fp16 autocast, which would downcast the matmul.
+            with torch.autocast(device_type = chunk_hidden_states.device.type, enabled = False):
+                chunk_logits = torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
+        elif lm_head_bias is None:
             chunk_logits = chunk_hidden_states @ lm_head.t()
         else:
             chunk_logits = torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
