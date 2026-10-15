@@ -147,7 +147,7 @@ def _reference_forced_forward(model, ids, forced):
             hidden_states = hidden_states.reshape(-1, gate.hidden_dim)
             logits = F.linear(hidden_states, gate.weight)
             probs = F.softmax(logits, dtype = torch.float, dim = -1)
-            idx = forced[:, li, :].long()
+            idx = forced[:, li, :].long().contiguous()
             w = probs.gather(-1, idx)
             w = w / w.sum(-1, keepdim = True)
             return logits, w.to(logits.dtype), idx
