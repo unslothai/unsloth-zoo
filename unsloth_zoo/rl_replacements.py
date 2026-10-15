@@ -191,6 +191,227 @@ def chunked_hidden_states_selective_log_softmax(
 
 RL_REPLACEMENTS["grpo_selective_log_softmax"] = chunked_hidden_states_selective_log_softmax
 
+# chunked_hidden_states_selective_log_softmax under autograd keeps every chunk's logits alive
+# until backward (all N x V of them, bf16 when compiled, float32 eager), so its peak grows with
+# the token count. This variant follows verl's FusedLinearForPPOFunction and prime-rl's chunked
+# LM head: the forward runs each chunk under no_grad and keeps only the log-sum-exp (and the
+# entropy), the backward recomputes one chunk's logits at a time, so the extra memory is about
+# one chunk of logits. Same arguments, chunk boundaries and logprobs as the function above;
+# return_entropy = True also returns the per-token entropy of the same softmax, differentiable.
+# Self-contained (needs only torch and os) so its source can be copied into generated trainers.
+def chunked_hidden_states_selective_log_softmax_recompute(
+    hidden_states: torch.Tensor,
+    lm_head: torch.Tensor,
+    index: torch.Tensor,
+    chunks: int = 4,
+    logit_scale_multiply: float = 0.0,
+    logit_scale_divide: float = 0.0,
+    logit_softcapping: float = 0.0,
+    temperature: float = 1.0,
+    max_rows_per_chunk: int = (
+        int(os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip())
+        if os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip().isdigit()
+        else 0
+    ),
+    lm_head_bias: Optional[torch.Tensor] = None,
+    return_entropy: bool = False,
+):
+    # All Unsloth Zoo code licensed under AGPL3
+    self_fn = chunked_hidden_states_selective_log_softmax_recompute
+    function = getattr(self_fn, "_autograd_function", None)
+    if function is None:
+        def post_forward(logits, index, scale_multiply, scale_divide, softcapping, temperature, with_entropy):
+            # The scale / softcap run in the matmul dtype, then float32, exactly as the plain path.
+            if scale_multiply != 0.0:
+                logits = logits * scale_multiply
+            if scale_divide != 0.0:
+                logits = logits / scale_divide
+            if softcapping != 0.0:
+                logits = softcapping * torch.tanh(logits / softcapping)
+            logits = logits.to(torch.float32)
+            if temperature != 1.0:
+                logits = logits / temperature
+            logsumexp = torch.logsumexp(logits, dim = -1)
+            selected = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
+            if with_entropy:
+                # -sum(p * log p) on log p = z - logsumexp: logsumexp - sum(p * z) cancels badly.
+                log_p = logits - logsumexp.unsqueeze(-1)
+                entropy = -(torch.exp(log_p) * log_p).sum(-1)
+            else:
+                entropy = torch.zeros_like(logsumexp)
+            return selected - logsumexp, logsumexp, entropy
+
+        def post_backward(
+            logits, index, logsumexp, entropy, grad_logps, grad_entropy,
+            scale_multiply, scale_divide, softcapping, temperature, with_entropy,
+        ):
+            # z exactly as the forward made it, so p matches the saved logsumexp; the softcap
+            # derivative in at least float32 (autograd would take it in the matmul dtype).
+            z = logits
+            if scale_multiply != 0.0:
+                z = z * scale_multiply
+            if scale_divide != 0.0:
+                z = z / scale_divide
+            if softcapping != 0.0:
+                z = softcapping * torch.tanh(z / softcapping)
+                x = logits.to(torch.promote_types(logits.dtype, torch.float32))
+                if scale_multiply != 0.0:
+                    x = x * scale_multiply
+                if scale_divide != 0.0:
+                    x = x / scale_divide
+                tanh = torch.tanh(x / softcapping)
+            z = z.to(torch.float32)
+            if temperature != 1.0:
+                z = z / temperature
+            log_p = z - logsumexp.unsqueeze(-1)
+            p = torch.exp(log_p)
+            # d logp / dz = onehot - p, d H / dz = -p * (log p + H)
+            if with_entropy:
+                grad_z = -p * (grad_logps.unsqueeze(-1) + grad_entropy.unsqueeze(-1) * (log_p + entropy.unsqueeze(-1)))
+            else:
+                grad_z = -p * grad_logps.unsqueeze(-1)
+            # A fused one-hot rather than scatter_add, which would materialise grad_z in float32.
+            onehot = torch.arange(z.shape[-1], device = z.device) == index.unsqueeze(-1)
+            grad_z = grad_z + onehot * grad_logps.unsqueeze(-1)
+            if temperature != 1.0:
+                grad_z = grad_z / temperature
+            if softcapping != 0.0:
+                grad_z = grad_z * (1.0 - tanh * tanh)
+            if scale_divide != 0.0:
+                grad_z = grad_z / scale_divide
+            if scale_multiply != 0.0:
+                grad_z = grad_z * scale_multiply
+            return grad_z.to(logits.dtype)
+
+        try:
+            from unsloth_zoo.temporary_patches.common import _maybe_compile as compile_function
+        except ImportError:
+            compile_function = torch.compile
+        compiled_forward  = compile_function(dynamic = True, fullgraph = True)(post_forward)
+        compiled_backward = compile_function(dynamic = True, fullgraph = True)(post_backward)
+
+        def run(kernel, eager, *args):
+            # A compile failure falls back to eager for the rest of the process.
+            if self_fn._use_compiled:
+                try:
+                    return kernel(*args)
+                except Exception:
+                    self_fn._use_compiled = False
+            return eager(*args)
+
+        def chunk_logits(chunk_hidden_states, lm_head, lm_head_bias):
+            chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
+            if lm_head_bias is None:
+                return chunk_hidden_states @ lm_head.t()
+            return torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
+
+        class ChunkedSelectiveLogSoftmax(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, hidden_states, lm_head, lm_head_bias, index, bounds, transforms):
+                device_type = lm_head.device.type
+                ctx.autocast_kwargs = dict(
+                    device_type = device_type,
+                    enabled = torch.is_autocast_enabled(device_type),
+                    dtype = torch.get_autocast_dtype(device_type),
+                    cache_enabled = torch.is_autocast_cache_enabled(),
+                )
+                logps, logsumexps, entropies = [], [], []
+                for a, b in zip(bounds[:-1], bounds[1:]):
+                    logits = chunk_logits(hidden_states[a:b], lm_head, lm_head_bias)
+                    chunk_index = index[a:b].to(lm_head.device)
+                    logp, logsumexp, entropy = run(
+                        compiled_forward, post_forward, logits, chunk_index, *transforms,
+                    )
+                    logps.append(logp)
+                    logsumexps.append(logsumexp)
+                    entropies.append(entropy)
+                logps = torch.cat(logps).to(hidden_states.device)
+                entropies = torch.cat(entropies).to(hidden_states.device)
+                ctx.save_for_backward(hidden_states, lm_head, lm_head_bias, index, torch.cat(logsumexps), entropies)
+                ctx.bounds = bounds
+                ctx.transforms = transforms
+                return logps, entropies
+
+            @staticmethod
+            def backward(ctx, grad_logps, grad_entropies):
+                hidden_states, lm_head, lm_head_bias, index, logsumexps, entropies = ctx.saved_tensors
+                need_hidden, need_head, need_bias = ctx.needs_input_grad[:3]
+                device = lm_head.device
+                if grad_logps is None:
+                    grad_logps = torch.zeros_like(entropies)
+                if grad_entropies is None:
+                    grad_entropies = torch.zeros_like(entropies)
+                grad_logps = grad_logps.to(device = device, dtype = torch.float32)
+                grad_entropies = grad_entropies.to(device = device, dtype = torch.float32)
+                entropies = entropies.to(device)
+                grad_hidden = torch.empty_like(hidden_states) if need_hidden else None
+                grad_head = None
+                grad_bias = torch.zeros(lm_head_bias.shape, dtype = torch.float32, device = device) if need_bias else None
+                head = None
+                for a, b in zip(ctx.bounds[:-1], ctx.bounds[1:]):
+                    chunk_hidden_states = hidden_states[a:b]
+                    with torch.no_grad(), torch.autocast(**ctx.autocast_kwargs):
+                        logits = chunk_logits(chunk_hidden_states, lm_head, lm_head_bias)
+                    grad_logits = run(
+                        compiled_backward, post_backward,
+                        logits, index[a:b].to(device), logsumexps[a:b], entropies[a:b],
+                        grad_logps[a:b], grad_entropies[a:b], *ctx.transforms,
+                    )
+                    del logits
+                    if head is None:
+                        # The head in the dtype the forward matmul ran in.
+                        head = lm_head if lm_head.dtype == grad_logits.dtype else lm_head.to(grad_logits.dtype)
+                    if need_hidden:
+                        grad_hidden[a:b] = (grad_logits @ head).to(device = hidden_states.device, dtype = hidden_states.dtype)
+                    if need_head:
+                        x = chunk_hidden_states.to(device = device, dtype = grad_logits.dtype)
+                        if grad_head is None:
+                            # Accumulate in place in the head's own dtype when the matmul ran in it,
+                            # as autograd does; a float32 head under autocast accumulates in float32.
+                            grad_head = torch.zeros(
+                                lm_head.shape, device = device,
+                                dtype = grad_logits.dtype if lm_head.dtype == grad_logits.dtype else torch.float32,
+                            )
+                        if grad_head.dtype == grad_logits.dtype:
+                            grad_head.addmm_(grad_logits.t(), x)
+                        else:
+                            grad_head.add_(grad_logits.t() @ x)
+                    if need_bias:
+                        grad_bias.add_(grad_logits.to(torch.float32).sum(0))
+                    del grad_logits
+                if need_head:
+                    grad_head = grad_head.to(lm_head.dtype)
+                if need_bias:
+                    grad_bias = grad_bias.to(lm_head_bias.dtype)
+                return grad_hidden, grad_head, grad_bias, None, None, None
+
+        self_fn._use_compiled = getattr(self_fn, "_use_compiled", True)
+        self_fn._autograd_function = function = ChunkedSelectiveLogSoftmax
+
+    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    flat_index = index.reshape(-1)
+    n_rows = flat_hidden_states.shape[0]
+    # Chunk boundaries exactly as chunked_hidden_states_selective_log_softmax, including the 2+
+    # rows per chunk rule for a trainable head.
+    if max_rows_per_chunk > 0:
+        chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
+        chunks = min(chunks, max(n_rows, 1))
+    if torch.is_grad_enabled() and lm_head.requires_grad and n_rows < 2 * chunks:
+        chunks = max(n_rows // 2, 1)
+    chunks = max(1, min(chunks, n_rows))
+    bounds = tuple((i * n_rows) // chunks for i in range(chunks + 1))
+    transforms = (
+        float(logit_scale_multiply), float(logit_scale_divide),
+        float(logit_softcapping), float(temperature), bool(return_entropy),
+    )
+    logps, entropies = function.apply(flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms)
+    logps = logps.reshape(hidden_states.shape[0], hidden_states.shape[1])
+    if return_entropy:
+        return logps, entropies.reshape(hidden_states.shape[0], hidden_states.shape[1])
+    return logps
+pass
+RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_selective_log_softmax_recompute
+
 def calculate_pad_tokens_in_prompt(
     input_ids: torch.Tensor,
     logits_to_keep: int,
@@ -1426,6 +1647,11 @@ def grpo_accumulated_loss(
         grpo_vision_chunks as _grpo_vision_chunks,
         chunked_hidden_states_selective_log_softmax,
     )
+    # Opt-in: recompute each logit chunk in backward instead of keeping every chunk's logits alive.
+    if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
+        from unsloth_zoo.rl_replacements import (
+            chunked_hidden_states_selective_log_softmax_recompute as chunked_hidden_states_selective_log_softmax,
+        )
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
     image_grid_thw = vision_inputs.get('image_grid_thw', None)
