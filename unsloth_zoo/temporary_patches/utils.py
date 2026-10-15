@@ -1228,6 +1228,53 @@ def dynamo_tracing_disabled():
     return bool(config.disable)
 
 
+# Inductor refuses any graph with a bf16 CUDA input or output on a device without
+# native bf16 (`_check_triton_bf16_support` in torch/_inductor/compile_fx.py: sm < 8,
+# e.g. T4) by raising SkipFrame. Dynamo then runs the frame eagerly, but under
+# `fullgraph = True` torch >= 2.13 turns that into "found no compiled frames" AFTER
+# the body ran. vLLM builds Gemma4's HF vision / audio towers from the checkpoint's
+# bf16 sub-config even when the engine runs float16, so their norm weights reach
+# our kernels as bf16 on a T4.
+_CUDA_NATIVE_BF16: dict = {}
+
+
+def _device_lacks_native_bf16(device):
+    """Mirrors `torch.cuda.is_bf16_supported(including_emulation = False)` per device."""
+    if device.type != "cuda":
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    native = _CUDA_NATIVE_BF16.get(index)
+    if native is None:
+        native = _CUDA_NATIVE_BF16[index] = bool(torch.version.hip) or \
+            torch.cuda.get_device_capability(index)[0] >= 8
+    return not native
+
+
+_ANY_CUDA_LACKS_BF16 = None
+
+
+def _inductor_would_skip_bf16(args, kwargs):
+    """Would Inductor refuse this call for a bf16 tensor on a device lacking bf16?"""
+    global _ANY_CUDA_LACKS_BF16
+    if _ANY_CUDA_LACKS_BF16 is None:
+        # Per-call cost on bf16-capable hosts is this one global read.
+        try:
+            _ANY_CUDA_LACKS_BF16 = torch.cuda.is_available() and any(
+                _device_lacks_native_bf16(torch.device("cuda", i))
+                for i in range(torch.cuda.device_count())
+            )
+        except Exception:
+            _ANY_CUDA_LACKS_BF16 = True
+    if not _ANY_CUDA_LACKS_BF16:
+        return False
+    for value in (*args, *kwargs.values()):
+        if not isinstance(value, torch.Tensor):
+            continue
+        if value.dtype is torch.bfloat16 and _device_lacks_native_bf16(value.device):
+            return True
+    return False
+
+
 def _is_our_own_disabled_hook(exc):
     """Did we break our own graph with our own `torch.compiler.disable`?
 
@@ -1931,6 +1978,12 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # post-call bookkeeping (torch/_dynamo/eval_frame.py), so catching
             # that and re-running eager executes the body twice, consuming RNG
             # twice and repeating any mutation it made.
+            return eager_func(*args, **kwargs)
+        if _inductor_would_skip_bf16(args, kwargs):
+            # Inductor would run this frame eagerly anyway (see
+            # `_device_lacks_native_bf16`); decided before the call for the same
+            # reason as above. Per call, not latched: a pack and its recompute see
+            # the same dtypes, so they always agree.
             return eager_func(*args, **kwargs)
         marker_before = _PACKED_COMPILED_IN_CHECKPOINT
         try:
