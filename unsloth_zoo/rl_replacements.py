@@ -1931,7 +1931,8 @@ def grpo_accumulated_loss(
     # Opt-in for TRL versions without the field or the geometric modes, e.g. geometric_mask.
     if os.environ.get("UNSLOTH_GRPO_VLLM_IS_MODE", ""):
         kwargs["vllm_importance_sampling_mode"] = os.environ["UNSLOTH_GRPO_VLLM_IS_MODE"]
-    if kwargs["vllm_importance_sampling_mode"] not in (
+    # Like TRL, only check the mode where it is used: with the correction off it stays a no-op.
+    if getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False) and kwargs["vllm_importance_sampling_mode"] not in (
         "token_truncate", "token_mask", "sequence_truncate", "sequence_mask", "geometric_truncate", "geometric_mask",
     ):
         raise ValueError(f"Unsloth: unknown vLLM importance sampling mode {kwargs['vllm_importance_sampling_mode']}.")

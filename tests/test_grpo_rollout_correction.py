@@ -326,7 +326,7 @@ class _DriverModel(torch.nn.Module):
         return __import__("types").SimpleNamespace(logits = hidden)
 
 
-def _drive(monkeypatch, correction, training = True, should_evaluate = False, loss_type = "dapo", is_mode = None):
+def _drive(monkeypatch, correction, training = True, should_evaluate = False, loss_type = "dapo", is_mode = None, args_mode = None, use_vllm = True):
     import collections
     import types
 
@@ -352,6 +352,7 @@ def _drive(monkeypatch, correction, training = True, should_evaluate = False, lo
     trainer = types.SimpleNamespace(
         args = types.SimpleNamespace(
             unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1, off_policy_mask_threshold = 0.5,
+            vllm_importance_sampling_mode = args_mode,
         ),
         processing_class = types.SimpleNamespace(pad_token_id = 0),
         model = model,
@@ -360,7 +361,7 @@ def _drive(monkeypatch, correction, training = True, should_evaluate = False, lo
         ),
         control = types.SimpleNamespace(should_evaluate = should_evaluate),
         _metrics = metrics,
-        use_vllm = True,
+        use_vllm = use_vllm,
         vllm_importance_sampling_correction = correction,
         _autocast_dtype = None,
         beta = 0.0,
@@ -423,3 +424,12 @@ def test_reversed_or_empty_is_clip_override_is_rejected(monkeypatch, spec):
 def test_rollout_rs_rejects_non_finite_thresholds(options, thresholds):
     with pytest.raises(ValueError, match = "finite"):
         rr.grpo_parse_rollout_rs(options, thresholds)
+
+
+@pytest.mark.parametrize("use_vllm, correction", [(False, False), (True, False), (False, True)])
+def test_unknown_trl_is_mode_is_ignored_without_is_correction(monkeypatch, use_vllm, correction):
+    # TRL only reads vllm_importance_sampling_mode inside its vLLM IS correction block, so a value this
+    # version does not know must stay a no-op when that correction is off, as it was before.
+    _drive(monkeypatch, correction = correction, use_vllm = use_vllm, args_mode = "some_future_mode")
+    with pytest.raises(ValueError, match = "importance sampling mode"):
+        _drive(monkeypatch, correction = True, args_mode = "some_future_mode")
