@@ -57,6 +57,20 @@ class _Model(torch.nn.Module):
         return SimpleNamespace(logits = self.head(torch.tanh(self.emb(input_ids))))
 
 
+class _OOMInVerifyModel(_Model):
+    """The packed forward succeeds; the first per-row verifier forward runs out of memory."""
+
+    def __init__(self):
+        super().__init__()
+        self.armed = True
+
+    def forward(self, input_ids = None, packed_seq_lengths = None, **kwargs):
+        if packed_seq_lengths is None and self.armed:
+            self.armed = False
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        return super().forward(input_ids = input_ids, packed_seq_lengths = packed_seq_lengths, **kwargs)
+
+
 def _block_source():
     src = inspect.getsource(rr.grpo_accumulated_loss)
     start = src.rindex("\n", 0, src.index("    new_logprobs = None")) + 1
@@ -74,7 +88,7 @@ SHORT = torch.tensor([
 ])
 
 
-def _run(model, input_ids):
+def _run(model, input_ids, **overrides):
     left_pad = rr.calculate_pad_tokens_in_prompt(input_ids, KEEP, PAD_ID)
     max_left_pad = int(left_pad.max())
     ns = {
@@ -103,6 +117,7 @@ def _run(model, input_ids):
         "logit_scale_multiply": 0.0, "logit_scale_divide": 0.0,
         "logit_softcapping": 0.0, "temperature": 1.0,
     }
+    ns.update(overrides)
     exec(_block_source(), ns)
     return ns
 
@@ -132,3 +147,27 @@ def test_non_oom_failure_still_disables_packing():
     ns = _run(model, LONG)
     assert ns["_pack_use"] is False
     assert model._unsloth_seq_packing_grad_ok is False
+
+
+def test_oom_in_the_per_row_verifier_disables_packing(monkeypatch):
+    # The packed forward completed, so the OOM says nothing about the packed length.
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    model = _OOMInVerifyModel()
+    ns = _run(model, LONG)
+    assert model.packed_calls == 1
+    assert ns["_pack_use"] is False
+    assert model._unsloth_seq_packing_grad_ok is False
+    assert getattr(model, "_unsloth_seq_packing_grad_unsafe_T", None) is None
+
+
+def test_oom_log_reports_the_cap_not_disabled(monkeypatch, capsys):
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    model = _Model(torch.cuda.OutOfMemoryError("CUDA out of memory"))
+    ns = _run(model, LONG, UNSLOTH_ENABLE_LOGGING = True)
+    out = capsys.readouterr().out
+    assert f"capped below T={ns['_pack_T']}" in out
+    assert "disabled" not in out
+
+    model = _Model(RuntimeError("kernel rejected the packed layout"))
+    _run(model, LONG, UNSLOTH_ENABLE_LOGGING = True)
+    assert "disabled (fell back to padded)" in capsys.readouterr().out
