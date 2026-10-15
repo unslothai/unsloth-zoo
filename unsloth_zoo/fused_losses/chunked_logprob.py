@@ -78,7 +78,7 @@ def _forward_stats(logits, targets, scalars, has_mul: bool, has_div: bool, has_c
     return selected - lse, lse, mean_logits
 
 
-def _logits_grad(logits, targets, lse, grad, scalars, has_mul: bool, has_div: bool, has_cap: bool):
+def _logits_grad(logits, targets, lse, grad, scalars, has_mul: bool, has_div: bool, has_cap: bool, out_dtype):
     # d logp_t / d z_v = onehot(t)_v - softmax(z)_v, chained back through temperature, softcap and scale.
     x = logits.float()
     if has_mul:
@@ -99,7 +99,7 @@ def _logits_grad(logits, targets, lse, grad, scalars, has_mul: bool, has_div: bo
         dz = dz * scalars[1]
     if has_div:
         dz = dz / scalars[2]
-    return dz.to(logits.dtype)
+    return dz.to(out_dtype)
 
 
 # Compiled bodies keyed by name; a body whose compile fails runs eager from then on (same math).
@@ -130,9 +130,30 @@ def _run(name, fn, *args):
         return fn(*args)
 
 
-def _project(hidden, weight, bias, compute_dtype):
+def _mm_fp32(a, b):
+    """a @ b with an fp32 result for half inputs: one bf16 rounding of a vocab-long sum is ~1% of a DPO gradient."""
+    if a.dtype in (torch.float16, torch.bfloat16) and a.is_cuda:
+        try:
+            return torch.mm(a, b, out_dtype = torch.float32)
+        except (TypeError, RuntimeError):
+            pass
+    return a @ b
+
+
+_FP32_LOGITS = os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") != "0"
+
+
+def _project(hidden, weight, bias, compute_dtype, fp32_out = False):
     h = hidden.to(compute_dtype)
     w = weight.to(compute_dtype)
+    if fp32_out and _FP32_LOGITS and compute_dtype in (torch.float16, torch.bfloat16) and h.is_cuda:
+        # Half GEMM, fp32 result: rounding every logit to bf16 biases a sequence's summed log-prob, which preference
+        # losses take differences of (B200 DPO gradient 0.99x of fp64 with bf16 logits, 1.002x with fp32; +4% time).
+        try:
+            out = torch.mm(h, w.t(), out_dtype = torch.float32)
+            return out if bias is None else out + bias.float()
+        except (TypeError, RuntimeError):
+            pass
     if bias is None:
         return h @ w.t()
     return torch.nn.functional.linear(h, w, bias.to(compute_dtype))
@@ -166,7 +187,7 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
         with torch.autocast(device.type, enabled = False):
             for a in range(0, n, rows_per_chunk):
                 b = min(a + rows_per_chunk, n)
-                logits = _project(hidden[a:b], weight, bias, compute_dtype)
+                logits = _project(hidden[a:b], weight, bias, compute_dtype, fp32_out = True)
                 lp, ls, mean = _run(
                     "fwd_mean" if want_mean else "fwd", _forward_stats,
                     logits, targets[a:b], scalars, *flags, bool(want_mean),
@@ -201,14 +222,14 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
             for a in range(0, n, ctx.rows_per_chunk):
                 b = min(a + ctx.rows_per_chunk, n)
                 h = hidden[a:b].to(compute_dtype)
-                logits = _project(h, w, bias, compute_dtype)
+                logits = _project(h, w, bias, compute_dtype, fp32_out = True)
                 dz = _run(
                     "bwd", _logits_grad,
-                    logits, targets[a:b], lse[a:b], grad_logps[a:b], scalars, *ctx.flags,
+                    logits, targets[a:b], lse[a:b], grad_logps[a:b], scalars, *ctx.flags, compute_dtype,
                 )
                 del logits
                 if need_h:
-                    grad_hidden[a:b] = (dz @ w).to(grad_hidden.dtype)
+                    grad_hidden[a:b] = _mm_fp32(dz, w).to(grad_hidden.dtype)
                 if need_w:
                     # Per-chunk GEMM in compute dtype, summed across chunks in fp32.
                     grad_weight.add_((dz.t() @ h).float())
@@ -309,7 +330,7 @@ class UnslothChunkedCE(torch.autograd.Function):
                 lp, lse, _ = _run("fwd", _forward_stats, logits, targets[a:b], scalars, *flags, False)
                 loss -= lp.sum()
                 if need_h or need_w or need_b:
-                    dz = _run("bwd", _logits_grad, logits, targets[a:b], lse, g_row[: b - a], scalars, *flags)
+                    dz = _run("bwd", _logits_grad, logits, targets[a:b], lse, g_row[: b - a], scalars, *flags, compute_dtype)
                     del logits
                     if need_h:
                         grad_hidden[a:b] = (dz @ w).to(grad_hidden.dtype)
