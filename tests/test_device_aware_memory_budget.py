@@ -110,6 +110,20 @@ def test_budget_counts_reusable_allocator_cache(monkeypatch):
     assert tiled._default_target_gb() == pytest.approx(4.0)
 
 
+def test_xpu_budget_counts_reusable_allocator_cache(monkeypatch):
+    _, tiled = _modules()
+    import types
+    fake = types.SimpleNamespace(
+        is_available = lambda: True,
+        mem_get_info = lambda index = None: (2 * GIB, 16 * GIB),
+        memory_reserved = lambda index = None: 10 * GIB,
+        memory_allocated = lambda index = None: 4 * GIB,
+    )
+    monkeypatch.setattr(tiled, "DEVICE_TYPE", "xpu", raising = False)
+    monkeypatch.setattr(tiled.torch, "xpu", fake, raising = False)
+    assert tiled._default_target_gb() == pytest.approx(4.0)
+
+
 def test_cpu_operand_budgets_from_host_ram(monkeypatch):
     _, tiled, fake = _mock(monkeypatch, {0: 2 * GIB, 1: 20 * GIB})
     psutil = pytest.importorskip("psutil")

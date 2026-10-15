@@ -89,27 +89,33 @@ def _default_target_gb(device = None):
         index = device.index
     if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
         # torch.cuda.mem_get_info also covers ROCm (PyTorch aliases the cuda API).
-        free = torch.cuda.mem_get_info(index)[0]
-        # Blocks the caching allocator holds but has not handed out are free to reuse.
-        try:
-            free += torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(index)
-        except Exception:
-            pass
+        free = torch.cuda.mem_get_info(index)[0] + _cached_unused_bytes(torch.cuda, index)
         return free / 1024 / 1024 / 1024 * 0.5
     if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
         # Present from torch 2.6, but raises on some Intel GPUs (e.g. Arc B580,
         # Lunar Lake). When the accelerator cannot report free memory, use a small
         # bounded default: host RAM would overshoot VRAM and still OOM the tiler.
         try:
-            return torch.xpu.mem_get_info(index)[0] / 1024 / 1024 / 1024 * 0.5
+            free = torch.xpu.mem_get_info(index)[0] + _cached_unused_bytes(torch.xpu, index)
+            return free / 1024 / 1024 / 1024 * 0.5
         except Exception:
             return 4.0
     if DEVICE_TYPE == "npu" and hasattr(torch, "npu"):
         try:
-            return torch.npu.mem_get_info(index)[0] / 1024 / 1024 / 1024 * 0.5
+            free = torch.npu.mem_get_info(index)[0] + _cached_unused_bytes(torch.npu, index)
+            return free / 1024 / 1024 / 1024 * 0.5
         except Exception:
             return 4.0
     return _host_target_gb()
+pass
+
+def _cached_unused_bytes(backend, index):
+    # Blocks the caching allocator holds but has not handed out are free to reuse.
+    try:
+        value = backend.memory_reserved(index) - backend.memory_allocated(index)
+    except Exception:
+        return 0
+    return value if isinstance(value, int) and value > 0 else 0
 pass
 
 def _host_target_gb():
