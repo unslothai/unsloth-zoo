@@ -85,3 +85,16 @@ def test_gradients_match_plain_checkpoint(gc_module, monkeypatch, mode):
         assert stats["pinned"] > 0 and stats["pageable"] == 0
     if mode.startswith("stream"):
         assert stats["prefetch_hits"] == stats["prefetched"] > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_side_stream_host_copy_is_pinned(gc_module):
+    # Bytes are charged to the pinned cap only for a destination that really is pinned:
+    # a non_blocking CUDA to CPU .to() allocates it from the pinned host allocator.
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    x = torch.randn(1024, 1024, device = "cuda", requires_grad = True)
+    record = offloader.pack(x)
+    torch.cuda.synchronize()
+    assert offloader.stats["pinned"] == 1 and record.pinned_bytes > 0
+    assert record.host.is_pinned()
+    assert torch.equal(offloader.unpack(record), x.detach())
