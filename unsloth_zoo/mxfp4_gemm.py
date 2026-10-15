@@ -120,9 +120,8 @@ if _HAS_TRITON:
 
     @triton.jit
     def _decode_mxfp4_tile_cvt(packed, scale):
-        """_decode_mxfp4_tile_asm via the sm_100+ / sm_120 hardware convert (PTX 9.2 ``cvt.rn.bf16x2.e2m1x2`` with
-        ``.scaled::n2::ue8m0``): one F2FP per byte. Scale 255 is e8m0 NaN to the cvt; the bit-trick decode and the
-        reference give value * 2^128, so 255 decodes at 254 and is doubled (predicated), bit for bit the same."""
+        """Hardware convert decode (PTX 9.2 ``cvt.rn.bf16x2.e2m1x2.scaled::n2::ue8m0``). Scale 255 is NaN to the
+        cvt but value * 2^128 in the reference, so it decodes at 254 and is doubled."""
         R: tl.constexpr = packed.shape[0]
         CB: tl.constexpr = packed.shape[1]
         CG: tl.constexpr = scale.shape[1]
@@ -173,7 +172,6 @@ if _HAS_TRITON:
 
     @triton.jit
     def _decode_probe_kernel(blocks_ptr, scales_ptr, out_ptr, CVT: tl.constexpr):
-        # One 16-byte group per row, one scale per row: the decoder exactly as the GEMMs call it.
         r = tl.program_id(0) * 64 + tl.arange(0, 64)
         packed = tl.load(blocks_ptr + r[:, None] * 16 + tl.arange(0, 16)[None, :])
         scale = tl.load(scales_ptr + r[:, None] + tl.arange(0, 1)[None, :])
@@ -488,10 +486,8 @@ def _asm_ok(device, eager = False):
 
 
 def _cvt_ok(index, eager = False):
-    """The hardware convert decode: needs ptxas with PTX 9.2 (CUDA 13.2+, e.g. Triton 3.8's ptxas-blackwell) and
-    sm_100f / sm_120f; compiled and checked bit for bit against the fma decode on every (byte, scale) once.
-    Timed faster on sm_120 (RTX PRO 6000); sm_100 is untimed, so it only takes it with UNSLOTH_MXFP4_CVT=1.
-    UNSLOTH_MXFP4_CVT=0 turns it off. None = cannot probe here (inside a trace; ``eager``: real tensors anyway)."""
+    """Needs PTX 9.2 ptxas and sm_100f / sm_120f; checked bit for bit vs the fma decode once. sm_100 is untimed,
+    so auto only enables sm_120. None = cannot probe here (inside a trace)."""
     import os
     mode = os.environ.get("UNSLOTH_MXFP4_CVT", "auto").strip().lower()
     major = torch.cuda.get_device_capability(index)[0]
