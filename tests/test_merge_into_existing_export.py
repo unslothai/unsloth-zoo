@@ -128,10 +128,15 @@ def _fake_hub(monkeypatch, base, fail):
         def ls(self, name, detail = True):
             return [{"name": f"{name}/{f}", "size": os.path.getsize(os.path.join(base, f))} for f in shards]
 
+    fetched = []
+
     def _fetch(local_dir, names):
-        if fail and any(f in shards for f in names):
-            raise OSError("simulated network failure")
+        # fail: True fails the first shard fetch, an int N fails once N shards landed.
         for f in names:
+            if f in shards:
+                if fail is True or (fail is not False and len(fetched) >= fail):
+                    raise OSError("simulated network failure")
+                fetched.append(f)
             if os.path.exists(os.path.join(base, f)):
                 shutil.copyfile(os.path.join(base, f), os.path.join(local_dir, f))
 
@@ -152,8 +157,9 @@ def _fake_hub(monkeypatch, base, fail):
     monkeypatch.setattr(S, "_try_copy_all_from_cache", lambda *a, **k: False)
 
 
+@pytest.mark.parametrize("fail", [True, 1], ids = ["first_shard", "later_shard"])
 @pytest.mark.parametrize("low_disk", [False, True])
-def test_failed_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low_disk):
+def test_failed_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low_disk, fail):
     base, peft_model = _build(tmp_path, "20KB")
     out = str(tmp_path / "out")
     _fake_hub(monkeypatch, base, fail = False)
@@ -161,7 +167,7 @@ def test_failed_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low_disk)
     expected = H.read_safetensors_dir(out)
     assert len([f for f in os.listdir(out) if f.endswith(".safetensors")]) > 1
 
-    _fake_hub(monkeypatch, base, fail = True)
+    _fake_hub(monkeypatch, base, fail = fail)
     with pytest.raises(OSError, match = "simulated"):
         H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
     got = H.read_safetensors_dir(out)
@@ -174,3 +180,29 @@ def test_failed_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low_disk)
     H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
     again = H.read_safetensors_dir(out)
     assert [k for k in expected if not torch.equal(again[k], expected[k])] == []
+
+
+def test_failed_local_copy_keeps_previous_export(tmp_path, monkeypatch):
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    expected = H.read_safetensors_dir(out)
+    assert len([f for f in os.listdir(out) if f.endswith(".safetensors")]) > 2
+
+    real_copy, copied = S._copy_file_from_source, []
+    def _copy_then_fail(src, target_dir, filename):
+        if str(src).endswith(".safetensors"):
+            if len(copied) >= 1:
+                raise OSError("simulated ENOSPC")
+            copied.append(filename)
+        return real_copy(src, target_dir, filename)
+    monkeypatch.setattr(S, "_copy_file_from_source", _copy_then_fail)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    assert copied
+    got = H.read_safetensors_dir(out)
+    assert sorted(got) == sorted(expected)
+    assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
+    assert not [f for f in os.listdir(out) if f.endswith(".unsloth-previous-export")]

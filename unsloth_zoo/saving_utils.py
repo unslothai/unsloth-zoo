@@ -5305,13 +5305,30 @@ def merge_and_overwrite_lora(
 
     # An earlier export's shard is already merged and the fetches below can keep it
     # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
-    _stale_shards = {}
-    if not is_local_path:
-        _stale_shards = _set_aside_stale_output_shards(
-            [os.path.join(save_directory, filename) for filename in safetensors_list],
-            save_directory,
-        )
+    # Local sources overwrite the output too; set those aside so a failed copy can roll back,
+    # except the in-place export, whose output shard IS the source.
+    _stale_candidates = []
+    for filename in safetensors_list:
+        _output_path = os.path.join(save_directory, filename)
+        if is_local_path:
+            _source_path = os.path.join(model_name, filename)
+            if not os.path.exists(_source_path) or (
+                os.path.exists(_output_path) and os.path.samefile(_output_path, _source_path)
+            ):
+                continue
+        _stale_candidates.append(_output_path)
+    _stale_shards = _set_aside_stale_output_shards(_stale_candidates, save_directory)
+    # Backups stay until every shard is fetched so a later failure restores all of them. Low disk
+    # mode drops each one as its replacement lands only when the disk cannot hold both copies.
+    _discard_per_shard = False
+    if low_disk_space_usage and _stale_shards:
+        try:
+            _backup_bytes = sum(os.path.getsize(_b) for _b in _stale_shards.values() if os.path.exists(_b))
+            _discard_per_shard = shutil.disk_usage(save_directory).free < _backup_bytes + (1 << 30)
+        except OSError:
+            _discard_per_shard = True
 
+    _discarded_shards = []
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
         if not is_local_path and _hf_cache_dir is not None:
@@ -5390,9 +5407,9 @@ def merge_and_overwrite_lora(
                 )
             pass
 
-            # Low disk mode bounds the extra space to one shard instead of a full copy.
-            if low_disk_space_usage and os.path.exists(file_path):
+            if _discard_per_shard and os.path.exists(file_path):
                 _discard_stale_output_shard(_stale_shards, file_path)
+                _discarded_shards.append(filename)
 
             if needs_splitting:
                 resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)
@@ -5404,6 +5421,11 @@ def merge_and_overwrite_lora(
         pass
     except BaseException:
         _restore_stale_output_shards(_stale_shards)
+        if _discarded_shards:
+            print(
+                f"Unsloth: Warning: the export in {save_directory} is incomplete. Low disk mode already "
+                f"replaced {', '.join(_discarded_shards)} with the base weights. Re-run the export."
+            )
         raise
     for _stale_path in list(_stale_shards):
         _discard_stale_output_shard(_stale_shards, _stale_path)
