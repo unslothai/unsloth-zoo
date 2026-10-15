@@ -26,3 +26,19 @@ flash-linear-attention (fla-core)
   gated-deltanet models get the Triton kernels without an extra
   `pip install flash-linear-attention`. Package __init__ exports were narrowed;
   all other files retain their original upstream MIT headers verbatim.
+
+--------------------------------------------------------------------------------
+vLLM (Gated DeltaNet ReplaySSM decode kernel)
+--------------------------------------------------------------------------------
+  Source:    https://github.com/vllm-project/vllm/pull/48792
+  Commit:    ccd8197ae9818607cb7e904ffbb83a7ce0fe31fa
+  License:   Apache-2.0
+  Copyright: Copyright contributors to the vLLM project
+  Location:  unsloth_zoo/_vendored/vllm/
+  License text + provenance: unsloth_zoo/_vendored/vllm/LICENSE and
+                             unsloth_zoo/_vendored/vllm/MANIFEST
+                             (also embedded verbatim in the shipped module
+                             unsloth_zoo/_vendored/_licenses.py).
+
+  One Triton kernel file (gdn_replayssm_decode.py), with its launch-config lookup
+  inlined; see the MANIFEST for the exact change.
