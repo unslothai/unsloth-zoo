@@ -89,7 +89,13 @@ def _default_target_gb(device = None):
         index = device.index
     if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
         # torch.cuda.mem_get_info also covers ROCm (PyTorch aliases the cuda API).
-        return torch.cuda.mem_get_info(index)[0] / 1024 / 1024 / 1024 * 0.5
+        free = torch.cuda.mem_get_info(index)[0]
+        # Blocks the caching allocator holds but has not handed out are free to reuse.
+        try:
+            free += torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(index)
+        except Exception:
+            pass
+        return free / 1024 / 1024 / 1024 * 0.5
     if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
         # Present from torch 2.6, but raises on some Intel GPUs (e.g. Arc B580,
         # Lunar Lake). When the accelerator cannot report free memory, use a small

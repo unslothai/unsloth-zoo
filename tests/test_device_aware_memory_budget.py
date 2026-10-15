@@ -49,8 +49,9 @@ def _modules():
 class _FakeCuda:
     """Two GPUs with different free memory; the process lives on GPU 1 (rank 1)."""
 
-    def __init__(self, free_by_index, current = 1):
+    def __init__(self, free_by_index, current = 1, cached_by_index = None):
         self.free_by_index = dict(free_by_index)
+        self.cached_by_index = dict(cached_by_index or {})
         self.current = current
         self.queried = []
 
@@ -72,10 +73,19 @@ class _FakeCuda:
         free = self.free_by_index[index]
         return (free, 80 * GIB)
 
+    def _index(self, device):
+        return self.current if device is None else (device if isinstance(device, int) else device.index)
 
-def _mock(monkeypatch, free_by_index, current = 1):
+    def memory_reserved(self, device = None):
+        return 4 * GIB + self.cached_by_index.get(self._index(device), 0)
+
+    def memory_allocated(self, device = None):
+        return 4 * GIB
+
+
+def _mock(monkeypatch, free_by_index, current = 1, cached_by_index = None):
     ce, tiled = _modules()
-    fake = _FakeCuda(free_by_index, current)
+    fake = _FakeCuda(free_by_index, current, cached_by_index)
     monkeypatch.setattr(tiled, "DEVICE_TYPE", "cuda", raising = False)
     monkeypatch.setattr(tiled.torch, "cuda", fake, raising = False)
     ce._get_chunk_multiplier.cache_clear()
@@ -93,6 +103,11 @@ def test_default_budget_uses_the_given_device(monkeypatch):
     import torch as real_torch
     assert tiled._default_target_gb(real_torch.device("cuda", 1)) == pytest.approx(10.0)
     assert fake.queried == [1], fake.queried
+
+
+def test_budget_counts_reusable_allocator_cache(monkeypatch):
+    _, tiled, _ = _mock(monkeypatch, {0: 2 * GIB, 1: 2 * GIB}, current = 1, cached_by_index = {1: 6 * GIB})
+    assert tiled._default_target_gb() == pytest.approx(4.0)
 
 
 def test_cpu_operand_budgets_from_host_ram(monkeypatch):
