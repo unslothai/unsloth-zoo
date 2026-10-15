@@ -701,6 +701,8 @@ def test_a_block_read_in_one_pass_over_the_kv_prefix_matches_one_row_sdpa_calls_
     # Rows on both sides of a block-count step stay one-row calls, as do array masks, quantized caches and float32 rows.
     monkeypatch.setattr(inference, "_EXACT_ATTENTION_MIN_KEYS", 0)
     monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
+    monkeypatch.setattr(inference, "_exact_attention_faster", lambda per_row, fused: True)
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
     blocks = lambda n: inference._sdpa_vector_blocks(gqa, n)
     q, k = mx.zeros((1, heads[0], 4, 256), mx.bfloat16), mx.zeros((1, heads[1], 70000, 256), mx.bfloat16)
     for n in (1024, 4096, 8192, 16384, 32768, 65536):
@@ -710,6 +712,30 @@ def test_a_block_read_in_one_pass_over_the_kv_prefix_matches_one_row_sdpa_calls_
                  (q.astype(mx.float32), k.astype(mx.float32), k.astype(mx.float32), 0.0625, None, None)):
         assert inference._exact_attention(*args, lambda: "rows") == "rows"
     assert isinstance(inference._exact_attention(q, k, k, 0.0625, None, None, lambda: q), mx.array) and inference._VERIFY_VERDICTS
+
+
+def test_exact_attention_engages_where_timed_faster_and_caches_each_bucket_verdict(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    timings, timed = [], inference._exact_attention_faster
+    faster = lambda per_row, fused: timings.append(per_row()) or timings[-1] in wins
+    monkeypatch.setattr(inference, "_exact_attention_faster", faster)
+    monkeypatch.setattr(inference, "_verify_admitted", lambda key, native, fused: "kernel")
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
+    q, k, wins = mx.zeros((1, 24, 4, 256), mx.bfloat16), mx.zeros((1, 4, 40000, 256), mx.bfloat16), {20000, 9500}
+    attend = lambda keys, rows = q: inference._exact_attention(rows, k[:, :, :keys], k[:, :, :keys], 0.0625, None, None, lambda: keys)
+    # Below the bottom limit nothing is timed; above it each power-of-two bucket is timed once, and its verdict holds for it alone.
+    assert [attend(n) for n in (5000, 9000, 12000, 20000, 30000, 40000, 10000)] == [5000, 9000, 12000, "kernel", "kernel", 40000, 10000]
+    assert timings == [9000, 20000, 40000]
+    # Each width is timed apart, and a loss in a larger bucket leaves a smaller one to its own timing.
+    assert attend(40000, q[:, :, :3]) == 40000 and attend(9500, q[:, :, :3]) == "kernel" and timings == [9000, 20000, 40000, 40000, 9500]
+    # The kernel must beat the one-row calls by 5% on the medians of three alternating runs; each run advances the clock by its own time.
+    for rows, kernel, verdict in (((10, 30, 10), (9.4, 9.4, 30), True), ((10, 10, 40), (9.4, 9.6, 9.6), False)):
+        now, spent, order = [0.0], [0.0], []
+        def clock():
+            now[0], spent[0] = now[0] + spent[0], 0.0
+            return now[0]
+        run = lambda durations, value: (lambda it: lambda: order.append(value.item()) or spent.__setitem__(0, next(it)) or value)(iter((0,) + durations))
+        assert timed(run(rows, mx.zeros(())), run(kernel, mx.ones(())), clock) is verdict and order == [0, 1] * 4
 
 
 def test_long_verify_blocks_read_attention_in_one_pass_and_match_the_native_verifier(qwen_4bit, monkeypatch):
@@ -726,6 +752,8 @@ def test_long_verify_blocks_read_attention_in_one_pass_and_match_the_native_veri
     with inference.exact_speculative_verify(model):
         assert _same(native[0], _verified(lm, cache, block, 0)) and not attention()
         monkeypatch.setattr(inference, "_EXACT_ATTENTION_MIN_KEYS", 4096)
+        monkeypatch.setattr(inference, "_exact_attention_faster", lambda per_row, fused: True)
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
         # An unscoped copy of the model stays on the one-row calls.
         assert _same(native[0], _verified(unscoped, cache, block, 0)) and not attention()
         assert all(_same(expected, _verified(lm, cache, block, keep)) for keep, expected in native.items())

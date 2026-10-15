@@ -32,6 +32,7 @@ import re
 import struct
 import sys
 import textwrap
+import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import RLock, local
@@ -4294,8 +4295,10 @@ _EXACT_ATTENTION_REDUCE = """
         }
     }
 """
-# Below this many keys the one-row calls are as fast: the block kernel pays off once K/V reads dominate.
-_EXACT_ATTENTION_MIN_KEYS = 16384
+# Below this many keys attention is too small a share of a verify round to time; above it, the kernel is timed.
+_EXACT_ATTENTION_MIN_KEYS = 8192
+# Whether the kernel timed faster, per (batch, width, heads, kv heads, dtype, power-of-two bucket of the first row's keys).
+_EXACT_ATTENTION_TIMED = {}
 
 
 @functools.cache
@@ -4353,8 +4356,33 @@ def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
     blocks = _sdpa_vector_blocks(gqa, first)
     if first < _EXACT_ATTENTION_MIN_KEYS or blocks is None or blocks != _sdpa_vector_blocks(gqa, keys.shape[2]):
         return per_row()
+    fused = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
+    # Each bucket is timed on its own: the kernel's advantage is not monotone in the key count (odd widths leave a pair half empty).
+    timing = (queries.shape[0], length, queries.shape[1], keys.shape[1], queries.dtype, first.bit_length())
+    if (faster := _EXACT_ATTENTION_TIMED.get(timing)) is None:
+        try:
+            mx.eval(queries, keys, values)
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return per_row()  # inside a function transformation, which cannot evaluate; timed later
+        faster = _EXACT_ATTENTION_TIMED[timing] = _exact_attention_faster(per_row, fused)
+    if not faster:
+        return per_row()
     key = ((queries.shape[0], length), "attention", queries.shape[1], keys.shape[1], queries.dtype, blocks)
-    return _verify_admitted(key, per_row, lambda: _exact_attention_rows(queries, keys, values, scale, blocks))
+    return _verify_admitted(key, per_row, fused)
+
+
+def _exact_attention_faster(per_row, fused, clock = time.perf_counter):
+    """Whether `fused()` beats `per_row()` by 5% on the median of three alternating runs, after one warm run of each."""
+    mx.eval(per_row(), fused())
+    seconds = ([], [])
+    for _ in range(3):
+        for run, spent in zip((per_row, fused), seconds):
+            mx.synchronize()
+            start = clock()
+            mx.eval(run())
+            spent.append(clock() - start)
+    return sorted(seconds[1])[1] < 0.95 * sorted(seconds[0])[1]
 
 
 @functools.cache
@@ -4533,11 +4561,11 @@ def exact_speculative_verify(model, *, _modules = None):
     quantized projection over balanced row slices, once its first block of that shape matched the
     native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition, and
     over a long KV cache a block wider than two rows reads each full-attention layer's keys and values once per
-    pair of rows instead of once per row. A block's gated-delta layers write only their final state, and the commit
-    replays each layer over the retained prefix with the same kernel instead of keeping every step's state, once
-    replays of a key's first block matched every per-step state bit for bit. Only verify calls of the language
-    models found here are served; other, training and distributed models, and an mlx-vlm whose verifier
-    drifted, keep the native methods.
+    pair of rows instead of once per row, where that measured faster on this device. A block's gated-delta layers
+    write only their final state, and the commit replays each layer over the retained prefix with the same kernel
+    instead of keeping every step's state, once replays of a key's first block matched every per-step state bit
+    for bit. Only verify calls of the language models found here are served; other, training and distributed
+    models, and an mlx-vlm whose verifier drifted, keep the native methods.
     """
     with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
         yield model
