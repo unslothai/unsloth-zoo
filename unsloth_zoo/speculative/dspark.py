@@ -45,6 +45,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 from transformers import Trainer, TrainingArguments
 
+from . import losses
 from .capture import resolve_text_parts, run_frozen_target
 
 _CONFIG_EXTRAS = (
@@ -381,11 +382,12 @@ def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher, labels):
 
 
 def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 0.9,
-                confidence_alpha = 1.0, decay_gamma = 4.0, chunk_size = 1024):
+                confidence_alpha = 1.0, decay_gamma = 4.0, chunk_size = 1024, teacher_lm_head_weight = None):
     """DeepSpec DSpark loss, chunked over supervised rows so [rows, vocab] logits never coexist.
 
     teacher_hidden: target post-norm states [B, S, H]; slot j's teacher is the target's own
-    prediction at label_index - 1. Returns (loss, stats).
+    prediction at label_index - 1, projected with `teacher_lm_head_weight` (the target's lm_head;
+    defaults to the drafter's copy). Returns (loss, stats).
     """
     eval_mask = out["eval_mask"]
     rows = eval_mask.nonzero(as_tuple = True)
@@ -395,6 +397,9 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
     slot = rows[2]
     weight = torch.exp(-slot.float() / float(decay_gamma)) if decay_gamma and decay_gamma > 0 else torch.ones_like(slot, dtype = torch.float32)
     lm_w = drafter.lm_head.weight
+    teacher_w = lm_w if teacher_lm_head_weight is None else teacher_lm_head_weight.to(device = lm_w.device, dtype = hidden.dtype)
+    # A chunk holds ~6 fp32 [rows, V] tensors (logits, log-softmax, probs, teacher, l1 terms).
+    chunk_size = max(1, min(chunk_size, losses.LOGITS_BUDGET_BYTES // (lm_w.shape[0] * 4 * 6)))
     mk = drafter.markov_head
     prev_emb = mk.markov_w1(prev).to(hidden.dtype) if mk is not None else None
     need_teacher = l1_alpha > 0 or (drafter.confidence_head is not None and confidence_alpha > 0)
@@ -410,7 +415,7 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
         teacher = None
         if teacher_rows is not None:
             with torch.no_grad():
-                teacher = (teacher_rows[e] @ lm_w.T).float().softmax(-1)
+                teacher = (teacher_rows[e] @ teacher_w.T).float().softmax(-1)
         args = (hidden[e], None if prev_emb is None else prev_emb[e], lm_w, None if mk is None else mk.markov_w2.weight, teacher, labels[e])
         if torch.is_grad_enabled() and hidden.requires_grad:
             ce, l1, correct = checkpoint(_row_terms, *args, use_reentrant = False)
@@ -509,6 +514,7 @@ class UnslothDSparkTrainer(Trainer):
             drafter, out, teacher_hidden = captured["final"].to(dtype), ce_alpha = self.args.dspark_ce_alpha,
             l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
             decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
+            teacher_lm_head_weight = resolve_text_parts(self.target_model)["lm_head"].weight,
         )
         if model.training:
             self._dspark_log.append(stats)
