@@ -142,7 +142,9 @@ def test_expert_pack_round_trip():
     per_expert = unpack_experts(module, ["heads.0.block.0.mlp.experts"])
     assert "heads.0.block.0.mlp.experts.3.gate_proj.weight" in per_expert
     packed, prefixes = pack_experts(per_expert, module)
-    assert prefixes == ["heads.0.block.0.mlp.experts"]
+    # transformers 4.x builds these experts as a ModuleList, which has nothing to pack.
+    is_packed = "heads.0.block.0.mlp.experts.down_proj" in module
+    assert prefixes == (["heads.0.block.0.mlp.experts"] if is_packed else [])
     assert set(packed) == set(module)
     assert all(torch.equal(packed[k], module[k]) for k in module)
 
