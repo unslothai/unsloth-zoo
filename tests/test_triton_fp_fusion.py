@@ -1,10 +1,20 @@
-"""Every Unsloth Zoo Triton launch states enable_fp_fusion explicitly.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-Triton main (3.9) flips the enable_fp_fusion default to False, which would silently change the
-numerics and speed of every kernel that relied on it. Launches that match an eager reference keep
-their deliberate False; every other launch asks for True. The GPU check runs a fresh process with
-TRITON_DEFAULT_FP_FUSION=0 (the Triton 3.9 default, on any Triton >= 3.2) and reads each compiled
-kernel's options."""
+"""Every Triton launch states enable_fp_fusion explicitly: Triton 3.9 flips the default to False."""
 
 import ast
 import json
@@ -67,15 +77,12 @@ def test_every_launch_states_fp_fusion():
     assert not wrong, wrong
 
 
-# ---------------------------------------------------------------------------------------------
-# GPU: compiled kernels carry the requested option under the Triton 3.9 default.
-
 
 def _compiled_options(kernel):
     from triton.runtime.jit import JITFunction
 
     seen = []
-    while not isinstance(kernel, JITFunction) and hasattr(kernel, "fn"):  # autotune / heuristics
+    while not isinstance(kernel, JITFunction) and hasattr(kernel, "fn"):
         kernel = kernel.fn
     if not isinstance(kernel, JITFunction):
         return seen
@@ -104,7 +111,6 @@ def exercise(device = "cuda"):
     E, R, C = 4, 64, 128
     blocks = torch.randint(0, 256, (E, R, C // 32, 16), dtype = torch.uint8, device = device, generator = g)
     scales = torch.randint(118, 130, (E, R, C // 32), dtype = torch.uint8, device = device, generator = g)
-    # T4 (sm75) has no bf16: the MXFP4 kernels are bf16 only.
     bf16 = torch.cuda.get_device_capability(device) >= (8, 0)
     dt = torch.bfloat16 if bf16 else torch.float16
     if bf16:
