@@ -127,7 +127,9 @@ def test_oracle_error_no_worse_than_plain_function(transforms):
     torch.testing.assert_close(got, plain, rtol = 1e-6, atol = 1e-6)
     want = torch.autograd.grad((oracle * weights).sum(), leaves)
     for x, y, z in zip(torch.autograd.grad((got * weights).sum(), leaves), torch.autograd.grad((plain * weights).sum(), leaves), want):
-        assert _error(x, z) <= max(2 * _error(y, z), 1e-9), (_error(x, z), _error(y, z))
+        # float32 rounding alone moves either error by a few ulps of the gradient scale
+        slack = 16 * torch.finfo(torch.float32).eps * max(1.0, float(z.abs().max()))
+        assert _error(x, z) <= 2 * _error(y, z) + slack, (_error(x, z), _error(y, z), slack)
 
 
 def test_chunk_count_invariance():
