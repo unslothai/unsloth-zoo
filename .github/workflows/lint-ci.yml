@@ -63,7 +63,7 @@ jobs:
         # declared floor. tests/test_python39_compatibility.py is what pins that.
         continue-on-error: true
         run: |
-          python -m compileall -q -j 0 unsloth_zoo tests scripts
+          python -m compileall -q -j 0 unsloth_zoo unsloth_zoo_downloads tests scripts
 
       - name: Python ruff check (narrow gate)
         # E9 / F63 / F7 / F82: syntax errors, broken comparisons, undefined names.
@@ -76,7 +76,7 @@ jobs:
         # Leaving it non-gating was not free. It still annotated every run red, which is
         # what a real failure on a PR then had to be picked out of.
         run: |
-          ruff check --select E9,F63,F7,F82 unsloth_zoo tests scripts
+          ruff check --select E9,F63,F7,F82 unsloth_zoo unsloth_zoo_downloads tests scripts
 
       - name: Exec-literal gate self-test
         run: python scripts/lint_exec_literals.py --self-test
@@ -118,7 +118,7 @@ jobs:
         run: |
           set -e
           if grep -rnE '(^|[^A-Za-z_])(pdb\.set_trace|breakpoint)\(|^import (pdb|ipdb)$|^from (pdb|ipdb) import' \
-              --include='*.py' unsloth_zoo scripts; then
+              --include='*.py' unsloth_zoo unsloth_zoo_downloads scripts; then
             echo "::error::Leftover debugger call found above. Remove it." >&2
             exit 1
           fi
@@ -172,4 +172,4 @@ jobs:
         # Style rule mirrored from unsloth: kwargs use `name = value` not `name=value`.
         continue-on-error: true
         run: |
-          python3 scripts/enforce_kwargs_spacing.py unsloth_zoo
+          python3 scripts/enforce_kwargs_spacing.py unsloth_zoo unsloth_zoo_downloads

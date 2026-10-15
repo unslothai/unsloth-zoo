@@ -52,7 +52,7 @@ dependencies = [
     "mlx-lm==0.31.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # Ceiling, not a pin: an older transformers (unsloth's <=5.5.0) still resolves 0.6.4,
     # since 0.6.5+ needs transformers>=5.14. unsloth #9466 is fixed in 0.6.9.
-    "mlx-vlm>=0.4.4,<=0.7.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx-vlm>=0.4.4,<=0.7.8 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
     # Floor is 4.52.4, not 4.51.3: peft declares no transformers floor of its own (a
@@ -100,7 +100,7 @@ unsloth_zoo = ["diffusion_studio/*.html"]
 # site-packages, where they collide with every other wheel using those names.
 # Dotted rather than "unsloth_zoo*", which also matches a sibling like
 # unsloth_zoo_cache/ and would ship it as another top-level package.
-include = ["unsloth_zoo", "unsloth_zoo.*"]
+include = ["unsloth_zoo", "unsloth_zoo.*", "unsloth_zoo_downloads", "unsloth_zoo_downloads.*"]
 exclude = ["images*", "tests*", "scripts*"]
 
 [project.optional-dependencies]
@@ -109,7 +109,7 @@ mlx = [
     # they are pins.
     "mlx==0.32.3",
     "mlx-lm==0.31.3",
-    "mlx-vlm>=0.4.4,<=0.7.4",
+    "mlx-vlm>=0.4.4,<=0.7.8",
 ]
 core = [
     "packaging>=24.1",

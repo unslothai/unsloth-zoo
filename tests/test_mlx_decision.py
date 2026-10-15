@@ -453,3 +453,14 @@ def test_minicpm_decoder_weights_map_back_to_its_llm_namespace():
     assert decision._decoder_tensor_name(wrapper, "language_model.lm_head.weight", {"llm.lm_head.weight"}) == "llm.lm_head.weight"
     assert decision._decoder_tensor_name(wrapper, path, {"model.language_model.layers.0.self_attn.q_proj.weight"}) == "model.language_model.layers.0.self_attn.q_proj.weight"
     assert decision._decoder_tensor_name(wrapper, path) == "model.language_model.layers.0.self_attn.q_proj.weight"
+
+
+def test_phi4_multimodal_decoder_weights_map_to_its_bare_and_wrapped_names():
+    wrapper = {"language_model": None}
+    stored = {"model.embed_tokens.weight", "model.layers.0.self_attn.qkv_proj.base_layer.weight", "model.layers.1.self_attn.qkv_proj.weight"}
+    assert decision._decoder_tensor_name(wrapper, "language_model.model.embed_tokens.weight", stored) == "model.embed_tokens.weight"
+    for layer, held in ((0, "base_layer.weight"), (1, "weight")):
+        path = f"language_model.model.layers.{layer}.self_attn.qkv_proj.weight"
+        assert decision._decoder_tensor_name(wrapper, path, stored) == f"model.layers.{layer}.self_attn.qkv_proj.{held}"
+        # Its adapter is saved and resumed under the linear's own name, which is what PEFT and the merge read.
+        assert decision._adapter_stem(wrapper, path.removesuffix(".weight"), stored) == f"base_model.model.model.layers.{layer}.self_attn.qkv_proj"

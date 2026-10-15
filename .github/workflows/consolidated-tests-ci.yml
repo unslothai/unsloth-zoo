@@ -147,8 +147,8 @@ jobs:
                 retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
                   "torch>=2.4.0,<2.11.0" &&
                 retry "$venv/bin/pip" install -e .[core] &&
-                { "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
                 retry "$venv/bin/pip" install pytest==9.0.3
               } > "$log" 2>&1 || rc=$?
               echo "$rc" > ".lanes/$version.install"
@@ -243,7 +243,13 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
-          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          # Retried, then fatal: with `|| true` a failed install left unsloth absent, and every
+          # test that needs it skipped while the job stayed green.
+          for attempt in 1 2 3; do
+            pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" && break
+            if [ "$attempt" = 3 ]; then echo "::error::installing unsloth@main failed 3 times"; exit 1; fi
+            echo "unsloth install attempt $attempt failed, retrying in 15s"; sleep 15
+          done
           pip install pytest==9.0.3 pyyaml==6.0.2
           # gguf is not a dependency of the zoo, and unsloth goes in --no-deps, so
           # without this every test that reads a GGUF back skips at
@@ -274,7 +280,9 @@ jobs:
         # pins that the same transition clears the blob at fault instead of
         # every completed shard (#9094). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
-        # no weights). The preference suite pins token boundaries, scheduling,
+        # no weights); test_train_on_responses_mask_out_tokens pins mask_out_tokens on
+        # the list, tensor, vision-collator and MLX routes (unsloth#6695).
+        # The preference suite pins token boundaries, scheduling,
         # objective normalization, and reference lifecycle without model weights.
         # test_mlx_quantized_optimizer_routing pins which optim
         # names reach the 8-bit path; it runs under the torch shim so it
@@ -342,8 +350,9 @@ jobs:
         # so a 3.10-only `match` and a module-level `str | Path` both reached main and
         # made the package un-importable on 3.9. It reads the floor from pyproject, so
         # raising requires-python relaxes it rather than making it lie.
-        # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
-        # nothing else; collect-only would let the packaging config regress.
+        # test_wheel_top_level_packages pins that discovery ships unsloth_zoo,
+        # unsloth_zoo_downloads and nothing else; collect-only would let the
+        # packaging config regress.
         # test_safe_serialization_none pins that `safe_serialization = None` means the
         # safetensors default rather than a pickle, and carries a drift gate over the whole
         # package for any future save entry point that forwards the argument unnormalised.
@@ -455,11 +464,13 @@ jobs:
               tests/test_mlx_optimizer_torch_parity.py \
               tests/test_hf_xet_fallback.py \
               tests/test_hf_xet_fallback_blob_scoped_redownload.py \
+              tests/test_download_helpers_import_without_zoo_init.py \
               tests/test_llama_cpp_install_consent.py \
               tests/test_llama_cpp_consent_platforms.py \
               tests/test_converter_source_staging.py \
               tests/test_get_transformers_model_type_empty.py \
               tests/test_train_on_responses_list_labels.py \
+              tests/test_train_on_responses_mask_out_tokens.py \
               tests/test_mlx_preference.py \
               tests/test_mlx_trainer_internals.py \
               tests/test_mlx_arrays_cache_advance.py \
@@ -657,8 +668,8 @@ jobs:
               retry .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-numerics/bin/pip install -e .[core] &&
-              { .lanes/venv-numerics/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+              retry .lanes/venv-numerics/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
               retry .lanes/venv-numerics/bin/pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
             } > .lanes/numerics-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/numerics.install
@@ -669,7 +680,7 @@ jobs:
           #
           # The mlx-lm pin and mlx-vlm bound are repeated here because pyproject's are
           # marker-gated to darwin + arm64 and so constrain nothing on this Linux lane.
-          # They mirror pyproject's ==0.31.3 and <=0.7.4; without them the lane resolved
+          # They mirror pyproject's ==0.31.3 and <=0.7.8; without them the lane resolved
           # mlx-lm 0.32.0 and mlx-vlm 0.7.0, combinations pyproject forbids.
           (
             rc=0
@@ -679,9 +690,9 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm==0.31.3" "mlx-vlm>=0.4.4,<=0.7.4" &&
-              { .lanes/venv-suites/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm==0.31.3" "mlx-vlm>=0.4.4,<=0.7.8" &&
+              retry .lanes/venv-suites/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
             } > .lanes/suites-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/suites.install
@@ -1134,8 +1145,8 @@ jobs:
                 retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
                   "torch>=2.4.0,<2.11.0" "torchvision<0.26" &&
                 retry "$venv/bin/pip" install -e .[core] &&
-                { "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
                 retry "$venv/bin/pip" install -U "$spec_t" "$spec_r" "$spec_p" &&
                 # bitsandbytes: imported at module scope in saving_utils.py.
                 # IPython + ipywidgets: logging_utils.py:50 imports

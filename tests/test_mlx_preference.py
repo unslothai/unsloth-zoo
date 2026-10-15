@@ -1,4 +1,4 @@
-"""Focused behavioral coverage for MLX ORPO and DPO."""
+"""Focused behavioral coverage for MLX ORPO, DPO, and CPO."""
 
 from __future__ import annotations
 
@@ -195,9 +195,12 @@ def build_plan(dataset=None, **kwargs):
 
 
 def test_configs_are_objective_specific_and_keyword_only():
-    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXORPOConfig, MLXTrainingConfig
+    from unsloth_zoo.mlx.trainer import MLXCPOConfig, MLXDPOConfig, MLXORPOConfig, MLXTrainingConfig
 
     assert not hasattr(MLXTrainingConfig(), "beta")
+    cpo, alphapo = MLXCPOConfig(), MLXCPOConfig(loss_type="alphapo", cpo_alpha=0.5)
+    assert (cpo.beta, cpo.label_smoothing, cpo.loss_type, cpo.cpo_alpha, cpo.simpo_gamma, cpo.alpha,
+            alphapo.loss_type, alphapo.cpo_alpha) == (0.1, 0.0, "sigmoid", 1.0, 0.5, 0.0, "simpo", 0.0)
     assert MLXORPOConfig(beta=0.2).beta == 0.2
     assert MLXDPOConfig(beta=0.3, label_smoothing=0.1).reference_free is False
     default = MLXDPOConfig()
@@ -490,11 +493,17 @@ def test_the_length_guards_refuse_only_untrainable_rows(kind, row, options, mess
         ("orpo", dict(max_seq_length=400), (400, 200), "no longer leaves room"),
         ("orpo", dict(max_length=8, max_prompt_length=12, max_seq_length=4), (4, 12), None),
         ("dpo", dict(max_seq_length=512), (512, 512), None),
+        ("cpo", dict(max_seq_length=512), (512, 256), "no longer leaves room"),
+        ("cpo", dict(max_length=8, max_prompt_length=8), None, "strictly less"),
     ],
 )
 def test_the_resolved_budget_matches_each_objectives_arithmetic(
     kind, overrides, expected, warning,
 ):
+    if expected is None:
+        with pytest.raises(ValueError, match=warning):
+            resolved(kind, **overrides)
+        return
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         length_policy = resolved(kind, **overrides)
@@ -529,6 +538,7 @@ def test_an_inherited_max_length_says_it_narrowed_the_budget():
     assert len(orpo) == 1 and "max_prompt_length=None" not in orpo[0]
     assert "resolves to 128" in orpo[0]
     assert resolve(2048, explicit=True) == []
+    assert resolve(2048, explicit=False, kind="cpo") == []
     assert resolve(1024, explicit=False) == []
 
 
@@ -773,29 +783,22 @@ class TinyModel:
         return self.output(self.embedding(tokens))
 
 
-@pytest.mark.parametrize("objective", ["orpo", "dpo"])
+@pytest.mark.parametrize("objective", ["orpo", "dpo", "cpo"])
 def test_microbatch_loss_matches_one_logical_batch(objective):
-    from unsloth_zoo.mlx.preference import (
-        make_dpo_loss_fn, make_orpo_loss_fn, resolve_preference_objective)
+    from unsloth_zoo.mlx import preference as p
 
     dataset = rows(3)
-    from unsloth_zoo.mlx.preference import create_preference_batch_plan
-    micro = create_preference_batch_plan(
-        dataset, Tokenizer(), batch_size=2, length_policy=policy(),
+    micro = p.create_preference_batch_plan(
+        dataset, Tokenizer(), batch_size=2, length_policy=policy(objective),
         num_batches=2, grad_accum=2, dataset_order="sequential",
     )
-    whole = create_preference_batch_plan(
-        dataset, Tokenizer(), batch_size=3, length_policy=policy(),
+    whole = p.create_preference_batch_plan(
+        dataset, Tokenizer(), batch_size=3, length_policy=policy(objective),
         num_batches=1, grad_accum=1, dataset_order="sequential",
     )
     model = TinyModel()
-    resolved_objective = resolve_preference_objective(
-        objective, beta=0.1, reference_free=True)
-    loss_fn = (
-        make_orpo_loss_fn(resolved_objective)
-        if objective == "orpo"
-        else make_dpo_loss_fn(resolved_objective)
-    )
+    loss_fn = getattr(p, f"make_{objective}_loss_fn")(p.resolve_preference_objective(
+        objective, beta=0.1, **({"reference_free": True} if objective == "dpo" else {})))
     micro_value = sum(float(loss_fn(model, *micro[index])[0]) for index in range(2)) / 2
     whole_value = float(loss_fn(model, *whole[0])[0])
     assert math.isclose(micro_value, whole_value, rel_tol=2e-5, abs_tol=2e-5)
@@ -909,6 +912,67 @@ def test_discopop_extreme_margins_have_finite_loss_and_gradients(tau):
     assert gradient.tolist() == pytest.approx(reference.grad.tolist(), rel=1e-5, abs=1e-6)
 
 
+# Run from TRL 0.24.0's own cpo_loss at beta 0.3, with smoothing 0.15 where it applies.
+_TRL_CPO_LOSSES = {
+    ("sigmoid", 0.0): (0.61633, 0.9327215, 0.5401627, 0.4609221),
+    ("simpo", 0.0): (0.7925735, 1.204412, 0.6793472, 0.5445731),
+    ("hinge", 0.0): (0.76, 1.57, 0.46, 0.0),
+    ("ipo", 0.0): (0.7511111, 12.72111, 0.01777781, 3.004444),
+    ("sigmoid", 0.25): (0.5882242, 1.077096, 0.4987407, 0.4228372),
+    ("simpo", 0.25): (0.7518978, 1.376524, 0.6123767, 0.4441063),
+    ("hinge", 0.25): (0.6588559, 1.847694, 0.2463015, 0.0),
+    ("ipo", 0.25): (0.2803911, 20.18088, 0.7151434, 15.7344),
+}
+
+
+@pytest.mark.parametrize("name,alpha", sorted(_TRL_CPO_LOSSES))
+def test_each_cpo_variant_matches_the_trl_formula(name, alpha):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference
+
+    objective = preference.resolve_preference_objective(
+        "cpo", beta=0.3, loss_type=name, alpha=alpha,
+        label_smoothing=0.15 if name in ("sigmoid", "simpo") else 0.0)
+    chosen, rejected = (preference._cpo_rewards(objective, mx.array(_DPO_FIXTURE[side]))
+                        for side in ("chosen", "rejected"))
+    scored = preference._CPO_VARIANTS[name](objective, chosen - rejected)
+    assert scored.tolist() == pytest.approx(_TRL_CPO_LOSSES[name, alpha], rel=1e-5)
+
+
+@pytest.mark.parametrize("loss_type,cpo_alpha,alpha", [
+    ("sigmoid", 0.7, 0.0), ("simpo", 0.0, 0.25), ("ipo", 1.0, 0.0)])
+def test_cpo_adds_a_response_only_nll_and_reports_it(loss_type, cpo_alpha, alpha):
+    from unsloth_zoo.mlx import preference
+
+    dataset = [{**row, "chosen": row["chosen"] * (index + 1)}
+               for index, row in enumerate(rows(2))]
+    batch, lengths, normalizers = build_plan(
+        dataset, length_policy=policy("cpo"), num_batches=1, grad_accum=1)[0]
+    model = TinyModel()
+    objective = preference.resolve_preference_objective(
+        "cpo", beta=0.2, loss_type=loss_type, cpo_alpha=cpo_alpha, alpha=alpha)
+    actual, _weight, stats = preference.make_cpo_loss_fn(objective)(
+        model, batch, lengths, normalizers)
+    mask = preference._response_mask(batch[:, 1:], lengths)
+    _logits, ce = preference._preference_forward(model, batch, mask)
+    pairs = batch.shape[0] // 2
+    logps = -(ce * mask).sum(axis=1)
+    if loss_type != "sigmoid":
+        logps = logps / mask.sum(axis=1)
+    rewards = preference._cpo_rewards(objective, logps)
+    delta = rewards[:pairs] - rewards[pairs:]
+    nll = (ce[:pairs] * mask[:pairs]).sum()
+    expected = preference._CPO_VARIANTS[loss_type](objective, delta).mean() \
+        + cpo_alpha * nll / mask[:pairs].sum()
+    assert float(actual) == pytest.approx(float(expected), rel=1e-6)
+    names = preference.PREFERENCE_EVAL_METRICS["cpo"]
+    assert float(stats[names.index("nll_loss")]) == pytest.approx(
+        float(nll) if cpo_alpha else 0.0, rel=1e-6)
+    assert float(stats[names.index("rewards/margins")]) == pytest.approx(
+        float(0.2 * delta.sum()), rel=1e-5, abs=1e-6)
+    assert float(stats[len(names) + 2]) == float(mask[:pairs].sum())
+
+
 def test_an_objective_is_valid_however_it_was_built():
     import dataclasses
     from unsloth_zoo.mlx.preference import (
@@ -916,7 +980,14 @@ def test_an_objective_is_valid_however_it_was_built():
         make_preference_eval_fn, resolve_preference_objective)
 
     for kind, options, match in (
-        ("cpo", {}, "unknown objective kind"),
+        ("rpo", {}, "unknown objective kind"),
+        ("cpo", dict(loss_types=("sigmoid", "hinge")), "exactly one"),
+        ("cpo", dict(loss_types=("kto_pair",)), "removed it"),
+        ("cpo", dict(loss_types=("robust",)), "unknown loss_type"),
+        ("cpo", dict(loss_types=("simpo",), beta=0.0), "divides by beta"),
+        ("cpo", dict(label_smoothing=1.5), r"\[0, 1\]"),
+        ("cpo", dict(alpha=float("nan")), "alpha must be finite"),
+        ("cpo", dict(cpo_alpha=-0.1), "cpo_alpha must be non-negative"),
         ("dpo", dict(loss_types=("bco_pair",)), "running mean"),
         ("dpo", dict(loss_types=("kto_pair",)), "removed it"),
         ("dpo", dict(loss_types=("sigmoidal",)), "unknown loss_type"),
@@ -938,7 +1009,10 @@ def test_an_objective_is_valid_however_it_was_built():
         with pytest.raises(ValueError, match=match):
             PreferenceObjective(kind=kind, **{"beta": 0.1, **options})
     with pytest.raises(ValueError, match="unknown objective kind"):
-        resolve_preference_objective("cpo", beta=0.1)
+        resolve_preference_objective("rpo", beta=0.1)
+    with pytest.warns(RuntimeWarning, match="Unsloth MLX CPO: ipo ignore"):
+        resolve_preference_objective("cpo", beta=0.1, loss_type="ipo",
+                                     label_smoothing=0.1)
 
     # A bound binds only where a loss reads the value.
     kept = PreferenceObjective(
@@ -952,7 +1026,7 @@ def test_an_objective_is_valid_however_it_was_built():
     assert {f.name for f in dataclasses.fields(PreferenceObjective)} == {
         "kind", "beta", "label_smoothing", "loss_types", "weights",
         "discopop_tau", "reference_free", "desirable_weight",
-        "undesirable_weight"}
+        "undesirable_weight", "cpo_alpha", "simpo_gamma", "alpha"}
 
     dpo = resolve_preference_objective("dpo", beta=0.1)
     assert (dpo.loss_types, dpo.weights, dpo.label_smoothing) == (
@@ -1717,11 +1791,18 @@ def test_the_trainer_precomputes_the_reference_once_per_split(
             _run_generation_trainer(trainer, monkeypatch, [])
 
 
-def test_mismatched_referenced_resume_rejects_before_adapter_hydration(tmp_path):
+@pytest.mark.parametrize("kind,provenance,message", [
+    ("dpo", {"kind": "reference_free"}, "provenance does not match"),
+    ("orpo", {"kind": "cpo_no_reference"}, "ORPO: checkpoint objective does not match"),
+    ("cpo", {"kind": "orpo_no_reference"}, "CPO: checkpoint objective does not match"),
+])
+def test_a_mismatched_resume_rejects_before_adapter_hydration(
+    tmp_path, kind, provenance, message,
+):
     import json
     import mlx.core as mx
     import mlx.nn as nn
-    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+    from unsloth_zoo.mlx import trainer as trainer_module
 
     class Adapter(nn.Module):
         def __init__(self):
@@ -1763,12 +1844,12 @@ def test_mismatched_referenced_resume_rejects_before_adapter_hydration(tmp_path)
     (checkpoint / "optimizer_state.safetensors").touch()
     (checkpoint / "trainer_state.json").write_text(json.dumps({
         "global_step": 1,
-        "preference_reference": {"kind": "reference_free"},
+        "preference_reference": provenance,
     }))
     model = Model()
-    trainer = MLXDPOTrainer(
+    trainer = getattr(trainer_module, f"MLX{kind.upper()}Trainer")(
         model, Tokenizer(), rows(1),
-        args=MLXDPOConfig(
+        args=getattr(trainer_module, f"MLX{kind.upper()}Config")(
             max_steps=2, compile=False, gradient_checkpointing=False,
             cast_norm_output_to_input_dtype=False, disable_memory_limits=True,
             output_dir=str(tmp_path / "output"),
@@ -1777,7 +1858,7 @@ def test_mismatched_referenced_resume_rejects_before_adapter_hydration(tmp_path)
     trainer._build_optimizer = lambda _steps: types.SimpleNamespace(
         learning_rate=mx.array(1e-5), state={}, update=lambda *_args: None,
     )
-    with pytest.raises(ValueError, match="provenance does not match"):
+    with pytest.raises(ValueError, match=message):
         trainer.train(resume_from_checkpoint=str(checkpoint))
     assert model.loaded is False
     assert model.adapter.lora_b.tolist() == [[0.0]]
@@ -1899,7 +1980,8 @@ def _run_generation_trainer(
     return trainer.train()
 
 
-@pytest.mark.parametrize("config_cls_name", ["MLXDPOConfig", "MLXORPOConfig", "MLXKTOConfig"])
+@pytest.mark.parametrize("config_cls_name", [
+    "MLXDPOConfig", "MLXORPOConfig", "MLXKTOConfig", "MLXCPOConfig"])
 def test_a_preference_field_a_dump_predates_still_reads_as_a_wholesale_copy(
         config_cls_name):
     """An unregistered appended field flips the copy detection, losing warmup_ratio."""
@@ -2254,14 +2336,12 @@ def test_generation_prompt_rejects_a_budget_with_no_room():
         )
 
 
-@pytest.mark.parametrize("objective", ["orpo", "dpo"])
+@pytest.mark.parametrize("objective", ["orpo", "dpo", "cpo"])
 def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch):
     """No perplexity: a preference loss is not a per-token likelihood."""
     from unsloth_zoo.mlx.preference import PREFERENCE_EVAL_METRICS
-    from unsloth_zoo.mlx.trainer import (
-        MLXDPOConfig, MLXDPOTrainer, MLXORPOConfig, MLXORPOTrainer,
-        _preference_metric_values,
-    )
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import _preference_metric_values
 
     # A window sum over the denominator it names; TRL averages per-batch means.
     batches = [[4.0, 9.0, 2.0, 3.0], [1.0, 1.0, 1.0, 1.0]]
@@ -2272,8 +2352,8 @@ def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch)
     assert set(_preference_metric_values(
         ("a", "b"), {0: 2, 1: 3}, [0.0] * 4).values()) == {0.0}
 
-    cls, config = ((MLXORPOTrainer, MLXORPOConfig) if objective == "orpo"
-                   else (MLXDPOTrainer, MLXDPOConfig))
+    cls, config = (getattr(trainer_module, f"MLX{objective.upper()}{part}")
+                   for part in ("Trainer", "Config"))
     common = _generation_common(
         tmp_path, max_steps=1, eval_steps=1, generate_during_eval=False)
     if objective == "dpo":
@@ -2285,35 +2365,47 @@ def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch)
     assert not [name for name in PREFERENCE_EVAL_METRICS[objective]
                 if f"eval_{name}" not in metrics]
     assert "eval_loss" in metrics and "eval_perplexity" not in metrics
+    if objective != "dpo":
+        # Resume compares against exactly this, so a run must write it.
+        assert trainer._preference_reference_provenance == {"kind": f"{objective}_no_reference"}
     assert any("eval_loss" in entry for entry in trainer.state.log_history)
 
 
+# Config fields, then the objective fields they must arrive as.
+_CARRIED_FIELDS = {
+    "dpo": (dict(reference_free=True, loss_type=["sigmoid", "robust"], loss_weights=[0.25, 0.5],
+                 discopop_tau=0.2, label_smoothing=0.2),
+            dict(reference_free=True, loss_types=("sigmoid", "robust"), weights=(0.25, 0.5),
+                 discopop_tau=0.2, label_smoothing=0.2)),
+    "cpo": (dict(loss_type="simpo", label_smoothing=0.2, cpo_alpha=0.3, simpo_gamma=0.7, alpha=0.4),
+            dict(loss_types=("simpo",), label_smoothing=0.2, cpo_alpha=0.3, simpo_gamma=0.7, alpha=0.4)),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_CARRIED_FIELDS))
 @pytest.mark.parametrize("use_cce", [False, True])
 def test_the_config_carries_every_objective_field_into_the_run(tmp_path,
-                                                               monkeypatch, use_cce):
+                                                               monkeypatch, use_cce, kind):
     from unsloth_zoo.mlx import trainer as trainer_module
-    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     captured = {}
-    factory = "make_dpo_cce_loss_fn" if use_cce else "make_dpo_loss_fn"
+    factory = f"make_{kind}_cce_loss_fn" if use_cce else f"make_{kind}_loss_fn"
     for name in (factory, "make_preference_eval_fn"):
         build = getattr(trainer_module, name)
         monkeypatch.setattr(trainer_module, name, (
             lambda *args, build=build, name=name, **kwargs: (
                 captured.setdefault(name, args[-1]),
                 build(*args, **kwargs))[1]))
+    fields, expected = _CARRIED_FIELDS[kind]
     common = _generation_common(
         tmp_path, max_steps=1, eval_steps=1, generate_during_eval=False,
-        use_cce=use_cce, reference_free=True, loss_type=["sigmoid", "robust"],
-        loss_weights=[0.25, 0.5], discopop_tau=0.2, label_smoothing=0.2)
-    trainer = MLXDPOTrainer(_tiny_model(), Tokenizer(), rows(4),
-                            eval_dataset=rows(3), args=MLXDPOConfig(**common))
+        use_cce=use_cce, **fields)
+    trainer = getattr(trainer_module, f"MLX{kind.upper()}Trainer")(
+        _tiny_model(), Tokenizer(), rows(4), eval_dataset=rows(3),
+        args=getattr(trainer_module, f"MLX{kind.upper()}Config")(**common))
     _run_generation_trainer(trainer, monkeypatch, [])
     objective = captured[factory]
-    assert (objective.loss_types, objective.weights) == (
-        ("sigmoid", "robust"), (0.25, 0.5))
-    assert (objective.discopop_tau, objective.label_smoothing) == (0.2, 0.2)
-    assert objective.reference_free
+    assert {name: getattr(objective, name) for name in expected} == expected
     assert captured["make_preference_eval_fn"] == objective
 
 
@@ -3272,14 +3364,18 @@ def test_dpo_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
     assert tokens > 0 and run._compile_decision is not None
 
 
-def test_the_kto_trainer_still_refuses_a_vision_language_model(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
+@pytest.mark.parametrize("kind", ["kto", "cpo"])
+def test_the_kto_and_cpo_trainers_refuse_a_vision_language_model(tmp_path, kind):
+    from unsloth_zoo.mlx import trainer as trainer_module
     class Model(type(_tiny_model())):
         _is_vlm_model = True
-    trainer = MLXKTOTrainer(
-        Model(), Tokenizer(), kto_rows(4), processor=VisionProcessor(),
-        args=MLXKTOConfig(**_generation_common(tmp_path, generate_during_eval=False)))
-    with pytest.raises(ValueError, match="KTO: vision-language models are not supported"):
+    trainer = getattr(trainer_module, f"MLX{kind.upper()}Trainer")(
+        Model(), Tokenizer(), kto_rows(4) if kind == "kto" else rows(4),
+        processor=VisionProcessor(),
+        args=getattr(trainer_module, f"MLX{kind.upper()}Config")(
+            **_generation_common(tmp_path, generate_during_eval=False)))
+    with pytest.raises(
+            ValueError, match=f"{kind.upper()}: vision-language models are not supported"):
         trainer._prepare_data(True)
 
 

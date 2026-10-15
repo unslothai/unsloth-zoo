@@ -507,7 +507,7 @@ def _projs_lora(projs):
     return (name, scaling, rank)
 
 
-def _lora_operands(projs, name, dtype):
+def _lora_operands(projs, name, dtype, x = None):
     """[E, in, R'] and [E, R', out] in `dtype`, rank zero-padded by moe_utils'
     _pad_lora_rank_for_grouped_mm (torch._grouped_mm rejects ranks 4 / 6 in bf16)."""
     stacks = _lora_stacks(projs, name)
@@ -518,14 +518,14 @@ def _lora_operands(projs, name, dtype):
         B = torch.stack([p.lora_B[name].weight for p in projs])   # [E, out, r]
     A = A.to(dtype).transpose(1, 2)                           # [E, in, r]
     B = B.to(dtype).transpose(1, 2)                           # [E, r, out]
-    A, B = _moe_utils._pad_lora_rank_for_grouped_mm(A, B)
+    A, B = _moe_utils._pad_lora_rank_for_grouped_mm(A, B, x)
     return A.contiguous(), B.contiguous()
 
 
 def _lora_delta(x, offsets, projs, lora, dtype):
     gmm = _moe_utils._grouped_mm_with_backward_fix
     name, scaling, _ = lora
-    A, B = _lora_operands(projs, name, dtype)
+    A, B = _lora_operands(projs, name, dtype, x)
     h = gmm(x, A, offsets)
     return gmm(h, B, offsets) * scaling
 

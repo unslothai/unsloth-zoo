@@ -112,6 +112,8 @@ def get_target_device(index = 0):
 def _device_empty_cache():
     if DEVICE_TYPE == "npu":
         torch.npu.empty_cache()
+    elif DEVICE_TYPE == "xpu":
+        torch.xpu.empty_cache()
     else:
         torch.cuda.empty_cache()
 pass
@@ -635,7 +637,25 @@ pass
 
 
 def patch_vllm_enable_sleep_mode():
-    from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
+    if DEVICE_TYPE == "xpu":
+        # Probe the module, not the version: nightly XPU builds before 0.23.0 ship it.
+        try:
+            from vllm.device_allocator.xpumem import (
+                XpuMemAllocator as MemAllocator, AllocationData, unmap_and_release,
+                create_and_allocate as create_and_map, _xpu_memcpy_sync,
+                MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                f"Unsloth: vLLM standby mode on XPU requires vLLM >= 0.23.0, but found {vllm_version}.\n"
+                "Please update vLLM, or disable UNSLOTH_VLLM_STANDBY."
+            ) from e
+    else:
+        # Every other device (incl. Ascend NPU) keeps the CUDA route it always took.
+        from vllm.device_allocator.cumem import (
+            CuMemAllocator as MemAllocator, AllocationData, unmap_and_release,
+            create_and_map, libcudart,
+        )
     try:
         from vllm.utils import is_pin_memory_available
     except:
@@ -644,6 +664,14 @@ def patch_vllm_enable_sleep_mode():
     from typing import Optional, Union, Tuple, Any
 
     logger.info(f"Unsloth: Enabling vLLM standby mode")
+
+
+    def _memcpy(dst_ptr, src_ptr, size_in_bytes, device, to_device):
+        if DEVICE_TYPE == "xpu":
+            kind = MEMCPY_HOST_TO_DEVICE if to_device else MEMCPY_DEVICE_TO_HOST
+            _xpu_memcpy_sync(dst_ptr, src_ptr, size_in_bytes, kind, device)
+        else:
+            libcudart.cudaMemcpy(dst_ptr, src_ptr, size_in_bytes)
 
     def __init__(self):
         # Replica of CuMemAllocator.__init__() with a clearer error message only.
@@ -655,7 +683,7 @@ def patch_vllm_enable_sleep_mode():
                 )
 
         self.pointer_to_data: dict[int, AllocationData] = {}
-        self.current_tag: str = CuMemAllocator.default_tag
+        self.current_tag: str = MemAllocator.default_tag
         self.allocator_and_pools: dict[str, Any] = {}
         if hasattr(self, '_python_malloc_callback'):
             # Newer vLLM exposes _python_malloc/free and assigns them to
@@ -672,7 +700,7 @@ def patch_vllm_enable_sleep_mode():
         """Sleep mode: offload allocations with offload_tags to CPU, discard the rest."""
         if offload_tags is None:
             # by default, allocated tensors are offloaded on sleep
-            offload_tags = (CuMemAllocator.default_tag, )
+            offload_tags = (MemAllocator.default_tag, )
         elif isinstance(offload_tags, str):
             offload_tags = (offload_tags, )
 
@@ -701,7 +729,7 @@ def patch_vllm_enable_sleep_mode():
                     device='cpu',
                     pin_memory=is_pin_memory_available())
                 cpu_ptr = cpu_backup_tensor.data_ptr()
-                libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+                _memcpy(cpu_ptr, ptr, size_in_bytes, handle[0], to_device = False)
                 data.cpu_backup_tensor = cpu_backup_tensor
                 cpu_offloads += 1
             logger.debug(f"data's tag is {data.tag} and is offloaded to cpu? {data.tag in offload_tags}")
@@ -731,7 +759,7 @@ def patch_vllm_enable_sleep_mode():
                         size_in_bytes = cpu_backup_tensor.numel(
                         ) * cpu_backup_tensor.element_size()
                         cpu_ptr = cpu_backup_tensor.data_ptr()
-                        libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
+                        _memcpy(ptr, cpu_ptr, size_in_bytes, handle[0], to_device = True)
                         data.cpu_backup_tensor = None
             pass
         pass
@@ -780,10 +808,10 @@ def patch_vllm_enable_sleep_mode():
     vllm.LLM.generate = get_patched_generate(vllm.LLM.generate)
     vllm.AsyncLLMEngine.generate = get_patched_generate(vllm.AsyncLLMEngine.generate)
 
-    CuMemAllocator.__init__ = __init__
-    CuMemAllocator.sleep = sleep
-    CuMemAllocator.wake_up = wake_up
-    CuMemAllocator.print_memory_summary = print_memory_summary
+    MemAllocator.__init__ = __init__
+    MemAllocator.sleep = sleep
+    MemAllocator.wake_up = wake_up
+    MemAllocator.print_memory_summary = print_memory_summary
 pass
 
 
@@ -1325,6 +1353,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     elif hasattr(vllm_internals, "model"): # Standard Language models
         vllm_text_model = vllm_internals.model
         vllm_text_model_prefix = "model"
+        if model_type == "muse_glimmer" and hasattr(config, "text_config"):
+            # vLLM keeps MuseGlimmer's text model at .model; HF nests it at model.language_model
+            vllm_text_model_prefix = "model.language_model"
     elif hasattr(vllm_internals, "language_model"):
         # Llama 3.2 / Gemma 3 / Qwen 2.5 VL keep the text model in model.language_model.model
         if not is_vision_model and not hasattr(config, "text_config"):
@@ -1376,6 +1407,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 if kk not in gemma4_kv_shared_layers:
                     get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
             get_state_dict(f"{prefix}.{o_proj_name}", 0, state_dict, o_proj)
+            # MuseGlimmer: vLLM output_gate_proj is HF self_attn.gate_proj (sigmoid gate on the attention output)
+            output_gate_proj = getattr(layer.self_attn, "output_gate_proj", None)
+            if output_gate_proj is not None:
+                get_state_dict(f"{prefix}.gate_proj", 0, state_dict, output_gate_proj)
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -2596,6 +2631,56 @@ def determine_max_lora_rank(lora_rank = 16):
 pass
 
 
+def _config_has_gdn_layers(config) -> bool:
+    # All Unsloth Zoo code licensed under LGPLv3
+    text_config = getattr(config, "text_config", None) or config
+    if getattr(text_config, "linear_key_head_dim", None) is not None: return True
+    return "linear_attention" in (getattr(text_config, "layer_types", None) or ())
+pass
+
+
+def _gdn_prefill_kwarg_mismatch(vllm_caller, flashinfer_fn, callee = "chunk_gated_delta_rule_fi"):
+    """Keywords `vllm_caller` passes to `callee` that `flashinfer_fn` does not accept, or None."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        tree = ast.parse(inspect.getsource(vllm_caller))
+        params = inspect.signature(inspect.unwrap(flashinfer_fn)).parameters
+    except (OSError, TypeError, ValueError, SyntaxError):
+        return None
+    passed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == callee:
+            passed.update(k.arg for k in node.keywords if k.arg is not None)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()): return None
+    missing = sorted(passed - set(params))
+    return missing or None
+pass
+
+
+def _flashinfer_gdn_prefill_mismatch():
+    """Why vLLM's FlashInfer GDN prefill call cannot run here, or None.
+
+    vLLM picks FlashInfer for GDN prefill from the GPU alone, then calls
+    flashinfer.gdn_prefill.chunk_gated_delta_rule with its own release's keywords
+    (vLLM 0.31 passes backend=, which flashinfer 0.6.x lacks), so probe the call.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+        caller = gdn.fi_chunk_gated_delta_rule
+    except Exception:
+        return None
+    try:
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+    except Exception as error:
+        return f"flashinfer.gdn_prefill is not importable ({type(error).__name__})"
+    missing = _gdn_prefill_kwarg_mismatch(caller, chunk_gated_delta_rule)
+    if missing:
+        return f"the installed flashinfer's chunk_gated_delta_rule lacks {missing}"
+    return None
+pass
+
+
 def vllm_supports_flashinfer(config) -> bool:
     """Approximate check for vLLM FLASHINFER support: looks up the model in
     ModelRegistry, then inspects for an `attn_backend not in {...}` guard that
@@ -3299,6 +3384,142 @@ _OUT_OF_MEMORY_MARKERS = (
     "cannot allocate memory",
     "unable to allocate",
 )
+
+
+# vLLM ReplaySSM (vllm-project/vllm#48018): Mamba2 decode reads a checkpointed
+# state plus the last few tokens' inputs and writes the state back once per
+# window instead of every token. On by default where it qualifies;
+# UNSLOTH_VLLM_REPLAYSSM=0 turns it off. vLLM only accepts it for architectures
+# that declare SupportsReplaySSM.
+# vLLM declares it only on NemotronH, but every Mamba2 hybrid decodes through the same
+# MambaMixer2, which sizes and drives the ring on its own. model_type: (vLLM module,
+# class, hf_config field holding n_groups).
+_REPLAYSSM_MAMBA2_MODELS = {
+    "falcon_h1": ("falcon_h1", "FalconH1ForCausalLM", "mamba_n_groups"),
+    "granitemoehybrid": ("granitemoehybrid", "GraniteMoeHybridForCausalLM", "mamba_n_groups"),
+    "zamba2": ("zamba2", "Zamba2ForCausalLM", "mamba_ngroups"),
+}
+# Gated DeltaNet: backported by unsloth_zoo.vllm_gdn_replayssm, opt-in only (UNSLOTH_VLLM_REPLAYSSM=1).
+_REPLAYSSM_GDN_MODEL_TYPES = (
+    "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
+)
+_REPLAYSSM_MODEL_TYPES = ("nemotron_h", *_REPLAYSSM_MAMBA2_MODELS, *_REPLAYSSM_GDN_MODEL_TYPES)
+
+
+def _replayssm_ring_hooks(model_cls, n_groups_field):
+    # The class-level state hooks size the hybrid KV page, so they must count the ring
+    # the layers allocate (MambaMixer2.get_state_shape / get_state_dtype).
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateDtypeCalculator,
+        MambaStateShapeCalculator,
+    )
+    shape_fn = model_cls.get_mamba_state_shape_from_config.__func__
+    dtype_fn = model_cls.get_mamba_state_dtype_from_config.__func__
+
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        shapes = shape_fn(cls, vllm_config)
+        cache_config = vllm_config.cache_config
+        if not getattr(cache_config, "use_replayssm", False) or len(shapes) != 2:
+            return shapes
+        return MambaStateShapeCalculator.append_replayssm_ring(
+            base_shapes = shapes,
+            n_groups = getattr(vllm_config.model_config.hf_config, n_groups_field),
+            tp_world_size = vllm_config.parallel_config.tensor_parallel_size,
+            logical_window = cache_config.replayssm_buffer_len,
+            backend = vllm_config.mamba_config.backend,
+        )
+
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        dtypes = dtype_fn(cls, vllm_config)
+        if not getattr(vllm_config.cache_config, "use_replayssm", False) or len(dtypes) != 2:
+            return dtypes
+        return MambaStateDtypeCalculator.append_replayssm_ring(dtypes, vllm_config.model_config.dtype)
+
+    model_cls.get_mamba_state_shape_from_config = classmethod(get_mamba_state_shape_from_config)
+    model_cls.get_mamba_state_dtype_from_config = classmethod(get_mamba_state_dtype_from_config)
+
+
+def _widen_vllm_replayssm_capability(class_names):
+    # ModelConfig, not the model class: vLLM reads the capability from a subprocess-cached registry entry.
+    try:
+        from vllm.config.model import ModelConfig
+    except Exception:
+        return False
+    capability = ModelConfig.__dict__.get("supports_replayssm")
+    if not isinstance(capability, property):
+        return False
+    archs = getattr(ModelConfig, "_unsloth_replayssm_archs", None)
+    if archs is None:
+        archs = set()
+        native = capability.fget
+
+        def supports_replayssm(self):
+            return native(self) or self.architecture in archs
+
+        ModelConfig.supports_replayssm = property(supports_replayssm)
+        ModelConfig._unsloth_replayssm_archs = archs
+    archs.update(class_names)
+    return True
+
+
+def _patch_vllm_replayssm_mamba2(model_type):
+    module_name, class_name, n_groups_field = _REPLAYSSM_MAMBA2_MODELS[model_type]
+    try:
+        import importlib
+        from vllm.config.model import ModelConfig
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+            MambaStateShapeCalculator,
+        )
+        model_cls = getattr(importlib.import_module(f"vllm.model_executor.models.{module_name}"), class_name)
+    except Exception:
+        return False
+    if not (
+        isinstance(ModelConfig.__dict__.get("supports_replayssm"), property)
+        and hasattr(MambaStateShapeCalculator, "append_replayssm_ring")
+        and hasattr(MambaStateDtypeCalculator, "append_replayssm_ring")
+        and hasattr(model_cls, "get_mamba_state_shape_from_config")
+        and hasattr(model_cls, "get_mamba_state_dtype_from_config")
+    ):
+        return False
+    if not getattr(model_cls, "_unsloth_replayssm_ring", False):
+        _replayssm_ring_hooks(model_cls, n_groups_field)
+        model_cls._unsloth_replayssm_ring = True
+    return _widen_vllm_replayssm_capability((class_name,))
+
+
+def _patch_vllm_replayssm_gdn():
+    from .vllm_gdn_replayssm import GDN_REPLAYSSM_ARCHITECTURES, patch_vllm_gdn_replayssm
+    if not patch_vllm_gdn_replayssm():
+        return False
+    return _widen_vllm_replayssm_capability(GDN_REPLAYSSM_ARCHITECTURES)
+
+
+def _vllm_replayssm_mode():
+    # "auto" (unset), "on" or "off".
+    value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return "off"
+    if value in ("1", "true", "on", "yes"):
+        return "on"
+    return "auto"
+
+
+def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
+    # None when ReplaySSM should be requested, else why it is not.
+    model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+    if model_type not in _REPLAYSSM_MODEL_TYPES:
+        return f"model type {model_type!r} has no ReplaySSM support in vLLM"
+    if device_type != "cuda":
+        return f"ReplaySSM is CUDA only, this is {device_type}"
+    if "use_replayssm" not in engine_arg_keys:
+        return "this vLLM has no `use_replayssm` engine arg"
+    return None
+
+
+def _is_vllm_replayssm_refusal(error_text):
+    # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2).
+    return "replayssm" in str(error_text).lower()
 
 
 def _is_memory_profiling_race_error(error_text):
@@ -4200,6 +4421,11 @@ def load_vllm(
         # supports_compute_capability() returns True unconditionally, and it is the last
         # entry in the MLA priority list, which is exactly what vLLM would fall back to
         # once the FlashInfer-backed ones are excluded.
+        if _config_has_gdn_layers(config) and "gdn_prefill_backend" not in engine_args:
+            gdn_mismatch = _flashinfer_gdn_prefill_mismatch()
+            if gdn_mismatch is not None:
+                print(f"Unsloth: vLLM GDN prefill uses Triton since {gdn_mismatch}.")
+                engine_args["gdn_prefill_backend"] = "triton"
         if _UNSLOTH_FLASHINFER_UNUSABLE:
             if _config_uses_mla(config):
                 engine_args["attention_backend"] = "TRITON_MLA"
@@ -4246,6 +4472,40 @@ def load_vllm(
                 _UNSLOTH_FLASHINFER_UNUSABLE = False
             return engine_args
 
+        # Only for engines built here: return_args callers (e.g. `vllm serve`) start
+        # their own process without the runner setting below.
+        replayssm_set_runner = False
+        replayssm_mode = _vllm_replayssm_mode()
+        # A runner the user forced to V2 would only get the engine refused and rebuilt.
+        if replayssm_mode == "auto" and os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip().lower() in ("1", "true"):
+            replayssm_mode = "off"
+        replayssm_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+        # Opt-in: vLLM 0.31 runs ReplaySSM on Model Runner V1 only, which costs Qwen3.5 more than the ring saves.
+        if replayssm_mode == "auto" and replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES:
+            replayssm_mode = "off"
+        if replayssm_mode != "off":
+            replayssm_skip = _vllm_replayssm_skip_reason(config, good_keys, DEVICE_TYPE)
+            if replayssm_skip is None and not (
+                _patch_vllm_replayssm_mamba2(replayssm_type) if replayssm_type in _REPLAYSSM_MAMBA2_MODELS
+                else _patch_vllm_replayssm_gdn() if replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES
+                else True
+            ):
+                replayssm_skip = f"this vLLM cannot enable ReplaySSM for {replayssm_type!r}"
+            if replayssm_skip is None:
+                engine_args["use_replayssm"] = True
+                print(
+                    "Unsloth: vLLM ReplaySSM decode is on for faster SSM / linear attention rollouts. "
+                    "Set UNSLOTH_VLLM_REPLAYSSM=0 to turn it off."
+                )
+                # vLLM 0.31's Triton ReplaySSM path only runs on Model Runner V1, no longer
+                # the CUDA default. Left set: vLLM caches env reads once the engine is up.
+                if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
+                    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+                    replayssm_set_runner = True
+            elif replayssm_mode == "on":
+                print(f"Unsloth: UNSLOTH_VLLM_REPLAYSSM=1 ignored: {replayssm_skip}.")
+        pass
+
         # Keep trying until success (2 times)
         trials = 0
         race_trials = 0
@@ -4274,6 +4534,13 @@ def load_vllm(
                 # reported it as an OOM and sent users to fixes that cannot work.
                 if _is_expandable_segments_error(error):
                     raise RuntimeError(_expandable_segments_standby_message(error))
+                # Config validation, before any allocation: load once more without it.
+                if engine_args.get("use_replayssm") and _is_vllm_replayssm_refusal(error):
+                    engine_args.pop("use_replayssm")
+                    if replayssm_set_runner:
+                        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                    print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
+                    continue
                 # A transient race: retry the *identical* load rather than fall
                 # through to the generic "memory" branch below, which would shrink
                 # gpu_memory_utilization and max_num_seqs for the rest of the run
