@@ -389,6 +389,13 @@ def _router_hook(layer_index):
         replay = _STATE.current
         positions = _split_router_output(output)
         if positions is None:
+            if not getattr(module, "_unsloth_replay_warned", False):
+                module._unsloth_replay_warned = True
+                warnings.warn(
+                    f"Unsloth: routing replay does not recognise the outputs of "
+                    f"{type(module).__name__} (it routes inside the MoE block); this layer keeps "
+                    f"its natural routing."
+                )
             _STATE.stats["router_calls_natural"] += 1
             return None
         li, wi, ii, dense = positions

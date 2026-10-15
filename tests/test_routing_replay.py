@@ -431,3 +431,16 @@ def test_real_pad_id_token_keeps_replay_under_attention_mask(replay):
     stats = rr.routing_replay_stats()
     assert stats["replayed_tokens"] == len(ids)
     assert stats["unmatched_tokens"] == 0
+
+
+def test_router_returning_only_logits_warns_and_stays_natural(replay):
+    # Sigmoid-scored families (DeepSeek-V3, GLM-4 MoE) pick experts in the block, not the router.
+    class LogitsOnlyRouter(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states @ torch.ones(16, NUM_EXPERTS)
+
+    router = LogitsOnlyRouter()
+    hook = rr._router_hook(0)
+    with pytest.warns(UserWarning, match = "routes inside the MoE block"):
+        assert hook(router, (torch.randn(3, 16),), router(torch.randn(3, 16))) is None
+    assert rr.routing_replay_stats()["router_calls_natural"] == 1
