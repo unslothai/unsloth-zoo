@@ -284,7 +284,7 @@ def test_selection_is_logged_once(fresh, caplog):
 
 def test_matmul_ogs_without_routing_or_ragged_metadata_is_refused(fresh):
     _, mods = _make_fake("triton_kernels", tkc.API_OGS_RAGGED)
-    del mods["topk"]  # neither routing.py nor topk: nothing to route with
+    del mods["topk"]
     for sub, mod in mods.items():
         fresh.setitem(sys.modules, "triton_kernels" if not sub else f"triton_kernels.{sub}", mod)
     fresh.setitem(sys.modules, "triton_kernels.topk", None)
@@ -324,7 +324,7 @@ def test_source_can_be_forced_when_both_exist(fresh, source, want):
 
 def test_vendored_copy_is_used_when_top_level_is_missing(fresh):
     vendored = _install(fresh, "vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
-    fresh.setitem(sys.modules, "triton_kernels", None)  # no top-level install, even if this env has one
+    fresh.setitem(sys.modules, "triton_kernels", None)
     fresh.setattr(tkc, "_import_top_level", lambda: None)
     fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
     assert tkc.selected_triton_kernels() == ("vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
@@ -409,7 +409,7 @@ def test_routing_from_router_topk_matches_backend_routing(fresh, api):
     k = 2
     vals, experts = torch.topk(logits, k, dim = -1)
     module = types.SimpleNamespace(num_experts = logits.shape[-1])
-    module.gate_up_proj = w1  # dense: routes through the resolved copy
+    module.gate_up_proj = w1
     ours = go._mxfp4_routing_from_topk(module, experts, torch.softmax(vals, -1))
     theirs = backend.routing(logits, k)
     assert type(ours[0]) is type(theirs[0])
@@ -460,7 +460,7 @@ def test_new_generation_translates_indices_and_precision(fresh):
     (_, g, _, _), (_, _, s, pc_down) = pkg.calls
     torch.testing.assert_close(g, gather.src_indx // k)
     torch.testing.assert_close(s, scatter.dst_indx)
-    assert pc_down.out_dtype == torch.float32 and pc.out_dtype is None  # the caller's config is not mutated
+    assert pc_down.out_dtype == torch.float32 and pc.out_dtype is None
 
 
 def test_unswizzle_handles_both_layout_contracts(fresh):
@@ -565,7 +565,7 @@ def test_routing_follows_the_copy_the_patched_forward_launches(fresh):
     fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
     fresh.setenv("UNSLOTH_TRITON_KERNELS_SOURCE", "vllm")
     module = torch.nn.Module()
-    module.__dict__["gate_up_proj"] = torch.zeros(1)  # dequantized: no copy to read from the weight
+    module.__dict__["gate_up_proj"] = torch.zeros(1)
     assert go._triton_kernels_root(module) == "vllm.third_party.triton_kernels"
     module.__dict__["_unsloth_tk_root"] = "triton_kernels"
     assert go._triton_kernels_root(module) == "triton_kernels"
@@ -576,8 +576,8 @@ def test_dense_training_follows_the_copy_the_patched_forward_launches(fresh):
     vendored = _install(fresh, "vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
     fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
     fresh.setenv("UNSLOTH_TRITON_KERNELS_SOURCE", "vllm")
-    weight = torch.zeros(1)  # dense projection: no copy to read from the weight
-    routing_data = type("RoutingData", (), {})()  # built locally for matmul+ragged, no copy in its module
+    weight = torch.zeros(1)
+    routing_data = type("RoutingData", (), {})()
     module = torch.nn.Module()
     assert go._ogs_root_for(weight, routing_data, module) == "vllm.third_party.triton_kernels"
     module.__dict__["_unsloth_tk_root"] = "triton_kernels"
