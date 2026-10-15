@@ -24,6 +24,14 @@ import torch
 ALIGN = 128
 
 
+def _chunk_row_bounds():
+    try:
+        from unsloth_zoo.temporary_patches.common import chunk_row_bounds
+    except ImportError as e:
+        pytest.skip(f"unsloth_zoo import unavailable: {e}")
+    return chunk_row_bounds
+
+
 def _ce_module():
     try:
         import unsloth_zoo.fused_losses.cross_entropy_loss as ce
@@ -96,7 +104,7 @@ def test_fused_ce_small_inputs_keep_torch_chunk(monkeypatch, bsz, qlen, n_chunks
 
 
 def test_chunk_row_bounds_invariants():
-    from unsloth_zoo.temporary_patches.common import chunk_row_bounds
+    chunk_row_bounds = _chunk_row_bounds()
     for chunks in (1, 2, 3, 4, 7, 12, 16, 32, 128):
         for n in list(range(chunks, 600)) + [8194, 4097, 12345, 16512, 131071]:
             assert chunk_row_bounds(n, chunks, align = 0) is None
@@ -111,7 +119,7 @@ def test_chunk_row_bounds_invariants():
 
 
 def test_chunk_row_bounds_keeps_budget_for_small_chunks():
-    from unsloth_zoo.temporary_patches.common import chunk_row_bounds
+    chunk_row_bounds = _chunk_row_bounds()
     # 129-row torch.chunk ranges: aligned ranges stay at 128 rows (one more range), never 256.
     bounds = chunk_row_bounds(16512, 128, align = ALIGN)
     sizes = [b - a for a, b in zip(bounds[:-1], bounds[1:])]
