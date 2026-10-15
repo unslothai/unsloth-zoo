@@ -695,9 +695,8 @@ def grpo_compute_loss(
     def masked_batch_mean(x):
         with torch.inference_mode():
             completion_length = n_mask_per_reward.mean()
-            # Sequence level only when x is narrower than the mask: a one-token
-            # completion is (B, 1) per token too, and its masked rows must not count.
-            if x.shape[1] == 1 and mask.shape[1] != 1:  # importance_sampling_level == "sequence"
+            # Sequence level only if x is narrower than mask: one-token completions are (B, 1) too.
+            if x.shape[1] == 1 and mask.shape[1] != 1:
                 return completion_length, x.mean()
             else:
                 # Rows with no tokens (mask_truncated_completions) are left out, as in TRL.
