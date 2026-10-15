@@ -362,7 +362,8 @@ def chunk_row_bounds(n_rows, chunks, align = CHUNK_ALIGN_ROWS):
         return None
     cap = -(-n_rows // chunks)
     size = (cap // align) * align
-    if size == 0 or 4 * size < 3 * cap:
+    # A 1-row tail hits the K=1 head-gradient matmul bug (see test_chunked_log_softmax_one_row_chunk).
+    if size == 0 or 4 * size < 3 * cap or n_rows % size == 1:
         return None
     return list(range(0, n_rows, size)) + [n_rows]
 pass

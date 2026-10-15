@@ -112,6 +112,7 @@ def test_chunk_row_bounds_invariants():
             assert bounds[0] == 0 and bounds[-1] == n and min(sizes) > 0
             assert max(sizes) <= math.ceil(n / chunks), (n, chunks, sizes)
             assert all(s % ALIGN == 0 for s in sizes[:-1]), (n, chunks, sizes)
+            assert sizes[-1] != 1, (n, chunks, sizes)
 
 
 def test_chunk_row_bounds_keeps_budget_for_small_chunks():
@@ -122,6 +123,8 @@ def test_chunk_row_bounds_keeps_budget_for_small_chunks():
     assert max(sizes) == 128 and len(sizes) == 129
     # Ranges would shrink by over a quarter (255 -> 128): keep torch.chunk.
     assert chunk_row_bounds(255 * 8, 8, align = ALIGN) is None
+    # A one-row tail (8193 = 8 x 1024 + 1) keeps torch.chunk.
+    assert chunk_row_bounds(8193, 8, align = ALIGN) is None
 
 
 @pytest.mark.parametrize("bsz, qlen, n_chunks", ODD_SHAPES[:2])
