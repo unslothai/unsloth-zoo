@@ -33,6 +33,16 @@ import torch
 transformers = pytest.importorskip("transformers")
 
 
+def _needs(name):
+    # Gemma 4 and Muse Glimmer arrive in transformers 5.x; the 4.57.6 floor has neither.
+    return pytest.mark.skipif(not hasattr(transformers, name), reason = f"transformers lacks {name}")
+
+
+_needs_gemma4_unified = _needs("Gemma4UnifiedForConditionalGeneration")
+_needs_muse_glimmer = _needs("MuseGlimmerForConditionalGeneration")
+_needs_gemma4 = _needs("Gemma4ForConditionalGeneration")
+
+
 def _linear(weight, bias = None, output_sizes = None):
     module = torch.nn.Module()
     module.weight = torch.nn.Parameter(weight.detach().clone(), requires_grad = False)
@@ -151,6 +161,7 @@ def _vllm_gemma4_unified(hf):
     return _llm(root)
 
 
+@_needs_gemma4_unified
 def test_gemma4_unified_is_a_gemma4_config():
     from unsloth_zoo.empty_model import _is_gemma4_config
     assert _is_gemma4_config(_gemma4_unified_config())
@@ -158,6 +169,7 @@ def test_gemma4_unified_is_a_gemma4_config():
     assert not _is_gemma4_config(types.SimpleNamespace(model_type = "gemma3"))
 
 
+@_needs_gemma4_unified
 def test_gemma4_unified_vllm_rebuild_matches_hf(monkeypatch, tmp_path):
     from safetensors.torch import save_file
     from transformers import Gemma4UnifiedForConditionalGeneration
@@ -184,6 +196,7 @@ def test_gemma4_unified_vllm_rebuild_matches_hf(monkeypatch, tmp_path):
         )
 
 
+@_needs_gemma4_unified
 def test_gemma4_unified_bnb_patch_dense_is_dequantized(monkeypatch, tmp_path):
     # load_in_4bit: vLLM builds vision_embedder.patch_dense with quant_config; its key is installed
     # as a plain tensor, so a packed weight must come back dequantized, not as uint8.
@@ -207,7 +220,9 @@ def test_gemma4_unified_bnb_patch_dense_is_dequantized(monkeypatch, tmp_path):
     got = rebuilt.model.embed_vision.patch_dense.weight
     assert got.dtype == torch.float32 and torch.equal(got, expected)
     assert not got.is_inference()  # trainable (vision LoRA / full vision fine-tuning)
-    torch.testing.assert_close(got, reference.model.embed_vision.patch_dense.weight, atol = 0.05, rtol = 0)
+    # NF4 rounds to within half its widest level gap (-1.0 to -0.696, so 0.152 x the block absmax).
+    original = reference.model.embed_vision.patch_dense.weight
+    torch.testing.assert_close(got, original, atol = 0.16 * original.abs().max().item(), rtol = 0)
 
 
 # ---------------------------------------------------------------- muse_glimmer
@@ -292,6 +307,7 @@ def _vllm_muse_glimmer(hf):
     return _llm(root)
 
 
+@_needs_muse_glimmer
 def test_muse_glimmer_vllm_rebuild_matches_hf(monkeypatch):
     from transformers import MuseGlimmerForConditionalGeneration
     config = _muse_glimmer_config()
@@ -395,6 +411,7 @@ def _vllm_gemma4_dense(hf):
     return _llm(root)
 
 
+@_needs_gemma4
 def test_gemma4_dense_vllm_rebuild_matches_hf(monkeypatch, tmp_path):
     from safetensors.torch import save_file
     from transformers import Gemma4ForConditionalGeneration
