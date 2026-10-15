@@ -47,7 +47,7 @@ def _env_float(name, default):
 # Per chunk: bf16 logits in forward; bf16 logits + bf16 logits gradient in backward. The compiled bodies fuse the
 # fp32 work, so 8 bytes per logit covers the eager fallback's fp32 temporaries too.
 _BYTES_PER_LOGIT = 8.0
-_CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 1.0)
+_CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 2.0)
 
 
 def chunked_logprob_rows(vocab_size, target_gb = None):
@@ -113,7 +113,9 @@ def _run(name, fn, *args):
         return fn(*args)
     compiled = _compiled.get(name)
     if compiled is None:
-        compiled = _compiled[name] = torch.compile(fn, dynamic = True, fullgraph = True, options = torch_compile_options)
+        # Rows are marked dynamic below; the vocab stays static, since a symbolic vocab makes Inductor's row reductions
+        # about 3x slower (8 ms vs 3 ms per call on a 15k x 152k chunk set, B200).
+        compiled = _compiled[name] = torch.compile(fn, dynamic = None, fullgraph = True, options = torch_compile_options)
     for x in args:
         # Row counts vary per chunk and per batch: dynamic from the first call, else one recompile per body.
         if torch.is_tensor(x) and x.dim() >= 1 and x.shape[0] > 1:
