@@ -903,11 +903,20 @@ def _gdn_backend():
 
 
 def _flashqla_version(flash_qla):
+    """Version of the imported flash_qla: the distribution's only if it owns the imported file
+    (a checkout earlier on sys.path can shadow an installed flash-qla)."""
+    version = getattr(flash_qla, "__version__", None)
+    if version:
+        return version
     try:
         import importlib.metadata as _md
-        return _md.version("flash-qla")
+        dist = _md.distribution("flash-qla")
+        origin = os.path.realpath(flash_qla.__file__)
+        if any(os.path.realpath(dist.locate_file(f)) == origin for f in dist.files or ()):
+            return dist.version
     except Exception:
-        return getattr(flash_qla, "__version__", None)
+        pass
+    return None
 
 
 def _load_flashqla():

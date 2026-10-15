@@ -230,3 +230,22 @@ def test_load_keeps_fla_on_sm120_unless_allowed(monkeypatch, capability, allow, 
     if allow is None: monkeypatch.delenv("UNSLOTH_FLASHQLA_ALLOW_SM120", raising = False)
     else: monkeypatch.setenv("UNSLOTH_FLASHQLA_ALLOW_SM120", allow)
     assert (fv._load_flashqla() is not None) == accepted
+
+
+def test_flashqla_version_belongs_to_the_imported_module(tmp_path, monkeypatch):
+    import importlib.metadata as md
+    checkout = tmp_path / "flash_qla" / "__init__.py"
+    checkout.parent.mkdir()
+    checkout.write_text("")
+    module = types.SimpleNamespace(__file__ = str(checkout))
+    installed = tmp_path / "site" / "flash_qla" / "__init__.py"
+    dist = types.SimpleNamespace(
+        version = "0.1.3",
+        files = ["flash_qla/__init__.py"],
+        locate_file = lambda f: tmp_path / "site" / f,
+    )
+    monkeypatch.setattr(md, "distribution", lambda name: dist)
+    # A shadowing checkout does not inherit the installed distribution's version.
+    assert fv._flashqla_version(module) is None
+    assert fv._flashqla_version(types.SimpleNamespace(__file__ = str(installed))) == "0.1.3"
+    assert fv._flashqla_version(types.SimpleNamespace(__file__ = str(checkout), __version__ = "0.1.2")) == "0.1.2"
