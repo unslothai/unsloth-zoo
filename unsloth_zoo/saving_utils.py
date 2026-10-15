@@ -8507,14 +8507,18 @@ def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of
                 # reshape(-1) so 0-dim scalars (e.g. Gemma-4 audio min/max) view as bytes
                 out.write(memoryview(res_t[k].reshape(-1).view(torch.uint8).numpy()))
             elif cast is not None:
+                # Bounded chunks, so a multi-GB embedding never sits in RAM at both widths.
                 src.seek(src_data_start + src_off0)
-                raw = bytearray(src.read(nbytes))
-                if len(raw) != nbytes:
-                    raise RuntimeError(
-                        f"Unsloth: unexpected EOF reading {src_path} for tensor {k}")
-                wide = torch.frombuffer(raw, dtype = cast).to(cast_to) if nbytes else torch.empty(0, dtype = cast_to)
-                out.write(memoryview(wide.view(torch.uint8).numpy()))
-                del raw, wide
+                remaining = nbytes
+                while remaining > 0:
+                    raw = bytearray(src.read(min(CHUNK, remaining)))
+                    if not raw:
+                        raise RuntimeError(
+                            f"Unsloth: unexpected EOF reading {src_path} for tensor {k}")
+                    wide = torch.frombuffer(raw, dtype = cast).to(cast_to)
+                    out.write(memoryview(wide.view(torch.uint8).numpy()))
+                    remaining -= len(raw)
+                    del raw, wide
             else:
                 src.seek(src_data_start + src_off0)
                 remaining = nbytes

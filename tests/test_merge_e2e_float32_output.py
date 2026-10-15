@@ -117,6 +117,8 @@ def test_upcast_shard_casts_only_16bit_floats(tmp_path):
         "c.weight": torch.randn(2, 2),
         "ids": torch.arange(7, dtype = torch.int64),
         "scalar": torch.tensor(1.5, dtype = torch.bfloat16),
+        # Larger than the 64 MB copy chunk, so the cast crosses a chunk boundary.
+        "big.weight": torch.randn(33 * 1024 * 1024 + 5).to(torch.bfloat16),
     }
     path = tmp_path / "model.safetensors"
     save_file(tensors, str(path), metadata = {"format": "pt"})
