@@ -551,8 +551,298 @@ def _decode_conv_contract(base):
         return None
 
 
+# The single-token step below repeats each stock kernel's per-lane order and calls the elementwise functors
+# MLX's compiled kernels call, on the same typed temporaries, so every intermediate rounds where stock rounds.
+_DECODE_STEP_SOURCE = """
+    constexpr uint NT = 32 * TY;
+    constexpr uint KEY = Hk * Dk;
+    constexpr uint C = 2 * KEY + Hv * Dv;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint tid = sg * 32 + lane;
+    uint n = threadgroup_position_in_grid.z;
+    uint row = n / Hv;
+    uint hv = n % Hv;
+    uint hk = hv / (Hv / Hk);
+    threadgroup T qs[Dk];
+    threadgroup T ks[Dk];
+    threadgroup T vs[Dv];
+    threadgroup T ys[Dv];
+    threadgroup float inv_norm[1];
+
+    {
+        // The window, depthwise taps and SiLU, as the decode convolution kernel computes them.
+        #pragma clang fp contract(off) reassociate(off)
+        for (uint i = tid; i < 2 * Dk + Dv; i += NT) {
+            uint c = i < Dk ? hk * Dk + i : i < 2 * Dk ? KEY + hk * Dk + i - Dk : 2 * KEY + hv * Dv + i - 2 * Dk;
+            bool owner = i >= 2 * Dk || hv % (Hv / Hk) == 0;
+            float acc = 0.0f;
+            for (uint tap = 0; tap < K; ++tap) {
+                T value = tap + 1 < K ? conv_state[(row * (K - 1) + tap) * C + c] : qkv[row * C + c];
+                if (owner) window[(row * K + tap) * C + c] = value;
+                float product = float(value) * conv_weight[tap * C + c];
+                acc = product + acc;
+            }
+            T conv = static_cast<T>(acc);
+            T act = Multiply()(conv, static_cast<T>(Sigmoid()(conv)));
+            if (i < Dk) qs[i] = act;
+            else if (i < 2 * Dk) ks[i - Dk] = act;
+            else vs[i - 2 * Dk] = act;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // mx.fast.rms_norm without a weight (rms_single_row), then the scalar head scale.
+    if (sg < 2) {
+        threadgroup T* x = sg == 0 ? qs : ks;
+        T scale = sg == 0 ? q_scale[0] : k_scale[0];
+        float thread_x[4];
+        float acc = 0;
+        for (int i = 0; i < 4; i++) {
+            thread_x[i] = x[lane * 4 + i];
+            acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        acc = simd_sum(lane == 0 ? acc : 0.0f);
+        float inv = metal::precise::rsqrt(acc / Dk + 1e-6f);
+        for (int i = 0; i < 4; i++) {
+            T normed = static_cast<T>(1) * static_cast<T>(thread_x[i] * inv);
+            x[lane * 4 + i] = Multiply()(scale, normed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    PT gate = Add()(static_cast<PT>(a[n]), static_cast<PT>(dt_bias[hv]));
+    float softplus = static_cast<float>(static_cast<PT>(LogAddExp()(gate, static_cast<PT>(0))));
+    float decay = Exp()(Multiply()(Negative()(Exp()(static_cast<float>(A_log[hv]))), softplus));
+    T beta = Sigmoid()(b[n]);
+
+    // The generic gated-delta kernel's recurrence, one simdgroup per value row.
+    for (uint j = 0; j < Dv / TY; ++j) {
+        uint dv = sg * (Dv / TY) + j;
+        auto i_state = state_in + (n * Dv + dv) * Dk + lane * 4;
+        auto o_state = state_out + (n * Dv + dv) * Dk + lane * 4;
+        float state[4];
+        for (int i = 0; i < 4; ++i) {
+            state[i] = static_cast<float>(i_state[i]);
+        }
+        float kv_mem = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            state[i] = state[i] * decay;
+            kv_mem += state[i] * ks[lane * 4 + i];
+        }
+        kv_mem = simd_sum(kv_mem);
+        auto delta = (vs[dv] - kv_mem) * beta;
+        float out = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            state[i] = state[i] + ks[lane * 4 + i] * delta;
+            out += state[i] * qs[lane * 4 + i];
+        }
+        out = simd_sum(out);
+        if (lane == 0) {
+            ys[dv] = static_cast<T>(out);
+        }
+        for (int i = 0; i < 4; ++i) {
+            o_state[i] = state[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // The gated RMSNorm: rms_single_row with the norm weight, then the float32 SiLU gate.
+    if (sg == 0) {
+        float acc = 0;
+        for (int i = 0; i < 4; i++) {
+            float xi = ys[lane * 4 + i];
+            acc += xi * xi;
+        }
+        acc = simd_sum(acc);
+        acc = simd_sum(lane == 0 ? acc : 0.0f);
+        if (lane == 0) {
+            inv_norm[0] = metal::precise::rsqrt(acc / Dv + norm_eps[0]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d = tid; d < Dv; d += NT) {
+        T normed = norm_weight[d] * static_cast<T>(static_cast<float>(ys[d]) * inv_norm[0]);
+        float zf = static_cast<float>(z[n * Dv + d]);
+        float silu = Multiply()(zf, Sigmoid()(zf));
+        y[n * Dv + d] = static_cast<T>(Multiply()(silu, static_cast<float>(normed)));
+    }
+"""
+_DECODE_STEP_ROWS = 8  # simdgroups per value head; each carries Dv / 8 state rows
+
+
 @functools.cache
-def _fused_decode_conv_class(base, call, prepare, conv, silu):
+def _decode_step_kernel():
+    try:
+        header = mx.metal.is_available() and nax._mlx_kernel_header("unary_ops.h")
+        binary = header and nax._mlx_kernel_header("binary_ops.h")
+        return binary and mx.fast.metal_kernel(
+            name = "unsloth_gated_delta_decode_step",
+            input_names = ["conv_state", "qkv", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight",
+                           "q_scale", "k_scale", "norm_eps", "state_in"],
+            output_names = ["window", "y", "state_out"], header = header + binary,
+            compile_options = {"math_mode": "safe"}, source = _DECODE_STEP_SOURCE,
+        ) or None
+    except (AttributeError, TypeError):
+        return None
+
+
+@functools.lru_cache(maxsize = 64)
+def _decode_step_scalars(head_dim, dtype, eps):
+    # `inv_scale * x` converts the Python scale to x's dtype; going through the same multiply keeps its rounding.
+    inv_scale, one = head_dim ** -0.5, mx.ones((1,), dtype)
+    scalars = ((inv_scale ** 2) * one, inv_scale * one, mx.array([eps], mx.float32))
+    mx.eval(*scalars)
+    return scalars
+
+
+def _decode_step(conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, eps, state, key_heads):
+    B, value_heads, Dv, Dk = state.shape
+    dtype = qkv.dtype
+    q_scale, k_scale, norm_eps = _decode_step_scalars(Dk, dtype, eps)
+    return _decode_step_kernel()(
+        inputs = [conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, norm_eps, state],
+        template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[0]),
+                    ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv), ("TY", _DECODE_STEP_ROWS)],
+        grid = (32, _DECODE_STEP_ROWS, B * value_heads), threadgroup = (32, _DECODE_STEP_ROWS, 1),
+        output_shapes = [(B, weight.shape[0], qkv.shape[-1]), (B, 1, value_heads, Dv), state.shape],
+        output_dtypes = [dtype, dtype, state.dtype],
+    )
+
+
+# Bodies the decode step mirrors. `gated_delta_kernel` is left out: the packed scope rebinds it, and its
+# single-token route is the generic kernel whose arithmetic `_make_gated_delta_kernel` pins.
+_DECODE_STEP_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.language": {
+        "Qwen3_5GatedDeltaNet.__call__": "f8deff65c803d4da",
+        "Qwen3_5GatedDeltaNet._normalize_qk": "8f16e229aec08b7a",
+        "Qwen3_5GatedDeltaNet._project_gates": "817d9767396ec3f8",
+        "Qwen3_5RMSNormGated.__call__": "7c0c74be3b59d596",
+        "_precise_swiglu": "d5cc9afa38657b66",
+        "_qwen3_5_advance_lengths_info": "67db74645bc98ea9",
+    },
+    "mlx_vlm.models.qwen3_5.gated_delta": {
+        "_compute_g_beta": "1185629ef7a77fba", "compute_g": "837fdb794c06f7f5",
+        "_make_gated_delta_kernel": "d3141d83bfd26d47",
+    },
+    "mlx_vlm.models.cache": {"ArraysCache.update_window": "5580299b90d3a0b1",
+                             "ArraysCache.update_recurrent": "c181bba469444c22"},
+    "mlx.nn": {"silu": "78867fdb7e42731c", "softplus": "4d48a9bee57aeadd"},
+}
+_DECODE_STEP_UPDATE = "dc29a058a40f2dce"
+_DECODE_STEP_METHODS = ("_causal_conv1d_decode", "_normalize_qk")  # the kernel replaces their calls
+_DECODE_STEP_VERDICTS = {}
+
+
+def _decode_step_contract(base):
+    """The functions the decode step of `base` calls, when it decodes through the pinned bodies, else None."""
+    language, source = (sys.modules.get(f"mlx_vlm.models.qwen3_5.{name}") for name in ("language", "gated_delta"))
+    cache = sys.modules.get("mlx_vlm.models.cache")
+    if language is None or source is None or cache is None or os.environ.get("UNSLOTH_MLX_FUSED_GDN_DECODE") == "0":
+        return None
+    layer = language.Qwen3_5GatedDeltaNet
+    if any(getattr(base, name, None) is not getattr(layer, name)
+           for name in ("__call__", "_normalize_qk", "_project_gates", "_causal_conv1d_decode")):
+        return None
+    if language.ArraysCache is not cache.ArraysCache or "gated_delta_update" not in vars(language):
+        return None
+    if _resolved_bindings(_DECODE_STEP_CONTRACT) is None:
+        return None
+    # Unsloth's training wrapper hands inference calls, which carry a state, to the update it replaced.
+    bound = update = vars(language)["gated_delta_update"]
+    if getattr(source, "_unsloth_gated_delta_patched", False) and update is source.gated_delta_update:
+        update = source._unsloth_gated_delta_original
+    try:
+        if _ast_fingerprint(update) != _DECODE_STEP_UPDATE or update.__globals__ is not vars(source):
+            return None
+    except (OSError, TypeError, SyntaxError, AttributeError):
+        return None
+    return (language, bound, update, cache.ArraysCache.update_window, cache.ArraysCache.update_recurrent,
+            language._qwen3_5_advance_lengths_info, language.Qwen3_5RMSNormGated.__call__)
+
+
+def _decode_step_route(language, bound, update, update_window, update_recurrent, advance_lengths, norm_call):
+    bindings = _resolved_bindings(_DECODE_STEP_CONTRACT)  # this resolution's, not a later one's
+    if bindings is None:
+        return None
+    bindings.append((vars(language), "gated_delta_update", bound))
+
+    def decode_step(self, inputs, mask = None, cache = None):
+        """The layer's output for one decode token on the fused kernel, or None where the native call decides."""
+        if (mask is not None or cache is None or inputs.ndim != 3 or inputs.shape[1] != 1
+                or getattr(type(cache), "update_window", None) is not update_window
+                or getattr(type(cache), "update_recurrent", None) is not update_recurrent
+                or any(name in getattr(cache, "__dict__", ()) for name in ("update_window", "update_recurrent"))
+                or type(self.norm).__call__ is not norm_call or not _bindings_intact(bindings)):
+            return None
+        B, K, Dk, Dv = inputs.shape[0], self.conv_kernel_size, self.head_k_dim, self.head_v_dim
+        conv_state, state = cache[0], cache[1]
+        if (conv_state is None or state is None or B == 0 or Dk != 128 or Dv != 128 or not 2 <= K <= 8
+                or self.num_v_heads % self.num_k_heads or any(name in vars(self) for name in _DECODE_STEP_METHODS)
+                or conv_state.shape != (B, K - 1, self.conv_dim) or conv_state.dtype not in (mx.bfloat16, mx.float16)
+                or state.shape != (B, self.num_v_heads, Dv, Dk) or state.dtype != mx.float32
+                or self.conv1d.weight.dtype not in (mx.bfloat16, mx.float16)
+                or self.norm.weight.dtype != conv_state.dtype or self.norm.weight.shape != (Dv,)
+                or self.A_log.shape != (self.num_v_heads,) or self.dt_bias.shape != self.A_log.shape
+                or any(t.dtype not in (mx.float32, mx.bfloat16, mx.float16) for t in (self.A_log, self.dt_bias))):
+            return None
+        dtype = conv_state.dtype
+        verdict_key = (self.num_k_heads, self.num_v_heads, K, dtype, self.A_log.dtype, self.dt_bias.dtype)
+        verdict = _DECODE_STEP_VERDICTS.get(verdict_key)
+        if verdict is False:
+            return None
+        mixed_qkv = self.in_proj_qkv(inputs)
+        z = self.in_proj_z(inputs)
+        b, a = self._project_gates(inputs)
+        # Past the projections the stock branch finishes whatever the kernel cannot take, so none runs twice.
+        fits = (all(t.dtype == dtype for t in (mixed_qkv, z, a, b)) and mixed_qkv.shape == (B, 1, self.conv_dim)
+                and z.shape == (B, 1, self.value_dim) and a.shape == (B, 1, self.num_v_heads) and b.shape == a.shape)
+        z = z.reshape(B, 1, -1, Dv)
+        if fits:
+            weight = self._unsloth_decode_conv_weight(None)
+            cached = self.__dict__.get("_unsloth_decode_step_weight")
+            if cached is None or cached[0] is not weight:
+                cached = (weight, mx.contiguous(weight))
+                mx.eval(cached[1])
+                self.__dict__["_unsloth_decode_step_weight"] = cached
+            fused = lambda: _decode_step(conv_state, mixed_qkv, cached[1], a, b, self.A_log, self.dt_bias, z,
+                                         self.norm.weight, self.norm.eps, state, self.num_k_heads)
+        if fits and verdict:
+            window, out, new_state = fused()
+        else:
+            window = mx.concatenate([conv_state, mixed_qkv], axis = 1)
+            conv_out = nn.silu(self._causal_conv1d_decode(window))
+            q, k, v = [t.reshape(B, 1, h, d) for t, h, d in zip(
+                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                [self.num_k_heads, self.num_k_heads, self.num_v_heads], [Dk, Dk, Dv])]
+            q, k = self._normalize_qk(q, k)
+            out, new_state = update(q, k, v, a, b, self.A_log, self.dt_bias, state = state, use_kernel = True)
+            out = self.norm(out, z)
+            if fits and verdict is None:
+                try:
+                    verdict = all(bool(mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item())
+                                  for x, y in zip(fused(), (window, out, new_state)))
+                except (RuntimeError, ValueError):
+                    verdict = None  # inside a function transformation, which cannot evaluate; checked later
+                else:
+                    _DECODE_STEP_VERDICTS[verdict_key] = verdict
+                    if not verdict:
+                        logger.warning("the fused gated-delta decode step differs from the native layer for %d key "
+                                       "heads, %d value heads, a %d-tap convolution and %s inputs; the native "
+                                       "layer stays in use", *verdict_key[:4])
+        cache.update_window(0, window, K - 1, lengths = cache.lengths)
+        cache.update_recurrent(1, 1, lambda initial, steps: (out, new_state))
+        if hasattr(cache, "advance"):
+            cache.advance(1)
+            advance_lengths(cache, 1)
+        return self.out_proj(out.reshape(B, 1, -1))
+
+    return decode_step
+
+
+@functools.cache
+def _fused_decode_conv_class(base, call, prepare, conv, silu, step = None):
     bindings = _resolved_bindings(_CONV_SILU_CONTRACT) or []  # this resolution's, not a later one's
     outer, inner = copy.deepcopy(_function_ast(call)), copy.deepcopy(_function_ast(prepare))
     start, index, before = _decode_conv_sites(outer)
@@ -588,10 +878,14 @@ def _fused_decode_conv_class(base, call, prepare, conv, silu):
                 return window, (q, k, v)
         return mx.concatenate([state, x], axis = 1), None
 
+    decode_step = step and _decode_step_route(*step)
+
     def fused_call(self, *args, **kwargs):
         if (self.training or prepare.__globals__.get(conv_name) is not conv
                 or not _bindings_intact(bindings)):
             return call(self, *args, **kwargs)
+        if decode_step is not None and (out := decode_step(self, *args, **kwargs)) is not None:
+            return out
         return adapted_call(self, *args, **kwargs)
 
     return type(f"_FusedDecodeConv{base.__name__}", (base,), {
@@ -605,6 +899,9 @@ def _fused_decode_conv_class(base, call, prepare, conv, silu):
 def fused_decode_conv_silu(model, *, _modules = None):
     """Fuse the recurrent decode conv window, convolution, SiLU and q/k/v split into one launch during serialized inference.
 
+    mlx-vlm's Qwen3.5 layer runs its whole single-token step, through the gated RMSNorm, in that launch instead,
+    once its first step of each head layout and dtype matched the native layer bit for bit;
+    `UNSLOTH_MLX_FUSED_GDN_DECODE=0` keeps it on the convolution-only launch.
     Prefill, unsupported convolution shapes, and training keep their native paths.
     Instance classes are restored when the context exits, including on cancellation.
     """
@@ -636,7 +933,9 @@ def fused_decode_conv_silu(model, *, _modules = None):
                         changed.append(module)
                     continue
                 if base not in specs:
-                    specs[base] = _decode_conv_contract(base)
+                    contract = _decode_conv_contract(base)
+                    step = contract and _decode_step_kernel() and _decode_step_contract(base)
+                    specs[base] = contract and (*contract, step or None)
                 contract = specs[base]
                 if contract is None or _decode_conv_kernel() is None:
                     continue
@@ -656,7 +955,7 @@ def fused_decode_conv_silu(model, *, _modules = None):
             if type(module) is getattr(module, "_unsloth_decode_patched", None):
                 module.__class__ = module._unsloth_decode_native
             for name in ("_unsloth_decode_scopes", "_unsloth_decode_native",
-                         "_unsloth_decode_patched"):
+                         "_unsloth_decode_patched", "_unsloth_decode_step_weight"):
                 module.__dict__.pop(name, None)
 
 

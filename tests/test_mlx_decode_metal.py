@@ -572,6 +572,97 @@ def test_packed_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
     assert routed_gated_delta.gated_delta_kernel is stock
 
 
+def _step_model(key_heads = 16, value_heads = 32, dtype = mx.bfloat16, gates = (mx.float32, mx.bfloat16), spread = 1.0):
+    model = native.Qwen3_5GatedDeltaNet(SimpleNamespace(
+        hidden_size = 64, linear_num_value_heads = value_heads, linear_num_key_heads = key_heads,
+        linear_key_head_dim = 128, linear_value_head_dim = 128, linear_conv_kernel_dim = 4, rms_norm_eps = 1e-6,
+    ))
+    model.set_dtype(dtype)
+    model.conv1d.weight = model.conv1d.weight * spread  # wide convolutions reach the SiLU's exp rounding
+    model.A_log = (mx.random.normal((value_heads,)) * 1.5).astype(gates[0])
+    model.dt_bias = (mx.random.normal((value_heads,)) * 3).astype(gates[1])
+    model.norm.weight = (1 + 0.3 * mx.random.normal((128,))).astype(dtype)
+    model.eval()
+    model.freeze()
+    return model
+
+
+def _steps(model, xs, cache = None, lengths = None):
+    cache, out = cache or native.ArraysCache(size = 2), []
+    for i, x in enumerate(xs):
+        if i == 1 and lengths is not None:  # decode rows of a ragged batch inside a speculative block
+            cache.lengths = mx.array(lengths)
+            cache.start_speculation(8)
+        out.append((model(x, cache = cache), *cache.state))
+    if lengths is not None:
+        out.append(tuple(a for record in cache._speculation["records"].values() for a in record if isinstance(a, mx.array)))
+    return out
+
+
+@pytest.mark.parametrize("heads, dtype, gates, rows, spread, lengths", [
+    ((16, 32), mx.bfloat16, (mx.float32, mx.bfloat16), 1, 1.0, None),  # Qwen3.5-9B
+    ((16, 32), mx.bfloat16, (mx.bfloat16, mx.bfloat16), 2, 4.0, [1, 0]),  # Qwen3.6-35B-A3B
+    ((2, 6), mx.float16, (mx.float32, mx.float32), 3, 0.3, None),
+])
+def test_decode_step_matches_the_native_layer_bitwise(heads, dtype, gates, rows, spread, lengths, monkeypatch):
+    model = _step_model(*heads, dtype, gates, spread)
+    xs = [(mx.random.normal((rows, n, 64)) * 4).astype(dtype) for n in (5, 1, 1, 1, 2, 1)]
+    expected = _steps(model, xs, lengths = lengths)
+    fused, calls = decode._decode_step, []
+    monkeypatch.setattr(decode, "_decode_step", lambda *args: calls.append(None) or fused(*args))
+    monkeypatch.setattr(decode, "_DECODE_STEP_VERDICTS", {})
+    with decode.fused_decode_conv_silu(model):
+        for actual, stock in zip(_steps(model, xs, lengths = lengths), expected, strict = True):
+            for x, y in zip(actual, stock):
+                _equal(x, y)
+    assert list(decode._DECODE_STEP_VERDICTS.values()) == [True] and len(calls) == 4  # one check, three steps
+
+
+def test_decode_step_keeps_the_native_layer_when_it_differs_or_cannot_serve(monkeypatch, caplog):
+    model, cache, stock = _step_model(2, 4), native.ArraysCache(size = 2), native.ArraysCache(size = 2)
+    xs = [(mx.random.normal((2, n, 64)) * 4).astype(mx.bfloat16) for n in (3, 1, 1)]
+    fused = decode._decode_step
+    monkeypatch.setattr(decode, "_decode_step", lambda *args: [t + (i == 1) for i, t in enumerate(fused(*args))])
+    monkeypatch.setattr(decode, "_DECODE_STEP_VERDICTS", {})
+    with caplog.at_level("WARNING"), decode.fused_decode_conv_silu(model):
+        native_steps = [(native.Qwen3_5GatedDeltaNet.__call__(model, x, cache = stock), *stock.state) for x in xs]
+        for actual, expected in zip(_steps(model, xs, cache), native_steps):
+            for x, y in zip(actual, expected):
+                _equal(x, y)
+    assert list(decode._DECODE_STEP_VERDICTS.values()) == [False] and "differs from the native layer" in caplog.text
+    monkeypatch.setattr(decode, "_decode_step", lambda *args: pytest.fail("the decode step served this call"))
+    monkeypatch.setattr(decode, "_DECODE_STEP_VERDICTS", {})
+    project, projected = model.in_proj_z, []
+    zeroed = lambda c: lambda *args: (lambda out: (out[0] * 0, out[1]))(type(c).update_recurrent(c, *args))
+    # Instance attributes the kernel would bypass; set through __dict__ so undoing one leaves nothing behind.
+    overrides = [[(model, "in_proj_z", lambda x: projected.append(None) or project(x).astype(mx.float32))],
+                 [(c, "update_recurrent", zeroed(c)) for c in (cache, stock)],
+                 [(model, "_normalize_qk", lambda q, k: (q * 2, k))]]
+    for call, env, override in ((dict(mask = mx.array([[True], [False]])), "1", []), ({}, "0", []),
+                                *[({}, "1", o) for o in overrides]):
+        with monkeypatch.context() as scoped:
+            scoped.setenv("UNSLOTH_MLX_FUSED_GDN_DECODE", env)
+            for target, name, value in override:
+                scoped.setitem(vars(target), name, value)
+            with decode.fused_decode_conv_silu(model):
+                _equal(model(xs[1], cache = cache, **call),
+                       native.Qwen3_5GatedDeltaNet.__call__(model, xs[1], cache = stock, **call))
+                for x, y in zip(cache.state, stock.state):
+                    _equal(x, y)
+    assert len(projected) == 2  # a projection the kernel cannot take is not run again on the way back
+
+
+def test_decode_step_reaches_the_update_behind_the_training_wrapper(monkeypatch):
+    original = vlm_gated_delta.gated_delta_update
+    wrapper = lambda *args, **kwargs: original(*args, **kwargs)
+    for module in (vlm_gated_delta, native):
+        monkeypatch.setattr(module, "gated_delta_update", wrapper)
+    monkeypatch.setattr(vlm_gated_delta, "_unsloth_gated_delta_original", original, raising = False)
+    assert decode._decode_step_contract(native.Qwen3_5GatedDeltaNet) is None
+    monkeypatch.setattr(vlm_gated_delta, "_unsloth_gated_delta_patched", True, raising = False)
+    assert decode._decode_step_contract(native.Qwen3_5GatedDeltaNet)[1:3] == (wrapper, original)
+
+
 def _attention_block(gqa, rows, keys, dtype = mx.bfloat16, heads = 8):
     # Keys and values as a KVCache returns them: a strided slice of a longer buffer.
     mx.random.seed(gqa * 100 + rows)
