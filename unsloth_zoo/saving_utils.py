@@ -4078,6 +4078,14 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     )
 
 
+def _remove_stale_output_shard(file_path, save_directory):
+    # Unlinks a link itself, never its target; a symlinked parent is left alone.
+    if os.path.lexists(file_path) and not os.path.isdir(file_path) and \
+            _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory):
+        os.remove(file_path)
+pass
+
+
 def _ensure_shard_writable(file_path):
     """Make an output shard owner-writable for the in-place "r+b" merge (hf_hub 1.x blobs are 0444).
 
@@ -5271,6 +5279,12 @@ def merge_and_overwrite_lora(
         pass
     pass
 
+    # An earlier export's shard is already merged and the fetches below can keep it
+    # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
+    if not is_local_path:
+        for filename in safetensors_list:
+            _remove_stale_output_shard(os.path.join(save_directory, filename), save_directory)
+
     # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
     if not is_local_path and _hf_cache_dir is not None:
         copied_all_from_cache = _try_copy_all_from_cache(
@@ -5325,15 +5339,17 @@ def merge_and_overwrite_lora(
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
         # For local models, copy the file if needed
-        if is_local_path and not os.path.exists(file_path):
-            local_file_path = os.path.join(model_name, filename)
-            if os.path.exists(local_file_path):
-                # A nested name has no parent here yet, so `copy2` would raise
-                # FileNotFoundError. The name is known to stay inside LEXICALLY, no
-                # stronger: a symlinked component still resolves wherever it points.
-                os.makedirs(os.path.dirname(file_path), exist_ok = True)
-                shutil.copy2(local_file_path, file_path)
-                print(f"Copied {filename} from local model directory")
+        # Overwrite unless it IS the source (in-place export): an earlier export's shard is already merged.
+        local_file_path = os.path.join(model_name, filename) if is_local_path else None
+        if is_local_path and os.path.exists(local_file_path) and not (
+            os.path.exists(file_path) and os.path.samefile(file_path, local_file_path)
+        ):
+            # A nested name has no parent here yet, so the copy would raise
+            # FileNotFoundError. The name is known to stay inside LEXICALLY, no
+            # stronger: a symlinked component still resolves wherever it points.
+            os.makedirs(os.path.dirname(file_path), exist_ok = True)
+            _copy_file_from_source(local_file_path, os.path.dirname(file_path), os.path.basename(file_path))
+            print(f"Copied {filename} from local model directory")
 
         elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
             hf_hub_download(
