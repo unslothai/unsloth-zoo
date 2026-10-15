@@ -701,6 +701,11 @@ def grpo_compute_loss(
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
     # TRL top_entropy_quantile: the policy term (not the KL) on high-entropy tokens only.
     entropy_mask = kwargs.get("entropy_mask", None)
+    # Parsed (option, lower_log, upper) tuples from grpo_parse_rollout_rs, or None.
+    rollout_rs = kwargs.get("rollout_rs", None)
+    # Per-completion weights from unsloth's generation step (ScaleRL zero-variance exclusion /
+    # prompt-level aggregation), normalised over the whole generation batch; replaces the loss_type normaliser.
+    sample_weight = kwargs.get("sample_weight", None)
     # Only direct callers see this fallback; the trainer always forwards an explicit value.
     use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
@@ -747,16 +752,19 @@ def grpo_compute_loss(
 
             if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
                 importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True)
+            elif vllm_importance_sampling_mode in ["geometric_mask", "geometric_truncate"]:
+                # Geometric mean of the token ratios (verl seq_mean_k1): the product blows up on long rows.
+                importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
 
             importance_sampling_ratio = torch.exp(importance_sampling_ratio)
 
-            if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate"]:
+            if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate", "geometric_truncate"]:
                 importance_sampling_ratio = torch.clamp(
                     importance_sampling_ratio, 
                     min=vllm_importance_sampling_clip_min,
                     max=vllm_importance_sampling_clip_max
                 )
-            elif vllm_importance_sampling_mode in ["token_mask", "sequence_mask"]:
+            elif vllm_importance_sampling_mode in ["token_mask", "sequence_mask", "geometric_mask"]:
                 min_val = (
                     vllm_importance_sampling_clip_min
                     if vllm_importance_sampling_clip_min is not None
@@ -778,8 +786,37 @@ def grpo_compute_loss(
                 )
             else:
                 raise ValueError(
-                        f"Unknown vLLM importance sampling mode: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+                        f"Unknown vLLM importance sampling mode: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', 'sequence_mask', 'geometric_truncate' and 'geometric_mask'."
                 )
+
+            if rollout_rs is not None:
+                # verl compute_rollout_rejection_mask: every option must pass. A rejected token gets
+                # IS weight 0 like TRL's *_mask modes, so it stays in the loss normaliser.
+                rs_log_ratio = torch.clamp(torch.nan_to_num((old - sampling_per_token_logps) * mask, nan = 0.0), min = -20.0, max = 20.0)
+                rs_mask = mask.to(rs_log_ratio.dtype)
+                rs_count = rs_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                rs_keep = torch.ones_like(rs_log_ratio)
+                for rs_option, rs_lower, rs_upper in rollout_rs:
+                    if rs_option.endswith("k1"):
+                        rs_stat = -rs_log_ratio
+                    elif rs_option.endswith("k2"):
+                        rs_stat = 0.5 * rs_log_ratio * rs_log_ratio
+                    else:
+                        rs_stat = torch.expm1(rs_log_ratio) - rs_log_ratio
+                    rs_stat = rs_stat * rs_mask
+                    if rs_option.startswith("seq_sum"):
+                        rs_stat = rs_stat.sum(dim=-1, keepdim=True)
+                    elif rs_option.startswith("seq_mean"):
+                        rs_stat = rs_stat.sum(dim=-1, keepdim=True) / rs_count
+                    elif rs_option.startswith("seq_max"):
+                        # k2, k3 >= 0 and masked entries are 0, so this is the masked max (0 on an empty row).
+                        rs_stat = rs_stat.amax(dim=-1, keepdim=True)
+                    if rs_lower is not None:
+                        rs_pass = (rs_stat >= rs_lower) & (rs_stat <= rs_upper)
+                    else:
+                        rs_pass = rs_stat <= rs_upper
+                    rs_keep = rs_keep * rs_pass.to(rs_keep.dtype)
+                importance_sampling_ratio = importance_sampling_ratio * rs_keep
     pass
 
     # Must detach when old is None: exp(new - new.detach()) == 1 but keeps grads correct.
@@ -878,7 +915,13 @@ def grpo_compute_loss(
     n_mask_per_reward = mask.sum(1)
 
     # https://github.com/huggingface/trl/blob/e8b8499f1f8d76838155b515e414ee98f757d6d5/trl/trainer/grpo_trainer.py#L1624
-    if loss_type in ["grpo", "sapo"]:
+    if sample_weight is not None:
+        # Same process / accumulation rescale as the dapo branch, whose weights are 1 / num_items_in_batch.
+        normalizer = 1.0 / num_processes
+        if steps_per_generation:
+            normalizer = normalizer * current_gradient_accumulation_steps / steps_per_generation
+        loss = (loss_i * mask * sample_weight.to(loss_i.dtype).unsqueeze(-1)).sum() / normalizer
+    elif loss_type in ["grpo", "sapo"]:
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "bnpo" and num_items_in_batch is None:
@@ -1165,6 +1208,11 @@ def _warn_unsupported_grpo_options(trainer):
         if entropy_coef:
             unsupported.append(f"entropy_coef={entropy_coef}")
         unsupported.append("use_adaptive_entropy=True")
+    # These only act on vLLM sampling logprobs, which exist with vllm_importance_sampling_correction.
+    if not (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False)):
+        for name in ("UNSLOTH_GRPO_VLLM_IS_MODE", "UNSLOTH_GRPO_VLLM_IS_CLIP", "UNSLOTH_GRPO_ROLLOUT_RS", "UNSLOTH_GRPO_ROLLOUT_METRICS"):
+            if os.environ.get(name, "") not in ("", "0"):
+                unsupported.append(f"{name}={os.environ[name]} (needs use_vllm and vllm_importance_sampling_correction=True)")
 
     if unsupported:
         message = (
@@ -1674,6 +1722,123 @@ pass
 RL_REPLACEMENTS["grpo_vision_chunks"] = grpo_vision_chunks
 
 
+GRPO_ROLLOUT_RS_OPTIONS = (
+    "token_k1", "token_k2", "token_k3",
+    "seq_sum_k1", "seq_sum_k2", "seq_sum_k3",
+    "seq_mean_k1", "seq_mean_k2", "seq_mean_k3",
+    "seq_max_k2", "seq_max_k3",
+)
+
+def grpo_parse_is_clip(spec, mode):
+    """Parse UNSLOTH_GRPO_VLLM_IS_CLIP "lower_upper" (either side may be empty) into (lower, upper).
+    Applied after GRPOConfig validation, so it checks the bounds itself: reversed bounds collapse
+    every truncated ratio to one value and make the mask modes reject every token."""
+    lower, _, upper = str(spec).partition("_")
+    lower = float(lower) if lower.strip() else None
+    upper = float(upper) if upper.strip() else None
+    if (lower is not None and not (0 <= lower < math.inf)) or (upper is not None and not (0 < upper < math.inf)):
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP needs a finite lower >= 0 and upper > 0, got {spec!r}.")
+    if lower is not None and upper is not None and lower > upper:
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP lower bound exceeds upper bound in {spec!r}.")
+    if lower is None and upper is None and str(mode).endswith("_truncate"):
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP={spec!r} gives no bound for {mode}.")
+    return lower, upper
+
+def grpo_parse_rollout_rs(options, thresholds):
+    """Parse verl rollout_rs / rollout_rs_threshold strings (comma separated, one threshold shared
+    or one per option; k1 takes "lower_upper" ratio bounds, default lower = 1 / upper; k2 / k3 a
+    single upper bound) into (option, lower_log, upper) tuples, k1 bounds in log space.
+    Returns None when options is empty."""
+    if options is None or not str(options).strip():
+        return None
+    names = []
+    for name in str(options).split(","):
+        name = name.strip()
+        if not name: continue
+        if name not in GRPO_ROLLOUT_RS_OPTIONS:
+            raise ValueError(f"Unsloth: unknown rollout rejection option {name}; choose from {GRPO_ROLLOUT_RS_OPTIONS}.")
+        if name not in names: names.append(name)
+    if not names:
+        return None
+    if thresholds is None or not str(thresholds).strip():
+        raise ValueError("Unsloth: UNSLOTH_GRPO_ROLLOUT_RS needs UNSLOTH_GRPO_ROLLOUT_RS_THRESHOLD.")
+    specs = [x.strip() for x in str(thresholds).split(",") if x.strip()]
+    if len(specs) not in (1, len(names)):
+        raise ValueError(f"Unsloth: give one rollout rejection threshold or {len(names)}, got {len(specs)}.")
+    if len(specs) == 1: specs = specs * len(names)
+    parsed = []
+    for name, spec in zip(names, specs):
+        if name.endswith("k1"):
+            if "_" in spec:
+                lower, upper = (float(x) for x in spec.split("_", 1))
+            else:
+                upper = float(spec)
+                lower = 1.0 / upper
+            if not (0 < lower <= upper < math.inf):
+                raise ValueError(f"Unsloth: rollout rejection bounds for {name} must be finite with 0 < lower <= upper, got {spec}.")
+            parsed.append((name, math.log(lower), math.log(upper)))
+        else:
+            if "_" in spec:
+                raise ValueError(f"Unsloth: {name} takes a single upper bound, got {spec}.")
+            upper = float(spec)
+            if not (0 < upper < math.inf):
+                raise ValueError(f"Unsloth: rollout rejection threshold for {name} must be positive and finite, got {spec}.")
+            parsed.append((name, None, upper))
+    return tuple(parsed)
+pass
+RL_REPLACEMENTS["grpo_parse_rollout_rs"] = grpo_parse_rollout_rs
+
+
+def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
+    """Sums for the rollout / trainer mismatch metrics over valid tokens, so processes and
+    micro-batches can be pooled before dividing. Returns a float64 vector:
+    [tokens, sum k1, sum k3, max k3, sum w, sum w^2, rejected tokens, rows, rejected rows],
+    k1 = log pi_rollout - log pi_train and k3 = r - 1 - log r (r = pi_train / pi_rollout) estimate
+    KL(rollout || train) as verl compute_offpolicy_metrics; w = the applied IS weights."""
+    with torch.no_grad():
+        log_ratio = old_logps.to(torch.float64) - sampling_logps.to(torch.float64)
+        # Tokens vLLM could not score (NaN) carry no divergence information: leave them out.
+        keep = mask.to(torch.bool) & ~torch.isnan(log_ratio)
+        maskd = keep.to(torch.float64)
+        log_ratio = torch.nan_to_num(log_ratio, nan = 0.0) * maskd
+        log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
+        k3 = (torch.expm1(log_ratio) - log_ratio) * maskd
+        w = torch.broadcast_to(is_weights.to(torch.float64), maskd.shape) * maskd
+        rejected = ((w == 0) & keep).to(torch.float64)
+        rows = (maskd.sum(-1) > 0).to(torch.float64)
+        return torch.stack([
+            maskd.sum(),
+            (-log_ratio).sum(),
+            k3.sum(),
+            k3.amax() if k3.numel() > 0 else k3.new_zeros(()),
+            w.sum(),
+            (w * w).sum(),
+            rejected.sum(),
+            rows.sum(),
+            ((rejected.sum(-1) > 0).to(torch.float64) * rows).sum(),
+        ])
+pass
+RL_REPLACEMENTS["grpo_rollout_mismatch_stats"] = grpo_rollout_mismatch_stats
+
+
+def grpo_rollout_mismatch_metrics(stats):
+    """Metric dict from (summed, k3 max maxed) grpo_rollout_mismatch_stats. ESS is the normalised
+    effective sample size (sum w)^2 / (N sum w^2) of the applied IS weights, verl's
+    rollout_is_eff_sample_size."""
+    stats = [float(x) for x in stats.tolist()]
+    n, k1, k3, k3_max, w1, w2, rej, rows, rej_rows = stats
+    return {
+        "sampling/rollout_kl_k1/mean": k1 / max(n, 1.0),
+        "sampling/rollout_kl_k3/mean": k3 / max(n, 1.0),
+        "sampling/rollout_kl_k3/max": k3_max,
+        "sampling/importance_sampling_ess": (w1 * w1) / (n * w2) if n > 0 and w2 > 0 else 0.0,
+        "sampling/importance_sampling_rejected_frac": rej / max(n, 1.0),
+        "sampling/importance_sampling_rejected_seq_frac": rej_rows / max(rows, 1.0),
+    }
+pass
+RL_REPLACEMENTS["grpo_rollout_mismatch_metrics"] = grpo_rollout_mismatch_metrics
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -1764,6 +1929,25 @@ def grpo_accumulated_loss(
     kwargs["vllm_importance_sampling_cap"] = getattr(trainer.args, "vllm_importance_sampling_cap", None)
     # Older TRL lacks this arg; fall back to token_truncate (legacy clamp(max=cap) behavior).
     kwargs["vllm_importance_sampling_mode"] = getattr(trainer.args, "vllm_importance_sampling_mode", None) or "token_truncate"
+    # Opt-in for TRL versions without the field or the geometric modes, e.g. geometric_mask.
+    if os.environ.get("UNSLOTH_GRPO_VLLM_IS_MODE", ""):
+        kwargs["vllm_importance_sampling_mode"] = os.environ["UNSLOTH_GRPO_VLLM_IS_MODE"]
+    # Like TRL, only check the mode where it is used: with the correction off it stays a no-op.
+    if getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False) and kwargs["vllm_importance_sampling_mode"] not in (
+        "token_truncate", "token_mask", "sequence_truncate", "sequence_mask", "geometric_truncate", "geometric_mask",
+    ):
+        raise ValueError(f"Unsloth: unknown vLLM importance sampling mode {kwargs['vllm_importance_sampling_mode']}.")
+    # TRL validates this in __init__, before the env override: get_gamma_weights sums a per-token log ratio.
+    if (
+        kwargs.get("loss_type", getattr(trainer, "loss_type", None)) == "vespo"
+        and getattr(trainer, "use_vllm", False)
+        and getattr(trainer, "vllm_importance_sampling_correction", False)
+        and kwargs["vllm_importance_sampling_mode"] not in ("token_truncate", "token_mask")
+    ):
+        raise ValueError(
+            "Unsloth: VESPO loss requires vllm_importance_sampling_mode to be 'token_truncate' or 'token_mask'. "
+            f"Got: {kwargs['vllm_importance_sampling_mode']}."
+        )
     kwargs["vllm_importance_sampling_clip_min"] = getattr(trainer.args, "vllm_importance_sampling_clip_min", None)
     kwargs["vllm_importance_sampling_clip_max"] = getattr(trainer.args, "vllm_importance_sampling_clip_max", None)
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
@@ -1837,6 +2021,21 @@ def grpo_accumulated_loss(
     if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
         kwargs["vllm_importance_sampling_clip_min"] = 0
         kwargs["vllm_importance_sampling_clip_max"] = kwargs["vllm_importance_sampling_cap"]
+    # "lower_upper" (either side may be empty), e.g. "0.999_1.001" for the geometric modes.
+    _is_clip_env = os.environ.get("UNSLOTH_GRPO_VLLM_IS_CLIP", "")
+    if _is_clip_env:
+        from unsloth_zoo.rl_replacements import grpo_parse_is_clip as _grpo_parse_is_clip
+        kwargs["vllm_importance_sampling_clip_min"], kwargs["vllm_importance_sampling_clip_max"] = _grpo_parse_is_clip(
+            _is_clip_env, kwargs["vllm_importance_sampling_mode"],
+        )
+    # verl rollout_rs rejection (token_k3, seq_mean_k3, seq_mean_k1, ...), applied with the vLLM IS ratio.
+    from unsloth_zoo.rl_replacements import grpo_parse_rollout_rs as _grpo_parse_rollout_rs
+    _rollout_rs = _grpo_parse_rollout_rs(
+        os.environ.get("UNSLOTH_GRPO_ROLLOUT_RS", ""), os.environ.get("UNSLOTH_GRPO_ROLLOUT_RS_THRESHOLD", ""),
+    )
+    if _rollout_rs is not None:
+        kwargs["rollout_rs"] = _rollout_rs
+    _rollout_metrics_on = os.environ.get("UNSLOTH_GRPO_ROLLOUT_METRICS", "0") == "1"
 
     if not hasattr(trainer, '_autocast_dtype'):
         # "no" is float32 training (a T4 / V100 without bfloat16): autocasting it to bfloat16 raises there.
@@ -2660,6 +2859,22 @@ def grpo_accumulated_loss(
                 kwargs,
                 upstream_scale,
             )
+        if (
+            _rollout_metrics_on and old_logps is not None and sampling_per_token_logps is not None
+            and flat_is_ratio is not None and flat_is_ratio.numel() > 0
+        ):
+            from unsloth_zoo.rl_replacements import (
+                grpo_rollout_mismatch_stats as _grpo_rollout_mismatch_stats,
+                grpo_rollout_mismatch_metrics as _grpo_rollout_mismatch_metrics,
+            )
+            _rollout_stats = _grpo_rollout_mismatch_stats(old_logps, sampling_per_token_logps, completion_mask, flat_is_ratio)
+            _rollout_stats = trainer.accelerator.gather(_rollout_stats.reshape(1, -1)).reshape(-1, _rollout_stats.numel())
+            _rollout_stats = torch.cat([_rollout_stats[:, :3].sum(0), _rollout_stats[:, 3:4].amax(0), _rollout_stats[:, 4:].sum(0)])
+            _metrics = trainer._metrics
+            if "train" in _metrics:
+                _metrics = _metrics["train" if _training else "eval"]
+            for _name, _value in _grpo_rollout_mismatch_metrics(_rollout_stats).items():
+                _metrics[_name].append(_value)
         if _entropy_bonus_on:
             _entropy_weights = _grpo_entropy_bonus_weights(
                 completion_mask, entropy_mask, _entropy_coef, kwargs, training = _training,
