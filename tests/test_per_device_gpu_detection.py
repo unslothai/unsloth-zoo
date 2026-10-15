@@ -363,6 +363,7 @@ def test_cuda_target_homogeneous_unchanged(monkeypatch):
 
 
 def test_rocm_target_mixed_family_builds_from_source(monkeypatch):
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)  # Windows keeps the prebuilt (own test)
     monkeypatch.setattr(llama_cpp, "torch", _fake_torch(archs = ["gfx1100", "gfx1201"]))
     assert llama_cpp._detect_gpu_target() is None
 
