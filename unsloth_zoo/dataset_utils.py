@@ -900,16 +900,13 @@ def train_on_responses_only(
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
 
-    # Precompute id sequences for mask_out_tokens (see docstring). Done once here so
-    # the per-example closure below only does integer comparisons.
     mask_out_sequences = []
     if mask_out_tokens:
         if isinstance(mask_out_tokens, str): mask_out_tokens = [mask_out_tokens]
         for token_string in mask_out_tokens:
             bare   = tokenizer(token_string,       add_special_tokens = False).input_ids
             spaced = tokenizer(" " + token_string, add_special_tokens = False).input_ids
-            # Skip the spaced form when it is just a space token before the bare ids
-            # (Qwen3 " </think>" = [220, 151668]): it would also mask that space.
+            # Qwen3 " </think>" = [220, 151668]: matching it would also mask the space.
             if any(spaced[i : i + len(bare)] == bare for i in range(len(spaced) - len(bare) + 1)):
                 spaced = None
             for ids in (bare, spaced):
@@ -1036,8 +1033,7 @@ def train_on_responses_only(
                 else:
                     labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
 
-            # Re-mask requested token sequences (e.g. "</think>") wherever they occur;
-            # positions outside kept spans are already -100, so re-masking is harmless.
+            # Outside kept spans labels are already -100, so masking everywhere is safe.
             for seq in mask_out_sequences:
                 seq_len, first = len(seq), seq[0]
                 i, limit = 0, n - len(seq)
