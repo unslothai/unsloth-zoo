@@ -185,3 +185,18 @@ def test_errors():
         losses.chunked_lm_loss(h, w, y, "kl_div")
     with pytest.raises(ValueError):
         losses.chunked_lm_loss(h, w, torch.zeros(3, dtype = torch.long))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU to split the target over devices")
+@pytest.mark.parametrize("loss_type", ["ce", "kl_div"])
+def test_target_lm_head_on_another_device(loss_type):
+    """A sharded target keeps its lm_head on another device than the head's rows."""
+    torch.manual_seed(0)
+    hidden = torch.randn(9, 8, device = "cuda", requires_grad = True)
+    weight = torch.randn(11, 8)
+    teacher = torch.randn(9, 8)
+    labels = torch.randint(0, 11, (9,), device = "cuda")
+    kw = dict(teacher_hidden = teacher) if loss_type != "ce" else {}
+    out, _, _ = losses.chunked_lm_loss(hidden, weight, labels, loss_type, chunk_size = 4, **kw)
+    ref = _reference(hidden.detach().cpu(), weight, labels.cpu(), loss_type, teacher_hidden = teacher)
+    assert out.device.type == "cuda" and torch.allclose(out.cpu(), ref, atol = 1e-4)

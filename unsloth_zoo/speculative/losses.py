@@ -105,14 +105,17 @@ def chunked_lm_loss(
         raise ValueError(
             f"Unsloth: hidden has {hidden.shape[0]} rows but labels has {labels.shape[0]}."
         )
+    # A target sharded over GPUs keeps its lm_head on the last one; the head's rows sit elsewhere.
+    lm_head_weight = lm_head_weight.to(hidden.device)
     if teacher_lm_head_weight is None:
         teacher_lm_head_weight = lm_head_weight
+    teacher_lm_head_weight = teacher_lm_head_weight.to(hidden.device)
     valid = labels != ignore_index
     hidden = hidden[valid]
     labels = labels[valid]
     if teacher_hidden is not None:
         teacher_hidden = teacher_hidden.reshape(-1, teacher_hidden.shape[-1])[valid.to(teacher_hidden.device)]
-        teacher_hidden = teacher_hidden.detach()
+        teacher_hidden = teacher_hidden.detach().to(hidden.device)
     n_tokens = int(labels.shape[0])
     loss_sum = hidden.new_zeros((), dtype = torch.float32 if hidden.dtype in (torch.float16, torch.bfloat16) else hidden.dtype)
     n_correct = None
