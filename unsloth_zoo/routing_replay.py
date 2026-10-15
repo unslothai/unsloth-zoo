@@ -60,15 +60,16 @@ def routing_replay_requested():
     return os.environ.get(ROUTING_REPLAY_ENV, "0") == "1"
 
 
-def vllm_supports_routed_experts():
+def _engine_arg_names():
     try:
         from vllm import EngineArgs
+        return set(inspect.signature(EngineArgs).parameters)
     except Exception:
-        return False
-    try:
-        return "enable_return_routed_experts" in inspect.signature(EngineArgs).parameters
-    except Exception:
-        return False
+        return set()
+
+
+def vllm_supports_routed_experts():
+    return "enable_return_routed_experts" in _engine_arg_names()
 
 
 def _config_is_moe(config):
@@ -94,7 +95,12 @@ def routing_replay_engine_args(config):
             stacklevel = 2,
         )
         return {}
-    return {"enable_return_routed_experts": True}
+    args = {"enable_return_routed_experts": True}
+    # Fused FlashInfer MoE kernels (auto on Blackwell) pick experts internally and leave the
+    # capture all zeros (vllm-project/vllm#44116); the Triton backend goes through the hook.
+    if "moe_backend" in _engine_arg_names():
+        args["moe_backend"] = "triton"
+    return args
 
 
 class _ReplayState:
@@ -114,6 +120,7 @@ class _ReplayState:
             router_calls_natural = 0,
         )
         self.changed = None
+        self.warned_invalid = False
 
 
 _STATE = _ReplayState()
@@ -154,6 +161,19 @@ def record_routed_experts(request_outputs, pad_token_id = None):
             rows = torch.full((len(full),) + tuple(routed.shape[1:]), -1, dtype = torch.int16)
             n = min(len(full), routed.shape[0])
             rows[:n] = routed[:n]
+            if rows.shape[-1] > 1:
+                # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.
+                ordered = rows.sort(dim = -1).values
+                bad = (ordered[..., 1:] == ordered[..., :-1]).any(dim = -1) & (ordered[..., :1] >= 0).squeeze(-1)
+                if bool(bad.any()):
+                    rows[bad] = -1
+                    _STATE.stats["invalid_rows"] = _STATE.stats.get("invalid_rows", 0) + int(bad.sum())
+                    if not _STATE.warned_invalid:
+                        _STATE.warned_invalid = True
+                        warnings.warn(
+                            "Unsloth: vLLM returned routed experts with repeated ids; those tokens keep "
+                            "the trainer's own routing."
+                        )
             # Keyed by every token: a pad id inside the sequence (pad == eos) can be real.
             key = tuple(full)
             store[key] = rows

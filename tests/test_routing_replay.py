@@ -106,9 +106,28 @@ def test_off_by_default(monkeypatch):
 
 
 def test_engine_args_need_moe(replay, monkeypatch):
-    monkeypatch.setattr(rr, "vllm_supports_routed_experts", lambda: True)
+    monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts"})
     assert rr.routing_replay_engine_args(_model().config) == {"enable_return_routed_experts": True}
     assert rr.routing_replay_engine_args(SimpleNamespace(num_experts = None)) == {}
+
+
+def test_engine_args_pin_a_capturing_moe_backend(replay, monkeypatch):
+    # Fused FlashInfer MoE (auto on Blackwell) leaves the capture all zeros: vllm-project/vllm#44116.
+    monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts", "moe_backend"})
+    assert rr.routing_replay_engine_args(_model().config) == {
+        "enable_return_routed_experts": True, "moe_backend": "triton",
+    }
+
+
+def test_repeated_expert_ids_are_not_replayed(replay):
+    rr._STATE.pad_token_id = PAD
+    routed = np.arange(4 * NUM_LAYERS * TOP_K).reshape(4, NUM_LAYERS, TOP_K) % NUM_EXPERTS
+    routed[1] = 0  # an all-zero capture for one token
+    rr.record_routed_experts([_request([3, 4], [5, 6, 7], routed)])
+    rows = rr._lookup((3, 4, 5, 6, 7)).long()
+    assert torch.equal(rows[0], torch.as_tensor(routed[0]).long())
+    assert bool((rows[1] == -1).all())
+    assert rr.routing_replay_stats()["invalid_rows"] == NUM_LAYERS
 
 
 def test_matching_ids_reproduce_natural_forward_and_grad(replay):
