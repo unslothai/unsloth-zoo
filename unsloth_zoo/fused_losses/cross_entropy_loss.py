@@ -20,6 +20,7 @@ __all__ = [
     "compute_fused_ce_loss",
     "unsloth_count_aware_cross_entropy",
     "unsloth_loss_count_kwargs",
+    "unsloth_fsdp_unshard",
 ]
 
 import torch
@@ -29,7 +30,9 @@ import weakref
 import functools
 import math
 import os
+import sys
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bounds
 from unsloth_zoo.device_type import DEVICE_TYPE
         
 
@@ -66,6 +69,31 @@ def _nonzero_count(n_items):
     if torch.is_tensor(n_items):
         return torch.where(n_items == 0, torch.ones_like(n_items), n_items)
     return n_items if n_items != 0 else 1
+pass
+
+@torch.compiler.disable
+def _fsdp_unshard(module):
+    module.unshard()
+pass
+
+def unsloth_fsdp_unshard(module):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """All-gather an FSDP2-sharded module (lm_head) whose weight the fused losses read without calling it.
+
+    FSDP2 unshards in the module's pre-forward hook, which never fires here; accelerate shards an
+    untied lm_head in its own group, so the weight would reach the matmul as a DTensor (unsloth-zoo#1751).
+    Traceable unless an FSDP2 unit is found, so compiled non-FSDP forwards keep one graph.
+    """
+    if module is None or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    # fully_shard lives here, so no FSDP2 unit can exist before this module was imported.
+    FSDPModule = getattr(sys.modules.get("torch.distributed.fsdp"), "FSDPModule", None)
+    if FSDPModule is None:
+        return
+    for submodule in module.modules():
+        if isinstance(submodule, FSDPModule):
+            # No-op once unsharded; post-backward reshards it and reduce-scatters its gradient.
+            _fsdp_unshard(submodule)
 pass
 
 def apply_autograd_function(autograd, mapping):
@@ -163,8 +191,8 @@ _CE_BYTES_PER_LOGIT = 16.0
 _CE_TARGET_GB_CAP = 4.0
 
 
-def _free_target_gb():
-    """Half the memory actually available to this backend, capped.
+def _free_target_gb(device = None):
+    """Half the memory actually available on `device` (None = current device), capped.
 
     `_default_target_gb` already answers this for every backend the zoo supports, and it
     answers it for the reason this needed: it checks `is_available()` before asking a device
@@ -183,14 +211,14 @@ def _free_target_gb():
     # for fused_losses/.tiled_mlp.py and every remote-code save walking this graph fails.
     from unsloth_zoo.tiled_mlp import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
 
-    return min(_default_target_gb(), _CE_TARGET_GB_CAP)
+    return min(_default_target_gb(device), _CE_TARGET_GB_CAP)
 
 
-@functools.cache
-def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
+def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        target_gb = _free_target_gb()
+        # Not cached: a first reading (before optimizer states exist) was reused forever.
+        target_gb = _free_target_gb(device)
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
@@ -207,10 +235,16 @@ def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
+# Explicit budgets are pure arithmetic of their arguments, so they stay cached.
+_get_explicit_chunk_multiplier = functools.cache(_get_chunk_multiplier)
+_get_chunk_multiplier.cache_clear = _get_explicit_chunk_multiplier.cache_clear
 
-def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0):
+def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Number of chunks that fits the target max memory usage."""
-    multiplier = _get_chunk_multiplier(vocab_size, target_gb, fixed_gb)
+    if target_gb is None:
+        multiplier = _get_chunk_multiplier(vocab_size, None, fixed_gb, device)
+    else:
+        multiplier = _get_explicit_chunk_multiplier(vocab_size, target_gb, fixed_gb)
     n_splits = (bsz*qlen) * multiplier
     # n_splits * 4 == (chunk transient GiB) / target. Round UP: nearest-rounding
     # (round(0.5) -> 0) collapses a large transient into one uncapped chunk.
@@ -311,12 +345,22 @@ class UnslothFusedLoss(torch.autograd.Function):
             n_chunks = get_chunk_size(
                 bsz, qlen, vocab_size, target_gb = target_gb,
                 fixed_gb = fixed_bytes / 1024 / 1024 / 1024,
+                device = device,
             )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
-        __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
-        __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
-        __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
+        bounds = chunk_row_bounds(bsz * qlen, n_chunks, align = CHUNK_ALIGN_ROWS)
+        if bounds is not None:
+            ranges = list(zip(bounds[:-1], bounds[1:]))
+            _flat_states = hidden_states.reshape(-1, hd)
+            _flat_grads  = grad_inputs.view(-1, hd)
+            __shift_labels = [labels[a:b]       for a, b in ranges]
+            __shift_states = [_flat_states[a:b] for a, b in ranges]
+            __grad_inputs  = [_flat_grads[a:b]  for a, b in ranges]
+        else:
+            __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
+            __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
+            __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
 
         def accumulate_chunk(
             n_chunks,

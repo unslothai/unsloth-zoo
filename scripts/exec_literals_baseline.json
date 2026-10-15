@@ -2,6 +2,7 @@
   "_comment": "Call sites that predate the gate. New ones fail; see scripts/lint_exec_literals.py.",
   "targets": [
     "unsloth_zoo",
+    "unsloth_zoo_downloads",
     "scripts"
   ],
   "entries": [

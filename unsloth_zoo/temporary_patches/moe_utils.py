@@ -1397,6 +1397,9 @@ def _check_grouped_gemm_available():
         _GROUPED_GEMM_AVAILABLE = True
         _init_triton_allocator()
     except (ImportError, ModuleNotFoundError):
+        # A temporary patch asking while unsloth itself imports: circular, not absent. Decide later.
+        if _unsloth_importing():
+            return False
         _GROUPED_GEMM_AVAILABLE = False
     return _GROUPED_GEMM_AVAILABLE
 
@@ -1404,14 +1407,47 @@ def _check_grouped_gemm_available():
 from functools import lru_cache, wraps
 
 
-@lru_cache(maxsize=1)
+def _unsloth_importing():
+    return bool(getattr(getattr(sys.modules.get("unsloth"), "__spec__", None), "_initializing", False))
+
+
+_SELECTED_MOE_BACKEND = None
+
+
 def select_moe_backend():
     """Select MoE backend from UNSLOTH_MOE_BACKEND + availability.
 
     Choices: "grouped_mm", "unsloth_triton", "native_torch" (default "grouped_mm").
     """
     # This Unsloth Zoo code section is licensed under AGPL3
+    global _SELECTED_MOE_BACKEND
+    if _SELECTED_MOE_BACKEND is not None:
+        return _SELECTED_MOE_BACKEND
+    backend = _select_moe_backend()
+    # Chosen while unsloth imports (its Triton kernels cannot load yet): choose again on the next call.
+    if not _unsloth_importing():
+        _SELECTED_MOE_BACKEND = backend
+    return backend
 
+
+def _clear_selected_moe_backend():
+    global _SELECTED_MOE_BACKEND
+    _SELECTED_MOE_BACKEND = None
+
+
+select_moe_backend.cache_clear = _clear_selected_moe_backend
+
+
+def select_moe_backend_for_interleaved_gate_up():
+    """select_moe_backend() for interleaved gate_up (GPT-OSS), which Triton cannot run: grouped_mm, not the loop."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    backend = select_moe_backend()
+    if backend == "unsloth_triton" and _check_torch_grouped_mm_supported():
+        return "grouped_mm"
+    return backend
+
+
+def _select_moe_backend():
     requested = os.environ.get("UNSLOTH_MOE_BACKEND")
     if requested:
         if requested == "grouped_mm" and _check_torch_grouped_mm_supported():

@@ -12,6 +12,7 @@ on:
     paths:
       - 'pyproject.toml'
       - 'unsloth_zoo/**'
+      - 'unsloth_zoo_downloads/**'
       - 'tests/**'
       # pyproject declares `readme = "README.md"`, so the build below reads it: deleting
       # or renaming it fails `python -m build`, and an ordinary edit changes the packaged
@@ -36,6 +37,7 @@ on:
     paths:
       - 'pyproject.toml'
       - 'unsloth_zoo/**'
+      - 'unsloth_zoo_downloads/**'
       - 'tests/**'
       - 'README.md'
       - 'setup.py'
@@ -93,14 +95,15 @@ jobs:
           print(f"wheel version: {version}")
           with zipfile.ZipFile(w) as z:
               n = z.namelist()
-              # Anything outside these two is a stray tree the wheel must not carry.
+              # Anything outside these three is a stray tree the wheel must not carry.
               tops = sorted({s.split("/")[0] for s in n if "/" in s})
-              strays = [t for t in tops if t not in ("unsloth_zoo", f"unsloth_zoo-{version}.dist-info")]
+              strays = [t for t in tops if t not in ("unsloth_zoo", "unsloth_zoo_downloads", f"unsloth_zoo-{version}.dist-info")]
               # Hard checks: must hold for any zoo release wheel.
               hard_checks = {
                 "unsloth_zoo/__init__.py shipped":      any(s == "unsloth_zoo/__init__.py" for s in n),
                 "unsloth_zoo/rl_replacements.py shipped": any(s == "unsloth_zoo/rl_replacements.py" for s in n),
                 "unsloth_zoo/temporary_patches/__init__.py shipped": any(s == "unsloth_zoo/temporary_patches/__init__.py" for s in n),
+                "unsloth_zoo_downloads/__init__.py shipped": any(s == "unsloth_zoo_downloads/__init__.py" for s in n),
                 "no .pyc files":                        not any(s.endswith(".pyc") for s in n),
                 "no .git tree":                         not any(s.startswith(".git/") for s in n),
                 "version is not 0.0.0":                 version is not None and version != "0.0.0",
@@ -138,6 +141,12 @@ jobs:
           ")
           echo "installed unsloth_zoo version: $WHEEL_VERSION"
           test -n "$WHEEL_VERSION" && test "$WHEEL_VERSION" != "0.0.0"
+          /tmp/v/bin/python -c "
+          import sys
+          import unsloth_zoo_downloads.hf_xet_fallback
+          import unsloth_zoo_downloads.hf_xet_health
+          assert 'unsloth_zoo' not in sys.modules, 'the light package ran the heavy init'
+          "
 
       - name: Upload wheel on failure
         if: failure()

@@ -561,7 +561,7 @@ from unsloth_zoo.loss_utils import (
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
-from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
+from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
 from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
@@ -3323,6 +3323,7 @@ if n_items is None:
             break
 pass
 
+if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -3423,6 +3424,7 @@ if (\\9) != () and type(\\9) is dict:
     explicit_shift_labels = (\\9).get("shift_labels", None)
     if not torch.is_tensor(explicit_shift_labels): explicit_shift_labels = None
 
+if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -3549,6 +3551,7 @@ if n_items is None:
             break
 pass
 
+if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
