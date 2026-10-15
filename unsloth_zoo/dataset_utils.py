@@ -913,6 +913,13 @@ def train_on_responses_only(
                 if ids and ids not in mask_out_sequences:
                     mask_out_sequences.append(ids)
     pass
+    # Grouped by first id. Up to 4 groups, each row costs one C-level list.index scan
+    # per group; past that a single set-membership pass over the row is cheaper.
+    mask_out_lookup = {}
+    for ids in mask_out_sequences:
+        mask_out_lookup.setdefault(ids[0], []).append((ids, len(ids), [-100] * len(ids)))
+    mask_out_groups  = tuple(mask_out_lookup.items())
+    mask_out_firsts  = frozenset(mask_out_lookup) if len(mask_out_lookup) > 4 else None
 
     def _train_on_responses_only(examples):
         input_ids_ = examples["input_ids"]
@@ -1034,13 +1041,21 @@ def train_on_responses_only(
                     labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
 
             # Outside kept spans labels are already -100, so masking everywhere is safe.
-            for seq in mask_out_sequences:
-                seq_len, first = len(seq), seq[0]
-                i, limit = 0, n - len(seq)
-                while i <= limit:
-                    if input_ids[i] == first and input_ids[i : i + seq_len] == seq:
-                        labels[i : i + seq_len] = [-100] * seq_len
-                    i += 1
+            if mask_out_lookup:
+                if mask_out_firsts is None:
+                    hits = []
+                    for first, group in mask_out_groups:
+                        i = -1
+                        while True:
+                            try: i = input_ids.index(first, i + 1)
+                            except ValueError: break
+                            hits.append((i, group))
+                else:
+                    hits = [(i, mask_out_lookup[t]) for i, t in enumerate(input_ids) if t in mask_out_firsts]
+                for i, group in hits:
+                    for seq, seq_len, fill in group:
+                        if seq_len == 1: labels[i] = -100
+                        elif input_ids[i : i + seq_len] == seq: labels[i : i + seq_len] = fill
             pass
 
             all_labels.append(labels)

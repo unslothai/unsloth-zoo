@@ -411,3 +411,24 @@ def test_a_collator_that_already_masks_refuses_mask_out_tokens():
     assert train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART) is trainer
     with pytest.raises(ValueError, match = "mask_out_tokens"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART, mask_out_tokens = [THINK_CLOSE])
+
+
+@pytest.mark.parametrize("strings", [
+    ["a", "ab", "aba", "bc", THINK_CLOSE],            # 3 first ids: list.index scans
+    ["a", "ab", "aba", "bc", "c", "d", THINK_CLOSE],  # 5 first ids: one set-membership pass
+])
+def test_matches_a_brute_force_scan_on_random_rows(strings):
+    """Shared first ids, overlaps and truncated tails, against a naive per-position scan."""
+    import random
+    rng = random.Random(3407)
+    a, b, c, d = ord("a"), ord("b"), ord("c"), ord("d")
+    seqs = [StubTokenizer()(t).input_ids for t in strings]
+    masker = _masker(mask_out_tokens = strings)
+    for _ in range(200):
+        row = [USER_ID, 10, ASSISTANT_ID] + [rng.choice([a, b, c, d, THINK_ID, 20]) for _ in range(rng.randint(0, 30))]
+        expected = [-100] * 3 + row[3:]
+        for seq in seqs:
+            for i in range(len(row) - len(seq) + 1):
+                if row[i : i + len(seq)] == seq:
+                    expected[i : i + len(seq)] = [-100] * len(seq)
+        assert masker({"input_ids": [row]})["labels"][0] == expected
