@@ -18,7 +18,8 @@
 
 Env: ``UNSLOTH_DISABLE_VENDORED_FLA=1`` never injects (an installed fla is untouched);
 an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VENDORED_FLA=1``;
-``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640).
+``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640);
+``UNSLOTH_GDN_BACKEND=flashqla`` sends supported chunk_gated_delta_rule calls to FlashQLA (``pip install flash-qla``).
 Injects only with torch >= 2.7, triton >= 3.3 and CUDA.
 """
 
@@ -891,6 +892,162 @@ def _repair_kernel_hub_closures(packages=_HUB_REPAIR_MODELING):
     return tuple(repaired)
 
 
+_GDN_BACKEND_MARK = "_unsloth_gdn_backend"
+_FLASHQLA_ARCHES = ((9, 0), (10, 0), (10, 3), (12, 0), (12, 1))
+_flashqla_state = {"module": None, "capability": None, "failed": False, "calls": 0, "skipped": set()}
+
+
+def _gdn_backend():
+    return os.environ.get("UNSLOTH_GDN_BACKEND", "").strip().lower()
+
+
+def _load_flashqla():
+    """flash_qla, or None. Its import picks kernels for the current device and raises on others."""
+    if _flashqla_state["module"] is not None:
+        return _flashqla_state["module"]
+    if _flashqla_state["failed"]:
+        return None
+    try:
+        import torch
+        if getattr(torch.version, "hip", None) is not None or not torch.cuda.is_available():
+            raise RuntimeError("FlashQLA needs an NVIDIA GPU")
+        capability = tuple(torch.cuda.get_device_capability())
+        if capability not in _FLASHQLA_ARCHES:
+            raise RuntimeError(f"FlashQLA does not support compute capability {capability}")
+        import flash_qla
+        flash_qla.chunk_gated_delta_rule
+    except Exception as e:
+        _flashqla_state["failed"] = True
+        logger.warning(
+            f"Unsloth: UNSLOTH_GDN_BACKEND=flashqla is set but FlashQLA is unavailable ({e}); "
+            f"using the fla Triton kernels. Install it with `pip install flash-qla`."
+        )
+        return None
+    _flashqla_state["module"] = flash_qla
+    _flashqla_state["capability"] = capability
+    return flash_qla
+
+
+def _flashqla_unsupported(q, k, v, g, beta, initial_state, cu_seqlens, cp_context, extra):
+    """Why FlashQLA cannot serve this call, or None. Mirrors fla's own FlashQLA backend
+    verifier (fla/ops/gated_delta_rule/backends/flash_qla.py)."""
+    import torch
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        return "not CUDA"
+    capability = tuple(torch.cuda.get_device_capability(q.device))
+    if capability != _flashqla_state["capability"]:
+        return f"compute capability {capability} differs from the one FlashQLA was loaded for"
+    if q.dtype not in (torch.float16, torch.bfloat16) or not (q.dtype == k.dtype == v.dtype):
+        return "dtype"
+    if q.shape[-1] != 128 or v.shape[-1] != 128:
+        return "head dim is not 128"
+    if v.shape[2] % k.shape[2] != 0:
+        return "value heads not a multiple of key heads"
+    if cu_seqlens is not None and q.shape[0] != 1:
+        return "cu_seqlens with batch > 1"
+    if cp_context is not None:
+        return "context parallel"
+    if extra.get("use_gate_in_kernel") or extra.get("use_beta_sigmoid_in_kernel") or extra.get("allow_neg_eigval"):
+        return "in-kernel gate / beta sigmoid / negative eigenvalues"
+    if "transpose_state_layout" in extra or extra.get("head_first"):
+        return "deprecated layout argument"
+    if capability[0] == 12:
+        if q.dtype == torch.float16:
+            return "float16 on SM120"
+        needs_backward = torch.is_grad_enabled() and any(
+            t is not None and t.requires_grad for t in (q, k, v, g, beta, initial_state)
+        )
+        if needs_backward:
+            # FlashQLA < 0.1.3 has no SM120 backward kernel.
+            try:
+                from flash_qla.ops.gated_delta_rule import chunk as _chunk
+                if getattr(_chunk, "fused_gdr_bwd", None) is None:
+                    return "no backward kernel on SM120"
+            except Exception:
+                return "no backward kernel on SM120"
+    return None
+
+
+def _make_flashqla_chunk_gated_delta_rule(original):
+    """Dispatch eligible calls to FlashQLA, everything else to ``original``. functools.wraps
+    keeps ``inspect.signature`` on the original: transformers' kernel-hub wrapper filters
+    kwargs by it."""
+    signature = inspect.signature(original)
+
+    @functools.wraps(original)
+    def chunk_gated_delta_rule(*args, **kwargs):
+        flash_qla = _flashqla_state["module"]
+        if flash_qla is None:
+            return original(*args, **kwargs)
+        try:
+            bound = signature.bind(*args, **kwargs)
+        except TypeError:
+            return original(*args, **kwargs)
+        a = bound.arguments
+        extra = dict(a.get("kwargs", {}))
+        for name in ("use_beta_sigmoid_in_kernel", "allow_neg_eigval"):
+            if name in a:
+                extra[name] = a[name]
+        q, k, v, g, beta = (a.get(name) for name in ("q", "k", "v", "g", "beta"))
+        initial_state = a.get("initial_state")
+        cu_seqlens = a.get("cu_seqlens")
+        reason = _flashqla_unsupported(
+            q, k, v, g, beta, initial_state, cu_seqlens, a.get("cp_context"), extra,
+        )
+        if reason is not None:
+            if UNSLOTH_ENABLE_LOGGING and reason not in _flashqla_state["skipped"]:
+                _flashqla_state["skipped"].add(reason)
+                logger.info(f"Unsloth: FlashQLA skipped ({reason}); using fla.")
+            return original(*args, **kwargs)
+        _flashqla_state["calls"] += 1
+        return flash_qla.chunk_gated_delta_rule(
+            q = q,
+            k = k,
+            v = v,
+            g = g,
+            beta = beta,
+            scale = a.get("scale"),
+            initial_state = initial_state,
+            output_final_state = a.get("output_final_state", False),
+            use_qk_l2norm_in_kernel = a.get("use_qk_l2norm_in_kernel", False),
+            cu_seqlens = cu_seqlens,
+            state_v_first = a.get("state_v_first", False),
+        )
+
+    setattr(chunk_gated_delta_rule, _GDN_BACKEND_MARK, "flashqla")
+    return chunk_gated_delta_rule
+
+
+def _install_gdn_backend():
+    """``UNSLOTH_GDN_BACKEND=flashqla``: route the live fla's chunk_gated_delta_rule through
+    FlashQLA where it applies. Unset: nothing is touched. Idempotent."""
+    if _gdn_backend() != "flashqla":
+        return False
+    module = sys.modules.get("fla.ops.gated_delta_rule")
+    original = getattr(module, "chunk_gated_delta_rule", None) if module is not None else None
+    if original is None:
+        return False
+    if getattr(original, _GDN_BACKEND_MARK, None) is not None:
+        return True
+    if _load_flashqla() is None:
+        return False
+    try:
+        import torch
+        wrapped = torch.compiler.disable(_make_flashqla_chunk_gated_delta_rule(original))
+    except Exception:
+        wrapped = _make_flashqla_chunk_gated_delta_rule(original)
+    setattr(wrapped, _GDN_BACKEND_MARK, "flashqla")
+    module.chunk_gated_delta_rule = wrapped
+    # Pre-#47630 modeling modules bound the original as a global at import.
+    for modname in _l2norm_modules(_GATED_DELTA_MODELING):
+        mod = sys.modules.get(modname)
+        if mod is not None and getattr(mod, "chunk_gated_delta_rule", None) is original:
+            setattr(mod, "chunk_gated_delta_rule", wrapped)
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: gated-delta chunk kernel routed through FlashQLA (UNSLOTH_GDN_BACKEND=flashqla).")
+    return True
+
+
 _NO_FLA_HUB_MARK = "_unsloth_rdna1_no_fla"
 
 
@@ -996,6 +1153,10 @@ def patch_vendor_fla(phase=None):
             except Exception as e:
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
+            try:
+                _install_gdn_backend()
+            except Exception as e:
+                logger.warning(f"Unsloth: could not enable UNSLOTH_GDN_BACKEND: {e}")
             try:
                 _repair_kernel_hub_closures()
             except Exception as e:
