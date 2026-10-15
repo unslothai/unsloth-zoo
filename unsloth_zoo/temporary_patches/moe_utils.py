@@ -1099,10 +1099,8 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
-# Selective expert dequant (UNSLOTH_MOE_SELECTIVE_DEQUANT=1): the recompute path dequantizes
-# only experts that received tokens, optionally UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS at a time,
-# and runs the base GEMM on that compact stack with compacted offsets. Opt-in because the
-# plan reads the token counts on the host (one sync per MoE layer forward; not capturable).
+# UNSLOTH_MOE_SELECTIVE_DEQUANT=1: dequantize only routed experts. Opt-in because the plan
+# reads token counts on the host (one sync per MoE layer forward; not capturable).
 SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
 
 

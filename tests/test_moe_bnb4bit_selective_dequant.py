@@ -119,7 +119,6 @@ def test_forward_and_grads_match_full_stack(nested, mode, monkeypatch):
     assert torch.equal(out, base_out)
     for got, want in zip(grads, base_grads):
         assert torch.equal(got, want)
-    # Unrouted experts get exactly zero LoRA grad on both paths.
     unused = torch.ones(E, dtype = torch.bool, device = DEVICE)
     unused[pool] = False
     for g in grads[2:]:
