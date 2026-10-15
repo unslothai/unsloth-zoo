@@ -361,7 +361,8 @@ def unsloth_chunked_ce_loss(
     shift_labels = True, ignore_index = -100, logit_scale_multiply = 0.0, logit_scale_divide = 0.0,
     logit_softcapping = 0.0, rows_per_chunk = None,
 ):
-    """Drop-in for the chunked fused CE (same shift / mask / n_items / scaling contract), scoring only labelled rows."""
+    """Drop-in for the chunked fused CE (same shift / mask / n_items / scaling contract), scoring only labelled rows.
+    A zero `scaling` stores unscaled gradients, so a collapsed GradScaler gives zeros rather than 0 * inf."""
     device = lm_head_weight.device
     labels = labels.to(device)
     if shift_labels:
@@ -385,7 +386,7 @@ def unsloth_chunked_ce_loss(
     if rows_per_chunk is None:
         rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0], n_rows = hidden.shape[0])
     return UnslothChunkedCE.apply(
-        hidden, lm_head_weight, lm_head_bias, labels[keep], divisor, 1.0 if scaling is None else float(scaling),
+        hidden, lm_head_weight, lm_head_bias, labels[keep], divisor, float(scaling or 1.0),
         int(rows_per_chunk), float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0),
         float(logit_softcapping or 0.0),
     )

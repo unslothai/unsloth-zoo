@@ -124,3 +124,11 @@ def test_fused_ce_routes_plain_ce_only(monkeypatch, label_smoothing):
     old.backward()
     torch.testing.assert_close(loss, old, rtol = 1e-5, atol = 1e-6)
     torch.testing.assert_close(hidden.grad, hidden2.grad, rtol = 1e-4, atol = 1e-6)
+
+
+def test_zero_scaling_gives_finite_gradients():
+    hidden = torch.randn(B, S, H, requires_grad = True)
+    labels = torch.randint(0, V, (B, S))
+    loss = unsloth_chunked_ce_loss(hidden, torch.randn(V, H), None, labels, scaling = 0.0)
+    loss.backward()
+    assert torch.isfinite(hidden.grad).all() and hidden.grad.abs().sum() > 0
