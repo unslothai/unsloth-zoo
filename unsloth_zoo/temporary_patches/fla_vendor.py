@@ -931,13 +931,11 @@ def _load_flashqla():
                 "set UNSLOTH_FLASHQLA_ALLOW_SM120=1 to use it anyway"
             )
         import flash_qla
-        # state_v_first (always forwarded below) first appeared in FlashQLA 0.1.1, and 0.1.1's
-        # id()-keyed tensor cache can reuse stale chunk indices for packed batches (fixed in 0.1.2).
+        # 0.1.1's id()-keyed tensor cache can reuse stale chunk indices for packed batches (fixed
+        # in 0.1.2); 0.1.0 lacks state_v_first. An unversioned build cannot be told apart.
         installed = _flashqla_version(flash_qla)
-        if "state_v_first" not in inspect.signature(flash_qla.chunk_gated_delta_rule).parameters or (
-            installed is not None and not _version_at_least(installed, "0.1.2")
-        ):
-            raise RuntimeError(f"flash-qla >= 0.1.2 is required (found {installed or 'an older build'})")
+        if installed is None or not _version_at_least(installed, "0.1.2"):
+            raise RuntimeError(f"flash-qla >= 0.1.2 is required (found {installed or 'an unversioned build'})")
     except Exception as e:
         _flashqla_state["failed"] = True
         logger.warning(

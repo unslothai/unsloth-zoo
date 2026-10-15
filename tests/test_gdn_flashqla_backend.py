@@ -200,7 +200,7 @@ def _qla_chunk_011(
 
 
 @pytest.mark.parametrize("chunk, version, accepted", [
-    (_qla_chunk_010, None, False), (_qla_chunk_011, None, True),
+    (_qla_chunk_010, None, False), (_qla_chunk_011, None, False),
     (_qla_chunk_011, "0.1.1", False), (_qla_chunk_011, "0.1.2", True), (_qla_chunk_011, "0.1.3", True),
 ])
 def test_load_rejects_flashqla_before_0_1_2(monkeypatch, chunk, version, accepted):
