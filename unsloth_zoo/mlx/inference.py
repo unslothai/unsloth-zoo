@@ -3880,7 +3880,7 @@ _EXACT_VERIFY_CONTRACT = {
 }
 # mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
 _VERIFY_FUSED_ROWS = 8
-_VERIFY_METHODS = ("verify", "_linear", "_linears", "_layer", "_feed_forward")
+_VERIFY_METHODS = ("verify", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta")
 _VERIFY_LOCK = RLock()
 _VERIFY_VERDICTS = {}
 # The verifier is one object per process: whether a call is served is kept per thread, not on it.
@@ -3928,21 +3928,137 @@ def _verify_sliced(project, linears, x, eligible):
     return _verify_admitted(key, lambda: project(x), sliced)
 
 
+# A taped verify block writes only each recurrent layer's final state, and its commit replays the retained
+# prefix with the same kernel, where stock writes the state after every step and commits one of them.
+_VERIFY_TAPE_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.speculative_verifier": {"Qwen3_5BatchInvariantForward._gated_delta": "a2958b13863bfa3f"},
+    "mlx_vlm.models.qwen3_5.gated_delta": {"gated_delta_update": "dc29a058a40f2dce",
+                                           "gated_delta_update_with_states": "b6184aa75f301467"},
+    "mlx_vlm.models.cache": {"ArraysCache.update_recurrent": "c181bba469444c22",
+                             "ArraysCache.commit_speculation": "a36c75395d84c19f"},
+    "mlx_vlm.speculative.cache_state": {"SpeculativeCacheTransaction.commit": "657125b51fe60be7"},
+}
+_TAPE_VERDICTS = {}
+
+
+def _retained_mask(lengths, length, mask):
+    retained = mx.arange(length)[None] < mx.array(lengths)[:, None]
+    return retained if mask is None else mx.logical_and(retained, mask)
+
+
+def _replay_matches(stock, replay, mask, initial):
+    """Whether replays reproduce stock's output, final state, and the state after any retained length, per row."""
+    y, final, states = stock
+    batch, length = y.shape[:2]
+    retained = [mx.zeros_like(final) if initial is None else initial, *(states[:, step] for step in range(length - 1)), final]
+    # Every partial length on all rows, then rows retaining none and all side by side.
+    patterns = [*([count] * batch for count in range(1, length)), [row % 2 * length for row in range(batch)]]
+    pairs = list(zip((y, final), replay(mask = mask)[:2]))
+    for lengths in patterns:
+        expected = mx.stack([retained[count][row] for row, count in enumerate(lengths)])
+        pairs.append((expected, replay(mask = _retained_mask(lengths, length, mask))[1]))
+    return all(a.dtype == b.dtype and a.shape == b.shape
+               and mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item() for a, b in pairs)
+
+
+def _taped_update(native, with_states):
+    """`gated_delta_update` keeping no per-step states for a block that fills its cache's speculative window."""
+    def gated_delta_update(q, k, v, a, b, A_log, dt_bias, state = None, mask = None, use_kernel = True,
+                           state_steps = None, cache = None, cache_index = 1):
+        tapes, length = getattr(_VERIFY_STATE, "tapes", None), q.shape[1]
+        # A two-step block's replay costs about what its one per-step state did, and stock commits an entry
+        # state of another batch size for rows retaining nothing.
+        if (tapes is None or cache is None or state is not None or state_steps is not None or length < 3
+                or getattr(cache, "history_capacity", 0) != length
+                or getattr(cache[cache_index], "shape", q.shape)[0] != q.shape[0]):
+            return native(q, k, v, a, b, A_log, dt_bias, state = state, mask = mask, use_kernel = use_kernel,
+                          state_steps = state_steps, cache = cache, cache_index = cache_index)
+
+        def update(initial, steps):
+            replay = functools.partial(with_states, q, k, v, a, b, A_log, dt_bias, initial,
+                                       use_kernel = use_kernel, state_steps = 0)
+            key = (*k.shape[2:], *v.shape[2:], length, a.ndim, q.dtype, k.dtype, v.dtype, a.dtype, b.dtype,
+                   getattr(initial, "dtype", None), getattr(mask, "dtype", None))
+            verdict = _TAPE_VERDICTS.get(key)
+            if not verdict:
+                stock = with_states(q, k, v, a, b, A_log, dt_bias, initial, mask, use_kernel = use_kernel,
+                                    state_steps = steps)
+                if verdict is None:
+                    try:
+                        verdict = _replay_matches(stock, replay, mask, initial)
+                    except (RuntimeError, ValueError):
+                        return stock  # inside a function transformation, which cannot evaluate; checked later
+                    _TAPE_VERDICTS[key] = verdict
+                    if not verdict:
+                        logger.warning("replaying a verify block's gated-delta prefix differs from its per-step "
+                                       "states for %s; verify keeps writing every step's state there", key)
+                return stock
+            y, final, _ = replay(mask = mask)
+            tapes.append((cache, cache_index, replay, mask))
+            return y, final, mx.broadcast_to(final[:, None], (final.shape[0], steps, *final.shape[1:]))
+
+        return cache.update_recurrent(cache_index, length, update)
+
+    return gated_delta_update
+
+
+@functools.cache
+def _taped_transaction_class(base):
+    def commit(self, lengths):
+        if not isinstance(lengths, int):
+            lengths = [int(value) for value in (lengths.reshape(-1).tolist() if isinstance(lengths, mx.array) else lengths)]
+        base.commit(self, lengths)
+        tapes = self.__dict__.pop("_unsloth_tapes", ())
+        counts = {lengths} if isinstance(lengths, int) else set(lengths)
+        # Retaining all or none, stock committed the final or the entry state itself.
+        if counts == {self.length} or counts == {0}:
+            return
+        # Otherwise stock selected from a stand-in history; the retained state is the replayed prefix.
+        for cache, index, replay, mask in tapes:
+            rows = [lengths] * replay.args[0].shape[0] if isinstance(lengths, int) else lengths
+            cache[index] = replay(mask = _retained_mask(rows, self.length, mask))[1]
+
+    def abort(self):
+        self.__dict__.pop("_unsloth_tapes", None)
+        base.abort(self)
+
+    return type(f"_Taped{base.__name__}", (base,), {"commit": commit, "abort": abort})
+
+
 @functools.cache
 def _exact_verify_class(base, *cache_key):
     bindings = _resolved_bindings(_EXACT_VERIFY_CONTRACT)
     eligible = getattr(sys.modules.get("mlx_vlm.models.quantized_verifier"), "_can_optimized_affine_linear", None)
     if bindings is None or eligible is None:
         return None
+    tape_bindings = _resolved_bindings(_VERIFY_TAPE_CONTRACT)
+    gated_delta, kernels = vars(base).get("_gated_delta"), sys.modules.get("mlx_vlm.models.qwen3_5.gated_delta")
+    taped = None
+    if (tape_bindings is not None and gated_delta is not None and kernels is not None
+            and gated_delta.__globals__.get("gated_delta_update") is kernels.gated_delta_update):
+        route = _taped_update(kernels.gated_delta_update, kernels.gated_delta_update_with_states)
+        taped = FunctionType(gated_delta.__code__, {**gated_delta.__globals__, "gated_delta_update": route},
+                             gated_delta.__name__, gated_delta.__defaults__, gated_delta.__closure__)
 
     def verify(self, language_model, inputs, *, cache = None, **kwargs):
-        outer = getattr(_VERIFY_STATE, "serving", False)
+        outer, outer_tapes = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
         _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
                                      and not language_model.training and _bindings_intact(bindings))
+        _VERIFY_STATE.tapes = [] if _VERIFY_STATE.serving and taped is not None and _bindings_intact(tape_bindings) else None
         try:
-            return base.verify(self, language_model, inputs, cache = cache, **kwargs)
+            output = base.verify(self, language_model, inputs, cache = cache, **kwargs)
+            if _VERIFY_STATE.tapes:
+                transaction = output.gdn_states
+                transaction.__class__ = _taped_transaction_class(type(transaction))
+                transaction._unsloth_tapes = _VERIFY_STATE.tapes
+            return output
         finally:
-            _VERIFY_STATE.serving = outer
+            _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer, outer_tapes
+
+    def taped_gated_delta(self, layer, inputs, mask, cache):
+        if getattr(_VERIFY_STATE, "tapes", None) is None:
+            return base._gated_delta(self, layer, inputs, mask, cache)
+        return taped(self, layer, inputs, mask, cache)
 
     def sliced_linear(self, linear, x):
         return _verify_sliced(lambda rows: base._linear(self, linear, rows), (linear,), x, eligible)
@@ -3985,7 +4101,8 @@ def _exact_verify_class(base, *cache_key):
 
     return type(f"_ScopedVerify{base.__name__}", (base,), {
         "verify": verify, "_linear": sliced_linear, "_linears": sliced_linears, "_layer": submitted_layer,
-        "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base})
+        "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base,
+        **({"_gated_delta": taped_gated_delta} if taped is not None else {})})
 
 
 @contextmanager
@@ -3995,7 +4112,10 @@ def exact_speculative_verify(model, *, _modules = None):
     Each layer of a verify block is submitted for evaluation as it is built, so the GPU runs while the host builds on.
     A verify block wider than the eight rows mlx-vlm's fused verify kernels serve runs each frozen
     quantized projection over balanced row slices, once its first block of that shape matched the
-    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition. Only verify calls of the language models found here are served; other,
+    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition.
+    A block's gated-delta layers write only their final state, and the commit replays each layer over the retained
+    prefix with the same kernel instead of keeping every step's state, once replays of a key's first block matched
+    every per-step state bit for bit. Only verify calls of the language models found here are served; other,
     training and distributed models, and an mlx-vlm whose verifier drifted, keep the native methods.
     """
     owners, verifier = [], None
