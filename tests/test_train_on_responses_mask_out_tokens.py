@@ -128,7 +128,7 @@ def test_every_occurrence_is_masked_across_turns():
     assert all(label == -100 for label, token in zip(labels, row) if token == THINK_ID)
 
 
-def test_a_multi_token_sequence_matches_whole_and_does_not_overlap():
+def test_a_multi_token_sequence_matches_whole_sequences_only():
     """``"ab"`` tokenizes to ``[97, 98]``; a partial match is left alone."""
     a, b, c = ord("a"), ord("b"), ord("c")
     row = [USER_ID, 10, ASSISTANT_ID, a, b, a, b, a, c, 20]
@@ -398,3 +398,23 @@ def test_the_collator_constructor_forwards_the_argument(mask):
         assert (at_closer == think_id).all()
     # the rest of the answer stays trained either way
     assert ((labels != -100) & (input_ids != think_id)).sum() > 0
+
+
+def test_overlapping_occurrences_are_all_masked():
+    a = ord("a")
+    row = [USER_ID, 10, ASSISTANT_ID, a, a, a, a, 20]
+
+    labels = _masker(mask_out_tokens = ["aaa"])({"input_ids": [row]})["labels"][0]
+
+    assert labels == [-100, -100, -100, -100, -100, -100, -100, 20]
+
+
+def test_a_collator_that_already_masks_refuses_mask_out_tokens():
+    """Its masker was built without the argument; ignoring it silently would train the closer."""
+    collator = UnslothVisionDataCollator(StubProcessor())
+    collator.train_on_responses_only = lambda batch: batch
+    trainer = StubTrainer(collator)
+
+    assert train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART) is trainer
+    with pytest.raises(ValueError, match = "mask_out_tokens"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART, mask_out_tokens = [THINK_CLOSE])

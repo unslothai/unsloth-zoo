@@ -1040,9 +1040,7 @@ def train_on_responses_only(
                 while i <= limit:
                     if input_ids[i] == first and input_ids[i : i + seq_len] == seq:
                         labels[i : i + seq_len] = [-100] * seq_len
-                        i += seq_len
-                    else:
-                        i += 1
+                    i += 1
             pass
 
             all_labels.append(labels)
@@ -2085,6 +2083,12 @@ def train_on_responses_only(
     if _is_vision_collator(data_collator):
         masking = getattr(data_collator, "train_on_responses_only", None)
         if callable(masking):
+            if mask_out_tokens:
+                raise ValueError(
+                    f"Unsloth: your {type(data_collator).__name__} already masks responses, so "
+                    "mask_out_tokens would be ignored. Pass it to the collator instead: "
+                    "UnslothVisionDataCollator(..., mask_out_tokens = [...])."
+                )
             return trainer  # collator already masks responses; nothing to do
         is_unsloth = any(b.__name__ == "UnslothVisionDataCollator" for b in type(data_collator).__mro__)
         if not is_unsloth:
