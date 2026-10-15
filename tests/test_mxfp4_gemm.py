@@ -64,14 +64,80 @@ def test_grouped_mm_matches_dequantize_then_matmul(transpose_b, counts):
         torch.testing.assert_close(got.float(), want, rtol = 1e-2, atol = 1e-2 * want.abs().max().item())
 
 
+def _cvt_supported():
+    import unsloth_zoo.mxfp4_gemm as mg
+    import os
+    old = os.environ.get("UNSLOTH_MXFP4_CVT")
+    os.environ["UNSLOTH_MXFP4_CVT"] = "1"
+    try:
+        return bool(mg._cvt_ok(torch.cuda.current_device()))
+    finally:
+        os.environ.pop("UNSLOTH_MXFP4_CVT") if old is None else os.environ.__setitem__("UNSLOTH_MXFP4_CVT", old)
+
+
+def _need_cvt(asm):
+    if asm == 2 and not _cvt_supported():
+        pytest.skip("hardware e2m1 convert needs sm_100+ / sm_120 and ptxas with PTX 9.2")
+
+
+def test_cvt_decode_is_bit_exact_for_every_byte_and_scale():
+    import unsloth_zoo.mxfp4_gemm as mg
+    _need_cvt(2)
+    rows = torch.arange(65536, device = "cuda")
+    blocks = (rows % 256).to(torch.uint8)[:, None].expand(65536, 16).contiguous()
+    scales = (rows // 256).to(torch.uint8)
+    got = torch.empty(65536, 32, dtype = torch.bfloat16, device = "cuda")
+    mg._decode_probe_kernel[(1024,)](blocks, scales, got, CVT = True)
+    want = mxfp4_dequantize_torch(blocks.view(65536, 1, 16), scales.view(65536, 1)).view(65536, 32)
+    # Every e8m0 incl. 255 (NaN to the cvt): bits of the reference, inf / 2^127 at 255, signed zeros kept.
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+def test_decode_mode_dispatch_and_off_switch(monkeypatch):
+    import unsloth_zoo.mxfp4_gemm as mg
+    index = torch.cuda.current_device()
+    major = torch.cuda.get_device_capability(index)[0]
+    for env, want in (("0", False), ("1", _cvt_supported()), ("auto", major == 12 and _cvt_supported())):
+        monkeypatch.setenv("UNSLOTH_MXFP4_CVT", env)
+        monkeypatch.setattr(mg, "_ASM_OK", {})
+        mode = mg._asm_ok(torch.device("cuda", index))
+        assert (mode == 2) == want and mode  # never drops below the fma decode on sm_80+
+    monkeypatch.setenv("UNSLOTH_MXFP4_ASM", "0")
+    monkeypatch.setattr(mg, "_ASM_OK", {})
+    assert mg._asm_ok(torch.device("cuda", index)) is False
+
+
+def test_cold_compiled_region_bakes_in_the_probed_decode_mode(monkeypatch):
+    # The op body is traced on FakeTensors and its ASM constexpr is frozen into the graph: probe before it.
+    import unsloth_zoo.mxfp4_gemm as mg
+    _need_cvt(2)
+    if mg.mxfp4_grouped_mm_op is None:
+        pytest.skip("needs torch.library.triton_op")
+    monkeypatch.setenv("UNSLOTH_MXFP4_CVT", "1")
+    monkeypatch.setattr(mg, "_ASM_OK", {})
+    traced, real_asm_ok = [], mg._asm_ok
+    monkeypatch.setattr(mg, "_asm_ok", lambda device, *a, **k: traced.append(real_asm_ok(device, *a, **k)) or traced[-1])
+    E, R, C = 4, 256, 256
+    blocks, scales = _stack(E, R, C, seed = 3)
+    counts = torch.full((E,), 16, dtype = torch.int32, device = "cuda")
+    x = torch.randn(64, C, dtype = torch.bfloat16, device = "cuda")
+    torch._dynamo.reset()
+    got = torch.compile(lambda t: mg.mxfp4_grouped_mm_compiled(t, blocks, scales, counts, True), fullgraph = True)(x)
+    torch._dynamo.reset()
+    assert traced and all(mode == 2 for mode in traced), traced
+    want = _reference(x, mxfp4_dequantize_torch(blocks, scales), counts, True)
+    torch.testing.assert_close(got.float(), want, rtol = 1e-2, atol = 1e-2 * want.abs().max().item())
+
+
 @pytest.mark.parametrize("big_tiles", [True, False])
-@pytest.mark.parametrize("asm", [True, False])
+@pytest.mark.parametrize("asm", [2, True, False])
 @pytest.mark.parametrize("E,M_per_expert", [(4, 1), (4, 12), (4, 40), (4, 80), (4, 150), (4, 300), (300, 1), (300, 3)])
 def test_every_tile_config_matches(E, M_per_expert, asm, big_tiles, monkeypatch):
     import unsloth_zoo.mxfp4_gemm as mg
     from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm
     if big_tiles and not mg._big_tiles(torch.device("cuda", torch.cuda.current_device())):
         pytest.skip("the B200 tile table only runs on sm_100 (256x256 overflows smaller shared memory)")
+    _need_cvt(asm)
     monkeypatch.setattr(mg, "_ASM_OK", {k: asm for k in (None, 0, torch.cuda.current_device())})
     monkeypatch.setattr(mg, "_BIG_TILES", {k: big_tiles for k in (None, 0, torch.cuda.current_device())})
     R, C = (320, 192) if E < 256 else (64, 64)
@@ -134,10 +200,11 @@ def _single(N, K, seed, lo = 118, hi = 130):
     return blocks[0], scales[0]
 
 
-@pytest.mark.parametrize("asm", [True, False])
+@pytest.mark.parametrize("asm", [2, True, False])
 def test_single_weight_decode_is_bit_exact_for_every_scale(asm, monkeypatch):
-    """Identity input makes every output one exact product: both decoders must equal mxfp4_dequant bit for bit."""
+    """Identity input makes every output one exact product: every decoder must equal mxfp4_dequant bit for bit."""
     import unsloth_zoo.mxfp4_gemm as mg
+    _need_cvt(asm)
     monkeypatch.setattr(mg, "_ASM_OK", {k: asm for k in (None, 0, torch.cuda.current_device())})
     # Rows scaled by >= 2^127 keep only |v| <= 0.5 so every value stays finite.
     small = torch.tensor([0, 1, 8, 9], dtype = torch.uint8, device = "cuda")
@@ -189,10 +256,11 @@ def test_fused_gemm_off_switch(monkeypatch):
     assert not mxfp4_gemm_available(torch.device("cuda"), torch.bfloat16)
 
 
-@pytest.mark.parametrize("asm", [True, False])
+@pytest.mark.parametrize("asm", [2, True, False])
 @pytest.mark.parametrize("E,rows", [(8, 1), (8, 4), (32, 16), (300, 12)])
 def test_decode_rows_take_the_grouped_gemv(E, rows, asm, monkeypatch):
     import unsloth_zoo.mxfp4_gemm as mg
+    _need_cvt(asm)
     from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm
     monkeypatch.setattr(mg, "_ASM_OK", {k: asm for k in (None, 0, torch.cuda.current_device())})
     launched = []

@@ -86,11 +86,11 @@ def keep_mxfp4_experts_packed() -> bool:
         return False
     try:
         # Only grouped_mm reads experts through _get_base_weight; loop and Triton index the stack.
-        from .moe_utils import select_moe_backend
+        from .moe_utils import select_moe_backend_for_interleaved_gate_up
         import transformers.models.gpt_oss.modeling_gpt_oss as modeling_gpt_oss
         if not getattr(modeling_gpt_oss.GptOssExperts, "_unsloth_lora_patched", False):
             return False
-        if select_moe_backend() != "grouped_mm":
+        if select_moe_backend_for_interleaved_gate_up() != "grouped_mm":
             return False
     except Exception:
         return False

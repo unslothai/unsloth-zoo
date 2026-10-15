@@ -74,26 +74,57 @@ def get_max_flat_qlen(
 pass
 
 
-def _default_target_gb():
+def _default_target_gb(device = None):
     # Size the tile memory budget from the free memory actually available on the
     # current backend, so a device with little memory left does not pick chunks
     # that immediately OOM. Mirror the CUDA path: query free memory and keep half.
+    # None means the current device, never index 0: under torchrun asking GPU 0
+    # reads the wrong card and opens a CUDA context on a GPU the rank never uses.
+    index = None
+    if device is not None:
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+        if device.type in ("cpu", "meta", "mps"):
+            return _host_target_gb()
+        index = device.index
     if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
         # torch.cuda.mem_get_info also covers ROCm (PyTorch aliases the cuda API).
-        return torch.cuda.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+        free = torch.cuda.mem_get_info(index)[0] + _cached_unused_bytes(torch.cuda, index)
+        return free / 1024 / 1024 / 1024 * 0.5
     if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
         # Present from torch 2.6, but raises on some Intel GPUs (e.g. Arc B580,
         # Lunar Lake). When the accelerator cannot report free memory, use a small
         # bounded default: host RAM would overshoot VRAM and still OOM the tiler.
         try:
-            return torch.xpu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+            free = torch.xpu.mem_get_info(index)[0] + _cached_unused_bytes(torch.xpu, index)
+            return free / 1024 / 1024 / 1024 * 0.5
         except Exception:
             return 4.0
     if DEVICE_TYPE == "npu" and hasattr(torch, "npu"):
         try:
-            return torch.npu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+            free = torch.npu.mem_get_info(index)[0] + _cached_unused_bytes(torch.npu, index)
+            return free / 1024 / 1024 / 1024 * 0.5
         except Exception:
             return 4.0
+    return _host_target_gb()
+pass
+
+def _cached_unused_bytes(backend, index):
+    # Blocks the caching allocator holds but has not handed out are free to reuse.
+    # memory_reserved + memory_allocated each flatten the whole stats dict (~100 us apiece);
+    # the fused CE asks on every forward, so read the nested dict once.
+    try:
+        stats = backend.memory_stats_as_nested_dict(index)
+        value = stats["reserved_bytes"]["all"]["current"] - stats["allocated_bytes"]["all"]["current"]
+    except Exception:
+        try:
+            value = backend.memory_reserved(index) - backend.memory_allocated(index)
+        except Exception:
+            return 0
+    return value if isinstance(value, int) and value > 0 else 0
+pass
+
+def _host_target_gb():
     # CPU / MPS / unified-memory backends: activations live in host RAM, budget from it.
     try:
         import psutil
@@ -263,8 +294,10 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
     mlp_module._unsloth_forward = forward
 
 
+    # Per device: device_map can place layers on different GPUs.
+    auto_target_gb = {}
+
     def tiled_forward_target_gb(self, x):
-        nonlocal target_gb
         bsz, qlen, hd = x.shape
         flat_qlen = bsz*qlen
         try:
@@ -274,14 +307,17 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
         except:
             intermediate_size = hd * 4
 
-        if target_gb is None:
-            target_gb = _default_target_gb()
+        budget_gb = target_gb
+        if budget_gb is None:
+            budget_gb = auto_target_gb.get(x.device)
+            if budget_gb is None:
+                budget_gb = auto_target_gb[x.device] = _default_target_gb(x.device)
 
         max_flat_qlen = get_max_flat_qlen(
             hd = hd,
             mlp_size = intermediate_size,
             nbytes = x.element_size(),
-            target_gb = target_gb,
+            target_gb = budget_gb,
             padded_length = padded_length,
         )
         n_shards, remainder = divmod(flat_qlen, max_flat_qlen)
