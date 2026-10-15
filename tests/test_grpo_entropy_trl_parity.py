@@ -202,6 +202,22 @@ def test_bonus_weights_follow_trl_1_8_and_1_9_for_token_sum_losses(loss_type):
     )
 
 
+def test_bonus_weights_do_not_divide_by_accumulation_in_eval():
+    # TRL scales the bonus by current_gradient_accumulation_steps only when model.training.
+    gen = torch.Generator().manual_seed(5)
+    mask = (torch.rand(3, 7, generator = gen) > 0.3).long()
+    for trl_version in ("1.10.0", "1.8.0"):
+        kwargs = dict(loss_type = "grpo", current_gradient_accumulation_steps = 4, num_items_in_batch = torch.tensor(9.0))
+        train = rr.grpo_entropy_bonus_weights(mask, None, 0.2, kwargs, trl_version = trl_version)
+        evaluation = rr.grpo_entropy_bonus_weights(mask, None, 0.2, kwargs, trl_version = trl_version, training = False)
+        torch.testing.assert_close(evaluation, train * 4)
+        torch.testing.assert_close(
+            evaluation.sum(), torch.tensor(-0.2, dtype = evaluation.dtype),
+        )
+    source = inspect.getsource(rr.grpo_accumulated_loss)
+    assert "training = _training" in source
+
+
 def test_bonus_gradient_ignores_grad_output_like_the_policy_term():
     entropies = torch.rand(2, 3, dtype = torch.float64, requires_grad = True)
     weights = torch.rand(2, 3, dtype = torch.float64)

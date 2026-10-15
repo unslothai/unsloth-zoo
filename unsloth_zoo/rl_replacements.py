@@ -1112,7 +1112,7 @@ pass
 RL_REPLACEMENTS["UnslothGRPOEntropyBonus"] = UnslothGRPOEntropyBonus
 
 
-def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss_kwargs, trl_version = None):
+def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss_kwargs, trl_version = None, training = True):
     """Per-token weights w with sum(w * entropies) == -entropy_coef * TRL's entropy_loss.
 
     TRL >= 1.10: the mean entropy over the tokens the policy term acts on, divided by the
@@ -1139,10 +1139,9 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
         else:
             normalizer = max(float(num_items_in_batch), 1.0) / loss_kwargs.get("num_processes", 1)
         return weights * (-entropy_coef / normalizer)
-    return weights * (
-        -entropy_coef / weights.sum().clamp(min = 1.0)
-        / loss_kwargs.get("current_gradient_accumulation_steps", 1)
-    )
+    # Unsloth before #11337 passes the training window's accumulation steps into eval too.
+    accumulation_steps = loss_kwargs.get("current_gradient_accumulation_steps", 1) if training else 1
+    return weights * (-entropy_coef / weights.sum().clamp(min = 1.0) / accumulation_steps)
 pass
 RL_REPLACEMENTS["grpo_entropy_bonus_weights"] = grpo_entropy_bonus_weights
 
@@ -2651,7 +2650,9 @@ def grpo_accumulated_loss(
                 upstream_scale,
             )
         if _entropy_bonus_on:
-            _entropy_weights = _grpo_entropy_bonus_weights(completion_mask, entropy_mask, _entropy_coef, kwargs)
+            _entropy_weights = _grpo_entropy_bonus_weights(
+                completion_mask, entropy_mask, _entropy_coef, kwargs, training = _training,
+            )
             _scaler = trainer.accelerator.scaler
             loss = loss + _UnslothGRPOEntropyBonus.apply(
                 new_entropies, _entropy_weights.to(new_entropies.device),
