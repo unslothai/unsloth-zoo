@@ -1290,7 +1290,8 @@ def _merge_and_overwrite_lora(
                             saved_weight = lora_stats.module.weight
                         if saved_weight is not None:
                             target_dtype = output_dtype if output_dtype is not None else W_original_dtype
-                            W = saved_weight.to(W.device, dtype = target_dtype, non_blocking = True)
+                            # Blocking: an async D2H copy into pinned memory is read by the mmap write before it lands.
+                            W = saved_weight.to(W.device, dtype = target_dtype)
                             count += 1
                     elif hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                         W = _merge_lora(W, lora_stats, output_key, use_dequant_base = use_dequant_base)
@@ -2669,7 +2670,6 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     W = saved_weight.to(
                         W.device,
                         dtype = output_dtype if output_dtype is not None else W.dtype,
-                        non_blocking = True,
                     )
                     count += 1
                     action_logged = True
@@ -5966,7 +5966,7 @@ def merge_and_dequantize_lora(
             DEQUANTIZED_KEYS.append(name)
             W = dequantize_module_weight(x.module)
             W = _merge_lora(W, x, name)
-            x = W.to(device = 'cpu', dtype = {str(output_dtype)}, non_blocking = True)
+            x = W.to(device = 'cpu', dtype = {str(output_dtype)})
         # Remove memory leak
         state_dict[name] = None
         return x
