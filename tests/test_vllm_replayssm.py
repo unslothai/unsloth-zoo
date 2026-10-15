@@ -109,6 +109,8 @@ def test_requested_only_for_engines_load_vllm_builds():
     src = ast.get_source_segment(VLLM_UTILS.read_text(encoding = "utf-8-sig"), fn)
     assert "_vllm_replayssm_mode()" in src
     assert '"VLLM_USE_V2_MODEL_RUNNER" not in os.environ' in src
+    # Gated DeltaNet stays opt-in: auto mode must not request it.
+    assert 'replayssm_mode == "auto" and replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES' in src
 
 
 # Drift guards against the installed vLLM, run whenever it has the engine arg load_vllm keys on.

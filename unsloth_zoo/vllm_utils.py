@@ -3394,7 +3394,8 @@ _REPLAYSSM_MAMBA2_MODELS = {
     "mamba2": ("mamba2", "Mamba2ForCausalLM", "n_groups"),
 }
 # Gated DeltaNet (Qwen3.5 / Qwen3.6 / Qwen3-Next): vLLM has no GDN ReplaySSM yet, so
-# unsloth_zoo.vllm_gdn_replayssm backports it. Top-level and nested text model types.
+# unsloth_zoo.vllm_gdn_replayssm backports it; opt-in only (UNSLOTH_VLLM_REPLAYSSM=1).
+# Top-level and nested text model types.
 _REPLAYSSM_GDN_MODEL_TYPES = (
     "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
 )
@@ -4477,9 +4478,13 @@ def load_vllm(
         # A runner the user forced to V2 would only get the engine refused and rebuilt.
         if replayssm_mode == "auto" and os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip().lower() in ("1", "true"):
             replayssm_mode = "off"
+        replayssm_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+        # GDN is opt-in: vLLM 0.31 runs ReplaySSM on Model Runner V1 only, which for Qwen3.5
+        # costs more than the ring saves on A100 (0.68x at 64 sequences; +2-6% on Blackwell).
+        if replayssm_mode == "auto" and replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES:
+            replayssm_mode = "off"
         if replayssm_mode != "off":
             replayssm_skip = _vllm_replayssm_skip_reason(config, good_keys, DEVICE_TYPE)
-            replayssm_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
             if replayssm_skip is None and not (
                 _patch_vllm_replayssm_mamba2(replayssm_type) if replayssm_type in _REPLAYSSM_MAMBA2_MODELS
                 else _patch_vllm_replayssm_gdn() if replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES
