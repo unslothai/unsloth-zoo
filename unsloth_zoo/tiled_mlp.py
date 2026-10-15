@@ -111,10 +111,16 @@ pass
 
 def _cached_unused_bytes(backend, index):
     # Blocks the caching allocator holds but has not handed out are free to reuse.
+    # memory_reserved + memory_allocated each flatten the whole stats dict (~100 us apiece);
+    # the fused CE asks on every forward, so read the nested dict once.
     try:
-        value = backend.memory_reserved(index) - backend.memory_allocated(index)
+        stats = backend.memory_stats_as_nested_dict(index)
+        value = stats["reserved_bytes"]["all"]["current"] - stats["allocated_bytes"]["all"]["current"]
     except Exception:
-        return 0
+        try:
+            value = backend.memory_reserved(index) - backend.memory_allocated(index)
+        except Exception:
+            return 0
     return value if isinstance(value, int) and value > 0 else 0
 pass
 

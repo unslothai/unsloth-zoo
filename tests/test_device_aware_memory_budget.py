@@ -192,3 +192,29 @@ def test_tiled_mlp_budget_follows_the_input_device(monkeypatch):
     mlp(x).sum().backward()
     mlp(x).sum().backward()
     assert seen == [x.device], seen
+
+
+def test_reusable_cache_is_read_from_one_stats_snapshot():
+    # memory_reserved / memory_allocated each rebuild the flat stats dict (~100 us apiece);
+    # the fused CE re-measures every forward, so one nested-dict read must be used when present.
+    _, tiled = _modules()
+    calls = []
+
+    class Backend:
+        def memory_stats_as_nested_dict(self, index = None):
+            calls.append(("nested", index))
+            return {
+                "reserved_bytes" : {"all": {"current": 10 * GIB}},
+                "allocated_bytes": {"all": {"current": 4 * GIB}},
+            }
+
+        def memory_reserved(self, index = None):
+            calls.append(("reserved", index))
+            return 10 * GIB
+
+        def memory_allocated(self, index = None):
+            calls.append(("allocated", index))
+            return 4 * GIB
+
+    assert tiled._cached_unused_bytes(Backend(), 1) == 6 * GIB
+    assert calls == [("nested", 1)], calls
