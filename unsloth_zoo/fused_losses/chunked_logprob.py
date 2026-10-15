@@ -48,13 +48,18 @@ def _env_float(name, default):
 # fp32 work, so 8 bytes per logit covers the eager fallback's fp32 temporaries too.
 _BYTES_PER_LOGIT = 8.0
 _CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 2.0)
+_MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 
 
-def chunked_logprob_rows(vocab_size, target_gb = None):
-    """Rows per chunk so that one chunk's logits stay near `target_gb`. At least 2: a one-row head gradient is a K=1
-    matmul Inductor mis-lowers under dynamic shapes (see chunked_hidden_states_selective_log_softmax)."""
+def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None):
+    """Rows per chunk so that one chunk's logits stay near `target_gb`, and with `n_rows` at most an eighth of them
+    (min `UNSLOTH_LOGPROB_MIN_ROWS`, 512), so a short batch is not projected in one or two
+    near-full chunks. At least 2: a one-row head gradient
+    is a K=1 matmul Inductor mis-lowers under dynamic shapes (see chunked_hidden_states_selective_log_softmax)."""
     target_gb = _CHUNK_GB if target_gb is None else target_gb
     rows = int(target_gb * (1024**3) / (max(int(vocab_size), 1) * _BYTES_PER_LOGIT))
+    if n_rows is not None:
+        rows = min(rows, max(_MIN_ROWS, -(-int(n_rows) // 8)))
     return max(rows, 2)
 
 
@@ -264,7 +269,7 @@ def unsloth_chunked_logprobs(
     hidden = hidden_states.reshape(-1, hidden_states.shape[-1]).to(lm_head.device)
     targets = index.reshape(-1).to(lm_head.device)
     if rows_per_chunk is None:
-        rows_per_chunk = chunked_logprob_rows(lm_head.shape[0])
+        rows_per_chunk = chunked_logprob_rows(lm_head.shape[0], n_rows = hidden.shape[0])
     logps, mean_logits = UnslothChunkedLogProbs.apply(
         hidden, lm_head, lm_head_bias, targets, int(rows_per_chunk), float(temperature),
         float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
@@ -383,7 +388,7 @@ def unsloth_chunked_ce_loss(
     # Only labelled rows reach the head: completion-only training skips the prompt's projection entirely.
     hidden = hidden[keep.to(hidden.device)].to(device)
     if rows_per_chunk is None:
-        rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0])
+        rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0], n_rows = hidden.shape[0])
     return UnslothChunkedCE.apply(
         hidden, lm_head_weight, lm_head_bias, labels[keep], divisor, 1.0 if scaling is None else float(scaling),
         int(rows_per_chunk), float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0),
