@@ -251,8 +251,7 @@ def _mxfp4_instance_forward(mlp_module):
 
 _DROPOUT_TYPES = (getattr(torch.nn.modules.dropout, "_DropoutNd", torch.nn.Dropout),)
 
-# Bumped whenever any submodule is registered anywhere (PEFT injecting LoRA layers and
-# their lora_dropout included), so the per-MLP dropout list below is rebuilt only then.
+# Bumped on any submodule registration (e.g. PEFT adding lora_dropout) to invalidate dropout lists.
 _MODULE_TREE_VERSION = [0]
 
 def _bump_module_tree_version(module, name, submodule):
@@ -268,10 +267,8 @@ except Exception:
 pass
 
 def _mlp_needs_rng_state(mlp_module):
-    # Decided per forward, not when patching: unsloth patches inside from_pretrained,
-    # before get_peft_model adds lora_dropout, so a patch time scan saw no dropout and
-    # the backward recompute drew different masks than the forward (wrong gradients).
-    # Only an active dropout with p > 0 draws random numbers.
+    # Per forward, not at patch time: unsloth patches before get_peft_model adds lora_dropout,
+    # so a patch time scan missed it and the recompute drew different masks (wrong grads).
     cached = mlp_module.__dict__.get("_unsloth_tiled_dropouts")
     if cached is None or not _HAS_MODULE_TREE_VERSION or cached[0] != _MODULE_TREE_VERSION[0]:
         dropouts = tuple(m for m in mlp_module.modules() if isinstance(m, _DROPOUT_TYPES))
