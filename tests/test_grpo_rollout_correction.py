@@ -402,3 +402,12 @@ def test_reversed_or_empty_is_clip_override_is_rejected(monkeypatch, spec):
         _drive(monkeypatch, correction = True, is_mode = "token_truncate")
     monkeypatch.setenv("UNSLOTH_GRPO_VLLM_IS_CLIP", "0.5_2")
     _drive(monkeypatch, correction = True, is_mode = "token_truncate")
+
+
+@pytest.mark.parametrize("options, thresholds", [
+    ("token_k3", "nan"), ("token_k3", "inf"), ("token_k1", "nan"),
+    ("token_k1", "nan_2"), ("token_k1", "0.5_nan"), ("seq_mean_k1", "0.5_inf"),
+])
+def test_rollout_rs_rejects_non_finite_thresholds(options, thresholds):
+    with pytest.raises(ValueError, match = "finite"):
+        rr.grpo_parse_rollout_rs(options, thresholds)

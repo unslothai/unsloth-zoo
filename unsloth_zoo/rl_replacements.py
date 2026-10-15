@@ -1773,15 +1773,15 @@ def grpo_parse_rollout_rs(options, thresholds):
             else:
                 upper = float(spec)
                 lower = 1.0 / upper
-            if lower <= 0 or upper <= 0 or lower > upper:
-                raise ValueError(f"Unsloth: rollout rejection bounds for {name} must be 0 < lower <= upper, got {spec}.")
+            if not (0 < lower <= upper < math.inf):
+                raise ValueError(f"Unsloth: rollout rejection bounds for {name} must be finite with 0 < lower <= upper, got {spec}.")
             parsed.append((name, math.log(lower), math.log(upper)))
         else:
             if "_" in spec:
                 raise ValueError(f"Unsloth: {name} takes a single upper bound, got {spec}.")
             upper = float(spec)
-            if upper <= 0:
-                raise ValueError(f"Unsloth: rollout rejection threshold for {name} must be positive, got {spec}.")
+            if not (0 < upper < math.inf):
+                raise ValueError(f"Unsloth: rollout rejection threshold for {name} must be positive and finite, got {spec}.")
             parsed.append((name, None, upper))
     return tuple(parsed)
 pass
