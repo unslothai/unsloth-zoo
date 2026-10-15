@@ -304,3 +304,23 @@ def test_dpo_policy_equals_reference_is_log2_and_precomputed_matches():
         states, weight, None, labels, mask, ref_chosen_logps = ref[:2], ref_rejected_logps = ref[2:],
     )
     torch.testing.assert_close(loss2, loss, rtol = 0, atol = 1e-13)
+
+
+def test_alphapo_and_discopop_stay_finite_on_long_completions():
+    # float32: exp(-200) underflows (AlphaPO) and exp(150) overflows against a zero modulation (DiscoPOP).
+    chosen = torch.tensor([-200.0, -2.0], requires_grad = True)
+    rejected = torch.tensor([-210.0, -3.0], requires_grad = True)
+    for alpha in (0.1, -0.2):
+        losses = cpo_preference_loss(chosen, rejected, loss_type = "sigmoid", beta = 0.1, alpha = alpha)[0]
+        grads = torch.autograd.grad(losses.sum(), (chosen, rejected))
+        assert torch.isfinite(losses).all() and all(torch.isfinite(g).all() for g in grads)
+        exact = cpo_preference_loss(chosen.double(), rejected.double(), loss_type = "sigmoid", beta = 0.1, alpha = alpha)[0]
+        torch.testing.assert_close(losses, exact.float())
+    zeros = torch.zeros(2)
+    chosen = torch.tensor([-1600.0, -2.0], requires_grad = True)
+    rejected = torch.tensor([-100.0, -3.0], requires_grad = True)
+    losses = dpo_preference_loss(chosen, rejected, zeros, zeros, loss_type = "discopop", beta = 0.1)[0]
+    grads = torch.autograd.grad(losses.sum(), (chosen, rejected))
+    assert torch.isfinite(losses).all() and all(torch.isfinite(g).all() for g in grads)
+    exact = dpo_preference_loss(chosen.double(), rejected.double(), zeros.double(), zeros.double(), loss_type = "discopop", beta = 0.1)[0]
+    torch.testing.assert_close(losses, exact.float())

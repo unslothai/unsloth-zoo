@@ -328,7 +328,8 @@ def dpo_preference_loss(
     elif loss_type == "discopop":
         scaled = (logratios - (ref_chosen_logps - ref_rejected_logps)) * beta
         modulation = torch.sigmoid(scaled / discopop_tau)
-        losses = -F.logsigmoid(scaled) * (1 - modulation) + torch.exp(-scaled) * modulation
+        # TRL's exp(-scaled) * modulation is inf * 0 = NaN once scaled < ~-89 in float32.
+        losses = -F.logsigmoid(scaled) * (1 - modulation) + torch.exp(F.logsigmoid(scaled / discopop_tau) - scaled)
     else:
         raise ValueError(f"Unsloth: unknown DPO loss_type {loss_type!r}; expected one of {DPO_LOSS_TYPES}.")
 
@@ -365,8 +366,9 @@ def cpo_preference_loss(
 ):
     """TRL ``CPOTrainer.cpo_loss`` (``loss_type="simpo"`` with ``cpo_alpha=0`` is SimPO)."""
     if alpha != 0.0:
-        chosen_scores = (1 - torch.exp(chosen_logps).pow(-alpha)) / alpha
-        rejected_scores = (1 - torch.exp(rejected_logps).pow(-alpha)) / alpha
+        # TRL's (1 - exp(logps) ** -alpha) / alpha, without exp(logps) underflowing to 0 on long completions.
+        chosen_scores = -torch.expm1(-alpha * chosen_logps) / alpha
+        rejected_scores = -torch.expm1(-alpha * rejected_logps) / alpha
     else:
         chosen_scores, rejected_scores = chosen_logps, rejected_logps
     logits = chosen_scores - rejected_scores
