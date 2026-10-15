@@ -820,8 +820,114 @@ def _take_prefetched(device_index, generation, cpu_index, buffer_slot):
     return False
 pass
 
+class _PerDeviceSlots(list):
+    """One slot per visible device, created on first access to that device.
+
+    Eager allocation on every GPU made each torchrun rank open a context on every card.
+    Iteration yields None for untouched devices and never allocates.
+    """
+    def __init__(self, n, factory):
+        super().__init__([None] * n)
+        self._factory = factory
+
+    def __getitem__(self, index):
+        value = list.__getitem__(self, index)
+        if value is None and isinstance(index, int):
+            value = self._factory(index)
+            list.__setitem__(self, index, value)
+        return value
+pass
+
+
+def _allocated_slots(slots):
+    """Slots already created, without creating the rest."""
+    if slots is None: return []
+    return [x for x in slots if x is not None]
+pass
+
+
+def _free_gpu_buffers_b():
+    """Release buffer B on every device that has one and turn double buffering off."""
+    global GPU_BUFFERS_B
+    global USE_DOUBLE_BUFFER
+    for buffer in _allocated_slots(GPU_BUFFERS_B):
+        if hasattr(buffer, "resize_"): buffer.resize_(0)
+    GPU_BUFFERS_B = None
+    USE_DOUBLE_BUFFER = False
+pass
+
+
+def _new_gpu_buffer(device_index):
+    with _no_inference_mode():
+        return torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = GPU_BUFFER_DTYPE, device = f"{DEVICE_TYPE_TORCH}:{device_index}")
+pass
+
+
+def _new_extra_stream(device_index):
+    # A bare Stream() lands on the current device, so create each card's side stream on that card
+    if DEVICE_TYPE == "npu":
+        return torch.npu.Stream(device = device_index)
+    elif DEVICE_TYPE_TORCH == "cuda":
+        return torch.cuda.Stream(device = torch.device(f"cuda:{device_index}"))
+    return torch.xpu.Stream(device = torch.device(f"xpu:{device_index}"))
+pass
+
+
+def _main_stream(device_index):
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.default_stream(torch.device(f"cuda:{device_index}"))
+    elif DEVICE_TYPE == "xpu":
+        return torch.xpu.current_stream(torch.device(f"xpu:{device_index}"))
+    return torch.npu.default_stream(device_index)
+pass
+
+
+def _ensure_device_buffers(device_index):
+    """Create this device's staging buffer(s) and side stream before the offload uses them."""
+    try:
+        GPU_BUFFERS[device_index]
+    except Exception as e:
+        if "out of memory" not in str(e).lower():
+            print("="*10 + "\n")
+            print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
+            print("Please set `import os; os.environ['PYTORCH_CUDA_ALLOC_CONF'] = '';`\n")
+            print("Then re-run Unsloth from the start.")
+            print("="*10 + "\n")
+        raise
+    EXTRA_STREAMS[device_index]
+    if GPU_BUFFERS_B is not None:
+        try:
+            GPU_BUFFERS_B[device_index]
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            _free_gpu_buffers_b()
+pass
+
+
+def _visible_device_count():
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.device_count()
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.device_count()
+    return torch.xpu.device_count()
+pass
+
+
+def _double_buffer_event_ctor():
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.Event
+    elif DEVICE_TYPE == "xpu":
+        return torch.xpu.Event
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.Event
+    raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
+pass
+
+
 CPU_BUFFERS = []
 CPU_INDEX = None
+GPU_BUFFER_DTYPE = None
 
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -878,69 +984,29 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             CPU_BUFFERS.append(x)
     pass
 
-    # Allocate one buffer per GPU
-    if DEVICE_TYPE in ("cuda", "hip"):
-        n_gpus = torch.cuda.device_count()
-    elif DEVICE_TYPE == "npu":
-        n_gpus = torch.npu.device_count()
-    else:
-        n_gpus = torch.xpu.device_count()
+    global GPU_BUFFER_DTYPE
+    GPU_BUFFER_DTYPE = dtype
+    n_gpus = _visible_device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
-    try:
-        with _no_inference_mode():
-            GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-        # Double buffering: try to allocate buffer B (auto-off on unified memory, or via env var)
-        if _double_buffer_disabled():
-            GPU_BUFFERS_B = None
-            USE_DOUBLE_BUFFER = False
-            BUFFER_EVENTS_A = None
-            BUFFER_EVENTS_B = None
-        else:
-            try:
-                with _no_inference_mode():
-                    GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-                USE_DOUBLE_BUFFER = False # enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
-                # Per-buffer events prevent double-buffering races; each tracks
-                # when compute on that buffer finishes
-                if DEVICE_TYPE in ("cuda", "hip"):
-                    event_ctor = torch.cuda.Event
-                elif DEVICE_TYPE == "xpu":
-                    event_ctor = torch.xpu.Event
-                elif DEVICE_TYPE == "npu":
-                    event_ctor = torch.npu.Event
-                else:
-                    raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
-                BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
-                BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
-            except RuntimeError as e:
-                if "out of memory" not in str(e).lower():
-                    raise
-                GPU_BUFFERS_B = None
-                USE_DOUBLE_BUFFER = False
-                BUFFER_EVENTS_A = None
-                BUFFER_EVENTS_B = None
-    except Exception as e:
-        print("="*10 + "\n")
-        print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
-        print("Please set `import os; os.environ['PYTORCH_CUDA_ALLOC_CONF'] = '';`\n")
-        print("Then re-run Unsloth from the start.")
-        print("="*10 + "\n")
-        raise
+    GPU_BUFFERS = _PerDeviceSlots(n_gpus, _new_gpu_buffer)
+    # Double buffering: auto-off on unified memory, or via env var
+    if _double_buffer_disabled():
+        GPU_BUFFERS_B = None
+        USE_DOUBLE_BUFFER = False
+        BUFFER_EVENTS_A = None
+        BUFFER_EVENTS_B = None
+    else:
+        GPU_BUFFERS_B = _PerDeviceSlots(n_gpus, _new_gpu_buffer)
+        USE_DOUBLE_BUFFER = False # enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
+        # Per-buffer events prevent double-buffering races; each tracks
+        # when compute on that buffer finishes. Bound to a device on first record.
+        event_ctor = _double_buffer_event_ctor()
+        BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
+        BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
 
     BACKWARD_PASS = True
-    # A bare Stream() lands on the current device, so create each card's side stream on that card
-    if DEVICE_TYPE == "npu":
-        EXTRA_STREAMS = tuple([torch.npu.Stream(device = i) for i in range(n_gpus)])
-    elif DEVICE_TYPE_TORCH == "cuda":
-        EXTRA_STREAMS = tuple([torch.cuda.Stream(device = torch.device(f"cuda:{i}")) for i in range(n_gpus)])
-    else:
-        EXTRA_STREAMS = tuple([torch.xpu.Stream(device = torch.device(f"xpu:{i}")) for i in range(n_gpus)])
-    if DEVICE_TYPE in ("cuda", "hip"):
-        MAIN_STREAMS  = tuple([torch.cuda.default_stream(torch.device(f"cuda:{i}")) for i in range(n_gpus)])
-    elif DEVICE_TYPE == "xpu":
-        MAIN_STREAMS  = tuple([torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)])
-    elif DEVICE_TYPE == "npu":
-        MAIN_STREAMS  = tuple([torch.npu.default_stream(i) for i in range(n_gpus)])
+    EXTRA_STREAMS = _PerDeviceSlots(n_gpus, _new_extra_stream)
+    MAIN_STREAMS  = _PerDeviceSlots(n_gpus, _main_stream)
 
     # Minimum size to enable Unsloth GC is 2MB (in bytes) -> 32 layers = 64MB
     MINIMUM_SIZE = 2 * 1024 * 1024
@@ -1036,6 +1102,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         global MAIN_STREAMS
                         device = arg.device
                         device_index = device.index
+                        _ensure_device_buffers(device_index)
                         GPU_BUFFER   = GPU_BUFFERS  [device_index]
                         MAIN_STREAM  = _compute_stream(device_index)
                         EXTRA_STREAM = EXTRA_STREAMS[device_index]
@@ -1064,9 +1131,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     USE_DOUBLE_BUFFER = True
                                     print(f"Unsloth: Double buffering enabled (parallel H2D + compute) for backward pass.")
                                 else:
-                                    for j in range(len(GPU_BUFFERS_B)):
-                                        GPU_BUFFERS_B[j].resize_(0)
-                                    GPU_BUFFERS_B = None
+                                    _free_gpu_buffers_b()
                         pass
 
                         # Extend buffer size
@@ -1094,10 +1159,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     raise
                                 # Clear buffer B and resize the single buffer
                                 if GPU_BUFFERS_B is not None:
-                                    USE_DOUBLE_BUFFER = False
-                                    for j in range(len(GPU_BUFFERS_B)):
-                                        GPU_BUFFERS_B[j].resize_(0)
-                                    GPU_BUFFERS_B = None
+                                    _free_gpu_buffers_b()
                                     print("Unsloth: Disabled double buffering due to insufficient VRAM.")
                                     GPU_BUFFER.resize_(gpu_numel)
                                 else:
@@ -1112,10 +1174,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                 except RuntimeError as e:
                                     if "out of memory" not in str(e).lower():
                                         raise
-                                    USE_DOUBLE_BUFFER = False
-                                    for j in range(len(GPU_BUFFERS_B)):
-                                        GPU_BUFFERS_B[j].resize_(0)
-                                    GPU_BUFFERS_B = None
+                                    _free_gpu_buffers_b()
                                     print("Unsloth: Disabled double buffering due to insufficient VRAM.")
 
                         # Read the cached flag off the slot itself, before the view is
@@ -1458,14 +1517,11 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         for i in range(len(CPU_BUFFERS)):
             if hasattr(CPU_BUFFERS[i], "resize_"): CPU_BUFFERS[i].resize_(0)
             if type(CPU_BUFFERS) is list: CPU_BUFFERS[i] = None
-        for i in range(len(GPU_BUFFERS)):
-            if hasattr(GPU_BUFFERS[i], "resize_"): GPU_BUFFERS[i].resize_(0)
-            if type(GPU_BUFFERS) is list: GPU_BUFFERS[i] = None
+        # Only devices that were used: indexing an untouched slot would allocate it.
+        for buffer in _allocated_slots(GPU_BUFFERS):
+            if hasattr(buffer, "resize_"): buffer.resize_(0)
         if GPU_BUFFERS_B is not None:
-            for i in range(len(GPU_BUFFERS_B)):
-                if hasattr(GPU_BUFFERS_B[i], "resize_"): GPU_BUFFERS_B[i].resize_(0)
-            GPU_BUFFERS_B = None
-            USE_DOUBLE_BUFFER = False
+            _free_gpu_buffers_b()
         CPU_BUFFERS = None
         GPU_BUFFERS = None
         BUFFER_EVENTS_A = None
@@ -1544,9 +1600,9 @@ def reset_unsloth_gradient_checkpointing_buffers():
     pass
 
     # Reset GPU buffers to initial size
-    for i in range(len(GPU_BUFFERS)):
-        if GPU_BUFFERS[i] is not None and hasattr(GPU_BUFFERS[i], "resize_"):
-            GPU_BUFFERS[i].resize_(INITIAL_GPU_BUFFER_SIZE)
+    for buffer in _allocated_slots(GPU_BUFFERS):
+        if hasattr(buffer, "resize_"):
+            buffer.resize_(INITIAL_GPU_BUFFER_SIZE)
     pass
 
     # Reset state for a fresh training run
@@ -1564,30 +1620,21 @@ def reset_unsloth_gradient_checkpointing_buffers():
     # Reset double buffering if buffer B still exists, or try to re-allocate
     if _double_buffer_disabled():
         if GPU_BUFFERS_B is not None:
-            for i in range(len(GPU_BUFFERS_B)):
-                if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
-                    GPU_BUFFERS_B[i].resize_(0)
-            GPU_BUFFERS_B = None
+            _free_gpu_buffers_b()
         USE_DOUBLE_BUFFER = False
     elif GPU_BUFFERS_B is not None:
-        for i in range(len(GPU_BUFFERS_B)):
-            if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
-                GPU_BUFFERS_B[i].resize_(INITIAL_GPU_BUFFER_SIZE)
+        for buffer in _allocated_slots(GPU_BUFFERS_B):
+            if hasattr(buffer, "resize_"):
+                buffer.resize_(INITIAL_GPU_BUFFER_SIZE)
         USE_DOUBLE_BUFFER = False
     else:
         try:
+            global GPU_BUFFER_DTYPE
+            if GPU_BUFFER_DTYPE is None and _allocated_slots(GPU_BUFFERS):
+                GPU_BUFFER_DTYPE = _allocated_slots(GPU_BUFFERS)[0].dtype
             n_gpus = len(GPU_BUFFERS)
-            dtype = GPU_BUFFERS[0].dtype
-            with _no_inference_mode():
-                GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype=dtype, device=f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-            if DEVICE_TYPE in ("cuda", "hip"):
-                event_ctor = torch.cuda.Event
-            elif DEVICE_TYPE == "xpu":
-                event_ctor = torch.xpu.Event
-            elif DEVICE_TYPE == "npu":
-                event_ctor = torch.npu.Event
-            else:
-                raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
+            GPU_BUFFERS_B = _PerDeviceSlots(n_gpus, _new_gpu_buffer)
+            event_ctor = _double_buffer_event_ctor()
             BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
             BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
             USE_DOUBLE_BUFFER = False
