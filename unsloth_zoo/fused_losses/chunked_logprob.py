@@ -351,7 +351,8 @@ def unsloth_chunked_ce_loss(
         divisor = torch.tensor(divisor, dtype = torch.float32)
     if divisor.numel() != 1:
         divisor = divisor.ravel()[0]
-    divisor = divisor.to(device = device, dtype = torch.float32).clamp(min = 1)
+    divisor = divisor.to(device = device, dtype = torch.float32)
+    divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)  # all-masked batch: loss 0, not 0 / 0
     # Only labelled rows reach the head: completion-only training skips the prompt's projection entirely.
     hidden = hidden[keep.to(hidden.device)].to(device)
     if rows_per_chunk is None:

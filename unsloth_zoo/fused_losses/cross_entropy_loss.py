@@ -604,6 +604,30 @@ _FUSED_LOSS_OPAQUE = torch.__version__.split("+")[0].split(".")[:2] == ["2", "11
 def _fused_loss_opaque(*args):
     return UnslothFusedLoss.apply(*args)
 
+# UNSLOTH_CHUNKED_CE=0 keeps the torch.func path below for every call.
+_CHUNKED_CE = os.environ.get("UNSLOTH_CHUNKED_CE", "1") != "0"
+_CHUNKED_CE_KWARGS = frozenset(("ignore_index", "logit_scale_multiply", "logit_scale_divide", "logit_softcapping"))
+
+
+def _use_chunked_ce(kwargs, target_gb):
+    # Plain token CE only: label smoothing, logits_bias, n_chunks and explicit memory targets keep the old path.
+    if not _CHUNKED_CE or target_gb is not None or TARGET_GB or N_CHUNKS:
+        return False
+    return all(k in _CHUNKED_CE_KWARGS for k in kwargs)
+
+
+@torch.compiler.disable
+def _chunked_ce_opaque(hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels,
+                       ignore_index, logit_scale_multiply, logit_scale_divide, logit_softcapping):
+    from unsloth_zoo.fused_losses.chunked_logprob import unsloth_chunked_ce_loss
+
+    return unsloth_chunked_ce_loss(
+        hidden_states, lm_head_weight, lm_head_bias, labels, mask = mask, n_items = n_items, scaling = scaling,
+        shift_labels = shift_labels, ignore_index = ignore_index, logit_scale_multiply = logit_scale_multiply,
+        logit_scale_divide = logit_scale_divide, logit_softcapping = logit_softcapping,
+    )
+
+
 def unsloth_fused_ce_loss(
     trainer,
     hidden_states  : torch.Tensor,
@@ -645,6 +669,14 @@ def unsloth_fused_ce_loss(
     device = lm_head_weight.device
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
+
+    if _use_chunked_ce(kwargs, target_gb):
+        return _chunked_ce_opaque(
+            hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels,
+            int(kwargs.get("ignore_index", -100)),
+            kwargs.get("logit_scale_multiply", 0.0), kwargs.get("logit_scale_divide", 0.0),
+            kwargs.get("logit_softcapping", 0.0),
+        )
 
     mapping = dict(
         loss_function = compute_fused_ce_loss,
