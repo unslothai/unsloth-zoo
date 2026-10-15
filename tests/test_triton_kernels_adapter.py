@@ -27,6 +27,7 @@ import torch
 import unsloth_zoo.triton_kernels_compat as tkc
 from unsloth_zoo.temporary_patches import gpt_oss as go
 
+_REAL_IMPORT_VLLM_VENDORED = tkc._import_vllm_vendored
 
 
 def _expert_rows(x_rows, w, bias, hist):
@@ -330,6 +331,32 @@ def test_vendored_copy_is_used_when_top_level_is_missing(fresh):
     assert go._check_triton_kernels_available() is False
 
 
+def test_forced_vendored_import_ignores_cached_top_level_children(fresh, tmp_path):
+    """Its absolute `triton_kernels.topk` import must load the vendored topk, not a cached top-level one."""
+    vendored_dir = tmp_path / "vllm" / "third_party" / "triton_kernels"
+    vendored_dir.mkdir(parents = True)
+    (tmp_path / "vllm" / "__init__.py").write_text("")
+    (tmp_path / "vllm" / "third_party" / "__init__.py").write_text("")
+    (vendored_dir / "__init__.py").write_text("")
+    (vendored_dir / "topk.py").write_text("SOURCE = 'vendored'\n")
+    (vendored_dir / "routing.py").write_text("from triton_kernels.topk import SOURCE\n")
+    for key in [k for k in sys.modules if k == "vllm" or k.startswith("vllm.")]:
+        fresh.delitem(sys.modules, key)
+    fresh.syspath_prepend(str(tmp_path))
+    # Unsloth's import fixes may hide vllm when the installed one is unusable.
+    fresh.setattr(sys, "meta_path", [f for f in sys.meta_path if "vllm" not in type(f).__name__.lower()])
+    find_spec = tkc.importlib.util.find_spec
+    fresh.setattr(tkc.importlib.util, "find_spec", getattr(find_spec, "_unsloth_original_find_spec", find_spec))
+    top, top_topk = types.ModuleType("triton_kernels"), types.ModuleType("triton_kernels.topk")
+    top_topk.SOURCE = "top-level"
+    fresh.setitem(sys.modules, "triton_kernels", top)
+    fresh.setitem(sys.modules, "triton_kernels.topk", top_topk)
+    fresh.setattr(tkc, "_probe", lambda module: module)
+    assert _REAL_IMPORT_VLLM_VENDORED().__name__ == "vllm.third_party.triton_kernels"
+    assert sys.modules["vllm.third_party.triton_kernels.routing"].SOURCE == "vendored"
+    assert sys.modules["triton_kernels"] is top and sys.modules["triton_kernels.topk"] is top_topk
+
+
 
 def _moe_inputs(T = 7, H = 8, I = 6, E = 4, seed = 0):
     gen = torch.Generator().manual_seed(seed)
@@ -529,3 +556,4 @@ def test_real_routing_matches_a_dense_moe_across_experts():
     vals, idx = torch.topk(logits, k, dim = 1)
     ref = torch.einsum("tk,tkn->tn", torch.softmax(vals, dim = 1), torch.einsum("tc,tknc->tkn", x.float(), dense[idx]))
     assert ((out - ref).norm() / ref.norm()).item() < 1e-2
+

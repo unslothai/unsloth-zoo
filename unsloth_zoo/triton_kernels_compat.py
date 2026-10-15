@@ -261,7 +261,8 @@ def _import_vllm_vendored():
     import pkgutil
     vendored = importlib.import_module("vllm.third_party.triton_kernels")
     previous = sys.modules.get("triton_kernels", _UNRESOLVED)
-    before = {name for name in sys.modules if name.startswith("triton_kernels.")}
+    # Hide cached top-level children too, or the vendored tree's absolute imports reuse them.
+    hidden = {name: sys.modules.pop(name) for name in list(sys.modules) if name.startswith("triton_kernels.")}
     sys.modules["triton_kernels"] = vendored
     try:
         for info in pkgutil.walk_packages(vendored.__path__, vendored.__name__ + "."):
@@ -272,8 +273,9 @@ def _import_vllm_vendored():
         return _probe(vendored)
     finally:
         # Drop the second copies the alias loaded, or a later top-level import mixes their classes with its own.
-        for name in [n for n in sys.modules if n.startswith("triton_kernels.") and n not in before]:
+        for name in [n for n in sys.modules if n.startswith("triton_kernels.")]:
             sys.modules.pop(name, None)
+        sys.modules.update(hidden)
         if previous is _UNRESOLVED:
             sys.modules.pop("triton_kernels", None)
         else:
