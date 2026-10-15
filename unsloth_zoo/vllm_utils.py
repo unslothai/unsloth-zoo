@@ -4461,7 +4461,9 @@ def load_vllm(
                 rope_overrides["max_position_embeddings"] = max_seq_length
             engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **rope_overrides}
 
-        suffix_config = _vllm_suffix_decoding_config()
+        # return_args callers (SyntheticDataKit's `vllm serve`) turn every value into a CLI flag with
+        # str(), and vLLM parses --speculative-config as JSON, so a dict here kills the server.
+        suffix_config = None if return_args else _vllm_suffix_decoding_config()
         if suffix_config is not None:
             engine_args["speculative_config"] = suffix_config
             if enable_lora:

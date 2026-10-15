@@ -175,3 +175,16 @@ def test_load_vllm_memory_retry_uses_the_refitting_shrink():
     src = ast.unparse(load_vllm)
     assert "_shrink_for_memory_retry(" in src
     assert "approx_max_num_seqs = max(int(approx_max_num_seqs * 0.75), 1)" not in src
+
+
+def test_return_args_callers_get_no_speculative_config():
+    # SyntheticDataKit stringifies load_vllm(return_args = True) into `vllm serve` flags;
+    # str(dict) is not JSON, so --speculative-config would make vLLM's parser exit.
+    load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+    assigns = [
+        n for n in ast.walk(load_vllm)
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "suffix_config" for t in n.targets)
+    ]
+    assert len(assigns) == 1
+    value = ast.unparse(assigns[0].value)
+    assert "return_args" in value and "_vllm_suffix_decoding_config()" in value
