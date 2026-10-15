@@ -19,7 +19,8 @@
 Env: ``UNSLOTH_DISABLE_VENDORED_FLA=1`` never injects (an installed fla is untouched);
 an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VENDORED_FLA=1``;
 ``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640);
-``UNSLOTH_GDN_BACKEND=flashqla`` sends supported chunk_gated_delta_rule calls to FlashQLA (``pip install flash-qla``).
+``UNSLOTH_GDN_BACKEND=flashqla`` sends supported chunk_gated_delta_rule calls to FlashQLA (``pip install flash-qla``);
+on SM120 only with ``UNSLOTH_FLASHQLA_ALLOW_SM120=1`` (QwenLM/FlashQLA#35).
 Injects only with torch >= 2.7, triton >= 3.3 and CUDA.
 """
 
@@ -914,6 +915,13 @@ def _load_flashqla():
         capability = tuple(torch.cuda.get_device_capability())
         if capability not in _FLASHQLA_ARCHES:
             raise RuntimeError(f"FlashQLA does not support compute capability {capability}")
+        # Its SM120 forward can return garbage (errors ~1e17) on some drivers with grouped value
+        # heads, varlen and padded alike, unfixed upstream (QwenLM/FlashQLA#35).
+        if capability[0] == 12 and os.environ.get("UNSLOTH_FLASHQLA_ALLOW_SM120", "0") != "1":
+            raise RuntimeError(
+                "its SM120 forward can return wrong outputs on some drivers (QwenLM/FlashQLA#35); "
+                "set UNSLOTH_FLASHQLA_ALLOW_SM120=1 to use it anyway"
+            )
         import flash_qla
         # state_v_first (always forwarded below) first appeared in FlashQLA 0.1.1.
         if "state_v_first" not in inspect.signature(flash_qla.chunk_gated_delta_rule).parameters:

@@ -185,3 +185,18 @@ def test_load_rejects_flashqla_without_state_v_first(monkeypatch, chunk, accepte
     loaded = fv._load_flashqla()
     assert (loaded is not None) == accepted
     assert fv._flashqla_state["failed"] == (not accepted)
+
+
+@pytest.mark.parametrize("capability, allow, accepted", [
+    ((12, 0), None, False), ((12, 1), None, False), ((12, 0), "1", True), ((9, 0), None, True),
+])
+def test_load_keeps_fla_on_sm120_unless_allowed(monkeypatch, capability, allow, accepted):
+    import torch
+    monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
+    monkeypatch.setitem(sys.modules, "flash_qla", types.SimpleNamespace(chunk_gated_delta_rule = _qla_chunk_011))
+    monkeypatch.setattr(fv, "_flashqla_state", dict(fv._flashqla_state, module = None, failed = False))
+    if allow is None: monkeypatch.delenv("UNSLOTH_FLASHQLA_ALLOW_SM120", raising = False)
+    else: monkeypatch.setenv("UNSLOTH_FLASHQLA_ALLOW_SM120", allow)
+    assert (fv._load_flashqla() is not None) == accepted
