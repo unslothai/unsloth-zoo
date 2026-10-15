@@ -4078,11 +4078,35 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     )
 
 
-def _remove_stale_output_shard(file_path, save_directory):
-    # Unlinks a link itself, never its target; a symlinked parent is left alone.
-    if os.path.lexists(file_path) and not os.path.isdir(file_path) and \
-            _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory):
-        os.remove(file_path)
+_STALE_SHARD_SUFFIX = ".unsloth-previous-export"
+
+def _set_aside_stale_output_shards(file_paths, save_directory):
+    # Renamed, not unlinked, so a failed fetch can put the earlier export back. Moves a
+    # link itself, never its target; a symlinked parent is left alone.
+    set_aside = {}
+    for file_path in file_paths:
+        if os.path.lexists(file_path) and not os.path.isdir(file_path) and \
+                _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory):
+            os.replace(file_path, file_path + _STALE_SHARD_SUFFIX)
+            set_aside[file_path] = file_path + _STALE_SHARD_SUFFIX
+    return set_aside
+pass
+
+
+def _restore_stale_output_shards(set_aside):
+    for file_path, backup_path in set_aside.items():
+        if os.path.lexists(backup_path):
+            if os.path.lexists(file_path) and not os.path.isdir(file_path):
+                os.remove(file_path)
+            os.replace(backup_path, file_path)
+    set_aside.clear()
+pass
+
+
+def _discard_stale_output_shard(set_aside, file_path):
+    backup_path = set_aside.pop(file_path, None)
+    if backup_path is not None and os.path.lexists(backup_path):
+        os.remove(backup_path)
 pass
 
 
@@ -5281,95 +5305,108 @@ def merge_and_overwrite_lora(
 
     # An earlier export's shard is already merged and the fetches below can keep it
     # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
+    _stale_shards = {}
     if not is_local_path:
-        for filename in safetensors_list:
-            _remove_stale_output_shard(os.path.join(save_directory, filename), save_directory)
-
-    # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
-    if not is_local_path and _hf_cache_dir is not None:
-        copied_all_from_cache = _try_copy_all_from_cache(
-            repo_id = model_name,
-            filenames_to_check = safetensors_list,
-            target_dir_str = save_directory,
-            hf_cache_dir = _hf_cache_dir,
-            token = token,
-        )
-        copied_tokenizer_model_from_cache = _try_copy_all_from_cache(
-            repo_id=model_name,
-            filenames_to_check=["tokenizer.model"],
-            target_dir_str=save_directory,
-            hf_cache_dir=_hf_cache_dir,
-            token=token,
+        _stale_shards = _set_aside_stale_output_shards(
+            [os.path.join(save_directory, filename) for filename in safetensors_list],
+            save_directory,
         )
 
-    if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
-        print(f"Downloading safetensors for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = safe_tensor_index_files + safetensors_list,
-            local_dir_use_symlinks = False,
-            cache_dir = _hf_cache_dir,
-            token = token,
-        )
-
-    if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
-        print(f"Attempting to download tokenizer.model for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = ["tokenizer.model"],
-            local_dir_use_symlinks = False,
-            cache_dir = _hf_cache_dir,
-            token = token,
-        )
-
-    final_safetensors_list = []
-
-    _reset_moe_merge_state()  # #5410
-
-    # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
-    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
-        file_path = os.path.join(save_directory, filename)
-        _materialize_shard_that_resolves_outside(file_path, save_directory)
-        # Before the copy, not only at the writers: those run much later, so a linked
-        # output component (`save_directory/weights -> /outside`) was followed by
-        # `makedirs` and `copy2` before anything refused.
-        _assert_shard_is_inside(file_path, save_directory)
-        # Only download if we didn't get everything from cache AND this specific file doesn't exist
-        # AND we're in low disk space mode
-        # For local models, copy the file if needed
-        # Overwrite unless it IS the source (in-place export): an earlier export's shard is already merged.
-        local_file_path = os.path.join(model_name, filename) if is_local_path else None
-        if is_local_path and os.path.exists(local_file_path) and not (
-            os.path.exists(file_path) and os.path.samefile(file_path, local_file_path)
-        ):
-            # A nested name has no parent here yet, so the copy would raise
-            # FileNotFoundError. The name is known to stay inside LEXICALLY, no
-            # stronger: a symlinked component still resolves wherever it points.
-            os.makedirs(os.path.dirname(file_path), exist_ok = True)
-            _copy_file_from_source(local_file_path, os.path.dirname(file_path), os.path.basename(file_path))
-            print(f"Copied {filename} from local model directory")
-
-        elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
-            hf_hub_download(
+    try:
+        # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
+        if not is_local_path and _hf_cache_dir is not None:
+            copied_all_from_cache = _try_copy_all_from_cache(
                 repo_id = model_name,
-                filename = filename,
-                repo_type = "model",
+                filenames_to_check = safetensors_list,
+                target_dir_str = save_directory,
+                hf_cache_dir = _hf_cache_dir,
+                token = token,
+            )
+            copied_tokenizer_model_from_cache = _try_copy_all_from_cache(
+                repo_id=model_name,
+                filenames_to_check=["tokenizer.model"],
+                target_dir_str=save_directory,
+                hf_cache_dir=_hf_cache_dir,
+                token=token,
+            )
+
+        if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
+            print(f"Downloading safetensors for {model_name}...")
+            snapshot_download(
+                repo_id = model_name,
                 local_dir = save_directory,
+                allow_patterns = safe_tensor_index_files + safetensors_list,
+                local_dir_use_symlinks = False,
                 cache_dir = _hf_cache_dir,
                 token = token,
             )
+
+        if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
+            print(f"Attempting to download tokenizer.model for {model_name}...")
+            snapshot_download(
+                repo_id = model_name,
+                local_dir = save_directory,
+                allow_patterns = ["tokenizer.model"],
+                local_dir_use_symlinks = False,
+                cache_dir = _hf_cache_dir,
+                token = token,
+            )
+
+        final_safetensors_list = []
+
+        _reset_moe_merge_state()  # #5410
+
+        # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
+        for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
+            file_path = os.path.join(save_directory, filename)
+            _materialize_shard_that_resolves_outside(file_path, save_directory)
+            # Before the copy, not only at the writers: those run much later, so a linked
+            # output component (`save_directory/weights -> /outside`) was followed by
+            # `makedirs` and `copy2` before anything refused.
+            _assert_shard_is_inside(file_path, save_directory)
+            # Only download if we didn't get everything from cache AND this specific file doesn't exist
+            # AND we're in low disk space mode
+            # For local models, copy the file if needed
+            # Overwrite unless it IS the source (in-place export): an earlier export's shard is already merged.
+            local_file_path = os.path.join(model_name, filename) if is_local_path else None
+            if is_local_path and os.path.exists(local_file_path) and not (
+                os.path.exists(file_path) and os.path.samefile(file_path, local_file_path)
+            ):
+                # A nested name has no parent here yet, so the copy would raise
+                # FileNotFoundError. The name is known to stay inside LEXICALLY, no
+                # stronger: a symlinked component still resolves wherever it points.
+                os.makedirs(os.path.dirname(file_path), exist_ok = True)
+                _copy_file_from_source(local_file_path, os.path.dirname(file_path), os.path.basename(file_path))
+                print(f"Copied {filename} from local model directory")
+
+            elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
+                hf_hub_download(
+                    repo_id = model_name,
+                    filename = filename,
+                    repo_type = "model",
+                    local_dir = save_directory,
+                    cache_dir = _hf_cache_dir,
+                    token = token,
+                )
+            pass
+
+            # Low disk mode bounds the extra space to one shard instead of a full copy.
+            if low_disk_space_usage and os.path.exists(file_path):
+                _discard_stale_output_shard(_stale_shards, file_path)
+
+            if needs_splitting:
+                resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)
+            else:
+                resulting_files = [filename]
+
+            # Collect all resulting files (temp names if split, original names if not)
+            final_safetensors_list.extend(resulting_files)
         pass
-
-        if needs_splitting:
-            resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)
-        else:
-            resulting_files = [filename]
-
-        # Collect all resulting files (temp names if split, original names if not)
-        final_safetensors_list.extend(resulting_files)
-    pass
+    except BaseException:
+        _restore_stale_output_shards(_stale_shards)
+        raise
+    for _stale_path in list(_stale_shards):
+        _discard_stale_output_shard(_stale_shards, _stale_path)
 
     if low_disk_space_usage and not is_local_path and not copied_all_from_cache:
         tokenizer_model_path = os.path.join(save_directory, "tokenizer.model")

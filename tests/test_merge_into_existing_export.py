@@ -78,25 +78,99 @@ def test_in_place_export_still_merges_once(tmp_path):
     assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
 
 
-def test_remove_stale_output_shard_unlinks_links_not_targets(tmp_path):
-    from unsloth_zoo.saving_utils import _remove_stale_output_shard
+def test_set_aside_moves_links_not_targets_and_restores(tmp_path):
+    from unsloth_zoo.saving_utils import (
+        _set_aside_stale_output_shards, _restore_stale_output_shards, _discard_stale_output_shard,
+    )
 
     out = tmp_path / "out"
     out.mkdir()
     target = tmp_path / "outside.safetensors"
     target.write_bytes(b"keep")
     (out / "model.safetensors").symlink_to(target)
-    _remove_stale_output_shard(str(out / "model.safetensors"), str(out))
-    assert not os.path.lexists(out / "model.safetensors")
-    assert target.read_bytes() == b"keep"
-
     (out / "model-00001-of-00002.safetensors").write_bytes(b"stale")
-    _remove_stale_output_shard(str(out / "model-00001-of-00002.safetensors"), str(out))
-    assert not os.path.exists(out / "model-00001-of-00002.safetensors")
-
     linked = tmp_path / "linked"
     linked.mkdir()
     (out / "weights").symlink_to(linked, target_is_directory = True)
     (linked / "model.safetensors").write_bytes(b"keep")
-    _remove_stale_output_shard(str(out / "weights" / "model.safetensors"), str(out))
+    paths = [str(out / n) for n in ("model.safetensors", "model-00001-of-00002.safetensors",
+                                    os.path.join("weights", "model.safetensors"))]
+
+    aside = _set_aside_stale_output_shards(paths, str(out))
+    assert not os.path.lexists(out / "model.safetensors")
+    assert not os.path.exists(out / "model-00001-of-00002.safetensors")
+    assert target.read_bytes() == b"keep"
     assert (linked / "model.safetensors").read_bytes() == b"keep"
+    assert paths[2] not in aside
+
+    (out / "model-00001-of-00002.safetensors").write_bytes(b"partial")
+    _restore_stale_output_shards(aside)
+    assert os.path.islink(out / "model.safetensors")
+    assert (out / "model-00001-of-00002.safetensors").read_bytes() == b"stale"
+    assert sorted(os.listdir(out)) == ["model-00001-of-00002.safetensors", "model.safetensors", "weights"]
+
+    aside = _set_aside_stale_output_shards(paths[1:2], str(out))
+    (out / "model-00001-of-00002.safetensors").write_bytes(b"base")
+    _discard_stale_output_shard(aside, paths[1])
+    assert (out / "model-00001-of-00002.safetensors").read_bytes() == b"base"
+    assert aside == {} and sorted(os.listdir(out)) == ["model-00001-of-00002.safetensors", "model.safetensors", "weights"]
+
+
+def _fake_hub(monkeypatch, base, fail):
+    import shutil
+    from unsloth_zoo import saving_utils as S
+
+    shards = sorted(f for f in os.listdir(base) if f.endswith(".safetensors"))
+
+    class _FS:
+        def __init__(self, *a, **k):
+            pass
+        def ls(self, name, detail = True):
+            return [{"name": f"{name}/{f}", "size": os.path.getsize(os.path.join(base, f))} for f in shards]
+
+    def _fetch(local_dir, names):
+        if fail and any(f in shards for f in names):
+            raise OSError("simulated network failure")
+        for f in names:
+            if os.path.exists(os.path.join(base, f)):
+                shutil.copyfile(os.path.join(base, f), os.path.join(local_dir, f))
+
+    def _snapshot(repo_id, local_dir = None, allow_patterns = (), **k):
+        _fetch(local_dir, list(allow_patterns))
+        return local_dir
+
+    def _hf_hub(repo_id, filename, local_dir = None, **k):
+        if local_dir is None:
+            raise OSError("not cached")
+        _fetch(local_dir, [filename])
+        return os.path.join(local_dir, filename)
+
+    monkeypatch.setattr(S, "determine_base_model_source", lambda *a, **k: ("fake/repo", False, "hub", False, None))
+    monkeypatch.setattr(S, "HfFileSystem", _FS)
+    monkeypatch.setattr(S, "snapshot_download", _snapshot)
+    monkeypatch.setattr(S, "hf_hub_download", _hf_hub)
+    monkeypatch.setattr(S, "_try_copy_all_from_cache", lambda *a, **k: False)
+
+
+@pytest.mark.parametrize("low_disk", [False, True])
+def test_failed_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low_disk):
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    expected = H.read_safetensors_dir(out)
+    assert len([f for f in os.listdir(out) if f.endswith(".safetensors")]) > 1
+
+    _fake_hub(monkeypatch, base, fail = True)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    got = H.read_safetensors_dir(out)
+    assert sorted(got) == sorted(expected)
+    assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
+    assert not [f for f in os.listdir(out) if f.endswith(".unsloth-previous-export")]
+
+    # A later successful export still merges onto the base, not onto the restored shards.
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    again = H.read_safetensors_dir(out)
+    assert [k for k in expected if not torch.equal(again[k], expected[k])] == []
