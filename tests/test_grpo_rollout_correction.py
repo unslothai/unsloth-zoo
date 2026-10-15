@@ -242,3 +242,51 @@ def test_compiles_fullgraph(options, mode):
     compiled = torch.compile(rr.grpo_compute_loss, fullgraph = True, dynamic = True)(*args, **kwargs)
     torch.testing.assert_close(compiled[0], eager[0], rtol = 1e-5, atol = 1e-6)
     torch.testing.assert_close(compiled[4], eager[4], rtol = 1e-5, atol = 1e-6)
+
+
+def _micro_losses(new, old, mask, adv, weight, ga, spg, num_processes = 1, loss_type = "dapo"):
+    kwargs = dict(
+        loss_type = loss_type, epsilon_low = 0.2, epsilon_high = 0.28, max_completion_length = new.shape[1],
+        num_items_in_batch = mask.sum(), current_gradient_accumulation_steps = ga, steps_per_generation = spg,
+        num_processes = num_processes, importance_sampling_level = "token",
+    )
+    rows = new.shape[0] // spg
+    total = 0
+    for i in range(spg):
+        s = slice(i * rows, (i + 1) * rows)
+        if weight is not None:
+            kwargs["sample_weight"] = weight[s]
+        total = total + rr.grpo_compute_loss(None, new[s], old[s], None, torch.zeros_like(mask[s]), mask[s], 0.0, adv[s], **kwargs)[0]
+    return total
+
+
+@pytest.mark.parametrize("ga,spg", [(1, 1), (2, 2), (4, 4), (2, 4)])
+def test_sample_weight_of_one_over_tokens_is_dapo(ga, spg):
+    new, old, _, mask, adv = _data(rows = 8, seed = 2)
+    weight = torch.full((8,), 1.0 / float(mask.sum()), dtype = torch.float64)
+    got = _micro_losses(new, old, mask, adv, weight, ga, spg)
+    want = _micro_losses(new, old, mask, adv, None, ga, spg)
+    torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-15)
+    g1, = torch.autograd.grad(got, new)
+    g2, = torch.autograd.grad(want, new)
+    torch.testing.assert_close(g1, g2, rtol = 1e-12, atol = 1e-15)
+
+
+@pytest.mark.parametrize("loss_type", ["dapo", "grpo", "cispo", "dr_grpo"])
+def test_sample_weight_prompt_level_matches_scalerl_formula(loss_type):
+    # ScaleRL prompt-level aggregation over 3 groups of 4, group 1 excluded (zero variance):
+    # (1 / kept groups) sum_g (1 / tokens in g) sum_{i in g, t} l_it, summed over the micro-batches.
+    new, old, _, mask, adv = _data(rows = 12, cols = 9, seed = 6)
+    keep = torch.tensor([1.0] * 4 + [0.0] * 4 + [1.0] * 4, dtype = torch.float64)
+    tokens = mask.sum(-1).double().view(3, 4).sum(-1).repeat_interleave(4)
+    weight = keep / (tokens.clamp(min = 1) * 2)
+    got = _micro_losses(new, old, mask, adv, weight, ga = 2, spg = 2, loss_type = loss_type)
+    if loss_type == "cispo":
+        per_token = -(new - old).exp().clamp(max = 0.28).detach() * adv.unsqueeze(1) * new
+    else:
+        coef = (new - old).exp()
+        a = adv.unsqueeze(1)
+        per_token = -torch.min(coef * a, coef.clamp(0.8, 1.28) * a)
+    per_row = (per_token * mask).sum(-1)
+    want = sum(per_row.view(3, 4)[g].sum() / tokens[4 * g] for g in (0, 2)) / 2
+    torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-15)

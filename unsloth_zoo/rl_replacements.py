@@ -703,6 +703,9 @@ def grpo_compute_loss(
     entropy_mask = kwargs.get("entropy_mask", None)
     # Parsed (option, lower_log, upper) tuples from grpo_parse_rollout_rs, or None.
     rollout_rs = kwargs.get("rollout_rs", None)
+    # Per-completion weights from unsloth's generation step (ScaleRL zero-variance exclusion /
+    # prompt-level aggregation), normalised over the whole generation batch; replaces the loss_type normaliser.
+    sample_weight = kwargs.get("sample_weight", None)
     # Only direct callers see this fallback; the trainer always forwards an explicit value.
     use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
@@ -912,7 +915,13 @@ def grpo_compute_loss(
     n_mask_per_reward = mask.sum(1)
 
     # https://github.com/huggingface/trl/blob/e8b8499f1f8d76838155b515e414ee98f757d6d5/trl/trainer/grpo_trainer.py#L1624
-    if loss_type in ["grpo", "sapo"]:
+    if sample_weight is not None:
+        # Same process / accumulation rescale as the dapo branch, whose weights are 1 / num_items_in_batch.
+        normalizer = 1.0 / num_processes
+        if steps_per_generation:
+            normalizer = normalizer * current_gradient_accumulation_steps / steps_per_generation
+        loss = (loss_i * mask * sample_weight.to(loss_i.dtype).unsqueeze(-1)).sum() / normalizer
+    elif loss_type in ["grpo", "sapo"]:
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "bnpo" and num_items_in_batch is None:
