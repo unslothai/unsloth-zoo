@@ -689,6 +689,24 @@ def _flex_routes_maskless_to_sdpa(config):
     return not _a_model_overrides_flex_locally()
 
 
+def _flash_sdpa_takes_causal(config, embeds):
+    """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; anything
+    else falls to the math kernel and its [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
+    if embeds.dtype not in (torch.float16, torch.bfloat16) or not embeds.is_cuda:
+        return False
+    if torch.version.hip is not None or not torch.backends.cuda.flash_sdp_enabled():
+        return False
+    if torch.cuda.get_device_capability(embeds.device) < (8, 0):
+        return False
+    head_dim = getattr(config, "head_dim", None)
+    if not isinstance(head_dim, int):
+        try:
+            head_dim = config.hidden_size // config.num_attention_heads
+        except Exception:
+            return False
+    return 0 < head_dim <= 256 and head_dim % 8 == 0
+
+
 def _maskless_causal_arguments(signature, args, kwargs):
     """Arguments for an eager create_causal_mask call that may return None, else None.
 
@@ -758,6 +776,8 @@ def _maskless_causal_arguments(signature, args, kwargs):
     right_padded = False
     if attention_mask is not None and not bool(attention_mask.all()):
         if os.environ.get(_SKIP_RIGHT_PADDING_MASK_ENV, "0") != "1":
+            return None
+        if not _flash_sdpa_takes_causal(config, embeds):
             return None
         # Every row starts real and stays padded after its first pad; left padding keeps the mask.
         mask = attention_mask.bool()

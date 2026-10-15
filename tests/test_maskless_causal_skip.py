@@ -475,6 +475,7 @@ def _right_padded(batch = 3, length = 8):
 
 
 def test_right_padding_skips_the_mask_when_opted_in(patched, monkeypatch):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
     monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
     kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
     before = dict(misc.CAUSAL_MASK_SKIP_STATS)
@@ -496,6 +497,7 @@ def test_right_padding_skips_the_mask_when_opted_in(patched, monkeypatch):
     torch.tensor([[1, 1, 1, 1], [0, 0, 0, 0]]),
 ], ids = ["left", "hole", "empty_row"])
 def test_other_padding_keeps_the_mask_when_opted_in(patched, monkeypatch, attention_mask):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
     monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
     kwargs = _kwargs(patched, batch = 2, length = 4, attention_mask = attention_mask)
     assert _decide(patched, **kwargs) is None
@@ -524,6 +526,7 @@ def test_right_padded_training_matches_the_masked_path(patched, monkeypatch, att
 
     base_loss, base_logits, base_grads = run()
     monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
     before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
     head_loss, head_logits, head_grads = run()
     assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] - before == (1 if attn == "sdpa" else 0)
@@ -541,3 +544,14 @@ def test_right_padded_training_matches_the_masked_path(patched, monkeypatch, att
     with torch.no_grad():
         moved = model.model(input_ids = changed, attention_mask = attention_mask, use_cache = False).last_hidden_state
     torch.testing.assert_close(moved[real], head_logits[real], rtol = 1e-5, atol = 1e-5)
+
+
+def test_right_padding_keeps_the_mask_without_flash_sdpa(patched, monkeypatch):
+    # fp32 / CPU / pre-sm80 SDPA would run enable_gqa on the math kernel: keep the mask there.
+    monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    assert _decide(patched, **kwargs) is None
+    assert isinstance(patched.create_causal_mask(**kwargs), torch.Tensor)
+    config = _config()
+    assert not misc._flash_sdpa_takes_causal(config, torch.zeros(1, 2, 16, dtype = torch.bfloat16))
+    assert not misc._flash_sdpa_takes_causal(config, torch.zeros(1, 2, 16))
