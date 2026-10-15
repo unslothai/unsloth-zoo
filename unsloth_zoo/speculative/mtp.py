@@ -458,7 +458,10 @@ def build_mtp_head(target_model_or_config, state_dict = None, dtype = None, devi
             config, state_dict = canonical, dtype = dtype, device = device, strict = strict, family = family,
             target_embed = target_embed, target_lm_head = target_lm_head,
         )
-        head._ckpt_prefix = ckpt_prefix or (prefixes.pop() if len(prefixes) == 1 else family.default_prefix())
+        # "" is a discovered prefix (bare `layers.N.*` names), not a missing one.
+        if ckpt_prefix is None:
+            ckpt_prefix = prefixes.pop() if len(prefixes) == 1 else family.default_prefix()
+        head._ckpt_prefix = ckpt_prefix
         return head
     with torch.device("meta" if state_dict is not None else (device or "cpu")):
         head = Qwen35MTPHead(config)
