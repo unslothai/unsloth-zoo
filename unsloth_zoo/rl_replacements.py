@@ -46,6 +46,46 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 pass
 
+def _truncated_support_mask_impl(logits: torch.Tensor, top_k: int, top_p: float, min_p: float) -> torch.Tensor:
+    if min_p > 0.0:
+        probs = torch.softmax(logits, dim = -1)
+        logits = logits.masked_fill(probs < min_p * probs.amax(dim = -1, keepdim = True), float("-inf"))
+    if top_k > 0 and top_k < logits.shape[-1]:
+        kth = torch.topk(logits, top_k, dim = -1).values[:, -1:]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p < 1.0:
+        sorted_logits = torch.sort(logits, dim = -1).values
+        dropped = torch.cumsum(torch.softmax(sorted_logits, dim = -1), dim = -1) <= (1.0 - top_p)
+        dropped = dropped & (sorted_logits < sorted_logits[:, -1:])
+        threshold = sorted_logits.masked_fill(dropped, float("inf")).amin(dim = -1, keepdim = True)
+        logits = logits.masked_fill(logits < threshold, float("-inf"))
+    return torch.isfinite(logits)
+pass
+
+# Opaque to Inductor: with dynamic chunk rows its lowering of these reductions raises CantSplit
+# (torch 2.13), and the set is a constant of the backward anyway.
+try:
+    _truncated_support_mask = torch.library.custom_op(
+        "unsloth_zoo::truncated_support_mask", mutates_args = (),
+    )(_truncated_support_mask_impl)
+    _truncated_support_mask.register_fake(
+        lambda logits, top_k, top_p, min_p: torch.empty_like(logits, dtype = torch.bool)
+    )
+except Exception:
+    _truncated_support_mask = _truncated_support_mask_impl
+pass
+
+# Mirrors vLLM v1 processed_logprobs: renormalised over what survives min_p, then top_k, then top_p
+# (sampler.py `sample`, topk_topp_sampler.py `apply_top_k_top_p`). The scored token is always kept
+# so a boundary disagreement between the trainer's recomputed set and the sampler's stays finite.
+def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p):
+    selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1))
+    keep = _truncated_support_mask(chunk_logits.detach(), top_k, top_p, min_p)
+    kept = chunk_logits.masked_fill(~keep, float("-inf"))
+    kept = kept.scatter(-1, chunk_index.unsqueeze(-1), selected_logits)
+    return selected_logits.squeeze(-1) - torch.logsumexp(kept, dim = -1)
+pass
+
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
 @_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(
@@ -53,6 +93,9 @@ def chunked_selective_log_softmax(
     index,
     temperature: float = 1.0,
     chunks: int = 4,
+    support_top_k: int = 0,
+    support_top_p: float = 1.0,
+    support_min_p: float = 0.0,
 ):
     # Fixed `chunks` row ranges; see chunked_hidden_states_selective_log_softmax.
     flat_logits = logits.reshape(-1, logits.shape[-1])
@@ -68,6 +111,11 @@ def chunked_selective_log_softmax(
         chunk_logits = chunk_logits.to(torch.float32)
         if temperature != 1.0:
             chunk_logits = chunk_logits / temperature
+        if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0:
+            all_per_token_logps.append(_truncated_support_logps(
+                chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
+            ))
+            continue
         selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
         logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
         per_token_logps = selected_logits - logsumexp_values
@@ -108,6 +156,9 @@ def chunked_hidden_states_selective_log_softmax(
         else 0
     ),
     lm_head_bias: Optional[torch.Tensor] = None,
+    support_top_k: int = 0,
+    support_top_p: float = 1.0,
+    support_min_p: float = 0.0,
     # Read in the default for the same Dynamo reason as max_rows_per_chunk. Pairs with vLLM's
     # head_dtype=float32 that load_vllm requests under the same flag.
     fp32_lm_head: bool = (
@@ -192,9 +243,14 @@ def chunked_hidden_states_selective_log_softmax(
         if temperature != 1.0:
             chunk_logits = chunk_logits / temperature
 
-        selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
-        per_token_logps = selected_logits - logsumexp_values
+        if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0:
+            per_token_logps = _truncated_support_logps(
+                chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
+            )
+        else:
+            selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
+            logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
+            per_token_logps = selected_logits - logsumexp_values
         # Return to the caller's device so the concatenation below and every
         # downstream consumer see the device they started on.
         all_per_token_logps.append(per_token_logps.to(hidden_states.device))
@@ -1250,6 +1306,114 @@ pass
 RL_REPLACEMENTS["_warn_unsupported_grpo_options"] = _warn_unsupported_grpo_options
 
 
+def _grpo_rollout_sampling_params(trainer, keys):
+    """Later sources override earlier ones as they do for the SamplingParams: GRPOConfig fields,
+    then generation_kwargs, then Unsloth's vllm_sampling_params."""
+    args = getattr(trainer, "args", None)
+    params = {key: getattr(args, key, None) for key in keys}
+    for overrides in (
+        getattr(args, "generation_kwargs", None),
+        getattr(getattr(args, "vllm_sampling_params", None), "_set_kwargs", None),
+    ):
+        if isinstance(overrides, dict):
+            for key in params:
+                if overrides.get(key, None) is not None:
+                    params[key] = overrides[key]
+    return params
+pass
+
+
+# vLLM v1 applies these to the logits before temperature, min_p and top_k / top_p
+# (Sampler.apply_logits_processors), so its kept set and logprobs come from logits the trainer never sees.
+_PRE_TRUNCATION_NEUTRAL = {
+    "repetition_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "min_tokens": 0,
+}
+_PRE_TRUNCATION_OPTIONAL = (
+    "logit_bias", "bad_words", "allowed_token_ids", "logits_processors",
+    "structured_outputs", "guided_decoding", "vllm_structured_outputs_regex", "vllm_guided_decoding_regex",
+)
+
+
+def grpo_truncated_support_blockers(trainer):
+    """Rollout settings under which the recomputed kept set cannot match vLLM's."""
+    params = _grpo_rollout_sampling_params(
+        trainer, ("temperature",) + tuple(_PRE_TRUNCATION_NEUTRAL) + _PRE_TRUNCATION_OPTIONAL,
+    )
+    blockers = []
+    for key, neutral in _PRE_TRUNCATION_NEUTRAL.items():
+        if params[key] is not None and float(params[key]) != neutral:
+            blockers.append(f"{key}={params[key]}")
+    for key in _PRE_TRUNCATION_OPTIONAL:
+        value = params[key]
+        if value is not None and not (isinstance(value, (dict, list, tuple, set, str)) and len(value) == 0):
+            blockers.append(key)
+    # The loss scales by the trainer's temperature; vLLM truncates at the rollout's.
+    trainer_temperature = getattr(trainer, "temperature", None)
+    if trainer_temperature is None:
+        trainer_temperature = getattr(getattr(trainer, "args", None), "temperature", None)
+    rollout_temperature = params["temperature"]
+    if rollout_temperature is not None and trainer_temperature is not None \
+            and float(rollout_temperature) != float(trainer_temperature):
+        blockers.append(f"rollout temperature={rollout_temperature} != trainer temperature={trainer_temperature}")
+    return blockers
+pass
+
+
+def grpo_sampling_support(trainer):
+    """(top_k, top_p, min_p) the rollouts were truncated with, or None for full-vocabulary sampling."""
+    params = _grpo_rollout_sampling_params(trainer, ("top_k", "top_p", "min_p"))
+    # top_k None / 0 / -1 all mean no top-k in TRL and vLLM.
+    top_k = max(int(params["top_k"] or 0), 0)
+    top_p = 1.0 if params["top_p"] is None else float(params["top_p"])
+    min_p = 0.0 if params["min_p"] is None else float(params["min_p"])
+    if top_k == 0 and top_p >= 1.0 and min_p <= 0.0:
+        return None
+    return top_k, top_p, min_p
+pass
+
+
+def grpo_truncated_support_kwargs(trainer):
+    """support_* kwargs for the chunked logprob helpers when UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 and
+    the vLLM rollouts were truncated, else {}. With the opt-in off, warns once if the truncated
+    vLLM logprobs feed the IS correction or the off-policy mask."""
+    if not getattr(trainer, "use_vllm", False):
+        return {}
+    support = grpo_sampling_support(trainer)
+    if support is None:
+        return {}
+    top_k, top_p, min_p = support
+    enabled = os.environ.get("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "0").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        args = getattr(trainer, "args", None)
+        consumed = (
+            getattr(trainer, "vllm_importance_sampling_correction", False)
+            or getattr(args, "off_policy_mask_threshold", None) is not None
+        )
+        if consumed and not getattr(trainer, "_unsloth_truncated_support_warned", False):
+            logger.warning(
+                f"Unsloth: rollouts sample with top_k={top_k}, top_p={top_p}, min_p={min_p}, so "
+                "vLLM's logprobs are renormalised over the kept tokens while the trainer scores the "
+                "full vocabulary. The importance sampling ratio / off-policy mask then sees a "
+                "systematic gap of log(kept probability mass) per token. Set "
+                "UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 to score the trainer over the same kept set."
+            )
+            trainer._unsloth_truncated_support_warned = True
+        return {}
+    blockers = grpo_truncated_support_blockers(trainer)
+    if blockers:
+        if not getattr(trainer, "_unsloth_truncated_support_blocked_warned", False):
+            logger.warning(
+                "Unsloth: ignoring UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 because the rollouts use "
+                f"{', '.join(blockers)}, which vLLM applies before truncating, so the trainer cannot "
+                "rebuild the same kept set. Scoring over the full vocabulary instead."
+            )
+            trainer._unsloth_truncated_support_blocked_warned = True
+        return {}
+    return {"support_top_k": top_k, "support_top_p": top_p, "support_min_p": min_p}
+pass
+RL_REPLACEMENTS["grpo_truncated_support_kwargs"] = grpo_truncated_support_kwargs
+
+
 _n_chunks_deprecation_warned = False
 
 def _warn_deprecated_n_chunks(n_chunks):
@@ -1880,6 +2044,7 @@ def grpo_accumulated_loss(
         grpo_shared_vision_inputs as _grpo_get_vision_inputs,
         grpo_vision_chunks as _grpo_vision_chunks,
         chunked_hidden_states_selective_log_softmax,
+        chunked_selective_log_softmax,
     )
     if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
         from unsloth_zoo.rl_replacements import (
@@ -2070,6 +2235,26 @@ def grpo_accumulated_loss(
             chunked_hidden_states_selective_log_softmax = partial(
                 chunked_hidden_states_selective_log_softmax, lm_head_bias = lm_head_bias,
             )
+        from unsloth_zoo.rl_replacements import grpo_truncated_support_kwargs
+        _support_kwargs = grpo_truncated_support_kwargs(trainer)
+        # old / ref logps come from Unsloth's _get_per_token_logps, which marks the trainer when
+        # it scored them over the same set; mixing the two normalisations would bias every ratio.
+        if _support_kwargs and (old_logps is not None or ref_logps is not None) \
+                and not getattr(trainer, "_unsloth_truncated_support_scored", False):
+            if not getattr(trainer, "_unsloth_truncated_support_refused", False):
+                from unsloth_zoo.log import logger as _zoo_logger
+                _zoo_logger.warning(
+                    "Unsloth: UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 needs an unsloth build that scores the "
+                    "old / reference logprobs over the same kept set. Ignoring it: pip install -U unsloth"
+                )
+                trainer._unsloth_truncated_support_refused = True
+            _support_kwargs = {}
+        if _support_kwargs:
+            from functools import partial
+            chunked_hidden_states_selective_log_softmax = partial(
+                chunked_hidden_states_selective_log_softmax, **_support_kwargs,
+            )
+            chunked_selective_log_softmax = partial(chunked_selective_log_softmax, **_support_kwargs)
         # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
         _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
         dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
