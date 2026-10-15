@@ -603,8 +603,11 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 # Compiled, `_ignore_causal_mask_sdpa` always refuses, so SDPA loses its `is_causal` kernels.
 # Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
-CAUSAL_MASK_SKIP_STATS = {"skipped": 0}
+CAUSAL_MASK_SKIP_STATS = {"skipped": 0, "right_padded": 0}
 _SKIP_CAUSAL_MASK_ENV = "UNSLOTH_SKIP_CAUSAL_MASK"
+# Opt-in: right-padded rows also run `is_causal` instead of a [bsz, 1, q, q] mask. Real tokens never
+# see the pad tail under causal attention, so only the outputs at pad positions change.
+_SKIP_RIGHT_PADDING_MASK_ENV = "UNSLOTH_SKIP_RIGHT_PADDING_MASK"
 # Any other non-None argument (or/and_mask_function, encoder_hidden_states, ...) keeps the mask.
 _PLAIN_CAUSAL_MASK_ARGUMENTS = frozenset((
     "config", "inputs_embeds", "input_embeds", "attention_mask", "cache_position",
@@ -752,13 +755,22 @@ def _maskless_causal_arguments(signature, args, kwargs):
             or position_ids.shape[-1] != q_length
         ):
             return None
+    right_padded = False
     if attention_mask is not None and not bool(attention_mask.all()):
-        return None
+        if os.environ.get(_SKIP_RIGHT_PADDING_MASK_ENV, "0") != "1":
+            return None
+        # Every row starts real and stays padded after its first pad; left padding keeps the mask.
+        mask = attention_mask.bool()
+        if not bool(mask[:, 0].all() & (mask[:, 1:] <= mask[:, :-1]).all()):
+            return None
+        right_padded = True
     if position_ids is not None and not bool((position_ids.diff(dim = -1) == 1).all()):
         return None
     for name in ("attention_mask", "position_ids"):
         if name in arguments:
             arguments[name] = None
+    if right_padded:
+        CAUSAL_MASK_SKIP_STATS["right_padded"] += 1
     return arguments
 
 
