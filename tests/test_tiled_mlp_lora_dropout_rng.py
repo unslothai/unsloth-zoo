@@ -115,3 +115,24 @@ def test_no_dropout_skips_rng_state():
     holder.eval()
     assert not _mlp_needs_rng_state(holder.mlp)
 pass
+
+
+def test_dropout_cache_survives_layer_slicing():
+    from unsloth_zoo import tiled_mlp
+    block = _Block()
+    patch_mlp(block.mlp, target_arctic = True, padded_length = HIDDEN)
+    assert not tiled_mlp._mlp_needs_rng_state(block.mlp)
+    cached = block.mlp.__dict__["_unsloth_tiled_dropouts"]
+    # transformers runs `for layer in self.layers[:n]` every forward, re-registering each layer.
+    layers = torch.nn.ModuleList([block])
+    layers[:1]
+    assert not tiled_mlp._mlp_needs_rng_state(block.mlp)
+    assert block.mlp.__dict__["_unsloth_tiled_dropouts"] is cached
+
+    # LoRA added after the first forward, on the original and on a deepcopy, is still seen.
+    clone = copy.deepcopy(block)
+    block = _lora(block, 0.1)
+    assert tiled_mlp._mlp_needs_rng_state(block.mlp)
+    clone = _lora(clone, 0.1)
+    assert tiled_mlp._mlp_needs_rng_state(clone.mlp)
+pass

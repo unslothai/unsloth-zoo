@@ -20,6 +20,7 @@ import math
 from collections import OrderedDict
 from types import MethodType
 import functools
+import weakref
 from fnmatch import fnmatch
 import torch
 from torch.utils.checkpoint import (
@@ -251,11 +252,17 @@ def _mxfp4_instance_forward(mlp_module):
 
 _DROPOUT_TYPES = (getattr(torch.nn.modules.dropout, "_DropoutNd", torch.nn.Dropout),)
 
-# Bumped on any submodule registration (e.g. PEFT adding lora_dropout) to invalidate dropout lists.
+# Bumped when a submodule is registered under a tiled MLP (e.g. PEFT adding lora_dropout) to
+# invalidate dropout lists. Only MLP subtrees count: transformers slices `self.layers[:n]` every
+# forward, which re-registers every layer and would otherwise force a rescan per layer per token.
 _MODULE_TREE_VERSION = [0]
+# id -> module, weak: a freed module's id reused by a sliced ModuleList must not match, and
+# keying on id avoids hashing arbitrary modules inside a process-wide hook.
+_TRACKED_MODULES = weakref.WeakValueDictionary()
 
 def _bump_module_tree_version(module, name, submodule):
-    _MODULE_TREE_VERSION[0] += 1
+    if _TRACKED_MODULES.get(id(module)) is module:
+        _MODULE_TREE_VERSION[0] += 1
     return None
 pass
 
@@ -270,12 +277,16 @@ def _mlp_needs_rng_state(mlp_module):
     # Per forward, not at patch time: unsloth patches before get_peft_model adds lora_dropout,
     # so a patch time scan missed it and the recompute drew different masks (wrong grads).
     cached = mlp_module.__dict__.get("_unsloth_tiled_dropouts")
-    if cached is None or not _HAS_MODULE_TREE_VERSION or cached[0] != _MODULE_TREE_VERSION[0]:
-        dropouts = tuple(m for m in mlp_module.modules() if isinstance(m, _DROPOUT_TYPES))
-        cached = (_MODULE_TREE_VERSION[0], dropouts)
+    # id check: a deepcopy carries the cache but its subtree is not tracked yet.
+    if cached is None or not _HAS_MODULE_TREE_VERSION or \
+        cached[0] != _MODULE_TREE_VERSION[0] or cached[1] != id(mlp_module):
+        modules = tuple(mlp_module.modules())
+        _TRACKED_MODULES.update((id(m), m) for m in modules)
+        dropouts = tuple(m for m in modules if isinstance(m, _DROPOUT_TYPES))
+        cached = (_MODULE_TREE_VERSION[0], id(mlp_module), dropouts)
         # __dict__, not setattr: these are already children, do not register them twice.
         mlp_module.__dict__["_unsloth_tiled_dropouts"] = cached
-    for m in cached[1]:
+    for m in cached[2]:
         if m.training and m.p > 0:
             return True
     return False
