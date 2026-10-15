@@ -2480,7 +2480,9 @@ def _store_vision_module(vllm_module, hf_name, state_dict, quant_state_dict, get
         # Non-layered keys are installed as plain tensors (set_additional_modules), so a
         # bitsandbytes-packed weight is dequantized (a small projection, e.g. Gemma-4 unified patch_dense).
         import bitsandbytes.functional as bnb_functional
-        weight = bnb_functional.dequantize_4bit(vllm_module.weight.data, quant_states[0])
+        # Extraction runs under vLLM's inference_mode; the dense copy is a training weight.
+        with torch.inference_mode(False), torch.no_grad():
+            weight = bnb_functional.dequantize_4bit(vllm_module.weight.data, quant_states[0])
         state_dict[f"{hf_name}.weight"] = weight
         quant_state_dict[f"{hf_name}.weight"] = weight
         bias = getattr(vllm_module, "bias", None)

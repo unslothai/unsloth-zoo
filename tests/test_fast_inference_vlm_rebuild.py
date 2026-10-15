@@ -202,9 +202,11 @@ def test_gemma4_unified_bnb_patch_dense_is_dequantized(monkeypatch, tmp_path):
     patch_dense.weight.bnb_quant_state = {0: quant_state}
     expected = bnb_functional.dequantize_4bit(packed, quant_state)
 
-    _, rebuilt = _rebuild(monkeypatch, llm, config)
+    with torch.inference_mode():  # get_vllm_state_dict runs under vLLM's inference_mode
+        _, rebuilt = _rebuild(monkeypatch, llm, config)
     got = rebuilt.model.embed_vision.patch_dense.weight
     assert got.dtype == torch.float32 and torch.equal(got, expected)
+    assert not got.is_inference()  # trainable (vision LoRA / full vision fine-tuning)
     torch.testing.assert_close(got, reference.model.embed_vision.patch_dense.weight, atol = 0.05, rtol = 0)
 
 
