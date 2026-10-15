@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CUDA `modules_to_save` copies must reach the merged shards intact: a non_blocking
-device-to-host copy was written before it landed (previous same-size tensor, or zeros)."""
+"""CUDA `modules_to_save` copies must land in their own merged keys, not a stale pinned buffer."""
 
 from __future__ import annotations
 
