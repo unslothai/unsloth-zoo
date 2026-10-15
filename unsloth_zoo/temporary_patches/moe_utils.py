@@ -1144,7 +1144,10 @@ def _bnb4bit_expert_split(param):
     return E, tuple(int(x) for x in shape[1:])
 
 
-_SELECTIVE_GATHER_PIECES = 8   # a gathered piece's packed copy is 1/32 of the fp16 output, its decode 1/8
+# Gathered ids are decoded in pieces of at least _SELECTIVE_GATHER_MIN experts and at most 1/8 of
+# the request, so the packed copy stays near 1/32 of the fp16 output without a launch per expert.
+_SELECTIVE_GATHER_PIECES = 8
+_SELECTIVE_GATHER_MIN = 32
 
 
 def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
@@ -1176,7 +1179,7 @@ def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
         pieces = [experts]
     else:
         n = int(experts.numel())
-        pieces = list(experts.split(max(1, -(-n // _SELECTIVE_GATHER_PIECES))))
+        pieces = list(experts.split(max(_SELECTIVE_GATHER_MIN, -(-n // _SELECTIVE_GATHER_PIECES))))
 
     def take(t, piece):
         return t[piece] if isinstance(piece, slice) else t.index_select(0, piece)
@@ -1248,9 +1251,9 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
     experts = [e for e, c in enumerate(counts) if c > 0] if selective else list(range(E))
     if not experts:
         return None
+    if not chunk and 8 * len(experts) > 7 * E:
+        return None   # under 1/8 of the stack to save, not worth the gathers
     chunk = chunk or len(experts)
-    if len(experts) == E and chunk >= E:
-        return None
     ends = []
     total = 0
     for c in counts:

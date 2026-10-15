@@ -47,7 +47,7 @@ def _env(monkeypatch):
 
 
 @pytest.mark.parametrize("nested", [False, True])
-def test_subset_dequant_matches_full_stack(nested):
+def test_subset_dequant_matches_full_stack(nested, monkeypatch):
     torch.manual_seed(0)
     experts = _Experts(nested)
     for param in (experts.gate_up_proj, experts.down_proj):
@@ -55,6 +55,10 @@ def test_subset_dequant_matches_full_stack(nested):
         for ids in (torch.tensor([7], device = DEVICE), torch.tensor([1, 4, 5, 11, 15], device = DEVICE), slice(2, 9)):
             sub = mu._get_base_weight(param, torch.bfloat16, experts = ids)
             assert torch.equal(sub, full[ids])
+        monkeypatch.setattr(mu, "_SELECTIVE_GATHER_MIN", 1)   # several pieces decoded into one output
+        ids = torch.tensor([0, 2, 3, 6, 8, 9, 10, 12, 13, 15], device = DEVICE)
+        assert torch.equal(mu._get_base_weight(param, torch.bfloat16, experts = ids), full[ids])
+        monkeypatch.setattr(mu, "_SELECTIVE_GATHER_MIN", 32)
 
 
 def _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch):
@@ -117,14 +121,20 @@ def test_forward_and_grads_match_full_stack(nested, mode, monkeypatch):
         assert stats["dequant_calls"] == 4 * -(-per_read // 4)
 
 
-def test_all_experts_routed_keeps_the_full_stack_path(monkeypatch):
+def test_nearly_all_experts_routed_keeps_the_full_stack_path(monkeypatch):
     monkeypatch.setenv("UNSLOTH_MOE_SELECTIVE_DEQUANT", "1")
     experts = _Experts(False)
+    sources = (experts.gate_up_proj, experts.down_proj)
     counts = torch.ones(E, dtype = torch.int32, device = DEVICE)
-    assert mu._selective_dequant_plan((experts.gate_up_proj, experts.down_proj), counts, E) is None
-    counts[3] = 0
-    plan = mu._selective_dequant_plan((experts.gate_up_proj, experts.down_proj), counts, E - 1)
-    assert plan is not None and plan.chunks[0][0].numel() == E - 1
+    assert mu._selective_dequant_plan(sources, counts, E) is None
+    counts[3] = 0   # 15 of 16 routed: above 7/8
+    assert mu._selective_dequant_plan(sources, counts, E - 1) is None
+    counts[4] = 0   # 14 of 16
+    plan = mu._selective_dequant_plan(sources, counts, E - 2)
+    assert plan is not None and plan.chunks[0][0].numel() == E - 2
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "8")
+    plan = mu._selective_dequant_plan(sources, torch.ones(E, dtype = torch.int32, device = DEVICE), E)
+    assert [c[0] for c in plan.chunks] == [slice(0, 8), slice(8, 16)]
 
 
 def test_plan_declines_unsplittable_or_plain_weights(monkeypatch):
