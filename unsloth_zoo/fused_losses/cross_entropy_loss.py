@@ -32,6 +32,7 @@ import math
 import os
 import sys
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bounds
 from unsloth_zoo.device_type import DEVICE_TYPE
         
 
@@ -341,9 +342,18 @@ class UnslothFusedLoss(torch.autograd.Function):
             )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
-        __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
-        __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
-        __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
+        bounds = chunk_row_bounds(bsz * qlen, n_chunks, align = CHUNK_ALIGN_ROWS)
+        if bounds is not None:
+            ranges = list(zip(bounds[:-1], bounds[1:]))
+            _flat_states = hidden_states.reshape(-1, hd)
+            _flat_grads  = grad_inputs.view(-1, hd)
+            __shift_labels = [labels[a:b]       for a, b in ranges]
+            __shift_states = [_flat_states[a:b] for a, b in ranges]
+            __grad_inputs  = [_flat_grads[a:b]  for a, b in ranges]
+        else:
+            __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
+            __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
+            __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
 
         def accumulate_chunk(
             n_chunks,
