@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Chunked lm_head losses split rows into chunks whose sizes are multiples of 128
-(the last takes the remainder). torch.chunk gave odd sizes such as 683 rows, which
-run the GEMM as 6 row tiles of 128 with 85 rows of padding, in every chunk. The
-chunk count, the losses and the gradients must not change beyond the order of the
-per-chunk sums."""
+"""128-row chunk alignment: same chunk count, losses and gradients up to sum order."""
 import json
 import math
 import os
@@ -93,11 +89,9 @@ def test_fused_ce_matches_previous_chunking(monkeypatch, dtype, tol, bsz, qlen, 
     ce = _ce_module()
     monkeypatch.setattr(ce, "CHUNK_ALIGN_ROWS", ALIGN, raising = False)
     loss, grads, _ = _run_fused(ce, bsz, qlen, n_chunks, dtype, bias = bias)
-    # The torch.chunk boundaries every release before this one used.
     monkeypatch.setattr(ce, "CHUNK_ALIGN_ROWS", 0, raising = False)
     old_loss, old_grads, old_rows = _run_fused(ce, bsz, qlen, n_chunks, dtype, bias = bias)
     assert old_rows == [t.shape[0] for t in torch.chunk(torch.empty(bsz * qlen), n_chunks)]
-    # accumulated_loss is a float32 scalar whatever the input dtype.
     torch.testing.assert_close(loss, old_loss, rtol = 2e-6, atol = 2e-6)
     # The input gradient of a row depends only on that row.
     torch.testing.assert_close(grads[0], old_grads[0], rtol = tol, atol = tol)

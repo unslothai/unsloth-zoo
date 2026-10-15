@@ -317,9 +317,6 @@ class UnslothFusedLoss(torch.autograd.Function):
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         n_rows = bsz * qlen
         if CHUNK_ALIGN_ROWS > 1 and n_chunks > 1 and n_rows >= CHUNK_ALIGN_ROWS * n_chunks:
-            # Same chunk count, all chunks but the last a multiple of 128 rows, largest chunk
-            # at most 127 rows over torch.chunk's. Only the order of the per-chunk sums
-            # (loss, lm_head gradient) changes. Smaller inputs keep torch.chunk exactly.
             bounds = chunk_row_bounds(n_rows, n_chunks, align = CHUNK_ALIGN_ROWS)
             ranges = list(zip(bounds[:-1], bounds[1:]))
             _flat_states = hidden_states.reshape(-1, hd)

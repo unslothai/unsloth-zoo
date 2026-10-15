@@ -108,8 +108,7 @@ def chunked_hidden_states_selective_log_softmax(
         else 0
     ),
     lm_head_bias: Optional[torch.Tensor] = None,
-    # Opt-in (UNSLOTH_CE_CHUNK_ALIGN=1) 128 row chunk alignment. Read in the default
-    # for the same reason as max_rows_per_chunk. 0 keeps the previous boundaries.
+    # Read in the default for the same reason as max_rows_per_chunk.
     chunk_align_rows: int = (
         128 if os.environ.get("UNSLOTH_CE_CHUNK_ALIGN", "0").strip() == "1" else 0
     ),
@@ -148,10 +147,7 @@ def chunked_hidden_states_selective_log_softmax(
 
     n_rows = flat_hidden_states.shape[0]
     chunks = max(1, min(chunks, n_rows))
-    # Exactly `chunks` ranges. With chunk_align_rows, all but the last are a multiple of it once
-    # every range has that many rows (fewer GEMM tile rows wasted), else i * n_rows // chunks.
-    # Inlined, not a helper call: this source is pasted into the generated trainer file.
-    # torch.sym_min, not min or if, so a symbolic n_rows adds no guard.
+    # Inlined chunk_row_bounds: this source is pasted into the generated trainer file.
     if chunk_align_rows > 1:
         unit = 1 + (chunk_align_rows - 1) * torch.sym_min(1, (n_rows // chunks) // chunk_align_rows)
         bounds = [unit * (((i * n_rows) // chunks) // unit) for i in range(chunks)] + [n_rows]
