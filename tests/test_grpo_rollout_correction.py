@@ -380,3 +380,25 @@ def test_vespo_rejects_non_token_is_mode_override(monkeypatch, mode):
     with pytest.raises(ValueError, match = "VESPO"):
         _drive(monkeypatch, correction = True, loss_type = "vespo", is_mode = mode)
     _drive(monkeypatch, correction = True, loss_type = "vespo", is_mode = "token_mask")
+
+
+def test_is_clip_env_parse_and_validation():
+    assert rr.grpo_parse_is_clip("0.999_1.001", "geometric_mask") == (0.999, 1.001)
+    assert rr.grpo_parse_is_clip("_2", "token_truncate") == (None, 2.0)
+    assert rr.grpo_parse_is_clip("0_2", "token_truncate") == (0.0, 2.0)
+    assert rr.grpo_parse_is_clip("0.5_", "sequence_mask") == (0.5, None)
+    assert rr.grpo_parse_is_clip("_", "token_mask") == (None, None)
+    for bad, mode in [("2_1", "token_truncate"), ("2_1", "sequence_mask"), ("-1_2", "token_mask"),
+                      ("_0", "token_truncate"), ("_nan", "token_mask"), ("_inf", "token_truncate"),
+                      ("_", "token_truncate"), ("_", "geometric_truncate")]:
+        with pytest.raises(ValueError, match = "UNSLOTH_GRPO_VLLM_IS_CLIP"):
+            rr.grpo_parse_is_clip(bad, mode)
+
+
+@pytest.mark.parametrize("spec", ["2_1", "_"])
+def test_reversed_or_empty_is_clip_override_is_rejected(monkeypatch, spec):
+    monkeypatch.setenv("UNSLOTH_GRPO_VLLM_IS_CLIP", spec)
+    with pytest.raises(ValueError, match = "UNSLOTH_GRPO_VLLM_IS_CLIP"):
+        _drive(monkeypatch, correction = True, is_mode = "token_truncate")
+    monkeypatch.setenv("UNSLOTH_GRPO_VLLM_IS_CLIP", "0.5_2")
+    _drive(monkeypatch, correction = True, is_mode = "token_truncate")

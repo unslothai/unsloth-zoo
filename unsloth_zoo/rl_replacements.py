@@ -1728,6 +1728,21 @@ GRPO_ROLLOUT_RS_OPTIONS = (
     "seq_max_k2", "seq_max_k3",
 )
 
+def grpo_parse_is_clip(spec, mode):
+    """Parse UNSLOTH_GRPO_VLLM_IS_CLIP "lower_upper" (either side may be empty) into (lower, upper).
+    Applied after GRPOConfig validation, so it checks the bounds itself: reversed bounds collapse
+    every truncated ratio to one value and make the mask modes reject every token."""
+    lower, _, upper = str(spec).partition("_")
+    lower = float(lower) if lower.strip() else None
+    upper = float(upper) if upper.strip() else None
+    if (lower is not None and not (0 <= lower < math.inf)) or (upper is not None and not (0 < upper < math.inf)):
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP needs a finite lower >= 0 and upper > 0, got {spec!r}.")
+    if lower is not None and upper is not None and lower > upper:
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP lower bound exceeds upper bound in {spec!r}.")
+    if lower is None and upper is None and str(mode).endswith("_truncate"):
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP={spec!r} gives no bound for {mode}.")
+    return lower, upper
+
 def grpo_parse_rollout_rs(options, thresholds):
     """Parse verl rollout_rs / rollout_rs_threshold strings (comma separated, one threshold shared
     or one per option; k1 takes "lower_upper" ratio bounds, default lower = 1 / upper; k2 / k3 a
@@ -2005,9 +2020,10 @@ def grpo_accumulated_loss(
     # "lower_upper" (either side may be empty), e.g. "0.999_1.001" for the geometric modes.
     _is_clip_env = os.environ.get("UNSLOTH_GRPO_VLLM_IS_CLIP", "")
     if _is_clip_env:
-        _is_clip_lower, _, _is_clip_upper = _is_clip_env.partition("_")
-        kwargs["vllm_importance_sampling_clip_min"] = float(_is_clip_lower) if _is_clip_lower.strip() else None
-        kwargs["vllm_importance_sampling_clip_max"] = float(_is_clip_upper) if _is_clip_upper.strip() else None
+        from unsloth_zoo.rl_replacements import grpo_parse_is_clip as _grpo_parse_is_clip
+        kwargs["vllm_importance_sampling_clip_min"], kwargs["vllm_importance_sampling_clip_max"] = _grpo_parse_is_clip(
+            _is_clip_env, kwargs["vllm_importance_sampling_mode"],
+        )
     # verl rollout_rs rejection (token_k3, seq_mean_k3, seq_mean_k1, ...), applied with the vLLM IS ratio.
     from unsloth_zoo.rl_replacements import grpo_parse_rollout_rs as _grpo_parse_rollout_rs
     _rollout_rs = _grpo_parse_rollout_rs(
