@@ -275,10 +275,10 @@ def _per_device_cache(function):
     cached = functools.cache(function)
     @functools.wraps(function)
     def wrapper(device = None):
+        if device is not None and not isinstance(device, int):
+            device = torch.device(device).index
         if device is None:
             device = _current_hip_device_index()
-        elif not isinstance(device, int):
-            device = torch.device(device).index
         return cached(device)
     wrapper.cache_clear = cached.cache_clear
     wrapper.cache_info = cached.cache_info

@@ -213,6 +213,9 @@ def test_amd_caches_take_an_explicit_device(amd_host):
     assert device_type._detect_gfx_arch(1) == "gfx1100"
     assert device_type.get_amd_attention_implementation("cuda:1") == "sdpa"
     assert device_type.get_amd_attention_implementation(torch.device("cuda", 0)) == "amd_aiter"
+    torch.cuda.set_device(1)
+    # An index-less device means the current one, never a stale None-keyed entry.
+    assert device_type._detect_gfx_arch("cuda") == "gfx1100"
 
 
 # Z2: rocminfo fallback honours HIP masks ----------------------------------------------
