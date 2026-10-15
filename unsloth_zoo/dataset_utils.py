@@ -913,8 +913,7 @@ def train_on_responses_only(
                 if ids and ids not in mask_out_sequences:
                     mask_out_sequences.append(ids)
     pass
-    # Grouped by first id. Up to 4 groups, each row costs one C-level list.index scan
-    # per group; past that a single set-membership pass over the row is cheaper.
+    # Up to 4 first ids: one C-level list.index scan each per row; past that one set pass is cheaper.
     mask_out_lookup = {}
     for ids in mask_out_sequences:
         mask_out_lookup.setdefault(ids[0], []).append((ids, len(ids), [-100] * len(ids)))
