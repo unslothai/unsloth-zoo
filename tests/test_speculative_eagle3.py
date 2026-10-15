@@ -309,3 +309,80 @@ def test_chunked_loss_equals_full_loss_and_gradients():
     assert g0.keys() == g1.keys() and g0
     for name in g0:
         assert torch.allclose(g0[name], g1[name], rtol = 1e-4, atol = 1e-6), name
+
+
+def test_training_goes_through_the_drafter_forward(tmp_path):
+    """DDP / FSDP reduce gradients only for calls through forward(); compute_loss must use it."""
+    target = _target()
+    drafter = _drafter(target).train()
+    calls = []
+    real = drafter.forward_train
+    drafter.forward_train = lambda *a, **k: calls.append(1) or real(*a, **k)
+    forwards = []
+    hook = drafter.register_forward_pre_hook(lambda module, args: forwards.append(1))
+    args = Eagle3TrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True, save_strategy = "no")
+    ids = torch.randint(0, VOCAB, (2, 16))
+    trainer = UnslothEagle3Trainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist()}]))
+    trainer.compute_loss(drafter, {"input_ids": ids, "labels": ids, "attention_mask": torch.ones_like(ids)})
+    hook.remove()
+    assert forwards == [1] and calls == [1]
+
+
+def test_accumulated_batches_weight_every_token_equally(tmp_path):
+    """With num_items_in_batch the loss is a sum over the microbatch divided by the logical-batch count."""
+    target = _target()
+    drafter = _drafter(target)
+    args = Eagle3TrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True, save_strategy = "no")
+    ids = torch.randint(0, VOCAB, (1, 16))
+    labels = ids.clone()
+    labels[:, :10] = -100
+    trainer = UnslothEagle3Trainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist()}]))
+    batch = {"input_ids": ids, "labels": labels, "attention_mask": torch.ones_like(ids)}
+    one = trainer.compute_loss(drafter, dict(batch), num_items_in_batch = 1)
+    seven = trainer.compute_loss(drafter, dict(batch), num_items_in_batch = 7)
+    assert trainer.model_accepts_loss_kwargs
+    assert torch.allclose(seven * 7, one)
+
+
+def test_draft_config_keeps_rope_on_every_transformers():
+    """transformers < 5 LlamaConfig reads rope_theta / rope_scaling; >= 5 reads rope_parameters."""
+    from transformers import LlamaConfig
+
+    from unsloth_zoo.speculative.eagle3 import _draft_layer_config
+
+    scaling = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+               "original_max_position_embeddings": 8192}
+    text = LlamaConfig(hidden_size = 64, intermediate_size = 128, num_attention_heads = 4, num_key_value_heads = 2,
+                       vocab_size = VOCAB, rope_theta = 500000.0, rope_scaling = dict(scaling))
+    config = _draft_layer_config(text)
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+
+    text.head_dim = config.head_dim
+    assert torch.equal(LlamaRotaryEmbedding(config).inv_freq, LlamaRotaryEmbedding(text).inv_freq)
+
+
+def test_draft_layer_updates_its_cache():
+    """transformers < 4.56 attention takes `past_key_value`; a wrong name leaves the cache empty."""
+    from transformers import DynamicCache
+
+    target = _target()
+    drafter = _drafter(target)
+    layer = drafter.layers[0]
+    H = drafter.config.hidden_size if hasattr(drafter, "config") else layer.hidden_norm.weight.shape[0]
+    x = torch.randn(1, 4, H)
+    positions = torch.arange(4)[None]
+    cache = DynamicCache()
+    layer(x, x, None, drafter.rotary_emb(x, positions), cache)
+    assert cache.get_seq_length() == 4
+
+
+def test_gemma4_per_layer_head_dim_does_not_break_the_draft_config():
+    gemma4 = pytest.importorskip("transformers.models.gemma4.configuration_gemma4")
+    from unsloth_zoo.speculative.eagle3 import _draft_layer_config
+
+    text = gemma4.Gemma4TextConfig(vocab_size = VOCAB, hidden_size = 64, intermediate_size = 128, num_hidden_layers = 4,
+                                   num_attention_heads = 4, num_key_value_heads = 2)
+    config = _draft_layer_config(text)
+    assert config.num_attention_heads * config.head_dim == config.hidden_size or config.head_dim > 0

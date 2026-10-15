@@ -124,29 +124,38 @@ def build_eagle3_vocab_map(token_id_lists, target_vocab_size, draft_vocab_size =
     return d2t, t2d
 
 
+def _attr(config, name, default = None):
+    # transformers 5 heterogeneous configs (Gemma 4) raise on a per-layer attribute read globally.
+    try:
+        return getattr(config, name, default)
+    except Exception:
+        return default
+
+
 def _draft_layer_config(text, attn_implementation = "sdpa"):
     """A one-layer llama config shaped like the target (speculators `_build_draft_config`)."""
+    import inspect
+
     from transformers import LlamaConfig
 
     hidden = int(text.hidden_size)
     heads = int(text.num_attention_heads)
-    kv_heads = int(getattr(text, "num_key_value_heads", None) or heads)
-    head_dim = getattr(text, "head_dim", None)
+    kv_heads = int(_attr(text, "num_key_value_heads") or heads)
+    head_dim = _attr(text, "head_dim")
     if head_dim and hidden % heads != 0 and hidden % head_dim == 0:
         heads = hidden // head_dim
         if heads % kv_heads != 0:
             kv_heads = heads
     head_dim = int(head_dim or hidden // heads)
-    intermediate = getattr(text, "intermediate_size", None)
-    if not isinstance(intermediate, int) or getattr(text, "num_experts", None) or getattr(text, "num_local_experts", None):
-        # MoE targets have no dense FFN width; speculators uses 3 x hidden.
-        intermediate = intermediate if isinstance(intermediate, int) and not (
-            getattr(text, "num_experts", None) or getattr(text, "num_local_experts", None)) else 3 * hidden
-    rope = getattr(text, "rope_parameters", None) or getattr(text, "rope_scaling", None) or {}
+    intermediate = _attr(text, "intermediate_size")
+    moe = _attr(text, "num_experts") or _attr(text, "num_local_experts")
+    # MoE targets have no dense FFN width; speculators uses 3 x hidden.
+    intermediate = intermediate if isinstance(intermediate, int) and not moe else 3 * hidden
+    rope = _attr(text, "rope_parameters") or _attr(text, "rope_scaling") or {}
     if isinstance(rope, dict) and "rope_theta" not in rope and isinstance(
             rope.get("full_attention") or rope.get("sliding_attention"), dict):
         rope = dict(rope.get("full_attention") or rope.get("sliding_attention"))
-    theta = (rope.get("rope_theta") if isinstance(rope, dict) else None) or getattr(text, "rope_theta", None) or 10000.0
+    theta = (rope.get("rope_theta") if isinstance(rope, dict) else None) or _attr(text, "rope_theta") or 10000.0
     rope_type = rope.get("rope_type", rope.get("type", "default")) if isinstance(rope, dict) else "default"
     # llama.cpp's eagle3 graph and vLLM's llama drafter both run plain (or llama3-scaled) RoPE.
     if rope_type in ("llama3", "linear"):
@@ -154,6 +163,11 @@ def _draft_layer_config(text, attn_implementation = "sdpa"):
         rope_parameters["rope_theta"] = float(theta)
     else:
         rope_parameters = {"rope_type": "default", "rope_theta": float(theta)}
+    if "rope_parameters" in inspect.signature(LlamaConfig.__init__).parameters:
+        rope_kwargs = {"rope_parameters": rope_parameters}
+    else:
+        scaling = {k: v for k, v in rope_parameters.items() if k != "rope_theta"}
+        rope_kwargs = {"rope_theta": float(theta), "rope_scaling": scaling if scaling.get("rope_type") != "default" else None}
     config = LlamaConfig(
         vocab_size = int(text.vocab_size),
         hidden_size = hidden,
@@ -164,13 +178,13 @@ def _draft_layer_config(text, attn_implementation = "sdpa"):
         head_dim = head_dim,
         # llama.cpp's eagle3 FFN is SiLU-gated regardless of the target's activation.
         hidden_act = "silu",
-        max_position_embeddings = int(getattr(text, "max_position_embeddings", 4096) or 4096),
-        initializer_range = float(getattr(text, "initializer_range", 0.02) or 0.02),
-        rms_norm_eps = float(getattr(text, "rms_norm_eps", None) or 1e-6),
+        max_position_embeddings = int(_attr(text, "max_position_embeddings", 4096) or 4096),
+        initializer_range = float(_attr(text, "initializer_range", 0.02) or 0.02),
+        rms_norm_eps = float(_attr(text, "rms_norm_eps") or 1e-6),
         tie_word_embeddings = False,
         attention_bias = False,
         mlp_bias = False,
-        rope_parameters = rope_parameters,
+        **rope_kwargs,
     )
     config._attn_implementation = attn_implementation
     return config
@@ -194,6 +208,10 @@ class _Eagle3Layer(nn.Module):
         self.self_attn.q_proj = nn.Linear(2 * H, config.num_attention_heads * hd, bias = config.attention_bias)
         self.self_attn.k_proj = nn.Linear(2 * H, config.num_key_value_heads * hd, bias = config.attention_bias)
         self.self_attn.v_proj = nn.Linear(2 * H, config.num_key_value_heads * hd, bias = config.attention_bias)
+        import inspect
+
+        params = inspect.signature(self.self_attn.forward).parameters
+        self._cache_kw = "past_key_values" if "past_key_values" in params else "past_key_value"
 
     def forward(self, embeds, hidden, attention_mask, position_embeddings, past_key_values):
         residual = hidden
@@ -205,7 +223,7 @@ class _Eagle3Layer(nn.Module):
             hidden_states = torch.cat([embeds, hidden], dim = -1),
             position_embeddings = position_embeddings,
             attention_mask = attention_mask,
-            past_key_values = past_key_values,
+            **{self._cache_kw: past_key_values},
         )
         hidden = residual + out
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
@@ -286,6 +304,10 @@ class Eagle3Drafter(nn.Module):
     def _run(self, embeds, hidden, mask, positions, cache):
         position_embeddings = self.rotary_emb(hidden, positions)
         return self.layers[0](embeds, hidden, mask, position_embeddings, cache)
+
+    def forward(self, aux_hidden, input_ids, attention_mask = None, ttt_steps = 3, return_hidden = False):
+        # Distributed wrappers only reduce gradients for calls that go through forward().
+        return self.forward_train(aux_hidden, input_ids, attention_mask, ttt_steps, return_hidden)
 
     def forward_train(self, aux_hidden, input_ids, attention_mask = None, ttt_steps = 3, return_hidden = False):
         """Training-time test over full sequences (speculators `Eagle3DraftModel.forward` after
@@ -523,9 +545,11 @@ def eagle3_loss(step_logits, teacher_logits, loss_mask, decay = 1.0):
 
 
 def eagle3_chunked_loss(drafter, step_hidden, final_hidden, lm_head_weight, loss_mask, decay = 1.0,
-                        chunk_rows = 1024):
+                        chunk_rows = 1024, normalizer = None):
     """`eagle3_loss` from the drafter's hidden states, on supervised rows only, in checkpointed chunks:
-    draft and teacher logits never exist for the whole batch ([B, T, Vd] fp32 per step OOMs 24 GB cards)."""
+    draft and teacher logits never exist for the whole batch ([B, T, Vd] fp32 per step OOMs 24 GB cards).
+    `normalizer` (supervised tokens in the whole accumulated batch) replaces the per-microbatch count,
+    so gradient accumulation weights every token equally."""
     from torch.utils.checkpoint import checkpoint
 
     weight = lm_head_weight[drafter.t2d.to(lm_head_weight.device)] if drafter.uses_draft_vocab else lm_head_weight
@@ -556,7 +580,7 @@ def eagle3_chunked_loss(drafter, step_hidden, final_hidden, lm_head_weight, loss
             hit_sum += int(hits)
         denom = n + 1e-5
         step_loss = kl_sum / denom
-        total = total + (decay ** k) * step_loss
+        total = total + (decay ** k) * (step_loss if normalizer is None else kl_sum / normalizer)
         stats["loss"].append(float(step_loss.detach()))
         stats["acc"].append(hit_sum / denom)
         stats["count"].append(float(n))
@@ -602,6 +626,8 @@ class UnslothEagle3Trainer(Trainer):
                 pad = getattr(tokenizer, "eos_token_id", 0) or 0
             kwargs["data_collator"] = MTPDataCollator(pad)
         super().__init__(model = model, args = args, **kwargs)
+        # compute_loss normalizes by num_items_in_batch itself, so the Trainer must not also divide by GA.
+        self.model_accepts_loss_kwargs = True
         self._eagle3_log = []
 
     def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None):
@@ -618,10 +644,12 @@ class UnslothEagle3Trainer(Trainer):
         loss_mask = (labels[:, 1:] != -100)
         if attention_mask is not None:
             loss_mask = loss_mask & attention_mask[:, 1:].bool()
-        step_hidden = drafter.forward_train(aux, input_ids, attention_mask, self.args.eagle3_ttt_steps,
-                                            return_hidden = True)
+        step_hidden = model(aux, input_ids, attention_mask, self.args.eagle3_ttt_steps, return_hidden = True)
+        normalizer = None
+        if num_items_in_batch is not None:
+            normalizer = torch.as_tensor(num_items_in_batch, device = loss_mask.device, dtype = torch.float32).clamp(min = 1)
         loss, stats = eagle3_chunked_loss(drafter, step_hidden, captured["final"][:, 1:], self._lm_head_weight,
-                                          loss_mask, self.args.eagle3_step_decay)
+                                          loss_mask, self.args.eagle3_step_decay, normalizer = normalizer)
         if model.training:
             self._eagle3_log.append(stats)
         return (loss, None) if return_outputs else loss
