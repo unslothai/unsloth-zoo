@@ -156,5 +156,4 @@ def test_tiled_mlp_budget_follows_the_input_device(monkeypatch):
     x = torch.randn(2, 64, 16, requires_grad = True)
     mlp(x).sum().backward()
     mlp(x).sum().backward()
-    # Measured once per device, with the device the input lives on.
     assert seen == [x.device], seen

@@ -189,8 +189,7 @@ def _free_target_gb(device = None):
 def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        # Measured on every call: free memory moves during training, and a cached
-        # first reading (often taken before the optimizer states exist) was reused forever.
+        # Not cached: a first reading (before optimizer states exist) was reused forever.
         target_gb = _free_target_gb(device)
     pass
 

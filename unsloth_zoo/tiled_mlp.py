@@ -78,15 +78,13 @@ def _default_target_gb(device = None):
     # Size the tile memory budget from the free memory actually available on the
     # current backend, so a device with little memory left does not pick chunks
     # that immediately OOM. Mirror the CUDA path: query free memory and keep half.
-    # `device` is the device the operand lives on. None means the current device,
-    # never a hard-coded index 0: under torchrun rank 1 asking GPU 0 reads the wrong
-    # card's free memory and opens a CUDA context on a GPU it never uses.
+    # None means the current device, never index 0: under torchrun asking GPU 0
+    # reads the wrong card and opens a CUDA context on a GPU the rank never uses.
     index = None
     if device is not None:
         if not isinstance(device, torch.device):
             device = torch.device(device)
         if device.type in ("cpu", "meta", "mps"):
-            # Host / unified memory: budget from host RAM below.
             return _host_target_gb()
         index = device.index
     if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
@@ -278,8 +276,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
     mlp_module._unsloth_forward = forward
 
 
-    # Automatic budget measured once per device the module runs on (device_map can
-    # place layers on different GPUs), not once for whichever device came first.
+    # Per device: device_map can place layers on different GPUs.
     auto_target_gb = {}
 
     def tiled_forward_target_gb(self, x):
