@@ -45,7 +45,7 @@ ALLOWLIST_PATH = Path(__file__).resolve().parent / "dynamic_exec_allowlist.json"
 
 # Directories scanned by default. Tests are excluded: they legitimately keep the
 # removed exec/eval around as an oracle to prove the replacement matches it.
-DEFAULT_TARGETS = ("unsloth_zoo", "unsloth", "studio", "scripts")
+DEFAULT_TARGETS = ("unsloth_zoo", "unsloth_zoo_downloads", "unsloth", "studio", "scripts")
 
 
 def _relative(path: Path) -> str:

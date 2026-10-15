@@ -4659,6 +4659,74 @@ def _save_remote_code_files(model, save_directory):
 pass
 
 
+_OUTPUT_DTYPE_ALIASES = {
+    "float32" : torch.float32, "fp32" : torch.float32, "f32" : torch.float32,
+    "float16" : torch.float16, "fp16" : torch.float16, "f16" : torch.float16, "half" : torch.float16,
+    "bfloat16" : torch.bfloat16, "bf16" : torch.bfloat16,
+}
+
+def _normalize_output_dtype(output_dtype):
+    if not isinstance(output_dtype, str): return output_dtype
+    key = output_dtype.strip().lower().removeprefix("torch.")
+    if key not in _OUTPUT_DTYPE_ALIASES:
+        raise ValueError(
+            f"Unsloth: Unsupported output dtype `{output_dtype}`. Use None (keep the base "
+            f"checkpoint's dtype) or \"float32\"."
+        )
+    return _OUTPUT_DTYPE_ALIASES[key]
+pass
+
+
+def _float32_merge_peak_bytes(total_16bit_bytes, max_shard_16bit_bytes, uploads_as_it_goes = False):
+    # A widened shard can be rewritten once more (grown vocab), holding two float32 copies.
+    # Local: earlier shards stay widened, so 2 x total + one more 16-bit shard's worth.
+    # Streamed to the Hub: widened shards are uploaded and removed, so total + 3 x shard.
+    if uploads_as_it_goes:
+        return total_16bit_bytes + 3 * max_shard_16bit_bytes
+    return 2 * total_16bit_bytes + 2 * max_shard_16bit_bytes
+pass
+
+
+def _upcast_shard_to_float32(save_directory, filename):
+    # Streams one tensor at a time to a temp file, then os.replace. A no-op on a shard
+    # with no BF16 / F16 tensors, so a re-run or an already float32 base costs nothing.
+    file_path = os.path.join(save_directory, filename)
+    with open(file_path, "rb") as f:
+        length_of_header = int.from_bytes(f.read(8), "little")
+        header_metadata = json.loads(f.read(length_of_header))
+    if not any(
+        isinstance(v, dict) and v.get("dtype") in ("BF16", "F16")
+        for k, v in header_metadata.items() if k != "__metadata__"
+    ):
+        return
+    _stream_rewrite_resized_shard_and_replace(
+        file_path, os.path.dirname(os.path.abspath(file_path)),
+        header_metadata, length_of_header, {}, cast_to = torch.float32,
+    )
+pass
+
+
+def _mark_config_float32(config_path):
+    # Without this, from_pretrained(dtype = "auto") reads bfloat16 and downcasts on load.
+    if not os.path.exists(config_path): return
+    with open(config_path, "r", encoding = "utf-8") as f:
+        data = json.load(f)
+    def _walk(obj):
+        if isinstance(obj, dict):
+            for key in ("torch_dtype", "dtype"):
+                if obj.get(key) in ("bfloat16", "float16"): obj[key] = "float32"
+            for value in obj.values(): _walk(value)
+        elif isinstance(obj, list):
+            for value in obj: _walk(value)
+    _walk(data)
+    if "torch_dtype" not in data and "dtype" not in data:
+        data["torch_dtype"] = "float32"
+    with open(config_path, "w", encoding = "utf-8") as f:
+        json.dump(data, f, indent = 2, sort_keys = True)
+        f.write("\n")
+pass
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -4691,6 +4759,11 @@ def merge_and_overwrite_lora(
             "To merge deliberately, pass `save_method = \"merged_16bit\"` (or "
             "\"merged_4bit\", \"mxfp4\") so the intent is on the call."
         )
+
+    # Only an explicit float32 on merged_16bit widens the shards; None, 16-bit values and
+    # every other save_method keep the on-disk dtype, as before.
+    output_dtype = _normalize_output_dtype(output_dtype)
+    upcast_to_float32 = output_dtype is torch.float32 and save_method == "merged_16bit"
 
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
@@ -4947,6 +5020,21 @@ def merge_and_overwrite_lora(
         break
     pass
 
+    # prepare_saving sized untouched tensors at their in-memory width, but every 16-bit tensor
+    # is widened, and each shard sits beside its float32 copy while it is rewritten.
+    if upcast_to_float32:
+        _peak = _float32_merge_peak_bytes(
+            total_size_in_bytes, max_size_in_bytes,
+            uploads_as_it_goes = push_to_hub and low_disk_space_usage,
+        )
+        if free < _peak:
+            raise RuntimeError(
+                f"Unsloth: a float32 merged export of `{model_name}` needs about "
+                f"{_peak / 1024**3:.1f} GB of free disk at its peak, but `{save_directory}` has "
+                f"{free / 1024**3:.1f} GB. Nothing was written. Free disk space, save to a larger "
+                f"volume, or use `output_dtype = None` for a 16-bit merge."
+            )
+
     # Read before Step 1 rewrites config.json: an in-place export would strip the block size.
     _fp8_disk_block_size = (
         _fp8_block_size_on_disk(model_name, token)
@@ -5038,6 +5126,12 @@ def merge_and_overwrite_lora(
             "packed tensors would be written unmerged. Nothing was written. Save the adapter "
             "with `model.save_pretrained(...)` instead."
         )
+    if upcast_to_float32 and (base_model_is_quantized or _ct_packed_format is not None):
+        raise RuntimeError(
+            f"Unsloth: a float32 merged export needs a 16-bit base checkpoint, but `{model_name}` "
+            f"is stored quantized ({quant_type or _ct_packed_format}). Nothing was merged. Use "
+            f"`output_dtype = None` for the default 16-bit merge."
+        )
     _ct_int_schemes = _compressed_int_pack_schemes(model_name, token) if _ct_packed_format == "pack-quantized" else None
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
@@ -5070,6 +5164,8 @@ def merge_and_overwrite_lora(
             _copy_export_remote_code(model_name, save_directory, token, model)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
+        if upcast_to_float32:
+            _mark_config_float32(Path(save_directory) / "config.json")
         _save_remote_code_files(model, save_directory)
         # #5410: keep trained eos / sampling defaults on reload.
         try:
@@ -5446,6 +5542,9 @@ def merge_and_overwrite_lora(
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
         if _int_rewrite is not None:
             _rewrite_compressed_int_shard(save_directory, filename, _int_rewrite, output_dtype)
+        if upcast_to_float32:
+            # Widen the shard first so the in-place merge below writes float32 slots.
+            _upcast_shard_to_float32(save_directory, filename)
         merged_count, shard_keys = _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
@@ -8344,12 +8443,16 @@ def split_safetensors_to_shards(file_path, max_shard_size_gb=2):
     return shards
 pass
 
-def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of_header, resized):
+def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of_header, resized, cast_to = None):
     # Stream one tensor at a time (peak RAM ~ one tensor): resized tensors from
     # `resized`, the rest byte-copied from src. Tensor-identical to dict+save_file.
     # A key of `resized` absent from the source header is APPENDED rather than replaced,
     # which is how a trained head with no base counterpart reaches the shard.
+    # `cast_to` re-labels and converts every BF16 / F16 tensor (float32 merged export).
     import struct
+    cast_name = _SAFETENSORS_DTYPE_NAMES[cast_to] if cast_to is not None else None
+    def _out_dtype(name):
+        return cast_name if cast_name is not None and name in ("BF16", "F16") else name
     src_data_start = 8 + length_of_header
     meta = header_metadata.get("__metadata__", None)
     tensor_keys = [k for k in header_metadata.keys() if k != "__metadata__"]
@@ -8361,31 +8464,36 @@ def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of
     for k in resized:
         entry = header_metadata.get(k)
         tensor = resized[k].detach()
-        if entry is not None: tensor = tensor.to(SAFETENSORS_DTYPES[entry["dtype"]])
+        if entry is not None: tensor = tensor.to(SAFETENSORS_DTYPES[_out_dtype(entry["dtype"])])
         res_t[k] = tensor.contiguous().cpu()
     tensor_keys += [k for k in res_t if k not in header_metadata]
 
     new_header = {}
     if meta is not None:
         new_header["__metadata__"] = meta
-    layout = []  # (key, src_off0, nbytes, is_resized)
+    layout = []  # (key, src_off0, src_nbytes, is_resized, cast)
     cursor = 0
     for k in tensor_keys:
         entry = header_metadata.get(k)
+        cast = None
         if k in res_t:
             t = res_t[k]
             shape = list(t.shape)
-            nbytes = t.numel() * t.element_size()
+            nbytes = src_nbytes = t.numel() * t.element_size()
             # dtype is unchanged by a vocab resize; an appended key labels its own.
-            dtype = entry["dtype"] if entry is not None else _SAFETENSORS_DTYPE_NAMES[t.dtype]
+            dtype = _out_dtype(entry["dtype"]) if entry is not None else _SAFETENSORS_DTYPE_NAMES[t.dtype]
         else:
             shape = list(entry["shape"])
             o0, o1 = entry["data_offsets"]
-            nbytes = o1 - o0
-            dtype = entry["dtype"]
+            nbytes = src_nbytes = o1 - o0
+            dtype = _out_dtype(entry["dtype"])
+            if dtype != entry["dtype"]:
+                cast = SAFETENSORS_DTYPES[entry["dtype"]]
+                nbytes = src_nbytes // torch.tensor([], dtype = cast).element_size() * \
+                    torch.tensor([], dtype = cast_to).element_size()
         new_header[k] = {"dtype": dtype, "shape": shape,
                          "data_offsets": [cursor, cursor + nbytes]}
-        layout.append((k, entry["data_offsets"][0] if entry is not None else 0, nbytes, k in res_t))
+        layout.append((k, entry["data_offsets"][0] if entry is not None else 0, src_nbytes, k in res_t, cast))
         cursor += nbytes
 
     header_bytes = json.dumps(new_header, separators = (",", ":")).encode("utf-8")
@@ -8395,10 +8503,23 @@ def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of
     with open(dst_path, "wb") as out, open(src_path, "rb") as src:
         out.write(struct.pack("<Q", len(header_bytes)))
         out.write(header_bytes)
-        for k, src_off0, nbytes, is_resized in layout:
+        for k, src_off0, nbytes, is_resized, cast in layout:
             if is_resized:
                 # reshape(-1) so 0-dim scalars (e.g. Gemma-4 audio min/max) view as bytes
                 out.write(memoryview(res_t[k].reshape(-1).view(torch.uint8).numpy()))
+            elif cast is not None:
+                # Bounded chunks, so a multi-GB embedding never sits in RAM at both widths.
+                src.seek(src_data_start + src_off0)
+                remaining = nbytes
+                while remaining > 0:
+                    raw = bytearray(src.read(min(CHUNK, remaining)))
+                    if not raw:
+                        raise RuntimeError(
+                            f"Unsloth: unexpected EOF reading {src_path} for tensor {k}")
+                    wide = torch.frombuffer(raw, dtype = cast).to(cast_to)
+                    out.write(memoryview(wide.view(torch.uint8).numpy()))
+                    remaining -= len(raw)
+                    del raw, wide
             else:
                 src.seek(src_data_start + src_off0)
                 remaining = nbytes
@@ -8440,7 +8561,7 @@ def _inplace_rewrite_resized_shard(filename_original, header_metadata, resized):
     tensors.clear()
 
 
-def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, header_metadata, length_of_header, resized):
+def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, header_metadata, length_of_header, resized, cast_to = None):
     # Stream the resized shard to a temp file then atomically os.replace it in
     # (peak RAM ~ one tensor). Used when disk has room for the transient copy.
     max_retries = 5
@@ -8460,6 +8581,7 @@ def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, heade
             header_metadata = header_metadata,
             length_of_header = length_of_header,
             resized = resized,
+            cast_to = cast_to,
         )
         if original_mode is not None:
             try:

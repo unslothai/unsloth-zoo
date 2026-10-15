@@ -2,6 +2,7 @@
   "_comment": "Call sites that predate the gate, each with why it is safe. New ones fail; see scripts/lint_risky_loaders.py.",
   "targets": [
     "unsloth_zoo",
+    "unsloth_zoo_downloads",
     "scripts"
   ],
   "entries": [
@@ -102,7 +103,7 @@
       "reason": "Iterates the fixed _VLLM_BNB_LOADER_PATHS pair of vLLM bitsandbytes loader modules."
     },
     {
-      "file": "unsloth_zoo/hf_xet_fallback.py",
+      "file": "unsloth_zoo_downloads/hf_xet_fallback.py",
       "rule": "dynamic-import",
       "sink": "import_module",
       "digest": "59e72c01edb14c86",
@@ -302,6 +303,22 @@
       "reason": "Reads back a .pt file this function just wrote with torch.save into a temporary location; never a downloaded file."
     },
     {
+      "file": "unsloth_zoo/speculative/__init__.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "9d1bef964dfe2d2f",
+      "count": 1,
+      "reason": "Lazy re-export: the submodule name comes from this package's own fixed name -> submodule table, never from user input."
+    },
+    {
+      "file": "unsloth_zoo/speculative/nextn.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "09d04a1e91d8e06e",
+      "count": 1,
+      "reason": "Imports transformers.models.<m>.modeling_<m> where <m> is the MTPFamily.module literal from the in-repo registry (mtp_families.py), never from a checkpoint or user input."
+    },
+    {
       "file": "unsloth_zoo/temporary_patches/ernie4_5_moe.py",
       "rule": "dynamic-import",
       "sink": "import_module",
@@ -345,7 +362,7 @@
       "file": "unsloth_zoo/temporary_patches/gpt_oss.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "2f91b677a1b74416",
+      "digest": "8a43c55c018acccf",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -353,15 +370,7 @@
       "file": "unsloth_zoo/temporary_patches/gpt_oss.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "8e22e34e9699eeda",
-      "count": 1,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/temporary_patches/gpt_oss.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "93f179a26cb6dc1f",
+      "digest": "ca551df69c498e93",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -441,38 +450,6 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "06e20c9053bfc084",
-      "count": 1,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/triton_kernels_compat.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "0d1075b5ac184ad0",
-      "count": 1,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/triton_kernels_compat.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "1dd442e1dba33e11",
-      "count": 2,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/triton_kernels_compat.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "212ce6ec4b2f9035",
-      "count": 1,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/triton_kernels_compat.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
       "digest": "4439cea57cfbfdbc",
       "count": 1,
       "reason": "Submodules found by walking the installed triton_kernels package (pkgutil)."
@@ -481,7 +458,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "44661647c0554b57",
+      "digest": "54785ddf74763b5c",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -489,7 +466,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "99148a97541087f5",
+      "digest": "8200e131cd5f0e66",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -497,7 +474,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "b456c7ad818ecd08",
+      "digest": "8a43c55c018acccf",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -505,7 +482,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "bb260743bb896b2c",
+      "digest": "9b82fef86295098f",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -513,7 +490,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "c4171f1b5f078ec9",
+      "digest": "9de88d301ba8baa7",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
