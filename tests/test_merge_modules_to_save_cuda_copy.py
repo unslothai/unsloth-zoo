@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`modules_to_save` copies living on CUDA must reach the merged shards intact.
-
-The merge moves each trained copy to the CPU and writes its buffer straight into the
-mmap. With `non_blocking=True` that device-to-host copy lands in pinned memory
-asynchronously, so the write read whatever the cached block held before: the previous
-same-size tensor, or zeros. float32 copies (fp16 models train them in fp32) hit it most.
-"""
+"""CUDA `modules_to_save` copies must reach the merged shards intact: a non_blocking
+device-to-host copy was written before it landed (previous same-size tensor, or zeros)."""
 
 from __future__ import annotations
 
