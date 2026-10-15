@@ -600,6 +600,26 @@ class Eagle3TrainingArguments(TrainingArguments):
     remove_unused_columns: bool = False
 
 
+class _SupervisedRowLabels:
+    """Labels that count only what the loss supervises (row t is scored by labels[t + 1], so never
+    position 0 or padding): every transformers version counts num_items_in_batch from raw labels."""
+
+    def __init__(self, collate):
+        self.collate = collate
+
+    def __call__(self, features):
+        batch = self.collate(features)
+        labels = batch.get("labels")
+        if labels is not None:
+            labels = labels.clone()
+            labels[:, 0] = -100
+            mask = batch.get("attention_mask")
+            if mask is not None:
+                labels = labels.masked_fill(~mask.bool(), -100)
+            batch["labels"] = labels
+        return batch
+
+
 class UnslothEagle3Trainer(Trainer):
     """Trains an EAGLE-3 drafter (`model`) against a frozen target, one target pass per batch.
 
@@ -631,21 +651,11 @@ class UnslothEagle3Trainer(Trainer):
             if pad is None:
                 pad = getattr(tokenizer, "eos_token_id", 0) or 0
             kwargs["data_collator"] = MTPDataCollator(pad)
+        kwargs["data_collator"] = _SupervisedRowLabels(kwargs["data_collator"])
         super().__init__(model = model, args = args, **kwargs)
         # compute_loss normalizes by num_items_in_batch itself, so the Trainer must not also divide by GA.
         self.model_accepts_loss_kwargs = True
         self._eagle3_log = []
-
-    def _get_num_items_in_batch(self, batch_samples, device):
-        # Count what compute_loss supervises (labels[:, 1:] inside the attention mask), not raw labels.
-        counted = []
-        for batch in batch_samples:
-            labels = batch.get("labels", batch["input_ids"])[:, 1:]
-            mask = batch.get("attention_mask")
-            if mask is not None:
-                labels = labels.masked_fill(~mask[:, 1:].bool(), -100)
-            counted.append({**batch, "labels": labels, "shift_labels": labels})
-        return super()._get_num_items_in_batch(counted, device)
 
     def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None):
         input_ids = inputs["input_ids"]
