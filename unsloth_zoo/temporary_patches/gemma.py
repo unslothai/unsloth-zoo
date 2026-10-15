@@ -421,9 +421,12 @@ def patch_Gemma3Processor():
         # ignore the tokenizer's uninitialised model_max_length sentinel (~1e30) for "max_length" padding
         _mml = getattr(self.tokenizer, "model_max_length", None)
         if not (isinstance(_mml, int) and 0 < _mml < int(1e15)): _mml = None
+        # transformers >= 5.15 sets processor.image_token_id to the BOI token; token_type_ids must mark the soft tokens.
+        image_token_id = getattr(self.tokenizer, "image_token_id", None)
+        if image_token_id is None: image_token_id = self.image_token_id
         text_inputs = _fix_double_bos_and_pad(
             text_inputs, self.tokenizer.bos_token_id, self.tokenizer.pad_token_id,
-            self.image_token_id, return_mm_token_type_ids, padding, padding_side, return_tensors,
+            image_token_id, return_mm_token_type_ids, padding, padding_side, return_tensors,
             max_length = max_length,
             pad_to_multiple_of = output_kwargs["text_kwargs"].get("pad_to_multiple_of", None),
             model_max_length = _mml,

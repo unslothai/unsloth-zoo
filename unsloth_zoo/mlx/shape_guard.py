@@ -6,7 +6,10 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Pure planning for bounded finite-text ``mx.compile`` signatures.
+"""Pure planning for bounded ``mx.compile`` signatures.
+
+Finite datasets are planned whole; unsized streams widen onto an endpoint grid
+(anchored at ``max_seq_length`` for text, anchor-free for post-expansion VLM).
 
 The cap here counts application-visible callable signatures. It is not an MLX
 compiler-cache count and is not an estimate of Metal resources.
@@ -31,6 +34,13 @@ MAX_COMPILE_VARIANTS = 256
 
 FULL_STEP_SCOPE = "full_step"
 DDP_LOCAL_GRAD_SCOPE = "ddp_local_grad"
+
+STREAM_GRID_FLOOR_WIDTH = 2
+STREAM_GRID_LINEAR_STEP = 32
+STREAM_GRID_ALIGNMENT = 8
+# Log-uniform mean quadratic overhead (r^2 - 1) / (2 ln r) - 1 = 5.04% at 21/20;
+# exact rationals keep the sequence identical across ranks.
+STREAM_GRID_RATIO = Fraction(21, 20)
 
 
 @dataclass(frozen=True)
@@ -105,6 +115,154 @@ class TextShapeGuardReport:
         }
         result["padding_fraction"] = self.padding_fraction
         return result
+
+
+@dataclass(frozen=True)
+class StreamShapeGuardReport:
+    """Outcome of guarding an unsized streaming schedule, emitted at training end."""
+
+    action: str
+    reason: str
+    cap: int
+    compile_scope: str
+    grid_ratio: str
+    grid_floor: int
+    grid_anchor: int | None = None
+    grid_endpoints: int | None = None
+    observed_signatures: int = 0
+    tripped: bool = False
+    trip_reason: str = ""
+    exact_width_only: bool = False
+    exact_ceiling: int | None = None
+    gate_released: bool = False
+
+    def to_dict(self):
+        return asdict(self)
+
+
+class StreamShapeGrid:
+    """Endpoint grid: ``x -> max(x + step, x * ratio)``, published as
+    ``1 + alignment * ceil(x / alignment)``; ``anchor`` terminates it, else it grows lazily.
+    """
+
+    __slots__ = ("_anchor", "_ratio", "_carried", "_endpoints", "_closed")
+
+    def __init__(self, *, anchor=None, ratio=STREAM_GRID_RATIO):
+        if ratio <= 1:
+            raise ValueError("stream grid ratio must exceed 1")
+        if anchor is not None:
+            anchor = operator.index(anchor)
+            if anchor < STREAM_GRID_FLOOR_WIDTH:
+                raise ValueError(
+                    "stream grid anchor must be at least "
+                    f"{STREAM_GRID_FLOOR_WIDTH}, got {anchor}"
+                )
+        self._anchor = anchor
+        self._ratio = Fraction(ratio)
+        self._carried = Fraction(STREAM_GRID_LINEAR_STEP)
+        self._endpoints = []
+        self._closed = False
+        self._publish(STREAM_GRID_FLOOR_WIDTH)
+
+    def _publish(self, endpoint):
+        if self._anchor is not None and endpoint >= self._anchor:
+            endpoint = self._anchor
+            self._closed = True
+        if not self._endpoints or endpoint > self._endpoints[-1]:
+            self._endpoints.append(endpoint)
+
+    def _grow(self):
+        if self._closed:
+            return False
+        carried = self._carried
+        self._carried = max(
+            carried + STREAM_GRID_LINEAR_STEP, carried * self._ratio,
+        )
+        aligned = -(-carried // STREAM_GRID_ALIGNMENT)
+        self._publish(1 + STREAM_GRID_ALIGNMENT * int(aligned))
+        return True
+
+    def endpoint_for(self, width):
+        """Smallest endpoint at or above ``width`` (the anchor caps it)."""
+        width = operator.index(width)
+        while self._endpoints[-1] < width and self._grow():
+            pass
+        endpoints = self._endpoints
+        low, high = 0, len(endpoints)
+        while low < high:
+            middle = (low + high) // 2
+            if endpoints[middle] < width:
+                low = middle + 1
+            else:
+                high = middle
+        return endpoints[low] if low < len(endpoints) else endpoints[-1]
+
+    def endpoints_through(self, width):
+        self.endpoint_for(width)
+        return tuple(
+            endpoint for endpoint in self._endpoints if endpoint <= width
+        )
+
+    @property
+    def ratio(self):
+        return self._ratio
+
+    @property
+    def anchor(self):
+        return self._anchor
+
+    @property
+    def endpoint_count(self):
+        """Total endpoints, or None while the grid can still grow."""
+        if self._anchor is None:
+            return None
+        while self._grow():
+            pass
+        return len(self._endpoints)
+
+
+def stream_phase_count(compile_scope, gradient_accumulation_steps):
+    """Cache entries one width costs: the signature carries the accumulation phase."""
+    steps = operator.index(gradient_accumulation_steps)
+    return len({
+        phase_for_microstep(compile_scope, steps, index)
+        for index in range(max(1, steps))
+    })
+
+
+def stream_exact_ceiling(grid, cap, phases_per_endpoint=1, in_flight=0):
+    """Signatures a stream may compile exact before widening; ``None`` widens from the first batch.
+
+    Staging precedes admission, so a synchronous run compiles ceiling + 1 exact
+    signatures; ``in_flight`` covers text prefetch batches staged ahead.
+    """
+    cap = int(cap)
+    phases = max(1, operator.index(phases_per_endpoint))
+    ceiling = min(SMALL_EXACT_SIGNATURE_THRESHOLD, cap // 4)
+    endpoints = grid.endpoint_count
+    if endpoints is not None:
+        # Reserve endpoints * phases, the crossing batch, and prefetched batches.
+        ceiling = min(
+        ceiling, cap - endpoints * phases - 1 - max(0, operator.index(in_flight)),
+    )
+    return ceiling if ceiling > 0 else None
+
+
+def describe_stream_shape_grid(grid, cap, exact_ceiling=None):
+    """One-line summary of the configured streaming endpoint policy."""
+
+    count = grid.endpoint_count
+    reach = "unbounded" if count is None else f"{count} endpoints"
+    allowance = (
+        "" if exact_ceiling is None else
+        f" widths stay exact while at most {exact_ceiling} signatures have "
+        f"been compiled, after which"
+    )
+    return (
+        f"Unsloth: streaming compile shapes are bounded to {cap} signatures;"
+        f"{allowance} widths widen over a {reach} grid (ratio "
+        f"{float(grid.ratio):.2f}, floor {STREAM_GRID_FLOOR_WIDTH})."
+    )
 
 
 @dataclass(frozen=True)
@@ -806,6 +964,15 @@ __all__ = (
     "MAX_COMPILE_VARIANTS",
     "FULL_STEP_SCOPE",
     "DDP_LOCAL_GRAD_SCOPE",
+    "STREAM_GRID_FLOOR_WIDTH",
+    "STREAM_GRID_LINEAR_STEP",
+    "STREAM_GRID_ALIGNMENT",
+    "STREAM_GRID_RATIO",
+    "StreamShapeGrid",
+    "StreamShapeGuardReport",
+    "describe_stream_shape_grid",
+    "stream_exact_ceiling",
+    "stream_phase_count",
     "TextShapeEvent",
     "TextShapeFrontier",
     "TextShapeGuardReport",

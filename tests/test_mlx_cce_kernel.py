@@ -433,6 +433,49 @@ def test_backboneless_text_model_selects_baseline_fallback(capsys):
     assert "separable hidden-state backbone" in out and "output head" not in out
 
 
+def test_stack_named_backbone_beside_the_head_yields_hidden_states():
+    # Nemotron-H shape: the stack returns hidden states from .backbone, not .model.
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+
+    class _Stack(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = nn.Embedding(96, 32)
+
+        def __call__(self, inputs=None, cache=None, inputs_embeds=None):
+            return ("hidden", inputs, inputs_embeds)
+
+    class _LM(nn.Module):
+        def __init__(self, backbone, head=True):
+            super().__init__()
+            self.backbone = backbone
+            if head:
+                self.lm_head = nn.Linear(32, 96, bias=False)
+
+    lm = _LM(_Stack())
+    assert U._forward_text_hidden_states(lm, "ids") == ("hidden", "ids", None)
+    merged = U._forward_text_hidden_states(lm, "ids", inputs_embeds="merged", mask="unused")
+    assert merged == ("hidden", "ids", "merged")
+    assert U.make_cce_loss_fn(lm)._unsloth_cce_backend != "baseline-fallback"
+    from unsloth_zoo.mlx.preference import _make_preference_cce_scorer
+    assert _make_preference_cce_scorer(lm) is not None
+
+    class _VLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = lm
+
+        def get_input_embeddings(self, input_ids, pixel_values=None):
+            return None
+
+    assert U.make_vlm_cce_loss_fn(_VLM())._unsloth_cce_backend != "baseline-fallback"
+    # A tied stack has no lm_head to split from; a bare container runs nothing.
+    for other in (_LM(_Stack(), head=False), _LM(nn.Module())):
+        assert U._get_text_backbone(other) is None
+
+
 @pytest.mark.parametrize("case", ["no_embeddings", "no_backbone", "invalid_scale",
                                   "masked_tail_knob"])
 def test_vlm_cce_fallbacks_are_marked(case):

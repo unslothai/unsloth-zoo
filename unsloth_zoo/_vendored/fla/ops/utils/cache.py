@@ -372,9 +372,11 @@ class CachedAutotuner(Autotuner):
         return key.autotune_key not in self.cache
 
     def run(self, *args, **kwargs):
-        key = AutotuneKey.build(self.arg_names, self.keys, args, kwargs)
-        if self.should_check_fla_cache(key):
-            self.maybe_load_cached_config(key)
+        # DISABLED (the default) never reads the disk cache: skip building a key on every launch.
+        if FLA_CACHE_MODE is not FlaCacheMode.DISABLED:
+            key = AutotuneKey.build(self.arg_names, self.keys, args, kwargs)
+            if self.should_check_fla_cache(key):
+                self.maybe_load_cached_config(key)
         return super().run(*args, **kwargs)
 
     def maybe_load_cached_config(self, key: AutotuneKey):

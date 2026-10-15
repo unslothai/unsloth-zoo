@@ -30,6 +30,7 @@ and a forward that ignores the stash gets handed back to PEFT so the LoRA is app
 from __future__ import annotations
 
 import contextlib
+import json
 import textwrap
 import re
 import sys
@@ -1354,3 +1355,46 @@ def test_a_real_cold_compile_reaches_the_static_probe_without_a_guard_on_a_bound
         "a real cold compiled start does not agree with the eager fold"
     )
     assert again.shape == out.shape
+
+
+@pytest.mark.parametrize(
+    "experts_cls, expected",
+    [
+        (_StashIgnoringExperts, MU.LORA_B_LAYOUT_RANK_MAJOR),
+        (_StashReadingExperts, MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT),
+    ],
+)
+@pytest.mark.parametrize("fullgraph", [True, False])
+def test_a_compiled_only_run_records_the_layout_its_forward_used(
+    restore_param_wrapper, monkeypatch, tmp_path, experts_cls, expected, fullgraph
+):
+    """A compiled-only run never reaches the eager probe: a stash-ignoring family folds
+    rank-major there, so the saved marker must say rank_major despite the legacy declaration."""
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT)
+    assert MU.patch_param_wrapper_for_moe()
+    model = _build(experts_cls)
+    experts = model.base_model.model.experts.get_base_layer()
+    wrappers = [
+        module for module in model.modules()
+        if getattr(module, "parameter_name", None) in ("gate_up_proj", "down_proj")
+        and hasattr(module, "lora_A")
+    ]
+    assert len(wrappers) == 2
+    assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is None
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(model, backend = "eager", fullgraph = fullgraph, dynamic = False)
+        with torch.no_grad():
+            compiled(_inputs())
+    finally:
+        torch._dynamo.reset()
+
+    assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is None
+    for wrapper in wrappers:
+        assert MU.moe_lora_b_layout_for_wrapper(wrapper, "default") == expected, (
+            wrapper.parameter_name
+        )
+    model.save_pretrained(str(tmp_path))
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert config.get("lora_B_layout") == expected

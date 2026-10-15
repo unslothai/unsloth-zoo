@@ -64,12 +64,17 @@ logger = init_logger(__name__)
 import inspect
 import functools
 
-@functools.lru_cache(1)
-def dummy_lora_has_scaling_factor(create_dummy_lora):
+@functools.lru_cache(None)
+def _dummy_lora_has_scaling_factor(create_dummy_lora):
     # create_dummy_lora(self, lora_id, rank, scaling_factor, embedding_modules)
     # create_dummy_lora(self, lora_id, rank, embedding_modules)
     keys = inspect.signature(create_dummy_lora).parameters.keys()
     return "scaling_factor" in keys
+pass
+
+def dummy_lora_has_scaling_factor(create_dummy_lora):
+    # Cache on the plain function: a bound method key pins its adapter manager and the whole model.
+    return _dummy_lora_has_scaling_factor(getattr(create_dummy_lora, "__func__", create_dummy_lora))
 pass
 
 def _drop_stacked_weight_maps(mapper):

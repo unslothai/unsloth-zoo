@@ -55,7 +55,8 @@ def unsloth_fused_lm_head_loss(
         vocab_size: ignored; kernel reads it from `lm_head.weight.shape[0]`.
         **kwargs: forwarded to the kernel. `num_items_in_batch` is renamed to
             `n_items`; also accepts `logit_scale_multiply`, `logit_scale_divide`,
-            `logit_softcapping`, plus extras the original loss_function ignored.
+            `logit_softcapping`, `logits_bias` (an extra vocab bias added after the
+            head), plus extras the original loss_function ignored.
     """
     n_items = kwargs.pop("num_items_in_batch", None)
     if n_items is None:

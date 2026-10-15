@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import inspect
 import json
 import os
@@ -266,7 +267,7 @@ def test_compiler_review_guards_are_present():
     mlx_compile_source = inspect.getsource(mlx_compile)
 
     assert (
-        'self.loss_function.__name__.endswith("ForCausalLMLoss") '
+        "_can_fuse_loss(self.loss_function) "
         "and labels is not None and NOT_RETURN_LOGITS"
     ) in compiler_source
     assert '"weight" in norm' not in mlx_compile_source
@@ -2531,3 +2532,570 @@ def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_p
     Image.fromarray(np.full((8, 8, 3), 99, dtype=np.uint8)).save(paths[2])
     with pytest.raises(ValueError, match="file backing a dataset image changed"):
         plan.materialize_all()
+
+
+def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
+    """VLM widens at the post-expansion width; unmaterializable targets are refused or bumped."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
+    from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
+
+    class _ExpandingProcessor(_ContentProcessor):
+        def __call__(self, text, **_kwargs):  # noqa: D401
+            width = 40 + 7 * max(int(item) for item in text)
+            rows = [[int(item), 200] + [2] * (width - 2) for item in text]
+            return {
+                "input_ids": np.array(rows, dtype=np.int32),
+                "attention_mask": np.array(
+                    [[1] * width for _ in rows], dtype=np.int32,
+                ),
+                "image_grid_thw": np.array([[1, 2, 2]] * len(text), np.int32),
+            }
+
+    grid = StreamShapeGrid()
+    config = {"model_type": "qwen3_5", "image_size": 16, "image_token_id": 200,
+              "video_token_id": 201, "vision_config": {"spatial_merge_size": 2}}
+    items = [{"text": "5"}]
+    plain = _build_response_masked_vlm_batch(
+        items, _ExpandingProcessor(), config, 8, 16,
+    )
+    guarded = _build_response_masked_vlm_batch(
+        items, _ExpandingProcessor(), config, 8, 16,
+        width_policy=grid.endpoint_for,
+    )
+
+    raw_width = int(plain["input_ids"].shape[1])
+    assert raw_width > 8
+    guarded_width = int(guarded["input_ids"].shape[1])
+    assert guarded_width == grid.endpoint_for(raw_width)
+    assert guarded["input_ids"][:, :raw_width].tolist() == plain["input_ids"].tolist()
+    assert guarded["attention_mask"][:, raw_width:].sum().item() == 0
+    assert int(guarded["position_ids"].shape[-1]) == guarded_width
+    assert (guarded["position_ids"][..., :raw_width].tolist()
+            == plain["position_ids"].tolist())
+
+    from unsloth_zoo.mlx.utils import _resolve_stream_vlm_target
+
+    class _NoPadTokenizer(_TinyTokenizer):
+        pad_token_id = None
+
+    class _NoPadProcessor(_ExpandingProcessor):
+        tokenizer = _NoPadTokenizer()
+
+    assert _resolve_stream_vlm_target(
+        plain, config, _NoPadProcessor(), grid.endpoint_for,
+    ) is None
+    bumped = dict(plain)
+    bumped["media_extent"] = mx.zeros((1, guarded_width), dtype=mx.int32)
+    target = _resolve_stream_vlm_target(
+        bumped, config, _ExpandingProcessor(), grid.endpoint_for,
+    )
+    assert target is not None and target > guarded_width
+
+
+# Per family: the rebindings its installer must make, as (module, class or None
+# for a module-level name, attribute[, the `unsloth_zoo.mlx.compile` attribute it
+# must be bound to]); the merge it replaces, as (class or None, attribute,
+# upstream requires equal counts), or None when it only delegates to a shared one.
+HOST_GRID_FAMILIES = [
+    ("dots_ocr",
+     [("vision", "VisionModel", "__call__"),
+      ("vision", "VisionModel", "get_pos_ids_by_grid"),
+      ("vision", "VisionModel", "rot_pos_emb"),
+      ("vision", "VisionAttention", "__call__"),
+      ("model", "Model", "merge_input_ids_with_image_features",
+       "_merge_exclusive_special_token_features")],
+     ("Model", "merge_input_ids_with_image_features", False)),
+    ("muse_glimmer",
+     [("vision", "VisionModel", "__call__"),
+      ("model", "Model", "get_input_embeddings")],
+     ("Model", "get_input_embeddings", True)),
+    ("minimax_m3_vl",
+     [("vision", "MiniMaxVisionTransformer", "__call__"),
+      ("vision", "MiniMaxVisionTransformer", "_segment_grid_thw"),
+      ("vision", "MiniMaxVisionAttention", "__call__"),
+      ("model", "Model", "_merge_visual_tokens"),
+      ("model", "Model", "merge_input_ids_with_visual_features")],
+     ("Model", "merge_input_ids_with_visual_features", True)),
+    ("kimi_k3",
+     [("model", "Model", "_prepare_inputs_for_multimodal")],
+     ("Model", "_prepare_inputs_for_multimodal", True)),
+    ("ernie4_5_moe_vl",
+     [("vision", "VisionModel", "__call__"),
+      ("vision", "VisionModel", "rot_pos_emb"),
+      ("vision", "VisionAttention", "__call__"),
+      ("model", "VariableResolutionResamplerModel", "__call__"),
+      ("model", "Model", "_merge_input_ids_with_image_features")],
+     None),
+    ("glm5_next",
+     [("vision", "VisionModel", "__call__"),
+      ("vision", "VisionModel", "_rotary_embeddings"),
+      ("vision", "VisionAttention", "__call__"),
+      ("model", "Model", "_video_grid"),
+      ("model", None, "_replace_features")],
+     (None, "_replace_features", True)),
+    *[(arch,
+       [("vision", f"{prefix}VisionRotaryEmbedding", "__call__"),
+        ("vision", "VisionModel", "rot_pos_emb"),
+        ("vision", "VisionModel", "__call__"),
+        *attention,
+        ("model", "Model", "get_input_embeddings"),
+        ("model", "Model", "merge_input_ids_with_image_features",
+         "_merge_exclusive_special_token_features")],
+       ("Model", "merge_input_ids_with_image_features", False))
+      for arch, prefix, attention in (
+          ("glm4v", "Glm4v", [("vision", "Glm4vVisionAttention", "__call__")]),)],
+]
+
+
+@contextlib.contextmanager
+def _installer_patches_restored(arch):
+    """Run an installer and put both of its modules back exactly as they were.
+
+    The installers rebind class methods and module-level names, and anything
+    left behind would change what a later test in this session measures.
+    """
+    import importlib
+
+    import unsloth_zoo.mlx.compile as mc
+
+    pytest.importorskip(f"mlx_vlm.models.{arch}.{arch}")
+    modules = {
+        "vision": importlib.import_module(f"mlx_vlm.models.{arch}.vision"),
+        "model": importlib.import_module(f"mlx_vlm.models.{arch}.{arch}"),
+    }
+    owners = list(modules.values()) + [
+        obj for module in modules.values()
+        for obj in vars(module).values() if isinstance(obj, type)]
+    snapshot = {owner: dict(vars(owner)) for owner in owners}
+    patched, bindings = set(mc._PATCHED_ARCHES), set(mc._PATCH_BINDINGS)
+    try:
+        yield mc, modules
+    finally:
+        for owner, members in snapshot.items():
+            for name in set(vars(owner)) - set(members):
+                delattr(owner, name)
+            for name, member in members.items():
+                if vars(owner).get(name) is not member:
+                    setattr(owner, name, member)
+        mc._PATCHED_ARCHES.clear()
+        mc._PATCHED_ARCHES.update(patched)
+        mc._PATCH_BINDINGS.clear()
+        mc._PATCH_BINDINGS.update(bindings)
+
+
+@pytest.mark.parametrize("arch,bindings,merge", HOST_GRID_FAMILIES)
+def test_each_host_grid_family_is_qualified_and_really_patched(arch, bindings, merge):
+    """Qualifying one of these without wiring its installer would compile the
+    unpatched tower, which reads the grid back on the host; a no-op installer
+    would satisfy that wiring and still leave the tower unpatched. The merge it
+    replaces also has to keep refusing what its own upstream refused."""
+    _skip_if_mlx_core_was_replaced()
+    import ast
+    import inspect
+    import textwrap
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        MLXVLMCompilePolicy,
+        _matching_pattern_bundles,
+        resolve_training_compile,
+    )
+
+    installer = f"{arch}_vision_compile_runtime"
+    with _installer_patches_restored(arch) as (mc, modules):
+        model = type("Model", (), {"__module__": f"mlx_vlm.models.{arch}.{arch}"})()
+        model.config = SimpleNamespace(model_type=arch)
+        decision = resolve_training_compile(
+            model, policy=MLXVLMCompilePolicy(mode="best_effort"))
+        assert decision.enabled, decision.reason
+        assert installer in {
+            name for bundle in _matching_pattern_bundles(arch)
+            for name in bundle.runtime_primitive_names}
+
+        owners = [modules[binding[0]] if binding[1] is None
+                  else getattr(modules[binding[0]], binding[1]) for binding in bindings]
+        originals = [getattr(owner, b[2]) for owner, b in zip(owners, bindings)]
+
+        mc._runtime_patch_primitive_installers()[installer]()
+
+        assert arch in mc._PATCHED_ARCHES
+        for owner, binding, original in zip(owners, bindings, originals):
+            bound = getattr(owner, binding[2])
+            assert bound is not original, binding[2]
+            if len(binding) == 4:
+                assert bound is getattr(mc, binding[3]), binding[2]
+
+        if merge is None:
+            # Image placeholders fill before video ones, and a surplus row is ignored.
+            owner, binding = owners[-1], bindings[-1]
+            merged = getattr(owner, binding[2])(
+                SimpleNamespace(config=SimpleNamespace(image_token_id=10, video_token_id=20)),
+                mx.array([[1.0], [2.0]]), mx.zeros((1, 3, 1)), mx.array([[20, 10, 5]]))
+            assert merged.tolist() == [[[0.0], [1.0], [0.0]]], binding[2]
+            return
+        cls, method, exact = merge
+        owner = modules["model"] if cls is None else getattr(modules["model"], cls)
+        source = inspect.getsource(getattr(owner, method))
+
+    # Parsed rather than matched as text, so a commented-out call cannot pass.
+    calls = [
+        node for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "_raise_on_feature_count_mismatch"]
+    assert len(calls) == 1, method
+    # Three positional args: the mask, the features, and the embeddings whose
+    # width turns the feature block into a count of placeholders it can fill.
+    assert len(calls[0].args) == 3, method
+    relaxed = any(
+        keyword.arg == "exact" and keyword.value.value is False
+        for keyword in calls[0].keywords)
+    assert relaxed is not exact, method
+
+
+def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch):
+    """Qwen3-Omni reuses the Qwen3 VL patches; its own embedder has to keep
+    upstream's exact count refusal, hand audio to upstream, and its backbone must
+    drop the per-layer eval only while training."""
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+
+    assert "qwen3_omni_moe" in mc._VERIFIED_TRAINING_ARCHES
+    assert "qwen3_family_multimodal_runtime" in {
+        name for bundle in mc._matching_pattern_bundles("qwen3_omni_moe")
+        for name in bundle.runtime_primitive_names}
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    upstream = lambda self, input_ids=None, pixel_values=None, **kwargs: kwargs
+    model_cls = type("Model", (), {"get_input_embeddings": upstream,
+                                   "__call__": lambda self, *a, **k: "thinker"})
+    backbone_cls = type("Backbone", (), {"__call__": lambda self, *a, **k: "original",
+                                         "_deepstack_process": lambda self, h, m, e: h + e})
+    lm_cls = type("LanguageModel", (), {"__call__": lambda self, *a, **k: "upstream lm"})
+    language = NS(Qwen3VLMoEModel=backbone_cls, create_attention_mask=lambda h, c: None,
+                  LanguageModel=lm_cls, LanguageModelOutput=NS)
+    vision = NS(**{name: type(name, (), {}) for name in
+                   ("Attention", "Qwen3VLMoEVisionBlock", "VisionModel")})
+    features_cls = type("Features", (NS,), {"to_dict": lambda self: dict(vars(self))})
+    thinker = NS(masked_scatter=None, InputEmbeddingsFeatures=features_cls)
+    mc._install_qwen3_omni_compile_patches(
+        NS(Model=model_cls), thinker, vision, language, (upstream,) * 5)
+    assert thinker.masked_scatter is mc._masked_scatter_no_numpy
+
+    vision_tower = lambda pixels, grid: (pixels, [pixels * 10])
+    vision_tower.patch_embed = NS(proj=NS(weight=mx.zeros(1)))
+    model = model_cls()
+    model.training = True
+    language_model = lambda ids, mask=None, cache=None, **kwargs: kwargs
+    language_model.model = NS(embed_tokens=lambda ids: mx.zeros((*ids.shape, 1)))
+    model.thinker = NS(config=NS(image_token_id=10, video_token_id=20),
+                       language_model=language_model, vision_tower=vision_tower)
+    images, video = mx.array([[1.0], [2.0]]), mx.array([[3.0]])
+    out = model.get_input_embeddings(
+        mx.array([[10, 5, 20, 10]]), images, pixel_values_videos=video, position_ids="P")
+    assert out.inputs_embeds.tolist() == [[[1.0], [0.0], [3.0], [2.0]]]
+    assert out.position_ids == "P" and len(out.visual_pos_masks) == 2
+    with pytest.raises(ValueError, match="tokens=3, features=2"):
+        model.get_input_embeddings(mx.array([[10, 10, 10]]), images, position_ids="P")
+    audio = model.get_input_embeddings(mx.array([[10]]), images, input_features=video,
+                                       position_ids="P", image_grid_thw=((1, 2, 2),))
+    assert audio["image_grid_thw"].tolist() == [[1, 2, 2]]
+    # Model.__call__ reaches the language model through the patched merge.
+    routed = model(mx.array([[10, 5, 20, 10]]), images, video, position_ids="P")
+    assert routed["inputs_embeds"].tolist() == [[[1.0], [0.0], [3.0], [2.0]]]
+    model.training = False
+    assert model(mx.array([[10]]), images, position_ids="P") == "thinker"
+    model.training = True
+
+    lm = lm_cls()
+    lm.training, lm.args = True, NS(tie_word_embeddings=False)
+    lm.model, lm.lm_head = (lambda inputs, **kw: kw["inputs_embeds"]), (lambda h: h * 2)
+    assert mx.compile(lambda h: lm(None, h, position_ids="P").logits)(mx.ones((1, 1, 1))).tolist() == [[[2.0]]]
+    lm.training = False
+    assert lm(None, position_ids="P") == "upstream lm"
+
+    backbone = backbone_cls()
+    backbone.training = False
+    assert backbone(None) == "original"
+    backbone.training, backbone.norm = True, lambda h: h + 1
+    backbone.layers = [lambda h, *args: h] * 2
+    # Compiled end to end: a per-layer eval would raise, and the embedder's
+    # deepstack rows (vision rows * 10) must land on their own positions, then norm.
+    trained = mx.compile(lambda h: backbone(
+        None, inputs_embeds=h, mask="m", visual_pos_masks=out.visual_pos_masks,
+        deepstack_visual_embeds=out.deepstack_visual_embeds))
+    assert trained(out.inputs_embeds).tolist() == [[[12.0], [1.0], [34.0], [23.0]]]
+    # Upstream's embedder hands full-length residuals: added in place, as upstream does,
+    # never gathered as rows (that would put row 0's residual on the first image token).
+    full = mx.array([[[0.0], [0.0], [5.0], [7.0]]])
+    assert backbone._deepstack_process(
+        mx.zeros((1, 4, 1)), mx.array([[False, False, True, True]]), full
+    ).tolist() == [[[0.0], [0.0], [5.0], [7.0]]]
+    # They reach the backbone as one array with a level per column, each for its own layer.
+    backbone.layers = [lambda h, *args: h, lambda h, *args: h * 2]
+    assert backbone(
+        None, inputs_embeds=mx.zeros((1, 4, 1)), mask="m",
+        visual_pos_masks=mx.array([[False, False, True, True]]),
+        deepstack_visual_embeds=mx.stack([full, full * 100], axis=2),
+    ).tolist() == [[[1.0], [1.0], [511.0], [715.0]]]
+
+
+def test_the_glm5_next_merge_really_refuses_a_count_mismatch():
+    """Its upstream refuses either direction, so the installed replacement has
+    to as well. Its merge takes no model, so it can be called directly."""
+    _skip_if_mlx_core_was_replaced()
+
+    with _installer_patches_restored("glm5_next") as (mc, modules):
+        mc._install_glm5_next_compile_patches()
+        replace = modules["model"]._replace_features
+        features = mx.array([[1.0, 1.0], [2.0, 2.0]])
+
+        with pytest.raises(ValueError, match="tokens=1, features=2"):
+            replace(mx.zeros((1, 3, 2)), mx.array([[True, False, False]]),
+                    features, "Image")
+        with pytest.raises(ValueError, match="tokens=3, features=2"):
+            replace(mx.zeros((1, 3, 2)), mx.array([[True, True, True]]),
+                    features, "Image")
+        merged = replace(mx.zeros((1, 3, 2)), mx.array([[True, False, True]]),
+                         features, "Image")
+        assert merged[0, 0].tolist() == [1.0, 1.0]
+
+
+def test_glm4v_moe_is_patched_but_not_qualified_for_compiled_training():
+    """Its decoder does not compile on MLX 0.32 (IndexError the runtime fallback
+    does not catch), so it must stay eager even though its tower is patched."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import MLXVLMCompilePolicy, resolve_training_compile
+
+    with _installer_patches_restored("glm4v_moe") as (mc, modules):
+        assert "glm4v_moe" not in mc._VERIFIED_TRAINING_ARCHES
+        tower = modules["vision"].VisionModel.__call__
+        mc._runtime_patch_primitive_installers()["glm4v_moe_vision_compile_runtime"]()
+        assert modules["vision"].VisionModel.__call__ is not tower
+        model = type("Model", (), {"__module__": "mlx_vlm.models.glm4v_moe.glm4v_moe"})()
+        model.config = SimpleNamespace(model_type="glm4v_moe")
+        decision = resolve_training_compile(
+            model, policy=MLXVLMCompilePolicy(mode="best_effort"))
+        assert not decision.enabled
+
+
+def test_glm5_next_on_an_older_tower_contract_stays_eager(monkeypatch):
+    """mlx-vlm 0.7.0's glm5_next has no VisionAttention: installing must neither
+    raise (it would abort every family's install) nor qualify the family."""
+    _skip_if_mlx_core_was_replaced()
+
+    with _installer_patches_restored("glm5_next") as (mc, modules):
+        monkeypatch.setattr(mc, "_VERIFIED_TRAINING_ARCHES", set(mc._VERIFIED_TRAINING_ARCHES))
+        mc._PATCHED_ARCHES.discard("glm5_next")
+        vision_call = modules["vision"].VisionModel.__call__
+        monkeypatch.delattr(modules["vision"], "VisionAttention")
+        mc._install_glm5_next_compile_patches()
+        assert "glm5_next" not in mc._VERIFIED_TRAINING_ARCHES
+        assert "glm5_next" not in mc._PATCHED_ARCHES
+        assert modules["vision"].VisionModel.__call__ is vision_call
+
+
+@pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
+def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
+    """No compile patch needed: qualification alone decides."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        _VERIFIED_TRAINING_ARCHES,
+        MLXVLMCompilePolicy,
+        build_compile_trait_reports,
+        get_compile_trait_report,
+        resolve_training_compile,
+    )
+
+    pytest.importorskip(f"mlx_vlm.models.{arch}.{arch}")
+
+    def decide(name):
+        model = type("Model", (), {"__module__": f"mlx_vlm.models.{name}.{name}"})()
+        model.config = SimpleNamespace(model_type=name)
+        return resolve_training_compile(
+            model, policy=MLXVLMCompilePolicy(mode="best_effort"),
+        )
+
+    assert get_compile_trait_report(arch).blocker_categories
+    decision = decide(arch)
+    assert decision.enabled, decision.reason
+    assert not decision.backend_qualifications
+
+    unqualified = sorted(
+        name for name, report in build_compile_trait_reports().items()
+        if report.blocker_categories and name not in _VERIFIED_TRAINING_ARCHES
+    )
+    if not unqualified:
+        pytest.skip("every architecture the scan blocks is training-qualified")
+    refused = decide(unqualified[0])
+    assert not refused.enabled
+    assert "blockers" in refused.reason
+
+
+@pytest.mark.parametrize("parent, decoder", [
+    ("gemma4", "gemma4_text"), ("qwen3_5", "qwen3_5_text"), ("qwen3_5_moe", "qwen3_5_moe_text"),
+    ("mage_vl", "qwen3"),
+])
+def test_nested_text_decoder_qualification_decides_its_parent(parent, decoder):
+    """An unqualified `text_config` decoder keeps a qualified parent eager."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        _VERIFIED_TRAINING_ARCHES,
+        MLXVLMCompilePolicy,
+        discover_architectures,
+        resolve_training_compile,
+    )
+
+    pytest.importorskip(f"mlx_vlm.models.{parent}.{parent}")
+
+    def parent_over(nested):
+        model = type("Model", (), {"__module__": f"mlx_vlm.models.{parent}.{parent}"})()
+        model.config = SimpleNamespace(
+            model_type=parent, text_config=SimpleNamespace(model_type=nested),
+        )
+        return model
+
+    policy = MLXVLMCompilePolicy(mode="best_effort")
+
+    decision = resolve_training_compile(parent_over(decoder), policy=policy)
+    assert decision.enabled, decision.reason
+    decoders = [decoder] if decoder in discover_architectures() else []
+    assert [q.arch for q in decision.backend_qualifications] == decoders
+    assert all(q.training_compile for q in decision.backend_qualifications)
+
+    unqualified = sorted(set(discover_architectures()) - _VERIFIED_TRAINING_ARCHES)
+    if not unqualified:
+        pytest.skip("every discovered architecture is training-qualified")
+    refused = resolve_training_compile(parent_over(unqualified[0]), policy=policy)
+    assert not refused.enabled
+    assert unqualified[0] in refused.reason
+
+
+def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch):
+    """Reference overlays vision blocks on sliding layers only, within the window."""
+    _skip_if_mlx_core_was_replaced()
+    from functools import partial
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+    from unsloth_zoo.mlx.utils import _SharedKVSlot
+
+    language = pytest.importorskip("mlx_vlm.models.gemma4.language")
+    from mlx_vlm.models.cache import BatchKVCache, KVCache
+    text_model = language.Gemma4TextModel
+    if not hasattr(text_model, "_apply_blockwise_bidirectional_overlay"):
+        pytest.skip(reason="mlx-vlm < 0.6.1 has no vision overlay; the patch leaves it alone")
+    upstream = text_model._make_masks
+    monkeypatch.setattr(text_model, "_make_masks", upstream)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    assert "gemma4_vision_masks_runtime" in {
+        name for bundle in mc._matching_pattern_bundles("gemma4")
+        for name in bundle.runtime_primitive_names}
+    mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
+    patched = text_model._make_masks
+
+    def stack(bidirectional, training=True):
+        model = NS(config=NS(use_bidirectional_attention=bidirectional), window_size=2,
+                   training=training, layers=[NS(layer_type="sliding_attention"),
+                                              NS(layer_type="full_attention")])
+        for name in ("_apply_blockwise_bidirectional_overlay", "_block_sequence_ids_for_mask"):
+            setattr(model, name, partial(getattr(text_model, name), model))
+        return model
+
+    def arrays(masks):
+        return [m.tolist() if isinstance(m, mx.array) else m for m in masks]
+
+    def reference(types, window=2):
+        types = np.asarray(types)
+        vision = (types == 1) | (types == 2)
+        block = np.cumsum(vision & ~np.pad(vision, ((0, 0), (1, 0)))[:, :-1], axis=1) * vision
+        q, k = np.indices((types.shape[1],) * 2)
+        same = (block[:, :, None] == block[:, None, :]) & (block[:, :, None] > 0)
+        return (((k <= q) | same) & (abs(q - k) < window))[:, None].tolist()
+
+    h = mx.zeros((2, 6, 1))
+    ids = mx.array([[0, 1, 1, 1, 1, 0], [1, 1, 0, 2, 2, 0]])
+    text_only = mx.zeros((2, 6), dtype=mx.int32)
+    for loss_cache in ([None, None], [_SharedKVSlot(), None]):
+        for types in (ids, text_only):
+            want = [reference(types), "causal"]
+            for training in (True, False):
+                assert arrays(patched(stack("vision", training), h, loss_cache, types)) == want
+            traced = mx.compile(lambda h, t: patched(stack("vision"), h, loss_cache, t)[0])
+            assert traced(h, types).tolist() == want[0]
+    want = arrays(upstream(stack(None), h, [None, None], ids))
+    traced = mx.compile(lambda h, t: [
+        m for m in patched(stack(None), h, [None, None], t) if isinstance(m, mx.array)])
+    assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
+    prefix = KVCache()
+    prefix.update_and_fetch(mx.zeros((2, 1, 3, 1)), mx.zeros((2, 1, 3, 1)))
+    for held in ([KVCache(), None], [prefix, None], [BatchKVCache([1, 0]), None]):
+        assert arrays(patched(stack("vision"), h, held, ids)) == arrays(
+            upstream(stack("vision"), h, held, ids))
+
+
+def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
+    """mlx-vlm < 0.6.1: two-argument `_make_masks`, no overlay; wrapping it broke every forward."""
+    from types import SimpleNamespace
+
+    import unsloth_zoo.mlx.compile as mc
+
+    class Gemma4TextModel:
+        def _make_masks(self, h, cache):
+            return ["upstream"] * len(cache)
+
+    upstream = Gemma4TextModel._make_masks
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    monkeypatch.setattr(
+        mc, "_try_import_module",
+        lambda name: SimpleNamespace(Gemma4TextModel=Gemma4TextModel),
+    )
+    mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
+    assert Gemma4TextModel._make_masks is upstream
+    assert Gemma4TextModel()._make_masks(None, [None, None]) == ["upstream", "upstream"]
+
+
+def test_cce_only_compile_family_is_refused_on_the_standard_loss():
+    """ernie's upstream forward, which `use_cce=False` runs, still reads on the
+    host; compile must be refused up front rather than fail mid-run."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+
+    ernie = type("Model", (), {"__module__": "mlx_vlm.models.ernie4_5_moe_vl.ernie4_5_moe_vl"})()
+    ernie.config = NS(model_type="ernie4_5_moe_vl")
+    policy = mc.MLXVLMCompilePolicy(mode="best_effort")
+    assert mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=True)).enabled
+    refused = mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=False))
+    assert not refused.enabled and refused.fallback_allowed
+    assert "use_cce=False" in refused.reason
+    # A CCE factory fallback (e.g. a LoRA-wrapped lm_head) lands on the same forward.
+    fell_back = mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=True), use_cce=False)
+    assert not fell_back.enabled and "use_cce=False" in fell_back.reason
+    import unsloth_zoo.mlx.trainer as mt
+    assert "use_cce=bool(use_cce)" in inspect.getsource(mt)
+    other = type("Model", (), {"__module__": "mlx_vlm.models.glm_ocr.glm_ocr"})()
+    other.config = NS(model_type="glm_ocr")
+    assert mc.resolve_training_compile(other, policy=policy, args=NS(use_cce=False)).enabled
+
+
+def test_vision_preference_plan_is_excluded_from_eager_fallback_refetch():
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.preference import (
+        FinitePreferenceBatchPlan, FiniteVisionPreferenceBatchPlan,
+    )
+
+    text = FinitePreferenceBatchPlan.__new__(FinitePreferenceBatchPlan)
+    vision = FiniteVisionPreferenceBatchPlan.__new__(FiniteVisionPreferenceBatchPlan)
+    assert trainer_module._eager_refetchable(text)
+    assert not trainer_module._eager_refetchable(vision)

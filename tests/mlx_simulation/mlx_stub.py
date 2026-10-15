@@ -426,8 +426,17 @@ def sign(a, **kw): return torch.sign(a)
 def conj(a, **kw): return torch.conj(a)
 
 
-def maximum(a, b, **kw): return torch.maximum(a, b)
-def minimum(a, b, **kw): return torch.minimum(a, b)
+def _binary_operands(a, b):
+    # MLX broadcasts Python scalars; torch.maximum/minimum require tensors.
+    if not torch.is_tensor(a):
+        a = torch.as_tensor(a, dtype=b.dtype, device=b.device)
+    if not torch.is_tensor(b):
+        b = torch.as_tensor(b, dtype=a.dtype, device=a.device)
+    return a, b
+
+
+def maximum(a, b, **kw): return torch.maximum(*_binary_operands(a, b))
+def minimum(a, b, **kw): return torch.minimum(*_binary_operands(a, b))
 def clip(a, lo=None, hi=None, **kw): return torch.clamp(a, min=lo, max=hi)
 
 
@@ -866,12 +875,18 @@ def save_safetensors(path, arrays, metadata=None, **kw):
     from safetensors.torch import save_file
     if not isinstance(arrays, dict):
         raise TypeError("save_safetensors expects a dict of name -> array")
-    # Real MLX has no contiguity constraint; safetensors.torch does, so normalize.
-    arrays = {
-        key: value.contiguous() if isinstance(value, torch.Tensor) else value
-        for key, value in arrays.items()
-    }
-    save_file(arrays, path, metadata=metadata)
+    # Real MLX has no contiguity constraint and writes each entry by value, so one array may sit
+    # under several keys; safetensors.torch refuses both non-contiguous and shared storage.
+    seen = set()
+    out = {}
+    for key, value in arrays.items():
+        if isinstance(value, torch.Tensor):
+            value = value.contiguous()
+            if value.untyped_storage().data_ptr() in seen:
+                value = value.clone()
+            seen.add(value.untyped_storage().data_ptr())
+        out[key] = value
+    save_file(out, path, metadata=metadata)
 
 
 def load(path, **kw):
@@ -946,7 +961,9 @@ def grad(fn, argnums=0, **kw):
 
 
 def value_and_grad(fn, argnums=0, **kw):
-    return torch.func.grad_and_value(fn, argnums=argnums)
+    split = lambda *args: (lambda out: (out[0], out) if isinstance(out, (tuple, list)) else (out, out))(fn(*args))  # noqa: E501
+    grad_and_value = torch.func.grad_and_value(split, argnums=argnums, has_aux=True)
+    return lambda *args: (lambda grads, value: (value[1], grads))(*grad_and_value(*args))
 
 
 def vmap(fn, in_axes=0, out_axes=0, **kw):

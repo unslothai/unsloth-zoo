@@ -83,10 +83,15 @@ class _Model(torch.nn.Module):
         return SimpleNamespace(logits = h if self.hidden_states else self.head(h))
 
 
+def _line_at(src, needle):
+    """Start of the line holding `needle`, so the slice dedents at any body indent."""
+    return src.rindex("\n", 0, src.index(needle)) + 1
+
+
 def _pg_forward_source():
     src = inspect.getsource(rr.grpo_accumulated_loss)
-    start = src.index("    def _pg_grad_forward():")
-    end   = src.index("    if _pg_layout is not None:")
+    start = _line_at(src, "    def _pg_grad_forward():")
+    end   = _line_at(src, "    if _pg_layout is not None:")
     return textwrap.dedent(src[start:end])
 
 

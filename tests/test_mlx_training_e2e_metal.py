@@ -30,6 +30,7 @@ _UNTRANSPOSED = dict(k=192, rows=1, out_width=128, transpose=False, rhs_indices=
 if _METAL:
     # Module scope: leaked mlx-simulation shims must not hijack test-time imports.
     import mlx.nn as nn
+    import mlx.optimizers as optim
     from mlx.utils import tree_flatten, tree_map
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -91,6 +92,89 @@ def test_cached_position_attribute_does_not_imply_multiaxis_rope():
     expected = lm(inputs).logits
     actual = lm.lm_head(mlx_utils._forward_text_hidden_states(lm, inputs))
     assert mx.allclose(actual, expected, atol=1e-5).item()
+
+
+@metal_only
+def test_minicpmv4_7_text_batch_matches_upstream_and_compiles(monkeypatch):
+    import importlib
+    from unsloth_zoo.mlx import loader
+
+    try:
+        module = importlib.import_module("mlx_vlm.models.minicpmv4_7.minicpmv4_7")
+    except ImportError:
+        pytest.skip("mlx-vlm has no MiniCPM-V 4.7")
+    text = dict(model_type="qwen3_5_text", hidden_size=64, intermediate_size=64, num_hidden_layers=2,
+                num_attention_heads=2, num_key_value_heads=1, head_dim=32, rms_norm_eps=1e-6,
+                vocab_size=64, full_attention_interval=2, linear_num_key_heads=1,
+                linear_num_value_heads=1, linear_key_head_dim=32, linear_value_head_dim=32,
+                rope_parameters={"mrope_interleaved": True, "mrope_section": [2, 1, 1],
+                                 "rope_theta": 1e7, "partial_rotary_factor": 0.25})
+    vision = dict(hidden_size=32, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2)
+    config = module.ModelConfig.from_dict(dict(
+        model_type="minicpmv4_7", text_config=text, vision_config=vision, insert_layer_id=0,
+        image_token_id=56, video_token_id=57, image_start_id=58, image_end_id=59,
+        slice_start_id=60, slice_end_id=61, newline_id=62))
+    installed = module.Model.get_input_embeddings
+    upstream = getattr(installed, "__wrapped__", installed)
+    monkeypatch.setattr(module.Model, "get_input_embeddings", upstream)
+    with monkeypatch.context() as changed:
+        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", "0" * 64)
+        assert loader._minicpmv4_7_text_positions_adapter(module.Model) is upstream
+    loader._ensure_minicpmv4_7_text_positions("minicpmv4_7")
+    patched = module.Model.get_input_embeddings
+    mx.random.seed(0)
+    model = module.Model(config)
+    model.train()
+    lm, ids = model.language_model, mx.array([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]])
+    for kwargs in ({}, {"mask": mx.array([[1, 1, 1, 1, 0, 0], [0, 0, 1, 1, 1, 1]])},
+                   {"attention_mask": mx.array([[0] * 6, [1, 0, 1, 0, 1, 1]], dtype=mx.bool_)}):
+        expected = upstream(model, ids, **kwargs)
+        expected = (expected.inputs_embeds, expected.position_ids, expected.rope_deltas,
+                    lm._position_ids, lm._rope_deltas)
+        lm._position_ids = lm._rope_deltas = mx.full((3, 1, 1), 97)
+        actual = patched(model, ids, **kwargs)
+        actual = (actual.inputs_embeds, actual.position_ids, actual.rope_deltas,
+                  lm._position_ids, lm._rope_deltas)
+        for a, e in zip(actual, expected):
+            assert a.dtype == e.dtype and mx.array_equal(a, e).item()
+    model.eval()
+    with pytest.raises(ValueError, match="placeholder"):
+        patched(model, mx.array([[config.image_token_id, 1]]))
+    model.train()
+
+    def loss(model, ids):
+        return nn.losses.cross_entropy(model(ids[:, :-1]).logits, ids[:, 1:]).mean()
+
+    step = nn.value_and_grad(model, loss)
+    eager, eager_grad = step(model, ids)
+    compiled, compiled_grad = mx.compile(lambda x: step(model, x), inputs=[model.state], outputs=[model.state])(ids)
+    assert compiled.item() == eager.item()
+    eager_grad, compiled_grad = dict(tree_flatten(eager_grad)), dict(tree_flatten(compiled_grad))
+    assert compiled_grad.keys() == eager_grad.keys()
+    assert float(mx.abs(eager_grad["language_model.model.embed_tokens.weight"]).max()) > 0
+    for name, grad in eager_grad.items():
+        assert mx.allclose(compiled_grad[name], grad, atol=1e-5, rtol=1e-3).item(), name
+
+
+@metal_only
+def test_qwen3_vl_pos_embed_interpolation_with_quantized_table():
+    from types import SimpleNamespace
+    from mlx_vlm.models.qwen3_vl.vision import VisionModel
+    from unsloth_zoo.mlx import compile as mc
+
+    mc._install_qwen3_family_compile_patches()
+    assert VisionModel.fast_pos_embed_interpolate.__module__ == mc.__name__
+    table = nn.QuantizedEmbedding.from_embedding(nn.Embedding(16, 64))
+
+    class Dense:  # the same rows behind a float weight
+        weight = mx.zeros((1,))
+        __call__ = staticmethod(table)
+
+    out = [VisionModel.fast_pos_embed_interpolate(
+        SimpleNamespace(num_grid_per_side=4, pos_embed=embed, config=SimpleNamespace(spatial_merge_size=2)),
+        [(1, 6, 8)]) for embed in (table, Dense())]
+    assert table.weight.dtype == mx.uint32
+    assert mx.array_equal(out[0], out[1]).item()
 
 
 @metal_only
@@ -173,6 +257,144 @@ def test_recurrent_language_layers_receive_one_adapter_each(per_layer):
     else:
         assert isinstance(model.high.q_proj, LoRALinear)
         assert model.low.q_proj is not model.high.q_proj
+
+
+@metal_only
+@pytest.mark.parametrize("window, T, windowed", [
+    (256, 1600, True), (640, 2000, True), (640, 1280, False), (None, 4100, False)])
+def test_training_attention_visits_only_the_window(monkeypatch, window, T, windowed):
+    from mlx_vlm.models import base as vlm_base
+
+    mx.random.seed(0)
+    B, heads, dim = 2, 4, 32
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(dim, 2 * dim)
+
+        def __call__(self, x, mask=None):
+            q, kv = mx.split(self.qkv(x), [dim], axis=-1)
+            q = q.reshape(B, T, heads, -1).transpose(0, 2, 1, 3)
+            k, v = (t.reshape(B, T, heads // 2, -1).transpose(0, 2, 1, 3)
+                    for t in mx.split(kv, 2, axis=-1))
+            out = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.3, mask=mask)
+            return out.transpose(0, 2, 1, 3).reshape(B, T, dim)
+
+    mlx_utils._patch_layer_class_for_gc(Attention)
+    layer, x = Attention(), mx.random.normal((B, T, dim))
+    windows = []
+    original = mlx_utils._windowed_attention
+    monkeypatch.setattr(mlx_utils, "_windowed_attention",
+                        lambda *a: windows.append(a[-2]) or original(*a))
+
+    def step():
+        def loss(params, x):
+            layer.update(params)
+            mask = "causal" if window is None else vlm_base.create_attention_mask(x, None, window_size=window)
+            return (layer(x, mask=mask) ** 2).sum()
+
+        params = layer.trainable_parameters()
+        out = mx.compile(mx.value_and_grad(loss, argnums=(0, 1)))(params, x)
+        mx.eval(out)
+        layer.update(params)
+        return out
+
+    try:
+        dense = step()
+        # A second run keeps the wrapper installed while this one evaluates.
+        mlx_utils.acquire_mlx_training_patches()
+        mlx_utils.acquire_mlx_training_patches()
+        try:
+            trained = step()
+            calls = len(windows)
+            paused = mlx_utils.pause_mlx_training_patches()
+            try:
+                step()
+            finally:
+                mlx_utils.resume_mlx_training_patches(paused)
+        finally:
+            mlx_utils.release_mlx_training_patches()
+            mlx_utils.release_mlx_training_patches()
+    finally:
+        mlx_utils._unpatch_layer_class_gc(Attention)
+    assert len(windows) == calls
+    assert set(windows) == ({window} if windowed else set())
+    assert not hasattr(mx.fast.scaled_dot_product_attention, "_unsloth_original")
+    assert not hasattr(vlm_base.create_causal_mask, "_unsloth_original")
+    (loss, (grads, dx)), (ref_loss, (ref_grads, ref_dx)) = trained, dense
+    assert mx.allclose(loss, ref_loss, rtol=1e-5)
+    assert mx.allclose(dx, ref_dx, atol=1e-4)
+    for key in ("weight", "bias"):
+        assert mx.allclose(grads["qkv"][key], ref_grads["qkv"][key], rtol=1e-4, atol=1e-4)
+
+
+@metal_only
+@pytest.mark.parametrize("heads, T, dim, pays", [
+    (8, 1536, 256, False), (8, 2048, 256, True), (8, 2048, 512, False), (8, 4096, 512, True)])
+def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
+    q, k = mx.zeros((1, heads, T, dim)), mx.zeros((1, 1, T, dim))
+    assert mlx_utils._windowing_pays(q, k, 512) is pays
+
+
+@metal_only
+@pytest.mark.parametrize("family", ["gemma4", "gemma3n"])
+@pytest.mark.parametrize("T", [2048, 5200])
+def test_windowed_attention_trains_kv_shared_gemma(monkeypatch, family, T):
+    # gemma3n shares K/V through the zoo's slots, gemma4 through mlx-vlm itself.
+    import importlib
+    from mlx.utils import tree_flatten
+
+    config_module = importlib.import_module(f"mlx_vlm.models.{family}.config")
+    language = importlib.import_module(f"mlx_vlm.models.{family}.language")
+    mx.random.seed(0)
+    layers, types = 15, (["sliding_attention"] * 4 + ["full_attention"]) * 3
+    shape = dict(
+        num_hidden_layers=layers, num_kv_shared_layers=10, sliding_window=512, layer_types=types,
+        hidden_size=64, head_dim=32, num_attention_heads=2, num_key_value_heads=1,
+        hidden_size_per_layer_input=16, vocab_size=512, vocab_size_per_layer_input=512)
+    if family == "gemma4":
+        shape.update(intermediate_size=128, global_head_dim=64)
+    else:
+        shape.update(model_type="gemma3n_text", intermediate_size=[128] * layers, laurel_rank=8,
+                     activation_sparsity_pattern=[0.0] * layers)
+    model = language.LanguageModel(config_module.TextConfig(**shape))
+    ids = mx.random.randint(0, 512, (1, T))
+    windows = []
+    original = mlx_utils._windowed_attention
+    monkeypatch.setattr(mlx_utils, "_windowed_attention",
+                        lambda *a: windows.append(a[-2]) or original(*a))
+
+    def step():
+        def loss(params):
+            model.update(params)
+            caches = mlx_utils._build_shared_kv_caches(model)
+            return model(ids, cache=caches).logits.astype(mx.float32).mean()
+
+        params = model.trainable_parameters()
+        out = mx.compile(mx.value_and_grad(loss))(params)
+        mx.eval(out)
+        model.update(params)
+        return out
+
+    layer_class = type(model.model.layers[0])
+    mlx_utils._patch_layer_class_for_gc(layer_class)
+    try:
+        dense = step()
+        mlx_utils.acquire_mlx_training_patches()
+        try:
+            trained = step()
+        finally:
+            mlx_utils.release_mlx_training_patches()
+    finally:
+        mlx_utils._unpatch_layer_class_gc(layer_class)
+    # Every sliding layer, in the forward and in its checkpoint recompute.
+    assert windows == [512] * 2 * types.count("sliding_attention")
+    (loss, grads), (ref_loss, ref_grads) = trained, dense
+    assert mx.allclose(loss, ref_loss, rtol=1e-5)
+    ref = dict(tree_flatten(ref_grads))
+    for name, grad in tree_flatten(grads):
+        assert (grad - ref[name]).abs().max() <= 1e-2 * ref[name].abs().max() + 1e-8, name
 
 
 def _dataset(n=24):
@@ -347,6 +569,28 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
     assert ClassCallback.calls == [0]
     assert trainer._saved == [str(tmp_path)]
     assert output.global_step == 3
+
+
+@metal_only
+def test_eval_reports_mean_token_accuracy_on_metal(tmp_path):
+    from transformers import TrainerCallback
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    class Recorder(TrainerCallback):
+        metrics = None
+
+        def on_evaluate(self, args, state, control, metrics, **_kwargs):
+            self.metrics = dict(metrics)
+
+    recorder = Recorder()
+    trainer = _callback_trainer(tmp_path, [recorder], max_steps=1)
+    trainer.train()
+    _, ntoks, correct = make_baseline_loss_fn()(
+        trainer.model, *_callback_batch(), return_correct=True,
+    )
+    expected = correct.item() / ntoks.item()
+    assert 0.0 <= expected <= 1.0
+    assert recorder.metrics["eval_mean_token_accuracy"] == pytest.approx(expected)
 
 
 @metal_only
@@ -688,6 +932,341 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
             assert mx.allclose(expected, got, atol=2e-5, rtol=2e-4).item()
     plan.configure_cce_compaction(False)
     assert plan.prepare_cce_batch(1, batch) is batch
+
+
+@metal_only
+def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch):
+    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    from unsloth_zoo.mlx import preference
+    mx.random.seed(611)
+    model = _cce_text_model(2053, 1024, quantized=True)
+    head = pack.HadamardQuantizedLinear(1024, 8192, 512)
+    head.signs = mx.where(mx.random.uniform(shape=(1024,)) < 0.5, -1.0, 1.0)
+    rotated = pack.hadamard_transform(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
+    head.weight, scales, biases = mx.quantize(rotated, group_size=128, bits=2)
+    head.scales, head.biases = scales.astype(mx.float16), biases.astype(mx.float16)
+    model.lm_head = head
+    ids = mx.random.randint(0, 2053, (2, 65))
+    lengths = mx.array([[0, 65], [0, 40]], dtype=mx.int32)
+    want = nn.value_and_grad(model, make_baseline_loss_fn())(model, ids, lengths)
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    assert loss_fn._unsloth_cce_backend == "runtime-cce"
+    got = nn.value_and_grad(model, loss_fn)(model, ids, lengths)
+    mx.eval(want, got)
+    assert got[0][0].item() == pytest.approx(want[0][0].item(), rel=1e-4)
+    for (_, expected), (_, actual) in zip(tree_flatten(want[1]), tree_flatten(got[1])):
+        assert mx.allclose(expected, actual, atol=1e-5, rtol=1e-3).item()
+    score = preference._make_preference_cce_scorer(model)
+    supervised = mx.arange(64)[None] < lengths[:, 1:] - 1
+    ce, _ = score(model, ids, supervised)
+    logits = model(ids[:, :-1]).astype(mx.float32)
+    dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="none")
+    assert mx.allclose(ce, dense * supervised, atol=1e-4, rtol=1e-4).item()
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
+        m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))
+    vlm_loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert vlm_loss._unsloth_cce_backend == "runtime-cce"
+    assert vlm_loss(model, {"input_ids": ids})[0].item() == pytest.approx(dense.mean().item(), rel=1e-4)
+
+
+@metal_only
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, 7.0])
+def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compiled, softcap):
+    import gc
+    from unsloth_zoo.mlx.cce import runtime_cce
+    from unsloth_zoo.mlx.cce.runtime_cce import make_chunked_cross_entropy_loss
+
+    stored, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(runtime_cce, "_forward_with_hidden_gradient",
+                        lambda *args, **kwargs: (out := forward(*args, **kwargs), stored.append(out[1].dtype))[0])
+
+    mx.random.seed(719)
+    hidden = (mx.random.normal((256, 128)) * 0.2).astype(mx.bfloat16)
+    weight = (mx.random.normal((8192, 128)) * 0.1).astype(mx.bfloat16)
+    targets = mx.where(mx.arange(256) % 5 == 0, -100, mx.arange(256) * 29)
+    cotangent = mx.where(mx.arange(256) % 2 == 0, 1.0, -0.5)
+    mx.eval(hidden, weight, targets, cotangent)
+    functions = []
+    for frozen, precompute in ((False, False), (True, False), (True, True)):
+        runtime, _ = make_chunked_cross_entropy_loss(
+            chunk_size=2048, weight_is_frozen=frozen, logit_softcap=softcap,
+            precompute_hidden_gradient=precompute,
+        )
+        def loss(h, runtime=runtime):
+            return (runtime(h, weight, targets) * cotangent).sum()
+        grad = mx.value_and_grad(loss)
+        functions.append(mx.compile(grad) if compiled else grad)
+    expected, actual, precomputed = [fn(hidden) for fn in functions]
+    reference, _ = make_chunked_cross_entropy_loss(chunk_size=2048, logit_softcap=softcap)
+    exact = mx.grad(lambda h: (reference(h, weight.astype(mx.float32), targets) * cotangent).sum())(
+        hidden.astype(mx.float32)
+    )
+    mx.eval(expected, actual, precomputed, exact)
+    for left, right in zip(expected, actual):
+        assert mx.array_equal(left, right).item()
+    assert mx.array_equal(precomputed[0], expected[0]).item()
+    assert mx.allclose(precomputed[1].astype(mx.float32), exact, atol=2e-3, rtol=0).item()
+    # Held until the backward, the gradient is stored at the hidden dtype.
+    assert stored == [mx.bfloat16]
+    assert mx.all(actual[1][::5] == 0).item()
+    assert mx.any(actual[1][1:] > 0).item() and mx.any(actual[1][1:] < 0).item()
+    del expected, actual, precomputed, exact, left, right
+    # Head-only peaks cover the release; precomputing saves memory only across a compiled model step.
+    peaks = []
+    for fn in functions[:2]:
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        result = fn(hidden)
+        mx.eval(result)
+        peaks.append(mx.get_peak_memory() - resident)
+        del result
+    assert peaks[1] < peaks[0]
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
+    import gc
+    import weakref
+    from unsloth_zoo.mlx.optimizers_quantized import QuantizedMomentAdamW
+
+    shape = (2048, 8192)
+    leaf = shape[0] * shape[1] * 2
+    results, peaks = [], []
+    for trainer_built in (False, True):
+        mx.random.seed(3)
+        params = {"w": (mx.random.normal(shape) * 0.02).astype(mx.bfloat16)}
+        grads = [(mx.random.normal(shape) * 1e-3).astype(mx.bfloat16) for _ in range(3)]
+        if trainer_built:
+            trainer = MLXTrainer.__new__(MLXTrainer)
+            trainer.args = MLXTrainingConfig(
+                optim="adamw_8bit" if quantized else "adamw", learning_rate=1e-3,
+                lr_scheduler_type="constant", warmup_steps=0, weight_decay=0.0,
+            )
+            opt = trainer._build_optimizer(total_steps=3)
+        else:
+            cls = QuantizedMomentAdamW if quantized else optim.AdamW
+            opt = cls(learning_rate=1e-3, weight_decay=0.0, bias_correction=True)
+        opt.init(params)
+        state = [params, opt.state]
+        step = mx.compile(lambda g: params.update(opt.apply_gradients({"w": g}, params)),
+                          inputs=state, outputs=state)
+        mx.eval(state, grads)
+        for g in grads:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            step(g)
+            mx.eval(state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    assert peaks[0] >= 3 * leaf
+    if quantized:
+        # 8-bit m is repacked either way; only the parameter is donated.
+        assert peaks[1] <= peaks[0] - leaf
+    else:
+        assert peaks[1] < leaf / 8
+    released = weakref.ref(trainer._build_optimizer(total_steps=3))
+    assert released() is None
+
+
+@metal_only
+def test_layer_ordered_update_frees_gradients_during_backward():
+    import gc
+    from unsloth_zoo.mlx.trainer import _async_eval_by_layer, _donate_optimizer_state
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Linear(2048, 2048, bias=False)
+            self.layers = [nn.Linear(2048, 2048, bias=False) for _ in range(16)]
+
+        def __call__(self, x):
+            x = self.embed(x)
+            for layer in self.layers:
+                def block(params, x, layer=layer):
+                    layer.update(params)
+                    return x + nn.gelu(layer(x))
+                x = mx.checkpoint(block)(layer.trainable_parameters(), x)
+            return x
+
+    results, peaks = [], []
+    for ordered in (False, True):
+        mx.random.seed(5)
+        model = Net()
+        model.set_dtype(mx.bfloat16)
+        opt = _donate_optimizer_state(optim.AdamW(learning_rate=1e-3, weight_decay=0.0))
+        opt.init(model.trainable_parameters())
+        grad_fn = nn.value_and_grad(model, lambda m, x: m(x).astype(mx.float32).square().mean())
+        state = [model.state, opt.state]
+
+        def step(x):
+            loss, grads = grad_fn(model, x)
+            opt.update(model, grads)
+            return loss
+
+        step = mx.compile(step, inputs=state, outputs=state)
+        xs = [mx.random.normal((4096, 2048)).astype(mx.bfloat16) for _ in range(3)]
+        mx.eval(state, xs)
+        for x in xs:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            loss = step(x)
+            if ordered:
+                _async_eval_by_layer(model.trainable_parameters(), "layers.")
+            mx.eval(loss, state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    layer_grads = 16 * 2048 * 2048 * 2
+    assert peaks[1] <= peaks[0] - 2 * layer_grads
+
+
+@metal_only
+def test_trainer_schedules_the_update_layer_by_layer(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx import trainer as trainer_module
+
+    calls, schedule = [], trainer_module._async_eval_by_layer
+
+    def spy(tree, prefix):
+        if created:  # the first step's state must already be allocated
+            before = mx.get_active_memory()
+            mx.eval(created)
+            unallocated.append(mx.get_active_memory() - before)
+            created.clear()
+        params = tree_flatten(model.trainable_parameters())
+        is_params = all(a is b for (_, a), (_, b) in zip(tree_flatten(tree), params))
+        calls.append((tree, prefix, is_params))
+        schedule(tree, prefix)
+
+    monkeypatch.setattr(trainer_module, "_async_eval_by_layer", spy)
+    in_trace, created, unallocated, build = [], [], [], MLXTrainer._build_optimizer
+
+    def build_spy(self, total_steps):
+        optimizer = build(self, total_steps)
+        init = optimizer.init
+
+        def init_spy(parameters):
+            try:
+                mx.eval(tree_flatten(parameters)[0][1])
+                in_trace.append(False)
+            except ValueError:
+                in_trace.append(True)
+            init(parameters)
+            created.extend(a for _, a in tree_flatten(optimizer.state) if a.size > 1)
+
+        optimizer.init = init_spy
+        return optimizer
+
+    monkeypatch.setattr(MLXTrainer, "_build_optimizer", build_spy)
+    model, tokenizer = FastMLXModel.from_pretrained(
+        str(_tiny_base(tmp_path / "base")), load_in_4bit=False, max_seq_length=64,
+        full_finetuning=True,
+    )
+    MLXTrainer(model=model, tokenizer=tokenizer, train_dataset=_dataset(8), args=MLXTrainingConfig(
+        per_device_train_batch_size=2, gradient_accumulation_steps=2, max_steps=2,
+        output_dir=str(tmp_path / "out"), report_to="none",
+    )).train()
+    # Optimizer state is created before, not inside, the first compiled step.
+    assert in_trace == [False] and unallocated == [0]
+    assert {prefix for _, prefix, _ in calls} == {"model.layers."}
+    # Accumulation substeps schedule the accumulated gradient, update steps the parameters.
+    assert [is_params for _, _, is_params in calls] == [False, True, False, True]
+    trainable = {name for name, _ in tree_flatten(model.trainable_parameters())}
+    for tree, _, _ in calls:
+        assert {name for name, _ in tree_flatten(tree)} == trainable
+
+
+@metal_only
+def test_trainer_compiled_step_uses_lora_head_cce(monkeypatch, tmp_path):
+    calls = []
+    factory = mlx_utils._make_text_lora_cce_loss_fn
+
+    def recording(*args, **kwargs):
+        loss = factory(*args, **kwargs)
+
+        def record(model, *batch):
+            calls.append(len(batch))
+            return loss(model, *batch)
+
+        return record
+
+    monkeypatch.setattr(mlx_utils, "_make_text_lora_cce_loss_fn", recording)
+    mx.random.seed(919)
+    model = _cce_text_model(2049, 1024, quantized=False, lora=True)
+    ids = tuple(range(2049))
+    labels = tuple(i if i % 10 == 0 else -100 for i in ids)
+    trainer = MLXTrainer(model=model, tokenizer=None, train_dataset=[], args=MLXTrainingConfig(
+        max_steps=1, per_device_train_batch_size=1, gradient_accumulation_steps=1,
+        learning_rate=1e-4, logging_steps=1, save_steps=0, output_dir=str(tmp_path),
+        compile=True, gradient_checkpointing=False, report_to="none",
+    ))
+    trainer._batches = FiniteTextBatchPlan(
+        [_FiniteTextRow(ids, offset=0, labels=labels)], [(0,)], max_seq_length=2049, pad_id=0,
+    )
+    trainer.save_model = lambda output_dir=None: None
+    trainer.train()
+    assert calls == [3]
+
+
+@metal_only
+def test_lora_head_cce_without_metal_keeps_baseline(monkeypatch):
+    model = _cce_text_model(2049, 1024, quantized=False, lora=True)
+    monkeypatch.setattr(mx.metal, "is_available", lambda: False)
+    loss = mlx_utils.make_cce_loss_fn(model)
+    assert not hasattr(loss, "_unsloth_compiled_loss_fn")
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("tokens, softcap, dim, promoted", [(128, 0.0, 1024, False), (2048, 0.0, 1024, False), (2048, 5.0, 1024, False), (2048, 0.0, 4096, False), (2048, 0.0, 4096, True)])
+def test_lora_head_cce_live_gradients_and_early_fallback(quantized, tokens, softcap, dim, promoted):
+    calls = []
+    low_precision = softcap > 0 or (dim > 1024 and not promoted)
+    mx.random.seed(917)
+    model = _cce_text_model(2049, dim, quantized=quantized, lora=True, calls=calls, softcap=softcap)
+    if promoted:
+        model.model.embed_tokens.weight = model.model.embed_tokens.weight.astype(mx.float32)
+    ids = mx.arange(tokens + 1, dtype=mx.int32)[None, :]
+    labels = mx.where(ids % 5 == 0, -100, ids)
+    batch = (ids, mx.array([[0, tokens + 1]], dtype=mx.int32), labels)
+    loss = mlx_utils.make_cce_loss_fn(model)
+    grad = nn.value_and_grad(model, getattr(loss, "_unsloth_compiled_loss_fn", loss))
+    compiled = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
+    native_loss = make_baseline_loss_fn()
+    reference = nn.value_and_grad(model, lambda m, *b: native_loss(lambda ids: m(ids).astype(mx.float32), *b))
+    first_loss = None
+    for iteration in range(2):
+        calls.clear()
+        actual = compiled(*batch)
+        mx.eval(actual)
+        assert calls == ([] if iteration else (["model", "backbone"] if tokens == 128 else ["backbone"]))
+        expected = reference(model, *batch)
+        mx.eval(expected)
+        assert actual[0][1].item() == expected[0][1].item()
+        assert actual[0][0].item() == pytest.approx(expected[0][0].item(), abs=(0.005 if low_precision else 1e-5) if tokens > 128 else 0, rel=0)
+        for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+            assert (mx.allclose(want, got, atol=2e-5 if low_precision else 2e-6, rtol=0.02 if low_precision else 2e-4) if tokens > 128 else mx.array_equal(want, got)).item()
+        for key in ("lora_a", "lora_b"):
+            assert mx.any(actual[1]["lm_head"][key] != 0).item()
+        if iteration:
+            assert actual[0][0].item() != first_loss
+        first_loss = actual[0][0].item()
+        model.lm_head.lora_a = model.lm_head.lora_a * 2.0
+        model.lm_head.lora_b = model.lm_head.lora_b * 3.0
 
 
 def _norm_model(seed=77, dtype=None):
@@ -1179,6 +1758,7 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
     assert aux <= trainable, sorted(aux - trainable)
     assert _adapter_keys(reloaded) <= trainable
     assert trainable == _adapter_keys(reloaded) | aux
+    assert reloaded._unsloth_reloaded_parameter_keys == aux
 
 
 def _record_cce_rows(monkeypatch):
@@ -1197,7 +1777,7 @@ def _record_cce_rows(monkeypatch):
 @pytest.mark.parametrize("reference", [False, True])
 @pytest.mark.parametrize("prompt_share", ["low", "high"])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-@pytest.mark.parametrize("kind", ["dpo", "orpo"])
+@pytest.mark.parametrize("kind", ["dpo", "orpo", "cpo"])
 def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, reference, prompt_share, dtype, kind):
     from unsloth_zoo.mlx import preference as p
     from mlx_lm.tuner.lora import LoRAEmbedding
@@ -1212,7 +1792,7 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
         model.model.embed_tokens = adapter
         model.freeze()
         adapter.unfreeze(keys=["lora_a", "lora_b"])
-        policy = p.LoRAReferencePolicy([adapter])
+        policy = p.ReferencePolicy(scales=[(adapter, 0.0)])
     model.set_dtype(getattr(mx, dtype))
     rows = []
     for i in range(8):
@@ -1230,8 +1810,9 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
         dense = p.make_dpo_loss_fn(objective, reference_policy=policy)
         loss = p.make_dpo_cce_loss_fn(model, objective, reference_policy=policy)
     else:
-        objective = p.resolve_preference_objective("orpo", beta=0.2)
-        dense, loss = p.make_orpo_loss_fn(objective), p.make_orpo_cce_loss_fn(model, objective)
+        objective = p.resolve_preference_objective(kind, beta=0.2,
+            **({"loss_type": "simpo", "alpha": 0.1} if kind == "cpo" else {}))
+        dense, loss = (getattr(p, f"make_{kind}{cce}_loss_fn")(*args) for cce, args in (("", (objective,)), ("_cce", (model, objective))))
     grad = nn.value_and_grad(model, loss)
     run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
     for index in range(2):
@@ -1257,6 +1838,129 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
             assert mx.allclose(want, got, atol=2e-5, rtol=rtol).item()
         if reference:
             assert adapter.scale == 2.0
+
+
+@metal_only
+@pytest.mark.parametrize("family,tied", [("nemotron_h", False), ("mamba2", False), ("mamba2", True)])
+def test_backbone_stack_hidden_states_and_cce_match_the_logits(family, tied):
+    import importlib
+
+    mod = importlib.import_module(f"mlx_lm.models.{family}")
+    common = dict(model_type=family, vocab_size=128, hidden_size=64, intermediate_size=128,
+                  layer_norm_epsilon=1e-5, conv_kernel=4, n_groups=1, use_bias=False,
+                  use_conv_bias=True)
+    if family == "nemotron_h":
+        args = mod.ModelArgs(
+            **common, max_position_embeddings=256, num_attention_heads=4,
+            num_key_value_heads=2, attention_bias=False, mamba_num_heads=4, mamba_head_dim=16,
+            mamba_proj_bias=False, ssm_state_size=16, mlp_bias=False, head_dim=16,
+            hybrid_override_pattern=["M", "*", "-", "M"], num_hidden_layers=4,
+        )
+    else:
+        args = mod.ModelArgs(
+            **common, num_heads=4, head_dim=16, state_size=16, num_hidden_layers=2,
+            tie_word_embeddings=tied, time_step_limit=(0.0, float("inf")), time_step_rank="auto",
+        )
+    mx.random.seed(0)
+    model = mod.Model(args)
+    mx.eval(model.parameters())
+    ids = mx.random.randint(0, 128, (2, 24))
+    lengths = mx.array([[0, 24], [0, 20]])
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    if tied:
+        # No lm_head to split from: the full forward stays the loss.
+        assert mlx_utils._get_text_backbone(model) is None
+        assert loss_fn._unsloth_cce_backend == "baseline-fallback"
+        return
+    hidden = mlx_utils._forward_text_hidden_states(model, ids)
+    assert mx.array_equal(model.lm_head(hidden), model(ids))
+    assert loss_fn._unsloth_cce_backend != "baseline-fallback"
+    def first(r):
+        return r[0] if isinstance(r, tuple) else r
+
+    cce = nn.value_and_grad(model, lambda m: first(loss_fn(m, ids, lengths)))(model)
+    ce = nn.value_and_grad(model, lambda m: first(make_baseline_loss_fn()(m, ids, lengths)))(model)
+    assert abs(cce[0].item() - ce[0].item()) <= 1e-5
+    for (key, got), (_, ref) in zip(tree_flatten(cce[1]), tree_flatten(ce[1])):
+        assert mx.allclose(got, ref, rtol=1e-4, atol=1e-6), key
+
+
+@metal_only
+@pytest.mark.parametrize("frozen", [False, True])
+def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
+    """A trainable-declared head may compute its weight gradient despite stop_gradient."""
+    from unsloth_zoo.mlx import preference as p, utils
+
+    model = _cce_text_model(2053, 64, quantized=False)
+    if frozen:
+        model.freeze()
+        model.model.unfreeze()
+    seen, build = [], utils._get_runtime_cce
+    monkeypatch.setattr(utils, "_get_runtime_cce", lambda **kw: seen.append(kw) or build(**kw))
+    assert p._make_preference_cce_scorer(model) is not None
+    assert [kw["weight_is_frozen"] for kw in seen] == [frozen]
+
+
+@metal_only
+@pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
+@pytest.mark.parametrize("loss_type", ["kto", "apo_zero_unpaired"])
+def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
+    from unsloth_zoo.mlx import preference as p
+    from mlx_lm.tuner.lora import LoRAEmbedding
+    mx.random.seed(941)
+    calls = []
+    model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
+                            softcap=0.5 if head == "softcap" else 0.0)
+    adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
+    adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.02
+    model.model.embed_tokens = adapter
+    model.freeze()
+    adapter.unfreeze(keys=["lora_a", "lora_b"])
+    reference = p.ReferencePolicy(scales=[(adapter, 0.0)])
+    seq = lambda step, i, size: tuple((j * step + i) % 2053 for j in range(size))
+    rows = [p.TokenizedKTORow(
+        seq(7, i, 13 + i), seq(11, i, 40 + 3 * i), label=i % 3 != 0,
+        kl_prompt_ids=seq(7, i, 13 + i), kl_completion_ids=seq(5, i, 30 + i)) for i in range(4)]
+    objective = p.resolve_preference_objective("kto", beta=0.2, loss_type=loss_type)
+    plan = p.FiniteKTOBatchPlan(rows, [(0, 1, 2, 3)], with_kl=objective.with_kl,
+                                normalizers=[(0, 4, 1)], cycle_length=1, max_seq_length=128, pad_id=0)
+    dense = nn.value_and_grad(model, p.make_kto_loss_fn(objective, reference_policy=reference))
+    grad = nn.value_and_grad(model, p.make_kto_cce_loss_fn(model, objective, reference_policy=reference))
+    mx.eval(expected := dense(model, *plan[0]))
+    calls.clear()
+    run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
+    mx.eval(actual := run(*plan[0]))
+    # The KL rows and the reference score through the kernel, not the logits.
+    assert "model" not in calls and adapter.scale == 2.0
+    for want, got in zip(expected[0], actual[0]):
+        assert mx.allclose(want, got, atol=1e-4, rtol=1e-5).item()
+    for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+        assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+    scorer = p.make_kto_cce_loss_fn(model, objective, reference_policy=reference)._unsloth_cce_scorer
+    want = p.precompute_reference_logps(plan, model, reference, batch_size=4)
+    calls.clear()
+    got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=scorer)
+    assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
+
+
+
+@metal_only
+@pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
+def test_grpo_cce_scores_like_the_logits(head):
+    from unsloth_zoo.mlx import grpo as g
+    mx.random.seed(947)
+    calls, objective = [], g.GRPOObjective(beta=0.04, temperature=0.7, max_completion_length=40)
+    model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls, softcap=0.5 if head == "softcap" else 0.0)
+    tokens = (mx.arange(4 * 48).reshape(4, 48) * 7 + 3) % 2053
+    old = g.completion_logps(model, tokens, 0.7) + 0.05
+    batch = (tokens, mx.array([[5, 48], [9, 40], [13, 33], [3, 48]]), mx.array([2.0, 100.0]), mx.array([1.0, -1.0, 0.5, -0.5]), mx.array([1, 1, 0, 1]), old, old - 0.1)  # noqa: E501
+    mx.eval(expected := nn.value_and_grad(model, g.make_grpo_loss_fn(objective))(model, *batch))
+    calls.clear()
+    cce = g.make_grpo_cce_loss_fn(model, objective)
+    mx.eval(actual := mx.compile(lambda *b: nn.value_and_grad(model, cce)(model, *b), inputs=model.state, outputs=model.state)(*batch))
+    assert ("model" in calls) is (head == "softcap") is (cce._unsloth_grpo_scorer is None)  # a softcap keeps the logits
+    flat = lambda out: [*out[0], *(value for _, value in tree_flatten(out[1]))]
+    assert all(mx.allclose(want, got, atol=1e-4, rtol=2e-4).item() for want, got in zip(flat(expected), flat(actual)))
 
 
 @metal_only
@@ -1348,7 +2052,7 @@ def test_preference_logit_sums_keep_float32_precision(quantized):
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("reference", [False, True])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-@pytest.mark.parametrize("kind", ["dpo", "orpo"])
+@pytest.mark.parametrize("kind", ["dpo", "orpo", "cpo"])
 def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, reference, dtype, kind):
     from types import SimpleNamespace
     from mlx_lm.tuner.lora import LoRAEmbedding
@@ -1362,7 +2066,7 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
         adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
         adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * .02
         model.model.embed_tokens = adapter
-        policy = p.LoRAReferencePolicy([adapter])
+        policy = p.ReferencePolicy(scales=[(adapter, 0.0)])
     model.set_dtype(getattr(mx, dtype))
     model.eval()
     rows = []
@@ -1393,7 +2097,7 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
     kernel_rows.clear()
     actual = MLXTrainer._evaluate_batch_totals(trainer, plan, candidate)
     mx.eval(expected, actual)
-    capacity = 256 if kind == "dpo" else 768
+    capacity = 768 if kind == "orpo" else 256
     assert kernel_rows == [capacity] * (4 if kind == "dpo" and reference else 2)
     assert len(calls) == 4 and actual[1].item() == 7
     for want, got in zip(expected, actual):
@@ -1407,6 +2111,9 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
 def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
     mx.random.seed(735)
     model = _cce_text_model(2053, 64, quantized=quantized)
+    def embed_forward(self, ids, inputs_embeds=None):
+        return self.embed_tokens(ids) if inputs_embeds is None else inputs_embeds
+    monkeypatch.setattr(type(model.model), "__call__", embed_forward)
     model.get_input_embeddings = lambda *args, **kwargs: None
     ids = mx.arange(1026).reshape(2, 513)
     batch = {"input_ids": ids, "labels": mx.where((ids % 11) == 5, ids, -100)}
@@ -1482,6 +2189,9 @@ def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
 
     mx.random.seed(412)
     model = _cce_text_model(2053, 64, quantized=quantized)
+    def embed_forward(self, ids, inputs_embeds=None):
+        return self.embed_tokens(ids) if inputs_embeds is None else inputs_embeds
+    monkeypatch.setattr(type(model.model), "__call__", embed_forward)
     model.get_input_embeddings = lambda *args, **kwargs: None
     ids = mx.arange(2050).reshape(2, 1025)
     batch = {"input_ids": ids, "labels": mx.where(ids % 17 == 5, ids, -100)}
@@ -1566,7 +2276,14 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         def __call__(self, inputs, pixel_values=None, mask=None, **_kwargs):
             return self.proj(self.embed(inputs))
 
+    from transformers import TrainerCallback
+
     seen_widths = []
+
+    class TrainingWidths(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            seen_widths.clear()
+
     original_call = TinyVLM.__call__
 
     def recording_call(self, inputs, *args, **kwargs):
@@ -1618,6 +2335,7 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         trainer._is_vlm = True
         trainer.processor = _Proc()
         trainer._batches = plan
+        trainer.add_callback(TrainingWidths())
         if planned:
             enabled_decision = types.SimpleNamespace(
                 should_raise=False, enabled=True, arch="tiny",
@@ -1883,6 +2601,29 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
 
 
 @metal_only
+def test_cce_loss_precomputes_the_hidden_gradient_only_in_training(monkeypatch):
+    from unsloth_zoo.mlx.cce import runtime_cce
+    from unsloth_zoo.mlx.utils import make_cce_loss_fn
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    ids = mx.array([tokenizer.encode("the capital of France is Paris")])
+    lengths = mx.array([[0, ids.shape[1]]], dtype=mx.int32)
+    calls, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(
+        runtime_cce, "_forward_with_hidden_gradient",
+        lambda *args, **kwargs: (calls.append(model.training), forward(*args, **kwargs))[1],
+    )
+    loss_fn = make_cce_loss_fn(model)
+    losses = []
+    for training in (True, False):
+        model.train(training)
+        losses.append(loss_fn(model, ids, lengths)[0])
+    mx.eval(losses)
+    assert calls == [True]
+    assert mx.array_equal(*losses).item()
+
+
+@metal_only
 @pytest.mark.parametrize("softcap", (0.0, 20.0), ids=("no-softcap", "softcap"))
 def test_post_head_multiplier_reaches_the_fused_cce_loss(softcap):
     """A model whose forward scales logits after the head must have that scale
@@ -2083,50 +2824,117 @@ def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
     assert mx.abs(grads["lm_head"]["lora_b"]).max().item() > 0
 
 
-@metal_only
-def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
-    """Borrowed K/V's cotangent is consumed by the source layer's backward; left
-    to run by that consumer, each borrowing layer keeps its T x T attention
-    cotangents alive until then."""
-    from mlx_vlm.models.gemma4.config import TextConfig
-    from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
+_KV_SHARED_PEAK_SCRIPT = r"""
+import json
+import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_flatten
+from mlx_vlm.models.gemma4.config import TextConfig
+from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
+from unsloth_zoo.mlx import utils as mlx_utils
 
-    seq_len = 512
-    ids = mx.random.randint(0, 64, (1, seq_len))
+seq_len = 512
+mx.random.seed(0)
+ids = mx.random.randint(0, 64, (1, seq_len))
 
-    def build(num_kv_shared_layers):
-        mx.random.seed(0)
-        model = Gemma4TextModel(TextConfig(
-            hidden_size=64, num_hidden_layers=15, intermediate_size=128,
-            num_attention_heads=8, head_dim=16, global_head_dim=32,
-            vocab_size=64, vocab_size_per_layer_input=64,
-            hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
-            num_kv_shared_layers=num_kv_shared_layers))
-        mx.eval(model.parameters())
-        return model
 
-    def peak_and_grads(model):
-        loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
-        mx.eval(loss_and_grad(model))
+def build(num_kv_shared_layers):
+    mx.random.seed(0)
+    model = Gemma4TextModel(TextConfig(
+        hidden_size=64, num_hidden_layers=15, intermediate_size=128,
+        num_attention_heads=8, head_dim=16, global_head_dim=32,
+        vocab_size=64, vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
+        num_kv_shared_layers=num_kv_shared_layers))
+    mx.eval(model.parameters())
+    return model
+
+
+def peak(model, repeats=5):
+    loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
+    mx.eval(loss_and_grad(model))
+    readings, grads = [], None
+    for _ in range(repeats):
+        grads = None
         mx.clear_cache()
         resident = mx.get_active_memory()
         mx.reset_peak_memory()
         grads = loss_and_grad(model)[1]
         mx.eval(grads)
-        return mx.get_peak_memory() - resident, grads
+        readings.append((mx.get_peak_memory() - resident,
+                         sum(g.nbytes for _, g in tree_flatten(grads))))
+    return readings
 
-    shared, unshared = build(10), build(0)
-    _, reference = peak_and_grads(shared)
+
+shared, unshared = build(10), build(0)
+mlx_utils._patch_layer_class_for_gc(DecoderLayer)
+print(json.dumps({"unshared": peak(unshared), "shared": peak(shared)}))
+"""
+
+
+@metal_only
+def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
+    """Borrowed K/V's cotangent is consumed by the source layer's backward; left
+    to run by that consumer, each borrowing layer keeps its T x T attention
+    cotangents alive until then.
+
+    The peaks are measured in a fresh interpreter. In this process, after the tests
+    before it, Metal's `get_peak_memory() - get_active_memory()` reads low for whole
+    stretches of a run: on repeated full-file runs the unshared peak read exactly
+    182285696 (pinned) or 183564288 (latest) when right, and 116 MB, 151 MB, 2284
+    bytes or negative when not, sometimes on every one of five repeats. Every flake
+    this test has had was such a low unshared reading (runs 35502075009, 36311394738,
+    36377153200). `mx.synchronize()` and `gc.collect()` do not remove them. No reading
+    was ever above the exact value, so each side is taken as the maximum of its
+    repeats, and a reading below the gradients that repeat produced is not kept.
+    """
+    import subprocess
+    import sys
+    from mlx_vlm.models.gemma4.config import TextConfig
+    from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
+
+    # Two interpreters: a fresh one can still read low on all five repeats (one run
+    # read unshared 160329148 throughout), and low stretches do not cross processes.
+    readings = {"shared": [], "unshared": []}
+    for _ in range(2):
+        run = subprocess.run(
+            [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
+            capture_output=True, text=True, timeout=900,
+        )
+        assert run.returncode == 0, run.stderr[-4000:]
+        for side, values in json.loads(run.stdout.strip().splitlines()[-1]).items():
+            readings[side] += values
+
+    def ceiling(side):
+        kept = [p for p, produced in readings[side] if p >= produced]
+        assert kept, f"every {side} repeat read a peak below its gradients: {readings[side]}"
+        return max(kept)
+
+    shared_peak, unshared_peak = ceiling("shared"), ceiling("unshared")
+    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak, readings)
+
+    # Checkpointing must not change what the shared model computes.
+    seq_len = 512
+    ids = mx.random.randint(0, 64, (1, seq_len))
+    mx.random.seed(0)
+    shared = Gemma4TextModel(TextConfig(
+        hidden_size=64, num_hidden_layers=15, intermediate_size=128,
+        num_attention_heads=8, head_dim=16, global_head_dim=32,
+        vocab_size=64, vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
+        num_kv_shared_layers=10))
+    mx.eval(shared.parameters())
+    loss_and_grad = nn.value_and_grad(shared, lambda m: (m(ids) ** 2).sum())
+    reference = loss_and_grad(shared)[1]
+    mx.eval(reference)
     mlx_utils._patch_layer_class_for_gc(DecoderLayer)
     try:
-        unshared_peak, _ = peak_and_grads(unshared)
-        shared_peak, grads = peak_and_grads(shared)
+        grads = loss_and_grad(shared)[1]
+        mx.eval(grads)
     finally:
         mlx_utils._unpatch_layer_class_gc(DecoderLayer)
-    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak)
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
-
 
 @metal_only
 def test_checkpointing_keeps_cacheless_kv_shared_gradients():
@@ -2171,3 +2979,338 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
             del Gemma3Model._kv_sharing_patched
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
+
+
+@metal_only
+def test_cce_hidden_forward_preserves_wrapper_embeddings_and_image_mask():
+    from types import SimpleNamespace
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(32, 64)
+
+        def __call__(self, ids, inputs_embeds=None, per_layer_inputs=None, image_mask=None):
+            h = self.embed_tokens(ids) * 8 if inputs_embeds is None else inputs_embeds
+            if per_layer_inputs is not None:
+                h = h + per_layer_inputs
+            if image_mask is not None:
+                h = h * mx.where(image_mask[..., None], 2, 1)
+            return h
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = nn.Module()
+            self.language_model.model = Backbone()
+            self._unsloth_text_only_vlm = True
+
+        def get_input_embeddings(self, ids, pixels):
+            h = self.language_model.model.embed_tokens(ids)
+            return SimpleNamespace(inputs_embeds=h, per_layer_inputs=h * 0.3)
+
+    model = Wrapper()
+    for rows in ([[2, 3, 4], [5, 6, 7]], [[7, 6, 5], [4, 3, 2]]):
+        ids = mx.array(rows)
+        features = model.get_input_embeddings(ids, None)
+        mask = ids % 2 == 0
+        expected = model.language_model.model(ids, inputs_embeds=features.inputs_embeds,
+            per_layer_inputs=features.per_layer_inputs, image_mask=mask)
+        actual = mlx_utils._forward_text_hidden_states(model, ids, visual_pos_masks=mask)
+        assert mx.array_equal(actual, expected).item()
+        inverse = mlx_utils._forward_text_hidden_states(model, ids, visual_pos_masks=~mask)
+        assert not mx.array_equal(inverse, expected).item()
+
+
+@metal_only
+@pytest.mark.parametrize("media_key", ["pixel_values", "pixel_values_videos"])
+def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatch, media_key):
+    calls = []
+    factory = mlx_utils._get_runtime_cce
+    def counted_factory(**kwargs):
+        runtime = factory(**kwargs)
+        def run(*args):
+            calls.append(True)
+            return runtime(*args)
+        return run
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", counted_factory)
+    base = _cce_text_model(32, 64, quantized=False)
+    class Model(type(base)):
+        def __init__(self):
+            super().__init__()
+            self.model.encoder = nn.Identity()
+        def __call__(self, ids, pixel_values=None, **kwargs):
+            pixel_values = kwargs.get("pixel_values_videos", pixel_values)
+            h = self.model(ids)
+            return self.lm_head(h if pixel_values is None else h + pixel_values)
+        def get_input_embeddings(self, *args, **kwargs):
+            pytest.fail("token-ID CCE must not request merged embeddings")
+    model = Model()
+    assert mlx_utils._get_backbone_embed_kwarg(model.model) is None
+    loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert loss._unsloth_cce_backend == "runtime-cce"
+    baseline = mlx_utils.make_vlm_baseline_loss_fn(model)
+    for pixels in (None, mx.ones((2, 3, 64)), None):
+        batch = dict(input_ids=mx.array([[2, 3, 4], [7, 6, 5]]), **{media_key: pixels})
+        before = len(calls)
+        actual, ntoks = loss(model, batch)
+        expected, expected_ntoks = baseline(model, batch)
+        assert mx.allclose(actual, expected, atol=1e-5).item()
+        assert ntoks.item() == expected_ntoks.item() == 4
+        assert len(calls) - before == int(pixels is None)
+    assert capsys.readouterr().out.count("cannot accept multimodal embeddings") == 1
+
+    class Alias:
+        def __call__(self, ids, input_embeddings=None):
+            pass
+    class Unknown:
+        def __call__(self, ids, **kwargs):
+            pass
+    class Positional:
+        def __call__(self, ids, inputs_embeds=None, /):
+            pass
+    assert mlx_utils._get_backbone_embed_kwarg(Alias()) == "input_embeddings"
+    assert mlx_utils._get_backbone_embed_kwarg(Unknown()) is None
+    assert mlx_utils._get_backbone_embed_kwarg(Positional()) is None
+
+
+@metal_only
+@pytest.mark.parametrize("conditioning", ["self_conditioning_logits", "self_conditioning_embeddings"])
+def test_encoder_decoder_cce_matches_full_forward_and_gradients(conditioning, request):
+    mlx_utils.acquire_mlx_training_patches()
+    request.addfinalizer(mlx_utils.release_mlx_training_patches)
+    config = pytest.importorskip("mlx_vlm.models.diffusion_gemma.config")
+    module = pytest.importorskip("mlx_vlm.models.diffusion_gemma.diffusion_gemma")
+    model = module.Model(config.ModelConfig(canvas_length=4, text_config=config.TextConfig(
+        vocab_size=64, hidden_size=64, intermediate_size=128, moe_intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        num_global_key_value_heads=1, head_dim=32, global_head_dim=32,
+        num_experts=2, top_k_experts=1, final_logit_softcapping=0.5,
+        layer_types=["sliding_attention", "full_attention"],
+    )))
+    cce = mlx_utils.make_vlm_cce_loss_fn(model, ignore_token_ids=[])
+    assert cce._unsloth_cce_backend == "runtime-cce"
+    ce = mlx_utils.make_vlm_baseline_loss_fn(model, ignore_token_ids=[])
+    for rows in ([[2, 3, 4, 5], [6, 7, 8, 9]], [[9, 8, 7, 6], [5, 4, 3, 2]]):
+        ids = mx.array(rows)
+        batch = dict(input_ids=ids, labels=mx.where(ids % 3 == 0, -100, ids),
+                     attention_mask=mx.ones_like(ids), canvas_ids=ids[:, ::-1],
+                     decoder_attention_mask=mx.ones((2, 8), dtype=mx.bool_))
+        batch[conditioning] = mx.random.normal((2, 4, 64)) * 0.1
+        (expected, n1), g1 = nn.value_and_grad(model, ce)(model, batch)
+        (actual, n2), g2 = nn.value_and_grad(model, cce)(model, batch)
+        assert n1.item() == n2.item()
+        assert mx.allclose(actual, expected, atol=1e-5).item()
+        for (name, a), (_, b) in zip(tree_flatten(g1), tree_flatten(g2)):
+            assert mx.allclose(a, b, atol=2e-5, rtol=2e-3).item(), name
+
+
+@metal_only
+def test_training_refuses_batch_axis_vocabulary_mask():
+    class Unsafe(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._dummy_tokenizer_ids = mx.array([3, 7])
+
+        def __call__(self, logits):
+            logits[self._dummy_tokenizer_ids] = -float("inf")
+            return logits
+
+    class Corrected(Unsafe):
+        def __call__(self, logits):
+            logits[..., self._dummy_tokenizer_ids] = -float("inf")
+            return logits
+
+    with pytest.raises(ValueError, match="unsafe output token mask.*batch axis"):
+        mlx_utils._validate_output_token_mask(Unsafe())
+    mlx_utils._validate_output_token_mask(Corrected())
+    empty = Unsafe()
+    empty._dummy_tokenizer_ids = mx.array([], mx.int32)
+    mlx_utils._validate_output_token_mask(empty)
+    logits = Corrected()(mx.zeros((2, 3, 8)))
+    assert mx.isneginf(logits[..., 3]).all().item()
+    assert mx.isneginf(logits[..., 7]).all().item()
+    assert (logits[..., 2] == 0).all().item()
+
+
+def _ragged_compact_prefix_rows(features, valid_mask):
+    """mlx-vlm 0.7.1's `_compact_prefix_rows`, verbatim."""
+    rows = []
+    for batch_idx, row in enumerate(valid_mask.tolist()):
+        length = sum(bool(v) for v in row)
+        if length:
+            rows.append(features[batch_idx, :length])
+    if not rows:
+        return features.reshape(-1, features.shape[-1])[:0]
+    return mx.concatenate(rows, axis=0)
+
+
+def _padded_features(counts, width=8, dim=6):
+    mx.random.seed(0)
+    features = mx.random.normal((len(counts), width, dim))
+    valid = mx.stack([mx.arange(width) < n for n in counts])
+    return features, valid
+
+
+@metal_only
+@pytest.mark.parametrize("counts", [
+    (5,), (8,), (0,), (5, 3), (3, 5), (8, 4, 1), (1, 4, 8), (5, 0, 6), (0, 7), (7, 0), (0, 0), (8, 8),
+])
+def test_gemma4_unified_reorder_matches_the_ragged_prefix(counts):
+    from unsloth_zoo.mlx.compile import _static_shape_prefix_rows
+
+    features, valid = _padded_features(counts)
+    reference = _ragged_compact_prefix_rows(features, valid)
+    reordered = _static_shape_prefix_rows(features, valid)
+
+    n_valid = int(reference.shape[0])
+    assert n_valid == sum(counts)
+    assert reordered.shape == (features.shape[0] * features.shape[1], features.shape[-1])
+    if n_valid:
+        assert mx.array_equal(reference, reordered[:n_valid])
+
+
+@metal_only
+def test_gemma4_unified_reorder_carries_every_valid_row():
+    from unsloth_zoo.mlx.compile import _static_shape_prefix_rows
+
+    counts = (2, 7, 4)
+    features, valid = _padded_features(counts)
+    reordered = _static_shape_prefix_rows(features, valid)
+    expected = mx.concatenate(
+        [features[row, :n] for row, n in enumerate(counts)], axis=0)
+    for index in range(sum(counts)):
+        assert mx.array_equal(reordered[index], expected[index]), f"row {index}"
+
+
+@metal_only
+def test_gemma4_unified_reorder_moves_padding_past_the_prefix():
+    from unsloth_zoo.mlx.compile import _static_shape_prefix_rows
+
+    counts = (2, 7, 4)
+    features, valid = _padded_features(counts)
+    reordered = _static_shape_prefix_rows(features, valid)
+    expected = mx.concatenate(
+        [features[row, n:] for row, n in enumerate(counts)], axis=0)
+    assert mx.array_equal(reordered[sum(counts):], expected)
+
+
+@metal_only
+def test_gemma4_unified_reorder_scatters_the_same_embeddings():
+    from mlx_vlm.models.gemma4.gemma4 import masked_scatter
+    from unsloth_zoo.mlx.compile import _static_shape_prefix_rows
+
+    counts = (5, 3)
+    features, valid = _padded_features(counts)
+    total = sum(counts)
+    embeds = mx.zeros((1, total + 4, features.shape[-1]))
+    placeholder = mx.arange(total + 4) < total
+    mask = mx.broadcast_to(mx.expand_dims(mx.expand_dims(placeholder, 0), -1), embeds.shape)
+
+    reference = masked_scatter(embeds, mask, _ragged_compact_prefix_rows(features, valid))
+    reordered = masked_scatter(embeds, mask, _static_shape_prefix_rows(features, valid))
+    assert mx.array_equal(reference, reordered)
+
+
+@metal_only
+@pytest.mark.parametrize("counts", [(3, 5), (8, 0, 4), (0, 0), (8, 8)])
+def test_gemma4_unified_sort_key_never_ties(counts):
+    from unsloth_zoo.mlx.compile import _valid_first_sort_key
+
+    _, valid = _padded_features(counts)
+    rows = valid.shape[0] * valid.shape[1]
+    keys = sorted(_valid_first_sort_key(valid.reshape(rows), rows).tolist())
+    assert len(set(keys)) == rows, f"tied keys: {keys}"
+
+
+@metal_only
+@pytest.mark.parametrize("use_cce", [False, True])
+def test_self_routed_vlm_merges_images_inside_loss(use_cce):
+    from types import SimpleNamespace
+
+    class GenerationWrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(16, 8)
+            self.vision = nn.Linear(3, 8, bias=False)
+            self.head = nn.Linear(8, 16, bias=False)
+
+        @property
+        def language_model(self):
+            return self
+
+        def get_input_embeddings(self, ids, pixels, mask=None, **kwargs):
+            h = self.embed(ids)
+            if pixels is not None:
+                h = h + self.vision(pixels)[:, None] * kwargs["image_scale"]
+            return SimpleNamespace(inputs_embeds=h)
+
+        def __call__(self, ids, inputs_embeds=None, **kwargs):
+            h = self.embed(ids) if inputs_embeds is None else inputs_embeds
+            return self.head(h)
+
+    mx.random.seed(12)
+    model = GenerationWrapper()
+    factory = mlx_utils.make_vlm_cce_loss_fn if use_cce else mlx_utils.make_vlm_baseline_loss_fn
+    loss = factory(model)
+    for pixels in ([[1., 2., 3.], [3., -2., 1.]], [[-1., 0., 2.], [2., 1., -3.]]):
+        batch = dict(input_ids=mx.array([[1, 2, 3], [4, 5, 6]]),
+                     pixel_values=mx.array(pixels), image_scale=mx.array(0.7))
+        def reference(m, b):
+            embeds = m.get_input_embeddings(b["input_ids"], b["pixel_values"], image_scale=b["image_scale"])
+            logits = m(b["input_ids"], inputs_embeds=embeds.inputs_embeds)
+            return nn.losses.cross_entropy(logits[:, :-1], b["input_ids"][:, 1:]).mean()
+        expected, expected_grad = nn.value_and_grad(model, reference)(model, batch)
+        (actual, _), grad = nn.value_and_grad(model, loss)(model, batch)
+        assert float(mx.abs(grad["vision"]["weight"]).max()) > 0
+        assert mx.array_equal(actual, expected).item()
+        assert mx.array_equal(grad["vision"]["weight"], expected_grad["vision"]["weight"]).item()
+
+
+@metal_only
+def test_xing4_0_checkpointed_layers_compile(monkeypatch, request):
+    from unsloth_zoo.mlx import loader
+
+    mlx_utils.acquire_mlx_training_patches()
+    request.addfinalizer(mlx_utils.release_mlx_training_patches)
+    config = pytest.importorskip("mlx_vlm.models.xing4_0.config")
+    language = pytest.importorskip("mlx_vlm.models.xing4_0.language")
+    upstream = language.HyperConnection.__call__
+    upstream = getattr(upstream, "__wrapped__", upstream)
+    monkeypatch.setattr(language.HyperConnection, "__call__", upstream)
+    loader._ensure_xing4_0_sliced_hyper_connection_base("xing4_0")
+    assert language.HyperConnection.__call__ is not upstream
+
+    mx.random.seed(5)
+    model = language.LanguageModel(config.ModelConfig(
+        vocab_size=64, hidden_size=64, intermediate_size=128, moe_intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+        n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=1, first_k_dense_replace=1,
+        kv_lora_rank=16, q_lora_rank=16, qk_rope_head_dim=16, qk_nope_head_dim=32, v_head_dim=32,
+        hc_sinkhorn_iters=3, max_position_embeddings=128))
+    for layer in model.model.layers:
+        for hyper in (layer.attn_hc, layer.ffn_hc):
+            hyper.hc_fn = mx.random.normal(hyper.hc_fn.shape) * 0.1
+            hyper.hc_base = mx.random.normal(hyper.hc_base.shape)
+    model.freeze()
+    for layer in model.model.layers:
+        layer.self_attn.o_proj.unfreeze()
+    mx.eval(model.parameters())
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    hidden = mx.random.normal((1, 5, 4, 64))
+    hyper = model.model.layers[1].ffn_hc
+    for actual, expected in zip(hyper(hidden), upstream(hyper, hidden)):
+        assert mx.array_equal(actual, expected).item()
+
+    grad = nn.value_and_grad(model, lambda m, i: m(i).logits.sum())
+    expected, expected_grad = grad(model, ids)
+    mx.eval(expected, expected_grad)
+    layer_cls = type(model.model.layers[0])
+    mlx_utils._patch_layer_class_for_gc(layer_cls)
+    request.addfinalizer(lambda: mlx_utils._unpatch_layer_class_gc(layer_cls))
+    step = mx.compile(lambda i: grad(model, i), inputs=model.state, outputs=model.state)
+    actual, actual_grad = step(ids)
+    assert mx.allclose(actual, expected, rtol=1e-4).item()
+    for (name, a), (_, b) in zip(tree_flatten(actual_grad), tree_flatten(expected_grad)):
+        assert float(mx.abs(b).max()) > 0, name
+        assert mx.allclose(a, b, atol=1e-5, rtol=1e-3).item(), name

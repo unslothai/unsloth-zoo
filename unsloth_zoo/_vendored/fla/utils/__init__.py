@@ -20,6 +20,7 @@ from ._config import (  # noqa: F401
     FLA_CI_ENV,
     FLA_DISABLE_TENSOR_CACHE,
     FLA_TENSOR_CACHE_SIZE,
+    LONG_INDEXING_THRESHOLD,
 )
 from ._decorators import (  # noqa: F401
     Action,
@@ -40,6 +41,7 @@ from ._device import (  # noqa: F401
     IS_NVIDIA,
     IS_NVIDIA_BLACKWELL,
     IS_NVIDIA_HOPPER,
+    IS_NVIDIA_SM100,
     IS_TF32_SUPPORTED,
     IS_TMA_SUPPORTED,
     USE_CUDA_GRAPH,
@@ -73,6 +75,7 @@ def _register_aliases():
         'IS_NPU',
         'IS_NVIDIA_BLACKWELL',
         'IS_NVIDIA_HOPPER',
+        'IS_NVIDIA_SM100',
         'USE_CUDA_GRAPH',
         'IS_TF32_SUPPORTED',
         'IS_GATHER_SUPPORTED',

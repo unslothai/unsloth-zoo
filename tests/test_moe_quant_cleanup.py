@@ -92,11 +92,12 @@ def test_temporary_patches_register_expected_count():
     src = inspect.getsource(moe_utils_bnb4bit)
     # Count is sticky to the file; if Phase 3 forgets the .append, we drop one.
     count = src.count("TEMPORARY_PATCHES.append(")
-    assert count == 9, (
-        f"moe_utils_bnb4bit registers {count} patches; expected 9 "
+    assert count == 10, (
+        f"moe_utils_bnb4bit registers {count} patches; expected 10 "
         "(4 original bnb4bit patches + the 2 PEFT MoE patches relocated from misc.py "
         "+ 3 later bnb4bit conversion patches: weight_conversions, "
-        "model_conversion_mapping, dequantize_plain_params)."
+        "model_conversion_mapping, dequantize_plain_params "
+        "+ keep_fused_experts for fused pre-quantized Llama-4 checkpoints)."
     )
 
 

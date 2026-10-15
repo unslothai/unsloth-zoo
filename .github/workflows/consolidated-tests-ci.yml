@@ -147,8 +147,8 @@ jobs:
                 retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
                   "torch>=2.4.0,<2.11.0" &&
                 retry "$venv/bin/pip" install -e .[core] &&
-                { "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
                 retry "$venv/bin/pip" install pytest==9.0.3
               } > "$log" 2>&1 || rc=$?
               echo "$rc" > ".lanes/$version.install"
@@ -243,8 +243,21 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
-          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          # Retried, then fatal: with `|| true` a failed install left unsloth absent, and every
+          # test that needs it skipped while the job stayed green.
+          for attempt in 1 2 3; do
+            pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" && break
+            if [ "$attempt" = 3 ]; then echo "::error::installing unsloth@main failed 3 times"; exit 1; fi
+            echo "unsloth install attempt $attempt failed, retrying in 15s"; sleep 15
+          done
           pip install pytest==9.0.3 pyyaml==6.0.2
+          # gguf is not a dependency of the zoo, and unsloth goes in --no-deps, so
+          # without this every test that reads a GGUF back skips at
+          # `pytest.importorskip("gguf")`: 73 of them, the whole post conversion
+          # verification file, silently and with the job still green.
+          pip install gguf
+          # For the planner compressed-tensors gate; torch cap repeated or a newer release swaps in CUDA torch.
+          pip install compressed-tensors "torch>=2.4.0,<2.11.0"
 
       - uses: ./.github/actions/pip-cache-save
         with:
@@ -252,10 +265,10 @@ jobs:
           key: ${{ steps.pip-cache.outputs.key }}
           cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
-      - name: pytest tests/security (HARD GATE)
-        run: python -m pytest tests/security -v
-
-      - name: pytest behavioral gates (HARD GATE)
+      - name: pytest CPU gates (two process lanes)
+        id: cpu-gates
+        # Under the job's 20: a hung test fails this step, and the next step still prints the lane logs.
+        timeout-minutes: 15
         # Deterministic, CPU-pure, sub-second files executed as a gate.
         # test_mlx_finetune_last_n_layers was born broken in #669 and stayed
         # invisible until #739 because no job executed it (collect-only plus
@@ -267,10 +280,10 @@ jobs:
         # pins that the same transition clears the blob at fault instead of
         # every completed shard (#9094). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
-        # no weights). The preference suite pins token boundaries, scheduling,
+        # no weights); test_train_on_responses_mask_out_tokens pins mask_out_tokens on
+        # the list, tensor, vision-collator and MLX routes (unsloth#6695).
+        # The preference suite pins token boundaries, scheduling,
         # objective normalization, and reference lifecycle without model weights.
-        # test_train_on_responses_mask_out_tokens pins that mask_out_tokens reaches the
-        # list, tensor and vision-collator paths and the MLX delegation (unsloth#6695).
         # test_mlx_quantized_optimizer_routing pins which optim
         # names reach the 8-bit path; it runs under the torch shim so it
         # EXECUTES here rather than skipping (the numerics need real MLX and run
@@ -285,6 +298,32 @@ jobs:
         # and that the weight-preprocessor registry is one dict across the package
         # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
         # neither was executed by any job before.
+        #
+        # The four bnb expert-stack files pin that a stack bitsandbytes cannot count in
+        # 32 bits is quantized and read in slices, and that the slice boundaries are
+        # exact. test_bnb_expert_stack_slicing_cpu is the one that actually executes
+        # here: it drives the arithmetic against a bitsandbytes stand-in, so it needs
+        # neither a GPU nor the package, while the other three carry the CUDA marker
+        # and skip. Collect-only proved only that they import, and a decline condition
+        # can be deleted without any of them going red.
+        #
+        # test_moe_bnb4bit_per_expert_conversions is deliberately NOT here. It needs
+        # bitsandbytes, which this runner does not install, so it could only ever skip
+        # and a gate entry that cannot execute is noise. Adding it did surface a real
+        # latent fault in it, though: six of its tests imported bitsandbytes without a
+        # guard and so failed rather than skipped, which is now fixed in the file.
+        #
+        # test_fp8_expert_dequant_tile_limit pins that a per-expert per-tensor FP8 scale
+        # derives a Triton tile larger than Triton will compile and is declined rather
+        # than launched, and that the limit is read out of Triton instead of copied.
+        # Three of its cases need no GPU, so they are a real gate on this runner; the
+        # rest carry the CUDA marker and skip here. Collect-only would have proved only
+        # that the file imports, which is how the guard could be removed and CI stay
+        # green.
+        #
+        # test_moe_router_not_a_lora_target pins that the automatic LoRA target search
+        # skips the MoE router leaf. Collect-only stays green with the skip reverted,
+        # which is the one state these assertions exist to catch.
         #
         # test_moe_stacked_expert_lora_reaches_forward pins that an expert LoRA reaches
         # the forward of a stacked-expert family Unsloth has no forward for, which is
@@ -340,6 +379,9 @@ jobs:
         # runs the dtype decision alone on CPU; left to --collect-only it would prove
         # only that it imports, which is the failure this comment already lists twice.
         #
+        # test_offload_recompute_dtype: follow-up; GPU cases skip here, the CPU byte-view
+        # and rounding checks still guard against a refactor reintroducing the cast.
+        #
         # The two compiled-cache files cover create_new_function's distributed
         # protocol: the rank-local guard that let one rank skip a broadcast and
         # hang the group under torchrun, and the digest agreement that stops two
@@ -349,6 +391,10 @@ jobs:
         # is the whole point of this block: 42 of the 44 fail against the code
         # they fix, so left to --collect-only they would prove only that they
         # import, which is the failure every paragraph above already describes.
+        #
+        # test_published_version_window.py asserts the published window matches what the
+        # caps admit. Left to --collect-only it proves only that it imports, so a later cap
+        # regression would keep CI green. Stdlib plus packaging, reads files only.
         #
         # The last two are here because `--collect-only` is exactly what missed
         # the bug they cover. `tests/` is not a package, so `from tests.x import
@@ -363,105 +409,193 @@ jobs:
         # URLs: the static bypass forms and, in the rebinding file, that the fetch
         # connects to the address the guard actually validated. Neither was executed
         # by any job before, so the guard could regress while CI stayed green.
+        # test_merge_index_weight_map_traversal pins that shard names taken from a
+        # local index cannot resolve outside save_directory, neither by creating a
+        # file through copy2 nor by the in-place r+b merge of one that exists.
+        #
+        # The three GGUF export files are the same story once more. They gate the
+        # converter child's `gguf` pin, the post conversion verification that
+        # decides whether an export is published at all, and the MTP config
+        # reconcile shared with unsloth. All three are CPU-pure, need no network
+        # and no llama.cpp toolchain, and they refuse a bad export, so a regression
+        # here silently publishes a broken GGUF. Left to --collect-only they would
+        # prove only that they import.
+        #
+        # test_llama_cpp_converter_scan pins that the scan stays quiet on the real
+        # upstream converter and still flags a planted payload. A scan that warns on
+        # every export is one users learn to ignore, so both directions are gated.
         # test_compiled_cache_fail_closed pins that the compiled cache refuses bytes
         # it did not generate, bytecode included: the digest covers the .py, so the
         # pyc has to be dropped before every verified import.
+        # test_device_map_planner_compressed_tensors: pack-quantized checkpoints planned at packed bytes.
+        # test_grpo_mask_truncated_rows: truncated completions stay out of the GRPO loss; its UnslothEfficientGRPO stubs bind to the real forward.
+        # test_mlx_embedding_guards: sentence-transformers layout shim and pooling-mode map, under the torch shim.
+        # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
+        # test_top_level_imports_are_declared: every package a zoo module imports at module level is a declared dependency.
+        # test_xpu_device_typed_autocast: nested bnb offset, Gemma3n fp32 regions and unsloth_train autocast follow the accelerator, not "cuda".
+        # test_xpu_empty_cache_arms: gradient checkpointing buffers and patch_model_and_tokenizer release cached memory through torch.xpu on XPU.
+        # One pytest process per group: MLX export shims replace sys.modules globally,
+        # and the security network blocker would break the advisory PyPI test.
         run: |
-          python -m pytest \
-            tests/test_training_utils_use_cache.py \
-            tests/test_loss_normalization_contract.py \
-            tests/test_mlx_finetune_last_n_layers.py \
-            tests/test_mlx_double_quant_reject.py \
-            tests/test_hf_xet_fallback.py \
-            tests/test_hf_xet_fallback_blob_scoped_redownload.py \
-            tests/test_llama_cpp_install_consent.py \
-            tests/test_llama_cpp_consent_platforms.py \
-            tests/test_get_transformers_model_type_empty.py \
-            tests/test_train_on_responses_list_labels.py \
-            tests/test_train_on_responses_mask_out_tokens.py \
-            tests/test_mlx_preference.py \
-            tests/test_mlx_trainer_internals.py \
-            tests/test_mlx_arrays_cache_advance.py \
-            tests/test_mlx_quantized_optimizer_routing.py \
-            tests/test_fp16_emulation.py \
-            tests/test_check_hf_model_exists_transport_errors.py \
-            tests/test_hub_transport_errors_single_segment.py \
-            tests/test_quant_status_transport_errors.py \
-            tests/test_local_base_model_resolution_offline.py \
-            tests/test_local_fp8_base_offline_resolution.py \
-            tests/test_local_4bit_merge_offline_resolution.py \
-            tests/test_gated_and_offline_config_classification.py \
-            tests/test_find_common_token_ids_no_match.py \
-            tests/test_vllm_direct_lora_loading.py \
-            tests/test_vllm_flashinfer_block_reversible.py \
-            tests/test_vllm_flashinfer_survives_spawn.py \
-            tests/test_sft_prepare_dataset_double_bos.py \
-            tests/test_moe_preprocess_weight_transpose.py \
-            tests/test_moe_weight_preprocessor_registry_shared.py \
-            tests/test_moe_triton_down_lora_roworder.py \
-            tests/test_moe_stacked_expert_lora_reaches_forward.py \
-            tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
-            tests/test_python39_compatibility.py \
-            tests/test_checkpoint_modes.py \
-            tests/test_gc_rewriter_bound_keywords.py \
-            tests/test_wheel_top_level_packages.py \
-            tests/test_vision_url_ssrf_guard.py \
-            tests/test_vision_url_dns_rebinding.py \
-            tests/test_compiled_cache_fail_closed.py \
-            tests/test_inductor_codegen_fallback.py \
-            tests/test_inductor_single_compile_worker.py \
-            tests/test_eager_fallback_latch.py \
-            tests/test_recompile_limit_fallback.py \
-            tests/test_checkpoint_compile_mix.py \
-            tests/test_disabled_hook_graph_break.py \
-            tests/test_missing_parent_package_is_drift.py \
-            tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
-            tests/test_hip_bf16_offload_dtype.py \
-            tests/test_disabled_hook_checkpoint_guard.py \
-            tests/test_conftest_module_leak_gate.py \
-            tests/test_compiled_cache_collective.py \
-            tests/test_compiled_cache_collective_gloo.py \
-            tests/test_undefined_name_gate.py \
-            tests/test_safe_serialization_none.py \
-            -v
+          set -euo pipefail
+          logs="$RUNNER_TEMP/zoo-cpu-gates"
+          mkdir -p "$logs"
+          run_gate() {
+            local name=$1 rc=0
+            shift
+            "$@" > "$logs/$name.log" 2>&1 || rc=$?
+            printf '%s\n' "$rc" > "$logs/$name.status"
+          }
+          behavioral() {
+            run_gate behavioral python -m pytest \
+              tests/test_ci_cpu_gate_results.py \
+              tests/test_top_level_imports_are_declared.py \
+              tests/test_training_utils_use_cache.py \
+              tests/test_unsloth_train_scheduler_kwargs.py \
+              tests/test_xpu_device_typed_autocast.py \
+              tests/test_xpu_empty_cache_arms.py \
+              tests/test_loss_normalization_contract.py \
+              tests/test_mlx_finetune_last_n_layers.py \
+              tests/test_mlx_double_quant_reject.py \
+              tests/test_mlx_incomplete_config.py \
+              tests/test_mlx_incomplete_config_vlm.py \
+              tests/test_mlx_adam_epsilon.py \
+              tests/test_mlx_optimizer_torch_parity.py \
+              tests/test_hf_xet_fallback.py \
+              tests/test_hf_xet_fallback_blob_scoped_redownload.py \
+              tests/test_llama_cpp_install_consent.py \
+              tests/test_llama_cpp_consent_platforms.py \
+              tests/test_converter_source_staging.py \
+              tests/test_get_transformers_model_type_empty.py \
+              tests/test_train_on_responses_list_labels.py \
+              tests/test_train_on_responses_mask_out_tokens.py \
+              tests/test_mlx_preference.py \
+              tests/test_mlx_trainer_internals.py \
+              tests/test_mlx_arrays_cache_advance.py \
+              tests/test_prepare_model_for_training_embedding_lora.py \
+              tests/test_mlx_quantized_optimizer_routing.py \
+              tests/test_mlx_embedding_guards.py \
+              tests/test_fp16_emulation.py \
+              tests/test_check_hf_model_exists_transport_errors.py \
+              tests/test_hub_transport_errors_single_segment.py \
+              tests/test_quant_status_transport_errors.py \
+              tests/test_local_base_model_resolution_offline.py \
+              tests/test_local_fp8_base_offline_resolution.py \
+              tests/test_local_4bit_merge_offline_resolution.py \
+              tests/test_gated_and_offline_config_classification.py \
+              tests/test_find_common_token_ids_no_match.py \
+              tests/test_vllm_direct_lora_loading.py \
+              tests/test_vllm_flashinfer_block_reversible.py \
+              tests/test_vllm_flashinfer_survives_spawn.py \
+              tests/test_vllm_weights_memory_usage.py \
+              tests/test_sft_prepare_dataset_double_bos.py \
+              tests/test_moe_preprocess_weight_transpose.py \
+              tests/test_relative_imports_resolve.py \
+              tests/test_grpo_mask_truncated_rows.py \
+              tests/test_deepseek_v41_compile_entries.py \
+              tests/test_moe_weight_preprocessor_registry_shared.py \
+              tests/test_moe_triton_down_lora_roworder.py \
+              tests/test_moe_router_not_a_lora_target.py \
+              tests/test_moe_router_under_moe_block_not_quantized.py \
+              tests/test_visual_encoder_not_quantized.py \
+              tests/test_moe_stacked_expert_lora_reaches_forward.py \
+              tests/test_bnb_expert_stack_slicing.py \
+              tests/test_bnb_expert_stack_slicing_cpu.py \
+              tests/test_bnb_expert_stack_merge_slicing.py \
+              tests/test_fp8_expert_dequant_tile_limit.py \
+              tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
+              tests/test_python39_compatibility.py \
+              tests/test_checkpoint_modes.py \
+              tests/test_gc_rewriter_bound_keywords.py \
+              tests/test_wheel_top_level_packages.py \
+              tests/test_vision_url_ssrf_guard.py \
+              tests/test_vision_url_dns_rebinding.py \
+              tests/test_merge_index_weight_map_traversal.py \
+              tests/test_gguf_converter_child_env.py \
+              tests/test_responses_only_last_turn_header.py \
+              tests/test_gguf_post_conversion_validation.py \
+              tests/test_mtp_config_reconcile.py \
+              tests/test_llama_cpp_converter_scan.py \
+              tests/test_compiled_cache_fail_closed.py \
+              tests/test_forced_float32_lora_forward_result_dtype.py \
+              tests/test_inductor_codegen_fallback.py \
+              tests/test_inductor_single_compile_worker.py \
+              tests/test_eager_fallback_latch.py \
+              tests/test_recompile_limit_fallback.py \
+              tests/test_checkpoint_compile_mix.py \
+              tests/test_disabled_hook_graph_break.py \
+              tests/test_missing_parent_package_is_drift.py \
+              tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
+              tests/test_hip_bf16_offload_dtype.py \
+              tests/test_offload_recompute_dtype.py \
+              tests/test_disabled_hook_checkpoint_guard.py \
+              tests/test_conftest_module_leak_gate.py \
+              tests/test_compiled_cache_collective.py \
+              tests/test_gpt_oss_matmul_ogs_for.py \
+              tests/test_gpt_oss_bnb4bit_eval_prefill.py \
+              tests/test_gpt_oss_eval_attention_chunking.py \
+              tests/test_compiled_cache_collective_gloo.py \
+              tests/test_undefined_name_gate.py \
+              tests/test_safe_serialization_none.py \
+              tests/test_published_version_window.py \
+              tests/test_device_map_planner_compressed_tensors.py \
+              tests/test_gemma3n_kv_sharing_without_cache.py \
+              tests/test_gemma3n_rmsnorm_with_scale.py \
+              tests/test_mlx_gkd_guards.py \
+              tests/test_output_collector_compile.py \
+              -v
+          }
+          other_gates() {
+            run_gate security python -m pytest tests/security -v
+            run_gate mlx-adapters python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
+            run_gate mlx-export python -m pytest tests/test_mlx_save_export_regressions.py -v
+            run_gate mlx-export-edges python -m pytest tests/test_mlx_save_export_edge_cases.py -v
+            run_gate mlx-moe-export python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
+            run_gate tokens python -m pytest tests/test_add_new_tokens_padded_vocab.py -v
+            run_gate cpu-advisory python -m pytest \
+              tests/test_mlx_module_exports.py \
+              tests/test_rl_replacements_cpu.py \
+              tests/test_temporary_patches_imports.py \
+              tests/test_zoo_history_regressions.py \
+              tests/test_pypi_version_sync.py \
+              -v
+          }
+          behavioral &
+          behavioral_pid=$!
+          other_gates &
+          other_pid=$!
+          failed=0
+          wait "$behavioral_pid" || failed=1
+          wait "$other_pid" || failed=1
+          for name in security behavioral mlx-adapters mlx-export mlx-export-edges mlx-moe-export tokens cpu-advisory; do
+            echo "::group::$name"
+            cat "$logs/$name.log" || failed=1
+            rc=$(cat "$logs/$name.status" 2>/dev/null) || rc=missing
+            if [ "$rc" != 0 ]; then
+              # Preserve the pre-existing continue-on-error on these CPU tests.
+              if [ "$name" = cpu-advisory ] && [ "$rc" != missing ]; then
+                echo "::warning::$name exited $rc"
+              else
+                echo "::error::$name exited $rc"
+                failed=1
+              fi
+            fi
+            echo "::endgroup::"
+          done
+          : > "$logs/.reported"
+          exit "$failed"
 
-      - name: pytest MLX adapter-filter gate (HARD GATE)
-        # Run in a fresh process so its module-scoped MLX simulation does not
-        # inherit module state from another MLX test file.
-        run: python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
-
-      - name: pytest MLX GGUF export gates (HARD GATE)
-        # One invocation each, for the reason above: tests/mlx_simulation/ replaces
-        # sys.modules["mlx.core"] process-wide, so a file collected after another
-        # inherits its shim.
-        #
-        # These are here because they were in NO job, which is the failure the
-        # comment above already lists four times. The MoE name-restoration work
-        # changed the arguments _prepare_mlx_gguf_export_directory is called with and
-        # took 13 tests in test_mlx_save_export_edge_cases.py down; every check on
-        # that pull request stayed green, because `pytest tests/ --collect-only`
-        # proves only that a file imports.
+      - name: Print CPU gate logs after a step timeout
+        if: ${{ failure() && steps.cpu-gates.outcome == 'failure' }}
         run: |
-          python -m pytest tests/test_mlx_save_export_regressions.py -v
-          python -m pytest tests/test_mlx_save_export_edge_cases.py -v
-          python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
-
-      - name: Token initialization regressions
-        run: python -m pytest tests/test_add_new_tokens_padded_vocab.py -v
-
-      - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
-        # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
-        # session-scoped network_blocker autouse fixture that would otherwise block
-        # test_pypi_version_sync from reaching pypi.org.
-        continue-on-error: true
-        run: |
-          python -m pytest \
-            tests/test_mlx_module_exports.py \
-            tests/test_rl_replacements_cpu.py \
-            tests/test_temporary_patches_imports.py \
-            tests/test_zoo_history_regressions.py \
-            tests/test_pypi_version_sync.py \
-            -v
+          logs="$RUNNER_TEMP/zoo-cpu-gates"
+          [ ! -e "$logs/.reported" ] || exit 0
+          for log in "$logs"/*.log; do
+            [ -e "$log" ] || continue
+            echo "::group::$(basename "$log" .log)"
+            cat "$log"
+            echo "::endgroup::"
+          done
 
   # Real MLX numerics on Linux. mlx-cpu publishes a manylinux x86-64 wheel and
   # mx.quantize/dequantize/compile all run on it, so the 8-bit optimizer state
@@ -532,24 +666,20 @@ jobs:
               retry .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-numerics/bin/pip install -e .[core] &&
-              { .lanes/venv-numerics/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+              retry .lanes/venv-numerics/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
               retry .lanes/venv-numerics/bin/pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
             } > .lanes/numerics-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/numerics.install
           ) < /dev/null > /dev/null 2>&1 &
 
-          # suites: the MLX packages MUST resolve in the SAME pip call as .[core].
-          # Split, pip solves them independently and mlx-vlm 0.6.9
-          # (transformers>=5.14) drags transformers past the <=5.5.0 this project
-          # pins: measured 5.5.0 -> 5.14.1. Together, pip honours the cap and lands
-          # on the newest mlx-vlm that fits, which is the 0.6.4 ceiling the audio
-          # gate records.
+          # suites: the MLX packages MUST resolve in the SAME pip call as .[core], so
+          # pip honours the transformers cap while picking mlx-vlm.
           #
-          # The <=0.7.1 bound is repeated here because pyproject's copy is marker-gated
-          # to darwin + arm64 and so constrains nothing on this Linux lane. Without it
-          # the lane resolved mlx-vlm 0.7.0 the moment the transformers cap moved,
-          # gating a combination pyproject forbids.
+          # The mlx-lm pin and mlx-vlm bound are repeated here because pyproject's are
+          # marker-gated to darwin + arm64 and so constrain nothing on this Linux lane.
+          # They mirror pyproject's ==0.31.3 and <=0.7.8; without them the lane resolved
+          # mlx-lm 0.32.0 and mlx-vlm 0.7.0, combinations pyproject forbids.
           (
             rc=0
             {
@@ -558,9 +688,9 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<=0.7.1" &&
-              { .lanes/venv-suites/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm==0.31.3" "mlx-vlm>=0.4.4,<=0.7.8" &&
+              retry .lanes/venv-suites/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
             } > .lanes/suites-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/suites.install
@@ -606,25 +736,49 @@ jobs:
           # landing on one of the excluded releases (4.57.4, 5.0.0, ...) passed.
           # The whole specifier set is the contract, so assert the whole thing.
           .lanes/venv-suites/bin/python - <<'PY'
-          from importlib.metadata import requires, version
+          from importlib.metadata import metadata, requires, version
           from packaging.requirements import Requirement
           from packaging.version import Version
 
-          specifiers = {
-              str(req.specifier)
+          # The cap may be marker-split, so the gate asks which requirement line
+          # applies where. Both platforms are checked here, since the Apple Silicon
+          # policy is one a Linux runner can still read.
+          extras = [""] + list(metadata("unsloth_zoo").get_all("Provides-Extra") or [])
+          reqs = [
+              req
               for raw in (requires("unsloth_zoo") or [])
               for req in [Requirement(raw)]
               if req.name.lower().replace("_", "-") == "transformers"
-          }
-          assert specifiers, (
+          ]
+          assert reqs, (
               "unsloth_zoo declares no transformers requirement, so this gate is "
               "checking nothing. Did the dependency move out of pyproject.toml?"
           )
-          assert len(specifiers) == 1, (
-              f"unsloth_zoo pins transformers inconsistently across extras: "
-              f"{sorted(specifiers)}. Pick one before this gate can mean anything."
+
+          def applies(req, **overrides):
+              """True when this requirement is live for some extra of this package.
+
+              `extra` has no value in the default marker environment, so a
+              requirement that carries one raises rather than answering; supply
+              every extra the distribution declares, plus the no-extra case.
+              """
+              if req.marker is None:
+                  return True
+              for extra in extras:
+                  try:
+                      if req.marker.evaluate({**overrides, "extra": extra}):
+                          return True
+                  except Exception:
+                      continue
+              return False
+
+          here = {str(req.specifier) for req in reqs if applies(req)}
+          assert len(here) == 1, (
+              f"on this platform unsloth_zoo pins transformers inconsistently "
+              f"across extras: {sorted(here)}. Pick one before this gate can "
+              f"mean anything."
           )
-          pinned = Requirement(f"transformers{specifiers.pop()}").specifier
+          pinned = Requirement(f"transformers{here.pop()}").specifier
           transformers = Version(version("transformers"))
           assert transformers in pinned, (
               f"transformers {transformers} is outside the range this package "
@@ -632,26 +786,35 @@ jobs:
           )
           print("transformers", transformers, "within the pinned range", pinned)
 
-          # The ceiling is a deliberate policy choice, not an incidental number,
-          # so state it here as well and on purpose. mlx-vlm >= 0.6.9 requires
-          # transformers >= 5.14, and we are not taking that jump yet; the cap is
-          # what keeps the joint MLX resolution off it. Checking only "matches
-          # pyproject" above would let an automated dependency bump raise the cap
-          # and quietly opt the whole project in -- which is exactly what #1144
-          # did. Raising this is a decision: change CEILING in the same commit
-          # that changes pyproject.toml, deliberately.
-          CEILING = Version("5.5.0")
-          declared = [
-              Version(str(s.version)) for s in pinned if s.operator == "<="
-          ]
-          assert declared and max(declared) <= CEILING, (
-              f"pyproject.toml pins transformers <= {max(declared) if declared else None}, "
-              f"above the {CEILING} ceiling this project holds on purpose. "
-              "mlx-vlm >= 0.6.9 needs transformers >= 5.14 and we are not "
-              "following it yet. If raising it is intended, raise CEILING here "
-              "in the same commit and say why."
-          )
-          print("declared ceiling", max(declared), "at or below the policy ceiling", CEILING)
+          # A policy literal, not "matches pyproject": that would let an automated bump
+          # raise the cap and opt the project in, which is what #1144 did. Raise it
+          # deliberately, in the same commit that changes pyproject.toml.
+          #
+          # CEILING is the newest transformers the version matrix was run against, on
+          # CUDA and on Apple Silicon. On darwin + arm64 it also decides the mlx-vlm the
+          # joint resolution lands on, since mlx-vlm 0.6.5 and up require
+          # transformers >= 5.14.
+          CEILING = Version("5.17.0")
+          DARWIN_ARM = {"sys_platform": "darwin", "platform_machine": "arm64"}
+          LINUX_X86 = {"sys_platform": "linux", "platform_machine": "x86_64"}
+
+          def ceiling_of(**overrides):
+              seen = {str(req.specifier) for req in reqs if applies(req, **overrides)}
+              assert len(seen) == 1, f"{overrides}: expected one pin, got {sorted(seen)}"
+              spec = Requirement(f"transformers{seen.pop()}").specifier
+              tops = [Version(str(s.version)) for s in spec if s.operator == "<="]
+              assert tops, f"{overrides}: the pin declares no <= ceiling: {spec}"
+              return max(tops)
+
+          for where, platform in (("off darwin", LINUX_X86), ("on darwin + arm64", DARWIN_ARM)):
+              declared = ceiling_of(**platform)
+              assert declared <= CEILING, (
+                  f"pyproject.toml pins transformers <= {declared} {where}, above the "
+                  f"{CEILING} ceiling this project holds on purpose. That ceiling is the "
+                  f"newest release the version matrix was run against. If raising it is "
+                  f"intended, raise CEILING here in the same commit and say what was run."
+              )
+              print("declared ceiling", where, declared, "<=", CEILING)
           PY
 
       # The five "Fail if ... skipped" gates below used to re-run their pytest
@@ -676,6 +839,31 @@ jobs:
             --report "$RUNNER_TEMP/mlx-reports/quantized_optimizer_state.xml" \
             --require no-skips \
             --message "real mlx is installed but the numeric tests skipped"
+
+      - name: pytest tests/test_mlx_optimizer_defaults.py (HARD GATE)
+        # rmsprop/adamax/adagrad/adadelta defaults and Adamax bias correction vs torch.optim; shim cannot answer.
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_optimizer_defaults.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml"
+
+      - name: Fail if the optimizer defaults tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the optimizer defaults tests skipped"
+
+      - name: pytest tests/test_mlx_gkd_loss.py (HARD GATE)
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_gkd_loss.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/gkd_loss.xml"
+
+      - name: Fail if the GKD numeric tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/gkd_loss.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the GKD numeric tests skipped"
 
       - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
         # Embedding identification, embed-scale resolution and probe cleanup are
@@ -721,6 +909,10 @@ jobs:
 
       - name: tests/test_mlx_shape_guard.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_shape_guard.py -v -rs
+
+      - name: tests/test_mlx_decision.py
+        # Decision request validation, prompts and answers; needs no weights.
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_decision.py -v -rs
 
       - name: tests/test_mlx_vlm_label_masks.py
         # Audio collation, label masking and the family/version gate.
@@ -774,6 +966,20 @@ jobs:
             --report "$RUNNER_TEMP/mlx-reports/gated_delta_batch_grad.xml" \
             --require one-passed \
             --message "real mlx is installed but no gated-delta gradient test ran"
+
+      # Pooling and contrastive losses need mlx core, not Metal; the real-checkpoint
+      # tests skip unless Qwen3-Embedding-0.6B is cached, hence one-passed.
+      - name: tests/test_mlx_embedding_pooling.py
+        run: >-
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_embedding_pooling.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/embedding_pooling.xml"
+
+      - name: Fail if the embedding pooling tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/embedding_pooling.xml" \
+            --require one-passed \
+            --message "real mlx is installed but no embedding pooling test ran"
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults.
   #
@@ -858,10 +1064,32 @@ jobs:
               def _strip_marker(s):
                   return s.split(";", 1)[0].strip()
 
+              def _marker(s):
+                  return s.split(";", 1)[1] if ";" in s else ""
+
+              # A requirement may be marker-split with a darwin-only line. This lane
+              # is Linux, so it has to take the line that applies to Linux rather
+              # than whichever one happens to come first in the file. Markers are
+              # matched as text because this step is stdlib-only by design (no
+              # packaging, no pip install yet).
+              _darwin_only = re.compile(r"sys_platform\s*==\s*['\"]darwin['\"]")
+
               def _pick(spec, name):
                   if spec != "__from_pyproject__":
                       return spec
-                  return next((_strip_marker(x) for x in all_deps if _pkg_name(x) == name), name)
+                  matches = [x for x in all_deps if _pkg_name(x) == name]
+                  usable = [x for x in matches if not _darwin_only.search(_marker(x))]
+                  if not usable:
+                      usable = matches
+                  if not usable:
+                      return name
+                  if len(usable) > 1 and len({_strip_marker(x) for x in usable}) > 1:
+                      raise SystemExit(
+                          f"pyproject declares {len(usable)} different off-darwin specs "
+                          f"for {name}: {sorted({_strip_marker(x) for x in usable})}. "
+                          f"This lane cannot pick one for you."
+                      )
+                  return _strip_marker(usable[0])
 
               spec_t = _pick(spec_t, "transformers")
               spec_r = _pick(spec_r, "trl")
@@ -915,8 +1143,8 @@ jobs:
                 retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
                   "torch>=2.4.0,<2.11.0" "torchvision<0.26" &&
                 retry "$venv/bin/pip" install -e .[core] &&
-                { "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
                 retry "$venv/bin/pip" install -U "$spec_t" "$spec_r" "$spec_p" &&
                 # bitsandbytes: imported at module scope in saving_utils.py.
                 # IPython + ipywidgets: logging_utils.py:50 imports
@@ -947,6 +1175,14 @@ jobs:
                 # to a composite model's on-disk weights is a class attribute in
                 # transformers 4 and a registry in 5, and losing it merges nothing
                 # silently, so one pinned version cannot show the merge finds it.
+                # test_fused_ce_coverage: a model that loses fused CE still trains (full
+                # logits), so each pin is checked against its release in the baseline.
+                # test_deepseek_v3_grpo_hidden_states: the GRPO wrapper must install on 4.x
+                # and >= 5.13 too, where DeepseekV3NaiveMoe does not exist.
+                # test_moe_hidden_states_wrapper: the Qwen3 MoE wrapper stays transparent to the
+                # compiler, wraps once and carries the marker unsloth's GRPO reads.
+                # test_fp16_casts_leftover_bf16_params: needs bitsandbytes, which only these
+                # lanes install, so in repo-tests-cpu it could only skip.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -961,10 +1197,21 @@ jobs:
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_compiler_getsource_tokenerror.py \
+                  tests/test_fused_ce_coverage.py \
+                  tests/test_deepseek_v3_grpo_hidden_states.py \
+                  tests/test_moe_hidden_states_wrapper.py \
+                  tests/test_aya_vision_logit_scale.py \
                   tests/test_vision_utils_grid_helpers_eager.py \
+                  tests/test_modeling_local_vision_helpers_eager.py \
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
+                  tests/test_data_dependent_helpers_not_fullgraph.py \
+                  tests/test_decode_compile_disable.py \
+                  tests/test_eager_decode_bypass.py \
                   tests/test_temporary_patches_exhaustive.py \
+                  tests/test_patch_keeps_module_name.py \
                   tests/test_mxfp4_load_path_layout.py \
+                  tests/test_linear4bit_packed_without_quant_state.py \
+                  tests/test_composite_conversion_rescope.py \
                   tests/test_missing_parent_package_is_drift.py \
                   tests/test_unsloth_zoo_lora_merge.py \
                   tests/test_peft_paramwrapper_layout_drift.py \
@@ -972,7 +1219,12 @@ jobs:
                   tests/test_moe_merge_e2e_cpu.py \
                   tests/test_merge_e2e_hub_unreachable.py \
                   tests/test_merge_e2e_partial_refusal.py \
-                  tests/test_gemma4_dtype_drift_guards.py >> "$log" 2>&1 || trc=$?
+                  tests/test_fix_untrained_tokens_composite_models.py \
+                  tests/test_gemma4_dtype_drift_guards.py \
+                  tests/test_gemma4_unified_forced_float32.py \
+                  tests/test_gemma3_processor_token_type_ids.py \
+                  tests/test_fp16_path_tiny_models.py \
+                  tests/test_fp16_casts_leftover_bf16_params.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else
                 echo "skipped" > ".lanes/$id.tests"

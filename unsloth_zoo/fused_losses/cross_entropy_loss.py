@@ -18,11 +18,14 @@ __all__ = [
     "unsloth_fused_ce_loss",
     "apply_autograd_function",
     "compute_fused_ce_loss",
+    "unsloth_count_aware_cross_entropy",
+    "unsloth_loss_count_kwargs",
 ]
 
 import torch
 from typing import Optional, Tuple, Callable, Dict
 import inspect
+import weakref
 import functools
 import math
 import os
@@ -58,6 +61,13 @@ def _get_mapping(autograd):
     return tuple(parameters.keys()), tuple([x.default for x in parameters.values()])
 pass
 
+def _nonzero_count(n_items):
+    """0 -> 1 so an all-masked batch gives loss 0, not 0 / 0."""
+    if torch.is_tensor(n_items):
+        return torch.where(n_items == 0, torch.ones_like(n_items), n_items)
+    return n_items if n_items != 0 else 1
+pass
+
 def apply_autograd_function(autograd, mapping):
     parameters, defaults = _get_mapping(autograd)
     return getattr(autograd, "apply")(*(
@@ -87,6 +97,7 @@ def compute_fused_ce_loss(
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     4) ignore_index         (passed to F.cross_entropy; defaults to -100)
     5) label_smoothing      (passed to F.cross_entropy; defaults to 0.0)
+    6) logits_bias          (X = X + logits_bias, right after the head; no gradient)
     """
     ignore_index = int(kwargs.get("ignore_index", -100))
     label_smoothing = float(kwargs.get("label_smoothing", 0.0))
@@ -104,6 +115,12 @@ def compute_fused_ce_loss(
         lm_head_weight,
         lm_head_bias,
     )
+    # Extra vocab bias added after the head (Bart `final_logits_bias`), with the stock dtype promotion.
+    logits_bias = kwargs.get("logits_bias", None)
+    if logits_bias is not None:
+        # Promote before the add: torch 2.7 inductor folds a bare add into a mixed dtype addmm under autocast.
+        logits_bias = logits_bias.to(device = device)
+        logits = logits.to(torch.promote_types(logits.dtype, logits_bias.dtype)) + logits_bias
     vocab_size = lm_head_weight.shape[0]
 
     # Apply softcapping and other functions
@@ -119,16 +136,16 @@ def compute_fused_ce_loss(
         logits = torch.tanh(logits)
         logits = logits * logit_softcapping
 
-    # Calculate cross entropy loss
-    reduction = "sum" if n_items is not None else "mean"
+    # sum / n_items, else sum / labelled tokens (the stock mean)
+    target = labels.view(-1).to(device).contiguous()
     loss = torch.nn.functional.cross_entropy(
         input  = logits.view(-1, vocab_size).float().contiguous(),
-        target = labels.view(-1).to(device).contiguous(),
-        reduction = reduction,
+        target = target,
+        reduction = "sum",
         ignore_index = ignore_index,
         label_smoothing = label_smoothing,
     )
-    loss = loss / n_items if n_items is not None else loss
+    loss = loss / _nonzero_count(n_items if n_items is not None else (target != ignore_index).sum())
     # Scale loss if needed for mixed precision training
     scaled_loss = loss * scaling if scaling is not None else loss
     # Must add .loss.detach otherwise autograd uses 2x VRAM
@@ -264,7 +281,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             divisor = torch.tensor(divisor, dtype = torch.float32, device = device)
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
-        divisor = divisor.to(dtype = torch.float32, device = device)
+        divisor = _nonzero_count(divisor.to(dtype = torch.float32, device = device))
         # Check what needs gradients
         lm_head_requires_grad = lm_head_weight is not None and lm_head_weight.requires_grad
         lm_head_bias_requires_grad = lm_head_bias is not None and lm_head_bias.requires_grad
@@ -276,7 +293,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         grad_lm_head_bias = torch.zeros_like(lm_head_bias, device = device) if lm_head_bias_requires_grad else None
 
         bsz, qlen, hd = hidden_states.shape
-        accumulated_loss = torch.zeros(1, device = device)[0]
+        # 0-dim, not a [0] view: MoE forwards on transformers 4.x add their aux loss in place.
+        accumulated_loss = torch.zeros((), device = device)
         # Chunk hidden_states and labels
         if "n_chunks" in extra_kwargs:
             n_chunks = extra_kwargs.pop("n_chunks")
@@ -575,6 +593,17 @@ class UnslothFusedLoss(torch.autograd.Function):
     pass
 pass
 
+# Resolved once here, not per call: under torch.compile dynamo ignores functools.cache, traces
+# inspect.signature and graph-breaks (it cannot key a dict on, or getattr, an autograd.Function).
+_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS = _get_mapping(UnslothFusedLoss)
+
+# torch 2.11 alone traces UnslothFusedLoss into a graph that saves zero gradients (right loss, nothing trains).
+_FUSED_LOSS_OPAQUE = torch.__version__.split("+")[0].split(".")[:2] == ["2", "11"]
+
+@torch.compiler.disable
+def _fused_loss_opaque(*args):
+    return UnslothFusedLoss.apply(*args)
+
 def unsloth_fused_ce_loss(
     trainer,
     hidden_states  : torch.Tensor,
@@ -617,7 +646,7 @@ def unsloth_fused_ce_loss(
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
 
-    return apply_autograd_function(UnslothFusedLoss, dict(
+    mapping = dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,
         lm_head_weight = lm_head_weight,
@@ -631,7 +660,89 @@ def unsloth_fused_ce_loss(
         torch_compile = torch_compile,
         overwrite = overwrite,
         extra_kwargs = kwargs,
+    )
+    apply = _fused_loss_opaque if _FUSED_LOSS_OPAQUE else UnslothFusedLoss.apply
+    return apply(*(
+        mapping.get(key, default) \
+        for key, default in zip(_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS)
     ))
+pass
+
+
+def unsloth_count_aware_cross_entropy(
+    logits,
+    labels,
+    n_items = None,
+    *,
+    shift = True,
+    ignore_index = -100,
+    mask = None,
+    vocab_size = None,
+):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Token CE as sum / n_items when the GA count is given, else the stock mean.
+
+    Runs in the logits' own dtype as stock does (no fp32 copy); with a count the per-token losses are
+    summed in fp32 so a half precision sum cannot overflow.
+    """
+    if shift:
+        logits = logits[..., :-1, :]
+        labels = labels[..., 1:]
+    if mask is not None:
+        keep = mask[:, -logits.shape[1]:].to(logits.device) != 0
+        logits = logits[keep]
+        labels = labels[keep.to(labels.device)]
+    if vocab_size is None:
+        vocab_size = logits.shape[-1]
+    logits = logits.reshape(-1, vocab_size)
+    labels = labels.reshape(-1).to(logits.device)
+    if n_items is None:
+        return torch.nn.functional.cross_entropy(logits, labels, ignore_index = ignore_index)
+    loss = torch.nn.functional.cross_entropy(
+        logits, labels, ignore_index = ignore_index, reduction = "none",
+    ).float().sum()
+    if torch.is_tensor(n_items):
+        # A DataParallel replica gets a one-element slice of the repeated count: keep the loss 0-dim.
+        n_items = n_items.to(loss.device)
+        if n_items.ndim > 0: n_items = n_items.reshape(-1)[0]
+    return loss / _nonzero_count(n_items)
+pass
+
+
+_LOSS_TAKES_COUNT = weakref.WeakKeyDictionary()
+
+def _loss_takes_count(loss_function):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Module.__call__ is (*args, **kwargs), so read forward; keyed on the function to hold no module alive.
+    target = loss_function.forward if isinstance(loss_function, torch.nn.Module) else loss_function
+    key = getattr(target, "__func__", target)
+    try:
+        return _LOSS_TAKES_COUNT[key]
+    except (KeyError, TypeError):
+        pass
+    try:
+        parameters = inspect.signature(target).parameters.values()
+        takes = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            or (p.name == "num_items_in_batch" and p.kind != inspect.Parameter.POSITIONAL_ONLY)
+            for p in parameters
+        )
+    except Exception:
+        takes = False
+    try:
+        _LOSS_TAKES_COUNT[key] = takes
+    except TypeError:
+        pass
+    return takes
+pass
+
+
+def unsloth_loss_count_kwargs(loss_function, n_items):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """`{"num_items_in_batch": n_items}`, or {} without a count or for a loss that cannot take it."""
+    if n_items is None or not _loss_takes_count(loss_function):
+        return {}
+    return {"num_items_in_batch": n_items}
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

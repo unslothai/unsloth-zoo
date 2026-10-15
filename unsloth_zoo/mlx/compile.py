@@ -27,7 +27,7 @@ compile-ready only once explicitly verified.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache, wraps
+from functools import lru_cache, partial, wraps
 from pathlib import Path
 from itertools import accumulate
 import ast
@@ -67,6 +67,7 @@ def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
 # - qwen2_5_vl: real end-to-end compiled training via train.py
 # - gemma3 / qwen3_vl / qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
 #   compiled synthetic forward+backward
+# - gemma4_unified: real compiled LoRA training on gemma-4-12B, text and image
 # SmolVLM has processor/template support, but real mlx-vlm training still hits
 # MLX primitive-less-array failures after a compiled call. Keep it patched but
 # unqualified until a real dataset compile run passes.
@@ -77,15 +78,32 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "gemma3",
     "gemma3n",
     "gemma4",
+    "gemma4_unified",
+    # Nested `text_config` decoder must qualify too, else gemma4 stays eager.
+    "gemma4_text",
+    "dots_ocr",
+    "ernie4_5_moe_vl",
+    "glm4v",
+    # glm4v_moe stays eager: MLX 0.32 raises IndexError (_Map_base::at) compiling its
+    # decoder, which re-sections one cos/sin array per layer; the fallback misses it.
+    "glm5_next",
     "glm_ocr",
     "idefics2",
     "idefics3",
+    "kimi_vl",
     "llama4",
     "llava",
     "llava_bunny",
     "llava_next",
+    "mage_vl",
+    "kimi_k3",
+    # kimi_k3's nested decoder, which has to be qualified for its parent to be.
+    "kimi_linear",
+    "minimax_m3_vl",
+    "muse_glimmer",
     "mistral3",
     "mistral4",
+    "moondream2",
     "mllama",
     "moondream3",
     "multi_modality",
@@ -97,10 +115,17 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "pixtral",
     "qwen2_vl",
     "qwen2_5_vl",
+    "qwen3",
     "qwen3_5",
     "qwen3_5_moe",
+    # mlx-vlm 0.7.4+ names these as qwen3_5 / qwen3_5_moe's `text_config` decoders.
+    "qwen3_5_moe_text",
+    "qwen3_5_text",
+    "qwen3_omni_moe",
     "qwen3_vl_moe",
     "qwen3_vl",
+    # Ternary Bonsai 2: Qwen3.5's Model with Hadamard-packed linears swapped in.
+    "prism_hadamard_qwen35",
 }
 _VERIFIED_GENERATION_ARCHES: set[str] = set()
 
@@ -110,6 +135,12 @@ _MODEL_REPO_TRAINING_COMPILE_BLOCKLIST: tuple[tuple[str, str], ...] = (
         "SmolVLM/Idefics3 real training currently leaves MLX primitive-less arrays after compiled execution",
     ),
 )
+
+# Compiled training here is qualified on the CCE loss only: `use_cce=False` runs
+# the upstream `Model.__call__`, which still reads these values on the host.
+_CCE_ONLY_TRAINING_COMPILE_ARCHES: dict[str, str] = {
+    "ernie4_5_moe_vl": "its token types and rotary positions",
+}
 
 
 _BACKEND_CONFIG_KEYS = (
@@ -213,15 +244,28 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "gemma3": "verify_gemma3",
     "gemma3n": "verify_gemma3n",
     "gemma4": "verify_gemma4",
+    "gemma4_unified": "verify_gemma4_unified",
+    "gemma4_text": "verify_gemma4_text",
+    "dots_ocr": "verify_dots_ocr",
+    "ernie4_5_moe_vl": "verify_ernie4_5_moe_vl",
+    "glm4v": "verify_glm4v",
+    "glm5_next": "verify_glm5_next",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",
     "idefics3": "verify_idefics3",
+    "kimi_vl": "verify_kimi_vl",
     "llama4": "verify_llama4",
     "llava": "verify_llava",
     "llava_bunny": "verify_llava_bunny",
     "llava_next": "verify_llava_next",
+    "mage_vl": "verify_mage_vl",
+    "kimi_k3": "verify_kimi_k3",
+    "kimi_linear": "verify_kimi_linear",
+    "minimax_m3_vl": "verify_minimax_m3_vl",
+    "muse_glimmer": "verify_muse_glimmer",
     "mistral3": "verify_mistral3",
     "mistral4": "verify_mistral4",
+    "moondream2": "verify_moondream2",
     "mllama": "verify_mllama",
     "moondream3": "verify_moondream3",
     "multi_modality": "verify_multi_modality",
@@ -233,8 +277,12 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "pixtral": "verify_pixtral",
     "qwen2_vl": "verify_qwen2_vl",
     "qwen2_5_vl": "verify_qwen2_5_vl",
+    "qwen3": "verify_qwen3",
     "qwen3_5": "verify_qwen3_5",
     "qwen3_5_moe": "verify_qwen3_5_moe",
+    "qwen3_5_moe_text": "verify_qwen3_5_moe_text",
+    "qwen3_5_text": "verify_qwen3_5_text",
+    "qwen3_omni_moe": "verify_qwen3_omni_moe",
     "qwen3_vl_moe": "verify_qwen3_vl_moe",
     "qwen3_vl": "verify_qwen3_vl",
     "smolvlm": "verify_smolvlm",
@@ -603,6 +651,18 @@ def list_compile_patch_primitives() -> tuple[CompilePatchPrimitive, ...]:
         CompilePatchPrimitive(
             name="padded_image_filtering",
             description="Replace Python-side padded image filtering with compile-safe MLX operations.",
+        ),
+        CompilePatchPrimitive(
+            name="static_shape_feature_compaction",
+            description="Reorder padded multimodal features instead of compacting them, so the shape stops depending on mask contents.",
+        ),
+        CompilePatchPrimitive(
+            name="training_prefill_mode_bypass",
+            description="Skip generation-only chunked-prefill bookkeeping while training, where it costs host syncs and mutable state but nothing reads it.",
+        ),
+        CompilePatchPrimitive(
+            name="presence_check_bypass",
+            description="Drop a host check for whether a token kind is present when its answer cannot change the result.",
         ),
     )
 
@@ -1666,6 +1726,7 @@ def resolve_training_compile(
     model_or_arch,
     policy: MLXVLMCompilePolicy | None = None,
     args=None,
+    use_cce=None,
 ) -> ResolvedTrainingCompileDecision:
     """Resolve whether a training run should use `mx.compile`.
 
@@ -1839,6 +1900,21 @@ def resolve_training_compile(
             qualification=qualification,
             backend_qualifications=backend_qualifications,
         )
+    host_reads = _CCE_ONLY_TRAINING_COMPILE_ARCHES.get(arch)
+    if use_cce is None:
+        use_cce = getattr(args, "use_cce", True)
+    if host_reads is not None and use_cce is False:
+        return finalize(
+            arch_name=arch,
+            enabled=False,
+            policy_mode=policy_mode,
+            fallback_allowed=fallback_allowed,
+            strict_requested=strict_requested,
+            should_raise=strict_requested,
+            reason=f"use_cce=False reads {host_reads} on the host",
+            qualification=qualification,
+            backend_qualifications=backend_qualifications,
+        )
     return finalize(
         arch_name=arch,
         enabled=True,
@@ -1972,6 +2048,38 @@ def _merge_special_token_features(
     return _merge_sequence_mask_features(special_mask, image_features, inputs_embeds)
 
 
+def _flatten_feature_rows(feature_rows, hidden_dim):
+    """Upstream scatters elements, so a leading or folded axis is only a reshape."""
+
+    if feature_rows.ndim == 2 and feature_rows.shape[-1] == hidden_dim:
+        return feature_rows
+    return feature_rows.reshape((-1, hidden_dim))
+
+
+def _raise_on_feature_count_mismatch(mask, feature_rows, inputs_embeds, exact=True):
+    """Each tower's own upstream count check (equal, or `exact=False`: no shortfall).
+
+    Needs a host value, so a traced mask is left alone.
+    """
+
+    import mlx.core as mx
+
+    try:
+        tokens = int(mx.sum(mask.astype(mx.int32)).item())
+    except Exception:
+        return
+    # Placeholders the features can fill (rows, or minimax's elements / hidden).
+    features, remainder = divmod(feature_rows.size, inputs_embeds.shape[-1])
+    if remainder:
+        features = 0
+    if tokens != features if exact else tokens > features:
+        raise ValueError(
+            "Unsloth MLX: image features and image tokens do not match: "
+            f"tokens={tokens}, features={features}. A max_seq_length shorter "
+            "than the prompt can truncate an image span; increase it."
+        )
+
+
 def _merge_sequence_mask_features(
     sequence_mask,
     feature_rows,
@@ -1981,12 +2089,9 @@ def _merge_sequence_mask_features(
 
     if sequence_mask.dtype != mx.bool_:
         sequence_mask = sequence_mask.astype(mx.bool_)
-    if feature_rows.ndim == 3 and feature_rows.shape[0] == 1:
-        feature_rows = feature_rows[0]
-    elif feature_rows.ndim > 2:
-        feature_rows = feature_rows.reshape((-1, feature_rows.shape[-1]))
 
     hidden_dim = inputs_embeds.shape[-1]
+    feature_rows = _flatten_feature_rows(feature_rows, hidden_dim)
     flat_mask = sequence_mask.reshape((-1,))
     flat_inputs = inputs_embeds.reshape((-1, hidden_dim))
 
@@ -2000,6 +2105,32 @@ def _merge_sequence_mask_features(
 
     flat_out = mx.where(mx.expand_dims(flat_mask, axis=-1), gathered, flat_inputs)
     return flat_out.reshape(inputs_embeds.shape), mx.expand_dims(sequence_mask, axis=-1)
+
+
+def _merge_exclusive_special_token_features(
+    image_token_id,
+    video_token_id,
+    image_features,
+    inputs_embeds,
+    input_ids,
+):
+    """Image placeholders, else video ones; upstream's host choice done via `mx.where`."""
+
+    import mlx.core as mx
+
+    special_mask = input_ids == image_token_id
+    if video_token_id is not None:
+        special_mask = mx.where(
+            mx.sum(special_mask) == 0, input_ids == video_token_id, special_mask
+        )
+    # Upstream refuses only a shortfall.
+    _raise_on_feature_count_mismatch(
+        special_mask, image_features, inputs_embeds, exact=False
+    )
+    merged, _ = _merge_sequence_mask_features(
+        special_mask, image_features, inputs_embeds
+    )
+    return merged
 
 
 def _merge_special_token_features_only(
@@ -3371,6 +3502,10 @@ def _install_qwen3_family_compile_patches():
         qwen3moe_module = None
         qwen3moe_vision_module = None
         qwen3moe_language_module = None
+    omni_module = _try_import_module("mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe")
+    omni_thinker_module = _try_import_module("mlx_vlm.models.qwen3_omni_moe.thinker")
+    omni_vision_module = _try_import_module("mlx_vlm.models.qwen3_omni_moe.vision")
+    omni_language_module = _try_import_module("mlx_vlm.models.qwen3_omni_moe.language")
 
     for generate_name in ("mlx_vlm.generate", "mlx_vlm.generate.ar"):
         try:
@@ -3595,8 +3730,10 @@ def _install_qwen3_family_compile_patches():
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = mx.array(idx_list, dtype=mx.int32)
-        weight_tensor = mx.array(weight_list, dtype=self.pos_embed.weight.dtype)
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        # A quantized pos_embed's weight is packed uint32; interpolate in the rows' dtype.
+        pos_embeds = self.pos_embed(idx_tensor)
+        weight_tensor = mx.array(weight_list, dtype=pos_embeds.dtype)
+        pos_embeds = pos_embeds * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
         split_sizes = [int(h * w) for _, h, w in grid_spec]
@@ -3806,7 +3943,228 @@ def _install_qwen3_family_compile_patches():
             ),
         )
         _PATCHED_ARCHES.add("qwen3_vl_moe")
-    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe"})
+    if None not in (omni_module, omni_thinker_module, omni_vision_module, omni_language_module):
+        _install_qwen3_omni_compile_patches(
+            omni_module,
+            omni_thinker_module,
+            omni_vision_module,
+            omni_language_module,
+            (
+                patched_qwen3_attention,
+                patched_qwen3_vision_block_call,
+                patched_qwen3_rot_pos_emb,
+                patched_qwen3_fast_pos_embed_interpolate,
+                patched_qwen3_vision_call,
+            ),
+        )
+    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"})
+
+
+def _install_qwen3_omni_compile_patches(
+    module, thinker_module, vision_module, language_module, tower_patches
+):
+    """Bind the Qwen3 VL tower / deepstack patches to Qwen3-Omni's thinker modules."""
+
+    import mlx.core as mx
+
+    attention, block, rot_pos_emb, pos_embed_interpolate, vision_call = tower_patches
+
+    backbone_cls = language_module.Qwen3VLMoEModel
+    original_deepstack = backbone_cls._deepstack_process
+
+    def patched_deepstack(self, hidden_states, visual_pos_masks, visual_embeds):
+        # Upstream's embedder (inference, audio) scatters full-length residuals that
+        # the row gather would misplace; the patched one hands a tuple of row blocks.
+        if not isinstance(visual_pos_masks, tuple):
+            return original_deepstack(self, hidden_states, visual_pos_masks, visual_embeds)
+        for mask, rows in zip(visual_pos_masks, visual_embeds):
+            hidden_states = _add_visual_embeds(hidden_states, mask, rows)
+        return hidden_states
+
+    def patched_backbone_call(
+        self,
+        inputs,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        position_ids=None,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        output_hidden_states=False,
+        output_hidden_state_idx=None,
+    ):
+        # Upstream's body minus its per-layer `mx.eval(h)`, which cannot run in a trace.
+        h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        if cache is None:
+            cache = [None] * len(self.layers)
+        if mask is None:
+            mask = language_module.create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
+
+        all_hidden_states = [] if output_hidden_states else None
+        selected_hidden_state = h if output_hidden_state_idx == 0 else None
+        position_embeddings = None
+        if (
+            position_ids is not None
+            and self.layers
+            and not self.layers[0].self_attn.rotary_emb.fused_apply
+        ):
+            position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
+
+        levels = deepstack_visual_embeds
+        if isinstance(levels, mx.array):
+            # Upstream's embedder hands one array holding a level per column.
+            levels = [levels[:, :, level] for level in range(levels.shape[2])]
+        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
+            if output_hidden_states:
+                all_hidden_states.append(h)
+            h = layer(h, mask, c, position_ids, position_embeddings)
+            if levels is not None and layer_idx < len(levels):
+                h = self._deepstack_process(h, visual_pos_masks, levels[layer_idx])
+            if output_hidden_state_idx == layer_idx + 1:
+                selected_hidden_state = h
+
+        if output_hidden_states:
+            all_hidden_states.append(h)
+        h = self.norm(h)
+        if output_hidden_states:
+            return h, all_hidden_states
+        if output_hidden_state_idx is not None:
+            if selected_hidden_state is None:
+                raise ValueError(
+                    f"output_hidden_state_idx={output_hidden_state_idx} is out of range"
+                )
+            return h, selected_hidden_state
+        return h
+
+    original_backbone_call = backbone_cls.__call__
+
+    @wraps(original_backbone_call)
+    def training_backbone_call(self, *args, **kwargs):
+        call = patched_backbone_call if getattr(self, "training", False) else original_backbone_call
+        return call(self, *args, **kwargs)
+
+    def patched_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        # Audio trains eagerly through upstream, whose rope index wants array grids.
+        if kwargs.get("input_features") is not None:
+            for key in ("image_grid_thw", "video_grid_thw"):
+                if isinstance(kwargs.get(key), tuple):
+                    kwargs[key] = mx.array(kwargs[key], dtype=mx.int32)
+            return original_get_input_embeddings(self, input_ids, pixel_values, **kwargs)
+
+        thinker = self.thinker
+        config = thinker.config
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
+        inputs_embeds = thinker.language_model.model.embed_tokens(input_ids)
+        dtype = thinker.vision_tower.patch_embed.proj.weight.dtype
+        # Image and video positions are disjoint, so each deepstack add is independent.
+        visual_masks, visual_levels = [], []
+
+        for pixels, grid, token_id in (
+            (pixel_values, image_grid_thw, config.image_token_id),
+            (pixel_values_videos, video_grid_thw, config.video_token_id),
+        ):
+            if pixels is None:
+                continue
+            cached = kwargs.get("cached_image_features", None) if pixels is pixel_values else None
+            if cached is not None:
+                embeds, deepstack = cached, None
+            else:
+                embeds, deepstack = thinker.vision_tower(pixels.astype(dtype), grid)
+            embeds = embeds.astype(inputs_embeds.dtype)
+            token_mask = input_ids == token_id
+            # Upstream requires the counts to be equal, for images and videos alike.
+            _raise_on_feature_count_mismatch(token_mask, embeds, inputs_embeds)
+            inputs_embeds = _masked_scatter_no_numpy(
+                inputs_embeds,
+                mx.broadcast_to(mx.expand_dims(token_mask, -1), inputs_embeds.shape),
+                embeds,
+            )
+            if deepstack is not None:
+                visual_masks.append(token_mask)
+                visual_levels.append(deepstack)
+
+        features = thinker_module.InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds,
+            visual_pos_masks=tuple(visual_masks) if visual_masks else None,
+            deepstack_visual_embeds=(
+                [tuple(rows) for rows in zip(*visual_levels)] if visual_levels else None
+            ),
+        )
+        return _attach_position_ids(features, kwargs["position_ids"])
+
+    original_language_call = language_module.LanguageModel.__call__
+
+    @wraps(original_language_call)
+    def training_language_call(
+        self, inputs, inputs_embeds=None, mask=None, cache=None,
+        visual_pos_masks=None, deepstack_visual_embeds=None, **kwargs,
+    ):
+        # Upstream's body for explicit positions, minus its traced-illegal `mx.eval`.
+        position_ids = kwargs.get("position_ids")
+        if not getattr(self, "training", False) or position_ids is None or cache is not None:
+            return original_language_call(
+                self, inputs, inputs_embeds, mask, cache,
+                visual_pos_masks, deepstack_visual_embeds, **kwargs,
+            )
+        captures = kwargs.get("output_hidden_states", False) or kwargs.get("output_hidden_state_idx") is not None
+        out = self.model(
+            inputs,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            output_hidden_states=kwargs.get("output_hidden_states", False),
+            output_hidden_state_idx=kwargs.get("output_hidden_state_idx"),
+        )
+        out, hidden_states = out if captures else (out, None)
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+        return language_module.LanguageModelOutput(logits=logits, hidden_states=hidden_states)
+
+    original_model_call = module.Model.__call__
+
+    @wraps(original_model_call)
+    def training_model_call(
+        self, input_ids, pixel_values=None, pixel_values_videos=None, mask=None, cache=None, **kwargs
+    ):
+        # Upstream's thinker call would bypass the patched embedder.
+        if not getattr(self, "training", False) or kwargs.get("position_ids") is None:
+            return original_model_call(
+                self, input_ids, pixel_values, pixel_values_videos, mask, cache, **kwargs
+            )
+        audio = {
+            key: kwargs.pop(key)
+            for key in ("input_features", "feature_attention_mask", "input_features_mask", "audio_feature_lengths")
+            if key in kwargs
+        }
+        features = self.get_input_embeddings(
+            input_ids, pixel_values, pixel_values_videos=pixel_values_videos, mask=mask, **audio, **kwargs
+        )
+        return self.thinker.language_model(
+            input_ids, mask=mask, cache=cache,
+            **{"pixel_values": pixel_values, "pixel_values_videos": pixel_values_videos,
+               **features.to_dict(), **kwargs},
+        )
+
+    thinker_module.masked_scatter = _masked_scatter_no_numpy
+    _patch_method(vision_module.Attention, "__call__", attention)
+    _patch_method(vision_module.Qwen3VLMoEVisionBlock, "__call__", block)
+    _patch_method(vision_module.VisionModel, "rot_pos_emb", rot_pos_emb)
+    _patch_method(vision_module.VisionModel, "fast_pos_embed_interpolate", pos_embed_interpolate)
+    _patch_method(vision_module.VisionModel, "__call__", vision_call)
+    _patch_method(backbone_cls, "_deepstack_process", patched_deepstack)
+    _patch_method(backbone_cls, "__call__", training_backbone_call)
+    original_get_input_embeddings = module.Model.get_input_embeddings
+    _patch_explicit_position_embeddings(module.Model, patched_get_input_embeddings)
+    _patch_method(language_module.LanguageModel, "__call__", training_language_call)
+    _patch_method(module.Model, "__call__", training_model_call)
+    _PATCHED_ARCHES.add("qwen3_omni_moe")
 
 
 def _install_glm_ocr_compile_patches():
@@ -3967,6 +4325,763 @@ def _install_glm_ocr_compile_patches():
     _patch_method(vision_module.VisionModel, "__call__", patched_glm_vision_call)
     _patch_explicit_position_embeddings(module.Model, patched_glm_get_input_embeddings)
     _PATCHED_ARCHES.add("glm_ocr")
+
+
+def _install_dots_ocr_compile_patches():
+    """Install compile-safe dots_ocr vision and merge patches.
+
+    Its tower reads the grid on the host and reduces the same array with
+    `mx.max`; the merge counts placeholders per row on the device.
+    """
+
+    module = _try_import_module("mlx_vlm.models.dots_ocr.dots_ocr")
+    vision_module = _try_import_module("mlx_vlm.models.dots_ocr.vision")
+    if module is None or vision_module is None:
+        return
+
+    apply_rotary_pos_emb_vision = vision_module.apply_rotary_pos_emb_vision
+
+    def patched_get_pos_ids_by_grid(self, grid_thw):
+        import mlx.core as mx
+
+        merge = self.spatial_merge_size
+        pos_ids = []
+        for t, h, w in _grid_to_tuple(grid_thw):
+            hpos_ids = mx.repeat(mx.arange(h).reshape(h, 1), w, axis=1)
+            hpos_ids = hpos_ids.reshape(h // merge, merge, w // merge, merge)
+            hpos_ids = hpos_ids.transpose(0, 2, 1, 3).flatten()
+
+            wpos_ids = mx.repeat(mx.arange(w).reshape(1, w), h, axis=0)
+            wpos_ids = wpos_ids.reshape(h // merge, merge, w // merge, merge)
+            wpos_ids = wpos_ids.transpose(0, 2, 1, 3).flatten()
+
+            pos_ids.append(mx.tile(mx.stack([hpos_ids, wpos_ids], axis=-1), (t, 1)))
+        return pos_ids
+
+    def patched_rot_pos_emb(self, grid_thw):
+        import mlx.core as mx
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        pos_ids = mx.concatenate(self.get_pos_ids_by_grid(grid_spec), axis=0)
+        max_grid_size = max(max(h, w) for _, h, w in grid_spec)
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        return rotary_pos_emb_full[pos_ids].reshape(pos_ids.shape[0], -1)
+
+    def patched_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
+        del output_hidden_states
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        hidden_states = self.patch_embed(hidden_states, grid_spec)
+        rotary_pos_emb = self.rot_pos_emb(grid_spec)
+        cu_seqlens = _build_cu_seqlens(grid_spec)
+
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
+            )
+
+        if self.config.post_norm:
+            hidden_states = self.post_trunk_norm(hidden_states)
+        return self.merger(hidden_states)
+
+    def patched_attention(self, hidden_states, cu_seqlens, rotary_pos_emb):
+        import mlx.core as mx
+
+        seq_length = hidden_states.shape[0]
+        qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1)
+        qkv = qkv.transpose(1, 0, 2, 3)
+        q, k, v = mx.split(qkv, 3)
+
+        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        split_indices = _split_points(cu_seqlens)
+        attn_outputs = [
+            mx.fast.scaled_dot_product_attention(
+                q_chunk, k_chunk, v_chunk, scale=self.scale
+            )
+            for q_chunk, k_chunk, v_chunk in zip(
+                mx.split(q, split_indices, axis=2),
+                mx.split(k, split_indices, axis=2),
+                mx.split(v, split_indices, axis=2),
+            )
+        ]
+        output = mx.concatenate(attn_outputs, axis=2)
+        output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
+        return self.proj(output)
+
+    _patch_method(
+        vision_module.VisionModel, "get_pos_ids_by_grid", patched_get_pos_ids_by_grid
+    )
+    _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_rot_pos_emb)
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    _patch_method(vision_module.VisionAttention, "__call__", patched_attention)
+    _patch_staticmethod(
+        module.Model,
+        "merge_input_ids_with_image_features",
+        _merge_exclusive_special_token_features,
+    )
+    _PATCHED_ARCHES.add("dots_ocr")
+
+
+def _install_kimi_k3_compile_patches():
+    """Only kimi_k3's merge reads back on the host (numpy); its tower takes a Python grid."""
+
+    module = _try_import_module("mlx_vlm.models.kimi_k3.kimi_k3")
+    if module is None:
+        return
+
+    def patched_prepare_inputs_for_multimodal(
+        self, image_features, inputs_embeds, input_ids, image_token_id=None
+    ):
+        import mlx.core as mx
+
+        candidates = []
+        for token_id in (
+            image_token_id,
+            self.config.image_token_index,
+            getattr(self.config, "media_placeholder_token_id", None),
+        ):
+            if token_id is None:
+                continue
+            if isinstance(token_id, mx.array):
+                if token_id.size == 0:
+                    continue
+                token_id = token_id.item()
+            token_id = int(token_id)
+            if token_id not in candidates:
+                candidates.append(token_id)
+
+        image_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
+        for token_id in candidates:
+            image_mask = mx.logical_or(image_mask, input_ids == token_id)
+
+        _raise_on_feature_count_mismatch(image_mask, image_features, inputs_embeds)
+        merged, _ = _merge_sequence_mask_features(
+            image_mask, image_features.astype(inputs_embeds.dtype), inputs_embeds
+        )
+        return merged
+
+    _patch_method(
+        module.Model,
+        "_prepare_inputs_for_multimodal",
+        patched_prepare_inputs_for_multimodal,
+    )
+    _PATCHED_ARCHES.add("kimi_k3")
+
+
+def _install_muse_glimmer_compile_patches():
+    """Install compile-safe muse_glimmer vision and merge patches.
+
+    The tower opens by reading the grid on the host, and the merge counts its
+    placeholders on the device before scattering.
+    """
+
+    module = _try_import_module("mlx_vlm.models.muse_glimmer.muse_glimmer")
+    vision_module = _try_import_module("mlx_vlm.models.muse_glimmer.vision")
+    if module is None or vision_module is None:
+        return
+
+    InputEmbeddingsFeatures = module.InputEmbeddingsFeatures
+
+    def patched_vision_call(self, pixel_values, grid_thw):
+        import mlx.core as mx
+
+        grid = [list(row) for row in _grid_to_tuple(grid_thw)]
+        full_split_points = vision_module._cu_seqlens(grid)[1:-1]
+        window_index, window_cu = vision_module._window_index(
+            grid, self.config.pos_emb_height
+        )
+        window_split_points = window_cu[1:-1]
+
+        hidden_states = self.ln_pre(self.patch_embedder(pixel_values, grid))
+        positions = vision_module._position_ids(grid)
+        if window_index is not None:
+            hidden_states = hidden_states[window_index]
+            positions = positions[window_index]
+        cos, sin = self._rotary(positions)
+
+        for idx, block in enumerate(self.layers):
+            split_points = (
+                full_split_points
+                if self.config.layer_types[idx] == "full_attention"
+                else window_split_points
+            )
+            hidden_states = block(hidden_states, split_points, cos, sin)
+
+        if window_index is not None:
+            hidden_states = hidden_states[mx.argsort(window_index)]
+        return self._pixel_shuffle(self.ln_post(hidden_states), grid)
+
+    def patched_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        language_model = self.language_model.model
+        inputs_embeds = language_model.embed_norm(language_model.embed_tokens(input_ids))
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos")
+        if pixel_values is None:
+            return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
+
+        grid_thw = kwargs.get("image_grid_thw")
+        if grid_thw is None:
+            grid_thw = kwargs.get("video_grid_thw")
+        cached = kwargs.get("cached_image_features")
+        image_features = (
+            cached
+            if cached is not None
+            else self._encode_image(pixel_values, image_grid_thw=grid_thw)
+        ).astype(inputs_embeds.dtype)
+
+        token_mask = (input_ids == self.config.image_token_id) | (
+            input_ids == self.config.video_token_id
+        )
+        _raise_on_feature_count_mismatch(token_mask, image_features, inputs_embeds)
+        merged, _ = _merge_sequence_mask_features(
+            token_mask, image_features, inputs_embeds
+        )
+        return InputEmbeddingsFeatures(inputs_embeds=merged)
+
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    _patch_method(module.Model, "get_input_embeddings", patched_get_input_embeddings)
+    _PATCHED_ARCHES.add("muse_glimmer")
+
+
+def _install_minimax_m3_vl_compile_patches():
+    """Install compile-safe minimax_m3_vl vision and merge patches.
+
+    Every host read of the grid runs through `_segment_grid_thw`, the encoder
+    splits on cumulative lengths it reads back, and the merge compares its
+    placeholder count with the feature size on the host.
+    """
+
+    module = _try_import_module("mlx_vlm.models.minimax_m3_vl.minimax_m3_vl")
+    vision_module = _try_import_module("mlx_vlm.models.minimax_m3_vl.vision")
+    if module is None or vision_module is None:
+        return
+
+    def patched_segment_grid_thw(self, grid_thw):
+        max_frames = self.config.vision_segment_max_frames
+        segments = []
+        for t, h, w in _grid_to_tuple(grid_thw):
+            if max_frames is None or t <= max_frames:
+                segments.append((t, h, w))
+                continue
+            for start in range(0, t, max_frames):
+                segments.append((min(max_frames, t - start), h, w))
+        return segments
+
+    def patched_transformer_call(
+        self, pixel_values, grid_thw, output_hidden_states=False
+    ):
+        import mlx.core as mx
+
+        hidden_states = self.embeddings(pixel_values).reshape(
+            -1, self.config.hidden_size
+        )
+        hidden_states = self.pre_layrnorm(hidden_states)
+        rotary_pos_emb = self._rotary_pos_emb(grid_thw)
+        rotary_pos_emb = (mx.cos(rotary_pos_emb), mx.sin(rotary_pos_emb))
+
+        seqlens = [t * h * w for t, h, w in self._segment_grid_thw(grid_thw)]
+        # A tuple instead of the upstream array: the attention below splits on
+        # these boundaries, which has to stay a host value under the tracer.
+        return self.encoder(
+            hidden_states,
+            tuple(accumulate(seqlens, initial=0)),
+            rotary_pos_emb,
+            output_hidden_states=output_hidden_states,
+        )
+
+    def patched_attention(self, hidden_states, cu_seqlens, rotary_pos_emb=None):
+        import mlx.core as mx
+
+        seq_length = hidden_states.shape[0]
+        q = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+        k = self.k_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+        v = self.v_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+
+        if rotary_pos_emb is not None:
+            q = vision_module._apply_vision_rope(
+                mx.expand_dims(q, axis=0), rotary_pos_emb
+            )[0]
+            k = vision_module._apply_vision_rope(
+                mx.expand_dims(k, axis=0), rotary_pos_emb
+            )[0]
+
+        q = q.transpose(1, 0, 2)[None]
+        k = k.transpose(1, 0, 2)[None]
+        v = v.transpose(1, 0, 2)[None]
+
+        split_points = _split_points(cu_seqlens)
+        if not split_points:
+            output = vision_module.ensure_fused_sdpa(q, k, v, self.scale)
+        else:
+            splits = [
+                mx.split(tensor, split_points, axis=2) for tensor in (q, k, v)
+            ]
+            outputs = [
+                vision_module.ensure_fused_sdpa(q_i, k_i, v_i, self.scale)
+                for q_i, k_i, v_i in zip(*splits)
+            ]
+            output = mx.concatenate(outputs, axis=2)
+        output = output[0].transpose(1, 0, 2).reshape(seq_length, -1)
+        return self.out_proj(output)
+
+    def patched_merge_visual_tokens(self, visual_features, grid_thw):
+        import mlx.core as mx
+
+        merge_size = self.config.vision_config.spatial_merge_size
+        feature_dim = visual_features.shape[-1]
+        outputs = []
+        offset = 0
+        for t, h, w in _grid_to_tuple(grid_thw):
+            length = t * h * w
+            features = visual_features[offset : offset + length]
+            offset += length
+            features = features.reshape(
+                t,
+                h // merge_size,
+                w // merge_size,
+                merge_size,
+                merge_size,
+                feature_dim,
+            )
+            features = features.reshape(-1, merge_size * merge_size * feature_dim)
+            outputs.append(self.patch_merge_mlp(features))
+        return mx.concatenate(outputs, axis=0)
+
+    def patched_merge_input_ids_with_visual_features(
+        inputs_embeds,
+        input_ids,
+        image_features=None,
+        video_features=None,
+        image_token_index=None,
+        video_token_index=None,
+    ):
+        import mlx.core as mx
+
+        visual_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
+        for features, token_index in (
+            (image_features, image_token_index),
+            (video_features, video_token_index),
+        ):
+            if features is None:
+                continue
+            special_mask = input_ids == token_index
+            _raise_on_feature_count_mismatch(special_mask, features, inputs_embeds)
+            inputs_embeds, _ = _merge_sequence_mask_features(
+                special_mask, features, inputs_embeds
+            )
+            visual_mask = visual_mask | special_mask
+        return inputs_embeds, visual_mask
+
+    _patch_method(
+        vision_module.MiniMaxVisionTransformer,
+        "_segment_grid_thw",
+        patched_segment_grid_thw,
+    )
+    _patch_method(
+        vision_module.MiniMaxVisionTransformer, "__call__", patched_transformer_call
+    )
+    _patch_method(vision_module.MiniMaxVisionAttention, "__call__", patched_attention)
+    _patch_method(module.Model, "_merge_visual_tokens", patched_merge_visual_tokens)
+    _patch_staticmethod(
+        module.Model,
+        "merge_input_ids_with_visual_features",
+        patched_merge_input_ids_with_visual_features,
+    )
+    _PATCHED_ARCHES.add("minimax_m3_vl")
+
+
+def _install_ernie4_5_moe_vl_compile_patches():
+    """Install compile-safe ernie4_5_moe_vl vision, resampler and merge patches.
+
+    The tower, the resampler and the merge each read the grid or the placeholder
+    count back on the host; these take the grid as Python tuples instead.
+    """
+
+    module = _try_import_module("mlx_vlm.models.ernie4_5_moe_vl.ernie4_5_moe_vl")
+    vision_module = _try_import_module("mlx_vlm.models.ernie4_5_moe_vl.vision")
+    if module is None or vision_module is None:
+        return
+
+    import numpy as np
+
+    def patched_rot_pos_emb(self, grid_thw, num_pad=0):
+        import mlx.core as mx
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        merge = self.spatial_merge_size
+        pos_ids = []
+        for t, h, w in grid_spec:
+            hpos_ids = np.tile(np.arange(h).reshape(-1, 1), (1, w))
+            wpos_ids = np.tile(np.arange(w).reshape(1, -1), (h, 1))
+            hpos_ids = hpos_ids.reshape(h // merge, merge, w // merge, merge)
+            wpos_ids = wpos_ids.reshape(h // merge, merge, w // merge, merge)
+            hpos_ids = np.transpose(hpos_ids, (0, 2, 1, 3)).flatten()
+            wpos_ids = np.transpose(wpos_ids, (0, 2, 1, 3)).flatten()
+            pos_ids.append(np.tile(np.stack([hpos_ids, wpos_ids], axis=-1), (t, 1)))
+        pos_ids = np.concatenate(pos_ids, axis=0)
+        if num_pad > 0:
+            pos_ids = np.concatenate(
+                [pos_ids, np.zeros((num_pad, 2), dtype=pos_ids.dtype)], axis=0
+            )
+        max_grid_size = max(max(h, w) for _, h, w in grid_spec)
+        rotary = self.rotary_pos_emb(max_grid_size)
+        return rotary[mx.array(pos_ids, dtype=mx.int32)].reshape(pos_ids.shape[0], -1)
+
+    def patched_vision_call(
+        self, hidden_states, grid_thw, output_hidden_states=None, num_pad=0
+    ):
+        del output_hidden_states
+        grid_spec = _grid_to_tuple(grid_thw)
+        hidden_states = self.patch_embed(hidden_states)
+        rotary_pos_emb = self.rot_pos_emb(grid_spec, num_pad=num_pad)
+        # One segment per image, not per frame, as upstream builds it.
+        cu_seqlens = [0]
+        for t, h, w in grid_spec:
+            cu_seqlens.append(cu_seqlens[-1] + t * h * w)
+        if num_pad > 0:
+            cu_seqlens.append(cu_seqlens[-1] + num_pad)
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states, cu_seqlens=tuple(cu_seqlens), rotary_pos_emb=rotary_pos_emb
+            )
+        return self.ln(hidden_states)
+
+    def patched_attention(self, x, cu_seqlens, rotary_pos_emb=None):
+        import mlx.core as mx
+
+        seq_length = x.shape[0]
+        qkv = (
+            self.qkv(x).reshape(seq_length, 3, self.num_heads, -1).transpose(1, 0, 2, 3)
+        )
+        q, k, v = mx.split(qkv, 3)
+        q = vision_module.apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+        k = vision_module.apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+        q, k, v = (tensor.transpose(0, 2, 1, 3) for tensor in (q, k, v))
+
+        # Upstream splits at its first two boundaries only, which leaves empty
+        # segments for one or two images; an empty segment crashes the compiled
+        # attention kernel, so those are dropped and the rest kept as upstream has them.
+        lengths = [end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])]
+        split_points = sorted(
+            {point for point in (lengths[0], sum(lengths[:2])) if 0 < point < seq_length}
+        )
+        segments = zip(*(mx.split(tensor, split_points, axis=2) for tensor in (q, k, v)))
+        output = mx.concatenate(
+            [
+                mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
+                for q, k, v in segments
+            ],
+            axis=2,
+        )
+        return self.proj(output.transpose(0, 2, 1, 3).reshape(seq_length, -1))
+
+    def patched_resampler_call(self, x, grid_thw):
+        import mlx.core as mx
+
+        x = self.spatial_linear(self.spatial_conv_reshape(x))
+        if self.use_temporal_conv:
+            grid = np.array(_grid_to_tuple(grid_thw), dtype=np.int64)
+            spatial_sizes = grid[:, 1:].prod(-1) // (self.spatial_conv_size**2)
+            tokens = grid.prod(-1) // (self.spatial_conv_size**2)
+            offsets = np.concatenate([[0], tokens.cumsum()[:-1]])
+            assert (
+                self.temporal_conv_size == 2
+            ), f"Hard Code: temporal_conv_size==2, got: {self.temporal_conv_size}"
+
+            def frame_rows(first):
+                rows = []
+                for temporal_size, spatial_size, offset in zip(grid[:, 0], spatial_sizes, offsets):
+                    start = first if temporal_size > 1 else 0
+                    for frame in range(start, temporal_size, 2):
+                        rows.append(
+                            np.arange(offset + frame * spatial_size, offset + (frame + 1) * spatial_size)
+                        )
+                return mx.array(np.concatenate(rows).astype(np.int32))
+
+            x = mx.concatenate([x[frame_rows(0), :], x[frame_rows(1), :]], axis=-1)
+            x = self.temporal_linear(x)
+        return self.after_norm(self.mlp(x))
+
+    def patched_merge(self, image_features, inputs_embeds, input_ids):
+        return _merge_exclusive_special_token_features(
+            self.config.image_token_id,
+            self.config.video_token_id,
+            image_features,
+            inputs_embeds,
+            input_ids,
+        )
+
+    _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_rot_pos_emb)
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    _patch_method(vision_module.VisionAttention, "__call__", patched_attention)
+    _patch_method(module.VariableResolutionResamplerModel, "__call__", patched_resampler_call)
+    _patch_method(module.Model, "_merge_input_ids_with_image_features", patched_merge)
+    _PATCHED_ARCHES.add("ernie4_5_moe_vl")
+
+
+# glm4v_moe's attention already builds its block mask from host values.
+_GLM4V_COMPILE_FAMILIES = {
+    "glm4v": ("Glm4vVisionRotaryEmbedding", "Glm4vVisionAttention"),
+    "glm4v_moe": ("Glm4vMoeVisionRotaryEmbedding", None),
+}
+
+
+def _install_glm4v_family_compile_patches(arch):
+    """Compile-safe glm4v / glm4v_moe tower, merge and embedder (grid as host tuples)."""
+
+    module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+    vision_module = _try_import_module(f"mlx_vlm.models.{arch}.vision")
+    if module is None or vision_module is None:
+        return
+    rotary_name, attention_name = _GLM4V_COMPILE_FAMILIES[arch]
+    InputEmbeddingsFeatures = module.InputEmbeddingsFeatures
+    apply_rotary_pos_emb_vision = vision_module.apply_rotary_pos_emb_vision
+
+    def patched_vision_rotary(self, seqlen):
+        import mlx.core as mx
+
+        inv_freq = 1.0 / (
+            self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
+        )
+        return mx.outer(mx.arange(int(seqlen), dtype=inv_freq.dtype), inv_freq)
+
+    def patched_rot_pos_emb(self, grid_thw):
+        import mlx.core as mx
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        merge = self.spatial_merge_size
+        pos_ids = []
+        for t, h, w in grid_spec:
+            hpos_ids = mx.repeat(mx.arange(h).reshape(h, 1), w, axis=1)
+            hpos_ids = hpos_ids.reshape(h // merge, merge, w // merge, merge)
+            hpos_ids = hpos_ids.transpose(0, 2, 1, 3).flatten()
+
+            wpos_ids = mx.repeat(mx.arange(w).reshape(1, w), h, axis=0)
+            wpos_ids = wpos_ids.reshape(h // merge, merge, w // merge, merge)
+            wpos_ids = wpos_ids.transpose(0, 2, 1, 3).flatten()
+
+            pos_ids.append(mx.tile(mx.stack([hpos_ids, wpos_ids], axis=-1), (t, 1)))
+
+        pos_ids = mx.concatenate(pos_ids, axis=0)
+        max_grid_size = max(max(h, w) for _, h, w in grid_spec)
+        rotary_pos_emb = self.rotary_pos_emb(max_grid_size)[pos_ids]
+        return rotary_pos_emb.reshape(pos_ids.shape[0], -1), pos_ids
+
+    def patched_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
+        del output_hidden_states
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        hidden_states = self.patch_embed(hidden_states)
+        hidden_states = self.post_conv_layernorm(hidden_states)
+        rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_spec)
+
+        cu_seqlens = _build_cu_seqlens(grid_spec)
+        # A tuple keeps the lengths on the host inside the embeddings.
+        seqlens = tuple(end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]))
+        hidden_states = self.embeddings(
+            hidden_states, seqlens, grid_spec, image_type_ids[:, 0], image_type_ids[:, 1]
+        )
+
+        for blk in self.blocks:
+            hidden_states = blk(
+                hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
+            )
+
+        hidden_states = self.post_layernorm(hidden_states)
+        hidden_states = hidden_states.reshape(
+            -1, self.spatial_merge_size, self.spatial_merge_size, hidden_states.shape[-1]
+        )
+        hidden_states = self.downsample(hidden_states).reshape(
+            -1, self.config.out_hidden_size
+        )
+        return self.merger(hidden_states)
+
+    def patched_attention(self, x, cu_seqlens, rotary_pos_emb=None):
+        import mlx.core as mx
+
+        seq_length = x.shape[0]
+        qkv = self.qkv(x).reshape(seq_length, 3, self.num_heads, -1).transpose(1, 0, 2, 3)
+        q, k, v = mx.split(qkv, 3)
+        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+        q, k, v = (tensor.transpose(0, 2, 1, 3) for tensor in (q, k, v))
+
+        # Upstream's first-two-boundary split, minus the empty segments that crash compiled SDPA.
+        lengths = [end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])]
+        split_points = sorted(
+            {point for point in (lengths[0], sum(lengths[:2])) if 0 < point < seq_length}
+        )
+        segments = zip(*(mx.split(tensor, split_points, axis=2) for tensor in (q, k, v)))
+        output = mx.concatenate(
+            [
+                mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
+                for q, k, v in segments
+            ],
+            axis=2,
+        )
+        return self.proj(output.transpose(0, 2, 1, 3).reshape(seq_length, -1))
+
+    def patched_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
+        if pixel_values is None:
+            self.language_model._position_ids = None
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
+
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        cached = kwargs.get("cached_image_features", None)
+        # Upstream's split + concatenate of the tower output is the identity.
+        hidden_states = (
+            cached
+            if cached is not None
+            else self.vision_tower(pixel_values.astype(dtype), grid_thw, output_hidden_states=False)
+        )
+        final_inputs_embeds = self.merge_input_ids_with_image_features(
+            self.config.image_token_id,
+            self.config.video_token_id,
+            hidden_states,
+            inputs_embeds,
+            input_ids,
+        )
+        features = InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
+        return _attach_position_ids(features, kwargs["position_ids"])
+
+    _patch_method(getattr(vision_module, rotary_name), "__call__", patched_vision_rotary)
+    _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_rot_pos_emb)
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    if attention_name is not None:
+        _patch_method(getattr(vision_module, attention_name), "__call__", patched_attention)
+    _patch_staticmethod(
+        module.Model,
+        "merge_input_ids_with_image_features",
+        _merge_exclusive_special_token_features,
+    )
+    _patch_explicit_position_embeddings(module.Model, patched_get_input_embeddings)
+    _PATCHED_ARCHES.add(arch)
+
+
+def _install_glm5_next_compile_patches():
+    """Compile-safe glm5_next tower, video grid and merge (grid as host tuples)."""
+
+    module = _try_import_module("mlx_vlm.models.glm5_next.glm5_next")
+    vision_module = _try_import_module("mlx_vlm.models.glm5_next.vision")
+    if module is None or vision_module is None:
+        return
+    # mlx-vlm 0.7.0 ships an older tower (no VisionAttention / _video_grid): stay eager.
+    if not all(
+        callable(getattr(owner, name, None))
+        for owner, name in (
+            (vision_module, "VisionAttention"),
+            (vision_module, "_apply_rotary"),
+            (getattr(vision_module, "VisionModel", None), "_rotary_embeddings"),
+            (getattr(module, "Model", None), "_video_grid"),
+            (module, "_replace_features"),
+        )
+    ):
+        _VERIFIED_TRAINING_ARCHES.discard("glm5_next")
+        _PATCHED_ARCHES.discard("glm5_next")
+        return
+
+    def patched_rotary_embeddings(self, grid_thw):
+        import mlx.core as mx
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        merge = self.spatial_merge_size
+        pos_ids = []
+        for t, h, w in grid_spec:
+            h_ids = mx.repeat(mx.arange(h)[:, None], w, axis=1)
+            w_ids = mx.repeat(mx.arange(w)[None, :], h, axis=0)
+            h_ids = h_ids.reshape(h // merge, merge, w // merge, merge)
+            w_ids = w_ids.reshape(h // merge, merge, w // merge, merge)
+            h_ids = h_ids.transpose(0, 2, 1, 3).flatten()
+            w_ids = w_ids.transpose(0, 2, 1, 3).flatten()
+            pos_ids.append(mx.tile(mx.stack([h_ids, w_ids], axis=-1), (t, 1)))
+
+        pos_ids = mx.concatenate(pos_ids, axis=0)
+        max_grid = max(max(h, w) for _, h, w in grid_spec)
+        rotary = self.rotary_pos_emb(max_grid)[pos_ids].reshape(pos_ids.shape[0], -1)
+        emb = mx.concatenate([rotary, rotary], axis=-1)
+        return mx.cos(emb), mx.sin(emb)
+
+    def patched_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
+        import mlx.core as mx
+
+        del output_hidden_states
+        grid_spec = _grid_to_tuple(grid_thw)
+        hidden_states = self.patch_embed(hidden_states)
+        position_embeddings = self._rotary_embeddings(grid_spec)
+
+        cu_seqlens = _build_cu_seqlens(grid_spec)
+
+        for block in self.blocks:
+            hidden_states = block(hidden_states, cu_seqlens, position_embeddings)
+
+        hidden_states = self.post_layernorm(hidden_states)
+        merge = self.spatial_merge_size
+        hidden_states = hidden_states.reshape(-1, merge, merge, hidden_states.shape[-1])
+        hidden_states = self.downsample(hidden_states).reshape(
+            -1, self.config.out_hidden_size
+        )
+        return self.merger(hidden_states)
+
+    def patched_video_grid(self, video_grid_thw):
+        # Host rows, not upstream's array: the patched tower reads them back.
+        flattened = []
+        for t, h, w in _grid_to_tuple(video_grid_thw):
+            flattened.extend([(1, h, w)] * t)
+        return tuple(flattened)
+
+    def patched_replace_features(inputs_embeds, positions, features, label):
+        del label
+        _raise_on_feature_count_mismatch(positions, features, inputs_embeds)
+        merged, _ = _merge_sequence_mask_features(
+            positions, features, inputs_embeds
+        )
+        return merged
+
+    def patched_vision_attention(self, x, cu_seqlens, position_embeddings):
+        import mlx.core as mx
+
+        length = x.shape[0]
+        qkv = self.qkv(x).reshape(length, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.transpose(1, 0, 2, 3)
+        q, k = self.q_norm(q), self.k_norm(k)
+        q, k = vision_module._apply_rotary(q, k, *position_embeddings)
+        q = q.transpose(1, 0, 2)[None]
+        k = k.transpose(1, 0, 2)[None]
+        v = v.transpose(1, 0, 2)[None]
+
+        split_indices = _split_points(cu_seqlens)
+        outputs = [
+            mx.fast.scaled_dot_product_attention(
+                q_chunk, k_chunk, v_chunk, scale=self.scale
+            )
+            for q_chunk, k_chunk, v_chunk in zip(
+                mx.split(q, split_indices, axis=2),
+                mx.split(k, split_indices, axis=2),
+                mx.split(v, split_indices, axis=2),
+            )
+        ]
+        out = mx.concatenate(outputs, axis=2)
+        out = out.transpose(0, 2, 1, 3).reshape(length, -1)
+        return self.proj(out)
+
+    setattr(module, "_replace_features", patched_replace_features)
+    _patch_method(vision_module.VisionAttention, "__call__", patched_vision_attention)
+    _patch_method(vision_module.VisionModel, "_rotary_embeddings", patched_rotary_embeddings)
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    _patch_method(module.Model, "_video_grid", patched_video_grid)
+    _PATCHED_ARCHES.add("glm5_next")
 
 
 def _paddleocr_vl_has_batched_vision(vision_module) -> bool:
@@ -4972,6 +6087,91 @@ def _install_gemma3n_compile_patches():
     _PATCHED_ARCHES.add("gemma3n")
 
 
+def _valid_first_sort_key(valid_flat, rows):
+    # The position term keeps keys distinct; MLX argsort is not guaranteed stable.
+    import mlx.core as mx
+
+    return (~valid_flat).astype(mx.int32) * rows + mx.arange(rows)
+
+
+def _static_shape_prefix_rows(features, valid_mask):
+    """Reorder valid rows first; `masked_scatter` never reads past them."""
+    import mlx.core as mx
+
+    rows = features.shape[0] * features.shape[1]
+    flat = features.reshape(rows, features.shape[-1])
+    order = mx.argsort(_valid_first_sort_key(valid_mask.reshape(rows), rows))
+    return mx.take(flat, order, axis=0)
+
+
+def _install_gemma4_unified_compile_patches():
+    module = _try_import_module("mlx_vlm.models.gemma4_unified.gemma4_unified")
+    if module is None:
+        return
+    if getattr(module, "_compact_prefix_rows", None) is not None:
+        setattr(module, "_compact_prefix_rows", _static_shape_prefix_rows)
+
+    model_cls = getattr(module, "Model", None)
+    original_update = getattr(model_cls, "_update_chunked_prefill_mode", None)
+    if original_update is None:
+        return
+
+    def patched_update_chunked_prefill_mode(self, input_ids=None, **kwargs):
+        # Skip `.item()` syncs; `BatchGenerator` reads the language model flag, so restore the config default.
+        if getattr(self, "training", False):
+            self.no_chunked_prefill = self._base_no_chunked_prefill
+            self.language_model.no_chunked_prefill = self._base_no_chunked_prefill
+            return
+        return original_update(self, input_ids=input_ids, **kwargs)
+
+    _patch_method(
+        model_cls,
+        "_update_chunked_prefill_mode",
+        patched_update_chunked_prefill_mode,
+    )
+    _PATCHED_ARCHES.add("gemma4_unified")
+
+
+def _install_gemma4_compile_patches():
+    """Vision overlay on sliding layers only, no host read (upstream's raises under mx.compile)."""
+
+    language_module = _try_import_module("mlx_vlm.models.gemma4.language")
+    text_model_cls = getattr(language_module, "Gemma4TextModel", None)
+    original_make_masks = getattr(text_model_cls, "_make_masks", None)
+    # mlx-vlm < 0.6.1 has no vision overlay and a two-argument `_make_masks`: nothing to fix.
+    if original_make_masks is None or not hasattr(
+        text_model_cls, "_apply_blockwise_bidirectional_overlay"
+    ):
+        return
+    from .utils import _SharedKVSlot
+
+    def patched_make_masks(self, h, cache, mm_token_type_ids=None):
+        # Only generation caches keep upstream's masks.
+        if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
+            return original_make_masks(self, h, cache, mm_token_type_ids)
+        masks = original_make_masks(self, h, cache, None)
+        n = h.shape[1]
+        if (
+            getattr(self.config, "use_bidirectional_attention", None) != "vision"
+            or mm_token_type_ids is None
+            or n <= 1
+        ):
+            return masks
+        positions = mx.arange(n)
+        in_window = mx.abs(positions[:, None] - positions[None]) < self.window_size
+        sliding = in_window & self._apply_blockwise_bidirectional_overlay(
+            language_module.create_causal_mask(n),
+            mm_token_type_ids,
+        )
+        return [
+            sliding if layer.layer_type == "sliding_attention" else mask
+            for layer, mask in zip(self.layers, masks)
+        ]
+
+    _patch_method(text_model_cls, "_make_masks", patched_make_masks)
+    _PATCHED_ARCHES.add("gemma4")
+
+
 def _install_deepseek_ocr_compile_patches():
     """Install DeepSeek OCR compile patches for SAM/projector/image merging."""
 
@@ -5751,8 +6951,8 @@ def _install_phi4_multimodal_patches():
 
         has_images = pixel_values is not None
         has_audio = input_audio_embeds is not None and input_audio_embeds.size > 0
-        if has_images or has_audio:
-            self.set_modality(has_image=has_images, has_audio=has_audio)
+        # Text alone runs on the base weights, as the reference does; upstream skips the switch and keeps the last input's.
+        self.set_modality(has_image=has_images, has_audio=has_audio)
 
         if not has_images and not has_audio:
             return InputEmbeddingsFeatures(
@@ -5818,7 +7018,18 @@ def _install_phi4_multimodal_patches():
             )
         return InputEmbeddingsFeatures(inputs_embeds=outputs)
 
+    def patched_phi4mm_set_weight_by_key(self, key, value):
+        # `set_modality` swaps the decoder between its vision and speech weights; under a LoRA adapter the wrapped linear computes.
+        *parents, name = key.split(".")
+        target = self
+        for part in parents:
+            target = target[int(part)] if part.isdigit() else getattr(target, part)
+        if "lora_a" in target and "linear" in target:
+            target = target.linear
+        setattr(target, name, value)
+
     _patch_method(phi4mm_vision_module.VisionTower, "__call__", patched_phi4mm_vision_tower_call)
+    _patch_method(phi4mm_module.Model, "_set_weight_by_key", patched_phi4mm_set_weight_by_key)
     patched_phi4mm_get_input_embeddings._unsloth_static_vlm_metadata = ("spatial_shapes",)
     _patch_method(phi4mm_module.Model, "get_input_embeddings", patched_phi4mm_get_input_embeddings)
     _PATCHED_ARCHES.add("phi4mm")
@@ -5870,7 +7081,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             name="qwen3_family_multimodal",
             description="Qwen3 VL family merge, deepstack, and vision patch set.",
             matcher=lambda arch, report: (
-                arch in {"qwen3_vl", "qwen3_5", "qwen3_5_moe"}
+                arch in {"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"}
                 or (arch.startswith("qwen3") and "qwen3_deepstack_multimodal" in report.pattern_traits)
             ),
             primitive_names=(
@@ -5957,6 +7168,25 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             runtime_primitive_names=("deepseek_ocr_multimodal_runtime",),
         ),
         CompilePatternBundle(
+            name="gemma4_unified_multimodal",
+            description="Gemma 4 unified padded-feature compaction and chunked-prefill bookkeeping.",
+            matcher=lambda arch, report: arch == "gemma4_unified",
+            primitive_names=(
+                "static_shape_feature_compaction",
+                "training_prefill_mode_bypass",
+            ),
+            adapter_name="gemma_vision_family",
+            protocol_names=("multimodal_merge",),
+            runtime_primitive_names=("gemma4_unified_multimodal_runtime",),
+        ),
+        CompilePatternBundle(
+            name="gemma4_vision_masks",
+            description="Gemma 4 vision attention masks for cache-free forwards, built as the reference does without a host read.",
+            matcher=lambda arch, report: arch == "gemma4",
+            primitive_names=("presence_check_bypass",),
+            runtime_primitive_names=("gemma4_vision_masks_runtime",),
+        ),
+        CompilePatternBundle(
             name="masked_scatter_multimodal",
             description="Shared compile-safe flattened masked-scatter replacement.",
             matcher=lambda arch, report: (
@@ -6026,6 +7256,70 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             adapter_name="phi_placeholder_family",
             protocol_names=("placeholder_expansion", "multimodal_merge", "cached_image_features"),
             runtime_primitive_names=("phi4_multimodal_spans_runtime",),
+        ),
+        CompilePatternBundle(
+            name="dots_ocr_vision_compile",
+            description="dots_ocr vision grid-metadata and merge compile patch set.",
+            matcher=lambda arch, report: arch == "dots_ocr",
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+            ),
+            runtime_primitive_names=("dots_ocr_vision_compile_runtime",),
+        ),
+        CompilePatternBundle(
+            name="grid_metadata_vision_compile",
+            description="Vision grid-metadata compile patch set for towers that read the grid on the host.",
+            matcher=lambda arch, report: arch
+            in {"muse_glimmer", "minimax_m3_vl", "kimi_k3"},
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+            ),
+            runtime_primitive_names=(
+                "muse_glimmer_vision_compile_runtime",
+                "kimi_k3_vision_compile_runtime",
+                "minimax_m3_vl_vision_compile_runtime",
+            ),
+        ),
+        CompilePatternBundle(
+            name="ernie4_5_moe_vl_vision_compile",
+            description="ernie4_5_moe_vl vision, resampler and merge compile patch set.",
+            matcher=lambda arch, report: arch == "ernie4_5_moe_vl",
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+            ),
+            runtime_primitive_names=("ernie4_5_moe_vl_vision_compile_runtime",),
+        ),
+        CompilePatternBundle(
+            name="glm4v_vision_compile",
+            description="glm4v / glm4v_moe vision grid-metadata, merge and position compile patch set.",
+            matcher=lambda arch, report: arch in {"glm4v", "glm4v_moe"},
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+                "explicit_position_plumbing",
+            ),
+            runtime_primitive_names=(
+                "glm4v_vision_compile_runtime",
+                "glm4v_moe_vision_compile_runtime",
+            ),
+        ),
+        CompilePatternBundle(
+            name="glm5_next_vision_compile",
+            description="glm5_next vision grid-metadata compile patch set.",
+            matcher=lambda arch, report: arch == "glm5_next",
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+            ),
+            runtime_primitive_names=("glm5_next_vision_compile_runtime",),
         ),
         CompilePatternBundle(
             name="glm_ocr_vision_compile",
@@ -6121,12 +7415,24 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
         "single_image_token_merge_runtime": _install_llama_pixtral_mistral_compile_patches,
         "mistral4_attention_backend_runtime": _install_mistral4_compile_patches,
         "gemma3n_multiscale_fusion_runtime": _install_gemma3n_compile_patches,
+        "gemma4_unified_multimodal_runtime": _install_gemma4_unified_compile_patches,
+        "gemma4_vision_masks_runtime": _install_gemma4_compile_patches,
         "deepseek_ocr_multimodal_runtime": _install_deepseek_ocr_compile_patches,
         "masked_scatter_multimodal_runtime": _install_masked_scatter_multimodal_patches,
         "padded_image_filtering_runtime": _install_idefics_family_compile_patches,
         "negative_image_placeholders_runtime": _install_negative_image_placeholder_patches,
         "expanded_image_placeholders_runtime": _install_expanded_image_placeholder_patches,
         "phi4_multimodal_spans_runtime": _install_phi4_multimodal_patches,
+        "dots_ocr_vision_compile_runtime": _install_dots_ocr_compile_patches,
+        "kimi_k3_vision_compile_runtime": _install_kimi_k3_compile_patches,
+        "muse_glimmer_vision_compile_runtime": _install_muse_glimmer_compile_patches,
+        "minimax_m3_vl_vision_compile_runtime": _install_minimax_m3_vl_compile_patches,
+        "ernie4_5_moe_vl_vision_compile_runtime": _install_ernie4_5_moe_vl_compile_patches,
+        "glm4v_vision_compile_runtime": partial(_install_glm4v_family_compile_patches, "glm4v"),
+        "glm4v_moe_vision_compile_runtime": partial(
+            _install_glm4v_family_compile_patches, "glm4v_moe"
+        ),
+        "glm5_next_vision_compile_runtime": _install_glm5_next_compile_patches,
         "glm_ocr_vision_compile_runtime": _install_glm_ocr_compile_patches,
         "paddleocr_vl_multimodal_runtime": _install_paddleocr_vl_compile_patches,
     }

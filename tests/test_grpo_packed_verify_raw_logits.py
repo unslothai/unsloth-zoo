@@ -70,10 +70,15 @@ class _Model(torch.nn.Module):
         return SimpleNamespace(logits = h if self.hidden_states else self.head(h))
 
 
+def _line_at(src, needle):
+    """Start of the line holding `needle`, so the slice dedents at any body indent."""
+    return src.rindex("\n", 0, src.index(needle)) + 1
+
+
 def _packed_block_source():
     src = inspect.getsource(rr.grpo_accumulated_loss)
-    start = src.index("    new_logprobs = None")
-    end = src.index("    # ---- PrefixGrouper resolution")
+    start = _line_at(src, "    new_logprobs = None")
+    end = _line_at(src, "    # ---- PrefixGrouper resolution")
     return textwrap.dedent(src[start:end])
 
 

@@ -140,7 +140,8 @@ def _install_vlm_types(monkeypatch):
     lora_module = types.ModuleType("mlx_vlm.trainer.lora_layers")
     lora_module.LoRASwitchLinear = VLMLoRASwitchLinear
     monkeypatch.setitem(sys.modules, switch_module.__name__, switch_module)
-    monkeypatch.setitem(sys.modules, lora_module.__name__, lora_module)
+    for name in (lora_module.__name__, "mlx_vlm.trainer.peft.lora_layers"):
+        monkeypatch.setitem(sys.modules, name, lora_module)
     return VLMSwitchLinear, VLMQuantizedSwitchLinear, VLMLoRASwitchLinear
 
 

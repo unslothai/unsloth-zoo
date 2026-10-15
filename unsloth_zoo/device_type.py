@@ -14,6 +14,7 @@
 
 __all__ = [
     "is_hip",
+    "npu_is_available",
     "get_amd_attention_implementation",
     "get_amd_flash_attn_func",
     "get_device_type",
@@ -210,6 +211,29 @@ def _amd_installation_hint():
 pass
 
 @functools.cache
+def npu_is_available():
+    """torch.npu present AND usable; guarded since importing torch_npu without a driver raises."""
+    if _IS_MLX:
+        return False
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        import importlib.util
+        if importlib.util.find_spec("torch_npu") is None:
+            return False
+        try:
+            import torch_npu  # noqa: F401
+        except Exception:
+            return False
+        npu = getattr(torch, "npu", None)
+        if npu is None:
+            return False
+    try:
+        return bool(npu.is_available())
+    except Exception:
+        return False
+pass
+
+@functools.cache
 def is_hip():
     if _IS_MLX:
         return False
@@ -377,6 +401,9 @@ def get_device_type():
         return "cuda"
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return "xpu"
+    # After xpu so a host with both keeps xpu.
+    elif npu_is_available():
+        return "npu"
     if hasattr(torch, "accelerator"):
         if not torch.accelerator.is_available():
             # Test-only CPU fallback; get_device_type is @functools.cache'd.
@@ -388,9 +415,9 @@ def get_device_type():
                 raise NotImplementedError(amd_hint)
             raise NotImplementedError("Unsloth cannot find any torch accelerator? You need a GPU.")
         accelerator = str(torch.accelerator.current_accelerator())
-        if accelerator in ("cuda", "xpu", "hip"):
+        if accelerator in ("cuda", "xpu", "hip", "npu"):
             raise RuntimeError(
-                f"Unsloth: Weirdly `torch.cuda.is_available()`, `torch.xpu.is_available()` and `is_hip` all failed.\n"\
+                f"Unsloth: Weirdly `torch.cuda.is_available()`, `torch.xpu.is_available()`, `torch.npu.is_available()` and `is_hip` all failed.\n"\
                 f"But `torch.accelerator.current_accelerator()` works with it being = `{accelerator}`\n"\
                 f"Please reinstall torch - it's most likely broken :("
             )
@@ -417,6 +444,8 @@ def get_device_count():
         return torch.cuda.device_count()
     elif DEVICE_TYPE == "xpu":
         return torch.xpu.device_count()
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.device_count()
     else:
         return 1
 pass
@@ -443,7 +472,7 @@ if DEVICE_TYPE == "hip":
 pass
 
 def device_synchronize():
-    """Cross-platform torch.cuda.synchronize() (CUDA, XPU, or HIP)."""
+    """Cross-platform torch.cuda.synchronize() (CUDA, XPU, HIP or NPU)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -451,10 +480,13 @@ def device_synchronize():
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "synchronize"):
                 torch.xpu.synchronize()
+    elif DEVICE_TYPE == "npu":
+        if npu_is_available() and hasattr(torch.npu, "synchronize"):
+            torch.npu.synchronize()
 pass
 
 def device_empty_cache():
-    """Cross-platform torch.cuda.empty_cache() (CUDA, XPU, or HIP)."""
+    """Cross-platform torch.cuda.empty_cache() (CUDA, XPU, HIP or NPU)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -462,10 +494,13 @@ def device_empty_cache():
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "empty_cache"):
                 torch.xpu.empty_cache()
+    elif DEVICE_TYPE == "npu":
+        if npu_is_available() and hasattr(torch.npu, "empty_cache"):
+            torch.npu.empty_cache()
 pass
 
 def device_is_bf16_supported():
-    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, or HIP)."""
+    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, HIP or NPU)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             return torch.cuda.is_bf16_supported()
@@ -473,6 +508,9 @@ def device_is_bf16_supported():
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "is_bf16_supported"):
                 return torch.xpu.is_bf16_supported()
+    elif DEVICE_TYPE == "npu":
+        if npu_is_available() and hasattr(torch.npu, "is_bf16_supported"):
+            return torch.npu.is_bf16_supported()
     return False
 pass
 

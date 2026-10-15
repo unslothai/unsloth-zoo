@@ -50,13 +50,17 @@ def dtype_from_config(config):
             dtype = getattr(config, dtype_name, None)
     return dtype
 
+def _as_torch_dtype(dtype):
+    # 5.x only converts a string dtype in __init__; later strings reach torch ops (#1556)
+    return getattr(torch, dtype, dtype) if isinstance(dtype, str) else dtype
+
 def set_dtype_in_config(config, dtype):
     try:
         string_dtype = str(dtype).split(".")[-1] if isinstance(dtype, torch.dtype) else dtype
         if HAS_TORCH_DTYPE:
             setattr(config, "torch_dtype", string_dtype)
         else:
-            setattr(config, "dtype", string_dtype)
+            setattr(config, "dtype", _as_torch_dtype(dtype))
     except:
         set_dtype_in_config_fallback(config, string_dtype)
 
@@ -66,7 +70,7 @@ def set_dtype_in_config_fallback(config, dtype):
         if HAS_TORCH_DTYPE:
             config.__dict__["torch_dtype"] = string_dtype
         else:
-            config.__dict__["dtype"] = string_dtype
+            config.__dict__["dtype"] = _as_torch_dtype(dtype)
     except:
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Failed to set dtype in config, fallback failed too")
@@ -126,6 +130,55 @@ def _transformers_model_module_names() -> tuple:
 def _transformers_model_module_name_set() -> frozenset:
     """Membership form of the above: the two lookups below were linear scans."""
     return frozenset(_transformers_model_module_names())
+
+
+def _standardize_model_types(model_types) -> list:
+    # Drops "" (sub-config default); the rest go into an import path, so plain names only
+    final_model_types = []
+    for model_type in (model_types or []):
+        model_type = model_type.lower()
+        model_type = model_type.replace("-", "_")
+        model_type = model_type.replace("/", "_")
+        model_type = model_type.replace(".", "_")
+        if not model_type.strip():
+            continue
+        if not re.fullmatch(r"[a-z0-9_]+", model_type):
+            raise ValueError(f"Unsloth: Invalid model_type {model_type!r} in config.")
+        final_model_types.append(model_type)
+    return final_model_types
+pass
+
+
+_MAX_INSTANCE_CONFIG_NODES = 1024
+
+
+def _instance_attribute_model_types(config) -> list:
+    # to_dict() writes the class model_type, so remote configs naming themselves only on
+    # the instance (Ling-2.6-flash: class "", instance "bailing_hybrid") serialize as ""
+    found, seen, stack = [], set(), [config]
+    while stack and len(seen) < _MAX_INSTANCE_CONFIG_NODES:
+        obj = stack.pop(0)
+        if obj is None or id(obj) in seen: continue
+        seen.add(id(obj))
+        model_type = getattr(obj, "model_type", None)
+        if isinstance(model_type, str) and model_type.strip():
+            found.append(model_type)
+        attributes = getattr(obj, "__dict__", None)
+        if not isinstance(attributes, dict): continue
+        for value in attributes.values():
+            if isinstance(value, (list, tuple)):
+                candidates = value
+            elif isinstance(value, dict):
+                candidates = value.values()
+            else:
+                candidates = (value,)
+            for candidate in candidates:
+                # Not duck typed: Mock objects would mint children forever
+                if isinstance(candidate, PretrainedConfig): stack.append(candidate)
+        pass
+    pass
+    return found
+pass
 
 
 def get_transformers_model_type(config, trust_remote_code=False):
@@ -226,27 +279,13 @@ def get_transformers_model_type(config, trust_remote_code=False):
                     stack.extend(obj)
         model_types = list(find(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
     pass
-    # `find` above returns a list, so an unresolved config arrives here as [], never
-    # None - an `is None` check would let it through and every consumer indexes [0]
-    # or joins the list. Treat empty and None the same.
-    if not model_types:
-        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
-    # Standardize model_type
-    final_model_types = []
-    for model_type in model_types:
-        model_type = model_type.lower()
-        model_type = model_type.replace("-", "_")
-        model_type = model_type.replace("/", "_")
-        model_type = model_type.replace(".", "_")
-        # PretrainedConfig.model_type defaults to "", so any nested sub-config that does
-        # not override it (dbrx attn_config/ffn_config, got_ocr2, qwen3_omni_moe) shows up
-        # here as an empty sentinel that says nothing about the architecture
-        if not model_type.strip():
-            continue
-        # model_type is interpolated into an import path, so it must be a plain module name
-        if not re.fullmatch(r"[a-z0-9_]+", model_type):
-            raise ValueError(f"Unsloth: Invalid model_type {model_type!r} in config.")
-        final_model_types.append(model_type)
+    from_instance_attribute = False
+    final_model_types = _standardize_model_types(model_types)
+    if not final_model_types:
+        final_model_types = _standardize_model_types(
+            _instance_attribute_model_types(config)
+        )
+        from_instance_attribute = bool(final_model_types)
     # Every candidate was an empty sentinel, so the architecture is still unknown
     if not final_model_types:
         raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
@@ -260,7 +299,10 @@ def get_transformers_model_type(config, trust_remote_code=False):
     _REMOTE_CODE_MODEL_TYPES = {"nemotron_h", "nemotronh_nano_vl_v2",}
     found_type = False
     for j, model_type in enumerate(final_model_types):
-        if model_type in _REMOTE_CODE_MODEL_TYPES:
+        if from_instance_attribute:
+            # Remote code; trimming would rewrite eg llama_foo to the wrong llama path
+            found_type = True
+        elif model_type in _REMOTE_CODE_MODEL_TYPES:
             found_type = True
         elif model_type not in all_model_types:
             # Try trimming, e.g. gemma3_text -> gemma3

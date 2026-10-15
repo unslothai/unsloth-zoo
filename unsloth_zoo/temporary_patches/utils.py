@@ -16,6 +16,11 @@
 
 __all__ = [
     "patch_function",
+    "UNSLOTH_DECODE_COMPILE",
+    "unsloth_decode_compile",
+    "eager_decode_active",
+    "unsloth_eager_decode",
+    "torch_compiler_disable_unless_decode",
     "compile_with_eager_fallback",
     "patch_function_past_key_values",
     "process_return",
@@ -42,8 +47,10 @@ __all__ = [
     "apply_pending_eager_fallbacks",
     "torch_compile_with_fallback",
 ]
+import contextlib
 import functools
 import inspect
+import threading
 import weakref
 import typing as t
 import torch
@@ -172,6 +179,9 @@ from importlib.machinery import ModuleSpec as _ModuleSpec
 # isinstance(weight, AffineQuantizedTensor), which needs a real type.
 class _ROCmSentinelMeta(type):
     def __getattr__(cls, name):
+        # Dunders must miss: a sentinel __wrapped__ sends inspect.unwrap down an endless chain.
+        if name.startswith("__"):
+            raise AttributeError(name)
         child = _ROCmSentinelMeta(name, (), {"__module__": cls.__module__})
         setattr(cls, name, child)
         return child
@@ -196,8 +206,13 @@ def _rocm_make_torchao_stub(name):
     mod.__path__    = []
     mod.__package__ = name
     mod.__spec__    = _MS(name, loader=None)
+    # Below every minimum: without torchao dist-info, transformers 5 parses this.
+    mod.__version__ = "0.0.0"
 
     def _getattr(attr):
+        # Dunders must miss: inspect calls __file__.endswith() on every module in sys.modules.
+        if attr.startswith("__"):
+            raise AttributeError(attr)
         full = f"{name}.{attr}"
         # Reuse an already-imported sub-module; else a sentinel class.
         if full in _s.modules:
@@ -238,9 +253,8 @@ class _ROCmTorchaoFinder(_MetaPathFinder):
 # Only Windows + ROCm (HIP) PyTorch needs this stub -- the one build where
 # `import torchao` crashes on the missing torch.distributed C-extension stack.
 # Elsewhere a failing import just means torchao isn't installed (transformers
-# handles that), and the stub would be harmful: is_torchao_available() reads a
-# sentinel torchao.__version__ and crashes in packaging.version.parse() with
-# "'_ROCmSentinelMeta' object is not iterable".
+# handles that), and the stub would be harmful: it makes torchao look present,
+# so anything probing the package gets stub answers instead of a clean miss.
 _is_windows_rocm = False
 if _sys_rocm_stub.platform == "win32":
     try:
@@ -1431,8 +1445,8 @@ def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
     compiled = _raw_torch_compile(fullgraph = fullgraph, dynamic = dynamic)(func)
     # Without fullgraph Dynamo already falls back by itself.
     if not fullgraph:
-        return compiled
-    return _fall_back_to_eager_on_recompile_limit(compiled, func, label)
+        return eager_under_zero3(func, compiled)
+    return eager_under_zero3(func, _fall_back_to_eager_on_recompile_limit(compiled, func, label))
 
 
 # Call sites that have already given up, by label. Outlives the wrappers, which
@@ -1905,6 +1919,10 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     def wrapper(*args, **kwargs):
         if state["eager"]:
             return eager_func(*args, **kwargs)
+        if torch.compiler.is_compiling():
+            # Inlined by an enclosing compile: the bookkeeping below would guard its
+            # graph on `state["compiler_off"] is None`, recompiling it on the next call.
+            return compiled_func(*args, **kwargs)
         if state["compiler_off"] is None:
             state["compiler_off"] = dynamo_tracing_disabled()
         if state["compiler_off"]:
@@ -2077,6 +2095,196 @@ def _settle_abandoned_checkpoint_generator():
     return True
 
 
+# True only while generate() runs a compiled decode step for a model that opted in. A
+# one-element list so Dynamo guards on the value and retraces when it flips.
+UNSLOTH_DECODE_COMPILE = [False]
+# [weakref to an eager stance Unsloth installed (True if torch has none), stance it replaced]
+UNSLOTH_EAGER_STANCE_OWNED = []
+
+
+def _owned_stance(entry):
+    return True if entry[0] is True else entry[0]()
+
+
+def _drop_dead_stance(ref):
+    owned = UNSLOTH_EAGER_STANCE_OWNED
+    # At interpreter shutdown module globals are cleared (None) before this weakref callback runs.
+    if owned is None:
+        return
+    owned[:] = [e for e in owned if e[0] is not ref]
+
+
+def unsloth_claim_eager_stance(stance, previous = None):
+    try:
+        ref = True if stance is True else weakref.ref(stance, _drop_dead_stance)
+    except TypeError:
+        ref = True
+    UNSLOTH_EAGER_STANCE_OWNED.append([ref, previous])
+
+
+def _owned_entry(current):
+    for entry in UNSLOTH_EAGER_STANCE_OWNED:
+        if entry[0] is True or _owned_stance(entry) is current:
+            return entry
+    return None
+
+
+def unsloth_owns_stance(current):
+    return _owned_entry(current) is not None
+
+
+def unsloth_release_stance(current):
+    entry = _owned_entry(current)
+    UNSLOTH_EAGER_STANCE_OWNED[:] = [e for e in UNSLOTH_EAGER_STANCE_OWNED if e is not entry]
+    return None if entry is None else entry[1]
+
+
+_DECODE_COMPILE_LOCK = threading.Lock()
+_DECODE_COMPILE_STATE = {"depth": 0, "stance": None}
+
+
+@contextlib.contextmanager
+def unsloth_decode_compile():
+    """Scope one generate() whose decode step compiles. Reference counted, so overlapping
+    calls keep the flag set until the last one exits. Dynamo runs under the default stance
+    meanwhile: eager_on_recompile, left by earlier eager inference, never compiles a new frame."""
+    set_stance = getattr(torch.compiler, "set_stance", None)
+    with _DECODE_COMPILE_LOCK:
+        _DECODE_COMPILE_STATE["depth"] += 1
+        if _DECODE_COMPILE_STATE["depth"] == 1:
+            UNSLOTH_DECODE_COMPILE[0] = True
+            stance = _current_stance()
+            _DECODE_COMPILE_STATE["stance"] = stance
+            _DECODE_COMPILE_STATE["owned"] = _stance_is_owned()
+            if set_stance is not None and stance is not None and stance[0] != "default":
+                set_stance("default")
+    try:
+        yield
+    finally:
+        with _DECODE_COMPILE_LOCK:
+            _DECODE_COMPILE_STATE["depth"] -= 1
+            if _DECODE_COMPILE_STATE["depth"] == 0:
+                UNSLOTH_DECODE_COMPILE[0] = False
+                stance = _DECODE_COMPILE_STATE["stance"]
+                _DECODE_COMPILE_STATE["stance"] = None
+                if set_stance is not None and stance is not None and stance[0] != "default":
+                    set_stance(stance[0], skip_guard_eval_unsafe = stance[1])
+                    # Restoring installs a new stance object: keep Unsloth's claim on it.
+                    owned = _DECODE_COMPILE_STATE.pop("owned", None)
+                    if owned is not None:
+                        _claim_current_stance(owned[1])
+
+
+# Set while generate() runs an eager decode step (no grad, one new token per row) on this
+# thread. Compiled regions then call their eager original: at one token their guard checks
+# and wrapper cost more than the fusion saves (Qwen3.5-2B, A100: 3.6 s -> 2.8 s per 64 tokens).
+# Thread-local, never set while tracing or with grad on, and only read outside tracing, so
+# training (including on another thread) and any outer compile keep the compiled path.
+_EAGER_DECODE_STATE = threading.local()
+
+
+def eager_decode_active():
+    return getattr(_EAGER_DECODE_STATE, "active", False)
+
+
+@contextlib.contextmanager
+def unsloth_eager_decode():
+    previous = eager_decode_active()
+    _EAGER_DECODE_STATE.active = not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+    try:
+        yield
+    finally:
+        _EAGER_DECODE_STATE.active = previous
+
+
+_SYS_MODULES = __import__("sys").modules
+
+
+def zero3_partitioned_training():
+    """True while a DeepSpeed ZeRO-3 config is live. ZeRO-3 gathers a partitioned weight when eager
+    code reads it, but inside torch.compile the parameter getter hands back the empty placeholder
+    (deepspeed/runtime/zero/parameter_offload.py), so a compiled region reading a child module's
+    weight (the compiled LoRA forward reads lora_A.weight) sees shape (0,) (unsloth#225)."""
+    module = _SYS_MODULES.get("transformers.integrations.deepspeed")
+    ref = getattr(module, "_hf_deepspeed_config_weak_ref", None)
+    config = ref() if ref is not None else None
+    return config is not None and config.is_zero3()
+
+
+def eager_under_zero3(func, compiled):
+    """`compiled`, except under DeepSpeed ZeRO-3 where `func` runs. For the compile paths that
+    do not go through `_eager_during_decode`; carries the same markers. The answer is fixed for a
+    whole run, so a checkpointed pack and its recompute always take the same side."""
+    @functools.wraps(compiled)
+    def zero3_dispatch(*args, **kwargs):
+        if zero3_partitioned_training():
+            return func(*args, **kwargs)
+        return compiled(*args, **kwargs)
+    zero3_dispatch.__wrapped__ = func
+    zero3_dispatch._unsloth_compiled_func = compiled
+    return zero3_dispatch
+
+
+def _eager_during_decode(func, compiled):
+    """`compiled`, except inside `unsloth_eager_decode()` where `func` runs directly. Carries
+    the compiled markers so "is this compiled?" checks and `unwrap_already_compiled` behave
+    exactly as they did on `compiled`. An enclosing compile traces `func`, so its graph-break
+    policy governs: a nested fullgraph region made accelerate >= 1.13's disabled hooks fatal."""
+    @functools.wraps(compiled)
+    def dispatch(*args, **kwargs):
+        if torch.compiler.is_compiling() or eager_decode_active() or zero3_partitioned_training():
+            return func(*args, **kwargs)
+        return compiled(*args, **kwargs)
+    dispatch.__wrapped__ = func
+    dispatch._unsloth_compiled_func = compiled
+    return dispatch
+
+
+def _stance_is_owned():
+    try:
+        import torch._dynamo.eval_frame as eval_frame
+        current = eval_frame._stance
+    except Exception:
+        current = None
+    return _owned_entry(current)
+
+
+def _claim_current_stance(previous = None):
+    try:
+        import torch._dynamo.eval_frame as eval_frame
+        unsloth_claim_eager_stance(eval_frame._stance, previous)
+    except Exception:
+        unsloth_claim_eager_stance(True, previous)
+
+
+def _current_stance():
+    try:
+        import torch._dynamo.eval_frame as eval_frame
+        return (eval_frame._stance.stance, eval_frame._stance.skip_guard_eval_unsafe)
+    except Exception:
+        return None
+
+
+def torch_compiler_disable_unless_decode(func = None, *, recursive = False):
+    """`torch.compiler.disable(recursive = recursive)`, except while Dynamo traces a compiled
+    decode step (`UNSLOTH_DECODE_COMPILE[0]`), which would otherwise graph-break at every layer."""
+    if func is None:
+        return functools.partial(torch_compiler_disable_unless_decode, recursive = recursive)
+    func = getattr(func, "_unsloth_undisabled", func)
+    disabled = torch.compiler.disable(func, recursive = recursive)
+
+    @functools.wraps(func)
+    def forward(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            if UNSLOTH_DECODE_COMPILE[0]:
+                return func(*args, **kwargs)
+        elif eager_decode_active():
+            return func(*args, **kwargs)  # nothing is tracing: skip the disable wrapper
+        return disabled(*args, **kwargs)
+    forward._unsloth_undisabled = func
+    return forward
+
+
 def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     """`torch.compile` that survives cache exhaustion under `fullgraph = True`.
 
@@ -2092,8 +2300,8 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     Reproducible on any GPU by lowering `recompile_limit`; a T4 gets there
     on its own.
 
-    `fullgraph = False` is returned untouched: Dynamo already falls back by
-    itself there, so wrapping would add a layer that can never fire.
+    `fullgraph = False` skips the fallback: Dynamo already falls back by itself
+    there. Both kinds go through `_eager_during_decode`.
 
     This is a BARE decorator: `compiler.py` writes it into every generated
     `unsloth_compiled_cache` module and `rl_replacements.py` applies it directly,
@@ -2105,11 +2313,11 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     def _decorate(func):
         func = unwrap_already_compiled(func)
         compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
-        if not fullgraph:
-            return compiled
-        return _fall_back_to_eager_on_recompile_limit(
-            compiled, func, getattr(func, "__qualname__", None) or repr(func),
-        )
+        if fullgraph:
+            compiled = _fall_back_to_eager_on_recompile_limit(
+                compiled, func, getattr(func, "__qualname__", None) or repr(func),
+            )
+        return _eager_during_decode(func, compiled)
     return _decorate
 
 
@@ -2294,6 +2502,7 @@ def patch_function(
                     new_func, _eager_func,
                     f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}",
                 )
+            new_func = eager_under_zero3(_eager_func, new_func)
     pass
 
     # Stash original under a unique name for later restoration.
