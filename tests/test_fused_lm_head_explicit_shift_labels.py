@@ -35,7 +35,10 @@ def _fused_forward():
     source = compiler.fixup_fused_lm_head(source)
     source, _ = compiler.apply_fused_lm_head(source, "Gemma3ForCausalLM")
     assert "unsloth_fused_ce_loss" in source
+    from _compiled_module_names import fused_loss_header_names
+
     scope = dict(vars(gemma3))
+    scope.update(fused_loss_header_names())
     scope.update(
         os = os,
         UNSLOTH_ENABLE_CCE = False,
