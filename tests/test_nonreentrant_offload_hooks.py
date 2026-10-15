@@ -121,3 +121,43 @@ def test_pinned_charge_matches_the_caching_host_allocator(gc_module):
     torch.cuda.synchronize()
     assert held() - before == gc_module.GC_PINNED_BYTES == 1 << 24  # block reused
     assert torch.equal(offloader.unpack(record), x.detach())
+
+
+class _TwoInputLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Linear(256, 256)
+        self.b = torch.nn.Linear(256, 256)
+
+    def forward(self, h, g):
+        return torch.tanh(self.a(h) + self.b(g)), g * 1.5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+@pytest.mark.parametrize("keep_last", ["0", "1"])
+def test_stream_prefetch_skips_inputs_already_unpacked(gc_module, monkeypatch, keep_last):
+    # Two saved inputs per checkpoint: unpacking the second must not reload the first again.
+    monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", keep_last)
+    torch.manual_seed(0)
+    layers = [_TwoInputLayer().cuda() for _ in range(5)]
+    def run(hooks):
+        torch.manual_seed(1)
+        h = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+        g = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+        x = (h, g)
+        for layer in layers:
+            if hooks is None:
+                h, g = ckpt.checkpoint(layer, h, g, use_reentrant = False)
+            else:
+                with hooks():
+                    h, g = ckpt.checkpoint(layer, h, g, use_reentrant = False)
+        (h.float().square().mean() + g.float().mean()).backward()
+        grads = [x[0].grad.clone(), x[1].grad.clone()] + [p.grad.clone() for l in layers for p in l.parameters()]
+        for l in layers: l.zero_grad(set_to_none = True)
+        return grads
+    ref = run(None)
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = True)
+    for a, b in zip(run(offloader.hooks), ref):
+        assert torch.equal(a, b)
+    assert offloader.stats["prefetched"] > 0
+    assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"]

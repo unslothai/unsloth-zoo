@@ -1545,7 +1545,7 @@ pass
 
 class _OffloadedActivation:
     """One saved activation: a host copy (`copied` marks the D2H), or still a device tensor."""
-    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "index", "pinned_bytes", "__weakref__")
+    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "index", "pinned_bytes", "unpacked", "__weakref__")
 
     def __init__(self, device, index):
         self.device        = device
@@ -1555,6 +1555,7 @@ class _OffloadedActivation:
         self.ready         = None  # set only on a prefetched device_tensor
         self.index         = index
         self.pinned_bytes  = 0
+        self.unpacked      = False
 
     def __del__(self):
         try:
@@ -1653,7 +1654,9 @@ class NonReentrantActivationOffloader:
     def _prefetch(self, index):
         if index < 0 or index >= len(self.order): return
         record = self.order[index]()
-        if record is None or record.host is None or record.device_tensor is not None: return
+        # A checkpoint with several saved inputs unpacks them in order, so index - 1 can be an
+        # input of the same checkpoint that was already handed out: reloading it duplicates it.
+        if record is None or record.unpacked or record.host is None or record.device_tensor is not None: return
         device_index = record.device.index
         compute = torch.cuda.current_stream(device_index)
         side = self._stream(self.h2d_streams, device_index)
@@ -1677,6 +1680,7 @@ class NonReentrantActivationOffloader:
             return x if device is None else x.to(device, non_blocking = True)
         record = packed
         self.backward_started = True
+        record.unpacked = True
         device_index = record.device.index
         compute = torch.cuda.current_stream(device_index)
         if record.device_tensor is not None:
