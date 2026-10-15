@@ -5010,6 +5010,16 @@ def merge_and_overwrite_lora(
         break
     pass
 
+    # Widening a shard holds it and its float32 copy at once, so the peak is the final size
+    # plus one 16-bit shard; prepare_saving only checked the final size.
+    if upcast_to_float32 and not push_to_hub and free < save_size + max_size_in_bytes:
+        raise RuntimeError(
+            f"Unsloth: a float32 merged export of `{model_name}` needs about "
+            f"{(save_size + max_size_in_bytes) / 1024**3:.1f} GB of free disk at its peak, but "
+            f"`{save_directory}` has {free / 1024**3:.1f} GB. Nothing was written. Free disk "
+            f"space, save to a larger volume, or use `output_dtype = None` for a 16-bit merge."
+        )
+
     # Read before Step 1 rewrites config.json: an in-place export would strip the block size.
     _fp8_disk_block_size = (
         _fp8_block_size_on_disk(model_name, token)

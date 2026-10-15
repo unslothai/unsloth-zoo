@@ -129,3 +129,18 @@ def test_upcast_shard_casts_only_16bit_floats(tmp_path):
     before = path.read_bytes()
     _upcast_shard_to_float32(str(tmp_path), "model.safetensors")
     assert path.read_bytes() == before
+
+
+def test_float32_refuses_before_writing_when_disk_cannot_hold_the_rewrite(tmp_path, monkeypatch):
+    # Widening a shard holds it and its float32 copy at once: final size + one 16-bit shard.
+    import shutil
+    base_dir, base, peft_model, adapted = _build("llama", str(tmp_path))
+    shard = sum(os.path.getsize(os.path.join(base_dir, f)) for f in os.listdir(base_dir) if f.endswith(".safetensors"))
+    final = sum(t.numel() * 4 for t in base.values())
+    free = int((final + shard // 2) / 0.95)
+    real = shutil.disk_usage
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: real(p)._replace(free = free))
+    out_dir = tmp_path / "merged"
+    with pytest.raises(RuntimeError, match = "free disk"):
+        H.run_merge(peft_model, base_dir, str(out_dir), save_dtype = torch.float32)
+    assert not any(out_dir.glob("*.safetensors"))
