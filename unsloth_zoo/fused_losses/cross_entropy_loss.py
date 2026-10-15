@@ -20,6 +20,7 @@ __all__ = [
     "compute_fused_ce_loss",
     "unsloth_count_aware_cross_entropy",
     "unsloth_loss_count_kwargs",
+    "unsloth_fsdp_unshard",
 ]
 
 import torch
@@ -66,6 +67,29 @@ def _nonzero_count(n_items):
     if torch.is_tensor(n_items):
         return torch.where(n_items == 0, torch.ones_like(n_items), n_items)
     return n_items if n_items != 0 else 1
+pass
+
+@torch.compiler.disable
+def unsloth_fsdp_unshard(module):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """All-gather an FSDP2-sharded module (lm_head) whose weight the fused losses read without calling it.
+
+    FSDP2 unshards in the module's pre-forward hook, which never fires here; accelerate shards an
+    untied lm_head in its own group, so the weight would reach the matmul as a DTensor (unsloth-zoo#1751).
+    """
+    if module is None or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError:
+        try:
+            from torch.distributed._composable.fsdp import FSDPModule
+        except ImportError:
+            return
+    for submodule in module.modules():
+        if isinstance(submodule, FSDPModule):
+            # No-op once unsharded; post-backward reshards it and reduce-scatters its gradient.
+            submodule.unshard()
 pass
 
 def apply_autograd_function(autograd, mapping):
