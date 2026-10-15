@@ -336,3 +336,13 @@ def test_layer_minus_one_is_the_embedding_output(tmp_path):
         reference = target(input_ids = ids, output_hidden_states = True).hidden_states
     assert torch.allclose(seen[-1].float(), reference[0].float())
     assert torch.allclose(seen[1].float(), reference[2].float())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU to put target layers on two devices")
+def test_context_states_from_layers_on_different_devices():
+    target = _target()
+    drafter = _drafter(target).cuda()
+    cap = run_frozen_target(target, _batch()[0], layer_ids = LAYERS)
+    cap[LAYERS[1]] = cap[LAYERS[1]].cuda()
+    ctx = drafter.context_states(cap)
+    assert ctx.device.type == "cuda" and ctx.shape[-1] == 2 * cap[LAYERS[0]].shape[-1]

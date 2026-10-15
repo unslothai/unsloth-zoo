@@ -298,7 +298,9 @@ class Qwen3DSparkDrafter(nn.Module):
         missing = [i for i in self.target_layer_ids if i not in captured]
         if missing:
             raise KeyError(f"Unsloth: target layers {missing} were not captured.")
-        return torch.cat([captured[i] for i in self.target_layer_ids], dim = -1)
+        # A target sharded over GPUs leaves each layer's states on that layer's device.
+        device = self.lm_head.weight.device
+        return torch.cat([captured[i].to(device) for i in self.target_layer_ids], dim = -1)
 
     def _block_mask(self, anchors, keep, S):
         B, N = anchors.shape
@@ -511,7 +513,7 @@ class UnslothDSparkTrainer(Trainer):
         dtype = next(p for p in drafter.parameters()).dtype
         out = model(drafter.context_states(captured).to(dtype), input_ids, loss_mask, self.args.dspark_num_anchors)
         loss, stats = dspark_loss(
-            drafter, out, teacher_hidden = captured["final"].to(dtype), ce_alpha = self.args.dspark_ce_alpha,
+            drafter, out, teacher_hidden = captured["final"].to(device = out["hidden"].device, dtype = dtype), ce_alpha = self.args.dspark_ce_alpha,
             l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
             decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
             teacher_lm_head_weight = resolve_text_parts(self.target_model)["lm_head"].weight,

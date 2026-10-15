@@ -121,8 +121,9 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
             per_row = target_lm_head_weight.shape[0] * target_lm_head_weight.element_size()
             rows = max(1, min(args.mtp_chunk_size, losses.LOGITS_BUDGET_BYTES // per_row))
             with torch.no_grad():
+                w = target_lm_head_weight
                 teacher_ids = torch.cat([
-                    (chunk.to(target_lm_head_weight.dtype) @ target_lm_head_weight.T).argmax(-1)
+                    (chunk.to(device = w.device, dtype = w.dtype) @ w.T).argmax(-1).to(labels.device)
                     for chunk in teacher_hidden.split(rows)
                 ]).view_as(labels)
             labels = torch.where(labels != -100, teacher_ids, labels)
