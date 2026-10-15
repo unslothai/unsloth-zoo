@@ -3381,9 +3381,100 @@ _OUT_OF_MEMORY_MARKERS = (
 
 # vLLM ReplaySSM (vllm-project/vllm#48018): Mamba2 decode reads a checkpointed
 # state plus the last few tokens' inputs and writes the state back once per
-# window instead of every token. Opt-in with UNSLOTH_VLLM_REPLAYSSM=1; vLLM only
-# accepts it for architectures that declare SupportsReplaySSM.
-_REPLAYSSM_MODEL_TYPES = ("nemotron_h",)
+# window instead of every token. On by default where it qualifies;
+# UNSLOTH_VLLM_REPLAYSSM=0 turns it off. vLLM only accepts it for architectures
+# that declare SupportsReplaySSM.
+# vLLM declares it only on NemotronH, but every Mamba2 hybrid decodes through the same
+# MambaMixer2, which sizes and drives the ring on its own. model_type: (vLLM module,
+# class, hf_config field holding n_groups).
+_REPLAYSSM_MAMBA2_MODELS = {
+    "falcon_h1": ("falcon_h1", "FalconH1ForCausalLM", "mamba_n_groups"),
+    "granitemoehybrid": ("granitemoehybrid", "GraniteMoeHybridForCausalLM", "mamba_n_groups"),
+    "zamba2": ("zamba2", "Zamba2ForCausalLM", "mamba_ngroups"),
+}
+_REPLAYSSM_MODEL_TYPES = ("nemotron_h", *_REPLAYSSM_MAMBA2_MODELS)
+
+
+def _replayssm_ring_hooks(model_cls, n_groups_field):
+    # The class-level state hooks size the hybrid KV page, so they must count the ring
+    # the layers allocate (MambaMixer2.get_state_shape / get_state_dtype).
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateDtypeCalculator,
+        MambaStateShapeCalculator,
+    )
+    shape_fn = model_cls.get_mamba_state_shape_from_config.__func__
+    dtype_fn = model_cls.get_mamba_state_dtype_from_config.__func__
+
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        shapes = shape_fn(cls, vllm_config)
+        cache_config = vllm_config.cache_config
+        if not getattr(cache_config, "use_replayssm", False) or len(shapes) != 2:
+            return shapes
+        return MambaStateShapeCalculator.append_replayssm_ring(
+            base_shapes = shapes,
+            n_groups = getattr(vllm_config.model_config.hf_config, n_groups_field),
+            tp_world_size = vllm_config.parallel_config.tensor_parallel_size,
+            logical_window = cache_config.replayssm_buffer_len,
+            backend = vllm_config.mamba_config.backend,
+        )
+
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        dtypes = dtype_fn(cls, vllm_config)
+        if not getattr(vllm_config.cache_config, "use_replayssm", False) or len(dtypes) != 2:
+            return dtypes
+        return MambaStateDtypeCalculator.append_replayssm_ring(dtypes, vllm_config.model_config.dtype)
+
+    model_cls.get_mamba_state_shape_from_config = classmethod(get_mamba_state_shape_from_config)
+    model_cls.get_mamba_state_dtype_from_config = classmethod(get_mamba_state_dtype_from_config)
+
+
+def _patch_vllm_replayssm_mamba2(model_type):
+    # True once vLLM will accept ReplaySSM for this Mamba2 hybrid. Idempotent. vLLM reads the
+    # capability from a subprocess-cached registry entry, so ModelConfig is patched, not the class.
+    module_name, class_name, n_groups_field = _REPLAYSSM_MAMBA2_MODELS[model_type]
+    try:
+        import importlib
+        from vllm.config.model import ModelConfig
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+            MambaStateShapeCalculator,
+        )
+        model_cls = getattr(importlib.import_module(f"vllm.model_executor.models.{module_name}"), class_name)
+    except Exception:
+        return False
+    capability = ModelConfig.__dict__.get("supports_replayssm")
+    if not (
+        isinstance(capability, property)
+        and hasattr(MambaStateShapeCalculator, "append_replayssm_ring")
+        and hasattr(MambaStateDtypeCalculator, "append_replayssm_ring")
+        and hasattr(model_cls, "get_mamba_state_shape_from_config")
+        and hasattr(model_cls, "get_mamba_state_dtype_from_config")
+    ):
+        return False
+    archs = getattr(ModelConfig, "_unsloth_replayssm_archs", None)
+    if archs is None:
+        archs = set()
+        native = capability.fget
+
+        def supports_replayssm(self):
+            return native(self) or self.architecture in archs
+
+        ModelConfig.supports_replayssm = property(supports_replayssm)
+        ModelConfig._unsloth_replayssm_archs = archs
+    if class_name not in archs:
+        _replayssm_ring_hooks(model_cls, n_groups_field)
+        archs.add(class_name)
+    return True
+
+
+def _vllm_replayssm_mode():
+    # "auto" (unset), "on" or "off".
+    value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return "off"
+    if value in ("1", "true", "on", "yes"):
+        return "on"
+    return "auto"
 
 
 def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
@@ -4356,17 +4447,28 @@ def load_vllm(
         # Only for engines built here: return_args callers (e.g. `vllm serve`) start
         # their own process without the runner setting below.
         replayssm_set_runner = False
-        if os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "0") == "1":
+        replayssm_mode = _vllm_replayssm_mode()
+        # A runner the user forced to V2 would only get the engine refused and rebuilt.
+        if replayssm_mode == "auto" and os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip().lower() in ("1", "true"):
+            replayssm_mode = "off"
+        if replayssm_mode != "off":
             replayssm_skip = _vllm_replayssm_skip_reason(config, good_keys, DEVICE_TYPE)
+            replayssm_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+            if replayssm_skip is None and replayssm_type in _REPLAYSSM_MAMBA2_MODELS \
+                    and not _patch_vllm_replayssm_mamba2(replayssm_type):
+                replayssm_skip = f"this vLLM cannot enable ReplaySSM for {replayssm_type!r}"
             if replayssm_skip is None:
                 engine_args["use_replayssm"] = True
-                print("Unsloth: vLLM ReplaySSM decode enabled (UNSLOTH_VLLM_REPLAYSSM=1).")
+                print(
+                    "Unsloth: vLLM ReplaySSM decode is on for faster Mamba2 rollouts. "
+                    "Set UNSLOTH_VLLM_REPLAYSSM=0 to turn it off."
+                )
                 # vLLM 0.31's Triton ReplaySSM path only runs on Model Runner V1, no longer
                 # the CUDA default. Left set: vLLM caches env reads once the engine is up.
                 if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
                     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
                     replayssm_set_runner = True
-            else:
+            elif replayssm_mode == "on":
                 print(f"Unsloth: UNSLOTH_VLLM_REPLAYSSM=1 ignored: {replayssm_skip}.")
         pass
 
