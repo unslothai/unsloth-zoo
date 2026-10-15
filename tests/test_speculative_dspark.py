@@ -136,12 +136,12 @@ def test_markov_bias_uses_the_teacher_forced_predecessor():
     assert not torch.allclose(base[..., 2, :], moved[..., 2, :])
 
 
-def _reference_loss(drafter, out, final, gamma = 4.0, ce_a = 0.1, l1_a = 0.9, conf_a = 1.0):
+def _reference_loss(drafter, out, final, gamma = 4.0, ce_a = 0.1, l1_a = 0.9, conf_a = 1.0, teacher_w = None):
     em = out["eval_mask"]
     logits = drafter.logits(out["hidden"], out["prev_ids"])
     teacher = torch.gather(final[:, None].expand(-1, em.shape[1], -1, -1), 2,
                            (out["label_index"] - 1).clamp(min = 0)[..., None].expand(-1, -1, -1, final.shape[-1]))
-    p = (teacher @ drafter.lm_head.weight.T).softmax(-1)
+    p = (teacher @ (drafter.lm_head.weight if teacher_w is None else teacher_w).T).softmax(-1)
     q = logits.softmax(-1)
     w = em.double() * torch.exp(-torch.arange(BS, dtype = torch.float64) / gamma)
     ce = torch.nn.functional.cross_entropy(logits.flatten(0, 2), out["target_ids"].flatten(), reduction = "none").view_as(w)
@@ -169,6 +169,36 @@ def test_loss_and_gradients_match_an_unchunked_reference(chunk_size):
     for g, r in zip(grads, ref_grads):
         assert torch.allclose(g, r, atol = 1e-6)
     assert stats["n_tokens"] == int(out["eval_mask"].sum())
+
+
+def test_teacher_is_projected_with_the_target_lm_head():
+    target = _target()
+    drafter = _drafter(target).freeze_shared()
+    ids, lm = _batch()
+    cap, _, out = _run(drafter, target, ids, lm)
+    final = cap["final"].double()
+    torch.manual_seed(3)
+    target_w = drafter.lm_head.weight.detach() + 0.5 * torch.randn_like(drafter.lm_head.weight)
+    loss, _ = dspark_loss(drafter, out, teacher_hidden = final, teacher_lm_head_weight = target_w)
+    _, _, out_ref = _run(drafter, target, ids, lm)
+    assert torch.allclose(loss.double(), _reference_loss(drafter, out_ref, final, teacher_w = target_w), atol = 1e-6)
+    assert not torch.allclose(loss.double(), _reference_loss(drafter, out_ref, final), atol = 1e-4)
+
+
+def test_chunks_respect_the_logits_budget(monkeypatch):
+    from unsloth_zoo.speculative import dspark, losses
+    target = _target()
+    drafter = _drafter(target).freeze_shared()
+    ids, lm = _batch()
+    cap, _, out = _run(drafter, target, ids, lm)
+    final = cap["final"].double()
+    full, _ = dspark_loss(drafter, out, teacher_hidden = final, chunk_size = 1024)
+    sizes, real = [], dspark._row_terms
+    monkeypatch.setattr(dspark, "_row_terms", lambda *a: sizes.append(a[0].shape[0]) or real(*a))
+    monkeypatch.setattr(losses, "LOGITS_BUDGET_BYTES", VOCAB * 4 * 6 * 2)
+    capped, _ = dspark_loss(drafter, out, teacher_hidden = final, chunk_size = 1024)
+    assert sizes and max(sizes) == 2 and sum(sizes) == int(out["eval_mask"].sum())
+    assert torch.allclose(capped, full, atol = 1e-9)
 
 
 def test_save_round_trip_and_schema(tmp_path):
