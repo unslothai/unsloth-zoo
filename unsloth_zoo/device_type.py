@@ -254,12 +254,17 @@ pass
 
 
 def _current_hip_device_index():
-    """Current HIP device index, or None off ROCm (never touches CUDA on NVIDIA).
-    No try/except: get_amd_flash_attn_func runs inside compiled forwards, and dynamo
-    constant-folds is_available / current_device."""
-    if is_hip() and torch.cuda.is_available():
+    """Current HIP device index, or None off ROCm (never touches CUDA on NVIDIA) or when
+    the runtime cannot answer, so the cached probes keep their own fallbacks. No try/except
+    while compiling: get_amd_flash_attn_func runs inside compiled forwards."""
+    if not (is_hip() and torch.cuda.is_available()):
+        return None
+    if torch.compiler.is_compiling():
         return torch.cuda.current_device()
-    return None
+    try:
+        return torch.cuda.current_device()
+    except Exception:
+        return None
 pass
 
 

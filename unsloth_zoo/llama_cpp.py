@@ -1125,7 +1125,8 @@ def _detect_gpu_target():
                 gfx = discrete[0]  # the installer's #7776 rule: a shadowing iGPU defers to the dGPU
             if not gfx.startswith("gfx"):
                 return None
-            if any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in discrete):
+            # Windows source builds are CUDA-only (_gpu_cmake_flags), so keep the prebuilt there.
+            if not IS_WINDOWS and any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in discrete):
                 return None
             return ("rocm", gfx)
         try:

@@ -163,7 +163,7 @@ _CE_BYTES_PER_LOGIT = 16.0
 _CE_TARGET_GB_CAP = 4.0
 
 
-def _free_target_gb():
+def _free_target_gb(device = None):
     """Half the memory actually available to this backend, capped.
 
     `_default_target_gb` already answers this for every backend the zoo supports, and it
@@ -183,14 +183,15 @@ def _free_target_gb():
     # for fused_losses/.tiled_mlp.py and every remote-code save walking this graph fails.
     from unsloth_zoo.tiled_mlp import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
 
-    return min(_default_target_gb(), _CE_TARGET_GB_CAP)
+    return min(_default_target_gb(device), _CE_TARGET_GB_CAP)
 
 
 @functools.cache
-def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
-    """Chunk multiplier sized to fit target max memory usage."""
+def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
+    """Chunk multiplier sized to fit target max memory usage. The automatic budget is read
+    from `device` (the lm_head's), and the cache is keyed on it, so each GPU keeps its own."""
     if target_gb is None:
-        target_gb = _free_target_gb()
+        target_gb = _free_target_gb(device)
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
@@ -208,9 +209,9 @@ def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     return multiplier
 pass
 
-def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0):
+def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Number of chunks that fits the target max memory usage."""
-    multiplier = _get_chunk_multiplier(vocab_size, target_gb, fixed_gb)
+    multiplier = _get_chunk_multiplier(vocab_size, target_gb, fixed_gb, device)
     n_splits = (bsz*qlen) * multiplier
     # n_splits * 4 == (chunk transient GiB) / target. Round UP: nearest-rounding
     # (round(0.5) -> 0) collapses a large transient into one uncapped chunk.
@@ -310,7 +311,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                 fixed_bytes += 2 * grad_lm_head_bias.numel() * grad_lm_head_bias.element_size()
             n_chunks = get_chunk_size(
                 bsz, qlen, vocab_size, target_gb = target_gb,
-                fixed_gb = fixed_bytes / 1024 / 1024 / 1024,
+                fixed_gb = fixed_bytes / 1024 / 1024 / 1024, device = device,
             )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")

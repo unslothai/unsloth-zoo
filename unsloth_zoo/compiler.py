@@ -888,7 +888,7 @@ def replace_sdpa_with_amd_aiter(source):
         block = [
             f"{indent}{_AITER_MARKER}, requires: pip install amd-aiter (ROCm >= 7.0)",
             f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func as {get_fn}",
-            f"{indent}{fn_var} = {get_fn}()",
+            f"{indent}{fn_var} = {get_fn}({q_var}.device)",
             f"{indent}{ok_var} = (",
             f"{indent}    {fn_var} is not None",
             # SDPA aligns causal masks top-left, aiter bottom-right; they agree

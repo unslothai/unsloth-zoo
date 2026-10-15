@@ -23,6 +23,7 @@ caches (set_device switch), the rocminfo mask fallback and the llama.cpp asset t
 import ast
 import importlib.machinery
 import inspect
+import re
 import sys
 import types
 from unittest import mock
@@ -79,7 +80,8 @@ def gc_dtype(monkeypatch, cuda_caps):
         listed = [tuple(c) for c in caps]
         monkeypatch.setattr(device_type, "_visible_cuda_capabilities", lambda: listed, raising = False)
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
-        monkeypatch.setenv("UNSLOTH_DISABLE_DOUBLE_BUFFER", "1")
+        # Not the env var: _double_buffer_disabled is functools.cached and would leak.
+        monkeypatch.setattr(gc, "_double_buffer_disabled", lambda: True)
         monkeypatch.setattr(torch, "empty", empty)
         monkeypatch.setattr(gc, "DEVICE_TYPE", "cuda")
         monkeypatch.setattr(gc, "DEVICE_TYPE_TORCH", "cuda")
@@ -178,6 +180,22 @@ def test_tiled_mlp_reads_the_activation_device():
     assert fake.mem_get_info.call_args.args == (device,)
 
 
+def test_fused_ce_budget_reads_the_head_device_per_device():
+    from unsloth_zoo.fused_losses import cross_entropy_loss as ce
+    fake = _fake_cuda()
+    free = {0: 40 * 1024 ** 3, 1: 2 * 1024 ** 3}
+    fake.mem_get_info.side_effect = lambda device = None: (free[getattr(device, "index", 0) or 0], 0)
+    ce._get_chunk_multiplier.cache_clear()
+    try:
+        with mock.patch.object(tiled_mlp, "DEVICE_TYPE", "cuda"), mock.patch.object(torch, "cuda", fake):
+            big = ce.get_chunk_size(1, 16_384, 151_936, device = torch.device("cuda", 0))
+            small = ce.get_chunk_size(1, 16_384, 151_936, device = torch.device("cuda", 1))
+    finally:
+        ce._get_chunk_multiplier.cache_clear()
+    # The 2 GiB head GPU needs more chunks than the 40 GiB one, not its cached answer.
+    assert small > big, (small, big)
+
+
 # Z3: per-device AMD arch / aiter caches -----------------------------------------------
 
 def _clear_amd_caches():
@@ -231,6 +249,42 @@ def test_amd_caches_take_an_explicit_device(amd_host):
     torch.cuda.set_device(1)
     # An index-less device means the current one, never a stale None-keyed entry.
     assert device_type._detect_gfx_arch("cuda") == "gfx1100"
+
+
+def test_amd_caches_fall_back_when_current_device_raises(amd_host, monkeypatch):
+    # A runtime that cannot answer (e.g. a forked worker) must reach the probes' own fallbacks.
+    def boom():
+        raise RuntimeError("Cannot re-initialize CUDA in forked subprocess")
+    monkeypatch.setattr(torch.cuda, "current_device", boom)
+    assert device_type.get_amd_attention_implementation() in ("sdpa", "amd_aiter")
+
+
+def test_registered_aiter_attention_asks_for_the_query_device(monkeypatch):
+    from unsloth_zoo.temporary_patches import amd_aiter
+    import transformers.integrations.sdpa_attention as sdpa
+    seen = []
+    def getter(device = None):
+        seen.append(device)
+        return None
+    monkeypatch.setattr(device_type, "get_amd_flash_attn_func", getter)
+    monkeypatch.setattr(device_type, "is_hip", lambda: True)
+    monkeypatch.setattr(sdpa, "sdpa_attention_forward", lambda *a, **k: "sdpa")
+    query = types.SimpleNamespace(is_cuda = True, device = torch.device("cuda", 1))
+    assert amd_aiter.aiter_attention_forward(None, query, None, None, None) == "sdpa"
+    assert seen == [torch.device("cuda", 1)]
+
+
+def test_compiled_aiter_rewrite_asks_for_the_query_device(monkeypatch):
+    from unsloth_zoo import compiler
+    monkeypatch.setattr(device_type, "get_amd_attention_implementation", lambda device = None: "amd_aiter")
+    source = (
+        "def forward(self, q, k, v):\n"
+        "    out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)\n"
+        "    return out\n"
+    )
+    rewritten = compiler.replace_sdpa_with_amd_aiter(source)
+    assert compiler._AITER_MARKER in rewritten
+    assert re.search(r"_get_aiter_fn\w*\(\w+\.device\)", rewritten), rewritten
 
 
 # Z2: rocminfo fallback honours HIP masks ----------------------------------------------
@@ -340,6 +394,13 @@ def test_rocm_target_ignores_a_shadowing_igpu(monkeypatch, archs, current):
 def test_rocm_target_lone_igpu_keeps_its_arch(monkeypatch):
     monkeypatch.setattr(llama_cpp, "torch", _fake_torch(archs = ["gfx1103"]))
     assert llama_cpp._detect_gpu_target() == ("rocm", "gfx1103")
+
+
+def test_rocm_target_mixed_family_keeps_the_prebuilt_on_windows(monkeypatch):
+    # Windows has no HIP source build, so a mixed host keeps the current card's bundle.
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", True)
+    monkeypatch.setattr(llama_cpp, "torch", _fake_torch(archs = ["gfx1100", "gfx1201"]))
+    assert llama_cpp._detect_gpu_target() == ("rocm", "gfx1100")
 
 
 def _manifest():
