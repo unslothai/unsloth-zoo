@@ -30,7 +30,6 @@ does not request ReplaySSM.
 __all__ = ["GDN_REPLAYSSM_ARCHITECTURES", "patch_vllm_gdn_replayssm"]
 
 import dataclasses
-import importlib
 import inspect
 import textwrap
 
@@ -47,8 +46,11 @@ _MODEL_HOOK_CLASSES = (
     ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
     ("qwen3_next", "Qwen3NextForCausalLM"),
 )
-_LAYER_MODULE = "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
-_BUILDER_MODULE = "vllm.v1.attention.backends.gdn_attn"
+
+
+def _model_modules():
+    from vllm.model_executor.models import qwen3_5, qwen3_next
+    return {"qwen3_5": qwen3_5, "qwen3_next": qwen3_next}
 
 # (method, exact source fragment in vLLM, replacement). A fragment that is not found
 # exactly once aborts the whole patch.
@@ -311,8 +313,7 @@ def _patch_builder(builder_module):
     Builder._unsloth_replayssm_patched = True
 
 
-def _patch_model_hooks(module_name, class_name):
-    model_cls = getattr(importlib.import_module(f"vllm.model_executor.models.{module_name}"), class_name)
+def _patch_model_hooks(model_cls):
     shape_fn = model_cls.__dict__["get_mamba_state_shape_from_config"].__func__
     dtype_fn = model_cls.__dict__["get_mamba_state_dtype_from_config"].__func__
 
@@ -380,8 +381,9 @@ def _patch_layer(layer_module):
 def patch_vllm_gdn_replayssm():
     """Install GDN ReplaySSM into the imported vLLM. Idempotent; False leaves vLLM untouched."""
     try:
-        layer_module = importlib.import_module(_LAYER_MODULE)
-        builder_module = importlib.import_module(_BUILDER_MODULE)
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as layer_module
+        from vllm.v1.attention import backend as backend_module
+        from vllm.v1.attention.backends import gdn_attn as builder_module
         Layer = layer_module.QwenGatedDeltaNetAttention
         Builder = builder_module.GDNAttentionMetadataBuilder
     except Exception:
@@ -392,16 +394,18 @@ def patch_vllm_gdn_replayssm():
         required = (
             hasattr(layer_module, "causal_conv1d_update")
             and hasattr(layer_module, "is_conv_state_dim_first")
-            and "replayssm_decode_base_cpu" in {f.name for f in dataclasses.fields(
-                importlib.import_module("vllm.v1.attention.backend").CommonAttentionMetadata)}
+            and "replayssm_decode_base_cpu" in {
+                f.name for f in dataclasses.fields(backend_module.CommonAttentionMetadata)
+            }
             and all(
                 n in Layer.__dict__ for n in (*_LAYER_SOURCE_EDITS, "get_state_shape")
             )
         )
         if not required:
             return False
-        for module_name, class_name in _MODEL_HOOK_CLASSES:
-            model_cls = getattr(importlib.import_module(f"vllm.model_executor.models.{module_name}"), class_name)
+        modules = _model_modules()
+        model_classes = [getattr(modules[m], c) for m, c in _MODEL_HOOK_CLASSES]
+        for model_cls in model_classes:
             for hook in ("get_mamba_state_shape_from_config", "get_mamba_state_dtype_from_config"):
                 if hook not in model_cls.__dict__:
                     return False
@@ -415,6 +419,6 @@ def patch_vllm_gdn_replayssm():
     if not _patch_layer(layer_module):
         return False
     _patch_builder(builder_module)
-    for module_name, class_name in _MODEL_HOOK_CLASSES:
-        _patch_model_hooks(module_name, class_name)
+    for model_cls in model_classes:
+        _patch_model_hooks(model_cls)
     return True

@@ -27,7 +27,7 @@ import pytest
 
 VLLM_UTILS = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo" / "vllm_utils.py"
 TREE = ast.parse(VLLM_UTILS.read_text(encoding = "utf-8-sig"))
-CONSTANTS = ("_REPLAYSSM_MAMBA2_MODELS", "_REPLAYSSM_MODEL_TYPES")
+CONSTANTS = ("_REPLAYSSM_MAMBA2_MODELS", "_REPLAYSSM_GDN_MODEL_TYPES", "_REPLAYSSM_MODEL_TYPES")
 HELPERS = ("_vllm_replayssm_mode", "_vllm_replayssm_skip_reason", "_is_vllm_replayssm_refusal")
 
 
@@ -58,7 +58,7 @@ def test_nemotron_h_on_cuda_is_requested(nested):
 
 
 @pytest.mark.parametrize("config, keys, device, why", [
-    (_config("qwen3_next"), KEYS, "cuda", "model type"),
+    (_config("lfm2"), KEYS, "cuda", "model type"),
     (_config("llama"), KEYS, "cuda", "model type"),
     (_config("nemotron_h"), KEYS, "hip", "CUDA only"),
     (_config("nemotron_h"), KEYS, "xpu", "CUDA only"),
