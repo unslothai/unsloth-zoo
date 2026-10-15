@@ -723,10 +723,101 @@ elif DEVICE_TYPE == "xpu":
 elif DEVICE_TYPE == "npu":
     torch_gpu_stream = torch.npu.stream
 
-def _current_gpu_stream(device):
-    if DEVICE_TYPE == "xpu": return torch.xpu.current_stream(device)
-    if DEVICE_TYPE == "npu": return torch.npu.current_stream(device)
-    return torch.cuda.current_stream(device)
+
+def _compute_stream(device_index):
+    """Current compute stream; never cache it at init (callers may train under `torch.cuda.stream(s)`)."""
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.current_stream(device_index)
+    elif DEVICE_TYPE == "xpu":
+        return torch.xpu.current_stream(device_index)
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.current_stream(device_index)
+    raise RuntimeError(f"Unsloth: no compute stream for device type {DEVICE_TYPE}")
+pass
+
+
+def _new_device_event():
+    if DEVICE_TYPE in ("cuda", "hip"):
+        return torch.cuda.Event()
+    elif DEVICE_TYPE == "xpu":
+        return torch.xpu.Event()
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.Event()
+    raise RuntimeError(f"Unsloth: no device events for device type {DEVICE_TYPE}")
+pass
+
+
+# UNSLOTH_GC_PREFETCH=1: during checkpoint k's backward, reload k-1 into the other slot.
+# Only along a verified sequential chain; otherwise falls back to on-demand reload.
+GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
+GC_PREFETCH_STATS = {"issued": 0, "consumed": 0, "dropped": 0}
+OFFLOAD_GENERATION = 0      # bumped at the first offload of every forward
+OFFLOAD_SLOT_META = []      # per CPU_INDEX: (generation, device_index, buffer_slot, new_size, shape, store_dtype)
+PREFETCHED = {}             # device_index -> (generation, cpu_index, buffer_slot)
+LAST_BACKWARD_INDEX = {}    # "last" -> (generation, cpu_index) of the last offloaded backward, any device
+COPY_EVENTS = {}            # (device_index, buffer_slot) -> event recorded after that slot's reload
+
+
+def _reset_gc_prefetch_state():
+    PREFETCHED.clear()
+    LAST_BACKWARD_INDEX.clear()
+    del OFFLOAD_SLOT_META[:]
+pass
+
+
+def _copy_event(device_index, buffer_slot):
+    key = (device_index, buffer_slot)
+    event = COPY_EVENTS.get(key)
+    if event is None:
+        event = COPY_EVENTS[key] = _new_device_event()
+    return event
+pass
+
+
+def _prefetch_offloaded_input(cpu_index, device_index, generation, current_slot):
+    """Queue reload of `cpu_index` into its slot; any doubt returns False (on-demand reload)."""
+    if not GC_PREFETCH or not USE_DOUBLE_BUFFER or GPU_BUFFERS_B is None: return False
+    if cpu_index < 0 or cpu_index >= len(OFFLOAD_SLOT_META): return False
+    meta = OFFLOAD_SLOT_META[cpu_index]
+    if meta is None: return False
+    meta_generation, meta_device, buffer_slot, new_size, shape, store_dtype = meta
+    if meta_generation != generation or meta_device != device_index: return False
+    # The other slot only: the current one is about to be read by this recompute.
+    if buffer_slot == current_slot: return False
+    if PREFETCHED.get(device_index) == (generation, cpu_index, buffer_slot): return False
+    host_buffer = CPU_BUFFERS[cpu_index] if cpu_index < len(CPU_BUFFERS) else None
+    if host_buffer is None or not getattr(host_buffer, HOST_PINNED_ATTR, False): return False
+    gpu_staging = GPU_BUFFERS_B[device_index] if buffer_slot == 1 else GPU_BUFFERS[device_index]
+    if gpu_staging.numel() * gpu_staging.element_size() < new_size: return False
+    if host_buffer.numel() * host_buffer.element_size() < new_size: return False
+    PREFETCHED.pop(device_index, None)
+    try:
+        buffer = _view_bytes_as(gpu_staging, new_size, store_dtype, shape)
+        x = _view_bytes_as(host_buffer, new_size, store_dtype, shape)
+        EXTRA_STREAM = EXTRA_STREAMS[device_index]
+        event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
+        EXTRA_STREAM.wait_event(event_buffer[device_index])
+        with torch_gpu_stream(EXTRA_STREAM):
+            buffer.copy_(x, non_blocking = True)
+            _copy_event(device_index, buffer_slot).record(EXTRA_STREAM)
+    except RuntimeError:
+        GC_PREFETCH_STATS["dropped"] += 1
+        return False
+    PREFETCHED[device_index] = (generation, cpu_index, buffer_slot)
+    GC_PREFETCH_STATS["issued"] += 1
+    return True
+pass
+
+
+def _take_prefetched(device_index, generation, cpu_index, buffer_slot):
+    """Consume a matching prefetch once; a stale or mismatched one is dropped."""
+    entry = PREFETCHED.pop(device_index, None)
+    if entry is None: return False
+    if entry == (generation, cpu_index, buffer_slot):
+        GC_PREFETCH_STATS["consumed"] += 1
+        return True
+    GC_PREFETCH_STATS["dropped"] += 1
+    return False
 pass
 
 CPU_BUFFERS = []
@@ -736,6 +827,9 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
     global FP32_OFFLOAD_EXACT
     FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
+    global GC_PREFETCH
+    GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
+    _reset_gc_prefetch_state()
     global CPU_BUFFERS
     global CPU_INDEX
     global GPU_BUFFERS
@@ -943,14 +1037,17 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         device = arg.device
                         device_index = device.index
                         GPU_BUFFER   = GPU_BUFFERS  [device_index]
-                        # Current, not default stream: in-process vLLM (fast_inference) switches it, and the idle default stream would race the copies.
-                        MAIN_STREAM  = _current_gpu_stream(device)
+                        MAIN_STREAM  = _compute_stream(device_index)
                         EXTRA_STREAM = EXTRA_STREAMS[device_index]
 
                         # Handle interrupted training runs
                         if BACKWARD_PASS:
                             BACKWARD_PASS = False
                             CPU_INDEX = 0
+                            # A new graph: earlier prefetch descriptors and slot records are stale.
+                            global OFFLOAD_GENERATION
+                            OFFLOAD_GENERATION += 1
+                            _reset_gc_prefetch_state()
                             if not FIRST_PASS and not USE_DOUBLE_BUFFER and GPU_BUFFERS_B is not None:
                                 try:
                                     if DEVICE_TYPE in ("cuda", "hip"):
@@ -1040,6 +1137,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM, buffer_slot,)
                         ctx._saved_dtype = arg.dtype
                         ctx._store_dtype = store_dtype
+                        # Prefetch only follows records made by a top level forward of this graph.
+                        ctx._offload_generation = None if in_gradient_checkpoint_recompute() else OFFLOAD_GENERATION
+                        while len(OFFLOAD_SLOT_META) <= CPU_INDEX: OFFLOAD_SLOT_META.append(None)
+                        OFFLOAD_SLOT_META[CPU_INDEX] = None if ctx._offload_generation is None else \
+                            (OFFLOAD_GENERATION, device_index, buffer_slot, new_size, shape, store_dtype)
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -1104,18 +1206,35 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
             x = _view_bytes_as(host_buffer, new_size, store_dtype, shape)
 
-            # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
-            if USE_DOUBLE_BUFFER:
-                # Wait for the last compute on THIS buffer to finish
-                event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
-                EXTRA_STREAM.wait_event(event_buffer[device_index])
-            else:
-                # Single buffer mode: wait for MAIN_STREAM
-                EXTRA_STREAM.wait_stream(MAIN_STREAM)
+            MAIN_STREAM = _compute_stream(device_index)
+            generation = getattr(ctx, "_offload_generation", None)
+            use_prefetch = GC_PREFETCH and USE_DOUBLE_BUFFER and generation is not None \
+                and not in_gradient_checkpoint_recompute()
+            prefetched = use_prefetch and _take_prefetched(device_index, generation, CPU_INDEX, buffer_slot)
+            if not prefetched:
+                # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
+                if USE_DOUBLE_BUFFER:
+                    # Wait for the last compute on THIS buffer to finish
+                    event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
+                    EXTRA_STREAM.wait_event(event_buffer[device_index])
+                else:
+                    # Single buffer mode: wait for the compute stream
+                    EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
-            # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
-            with torch_gpu_stream(EXTRA_STREAM):
-                buffer.copy_(x, non_blocking = host_is_pinned)
+                # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
+                with torch_gpu_stream(EXTRA_STREAM):
+                    buffer.copy_(x, non_blocking = host_is_pinned)
+                    if use_prefetch: _copy_event(device_index, buffer_slot).record(EXTRA_STREAM)
+            pass
+            if use_prefetch:
+                # Sequential chain only: this backward follows CPU_INDEX + 1, or is the top of the graph.
+                last = LAST_BACKWARD_INDEX.get("last")
+                in_chain = (last == (generation, CPU_INDEX + 1)) or \
+                    ((last is None or last[0] != generation) and CPU_INDEX == len(OFFLOAD_SLOT_META) - 1)
+                LAST_BACKWARD_INDEX["last"] = (generation, CPU_INDEX)
+                if in_chain:
+                    _prefetch_offloaded_input(CPU_INDEX - 1, device_index, generation, buffer_slot)
+            pass
         else:
             # No GPU buffer seen
             if len(tensor_indices) != 0:
@@ -1164,7 +1283,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # Wait for GPU buffer to finish
             if CPU_INDEX is not None:
-                MAIN_STREAM.wait_stream(EXTRA_STREAM)
+                if use_prefetch:
+                    # Only this slot's copy: a prefetch queued behind it must not stall the recompute.
+                    MAIN_STREAM.wait_event(_copy_event(device_index, buffer_slot))
+                else:
+                    MAIN_STREAM.wait_stream(EXTRA_STREAM)
                 x = buffer.detach() if store_dtype == saved_dtype else buffer.to(saved_dtype)
                 x.requires_grad_(True)
                 detached_inputs[0] = x
@@ -1348,10 +1471,11 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         BUFFER_EVENTS_A = None
         BUFFER_EVENTS_B = None
         NEXT_BUFFER_SLOT = None
+        # Collect first so tensors only reachable through cycles are freed before the cache is emptied.
+        gc.collect()
         if DEVICE_TYPE == "npu": torch.npu.empty_cache()
         elif DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
         else: torch.cuda.empty_cache()
-        gc.collect()
 
     if (torch.utils.checkpoint.checkpoint.__name__ == "unsloth_checkpoint") and \
         hasattr(torch.utils.checkpoint, "_old_checkpoint"):
@@ -1428,6 +1552,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
     # Reset state for a fresh training run
     CPU_INDEX = 0
     BACKWARD_PASS = True
+    _reset_gc_prefetch_state()
     LAST_GC_INDEX = 0
     FIRST_PASS = True
     CURRENT_GC_INDEX = 0
@@ -1469,10 +1594,11 @@ def reset_unsloth_gradient_checkpointing_buffers():
         except RuntimeError:
             pass
 
+    # Collect first so tensors only reachable through cycles are freed before the cache is emptied.
+    gc.collect()
     if DEVICE_TYPE == "npu": torch.npu.empty_cache()
     elif DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
     else: torch.cuda.empty_cache()
-    gc.collect()
 pass
 
 

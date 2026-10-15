@@ -48,6 +48,7 @@ import torch
 from torch import __version__ as torch_version
 import json
 import psutil
+import copy
 import functools
 import contextlib
 import itertools
@@ -58,6 +59,7 @@ from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
 from .empty_model import (
+    FP8_MOE_SHARED_BLOCK,
     _is_gemma4_config,
     _import_vllm_bnb_loader_module,
     _resolve_safetensors_index,
@@ -110,6 +112,8 @@ def get_target_device(index = 0):
 def _device_empty_cache():
     if DEVICE_TYPE == "npu":
         torch.npu.empty_cache()
+    elif DEVICE_TYPE == "xpu":
+        torch.xpu.empty_cache()
     else:
         torch.cuda.empty_cache()
 pass
@@ -633,7 +637,25 @@ pass
 
 
 def patch_vllm_enable_sleep_mode():
-    from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
+    if DEVICE_TYPE == "xpu":
+        # Probe the module, not the version: nightly XPU builds before 0.23.0 ship it.
+        try:
+            from vllm.device_allocator.xpumem import (
+                XpuMemAllocator as MemAllocator, AllocationData, unmap_and_release,
+                create_and_allocate as create_and_map, _xpu_memcpy_sync,
+                MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                f"Unsloth: vLLM standby mode on XPU requires vLLM >= 0.23.0, but found {vllm_version}.\n"
+                "Please update vLLM, or disable UNSLOTH_VLLM_STANDBY."
+            ) from e
+    else:
+        # Every other device (incl. Ascend NPU) keeps the CUDA route it always took.
+        from vllm.device_allocator.cumem import (
+            CuMemAllocator as MemAllocator, AllocationData, unmap_and_release,
+            create_and_map, libcudart,
+        )
     try:
         from vllm.utils import is_pin_memory_available
     except:
@@ -642,6 +664,14 @@ def patch_vllm_enable_sleep_mode():
     from typing import Optional, Union, Tuple, Any
 
     logger.info(f"Unsloth: Enabling vLLM standby mode")
+
+
+    def _memcpy(dst_ptr, src_ptr, size_in_bytes, device, to_device):
+        if DEVICE_TYPE == "xpu":
+            kind = MEMCPY_HOST_TO_DEVICE if to_device else MEMCPY_DEVICE_TO_HOST
+            _xpu_memcpy_sync(dst_ptr, src_ptr, size_in_bytes, kind, device)
+        else:
+            libcudart.cudaMemcpy(dst_ptr, src_ptr, size_in_bytes)
 
     def __init__(self):
         # Replica of CuMemAllocator.__init__() with a clearer error message only.
@@ -653,7 +683,7 @@ def patch_vllm_enable_sleep_mode():
                 )
 
         self.pointer_to_data: dict[int, AllocationData] = {}
-        self.current_tag: str = CuMemAllocator.default_tag
+        self.current_tag: str = MemAllocator.default_tag
         self.allocator_and_pools: dict[str, Any] = {}
         if hasattr(self, '_python_malloc_callback'):
             # Newer vLLM exposes _python_malloc/free and assigns them to
@@ -670,7 +700,7 @@ def patch_vllm_enable_sleep_mode():
         """Sleep mode: offload allocations with offload_tags to CPU, discard the rest."""
         if offload_tags is None:
             # by default, allocated tensors are offloaded on sleep
-            offload_tags = (CuMemAllocator.default_tag, )
+            offload_tags = (MemAllocator.default_tag, )
         elif isinstance(offload_tags, str):
             offload_tags = (offload_tags, )
 
@@ -699,7 +729,7 @@ def patch_vllm_enable_sleep_mode():
                     device='cpu',
                     pin_memory=is_pin_memory_available())
                 cpu_ptr = cpu_backup_tensor.data_ptr()
-                libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+                _memcpy(cpu_ptr, ptr, size_in_bytes, handle[0], to_device = False)
                 data.cpu_backup_tensor = cpu_backup_tensor
                 cpu_offloads += 1
             logger.debug(f"data's tag is {data.tag} and is offloaded to cpu? {data.tag in offload_tags}")
@@ -729,7 +759,7 @@ def patch_vllm_enable_sleep_mode():
                         size_in_bytes = cpu_backup_tensor.numel(
                         ) * cpu_backup_tensor.element_size()
                         cpu_ptr = cpu_backup_tensor.data_ptr()
-                        libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
+                        _memcpy(ptr, cpu_ptr, size_in_bytes, handle[0], to_device = True)
                         data.cpu_backup_tensor = None
             pass
         pass
@@ -778,10 +808,10 @@ def patch_vllm_enable_sleep_mode():
     vllm.LLM.generate = get_patched_generate(vllm.LLM.generate)
     vllm.AsyncLLMEngine.generate = get_patched_generate(vllm.AsyncLLMEngine.generate)
 
-    CuMemAllocator.__init__ = __init__
-    CuMemAllocator.sleep = sleep
-    CuMemAllocator.wake_up = wake_up
-    CuMemAllocator.print_memory_summary = print_memory_summary
+    MemAllocator.__init__ = __init__
+    MemAllocator.sleep = sleep
+    MemAllocator.wake_up = wake_up
+    MemAllocator.print_memory_summary = print_memory_summary
 pass
 
 
@@ -1087,6 +1117,31 @@ def get_vllm_state_dict(
         return _get_vllm_state_dict(llm, return_state_dict, config, is_vision_model)
 
 
+def _block_scale_rows(start, end, block_size):
+    """Scale rows for weight rows [start, end) of a fused block-FP8 projection.
+
+    The rebuilt layer indexes scales from its own row 0, so a slice is only representable when it
+    starts on a block boundary, or sits inside one block (a block shared by small projections then
+    goes to each of them). A slice starting mid-block and crossing into the next would get the wrong
+    scale for its later rows, so it is refused rather than rebuilt wrongly."""
+    first, last = start // block_size, (end - 1) // block_size
+    if start % block_size != 0 and first != last:
+        raise ValueError(
+            f"Unsloth: a fused block FP8 slice [{start}, {end}) starts inside a {block_size}-row block and "
+            f"crosses into the next one, which cannot be rebuilt with per-block scales."
+        )
+    return first, last + 1
+pass
+
+
+def _block_scale_grid_matches(weight_shape, scale_shape, block_size):
+    """A block FP8 scale grid has ceil(dim / block) entries per dimension, so a dimension smaller
+    than (or not a multiple of) its block still gets one scale for the partial block."""
+    (a, b), (p, q) = tuple(weight_shape), tuple(scale_shape)
+    return -(-a // block_size[0]) == p and -(-b // block_size[1]) == q
+pass
+
+
 def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
@@ -1186,7 +1241,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             offsets = np.cumsum(offsets)
             scale_suffix = '.weight_scale'
             if weight_scale.ndim == 2:
-                if weight_scale.shape[1] > 1:
+                # A block scale over in_features <= block is [n, 1] like per-row, so check vLLM's block flag first.
+                is_block_quant = isinstance(getattr(proj, "weight_block_size", None), (list, tuple))
+                if is_block_quant or weight_scale.shape[1] > 1:
                     # Block quantized: 2D weight scale. vLLM stores it transposed
                     # vs what HF expects (e.g. qwen3 qkv [6144,4096], scale.T [48,32]).
                     scale_suffix = '.weight_scale_inv'
@@ -1203,19 +1260,17 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                             weight_scale = weight_scale.T
                             logger.info(f"Unsloth: Transposed weight scale for {prefix} for weight shape {qweight.shape} and scale shape {weight_scale.shape}")
                     pass
-                    a, b = qweight.shape
-                    p, q = weight_scale.shape
                     # Sanity check against wrongly sliced [0, x] weights
-                    assert a // p == proj.weight_block_size[0] and b // q == proj.weight_block_size[1], f"Unsloth: vLLM weight for {prefix} has unexpected weight shape {qweight.shape} and scale {weight_scale.shape} and block size {proj.weight_block_size}"
+                    assert _block_scale_grid_matches(qweight.shape, weight_scale.shape, proj.weight_block_size), f"Unsloth: vLLM weight for {prefix} has unexpected weight shape {qweight.shape} and scale {weight_scale.shape} and block size {proj.weight_block_size}"
                 else:
                     # Dynamic (per row/column) quant: scale [n,1], weight [4096,6144];
                     # transpose then slice.
                     qweight = qweight.T
                     block_size = 1
 
-                scale_offsets = [x//block_size for x in offsets]
                 if slice_weights:
-                    weight_scale = weight_scale[scale_offsets[kk] : scale_offsets[kk + 1]]
+                    lo, hi = _block_scale_rows(offsets[kk], offsets[kk + 1], block_size)
+                    weight_scale = weight_scale[lo : hi]
 
             if slice_weights:
                 weight = qweight[offsets[kk] : offsets[kk + 1]]
@@ -1298,6 +1353,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     elif hasattr(vllm_internals, "model"): # Standard Language models
         vllm_text_model = vllm_internals.model
         vllm_text_model_prefix = "model"
+        if model_type == "muse_glimmer" and hasattr(config, "text_config"):
+            # vLLM keeps MuseGlimmer's text model at .model; HF nests it at model.language_model
+            vllm_text_model_prefix = "model.language_model"
     elif hasattr(vllm_internals, "language_model"):
         # Llama 3.2 / Gemma 3 / Qwen 2.5 VL keep the text model in model.language_model.model
         if not is_vision_model and not hasattr(config, "text_config"):
@@ -1349,6 +1407,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 if kk not in gemma4_kv_shared_layers:
                     get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
             get_state_dict(f"{prefix}.{o_proj_name}", 0, state_dict, o_proj)
+            # MuseGlimmer: vLLM output_gate_proj is HF self_attn.gate_proj (sigmoid gate on the attention output)
+            output_gate_proj = getattr(layer.self_attn, "output_gate_proj", None)
+            if output_gate_proj is not None:
+                get_state_dict(f"{prefix}.gate_proj", 0, state_dict, output_gate_proj)
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -1423,18 +1485,23 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.w2", 0, state_dict, feed_forward.w2)
         elif not hasattr(layer, "mlp") and hasattr(getattr(experts, "routed_experts", experts), "w13_weight"):
             # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.24: on routed_experts)
-            w13, w2 = vllm_moe_expert_weights(experts, f"layer {kk}", text_config)
+            found = vllm_moe_expert_descriptor(experts, f"layer {kk}", text_config)
             moe_tensors = {
-                f"{prefix}.experts.gate_up_proj": w13,
-                f"{prefix}.experts.down_proj": w2,
+                f"{prefix}.experts.gate_up_proj": found["w13"],
+                f"{prefix}.experts.down_proj": found["w2"],
                 f"{prefix}.gate.weight": feed_forward.gate.weight,
             }
             expert_bias = getattr(feed_forward.gate, "e_score_correction_bias", None)
             if expert_bias is not None:
                 moe_tensors[f"{prefix}.expert_bias"] = expert_bias
+            fp8_keys = set()
+            if found["scheme"] == "fp8_block":
+                for key, name in (("w13", "gate_up_proj"), ("w2", "down_proj")):
+                    fp8_keys.add(f"{prefix}.experts.{name}")
+                    moe_tensors[f"{prefix}.experts.{name}_scale_inv"] = found[f"{key}_scale_inv"]
             for key, value in moe_tensors.items():
-                # float8 also passes is_floating_point(); its scales are not carried over
-                if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                # float8 also passes is_floating_point(); only the descriptor's FP8 experts are allowed
+                if key not in fp8_keys and value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
                     raise NotImplementedError(
                         f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({key}); "
                         "load the model in 16-bit or set fast_inference = False."
@@ -1767,6 +1834,80 @@ def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, che
 pass
 
 
+def _accepted_kwargs(cls, kwargs):
+    """Drop kwargs `cls.__init__` rejects (FP8Linear lost `dtype` in 5.10; Fbgemm `weight_dtype` -> `dtype` in 5.0)."""
+    params = inspect.signature(cls.__init__).parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()): return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+pass
+
+
+def _fp8_experts_class():
+    """transformers' FP8Experts routed through its experts interface (as `replace_with_fp8_linear` builds it)."""
+    try:
+        from transformers.integrations.finegrained_fp8 import FP8Experts, ALL_FP8_EXPERTS_FUNCTIONS
+        from transformers.integrations.moe import use_experts_implementation
+    except Exception:
+        return None
+    return functools.partial(
+        _build_fp8_experts, FP8Experts, ALL_FP8_EXPERTS_FUNCTIONS, use_experts_implementation,
+    )
+pass
+
+
+def _build_fp8_experts(FP8Experts, interface, use_experts_implementation, config, block_size):
+    kwargs = dict(has_bias = False, has_gate = True)
+    try:
+        cls = use_experts_implementation(experts_class = FP8Experts, experts_interface = interface, **kwargs)
+    except TypeError:
+        cls = use_experts_implementation(experts_class = FP8Experts, experts_interface = interface)
+    with torch.device("meta"):
+        return cls(**_accepted_kwargs(FP8Experts, dict(
+            config = config, block_size = tuple(block_size), activation_scheme = "dynamic",
+            scale_fmt = "float", **kwargs,
+        )))
+pass
+
+
+def _swap_in_fp8_experts(new_model, quant_state_dict, config):
+    """Replace each HF experts module whose vLLM experts are block FP8 by a meta FP8Experts.
+
+    The binding loop then points gate_up_proj / down_proj and their *_scale_inv at vLLM's tensors,
+    so nothing is allocated and no float8 tensor is ever cast.
+    """
+    suffix = ".gate_up_proj_scale_inv"
+    names = [k for k in quant_state_dict if k.endswith(".experts" + suffix)]
+    if not names: return
+    build = _fp8_experts_class()
+    if build is None:
+        raise NotImplementedError(
+            "Unsloth: fast_inference with block FP8 MoE experts needs transformers' FP8Experts "
+            "(transformers >= 5), which this transformers does not have. Upgrade transformers, load the "
+            "16-bit (BF16) checkpoint, or set fast_inference = False."
+        )
+    text_config = getattr(config, "text_config", None) or config
+    step3p7_limits = []
+    for name in names:
+        path = name[: -len(suffix)].replace("language_model.model", "language_model")
+        old = new_model.get_submodule(path)
+        experts_config = getattr(old, "config", None) or text_config
+        if getattr(old, "act_fn", None) is torch.nn.functional.silu and getattr(experts_config, "hidden_act", None) is None \
+            and getattr(experts_config, "hidden_activation", None) is None:
+            # LFM2-MoE hard-codes F.silu and names no activation, which FP8Experts reads.
+            experts_config = copy.copy(experts_config)
+            experts_config.hidden_act = "silu"
+        new = build(experts_config, list(FP8_MOE_SHARED_BLOCK))
+        new.requires_grad_(False)
+        new._unsloth_vllm_shared_fp8 = True
+        new_model.set_submodule(path, new)
+        if type(old).__name__ == "Step3p7Experts":
+            step3p7_limits.append((new_model.get_submodule(path.rpartition(".")[0]), getattr(old, "limit", None)))
+    if step3p7_limits:
+        from unsloth_zoo.temporary_patches.step3p7_moe import _adopt_step3p7_fp8_experts
+        _adopt_step3p7_fp8_experts(new_model, step3p7_limits)
+pass
+
+
 def _native_config_for_vllm_rebuild(config):
     """Native config for a trust_remote_code Nemotron-H: vLLM uses native names, and from_config on the remote config fails on its block names ("mamba")."""
     if getattr(config, "model_type", None) != "nemotron_h": return config
@@ -1809,6 +1950,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     quant_method = get_quant_type(config)
     kwargs = dict()
     compute_dtype = dtype  # Do not use config file's dtype!
+    _swap_in_fp8_experts(new_model, quant_state_dict, config)
 
     if quantization_config != {} or bnb_config is not None:
         # Get quantization_config flags
@@ -1931,9 +2073,21 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     _refresh_placeholder_dims(parent, attr_name, raw_value)
                 continue
             elif fp8_weight_scale is not None:
-                if fp8_weight_scale.ndim == 1:
+                if quant_method not in ("fp8", "fbgemm_fp8", "compressed-tensors"):
+                    # load_in_fp8 has no quantization_config: [N, 1] scale = fp8_per_channel, 2D grid = fp8_per_block.
+                    from transformers.integrations.finegrained_fp8 import FP8Linear
+                    from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
+                    kwargs.setdefault("input_scale_ub", None)
+                    kwargs.setdefault("activation_scheme", "dynamic")
+                    kwargs.setdefault("block_size", [128, 128])
+                    # Keep the [N, 1] shape: Unsloth's row kernels (weight_dequant, fp8_linear) key on it.
+                    online_row_fp8 = fp8_weight_scale.ndim == 2 and fp8_weight_scale.shape[1] == 1
+                else:
+                    online_row_fp8 = False
+                if fp8_weight_scale.ndim == 1 or online_row_fp8:
                     # FP8 dynamic/static (not block) quant
-                    layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
+                    fbgemm_kwargs = dict(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype, dtype = dtype)
+                    layer = FbgemmFp8Linear(**_accepted_kwargs(FbgemmFp8Linear, fbgemm_kwargs)).to(get_target_device())
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
                     layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
@@ -1949,7 +2103,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                         fp8_kwargs = dict(in_features=0, out_features=0, bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'], device=get_target_device())
                     else:
                         fp8_kwargs = dict(in_features=0, out_features=0, has_bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'])
-                    layer = FP8Linear(**fp8_kwargs)
+                    layer = FP8Linear(**_accepted_kwargs(FP8Linear, fp8_kwargs))
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
                     layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
@@ -2188,6 +2342,83 @@ def vision_max_num_seqs(
 pass
 
 
+def _kv_cache_elements_per_token(config):
+    """KV cache elements per token: (layers growing with the sequence, [(sliding_window, elements)]).
+    Uses the real head_dim / KV heads per layer, MLA's latent cache, and skips linear-attention
+    (constant state) and KV-shared layers. Unknown layouts count as full attention."""
+    hd       = config.hidden_size
+    n_layers = config.num_hidden_layers
+    n_heads  = _config_get(config, "num_attention_heads", 1) or 1
+    kv_lora_rank = getattr(config, "kv_lora_rank", None)
+    rope_dim = getattr(config, "qk_rope_head_dim", None) or 0
+    mla_head_dim = None
+    if kv_lora_rank:
+        if os.environ.get("VLLM_MLA_DISABLE", "0") in ("0", ""):
+            return (kv_lora_rank + rope_dim) * n_layers, []
+        mla_head_dim = (getattr(config, "qk_nope_head_dim", None) or 0) + rope_dim or None
+
+    layer_types = getattr(config, "layer_types", None)
+    layer_types = list(layer_types) if layer_types is not None else []
+    if len(layer_types) != n_layers: layer_types = ["full_attention"] * n_layers
+    per_layer = getattr(config, "per_layer_config", None)
+    try:
+        per_layer = list(per_layer) if per_layer is not None else []
+    except Exception:
+        per_layer = []
+    if len(per_layer) != n_layers: per_layer = [None] * n_layers
+    n_shared = getattr(config, "num_kv_shared_layers", None) or 0
+    sliding_window = getattr(config, "sliding_window", None)
+
+    def _get(layer, name):
+        value = getattr(layer, name, None) if layer is not None else None
+        if value is None:
+            try:
+                value = getattr(config, name, None)
+            except Exception:
+                value = None
+        return value
+
+    full, sliding = 0, {}
+    for i, (layer_type, layer) in enumerate(zip(layer_types, per_layer)):
+        if i >= n_layers - n_shared: break
+        if layer_type in ("linear_attention", "mamba", "conv"): continue
+        head_dim   = mla_head_dim or _get(layer, "head_dim")
+        n_kv_heads = _get(layer, "num_key_value_heads")
+        if layer is None and layer_type == "full_attention":
+            # Older Gemma-4 configs spell the full-attention shape as global_*.
+            head_dim   = _get(None, "global_head_dim") or head_dim
+            n_kv_heads = _get(None, "num_global_key_value_heads") or n_kv_heads
+        if not head_dim: head_dim = hd // n_heads
+        if not n_kv_heads: n_kv_heads = n_heads
+        # vLLM caches head_size + head_size_v (MiMo-V2: v_head_dim != head_dim).
+        v_head_dim = _get(layer, "v_head_dim") or head_dim
+        elements = (head_dim + v_head_dim) * n_kv_heads
+        window = _get(layer, "sliding_window") or sliding_window
+        if layer_type == "sliding_attention" and window:
+            sliding[window] = sliding.get(window, 0) + elements
+        else:
+            full += elements
+    return full, sorted(sliding.items())
+pass
+
+
+def _kv_cache_tokens(memory_bytes, full_bytes, sliding_bytes, context_length, in_flight_tokens = 2 * 8192):
+    """Longest single sequence the KV cache holds. vLLM keeps window - 1 + in-flight tokens per
+    sliding layer (kv_cache_interface.SlidingWindowSpec); full layers grow with the sequence."""
+    if memory_bytes <= 0: return 0
+    caps = sorted((window + in_flight_tokens, b) for window, b in sliding_bytes)
+    growing = full_bytes + sum(b for _, b in caps)
+    used, start = 0, 0
+    for cap, b in caps:
+        if growing <= 0: break
+        if used + (cap - start) * growing >= memory_bytes: break
+        used += (cap - start) * growing
+        start, growing = cap, growing - b
+    if growing <= 0: return max(context_length, start)
+    return int(start + (memory_bytes - used) / growing)
+pass
+
+
 def approximate_vllm_memory_usage(
     config,
     load_in_4bit = False,
@@ -2202,6 +2433,7 @@ def approximate_vllm_memory_usage(
     parallel_sequences = 64,
     cuda_graph_overhead = True,
     weight_bytes = None,
+    max_num_batched_tokens = 8192, # chunked prefill budget; sliding-window layers keep window + 2x this
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -2224,11 +2456,17 @@ def approximate_vllm_memory_usage(
     n_layers = config.num_hidden_layers
     n_kv_heads = _config_get(config, "num_key_value_heads", 1)
     n_heads    = _config_get(config, "num_attention_heads", 1)
-    # Group Query Attention
-    kv_size = hd // n_heads * n_kv_heads
+    # Real head_dim (Qwen3 / Gemma-3 / gpt-oss); MLA's is rope-only and Gemma-4's raises, so both keep hidden_size / heads.
+    try:
+        head_dim = None if getattr(config, "kv_lora_rank", None) else getattr(config, "head_dim", None)
+    except Exception:
+        head_dim = None
+    head_dim = head_dim or hd // n_heads
+    q_size  = head_dim * n_heads
+    kv_size = head_dim * n_kv_heads
 
     # Modules
-    qkvo = hd + kv_size + kv_size + hd
+    qkvo = q_size + kv_size + kv_size + q_size
     qkvo = qkvo * hd
     if is_moe:
         mlp = n_experts * (hd * moe_size) * 3 + (hd * shared_size) * 3 + hd * n_experts
@@ -2243,8 +2481,8 @@ def approximate_vllm_memory_usage(
     lm_head = 0 if getattr(config, "tie_word_embeddings", True) else vocab_size * hd
 
     # LoRA modules on all QKVO, MLP
-    qkvo_A = hd * max_lora_rank * 4
-    qkvo_B = max_lora_rank * (hd + kv_size + kv_size + hd)
+    qkvo_A = max_lora_rank * (hd * 3 + q_size) # o_proj reads the attention width
+    qkvo_B = max_lora_rank * (q_size + kv_size + kv_size + hd)
     mlp_A  = hd * max_lora_rank * 2 + mlp_size * max_lora_rank
     mlp_B  = max_lora_rank * (mlp_size + mlp_size) + max_lora_rank * hd
     if is_moe:
@@ -2272,7 +2510,9 @@ def approximate_vllm_memory_usage(
 
     # Activation memory - assume bsz=2
     bsz = 2
-    activation_qkv  = max_seq_length * bsz * (hd + kv_size + kv_size)
+    # Stays on hidden_size / heads: it sets vLLM's gpu_memory_utilization, and the real head_dim broke long-context loads.
+    kv_size_hidden  = hd // n_heads * n_kv_heads
+    activation_qkv  = max_seq_length * bsz * (hd + kv_size_hidden + kv_size_hidden)
     residual_memory = (max_seq_length * bsz)*2
     activation_mlp  = max_seq_length * bsz * (mlp_size + mlp_size)
     weights = mlp_size * hd
@@ -2299,7 +2539,7 @@ def approximate_vllm_memory_usage(
 
     # KV cache size (float16 is 2 bytes. float8 is 1.25 bytes)
     float_bytes = 1.25 if float8_kv_cache else 2
-    kv_elements = (kv_size * 2 * n_layers) * float_bytes
+    full_kv_elements, sliding_kv_elements = _kv_cache_elements_per_token(config)
     memory_left_for_kv_cache = free_memory - bytes_for_model
 
     # Account for CUDA graph capture overhead.
@@ -2316,8 +2556,13 @@ def approximate_vllm_memory_usage(
 
     if memory_left_for_kv_cache <= 0: memory_left_for_kv_cache = 0
 
-    # Approx maximum # of KV cache elements
-    max_num_batched_tokens = int(0.95*(memory_left_for_kv_cache / kv_elements))
+    max_num_batched_tokens = _kv_cache_tokens(
+        0.95 * memory_left_for_kv_cache,
+        full_kv_elements * float_bytes,
+        [(window, elements * float_bytes) for window, elements in sliding_kv_elements],
+        context_length,
+        in_flight_tokens = 2 * max(int(max_num_batched_tokens or 0), 8192),
+    )
     # Round by 256
     max_num_batched_tokens = (max_num_batched_tokens // 256) * 256
     # Assuming all requests output max_seq_length, get theoretical max requests
@@ -2383,6 +2628,56 @@ def determine_max_lora_rank(lora_rank = 16):
         f"Unsloth: vLLM does not support LoRA ranks of {lora_rank}.\n"\
         "Only `{possible_max_ranks}` is supported."
     )
+pass
+
+
+def _config_has_gdn_layers(config) -> bool:
+    # All Unsloth Zoo code licensed under LGPLv3
+    text_config = getattr(config, "text_config", None) or config
+    if getattr(text_config, "linear_key_head_dim", None) is not None: return True
+    return "linear_attention" in (getattr(text_config, "layer_types", None) or ())
+pass
+
+
+def _gdn_prefill_kwarg_mismatch(vllm_caller, flashinfer_fn, callee = "chunk_gated_delta_rule_fi"):
+    """Keywords `vllm_caller` passes to `callee` that `flashinfer_fn` does not accept, or None."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        tree = ast.parse(inspect.getsource(vllm_caller))
+        params = inspect.signature(inspect.unwrap(flashinfer_fn)).parameters
+    except (OSError, TypeError, ValueError, SyntaxError):
+        return None
+    passed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == callee:
+            passed.update(k.arg for k in node.keywords if k.arg is not None)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()): return None
+    missing = sorted(passed - set(params))
+    return missing or None
+pass
+
+
+def _flashinfer_gdn_prefill_mismatch():
+    """Why vLLM's FlashInfer GDN prefill call cannot run here, or None.
+
+    vLLM picks FlashInfer for GDN prefill from the GPU alone, then calls
+    flashinfer.gdn_prefill.chunk_gated_delta_rule with its own release's keywords
+    (vLLM 0.31 passes backend=, which flashinfer 0.6.x lacks), so probe the call.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+        caller = gdn.fi_chunk_gated_delta_rule
+    except Exception:
+        return None
+    try:
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+    except Exception as error:
+        return f"flashinfer.gdn_prefill is not importable ({type(error).__name__})"
+    missing = _gdn_prefill_kwarg_mismatch(caller, chunk_gated_delta_rule)
+    if missing:
+        return f"the installed flashinfer's chunk_gated_delta_rule lacks {missing}"
+    return None
 pass
 
 
@@ -2476,6 +2771,62 @@ def _get_torchao_fp8_config(fp8_mode: str):
         granularity = granularity,
         activation_value_lb = 1e-12,
     )
+
+
+# load_in_fp8 -> vLLM online FP8 (training rebuilds FP8Linear, which has a backward; torchao's does not).
+# fp8_per_block: vLLM >= 0.20, fp8_per_channel: >= 0.24; 0.31 rejects quantization="fp8" for BF16.
+_VLLM_ONLINE_FP8_SCHEMES = {"row": "fp8_per_channel", "block": "fp8_per_block"}
+
+
+def _get_vllm_online_fp8_quantization(fp8_mode, quantization_methods = None, device_capability = None):
+    """vLLM's native online FP8 `quantization=` name for fp8_mode, or None when the installed
+    vLLM lacks it (callers then fall back to torchao). UNSLOTH_VLLM_ONLINE_FP8=torchao forces
+    the torchao path, =native skips the Blackwell block fallback below."""
+    if fp8_mode not in _VLLM_ONLINE_FP8_SCHEMES:
+        raise ValueError("Unsloth: `load_in_fp8` supports only 'row' or 'block'")
+    choice = os.environ.get("UNSLOTH_VLLM_ONLINE_FP8", "auto").lower()
+    if choice == "torchao":
+        return None
+    if device_capability is None:
+        try:
+            device_capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+        except Exception:
+            device_capability = None
+    if quantization_methods is None:
+        try:
+            from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+            quantization_methods = QUANTIZATION_METHODS
+        except Exception:
+            return None
+    scheme = _VLLM_ONLINE_FP8_SCHEMES[fp8_mode]
+    if scheme not in quantization_methods:
+        return None
+    # vLLM 0.29 - 0.31 online block scales break DeepGEMM on Blackwell; keep torchao there.
+    if fp8_mode == "block" and choice != "native" and device_capability is not None and device_capability[0] >= 10:
+        print(
+            "Unsloth: vLLM's online per-block FP8 crashes on Blackwell GPUs, so `load_in_fp8 = 'block'` "
+            "uses torchao, which can generate but cannot backprop. To train, use `load_in_fp8 = True` "
+            "(row-wise FP8) or a pre-quantized block FP8 checkpoint. UNSLOTH_VLLM_ONLINE_FP8=native "
+            "forces vLLM's per-block path."
+        )
+        return None
+    return scheme
+
+
+def _vllm_online_fp8_moe_ignore(config):
+    """`ignore` list for vLLM's native online FP8 on a sparse MoE model, else None.
+
+    Routers stay 16-bit like FP8 checkpoints keep them; this also sidesteps vLLM 0.29's CUTLASS
+    per-channel kernel, which asserts when it pads an output dim < 16 (an 8-expert router, a
+    1-wide shared_expert_gate). The routed experts stay 16-bit as well: online FP8 experts use
+    vLLM's online MoE methods, whose tensors the training model cannot share, so quantizing them
+    would make the load fail after the engine was built. The linear layers are still FP8.
+    """
+    text_config = getattr(config, "text_config", None) or config
+    if not any(_config_get(text_config, k) for k in ("num_experts", "num_local_experts", "n_routed_experts")):
+        return None
+    return [r"re:.*\.gate$", r"re:.*\.shared_expert_gate$", r"re:.*\.experts$"]
+pass
 
 
 # Idempotency flag so the piecewise-compile fix is only installed once per process.
@@ -3035,6 +3386,142 @@ _OUT_OF_MEMORY_MARKERS = (
 )
 
 
+# vLLM ReplaySSM (vllm-project/vllm#48018): Mamba2 decode reads a checkpointed
+# state plus the last few tokens' inputs and writes the state back once per
+# window instead of every token. On by default where it qualifies;
+# UNSLOTH_VLLM_REPLAYSSM=0 turns it off. vLLM only accepts it for architectures
+# that declare SupportsReplaySSM.
+# vLLM declares it only on NemotronH, but every Mamba2 hybrid decodes through the same
+# MambaMixer2, which sizes and drives the ring on its own. model_type: (vLLM module,
+# class, hf_config field holding n_groups).
+_REPLAYSSM_MAMBA2_MODELS = {
+    "falcon_h1": ("falcon_h1", "FalconH1ForCausalLM", "mamba_n_groups"),
+    "granitemoehybrid": ("granitemoehybrid", "GraniteMoeHybridForCausalLM", "mamba_n_groups"),
+    "zamba2": ("zamba2", "Zamba2ForCausalLM", "mamba_ngroups"),
+}
+# Gated DeltaNet: backported by unsloth_zoo.vllm_gdn_replayssm, opt-in only (UNSLOTH_VLLM_REPLAYSSM=1).
+_REPLAYSSM_GDN_MODEL_TYPES = (
+    "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
+)
+_REPLAYSSM_MODEL_TYPES = ("nemotron_h", *_REPLAYSSM_MAMBA2_MODELS, *_REPLAYSSM_GDN_MODEL_TYPES)
+
+
+def _replayssm_ring_hooks(model_cls, n_groups_field):
+    # The class-level state hooks size the hybrid KV page, so they must count the ring
+    # the layers allocate (MambaMixer2.get_state_shape / get_state_dtype).
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateDtypeCalculator,
+        MambaStateShapeCalculator,
+    )
+    shape_fn = model_cls.get_mamba_state_shape_from_config.__func__
+    dtype_fn = model_cls.get_mamba_state_dtype_from_config.__func__
+
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        shapes = shape_fn(cls, vllm_config)
+        cache_config = vllm_config.cache_config
+        if not getattr(cache_config, "use_replayssm", False) or len(shapes) != 2:
+            return shapes
+        return MambaStateShapeCalculator.append_replayssm_ring(
+            base_shapes = shapes,
+            n_groups = getattr(vllm_config.model_config.hf_config, n_groups_field),
+            tp_world_size = vllm_config.parallel_config.tensor_parallel_size,
+            logical_window = cache_config.replayssm_buffer_len,
+            backend = vllm_config.mamba_config.backend,
+        )
+
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        dtypes = dtype_fn(cls, vllm_config)
+        if not getattr(vllm_config.cache_config, "use_replayssm", False) or len(dtypes) != 2:
+            return dtypes
+        return MambaStateDtypeCalculator.append_replayssm_ring(dtypes, vllm_config.model_config.dtype)
+
+    model_cls.get_mamba_state_shape_from_config = classmethod(get_mamba_state_shape_from_config)
+    model_cls.get_mamba_state_dtype_from_config = classmethod(get_mamba_state_dtype_from_config)
+
+
+def _widen_vllm_replayssm_capability(class_names):
+    # ModelConfig, not the model class: vLLM reads the capability from a subprocess-cached registry entry.
+    try:
+        from vllm.config.model import ModelConfig
+    except Exception:
+        return False
+    capability = ModelConfig.__dict__.get("supports_replayssm")
+    if not isinstance(capability, property):
+        return False
+    archs = getattr(ModelConfig, "_unsloth_replayssm_archs", None)
+    if archs is None:
+        archs = set()
+        native = capability.fget
+
+        def supports_replayssm(self):
+            return native(self) or self.architecture in archs
+
+        ModelConfig.supports_replayssm = property(supports_replayssm)
+        ModelConfig._unsloth_replayssm_archs = archs
+    archs.update(class_names)
+    return True
+
+
+def _patch_vllm_replayssm_mamba2(model_type):
+    module_name, class_name, n_groups_field = _REPLAYSSM_MAMBA2_MODELS[model_type]
+    try:
+        import importlib
+        from vllm.config.model import ModelConfig
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+            MambaStateShapeCalculator,
+        )
+        model_cls = getattr(importlib.import_module(f"vllm.model_executor.models.{module_name}"), class_name)
+    except Exception:
+        return False
+    if not (
+        isinstance(ModelConfig.__dict__.get("supports_replayssm"), property)
+        and hasattr(MambaStateShapeCalculator, "append_replayssm_ring")
+        and hasattr(MambaStateDtypeCalculator, "append_replayssm_ring")
+        and hasattr(model_cls, "get_mamba_state_shape_from_config")
+        and hasattr(model_cls, "get_mamba_state_dtype_from_config")
+    ):
+        return False
+    if not getattr(model_cls, "_unsloth_replayssm_ring", False):
+        _replayssm_ring_hooks(model_cls, n_groups_field)
+        model_cls._unsloth_replayssm_ring = True
+    return _widen_vllm_replayssm_capability((class_name,))
+
+
+def _patch_vllm_replayssm_gdn():
+    from .vllm_gdn_replayssm import GDN_REPLAYSSM_ARCHITECTURES, patch_vllm_gdn_replayssm
+    if not patch_vllm_gdn_replayssm():
+        return False
+    return _widen_vllm_replayssm_capability(GDN_REPLAYSSM_ARCHITECTURES)
+
+
+def _vllm_replayssm_mode():
+    # "auto" (unset), "on" or "off".
+    value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return "off"
+    if value in ("1", "true", "on", "yes"):
+        return "on"
+    return "auto"
+
+
+def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
+    # None when ReplaySSM should be requested, else why it is not.
+    model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+    if model_type not in _REPLAYSSM_MODEL_TYPES:
+        return f"model type {model_type!r} has no ReplaySSM support in vLLM"
+    if device_type != "cuda":
+        return f"ReplaySSM is CUDA only, this is {device_type}"
+    if "use_replayssm" not in engine_arg_keys:
+        return "this vLLM has no `use_replayssm` engine arg"
+    return None
+
+
+def _is_vllm_replayssm_refusal(error_text):
+    # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2).
+    return "replayssm" in str(error_text).lower()
+
+
 def _is_memory_profiling_race_error(error_text):
     # Another process on a shared GPU freed memory mid-profile. Transient, and
     # retryable by repeating the identical load.
@@ -3213,8 +3700,9 @@ def load_vllm(
     unsloth_vllm_standby   : bool = False,
     is_vision_model        : bool = False,
     return_args            : bool = False, # Just return args
-    max_num_seqs           : int = 256, # how many seqs to process in parallel. Default vLLM 256
+    max_num_seqs           : int = 256, # how many seqs to process in parallel. 256 / None = pick from free memory
     fp8_mode               : Optional[str] = None,
+    max_num_batched_tokens : Optional[int] = None, # chunked prefill budget. None = pick from free memory
     rope_scaling           : Optional[dict] = None, # caller's RoPE scaling, e.g. YaRN past the native window
 ):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -3359,6 +3847,20 @@ def load_vllm(
 
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
+    fp8_moe = fp8_moe_checkpoint_scheme(config)
+    if fp8_moe is not None:
+        shareable, reason = fp8_moe
+        if shareable and _fp8_experts_class() is None:
+            shareable, reason = False, "this transformers has no FP8Experts (transformers >= 5 needed)"
+        if not shareable:
+            raise NotImplementedError(
+                f"Unsloth: fast_inference = True cannot share this FP8 MoE checkpoint's experts with "
+                f"training: {reason}. Supported: block FP8 (quant_method = 'fp8', weight_block_size = "
+                "[128, 128], dynamic activations). Load the 16-bit (BF16) checkpoint, or set "
+                "fast_inference = False."
+            )
+
+    requested_max_num_batched_tokens = max_num_batched_tokens
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
@@ -3374,6 +3876,12 @@ def load_vllm(
         account_for_gradients = training,
         weight_bytes = vllm_weights_memory_usage(
             config, load_in_4bit = use_bitsandbytes, load_in_8bit = is_fp8,
+        ),
+        # Sliding layers hold the prefill budget past their window: max(8192, max_seq_length) for vision models.
+        max_num_batched_tokens = max(
+            8192,
+            max_seq_length if is_vision_model else 0,
+            int(requested_max_num_batched_tokens or 0),
         ),
     )
 
@@ -3591,10 +4099,18 @@ def load_vllm(
         elif memory_left_for_kv_cache_gb <= 80: max_num_batched_tokens, approx_max_num_seqs = 8192, 128 # + 16
         elif memory_left_for_kv_cache_gb >  80: max_num_batched_tokens, approx_max_num_seqs = 8192, 256 # + 16
 
+        # 256 is the signature default, so only another value is an explicit request (as for vision).
+        explicit_max_num_seqs = max_num_seqs not in (None, 256)
+        if explicit_max_num_seqs: approx_max_num_seqs = max(int(max_num_seqs), 1)
+
+        if requested_max_num_batched_tokens is not None:
+            max_num_batched_tokens = max(int(requested_max_num_batched_tokens), 1)
+
         vision_seq_cap = None
         if is_vision_model:
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
-            max_num_batched_tokens = max(8192, max_seq_length)
+            if requested_max_num_batched_tokens is None:
+                max_num_batched_tokens = max(8192, max_seq_length)
             approx_max_num_seqs = vision_max_num_seqs(
                 approx_max_num_seqs, max_num_seqs, config, max_num_batched_tokens,
                 memory_left_for_kv_cache_gb, vllm_version,
@@ -3610,19 +4126,23 @@ def load_vllm(
         if not enable_chunked_prefill:
             max_num_batched_tokens = max(max_num_batched_tokens, max_seq_length)
 
-        # float8 KV cache fits more sequences -> more throughput
-        if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
+        if not explicit_max_num_seqs:
+            if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
 
-        # Scale num_seqs by conservativeness
-        approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
-        approx_max_num_seqs = max(approx_max_num_seqs, 1)
-        if vision_seq_cap is not None:
-            approx_max_num_seqs = min(approx_max_num_seqs, vision_seq_cap)
+            approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
+            approx_max_num_seqs = max(approx_max_num_seqs, 1)
+            if vision_seq_cap is not None:
+                approx_max_num_seqs = min(approx_max_num_seqs, vision_seq_cap)
 
         # Larger warmup batches crash Gemma-4 on B200 (illegal memory access, plain vLLM too).
         reachable_tokens = approx_max_num_seqs * max_seq_length
-        if max_num_batched_tokens > reachable_tokens:
+        if max_num_batched_tokens > reachable_tokens and requested_max_num_batched_tokens is None:
             max_num_batched_tokens = reachable_tokens
+        if max_num_batched_tokens < approx_max_num_seqs:
+            if requested_max_num_batched_tokens is None:
+                max_num_batched_tokens = approx_max_num_seqs
+            elif not explicit_max_num_seqs:
+                approx_max_num_seqs = max_num_batched_tokens
 
         # Check max RAM usage for vLLM (swap space) default is 4GB
         memory = psutil.virtual_memory()
@@ -3664,6 +4184,12 @@ def load_vllm(
         # Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to force compilation_config=3 without the fix
         # (e.g. once vLLM ships the fix upstream), or UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX=0 to
         # disable the Unsloth-side monkeypatch and take the compilation_config=2 fallback.
+        native_fp8 = None
+        torchao_fp8 = False
+        if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
+            native_fp8 = _get_vllm_online_fp8_quantization(fp8_mode)
+            torchao_fp8 = native_fp8 is None
+
         if compilation_config == 3 and os.environ.get("UNSLOTH_VLLM_PIECEWISE_COMPILE", "0") != "1":
             install_fix = os.environ.get("UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX", "1") != "0"
             fixed = False
@@ -3739,6 +4265,9 @@ def load_vllm(
                         # [rank0]: TypeError: 'NoneType' object does not support the context manager protocol
                     )
                 )
+                # Persistent TMA specializes torchao _scaled_mm graphs ("Constraints violated (input_ids, positions)").
+                if torchao_fp8:
+                    compile_flags["inductor_compile_config"].pop("triton.enable_persistent_tma_matmul", None)
                 good_keys = inspect.signature(CompilationConfig).parameters.keys()
                 # Use new cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE mode for maximum performance
                 # See https://docs.vllm.ai/en/v0.10.2/api/vllm/config/compilation.html#vllm.config.compilation.CUDAGraphMode
@@ -3798,6 +4327,9 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
+        if fp8_moe is not None:
+            # Only the Triton FP8 MoE kernel keeps the expert layout training aliases.
+            engine_args["moe_backend"] = "triton"
         if (enable_lora and not use_async and not use_engine and not use_bitsandbytes and not is_fp8
                 and _merged_rollout_mode() == "attention"):
             # Attention is folded, so vLLM wraps only the rest: no punica kernels on attention.
@@ -3843,14 +4375,21 @@ def load_vllm(
 
         # On-the-fly quantization (vLLM >= 0.12.0); older versions quantize offline.
         # https://github.com/vllm-project/vllm/pull/23014
+        # Prefer vLLM native online FP8, torchao fallback; MoE routers / experts stay 16-bit.
         if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
-            from torchao.core.config import config_to_dict
-            torchao_config = _get_torchao_fp8_config(fp8_mode)
-            hf_overrides = {
-                "quantization_config_dict_json": json.dumps(config_to_dict(torchao_config)),
-            }
-            engine_args["quantization"] = "torchao"
-            engine_args["hf_overrides"] = hf_overrides
+            if native_fp8 is not None:
+                engine_args["quantization"] = native_fp8
+                online_ignore = _vllm_online_fp8_moe_ignore(config)
+                if online_ignore is not None:
+                    engine_args["quantization_config"] = {"ignore": online_ignore}
+            else:
+                from torchao.core.config import config_to_dict
+                torchao_config = _get_torchao_fp8_config(fp8_mode)
+                hf_overrides = {
+                    "quantization_config_dict_json": json.dumps(config_to_dict(torchao_config)),
+                }
+                engine_args["quantization"] = "torchao"
+                engine_args["hf_overrides"] = hf_overrides
 
         # vLLM reads config.json itself, so the caller's RoPE scaling only reaches it as an
         # override; without it positions past the native window index out of the cos/sin cache.
@@ -3882,6 +4421,11 @@ def load_vllm(
         # supports_compute_capability() returns True unconditionally, and it is the last
         # entry in the MLA priority list, which is exactly what vLLM would fall back to
         # once the FlashInfer-backed ones are excluded.
+        if _config_has_gdn_layers(config) and "gdn_prefill_backend" not in engine_args:
+            gdn_mismatch = _flashinfer_gdn_prefill_mismatch()
+            if gdn_mismatch is not None:
+                print(f"Unsloth: vLLM GDN prefill uses Triton since {gdn_mismatch}.")
+                engine_args["gdn_prefill_backend"] = "triton"
         if _UNSLOTH_FLASHINFER_UNUSABLE:
             if _config_uses_mla(config):
                 engine_args["attention_backend"] = "TRITON_MLA"
@@ -3928,6 +4472,40 @@ def load_vllm(
                 _UNSLOTH_FLASHINFER_UNUSABLE = False
             return engine_args
 
+        # Only for engines built here: return_args callers (e.g. `vllm serve`) start
+        # their own process without the runner setting below.
+        replayssm_set_runner = False
+        replayssm_mode = _vllm_replayssm_mode()
+        # A runner the user forced to V2 would only get the engine refused and rebuilt.
+        if replayssm_mode == "auto" and os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip().lower() in ("1", "true"):
+            replayssm_mode = "off"
+        replayssm_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
+        # Opt-in: vLLM 0.31 runs ReplaySSM on Model Runner V1 only, which costs Qwen3.5 more than the ring saves.
+        if replayssm_mode == "auto" and replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES:
+            replayssm_mode = "off"
+        if replayssm_mode != "off":
+            replayssm_skip = _vllm_replayssm_skip_reason(config, good_keys, DEVICE_TYPE)
+            if replayssm_skip is None and not (
+                _patch_vllm_replayssm_mamba2(replayssm_type) if replayssm_type in _REPLAYSSM_MAMBA2_MODELS
+                else _patch_vllm_replayssm_gdn() if replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES
+                else True
+            ):
+                replayssm_skip = f"this vLLM cannot enable ReplaySSM for {replayssm_type!r}"
+            if replayssm_skip is None:
+                engine_args["use_replayssm"] = True
+                print(
+                    "Unsloth: vLLM ReplaySSM decode is on for faster SSM / linear attention rollouts. "
+                    "Set UNSLOTH_VLLM_REPLAYSSM=0 to turn it off."
+                )
+                # vLLM 0.31's Triton ReplaySSM path only runs on Model Runner V1, no longer
+                # the CUDA default. Left set: vLLM caches env reads once the engine is up.
+                if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
+                    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+                    replayssm_set_runner = True
+            elif replayssm_mode == "on":
+                print(f"Unsloth: UNSLOTH_VLLM_REPLAYSSM=1 ignored: {replayssm_skip}.")
+        pass
+
         # Keep trying until success (2 times)
         trials = 0
         race_trials = 0
@@ -3956,6 +4534,13 @@ def load_vllm(
                 # reported it as an OOM and sent users to fixes that cannot work.
                 if _is_expandable_segments_error(error):
                     raise RuntimeError(_expandable_segments_standby_message(error))
+                # Config validation, before any allocation: load once more without it.
+                if engine_args.get("use_replayssm") and _is_vllm_replayssm_refusal(error):
+                    engine_args.pop("use_replayssm")
+                    if replayssm_set_runner:
+                        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                    print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
+                    continue
                 # A transient race: retry the *identical* load rather than fall
                 # through to the generic "memory" branch below, which would shrink
                 # gpu_memory_utilization and max_num_seqs for the rest of the run
@@ -4660,6 +5245,67 @@ def _remap_moe_expert_lora_keys(model, state_dict):
 pass
 
 
+_MOE_STACKED_LORA_KEY = re.compile(r"^(.*)\.(lora_A|lora_B)\.weight$")
+
+
+def _moe_lone_expert_lora_prefixes(keys):
+    """Expert prefixes with only one of gate_up (`.base_layer.lora_*`) / down_proj (`.lora_*`); vLLM needs both."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    outer, base = set(), set()
+    for key in keys:
+        if "experts" not in key and "moe" not in key: continue
+        if not _is_moe_expert_lora_key(key): continue
+        match = _MOE_STACKED_LORA_KEY.match(key)
+        if match is None: continue
+        prefix = match.group(1)
+        if prefix.endswith(".base_layer"): base.add(prefix[:-len(".base_layer")])
+        else: outer.add(prefix)
+    return sorted(outer - base)
+pass
+
+
+def _pad_lone_moe_expert_lora(model, state_dict):
+    """Add a zero A/B for the missing expert half; which half is present comes from shapes vs FusedMoE3DWithLoRA buffers."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    lone = _moe_lone_expert_lora_prefixes(state_dict)
+    if len(lone) == 0: return state_dict
+    runner = _get_vllm_model_runner(model)
+    manager = _get_vllm_lora_manager(model, runner)
+    modules = getattr(manager, "modules", None)
+    if not isinstance(modules, dict): return state_dict
+    vllm_model = _get_vllm_lora_model(model, runner)
+    weights_mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
+    if weights_mapper is not None:
+        from .vllm_lora_worker_manager import _drop_stacked_weight_maps
+        weights_mapper = _drop_stacked_weight_maps(weights_mapper)
+
+    padded = dict(state_dict)
+    for prefix in lone:
+        A = state_dict.get(f"{prefix}.lora_A.weight")
+        B = state_dict.get(f"{prefix}.lora_B.weight")
+        if not torch.is_tensor(A) or not torch.is_tensor(B) or A.dim() != 2 or B.dim() != 2: continue
+        module = modules.get(_resolve_lora_key_to_module(f"{prefix}.lora_A.weight", weights_mapper))
+        try:
+            hidden = module.w13_lora_a_stacked[0].shape[-1]
+            gate_up_out = module.w13_lora_b_stacked[0].shape[-2]
+            intermediate = module.w2_lora_a_stacked[0].shape[-1]
+        except Exception:
+            continue
+        if len(module.w13_lora_b_stacked) != 1: continue  # 2D wrapper, not the stacked layout
+        rank_experts = A.shape[0]
+        zeros = lambda *shape: torch.zeros(shape, dtype = A.dtype, device = A.device)
+        if A.shape[1] == hidden and B.shape[0] == gate_up_out:
+            padded[f"{prefix}.base_layer.lora_A.weight"] = A
+            padded[f"{prefix}.base_layer.lora_B.weight"] = B
+            padded[f"{prefix}.lora_A.weight"] = zeros(rank_experts, intermediate)
+            padded[f"{prefix}.lora_B.weight"] = zeros(hidden, rank_experts)
+        elif A.shape[1] == intermediate and B.shape[0] == hidden:
+            padded[f"{prefix}.base_layer.lora_A.weight"] = zeros(rank_experts, hidden)
+            padded[f"{prefix}.base_layer.lora_B.weight"] = zeros(gate_up_out, rank_experts)
+    return padded
+pass
+
+
 def _check_lora_is_servable(model, keys, source, peft_config):
     """Refuse an adapter vLLM would accept and then silently ignore.
 
@@ -4775,9 +5421,33 @@ def _merged_rollout_lora_params(module):
 pass
 
 
+def _merged_rollout_is_param_wrapper(module):
+    """PEFT target_parameters LoRA (ParamWrapper): stacked MoE expert weights."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return isinstance(getattr(module, "parameter_name", None), str) and callable(getattr(module, "get_param", None))
+pass
+
+
+def _merged_rollout_base_weight(module):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if _merged_rollout_is_param_wrapper(module):
+        try: return module.get_param()
+        except Exception: return None
+    return getattr(getattr(module, "base_layer", None), "weight", None)
+pass
+
+
+def _merged_rollout_exact_possible():
+    # All Unsloth Zoo code licensed under LGPLv3
+    if os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "auto").strip().lower() == "copy": return False
+    from .merged_rollout_exact import triton as _triton
+    return _triton is not None and torch.cuda.is_available()
+pass
+
+
 def _merged_rollout_layer_key(module):
     # All Unsloth Zoo code licensed under LGPLv3
-    W = getattr(getattr(module, "base_layer", None), "weight", None)
+    W = _merged_rollout_base_weight(module)
     lora_A = getattr(module, "lora_A", None)
     key = (
         id(module),
@@ -4821,7 +5491,8 @@ pass
 
 class _MergedRolloutState(_MergedRolloutVerdict):
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = ("entries", "depth", "poisoned", "model_ref", "engine_ref", "stream", "host", "folded", "rest")
+    __slots__ = ("entries", "depth", "poisoned", "model_ref", "engine_ref", "stream", "host", "folded", "rest",
+                 "exact_targets", "fixup")
 
     def __init__(self, model, entries):
         self.entries = entries   # (lora module, W the shared base weight, P its pristine copy on the host)
@@ -4829,6 +5500,8 @@ class _MergedRolloutState(_MergedRolloutVerdict):
         self.host = None         # P's arena and its page-lock (unregistered before the arena is freed)
         self.folded = frozenset()  # module names folded; their LoRA tensors never go to vLLM
         self.rest = False        # other LoRA layers exist and are served by vLLM LoRA (attention mode)
+        self.exact_targets = None  # exact mode (P is None): the folded targets until the unfold
+        self.fixup = None        # exact mode: {"bad", "elements"} of the last fold
         self.depth = 0
         self.poisoned = None     # set when the restore failed twice
         self.model_ref = weakref.ref(model)
@@ -4875,8 +5548,12 @@ def _merged_rollout_targets(model):
     if getattr(config, "trainable_token_indices", None):
         return None, "trainable_token_indices adapts the embeddings"
     attention_only = _merged_rollout_mode() == "attention"
-    if getattr(config, "target_parameters", None) and not attention_only:
-        return None, "target_parameters (MoE expert LoRA) is not folded (try UNSLOTH_VLLM_MERGED_ROLLOUT=attention)"
+    fold_experts = not attention_only and _merged_rollout_exact_possible()
+    if getattr(config, "target_parameters", None) and not attention_only and not fold_experts:
+        return None, (
+            "target_parameters (MoE expert LoRA) is only folded by the exact fold (CUDA + Triton); "
+            "try UNSLOTH_VLLM_MERGED_ROLLOUT=attention"
+        )
 
     adapter = _MERGED_ROLLOUT_ADAPTER
     targets = []
@@ -4891,6 +5568,11 @@ def _merged_rollout_targets(model):
         if attention_only and (not _MERGED_ROLLOUT_ATTENTION.search(name) or _MERGED_ROLLOUT_NON_LANGUAGE.search(name)):
             continue
 
+        if _merged_rollout_is_param_wrapper(module):
+            reason = _merged_rollout_expert_refusal(name, module, adapter, fold_experts)
+            if reason is not None: return None, reason
+            targets.append((name, module, module.get_param()))
+            continue
         if _is_moe_expert_lora_key(name + ".lora_A.weight"):
             return None, f"{name} is a MoE expert LoRA"
         if _MERGED_ROLLOUT_NON_LANGUAGE.search(name):
@@ -4994,7 +5676,12 @@ def _prepare_merged_rollout_locked(model):
     else:
         targets, reason = _merged_rollout_targets(model)
     if reason is None:
-        entries, reason = _merged_rollout_host_copies(targets)
+        if _merged_rollout_use_exact(targets):
+            entries = ([(module, W, None) for _, module, W in targets], None)
+        elif any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
+            reason = "MoE expert LoRA folds only with the exact fold, which needs every folded weight on one CUDA device"
+        else:
+            entries, reason = _merged_rollout_host_copies(targets)
     if reason is not None:
         modules = _merged_rollout_lora_layers(model)
         model._unsloth_merged_rollout_state = _MergedRolloutVerdict(model, modules, reason)
@@ -5009,12 +5696,16 @@ def _prepare_merged_rollout_locked(model):
     folded_ids = {id(module) for _, module, _ in targets}
     state.rest = any(id(module) not in folded_ids for module in _merged_rollout_lora_layers(model))
     model._unsloth_merged_rollout_state = state
-    nbytes = sum(P.numel() * P.element_size() for _, _, P in entries)
-    pinned = "pinned" if getattr(entries[0][2], "is_pinned", lambda: False)() else "pageable"
     rest = "; the other LoRA layers stay on vLLM LoRA" if state.rest else ""
+    if entries[0][2] is None:
+        how = "exact fold / unfold, no pristine copy (only non-round-tripping elements are kept, in pinned host memory)"
+    else:
+        nbytes = sum(P.numel() * P.element_size() for _, _, P in entries)
+        pinned = "pinned" if getattr(entries[0][2], "is_pinned", lambda: False)() else "pageable"
+        how = f"pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)"
     _merged_rollout_log_once(
         f"Unsloth: Merged-weight rollouts on ({_merged_rollout_mode()}): folding the adapter into {len(entries)} "
-        f"shared weights{rest}; pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)."
+        f"shared weights{rest}; {how}."
     )
     return state
 pass
@@ -5078,6 +5769,7 @@ def _merged_rollout_refresh_pristine(state):
     """Bit-exact sample check of W vs P: catches base reloads that skip _version
     (load_weights into inference tensors, .data writes), then re-copies P from W."""
     # All Unsloth Zoo code licensed under LGPLv3
+    if state.entries[0][2] is None: return False   # exact mode folds whatever W is
     sample_W, sample_P = [], []
     for _, W, P in state.entries:
         sample_W.extend(_merged_rollout_sample(W))
@@ -5145,9 +5837,118 @@ def _merged_rollout_wait_restore(state):
 pass
 
 
-def _merged_rollout_restore(state):
-    """Copy W back from P, retried once (idempotent); two failures poison the state."""
+def _merged_rollout_use_exact(targets):
     # All Unsloth Zoo code licensed under LGPLv3
+    if os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "auto").strip().lower() == "copy": return False
+    from .merged_rollout_exact import exact_merge_available, exact_merge_failure
+    # One stream, one host sync per fold: the kernel path assumes a single device.
+    if len({W.device for _, _, W in targets}) != 1: return False
+    for _, _, W in targets:
+        if not exact_merge_available(W.device, W.dtype):
+            failure = exact_merge_failure(W.device, W.dtype) if W.device.type == "cuda" else None
+            if failure is not None:
+                _merged_rollout_log_once(f"Unsloth: exact merged rollout self-check failed ({failure}); using the pinned copy.")
+            return False
+    return True
+pass
+
+
+def _merged_rollout_expert_refusal(name, module, adapter, fold_experts):
+    """Why a ParamWrapper (stacked expert) LoRA cannot be folded, or None."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not fold_experts:
+        return f"{name} is a MoE expert LoRA, only folded by the exact fold (CUDA + Triton)"
+    if tuple(module.lora_A.keys()) != (adapter,):
+        return f"{name} holds adapters {list(module.lora_A.keys())}"
+    if len(getattr(module, "merged_adapters", None) or ()) != 0:
+        return f"{name} already has a PEFT-merged adapter"
+    if getattr(module, "disable_adapters", False):
+        return f"{name} has its adapters disabled"
+    if getattr(module, "lora_bias", {}).get(adapter, False):
+        return f"{name} uses lora_bias, which adds a bias term"
+    scaling = getattr(module, "scaling", {}).get(adapter, None)
+    if isinstance(scaling, bool) or not isinstance(scaling, (int, float)):
+        return f"{name} has a non-scalar LoRA scaling"
+    W = _merged_rollout_base_weight(module)
+    if not isinstance(W, torch.Tensor) or W.dim() != 3 or getattr(module, "num_experts", 1) != W.shape[0]:
+        return f"{name} is not a stacked [experts, out, in] weight"
+    if W.dtype not in (torch.bfloat16, torch.float16):
+        return f"{name} base weight is {W.dtype}, not 16-bit"
+    if W.requires_grad:
+        return f"{name} base weight is trainable"
+    if W.device.type != "cuda":
+        return f"{name} is on {W.device.type}, and experts are only folded on CUDA"
+    from .merged_rollout_exact import exact_merge_available
+    if not exact_merge_available(W.device, W.dtype):
+        return f"{name} is a MoE expert LoRA and the exact fold self-check failed on this GPU"
+    return None
+pass
+
+
+def _merged_rollout_exact_target(ExactFoldTarget, module, W, adapter):
+    """[E, N, K] view of W with per-expert A_e [R, K] and B_e [N, R].
+
+    Dense: E = 1. PEFT target_parameters (ParamWrapper): A is [r * E, in] grouped by expert,
+    B is [out, r * E] rank-major (B.reshape(out, r, E)[:, :, e] is B_e) or, under
+    UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert, B.reshape(out, E, r)[:, e]; W is
+    [E, out, in] when PEFT swapped its in / out features, else [E, in, out].
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    A = module.lora_A[adapter].weight.to(W.dtype)
+    B = module.lora_B[adapter].weight.to(W.dtype)
+    if not _merged_rollout_is_param_wrapper(module):
+        return ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), module.scaling[adapter])
+    E = W.shape[0]
+    rank = A.shape[0] // E
+    from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_layout_for_wrapper, LORA_B_LAYOUT_RANK_MAJOR
+    a = A.reshape(E, rank, A.shape[1])
+    if moe_lora_b_layout_for_wrapper(module, adapter) == LORA_B_LAYOUT_RANK_MAJOR:
+        b = B.reshape(B.shape[0], rank, E).permute(2, 0, 1)
+    else:
+        b = B.reshape(B.shape[0], E, rank).permute(1, 0, 2)
+    w = W if getattr(module, "_did_swap_in_out_features", False) else W.transpose(1, 2)
+    return ExactFoldTarget(w, a, b, module.scaling[adapter])
+pass
+
+
+def _merged_rollout_exact_fold(state, adapter):
+    """Fold in place with the exact kernel; the fix-up store streams to pinned host memory."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    from .merged_rollout_exact import ExactFoldTarget, exact_fold
+    device = state.entries[0][1].device
+    if state.stream is None: state.stream = torch.cuda.Stream(device = device)
+    # A / B are cast once and held until the unfold, so the delta is recomputed from the same bits.
+    targets = [_merged_rollout_exact_target(ExactFoldTarget, module, W, adapter) for module, W, _ in state.entries]
+    state.exact_targets = targets
+    state.fixup = exact_fold(targets, stream = state.stream)
+    _merged_rollout_log_once(
+        f"Unsloth: exact merged rollout keeps {state.fixup['bad']:,} of {state.fixup['elements']:,} weights "
+        f"({100 * state.fixup['bad'] / max(state.fixup['elements'], 1):.2f}%) for the restore."
+    )
+pass
+
+
+def _merged_rollout_restore(state):
+    """Copy W back from P, retried once (idempotent); two failures poison the state.
+    Exact mode unfolds once: an unfold is not idempotent, so any failure poisons."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if state.entries and state.entries[0][2] is None:
+        from .merged_rollout_exact import exact_unfold
+        targets, state.exact_targets = state.exact_targets, None
+        # Failed while building the targets: no kernel ran, nothing to undo.
+        if targets is None: return
+        try:
+            _merged_rollout_synchronize(state)
+            with torch.inference_mode():
+                exact_unfold(targets, stream = state.stream)
+            state.record()
+        except BaseException as error:
+            state.poisoned = repr(error)
+            raise RuntimeError(
+                "Unsloth: an exact merged-weight rollout could not restore the base weights; "
+                "the training weights may still hold the folded adapter. Reload the model."
+            ) from error
+        return
     first_error = None
     for _ in range(2):
         try:
@@ -5184,10 +5985,13 @@ def merged_rollout(state):
             if outermost:
                 with torch.inference_mode():
                     _merged_rollout_wait_restore(state)
-                    _merged_rollout_refresh_pristine(state)
-                    # W == P bit for bit here (restored, and sample-checked above).
-                    for module, W, P in state.entries:
-                        _merged_rollout_fold(W, module, adapter)
+                    if state.entries[0][2] is None:
+                        _merged_rollout_exact_fold(state, adapter)
+                    else:
+                        _merged_rollout_refresh_pristine(state)
+                        # W == P bit for bit here (restored, and sample-checked above).
+                        for module, W, P in state.entries:
+                            _merged_rollout_fold(W, module, adapter)
                 _merged_rollout_synchronize(state)
             yield
         finally:
@@ -5430,6 +6234,7 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
 
         state_dict = _remap_moe_expert_lora_keys(model, state_dict)
         _check_lora_is_servable(model, list(state_dict), "the training model", peft_config)
+        state_dict = _pad_lone_moe_expert_lora(model, state_dict)
 
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
@@ -5451,11 +6256,13 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
                 _saved_peft_config = get_peft_config(save_directory)
             except Exception:
                 _saved_peft_config = None
-        # Loading by path skips the Gemma-4 expert rename, so pass tensors only when a key changed.
+        # Path loading skips the expert rename and lone-pair padding: pass tensors when either applies.
         _remapped_keys = list(_remap_moe_expert_lora_keys(model, dict.fromkeys(_saved_keys)))
-        if _saved_peft_config is not None and _remapped_keys != _saved_keys:
+        _lone_expert_pairs = len(_moe_lone_expert_lora_prefixes(_remapped_keys)) != 0
+        if _saved_peft_config is not None and (_remapped_keys != _saved_keys or _lone_expert_pairs):
             state_dict = _remap_moe_expert_lora_keys(model, _saved_adapter_lora_tensors(save_directory))
             _check_lora_is_servable(model, list(state_dict), save_directory, _saved_peft_config)
+            state_dict = _pad_lone_moe_expert_lora(model, state_dict)
             lora_request = LoRARequest(
                 str(lora_request_id), lora_request_id,
                 lora_tensors = state_dict, lora_config = _saved_peft_config,

@@ -20,6 +20,7 @@ __all__ = [
     "compute_fused_ce_loss",
     "unsloth_count_aware_cross_entropy",
     "unsloth_loss_count_kwargs",
+    "unsloth_fsdp_unshard",
 ]
 
 import torch
@@ -29,6 +30,7 @@ import weakref
 import functools
 import math
 import os
+import sys
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 from unsloth_zoo.device_type import DEVICE_TYPE
         
@@ -59,6 +61,38 @@ def _get_mapping(autograd):
     parameters = dict(parameters)
     parameters.pop("ctx", None)
     return tuple(parameters.keys()), tuple([x.default for x in parameters.values()])
+pass
+
+def _nonzero_count(n_items):
+    """0 -> 1 so an all-masked batch gives loss 0, not 0 / 0."""
+    if torch.is_tensor(n_items):
+        return torch.where(n_items == 0, torch.ones_like(n_items), n_items)
+    return n_items if n_items != 0 else 1
+pass
+
+@torch.compiler.disable
+def _fsdp_unshard(module):
+    module.unshard()
+pass
+
+def unsloth_fsdp_unshard(module):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """All-gather an FSDP2-sharded module (lm_head) whose weight the fused losses read without calling it.
+
+    FSDP2 unshards in the module's pre-forward hook, which never fires here; accelerate shards an
+    untied lm_head in its own group, so the weight would reach the matmul as a DTensor (unsloth-zoo#1751).
+    Traceable unless an FSDP2 unit is found, so compiled non-FSDP forwards keep one graph.
+    """
+    if module is None or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    # fully_shard lives here, so no FSDP2 unit can exist before this module was imported.
+    FSDPModule = getattr(sys.modules.get("torch.distributed.fsdp"), "FSDPModule", None)
+    if FSDPModule is None:
+        return
+    for submodule in module.modules():
+        if isinstance(submodule, FSDPModule):
+            # No-op once unsharded; post-backward reshards it and reduce-scatters its gradient.
+            _fsdp_unshard(submodule)
 pass
 
 def apply_autograd_function(autograd, mapping):
@@ -129,16 +163,16 @@ def compute_fused_ce_loss(
         logits = torch.tanh(logits)
         logits = logits * logit_softcapping
 
-    # Calculate cross entropy loss
-    reduction = "sum" if n_items is not None else "mean"
+    # sum / n_items, else sum / labelled tokens (the stock mean)
+    target = labels.view(-1).to(device).contiguous()
     loss = torch.nn.functional.cross_entropy(
         input  = logits.view(-1, vocab_size).float().contiguous(),
-        target = labels.view(-1).to(device).contiguous(),
-        reduction = reduction,
+        target = target,
+        reduction = "sum",
         ignore_index = ignore_index,
         label_smoothing = label_smoothing,
     )
-    loss = loss / n_items if n_items is not None else loss
+    loss = loss / _nonzero_count(n_items if n_items is not None else (target != ignore_index).sum())
     # Scale loss if needed for mixed precision training
     scaled_loss = loss * scaling if scaling is not None else loss
     # Must add .loss.detach otherwise autograd uses 2x VRAM
@@ -274,7 +308,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             divisor = torch.tensor(divisor, dtype = torch.float32, device = device)
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
-        divisor = divisor.to(dtype = torch.float32, device = device)
+        divisor = _nonzero_count(divisor.to(dtype = torch.float32, device = device))
         # Check what needs gradients
         lm_head_requires_grad = lm_head_weight is not None and lm_head_weight.requires_grad
         lm_head_bias_requires_grad = lm_head_bias is not None and lm_head_bias.requires_grad
@@ -698,7 +732,7 @@ def unsloth_count_aware_cross_entropy(
         # A DataParallel replica gets a one-element slice of the repeated count: keep the loss 0-dim.
         n_items = n_items.to(loss.device)
         if n_items.ndim > 0: n_items = n_items.reshape(-1)[0]
-    return loss / n_items
+    return loss / _nonzero_count(n_items)
 pass
 
 

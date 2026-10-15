@@ -2,6 +2,7 @@
   "_comment": "Call sites that predate the gate, each with why it is safe. New ones fail; see scripts/lint_risky_loaders.py.",
   "targets": [
     "unsloth_zoo",
+    "unsloth_zoo_downloads",
     "scripts"
   ],
   "entries": [
@@ -102,7 +103,7 @@
       "reason": "Iterates the fixed _VLLM_BNB_LOADER_PATHS pair of vLLM bitsandbytes loader modules."
     },
     {
-      "file": "unsloth_zoo/hf_xet_fallback.py",
+      "file": "unsloth_zoo_downloads/hf_xet_fallback.py",
       "rule": "dynamic-import",
       "sink": "import_module",
       "digest": "59e72c01edb14c86",
@@ -300,6 +301,22 @@
       "digest": "2050c7fdd98e6c78",
       "count": 1,
       "reason": "Reads back a .pt file this function just wrote with torch.save into a temporary location; never a downloaded file."
+    },
+    {
+      "file": "unsloth_zoo/speculative/__init__.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "9d1bef964dfe2d2f",
+      "count": 1,
+      "reason": "Lazy re-export: the submodule name comes from this package's own fixed name -> submodule table, never from user input."
+    },
+    {
+      "file": "unsloth_zoo/speculative/nextn.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "09d04a1e91d8e06e",
+      "count": 1,
+      "reason": "Imports transformers.models.<m>.modeling_<m> where <m> is the MTPFamily.module literal from the in-repo registry (mtp_families.py), never from a checkpoint or user input."
     },
     {
       "file": "unsloth_zoo/temporary_patches/ernie4_5_moe.py",
@@ -524,6 +541,14 @@
       "digest": "1514c70a7a2bd102",
       "count": 1,
       "reason": "Iterates a fixed table of vLLM LoRA layer classes."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "197b2447d30d6dfd",
+      "count": 1,
+      "reason": "Imports a vLLM model module named in the fixed _REPLAYSSM_MAMBA2_MODELS table."
     },
     {
       "file": "unsloth_zoo/vllm_utils.py",

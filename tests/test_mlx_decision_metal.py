@@ -38,7 +38,7 @@ from mlx_simulation import mlx_is_simulated  # noqa: E402
 if mlx_is_simulated():
     pytest.skip("needs real MLX: mx.fast attention and RoPE", allow_module_level = True)
 
-from mlx.nn import Dropout, Embedding, LayerNorm, Linear, Sequential, quantize  # noqa: E402
+from mlx.nn import Dropout, Embedding, LayerNorm, Linear, Module, Sequential, quantize  # noqa: E402
 from mlx.utils import tree_flatten, tree_map  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402
 
@@ -209,6 +209,44 @@ def test_load_drains_generation_streams_before_clearing_the_cache(checkpoint, mo
     load_decision_model(checkpoint[1])
     clear = calls.index(("clear", ()))
     assert ("sync", (stream,)) in calls[:clear] and ("sync", ()) in calls[:clear]
+
+
+def test_arrays_kept_outside_the_parameters_are_evaluated_for_other_threads(monkeypatch):
+    import threading
+
+    from unsloth_zoo.mlx.decision import ClefModel
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    class Positions(Module):
+        def __init__(self):
+            super().__init__()
+            self._scales = mx.arange(3) * 2.0
+
+    class Tower(Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = Linear(2, 2)
+            self._positions = Positions()
+            self._tables = [mx.ones(2) * 3.0]
+
+    monkeypatch.setattr(FastMLXModel, "from_pretrained", staticmethod(lambda *args, **kwargs: (Tower(), None)))
+    pipeline = ClefModel.__new__(ClefModel)
+    loader = threading.Thread(target = pipeline._load, args = ("source", None, None, None))
+    loader.start()
+    loader.join()
+    # MLX evaluates a lazy array only on the thread that made it.
+    tower = pipeline.model
+    assert (tower._positions._scales + 1).tolist() == [1.0, 3.0, 5.0]
+    assert (tower._tables[0] + tower.proj.bias * 0).tolist() == [3.0, 3.0]
+
+
+def test_a_decoder_that_swaps_its_weights_per_modality_trains_through_adapters_only():
+    decoder = Module()
+    decoder.proj = Linear(2, 2)
+    # Phi-4-multimodal's table of the weights it sets back for each input's modality.
+    decoder._base_weights = {"proj.weight": mx.ones((2, 2))}
+    with pytest.raises(ValueError, match = "swaps its decoder weights"):
+        clef_training_network(SimpleNamespace(model = decoder), full_finetuning = True)
 
 
 def _decoder(quantized = False, bits = 8):
@@ -864,9 +902,13 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
             loaded[True].thinker.vision_tower, loaded[True].thinker.audio_tower = Linear(64, 64), Linear(64, 64)
             # A projector between a tower and the decoder too, as other families name it; never the talker.
             loaded[True].multi_modal_projector, loaded[True].thinker.talker = Linear(64, 64), Linear(64, 64)
+            # A connector whose name says nothing, or names both, serves whichever tower is read; one named for a modality, only that one.
+            loaded[True].mlp1x, loaded[True].audio_image_proj, loaded[True].audio_projection, loaded[True].language_model.vision_bias = (Linear(64, 64) for _ in range(4))
             _QwenModel._load(SimpleNamespace(reads_images = reads[0], reads_audio = reads[1]), tmp_path, None, None, None, None, True)
             towers = (loaded[True].vision_tower, loaded[True].thinker.vision_tower, loaded[True].thinker.audio_tower, loaded[True].multi_modal_projector, loaded[True].thinker.talker)
             assert ["scales" not in tower for tower in towers] == [reads[0], reads[0], reads[1], any(reads), False]
+            others = (loaded[True].mlp1x, loaded[True].audio_image_proj, loaded[True].audio_projection, loaded[True].language_model.vision_bias)
+            assert ["scales" not in module for module in others] == [any(reads), any(reads), reads[1], False]
     network = clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
     if mode == "qlora":
         # Adapters over quantized layers receive gradients.

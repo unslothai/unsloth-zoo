@@ -487,6 +487,7 @@ def _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act = ACT_GPTOSS, inter
             STACKED = tb.get("stacked", False), ACT = act, INTERLEAVED = interleaved,
             BIAS_KIND = bias_kind, HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
             LORA_KIND = kind, BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -503,6 +504,7 @@ def _down(x, idx, rw, dense_rw, tb, top_k, lora, out):
             NESTED = tb["nested"], STACKED = tb.get("stacked", False), BIAS_KIND = bias_kind,
             HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r), LORA_KIND = kind,
             BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -641,6 +643,7 @@ def _lora_h_launch(x, idx, a_ptrs, kind, r, row_div, out):
         _lora_h_kernel[(idx.numel(), r)](
             x, idx, a_ptrs, out, K, row_div, R = r, LORA_KIND = kind,
             BLOCK_K = max(16, min(1024, triton.next_power_of_2(K))), num_warps = 4,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -695,6 +698,7 @@ def _lora_a_launch(x, idx, a, row_div):
         _routed_lora_a_kernel[(P, triton.cdiv(r, block_r))](
             x, idx, a, out, K, row_div, x.stride(0), a.stride(0), a.stride(1), a.stride(2),
             R = r, BLOCK_R = block_r, BLOCK_K = block_k, num_warps = warps,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -715,6 +719,7 @@ def _lora_b_launch(base, prev, h, idx, b, scaling):
             float(scaling), base.stride(0) if base is not None else 0, b.stride(0), b.stride(1), b.stride(2),
             HAS_BASE = base is not None, HAS_PREV = prev is not None, R = r, R_PAD = r_pad, BLOCK_N = block_n,
             num_warps = warps,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -856,6 +861,7 @@ def _launch_expert(x, idx, weight, bias, out, row_div, lora_a = None, h_out = No
             P_PAD = max(16, triton.next_power_of_2(P)),
             BLOCK_N = c["BLOCK_N"], BLOCK_K = c["BLOCK_K"], SPLIT_K = S,
             num_warps = c["num_warps"], num_stages = c["num_stages"], **kw,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -1052,6 +1058,7 @@ def _gate_up_act_launch(x, idx, weight, bias, lora_a, lora_b, lora_h, scaling, t
             P, N // 2, float(alpha), float(limit), float(scaling), bs[0], bs[1], bs[2],
             SPLIT_K = S, ACT = act, INTERLEAVED = interleaved, HAS_LORA = lora_b is not None, SPLIT_H = SH,
             R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK, num_warps = warps,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -1068,6 +1075,7 @@ def _down_sum_launch(x, idx, rw, weight, bias, lora_a, lora_b, lora_h, scaling, 
             P, N, rw.stride(0), float(scaling), bs[0], bs[1], bs[2],
             TOP_K = top_k, TOP_K_PAD = triton.next_power_of_2(top_k), SPLIT_K = S, HAS_LORA = lora_b is not None,
             SPLIT_H = SH, R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK, num_warps = warps,
+            enable_fp_fusion = True,
         )
     return out
 

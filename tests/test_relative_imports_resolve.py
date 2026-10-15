@@ -51,11 +51,11 @@ RELATIVE_IMPORT = re.compile(r"^\s*import\s+\.(\S+)\s*$", re.MULTILINE)
 
 
 def _modules():
-    return sorted(ROOT.rglob("*.py"))
+    return sorted(p for root in (ROOT, ROOT.parent / "unsloth_zoo_downloads") for p in root.rglob("*.py"))
 
 
 def _rel(p):
-    return str(p.relative_to(ROOT))
+    return str(p.relative_to(ROOT.parent))
 
 
 @pytest.mark.parametrize("path", _modules(), ids = _rel)

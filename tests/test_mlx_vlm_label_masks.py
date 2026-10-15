@@ -3872,6 +3872,179 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
     assert _phi4mm_token_ids({"audio_token_index": 11}) == (expected[0], 11)
 
 
+def test_phi4mm_switches_to_its_speech_weights_under_lora_adapters():
+    from types import SimpleNamespace
+
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import compile as patches
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_speech_lora, apply_base_weights = phi4mm.set_modality, phi4mm.apply_speech_lora, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.layers = [nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)]
+    model.layers[0] = LoRALinear.from_base(model.layers[0], r=1)
+    keys = [f"layers.{index}.weight" for index in range(2)]
+    model._base_weights = {key: mx.ones((2, 2)) for key in keys}
+    model._speech_lora_a = {key: mx.ones((1, 2)) for key in keys}
+    model._speech_lora_b = {key: mx.ones((2, 1)) for key in keys}
+    model._speech_lora_scale, model._active_lora = 2.0, "vision"
+    model.set_modality(has_audio=True)
+    # A fresh adapter adds nothing, so either linear computes with base + scale * B @ A = 3 everywhere.
+    assert [layer(mx.ones((1, 2))).tolist() for layer in model.layers] == [[[6.0, 6.0]]] * 2
+    # A row of text alone switches back to the base weights, as the reference model's does.
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert [layer(mx.ones((1, 2))).tolist() for layer in model.layers] == [[[2.0, 2.0]]] * 2
+
+
+@pytest.mark.parametrize("full_finetuning", [True, False])
+def test_phi4mm_full_finetuning_keeps_one_set_of_decoder_weights(full_finetuning):
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_both_loras, apply_base_weights = phi4mm.set_modality, phi4mm.apply_both_loras, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.layers = [nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)]
+    keys = [f"layers.{index}.weight" for index in range(2)]
+    model._base_weights = {key: mx.ones((2, 2)) for key in keys}
+    for kind, scale in (("vision", 1.0), ("speech", 2.0)):
+        setattr(model, f"_{kind}_lora_a", {key: mx.ones((1, 2)) for key in keys})
+        setattr(model, f"_{kind}_lora_b", {key: mx.ones((2, 1)) for key in keys})
+        setattr(model, f"_{kind}_lora_scale", scale)
+    model._active_lora, model._unsloth_full_finetuning = "vision", full_finetuning
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    _finish_load(model, None)
+    # What training changed, then a row of text alone.
+    model.layers[1].weight = model.layers[1].weight + 1
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    outputs = [layer(mx.ones((1, 2))).tolist() for layer in model.layers]
+    # Base 1 with both adapters merged (+1, +2) is 4 everywhere; swapping sets the base 1 back.
+    assert outputs == ([[[8.0, 8.0]], [[10.0, 10.0]]] if full_finetuning else [[[2.0, 2.0]]] * 2)
+
+
+@pytest.mark.parametrize("full_finetuning", [True, False])
+def test_phi4mm_weight_swaps_keep_the_requested_dtype(full_finetuning):
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_both_loras, apply_base_weights = phi4mm.set_modality, phi4mm.apply_both_loras, phi4mm.apply_base_weights
+        apply_speech_lora = phi4mm.apply_speech_lora
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    # The loader has cast the decoder to float32; the copies the sanitizer kept are the checkpoint's bfloat16.
+    model.layers = [nn.Linear(2, 2, bias=False)]
+    model.layers[0].weight = mx.ones((2, 2), dtype=mx.float32)
+    key = "layers.0.weight"
+    model._base_weights = {key: mx.ones((2, 2), dtype=mx.bfloat16)}
+    for kind in ("vision", "speech"):
+        setattr(model, f"_{kind}_lora_a", {key: mx.ones((1, 2), dtype=mx.bfloat16)})
+        setattr(model, f"_{kind}_lora_b", {key: mx.ones((2, 1), dtype=mx.bfloat16)})
+        setattr(model, f"_{kind}_lora_scale", 1.0)
+    model._active_lora, model._unsloth_full_finetuning = "vision", full_finetuning
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    _finish_load(model, None)
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert model.layers[0].weight.dtype == mx.float32
+    model.set_modality(has_audio=True)
+    assert model.layers[0].weight.dtype == mx.float32
+
+
+def test_phi4mm_weight_swaps_run_on_a_thread_other_than_the_loader():
+    import threading
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_speech_lora, apply_base_weights = phi4mm.set_modality, phi4mm.apply_speech_lora, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.layers = [nn.Linear(2, 2, bias=False)]
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    key = "layers.0.weight"
+
+    def load():
+        # The tables a checkpoint load leaves lazy on the loading thread's stream.
+        model.layers[0].weight = mx.ones((2, 2), dtype=mx.float32)
+        model._base_weights = {key: mx.ones((2, 2), dtype=mx.bfloat16) * 1}
+        model._speech_lora_a, model._speech_lora_b = {key: mx.ones((1, 2), dtype=mx.bfloat16) * 1}, {key: mx.ones((2, 1), dtype=mx.bfloat16) * 1}
+        model._speech_lora_scale, model._active_lora = 1.0, "vision"
+        _finish_load(model, None)
+
+    loader = threading.Thread(target=load)
+    loader.start()
+    loader.join()
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert model.layers[0](mx.ones((1, 2))).tolist() == [[2.0, 2.0]]
+    model.set_modality(has_audio=True)
+    assert model.layers[0](mx.ones((1, 2))).tolist() == [[4.0, 4.0]]
+
+
+def test_phi4mm_keeps_a_merged_decision_adapter_across_its_weight_swaps(tmp_path):
+    import json
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.decision import _merge_lora
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_vision_lora, apply_base_weights = phi4mm.set_modality, phi4mm.apply_vision_lora, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    model.language_model.model.layers = [nn.Linear(2, 2, bias=False)]
+    model.language_model.model.embed_tokens = lambda ids: mx.zeros((1, 2, 2))
+    key = "language_model.model.layers.0.weight"
+    model._base_weights = {key: mx.ones((2, 2))}
+    model._vision_lora_a, model._vision_lora_b, model._vision_lora_scale = {key: mx.ones((1, 2))}, {key: mx.ones((2, 1))}, 1.0
+    model.language_model.model.layers[0].weight = mx.ones((2, 2)) * 2
+    model._active_lora = "vision"
+    mx.save_safetensors(str(tmp_path / "adapter_model.safetensors"), {
+        "base_model.model.model.layers.0.lora_A.weight": mx.ones((1, 2)), "base_model.model.model.layers.0.lora_B.weight": mx.ones((2, 1)) * 5,
+    })
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 1, "lora_alpha": 1, "target_modules": ["layers.0"]}))
+    _merge_lora(model, tmp_path)
+
+    def layer():
+        return model.language_model.model.layers[0](mx.ones((1, 2))).tolist()
+
+    # Base 1, vision +1, adapter +5: a row of text runs on base and adapter, an image adds the vision weights back.
+    assert layer() == [[14.0, 14.0]]
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert layer() == [[12.0, 12.0]]
+    model.set_modality(has_image=True)
+    assert layer() == [[14.0, 14.0]]
+
+
 def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
     """The regression this guards is in the compile-preparation branch, not the
     helper: training threads the checkpoint mapping, which declares neither
@@ -4325,6 +4498,66 @@ def test_nemotron_sound_modules_are_frozen_and_not_quantized():
     assert all(getattr(model, name).frozen for name in names)
     predicate = mlx_loader._compose_mlx_quant_predicate(model, mlx_loader._MLXQuantizationSpec(), is_vlm=True)
     assert all(not predicate(name, object()) for name in names)
+
+
+def test_connectors_between_a_tower_and_the_decoder_are_not_quantized():
+    import unsloth_zoo.mlx.loader as mlx_loader
+    predicate = mlx_loader._compose_mlx_quant_predicate(object(), mlx_loader._MLXQuantizationSpec(), is_vlm=True)
+    kept = ("resampler.attn.q_proj", "audio_projection_layer.linear1", "resampler_model.mlp", "mlp1.layers.1", "mlp1.3", "model.mlp1.1")
+    assert [path for path in kept if predicate(path, object())] == []
+    # Whole path components only: a decoder layer whose name merely contains one is still quantized.
+    quantized = ("language_model.model.layers.0.mlp.down_proj", "language_model.model.layers.0.mlp1x.proj", "language_model.upsampler.proj")
+    assert all(predicate(path, object()) for path in quantized)
+    # A text model's own layers of the same names are still quantized.
+    text = mlx_loader._compose_mlx_quant_predicate(object(), mlx_loader._MLXQuantizationSpec(), is_vlm=False)
+    assert all(text(path, object()) for path in kept)
+
+
+def _module_tree(base=nn.Module, **children):
+    module = base()
+    for name, child in children.items():
+        setattr(module, name, child)
+    return module
+
+
+def test_a_quantizing_load_skips_whatever_sits_beside_the_text_decoder():
+    import unsloth_zoo.mlx.loader as mlx_loader
+    linear = lambda: nn.Linear(2, 2)
+
+    class _Nested(nn.Module):
+        language_model = property(lambda self: self.thinker.language_model)
+
+    # A decoder may hold layers named like a connector or a speech module (Gemma's `per_layer_projection`).
+    decoder = _module_tree(per_layer_projection=linear(), image_proj=linear(), tts=linear(), layers=[_module_tree(q_proj=linear())])
+    model = _module_tree(
+        _Nested,
+        thinker=_module_tree(language_model=decoder, bridge=linear(), language_model_norm=linear()),
+        image_proj=_module_tree(linear1=linear()),
+        spatial_projectors=[_module_tree(dense=linear())],
+        tts_adapter=linear(),
+        talker=_module_tree(text_projection=linear(), code_predictor=linear()),
+        wrapper=_module_tree(tts=_module_tree(head=linear())),
+    )
+
+    def quantized(model, spec=mlx_loader._MLXQuantizationSpec(), is_vlm=True):
+        predicate = mlx_loader._compose_mlx_quant_predicate(model, spec, is_vlm=is_vlm)
+        return {path for path, module in model.named_modules() if hasattr(module, "to_quantized") and predicate(path, module)}
+
+    inside = {f"thinker.language_model.{leaf}" for leaf in ("per_layer_projection", "image_proj", "tts", "layers.0.q_proj")}
+    # Speech generators are quantized like the decoder, wherever they sit; mlx-vlm keeps the code predictor dense.
+    assert quantized(model) == inside | {"talker.text_projection", "wrapper.tts.head"}
+    # Naming a module beside the decoder does not bring it back.
+    assert quantized(model, mlx_loader._MLXQuantizationSpec(quantize_modules=("image_proj",))) == {"thinker.language_model.image_proj"}
+    assert "image_proj.linear1" in quantized(model, is_vlm=False)
+    predicate =mlx_loader._compose_mlx_quant_predicate(model, mlx_loader._MLXQuantizationSpec(), is_vlm=True)
+    assert predicate("thinker.language_model.layers.0.q_proj", linear())
+
+    # Without a decoder of its own to go by (Molmo Point), only names are skipped.
+    class _Flat(nn.Module):
+        language_model = property(lambda self: self)
+
+    flat = _module_tree(_Flat, lm=_module_tree(q_proj=linear()), point_predictor=linear(), build_vit_embedding=linear())
+    assert quantized(flat) == {"lm.q_proj", "point_predictor"}
 
 
 def test_qwen3_omni_nested_audio_tower_is_frozen():

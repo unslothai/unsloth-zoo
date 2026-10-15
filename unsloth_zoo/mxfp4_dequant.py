@@ -291,6 +291,7 @@ def _launch(grid, blocks, scales, out, experts, token_counts, N, G, stride_e, st
             BLOCK_N = BLOCK_N, BLOCK_G = BLOCK_G, USE_EXPERTS = experts is not None,
             USE_COUNTS = token_counts is not None,
             BF16_BITS = bf16_bits, LONG_INDEXING = long_indexing, num_warps = 4,
+            enable_fp_fusion = True,
         )
 
 

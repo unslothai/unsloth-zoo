@@ -4012,14 +4012,16 @@ def _install_qwen3_omni_compile_patches(
         ):
             position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
+        levels = deepstack_visual_embeds
+        if isinstance(levels, mx.array):
+            # Upstream's embedder hands one array holding a level per column.
+            levels = [levels[:, :, level] for level in range(levels.shape[2])]
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             if output_hidden_states:
                 all_hidden_states.append(h)
             h = layer(h, mask, c, position_ids, position_embeddings)
-            if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
-                h = self._deepstack_process(
-                    h, visual_pos_masks, deepstack_visual_embeds[layer_idx]
-                )
+            if levels is not None and layer_idx < len(levels):
+                h = self._deepstack_process(h, visual_pos_masks, levels[layer_idx])
             if output_hidden_state_idx == layer_idx + 1:
                 selected_hidden_state = h
 
@@ -6949,8 +6951,8 @@ def _install_phi4_multimodal_patches():
 
         has_images = pixel_values is not None
         has_audio = input_audio_embeds is not None and input_audio_embeds.size > 0
-        if has_images or has_audio:
-            self.set_modality(has_image=has_images, has_audio=has_audio)
+        # Text alone runs on the base weights, as the reference does; upstream skips the switch and keeps the last input's.
+        self.set_modality(has_image=has_images, has_audio=has_audio)
 
         if not has_images and not has_audio:
             return InputEmbeddingsFeatures(
@@ -7016,7 +7018,18 @@ def _install_phi4_multimodal_patches():
             )
         return InputEmbeddingsFeatures(inputs_embeds=outputs)
 
+    def patched_phi4mm_set_weight_by_key(self, key, value):
+        # `set_modality` swaps the decoder between its vision and speech weights; under a LoRA adapter the wrapped linear computes.
+        *parents, name = key.split(".")
+        target = self
+        for part in parents:
+            target = target[int(part)] if part.isdigit() else getattr(target, part)
+        if "lora_a" in target and "linear" in target:
+            target = target.linear
+        setattr(target, name, value)
+
     _patch_method(phi4mm_vision_module.VisionTower, "__call__", patched_phi4mm_vision_tower_call)
+    _patch_method(phi4mm_module.Model, "_set_weight_by_key", patched_phi4mm_set_weight_by_key)
     patched_phi4mm_get_input_embeddings._unsloth_static_vlm_metadata = ("spatial_shapes",)
     _patch_method(phi4mm_module.Model, "get_input_embeddings", patched_phi4mm_get_input_embeddings)
     _PATCHED_ARCHES.add("phi4mm")

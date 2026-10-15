@@ -29,9 +29,8 @@ defects behind https://github.com/unslothai/unsloth/issues/2693:
    supported version.
 
 It lives here rather than in ``unsloth`` so the generated trainer source can
-import it without importing back into ``unsloth`` itself. Wiring the three
-``dataset_utils`` copies onto it is a follow-up: that changes behaviour for
-every consumer of this package.
+import it without importing back into ``unsloth`` itself. ``dataset_utils`` now
+sizes its auto paths through it as well.
 """
 
 from __future__ import annotations
@@ -691,11 +690,10 @@ def _serial_for_the_zoo(value: Optional[int]) -> Optional[int]:
 def resolve_responses_only_num_proc(trainer, num_proc):
     """Bound the worker count ``train_on_responses_only`` hands to ``map()``.
 
-    ``dataset_utils.train_on_responses_only`` still auto-sizes with the uncapped
-    ``min(max(cpu_count + 4, 2), 64)`` heuristic this module replaces everywhere
-    else -- the shape behind issue #2693. Until that copy is wired onto this
-    module the bound is applied from outside, and two properties of its API
-    constrain what can be expressed:
+    Older ``dataset_utils.train_on_responses_only`` releases auto-size with the
+    uncapped ``min(max(cpu_count + 4, 2), 64)`` heuristic (issue #2693), so the
+    bound is applied from outside, and two properties of its API constrain what
+    can be expressed:
 
     * **Serial is the config-layer sentinel, not the call-site one.** That helper
       reads ``None`` as "size it for me", so on ``fork`` handing it ``None``

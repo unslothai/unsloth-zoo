@@ -348,6 +348,9 @@ def _load_lora_outcome(model):
 @pytest.mark.parametrize("case", sorted(_ineligible_cases()))
 def test_ineligible_falls_back_to_todays_path(case, capsys, monkeypatch):
     kwargs, mutate, needle = _ineligible_cases()[case]
+    if case == "target_parameters":
+        # Refused on the copy path only; the exact fold handles real expert LoRA (section 15).
+        monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "copy")
     model, llm, vllm_model = _make_model(**kwargs)
     if mutate is not None: mutate(model)
     before = _snapshot(vllm_model)
@@ -856,7 +859,8 @@ _cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 
 
 @_cuda
-def test_cuda_pristine_copy_is_pinned_host_memory_not_gpu():
+def test_cuda_pristine_copy_is_pinned_host_memory_not_gpu(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "copy")
     model, llm, vllm_model = _make_model(device = "cuda")
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
@@ -876,27 +880,31 @@ def test_cuda_fold_restore_is_bit_exact_over_100_cycles():
 
 
 @_cuda
-def test_cuda_folded_value_matches_single_rounding():
+@pytest.mark.parametrize("restore", ["copy", "auto"])
+def test_cuda_folded_value_matches_single_rounding(monkeypatch, restore):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", restore)
     model, llm, vllm_model = _make_model(device = "cuda")
     state = prepare_merged_rollout(model)
+    bases = [W.detach().clone() for _, W, _ in state.entries]
     expected = []
     for module, W, P in state.entries:
         A = module.lora_A["default"].weight.to(DTYPE).float()
         B = module.lora_B["default"].weight.to(DTYPE).float()
-        expected.append((P.cuda().float() + module.scaling["default"] * (B @ A)).to(DTYPE))
+        expected.append((W.detach().float() + module.scaling["default"] * (B @ A)).to(DTYPE))
     for _ in range(3):
         with merged_rollout(state):
-            for (module, W, P), want in zip(state.entries, expected):
+            for (module, W, P), want, base in zip(state.entries, expected, bases):
                 ulp = (want.float().abs() * 2 ** -7).clamp_min(2 ** -133)
                 assert ((W.float() - want.float()).abs() <= ulp).all()
-                assert not torch.equal(W.cpu(), P)
+                assert not torch.equal(W, base)
         # Read on the current stream with no host sync: it must see the restored weights.
-        for _, W, P in state.entries:
-            assert torch.equal(W, P.cuda(non_blocking = True))
+        for (_, W, _), base in zip(state.entries, bases):
+            assert torch.equal(W, base)
 
 
 @_cuda
 def test_cuda_falls_back_when_host_ram_is_short(monkeypatch, capsys):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "copy")
     import unsloth_zoo.block_swap as block_swap
     monkeypatch.setattr(block_swap, "_pin_budget", lambda: 0)
     model, llm, vllm_model = _make_model(device = "cuda")
@@ -1235,6 +1243,7 @@ def test_attention_engine_still_serves_the_unfolded_rest(_attention_mode, _isola
 
 
 def test_target_parameters_refused_only_when_folding_everything(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "copy")
     model, llm, vllm_model = _make_model()
     model.peft_config["default"].target_parameters = ["mlp.experts.gate_up_proj"]
     targets, reason = _merged_rollout_targets(model)
@@ -1242,3 +1251,195 @@ def test_target_parameters_refused_only_when_folding_everything(monkeypatch):
     monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "attention")
     targets, reason = _merged_rollout_targets(model)
     assert reason is None and {_is_attention(n) for n, _, _ in targets} == {True}
+
+
+# 14. Exact fold / unfold (default on CUDA): no pristine copy, bit-exact restore, streamed fix-up store.
+@_cuda
+def test_cuda_exact_mode_keeps_no_pristine_copy():
+    model, llm, vllm_model = _make_model(device = "cuda")
+    state = prepare_merged_rollout(model)
+    assert state is not None and all(P is None for _, _, P in state.entries) and state.host is None
+
+
+@_cuda
+def test_cuda_exact_generate_folds_then_restores_bit_exact(_isolate):
+    model, llm, vllm_model = _make_model(device = "cuda")
+    before = _snapshot(vllm_model)
+    for step in range(20):
+        _perturb_adapter(model, step)
+        llm.generate(["hi"], lora_request = load_lora(model, _ADAPTER_DIR, load_tensors = True))
+        assert llm.calls[-1][1] is None
+        assert not all(torch.equal(a, b) for a, b in zip(before, llm.calls[-1][2]))
+        state = model._unsloth_merged_rollout_state
+        assert state.exact_targets is None and 0 <= state.fixup["bad"] < state.fixup["elements"]
+    _assert_bitwise(before, vllm_model)
+
+
+@_cuda
+def test_cuda_exact_attention_mode(monkeypatch, _isolate):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "attention")
+    model, llm, vllm_model = _make_model(device = "cuda")
+    before = _snapshot(vllm_model)
+    llm.generate(["hi"], lora_request = load_lora(model, _ADAPTER_DIR, load_tensors = True))
+    sent = llm.calls[-1][1]
+    assert type(sent) is _isolate.LoRARequest and not any("self_attn" in k for k in sent.lora_tensors)
+    _assert_bitwise(before, vllm_model)
+
+
+@_cuda
+def test_cuda_exact_failed_unfold_poisons(monkeypatch):
+    model, llm, vllm_model = _make_model(device = "cuda")
+    state = prepare_merged_rollout(model)
+    import unsloth_zoo.merged_rollout_exact as ex
+    def broken(targets, stream = None): raise RuntimeError("Unsloth: exact LoRA unfold checksum mismatch")
+    monkeypatch.setattr(ex, "exact_unfold", broken)
+    with pytest.raises(RuntimeError, match = "could not restore"):
+        with merged_rollout(state): pass
+    assert state.poisoned is not None
+    with pytest.raises(RuntimeError):
+        prepare_merged_rollout(model)
+
+
+@_cuda
+def test_cuda_exact_failed_target_build_keeps_state_usable(monkeypatch):
+    # e.g. an OOM casting the adapter factors: nothing was folded, so the original error
+    # surfaces, the weights are untouched and the next rollout works.
+    import unsloth_zoo.vllm_utils as vu
+    model, llm, vllm_model = _make_model(device = "cuda")
+    state = prepare_merged_rollout(model)
+    before = _snapshot(vllm_model)
+    real = vu._merged_rollout_exact_target
+    def oom(*args, **kwargs): raise torch.OutOfMemoryError("CUDA out of memory")
+    monkeypatch.setattr(vu, "_merged_rollout_exact_target", oom)
+    with pytest.raises(torch.OutOfMemoryError):
+        with merged_rollout(state): pass
+    assert state.poisoned is None
+    _assert_bitwise(before, vllm_model)
+    monkeypatch.setattr(vu, "_merged_rollout_exact_target", real)
+    with merged_rollout(state): pass
+    _assert_bitwise(before, vllm_model)
+
+
+# 15. MoE expert LoRA (PEFT target_parameters) folded by the exact kernel.
+class _Experts(nn.Module):
+    def __init__(self, E, H, I, transposed):
+        super().__init__()
+        self.is_transposed = transposed
+        shape_gu, shape_d = ((E, H, 2 * I), (E, I, H)) if transposed else ((E, 2 * I, H), (E, H, I))
+        self.gate_up_proj = nn.Parameter(torch.randn(shape_gu) * 0.02)
+        self.down_proj = nn.Parameter(torch.randn(shape_d) * 0.02)
+
+
+class _MoeBlock(nn.Module):
+    def __init__(self, E, H, I, transposed):
+        super().__init__()
+        self.experts = _Experts(E, H, I, transposed)
+
+
+class _MoeLayer(nn.Module):
+    def __init__(self, E, H, I, transposed):
+        super().__init__()
+        self.self_attn = _Attn()
+        self.mlp = _MoeBlock(E, H, I, transposed)
+
+
+class _MoeTiny(nn.Module):
+    def __init__(self, transposed):
+        super().__init__()
+        self.config = _Config(model_type = "tiny_moe", tie_word_embeddings = False)
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_MoeLayer(4, H, 32, transposed) for _ in range(2)])
+
+
+def _make_moe(transposed = False):
+    torch.manual_seed(0)
+    base = _MoeTiny(transposed).cuda()
+    for p in base.parameters():
+        p.data = p.data.to(DTYPE); p.requires_grad_(False)
+    shared = [p for p in base.parameters()]
+    config = LoraConfig(r = 4, lora_alpha = 8, target_modules = ["q_proj", "o_proj"],
+                        target_parameters = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"], lora_dropout = 0.0)
+    model = get_peft_model(base, config)
+    g = torch.Generator().manual_seed(1)
+    for name, p in model.named_parameters():
+        if "lora_B" in name:
+            p.data = (torch.randn(p.shape, generator = g) * 0.05).to(p.device, p.dtype)
+    vllm_model = nn.Module()
+    vllm_model.weights = nn.ParameterList([nn.Parameter(t, requires_grad = False) for t in shared])
+    llm = _FakeLLM(vllm_model)
+    install_merged_rollout_engine_wrapper(llm)
+    model.vllm_engine = llm
+    return model, llm, vllm_model
+
+
+def _expert_oracle(module, W0, grouped = False):
+    # PEFT's own per-expert delta formula, fp64, from the W-dtype-cast factors the fold uses.
+    E = W0.shape[0]
+    A = module.lora_A["default"].weight.to(W0.dtype).double()
+    B = module.lora_B["default"].weight.to(W0.dtype).double()
+    A = A.reshape(E, -1, A.shape[-1])
+    # grouped_by_expert (UNSLOTH_MOE_LORA_B_LAYOUT): B_e is the e-th block of r columns.
+    B = B.reshape(B.shape[0], E, -1).permute(0, 2, 1) if grouped else B.reshape(B.shape[0], -1, E)
+    # PEFT 0.18 has no swap flag: its param is always [E, in, out].
+    eq = "o r e, e r i -> e o i" if getattr(module, "_did_swap_in_out_features", False) else "o r e, e r i -> e i o"
+    delta = torch.einsum(eq.replace(" ", ""), B, A) * module.scaling["default"]
+    return (W0.float() + delta.float()).to(W0.dtype)
+
+
+@_cuda
+@pytest.mark.parametrize("layout", ["rank_major", "grouped_by_expert"])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_cuda_exact_folds_moe_experts(transposed, layout, monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_utils
+    monkeypatch.setattr(moe_utils, "moe_lora_b_layout_for_wrapper", lambda wrapper, adapter_name = None: layout)
+    model, llm, vllm_model = _make_moe(transposed)
+    state = prepare_merged_rollout(model)
+    assert state is not None, model._unsloth_merged_rollout_state.reason
+    experts = [(m, W) for m, W, _ in state.entries if vllm_utils._merged_rollout_is_param_wrapper(m)]
+    assert len(experts) == 4   # 2 layers x gate_up, down
+    before = _snapshot(vllm_model)
+    W0 = [W.detach().clone() for _, W in experts]
+    with merged_rollout(state):
+        for (m, W), w0 in zip(experts, W0):
+            want = _expert_oracle(m, w0, grouped = layout == "grouped_by_expert")
+            assert (W.view(torch.int16).int() - want.view(torch.int16).int()).abs().max().item() <= 1
+            assert not torch.equal(W, w0)
+    _assert_bitwise(before, vllm_model)
+
+
+@_cuda
+def test_moe_experts_refused_when_exact_mode_is_off_for_the_targets(monkeypatch):
+    # e.g. folded weights on two devices: the copy fold is 2-D only, so experts stay on vLLM LoRA.
+    model, llm, vllm_model = _make_moe()
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_use_exact", lambda targets: False)
+    assert prepare_merged_rollout(model) is None
+    assert "exact fold" in model._unsloth_merged_rollout_state.reason
+
+
+@_cuda
+def test_moe_experts_refused_without_the_exact_fold(monkeypatch):
+    model, llm, vllm_model = _make_moe()
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT_RESTORE", "copy")
+    targets, reason = _merged_rollout_targets(model)
+    assert targets is None and "exact fold" in reason
+
+
+@_cuda
+def test_cuda_failed_self_check_falls_back_to_copy(monkeypatch, capsys):
+    import unsloth_zoo.merged_rollout_exact as ex
+    monkeypatch.setattr(ex, "_SELF_CHECK", {})
+    monkeypatch.setattr(ex, "_self_check", lambda device, dtype: "fold is 3 ulp from the reference")
+    model, llm, vllm_model = _make_model(device = "cuda")
+    state = prepare_merged_rollout(model)
+    assert state is not None and all(P is not None for _, _, P in state.entries)
+    assert "self-check failed" in capsys.readouterr().out
+
+
+def test_exact_mode_needs_one_device(monkeypatch):
+    # Targets split across devices (a model-parallel training model) take the copy path.
+    import unsloth_zoo.merged_rollout_exact as ex
+    monkeypatch.setattr(ex, "exact_merge_available", lambda device, dtype = None: True)
+    one = [(None, None, torch.empty(2, dtype = DTYPE)), (None, None, torch.empty(2, dtype = DTYPE))]
+    two = [one[0], (None, None, torch.empty(2, dtype = DTYPE, device = "meta"))]
+    assert vllm_utils._merged_rollout_use_exact(one) is True
+    assert vllm_utils._merged_rollout_use_exact(two) is False

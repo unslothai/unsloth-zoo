@@ -2832,6 +2832,13 @@ def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch
     assert backbone._deepstack_process(
         mx.zeros((1, 4, 1)), mx.array([[False, False, True, True]]), full
     ).tolist() == [[[0.0], [0.0], [5.0], [7.0]]]
+    # They reach the backbone as one array with a level per column, each for its own layer.
+    backbone.layers = [lambda h, *args: h, lambda h, *args: h * 2]
+    assert backbone(
+        None, inputs_embeds=mx.zeros((1, 4, 1)), mask="m",
+        visual_pos_masks=mx.array([[False, False, True, True]]),
+        deepstack_visual_embeds=mx.stack([full, full * 100], axis=2),
+    ).tolist() == [[[1.0], [1.0], [511.0], [715.0]]]
 
 
 def test_the_glm5_next_merge_really_refuses_a_count_mismatch():
