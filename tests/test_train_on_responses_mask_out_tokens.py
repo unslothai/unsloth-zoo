@@ -328,3 +328,73 @@ def test_the_precompute_against_a_real_fast_tokenizer():
     assert "let me think" in trained, "only the closer is masked"
     assert THINK_CLOSE not in trained
     assert "hello" not in trained and INSTRUCTION_PART not in trained
+
+
+# ------------------------------------------------------ leading-space variant
+
+
+def test_a_separate_space_token_before_the_closer_stays_trained():
+    """Qwen3 / SmolLM3 encode " </think>" as [space, </think>]; only the closer is
+    masked, the space before it is not."""
+    space = ord(" ")
+    row = [USER_ID, 10, ASSISTANT_ID, 20, space, THINK_ID, 21]
+
+    labels = _masker(mask_out_tokens = [THINK_CLOSE])({"input_ids": [row]})["labels"][0]
+
+    assert labels == [-100, -100, -100, 20, space, -100, 21]
+
+
+def test_a_merged_leading_space_form_is_still_matched():
+    """BPE merges " ab" into one piece; that in-context form is masked too."""
+    class MergingTokenizer(StubTokenizer):
+        def __call__(self, text, add_special_tokens = False, **kwargs):
+            if text == " ab":
+                return StubEncoding(input_ids = [77], attention_mask = [1])
+            return super().__call__(text, add_special_tokens, **kwargs)
+
+    a, b = ord("a"), ord("b")
+    row = [USER_ID, 10, ASSISTANT_ID, a, b, 20, 77, 21]
+    masker = train_on_responses_only(
+        None, INSTRUCTION_PART, RESPONSE_PART, tokenizer = MergingTokenizer(),
+        return_function = True, mask_out_tokens = ["ab"],
+    )
+
+    labels = masker({"input_ids": [row]})["labels"][0]
+
+    assert labels == [-100, -100, -100, -100, -100, 20, -100, 21]
+
+
+# ------------------------------------------- UnslothVisionDataCollator(...) kwarg
+
+
+def _real_collator(**kwargs):
+    from test_vision_collator_string_content import PHI4V_TEMPLATE, _Model, _make_processor
+    from unsloth_zoo.vision_utils import UnslothVisionDataCollator
+
+    processor = _make_processor(PHI4V_TEMPLATE)
+    processor.tokenizer.add_tokens([THINK_CLOSE], special_tokens = True)
+    collator = UnslothVisionDataCollator(
+        _Model(), processor, train_on_responses_only = True,
+        instruction_part = "<|im_start|>user<|im_sep|>",
+        response_part = "<|im_start|>assistant<|im_sep|>", **kwargs,
+    )
+    return collator, processor.tokenizer.convert_tokens_to_ids(THINK_CLOSE)
+
+
+@pytest.mark.parametrize("mask", [True, False])
+def test_the_collator_constructor_forwards_the_argument(mask):
+    from test_vision_collator_string_content import _example
+
+    kwargs = {"mask_out_tokens": [THINK_CLOSE]} if mask else {}
+    collator, think_id = _real_collator(**kwargs)
+    batch = collator([_example("ab </think> cd"), _example("</think>xy")])
+
+    input_ids, labels = batch["input_ids"], batch["labels"]
+    at_closer = labels[input_ids == think_id]
+    assert at_closer.numel() == 2
+    if mask:
+        assert (at_closer == -100).all()
+    else:
+        assert (at_closer == think_id).all()
+    # the rest of the answer stays trained either way
+    assert ((labels != -100) & (input_ids != think_id)).sum() > 0

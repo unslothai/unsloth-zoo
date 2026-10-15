@@ -780,8 +780,8 @@ def train_on_responses_only(
     mask_out_tokens re-masks the given token strings to -100 even inside kept
     response spans - e.g. mask_out_tokens=["</think>"] reproduces the Nemotron
     Ultra recipe of never training on the thinking closer. Each entry is matched
-    as its tokenized id sequence (a leading-space variant is matched too, for
-    SentencePiece-style tokenizers). Atomic added tokens such as "</think>"
+    as its tokenized id sequence (a leading-space variant is matched too when it
+    merges into the string, as with SentencePiece/BPE "▁word" pieces). Atomic added tokens such as "</think>"
     always match exactly; multi-token strings match only where the in-context
     tokenization equals the standalone one.
     """
@@ -906,8 +906,13 @@ def train_on_responses_only(
     if mask_out_tokens:
         if isinstance(mask_out_tokens, str): mask_out_tokens = [mask_out_tokens]
         for token_string in mask_out_tokens:
-            for candidate in dict.fromkeys((token_string, " " + token_string)):
-                ids = tokenizer(candidate, add_special_tokens = False).input_ids
+            bare   = tokenizer(token_string,       add_special_tokens = False).input_ids
+            spaced = tokenizer(" " + token_string, add_special_tokens = False).input_ids
+            # Skip the spaced form when it is just a space token before the bare ids
+            # (Qwen3 " </think>" = [220, 151668]): it would also mask that space.
+            if any(spaced[i : i + len(bare)] == bare for i in range(len(spaced) - len(bare) + 1)):
+                spaced = None
+            for ids in (bare, spaced):
                 if ids and ids not in mask_out_sequences:
                     mask_out_sequences.append(ids)
     pass
