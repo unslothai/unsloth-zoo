@@ -417,3 +417,21 @@ def test_gemma4_dense_vllm_rebuild_matches_hf(monkeypatch, tmp_path):
     input_ids = torch.tensor([[2, 5, 9, 17, 33, 64, 100, 7]])
     with torch.no_grad():
         torch.testing.assert_close(rebuilt(input_ids = input_ids).logits, reference(input_ids = input_ids).logits)
+
+
+def test_set_module_attribute_keeps_buffers_as_buffers():
+    # gemma-4-26B-A4B: std_bias / std_scale are vision-tower buffers; set as Parameters the
+    # rebuilt-tower census failed ("unexpected parameter", "buffer missing").
+    from unsloth_zoo.empty_model import _set_module_attribute
+    root = torch.nn.Module()
+    root.tower = torch.nn.Module()
+    root.tower.register_buffer("std_bias", torch.zeros(4))
+    root.tower.proj = torch.nn.Linear(4, 4)
+    value = torch.nn.Parameter(torch.arange(4.0), requires_grad = False)
+    _set_module_attribute(root, "tower.std_bias", value)
+    assert "std_bias" in dict(root.tower.named_buffers())
+    assert "std_bias" not in dict(root.tower.named_parameters())
+    assert torch.equal(root.tower.std_bias, torch.arange(4.0))
+    weight = torch.nn.Parameter(torch.ones(4, 4), requires_grad = False)
+    _set_module_attribute(root, "tower.proj.weight", weight)
+    assert root.tower.proj.weight is weight

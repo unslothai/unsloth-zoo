@@ -48,6 +48,7 @@ from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
 # get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
+_CLAMP_BOUND_SUFFIXES = (".input_min", ".input_max", ".output_min", ".output_max")
 QWEN_VL_MERGED_QKV_TYPES = (
     "qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision",
     "qwen3_5", "qwen3_5_vision", "qwen3_5_moe", "qwen3_5_moe_vision",
@@ -832,6 +833,9 @@ def _set_module_attribute(root, path, value):
     last = parts[-1]
     if last.isdigit():
         obj[int(last)] = value
+    elif isinstance(obj, torch.nn.Module) and last in obj._buffers and isinstance(value, torch.Tensor):
+        # A buffer (e.g. Gemma-4 vision std_bias / std_scale) stays a buffer, not a Parameter.
+        obj._buffers[last] = value.data if isinstance(value, torch.nn.Parameter) else value
     else:
         setattr(obj, last, value)
 pass
@@ -2389,8 +2393,8 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 layer_path = layer_path.replace('language_model.model', 'language_model')
 
 
-            if isinstance(layer_module, torch.Tensor):
-                # Parameters / buffers (e.g. Gemma4 clip bounds named *_proj.input_min)
+            if isinstance(layer_module, torch.Tensor) and layer_path.endswith(_CLAMP_BOUND_SUFFIXES):
+                # Gemma4 clipped-linear bounds (*_proj.input_min ...); other tensors keep the old path.
                 state_dict[f"{layer_path}"] = layer_module.data
                 quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
             elif layer_module is not None:
