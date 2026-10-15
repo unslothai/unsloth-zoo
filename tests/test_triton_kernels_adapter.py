@@ -503,3 +503,29 @@ def test_renamed_kernel_hopper_only_assert_is_detected(monkeypatch):
     assert go._blackwell_value_swizzle_unsupported() is False
     assert go._blackwell_value_swizzle_unsupported(root) is True
     go._source_rejects_blackwell_value_swizzle.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "needs CUDA")
+def test_real_routing_matches_a_dense_moe_across_experts():
+    """The installed copy's own routing (topk metadata on newer APIs) with k = 4 of 8 experts."""
+    backend = tkc.get_triton_kernels_backend()
+    if backend is None:
+        pytest.skip("no triton_kernels copy installed")
+    from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize_torch
+
+    g = torch.Generator(device = "cuda").manual_seed(0)
+    E, N, K, T, k = 8, 256, 512, 64, 4
+    blocks = torch.randint(0, 256, (E, N, K // 32, 16), dtype = torch.uint8, device = "cuda", generator = g)
+    scales = torch.randint(118, 128, (E, N, K // 32), dtype = torch.uint8, device = "cuda", generator = g)
+    w, precision = tkc.mxfp4_ogs_weight(blocks, scales)
+    dense = mxfp4_dequantize_torch(blocks, scales, dtype = torch.float32)
+    x = torch.randn(T, K, device = "cuda", generator = g).to(torch.bfloat16)
+    logits = torch.randn(T, E, device = "cuda", generator = g)
+    rdata, gather, scatter = backend.routing(logits, k)
+    out = backend.matmul_ogs(
+        x, w, None, rdata, gather_indx = gather, scatter_indx = scatter,
+        precision_config = precision, gammas = rdata.gate_scal,
+    ).float()
+    vals, idx = torch.topk(logits, k, dim = 1)
+    ref = torch.einsum("tk,tkn->tn", torch.softmax(vals, dim = 1), torch.einsum("tc,tknc->tkn", x.float(), dense[idx]))
+    assert ((out - ref).norm() / ref.norm()).item() < 1e-2
