@@ -2428,7 +2428,7 @@ from .moe_utils import (
     _get_moe_lora_weights,
     _apply_lora_grouped_mm,
     _get_lora_wrapper_for_param,
-    select_moe_backend,
+    select_moe_backend_for_interleaved_gate_up,
     patch_param_wrapper_for_moe,
     forward_native_grouped_mm,
     forward_native_moe_loop,
@@ -2464,7 +2464,7 @@ def patch_gpt_oss_moe_for_lora():
     if hasattr(GptOssExpertsClass, "_unsloth_lora_patched"):
         return
 
-    backend = select_moe_backend()
+    backend = select_moe_backend_for_interleaved_gate_up()
 
     if backend == "grouped_mm":
         forward = forward_native_grouped_mm
@@ -3025,7 +3025,7 @@ def patch_gpt_oss_linearized():
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
 
     # Patch only GptOssExperts.forward (not the class) to keep 4-bit weight loading working
-    backend = select_moe_backend()
+    backend = select_moe_backend_for_interleaved_gate_up()
 
     if backend == "grouped_mm":
 
