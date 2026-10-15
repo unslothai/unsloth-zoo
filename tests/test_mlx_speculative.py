@@ -316,3 +316,15 @@ def test_probes_pay_their_measured_regret_within_the_budget():
     assert _run(controller, machine, [([0.3] * 16, 0.2), ([0.3] * 16, None)] * 2, rounds = 600, report = report) == "plain"
     assert report["rate"] >= 0.987 * 4 / machine.plain(4) and DraftController(max_depth = 15)._warmup == [15, 7, 3, 1]
 
+
+
+def test_only_the_verify_forward_is_built_as_a_verify_block():
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.speculative import SpeculativeEngine
+
+    marked = lambda: getattr(inference._VERIFY_STATE, "attention", False)
+    engine, seen = object.__new__(SpeculativeEngine), []
+    engine._exact, engine.lm, engine.cache, engine._kwargs, engine._hidden = False, None, None, dict, lambda out: None
+    engine._verify_forward = lambda lm, inputs, cache: seen.append(marked()) or (type("Out", (), {"logits": None}), None)
+    engine._verify(None)
+    assert seen == [True] and not marked()
