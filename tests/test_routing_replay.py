@@ -333,6 +333,33 @@ def test_topk_softmax_router_is_covered_by_softmax_renorm(replay):
     torch.testing.assert_close(weights, F.softmax(logits.gather(-1, forced), dim = -1))
 
 
+def test_dense_score_router_is_replayed(replay):
+    # Unsloth's GPT-OSS router: (logits, dense [tokens, experts] scores, indices).
+    class DenseScoreRouter(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(NUM_EXPERTS, 16))
+
+        def forward(self, hidden_states):
+            logits = F.linear(hidden_states, self.weight)
+            top, idx = torch.topk(logits, TOP_K, dim = -1)
+            top = F.softmax(top, dim = 1, dtype = top.dtype)
+            return logits, torch.zeros_like(logits).scatter_(1, idx, top), idx
+
+    router = DenseScoreRouter()
+    hidden = torch.randn(5, 16)
+    forced = torch.tensor([[0, 1]] * 4 + [[-1, -1]])
+    rr._STATE.current = forced[:, None, :].clone()
+    natural = router(hidden)
+    logits, scores, ids = rr._router_hook(0)(router, (hidden,), natural)
+    assert router._unsloth_replay_formula == "softmax_renorm"
+    assert torch.equal(ids[:4], forced[:4]) and torch.equal(ids[4], natural[2][4])
+    expected = torch.zeros_like(logits[:4]).scatter(1, forced[:4], F.softmax(logits[:4, :2], dim = -1))
+    torch.testing.assert_close(scores[:4], expected)
+    torch.testing.assert_close(scores[4], natural[1][4])
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 1
+
+
 def test_record_drops_pad_and_marks_last_token(replay):
     rr._STATE.pad_token_id = PAD
     routed = np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS

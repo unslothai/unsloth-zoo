@@ -363,7 +363,8 @@ def _formulas():
 
 
 def _split_router_output(output):
-    """(logits position, weights position, ids position) in a (logits, weights, ids) style tuple."""
+    """(logits position, weights position, ids position, dense) in a (logits, weights, ids) style
+    tuple. dense: the weights are [tokens, experts] scores, zero off the top-k (Unsloth's GPT-OSS)."""
     if not isinstance(output, tuple) or len(output) != 3:
         return None
     ids_pos = [i for i, x in enumerate(output) if torch.is_tensor(x) and not x.is_floating_point()]
@@ -374,9 +375,13 @@ def _split_router_output(output):
     k = ids.shape[-1]
     weights_pos = [i for i in float_pos if output[i].shape[-1] == k and output[i].shape[:-1] == ids.shape[:-1]]
     logits_pos = [i for i in float_pos if output[i].shape[-1] > k]
-    if len(weights_pos) != 1 or len(logits_pos) != 1:
-        return None
-    return logits_pos[0], weights_pos[0], ids_pos[0]
+    if len(weights_pos) == 1 and len(logits_pos) == 1:
+        return logits_pos[0], weights_pos[0], ids_pos[0], False
+    a, b = (output[i] for i in float_pos)
+    if not weights_pos and a.shape == b.shape and a.shape[:-1] == ids.shape[:-1]:
+        # (router_logits, router_scores, router_indices), both [tokens, experts].
+        return float_pos[0], float_pos[1], ids_pos[0], True
+    return None
 
 
 def _router_hook(layer_index):
@@ -386,12 +391,16 @@ def _router_hook(layer_index):
         if positions is None:
             _STATE.stats["router_calls_natural"] += 1
             return None
-        li, wi, ii = positions
+        li, wi, ii, dense = positions
         logits, weights, ids = output[li], output[wi], output[ii]
         num_experts = logits.shape[-1]
         logits2 = logits.reshape(-1, num_experts)
         ids2 = ids.reshape(-1, ids.shape[-1])
-        weights2 = weights.reshape(ids2.shape)
+        if dense:
+            scores2 = weights.reshape(logits2.shape)
+            weights2 = scores2.gather(-1, ids2.long())
+        else:
+            weights2 = weights.reshape(ids2.shape)
         recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2)
         if recomputed is not None:
             _STATE.stats["router_calls_recomputed"] += 1
@@ -443,6 +452,10 @@ def _router_hook(layer_index):
             _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed
         _STATE.stats["router_calls_replayed"] += 1
 
+        if dense:
+            new_weights = torch.zeros_like(scores2).scatter(-1, forced, new_weights)
+            new_weights = torch.where(valid, new_weights, scores2)
+
         output = list(output)
         output[ii] = forced.to(ids.dtype).reshape(ids.shape)
         output[wi] = new_weights.reshape(weights.shape)
@@ -453,7 +466,8 @@ def _router_hook(layer_index):
 
 def _is_router(module):
     name = type(module).__name__
-    return name.endswith("TopKRouter") or name.endswith("TopkRouter")
+    # Also Unsloth's GptOssTopKRouterBnb4bit.
+    return "TopKRouter" in name or "TopkRouter" in name
 
 
 def install_routing_replay(model, llm = None, tokenizer = None):
