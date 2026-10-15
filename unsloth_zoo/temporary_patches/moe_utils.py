@@ -4465,19 +4465,19 @@ def patch_param_wrapper_for_moe():
 # UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
 
 
-_WEIGHTED_UNPERMUTE = None
+# Resolved once at import, not lazily on first call: the combine runs inside compiled
+# MoE forwards, and a global that changes after the first trace makes Dynamo guard on
+# it and recompile every enclosing graph once. moe_triton_kernels only imports triton
+# inside its kernel builders, so importing it here is cheap.
+try:
+    from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _WEIGHTED_UNPERMUTE
+except ImportError:
+    _WEIGHTED_UNPERMUTE = None
 
 
 def weighted_unpermute(*args, **kwargs):
     """Fused Triton combine, or None so the caller falls back to the eager reduction."""
-    global _WEIGHTED_UNPERMUTE
     if _WEIGHTED_UNPERMUTE is None:
-        try:
-            from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
-        except ImportError:
-            _wu = False
-        _WEIGHTED_UNPERMUTE = _wu
-    if _WEIGHTED_UNPERMUTE is False:
         return None
     return _WEIGHTED_UNPERMUTE(*args, **kwargs)
 
