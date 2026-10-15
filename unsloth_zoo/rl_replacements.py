@@ -1112,6 +1112,41 @@ pass
 RL_REPLACEMENTS["UnslothGRPOEntropyBonus"] = UnslothGRPOEntropyBonus
 
 
+def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss_kwargs, trl_version = None):
+    """Per-token weights w with sum(w * entropies) == -entropy_coef * TRL's entropy_loss.
+
+    TRL >= 1.10: the mean entropy over the tokens the policy term acts on, divided by the
+    accumulation steps (1 in eval) for every loss_type. TRL 1.8 and 1.9 instead divided cispo /
+    dapo / vespo by the policy term's own global token normalizer, without the mean.
+    """
+    weights = completion_mask.to(torch.float32)
+    if entropy_mask is not None:
+        weights = weights * entropy_mask
+    if trl_version is None:
+        try:
+            import trl
+            trl_version = trl.__version__
+        except Exception:
+            trl_version = "0"
+    from packaging.version import Version
+    loss_type = loss_kwargs.get("loss_type", "grpo")
+    if Version(trl_version) < Version("1.10.0") and loss_type in ("cispo", "dapo", "vespo"):
+        # TRL 1.8 / 1.9 used num_items_in_batch / num_processes as is, before 1.10 rescaled it to
+        # one accumulation window (grpo_compute_loss always rescales the policy term).
+        num_items_in_batch = loss_kwargs.get("num_items_in_batch", None)
+        if torch.is_tensor(num_items_in_batch):
+            normalizer = num_items_in_batch.clamp(min = 1.0) / loss_kwargs.get("num_processes", 1)
+        else:
+            normalizer = max(float(num_items_in_batch), 1.0) / loss_kwargs.get("num_processes", 1)
+        return weights * (-entropy_coef / normalizer)
+    return weights * (
+        -entropy_coef / weights.sum().clamp(min = 1.0)
+        / loss_kwargs.get("current_gradient_accumulation_steps", 1)
+    )
+pass
+RL_REPLACEMENTS["grpo_entropy_bonus_weights"] = grpo_entropy_bonus_weights
+
+
 def _warn_unsupported_grpo_options(trainer):
     """Warn once per trainer about TRL GRPOConfig options this path ignores, so setting
     them is not silently dropped. Adaptive entropy control (use_adaptive_entropy) is
@@ -1687,6 +1722,7 @@ def grpo_accumulated_loss(
         from unsloth_zoo.rl_replacements import (
             chunked_hidden_states_selective_log_softmax_recompute as _entropy_log_softmax,
             UnslothGRPOEntropyBonus as _UnslothGRPOEntropyBonus,
+            grpo_entropy_bonus_weights as _grpo_entropy_bonus_weights,
         )
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
@@ -2615,14 +2651,7 @@ def grpo_accumulated_loss(
                 upstream_scale,
             )
         if _entropy_bonus_on:
-            # As TRL: a masked token mean divided only by the accumulation steps, whatever the loss_type.
-            _entropy_weights = completion_mask.to(torch.float32)
-            if entropy_mask is not None:
-                _entropy_weights = _entropy_weights * entropy_mask
-            _entropy_weights = _entropy_weights * (
-                -_entropy_coef / _entropy_weights.sum().clamp(min = 1.0)
-                / kwargs.get("current_gradient_accumulation_steps", 1)
-            )
+            _entropy_weights = _grpo_entropy_bonus_weights(completion_mask, entropy_mask, _entropy_coef, kwargs)
             _scaler = trainer.accelerator.scaler
             loss = loss + _UnslothGRPOEntropyBonus.apply(
                 new_entropies, _entropy_weights.to(new_entropies.device),

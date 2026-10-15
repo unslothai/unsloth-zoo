@@ -130,10 +130,7 @@ def _unsloth(quantile, coef, loss_type, beta, ga, data):
         kwargs["entropy_mask"] = entropy_mask
     loss, *_ = rr.grpo_compute_loss(ref, logps, old, None, torch.zeros_like(mask), mask, beta, advantages, **kwargs)
     if coef != 0.0:
-        weights = mask.to(torch.float64)
-        if entropy_mask is not None:
-            weights = weights * entropy_mask
-        weights = weights * (-coef / weights.sum().clamp(min = 1.0) / ga)
+        weights = rr.grpo_entropy_bonus_weights(mask, entropy_mask, coef, kwargs).to(torch.float64)
         loss = loss + rr.UnslothGRPOEntropyBonus.apply(entropies, weights, 1.0, None)
     return loss, torch.autograd.grad(loss, [logps, entropies], allow_unused = True)
 
@@ -175,6 +172,34 @@ def test_entropy_mask_matches_trl(case, seed):
 @pytest.mark.parametrize("seed", [0, 3])
 def test_entropy_bonus_matches_trl(case, seed):
     _check(case, seed)
+
+
+@pytest.mark.parametrize("loss_type", ["grpo", "dapo", "cispo", "bnpo"])
+def test_bonus_weights_follow_trl_1_8_and_1_9_for_token_sum_losses(loss_type):
+    # TRL 1.8.0 / 1.9.0 GRPOTrainer._compute_loss, transcribed: cispo / dapo / vespo divided the
+    # entropy sum by the policy normalizer; the rest took the masked mean over the GA steps.
+    gen = torch.Generator().manual_seed(11)
+    mask = (torch.rand(4, 6, generator = gen) > 0.3).long()
+    entropy_mask = torch.rand(4, 6, generator = gen) > 0.5
+    entropies = torch.rand(4, 6, generator = gen, dtype = torch.float64)
+    kwargs = dict(
+        loss_type = loss_type, num_items_in_batch = torch.tensor(40.0), num_processes = 2,
+        steps_per_generation = 4, current_gradient_accumulation_steps = 2,
+    )
+    effective = (mask * entropy_mask).double()
+    if loss_type in ("cispo", "dapo"):
+        normalizer = 40.0 / 2
+        want = (entropies * effective).sum() / normalizer
+    else:
+        want = (entropies * effective).sum() / effective.sum().clamp(min = 1.0) / 2
+    for version in ("1.8.0", "1.9.0"):
+        weights = rr.grpo_entropy_bonus_weights(mask, entropy_mask, 0.3, kwargs, trl_version = version)
+        torch.testing.assert_close((weights.double() * entropies).sum(), -0.3 * want)
+    weights = rr.grpo_entropy_bonus_weights(mask, entropy_mask, 0.3, kwargs, trl_version = "1.10.0")
+    torch.testing.assert_close(
+        (weights.double() * entropies).sum(),
+        -0.3 * (entropies * effective).sum() / effective.sum().clamp(min = 1.0) / 2,
+    )
 
 
 def test_bonus_gradient_ignores_grad_output_like_the_policy_term():
