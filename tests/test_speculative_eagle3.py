@@ -346,6 +346,23 @@ def test_accumulated_batches_weight_every_token_equally(tmp_path):
     assert torch.allclose(seven * 7, one)
 
 
+def test_items_in_batch_count_the_supervised_rows(tmp_path):
+    """Row t is supervised by labels[t + 1]: position 0 and padding never count."""
+    from transformers import Trainer
+
+    if not hasattr(Trainer, "_get_num_items_in_batch"):
+        pytest.skip("this transformers counts items inline")
+    target = _target()
+    drafter = _drafter(target)
+    args = Eagle3TrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True, save_strategy = "no")
+    trainer = UnslothEagle3Trainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": [1, 2, 3]}]))
+    ids = torch.randint(0, VOCAB, (2, 6))
+    mask = torch.tensor([[1] * 6, [1] * 4 + [0] * 2])
+    batches = [{"input_ids": ids, "labels": ids.clone(), "attention_mask": mask}]
+    assert int(trainer._get_num_items_in_batch(batches, torch.device("cpu"))) == 5 + 3
+
+
 def test_draft_config_keeps_rope_on_every_transformers():
     """transformers < 5 LlamaConfig reads rope_theta / rope_scaling; >= 5 reads rope_parameters."""
     from transformers import LlamaConfig

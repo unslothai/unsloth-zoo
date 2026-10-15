@@ -632,6 +632,17 @@ class UnslothEagle3Trainer(Trainer):
         self.model_accepts_loss_kwargs = True
         self._eagle3_log = []
 
+    def _get_num_items_in_batch(self, batch_samples, device):
+        # Count what compute_loss supervises (labels[:, 1:] inside the attention mask), not raw labels.
+        counted = []
+        for batch in batch_samples:
+            labels = batch.get("labels", batch["input_ids"])[:, 1:]
+            mask = batch.get("attention_mask")
+            if mask is not None:
+                labels = labels.masked_fill(~mask[:, 1:].bool(), -100)
+            counted.append({**batch, "labels": labels, "shift_labels": labels})
+        return super()._get_num_items_in_batch(counted, device)
+
     def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None):
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
