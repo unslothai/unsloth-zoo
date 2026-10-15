@@ -117,3 +117,16 @@ def test_invalid_env_is_ignored(monkeypatch):
     add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_new_tok>"])
     n = len(tokenizer)
     assert _rows(model) == (n, n, n)
+
+
+def test_second_call_unsuppresses_the_rows_it_turns_into_tokens(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    n1 = len(tokenizer)
+    padded = model.get_input_embeddings().weight.shape[0]
+    assert list(model.generation_config.suppress_tokens) == list(range(n1, padded))
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_b>"], pad_to_multiple_of = 64)
+    new_id = tokenizer.convert_tokens_to_ids("<unsloth_b>")
+    assert new_id == n1 and _rows(model) == (padded, padded, padded)
+    assert list(model.generation_config.suppress_tokens) == list(range(n1 + 1, padded))

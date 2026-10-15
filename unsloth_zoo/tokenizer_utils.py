@@ -115,14 +115,16 @@ def _round_up_vocab(n_rows, pad_to_multiple_of):
 pass
 
 
-def _suppress_padded_rows(model, start, end):
-    """Alignment rows [start, end) have no token: keep HF generate from ever sampling them."""
-    if end <= start: return
+def _suppress_padded_rows(model, start, end, now_valid = range(0)):
+    """Alignment rows [start, end) have no token: keep HF generate from ever sampling them.
+    Ids in `now_valid` were alignment rows of an earlier call and are real tokens now."""
     generation_config = getattr(model, "generation_config", None)
     if generation_config is None: return
     suppress = list(getattr(generation_config, "suppress_tokens", None) or [])
+    if not suppress and end <= start: return
+    suppress = [i for i in suppress if i not in now_valid]
     suppress += [i for i in range(start, end) if i not in suppress]
-    generation_config.suppress_tokens = suppress
+    generation_config.suppress_tokens = suppress or None
 pass
 
 
@@ -269,11 +271,15 @@ def add_new_tokens(
 
     # Deterministic mean init for alignment rows (HF mean_resizing samples them randomly).
     pad_start = max(old_rows, new_vocab_length)
-    if pad_to_multiple_of is not None and resize_target > pad_start:
+    padded = pad_to_multiple_of is not None and resize_target > pad_start
+    if padded:
         with torch.no_grad():
             embedding_matrix[pad_start:resize_target] = mean_embedding
             lm_head_matrix  [pad_start:resize_target] = mean_lm_head
-        _suppress_padded_rows(model, pad_start, resize_target)
+    # A later call reuses earlier alignment rows for its new tokens: those ids must not stay suppressed.
+    _suppress_padded_rows(
+        model, pad_start, resize_target if padded else pad_start, range(old_length, new_vocab_length),
+    )
     pass
 
     # We set a flag to say we need to train embeddings
