@@ -1795,9 +1795,11 @@ def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
     k1 = log pi_rollout - log pi_train and k3 = r - 1 - log r (r = pi_train / pi_rollout) estimate
     KL(rollout || train) as verl compute_offpolicy_metrics; w = the applied IS weights."""
     with torch.no_grad():
-        keep = mask.to(torch.bool)
+        log_ratio = old_logps.to(torch.float64) - sampling_logps.to(torch.float64)
+        # Tokens vLLM could not score (NaN) carry no divergence information: leave them out.
+        keep = mask.to(torch.bool) & ~torch.isnan(log_ratio)
         maskd = keep.to(torch.float64)
-        log_ratio = torch.nan_to_num(old_logps.to(torch.float64) - sampling_logps.to(torch.float64), nan = 0.0) * maskd
+        log_ratio = torch.nan_to_num(log_ratio, nan = 0.0) * maskd
         log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
         k3 = (torch.expm1(log_ratio) - log_ratio) * maskd
         w = torch.broadcast_to(is_weights.to(torch.float64), maskd.shape) * maskd

@@ -224,6 +224,18 @@ def test_mismatch_metrics_empty_and_on_policy():
     assert got["sampling/importance_sampling_rejected_frac"] == 0.0
 
 
+def test_mismatch_stats_leave_out_unscored_tokens():
+    new, old, sampling, mask, adv = _data(rows = 4, seed = 3)
+    _, flat = _loss(new, old, sampling, mask, adv, "token_truncate", 0.5, 2.0)
+    holed = sampling.clone()
+    hole = mask.to(torch.bool) & (torch.rand(mask.shape, generator = torch.Generator().manual_seed(1)) < 0.3)
+    assert hole.any()
+    holed[hole] = float("nan")
+    got = rr.grpo_rollout_mismatch_stats(old, holed, mask, flat)
+    want = rr.grpo_rollout_mismatch_stats(old, sampling, mask * (~hole), flat)
+    torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-14)
+
+
 @pytest.mark.parametrize("options", [None, "token_k3,seq_mean_k1"])
 @pytest.mark.parametrize("mode", ["geometric_mask", "sequence_mask"])
 def test_compiles_fullgraph(options, mode):
