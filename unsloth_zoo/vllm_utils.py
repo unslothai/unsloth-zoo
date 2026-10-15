@@ -3391,7 +3391,6 @@ _REPLAYSSM_MAMBA2_MODELS = {
     "falcon_h1": ("falcon_h1", "FalconH1ForCausalLM", "mamba_n_groups"),
     "granitemoehybrid": ("granitemoehybrid", "GraniteMoeHybridForCausalLM", "mamba_n_groups"),
     "zamba2": ("zamba2", "Zamba2ForCausalLM", "mamba_ngroups"),
-    "mamba2": ("mamba2", "Mamba2ForCausalLM", "n_groups"),
 }
 # Gated DeltaNet (Qwen3.5 / Qwen3.6 / Qwen3-Next): vLLM has no GDN ReplaySSM yet, so
 # unsloth_zoo.vllm_gdn_replayssm backports it; opt-in only (UNSLOTH_VLLM_REPLAYSSM=1).

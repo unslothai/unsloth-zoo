@@ -198,7 +198,6 @@ _HF_CONFIGS = {
     "falcon_h1": "FalconH1Config",
     "granitemoehybrid": "GraniteMoeHybridConfig",
     "zamba2": "Zamba2Config",
-    "mamba2": "Mamba2Config",
 }
 
 
