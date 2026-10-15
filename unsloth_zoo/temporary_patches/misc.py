@@ -698,13 +698,21 @@ def _flash_sdpa_takes_causal(config, embeds):
         return False
     if torch.cuda.get_device_capability(embeds.device) < (8, 0):
         return False
-    head_dim = getattr(config, "head_dim", None)
-    if not isinstance(head_dim, int):
+    try:
+        configs = [config] if not getattr(config, "is_heterogeneous", False) else list(config.per_layer_config)
+    except Exception:
+        return False
+    for layer_config in configs:
+        # transformers >= 5.17 heterogeneous configs raise a RuntimeError on a global per-layer attribute.
         try:
-            head_dim = config.hidden_size // config.num_attention_heads
+            head_dim = getattr(layer_config, "head_dim", None)
+            if not isinstance(head_dim, int):
+                head_dim = layer_config.hidden_size // layer_config.num_attention_heads
         except Exception:
             return False
-    return 0 < head_dim <= 256 and head_dim % 8 == 0
+        if not (0 < head_dim <= 256 and head_dim % 8 == 0):
+            return False
+    return True
 
 
 def _maskless_causal_arguments(signature, args, kwargs):

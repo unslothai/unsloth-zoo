@@ -555,3 +555,22 @@ def test_right_padding_keeps_the_mask_without_flash_sdpa(patched, monkeypatch):
     config = _config()
     assert not misc._flash_sdpa_takes_causal(config, torch.zeros(1, 2, 16, dtype = torch.bfloat16))
     assert not misc._flash_sdpa_takes_causal(config, torch.zeros(1, 2, 16))
+
+
+def test_flash_sdpa_check_reads_heterogeneous_head_dims(monkeypatch):
+    # transformers >= 5.17 raises on config.head_dim when it varies per layer (Gemma4Unified).
+    try:
+        from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
+    except Exception:
+        pytest.skip("this transformers has no heterogeneous Gemma4UnifiedTextConfig")
+    import types
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (9, 0))
+    embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
+    wide = Gemma4UnifiedTextConfig(num_hidden_layers = 4)
+    assert wide.is_heterogeneous
+    assert misc._flash_sdpa_takes_causal(wide, embeds) is False  # 512-dim full-attention layers
+    narrow = Gemma4UnifiedTextConfig(num_hidden_layers = 4, global_head_dim = 128)
+    assert misc._flash_sdpa_takes_causal(narrow, embeds) is True
+    assert misc._flash_sdpa_takes_causal(_config(), embeds) is True
