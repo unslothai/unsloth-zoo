@@ -353,3 +353,48 @@ def test_length_averaged_losses_finite_with_empty_completion_row(method, loss_ty
     assert torch.isfinite(loss) and all(torch.isfinite(v).all() for v in metrics.values())
     assert torch.isfinite(states.grad).all() and torch.isfinite(weight.grad).all()
     assert states.grad[1].abs().max() == 0
+
+
+def test_orpo_gradient_keeps_its_limit_at_logp_zero():
+    # sigmoid(-log_odds) -> 0 and 1 / (1 - p) -> inf at p = 1, with a finite product e^r / (1 - e^r).
+    chosen = torch.tensor([0.0, -2.0, -1e-3], requires_grad = True)
+    rejected = torch.tensor([-1.0, -3.0, -0.5], requires_grad = True)
+    grads = torch.autograd.grad(orpo_preference_loss(chosen, rejected, beta = 0.1)[0].sum(), (chosen, rejected))
+    assert abs(grads[0][0].item() - 0.1 * math.exp(-1) / (1 - math.exp(-1))) < 1e-6
+    assert abs(grads[1][0].item()) < 1e-30
+    c64 = chosen.detach().double().requires_grad_(True)
+    r64 = rejected.detach().double().requires_grad_(True)
+    c_ = c64.clone(); c_ = torch.where(torch.arange(3) == 0, c_ - 1e-12, c_)
+    exact = torch.autograd.grad(orpo_preference_loss(c_, r64, beta = 0.1)[0].sum(), (c64, r64))
+    torch.testing.assert_close(grads[0], exact[0].float(), rtol = 1e-5, atol = 1e-7)
+    torch.testing.assert_close(grads[1], exact[1].float(), rtol = 1e-5, atol = 1e-7)
+
+
+def test_reference_bias_used_with_shared_weight():
+    states, weight, b, labels, mask = _tensors(21, rows = 4, bias = True)
+    ref_states = states.detach() + 0.1
+    ref_bias = b.detach() + torch.linspace(-3, 3, b.shape[0], dtype = DT)
+    ref_logps = fused_linear_token_logps(ref_states, weight.detach(), ref_bias, labels, mask)["per_token_logps"]
+    ref_logps = (ref_logps * mask).sum(-1)
+    kwargs = dict(method = "dpo", loss_type = "sigmoid", beta = 0.3)
+    want = fused_linear_preference_loss(
+        states, weight, b, labels, mask, ref_chosen_logps = ref_logps[:2], ref_rejected_logps = ref_logps[2:], **kwargs,
+    )[0]
+    got = fused_linear_preference_loss(
+        states, weight, b, labels, mask, ref_hidden_states = ref_states, ref_lm_head_bias = ref_bias, **kwargs,
+    )[0]
+    torch.testing.assert_close(got, want)
+
+
+def test_sigmoid_label_smoothing_follows_installed_trl():
+    chosen, rejected = torch.tensor([-2.0, -5.0], dtype = DT), torch.tensor([-3.0, -1.0], dtype = DT)
+    zeros = torch.zeros(2, dtype = DT)
+    plain = -F.logsigmoid(0.5 * (chosen - rejected))
+    conservative = 0.8 * plain - 0.2 * F.logsigmoid(-0.5 * (chosen - rejected))
+    kw = dict(loss_type = "sigmoid", beta = 0.5, label_smoothing = 0.2)
+    torch.testing.assert_close(dpo_preference_loss(chosen, rejected, zeros, zeros, sigmoid_label_smoothing = False, **kw)[0], plain)
+    torch.testing.assert_close(dpo_preference_loss(chosen, rejected, zeros, zeros, sigmoid_label_smoothing = True, **kw)[0], conservative)
+    trl = pytest.importorskip("trl")
+    from packaging.version import Version
+    legacy = Version(trl.__version__) < Version("0.29.0.dev0")
+    torch.testing.assert_close(dpo_preference_loss(chosen, rejected, zeros, zeros, **kw)[0], conservative if legacy else plain)

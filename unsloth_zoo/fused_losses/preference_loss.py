@@ -33,6 +33,7 @@ __all__ = [
     "CPO_LOSS_TYPES",
 ]
 
+import functools
 import math
 import os
 from typing import Optional
@@ -55,6 +56,18 @@ def _rows_per_chunk(n_rows, vocab_size, chunk_size):
     # About four float32 rows x vocab buffers are live per chunk in backward.
     rows = _target_chunk_bytes() // max(4 * 4 * vocab_size, 1)
     return max(1, min(int(rows), max(n_rows, 1)))
+
+
+@functools.lru_cache(maxsize = None)
+def _trl_sigmoid_uses_label_smoothing():
+    # TRL <= 0.28 DPOTrainer.dpo_loss smooths the sigmoid loss (conservative DPO); TRL >= 0.29
+    # applies label_smoothing only to robust / exo_pair / aot and its sigmoid is -logsigmoid(beta * delta).
+    try:
+        from importlib.metadata import version
+        from packaging.version import Version
+        return Version(version("trl")) < Version("0.29.0.dev0")
+    except Exception:
+        return True
 
 
 def _transform_logits(logits, scale_multiply, scale_divide, softcapping):
@@ -260,10 +273,13 @@ def dpo_preference_loss(
     label_smoothing: float = 0.0,
     reference_free: bool = False,
     discopop_tau: float = 0.05,
+    sigmoid_label_smoothing: Optional[bool] = None,
 ):
     """TRL ``DPOTrainer.dpo_loss`` (reverse KL): ``(losses, chosen_rewards, rejected_rewards)``.
 
     ``bco_pair`` (running mean across steps) and ``sft`` (chosen NLL) stay with the trainer.
+    ``sigmoid_label_smoothing`` (default: follow the installed TRL) applies ``label_smoothing`` to
+    ``sigmoid`` as conservative DPO, as TRL <= 0.28 does; TRL >= 0.29 ignores it there.
     """
     chosen_logratios = chosen_logps - (not reference_free) * ref_chosen_logps
     rejected_logratios = rejected_logps - (not reference_free) * ref_rejected_logps
@@ -274,7 +290,11 @@ def dpo_preference_loss(
         ref_logratios = ref_chosen_logps - ref_rejected_logps
     logits = logratios - ref_logratios
 
-    if loss_type == "sigmoid":
+    if sigmoid_label_smoothing is None:
+        sigmoid_label_smoothing = _trl_sigmoid_uses_label_smoothing()
+    if loss_type == "sigmoid" and not sigmoid_label_smoothing:
+        losses = -F.logsigmoid(beta * logits)
+    elif loss_type == "sigmoid":
         losses = (
             -F.logsigmoid(beta * logits) * (1 - label_smoothing)
             - F.logsigmoid(-beta * logits) * label_smoothing
@@ -356,8 +376,17 @@ def orpo_preference_loss(chosen_logps: torch.Tensor, rejected_logps: torch.Tenso
     """TRL ``ORPOTrainer.odds_ratio_loss`` on length-averaged logps; minimise ``nll - losses.mean()``."""
     dtype = torch.promote_types(chosen_logps.dtype, torch.float32)
     chosen_logps, rejected_logps = chosen_logps.to(dtype), rejected_logps.to(dtype)
-    log_odds = (chosen_logps - rejected_logps) - (_log1mexp(chosen_logps) - _log1mexp(rejected_logps))
-    ratio = F.logsigmoid(log_odds)
+    log1mexp_chosen, log1mexp_rejected = _log1mexp(chosen_logps), _log1mexp(rejected_logps)
+    log_odds = (chosen_logps - rejected_logps) - (log1mexp_chosen - log1mexp_rejected)
+    # Autograd through the clamped log1mexp loses the finite limit of sigmoid(-log_odds) / (1 - p)
+    # at a logp of exactly 0, so the analytic gradients are attached instead (same value).
+    with torch.no_grad():
+        log_sig_neg = F.logsigmoid(-log_odds)
+        grad_chosen = torch.exp(log_sig_neg - log1mexp_chosen)
+        grad_rejected = -torch.exp(log_sig_neg - log1mexp_rejected)
+    ratio = F.logsigmoid(log_odds).detach() \
+        + grad_chosen * (chosen_logps - chosen_logps.detach()) \
+        + grad_rejected * (rejected_logps - rejected_logps.detach())
     losses = beta * ratio
     chosen_rewards = beta * chosen_logps.detach()
     rejected_rewards = beta * rejected_logps.detach()
@@ -431,6 +460,7 @@ def fused_linear_preference_loss(
     chunk_size: Optional[int] = None,
     discopop_tau: float = 0.05,
     alpha: float = 0.0,
+    sigmoid_label_smoothing: Optional[bool] = None,
 ):
     """Preference loss from hidden states ``[2B, T, H]``, chosen rows first then rejected.
 
@@ -469,7 +499,9 @@ def fused_linear_preference_loss(
                 ref_per_token = fused_linear_token_logps(
                     ref_hidden_states,
                     lm_head_weight if ref_lm_head_weight is None else ref_lm_head_weight,
-                    lm_head_bias if ref_lm_head_weight is None else ref_lm_head_bias,
+                    ref_lm_head_bias if ref_lm_head_bias is not None else (
+                        lm_head_bias if ref_lm_head_weight is None else None
+                    ),
                     labels, loss_mask, **transforms,
                 )["per_token_logps"]
                 ref_logps = _sequence_logps(ref_per_token, loss_mask, average)
@@ -478,6 +510,7 @@ def fused_linear_preference_loss(
             chosen_logps, rejected_logps, ref_chosen_logps, ref_rejected_logps,
             loss_type = loss_type, beta = beta, label_smoothing = label_smoothing,
             reference_free = reference_free, discopop_tau = discopop_tau,
+            sigmoid_label_smoothing = sigmoid_label_smoothing,
         )
         loss = losses.mean()
     else:
