@@ -374,8 +374,9 @@ def _aux_capture_ids(aux_layer_ids, num_layers):
     """Aux id k (input of layer k) is the output of decoder layer k - 1."""
     ids = []
     for k in aux_layer_ids:
-        if not 1 <= k <= num_layers:
-            raise ValueError(f"Unsloth: EAGLE-3 aux layer id {k} must be in [1, {num_layers}].")
+        # llama.cpp reads id == n_layer from the nextn output, not a layer input (common/speculative.cpp).
+        if not 1 <= k < num_layers:
+            raise ValueError(f"Unsloth: EAGLE-3 aux layer id {k} must be in [1, {num_layers - 1}].")
         ids.append(k - 1)
     return ids
 

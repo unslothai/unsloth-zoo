@@ -445,3 +445,10 @@ def test_chunked_loss_with_the_target_lm_head_on_another_device():
 def test_eagle3_compute_loss_applies_the_distributed_scale():
     import inspect
     assert "token_average_scale(self, num_items_in_batch)" in inspect.getsource(UnslothEagle3Trainer.compute_loss)
+
+
+def test_aux_id_equal_to_the_layer_count_is_refused():
+    """llama.cpp reads id == n_layer from the nextn output, which plain Llama / Qwen3 graphs never fill."""
+    assert _aux_capture_ids([1, 2], 4) == [0, 1]
+    with pytest.raises(ValueError, match = "aux layer id 4"):
+        _aux_capture_ids([1, 4], 4)
