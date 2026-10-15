@@ -1501,7 +1501,10 @@ class _OffloadedActivation:
         self.pinned_bytes  = 0
 
     def __del__(self):
-        if self.pinned_bytes: _release_pinned(self.pinned_bytes)
+        try:
+            if self.pinned_bytes: _release_pinned(self.pinned_bytes)
+        except Exception:
+            pass  # interpreter shutdown
 pass
 
 
@@ -1593,10 +1596,11 @@ class NonReentrantActivationOffloader:
         return record
     pass
 
-    def _prefetch(self, index, device_index):
+    def _prefetch(self, index):
         if index < 0 or index >= len(self.order): return
         record = self.order[index]()
         if record is None or record.host is None or record.device_tensor is not None: return
+        device_index = record.device.index
         compute = torch.cuda.current_stream(device_index)
         side = self._stream(self.h2d_streams, device_index)
         # Allocated on the compute stream, which consumes it; the side stream waits for
@@ -1631,7 +1635,7 @@ class NonReentrantActivationOffloader:
         else:
             if record.copied is not None: compute.wait_event(record.copied)
             x = record.host.to(record.device, non_blocking = True)
-        if self.stream_mode: self._prefetch(record.index - 1, device_index)
+        if self.stream_mode: self._prefetch(record.index - 1)
         return x
     pass
 
