@@ -444,3 +444,12 @@ def test_router_returning_only_logits_warns_and_stays_natural(replay):
     with pytest.warns(UserWarning, match = "routes inside the MoE block"):
         assert hook(router, (torch.randn(3, 16),), router(torch.randn(3, 16))) is None
     assert rr.routing_replay_stats()["router_calls_natural"] == 1
+
+
+def test_generate_without_training_keeps_bounded_routes(replay, monkeypatch):
+    monkeypatch.setattr(rr, "_MAX_CALLS_PER_ROLLOUT", 3)
+    for i in range(10):
+        rr.record_routed_experts([_request([20 + i], [30 + i, 40 + i], np.zeros((3, NUM_LAYERS, TOP_K)))])
+    assert len(rr._STATE.generations) == 1
+    assert len(next(iter(rr._STATE.generations.values()))) == 3
+    assert rr._lookup((29, 39, 49)) is not None and rr._lookup((20, 30, 40)) is None

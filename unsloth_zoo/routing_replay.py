@@ -54,6 +54,7 @@ import torch.nn.functional as F
 ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 _MAX_ROLLOUTS = 2
+_MAX_CALLS_PER_ROLLOUT = 64
 _MAX_PENDING = 64
 
 
@@ -194,7 +195,10 @@ def record_routed_experts(request_outputs, pad_token_id = None):
             _STATE.generation_id += 1
             _STATE.generations[_STATE.generation_id] = []
             _STATE.forwarded_since_record = False
-        next(reversed(_STATE.generations.values())).append((store, unpadded, pad_token_id))
+        calls = next(reversed(_STATE.generations.values()))
+        calls.append((store, unpadded, pad_token_id))
+        # generate without training forwards in between (evaluation) would otherwise grow forever.
+        del calls[:-_MAX_CALLS_PER_ROLLOUT]
         while len(_STATE.generations) > _MAX_ROLLOUTS:
             _STATE.generations.popitem(last = False)
     return len(store)
