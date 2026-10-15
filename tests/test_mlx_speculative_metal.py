@@ -457,6 +457,11 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
             patch.setattr(native, name, lambda self, *args: None)
             with inference.exact_speculative_verify(model):
                 assert type(verifier) is native
+    # A drifted attention body leaves only the attention route native.
+    with monkeypatch.context() as patch:
+        patch.setattr(native, "_attention", lambda self, *args: None)
+        with inference.exact_speculative_verify(model):
+            assert type(verifier) is not native and "_attention" not in vars(type(verifier))
 
 
 def _verify_call(lm, cache, block):
@@ -676,6 +681,56 @@ def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qw
                 entry.left_padding = padding + 0
         starts = [start + keep for start, keep in zip(starts, keeps)]
     assert not any("keys" in vars(entry) for entry in engine.cache)  # the commit's view of the QSA keys is gone
+
+
+@pytest.mark.parametrize("heads", [(24, 4), (16, 2), (8, 2)])
+def test_a_block_read_in_one_pass_over_the_kv_prefix_matches_one_row_sdpa_calls_bit_for_bit(heads, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    gqa = heads[0] // heads[1]
+    # Batched rows, a row count past one threadgroup's, and key counts on each side of MLX's block-count steps.
+    for batch, width, keys, dtype in ((1, 3, 5000, mx.bfloat16), (2, 5, 9000, mx.float16), (1, 8, 40000, mx.bfloat16), (1, 13, 70000, mx.bfloat16)):
+        blocks = inference._sdpa_vector_blocks(gqa, keys - width + 1)
+        assert blocks == inference._sdpa_vector_blocks(gqa, keys)
+        # Cache-shaped: a capacity-padded buffer cut to `keys`, and queries transposed from (B, L, H, D).
+        k, v = (mx.random.normal((batch, heads[1], keys + 100, 256)).astype(dtype)[..., :keys, :] for _ in range(2))
+        q = (2 * mx.random.normal((batch, width, heads[0], 256))).astype(dtype).transpose(0, 2, 1, 3)
+        rows = mx.concatenate([mx.fast.scaled_dot_product_attention(
+            q[:, :, i : i + 1], k[:, :, : keys - width + i + 1], v[:, :, : keys - width + i + 1], scale = 0.0625)
+            for i in range(width)], axis = 2)
+        assert mx.array_equal(inference._exact_attention_rows(q, k, v, 0.0625, blocks).view(mx.uint16), rows.view(mx.uint16)).item()
+    # Rows on both sides of a block-count step stay one-row calls, as do array masks, quantized caches and float32 rows.
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_MIN_KEYS", 0)
+    monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
+    blocks = lambda n: inference._sdpa_vector_blocks(gqa, n)
+    q, k = mx.zeros((1, heads[0], 4, 256), mx.bfloat16), mx.zeros((1, heads[1], 70000, 256), mx.bfloat16)
+    for n in (1024, 4096, 8192, 16384, 32768, 65536):
+        if blocks(n - 1) != blocks(n) or blocks(n) != blocks(n + 1):
+            assert inference._exact_attention(q, k[:, :, : n + 1], k[:, :, : n + 1], 0.0625, None, None, lambda: "rows") == "rows"
+    for args in ((q, k, k, 0.0625, None, mx.ones((1, 1, 4, k.shape[2]), mx.bool_)), (q, k, k, 0.0625, SimpleNamespace(bits = 8), None),
+                 (q.astype(mx.float32), k.astype(mx.float32), k.astype(mx.float32), 0.0625, None, None)):
+        assert inference._exact_attention(*args, lambda: "rows") == "rows"
+    assert isinstance(inference._exact_attention(q, k, k, 0.0625, None, None, lambda: q), mx.array) and inference._VERIFY_VERDICTS
+
+
+def test_long_verify_blocks_read_attention_in_one_pass_and_match_the_native_verifier(qwen_4bit, monkeypatch):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    model, ids, _ = qwen_4bit
+    lm, block = model.language_model, mx.array([ids[0][24:30]])
+    cache, prompt = make_prompt_cache(lm), (ids[0] * 64)[:4200]
+    lm(mx.array([prompt]), cache = cache, skip_logits = True)
+    mx.eval([entry.state for entry in cache])
+    native, unscoped = {keep: _verified(lm, cache, block, keep) for keep in (0, 2, 6)}, __import__("copy").copy(lm)
+    attention = lambda: [key for key in served if key[1] == "attention"]
+    served = _serving(monkeypatch)
+    with inference.exact_speculative_verify(model):
+        assert _same(native[0], _verified(lm, cache, block, 0)) and not attention()
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_MIN_KEYS", 4096)
+        # An unscoped copy of the model stays on the one-row calls.
+        assert _same(native[0], _verified(unscoped, cache, block, 0)) and not attention()
+        assert all(_same(expected, _verified(lm, cache, block, keep)) for keep, expected in native.items())
+    layers = sum(not layer.is_linear for layer in lm.model.layers)
+    assert len(attention()) == layers * len(native) and all(inference._VERIFY_VERDICTS[key] for key in attention())
 
 
 def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
