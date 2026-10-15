@@ -100,7 +100,6 @@ def _top_level_triton_kernels_backend():
 
 
 def _check_triton_kernels_available():
-    """Is OpenAI's triton_kernels package available for MXFP4."""
     return _top_level_triton_kernels_backend() is not None
 
 
