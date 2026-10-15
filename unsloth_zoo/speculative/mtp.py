@@ -98,11 +98,13 @@ def mtp_family_name(config):
 
 
 def find_mtp_tensor_names(source, revision = None, config = None):
-    """{full tensor name: shard file} for every MTP tensor in the checkpoint."""
+    """{full tensor name: shard file} for every MTP tensor in the checkpoint. `config` (the
+    target's) picks the family; read from `source` when omitted."""
     weight_map, _ = _weight_map(source, revision = revision)
-    family = _nextn_family(_text_config(config) if config is not None else None)
+    text = _text_config(config) if config is not None else _source_text_config(source, revision)
+    family = _nextn_family(text)
     if family is not None:
-        n = int(_text_config(config).num_hidden_layers)
+        n = int(text.num_hidden_layers)
         return {name: shard for name, shard in weight_map.items() if family.is_mtp_name(name, n)}
     return {name: shard for name, shard in weight_map.items() if MTP_PREFIX_RE.match(name)}
 

@@ -313,3 +313,13 @@ def test_pre_norm_family_trains_on_last_layer_hidden(tmp_path):
         out = target.model(input_ids = ids[:, :12], output_hidden_states = True)
     # transformers' last hidden_states entry is post-norm; the pre-norm residual is the last layer's output.
     assert calls and not torch.allclose(calls[0][0, :9], out.last_hidden_state[0, :9], atol = 1e-4)
+
+
+def test_find_mtp_tensor_names_reads_the_config_from_the_checkpoint(tmp_path):
+    from unsloth_zoo.speculative.mtp import find_mtp_tensor_names
+
+    config = _glm_config()
+    head = _randomise(build_nextn_head(config))
+    ckpt = _write_target_checkpoint(tmp_path / "ckpt", config, head)
+    found = find_mtp_tensor_names(str(ckpt))
+    assert found and set(found) == set(export_nextn_state_dict(head))
