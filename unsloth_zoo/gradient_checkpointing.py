@@ -153,6 +153,10 @@ def _grow_host_buffer(buffer, new_size):
     """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
     if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
     old_bytes = _storage_bytes(buffer)
+    if new_size * buffer.element_size() <= old_bytes:
+        # A shrunk buffer keeps its storage, so this resize_ allocates nothing.
+        buffer.resize_(new_size)
+        return _mark_host_buffer(buffer)
     new_bytes = max(old_bytes, new_size * buffer.element_size())
     pinned = getattr(buffer, HOST_PINNED_ATTR, False)
     # resize_ takes a new pinned block and hands the old one back to the host cache.
@@ -199,6 +203,15 @@ def _host_allocator_held_bytes():
     except Exception: return None  # torch < 2.7 has no host_memory_stats
 
 
+def _host_allocator_free_bytes():
+    """Pinned bytes cached free in the host allocator (any user's), None if unknown."""
+    if DEVICE_TYPE not in ("cuda", "hip"): return None
+    try:
+        stats = torch.cuda.host_memory_stats()
+        return int(stats["allocated_bytes.current"]) - int(stats["active_bytes.current"])
+    except Exception: return None
+
+
 def _compute_pinned_cap():
     env = os.environ.get("UNSLOTH_GC_PINNED_MAX_GB")
     if env:
@@ -240,8 +253,12 @@ def _reserve_pinned(nbytes):
     global GC_PINNED_BYTES, GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _HOST_HELD_BASELINE
     block = _pinned_block_bytes(nbytes)
     if _PINNED_CACHED.get(block, 0) > 0:
-        _PINNED_CACHED[block] -= 1  # the allocator hands back the cached block, already charged
-        return True
+        _PINNED_CACHED[block] -= 1
+        free = _host_allocator_free_bytes()
+        if free is None or free >= block:
+            return True  # the allocator hands back the cached block, already charged
+        # Another pinned user took the block: it is no longer ours, and this request is new.
+        GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
     held = _host_allocator_held_bytes()
     if GC_PINNED_CAP is None:
         GC_PINNED_CAP = _compute_pinned_cap()

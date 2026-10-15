@@ -25,6 +25,7 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
     monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
     monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: None, raising = False)
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: None, raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)
     return gc_module
@@ -151,3 +152,30 @@ def test_allocator_growth_beyond_our_charge_counts(monkeypatch, gc_module):
     assert gc_module._reserve_pinned(4096)
     held["bytes"] = 1000 + 4096 + 4096              # a cached block of ours was taken by another user
     assert not gc_module._reserve_pinned(4096)      # 8192 already held past the baseline
+
+
+def test_cached_block_taken_by_another_user_is_not_reused_past_the_cap(monkeypatch, gc_module):
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(6000 / (1 << 30)))
+    held = {"bytes": 0}
+    free = {"bytes": 0}
+    monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: held["bytes"])
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: free["bytes"])
+    assert gc_module._reserve_pinned(4096)
+    held["bytes"] = 4096
+    gc_module._release_pinned(4096)                 # cached, but a pinned DataLoader takes it
+    free["bytes"] = 0
+    # A new 4096 block would make 8192 pinned, past the 6000 cap.
+    assert not gc_module._reserve_pinned(4096)
+    # Still reusable when the allocator really holds it free.
+    gc_module._release_pinned(4096)
+    free["bytes"] = 4096
+    assert gc_module._reserve_pinned(4096)
+
+
+def test_regrowth_within_retained_storage_reserves_nothing(monkeypatch, gc_module, pin_requests):
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", "1")
+    a = gc_module._new_host_buffer(4000, torch.float16)   # 8000 bytes, 8192 block
+    a.resize_(1000)                                         # reset shrinks numel, keeps storage
+    grown = gc_module._grow_host_buffer(a, 3000)            # 6000 bytes fit the 8000 storage
+    assert grown is a and getattr(grown, gc_module.HOST_PINNED_ATTR)
+    assert gc_module.GC_PINNED_BYTES == 8192 and gc_module._PINNED_CACHED == {}
