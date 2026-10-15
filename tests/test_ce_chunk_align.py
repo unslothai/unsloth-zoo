@@ -57,7 +57,6 @@ def _run_fused(ce, bsz, qlen, n_chunks, dtype, hd = 8, vocab = 48, bias = False)
     return loss.detach(), grads, rows
 
 
-# bsz * qlen = 8194 in 12 chunks: torch.chunk gives 683 rows per chunk.
 ODD_SHAPES = [(2, 4097, 12), (3, 1001, 4), (1, 5000, 8), (2, 777, 3)]
 
 
@@ -70,7 +69,6 @@ def test_fused_ce_chunks_are_aligned(monkeypatch, bsz, qlen, n_chunks):
     assert sum(rows) == n
     assert all(r % ALIGN == 0 for r in rows[:-1]), rows
     assert 0 < rows[-1]
-    # Memory: no chunk larger than torch.chunk's largest.
     assert max(rows) <= math.ceil(n / n_chunks), rows
 
 
@@ -85,7 +83,6 @@ def test_fused_ce_matches_previous_chunking(monkeypatch, dtype, tol, bsz, qlen, 
     old_loss, old_grads, old_rows = _run_fused(ce, bsz, qlen, n_chunks, dtype, bias = bias)
     assert old_rows == [t.shape[0] for t in torch.chunk(torch.empty(bsz * qlen), n_chunks)]
     torch.testing.assert_close(loss, old_loss, rtol = 2e-6, atol = 2e-6)
-    # The input gradient of a row depends only on that row.
     torch.testing.assert_close(grads[0], old_grads[0], rtol = tol, atol = tol)
     for a, b in zip(grads[1:], old_grads[1:]):
         torch.testing.assert_close(a, b, rtol = tol, atol = tol)

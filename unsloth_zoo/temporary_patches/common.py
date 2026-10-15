@@ -355,9 +355,8 @@ pass
 CHUNK_ALIGN_ROWS = 128 if os.environ.get("UNSLOTH_CE_CHUNK_ALIGN", "0").strip() == "1" else 0
 
 def chunk_row_bounds(n_rows, chunks, align = CHUNK_ALIGN_ROWS):
-    """Boundaries of equal ``align``-multiple ranges (plus a remainder) none larger than
-    ``ceil(n_rows / chunks)``, so the memory budget behind ``chunks`` holds; this can add ranges.
-    None when that would shrink ranges by over a quarter (caller keeps torch.chunk)."""
+    """``align``-multiple row ranges no larger than ``ceil(n_rows / chunks)`` (may add ranges).
+    None means keep torch.chunk."""
     if align <= 1 or chunks <= 1:
         return None
     cap = -(-n_rows // chunks)
