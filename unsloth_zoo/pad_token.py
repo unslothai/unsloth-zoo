@@ -416,7 +416,11 @@ def fix_pad_token(
         if added and hasattr(model, "resize_token_embeddings"):
             try:
                 if model.get_input_embeddings().weight.shape[0] < len(inner):
-                    model.resize_token_embeddings(len(inner))
+                    # Opt-in UNSLOTH_VOCAB_PAD_MULTIPLE aligns the grown rows; off resizes to len(inner) exactly.
+                    from .tokenizer_utils import _vocab_pad_multiple, _round_up_vocab, _suppress_padded_rows
+                    target = _round_up_vocab(len(inner), _vocab_pad_multiple())
+                    model.resize_token_embeddings(target)
+                    _suppress_padded_rows(model, len(inner), target)
             except Exception:
                 pass
         model_cfg = getattr(model, "config", None)

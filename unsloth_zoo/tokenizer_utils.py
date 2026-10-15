@@ -93,16 +93,56 @@ def mean_of_trained_tokens(model, eps = 1e-16):
 pass
 
 
+def _vocab_pad_multiple(pad_to_multiple_of = None):
+    """Opt-in row alignment for grown embeddings: kwarg, else UNSLOTH_VOCAB_PAD_MULTIPLE, else off (None)."""
+    if pad_to_multiple_of is None:
+        import os
+        env = os.environ.get("UNSLOTH_VOCAB_PAD_MULTIPLE", "").strip()
+        if not env: return None
+        try: pad_to_multiple_of = int(env)
+        except ValueError:
+            logger.warning(f"Unsloth: ignoring UNSLOTH_VOCAB_PAD_MULTIPLE={env!r} (not an integer).")
+            return None
+    elif type(pad_to_multiple_of) is not int:
+        raise ValueError(f"Unsloth: pad_to_multiple_of must be an integer, got {pad_to_multiple_of!r}")
+    return pad_to_multiple_of if pad_to_multiple_of > 1 else None
+pass
+
+
+def _round_up_vocab(n_rows, pad_to_multiple_of):
+    if not pad_to_multiple_of: return n_rows
+    return -(-n_rows // pad_to_multiple_of) * pad_to_multiple_of
+pass
+
+
+def _suppress_padded_rows(model, start, end):
+    """Alignment rows [start, end) have no token: keep HF generate from ever sampling them."""
+    if end <= start: return
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None: return
+    suppress = list(getattr(generation_config, "suppress_tokens", None) or [])
+    suppress += [i for i in range(start, end) if i not in suppress]
+    generation_config.suppress_tokens = suppress
+pass
+
+
 def add_new_tokens(
     model,
     tokenizer,
     new_tokens = [],
     method = "mean",
     interpolation = 0.5,
+    pad_to_multiple_of = None,
 ):
     """
     Resize the tokenizer and add new tokens to the model, excluding untrained
     tokens from the mean calculation.
+
+    pad_to_multiple_of (or UNSLOTH_VOCAB_PAD_MULTIPLE) is opt-in: when the
+    embedding has to grow, round its row count up to that multiple (e.g. 64).
+    The tokenizer length is unchanged; the extra rows hold the trained mean,
+    are never labels, and are added to generation_config.suppress_tokens so HF
+    generate cannot emit them. config.vocab_size becomes the padded row count.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     assert(isinstance(new_tokens, (list, tuple)))
@@ -163,6 +203,13 @@ def add_new_tokens(
     # new_vocab_length already includes the freshly added tokens, so do NOT add
     # their count again here.
     resize_target = max(old_input_length, old_output_length, new_vocab_length)
+    # Opt-in: align the grown matrix (Llama-3 + 1 token = 128257 rows -> 128320 at 64).
+    # Only when the new tokens actually overflow the existing rows.
+    pad_to_multiple_of = _vocab_pad_multiple(pad_to_multiple_of)
+    old_rows = max(old_input_length, old_output_length)
+    if pad_to_multiple_of is not None and resize_target > old_rows:
+        resize_target = _round_up_vocab(resize_target, pad_to_multiple_of)
+    pass
     # Also resizes lm_head as well!
     model.resize_token_embeddings(resize_target)
 
@@ -219,6 +266,15 @@ def add_new_tokens(
         with torch.no_grad():
             embedding_matrix[old_length:new_vocab_length] = mean_embedding
             lm_head_matrix  [old_length:new_vocab_length] = mean_lm_head
+    pass
+
+    # Opt-in alignment rows: deterministic mean init (HF mean_resizing samples them randomly).
+    pad_start = max(old_rows, new_vocab_length)
+    if pad_to_multiple_of is not None and resize_target > pad_start:
+        with torch.no_grad():
+            embedding_matrix[pad_start:resize_target] = mean_embedding
+            lm_head_matrix  [pad_start:resize_target] = mean_lm_head
+        _suppress_padded_rows(model, pad_start, resize_target)
     pass
 
     # We set a flag to say we need to train embeddings
