@@ -31,7 +31,7 @@ __all__ = [
 
 import torch
 
-from .cross_entropy_loss import unsloth_fused_ce_loss
+from .cross_entropy_loss import unsloth_fsdp_unshard, unsloth_fused_ce_loss
 
 
 EMPTY_LOGITS = torch.empty(0)
@@ -81,6 +81,7 @@ def unsloth_fused_lm_head_loss(
         target = labels
         do_shift = True
 
+    unsloth_fsdp_unshard(lm_head)
     loss = unsloth_fused_ce_loss(
         trainer        = None,
         hidden_states  = hidden_states,

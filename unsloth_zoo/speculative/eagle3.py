@@ -509,7 +509,7 @@ def load_eagle3_drafter(directory, target_model, dtype = None, device = None):
 
 def _converter_path():
     """The converter Unsloth's GGUF export uses (pinned / staged unslothai/llama.cpp revision)."""
-    from ..llama_cpp import _download_convert_hf_to_gguf
+    from unsloth_zoo.llama_cpp import _download_convert_hf_to_gguf
     return _download_convert_hf_to_gguf()[0]
 
 
