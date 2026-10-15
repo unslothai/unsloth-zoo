@@ -1798,6 +1798,7 @@ def grpo_accumulated_loss(
         new_logprobs = None
         _pack_result = None
         _pack_use = False
+        _pack_T = None
         _pack_enabled = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING", "1").lower() not in ("0", "false", "no", "off")
         _pack_ok = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
         if (_pack_enabled and not _pg_skip_pack and pixel_values is None
@@ -1939,7 +1940,14 @@ def grpo_accumulated_loss(
                 _pack_use = False
                 if isinstance(_pack_err, torch.cuda.OutOfMemoryError):
                     torch.cuda.empty_cache()
-                unwrapped_model._unsloth_seq_packing_grad_ok = False
+                if isinstance(_pack_err, torch.cuda.OutOfMemoryError) and _pack_T is not None:
+                    # an OOM means this length does not fit, not that packing is wrong
+                    _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
+                    unwrapped_model._unsloth_seq_packing_grad_unsafe_T = (
+                        _pack_T if _pack_unsafe is None else min(_pack_unsafe, _pack_T)
+                    )
+                else:
+                    unwrapped_model._unsloth_seq_packing_grad_ok = False
                 if UNSLOTH_ENABLE_LOGGING:
                     print(f"[Unsloth] GRPO sequence-packing disabled (fell back to padded): {_pack_err!r}", flush = True)
         # ---- PrefixGrouper resolution + first-use self-verify (grad) ----
