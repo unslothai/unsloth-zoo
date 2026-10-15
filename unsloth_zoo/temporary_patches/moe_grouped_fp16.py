@@ -738,11 +738,13 @@ def unavailable_reason():
 # Generic MoE path (moe_utils.grouped_mm_triton): torch._grouped_mm semantics on bf16 / fp16 operands of one dtype.
 
 
-def generic_grouped_mm(inputs, weight, offsets):
-    """torch._grouped_mm semantics; offsets are read on device (no host sync). Rows past offsets[-1] stay unwritten."""
+def generic_grouped_mm(inputs, weight, offsets, config_rows = None):
+    """torch._grouped_mm semantics; offsets are read on device (no host sync). Rows past offsets[-1] stay unwritten.
+    config_rows = (M, E) of the whole problem picks the tiles when this call is one slice of it."""
     M, K = inputs.shape
     E, _, N = weight.shape
-    config = generic_gemm_config(M, E, N, K, inputs.device, inputs.dtype)
+    config_M, config_E = config_rows or (M, E)
+    config = generic_gemm_config(config_M, config_E, N, K, inputs.device, inputs.dtype)
     out = grouped_gemm(inputs, weight, offsets, inputs.dtype, b_trans = False, num_experts = E,
                        config = config, backend = "triton", ends = True)
     GENERIC_CALLS["gemm"] += 1
