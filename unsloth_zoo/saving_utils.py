@@ -4677,6 +4677,15 @@ def _normalize_output_dtype(output_dtype):
 pass
 
 
+def _float32_merge_peak_bytes(total_16bit_bytes, max_shard_16bit_bytes, uploads_as_it_goes = False):
+    # Local: earlier shards stay widened, so the last rewrite peaks at 2 x total + one shard.
+    # Streamed to the Hub: widened shards are uploaded and removed, so 16-bit total + 2 x shard.
+    if uploads_as_it_goes:
+        return total_16bit_bytes + 2 * max_shard_16bit_bytes
+    return 2 * total_16bit_bytes + max_shard_16bit_bytes
+pass
+
+
 def _upcast_shard_to_float32(save_directory, filename):
     # Streams one tensor at a time to a temp file, then os.replace. A no-op on a shard
     # with no BF16 / F16 tensors, so a re-run or an already float32 base costs nothing.
@@ -5010,15 +5019,20 @@ def merge_and_overwrite_lora(
         break
     pass
 
-    # Widening a shard holds it and its float32 copy at once, so the peak is the final size
-    # plus one 16-bit shard; prepare_saving only checked the final size.
-    if upcast_to_float32 and not push_to_hub and free < save_size + max_size_in_bytes:
-        raise RuntimeError(
-            f"Unsloth: a float32 merged export of `{model_name}` needs about "
-            f"{(save_size + max_size_in_bytes) / 1024**3:.1f} GB of free disk at its peak, but "
-            f"`{save_directory}` has {free / 1024**3:.1f} GB. Nothing was written. Free disk "
-            f"space, save to a larger volume, or use `output_dtype = None` for a 16-bit merge."
+    # prepare_saving sized untouched tensors at their in-memory width, but every 16-bit tensor
+    # is widened, and each shard sits beside its float32 copy while it is rewritten.
+    if upcast_to_float32:
+        _peak = _float32_merge_peak_bytes(
+            total_size_in_bytes, max_size_in_bytes,
+            uploads_as_it_goes = push_to_hub and low_disk_space_usage,
         )
+        if free < _peak:
+            raise RuntimeError(
+                f"Unsloth: a float32 merged export of `{model_name}` needs about "
+                f"{_peak / 1024**3:.1f} GB of free disk at its peak, but `{save_directory}` has "
+                f"{free / 1024**3:.1f} GB. Nothing was written. Free disk space, save to a larger "
+                f"volume, or use `output_dtype = None` for a 16-bit merge."
+            )
 
     # Read before Step 1 rewrites config.json: an in-place export would strip the block size.
     _fp8_disk_block_size = (

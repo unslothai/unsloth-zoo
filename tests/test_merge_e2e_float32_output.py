@@ -144,3 +144,11 @@ def test_float32_refuses_before_writing_when_disk_cannot_hold_the_rewrite(tmp_pa
     with pytest.raises(RuntimeError, match = "free disk"):
         H.run_merge(peft_model, base_dir, str(out_dir), save_dtype = torch.float32)
     assert not any(out_dir.glob("*.safetensors"))
+
+
+def test_float32_peak_counts_every_16bit_tensor_and_the_rewrite():
+    from unsloth_zoo.saving_utils import _float32_merge_peak_bytes
+    # 10 GB of 16-bit shards, largest 4 GB: widened total 20 GB plus a 4 GB shard mid-rewrite.
+    assert _float32_merge_peak_bytes(10, 4) == 24
+    # Streamed to the Hub: the 16-bit copies plus one shard's 8 GB float32 temp.
+    assert _float32_merge_peak_bytes(10, 4, uploads_as_it_goes = True) == 18
