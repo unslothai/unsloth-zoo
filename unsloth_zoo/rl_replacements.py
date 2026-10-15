@@ -191,14 +191,10 @@ def chunked_hidden_states_selective_log_softmax(
 
 RL_REPLACEMENTS["grpo_selective_log_softmax"] = chunked_hidden_states_selective_log_softmax
 
-# chunked_hidden_states_selective_log_softmax under autograd keeps every chunk's logits alive
-# until backward (all N x V of them, bf16 when compiled, float32 eager), so its peak grows with
-# the token count. This variant follows verl's FusedLinearForPPOFunction and prime-rl's chunked
-# LM head: the forward runs each chunk under no_grad and keeps only the log-sum-exp (and the
-# entropy), the backward recomputes one chunk's logits at a time, so the extra memory is about
-# one chunk of logits. Same arguments, chunk boundaries and logprobs as the function above;
-# return_entropy = True also returns the per-token entropy of the same softmax, differentiable.
-# Self-contained (needs only torch and os) so its source can be copied into generated trainers.
+# The function above keeps every chunk's logits for backward (N x V). This one, like verl's
+# FusedLinearForPPOFunction and prime-rl's chunked LM head, keeps only per-row logsumexp and
+# recomputes one chunk at a time in backward. Same arguments, chunks and logprobs; optional
+# differentiable entropy. Self-contained (torch, os) so its source can be copied into trainers.
 def chunked_hidden_states_selective_log_softmax_recompute(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -291,7 +287,6 @@ def chunked_hidden_states_selective_log_softmax_recompute(
         compiled_backward = compile_function(dynamic = True, fullgraph = True)(post_backward)
 
         def run(kernel, eager, *args):
-            # A compile failure falls back to eager for the rest of the process.
             if self_fn._use_compiled:
                 try:
                     return kernel(*args)
@@ -359,7 +354,6 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                     )
                     del logits
                     if head is None:
-                        # The head in the dtype the forward matmul ran in.
                         head = lm_head if lm_head.dtype == grad_logits.dtype else lm_head.to(grad_logits.dtype)
                     if need_hidden:
                         grad_hidden[a:b] = (grad_logits @ head).to(device = hidden_states.device, dtype = hidden_states.dtype)
@@ -391,8 +385,7 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
     n_rows = flat_hidden_states.shape[0]
-    # Chunk boundaries exactly as chunked_hidden_states_selective_log_softmax, including the 2+
-    # rows per chunk rule for a trainable head.
+    # Same chunk boundaries as chunked_hidden_states_selective_log_softmax.
     if max_rows_per_chunk > 0:
         chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
         chunks = min(chunks, max(n_rows, 1))
