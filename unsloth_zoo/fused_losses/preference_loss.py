@@ -417,13 +417,17 @@ def fused_linear_preference_loss(
     logit_scale_divide: float = 0.0,
     logit_softcapping: float = 0.0,
     chunk_size: Optional[int] = None,
+    discopop_tau: float = 0.05,
+    alpha: float = 0.0,
 ):
     """Preference loss from hidden states ``[2B, T, H]``, chosen rows first then rejected.
 
     ``method`` is ``"dpo"`` (``DPO_LOSS_TYPES``; ``ipo`` length-averages as TRL does), ``"orpo"`` or
     ``"cpo"`` (``simpo`` with ``cpo_alpha=0`` is SimPO). DPO reference logps are passed in
     (precomputed) or scored without grad from ``ref_hidden_states``. ``nll_mask`` picks the NLL
-    tokens of ORPO / CPO (default ``loss_mask``). Returns ``(loss, metrics)`` with TRL's metric names.
+    tokens of ORPO / CPO (default ``loss_mask``). ``discopop_tau`` is ``DPOConfig.discopop_tau``,
+    ``alpha`` is ``CPOConfig.alpha`` (AlphaPO; ``cpo_alpha`` only weights the NLL). Returns
+    ``(loss, metrics)`` with TRL's metric names.
     """
     transforms = dict(
         logit_scale_multiply = logit_scale_multiply,
@@ -461,7 +465,7 @@ def fused_linear_preference_loss(
         losses, chosen_rewards, rejected_rewards = dpo_preference_loss(
             chosen_logps, rejected_logps, ref_chosen_logps, ref_rejected_logps,
             loss_type = loss_type, beta = beta, label_smoothing = label_smoothing,
-            reference_free = reference_free,
+            reference_free = reference_free, discopop_tau = discopop_tau,
         )
         loss = losses.mean()
     else:
@@ -477,7 +481,7 @@ def fused_linear_preference_loss(
         elif method == "cpo":
             losses, chosen_rewards, rejected_rewards = cpo_preference_loss(
                 chosen_logps, rejected_logps, loss_type = loss_type, beta = beta,
-                label_smoothing = label_smoothing, simpo_gamma = simpo_gamma,
+                label_smoothing = label_smoothing, simpo_gamma = simpo_gamma, alpha = alpha,
             )
             loss = losses.mean() + cpo_alpha * nll_loss
         else:

@@ -273,6 +273,24 @@ def test_fused_preference_loss_end_to_end(method, loss_type):
     torch.testing.assert_close(weight.grad, weight_b.grad, rtol = 0, atol = 1e-11)
 
 
+@pytest.mark.parametrize(
+    "method, loss_type, extra",
+    [("dpo", "discopop", dict(discopop_tau = 0.3)), ("cpo", "simpo", dict(alpha = 0.4)), ("cpo", "sigmoid", dict(alpha = -0.2))],
+)
+def test_fused_preference_loss_forwards_discopop_tau_and_alphapo_alpha(method, loss_type, extra):
+    states, weight, _, labels, mask = _tensors(12, rows = 4)
+    mask[:, 0] = True
+    ref_states = (states + 0.1 * torch.randn_like(states)).detach()
+    loss, _ = fused_linear_preference_loss(
+        states, weight, None, labels, mask, method = method, loss_type = loss_type, beta = 0.1,
+        ref_hidden_states = ref_states if method == "dpo" else None, chunk_size = 5, **extra,
+    )
+    want, _, _ = _full_logits_preference(method, loss_type, states.detach(), weight.detach(), labels, mask, ref_states, beta = 0.1, **extra)
+    default, _, _ = _full_logits_preference(method, loss_type, states.detach(), weight.detach(), labels, mask, ref_states, beta = 0.1)
+    torch.testing.assert_close(loss.detach(), want, rtol = 0, atol = 1e-12)
+    assert abs(float(want - default)) > 1e-6
+
+
 def test_dpo_policy_equals_reference_is_log2_and_precomputed_matches():
     states, weight, _, labels, mask = _tensors(11, rows = 4)
     loss, metrics = fused_linear_preference_loss(
