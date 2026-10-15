@@ -290,3 +290,93 @@ def test_sample_weight_prompt_level_matches_scalerl_formula(loss_type):
     per_row = (per_token * mask).sum(-1)
     want = sum(per_row.view(3, 4)[g].sum() / tokens[4 * g] for g in (0, 2)) / 2
     torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-15)
+
+
+_DRIVER_IDS = torch.tensor([[1, 2, 3, 4, 5], [1, 2, 6, 7, 3]])
+_DRIVER_MASK = torch.tensor([[1, 1, 1], [1, 1, 0]])
+
+
+class _DriverModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        torch.manual_seed(0)
+        self.emb = torch.nn.Embedding(8, 4)
+        self.head = torch.nn.Linear(4, 8, bias = False)
+        self.device = torch.device("cpu")
+
+    def get_output_embeddings(self):
+        return self.head
+
+    def forward(self, input_ids = None, attention_mask = None, logits_to_keep = None, **kwargs):
+        hidden = self.emb(input_ids)
+        if logits_to_keep:
+            hidden = hidden[:, -logits_to_keep:]
+        return __import__("types").SimpleNamespace(logits = hidden)
+
+
+def _drive(monkeypatch, correction, training = True, should_evaluate = False, loss_type = "dapo", is_mode = None):
+    import collections
+    import types
+
+    monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    monkeypatch.setenv("UNSLOTH_RETURN_HIDDEN_STATES", "0")
+    monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_METRICS", "1")
+    if is_mode is not None:
+        monkeypatch.setenv("UNSLOTH_GRPO_VLLM_IS_MODE", is_mode)
+
+    class _Loss:
+        @staticmethod
+        def apply(*args):
+            zero = torch.zeros(())
+            # What the real forward returns: empty when the IS correction is off, else ratio * mask.
+            ratio = _DRIVER_MASK.double() if correction else torch.tensor([])
+            return zero, zero, zero, zero, ratio, zero
+
+    monkeypatch.setattr(rr, "UnslothEfficientGRPO", _Loss)
+    model = _DriverModel()
+    model.train(training)
+    metrics = {"train": collections.defaultdict(list), "eval": collections.defaultdict(list)}
+    trainer = types.SimpleNamespace(
+        args = types.SimpleNamespace(
+            unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1, off_policy_mask_threshold = 0.5,
+        ),
+        processing_class = types.SimpleNamespace(pad_token_id = 0),
+        model = model,
+        accelerator = types.SimpleNamespace(
+            unwrap_model = lambda m, keep_fp32_wrapper = False: m, scaler = None, gather = lambda t: t,
+        ),
+        control = types.SimpleNamespace(should_evaluate = should_evaluate),
+        _metrics = metrics,
+        use_vllm = True,
+        vllm_importance_sampling_correction = correction,
+        _autocast_dtype = None,
+        beta = 0.0,
+        loss_type = loss_type,
+    )
+    logps = torch.zeros(_DRIVER_MASK.shape, dtype = torch.float64)
+    rr.grpo_accumulated_loss(
+        trainer, _DRIVER_IDS, (_DRIVER_IDS != 0).long(), 3, _DRIVER_MASK,
+        torch.zeros(_DRIVER_IDS.shape[0]), logps, None,
+        loss_type = loss_type, sampling_per_token_logps = logps - 0.1,
+    )
+    return metrics
+
+
+def test_rollout_metrics_skip_when_is_correction_is_off(monkeypatch):
+    metrics = _drive(monkeypatch, correction = False)
+    assert not metrics["train"] and not metrics["eval"]
+    metrics = _drive(monkeypatch, correction = True)
+    assert "sampling/rollout_kl_k1/mean" in metrics["train"]
+
+
+def test_rollout_metrics_bucket_follows_model_mode(monkeypatch):
+    metrics = _drive(monkeypatch, correction = True, training = False, should_evaluate = False)
+    assert "sampling/rollout_kl_k1/mean" in metrics["eval"] and not metrics["train"]
+
+
+@pytest.mark.parametrize("mode", ["geometric_mask", "geometric_truncate", "sequence_mask"])
+def test_vespo_rejects_non_token_is_mode_override(monkeypatch, mode):
+    with pytest.raises(ValueError, match = "VESPO"):
+        _drive(monkeypatch, correction = True, loss_type = "vespo", is_mode = mode)
+    _drive(monkeypatch, correction = True, loss_type = "vespo", is_mode = "token_mask")

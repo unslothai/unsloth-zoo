@@ -1918,6 +1918,17 @@ def grpo_accumulated_loss(
         "token_truncate", "token_mask", "sequence_truncate", "sequence_mask", "geometric_truncate", "geometric_mask",
     ):
         raise ValueError(f"Unsloth: unknown vLLM importance sampling mode {kwargs['vllm_importance_sampling_mode']}.")
+    # TRL validates this in __init__, before the env override: get_gamma_weights sums a per-token log ratio.
+    if (
+        kwargs.get("loss_type", getattr(trainer, "loss_type", None)) == "vespo"
+        and getattr(trainer, "use_vllm", False)
+        and getattr(trainer, "vllm_importance_sampling_correction", False)
+        and kwargs["vllm_importance_sampling_mode"] not in ("token_truncate", "token_mask")
+    ):
+        raise ValueError(
+            "Unsloth: VESPO loss requires vllm_importance_sampling_mode to be 'token_truncate' or 'token_mask'. "
+            f"Got: {kwargs['vllm_importance_sampling_mode']}."
+        )
     kwargs["vllm_importance_sampling_clip_min"] = getattr(trainer.args, "vllm_importance_sampling_clip_min", None)
     kwargs["vllm_importance_sampling_clip_max"] = getattr(trainer.args, "vllm_importance_sampling_clip_max", None)
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
@@ -2814,7 +2825,10 @@ def grpo_accumulated_loss(
                 kwargs,
                 upstream_scale,
             )
-        if _rollout_metrics_on and old_logps is not None and sampling_per_token_logps is not None and flat_is_ratio is not None:
+        if (
+            _rollout_metrics_on and old_logps is not None and sampling_per_token_logps is not None
+            and flat_is_ratio is not None and flat_is_ratio.numel() > 0
+        ):
             from unsloth_zoo.rl_replacements import (
                 grpo_rollout_mismatch_stats as _grpo_rollout_mismatch_stats,
                 grpo_rollout_mismatch_metrics as _grpo_rollout_mismatch_metrics,
@@ -2824,7 +2838,7 @@ def grpo_accumulated_loss(
             _rollout_stats = torch.cat([_rollout_stats[:, :3].sum(0), _rollout_stats[:, 3:4].amax(0), _rollout_stats[:, 4:].sum(0)])
             _metrics = trainer._metrics
             if "train" in _metrics:
-                _metrics = _metrics["eval" if trainer.control.should_evaluate else "train"]
+                _metrics = _metrics["train" if _training else "eval"]
             for _name, _value in _grpo_rollout_mismatch_metrics(_rollout_stats).items():
                 _metrics[_name].append(_value)
         if _entropy_bonus_on:
