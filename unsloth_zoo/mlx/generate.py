@@ -242,9 +242,9 @@ class GenerationDefaults:
 class GenerationRequest:
     """One generation request.
 
-    Exactly one of ``prompt`` and ``prompt_token_ids`` must be provided.
-    Rendered prompt strings are encoded as-is; chat templating belongs to the
-    caller. ``image`` (vision models only) accepts a PIL image, an array, or a
+    Exactly one of ``prompt`` and ``prompt_token_ids`` must be provided, and a
+    vision request with media must use ``prompt``. Rendered prompt strings are
+    encoded as-is; chat templating belongs to the caller. ``image`` (vision models only) accepts a PIL image, an array, or a
     str/os.PathLike filesystem path or URL, decoded once before grouping; raw
     bytes and file-like objects are rejected. ``audio`` (vision models only) is
     accepted but decodes one request at a time, since no supported mlx-vlm
@@ -329,6 +329,29 @@ def _normalize_stop_strings(stop_strings: Sequence[str] | str | None) -> tuple[s
     return tuple(dict.fromkeys(stops))
 
 
+def _validated_prompt_ids(request: GenerationRequest, index: int) -> tuple[int, ...]:
+    try:
+        prompt_ids = list(request.prompt_token_ids)
+    except TypeError as exc:
+        raise TypeError(
+            f"requests[{index}].prompt_token_ids must be a sequence "
+            "of integers."
+        ) from exc
+    if not prompt_ids:
+        raise ValueError(
+            f"requests[{index}].prompt_token_ids must not be empty."
+        )
+    if any(
+        isinstance(token, bool) or not isinstance(token, Integral)
+        for token in prompt_ids
+    ):
+        raise TypeError(
+            f"requests[{index}].prompt_token_ids must contain only "
+            "integers."
+        )
+    return tuple(int(token) for token in prompt_ids)
+
+
 def _validate_text_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
@@ -349,28 +372,9 @@ def _validate_text_requests(
         if has_prompt and not request.prompt:
             raise ValueError(f"requests[{index}].prompt must not be empty.")
         if has_ids:
-            try:
-                prompt_ids = list(request.prompt_token_ids)
-            except TypeError as exc:
-                raise TypeError(
-                    f"requests[{index}].prompt_token_ids must be a sequence "
-                    "of integers."
-                ) from exc
-            if not prompt_ids:
-                raise ValueError(
-                    f"requests[{index}].prompt_token_ids must not be empty."
-                )
-            if any(
-                isinstance(token, bool) or not isinstance(token, Integral)
-                for token in prompt_ids
-            ):
-                raise TypeError(
-                    f"requests[{index}].prompt_token_ids must contain only "
-                    "integers."
-                )
             validated[index] = replace(
                 request,
-                prompt_token_ids=tuple(int(token) for token in prompt_ids),
+                prompt_token_ids=_validated_prompt_ids(request, index),
             )
         if request.max_tokens is not None:
             _validate_positive_int(request.max_tokens, f"requests[{index}].max_tokens")
@@ -542,6 +546,10 @@ def _unpadded_lengths(mask) -> list[int] | None:
         return None
 
 
+# A vision batch takes media-free rows as prompt_token_ids, which earlier releases refused.
+VLM_TOKEN_ID_PROMPTS = True
+
+
 def _validate_vlm_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
@@ -550,14 +558,25 @@ def _validate_vlm_requests(
     for index, request in enumerate(validated):
         if not isinstance(request, GenerationRequest):
             raise TypeError(f"requests[{index}] must be GenerationRequest.")
-        if request.prompt is None or request.prompt_token_ids is not None:
+        has_ids = request.prompt_token_ids is not None
+        if (request.prompt is not None) == has_ids:
             raise ValueError(
-                f"requests[{index}] must provide a rendered prompt string; "
-                "token-id prompts are text-model only."
+                f"requests[{index}] must provide exactly one of prompt or "
+                "prompt_token_ids."
             )
-        if not isinstance(request.prompt, str):
+        if has_ids:
+            if request.image is not None or request.audio is not None:
+                raise ValueError(
+                    f"requests[{index}] gives token ids with media; only the "
+                    "processor can place media tokens, so send a rendered prompt."
+                )
+            validated[index] = replace(
+                request,
+                prompt_token_ids=_validated_prompt_ids(request, index),
+            )
+        elif not isinstance(request.prompt, str):
             raise TypeError(f"requests[{index}].prompt must be a string.")
-        if not request.prompt:
+        elif not request.prompt:
             raise ValueError(f"requests[{index}].prompt must not be empty.")
         if request.image is not None and request.audio is not None:
             raise ValueError(
@@ -2778,11 +2797,32 @@ class _VLMBatchAdapter:
         # length keeps varied batches working, at the cost of smaller groups.
         shape = self._image_shape(request.image)
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        key = (request.image is None, shape, len(tokenizer.encode(request.prompt)))
+        ids = request.prompt_token_ids
+        width = len(ids) if ids is not None else len(tokenizer.encode(request.prompt))
+        key = (request.image is None, ids is not None, shape, width)
         if self.batches_observable:
             return key
         sampling = request.sampling or self.defaults.sampling
         return (_sampler_key(sampling), *key)
+
+    def _prompt_inputs(self, requests: Sequence[GenerationRequest]) -> dict:
+        """``prepare_inputs`` for rows grouped alike; token-id rows are their own input ids."""
+        if requests[0].prompt_token_ids is not None:
+            import mlx.core as mx
+
+            input_ids = mx.array([list(request.prompt_token_ids) for request in requests])
+            return {"input_ids": input_ids, "attention_mask": mx.ones(input_ids.shape, dtype=mx.int32)}
+        images = [request.image for request in requests if request.image is not None]
+        return self.prepare_inputs(
+            self.processor,
+            images=images or None,
+            audio=None,
+            prompts=[request.prompt for request in requests],
+            image_token_index=getattr(getattr(self.model, "config", None), "image_token_index", None),
+            resize_shape=None,
+            add_special_tokens=self._add_special_tokens(),
+            pad_to_uniform_size=False,
+        )
 
     def _decode_image(self, request: GenerationRequest) -> GenerationRequest:
         """Load a path or URL image once, before grouping.
@@ -2961,23 +3001,11 @@ class _VLMBatchAdapter:
     ) -> Iterator[GenerationEvent]:
         chunk = [requests[index] for index in indices]
         batch_size = len(chunk)
-        prompts = [request.prompt for request in chunk]
-        images = [request.image for request in chunk if request.image is not None]
         row_sampling = [
             request.sampling or self.defaults.sampling for request in chunk
         ]
         sampling = row_sampling[0]
-        config = getattr(self.model, "config", None)
-        inputs = self.prepare_inputs(
-            self.processor,
-            images=images or None,
-            audio=None,
-            prompts=prompts,
-            image_token_index=getattr(config, "image_token_index", None),
-            resize_shape=None,
-            add_special_tokens=self._add_special_tokens(),
-            pad_to_uniform_size=False,
-        )
+        inputs = self._prompt_inputs(chunk)
         input_ids = inputs.get("input_ids")
         pixel_values = inputs.get("pixel_values")
         mask = inputs.get("attention_mask")
@@ -3589,18 +3617,7 @@ class _VLMBatchSession:
     def _prepare(self, request: GenerationRequest):
 
         adapter = self.adapter
-        request = adapter._decode_image(request)
-        config = getattr(adapter.model, "config", None)
-        inputs = adapter.prepare_inputs(
-            adapter.processor,
-            images = None if request.image is None else [request.image],
-            audio = None,
-            prompts = [request.prompt],
-            image_token_index = getattr(config, "image_token_index", None),
-            resize_shape = None,
-            add_special_tokens = adapter._add_special_tokens(),
-            pad_to_uniform_size = False,
-        )
+        inputs = adapter._prompt_inputs([adapter._decode_image(request)])
         input_ids = inputs.get("input_ids")
         data_kwargs = {
             key: value
@@ -3747,16 +3764,7 @@ class _SpeculativeBatchSession:
         if request.audio is not None:
             raise BatchRowRefused("An audio request decodes on its own and cannot join a batch; generate it with generate_batch or stream_batch.")
         request = adapter._decode_image(request)
-        inputs = adapter.prepare_inputs(
-            adapter.processor,
-            images = None if request.image is None else [request.image],
-            audio = None,
-            prompts = [request.prompt],
-            image_token_index = getattr(getattr(adapter.model, "config", None), "image_token_index", None),
-            resize_shape = None,
-            add_special_tokens = adapter._add_special_tokens(),
-            pad_to_uniform_size = False,
-        )
+        inputs = adapter._prompt_inputs([request])
         input_ids, mask = inputs["input_ids"], inputs.get("attention_mask")
         extra = {key: value for key, value in inputs.items() if key not in ("input_ids", "pixel_values", "attention_mask")}
         row = self._next_row
@@ -4337,6 +4345,7 @@ __all__ = [
     "GenerationRequest",
     "GenerationResult",
     "SamplingParams",
+    "VLM_TOKEN_ID_PROMPTS",
     "fast_generate",
     "generate_batch",
     "generation_mode",

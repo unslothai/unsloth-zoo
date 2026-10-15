@@ -502,9 +502,11 @@ def test_vlm_requests_accept_stop_strings():
                                   GenerationDefaults(stop_strings=("STOP",)))
 
 
-def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
+def test_vlm_requests_reject_token_ids_with_media_and_unsupported_controls():
     from unsloth_zoo.mlx.generate import _validate_vlm_requests
-    cases = ((GenerationRequest(prompt_token_ids=[1]), GenerationDefaults(), "rendered prompt string"),
+    assert _validate_vlm_requests([GenerationRequest(prompt_token_ids=iter((1, 2)))], GenerationDefaults())[0].prompt_token_ids == (1, 2)  # noqa: E501
+    cases = ((GenerationRequest(prompt_token_ids=[1], image="i.png"), GenerationDefaults(), "token ids with media"),
+        (GenerationRequest(prompt="a", prompt_token_ids=[1]), GenerationDefaults(), "exactly one"),
         (GenerationRequest(prompt=""), GenerationDefaults(), "must not be empty"),
         (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
         # One mlx-vlm would drop rather than apply is refused: an inert start or bogus scheme,
@@ -1385,6 +1387,7 @@ def _vlm_adapter(generator_type = None):
         _VLMBatchAdapter._row_logits_processors, adapter)
     adapter._wired_limit = lambda: _wired_ctx(adapter.wired)
     adapter._decode_image = lambda request: request
+    adapter._prompt_inputs = types.MethodType(_VLMBatchAdapter._prompt_inputs, adapter)
     adapter._add_special_tokens = lambda: True
     adapter._split_prompt_kwargs = lambda kwargs, n: [dict(kwargs)] * n
     adapter._admission_stalled = lambda generator: False
@@ -1556,6 +1559,20 @@ def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     assert (session.rows_in_flight, len(session.generator.inserted)) == (1, 1)
     session.adapter.model.get_input_embeddings = plain
     assert session.add(GenerationRequest(prompt = "fg")) == 1
+
+
+def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
+    session = _vlm_session()
+    session.adapter.prepare_inputs = lambda *a, **k: pytest.fail("processed")
+    assert session.add(GenerationRequest(prompt_token_ids = (7, 8, 9))) == 0
+    assert session.generator.inserted[0][0] == [[7, 8, 9]]
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.processor, adapter.batches_observable = types.SimpleNamespace(tokenizer = _CharTokenizer()), True
+    rows = [GenerationRequest(prompt_token_ids = (1, 2)), GenerationRequest(prompt_token_ids = (3, 4))]
+    assert adapter._group_key(rows[0]) != adapter._group_key(GenerationRequest(prompt = "ab"))
+    inputs = _VLMBatchAdapter._prompt_inputs(adapter, rows)
+    assert [inputs[k].tolist() for k in ("input_ids", "attention_mask")] == [[[1, 2], [3, 4]], [[1, 1]] * 2]
 
 
 def test_a_processor_is_shown_its_own_row_s_history_from_its_own_offset():
