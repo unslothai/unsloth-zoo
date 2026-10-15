@@ -1355,3 +1355,29 @@ def test_routed_lora_cuda_graph_reads_live_adapters():
             want = f()
             assert not torch.allclose(before, want)
             assert torch.equal(out, want)
+
+
+@pytest.mark.parametrize("nested", [True, False])
+@pytest.mark.parametrize("h, i", [(512, 256), (2048, 512)])
+def test_even_k_skips_masks_bit_for_bit(nested, h, i, monkeypatch):
+    # K a multiple of BLOCK_K drops the K masks: outputs must equal the masked kernel bit for bit.
+    gu_w, dn_w = _weights(11, h = h, i = i)
+    gu_p, dn_p = _q4(gu_w, nested = nested), _q4(dn_w, nested = nested)
+    gu, dn = MR._nf4_table(gu_p, gu_p.device), MR._nf4_table(dn_p, dn_p.device)
+    g = torch.Generator().manual_seed(3)
+    T, k = 3, 2
+    x = torch.randn(T, h, generator = g).to(DEV, DT)
+    idx = torch.randint(0, E, (T * k,), generator = g).to(DEV)
+    rw = torch.softmax(torch.randn(T, k, generator = g), -1).to(DEV)
+    assert MR._even_k(h, MR._block_k(h, 64)) == (torch.version.hip is None)
+
+    def run():
+        inter = MR.routed_gate_up(x, idx, gu, k, 1.702, 7.0, None, MR.ACT_SILU, False)
+        return inter, MR.routed_down(inter.to(DT), idx, rw, False, dn, k, DT)
+
+    fast = run()
+    monkeypatch.setattr(MR, "_even_k", lambda K, block_k: False)
+    masked = run()
+    for a, b in zip(fast, masked):
+        assert torch.equal(a.view(torch.uint8) if a.dtype != torch.float32 else a.view(torch.int32),
+                           b.view(torch.uint8) if b.dtype != torch.float32 else b.view(torch.int32))
