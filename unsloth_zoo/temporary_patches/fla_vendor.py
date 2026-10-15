@@ -915,7 +915,9 @@ def _load_flashqla():
         if capability not in _FLASHQLA_ARCHES:
             raise RuntimeError(f"FlashQLA does not support compute capability {capability}")
         import flash_qla
-        flash_qla.chunk_gated_delta_rule
+        # state_v_first (always forwarded below) first appeared in FlashQLA 0.1.1.
+        if "state_v_first" not in inspect.signature(flash_qla.chunk_gated_delta_rule).parameters:
+            raise RuntimeError("flash-qla >= 0.1.1 is required")
     except Exception as e:
         _flashqla_state["failed"] = True
         logger.warning(

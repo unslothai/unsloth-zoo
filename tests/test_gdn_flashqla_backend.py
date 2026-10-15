@@ -157,3 +157,31 @@ def test_verifier_rejects_what_flashqla_cannot_run():
         assert fv._flashqla_unsupported(q, k, v, g, b, None, None, None, {"use_gate_in_kernel": True}) is not None
     finally:
         state["capability"] = previous
+
+
+def _qla_chunk_010(
+    q, k, v, g, beta, scale = None, initial_state = None, output_final_state = False,
+    use_qk_l2norm_in_kernel = False, cu_seqlens = None, head_first = False,
+):
+    return "flashqla-0.1.0"
+
+
+def _qla_chunk_011(
+    q, k, v, g, beta, scale = None, initial_state = None, output_final_state = False,
+    use_qk_l2norm_in_kernel = False, cu_seqlens = None, head_first = False,
+    state_v_first = False,
+):
+    return "flashqla-0.1.1"
+
+
+@pytest.mark.parametrize("chunk, accepted", [(_qla_chunk_010, False), (_qla_chunk_011, True)])
+def test_load_rejects_flashqla_without_state_v_first(monkeypatch, chunk, accepted):
+    import torch
+    monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
+    monkeypatch.setitem(sys.modules, "flash_qla", types.SimpleNamespace(chunk_gated_delta_rule = chunk))
+    monkeypatch.setattr(fv, "_flashqla_state", dict(fv._flashqla_state, module = None, failed = False))
+    loaded = fv._load_flashqla()
+    assert (loaded is not None) == accepted
+    assert fv._flashqla_state["failed"] == (not accepted)
