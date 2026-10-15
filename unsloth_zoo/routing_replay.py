@@ -86,7 +86,8 @@ def routing_replay_engine_args(config):
         return {}
     if not vllm_supports_routed_experts():
         warnings.warn(
-            f"Unsloth: {ROUTING_REPLAY_ENV}=1 needs vLLM >= 0.14 (enable_return_routed_experts). "
+            f"Unsloth: {ROUTING_REPLAY_ENV}=1 needs a vLLM with enable_return_routed_experts "
+            "(0.14 or newer, 0.22 or newer for hybrid attention MoE). "
             "Routing replay is off.",
             stacklevel = 2,
         )
