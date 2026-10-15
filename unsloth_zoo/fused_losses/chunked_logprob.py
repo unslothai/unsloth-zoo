@@ -114,6 +114,10 @@ def _run(name, fn, *args):
     compiled = _compiled.get(name)
     if compiled is None:
         compiled = _compiled[name] = torch.compile(fn, dynamic = True, fullgraph = True, options = torch_compile_options)
+    for x in args:
+        # Row counts vary per chunk and per batch: dynamic from the first call, else one recompile per body.
+        if torch.is_tensor(x) and x.dim() >= 1 and x.shape[0] > 1:
+            torch._dynamo.maybe_mark_dynamic(x, 0)
     try:
         return compiled(*args)
     except torch.OutOfMemoryError:
