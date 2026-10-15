@@ -324,3 +324,32 @@ def test_alphapo_and_discopop_stay_finite_on_long_completions():
     assert torch.isfinite(losses).all() and all(torch.isfinite(g).all() for g in grads)
     exact = dpo_preference_loss(chosen.double(), rejected.double(), zeros.double(), zeros.double(), loss_type = "discopop", beta = 0.1)[0]
     torch.testing.assert_close(losses, exact.float())
+
+
+def test_orpo_gradients_finite_at_logps_near_zero():
+    # float32 exp(x) rounds to 1 for x near 0: the unused log1p(-exp(x)) branch must not leak NaN.
+    chosen = torch.tensor([0.0, -1e-9, -1e-4, -2.0], requires_grad = True)
+    rejected = torch.tensor([-1.0, -0.5, 0.0, -3.0], requires_grad = True)
+    losses, _, _, ratio, log_odds = orpo_preference_loss(chosen, rejected, beta = 0.1)
+    grads = torch.autograd.grad(losses.sum(), (chosen, rejected))
+    assert torch.isfinite(losses).all() and all(torch.isfinite(g).all() for g in grads)
+    # Away from an exact 0 the values are unchanged.
+    exact = orpo_preference_loss(chosen.double(), rejected.double(), beta = 0.1)[0]
+    torch.testing.assert_close(losses[[1, 3]], exact[[1, 3]].float())
+
+
+@pytest.mark.parametrize(
+    "method, loss_type", [("orpo", "sigmoid"), ("dpo", "ipo"), ("cpo", "ipo"), ("cpo", "simpo")],
+)
+def test_length_averaged_losses_finite_with_empty_completion_row(method, loss_type):
+    states, weight, _, labels, mask = _tensors(13, rows = 4)
+    mask[:, 0] = True
+    mask[1] = False  # a chosen completion fully truncated away
+    loss, metrics = fused_linear_preference_loss(
+        states, weight, None, labels, mask, method = method, loss_type = loss_type, beta = 0.1,
+        ref_hidden_states = states.detach() + 0.1 if method == "dpo" else None, chunk_size = 5,
+    )
+    loss.backward()
+    assert torch.isfinite(loss) and all(torch.isfinite(v).all() for v in metrics.values())
+    assert torch.isfinite(states.grad).all() and torch.isfinite(weight.grad).all()
+    assert states.grad[1].abs().max() == 0

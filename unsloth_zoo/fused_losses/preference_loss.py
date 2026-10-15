@@ -340,7 +340,16 @@ def dpo_preference_loss(
 
 def _log1mexp(x):
     # log(1 - exp(x)) as TRL >= 0.29 computes it; log1p(-exp(x)) cancels near x = 0.
-    return torch.where(x < -0.6931471805599453, torch.log1p(-torch.exp(x)), torch.log(-torch.expm1(x)))
+    # Each branch only sees its own inputs, since an inf derivative in the unused branch times the
+    # zero where-mask is NaN. x = 0 (probability 1) is clamped to -tiny: finite value and gradient.
+    cut = -0.6931471805599453
+    x = x.clamp(max = -torch.finfo(x.dtype).tiny)
+    small = x < cut
+    return torch.where(
+        small,
+        torch.log1p(-torch.exp(torch.where(small, x, cut))),
+        torch.log(-torch.expm1(torch.where(small, cut, x))),
+    )
 
 
 def orpo_preference_loss(chosen_logps: torch.Tensor, rejected_logps: torch.Tensor, beta: float = 0.1):
@@ -393,7 +402,8 @@ def cpo_preference_loss(
 def _sequence_logps(per_token_logps, mask, average):
     mask = mask.to(per_token_logps.dtype)
     total = (per_token_logps * mask).sum(-1)
-    return total / mask.sum(-1) if average else total
+    # A row with no completion tokens (fully truncated) averages to 0 instead of 0 / 0 = NaN.
+    return total / mask.sum(-1).clamp(min = 1) if average else total
 
 
 def fused_linear_preference_loss(
