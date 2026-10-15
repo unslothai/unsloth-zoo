@@ -3872,6 +3872,18 @@ def _gpu_class():
     return str(info.get("architecture", ""))[-1:]
 
 
+@functools.cache
+def _gpu_generation():
+    info = (getattr(mx, "device_info", None) or mx.metal.device_info)()
+    match = re.match(r"applegpu_g(\d+)", str(info.get("architecture", "")))
+    return int(match.group(1)) if match else 0
+
+
+def _launch_simds():
+    # Before M3 (no dynamic caching), this kernel's pipeline allows 832 threads per threadgroup, not 1024.
+    return 32 if _gpu_generation() >= 15 else 24
+
+
 def _vector_blocks(simds, keys):
     """The key-interleave count MLX 0.32.3's sdpa_vector_2pass picks for this launch."""
     forced = int(os.environ.get("MLX_SDPA_BLOCKS", "0") or 0)
@@ -3958,7 +3970,7 @@ def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
             and _vector_attention_kernels() is not None):
         return None
     rows, gqa = queries.shape[2], queries.shape[1] // keys.shape[1]
-    step = 32 // gqa   # MLX's launch holds gqa * rows simdgroups
+    step = _launch_simds() // gqa   # a launch holds gqa * rows simdgroups
     outs = []
     for start in range(0, rows, step):
         stop = min(start + step, rows)

@@ -596,12 +596,22 @@ def test_verify_attention_matches_mlx_vector_kernel_and_decode_rows_bitwise(gqa,
             queries[:, :, i : i + 1], keys[..., : horizon(i), :], values[..., : horizon(i), :], scale = 1.0)
             for i in range(rows)], axis = 2))
     monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # MLX's own vector kernel over each launch's rows
-    step = 32 // gqa
+    step = decode._launch_simds() // gqa
     _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
         queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
         values[..., : 4500 - rows + min(i + step, rows), :], scale = 1.0, mask = "causal")
         for i in range(0, rows, step)], axis = 2))
     assert not mx.array_equal(out[:, :, :1], out[:, :, 1:2]).item()
+
+
+def test_launches_before_m3_fit_their_threadgroup_limit(monkeypatch):
+    monkeypatch.setattr(decode, "_gpu_generation", lambda: 13)
+    launched, kernel = [], decode._vector_attention
+    monkeypatch.setattr(decode, "_vector_attention", lambda *args: launched.append(args[0].shape[2]) or kernel(*args))
+    queries, keys, values = _attention_block(8, 8, 4500)
+    out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None)
+    _equal(out, decode._decode_attention(queries, keys, values, 1.0))
+    assert launched == [3, 3, 2]   # 32 lanes x 8 query heads x 3 rows = 768 of the 832 threads allowed
 
 
 def _gemma4_attention(gqa):
@@ -632,7 +642,7 @@ def _attend(gemma4, module, x, keys = 4096, mask = "causal", call = None):
 def test_verify_scope_serves_only_marked_global_blocks_and_restores(monkeypatch):
     gemma4, layers = _gemma4_attention(gqa = 8)
     sliding, full = layers.layers
-    x = mx.random.normal((1, 4, 64)).astype(mx.bfloat16)
+    x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)   # one launch on every GPU, M1 included
     launched, kernel = [], decode._vector_attention
     monkeypatch.setattr(decode, "_vector_attention", lambda *args: launched.append(args[0].shape[2]) or kernel(*args))
     native = lambda *args: _attend(gemma4, full, *args, call = gemma4.Attention.__call__)
@@ -644,14 +654,14 @@ def test_verify_scope_serves_only_marked_global_blocks_and_restores(monkeypatch)
         _equal(_attend(gemma4, full, x), native(x))
         with decode.verify_block_attention():
             _equal(_attend(gemma4, full, x), vector)
-            assert launched == [4]
+            assert launched == [3]
             # A decode step, an unmasked block, and too few keys for MLX's two-pass kernel stay native.
             for args in [(x[:, :1],), (x, 4096, None), (x, 600)]:
                 _equal(_attend(gemma4, full, *args), native(*args))
             full.train()
             _equal(_attend(gemma4, full, x), native(x))
             full.eval()
-        assert launched == [4]
+        assert launched == [3]
     assert type(full) is gemma4.Attention
     with pytest.raises(RuntimeError, match = "cancel"):
         with decode.fused_verify_attention(layers):
