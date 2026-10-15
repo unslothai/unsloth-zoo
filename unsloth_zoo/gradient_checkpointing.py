@@ -134,11 +134,13 @@ def _mark_host_buffer(buffer):
 
 
 def _new_host_buffer(numel, dtype):
-    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled()):
+    nbytes = numel * dtype.itemsize
+    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled() and _reserve_pinned(nbytes)):
         return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
     try:
         return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True))
     except RuntimeError as e:
+        _release_pinned(nbytes)
         if not _is_host_alloc_oom(e): raise
         _warn_pinned_unavailable(e)
         return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
@@ -147,14 +149,90 @@ def _new_host_buffer(numel, dtype):
 def _grow_host_buffer(buffer, new_size):
     """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
     if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
+    old_bytes = _storage_bytes(buffer)
+    new_bytes = max(old_bytes, new_size * buffer.element_size())
+    pinned = getattr(buffer, HOST_PINNED_ATTR, False)
+    if pinned and not _reserve_pinned(new_bytes - old_bytes):
+        _release_pinned(old_bytes)
+        return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
     try:
         buffer.resize_(new_size)
         return _mark_host_buffer(buffer)
     except RuntimeError as e:
+        if pinned: _release_pinned(new_bytes - old_bytes)
         if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
+        _release_pinned(old_bytes)
         _warn_pinned_unavailable(e)
         # Pinning is gone for this slot, so the cached flag has to flip with it.
         return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+
+
+# Pinned pages cannot be swapped, and every local rank pins its own pool from the same
+# host RAM (Arctic ALST). Past the cap new offload buffers stay pageable instead of
+# pinning the host into the OOM killer. Shares block_swap's reserve and per-rank split.
+GC_PINNED_BYTES = 0
+GC_PINNED_CAP = None        # None = not computed yet, -1 = uncapped
+_WARNED_ABOUT_PINNED_CAP = False
+
+
+def _compute_pinned_cap():
+    env = os.environ.get("UNSLOTH_GC_PINNED_MAX_GB")
+    if env:
+        try: return max(0, int(float(env) * (1 << 30)))
+        except ValueError: pass
+    try:
+        import psutil
+        from .block_swap import _PIN_RESERVE_MIN_BYTES, _PIN_RESERVE_FRACTION, _local_world_size
+        vm = psutil.virtual_memory()
+    except Exception:
+        return -1  # unmeasurable: keep the old uncapped behaviour
+    reserve = max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+    # Bytes this process already pinned are missing from `available`, so add them back.
+    return max(0, vm.available - reserve) // _local_world_size() + GC_PINNED_BYTES
+
+
+def _storage_bytes(buffer):
+    # resize_ never shrinks a storage, so numel can understate what stays pinned.
+    try: return buffer.untyped_storage().nbytes()
+    except Exception: return buffer.numel() * buffer.element_size()
+
+
+def _pool_pinned_bytes():
+    if not CPU_BUFFERS: return 0
+    return sum(
+        _storage_bytes(x) for x in CPU_BUFFERS
+        if x is not None and getattr(x, HOST_PINNED_ATTR, False)
+    )
+
+
+def _reset_pinned_cap():
+    global GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP
+    GC_PINNED_CAP = None
+    _WARNED_ABOUT_PINNED_CAP = False
+
+
+def _reserve_pinned(nbytes):
+    """Count `nbytes` against the pinned cap; False means allocate pageable instead."""
+    global GC_PINNED_BYTES, GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP
+    if GC_PINNED_CAP is None:
+        GC_PINNED_CAP = _compute_pinned_cap()
+    if GC_PINNED_CAP >= 0 and GC_PINNED_BYTES + nbytes > GC_PINNED_CAP:
+        if not _WARNED_ABOUT_PINNED_CAP:
+            _WARNED_ABOUT_PINNED_CAP = True
+            print(
+                f"Unsloth: Gradient checkpointing pinned host memory reached its cap of "
+                f"{GC_PINNED_CAP / (1 << 30):.1f}GB (free host RAM split across local ranks), "
+                "so further offload buffers use pageable memory. Training continues; "
+                "set UNSLOTH_GC_PINNED_MAX_GB to change the cap."
+            )
+        return False
+    GC_PINNED_BYTES += nbytes
+    return True
+
+
+def _release_pinned(nbytes):
+    global GC_PINNED_BYTES
+    GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - nbytes)
 
 
 def _view_bytes_as(buffer, nbytes, dtype, shape):
@@ -952,6 +1030,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global BUFFER_EVENTS_A
     global BUFFER_EVENTS_B
     global NEXT_BUFFER_SLOT
+    _release_pinned(_pool_pinned_bytes())
+    _reset_pinned_cap()
     CPU_BUFFERS = []
     CPU_INDEX = 0
 
@@ -1514,6 +1594,7 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         global BUFFER_EVENTS_A
         global BUFFER_EVENTS_B
         global NEXT_BUFFER_SLOT
+        _release_pinned(_pool_pinned_bytes())
         for i in range(len(CPU_BUFFERS)):
             if hasattr(CPU_BUFFERS[i], "resize_"): CPU_BUFFERS[i].resize_(0)
             if type(CPU_BUFFERS) is list: CPU_BUFFERS[i] = None
@@ -1581,6 +1662,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
     if len(CPU_BUFFERS) == 0:
         return
 
+    pinned_before = _pool_pinned_bytes()
     # Reset CPU buffers to initial size; free any added during training
     for i in range(len(CPU_BUFFERS)):
         if i < INITIAL_CPU_BUFFER_COUNT:
@@ -1598,6 +1680,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
     if len(CPU_BUFFERS) > INITIAL_CPU_BUFFER_COUNT:
         del CPU_BUFFERS[INITIAL_CPU_BUFFER_COUNT:]
     pass
+    _release_pinned(pinned_before - _pool_pinned_bytes())
 
     # Reset GPU buffers to initial size
     for buffer in _allocated_slots(GPU_BUFFERS):
