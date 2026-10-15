@@ -3533,6 +3533,15 @@ def _vllm_suffix_decoding_config():
     return {**extra, "method": "suffix"}
 
 
+def _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config):
+    # vLLM with LoRA + speculation refuses max_num_batched_tokens < max_num_seqs * (k + 1)
+    # (EngineArgs.create_engine_config). Suffix decoding defaults k to its tree depth (24).
+    k = speculative_config.get("num_speculative_tokens")
+    if k is None:
+        k = speculative_config.get("suffix_decoding_max_tree_depth", 24)
+    return min(int(max_num_seqs), max(int(max_num_batched_tokens) // (int(k) + 1), 1))
+
+
 def _vllm_replayssm_mode():
     # "auto" (unset), "on" or "off".
     value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
@@ -4445,6 +4454,17 @@ def load_vllm(
         suffix_config = _vllm_suffix_decoding_config()
         if suffix_config is not None:
             engine_args["speculative_config"] = suffix_config
+            if enable_lora:
+                fitted_max_num_seqs = _fit_max_num_seqs_to_speculation(
+                    engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], suffix_config,
+                )
+                if fitted_max_num_seqs < engine_args["max_num_seqs"]:
+                    print(
+                        f"Unsloth: Lowering vLLM max_num_seqs from {engine_args['max_num_seqs']} to "
+                        f"{fitted_max_num_seqs} so LoRA fits the suffix decoding lookahead."
+                    )
+                    approx_max_num_seqs = fitted_max_num_seqs
+                    engine_args["max_num_seqs"] = fitted_max_num_seqs
             print(f"Unsloth: vLLM uses suffix decoding for generation with speculative_config = {suffix_config}.")
 
         # Pin the backend for the worker, which the sys.modules block only reaches under

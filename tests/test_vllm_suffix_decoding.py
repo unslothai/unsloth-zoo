@@ -111,3 +111,37 @@ def test_load_vllm_passes_speculative_config_before_arg_filter():
     assign = src.find("engine_args['speculative_config'] = suffix_config")
     arg_filter = src.find("good_keys = inspect.signature(AsyncEngineArgs", max(assign, 0))
     assert -1 < call < assign < arg_filter
+
+
+def _fit():
+    nodes = [n for n in _tree().body if isinstance(n, ast.FunctionDef) and n.name == "_fit_max_num_seqs_to_speculation"]
+    assert len(nodes) == 1, "_fit_max_num_seqs_to_speculation is missing from vllm_utils.py"
+    ns = {}
+    exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_fit", "exec"), ns)
+    return ns["_fit_max_num_seqs_to_speculation"]
+
+
+@pytest.mark.parametrize("seqs, tokens, config, expected", [
+    # >80 GiB tier: 256 seqs, 8192 tokens. vLLM needs tokens >= seqs * (k + 1) with LoRA.
+    (256, 8192, {"method": "suffix", "num_speculative_tokens": 32}, 248),
+    (256, 8192, {"method": "suffix"}, 256),  # default k = 24 already fits (256 * 25 = 6400)
+    (256, 4096, {"method": "suffix"}, 163),
+    (256, 8192, {"method": "suffix", "suffix_decoding_max_tree_depth": 63}, 128),
+    (8, 2048, {"method": "suffix", "num_speculative_tokens": 32}, 8),
+    (4, 16, {"method": "suffix", "num_speculative_tokens": 32}, 1),
+])
+def test_max_num_seqs_fits_lora_speculation(seqs, tokens, config, expected):
+    fitted = _fit()(seqs, tokens, config)
+    assert fitted == expected
+    k = config.get("num_speculative_tokens", config.get("suffix_decoding_max_tree_depth", 24))
+    assert fitted == 1 or tokens >= fitted * (k + 1)
+
+
+def test_load_vllm_fits_max_num_seqs_with_lora():
+    load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+    src = ast.unparse(load_vllm)
+    assign = src.find("engine_args['speculative_config'] = suffix_config")
+    fit = src.find("_fit_max_num_seqs_to_speculation(", max(assign, 0))
+    lowered = src.find("engine_args['max_num_seqs'] = fitted_max_num_seqs", max(fit, 0))
+    arg_filter = src.find("good_keys = inspect.signature(AsyncEngineArgs", max(lowered, 0))
+    assert -1 < assign < fit < lowered < arg_filter
