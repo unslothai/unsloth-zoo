@@ -409,6 +409,20 @@ def test_rocm_target_mixed_family_keeps_the_prebuilt_on_windows(monkeypatch):
     assert llama_cpp._detect_gpu_target() == ("rocm", "gfx1100")
 
 
+def test_rocm_target_skips_an_unreadable_card(monkeypatch):
+    fake = _fake_torch(archs = ["gfx1100", "gfx1101", "gfx1100"])
+    real = fake.cuda.get_device_properties
+
+    def flaky(i):
+        if i == 1:
+            raise RuntimeError("unreadable")
+        return real(i)
+
+    fake.cuda.get_device_properties = flaky
+    monkeypatch.setattr(llama_cpp, "torch", fake)
+    assert llama_cpp._detect_gpu_target() == ("rocm", "gfx1100")
+
+
 def _manifest():
     def art(name, sms, coverage = "narrow"):
         return {"asset_name": name, "install_kind": "linux-cuda", "runtime_line": "cuda12",

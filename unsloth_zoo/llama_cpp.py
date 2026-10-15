@@ -1111,10 +1111,13 @@ def _detect_gpu_target():
             return None
         count = max(1, torch.cuda.device_count())
         if getattr(torch.version, "hip", None):
-            archs = [
-                (getattr(torch.cuda.get_device_properties(i), "gcnArchName", "") or "").split(":")[0]
-                for i in range(count)
-            ]
+            archs = []
+            for i in range(count):
+                try:
+                    props = torch.cuda.get_device_properties(i)
+                except Exception:
+                    props = None  # unreadable: skipped below, the readable cards still decide
+                archs.append((getattr(props, "gcnArchName", "") or "").split(":")[0])
             try:
                 current = torch.cuda.current_device()
             except Exception:
