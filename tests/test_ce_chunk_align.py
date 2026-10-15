@@ -21,8 +21,6 @@ import os
 import pytest
 import torch
 
-os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
-
 ALIGN = 128
 
 
