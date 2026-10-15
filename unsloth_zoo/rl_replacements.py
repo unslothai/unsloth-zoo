@@ -191,10 +191,8 @@ def chunked_hidden_states_selective_log_softmax(
 
 RL_REPLACEMENTS["grpo_selective_log_softmax"] = chunked_hidden_states_selective_log_softmax
 
-# The function above keeps every chunk's logits for backward (N x V). This one, like verl's
-# FusedLinearForPPOFunction and prime-rl's chunked LM head, keeps only per-row logsumexp and
-# recomputes one chunk at a time in backward. Same arguments, chunks and logprobs; optional
-# differentiable entropy. Self-contained (torch, os) so its source can be copied into trainers.
+# Keeps only per-row logsumexp and recomputes each chunk's logits in backward (as verl's
+# FusedLinearForPPOFunction). Self-contained (torch, os): its source is copied into trainers.
 def chunked_hidden_states_selective_log_softmax_recompute(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -385,7 +383,6 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
     n_rows = flat_hidden_states.shape[0]
-    # Same chunk boundaries as chunked_hidden_states_selective_log_softmax.
     if max_rows_per_chunk > 0:
         chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
         chunks = min(chunks, max(n_rows, 1))
@@ -1640,7 +1637,6 @@ def grpo_accumulated_loss(
         grpo_vision_chunks as _grpo_vision_chunks,
         chunked_hidden_states_selective_log_softmax,
     )
-    # Opt-in: recompute each logit chunk in backward instead of keeping every chunk's logits alive.
     if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
         from unsloth_zoo.rl_replacements import (
             chunked_hidden_states_selective_log_softmax_recompute as chunked_hidden_states_selective_log_softmax,
