@@ -1688,6 +1688,7 @@ class UnslothVisionDataCollator:
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
         chat_template_kwargs = None,
+        mask_out_tokens = None, # e.g. ["</think>"]: see train_on_responses_only
     ):
         has_images = getattr(processor, "image_processor", None) is not None or _processor_takes_images(processor)
         audio_call_kwarg = _audio_call_kwarg(processor)
@@ -1807,6 +1808,7 @@ class UnslothVisionDataCollator:
                 return_function    = True,
                 num_proc           = num_proc,
                 last_response_only = last_response_only,
+                mask_out_tokens    = mask_out_tokens,
             )
         else:
             self.train_on_responses_only = None

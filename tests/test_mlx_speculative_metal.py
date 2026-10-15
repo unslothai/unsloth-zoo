@@ -664,13 +664,15 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
                 step += 1
         return results
 
-    batched, alone = run({0: greedy[0], 3: greedy[1], 6: sampled, 7: greedy[2], 8: resumed}), run({0: sampled})
+    by_ids = GenerationRequest(prompt_token_ids = tok.encode(texts[0], add_special_tokens = False), max_tokens = 40)
+    batched, alone = run({0: greedy[0], 3: greedy[1], 6: sampled, 7: greedy[2], 8: resumed, 9: by_ids}), run({0: sampled})
     for request, result, expected in zip(greedy, (batched[0], batched[3], batched[7]), upstream):
         n = len(result.token_ids)
         # A stop token ends the reply without joining its text.
         assert result.token_ids == [token for token, _ in expected[:n]] and (n == request.max_tokens or expected[n][0] in tok.stopping_criteria.eos_token_ids)
         assert result.logprobs == pytest.approx([logprobs[token].item() for token, logprobs in expected[:n]], abs = 0.02)
     assert (batched[6].token_ids, batched[6].logprobs) == (alone[0].token_ids, alone[0].logprobs)
+    assert batched[9].token_ids == batched[0].token_ids  # a token-id prompt prefills as its rendered twin
     assert [batched[0].finish_reason, batched[3].finish_reason] == ["length", "stop"]
     assert batched[0].draft_tokens >= batched[0].accepted_draft_tokens > 0
     assert (batched[8].cached_token_count, sorted(banked)) == (0, [size - 9, size - 1])
