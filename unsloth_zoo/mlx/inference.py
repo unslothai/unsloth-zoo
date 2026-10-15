@@ -17,7 +17,7 @@
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
 small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
-Qwen exact speculative verify blocks, and Gemma 4 verify-block attention."""
+Qwen exact speculative verify blocks, Gemma 4 verify-block attention, and Qwen sparse attention block selection."""
 
 import ast
 import functools
@@ -41,7 +41,7 @@ from typing import Callable, NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import nax, qmm
+from . import attention, nax, qmm
 
 
 logger = logging.getLogger(__name__)
@@ -4631,6 +4631,88 @@ def fused_verify_attention(model, *, _modules = None):
                     module.__class__ = native
 
 
+# The selection route recomputes the indexer query and per-head scores exactly as this body does.
+_QSA_SELECT_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.language": {"Qwen4ExpQSAIndexer.select_from_projected": "379bb821075d65a8"},
+}
+_QSA_LOCK = RLock()
+_QSA_SCOPES = {}
+_QSA_VERDICTS = {}
+
+
+def _qsa_select_route(native, bindings):
+    def select_from_projected(self, qk, cache, position_ids):
+        past = cache.offset if cache is not None else 0
+        selection = native(self, qk, cache, position_ids)
+        pooled = getattr(cache, "index_block_keys", None)
+        # The native top-k is still lazy; once the picks replace it, it is never evaluated.
+        if (selection is None or not selection.zero_padding or not isinstance(pooled, mx.array)
+                or pooled.shape[2] <= self.block_topk or self.training or not _bindings_intact(bindings)):
+            return selection
+        batch, rows, _ = qk.shape
+        if position_ids is None:
+            position_ids = self._default_position_ids(batch, past, rows)
+        query = qk.reshape(batch, rows, self.n_heads + self.kv_heads, self.head_dim)[:, :, : self.n_heads]
+        query = self._apply_rope(self.q_layernorm(query).transpose(0, 2, 1, 3), position_ids)
+        scores = query.astype(mx.float32) @ pooled.astype(mx.float32).transpose(0, 1, 3, 2)
+        picks = attention.select_blocks(scores, selection.complete_counts, self.block_topk, self.head_dim)
+        key = (self.n_heads, self.head_dim, self.block_topk, rows == 1)
+        verdict = _QSA_VERDICTS.get(key)
+        if verdict is None:
+            try:
+                verdict = bool(mx.array_equal(mx.sort(selection.selected_blocks, axis = -1), picks).item())
+            except (RuntimeError, ValueError):
+                return selection  # inside a function transformation, which cannot evaluate; checked later
+            _QSA_VERDICTS[key] = verdict
+            if not verdict:
+                logger.warning("the QSA block selection kernel picked other blocks than argpartition for %d "
+                               "indexer heads of width %d and top-%d; the native selection stays in use", *key[:3])
+        if verdict:
+            selection.selected_blocks = picks
+        return selection
+
+    return select_from_projected
+
+
+@contextmanager
+def fused_qsa_attention(model, *, _modules = None):
+    """Speed up mlx-vlm's Qwen sparse attention (qwen4_exp) during serialized inference.
+
+    Block selection runs on one kernel per query row that picks exactly `argpartition`'s blocks
+    from the native float32 scores, checked against the native selection at first use per layout.
+    `Qwen4ExpQSAIndexer.select_from_projected` is rebound process-wide while any scope is open.
+    `UNSLOTH_MLX_QSA_SELECT=0` turns the route off.
+    """
+    entered = []
+    try:
+        with _QSA_LOCK:
+            indexer = getattr(sys.modules.get("mlx_vlm.models.qwen4_exp.language"), "Qwen4ExpQSAIndexer", None)
+            if (indexer is not None and os.environ.get("UNSLOTH_MLX_QSA_SELECT", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and any(isinstance(module, indexer) and not module.training
+                            for _, module in _fusion_modules(model, _modules))
+                    and attention._select_kernel() is not None):
+                held = _QSA_SCOPES.get("select")
+                if held is None and (bindings := _resolved_bindings(_QSA_SELECT_CONTRACT)) is not None:
+                    native = vars(indexer)["select_from_projected"]
+                    route = _qsa_select_route(native, [b for b in bindings if b[2] is not native])
+                    indexer.select_from_projected = route
+                    held = _QSA_SCOPES["select"] = [0, indexer, native, route]
+                if held is not None:
+                    held[0] += 1
+                    entered.append(held)
+        yield model
+    finally:
+        with _QSA_LOCK:
+            for held in entered:
+                held[0] -= 1
+                if not held[0]:
+                    _, indexer, native, route = held
+                    del _QSA_SCOPES["select"]
+                    if vars(indexer).get("select_from_projected") is route:
+                        indexer.select_from_projected = native
+
+
 class InferenceScope(NamedTuple):
     """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
     `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
@@ -4660,6 +4742,7 @@ INFERENCE_SCOPES = [
     InferenceScope(nax_quantized_linear, int8_prefill = True),
     InferenceScope(dense_prefill_linear),
     InferenceScope(fused_packed_gated_delta),
+    InferenceScope(fused_qsa_attention),
     InferenceScope(fused_residual_norm_handoff),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),

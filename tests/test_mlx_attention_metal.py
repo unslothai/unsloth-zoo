@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import sys
 
 import pytest
@@ -59,6 +60,7 @@ from unsloth_zoo.mlx.attention import (
     fused_kernel_exists,
     install_quantized_attention,
     quantized_sdpa_over,
+    select_blocks,
 )
 
 GS = 64
@@ -651,3 +653,25 @@ def test_qsa_wrapper_forwards_unknown_kwargs_outside_training():
     wrapped = attention._qsa_attention_training_over(dispatch)
     assert wrapped(*[None] * 5, cache=None, scale=1., block_size=4, causal=True,
                    mask=None, mask_factory=None, future_flag="kept") == "kept"
+
+
+def _stock_selection(scores, complete, topk):
+    # mlx-vlm 0.7.4 Qwen4ExpQSAIndexer.select_from_projected after the per-head scores, sorted.
+    blocks = mx.sum(mx.maximum(scores, 0), axis = 1) / math.sqrt(128)
+    blocks = mx.where(mx.arange(scores.shape[-1])[None, None] < complete[..., None], blocks, -mx.inf)
+    picks = mx.argpartition(blocks, kth = -topk, axis = -1)[..., -topk:].astype(mx.int32)
+    return mx.sort(mx.where(picks < complete[..., None], picks, -1), axis = -1)
+
+
+@pytest.mark.parametrize("kind", ["normal", "ties", "zeros", "nan", "negzero"])
+def test_qsa_block_selection_picks_argpartitions_set(kind):
+    mx.random.seed(len(kind))
+    for B, L, nb in [(1, 1, 1025), (1, 2, 70000), (2, 3, 4096), (1, 300, 1500), (1, 64, 40000)]:
+        scores = mx.random.normal((B, 4, L, nb))
+        draw = mx.random.uniform(shape = scores.shape)
+        scores = {"ties": mx.round(scores * 2) / 2, "zeros": mx.where(draw < 0.9, -1.0, scores),
+                  "nan": mx.where(draw < 0.001, mx.nan, scores), "negzero": mx.where(draw < 0.5, -0.0, scores),
+                  }.get(kind, scores)
+        # Rows straddle the top-k: some see fewer complete blocks than it, the rest more.
+        complete = mx.broadcast_to(nb - L + mx.arange(L, dtype = mx.int32), (B, L)) - (B * L > 3) * (nb - 600)
+        assert mx.array_equal(select_blocks(scores, complete, 512, 128), _stock_selection(scores, complete, 512)).item()

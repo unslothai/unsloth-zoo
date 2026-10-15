@@ -15,8 +15,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Quantized-KV attention through `mx.fast.scaled_dot_product_attention` over a dequantized copy,
-once the `[B, HQ, L, S]` scores the runtimes materialize would cost more than the copy."""
+once the `[B, HQ, L, S]` scores the runtimes materialize would cost more than the copy, and Metal kernels for
+Qwen Sparse Attention (QSA) in mlx-vlm's qwen4_exp."""
 import functools
+import math
 import os
 import re
 
@@ -229,3 +231,180 @@ def install_sparse_attention_training():
                 for alias, value in list(vars(consumer).items()):
                     if value is original:
                         setattr(consumer, alias, wrapped)
+
+
+# QSA block selection.
+_SELECT_HEADER = """
+#include <metal_simdgroup>
+using namespace metal;
+
+// mlx-vlm's sum(maximum(head_scores, 0), heads) / sqrt(d): maximum keeps NaN, the column sum adds
+// head by head, the divide is IEEE.
+inline float qsa_block_score(const device float* scores, size_t head_stride, uint heads, float divisor) {
+    float total = 0.0f;
+    for (uint h = 0; h < heads; ++h) {
+        const float v = scores[h * head_stride];
+        total = (metal::isnan(v) ? v : (v > 0.0f ? v : 0.0f)) + total;
+    }
+    return metal::precise::divide(total, divisor);
+}
+
+// Block scores are +0, positive or NaN; MLX's sort puts NaN above +inf.
+inline uint qsa_order_key(float score) {
+    return metal::isnan(score) ? 0xFFFFFFFFu : as_type<uint>(score);
+}
+"""
+
+# One threadgroup per query row. A radix select over the order keys finds the top-k threshold; the
+# blocks above it and the highest-index blocks tied with it are argpartition's set (the last k of
+# MLX's stable ascending argsort), written in increasing order after the -1 of missing picks.
+_SELECT_SOURCE = """
+    constexpr uint TG = 1024;
+    constexpr uint NSG = TG / 32;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint nb = uint(dims[0]);
+    const uint L = uint(dims[1]);
+    const uint b = row / L;
+    const uint c = metal::min(uint(metal::max(complete[row], 0)), nb);
+    device int* picks = out + size_t(row) * TOPK;
+
+    if (c <= TOPK) {
+        for (uint i = tid; i < TOPK; i += TG) {
+            picks[i] = i < TOPK - c ? -1 : int(i - (TOPK - c));
+        }
+        return;
+    }
+
+    threadgroup atomic_uint hist[256];
+    threadgroup uint decided[2];
+    threadgroup uint sg_counts[NSG];
+    device uint* keys = scratch + size_t(row) * nb;
+    const device float* row_scores = scores + (size_t(b) * H * L + (row - b * L)) * nb;
+    const size_t head_stride = size_t(L) * nb;
+    const float div = divisor[0];
+
+    uint prefix = 0;
+    uint remaining = TOPK;
+    for (uint pass = 0; pass < 4; ++pass) {
+        const uint shift = 24 - 8 * pass;
+        if (tid < 256) {
+            atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < c; e += TG) {
+            uint key;
+            if (pass == 0) {
+                key = qsa_order_key(qsa_block_score(row_scores + e, head_stride, H, div));
+                keys[e] = key;
+            } else {
+                key = keys[e];
+            }
+            if (pass == 0 || (key >> (shift + 8)) == prefix) {
+                atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            // Lane l owns digits 8l..8l+7: find the digit where the count above reaches `remaining`.
+            uint counts[8];
+            uint owned = 0;
+            for (uint j = 0; j < 8; ++j) {
+                counts[j] = atomic_load_explicit(&hist[8 * lane + j], memory_order_relaxed);
+                owned += counts[j];
+            }
+            const uint above = simd_sum(owned) - simd_prefix_inclusive_sum(owned);
+            if (above < remaining && remaining <= above + owned) {
+                uint acc = above;
+                for (int j = 7; j >= 0; --j) {
+                    if (acc + counts[j] >= remaining) {
+                        decided[0] = (prefix << 8) | (8 * lane + uint(j));
+                        decided[1] = remaining - acc;
+                        break;
+                    }
+                    acc += counts[j];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = decided[0];
+        remaining = decided[1];
+    }
+
+    const uint threshold = prefix;
+    const uint skip = atomic_load_explicit(&hist[threshold & 255u], memory_order_relaxed) - remaining;
+    uint tie_carry = 0;
+    uint pick_carry = 0;
+    for (uint base = 0; base < c; base += TG) {
+        const uint e = base + tid;
+        const uint key = e < c ? keys[e] : 0u;
+        const uint tie = (e < c && key == threshold) ? 1u : 0u;
+        uint tie_before = 0, tie_chunk = 0;
+        if (skip) {
+            const uint ties = simd_sum(tie);
+            if (lane == 0) {
+                sg_counts[sg] = ties;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = 0; s < NSG; ++s) {
+                tie_before += s < sg ? sg_counts[s] : 0u;
+                tie_chunk += sg_counts[s];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            tie_before += simd_prefix_exclusive_sum(tie);
+        }
+        const uint pick = (e < c && (key > threshold || (tie && tie_carry + tie_before >= skip))) ? 1u : 0u;
+        const uint simd_picks = simd_sum(pick);
+        if (lane == 0) {
+            sg_counts[sg] = simd_picks;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint pick_before = 0, pick_chunk = 0;
+        for (uint s = 0; s < NSG; ++s) {
+            pick_before += s < sg ? sg_counts[s] : 0u;
+            pick_chunk += sg_counts[s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (pick) {
+            picks[pick_carry + pick_before + simd_prefix_exclusive_sum(pick)] = int(e);
+        }
+        tie_carry += tie_chunk;
+        pick_carry += pick_chunk;
+    }
+"""
+
+
+@functools.cache
+def _select_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name = "unsloth_qsa_select_blocks", input_names = ["scores", "complete", "divisor", "dims"],
+        output_names = ["out", "scratch"], header = _SELECT_HEADER, source = _SELECT_SOURCE,
+    )
+
+
+@functools.cache
+def _divisor(head_dim):
+    # The float32 MLX makes of the Python float in `scores / math.sqrt(head_dim)`.
+    return mx.array([math.sqrt(head_dim)], dtype = mx.float32)
+
+
+def select_blocks(scores, complete, topk, head_dim):
+    """mlx-vlm's QSA block selection from float32 per-head scores [B, H, L, blocks], in one launch.
+
+    Returns [B, L, topk] int32: the set `argpartition` picks among each row's first `complete`
+    blocks, ascending, after one -1 per missing pick, which is the order the indexed attention
+    kernel sorts any selection into.
+    """
+    B, H, L, nb = scores.shape
+    out, _ = _select_kernel()(
+        inputs = [mx.contiguous(scores), mx.contiguous(complete.astype(mx.int32)), _divisor(head_dim),
+                  mx.array([nb, L], dtype = mx.int32)],
+        template = [("H", H), ("TOPK", topk)],
+        grid = (1024, B * L, 1), threadgroup = (1024, 1, 1),
+        output_shapes = [(B, L, topk), (B * L, max(nb, 1))], output_dtypes = [mx.int32, mx.uint32],
+    )
+    return out
