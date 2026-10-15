@@ -33,6 +33,7 @@ import torch.distributed as dist
 import os
 import time
 import contextlib
+import traceback
 import re
 import pathlib
 from typing import Optional
@@ -180,23 +181,39 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
         out = function(*args, **kwargs)
         return out if n == 1 else out
 
-    # Multi-process: only main executes the function
+    # Multi-process: only main executes the function. Its result travels in an
+    # (ok, value) envelope so a raise on main reaches every rank; otherwise the
+    # peers sit in broadcast_object_list until the process group timeout.
+    error = None
     if is_main_process():
-        out = function(*args, **kwargs)
-        obj_list = [out] if n == 1 else list(out)
+        try:
+            out = function(*args, **kwargs)
+            envelope = (True, out if n == 1 else list(out))
+        except BaseException as exception:
+            error = exception
+            message = "".join(traceback.format_exception_only(type(exception), exception)).strip()
+            envelope = (False, message)
     else:
-        obj_list = [None for _ in range(n)]
+        envelope = None
+    obj_list = [envelope]
 
-    if torch_distributed_is_initialized():
-        device = _collective_device()
-        dist.broadcast_object_list(obj_list, src = 0, device = device)
-        # barrier() also defaults to the current device, so name this rank's GPU.
-        if device.type == "cuda" and device.index is not None:
-            dist.barrier(device_ids = [device.index])  # wait until main is done
-        else:
-            dist.barrier()  # wait until main is done
+    device = _collective_device()
+    dist.broadcast_object_list(obj_list, src = 0, device = device)
+    ok, value = obj_list[0]
+    if not ok:
+        # Every rank raises; no barrier since all ranks skip it together.
+        if error is not None: raise error
+        raise RuntimeError(
+            f"Unsloth: distributed_function `{getattr(function, '__name__', function)}` "
+            f"failed on rank 0: {value}"
+        )
+    # barrier() also defaults to the current device, so name this rank's GPU.
+    if device.type == "cuda" and device.index is not None:
+        dist.barrier(device_ids = [device.index])  # wait until main is done
+    else:
+        dist.barrier()  # wait until main is done
 
-    return obj_list[0] if n == 1 else obj_list
+    return value
 pass
 
 def _collective_device():
