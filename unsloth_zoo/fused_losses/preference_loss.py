@@ -14,27 +14,19 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Chunked linear preference losses (DPO family, ORPO, CPO / SimPO).
+"""Chunked linear token logps for preference trainers (DPO, ORPO, CPO / SimPO).
 
 ``fused_linear_token_logps`` scores completion tokens from the final hidden states through
 the output head one chunk of rows at a time and recomputes each chunk in backward, so the
-``batch x seq_len x vocab`` logits are never materialised. The loss functions reproduce
-TRL's formulas on sequence logps.
+``batch x seq_len x vocab`` logits are never materialised. The preference loss itself stays
+with TRL's trainer.
 """
 
 __all__ = [
     "fused_linear_token_logps",
     "linear_mean_logits",
-    "dpo_preference_loss",
-    "orpo_preference_loss",
-    "cpo_preference_loss",
-    "fused_linear_preference_loss",
-    "DPO_LOSS_TYPES",
-    "CPO_LOSS_TYPES",
 ]
 
-import functools
-import math
 import os
 from typing import Optional
 
@@ -56,18 +48,6 @@ def _rows_per_chunk(n_rows, vocab_size, chunk_size):
     # About four float32 rows x vocab buffers are live per chunk in backward.
     rows = _target_chunk_bytes() // max(4 * 4 * vocab_size, 1)
     return max(1, min(int(rows), max(n_rows, 1)))
-
-
-@functools.lru_cache(maxsize = None)
-def _trl_sigmoid_uses_label_smoothing():
-    # TRL <= 0.28 DPOTrainer.dpo_loss smooths the sigmoid loss (conservative DPO); TRL >= 0.29
-    # applies label_smoothing only to robust / exo_pair / aot and its sigmoid is -logsigmoid(beta * delta).
-    try:
-        from importlib.metadata import version
-        from packaging.version import Version
-        return Version(version("trl")) < Version("0.29.0.dev0")
-    except Exception:
-        return True
 
 
 def _transform_logits(logits, scale_multiply, scale_divide, softcapping):
@@ -92,6 +72,8 @@ def _linear_float32(hidden, weight, bias):
             logits = torch.mm(hidden, weight.t(), out_dtype = torch.float32)
             _MM_OUT_DTYPE_OK[key] = True
             return logits if bias is None else logits + bias.float()
+        except torch.cuda.OutOfMemoryError:
+            raise
         except (TypeError, RuntimeError, NotImplementedError):
             _MM_OUT_DTYPE_OK[key] = False
     logits = F.linear(hidden, weight, bias)
@@ -254,289 +236,3 @@ def linear_mean_logits(
         end = min(start + rows, flat.shape[0])
         out[start:end] = _chunk_logits(flat[start:end], lm_head_weight, lm_head_bias, transforms).mean(-1).to(out.device)
     return out.reshape(shape)
-
-
-DPO_LOSS_TYPES = (
-    "sigmoid", "robust", "exo_pair", "hinge", "ipo", "sppo_hard", "nca_pair",
-    "aot", "aot_pair", "aot_unpaired", "apo_zero", "apo_down", "discopop",
-)
-CPO_LOSS_TYPES = ("sigmoid", "hinge", "ipo", "simpo")
-
-
-def dpo_preference_loss(
-    chosen_logps: torch.Tensor,
-    rejected_logps: torch.Tensor,
-    ref_chosen_logps: torch.Tensor,
-    ref_rejected_logps: torch.Tensor,
-    loss_type: str = "sigmoid",
-    beta: float = 0.1,
-    label_smoothing: float = 0.0,
-    reference_free: bool = False,
-    discopop_tau: float = 0.05,
-    sigmoid_label_smoothing: Optional[bool] = None,
-):
-    """TRL ``DPOTrainer.dpo_loss`` (reverse KL): ``(losses, chosen_rewards, rejected_rewards)``.
-
-    ``bco_pair`` (running mean across steps) and ``sft`` (chosen NLL) stay with the trainer.
-    ``sigmoid_label_smoothing`` (default: follow the installed TRL) applies ``label_smoothing`` to
-    ``sigmoid`` as conservative DPO, as TRL <= 0.28 does; TRL >= 0.29 ignores it there.
-    """
-    chosen_logratios = chosen_logps - (not reference_free) * ref_chosen_logps
-    rejected_logratios = rejected_logps - (not reference_free) * ref_rejected_logps
-    logratios = chosen_logps - rejected_logps
-    if reference_free:
-        ref_logratios = torch.zeros(1, dtype = logratios.dtype, device = logratios.device)
-    else:
-        ref_logratios = ref_chosen_logps - ref_rejected_logps
-    logits = logratios - ref_logratios
-
-    if sigmoid_label_smoothing is None:
-        sigmoid_label_smoothing = _trl_sigmoid_uses_label_smoothing()
-    if loss_type == "sigmoid" and not sigmoid_label_smoothing:
-        losses = -F.logsigmoid(beta * logits)
-    elif loss_type == "sigmoid":
-        losses = (
-            -F.logsigmoid(beta * logits) * (1 - label_smoothing)
-            - F.logsigmoid(-beta * logits) * label_smoothing
-        )
-    elif loss_type == "robust":
-        losses = (
-            -F.logsigmoid(beta * logits) * (1 - label_smoothing)
-            + F.logsigmoid(-beta * logits) * label_smoothing
-        ) / (1 - 2 * label_smoothing)
-    elif loss_type == "exo_pair":
-        # TRL replaces a zero label_smoothing with 1e-3 for exo_pair (log(0) otherwise).
-        eps = label_smoothing if label_smoothing != 0 else 1e-3
-        losses = (beta * logits).sigmoid() * (
-            F.logsigmoid(beta * logits) - math.log(1 - eps)
-        ) + (-beta * logits).sigmoid() * (F.logsigmoid(-beta * logits) - math.log(eps))
-    elif loss_type == "hinge":
-        losses = torch.relu(1 - beta * logits)
-    elif loss_type == "ipo":
-        losses = (logits - 1 / (2 * beta)) ** 2
-    elif loss_type == "sppo_hard":
-        a = chosen_logps - ref_chosen_logps
-        b = rejected_logps - ref_rejected_logps
-        losses = (a - 0.5 / beta) ** 2 + (b + 0.5 / beta) ** 2
-    elif loss_type == "nca_pair":
-        chosen_rewards = (chosen_logps - ref_chosen_logps) * beta
-        rejected_rewards = (rejected_logps - ref_rejected_logps) * beta
-        losses = (
-            -F.logsigmoid(chosen_rewards)
-            - 0.5 * F.logsigmoid(-chosen_rewards)
-            - 0.5 * F.logsigmoid(-rejected_rewards)
-        )
-    elif loss_type in ("aot_pair", "aot_unpaired", "aot"):
-        # TRL 0.28 renamed aot_pair to aot_unpaired.
-        if loss_type != "aot":
-            first, _ = torch.sort(chosen_logps - ref_chosen_logps, dim = 0)
-            second, _ = torch.sort(rejected_logps - ref_rejected_logps, dim = 0)
-        else:
-            first, _ = torch.sort(chosen_logps - rejected_logps, dim = 0)
-            second, _ = torch.sort(ref_chosen_logps - ref_rejected_logps, dim = 0)
-        delta = first - second
-        losses = (
-            -F.logsigmoid(beta * delta) * (1 - label_smoothing)
-            - F.logsigmoid(-beta * delta) * label_smoothing
-        )
-    elif loss_type == "apo_zero":
-        losses = (1 - torch.sigmoid(beta * chosen_logratios)) + torch.sigmoid(beta * rejected_logratios)
-    elif loss_type == "apo_down":
-        losses = torch.sigmoid(beta * chosen_logratios) + (
-            1 - torch.sigmoid(beta * (chosen_logratios - rejected_logratios))
-        )
-    elif loss_type == "discopop":
-        scaled = (logratios - (ref_chosen_logps - ref_rejected_logps)) * beta
-        modulation = torch.sigmoid(scaled / discopop_tau)
-        # TRL's exp(-scaled) * modulation is inf * 0 = NaN once scaled < ~-89 in float32.
-        losses = -F.logsigmoid(scaled) * (1 - modulation) + torch.exp(F.logsigmoid(scaled / discopop_tau) - scaled)
-    else:
-        raise ValueError(f"Unsloth: unknown DPO loss_type {loss_type!r}; expected one of {DPO_LOSS_TYPES}.")
-
-    chosen_rewards = beta * (chosen_logps - ref_chosen_logps).detach()
-    rejected_rewards = beta * (rejected_logps - ref_rejected_logps).detach()
-    return losses, chosen_rewards, rejected_rewards
-
-
-def _log1mexp(x):
-    # log(1 - exp(x)) as TRL >= 0.29 computes it; log1p(-exp(x)) cancels near x = 0.
-    # Each branch only sees its own inputs, since an inf derivative in the unused branch times the
-    # zero where-mask is NaN. x = 0 (probability 1) is clamped to -tiny: finite value and gradient.
-    cut = -0.6931471805599453
-    x = x.clamp(max = -torch.finfo(x.dtype).tiny)
-    small = x < cut
-    return torch.where(
-        small,
-        torch.log1p(-torch.exp(torch.where(small, x, cut))),
-        torch.log(-torch.expm1(torch.where(small, cut, x))),
-    )
-
-
-def orpo_preference_loss(chosen_logps: torch.Tensor, rejected_logps: torch.Tensor, beta: float = 0.1):
-    """TRL ``ORPOTrainer.odds_ratio_loss`` on length-averaged logps; minimise ``nll - losses.mean()``."""
-    dtype = torch.promote_types(chosen_logps.dtype, torch.float32)
-    chosen_logps, rejected_logps = chosen_logps.to(dtype), rejected_logps.to(dtype)
-    log1mexp_chosen, log1mexp_rejected = _log1mexp(chosen_logps), _log1mexp(rejected_logps)
-    log_odds = (chosen_logps - rejected_logps) - (log1mexp_chosen - log1mexp_rejected)
-    # Autograd through the clamped log1mexp loses the finite limit of sigmoid(-log_odds) / (1 - p)
-    # at a logp of exactly 0, so the analytic gradients are attached instead (same value).
-    with torch.no_grad():
-        log_sig_neg = F.logsigmoid(-log_odds)
-        grad_chosen = torch.exp(log_sig_neg - log1mexp_chosen)
-        grad_rejected = -torch.exp(log_sig_neg - log1mexp_rejected)
-    ratio = F.logsigmoid(log_odds).detach() \
-        + grad_chosen * (chosen_logps - chosen_logps.detach()) \
-        + grad_rejected * (rejected_logps - rejected_logps.detach())
-    losses = beta * ratio
-    chosen_rewards = beta * chosen_logps.detach()
-    rejected_rewards = beta * rejected_logps.detach()
-    return losses, chosen_rewards, rejected_rewards, torch.mean(ratio), torch.mean(log_odds)
-
-
-def cpo_preference_loss(
-    chosen_logps: torch.Tensor,
-    rejected_logps: torch.Tensor,
-    loss_type: str = "sigmoid",
-    beta: float = 0.1,
-    label_smoothing: float = 0.0,
-    simpo_gamma: float = 0.5,
-    alpha: float = 0.0,
-):
-    """TRL ``CPOTrainer.cpo_loss`` (``loss_type="simpo"`` with ``cpo_alpha=0`` is SimPO)."""
-    if alpha != 0.0:
-        # TRL's (1 - exp(logps) ** -alpha) / alpha, without exp(logps) underflowing to 0 on long completions.
-        chosen_scores = -torch.expm1(-alpha * chosen_logps) / alpha
-        rejected_scores = -torch.expm1(-alpha * rejected_logps) / alpha
-    else:
-        chosen_scores, rejected_scores = chosen_logps, rejected_logps
-    logits = chosen_scores - rejected_scores
-    if loss_type in ("simpo", "sigmoid"):
-        if loss_type == "simpo":
-            logits = logits - simpo_gamma / beta
-        losses = (
-            -F.logsigmoid(beta * logits) * (1 - label_smoothing)
-            - F.logsigmoid(-beta * logits) * label_smoothing
-        )
-    elif loss_type == "hinge":
-        losses = torch.relu(1 - beta * logits)
-    elif loss_type == "ipo":
-        losses = (logits - 1 / (2 * beta)) ** 2
-    else:
-        raise ValueError(f"Unsloth: unknown CPO loss_type {loss_type!r}; expected one of {CPO_LOSS_TYPES}.")
-    chosen_rewards = beta * chosen_scores.detach()
-    rejected_rewards = beta * rejected_scores.detach()
-    return losses, chosen_rewards, rejected_rewards
-
-
-def _sequence_logps(per_token_logps, mask, average):
-    mask = mask.to(per_token_logps.dtype)
-    total = (per_token_logps * mask).sum(-1)
-    # A row with no completion tokens (fully truncated) averages to 0 instead of 0 / 0 = NaN.
-    return total / mask.sum(-1).clamp(min = 1) if average else total
-
-
-def fused_linear_preference_loss(
-    hidden_states: torch.Tensor,
-    lm_head_weight: torch.Tensor,
-    lm_head_bias: Optional[torch.Tensor],
-    labels: torch.Tensor,
-    loss_mask: torch.Tensor,
-    method: str = "dpo",
-    loss_type: str = "sigmoid",
-    beta: float = 0.1,
-    label_smoothing: float = 0.0,
-    ref_chosen_logps: Optional[torch.Tensor] = None,
-    ref_rejected_logps: Optional[torch.Tensor] = None,
-    ref_hidden_states: Optional[torch.Tensor] = None,
-    ref_lm_head_weight: Optional[torch.Tensor] = None,
-    ref_lm_head_bias: Optional[torch.Tensor] = None,
-    reference_free: bool = False,
-    simpo_gamma: float = 0.5,
-    cpo_alpha: float = 1.0,
-    nll_mask: Optional[torch.Tensor] = None,
-    logit_scale_multiply: float = 0.0,
-    logit_scale_divide: float = 0.0,
-    logit_softcapping: float = 0.0,
-    chunk_size: Optional[int] = None,
-    discopop_tau: float = 0.05,
-    alpha: float = 0.0,
-    sigmoid_label_smoothing: Optional[bool] = None,
-):
-    """Preference loss from hidden states ``[2B, T, H]``, chosen rows first then rejected.
-
-    ``method`` is ``"dpo"`` (``DPO_LOSS_TYPES``; ``ipo`` length-averages as TRL does), ``"orpo"`` or
-    ``"cpo"`` (``simpo`` with ``cpo_alpha=0`` is SimPO). DPO reference logps are passed in
-    (precomputed) or scored without grad from ``ref_hidden_states``. ``nll_mask`` picks the NLL
-    tokens of ORPO / CPO (default ``loss_mask``). ``discopop_tau`` is ``DPOConfig.discopop_tau``,
-    ``alpha`` is ``CPOConfig.alpha`` (AlphaPO; ``cpo_alpha`` only weights the NLL). Returns
-    ``(loss, metrics)`` with TRL's metric names.
-    """
-    transforms = dict(
-        logit_scale_multiply = logit_scale_multiply,
-        logit_scale_divide = logit_scale_divide,
-        logit_softcapping = logit_softcapping,
-        chunk_size = chunk_size,
-    )
-    n_pairs = hidden_states.shape[0] // 2
-    loss_mask = loss_mask.bool()
-    score_mask = loss_mask if nll_mask is None else (loss_mask | nll_mask.bool())
-    per_token = fused_linear_token_logps(
-        hidden_states, lm_head_weight, lm_head_bias, labels, score_mask, **transforms,
-    )["per_token_logps"]
-
-    average = method in ("orpo",) or (method == "dpo" and loss_type == "ipo") or (
-        method == "cpo" and loss_type in ("ipo", "simpo")
-    )
-    logps = _sequence_logps(per_token, loss_mask, average)
-    chosen_logps, rejected_logps = logps[:n_pairs], logps[n_pairs:]
-    metrics = {}
-
-    if method == "dpo":
-        if ref_chosen_logps is None or ref_rejected_logps is None:
-            if ref_hidden_states is None:
-                raise ValueError("Unsloth: DPO needs ref_chosen_logps / ref_rejected_logps or ref_hidden_states.")
-            with torch.no_grad():
-                ref_per_token = fused_linear_token_logps(
-                    ref_hidden_states,
-                    lm_head_weight if ref_lm_head_weight is None else ref_lm_head_weight,
-                    ref_lm_head_bias if ref_lm_head_bias is not None else (
-                        lm_head_bias if ref_lm_head_weight is None else None
-                    ),
-                    labels, loss_mask, **transforms,
-                )["per_token_logps"]
-                ref_logps = _sequence_logps(ref_per_token, loss_mask, average)
-            ref_chosen_logps, ref_rejected_logps = ref_logps[:n_pairs], ref_logps[n_pairs:]
-        losses, chosen_rewards, rejected_rewards = dpo_preference_loss(
-            chosen_logps, rejected_logps, ref_chosen_logps, ref_rejected_logps,
-            loss_type = loss_type, beta = beta, label_smoothing = label_smoothing,
-            reference_free = reference_free, discopop_tau = discopop_tau,
-            sigmoid_label_smoothing = sigmoid_label_smoothing,
-        )
-        loss = losses.mean()
-    else:
-        nll_tokens = (loss_mask if nll_mask is None else nll_mask.bool())[:n_pairs]
-        nll_loss = -(per_token[:n_pairs] * nll_tokens).sum() / nll_tokens.sum().clamp(min = 1)
-        if method == "orpo":
-            losses, chosen_rewards, rejected_rewards, log_odds_ratio, log_odds_chosen = orpo_preference_loss(
-                chosen_logps, rejected_logps, beta = beta,
-            )
-            loss = nll_loss - losses.mean()
-            metrics["log_odds_ratio"] = log_odds_ratio.detach()
-            metrics["log_odds_chosen"] = log_odds_chosen.detach()
-        elif method == "cpo":
-            losses, chosen_rewards, rejected_rewards = cpo_preference_loss(
-                chosen_logps, rejected_logps, loss_type = loss_type, beta = beta,
-                label_smoothing = label_smoothing, simpo_gamma = simpo_gamma, alpha = alpha,
-            )
-            loss = losses.mean() + cpo_alpha * nll_loss
-        else:
-            raise ValueError(f"Unsloth: unknown preference method {method!r}; expected dpo, orpo or cpo.")
-        metrics["nll_loss"] = nll_loss.detach()
-
-    metrics["rewards/chosen"] = chosen_rewards.mean()
-    metrics["rewards/rejected"] = rejected_rewards.mean()
-    metrics["rewards/accuracies"] = (chosen_rewards > rejected_rewards).float().mean()
-    metrics["rewards/margins"] = (chosen_rewards - rejected_rewards).mean()
-    metrics["logps/chosen"] = chosen_logps.detach().mean()
-    metrics["logps/rejected"] = rejected_logps.detach().mean()
-    return loss, metrics

@@ -14,24 +14,15 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Chunked linear preference loss against a float64 full-logits oracle and TRL's own formulas."""
-
-import math
-import types
+"""Chunked linear preference loss against a float64 full-logits oracle."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from unsloth_zoo.fused_losses.preference_loss import (
-    CPO_LOSS_TYPES,
-    DPO_LOSS_TYPES,
-    cpo_preference_loss,
-    dpo_preference_loss,
-    fused_linear_preference_loss,
     fused_linear_token_logps,
     linear_mean_logits,
-    orpo_preference_loss,
 )
 
 DT = torch.float64
@@ -134,267 +125,19 @@ def test_float32_and_half_heads_promote_to_float32():
         assert (out["per_token_logps"].double() - oracle).abs().max() < tol
 
 
-# ---- loss formulas against TRL's own methods -------------------------------------------------
+def test_out_of_memory_does_not_disable_float32_gemm(monkeypatch):
+    # A transient OOM in the float32-output GEMM must surface, not silently switch every later
+    # call in the process to half-precision logits.
+    import unsloth_zoo.fused_losses.preference_loss as module
 
+    monkeypatch.setattr(module, "_MM_OUT_DTYPE_OK", {})
 
-def _logps(seed, n = 6):
-    gen = torch.Generator().manual_seed(seed)
-    draw = lambda: -torch.rand(n, generator = gen, dtype = DT) * 20 - 0.01
-    return draw(), draw(), draw(), draw()
+    def oom(*args, **kwargs):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory")
 
-
-def _trl_dpo():
-    trl = pytest.importorskip("trl")
-    from trl import DPOTrainer
-
-    if not hasattr(DPOTrainer, "dpo_loss"):
-        pytest.skip("TRL >= 0.29 inlines the DPO loss")
-    return DPOTrainer
-
-
-@pytest.mark.parametrize("loss_type", DPO_LOSS_TYPES)
-@pytest.mark.parametrize("beta, label_smoothing", [(0.1, 0.0), (0.5, 0.2)])
-@pytest.mark.parametrize("reference_free", [False, True])
-def test_dpo_loss_matches_trl(loss_type, beta, label_smoothing, reference_free):
-    DPOTrainer = _trl_dpo()
-    import inspect
-
-    trl_source = inspect.getsource(DPOTrainer.dpo_loss)
-    if f'"{loss_type}"' not in trl_source:
-        pytest.skip(f"{loss_type} not in this TRL")
-    if loss_type == "robust" and label_smoothing == 0.0:
-        label_smoothing = 0.1
-    stub = types.SimpleNamespace(
-        accelerator = types.SimpleNamespace(device = torch.device("cpu")),
-        reference_free = reference_free, f_divergence_type = "reverse_kl", f_divergence_params = {},
-        beta = beta, label_smoothing = label_smoothing, loss_type = [loss_type],
-        args = types.SimpleNamespace(discopop_tau = 0.05),
-    )
-    chosen, rejected, ref_chosen, ref_rejected = _logps(7)
-    want = DPOTrainer.dpo_loss(stub, chosen, rejected, ref_chosen, ref_rejected, loss_type)
-    got = dpo_preference_loss(
-        chosen, rejected, ref_chosen, ref_rejected, loss_type = loss_type, beta = beta,
-        label_smoothing = label_smoothing, reference_free = reference_free,
-    )
-    for g, w in zip(got, want):
-        torch.testing.assert_close(g, w, rtol = 1e-13, atol = 1e-13)
-
-
-def _trl_class(name):
-    trl = pytest.importorskip("trl")
-    cls = getattr(trl, name, None)
-    if cls is None:
-        try:
-            module = __import__(f"trl.experimental.{name[:-7].lower()}", fromlist = [name])
-            cls = getattr(module, name)
-        except Exception:
-            pytest.skip(f"{name} not available")
-    return cls
-
-
-@pytest.mark.parametrize("beta", [0.1, 1.0])
-def test_orpo_loss_matches_trl(beta):
-    ORPOTrainer = _trl_class("ORPOTrainer")
-    stub = types.SimpleNamespace(accelerator = types.SimpleNamespace(device = torch.device("cpu")), beta = beta)
-    chosen, rejected, _, _ = _logps(8)
-    chosen, rejected = chosen / 20, rejected / 20  # length-averaged logps
-    want = ORPOTrainer.odds_ratio_loss(stub, chosen, rejected)
-    got = orpo_preference_loss(chosen, rejected, beta = beta)
-    # TRL >= 0.29 casts to float32 first; older TRL keeps float64.
-    tol = 1e-13 if want[0].dtype == DT else 1e-5
-    for g, w in zip(got, want):
-        torch.testing.assert_close(g, w.to(g.dtype), rtol = tol, atol = tol)
-
-
-@pytest.mark.parametrize("loss_type", CPO_LOSS_TYPES)
-@pytest.mark.parametrize("alpha", [0.0, 0.3])
-def test_cpo_loss_matches_trl(loss_type, alpha):
-    CPOTrainer = _trl_class("CPOTrainer")
-    stub = types.SimpleNamespace(
-        accelerator = types.SimpleNamespace(device = torch.device("cpu")), beta = 0.2, loss_type = loss_type,
-        label_smoothing = 0.1, simpo_gamma = 0.7, alpha = alpha,
-    )
-    chosen, rejected, _, _ = _logps(9)
-    chosen, rejected = chosen / 20, rejected / 20
-    want = CPOTrainer.cpo_loss(stub, chosen, rejected)
-    got = cpo_preference_loss(
-        chosen, rejected, loss_type = loss_type, beta = 0.2, label_smoothing = 0.1, simpo_gamma = 0.7, alpha = alpha,
-    )
-    for g, w in zip(got, want):
-        torch.testing.assert_close(g, w, rtol = 1e-13, atol = 1e-13)
-
-
-# ---- end to end from hidden states -------------------------------------------------------------
-
-
-def _full_logits_preference(method, loss_type, states, weight, labels, mask, ref_states = None, **kw):
-    logprobs = F.linear(states, weight).log_softmax(-1)
-    per_token = logprobs.gather(-1, labels.unsqueeze(-1)).squeeze(-1) * mask
-    n = states.shape[0] // 2
-    average = method == "orpo" or (method == "dpo" and loss_type == "ipo") or (method == "cpo" and loss_type in ("ipo", "simpo"))
-    logps = per_token.sum(-1) / (mask.sum(-1) if average else 1)
-    if method == "dpo":
-        with torch.no_grad():
-            ref = F.linear(ref_states, weight).log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1) * mask
-            ref = ref.sum(-1) / (mask.sum(-1) if average else 1)
-        losses, cr, rr = dpo_preference_loss(logps[:n], logps[n:], ref[:n], ref[n:], loss_type = loss_type, **kw)
-        return losses.mean(), cr, rr
-    nll = -(per_token[:n]).sum() / mask[:n].sum()
-    if method == "orpo":
-        losses, cr, rr, _, _ = orpo_preference_loss(logps[:n], logps[n:], **kw)
-        return nll - losses.mean(), cr, rr
-    losses, cr, rr = cpo_preference_loss(logps[:n], logps[n:], loss_type = loss_type, **kw)
-    return losses.mean() + nll, cr, rr
-
-
-@pytest.mark.parametrize(
-    "method, loss_type",
-    [("dpo", "sigmoid"), ("dpo", "ipo"), ("dpo", "hinge"), ("orpo", "sigmoid"), ("cpo", "sigmoid"), ("cpo", "simpo")],
-)
-def test_fused_preference_loss_end_to_end(method, loss_type):
-    states, weight, _, labels, mask = _tensors(10, rows = 4)
-    mask[:, 0] = True  # no empty completion
-    ref_states = (states + 0.1 * torch.randn_like(states)).detach()
-    kwargs = dict(beta = 0.1)
-    loss, metrics = fused_linear_preference_loss(
-        states, weight, None, labels, mask, method = method, loss_type = loss_type,
-        ref_hidden_states = ref_states if method == "dpo" else None, chunk_size = 5, cpo_alpha = 1.0, **kwargs,
-    )
-    states_b = states.detach().clone().requires_grad_(True)
-    weight_b = weight.detach().clone().requires_grad_(True)
-    want, cr, rr = _full_logits_preference(method, loss_type, states_b, weight_b, labels, mask, ref_states, **kwargs)
-    torch.testing.assert_close(loss, want, rtol = 0, atol = 1e-12)
-    assert metrics["rewards/chosen"].item() == pytest.approx(cr.mean().item(), abs = 1e-12)
-    assert metrics["rewards/margins"].item() == pytest.approx((cr - rr).mean().item(), abs = 1e-12)
-    assert metrics["rewards/accuracies"].item() == pytest.approx((cr > rr).double().mean().item(), abs = 1e-12)
-    loss.backward()
-    want.backward()
-    torch.testing.assert_close(states.grad, states_b.grad, rtol = 0, atol = 1e-11)
-    torch.testing.assert_close(weight.grad, weight_b.grad, rtol = 0, atol = 1e-11)
-
-
-@pytest.mark.parametrize(
-    "method, loss_type, extra",
-    [("dpo", "discopop", dict(discopop_tau = 0.3)), ("cpo", "simpo", dict(alpha = 0.4)), ("cpo", "sigmoid", dict(alpha = -0.2))],
-)
-def test_fused_preference_loss_forwards_discopop_tau_and_alphapo_alpha(method, loss_type, extra):
-    states, weight, _, labels, mask = _tensors(12, rows = 4)
-    mask[:, 0] = True
-    ref_states = (states + 0.1 * torch.randn_like(states)).detach()
-    loss, _ = fused_linear_preference_loss(
-        states, weight, None, labels, mask, method = method, loss_type = loss_type, beta = 0.1,
-        ref_hidden_states = ref_states if method == "dpo" else None, chunk_size = 5, **extra,
-    )
-    want, _, _ = _full_logits_preference(method, loss_type, states.detach(), weight.detach(), labels, mask, ref_states, beta = 0.1, **extra)
-    default, _, _ = _full_logits_preference(method, loss_type, states.detach(), weight.detach(), labels, mask, ref_states, beta = 0.1)
-    torch.testing.assert_close(loss.detach(), want, rtol = 0, atol = 1e-12)
-    assert abs(float(want - default)) > 1e-6
-
-
-def test_dpo_policy_equals_reference_is_log2_and_precomputed_matches():
-    states, weight, _, labels, mask = _tensors(11, rows = 4)
-    loss, metrics = fused_linear_preference_loss(
-        states, weight, None, labels, mask, ref_hidden_states = states.detach(),
-    )
-    assert loss.item() == pytest.approx(math.log(2), abs = 1e-12)
-    assert metrics["rewards/margins"].item() == pytest.approx(0.0, abs = 1e-12)
-    per_token = fused_linear_token_logps(states.detach(), weight.detach(), None, labels, mask)["per_token_logps"]
-    ref = per_token.sum(-1)
-    loss2, _ = fused_linear_preference_loss(
-        states, weight, None, labels, mask, ref_chosen_logps = ref[:2], ref_rejected_logps = ref[2:],
-    )
-    torch.testing.assert_close(loss2, loss, rtol = 0, atol = 1e-13)
-
-
-def test_alphapo_and_discopop_stay_finite_on_long_completions():
-    # float32: exp(-200) underflows (AlphaPO) and exp(150) overflows against a zero modulation (DiscoPOP).
-    chosen = torch.tensor([-200.0, -2.0], requires_grad = True)
-    rejected = torch.tensor([-210.0, -3.0], requires_grad = True)
-    for alpha in (0.1, -0.2):
-        losses = cpo_preference_loss(chosen, rejected, loss_type = "sigmoid", beta = 0.1, alpha = alpha)[0]
-        grads = torch.autograd.grad(losses.sum(), (chosen, rejected))
-        assert torch.isfinite(losses).all() and all(torch.isfinite(g).all() for g in grads)
-        exact = cpo_preference_loss(chosen.double(), rejected.double(), loss_type = "sigmoid", beta = 0.1, alpha = alpha)[0]
-        torch.testing.assert_close(losses, exact.float())
-    zeros = torch.zeros(2)
-    chosen = torch.tensor([-1600.0, -2.0], requires_grad = True)
-    rejected = torch.tensor([-100.0, -3.0], requires_grad = True)
-    losses = dpo_preference_loss(chosen, rejected, zeros, zeros, loss_type = "discopop", beta = 0.1)[0]
-    grads = torch.autograd.grad(losses.sum(), (chosen, rejected))
-    assert torch.isfinite(losses).all() and all(torch.isfinite(g).all() for g in grads)
-    exact = dpo_preference_loss(chosen.double(), rejected.double(), zeros.double(), zeros.double(), loss_type = "discopop", beta = 0.1)[0]
-    torch.testing.assert_close(losses, exact.float())
-
-
-def test_orpo_gradients_finite_at_logps_near_zero():
-    # float32 exp(x) rounds to 1 for x near 0: the unused log1p(-exp(x)) branch must not leak NaN.
-    chosen = torch.tensor([0.0, -1e-9, -1e-4, -2.0], requires_grad = True)
-    rejected = torch.tensor([-1.0, -0.5, 0.0, -3.0], requires_grad = True)
-    losses, _, _, ratio, log_odds = orpo_preference_loss(chosen, rejected, beta = 0.1)
-    grads = torch.autograd.grad(losses.sum(), (chosen, rejected))
-    assert torch.isfinite(losses).all() and all(torch.isfinite(g).all() for g in grads)
-    # Away from an exact 0 the values are unchanged.
-    exact = orpo_preference_loss(chosen.double(), rejected.double(), beta = 0.1)[0]
-    torch.testing.assert_close(losses[[1, 3]], exact[[1, 3]].float())
-
-
-@pytest.mark.parametrize(
-    "method, loss_type", [("orpo", "sigmoid"), ("dpo", "ipo"), ("cpo", "ipo"), ("cpo", "simpo")],
-)
-def test_length_averaged_losses_finite_with_empty_completion_row(method, loss_type):
-    states, weight, _, labels, mask = _tensors(13, rows = 4)
-    mask[:, 0] = True
-    mask[1] = False  # a chosen completion fully truncated away
-    loss, metrics = fused_linear_preference_loss(
-        states, weight, None, labels, mask, method = method, loss_type = loss_type, beta = 0.1,
-        ref_hidden_states = states.detach() + 0.1 if method == "dpo" else None, chunk_size = 5,
-    )
-    loss.backward()
-    assert torch.isfinite(loss) and all(torch.isfinite(v).all() for v in metrics.values())
-    assert torch.isfinite(states.grad).all() and torch.isfinite(weight.grad).all()
-    assert states.grad[1].abs().max() == 0
-
-
-def test_orpo_gradient_keeps_its_limit_at_logp_zero():
-    # sigmoid(-log_odds) -> 0 and 1 / (1 - p) -> inf at p = 1, with a finite product e^r / (1 - e^r).
-    chosen = torch.tensor([0.0, -2.0, -1e-3], requires_grad = True)
-    rejected = torch.tensor([-1.0, -3.0, -0.5], requires_grad = True)
-    grads = torch.autograd.grad(orpo_preference_loss(chosen, rejected, beta = 0.1)[0].sum(), (chosen, rejected))
-    assert abs(grads[0][0].item() - 0.1 * math.exp(-1) / (1 - math.exp(-1))) < 1e-6
-    assert abs(grads[1][0].item()) < 1e-30
-    c64 = chosen.detach().double().requires_grad_(True)
-    r64 = rejected.detach().double().requires_grad_(True)
-    c_ = c64.clone(); c_ = torch.where(torch.arange(3) == 0, c_ - 1e-12, c_)
-    exact = torch.autograd.grad(orpo_preference_loss(c_, r64, beta = 0.1)[0].sum(), (c64, r64))
-    torch.testing.assert_close(grads[0], exact[0].float(), rtol = 1e-5, atol = 1e-7)
-    torch.testing.assert_close(grads[1], exact[1].float(), rtol = 1e-5, atol = 1e-7)
-
-
-def test_reference_bias_used_with_shared_weight():
-    states, weight, b, labels, mask = _tensors(21, rows = 4, bias = True)
-    ref_states = states.detach() + 0.1
-    ref_bias = b.detach() + torch.linspace(-3, 3, b.shape[0], dtype = DT)
-    ref_logps = fused_linear_token_logps(ref_states, weight.detach(), ref_bias, labels, mask)["per_token_logps"]
-    ref_logps = (ref_logps * mask).sum(-1)
-    kwargs = dict(method = "dpo", loss_type = "sigmoid", beta = 0.3)
-    want = fused_linear_preference_loss(
-        states, weight, b, labels, mask, ref_chosen_logps = ref_logps[:2], ref_rejected_logps = ref_logps[2:], **kwargs,
-    )[0]
-    got = fused_linear_preference_loss(
-        states, weight, b, labels, mask, ref_hidden_states = ref_states, ref_lm_head_bias = ref_bias, **kwargs,
-    )[0]
-    torch.testing.assert_close(got, want)
-
-
-def test_sigmoid_label_smoothing_follows_installed_trl():
-    chosen, rejected = torch.tensor([-2.0, -5.0], dtype = DT), torch.tensor([-3.0, -1.0], dtype = DT)
-    zeros = torch.zeros(2, dtype = DT)
-    plain = -F.logsigmoid(0.5 * (chosen - rejected))
-    conservative = 0.8 * plain - 0.2 * F.logsigmoid(-0.5 * (chosen - rejected))
-    kw = dict(loss_type = "sigmoid", beta = 0.5, label_smoothing = 0.2)
-    torch.testing.assert_close(dpo_preference_loss(chosen, rejected, zeros, zeros, sigmoid_label_smoothing = False, **kw)[0], plain)
-    torch.testing.assert_close(dpo_preference_loss(chosen, rejected, zeros, zeros, sigmoid_label_smoothing = True, **kw)[0], conservative)
-    trl = pytest.importorskip("trl")
-    from packaging.version import Version
-    legacy = Version(trl.__version__) < Version("0.29.0.dev0")
-    torch.testing.assert_close(dpo_preference_loss(chosen, rejected, zeros, zeros, **kw)[0], conservative if legacy else plain)
+    monkeypatch.setattr(module.torch, "mm", oom)
+    hidden = torch.randn(3, 4, dtype = torch.bfloat16)
+    weight = torch.randn(5, 4, dtype = torch.bfloat16)
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        module._linear_float32(hidden, weight, None)
+    assert module._MM_OUT_DTYPE_OK.get(("cpu", torch.bfloat16), True) is True
