@@ -1,16 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Opt-in row alignment for add_new_tokens (pad_to_multiple_of / UNSLOTH_VOCAB_PAD_MULTIPLE).
-
-Default: the embedding grows to exactly len(tokenizer) (unchanged behaviour).
-Opt-in: rows round up to the multiple, the tokenizer length is unchanged, the new token row
-is mean-initialised as before, the alignment rows are deterministic and listed in
-generation_config.suppress_tokens so HF generate never emits them, and the model round-trips
-through save_pretrained / from_pretrained with the padded config.vocab_size.
-
-CPU only, tiny model from the local HF cache (hf-internal-testing/tiny-random-LlamaForCausalLM).
-"""
+"""Opt-in row alignment for add_new_tokens (pad_to_multiple_of / UNSLOTH_VOCAB_PAD_MULTIPLE)."""
 
 import os
 
@@ -56,7 +47,6 @@ def test_default_path_rows_equal_tokenizer_length(monkeypatch):
 @pytest.mark.parametrize("via_env", [False, True])
 def test_opt_in_pads_rows_and_suppresses_them(monkeypatch, tmp_path, via_env):
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
-    # Reference row from the default path (same weights, same mean init).
     ref_model, ref_tok = _load()
     add_new_tokens(ref_model, ref_tok, new_tokens = ["<unsloth_new_tok>"])
     new_id = ref_tok.convert_tokens_to_ids("<unsloth_new_tok>")
@@ -83,7 +73,6 @@ def test_opt_in_pads_rows_and_suppresses_them(monkeypatch, tmp_path, via_env):
     assert torch.equal(emb[:old_rows], old_trained), "trained rows changed"
     assert torch.equal(emb [new_id], ref_emb),  "new token row must be initialised as before"
     assert torch.equal(head[new_id], ref_head), "new token lm_head row must be initialised as before"
-    # Alignment rows are deterministic (the trained mean), not random.
     assert torch.equal(emb [n:], ref_emb .expand(padded - n, -1))
     assert torch.equal(head[n:], ref_head.expand(padded - n, -1))
 
@@ -102,7 +91,6 @@ def test_opt_in_pads_rows_and_suppresses_them(monkeypatch, tmp_path, via_env):
     with torch.no_grad():
         head[n:] = ref_head
 
-    # Merged save round trip with the padded vocab.
     model.save_pretrained(tmp_path / "m")
     tokenizer.save_pretrained(tmp_path / "m")
     reloaded = AutoModelForCausalLM.from_pretrained(tmp_path / "m", torch_dtype = torch.float32)
@@ -117,7 +105,7 @@ def test_opt_in_noop_when_existing_padding_absorbs_tokens(monkeypatch):
     monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
     model, tokenizer = _load()
     rows = model.get_input_embeddings().weight.shape[0]
-    model.resize_token_embeddings(rows + 10, mean_resizing = False)  # ship 10 spare rows
+    model.resize_token_embeddings(rows + 10, mean_resizing = False)
     add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_new_tok>"], pad_to_multiple_of = 64)
     assert _rows(model) == (rows + 10, rows + 10, rows + 10)
     assert not (getattr(model.generation_config, "suppress_tokens", None) or [])

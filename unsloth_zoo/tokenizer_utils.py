@@ -203,8 +203,7 @@ def add_new_tokens(
     # new_vocab_length already includes the freshly added tokens, so do NOT add
     # their count again here.
     resize_target = max(old_input_length, old_output_length, new_vocab_length)
-    # Opt-in: align the grown matrix (Llama-3 + 1 token = 128257 rows -> 128320 at 64).
-    # Only when the new tokens actually overflow the existing rows.
+    # Align only when the new tokens overflow the existing rows.
     pad_to_multiple_of = _vocab_pad_multiple(pad_to_multiple_of)
     old_rows = max(old_input_length, old_output_length)
     if pad_to_multiple_of is not None and resize_target > old_rows:
@@ -268,7 +267,7 @@ def add_new_tokens(
             lm_head_matrix  [old_length:new_vocab_length] = mean_lm_head
     pass
 
-    # Opt-in alignment rows: deterministic mean init (HF mean_resizing samples them randomly).
+    # Deterministic mean init for alignment rows (HF mean_resizing samples them randomly).
     pad_start = max(old_rows, new_vocab_length)
     if pad_to_multiple_of is not None and resize_target > pad_start:
         with torch.no_grad():
