@@ -1129,11 +1129,13 @@ def _detect_gpu_target():
             if not IS_WINDOWS and any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in discrete):
                 return None
             return ("rocm", gfx)
-        try:
-            caps = [torch.cuda.get_device_capability(i) for i in range(count)]
-        except Exception:
-            # An unreadable card: the current device, as before (a partial list can hide one).
-            caps = [torch.cuda.get_device_capability()]
+        caps = []
+        for i in range(count):
+            try:
+                caps.append(torch.cuda.get_device_capability(i))
+            except Exception:
+                continue  # unreadable: the readable cards, current device included, still count
+        caps = caps or [torch.cuda.get_device_capability()]
         sms = sorted({major * 10 + minor for major, minor in caps})
         cuda_version = getattr(torch.version, "cuda", None)
         line = f"cuda{cuda_version.split('.')[0]}" if cuda_version else None

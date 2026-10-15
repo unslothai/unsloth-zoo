@@ -372,17 +372,21 @@ def test_rocm_target_same_family_uses_current_arch(monkeypatch):
     assert llama_cpp._detect_gpu_target() == ("rocm", "gfx1101")
 
 
-def test_cuda_target_unreadable_card_uses_current_device(monkeypatch):
-    fake = _fake_torch(caps = [(8, 9), (8, 9)])
+@pytest.mark.parametrize("caps,expected", [
+    ([(8, 9), (8, 9), (8, 9)], ("cuda", 89, "cuda12")),
+    ([(8, 9), (8, 9), (7, 5)], ("cuda", 75, "cuda12", (75, 89))),  # a readable old card still counts
+])
+def test_cuda_target_skips_an_unreadable_card(monkeypatch, caps, expected):
+    fake = _fake_torch(caps = caps)
 
     def flaky(i = None):
         if i == 1:
             raise RuntimeError("unreadable")
-        return (8, 9)
+        return caps[0 if i is None else i]
 
     fake.cuda.get_device_capability = flaky
     monkeypatch.setattr(llama_cpp, "torch", fake)
-    assert llama_cpp._detect_gpu_target() == ("cuda", 89, "cuda12")
+    assert llama_cpp._detect_gpu_target() == expected
 
 
 @pytest.mark.parametrize("archs", [["gfx1100", "gfx1036"], ["gfx1201", "gfx1103:xnack-"]])
