@@ -941,7 +941,9 @@ def patch_transformers_masks():
                 pm = _cache.get(device)
                 if pm is None:
                     pm = padding_mask.to(device, non_blocking=True)
-                    _cache[device] = pm
+                    # Flex traces mask_mod as a pure higher-order subgraph.
+                    if not torch.compiler.is_compiling():
+                        _cache[device] = pm
                 return pm[batch_idx, kv_idx]
             return inner_mask
         masking_utils.padding_mask_function = padding_mask_wrapper
@@ -959,7 +961,8 @@ def patch_transformers_masks():
                 pm = _cache.get(device)
                 if pm is None:
                     pm = packed_sequence_mask.to(device, non_blocking=True)
-                    _cache[device] = pm
+                    if not torch.compiler.is_compiling():
+                        _cache[device] = pm
                 return pm[batch_idx, q_idx] == pm[batch_idx, kv_idx]
             return inner_mask
         masking_utils.packed_sequence_mask_function = packed_sequence_mask_wrapper
