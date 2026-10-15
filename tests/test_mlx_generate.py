@@ -1726,3 +1726,58 @@ def test_row_quantizer_starts_uniform_rows_at_the_first_token():
     assert uniform.keywords == {"kv_group_size": 64, "quantized_kv_start": 0, "kv_bits": 4}
     turbo = _row_quantizer(module, {"kv_bits": 3.5, "kv_quant_scheme": "turboquant"})
     assert turbo.keywords["quantized_kv_start"] == 5000
+
+
+_SINGLE_ROW_MODEL = '''
+def _is_single_row_batch_cache(entry):
+    return entry.rows == 1
+
+
+def _extract_row_cache(entry, row):
+    return entry
+
+
+class Model(dict):
+    fa_idx = 0
+
+    def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, position_ids=None,
+                 capture_layer_ids=None, hidden_sink=None):
+        taken = hidden_sink is None and _is_single_row_batch_cache(cache[self.fa_idx])
+        if taken:
+            cache[self.fa_idx] = _extract_row_cache(cache[self.fa_idx], 0)
+        self.seen.append(taken)
+        return taken
+'''
+
+
+def test_single_row_decode_skips_the_shortcut_only_for_an_unpadded_decode_step():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.generate import single_row_batch_decode
+
+    namespace = {}
+    exec(_SINGLE_ROW_MODEL, namespace)
+    Model, native = namespace["Model"], namespace["_is_single_row_batch_cache"]
+    inner = Model()
+    inner.seen = []
+    model = types.SimpleNamespace(named_modules = lambda: [("stub", types.SimpleNamespace()), ("model", inner)])
+    row = lambda pad, rows = 1: types.SimpleNamespace(rows = rows, left_padding = mx.array([pad] * rows))
+    step, prefill = mx.zeros((1, 1)), mx.zeros((1, 4))
+    with single_row_batch_decode(model):
+        with single_row_batch_decode(model):
+            patched = type(inner)
+        assert type(inner) is patched and patched is not Model
+        # A call filling a hidden sink never takes the shortcut, so it is never run twice to compare.
+        inner(step, cache = [row(0)], hidden_sink = [])
+        # The first-use comparison runs on Metal; here the class is taken as already verified.
+        patched._unsloth_single_row_verdict = True
+        for cache, inputs in ((row(0), step), (row(2), step), (row(0), prefill), (row(0, rows = 2), mx.zeros((2, 1)))):
+            inner(inputs, cache = [cache])
+        assert inner.seen == [False, False, True, True, False]
+        patched._unsloth_single_row_verdict = False
+        inner(step, cache = [row(0)])
+        assert inner.seen[-1] is True
+    assert type(inner) is Model and "_unsloth_single_row_scopes" not in vars(inner)
+    # The stand-in predicate answers as mlx-vlm's own outside a skipped call.
+    assert namespace["_is_single_row_batch_cache"]._unsloth_native is native
+    assert namespace["_is_single_row_batch_cache"](row(0)) is True

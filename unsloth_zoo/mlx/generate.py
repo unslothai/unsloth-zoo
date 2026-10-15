@@ -2460,6 +2460,178 @@ def _media_token_ids(config) -> set[int]:
     return ids
 
 
+_SINGLE_ROW_PREDICATE = "_is_single_row_batch_cache"
+_SINGLE_ROW_PARAMETERS = (
+    "self", "inputs", "inputs_embeds", "mask", "cache", "position_ids", "capture_layer_ids", "hidden_sink",
+)
+_SINGLE_ROW_LOCK = threading.Lock()
+_SINGLE_ROW_BYPASS = threading.local()
+
+
+def _single_row_predicate(call):
+    """mlx-vlm's predicate for the single-row shortcut *call* takes, or None when it takes none we know.
+
+    Its global is swapped once for a wrapper that answers the same unless a call through
+    ``single_row_batch_decode`` has asked to skip the shortcut on this thread.
+    """
+
+    code = getattr(call, "__code__", None)
+    if code is None or not {_SINGLE_ROW_PREDICATE, "_extract_row_cache"} <= set(code.co_names):
+        return None
+    if tuple(inspect.signature(call).parameters) != _SINGLE_ROW_PARAMETERS:
+        return None
+    namespace = call.__globals__
+    current = namespace.get(_SINGLE_ROW_PREDICATE)
+    native = getattr(current, "_unsloth_native", current)
+    if not callable(native):
+        return None
+    if native is current:
+        def predicate(cache_entry):
+            return not getattr(_SINGLE_ROW_BYPASS, "active", False) and native(cache_entry)
+
+        predicate._unsloth_native = native
+        namespace[_SINGLE_ROW_PREDICATE] = predicate
+    return native
+
+
+def _bypassing_single_row(call, cache):
+    previous = getattr(_SINGLE_ROW_BYPASS, "active", False)
+    _SINGLE_ROW_BYPASS.active = True
+    try:
+        return call(cache = cache)
+    finally:
+        _SINGLE_ROW_BYPASS.active = previous
+
+
+def _detached_cache_entry(entry):
+    import mlx.core as mx
+
+    # Cache updates overwrite their arrays in place, so the copy owns every one of them.
+    own = lambda value: mx.array(value) if isinstance(value, mx.array) else value
+    detached = copy.copy(entry)
+    for name, value in vars(entry).items():
+        detached.__dict__[name] = [own(item) for item in value] if isinstance(value, list) else own(value)
+    return detached
+
+
+def _cache_leaves(cache) -> list:
+    from mlx.utils import tree_flatten
+
+    return [type(entry) for entry in cache] + [
+        value for entry in cache if entry is not None for _, value in tree_flatten(entry.state)
+    ]
+
+
+def _same_bits(want: list, got: list) -> bool:
+    import mlx.core as mx
+
+    if len(want) != len(got):
+        return False
+    for a, b in zip(want, got):
+        if isinstance(a, mx.array) != isinstance(b, mx.array):
+            return False
+        if not isinstance(a, mx.array):
+            if a != b:
+                return False
+        elif a.dtype != b.dtype or a.shape != b.shape or not mx.array_equal(
+            mx.contiguous(a).view(mx.uint8), mx.contiguous(b).view(mx.uint8)
+        ).item():
+            return False
+    return True
+
+
+def _first_single_row_decode(module, call, cache, extracts):
+    import mlx.core as mx
+
+    evaluate = lambda leaves: mx.eval(*[leaf for leaf in leaves if isinstance(leaf, mx.array)])
+    # The shortcut copies the entries it extracts but advances the ones it passes through.
+    shadow = [entry if entry is None or extracts(entry) else _detached_cache_entry(entry) for entry in cache]
+    want = [call(cache = shadow), *_cache_leaves(shadow)]
+    evaluate(want)
+    got = [_bypassing_single_row(call, cache), *_cache_leaves(cache)]
+    evaluate(got)
+    verdict = _same_bits(want, got)
+    type(module)._unsloth_single_row_verdict = verdict
+    if verdict:
+        return got[0]
+    cache[:] = shadow
+    return want[0]
+
+
+@functools.cache
+def _single_row_decode_class(base, native_predicate):
+    native_call = base.__call__
+
+    def __call__(self, inputs, inputs_embeds = None, mask = None, cache = None, position_ids = None,
+                 capture_layer_ids = None, hidden_sink = None):
+        call = functools.partial(
+            native_call, self, inputs, inputs_embeds = inputs_embeds, mask = mask, position_ids = position_ids,
+            capture_layer_ids = capture_layer_ids, hidden_sink = hidden_sink,
+        )
+        rows = inputs if inputs_embeds is None else inputs_embeds
+        full_attention = None if cache is None else cache[self.fa_idx]
+        verdict = type(self)._unsloth_single_row_verdict
+        if (
+            verdict is False
+            or hidden_sink is not None
+            or full_attention is None
+            or tuple(rows.shape[:2]) != (1, 1)
+            or not native_predicate(full_attention)
+            # Already evaluated: the batched decode mask reads it every step too.
+            or full_attention.left_padding.item() != 0
+        ):
+            return call(cache = cache)
+        if verdict is None:
+            return _first_single_row_decode(self, call, cache, native_predicate)
+        return _bypassing_single_row(call, cache)
+
+    return type(f"_SingleRowDecode{base.__name__}", (base,), {
+        "__call__": __call__,
+        "_unsloth_single_row_native": base,
+        "_unsloth_single_row_verdict": None,
+    })
+
+
+@contextmanager
+def single_row_batch_decode(model):
+    """Decode a one-row batch cache in place rather than through mlx-vlm's single-row shortcut.
+
+    mlx-vlm's Qwen3.5 model extracts a one-row batch cache into per-row caches, decodes those and
+    merges them back on every call: about three copies of each full-attention layer's KV per token,
+    which a batch pays whenever it shrinks to one row. Within this scope a decode step on a row with
+    no left padding takes the batched path instead. The first such step of each model class runs the
+    shortcut on a copy as well, and keeps the shortcut unless output and cache state match bit for bit.
+    """
+
+    changed = []
+    try:
+        with _SINGLE_ROW_LOCK:
+            for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                base = type(module)
+                if hasattr(base, "_unsloth_single_row_native"):
+                    # Another scope's swap: hold it too, so only the last holder restores.
+                    if getattr(module, "_unsloth_single_row_scopes", 0):
+                        module._unsloth_single_row_scopes += 1
+                        changed.append(module)
+                    continue
+                if not isinstance(module, dict) or "__call__" in module or not hasattr(module, "fa_idx"):
+                    continue
+                predicate = _single_row_predicate(base.__call__)
+                if predicate is None:
+                    continue
+                module.__class__ = _single_row_decode_class(base, predicate)
+                module._unsloth_single_row_scopes = 1
+                changed.append(module)
+        yield model
+    finally:
+        with _SINGLE_ROW_LOCK:
+            for module in reversed(changed):
+                module._unsloth_single_row_scopes -= 1
+                if module._unsloth_single_row_scopes == 0:
+                    module.__class__ = type(module)._unsloth_single_row_native
+                    module.__dict__.pop("_unsloth_single_row_scopes", None)
+
+
 class _VLMBatchAdapter:
     """Event-level adapter over mlx-vlm's BatchGenerator.
 
@@ -2852,7 +3024,7 @@ class _VLMBatchAdapter:
         generator = None
         active_error = None
         try:
-            with self._wired_limit():
+            with self._wired_limit(), single_row_batch_decode(self.model):
                 embedding_output = self.model.get_input_embeddings(
                     input_ids,
                     pixel_values,
@@ -3122,6 +3294,7 @@ class _VLMBatchSession:
         self._stack = ExitStack()
         try:
             self._stack.enter_context(adapter._wired_limit())
+            self._stack.enter_context(single_row_batch_decode(adapter.model))
             self.generator = self._open()
             self._cache_materializer = _VLMCacheMaterializer(self.generator)
         except BaseException:
