@@ -204,10 +204,8 @@ def grpo_chunked_hidden_states_logprobs(
     lm_head_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
-    # Same signature and result as chunked_hidden_states_selective_log_softmax. Under grad, autograd over that
-    # function keeps every chunk's logits until backward (tokens x vocab); unsloth_chunked_logprobs recomputes them
-    # per chunk instead, so the head's memory stays flat in sequence length. No grad: the old function, unchanged.
-    # UNSLOTH_GRPO_CHUNKED_LOGPROBS=0 restores the old gradient path.
+    # chunked_hidden_states_selective_log_softmax's contract. Under grad autograd over it keeps every chunk's logits
+    # (tokens x vocab) for backward; this recomputes them per chunk. UNSLOTH_GRPO_CHUNKED_LOGPROBS=0 opts out.
     needs_grad = torch.is_grad_enabled() and (
         hidden_states.requires_grad
         or lm_head.requires_grad
@@ -2243,8 +2241,7 @@ def grpo_accumulated_loss(
                                 logit_scale_multiply=0.0, logit_scale_divide=0.0,
                                 logit_softcapping=0.0, temperature=1, batch_size=8,
                                 lm_head_bias=None):
-            # Both batch shapes: backward recomputes each chunk's logits, so the head's memory is flat in
-            # sequence length and Unsloth_Offloaded_Log_Softmax (a full recompute with grad) is not needed.
+            # Backward recomputes per chunk, so Unsloth_Offloaded_Log_Softmax (a full recompute with grad) is not needed.
             return chunked_hidden_states_selective_log_softmax(
                 hidden_states,
                 lm_head,

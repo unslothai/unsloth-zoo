@@ -44,8 +44,7 @@ def _env_float(name, default):
         return default
 
 
-# Per chunk: bf16 logits in forward; bf16 logits + bf16 logits gradient in backward. The compiled bodies fuse the
-# fp32 work, so 8 bytes per logit covers the eager fallback's fp32 temporaries too.
+# Per chunk: fp32 logits (log-probs) or half logits (CE) plus a half logits gradient; the compiled bodies fuse the rest.
 _BYTES_PER_LOGIT = 8.0
 _CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 2.0)
 _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
@@ -118,11 +117,10 @@ def _run(name, fn, *args):
         return fn(*args)
     compiled = _compiled.get(name)
     if compiled is None:
-        # Rows are marked dynamic below; the vocab stays static, since a symbolic vocab makes Inductor's row reductions
-        # about 3x slower (8 ms vs 3 ms per call on a 15k x 152k chunk set, B200).
+        # Only rows are dynamic: a symbolic vocab makes Inductor's row reductions ~3x slower.
         compiled = _compiled[name] = torch.compile(fn, dynamic = None, fullgraph = True, options = torch_compile_options)
     for x in args:
-        # Row counts vary per chunk and per batch: dynamic from the first call, else one recompile per body.
+        # Else the second row count recompiles each body.
         if torch.is_tensor(x) and x.dim() >= 1 and x.shape[0] > 1:
             torch._dynamo.maybe_mark_dynamic(x, 0)
     try:
@@ -136,7 +134,7 @@ def _run(name, fn, *args):
 
 
 def _mm_fp32(a, b):
-    """a @ b with an fp32 result for half inputs: one bf16 rounding of a vocab-long sum is ~1% of a DPO gradient."""
+    """a @ b with an fp32 result for half inputs, so a vocab-long sum is rounded once, when cast to the grad dtype."""
     if a.dtype in (torch.float16, torch.bfloat16) and a.is_cuda:
         try:
             return torch.mm(a, b, out_dtype = torch.float32)
@@ -152,8 +150,7 @@ def _project(hidden, weight, bias, compute_dtype, fp32_out = False):
     h = hidden.to(compute_dtype)
     w = weight.to(compute_dtype)
     if fp32_out and _FP32_LOGITS and compute_dtype in (torch.float16, torch.bfloat16) and h.is_cuda:
-        # Half GEMM, fp32 result: rounding every logit to bf16 biases a sequence's summed log-prob, which preference
-        # losses take differences of (B200 DPO gradient 0.99x of fp64 with bf16 logits, 1.002x with fp32; +4% time).
+        # bf16 logits bias a sequence's summed log-prob, which preference losses take differences of.
         try:
             out = torch.mm(h, w.t(), out_dtype = torch.float32)
             return out if bias is None else out + bias.float()
@@ -236,7 +233,6 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
                 if need_h:
                     grad_hidden[a:b] = _mm_fp32(dz, w).to(grad_hidden.dtype)
                 if need_w:
-                    # Per-chunk GEMM in compute dtype, summed across chunks in fp32.
                     grad_weight.add_((dz.t() @ h).float())
                 if need_b:
                     grad_bias.add_(dz.float().sum(0))
@@ -325,7 +321,6 @@ class UnslothChunkedCE(torch.autograd.Function):
         grad_weight = torch.zeros(weight.shape, device = weight.device, dtype = torch.float32) if need_w else None
         grad_bias = torch.zeros(bias.shape, device = bias.device, dtype = torch.float32) if need_b else None
         w = weight.to(compute_dtype)
-        # d(sum -logp / divisor) / d logp = -1 / divisor, times the loss scale.
         g_row = (-float(scaling) / divisor).expand(min(rows_per_chunk, max(n, 1)))
         with torch.autocast(device.type, enabled = False):
             for a in range(0, n, rows_per_chunk):
@@ -385,7 +380,7 @@ def unsloth_chunked_ce_loss(
         divisor = divisor.ravel()[0]
     divisor = divisor.to(device = device, dtype = torch.float32)
     divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)  # all-masked batch: loss 0, not 0 / 0
-    # Only labelled rows reach the head: completion-only training skips the prompt's projection entirely.
+    # Unlabelled rows (prompts in completion-only training) never reach the head.
     hidden = hidden[keep.to(hidden.device)].to(device)
     if rows_per_chunk is None:
         rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0], n_rows = hidden.shape[0])
