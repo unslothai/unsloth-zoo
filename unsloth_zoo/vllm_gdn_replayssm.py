@@ -155,7 +155,7 @@ def _edit_method(cls, name, edits, namespace):
 def _replayssm_decode_rows(self, mixed_qkv, a, b, state_indices, attn_metadata, out = None):
     # Ring decode for one token per row into `out` (rows, 1, local_v_heads, head_v_dim).
     import torch
-    from ._vendored.vllm.gdn_replayssm_decode import fused_recurrent_gated_delta_rule_replayssm
+    from unsloth_zoo._vendored.vllm.gdn_replayssm_decode import fused_recurrent_gated_delta_rule_replayssm
     kv_cache = self.kv_cache
     if out is None:
         out = torch.empty(
@@ -413,7 +413,7 @@ def patch_vllm_gdn_replayssm():
         for name, edits in _LAYER_SOURCE_EDITS.items():
             if _edit_method(Layer, name, edits, layer_module.__dict__) is None:
                 return False
-        from ._vendored.vllm.gdn_replayssm_decode import fused_recurrent_gated_delta_rule_replayssm  # noqa: F401
+        from unsloth_zoo._vendored.vllm.gdn_replayssm_decode import fused_recurrent_gated_delta_rule_replayssm  # noqa: F401
     except Exception:
         return False
     if not _patch_layer(layer_module):
