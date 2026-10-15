@@ -3511,15 +3511,13 @@ def _vllm_supports_fp32_lm_head():
 
 def _vllm_fp32_lm_head_overrides(training):
     # Raises rather than half-applying: the trainer reads the same flag, and only both sides in fp32 pays off.
-    if not _fp32_lm_head_requested():
+    if not training or not _fp32_lm_head_requested():
         return {}
     if not _vllm_supports_fp32_lm_head():
         raise RuntimeError(
             f"Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 needs vLLM >= 0.26.0 for an fp32 lm_head, "
             f"but found vLLM {vllm_version}. Upgrade vLLM or unset UNSLOTH_VLLM_FP32_LM_HEAD."
         )
-    if not training:
-        return {}
     return {"head_dtype": "float32"}
 
 

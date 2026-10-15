@@ -153,6 +153,8 @@ def test_overrides_refuse_old_vllm(monkeypatch):
     ns = _helpers(monkeypatch, has_apply_head = False, version = "0.24.0")
     with pytest.raises(RuntimeError, match = "vLLM >= 0.26.0"):
         ns["_vllm_fp32_lm_head_overrides"](True)
+    # Inference-only engines never request the override, so an old vLLM must not block them.
+    assert ns["_vllm_fp32_lm_head_overrides"](False) == {}
 
 
 def test_load_vllm_merges_override_before_arg_filter():
