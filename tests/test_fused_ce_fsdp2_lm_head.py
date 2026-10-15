@@ -128,6 +128,7 @@ def _run(tmp_path, mode):
         MASTER_PORT = str(_free_port()),
         CUDA_VISIBLE_DEVICES = "",
         UNSLOTH_IS_PRESENT = "1",
+        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1",
         PYTHONPATH = os.pathsep.join([str(REPO), env.get("PYTHONPATH", "")]),
     )
     out = tmp_path / f"r_{mode}"
@@ -156,3 +157,38 @@ def test_fused_ce_with_separately_sharded_lm_head(tmp_path, mode):
             # The gradient went through FSDP's reduce-scatter, onto the sharded parameter.
             assert r["sharded_grad"], r
             assert r["grad_err"] < 1e-5, r
+
+
+_FULLGRAPH = textwrap.dedent(
+    r"""
+    import sys, torch
+    import torch.distributed as dist
+    import torch.distributed.fsdp
+    from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fsdp_unshard
+    lm_head = torch.nn.Linear(8, 8)
+    def f(x):
+        unsloth_fsdp_unshard(lm_head)
+        return lm_head(x).sum()
+    dist.init_process_group("gloo", rank = 0, world_size = 1)
+    torch.compile(f, fullgraph = True, backend = "eager")(torch.randn(2, 8))
+    dist.destroy_process_group()
+    print("FULLGRAPH_OK")
+    """
+)
+
+
+def test_unshard_keeps_non_fsdp_forward_in_one_graph(tmp_path):
+    # DDP and single-GPU forwards (a process group, no FSDP2 unit) must not graph-break on it.
+    script = tmp_path / "fullgraph.py"
+    script.write_text(_FULLGRAPH)
+    env = dict(os.environ)
+    env.update(
+        MASTER_ADDR = "127.0.0.1",
+        MASTER_PORT = str(_free_port()),
+        CUDA_VISIBLE_DEVICES = "",
+        UNSLOTH_IS_PRESENT = "1",
+        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1",
+        PYTHONPATH = os.pathsep.join([str(REPO), env.get("PYTHONPATH", "")]),
+    )
+    p = subprocess.run([sys.executable, str(script)], env = env, capture_output = True, text = True, timeout = 600)
+    assert "FULLGRAPH_OK" in p.stdout, (p.stdout + p.stderr)[-4000:]
