@@ -30,6 +30,7 @@ __all__ = [
     "chunked_logprob_rows",
 ]
 
+import functools
 import os
 import torch
 from typing import Optional
@@ -50,12 +51,24 @@ _CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 2.0)
 _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 
 
+@functools.cache
+def _default_chunk_gb():
+    # Like the fused CE it replaces: at most half the free memory, read once, so a nearly full device gets small chunks.
+    try:
+        from unsloth_zoo.tiled_mlp import _default_target_gb
+
+        free = float(_default_target_gb())
+    except Exception:
+        return _CHUNK_GB
+    return min(_CHUNK_GB, free) if free > 0 else _CHUNK_GB
+
+
 def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None):
     """Rows per chunk so that one chunk's logits stay near `target_gb`, and with `n_rows` at most an eighth of them
     (min `UNSLOTH_LOGPROB_MIN_ROWS`, 512), so a short batch is not projected in one or two
     near-full chunks. At least 2: a one-row head gradient
     is a K=1 matmul Inductor mis-lowers under dynamic shapes (see chunked_hidden_states_selective_log_softmax)."""
-    target_gb = _CHUNK_GB if target_gb is None else target_gb
+    target_gb = _default_chunk_gb() if target_gb is None else target_gb
     rows = int(target_gb * (1024**3) / (max(int(vocab_size), 1) * _BYTES_PER_LOGIT))
     if n_rows is not None:
         rows = min(rows, max(_MIN_ROWS, -(-int(n_rows) // 8)))

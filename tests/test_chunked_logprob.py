@@ -233,3 +233,14 @@ def test_fp32_output_gemm_only_where_fast(monkeypatch, fp32_out_gemm):
     logps = unsloth_chunked_logprobs(hidden.bfloat16(), w, torch.randint(0, 32, (8,), device = "cuda"))
     logps.sum().backward()
     assert torch.isfinite(logps).all() and torch.isfinite(hidden.grad).all()
+
+
+def test_default_chunk_budget_shrinks_with_free_memory(monkeypatch):
+    import unsloth_zoo.tiled_mlp as tm
+
+    for free, want in ((0.25, 0.25), (64.0, cl._CHUNK_GB)):
+        monkeypatch.setattr(tm, "_default_target_gb", lambda free = free: free)
+        cl._default_chunk_gb.cache_clear()
+        assert cl._default_chunk_gb() == want
+        assert cl.chunked_logprob_rows(1000) == cl.chunked_logprob_rows(1000, target_gb = want)
+    cl._default_chunk_gb.cache_clear()
