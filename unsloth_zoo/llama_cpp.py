@@ -1102,8 +1102,8 @@ def _detect_gpu_target():
     The bundle serves every visible device, not just device 0. CUDA: sm is the minimum
     visible SM, and a mixed host appends the sorted visible SMs as a 4th element so
     _select_gpu_assets only offers bundles covering all of them. ROCm: the current
-    device's arch when every other visible card (shadowing iGPUs aside) shares its bundle
-    family, else None (a source build, which _gpu_cmake_flags targets at every visible arch)."""
+    device's arch (a discrete card's when the current one is a shadowing iGPU) when every
+    discrete card shares its bundle family, else None (a source build, which _gpu_cmake_flags targets at every visible arch)."""
     if torch is None:
         return None
     try:
@@ -1120,11 +1120,12 @@ def _detect_gpu_target():
             except Exception:
                 current = 0
             gfx = archs[current] if 0 <= current < count else archs[0]
+            discrete = [a for a in archs if a.startswith("gfx") and a not in _SHADOWING_INTEGRATED_GFX]
+            if gfx in _SHADOWING_INTEGRATED_GFX and discrete:
+                gfx = discrete[0]  # the installer's #7776 rule: a shadowing iGPU defers to the dGPU
             if not gfx.startswith("gfx"):
                 return None
-            peers = [a for i, a in enumerate(archs) if i != current and a.startswith("gfx")
-                     and a not in _SHADOWING_INTEGRATED_GFX]
-            if any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in peers):
+            if any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in discrete):
                 return None
             return ("rocm", gfx)
         try:

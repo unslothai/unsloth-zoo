@@ -331,9 +331,15 @@ def test_cuda_target_unreadable_card_uses_current_device(monkeypatch):
 
 
 @pytest.mark.parametrize("archs", [["gfx1100", "gfx1036"], ["gfx1201", "gfx1103:xnack-"]])
-def test_rocm_target_ignores_a_shadowing_igpu(monkeypatch, archs):
-    monkeypatch.setattr(llama_cpp, "torch", _fake_torch(archs = archs))
+@pytest.mark.parametrize("current", [0, 1])
+def test_rocm_target_ignores_a_shadowing_igpu(monkeypatch, archs, current):
+    monkeypatch.setattr(llama_cpp, "torch", _fake_torch(archs = archs, current = current))
     assert llama_cpp._detect_gpu_target() == ("rocm", archs[0])
+
+
+def test_rocm_target_lone_igpu_keeps_its_arch(monkeypatch):
+    monkeypatch.setattr(llama_cpp, "torch", _fake_torch(archs = ["gfx1103"]))
+    assert llama_cpp._detect_gpu_target() == ("rocm", "gfx1103")
 
 
 def _manifest():
