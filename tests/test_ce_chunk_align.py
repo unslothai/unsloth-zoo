@@ -14,21 +14,15 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""128-row chunk alignment: same chunk count, losses and gradients up to sum order."""
-import json
+"""128-row chunk alignment: no chunk above torch.chunk's largest, losses and gradients up to sum order."""
 import math
 import os
-import subprocess
-import sys
-import textwrap
-from pathlib import Path
 
 import pytest
 import torch
 
 os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
 
-ROOT = Path(__file__).resolve().parents[1]
 ALIGN = 128
 
 
@@ -73,13 +67,11 @@ def test_fused_ce_chunks_are_aligned(monkeypatch, bsz, qlen, n_chunks):
     monkeypatch.setattr(ce, "CHUNK_ALIGN_ROWS", ALIGN, raising = False)
     n = bsz * qlen
     _, _, rows = _run_fused(ce, bsz, qlen, n_chunks, torch.float32)
-    old_count = len(torch.chunk(torch.empty(n), n_chunks))
-    assert len(rows) == old_count == n_chunks
     assert sum(rows) == n
     assert all(r % ALIGN == 0 for r in rows[:-1]), rows
     assert 0 < rows[-1]
-    # Memory: no chunk more than ALIGN - 1 rows over torch.chunk's largest.
-    assert max(rows) <= math.ceil(n / n_chunks) + ALIGN - 1, rows
+    # Memory: no chunk larger than torch.chunk's largest.
+    assert max(rows) <= math.ceil(n / n_chunks), rows
 
 
 @pytest.mark.parametrize("dtype, tol", [(torch.float64, 1e-12), (torch.float32, 2e-6)])
@@ -110,72 +102,26 @@ def test_fused_ce_small_inputs_keep_torch_chunk(monkeypatch, bsz, qlen, n_chunks
 
 def test_chunk_row_bounds_invariants():
     from unsloth_zoo.temporary_patches.common import chunk_row_bounds
-    for chunks in (1, 2, 3, 4, 7, 12, 16, 32):
-        for n in list(range(chunks, 600)) + [8194, 4097, 12345, 131071]:
+    for chunks in (1, 2, 3, 4, 7, 12, 16, 32, 128):
+        for n in list(range(chunks, 600)) + [8194, 4097, 12345, 16512, 131071]:
+            assert chunk_row_bounds(n, chunks, align = 0) is None
             bounds = chunk_row_bounds(n, chunks, align = ALIGN)
+            if bounds is None:
+                continue
             sizes = [b - a for a, b in zip(bounds[:-1], bounds[1:])]
-            assert len(sizes) == chunks and bounds[0] == 0 and bounds[-1] == n
-            assert max(sizes) <= math.ceil(n / chunks) + ALIGN - 1, (n, chunks, sizes)
-            if n >= ALIGN * chunks:
-                assert min(sizes) >= ALIGN, (n, chunks, sizes)
-                assert all(s % ALIGN == 0 for s in sizes[:-1]), (n, chunks, sizes)
-            else:
-                assert bounds == [(i * n) // chunks for i in range(chunks + 1)]
-            assert chunk_row_bounds(n, chunks, align = 0) == [(i * n) // chunks for i in range(chunks + 1)]
+            assert bounds[0] == 0 and bounds[-1] == n and min(sizes) > 0
+            assert max(sizes) <= math.ceil(n / chunks), (n, chunks, sizes)
+            assert all(s % ALIGN == 0 for s in sizes[:-1]), (n, chunks, sizes)
 
 
-CHILD = textwrap.dedent(
-    """
-    import json, sys
-    import torch, torch._dynamo
-    from torch._dynamo.utils import counters
-    _compile = torch.compile
-    def _dynamo_only(fn = None, **kw):
-        kw.pop("options", None)
-        kw.pop("mode", None)
-        kw["backend"] = "eager"
-        return _compile(**kw) if fn is None else _compile(fn, **kw)
-    torch.compile = _dynamo_only
-    import unsloth_zoo.rl_replacements as R
-
-    torch.manual_seed(0)
-    hidden, vocab, chunks = 8, 40, 4
-    lm_head = (torch.randn(vocab, hidden, dtype = torch.float64) * 0.3).requires_grad_(True)
-    worst = 0.0
-    counters.clear()
-    for T in (777, 1001, 1301):
-        states = torch.randn(1, T, hidden, dtype = torch.float64, requires_grad = True)
-        index = torch.randint(0, vocab, (1, T))
-        weights = torch.randn(1, T, dtype = torch.float64)
-        out = R.chunked_hidden_states_selective_log_softmax(states, lm_head, index, chunks)
-        (out * weights).sum().backward()
-        got = [out.detach(), states.grad.clone(), lm_head.grad.clone()]
-        states.grad = None
-        lm_head.grad = None
-        logits = states.reshape(-1, hidden) @ lm_head.t()
-        ref = (logits.gather(-1, index.reshape(-1, 1)).squeeze(-1) - logits.logsumexp(-1)).reshape(1, T)
-        (ref * weights).sum().backward()
-        want = [ref.detach(), states.grad, lm_head.grad]
-        lm_head.grad = None
-        worst = max(worst, max(float((a - b).abs().max()) for a, b in zip(got, want)))
-    print(json.dumps({"graphs": counters["stats"]["unique_graphs"], "worst": worst}))
-    """
-)
-
-
-def test_grpo_logprobs_aligned_without_recompiles():
-    env = dict(os.environ, UNSLOTH_ALLOW_CPU = "1", UNSLOTH_CE_CHUNK_ALIGN = "1")
-    env["PYTHONPATH"] = os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")])
-    run = subprocess.run(
-        [sys.executable, "-c", CHILD], capture_output = True, text = True, timeout = 600, env = env,
-    )
-    if run.returncode != 0 and "unsloth_zoo import unavailable" in run.stderr:
-        pytest.skip(run.stderr[-500:])
-    assert run.returncode == 0, run.stderr[-3000:]
-    out = json.loads(run.stdout.strip().splitlines()[-1])
-    assert out["graphs"] == 1, out
-    # The helper upcasts logits to float32, so float32 rounding even from float64 inputs.
-    assert out["worst"] < 1e-5, out
+def test_chunk_row_bounds_keeps_budget_for_small_chunks():
+    from unsloth_zoo.temporary_patches.common import chunk_row_bounds
+    # 129-row torch.chunk ranges: aligned ranges stay at 128 rows (one more range), never 256.
+    bounds = chunk_row_bounds(16512, 128, align = ALIGN)
+    sizes = [b - a for a, b in zip(bounds[:-1], bounds[1:])]
+    assert max(sizes) == 128 and len(sizes) == 129
+    # Ranges would shrink by over a quarter (255 -> 128): keep torch.chunk.
+    assert chunk_row_bounds(255 * 8, 8, align = ALIGN) is None
 
 
 @pytest.mark.parametrize("bsz, qlen, n_chunks", ODD_SHAPES[:2])
@@ -186,34 +132,3 @@ def test_default_is_off_and_keeps_torch_chunk(bsz, qlen, n_chunks):
         pytest.skip("UNSLOTH_CE_CHUNK_ALIGN=1 set in the environment")
     _, _, rows = _run_fused(ce, bsz, qlen, n_chunks, torch.float32)
     assert rows == [t.shape[0] for t in torch.chunk(torch.empty(bsz * qlen), n_chunks)]
-
-
-def test_grpo_helper_source_is_self_contained():
-    """unsloth pastes inspect.getsource of this helper into the generated GRPO trainer file,
-    whose header imports only torch, os, typing and friends: it must not call zoo helpers."""
-    import inspect
-    from typing import Optional
-    try:
-        import unsloth_zoo.rl_replacements as R
-    except ImportError as e:
-        pytest.skip(f"unsloth_zoo import unavailable: {e}")
-    fn = R.RL_REPLACEMENTS["grpo_selective_log_softmax"]
-    src = textwrap.dedent(inspect.getsource(getattr(fn, "__wrapped__", fn)))
-    src = "\n".join(l for l in src.splitlines() if not l.startswith("@"))
-    old = os.environ.get("UNSLOTH_CE_CHUNK_ALIGN")
-    os.environ["UNSLOTH_CE_CHUNK_ALIGN"] = "1"
-    try:
-        namespace = {"torch": torch, "os": os, "Optional": Optional, "math": math}
-        exec(src, namespace)
-    finally:
-        if old is None: os.environ.pop("UNSLOTH_CE_CHUNK_ALIGN", None)
-        else: os.environ["UNSLOTH_CE_CHUNK_ALIGN"] = old
-    helper = namespace[fn.__name__ if hasattr(fn, "__name__") else "chunked_hidden_states_selective_log_softmax"]
-    torch.manual_seed(0)
-    states = torch.randn(1, 1001, 8, dtype = torch.float64)
-    lm_head = torch.randn(40, 8, dtype = torch.float64)
-    index = torch.randint(0, 40, (1, 1001))
-    out = helper(states, lm_head, index, 4)
-    logits = states.reshape(-1, 8) @ lm_head.t()
-    ref = (logits.gather(-1, index.reshape(-1, 1)).squeeze(-1) - logits.logsumexp(-1)).reshape(1, 1001)
-    torch.testing.assert_close(out, ref.to(out.dtype), rtol = 1e-5, atol = 1e-5)

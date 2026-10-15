@@ -108,10 +108,6 @@ def chunked_hidden_states_selective_log_softmax(
         else 0
     ),
     lm_head_bias: Optional[torch.Tensor] = None,
-    # Read in the default for the same reason as max_rows_per_chunk.
-    chunk_align_rows: int = (
-        128 if os.environ.get("UNSLOTH_CE_CHUNK_ALIGN", "0").strip() == "1" else 0
-    ),
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
     # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
@@ -147,12 +143,7 @@ def chunked_hidden_states_selective_log_softmax(
 
     n_rows = flat_hidden_states.shape[0]
     chunks = max(1, min(chunks, n_rows))
-    # Inlined chunk_row_bounds: this source is pasted into the generated trainer file.
-    if chunk_align_rows > 1:
-        unit = 1 + (chunk_align_rows - 1) * torch.sym_min(1, (n_rows // chunks) // chunk_align_rows)
-        bounds = [unit * (((i * n_rows) // chunks) // unit) for i in range(chunks)] + [n_rows]
-    else:
-        bounds = [(i * n_rows) // chunks for i in range(chunks + 1)]
+    bounds = [(i * n_rows) // chunks for i in range(chunks + 1)]
     chunked_hidden_states = [flat_hidden_states[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
     chunked_index = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
 

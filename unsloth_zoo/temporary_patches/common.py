@@ -355,15 +355,16 @@ pass
 CHUNK_ALIGN_ROWS = 128 if os.environ.get("UNSLOTH_CE_CHUNK_ALIGN", "0").strip() == "1" else 0
 
 def chunk_row_bounds(n_rows, chunks, align = CHUNK_ALIGN_ROWS):
-    """``chunks + 1`` boundaries; all ranges but the last are multiples of ``align``
-    when every range holds ``align``+ rows. ``torch.sym_min``, not ``min``/``if``, so a
-    symbolic ``n_rows`` adds no Dynamo guard."""
-    if align <= 1:
-        return [(i * n_rows) // chunks for i in range(chunks + 1)]
-    unit = 1 + (align - 1) * torch.sym_min(1, (n_rows // chunks) // align)
-    bounds = [unit * (((i * n_rows) // chunks) // unit) for i in range(chunks)]
-    bounds.append(n_rows)
-    return bounds
+    """Boundaries of equal ``align``-multiple ranges (plus a remainder) none larger than
+    ``ceil(n_rows / chunks)``, so the memory budget behind ``chunks`` holds; this can add ranges.
+    None when that would shrink ranges by over a quarter (caller keeps torch.chunk)."""
+    if align <= 1 or chunks <= 1:
+        return None
+    cap = -(-n_rows // chunks)
+    size = (cap // align) * align
+    if size == 0 or 4 * size < 3 * cap:
+        return None
+    return list(range(0, n_rows, size)) + [n_rows]
 pass
 
 

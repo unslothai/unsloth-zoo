@@ -315,9 +315,8 @@ class UnslothFusedLoss(torch.autograd.Function):
             )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
-        n_rows = bsz * qlen
-        if CHUNK_ALIGN_ROWS > 1 and n_chunks > 1 and n_rows >= CHUNK_ALIGN_ROWS * n_chunks:
-            bounds = chunk_row_bounds(n_rows, n_chunks, align = CHUNK_ALIGN_ROWS)
+        bounds = chunk_row_bounds(bsz * qlen, n_chunks, align = CHUNK_ALIGN_ROWS)
+        if bounds is not None:
             ranges = list(zip(bounds[:-1], bounds[1:]))
             _flat_states = hidden_states.reshape(-1, hd)
             _flat_grads  = grad_inputs.view(-1, hd)
