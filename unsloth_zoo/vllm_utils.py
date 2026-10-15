@@ -3542,6 +3542,16 @@ def _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, specu
     return min(int(max_num_seqs), max(int(max_num_batched_tokens) // (int(k) + 1), 1))
 
 
+def _shrink_for_memory_retry(max_num_seqs, max_num_batched_tokens, max_seq_length, speculative_config = None):
+    # Memory retry: 3/4 of the sequences, tokens capped at a full batch of them, then refit the
+    # LoRA + speculation lower bound the shrink can break.
+    max_num_seqs = max(int(max_num_seqs * 0.75), 1)
+    max_num_batched_tokens = min(max_num_batched_tokens, max_num_seqs * max_seq_length)
+    if speculative_config is not None:
+        max_num_seqs = _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config)
+    return max_num_seqs, max_num_batched_tokens
+
+
 def _vllm_replayssm_mode():
     # "auto" (unset), "on" or "off".
     value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
@@ -4643,9 +4653,11 @@ def load_vllm(
                     raise RuntimeError(error)
 
                 if "gpu_memory_utilization" in error or "memory" in error:
-                    approx_max_num_seqs = max(int(approx_max_num_seqs * 0.75), 1)
+                    approx_max_num_seqs, max_num_batched_tokens = _shrink_for_memory_retry(
+                        approx_max_num_seqs, max_num_batched_tokens, max_seq_length,
+                        engine_args.get("speculative_config") if enable_lora else None,
+                    )
                     engine_args["max_num_seqs"] = approx_max_num_seqs
-                    max_num_batched_tokens = min(max_num_batched_tokens, approx_max_num_seqs * max_seq_length)
                     engine_args["max_num_batched_tokens"] = max_num_batched_tokens
                     engine_args["gpu_memory_utilization"] *= 0.85
                     print(

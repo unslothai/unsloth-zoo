@@ -145,3 +145,33 @@ def test_load_vllm_fits_max_num_seqs_with_lora():
     lowered = src.find("engine_args['max_num_seqs'] = fitted_max_num_seqs", max(fit, 0))
     arg_filter = src.find("good_keys = inspect.signature(AsyncEngineArgs", max(lowered, 0))
     assert -1 < assign < fit < lowered < arg_filter
+
+
+def _shrink():
+    names = ("_fit_max_num_seqs_to_speculation", "_shrink_for_memory_retry")
+    nodes = [n for n in _tree().body if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert len(nodes) == 2, "memory retry helpers are missing from vllm_utils.py"
+    ns = {}
+    exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_shrink", "exec"), ns)
+    return ns["_shrink_for_memory_retry"]
+
+
+@pytest.mark.parametrize("seqs, tokens, max_seq_length, config, expected", [
+    # 15 seqs * 33 <= 512 fits; the retry's 11 seqs and 176 tokens would not (11 * 33 = 363).
+    (15, 512, 16, {"method": "suffix", "num_speculative_tokens": 32}, (5, 176)),
+    (15, 512, 16, None, (11, 176)),
+    (256, 8192, 2048, {"method": "suffix"}, (192, 8192)),
+])
+def test_memory_retry_keeps_the_lora_speculation_bound(seqs, tokens, max_seq_length, config, expected):
+    got = _shrink()(seqs, tokens, max_seq_length, config)
+    assert got == expected
+    if config is not None:
+        k = config.get("num_speculative_tokens", 24)
+        assert got[1] >= got[0] * (k + 1)
+
+
+def test_load_vllm_memory_retry_uses_the_refitting_shrink():
+    load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+    src = ast.unparse(load_vllm)
+    assert "_shrink_for_memory_retry(" in src
+    assert "approx_max_num_seqs = max(int(approx_max_num_seqs * 0.75), 1)" not in src
