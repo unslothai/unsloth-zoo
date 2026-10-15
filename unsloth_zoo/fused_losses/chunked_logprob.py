@@ -53,8 +53,7 @@ _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 
 @functools.cache
 def _default_chunk_gb(device = None):
-    # Like the fused CE it replaces: at most half the free memory, read once per device, so a nearly full device
-    # (the head's, which may not be GPU 0 under device_map) gets small chunks.
+    # Half the head device's free memory, read once per device, as the fused CE it replaces does.
     try:
         if device is not None and device.type == "cuda" and torch.cuda.is_available():
             free = torch.cuda.mem_get_info(device)[0] / 1024**3 * 0.5
@@ -123,7 +122,6 @@ def _logits_grad(logits, targets, lse, grad, scalars, has_mul: bool, has_div: bo
     return dz.to(out_dtype)
 
 
-# Compiled bodies keyed by name; a body whose compile fails runs eager from then on (same math).
 _COMPILE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") not in ("1", "partial")
 _compiled = {}
 _eager = set()

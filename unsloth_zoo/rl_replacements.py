@@ -204,8 +204,7 @@ def grpo_chunked_hidden_states_logprobs(
     lm_head_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
-    # chunked_hidden_states_selective_log_softmax's contract. Under grad autograd over it keeps every chunk's logits
-    # (tokens x vocab) for backward; this recomputes them per chunk. UNSLOTH_GRPO_CHUNKED_LOGPROBS=0 opts out.
+    # Same contract as chunked_hidden_states_selective_log_softmax, but under grad recomputes logits per chunk.
     needs_grad = torch.is_grad_enabled() and (
         hidden_states.requires_grad
         or lm_head.requires_grad
