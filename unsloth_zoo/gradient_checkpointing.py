@@ -24,6 +24,7 @@ import inspect
 import warnings
 import gc
 import threading
+import weakref
 from .utils import _get_dtype, Version
 # Re-exported under its old name: it lives in integrated_device.py so the import-time
 # allocator block can share the topic without importing torch.
@@ -53,6 +54,8 @@ __all__ = [
     "patch_unsloth_smart_gradient_checkpointing",
     "unpatch_unsloth_smart_gradient_checkpointing",
     "reset_unsloth_gradient_checkpointing_buffers",
+    "NonReentrantActivationOffloader",
+    "non_reentrant_offload_hooks",
 ]
 
 # Initial buffer sizes for gradient checkpointing
@@ -1476,6 +1479,177 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
         return (None, None) + grads
     pass
+pass
+
+
+def _is_compiling():
+    try: return torch.compiler.is_compiling()
+    except AttributeError: return False
+pass
+
+
+class _OffloadedActivation:
+    """One saved activation: a host copy (`copied` marks the D2H), or still a device tensor."""
+    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "index", "pinned_bytes", "__weakref__")
+
+    def __init__(self, device, index):
+        self.device        = device
+        self.host          = None
+        self.copied        = None
+        self.device_tensor = None
+        self.ready         = None  # set only on a prefetched device_tensor
+        self.index         = index
+        self.pinned_bytes  = 0
+
+    def __del__(self):
+        if self.pinned_bytes: _release_pinned(self.pinned_bytes)
+pass
+
+
+class NonReentrantActivationOffloader:
+    """
+    All Unsloth Zoo code licensed under LGPLv3
+    saved_tensors_hooks for torch's non-reentrant checkpoint: the checkpoint inputs that
+    need grad go to pinned host memory on a side stream, so the D2H overlaps the next
+    layers instead of queueing on the compute stream.
+
+    UNSLOTH_GC_OFFLOAD_BACKEND=unsloth_stream (from the datta0/unsloth-zoo FSDP2 prototype)
+    also keeps the last UNSLOTH_GC_STREAM_KEEP_LAST (default 1) activations on the device,
+    whose backward comes first, and reloads layer i-1 on a second side stream while layer i
+    recomputes. Costs up to one more activation of VRAM each way.
+    """
+    def __init__(self, stream_mode = None):
+        if stream_mode is None:
+            stream_mode = os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "").strip().lower() == "unsloth_stream"
+        self.stream_mode = bool(stream_mode)
+        try:
+            self.keep_last = max(0, int(os.environ.get("UNSLOTH_GC_STREAM_KEEP_LAST", "1")))
+        except ValueError:
+            self.keep_last = 1
+        self.d2h_streams = {}
+        self.h2d_streams = {}
+        # Weak, so a graph dropped without backward frees its activations. Forward order.
+        self.order = []
+        self.backward_started = False
+        self.stats = {"pinned": 0, "pageable": 0, "kept": 0, "prefetched": 0, "prefetch_hits": 0}
+    pass
+
+    def _stream(self, cache, device_index):
+        stream = cache.get(device_index)
+        if stream is None:
+            stream = cache[device_index] = _new_extra_stream(device_index)
+        return stream
+    pass
+
+    def _to_host(self, record, x):
+        nbytes = x.numel() * x.element_size()
+        # The caching host allocator rounds a pinned block up to a power of two.
+        rounded = 1 << max(0, (nbytes - 1).bit_length())
+        if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled() and _reserve_pinned(rounded):
+            device_index = x.device.index
+            side = self._stream(self.d2h_streams, device_index)
+            side.wait_stream(torch.cuda.current_stream(device_index))
+            try:
+                with torch.cuda.stream(side):
+                    # A non_blocking D2H allocates its destination pinned.
+                    host = x.to("cpu", non_blocking = True)
+                    copied = torch.cuda.Event()
+                    copied.record(side)
+            except RuntimeError as e:
+                _release_pinned(rounded)
+                if not _is_host_alloc_oom(e): raise
+                _warn_pinned_unavailable(e)
+            else:
+                # The caller drops x next; its block must outlive the copy.
+                x.record_stream(side)
+                record.host, record.copied, record.pinned_bytes = host, copied, rounded
+                self.stats["pinned"] += 1
+                return
+        record.host = x.to("cpu")
+        self.stats["pageable"] += 1
+    pass
+
+    def pack(self, x):
+        if not x.requires_grad or x.device.type == "cpu":
+            return None, x
+        if DEVICE_TYPE not in ("cuda", "hip") or x.device.type != "cuda" or _is_compiling():
+            return x.device, x.to("cpu", non_blocking = True)
+        if self.backward_started:
+            self.backward_started = False
+            self.order = []
+        record = _OffloadedActivation(x.device, len(self.order))
+        self.order.append(weakref.ref(record))
+        x = x.detach()
+        if self.stream_mode and self.keep_last > 0:
+            record.device_tensor = x
+            self.stats["kept"] += 1
+            if record.index >= self.keep_last:
+                older = self.order[record.index - self.keep_last]()
+                if older is not None and older.host is None and older.device_tensor is not None:
+                    self._to_host(older, older.device_tensor)
+                    older.device_tensor = None
+                    self.stats["kept"] -= 1
+        else:
+            self._to_host(record, x)
+        return record
+    pass
+
+    def _prefetch(self, index, device_index):
+        if index < 0 or index >= len(self.order): return
+        record = self.order[index]()
+        if record is None or record.host is None or record.device_tensor is not None: return
+        compute = torch.cuda.current_stream(device_index)
+        side = self._stream(self.h2d_streams, device_index)
+        # Allocated on the compute stream, which consumes it; the side stream waits for
+        # that stream's earlier users of the block and for this record's D2H.
+        x = torch.empty_like(record.host, device = record.device)
+        side.wait_stream(compute)
+        if record.copied is not None: side.wait_event(record.copied)
+        with torch.cuda.stream(side):
+            x.copy_(record.host, non_blocking = True)
+            ready = torch.cuda.Event()
+            ready.record(side)
+        x.record_stream(side)
+        record.device_tensor, record.ready = x, ready
+        self.stats["prefetched"] += 1
+    pass
+
+    def unpack(self, packed):
+        if type(packed) is tuple:
+            device, x = packed
+            return x if device is None else x.to(device, non_blocking = True)
+        record = packed
+        self.backward_started = True
+        device_index = record.device.index
+        compute = torch.cuda.current_stream(device_index)
+        if record.device_tensor is not None:
+            x = record.device_tensor
+            if record.ready is not None:
+                compute.wait_event(record.ready)
+                # One shot: a retain_graph rerun reloads from the host copy.
+                record.device_tensor, record.ready = None, None
+                self.stats["prefetch_hits"] += 1
+        else:
+            if record.copied is not None: compute.wait_event(record.copied)
+            x = record.host.to(record.device, non_blocking = True)
+        if self.stream_mode: self._prefetch(record.index - 1, device_index)
+        return x
+    pass
+
+    def hooks(self):
+        return torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack)
+    pass
+pass
+
+
+NONREENTRANT_OFFLOADER = None
+
+def non_reentrant_offload_hooks():
+    """saved_tensors_hooks context that offloads non-reentrant checkpoint inputs to the host."""
+    global NONREENTRANT_OFFLOADER
+    if NONREENTRANT_OFFLOADER is None:
+        NONREENTRANT_OFFLOADER = NonReentrantActivationOffloader()
+    return NONREENTRANT_OFFLOADER.hooks()
 pass
 
 
