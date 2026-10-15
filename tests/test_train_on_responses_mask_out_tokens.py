@@ -93,7 +93,6 @@ def _expected(row, masked_positions = ()):
     return labels
 
 
-# --------------------------------------------------------------------------- list path
 
 
 def test_the_closer_inside_a_kept_response_is_masked():
@@ -149,7 +148,6 @@ def test_datasets_map_batched_is_the_text_sft_route():
         assert labels == _expected(ROW, masked_positions = [ROW_THINK_POS])
 
 
-# ------------------------------------------------------------------------- tensor path
 
 
 def test_tensor_batches_keep_their_type_and_their_existing_masks():
@@ -183,7 +181,6 @@ def test_tensor_batches_without_the_argument_are_unchanged():
     assert out[0].tolist() == _expected(ROW)
 
 
-# ----------------------------------------------------------------- vision collator path
 
 
 class StubProcessor:
@@ -252,7 +249,6 @@ def test_the_vision_collator_without_the_argument_trains_the_closer():
     assert labels[1].tolist() == [-100, -100, -100, -100, THINK_ID, 30, 31, 32, 33]
 
 
-# ------------------------------------------------------------------ MLX delegation
 
 
 def test_the_mlx_delegation_forwards_the_argument(monkeypatch):
@@ -284,7 +280,6 @@ def test_the_mlx_delegation_forwards_the_argument(monkeypatch):
     assert calls[0]["response_part"] == RESPONSE_PART
 
 
-# ------------------------------------------------------- a real tokenizer, in memory
 
 
 def test_the_precompute_against_a_real_fast_tokenizer():
@@ -330,7 +325,6 @@ def test_the_precompute_against_a_real_fast_tokenizer():
     assert "hello" not in trained and INSTRUCTION_PART not in trained
 
 
-# ------------------------------------------------------ leading-space variant
 
 
 def test_a_separate_space_token_before_the_closer_stays_trained():
@@ -364,7 +358,6 @@ def test_a_merged_leading_space_form_is_still_matched():
     assert labels == [-100, -100, -100, -100, -100, 20, -100, 21]
 
 
-# ------------------------------------------- UnslothVisionDataCollator(...) kwarg
 
 
 def _real_collator(**kwargs):
