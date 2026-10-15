@@ -317,7 +317,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             n_chunks = get_chunk_size(
                 bsz, qlen, vocab_size, target_gb = target_gb,
                 fixed_gb = fixed_bytes / 1024 / 1024 / 1024,
-                device = hidden_states.device,
+                device = device,
             )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")

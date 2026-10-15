@@ -142,7 +142,7 @@ def test_fused_ce_explicit_budget_stays_cached(monkeypatch):
     assert fake.queried == []
 
 
-def test_fused_ce_passes_the_hidden_states_device(monkeypatch):
+def test_fused_ce_budgets_the_lm_head_device(monkeypatch):
     ce, _ = _modules()
     import torch
     seen = []
@@ -163,7 +163,7 @@ def test_fused_ce_passes_the_hidden_states_device(monkeypatch):
         lm_head_bias = None, labels = labels,
     )
     loss.backward()
-    assert seen and all(isinstance(d, torch.device) and d == hidden.device for d in seen), seen
+    assert seen and all(isinstance(d, torch.device) and d == weight.device for d in seen), seen
 
 
 def test_tiled_mlp_budget_follows_the_input_device(monkeypatch):
