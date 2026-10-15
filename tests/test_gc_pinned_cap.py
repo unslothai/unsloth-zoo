@@ -22,6 +22,9 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "CPU_BUFFERS", [], raising = False)
     monkeypatch.setattr(gc_module, "GC_PINNED_BYTES", 0, raising = False)
     monkeypatch.setattr(gc_module, "GC_PINNED_CAP", None, raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
+    monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
+    monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: None, raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)
     return gc_module
@@ -50,21 +53,22 @@ def pin_requests(monkeypatch, gc_module):
 
 def test_pins_until_the_cap_then_goes_pageable(monkeypatch, gc_module, pin_requests):
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(3000 / (1 << 30)))
-    a = gc_module._new_host_buffer(1000, torch.float16)   # 2000 bytes, fits
-    b = gc_module._new_host_buffer(1000, torch.float16)   # 4000 total, over the cap
+    a = gc_module._new_host_buffer(1000, torch.float16)   # 2000 bytes, a 2048 block, fits
+    b = gc_module._new_host_buffer(1000, torch.float16)   # 4096 total, over the cap
     assert pin_requests == [True, False]
     assert getattr(a, gc_module.HOST_PINNED_ATTR) and not getattr(b, gc_module.HOST_PINNED_ATTR)
-    assert gc_module.GC_PINNED_BYTES == 2000
+    assert gc_module.GC_PINNED_BYTES == 2048
 
 
 def test_growth_past_the_cap_swaps_to_pageable(monkeypatch, gc_module, pin_requests):
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(3000 / (1 << 30)))
     a = gc_module._new_host_buffer(1000, torch.float16)
-    assert gc_module.GC_PINNED_BYTES == 2000
+    assert gc_module.GC_PINNED_BYTES == 2048
     grown = gc_module._grow_host_buffer(a, 4000)          # 8000 bytes would exceed 3000
     assert grown.numel() == 4000
     assert not getattr(grown, gc_module.HOST_PINNED_ATTR)
-    assert gc_module.GC_PINNED_BYTES == 0                  # the pinned slot was given up
+    # The given up block stays in torch's host cache, so it stays charged.
+    assert gc_module.GC_PINNED_BYTES == 2048 and gc_module._PINNED_CACHED == {2048: 1}
 
 
 def test_growth_within_the_cap_stays_pinned(monkeypatch, gc_module, pin_requests):
@@ -72,7 +76,8 @@ def test_growth_within_the_cap_stays_pinned(monkeypatch, gc_module, pin_requests
     a = gc_module._new_host_buffer(1000, torch.float16)
     grown = gc_module._grow_host_buffer(a, 4000)
     assert grown is a and getattr(grown, gc_module.HOST_PINNED_ATTR)
-    assert gc_module.GC_PINNED_BYTES == 8000
+    # New 8192 block plus the old 2048 block resize_ returned to the host cache.
+    assert gc_module.GC_PINNED_BYTES == 8192 + 2048
 
 
 def test_cap_is_free_ram_minus_reserve_split_by_local_ranks(monkeypatch, gc_module):
@@ -105,4 +110,44 @@ def test_failed_pin_releases_its_reservation(monkeypatch, gc_module):
     monkeypatch.setattr(torch, "empty", refuse_pinned)
     buffer = gc_module._new_host_buffer(1000, torch.float16)
     assert buffer.numel() == 1000
-    assert gc_module.GC_PINNED_BYTES == 0
+    assert not gc_module.PINNED_MEMORY_AVAILABLE
+
+
+def test_rounded_block_counts_against_the_cap(monkeypatch, gc_module):
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(6000 / (1 << 30)))
+    assert gc_module._reserve_pinned(2049)          # 4096 block
+    assert not gc_module._reserve_pinned(2049)      # 8192 > 6000, though 4098 requested bytes fit
+    assert gc_module.GC_PINNED_BYTES == 4096
+
+
+def test_released_blocks_stay_charged_and_are_reused(monkeypatch, gc_module):
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
+    assert gc_module._reserve_pinned(3000)          # 4096 block
+    gc_module._release_pinned(3000)
+    assert gc_module.GC_PINNED_BYTES == 4096
+    # Another size class cannot pile on top of the cached block past the cap.
+    assert not gc_module._reserve_pinned(7000)      # 4096 cached + 8192 > 10000
+    # The same size class takes the cached block back without a new charge.
+    assert gc_module._reserve_pinned(4000)
+    assert gc_module.GC_PINNED_BYTES == 4096 and gc_module._PINNED_CACHED == {4096: 0}
+
+
+def test_emptied_host_cache_drops_the_cached_charge(monkeypatch, gc_module):
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
+    held = {"bytes": 0}
+    monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: held["bytes"])
+    assert gc_module._reserve_pinned(3000)
+    held["bytes"] = 4096
+    gc_module._release_pinned(3000)
+    held["bytes"] = 0                               # torch.cuda.empty_host_cache()
+    assert gc_module._reserve_pinned(7000)          # 8192 fits once the 4096 is gone
+    assert gc_module.GC_PINNED_BYTES == 8192 and gc_module._PINNED_CACHED == {}
+
+
+def test_allocator_growth_beyond_our_charge_counts(monkeypatch, gc_module):
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
+    held = {"bytes": 1000}                          # someone else's, before the cap was computed
+    monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: held["bytes"])
+    assert gc_module._reserve_pinned(4096)
+    held["bytes"] = 1000 + 4096 + 4096              # a cached block of ours was taken by another user
+    assert not gc_module._reserve_pinned(4096)      # 8192 already held past the baseline

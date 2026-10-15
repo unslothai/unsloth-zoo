@@ -23,6 +23,8 @@ def gc_module(monkeypatch):
     except ImportError as e:
         pytest.skip(f"unsloth_zoo import unavailable: {e}")
     monkeypatch.setattr(gc_module, "GC_PINNED_CAP", None, raising = False)
+    monkeypatch.setattr(gc_module, "GC_PINNED_BYTES", 0, raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)
     return gc_module
 
@@ -97,4 +99,25 @@ def test_side_stream_host_copy_is_pinned(gc_module):
     torch.cuda.synchronize()
     assert offloader.stats["pinned"] == 1 and record.pinned_bytes > 0
     assert record.host.is_pinned()
+    assert torch.equal(offloader.unpack(record), x.detach())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_pinned_charge_matches_the_caching_host_allocator(gc_module):
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    held = lambda: torch.cuda.host_memory_stats()["allocated_bytes.current"]
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    x = torch.randn(3, 1000, 1000, device = "cuda", requires_grad = True)  # 12 MB
+    before = held()
+    record = offloader.pack(x)
+    torch.cuda.synchronize()
+    # torch hands out a 16 MiB block for 12 MB, and the cap is charged the same.
+    assert held() - before == gc_module.GC_PINNED_BYTES == 1 << 24
+    del record
+    # The freed block stays pinned in the host cache and stays charged.
+    assert held() - before == gc_module.GC_PINNED_BYTES == 1 << 24
+    record = offloader.pack(x)
+    torch.cuda.synchronize()
+    assert held() - before == gc_module.GC_PINNED_BYTES == 1 << 24  # block reused
     assert torch.equal(offloader.unpack(record), x.detach())
