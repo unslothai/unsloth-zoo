@@ -110,6 +110,21 @@ def test_visible_cuda_capabilities_lists_every_device(cuda_caps):
     assert device_type._visible_cuda_capabilities() == [(8, 6), (6, 1), (9, 0)]
 
 
+@pytest.mark.parametrize("current,expected", [(0, [(8, 0)]), (2, [(7, 5)])])
+def test_visible_cuda_capabilities_partial_scan_uses_current_device(monkeypatch, cuda_caps, current, expected):
+    # Matches core: a partial list could hide the weakest card, so judge the current device.
+    caps = [(8, 0), (8, 0), (7, 5)]
+    cuda_caps(caps, current = current)
+
+    def flaky(device = None):
+        if device == 1:
+            raise RuntimeError("unreadable")
+        return caps[current if device is None else device]
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", flaky)
+    assert device_type._visible_cuda_capabilities() == expected
+
+
 # C2: pre-Turing compile switch --------------------------------------------------------
 
 def _old_cuda_arch_version(caps, current, cuda_caps):
@@ -300,6 +315,25 @@ def test_rocm_target_mixed_family_builds_from_source(monkeypatch):
 def test_rocm_target_same_family_uses_current_arch(monkeypatch):
     monkeypatch.setattr(llama_cpp, "torch", _fake_torch(archs = ["gfx1100", "gfx1101:xnack-"], current = 1))
     assert llama_cpp._detect_gpu_target() == ("rocm", "gfx1101")
+
+
+def test_cuda_target_unreadable_card_uses_current_device(monkeypatch):
+    fake = _fake_torch(caps = [(8, 9), (8, 9)])
+
+    def flaky(i = None):
+        if i == 1:
+            raise RuntimeError("unreadable")
+        return (8, 9)
+
+    fake.cuda.get_device_capability = flaky
+    monkeypatch.setattr(llama_cpp, "torch", fake)
+    assert llama_cpp._detect_gpu_target() == ("cuda", 89, "cuda12")
+
+
+@pytest.mark.parametrize("archs", [["gfx1100", "gfx1036"], ["gfx1201", "gfx1103:xnack-"]])
+def test_rocm_target_ignores_a_shadowing_igpu(monkeypatch, archs):
+    monkeypatch.setattr(llama_cpp, "torch", _fake_torch(archs = archs))
+    assert llama_cpp._detect_gpu_target() == ("rocm", archs[0])
 
 
 def _manifest():

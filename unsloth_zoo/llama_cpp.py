@@ -1089,6 +1089,12 @@ def _fetch_release_json_asset(assets, asset_name):
         return None
 
 
+# iGPUs a discrete card shadows; mirrors SHADOWING_INTEGRATED_GFX in unsloth's installer.
+_SHADOWING_INTEGRATED_GFX = frozenset(
+    ("gfx90c", "gfx1013", "gfx1033", "gfx1035", "gfx1036", "gfx1103", "gfx1153")
+)
+
+
 def _detect_gpu_target():
     """Return ("cuda", sm, "cuda12"/"cuda13"/None) or ("rocm", "gfxNNNN")
     from torch, or None when no GPU target is detectable.
@@ -1096,8 +1102,8 @@ def _detect_gpu_target():
     The bundle serves every visible device, not just device 0. CUDA: sm is the minimum
     visible SM, and a mixed host appends the sorted visible SMs as a 4th element so
     _select_gpu_assets only offers bundles covering all of them. ROCm: the current
-    device's arch when every visible card shares its bundle family, else None (a
-    source build, which _gpu_cmake_flags targets at every visible arch)."""
+    device's arch when every other visible card (shadowing iGPUs aside) shares its bundle
+    family, else None (a source build, which _gpu_cmake_flags targets at every visible arch)."""
     if torch is None:
         return None
     try:
@@ -1116,11 +1122,17 @@ def _detect_gpu_target():
             gfx = archs[current] if 0 <= current < count else archs[0]
             if not gfx.startswith("gfx"):
                 return None
-            if any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in archs if a.startswith("gfx")):
+            peers = [a for i, a in enumerate(archs) if i != current and a.startswith("gfx")
+                     and a not in _SHADOWING_INTEGRATED_GFX]
+            if any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in peers):
                 return None
             return ("rocm", gfx)
-        sms = sorted({major * 10 + minor for major, minor in
-                      (torch.cuda.get_device_capability(i) for i in range(count))})
+        try:
+            caps = [torch.cuda.get_device_capability(i) for i in range(count)]
+        except Exception:
+            # An unreadable card: the current device, as before (a partial list can hide one).
+            caps = [torch.cuda.get_device_capability()]
+        sms = sorted({major * 10 + minor for major, minor in caps})
         cuda_version = getattr(torch.version, "cuda", None)
         line = f"cuda{cuda_version.split('.')[0]}" if cuda_version else None
         if len(sms) > 1:
