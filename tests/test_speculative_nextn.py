@@ -323,3 +323,12 @@ def test_find_mtp_tensor_names_reads_the_config_from_the_checkpoint(tmp_path):
     ckpt = _write_target_checkpoint(tmp_path / "ckpt", config, head)
     found = find_mtp_tensor_names(str(ckpt))
     assert found and set(found) == set(export_nextn_state_dict(head))
+
+
+def test_empty_checkpoint_prefix_is_kept():
+    """Bare `layers.N.*` names: the discovered "" prefix must not fall back to `model.`."""
+    config = _glm_config()
+    head = build_mtp_head(config, ckpt_prefix = "")
+    assert head._ckpt_prefix == ""
+    assert all(not k.startswith("model.") for k in head.mtp_state_dict())
+    assert build_mtp_head(config)._ckpt_prefix == head.family.default_prefix()
