@@ -170,9 +170,8 @@ def _grow_host_buffer(buffer, new_size):
         return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
 
 
-# Pinned pages cannot be swapped, and every local rank pins its own pool from the same
-# host RAM (Arctic ALST). Past the cap new offload buffers stay pageable instead of
-# pinning the host into the OOM killer. Shares block_swap's reserve and per-rank split.
+# Pinned pages cannot be swapped and every local rank pins its own pool (Arctic ALST), so
+# past block_swap's per-rank budget new offload buffers stay pageable.
 GC_PINNED_BYTES = 0
 GC_PINNED_CAP = None        # None = not computed yet, -1 = uncapped
 _WARNED_ABOUT_PINNED_CAP = False

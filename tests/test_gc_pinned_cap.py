@@ -2,11 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""The gradient checkpointing pinned host pool is capped by free host RAM per local rank.
-
-Past the cap new and regrown offload buffers are pageable instead of pinned, and nothing
-raises. CPU only: torch.empty is spied so a pinned request is recorded, not performed.
-"""
+"""Past the pinned cap (free host RAM per local rank) offload buffers go pageable, never raise.
+CPU only: torch.empty is spied so a pinned request is recorded, not performed."""
 import types
 
 import pytest
