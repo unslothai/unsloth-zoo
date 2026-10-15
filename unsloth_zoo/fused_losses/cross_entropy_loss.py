@@ -35,6 +35,10 @@ from unsloth_zoo.device_type import DEVICE_TYPE
 
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
 N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
+# Opt-in: accumulate a trainable lm_head weight gradient across chunks in float32 (one
+# extra float32 copy of the head while the loss runs). The bias gradient always is.
+FP32_HEAD_GRAD = os.environ.get("UNSLOTH_CE_FP32_HEAD_GRAD", "0") == "1"
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
 
 # Register grad_and_value_impl in trace_rules (grad_impl is registered but
 # grad_and_value_impl is not, which can cause GB0149 "Unsupported functorch
@@ -289,8 +293,16 @@ class UnslothFusedLoss(torch.autograd.Function):
 
         # Create backwards output
         grad_inputs = torch.empty_like(hidden_states, device = device) if not overwrite else hidden_states
-        grad_lm_head = torch.zeros_like(lm_head_weight, device = device) if lm_head_requires_grad else None
-        grad_lm_head_bias = torch.zeros_like(lm_head_bias, device = device) if lm_head_bias_requires_grad else None
+        # Summing per-chunk half precision gradients in half precision rounds once per chunk:
+        # at 16 chunks the bias gradient is 2-15x further from an fp64 oracle than unfused.
+        grad_lm_head = torch.zeros_like(
+            lm_head_weight, device = device,
+            dtype = torch.float32 if FP32_HEAD_GRAD and lm_head_weight.dtype in _HALF_DTYPES else None,
+        ) if lm_head_requires_grad else None
+        grad_lm_head_bias = torch.zeros_like(
+            lm_head_bias, device = device,
+            dtype = torch.float32 if lm_head_bias.dtype in _HALF_DTYPES else None,
+        ) if lm_head_bias_requires_grad else None
 
         bsz, qlen, hd = hidden_states.shape
         # 0-dim, not a [0] view: MoE forwards on transformers 4.x add their aux loss in place.
@@ -500,6 +512,8 @@ class UnslothFusedLoss(torch.autograd.Function):
                     **extra_kwargs,
                 )
         pass
+        if grad_lm_head is not None: grad_lm_head = grad_lm_head.to(lm_head_weight.dtype)
+        if grad_lm_head_bias is not None: grad_lm_head_bias = grad_lm_head_bias.to(lm_head_bias.dtype)
         ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
         ctx.scaling = scaling
         return accumulated_loss
