@@ -171,6 +171,41 @@ def test_opt_in_returns_support_kwargs(monkeypatch):
     assert rr.grpo_truncated_support_kwargs(_trainer()) == {}
 
 
+@pytest.mark.parametrize("overrides", [
+    dict(generation_kwargs = {"temperature": 0.7}),
+    dict(vllm_sampling_params = types.SimpleNamespace(_set_kwargs = {"temperature": 1.3})),
+    dict(repetition_penalty = 1.1),
+    dict(generation_kwargs = {"presence_penalty": 0.5}),
+    dict(generation_kwargs = {"logit_bias": {5: 2.0}}),
+    dict(vllm_sampling_params = types.SimpleNamespace(_set_kwargs = {"bad_words": ["x"]})),
+    dict(generation_kwargs = {"allowed_token_ids": [1, 2]}),
+    dict(generation_kwargs = {"min_tokens": 4}),
+    dict(vllm_structured_outputs_regex = "a+"),
+], ids = ["gen_temperature", "vllm_temperature", "repetition_penalty", "presence_penalty",
+          "logit_bias", "bad_words", "allowed_token_ids", "min_tokens", "structured_regex"])
+def test_opt_in_refuses_settings_vllm_applies_before_truncation(monkeypatch, caplog, overrides):
+    # vLLM v1 Sampler: apply_logits_processors (allowed ids, bad words, logit bias / min tokens,
+    # penalties), then temperature, then min_p, then top_k / top_p, at the rollout's own temperature.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    caplog.set_level(logging.WARNING)
+    rr.logger.propagate = True
+    t = _trainer(**{"top_p": 0.9, "temperature": 1.0, "repetition_penalty": 1.0, **overrides})
+    t.temperature = 1.0
+    assert rr.grpo_truncated_support_kwargs(t) == {}
+    assert rr.grpo_truncated_support_kwargs(t) == {}
+    assert caplog.text.count("ignoring UNSLOTH_GRPO_TRUNCATED_SUPPORT=1") == 1
+
+
+def test_opt_in_keeps_neutral_processor_settings(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    t = _trainer(top_p = 0.9, temperature = 0.8, repetition_penalty = 1.0, vllm_structured_outputs_regex = None,
+                 generation_kwargs = {"temperature": 0.8, "presence_penalty": 0.0, "logit_bias": {}, "min_tokens": 0})
+    t.temperature = 0.8
+    assert rr.grpo_truncated_support_kwargs(t) == {
+        "support_top_k": 0, "support_top_p": 0.9, "support_min_p": 0.0,
+    }
+
+
 def test_loss_binds_the_raw_logits_helper_locally_so_the_support_partial_reaches_it():
     src = inspect.getsource(rr.grpo_accumulated_loss)
     assert "grpo_truncated_support_kwargs(trainer)" in src

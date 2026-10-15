@@ -968,12 +968,11 @@ pass
 RL_REPLACEMENTS["_warn_unsupported_grpo_options"] = _warn_unsupported_grpo_options
 
 
-def grpo_sampling_support(trainer):
-    """(top_k, top_p, min_p) the rollouts were truncated with, or None for full-vocabulary sampling.
-    Later sources override earlier ones as they do for the SamplingParams: GRPOConfig fields,
+def _grpo_rollout_sampling_params(trainer, keys):
+    """Later sources override earlier ones as they do for the SamplingParams: GRPOConfig fields,
     then generation_kwargs, then Unsloth's vllm_sampling_params."""
     args = getattr(trainer, "args", None)
-    params = {key: getattr(args, key, None) for key in ("top_k", "top_p", "min_p")}
+    params = {key: getattr(args, key, None) for key in keys}
     for overrides in (
         getattr(args, "generation_kwargs", None),
         getattr(getattr(args, "vllm_sampling_params", None), "_set_kwargs", None),
@@ -982,6 +981,49 @@ def grpo_sampling_support(trainer):
             for key in params:
                 if overrides.get(key, None) is not None:
                     params[key] = overrides[key]
+    return params
+pass
+
+
+# vLLM v1 applies these to the logits before temperature, min_p and top_k / top_p
+# (Sampler.apply_logits_processors), so its kept set and logprobs come from logits the trainer never sees.
+_PRE_TRUNCATION_NEUTRAL = {
+    "repetition_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "min_tokens": 0,
+}
+_PRE_TRUNCATION_OPTIONAL = (
+    "logit_bias", "bad_words", "allowed_token_ids", "logits_processors",
+    "structured_outputs", "guided_decoding", "vllm_structured_outputs_regex", "vllm_guided_decoding_regex",
+)
+
+
+def grpo_truncated_support_blockers(trainer):
+    """Rollout settings under which the recomputed kept set cannot match vLLM's."""
+    params = _grpo_rollout_sampling_params(
+        trainer, ("temperature",) + tuple(_PRE_TRUNCATION_NEUTRAL) + _PRE_TRUNCATION_OPTIONAL,
+    )
+    blockers = []
+    for key, neutral in _PRE_TRUNCATION_NEUTRAL.items():
+        if params[key] is not None and float(params[key]) != neutral:
+            blockers.append(f"{key}={params[key]}")
+    for key in _PRE_TRUNCATION_OPTIONAL:
+        value = params[key]
+        if value is not None and not (isinstance(value, (dict, list, tuple, set, str)) and len(value) == 0):
+            blockers.append(key)
+    # The loss scales by the trainer's temperature; vLLM truncates at the rollout's.
+    trainer_temperature = getattr(trainer, "temperature", None)
+    if trainer_temperature is None:
+        trainer_temperature = getattr(getattr(trainer, "args", None), "temperature", None)
+    rollout_temperature = params["temperature"]
+    if rollout_temperature is not None and trainer_temperature is not None \
+            and float(rollout_temperature) != float(trainer_temperature):
+        blockers.append(f"rollout temperature={rollout_temperature} != trainer temperature={trainer_temperature}")
+    return blockers
+pass
+
+
+def grpo_sampling_support(trainer):
+    """(top_k, top_p, min_p) the rollouts were truncated with, or None for full-vocabulary sampling."""
+    params = _grpo_rollout_sampling_params(trainer, ("top_k", "top_p", "min_p"))
     # top_k None / 0 / -1 all mean no top-k in TRL and vLLM.
     top_k = max(int(params["top_k"] or 0), 0)
     top_p = 1.0 if params["top_p"] is None else float(params["top_p"])
@@ -1018,6 +1060,16 @@ def grpo_truncated_support_kwargs(trainer):
                 "UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 to score the trainer over the same kept set."
             )
             trainer._unsloth_truncated_support_warned = True
+        return {}
+    blockers = grpo_truncated_support_blockers(trainer)
+    if blockers:
+        if not getattr(trainer, "_unsloth_truncated_support_blocked_warned", False):
+            logger.warning(
+                "Unsloth: ignoring UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 because the rollouts use "
+                f"{', '.join(blockers)}, which vLLM applies before truncating, so the trainer cannot "
+                "rebuild the same kept set. Scoring over the full vocabulary instead."
+            )
+            trainer._unsloth_truncated_support_blocked_warned = True
         return {}
     return {"support_top_k": top_k, "support_top_p": top_p, "support_min_p": min_p}
 pass
