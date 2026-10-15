@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The triton_kernels adapter on CPU fakes of each upstream API generation.
-
-The fakes implement each generation's documented index semantics (matmul_ogs: gather by
-``src // k``, scatter summed over the k slots; matmul: gather by token row, scatter one row
-per (token, slot), no sum), so a translation mistake shows up as a wrong MoE output.
-"""
+"""CPU fakes of each triton_kernels API generation's index semantics: a translation mistake gives a wrong MoE output."""
 
 import dataclasses
 import logging
@@ -33,7 +28,6 @@ import unsloth_zoo.triton_kernels_compat as tkc
 from unsloth_zoo.temporary_patches import gpt_oss as go
 
 
-# ---- fake triton_kernels generations -------------------------------------------------------
 
 def _expert_rows(x_rows, w, bias, hist):
     out, lo = [], 0
@@ -52,7 +46,6 @@ def _activate(y, reduction_n):
 
 
 def _make_fake(name, api):
-    """A triton_kernels package of generation `api` (one of tkc.API_*), registered in sys.modules by the caller."""
     pkg = types.ModuleType(name)
     pkg.__path__ = []
     mods = {"": pkg}
@@ -266,7 +259,6 @@ def fresh(monkeypatch):
 ALL_APIS = (tkc.API_OGS_ROUTING, tkc.API_OGS_RAGGED, tkc.API_MATMUL_RAGGED)
 
 
-# ---- selection -------------------------------------------------------------------------
 
 @pytest.mark.parametrize("api", ALL_APIS)
 def test_each_generation_resolves_and_is_detected(fresh, api):
@@ -335,11 +327,9 @@ def test_vendored_copy_is_used_when_top_level_is_missing(fresh):
     fresh.setattr(tkc, "_import_top_level", lambda: None)
     fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
     assert tkc.selected_triton_kernels() == ("vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
-    # patch_gpt_oss keys on the top-level package only.
     assert go._check_triton_kernels_available() is False
 
 
-# ---- translation -----------------------------------------------------------------------
 
 def _moe_inputs(T = 7, H = 8, I = 6, E = 4, seed = 0):
     gen = torch.Generator().manual_seed(seed)
@@ -421,7 +411,6 @@ def test_old_generation_calls_are_passed_through_unchanged(fresh):
     assert act.reduction_n == 2 and act.fn_args == (1.702, 7.0) and act.specs.fn == "swiglu_fn"
     backend.gate_up(x, w1, b1, rd, gather, pc, fused_activation = act)
     backend.down(torch.randn(x.shape[0] * 2, 6), w2, b2, rd, scatter, pc, gammas = rd.gate_scal)
-    # Same objects in, no translation: the routing objects and the caller's PrecisionConfig.
     assert [(c[0], c[1], c[2], c[3]) for c in pkg.calls] == [
         ("matmul_ogs", gather, None, pc), ("matmul_ogs", None, scatter, pc),
     ]
@@ -476,7 +465,6 @@ def test_unswizzle_handles_both_layout_contracts(fresh):
 
 @pytest.mark.parametrize("api", ALL_APIS)
 def test_decode_custom_op_runs_on_every_generation(fresh, api):
-    """mxfp4_ogs_moe's body (routing, fused SwiGLU, gather / scatter) on the resolved backend."""
     _install(fresh, "triton_kernels", api)
     go._ogs_modules.cache_clear()
     try:
@@ -488,7 +476,6 @@ def test_decode_custom_op_runs_on_every_generation(fresh, api):
         go._ogs_modules.cache_clear()
 
 
-# ---- Blackwell value-layout probe on the renamed kernel -----------------------------------
 
 # Verbatim from triton_kernels matmul_details/_matmul.py (release/3.8.x, main 4eda6cc).
 MATMUL_HOPPER_ONLY_SOURCE = '''
@@ -511,7 +498,6 @@ def test_renamed_kernel_hopper_only_assert_is_detected(monkeypatch):
     leaf = types.ModuleType(root + ".matmul_details._matmul")
     leaf._matmul = types.SimpleNamespace(src = MATMUL_HOPPER_ONLY_SOURCE)
     monkeypatch.setitem(sys.modules, leaf.__name__, leaf)
-    # Read from the copy that owns the layout, not from whatever `triton_kernels` is.
     monkeypatch.setitem(sys.modules, "triton_kernels.matmul_ogs_details._matmul_ogs", None)
     monkeypatch.setitem(sys.modules, "triton_kernels.matmul_details._matmul", None)
     assert go._blackwell_value_swizzle_unsupported() is False

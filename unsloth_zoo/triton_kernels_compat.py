@@ -14,21 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""OpenAI's triton_kernels for packed MXFP4 experts: resolve once, self-check per device.
-
-Three upstream API generations are accepted and reduced to the few operations Zoo uses
-(`TritonKernelsBackend`):
-
-* ``matmul_ogs+routing``: ``matmul_ogs.py`` + ``routing.py`` (Triton release/3.5.x and earlier,
-  vLLM's vendored copy). Calls go through unchanged.
-* ``matmul_ogs+ragged``: ``matmul_ogs.py`` without ``routing.py`` (removed in triton-lang/triton
-  30ede52, #8375; release/3.6.x). Routing is ``topk`` + bitmatrix metadata + ``RaggedTensorMetadata``,
-  rebuilt here into ``matmul_ogs``'s own ``RoutingData`` / ``GatherIndx`` / ``ScatterIndx``.
-* ``matmul+ragged``: ``matmul.py`` (renamed in d8119d5, #8765; release/3.7.x onward). Gather takes
-  token rows, scatter writes one row per (token, slot) with no reduction, and the weight scale is
-  ``b_mx_scale``. Zoo keeps its own ``RoutingData`` / ``GatherIndx`` / ``ScatterIndx`` with the old
-  field names and translates at the call.
-"""
+"""OpenAI's triton_kernels for packed MXFP4 experts, across three upstream API generations:
+``matmul_ogs+routing`` (release/3.5.x, vLLM's copy), ``matmul_ogs+ragged`` (``routing.py`` removed in
+30ede52, #8375) and ``matmul+ragged`` (renamed in d8119d5, #8765; no scatter reduction, ``b_mx_scale``)."""
 
 import contextlib
 import dataclasses
@@ -68,7 +56,6 @@ API_MATMUL_RAGGED = "matmul+ragged"
 
 @dataclasses.dataclass
 class GatherIndx:
-    """``matmul+ragged`` has no index classes: the old fields, expert-sorted (``src_indx`` = combine)."""
     src_indx: torch.Tensor
     dst_indx: torch.Tensor
 
@@ -81,7 +68,6 @@ class ScatterIndx:
 
 @dataclasses.dataclass
 class RoutingData:
-    """``matmul+ragged`` routing: the old fields, with ``expt_data`` the ``RaggedTensorMetadata``."""
     gate_scal: torch.Tensor
     expt_hist: torch.Tensor
     n_expts_tot: int
@@ -98,7 +84,6 @@ def _has(module, *names):
 
 
 def _detect_api(name):
-    """The generation of the triton_kernels rooted at `name`, from the modules and names Zoo calls."""
     sub = lambda s: importlib.import_module(f"{name}.{s}")
     tensor = sub("tensor")
     if not _has(tensor, "convert_layout", "wrap_torch_tensor", "FP4"):
@@ -131,7 +116,6 @@ def _detect_api(name):
 
 
 class TritonKernelsBackend:
-    """The operations Zoo's MXFP4 experts use, on one triton_kernels copy (top-level or vLLM's)."""
 
     def __init__(self, module, api = None):
         self.module = module
@@ -156,9 +140,7 @@ class TritonKernelsBackend:
     def __repr__(self):
         return f"TritonKernelsBackend({self.name}, {self.api})"
 
-    # ---- routing -----------------------------------------------------------------------
     def routing(self, logits, n_expts_act):
-        """(routing_data, gather_indx, scatter_indx): top-k, softmax over the top-k, expert-sorted."""
         if self.api == API_OGS_ROUTING:
             return self.routing_module.routing(logits, n_expts_act)
         topk = importlib.import_module(self.name + ".topk").topk
@@ -176,7 +158,6 @@ class TritonKernelsBackend:
 
     def routing_from_sorted(self, gate_scal, expt_hist, combine_indx, dispatch_indx, n_expts_tot, n_expts_act,
                             expt_data = None):
-        """Routing objects from expert-sorted gates; `expt_data` is only read on matmul_ogs+routing."""
         types_ = self.index_types
         if self.api != API_OGS_ROUTING:
             expt_data = self.ragged_metadata(expt_hist, combine_indx.shape[0])
@@ -187,9 +168,7 @@ class TritonKernelsBackend:
             types_.ScatterIndx(src_indx = dispatch_indx, dst_indx = combine_indx),
         )
 
-    # ---- precision / activation ------------------------------------------------------
     def precision(self, weight_scale):
-        """PrecisionConfig for an MXFP4 weight (e8m0 scales, 32-wide blocks) and bf16 activations."""
         mo = self.mm
         flex = mo.FlexCtx(rhs_data = mo.InFlexData())
         if "weight_scale" in self._precision_fields:
@@ -205,7 +184,7 @@ class TritonKernelsBackend:
         return scale if scale is not None else getattr(precision_config, "b_mx_scale", None)
 
     def swiglu_activation(self, alpha, limit):
-        """gpt-oss SwiGLU fused into the gate_up GEMM: 2 columns in, 1 out (`reduction_n` moved in #8483)."""
+        # `reduction_n` moved in #8483.
         mo = self.mm
         fn = self.swiglu.swiglu_fn
         if "reduction_n" in self._activation_fields:
@@ -213,21 +192,15 @@ class TritonKernelsBackend:
         return mo.FusedActivation(mo.FnSpecs("swiglu", fn, ("alpha", "limit"), reduction_n = 2), (alpha, limit))
 
     def unswizzle(self, tensor):
-        """A triton_kernels Tensor's storage in its pre-swizzle form: unit stride on dim -2, packed
-        along it, as wrapped from ``blocks.transpose(-2, -1)`` (no copy when already strided that way).
-        Old layouts unswizzle themselves; newer ones convert to ``StridedLayout(major_dim = -2)``
-        (their canonical unswizzled form packs FP4 along the last dim instead)."""
+        # major_dim = -2: the checkpoint packs FP4 along dim -2; the canonical unswizzled form packs the last dim.
         layout = tensor.storage.layout
         if hasattr(layout, "unswizzle_data"):
             return layout.unswizzle_data(tensor.storage.data)
         strided = self.tensor.convert_layout(tensor, self.layout.StridedLayout(major_dim = -2))
         return strided.storage.data
 
-    # ---- GEMMs -----------------------------------------------------------------------
     def matmul_ogs(self, x, weight, bias, routing_data, gather_indx = None, scatter_indx = None,
                    precision_config = None, gammas = None, fused_activation = None):
-        """matmul_ogs semantics on every generation: rows gathered from ``x[src // k]``, expert-sorted,
-        and with `scatter_indx` written back to ``out[dst // k]`` summed over each token's k slots."""
         kwargs = {}
         if gammas is not None:
             kwargs["gammas"] = gammas
@@ -240,15 +213,13 @@ class TritonKernelsBackend:
             )
         k = routing_data.n_expts_act
         if gather_indx is not None:
-            # matmul gathers x rows directly; matmul_ogs divided the (token, slot) index by k itself.
             kwargs["gather_indx"] = torch.div(gather_indx.src_indx, k, rounding_mode = "trunc")
         if scatter_indx is None:
             return self.mm.matmul(
                 x, weight, bias, a_ragged_metadata = routing_data.expt_data,
                 precision_config = precision_config, **kwargs,
             )
-        # matmul scatters one row per (token, slot) and leaves the k-sum to the caller: fp32 rows, summed
-        # in fp32, as matmul_ogs's own reduction.
+        # matmul leaves the k-sum to the caller: sum in fp32, as matmul_ogs's own reduction does.
         precision_config = dataclasses.replace(precision_config or self.mm.PrecisionConfig(), out_dtype = torch.float32)
         rows = self.mm.matmul(
             x, weight, bias, a_ragged_metadata = routing_data.expt_data, scatter_indx = scatter_indx.dst_indx,
@@ -257,14 +228,12 @@ class TritonKernelsBackend:
         return rows.view(-1, k, rows.shape[-1]).sum(1).to(x.dtype)
 
     def gate_up(self, x, weight, bias, routing_data, gather_indx, precision_config, fused_activation = None):
-        """Expert-sorted rows ``x[src // k] @ W[e] + b[e]`` (then the fused activation)."""
         return self.matmul_ogs(
             x, weight, bias, routing_data, gather_indx = gather_indx,
             precision_config = precision_config, fused_activation = fused_activation,
         )
 
     def down(self, h, weight, bias, routing_data, scatter_indx, precision_config, gammas = None):
-        """``out[dst // k] += gamma * (h @ W[e] + b[e])`` over expert-sorted rows of `h`."""
         return self.matmul_ogs(
             h, weight, bias, routing_data, scatter_indx = scatter_indx,
             precision_config = precision_config, gammas = gammas,
@@ -272,7 +241,6 @@ class TritonKernelsBackend:
 
 
 def _probe(module):
-    """The pieces the packed experts call; a stripped or unknown build fails here, not mid-forward."""
     _BACKENDS[module.__name__] = TritonKernelsBackend(module)
     return module
 
@@ -284,7 +252,7 @@ def _import_top_level():
 
 
 def _import_vllm_vendored():
-    """vLLM's copy imports itself as `triton_kernels`: alias only while importing (a lasting alias flips patch_gpt_oss)."""
+    # vLLM's copy imports itself as `triton_kernels`: alias only while importing (a lasting alias flips patch_gpt_oss).
     try:
         if importlib.util.find_spec("vllm.third_party.triton_kernels") is None:
             return None
@@ -296,7 +264,6 @@ def _import_vllm_vendored():
     before = {name for name in sys.modules if name.startswith("triton_kernels.")}
     sys.modules["triton_kernels"] = vendored
     try:
-        # Import every submodule now: lazy ones (routing -> `.topk`) import `triton_kernels.*` absolutely.
         for info in pkgutil.walk_packages(vendored.__path__, vendored.__name__ + "."):
             try:
                 importlib.import_module(info.name)
@@ -314,10 +281,7 @@ def _import_vllm_vendored():
 
 
 def get_triton_kernels():
-    """The triton_kernels module (top-level install first, then vLLM's vendored copy) or None. Never raises.
-
-    UNSLOTH_TRITON_KERNELS_SOURCE = auto | triton_kernels | vllm pins the copy (e.g. vLLM's while both exist).
-    """
+    """Top-level triton_kernels, else vLLM's copy, else None; UNSLOTH_TRITON_KERNELS_SOURCE = auto | triton_kernels | vllm."""
     global _MODULE
     if _MODULE is not _UNRESOLVED:
         return _MODULE
@@ -352,7 +316,6 @@ def _log_selected(backend):
 
 
 def triton_kernels_backend_for(module):
-    """The backend for a triton_kernels copy (module or its dotted name); cached, raises ImportError if unusable."""
     name = module if isinstance(module, str) else module.__name__
     backend = _BACKENDS.get(name)
     if backend is None:
@@ -363,7 +326,6 @@ def triton_kernels_backend_for(module):
 
 
 def get_triton_kernels_backend():
-    """The resolved copy's backend (see get_triton_kernels), or None. Never raises."""
     tk = get_triton_kernels()
     if tk is None:
         return None
@@ -374,14 +336,12 @@ def get_triton_kernels_backend():
 
 
 def selected_triton_kernels():
-    """(module name, API generation) of the resolved copy, or None: what the MXFP4 experts run on."""
     backend = get_triton_kernels_backend()
     return None if backend is None else (backend.name, backend.api)
 
 
 @contextlib.contextmanager
 def triton_kernels_alias():
-    """`import triton_kernels` resolves to the resolved module inside this block (load-time layout code)."""
     tk = get_triton_kernels()
     previous = sys.modules.get("triton_kernels", _UNRESOLVED)
     if tk is not None and previous is _UNRESOLVED:
@@ -410,7 +370,6 @@ def mxfp4_ogs_weight(blocks, scales):
 
 
 def _self_check(device):
-    """One real-shaped routed GEMM (gpt-oss-20b gate_up rows) against exact dequant + bf16 matmul."""
     tk = get_triton_kernels()
     if tk is None or device.type != "cuda" or torch.version.hip is not None:
         return False
@@ -437,7 +396,6 @@ def _self_check(device):
 
 
 def matmul_ogs_available(device = None) -> bool:
-    """Self-checked once per device; any import, layout, launch or accuracy failure -> False (use exact dequant)."""
     if device is None:
         if not torch.cuda.is_available():
             return False

@@ -137,7 +137,6 @@ _HOPPER_ONLY_VALUE_ASSERTS = frozenset(
     ast.dump(ast.parse(condition, mode = "eval").body, include_attributes = False)
     for condition in (
         'SWIZZLE_MX_VALUE == "HOPPER_VALUE" or SWIZZLE_MX_VALUE is None',
-        # matmul.py (triton-lang/triton #8765 onward) names the unswizzled layout.
         'SWIZZLE_MX_VALUE == "HOPPER_VALUE" or SWIZZLE_MX_VALUE == "STRIDED"',
     )
 )
@@ -171,14 +170,13 @@ def _source_rejects_blackwell_value_swizzle(source):
 
 
 def _blackwell_value_swizzle_unsupported(root = "triton_kernels"):
-    """Read the matmul kernel this process would actually launch (from the copy rooted at `root`)."""
+    """Read the matmul kernel this process would actually launch."""
     import importlib
     try:
         importlib.import_module(root)  # a blocked or missing package: nothing to read
     except Exception:
         return False
     kernel_modules = []
-    # One or the other per build: matmul_ogs_details until the rename (#8765), matmul_details after.
     for name in (f"{root}.matmul_ogs_details._matmul_ogs", f"{root}.matmul_details._matmul"):
         try:
             kernel_modules.append(importlib.import_module(name))
@@ -262,7 +260,7 @@ def _force_strided_mxfp4_values(value_layout, layout_module, w):
         )
         if not selected_is_blackwell:
             return False
-        # The kernels of the copy that owns this layout module (vLLM's copy under a live top-level install).
+        # Use the kernels of the copy owning this layout module (may be vLLM's).
         root = getattr(layout_module, "__name__", "")
         root = root[: -len(".tensor_details.layout")] if root.endswith(".tensor_details.layout") else "triton_kernels"
         return _blackwell_value_swizzle_unsupported(root)
@@ -515,7 +513,6 @@ def _mxfp4_routing_from_topk(module, router_indices, routing_weights):
             expt_data = tk_routing.ExptData(
                 expt_hist, *expt_data_from_hist(expt_hist, n_expts_tot, router_indices.numel(), block_ms),
             )
-        # Newer builds: RaggedTensorMetadata from the same histogram (built by the backend).
         return backend.routing_from_sorted(
             gate_scal, expt_hist, combine_indx, dispatch_indx, n_expts_tot, router_indices.shape[1], expt_data,
         )
@@ -2187,7 +2184,6 @@ _OGS_FAILED = set()
 
 @functools.lru_cache(maxsize = 1)
 def _ogs_modules():
-    """The resolved triton_kernels backend (top-level install or vLLM's vendored copy, never a lasting alias)."""
     from unsloth_zoo.triton_kernels_compat import get_triton_kernels_backend
     return get_triton_kernels_backend()
 
@@ -2545,10 +2541,9 @@ def _ogs_expert_offsets(routing_data):
 
 
 def _ogs_root_for(weight, routing_data = None):
-    """The triton_kernels copy owning `weight` (other copies reject its Tensor); dense weights use `routing_data`'s."""
+    """Other copies reject `weight`'s Tensor; dense weights use `routing_data`'s copy."""
     if isinstance(weight, torch.Tensor):
         owner = type(routing_data).__module__ if routing_data is not None else ""
-        # RoutingData lives in routing.py (old builds) or matmul_ogs.py (routing.py removed).
         for suffix in (".routing", ".matmul_ogs"):
             if owner.endswith(suffix):
                 return owner[: -len(suffix)]
@@ -2566,7 +2561,6 @@ def _ogs_backend_for(weight, routing_data = None):
 
 
 def _matmul_ogs_for(weight, routing_data = None):
-    """matmul_ogs semantics from the copy owning `weight` (see _ogs_root_for), on any API generation."""
     return _ogs_backend_for(weight, routing_data).matmul_ogs
 
 

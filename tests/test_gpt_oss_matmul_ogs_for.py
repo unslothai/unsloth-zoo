@@ -71,7 +71,6 @@ def test_triton_tensor_weight_keeps_its_own_copy(monkeypatch):
 
 
 def test_dense_weight_uses_matmul_ogs_routing_data_copy(monkeypatch):
-    # routing.py removed upstream (#8375): RoutingData then lives in matmul_ogs.py.
     _, _, mo = _fake_copy(monkeypatch, "fake_tk_ragged")
 
     class RoutingData:
