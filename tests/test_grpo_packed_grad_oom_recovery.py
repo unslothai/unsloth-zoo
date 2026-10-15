@@ -116,6 +116,7 @@ def _run(model, input_ids, **overrides):
         "_pg_skip_pack": False,
         "logit_scale_multiply": 0.0, "logit_scale_divide": 0.0,
         "logit_softcapping": 0.0, "temperature": 1.0,
+        "_need_entropy": False,
     }
     ns.update(overrides)
     exec(_block_source(), ns)
