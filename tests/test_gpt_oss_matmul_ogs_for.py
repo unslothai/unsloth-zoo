@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dense torch.Tensor expert weights must not resolve to "torch.matmul_ogs" (broke native MXFP4 training)."""
+"""Dense torch.Tensor expert weights must not resolve to the "torch" copy (broke native MXFP4 training)."""
 import sys
 import types
 
@@ -48,23 +48,33 @@ def _fake_copy(monkeypatch, root):
 def test_dense_weight_uses_routing_data_copy(monkeypatch):
     RoutingData, _, mo = _fake_copy(monkeypatch, "fake_vendored.triton_kernels")
     dense = torch.zeros(2, 4, 6, dtype = torch.bfloat16)
-    assert gpt_oss._matmul_ogs_for(dense, RoutingData()) is mo.matmul_ogs
+    assert gpt_oss._ogs_root_for(dense, RoutingData()) == "fake_vendored.triton_kernels"
 
 
 def test_dense_parameter_uses_routing_data_copy(monkeypatch):
     RoutingData, _, mo = _fake_copy(monkeypatch, "fake_tk_param")
     dense = torch.nn.Parameter(torch.zeros(2, 4, 6), requires_grad = False)
-    assert gpt_oss._matmul_ogs_for(dense, RoutingData()) is mo.matmul_ogs
+    assert gpt_oss._ogs_root_for(dense, RoutingData()) == "fake_tk_param"
 
 
 def test_dense_weight_without_routing_falls_back_to_resolved(monkeypatch):
     _, _, mo = _fake_copy(monkeypatch, "fake_tk_resolved")
     import unsloth_zoo.triton_kernels_compat as compat
     monkeypatch.setattr(compat, "get_triton_kernels", lambda: sys.modules["fake_tk_resolved"])
-    assert gpt_oss._matmul_ogs_for(torch.zeros(1, 2, 2)) is mo.matmul_ogs
+    assert gpt_oss._ogs_root_for(torch.zeros(1, 2, 2)) == "fake_tk_resolved"
 
 
 def test_triton_tensor_weight_keeps_its_own_copy(monkeypatch):
     _, Tensor, mo = _fake_copy(monkeypatch, "fake_tk_weight")
     OtherRouting, _, _ = _fake_copy(monkeypatch, "fake_tk_other")
-    assert gpt_oss._matmul_ogs_for(Tensor(), OtherRouting()) is mo.matmul_ogs
+    assert gpt_oss._ogs_root_for(Tensor(), OtherRouting()) == "fake_tk_weight"
+
+
+def test_dense_weight_uses_matmul_ogs_routing_data_copy(monkeypatch):
+    _, _, mo = _fake_copy(monkeypatch, "fake_tk_ragged")
+
+    class RoutingData:
+        pass
+
+    RoutingData.__module__ = mo.__name__
+    assert gpt_oss._ogs_root_for(torch.zeros(2, 4, 6), RoutingData()) == "fake_tk_ragged"
