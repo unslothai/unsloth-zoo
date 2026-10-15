@@ -331,6 +331,7 @@ def test_source_can_be_forced_when_both_exist(fresh, source, want):
 
 def test_vendored_copy_is_used_when_top_level_is_missing(fresh):
     vendored = _install(fresh, "vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
+    fresh.setitem(sys.modules, "triton_kernels", None)  # no top-level install, even if this env has one
     fresh.setattr(tkc, "_import_top_level", lambda: None)
     fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
     assert tkc.selected_triton_kernels() == ("vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
@@ -502,6 +503,11 @@ def test_renamed_kernel_hopper_only_assert_is_detected(monkeypatch):
     go._source_rejects_blackwell_value_swizzle.cache_clear()
     assert go._source_rejects_blackwell_value_swizzle(MATMUL_HOPPER_ONLY_SOURCE) is True
     root = "fake_vendored_root.triton_kernels"
+    for name in ("fake_vendored_root", root, root + ".matmul_details"):
+        package = types.ModuleType(name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, name, package)
+    monkeypatch.setitem(sys.modules, root + ".matmul_ogs_details", None)
     leaf = types.ModuleType(root + ".matmul_details._matmul")
     leaf._matmul = types.SimpleNamespace(src = MATMUL_HOPPER_ONLY_SOURCE)
     monkeypatch.setitem(sys.modules, leaf.__name__, leaf)

@@ -173,10 +173,16 @@ def _source_rejects_blackwell_value_swizzle(source):
 def _blackwell_value_swizzle_unsupported(root = "triton_kernels"):
     """Read the matmul kernel this process would actually launch (from the copy rooted at `root`)."""
     import importlib
+    try:
+        importlib.import_module(root)  # a blocked or missing package: nothing to read
+    except Exception:
+        return False
     kernel_modules = []
+    # One or the other per build: matmul_ogs_details until the rename (#8765), matmul_details after.
     for name in (f"{root}.matmul_ogs_details._matmul_ogs", f"{root}.matmul_details._matmul"):
         try:
             kernel_modules.append(importlib.import_module(name))
+            break
         except Exception:
             pass
     found = False
