@@ -120,7 +120,6 @@ def test_grpo_kl_clamp_precedes_bias_correction_and_beta(use_bias_correction_kl)
 
 @pytest.mark.parametrize("width", [1, 2])
 def test_grpo_mean_kl_skips_masked_rows_for_one_token_completions(width):
-    # Width 1 is still per token: the fully masked row must leave the KL mean.
     new = torch.zeros(2, width, dtype=torch.float64, requires_grad=True)
     ref = torch.full((2, width), 0.5, dtype=torch.float64)
     mask = torch.zeros(2, width, dtype=torch.long)
