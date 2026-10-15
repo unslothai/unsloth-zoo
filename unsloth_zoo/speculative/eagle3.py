@@ -53,6 +53,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Trainer, TrainingArguments
 
+from .trainer import token_average_scale
 from .capture import resolve_text_parts, run_frozen_target
 
 # Target text model_types where llama.cpp exposes layer inputs (`t_layer_inp`) AND vLLM 0.31
@@ -555,6 +556,8 @@ def eagle3_chunked_loss(drafter, step_hidden, final_hidden, lm_head_weight, loss
     from torch.utils.checkpoint import checkpoint
 
     weight = lm_head_weight[drafter.t2d.to(lm_head_weight.device)] if drafter.uses_draft_vocab else lm_head_weight
+    # A target sharded over GPUs keeps its lm_head on another device than the drafter.
+    weight = weight.to(drafter.fc.weight.device)
 
     def chunk_kl(h, th):
         logp = F.log_softmax(drafter.logits(h).float(), dim = -1)
@@ -667,6 +670,7 @@ class UnslothEagle3Trainer(Trainer):
                                           loss_mask, self.args.eagle3_step_decay, normalizer = normalizer)
         if model.training:
             self._eagle3_log.append(stats)
+        loss = loss * token_average_scale(self, num_items_in_batch)
         return (loss, None) if return_outputs else loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys = None):

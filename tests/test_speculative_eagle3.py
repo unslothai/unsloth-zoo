@@ -422,3 +422,26 @@ def test_embedding_on_another_device_lands_on_the_drafter():
     out = drafter.embed(torch.tensor([[1, 2, 3]]))
     assert out.device == drafter.fc.weight.device
     assert torch.equal(out.cpu(), target.model.embed_tokens.weight[[1, 2, 3]][None].to(out.dtype))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU to keep the target lm_head on another device")
+def test_chunked_loss_with_the_target_lm_head_on_another_device():
+    target = _target()
+    from unsloth_zoo.speculative.capture import resolve_text_parts
+    lm = resolve_text_parts(target)["lm_head"].weight
+    ids = torch.randint(0, VOCAB, (1, 12))
+    mask = torch.ones_like(ids)
+    drafter = _drafter(target).train()
+    aux, cap = _aux(target, drafter, ids, mask)
+    ref, _ = eagle3_chunked_loss(drafter, drafter.forward_train(aux, ids, mask, 2, return_hidden = True),
+                                 cap["final"][:, 1:], lm, mask[:, 1:].bool())
+    drafter = drafter.cuda()
+    drafter.set_embeddings(target.model.embed_tokens.weight)
+    hidden = drafter.forward_train(aux.cuda(), ids.cuda(), mask.cuda(), 2, return_hidden = True)
+    loss, _ = eagle3_chunked_loss(drafter, hidden, cap["final"][:, 1:].cuda(), lm, mask[:, 1:].bool().cuda())
+    assert torch.allclose(loss.cpu(), ref, atol = 1e-4)
+
+
+def test_eagle3_compute_loss_applies_the_distributed_scale():
+    import inspect
+    assert "token_average_scale(self, num_items_in_batch)" in inspect.getsource(UnslothEagle3Trainer.compute_loss)
