@@ -279,3 +279,30 @@ def test_trainer_evaluates_and_resumes(tmp_path):
                                    eval_dataset = rows, data_collator = MTPDataCollator(pad_token_id = 0))
     resumed.train(resume_from_checkpoint = str(tmp_path / "checkpoint-2"))
     assert resumed.state.global_step == 4
+
+
+def test_layer_minus_one_is_the_embedding_output(tmp_path):
+    """DeepSpec's target layer -1 is the embedding output, not the last decoder layer."""
+    target = _target().float()
+    drafter = Qwen3DSparkDrafter.from_target(target, target_layer_ids = [-1, 1], mask_token_id = VOCAB - 1,
+                                             num_draft_layers = 1, block_size = BS, num_anchors = 6, markov_rank = 8)
+    seen = {}
+    real = drafter.context_states
+
+    def spy(captured):
+        seen.update(captured)
+        return real(captured)
+
+    drafter.context_states = spy
+    ids = torch.randint(0, VOCAB - 1, (1, 16), generator = torch.Generator().manual_seed(0))
+    args = DSparkTrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True,
+                                   dspark_num_anchors = 6, save_strategy = "no")
+    trainer = UnslothDSparkTrainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist(), "labels": ids[0].tolist()}]),
+                                   data_collator = MTPDataCollator(pad_token_id = 0))
+    batch = {"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones_like(ids)}
+    trainer.compute_loss(drafter, batch)
+    with torch.no_grad():
+        reference = target(input_ids = ids, output_hidden_states = True).hidden_states
+    assert torch.allclose(seen[-1].float(), reference[0].float())
+    assert torch.allclose(seen[1].float(), reference[2].float())

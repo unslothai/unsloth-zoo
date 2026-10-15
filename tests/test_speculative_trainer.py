@@ -152,3 +152,22 @@ def test_gradient_accumulation_matches_one_big_batch(tmp_path):
         results.append(head.state_dict())
     for k in init:
         assert torch.allclose(results[0][k], results[1][k], atol = 1e-5), k
+
+
+def test_teacher_labels_are_chunk_budget_invariant(tmp_path, monkeypatch):
+    """`mtp_label_source="teacher"` projects in budget-capped chunks; a tiny budget gives the same loss."""
+    from unsloth_zoo.speculative import losses
+
+    target = _target()
+    parts = resolve_text_parts(target)
+    head = build_mtp_head(parts["config"], device = DEVICE)
+    input_ids = torch.randint(1, VOCAB, (2, 12), device = DEVICE)
+    labels = input_ids.clone()
+    labels[:, :4] = -100
+    final = run_frozen_target(target, input_ids)["final"]
+    args = _args(tmp_path, mtp_label_source = "teacher")
+    full, _ = mtp_step_losses(head, parts, final, input_ids, torch.ones_like(input_ids), labels, args)
+    element = parts["lm_head"].weight.element_size()
+    monkeypatch.setattr(losses, "LOGITS_BUDGET_BYTES", 3 * VOCAB * element)
+    small, _ = mtp_step_losses(head, parts, final, input_ids, torch.ones_like(input_ids), labels, args)
+    assert torch.allclose(full, small)

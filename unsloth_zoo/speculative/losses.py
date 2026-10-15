@@ -69,6 +69,9 @@ def _chunk_loss(hidden, labels, teacher_hidden, weight, teacher_weight, loss_typ
     return (lam * kl + (1.0 - lam) * tv).sum(), n_correct
 
 
+LOGITS_BUDGET_BYTES = 256 << 20
+
+
 def chunked_lm_loss(
     hidden,
     lm_head_weight,
@@ -93,9 +96,9 @@ def chunked_lm_loss(
         raise ValueError(f"Unsloth: loss_type = {loss_type!r} needs teacher_hidden.")
     if chunk_size < 1:
         raise ValueError(f"Unsloth: chunk_size must be >= 1, got {chunk_size}.")
-    # A chunk holds ~2 (ce) or ~6 (teacher losses) fp32 [rows, V] tensors: keep that near 256 MB.
+    # A chunk holds ~2 (ce) or ~6 (teacher losses) fp32 [rows, V] tensors: keep that near the budget.
     per_row = lm_head_weight.shape[0] * 4 * (2 if loss_type == "ce" else 6)
-    chunk_size = max(1, min(chunk_size, (256 << 20) // per_row))
+    chunk_size = max(1, min(chunk_size, LOGITS_BUDGET_BYTES // per_row))
     hidden = hidden.reshape(-1, hidden.shape[-1])
     labels = labels.reshape(-1).to(hidden.device)
     if hidden.shape[0] != labels.shape[0]:
