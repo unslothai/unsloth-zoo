@@ -242,9 +242,9 @@ class GenerationDefaults:
 class GenerationRequest:
     """One generation request.
 
-    Exactly one of ``prompt`` and ``prompt_token_ids`` must be provided.
-    Rendered prompt strings are encoded as-is; chat templating belongs to the
-    caller. ``image`` (vision models only) accepts a PIL image, an array, or a
+    Exactly one of ``prompt`` and ``prompt_token_ids`` must be provided, and a
+    vision request with media must use ``prompt``. Rendered prompt strings are
+    encoded as-is; chat templating belongs to the caller. ``image`` (vision models only) accepts a PIL image, an array, or a
     str/os.PathLike filesystem path or URL, decoded once before grouping; raw
     bytes and file-like objects are rejected. ``audio`` (vision models only) is
     accepted but decodes one request at a time, since no supported mlx-vlm
@@ -329,6 +329,29 @@ def _normalize_stop_strings(stop_strings: Sequence[str] | str | None) -> tuple[s
     return tuple(dict.fromkeys(stops))
 
 
+def _validated_prompt_ids(request: GenerationRequest, index: int) -> tuple[int, ...]:
+    try:
+        prompt_ids = list(request.prompt_token_ids)
+    except TypeError as exc:
+        raise TypeError(
+            f"requests[{index}].prompt_token_ids must be a sequence "
+            "of integers."
+        ) from exc
+    if not prompt_ids:
+        raise ValueError(
+            f"requests[{index}].prompt_token_ids must not be empty."
+        )
+    if any(
+        isinstance(token, bool) or not isinstance(token, Integral)
+        for token in prompt_ids
+    ):
+        raise TypeError(
+            f"requests[{index}].prompt_token_ids must contain only "
+            "integers."
+        )
+    return tuple(int(token) for token in prompt_ids)
+
+
 def _validate_text_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
@@ -349,28 +372,9 @@ def _validate_text_requests(
         if has_prompt and not request.prompt:
             raise ValueError(f"requests[{index}].prompt must not be empty.")
         if has_ids:
-            try:
-                prompt_ids = list(request.prompt_token_ids)
-            except TypeError as exc:
-                raise TypeError(
-                    f"requests[{index}].prompt_token_ids must be a sequence "
-                    "of integers."
-                ) from exc
-            if not prompt_ids:
-                raise ValueError(
-                    f"requests[{index}].prompt_token_ids must not be empty."
-                )
-            if any(
-                isinstance(token, bool) or not isinstance(token, Integral)
-                for token in prompt_ids
-            ):
-                raise TypeError(
-                    f"requests[{index}].prompt_token_ids must contain only "
-                    "integers."
-                )
             validated[index] = replace(
                 request,
-                prompt_token_ids=tuple(int(token) for token in prompt_ids),
+                prompt_token_ids=_validated_prompt_ids(request, index),
             )
         if request.max_tokens is not None:
             _validate_positive_int(request.max_tokens, f"requests[{index}].max_tokens")
@@ -542,6 +546,10 @@ def _unpadded_lengths(mask) -> list[int] | None:
         return None
 
 
+# A vision batch takes media-free rows as prompt_token_ids, which earlier releases refused.
+VLM_TOKEN_ID_PROMPTS = True
+
+
 def _validate_vlm_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
@@ -550,14 +558,25 @@ def _validate_vlm_requests(
     for index, request in enumerate(validated):
         if not isinstance(request, GenerationRequest):
             raise TypeError(f"requests[{index}] must be GenerationRequest.")
-        if request.prompt is None or request.prompt_token_ids is not None:
+        has_ids = request.prompt_token_ids is not None
+        if (request.prompt is not None) == has_ids:
             raise ValueError(
-                f"requests[{index}] must provide a rendered prompt string; "
-                "token-id prompts are text-model only."
+                f"requests[{index}] must provide exactly one of prompt or "
+                "prompt_token_ids."
             )
-        if not isinstance(request.prompt, str):
+        if has_ids:
+            if request.image is not None or request.audio is not None:
+                raise ValueError(
+                    f"requests[{index}] gives token ids with media; only the "
+                    "processor can place media tokens, so send a rendered prompt."
+                )
+            validated[index] = replace(
+                request,
+                prompt_token_ids=_validated_prompt_ids(request, index),
+            )
+        elif not isinstance(request.prompt, str):
             raise TypeError(f"requests[{index}].prompt must be a string.")
-        if not request.prompt:
+        elif not request.prompt:
             raise ValueError(f"requests[{index}].prompt must not be empty.")
         if request.image is not None and request.audio is not None:
             raise ValueError(
@@ -975,7 +994,7 @@ def generation_mode(model, int8_prefill = None):
         from .inference import (_fusion_modules, dense_prefill_linear, exact_speculative_verify,
                                 fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
                                 fused_moe_router, fused_packed_gated_delta, fused_residual_norm,
-                                fused_residual_norm_handoff, nax_quantized_linear)
+                                fused_residual_norm_handoff, fused_verify_attention, nax_quantized_linear)
         # One walk serves the flags and every scope: eval and the scopes leave the module graph alone.
         modules = tuple(_fusion_modules(model, None))
         training_states = _snapshot_training_flags([module for _, module in modules] or [model])
@@ -988,7 +1007,7 @@ def generation_mode(model, int8_prefill = None):
                 dense_prefill_linear(model, _modules = modules), \
                 fused_packed_gated_delta(model, _modules = modules), \
                 fused_residual_norm_handoff(model, _modules = modules), \
-                exact_speculative_verify(model, _modules = modules):
+                exact_speculative_verify(model, _modules = modules), fused_verify_attention(model, _modules = modules):
             yield model
     except BaseException as exc:
         active_error = exc
@@ -2460,6 +2479,178 @@ def _media_token_ids(config) -> set[int]:
     return ids
 
 
+_SINGLE_ROW_PREDICATE = "_is_single_row_batch_cache"
+_SINGLE_ROW_PARAMETERS = (
+    "self", "inputs", "inputs_embeds", "mask", "cache", "position_ids", "capture_layer_ids", "hidden_sink",
+)
+_SINGLE_ROW_LOCK = threading.Lock()
+_SINGLE_ROW_BYPASS = threading.local()
+
+
+def _single_row_predicate(call):
+    """mlx-vlm's predicate for the single-row shortcut *call* takes, or None when it takes none we know.
+
+    Its global is swapped once for a wrapper that answers the same unless a call through
+    ``single_row_batch_decode`` has asked to skip the shortcut on this thread.
+    """
+
+    code = getattr(call, "__code__", None)
+    if code is None or not {_SINGLE_ROW_PREDICATE, "_extract_row_cache"} <= set(code.co_names):
+        return None
+    if tuple(inspect.signature(call).parameters) != _SINGLE_ROW_PARAMETERS:
+        return None
+    namespace = call.__globals__
+    current = namespace.get(_SINGLE_ROW_PREDICATE)
+    native = getattr(current, "_unsloth_native", current)
+    if not callable(native):
+        return None
+    if native is current:
+        def predicate(cache_entry):
+            return not getattr(_SINGLE_ROW_BYPASS, "active", False) and native(cache_entry)
+
+        predicate._unsloth_native = native
+        namespace[_SINGLE_ROW_PREDICATE] = predicate
+    return native
+
+
+def _bypassing_single_row(call, cache):
+    previous = getattr(_SINGLE_ROW_BYPASS, "active", False)
+    _SINGLE_ROW_BYPASS.active = True
+    try:
+        return call(cache = cache)
+    finally:
+        _SINGLE_ROW_BYPASS.active = previous
+
+
+def _detached_cache_entry(entry):
+    import mlx.core as mx
+
+    # Cache updates overwrite their arrays in place, so the copy owns every one of them.
+    own = lambda value: mx.array(value) if isinstance(value, mx.array) else value
+    detached = copy.copy(entry)
+    for name, value in vars(entry).items():
+        detached.__dict__[name] = [own(item) for item in value] if isinstance(value, list) else own(value)
+    return detached
+
+
+def _cache_leaves(cache) -> list:
+    from mlx.utils import tree_flatten
+
+    return [type(entry) for entry in cache] + [
+        value for entry in cache if entry is not None for _, value in tree_flatten(entry.state)
+    ]
+
+
+def _same_bits(want: list, got: list) -> bool:
+    import mlx.core as mx
+
+    if len(want) != len(got):
+        return False
+    for a, b in zip(want, got):
+        if isinstance(a, mx.array) != isinstance(b, mx.array):
+            return False
+        if not isinstance(a, mx.array):
+            if a != b:
+                return False
+        elif a.dtype != b.dtype or a.shape != b.shape or not mx.array_equal(
+            mx.contiguous(a).view(mx.uint8), mx.contiguous(b).view(mx.uint8)
+        ).item():
+            return False
+    return True
+
+
+def _first_single_row_decode(module, call, cache, extracts):
+    import mlx.core as mx
+
+    evaluate = lambda leaves: mx.eval(*[leaf for leaf in leaves if isinstance(leaf, mx.array)])
+    # The shortcut copies the entries it extracts but advances the ones it passes through.
+    shadow = [entry if entry is None or extracts(entry) else _detached_cache_entry(entry) for entry in cache]
+    want = [call(cache = shadow), *_cache_leaves(shadow)]
+    evaluate(want)
+    got = [_bypassing_single_row(call, cache), *_cache_leaves(cache)]
+    evaluate(got)
+    verdict = _same_bits(want, got)
+    type(module)._unsloth_single_row_verdict = verdict
+    if verdict:
+        return got[0]
+    cache[:] = shadow
+    return want[0]
+
+
+@functools.cache
+def _single_row_decode_class(base, native_predicate):
+    native_call = base.__call__
+
+    def __call__(self, inputs, inputs_embeds = None, mask = None, cache = None, position_ids = None,
+                 capture_layer_ids = None, hidden_sink = None):
+        call = functools.partial(
+            native_call, self, inputs, inputs_embeds = inputs_embeds, mask = mask, position_ids = position_ids,
+            capture_layer_ids = capture_layer_ids, hidden_sink = hidden_sink,
+        )
+        rows = inputs if inputs_embeds is None else inputs_embeds
+        full_attention = None if cache is None else cache[self.fa_idx]
+        verdict = type(self)._unsloth_single_row_verdict
+        if (
+            verdict is False
+            or hidden_sink is not None
+            or full_attention is None
+            or tuple(rows.shape[:2]) != (1, 1)
+            or not native_predicate(full_attention)
+            # Already evaluated: the batched decode mask reads it every step too.
+            or full_attention.left_padding.item() != 0
+        ):
+            return call(cache = cache)
+        if verdict is None:
+            return _first_single_row_decode(self, call, cache, native_predicate)
+        return _bypassing_single_row(call, cache)
+
+    return type(f"_SingleRowDecode{base.__name__}", (base,), {
+        "__call__": __call__,
+        "_unsloth_single_row_native": base,
+        "_unsloth_single_row_verdict": None,
+    })
+
+
+@contextmanager
+def single_row_batch_decode(model):
+    """Decode a one-row batch cache in place rather than through mlx-vlm's single-row shortcut.
+
+    mlx-vlm's Qwen3.5 model extracts a one-row batch cache into per-row caches, decodes those and
+    merges them back on every call: about three copies of each full-attention layer's KV per token,
+    which a batch pays whenever it shrinks to one row. Within this scope a decode step on a row with
+    no left padding takes the batched path instead. The first such step of each model class runs the
+    shortcut on a copy as well, and keeps the shortcut unless output and cache state match bit for bit.
+    """
+
+    changed = []
+    try:
+        with _SINGLE_ROW_LOCK:
+            for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                base = type(module)
+                if hasattr(base, "_unsloth_single_row_native"):
+                    # Another scope's swap: hold it too, so only the last holder restores.
+                    if getattr(module, "_unsloth_single_row_scopes", 0):
+                        module._unsloth_single_row_scopes += 1
+                        changed.append(module)
+                    continue
+                if not isinstance(module, dict) or "__call__" in module or not hasattr(module, "fa_idx"):
+                    continue
+                predicate = _single_row_predicate(base.__call__)
+                if predicate is None:
+                    continue
+                module.__class__ = _single_row_decode_class(base, predicate)
+                module._unsloth_single_row_scopes = 1
+                changed.append(module)
+        yield model
+    finally:
+        with _SINGLE_ROW_LOCK:
+            for module in reversed(changed):
+                module._unsloth_single_row_scopes -= 1
+                if module._unsloth_single_row_scopes == 0:
+                    module.__class__ = type(module)._unsloth_single_row_native
+                    module.__dict__.pop("_unsloth_single_row_scopes", None)
+
+
 class _VLMBatchAdapter:
     """Event-level adapter over mlx-vlm's BatchGenerator.
 
@@ -2606,11 +2797,32 @@ class _VLMBatchAdapter:
         # length keeps varied batches working, at the cost of smaller groups.
         shape = self._image_shape(request.image)
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        key = (request.image is None, shape, len(tokenizer.encode(request.prompt)))
+        ids = request.prompt_token_ids
+        width = len(ids) if ids is not None else len(tokenizer.encode(request.prompt))
+        key = (request.image is None, ids is not None, shape, width)
         if self.batches_observable:
             return key
         sampling = request.sampling or self.defaults.sampling
         return (_sampler_key(sampling), *key)
+
+    def _prompt_inputs(self, requests: Sequence[GenerationRequest]) -> dict:
+        """``prepare_inputs`` for rows grouped alike; token-id rows are their own input ids."""
+        if requests[0].prompt_token_ids is not None:
+            import mlx.core as mx
+
+            input_ids = mx.array([list(request.prompt_token_ids) for request in requests])
+            return {"input_ids": input_ids, "attention_mask": mx.ones(input_ids.shape, dtype=mx.int32)}
+        images = [request.image for request in requests if request.image is not None]
+        return self.prepare_inputs(
+            self.processor,
+            images=images or None,
+            audio=None,
+            prompts=[request.prompt for request in requests],
+            image_token_index=getattr(getattr(self.model, "config", None), "image_token_index", None),
+            resize_shape=None,
+            add_special_tokens=self._add_special_tokens(),
+            pad_to_uniform_size=False,
+        )
 
     def _decode_image(self, request: GenerationRequest) -> GenerationRequest:
         """Load a path or URL image once, before grouping.
@@ -2789,23 +3001,11 @@ class _VLMBatchAdapter:
     ) -> Iterator[GenerationEvent]:
         chunk = [requests[index] for index in indices]
         batch_size = len(chunk)
-        prompts = [request.prompt for request in chunk]
-        images = [request.image for request in chunk if request.image is not None]
         row_sampling = [
             request.sampling or self.defaults.sampling for request in chunk
         ]
         sampling = row_sampling[0]
-        config = getattr(self.model, "config", None)
-        inputs = self.prepare_inputs(
-            self.processor,
-            images=images or None,
-            audio=None,
-            prompts=prompts,
-            image_token_index=getattr(config, "image_token_index", None),
-            resize_shape=None,
-            add_special_tokens=self._add_special_tokens(),
-            pad_to_uniform_size=False,
-        )
+        inputs = self._prompt_inputs(chunk)
         input_ids = inputs.get("input_ids")
         pixel_values = inputs.get("pixel_values")
         mask = inputs.get("attention_mask")
@@ -2852,7 +3052,7 @@ class _VLMBatchAdapter:
         generator = None
         active_error = None
         try:
-            with self._wired_limit():
+            with self._wired_limit(), single_row_batch_decode(self.model):
                 embedding_output = self.model.get_input_embeddings(
                     input_ids,
                     pixel_values,
@@ -3122,6 +3322,7 @@ class _VLMBatchSession:
         self._stack = ExitStack()
         try:
             self._stack.enter_context(adapter._wired_limit())
+            self._stack.enter_context(single_row_batch_decode(adapter.model))
             self.generator = self._open()
             self._cache_materializer = _VLMCacheMaterializer(self.generator)
         except BaseException:
@@ -3416,18 +3617,7 @@ class _VLMBatchSession:
     def _prepare(self, request: GenerationRequest):
 
         adapter = self.adapter
-        request = adapter._decode_image(request)
-        config = getattr(adapter.model, "config", None)
-        inputs = adapter.prepare_inputs(
-            adapter.processor,
-            images = None if request.image is None else [request.image],
-            audio = None,
-            prompts = [request.prompt],
-            image_token_index = getattr(config, "image_token_index", None),
-            resize_shape = None,
-            add_special_tokens = adapter._add_special_tokens(),
-            pad_to_uniform_size = False,
-        )
+        inputs = adapter._prompt_inputs([adapter._decode_image(request)])
         input_ids = inputs.get("input_ids")
         data_kwargs = {
             key: value
@@ -3574,16 +3764,7 @@ class _SpeculativeBatchSession:
         if request.audio is not None:
             raise BatchRowRefused("An audio request decodes on its own and cannot join a batch; generate it with generate_batch or stream_batch.")
         request = adapter._decode_image(request)
-        inputs = adapter.prepare_inputs(
-            adapter.processor,
-            images = None if request.image is None else [request.image],
-            audio = None,
-            prompts = [request.prompt],
-            image_token_index = getattr(getattr(adapter.model, "config", None), "image_token_index", None),
-            resize_shape = None,
-            add_special_tokens = adapter._add_special_tokens(),
-            pad_to_uniform_size = False,
-        )
+        inputs = adapter._prompt_inputs([request])
         input_ids, mask = inputs["input_ids"], inputs.get("attention_mask")
         extra = {key: value for key, value in inputs.items() if key not in ("input_ids", "pixel_values", "attention_mask")}
         row = self._next_row
@@ -4164,6 +4345,7 @@ __all__ = [
     "GenerationRequest",
     "GenerationResult",
     "SamplingParams",
+    "VLM_TOKEN_ID_PROMPTS",
     "fast_generate",
     "generate_batch",
     "generation_mode",

@@ -769,12 +769,21 @@ def train_on_responses_only(
     return_function   = False, # Useful for iterating over lists
     num_proc          = None,
     last_response_only = False, # Train only on the last assistant turn
+    mask_out_tokens   = None,  # e.g. ["</think>"] - also mask these inside kept responses
 ):
     """Train only on responses by masking instruction labels to -100.
 
     With last_response_only=True, only the final assistant turn is unmasked;
     earlier assistant turns stay at -100 (never written, never copied from
     old_labels).
+
+    mask_out_tokens re-masks the given token strings to -100 even inside kept
+    response spans - e.g. mask_out_tokens=["</think>"] reproduces the Nemotron
+    Ultra recipe of never training on the thinking closer. Each entry is matched
+    as its tokenized id sequence (a leading-space variant is matched too when it
+    merges into the string, as with SentencePiece/BPE "▁word" pieces). Atomic added tokens such as "</think>"
+    always match exactly; multi-token strings match only where the in-context
+    tokenization equals the standalone one.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if trainer is not None:
@@ -795,6 +804,7 @@ def train_on_responses_only(
                 return_function=return_function,
                 num_proc=num_proc,
                 last_response_only=last_response_only,
+                mask_out_tokens=mask_out_tokens,
             )
 
     if tokenizer is None and trainer is not None:
@@ -889,6 +899,26 @@ def train_on_responses_only(
 
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
+
+    mask_out_sequences = []
+    if mask_out_tokens:
+        if isinstance(mask_out_tokens, str): mask_out_tokens = [mask_out_tokens]
+        for token_string in mask_out_tokens:
+            bare   = tokenizer(token_string,       add_special_tokens = False).input_ids
+            spaced = tokenizer(" " + token_string, add_special_tokens = False).input_ids
+            # Qwen3 " </think>" = [220, 151668]: matching it would also mask the space.
+            if any(spaced[i : i + len(bare)] == bare for i in range(len(spaced) - len(bare) + 1)):
+                spaced = None
+            for ids in (bare, spaced):
+                if ids and ids not in mask_out_sequences:
+                    mask_out_sequences.append(ids)
+    pass
+    # Up to 4 first ids: one C-level list.index scan each per row; past that one set pass is cheaper.
+    mask_out_lookup = {}
+    for ids in mask_out_sequences:
+        mask_out_lookup.setdefault(ids[0], []).append((ids, len(ids), [-100] * len(ids)))
+    mask_out_groups  = tuple(mask_out_lookup.items())
+    mask_out_firsts  = frozenset(mask_out_lookup) if len(mask_out_lookup) > 4 else None
 
     def _train_on_responses_only(examples):
         input_ids_ = examples["input_ids"]
@@ -1008,6 +1038,24 @@ def train_on_responses_only(
                     labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
                 else:
                     labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
+
+            # Outside kept spans labels are already -100, so masking everywhere is safe.
+            if mask_out_lookup:
+                if mask_out_firsts is None:
+                    hits = []
+                    for first, group in mask_out_groups:
+                        i = -1
+                        while True:
+                            try: i = input_ids.index(first, i + 1)
+                            except ValueError: break
+                            hits.append((i, group))
+                else:
+                    hits = [(i, mask_out_lookup[t]) for i, t in enumerate(input_ids) if t in mask_out_firsts]
+                for i, group in hits:
+                    for seq, seq_len, fill in group:
+                        if seq_len == 1: labels[i] = -100
+                        elif input_ids[i : i + seq_len] == seq: labels[i : i + seq_len] = fill
+            pass
 
             all_labels.append(labels)
         pass
@@ -2049,6 +2097,12 @@ def train_on_responses_only(
     if _is_vision_collator(data_collator):
         masking = getattr(data_collator, "train_on_responses_only", None)
         if callable(masking):
+            if mask_out_tokens:
+                raise ValueError(
+                    f"Unsloth: your {type(data_collator).__name__} already masks responses, so "
+                    "mask_out_tokens would be ignored. Pass it to the collator instead: "
+                    "UnslothVisionDataCollator(..., mask_out_tokens = [...])."
+                )
             return trainer  # collator already masks responses; nothing to do
         is_unsloth = any(b.__name__ == "UnslothVisionDataCollator" for b in type(data_collator).__mro__)
         if not is_unsloth:
@@ -2116,6 +2170,7 @@ def train_on_responses_only(
                 tokenizer          = coll_proc,
                 return_function    = True,
                 last_response_only = last_response_only,
+                mask_out_tokens    = mask_out_tokens,
                 **parts,
             )
             print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")

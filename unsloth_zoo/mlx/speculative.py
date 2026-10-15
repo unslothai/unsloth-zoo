@@ -977,7 +977,9 @@ class SpeculativeEngine:
         if self._exact:
             out = self.lm(inputs, cache = self.cache, speculative_verify = True, **{"capture_layer_ids": [], **self._kwargs()})
             return out.logits, self._hidden(out), out.gdn_states
-        out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._kwargs())
+        from .inference import verify_block_attention
+        with verify_block_attention():
+            out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._kwargs())
         return out.logits, self._hidden(out), transaction
 
     def _plain(self, length: int, states: list[RowState], waiting: Callable[[], bool] | None = None) -> Iterator[list[list[int]]]:
