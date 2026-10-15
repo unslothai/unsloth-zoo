@@ -14,17 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""ReplaySSM decode for Gated DeltaNet (Qwen3.5 / Qwen3.6 / Qwen3-Next) on released vLLM.
+"""Runtime backport of vllm-project/vllm#48792 (GDN ReplaySSM decode, closed unmerged) to released vLLM.
 
-Upstream vLLM ships ReplaySSM for Mamba2 only. This backports the GDN half from
-vllm-project/vllm#48792 (closed unmerged when its fork was deleted) as an idempotent
-runtime patch: the decode kernel (vendored under ``_vendored/vllm``), the three extra
-ring tensors in the GDN state page, the per-row ring cursor / flush flag in the GDN
-metadata builder, and the decode dispatch in ``QwenGatedDeltaNetAttention``.
-
-Every piece is matched against the installed vLLM's source first; any mismatch leaves
-vLLM untouched and ``patch_vllm_gdn_replayssm`` returns False, so the caller simply
-does not request ReplaySSM.
+Every edit is matched against the installed vLLM source first; any mismatch leaves vLLM untouched.
 """
 
 __all__ = ["GDN_REPLAYSSM_ARCHITECTURES", "patch_vllm_gdn_replayssm"]
@@ -40,7 +32,6 @@ GDN_REPLAYSSM_ARCHITECTURES = (
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3NextForCausalLM",
 )
-# Classes that define the class-level GDN state hooks (subclasses inherit them).
 _MODEL_HOOK_CLASSES = (
     ("qwen3_5", "Qwen3_5ForCausalLMBase"),
     ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
@@ -52,8 +43,7 @@ def _model_modules():
     from vllm.model_executor.models import qwen3_5, qwen3_next
     return {"qwen3_5": qwen3_5, "qwen3_next": qwen3_next}
 
-# (method, exact source fragment in vLLM, replacement). A fragment that is not found
-# exactly once aborts the whole patch.
+# (method, exact vLLM source fragment, replacement); a fragment not found exactly once aborts the patch.
 _LAYER_SOURCE_EDITS = {
     "_fused_gdn_decode_unsupported_reason": (
         (
@@ -131,8 +121,7 @@ def _gdn_ring_dtypes(base_dtypes, model_dtype):
 
 
 def _apply_edit(source, old, new):
-    # Replace `old` (written at depth 0) where it appears exactly once as whole lines at
-    # some indentation depth; None if no depth gives exactly one match.
+    # `old` must match exactly once as whole lines at some indentation depth, else None.
     for depth in range(8):
         pad = " " * (4 * depth)
         old_i = "\n" + textwrap.indent(old, pad)
@@ -153,7 +142,7 @@ def _edit_method(cls, name, edits, namespace):
 
 
 def _replayssm_decode_rows(self, mixed_qkv, a, b, state_indices, attn_metadata, out = None):
-    # Ring decode for one token per row into `out` (rows, 1, local_v_heads, head_v_dim).
+    # `out`: (rows, 1, local_v_heads, head_v_dim).
     import torch
     from unsloth_zoo._vendored.vllm.gdn_replayssm_decode import fused_recurrent_gated_delta_rule_replayssm
     kv_cache = self.kv_cache
@@ -187,8 +176,7 @@ def _make_decode_non_spec(layer_module):
     is_conv_state_dim_first = layer_module.is_conv_state_dim_first
 
     def _forward_core_decode_non_spec_replayssm(self, mixed_qkv, b, a, core_attn_out, attn_metadata):
-        # Mirrors vLLM's _forward_core_decode_non_spec with the ring kernel in place of
-        # the packed recurrent decode.
+        # vLLM's _forward_core_decode_non_spec with the ring kernel in place of the packed decode.
         state_indices = attn_metadata.non_spec_state_indices_tensor
         kv_cache = self.kv_cache
         conv_state = kv_cache[0] if is_conv_state_dim_first() else kv_cache[0].transpose(-1, -2)
@@ -254,7 +242,6 @@ def _patch_builder(builder_module):
 
     @dataclasses.dataclass
     class GDNReplaySSMAttentionMetadata(Metadata):
-        # Per decode row: ring write position and flush flag (None unless decoding).
         write_pos_d: "torch.Tensor | None" = None
         is_flush_d: "torch.Tensor | None" = None
 
@@ -409,7 +396,6 @@ def patch_vllm_gdn_replayssm():
             for hook in ("get_mamba_state_shape_from_config", "get_mamba_state_dtype_from_config"):
                 if hook not in model_cls.__dict__:
                     return False
-        # Dry-run the source edits before touching anything.
         for name, edits in _LAYER_SOURCE_EDITS.items():
             if _edit_method(Layer, name, edits, layer_module.__dict__) is None:
                 return False

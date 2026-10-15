@@ -3392,9 +3392,7 @@ _REPLAYSSM_MAMBA2_MODELS = {
     "granitemoehybrid": ("granitemoehybrid", "GraniteMoeHybridForCausalLM", "mamba_n_groups"),
     "zamba2": ("zamba2", "Zamba2ForCausalLM", "mamba_ngroups"),
 }
-# Gated DeltaNet (Qwen3.5 / Qwen3.6 / Qwen3-Next): vLLM has no GDN ReplaySSM yet, so
-# unsloth_zoo.vllm_gdn_replayssm backports it; opt-in only (UNSLOTH_VLLM_REPLAYSSM=1).
-# Top-level and nested text model types.
+# Gated DeltaNet: backported by unsloth_zoo.vllm_gdn_replayssm, opt-in only (UNSLOTH_VLLM_REPLAYSSM=1).
 _REPLAYSSM_GDN_MODEL_TYPES = (
     "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
 )
@@ -3435,8 +3433,7 @@ def _replayssm_ring_hooks(model_cls, n_groups_field):
 
 
 def _widen_vllm_replayssm_capability(class_names):
-    # vLLM reads the capability from a subprocess-cached registry entry, so ModelConfig is
-    # patched, not the model class. Idempotent; False when this vLLM has no such property.
+    # ModelConfig, not the model class: vLLM reads the capability from a subprocess-cached registry entry.
     try:
         from vllm.config.model import ModelConfig
     except Exception:
@@ -3459,7 +3456,6 @@ def _widen_vllm_replayssm_capability(class_names):
 
 
 def _patch_vllm_replayssm_mamba2(model_type):
-    # True once vLLM will accept ReplaySSM for this Mamba2 hybrid. Idempotent.
     module_name, class_name, n_groups_field = _REPLAYSSM_MAMBA2_MODELS[model_type]
     try:
         import importlib
@@ -3486,7 +3482,6 @@ def _patch_vllm_replayssm_mamba2(model_type):
 
 
 def _patch_vllm_replayssm_gdn():
-    # True once vLLM will accept ReplaySSM for the Gated DeltaNet models. Idempotent.
     from .vllm_gdn_replayssm import GDN_REPLAYSSM_ARCHITECTURES, patch_vllm_gdn_replayssm
     if not patch_vllm_gdn_replayssm():
         return False
@@ -4478,8 +4473,7 @@ def load_vllm(
         if replayssm_mode == "auto" and os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip().lower() in ("1", "true"):
             replayssm_mode = "off"
         replayssm_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
-        # GDN is opt-in: vLLM 0.31 runs ReplaySSM on Model Runner V1 only, which for Qwen3.5
-        # costs more than the ring saves on A100 (0.68x at 64 sequences; +2-6% on Blackwell).
+        # Opt-in: vLLM 0.31 runs ReplaySSM on Model Runner V1 only, which costs Qwen3.5 more than the ring saves.
         if replayssm_mode == "auto" and replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES:
             replayssm_mode = "off"
         if replayssm_mode != "off":
