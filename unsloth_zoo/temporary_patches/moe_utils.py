@@ -1439,10 +1439,7 @@ select_moe_backend.cache_clear = _clear_selected_moe_backend
 
 
 def select_moe_backend_for_interleaved_gate_up():
-    """select_moe_backend() for experts whose gate_up is interleaved (GPT-OSS), which the Triton kernels cannot run.
-
-    A request for unsloth_triton takes the next choice, grouped_mm, when supported, instead of the per-expert loop.
-    """
+    """select_moe_backend() for interleaved gate_up (GPT-OSS), which Triton cannot run: grouped_mm, not the loop."""
     # This Unsloth Zoo code section is licensed under AGPL3
     backend = select_moe_backend()
     if backend == "unsloth_triton" and _check_torch_grouped_mm_supported():
