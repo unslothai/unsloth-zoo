@@ -40,6 +40,8 @@ def _fake_package(name, complete = True, lazy_absolute = False):
     subs["tensor"] = tensor
     subs["swiglu"] = types.ModuleType(name + ".swiglu")
     subs["routing"] = types.ModuleType(name + ".routing")
+    for attr in ("routing", "RoutingData", "GatherIndx", "ScatterIndx"):
+        setattr(subs["routing"], attr, object())
     details = types.ModuleType(name + ".tensor_details")
     details.__path__ = []
     subs["tensor_details"] = details
@@ -54,6 +56,8 @@ def _fake_package(name, complete = True, lazy_absolute = False):
 @pytest.fixture
 def fresh(monkeypatch):
     monkeypatch.setattr(tkc, "_MODULE", tkc._UNRESOLVED)
+    monkeypatch.setattr(tkc, "_BACKENDS", {})
+    monkeypatch.delenv("UNSLOTH_TRITON_KERNELS_SOURCE", raising = False)
     monkeypatch.setattr(tkc, "_DEVICE_OK", {})
     for key in [k for k in sys.modules if k == "triton_kernels" or k.startswith("triton_kernels.")]:
         monkeypatch.delitem(sys.modules, key)

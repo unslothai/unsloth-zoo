@@ -954,7 +954,8 @@ def grpo_compute_loss(
     def masked_batch_mean(x):
         with torch.inference_mode():
             completion_length = n_mask_per_reward.mean()
-            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
+            # Sequence level only if x is narrower than mask: one-token completions are (B, 1) too.
+            if x.shape[1] == 1 and mask.shape[1] != 1:
                 return completion_length, x.mean()
             else:
                 # Rows with no tokens (mask_truncated_completions) are left out, as in TRL.
@@ -2305,6 +2306,10 @@ def grpo_accumulated_loss(
         new_logprobs = None
         _pack_result = None
         _pack_use = False
+        _pack_T = None
+        # True only while the packed forward and its scatter run, so an OOM elsewhere (setup, per-row verifier)
+        # is not read as a length limit
+        _pack_in_packed = False
         _pack_enabled = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING", "1").lower() not in ("0", "false", "no", "off")
         _pack_ok = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
         if (_pack_enabled and not _pg_skip_pack and pixel_values is None
@@ -2338,6 +2343,7 @@ def grpo_accumulated_loss(
                     # row's left-pad (matches create_completion_attention_mask exactly)
                     _pack_cstart = (_pack_L - logits_to_keep) - left_pad_tokens_per_prompt  # [rows]
                     _pack_ctgt = (_pack_nz_idx[1:, 1] >= _pack_cstart[_pack_nz_idx[1:, 0]]) & _pack_within
+                    _pack_in_packed = True
                     with autocaster:
                         # use_cache=False: a KV cache silently disables varlen packing
                         _pack_hidden = unwrapped_model(
@@ -2380,6 +2386,7 @@ def grpo_accumulated_loss(
                         _pack_entropies = torch.zeros(
                             total_rows * _pack_L, dtype = torch.float32, device = input_ids.device,
                         ).index_put((_pack_tgt,), _pack_ent.to(torch.float32)).view(total_rows, _pack_L)[:, -_pack_W:]
+                    _pack_in_packed = False
                     # trust decision: re-verify when T or the longest segment grows past what was verified
                     # (a LongRoPE cache switch can change the result)
                     _pack_vT = int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_T", 0))
@@ -2456,9 +2463,17 @@ def grpo_accumulated_loss(
                 _pack_use = False
                 if isinstance(_pack_err, torch.cuda.OutOfMemoryError):
                     torch.cuda.empty_cache()
-                unwrapped_model._unsloth_seq_packing_grad_ok = False
-                if UNSLOTH_ENABLE_LOGGING:
-                    print(f"[Unsloth] GRPO sequence-packing disabled (fell back to padded): {_pack_err!r}", flush = True)
+                if isinstance(_pack_err, torch.cuda.OutOfMemoryError) and _pack_in_packed and _pack_T is not None:
+                    # an OOM in the packed forward means this length does not fit, not that packing is wrong
+                    _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
+                    _pack_unsafe = _pack_T if _pack_unsafe is None else min(_pack_unsafe, _pack_T)
+                    unwrapped_model._unsloth_seq_packing_grad_unsafe_T = _pack_unsafe
+                    if UNSLOTH_ENABLE_LOGGING:
+                        print(f"[Unsloth] GRPO sequence-packing OOM at T={_pack_T}: packing capped below T={_pack_unsafe}, this batch uses the padded loop: {_pack_err!r}", flush = True)
+                else:
+                    unwrapped_model._unsloth_seq_packing_grad_ok = False
+                    if UNSLOTH_ENABLE_LOGGING:
+                        print(f"[Unsloth] GRPO sequence-packing disabled (fell back to padded): {_pack_err!r}", flush = True)
         # ---- PrefixGrouper resolution + first-use self-verify (grad) ----
         # Verify runs under no_grad, then a separate grad forward builds new_logprobs,
         # so no inference tensors are saved for backward.

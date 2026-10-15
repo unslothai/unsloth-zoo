@@ -502,9 +502,11 @@ def test_vlm_requests_accept_stop_strings():
                                   GenerationDefaults(stop_strings=("STOP",)))
 
 
-def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
+def test_vlm_requests_reject_token_ids_with_media_and_unsupported_controls():
     from unsloth_zoo.mlx.generate import _validate_vlm_requests
-    cases = ((GenerationRequest(prompt_token_ids=[1]), GenerationDefaults(), "rendered prompt string"),
+    assert _validate_vlm_requests([GenerationRequest(prompt_token_ids=iter((1, 2)))], GenerationDefaults())[0].prompt_token_ids == (1, 2)  # noqa: E501
+    cases = ((GenerationRequest(prompt_token_ids=[1], image="i.png"), GenerationDefaults(), "token ids with media"),
+        (GenerationRequest(prompt="a", prompt_token_ids=[1]), GenerationDefaults(), "exactly one"),
         (GenerationRequest(prompt=""), GenerationDefaults(), "must not be empty"),
         (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
         # One mlx-vlm would drop rather than apply is refused: an inert start or bogus scheme,
@@ -1385,6 +1387,7 @@ def _vlm_adapter(generator_type = None):
         _VLMBatchAdapter._row_logits_processors, adapter)
     adapter._wired_limit = lambda: _wired_ctx(adapter.wired)
     adapter._decode_image = lambda request: request
+    adapter._prompt_inputs = types.MethodType(_VLMBatchAdapter._prompt_inputs, adapter)
     adapter._add_special_tokens = lambda: True
     adapter._split_prompt_kwargs = lambda kwargs, n: [dict(kwargs)] * n
     adapter._admission_stalled = lambda generator: False
@@ -1558,6 +1561,20 @@ def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     assert session.add(GenerationRequest(prompt = "fg")) == 1
 
 
+def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
+    session = _vlm_session()
+    session.adapter.prepare_inputs = lambda *a, **k: pytest.fail("processed")
+    assert session.add(GenerationRequest(prompt_token_ids = (7, 8, 9))) == 0
+    assert session.generator.inserted[0][0] == [[7, 8, 9]]
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.processor, adapter.batches_observable = types.SimpleNamespace(tokenizer = _CharTokenizer()), True
+    rows = [GenerationRequest(prompt_token_ids = (1, 2)), GenerationRequest(prompt_token_ids = (3, 4))]
+    assert adapter._group_key(rows[0]) != adapter._group_key(GenerationRequest(prompt = "ab"))
+    inputs = _VLMBatchAdapter._prompt_inputs(adapter, rows)
+    assert [inputs[k].tolist() for k in ("input_ids", "attention_mask")] == [[[1, 2], [3, 4]], [[1, 1]] * 2]
+
+
 def test_a_processor_is_shown_its_own_row_s_history_from_its_own_offset():
     """Rows rarely share a prompt length, so each latches its own offset."""
     from unsloth_zoo.mlx.generate import _row_processors
@@ -1660,7 +1677,7 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     # than raising TypeError out of the generation path.
     from unsloth_zoo.mlx.inference import (exact_speculative_verify, fused_decode_conv_silu, fused_moe_gate_up,
                                            fused_moe_routed_experts, fused_moe_router, fused_packed_gated_delta,
-                                           fused_residual_norm, fused_residual_norm_handoff)
+                                           fused_residual_norm, fused_residual_norm_handoff, fused_verify_attention)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1670,7 +1687,7 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
         )
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
                 fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model), \
-                exact_speculative_verify(model), fused_packed_gated_delta(model):
+                exact_speculative_verify(model), fused_packed_gated_delta(model), fused_verify_attention(model):
             pass
 
 
@@ -1693,7 +1710,7 @@ def test_generation_paths_enter_every_inference_fusion(monkeypatch):
              for node in ast.walk(ast.parse(inspect.getsource(loader))) if isinstance(node, ast.With)]
     sites = [site for site in sites if any(name.startswith(prefixes) for name in site)]
     # The loader's generate sites run no speculative verify rounds.
-    assert len(sites) == 2 and all(site == scopes - {"exact_speculative_verify"} for site in sites)
+    assert len(sites) == 2 and all(site == scopes - {"exact_speculative_verify", "fused_verify_attention"} for site in sites)
 
 
 def test_cache_layout_tells_quantized_packings_apart():
@@ -1726,3 +1743,58 @@ def test_row_quantizer_starts_uniform_rows_at_the_first_token():
     assert uniform.keywords == {"kv_group_size": 64, "quantized_kv_start": 0, "kv_bits": 4}
     turbo = _row_quantizer(module, {"kv_bits": 3.5, "kv_quant_scheme": "turboquant"})
     assert turbo.keywords["quantized_kv_start"] == 5000
+
+
+_SINGLE_ROW_MODEL = '''
+def _is_single_row_batch_cache(entry):
+    return entry.rows == 1
+
+
+def _extract_row_cache(entry, row):
+    return entry
+
+
+class Model(dict):
+    fa_idx = 0
+
+    def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, position_ids=None,
+                 capture_layer_ids=None, hidden_sink=None):
+        taken = hidden_sink is None and _is_single_row_batch_cache(cache[self.fa_idx])
+        if taken:
+            cache[self.fa_idx] = _extract_row_cache(cache[self.fa_idx], 0)
+        self.seen.append(taken)
+        return taken
+'''
+
+
+def test_single_row_decode_skips_the_shortcut_only_for_an_unpadded_decode_step():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.generate import single_row_batch_decode
+
+    namespace = {}
+    exec(_SINGLE_ROW_MODEL, namespace)
+    Model, native = namespace["Model"], namespace["_is_single_row_batch_cache"]
+    inner = Model()
+    inner.seen = []
+    model = types.SimpleNamespace(named_modules = lambda: [("stub", types.SimpleNamespace()), ("model", inner)])
+    row = lambda pad, rows = 1: types.SimpleNamespace(rows = rows, left_padding = mx.array([pad] * rows))
+    step, prefill = mx.zeros((1, 1)), mx.zeros((1, 4))
+    with single_row_batch_decode(model):
+        with single_row_batch_decode(model):
+            patched = type(inner)
+        assert type(inner) is patched and patched is not Model
+        # A call filling a hidden sink never takes the shortcut, so it is never run twice to compare.
+        inner(step, cache = [row(0)], hidden_sink = [])
+        # The first-use comparison runs on Metal; here the class is taken as already verified.
+        patched._unsloth_single_row_verdict = True
+        for cache, inputs in ((row(0), step), (row(2), step), (row(0), prefill), (row(0, rows = 2), mx.zeros((2, 1)))):
+            inner(inputs, cache = [cache])
+        assert inner.seen == [False, False, True, True, False]
+        patched._unsloth_single_row_verdict = False
+        inner(step, cache = [row(0)])
+        assert inner.seen[-1] is True
+    assert type(inner) is Model and "_unsloth_single_row_scopes" not in vars(inner)
+    # The stand-in predicate answers as mlx-vlm's own outside a skipped call.
+    assert namespace["_is_single_row_batch_cache"]._unsloth_native is native
+    assert namespace["_is_single_row_batch_cache"](row(0)) is True

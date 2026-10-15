@@ -58,6 +58,8 @@ def declared_floor():
 
 def in_scope(path):
     """Files that must work on the floor, with the two exclusions applied."""
+    if PACKAGE_ROOT not in path.parents:
+        return True
     rel = path.relative_to(PACKAGE_ROOT)
     if rel.parts[0] == "_vendored":
         return False
@@ -67,7 +69,8 @@ def in_scope(path):
 
 
 def scoped_files():
-    files = sorted(p for p in PACKAGE_ROOT.rglob("*.py")
+    files = sorted(p for root in (PACKAGE_ROOT, REPO_ROOT / "unsloth_zoo_downloads")
+                   for p in root.rglob("*.py")
                    if "__pycache__" not in p.parts and in_scope(p))
     assert len(files) > 50, f"only found {len(files)} files, the glob is wrong"
     return files
