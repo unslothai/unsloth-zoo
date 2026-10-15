@@ -345,7 +345,7 @@
       "file": "unsloth_zoo/temporary_patches/gpt_oss.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "2f91b677a1b74416",
+      "digest": "8a43c55c018acccf",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -353,15 +353,7 @@
       "file": "unsloth_zoo/temporary_patches/gpt_oss.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "8e22e34e9699eeda",
-      "count": 1,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/temporary_patches/gpt_oss.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "93f179a26cb6dc1f",
+      "digest": "ca551df69c498e93",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -441,38 +433,6 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "06e20c9053bfc084",
-      "count": 1,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/triton_kernels_compat.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "0d1075b5ac184ad0",
-      "count": 1,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/triton_kernels_compat.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "1dd442e1dba33e11",
-      "count": 2,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/triton_kernels_compat.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "212ce6ec4b2f9035",
-      "count": 1,
-      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
-    },
-    {
-      "file": "unsloth_zoo/triton_kernels_compat.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
       "digest": "4439cea57cfbfdbc",
       "count": 1,
       "reason": "Submodules found by walking the installed triton_kernels package (pkgutil)."
@@ -481,7 +441,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "44661647c0554b57",
+      "digest": "54785ddf74763b5c",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -489,7 +449,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "99148a97541087f5",
+      "digest": "8200e131cd5f0e66",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -497,7 +457,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "b456c7ad818ecd08",
+      "digest": "8a43c55c018acccf",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -505,7 +465,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "bb260743bb896b2c",
+      "digest": "9b82fef86295098f",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
@@ -513,7 +473,7 @@
       "file": "unsloth_zoo/triton_kernels_compat.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "c4171f1b5f078ec9",
+      "digest": "9de88d301ba8baa7",
       "count": 1,
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
