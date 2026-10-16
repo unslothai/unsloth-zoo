@@ -1502,7 +1502,7 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
     from contextlib import contextmanager
     import mlx_lm
     import mlx_vlm
-    from unsloth_zoo.mlx import loader
+    from unsloth_zoo.mlx import inference, loader
 
     root = nn.Sequential(nn.Linear(4, 4))
     root._tokenizer = types.SimpleNamespace(eos_token_ids = {2})
@@ -1510,7 +1510,7 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
     entered = []
 
     @contextmanager
-    def scope(model, *args):
+    def scope(model, *args, _modules):
         entered.append((model, *args))
         yield model
 
@@ -1519,7 +1519,8 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
         assert "int8_prefill" not in kwargs
         yield types.SimpleNamespace(token = 7)
 
-    monkeypatch.setattr(loader, scope_name, scope)
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [
+        entry._replace(enter = scope) if entry.name == scope_name else entry for entry in inference.INFERENCE_SCOPES])
     monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
     generated = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1, int8_prefill = vlm)
     assert generated.tolist() == [[1, 2, 7]]
