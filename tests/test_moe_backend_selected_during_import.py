@@ -26,6 +26,9 @@ def test_backend_chosen_during_unsloth_import_is_chosen_again(monkeypatch):
     fake = types.ModuleType("unsloth")
     fake.__spec__ = spec
     monkeypatch.setitem(sys.modules, "unsloth", fake)
+    # An earlier test on this worker may have imported the kernels; mid-import they are not there yet.
+    for name in [name for name in sys.modules if name.startswith("unsloth.")]:
+        monkeypatch.delitem(sys.modules, name)
     monkeypatch.setenv("UNSLOTH_MOE_BACKEND", "unsloth_triton")
     monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None)
     monkeypatch.setattr(M, "_check_torch_grouped_mm_supported", lambda: False)

@@ -221,8 +221,15 @@ def test_gemma4_unified_bnb_patch_dense_is_dequantized(monkeypatch, tmp_path):
     assert got.dtype == torch.float32 and torch.equal(got, expected)
     assert not got.is_inference()  # trainable (vision LoRA / full vision fine-tuning)
     # NF4 rounds to within half its widest level gap (-1.0 to -0.696, so 0.152 x the block absmax).
+    # Checked through a flat dequantize: bitsandbytes' CPU dequantize_4bit reads the wrong block's
+    # absmax for 2-D shapes whose rows are not a multiple of the block size (this one is 24 x 12).
     original = reference.model.embed_vision.patch_dense.weight
-    torch.testing.assert_close(got, original, atol = 0.16 * original.abs().max().item(), rtol = 0)
+    flat_state = copy.copy(quant_state)
+    flat_state.shape = torch.Size([1, original.numel()])
+    unpacked = bnb_functional.dequantize_4bit(packed, flat_state).view_as(original)
+    torch.testing.assert_close(unpacked, original, atol = 0.16 * original.abs().max().item(), rtol = 0)
+    if torch.equal(expected, unpacked):
+        torch.testing.assert_close(got, original, atol = 0.16 * original.abs().max().item(), rtol = 0)
 
 
 # ---------------------------------------------------------------- muse_glimmer
