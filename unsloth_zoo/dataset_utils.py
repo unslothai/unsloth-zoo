@@ -2886,6 +2886,18 @@ def sft_prepare_dataset(
                     _tokenize_pc, batched=False,
                     remove_columns=list(column_names), **map_kwargs,
                 )
+            if assistant_only_loss:
+                # Truncation can cut every assistant completion token; prompt-history assistant turns
+                # don't count while completion_mask applies.
+                pc_completion_only = getattr(self, "completion_only_loss", None)
+                if pc_completion_only is None:
+                    pc_completion_only = getattr(args, "completion_only_loss", None)
+                if pc_completion_only is None or pc_completion_only:
+                    dataset = dataset.filter(
+                        lambda row: any(a and c for a, c in zip(row["assistant_masks"], row["completion_mask"]))
+                    )
+                else:
+                    dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
         elif do_messages:
             truncate_messages = do_truncation and isinstance(max_seq_length, int) and max_seq_length > 0 and \
                 not locals().get("_unsloth_wrapped_packing", False)
