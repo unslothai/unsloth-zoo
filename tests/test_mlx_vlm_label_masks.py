@@ -1382,7 +1382,8 @@ def _mlx_lm_architecture(monkeypatch):
                 raise NotImplementedError("Engram layers are not supported.")
 
     class Model(_PlainModel):
-        pass
+        def embed_inputs(self, inputs, *, pixel_values=None):
+            raise AssertionError("routing never builds the model")
 
     Model.__module__ = ModelArgs.__module__ = module.__name__
     module.Model, module.ModelArgs = Model, ModelArgs
@@ -1405,6 +1406,32 @@ def test_mlx_lm_keeps_a_wrapper_only_while_its_model_args_take_the_config(monkey
     assert route(_VLM_CONFIG, _VLMOnlyClass) is True
     assert route(refused, None) is False
     assert _VLM_CONFIG["vision_config"] == takes["vision_config"] == {"hidden_size": 8}
+
+
+def test_mlx_lm_serves_images_by_its_own_processor_rule(monkeypatch):
+    """Muse Spark: mlx_lm.processors registers a processor per model module, keyed by
+    `processor_type` when the config names one, and only for a populated vision_config."""
+    import sys
+    import types
+    from unsloth_zoo.mlx import loader
+
+    model = _mlx_lm_architecture(monkeypatch)
+    monkeypatch.setattr(loader, "_get_mlx_lm_model_class", lambda _t: model)
+    processors = types.ModuleType("mlx_lm.processors")
+    processors.PROCESSORS = {model.__module__: object, "named": object}
+    monkeypatch.setitem(sys.modules, "mlx_lm.processors", processors)
+    config = {**_VLM_CONFIG, "rope_theta": 1e4}
+
+    def serves(**changes):
+        return loader._mlx_lm_serves_images({**config, **changes}, "fake_vlm")
+
+    assert serves() is True
+    assert serves(vision_config={}) is False
+    assert serves(processor_type="unregistered") is False
+    assert serves(processor_type="named") is True
+    assert serves(engram_layer_ids=[1]) is False
+    monkeypatch.setattr(model, "embed_inputs", None)
+    assert serves() is False
 
 
 def test_text_only_config_is_never_routed_to_the_vlm_loader(monkeypatch):
@@ -7066,13 +7093,18 @@ def test_image_capability_includes_nested_encoders_and_pixel_projections(path):
     assert _model_supports_images(root) is True
 
 
-def test_text_training_checks_model_capability_with_a_replacement_tokenizer(tmp_path):
+@pytest.mark.parametrize("supports_images, message", [
+    (False, "`text_wrapper` has no vision path"),
+    # An mlx_lm image model (not built by mlx-vlm) takes images in generation only.
+    (True, "`text_wrapper` takes images in generation only"),
+])
+def test_text_training_checks_model_capability_with_a_replacement_tokenizer(tmp_path, supports_images, message):
     from tokenizers import Tokenizer, models
     from transformers import PreTrainedTokenizerFast
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     model = nn.Linear(2, 2)
-    model._unsloth_supports_images = False
+    model._unsloth_supports_images = supports_images
     model._config = {"model_type": "text_wrapper"}
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(models.WordLevel({"a": 0})))
     trainer = MLXTrainer(
@@ -7080,7 +7112,7 @@ def test_text_training_checks_model_capability_with_a_replacement_tokenizer(tmp_
         train_dataset=[{"input_ids": [0, 0], "image": Image.new("RGB", (2, 2))}],
         args=MLXTrainingConfig(max_steps=1, output_dir=str(tmp_path), report_to="none"),
     )
-    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+    with pytest.raises(ValueError, match=message):
         trainer._prepare_data(False)
 
 

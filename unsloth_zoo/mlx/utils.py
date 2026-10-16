@@ -9056,7 +9056,8 @@ def _validate_mlx_image_input(target, has_images):
     if has_images and getattr(target, "_unsloth_supports_images", None) is False:
         name = getattr(target, "_unsloth_modality_model_type", type(target).__name__)
         raise ValueError(
-            f"Unsloth MLX: `{name}` has no vision path; image and video inputs are not supported."
+            getattr(target, "_unsloth_image_input_error", None)
+            or f"Unsloth MLX: `{name}` has no vision path; image and video inputs are not supported."
         )
 
 

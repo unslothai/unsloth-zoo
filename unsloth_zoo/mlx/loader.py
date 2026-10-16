@@ -3473,6 +3473,22 @@ def _mlx_lm_accepts_config(cls, config: dict) -> bool:
     return True
 
 
+def _mlx_lm_serves_images(config: dict, model_type: str) -> bool:
+    """Whether mlx_lm builds this checkpoint's vision tower and feeds it: mlx_lm.processors'
+    own rule (a populated vision_config, a registered processor) plus `embed_inputs`."""
+    if not config.get("vision_config"):
+        return False
+    cls = _get_mlx_lm_model_class(model_type)
+    if cls is None or not callable(getattr(cls, "embed_inputs", None)):
+        return False
+    try:
+        from mlx_lm.processors import PROCESSORS
+    except ImportError:
+        return False
+    module = cls.__module__.rsplit(".", 1)[-1]
+    return config.get("processor_type", module) in PROCESSORS and _mlx_lm_accepts_config(cls, config)
+
+
 def _mlx_vlm_only_text_model(config: dict, model_type: str) -> bool:
     if _is_vlm(config) or not model_type:
         return False
@@ -7721,6 +7737,17 @@ def _mlx_generate(self, *args, **kwargs):
         except TypeError:
             prompt_ids = tokenizer.encode(prompt_ids)
 
+    pixel_values = kwargs.pop("pixel_values", None)
+    if pixel_values is None and isinstance(prompt, dict):
+        pixel_values = prompt.get("pixel_values")
+    if pixel_values is not None and getattr(self, "_unsloth_supports_images", False):
+        import mlx.core as mx
+        if isinstance(pixel_values, (list, tuple)):
+            pixel_values = [mx.array(image) for image in pixel_values]
+        kwargs["input_embeddings"] = self.embed_inputs(mx.array(prompt_ids), pixel_values=pixel_values)
+        # As mlx_lm's generate: the prefill runs on another stream, so compute the vision rows first.
+        mx.eval(kwargs["input_embeddings"])
+
     int8_prefill = kwargs.pop("int8_prefill", None)
     streamer = kwargs.pop("streamer", None)
     max_tokens = kwargs.pop("max_tokens", None)
@@ -7817,6 +7844,41 @@ def _mlx_chat_template_batch_encoding(output):
     return BatchEncoding({"input_ids": output})
 
 
+def _is_mlx_image_input(value):
+    import numpy as np
+    from PIL import Image
+
+    if isinstance(value, (list, tuple)):
+        return bool(value) and all(_is_mlx_image_input(item) for item in value)
+    return isinstance(value, Image.Image) or isinstance(value, np.ndarray) and value.ndim == 3
+
+
+def _mlx_lm_image_inputs(tokenizer, processor, images, text=None, *, return_tensors=None,
+                         add_special_tokens=None, **kwargs):
+    """HF processor-style `input_ids`, `attention_mask` and `pixel_values` (a list of
+    per-image arrays) for one prompt of an mlx_lm image model."""
+    import numpy as np
+    from PIL import Image
+    from transformers import BatchEncoding
+
+    if isinstance(text, (list, tuple)) and len(text) == 1:
+        text = text[0]
+    if not isinstance(text, str):
+        raise ValueError("Unsloth MLX: image inputs of an mlx_lm model take one prompt string.")
+    images = [
+        np.asarray(image.convert("RGB") if isinstance(image, Image.Image) else image, dtype=np.uint8)
+        for image in (images if isinstance(images, (list, tuple)) else [images])
+    ]
+    text, pixel_values = processor(text, images=images)
+    if add_special_tokens is None:
+        bos = getattr(tokenizer, "bos_token", None)
+        add_special_tokens = bos is None or not text.startswith(bos)
+    ids = tokenizer.encode(text, add_special_tokens=add_special_tokens)
+    encoding = BatchEncoding({"input_ids": [ids], "attention_mask": [[1] * len(ids)]}, tensor_type=return_tensors)
+    encoding["pixel_values"] = pixel_values
+    return encoding
+
+
 def _patch_mlx_tokenizer_call(tokenizer):
     """Patch mlx-lm TokenizerWrapper to match HF notebook tokenizer APIs."""
     if tokenizer is None:
@@ -7827,6 +7889,13 @@ def _patch_mlx_tokenizer_call(tokenizer):
     if "__call__" not in cls.__dict__:
         if hasattr(tokenizer, "_tokenizer") and callable(tokenizer._tokenizer):
             def tokenizer_wrapper_call(self, *args, **kwargs):
+                image_processor = self.__dict__.get("_unsloth_image_processor")
+                if image_processor is not None:
+                    images = kwargs.pop("images", None)
+                    if images is None and args and _is_mlx_image_input(args[0]):
+                        images, args = args[0], args[1:]
+                    if images is not None:
+                        return _mlx_lm_image_inputs(self, image_processor, images, *args, **kwargs)
                 return self._tokenizer(*args, **kwargs)
 
             tokenizer_wrapper_call._unsloth_mlx_call = True
@@ -9830,9 +9899,16 @@ class FastMLXModel:
             or text_only is not False and _mlx_vlm_only_text_model(config_data, model_type)
         )
 
+        mlx_lm_vision = _mlx_lm_serves_images(config_data, model_type)
+        # Images go to mlx-vlm first; mlx_lm serves only the types mlx-vlm lacks.
+        mlx_lm_images = (
+            text_only is not True and mlx_lm_vision
+            and _resolve_mlx_vlm_model_class(model_type) is None
+        )
+
         if force_vlm_text_path:
             is_vlm = True
-        elif text_only is True:
+        elif text_only is True or mlx_lm_images:
             is_vlm = False
         elif text_only is False:
             is_vlm = True
@@ -10157,6 +10233,8 @@ class FastMLXModel:
                 return_config=True,
                 revision=revision,
             )
+            if mlx_lm_vision and not mlx_lm_images:
+                mlx_load_kwargs["model_config"] = {"vision_config": None}
             if target_dtype is not None or want_runtime_quant:
                 mlx_load_kwargs["lazy"] = True
             if _mlx_distributed_requested(pipeline_group, tensor_group):
@@ -10210,6 +10288,12 @@ class FastMLXModel:
                 strict=False,
             )
             model._is_vlm_model = False
+            if mlx_lm_images:
+                from mlx_lm.processors import load_processor
+                # The tokenizer's HF-style call takes images through it; see _patch_mlx_tokenizer_call.
+                tokenizer._unsloth_image_processor = load_processor(model, config)
+                model._unsloth_supports_images = True
+                model._unsloth_modality_model_type = model_type
 
             model._config = config
             model._hf_repo = model_name

@@ -9437,7 +9437,15 @@ class MLXTrainer:
                 strict=False,
             )
             if self.tokenizer is not None:
-                self.tokenizer._unsloth_supports_images = getattr(self.model, "_unsloth_supports_images", None)
+                supports_images = getattr(self.model, "_unsloth_supports_images", None)
+                if supports_images and not getattr(self.model, "_is_vlm_model", False):
+                    # An mlx_lm image model: this text path would drop the images.
+                    supports_images = False
+                    self.tokenizer._unsloth_image_input_error = (
+                        f"Unsloth MLX: `{model_type}` takes images in generation only; "
+                        "mlx_lm has no image training path."
+                    )
+                self.tokenizer._unsloth_supports_images = supports_images
                 self.tokenizer._unsloth_modality_model_type = model_type
 
         if self.preference_kind:
