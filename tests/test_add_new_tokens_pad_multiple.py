@@ -217,3 +217,67 @@ def test_vllm_generate_biases_padded_rows(monkeypatch):
     assert seen[1].logit_bias == want
     assert [p.logit_bias for p in seen[2]] == [want, want]
     assert len(seen) == 3
+
+
+def _vllm_wrapper_ns():
+    import ast
+    import copy
+    import functools
+    import pathlib
+
+    import unsloth_zoo
+    path = pathlib.Path(unsloth_zoo.__file__).parent / "vllm_utils.py"
+    nodes = [n for n in ast.parse(path.read_text(encoding = "utf-8-sig")).body
+             if isinstance(n, ast.FunctionDef) and n.name == "suppress_vllm_padded_vocab"]
+    ns = {"copy": copy, "functools": functools}
+    exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_helpers", "exec"), ns)
+    return ns["suppress_vllm_padded_vocab"]
+
+
+class _Params:
+    def __init__(self, logit_bias = None):
+        self.logit_bias = logit_bias
+
+
+def test_vllm_padded_vocab_not_biased_under_speculative_decoding(capsys):
+    # vLLM 0.29 SamplingParams._validate_spec_decode raises on any logit_bias with speculation.
+    seen = []
+
+    class LLM:
+        def generate(self, prompts, sampling_params = None):
+            seen.append(sampling_params)
+
+    llm = LLM()
+    original = llm.generate
+    _vllm_wrapper_ns()(llm, [10, 11], speculative = True)
+    assert llm.generate == original
+    llm.generate(["a"], _Params())
+    assert seen[0].logit_bias is None
+    assert "speculative decoding" in capsys.readouterr().out
+
+
+def test_vllm_padded_vocab_biases_llm_engine_add_request():
+    # load_vllm(use_engine = True) returns an LLMEngine: requests go through add_request.
+    seen = []
+
+    class LLMEngine:
+        def add_request(self, request_id, prompt, params, arrival_time = None):
+            seen.append(params)
+            return request_id
+
+    class PoolingParams:
+        pass
+
+    engine = LLMEngine()
+    wrap = _vllm_wrapper_ns()
+    wrap(engine, [10, 11])
+    wrap(engine, [10, 11])
+    mine = _Params({3: 1.0})
+    assert engine.add_request("r0", "p", mine) == "r0"
+    engine.add_request("r1", "p", params = _Params())
+    pooling = PoolingParams()
+    engine.add_request("r2", "p", pooling)
+    want = {10: -100.0, 11: -100.0}
+    assert seen[0].logit_bias == {3: 1.0, **want} and mine.logit_bias == {3: 1.0}
+    assert seen[1].logit_bias == want
+    assert seen[2] is pooling

@@ -3560,12 +3560,18 @@ def _padded_vocab_ids(config):
 pass
 
 
-def suppress_vllm_padded_vocab(llm, padded_ids):
+def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
     """vLLM samples every row of config.vocab_size and ignores generation_config.suppress_tokens,
     so alignment rows from add_new_tokens(pad_to_multiple_of = ...) could be emitted as ids no
-    tokenizer token has. Bias them to -100 in every llm.generate call. Idempotent."""
-    generate = getattr(llm, "generate", None)
-    if generate is None or getattr(generate, "_unsloth_padded_vocab", False):
+    tokenizer token has. Bias them to -100 on every request: llm.generate (LLM, AsyncLLM) and
+    add_request (LLMEngine, AsyncLLM). Idempotent."""
+    if speculative:
+        # SamplingParams._validate_spec_decode rejects any logit_bias under speculative decoding
+        # (vLLM 0.29; older V1 drops it with a warning), so biasing would fail every request.
+        print(
+            "Unsloth: vLLM does not support logit_bias with speculative decoding, so this padded "
+            "vocabulary's alignment rows stay sampleable."
+        )
         return llm
     bias = {int(i): -100.0 for i in padded_ids}
 
@@ -3577,20 +3583,39 @@ def suppress_vllm_padded_vocab(llm, padded_ids):
                 params = SamplingParams()
             else:
                 params = get_default()
+        if not hasattr(params, "logit_bias"):
+            # PoolingParams: nothing is sampled.
+            return params
         params = copy.copy(params)
         params.logit_bias = {**(getattr(params, "logit_bias", None) or {}), **bias}
         return params
 
-    @functools.wraps(generate)
-    def generate_without_padded_vocab(prompts, sampling_params = None, *args, **kwargs):
-        if isinstance(sampling_params, (list, tuple)):
-            sampling_params = [_with_bias(params) for params in sampling_params]
-        else:
-            sampling_params = _with_bias(sampling_params)
-        return generate(prompts, sampling_params, *args, **kwargs)
+    generate = getattr(llm, "generate", None)
+    if generate is not None and not getattr(generate, "_unsloth_padded_vocab", False):
+        @functools.wraps(generate)
+        def generate_without_padded_vocab(prompts, sampling_params = None, *args, **kwargs):
+            if isinstance(sampling_params, (list, tuple)):
+                sampling_params = [_with_bias(params) for params in sampling_params]
+            else:
+                sampling_params = _with_bias(sampling_params)
+            return generate(prompts, sampling_params, *args, **kwargs)
 
-    generate_without_padded_vocab._unsloth_padded_vocab = True
-    llm.generate = generate_without_padded_vocab
+        generate_without_padded_vocab._unsloth_padded_vocab = True
+        llm.generate = generate_without_padded_vocab
+
+    add_request = getattr(llm, "add_request", None)
+    if add_request is not None and not getattr(add_request, "_unsloth_padded_vocab", False):
+        @functools.wraps(add_request)
+        def add_request_without_padded_vocab(*args, **kwargs):
+            # add_request(request_id, prompt, params, ...)
+            if "params" in kwargs:
+                kwargs["params"] = _with_bias(kwargs["params"])
+            elif len(args) > 2:
+                args = args[:2] + (_with_bias(args[2]),) + args[3:]
+            return add_request(*args, **kwargs)
+
+        add_request_without_padded_vocab._unsloth_padded_vocab = True
+        llm.add_request = add_request_without_padded_vocab
     return llm
 pass
 
@@ -4778,12 +4803,9 @@ def load_vllm(
             wrap_vllm_generate(llm)
         padded_ids = _padded_vocab_ids(config)
         if padded_ids:
-            if engine_args.get("speculative_config", None) is not None:
-                print(
-                    "Unsloth: vLLM ignores logit_bias under speculative decoding, so this padded "
-                    "vocabulary's alignment rows stay sampleable."
-                )
-            suppress_vllm_padded_vocab(llm, padded_ids)
+            suppress_vllm_padded_vocab(
+                llm, padded_ids, speculative = engine_args.get("speculative_config", None) is not None,
+            )
         if _merged_rollout_enabled():
             llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)
