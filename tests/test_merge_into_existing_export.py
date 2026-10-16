@@ -125,11 +125,16 @@ def _fake_hub(monkeypatch, base, fail):
             if os.path.exists(os.path.join(base, f)):
                 shutil.copyfile(os.path.join(base, f), os.path.join(local_dir, f))
 
+    revisions = []
+    _fake_hub.revisions = revisions
+
     def _snapshot(repo_id, local_dir = None, allow_patterns = (), **k):
+        revisions.append(k.get("revision"))
         _fetch(local_dir, list(allow_patterns))
         return local_dir
 
     def _hf_hub(repo_id, filename, local_dir = None, **k):
+        revisions.append(k.get("revision"))
         if local_dir is None:
             raise OSError("not cached")
         _fetch(local_dir, [filename])
@@ -316,3 +321,63 @@ def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch):
         now = open(os.path.join(out, f), "rb").read()
         assert now == (open(os.path.join(base, f), "rb").read() if f in copied else before[f]), f
     assert _no_staging_left(out)
+
+
+class _ModelInfo:
+    sha = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.mark.parametrize("low_disk", [False, True])
+def test_hub_fetches_pin_one_commit(tmp_path, monkeypatch, low_disk):
+    # Per-shard downloads must not mix commits if the repo is pushed to mid-export.
+    import huggingface_hub
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    monkeypatch.setattr(huggingface_hub.HfApi, "model_info", lambda self, repo_id, **k: _ModelInfo())
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    assert _fake_hub.revisions and set(_fake_hub.revisions) == {_ModelInfo.sha}
+
+
+def test_hub_fetches_unpinned_when_commit_unknown(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    def _offline(self, repo_id, **k):
+        raise OSError("offline")
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    monkeypatch.setattr(huggingface_hub.HfApi, "model_info", _offline)
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = True)
+    assert _fake_hub.revisions and set(_fake_hub.revisions) == {None}
+
+
+def test_partial_cache_copy_is_reported_when_a_later_fetch_fails(tmp_path, monkeypatch, capsys):
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = True)
+    first = _shards(out)[0]
+
+    def _partial_cache_copy(repo_id, filenames_to_check, target_dir_str, hf_cache_dir, token, **k):
+        # One shard copies from the cache, then the copy gives up.
+        if first not in filenames_to_check:
+            return False
+        S._copy_file_from_source(os.path.join(base, first), target_dir_str, first)
+        if k.get("copied") is not None:
+            k["copied"].append(first)
+        return False
+    _fake_hub(monkeypatch, base, fail = True)
+    monkeypatch.setattr(S, "_get_hf_cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(S, "_try_copy_all_from_cache", _partial_cache_copy)
+    capsys.readouterr()
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = True)
+    printed = capsys.readouterr().out
+    assert "is incomplete" in printed and first in printed
+    assert open(os.path.join(out, first), "rb").read() == open(os.path.join(base, first), "rb").read()

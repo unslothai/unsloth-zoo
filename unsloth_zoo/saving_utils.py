@@ -4102,7 +4102,18 @@ def _previous_export_shards(filenames, save_directory, source_directory = None):
 pass
 
 
-def _download_shard_over_previous_export(repo_id, filename, save_directory, cache_dir, token):
+def _resolve_hub_commit(repo_id, token):
+    # One commit for every file an export fetches, so a push to the repo mid-export cannot mix
+    # shards from two commits. Offline or unreachable gives None: unpinned, as before.
+    try:
+        from huggingface_hub import HfApi
+        return HfApi(token = token).model_info(repo_id).sha
+    except Exception:
+        return None
+pass
+
+
+def _download_shard_over_previous_export(repo_id, filename, save_directory, cache_dir, token, revision = None):
     # Downloaded into a private folder beside the output, then renamed over the previous shard,
     # so a failed download leaves that shard as it was and no second copy is ever kept.
     file_path = os.path.join(save_directory, filename)
@@ -4115,6 +4126,7 @@ def _download_shard_over_previous_export(repo_id, filename, save_directory, cach
             local_dir = staging_dir,
             cache_dir = cache_dir,
             token = token,
+            revision = revision,
         )
         os.replace(os.path.join(staging_dir, filename), file_path)
     finally:
@@ -4812,6 +4824,7 @@ def merge_and_overwrite_lora(
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
     safetensors_list = []
+    _hub_revision = None
     max_size_in_bytes = 0
     total_size_in_bytes = 0
     config = model.config
@@ -4987,6 +5000,7 @@ def merge_and_overwrite_lora(
                 safetensors_list.append(fname)
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
+            _hub_revision = _resolve_hub_commit(model_name, token)
 
             # Drop stale/duplicate shard sets the index doesn't reference. Some repos (e.g.
             # granite-3.2-8b-instruct) ship a leftover second shard set next to the real one while
@@ -4998,6 +5012,7 @@ def merge_and_overwrite_lora(
                     repo_id  = model_name,
                     filename = "model.safetensors.index.json",
                     token    = token,
+                    revision = _hub_revision,
                 )
                 with open(_idx_path, "r", encoding = "utf-8") as f:
                     _weight_map = json.load(f).get("weight_map", {})
@@ -5308,6 +5323,7 @@ def merge_and_overwrite_lora(
                     local_dir_use_symlinks = False,
                     cache_dir = _hf_cache_dir,
                     token = token,
+                    revision = _hub_revision,
                 )
 
         if push_to_hub and safe_tensor_index_files:
@@ -5327,19 +5343,27 @@ def merge_and_overwrite_lora(
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
         if not is_local_path and _hf_cache_dir is not None:
-            copied_all_from_cache = _try_copy_all_from_cache(
-                repo_id = model_name,
-                filenames_to_check = safetensors_list,
-                target_dir_str = save_directory,
-                hf_cache_dir = _hf_cache_dir,
-                token = token,
-            )
+            # A copy that fails part way has still replaced the shards before it.
+            _copied_from_cache = []
+            try:
+                copied_all_from_cache = _try_copy_all_from_cache(
+                    repo_id = model_name,
+                    filenames_to_check = safetensors_list,
+                    target_dir_str = save_directory,
+                    hf_cache_dir = _hf_cache_dir,
+                    token = token,
+                    revision = _hub_revision,
+                    copied = _copied_from_cache,
+                )
+            finally:
+                _replaced_shards.extend(f for f in _copied_from_cache if f in _stale_shards)
             copied_tokenizer_model_from_cache = _try_copy_all_from_cache(
                 repo_id=model_name,
                 filenames_to_check=["tokenizer.model"],
                 target_dir_str=save_directory,
                 hf_cache_dir=_hf_cache_dir,
                 token=token,
+                revision = _hub_revision,
             )
 
         if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
@@ -5352,6 +5376,7 @@ def merge_and_overwrite_lora(
                 local_dir_use_symlinks = False,
                 cache_dir = _hf_cache_dir,
                 token = token,
+                revision = _hub_revision,
             )
 
         if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
@@ -5363,6 +5388,7 @@ def merge_and_overwrite_lora(
                 local_dir_use_symlinks = False,
                 cache_dir = _hf_cache_dir,
                 token = token,
+                revision = _hub_revision,
             )
 
         final_safetensors_list = []
@@ -5394,7 +5420,9 @@ def merge_and_overwrite_lora(
                 if filename in _stale_shards: _replaced_shards.append(filename)
 
             elif not copied_all_from_cache and not is_local_path and filename in _stale_shards:
-                _download_shard_over_previous_export(model_name, filename, save_directory, _hf_cache_dir, token)
+                _download_shard_over_previous_export(
+                    model_name, filename, save_directory, _hf_cache_dir, token, revision = _hub_revision,
+                )
                 _replaced_shards.append(filename)
 
             elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
@@ -5405,6 +5433,7 @@ def merge_and_overwrite_lora(
                     local_dir = save_directory,
                     cache_dir = _hf_cache_dir,
                     token = token,
+                    revision = _hub_revision,
                 )
             pass
 
@@ -5420,7 +5449,7 @@ def merge_and_overwrite_lora(
         if _replaced_shards:
             print(
                 f"Unsloth: Warning: the export in {save_directory} is incomplete. These shards "
-                f"already hold the base weights: {', '.join(_replaced_shards)}. Re-run the export."
+                f"already hold the base weights: {', '.join(dict.fromkeys(_replaced_shards))}. Re-run the export."
             )
         raise
 
@@ -5435,6 +5464,7 @@ def merge_and_overwrite_lora(
                     local_dir = save_directory,
                     cache_dir = _hf_cache_dir,
                     token = token,
+                    revision = _hub_revision,
                 )
                 print("Downloaded tokenizer.model")
             except Exception as e:
@@ -5765,9 +5795,11 @@ def _try_copy_all_from_cache(
     target_dir_str: str, # Expect string path for target directory
     hf_cache_dir: Optional[Path],
     token: Optional[str],
+    revision: Optional[str] = None,
+    copied: Optional[list] = None,
 ) -> bool:
     """If ALL files exist in the HF cache, copy them into target_dir_str.
-    Returns True on success, False otherwise.
+    Returns True on success, False otherwise. Names copied so far are appended to `copied`.
     """
     from huggingface_hub.errors import LocalEntryNotFoundError
 
@@ -5789,6 +5821,7 @@ def _try_copy_all_from_cache(
                 repo_type = "model",
                 cache_dir = hf_cache_dir,
                 token = token,
+                revision = revision,
             )
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
@@ -5818,6 +5851,7 @@ def _try_copy_all_from_cache(
         try:
             # Pass string target_dir_str to copy helper
             _copy_file_from_source(cached_path, target_dir_str, filename)
+            if copied is not None: copied.append(filename)
         except (IOError, PermissionError, FileNotFoundError) as copy_err:
              print(f"Cache copy failed: Error copying {filename} from {cached_path} to {target_dir_str}: {copy_err}")
              all_copied = False; break
