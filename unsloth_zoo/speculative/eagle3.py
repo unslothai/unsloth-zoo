@@ -681,11 +681,14 @@ class UnslothEagle3Trainer(Trainer):
         normalizer = None
         if num_items_in_batch is not None:
             normalizer = torch.as_tensor(num_items_in_batch, device = loss_mask.device, dtype = torch.float32).clamp(min = 1)
-        loss, stats = model(
-            aux, input_ids, attention_mask, self.args.eagle3_ttt_steps,
-            loss_kwargs = dict(final_hidden = captured["final"][:, 1:], lm_head_weight = self._lm_head_weight,
-                               loss_mask = loss_mask, decay = self.args.eagle3_step_decay, normalizer = normalizer),
-        )
+        loss_kwargs = dict(final_hidden = captured["final"][:, 1:], lm_head_weight = self._lm_head_weight,
+                           loss_mask = loss_mask, decay = self.args.eagle3_step_decay, normalizer = normalizer)
+        if isinstance(model, nn.DataParallel):
+            # DataParallel scatters forward kwargs along dim 0 and cannot gather Python stats: score after the gather.
+            step_hidden = model(aux, input_ids, attention_mask, self.args.eagle3_ttt_steps, return_hidden = True)
+            loss, stats = eagle3_chunked_loss(drafter, step_hidden, **loss_kwargs)
+        else:
+            loss, stats = model(aux, input_ids, attention_mask, self.args.eagle3_ttt_steps, loss_kwargs = loss_kwargs)
         if model.training:
             self._eagle3_log.append(stats)
         loss = loss * token_average_scale(self, num_items_in_batch)

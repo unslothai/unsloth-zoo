@@ -349,6 +349,21 @@ def test_default_ddp_reduces_the_loss_only_parameters(tmp_path):
     assert drafter.norm.weight.grad is not None and drafter.fc.weight.grad is not None
 
 
+def test_data_parallel_scores_after_the_gather(tmp_path):
+    """nn.DataParallel scatters forward kwargs along dim 0 (the lm_head too) and cannot gather Python stats."""
+    target = _target()
+    drafter = _drafter(target).train()
+    seen = []
+    hook = drafter.register_forward_pre_hook(lambda m, a, k: seen.append("loss_kwargs" in k), with_kwargs = True)
+    args = Eagle3TrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True, save_strategy = "no")
+    ids = torch.randint(0, VOCAB, (2, 16))
+    trainer = UnslothEagle3Trainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist()}]))
+    loss = trainer.compute_loss(torch.nn.DataParallel(drafter), {"input_ids": ids, "labels": ids, "attention_mask": torch.ones_like(ids)})
+    hook.remove()
+    assert seen == [False] and torch.isfinite(loss)
+
+
 def test_accumulated_batches_weight_every_token_equally(tmp_path):
     """With num_items_in_batch the loss is a sum over the microbatch divided by the logical-batch count."""
     target = _target()

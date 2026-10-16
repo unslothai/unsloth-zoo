@@ -517,16 +517,20 @@ class UnslothDSparkTrainer(Trainer):
                                      layer_ids = [i for i in ids if i >= 0], embed = -1 in ids)
         if -1 in ids:
             captured[-1] = captured.pop("embed")
-        dtype = next(p for p in drafter.parameters()).dtype
-        loss, stats = model(
-            drafter.context_states(captured).to(dtype), input_ids, loss_mask, self.args.dspark_num_anchors,
-            loss_kwargs = dict(
-                teacher_hidden = captured["final"].to(dtype), ce_alpha = self.args.dspark_ce_alpha,
-                l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
-                decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
-                teacher_lm_head_weight = resolve_text_parts(self.target_model)["lm_head"].weight,
-            ),
+        param = next(p for p in drafter.parameters())
+        context = drafter.context_states(captured).to(param.dtype)
+        loss_kwargs = dict(
+            teacher_hidden = captured["final"].to(device = param.device, dtype = param.dtype), ce_alpha = self.args.dspark_ce_alpha,
+            l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
+            decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
+            teacher_lm_head_weight = resolve_text_parts(self.target_model)["lm_head"].weight,
         )
+        if isinstance(model, nn.DataParallel):
+            # DataParallel scatters forward kwargs along dim 0 and cannot gather Python stats: score after the gather.
+            out = model(context, input_ids, loss_mask, self.args.dspark_num_anchors)
+            loss, stats = dspark_loss(drafter, out, **loss_kwargs)
+        else:
+            loss, stats = model(context, input_ids, loss_mask, self.args.dspark_num_anchors, loss_kwargs = loss_kwargs)
         if model.training:
             self._dspark_log.append(stats)
         return (loss, None) if return_outputs else loss

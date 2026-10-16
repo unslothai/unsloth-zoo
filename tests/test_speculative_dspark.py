@@ -336,6 +336,24 @@ def test_default_ddp_reduces_the_loss_only_heads(tmp_path):
     assert all(p.grad is not None for p in drafter.confidence_head.parameters())
 
 
+def test_data_parallel_scores_after_the_gather(tmp_path):
+    """nn.DataParallel scatters forward kwargs along dim 0 (the lm_head too) and cannot gather Python stats."""
+    target = _target().float()
+    drafter = Qwen3DSparkDrafter.from_target(target, target_layer_ids = LAYERS, mask_token_id = VOCAB - 1,
+                                             num_draft_layers = 1, block_size = BS, num_anchors = 6, markov_rank = 8).train()
+    seen = []
+    hook = drafter.register_forward_pre_hook(lambda m, a, k: seen.append("loss_kwargs" in k), with_kwargs = True)
+    ids = torch.randint(0, VOCAB - 1, (2, 16), generator = torch.Generator().manual_seed(0))
+    args = DSparkTrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True,
+                                   dspark_num_anchors = 6, save_strategy = "no")
+    trainer = UnslothDSparkTrainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist(), "labels": ids[0].tolist()}]),
+                                   data_collator = MTPDataCollator(pad_token_id = 0))
+    loss = trainer.compute_loss(torch.nn.DataParallel(drafter), {"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones_like(ids)})
+    hook.remove()
+    assert seen == [False] and torch.isfinite(loss)
+
+
 def test_layer_minus_one_is_the_embedding_output(tmp_path):
     """DeepSpec's target layer -1 is the embedding output, not the last decoder layer."""
     target = _target().float()
