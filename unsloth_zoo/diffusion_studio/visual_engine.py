@@ -162,6 +162,18 @@ def _resolve_ngl(ngl = None, base_env = None):
     return DEFAULT_NGL
 
 
+def _first_visible_gpu(mask):
+    """One card from an inherited mask: its first entry, so ``0,1`` still means GPU 0 alone and
+    ``2,1`` never reaches a hidden GPU 0; an all-hiding mask is kept; no mask means GPU 0."""
+    if mask is None:
+        return "0"
+    # CUDA stops at the first invalid entry, so a leading empty entry (",2") hides every GPU.
+    first = mask.split(",")[0].strip()
+    if first in ("", "-1"):
+        return mask
+    return first
+
+
 def _build_subprocess_env(server_bin, gpu = None, maxtok = 0, ngl = None, base_env = None, os_name = None):
     """Build the visual-server child env so it loads the CUDA backend, not CPU.
 
@@ -169,11 +181,11 @@ def _build_subprocess_env(server_bin, gpu = None, maxtok = 0, ngl = None, base_e
     (``cudart64_*.dll``) is prepended to ``PATH`` (#6273). Linux/WSL: the bundled ``nvidia-*`` dirs
     are prepended to ``LD_LIBRARY_PATH`` ahead of any inherited system CUDA (#6303). macOS / no GPU
     wheels: only the binary dir is added (unchanged). Pure/injectable for cross-platform tests.
-    ``gpu=None`` keeps an inherited ``CUDA_VISIBLE_DEVICES`` (else GPU 0, as before); any other
-    value, including ``""`` (CPU only), replaces it."""
+    ``gpu=None`` keeps one GPU, as before: the first entry of an inherited ``CUDA_VISIBLE_DEVICES``
+    (``""`` / ``-1`` stay hidden), else GPU 0. Any other value, including ``""`` (CPU only), replaces it."""
     name = os.name if os_name is None else os_name
     env = dict(os.environ if base_env is None else base_env)
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else env.get("CUDA_VISIBLE_DEVICES", "0")
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else _first_visible_gpu(env.get("CUDA_VISIBLE_DEVICES"))
     env["NGL"] = str(_resolve_ngl(ngl, base_env))
     env["MAXTOK"] = str(maxtok)
 

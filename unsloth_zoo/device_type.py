@@ -544,6 +544,8 @@ pass
 DEVICE_COUNT : int = get_device_count()
 
 _PER_DEVICE_CACHED = ("_detect_gfx_arch", "get_amd_attention_implementation", "get_amd_flash_attn_func")
+# False: callers use the no-argument getters, the cache entry the setup gates already filled.
+AMD_PER_DEVICE_CACHES = False
 
 
 def _use_per_device_caches(device_type, device_count):
@@ -553,6 +555,7 @@ def _use_per_device_caches(device_type, device_count):
         return False
     for name in _PER_DEVICE_CACHED:
         globals()[name] = _per_device_cache(globals()[name].__wrapped__, multi_device = True)
+    globals()["AMD_PER_DEVICE_CACHES"] = True
     return True
 pass
 _use_per_device_caches(DEVICE_TYPE, DEVICE_COUNT)

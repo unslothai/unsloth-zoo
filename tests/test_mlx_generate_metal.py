@@ -1180,12 +1180,13 @@ def test_nax_quantized_linear_first_use_check_rejects_a_wrong_kernel(monkeypatch
 @real_mlx_only
 @pytest.mark.parametrize("blocker", [None, "kill switch", "no NAX", "gap closed", "distributed", "probe failed"])
 def test_nax_quantized_linear_scope_stays_native(monkeypatch, blocker):
-    from unsloth_zoo.mlx import inference, nax
+    from unsloth_zoo.mlx import inference, nax, qmm
 
     model = _QuantizedHead()
     monkeypatch.delenv("UNSLOTH_MLX_NAX_QMM", raising = False)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
     monkeypatch.setattr(nax, "nax_available", lambda: blocker != "no NAX")
+    monkeypatch.setattr(qmm, "simd_qmm_available", lambda: False)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: blocker != "probe failed")
     monkeypatch.setattr(nax, "gap_open", lambda name: blocker != "gap closed")
     if blocker == "kill switch":
@@ -1209,6 +1210,166 @@ def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
         assert type(model.alias).__name__ == "_NaxSmallMQuantizedLinear"
         assert model.proj._unsloth_nax_qmm_scopes == 1
     assert type(model.proj) is nn.QuantizedLinear and "_unsloth_nax_qmm_rows" not in model.proj
+
+
+def _apple_gpu():
+    if not (_METAL and _HAS_REAL_MLX):
+        return False
+    from unsloth_zoo.mlx import nax
+    return nax._gpu_generation() is not None
+
+
+# simdgroup matrices are only known to lay out their elements this way on Apple's own GPUs.
+apple_gpu_only = pytest.mark.skipif(not _apple_gpu(), reason="requires a non-paravirtual Apple GPU")
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+@pytest.mark.parametrize("bits", [4, 8])
+@apple_gpu_only
+def test_simd_qmm_matches_native(bits, group_size, dtype):
+    from unsloth_zoo.mlx import qmm
+
+    for N, groups in ((328, 68), (72, 17), (64, 1)):   # uneven K splits, and the last one unsplit
+        K = group_size * groups
+        w, scales, biases = _quantized(N, K, group_size, dtype, bits, seed = groups)
+        for M in (2, 3, 5, 6, 8, 9, 16, 21, 24):   # the few-row kernel takes up to 5 rows
+            # Rows differ in scale and the rows after M are NaN, so a row mix-up or a read past M shows.
+            padded = mx.random.normal((M + 16, K), key = mx.random.key(M)) * (1 + mx.arange(M + 16)[:, None])
+            x = mx.where(mx.arange(M + 16)[:, None] < M, padded, mx.nan).astype(dtype)[:M]
+            got = qmm.simd_qmm(x, w, scales, biases, group_size, bits).astype(mx.float32)
+            with mx.stream(mx.cpu):
+                weight = mx.dequantize(w, scales.astype(mx.float32), biases.astype(mx.float32),
+                                       group_size = group_size, bits = bits)
+                exact = x.astype(mx.float32) @ weight.T
+                terms = mx.abs(x.astype(mx.float32)) @ mx.abs(weight).T
+                bound = mx.finfo(dtype).eps * mx.abs(exact) + K * 2.0 ** -23 * terms
+                mx.eval(exact, bound)
+            assert mx.all(mx.abs(got - exact) <= bound).item(), (N, groups, M)
+
+
+@apple_gpu_only
+def test_simd_qmm_takes_the_few_row_kernel_up_to_5_rows(monkeypatch):
+    from unsloth_zoo.mlx import qmm
+
+    built, metal_kernel = [], mx.fast.metal_kernel
+    monkeypatch.setattr(mx.fast, "metal_kernel", lambda **kwargs: built.append(kwargs) or metal_kernel(**kwargs))
+    qmm._simd_qmm_launch.cache_clear()
+    took = []
+    for bits, M in ((4, 5), (4, 6), (8, 5), (8, 6)):
+        w, scales, biases = _quantized(64, 128, 64, mx.bfloat16, bits, seed = M)
+        mx.eval(qmm.simd_qmm(mx.ones((M, 128), mx.bfloat16), w, scales, biases, 64, bits))
+        took.append(built[-1]["source"].endswith(qmm._SIMD_QMM_FEW_ROW_SOURCE))
+    assert took == [True, False, True, False]
+    # MLX recompiles a kernel whose name comes back with another source.
+    assert len({kwargs["name"] for kwargs in built}) == len(built)
+    qmm._simd_qmm_launch.cache_clear()
+    # The first-use check is keyed by this, so each row count of the few-row kernel is checked on its own.
+    assert len({qmm.simd_qmm_geometry(M, 328, 512, 64) for M in range(1, 9)}) == 6
+
+
+def test_simd_qmm_covers_4_and_8_bit_weights_where_stock_has_no_nax(monkeypatch):
+    from unsloth_zoo.mlx import nax, qmm
+
+    for args in ((328, 512, 64, 4, "affine"), (328, 512, 64, 8, "affine"), (1 << 18, 1 << 14, 64, 8, "affine")):
+        assert qmm.simd_qmm_supported(*args)
+    for args in ((324, 512, 64, 4, "affine"), (328, 480, 64, 4, "affine"), (328, 512, 16, 4, "affine"),
+                 (328, 512, 64, 5, "affine"), (328, 512, 32, 4, "mxfp4"),
+                 (1 << 18, 1 << 15, 128, 8, "affine"),   # 2^31 packed words
+                 ((1 << 29) - 8, 32, 32, 4, "affine")):   # 5 rows of output past 2^31
+        assert not qmm.simd_qmm_supported(*args)
+    assert qmm.simd_qmm_geometry(9, 328, 512, 64)[:2] == (16, 8) and qmm.simd_qmm_geometry(8, 328, 128, 64)[:2] == (8, 2)
+    monkeypatch.setattr(nax.mx.metal, "is_available", lambda: True)
+    # An M5 dispatches no NAX kernels below macOS 26.2 (no NAX GPU) or from a wheel built without them.
+    for architecture, nax_gpu, stock_kernels, expected in (
+            ("applegpu_g15s", False, True, True), ("applegpu_g17s", True, True, False),
+            ("applegpu_g17s", False, True, True), ("applegpu_g17s", True, False, True), ("air64_v27", False, True, False)):
+        monkeypatch.setattr(nax, "_gpu_architecture", lambda: architecture)
+        monkeypatch.setattr(nax, "_nax_gpu", lambda: nax_gpu)
+        monkeypatch.setattr(nax, "_stock_nax_kernels", lambda: stock_kernels)
+        assert qmm.simd_qmm_available() is expected, architecture
+    monkeypatch.setattr(qmm, "_SIMD_QMM_ROWS", ((4, None, 1 << 20, 4096, 5, 30), (4, None, 1 << 21, None, 7, 12),
+                                                (8, None, 1 << 20, None, 6, 16)))
+    assert [qmm.simd_qmm_row_range(N, K, 64, 4) for N, K in ((4096, 256), (8192, 256), (4096, 128))] == [
+        (5, 24), (7, 12), (0, -1)]
+    assert qmm.simd_qmm_row_range(4096, 256, 64, 8) == (6, 16)
+
+
+@apple_gpu_only
+def test_nax_quantized_linear_scope_routes_without_nax(monkeypatch, caplog):
+    from unsloth_zoo.mlx import inference, nax, qmm
+
+    model = _QuantizedHead()
+    calls = []
+    kernel = qmm.simd_qmm
+    monkeypatch.setattr(qmm, "simd_qmm", lambda *args: calls.append(args[0].shape[0]) or kernel(*args))
+    checked, check = [], inference._nax_small_m_qmm
+    monkeypatch.setattr(inference, "_nax_small_m_qmm", lambda *args: checked.append(1) or check(*args))
+    monkeypatch.setattr(nax, "nax_available", lambda: False)
+    monkeypatch.setattr(qmm, "simd_qmm_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(qmm, "_SIMD_QMM_ROWS", ((4, None, 0, None, 1, 20), (8, None, 0, None, 1, 20)))
+    monkeypatch.setattr(nax, "int8_prefill_min_rows", lambda N, K: 17)
+    monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
+    monkeypatch.delenv("UNSLOTH_MLX_SIMD_QMM", raising = False)
+    caplog.set_level("INFO", logger = inference.__name__)
+
+    def run(rows):
+        calls.clear()
+        checked.clear()
+        return model(mx.random.normal((rows, 1, 512), key = mx.random.key(rows)).astype(mx.bfloat16))
+
+    natives = {rows: run(rows) for rows in (1, 2, 20, 21, 1024)}
+    with inference.nax_quantized_linear(model, True):   # int8 prefill needs NAX: asking for it changes nothing
+        assert [type(m).__name__ for m in (model.embed, model.proj, model.odd)] == [
+            "_SimdSmallMQuantizedEmbedding", "_SimdSmallMQuantizedLinear", "_SimdSmallMQuantizedLinear"]
+        assert not any(m._unsloth_nax_int8_prefill_rows for m in (model.embed, model.proj, model.odd))
+        for rows, native in natives.items():
+            routed = run(rows)
+            assert calls == ([rows] * 3 if 2 <= rows <= 20 else [])
+            # Rows no route takes return to the native call unchecked; dense prefill starts at 1024.
+            assert len(checked) == (3 if 2 <= rows <= 20 or rows == 1024 else 0)
+            for a, b in zip(routed, native):
+                assert mx.allclose(a, b, rtol = 2e-2, atol = 2e-2).item()
+        assert len(inference._NAX_QMM_VERIFIED) == 6 and all(inference._NAX_QMM_VERIFIED.values())
+        block = mx.random.normal((1, 4, 512), key = mx.random.key(4)).astype(mx.bfloat16)
+        for x, routes in ((block, False), (block.reshape(4, 1, 512), True), (block.reshape(2, 2, 512), True),
+                          (block.reshape(4, 512), True), (block[0, :1], False)):
+            calls.clear()   # one sequence's block of positions stays native; the same rows as sequences route
+            checked.clear()
+            model(x)
+            assert calls == ([4] * 3 if routes else []) and len(checked) == (3 if routes else 0)
+        checked.clear()   # a prefill-sized block still reaches the prefill routes
+        model(mx.zeros((1, 1024, 512), mx.bfloat16))
+        assert len(checked) == 3
+        # The memo holds while the weight layout does: new values are read; scales promoted in place go native.
+        supported, support = [], qmm.simd_qmm_supported
+        monkeypatch.setattr(qmm, "simd_qmm_supported", lambda *args: supported.append(1) or support(*args))
+        routed = run(2)
+        assert calls == [2] * 3 and not supported
+        model.odd.scales, model.odd.biases = model.odd.scales * 2, model.odd.biases * 2
+        assert mx.array_equal(run(2)[1], 2 * routed[1]).item() and not supported
+        model.odd.scales += mx.array(0, mx.float32)
+        assert run(2)[1].dtype == mx.float32 and calls == [2] * 2 and len(supported) == 1
+        model.odd.scales = model.odd.scales.astype(mx.bfloat16)
+        run(2)
+        model.odd.group_size = 128   # the native call refuses what the kernel would misread
+        with pytest.raises(ValueError):
+            run(2)
+        model.odd.group_size = 64
+        assert sum("SIMD small-row kernel; UNSLOTH_MLX_SIMD_QMM=0" in r.getMessage() for r in caplog.records) == 1
+    assert [type(m) for m in (model.embed, model.proj, model.odd)] == [nn.QuantizedEmbedding] + [nn.QuantizedLinear] * 2
+    assert not any("_unsloth_nax_qmm_ready" in m.__dict__ for m in (model.embed, model.proj, model.odd))
+    for blocker in ("kill switch", "gap closed", "probe failed", "NAX"):
+        with monkeypatch.context() as patch:
+            if blocker == "kill switch":
+                patch.setenv("UNSLOTH_MLX_SIMD_QMM", "0")
+            patch.setattr(nax, "gap_open", lambda name: (blocker, name) != ("gap closed", "small_m_qmm_simd"))
+            patch.setattr(nax, "kernel_probe_passed", lambda key, *args: (blocker, key) != ("probe failed", qmm.SIMD_QMM_PROBE_KEY))
+            patch.setattr(nax, "nax_available", lambda: blocker == "NAX")   # where stock has NAX, its route runs
+            patch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+            with inference.nax_quantized_linear(model):
+                assert type(model.embed).__name__ == ("_NaxSmallM" if blocker == "NAX" else "") + "QuantizedEmbedding"
 
 
 class _PrefillProjections(nn.Module):
@@ -1333,6 +1494,164 @@ def test_dense_prefill_linear_first_use_check_rejects_a_different_result(monkeyp
             assert _same_bits(model(x[:, :rows]), [out[:, :rows] for out in native])
     assert list(inference._DENSE_QMM_VERIFIED.values()) == [False, False]
     assert "the native call stays in use" in caplog.text
+
+
+@real_mlx_only
+@pytest.mark.parametrize("N, K, rows, same", [
+    (2048, 2048, (1100, 1300), True),
+    (1024, 4600, (1501, 1601), False),   # NAX split K
+    (1024, 512, (2047, 2049), False),    # both sides within 2048
+    (6000, 8192, (1501, 2201), False),   # K over M + N
+    (1500, 512, (1401, 1601), False),    # N over M
+    (1009, 512, (1025, 1041), False),    # a million outputs
+    (1024, 4000, (1999, 2001), False),   # K under twice the widest side
+    (2048, 2048, (1088, 1056), False),   # 64- against 32-row alignment
+    (2048, 2048, (1152, 1088), False),   # 128- against 64-row alignment
+    (2048, 2048, (1056, 1100), False),   # 32-row alignment against none
+])
+def test_dense_prefill_row_key_splits_at_each_mlx_row_decision(N, K, rows, same):
+    from unsloth_zoo.mlx import inference
+
+    first, second = (inference._dense_qmm_rows(M, N, K) for M in rows)
+    assert (first == second) is same
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("mlx_version, quantized, verdicts", [
+    (None, [1100, 1152], 2),
+    ("0.0.0", [1100, 1300, 1152], 0),   # another MLX takes the native call at every row count
+])
+def test_dense_prefill_linear_compares_once_per_row_count_decision(monkeypatch, mlx_version, quantized, verdicts):
+    from unsloth_zoo.mlx import inference
+
+    model = _PrefillProjections()
+    x = mx.random.normal((1, 1300, 512), key = mx.random.key(4)).astype(mx.bfloat16)
+    rows = (1100, 1300, 1152)   # 1300 decides as 1100 does; 1152 aligns on 128 rows
+    natives = [model(x[:, :n]) for n in rows]
+    mx.eval(natives)
+    seen, quantized_matmul = [], mx.quantized_matmul
+    monkeypatch.setattr(mx, "quantized_matmul", lambda a, w, *args, **kwargs: (
+        seen.append(a.shape[-2]) if w.shape[0] == 2048 else None, quantized_matmul(a, w, *args, **kwargs))[1])
+    verified = {}
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
+    if mlx_version is not None:
+        monkeypatch.setattr(inference, "_DENSE_QMM_DISPATCH_MLX", (mlx_version,))
+    with inference.dense_prefill_linear(model):
+        for n, native in zip(rows, natives):
+            assert _same_bits(model(x[:, :n]), native)
+    assert seen == quantized and len(verified) == verdicts
+
+
+class _OneColumn(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.QuantizedLinear(64, 1, bias = False, group_size = 64, bits = 4)
+        self.set_dtype(mx.bfloat16)
+        self.eval()
+
+    def __call__(self, x):
+        return self.proj(x)
+
+
+@real_mlx_only
+@metal_only
+def test_dense_prefill_leaves_a_one_column_output_native(monkeypatch):
+    from unsloth_zoo.mlx import inference
+
+    model = _OneColumn()
+    x = mx.random.normal((1, 65553, 64)).astype(mx.bfloat16)   # past the tile floor
+    native = model(x)
+    mx.eval(native)
+    verified = {}
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
+    with inference.dense_prefill_linear(model):
+        assert _same_bits([model(x)], [native])
+    assert not verified
+
+
+_FAILED = "[METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+
+
+def _first_use_checks():
+    from mlx_lm.models.gated_delta import gated_delta_kernel
+    from unsloth_zoo.mlx import inference as I
+
+    rows = lambda *shape: mx.random.normal(shape).astype(mx.bfloat16)
+    delta = (rows(1, 2, 1, 128), rows(1, 2, 1, 128), rows(1, 2, 1, 8), mx.ones((1, 2, 1)), rows(1, 2, 1),
+             mx.zeros((1, 1, 8, 128)))
+    model = _PrefillProjections()
+
+    def dense():
+        with I.dense_prefill_linear(model):
+            return model(rows(1, 2048, 512))
+
+    return {
+        "add_norm": (lambda: I._add_norm_verified(mx.bfloat16, 256), "_ADD_NORM_VERDICTS"),
+        "router": (lambda: I._moe_router_verified(mx.bfloat16, mx.float32, 64, 4, I._QWEN_ROUTING, True), None),
+        "router_shared": (lambda: I._moe_router_shared_verified(mx.bfloat16, 64, 4, True), None),
+        "combine": (lambda: I._moe_combine_verified(mx.bfloat16, 2, 64), None),
+        "gated_delta": (lambda: I._packed_gated_delta_route(gated_delta_kernel, [])(*delta), "_GATED_DELTA_VERDICTS"),
+        "verify": (lambda: I._verify_admitted("key", lambda: rows(2, 4), lambda: rows(2, 4)), "_VERIFY_VERDICTS"),
+        "dense": (dense, "_DENSE_QMM_VERIFIED"),
+    }
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("site", ["add_norm", "router", "router_shared", "combine", "gated_delta", "verify", "dense"])
+def test_a_first_use_mismatch_from_a_failed_command_buffer_raises_instead_of_recording(monkeypatch, site):
+    from unsloth_zoo.mlx import inference
+
+    check, verdicts = _first_use_checks()[site]
+    for cached in (inference._moe_router_verified, inference._moe_router_shared_verified, inference._moe_combine_verified):
+        cached.cache_clear()
+    if verdicts:
+        monkeypatch.setattr(inference, verdicts, {})
+
+    def failed(*_):
+        raise RuntimeError(_FAILED)
+
+    monkeypatch.setattr(mx, "array_equal", lambda *a, **k: mx.array(False))
+    monkeypatch.setattr(mx, "synchronize", failed)
+    with pytest.raises(RuntimeError, match = "Command buffer execution failed"):
+        check()
+    assert not getattr(inference, verdicts) if verdicts else True
+    for cached in (inference._moe_router_verified, inference._moe_router_shared_verified, inference._moe_combine_verified):
+        assert not cached.cache_info().currsize
+        cached.cache_clear()
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("error, raised", [
+    (RuntimeError(_FAILED), True),
+    (ValueError("[eval] Attempting to eval an array during function transformations like compile or vmap"), False),
+    (RuntimeError("[metal::Device] Unable to build metal library from source"), False),
+])
+def test_a_first_use_check_defers_only_what_cannot_evaluate_now(monkeypatch, error, raised):
+    from unsloth_zoo.mlx import inference
+
+    model = _PrefillProjections()
+    x = mx.random.normal((1, 2048, 512)).astype(mx.bfloat16)
+    native = model(x)
+    mx.eval(native)
+
+    def refuse(*_, **__):
+        raise error
+
+    monkeypatch.setattr(mx, "array_equal", refuse)
+    verified = {}
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
+    with inference.dense_prefill_linear(model):
+        if raised:
+            with pytest.raises(RuntimeError, match = "Command buffer execution failed"):
+                model(x)
+        else:
+            outputs = model(x)
+            monkeypatch.undo()
+            assert _same_bits(outputs, native)
+    assert not verified
 
 
 @metal_only
@@ -1502,7 +1821,7 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
     from contextlib import contextmanager
     import mlx_lm
     import mlx_vlm
-    from unsloth_zoo.mlx import loader
+    from unsloth_zoo.mlx import inference, loader
 
     root = nn.Sequential(nn.Linear(4, 4))
     root._tokenizer = types.SimpleNamespace(eos_token_ids = {2})
@@ -1510,7 +1829,7 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
     entered = []
 
     @contextmanager
-    def scope(model, *args):
+    def scope(model, *args, _modules):
         entered.append((model, *args))
         yield model
 
@@ -1519,10 +1838,28 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
         assert "int8_prefill" not in kwargs
         yield types.SimpleNamespace(token = 7)
 
-    monkeypatch.setattr(loader, scope_name, scope)
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [
+        entry._replace(enter = scope) if entry.name == scope_name else entry for entry in inference.INFERENCE_SCOPES])
     monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
     generated = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1, int8_prefill = vlm)
     assert generated.tolist() == [[1, 2, 7]]
+
+
+@real_mlx_only
+@metal_only
+def test_warm_inference_leaves_no_shape_keyed_check_to_the_first_request(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    verdicts = ("_ADD_NORM_VERDICTS", "_DECODE_STEP_VERDICTS")
+    for name in verdicts:
+        monkeypatch.setattr(inference, name, {})
+    model, _ = FastMLXModel.from_pretrained(QWEN_VLM_MODEL)
+    inference.warm_inference(model)
+    warmed = {name: dict(getattr(inference, name)) for name in verdicts}
+    assert all(warmed.values()), warmed
+    model.generate(mx.arange(100, 137)[None], max_tokens = 3, do_sample = False)
+    assert {name: getattr(inference, name) for name in verdicts} == warmed
 
 
 def _packed_codes(codes, bits):   # MLX's layout: a little-endian bitstream of `bits`-wide codes

@@ -312,6 +312,143 @@ def test_recompute_replays_each_forward_of_a_chunked_loss(replay):
         torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
 
 
+def _old_weighted_sum_hash(ids):
+    # The position-weighted int64 sum the recompute used to match forwards by.
+    ids = ids.long().sort(-1).values
+    weights = torch.arange(1, ids.numel() + 1, dtype = torch.long).view(ids.shape)
+    return int(((ids + 1) * (weights * 2654435761)).sum())
+
+
+def test_recompute_tells_apart_forwards_whose_routes_hash_alike(replay):
+    # Two different sequences whose first layer natural routes collide under a weighted sum
+    # hash: each checkpoint recompute must still replay its own forward's routes.
+    model = _model()
+    batch = torch.randint(1, 64, (256, 7), generator = torch.Generator().manual_seed(749))
+    captured = {}
+    handle = model.model.layers[0].mlp.gate.register_forward_hook(
+        lambda m, a, out: captured.__setitem__("ids", out[2].detach().clone())
+    )
+    with torch.no_grad():
+        model(input_ids = batch)
+    handle.remove()
+    routes = captured["ids"].reshape(256, 7, TOP_K)
+    seen, pair = {}, None
+    for i, ids in enumerate(routes):
+        key = _old_weighted_sum_hash(ids)
+        if key in seen and not torch.equal(ids, routes[seen[key]]):
+            pair = (seen[key], i)
+            break
+        seen[key] = i
+    assert pair is not None
+    sequences = [batch[i].tolist() for i in pair]
+    forced = [(_natural_ids(model, seq) + 2) % NUM_EXPERTS for seq in sequences]
+
+    def run(checkpointing):
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        rr.reset_routing_replay()
+        _install(m)
+        rr.record_routed_experts([_request(seq[:3], seq[3:], f.numpy()) for seq, f in zip(sequences, forced)])
+        losses = [m(input_ids = torch.tensor([seq])).logits.float().square().mean() for seq in sequences]
+        sum(losses).backward()
+        return torch.stack([l.detach() for l in losses]), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    losses_plain, grads_plain = run(False)
+    losses_gc, grads_gc = run(True)
+    torch.testing.assert_close(losses_gc, losses_plain, rtol = 1e-5, atol = 1e-6)
+    assert grads_gc.keys() == grads_plain.keys()
+    for name in grads_plain:
+        torch.testing.assert_close(grads_gc[name], grads_plain[name], rtol = 1e-4, atol = 1e-6, msg = name)
+
+
+def test_recompute_keeps_natural_routing_when_forwards_are_ambiguous(replay):
+    # Same natural routing, different replays: no way to tell which forward a recompute is.
+    ids2 = torch.tensor([[1, 0], [3, 2]])
+    fp = rr._fingerprint(ids2)
+    valid = torch.ones((2, 1), dtype = torch.bool)
+    rr._STATE.pending = [
+        {0: (fp, torch.tensor([[4, 5], [6, 7]]), valid)},
+        {0: (fp, torch.tensor([[5, 6], [7, 4]]), valid)},
+    ]
+    forced, ok = rr._recomputed_routes(0, ids2)
+    assert not bool(ok.any())
+    rr._STATE.pending = [
+        {0: (fp, torch.tensor([[4, 5], [6, 7]]), valid)},
+        {0: (rr._fingerprint(torch.tensor([[2, 0], [3, 1]])), torch.tensor([[5, 6], [7, 4]]), valid)},
+    ]
+    forced, ok = rr._recomputed_routes(0, ids2)
+    assert bool(ok.all()) and forced.tolist() == [[4, 5], [6, 7]]
+
+
+def test_recompute_accepts_the_same_expert_set_in_another_order(replay):
+    # Two forwards with identical natural routing whose replays hold the same experts in a
+    # different order: the recompute must still replay them, not fall back to natural routing.
+    model = _model()
+    batch = torch.randint(1, 64, (1024, 2), generator = torch.Generator().manual_seed(749))
+    captured = {}
+    handle = model.model.layers[0].mlp.gate.register_forward_hook(
+        lambda m, a, out: captured.__setitem__("ids", out[2].detach().clone())
+    )
+    with torch.no_grad():
+        model(input_ids = batch)
+    handle.remove()
+    routes = captured["ids"].reshape(1024, 2, TOP_K)
+    seen, pair = {}, None
+    for i, route in enumerate(routes):
+        key = tuple(route.sort(-1).values.flatten().tolist())
+        if key in seen and not torch.equal(batch[i], batch[seen[key]]):
+            pair = (seen[key], i)
+            break
+        seen[key] = i
+    assert pair is not None
+    sequences = [batch[i].tolist() for i in pair]
+    forced = torch.tensor([[[4, 5], [4, 5]], [[4, 5], [4, 5]]])  # tokens, layers, top-k
+    forced_rows = [forced, forced.flip(-1)]
+
+    def run(checkpointing):
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        rr.reset_routing_replay()
+        _install(m)
+        rr.record_routed_experts([_request(seq[:1], seq[1:], f.numpy()) for seq, f in zip(sequences, forced_rows)])
+        losses = [m(input_ids = torch.tensor([seq])).logits.float().square().mean() for seq in sequences]
+        if checkpointing:
+            a, b = rr._STATE.pending
+            assert torch.equal(a[0][0], b[0][0]) and not torch.equal(a[0][1], b[0][1])
+        sum(losses).backward()
+        return torch.stack([l.detach() for l in losses]), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    losses_plain, grads_plain = run(False)
+    losses_gc, grads_gc = run(True)
+    torch.testing.assert_close(losses_gc, losses_plain, rtol = 1e-5, atol = 1e-6)
+    for name in grads_plain:
+        torch.testing.assert_close(grads_gc[name], grads_plain[name], rtol = 1e-4, atol = 1e-6, msg = name)
+
+
+@pytest.mark.parametrize("version, expected", [("0.18.0", False), ("0.21.1", False), ("0.22.0", True), ("0.31.0", True)])
+def test_engine_args_need_vllm_022_for_hybrid_attention(replay, monkeypatch, version, expected):
+    # vLLM < 0.22 indexes its routed experts capture by physical block in a buffer sized per
+    # KV cache group, so hybrid attention models crash in generate.
+    import importlib.metadata
+    monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts"})
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: version)
+    hybrid = SimpleNamespace(num_experts = 8, layer_types = ["sliding_attention", "full_attention"])
+    nested = SimpleNamespace(text_config = SimpleNamespace(num_local_experts = 8, hybrid_override_pattern = "M-M*-"))
+    full = SimpleNamespace(num_experts = 8, layer_types = ["full_attention", "full_attention"])
+    want = {"enable_return_routed_experts": True}
+    for config in (hybrid, nested):
+        if expected:
+            assert rr.routing_replay_engine_args(config) == want
+        else:
+            with pytest.warns(UserWarning, match = "hybrid attention"):
+                assert rr.routing_replay_engine_args(config) == {}
+    assert rr.routing_replay_engine_args(full) == want
+
+
 def test_topk_softmax_router_is_covered_by_softmax_renorm(replay):
     class GptOssLikeRouter(torch.nn.Module):
         def __init__(self):
@@ -453,3 +590,21 @@ def test_generate_without_training_keeps_bounded_routes(replay, monkeypatch):
     assert len(rr._STATE.generations) == 1
     assert len(next(iter(rr._STATE.generations.values()))) == 3
     assert rr._lookup((29, 39, 49)) is not None and rr._lookup((20, 30, 40)) is None
+
+
+def test_recompute_with_several_same_shape_forwards_keeps_candidate_shapes():
+    # Three recorded forwards of one shape, each routing 5 tokens to 2 experts: the per-candidate
+    # agreement must reduce to one flag per candidate before it meets the per-candidate match.
+    ids2 = torch.randint(0, 8, (5, 2))
+    fp = rr._fingerprint(ids2)
+    replay = torch.randint(0, 8, (5, 2))
+    saved = rr._STATE.pending, rr._STATE.recomputed
+    try:
+        rr._STATE.pending = [
+            {0: (fp, replay[:, torch.randperm(2)], torch.ones((5, 1), dtype = torch.bool))} for _ in range(3)
+        ]
+        forced, valid = rr._recomputed_routes(0, ids2)
+    finally:
+        rr._STATE.pending, rr._STATE.recomputed = saved
+    assert forced.shape == (5, 2)
+    assert bool(valid.all())

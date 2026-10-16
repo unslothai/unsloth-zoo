@@ -3552,6 +3552,140 @@ def _shrink_for_memory_retry(max_num_seqs, max_num_batched_tokens, max_seq_lengt
     return max_num_seqs, max_num_batched_tokens
 
 
+def _padded_vocab_ids(config):
+    # Written by tokenizer_utils._suppress_padded_rows (add_new_tokens(pad_to_multiple_of = ...)).
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config() if callable(get_text_config) else config
+    return list(getattr(text_config, "unsloth_vocab_pad_ids", None) or [])
+pass
+
+
+def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
+    """vLLM samples every row of config.vocab_size and ignores generation_config.suppress_tokens,
+    so alignment rows from add_new_tokens(pad_to_multiple_of = ...) could be emitted as ids no
+    tokenizer token has. Bias them to -100 on every request the engine core receives.
+    Idempotent."""
+    if speculative:
+        # SamplingParams._validate_spec_decode rejects any logit_bias under speculative decoding
+        # (vLLM 0.29; older V1 drops it with a warning), so biasing would fail every request.
+        print(
+            "Unsloth: vLLM does not support logit_bias with speculative decoding, so this padded "
+            "vocabulary's alignment rows stay sampleable."
+        )
+        return llm
+    bias = {int(i): -100.0 for i in padded_ids}
+    try:
+        # Model Runner V2 refuses a request with more logit_bias entries than this.
+        from vllm.v1.worker.gpu.sample.logit_bias import MAX_NUM_LOGIT_BIAS_TOKENS as max_bias
+    except Exception:
+        max_bias = 1024
+    warned = []
+
+    def _bias_request(request):
+        params = getattr(request, "sampling_params", None)
+        if params is None or not hasattr(params, "logit_bias"):
+            # Pooling request: nothing is sampled.
+            return
+        current = params.logit_bias or {}
+        if all(current.get(i) == -100.0 for i in bias):
+            return
+        merged = {**current, **bias}
+        if len(merged) > max_bias:
+            if not warned:
+                warned.append(True)
+                print(
+                    f"Unsloth: {len(merged)} logit_bias entries exceed vLLM's limit of {max_bias}, so "
+                    "this padded vocabulary's alignment rows stay sampleable for such requests."
+                )
+            return
+        params = copy.copy(params)
+        params.logit_bias = merged
+        request.sampling_params = params
+
+    # Every request reaches the engine core as an EngineCoreRequest through the frontend client's
+    # add_request / add_request_async: LLM.generate / chat / enqueue, LLMEngine and AsyncLLM
+    # add_request (also with a prebuilt EngineCoreRequest), n > 1 children and AsyncLLM streaming
+    # input chunks. Biasing there covers them all, once per request.
+    engine = getattr(llm, "llm_engine", None) or llm
+    client = getattr(engine, "engine_core", None)
+    hooked = False
+    for name in ("add_request", "add_request_async"):
+        method = getattr(client, name, None) if client is not None else None
+        if method is None:
+            continue
+        hooked = True
+        if getattr(method, "_unsloth_padded_vocab", False):
+            continue
+        if inspect.iscoroutinefunction(method):
+            @functools.wraps(method)
+            async def add_request_without_padded_vocab(request, *args, _method = method, **kwargs):
+                _bias_request(request)
+                return await _method(request, *args, **kwargs)
+        else:
+            @functools.wraps(method)
+            def add_request_without_padded_vocab(request, *args, _method = method, **kwargs):
+                _bias_request(request)
+                return _method(request, *args, **kwargs)
+        add_request_without_padded_vocab._unsloth_padded_vocab = True
+        setattr(client, name, add_request_without_padded_vocab)
+    if not hooked:
+        # V0 engine (vLLM < 0.11, or 0.10.x choosing V0): LLMEngine.add_request and
+        # _AsyncLLMEngine.add_request_async both end in _add_processed_request(params = ...),
+        # as do n > 1 children. V0 rejects logit_bias ids >= len(tokenizer), which alignment rows
+        # are by definition, so append a per-request logits processor applying the same bias.
+        v0 = engine if hasattr(engine, "_add_processed_request") else getattr(engine, "engine", None)
+        if (getattr(getattr(v0, "scheduler_config", None), "num_scheduler_steps", 1) or 1) > 1:
+            # V0 multi-step decoding rejects logits processors (LLMEngine.add_request).
+            print("Unsloth: vLLM multi-step decoding takes no logits processors, so padded vocabulary rows stay sampleable.")
+            return llm
+        method = getattr(v0, "_add_processed_request", None)
+        if method is None:
+            print("Unsloth: this vLLM engine has no known request ingress, so padded vocabulary rows stay sampleable.")
+            return llm
+        if not getattr(method, "_unsloth_padded_vocab", False):
+            indices = {}
+            pad_ids = list(bias)
+
+            def _bias_padded_rows(token_ids, logits):
+                index = indices.get(logits.device)
+                if index is None:
+                    index = indices[logits.device] = torch.tensor(pad_ids, dtype = torch.long, device = logits.device)
+                logits[index] += -100.0
+                return logits
+
+            @functools.wraps(method)
+            def _add_processed_request_without_padded_vocab(*args, **kwargs):
+                params = kwargs.get("params", None)
+                if params is not None and hasattr(params, "logits_processors"):
+                    processors = list(params.logits_processors or [])
+                    if _bias_padded_rows not in processors:
+                        params = copy.copy(params)
+                        # A fresh list: V0 extends it in place with its own processors.
+                        params.logits_processors = processors + [_bias_padded_rows]
+                        kwargs["params"] = params
+                return method(*args, **kwargs)
+
+            _add_processed_request_without_padded_vocab._unsloth_padded_vocab = True
+            v0._add_processed_request = _add_processed_request_without_padded_vocab
+    return llm
+pass
+
+
+def _warn_padded_vocab_for_serve(config):
+    # return_args builds a separate `vllm serve`: no engine here to hook, and neither
+    # --generation-config nor --override-generation-config can carry logit_bias (vLLM only reads
+    # temperature, top_p, top_k, min_p, repetition_penalty and max_new_tokens from it).
+    padded_ids = _padded_vocab_ids(config)
+    if padded_ids:
+        print(
+            f"Unsloth: this model has {len(padded_ids)} padded vocabulary rows ({min(padded_ids)} to "
+            f"{max(padded_ids)}) that no token has, and `vllm serve` does not suppress them. Send "
+            f"logit_bias = {{id: -100}} for those ids with every request (the OpenAI API accepts it)."
+        )
+    return padded_ids
+pass
+
+
 def _fp32_lm_head_requested():
     return os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
 
@@ -3566,6 +3700,47 @@ def _vllm_supports_fp32_lm_head():
     return hasattr(LogitsProcessor, "_apply_head")
 
 
+def _patch_vllm_fp32_lm_head_excluded_quant():
+    # vLLM 0.26.0 - 0.28.x only accept UnquantizedEmbeddingMethod for a head_dtype override, but a
+    # quant config that excludes lm_head (ModelOpt FP8 / NVFP4) hands out UnquantizedLinearMethod,
+    # so _apply_head raises although the weight is plain. Backport the 0.29.0 guard: swap in an
+    # UnquantizedEmbeddingMethod for that one call. Only reached with UNSLOTH_VLLM_FP32_LM_HEAD=1.
+    try:
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
+    except Exception:
+        return False
+    original = getattr(LogitsProcessor, "_apply_head", None)
+    if original is None or getattr(original, "_unsloth_excluded_quant_patched", False):
+        return False
+    code = getattr(original, "__code__", None)
+    if code is None or "UnquantizedLinearMethod" in code.co_names:
+        # vLLM >= 0.29.0 already accepts both.
+        return False
+    embedding_method = UnquantizedEmbeddingMethod()
+
+    def _apply_head(self, lm_head, hidden_states, embedding_bias):
+        quant_method = getattr(lm_head, "quant_method", None)
+        if (
+            getattr(self, "head_dtype", None) is not None
+            and self.head_dtype != hidden_states.dtype
+            and isinstance(quant_method, UnquantizedLinearMethod)
+            and not isinstance(quant_method, UnquantizedEmbeddingMethod)
+        ):
+            lm_head.quant_method = embedding_method
+            try:
+                return original(self, lm_head, hidden_states, embedding_bias)
+            finally:
+                lm_head.quant_method = quant_method
+        return original(self, lm_head, hidden_states, embedding_bias)
+
+    _apply_head._unsloth_excluded_quant_patched = True
+    _apply_head.__wrapped__ = original
+    LogitsProcessor._apply_head = _apply_head
+    return True
+
+
 def _vllm_fp32_lm_head_overrides(training):
     # Raises rather than half-applying: the trainer reads the same flag, and only both sides in fp32 pays off.
     if not training or not _fp32_lm_head_requested():
@@ -3575,6 +3750,7 @@ def _vllm_fp32_lm_head_overrides(training):
             f"Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 needs vLLM >= 0.26.0 for an fp32 lm_head, "
             f"but found vLLM {vllm_version}. Upgrade vLLM or unset UNSLOTH_VLLM_FP32_LM_HEAD."
         )
+    _patch_vllm_fp32_lm_head_excluded_quant()
     return {"head_dtype": "float32"}
 
 
@@ -4564,6 +4740,7 @@ def load_vllm(
 
         # Quick exit. The finally below restores the patch on the way out.
         if return_args:
+            _warn_padded_vocab_for_serve(config)
             # No engine is built here, so nothing will ever reach delete_vllm to lift the
             # block, and the failure arm below is not reached either. Hand flashinfer back
             # rather than poisoning the session for good.
@@ -4733,6 +4910,11 @@ def load_vllm(
         if engine_args.get("enable_return_routed_experts", False):
             from .routing_replay import wrap_vllm_generate
             wrap_vllm_generate(llm)
+        padded_ids = _padded_vocab_ids(config)
+        if padded_ids:
+            suppress_vllm_padded_vocab(
+                llm, padded_ids, speculative = engine_args.get("speculative_config", None) is not None,
+            )
         if _merged_rollout_enabled():
             llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)

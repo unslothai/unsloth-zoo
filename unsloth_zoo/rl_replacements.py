@@ -54,11 +54,11 @@ def _truncated_support_mask_impl(logits: torch.Tensor, top_k: int, top_p: float,
         kth = torch.topk(logits, top_k, dim = -1).values[:, -1:]
         logits = logits.masked_fill(logits < kth, float("-inf"))
     if top_p < 1.0:
-        sorted_logits = torch.sort(logits, dim = -1).values
+        # Per sorted position, as vLLM does: a cutoff inside a run of equal logits keeps only part of it.
+        sorted_logits, sorted_idx = torch.sort(logits, dim = -1)
         dropped = torch.cumsum(torch.softmax(sorted_logits, dim = -1), dim = -1) <= (1.0 - top_p)
-        dropped = dropped & (sorted_logits < sorted_logits[:, -1:])
-        threshold = sorted_logits.masked_fill(dropped, float("inf")).amin(dim = -1, keepdim = True)
-        logits = logits.masked_fill(logits < threshold, float("-inf"))
+        dropped[:, -1] = False
+        logits = logits.scatter(-1, sorted_idx, sorted_logits.masked_fill(dropped, float("-inf")))
     return torch.isfinite(logits)
 pass
 
@@ -78,12 +78,22 @@ pass
 # Mirrors vLLM v1 processed_logprobs: renormalised over what survives min_p, then top_k, then top_p
 # (sampler.py `sample`, topk_topp_sampler.py `apply_top_k_top_p`). The scored token is always kept
 # so a boundary disagreement between the trainer's recomputed set and the sampler's stays finite.
+# A scored token tied with the smallest kept logit but dropped by the sort counts as one of the kept
+# tokens (vLLM keeps an arbitrary subset of a tied run): it takes the place of one kept tied token,
+# so both the value and its gradient are those of a kept token.
 def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p):
-    selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1))
-    keep = _truncated_support_mask(chunk_logits.detach(), top_k, top_p, min_p)
+    index = chunk_index.unsqueeze(-1)
+    selected_logits = torch.gather(chunk_logits, dim = -1, index = index)
+    detached = chunk_logits.detach()
+    keep = _truncated_support_mask(detached, top_k, top_p, min_p)
+    selected_kept = torch.gather(keep, dim = -1, index = index)
+    smallest_kept = detached.masked_fill(~keep, float("inf")).amin(dim = -1, keepdim = True)
+    tied = (~selected_kept) & (selected_logits.detach() == smallest_kept)
+    boundary = (keep & (detached == smallest_kept)).to(torch.int32).argmax(dim = -1, keepdim = True)
+    keep = keep.scatter(-1, boundary, torch.gather(keep, dim = -1, index = boundary) & ~tied)
+    keep = keep.scatter(-1, index, torch.ones_like(selected_kept))
     kept = chunk_logits.masked_fill(~keep, float("-inf"))
-    kept = kept.scatter(-1, chunk_index.unsqueeze(-1), selected_logits)
-    return selected_logits.squeeze(-1) - torch.logsumexp(kept, dim = -1)
+    return (selected_logits - torch.logsumexp(kept, dim = -1, keepdim = True)).squeeze(-1)
 pass
 
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
@@ -1258,6 +1268,45 @@ pass
 RL_REPLACEMENTS["grpo_entropy_bonus_weights"] = grpo_entropy_bonus_weights
 
 
+_HIGH_ENTROPY_MASK_PADS = {}
+def _high_entropy_mask_pads(method):
+    # TRL >= 0.24 pads every rank to one length before the gather; TRL 0.22 / 0.23 gather the
+    # raw valid tokens and return early on a rank that has none
+    func = getattr(method, "__func__", method)
+    pads = _HIGH_ENTROPY_MASK_PADS.get(func, None)
+    if pads is None:
+        try:
+            source = inspect.getsource(func)
+            pads = ("pad_across_processes" in source) or ("accelerator.gather" not in source)
+        except Exception:
+            pads = True
+        _HIGH_ENTROPY_MASK_PADS[func] = pads
+    return pads
+pass
+
+
+def grpo_high_entropy_mask(trainer, entropies, mask, threshold):
+    """trainer.get_high_entropy_mask, except on a multi-process run whose method gathers without
+    padding (TRL < 0.24): a rank with no valid tokens returns before the gather the other ranks
+    enter, so training hangs, and uneven token counts break the gather. Those runs take TRL >= 0.24's
+    padded gather, which sees the same quantile population; a single process is unchanged."""
+    accelerator = getattr(trainer, "accelerator", None)
+    if getattr(accelerator, "num_processes", 1) > 1 and not _high_entropy_mask_pads(trainer.get_high_entropy_mask):
+        local = entropies[mask.bool()].float()
+        # entropies are >= 0, so a negative sentinel cannot collide with a real value
+        pad_value = -1e9
+        padded = accelerator.pad_across_processes(local, dim = 0, pad_index = pad_value)
+        gathered = accelerator.gather(padded)
+        gathered = gathered[gathered != pad_value]
+        if gathered.numel() == 0:
+            return torch.zeros_like(entropies, dtype = torch.bool)
+        entropy_threshold = torch.quantile(gathered, threshold)
+        entropy_mask = (entropies * mask.float()) >= entropy_threshold
+        return entropy_mask & mask.bool()
+    return trainer.get_high_entropy_mask(entropies, mask, threshold)
+pass
+
+
 def _warn_unsupported_grpo_options(trainer):
     """Warn once per trainer about TRL GRPOConfig options this path ignores, so setting
     them is not silently dropped. Adaptive entropy control (use_adaptive_entropy) is
@@ -1311,9 +1360,25 @@ def _grpo_rollout_sampling_params(trainer, keys):
     then generation_kwargs, then Unsloth's vllm_sampling_params."""
     args = getattr(trainer, "args", None)
     params = {key: getattr(args, key, None) for key in keys}
+    vllm_sampling_params = getattr(args, "vllm_sampling_params", None)
+    vllm_overrides = getattr(vllm_sampling_params, "_set_kwargs", None)
+    if vllm_overrides is None and vllm_sampling_params is not None:
+        # A raw vllm.SamplingParams: take exactly the fields generation applies from it, through the
+        # grpo_update_SamplingParams the trainer's generated module calls (unsloth >= #11595 copies
+        # the fields that differ from SamplingParams(), older ones use this module's, lists only)
+        update = grpo_update_SamplingParams
+        for klass in type(trainer).__mro__:
+            candidate = getattr(sys.modules.get(klass.__module__, None), "grpo_update_SamplingParams", None)
+            if callable(candidate):
+                update = candidate
+                break
+        try:
+            vllm_overrides = update(type(vllm_sampling_params), {}, vllm_sampling_params)
+        except Exception:
+            vllm_overrides = grpo_update_SamplingParams(type(vllm_sampling_params), {}, vllm_sampling_params)
     for overrides in (
         getattr(args, "generation_kwargs", None),
-        getattr(getattr(args, "vllm_sampling_params", None), "_set_kwargs", None),
+        vllm_overrides,
     ):
         if isinstance(overrides, dict):
             for key in params:
@@ -2064,6 +2129,7 @@ def grpo_accumulated_loss(
             chunked_hidden_states_selective_log_softmax_recompute as _entropy_log_softmax,
             UnslothGRPOEntropyBonus as _UnslothGRPOEntropyBonus,
             grpo_entropy_bonus_weights as _grpo_entropy_bonus_weights,
+            grpo_high_entropy_mask as _grpo_high_entropy_mask,
         )
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
@@ -2251,6 +2317,20 @@ def grpo_accumulated_loss(
             _support_kwargs = {}
         if _support_kwargs:
             from functools import partial
+            if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
+                # The recompute helper scores the full vocabulary only, so the kept set uses the plain helper
+                from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax
+                if lm_head_bias is not None:
+                    chunked_hidden_states_selective_log_softmax = partial(
+                        chunked_hidden_states_selective_log_softmax, lm_head_bias = lm_head_bias,
+                    )
+                if not getattr(trainer, "_unsloth_truncated_support_recompute_warned", False):
+                    from unsloth_zoo.log import logger as _zoo_logger
+                    _zoo_logger.warning(
+                        "Unsloth: UNSLOTH_GRPO_LOGPROB_RECOMPUTE=1 is not used with UNSLOTH_GRPO_TRUNCATED_SUPPORT=1; "
+                        "the logprobs are scored with the standard helper over the kept set."
+                    )
+                    trainer._unsloth_truncated_support_recompute_warned = True
             chunked_hidden_states_selective_log_softmax = partial(
                 chunked_hidden_states_selective_log_softmax, **_support_kwargs,
             )
@@ -2333,11 +2413,18 @@ def grpo_accumulated_loss(
         # No width dispatch in these helpers: unsloth rewrites every
         # `if <x>.shape[-1] == lm_head.shape[1]:` in this function and refuses any other spelling.
         def _hidden_logps_and_entropies(hidden_states, ids, chunks):
-            return _entropy_log_softmax(
+            logps, entropies = _entropy_log_softmax(
                 hidden_states, lm_head, ids, chunks,
                 logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
                 lm_head_bias = lm_head_bias, return_entropy = True,
             )
+            if _support_kwargs:
+                # Entropies stay full-vocabulary as TRL's; the logprobs take the kept set
+                logps = chunked_hidden_states_selective_log_softmax(
+                    hidden_states, lm_head, ids, chunks,
+                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                )
+            return logps, entropies
 
         def _raw_logits_entropies(logits):
             # The forward already scaled / softcapped these; same temperature as the logprobs.
@@ -2520,19 +2607,22 @@ def grpo_accumulated_loss(
                 _pack_lengths = _pack_keep.sum(dim = 1)
                 _pack_lengths_cpu = _pack_lengths.tolist()                 # single GPU->CPU sync, reused below
                 _pack_nz_cpu = [_n for _n in _pack_lengths_cpu if _n > 0]
-                _pack_flat_ids = input_ids[_pack_keep].unsqueeze(0)
-                _pack_T = _pack_flat_ids.shape[1]
+                _pack_T = sum(_pack_nz_cpu)
                 _pack_L = input_ids.shape[1]
                 _pack_W = logits_to_keep + max_left_pad
                 _pack_maxseg = max(_pack_nz_cpu) if _pack_nz_cpu else 0
                 # sliding-window models lose the per-sequence local window in a packed stream
                 _pack_sw = getattr(getattr(unwrapped_model, "config", None), "sliding_window", None)
                 _pack_sw_ok = not (isinstance(_pack_sw, int) and _pack_sw > 0 and _pack_maxseg > _pack_sw)
-                _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
                 _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
-                # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch)
-                if _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok and (_pack_ok is True or _pack_active >= 2) \
-                        and not (_pack_unsafe is not None and _pack_T >= _pack_unsafe):
+                # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch or a
+                # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
+                _pack_capped = _pack_unsafe is not None and _pack_T >= _pack_unsafe
+                if not _pack_capped:
+                    _pack_flat_ids = input_ids[_pack_keep].unsqueeze(0)
+                    _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
+                if (not _pack_capped) and _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok \
+                        and (_pack_ok is True or _pack_active >= 2):
                     _pack_psl = torch.tensor(_pack_nz_cpu, dtype = torch.int32, device = input_ids.device)
                     # reset 0-based position_ids per segment
                     _pack_pos = (_pack_keep.cumsum(dim = 1) - 1)[_pack_keep].unsqueeze(0)
@@ -2790,9 +2880,14 @@ def grpo_accumulated_loss(
                 all_entropies_list = [_pack_entropies]
             zipped_inputs = []
         else:
-            # packing rejected/unused: drop the packed graph before the padded loop so both don't co-reside
+            # packing rejected/unused: drop the packed graph and its index buffers before the padded loop so
+            # neither co-resides with it
             _pack_hidden = _pack_sel = _pack_result = None
             _pack_ent = _pack_entropies = None
+            if _pack_T is not None:
+                _pack_keep = _pack_lengths = _pack_flat_ids = _pack_pos = _pack_psl = None
+                _pack_nz_idx = _pack_within = _pack_cstart = _pack_ctgt = _pack_tgt = None
+                _pack_h = _pack_tid = _pack_ref = _pack_cm = None
 
         def to_device(tensor, device, non_blocking=True):
             if tensor is None: return None
@@ -3025,8 +3120,9 @@ def grpo_accumulated_loss(
         if _need_entropy:
             new_entropies = torch.cat(all_entropies_list, dim = 0)
             if _entropy_mask_on:
-                # TRL's own method, so its quantile population, ties and empty-batch rule match per version.
-                entropy_mask = trainer.get_high_entropy_mask(new_entropies.detach(), completion_mask, 1 - _entropy_quantile)
+                # TRL's own method, so its quantile population, ties and empty-batch rule match per version
+                # (multi-process TRL < 0.24 takes the padded gather so an empty rank cannot hang the rest).
+                entropy_mask = _grpo_high_entropy_mask(trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile)
                 kwargs["entropy_mask"] = entropy_mask
 
         # DeepSpeed (no scaler) only: undo training_step's 1/GAS, which transformers >= 5.19 skips when
