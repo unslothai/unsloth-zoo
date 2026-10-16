@@ -57,8 +57,10 @@ def _moe_router_gate_names(model):
     return names
 
 
-# Mirrors PEFT's _check_lora_target_modules_mamba in peft/tuners/tuners_utils.py.
-MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h"))
+# Mirrors PEFT's _check_lora_target_modules_mamba in peft/tuners/tuners_utils.py, plus
+# nemotron_h_puzzle (NVIDIA Nemotron 3.5 Bolt's language model), whose fused Mamba kernel reads
+# out_proj.weight directly and so skips a LoRA adapter on it.
+MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h", "nemotron_h_puzzle"))
 MAMBA_ONLY_LEAVES = frozenset(("out_proj", "conv1d"))
 # Mamba, Mamba2, Nemotron-H name the mixer `mixer`; Falcon-H1, Bamba, Zamba2 `mamba`.
 MAMBA_MIXER_NAMES = ("mixer", "mamba")
