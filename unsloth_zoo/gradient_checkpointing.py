@@ -159,6 +159,10 @@ def _grow_host_buffer(buffer, new_size):
         return _mark_host_buffer(buffer)
     new_bytes = max(old_bytes, new_size * buffer.element_size())
     pinned = getattr(buffer, HOST_PINNED_ATTR, False)
+    if not pinned:
+        # Contents are rewritten before every read, so a pageable slot can take a fresh block:
+        # pinned again once RAM allows, instead of staying pageable after one low-RAM moment.
+        return _new_host_buffer(new_size, buffer.dtype)
     # resize_ takes a new pinned block and hands the old one back to the host cache.
     if pinned and not _reserve_pinned(new_bytes):
         _release_pinned(old_bytes)

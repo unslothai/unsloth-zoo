@@ -189,6 +189,28 @@ def test_legacy_padded_model_releases_its_rows(monkeypatch, tmp_path):
     assert model.config.unsloth_vocab_pad_ids == list(range(n1 + 1, padded))
 
 
+@pytest.mark.parametrize("pad", [None, 64])
+def test_legacy_padded_model_releases_its_rows_when_growing(monkeypatch, tmp_path, pad):
+    # New tokens overflowing the legacy alignment rows grow the embedding: the rows from that
+    # resize must not hide the legacy layout, or the old alignment ids stay suppressed as tokens.
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    n1 = len(tokenizer)
+    padded = model.get_input_embeddings().weight.shape[0]
+    del model.config.unsloth_vocab_pad_ids
+    del model.config.unsloth_vocab_pad_suppressed_ids
+    model.save_pretrained(tmp_path / "m")
+    tokenizer.save_pretrained(tmp_path / "m")
+    model = AutoModelForCausalLM.from_pretrained(tmp_path / "m", torch_dtype = torch.float32)
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path / "m")
+    extra = [f"<unsloth_g{i}>" for i in range(padded - n1 + 1)]
+    add_new_tokens(model, tokenizer, new_tokens = extra, pad_to_multiple_of = pad)
+    assert len(tokenizer) == padded + 1
+    suppress = set(model.generation_config.suppress_tokens or [])
+    assert not suppress & set(range(n1, padded + 1))
+
+
 def test_alignment_rows_already_suppressed_are_still_recorded_for_vllm(monkeypatch):
     # vLLM only biases the recorded rows, so a row the caller already suppressed must be recorded
     # too; it stays the caller's suppression when it later becomes a token.
