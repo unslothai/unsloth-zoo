@@ -54,11 +54,11 @@ def _truncated_support_mask_impl(logits: torch.Tensor, top_k: int, top_p: float,
         kth = torch.topk(logits, top_k, dim = -1).values[:, -1:]
         logits = logits.masked_fill(logits < kth, float("-inf"))
     if top_p < 1.0:
-        sorted_logits = torch.sort(logits, dim = -1).values
+        # Per sorted position, as vLLM does: a cutoff inside a run of equal logits keeps only part of it.
+        sorted_logits, sorted_idx = torch.sort(logits, dim = -1)
         dropped = torch.cumsum(torch.softmax(sorted_logits, dim = -1), dim = -1) <= (1.0 - top_p)
-        dropped = dropped & (sorted_logits < sorted_logits[:, -1:])
-        threshold = sorted_logits.masked_fill(dropped, float("inf")).amin(dim = -1, keepdim = True)
-        logits = logits.masked_fill(logits < threshold, float("-inf"))
+        dropped[:, -1] = False
+        logits = logits.scatter(-1, sorted_idx, sorted_logits.masked_fill(dropped, float("-inf")))
     return torch.isfinite(logits)
 pass
 
@@ -78,12 +78,17 @@ pass
 # Mirrors vLLM v1 processed_logprobs: renormalised over what survives min_p, then top_k, then top_p
 # (sampler.py `sample`, topk_topp_sampler.py `apply_top_k_top_p`). The scored token is always kept
 # so a boundary disagreement between the trainer's recomputed set and the sampler's stays finite.
+# A scored token tied with the smallest kept logit counts as one of the kept tokens (vLLM keeps an
+# arbitrary subset of a tied run), not as an extra one.
 def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p):
     selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1))
     keep = _truncated_support_mask(chunk_logits.detach(), top_k, top_p, min_p)
     kept = chunk_logits.masked_fill(~keep, float("-inf"))
-    kept = kept.scatter(-1, chunk_index.unsqueeze(-1), selected_logits)
-    return selected_logits.squeeze(-1) - torch.logsumexp(kept, dim = -1)
+    logsumexp_values = torch.logsumexp(kept, dim = -1, keepdim = True)
+    smallest_kept = chunk_logits.detach().masked_fill(~keep, float("inf")).amin(dim = -1, keepdim = True)
+    outside = selected_logits.detach() < smallest_kept
+    logsumexp_values = torch.where(outside, torch.logaddexp(logsumexp_values, selected_logits), logsumexp_values)
+    return (selected_logits - logsumexp_values).squeeze(-1)
 pass
 
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
@@ -1311,9 +1316,28 @@ def _grpo_rollout_sampling_params(trainer, keys):
     then generation_kwargs, then Unsloth's vllm_sampling_params."""
     args = getattr(trainer, "args", None)
     params = {key: getattr(args, key, None) for key in keys}
+    vllm_sampling_params = getattr(args, "vllm_sampling_params", None)
+    vllm_overrides = getattr(vllm_sampling_params, "_set_kwargs", None)
+    if vllm_overrides is None and vllm_sampling_params is not None:
+        # A raw vllm.SamplingParams: unsloth's grpo_update_SamplingParams applies the fields that
+        # differ from SamplingParams()
+        vllm_overrides = {}
+        try:
+            defaults = type(vllm_sampling_params)()
+        except Exception:
+            defaults = None
+        for key in keys:
+            if hasattr(vllm_sampling_params, key):
+                value = getattr(vllm_sampling_params, key)
+                try:
+                    differs = bool(value != getattr(defaults, key, None))
+                except Exception:
+                    differs = True
+                if differs:
+                    vllm_overrides[key] = value
     for overrides in (
         getattr(args, "generation_kwargs", None),
-        getattr(getattr(args, "vllm_sampling_params", None), "_set_kwargs", None),
+        vllm_overrides,
     ):
         if isinstance(overrides, dict):
             for key in params:
@@ -2251,6 +2275,20 @@ def grpo_accumulated_loss(
             _support_kwargs = {}
         if _support_kwargs:
             from functools import partial
+            if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
+                # The recompute helper scores the full vocabulary only, so the kept set uses the plain helper
+                from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax
+                if lm_head_bias is not None:
+                    chunked_hidden_states_selective_log_softmax = partial(
+                        chunked_hidden_states_selective_log_softmax, lm_head_bias = lm_head_bias,
+                    )
+                if not getattr(trainer, "_unsloth_truncated_support_recompute_warned", False):
+                    from unsloth_zoo.log import logger as _zoo_logger
+                    _zoo_logger.warning(
+                        "Unsloth: UNSLOTH_GRPO_LOGPROB_RECOMPUTE=1 is not used with UNSLOTH_GRPO_TRUNCATED_SUPPORT=1; "
+                        "the logprobs are scored with the standard helper over the kept set."
+                    )
+                    trainer._unsloth_truncated_support_recompute_warned = True
             chunked_hidden_states_selective_log_softmax = partial(
                 chunked_hidden_states_selective_log_softmax, **_support_kwargs,
             )
@@ -2333,11 +2371,18 @@ def grpo_accumulated_loss(
         # No width dispatch in these helpers: unsloth rewrites every
         # `if <x>.shape[-1] == lm_head.shape[1]:` in this function and refuses any other spelling.
         def _hidden_logps_and_entropies(hidden_states, ids, chunks):
-            return _entropy_log_softmax(
+            logps, entropies = _entropy_log_softmax(
                 hidden_states, lm_head, ids, chunks,
                 logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
                 lm_head_bias = lm_head_bias, return_entropy = True,
             )
+            if _support_kwargs:
+                # Entropies stay full-vocabulary as TRL's; the logprobs take the kept set
+                logps = chunked_hidden_states_selective_log_softmax(
+                    hidden_states, lm_head, ids, chunks,
+                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                )
+            return logps, entropies
 
         def _raw_logits_entropies(logits):
             # The forward already scaled / softcapped these; same temperature as the logprobs.
