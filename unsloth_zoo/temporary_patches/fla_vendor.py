@@ -1032,20 +1032,41 @@ def _make_flashqla_chunk_gated_delta_rule(original):
                 _flashqla_state["skipped"].add(reason)
                 logger.info(f"Unsloth: FlashQLA skipped ({reason}); using fla.")
             return original(*args, **kwargs)
+        # A toolchain can accept a call and still fail to build its kernel (fp16 on SM100 with
+        # TileLang 0.1.12 and nvcc 13.1): fall back to fla, and stop retrying that dtype.
+        dtype = getattr(q, "dtype", None)
+        failed_key = (_flashqla_state["capability"], dtype)
+        failed_calls = _flashqla_state.setdefault("failed_calls", set())
+        if failed_key in failed_calls:
+            return original(*args, **kwargs)
         _flashqla_state["calls"] += 1
-        return flash_qla.chunk_gated_delta_rule(
-            q = q,
-            k = k,
-            v = v,
-            g = g,
-            beta = beta,
-            scale = a.get("scale"),
-            initial_state = initial_state,
-            output_final_state = a.get("output_final_state", False),
-            use_qk_l2norm_in_kernel = a.get("use_qk_l2norm_in_kernel", False),
-            cu_seqlens = cu_seqlens,
-            state_v_first = a.get("state_v_first", False),
-        )
+        try:
+            return flash_qla.chunk_gated_delta_rule(
+                q = q,
+                k = k,
+                v = v,
+                g = g,
+                beta = beta,
+                scale = a.get("scale"),
+                initial_state = initial_state,
+                output_final_state = a.get("output_final_state", False),
+                use_qk_l2norm_in_kernel = a.get("use_qk_l2norm_in_kernel", False),
+                cu_seqlens = cu_seqlens,
+                state_v_first = a.get("state_v_first", False),
+            )
+        except Exception as e:
+            import torch
+            if isinstance(e, getattr(torch.cuda, "OutOfMemoryError", ())):
+                raise
+            failed_calls.add(failed_key)
+            # A build failure dumps the generated source: report its first compiler error.
+            lines = [line.strip() for line in str(e).splitlines() if line.strip()]
+            message = next((line for line in lines if ": error:" in line), lines[0] if lines else "")
+            logger.warning(
+                f"Unsloth: FlashQLA failed on {dtype} ({type(e).__name__}: {message[:200]}); "
+                f"using the fla Triton kernels for {dtype}."
+            )
+            return original(*args, **kwargs)
 
     setattr(chunk_gated_delta_rule, _GDN_BACKEND_MARK, "flashqla")
     return chunk_gated_delta_rule
