@@ -3566,6 +3566,47 @@ def _vllm_supports_fp32_lm_head():
     return hasattr(LogitsProcessor, "_apply_head")
 
 
+def _patch_vllm_fp32_lm_head_excluded_quant():
+    # vLLM 0.26.0 - 0.28.x only accept UnquantizedEmbeddingMethod for a head_dtype override, but a
+    # quant config that excludes lm_head (ModelOpt FP8 / NVFP4) hands out UnquantizedLinearMethod,
+    # so _apply_head raises although the weight is plain. Backport the 0.29.0 guard: swap in an
+    # UnquantizedEmbeddingMethod for that one call. Only reached with UNSLOTH_VLLM_FP32_LM_HEAD=1.
+    try:
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
+    except Exception:
+        return False
+    original = getattr(LogitsProcessor, "_apply_head", None)
+    if original is None or getattr(original, "_unsloth_excluded_quant_patched", False):
+        return False
+    code = getattr(original, "__code__", None)
+    if code is None or "UnquantizedLinearMethod" in code.co_names:
+        # vLLM >= 0.29.0 already accepts both.
+        return False
+    embedding_method = UnquantizedEmbeddingMethod()
+
+    def _apply_head(self, lm_head, hidden_states, embedding_bias):
+        quant_method = getattr(lm_head, "quant_method", None)
+        if (
+            getattr(self, "head_dtype", None) is not None
+            and self.head_dtype != hidden_states.dtype
+            and isinstance(quant_method, UnquantizedLinearMethod)
+            and not isinstance(quant_method, UnquantizedEmbeddingMethod)
+        ):
+            lm_head.quant_method = embedding_method
+            try:
+                return original(self, lm_head, hidden_states, embedding_bias)
+            finally:
+                lm_head.quant_method = quant_method
+        return original(self, lm_head, hidden_states, embedding_bias)
+
+    _apply_head._unsloth_excluded_quant_patched = True
+    _apply_head.__wrapped__ = original
+    LogitsProcessor._apply_head = _apply_head
+    return True
+
+
 def _vllm_fp32_lm_head_overrides(training):
     # Raises rather than half-applying: the trainer reads the same flag, and only both sides in fp32 pays off.
     if not training or not _fp32_lm_head_requested():
@@ -3575,6 +3616,7 @@ def _vllm_fp32_lm_head_overrides(training):
             f"Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 needs vLLM >= 0.26.0 for an fp32 lm_head, "
             f"but found vLLM {vllm_version}. Upgrade vLLM or unset UNSLOTH_VLLM_FP32_LM_HEAD."
         )
+    _patch_vllm_fp32_lm_head_excluded_quant()
     return {"head_dtype": "float32"}
 
 
