@@ -85,6 +85,80 @@ def _chunk_logits(hidden, weight, bias, transforms):
     return _transform_logits(_linear_float32(hidden, weight, bias), *transforms)
 
 
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def _sliced_backward(ctx, hidden, weight, bias, labels, lse, grad_logps):
+    # A trainable half precision head: a float32 vocab x hidden accumulator plus per chunk GEMM and
+    # cast copies cost about 10 x vocab x hidden bytes, and summing chunks in the head dtype loses
+    # bits every chunk. Loop over vocab slices instead, each summed over every row chunk in a float32
+    # accumulator of about one chunk's size: the head gradient costs what autograd's own does, with
+    # the float32 accumulation of the per chunk loop.
+    need_hidden, need_weight, need_bias = ctx.needs_input_grad[:3]
+    scale_multiply, scale_divide, softcapping = ctx.transforms
+    scale = 1.0
+    if scale_multiply != 0.0:
+        scale *= scale_multiply
+    if scale_divide != 0.0:
+        scale /= scale_divide
+    n_rows = hidden.shape[0]
+    vocab_size, hidden_size = weight.shape
+    acc_dtype = torch.promote_types(weight.dtype, torch.float32)
+    n_slices = max(1, min(vocab_size, -(-vocab_size * hidden_size * 4 // _target_chunk_bytes())))
+    slice_size = -(-vocab_size // n_slices)
+    # Keep each rows x slice logits block the size of a rows x vocab chunk.
+    rows = max(1, min(ctx.rows * (-(-vocab_size // slice_size)), max(n_rows, 1)))
+    grad_hidden = (
+        torch.zeros((n_rows, hidden_size), dtype = acc_dtype, device = weight.device)
+        if need_hidden else None
+    )
+    grad_weight = torch.empty_like(weight)
+    grad_bias = (
+        torch.zeros(bias.shape, dtype = acc_dtype, device = bias.device)
+        if (need_bias and bias is not None) else None
+    )
+    if grad_logps is None:
+        grad_logps = torch.zeros(n_rows, dtype = acc_dtype, device = hidden.device)
+    with torch.autocast(device_type = hidden.device.type, enabled = False):
+        for first in range(0, vocab_size, slice_size):
+            last = min(first + slice_size, vocab_size)
+            weight_slice = weight[first:last]
+            bias_slice = bias[first:last] if bias is not None else None
+            weight_acc = torch.zeros((last - first, hidden_size), dtype = acc_dtype, device = weight.device)
+            for start in range(0, n_rows, rows):
+                end = min(start + rows, n_rows)
+                chunk_hidden = hidden[start:end].to(device = weight.device, dtype = weight.dtype)
+                logits = _chunk_logits(chunk_hidden, weight_slice, bias_slice, ctx.transforms)
+                grad_logits = (logits - lse[start:end].to(logits).unsqueeze(-1)).exp_()
+                grad_logits.neg_()
+                target = labels[start:end].to(logits.device) - first
+                inside = (target >= 0) & (target < last - first)
+                grad_logits.scatter_add_(
+                    -1, target.clamp(0, last - first - 1).unsqueeze(-1),
+                    inside.to(grad_logits.dtype).unsqueeze(-1),
+                )
+                grad_logits.mul_(grad_logps[start:end].to(grad_logits).unsqueeze(-1))
+                if softcapping != 0.0:
+                    grad_logits.mul_(1.0 - (logits / softcapping).square())
+                del logits
+                if scale != 1.0:
+                    grad_logits.mul_(scale)
+                if grad_bias is not None:
+                    grad_bias[first:last] += grad_logits.sum(0)
+                grad_logits = grad_logits.to(weight.dtype)
+                if need_hidden:
+                    grad_hidden[start:end] += grad_logits @ weight_slice
+                weight_acc += grad_logits.t() @ chunk_hidden
+                del grad_logits
+            grad_weight[first:last] = weight_acc
+            del weight_acc
+    if grad_hidden is not None:
+        grad_hidden = grad_hidden.to(device = hidden.device, dtype = hidden.dtype)
+    if grad_bias is not None:
+        grad_bias = grad_bias.to(bias.dtype)
+    return grad_hidden, grad_weight, grad_bias, None, None, None, None, None
+
+
 class _ChunkedLinearTokenLogps(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, bias, labels, rows, transforms, want_mean, want_lssp):
@@ -94,11 +168,16 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
         logps = torch.empty(n_rows, dtype = dtype, device = device)
         mean_logits = torch.empty(n_rows if want_mean else 0, dtype = dtype, device = device)
         log_sum_sq_probs = torch.empty(n_rows if want_lssp else 0, dtype = dtype, device = device)
+        # A trainable half precision head runs the vocab sliced backward, which needs each row's lse.
+        sliced = ctx.needs_input_grad[1] and weight.dtype in _HALF_DTYPES
+        saved_lse = torch.empty(n_rows if sliced else 0, dtype = dtype, device = device)
         with torch.autocast(device_type = device.type, enabled = False):
             for start in range(0, n_rows, rows):
                 end = min(start + rows, n_rows)
                 logits = _chunk_logits(hidden[start:end], weight, bias, transforms)
                 lse = logits.logsumexp(-1)
+                if sliced:
+                    saved_lse[start:end] = lse.to(device)
                 target = labels[start:end].to(logits.device).unsqueeze(-1)
                 logps[start:end] = (logits.gather(-1, target).squeeze(-1) - lse).to(device)
                 if want_mean:
@@ -106,7 +185,8 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
                 if want_lssp:
                     log_sum_sq_probs[start:end] = ((2.0 * logits).logsumexp(-1) - 2.0 * lse).to(device)
                 del logits
-        ctx.save_for_backward(hidden, weight, bias, labels)
+        ctx.save_for_backward(hidden, weight, bias, labels, saved_lse)
+        ctx.sliced = sliced
         ctx.rows = rows
         ctx.transforms = transforms
         ctx.mark_non_differentiable(mean_logits, log_sum_sq_probs)
@@ -114,8 +194,10 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_logps, grad_mean, grad_lssp):
-        hidden, weight, bias, labels = ctx.saved_tensors
+        hidden, weight, bias, labels, saved_lse = ctx.saved_tensors
         need_hidden, need_weight, need_bias = ctx.needs_input_grad[:3]
+        if ctx.sliced and need_weight:
+            return _sliced_backward(ctx, hidden, weight, bias, labels, saved_lse, grad_logps)
         scale_multiply, scale_divide, softcapping = ctx.transforms
         scale = 1.0
         if scale_multiply != 0.0:
@@ -124,13 +206,9 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
             scale /= scale_divide
         n_rows = hidden.shape[0]
         grad_hidden = torch.zeros_like(hidden) if need_hidden else None
-        # float32 bias accumulator: summing per-chunk gradients in bf16 loses bits every chunk.
+        # float32 accumulators: summing per-chunk head gradients in bf16 loses bits every chunk.
         acc_dtype = torch.promote_types(weight.dtype, torch.float32)
-        # The head gradient is vocab x hidden, so it is accumulated in place in the head dtype like
-        # autograd's own gradient: a float32 accumulator plus per chunk GEMM and cast copies would add
-        # about 8 x vocab x hidden bytes of peak memory for a trainable half precision head. addmm_
-        # still sums each chunk in float32 and rounds once per chunk.
-        grad_weight = torch.zeros_like(weight) if need_weight else None
+        grad_weight = torch.zeros(weight.shape, dtype = acc_dtype, device = weight.device) if need_weight else None
         grad_bias = (
             torch.zeros(bias.shape, dtype = acc_dtype, device = bias.device)
             if (need_bias and bias is not None) else None
@@ -158,8 +236,10 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
                 if need_hidden:
                     grad_hidden[start:end] = (grad_logits @ weight).to(device = hidden.device, dtype = hidden.dtype)
                 if need_weight:
-                    grad_weight.addmm_(grad_logits.t(), chunk_hidden)
+                    grad_weight.add_((grad_logits.t() @ chunk_hidden).to(acc_dtype))
                 del grad_logits
+        if grad_weight is not None:
+            grad_weight = grad_weight.to(weight.dtype)
         if grad_bias is not None:
             grad_bias = grad_bias.to(bias.dtype)
         return grad_hidden, grad_weight, grad_bias, None, None, None, None, None

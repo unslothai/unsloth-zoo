@@ -143,14 +143,67 @@ def test_out_of_memory_does_not_disable_float32_gemm(monkeypatch):
     assert module._MM_OUT_DTYPE_OK.get(("cpu", torch.bfloat16), True) is True
 
 
+def _head_grad_error(dtype, n_rows, chunk_size, vocab = 512, hidden = 64, bias = False, softcap = 0.0):
+    generator = torch.Generator().manual_seed(0)
+    states = torch.randn(1, n_rows, hidden, generator = generator).to(dtype).requires_grad_(True)
+    weight = (torch.randn(vocab, hidden, generator = generator) * 0.3).to(dtype).requires_grad_(True)
+    head_bias = (torch.randn(vocab, generator = generator) * 0.1).to(dtype).requires_grad_(True) if bias else None
+    labels = torch.randint(0, vocab, (1, n_rows), generator = generator)
+    mask = torch.ones(1, n_rows, dtype = torch.bool)
+    out = fused_linear_token_logps(
+        states, weight, head_bias, labels, mask, logit_softcapping = softcap, chunk_size = chunk_size,
+    )["per_token_logps"]
+    out.sum().backward()
+    w64 = weight.detach().double().requires_grad_(True)
+    s64 = states.detach().double().requires_grad_(True)
+    b64 = head_bias.detach().double().requires_grad_(True) if bias else None
+    logits = F.linear(s64, w64, b64)
+    if softcap != 0.0:
+        logits = softcap * torch.tanh(logits / softcap)
+    want = logits.log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    want.sum().backward()
+    rel = lambda got, ref: ((got.double() - ref).norm() / ref.norm()).item()
+    errors = {"weight": rel(weight.grad, w64.grad), "hidden": rel(states.grad, s64.grad)}
+    if bias:
+        errors["bias"] = rel(head_bias.grad, b64.grad)
+    assert weight.grad.dtype == dtype and states.grad.dtype == dtype
+    return errors
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_trainable_head_grad_does_not_degrade_with_many_chunks(dtype):
+    # 512 one row chunks must not round the head gradient 512 times: the error stays within 25% of a
+    # single chunk's (a head dtype accumulator measured 7.5x worse for bf16, 7.8x for fp16).
+    one = _head_grad_error(dtype, 512, 512)
+    many = _head_grad_error(dtype, 512, 1)
+    assert many["weight"] <= 1.25 * one["weight"]
+    assert many["hidden"] <= 1.25 * one["hidden"]
+    # Stated bounds against the float64 oracle.
+    assert many["weight"] < (5e-3 if dtype == torch.bfloat16 else 6e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_trainable_head_grad_over_vocab_slices(monkeypatch, dtype):
+    # Force several vocab slices (with a bias and softcapping) and compare against one slice.
+    import unsloth_zoo.fused_losses.preference_loss as module
+    whole = _head_grad_error(dtype, 96, 7, vocab = 200, hidden = 32, bias = True, softcap = 30.0)
+    monkeypatch.setattr(module, "_target_chunk_bytes", lambda: 200 * 32 * 4 // 5)
+    sliced = _head_grad_error(dtype, 96, 7, vocab = 200, hidden = 32, bias = True, softcap = 30.0)
+    for name in whole:
+        assert sliced[name] <= 1.25 * whole[name] + 1e-6, name
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_trainable_head_grad_has_no_head_sized_float32_temporaries(dtype):
-    # A trainable head accumulates its vocab x hidden gradient in place in the head dtype; a float32
-    # accumulator plus per chunk head sized GEMM / cast copies used to add GiBs of peak memory.
+def test_trainable_head_grad_has_no_head_sized_float32_temporaries(monkeypatch, dtype):
+    # A trainable half precision head runs vocab sliced backward: its float32 accumulators are one
+    # slice, so backward creates no head sized tensor in another dtype (a float32 accumulator plus
+    # per chunk head sized GEMM / cast copies used to add GiBs of peak memory).
     from torch.utils._python_dispatch import TorchDispatchMode
+    import unsloth_zoo.fused_losses.preference_loss as module
 
     torch.manual_seed(0)
     vocab, hidden = 64, 16
+    monkeypatch.setattr(module, "_target_chunk_bytes", lambda: vocab * hidden * 4 // 4)
     states = torch.randn(2, 9, hidden, dtype = dtype, requires_grad = True)
     weight = (torch.randn(vocab, hidden) * 0.3).to(dtype).requires_grad_(True)
     labels = torch.randint(0, vocab, (2, 9))
