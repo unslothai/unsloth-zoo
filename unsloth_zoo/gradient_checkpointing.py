@@ -1838,6 +1838,8 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         # Only devices that were used: indexing an untouched slot would allocate it.
         for buffer in _allocated_slots(GPU_BUFFERS):
             if hasattr(buffer, "resize_"): buffer.resize_(0)
+        # resize_(0) keeps the storage: drop the loop reference so empty_cache() below can release it.
+        buffer = None
         if GPU_BUFFERS_B is not None:
             _free_gpu_buffers_b()
         CPU_BUFFERS = None
