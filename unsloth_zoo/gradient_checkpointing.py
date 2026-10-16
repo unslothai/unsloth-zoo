@@ -243,6 +243,21 @@ def _block_fits_host_ram(block):
     return block + min(_PIN_HEADROOM_BYTES, vm.total // 10) <= vm.available
 
 
+def _empty_host_cache():
+    """Return cached free pinned blocks to the OS. A pinned buffer that grows leaves its old block
+    in torch's host cache, and once growth goes pageable nothing reuses it. True if any were freed."""
+    global GC_PINNED_BYTES
+    if DEVICE_TYPE not in ("cuda", "hip"): return False
+    ours = sum(k * v for k, v in _PINNED_CACHED.items())
+    free = _host_allocator_free_bytes()
+    if not (ours if free is None else free): return False
+    try: torch._C._host_emptyCache()
+    except Exception: return False
+    GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - ours)
+    _PINNED_CACHED.clear()
+    return True
+
+
 def _storage_bytes(buffer):
     # resize_ never shrinks a storage, so numel can understate what stays pinned.
     try: return buffer.untyped_storage().nbytes()
@@ -289,7 +304,7 @@ def _reserve_pinned(nbytes):
             # A cached block taken by another pinned user makes our next request a new one.
             used = max(used, held - _HOST_HELD_BASELINE)
     if GC_PINNED_CAP == _PIN_PER_BLOCK:
-        if not _block_fits_host_ram(block):
+        if not _block_fits_host_ram(block) and not (_empty_host_cache() and _block_fits_host_ram(block)):
             if not _WARNED_ABOUT_PINNED_CAP:
                 _WARNED_ABOUT_PINNED_CAP = True
                 print(
