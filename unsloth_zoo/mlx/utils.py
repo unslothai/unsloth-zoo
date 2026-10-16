@@ -487,7 +487,7 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
         mx.array.__getitem__ = current._unsloth_index_original
 
 
-# Training SDPA runs MLX's unfused fallback, scoring every key even outside the window.
+# Array-masked training SDPA runs MLX's unfused fallback, scoring every key even outside the window.
 _TRAINING_ATTENTION_BLOCK = 512
 _WINDOW_MASKS = {}
 
@@ -563,10 +563,21 @@ def _windowing_pays(q, k, block):
     return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
 
 
+def _as_array_mask(q, k, mask):
+    T, S = q.shape[-2], k.shape[-2]
+    if mask is None:
+        return mx.ones((T, S), dtype=mx.bool_)
+    return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
+
+
 def _wrap_training_sdpa(original):
     @wraps(original)
     def wrapper(q, k, v, *, scale, mask=None, **kwargs):
         T = q.shape[-2]
+        # mlx 0.32.4's fused VJP raises for the vector kernel (<= 8 queries) and sinks: an array mask goes unfused.
+        if (T <= 8 or kwargs.get("sinks") is not None) and (
+                mask is None or isinstance(mask, str) and mask == "causal") and mlx_training_patches_active():
+            mask = _as_array_mask(q, k, mask)
         if (isinstance(mask, mx.array) and mask.shape == (T, T) and k.shape[-2] == T
                 and all(value is None for value in kwargs.values())):
             window = _registered_window(mask)

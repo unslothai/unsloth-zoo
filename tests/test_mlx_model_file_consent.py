@@ -170,15 +170,17 @@ def test_guard_is_idempotent(fake_loaders):
     assert not getattr(first_lm.__wrapped__, "_unsloth_model_file_guard", False)
 
 
-def test_releases_that_gate_model_file_are_left_alone(monkeypatch):
-    from unsloth_zoo.mlx.loader import _install_mlx_model_file_guard
+def test_releases_with_their_own_gate_receive_the_scoped_trust(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx.loader import _install_mlx_model_file_guard, _scoped_mlx_model_file_trust
 
-    # mlx-lm >= 0.32 takes trust_remote_code itself; mlx-vlm < 0.7 has no model_path.
+    # mlx-lm >= 0.32 refuses model_file unless trust_remote_code=True; mlx-vlm < 0.7 has no model_path.
     lm_utils = types.ModuleType("mlx_lm.utils")
     vlm_utils = types.ModuleType("mlx_vlm.utils")
 
-    def load_model(model_path, lazy=False, strict=True, model_config={}, trust_remote_code=False):
-        return "model", {}
+    def load_model(model_path, lazy=False, strict=True, model_config=None, trust_remote_code=False):
+        if json.loads((Path(model_path) / "config.json").read_text()).get("model_file") and not trust_remote_code:
+            raise ValueError("refused by mlx-lm")
+        return "model", trust_remote_code
 
     def get_model_and_args(config):
         return None, config["model_type"]
@@ -188,8 +190,20 @@ def test_releases_that_gate_model_file_are_left_alone(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx_lm.utils", lm_utils)
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", vlm_utils)
     _install_mlx_model_file_guard()
-    assert lm_utils.load_model is load_model
     assert vlm_utils.get_model_and_args is get_model_and_args
+    model_path, _ = _model_dir(tmp_path, model_file=True)
+
+    @_scoped_mlx_model_file_trust
+    def from_pretrained(model_name, trust_remote_code=False):
+        return lm_utils.load_model(model_name)
+
+    with pytest.raises(ValueError, match="trust_remote_code=True"):
+        from_pretrained(model_path)
+    assert from_pretrained(model_path, trust_remote_code=True) == ("model", True)
+    # A direct caller's own consent counts once the guard is installed.
+    assert lm_utils.load_model(model_path, trust_remote_code=True) == ("model", True)
+    with pytest.raises(ValueError, match="trust_remote_code=True"):
+        lm_utils.load_model(model_path, trust_remote_code=False)
 
 
 def test_from_pretrained_is_scoped():
