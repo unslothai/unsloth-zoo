@@ -701,10 +701,18 @@ def _flash_sdpa_accepts(device, dtype, num_heads, num_kv_heads, head_dim, dropou
     if accepts is not None:
         return accepts
     try:
-        query = torch.empty((1, num_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
-        key_value = torch.empty((1, num_kv_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
-        params = torch.backends.cuda.SDPAParams(query, key_value, key_value, None, dropout, True, True)
-        accepts = torch.backends.cuda.can_use_flash_attention(params, False) is True
+        # The arch checks read the current device's properties, so probe on the embeds' device.
+        with torch.cuda.device(device):
+            query = torch.empty((1, num_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
+            key_value = torch.empty((1, num_kv_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
+            try:
+                params = torch.backends.cuda.SDPAParams(query, key_value, key_value, None, dropout, True, True)
+            except TypeError:
+                # torch < 2.5 has no enable_gqa argument, so only equal head counts can be probed.
+                if num_heads != num_kv_heads:
+                    raise
+                params = torch.backends.cuda.SDPAParams(query, key_value, key_value, None, dropout, True)
+            accepts = torch.backends.cuda.can_use_flash_attention(params, False) is True
     except Exception:
         accepts = False
     _FLASH_SDPA_ACCEPTS_CACHE[key] = accepts

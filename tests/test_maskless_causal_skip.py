@@ -649,3 +649,50 @@ def test_flash_sdpa_check_matches_the_real_dispatcher():
         expected = torch.backends.cuda.flash_sdp_enabled() and torch.cuda.get_device_capability(device) >= (8, 0) \
             and torch.backends.cuda.can_use_flash_attention(params, False)
         assert misc._flash_sdpa_takes_causal(config, embeds) is bool(expected)
+
+
+class _FakeProbe:
+    """Stands in for torch's CUDA probe on a CPU host: records the current device per flash check."""
+    def __init__(self, monkeypatch, gqa_argument = True, accepts_on = ("cuda:1",)):
+        import contextlib
+        self.current = "cuda:0"
+        self.checked_on = []
+        self.param_counts = []
+        real_empty = torch.empty
+        monkeypatch.setattr(misc, "_FLASH_SDPA_ACCEPTS_CACHE", {})
+        monkeypatch.setattr(torch, "empty", lambda shape, device = None, **kwargs: real_empty(shape, **kwargs))
+        @contextlib.contextmanager
+        def device(target):
+            previous, self.current = self.current, str(target)
+            try:
+                yield
+            finally:
+                self.current = previous
+        monkeypatch.setattr(torch.cuda, "device", device)
+        def params(*args):
+            if len(args) == 7 and not gqa_argument:
+                raise TypeError("SDPAParams takes 6 arguments")
+            self.param_counts.append(len(args))
+            return args
+        monkeypatch.setattr(torch.backends.cuda, "SDPAParams", params)
+        def can_use(params, debug = False):
+            self.checked_on.append(self.current)
+            return self.current in accepts_on
+        monkeypatch.setattr(torch.backends.cuda, "can_use_flash_attention", can_use)
+
+
+def test_flash_probe_runs_on_the_embeds_device(monkeypatch):
+    # torch reads the current device's arch: with device_map across mixed GPUs a cuda:1 probe must not ask cuda:0.
+    probe = _FakeProbe(monkeypatch, accepts_on = ("cuda:1",))
+    assert misc._flash_sdpa_accepts("cuda:1", torch.bfloat16, 8, 1, 256, 0.1, True) is True
+    assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 1, 256, 0.1, True) is False
+    assert probe.checked_on == ["cuda:1", "cuda:0"]
+    assert probe.current == "cuda:0"
+
+
+def test_flash_probe_without_enable_gqa_argument(monkeypatch):
+    # torch 2.4 SDPAParams has no enable_gqa: MHA is still probed, GQA keeps the mask.
+    probe = _FakeProbe(monkeypatch, gqa_argument = False, accepts_on = ("cuda:0",))
+    assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 8, 128, 0.0, True) is True
+    assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 1, 128, 0.0, True) is False
+    assert probe.param_counts == [6]
