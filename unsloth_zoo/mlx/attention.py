@@ -18,6 +18,7 @@
 once the `[B, HQ, L, S]` scores the runtimes materialize would cost more than the copy, and Metal kernels for
 Qwen Sparse Attention (QSA) in mlx-vlm's qwen4_exp."""
 import functools
+import hashlib
 import math
 import os
 import re
@@ -408,3 +409,257 @@ def select_blocks(scores, complete, topk, head_dim):
         output_shapes = [(B, L, topk), (B * L, max(nb, 1))], output_dtypes = [mx.int32, mx.uint32],
     )
     return out
+
+
+# Tensor-unit QSA prefill attention over the selected blocks (inexact: fp32 sums in another order).
+_PREFILL_HEADER = """
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+#define UNROLL _Pragma("clang loop unroll(full)")
+
+// MLX's 16x16 tensor-unit fragment and its 16x32x16 matmul
+// (mlx/backend/metal/kernels/steel/attn/nax.h, Copyright © 2025 Apple Inc., MIT).
+template <typename C, typename A, typename B, bool TB>
+inline void nax_mma(thread vec<C, 8>& c0, thread vec<C, 8>& c1, const thread vec<A, 8>& a,
+                    const thread vec<B, 8>& b0, const thread vec<B, 8>& b1) {
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16, 32, 16, false, TB, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+  auto ca = op.template get_left_input_cooperative_tensor<A, B, C>();
+  auto cb = op.template get_right_input_cooperative_tensor<A, B, C>();
+  auto cc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), C>();
+  UNROLL for (short i = 0; i < 8; i++) {
+    ca[i] = a[i];
+    cb[i] = b0[i];
+    cb[8 + i] = b1[i];
+    cc[i] = c0[i];
+    cc[8 + i] = c1[i];
+  }
+  op.run(ca, cb, cc);
+  UNROLL for (short i = 0; i < 8; i++) {
+    c0[i] = cc[i];
+    c1[i] = cc[8 + i];
+  }
+}
+
+template <typename T>
+inline T row_max(T x) {
+  x = metal::max(x, simd_shuffle_xor(x, ushort(1)));
+  return metal::max(x, simd_shuffle_xor(x, ushort(8)));
+}
+
+template <typename T>
+inline T row_sum(T x) {
+  x += simd_shuffle_xor(x, ushort(1));
+  return x + simd_shuffle_xor(x, ushort(8));
+}
+"""
+
+# MLX's NAX flash attention (steel_attention_nax.h) over gathered keys. A threadgroup is one (query row, KV head);
+# fragment rows are that KV head's query heads. Simdgroup sg scores half of D, the halves meet in threadgroup
+# memory, and sg accumulates P V for its half of D. Keys come 32 at a time from 8 units: the row's sorted picks
+# (-1 first), then its partial tail block.
+_PREFILL_SOURCE = """
+    constexpr int D = 256;
+    const ushort lane = thread_index_in_simdgroup;
+    const int sg = simdgroup_index_in_threadgroup;
+    const int tq = threadgroup_position_in_grid.x;
+    const int kvh = threadgroup_position_in_grid.y;
+    const int kL = params[0];
+    const int L = params[1];
+    const float scale2 = scale[0] * 1.44269504089f;
+    threadgroup float partial[2 * 2 * 32 * 16];
+
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) | ((lane >> 1) & 3);
+    const short fn = ((qid & 2) | (lane & 1)) * 4;
+
+    const int qe = query_ends[tq];
+    const int complete = qe >> 2;
+    const int nsel = min(TOPK, complete);
+    const int ntail = qe - (complete << 2);
+    const int U = nsel + (ntail > 0 ? 1 : 0);
+    const device int* blk = sel + size_t(tq) * TOPK + (TOPK - nsel);
+    // mlx-vlm sends no pick outside [0, complete); skipping them keeps any input from addressing past the keys.
+    auto unit_block = [&](int u) -> int {
+      if (u < nsel) {
+        const int b = blk[u];
+        return uint(b) < uint(complete) ? b : -1;
+      }
+      return u < U ? complete : -1;
+    };
+
+    bool row_ok[2];
+    const device bfloat* qrow[2];
+    UNROLL for (short i = 0; i < 2; i++) {
+      row_ok[i] = fm + 8 * i < GQA;
+      qrow[i] = (const device bfloat*)q + (size_t(kvh * GQA + (row_ok[i] ? fm + 8 * i : 0)) * L + tq) * D + fn;
+    }
+    const device bfloat* kh = (const device bfloat*)k + size_t(kvh) * kL * D + fn;
+    const device bfloat* vh = (const device bfloat*)v + size_t(kvh) * kL * D + sg * 128 + fn;
+
+    vec<float, 8> o[8];
+    UNROLL for (short d = 0; d < 8; d++) o[d] = 0.0f;
+    float m[2] = {-INFINITY, -INFINITY};
+    float l[2] = {0.0f, 0.0f};
+
+    for (int u0 = 0; u0 < U; u0 += 8) {
+      // Key rows this lane loads (fragment f, element row i) and visible tokens of its score columns.
+      uint krow[2][2];
+      int nvis[2];
+      UNROLL for (short f = 0; f < 2; f++) {
+        UNROLL for (short i = 0; i < 2; i++) {
+          const short slot = 16 * f + fm + 8 * i;
+          const int b = unit_block(u0 + (slot >> 2));
+          krow[f][i] = b < 0 ? 0u : uint(min(4 * b + (slot & 3), kL - 1));
+        }
+        const int u = u0 + ((16 * f + fn) >> 2);
+        const int b = unit_block(u);
+        nvis[f] = b < 0 ? 0 : (u < nsel ? 4 : ntail);
+      }
+
+      vec<float, 8> s[2];
+      s[0] = 0.0f;
+      s[1] = 0.0f;
+      UNROLL for (short d = sg * 8; d < sg * 8 + 8; d++) {
+        vec<bfloat, 8> qa, k0, k1;
+        UNROLL for (short i = 0; i < 2; i++) {
+          const vec<bfloat, 4> qv = row_ok[i] ? *(const device vec<bfloat, 4>*)(qrow[i] + 16 * d) : vec<bfloat, 4>(0);
+          const vec<bfloat, 4> a = *(const device vec<bfloat, 4>*)(kh + krow[0][i] * D + 16 * d);
+          const vec<bfloat, 4> c = *(const device vec<bfloat, 4>*)(kh + krow[1][i] * D + 16 * d);
+          UNROLL for (short j = 0; j < 4; j++) {
+            qa[4 * i + j] = qv[j];
+            k0[4 * i + j] = a[j];
+            k1[4 * i + j] = c[j];
+          }
+        }
+        nax_mma<float, bfloat, bfloat, true>(s[0], s[1], qa, k0, k1);
+      }
+      threadgroup float* buf = partial + ((u0 >> 3) & 1) * 1024 + lane * 16;
+      UNROLL for (short e = 0; e < 8; e++) {
+        buf[sg * 512 + e] = s[0][e];
+        buf[sg * 512 + 8 + e] = s[1][e];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      UNROLL for (short e = 0; e < 8; e++) {
+        s[0][e] += buf[(1 - sg) * 512 + e];
+        s[1][e] += buf[(1 - sg) * 512 + 8 + e];
+      }
+
+      UNROLL for (short i = 0; i < 2; i++) {
+        float smax = -INFINITY;
+        UNROLL for (short f = 0; f < 2; f++) {
+          UNROLL for (short j = 0; j < 4; j++) {
+            const float x = j < nvis[f] ? s[f][4 * i + j] * scale2 : -INFINITY;
+            s[f][4 * i + j] = x;
+            smax = metal::max(smax, x);
+          }
+        }
+        const float mnew = metal::max(m[i], row_max(smax));
+        const float mref = mnew == -INFINITY ? 0.0f : mnew;
+        const float factor = fast::exp2(m[i] - mref);
+        m[i] = mnew;
+        float psum = 0.0f;
+        UNROLL for (short f = 0; f < 2; f++) {
+          UNROLL for (short j = 0; j < 4; j++) {
+            const float p = fast::exp2(s[f][4 * i + j] - mref);
+            s[f][4 * i + j] = p;
+            psum += p;
+          }
+        }
+        l[i] = l[i] * factor + row_sum(psum);
+        UNROLL for (short d = 0; d < 8; d++) {
+          UNROLL for (short j = 0; j < 4; j++) o[d][4 * i + j] *= factor;
+        }
+      }
+
+      // The tensor units read float operands at 10 mantissa bits; a half part plus its remainder keeps ~22 bits of P.
+      vec<float, 8> hi[2], lo[2];
+      UNROLL for (short f = 0; f < 2; f++) {
+        UNROLL for (short e = 0; e < 8; e++) {
+          hi[f][e] = float(half(s[f][e]));
+          lo[f][e] = s[f][e] - hi[f][e];
+        }
+      }
+      UNROLL for (short d = 0; d < 8; d += 2) {
+        UNROLL for (short f = 0; f < 2; f++) {
+          vec<bfloat, 8> v0, v1;
+          UNROLL for (short i = 0; i < 2; i++) {
+            const vec<bfloat, 4> a = *(const device vec<bfloat, 4>*)(vh + krow[f][i] * D + 16 * d);
+            const vec<bfloat, 4> c = *(const device vec<bfloat, 4>*)(vh + krow[f][i] * D + 16 * d + 16);
+            UNROLL for (short j = 0; j < 4; j++) {
+              v0[4 * i + j] = a[j];
+              v1[4 * i + j] = c[j];
+            }
+          }
+          nax_mma<float, float, bfloat, false>(o[d], o[d + 1], hi[f], v0, v1);
+          nax_mma<float, float, bfloat, false>(o[d], o[d + 1], lo[f], v0, v1);
+        }
+      }
+    }
+
+    UNROLL for (short i = 0; i < 2; i++) {
+      if (!row_ok[i]) continue;
+      const float rr = l[i] == 0.0f ? 0.0f : 1.0f / l[i];
+      device bfloat* orow = (device bfloat*)out + (size_t(kvh * GQA + fm + 8 * i) * L + tq) * D + sg * 128 + fn;
+      UNROLL for (short d = 0; d < 8; d++) {
+        vec<bfloat, 4> w;
+        UNROLL for (short j = 0; j < 4; j++) w[j] = bfloat(o[d][4 * i + j] * rr);
+        *(device vec<bfloat, 4>*)(orow + 16 * d) = w;
+      }
+    }"""
+
+PREFILL_PROBE_KEY = "qsa_prefill:" + hashlib.sha256((_PREFILL_HEADER + _PREFILL_SOURCE).encode()).hexdigest()[:12]
+PREFILL_MIN_ROWS = 64  # fewer rows run faster on the native kernel at long contexts
+
+
+@functools.cache
+def _prefill_kernel():
+    return mx.fast.metal_kernel(
+        name = "unsloth_qsa_prefill", input_names = ["q", "k", "v", "sel", "query_ends", "params", "scale"],
+        output_names = ["out"], header = _PREFILL_HEADER, source = _PREFILL_SOURCE,
+    )
+
+
+def fast_prefill_supported(queries, keys, block_indices, block_size):
+    """Whether `fast_prefill_attention` covers this indexed prefill call: the measured Qwen3.8 layout."""
+    B, H, L, D = queries.shape
+    return (B == 1 and H == 24 and keys.shape[1] == 2 and D == 256 and block_size == 4
+            and block_indices.shape[-1] == 512 and L >= PREFILL_MIN_ROWS and queries.dtype == mx.bfloat16)
+
+
+def fast_prefill_attention(queries, keys, values, block_indices, query_ends, scale):
+    """mlx-vlm's indexed QSA prefill attention on the tensor units, for `fast_prefill_supported` calls."""
+    _, H, L, D = queries.shape
+    return _prefill_kernel()(
+        inputs = [queries, keys, values, mx.sort(block_indices.astype(mx.int32), axis = -1),
+                  query_ends.astype(mx.int32), mx.array([keys.shape[2], L], dtype = mx.int32),
+                  mx.array([scale], dtype = mx.float32)],
+        template = [("GQA", H // keys.shape[1]), ("TOPK", block_indices.shape[-1])],
+        grid = (64 * L, keys.shape[1], 1), threadgroup = (64, 1, 1),
+        output_shapes = [(1, H, L, D)], output_dtypes = [queries.dtype],
+    )[0]
+
+
+def probe_fast_prefill():
+    """Compare with the native kernel on shuffled picks, -1 picks, tail blocks and rows with no visible key."""
+    from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
+    for L, N in ((64, 4101), (96, 1501), (64, 63)):
+        q = mx.random.normal((1, 24, L, 256), key = mx.random.key(N + L)).astype(mx.bfloat16)
+        k, v = (mx.random.normal((1, 2, N, 256), key = mx.random.key(N + i)).astype(mx.bfloat16) for i in (0, 1))
+        ends = mx.arange(N - L + 1, N + 1, dtype = mx.int32)[None]
+        complete = ends // 4
+        blocks = max(N // 4, 512)
+        scores = mx.random.uniform(shape = (1, L, blocks), key = mx.random.key(3))
+        scores = mx.where(mx.arange(blocks)[None, None] < complete[..., None], scores, -mx.inf)
+        picks = mx.argpartition(scores, kth = -512, axis = -1)[..., -512:].astype(mx.int32)
+        drop = (mx.random.uniform(shape = picks.shape, key = mx.random.key(5)) < 0.05) | (ends[..., None] == 4)
+        picks = mx.where((picks < complete[..., None]) & ~drop, picks, -1)
+        shuffle = mx.argsort(mx.random.uniform(shape = picks.shape, key = mx.random.key(4)), axis = -1)
+        picks = mx.take_along_axis(picks, shuffle, axis = -1)
+        native = qsa_sparse_attention(q, k, v, picks, ends, scale = 256 ** -0.5, block_size = 4)
+        got = fast_prefill_attention(q, k, v, picks, ends, 256 ** -0.5)
+        error = mx.abs(got.astype(mx.float32) - native.astype(mx.float32)).max().item()
+        assert error <= 0.02 * mx.abs(native.astype(mx.float32)).max().item(), (L, N, error)
+        # Only rounding differs (fp32 summation order, P's last bits), so nearly every bf16 output matches.
+        assert mx.mean(got == native).item() >= 0.99, (L, N)

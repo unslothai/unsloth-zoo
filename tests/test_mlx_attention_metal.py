@@ -52,13 +52,16 @@ if mlx_is_simulated():
         allow_module_level = True,
     )
 
+from unsloth_zoo.mlx import nax
 from unsloth_zoo.mlx.attention import (
     _PATCH_FLAG,
     _PATCH_TARGETS,
     dequantized_sdpa,
     dequantizing_is_smaller,
+    fast_prefill_supported,
     fused_kernel_exists,
     install_quantized_attention,
+    probe_fast_prefill,
     quantized_sdpa_over,
     select_blocks,
 )
@@ -675,3 +678,22 @@ def test_qsa_block_selection_picks_argpartitions_set(kind):
         # Rows straddle the top-k: some see fewer complete blocks than it, the rest more.
         complete = mx.broadcast_to(nb - L + mx.arange(L, dtype = mx.int32), (B, L)) - (B * L > 3) * (nb - 600)
         assert mx.array_equal(select_blocks(scores, complete, 512, 128), _stock_selection(scores, complete, 512)).item()
+
+
+def test_qsa_fast_prefill_matches_the_native_kernel():
+    if not nax.nax_available():
+        pytest.skip("needs the neural accelerators")
+    probe_fast_prefill()
+
+
+@pytest.mark.parametrize("change", [None, "batch", "heads", "kv_heads", "width", "dtype", "topk", "block", "rows"])
+def test_qsa_fast_prefill_covers_only_the_measured_layout(change):
+    B, H, KV, D, L, topk, block, dtype = 1, 24, 2, 256, 64, 512, 4, mx.bfloat16
+    B, H, KV, D, L, topk, block, dtype = {
+        "batch": (2, H, KV, D, L, topk, block, dtype), "heads": (B, 12, KV, D, L, topk, block, dtype),
+        "kv_heads": (B, H, 4, D, L, topk, block, dtype), "width": (B, H, KV, 128, L, topk, block, dtype),
+        "dtype": (B, H, KV, D, L, topk, block, mx.float16), "topk": (B, H, KV, D, L, 256, block, dtype),
+        "block": (B, H, KV, D, L, topk, 8, dtype), "rows": (B, H, KV, D, 63, topk, block, dtype),
+    }.get(change, (B, H, KV, D, L, topk, block, dtype))
+    queries, keys = mx.zeros((B, H, L, D), dtype), mx.zeros((B, KV, 4096, D), dtype)
+    assert fast_prefill_supported(queries, keys, mx.zeros((B, L, topk), mx.int32), block) == (change is None)

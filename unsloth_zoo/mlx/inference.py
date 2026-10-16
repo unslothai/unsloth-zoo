@@ -4674,44 +4674,91 @@ def _qsa_select_route(native, bindings):
     return select_from_projected
 
 
+_QSA_PREFILL_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.language": {"dispatch_qsa_attention": "03585a97b388a06f"},
+    "mlx_vlm.models.qwen4_exp.qsa_kernel": {"select_qsa_execution_plan": "73a34b78cc396c32"},
+}
+
+
+def _qsa_prefill_route(native, bindings, plan_of, indexed):
+    def dispatch_qsa_attention(queries, keys, values, block_indices, query_ends, *, cache, scale, block_size,
+                               causal, mask, mask_factory, allow_sparse_decode = False):
+        if (_bindings_intact(bindings) and plan_of(queries, keys, values, block_indices, query_ends,
+                                                   block_size = block_size, causal = causal,
+                                                   allow_sparse_decode = allow_sparse_decode) is indexed
+                and attention.fast_prefill_supported(queries, keys, block_indices, block_size)):
+            return attention.fast_prefill_attention(queries, keys, values, block_indices, query_ends, scale)
+        return native(queries, keys, values, block_indices, query_ends, cache = cache, scale = scale,
+                      block_size = block_size, causal = causal, mask = mask, mask_factory = mask_factory,
+                      allow_sparse_decode = allow_sparse_decode)
+
+    return dispatch_qsa_attention
+
+
+def _qsa_enter(entered, key, contract, owner, name, make_route):
+    held = _QSA_SCOPES.get(key)
+    if held is None and (bindings := _resolved_bindings(contract)) is not None:
+        native = vars(owner)[name]
+        route = make_route(native, [b for b in bindings if b[2] is not native])
+        setattr(owner, name, route)
+        held = _QSA_SCOPES[key] = [0, owner, name, native, route]
+    if held is not None:
+        held[0] += 1
+        entered.append((key, held))
+
+
 @contextmanager
+def _qsa_routes(model, modules, enter):
+    entered = []
+    try:
+        with _QSA_LOCK:
+            language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+            indexer = getattr(language, "Qwen4ExpQSAIndexer", None)
+            if (indexer is not None and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and any(isinstance(module, indexer) and not module.training
+                            for _, module in _fusion_modules(model, modules))):
+                enter(entered, language, indexer)
+        yield model
+    finally:
+        with _QSA_LOCK:
+            for key, held in entered:
+                held[0] -= 1
+                if not held[0]:
+                    _, owner, name, native, route = held
+                    del _QSA_SCOPES[key]
+                    if vars(owner).get(name) is route:
+                        setattr(owner, name, native)
+
+
 def fused_qsa_attention(model, *, _modules = None):
-    """Speed up mlx-vlm's Qwen sparse attention (qwen4_exp) during serialized inference.
+    """Speed up mlx-vlm's Qwen sparse attention (qwen4_exp) block selection during serialized inference.
 
     Block selection runs on one kernel per query row that picks exactly `argpartition`'s blocks
     from the native float32 scores, checked against the native selection at first use per layout.
     `Qwen4ExpQSAIndexer.select_from_projected` is rebound process-wide while any scope is open.
     `UNSLOTH_MLX_QSA_SELECT=0` turns the route off.
     """
-    entered = []
-    try:
-        with _QSA_LOCK:
-            indexer = getattr(sys.modules.get("mlx_vlm.models.qwen4_exp.language"), "Qwen4ExpQSAIndexer", None)
-            if (indexer is not None and os.environ.get("UNSLOTH_MLX_QSA_SELECT", "1") != "0"
-                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
-                    and any(isinstance(module, indexer) and not module.training
-                            for _, module in _fusion_modules(model, _modules))
-                    and attention._select_kernel() is not None):
-                held = _QSA_SCOPES.get("select")
-                if held is None and (bindings := _resolved_bindings(_QSA_SELECT_CONTRACT)) is not None:
-                    native = vars(indexer)["select_from_projected"]
-                    route = _qsa_select_route(native, [b for b in bindings if b[2] is not native])
-                    indexer.select_from_projected = route
-                    held = _QSA_SCOPES["select"] = [0, indexer, native, route]
-                if held is not None:
-                    held[0] += 1
-                    entered.append(held)
-        yield model
-    finally:
-        with _QSA_LOCK:
-            for held in entered:
-                held[0] -= 1
-                if not held[0]:
-                    _, indexer, native, route = held
-                    del _QSA_SCOPES["select"]
-                    if vars(indexer).get("select_from_projected") is route:
-                        indexer.select_from_projected = native
+    def enter(entered, language, indexer):
+        if os.environ.get("UNSLOTH_MLX_QSA_SELECT", "1") != "0" and attention._select_kernel() is not None:
+            _qsa_enter(entered, "select", _QSA_SELECT_CONTRACT, indexer, "select_from_projected", _qsa_select_route)
 
+    return _qsa_routes(model, _modules, enter)
+
+
+def fast_qsa_prefill(model, *, _modules = None):
+    """Run mlx-vlm's indexed QSA prefill of the Qwen3.8 layout on the neural accelerators once its kernel
+    passes a probe; not bitwise, as its fp32 sums run in another order. Other calls keep the native kernel.
+    `dispatch_qsa_attention` is rebound process-wide while any scope is open."""
+    def enter(entered, language, indexer):
+        kernels = sys.modules.get("mlx_vlm.models.qwen4_exp.qsa_kernel")
+        if kernels is not None and nax.kernel_probe_passed(
+                attention.PREFILL_PROBE_KEY, attention.__name__, "probe_fast_prefill"):
+            _qsa_enter(entered, "prefill", _QSA_PREFILL_CONTRACT, language, "dispatch_qsa_attention",
+                       lambda native, bindings: _qsa_prefill_route(
+                           native, bindings, kernels.select_qsa_execution_plan,
+                           kernels.QSAExecutionPlan.INDEXED_SPARSE_PREFILL))
+
+    return _qsa_routes(model, _modules, enter)
 
 class InferenceScope(NamedTuple):
     """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
@@ -4743,6 +4790,7 @@ INFERENCE_SCOPES = [
     InferenceScope(dense_prefill_linear),
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_qsa_attention),
+    InferenceScope(fast_qsa_prefill, opt_in = "UNSLOTH_MLX_FAST_QSA"),
     InferenceScope(fused_residual_norm_handoff),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),

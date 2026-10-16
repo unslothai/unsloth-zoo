@@ -808,7 +808,7 @@ try:
     from mlx_vlm.models.qwen4_exp.config import TextConfig as Qwen4TextConfig
 except ImportError:  # mlx-vlm before qwen4_exp
     qwen4 = None
-from unsloth_zoo.mlx import attention as mlx_attention
+from unsloth_zoo.mlx import attention as mlx_attention, nax
 
 
 def _qsa_layer():
@@ -908,3 +908,42 @@ def test_qsa_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
     with decode.fused_qsa_attention(attention):
         assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is not native
     assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is native
+
+
+def _qsa_prefill_scope(monkeypatch, calls):
+    from mlx_vlm.models.qwen4_exp import qsa_kernel
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_QSA", "1")
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(mlx_attention, "fast_prefill_supported", lambda queries, *args: queries.shape[2] >= 20)
+    monkeypatch.setattr(mlx_attention, "fast_prefill_attention", lambda q, k, v, blocks, ends, scale: calls.append(
+        q.shape[2]) or qsa_kernel.qsa_sparse_attention(q, k, v, blocks, ends, scale = scale, block_size = 4))
+
+
+def test_qsa_prefill_route_takes_indexed_prefill_and_restores(monkeypatch):
+    attention, native, calls = _qsa_layer(), qwen4.dispatch_qsa_attention, []
+    expected = _qsa_run(attention)
+    _qsa_prefill_scope(monkeypatch, calls)
+    q, kv = mx.zeros((1, 4, 20, 32), mx.bfloat16), mx.zeros((1, 2, 20, 32), mx.bfloat16)
+    picks, ends = mx.zeros((1, 20, 8), mx.int32), mx.arange(1, 21, dtype = mx.int32)[None]
+    with decode.inference_scopes(attention):
+        assert qwen4.dispatch_qsa_attention is not native
+        for actual, out in zip(_qsa_run(attention), expected):
+            _equal(actual, out)
+        qwen4.dispatch_qsa_attention(q, kv, kv, picks, ends, cache = None, scale = 1.0, block_size = 4, causal = False,
+                                     mask = None, mask_factory = lambda: mx.ones((20, 20), mx.bool_))
+    assert calls == [20, 30, 41] and qwen4.dispatch_qsa_attention is native
+
+
+@pytest.mark.parametrize("reason", ["switch", "probe", "body"])
+def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
+    attention, calls = _qsa_layer(), []
+    _qsa_prefill_scope(monkeypatch, calls)
+    if reason == "switch":
+        monkeypatch.delenv("UNSLOTH_MLX_FAST_QSA")
+    elif reason == "probe":
+        monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: False)
+    else:
+        monkeypatch.setattr(qwen4, "dispatch_qsa_attention", lambda *args, **kwargs: None)
+    native = qwen4.dispatch_qsa_attention
+    with decode.inference_scopes(attention):
+        assert qwen4.dispatch_qsa_attention is native
