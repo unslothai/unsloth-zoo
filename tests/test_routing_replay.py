@@ -590,3 +590,21 @@ def test_generate_without_training_keeps_bounded_routes(replay, monkeypatch):
     assert len(rr._STATE.generations) == 1
     assert len(next(iter(rr._STATE.generations.values()))) == 3
     assert rr._lookup((29, 39, 49)) is not None and rr._lookup((20, 30, 40)) is None
+
+
+def test_recompute_with_several_same_shape_forwards_keeps_candidate_shapes():
+    # Three recorded forwards of one shape, each routing 5 tokens to 2 experts: the per-candidate
+    # agreement must reduce to one flag per candidate before it meets the per-candidate match.
+    ids2 = torch.randint(0, 8, (5, 2))
+    fp = rr._fingerprint(ids2)
+    replay = torch.randint(0, 8, (5, 2))
+    saved = rr._STATE.pending, rr._STATE.recomputed
+    try:
+        rr._STATE.pending = [
+            {0: (fp, replay[:, torch.randperm(2)], torch.ones((5, 1), dtype = torch.bool))} for _ in range(3)
+        ]
+        forced, valid = rr._recomputed_routes(0, ids2)
+    finally:
+        rr._STATE.pending, rr._STATE.recomputed = saved
+    assert forced.shape == (5, 2)
+    assert bool(valid.all())
