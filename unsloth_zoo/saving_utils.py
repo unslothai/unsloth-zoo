@@ -4102,6 +4102,37 @@ def _previous_export_shards(filenames, save_directory, source_directory = None):
 pass
 
 
+_REFRESH_DISK_MARGIN = 64 * 1024 * 1024
+
+def _check_disk_for_previous_export_refresh(save_directory, new_sizes):
+    """Refuse a re-export the disk cannot finish before any previous shard is replaced.
+
+    prepare_saving compares free space with the in-memory save size, which a 4bit model with a
+    narrow adapter puts below the largest base shard. The refresh stages one shard at a time (a
+    split shard likewise writes its parts before removing it), so it needs the growth of the
+    whole set plus the largest shard.
+    """
+    if not new_sizes:
+        return
+    try:
+        growth = 0
+        for filename, new_size in new_sizes.items():
+            output_path = os.path.join(save_directory, filename)
+            old_size = os.lstat(output_path).st_size if os.path.lexists(output_path) else 0
+            growth += new_size - old_size
+        needed = max(growth, 0) + max(new_sizes.values()) + _REFRESH_DISK_MARGIN
+        free = shutil.disk_usage(save_directory).free
+    except OSError:
+        return
+    if free < needed:
+        raise RuntimeError(
+            f"Unsloth: Not enough disk space to replace the previous export in {save_directory}: "
+            f"{needed / 1024**3:.2f} GB is needed and {free / 1024**3:.2f} GB is free. "
+            "Nothing was changed. Free up disk space or remove the previous export, then re-run."
+        )
+pass
+
+
 def _resolve_hub_commit(repo_id, token):
     # One commit for every file an export fetches, so a push to the repo mid-export cannot mix
     # shards from two commits. Offline or unreachable gives None: unpinned, as before.
@@ -4825,6 +4856,7 @@ def merge_and_overwrite_lora(
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
     safetensors_list = []
     _hub_revision = None
+    _hub_shard_sizes = {}
     max_size_in_bytes = 0
     total_size_in_bytes = 0
     config = model.config
@@ -5002,6 +5034,7 @@ def merge_and_overwrite_lora(
                 if _hf_has_proper and fname == "consolidated.safetensors":
                     continue
                 safetensors_list.append(fname)
+                _hub_shard_sizes[fname] = x["size"]
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
 
@@ -5337,10 +5370,24 @@ def merge_and_overwrite_lora(
     # An earlier export's shard is already merged and the fetches below can keep it
     # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
     # Each one is replaced in turn by a staged copy renamed over it, so no second copy of the
-    # checkpoint is kept; prepare_saving already refused a disk that cannot hold the export.
+    # checkpoint is kept, and a disk that cannot finish the refresh is refused before it starts.
     _stale_shards = set(_previous_export_shards(
         safetensors_list, save_directory, model_name if is_local_path else None,
     ))
+    if _stale_shards:
+        if is_local_path:
+            _new_sizes = {
+                f : os.path.getsize(os.path.join(model_name, f)) for f in safetensors_list
+                if os.path.exists(os.path.join(model_name, f)) and (
+                    f in _stale_shards or not os.path.lexists(os.path.join(save_directory, f))
+                )
+            }
+        else:
+            _new_sizes = {
+                f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
+            }
+        _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
+    pass
 
     _replaced_shards = []
     try:

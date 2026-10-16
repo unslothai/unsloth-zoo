@@ -400,3 +400,50 @@ def test_hub_listing_pins_the_same_commit_as_the_fetches(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "HfFileSystem", _RecordingFS)
     H.run_merge(peft_model, base, str(tmp_path / "out"), save_dtype = torch.float32, low_disk_space_usage = True)
     assert listed and set(listed) == {_ModelInfo.sha}
+
+
+@pytest.mark.parametrize("source", ["local", "hub_low_disk"])
+def test_refresh_refused_when_free_space_is_below_the_largest_shard(tmp_path, monkeypatch, source):
+    # A 4bit model with a narrow adapter has an in-memory save size below the largest base
+    # shard, so prepare_saving passes; the refresh itself must refuse before touching anything.
+    # On-disk dtype: a float32 upcast has its own peak check.
+    import errno
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    low_disk = source == "hub_low_disk"
+    if source != "local":
+        _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = None, low_disk_space_usage = low_disk)
+    before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
+    sizes = sorted(len(v) for v in before.values())
+    assert sizes[0] < sizes[-1]
+    free = sizes[-1] - 1
+
+    monkeypatch.setattr(S, "get_torch_storage_size_new", lambda x, element_size: 1)
+    disk = S.shutil.disk_usage(out)
+    monkeypatch.setattr(S.shutil, "disk_usage", lambda _: type(disk)(disk.total, disk.total - free, free))
+    def _stage(path):
+        if os.path.getsize(path) > free:
+            raise OSError(errno.ENOSPC, "simulated full disk")
+    if source == "local":
+        real_copy = S._copy_file_from_source
+        def _copy(src, target_dir, filename):
+            if str(src).endswith(".safetensors"):
+                _stage(src)
+            return real_copy(src, target_dir, filename)
+        monkeypatch.setattr(S, "_copy_file_from_source", _copy)
+    else:
+        _fake_hub(monkeypatch, base, fail = False)
+        real_hf = S.hf_hub_download
+        def _hf(repo_id, filename, local_dir = None, **k):
+            if local_dir is not None and filename.endswith(".safetensors"):
+                _stage(os.path.join(base, filename))
+            return real_hf(repo_id, filename, local_dir = local_dir, **k)
+        monkeypatch.setattr(S, "hf_hub_download", _hf)
+
+    with pytest.raises(RuntimeError, match = "Nothing was changed"):
+        H.run_merge(peft_model, base, out, save_dtype = None, low_disk_space_usage = low_disk)
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+    assert _no_staging_left(out)
