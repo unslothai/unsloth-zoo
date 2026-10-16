@@ -459,3 +459,19 @@ def test_asset_ranking_covers_every_visible_sm(monkeypatch):
     # Single device: narrowest covering bundle first, unchanged.
     names = [n for n, _ in llama_cpp._select_gpu_assets("b1", assets, manifest, target = ("cuda", 75, "cuda12"))]
     assert names == ["sm75-only.tar.gz", "portable.tar.gz"]
+
+
+def test_cmake_targets_skip_an_unreadable_card(monkeypatch):
+    fake = _fake_torch(archs = ["gfx1100", "gfx1030", "gfx1201"])
+    real = fake.cuda.get_device_properties
+
+    def flaky(i):
+        if i == 1:
+            raise RuntimeError("unreadable")
+        return real(i)
+
+    fake.cuda.get_device_properties = flaky
+    monkeypatch.setattr(llama_cpp, "torch", fake)
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    flags = llama_cpp._gpu_cmake_flags("ON")
+    assert "-DGPU_TARGETS=gfx1100;gfx1201" in flags

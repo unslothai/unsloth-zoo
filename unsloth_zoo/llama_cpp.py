@@ -1177,13 +1177,16 @@ def _gpu_cmake_flags(gpu_support):
     # Every visible arch, not just device 0, so a mixed-arch host gets code objects for each card.
     targets = []
     try:
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                gfx = (getattr(torch.cuda.get_device_properties(i), "gcnArchName", "") or "").split(":")[0]
-                if gfx.startswith("gfx") and gfx not in targets:
-                    targets.append(gfx)
+        count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     except Exception:
-        pass
+        count = 0
+    for i in range(count):
+        try:  # per device: one unreadable card must not drop the archs after it
+            gfx = (getattr(torch.cuda.get_device_properties(i), "gcnArchName", "") or "").split(":")[0]
+        except Exception:
+            continue
+        if gfx.startswith("gfx") and gfx not in targets:
+            targets.append(gfx)
     if targets:
         flags.append(f"-DGPU_TARGETS={';'.join(targets)}")
     print(f"Unsloth: Detected ROCm - building llama.cpp with HIP ({' '.join(flags)})")
