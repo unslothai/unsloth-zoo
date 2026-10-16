@@ -803,7 +803,7 @@ def _unique_suffix(source):
     suffix, counter = "", 0
     while any(f"{n}{suffix}" in source for n in (
         "_aiter_fn", "_aiter_ok", "_aiter_q", "_aiter_k", "_aiter_v",
-        "_aiter_out", "_call_aiter_safe", "_get_aiter_fn",
+        "_aiter_out", "_call_aiter_safe", "_aiter_device_type",
     )):
         counter += 1
         suffix = f"_{counter}"
@@ -870,7 +870,7 @@ def replace_sdpa_with_amd_aiter(source):
     ok_var  = f"_aiter_ok{suffix}"
     out_tmp = f"_aiter_out{suffix}"
     safe_fn = f"_call_aiter_safe{suffix}"
-    get_fn  = f"_get_aiter_fn{suffix}"
+    dt_mod  = f"_aiter_device_type{suffix}"
     qt, kt, vt = f"_aiter_q{suffix}", f"_aiter_k{suffix}", f"_aiter_v{suffix}"
 
     # Bottom up so earlier line numbers stay valid.
@@ -887,8 +887,11 @@ def replace_sdpa_with_amd_aiter(source):
 
         block = [
             f"{indent}{_AITER_MARKER}, requires: pip install amd-aiter (ROCm >= 7.0)",
-            f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func as {get_fn}",
-            f"{indent}{fn_var} = {get_fn}({q_var}.device)",
+            f"{indent}import unsloth_zoo.device_type as {dt_mod}",
+            f"{indent}{fn_var} = (",
+            f"{indent}    {dt_mod}.get_amd_flash_attn_func({q_var}.device)",
+            f"{indent}    if {dt_mod}.AMD_PER_DEVICE_CACHES else {dt_mod}.get_amd_flash_attn_func()",
+            f"{indent})",
             f"{indent}{ok_var} = (",
             f"{indent}    {fn_var} is not None",
             # SDPA aligns causal masks top-left, aiter bottom-right; they agree
