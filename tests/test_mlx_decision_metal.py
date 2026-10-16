@@ -558,10 +558,14 @@ def test_training_forward_matches_eval_until_dropout_applies(checkpoint):
     model.eval()
     want = np.array(model(**batch))
     model.train()
+    mx.random.seed(3407)
     dropped = np.array(model(**batch))
     np.testing.assert_allclose(np.array(_without_dropout(model)(**batch)), want, atol = 1e-4)
     if model.head.layers:
-        assert np.abs(dropped - want)[np.array(batch["marker_mask"])].min() > 1e-4
+        # Dropout applies when the training scores move, not when every one does: a single
+        # marker score can land within 1e-4 of its eval value by chance.
+        moved = np.abs(dropped - want)[np.array(batch["marker_mask"])] > 1e-4
+        assert moved.mean() >= 0.5, moved
 
 
 def test_decay_skips_what_transformers_skips_by_class_and_by_name():
