@@ -32,11 +32,11 @@ import re
 import struct
 import sys
 import textwrap
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import RLock, local
 from types import FunctionType
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -4509,3 +4509,72 @@ def fused_verify_attention(model, *, _modules = None):
                 native = getattr(type(module), "_unsloth_verify_attention_native", None)
                 if native is not None:
                     module.__class__ = native
+
+
+class InferenceScope(NamedTuple):
+    """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
+    `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
+    enter: Callable
+    serves: frozenset = frozenset()
+    opt_in: str = None
+    int8_prefill: bool = False
+
+    @property
+    def name(self):
+        return self.enter.__name__
+
+    def admits(self, call):
+        if self.opt_in is not None and os.environ.get(self.opt_in) != "1":
+            return False
+        return call is None or not self.serves or not self.serves.isdisjoint(call)
+
+
+# Outermost first; every generation path (Studio included) enters these. An inexact scope sets `opt_in`.
+# Call traits: "batch", "speculative" (drafts verified in blocks), "vision" (mlx-vlm), "audio".
+INFERENCE_SCOPES = [
+    InferenceScope(fused_moe_gate_up),
+    InferenceScope(fused_decode_conv_silu),
+    InferenceScope(fused_residual_norm),
+    InferenceScope(fused_moe_router),
+    InferenceScope(fused_moe_routed_experts),
+    InferenceScope(nax_quantized_linear, int8_prefill = True),
+    InferenceScope(dense_prefill_linear),
+    InferenceScope(fused_packed_gated_delta),
+    InferenceScope(fused_residual_norm_handoff),
+    InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
+    InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
+]
+
+
+@contextmanager
+def inference_scopes(model, call = None, *, int8_prefill = None, on_error = None, _modules = None):
+    """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation.
+
+    Traits this zoo does not know are ignored. A scope that raises on entry propagates unless `on_error` is
+    given: then `on_error(name, error)` runs and, if it returns, the generation continues without that scope.
+    """
+    if call is not None:
+        call = frozenset((call,) if isinstance(call, str) else call)
+    modules = tuple(_fusion_modules(model, _modules))
+    with ExitStack() as stack:
+        for scope in INFERENCE_SCOPES:
+            if not scope.admits(call):
+                continue
+            args = (int8_prefill,) if scope.int8_prefill else ()
+            try:
+                stack.enter_context(scope.enter(model, *args, _modules = modules))
+            except Exception as error:
+                if on_error is None:
+                    raise
+                on_error(scope.name, error)
+        yield model
+
+
+_WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17 rows)
+
+
+def warm_inference(model, int8_prefill = None):
+    """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
+    first-use checks; checks keyed by a request's row count still run then."""
+    model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
+                   int8_prefill = int8_prefill)
