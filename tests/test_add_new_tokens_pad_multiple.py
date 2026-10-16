@@ -451,6 +451,22 @@ def test_vllm_padded_vocab_biases_v0_engine():
     assert len(async_engine.engine.seen[0].logits_processors) == 1
 
 
+def test_vllm_padded_vocab_skips_v0_multi_step(capsys):
+    from types import SimpleNamespace
+    wrap = _vllm_wrapper_ns()["suppress_vllm_padded_vocab"]
+
+    class LLM:
+        def __init__(self):
+            self.llm_engine = _V0LLMEngine()
+            self.llm_engine.scheduler_config = SimpleNamespace(num_scheduler_steps = 8)
+
+    llm = LLM()
+    wrap(llm, IDS)
+    assert "multi-step" in capsys.readouterr().out
+    llm.llm_engine.add_request("r0", "p", _V0Params())
+    assert llm.llm_engine.seen[0].logits_processors is None
+
+
 def test_return_args_warns_for_padded_vocab(capsys):
     import ast
     import pathlib

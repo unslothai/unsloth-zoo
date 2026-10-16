@@ -3634,6 +3634,10 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         # as do n > 1 children. V0 rejects logit_bias ids >= len(tokenizer), which alignment rows
         # are by definition, so append a per-request logits processor applying the same bias.
         v0 = engine if hasattr(engine, "_add_processed_request") else getattr(engine, "engine", None)
+        if (getattr(getattr(v0, "scheduler_config", None), "num_scheduler_steps", 1) or 1) > 1:
+            # V0 multi-step decoding rejects logits processors (LLMEngine.add_request).
+            print("Unsloth: vLLM multi-step decoding takes no logits processors, so padded vocabulary rows stay sampleable.")
+            return llm
         method = getattr(v0, "_add_processed_request", None)
         if method is None:
             print("Unsloth: this vLLM engine has no known request ingress, so padded vocabulary rows stay sampleable.")
