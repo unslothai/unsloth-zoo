@@ -81,6 +81,21 @@ def test_growth_within_the_cap_stays_pinned(monkeypatch, gc_module, pin_requests
     assert gc_module.GC_PINNED_BYTES == 8192 + 2048
 
 
+def test_pageable_slot_is_pinned_again_when_it_grows_after_ram_frees(monkeypatch, gc_module, pin_requests):
+    # A low-RAM moment sends one growth pageable; the next growth must not stay pageable for good.
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    gib = 1 << 30
+    host = _fake_host(monkeypatch, total_gib = 12, available_gib = 8)
+    a = gc_module._new_host_buffer(1000, torch.float16)
+    host.available = 0
+    b = gc_module._grow_host_buffer(a, 4000)
+    assert not getattr(b, gc_module.HOST_PINNED_ATTR)
+    host.available = 8 * gib
+    c = gc_module._grow_host_buffer(b, 8000)
+    assert c.numel() == 8000 and getattr(c, gc_module.HOST_PINNED_ATTR)
+    assert pin_requests == [True, False, True]
+
+
 def test_cap_is_free_ram_minus_reserve_split_by_local_ranks(monkeypatch, gc_module):
     gib = 1 << 30
     fake = types.SimpleNamespace(
