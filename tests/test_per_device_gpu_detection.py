@@ -273,7 +273,9 @@ def test_per_device_caches_only_with_two_hip_devices(monkeypatch, dtype, count, 
     for name in _AMD_CACHED:
         monkeypatch.setattr(device_type, name, getattr(device_type, name))  # restored after the test
     monkeypatch.setattr(torch.cuda, "device_count", mock.Mock(side_effect = AssertionError("no probe")))
+    monkeypatch.setattr(device_type, "AMD_PER_DEVICE_CACHES", False)
     assert device_type._use_per_device_caches(dtype, count) is multi
+    assert device_type.AMD_PER_DEVICE_CACHES is multi
     for name in _AMD_CACHED:
         assert hasattr(getattr(device_type, name), "cache_info")
         assert (getattr(device_type, name).__class__.__name__ == "function") is multi
@@ -305,19 +307,22 @@ def test_amd_caches_fall_back_when_current_device_raises(amd_host, monkeypatch):
     assert device_type.get_amd_attention_implementation() in ("sdpa", "amd_aiter")
 
 
-def test_registered_aiter_attention_asks_for_the_query_device(monkeypatch):
+@pytest.mark.parametrize("per_device", [True, False])
+def test_registered_aiter_attention_asks_for_the_query_device(monkeypatch, per_device):
     from unsloth_zoo.temporary_patches import amd_aiter
     import transformers.integrations.sdpa_attention as sdpa
     seen = []
-    def getter(device = None):
-        seen.append(device)
+    def getter(*args):
+        seen.append(args)
         return None
     monkeypatch.setattr(device_type, "get_amd_flash_attn_func", getter)
+    monkeypatch.setattr(device_type, "AMD_PER_DEVICE_CACHES", per_device)
     monkeypatch.setattr(device_type, "is_hip", lambda: True)
     monkeypatch.setattr(sdpa, "sdpa_attention_forward", lambda *a, **k: "sdpa")
     query = types.SimpleNamespace(is_cuda = True, device = torch.device("cuda", 1))
     assert amd_aiter.aiter_attention_forward(None, query, None, None, None) == "sdpa"
-    assert seen == [torch.device("cuda", 1)]
+    # One HIP device: the no-argument call, the cache entry the setup gate already filled.
+    assert seen == ([(torch.device("cuda", 1),)] if per_device else [()])
 
 
 def test_compiled_aiter_rewrite_asks_for_the_query_device(monkeypatch):
@@ -330,7 +335,9 @@ def test_compiled_aiter_rewrite_asks_for_the_query_device(monkeypatch):
     )
     rewritten = compiler.replace_sdpa_with_amd_aiter(source)
     assert compiler._AITER_MARKER in rewritten
-    assert re.search(r"_get_aiter_fn\w*\(\w+\.device\)", rewritten), rewritten
+    assert re.search(r"get_amd_flash_attn_func\(\w+\.device\)", rewritten), rewritten
+    assert re.search(r"AMD_PER_DEVICE_CACHES else \w+\.get_amd_flash_attn_func\(\)", rewritten), rewritten
+    compile(rewritten, "<rewritten>", "exec")
 
 
 # Z2: rocminfo fallback honours HIP masks ----------------------------------------------
