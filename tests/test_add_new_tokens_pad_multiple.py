@@ -197,26 +197,47 @@ def test_vllm_generate_biases_padded_rows(monkeypatch):
 
     seen = []
 
+    class Engine:
+        def add_request(self, request_id, prompt, params, lora_request = None, priority = 0):
+            seen.append(params)
+            return request_id
+
     class LLM:
-        def get_default_sampling_params(self):
-            return Params()
+        # Like vLLM's LLM: every facade method submits through llm_engine.add_request.
+        def __init__(self):
+            self.llm_engine = Engine()
+
+        def _submit(self, prompts, params):
+            params = params if isinstance(params, list) else [params or Params()] * len(prompts)
+            return [self.llm_engine.add_request(str(i), p, q) for i, (p, q) in enumerate(zip(prompts, params))]
 
         def generate(self, prompts, sampling_params = None, use_tqdm = True):
-            seen.append(sampling_params)
-            return ["out"]
+            return self._submit(prompts, sampling_params)
+
+        def chat(self, messages, sampling_params = None):
+            return self._submit(messages, sampling_params)
+
+        def enqueue(self, prompts, sampling_params = None):
+            return self._submit(prompts, sampling_params)
 
     llm = LLM()
+    generate = llm.generate
     ns["suppress_vllm_padded_vocab"](llm, ids)
     ns["suppress_vllm_padded_vocab"](llm, ids)
+    assert llm.generate == generate, "facade methods stay unwrapped: the bias is added once, at ingress"
     mine = Params({5: 2.0})
-    assert llm.generate(["a"], mine, use_tqdm = False) == ["out"]
+    llm.generate(["a"], mine, use_tqdm = False)
     llm.generate(["a"])
     llm.generate(["a", "b"], sampling_params = [Params(), Params({ids[0]: 3.0})])
+    llm.chat([["hi"]], mine)
+    llm.enqueue(["a"], Params())
     want = {i: -100.0 for i in ids}
     assert seen[0].logit_bias == {5: 2.0, **want} and mine.logit_bias == {5: 2.0}
     assert seen[1].logit_bias == want
-    assert [p.logit_bias for p in seen[2]] == [want, want]
-    assert len(seen) == 3
+    assert [p.logit_bias for p in seen[2:4]] == [want, want]
+    assert seen[4].logit_bias == {5: 2.0, **want}
+    assert seen[5].logit_bias == want
+    assert len(seen) == 6
 
 
 def _vllm_wrapper_ns():
@@ -281,3 +302,31 @@ def test_vllm_padded_vocab_biases_llm_engine_add_request():
     assert seen[0].logit_bias == {3: 1.0, **want} and mine.logit_bias == {3: 1.0}
     assert seen[1].logit_bias == want
     assert seen[2] is pooling
+
+
+def test_vllm_padded_vocab_bias_respects_the_logit_bias_limit(capsys):
+    # vLLM 0.29 Model Runner V2 raises past MAX_NUM_LOGIT_BIAS_TOKENS (1024) entries per request.
+    seen = []
+
+    class LLMEngine:
+        def add_request(self, request_id, prompt, params):
+            seen.append(params)
+
+    wrap = _vllm_wrapper_ns()
+    big = LLMEngine()
+    wrap(big, list(range(2000, 3100)))  # pad_to_multiple_of = 2048 territory
+    plain = _Params()
+    big.add_request("r0", "p", plain)
+    big.add_request("r1", "p", _Params())
+    assert seen[0] is plain and plain.logit_bias is None
+    assert seen[1].logit_bias is None
+
+    small = LLMEngine()
+    wrap(small, list(range(2000, 2063)))
+    crowded = _Params({i: 1.0 for i in range(1000)})
+    small.add_request("r2", "p", crowded)
+    assert seen[2] is crowded and len(crowded.logit_bias) == 1000
+    small.add_request("r3", "p", _Params({i: 1.0 for i in range(900)}))
+    assert len(seen[3].logit_bias) == 963
+    out = capsys.readouterr().out
+    assert out.count("exceed vLLM's limit of 1024") == 2  # once per engine

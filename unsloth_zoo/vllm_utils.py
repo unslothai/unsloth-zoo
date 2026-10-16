@@ -3563,8 +3563,8 @@ pass
 def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
     """vLLM samples every row of config.vocab_size and ignores generation_config.suppress_tokens,
     so alignment rows from add_new_tokens(pad_to_multiple_of = ...) could be emitted as ids no
-    tokenizer token has. Bias them to -100 on every request: llm.generate (LLM, AsyncLLM) and
-    add_request (LLMEngine, AsyncLLM). Idempotent."""
+    tokenizer token has. Bias them to -100 on every request at the engine's add_request.
+    Idempotent."""
     if speculative:
         # SamplingParams._validate_spec_decode rejects any logit_bias under speculative decoding
         # (vLLM 0.29; older V1 drops it with a warning), so biasing would fail every request.
@@ -3574,48 +3574,53 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         )
         return llm
     bias = {int(i): -100.0 for i in padded_ids}
+    try:
+        # Model Runner V2 refuses a request with more logit_bias entries than this.
+        from vllm.v1.worker.gpu.sample.logit_bias import MAX_NUM_LOGIT_BIAS_TOKENS as max_bias
+    except Exception:
+        max_bias = 1024
+    warned = []
 
     def _with_bias(params):
-        if params is None:
-            get_default = getattr(llm, "get_default_sampling_params", None)
-            if get_default is None:
-                from vllm import SamplingParams
-                params = SamplingParams()
-            else:
-                params = get_default()
-        if not hasattr(params, "logit_bias"):
+        if params is None or not hasattr(params, "logit_bias"):
             # PoolingParams: nothing is sampled.
             return params
+        merged = {**(params.logit_bias or {}), **bias}
+        if len(merged) > max_bias:
+            if not warned:
+                warned.append(True)
+                print(
+                    f"Unsloth: {len(merged)} logit_bias entries exceed vLLM's limit of {max_bias}, so "
+                    "this padded vocabulary's alignment rows stay sampleable for such requests."
+                )
+            return params
         params = copy.copy(params)
-        params.logit_bias = {**(getattr(params, "logit_bias", None) or {}), **bias}
+        params.logit_bias = merged
         return params
 
-    generate = getattr(llm, "generate", None)
-    if generate is not None and not getattr(generate, "_unsloth_padded_vocab", False):
-        @functools.wraps(generate)
-        def generate_without_padded_vocab(prompts, sampling_params = None, *args, **kwargs):
-            if isinstance(sampling_params, (list, tuple)):
-                sampling_params = [_with_bias(params) for params in sampling_params]
-            else:
-                sampling_params = _with_bias(sampling_params)
-            return generate(prompts, sampling_params, *args, **kwargs)
+    # Every LLM entry point (generate, chat, enqueue, enqueue_chat, beam search) submits through
+    # llm.llm_engine.add_request, and LLMEngine / AsyncLLM take requests there too, so wrapping
+    # that one ingress biases each request exactly once.
+    engine = getattr(llm, "llm_engine", None)
+    target = engine if getattr(engine, "add_request", None) is not None else llm
+    add_request = getattr(target, "add_request", None)
+    if add_request is None:
+        print("Unsloth: this vLLM engine has no add_request, so padded vocabulary rows stay sampleable.")
+        return llm
+    if getattr(add_request, "_unsloth_padded_vocab", False):
+        return llm
 
-        generate_without_padded_vocab._unsloth_padded_vocab = True
-        llm.generate = generate_without_padded_vocab
+    @functools.wraps(add_request)
+    def add_request_without_padded_vocab(*args, **kwargs):
+        # add_request(request_id, prompt, params, ...)
+        if "params" in kwargs:
+            kwargs["params"] = _with_bias(kwargs["params"])
+        elif len(args) > 2:
+            args = args[:2] + (_with_bias(args[2]),) + args[3:]
+        return add_request(*args, **kwargs)
 
-    add_request = getattr(llm, "add_request", None)
-    if add_request is not None and not getattr(add_request, "_unsloth_padded_vocab", False):
-        @functools.wraps(add_request)
-        def add_request_without_padded_vocab(*args, **kwargs):
-            # add_request(request_id, prompt, params, ...)
-            if "params" in kwargs:
-                kwargs["params"] = _with_bias(kwargs["params"])
-            elif len(args) > 2:
-                args = args[:2] + (_with_bias(args[2]),) + args[3:]
-            return add_request(*args, **kwargs)
-
-        add_request_without_padded_vocab._unsloth_padded_vocab = True
-        llm.add_request = add_request_without_padded_vocab
+    add_request_without_padded_vocab._unsloth_padded_vocab = True
+    target.add_request = add_request_without_padded_vocab
     return llm
 pass
 
