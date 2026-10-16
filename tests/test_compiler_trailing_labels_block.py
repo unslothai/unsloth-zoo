@@ -60,7 +60,10 @@ def _run(source, z, return_logits, loss_function = ForCausalLMLoss):
         calls.append(1)
         return ForCausalLMLoss(hidden_states @ lm_head_weight.t(), labels)
 
-    ns = dict(
+    from _compiled_module_names import fused_loss_header_names
+
+    ns = fused_loss_header_names()
+    ns.update(
         torch = torch, os = os, EMPTY_LOGITS = torch.empty(0), UNSLOTH_ENABLE_CCE = False,
         HAS_CUT_CROSS_ENTROPY = False, UNSLOTH_COMPILE_DISABLE = True, unsloth_fused_ce_loss = fused,
         _can_fuse_loss = _can_fuse_loss,

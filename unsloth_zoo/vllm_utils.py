@@ -3552,6 +3552,32 @@ def _shrink_for_memory_retry(max_num_seqs, max_num_batched_tokens, max_seq_lengt
     return max_num_seqs, max_num_batched_tokens
 
 
+def _fp32_lm_head_requested():
+    return os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _vllm_supports_fp32_lm_head():
+    # Generation models honour hf_overrides head_dtype from vLLM 0.26.0 (LogitsProcessor._apply_head);
+    # older versions silently ignore it, so detect the method rather than trust the override.
+    try:
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    except Exception:
+        return False
+    return hasattr(LogitsProcessor, "_apply_head")
+
+
+def _vllm_fp32_lm_head_overrides(training):
+    # Raises rather than half-applying: the trainer reads the same flag, and only both sides in fp32 pays off.
+    if not training or not _fp32_lm_head_requested():
+        return {}
+    if not _vllm_supports_fp32_lm_head():
+        raise RuntimeError(
+            f"Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 needs vLLM >= 0.26.0 for an fp32 lm_head, "
+            f"but found vLLM {vllm_version}. Upgrade vLLM or unset UNSLOTH_VLLM_FP32_LM_HEAD."
+        )
+    return {"head_dtype": "float32"}
+
+
 def _vllm_replayssm_mode():
     # "auto" (unset), "on" or "off".
     value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
@@ -4478,6 +4504,10 @@ def load_vllm(
                     approx_max_num_seqs = fitted_max_num_seqs
                     engine_args["max_num_seqs"] = fitted_max_num_seqs
             print(f"Unsloth: vLLM uses suffix decoding for generation with speculative_config = {suffix_config}.")
+        fp32_head_overrides = _vllm_fp32_lm_head_overrides(training)
+        if fp32_head_overrides:
+            engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **fp32_head_overrides}
+            print("Unsloth: vLLM computes rollout logits with an fp32 lm_head (UNSLOTH_VLLM_FP32_LM_HEAD=1).")
 
         # Pin the backend for the worker, which the sys.modules block only reaches under
         # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is
