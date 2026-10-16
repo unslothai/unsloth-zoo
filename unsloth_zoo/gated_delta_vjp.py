@@ -294,11 +294,19 @@ def patch_gated_delta():
 
         def patched_gated_delta_update(
             q, k, v, a, b, A_log, dt_bias,
-            state=None, mask=None, use_kernel=True,
+            state=None, mask=None, use_kernel=True, **kwargs,
         ):
+            # mlx-lm 0.32 added `lower_bound` and `allow_neg_eigval`; older releases never pass them.
+            if _vlm_must_delegate(kwargs, ("lower_bound", "allow_neg_eigval"), "mlx-lm"):
+                return original_gated_delta_update(q, k, v, a, b, A_log, dt_bias, state=state,
+                                                   mask=mask, use_kernel=use_kernel, **kwargs)
             is_training_call = _is_training_call(state, use_kernel)
             beta = mx.sigmoid(b)
-            g = gated_delta.compute_g(A_log, a, dt_bias)
+            if kwargs.get("allow_neg_eigval"):
+                beta = beta * 2.0
+            lower_bound = kwargs.get("lower_bound")
+            g = (gated_delta.compute_g(A_log, a, dt_bias) if lower_bound is None
+                 else gated_delta.compute_lower_bound_g(A_log, a, dt_bias, lower_bound))
             if state is None:
                 B, _, Hk, Dk = q.shape
                 Hv, Dv = v.shape[-2:]
