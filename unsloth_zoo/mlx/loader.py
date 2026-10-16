@@ -8195,7 +8195,11 @@ def _decides(segment):
     tokens = _role_tokens(segment)
     if not tokens & {"gate", "router"}:
         return False
-    return not (tokens - {"gate", "router"}) & (_MLP_LEAVES | {"proj"})
+    rest = tokens - {"gate", "router"}
+    # talkie's `mlp_gate` is its block's gate projection, as llama.cpp's `ffn_gate` is.
+    if "router" not in tokens and rest and rest <= _MLP_PATH_TOKENS:
+        return False
+    return not rest & (_MLP_LEAVES | {"proj"})
 
 
 def _linear_role(path):

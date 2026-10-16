@@ -109,6 +109,8 @@ _ROLE_CASES = {
     "linear_attn.in_proj_qkv": "attention", "per_layer_input_gate": "gate",
     "block_sparse_moe.switch_mlp.gate_up_proj": "mlp",
     "mlp.zaya_block.router.down_proj": "gate",
+    "blocks.0.mlp.mlp_gate": "mlp", "ffn_gate": "mlp", "ffn_gate_inp": "gate", "moe_gate": "gate",
+    "mlp.router_mlp.0": "gate",
 }
 
 
