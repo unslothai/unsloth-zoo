@@ -80,6 +80,22 @@ def _linear_float32(hidden, weight, bias):
     return logits.to(torch.promote_types(logits.dtype, torch.float32))
 
 
+def _mm_float32(a, b):
+    # Half GEMM with float32 output: per slice / row group partial sums can exceed the fp16 range
+    # before they cancel in the float32 accumulators.
+    key = (a.device.type, a.dtype)
+    if _MM_OUT_DTYPE_OK.get(key, True):
+        try:
+            out = torch.mm(a, b, out_dtype = torch.float32)
+            _MM_OUT_DTYPE_OK[key] = True
+            return out
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except (TypeError, RuntimeError, NotImplementedError):
+            _MM_OUT_DTYPE_OK[key] = False
+    return torch.mm(a.float(), b.float())
+
+
 def _chunk_logits(hidden, weight, bias, transforms):
     hidden = hidden.to(device = weight.device, dtype = weight.dtype)
     return _transform_logits(_linear_float32(hidden, weight, bias), *transforms)
@@ -147,8 +163,8 @@ def _sliced_backward(ctx, hidden, weight, bias, labels, lse, grad_logps):
                     grad_bias[first:last] += grad_logits.sum(0)
                 grad_logits = grad_logits.to(weight.dtype)
                 if need_hidden:
-                    grad_hidden[start:end] += grad_logits @ weight_slice
-                weight_acc += grad_logits.t() @ chunk_hidden
+                    grad_hidden[start:end] += _mm_float32(grad_logits, weight_slice)
+                weight_acc += _mm_float32(grad_logits.t(), chunk_hidden)
                 del grad_logits
             grad_weight[first:last] = weight_acc
             del weight_acc
@@ -170,6 +186,14 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
         log_sum_sq_probs = torch.empty(n_rows if want_lssp else 0, dtype = dtype, device = device)
         # A trainable half precision head runs the vocab sliced backward, which needs each row's lse.
         sliced = ctx.needs_input_grad[1] and weight.dtype in _HALF_DTYPES
+        if sliced and ctx.needs_input_grad[0]:
+            # Sliced backward holds a float32 rows x hidden gradient plus its cast (6 N H bytes for a
+            # half hidden) and a head dtype head gradient (2 V H); the per chunk loop holds float32
+            # head sized copies (10 V H) and a hidden dtype gradient. Long contexts favour the latter.
+            vocab_size = weight.shape[0]
+            hidden_bytes = hidden.element_size()
+            cast_bytes = hidden_bytes if hidden.dtype != torch.float32 else 0
+            sliced = 2 * vocab_size + n_rows * (4 + cast_bytes) <= 10 * vocab_size + n_rows * hidden_bytes
         saved_lse = torch.empty(n_rows if sliced else 0, dtype = dtype, device = device)
         with torch.autocast(device_type = device.type, enabled = False):
             for start in range(0, n_rows, rows):
