@@ -346,9 +346,8 @@ class BlockSwap:
                 owners.setdefault(id(p), set()).add(li)
         shared = {pid for pid, o in owners.items() if len(o) > 1}
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
-        # Weights already in host RAM are replaced by the packed copy, so their bytes come back.
-        _check_host_fit([b.nbytes() for b in self.blocks],
-                        sum(p.data.nbytes for b in self.blocks for p in b.params if p.data.device.type == "cpu"))
+        # No credit for weights already in host RAM: packing holds both copies while it runs.
+        _check_host_fit([b.nbytes() for b in self.blocks])
         homes = {b.home for b in self.blocks if b.home is not None}
         for li, layer in enumerate(layers):
             if li not in self.pos:

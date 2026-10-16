@@ -1036,9 +1036,23 @@ def test_host_fit_refuses_with_the_counts_when_the_layers_do_not_fit(monkeypatch
 
 def test_host_fit_counts_weights_already_in_host_ram_as_available(monkeypatch):
     import sys
-    # Layers loaded to host already took their RAM; packing replaces them, it does not add to them.
+    # The host-load guard's running total: layers it already moved are not copied again.
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(6 * _GiB))
     _mod._check_host_fit([_GiB // 2] * 20, on_host = 10 * _GiB)
+
+
+def test_block_swap_refuses_host_loaded_layers_without_room_to_pack(monkeypatch):
+    import sys, pytest
+    if not torch.cuda.is_available():
+        return
+    # Host-loaded layers are copied into the packed arena before their originals go: both are resident at once.
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda(); blocks[2:].cpu()
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda vm: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
+        BlockSwap(blocks, 6, device = "cuda")
 
 
 def test_host_fit_is_skipped_without_psutil(monkeypatch):
