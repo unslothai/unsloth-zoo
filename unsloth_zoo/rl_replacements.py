@@ -1258,6 +1258,45 @@ pass
 RL_REPLACEMENTS["grpo_entropy_bonus_weights"] = grpo_entropy_bonus_weights
 
 
+_HIGH_ENTROPY_MASK_PADS = {}
+def _high_entropy_mask_pads(method):
+    # TRL >= 0.24 pads every rank to one length before the gather; TRL 0.22 / 0.23 gather the
+    # raw valid tokens and return early on a rank that has none
+    func = getattr(method, "__func__", method)
+    pads = _HIGH_ENTROPY_MASK_PADS.get(func, None)
+    if pads is None:
+        try:
+            source = inspect.getsource(func)
+            pads = ("pad_across_processes" in source) or ("accelerator.gather" not in source)
+        except Exception:
+            pads = True
+        _HIGH_ENTROPY_MASK_PADS[func] = pads
+    return pads
+pass
+
+
+def grpo_high_entropy_mask(trainer, entropies, mask, threshold):
+    """trainer.get_high_entropy_mask, except on a multi-process run whose method gathers without
+    padding (TRL < 0.24): a rank with no valid tokens returns before the gather the other ranks
+    enter, so training hangs, and uneven token counts break the gather. Those runs take TRL >= 0.24's
+    padded gather, which sees the same quantile population; a single process is unchanged."""
+    accelerator = getattr(trainer, "accelerator", None)
+    if getattr(accelerator, "num_processes", 1) > 1 and not _high_entropy_mask_pads(trainer.get_high_entropy_mask):
+        local = entropies[mask.bool()].float()
+        # entropies are >= 0, so a negative sentinel cannot collide with a real value
+        pad_value = -1e9
+        padded = accelerator.pad_across_processes(local, dim = 0, pad_index = pad_value)
+        gathered = accelerator.gather(padded)
+        gathered = gathered[gathered != pad_value]
+        if gathered.numel() == 0:
+            return torch.zeros_like(entropies, dtype = torch.bool)
+        entropy_threshold = torch.quantile(gathered, threshold)
+        entropy_mask = (entropies * mask.float()) >= entropy_threshold
+        return entropy_mask & mask.bool()
+    return trainer.get_high_entropy_mask(entropies, mask, threshold)
+pass
+
+
 def _warn_unsupported_grpo_options(trainer):
     """Warn once per trainer about TRL GRPOConfig options this path ignores, so setting
     them is not silently dropped. Adaptive entropy control (use_adaptive_entropy) is
@@ -2064,6 +2103,7 @@ def grpo_accumulated_loss(
             chunked_hidden_states_selective_log_softmax_recompute as _entropy_log_softmax,
             UnslothGRPOEntropyBonus as _UnslothGRPOEntropyBonus,
             grpo_entropy_bonus_weights as _grpo_entropy_bonus_weights,
+            grpo_high_entropy_mask as _grpo_high_entropy_mask,
         )
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
@@ -3025,8 +3065,9 @@ def grpo_accumulated_loss(
         if _need_entropy:
             new_entropies = torch.cat(all_entropies_list, dim = 0)
             if _entropy_mask_on:
-                # TRL's own method, so its quantile population, ties and empty-batch rule match per version.
-                entropy_mask = trainer.get_high_entropy_mask(new_entropies.detach(), completion_mask, 1 - _entropy_quantile)
+                # TRL's own method, so its quantile population, ties and empty-batch rule match per version
+                # (multi-process TRL < 0.24 takes the padded gather so an empty rank cannot hang the rest).
+                entropy_mask = _grpo_high_entropy_mask(trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile)
                 kwargs["entropy_mask"] = entropy_mask
 
         # DeepSpeed (no scaler) only: undo training_step's 1/GAS, which transformers >= 5.19 skips when
