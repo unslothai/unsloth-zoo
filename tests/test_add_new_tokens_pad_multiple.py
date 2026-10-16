@@ -221,11 +221,11 @@ def _vllm_wrapper_ns():
 
     import unsloth_zoo
     path = pathlib.Path(unsloth_zoo.__file__).parent / "vllm_utils.py"
-    wanted = {"_padded_vocab_ids", "suppress_vllm_padded_vocab"}
+    wanted = {"_padded_vocab_ids", "suppress_vllm_padded_vocab", "_warn_padded_vocab_for_serve"}
     nodes = [n for n in ast.parse(path.read_text(encoding = "utf-8-sig")).body
              if isinstance(n, ast.FunctionDef) and n.name in wanted]
     assert {n.name for n in nodes} == wanted
-    ns = {"copy": copy, "functools": functools, "inspect": inspect}
+    ns = {"copy": copy, "functools": functools, "inspect": inspect, "torch": torch}
     exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_helpers", "exec"), ns)
     return ns
 
@@ -387,3 +387,86 @@ def test_vllm_padded_vocab_bias_respects_the_logit_bias_limit(capsys):
     small.add_request("r3", "p", _Params({i: 1.0 for i in range(900)}))
     assert [len(r.sampling_params.logit_bias) for r in small.engine_core.seen] == [1000, 963]
     assert capsys.readouterr().out.count("exceed vLLM's limit of 1024") == 2  # once per engine
+
+
+class _V0Params:
+    def __init__(self, n = 1, logits_processors = None):
+        self.n = n
+        self.logits_processors = logits_processors
+
+
+class _V0LLMEngine:
+    # vLLM 0.10.2 V0 LLMEngine: add_request(request_id, prompt, params, ...) rejects requests that
+    # already carry logits_processors, then _add_processed_request(params = ...), which n > 1
+    # children (ParallelSampleSequenceGroup) and _AsyncLLMEngine.add_request_async also call.
+    def __init__(self):
+        self.seen = []
+
+    def add_request(self, request_id, prompt, params, arrival_time = None):
+        if params.logits_processors:
+            raise ValueError("Logits processors are not supported in multi-step decoding")
+        if params.n > 1:
+            for i in range(params.n):
+                self._add_processed_request(request_id = f"{i}_{request_id}", processed_inputs = prompt, params = params)
+            return
+        self._add_processed_request(request_id = request_id, processed_inputs = prompt, params = params)
+
+    def _add_processed_request(self, request_id, processed_inputs, params, arrival_time = 0.0):
+        self.seen.append(params)
+
+
+def test_vllm_padded_vocab_biases_v0_engine():
+    wrap = _vllm_wrapper_ns()["suppress_vllm_padded_vocab"]
+
+    class LLM:
+        def __init__(self):
+            self.llm_engine = _V0LLMEngine()
+
+    class AsyncLLMEngine:
+        def __init__(self):
+            self.engine = _V0LLMEngine()
+
+    llm = LLM()
+    wrap(llm, IDS)
+    wrap(llm, IDS)
+    mine = _V0Params()
+    user_proc = lambda token_ids, logits: logits
+    llm.llm_engine.add_request("r0", "p", mine)
+    llm.llm_engine.add_request("r1", "p", _V0Params(n = 2))
+    llm.llm_engine._add_processed_request(request_id = "r2", processed_inputs = "p", params = _V0Params(logits_processors = [user_proc]))
+    seen = llm.llm_engine.seen
+    assert mine.logits_processors is None
+    assert [len(p.logits_processors) for p in seen] == [1, 1, 1, 2]
+    assert seen[3].logits_processors[0] is user_proc
+    logits = torch.zeros(2100)
+    seen[0].logits_processors[0]([], logits)
+    assert torch.equal(logits[IDS], torch.full((len(IDS),), -100.0))
+    assert int((logits != 0).sum()) == len(IDS)
+    # V0 extends each request's list in place: requests must not share one.
+    assert seen[0].logits_processors is not seen[1].logits_processors
+
+    async_engine = AsyncLLMEngine()
+    wrap(async_engine, IDS)
+    async_engine.engine._add_processed_request(request_id = "a", processed_inputs = "p", params = _V0Params())
+    assert len(async_engine.engine.seen[0].logits_processors) == 1
+
+
+def test_return_args_warns_for_padded_vocab(capsys):
+    import ast
+    import pathlib
+    from types import SimpleNamespace
+
+    import unsloth_zoo
+    warn = _vllm_wrapper_ns()["_warn_padded_vocab_for_serve"]
+    assert warn(SimpleNamespace()) == []
+    assert capsys.readouterr().out == ""
+    assert warn(SimpleNamespace(unsloth_vocab_pad_ids = IDS)) == IDS
+    out = capsys.readouterr().out
+    assert "vllm serve" in out and "logit_bias" in out and "2000 to 2062" in out
+    # load_vllm's return_args exit warns before returning the args.
+    path = pathlib.Path(unsloth_zoo.__file__).parent / "vllm_utils.py"
+    load_vllm = next(n for n in ast.walk(ast.parse(path.read_text(encoding = "utf-8-sig")))
+                     if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+    exits = [n for n in ast.walk(load_vllm) if isinstance(n, ast.If) and ast.unparse(n.test) == "return_args"
+             and any(isinstance(b, ast.Return) for b in ast.walk(n))]
+    assert exits and all("_warn_padded_vocab_for_serve(config)" in ast.unparse(n) for n in exits)

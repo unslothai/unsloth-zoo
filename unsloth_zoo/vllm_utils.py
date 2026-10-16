@@ -3629,8 +3629,56 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         add_request_without_padded_vocab._unsloth_padded_vocab = True
         setattr(client, name, add_request_without_padded_vocab)
     if not hooked:
-        print("Unsloth: this vLLM engine has no engine core client, so padded vocabulary rows stay sampleable.")
+        # V0 engine (vLLM < 0.11, or 0.10.x choosing V0): LLMEngine.add_request and
+        # _AsyncLLMEngine.add_request_async both end in _add_processed_request(params = ...),
+        # as do n > 1 children. V0 rejects logit_bias ids >= len(tokenizer), which alignment rows
+        # are by definition, so append a per-request logits processor applying the same bias.
+        v0 = engine if hasattr(engine, "_add_processed_request") else getattr(engine, "engine", None)
+        method = getattr(v0, "_add_processed_request", None)
+        if method is None:
+            print("Unsloth: this vLLM engine has no known request ingress, so padded vocabulary rows stay sampleable.")
+            return llm
+        if not getattr(method, "_unsloth_padded_vocab", False):
+            indices = {}
+            pad_ids = list(bias)
+
+            def _bias_padded_rows(token_ids, logits):
+                index = indices.get(logits.device)
+                if index is None:
+                    index = indices[logits.device] = torch.tensor(pad_ids, dtype = torch.long, device = logits.device)
+                logits[index] += -100.0
+                return logits
+
+            @functools.wraps(method)
+            def _add_processed_request_without_padded_vocab(*args, **kwargs):
+                params = kwargs.get("params", None)
+                if params is not None and hasattr(params, "logits_processors"):
+                    processors = list(params.logits_processors or [])
+                    if _bias_padded_rows not in processors:
+                        params = copy.copy(params)
+                        # A fresh list: V0 extends it in place with its own processors.
+                        params.logits_processors = processors + [_bias_padded_rows]
+                        kwargs["params"] = params
+                return method(*args, **kwargs)
+
+            _add_processed_request_without_padded_vocab._unsloth_padded_vocab = True
+            v0._add_processed_request = _add_processed_request_without_padded_vocab
     return llm
+pass
+
+
+def _warn_padded_vocab_for_serve(config):
+    # return_args builds a separate `vllm serve`: no engine here to hook, and neither
+    # --generation-config nor --override-generation-config can carry logit_bias (vLLM only reads
+    # temperature, top_p, top_k, min_p, repetition_penalty and max_new_tokens from it).
+    padded_ids = _padded_vocab_ids(config)
+    if padded_ids:
+        print(
+            f"Unsloth: this model has {len(padded_ids)} padded vocabulary rows ({min(padded_ids)} to "
+            f"{max(padded_ids)}) that no token has, and `vllm serve` does not suppress them. Send "
+            f"logit_bias = {{id: -100}} for those ids with every request (the OpenAI API accepts it)."
+        )
+    return padded_ids
 pass
 
 
@@ -4646,6 +4694,7 @@ def load_vllm(
 
         # Quick exit. The finally below restores the patch on the way out.
         if return_args:
+            _warn_padded_vocab_for_serve(config)
             # No engine is built here, so nothing will ever reach delete_vllm to lift the
             # block, and the failure arm below is not reached either. Hand flashinfer back
             # rather than poisoning the session for good.
