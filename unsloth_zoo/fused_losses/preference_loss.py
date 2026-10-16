@@ -124,9 +124,13 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
             scale /= scale_divide
         n_rows = hidden.shape[0]
         grad_hidden = torch.zeros_like(hidden) if need_hidden else None
-        # float32 accumulators: summing per-chunk head gradients in bf16 loses bits every chunk.
+        # float32 bias accumulator: summing per-chunk gradients in bf16 loses bits every chunk.
         acc_dtype = torch.promote_types(weight.dtype, torch.float32)
-        grad_weight = torch.zeros(weight.shape, dtype = acc_dtype, device = weight.device) if need_weight else None
+        # The head gradient is vocab x hidden, so it is accumulated in place in the head dtype like
+        # autograd's own gradient: a float32 accumulator plus per chunk GEMM and cast copies would add
+        # about 8 x vocab x hidden bytes of peak memory for a trainable half precision head. addmm_
+        # still sums each chunk in float32 and rounds once per chunk.
+        grad_weight = torch.zeros_like(weight) if need_weight else None
         grad_bias = (
             torch.zeros(bias.shape, dtype = acc_dtype, device = bias.device)
             if (need_bias and bias is not None) else None
@@ -154,10 +158,8 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
                 if need_hidden:
                     grad_hidden[start:end] = (grad_logits @ weight).to(device = hidden.device, dtype = hidden.dtype)
                 if need_weight:
-                    grad_weight.add_((grad_logits.t() @ chunk_hidden).to(acc_dtype))
+                    grad_weight.addmm_(grad_logits.t(), chunk_hidden)
                 del grad_logits
-        if grad_weight is not None:
-            grad_weight = grad_weight.to(weight.dtype)
         if grad_bias is not None:
             grad_bias = grad_bias.to(bias.dtype)
         return grad_hidden, grad_weight, grad_bias, None, None, None, None, None

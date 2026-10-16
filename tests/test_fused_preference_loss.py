@@ -141,3 +141,46 @@ def test_out_of_memory_does_not_disable_float32_gemm(monkeypatch):
     with pytest.raises(torch.cuda.OutOfMemoryError):
         module._linear_float32(hidden, weight, None)
     assert module._MM_OUT_DTYPE_OK.get(("cpu", torch.bfloat16), True) is True
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_trainable_head_grad_has_no_head_sized_float32_temporaries(dtype):
+    # A trainable head accumulates its vocab x hidden gradient in place in the head dtype; a float32
+    # accumulator plus per chunk head sized GEMM / cast copies used to add GiBs of peak memory.
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    torch.manual_seed(0)
+    vocab, hidden = 64, 16
+    states = torch.randn(2, 9, hidden, dtype = dtype, requires_grad = True)
+    weight = (torch.randn(vocab, hidden) * 0.3).to(dtype).requires_grad_(True)
+    labels = torch.randint(0, vocab, (2, 9))
+    mask = torch.ones(2, 9, dtype = torch.bool)
+    mask[1, 5:] = False
+    head_numel = vocab * hidden
+
+    class Record(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.big = []
+
+        def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+            out = func(*args, **(kwargs or {}))
+            for t in (out if isinstance(out, (tuple, list)) else (out,)):
+                if isinstance(t, torch.Tensor) and t.numel() >= head_numel and t.dtype != dtype:
+                    self.big.append((str(func), t.dtype))
+            return out
+
+    out = fused_linear_token_logps(states, weight, None, labels, mask, chunk_size = 3)["per_token_logps"]
+    record = Record()
+    with record:
+        out.sum().backward()
+    assert record.big == []
+    assert weight.grad.dtype == dtype
+
+    w64 = weight.detach().double().requires_grad_(True)
+    s64 = states.detach().double()
+    want = F.linear(s64, w64).log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1) * mask
+    want.sum().backward()
+    tol = 1e-5 if dtype == torch.float32 else 2e-2
+    rel = (weight.grad.double() - w64.grad).norm() / w64.grad.norm()
+    assert rel < tol
