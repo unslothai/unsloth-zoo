@@ -803,7 +803,7 @@ def _unique_suffix(source):
     suffix, counter = "", 0
     while any(f"{n}{suffix}" in source for n in (
         "_aiter_fn", "_aiter_ok", "_aiter_q", "_aiter_k", "_aiter_v",
-        "_aiter_out", "_call_aiter_safe", "_get_aiter_fn",
+        "_aiter_out", "_call_aiter_safe", "_aiter_device_type",
     )):
         counter += 1
         suffix = f"_{counter}"

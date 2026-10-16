@@ -527,3 +527,17 @@ def test_cmake_targets_skip_an_unreadable_card(monkeypatch):
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     flags = llama_cpp._gpu_cmake_flags("ON")
     assert "-DGPU_TARGETS=gfx1100;gfx1201" in flags
+
+
+def test_compiled_aiter_rewrite_avoids_a_local_named_like_its_module_alias(monkeypatch):
+    from unsloth_zoo import compiler
+    monkeypatch.setattr(device_type, "get_amd_attention_implementation", lambda device = None: "amd_aiter")
+    source = (
+        "def forward(self, q, k, v):\n"
+        "    _aiter_device_type = 1\n"
+        "    out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)\n"
+        "    return out + _aiter_device_type\n"
+    )
+    rewritten = compiler.replace_sdpa_with_amd_aiter(source)
+    assert "import unsloth_zoo.device_type as _aiter_device_type\n" not in rewritten, rewritten
+    assert re.search(r"import unsloth_zoo\.device_type as _aiter_device_type_\d+", rewritten), rewritten
