@@ -1350,6 +1350,63 @@ def test_text_capable_mlx_lm_architecture_still_decides_by_its_sanitize(monkeypa
     ) is False
 
 
+def test_a_tower_stripping_mlx_lm_class_stays_when_mlx_vlm_lacks_the_type(monkeypatch):
+    """Muse Spark: mlx_lm drops its audio tower in sanitize, and mlx-vlm has no muse_spark."""
+    assert _route_text_only(
+        monkeypatch, mlx_lm_class=_StripSanitizeModel, vlm_class=None
+    ) is False
+
+
+def _mlx_lm_architecture(monkeypatch):
+    """A Model whose mlx_lm module's ModelArgs need rope_theta and refuse engram layers."""
+    import dataclasses
+    import sys
+    import types
+
+    module = types.ModuleType("_unsloth_fake_mlx_lm_architecture")
+
+    @dataclasses.dataclass
+    class ModelArgs:
+        rope_theta: float
+        engram_layer_ids: list = None
+        vision_config: dict = None
+
+        @classmethod
+        def from_dict(cls, params):
+            names = inspect.signature(cls).parameters
+            return cls(**{key: value for key, value in params.items() if key in names})
+
+        def __post_init__(self):
+            self.vision_config["hidden_size"] = 0
+            if self.engram_layer_ids:
+                raise NotImplementedError("Engram layers are not supported.")
+
+    class Model(_PlainModel):
+        pass
+
+    Model.__module__ = ModelArgs.__module__ = module.__name__
+    module.Model, module.ModelArgs = Model, ModelArgs
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return Model
+
+
+def test_mlx_lm_keeps_a_wrapper_only_while_its_model_args_take_the_config(monkeypatch):
+    """DeepSeek-V4.1: mlx_lm's ModelArgs refuse the published engram layers, which mlx-vlm builds."""
+    model = _mlx_lm_architecture(monkeypatch)
+    # rope_theta is backfilled from rope_parameters, as mlx_lm's load is handed it.
+    takes = {**_VLM_CONFIG, "rope_parameters": {"rope_theta": 1e4}}
+    refused = {**takes, "engram_layer_ids": [1, 14]}
+
+    def route(config, vlm_class):
+        return _route_text_only(monkeypatch, mlx_lm_class=model, vlm_class=vlm_class, config=config)
+
+    assert route(takes, _VLMOnlyClass) is False
+    assert route(refused, _VLMOnlyClass) is True
+    assert route(_VLM_CONFIG, _VLMOnlyClass) is True
+    assert route(refused, None) is False
+    assert _VLM_CONFIG["vision_config"] == takes["vision_config"] == {"hidden_size": 8}
+
+
 def test_text_only_config_is_never_routed_to_the_vlm_loader(monkeypatch):
     assert _route_text_only(
         monkeypatch,

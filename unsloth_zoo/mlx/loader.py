@@ -798,6 +798,19 @@ _MLX_LM_CONFIG_BACKFILLS = {
 }
 
 
+def _mlx_lm_backfills(config, args_class):
+    parameters = inspect.signature(args_class).parameters
+    filled = {}
+    for key, derive in _MLX_LM_CONFIG_BACKFILLS.items():
+        parameter = parameters.get(key)
+        if parameter is None or parameter.default is not inspect.Parameter.empty or key in config:
+            continue
+        value = derive(config)
+        if value is not None:
+            filled[key] = value
+    return filled
+
+
 def _mlx_lm_config_backfill(model_name, model_path, model_config):
     """model_config plus the required mlx-lm ModelArgs fields config.json lacks but implies."""
     try:
@@ -807,17 +820,9 @@ def _mlx_lm_config_backfill(model_name, model_path, model_config):
         if config.get("model_file") is not None:
             return model_config
         _, args_class = _get_classes(config=config)
-        parameters = inspect.signature(args_class).parameters
+        filled = _mlx_lm_backfills(config, args_class)
     except Exception:
         return model_config
-    filled = {}
-    for key, derive in _MLX_LM_CONFIG_BACKFILLS.items():
-        parameter = parameters.get(key)
-        if parameter is None or parameter.default is not inspect.Parameter.empty or key in config:
-            continue
-        value = derive(config)
-        if value is not None:
-            filled[key] = value
     if not filled:
         return model_config
     listed = ", ".join(f"{key}={value!r}" for key, value in filled.items())
@@ -3450,10 +3455,22 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
         return False
 
     cls = _get_mlx_lm_model_class(model_type)
-    if cls is None:
-        return _resolve_mlx_vlm_model_class(model_type) is not None
+    if cls is not None and _mlx_lm_accepts_config(cls, config) and not _has_multimodal_strip_sanitize(cls):
+        return False
+    return _resolve_mlx_vlm_model_class(model_type) is not None
 
-    return _has_multimodal_strip_sanitize(cls)
+
+def _mlx_lm_accepts_config(cls, config: dict) -> bool:
+    """Whether mlx_lm's ModelArgs take the config its load hands over (deepseek_v41's refuse engram layers)."""
+    args_class = getattr(sys.modules.get(cls.__module__), "ModelArgs", None)
+    if args_class is None or config.get("model_file") is not None:
+        return True
+    try:
+        # Deep: __post_init__ may rewrite nested configs (gemma3's text_config vocab_size).
+        args_class.from_dict(copy.deepcopy({**config, **_mlx_lm_backfills(config, args_class)}))
+    except Exception:
+        return False
+    return True
 
 
 def _mlx_vlm_only_text_model(config: dict, model_type: str) -> bool:
