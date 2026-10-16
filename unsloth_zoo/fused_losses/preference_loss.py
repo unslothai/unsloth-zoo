@@ -67,7 +67,8 @@ def _linear_float32(hidden, weight, bias):
     # A half-precision head rounds its logits to bf16 / fp16 before the softmax; that rounding
     # dominates the logp error, so ask the GEMM for float32 output (torch >= 2.8) where it can.
     key = (hidden.device.type, weight.dtype)
-    if weight.dtype in (torch.float16, torch.bfloat16) and _MM_OUT_DTYPE_OK.get(key, True):
+    # Not on ROCm: its half-in / fp32-out GEMM is a slow fallback (gfx1151: 6-14x a half GEMM).
+    if torch.version.hip is None and weight.dtype in (torch.float16, torch.bfloat16) and _MM_OUT_DTYPE_OK.get(key, True):
         try:
             logits = torch.mm(hidden, weight.t(), out_dtype = torch.float32)
             _MM_OUT_DTYPE_OK[key] = True
