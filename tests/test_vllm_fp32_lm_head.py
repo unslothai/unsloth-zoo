@@ -117,7 +117,10 @@ def _vllm_utils_tree():
 
 def _helpers(monkeypatch, has_apply_head, version):
     tree = _vllm_utils_tree()
-    wanted = {"_fp32_lm_head_requested", "_vllm_supports_fp32_lm_head", "_vllm_fp32_lm_head_overrides"}
+    wanted = {
+        "_fp32_lm_head_requested", "_vllm_supports_fp32_lm_head", "_vllm_fp32_lm_head_overrides",
+        "_patch_vllm_fp32_lm_head_excluded_quant",
+    }
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
     assert {n.name for n in nodes} == wanted
     ns = {"os": os, "vllm_version": version}
@@ -168,3 +171,114 @@ def test_load_vllm_merges_override_before_arg_filter():
     assert -1 < call < merge < arg_filter
     # Merged, not assigned, so the rope / gemma4 / torchao overrides set earlier survive.
     assert "engine_args.get('hf_overrides', {})" in src[call:arg_filter]
+
+
+def _fake_vllm_layers(monkeypatch, accepts_linear_method):
+    # Mirrors the head_dtype guard of LogitsProcessor._apply_head: vLLM 0.26.0 - 0.28.x accept only
+    # UnquantizedEmbeddingMethod, 0.29.0 also accepts UnquantizedLinearMethod.
+    class UnquantizedLinearMethod:
+        pass
+
+    class UnquantizedEmbeddingMethod:
+        pass
+
+    # Built from source so the method names its classes as globals, as vLLM's module does.
+    accepted = "(UnquantizedEmbeddingMethod, UnquantizedLinearMethod)" if accepts_linear_method else "UnquantizedEmbeddingMethod"
+    source = (
+        "def _apply_head(self, lm_head, hidden_states, embedding_bias):\n"
+        "    if self.head_dtype is None or self.head_dtype == hidden_states.dtype:\n"
+        "        return F.linear(hidden_states, lm_head.weight, embedding_bias)\n"
+        f"    if not isinstance(lm_head.quant_method, {accepted}):\n"
+        "        raise ValueError('unquantized lm_head only')\n"
+        "    return F.linear(hidden_states.to(self.head_dtype), lm_head.weight.to(self.head_dtype))\n"
+    )
+    module_globals = {
+        "F": torch.nn.functional,
+        "UnquantizedEmbeddingMethod": UnquantizedEmbeddingMethod,
+        "UnquantizedLinearMethod": UnquantizedLinearMethod,
+    }
+    exec(source, module_globals)
+    _apply_head = module_globals["_apply_head"]
+
+    class LogitsProcessor:
+        pass
+    LogitsProcessor._apply_head = _apply_head
+    names = ["vllm", "vllm.model_executor", "vllm.model_executor.layers"]
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    for leaf, attrs in [
+        ("logits_processor", {"LogitsProcessor": LogitsProcessor, "UnquantizedEmbeddingMethod": UnquantizedEmbeddingMethod}),
+        ("linear", {"UnquantizedLinearMethod": UnquantizedLinearMethod}),
+        ("vocab_parallel_embedding", {"UnquantizedEmbeddingMethod": UnquantizedEmbeddingMethod}),
+    ]:
+        module = types.ModuleType(f"vllm.model_executor.layers.{leaf}")
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    return LogitsProcessor, UnquantizedLinearMethod, UnquantizedEmbeddingMethod
+
+
+def _exec_helpers(version):
+    wanted = {
+        "_fp32_lm_head_requested", "_vllm_supports_fp32_lm_head", "_vllm_fp32_lm_head_overrides",
+        "_patch_vllm_fp32_lm_head_excluded_quant",
+    }
+    nodes = [n for n in _vllm_utils_tree().body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+    ns = {"os": os, "vllm_version": version}
+    exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_helpers", "exec"), ns)
+    return ns
+
+
+def _excluded_head(linear_method_cls):
+    head = torch.nn.Module()
+    head.weight = torch.nn.Parameter(torch.randn(48, 16).to(torch.bfloat16), requires_grad = False)
+    head.quant_method = linear_method_cls()
+    return head
+
+
+def test_excluded_quant_head_fp32_on_vllm_026_028(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    LogitsProcessor, Linear, Embedding = _fake_vllm_layers(monkeypatch, accepts_linear_method = False)
+    ns = _exec_helpers("0.27.0")
+
+    head = _excluded_head(Linear)
+    hidden = torch.randn(3, 16).to(torch.bfloat16)
+    processor = LogitsProcessor()
+    processor.head_dtype = torch.float32
+    # The ModelOpt excluded head fails before the backport ...
+    with pytest.raises(ValueError):
+        processor._apply_head(head, hidden, None)
+    assert ns["_vllm_fp32_lm_head_overrides"](True) == {"head_dtype": "float32"}
+    # ... and projects in fp32 after it, leaving the layer's own quant method in place.
+    out = processor._apply_head(head, hidden, None)
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out, hidden.float() @ head.weight.float().t())
+    assert type(head.quant_method) is Linear
+    # Default head dtype and plain embedding heads go through the original method untouched.
+    processor.head_dtype = None
+    assert processor._apply_head(head, hidden, None).dtype == torch.bfloat16
+    # Patching twice wraps once.
+    patched = LogitsProcessor._apply_head
+    assert ns["_patch_vllm_fp32_lm_head_excluded_quant"]() is False
+    assert LogitsProcessor._apply_head is patched
+
+
+def test_excluded_quant_head_untouched_on_vllm_029(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    LogitsProcessor, Linear, Embedding = _fake_vllm_layers(monkeypatch, accepts_linear_method = True)
+    original = LogitsProcessor._apply_head
+    ns = _exec_helpers("0.29.0")
+    assert ns["_vllm_fp32_lm_head_overrides"](True) == {"head_dtype": "float32"}
+    assert LogitsProcessor._apply_head is original
+
+
+def test_excluded_quant_patch_not_reached_when_off(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
+    LogitsProcessor, Linear, Embedding = _fake_vllm_layers(monkeypatch, accepts_linear_method = False)
+    original = LogitsProcessor._apply_head
+    ns = _exec_helpers("0.27.0")
+    assert ns["_vllm_fp32_lm_head_overrides"](True) == {}
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    # Inference-only engines never request the override, so they never patch either.
+    assert ns["_vllm_fp32_lm_head_overrides"](False) == {}
+    assert LogitsProcessor._apply_head is original
