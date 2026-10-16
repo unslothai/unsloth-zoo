@@ -45,7 +45,5 @@ def test_each_gemm_is_tuned_at_its_real_n(monkeypatch):
         )
 
     gemm1, gemm2 = seen
-    # Autotuner weight is (E, 2 * intermediate_dim, hidden_dim): N = 2I, K = H for gate_up.
     assert (2 * gemm1["intermediate_dim"], gemm1["hidden_dim"]) == (2 * I, H)
-    # Down projection: N = H, K = I.
     assert (2 * gemm2["intermediate_dim"], gemm2["hidden_dim"]) == (H, I)

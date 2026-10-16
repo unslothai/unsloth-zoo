@@ -5277,8 +5277,7 @@ def forward_triton_grouped_gemm(
         else:
             intermediate_dim = self.gate_up_proj.shape[1] // 2
 
-        # The autotuner builds a (E, 2 * intermediate_dim, hidden_dim) weight, so pass half of each GEMM's
-        # N: tuning on a doubled N can pick a BLOCK_SIZE_N that does not divide the real one.
+        # The autotuner doubles intermediate_dim itself: a doubled N can tune a BLOCK_SIZE_N the real N does not divide.
         gemm1_configs = get_or_autotune_moe_kernels(
             num_experts=self.num_experts,
             hidden_dim=hidden_dim,
