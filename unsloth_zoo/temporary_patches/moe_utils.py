@@ -5277,20 +5277,20 @@ def forward_triton_grouped_gemm(
         else:
             intermediate_dim = self.gate_up_proj.shape[1] // 2
 
-        # Autotune first GEMM.
+        # The autotuner doubles intermediate_dim itself: a doubled N can tune a BLOCK_SIZE_N the real N does not divide.
         gemm1_configs = get_or_autotune_moe_kernels(
             num_experts=self.num_experts,
             hidden_dim=hidden_dim,
-            intermediate_dim=intermediate_dim * 2,
+            intermediate_dim=intermediate_dim,
             top_k=top_k,
             dtype=hidden_states.dtype,
         )
 
-        # Autotune second GEMM (output dim is hidden_dim).
+        # Second GEMM: K = intermediate_dim, N = hidden_dim.
         gemm2_configs = get_or_autotune_moe_kernels(
             num_experts=self.num_experts,
             hidden_dim=intermediate_dim,
-            intermediate_dim=hidden_dim,
+            intermediate_dim=hidden_dim // 2 if hidden_dim % 2 == 0 else hidden_dim,
             top_k=top_k,
             dtype=hidden_states.dtype,
         )
