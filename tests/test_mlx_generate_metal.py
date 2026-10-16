@@ -1375,7 +1375,7 @@ def test_dense_prefill_linear_compares_once_per_row_count_decision(monkeypatch, 
     verified = {}
     monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
     if mlx_version is not None:
-        monkeypatch.setattr(inference, "_DENSE_QMM_DISPATCH_MLX", mlx_version)
+        monkeypatch.setattr(inference, "_DENSE_QMM_DISPATCH_MLX", (mlx_version,))
     with inference.dense_prefill_linear(model):
         for n, native in zip(rows, natives):
             assert _same_bits(model(x[:, :n]), native)

@@ -3762,11 +3762,11 @@ _DENSE_QMM_MIN_ROWS = 1024
 _DENSE_QMM_MIN_TILES = 4096
 # The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
 _DENSE_QMM_MAX_WEIGHTS = 1 << 28
-_DENSE_QMM_DISPATCH_MLX = "0.32.3"
+_DENSE_QMM_DISPATCH_MLX = ("0.32.3", "0.32.4")  # 0.32.4's thin NAX case needs N <= 64, so M > 16384 here
 
 
 def _dense_qmm_rows(M, N, K):
-    """What MLX 0.32.3 decides from the row count for both matmuls past the tile floor, so one comparison
+    """What MLX 0.32.3 and 0.32.4 decide from the row count for both matmuls past the tile floor, so one comparison
     covers every row count deciding the same.
 
     Its quantized matmul leaves split K at one there and reads the rows only in bounds checks. Its dense
@@ -3787,7 +3787,7 @@ def _dense_prefill_qmm(module, x, bindings):
     one-column output (a matrix-vector product whose kernel MLX picks by the row count), would need a check
     per prompt length, which costs about what the dense matmul saves, so those take the native call.
     """
-    if mx.__version__ != _DENSE_QMM_DISPATCH_MLX:
+    if mx.__version__ not in _DENSE_QMM_DISPATCH_MLX:
         return None
     if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
         return None
