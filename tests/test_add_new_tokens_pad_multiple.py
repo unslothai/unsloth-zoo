@@ -168,13 +168,32 @@ def test_padded_call_releases_only_its_own_rows(monkeypatch, tmp_path):
     assert model.config.unsloth_vocab_pad_ids == list(range(n1 + 2, padded))
 
 
-def test_vllm_generate_biases_padded_rows(monkeypatch):
-    # vLLM ignores suppress_tokens and samples every config.vocab_size row.
+def test_legacy_padded_model_releases_its_rows(monkeypatch, tmp_path):
+    # Saved by padding code that suppressed the alignment rows but did not record them.
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    n1 = len(tokenizer)
+    padded = model.get_input_embeddings().weight.shape[0]
+    del model.config.unsloth_vocab_pad_ids
+    model.save_pretrained(tmp_path / "m")
+    tokenizer.save_pretrained(tmp_path / "m")
+    model = AutoModelForCausalLM.from_pretrained(tmp_path / "m", torch_dtype = torch.float32)
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path / "m")
+    assert not hasattr(model.config, "unsloth_vocab_pad_ids")
+    assert list(model.generation_config.suppress_tokens) == list(range(n1, padded))
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_b>"])
+    assert tokenizer.convert_tokens_to_ids("<unsloth_b>") == n1
+    assert list(model.generation_config.suppress_tokens) == list(range(n1 + 1, padded))
+    assert model.config.unsloth_vocab_pad_ids == list(range(n1 + 1, padded))
+
+
+def _vllm_wrapper_ns():
     import ast
     import copy
     import functools
+    import inspect
     import pathlib
-    import types
 
     import unsloth_zoo
     path = pathlib.Path(unsloth_zoo.__file__).parent / "vllm_utils.py"
@@ -182,151 +201,165 @@ def test_vllm_generate_biases_padded_rows(monkeypatch):
     nodes = [n for n in ast.parse(path.read_text(encoding = "utf-8-sig")).body
              if isinstance(n, ast.FunctionDef) and n.name in wanted]
     assert {n.name for n in nodes} == wanted
-    ns = {"copy": copy, "functools": functools}
+    ns = {"copy": copy, "functools": functools, "inspect": inspect}
     exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_helpers", "exec"), ns)
-
-    model, tokenizer = _load()
-    assert ns["_padded_vocab_ids"](model.config) == []
-    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
-    ids = ns["_padded_vocab_ids"](model.config)
-    assert ids == list(range(len(tokenizer), model.config.vocab_size))
-
-    class Params:
-        def __init__(self, logit_bias = None):
-            self.logit_bias = logit_bias
-
-    seen = []
-
-    class Engine:
-        def add_request(self, request_id, prompt, params, lora_request = None, priority = 0):
-            seen.append(params)
-            return request_id
-
-    class LLM:
-        # Like vLLM's LLM: every facade method submits through llm_engine.add_request.
-        def __init__(self):
-            self.llm_engine = Engine()
-
-        def _submit(self, prompts, params):
-            params = params if isinstance(params, list) else [params or Params()] * len(prompts)
-            return [self.llm_engine.add_request(str(i), p, q) for i, (p, q) in enumerate(zip(prompts, params))]
-
-        def generate(self, prompts, sampling_params = None, use_tqdm = True):
-            return self._submit(prompts, sampling_params)
-
-        def chat(self, messages, sampling_params = None):
-            return self._submit(messages, sampling_params)
-
-        def enqueue(self, prompts, sampling_params = None):
-            return self._submit(prompts, sampling_params)
-
-    llm = LLM()
-    generate = llm.generate
-    ns["suppress_vllm_padded_vocab"](llm, ids)
-    ns["suppress_vllm_padded_vocab"](llm, ids)
-    assert llm.generate == generate, "facade methods stay unwrapped: the bias is added once, at ingress"
-    mine = Params({5: 2.0})
-    llm.generate(["a"], mine, use_tqdm = False)
-    llm.generate(["a"])
-    llm.generate(["a", "b"], sampling_params = [Params(), Params({ids[0]: 3.0})])
-    llm.chat([["hi"]], mine)
-    llm.enqueue(["a"], Params())
-    want = {i: -100.0 for i in ids}
-    assert seen[0].logit_bias == {5: 2.0, **want} and mine.logit_bias == {5: 2.0}
-    assert seen[1].logit_bias == want
-    assert [p.logit_bias for p in seen[2:4]] == [want, want]
-    assert seen[4].logit_bias == {5: 2.0, **want}
-    assert seen[5].logit_bias == want
-    assert len(seen) == 6
-
-
-def _vllm_wrapper_ns():
-    import ast
-    import copy
-    import functools
-    import pathlib
-
-    import unsloth_zoo
-    path = pathlib.Path(unsloth_zoo.__file__).parent / "vllm_utils.py"
-    nodes = [n for n in ast.parse(path.read_text(encoding = "utf-8-sig")).body
-             if isinstance(n, ast.FunctionDef) and n.name == "suppress_vllm_padded_vocab"]
-    ns = {"copy": copy, "functools": functools}
-    exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_helpers", "exec"), ns)
-    return ns["suppress_vllm_padded_vocab"]
+    return ns
 
 
 class _Params:
-    def __init__(self, logit_bias = None):
+    def __init__(self, logit_bias = None, n = 1):
         self.logit_bias = logit_bias
+        self.n = n
+
+
+class _PoolingParams:
+    pass
+
+
+class _EngineCoreRequest:
+    def __init__(self, request_id, params):
+        self.request_id = request_id
+        is_sampling = hasattr(params, "logit_bias")
+        self.sampling_params = copy_params(params) if is_sampling else None
+        self.pooling_params = None if is_sampling else params
+
+
+def copy_params(params):
+    import copy
+    return copy.copy(params)
+
+
+class _Client:
+    def __init__(self):
+        self.seen = []
+
+    def add_request(self, request):
+        self.seen.append(request)
+
+
+class _AsyncClient:
+    def __init__(self):
+        self.seen = []
+
+    async def add_request_async(self, request):
+        self.seen.append(request)
+
+
+class _LLMEngine:
+    # vLLM 0.29 LLMEngine.add_request: process_inputs (clones params) or a prebuilt
+    # EngineCoreRequest whose own params win, then n > 1 fan-out, then engine_core.add_request.
+    def __init__(self):
+        self.engine_core = _Client()
+
+    def add_request(self, request_id, prompt, params):
+        request = prompt if isinstance(prompt, _EngineCoreRequest) else _EngineCoreRequest(request_id, params)
+        n = getattr(request.sampling_params, "n", 1)
+        for i in range(n):
+            child = request if n == 1 else _EngineCoreRequest(f"{i}_{request_id}", request.sampling_params)
+            self.engine_core.add_request(child)
+        return request_id
+
+
+class _LLM:
+    # vLLM 0.29 LLM: generate / chat / enqueue all end in llm_engine.add_request.
+    def __init__(self):
+        self.llm_engine = _LLMEngine()
+
+    def _submit(self, prompts, params):
+        params = params if isinstance(params, list) else [params or _Params()] * len(prompts)
+        return [self.llm_engine.add_request(str(i), p, q) for i, (p, q) in enumerate(zip(prompts, params))]
+
+    def generate(self, prompts, sampling_params = None):
+        return self._submit(prompts, sampling_params)
+
+    def chat(self, messages, sampling_params = None):
+        return self._submit(messages, sampling_params)
+
+    def enqueue(self, prompts, sampling_params = None):
+        return self._submit(prompts, sampling_params)
+
+
+IDS = list(range(2000, 2063))
+WANT = {i: -100.0 for i in IDS}
+
+
+def test_vllm_generate_biases_padded_rows():
+    ns = _vllm_wrapper_ns()
+    model, tokenizer = _load()
+    assert ns["_padded_vocab_ids"](model.config) == []
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    assert ns["_padded_vocab_ids"](model.config) == list(range(len(tokenizer), model.config.vocab_size))
+
+    llm = _LLM()
+    generate, add_request = llm.generate, llm.llm_engine.add_request
+    ns["suppress_vllm_padded_vocab"](llm, IDS)
+    ns["suppress_vllm_padded_vocab"](llm, IDS)
+    assert llm.generate == generate and llm.llm_engine.add_request == add_request
+    mine = _Params({5: 2.0})
+    llm.generate(["a"], mine)
+    llm.generate(["a", "b"], sampling_params = [_Params(), _Params({IDS[0]: 3.0})])
+    llm.chat([["hi"]], mine)
+    llm.enqueue(["a"], _Params(n = 2))
+    seen = llm.llm_engine.engine_core.seen
+    assert [r.sampling_params.logit_bias for r in seen] == [{5: 2.0, **WANT}, WANT, WANT, {5: 2.0, **WANT}, WANT, WANT]
+    assert mine.logit_bias == {5: 2.0}
+
+
+def test_vllm_padded_vocab_biases_prebuilt_engine_core_request():
+    # LLMEngine.add_request(request_id, EngineCoreRequest, params) sends the request's own params.
+    engine = _LLMEngine()
+    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](engine, IDS)
+    prebuilt = _EngineCoreRequest("r0", _Params({1: 1.0}))
+    engine.add_request("r0", prebuilt, _Params())
+    pooling = _PoolingParams()
+    engine.add_request("r1", "p", pooling)
+    seen = engine.engine_core.seen
+    assert seen[0].sampling_params.logit_bias == {1: 1.0, **WANT}
+    assert seen[1].sampling_params is None and seen[1].pooling_params is pooling
+
+
+def test_vllm_padded_vocab_biases_async_streaming_chunks():
+    # AsyncLLM streaming input: each chunk's own SamplingParams go through process_inputs and
+    # straight to engine_core.add_request_async, never through AsyncLLM.add_request.
+    import asyncio
+
+    class AsyncLLM:
+        def __init__(self):
+            self.engine_core = _AsyncClient()
+
+        async def stream(self, chunks):
+            for i, params in enumerate(chunks):
+                await self.engine_core.add_request_async(_EngineCoreRequest("s", params))
+
+    llm = AsyncLLM()
+    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, IDS)
+    asyncio.run(llm.stream([_Params(), _Params({9: 1.0})]))
+    assert [r.sampling_params.logit_bias for r in llm.engine_core.seen] == [WANT, {9: 1.0, **WANT}]
 
 
 def test_vllm_padded_vocab_not_biased_under_speculative_decoding(capsys):
     # vLLM 0.29 SamplingParams._validate_spec_decode raises on any logit_bias with speculation.
-    seen = []
-
-    class LLM:
-        def generate(self, prompts, sampling_params = None):
-            seen.append(sampling_params)
-
-    llm = LLM()
-    original = llm.generate
-    _vllm_wrapper_ns()(llm, [10, 11], speculative = True)
-    assert llm.generate == original
+    llm = _LLM()
+    add_request = llm.llm_engine.engine_core.add_request
+    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, IDS, speculative = True)
+    assert llm.llm_engine.engine_core.add_request == add_request
     llm.generate(["a"], _Params())
-    assert seen[0].logit_bias is None
+    assert llm.llm_engine.engine_core.seen[0].sampling_params.logit_bias is None
     assert "speculative decoding" in capsys.readouterr().out
-
-
-def test_vllm_padded_vocab_biases_llm_engine_add_request():
-    # load_vllm(use_engine = True) returns an LLMEngine: requests go through add_request.
-    seen = []
-
-    class LLMEngine:
-        def add_request(self, request_id, prompt, params, arrival_time = None):
-            seen.append(params)
-            return request_id
-
-    class PoolingParams:
-        pass
-
-    engine = LLMEngine()
-    wrap = _vllm_wrapper_ns()
-    wrap(engine, [10, 11])
-    wrap(engine, [10, 11])
-    mine = _Params({3: 1.0})
-    assert engine.add_request("r0", "p", mine) == "r0"
-    engine.add_request("r1", "p", params = _Params())
-    pooling = PoolingParams()
-    engine.add_request("r2", "p", pooling)
-    want = {10: -100.0, 11: -100.0}
-    assert seen[0].logit_bias == {3: 1.0, **want} and mine.logit_bias == {3: 1.0}
-    assert seen[1].logit_bias == want
-    assert seen[2] is pooling
 
 
 def test_vllm_padded_vocab_bias_respects_the_logit_bias_limit(capsys):
     # vLLM 0.29 Model Runner V2 raises past MAX_NUM_LOGIT_BIAS_TOKENS (1024) entries per request.
-    seen = []
-
-    class LLMEngine:
-        def add_request(self, request_id, prompt, params):
-            seen.append(params)
-
-    wrap = _vllm_wrapper_ns()
-    big = LLMEngine()
+    wrap = _vllm_wrapper_ns()["suppress_vllm_padded_vocab"]
+    big = _LLMEngine()
     wrap(big, list(range(2000, 3100)))  # pad_to_multiple_of = 2048 territory
-    plain = _Params()
-    big.add_request("r0", "p", plain)
+    big.add_request("r0", "p", _Params())
     big.add_request("r1", "p", _Params())
-    assert seen[0] is plain and plain.logit_bias is None
-    assert seen[1].logit_bias is None
+    assert [r.sampling_params.logit_bias for r in big.engine_core.seen] == [None, None]
 
-    small = LLMEngine()
-    wrap(small, list(range(2000, 2063)))
-    crowded = _Params({i: 1.0 for i in range(1000)})
-    small.add_request("r2", "p", crowded)
-    assert seen[2] is crowded and len(crowded.logit_bias) == 1000
+    small = _LLMEngine()
+    wrap(small, IDS)
+    small.add_request("r2", "p", _Params({i: 1.0 for i in range(1000)}))
     small.add_request("r3", "p", _Params({i: 1.0 for i in range(900)}))
-    assert len(seen[3].logit_bias) == 963
-    out = capsys.readouterr().out
-    assert out.count("exceed vLLM's limit of 1024") == 2  # once per engine
+    assert [len(r.sampling_params.logit_bias) for r in small.engine_core.seen] == [1000, 963]
+    assert capsys.readouterr().out.count("exceed vLLM's limit of 1024") == 2  # once per engine

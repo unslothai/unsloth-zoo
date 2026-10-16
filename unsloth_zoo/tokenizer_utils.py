@@ -135,8 +135,18 @@ def _suppress_padded_rows(model, start, end, now_valid = range(0)):
     if generation_config is None: return
     config = _vocab_pad_config(model)
     owned = list(getattr(config, _VOCAB_PAD_IDS_KEY, None) or []) if config is not None else []
+    suppress = getattr(generation_config, "suppress_tokens", None) or []
+    if suppress and not owned and len(now_valid) and config is not None and not hasattr(config, _VOCAB_PAD_IDS_KEY):
+        # Saved by padding code that did not record its rows: those are exactly every row past the
+        # tokenizer, all suppressed. A model suppressing only some spare rows keeps them.
+        embeddings = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+        rows = getattr(getattr(embeddings, "weight", None), "shape", (0,))[0]
+        legacy = range(now_valid.start, rows)
+        if len(legacy) and set(legacy).issubset(suppress):
+            owned = list(legacy)
+    pass
     if not owned and end <= start: return
-    suppress = list(getattr(generation_config, "suppress_tokens", None) or [])
+    suppress = list(suppress)
     released = set(owned).intersection(now_valid)
     suppress = [i for i in suppress if i not in released]
     owned = [i for i in owned if i not in released]

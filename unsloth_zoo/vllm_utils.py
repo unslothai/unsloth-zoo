@@ -3563,7 +3563,7 @@ pass
 def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
     """vLLM samples every row of config.vocab_size and ignores generation_config.suppress_tokens,
     so alignment rows from add_new_tokens(pad_to_multiple_of = ...) could be emitted as ids no
-    tokenizer token has. Bias them to -100 on every request at the engine's add_request.
+    tokenizer token has. Bias them to -100 on every request the engine core receives.
     Idempotent."""
     if speculative:
         # SamplingParams._validate_spec_decode rejects any logit_bias under speculative decoding
@@ -3581,11 +3581,15 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         max_bias = 1024
     warned = []
 
-    def _with_bias(params):
+    def _bias_request(request):
+        params = getattr(request, "sampling_params", None)
         if params is None or not hasattr(params, "logit_bias"):
-            # PoolingParams: nothing is sampled.
-            return params
-        merged = {**(params.logit_bias or {}), **bias}
+            # Pooling request: nothing is sampled.
+            return
+        current = params.logit_bias or {}
+        if all(current.get(i) == -100.0 for i in bias):
+            return
+        merged = {**current, **bias}
         if len(merged) > max_bias:
             if not warned:
                 warned.append(True)
@@ -3593,34 +3597,39 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
                     f"Unsloth: {len(merged)} logit_bias entries exceed vLLM's limit of {max_bias}, so "
                     "this padded vocabulary's alignment rows stay sampleable for such requests."
                 )
-            return params
+            return
         params = copy.copy(params)
         params.logit_bias = merged
-        return params
+        request.sampling_params = params
 
-    # Every LLM entry point (generate, chat, enqueue, enqueue_chat, beam search) submits through
-    # llm.llm_engine.add_request, and LLMEngine / AsyncLLM take requests there too, so wrapping
-    # that one ingress biases each request exactly once.
-    engine = getattr(llm, "llm_engine", None)
-    target = engine if getattr(engine, "add_request", None) is not None else llm
-    add_request = getattr(target, "add_request", None)
-    if add_request is None:
-        print("Unsloth: this vLLM engine has no add_request, so padded vocabulary rows stay sampleable.")
-        return llm
-    if getattr(add_request, "_unsloth_padded_vocab", False):
-        return llm
-
-    @functools.wraps(add_request)
-    def add_request_without_padded_vocab(*args, **kwargs):
-        # add_request(request_id, prompt, params, ...)
-        if "params" in kwargs:
-            kwargs["params"] = _with_bias(kwargs["params"])
-        elif len(args) > 2:
-            args = args[:2] + (_with_bias(args[2]),) + args[3:]
-        return add_request(*args, **kwargs)
-
-    add_request_without_padded_vocab._unsloth_padded_vocab = True
-    target.add_request = add_request_without_padded_vocab
+    # Every request reaches the engine core as an EngineCoreRequest through the frontend client's
+    # add_request / add_request_async: LLM.generate / chat / enqueue, LLMEngine and AsyncLLM
+    # add_request (also with a prebuilt EngineCoreRequest), n > 1 children and AsyncLLM streaming
+    # input chunks. Biasing there covers them all, once per request.
+    engine = getattr(llm, "llm_engine", None) or llm
+    client = getattr(engine, "engine_core", None)
+    hooked = False
+    for name in ("add_request", "add_request_async"):
+        method = getattr(client, name, None) if client is not None else None
+        if method is None:
+            continue
+        hooked = True
+        if getattr(method, "_unsloth_padded_vocab", False):
+            continue
+        if inspect.iscoroutinefunction(method):
+            @functools.wraps(method)
+            async def add_request_without_padded_vocab(request, *args, _method = method, **kwargs):
+                _bias_request(request)
+                return await _method(request, *args, **kwargs)
+        else:
+            @functools.wraps(method)
+            def add_request_without_padded_vocab(request, *args, _method = method, **kwargs):
+                _bias_request(request)
+                return _method(request, *args, **kwargs)
+        add_request_without_padded_vocab._unsloth_padded_vocab = True
+        setattr(client, name, add_request_without_padded_vocab)
+    if not hooked:
+        print("Unsloth: this vLLM engine has no engine core client, so padded vocabulary rows stay sampleable.")
     return llm
 pass
 
