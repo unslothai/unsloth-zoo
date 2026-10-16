@@ -105,11 +105,14 @@ def _fake_hub(monkeypatch, base, fail):
     from unsloth_zoo import saving_utils as S
 
     shards = sorted(f for f in os.listdir(base) if f.endswith(".safetensors"))
+    revisions = []
+    _fake_hub.revisions = revisions
 
     class _FS:
         def __init__(self, *a, **k):
             pass
-        def ls(self, name, detail = True):
+        def ls(self, name, detail = True, **k):
+            revisions.append(k.get("revision"))
             return [{"name": f"{name}/{f}", "size": os.path.getsize(os.path.join(base, f))} for f in shards]
 
     fetched = []
@@ -124,9 +127,6 @@ def _fake_hub(monkeypatch, base, fail):
                 fetched.append(f)
             if os.path.exists(os.path.join(base, f)):
                 shutil.copyfile(os.path.join(base, f), os.path.join(local_dir, f))
-
-    revisions = []
-    _fake_hub.revisions = revisions
 
     def _snapshot(repo_id, local_dir = None, allow_patterns = (), **k):
         revisions.append(k.get("revision"))
@@ -381,3 +381,22 @@ def test_partial_cache_copy_is_reported_when_a_later_fetch_fails(tmp_path, monke
     printed = capsys.readouterr().out
     assert "is incomplete" in printed and first in printed
     assert open(os.path.join(out, first), "rb").read() == open(os.path.join(base, first), "rb").read()
+
+
+def test_hub_listing_pins_the_same_commit_as_the_fetches(tmp_path, monkeypatch):
+    # Names and sizes come from the listing; an unpinned one can describe an older commit.
+    import huggingface_hub
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path, "20KB")
+    monkeypatch.setattr(huggingface_hub.HfApi, "model_info", lambda self, repo_id, **k: _ModelInfo())
+    _fake_hub(monkeypatch, base, fail = False)
+    listed = []
+    real_fs = S.HfFileSystem
+    class _RecordingFS(real_fs):
+        def ls(self, name, detail = True, **k):
+            listed.append(k.get("revision"))
+            return super().ls(name, detail = detail, **k)
+    monkeypatch.setattr(S, "HfFileSystem", _RecordingFS)
+    H.run_merge(peft_model, base, str(tmp_path / "out"), save_dtype = torch.float32, low_disk_space_usage = True)
+    assert listed and set(listed) == {_ModelInfo.sha}

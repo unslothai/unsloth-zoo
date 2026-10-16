@@ -4968,8 +4968,11 @@ def merge_and_overwrite_lora(
             # Third Hub round trip on this path, and it had the same bare `except:` as
             # the other two: an unreachable Hub was reported as "Could not determine
             # original model ID", a claim about the name rather than the network.
+            # The listing is pinned to the same commit as every fetch below, so the shard names
+            # and sizes cannot describe an older commit than the files downloaded.
             try:
-                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+                _hub_revision = _resolve_hub_commit(model_name, token)
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True, revision = _hub_revision)
             except _HUB_ABSENT_ERRORS:
                 # Genuinely absent, which is what the original-model-id fallback is for.
                 original_model_id = get_original_model_id(model_name)
@@ -4979,7 +4982,8 @@ def merge_and_overwrite_lora(
                 # Assigned after the check so the message above names the failing input
                 # instead of always saying "from None".
                 model_name = original_model_id
-                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+                _hub_revision = _resolve_hub_commit(model_name, token)
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True, revision = _hub_revision)
             except Exception as e:
                 raise _hub_unreachable_error(
                     model_name, e,
@@ -5000,7 +5004,6 @@ def merge_and_overwrite_lora(
                 safetensors_list.append(fname)
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
-            _hub_revision = _resolve_hub_commit(model_name, token)
 
             # Drop stale/duplicate shard sets the index doesn't reference. Some repos (e.g.
             # granite-3.2-8b-instruct) ship a leftover second shard set next to the real one while
