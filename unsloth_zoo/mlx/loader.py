@@ -1060,7 +1060,8 @@ def _raise_mlx_remote_code_refusal(model_path, error, *, tokenizer_only=False):
             ) from error
 
 
-# mlx-lm < 0.32 and mlx-vlm exec a config.json `model_file` unchecked; trust is scoped here.
+# mlx-lm < 0.32 and mlx-vlm exec a config.json `model_file` unchecked; trust is scoped here and
+# handed to the releases that take their own `trust_remote_code`.
 _MLX_MODEL_FILE_TRUST = contextvars.ContextVar("unsloth_mlx_model_file_trust", default=False)
 
 
@@ -1103,9 +1104,9 @@ def _guard_mlx_model_file_loader(module, name, declared_model_file, required_par
         signature = inspect.signature(original)
     except (TypeError, ValueError):
         return
-    # Newer releases gate model_file on their own trust_remote_code; older ones never exec it.
-    if "trust_remote_code" in signature.parameters or required_parameter not in signature.parameters:
+    if required_parameter not in signature.parameters:
         return
+    forwards_trust = "trust_remote_code" in signature.parameters
 
     @wraps(original)
     def guarded(*args, **kwargs):
@@ -1120,12 +1121,14 @@ def _guard_mlx_model_file_loader(module, name, declared_model_file, required_par
                 f"Unsloth: The model at {model_path} names a model_file ({model_file!r}) outside "
                 "its own folder. Refusing to run it."
             )
-        if model_file and not _MLX_MODEL_FILE_TRUST.get():
+        if model_file and not (_MLX_MODEL_FILE_TRUST.get() or forwards_trust and arguments.get("trust_remote_code")):
             raise ValueError(
                 f"Unsloth: The model at {model_path} requires importing and running a custom "
                 f"module ({model_file!r}) to build its architecture. This is disabled by "
                 "default. Pass trust_remote_code=True if you trust this model."
             )
+        if forwards_trust and "trust_remote_code" not in arguments:
+            kwargs["trust_remote_code"] = _MLX_MODEL_FILE_TRUST.get()
         return original(*args, **kwargs)
 
     guarded._unsloth_model_file_guard = True
@@ -7502,7 +7505,8 @@ def _mlx_generate(self, *args, **kwargs):
                 dense_prefill_linear(self), \
                 fused_packed_gated_delta(self), \
                 fused_residual_norm_handoff(self):
-            for response in stream_generate(
+            # mlx-lm 0.32 refuses max_tokens=0; the reply is then just the prompt.
+            for response in () if max_tokens == 0 else stream_generate(
                 self,
                 tokenizer,
                 prompt_ids,

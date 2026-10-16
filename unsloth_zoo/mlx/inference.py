@@ -144,14 +144,16 @@ _MOE_GATE_UP_LOCK = RLock()
 
 # Bodies the fused expert call reimplements. The two switch layer packages no longer share a
 # `SwitchGLU.__call__`: mlx-vlm 0.7.1 gave it a short-sequence decode path that mlx-lm has not
-# taken, so that one name is hashed per package and mlx-vlm accepts either body.
+# taken, so that one name is hashed per package and mlx-vlm accepts either body. mlx-lm 0.32
+# passes an nvfp4 per-expert `global_scale`, which `_moe_gate_up_packable` refuses.
+_QUANTIZED_SWITCH_CALLS = ("59bbb193612cbe06", "dc4bcc9ffe32ef12")
 _MOE_GATE_UP_FUNCTIONS = {
-    "QuantizedSwitchLinear.__call__": "59bbb193612cbe06",
+    "QuantizedSwitchLinear.__call__": _QUANTIZED_SWITCH_CALLS,
     "_gather_sort": "75657d7fb03060c6",
     "_scatter_unsort": "78d5aa7dbef7183e",
 }
 _MOE_SWITCH_GLU_CALLS = {
-    "mlx_lm.models.switch_layers": ("ed00798a68bad37d",),
+    "mlx_lm.models.switch_layers": ("ed00798a68bad37d", "3a412610c5b9c112"),
     "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265"),
 }
 
@@ -188,6 +190,8 @@ def _moe_gate_up_packable(module, projection_type):
     if _native_type(gate) is not projection_type or _native_type(up) is not projection_type:
         return False
     if gate.trainable_parameters() or up.trainable_parameters():
+        return False
+    if gate.get("global_scale") is not None or up.get("global_scale") is not None:
         return False
     if (gate.group_size, gate.bits, gate.mode) != (up.group_size, up.bits, up.mode):
         return False
@@ -3066,6 +3070,7 @@ _MOE_ROUTER_BODIES = {
     # gemma4 Router in mlx_vlm gemma4_text, gemma4 and mlx_lm gemma4_text
     "c64fed4e7e7514ea": (_gemma4_router_call, _GEMMA_ROUTING, "config.num_experts", "config.top_k_experts"),
     "09b6eefdbdfb7f24": (_gemma4_router_call, _GEMMA_ROUTING, "config.num_experts", "config.top_k_experts"),
+    "c8835cdceb1c6c95": (_gemma4_router_call, _GEMMA_ROUTING, "config.num_experts", "config.top_k_experts"),
 }
 
 
@@ -3463,7 +3468,7 @@ def _nax_qmm_classes(*cache_key):
     }
 
 
-_NAX_SWITCH_CONTRACT = {path: {"QuantizedSwitchLinear.__call__": "59bbb193612cbe06"}
+_NAX_SWITCH_CONTRACT = {path: {"QuantizedSwitchLinear.__call__": _QUANTIZED_SWITCH_CALLS}
                         for path in ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers")}
 
 

@@ -442,11 +442,13 @@ try:
 except ImportError:  # mlx-vlm < 0.6 layers call mlx-lm's module
     vlm_gated_delta = lm_gated_delta
 
-# The scope leaves a module that packs on its own (mlx-vlm 0.7.8) alone, so the route is exercised on one that does not.
+# The scope leaves a module that packs on its own (mlx-vlm 0.7.8, mlx-lm 0.32) alone, so the route is exercised on one
+# that does not, when one is installed.
 _PACKED_SOURCES = [case for case in [(native, vlm_gated_delta, native.Qwen3_5GatedDeltaNet, native.ArraysCache),
                                      (lm_qwen3_5, lm_gated_delta, lm_qwen3_5.GatedDeltaNet, lm_cache.ArraysCache)]
                    if not hasattr(case[1], "_gated_delta_kernel_packed")]
-_, routed_gated_delta, _ROUTED_LAYER, _ = _PACKED_SOURCES[0]
+_, routed_gated_delta, _ROUTED_LAYER, _ = _PACKED_SOURCES[0] if _PACKED_SOURCES else (None,) * 4
+_needs_unpacked_source = pytest.mark.skipif(not _PACKED_SOURCES, reason = "every installed gated-delta module packs")
 
 
 def _packable_model(layer = _ROUTED_LAYER):
@@ -510,6 +512,7 @@ def test_packed_scope_preserves_prefill_and_decode_and_restores(consumer, source
     assert source.gated_delta_kernel is stock
 
 
+@_needs_unpacked_source
 def test_packed_route_keeps_other_shapes_and_a_differing_kernel_on_the_generic_kernel(monkeypatch, caplog):
     stock, packed = routed_gated_delta.gated_delta_kernel, decode._packed_gated_delta
     monkeypatch.setattr(decode, "_GATED_DELTA_VERDICTS", {})
@@ -539,6 +542,7 @@ def test_packed_route_keeps_other_shapes_and_a_differing_kernel_on_the_generic_k
         route(*_recurrence(mx.bfloat16))
 
 
+@_needs_unpacked_source
 @pytest.mark.parametrize("reason", ["switch", "upstream", "body", "kernel", "distributed", "model"])
 def test_packed_scope_steps_aside(reason, monkeypatch, caplog):
     stock, model = routed_gated_delta.gated_delta_kernel, _packable_model()
@@ -559,6 +563,7 @@ def test_packed_scope_steps_aside(reason, monkeypatch, caplog):
     assert ("differs from the version" in caplog.text) == (reason == "body")
 
 
+@_needs_unpacked_source
 def test_packed_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
     stock, model, foreign = routed_gated_delta.gated_delta_kernel, _packable_model(), lambda *args: None
     with decode.fused_packed_gated_delta(model):

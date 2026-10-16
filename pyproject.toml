@@ -48,8 +48,9 @@ dependencies = [
     # Silicon lane is green on the new release.
     "mlx==0.32.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # GenerationBatch.Response and BatchGenerator.next_generated, which batched
-    # generation drives, first ship in mlx-lm 0.31.2.
-    "mlx-lm==0.31.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # generation drives, first ship in mlx-lm 0.31.2. A range, not a pin: 0.32 requires Python 3.11,
+    # so Python 3.10 resolves 0.31.3.
+    "mlx-lm>=0.31.3,<=0.32.2 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # Ceiling, not a pin: an older transformers (unsloth's <=5.5.0) still resolves 0.6.4,
     # since 0.6.5+ needs transformers>=5.14. unsloth #9466 is fixed in 0.6.9.
     "mlx-vlm>=0.4.4,<=0.7.8 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
@@ -108,7 +109,7 @@ mlx = [
     # Keep in sync with the MLX-only dependency pins above, including the reason
     # they are pins.
     "mlx==0.32.3",
-    "mlx-lm==0.31.3",
+    "mlx-lm>=0.31.3,<=0.32.2",
     "mlx-vlm>=0.4.4,<=0.7.8",
 ]
 core = [

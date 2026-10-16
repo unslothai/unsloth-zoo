@@ -795,6 +795,24 @@ def _row_processors(request: GenerationRequest) -> list:
     return [_sequential_history(fn) for fn in (request.logits_processors or ())]
 
 
+@functools.cache
+def _mlx_lm_shows_the_prompt() -> bool:
+    """mlx-lm 0.32 shows a processor the whole prompt, batched and alone alike."""
+    try:
+        from importlib.metadata import version
+        from packaging.version import Version
+
+        return Version(version("mlx-lm")) >= Version("0.32.0")
+    except Exception:
+        return True
+
+
+def _text_row_processors(request: GenerationRequest) -> list:
+    if _mlx_lm_shows_the_prompt():
+        return list(request.logits_processors or ())
+    return _row_processors(request)
+
+
 class _PerRowSampler:
 
     def __init__(self, params, *, sample_utils_module, make_sampler):
@@ -1634,7 +1652,7 @@ class _TextBatchSession:
                 [prompt],
                 max_tokens=[int(request.max_tokens or defaults.max_tokens)],
                 samplers=[sampler],
-                logits_processors=[_row_processors(request)],
+                logits_processors=[_text_row_processors(request)],
             )
         except BaseException:
             self.usable = False

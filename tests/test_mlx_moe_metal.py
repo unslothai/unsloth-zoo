@@ -2,6 +2,7 @@
 import contextlib
 import functools
 import gc
+import inspect
 import sys
 import threading
 from types import FunctionType, SimpleNamespace
@@ -21,7 +22,10 @@ from mlx.utils import tree_flatten
 from mlx_lm.models import gemma4_text as lm_gemma
 from mlx_lm.models import qwen3_next as lm_qwen
 from mlx_lm.models import switch_layers as lm
-from mlx_lm.models.gpt_oss import SwiGLU
+try:
+    from mlx_lm.models.activations import SwigluOAI as SwiGLU
+except ImportError:  # mlx-lm < 0.32
+    from mlx_lm.models.gpt_oss import SwiGLU
 from mlx_vlm.models import switch_layers as vlm
 from mlx_vlm.models.gemma4 import language as vlm_gemma
 from mlx_vlm.models.gemma4.language import GeGLU
@@ -394,6 +398,24 @@ def test_accepted_switch_glu_bodies_cover_the_installed_packages():
     for path, accepted in fusion._MOE_SWITCH_GLU_CALLS.items():
         native = {"mlx_lm.models.switch_layers": lm, "mlx_vlm.models.switch_layers": vlm}[path]
         assert fusion._ast_fingerprint(native.SwitchGLU.__call__) in accepted
+
+
+@pytest.mark.skipif("global_scale" not in inspect.signature(lm.SwitchLinear.to_quantized).parameters,
+                    reason = "Requires an mlx-lm with nvfp4 global scales")
+def test_global_scale_projections_keep_the_native_path():
+    # gate and up each carry their own per-expert scale, which one packed matmul cannot apply
+    mx.random.seed(19)
+    model = lm.SwitchGLU(2048, 512, 8, bias = False)
+    model.set_dtype(mx.bfloat16)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(model, name, getattr(model, name).to_quantized(16, 4, mode = "nvfp4", global_scale = True))
+    model.eval()
+    model.freeze()
+    samples = _samples(model, mx.bfloat16, 2048, [(1, 1), (1, 32)])
+    with fused_moe_gate_up(model):
+        assert type(model) is lm.SwitchGLU
+        for x, indices, expected in samples:
+            _equal(model(x, indices), expected)
 
 
 def test_routing_bodies_cover_the_installed_packages():
