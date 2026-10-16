@@ -253,3 +253,16 @@ def test_cuda_autocast_matches_plain_function(rows, head_dtype):
     for a, b in zip(*results):
         assert a.shape == b.shape
         assert float((a - b).abs().max() / b.abs().max()) < 1e-2
+
+
+def test_cached_function_survives_a_missing_compiled_flag():
+    # A monkeypatch of _use_compiled on the module function, undone after the autograd function
+    # was cached, deletes the flag; later calls must fall back to the default instead of raising.
+    function = _standalone()
+    head, states, _, index, weights, _ = _inputs(rows = 6, bias = False, seed = 3)
+    function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0)
+    assert getattr(function, "_autograd_function", None) is not None
+    del function._use_compiled
+    out = function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0)
+    (out * weights).sum().backward()
+    assert out.isfinite().all()

@@ -366,7 +366,8 @@ def chunked_hidden_states_selective_log_softmax_recompute(
         compiled_backward = compile_function(dynamic = True, fullgraph = True)(post_backward)
 
         def run(kernel, eager, *args):
-            if self_fn._use_compiled:
+            # getattr: the cached autograd function can outlive the flag (a test's monkeypatch undo).
+            if getattr(self_fn, "_use_compiled", True):
                 try:
                     return kernel(*args)
                 except Exception:
