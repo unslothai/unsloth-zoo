@@ -25,7 +25,7 @@ import warnings
 import gc
 import threading
 import weakref
-from .utils import _get_dtype, Version
+from .utils import _get_dtype, Version, is_distributed
 # Re-exported under its old name: it lives in integrated_device.py so the import-time
 # allocator block can share the topic without importing torch.
 from .integrated_device import _any_device_integrated
@@ -1587,6 +1587,16 @@ class NonReentrantActivationOffloader:
             self.keep_last = max(0, int(os.environ.get("UNSLOTH_GC_STREAM_KEEP_LAST", "1")))
         except ValueError:
             self.keep_last = 1
+        # A side stream D2H keeps its device block until the copy ends (record_stream), and
+        # unthrottled copies piled up 2-4 activations of extra VRAM. 0 copies on the compute
+        # stream (no extra VRAM, no overlap, the single GPU default); N > 0 overlaps the next
+        # layers with at most N copies in flight per device (distributed default 1).
+        default_inflight = 1 if is_distributed() else 0
+        try:
+            self.max_inflight = max(0, int(os.environ.get("UNSLOTH_GC_MAX_INFLIGHT_COPIES", default_inflight)))
+        except ValueError:
+            self.max_inflight = default_inflight
+        self.inflight = {}
         self.d2h_streams = {}
         self.h2d_streams = {}
         # Weak, so a graph dropped without backward frees its activations. Forward order.
@@ -1606,6 +1616,24 @@ class NonReentrantActivationOffloader:
         nbytes = x.numel() * x.element_size()
         if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled() and _reserve_pinned(nbytes):
             device_index = x.device.index
+            if self.max_inflight == 0:
+                try:
+                    host = x.to("cpu", non_blocking = True)
+                except RuntimeError as e:
+                    _release_pinned(nbytes)
+                    if not _is_host_alloc_oom(e): raise
+                    _warn_pinned_unavailable(e)
+                else:
+                    record.host, record.pinned_bytes = host, nbytes
+                    self.stats["pinned"] += 1
+                    return
+                record.host = x.to("cpu")
+                self.stats["pageable"] += 1
+                return
+            inflight = self.inflight.setdefault(device_index, [])
+            # Wait on the host for the oldest copies past the limit so their blocks can be reused.
+            while inflight and (len(inflight) >= self.max_inflight or inflight[0].query()):
+                inflight.pop(0).synchronize()
             side = self._stream(self.d2h_streams, device_index)
             side.wait_stream(torch.cuda.current_stream(device_index))
             try:
@@ -1621,6 +1649,7 @@ class NonReentrantActivationOffloader:
             else:
                 # The caller drops x next; its block must outlive the copy.
                 x.record_stream(side)
+                inflight.append(copied)
                 record.host, record.copied, record.pinned_bytes = host, copied, nbytes
                 self.stats["pinned"] += 1
                 return

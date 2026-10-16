@@ -62,7 +62,7 @@ def _run(hooks, layers, seed = 0):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
-@pytest.mark.parametrize("mode", ["default", "stream_keep0", "stream_keep1", "stream_keep2", "pageable"])
+@pytest.mark.parametrize("mode", ["default", "side1", "side2", "stream_keep0", "stream_keep1", "stream_keep2", "pageable"])
 def test_gradients_match_plain_checkpoint(gc_module, monkeypatch, mode):
     torch.manual_seed(0)
     layers = [
@@ -73,6 +73,8 @@ def test_gradients_match_plain_checkpoint(gc_module, monkeypatch, mode):
         monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", "0")
     if mode.startswith("stream"):
         monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", mode[-1])
+    if mode.startswith("side"):
+        monkeypatch.setenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", mode[-1])
     offloader = gc_module.NonReentrantActivationOffloader(stream_mode = mode.startswith("stream"))
     ref_loss, ref_grads = _run(None, layers)
     for _ in range(2):  # the second step reuses cached pinned blocks
@@ -87,6 +89,8 @@ def test_gradients_match_plain_checkpoint(gc_module, monkeypatch, mode):
         assert stats["pinned"] > 0 and stats["pageable"] == 0
     if mode.startswith("stream"):
         assert stats["prefetch_hits"] == stats["prefetched"] > 0
+    if mode.startswith("side"):
+        assert offloader.d2h_streams and len(offloader.inflight[0]) <= int(mode[-1])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
@@ -161,3 +165,48 @@ def test_stream_prefetch_skips_inputs_already_unpacked(gc_module, monkeypatch, k
         assert torch.equal(a, b)
     assert offloader.stats["prefetched"] > 0
     assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"]
+
+
+def _forward_peak_active(hooks, n_layers = 12):
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    base = torch.cuda.memory_stats()["active_bytes.all.current"]
+    torch.cuda.reset_peak_memory_stats()
+    h = torch.randn(1, 4096, 2048, device = "cuda", dtype = torch.float16, requires_grad = True)  # 16 MiB
+    for _ in range(n_layers):
+        with hooks():
+            h = ckpt.checkpoint(lambda a: torch.tanh(a * 0.9), h, use_reentrant = False)
+    torch.cuda.synchronize()
+    peak = torch.cuda.memory_stats()["active_bytes.all.peak"] - base
+    h.float().mean().backward()
+    return peak
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_single_gpu_default_copies_on_the_compute_stream(gc_module, monkeypatch):
+    # Copying on the compute stream, like the saved_tensors_hooks Unsloth used before, frees
+    # each block in stream order, so offloading adds no VRAM over that baseline.
+    monkeypatch.delenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", raising = False)
+    monkeypatch.setattr(gc_module, "is_distributed", lambda: False)
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    assert offloader.max_inflight == 0
+
+    def pack(x):
+        if x.requires_grad and x.device.type != "cpu": return x.device, x.to("cpu", non_blocking = True)
+        return None, x
+
+    def unpack(packed):
+        device, x = packed
+        return x if device is None else x.to(device, non_blocking = True)
+
+    baseline = _forward_peak_active(lambda: torch.autograd.graph.saved_tensors_hooks(pack, unpack))
+    assert _forward_peak_active(offloader.hooks) <= baseline
+    assert offloader.stats["pinned"] > 0 and not offloader.d2h_streams
+
+
+def test_distributed_default_bounds_inflight_copies(gc_module, monkeypatch):
+    monkeypatch.delenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", raising = False)
+    monkeypatch.setattr(gc_module, "is_distributed", lambda: True)
+    assert gc_module.NonReentrantActivationOffloader().max_inflight == 1
+    monkeypatch.setenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", "3")
+    assert gc_module.NonReentrantActivationOffloader().max_inflight == 3
