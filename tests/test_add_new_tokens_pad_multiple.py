@@ -176,6 +176,7 @@ def test_legacy_padded_model_releases_its_rows(monkeypatch, tmp_path):
     n1 = len(tokenizer)
     padded = model.get_input_embeddings().weight.shape[0]
     del model.config.unsloth_vocab_pad_ids
+    del model.config.unsloth_vocab_pad_suppressed_ids
     model.save_pretrained(tmp_path / "m")
     tokenizer.save_pretrained(tmp_path / "m")
     model = AutoModelForCausalLM.from_pretrained(tmp_path / "m", torch_dtype = torch.float32)
@@ -186,6 +187,29 @@ def test_legacy_padded_model_releases_its_rows(monkeypatch, tmp_path):
     assert tokenizer.convert_tokens_to_ids("<unsloth_b>") == n1
     assert list(model.generation_config.suppress_tokens) == list(range(n1 + 1, padded))
     assert model.config.unsloth_vocab_pad_ids == list(range(n1 + 1, padded))
+
+
+def test_alignment_rows_already_suppressed_are_still_recorded_for_vllm(monkeypatch):
+    # vLLM only biases the recorded rows, so a row the caller already suppressed must be recorded
+    # too; it stays the caller's suppression when it later becomes a token.
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    n0 = len(tokenizer)
+    model.generation_config.suppress_tokens = [7, n0 + 1]
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    n1 = len(tokenizer)
+    padded = model.get_input_embeddings().weight.shape[0]
+    assert n1 == n0 + 1 and n1 < padded
+    assert model.config.unsloth_vocab_pad_ids == list(range(n1, padded))
+    assert model.config.unsloth_vocab_pad_suppressed_ids == list(range(n1 + 1, padded))
+    assert sorted(model.generation_config.suppress_tokens) == [7] + list(range(n1, padded))
+
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_b>", "<unsloth_c>"])
+    assert tokenizer.convert_tokens_to_ids("<unsloth_b>") == n1
+    # n1 was the caller's: still suppressed. n1 + 1 was ours: released. Neither is an alignment row now.
+    assert sorted(model.generation_config.suppress_tokens) == [7, n1] + list(range(n1 + 2, padded))
+    assert model.config.unsloth_vocab_pad_ids == list(range(n1 + 2, padded))
+    assert model.config.unsloth_vocab_pad_suppressed_ids == list(range(n1 + 2, padded))
 
 
 def _vllm_wrapper_ns():

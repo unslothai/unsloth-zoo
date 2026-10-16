@@ -115,15 +115,25 @@ def _round_up_vocab(n_rows, pad_to_multiple_of):
 pass
 
 
-# Alignment rows Unsloth added (and suppressed), on the text config so they survive save / load
-# and reach vLLM through the model config.
+# On the text config so they survive save / load and reach vLLM through the model config:
+# every alignment row (no token has it: vLLM biases these), and the subset of those Unsloth itself
+# put in suppress_tokens (only these are released when a row becomes a token).
 _VOCAB_PAD_IDS_KEY = "unsloth_vocab_pad_ids"
+_VOCAB_PAD_SUPPRESSED_KEY = "unsloth_vocab_pad_suppressed_ids"
 
 
 def _vocab_pad_config(model):
     config = getattr(model, "config", None)
     get_text_config = getattr(config, "get_text_config", None)
     return get_text_config() if callable(get_text_config) else config
+pass
+
+
+def _set_or_drop(config, key, ids):
+    if ids:
+        setattr(config, key, ids)
+    elif hasattr(config, key):
+        delattr(config, key)
 pass
 
 
@@ -134,31 +144,36 @@ def _suppress_padded_rows(model, start, end, now_valid = range(0)):
     generation_config = getattr(model, "generation_config", None)
     if generation_config is None: return
     config = _vocab_pad_config(model)
-    owned = list(getattr(config, _VOCAB_PAD_IDS_KEY, None) or []) if config is not None else []
+    rows = list(getattr(config, _VOCAB_PAD_IDS_KEY, None) or []) if config is not None else []
+    owned = getattr(config, _VOCAB_PAD_SUPPRESSED_KEY, None) if config is not None else None
+    owned = list(owned) if owned is not None else list(rows)
     suppress = getattr(generation_config, "suppress_tokens", None) or []
-    if suppress and not owned and len(now_valid) and config is not None and not hasattr(config, _VOCAB_PAD_IDS_KEY):
+    if suppress and not rows and len(now_valid) and config is not None and not hasattr(config, _VOCAB_PAD_IDS_KEY):
         # Saved by padding code that did not record its rows: those are exactly every row past the
         # tokenizer, all suppressed. A model suppressing only some spare rows keeps them.
         embeddings = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
-        rows = getattr(getattr(embeddings, "weight", None), "shape", (0,))[0]
-        legacy = range(now_valid.start, rows)
+        n_rows = getattr(getattr(embeddings, "weight", None), "shape", (0,))[0]
+        legacy = range(now_valid.start, n_rows)
         if len(legacy) and set(legacy).issubset(suppress):
+            rows = list(legacy)
             owned = list(legacy)
     pass
-    if not owned and end <= start: return
+    if not rows and end <= start: return
     suppress = list(suppress)
-    released = set(owned).intersection(now_valid)
-    suppress = [i for i in suppress if i not in released]
-    owned = [i for i in owned if i not in released]
-    added = [i for i in range(start, end) if i not in suppress]
-    suppress += added
-    owned += added
+    now_valid = set(now_valid)
+    suppress = [i for i in suppress if not (i in now_valid and i in owned)]
+    rows  = [i for i in rows  if i not in now_valid]
+    owned = [i for i in owned if i not in now_valid]
+    for i in range(start, end):
+        if i not in rows: rows.append(i)
+        if i not in suppress:
+            suppress.append(i)
+            owned.append(i)
+    pass
     generation_config.suppress_tokens = suppress or None
     if config is not None:
-        if owned:
-            setattr(config, _VOCAB_PAD_IDS_KEY, owned)
-        elif hasattr(config, _VOCAB_PAD_IDS_KEY):
-            delattr(config, _VOCAB_PAD_IDS_KEY)
+        _set_or_drop(config, _VOCAB_PAD_IDS_KEY, rows)
+        _set_or_drop(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
     pass
 pass
 
