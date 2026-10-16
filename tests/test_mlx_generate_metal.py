@@ -1335,6 +1335,139 @@ def test_dense_prefill_linear_first_use_check_rejects_a_different_result(monkeyp
     assert "the native call stays in use" in caplog.text
 
 
+class _DecodeProjections(nn.Module):
+    def __init__(self, mode, group_size, bits, dtype):
+        super().__init__()
+        self.biased = nn.QuantizedLinear(1024, 40, bias = True, group_size = group_size, bits = bits, mode = mode)
+        self.wide = nn.QuantizedLinear(1024, 2048, bias = False, group_size = group_size, bits = bits, mode = mode)
+        self.affine = nn.QuantizedLinear(1024, 64, bias = False, group_size = 64, bits = 4)
+        self.biased.bias = mx.random.normal((40,), key = mx.random.key(6))
+        self.set_dtype(dtype)
+        self.eval()
+
+    def __call__(self, x):
+        return self.biased(x), self.wide(x), self.affine(x)
+
+
+def _counted_fp_qmv(monkeypatch, inference, change = lambda y: y):
+    launches, kernel = [], inference._fp_qmv_kernel()
+    monkeypatch.setattr(inference, "_fp_qmv_kernel",
+                        lambda: lambda **kw: launches.append(kw["output_shapes"]) or [change(kernel(**kw)[0])])
+    monkeypatch.setattr(inference, "_FP_QMV_VERIFIED", {})
+    return launches
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+@pytest.mark.parametrize("mode, group_size, bits", [("mxfp8", 32, 8), ("mxfp4", 32, 4), ("nvfp4", 16, 4)])
+def test_fp_quantized_decode_linear_matches_native_and_restores(monkeypatch, mode, group_size, bits, dtype):
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    dtype = getattr(mx, dtype)
+    model = _DecodeProjections(mode, group_size, bits, dtype)
+    values = mx.random.normal((2048,), key = mx.random.key(7)).astype(dtype)
+    # one row as a vector, strided, in a batch shape, zeros and NaN; then two rows and a prefill, which stay native
+    xs = [values[:1024], values[1::2], values[:1024].reshape(1, 1, 1024), mx.zeros((1, 1024), dtype),
+          mx.full((1024,), float("nan"), dtype), values.reshape(2, 1024),
+          mx.random.normal((1, 2048, 1024), key = mx.random.key(8)).astype(dtype)]
+    natives = [model(x) for x in xs]
+    mx.eval(natives)
+    launches = _counted_fp_qmv(monkeypatch, inference)
+    dequantized, dequantize = [], mx.dequantize
+    monkeypatch.setattr(mx, "dequantize", lambda *a, **k: dequantized.append(None) or dequantize(*a, **k))
+    with generation_mode(model):
+        with inference.fp_quantized_decode_linear(model):
+            pass
+        assert type(model.wide) is type(model.biased) is not nn.QuantizedLinear  # until the outer scope exits
+        for x, native in zip(xs, natives):
+            launches.clear()
+            dequantized.clear()
+            assert _same_bits(model(x), native)
+            assert launches == ([] if x.size > 1024 else [[(*x.shape[:-1], 40)], [(*x.shape[:-1], 2048)]])
+            assert len(dequantized) == (x.size == 2048 * 1024)  # the dense prefill route still serves the wide linear
+        model.train()
+        mx.eval(model(xs[0]))
+        model.eval()
+        with mx.stream(mx.cpu):
+            mx.eval(model(xs[0]))
+        linear_call = nn.QuantizedLinear.__call__
+        with monkeypatch.context() as patch:  # a wrapper installed after the scope resolved the native body
+            patch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: linear_call(self, x) + 1)
+            assert _same_bits(model(xs[0]), [native + 1 for native in natives[0]])
+        assert not launches  # training, a CPU stream and a rebound native body take the native call
+    assert type(model.wide) is type(model.biased) is nn.QuantizedLinear
+    assert not [name for name in model.wide.__dict__ if name.startswith("_unsloth_fp_qmv")]
+    assert list(inference._FP_QMV_VERIFIED.values()) == [True, True]
+    monkeypatch.setenv("UNSLOTH_MLX_FP_QMV", "0")
+    with inference.fp_quantized_decode_linear(model):
+        assert type(model.wide) is nn.QuantizedLinear
+
+
+@real_mlx_only
+@metal_only
+def test_fp_quantized_decode_linear_first_use_check_rejects_a_different_result(monkeypatch, caplog):
+    from unsloth_zoo.mlx import inference
+
+    model = _DecodeProjections("mxfp8", 32, 8, mx.bfloat16)
+    x = mx.random.normal((1, 1, 1024), key = mx.random.key(9)).astype(mx.bfloat16)
+    native = model(x)
+    launches = _counted_fp_qmv(monkeypatch, inference, lambda y: y + 1)
+    with inference.fp_quantized_decode_linear(model):
+        for _ in range(2):   # a differing shape is not launched again
+            assert _same_bits(model(x), native)
+    assert len(launches) == 2 and list(inference._FP_QMV_VERIFIED.values()) == [False, False]
+    assert "the native call stays in use" in caplog.text
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("mode, group_size, bits", [("mxfp8", 32, 8), ("mxfp4", 32, 4), ("nvfp4", 16, 4)])
+def test_fp_quantized_decode_linear_keeps_unaligned_projections_native(monkeypatch, mode, group_size, bits):
+    from unsloth_zoo.mlx import inference
+
+    launches = _counted_fp_qmv(monkeypatch, inference)
+    for k, n in ((1056, 64), (1024, 36)):   # K off the kernel's 256/512 step, N off MLX's eight-row tile
+        layer = nn.QuantizedLinear(k, n, bias = False, group_size = group_size, bits = bits, mode = mode)
+        layer.eval()
+        x = mx.random.normal((k,), key = mx.random.key(n)).astype(mx.bfloat16)
+        native = layer(x)
+        with inference.fp_quantized_decode_linear(layer):
+            assert _same_bits([layer(x)], [native])
+    assert not launches
+
+
+_FP_QMV_TEMPLATE = """template <
+    typename T,
+    int group_size,
+    int bits,{flags}
+    {rows}>
+METAL_FUNC void fp_qmv_fast_impl(
+    const device uint32_t* w,
+    const device uint8_t* scales,{scale}
+    const device T* x,
+    device T* y)"""
+
+
+@real_mlx_only
+@pytest.mark.parametrize("flags, scale, rows, call", [
+    ("\n    bool has_global_scale = false,", "\n    const device float* global_scale,", "int results_per_simdgroup = 4",
+     "<T, G, B, false, 2>(w, scales, nullptr, x,"),  # MLX 0.32.3
+    ("\n    bool partial_rows = false,\n    bool has_global_scale = false,", "\n    const device float* global_scale,",
+     "int results_per_simdgroup = 4", "<T, G, B, false, false, 2>(w, scales, nullptr, x,"),  # MLX 0.32.4
+    ("", "", "int results_per_simdgroup = 4", "<T, G, B, 2>(w, scales, x,"),
+    ("", "", "bool has_global_scale = false", None),  # no row count to set
+    ("\n    int simdgroups = 2,", "", "int results_per_simdgroup = 4", None),
+    ("\n    bool transposed = true,", "", "int results_per_simdgroup = 4", None),
+])
+def test_fp_qmv_source_fills_the_installed_template_by_name(flags, scale, rows, call):
+    from unsloth_zoo.mlx import inference
+
+    source = inference._fp_qmv_source(_FP_QMV_TEMPLATE.format(flags = flags, scale = scale, rows = rows))
+    assert source[len("fp_qmv_fast_impl"):].startswith(call) if call else source is None
+
+
 @metal_only
 def test_vlm_cache_materialization_finishes_the_previous_snapshot(monkeypatch):
     from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
@@ -1497,7 +1630,7 @@ def test_vlm_cache_materialization_reuses_cache_buffers(monkeypatch):
 
 @real_mlx_only
 @pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
-@pytest.mark.parametrize("scope_name", ["nax_quantized_linear", "dense_prefill_linear"])
+@pytest.mark.parametrize("scope_name", ["nax_quantized_linear", "dense_prefill_linear", "fp_quantized_decode_linear"])
 def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, scope_name):
     from contextlib import contextmanager
     import mlx_lm

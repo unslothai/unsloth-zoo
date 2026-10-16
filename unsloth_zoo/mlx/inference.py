@@ -3853,6 +3853,147 @@ def dense_prefill_linear(model, *, _modules = None):
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
 
 
+_FP_QMV_LOCK = RLock()
+_FP_QMV_VERIFIED = {}
+_FP_QMV_MODES = {("mxfp8", 8, 32), ("mxfp4", 4, 32), ("nvfp4", 4, 16)}
+# Output rows per simdgroup. MLX's single-row launch uses 4, which leaves few threadgroups for a narrow
+# projection; each row's K reduction is the same either way.
+_FP_QMV_ROWS = 2
+
+
+def _fp_qmv_source(header):
+    """A call of `header`'s `fp_qmv_fast_impl` with `_FP_QMV_ROWS` rows, its other flags off; None if unknown."""
+    found = re.search(r"template\s*<([^<>]*)>\s*METAL_FUNC void fp_qmv_fast_impl\s*\(([^)]*)\)", header)
+    if found is None:
+        return None
+    named = {"T": "T", "group_size": "G", "bits": "B", "results_per_simdgroup": str(_FP_QMV_ROWS)}
+    arguments = []
+    for parameter in found.group(1).split(","):
+        declaration, _, default = parameter.partition("=")
+        kind, name = (declaration.split() + [""])[:2]
+        if name in named:
+            arguments.append(named.pop(name))
+        elif kind == "bool" and default.strip() == "false":
+            arguments.append("false")
+        else:
+            return None
+    if named:
+        return None
+    scale = "nullptr, " if "global_scale" in found.group(2) else ""
+    return (f"fp_qmv_fast_impl<{', '.join(arguments)}>(w, scales, {scale}x, y, k, n, "
+            "threadgroup_position_in_grid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);")
+
+
+@functools.cache
+def _fp_qmv_kernel():
+    try:
+        if not mx.metal.is_available():
+            return None
+        seen = set()
+        _inline("mlx/backend/metal/kernels/utils.h", seen)   # already in metal_kernel's preamble
+        header = _inline("mlx/backend/metal/kernels/fp_quantized.h", seen, None, "fp_qmv_impl")
+        source = _fp_qmv_source(header)
+        return source and mx.fast.metal_kernel(
+            name = "unsloth_fp_qmv_narrow", input_names = ["w", "scales", "x", "k", "n"], output_names = ["y"],
+            header = header, source = source)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _fp_qmv(module, x, bindings):
+    """The narrow kernel's result for a single-row call, or None when it takes the native call."""
+    if (not isinstance(x, mx.array) or x.ndim < 1 or x.dtype not in (mx.bfloat16, mx.float16)
+            or not x.shape[-1] or x.size != x.shape[-1] or module.training or mx.default_device() != mx.gpu):
+        return None
+    w, scales = module.get("weight"), module.get("scales")
+    mode, bits, group_size = module.mode, module.bits, module.group_size
+    if (mode, bits, group_size) not in _FP_QMV_MODES or module.get("biases") is not None:
+        return None
+    if not isinstance(w, mx.array) or not isinstance(scales, mx.array) or not _bindings_intact(bindings):
+        return None
+    N, K = w.shape[0], x.shape[-1]
+    # MLX takes its fast kernel, whose arithmetic this launch keeps, only on these alignments.
+    if (N % 8 or K % (_values_per_thread(mode, bits) * 32) or w.dtype != mx.uint32 or scales.dtype != mx.uint8
+            or w.shape != (N, K * bits // 32) or scales.shape != (N, K // group_size)):
+        return None
+    key = (N, K, mode, x.dtype)
+    verified = _FP_QMV_VERIFIED.get(key)
+    kernel = _fp_qmv_kernel()
+    if verified is False or kernel is None:
+        return None
+    routed = kernel(inputs = [w, scales, x, _scalar(K), _scalar(N)],
+                    template = [("T", x.dtype), ("G", group_size), ("B", bits)],
+                    grid = (32, 2 * -(-N // (2 * _FP_QMV_ROWS)), 1), threadgroup = (32, 2, 1),
+                    output_shapes = [(*x.shape[:-1], N)], output_dtypes = [x.dtype])[0]
+    if verified is None:
+        native = mx.quantized_matmul(x, w, scales = scales, transpose = True, group_size = group_size,
+                                     bits = bits, mode = mode)
+        try:
+            verified = bool(mx.array_equal(native.view(mx.uint16), routed.view(mx.uint16)).item())
+        except (RuntimeError, ValueError):
+            return None  # inside a function transformation, which cannot evaluate; checked later
+        _FP_QMV_VERIFIED[key] = verified
+        if not verified:
+            logger.warning("the narrow single-row %s matmul differs from the native one for N=%d K=%d %s; "
+                           "the native call stays in use", mode, N, K, x.dtype)
+    return routed if verified else None
+
+
+@functools.cache
+def _fp_qmv_class(base, *cache_key):
+    bindings = _dense_qmm_bindings(*cache_key)
+
+    def linear(self, x):
+        routed = _fp_qmv(self, x, bindings)
+        if routed is None:
+            return base.__call__(self, x)
+        return routed + self["bias"] if "bias" in self else routed
+
+    return type("_FpDecodeQuantizedLinear", (base,), {"__call__": linear})
+
+
+@contextmanager
+def fp_quantized_decode_linear(model, *, _modules = None):
+    """Run single-row mxfp8, mxfp4 and nvfp4 projections with two output rows per simdgroup.
+
+    MLX's floating-point quantized matrix-vector kernel computes four output rows per simdgroup;
+    computing two gives a narrow projection twice the threadgroups, with each row's arithmetic
+    unchanged. Each (shape, mode, dtype) is compared bit for bit with the native call on first use.
+    Batched rows, training and other quantizations keep the native call; a linear the dense prefill
+    scope routes keeps that route for its other calls. `UNSLOTH_MLX_FP_QMV=0` turns the route off.
+    """
+    changed = []
+    try:
+        with _FP_QMV_LOCK:
+            if (os.environ.get("UNSLOTH_MLX_FP_QMV", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and _dense_qmm_bindings(nn.QuantizedLinear.__call__) is not None):
+                bases = (nn.QuantizedLinear, _dense_qmm_class(nn.QuantizedLinear.__call__))
+                seen = set()
+                for _, module in _fusion_modules(model, _modules):
+                    if id(module) in seen:   # named_modules() yields a shared module once per path
+                        continue
+                    seen.add(id(module))
+                    if module.__dict__.get("_unsloth_fp_qmv_scopes"):
+                        module._unsloth_fp_qmv_scopes += 1
+                    elif (type(module) in bases and not module.training
+                          and (getattr(module, "mode", None), module.bits, module.group_size) in _FP_QMV_MODES):
+                        module._unsloth_fp_qmv_native = type(module)
+                        module.__class__ = _fp_qmv_class(type(module), nn.QuantizedLinear.__call__)
+                        module._unsloth_fp_qmv_scopes = 1
+                    else:
+                        continue
+                    changed.append(module)
+        yield model
+    finally:
+        with _FP_QMV_LOCK:
+            for module in reversed(changed):
+                module._unsloth_fp_qmv_scopes -= 1
+                if not module._unsloth_fp_qmv_scopes:
+                    module.__class__ = module.__dict__.pop("_unsloth_fp_qmv_native")
+                    module.__dict__.pop("_unsloth_fp_qmv_scopes")
+
+
 # The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
 # 0.7.1 added the verifier's `verify` entry; earlier releases miss it and stay native.
 _EXACT_VERIFY_CONTRACT = {
