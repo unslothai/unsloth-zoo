@@ -308,6 +308,8 @@ class BlockSwap:
     _tot = None
     _seen = None
     _adapt_seen = None
+    _step_peak = None
+    _last_peak = None
 
     def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail"):
         self.blocks, self.handles = [], []
@@ -489,6 +491,8 @@ class BlockSwap:
         def hook(module, args, kwargs):
             b = self.blocks[i]
             self.current = self.indices[i]
+            if self._auto and not self._settled:
+                self._note_peak(b.home)
             self._fetch(b, steal = True)
             marks = getattr(b, "marks", None)
             if marks is not None:
@@ -553,8 +557,11 @@ class BlockSwap:
 
     def _bwd(self, i):
         def hook(grad):
+            if self._auto and not self._settled:
+                self._note_peak(self.blocks[i].home)
             self._release(self.blocks[i])
             if i == 0:
+                self._last_peak, self._step_peak = self._step_peak or {}, {}
                 self._steps += 1
                 if self._steps == 1 and self._tot is not None:
                     # Step 1 includes copies armed at install and warmup: windows start after it.
@@ -688,6 +695,13 @@ class BlockSwap:
             print(f"Unsloth: offload_layers prefetch_depth = 'auto' settled on {self.depth} "
                   f"(copies stalled {100 * stall:.1f}% of the swapped layers' time).")
 
+    def _note_peak(self, dv):
+        # Our own per-step high-water mark: torch's peak counter still holds the load and the pre-swap model.
+        if self._step_peak is None:
+            self._step_peak = {}
+        k = torch.device(dv).index
+        self._step_peak[k] = max(self._step_peak.get(k, 0), torch.cuda.memory_allocated(dv))
+
     def _grow_pool(self):
         """One more slot for every pool that can use one, if each card still has room for it."""
         sigs = [b.sig for b in self.blocks]
@@ -704,7 +718,8 @@ class BlockSwap:
                 need[dv] = need.get(dv, 0) + n
         for dv, n in need.items():
             # Between steps the activations are gone; keep room for the next step's peak.
-            transient = torch.cuda.max_memory_allocated(dv) - torch.cuda.memory_allocated(dv)
+            peak = (self._last_peak or {}).get(torch.device(dv).index, 0)
+            transient = max(0, peak - torch.cuda.memory_allocated(dv))
             if _free_device_bytes(dv) - transient < 2 * n:
                 return False
         for s in want:

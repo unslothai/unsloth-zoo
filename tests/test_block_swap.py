@@ -993,6 +993,21 @@ def test_grow_pool_adds_a_slot_only_with_room_for_the_next_step(monkeypatch):
     sw.remove()
 
 
+def test_grow_pool_ignores_the_load_time_peak(monkeypatch):
+    if not torch.cuda.is_available():
+        return
+    # The process peak still holds the model load; only the swap's own last step counts as headroom.
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    now = torch.cuda.memory_allocated()
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: now + (64 << 30))
+    monkeypatch.setattr(_mod, "_free_device_bytes", lambda dv: 1 << 30)
+    assert sw._grow_pool()
+    sw._last_peak = {torch.device("cuda").index or 0: now + (2 << 30)}
+    assert not sw._grow_pool()
+    sw.remove()
+
+
 _GiB = 1 << 30
 
 
