@@ -109,7 +109,7 @@ _GAPS = {
     # then qmm_t_splitk until the output is wide enough for qmm_nax.
     "small_m_qmm": Gap(open_in = ("0.32.2", "0.32.3", "0.32.4"), closed_on_main = False),
     # Without NAX the same rows run qmv_wide (plain qmv before generation 15), then qmm_t_splitk.
-    "small_m_qmm_simd": Gap(open_in = ("0.32.3",), closed_on_main = False),
+    "small_m_qmm_simd": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
     # MLX's sorted gather kernel runs 32-row tiles below 64 rows per expert, with two barriers per K step.
     "sorted_gather_qmm": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
 }
