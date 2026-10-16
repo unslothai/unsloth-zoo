@@ -114,16 +114,17 @@ def routing_replay_engine_args(config):
     if not vllm_supports_routed_experts():
         warnings.warn(
             f"Unsloth: {ROUTING_REPLAY_ENV}=1 needs a vLLM with enable_return_routed_experts "
-            "(0.14 or newer, 0.22 or newer for hybrid attention MoE). "
+            "(0.14 or newer, 0.21 or newer for hybrid attention MoE). "
             "Routing replay is off.",
             stacklevel = 2,
         )
         return {}
-    if _config_is_hybrid_attention(config) and not _vllm_at_least(0, 22):
-        # Older vLLM sizes the capture buffer per KV cache group but indexes it by physical
-        # block, so a hybrid model's first generate dies with an IndexError.
+    if _config_is_hybrid_attention(config) and not _vllm_at_least(0, 21):
+        # vLLM 0.14 to 0.20 size the shared capture buffer by KV cache tokens of one group but
+        # index it by slot, so a hybrid model's first generate dies with an IndexError. 0.21
+        # keeps per-request buffers indexed by position.
         warnings.warn(
-            f"Unsloth: {ROUTING_REPLAY_ENV}=1 needs vLLM 0.22 or newer for hybrid attention MoE "
+            f"Unsloth: {ROUTING_REPLAY_ENV}=1 needs vLLM 0.21 or newer for hybrid attention MoE "
             "models. Routing replay is off.",
             stacklevel = 2,
         )

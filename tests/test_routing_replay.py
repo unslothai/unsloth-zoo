@@ -429,10 +429,10 @@ def test_recompute_accepts_the_same_expert_set_in_another_order(replay):
         torch.testing.assert_close(grads_gc[name], grads_plain[name], rtol = 1e-4, atol = 1e-6, msg = name)
 
 
-@pytest.mark.parametrize("version, expected", [("0.18.0", False), ("0.21.1", False), ("0.22.0", True), ("0.31.0", True)])
-def test_engine_args_need_vllm_022_for_hybrid_attention(replay, monkeypatch, version, expected):
-    # vLLM < 0.22 indexes its routed experts capture by physical block in a buffer sized per
-    # KV cache group, so hybrid attention models crash in generate.
+@pytest.mark.parametrize("version, expected", [("0.18.0", False), ("0.20.2", False), ("0.21.0", True), ("0.22.0", True), ("0.31.0", True)])
+def test_engine_args_need_vllm_021_for_hybrid_attention(replay, monkeypatch, version, expected):
+    # vLLM 0.14 to 0.20 index the shared routed experts buffer by slot in a buffer sized for one
+    # KV cache group, so hybrid attention models crash in generate; 0.21 indexes per request.
     import importlib.metadata
     monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts"})
     monkeypatch.setattr(importlib.metadata, "version", lambda name: version)
