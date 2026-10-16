@@ -108,7 +108,6 @@ def test_decode_mode_dispatch_and_off_switch(monkeypatch):
 
 
 def test_first_call_inside_cuda_graph_capture_does_not_probe(monkeypatch):
-    # The probe syncs; capturing a cold first call must keep the fma decode and still replay.
     import unsloth_zoo.mxfp4_gemm as mg
     from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm
     _need_cvt(2)
@@ -118,7 +117,7 @@ def test_first_call_inside_cuda_graph_capture_does_not_probe(monkeypatch):
     counts = torch.full((E,), 16, dtype = torch.int32, device = "cuda")
     x = torch.randn(64, C, dtype = torch.bfloat16, device = "cuda")
     monkeypatch.setattr(mg, "_ASM_OK", {k: True for k in (None, 0, torch.cuda.current_device())})
-    want = mxfp4_grouped_mm(x, blocks, scales, counts, transpose_b = True)  # compile the fma kernels
+    want = mxfp4_grouped_mm(x, blocks, scales, counts, transpose_b = True)
     monkeypatch.setattr(mg, "_ASM_OK", {})
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
