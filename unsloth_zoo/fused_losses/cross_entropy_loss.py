@@ -218,10 +218,12 @@ def _free_target_gb(device = None):
     return min(_default_target_gb(device), _CE_TARGET_GB_CAP)
 
 
+@functools.cache
 def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        # Not cached: a first reading (before optimizer states exist) was reused forever.
+        # Measured once per device and cached: a per-call reading costs a host query every
+        # forward and breaks graphs that trace across the loss.
         target_gb = _free_target_gb(device)
     pass
 
@@ -239,9 +241,7 @@ def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0, device =
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
-# Explicit budgets are pure arithmetic of their arguments, so they stay cached.
-_get_explicit_chunk_multiplier = functools.cache(_get_chunk_multiplier)
-_get_chunk_multiplier.cache_clear = _get_explicit_chunk_multiplier.cache_clear
+_get_explicit_chunk_multiplier = _get_chunk_multiplier
 
 def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Number of chunks that fits the target max memory usage."""

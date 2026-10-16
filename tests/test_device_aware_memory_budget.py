@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tile / fused CE memory budgets must be read from the operand's device, not GPU 0, and not cached."""
+"""Tile / fused CE memory budgets must be read from the operand's device, not GPU 0."""
 import importlib
 import types
 
@@ -40,9 +40,8 @@ def _modules():
 class _FakeCuda:
     """Two GPUs with different free memory; the process lives on GPU 1 (rank 1)."""
 
-    def __init__(self, free_by_index, current = 1, cached_by_index = None):
+    def __init__(self, free_by_index, current = 1):
         self.free_by_index = dict(free_by_index)
-        self.cached_by_index = dict(cached_by_index or {})
         self.current = current
         self.queried = []
 
@@ -63,19 +62,10 @@ class _FakeCuda:
         free = self.free_by_index[index]
         return (free, 80 * GIB)
 
-    def _index(self, device):
-        return self.current if device is None else (device if isinstance(device, int) else device.index)
 
-    def memory_reserved(self, device = None):
-        return 4 * GIB + self.cached_by_index.get(self._index(device), 0)
-
-    def memory_allocated(self, device = None):
-        return 4 * GIB
-
-
-def _mock(monkeypatch, free_by_index, current = 1, cached_by_index = None):
+def _mock(monkeypatch, free_by_index, current = 1):
     ce, tiled = _modules()
-    fake = _FakeCuda(free_by_index, current, cached_by_index)
+    fake = _FakeCuda(free_by_index, current)
     monkeypatch.setattr(tiled, "DEVICE_TYPE", "cuda", raising = False)
     monkeypatch.setattr(tiled.torch, "cuda", fake, raising = False)
     ce._get_chunk_multiplier.cache_clear()
@@ -95,25 +85,6 @@ def test_default_budget_uses_the_given_device(monkeypatch):
     assert fake.queried == [1], fake.queried
 
 
-def test_budget_counts_reusable_allocator_cache(monkeypatch):
-    _, tiled, _ = _mock(monkeypatch, {0: 2 * GIB, 1: 2 * GIB}, current = 1, cached_by_index = {1: 6 * GIB})
-    assert tiled._default_target_gb() == pytest.approx(4.0)
-
-
-def test_xpu_budget_counts_reusable_allocator_cache(monkeypatch):
-    _, tiled = _modules()
-    import types
-    fake = types.SimpleNamespace(
-        is_available = lambda: True,
-        mem_get_info = lambda index = None: (2 * GIB, 16 * GIB),
-        memory_reserved = lambda index = None: 10 * GIB,
-        memory_allocated = lambda index = None: 4 * GIB,
-    )
-    monkeypatch.setattr(tiled, "DEVICE_TYPE", "xpu", raising = False)
-    monkeypatch.setattr(tiled.torch, "xpu", fake, raising = False)
-    assert tiled._default_target_gb() == pytest.approx(4.0)
-
-
 def test_cpu_operand_budgets_from_host_ram(monkeypatch):
     _, tiled, fake = _mock(monkeypatch, {0: 2 * GIB, 1: 20 * GIB})
     psutil = pytest.importorskip("psutil")
@@ -123,14 +94,17 @@ def test_cpu_operand_budgets_from_host_ram(monkeypatch):
     assert fake.queried == []
 
 
-def test_fused_ce_budget_is_remeasured_each_call(monkeypatch):
-    """Free memory changes between steps; the chunk count must follow it."""
+def test_fused_ce_budget_is_measured_once_per_device(monkeypatch):
+    """One host query per device, then cached: re-measuring every forward cost a query each step."""
+    import torch
     ce, tiled, fake = _mock(monkeypatch, {0: 80 * GIB, 1: 8 * GIB}, current = 1)
-    roomy = ce.get_chunk_size(1, 16_384, 151_936)
-    fake.free_by_index[1] = 1 * GIB  # optimizer states / activations now hold most of it
-    tight = ce.get_chunk_size(1, 16_384, 151_936)
-    assert tight > roomy, (roomy, tight)
-    assert 0 not in fake.queried, fake.queried
+    first = ce.get_chunk_size(1, 16_384, 151_936)
+    fake.free_by_index[1] = 1 * GIB
+    again = ce.get_chunk_size(1, 16_384, 151_936)
+    assert again == first
+    assert fake.queried == [1], fake.queried
+    ce.get_chunk_size(1, 16_384, 151_936, device = torch.device("cuda", 0))
+    assert fake.queried == [1, 0], fake.queried
 
 
 def test_fused_ce_explicit_budget_stays_cached(monkeypatch):
@@ -192,29 +166,3 @@ def test_tiled_mlp_budget_follows_the_input_device(monkeypatch):
     mlp(x).sum().backward()
     mlp(x).sum().backward()
     assert seen == [x.device], seen
-
-
-def test_reusable_cache_is_read_from_one_stats_snapshot():
-    # memory_reserved / memory_allocated each rebuild the flat stats dict (~100 us apiece);
-    # the fused CE re-measures every forward, so one nested-dict read must be used when present.
-    _, tiled = _modules()
-    calls = []
-
-    class Backend:
-        def memory_stats_as_nested_dict(self, index = None):
-            calls.append(("nested", index))
-            return {
-                "reserved_bytes" : {"all": {"current": 10 * GIB}},
-                "allocated_bytes": {"all": {"current": 4 * GIB}},
-            }
-
-        def memory_reserved(self, index = None):
-            calls.append(("reserved", index))
-            return 10 * GIB
-
-        def memory_allocated(self, index = None):
-            calls.append(("allocated", index))
-            return 4 * GIB
-
-    assert tiled._cached_unused_bytes(Backend(), 1) == 6 * GIB
-    assert calls == [("nested", 1)], calls
