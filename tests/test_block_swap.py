@@ -1078,6 +1078,36 @@ def test_host_load_counts_layers_already_moved_as_used(monkeypatch):
     assert state.done == {1}
 
 
+def test_host_load_counts_streamed_embeddings_still_to_come(monkeypatch):
+    import sys
+    import pytest
+    # Three 16 KiB layers fit, but a 64 MiB streamed table still on meta does not: refuse before any layer moves.
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 10 * 64 * 64 * 4, total))
+    state, layers = _host_load(4, 3)
+    state.embedding_prefixes = {"emb.": nn.Embedding(1 << 18, 64, device = "meta")}
+    with pytest.raises(ValueError, match = "At most"):
+        state.evict(1)
+    assert not state.done
+
+
+def test_host_load_refuses_an_embedding_that_does_not_fit(monkeypatch):
+    if not torch.cuda.is_available():
+        return
+    import sys
+    import pytest
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + (1 << 20), total))
+    state, layers = _host_load(4, 0)
+    emb = nn.Embedding(1 << 16, 64, device = "cuda")  # 16 MiB
+    state.embedding_prefixes = {"emb.": emb}
+    with pytest.raises(ValueError, match = "At most"):
+        state.evict_embedding(emb)
+    assert emb.weight.device.type == "cuda" and not state.embeddings
+
+
 def test_host_load_is_unguarded_without_psutil(monkeypatch):
     import sys
     monkeypatch.setitem(sys.modules, "psutil", None)

@@ -998,7 +998,7 @@ class _HostLoad:
         self.n, self.placement, self.want_embeddings = n, placement, embeddings
         self.layers, self.indices, self.prefixes = None, [], {}
         self.done, self.done_bytes = set(), []
-        self.embedding_prefixes, self.embeddings = {}, []
+        self.embedding_prefixes, self.embeddings, self.embedding_bytes = {}, [], []
 
     def bind(self, model):
         if self.layers is not None:
@@ -1013,15 +1013,25 @@ class _HostLoad:
         if self.want_embeddings:
             self.embedding_prefixes = {f"{n}.": m for n, m in extra_input_embeddings(model)}
 
+    def _pending_embedding_bytes(self, skip = None):
+        # Streamed tables still to come; a meta weight already knows its size.
+        return [m.weight.nbytes for m in self.embedding_prefixes.values()
+                if m not in self.embeddings and m is not skip and getattr(m, "weight", None) is not None]
+
     def evict_embedding(self, module):
         weight = getattr(module, "weight", None)
         if module in self.embeddings or weight is None or weight.device.type == "meta":
             return
+        left = max(len(self.indices) - len(self.done), 0)
+        size = self.done_bytes[-1] if self.done_bytes else 0
+        _check_host_fit(self.done_bytes + self.embedding_bytes + [weight.nbytes] + [size] * left,
+                        sum(self.done_bytes) + sum(self.embedding_bytes) + (weight.nbytes if weight.device.type == "cpu" else 0))
         with torch.no_grad():
             weight.requires_grad_(False)
             if weight.device.type != "cpu":
                 weight.data = weight.data.to("cpu")
         self.embeddings.append(module)
+        self.embedding_bytes.append(weight.nbytes)
 
     def evict(self, i, force = False):
         if i in self.done:
@@ -1033,8 +1043,8 @@ class _HostLoad:
         # Layers still to come are sized like this one; the first check runs before any layer has moved.
         size = sum(p.nbytes for p in params if p.device.type != "meta")
         left = len(self.indices) - len(self.done)
-        _check_host_fit(self.done_bytes + [size] * left,
-                        sum(self.done_bytes) + sum(p.nbytes for p in params if p.device.type == "cpu"))
+        _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + [size] * left,
+                        sum(self.done_bytes) + sum(self.embedding_bytes) + sum(p.nbytes for p in params if p.device.type == "cpu"))
         with torch.no_grad():
             for p in params:
                 if p.is_floating_point():
