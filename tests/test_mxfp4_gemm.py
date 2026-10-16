@@ -107,6 +107,30 @@ def test_decode_mode_dispatch_and_off_switch(monkeypatch):
     assert mg._asm_ok(torch.device("cuda", index)) is False
 
 
+def test_first_call_inside_cuda_graph_capture_does_not_probe(monkeypatch):
+    # The probe syncs; capturing a cold first call must keep the fma decode and still replay.
+    import unsloth_zoo.mxfp4_gemm as mg
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm
+    _need_cvt(2)
+    monkeypatch.setenv("UNSLOTH_MXFP4_CVT", "1")
+    E, R, C = 4, 128, 256
+    blocks, scales = _stack(E, R, C, seed = 5)
+    counts = torch.full((E,), 16, dtype = torch.int32, device = "cuda")
+    x = torch.randn(64, C, dtype = torch.bfloat16, device = "cuda")
+    monkeypatch.setattr(mg, "_ASM_OK", {k: True for k in (None, 0, torch.cuda.current_device())})
+    want = mxfp4_grouped_mm(x, blocks, scales, counts, transpose_b = True)  # compile the fma kernels
+    monkeypatch.setattr(mg, "_ASM_OK", {})
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = mxfp4_grouped_mm(x, blocks, scales, counts, transpose_b = True)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(got, want)
+    assert mg._ASM_OK == {}  # decided on the next eager call, not during capture
+    assert mg._asm_ok(torch.device("cuda", torch.cuda.current_device())) == 2
+
+
 def test_cold_compiled_region_bakes_in_the_probed_decode_mode(monkeypatch):
     # The op body is traced on FakeTensors and its ASM constexpr is frozen into the graph: probe before it.
     import unsloth_zoo.mxfp4_gemm as mg
