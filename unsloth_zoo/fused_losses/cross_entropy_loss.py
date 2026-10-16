@@ -219,11 +219,16 @@ def _free_target_gb(device = None):
 
 
 @functools.cache
+def _measured_target_gb(device = None):
+    # Read once per device: a per-call reading costs a host query and a graph break each forward.
+    return _free_target_gb(device)
+
+
+@functools.cache
 def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        # Measured once per device: a per-call reading costs a host query and a graph break each forward.
-        target_gb = _free_target_gb(device)
+        target_gb = _measured_target_gb(device)
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
@@ -240,6 +245,12 @@ def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0, device =
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
+_clear_chunk_multipliers = _get_chunk_multiplier.cache_clear
+def _clear_chunk_budget_caches():
+    _clear_chunk_multipliers()
+    _measured_target_gb.cache_clear()
+pass
+_get_chunk_multiplier.cache_clear = _clear_chunk_budget_caches
 _get_explicit_chunk_multiplier = _get_chunk_multiplier
 
 def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0, device = None):

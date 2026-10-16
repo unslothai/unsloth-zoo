@@ -107,6 +107,15 @@ def test_fused_ce_budget_is_measured_once_per_device(monkeypatch):
     assert fake.queried == [1, 0], fake.queried
 
 
+
+def test_fused_ce_budget_is_read_once_per_device_across_shapes(monkeypatch):
+    """New vocab sizes and fixed_gb values must reuse the device reading, not query again."""
+    ce, tiled, fake = _mock(monkeypatch, {0: 80 * GIB, 1: 8 * GIB}, current = 1)
+    ce.get_chunk_size(1, 16_384, 151_936)
+    ce.get_chunk_size(1, 8_192, 151_936, fixed_gb = 0.5)
+    ce.get_chunk_size(2, 4_096, 262_144, fixed_gb = 1.25)
+    assert fake.queried == [1], fake.queried
+
 def test_fused_ce_explicit_budget_stays_cached(monkeypatch):
     ce, _, fake = _mock(monkeypatch, {0: 80 * GIB, 1: 8 * GIB})
     a = ce.get_chunk_size(1, 16_384, 151_936, target_gb = 2.0)
