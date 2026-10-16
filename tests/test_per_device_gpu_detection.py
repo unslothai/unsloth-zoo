@@ -423,6 +423,21 @@ def test_rocm_target_skips_an_unreadable_card(monkeypatch):
     assert llama_cpp._detect_gpu_target() == ("rocm", "gfx1100")
 
 
+@pytest.mark.parametrize("archs,expected", [(["gfx1100", "gfx1101"], "gfx1101"), (["gfx1100", "gfx1036"], "gfx1036")])
+def test_rocm_target_unreadable_current_card_uses_a_readable_one(monkeypatch, archs, expected):
+    fake = _fake_torch(archs = archs)
+    real = fake.cuda.get_device_properties
+
+    def flaky(i):
+        if i == 0:
+            raise RuntimeError("unreadable")
+        return real(i)
+
+    fake.cuda.get_device_properties = flaky
+    monkeypatch.setattr(llama_cpp, "torch", fake)
+    assert llama_cpp._detect_gpu_target() == ("rocm", expected)
+
+
 def _manifest():
     def art(name, sms, coverage = "narrow"):
         return {"asset_name": name, "install_kind": "linux-cuda", "runtime_line": "cuda12",

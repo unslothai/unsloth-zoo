@@ -1124,8 +1124,11 @@ def _detect_gpu_target():
                 current = 0
             gfx = archs[current] if 0 <= current < count else archs[0]
             discrete = [a for a in archs if a.startswith("gfx") and a not in _SHADOWING_INTEGRATED_GFX]
-            if gfx in _SHADOWING_INTEGRATED_GFX and discrete:
-                gfx = discrete[0]  # the installer's #7776 rule: a shadowing iGPU defers to the dGPU
+            if (gfx in _SHADOWING_INTEGRATED_GFX or not gfx.startswith("gfx")) and discrete:
+                # The installer's #7776 rule; an unreadable current card defers the same way.
+                gfx = discrete[0]
+            elif not gfx.startswith("gfx"):
+                gfx = next((a for a in archs if a.startswith("gfx")), gfx)
             if not gfx.startswith("gfx"):
                 return None
             # Windows source builds are CUDA-only (_gpu_cmake_flags), so keep the prebuilt there.
