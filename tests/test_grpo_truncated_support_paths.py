@@ -260,3 +260,15 @@ def test_boundary_tied_sampled_token_is_in_the_denominator():
     got = rr._truncated_support_logps(x, torch.tensor([100]), 0, 0.9, 0.0)
     want = -30.0 - torch.logaddexp(torch.log(torch.tensor(90.0)), torch.tensor(-30.0))
     torch.testing.assert_close(got, want.reshape(1))
+
+
+def test_raw_sampling_params_temperature_is_not_a_false_blocker(monkeypatch):
+    # Neither generation helper applies a raw SamplingParams temperature (unsloth's skips it, this
+    # module's copies list fields only): the rollout samples at the trainer temperature, so a raw
+    # temperature must not block truncated scoring.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    want = {"support_top_k": 0, "support_top_p": 0.9, "support_min_p": 0.0}
+    klass = _compiled_trainer_class(monkeypatch)
+    for trainer in (_raw_trainer(klass, temperature = 0.7), _raw_trainer(temperature = 0.7)):
+        assert rr.grpo_truncated_support_blockers(trainer) == []
+        assert rr.grpo_truncated_support_kwargs(trainer) == want
