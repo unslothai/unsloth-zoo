@@ -1351,3 +1351,116 @@ def test_qwen4_prefill_scope_steps_aside(reason, monkeypatch, caplog):
     assert ("differs from the version" in caplog.text) == (reason in ("body", "wrapped", "rebound"))
     assert caplog.text.count("differs from mlx-vlm's") == (reason == "differs")
     assert type(hc) is cls
+
+
+def _qwen4_read(combine = True, lowrank = 160, bits = 4, group_size = 32, dtype = mx.bfloat16):
+    module = _qwen4_hc(combine, lowrank = lowrank, dtype = dtype)
+    nn.quantize(module, group_size = group_size, bits = bits)
+    module.eval()
+    return module
+
+
+def _qwen4_rows(rows, dtype = mx.bfloat16):
+    return (mx.random.normal((1, rows, 4 * 1280)) * mx.exp(2 * mx.random.normal((1, rows, 1)))).astype(dtype)
+
+
+def _logged_decode_kernels(monkeypatch, log, shift = 0):
+    kernels = decode._qwen4_decode_kernels()
+
+    def logged(kernel):
+        return lambda **kw: log.append(kernel) or [out + shift if shift else out for out in kernel(**kw)]
+    monkeypatch.setattr(decode, "_qwen4_decode_kernels", lambda: tuple(logged(k) for k in kernels))
+
+
+@_needs_qwen4
+@pytest.mark.parametrize("dtype, bits, group_size, lowrank, combine", [
+    (mx.bfloat16, 4, 32, 160, True), (mx.float16, 8, 64, 192, False)])
+def test_qwen4_decode_read_matches_mlx_vlm_bitwise(dtype, bits, group_size, lowrank, combine, monkeypatch):
+    mx.random.seed(0)
+    module, forward = _qwen4_read(combine, lowrank, bits, group_size, dtype), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
+    # Enough one-row reads that a norm rounding off by one float32 ulp shows in some 16-bit result.
+    inputs = [_qwen4_rows(1, dtype) for _ in range(128)] + [_qwen4_rows(2, dtype)]
+    expected = [forward._hyper_connection(module, x) for x in inputs]
+    log = []
+    _logged_decode_kernels(monkeypatch, log)
+    monkeypatch.setattr(decode, "_QWEN4_PREFILL_VERDICTS", {})
+    # Generation also holds the dense prefill scope, which swaps every quantized linear's class; it opens before
+    # this scope or after it, closing first.
+    outer, inner = ((decode.dense_prefill_linear, decode.fused_qwen4_decode) if combine
+                    else (decode.fused_qwen4_decode, decode.dense_prefill_linear))
+    with outer(module), decode.fused_qwen4_decode(module):
+        with inner(module), decode.fused_qwen4_decode(module):
+            assert type(module.input_mix_weight_down) is not nn.QuantizedLinear
+            for x, reference in zip(inputs[:64], expected):
+                _assert_same(forward._hyper_connection(module, x), reference)
+        for x, reference in zip(inputs[64:], expected[64:]):   # the outer scope still routes
+            _assert_same(forward._hyper_connection(module, x), reference)
+    # A first-use comparison and 127 served one-row reads, two launches each; the two-row read stays native.
+    assert len(log) == 256 and list(decode._QWEN4_PREFILL_VERDICTS.values()) == [True]
+    assert "_hyper_connection" not in vars(forward)
+    assert not {"_unsloth_qwen4_decode_scopes", "_unsloth_qwen4_decode_plan"} & set(vars(module))
+
+
+@_needs_qwen4
+@pytest.mark.parametrize("reason", [
+    "switch", "body", "patched", "outside", "differs", "aligned", "quad", "child", "override", "linear",
+    "foreign", "late", "rebound", "lora", "dtype", "verified", "relinear"])
+def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
+    module = _qwen4_read(lowrank = {"aligned": 512, "quad": 128}.get(reason, 160))
+    other, forward = _qwen4_read(), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
+    x = _qwen4_rows(1, mx.float16 if reason == "dtype" else mx.bfloat16)   # "dtype": not the plan's
+    if reason == "body":
+        monkeypatch.setattr(qwen4.Qwen4ExpRMSNorm, "__call__", lambda self, x: x)
+    elif reason == "child":
+        module.hc_norm.__class__ = type("Shifted", (qwen4.Qwen4ExpRMSNorm,), {
+            "__call__": lambda self, x: qwen4.Qwen4ExpRMSNorm.__call__(self, x) + 1})
+    elif reason == "patched":
+        stock_linear = nn.QuantizedLinear.__call__
+        monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: stock_linear(self, x) * 2)
+    elif reason == "lora":   # an unfused adapter wraps the projection, which has no weight of its own
+        from mlx_lm.tuner.lora import LoRALinear
+        module.input_mix_weight_down = LoRALinear.from_base(module.input_mix_weight_down)
+        module.input_mix_weight_down.lora_b = mx.random.normal(module.input_mix_weight_down.lora_b.shape) * 0.01
+    elif reason == "override":
+        module.input_mix_weight_down.__class__ = type("Scaled", (nn.QuantizedLinear,), {
+            "__call__": lambda self, x: nn.QuantizedLinear.__call__(self, x) * 2})
+    elif reason == "linear":
+        monkeypatch.setitem(vars(forward), "_linear", lambda linear, h: linear(h) * 2)
+    elif reason in ("verified", "relinear"):   # exact_batch_invariant_decode's class already over the forward
+        native = type(forward)
+        methods = (getattr(native, name, None) for name in decode._VERIFY_METHODS)
+        verified = decode._exact_verify_class(native, "__call__", False, *methods)
+        if reason == "relinear":   # a class under that one decorating its `_linear`
+            sliced = verified._linear
+            verified = type("Scaled", (verified,), {
+                "_linear": functools.wraps(sliced)(lambda self, linear, h: sliced(self, linear, h) * 2)})
+        monkeypatch.setattr(forward, "__class__", verified)
+    foreign = lambda m, h: type(forward)._hyper_connection(forward, m, h)
+    if reason == "foreign":   # another library's hook on the shared forward object
+        monkeypatch.setitem(vars(forward), "_hyper_connection", foreign)
+    for name, value in (("_QWEN4_PREFILL_VERDICTS", {}), ("_QWEN4_DECODE_BINDINGS", [None]), ("_CONTRACT_MISSES", set())):
+        monkeypatch.setattr(decode, name, value)
+    if reason == "rebound":   # the exported norm class replaced after an earlier scope resolved the contract
+        with decode.fused_qwen4_decode(other):
+            pass
+        stock_norm = qwen4.Qwen4ExpRMSNorm
+        monkeypatch.setattr(qwen4, "Qwen4ExpRMSNorm", type("Shifted", (stock_norm,), {
+            "__call__": lambda self, h: stock_norm.__call__(self, h) + 1}))
+        module.hc_norm.__class__ = qwen4.Qwen4ExpRMSNorm
+    target = other if reason == "outside" else module
+    expected = forward._hyper_connection(target, x)
+    log = []
+    _logged_decode_kernels(monkeypatch, log, shift = 1 if reason == "differs" else 0)
+    monkeypatch.setenv("UNSLOTH_MLX_QWEN4_DECODE", "0" if reason == "switch" else "1")
+    with caplog.at_level("WARNING"), decode.fused_qwen4_decode(module):
+        hooked = getattr(vars(forward).get("_hyper_connection"), "func", None) is decode._qwen4_decode_read
+        if reason == "late":   # replaced while the scope is open
+            vars(forward)["_hyper_connection"] = foreign
+        for _ in range(2):
+            _assert_same(forward._hyper_connection(target, x), expected)
+    left = vars(forward).pop("_hyper_connection", None) if reason == "late" else vars(forward).get("_hyper_connection")
+    assert left is (foreign if reason in ("foreign", "late") else None)
+    assert hooked == (reason in ("outside", "differs", "late", "dtype", "verified"))
+    assert len(log) == {"differs": 2, "verified": 4}.get(reason, 0)
+    assert ("differs from the version" in caplog.text) == (reason in ("body", "patched", "rebound"))
+    assert caplog.text.count("differs from mlx-vlm's") == (reason == "differs")
