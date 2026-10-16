@@ -4453,3 +4453,13 @@ def inference_scopes(model, call = None, *, int8_prefill = None, on_error = None
                     raise
                 on_error(scope.name, error)
         yield model
+
+
+_WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17 rows)
+
+
+def warm_inference(model, int8_prefill = None):
+    """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
+    first-use checks; checks keyed by a request's row count still run then."""
+    model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
+                   int8_prefill = int8_prefill)

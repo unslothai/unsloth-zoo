@@ -1526,6 +1526,23 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
     assert generated.tolist() == [[1, 2, 7]]
 
 
+@real_mlx_only
+@metal_only
+def test_warm_inference_leaves_no_shape_keyed_check_to_the_first_request(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    verdicts = ("_ADD_NORM_VERDICTS", "_DECODE_STEP_VERDICTS")
+    for name in verdicts:
+        monkeypatch.setattr(inference, name, {})
+    model, _ = FastMLXModel.from_pretrained(QWEN_VLM_MODEL)
+    inference.warm_inference(model)
+    warmed = {name: dict(getattr(inference, name)) for name in verdicts}
+    assert all(warmed.values()), warmed
+    model.generate(mx.arange(100, 137)[None], max_tokens = 3, do_sample = False)
+    assert {name: getattr(inference, name) for name in verdicts} == warmed
+
+
 def _packed_codes(codes, bits):   # MLX's layout: a little-endian bitstream of `bits`-wide codes
     import numpy as np
     stream = (codes[..., None].astype(np.uint8) >> np.arange(bits, dtype = np.uint8)) & 1
