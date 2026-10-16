@@ -689,6 +689,28 @@ def _flex_routes_maskless_to_sdpa(config):
     return not _a_model_overrides_flex_locally()
 
 
+_ATTENTION_DROPOUT_NAMES = ("attention_dropout", "attn_dropout", "attn_pdrop", "attention_probs_dropout_prob")
+_FLASH_SDPA_ACCEPTS_CACHE = {}
+
+
+def _flash_sdpa_accepts(device, dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
+    # Ask torch's own dispatcher: flash also rejects by arch, torch version, dropout and grad
+    # (torch 2.6 has no flash past sm90; sm86 / sm89 / sm120 refuse head_dim > 224 training with dropout).
+    key = (str(device), dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad)
+    accepts = _FLASH_SDPA_ACCEPTS_CACHE.get(key, None)
+    if accepts is not None:
+        return accepts
+    try:
+        query = torch.empty((1, num_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
+        key_value = torch.empty((1, num_kv_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
+        params = torch.backends.cuda.SDPAParams(query, key_value, key_value, None, dropout, True, True)
+        accepts = torch.backends.cuda.can_use_flash_attention(params, False) is True
+    except Exception:
+        accepts = False
+    _FLASH_SDPA_ACCEPTS_CACHE[key] = accepts
+    return accepts
+
+
 def _flash_sdpa_takes_causal(config, embeds):
     """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; anything
     else falls to the math kernel and its [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
@@ -702,15 +724,32 @@ def _flash_sdpa_takes_causal(config, embeds):
         configs = [config] if not getattr(config, "is_heterogeneous", False) else list(config.per_layer_config)
     except Exception:
         return False
+    # Training mode is unknown here, so any configured attention dropout counts.
+    requires_grad = torch.is_grad_enabled()
     for layer_config in configs:
         # transformers >= 5.17 heterogeneous configs raise a RuntimeError on a global per-layer attribute.
         try:
             head_dim = getattr(layer_config, "head_dim", None)
             if not isinstance(head_dim, int):
                 head_dim = layer_config.hidden_size // layer_config.num_attention_heads
+            num_heads = layer_config.num_attention_heads
+            num_kv_heads = getattr(layer_config, "num_key_value_heads", None)
+            if num_kv_heads is None:
+                num_kv_heads = num_heads
+            dropout = 0.0
+            for name in _ATTENTION_DROPOUT_NAMES:
+                value = getattr(layer_config, name, None)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    dropout = max(dropout, float(value))
         except Exception:
             return False
         if not (0 < head_dim <= 256 and head_dim % 8 == 0):
+            return False
+        if not isinstance(num_heads, int) or not isinstance(num_kv_heads, int):
+            return False
+        if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+            return False
+        if not _flash_sdpa_accepts(embeds.device, embeds.dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
             return False
     return True
 
