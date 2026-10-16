@@ -20,6 +20,7 @@ import math
 from collections import OrderedDict
 from types import MethodType
 import functools
+import weakref
 from fnmatch import fnmatch
 import torch
 from torch.utils.checkpoint import (
@@ -280,13 +281,49 @@ def _mxfp4_instance_forward(mlp_module):
     return None
 
 
-def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length = 128):
-    preserve_rng_state = False
-    for n, m in mlp_module.named_modules():
-        if isinstance(m, torch.nn.Dropout):
-            preserve_rng_state = True
-            break
+_DROPOUT_TYPES = (getattr(torch.nn.modules.dropout, "_DropoutNd", torch.nn.Dropout),)
 
+# Bumped when a submodule is registered under a tiled MLP (e.g. PEFT adding lora_dropout) to
+# invalidate dropout lists. Only MLP subtrees count: transformers slices `self.layers[:n]` every
+# forward, which re-registers every layer and would otherwise force a rescan per layer per token.
+_MODULE_TREE_VERSION = [0]
+# id -> module, weak: a freed module's id reused by a sliced ModuleList must not match, and
+# keying on id avoids hashing arbitrary modules inside a process-wide hook.
+_TRACKED_MODULES = weakref.WeakValueDictionary()
+
+def _bump_module_tree_version(module, name, submodule):
+    if _TRACKED_MODULES.get(id(module)) is module:
+        _MODULE_TREE_VERSION[0] += 1
+    return None
+pass
+
+try:
+    torch.nn.modules.module.register_module_module_registration_hook(_bump_module_tree_version)
+    _HAS_MODULE_TREE_VERSION = True
+except Exception:
+    _HAS_MODULE_TREE_VERSION = False
+pass
+
+def _mlp_needs_rng_state(mlp_module):
+    # Per forward, not at patch time: unsloth patches before get_peft_model adds lora_dropout,
+    # so a patch time scan missed it and the recompute drew different masks (wrong grads).
+    cached = mlp_module.__dict__.get("_unsloth_tiled_dropouts")
+    # id check: a deepcopy carries the cache but its subtree is not tracked yet.
+    if cached is None or not _HAS_MODULE_TREE_VERSION or \
+        cached[0] != _MODULE_TREE_VERSION[0] or cached[1] != id(mlp_module):
+        modules = tuple(mlp_module.modules())
+        _TRACKED_MODULES.update((id(m), m) for m in modules)
+        dropouts = tuple(m for m in modules if isinstance(m, _DROPOUT_TYPES))
+        cached = (_MODULE_TREE_VERSION[0], id(mlp_module), dropouts)
+        # __dict__, not setattr: these are already children, do not register them twice.
+        mlp_module.__dict__["_unsloth_tiled_dropouts"] = cached
+    for m in cached[2]:
+        if m.training and m.p > 0:
+            return True
+    return False
+pass
+
+def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length = 128):
     # unbound
     forward = _mxfp4_instance_forward(mlp_module) or mlp_module.__class__.forward
     mlp_module._original_forward = forward
@@ -325,6 +362,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
+        preserve_rng_state = _mlp_needs_rng_state(mlp_module)
         return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, max_flat_qlen)
 
     def tiled_forward_arctic_size(self, x):
@@ -337,6 +375,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
+        preserve_rng_state = _mlp_needs_rng_state(mlp_module)
         return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, chunk_size)
 
     if target_arctic:
