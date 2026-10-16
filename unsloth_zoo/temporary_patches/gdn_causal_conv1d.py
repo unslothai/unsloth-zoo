@@ -255,6 +255,7 @@ def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None):
             ACTIVATION = activation is not None,
             HAS_SEQ_IDX = seq_idx is not None,
             num_warps = _NUM_WARPS,
+            enable_fp_fusion = True,
         )
     return y
 
@@ -285,6 +286,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
             NEED_DX = need_dx, NEED_DW = need_dw, NEED_DB = need_db,
             HAS_SEQ_IDX = seq_idx is not None,
             num_warps = _NUM_WARPS,
+            enable_fp_fusion = True,
         )
     if dw is not None:
         dw = dw.sum(0).to(weight.dtype)
@@ -482,6 +484,25 @@ def _is_gdn_function(torch_function):
     return module.rsplit(".", 1)[-1] in _GDN_LEAVES
 
 
+def _hub_gdn_function(decorator, torch_function):
+    """Hub-decorate the GDN dispatch. transformers >= 5.20 refuses `seq_idx` on its torch path
+    when causal-conv1d is missing, but this dispatch keeps packed rows apart, so packed calls
+    go to it directly; everything else still goes through the hub wrapper."""
+    dispatch = _make_hub_dispatch(torch_function)
+    hub_fn = decorator(dispatch)
+    # The hub wrapper passes only the implementation's named parameters on.
+    names = frozenset(inspect.signature(dispatch).parameters)
+
+    @functools.wraps(hub_fn)
+    def causal_conv1d_fn(*args, **kwargs):
+        if kwargs.get("seq_idx") is not None:
+            return dispatch(*args, **{k: v for k, v in kwargs.items() if k in names})
+        return hub_fn(*args, **kwargs)
+
+    setattr(causal_conv1d_fn, _MARK, True)
+    return causal_conv1d_fn
+
+
 def _patch_hub_decorator():
     """transformers >= 5.15: hook the hub decorator so later-decorated GDN convs
     (incl. compiled copies) get the Triton dispatch."""
@@ -500,7 +521,7 @@ def _patch_hub_decorator():
         if func_name != "causal_conv1d_fn" or package != "causal_conv1d":
             return decorator
         # A usable package still wins: the hub wrapper only calls this torch fallback without it.
-        return lambda fn: decorator(_make_hub_dispatch(fn) if _is_gdn_function(fn) else fn)
+        return lambda fn: _hub_gdn_function(decorator, fn) if _is_gdn_function(fn) else decorator(fn)
 
     setattr(use_kernel_func_from_hub_with_fallback, _HUB_MARK, True)
     hub_kernels.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback

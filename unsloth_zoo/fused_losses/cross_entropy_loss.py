@@ -20,6 +20,7 @@ __all__ = [
     "compute_fused_ce_loss",
     "unsloth_count_aware_cross_entropy",
     "unsloth_loss_count_kwargs",
+    "unsloth_fsdp_unshard",
 ]
 
 import torch
@@ -29,12 +30,18 @@ import weakref
 import functools
 import math
 import os
+import sys
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bounds
 from unsloth_zoo.device_type import DEVICE_TYPE
         
 
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
 N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
+# Opt-in: accumulate a trainable lm_head weight gradient across chunks in float32 (one
+# extra float32 copy of the head while the loss runs). The bias gradient always is.
+FP32_HEAD_GRAD = os.environ.get("UNSLOTH_CE_FP32_HEAD_GRAD", "0") == "1"
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
 
 # Register grad_and_value_impl in trace_rules (grad_impl is registered but
 # grad_and_value_impl is not, which can cause GB0149 "Unsupported functorch
@@ -66,6 +73,31 @@ def _nonzero_count(n_items):
     if torch.is_tensor(n_items):
         return torch.where(n_items == 0, torch.ones_like(n_items), n_items)
     return n_items if n_items != 0 else 1
+pass
+
+@torch.compiler.disable
+def _fsdp_unshard(module):
+    module.unshard()
+pass
+
+def unsloth_fsdp_unshard(module):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """All-gather an FSDP2-sharded module (lm_head) whose weight the fused losses read without calling it.
+
+    FSDP2 unshards in the module's pre-forward hook, which never fires here; accelerate shards an
+    untied lm_head in its own group, so the weight would reach the matmul as a DTensor (unsloth-zoo#1751).
+    Traceable unless an FSDP2 unit is found, so compiled non-FSDP forwards keep one graph.
+    """
+    if module is None or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    # fully_shard lives here, so no FSDP2 unit can exist before this module was imported.
+    FSDPModule = getattr(sys.modules.get("torch.distributed.fsdp"), "FSDPModule", None)
+    if FSDPModule is None:
+        return
+    for submodule in module.modules():
+        if isinstance(submodule, FSDPModule):
+            # No-op once unsharded; post-backward reshards it and reduce-scatters its gradient.
+            _fsdp_unshard(submodule)
 pass
 
 def apply_autograd_function(autograd, mapping):
@@ -163,8 +195,8 @@ _CE_BYTES_PER_LOGIT = 16.0
 _CE_TARGET_GB_CAP = 4.0
 
 
-def _free_target_gb():
-    """Half the memory actually available to this backend, capped.
+def _free_target_gb(device = None):
+    """Half the memory actually available on `device` (None = current device), capped.
 
     `_default_target_gb` already answers this for every backend the zoo supports, and it
     answers it for the reason this needed: it checks `is_available()` before asking a device
@@ -183,14 +215,20 @@ def _free_target_gb():
     # for fused_losses/.tiled_mlp.py and every remote-code save walking this graph fails.
     from unsloth_zoo.tiled_mlp import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
 
-    return min(_default_target_gb(), _CE_TARGET_GB_CAP)
+    return min(_default_target_gb(device), _CE_TARGET_GB_CAP)
 
 
 @functools.cache
-def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
+def _measured_target_gb(device = None):
+    # Read once per device: a per-call reading costs a host query and a graph break each forward.
+    return _free_target_gb(device)
+
+
+@functools.cache
+def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        target_gb = _free_target_gb()
+        target_gb = _measured_target_gb(device)
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
@@ -207,10 +245,20 @@ def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
+_clear_chunk_multipliers = _get_chunk_multiplier.cache_clear
+def _clear_chunk_budget_caches():
+    _clear_chunk_multipliers()
+    _measured_target_gb.cache_clear()
+pass
+_get_chunk_multiplier.cache_clear = _clear_chunk_budget_caches
+_get_explicit_chunk_multiplier = _get_chunk_multiplier
 
-def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0):
+def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Number of chunks that fits the target max memory usage."""
-    multiplier = _get_chunk_multiplier(vocab_size, target_gb, fixed_gb)
+    if target_gb is None:
+        multiplier = _get_chunk_multiplier(vocab_size, None, fixed_gb, device)
+    else:
+        multiplier = _get_explicit_chunk_multiplier(vocab_size, target_gb, fixed_gb)
     n_splits = (bsz*qlen) * multiplier
     # n_splits * 4 == (chunk transient GiB) / target. Round UP: nearest-rounding
     # (round(0.5) -> 0) collapses a large transient into one uncapped chunk.
@@ -292,8 +340,16 @@ class UnslothFusedLoss(torch.autograd.Function):
         grad_inputs = None
         if compute_gradients:
             grad_inputs = torch.empty_like(hidden_states, device = device) if not overwrite else hidden_states
-        grad_lm_head = torch.zeros_like(lm_head_weight, device = device) if compute_gradients and lm_head_requires_grad else None
-        grad_lm_head_bias = torch.zeros_like(lm_head_bias, device = device) if compute_gradients and lm_head_bias_requires_grad else None
+        # Summing per-chunk half precision gradients in half precision rounds once per chunk:
+        # at 16 chunks the bias gradient is 2-15x further from an fp64 oracle than unfused.
+        grad_lm_head = torch.zeros_like(
+            lm_head_weight, device = device,
+            dtype = torch.float32 if FP32_HEAD_GRAD and lm_head_weight.dtype in _HALF_DTYPES else None,
+        ) if compute_gradients and lm_head_requires_grad else None
+        grad_lm_head_bias = torch.zeros_like(
+            lm_head_bias, device = device,
+            dtype = torch.float32 if lm_head_bias.dtype in _HALF_DTYPES else None,
+        ) if compute_gradients and lm_head_bias_requires_grad else None
 
         bsz, qlen, hd = hidden_states.shape
         # 0-dim, not a [0] view: MoE forwards on transformers 4.x add their aux loss in place.
@@ -314,12 +370,26 @@ class UnslothFusedLoss(torch.autograd.Function):
             n_chunks = get_chunk_size(
                 bsz, qlen, vocab_size, target_gb = target_gb,
                 fixed_gb = fixed_bytes / 1024 / 1024 / 1024,
+                device = device,
             )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
-        __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
-        __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
-        __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd), n_chunks, dim = 0) if compute_gradients else (None,) * len(__shift_states)
+        bounds = chunk_row_bounds(bsz * qlen, n_chunks, align = CHUNK_ALIGN_ROWS)
+        if bounds is not None:
+            ranges = list(zip(bounds[:-1], bounds[1:]))
+            _flat_states = hidden_states.reshape(-1, hd)
+            __shift_labels = [labels[a:b]       for a, b in ranges]
+            __shift_states = [_flat_states[a:b] for a, b in ranges]
+            if compute_gradients:
+                _flat_grads = grad_inputs.view(-1, hd)
+                __grad_inputs = [_flat_grads[a:b] for a, b in ranges]
+        else:
+            __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
+            __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
+            if compute_gradients:
+                __grad_inputs = torch.chunk(grad_inputs.view(-1, hd), n_chunks, dim = 0)
+        if not compute_gradients:
+            __grad_inputs = (None,) * len(__shift_states)
 
         def accumulate_chunk(
             n_chunks,
@@ -456,7 +526,8 @@ class UnslothFusedLoss(torch.autograd.Function):
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
-                _FUSED_CE_COMPILE_SUPPORTED = True
+                # A loss-only graph does not prove the grad_and_value graph compiles.
+                if compute_gradients: _FUSED_CE_COMPILE_SUPPORTED = True
             except Exception:
                 _FUSED_CE_COMPILE_SUPPORTED = False
                 torch._dynamo.reset()
@@ -516,6 +587,8 @@ class UnslothFusedLoss(torch.autograd.Function):
                 )
         pass
         if compute_gradients:
+            if grad_lm_head is not None: grad_lm_head = grad_lm_head.to(lm_head_weight.dtype)
+            if grad_lm_head_bias is not None: grad_lm_head_bias = grad_lm_head_bias.to(lm_head_bias.dtype)
             ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
             ctx.scaling = scaling
         return accumulated_loss

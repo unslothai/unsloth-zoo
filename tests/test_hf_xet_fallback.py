@@ -18,14 +18,13 @@
 file/snapshot entrypoints, the UNSLOTH_DISABLE_XET knob, and HF_HUB_DISABLE_XET.
 
 CPU-only, no network, no real subprocess (the download seam is monkeypatched).
-The modules under test are loaded via importlib to avoid importing the full
-``unsloth_zoo`` package (torch + GPU init).
+The modules under test come from ``unsloth_zoo_downloads``, which does not
+import the full ``unsloth_zoo`` package (torch + GPU init).
 """
 
 from __future__ import annotations
 
 import errno
-import importlib.util
 import json
 import math
 import pathlib
@@ -42,36 +41,8 @@ import pytest
 import huggingface_hub
 from huggingface_hub import constants as hf_constants
 
-_ZOO_DIR = Path(__file__).resolve().parents[1] / "unsloth_zoo"
-
-
-def _load(name: str, filename: str):
-    spec = importlib.util.spec_from_file_location(name, _ZOO_DIR / filename)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-# Package placeholder so intra-package imports in hf_xet_fallback resolve to the files
-# loaded below. Restored afterwards: a leftover would shadow the real unsloth_zoo.
-_saved_modules = {
-    name: sys.modules.get(name)
-    for name in ("unsloth_zoo", "unsloth_zoo.hf_cache_state", "unsloth_zoo.hf_xet_fallback")
-}
-if "unsloth_zoo" not in sys.modules:
-    _pkg = _types.ModuleType("unsloth_zoo")
-    _pkg.__path__ = [str(_ZOO_DIR)]
-    sys.modules["unsloth_zoo"] = _pkg
-
-hcs = _load("unsloth_zoo.hf_cache_state", "hf_cache_state.py")
-xf = _load("unsloth_zoo.hf_xet_fallback", "hf_xet_fallback.py")
-
-for _name, _mod in _saved_modules.items():
-    if _mod is None:
-        sys.modules.pop(_name, None)
-    else:
-        sys.modules[_name] = _mod
+from unsloth_zoo_downloads import hf_cache_state as hcs
+from unsloth_zoo_downloads import hf_xet_fallback as xf
 
 # Real prep impl, captured before the autouse fixture stubs the module attribute.
 _REAL_DEFAULT_PREPARE = xf._default_prepare_for_http

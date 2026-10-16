@@ -1290,7 +1290,8 @@ def _merge_and_overwrite_lora(
                             saved_weight = lora_stats.module.weight
                         if saved_weight is not None:
                             target_dtype = output_dtype if output_dtype is not None else W_original_dtype
-                            W = saved_weight.to(W.device, dtype = target_dtype, non_blocking = True)
+                            # Blocking: an async D2H copy into pinned memory is read by the mmap write before it lands.
+                            W = saved_weight.to(W.device, dtype = target_dtype)
                             count += 1
                     elif hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                         W = _merge_lora(W, lora_stats, output_key, use_dequant_base = use_dequant_base)
@@ -2669,7 +2670,6 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     W = saved_weight.to(
                         W.device,
                         dtype = output_dtype if output_dtype is not None else W.dtype,
-                        non_blocking = True,
                     )
                     count += 1
                     action_logged = True
@@ -4078,6 +4078,93 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     )
 
 
+def _previous_export_shards(filenames, save_directory, source_directory = None):
+    """Output shards an earlier export left behind, which the fetch must replace, not reuse.
+
+    The in-place export is skipped (its output shard IS the source), and so is a shard under a
+    symlinked parent, which the containment check refuses later anyway.
+    """
+    stale = []
+    for filename in filenames:
+        output_path = os.path.join(save_directory, filename)
+        if not os.path.lexists(output_path) or os.path.isdir(output_path):
+            continue
+        if not _resolves_inside(os.path.dirname(output_path) or os.curdir, save_directory):
+            continue
+        if source_directory is not None:
+            source_path = os.path.join(source_directory, filename)
+            if not os.path.exists(source_path) or (
+                os.path.exists(output_path) and os.path.samefile(output_path, source_path)
+            ):
+                continue
+        stale.append(filename)
+    return stale
+pass
+
+
+_REFRESH_DISK_MARGIN = 64 * 1024 * 1024
+
+def _check_disk_for_previous_export_refresh(save_directory, new_sizes):
+    """Refuse a re-export the disk cannot finish before any previous shard is replaced.
+
+    prepare_saving compares free space with the in-memory save size, which a 4bit model with a
+    narrow adapter puts below the largest base shard. The refresh stages one shard at a time (a
+    split shard likewise writes its parts before removing it), so it needs the growth of the
+    whole set plus the largest shard.
+    """
+    if not new_sizes:
+        return
+    try:
+        growth = 0
+        for filename, new_size in new_sizes.items():
+            output_path = os.path.join(save_directory, filename)
+            old_size = os.lstat(output_path).st_size if os.path.lexists(output_path) else 0
+            growth += new_size - old_size
+        needed = max(growth, 0) + max(new_sizes.values()) + _REFRESH_DISK_MARGIN
+        free = shutil.disk_usage(save_directory).free
+    except OSError:
+        return
+    if free < needed:
+        raise RuntimeError(
+            f"Unsloth: Not enough disk space to replace the previous export in {save_directory}: "
+            f"{needed / 1024**3:.2f} GB is needed and {free / 1024**3:.2f} GB is free. "
+            "Nothing was changed. Free up disk space or remove the previous export, then re-run."
+        )
+pass
+
+
+def _resolve_hub_commit(repo_id, token):
+    # One commit for every file an export fetches, so a push to the repo mid-export cannot mix
+    # shards from two commits. Offline or unreachable gives None: unpinned, as before.
+    try:
+        from huggingface_hub import HfApi
+        return HfApi(token = token).model_info(repo_id).sha
+    except Exception:
+        return None
+pass
+
+
+def _download_shard_over_previous_export(repo_id, filename, save_directory, cache_dir, token, revision = None):
+    # Downloaded into a private folder beside the output, then renamed over the previous shard,
+    # so a failed download leaves that shard as it was and no second copy is ever kept.
+    file_path = os.path.join(save_directory, filename)
+    staging_dir = tempfile.mkdtemp(dir = save_directory, prefix = ".unsloth-fetch-")
+    try:
+        hf_hub_download(
+            repo_id = repo_id,
+            filename = filename,
+            repo_type = "model",
+            local_dir = staging_dir,
+            cache_dir = cache_dir,
+            token = token,
+            revision = revision,
+        )
+        os.replace(os.path.join(staging_dir, filename), file_path)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors = True)
+pass
+
+
 def _ensure_shard_writable(file_path):
     """Make an output shard owner-writable for the in-place "r+b" merge (hf_hub 1.x blobs are 0444).
 
@@ -4659,6 +4746,74 @@ def _save_remote_code_files(model, save_directory):
 pass
 
 
+_OUTPUT_DTYPE_ALIASES = {
+    "float32" : torch.float32, "fp32" : torch.float32, "f32" : torch.float32,
+    "float16" : torch.float16, "fp16" : torch.float16, "f16" : torch.float16, "half" : torch.float16,
+    "bfloat16" : torch.bfloat16, "bf16" : torch.bfloat16,
+}
+
+def _normalize_output_dtype(output_dtype):
+    if not isinstance(output_dtype, str): return output_dtype
+    key = output_dtype.strip().lower().removeprefix("torch.")
+    if key not in _OUTPUT_DTYPE_ALIASES:
+        raise ValueError(
+            f"Unsloth: Unsupported output dtype `{output_dtype}`. Use None (keep the base "
+            f"checkpoint's dtype) or \"float32\"."
+        )
+    return _OUTPUT_DTYPE_ALIASES[key]
+pass
+
+
+def _float32_merge_peak_bytes(total_16bit_bytes, max_shard_16bit_bytes, uploads_as_it_goes = False):
+    # A widened shard can be rewritten once more (grown vocab), holding two float32 copies.
+    # Local: earlier shards stay widened, so 2 x total + one more 16-bit shard's worth.
+    # Streamed to the Hub: widened shards are uploaded and removed, so total + 3 x shard.
+    if uploads_as_it_goes:
+        return total_16bit_bytes + 3 * max_shard_16bit_bytes
+    return 2 * total_16bit_bytes + 2 * max_shard_16bit_bytes
+pass
+
+
+def _upcast_shard_to_float32(save_directory, filename):
+    # Streams one tensor at a time to a temp file, then os.replace. A no-op on a shard
+    # with no BF16 / F16 tensors, so a re-run or an already float32 base costs nothing.
+    file_path = os.path.join(save_directory, filename)
+    with open(file_path, "rb") as f:
+        length_of_header = int.from_bytes(f.read(8), "little")
+        header_metadata = json.loads(f.read(length_of_header))
+    if not any(
+        isinstance(v, dict) and v.get("dtype") in ("BF16", "F16")
+        for k, v in header_metadata.items() if k != "__metadata__"
+    ):
+        return
+    _stream_rewrite_resized_shard_and_replace(
+        file_path, os.path.dirname(os.path.abspath(file_path)),
+        header_metadata, length_of_header, {}, cast_to = torch.float32,
+    )
+pass
+
+
+def _mark_config_float32(config_path):
+    # Without this, from_pretrained(dtype = "auto") reads bfloat16 and downcasts on load.
+    if not os.path.exists(config_path): return
+    with open(config_path, "r", encoding = "utf-8") as f:
+        data = json.load(f)
+    def _walk(obj):
+        if isinstance(obj, dict):
+            for key in ("torch_dtype", "dtype"):
+                if obj.get(key) in ("bfloat16", "float16"): obj[key] = "float32"
+            for value in obj.values(): _walk(value)
+        elif isinstance(obj, list):
+            for value in obj: _walk(value)
+    _walk(data)
+    if "torch_dtype" not in data and "dtype" not in data:
+        data["torch_dtype"] = "float32"
+    with open(config_path, "w", encoding = "utf-8") as f:
+        json.dump(data, f, indent = 2, sort_keys = True)
+        f.write("\n")
+pass
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -4692,9 +4847,16 @@ def merge_and_overwrite_lora(
             "\"merged_4bit\", \"mxfp4\") so the intent is on the call."
         )
 
+    # Only an explicit float32 on merged_16bit widens the shards; None, 16-bit values and
+    # every other save_method keep the on-disk dtype, as before.
+    output_dtype = _normalize_output_dtype(output_dtype)
+    upcast_to_float32 = output_dtype is torch.float32 and save_method == "merged_16bit"
+
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
     safetensors_list = []
+    _hub_revision = None
+    _hub_shard_sizes = {}
     max_size_in_bytes = 0
     total_size_in_bytes = 0
     config = model.config
@@ -4838,8 +5000,11 @@ def merge_and_overwrite_lora(
             # Third Hub round trip on this path, and it had the same bare `except:` as
             # the other two: an unreachable Hub was reported as "Could not determine
             # original model ID", a claim about the name rather than the network.
+            # The listing is pinned to the same commit as every fetch below, so the shard names
+            # and sizes cannot describe an older commit than the files downloaded.
             try:
-                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+                _hub_revision = _resolve_hub_commit(model_name, token)
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True, revision = _hub_revision)
             except _HUB_ABSENT_ERRORS:
                 # Genuinely absent, which is what the original-model-id fallback is for.
                 original_model_id = get_original_model_id(model_name)
@@ -4849,7 +5014,8 @@ def merge_and_overwrite_lora(
                 # Assigned after the check so the message above names the failing input
                 # instead of always saying "from None".
                 model_name = original_model_id
-                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+                _hub_revision = _resolve_hub_commit(model_name, token)
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True, revision = _hub_revision)
             except Exception as e:
                 raise _hub_unreachable_error(
                     model_name, e,
@@ -4868,6 +5034,7 @@ def merge_and_overwrite_lora(
                 if _hf_has_proper and fname == "consolidated.safetensors":
                     continue
                 safetensors_list.append(fname)
+                _hub_shard_sizes[fname] = x["size"]
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
 
@@ -4881,6 +5048,7 @@ def merge_and_overwrite_lora(
                     repo_id  = model_name,
                     filename = "model.safetensors.index.json",
                     token    = token,
+                    revision = _hub_revision,
                 )
                 with open(_idx_path, "r", encoding = "utf-8") as f:
                     _weight_map = json.load(f).get("weight_map", {})
@@ -4946,6 +5114,21 @@ def merge_and_overwrite_lora(
         # Stop loop and continue
         break
     pass
+
+    # prepare_saving sized untouched tensors at their in-memory width, but every 16-bit tensor
+    # is widened, and each shard sits beside its float32 copy while it is rewritten.
+    if upcast_to_float32:
+        _peak = _float32_merge_peak_bytes(
+            total_size_in_bytes, max_size_in_bytes,
+            uploads_as_it_goes = push_to_hub and low_disk_space_usage,
+        )
+        if free < _peak:
+            raise RuntimeError(
+                f"Unsloth: a float32 merged export of `{model_name}` needs about "
+                f"{_peak / 1024**3:.1f} GB of free disk at its peak, but `{save_directory}` has "
+                f"{free / 1024**3:.1f} GB. Nothing was written. Free disk space, save to a larger "
+                f"volume, or use `output_dtype = None` for a 16-bit merge."
+            )
 
     # Read before Step 1 rewrites config.json: an in-place export would strip the block size.
     _fp8_disk_block_size = (
@@ -5038,6 +5221,12 @@ def merge_and_overwrite_lora(
             "packed tensors would be written unmerged. Nothing was written. Save the adapter "
             "with `model.save_pretrained(...)` instead."
         )
+    if upcast_to_float32 and (base_model_is_quantized or _ct_packed_format is not None):
+        raise RuntimeError(
+            f"Unsloth: a float32 merged export needs a 16-bit base checkpoint, but `{model_name}` "
+            f"is stored quantized ({quant_type or _ct_packed_format}). Nothing was merged. Use "
+            f"`output_dtype = None` for the default 16-bit merge."
+        )
     _ct_int_schemes = _compressed_int_pack_schemes(model_name, token) if _ct_packed_format == "pack-quantized" else None
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
@@ -5070,6 +5259,8 @@ def merge_and_overwrite_lora(
             _copy_export_remote_code(model_name, save_directory, token, model)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
+        if upcast_to_float32:
+            _mark_config_float32(Path(save_directory) / "config.json")
         _save_remote_code_files(model, save_directory)
         # #5410: keep trained eos / sampling defaults on reload.
         try:
@@ -5168,6 +5359,7 @@ def merge_and_overwrite_lora(
                     local_dir_use_symlinks = False,
                     cache_dir = _hf_cache_dir,
                     token = token,
+                    revision = _hub_revision,
                 )
 
         if push_to_hub and safe_tensor_index_files:
@@ -5175,89 +5367,141 @@ def merge_and_overwrite_lora(
         pass
     pass
 
-    # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
-    if not is_local_path and _hf_cache_dir is not None:
-        copied_all_from_cache = _try_copy_all_from_cache(
-            repo_id = model_name,
-            filenames_to_check = safetensors_list,
-            target_dir_str = save_directory,
-            hf_cache_dir = _hf_cache_dir,
-            token = token,
-        )
-        copied_tokenizer_model_from_cache = _try_copy_all_from_cache(
-            repo_id=model_name,
-            filenames_to_check=["tokenizer.model"],
-            target_dir_str=save_directory,
-            hf_cache_dir=_hf_cache_dir,
-            token=token,
-        )
+    # An earlier export's shard is already merged and the fetches below can keep it
+    # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
+    # Each one is replaced in turn by a staged copy renamed over it, so no second copy of the
+    # checkpoint is kept, and a disk that cannot finish the refresh is refused before it starts.
+    _stale_shards = set(_previous_export_shards(
+        safetensors_list, save_directory, model_name if is_local_path else None,
+    ))
+    if _stale_shards:
+        if is_local_path:
+            _new_sizes = {
+                f : os.path.getsize(os.path.join(model_name, f)) for f in safetensors_list
+                if os.path.exists(os.path.join(model_name, f)) and (
+                    f in _stale_shards or not os.path.lexists(os.path.join(save_directory, f))
+                )
+            }
+        else:
+            _new_sizes = {
+                f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
+            }
+        _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
+    pass
 
-    if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
-        print(f"Downloading safetensors for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = safe_tensor_index_files + safetensors_list,
-            local_dir_use_symlinks = False,
-            cache_dir = _hf_cache_dir,
-            token = token,
-        )
+    _replaced_shards = []
+    try:
+        # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
+        if not is_local_path and _hf_cache_dir is not None:
+            # A copy that fails part way has still replaced the shards before it.
+            _copied_from_cache = []
+            try:
+                copied_all_from_cache = _try_copy_all_from_cache(
+                    repo_id = model_name,
+                    filenames_to_check = safetensors_list,
+                    target_dir_str = save_directory,
+                    hf_cache_dir = _hf_cache_dir,
+                    token = token,
+                    revision = _hub_revision,
+                    copied = _copied_from_cache,
+                )
+            finally:
+                _replaced_shards.extend(f for f in _copied_from_cache if f in _stale_shards)
+            copied_tokenizer_model_from_cache = _try_copy_all_from_cache(
+                repo_id=model_name,
+                filenames_to_check=["tokenizer.model"],
+                target_dir_str=save_directory,
+                hf_cache_dir=_hf_cache_dir,
+                token=token,
+                revision = _hub_revision,
+            )
 
-    if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
-        print(f"Attempting to download tokenizer.model for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = ["tokenizer.model"],
-            local_dir_use_symlinks = False,
-            cache_dir = _hf_cache_dir,
-            token = token,
-        )
+        if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
+            print(f"Downloading safetensors for {model_name}...")
+            # Previous export shards are fetched one by one in the loop below.
+            snapshot_download(
+                repo_id = model_name,
+                local_dir = save_directory,
+                allow_patterns = safe_tensor_index_files + [f for f in safetensors_list if f not in _stale_shards],
+                local_dir_use_symlinks = False,
+                cache_dir = _hf_cache_dir,
+                token = token,
+                revision = _hub_revision,
+            )
 
-    final_safetensors_list = []
+        if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
+            print(f"Attempting to download tokenizer.model for {model_name}...")
+            snapshot_download(
+                repo_id = model_name,
+                local_dir = save_directory,
+                allow_patterns = ["tokenizer.model"],
+                local_dir_use_symlinks = False,
+                cache_dir = _hf_cache_dir,
+                token = token,
+                revision = _hub_revision,
+            )
 
-    _reset_moe_merge_state()  # #5410
+        final_safetensors_list = []
 
-    # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
-    for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
-        file_path = os.path.join(save_directory, filename)
-        _materialize_shard_that_resolves_outside(file_path, save_directory)
-        # Before the copy, not only at the writers: those run much later, so a linked
-        # output component (`save_directory/weights -> /outside`) was followed by
-        # `makedirs` and `copy2` before anything refused.
-        _assert_shard_is_inside(file_path, save_directory)
-        # Only download if we didn't get everything from cache AND this specific file doesn't exist
-        # AND we're in low disk space mode
-        # For local models, copy the file if needed
-        if is_local_path and not os.path.exists(file_path):
-            local_file_path = os.path.join(model_name, filename)
-            if os.path.exists(local_file_path):
-                # A nested name has no parent here yet, so `copy2` would raise
+        _reset_moe_merge_state()  # #5410
+
+        # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
+        for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
+            file_path = os.path.join(save_directory, filename)
+            _materialize_shard_that_resolves_outside(file_path, save_directory)
+            # Before the copy, not only at the writers: those run much later, so a linked
+            # output component (`save_directory/weights -> /outside`) was followed by
+            # `makedirs` and `copy2` before anything refused.
+            _assert_shard_is_inside(file_path, save_directory)
+            # Only download if we didn't get everything from cache AND this specific file doesn't exist
+            # AND we're in low disk space mode
+            # For local models, copy the file if needed
+            # Overwrite unless it IS the source (in-place export): an earlier export's shard is already merged.
+            local_file_path = os.path.join(model_name, filename) if is_local_path else None
+            if is_local_path and os.path.exists(local_file_path) and not (
+                os.path.exists(file_path) and os.path.samefile(file_path, local_file_path)
+            ):
+                # A nested name has no parent here yet, so the copy would raise
                 # FileNotFoundError. The name is known to stay inside LEXICALLY, no
                 # stronger: a symlinked component still resolves wherever it points.
                 os.makedirs(os.path.dirname(file_path), exist_ok = True)
-                shutil.copy2(local_file_path, file_path)
+                _copy_file_from_source(local_file_path, os.path.dirname(file_path), os.path.basename(file_path))
                 print(f"Copied {filename} from local model directory")
+                if filename in _stale_shards: _replaced_shards.append(filename)
 
-        elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
-            hf_hub_download(
-                repo_id = model_name,
-                filename = filename,
-                repo_type = "model",
-                local_dir = save_directory,
-                cache_dir = _hf_cache_dir,
-                token = token,
-            )
+            elif not copied_all_from_cache and not is_local_path and filename in _stale_shards:
+                _download_shard_over_previous_export(
+                    model_name, filename, save_directory, _hf_cache_dir, token, revision = _hub_revision,
+                )
+                _replaced_shards.append(filename)
+
+            elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
+                hf_hub_download(
+                    repo_id = model_name,
+                    filename = filename,
+                    repo_type = "model",
+                    local_dir = save_directory,
+                    cache_dir = _hf_cache_dir,
+                    token = token,
+                    revision = _hub_revision,
+                )
+            pass
+
+            if needs_splitting:
+                resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)
+            else:
+                resulting_files = [filename]
+
+            # Collect all resulting files (temp names if split, original names if not)
+            final_safetensors_list.extend(resulting_files)
         pass
-
-        if needs_splitting:
-            resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)
-        else:
-            resulting_files = [filename]
-
-        # Collect all resulting files (temp names if split, original names if not)
-        final_safetensors_list.extend(resulting_files)
-    pass
+    except BaseException:
+        if _replaced_shards:
+            print(
+                f"Unsloth: Warning: the export in {save_directory} is incomplete. These shards "
+                f"already hold the base weights: {', '.join(dict.fromkeys(_replaced_shards))}. Re-run the export."
+            )
+        raise
 
     if low_disk_space_usage and not is_local_path and not copied_all_from_cache:
         tokenizer_model_path = os.path.join(save_directory, "tokenizer.model")
@@ -5270,6 +5514,7 @@ def merge_and_overwrite_lora(
                     local_dir = save_directory,
                     cache_dir = _hf_cache_dir,
                     token = token,
+                    revision = _hub_revision,
                 )
                 print("Downloaded tokenizer.model")
             except Exception as e:
@@ -5446,6 +5691,9 @@ def merge_and_overwrite_lora(
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
         if _int_rewrite is not None:
             _rewrite_compressed_int_shard(save_directory, filename, _int_rewrite, output_dtype)
+        if upcast_to_float32:
+            # Widen the shard first so the in-place merge below writes float32 slots.
+            _upcast_shard_to_float32(save_directory, filename)
         merged_count, shard_keys = _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
@@ -5597,9 +5845,11 @@ def _try_copy_all_from_cache(
     target_dir_str: str, # Expect string path for target directory
     hf_cache_dir: Optional[Path],
     token: Optional[str],
+    revision: Optional[str] = None,
+    copied: Optional[list] = None,
 ) -> bool:
     """If ALL files exist in the HF cache, copy them into target_dir_str.
-    Returns True on success, False otherwise.
+    Returns True on success, False otherwise. Names copied so far are appended to `copied`.
     """
     from huggingface_hub.errors import LocalEntryNotFoundError
 
@@ -5621,6 +5871,7 @@ def _try_copy_all_from_cache(
                 repo_type = "model",
                 cache_dir = hf_cache_dir,
                 token = token,
+                revision = revision,
             )
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
@@ -5650,6 +5901,7 @@ def _try_copy_all_from_cache(
         try:
             # Pass string target_dir_str to copy helper
             _copy_file_from_source(cached_path, target_dir_str, filename)
+            if copied is not None: copied.append(filename)
         except (IOError, PermissionError, FileNotFoundError) as copy_err:
              print(f"Cache copy failed: Error copying {filename} from {cached_path} to {target_dir_str}: {copy_err}")
              all_copied = False; break
@@ -5966,7 +6218,7 @@ def merge_and_dequantize_lora(
             DEQUANTIZED_KEYS.append(name)
             W = dequantize_module_weight(x.module)
             W = _merge_lora(W, x, name)
-            x = W.to(device = 'cpu', dtype = {str(output_dtype)}, non_blocking = True)
+            x = W.to(device = 'cpu', dtype = {str(output_dtype)})
         # Remove memory leak
         state_dict[name] = None
         return x
@@ -8344,12 +8596,16 @@ def split_safetensors_to_shards(file_path, max_shard_size_gb=2):
     return shards
 pass
 
-def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of_header, resized):
+def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of_header, resized, cast_to = None):
     # Stream one tensor at a time (peak RAM ~ one tensor): resized tensors from
     # `resized`, the rest byte-copied from src. Tensor-identical to dict+save_file.
     # A key of `resized` absent from the source header is APPENDED rather than replaced,
     # which is how a trained head with no base counterpart reaches the shard.
+    # `cast_to` re-labels and converts every BF16 / F16 tensor (float32 merged export).
     import struct
+    cast_name = _SAFETENSORS_DTYPE_NAMES[cast_to] if cast_to is not None else None
+    def _out_dtype(name):
+        return cast_name if cast_name is not None and name in ("BF16", "F16") else name
     src_data_start = 8 + length_of_header
     meta = header_metadata.get("__metadata__", None)
     tensor_keys = [k for k in header_metadata.keys() if k != "__metadata__"]
@@ -8361,31 +8617,36 @@ def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of
     for k in resized:
         entry = header_metadata.get(k)
         tensor = resized[k].detach()
-        if entry is not None: tensor = tensor.to(SAFETENSORS_DTYPES[entry["dtype"]])
+        if entry is not None: tensor = tensor.to(SAFETENSORS_DTYPES[_out_dtype(entry["dtype"])])
         res_t[k] = tensor.contiguous().cpu()
     tensor_keys += [k for k in res_t if k not in header_metadata]
 
     new_header = {}
     if meta is not None:
         new_header["__metadata__"] = meta
-    layout = []  # (key, src_off0, nbytes, is_resized)
+    layout = []  # (key, src_off0, src_nbytes, is_resized, cast)
     cursor = 0
     for k in tensor_keys:
         entry = header_metadata.get(k)
+        cast = None
         if k in res_t:
             t = res_t[k]
             shape = list(t.shape)
-            nbytes = t.numel() * t.element_size()
+            nbytes = src_nbytes = t.numel() * t.element_size()
             # dtype is unchanged by a vocab resize; an appended key labels its own.
-            dtype = entry["dtype"] if entry is not None else _SAFETENSORS_DTYPE_NAMES[t.dtype]
+            dtype = _out_dtype(entry["dtype"]) if entry is not None else _SAFETENSORS_DTYPE_NAMES[t.dtype]
         else:
             shape = list(entry["shape"])
             o0, o1 = entry["data_offsets"]
-            nbytes = o1 - o0
-            dtype = entry["dtype"]
+            nbytes = src_nbytes = o1 - o0
+            dtype = _out_dtype(entry["dtype"])
+            if dtype != entry["dtype"]:
+                cast = SAFETENSORS_DTYPES[entry["dtype"]]
+                nbytes = src_nbytes // torch.tensor([], dtype = cast).element_size() * \
+                    torch.tensor([], dtype = cast_to).element_size()
         new_header[k] = {"dtype": dtype, "shape": shape,
                          "data_offsets": [cursor, cursor + nbytes]}
-        layout.append((k, entry["data_offsets"][0] if entry is not None else 0, nbytes, k in res_t))
+        layout.append((k, entry["data_offsets"][0] if entry is not None else 0, src_nbytes, k in res_t, cast))
         cursor += nbytes
 
     header_bytes = json.dumps(new_header, separators = (",", ":")).encode("utf-8")
@@ -8395,10 +8656,23 @@ def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of
     with open(dst_path, "wb") as out, open(src_path, "rb") as src:
         out.write(struct.pack("<Q", len(header_bytes)))
         out.write(header_bytes)
-        for k, src_off0, nbytes, is_resized in layout:
+        for k, src_off0, nbytes, is_resized, cast in layout:
             if is_resized:
                 # reshape(-1) so 0-dim scalars (e.g. Gemma-4 audio min/max) view as bytes
                 out.write(memoryview(res_t[k].reshape(-1).view(torch.uint8).numpy()))
+            elif cast is not None:
+                # Bounded chunks, so a multi-GB embedding never sits in RAM at both widths.
+                src.seek(src_data_start + src_off0)
+                remaining = nbytes
+                while remaining > 0:
+                    raw = bytearray(src.read(min(CHUNK, remaining)))
+                    if not raw:
+                        raise RuntimeError(
+                            f"Unsloth: unexpected EOF reading {src_path} for tensor {k}")
+                    wide = torch.frombuffer(raw, dtype = cast).to(cast_to)
+                    out.write(memoryview(wide.view(torch.uint8).numpy()))
+                    remaining -= len(raw)
+                    del raw, wide
             else:
                 src.seek(src_data_start + src_off0)
                 remaining = nbytes
@@ -8440,7 +8714,7 @@ def _inplace_rewrite_resized_shard(filename_original, header_metadata, resized):
     tensors.clear()
 
 
-def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, header_metadata, length_of_header, resized):
+def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, header_metadata, length_of_header, resized, cast_to = None):
     # Stream the resized shard to a temp file then atomically os.replace it in
     # (peak RAM ~ one tensor). Used when disk has room for the transient copy.
     max_retries = 5
@@ -8460,6 +8734,7 @@ def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, heade
             header_metadata = header_metadata,
             length_of_header = length_of_header,
             resized = resized,
+            cast_to = cast_to,
         )
         if original_mode is not None:
             try:

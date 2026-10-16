@@ -103,7 +103,12 @@ OLD_CUDA_ARCH_VERSION = False
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
-        OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+        # Any visible pre-Turing card, not just the current one: a device_map can place
+        # layers on it, and Inductor fails there.
+        from .device_type import _visible_cuda_capabilities
+        OLD_CUDA_ARCH_VERSION = any(
+            (_major <= 7) and (_minor < 5) for _major, _minor in _visible_cuda_capabilities()
+        )
     else:
         # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
         # ask whether a device is present before asking what it can do. There is
@@ -561,7 +566,7 @@ from unsloth_zoo.loss_utils import (
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
-from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
+from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
 from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
@@ -883,7 +888,7 @@ def replace_sdpa_with_amd_aiter(source):
         block = [
             f"{indent}{_AITER_MARKER}, requires: pip install amd-aiter (ROCm >= 7.0)",
             f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func as {get_fn}",
-            f"{indent}{fn_var} = {get_fn}()",
+            f"{indent}{fn_var} = {get_fn}({q_var}.device)",
             f"{indent}{ok_var} = (",
             f"{indent}    {fn_var} is not None",
             # SDPA aligns causal masks top-left, aiter bottom-right; they agree
@@ -3323,6 +3328,7 @@ if n_items is None:
             break
 pass
 
+if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -3423,6 +3429,7 @@ if (\\9) != () and type(\\9) is dict:
     explicit_shift_labels = (\\9).get("shift_labels", None)
     if not torch.is_tensor(explicit_shift_labels): explicit_shift_labels = None
 
+if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -3549,6 +3556,7 @@ if n_items is None:
             break
 pass
 
+if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 

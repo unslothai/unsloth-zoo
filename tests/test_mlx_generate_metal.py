@@ -1,3 +1,4 @@
+import contextlib
 import types
 
 import pytest
@@ -30,6 +31,7 @@ def _nax_available():
 nax_only = pytest.mark.skipif(not _nax_available(), reason="requires an Apple GPU with neural accelerators")
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 VLM_MODEL = "mlx-community/FastVLM-0.5B-bf16"
+QWEN_VLM_MODEL = "mlx-community/Qwen3.5-0.8B-bf16"
 
 class _CompileBlock(nn.Module):
     def __init__(self):
@@ -542,6 +544,83 @@ def test_vlm_stream_prefills_a_short_arrival_ahead_of_a_long_prefill_bitwise():
     assert got_long.prompt_token_count > 3 * 2048 and order == [1, 0]
     for got, alone in ((got_long, alone_long), (got_short, alone_short)):
         assert (got.token_ids[0], got.logprobs[0]) == (alone.token_ids[0], alone.logprobs[0])
+
+
+@metal_only
+@pytest.mark.parametrize("disagreement", [None, "output", "cache"])
+def test_vlm_stream_row_left_alone_decodes_bitwise_without_the_single_row_shortcut(monkeypatch, disagreement):
+    from mlx.utils import tree_flatten
+    from mlx_vlm import load
+    from mlx_vlm.models.qwen3_5 import language
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx import generate as engine
+    from unsloth_zoo.mlx.generate import BatchStream, GenerationDefaults, GenerationRequest
+    model, processor = load(QWEN_VLM_MODEL)
+    model._is_vlm_model = True
+    rules = " ".join(f"Rule {i}: answer at length." for i in range(300))
+    story = GenerationRequest(prompt=apply_chat_template(processor, model.config, f"{rules} Tell a story.", num_images=0))
+    poem = GenerationRequest(prompt=apply_chat_template(processor, model.config, "Write a poem.", num_images=0), max_tokens=6)
+    extracted, native_extract, scope = [], language._extract_row_cache, engine.single_row_batch_decode
+    monkeypatch.setattr(language, "_extract_row_cache", lambda entry, row: extracted.append(row) or native_extract(entry, row))
+    if disagreement:
+        # A batched step that disagrees with the shortcut in its output or its cache alone.
+        native_bypass = engine._bypassing_single_row
+
+        def disagreeing(call, cache):
+            out = native_bypass(call, cache)
+            for entry in cache if disagreement == "cache" else ():
+                if isinstance(getattr(entry, "keys", None), mx.array):
+                    entry.keys = entry.keys + 1
+            return out + 1 if disagreement == "output" else out
+
+        monkeypatch.setattr(engine, "_bypassing_single_row", disagreeing)
+    engine._single_row_decode_class.cache_clear()
+
+    def run(single_row_scope):
+        monkeypatch.setattr(engine, "single_row_batch_decode", single_row_scope)
+        extracted.clear()
+        defaults = GenerationDefaults(max_tokens=24, prefill_batch_size=1, completion_batch_size=4)
+        results, state = {}, None
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            row = stream.add(story)
+            stream.add(poem)
+            while row not in results:
+                results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+                batch = stream._session.generator._generation_batch
+                if row not in results and len(batch.uids) == 1:
+                    state = [mx.array(v) for e in batch.prompt_cache for _, v in tree_flatten(e.state) if isinstance(v, mx.array)]
+                    mx.eval(state)
+        return results[row], state, len(extracted)
+
+    stock_scope = lambda model: contextlib.nullcontext(model)
+    stock, stock_state, stock_extracted = run(stock_scope)
+    # The story decodes alone once the poem ends, and each such step went through the shortcut.
+    assert stock_extracted > 10 and stock_state is not None
+    for again in (False, True):
+        scoped, state, scoped_extracted = run(scope)
+        assert (scoped.token_ids, scoped.logprobs) == (stock.token_ids, stock.logprobs)
+        assert len(state) == len(stock_state)
+        assert all(a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(
+            mx.contiguous(a).view(mx.uint8), mx.contiguous(b).view(mx.uint8)).item() for a, b in zip(state, stock_state))
+        if disagreement:
+            # The disagreeing step is replaced by the shortcut's, which the batch then keeps taking.
+            assert scoped_extracted == stock_extracted
+        elif again:
+            assert scoped_extracted == 0
+        else:
+            # One step runs both paths to compare them; the batch stays on its own path after that.
+            assert 0 < scoped_extracted < stock_extracted
+    if not disagreement:
+        # generate_batch enters the scope too. It batches only prompts of one length, so the
+        # story runs twice and the batch shrinks to one row when the shorter copy ends.
+        rows, short_story = {}, GenerationRequest(prompt=story.prompt, max_tokens=6)
+        for name, single_row_scope in (("stock", stock_scope), ("scoped", scope)):
+            monkeypatch.setattr(engine, "single_row_batch_decode", single_row_scope)
+            extracted.clear()
+            rows[name] = engine.generate_batch(model, processor, [story, short_story], defaults=GenerationDefaults(max_tokens=24))
+            rows[name + " extracted"] = len(extracted)
+        assert [(r.token_ids, r.logprobs) for r in rows["scoped"]] == [(r.token_ids, r.logprobs) for r in rows["stock"]]
+        assert rows["stock extracted"] > 10 and rows["scoped extracted"] == 0
 
 
 @metal_only

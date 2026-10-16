@@ -102,12 +102,20 @@ def test_inkling_config_moe_width_from_split():
         pytest.skip("no Inkling in this transformers")
     from unsloth_zoo.temporary_patches.inkling import patch_inkling_text_config
     saved_init = InklingTextConfig.__init__
+    split = dict(hidden_size = 64, num_hidden_layers = 2, intermediate_size = 2048, dense_intermediate_size = 16384)
+    # transformers 5.20 reads the split itself, and then sets the MoE width from it unconditionally.
+    InklingTextConfig.__init__ = getattr(saved_init, "__wrapped__", saved_init)
+    try:
+        native_split = InklingTextConfig(**split).moe_intermediate_size == 2048
+    finally:
+        InklingTextConfig.__init__ = saved_init
     patch_inkling_text_config()
-    c = InklingTextConfig(hidden_size = 64, num_hidden_layers = 2, intermediate_size = 2048, dense_intermediate_size = 16384)
+    c = InklingTextConfig(**split)
     assert c.moe_intermediate_size == 2048
     assert c.intermediate_size == 16384
-    c = InklingTextConfig(hidden_size = 64, num_hidden_layers = 2, intermediate_size = 2048, dense_intermediate_size = 16384, moe_intermediate_size = 512)
-    assert c.moe_intermediate_size == 512
+    if not native_split:
+        c = InklingTextConfig(**split, moe_intermediate_size = 512)
+        assert c.moe_intermediate_size == 512
     c = InklingTextConfig(hidden_size = 64, num_hidden_layers = 2)
     assert c.moe_intermediate_size == 3072
     InklingTextConfig.__init__ = saved_init

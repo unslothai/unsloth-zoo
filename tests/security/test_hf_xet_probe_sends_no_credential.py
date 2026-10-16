@@ -6,9 +6,7 @@ A hand-rolled `urllib` Request ignores `HF_HUB_DISABLE_IMPLICIT_TOKEN` and keeps
 `Authorization` across a cross-host 3xx. Loopback only, enforced by the package conftest.
 """
 
-import importlib.util
 import os
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,25 +19,10 @@ DUMMY_TOKEN = "hf_dummyTokenForTestsOnly000000000000"
 
 
 def _load_hf_xet_health():
-    """Load the module standalone: importing `unsloth_zoo` runs import-time device detection.
+    """The light package imports without `unsloth_zoo`'s import-time device detection."""
+    from unsloth_zoo_downloads import hf_xet_health
 
-    Its one relative import needs a parent package, which the stub supplies.
-    """
-    import types
-
-    pkg_name = "unsloth_zoo_stub_for_xet_test"
-    if pkg_name not in sys.modules:
-        pkg = types.ModuleType(pkg_name)
-        pkg.__path__ = [str(REPO_ROOT / "unsloth_zoo")]
-        sys.modules[pkg_name] = pkg
-
-    name = f"{pkg_name}.hf_xet_health"
-    path = REPO_ROOT / "unsloth_zoo" / "hf_xet_health.py"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+    return hf_xet_health
 
 
 class _RecordingHandler(BaseHTTPRequestHandler):
@@ -193,7 +176,7 @@ def test_source_carries_no_authorization_header():
     """
     import ast
 
-    path = REPO_ROOT / "unsloth_zoo" / "hf_xet_health.py"
+    path = REPO_ROOT / "unsloth_zoo_downloads" / "hf_xet_health.py"
     tree = ast.parse(path.read_text(encoding = "utf-8"))
 
     docstrings = set()

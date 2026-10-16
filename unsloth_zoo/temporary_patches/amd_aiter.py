@@ -116,7 +116,7 @@ def aiter_attention_forward(
             return _fallback()
 
     from unsloth_zoo.device_type import get_amd_flash_attn_func
-    flash_attn_func = get_amd_flash_attn_func()
+    flash_attn_func = get_amd_flash_attn_func(query.device)
     if flash_attn_func is None:
         return _fallback()
 
