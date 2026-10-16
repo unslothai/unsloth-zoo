@@ -201,10 +201,19 @@ def test_fused_ce_budget_reads_the_head_device_per_device():
 
 # Z3: per-device AMD arch / aiter caches -----------------------------------------------
 
+_AMD_CACHED = ("_detect_gfx_arch", "get_amd_attention_implementation", "get_amd_flash_attn_func")
+
+
 def _clear_amd_caches():
-    for fn in (device_type._detect_gfx_arch, device_type.get_amd_attention_implementation,
-               device_type.get_amd_flash_attn_func):
-        fn.cache_clear()
+    for name in _AMD_CACHED:
+        getattr(device_type, name).cache_clear()
+
+
+def _multi_device_caches(monkeypatch):
+    # Import on a host without two HIP devices keeps the plain cache; rebuild the per-device one.
+    for name in _AMD_CACHED:
+        fn = inspect.unwrap(getattr(device_type, name))
+        monkeypatch.setattr(device_type, name, device_type._per_device_cache(fn, multi_device = True))
 
 
 @pytest.fixture
@@ -224,6 +233,7 @@ def amd_host(monkeypatch):
     aiter.__spec__ = importlib.machinery.ModuleSpec("aiter", None)
     aiter.flash_attn_func = lambda *a, **k: None
     monkeypatch.setitem(sys.modules, "aiter", aiter)
+    _multi_device_caches(monkeypatch)
     _clear_amd_caches()
     yield aiter
     _clear_amd_caches()
@@ -243,6 +253,31 @@ def test_aiter_choice_follows_set_device(amd_host):
     torch.cuda.set_device(1)
     assert device_type.get_amd_attention_implementation() == "sdpa"
     assert device_type.get_amd_flash_attn_func() is None
+
+
+@pytest.mark.parametrize("hip,count", [(False, 2), (True, 1), (True, 0)])
+def test_single_device_keeps_the_plain_cache(monkeypatch, hip, count):
+    monkeypatch.setattr(device_type, "is_hip", lambda: hip)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
+    calls = []
+
+    def probe(device = None):
+        calls.append(device)
+        return "gfx1151"
+
+    cached = device_type._per_device_cache(probe)
+    assert hasattr(cached, "cache_info") and inspect.unwrap(cached) is probe
+    assert cached() == cached() == "gfx1151"
+    assert calls == [None]
+
+
+def test_plain_cache_resolves_a_device_argument(monkeypatch):
+    monkeypatch.setattr(device_type, "is_hip", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda i: types.SimpleNamespace(gcnArchName = ["gfx1151"][i]))
+    fn = device_type._per_device_cache(inspect.unwrap(device_type._detect_gfx_arch), multi_device = False)
+    assert fn(torch.device("cuda", 0)) == fn("cuda:0") == fn(0) == "gfx1151"
 
 
 def test_amd_caches_take_an_explicit_device(amd_host):

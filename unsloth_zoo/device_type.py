@@ -274,10 +274,18 @@ def _current_hip_device_index():
 pass
 
 
-def _per_device_cache(function):
+def _per_device_cache(function, multi_device = None):
     """functools.cache keyed by device index; the no-argument call means the current
-    device, so torch.cuda.set_device(1) no longer reuses device 0's answer."""
+    device, so torch.cuda.set_device(1) no longer reuses device 0's answer. Off ROCm or
+    with one visible device the plain C-level cache is exact, so no per-call wrapper."""
     cached = functools.cache(function)
+    if multi_device is None:
+        try:
+            multi_device = is_hip() and torch.cuda.device_count() > 1
+        except Exception:
+            multi_device = False
+    if not multi_device:
+        return cached
     @functools.wraps(function)
     def wrapper(device = None):
         if device is not None and not isinstance(device, int):
@@ -341,6 +349,8 @@ def _detect_gfx_arch(device = None):
     mask-mapped to the same device but may still differ on unusual setups.
     """
     import re as _re
+    if device is not None and not isinstance(device, int):
+        device = torch.device(device).index
     # PyTorch device first: right arch for the GPU torch is using, and it
     # respects HIP_VISIBLE_DEVICES.
     try:
