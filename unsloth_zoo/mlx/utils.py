@@ -18595,6 +18595,23 @@ def _asset_link_stays_in_the_model(file, source):
         return False
 
 
+@contextlib.contextmanager
+def _detached_detokenizer(processor):
+    """Without mlx-vlm's attached streaming detokenizer: transformers deep-copies a processor's
+    attributes to serialize it, and the naive one (tiktoken tokenizers, e.g. Kimi) cannot be copied."""
+    detokenizer = vars(processor).pop("detokenizer", None) if hasattr(processor, "__dict__") else None
+    try:
+        yield
+    finally:
+        if detokenizer is not None:
+            processor.detokenizer = detokenizer
+
+
+def _save_tokenizer(tokenizer, path):
+    with _detached_detokenizer(tokenizer):
+        tokenizer.save_pretrained(str(path))
+
+
 def _save_vlm_processor_assets(processor, path, sources=()):
     path = Path(path)
     failures = []
@@ -18659,7 +18676,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
         try:
             with tempfile.TemporaryDirectory() as staging:
                 try:
-                    save(staging)
+                    with _detached_detokenizer(component):
+                        save(staging)
                 except Exception as error:
                     failures.append(f"{type(component).__name__}: {error}")
                     success = False
@@ -19048,7 +19066,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
             is_vlm=is_vlm,
         )
 
-    tokenizer.save_pretrained(str(path))
+    _save_tokenizer(tokenizer, path)
 
     src_path = _get_src_path(model)
     if src_path is not None:
@@ -19337,7 +19355,7 @@ def save_pretrained_merged(
         else:
             save_lora_adapters(model, save_directory)
         try:
-            tokenizer.save_pretrained(str(save_directory))
+            _save_tokenizer(tokenizer, save_directory)
         except Exception:
             pass
     else:

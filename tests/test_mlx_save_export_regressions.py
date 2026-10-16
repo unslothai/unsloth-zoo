@@ -4909,3 +4909,29 @@ def test_clean_processor_save_does_not_invent_processor_config(tmp_path):
     _save_vlm_processor_assets(Processor(), tmp_path)
     assert (tmp_path / "preprocessor_config.json").is_file()
     assert not (tmp_path / "processor_config.json").exists()
+
+
+def test_processor_saves_skip_mlx_vlms_uncopyable_detokenizer(tmp_path):
+    import copy
+    from unsloth_zoo.mlx.utils import _save_tokenizer, _save_vlm_processor_assets
+
+    class Detokenizer:   # mlx-vlm's naive streaming detokenizer refuses a deep copy
+        def __deepcopy__(self, memo):
+            raise AttributeError("property 'text' of 'NaiveStreamingDetokenizer' object has no setter")
+
+    class Processor:   # transformers deep-copies a processor's attributes to serialize it
+        def __init__(self):
+            self.size, self.detokenizer = 32, Detokenizer()
+        def to_dict(self):
+            return {"processor_class": "Processor", **copy.deepcopy(vars(self))}
+        def save_pretrained(self, path):
+            (Path(path) / "processor_config.json").write_text(json.dumps(self.to_dict()))
+
+    processor = Processor()
+    detokenizer = processor.detokenizer
+    for save in (_save_tokenizer, _save_vlm_processor_assets):
+        out = tmp_path / save.__name__
+        out.mkdir()
+        save(processor, out)
+        assert json.loads((out / "processor_config.json").read_text()) == {"processor_class": "Processor", "size": 32}
+        assert processor.detokenizer is detokenizer
