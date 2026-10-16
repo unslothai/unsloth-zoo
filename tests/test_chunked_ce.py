@@ -132,3 +132,15 @@ def test_zero_scaling_gives_finite_gradients():
     loss = unsloth_chunked_ce_loss(hidden, torch.randn(V, H), None, labels, scaling = 0.0)
     loss.backward()
     assert torch.isfinite(hidden.grad).all() and hidden.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("flag", ["FP32_HEAD_GRAD", "_FUSED_CE_COMPILE_DISABLED"])
+def test_old_path_opt_ins_keep_the_old_path(monkeypatch, flag):
+    calls = {"new": 0}
+    monkeypatch.setattr(cel, "_chunked_ce_opaque", lambda *a: calls.__setitem__("new", 1))
+    monkeypatch.setattr(cel, "_CHUNKED_CE", True)
+    monkeypatch.setattr(cel, flag, True)
+    hidden = torch.randn(B, S, H, requires_grad = True)
+    loss = cel.unsloth_fused_ce_loss(None, hidden, torch.randn(V, H), None, torch.randint(0, V, (B, S)))
+    loss.backward()
+    assert calls["new"] == 0 and torch.isfinite(hidden.grad).all()

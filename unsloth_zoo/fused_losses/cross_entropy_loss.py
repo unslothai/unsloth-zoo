@@ -57,8 +57,8 @@ except Exception:
     pass
 
 # Module-level flag: None = untested, True = works, False = skip compile.
-_FUSED_CE_COMPILE_SUPPORTED = None if \
-    os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") != "1" else False
+_FUSED_CE_COMPILE_DISABLED = os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") == "1"
+_FUSED_CE_COMPILE_SUPPORTED = None if not _FUSED_CE_COMPILE_DISABLED else False
 
 @functools.cache
 def _get_mapping(autograd):
@@ -670,6 +670,9 @@ _CHUNKED_CE_KWARGS = frozenset(("ignore_index", "logit_scale_multiply", "logit_s
 def _use_chunked_ce(kwargs, target_gb):
     # Plain token CE only: label smoothing, logits_bias, n_chunks and explicit memory targets keep the old path.
     if not _CHUNKED_CE or target_gb is not None or TARGET_GB or N_CHUNKS:
+        return False
+    # Opt-ins only the old path implements: fp32 head-gradient accumulation, no fused-CE compile.
+    if FP32_HEAD_GRAD or _FUSED_CE_COMPILE_DISABLED:
         return False
     if float(kwargs.get("label_smoothing", 0.0) or 0.0) != 0.0:
         return False
