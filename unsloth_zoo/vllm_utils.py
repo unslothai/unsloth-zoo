@@ -3552,6 +3552,49 @@ def _shrink_for_memory_retry(max_num_seqs, max_num_batched_tokens, max_seq_lengt
     return max_num_seqs, max_num_batched_tokens
 
 
+def _padded_vocab_ids(config):
+    # Written by tokenizer_utils._suppress_padded_rows (add_new_tokens(pad_to_multiple_of = ...)).
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config() if callable(get_text_config) else config
+    return list(getattr(text_config, "unsloth_vocab_pad_ids", None) or [])
+pass
+
+
+def suppress_vllm_padded_vocab(llm, padded_ids):
+    """vLLM samples every row of config.vocab_size and ignores generation_config.suppress_tokens,
+    so alignment rows from add_new_tokens(pad_to_multiple_of = ...) could be emitted as ids no
+    tokenizer token has. Bias them to -100 in every llm.generate call. Idempotent."""
+    generate = getattr(llm, "generate", None)
+    if generate is None or getattr(generate, "_unsloth_padded_vocab", False):
+        return llm
+    bias = {int(i): -100.0 for i in padded_ids}
+
+    def _with_bias(params):
+        if params is None:
+            get_default = getattr(llm, "get_default_sampling_params", None)
+            if get_default is None:
+                from vllm import SamplingParams
+                params = SamplingParams()
+            else:
+                params = get_default()
+        params = copy.copy(params)
+        params.logit_bias = {**(getattr(params, "logit_bias", None) or {}), **bias}
+        return params
+
+    @functools.wraps(generate)
+    def generate_without_padded_vocab(prompts, sampling_params = None, *args, **kwargs):
+        if isinstance(sampling_params, (list, tuple)):
+            sampling_params = [_with_bias(params) for params in sampling_params]
+        else:
+            sampling_params = _with_bias(sampling_params)
+        return generate(prompts, sampling_params, *args, **kwargs)
+
+    generate_without_padded_vocab._unsloth_padded_vocab = True
+    llm.generate = generate_without_padded_vocab
+    return llm
+pass
+
+
 def _fp32_lm_head_requested():
     return os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
 
@@ -4733,6 +4776,14 @@ def load_vllm(
         if engine_args.get("enable_return_routed_experts", False):
             from .routing_replay import wrap_vllm_generate
             wrap_vllm_generate(llm)
+        padded_ids = _padded_vocab_ids(config)
+        if padded_ids:
+            if engine_args.get("speculative_config", None) is not None:
+                print(
+                    "Unsloth: vLLM ignores logit_bias under speculative decoding, so this padded "
+                    "vocabulary's alignment rows stay sampleable."
+                )
+            suppress_vllm_padded_vocab(llm, padded_ids)
         if _merged_rollout_enabled():
             llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)

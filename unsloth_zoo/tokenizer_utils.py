@@ -115,16 +115,41 @@ def _round_up_vocab(n_rows, pad_to_multiple_of):
 pass
 
 
+# Alignment rows Unsloth added (and suppressed), on the text config so they survive save / load
+# and reach vLLM through the model config.
+_VOCAB_PAD_IDS_KEY = "unsloth_vocab_pad_ids"
+
+
+def _vocab_pad_config(model):
+    config = getattr(model, "config", None)
+    get_text_config = getattr(config, "get_text_config", None)
+    return get_text_config() if callable(get_text_config) else config
+pass
+
+
 def _suppress_padded_rows(model, start, end, now_valid = range(0)):
     """Alignment rows [start, end) have no token: keep HF generate from ever sampling them.
-    Ids in `now_valid` were alignment rows of an earlier call and are real tokens now."""
+    Ids in `now_valid` were alignment rows of an earlier call and are real tokens now; only
+    rows suppressed here are released, suppression the model or caller set is kept."""
     generation_config = getattr(model, "generation_config", None)
     if generation_config is None: return
+    config = _vocab_pad_config(model)
+    owned = list(getattr(config, _VOCAB_PAD_IDS_KEY, None) or []) if config is not None else []
+    if not owned and end <= start: return
     suppress = list(getattr(generation_config, "suppress_tokens", None) or [])
-    if not suppress and end <= start: return
-    suppress = [i for i in suppress if i not in now_valid]
-    suppress += [i for i in range(start, end) if i not in suppress]
+    released = set(owned).intersection(now_valid)
+    suppress = [i for i in suppress if i not in released]
+    owned = [i for i in owned if i not in released]
+    added = [i for i in range(start, end) if i not in suppress]
+    suppress += added
+    owned += added
     generation_config.suppress_tokens = suppress or None
+    if config is not None:
+        if owned:
+            setattr(config, _VOCAB_PAD_IDS_KEY, owned)
+        elif hasattr(config, _VOCAB_PAD_IDS_KEY):
+            delattr(config, _VOCAB_PAD_IDS_KEY)
+    pass
 pass
 
 
@@ -144,7 +169,9 @@ def add_new_tokens(
     embedding has to grow, round its row count up to that multiple (e.g. 64).
     The tokenizer length is unchanged; the extra rows hold the trained mean,
     are never labels, and are added to generation_config.suppress_tokens so HF
-    generate cannot emit them. config.vocab_size becomes the padded row count.
+    generate cannot emit them. They are also recorded as config.unsloth_vocab_pad_ids,
+    which load_vllm reads to bias them out of vLLM sampling (vLLM ignores
+    suppress_tokens). config.vocab_size becomes the padded row count.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     assert(isinstance(new_tokens, (list, tuple)))

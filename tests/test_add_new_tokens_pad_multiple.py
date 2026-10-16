@@ -130,3 +130,90 @@ def test_second_call_unsuppresses_the_rows_it_turns_into_tokens(monkeypatch):
     new_id = tokenizer.convert_tokens_to_ids("<unsloth_b>")
     assert new_id == n1 and _rows(model) == (padded, padded, padded)
     assert list(model.generation_config.suppress_tokens) == list(range(n1 + 1, padded))
+
+
+def test_padding_off_keeps_suppression_it_does_not_own(monkeypatch):
+    # The model's own suppress_tokens may name a spare row a new token now takes: without
+    # padding, add_new_tokens must leave that list exactly as it was.
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    rows = model.get_input_embeddings().weight.shape[0]
+    model.resize_token_embeddings(rows + 16, mean_resizing = False)
+    model.generation_config.suppress_tokens = [7, rows]
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_new_tok>"])
+    assert tokenizer.convert_tokens_to_ids("<unsloth_new_tok>") == rows
+    assert list(model.generation_config.suppress_tokens) == [7, rows]
+    assert not hasattr(model.config, "unsloth_vocab_pad_ids")
+
+
+def test_padded_call_releases_only_its_own_rows(monkeypatch, tmp_path):
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    n1 = len(tokenizer)
+    padded = model.get_input_embeddings().weight.shape[0]
+    assert model.config.unsloth_vocab_pad_ids == list(range(n1, padded))
+    # The caller suppresses an id of its own: still suppressed after it becomes a token.
+    model.generation_config.suppress_tokens = [7] + list(model.generation_config.suppress_tokens)
+
+    # Ownership survives save / load, so a later call (padding off) still releases the reused row.
+    model.save_pretrained(tmp_path / "m")
+    tokenizer.save_pretrained(tmp_path / "m")
+    model = AutoModelForCausalLM.from_pretrained(tmp_path / "m", torch_dtype = torch.float32)
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path / "m")
+    assert model.config.unsloth_vocab_pad_ids == list(range(n1, padded))
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_b>", "<unsloth_c>"])
+    assert tokenizer.convert_tokens_to_ids("<unsloth_c>") == n1 + 1
+    assert list(model.generation_config.suppress_tokens) == [7] + list(range(n1 + 2, padded))
+    assert model.config.unsloth_vocab_pad_ids == list(range(n1 + 2, padded))
+
+
+def test_vllm_generate_biases_padded_rows(monkeypatch):
+    # vLLM ignores suppress_tokens and samples every config.vocab_size row.
+    import ast
+    import copy
+    import functools
+    import pathlib
+    import types
+
+    import unsloth_zoo
+    path = pathlib.Path(unsloth_zoo.__file__).parent / "vllm_utils.py"
+    wanted = {"_padded_vocab_ids", "suppress_vllm_padded_vocab"}
+    nodes = [n for n in ast.parse(path.read_text(encoding = "utf-8-sig")).body
+             if isinstance(n, ast.FunctionDef) and n.name in wanted]
+    assert {n.name for n in nodes} == wanted
+    ns = {"copy": copy, "functools": functools}
+    exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_helpers", "exec"), ns)
+
+    model, tokenizer = _load()
+    assert ns["_padded_vocab_ids"](model.config) == []
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    ids = ns["_padded_vocab_ids"](model.config)
+    assert ids == list(range(len(tokenizer), model.config.vocab_size))
+
+    class Params:
+        def __init__(self, logit_bias = None):
+            self.logit_bias = logit_bias
+
+    seen = []
+
+    class LLM:
+        def get_default_sampling_params(self):
+            return Params()
+
+        def generate(self, prompts, sampling_params = None, use_tqdm = True):
+            seen.append(sampling_params)
+            return ["out"]
+
+    llm = LLM()
+    ns["suppress_vllm_padded_vocab"](llm, ids)
+    ns["suppress_vllm_padded_vocab"](llm, ids)
+    mine = Params({5: 2.0})
+    assert llm.generate(["a"], mine, use_tqdm = False) == ["out"]
+    llm.generate(["a"])
+    llm.generate(["a", "b"], sampling_params = [Params(), Params({ids[0]: 3.0})])
+    want = {i: -100.0 for i in ids}
+    assert seen[0].logit_bias == {5: 2.0, **want} and mine.logit_bias == {5: 2.0}
+    assert seen[1].logit_bias == want
+    assert [p.logit_bias for p in seen[2]] == [want, want]
+    assert len(seen) == 3
