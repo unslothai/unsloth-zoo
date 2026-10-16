@@ -15,8 +15,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Fused CE under no_grad / inference_mode: same loss, no gradient pass, hidden states untouched."""
-import contextlib
-
 import pytest
 import torch
 
@@ -90,7 +88,8 @@ def test_training_after_eval_matches_reference(bias):
     torch.testing.assert_close(loss, ref)
     torch.testing.assert_close(hidden.grad, h2.grad)
     torch.testing.assert_close(weight.grad, w2.grad)
-    if bias: torch.testing.assert_close(b.grad, b2.grad)
+    if bias:
+        torch.testing.assert_close(b.grad, b2.grad)
 
 
 def test_eval_probe_does_not_settle_compile_support(monkeypatch):
