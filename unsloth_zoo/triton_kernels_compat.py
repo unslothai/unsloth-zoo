@@ -219,13 +219,12 @@ class TritonKernelsBackend:
                 x, weight, bias, a_ragged_metadata = routing_data.expt_data,
                 precision_config = precision_config, **kwargs,
             )
-        # matmul leaves the k-sum to the caller: sum in fp32, as matmul_ogs's own reduction does.
-        precision_config = dataclasses.replace(precision_config or self.mm.PrecisionConfig(), out_dtype = torch.float32)
+        # matmul leaves the k-sum to the caller. As matmul_ogs (split_k = 1): rows in the output dtype, fp32 sum.
         rows = self.mm.matmul(
             x, weight, bias, a_ragged_metadata = routing_data.expt_data, scatter_indx = scatter_indx.dst_indx,
             precision_config = precision_config, **kwargs,
         )
-        return rows.view(-1, k, rows.shape[-1]).sum(1).to(x.dtype)
+        return rows.view(-1, k, rows.shape[-1]).sum(1, dtype = torch.float32).to(rows.dtype)
 
     def gate_up(self, x, weight, bias, routing_data, gather_indx, precision_config, fused_activation = None):
         return self.matmul_ogs(
