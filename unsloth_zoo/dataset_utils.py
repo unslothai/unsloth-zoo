@@ -2820,7 +2820,7 @@ def sft_prepare_dataset(
                         response_part = "<|start|>assistant",
                     )
                 response_labels = _response_labels(
-                    None, tokenizer = tokenizer, return_function = True, **marker_kwargs,
+                    None, tokenizer = processing_class, return_function = True, **marker_kwargs,
                 )
             if assistant_only_loss:
                 used_column_names.append("assistant_masks")
