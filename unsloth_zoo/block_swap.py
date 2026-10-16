@@ -535,6 +535,22 @@ class BlockSwap:
         for dev in self.streams:
             torch.cuda.synchronize(dev)
 
+    @contextmanager
+    def shaped(self):
+        """Evicted weights read as empty tensors, but PEFT wraps MoE expert weights by their shape. While this is
+        open they read as zero-stride placeholders of their real shape, on their own card, holding no memory."""
+        held = []
+        for b in self.blocks:
+            if not b.resident:
+                for p, e, sig in zip(b.params, b.empties, b.sig):
+                    held.append((p, e))
+                    p.data = e.new_zeros(()).expand(sig[0])
+        try:
+            yield
+        finally:
+            for p, e in held:
+                p.data = e
+
     def host_bytes(self):
         return sum(b.nbytes() for b in self.blocks)
 

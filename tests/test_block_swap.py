@@ -334,6 +334,36 @@ def test_state_dict_substitutes_host_copies_for_evicted_blocks():
     sw.remove()
 
 
+def test_shaped_gives_evicted_expert_weights_their_shape_without_memory():
+    # PEFT's ParamWrapper reads an expert weight's shape; an evicted one is an empty tensor.
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA not available")
+        return
+
+    class Experts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Parameter(torch.randn(4, 16, 8), requires_grad = False)
+
+    layers = nn.ModuleList([Experts() for _ in range(3)]).to("cuda")
+    sw = BlockSwap(layers, 3, prefetch_depth = 1)
+    w = layers[0].gate_up_proj
+    assert w.numel() == 0
+    with sw.shaped():
+        assert w.shape == (4, 16, 8) and w.device.type == "cuda"
+        assert w.untyped_storage().nbytes() == w.element_size()
+        try:
+            from peft.tuners.lora.layer import ParamWrapper
+        except ImportError:
+            ParamWrapper = None
+        if ParamWrapper is not None:
+            pw = ParamWrapper(layers[0], "default", parameter_name = "gate_up_proj", r = 2, lora_alpha = 2)
+            assert pw.num_experts == 4
+    assert w.numel() == 0
+    sw.remove()
+    assert w.shape == (4, 16, 8)
+
+
 def test_state_dict_follows_weights_renamed_after_install():
     # from_pretrained(offload_layers = N) installs before PEFT wraps each Linear in a base_layer.
     if not torch.cuda.is_available():
