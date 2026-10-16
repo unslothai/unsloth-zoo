@@ -386,11 +386,11 @@ def _mlx_lora_type_specs(*, include_convolutions=False):
                 vlm_lora_module.LoRASwitchLinear,
             )
         )
-    from .utils import LoRAHadamardLinear, _hadamard_pack_module
-    pack = _hadamard_pack_module()
-    if pack is not None:
+    from .utils import LoRAHadamardLinear, _hadamard_pack_modules
+    packs = _hadamard_pack_modules()
+    if packs:
         specs.append(_MLXLoRATypeSpec(
-            (pack.HadamardQuantizedLinear,), LoRAHadamardLinear,
+            tuple(pack.HadamardQuantizedLinear for pack in packs), LoRAHadamardLinear,
         ))
     if include_convolutions:
         from .utils import LoRAPointwiseConv2d
