@@ -201,10 +201,19 @@ def test_fused_ce_budget_reads_the_head_device_per_device():
 
 # Z3: per-device AMD arch / aiter caches -----------------------------------------------
 
+_AMD_CACHED = ("_detect_gfx_arch", "get_amd_attention_implementation", "get_amd_flash_attn_func")
+
+
 def _clear_amd_caches():
-    for fn in (device_type._detect_gfx_arch, device_type.get_amd_attention_implementation,
-               device_type.get_amd_flash_attn_func):
-        fn.cache_clear()
+    for name in _AMD_CACHED:
+        getattr(device_type, name).cache_clear()
+
+
+def _multi_device_caches(monkeypatch):
+    # Import on a host without two HIP devices keeps the plain cache; rebuild the per-device one.
+    for name in _AMD_CACHED:
+        fn = inspect.unwrap(getattr(device_type, name))
+        monkeypatch.setattr(device_type, name, device_type._per_device_cache(fn, multi_device = True))
 
 
 @pytest.fixture
@@ -224,6 +233,7 @@ def amd_host(monkeypatch):
     aiter.__spec__ = importlib.machinery.ModuleSpec("aiter", None)
     aiter.flash_attn_func = lambda *a, **k: None
     monkeypatch.setitem(sys.modules, "aiter", aiter)
+    _multi_device_caches(monkeypatch)
     _clear_amd_caches()
     yield aiter
     _clear_amd_caches()
@@ -245,6 +255,41 @@ def test_aiter_choice_follows_set_device(amd_host):
     assert device_type.get_amd_flash_attn_func() is None
 
 
+def test_plain_cache_by_default():
+    calls = []
+
+    def probe(device = None):
+        calls.append(device)
+        return "gfx1151"
+
+    cached = device_type._per_device_cache(probe)
+    assert hasattr(cached, "cache_info") and inspect.unwrap(cached) is probe
+    assert cached() == cached() == "gfx1151"
+    assert calls == [None]
+
+
+@pytest.mark.parametrize("dtype,count,multi", [("hip", 2, True), ("hip", 1, False), ("cuda", 2, False), ("cpu", 0, False)])
+def test_per_device_caches_only_with_two_hip_devices(monkeypatch, dtype, count, multi):
+    for name in _AMD_CACHED:
+        monkeypatch.setattr(device_type, name, getattr(device_type, name))  # restored after the test
+    monkeypatch.setattr(torch.cuda, "device_count", mock.Mock(side_effect = AssertionError("no probe")))
+    monkeypatch.setattr(device_type, "AMD_PER_DEVICE_CACHES", False)
+    assert device_type._use_per_device_caches(dtype, count) is multi
+    assert device_type.AMD_PER_DEVICE_CACHES is multi
+    for name in _AMD_CACHED:
+        assert hasattr(getattr(device_type, name), "cache_info")
+        assert (getattr(device_type, name).__class__.__name__ == "function") is multi
+
+
+def test_plain_cache_resolves_a_device_argument(monkeypatch):
+    monkeypatch.setattr(device_type, "is_hip", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda i: types.SimpleNamespace(gcnArchName = ["gfx1151"][i]))
+    fn = device_type._per_device_cache(inspect.unwrap(device_type._detect_gfx_arch), multi_device = False)
+    assert fn(torch.device("cuda", 0)) == fn("cuda:0") == fn(0) == "gfx1151"
+
+
 def test_amd_caches_take_an_explicit_device(amd_host):
     assert device_type._detect_gfx_arch(1) == "gfx1100"
     assert device_type.get_amd_attention_implementation("cuda:1") == "sdpa"
@@ -262,19 +307,22 @@ def test_amd_caches_fall_back_when_current_device_raises(amd_host, monkeypatch):
     assert device_type.get_amd_attention_implementation() in ("sdpa", "amd_aiter")
 
 
-def test_registered_aiter_attention_asks_for_the_query_device(monkeypatch):
+@pytest.mark.parametrize("per_device", [True, False])
+def test_registered_aiter_attention_asks_for_the_query_device(monkeypatch, per_device):
     from unsloth_zoo.temporary_patches import amd_aiter
     import transformers.integrations.sdpa_attention as sdpa
     seen = []
-    def getter(device = None):
-        seen.append(device)
+    def getter(*args):
+        seen.append(args)
         return None
     monkeypatch.setattr(device_type, "get_amd_flash_attn_func", getter)
+    monkeypatch.setattr(device_type, "AMD_PER_DEVICE_CACHES", per_device)
     monkeypatch.setattr(device_type, "is_hip", lambda: True)
     monkeypatch.setattr(sdpa, "sdpa_attention_forward", lambda *a, **k: "sdpa")
     query = types.SimpleNamespace(is_cuda = True, device = torch.device("cuda", 1))
     assert amd_aiter.aiter_attention_forward(None, query, None, None, None) == "sdpa"
-    assert seen == [torch.device("cuda", 1)]
+    # One HIP device: the no-argument call, the cache entry the setup gate already filled.
+    assert seen == ([(torch.device("cuda", 1),)] if per_device else [()])
 
 
 def test_compiled_aiter_rewrite_asks_for_the_query_device(monkeypatch):
@@ -287,7 +335,9 @@ def test_compiled_aiter_rewrite_asks_for_the_query_device(monkeypatch):
     )
     rewritten = compiler.replace_sdpa_with_amd_aiter(source)
     assert compiler._AITER_MARKER in rewritten
-    assert re.search(r"_get_aiter_fn\w*\(\w+\.device\)", rewritten), rewritten
+    assert re.search(r"get_amd_flash_attn_func\(\w+\.device\)", rewritten), rewritten
+    assert re.search(r"AMD_PER_DEVICE_CACHES else \w+\.get_amd_flash_attn_func\(\)", rewritten), rewritten
+    compile(rewritten, "<rewritten>", "exec")
 
 
 # Z2: rocminfo fallback honours HIP masks ----------------------------------------------
@@ -477,3 +527,17 @@ def test_cmake_targets_skip_an_unreadable_card(monkeypatch):
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     flags = llama_cpp._gpu_cmake_flags("ON")
     assert "-DGPU_TARGETS=gfx1100;gfx1201" in flags
+
+
+def test_compiled_aiter_rewrite_avoids_a_local_named_like_its_module_alias(monkeypatch):
+    from unsloth_zoo import compiler
+    monkeypatch.setattr(device_type, "get_amd_attention_implementation", lambda device = None: "amd_aiter")
+    source = (
+        "def forward(self, q, k, v):\n"
+        "    _aiter_device_type = 1\n"
+        "    out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)\n"
+        "    return out + _aiter_device_type\n"
+    )
+    rewritten = compiler.replace_sdpa_with_amd_aiter(source)
+    assert "import unsloth_zoo.device_type as _aiter_device_type\n" not in rewritten, rewritten
+    assert re.search(r"import unsloth_zoo\.device_type as _aiter_device_type_\d+", rewritten), rewritten

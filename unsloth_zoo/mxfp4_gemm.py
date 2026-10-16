@@ -487,7 +487,7 @@ def _asm_ok(device, eager = False):
 
 def _cvt_ok(index, eager = False):
     """Needs PTX 9.2 ptxas and sm_100f / sm_120f; checked bit for bit vs the fma decode once. sm_100 is untimed,
-    so auto only enables sm_120. None = cannot probe here (inside a trace)."""
+    so auto only enables sm_120. None = cannot probe here (inside a trace or a CUDA graph capture)."""
     import os
     mode = os.environ.get("UNSLOTH_MXFP4_CVT", "auto").strip().lower()
     major = torch.cuda.get_device_capability(index)[0]
@@ -502,6 +502,12 @@ def _cvt_ok(index, eager = False):
                 return None
         except Exception:
             pass
+    try:
+        # The probe syncs (torch.equal); inside a CUDA graph capture that would invalidate it.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+    except Exception:
+        return None
     try:
         device = torch.device("cuda", index)
         rows = torch.arange(65536, device = device)

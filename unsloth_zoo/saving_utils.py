@@ -4078,35 +4078,90 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     )
 
 
-_STALE_SHARD_SUFFIX = ".unsloth-previous-export"
+def _previous_export_shards(filenames, save_directory, source_directory = None):
+    """Output shards an earlier export left behind, which the fetch must replace, not reuse.
 
-def _set_aside_stale_output_shards(file_paths, save_directory):
-    # Renamed, not unlinked, so a failed fetch can put the earlier export back. Moves a
-    # link itself, never its target; a symlinked parent is left alone.
-    set_aside = {}
-    for file_path in file_paths:
-        if os.path.lexists(file_path) and not os.path.isdir(file_path) and \
-                _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory):
-            os.replace(file_path, file_path + _STALE_SHARD_SUFFIX)
-            set_aside[file_path] = file_path + _STALE_SHARD_SUFFIX
-    return set_aside
+    The in-place export is skipped (its output shard IS the source), and so is a shard under a
+    symlinked parent, which the containment check refuses later anyway.
+    """
+    stale = []
+    for filename in filenames:
+        output_path = os.path.join(save_directory, filename)
+        if not os.path.lexists(output_path) or os.path.isdir(output_path):
+            continue
+        if not _resolves_inside(os.path.dirname(output_path) or os.curdir, save_directory):
+            continue
+        if source_directory is not None:
+            source_path = os.path.join(source_directory, filename)
+            if not os.path.exists(source_path) or (
+                os.path.exists(output_path) and os.path.samefile(output_path, source_path)
+            ):
+                continue
+        stale.append(filename)
+    return stale
 pass
 
 
-def _restore_stale_output_shards(set_aside):
-    for file_path, backup_path in set_aside.items():
-        if os.path.lexists(backup_path):
-            if os.path.lexists(file_path) and not os.path.isdir(file_path):
-                os.remove(file_path)
-            os.replace(backup_path, file_path)
-    set_aside.clear()
+_REFRESH_DISK_MARGIN = 64 * 1024 * 1024
+
+def _check_disk_for_previous_export_refresh(save_directory, new_sizes):
+    """Refuse a re-export the disk cannot finish before any previous shard is replaced.
+
+    prepare_saving compares free space with the in-memory save size, which a 4bit model with a
+    narrow adapter puts below the largest base shard. The refresh stages one shard at a time (a
+    split shard likewise writes its parts before removing it), so it needs the growth of the
+    whole set plus the largest shard.
+    """
+    if not new_sizes:
+        return
+    try:
+        growth = 0
+        for filename, new_size in new_sizes.items():
+            output_path = os.path.join(save_directory, filename)
+            old_size = os.lstat(output_path).st_size if os.path.lexists(output_path) else 0
+            growth += new_size - old_size
+        needed = max(growth, 0) + max(new_sizes.values()) + _REFRESH_DISK_MARGIN
+        free = shutil.disk_usage(save_directory).free
+    except OSError:
+        return
+    if free < needed:
+        raise RuntimeError(
+            f"Unsloth: Not enough disk space to replace the previous export in {save_directory}: "
+            f"{needed / 1024**3:.2f} GB is needed and {free / 1024**3:.2f} GB is free. "
+            "Nothing was changed. Free up disk space or remove the previous export, then re-run."
+        )
 pass
 
 
-def _discard_stale_output_shard(set_aside, file_path):
-    backup_path = set_aside.pop(file_path, None)
-    if backup_path is not None and os.path.lexists(backup_path):
-        os.remove(backup_path)
+def _resolve_hub_commit(repo_id, token):
+    # One commit for every file an export fetches, so a push to the repo mid-export cannot mix
+    # shards from two commits. Offline or unreachable gives None: unpinned, as before.
+    try:
+        from huggingface_hub import HfApi
+        return HfApi(token = token).model_info(repo_id).sha
+    except Exception:
+        return None
+pass
+
+
+def _download_shard_over_previous_export(repo_id, filename, save_directory, cache_dir, token, revision = None):
+    # Downloaded into a private folder beside the output, then renamed over the previous shard,
+    # so a failed download leaves that shard as it was and no second copy is ever kept.
+    file_path = os.path.join(save_directory, filename)
+    staging_dir = tempfile.mkdtemp(dir = save_directory, prefix = ".unsloth-fetch-")
+    try:
+        hf_hub_download(
+            repo_id = repo_id,
+            filename = filename,
+            repo_type = "model",
+            local_dir = staging_dir,
+            cache_dir = cache_dir,
+            token = token,
+            revision = revision,
+        )
+        os.replace(os.path.join(staging_dir, filename), file_path)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors = True)
 pass
 
 
@@ -4800,6 +4855,8 @@ def merge_and_overwrite_lora(
     inner_model = model.base_model.model if isinstance(model, PeftModel) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
     safetensors_list = []
+    _hub_revision = None
+    _hub_shard_sizes = {}
     max_size_in_bytes = 0
     total_size_in_bytes = 0
     config = model.config
@@ -4943,8 +5000,11 @@ def merge_and_overwrite_lora(
             # Third Hub round trip on this path, and it had the same bare `except:` as
             # the other two: an unreachable Hub was reported as "Could not determine
             # original model ID", a claim about the name rather than the network.
+            # The listing is pinned to the same commit as every fetch below, so the shard names
+            # and sizes cannot describe an older commit than the files downloaded.
             try:
-                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+                _hub_revision = _resolve_hub_commit(model_name, token)
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True, revision = _hub_revision)
             except _HUB_ABSENT_ERRORS:
                 # Genuinely absent, which is what the original-model-id fallback is for.
                 original_model_id = get_original_model_id(model_name)
@@ -4954,7 +5014,8 @@ def merge_and_overwrite_lora(
                 # Assigned after the check so the message above names the failing input
                 # instead of always saying "from None".
                 model_name = original_model_id
-                file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+                _hub_revision = _resolve_hub_commit(model_name, token)
+                file_list = HfFileSystem(token = token).ls(model_name, detail = True, revision = _hub_revision)
             except Exception as e:
                 raise _hub_unreachable_error(
                     model_name, e,
@@ -4973,6 +5034,7 @@ def merge_and_overwrite_lora(
                 if _hf_has_proper and fname == "consolidated.safetensors":
                     continue
                 safetensors_list.append(fname)
+                _hub_shard_sizes[fname] = x["size"]
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
 
@@ -4986,6 +5048,7 @@ def merge_and_overwrite_lora(
                     repo_id  = model_name,
                     filename = "model.safetensors.index.json",
                     token    = token,
+                    revision = _hub_revision,
                 )
                 with open(_idx_path, "r", encoding = "utf-8") as f:
                     _weight_map = json.load(f).get("weight_map", {})
@@ -5296,6 +5359,7 @@ def merge_and_overwrite_lora(
                     local_dir_use_symlinks = False,
                     cache_dir = _hf_cache_dir,
                     token = token,
+                    revision = _hub_revision,
                 )
 
         if push_to_hub and safe_tensor_index_files:
@@ -5305,57 +5369,64 @@ def merge_and_overwrite_lora(
 
     # An earlier export's shard is already merged and the fetches below can keep it
     # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
-    # Local sources overwrite the output too; set those aside so a failed copy can roll back,
-    # except the in-place export, whose output shard IS the source.
-    _stale_candidates = []
-    for filename in safetensors_list:
-        _output_path = os.path.join(save_directory, filename)
+    # Each one is replaced in turn by a staged copy renamed over it, so no second copy of the
+    # checkpoint is kept, and a disk that cannot finish the refresh is refused before it starts.
+    _stale_shards = set(_previous_export_shards(
+        safetensors_list, save_directory, model_name if is_local_path else None,
+    ))
+    if _stale_shards:
         if is_local_path:
-            _source_path = os.path.join(model_name, filename)
-            if not os.path.exists(_source_path) or (
-                os.path.exists(_output_path) and os.path.samefile(_output_path, _source_path)
-            ):
-                continue
-        _stale_candidates.append(_output_path)
-    _stale_shards = _set_aside_stale_output_shards(_stale_candidates, save_directory)
-    # Backups stay until every shard is fetched so a later failure restores all of them. Low disk
-    # mode drops each one as its replacement lands only when the disk cannot hold both copies.
-    _discard_per_shard = False
-    if low_disk_space_usage and _stale_shards:
-        try:
-            _backup_bytes = sum(os.path.getsize(_b) for _b in _stale_shards.values() if os.path.exists(_b))
-            _discard_per_shard = shutil.disk_usage(save_directory).free < _backup_bytes + (1 << 30)
-        except OSError:
-            _discard_per_shard = True
+            _new_sizes = {
+                f : os.path.getsize(os.path.join(model_name, f)) for f in safetensors_list
+                if os.path.exists(os.path.join(model_name, f)) and (
+                    f in _stale_shards or not os.path.lexists(os.path.join(save_directory, f))
+                )
+            }
+        else:
+            _new_sizes = {
+                f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
+            }
+        _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
+    pass
 
-    _discarded_shards = []
+    _replaced_shards = []
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
         if not is_local_path and _hf_cache_dir is not None:
-            copied_all_from_cache = _try_copy_all_from_cache(
-                repo_id = model_name,
-                filenames_to_check = safetensors_list,
-                target_dir_str = save_directory,
-                hf_cache_dir = _hf_cache_dir,
-                token = token,
-            )
+            # A copy that fails part way has still replaced the shards before it.
+            _copied_from_cache = []
+            try:
+                copied_all_from_cache = _try_copy_all_from_cache(
+                    repo_id = model_name,
+                    filenames_to_check = safetensors_list,
+                    target_dir_str = save_directory,
+                    hf_cache_dir = _hf_cache_dir,
+                    token = token,
+                    revision = _hub_revision,
+                    copied = _copied_from_cache,
+                )
+            finally:
+                _replaced_shards.extend(f for f in _copied_from_cache if f in _stale_shards)
             copied_tokenizer_model_from_cache = _try_copy_all_from_cache(
                 repo_id=model_name,
                 filenames_to_check=["tokenizer.model"],
                 target_dir_str=save_directory,
                 hf_cache_dir=_hf_cache_dir,
                 token=token,
+                revision = _hub_revision,
             )
 
         if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
             print(f"Downloading safetensors for {model_name}...")
+            # Previous export shards are fetched one by one in the loop below.
             snapshot_download(
                 repo_id = model_name,
                 local_dir = save_directory,
-                allow_patterns = safe_tensor_index_files + safetensors_list,
+                allow_patterns = safe_tensor_index_files + [f for f in safetensors_list if f not in _stale_shards],
                 local_dir_use_symlinks = False,
                 cache_dir = _hf_cache_dir,
                 token = token,
+                revision = _hub_revision,
             )
 
         if not copied_tokenizer_model_from_cache and not low_disk_space_usage and not is_local_path:
@@ -5367,6 +5438,7 @@ def merge_and_overwrite_lora(
                 local_dir_use_symlinks = False,
                 cache_dir = _hf_cache_dir,
                 token = token,
+                revision = _hub_revision,
             )
 
         final_safetensors_list = []
@@ -5395,6 +5467,13 @@ def merge_and_overwrite_lora(
                 os.makedirs(os.path.dirname(file_path), exist_ok = True)
                 _copy_file_from_source(local_file_path, os.path.dirname(file_path), os.path.basename(file_path))
                 print(f"Copied {filename} from local model directory")
+                if filename in _stale_shards: _replaced_shards.append(filename)
+
+            elif not copied_all_from_cache and not is_local_path and filename in _stale_shards:
+                _download_shard_over_previous_export(
+                    model_name, filename, save_directory, _hf_cache_dir, token, revision = _hub_revision,
+                )
+                _replaced_shards.append(filename)
 
             elif not copied_all_from_cache and low_disk_space_usage and not os.path.exists(file_path) and not is_local_path:
                 hf_hub_download(
@@ -5404,12 +5483,9 @@ def merge_and_overwrite_lora(
                     local_dir = save_directory,
                     cache_dir = _hf_cache_dir,
                     token = token,
+                    revision = _hub_revision,
                 )
             pass
-
-            if _discard_per_shard and os.path.exists(file_path):
-                _discard_stale_output_shard(_stale_shards, file_path)
-                _discarded_shards.append(filename)
 
             if needs_splitting:
                 resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)
@@ -5420,15 +5496,12 @@ def merge_and_overwrite_lora(
             final_safetensors_list.extend(resulting_files)
         pass
     except BaseException:
-        _restore_stale_output_shards(_stale_shards)
-        if _discarded_shards:
+        if _replaced_shards:
             print(
-                f"Unsloth: Warning: the export in {save_directory} is incomplete. Low disk mode already "
-                f"replaced {', '.join(_discarded_shards)} with the base weights. Re-run the export."
+                f"Unsloth: Warning: the export in {save_directory} is incomplete. These shards "
+                f"already hold the base weights: {', '.join(dict.fromkeys(_replaced_shards))}. Re-run the export."
             )
         raise
-    for _stale_path in list(_stale_shards):
-        _discard_stale_output_shard(_stale_shards, _stale_path)
 
     if low_disk_space_usage and not is_local_path and not copied_all_from_cache:
         tokenizer_model_path = os.path.join(save_directory, "tokenizer.model")
@@ -5441,6 +5514,7 @@ def merge_and_overwrite_lora(
                     local_dir = save_directory,
                     cache_dir = _hf_cache_dir,
                     token = token,
+                    revision = _hub_revision,
                 )
                 print("Downloaded tokenizer.model")
             except Exception as e:
@@ -5771,9 +5845,11 @@ def _try_copy_all_from_cache(
     target_dir_str: str, # Expect string path for target directory
     hf_cache_dir: Optional[Path],
     token: Optional[str],
+    revision: Optional[str] = None,
+    copied: Optional[list] = None,
 ) -> bool:
     """If ALL files exist in the HF cache, copy them into target_dir_str.
-    Returns True on success, False otherwise.
+    Returns True on success, False otherwise. Names copied so far are appended to `copied`.
     """
     from huggingface_hub.errors import LocalEntryNotFoundError
 
@@ -5795,6 +5871,7 @@ def _try_copy_all_from_cache(
                 repo_type = "model",
                 cache_dir = hf_cache_dir,
                 token = token,
+                revision = revision,
             )
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
@@ -5824,6 +5901,7 @@ def _try_copy_all_from_cache(
         try:
             # Pass string target_dir_str to copy helper
             _copy_file_from_source(cached_path, target_dir_str, filename)
+            if copied is not None: copied.append(filename)
         except (IOError, PermissionError, FileNotFoundError) as copy_err:
              print(f"Cache copy failed: Error copying {filename} from {cached_path} to {target_dir_str}: {copy_err}")
              all_copied = False; break

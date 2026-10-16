@@ -172,3 +172,29 @@ def test_oom_log_reports_the_cap_not_disabled(monkeypatch, capsys):
     model = _Model(RuntimeError("kernel rejected the packed layout"))
     _run(model, LONG, UNSLOTH_ENABLE_LOGGING = True)
     assert "disabled (fell back to padded)" in capsys.readouterr().out
+
+
+def test_capped_batch_skips_packing_prep(monkeypatch):
+    # A batch at or above the OOM cap decides from the host lengths alone: no flatten of the
+    # ids and no active-row read (both cost a GPU sync and keep buffers alive).
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    model = _Model(torch.cuda.OutOfMemoryError("CUDA out of memory"))
+    ns = _run(model, LONG)
+    assert model._unsloth_seq_packing_grad_unsafe_T == ns["_pack_T"]
+    ns = _run(model, LONG)
+    assert ns["_pack_use"] is False
+    assert ns["_pack_T"] == int((LONG != PAD_ID).sum())
+    assert "_pack_flat_ids" not in ns
+    assert "_pack_active" not in ns
+    # below the cap the prep runs as before
+    ns = _run(model, SHORT)
+    assert ns["_pack_flat_ids"].shape[1] == ns["_pack_T"]
+    assert "_pack_active" in ns
+
+
+def test_padded_fallback_drops_packing_index_buffers():
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    start = src.index("# packing rejected/unused")
+    branch = src[start:src.index("def to_device", start)]
+    for name in ("_pack_keep", "_pack_lengths", "_pack_flat_ids", "_pack_nz_idx", "_pack_ctgt"):
+        assert f"{name} = " in branch or f"{name} =" in branch, name

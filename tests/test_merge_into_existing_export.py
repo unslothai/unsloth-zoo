@@ -78,10 +78,8 @@ def test_in_place_export_still_merges_once(tmp_path):
     assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
 
 
-def test_set_aside_moves_links_not_targets_and_restores(tmp_path):
-    from unsloth_zoo.saving_utils import (
-        _set_aside_stale_output_shards, _restore_stale_output_shards, _discard_stale_output_shard,
-    )
+def test_previous_export_shards_skips_in_place_and_linked_parents(tmp_path):
+    from unsloth_zoo.saving_utils import _previous_export_shards
 
     out = tmp_path / "out"
     out.mkdir()
@@ -93,27 +91,13 @@ def test_set_aside_moves_links_not_targets_and_restores(tmp_path):
     linked.mkdir()
     (out / "weights").symlink_to(linked, target_is_directory = True)
     (linked / "model.safetensors").write_bytes(b"keep")
-    paths = [str(out / n) for n in ("model.safetensors", "model-00001-of-00002.safetensors",
-                                    os.path.join("weights", "model.safetensors"))]
+    names = ["model.safetensors", "model-00001-of-00002.safetensors",
+             os.path.join("weights", "model.safetensors"), "missing.safetensors"]
 
-    aside = _set_aside_stale_output_shards(paths, str(out))
-    assert not os.path.lexists(out / "model.safetensors")
-    assert not os.path.exists(out / "model-00001-of-00002.safetensors")
-    assert target.read_bytes() == b"keep"
-    assert (linked / "model.safetensors").read_bytes() == b"keep"
-    assert paths[2] not in aside
-
-    (out / "model-00001-of-00002.safetensors").write_bytes(b"partial")
-    _restore_stale_output_shards(aside)
-    assert os.path.islink(out / "model.safetensors")
-    assert (out / "model-00001-of-00002.safetensors").read_bytes() == b"stale"
-    assert sorted(os.listdir(out)) == ["model-00001-of-00002.safetensors", "model.safetensors", "weights"]
-
-    aside = _set_aside_stale_output_shards(paths[1:2], str(out))
-    (out / "model-00001-of-00002.safetensors").write_bytes(b"base")
-    _discard_stale_output_shard(aside, paths[1])
-    assert (out / "model-00001-of-00002.safetensors").read_bytes() == b"base"
-    assert aside == {} and sorted(os.listdir(out)) == ["model-00001-of-00002.safetensors", "model.safetensors", "weights"]
+    assert _previous_export_shards(names, str(out)) == names[:2]
+    # In place: the output shard is the source itself.
+    assert _previous_export_shards(names[1:2], str(out), str(out)) == []
+    assert target.read_bytes() == b"keep" and (linked / "model.safetensors").read_bytes() == b"keep"
 
 
 def _fake_hub(monkeypatch, base, fail):
@@ -121,14 +105,18 @@ def _fake_hub(monkeypatch, base, fail):
     from unsloth_zoo import saving_utils as S
 
     shards = sorted(f for f in os.listdir(base) if f.endswith(".safetensors"))
+    revisions = []
+    _fake_hub.revisions = revisions
 
     class _FS:
         def __init__(self, *a, **k):
             pass
-        def ls(self, name, detail = True):
+        def ls(self, name, detail = True, **k):
+            revisions.append(k.get("revision"))
             return [{"name": f"{name}/{f}", "size": os.path.getsize(os.path.join(base, f))} for f in shards]
 
     fetched = []
+    _fake_hub.fetched = fetched
 
     def _fetch(local_dir, names):
         # fail: True fails the first shard fetch, an int N fails once N shards landed.
@@ -141,10 +129,12 @@ def _fake_hub(monkeypatch, base, fail):
                 shutil.copyfile(os.path.join(base, f), os.path.join(local_dir, f))
 
     def _snapshot(repo_id, local_dir = None, allow_patterns = (), **k):
+        revisions.append(k.get("revision"))
         _fetch(local_dir, list(allow_patterns))
         return local_dir
 
     def _hf_hub(repo_id, filename, local_dir = None, **k):
+        revisions.append(k.get("revision"))
         if local_dir is None:
             raise OSError("not cached")
         _fetch(local_dir, [filename])
@@ -157,52 +147,303 @@ def _fake_hub(monkeypatch, base, fail):
     monkeypatch.setattr(S, "_try_copy_all_from_cache", lambda *a, **k: False)
 
 
-@pytest.mark.parametrize("fail", [True, 1], ids = ["first_shard", "later_shard"])
+def _shards(directory):
+    return sorted(f for f in os.listdir(directory) if f.endswith(".safetensors"))
+
+
+def _no_staging_left(directory):
+    return not [f for f in os.listdir(directory) if f.startswith(".unsloth-")]
+
+
 @pytest.mark.parametrize("low_disk", [False, True])
-def test_failed_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low_disk, fail):
+def test_failed_first_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low_disk):
     base, peft_model = _build(tmp_path, "20KB")
     out = str(tmp_path / "out")
     _fake_hub(monkeypatch, base, fail = False)
     H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
     expected = H.read_safetensors_dir(out)
-    assert len([f for f in os.listdir(out) if f.endswith(".safetensors")]) > 1
+    assert len(_shards(out)) > 1
 
-    _fake_hub(monkeypatch, base, fail = fail)
+    _fake_hub(monkeypatch, base, fail = True)
     with pytest.raises(OSError, match = "simulated"):
         H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
     got = H.read_safetensors_dir(out)
     assert sorted(got) == sorted(expected)
     assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
-    assert not [f for f in os.listdir(out) if f.endswith(".unsloth-previous-export")]
+    assert _no_staging_left(out)
 
-    # A later successful export still merges onto the base, not onto the restored shards.
+    # A later successful export still merges onto the base, not onto the kept shards.
     _fake_hub(monkeypatch, base, fail = False)
     H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
     again = H.read_safetensors_dir(out)
     assert [k for k in expected if not torch.equal(again[k], expected[k])] == []
 
 
-def test_failed_local_copy_keeps_previous_export(tmp_path, monkeypatch):
+@pytest.mark.parametrize("low_disk", [False, True])
+def test_failed_later_hub_fetch_keeps_unfetched_shards(tmp_path, monkeypatch, low_disk):
+    # Shards are replaced one at a time (no second copy of the checkpoint), so a network
+    # failure part way only loses the shards already refreshed, and says so.
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
+
+    _fake_hub(monkeypatch, base, fail = 1)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    replaced = _fake_hub.fetched
+    assert len(replaced) == 1 and _shards(out) == sorted(before)
+    for f in before:
+        now = open(os.path.join(out, f), "rb").read()
+        assert now == (open(os.path.join(base, f), "rb").read() if f in replaced else before[f]), f
+    assert _no_staging_left(out)
+
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+
+
+def _dir_bytes(directory):
+    total = 0
+    for root, _, files in os.walk(directory):
+        for f in files:
+            total += os.lstat(os.path.join(root, f)).st_size
+    return total
+
+
+@pytest.mark.parametrize("source", ["local", "hub", "hub_low_disk"])
+def test_reexport_keeps_no_second_copy_of_the_checkpoint(tmp_path, monkeypatch, source):
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    low_disk = source == "hub_low_disk"
+    if source != "local":
+        _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    expected = H.read_safetensors_dir(out)
+    size_before = _dir_bytes(out)
+    largest = max(os.path.getsize(os.path.join(base, f)) for f in _shards(base))
+
+    peak = [0]
+    if source == "local":
+        real_copy = S._copy_file_from_source
+        def _copy(src, target_dir, filename):
+            real_copy(src, target_dir, filename)
+            peak[0] = max(peak[0], _dir_bytes(out))
+        monkeypatch.setattr(S, "_copy_file_from_source", _copy)
+    else:
+        real_hf = S.hf_hub_download
+        def _hf(*a, **k):
+            path = real_hf(*a, **k)
+            peak[0] = max(peak[0], _dir_bytes(out))
+            return path
+        monkeypatch.setattr(S, "hf_hub_download", _hf)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    assert peak[0] > 0
+    assert peak[0] <= size_before + largest, (peak[0], size_before, largest)
+    got = H.read_safetensors_dir(out)
+    assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
+    assert _no_staging_left(out)
+
+
+@pytest.mark.parametrize("source", ["local", "hub_low_disk"])
+def test_reexport_refused_before_touching_when_disk_is_short(tmp_path, monkeypatch, source):
+    # Per-shard refresh needs at most one shard more than the export, which prepare_saving's
+    # free space check already covers, so a short disk is refused before any shard changes.
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    low_disk = source == "hub_low_disk"
+    if source != "local":
+        _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
+
+    disk = S.shutil.disk_usage(out)
+    monkeypatch.setattr(S.shutil, "disk_usage", lambda _: type(disk)(disk.total, disk.total - 4096, 4096))
+    if source != "local":
+        _fake_hub(monkeypatch, base, fail = False)
+    with pytest.raises(RuntimeError, match = "no disk space"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    assert _fake_hub.fetched == [] if source != "local" else True
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+    assert _no_staging_left(out)
+
+
+def test_reexport_with_longest_valid_shard_name(tmp_path):
+    import json
+    from pathlib import Path
+
+    base, peft_model = _build(tmp_path, "20KB")
+    index = json.loads((Path(base) / "model.safetensors.index.json").read_text())
+    old_name = sorted(set(index["weight_map"].values()))[-1]
+    long_name = "x" * (240 - len(".safetensors")) + ".safetensors"
+    (Path(base) / old_name).rename(Path(base) / long_name)
+    index["weight_map"] = {k : long_name if v == old_name else v for k, v in index["weight_map"].items()}
+    (Path(base) / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    fresh = str(tmp_path / "fresh")
+    H.run_merge(peft_model, base, fresh, save_dtype = torch.float32)
+    expected = H.read_safetensors_dir(fresh)
+    out = str(tmp_path / "out")
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    got = H.read_safetensors_dir(out)
+    assert sorted(got) == sorted(expected)
+    assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
+    assert long_name in _shards(out) and _no_staging_left(out)
+
+
+def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch):
     from unsloth_zoo import saving_utils as S
 
     base, peft_model = _build(tmp_path, "20KB")
     out = str(tmp_path / "out")
     H.run_merge(peft_model, base, out, save_dtype = torch.float32)
-    expected = H.read_safetensors_dir(out)
-    assert len([f for f in os.listdir(out) if f.endswith(".safetensors")]) > 2
+    before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
+    assert len(before) > 2
 
     real_copy, copied = S._copy_file_from_source, []
     def _copy_then_fail(src, target_dir, filename):
         if str(src).endswith(".safetensors"):
             if len(copied) >= 1:
-                raise OSError("simulated ENOSPC")
+                raise OSError("simulated I/O error")
             copied.append(filename)
         return real_copy(src, target_dir, filename)
     monkeypatch.setattr(S, "_copy_file_from_source", _copy_then_fail)
     with pytest.raises(OSError, match = "simulated"):
         H.run_merge(peft_model, base, out, save_dtype = torch.float32)
-    assert copied
-    got = H.read_safetensors_dir(out)
-    assert sorted(got) == sorted(expected)
-    assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
-    assert not [f for f in os.listdir(out) if f.endswith(".unsloth-previous-export")]
+    assert len(copied) == 1 and _shards(out) == sorted(before)
+    for f in before:
+        now = open(os.path.join(out, f), "rb").read()
+        assert now == (open(os.path.join(base, f), "rb").read() if f in copied else before[f]), f
+    assert _no_staging_left(out)
+
+
+class _ModelInfo:
+    sha = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.mark.parametrize("low_disk", [False, True])
+def test_hub_fetches_pin_one_commit(tmp_path, monkeypatch, low_disk):
+    # Per-shard downloads must not mix commits if the repo is pushed to mid-export.
+    import huggingface_hub
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    monkeypatch.setattr(huggingface_hub.HfApi, "model_info", lambda self, repo_id, **k: _ModelInfo())
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
+    assert _fake_hub.revisions and set(_fake_hub.revisions) == {_ModelInfo.sha}
+
+
+def test_hub_fetches_unpinned_when_commit_unknown(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    def _offline(self, repo_id, **k):
+        raise OSError("offline")
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    monkeypatch.setattr(huggingface_hub.HfApi, "model_info", _offline)
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = True)
+    assert _fake_hub.revisions and set(_fake_hub.revisions) == {None}
+
+
+def test_partial_cache_copy_is_reported_when_a_later_fetch_fails(tmp_path, monkeypatch, capsys):
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = True)
+    first = _shards(out)[0]
+
+    def _partial_cache_copy(repo_id, filenames_to_check, target_dir_str, hf_cache_dir, token, **k):
+        # One shard copies from the cache, then the copy gives up.
+        if first not in filenames_to_check:
+            return False
+        S._copy_file_from_source(os.path.join(base, first), target_dir_str, first)
+        if k.get("copied") is not None:
+            k["copied"].append(first)
+        return False
+    _fake_hub(monkeypatch, base, fail = True)
+    monkeypatch.setattr(S, "_get_hf_cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(S, "_try_copy_all_from_cache", _partial_cache_copy)
+    capsys.readouterr()
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = True)
+    printed = capsys.readouterr().out
+    assert "is incomplete" in printed and first in printed
+    assert open(os.path.join(out, first), "rb").read() == open(os.path.join(base, first), "rb").read()
+
+
+def test_hub_listing_pins_the_same_commit_as_the_fetches(tmp_path, monkeypatch):
+    # Names and sizes come from the listing; an unpinned one can describe an older commit.
+    import huggingface_hub
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path, "20KB")
+    monkeypatch.setattr(huggingface_hub.HfApi, "model_info", lambda self, repo_id, **k: _ModelInfo())
+    _fake_hub(monkeypatch, base, fail = False)
+    listed = []
+    real_fs = S.HfFileSystem
+    class _RecordingFS(real_fs):
+        def ls(self, name, detail = True, **k):
+            listed.append(k.get("revision"))
+            return super().ls(name, detail = detail, **k)
+    monkeypatch.setattr(S, "HfFileSystem", _RecordingFS)
+    H.run_merge(peft_model, base, str(tmp_path / "out"), save_dtype = torch.float32, low_disk_space_usage = True)
+    assert listed and set(listed) == {_ModelInfo.sha}
+
+
+@pytest.mark.parametrize("source", ["local", "hub_low_disk"])
+def test_refresh_refused_when_free_space_is_below_the_largest_shard(tmp_path, monkeypatch, source):
+    # A 4bit model with a narrow adapter has an in-memory save size below the largest base
+    # shard, so prepare_saving passes; the refresh itself must refuse before touching anything.
+    # On-disk dtype: a float32 upcast has its own peak check.
+    import errno
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    low_disk = source == "hub_low_disk"
+    if source != "local":
+        _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = None, low_disk_space_usage = low_disk)
+    before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
+    sizes = sorted(len(v) for v in before.values())
+    assert sizes[0] < sizes[-1]
+    free = sizes[-1] - 1
+
+    monkeypatch.setattr(S, "get_torch_storage_size_new", lambda x, element_size: 1)
+    disk = S.shutil.disk_usage(out)
+    monkeypatch.setattr(S.shutil, "disk_usage", lambda _: type(disk)(disk.total, disk.total - free, free))
+    def _stage(path):
+        if os.path.getsize(path) > free:
+            raise OSError(errno.ENOSPC, "simulated full disk")
+    if source == "local":
+        real_copy = S._copy_file_from_source
+        def _copy(src, target_dir, filename):
+            if str(src).endswith(".safetensors"):
+                _stage(src)
+            return real_copy(src, target_dir, filename)
+        monkeypatch.setattr(S, "_copy_file_from_source", _copy)
+    else:
+        _fake_hub(monkeypatch, base, fail = False)
+        real_hf = S.hf_hub_download
+        def _hf(repo_id, filename, local_dir = None, **k):
+            if local_dir is not None and filename.endswith(".safetensors"):
+                _stage(os.path.join(base, filename))
+            return real_hf(repo_id, filename, local_dir = local_dir, **k)
+        monkeypatch.setattr(S, "hf_hub_download", _hf)
+
+    with pytest.raises(RuntimeError, match = "Nothing was changed"):
+        H.run_merge(peft_model, base, out, save_dtype = None, low_disk_space_usage = low_disk)
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+    assert _no_staging_left(out)

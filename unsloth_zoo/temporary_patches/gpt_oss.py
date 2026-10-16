@@ -2549,6 +2549,10 @@ def _ogs_root_for(weight, routing_data = None, module = None):
         for suffix in (".routing", ".matmul_ogs"):
             if owner.endswith(suffix):
                 return owner[: -len(suffix)]
+        # matmul API: the adapter's RoutingData carries the building copy's ragged metadata.
+        owner = type(getattr(routing_data, "expt_data", None)).__module__
+        if owner.endswith(".tensor_details.ragged_tensor"):
+            return owner[: -len(".tensor_details.ragged_tensor")]
         if module is not None and module.__dict__.get("_unsloth_tk_root"):
             return module.__dict__["_unsloth_tk_root"]
         from unsloth_zoo.triton_kernels_compat import get_triton_kernels

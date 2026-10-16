@@ -111,6 +111,54 @@ def test_flashqla_routes_eligible_calls_and_falls_back(monkeypatch, fake_env):
     assert gdr.chunk_gated_delta_rule is wrapped
 
 
+def test_flashqla_failure_falls_back_once_per_dtype(monkeypatch, fake_env):
+    # fp16 on SM100 passes the verifier but its kernel can fail to compile (TileLang 0.1.12,
+    # nvcc 13.1): that call and later ones of the same dtype go to fla, with one warning.
+    gdr, _, calls = fake_env
+    monkeypatch.setenv("UNSLOTH_GDN_BACKEND", "flashqla")
+    _supported_only_when(monkeypatch, lambda q: True)
+    built = []
+
+    def flash_chunk(**kwargs):
+        built.append(kwargs["q"].dtype)
+        if kwargs["q"].dtype == "float16":
+            raise RuntimeError("Compilation error:\nno suitable user-defined conversion")
+        return ("flashqla", kwargs)
+
+    fv._flashqla_state["module"] = types.SimpleNamespace(chunk_gated_delta_rule = flash_chunk)
+    monkeypatch.setattr(fv, "_load_flashqla", lambda: fv._flashqla_state["module"])
+    warnings = []
+    monkeypatch.setattr(fv.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    assert fv._install_gdn_backend() is True
+    wrapped = gdr.chunk_gated_delta_rule
+
+    fp16 = types.SimpleNamespace(dtype = "float16")
+    bf16 = types.SimpleNamespace(dtype = "bfloat16")
+    assert wrapped(fp16, "k", "v", "g", "beta")[0] == "fla"
+    assert wrapped(fp16, "k", "v", "g", "beta")[0] == "fla"
+    assert built == ["float16"]
+    assert len(warnings) == 1 and "float16" in warnings[0] and "Compilation error" in warnings[0]
+    assert wrapped(bf16, "k", "v", "g", "beta")[0] == "flashqla"
+    assert built == ["float16", "bfloat16"]
+
+
+def test_flashqla_oom_is_not_swallowed(monkeypatch, fake_env):
+    torch = pytest.importorskip("torch")
+    gdr, _, _ = fake_env
+    monkeypatch.setenv("UNSLOTH_GDN_BACKEND", "flashqla")
+    _supported_only_when(monkeypatch, lambda q: True)
+
+    def flash_chunk(**kwargs):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+    fv._flashqla_state["module"] = types.SimpleNamespace(chunk_gated_delta_rule = flash_chunk)
+    monkeypatch.setattr(fv, "_load_flashqla", lambda: fv._flashqla_state["module"])
+    assert fv._install_gdn_backend() is True
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        gdr.chunk_gated_delta_rule(types.SimpleNamespace(dtype = "float16"), "k", "v", "g", "beta")
+    assert not fv._flashqla_state.get("failed_calls")
+
+
 def test_flashqla_unavailable_keeps_fla(monkeypatch, fake_env):
     gdr, _, _ = fake_env
     monkeypatch.setenv("UNSLOTH_GDN_BACKEND", "flashqla")
