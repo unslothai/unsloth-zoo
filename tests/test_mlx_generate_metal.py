@@ -1496,6 +1496,164 @@ def test_dense_prefill_linear_first_use_check_rejects_a_different_result(monkeyp
     assert "the native call stays in use" in caplog.text
 
 
+@real_mlx_only
+@pytest.mark.parametrize("N, K, rows, same", [
+    (2048, 2048, (1100, 1300), True),
+    (1024, 4600, (1501, 1601), False),   # NAX split K
+    (1024, 512, (2047, 2049), False),    # both sides within 2048
+    (6000, 8192, (1501, 2201), False),   # K over M + N
+    (1500, 512, (1401, 1601), False),    # N over M
+    (1009, 512, (1025, 1041), False),    # a million outputs
+    (1024, 4000, (1999, 2001), False),   # K under twice the widest side
+    (2048, 2048, (1088, 1056), False),   # 64- against 32-row alignment
+    (2048, 2048, (1152, 1088), False),   # 128- against 64-row alignment
+    (2048, 2048, (1056, 1100), False),   # 32-row alignment against none
+])
+def test_dense_prefill_row_key_splits_at_each_mlx_row_decision(N, K, rows, same):
+    from unsloth_zoo.mlx import inference
+
+    first, second = (inference._dense_qmm_rows(M, N, K) for M in rows)
+    assert (first == second) is same
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("mlx_version, quantized, verdicts", [
+    (None, [1100, 1152], 2),
+    ("0.0.0", [1100, 1300, 1152], 0),   # another MLX takes the native call at every row count
+])
+def test_dense_prefill_linear_compares_once_per_row_count_decision(monkeypatch, mlx_version, quantized, verdicts):
+    from unsloth_zoo.mlx import inference
+
+    model = _PrefillProjections()
+    x = mx.random.normal((1, 1300, 512), key = mx.random.key(4)).astype(mx.bfloat16)
+    rows = (1100, 1300, 1152)   # 1300 decides as 1100 does; 1152 aligns on 128 rows
+    natives = [model(x[:, :n]) for n in rows]
+    mx.eval(natives)
+    seen, quantized_matmul = [], mx.quantized_matmul
+    monkeypatch.setattr(mx, "quantized_matmul", lambda a, w, *args, **kwargs: (
+        seen.append(a.shape[-2]) if w.shape[0] == 2048 else None, quantized_matmul(a, w, *args, **kwargs))[1])
+    verified = {}
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
+    if mlx_version is not None:
+        monkeypatch.setattr(inference, "_DENSE_QMM_DISPATCH_MLX", (mlx_version,))
+    with inference.dense_prefill_linear(model):
+        for n, native in zip(rows, natives):
+            assert _same_bits(model(x[:, :n]), native)
+    assert seen == quantized and len(verified) == verdicts
+
+
+class _OneColumn(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.QuantizedLinear(64, 1, bias = False, group_size = 64, bits = 4)
+        self.set_dtype(mx.bfloat16)
+        self.eval()
+
+    def __call__(self, x):
+        return self.proj(x)
+
+
+@real_mlx_only
+@metal_only
+def test_dense_prefill_leaves_a_one_column_output_native(monkeypatch):
+    from unsloth_zoo.mlx import inference
+
+    model = _OneColumn()
+    x = mx.random.normal((1, 65553, 64)).astype(mx.bfloat16)   # past the tile floor
+    native = model(x)
+    mx.eval(native)
+    verified = {}
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
+    with inference.dense_prefill_linear(model):
+        assert _same_bits([model(x)], [native])
+    assert not verified
+
+
+_FAILED = "[METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+
+
+def _first_use_checks():
+    from mlx_lm.models.gated_delta import gated_delta_kernel
+    from unsloth_zoo.mlx import inference as I
+
+    rows = lambda *shape: mx.random.normal(shape).astype(mx.bfloat16)
+    delta = (rows(1, 2, 1, 128), rows(1, 2, 1, 128), rows(1, 2, 1, 8), mx.ones((1, 2, 1)), rows(1, 2, 1),
+             mx.zeros((1, 1, 8, 128)))
+    model = _PrefillProjections()
+
+    def dense():
+        with I.dense_prefill_linear(model):
+            return model(rows(1, 2048, 512))
+
+    return {
+        "add_norm": (lambda: I._add_norm_verified(mx.bfloat16, 256), "_ADD_NORM_VERDICTS"),
+        "router": (lambda: I._moe_router_verified(mx.bfloat16, mx.float32, 64, 4, I._QWEN_ROUTING, True), None),
+        "router_shared": (lambda: I._moe_router_shared_verified(mx.bfloat16, 64, 4, True), None),
+        "combine": (lambda: I._moe_combine_verified(mx.bfloat16, 2, 64), None),
+        "gated_delta": (lambda: I._packed_gated_delta_route(gated_delta_kernel, [])(*delta), "_GATED_DELTA_VERDICTS"),
+        "verify": (lambda: I._verify_admitted("key", lambda: rows(2, 4), lambda: rows(2, 4)), "_VERIFY_VERDICTS"),
+        "dense": (dense, "_DENSE_QMM_VERIFIED"),
+    }
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("site", ["add_norm", "router", "router_shared", "combine", "gated_delta", "verify", "dense"])
+def test_a_first_use_mismatch_from_a_failed_command_buffer_raises_instead_of_recording(monkeypatch, site):
+    from unsloth_zoo.mlx import inference
+
+    check, verdicts = _first_use_checks()[site]
+    for cached in (inference._moe_router_verified, inference._moe_router_shared_verified, inference._moe_combine_verified):
+        cached.cache_clear()
+    if verdicts:
+        monkeypatch.setattr(inference, verdicts, {})
+
+    def failed(*_):
+        raise RuntimeError(_FAILED)
+
+    monkeypatch.setattr(mx, "array_equal", lambda *a, **k: mx.array(False))
+    monkeypatch.setattr(mx, "synchronize", failed)
+    with pytest.raises(RuntimeError, match = "Command buffer execution failed"):
+        check()
+    assert not getattr(inference, verdicts) if verdicts else True
+    for cached in (inference._moe_router_verified, inference._moe_router_shared_verified, inference._moe_combine_verified):
+        assert not cached.cache_info().currsize
+        cached.cache_clear()
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("error, raised", [
+    (RuntimeError(_FAILED), True),
+    (ValueError("[eval] Attempting to eval an array during function transformations like compile or vmap"), False),
+    (RuntimeError("[metal::Device] Unable to build metal library from source"), False),
+])
+def test_a_first_use_check_defers_only_what_cannot_evaluate_now(monkeypatch, error, raised):
+    from unsloth_zoo.mlx import inference
+
+    model = _PrefillProjections()
+    x = mx.random.normal((1, 2048, 512)).astype(mx.bfloat16)
+    native = model(x)
+    mx.eval(native)
+
+    def refuse(*_, **__):
+        raise error
+
+    monkeypatch.setattr(mx, "array_equal", refuse)
+    verified = {}
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
+    with inference.dense_prefill_linear(model):
+        if raised:
+            with pytest.raises(RuntimeError, match = "Command buffer execution failed"):
+                model(x)
+        else:
+            outputs = model(x)
+            monkeypatch.undo()
+            assert _same_bits(outputs, native)
+    assert not verified
+
+
 @metal_only
 def test_vlm_cache_materialization_finishes_the_previous_snapshot(monkeypatch):
     from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
@@ -1663,7 +1821,7 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
     from contextlib import contextmanager
     import mlx_lm
     import mlx_vlm
-    from unsloth_zoo.mlx import loader
+    from unsloth_zoo.mlx import inference, loader
 
     root = nn.Sequential(nn.Linear(4, 4))
     root._tokenizer = types.SimpleNamespace(eos_token_ids = {2})
@@ -1671,7 +1829,7 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
     entered = []
 
     @contextmanager
-    def scope(model, *args):
+    def scope(model, *args, _modules):
         entered.append((model, *args))
         yield model
 
@@ -1680,10 +1838,28 @@ def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, sc
         assert "int8_prefill" not in kwargs
         yield types.SimpleNamespace(token = 7)
 
-    monkeypatch.setattr(loader, scope_name, scope)
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [
+        entry._replace(enter = scope) if entry.name == scope_name else entry for entry in inference.INFERENCE_SCOPES])
     monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
     generated = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1, int8_prefill = vlm)
     assert generated.tolist() == [[1, 2, 7]]
+
+
+@real_mlx_only
+@metal_only
+def test_warm_inference_leaves_no_shape_keyed_check_to_the_first_request(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    verdicts = ("_ADD_NORM_VERDICTS", "_DECODE_STEP_VERDICTS")
+    for name in verdicts:
+        monkeypatch.setattr(inference, name, {})
+    model, _ = FastMLXModel.from_pretrained(QWEN_VLM_MODEL)
+    inference.warm_inference(model)
+    warmed = {name: dict(getattr(inference, name)) for name in verdicts}
+    assert all(warmed.values()), warmed
+    model.generate(mx.arange(100, 137)[None], max_tokens = 3, do_sample = False)
+    assert {name: getattr(inference, name) for name in verdicts} == warmed
 
 
 def _packed_codes(codes, bits):   # MLX's layout: a little-endian bitstream of `bits`-wide codes

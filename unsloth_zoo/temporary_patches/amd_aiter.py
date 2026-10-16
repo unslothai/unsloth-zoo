@@ -115,8 +115,13 @@ def aiter_attention_forward(
                 and kwarg_value is not None and kwarg_value is not False):
             return _fallback()
 
-    from unsloth_zoo.device_type import get_amd_flash_attn_func
-    flash_attn_func = get_amd_flash_attn_func()
+    from unsloth_zoo import device_type
+    # One HIP device: the no-argument call reuses the setup gate's cache entry.
+    flash_attn_func = (
+        device_type.get_amd_flash_attn_func(query.device)
+        if device_type.AMD_PER_DEVICE_CACHES
+        else device_type.get_amd_flash_attn_func()
+    )
     if flash_attn_func is None:
         return _fallback()
 

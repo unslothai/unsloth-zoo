@@ -58,9 +58,7 @@ from .compile import (
     trace_compile_application,
 )
 from .attention import install_quantized_attention
-from .inference import (dense_prefill_linear, fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                        fused_moe_router, fused_packed_gated_delta, fused_residual_norm, fused_residual_norm_handoff,
-                        nax_quantized_linear)
+from .inference import inference_scopes
 
 _vlm_model_types_cache = None
 _VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
@@ -7369,11 +7367,7 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     generated_ids = []
     last_generation_tokens = None
-    with fused_moe_gate_up(self), fused_decode_conv_silu(self), fused_residual_norm(self), \
-            fused_moe_router(self), fused_moe_routed_experts(self), nax_quantized_linear(self, int8_prefill), \
-            dense_prefill_linear(self), \
-            fused_packed_gated_delta(self), \
-            fused_residual_norm_handoff(self):
+    with inference_scopes(self, ("vision",), int8_prefill = int8_prefill):
         for response in stream_generate(
             self,
             processor,
@@ -7497,11 +7491,7 @@ def _mlx_generate(self, *args, **kwargs):
     generated_ids = []
     eos_restore_state = _mlx_override_tokenizer_eos_ids(tokenizer, eos_token_id)
     try:
-        with fused_moe_gate_up(self), fused_decode_conv_silu(self), fused_residual_norm(self), \
-                fused_moe_router(self), fused_moe_routed_experts(self), nax_quantized_linear(self, int8_prefill), \
-                dense_prefill_linear(self), \
-                fused_packed_gated_delta(self), \
-                fused_residual_norm_handoff(self):
+        with inference_scopes(self, (), int8_prefill = int8_prefill):
             for response in stream_generate(
                 self,
                 tokenizer,

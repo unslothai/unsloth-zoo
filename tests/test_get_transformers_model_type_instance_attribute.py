@@ -45,9 +45,11 @@ def test_instance_only_model_type_resolves():
 
 def test_unknown_remote_type_is_not_prefix_truncated():
     import transformers.models
-    assert "bailing_hybrid" not in set(dir(transformers.models))
+    # Not bailing_hybrid: transformers 5.20 ships that one natively.
+    remote_type = "unsloth_remote_hybrid"
+    assert remote_type not in set(dir(transformers.models))
 
-    assert get_transformers_model_type(_BailingLikeConfig()) == ["bailing_hybrid"]
+    assert get_transformers_model_type(_BailingLikeConfig(model_type = remote_type)) == [remote_type]
 
 
 def test_prefix_colliding_remote_type_is_not_rewritten():
@@ -69,7 +71,8 @@ def test_nested_sub_config_instance_attribute_is_reached():
 
 def test_sub_config_inside_a_list_is_reached():
     config = _EmptyEverywhereConfig()
-    config.sub_configs = [_SubConfig(model_type = "some_remote_type")]
+    # Not `sub_configs`: transformers 5.20 made that a read-only PretrainedConfig property.
+    config.decoder_configs = [_SubConfig(model_type = "some_remote_type")]
 
     assert get_transformers_model_type(config) == ["some_remote_type"]
 

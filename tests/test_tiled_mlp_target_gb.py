@@ -26,6 +26,8 @@ def _fake_cuda(free_bytes):
     fake = mock.MagicMock()
     fake.is_available.return_value = True
     fake.mem_get_info.return_value = (free_bytes, free_bytes * 2)
+    fake.memory_reserved.return_value = 0
+    fake.memory_allocated.return_value = 0
     return fake
 
 
