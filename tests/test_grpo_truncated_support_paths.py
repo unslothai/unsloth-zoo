@@ -19,13 +19,15 @@ cutoff, the logprob recompute helper, entropy scoring, and raw vllm.SamplingPara
 
 import inspect
 import os
+import sys
 import types
 
 import pytest
 import torch
 
 import unsloth_zoo.rl_replacements as rr
-from tests.test_grpo_truncated_support import _vllm_processed_logprobs
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_grpo_truncated_support import _vllm_processed_logprobs  # noqa: E402
 
 
 @pytest.mark.parametrize("top_p", [0.9, 0.1])
