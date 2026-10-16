@@ -466,7 +466,7 @@ def main():
     _STATE["host"] = args.host
     with open(_PLAYER_TEMPLATE, encoding="utf-8") as player_template:
         _STATE["player"] = player_template.read()
-    print(f"loading {args.gguf} on GPU {os.environ.get('CUDA_VISIBLE_DEVICES', '0') if args.gpu is None else args.gpu} (optimized visual decoder) ...", flush=True)
+    print(f"loading {args.gguf} on GPU {V._first_visible_gpu(os.environ.get('CUDA_VISIBLE_DEVICES')) if args.gpu is None else args.gpu} (optimized visual decoder) ...", flush=True)
     _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok, ngl=args.ngl)
     print(f"gpu layers (NGL) = {_STATE['server'].ngl}", flush=True)
     print(f"DiffusionGemma OpenAI shim ready on http://{args.host}:{args.port}  (model={MODEL_ID})",

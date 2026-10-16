@@ -7,9 +7,9 @@
 # (at your option) any later version.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# The visual-server env builder must keep an inherited CUDA_VISIBLE_DEVICES when no
-# gpu is given (it used to force "0"), pin GPU 0 when none is inherited, and replace
-# it verbatim when a gpu is given.
+# With no gpu given the visual-server env builder keeps one card: the first entry of an
+# inherited CUDA_VISIBLE_DEVICES (it used to force "0", a GPU the mask may hide), GPU 0
+# when none is inherited; a given gpu replaces the mask verbatim.
 
 from __future__ import annotations
 
@@ -19,17 +19,20 @@ import pytest
 
 from unsloth_zoo.diffusion_studio import visual_engine as V
 
-MASKS = ["", "-1", "2,1", "GPU-8a1b2c3d-0000-1111-2222-333344445555",
-         "MIG-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "MIG-GPU-8a1b2c3d/1/0"]
-
-
 def _env(base_env, **kw):
     return V._build_subprocess_env("/dg/srv", base_env = base_env, os_name = "posix", **kw)
 
 
-@pytest.mark.parametrize("mask", MASKS)
-def test_inherited_mask_kept_by_default(mask):
-    assert _env({"PATH": "/usr/bin", "CUDA_VISIBLE_DEVICES": mask})["CUDA_VISIBLE_DEVICES"] == mask
+@pytest.mark.parametrize("mask,expected", [
+    ("", ""), ("-1", "-1"), ("2,1", "2"), ("0,1", "0"), (" 3 , 0", "3"),
+    ("GPU-8a1b2c3d-0000-1111-2222-333344445555", "GPU-8a1b2c3d-0000-1111-2222-333344445555"),
+    ("GPU-aaaa,GPU-bbbb", "GPU-aaaa"),
+    ("MIG-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "MIG-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"),
+    ("MIG-GPU-8a1b2c3d/1/0", "MIG-GPU-8a1b2c3d/1/0"),
+])
+def test_inherited_mask_keeps_one_visible_gpu_by_default(mask, expected):
+    # Identical GPUs under "0,1" still run on GPU 0 alone, as before; a hidden GPU 0 is never used.
+    assert _env({"PATH": "/usr/bin", "CUDA_VISIBLE_DEVICES": mask})["CUDA_VISIBLE_DEVICES"] == expected
 
 
 def test_unset_mask_keeps_gpu_0_by_default():
