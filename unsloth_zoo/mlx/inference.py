@@ -2181,10 +2181,11 @@ _QDOT = r"""
 #define UNROLL _Pragma("clang loop unroll(full)")
 
 #ifdef UNSLOTH_AFFINE
-template <typename T, int bits>
+// qmv_fast reads two packs per lane (one at 2 bits); qmv reads one.
+template <typename T, int bits, int fast>
 struct Lane {
   typedef T scale_t;
-  static constexpr constant int packs = bits == 2 ? 1 : 2;
+  static constexpr constant int packs = fast && bits != 2 ? 2 : 1;
   static constexpr constant int pack_factor = get_pack_factor<bits, 32>();
   static constexpr constant int bytes_per_pack = get_bytes_per_pack<bits, 32>();
 };
@@ -2351,7 +2352,7 @@ struct Terms<U, values_per_thread, 8> {
   }
 };
 #else
-template <typename T, int bits>
+template <typename T, int bits, int fast>
 struct Lane {
   typedef uint8_t scale_t;
   static constexpr constant int packs = 2;
@@ -2429,10 +2430,10 @@ struct ExpertParams {
   int64_t w[2][3]; // per-expert byte strides of (weight, scales, biases) per projection
 };
 
-template <typename T, int group_size, int bits, int out>
+template <typename T, int group_size, int bits, int out, int fast>
 struct Dots {
   typedef float U;
-  typedef Lane<T, bits> lane;
+  typedef Lane<T, bits, fast> lane;
   static constexpr constant int values_per_thread = lane::pack_factor * lane::packs;
   static constexpr constant int block_size = values_per_thread * SIMD_SIZE;
   static constexpr constant int scale_step = group_size / values_per_thread;
@@ -2474,13 +2475,16 @@ struct Dots {
     Terms<U, values_per_thread, bits> terms;
     x += lane_id * values_per_thread;
     for (int k = 0; k < K; k += block_size) {
+      // qmv's last block: lanes past K add nothing.
+      if (fast || k + lane_id * values_per_thread < K) {
 #ifdef UNSLOTH_AFFINE
-      sum = load_vector<T, U, values_per_thread, bits>(x, xt);
+        sum = load_vector<T, U, values_per_thread, bits>(x, xt);
 #else
-      load_vector<T, U, values_per_thread>(x, xt);
+        load_vector<T, U, values_per_thread>(x, xt);
 #endif
-      UNROLL for (int j = 0; j < P; j++) {
-        rows(p[j], K, terms, xt, sum, result + j * out);
+        UNROLL for (int j = 0; j < P; j++) {
+          rows(p[j], K, terms, xt, sum, result + j * out);
+        }
       }
       UNROLL for (int j = 0; j < P; j++) {
         p[j].w += block_size * lane::bytes_per_pack / lane::pack_factor;
@@ -2495,7 +2499,7 @@ struct Dots {
   }
 };
 
-template <typename T, int group_size, int bits, int out, typename Inds>
+template <typename T, int group_size, int bits, int out, int fast, typename Inds>
 METAL_FUNC void gate_up_rows(
     const device uint8_t* wg,
     const device uint8_t* sg,
@@ -2509,7 +2513,7 @@ METAL_FUNC void gate_up_rows(
     ExpertParams p,
     uint3 tid,
     uint3 lid) {
-  typedef Dots<T, group_size, bits, out> dots;
+  typedef Dots<T, group_size, bits, out, fast> dots;
   const int lane = lid.x;
   const int n0 = tid.x * (2 * out) + lid.y * out;
   const int64_t e = inds[tid.y];
@@ -2532,7 +2536,7 @@ METAL_FUNC void gate_up_rows(
   }
 }
 
-template <typename T, int group_size, int bits, int out, typename Inds, typename Scores, typename Shared, typename S>
+template <typename T, int group_size, int bits, int out, int fast, typename Inds, typename Scores, typename Shared, typename S>
 METAL_FUNC void down_rows(
     const device uint8_t* w,
     const device uint8_t* ws,
@@ -2548,7 +2552,7 @@ METAL_FUNC void down_rows(
     uint3 tid,
     uint3 lid,
     uint3 lsize) {
-  typedef Dots<T, group_size, bits, out> dots;
+  typedef Dots<T, group_size, bits, out, fast> dots;
   const int lane = lid.x;
   const int n0 = tid.x * out;
   const size_t route = size_t(tid.y) * p.top_k;
@@ -2577,7 +2581,7 @@ _BODIES = {
   const ExpertParams p{k, n, top_k, {
       {wg_strides[0] * int64_t(sizeof(*wg)), sg_strides[0] * int64_t(sizeof(*sg)), bg_strides[0] * int64_t(sizeof(*bg))},
       {wu_strides[0] * int64_t(sizeof(*wu)), su_strides[0] * int64_t(sizeof(*su)), bu_strides[0] * int64_t(sizeof(*bu))}}};
-  gate_up_rows<T, group_size, bits, out>(
+  gate_up_rows<T, group_size, bits, out, fast>(
       (const device uint8_t*)wg, (const device uint8_t*)sg, (const device uint8_t*)bg,
       (const device uint8_t*)wu, (const device uint8_t*)su, (const device uint8_t*)bu,
       x, inds, y, p, threadgroup_position_in_grid, thread_position_in_threadgroup);
@@ -2585,7 +2589,7 @@ _BODIES = {
     "down": r"""
   threadgroup T products[31 * out];
   const ExpertParams p{k, n, top_k, {{w_strides[0] * int64_t(sizeof(*w)), ws_strides[0] * int64_t(sizeof(*ws)), wb_strides[0] * int64_t(sizeof(*wb))}, {}}};
-  down_rows<T, group_size, bits, out>(
+  down_rows<T, group_size, bits, out, fast>(
       (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb, x, inds, scores, shared, s, y, p,
       products, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup);
 """,
@@ -2643,19 +2647,20 @@ def _scalar(value):
     return mx.array(value, mx.int32)
 
 
-def _values_per_thread(mode, bits):
+def _values_per_thread(mode, bits, fast = True):
     if mode != "affine":
         return 2 * 32 // bits
     pack_factor = 8 if bits in (3, 5) else 4 if bits == 6 else 32 // bits
-    return pack_factor * (1 if bits == 2 else 2)
+    return pack_factor * (1 if bits == 2 or not fast else 2)
 
 
 def _trailing(a, dtype, rows, cols):
     return a.dtype == dtype and a.ndim >= 2 and a.shape[-2:] == (rows, cols)
 
 
-def _one_row_fast(mode, group_size, bits, dtype, k, n, w, scales, biases):
-    """Whether MLX's one-row gather kernel for (K, N) is qmv_fast / fp_qmv_fast for these weights."""
+def _one_row_kernel(mode, group_size, bits, dtype, k, n, w, scales, biases):
+    """MLX's one-row gather kernel for (K, N) with these weights: 1 for qmv_fast / fp_qmv_fast, 0 for the affine
+    qmv, -1 for one the routed kernels do not reproduce."""
     affine = mode == "affine"
     known = (
         (affine and 2 <= bits <= 8 and bits != 7 and group_size in (32, 64, 128))
@@ -2664,15 +2669,17 @@ def _one_row_fast(mode, group_size, bits, dtype, k, n, w, scales, biases):
         or (mode == "nvfp4" and bits == 4 and group_size == 16)
     )
     if not known or scales is None or affine != (biases is not None):
-        return False
-    per_thread = _values_per_thread(mode, bits)
-    if n % 8 != 0 or n < 16 or k % (per_thread * 32) != 0 or group_size < per_thread:
-        return False
-    return (
+        return -1
+    # MLX's qmv_fast_k_alignment: qmv_fast's K step.
+    fast = k % (_values_per_thread(mode, bits) * 32) == 0
+    if n % 8 != 0 or n < 16 or not (fast or affine) or group_size < _values_per_thread(mode, bits, fast):
+        return -1
+    shaped = (
         _trailing(w, mx.uint32, n, k * bits // 32)
         and _trailing(scales, dtype if affine else mx.uint8, n, k // group_size)
         and (not affine or _trailing(biases, dtype, n, k // group_size))
     )
+    return int(fast) if shaped else -1
 
 
 def _key(a):
@@ -2692,12 +2699,13 @@ def _specs(keys):
 
 
 def _projection(t, mode, group_size, bits, dtype, k):
-    """N of one projection's (weight, scales[, biases]) with one fast-kernel weight per expert, else -1."""
+    """(N, MLX's one-row kernel) of one projection's (weight, scales[, biases]) with one weight per expert, else (-1, -1)."""
     if len(t) != (3 if mode == "affine" else 2) or any(a.ndim != 3 or a.shape[0] != t[0].shape[0] for a in t):
-        return -1
+        return -1, -1
     n = t[0].shape[-2]
     scales, biases = (list(t[1:]) + [None])[:2]
-    return n if _one_row_fast(mode, group_size, bits, dtype, k, n, t[0], scales, biases) else -1
+    fast = _one_row_kernel(mode, group_size, bits, dtype, k, n, t[0], scales, biases)
+    return (n, fast) if fast >= 0 else (-1, -1)
 
 
 def _launch(name, affine, dtype, quant, out_rows, per, projections, experts, shape, grid, threadgroup, k, n, top_k, routes):
@@ -2706,7 +2714,7 @@ def _launch(name, affine, dtype, quant, out_rows, per, projections, experts, sha
         return None
     scalars = [_scalar(k), _scalar(n), _scalar(top_k)]
     args = dict(
-        template = [("T", dtype), ("group_size", quant[0]), ("bits", quant[1]), ("out", out_rows)],
+        template = [("T", dtype), ("group_size", quant[0]), ("bits", quant[1]), ("out", out_rows), ("fast", quant[2])],
         grid = grid,
         threadgroup = threadgroup,
         output_shapes = [shape],
@@ -2739,16 +2747,16 @@ def _gate_up_plan(x, inds, gate, up, group_size, bits, mode):
     ):
         return None
     k = x.shape[-1]
-    n = _projection(gate, mode, group_size, bits, x.dtype, k)
+    n, fast = _projection(gate, mode, group_size, bits, x.dtype, k)
     if (n < 0 or n % (2 * _GATE_UP_ROWS) != 0
-            or _projection(up, mode, group_size, bits, x.dtype, k) != n
+            or _projection(up, mode, group_size, bits, x.dtype, k) != (n, fast)
             or gate[0].shape[0] != up[0].shape[0]):
         return None
     shape, routes = (*inds.shape, n), math.prod(inds.shape)
     if routes == 0:
         return shape, x.dtype
     return _launch(
-        "gate_up", mode == "affine", x.dtype, (group_size, bits), _GATE_UP_ROWS, len(gate), 2,
+        "gate_up", mode == "affine", x.dtype, (group_size, bits, fast), _GATE_UP_ROWS, len(gate), 2,
         gate[0].shape[0], shape, grid = (32 * n // (2 * _GATE_UP_ROWS), 2 * routes, 1),
         threadgroup = (32, 2, 1), k = k, n = n, top_k = inds.shape[-1], routes = routes,
     )
@@ -2775,7 +2783,7 @@ def _down_plan(x, inds, scores, shared, s, w, group_size, bits, mode):
     w = _specs(w)
     if x.ndim < 2 or inds.dtype not in _INDS or inds.shape != scores.shape:
         return None
-    n = _projection(w, mode, group_size, bits, x.dtype, x.shape[-1])
+    n, fast = _projection(w, mode, group_size, bits, x.dtype, x.shape[-1])
     if n < 0 or n % _DOWN_ROWS != 0 or not _combinable(x, scores, shared, s, n):
         return None
     routes, top_k = math.prod(inds.shape), scores.shape[-1]
@@ -2783,7 +2791,7 @@ def _down_plan(x, inds, scores, shared, s, w, group_size, bits, mode):
         return s.shape, x.dtype
     simds = min(top_k, _MAX_SIMDS)
     return _launch(
-        "down", mode == "affine", x.dtype, (group_size, bits), _DOWN_ROWS, len(w), 1, w[0].shape[0],
+        "down", mode == "affine", x.dtype, (group_size, bits, fast), _DOWN_ROWS, len(w), 1, w[0].shape[0],
         s.shape, grid = (32 * n // _DOWN_ROWS, simds * (routes // top_k), 1),
         threadgroup = (32, simds, 1), k = x.shape[-1], n = n, top_k = top_k, routes = routes,
     )

@@ -632,9 +632,9 @@ def _routed(block):
         yield
 
 
-def _expert_block(native, quantization, dtype):
+def _expert_block(native, quantization, dtype, widths = (512, 512)):
     mx.random.seed(23)
-    args = SimpleNamespace(hidden_size = 512, moe_intermediate_size = 512, num_experts = 32, num_experts_per_tok = 8,
+    args = SimpleNamespace(hidden_size = widths[0], moe_intermediate_size = widths[1], num_experts = 32, num_experts_per_tok = 8,
                            shared_expert_intermediate_size = 512, norm_topk_prob = True)
     block = (vlm_qwen.Qwen3_5MoeSparseMoeBlock if native is vlm_qwen else lm_qwen.Qwen3NextSparseMoeBlock)(args)
     block.set_dtype(dtype)
@@ -648,11 +648,16 @@ def _expert_block(native, quantization, dtype):
 
 @pytest.mark.parametrize("native", [vlm_qwen, lm_qwen])
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("quantization", [(8, "affine", 64), (4, "affine", 32), (4, "mxfp4", 32), (4, "nvfp4", 16)])
-def test_routed_experts_run_on_the_decode_kernels_bitwise(native, dtype, quantization, monkeypatch):
-    block = _expert_block(native, quantization, dtype)
+# (hidden, expert) widths: MLX runs qmv for a K its bit width's qmv_fast step does not divide (512 at 4 bits, 256 at 8),
+# here the down projection, gate/up, both, and neither at 8 bits.
+@pytest.mark.parametrize("quantization, widths", [((8, "affine", 64), (512, 512)), ((4, "affine", 32), (512, 512)), ((4, "mxfp4", 32), (512, 512)),
+                                                  ((4, "nvfp4", 16), (512, 512)), ((4, "affine", 32), (512, 640)), ((4, "affine", 32), (640, 512)),
+                                                  ((8, "affine", 32), (640, 640)), ((6, "affine", 32), (640, 640)), ((2, "affine", 32), (640, 640)),
+                                                  ((8, "affine", 64), (768, 768))])
+def test_routed_experts_run_on_the_decode_kernels_bitwise(native, dtype, quantization, widths, monkeypatch):
+    block = _expert_block(native, quantization, dtype, widths)
     # decode rows, the last row alone, and the first sorted width, whose 64 routes stay native
-    xs = [mx.random.normal((rows, 1, 512)).astype(dtype) for rows in (1, 7, 8)]
+    xs = [mx.random.normal((rows, 1, widths[0])).astype(dtype) for rows in (1, 7, 8)]
     xs.insert(2, xs[1][6:])
     expected = [block(x) for x in xs]
     gathers = _counting_gather_qmm(monkeypatch)
