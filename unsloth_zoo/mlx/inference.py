@@ -136,17 +136,15 @@ _FAILED_BUFFER = "[METAL] Command buffer execution failed"
 
 
 def _settled(verdict):
-    """`verdict`, once a mismatch is known not to come from a failed command buffer: one that ran out of memory
-    leaves garbage that reads as a mismatch, and MLX raises its error only at the next synchronize."""
+    """`verdict`, after synchronizing on a mismatch: a failed command buffer's garbage reads as one, and MLX
+    raises that error only at the next synchronize."""
     if not verdict:
         mx.synchronize()
     return verdict
 
 
 def _unless_failed_buffer(error):
-    """Re-raise a failed command buffer a first-use check met. The check only means to catch MLX refusing to
-    evaluate inside a function transformation; MLX clears a buffer error once raised, so swallowing one would
-    carry on with that buffer's garbage."""
+    """Re-raise a failed command buffer: MLX clears it once raised, so swallowing it keeps the garbage."""
     if str(error).startswith(_FAILED_BUFFER):
         raise error
 
@@ -3766,13 +3764,8 @@ _DENSE_QMM_DISPATCH_MLX = ("0.32.3", "0.32.4")  # 0.32.4's thin NAX case needs N
 
 
 def _dense_qmm_rows(M, N, K):
-    """What MLX 0.32.3 and 0.32.4 decide from the row count for both matmuls past the tile floor, so one comparison
-    covers every row count deciding the same.
-
-    Its quantized matmul leaves split K at one there and reads the rows only in bounds checks. Its dense
-    matmul picks NAX split K, tiles and K blocks from these predicates (the rest it tests cannot hold past
-    the floor) and aligns on 32, 64 or 128 rows.
-    """
+    """MLX 0.32.3/0.32.4's row-count decisions past the tile floor (dense steel_matmul_axpby split K, tiles,
+    K blocks, row alignment; qmm reads rows only in bounds checks): one comparison per distinct tuple."""
     widest = max(M, N)
     return (K >= 3 * widest, M <= 2048 and N <= 2048, K >= 8192 and K > M + N, N > M, M * N >= 1 << 20,
             2 * widest > K, next((rows for rows in (128, 64, 32) if M % rows == 0), 0))
@@ -3782,10 +3775,8 @@ def _dense_prefill_qmm(module, x, bindings):
     """`x` times the dequantized weight for a prefill-sized call, or None when it takes the native call.
 
     MLX's quantized matmul dequantizes inside every tile; dequantizing once is the same arithmetic.
-    Each (projection shape, quantization, dtypes) is compared bit for bit on its first use at every set of
-    row-count decisions `_dense_qmm_rows` tells apart, since MLX picks its kernels by them. Another MLX, or a
-    one-column output (a matrix-vector product whose kernel MLX picks by the row count), would need a check
-    per prompt length, which costs about what the dense matmul saves, so those take the native call.
+    Compared bit for bit on first use per (`_dense_qmm_rows`, shape, quantization, dtypes). Another MLX or a
+    one-column output (matvec, kernel picked per row count) would need a check per prompt length: native.
     """
     if mx.__version__ not in _DENSE_QMM_DISPATCH_MLX:
         return None
