@@ -190,11 +190,18 @@ def _make_fake(name, api):
             meta = types.SimpleNamespace(col_sum = hist, col_sorted_indx = combine, row_sorted_indx = dispatch)
             return types.SimpleNamespace(vals = vals, indx = indx, mask_metadata = meta)
 
+        @dataclasses.dataclass
+        class RaggedTensorMetadata:
+            slice_sizes: torch.Tensor
+            slice_offs: torch.Tensor
+
+        RaggedTensorMetadata.__module__ = ragged.__name__
+
         def make_ragged_tensor_metadata(slice_sizes, n_total_rows):
             assert slice_sizes.dtype == torch.int32
             offs = torch.cat((slice_sizes.new_zeros(1), torch.cumsum(slice_sizes, 0, dtype = torch.int32)))
             assert int(offs[-1]) == n_total_rows
-            return types.SimpleNamespace(slice_sizes = slice_sizes, slice_offs = offs)
+            return RaggedTensorMetadata(slice_sizes, offs)
 
         topk_mod.topk = topk
         ragged.make_ragged_tensor_metadata = make_ragged_tensor_metadata
@@ -465,7 +472,41 @@ def test_new_generation_translates_indices_and_precision(fresh):
     (_, g, _, _), (_, _, s, pc_down) = pkg.calls
     torch.testing.assert_close(g, gather.src_indx // k)
     torch.testing.assert_close(s, scatter.dst_indx)
-    assert pc_down.out_dtype == torch.float32 and pc.out_dtype is None
+    assert pc_down is pc and pc.out_dtype is None
+
+
+def test_new_generation_down_rows_stay_in_output_dtype(fresh):
+    # fp32 matmul rows would double every down projection's (tokens * k, hidden) buffer.
+    pkg = _install(fresh, "triton_kernels", tkc.API_MATMUL_RAGGED)
+    backend = tkc.get_triton_kernels_backend()
+    x, logits, w1, b1, w2, b2 = _moe_inputs()
+    k = 2
+    rd, gather, scatter = backend.routing(logits, k)
+    h = torch.randn(x.shape[0] * k, w2.shape[1]).to(torch.bfloat16)
+    out = backend.down(h, w2, b2, rd, scatter, None, gammas = rd.gate_scal)
+    (_, _, _, pc_down), = pkg.calls
+    assert pc_down is None or pc_down.out_dtype in (None, torch.bfloat16)
+    assert out.dtype == torch.bfloat16
+    rows = sys.modules["triton_kernels.matmul"].matmul(
+        h, w2, b2, a_ragged_metadata = rd.expt_data, scatter_indx = scatter.dst_indx, gammas = rd.gate_scal,
+    )
+    assert rows.dtype == torch.bfloat16
+    torch.testing.assert_close(out, rows.view(-1, k, rows.shape[-1]).float().sum(1).to(torch.bfloat16), rtol = 0, atol = 0)
+
+
+def test_dense_training_follows_the_copy_that_built_ragged_routing(fresh):
+    # Routing came from the top-level copy: resolve it from the ragged metadata, not the SOURCE env var.
+    _install(fresh, "triton_kernels", tkc.API_MATMUL_RAGGED)
+    vendored = _install(fresh, "vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
+    fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
+    fresh.setenv("UNSLOTH_TRITON_KERNELS_SOURCE", "vllm")
+    assert tkc.selected_triton_kernels()[0] == "vllm.third_party.triton_kernels"
+    x, logits, *_ = _moe_inputs()
+    routing_data, _, _ = tkc.triton_kernels_backend_for("triton_kernels").routing(logits, 2)
+    assert isinstance(routing_data, tkc.RoutingData)
+    module = torch.nn.Module()  # LoRA / training forward never sets _unsloth_tk_root
+    assert go._ogs_root_for(torch.zeros(1), routing_data, module) == "triton_kernels"
+    assert go._ogs_backend_for(torch.zeros(1), routing_data, module).api == tkc.API_MATMUL_RAGGED
 
 
 def test_unswizzle_handles_both_layout_contracts(fresh):
