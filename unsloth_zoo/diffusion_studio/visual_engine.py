@@ -162,16 +162,18 @@ def _resolve_ngl(ngl = None, base_env = None):
     return DEFAULT_NGL
 
 
-def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, ngl = None, base_env = None, os_name = None):
+def _build_subprocess_env(server_bin, gpu = None, maxtok = 0, ngl = None, base_env = None, os_name = None):
     """Build the visual-server child env so it loads the CUDA backend, not CPU.
 
     Binary dir first, then bundled CUDA runtime, then the inherited path. Windows: torch/lib
     (``cudart64_*.dll``) is prepended to ``PATH`` (#6273). Linux/WSL: the bundled ``nvidia-*`` dirs
     are prepended to ``LD_LIBRARY_PATH`` ahead of any inherited system CUDA (#6303). macOS / no GPU
-    wheels: only the binary dir is added (unchanged). Pure/injectable for cross-platform tests."""
+    wheels: only the binary dir is added (unchanged). Pure/injectable for cross-platform tests.
+    ``gpu=None`` keeps an inherited ``CUDA_VISIBLE_DEVICES`` (else GPU 0, as before); any other
+    value, including ``""`` (CPU only), replaces it."""
     name = os.name if os_name is None else os_name
     env = dict(os.environ if base_env is None else base_env)
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else env.get("CUDA_VISIBLE_DEVICES", "0")
     env["NGL"] = str(_resolve_ngl(ngl, base_env))
     env["MAXTOK"] = str(maxtok)
 
@@ -226,7 +228,7 @@ def _replace_request_file(req_path, req):
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
-    def __init__(self, gguf, gpu="0", maxtok=0, server_bin=None, req_path=None, ngl=None):
+    def __init__(self, gguf, gpu=None, maxtok=0, server_bin=None, req_path=None, ngl=None):
         self.gguf = gguf
         self.server_bin = _resolve_bin(server_bin)
         self.maxtok_req = int(maxtok)
@@ -429,7 +431,7 @@ if __name__ == "__main__":
     gguf = sys.argv[1] if len(sys.argv) > 1 else "diffusion-gemma-Q8_0.gguf"
     prompt = sys.argv[2] if len(sys.argv) > 2 else "In one sentence, what is a transformer in ML?"
     blocks = int(sys.argv[3]) if len(sys.argv) > 3 else 2
-    srv = VisualServer(gguf, gpu=os.environ.get("DG_GPU", "0"))
+    srv = VisualServer(gguf, gpu=os.environ.get("DG_GPU"))
     print("visual server ready, n_vocab=", srv.n_vocab, flush=True)
     n_frames = [0]
 

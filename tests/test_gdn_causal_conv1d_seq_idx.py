@@ -228,30 +228,39 @@ def test_hub_wrapper_forwards_seq_idx(monkeypatch):
     if original is None:
         pytest.skip("transformers without use_kernel_func_from_hub_with_fallback")
     original = original.__wrapped__ if getattr(original, gcc._HUB_MARK, False) else original
+    import transformers.integrations as integrations
+    # Start unpatched (a CUDA host patched it at import), then patch as the product does.
+    monkeypatch.setattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", original)
+    monkeypatch.setattr(integrations, "use_kernel_func_from_hub_with_fallback", original)
     monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
+    patched = gcc._patch_hub_decorator()
     seen = []
+    any_conv = gcc._causal_conv1d_any
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("seq_idx", args[4] if len(args) > 4 else None))
+        return any_conv(*args, **kwargs)
+
+    monkeypatch.setattr(gcc, "_causal_conv1d_any", spy)
 
     def causal_conv1d_fn(hidden_states, weight, bias = None, activation = None, **kwargs):
         return gcc.causal_conv1d_reference(hidden_states, weight, bias, activation)
 
     causal_conv1d_fn.__module__ = "transformers.models.qwen3_5.modeling_qwen3_5"
-    dispatch = gcc._make_hub_dispatch(causal_conv1d_fn)
-
-    def spy(*args, seq_idx = None, **kwargs):
-        seen.append(seq_idx)
-        return dispatch(*args, seq_idx = seq_idx, **kwargs)
-
-    spy.__signature__ = inspect.signature(dispatch)
-    hub_fn = original("causal_conv1d_fn", "causal_conv1d")(spy)
+    # transformers >= 5.20 raises on seq_idx in its own torch path without causal-conv1d.
+    hub_fn = patched("causal_conv1d_fn", "causal_conv1d")(causal_conv1d_fn)
+    assert gcc._is_marked(hub_fn)
+    assert "seq_idx" in inspect.signature(hub_fn).parameters
     x, w = torch.randn(1, 8, 6, dtype = torch.float64), torch.randn(8, 4, dtype = torch.float64)
     seq_idx = _seq_idx_from_lengths([[2, 4]])
-    hub_fn(x, w, None, activation = "silu", seq_idx = seq_idx, cu_seq_lens_q = None, position_ids = None)
+    out = hub_fn(x, w, None, activation = "silu", seq_idx = seq_idx, cu_seq_lens_q = None, position_ids = None)
     assert seen and seen[-1] is seq_idx
-    hub_fn = original("causal_conv1d_fn", "causal_conv1d")(dispatch)
+    torch.testing.assert_close(out, _per_document(x, w, None, "silu", seq_idx))
     torch.testing.assert_close(
         hub_fn(x, w, None, activation = "silu", seq_idx = seq_idx, max_length_q = 4),
         _per_document(x, w, None, "silu", seq_idx),
     )
+    torch.testing.assert_close(hub_fn(x, w, None, activation = "silu"), causal_conv1d_fn(x, w, None, "silu"))
 
 
 def _wide_ids(lengths, labels, dtype, device):

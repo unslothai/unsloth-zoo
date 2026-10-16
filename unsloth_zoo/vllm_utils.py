@@ -3495,6 +3495,89 @@ def _patch_vllm_replayssm_gdn():
     return _widen_vllm_replayssm_capability(GDN_REPLAYSSM_ARCHITECTURES)
 
 
+def _vllm_suffix_decoding_config():
+    # UNSLOTH_VLLM_SUFFIX_DECODING=1, or a JSON object of extra speculative_config keys
+    # (e.g. {"num_speculative_tokens": 16}). None when unset; raises when vLLM cannot run it.
+    value = os.environ.get("UNSLOTH_VLLM_SUFFIX_DECODING", "").strip()
+    if value.lower() in ("", "0", "false", "off", "no"):
+        return None
+    extra = {}
+    if value.startswith("{"):
+        try:
+            extra = json.loads(value)
+        except ValueError as error:
+            raise ValueError(f"Unsloth: UNSLOTH_VLLM_SUFFIX_DECODING is not valid JSON: {error}")
+        if not isinstance(extra, dict):
+            raise ValueError("Unsloth: UNSLOTH_VLLM_SUFFIX_DECODING must be 1 or a JSON object.")
+    elif value.lower() not in ("1", "true", "on", "yes"):
+        raise ValueError(f"Unsloth: UNSLOTH_VLLM_SUFFIX_DECODING={value!r} must be 1 or a JSON object.")
+
+    installed = globals().get("vllm_version", "not installed")
+    try:
+        from typing import get_args
+        from vllm.config.speculative import SpeculativeMethod
+        supported = "suffix" in get_args(SpeculativeMethod)
+    except Exception:
+        supported = False
+    if not supported:
+        raise RuntimeError(
+            f"Unsloth: suffix decoding needs vLLM >= 0.11.1 (speculative method 'suffix'), but found "
+            f"vLLM {installed}. Upgrade vLLM or unset UNSLOTH_VLLM_SUFFIX_DECODING."
+        )
+    if importlib.util.find_spec("arctic_inference") is None:
+        raise RuntimeError(
+            "Unsloth: suffix decoding needs the Arctic Inference package. Install it with "
+            "`pip install arctic-inference` (vLLM suggests arctic-inference==0.1.1), or unset "
+            "UNSLOTH_VLLM_SUFFIX_DECODING."
+        )
+    return {**extra, "method": "suffix"}
+
+
+def _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config):
+    # vLLM with LoRA + speculation refuses max_num_batched_tokens < max_num_seqs * (k + 1)
+    # (EngineArgs.create_engine_config). Suffix decoding defaults k to its tree depth (24).
+    k = speculative_config.get("num_speculative_tokens")
+    if k is None:
+        k = speculative_config.get("suffix_decoding_max_tree_depth", 24)
+    return min(int(max_num_seqs), max(int(max_num_batched_tokens) // (int(k) + 1), 1))
+
+
+def _shrink_for_memory_retry(max_num_seqs, max_num_batched_tokens, max_seq_length, speculative_config = None):
+    # Memory retry: 3/4 of the sequences, tokens capped at a full batch of them, then refit the
+    # LoRA + speculation lower bound the shrink can break.
+    max_num_seqs = max(int(max_num_seqs * 0.75), 1)
+    max_num_batched_tokens = min(max_num_batched_tokens, max_num_seqs * max_seq_length)
+    if speculative_config is not None:
+        max_num_seqs = _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config)
+    return max_num_seqs, max_num_batched_tokens
+
+
+def _fp32_lm_head_requested():
+    return os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _vllm_supports_fp32_lm_head():
+    # Generation models honour hf_overrides head_dtype from vLLM 0.26.0 (LogitsProcessor._apply_head);
+    # older versions silently ignore it, so detect the method rather than trust the override.
+    try:
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    except Exception:
+        return False
+    return hasattr(LogitsProcessor, "_apply_head")
+
+
+def _vllm_fp32_lm_head_overrides(training):
+    # Raises rather than half-applying: the trainer reads the same flag, and only both sides in fp32 pays off.
+    if not training or not _fp32_lm_head_requested():
+        return {}
+    if not _vllm_supports_fp32_lm_head():
+        raise RuntimeError(
+            f"Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 needs vLLM >= 0.26.0 for an fp32 lm_head, "
+            f"but found vLLM {vllm_version}. Upgrade vLLM or unset UNSLOTH_VLLM_FP32_LM_HEAD."
+        )
+    return {"head_dtype": "float32"}
+
+
 def _vllm_replayssm_mode():
     # "auto" (unset), "on" or "off".
     value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
@@ -4327,6 +4410,9 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
+        if not use_async and not use_engine:
+            from .routing_replay import routing_replay_engine_args
+            engine_args.update(routing_replay_engine_args(config))
         if fp8_moe is not None:
             # Only the Triton FP8 MoE kernel keeps the expert layout training aliases.
             engine_args["moe_backend"] = "triton"
@@ -4403,6 +4489,28 @@ def load_vllm(
             if native_max and original_max and factor and native_max < max_seq_length <= original_max * factor:
                 rope_overrides["max_position_embeddings"] = max_seq_length
             engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **rope_overrides}
+
+        # return_args callers (SyntheticDataKit's `vllm serve`) turn every value into a CLI flag with
+        # str(), and vLLM parses --speculative-config as JSON, so a dict here kills the server.
+        suffix_config = None if return_args else _vllm_suffix_decoding_config()
+        if suffix_config is not None:
+            engine_args["speculative_config"] = suffix_config
+            if enable_lora:
+                fitted_max_num_seqs = _fit_max_num_seqs_to_speculation(
+                    engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], suffix_config,
+                )
+                if fitted_max_num_seqs < engine_args["max_num_seqs"]:
+                    print(
+                        f"Unsloth: Lowering vLLM max_num_seqs from {engine_args['max_num_seqs']} to "
+                        f"{fitted_max_num_seqs} so LoRA fits the suffix decoding lookahead."
+                    )
+                    approx_max_num_seqs = fitted_max_num_seqs
+                    engine_args["max_num_seqs"] = fitted_max_num_seqs
+            print(f"Unsloth: vLLM uses suffix decoding for generation with speculative_config = {suffix_config}.")
+        fp32_head_overrides = _vllm_fp32_lm_head_overrides(training)
+        if fp32_head_overrides:
+            engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **fp32_head_overrides}
+            print("Unsloth: vLLM computes rollout logits with an fp32 lm_head (UNSLOTH_VLLM_FP32_LM_HEAD=1).")
 
         # Pin the backend for the worker, which the sys.modules block only reaches under
         # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is
@@ -4580,9 +4688,11 @@ def load_vllm(
                     raise RuntimeError(error)
 
                 if "gpu_memory_utilization" in error or "memory" in error:
-                    approx_max_num_seqs = max(int(approx_max_num_seqs * 0.75), 1)
+                    approx_max_num_seqs, max_num_batched_tokens = _shrink_for_memory_retry(
+                        approx_max_num_seqs, max_num_batched_tokens, max_seq_length,
+                        engine_args.get("speculative_config") if enable_lora else None,
+                    )
                     engine_args["max_num_seqs"] = approx_max_num_seqs
-                    max_num_batched_tokens = min(max_num_batched_tokens, approx_max_num_seqs * max_seq_length)
                     engine_args["max_num_batched_tokens"] = max_num_batched_tokens
                     engine_args["gpu_memory_utilization"] *= 0.85
                     print(
@@ -4620,6 +4730,9 @@ def load_vllm(
         pass
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
         llm.approx_max_num_seqs = approx_max_num_seqs
+        if engine_args.get("enable_return_routed_experts", False):
+            from .routing_replay import wrap_vllm_generate
+            wrap_vllm_generate(llm)
         if _merged_rollout_enabled():
             llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)

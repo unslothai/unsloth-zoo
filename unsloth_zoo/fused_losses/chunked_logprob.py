@@ -35,7 +35,7 @@ import os
 import torch
 from typing import Optional
 
-from unsloth_zoo.temporary_patches.common import torch_compile_options
+from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, torch_compile_options
 
 
 def _env_float(name, default):
@@ -55,12 +55,9 @@ _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 def _default_chunk_gb(device = None):
     # Half the head device's free memory, read once per device, as the fused CE it replaces does.
     try:
-        if device is not None and device.type == "cuda" and torch.cuda.is_available():
-            free = torch.cuda.mem_get_info(device)[0] / 1024**3 * 0.5
-        else:
-            from unsloth_zoo.tiled_mlp import _default_target_gb
+        from unsloth_zoo.tiled_mlp import _default_target_gb
 
-            free = float(_default_target_gb())
+        free = float(_default_target_gb(device))
     except Exception:
         return _CHUNK_GB
     return min(_CHUNK_GB, free) if free > 0 else _CHUNK_GB
@@ -75,6 +72,10 @@ def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None, device = N
     rows = int(target_gb * (1024**3) / (max(int(vocab_size), 1) * _BYTES_PER_LOGIT))
     if n_rows is not None:
         rows = min(rows, max(_MIN_ROWS, -(-int(n_rows) // 8)))
+    # UNSLOTH_CE_CHUNK_ALIGN=1: whole 128-row tiles, as chunk_row_bounds does, unless that shrinks a chunk by > 1/4.
+    aligned = (rows // CHUNK_ALIGN_ROWS) * CHUNK_ALIGN_ROWS if CHUNK_ALIGN_ROWS > 1 else 0
+    if aligned and 4 * aligned >= 3 * rows:
+        rows = aligned
     return max(rows, 2)
 
 
@@ -381,6 +382,7 @@ def unsloth_chunked_ce_loss(
     hidden_states, lm_head_weight, lm_head_bias, labels, mask = None, n_items = None, scaling = None,
     shift_labels = True, ignore_index = -100, logit_scale_multiply = 0.0, logit_scale_divide = 0.0,
     logit_softcapping = 0.0, rows_per_chunk = None,
+    target_gb = None,
 ):
     """Drop-in for the chunked fused CE (same shift / mask / n_items / scaling contract), scoring only labelled rows.
     A zero `scaling` stores unscaled gradients, so a collapsed GradScaler gives zeros rather than 0 * inf."""
@@ -405,7 +407,9 @@ def unsloth_chunked_ce_loss(
     # Unlabelled rows (prompts in completion-only training) never reach the head.
     hidden = hidden[keep.to(hidden.device)].to(device)
     if rows_per_chunk is None:
-        rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0], n_rows = hidden.shape[0], device = device)
+        rows_per_chunk = chunked_logprob_rows(
+            lm_head_weight.shape[0], target_gb = target_gb, n_rows = hidden.shape[0], device = device
+        )
     return UnslothChunkedCE.apply(
         hidden, lm_head_weight, lm_head_bias, labels[keep], divisor, float(scaling or 1.0),
         int(rows_per_chunk), float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0),

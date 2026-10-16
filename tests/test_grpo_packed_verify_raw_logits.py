@@ -82,7 +82,7 @@ def _packed_block_source():
     return textwrap.dedent(src[start:end])
 
 
-def _run_packed_block(hidden_states = False):
+def _run_packed_block(hidden_states = False, need_entropy = False):
     """Exec the real packed + verify block and hand back its locals."""
     model = _Model(hidden_states = hidden_states)
     lm_head = model.head.weight                       # [vocab, hidden]
@@ -119,6 +119,13 @@ def _run_packed_block(hidden_states = False):
         "_pg_skip_pack": False,
         "logit_scale_multiply": 0.0, "logit_scale_divide": 0.0,
         "logit_softcapping": 0.0, "temperature": 1.0,
+        "_need_entropy": need_entropy,
+        "_hidden_logps_and_entropies": lambda h, ids, chunks: rr.chunked_hidden_states_selective_log_softmax_recompute(
+            h, lm_head, ids, chunks, return_entropy = True,
+        ),
+        "_raw_logits_entropies": lambda logits: -(
+            torch.log_softmax(logits.float(), -1).exp() * torch.log_softmax(logits.float(), -1)
+        ).sum(-1),
     }
     exec(_packed_block_source(), ns)
     return ns, model, input_ids, max_left_pad
@@ -168,6 +175,30 @@ def test_verified_packed_result_matches_the_per_row_logprobs(hidden_states):
     ref = _reference_logprobs(model, input_ids, max_left_pad)
     got = ns["_pack_result"].detach().float()
     assert torch.allclose(got * mask, ref * mask, atol = 1e-5), (got * mask, ref * mask)
+
+
+@pytest.mark.parametrize("hidden_states", [False, True])
+def test_packed_entropies_match_the_per_row_entropies(hidden_states):
+    ns, model, input_ids, max_left_pad = _run_packed_block(hidden_states = hidden_states, need_entropy = True)
+    if not ns["_pack_use"]:
+        pytest.fail("packed path rejected; nothing to compare")
+    width = KEEP + max_left_pad
+    mask = rr.create_completion_attention_mask(
+        input_ids[:, -width:], rr.calculate_pad_tokens_in_prompt(input_ids, KEEP, PAD_ID), max_left_pad, PAD_ID,
+    ).float()
+    ref = torch.zeros(input_ids.shape[0], L)
+    for row in range(input_ids.shape[0]):
+        cols = (input_ids[row] != PAD_ID).nonzero(as_tuple = False).squeeze(1)
+        real = input_ids[row][cols].unsqueeze(0)
+        with torch.no_grad():
+            out_ = model(input_ids = real).logits.float()
+            if model.hidden_states: out_ = out_ @ model.head.weight.t().float()
+            log_p = torch.log_softmax(out_, dim = -1)[0]
+        for j in range(1, real.shape[1]):
+            ref[row, cols[j]] = -(log_p[j - 1].exp() * log_p[j - 1]).sum()
+    got = ns["_pack_entropies"].detach().float()
+    assert torch.allclose(got * mask, ref[:, -width:] * mask, atol = 1e-5), (got * mask, ref[:, -width:] * mask)
+    torch.testing.assert_close(ns["_pack_result"].detach().float() * mask, _reference_logprobs(model, input_ids, max_left_pad) * mask, atol = 1e-5, rtol = 0)
 
 
 if __name__ == "__main__":

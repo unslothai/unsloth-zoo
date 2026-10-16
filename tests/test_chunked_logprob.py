@@ -239,7 +239,7 @@ def test_default_chunk_budget_shrinks_with_free_memory(monkeypatch):
     import unsloth_zoo.tiled_mlp as tm
 
     for free, want in ((0.25, 0.25), (64.0, cl._CHUNK_GB)):
-        monkeypatch.setattr(tm, "_default_target_gb", lambda free = free: free)
+        monkeypatch.setattr(tm, "_default_target_gb", lambda device = None, free = free: free)
         cl._default_chunk_gb.cache_clear()
         assert cl._default_chunk_gb() == want
         assert cl.chunked_logprob_rows(1000) == cl.chunked_logprob_rows(1000, target_gb = want)
@@ -247,9 +247,10 @@ def test_default_chunk_budget_shrinks_with_free_memory(monkeypatch):
 
 
 def test_chunk_budget_reads_the_head_device(monkeypatch):
+    import unsloth_zoo.tiled_mlp as tm
+
     seen = []
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda d: seen.append(d) or (int(0.5 * 1024**3), 0))
+    monkeypatch.setattr(tm, "_default_target_gb", lambda device = None: seen.append(device) or 0.25)
     cl._default_chunk_gb.cache_clear()
     dev = torch.device("cuda", 1)
     assert cl._default_chunk_gb(dev) == 0.25 and seen == [dev]
@@ -282,3 +283,20 @@ def test_half_trainable_head_gradient_keeps_its_dtype():
     torch.log_softmax(hd.bfloat16().double() @ wd.t(), -1).gather(-1, targets[:, None]).sum().backward()
     assert head.grad.dtype == torch.bfloat16
     torch.testing.assert_close(head.grad.double(), wd.grad, rtol = 3e-2, atol = 3e-2)
+
+
+def test_rows_honour_the_opt_in_128_row_alignment(monkeypatch):
+    monkeypatch.setattr(cl, "CHUNK_ALIGN_ROWS", 128)
+    assert cl.chunked_logprob_rows(1000, target_gb = 1.0, n_rows = 8 * 700) == 640
+    assert cl.chunked_logprob_rows(1000, target_gb = 1.0, n_rows = 8 * 150) == 512
+    monkeypatch.setattr(cl, "CHUNK_ALIGN_ROWS", 0)
+    assert cl.chunked_logprob_rows(1000, target_gb = 1.0, n_rows = 8 * 700) == 700
+
+
+@pytest.mark.parametrize("extra", [{"support_top_k": 4}, {"support_top_p": 0.9}, {"fp32_lm_head": True}])
+def test_grpo_route_hands_support_and_fp32_head_calls_to_the_old_function(monkeypatch, extra):
+    seen = []
+    monkeypatch.setattr(rr, "chunked_hidden_states_selective_log_softmax", lambda *a, **k: seen.append(k) or "old")
+    hidden = torch.randn(1, 4, 8, requires_grad = True)
+    out = rr.grpo_chunked_hidden_states_logprobs(hidden, torch.randn(16, 8), torch.randint(0, 16, (1, 4)), **extra)
+    assert out == "old" and all(seen[0][k] == v for k, v in extra.items())

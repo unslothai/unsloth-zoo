@@ -319,8 +319,12 @@ def test_probes_pay_their_measured_regret_within_the_budget():
 
 
 def test_only_the_verify_forward_is_built_as_a_verify_block():
-    from unsloth_zoo.mlx import inference
+    import importlib
     from unsloth_zoo.mlx.speculative import SpeculativeEngine
+
+    # The module _verify's `from .inference import` resolves, i.e. sys.modules. The package
+    # attribute can be a stale copy after the shim tests purge and restore unsloth_zoo.mlx.
+    inference = importlib.import_module("unsloth_zoo.mlx.inference")
 
     marked = lambda: getattr(inference._VERIFY_STATE, "attention", False)
     engine, seen = object.__new__(SpeculativeEngine), []

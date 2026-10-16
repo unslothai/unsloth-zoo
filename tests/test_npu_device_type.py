@@ -85,7 +85,7 @@ if vu is not None:
     vu._device_empty_cache()
 gc.reset_unsloth_gradient_checkpointing_buffers()
 print("CACHE", calls.count("empty_cache") - before)
-print("GC", len(gc.GPU_BUFFERS), gc.GPU_BUFFERS[0].dtype, gc.MAIN_STREAMS, gc.EXTRA_STREAMS, amp)
+print("GC", len(gc.GPU_BUFFERS), gc.GPU_BUFFERS[0].dtype, gc.MAIN_STREAMS[0], gc.EXTRA_STREAMS[0], amp)
 """
 
 _CELLS = ("cuda", "hip", "xpu", "npu", "xpu+npu", "none")
@@ -146,7 +146,7 @@ def test_npu_skips_the_cuda_flashinfer_setup(answers):
 
 
 def test_npu_gradient_checkpointing_initializes(answers):
-    assert answers.get("gc") == "1 torch.bfloat16 ('main',) (('stream', 0),) npu", answers["stderr"]
+    assert answers.get("gc") == "1 torch.bfloat16 main ('stream', 0) npu", answers["stderr"]
 
 
 @pytest.mark.parametrize(
