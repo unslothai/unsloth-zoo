@@ -216,3 +216,31 @@ def test_several_local_ranks_keep_the_split_cap(monkeypatch, gc_module):
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
     assert gc_module._compute_pinned_cap() == 0
     assert not gc_module._reserve_pinned(32 << 20)
+
+
+def test_single_rank_frees_dead_cached_blocks_before_going_pageable(monkeypatch, gc_module):
+    # A grown pinned buffer leaves its old block in torch's host cache. When RAM runs short
+    # those blocks are returned to the OS first, so they do not sit beside the pageable copies.
+    gib = 1 << 30
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
+    host = _fake_host(monkeypatch, total_gib = 8, available_gib = 3)
+    half = gib // 2
+    assert gc_module._reserve_pinned(half)
+    gc_module._release_pinned(half)                  # 512 MiB block now dead in the host cache
+    emptied = []
+
+    def empty_host_cache():
+        emptied.append(True)
+        host.available += half
+
+    monkeypatch.setattr(torch._C, "_host_emptyCache", empty_host_cache, raising = False)
+    # 1 GiB + 0.8 GiB headroom does not fit in 1.5 GiB, but does once the dead block is freed.
+    host.available = int(1.5 * gib)
+    assert gc_module._reserve_pinned(1 * gib)
+    assert emptied == [True]
+    assert gc_module.GC_PINNED_BYTES == 1 * gib and gc_module._PINNED_CACHED == {}
+    # Nothing cached any more: a block that still does not fit goes pageable without a flush.
+    host.available = int(1.5 * gib)
+    assert not gc_module._reserve_pinned(1 * gib)
+    assert emptied == [True]
