@@ -306,9 +306,14 @@ class Eagle3Drafter(nn.Module):
         position_embeddings = self.rotary_emb(hidden, positions)
         return self.layers[0](embeds, hidden, mask, position_embeddings, cache)
 
-    def forward(self, aux_hidden, input_ids, attention_mask = None, ttt_steps = 3, return_hidden = False):
-        # Distributed wrappers only reduce gradients for calls that go through forward().
-        return self.forward_train(aux_hidden, input_ids, attention_mask, ttt_steps, return_hidden)
+    def forward(self, aux_hidden, input_ids, attention_mask = None, ttt_steps = 3, return_hidden = False,
+                *, loss_kwargs = None):
+        out = self.forward_train(aux_hidden, input_ids, attention_mask, ttt_steps,
+                                 return_hidden = return_hidden or loss_kwargs is not None)
+        if loss_kwargs is not None:
+            # DDP's unused-parameter search must see norm.weight in the returned loss graph.
+            return eagle3_chunked_loss(self, out, **loss_kwargs)
+        return out
 
     def forward_train(self, aux_hidden, input_ids, attention_mask = None, ttt_steps = 3, return_hidden = False):
         """Training-time test over full sequences (speculators `Eagle3DraftModel.forward` after
@@ -673,12 +678,14 @@ class UnslothEagle3Trainer(Trainer):
         loss_mask = (labels[:, 1:] != -100)
         if attention_mask is not None:
             loss_mask = loss_mask & attention_mask[:, 1:].bool()
-        step_hidden = model(aux, input_ids, attention_mask, self.args.eagle3_ttt_steps, return_hidden = True)
         normalizer = None
         if num_items_in_batch is not None:
             normalizer = torch.as_tensor(num_items_in_batch, device = loss_mask.device, dtype = torch.float32).clamp(min = 1)
-        loss, stats = eagle3_chunked_loss(drafter, step_hidden, captured["final"][:, 1:], self._lm_head_weight,
-                                          loss_mask, self.args.eagle3_step_decay, normalizer = normalizer)
+        loss, stats = model(
+            aux, input_ids, attention_mask, self.args.eagle3_ttt_steps,
+            loss_kwargs = dict(final_hidden = captured["final"][:, 1:], lm_head_weight = self._lm_head_weight,
+                               loss_mask = loss_mask, decay = self.args.eagle3_step_decay, normalizer = normalizer),
+        )
         if model.training:
             self._eagle3_log.append(stats)
         loss = loss * token_average_scale(self, num_items_in_batch)

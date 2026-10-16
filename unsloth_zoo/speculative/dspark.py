@@ -312,9 +312,16 @@ class Qwen3DSparkDrafter(nn.Module):
         ctx = ctx & keep[:, q_block][..., None]
         return torch.cat([ctx, own], dim = -1)[:, None]
 
-    def forward(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None):
-        # Wrappers such as DDP only sync gradients for calls that go through forward().
-        return self.forward_train(context, input_ids, loss_mask, num_anchors, generator, anchors)
+    def forward(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None,
+                *, loss_kwargs = None):
+        out = self.forward_train(context, input_ids, loss_mask, num_anchors, generator, anchors)
+        if loss_kwargs is not None:
+            # Include the Markov/confidence heads in DDP's unused-parameter search.
+            teacher_hidden = loss_kwargs.get("teacher_hidden")
+            if teacher_hidden is not None:
+                loss_kwargs = dict(loss_kwargs, teacher_hidden = teacher_hidden.to(out["hidden"].device))
+            return dspark_loss(self, out, **loss_kwargs)
+        return out
 
     def forward_train(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None):
         """Teacher-forced DeepSpec training forward over sampled anchor blocks.
@@ -511,12 +518,14 @@ class UnslothDSparkTrainer(Trainer):
         if -1 in ids:
             captured[-1] = captured.pop("embed")
         dtype = next(p for p in drafter.parameters()).dtype
-        out = model(drafter.context_states(captured).to(dtype), input_ids, loss_mask, self.args.dspark_num_anchors)
-        loss, stats = dspark_loss(
-            drafter, out, teacher_hidden = captured["final"].to(device = out["hidden"].device, dtype = dtype), ce_alpha = self.args.dspark_ce_alpha,
-            l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
-            decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
-            teacher_lm_head_weight = resolve_text_parts(self.target_model)["lm_head"].weight,
+        loss, stats = model(
+            drafter.context_states(captured).to(dtype), input_ids, loss_mask, self.args.dspark_num_anchors,
+            loss_kwargs = dict(
+                teacher_hidden = captured["final"].to(dtype), ce_alpha = self.args.dspark_ce_alpha,
+                l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
+                decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
+                teacher_lm_head_weight = resolve_text_parts(self.target_model)["lm_head"].weight,
+            ),
         )
         if model.training:
             self._dspark_log.append(stats)
