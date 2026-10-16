@@ -274,16 +274,12 @@ def _current_hip_device_index():
 pass
 
 
-def _per_device_cache(function, multi_device = None):
+def _per_device_cache(function, multi_device = False):
     """functools.cache keyed by device index; the no-argument call means the current
     device, so torch.cuda.set_device(1) no longer reuses device 0's answer. Off ROCm or
-    with one visible device the plain C-level cache is exact, so no per-call wrapper."""
+    with one visible device the plain C-level cache is exact, so that is the default and
+    _use_per_device_caches swaps the wrapper in once DEVICE_COUNT is known."""
     cached = functools.cache(function)
-    if multi_device is None:
-        try:
-            multi_device = is_hip() and torch.cuda.device_count() > 1
-        except Exception:
-            multi_device = False
     if not multi_device:
         return cached
     @functools.wraps(function)
@@ -546,6 +542,20 @@ def get_device_count():
 pass
 
 DEVICE_COUNT : int = get_device_count()
+
+_PER_DEVICE_CACHED = ("_detect_gfx_arch", "get_amd_attention_implementation", "get_amd_flash_attn_func")
+
+
+def _use_per_device_caches(device_type, device_count):
+    """Per-device AMD caches only with two or more HIP devices; reuses DEVICE_COUNT, so no
+    extra device probe (UNSLOTH_ZOO_DISABLE_GPU_INIT stays GPU-free)."""
+    if device_type != "hip" or device_count < 2:
+        return False
+    for name in _PER_DEVICE_CACHED:
+        globals()[name] = _per_device_cache(globals()[name].__wrapped__, multi_device = True)
+    return True
+pass
+_use_per_device_caches(DEVICE_TYPE, DEVICE_COUNT)
 
 # Check blocksize for 4bit -> 64 for CUDA, 128 for AMD
 # If AMD, we cannot load pre-quantized models for now :(

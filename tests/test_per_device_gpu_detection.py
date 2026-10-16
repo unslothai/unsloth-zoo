@@ -255,10 +255,7 @@ def test_aiter_choice_follows_set_device(amd_host):
     assert device_type.get_amd_flash_attn_func() is None
 
 
-@pytest.mark.parametrize("hip,count", [(False, 2), (True, 1), (True, 0)])
-def test_single_device_keeps_the_plain_cache(monkeypatch, hip, count):
-    monkeypatch.setattr(device_type, "is_hip", lambda: hip)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
+def test_plain_cache_by_default():
     calls = []
 
     def probe(device = None):
@@ -269,6 +266,17 @@ def test_single_device_keeps_the_plain_cache(monkeypatch, hip, count):
     assert hasattr(cached, "cache_info") and inspect.unwrap(cached) is probe
     assert cached() == cached() == "gfx1151"
     assert calls == [None]
+
+
+@pytest.mark.parametrize("dtype,count,multi", [("hip", 2, True), ("hip", 1, False), ("cuda", 2, False), ("cpu", 0, False)])
+def test_per_device_caches_only_with_two_hip_devices(monkeypatch, dtype, count, multi):
+    for name in _AMD_CACHED:
+        monkeypatch.setattr(device_type, name, getattr(device_type, name))  # restored after the test
+    monkeypatch.setattr(torch.cuda, "device_count", mock.Mock(side_effect = AssertionError("no probe")))
+    assert device_type._use_per_device_caches(dtype, count) is multi
+    for name in _AMD_CACHED:
+        assert hasattr(getattr(device_type, name), "cache_info")
+        assert (getattr(device_type, name).__class__.__name__ == "function") is multi
 
 
 def test_plain_cache_resolves_a_device_argument(monkeypatch):
