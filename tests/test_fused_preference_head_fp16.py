@@ -82,3 +82,21 @@ def test_long_context_keeps_per_chunk_backward(monkeypatch, n_rows, hidden_grad,
     out.sum().backward()
     assert bool(calls) == want_sliced
     assert weight.grad is not None and weight.grad.isfinite().all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_per_chunk_head_grad_does_not_overflow_fp16(monkeypatch, device):
+    # Rows past about twice the vocab take the per chunk loop; its head GEMM must not round each
+    # chunk to fp16 either, or +inf and -inf chunks sum to NaN.
+    monkeypatch.setattr(module, "_target_chunk_bytes", lambda: 1024)  # 4 rows per chunk
+    calls = []
+    real = module._sliced_backward
+    monkeypatch.setattr(module, "_sliced_backward", lambda *a: calls.append(1) or real(*a))
+    hidden = torch.full((1, 40, 8), 1.5, device = device, dtype = torch.float16)
+    weight = torch.zeros((16, 8), device = device, dtype = torch.float16)
+    sign = torch.tensor([1.0] * 4 + [-1.0] * 4, device = device).repeat(5)
+    upstream = (32768.0 * sign).unsqueeze(0)
+    _, grad_hidden, grad_weight = _run(hidden, weight, upstream)
+    assert not calls
+    assert grad_weight.isfinite().all()
+    assert grad_hidden.isfinite().all()

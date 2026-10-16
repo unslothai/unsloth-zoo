@@ -260,7 +260,9 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
                 if need_hidden:
                     grad_hidden[start:end] = (grad_logits @ weight).to(device = hidden.device, dtype = hidden.dtype)
                 if need_weight:
-                    grad_weight.add_((grad_logits.t() @ chunk_hidden).to(acc_dtype))
+                    # Opposite signed row chunks overflow an fp16 product before they cancel here.
+                    grad_weight.add_(_mm_float32(grad_logits.t(), chunk_hidden) if weight.dtype in _HALF_DTYPES
+                                     else (grad_logits.t() @ chunk_hidden).to(acc_dtype))
                 del grad_logits
         if grad_weight is not None:
             grad_weight = grad_weight.to(weight.dtype)
