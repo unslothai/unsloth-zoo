@@ -139,10 +139,12 @@ def test_real_checkpoint_spellings():
 def test_expert_pack_round_trip():
     head = build_nextn_head(_glm_config())
     module = head.state_dict()
+    # transformers < 5 keeps experts as a ModuleList of per-expert Linears: nothing to pack.
+    packed_layout = "heads.0.block.0.mlp.experts.gate_up_proj" in module
     per_expert = unpack_experts(module, ["heads.0.block.0.mlp.experts"])
     assert "heads.0.block.0.mlp.experts.3.gate_proj.weight" in per_expert
     packed, prefixes = pack_experts(per_expert, module)
-    assert prefixes == ["heads.0.block.0.mlp.experts"]
+    assert prefixes == (["heads.0.block.0.mlp.experts"] if packed_layout else [])
     assert set(packed) == set(module)
     assert all(torch.equal(packed[k], module[k]) for k in module)
 

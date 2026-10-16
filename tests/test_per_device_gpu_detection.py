@@ -178,14 +178,16 @@ def test_tiled_mlp_reads_the_activation_device():
     device = torch.device("cuda", 1)
     with mock.patch.object(tiled_mlp, "DEVICE_TYPE", "cuda"), mock.patch.object(torch, "cuda", fake):
         tiled_mlp._default_target_gb(device)
-    assert fake.mem_get_info.call_args.args == (device,)
+    assert fake.mem_get_info.call_args.args in ((device,), (1,))  # the device or its index
 
 
 def test_fused_ce_budget_reads_the_head_device_per_device():
     from unsloth_zoo.fused_losses import cross_entropy_loss as ce
     fake = _fake_cuda()
     free = {0: 40 * 1024 ** 3, 1: 2 * 1024 ** 3}
-    fake.mem_get_info.side_effect = lambda device = None: (free[getattr(device, "index", 0) or 0], 0)
+    fake.mem_get_info.side_effect = lambda device = None: (
+        free[device if isinstance(device, int) else (getattr(device, "index", 0) or 0)], 0
+    )
     ce._get_chunk_multiplier.cache_clear()
     try:
         with mock.patch.object(tiled_mlp, "DEVICE_TYPE", "cuda"), mock.patch.object(torch, "cuda", fake):

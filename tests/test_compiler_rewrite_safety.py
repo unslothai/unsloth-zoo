@@ -214,7 +214,10 @@ def _route_frozen_head(source, bias):
         return torch.zeros(())
     ForCausalLMLoss._unsloth_fused_loss = ForCausalLMLoss
 
-    ns = dict(
+    from _compiled_module_names import fused_loss_header_names
+
+    ns = fused_loss_header_names()
+    ns.update(
         torch = torch, os = os, EMPTY_LOGITS = torch.empty(0),
         UNSLOTH_ENABLE_CCE = True, HAS_CUT_CROSS_ENTROPY = True, UNSLOTH_COMPILE_DISABLE = True,
         fused_linear_cross_entropy = fused_linear_cross_entropy,

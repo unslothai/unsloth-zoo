@@ -118,6 +118,31 @@ def test_grpo_kl_clamp_precedes_bias_correction_and_beta(use_bias_correction_kl)
     torch.testing.assert_close(mean_kl, kl.mean())
     torch.testing.assert_close(loss, beta * kl.mean())
 
+@pytest.mark.parametrize("width", [1, 2])
+def test_grpo_mean_kl_skips_masked_rows_for_one_token_completions(width):
+    new = torch.zeros(2, width, dtype=torch.float64, requires_grad=True)
+    ref = torch.full((2, width), 0.5, dtype=torch.float64)
+    mask = torch.zeros(2, width, dtype=torch.long)
+    mask[0] = 1
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, new.detach(), None, torch.zeros(2, width, dtype=torch.long),
+        mask, 0.1, torch.ones(2, dtype=torch.float64),
+    )
+    expected = math.exp(0.5) - 1.0 - 0.5
+    torch.testing.assert_close(mean_kl, torch.tensor(expected, dtype=torch.float64))
+    torch.testing.assert_close(loss, torch.tensor((-1.0 + 0.1 * expected) / 2, dtype=torch.float64))
+
+
+def test_grpo_sequence_level_beta_zero_mean_kl_still_zero():
+    new = torch.zeros(2, 3, requires_grad=True)
+    mask = torch.ones(2, 3, dtype=torch.long)
+    _, _, mean_kl, *_ = rr.grpo_compute_loss(
+        new.detach(), new, new.detach(), None, torch.zeros(2, 3, dtype=torch.long),
+        mask, 0.0, torch.ones(2), importance_sampling_level="sequence",
+    )
+    assert float(mean_kl) == 0.0
+
+
 def test_calculate_pad_tokens_in_prompt_counts_left_pads():
     PAD = 0
     # batch=2, seq_len=6, logits_to_keep=3 -> prompt_section is the
