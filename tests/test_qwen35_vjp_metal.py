@@ -260,7 +260,10 @@ def test_end_to_end_training_step_all_patches():
     # Grads alone prove nothing: upstream's ops path differentiates too.
     assert qlang.gated_delta_update.__name__ == "patched_vlm_gated_delta_update"
 
-    inputs = mx.array([[1, 2, 3, 4, 5, 6]])
+    # Longer than 8 tokens, as text, preference and GRPO batches are (padded to 1 + 32k): from mlx 0.32.4 the
+    # attention VJP refuses a <= 8 row query, which mlx serves with its vector kernel and which
+    # has no logsumexp for the backward pass.
+    inputs = mx.array([list(range(1, 13))])
 
     def loss_fn(m):
         out = m(inputs)
