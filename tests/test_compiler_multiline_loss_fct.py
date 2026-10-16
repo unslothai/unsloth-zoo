@@ -162,8 +162,10 @@ def test_inner_model_logits_are_not_fused():
 
 
 def _granite_loss(source, attention_mask):
+    from _compiled_module_names import fused_loss_header_names
     from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_ce_loss
-    ns = dict(
+    ns = fused_loss_header_names()
+    ns.update(
         torch = torch, nn = torch.nn, os = os, EMPTY_LOGITS = torch.empty(0), UNSLOTH_ENABLE_CCE = False,
         HAS_CUT_CROSS_ENTROPY = False, UNSLOTH_COMPILE_DISABLE = True,
         unsloth_fused_ce_loss = unsloth_fused_ce_loss, __DYNAMO__RECOMPILING__ = None,
