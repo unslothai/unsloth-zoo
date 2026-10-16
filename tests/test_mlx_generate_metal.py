@@ -1409,6 +1409,90 @@ def test_dense_prefill_leaves_a_one_column_output_native(monkeypatch):
     assert not verified
 
 
+_FAILED = "[METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+
+
+def _first_use_checks():
+    from mlx_lm.models.gated_delta import gated_delta_kernel
+    from unsloth_zoo.mlx import inference as I
+
+    rows = lambda *shape: mx.random.normal(shape).astype(mx.bfloat16)
+    delta = (rows(1, 2, 1, 128), rows(1, 2, 1, 128), rows(1, 2, 1, 8), mx.ones((1, 2, 1)), rows(1, 2, 1),
+             mx.zeros((1, 1, 8, 128)))
+    model = _PrefillProjections()
+
+    def dense():
+        with I.dense_prefill_linear(model):
+            return model(rows(1, 2048, 512))
+
+    return {
+        "add_norm": (lambda: I._add_norm_verified(mx.bfloat16, 256), "_ADD_NORM_VERDICTS"),
+        "router": (lambda: I._moe_router_verified(mx.bfloat16, mx.float32, 64, 4, I._QWEN_ROUTING, True), None),
+        "router_shared": (lambda: I._moe_router_shared_verified(mx.bfloat16, 64, 4, True), None),
+        "combine": (lambda: I._moe_combine_verified(mx.bfloat16, 2, 64), None),
+        "gated_delta": (lambda: I._packed_gated_delta_route(gated_delta_kernel, [])(*delta), "_GATED_DELTA_VERDICTS"),
+        "verify": (lambda: I._verify_admitted("key", lambda: rows(2, 4), lambda: rows(2, 4)), "_VERIFY_VERDICTS"),
+        "dense": (dense, "_DENSE_QMM_VERIFIED"),
+    }
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("site", ["add_norm", "router", "router_shared", "combine", "gated_delta", "verify", "dense"])
+def test_a_first_use_mismatch_from_a_failed_command_buffer_raises_instead_of_recording(monkeypatch, site):
+    from unsloth_zoo.mlx import inference
+
+    check, verdicts = _first_use_checks()[site]
+    for cached in (inference._moe_router_verified, inference._moe_router_shared_verified, inference._moe_combine_verified):
+        cached.cache_clear()
+    if verdicts:
+        monkeypatch.setattr(inference, verdicts, {})
+
+    def failed(*_):
+        raise RuntimeError(_FAILED)
+
+    monkeypatch.setattr(mx, "array_equal", lambda *a, **k: mx.array(False))
+    monkeypatch.setattr(mx, "synchronize", failed)
+    with pytest.raises(RuntimeError, match = "Command buffer execution failed"):
+        check()
+    assert not getattr(inference, verdicts) if verdicts else True
+    for cached in (inference._moe_router_verified, inference._moe_router_shared_verified, inference._moe_combine_verified):
+        assert not cached.cache_info().currsize
+        cached.cache_clear()
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("error, raised", [
+    (RuntimeError(_FAILED), True),
+    (ValueError("[eval] Attempting to eval an array during function transformations like compile or vmap"), False),
+    (RuntimeError("[metal::Device] Unable to build metal library from source"), False),
+])
+def test_a_first_use_check_defers_only_what_cannot_evaluate_now(monkeypatch, error, raised):
+    from unsloth_zoo.mlx import inference
+
+    model = _PrefillProjections()
+    x = mx.random.normal((1, 2048, 512)).astype(mx.bfloat16)
+    native = model(x)
+    mx.eval(native)
+
+    def refuse(*_, **__):
+        raise error
+
+    monkeypatch.setattr(mx, "array_equal", refuse)
+    verified = {}
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
+    with inference.dense_prefill_linear(model):
+        if raised:
+            with pytest.raises(RuntimeError, match = "Command buffer execution failed"):
+                model(x)
+        else:
+            outputs = model(x)
+            monkeypatch.undo()
+            assert _same_bits(outputs, native)
+    assert not verified
+
+
 @metal_only
 def test_vlm_cache_materialization_finishes_the_previous_snapshot(monkeypatch):
     from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
