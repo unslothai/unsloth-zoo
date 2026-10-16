@@ -273,3 +273,6 @@ jobs:
       - name: tests/test_mlx_decision_metal.py
         # Typed-decision model logits against a torch reference of laya's DecisionModel.
         run: python -m pytest tests/test_mlx_decision_metal.py -v -rs
+
+      - name: tests/test_mlx_qat.py
+        run: python -m pytest tests/test_mlx_qat.py -v -rs
