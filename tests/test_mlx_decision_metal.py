@@ -94,6 +94,10 @@ class _Reference(torch.nn.Module):
         return logits.masked_fill(~marker_mask, -1e4)
 
 
+# A padded evaluation batch takes qmm, a lone record qmv, which mlx 0.32.4 sums in float32.
+_EVAL_REL = 3e-3
+
+
 # 1 and 0 head layers exercise the trimmed last layer alone and the no-head gather.
 @pytest.fixture(scope = "module", params = [2, 1, 0])
 def checkpoint(request, tmp_path_factory):
@@ -749,8 +753,8 @@ def test_clef_trains_decoder_adapters_and_head_at_their_own_rates(clef, encoder_
     trainer.train()
     moved = {name.split(".")[0] for name, value in _parameters(network).items() if not np.array_equal(value, before[name])}
     assert moved == ({"encoder"} if encoder_lr else {"head"}) and network.training
-    assert trainer.state.log_history[0]["loss"] == pytest.approx(first, rel = 1e-3)
-    assert trainer.evaluate()["eval_loss"] == pytest.approx(sum(_clef_record_loss(network, record).item() for record in items) / 3, rel = 1e-3)
+    assert trainer.state.log_history[0]["loss"] == pytest.approx(first, rel = _EVAL_REL)
+    assert trainer.evaluate()["eval_loss"] == pytest.approx(sum(_clef_record_loss(network, record).item() for record in items) / 3, rel = _EVAL_REL)
     assert [len(row) for row in clef_logits(network, items)[0]] == [3, 2]
 
 
@@ -788,7 +792,7 @@ def test_clef_kl_penalty_holds_on_to_the_starting_model_and_fields_are_permuted_
     started = clef_logits(network, [record])[0]
     trainer = MLXDecisionTrainer(network, _config(), [record], [record], kl_weight = 2.0)
     plain = lambda: MLXDecisionTrainer(network, _config(), [record], [record]).evaluate()["eval_loss"]
-    assert trainer.evaluate()["eval_loss"] == pytest.approx(plain(), rel = 1e-3)
+    assert trainer.evaluate()["eval_loss"] == pytest.approx(plain(), rel = _EVAL_REL)
     network.update(tree_map(lambda value: value + 0.3 * mx.random.normal(value.shape).astype(value.dtype), network.trainable_parameters()))
     log = lambda rows: [torch.log_softmax(torch.as_tensor(row), 0) for row in rows]
     kl = sum((ref.exp() * (ref - now)).sum().item() for ref, now in zip(log(started), log(clef_logits(network, [record])[0]))) / 3
@@ -822,7 +826,7 @@ def test_evaluation_weighs_records_alike_and_hands_metrics_logits_and_soft_targe
     config = _config(per_device_eval_batch_size = 1)
     trainer = MLXDecisionTrainer(network, config, items, items, compute_metrics = metrics, preprocess_logits_for_metrics = lambda logits, labels: 2 * logits)
     got, want = trainer.evaluate(), [_clef_record_loss(network, item).item() / len(item["targets"]) for item in items]
-    assert got["eval_loss"] == pytest.approx(sum(want) / 2, rel = 1e-3) and got["eval_width"] == 3 and "eval_hits" in got and got["eval_runtime"] > 0
+    assert got["eval_loss"] == pytest.approx(sum(want) / 2, rel = _EVAL_REL) and got["eval_width"] == 3 and "eval_hits" in got and got["eval_runtime"] > 0
     logits, flat = seen[0].predictions, [row for rows in clef_logits(network, items) for row in rows]
     np.testing.assert_allclose(seen[0].label_ids, [[0.0, 0.25, 0.75], [1.0, 0.0, 0.0], [1.0, 0.0, -100.0]])
     np.testing.assert_allclose(logits[1, :2], 2 * flat[1], rtol = 2e-3)
@@ -830,7 +834,7 @@ def test_evaluation_weighs_records_alike_and_hands_metrics_logits_and_soft_targe
     assert logits[1, 2] == -2e4 and logits[2, 2] == -100 and logits.shape == (3, 3)
     told = SimpleNamespace(on_predict = lambda *_, metrics, **__: seen.append(metrics))
     output = MLXDecisionTrainer(network, config, items, callbacks = [told], preprocess_logits_for_metrics = lambda logits, labels: logits.argmax(-1)).predict(items)
-    assert seen[-1] is output.metrics and output.metrics["test_loss"] == pytest.approx(sum(want) / 2, rel = 1e-3) and output.predictions.shape == (3,) and output.label_ids.shape == (3, 3) and trainer.evaluate(items[1:], "held")["held_loss"] == pytest.approx(want[1], rel = 1e-3)
+    assert seen[-1] is output.metrics and output.metrics["test_loss"] == pytest.approx(sum(want) / 2, rel = _EVAL_REL) and output.predictions.shape == (3,) and output.label_ids.shape == (3, 3) and trainer.evaluate(items[1:], "held")["held_loss"] == pytest.approx(want[1], rel = _EVAL_REL)
 
 
 def test_trainer_follows_the_evaluation_and_logging_schedule_it_is_given(checkpoint):
@@ -845,7 +849,7 @@ def test_trainer_follows_the_evaluation_and_logging_schedule_it_is_given(checkpo
     evaluated = [log for log in history if "eval_loss" in log]
     assert [log["step"] for log in evaluated] == [4, 5][: 1 + _default_flow_evaluates_final_step()] and [log["step"] for log in history if "learning_rate" in log] == [2, 4, 5]
     model.eval()
-    assert evaluated[-1]["eval_loss"] == pytest.approx(_soft_cross_entropy(model, collate_decisions(_items(), 0), (0.2, 0.0, 0.0)).item(), rel = 1e-3)
+    assert evaluated[-1]["eval_loss"] == pytest.approx(_soft_cross_entropy(model, collate_decisions(_items(), 0), (0.2, 0.0, 0.0)).item(), rel = _EVAL_REL)
     args = _config(logging_steps = 5)
     args.dataloader_drop_last, args.logging_first_step, args.eval_strategy = True, True, "no"
     trainer = MLXDecisionTrainer(model, args, _items()[:5], _items())
@@ -941,7 +945,7 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
     head = mx.load(str(out / "joint_head.safetensors"))
     assert {str(value.dtype).rsplit(".", 1)[-1] for value in head.values() if value.ndim} == {"bfloat16"} and head["residual_gate"].dtype == mx.float32
     pipeline.head = _load_joint_head(out)
-    np.testing.assert_allclose(np.array(pipeline.logits(*args)), before / 2, atol = 3e-2)
+    np.testing.assert_allclose(np.array(pipeline.logits(*args)), before / 2, atol = 5e-2)
     config = json.loads((out / "unsloth_decision_config.json").read_text())
     assert config["folded_temperature"] == 2.0 and "head_temperature" not in config and config["fine_tuned"] is True
     assert load_decision_model(out).temperatures == {"choice": 1.0, "score": 1.0, "noul": 5.0}

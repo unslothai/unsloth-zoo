@@ -6929,7 +6929,8 @@ class MLXTrainer:
             # Carried as state across loop iterations, or reduced eagerly
             # outside mx.compile under DDP.
             grad = tree_map(mx.stop_gradient, grad)
-            toks_f = mx.stop_gradient(toks_f)
+            # Not stop_gradient: mlx 0.32.4's compile drops one whose input has an equal twin, as this cast does.
+            toks_f = toks_f + 0
             return lvalue, toks, stats, (grad, toks_f)
 
         # Unified step for VLM (dict batch) and text (tuple batch) training.
@@ -6949,7 +6950,7 @@ class MLXTrainer:
                 return lvalue, toks, stats, None, grad_norm
 
             grad = tree_map(mx.stop_gradient, grad)
-            toks_f = mx.stop_gradient(toks_f)
+            toks_f = toks_f + 0  # see _local_grad_step
             return lvalue, toks, stats, (grad, toks_f), None
 
         _compile_decision = getattr(self, "_compile_decision", None)

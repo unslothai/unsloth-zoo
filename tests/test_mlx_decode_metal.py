@@ -676,6 +676,11 @@ def _attention_block(gqa, rows, keys, dtype = mx.bfloat16, heads = 8):
     return queries, buffer[0, ..., :keys, :] * 0.5, buffer[1, ..., :keys, :]
 
 
+def _mlx_vector_launch_fits(simds):
+    # Before M3, MLX 0.32.4's unrolled head-dim-512 vector kernel holds 448 threads per threadgroup.
+    return decode._gpu_generation() >= 15 or 32 * simds <= 448
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("gqa", [4, 8])
 @pytest.mark.parametrize("rows", [2, 3, 5, 8])
@@ -693,10 +698,11 @@ def test_verify_attention_matches_mlx_vector_kernel_and_decode_rows_bitwise(gqa,
             for i in range(rows)], axis = 2))
     monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # MLX's own vector kernel over each launch's rows
     step = decode._launch_simds() // gqa
-    _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
-        queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
-        values[..., : 4500 - rows + min(i + step, rows), :], scale = 1.0, mask = "causal")
-        for i in range(0, rows, step)], axis = 2))
+    if _mlx_vector_launch_fits(gqa * min(step, rows)):
+        _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
+            queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
+            values[..., : 4500 - rows + min(i + step, rows), :], scale = 1.0, mask = "causal")
+            for i in range(0, rows, step)], axis = 2))
     assert not mx.array_equal(out[:, :, :1], out[:, :, 1:2]).item()
 
 
@@ -744,12 +750,14 @@ def test_verify_scope_serves_only_marked_global_blocks_and_restores(monkeypatch)
     native = lambda *args: _attend(gemma4, full, *args, call = gemma4.Attention.__call__)
     with monkeypatch.context() as patch:
         patch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # the native call on MLX's vector kernel
-        vector = native(x)
+        vector = native(x) if _mlx_vector_launch_fits(8 * 3) else None
     with decode.fused_verify_attention(layers):
         assert type(sliding) is gemma4.Attention and type(full) is not gemma4.Attention
         _equal(_attend(gemma4, full, x), native(x))
         with decode.verify_block_attention():
-            _equal(_attend(gemma4, full, x), vector)
+            served = _attend(gemma4, full, x)
+            if vector is not None:
+                _equal(served, vector)
             assert launched == [3]
             # A decode step, an unmasked block, and too few keys for MLX's two-pass kernel stay native.
             for args in [(x[:, :1],), (x, 4096, None), (x, 600)]:

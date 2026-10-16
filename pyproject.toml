@@ -46,7 +46,7 @@ dependencies = [
     # #1081, unsloth #9478), and it reached users through an unattended upgrade
     # because nothing bounded it. Bump these deliberately, after the Apple
     # Silicon lane is green on the new release.
-    "mlx==0.32.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx==0.32.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # GenerationBatch.Response and BatchGenerator.next_generated, which batched
     # generation drives, first ship in mlx-lm 0.31.2. A range, not a pin: 0.32 requires Python 3.11,
     # so Python 3.10 resolves 0.31.3.
@@ -108,7 +108,7 @@ exclude = ["images*", "tests*", "scripts*"]
 mlx = [
     # Keep in sync with the MLX-only dependency pins above, including the reason
     # they are pins.
-    "mlx==0.32.3",
+    "mlx==0.32.4",
     "mlx-lm>=0.31.3,<=0.32.2",
     "mlx-vlm>=0.4.4,<=0.7.8",
 ]

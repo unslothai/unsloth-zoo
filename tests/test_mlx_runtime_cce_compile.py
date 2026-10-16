@@ -680,7 +680,8 @@ def test_label_smoothing_matches_closed_form():
     assert max(float(mx.abs(a - b).max().item()) for a, b in zip(gc, gm)) < 2e-5
 
 
-@pytest.mark.parametrize("quantized, budget_mib", [(True, 12), (False, 88)])
+# mlx 0.32.4 keeps split-K quantized matmul partials in float32: about 13 MiB here, 9 MiB on 0.32.3.
+@pytest.mark.parametrize("quantized, budget_mib", [(True, 16), (False, 88)])
 def test_runtime_cce_backward_peak_memory(quantized, budget_mib):
     _skip_torch_shim()
     if not mx.metal.is_available():

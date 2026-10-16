@@ -313,6 +313,8 @@ def test_wide_verify_blocks_in_slices_match_the_native_verifier(qwen_4bit, monke
     assert len(served) >= len(native) * len(verdicts)
 
 
+@pytest.mark.xfail(tuple(map(int, mx.__version__.split(".")[:3])) >= (0, 32, 4), strict = True,
+                   reason = "mlx-vlm's exact verifier keeps mlx 0.32.3's quantized matvec sums; 0.32.4 sums in float32")
 def test_a_sliced_verify_block_matches_one_token_decode_steps(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference
     (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)
