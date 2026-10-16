@@ -184,8 +184,12 @@ def _grow_host_buffer(buffer, new_size):
 # through 2.13). So GC_PINNED_BYTES charges rounded blocks, a release only moves a block
 # into _PINNED_CACHED (reusable by the next reservation of that size), and it drops only
 # when torch.cuda.host_memory_stats() shows the allocator holding less.
+# A single local rank has no other ranks to leave RAM for, and a refused pin still stores the
+# same bytes pageable, so it only refuses a block that would not fit in the RAM available now.
 GC_PINNED_BYTES = 0
-GC_PINNED_CAP = None        # None = not computed yet, -1 = uncapped
+GC_PINNED_CAP = None        # None = not computed yet, -1 = uncapped, -2 = per block (one rank)
+_PIN_PER_BLOCK = -2
+_PIN_HEADROOM_BYTES = 1 << 30
 _WARNED_ABOUT_PINNED_CAP = False
 _PINNED_CACHED = {}         # rounded block bytes -> count released but still cached
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
@@ -223,9 +227,20 @@ def _compute_pinned_cap():
         vm = psutil.virtual_memory()
     except Exception:
         return -1  # unmeasurable: keep the old uncapped behaviour
+    if _local_world_size() == 1: return _PIN_PER_BLOCK
     reserve = max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
     # Bytes this process already pinned are missing from `available`, so add them back.
     return max(0, vm.available - reserve) // _local_world_size() + GC_PINNED_BYTES
+
+
+def _block_fits_host_ram(block):
+    """One local rank: pin unless the block would leave under min(1 GiB, 10% of RAM) available."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+    except Exception:
+        return True
+    return block + min(_PIN_HEADROOM_BYTES, vm.total // 10) <= vm.available
 
 
 def _storage_bytes(buffer):
@@ -273,7 +288,17 @@ def _reserve_pinned(nbytes):
         if _HOST_HELD_BASELINE is not None:
             # A cached block taken by another pinned user makes our next request a new one.
             used = max(used, held - _HOST_HELD_BASELINE)
-    if GC_PINNED_CAP >= 0 and used + block > GC_PINNED_CAP:
+    if GC_PINNED_CAP == _PIN_PER_BLOCK:
+        if not _block_fits_host_ram(block):
+            if not _WARNED_ABOUT_PINNED_CAP:
+                _WARNED_ABOUT_PINNED_CAP = True
+                print(
+                    "Unsloth: Host RAM is nearly full, so gradient checkpointing offload buffers that "
+                    "do not fit use pageable memory. Training continues; "
+                    "set UNSLOTH_GC_PINNED_MAX_GB to set a fixed pinned cap instead."
+                )
+            return False
+    elif GC_PINNED_CAP >= 0 and used + block > GC_PINNED_CAP:
         if not _WARNED_ABOUT_PINNED_CAP:
             _WARNED_ABOUT_PINNED_CAP = True
             print(

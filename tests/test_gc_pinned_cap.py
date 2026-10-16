@@ -179,3 +179,40 @@ def test_regrowth_within_retained_storage_reserves_nothing(monkeypatch, gc_modul
     grown = gc_module._grow_host_buffer(a, 3000)            # 6000 bytes fit the 8000 storage
     assert grown is a and getattr(grown, gc_module.HOST_PINNED_ATTR)
     assert gc_module.GC_PINNED_BYTES == 8192 and gc_module._PINNED_CACHED == {}
+
+
+def _fake_host(monkeypatch, total_gib, available_gib):
+    gib = 1 << 30
+    host = types.SimpleNamespace(total = int(total_gib * gib), available = int(available_gib * gib))
+    fake = types.SimpleNamespace(virtual_memory = lambda: host)
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake)
+    return host
+
+
+def test_single_rank_low_ram_host_still_pins_what_fits(monkeypatch, gc_module, pin_requests):
+    # 8 GiB host with 3 GiB available: the 4 GiB reserve meant for other ranks must not
+    # force a single process to pageable copies that pinned fine before the cap existed.
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    _fake_host(monkeypatch, total_gib = 8, available_gib = 3)
+    for _ in range(8):
+        gc_module._new_host_buffer(16 << 20, torch.float16)   # 32 MiB each
+    assert pin_requests == [True] * 8
+
+
+def test_single_rank_refuses_a_block_that_does_not_fit_now(monkeypatch, gc_module, pin_requests):
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    gib = 1 << 30
+    host = _fake_host(monkeypatch, total_gib = 12, available_gib = 3)
+    assert gc_module._reserve_pinned(1 * gib)
+    # Available RAM is re-read per new block: the host filled up since the first one.
+    host.available = int(1.5 * gib)
+    assert not gc_module._reserve_pinned(1 * gib)
+    host.available = 4 * gib
+    assert gc_module._reserve_pinned(1 * gib)
+
+
+def test_several_local_ranks_keep_the_split_cap(monkeypatch, gc_module):
+    _fake_host(monkeypatch, total_gib = 8, available_gib = 3)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    assert gc_module._compute_pinned_cap() == 0
+    assert not gc_module._reserve_pinned(32 << 20)
