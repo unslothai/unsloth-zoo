@@ -1095,8 +1095,10 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
 
     if dtype is None:
         if DEVICE_TYPE == "cuda":
-            major_version, minor_version = torch.cuda.get_device_capability()
-            SUPPORTS_BFLOAT16 = (major_version >= 8)
+            # Every visible device, as the HIP probe does: a device_map can put layers
+            # on a pre-Ampere card next to an Ampere device 0.
+            from .device_type import _visible_cuda_capabilities
+            SUPPORTS_BFLOAT16 = all(major >= 8 for major, _ in _visible_cuda_capabilities())
         elif DEVICE_TYPE == "hip":
             # Ask rather than assume: RDNA 1/2 (gfx101x, gfx103x) have no native bf16,
             # so Triton picks a dot intrinsic LLVM cannot lower and the process dies

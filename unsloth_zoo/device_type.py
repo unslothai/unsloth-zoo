@@ -241,20 +241,111 @@ def is_hip():
 pass
 
 
-@functools.cache
-def _detect_gfx_arch():
+def _visible_cuda_capabilities():
+    """(major, minor) of every visible CUDA device, so a gate holds for the weakest card
+    a device_map can use, not just device 0. An unreadable card is skipped; the readable ones
+    include the current device, so a gate is never less strict than before. Matches core's
+    cuda_gate_capabilities, so both pick the same dtype."""
+    capabilities = []
+    try:
+        for index in range(torch.cuda.device_count()):
+            try:
+                capabilities.append(tuple(torch.cuda.get_device_capability(index)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return capabilities or [tuple(torch.cuda.get_device_capability())]
+pass
+
+
+def _current_hip_device_index():
+    """Current HIP device index, or None off ROCm (never touches CUDA on NVIDIA) or when
+    the runtime cannot answer, so the cached probes keep their own fallbacks. No try/except
+    while compiling: get_amd_flash_attn_func runs inside compiled forwards."""
+    if not (is_hip() and torch.cuda.is_available()):
+        return None
+    if torch.compiler.is_compiling():
+        return torch.cuda.current_device()
+    try:
+        return torch.cuda.current_device()
+    except Exception:
+        return None
+pass
+
+
+def _per_device_cache(function):
+    """functools.cache keyed by device index; the no-argument call means the current
+    device, so torch.cuda.set_device(1) no longer reuses device 0's answer."""
+    cached = functools.cache(function)
+    @functools.wraps(function)
+    def wrapper(device = None):
+        if device is not None and not isinstance(device, int):
+            device = torch.device(device).index
+        if device is None:
+            device = _current_hip_device_index()
+        return cached(device)
+    wrapper.cache_clear = cached.cache_clear
+    wrapper.cache_info = cached.cache_info
+    return wrapper
+pass
+
+
+def _visible_gfx_targets(out):
+    """gfx targets in rocminfo / hipconfig output, one per GPU agent (Studio's
+    _list_rocm_gfx_targets): split on agent headers so two same-arch cards stay two."""
+    sections = re.split(r"(?mi)^\s*\*+\s*$\s*agent\s+\d+\s*$|\bdevice\s*#\s*\d+\b", out)
+    if len(sections) > 1:
+        tokens = []
+        for section in sections[1:]:
+            m = re.search(r"gfx[1-9][0-9a-z]{2,3}", section.lower())
+            if m: tokens.append(m.group(0))
+        return tokens
+    return list(dict.fromkeys(re.findall(r"gfx[0-9a-f]+", out.lower())))
+pass
+
+
+def _pick_gfx_target(out, index = None):
+    """The gfx of HIP device ``index`` (default 0) from subprocess output. rocminfo is
+    already ROCR-filtered, so only HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES remap it,
+    as in Studio's _pick_rocm_gfx_target; an unresolvable mask keeps the first GPU."""
+    tokens = _visible_gfx_targets(out)
+    if not tokens:
+        return None
+    index = index or 0
+    for env in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        mask = os.environ.get(env)
+        if mask is None:
+            continue
+        mask = [x.strip() for x in mask.split(",") if x.strip()]
+        if not mask or mask[0] == "-1":
+            return None
+        try:
+            physical = int(mask[index] if index < len(mask) else mask[0])
+            if 0 <= physical < len(tokens):
+                return tokens[physical]
+        except ValueError:
+            pass
+        return tokens[0]
+    return tokens[index] if index < len(tokens) else tokens[0]
+pass
+
+
+@_per_device_cache
+def _detect_gfx_arch(device = None):
     """Return the GPU architecture string (e.g. 'gfx942') or None if undetectable.
 
-    Uses the PyTorch-active device first so that HIP_VISIBLE_DEVICES and multi-arch
-    hosts are handled correctly. Subprocess probes (rocminfo, hipconfig) scan
-    system-wide output and may return a different arch than the active device.
+    ``device`` is a HIP device index; None means the current device (cached per index).
+    Uses the PyTorch device first so that HIP_VISIBLE_DEVICES and multi-arch
+    hosts are handled correctly. Subprocess probes (rocminfo, hipconfig) are
+    mask-mapped to the same device but may still differ on unusual setups.
     """
     import re as _re
-    # Active device first: right arch for the GPU torch is using, and it
+    # PyTorch device first: right arch for the GPU torch is using, and it
     # respects HIP_VISIBLE_DEVICES.
     try:
         if torch.cuda.is_available():
-            dev = torch.cuda.current_device()
+            dev = torch.cuda.current_device() if device is None else device
             arch = torch.cuda.get_device_properties(dev).gcnArchName
             # gcnArchName may include suffixes e.g. "gfx942:sramecc+:xnack-"
             m = _re.match(r"gfx[0-9a-f]+", arch)
@@ -264,26 +355,20 @@ def _detect_gfx_arch():
         pass
     # Subprocess fallbacks for unusual builds where PyTorch cannot query the device.
     import subprocess
-    try:
-        r = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
-        m = _re.search(r"gfx[0-9a-f]+", r.stdout)
-        if m:
-            return m.group(0)
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(["hipconfig", "--full"], capture_output=True, text=True, timeout=10)
-        m = _re.search(r"gfx[0-9a-f]+", r.stdout)
-        if m:
-            return m.group(0)
-    except Exception:
-        pass
+    for command in (["rocminfo"], ["hipconfig", "--full"]):
+        try:
+            r = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            gfx = _pick_gfx_target(r.stdout, device)
+            if gfx:
+                return gfx
+        except Exception:
+            pass
     return None
 pass
 
 
-@functools.cache
-def get_amd_attention_implementation():
+@_per_device_cache
+def get_amd_attention_implementation(device = None):
     """
     Return the best available attention implementation for AMD ROCm.
 
@@ -317,7 +402,7 @@ def get_amd_attention_implementation():
     # aiter's CK/ASM kernels are CDNA-only: gfx942 (MI300X/MI325X) and gfx950
     # (MI355X). flash_attn_func imports on all archs but only runs on these two.
     try:
-        _gfx = _detect_gfx_arch()
+        _gfx = _detect_gfx_arch(device)
         _AITER_SUPPORTED_ARCHS = ("gfx942", "gfx950")  # CDNA3, CDNA4
         if _gfx not in _AITER_SUPPORTED_ARCHS:
             return "sdpa"
@@ -340,8 +425,8 @@ def get_amd_attention_implementation():
     return "sdpa"
 
 
-@functools.cache
-def get_amd_flash_attn_func():
+@_per_device_cache
+def get_amd_flash_attn_func(device = None):
     """
     Return the amd-aiter flash attention function, or None if unavailable.
 
@@ -353,7 +438,7 @@ def get_amd_flash_attn_func():
     Shapes: q/k/v = (batch, seqlen, nheads, headdim), float16 or bfloat16
     Returns: output tensor, same shape as q
     """
-    if get_amd_attention_implementation() != "amd_aiter":
+    if get_amd_attention_implementation(device) != "amd_aiter":
         return None
     try:
         import aiter as _aiter
