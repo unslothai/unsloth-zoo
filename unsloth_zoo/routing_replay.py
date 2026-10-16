@@ -381,8 +381,9 @@ def _recomputed_routes(layer_index, ids2):
     forced_all = torch.stack([c[1] for c in candidates])
     forced = forced_all[pick]
     # Several forwards with the same natural routing but different replays cannot be told
-    # apart, so keep the natural routing there rather than guess.
-    agree = ((forced_all == forced).flatten(1).all(-1) | ~match).all()
+    # apart, so keep the natural routing there rather than guess. Only the expert set counts:
+    # the same experts in another order route and weight every token identically.
+    agree = ((forced_all.sort(-1).values == forced.sort(-1).values).flatten(1).all(-1) | ~match).all()
     valid = torch.stack([c[2] for c in candidates])[pick] & match.any() & agree
     return forced, valid
 

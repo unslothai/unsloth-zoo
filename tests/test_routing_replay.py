@@ -382,6 +382,53 @@ def test_recompute_keeps_natural_routing_when_forwards_are_ambiguous(replay):
     assert bool(ok.all()) and forced.tolist() == [[4, 5], [6, 7]]
 
 
+def test_recompute_accepts_the_same_expert_set_in_another_order(replay):
+    # Two forwards with identical natural routing whose replays hold the same experts in a
+    # different order: the recompute must still replay them, not fall back to natural routing.
+    model = _model()
+    batch = torch.randint(1, 64, (1024, 2), generator = torch.Generator().manual_seed(749))
+    captured = {}
+    handle = model.model.layers[0].mlp.gate.register_forward_hook(
+        lambda m, a, out: captured.__setitem__("ids", out[2].detach().clone())
+    )
+    with torch.no_grad():
+        model(input_ids = batch)
+    handle.remove()
+    routes = captured["ids"].reshape(1024, 2, TOP_K)
+    seen, pair = {}, None
+    for i, route in enumerate(routes):
+        key = tuple(route.sort(-1).values.flatten().tolist())
+        if key in seen and not torch.equal(batch[i], batch[seen[key]]):
+            pair = (seen[key], i)
+            break
+        seen[key] = i
+    assert pair is not None
+    sequences = [batch[i].tolist() for i in pair]
+    forced = torch.tensor([[[4, 5], [4, 5]], [[4, 5], [4, 5]]])  # tokens, layers, top-k
+    forced_rows = [forced, forced.flip(-1)]
+
+    def run(checkpointing):
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        rr.reset_routing_replay()
+        _install(m)
+        rr.record_routed_experts([_request(seq[:1], seq[1:], f.numpy()) for seq, f in zip(sequences, forced_rows)])
+        losses = [m(input_ids = torch.tensor([seq])).logits.float().square().mean() for seq in sequences]
+        if checkpointing:
+            a, b = rr._STATE.pending
+            assert torch.equal(a[0][0], b[0][0]) and not torch.equal(a[0][1], b[0][1])
+        sum(losses).backward()
+        return torch.stack([l.detach() for l in losses]), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    losses_plain, grads_plain = run(False)
+    losses_gc, grads_gc = run(True)
+    torch.testing.assert_close(losses_gc, losses_plain, rtol = 1e-5, atol = 1e-6)
+    for name in grads_plain:
+        torch.testing.assert_close(grads_gc[name], grads_plain[name], rtol = 1e-4, atol = 1e-6, msg = name)
+
+
 @pytest.mark.parametrize("version, expected", [("0.18.0", False), ("0.21.1", False), ("0.22.0", True), ("0.31.0", True)])
 def test_engine_args_need_vllm_022_for_hybrid_attention(replay, monkeypatch, version, expected):
     # vLLM < 0.22 indexes its routed experts capture by physical block in a buffer sized per
