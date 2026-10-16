@@ -669,7 +669,9 @@ _DECODE_STEP_SOURCE = """
         y[n * Dv + d] = static_cast<T>(Multiply()(silu, static_cast<float>(normed)));
     }
 """
-_DECODE_STEP_ROWS = 8  # simdgroups per value head; each carries Dv / 8 state rows
+# Simdgroups per value head; each carries Dv / 16 state rows. Layers run one after another in a decode step, so
+# a few heads per row must fill the GPU: 16 measured up to 18% faster per layer than 8 at <= 64 heads.
+_DECODE_STEP_ROWS = 16
 
 
 @functools.cache
