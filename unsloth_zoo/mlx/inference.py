@@ -4390,12 +4390,8 @@ def fused_verify_attention(model, *, _modules = None):
 
 
 class InferenceScope(NamedTuple):
-    """A scope `inference_scopes` enters, called as `enter(model, _modules = modules)`.
-
-    `serves` holds the call traits it is entered for, any one of which admits it; empty admits every
-    generation. `opt_in` names an environment switch that must be "1" before any caller enters it.
-    `int8_prefill` passes the generation's Int8 Prefill decision as the second argument.
-    """
+    """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
+    `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
     enter: Callable
     serves: frozenset = frozenset()
     opt_in: str = None
@@ -4411,11 +4407,8 @@ class InferenceScope(NamedTuple):
         return call is None or not self.serves or not self.serves.isdisjoint(call)
 
 
-# Every scope a generation holds, outermost first. Registering one here is all a new scope needs to
-# reach generation_mode, the loader's generate wrappers and Unsloth Studio. Exact routes measured faster
-# where they run may be on by default, with their own `=0` kill switch; an inexact scope sets `opt_in`.
-# Call traits: "batch" (rows decode together), "speculative" (drafted tokens are verified in blocks),
-# "vision" (an mlx-vlm generation) and "audio" (audio in the prompt).
+# Outermost first; every generation path (Studio included) enters these. An inexact scope sets `opt_in`.
+# Call traits: "batch", "speculative" (drafts verified in blocks), "vision" (mlx-vlm), "audio".
 INFERENCE_SCOPES = [
     InferenceScope(fused_moe_gate_up),
     InferenceScope(fused_decode_conv_silu),
