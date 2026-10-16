@@ -78,17 +78,22 @@ pass
 # Mirrors vLLM v1 processed_logprobs: renormalised over what survives min_p, then top_k, then top_p
 # (sampler.py `sample`, topk_topp_sampler.py `apply_top_k_top_p`). The scored token is always kept
 # so a boundary disagreement between the trainer's recomputed set and the sampler's stays finite.
-# A scored token tied with the smallest kept logit counts as one of the kept tokens (vLLM keeps an
-# arbitrary subset of a tied run), not as an extra one.
+# A scored token tied with the smallest kept logit but dropped by the sort counts as one of the kept
+# tokens (vLLM keeps an arbitrary subset of a tied run): it takes the place of one kept tied token,
+# so both the value and its gradient are those of a kept token.
 def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p):
-    selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1))
-    keep = _truncated_support_mask(chunk_logits.detach(), top_k, top_p, min_p)
+    index = chunk_index.unsqueeze(-1)
+    selected_logits = torch.gather(chunk_logits, dim = -1, index = index)
+    detached = chunk_logits.detach()
+    keep = _truncated_support_mask(detached, top_k, top_p, min_p)
+    selected_kept = torch.gather(keep, dim = -1, index = index)
+    smallest_kept = detached.masked_fill(~keep, float("inf")).amin(dim = -1, keepdim = True)
+    tied = (~selected_kept) & (selected_logits.detach() == smallest_kept)
+    boundary = (keep & (detached == smallest_kept)).to(torch.int32).argmax(dim = -1, keepdim = True)
+    keep = keep.scatter(-1, boundary, torch.gather(keep, dim = -1, index = boundary) & ~tied)
+    keep = keep.scatter(-1, index, torch.ones_like(selected_kept))
     kept = chunk_logits.masked_fill(~keep, float("-inf"))
-    logsumexp_values = torch.logsumexp(kept, dim = -1, keepdim = True)
-    smallest_kept = chunk_logits.detach().masked_fill(~keep, float("inf")).amin(dim = -1, keepdim = True)
-    outside = selected_logits.detach() < smallest_kept
-    logsumexp_values = torch.where(outside, torch.logaddexp(logsumexp_values, selected_logits), logsumexp_values)
-    return (selected_logits - logsumexp_values).squeeze(-1)
+    return (selected_logits - torch.logsumexp(kept, dim = -1, keepdim = True)).squeeze(-1)
 pass
 
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
@@ -1319,22 +1324,19 @@ def _grpo_rollout_sampling_params(trainer, keys):
     vllm_sampling_params = getattr(args, "vllm_sampling_params", None)
     vllm_overrides = getattr(vllm_sampling_params, "_set_kwargs", None)
     if vllm_overrides is None and vllm_sampling_params is not None:
-        # A raw vllm.SamplingParams: unsloth's grpo_update_SamplingParams applies the fields that
-        # differ from SamplingParams()
-        vllm_overrides = {}
+        # A raw vllm.SamplingParams: take exactly the fields generation applies from it, through the
+        # grpo_update_SamplingParams the trainer's generated module calls (unsloth >= #11595 copies
+        # the fields that differ from SamplingParams(), older ones use this module's, lists only)
+        update = grpo_update_SamplingParams
+        for klass in type(trainer).__mro__:
+            candidate = getattr(sys.modules.get(klass.__module__, None), "grpo_update_SamplingParams", None)
+            if callable(candidate):
+                update = candidate
+                break
         try:
-            defaults = type(vllm_sampling_params)()
+            vllm_overrides = update(type(vllm_sampling_params), {}, vllm_sampling_params)
         except Exception:
-            defaults = None
-        for key in keys:
-            if hasattr(vllm_sampling_params, key):
-                value = getattr(vllm_sampling_params, key)
-                try:
-                    differs = bool(value != getattr(defaults, key, None))
-                except Exception:
-                    differs = True
-                if differs:
-                    vllm_overrides[key] = value
+            vllm_overrides = grpo_update_SamplingParams(type(vllm_sampling_params), {}, vllm_sampling_params)
     for overrides in (
         getattr(args, "generation_kwargs", None),
         vllm_overrides,

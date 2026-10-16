@@ -132,39 +132,129 @@ def test_entropy_scoring_keeps_the_truncated_support(monkeypatch):
 
 
 class _RawSamplingParams:
-    """vllm.SamplingParams built directly, so it has no _set_kwargs."""
-    _defaults = dict(
-        n = 1, temperature = 1.0, top_p = 1.0, top_k = 0, min_p = 0.0, repetition_penalty = 1.0,
+    """vllm.SamplingParams built directly, so it has no _set_kwargs (explicit keyword signature,
+    as grpo_update_SamplingParams reads it)."""
+
+    def __init__(
+        self, n = 1, temperature = 1.0, top_p = 1.0, top_k = 0, min_p = 0.0, repetition_penalty = 1.0,
         presence_penalty = 0.0, frequency_penalty = 0.0, min_tokens = 0, logit_bias = None,
-        bad_words = None, allowed_token_ids = None, logits_processors = None, seed = None,
+        bad_words = None, allowed_token_ids = None, logits_processors = None, seed = None, stop = None,
+    ):
+        for key, value in dict(locals()).items():
+            if key != "self":
+                setattr(self, key, value)
+
+
+# unsloth >= #11595 grpo_update_SamplingParams (unsloth/models/rl_replacements.py), verbatim; the
+# compiled trainer module defines it, so the trainer class's module carries it.
+_UNSLOTH_UPDATE = '''
+import inspect
+def grpo_update_SamplingParams(
+    SamplingParams,
+    generation_kwargs,
+    vllm_sampling_params = None,
+):
+    good_sampling_params_keys = inspect.signature(SamplingParams).parameters.keys()
+
+    new_generation_kwargs = {}
+    for key in generation_kwargs.keys():
+        if key in good_sampling_params_keys:
+            new_generation_kwargs[key] = generation_kwargs[key]
+    generation_kwargs = new_generation_kwargs
+
+    if vllm_sampling_params is not None:
+        overwrites = getattr(vllm_sampling_params, "_set_kwargs", None)
+        if overwrites is None:
+            default_sampling_params = SamplingParams()
+            overwrites = {}
+            for key in good_sampling_params_keys:
+                if key.startswith("_") or not hasattr(vllm_sampling_params, key):
+                    continue
+                overwrited_key = getattr(vllm_sampling_params, key)
+                if overwrited_key != getattr(default_sampling_params, key, None):
+                    overwrites[key] = overwrited_key
+        for key, overwrited_key in overwrites.items():
+            if key in good_sampling_params_keys and key not in (
+                "seed",
+                "n",
+                "temperature",
+                "max_tokens",
+                "logprobs",
+            ):
+                generation_kwargs[key] = overwrited_key
+    return generation_kwargs
+
+class UnslothGRPOTrainer:
+    pass
+'''
+
+
+def _compiled_trainer_class(monkeypatch):
+    module = types.ModuleType("unsloth_compiled_cache_test.UnslothGRPOTrainer")
+    exec(_UNSLOTH_UPDATE, module.__dict__)
+    module.UnslothGRPOTrainer.__module__ = module.__name__
+    monkeypatch.setitem(__import__("sys").modules, module.__name__, module)
+    return module.UnslothGRPOTrainer
+
+
+def _raw_trainer(trainer_class = None, **raw):
+    trainer = (trainer_class or types.SimpleNamespace)()
+    trainer.use_vllm = True
+    trainer.temperature = 1.0
+    trainer.vllm_importance_sampling_correction = False
+    trainer.args = types.SimpleNamespace(
+        top_k = 0, top_p = 0.9, min_p = 0.0, temperature = 1.0, repetition_penalty = 1.0,
+        generation_kwargs = None, vllm_sampling_params = _RawSamplingParams(**raw),
     )
-
-    def __init__(self, **kwargs):
-        for key, value in {**self._defaults, **kwargs}.items():
-            setattr(self, key, value)
+    return trainer
 
 
-def _raw_trainer(**raw):
-    return types.SimpleNamespace(
-        use_vllm = True, temperature = 1.0, vllm_importance_sampling_correction = False,
-        args = types.SimpleNamespace(
-            top_k = 0, top_p = 0.9, min_p = 0.0, temperature = 1.0, repetition_penalty = 1.0,
-            generation_kwargs = None, vllm_sampling_params = _RawSamplingParams(**raw),
-        ),
-    )
-
-
-def test_raw_sampling_params_override_the_config(monkeypatch):
+def test_raw_sampling_params_follow_unsloth_generation(monkeypatch):
+    # Current unsloth applies the raw fields that differ from SamplingParams(), so scoring does too.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
-    assert rr.grpo_truncated_support_kwargs(_raw_trainer(top_k = 20)) == {
+    klass = _compiled_trainer_class(monkeypatch)
+    assert rr.grpo_truncated_support_kwargs(_raw_trainer(klass, top_k = 20)) == {
         "support_top_k": 20, "support_top_p": 0.9, "support_min_p": 0.0,
     }
-    assert rr.grpo_truncated_support_kwargs(_raw_trainer(top_p = 0.8)) == {
+    assert rr.grpo_truncated_support_kwargs(_raw_trainer(klass, top_p = 0.8)) == {
         "support_top_k": 0, "support_top_p": 0.8, "support_min_p": 0.0,
     }
     # Fields left at the SamplingParams default do not override the config.
-    assert rr.grpo_truncated_support_kwargs(_raw_trainer(seed = 3)) == {
+    assert rr.grpo_truncated_support_kwargs(_raw_trainer(klass, seed = 3)) == {
         "support_top_k": 0, "support_top_p": 0.9, "support_min_p": 0.0,
     }
-    assert rr.grpo_truncated_support_blockers(_raw_trainer(repetition_penalty = 1.1)) == ["repetition_penalty=1.1"]
-    assert rr.grpo_truncated_support_kwargs(_raw_trainer(repetition_penalty = 1.1)) == {}
+    assert rr.grpo_truncated_support_blockers(_raw_trainer(klass, repetition_penalty = 1.1)) == ["repetition_penalty=1.1"]
+    assert rr.grpo_truncated_support_kwargs(_raw_trainer(klass, repetition_penalty = 1.1)) == {}
+
+
+def test_raw_sampling_params_follow_zoo_generation_helper(monkeypatch):
+    # Without the unsloth copy (unsloth before #11595), generation goes through this module's
+    # grpo_update_SamplingParams, which only copies non-empty list / tuple fields: raw scalars never
+    # reach the rollout, so scoring must not use them either.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    applied = rr.grpo_update_SamplingParams(_RawSamplingParams, {}, _RawSamplingParams(top_k = 20, top_p = 0.8, stop = ["x"]))
+    assert applied == {"stop": ["x"]}
+    assert rr.grpo_truncated_support_kwargs(_raw_trainer(top_k = 20, top_p = 0.8)) == {
+        "support_top_k": 0, "support_top_p": 0.9, "support_min_p": 0.0,
+    }
+    assert rr.grpo_truncated_support_blockers(_raw_trainer(repetition_penalty = 1.1)) == []
+
+
+def test_boundary_tied_sampled_token_is_in_the_denominator():
+    # 100 equal logits at top_p = 0.9 keep 90 of them. A sampled token the sort dropped must take one
+    # kept token's place: logprob -log(90) and d/dlogit = 1 - 1/90, as for a kept token.
+    logits = torch.zeros(1, 100)
+    keep = rr._truncated_support_mask(logits, 0, 0.9, 0.0)[0]
+    for token in (int((~keep).nonzero()[0]), int(keep.nonzero()[0])):
+        x = logits.clone().requires_grad_(True)
+        got = rr._truncated_support_logps(x, torch.tensor([token]), 0, 0.9, 0.0)
+        torch.testing.assert_close(got, torch.tensor([-float(torch.log(torch.tensor(90.0)))]))
+        (grad,) = torch.autograd.grad(got.sum(), [x])
+        torch.testing.assert_close(grad[0, token], torch.tensor(1.0 - 1.0 / 90))
+        assert int((grad[0] != 0).sum()) == 90
+        torch.testing.assert_close(grad.sum(), torch.tensor(0.0), atol = 1e-6, rtol = 0)
+    # A token strictly below the kept set is still added on top of it (91 terms).
+    x = torch.cat([torch.zeros(1, 100), torch.full((1, 1), -30.0)], dim = 1).requires_grad_(True)
+    got = rr._truncated_support_logps(x, torch.tensor([100]), 0, 0.9, 0.0)
+    want = -30.0 - torch.logaddexp(torch.log(torch.tensor(90.0)), torch.tensor(-30.0))
+    torch.testing.assert_close(got, want.reshape(1))
