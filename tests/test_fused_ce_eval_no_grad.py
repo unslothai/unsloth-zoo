@@ -93,7 +93,6 @@ def test_training_after_eval_matches_reference(bias):
 
 
 def test_eval_probe_does_not_settle_compile_support(monkeypatch):
-    """A loss-only compile succeeding says nothing about the grad_and_value graph."""
     ce = _ce_module()
     monkeypatch.setattr(ce, "_FUSED_CE_COMPILE_SUPPORTED", None)
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: (lambda *a, **k: fn(*a, **k)))
