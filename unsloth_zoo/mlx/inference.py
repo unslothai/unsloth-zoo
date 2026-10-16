@@ -3263,8 +3263,7 @@ def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
 
 def _nax_small_m_qmm(module, x, bindings):
     """The small-row kernel's result for this call, or None when it takes the native call."""
-    # A shape already verified for this weight layout skips the checks, which cost more host time than a few
-    # rows save.
+    # A verified shape for this weight layout skips the checks (they cost more host time than a few rows save).
     ready = module.__dict__.get("_unsloth_nax_qmm_ready", {}).get(x.shape) if type(x) is mx.array else None
     if ready is not None and not module.training and _bindings_intact(bindings):
         w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
@@ -3485,8 +3484,7 @@ def _nax_qmm_classes(route, *cache_key):
     if bindings is None:
         return {}
 
-    # Calls no route takes skip the checks: below every route's rows, between the small-row and the next
-    # route's rows, or a single-sequence block the route leaves native.
+    # Calls no route takes (below every route, between small-row and the next, a native block) skip the checks.
     def declined(self, x):
         if type(x) is not mx.array:
             return False

@@ -131,8 +131,7 @@ _SIMD_QMM_SOURCE = """
     }
 """
 
-# Up to this many rows an 8 x 8 tile is mostly padding, so scalar lanes split K, dequantizing
-# each code once as `s * q + b` in fp32. More columns a threadgroup, or a rolled code loop, spill the accumulators.
+# Up to this many rows an 8 x 8 tile is mostly padding: scalar lanes split K (`s * q + b` in fp32); wider tiles spill.
 _SIMD_QMM_FEW_ROWS = 5
 _SIMD_QMM_FEW_ROW_SOURCE = """
     constexpr int G = K / GS;
@@ -178,8 +177,7 @@ _SIMD_QMM_FEW_ROW_SOURCE = """
     }
 """
 
-# Constants go into the source because MLX re-parses template arguments on every call; it also recompiles
-# a library whose name returns with another source, hence one name per configuration.
+# Constants in the source (MLX re-parses template args per call), one kernel name per configuration.
 _SIMD_QMM_TYPE, _SIMD_QMM_CONSTANT = "typedef {1} {0};\n", "constexpr int {} = {};\n"
 _SIMD_QMM_METAL_TYPES = {mx.bfloat16: "bfloat16_t", mx.float16: "float16_t", mx.float32: "float",
                          mx.uint16: "uint16_t", mx.uint32: "uint32_t"}
@@ -239,8 +237,7 @@ def simd_qmm(x, w, scales, biases, group_size, bits):
     return _simd_qmm_launch(M, w.shape[0], K, group_size, bits, x.dtype)(inputs = [x, w, scales, biases])[0]
 
 
-# Rows where the kernels beat stock end to end, in `nax._QMM_ROWS_BY_GPU`'s format; measured on an M3 Max,
-# taken by every generation.
+# `nax._QMM_ROWS_BY_GPU` format; measured on an M3 Max, used for every generation.
 _SIMD_QMM_ROWS = ((4, None, 1 << 23, 7168, 3, 24), (4, None, 1 << 24, 65536, 3, 24), (4, None, 1 << 24, None, 3, 16),
                   (8, None, 1 << 23, None, 3, 16))
 
