@@ -1335,6 +1335,80 @@ def test_dense_prefill_linear_first_use_check_rejects_a_different_result(monkeyp
     assert "the native call stays in use" in caplog.text
 
 
+@real_mlx_only
+@pytest.mark.parametrize("N, K, rows, same", [
+    (2048, 2048, (1100, 1300), True),
+    (1024, 4600, (1501, 1601), False),   # NAX split K
+    (1024, 512, (2047, 2049), False),    # both sides within 2048
+    (6000, 8192, (1501, 2201), False),   # K over M + N
+    (1500, 512, (1401, 1601), False),    # N over M
+    (1009, 512, (1025, 1041), False),    # a million outputs
+    (1024, 4000, (1999, 2001), False),   # K under twice the widest side
+    (2048, 2048, (1088, 1056), False),   # 64- against 32-row alignment
+    (2048, 2048, (1152, 1088), False),   # 128- against 64-row alignment
+    (2048, 2048, (1056, 1100), False),   # 32-row alignment against none
+])
+def test_dense_prefill_row_key_splits_at_each_mlx_row_decision(N, K, rows, same):
+    from unsloth_zoo.mlx import inference
+
+    first, second = (inference._dense_qmm_rows(M, N, K) for M in rows)
+    assert (first == second) is same
+
+
+@real_mlx_only
+@metal_only
+@pytest.mark.parametrize("mlx_version, quantized, verdicts", [
+    (None, [1100, 1152], 2),
+    ("0.0.0", [1100, 1300, 1152], 0),   # another MLX takes the native call at every row count
+])
+def test_dense_prefill_linear_compares_once_per_row_count_decision(monkeypatch, mlx_version, quantized, verdicts):
+    from unsloth_zoo.mlx import inference
+
+    model = _PrefillProjections()
+    x = mx.random.normal((1, 1300, 512), key = mx.random.key(4)).astype(mx.bfloat16)
+    rows = (1100, 1300, 1152)   # 1300 decides as 1100 does; 1152 aligns on 128 rows
+    natives = [model(x[:, :n]) for n in rows]
+    mx.eval(natives)
+    seen, quantized_matmul = [], mx.quantized_matmul
+    monkeypatch.setattr(mx, "quantized_matmul", lambda a, w, *args, **kwargs: (
+        seen.append(a.shape[-2]) if w.shape[0] == 2048 else None, quantized_matmul(a, w, *args, **kwargs))[1])
+    verified = {}
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
+    if mlx_version is not None:
+        monkeypatch.setattr(inference, "_DENSE_QMM_DISPATCH_MLX", mlx_version)
+    with inference.dense_prefill_linear(model):
+        for n, native in zip(rows, natives):
+            assert _same_bits(model(x[:, :n]), native)
+    assert seen == quantized and len(verified) == verdicts
+
+
+class _OneColumn(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.QuantizedLinear(64, 1, bias = False, group_size = 64, bits = 4)
+        self.set_dtype(mx.bfloat16)
+        self.eval()
+
+    def __call__(self, x):
+        return self.proj(x)
+
+
+@real_mlx_only
+@metal_only
+def test_dense_prefill_leaves_a_one_column_output_native(monkeypatch):
+    from unsloth_zoo.mlx import inference
+
+    model = _OneColumn()
+    x = mx.random.normal((1, 65553, 64)).astype(mx.bfloat16)   # past the tile floor
+    native = model(x)
+    mx.eval(native)
+    verified = {}
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", verified)
+    with inference.dense_prefill_linear(model):
+        assert _same_bits([model(x)], [native])
+    assert not verified
+
+
 @metal_only
 def test_vlm_cache_materialization_finishes_the_previous_snapshot(monkeypatch):
     from unsloth_zoo.mlx.generate import _VLMCacheMaterializer

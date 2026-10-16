@@ -3734,15 +3734,33 @@ _DENSE_QMM_MIN_ROWS = 1024
 _DENSE_QMM_MIN_TILES = 4096
 # The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
 _DENSE_QMM_MAX_WEIGHTS = 1 << 28
+_DENSE_QMM_DISPATCH_MLX = "0.32.3"
+
+
+def _dense_qmm_rows(M, N, K):
+    """What MLX 0.32.3 decides from the row count for both matmuls past the tile floor, so one comparison
+    covers every row count deciding the same.
+
+    Its quantized matmul leaves split K at one there and reads the rows only in bounds checks. Its dense
+    matmul picks NAX split K, tiles and K blocks from these predicates (the rest it tests cannot hold past
+    the floor) and aligns on 32, 64 or 128 rows.
+    """
+    widest = max(M, N)
+    return (K >= 3 * widest, M <= 2048 and N <= 2048, K >= 8192 and K > M + N, N > M, M * N >= 1 << 20,
+            2 * widest > K, next((rows for rows in (128, 64, 32) if M % rows == 0), 0))
 
 
 def _dense_prefill_qmm(module, x, bindings):
     """`x` times the dequantized weight for a prefill-sized call, or None when it takes the native call.
 
     MLX's quantized matmul dequantizes inside every tile; dequantizing once is the same arithmetic.
-    Each (shape, quantization, dtypes) is compared bit for bit on its first use; the row count is part of
-    the shape because MLX picks its kernels by it.
+    Each (projection shape, quantization, dtypes) is compared bit for bit on its first use at every set of
+    row-count decisions `_dense_qmm_rows` tells apart, since MLX picks its kernels by them. Another MLX, or a
+    one-column output (a matrix-vector product whose kernel MLX picks by the row count), would need a check
+    per prompt length, which costs about what the dense matmul saves, so those take the native call.
     """
+    if mx.__version__ != _DENSE_QMM_DISPATCH_MLX:
+        return None
     if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
         return None
     w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
@@ -3751,12 +3769,12 @@ def _dense_prefill_qmm(module, x, bindings):
     N, K, M = w.shape[0], x.shape[-1], x.shape[-2]
     if x.size != M * K:  # MLX reads the row count of a batch from its memory layout
         return None
-    if (M < _DENSE_QMM_MIN_ROWS or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
+    if (M < _DENSE_QMM_MIN_ROWS or N == 1 or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
             or N * K > _DENSE_QMM_MAX_WEIGHTS or module.training or not _bindings_intact(bindings)):
         return None
     group_size, bits, mode = module.group_size, module.bits, module.mode
     family = (N, K, bits, group_size, mode, x.dtype, w.dtype, scales.dtype, getattr(biases, "dtype", None))
-    key = (x.shape, *family)
+    key = (_dense_qmm_rows(M, N, K), *family)
     verified = _DENSE_QMM_VERIFIED.get(key)
     if verified is False or family in _DENSE_QMM_VERIFIED:   # one differing row count retires the projection shape
         return None
