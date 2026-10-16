@@ -347,6 +347,8 @@ def test_shaped_gives_evicted_expert_weights_their_shape_without_memory():
 
     layers = nn.ModuleList([Experts() for _ in range(3)]).to("cuda")
     sw = BlockSwap(layers, 3, prefetch_depth = 1)
+    for b in sw.blocks:
+        sw._release(b)
     w = layers[0].gate_up_proj
     assert w.numel() == 0
     with sw.shaped():
