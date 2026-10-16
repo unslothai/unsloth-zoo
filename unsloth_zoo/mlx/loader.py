@@ -6985,9 +6985,8 @@ def _promote_partial_sums(source):
 
 
 def _ensure_exact_verify_sums_promoted():
-    """mlx-vlm <= 0.7.8's exact verify kernels add their input in its own dtype, as MLX's qmv did
-    before 0.32.4; 0.32.4 promotes each element to float32 first, so verify stopped matching decode
-    bit for bit. Rewrite the sums that still have the old form. Gated on MLX and on the source."""
+    """MLX 0.32.4's qmv sums its input in float32; mlx-vlm <= 0.7.8's exact verify kernels still sum in the
+    input dtype, so verify no longer matches decode. Rewrite the old-form sums (gated on MLX and source)."""
     global _exact_verify_sums_promoted
 
     if _exact_verify_sums_promoted:

@@ -574,8 +574,7 @@ def _wrap_training_sdpa(original):
     @wraps(original)
     def wrapper(q, k, v, *, scale, mask=None, **kwargs):
         T = q.shape[-2]
-        # mlx 0.32.4's fused VJP raises for the vector kernel (<= 8 queries) and for sinks; an array
-        # mask sends those calls through the unfused forward and backward instead.
+        # mlx 0.32.4's fused VJP raises for the vector kernel (<= 8 queries) and sinks: an array mask goes unfused.
         if (T <= 8 or kwargs.get("sinks") is not None) and (
                 mask is None or isinstance(mask, str) and mask == "causal") and mlx_training_patches_active():
             mask = _as_array_mask(q, k, mask)
