@@ -167,10 +167,11 @@ def _first_visible_gpu(mask):
     ``2,1`` never reaches a hidden GPU 0; an all-hiding mask is kept; no mask means GPU 0."""
     if mask is None:
         return "0"
-    tokens = [t.strip() for t in mask.split(",") if t.strip()]
-    if not tokens or tokens[0] == "-1":
+    # CUDA stops at the first invalid entry, so a leading empty entry (",2") hides every GPU.
+    first = mask.split(",")[0].strip()
+    if first in ("", "-1"):
         return mask
-    return tokens[0]
+    return first
 
 
 def _build_subprocess_env(server_bin, gpu = None, maxtok = 0, ngl = None, base_env = None, os_name = None):
