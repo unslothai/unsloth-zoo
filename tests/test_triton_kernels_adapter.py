@@ -476,8 +476,7 @@ def test_new_generation_translates_indices_and_precision(fresh):
 
 
 def test_new_generation_down_rows_stay_in_output_dtype(fresh):
-    # matmul_ogs (split_k = 1) wrote the k rows in the output dtype and summed them in fp32; an fp32 matmul
-    # output doubles the (tokens * k, hidden) buffer of every down projection.
+    # fp32 matmul rows would double every down projection's (tokens * k, hidden) buffer.
     pkg = _install(fresh, "triton_kernels", tkc.API_MATMUL_RAGGED)
     backend = tkc.get_triton_kernels_backend()
     x, logits, w1, b1, w2, b2 = _moe_inputs()
@@ -496,8 +495,7 @@ def test_new_generation_down_rows_stay_in_output_dtype(fresh):
 
 
 def test_dense_training_follows_the_copy_that_built_ragged_routing(fresh):
-    # The patched mlp_forward routes with the top-level copy; on the matmul API its RoutingData is the adapter's,
-    # so the owner must come from the ragged metadata, not from UNSLOTH_TRITON_KERNELS_SOURCE.
+    # Routing came from the top-level copy: resolve it from the ragged metadata, not the SOURCE env var.
     _install(fresh, "triton_kernels", tkc.API_MATMUL_RAGGED)
     vendored = _install(fresh, "vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
     fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
