@@ -2520,19 +2520,22 @@ def grpo_accumulated_loss(
                 _pack_lengths = _pack_keep.sum(dim = 1)
                 _pack_lengths_cpu = _pack_lengths.tolist()                 # single GPU->CPU sync, reused below
                 _pack_nz_cpu = [_n for _n in _pack_lengths_cpu if _n > 0]
-                _pack_flat_ids = input_ids[_pack_keep].unsqueeze(0)
-                _pack_T = _pack_flat_ids.shape[1]
+                _pack_T = sum(_pack_nz_cpu)
                 _pack_L = input_ids.shape[1]
                 _pack_W = logits_to_keep + max_left_pad
                 _pack_maxseg = max(_pack_nz_cpu) if _pack_nz_cpu else 0
                 # sliding-window models lose the per-sequence local window in a packed stream
                 _pack_sw = getattr(getattr(unwrapped_model, "config", None), "sliding_window", None)
                 _pack_sw_ok = not (isinstance(_pack_sw, int) and _pack_sw > 0 and _pack_maxseg > _pack_sw)
-                _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
                 _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
-                # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch)
-                if _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok and (_pack_ok is True or _pack_active >= 2) \
-                        and not (_pack_unsafe is not None and _pack_T >= _pack_unsafe):
+                # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch or a
+                # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
+                _pack_capped = _pack_unsafe is not None and _pack_T >= _pack_unsafe
+                if not _pack_capped:
+                    _pack_flat_ids = input_ids[_pack_keep].unsqueeze(0)
+                    _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
+                if (not _pack_capped) and _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok \
+                        and (_pack_ok is True or _pack_active >= 2):
                     _pack_psl = torch.tensor(_pack_nz_cpu, dtype = torch.int32, device = input_ids.device)
                     # reset 0-based position_ids per segment
                     _pack_pos = (_pack_keep.cumsum(dim = 1) - 1)[_pack_keep].unsqueeze(0)
@@ -2790,9 +2793,14 @@ def grpo_accumulated_loss(
                 all_entropies_list = [_pack_entropies]
             zipped_inputs = []
         else:
-            # packing rejected/unused: drop the packed graph before the padded loop so both don't co-reside
+            # packing rejected/unused: drop the packed graph and its index buffers before the padded loop so
+            # neither co-resides with it
             _pack_hidden = _pack_sel = _pack_result = None
             _pack_ent = _pack_entropies = None
+            if _pack_T is not None:
+                _pack_keep = _pack_lengths = _pack_flat_ids = _pack_pos = _pack_psl = None
+                _pack_nz_idx = _pack_within = _pack_cstart = _pack_ctgt = _pack_tgt = None
+                _pack_h = _pack_tid = _pack_ref = _pack_cm = None
 
         def to_device(tensor, device, non_blocking=True):
             if tensor is None: return None
