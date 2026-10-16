@@ -2795,7 +2795,6 @@ def sft_prepare_dataset(
         if do_messages or do_prompt_completion:
             assistant_only_loss = bool(getattr(args, "assistant_only_loss", False))
             training_chat_template = getattr(self, "chat_template", None)
-            # Both conversational formats need role masks, including tool turns in completions.
             # No {% generation %} markers (or no TRL training template): assistant masks would be all zeros,
             # so mask with train_on_responses_only markers instead.
             import re as _re
@@ -2887,8 +2886,7 @@ def sft_prepare_dataset(
                     remove_columns=list(column_names), **map_kwargs,
                 )
             if assistant_only_loss:
-                # Truncation can cut every assistant completion token; prompt-history assistant turns
-                # don't count while completion_mask applies.
+                # Prompt-history assistant turns are no target while completion_mask applies.
                 pc_completion_only = getattr(self, "completion_only_loss", None)
                 if pc_completion_only is None:
                     pc_completion_only = getattr(args, "completion_only_loss", None)
