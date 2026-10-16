@@ -456,7 +456,8 @@ def _router_hook(layer_index):
         else:
             forced, valid = recomputed
             forced = torch.where(valid, forced, ids2.long())
-        new_weights = _formulas()[formula](logits2, forced).to(weights2.dtype)
+        reweight = _formulas()[formula]
+        new_weights = reweight(logits2, forced).to(weights2.dtype)
         new_weights = torch.where(valid, new_weights, weights2)
         with torch.no_grad():
             changed = (forced.sort(-1).values != ids2.long().sort(-1).values).any(-1).sum()
