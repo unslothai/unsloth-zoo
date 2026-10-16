@@ -222,8 +222,7 @@ def _free_target_gb(device = None):
 def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0, device = None):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        # Measured once per device and cached: a per-call reading costs a host query every
-        # forward and breaks graphs that trace across the loss.
+        # Measured once per device: a per-call reading costs a host query and a graph break each forward.
         target_gb = _free_target_gb(device)
     pass
 
