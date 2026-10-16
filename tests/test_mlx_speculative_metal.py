@@ -33,6 +33,8 @@ PAST_WINDOW = "Summarize these notes in one paragraph:\n" + "The planets orbit t
 
 def _load(repo, *extra):
     from mlx_vlm import load
+    from unsloth_zoo.mlx.loader import _ensure_exact_verify_sums_promoted
+    _ensure_exact_verify_sums_promoted()  # as FastMLXModel's VLM load does
     model, processor = load(repo)
     model._processor, tok = processor, processor.tokenizer
     ids = [
@@ -40,6 +42,56 @@ def _load(repo, *extra):
         for p in [*PROMPTS, *extra]
     ]
     return model, ids
+
+
+# Every mlx-vlm 0.7.8 kernel source that copies MLX's qmv input sum.
+EXACT_VERIFY_SUMS = [("mlx_vlm.models.quantized_verifier", "_AFFINE_MOE_HC_HEADER"),
+                     ("mlx_vlm.models.quantized_verifier", "_target_verify_qlinear_header"),
+                     ("mlx_vlm.models.fast_ops", "_AFFINE5_SWITCH_HEADER"), ("mlx_vlm.models.fast_ops", "_AFFINE4_SWITCH_HEADER"),
+                     ("mlx_vlm.models.glm_moe_dsa.speculative_verifier", "_quantized_head_header")]
+
+
+def _verify_sources(monkeypatch):
+    """The listed sources as they stand, restored after the test, with promotion not yet done."""
+    import importlib
+    from unsloth_zoo.mlx import loader
+    monkeypatch.setattr(loader, "_exact_verify_sums_promoted", False)
+    modules = {module: importlib.import_module(module) for module, _ in EXACT_VERIFY_SUMS}
+    before = {(module, name): getattr(modules[module], name) for module, name in EXACT_VERIFY_SUMS}
+    for (module, name), source in before.items():
+        monkeypatch.setattr(modules[module], name, source)
+    return modules, before
+
+
+def _assert_promoted(modules, before, promoted):
+    for (module, name), source in before.items():
+        after = getattr(modules[module], name)
+        if not promoted:  # MLX before 0.32.4 adds in the input dtype, as the kernels do
+            assert after is source, name
+        else:
+            text = after if isinstance(after, str) else after(4, 64)
+            assert "sum += x[i] + x[i + 1]" not in text and "sum += float(x[i]) + float(x[i + 1])" in text, name
+
+
+# First in the file: the model fixtures promote the sums for the rest of the session.
+@pytest.mark.parametrize("version", ["0.32.3", "0.32.4"])
+def test_exact_verify_kernels_sum_their_input_as_the_installed_mlx_decode_does(monkeypatch, version):
+    from unsloth_zoo.mlx import loader
+    modules, before = _verify_sources(monkeypatch)
+    monkeypatch.setattr(mx, "__version__", version)
+    built = modules["mlx_vlm.models.quantized_verifier"]._target_verify_qmv_kernel
+    built(4, 64, mx.bfloat16, 2, 64, 64)
+    loader._ensure_exact_verify_sums_promoted()
+    assert (built.cache_info().currsize > 0) == (version == "0.32.3")  # a kernel built earlier keeps its sums
+    _assert_promoted(modules, before, version == "0.32.4")
+
+
+def test_a_fast_mlx_model_load_promotes_the_verify_sums(monkeypatch):
+    from packaging.version import Version
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    modules, before = _verify_sources(monkeypatch)
+    FastMLXModel.from_pretrained(QUANTIZED)
+    _assert_promoted(modules, before, Version(mx.__version__) >= Version("0.32.4"))
 
 
 @pytest.fixture(scope = "module")
@@ -313,8 +365,6 @@ def test_wide_verify_blocks_in_slices_match_the_native_verifier(qwen_4bit, monke
     assert len(served) >= len(native) * len(verdicts)
 
 
-@pytest.mark.xfail(tuple(map(int, mx.__version__.split(".")[:3])) >= (0, 32, 4), strict = True,
-                   reason = "mlx-vlm's exact verifier keeps mlx 0.32.3's quantized matvec sums; 0.32.4 sums in float32")
 def test_a_sliced_verify_block_matches_one_token_decode_steps(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference
     (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)

@@ -6968,6 +6968,52 @@ def _ensure_vlm_prompt_utils_patched():
     _vlm_prompt_utils_patched = True
 
 
+_exact_verify_sums_promoted = False
+_LOW_PRECISION_SUM = re.compile(r"sum \+= x\[i\][^;]*;")
+_SUMMED_ELEMENT = re.compile(r"\bx\[i(?: \+ \d+)?\]")
+# Header strings and header builders of mlx-vlm's exact verify kernels, which copy MLX's qmv input sum.
+_EXACT_VERIFY_SUM_SOURCES = {
+    "mlx_vlm.models.quantized_verifier": ("_AFFINE_MOE_HC_HEADER", "_target_verify_qlinear_header"),
+    "mlx_vlm.models.fast_ops": ("_AFFINE5_SWITCH_HEADER", "_AFFINE4_SWITCH_HEADER"),
+    "mlx_vlm.models.glm_moe_dsa.speculative_verifier": ("_quantized_head_header",),
+}
+
+
+def _promote_partial_sums(source):
+    return _LOW_PRECISION_SUM.sub(
+        lambda statement: _SUMMED_ELEMENT.sub(lambda x: f"float({x.group(0)})", statement.group(0)), source)
+
+
+def _ensure_exact_verify_sums_promoted():
+    """mlx-vlm <= 0.7.8's exact verify kernels add their input in its own dtype, as MLX's qmv did
+    before 0.32.4; 0.32.4 promotes each element to float32 first, so verify stopped matching decode
+    bit for bit. Rewrite the sums that still have the old form. Gated on MLX and on the source."""
+    global _exact_verify_sums_promoted
+
+    if _exact_verify_sums_promoted:
+        return
+    import mlx.core as mx
+    from packaging.version import Version
+
+    if Version(mx.__version__) >= Version("0.32.4"):
+        for module_name, names in _EXACT_VERIFY_SUM_SOURCES.items():
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                continue
+            for name in names:
+                source = getattr(module, name, None)
+                if isinstance(source, str):
+                    setattr(module, name, _promote_partial_sums(source))
+                elif isinstance(source, types.FunctionType) and _LOW_PRECISION_SUM.search(_safe_getsource(source) or ""):
+                    setattr(module, name, wraps(source)(lambda *a, _build = source, **k: _promote_partial_sums(_build(*a, **k))))
+            # A verify run before this load built kernels from the old sources.
+            for value in list(vars(module).values()):
+                if getattr(value, "__module__", None) == module_name and callable(getattr(value, "cache_clear", None)):
+                    value.cache_clear()
+    _exact_verify_sums_promoted = True
+
+
 def _ensure_vlm_processor_inputs_patched():
     """Patch mlx-vlm's processor call without replacing its input preparation."""
 
@@ -9551,6 +9597,7 @@ class FastMLXModel:
                 install_mlx_compile_patches()
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_exact_verify_sums_promoted()
             _ensure_xing4_0_sliced_hyper_connection_base(model_type)
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
