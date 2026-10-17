@@ -462,7 +462,8 @@ inline void nax_mma(thread vec<C, 8>& c0, thread vec<C, 8>& c1, const thread vec
 # MLX's NAX flash attention (steel_attention_nax.h) over gathered keys. A threadgroup is one (query row, KV head);
 # fragment rows are that KV head's query heads. Simdgroup sg scores half of D, the halves meet in threadgroup
 # memory, and sg accumulates P V for its half of D. Keys come 32 at a time from 8 units: the row's sorted picks
-# (-1 first), then its partial tail block.
+# (-1 first), then its partial tail block. A lane's 16-byte gather feeds two fragments, which permutes D: Q must
+# gather the same dims as K, and V the same dims as the output store.
 _PREFILL_SOURCE = """
     constexpr int D = 256;
     const ushort lane = thread_index_in_simdgroup;
@@ -525,19 +526,22 @@ _PREFILL_SOURCE = """
       vec<float, 8> s[2];
       s[0] = 0.0f;
       s[1] = 0.0f;
-      UNROLL for (short d = sg * 8; d < sg * 8 + 8; d++) {
-        vec<bfloat, 8> qa, k0, k1;
+      UNROLL for (short d = sg * 8; d < sg * 8 + 8; d += 2) {
+        vec<bfloat, 8> qa[2], k0[2], k1[2];
         UNROLL for (short i = 0; i < 2; i++) {
-          const vec<bfloat, 4> qv = row_ok[i] ? *(const device vec<bfloat, 4>*)(qrow[i] + 16 * d) : vec<bfloat, 4>(0);
-          const vec<bfloat, 4> a = *(const device vec<bfloat, 4>*)(kh + krow[0][i] * D + 16 * d);
-          const vec<bfloat, 4> c = *(const device vec<bfloat, 4>*)(kh + krow[1][i] * D + 16 * d);
-          UNROLL for (short j = 0; j < 4; j++) {
-            qa[4 * i + j] = qv[j];
-            k0[4 * i + j] = a[j];
-            k1[4 * i + j] = c[j];
+          const vec<bfloat, 8> qv = row_ok[i] ? *(const device vec<bfloat, 8>*)(qrow[i] + 16 * d + fn) : vec<bfloat, 8>(0);
+          const vec<bfloat, 8> a = *(const device vec<bfloat, 8>*)(kh + krow[0][i] * D + 16 * d + fn);
+          const vec<bfloat, 8> c = *(const device vec<bfloat, 8>*)(kh + krow[1][i] * D + 16 * d + fn);
+          UNROLL for (short h = 0; h < 2; h++) {
+            UNROLL for (short j = 0; j < 4; j++) {
+              qa[h][4 * i + j] = qv[4 * h + j];
+              k0[h][4 * i + j] = a[4 * h + j];
+              k1[h][4 * i + j] = c[4 * h + j];
+            }
           }
         }
-        nax_mma<float, bfloat, bfloat, true>(s[0], s[1], qa, k0, k1);
+        nax_mma<float, bfloat, bfloat, true>(s[0], s[1], qa[0], k0[0], k1[0]);
+        nax_mma<float, bfloat, bfloat, true>(s[0], s[1], qa[1], k0[1], k1[1]);
       }
       threadgroup float* buf = partial + ((u0 >> 3) & 1) * 1024 + lane * 16;
       UNROLL for (short e = 0; e < 8; e++) {
@@ -589,11 +593,10 @@ _PREFILL_SOURCE = """
         UNROLL for (short f = 0; f < 2; f++) {
           vec<bfloat, 8> v0, v1;
           UNROLL for (short i = 0; i < 2; i++) {
-            const vec<bfloat, 4> a = *(const device vec<bfloat, 4>*)(vh + krow[f][i] * D + 16 * d);
-            const vec<bfloat, 4> c = *(const device vec<bfloat, 4>*)(vh + krow[f][i] * D + 16 * d + 16);
+            const vec<bfloat, 8> a = *(const device vec<bfloat, 8>*)(vh + krow[f][i] * D + 16 * d + fn);
             UNROLL for (short j = 0; j < 4; j++) {
               v0[4 * i + j] = a[j];
-              v1[4 * i + j] = c[j];
+              v1[4 * i + j] = a[4 + j];
             }
           }
           nax_mma<float, float, bfloat, false>(o[d], o[d + 1], hi[f], v0, v1);
@@ -606,10 +609,13 @@ _PREFILL_SOURCE = """
       if (!row_ok[i]) continue;
       const float rr = l[i] == 0.0f ? 0.0f : 1.0f / l[i];
       device bfloat* orow = (device bfloat*)out + (size_t(kvh * GQA + fm + 8 * i) * L + tq) * D + sg * 128 + fn;
-      UNROLL for (short d = 0; d < 8; d++) {
-        vec<bfloat, 4> w;
-        UNROLL for (short j = 0; j < 4; j++) w[j] = bfloat(o[d][4 * i + j] * rr);
-        *(device vec<bfloat, 4>*)(orow + 16 * d) = w;
+      UNROLL for (short d = 0; d < 8; d += 2) {
+        vec<bfloat, 8> w;
+        UNROLL for (short j = 0; j < 4; j++) {
+          w[j] = bfloat(o[d][4 * i + j] * rr);
+          w[4 + j] = bfloat(o[d + 1][4 * i + j] * rr);
+        }
+        *(device vec<bfloat, 8>*)(orow + 16 * d + fn) = w;
       }
     }"""
 
