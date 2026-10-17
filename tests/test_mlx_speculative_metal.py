@@ -827,20 +827,27 @@ def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(mo
 
 
 @pytest.mark.parametrize("max_lag", [128, 4])
-def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag):
+def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag, monkeypatch):
+    from mlx_vlm.speculative.common import generation_stream
     from unsloth_zoo.mlx.generate import SamplingParams
     model, ids = qwen_mtp
     controller = _script(("plain", 8), ("draft", 3), ("copy", 4), ("draft", 3))
-    accepted = []
+    accepted, apart, synced = [], [], []
+    monkeypatch.setattr(mx, "synchronize", lambda stream = None, sync = mx.synchronize: synced.append(stream) or sync(stream))
     record = controller.record_round
     def record_drafts(plan, rows, counts, **kwargs):
         accepted.extend((count, row.length) for row, count in zip(plan.rows, counts) if row.source == "draft")
+        if any(row.source == "draft" for row in plan.rows):
+            apart.append(kwargs["catch_up_seconds"] > 0 and synced == [generation_stream])
+        synced.clear()
         record(plan, rows, counts, **kwargs)
-    controller.record_round = record_drafts
+    controller.record_round, controller.interrupts_plain = record_drafts, lambda rows: False
     drafter = _drafter(model, max_lag = max_lag)
     (out,), _, _ = _run(model, ids[:1], 128, controller, SamplingParams(), drafter = drafter)
     assert out == _solo(model, ids[0], 128, SamplingParams())
     assert any(drafter.dropped.values()) == (max_lag < 8)
+    # Only a plain window leaves more pairs than a round does: its replay is timed apart from drafting.
+    assert apart[:4] == [max_lag >= 8, False] * 2
     # A head that dropped context past max_lag accepts less; a misaligned catch-up would accept next to nothing.
     assert sum(count for count, _ in accepted) >= (0.6 if max_lag >= 8 else 0.5) * sum(length for _, length in accepted)
 

@@ -181,6 +181,8 @@ def test_fused_rounds_learn_how_much_drafting_they_hide():
     assert (controller.verify_cost[1][3].value, controller.draft_cost[2].value) == pytest.approx((1.0, 0.5))
     assert controller.round_seconds(fused, state) == pytest.approx(1.2, rel = 0.01)
     assert controller._split_due(fused).split
+    controller.record_round(fused, state, [1], seconds = 1.9, catch_up_seconds = 0.7)
+    assert controller.round_seconds(fused, state) == pytest.approx(1.2, rel = 0.01)
 
 
 def test_a_round_running_first_use_work_updates_no_cost_and_is_measured_again():
@@ -227,6 +229,11 @@ def test_plain_is_interrupted_only_by_a_worthwhile_copy():
     for rate, credit, interrupts in ((0.01, 0.0, False), (0.01, 100.0, True), (0.5, 0.0, True)):
         state[0].stats.copy.value, state[0].stats.probe_at["copy"], controller._credit = rate, 0, credit
         assert controller.interrupts_plain(state) == interrupts
+    fresh = DraftController(max_depth = 0, max_copy = 16)
+    unmeasured = [RowState(fresh.new_reply(), can_draft = False, copy_available = 16)]
+    fresh.record_plain(unmeasured, 1, 1.0, 1.0)
+    fresh.verify_cost[1] = {2: _Ema(3.0), 17: _Ema(12.0)}
+    assert fresh.interrupts_plain(unmeasured)
 
 
 def test_mixed_depth_rounds_keep_flat_drafting_costs():
@@ -253,6 +260,21 @@ def test_unlucky_rounds_do_not_end_drafting():
     _run(controller := DraftController(max_depth = 3, can_copy = False), machine := _Machine(draft_slope = 0.3), [([0.7] * 3, None)], rounds = 1000)
     _run(controller, machine, [([0.0] * 3, None)], rounds = 80)  # one reply's rejected tail, then the next reply's rejected first round
     assert _run(controller, machine, [([0.0] * 3, None)], rounds = 1, states = (states := [])) and max(controller.score(controller._round_at(width, states), states) for width in range(2, 5)) > controller.score(RoundPlan("plain", 1), states)
+
+
+def test_a_fresh_loads_first_reply_drafts_on_its_own_accepted_rounds():
+    # Flash-Next's first rounds and plain window, in plain steps; with a cheaper head, unmeasured copies get one probe.
+    for copies, draft, first in ((0, 0.70, RowPlan("draft", 3)), (16, 0.05, RowPlan("copy", 4)), (16, 0.05, RowPlan("draft", 3))):
+        controller = DraftController(max_depth = 3, can_copy = bool(copies))
+        if first.source == "draft" and copies:
+            controller.copy_acceptance = _Ema(0.7, controller.seed_weight)
+        state = [RowState(controller.new_reply(), copy_available = copies)]
+        for accepted, seconds, drafting in ((3, 1.96 + draft, draft), (1, 1.80, 0.18)):
+            controller.record_round(controller.plan(state), state, [accepted], seconds = seconds, draft_seconds = drafting)
+        assert controller.plan(state).kind == "plain"
+        controller.record_plain(state, 8, 8.0, 1.0)
+        assert controller.plan(state).rows == (first,)
+
 
 @pytest.mark.parametrize("draft, floor", [([1.0], 0.97), ([0.5] * 16, 0.97)])
 def test_wide_batch_settles_on_plain_without_endless_probes(draft, floor):

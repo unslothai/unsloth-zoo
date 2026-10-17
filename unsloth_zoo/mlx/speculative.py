@@ -153,10 +153,14 @@ class _Ema:
 class ReplyStats:
     """One reply's acceptance, seeded from what the load has seen so far."""
 
+    # A bare prior weighs as a few samples, so it yields to a reply's first rounds but not to one of them.
+    PRIOR_SAMPLES = 3
+
     def __init__(self, draft: list[_Ema], copy: _Ema, backoff: int, weight: int = 1):
-        self.draft = [_Ema(ema.value, weight) for ema in draft]
+        seed = lambda ema: _Ema(ema.value, min(weight, max(self.PRIOR_SAMPLES, ema.count)))
+        self.draft = [seed(ema) for ema in draft]
         self.draft_seen = [ema.count > 1 for ema in draft]
-        self.copy = _Ema(copy.value, weight)
+        self.copy = seed(copy)
         self.tokens = 0
         # Per source: the doubling back-off, and the token count to retry an unused source at.
         self.backoff = {"copy": backoff, "draft": backoff}
@@ -440,7 +444,7 @@ class DraftController:
             # The deepest affordable draft probe: a full-depth one may not fit the credit a reply earns.
             for depth in range(self.max_depth, 1, -1) or [self.max_depth]:
                 probe, sources = self._source_probe(chosen, rows, depth)
-                if sources and self._affordable(probe, chosen, rows):
+                if sources and (self._affordable(probe, chosen, rows) or self._unmeasured(sources)):
                     chosen, self._probing_sources, self._reference = probe, sources, self.score(chosen, rows)
                     break
                 if "draft" not in sources.values():
@@ -541,6 +545,10 @@ class DraftController:
     def _affordable(self, probe: RoundPlan, best: RoundPlan, rows: Sequence[RowState], rounds: int = 1) -> bool:
         return self._regret(probe, best, rows) * rounds <= self._credit
 
+    def _unmeasured(self, sources: dict[int, str]) -> bool:
+        # A source the load never measured loses only by its prior, so its first probe waits for no credit.
+        return any((self.copy_acceptance if source == "copy" else self.draft_acceptance[0]).count <= 1 for source in sources.values())
+
     def _account(self, emitted: int, seconds: float, charged: float | None = None) -> None:
         self._credit += self.explore_fraction * seconds
         if self._reference is not None:
@@ -567,7 +575,7 @@ class DraftController:
         """Whether copies now on offer are worth ending a plain window early for."""
         plain_plan = RoundPlan("plain", 1)
         probe, sources = self._source_probe(plain_plan, rows)
-        if "copy" in sources.values() and self._affordable(probe, plain_plan, rows):
+        if "copy" in sources.values() and (self._affordable(probe, plain_plan, rows) or self._unmeasured(sources)):
             return True
         if not any(state.copy_available for state in rows):
             return False
@@ -657,7 +665,7 @@ class DraftController:
             self._since_split += 1
             drafting = sum(self._draft_seconds(depth) for depth in depths) + catch_up * self._catch_up_seconds()
             if drafting:
-                hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds, 0.0), drafting)
+                hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds + catch_up_seconds, 0.0), drafting)
                 self.hidden_drafting.setdefault(bucket, _Ema()).update(hidden, self.cost_alpha)
             else:
                 verify.update(seconds, self.cost_alpha)
@@ -1080,15 +1088,19 @@ class SpeculativeEngine:
         start, work = time.perf_counter(), first_use_work()
         depth = max((spec.length for spec in plan.rows if spec.source == "draft"), default = 0)
         draft_rows = [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)]
-        drafts, draft_seconds = None, 0.0
+        drafts, draft_seconds, catch_up_seconds = None, 0.0, 0.0
         if depth:
             with mx.stream(self._stream):
-                # Replay is one head forward, as costly for one pair as for many, so it counts as drafting.
+                # A round's few pairs replay as drafting; a plain window's backlog is replayed and timed apart.
+                if max(len(getattr(row, "tokens", ())) for row in draft_rows) > self.controller.max_depth + 1:
+                    self.drafter.catch_up(self.draft_cache, draft_rows)
+                    mx.synchronize(self._stream)
+                    catch_up_seconds = time.perf_counter() - start
                 self.drafter.catch_up(self.draft_cache, draft_rows)
                 drafts = self.drafter.draft(self.draft_cache, draft_rows, depth, self.cache).astype(inputs.dtype)
                 if plan.split:
                     mx.eval(drafts)
-                    draft_seconds = time.perf_counter() - start
+                    draft_seconds = time.perf_counter() - start - catch_up_seconds
                 else:
                     # The head drafts on the GPU while the host builds the verify graph.
                     mx.async_eval(drafts)
@@ -1162,7 +1174,7 @@ class SpeculativeEngine:
             emitted.append(taken)
         self.controller.record_round(
             plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds,
-            first_use = first_use_work() != work,
+            catch_up_seconds = catch_up_seconds, first_use = first_use_work() != work,
         )
         return emitted
 
@@ -1479,6 +1491,7 @@ class MTPDrafter:
                 row.last = last[i : i + 1]
                 row.position += length
                 row.tokens, row.hidden = [], []
+        mx.async_eval(last, *(entry.state for entry in cache))
         return sum(lengths)
 
     def probe(self, hidden: mx.array) -> list:
