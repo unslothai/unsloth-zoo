@@ -644,6 +644,39 @@ def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit
     assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted)
 
 
+def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qwen4):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import EngineRow, SpeculativeEngine
+    (model, ids), greedy = qwen4, SamplingParams()
+    lm, engine, stepped = model.language_model, SpeculativeEngine(model, _rounds_only()), []
+    prompts, streams = [ids[0][:30], ids[1][:16], ids[0][:23]], [ids[0][30:44], ids[0][2:16], ids[0][23:37]]
+    # Rows of different MRoPE deltas, as image prompts leave them; the last row's is the model's own afterwards.
+    for uid, (prompt, stream, delta) in enumerate(zip(prompts, streams, (0, -4, 7))):
+        cache = make_prompt_cache(lm)
+        lm(mx.array([prompt]), cache = cache)
+        engine.add(EngineRow(cache = _clone(cache), pending = stream[0], prompt = prompt, sampling = greedy, max_tokens = 32,
+                             uid = uid, rope_delta = delta))
+        outs = [lm(mx.array([[token]]), cache = cache, rope_deltas = mx.array([[delta]]), return_hidden = True) for token in stream]
+        stepped.append((mx.concatenate([out.logits for out in outs], 1), mx.concatenate([out.hidden_states[-1] for out in outs], 1)))
+    for row in engine._rows:
+        row.draft = object()  # a drafting row, so verify returns the hidden states an MTP head reads
+    assert engine._invariant and engine._batch_rounds
+    # Blocks of each row's own stream, kept raggedly, so a rejected tail left in any cache shows in the next block.
+    starts = [0, 0, 0]
+    for keeps in ((5, 2, 3), (1, 5, 2), (4, 3, 1)):
+        logits, hidden, transaction = engine._verify(mx.array([stream[start : start + 5] for stream, start in zip(streams, starts)]))
+        assert all(_same([("logits", want_logits[:, start : start + 5]), ("hidden", want_hidden[:, start : start + 5])],
+                         [("logits", logits[i : i + 1]), ("hidden", hidden[i : i + 1])])
+                   for i, ((want_logits, want_hidden), start) in enumerate(zip(stepped, starts)))
+        transaction.commit(list(keeps))
+        for entry in engine.cache:  # as a round does after a ragged commit
+            padding = getattr(entry, "left_padding", None)
+            if isinstance(padding, mx.array) and not hasattr(entry, "metadata_revision"):
+                entry.left_padding = padding + 0
+        starts = [start + keep for start, keep in zip(starts, keeps)]
+    assert not any("keys" in vars(entry) for entry in engine.cache)  # the commit's view of the QSA keys is gone
+
 
 def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
     from unsloth_zoo.mlx.generate import SamplingParams
