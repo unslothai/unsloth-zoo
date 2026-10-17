@@ -2297,11 +2297,16 @@ def grpo_accumulated_loss(
         output_embeddings = trainer.model.get_output_embeddings()
         lm_head = output_embeddings.weight
         lm_head_bias = getattr(output_embeddings, "bias", None)
-        if lm_head_bias is not None:
-            from functools import partial
-            chunked_hidden_states_selective_log_softmax = partial(
-                chunked_hidden_states_selective_log_softmax, lm_head_bias = lm_head_bias,
-            )
+
+        def _refresh_lm_head():
+            # FSDP2 replaces Parameters during forward's unshard. The bindings above
+            # are only safe for metadata until that forward has finished.
+            nonlocal lm_head, lm_head_bias
+            from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fsdp_unshard
+            unsloth_fsdp_unshard(output_embeddings)
+            lm_head = output_embeddings.weight
+            lm_head_bias = getattr(output_embeddings, "bias", None)
+
         from unsloth_zoo.rl_replacements import grpo_truncated_support_kwargs
         _support_kwargs = grpo_truncated_support_kwargs(trainer)
         # old / ref logps come from Unsloth's _get_per_token_logps, which marks the trainer when
@@ -2321,10 +2326,6 @@ def grpo_accumulated_loss(
             if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
                 # The recompute helper scores the full vocabulary only, so the kept set uses the plain helper
                 from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax
-                if lm_head_bias is not None:
-                    chunked_hidden_states_selective_log_softmax = partial(
-                        chunked_hidden_states_selective_log_softmax, lm_head_bias = lm_head_bias,
-                    )
                 if not getattr(trainer, "_unsloth_truncated_support_recompute_warned", False):
                     from unsloth_zoo.log import logger as _zoo_logger
                     _zoo_logger.warning(
@@ -2424,6 +2425,7 @@ def grpo_accumulated_loss(
                 logps = chunked_hidden_states_selective_log_softmax(
                     hidden_states, lm_head, ids, chunks,
                     logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                    lm_head_bias = lm_head_bias,
                 )
             return logps, entropies
 
@@ -2643,6 +2645,7 @@ def grpo_accumulated_loss(
                             packed_seq_lengths = _pack_psl,
                             use_cache = False,
                         ).logits
+                        _refresh_lm_head()
                         # `.logits` carries hidden states only when the forward is the
                         # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
                         # otherwise it is real [T, vocab] logits and the lm_head matmul
@@ -2657,6 +2660,7 @@ def grpo_accumulated_loss(
                                 _pack_sel = chunked_hidden_states_selective_log_softmax(
                                     _pack_h, lm_head, _pack_tid, _pack_chunks,
                                     logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                    lm_head_bias = lm_head_bias,
                                 )[0]
                         else:
                             # Raw logits: the forward already applied scale/softcap.
@@ -2696,6 +2700,7 @@ def grpo_accumulated_loss(
                                 _pack_real = input_ids[_pack_i][_pack_rmask].unsqueeze(0)
                                 _pack_rpos = torch.arange(_pack_ni, device = input_ids.device).unsqueeze(0)
                                 _pack_rh = unwrapped_model(input_ids = _pack_real, position_ids = _pack_rpos, use_cache = False).logits
+                                _refresh_lm_head()
                                 # same width dispatch as the packed call above: this forward
                                 # returns raw logits whenever that one did, and the first
                                 # packed batch always lands here
@@ -2703,6 +2708,7 @@ def grpo_accumulated_loss(
                                     _pack_rsel = chunked_hidden_states_selective_log_softmax(
                                         _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
                                         logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                        lm_head_bias = lm_head_bias,
                                     )[0]
                                 else:
                                     _pack_rsel = chunked_selective_log_softmax(
@@ -2777,6 +2783,7 @@ def grpo_accumulated_loss(
                     prefix_seg_info = _pg_layout.prefix_seg_info,
                     use_cache = False,
                 ).logits
+                _refresh_lm_head()
                 # Same width dispatch as the packed path and compute_logprobs_chunk.
                 # `.logits` carries hidden states only when the forward is the Unsloth
                 # generated one honouring UNSLOTH_RETURN_HIDDEN_STATES; otherwise it is
@@ -2785,6 +2792,9 @@ def grpo_accumulated_loss(
                 # that same signature, which skips the lm_head matmul and the scale /
                 # softcap the forward already applied.
                 _pg_fn = chunked_hidden_states_selective_log_softmax
+                if lm_head_bias is not None:
+                    from functools import partial
+                    _pg_fn = partial(_pg_fn, lm_head_bias = lm_head_bias)
                 if _h.shape[-1] != lm_head.shape[1]:
                     def _pg_fn(_pg_h, _pg_lm, _pg_ids, _pg_n, _pg_lsm, _pg_lsd, _pg_lsc, _pg_t):
                         return chunked_selective_log_softmax(
@@ -3047,6 +3057,7 @@ def grpo_accumulated_loss(
                 )
 
         def compute_logprobs_chunk(new_hidden_states_chunk, completion_ids, input_ids_chunk):
+            _refresh_lm_head()
             # Hidden states -> lm_head matmul path; raw logits -> skip matmul and
             # skip scale/softcap (model forward already applied them).
             chunks = input_ids_chunk.shape[0] * multiplier
