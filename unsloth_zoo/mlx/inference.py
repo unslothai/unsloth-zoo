@@ -4005,9 +4005,22 @@ _EXACT_VERIFY_CONTRACT = {
         "supports_optimized_affine_head": "b0611c0de3000a20",
     },
 }
+# qwen4_exp runs its decode steps as well as its verify blocks on one batch-invariant forward, entered at
+# `__call__`, whose `_model` already submits each layer. It inherits the Qwen3.5 bodies pinned above.
+_QWEN4_FORWARD_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.language": {
+        "Qwen4ExpBatchInvariantForward.__call__": "d7a813b4f944d125",
+        "Qwen4ExpBatchInvariantForward._layer": "537ce3afba7c9732",
+    },
+}
+# (language module, its forward object, the forward's module and class, the entry that serves, wrap `_layer`)
+_QWEN3_5_VERIFIER = ("mlx_vlm.models.qwen3_5.language", "_EXACT_SPECULATIVE_VERIFIER",
+                     "mlx_vlm.models.qwen3_5.speculative_verifier", "Qwen3_5BatchInvariantForward", "verify", True)
+_QWEN4_FORWARD = ("mlx_vlm.models.qwen4_exp.language", "_QWEN4_BATCH_INVARIANT_FORWARD",
+                  "mlx_vlm.models.qwen4_exp.language", "Qwen4ExpBatchInvariantForward", "__call__", False)
 # mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
 _VERIFY_FUSED_ROWS = 8
-_VERIFY_METHODS = ("verify", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta")
+_VERIFY_METHODS = ("verify", "__call__", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta")
 _VERIFY_LOCK = RLock()
 _VERIFY_VERDICTS = {}
 # The verifier is one object per process: whether a call is served is kept per thread, not on it.
@@ -4154,15 +4167,17 @@ def _taped_transaction_class(base):
 
 
 @functools.cache
-def _exact_verify_class(base, *cache_key):
-    bindings = _resolved_bindings(_EXACT_VERIFY_CONTRACT)
+def _exact_verify_class(base, entry, submit_layers, *cache_key):
+    contract = _EXACT_VERIFY_CONTRACT if entry == "verify" else {**_EXACT_VERIFY_CONTRACT, **_QWEN4_FORWARD_CONTRACT}
+    bindings = _resolved_bindings(contract)
     eligible = getattr(sys.modules.get("mlx_vlm.models.quantized_verifier"), "_can_optimized_affine_linear", None)
     if bindings is None or eligible is None:
         return None
+    native_entry = getattr(base, entry)
     tape_bindings = _resolved_bindings(_VERIFY_TAPE_CONTRACT)
     gated_delta, kernels = vars(base).get("_gated_delta"), sys.modules.get("mlx_vlm.models.qwen3_5.gated_delta")
     taped = None
-    if (tape_bindings is not None and gated_delta is not None and kernels is not None
+    if (entry == "verify" and tape_bindings is not None and gated_delta is not None and kernels is not None
             and gated_delta.__globals__.get("gated_delta_update") is kernels.gated_delta_update):
         route = _taped_update(kernels.gated_delta_update, kernels.gated_delta_update_with_states)
         taped = FunctionType(gated_delta.__code__, {**gated_delta.__globals__, "gated_delta_update": route},
@@ -4182,6 +4197,15 @@ def _exact_verify_class(base, *cache_key):
             return output
         finally:
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer, outer_tapes
+
+    def entered(self, language_model, *args, **kwargs):
+        outer = getattr(_VERIFY_STATE, "serving", False)
+        _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
+                                     and not language_model.training and _bindings_intact(bindings))
+        try:
+            return native_entry(self, language_model, *args, **kwargs)
+        finally:
+            _VERIFY_STATE.serving = outer
 
     def taped_gated_delta(self, layer, inputs, mask, cache):
         if getattr(_VERIFY_STATE, "tapes", None) is None:
@@ -4227,10 +4251,51 @@ def _exact_verify_class(base, *cache_key):
                *((p.weight.shape, p.bits, p.group_size, p.mode) for p in projections))
         return _verify_admitted(key, lambda: base._feed_forward(self, feed_forward, x), routed)
 
-    return type(f"_ScopedVerify{base.__name__}", (base,), {
-        "verify": verify, "_linear": sliced_linear, "_linears": sliced_linears, "_layer": submitted_layer,
-        "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base,
-        **({"_gated_delta": taped_gated_delta} if taped is not None else {})})
+    methods = {entry: verify if entry == "verify" else entered, "_linear": sliced_linear, "_linears": sliced_linears,
+               "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base}
+    if submit_layers:
+        methods["_layer"] = submitted_layer
+    if taped is not None:
+        methods["_gated_delta"] = taped_gated_delta
+    return type(f"_ScopedVerify{base.__name__}", (base,), methods)
+
+
+@contextmanager
+def _exact_forwards(model, forwards, modules):
+    """Serve each of `forwards` (as `_QWEN3_5_VERIFIER`) for the language models of `model` it belongs to."""
+    owners, verifiers = [], []
+    try:
+        with _VERIFY_LOCK:
+            usable = not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and mx.metal.is_available()
+            for language_name, target_name, native_module, native_name, entry, submit in forwards if usable else ():
+                language = sys.modules.get(language_name)
+                native = getattr(sys.modules.get(native_module), native_name, None)
+                call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
+                target = getattr(language, target_name, None)
+                if (call is None or native is None
+                        or getattr(type(target), "_unsloth_verify_native", type(target)) is not native):
+                    continue
+                # qwen3_5_moe inherits the call; a shared module is yielded once per path.
+                found = {id(module): module for _, module in _fusion_modules(model, modules)
+                         if getattr(type(module), "__call__", None) is call}
+                methods = [getattr(native, name, None) for name in _VERIFY_METHODS]
+                patched = _exact_verify_class(native, entry, submit, *methods) if found else None
+                if patched is not None:
+                    target.__class__ = patched
+                    target._unsloth_verify_scopes = getattr(target, "_unsloth_verify_scopes", 0) + 1
+                    verifiers.append(target)
+                    for module in found.values():
+                        module._unsloth_verify_scopes = getattr(module, "_unsloth_verify_scopes", 0) + 1
+                        owners.append(module)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for owner in owners + verifiers:
+                owner._unsloth_verify_scopes -= 1
+                if not owner._unsloth_verify_scopes:
+                    owner.__dict__.pop("_unsloth_verify_scopes", None)
+                    if any(owner is verifier for verifier in verifiers):
+                        owner.__class__ = type(owner)._unsloth_verify_native
 
 
 @contextmanager
@@ -4246,39 +4311,23 @@ def exact_speculative_verify(model, *, _modules = None):
     every per-step state bit for bit. Only verify calls of the language models found here are served; other,
     training and distributed models, and an mlx-vlm whose verifier drifted, keep the native methods.
     """
-    owners, verifier = [], None
-    try:
-        with _VERIFY_LOCK:
-            language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
-            native = getattr(sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier"),
-                             "Qwen3_5BatchInvariantForward", None)
-            call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
-            target = getattr(language, "_EXACT_SPECULATIVE_VERIFIER", None)
-            if (call is not None and native is not None
-                    and getattr(type(target), "_unsloth_verify_native", type(target)) is native
-                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
-                    and mx.metal.is_available()):
-                # qwen3_5_moe inherits the call; a shared module is yielded once per path.
-                found = {id(module): module for _, module in _fusion_modules(model, _modules)
-                         if getattr(type(module), "__call__", None) is call}
-                methods = [vars(native).get(name) for name in _VERIFY_METHODS]
-                patched = _exact_verify_class(native, *methods) if found else None
-                if patched is not None:
-                    target.__class__ = patched
-                    target._unsloth_verify_scopes = getattr(target, "_unsloth_verify_scopes", 0) + 1
-                    verifier = target
-                    for module in found.values():
-                        module._unsloth_verify_scopes = getattr(module, "_unsloth_verify_scopes", 0) + 1
-                        owners.append(module)
+    with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
         yield model
-    finally:
-        with _VERIFY_LOCK:
-            for owner in owners + ([verifier] if verifier is not None else []):
-                owner._unsloth_verify_scopes -= 1
-                if not owner._unsloth_verify_scopes:
-                    owner.__dict__.pop("_unsloth_verify_scopes", None)
-                    if owner is verifier:
-                        verifier.__class__ = type(verifier)._unsloth_verify_native
+
+
+@contextmanager
+def exact_batch_invariant_decode(model, *, _modules = None):
+    """Speed up the batch-invariant forward qwen4_exp runs its one-token decode steps and its speculative verify blocks
+    on, during serialized inference.
+
+    As `exact_speculative_verify` does for the Qwen3.5 verifier, frozen quantized projections in blocks wider than
+    eight rows run over balanced row slices and sparse blocks' routed experts run on the decode kernels, each once its
+    first call of that shape matched the native call bit for bit. The forward already submits each layer. Only calls
+    of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
+    forward drifted, keep the native methods.
+    """
+    with _exact_forwards(model, (_QWEN4_FORWARD,), _modules):
+        yield model
 
 
 # MLX's sdpa_vector_2pass_1/2 (mlx/backend/metal/kernels/sdpa_vector.h, Copyright © 2024 Apple Inc., MIT),
@@ -4669,6 +4718,8 @@ INFERENCE_SCOPES = [
     InferenceScope(dense_prefill_linear),
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_residual_norm_handoff),
+    # qwen4_exp decodes on the forward its verify blocks run on, so every generation holds this one.
+    InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
 ]

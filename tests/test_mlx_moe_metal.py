@@ -680,7 +680,7 @@ def test_verify_blocks_run_their_routed_experts_on_the_decode_kernels_bitwise(mo
     block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
     xs = [mx.random.normal(shape).astype(mx.bfloat16) for shape in ((2, 5, 512), (1, 9, 512))]
     expected = [native()._feed_forward(block, x) for x in xs]
-    verifier = fusion._exact_verify_class(native, *(vars(native)[name] for name in fusion._VERIFY_METHODS))()
+    verifier = fusion._exact_verify_class(native, "verify", True, *(vars(native).get(name) for name in fusion._VERIFY_METHODS))()
     monkeypatch.setattr(fusion, "_VERIFY_VERDICTS", {})
     gathers = _counting_gather_qmm(monkeypatch)
     with fusion.fused_moe_routed_experts(block):
