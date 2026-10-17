@@ -16,6 +16,7 @@
 
 """MoE routing replay (UNSLOTH_GRPO_ROUTING_REPLAY): forcing the rollout's expert ids. CPU only."""
 
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -82,6 +83,186 @@ def _request(prompt, completion, routed):
         prompt_token_ids = list(prompt),
         outputs = [SimpleNamespace(token_ids = list(completion), routed_experts = np.asarray(routed, dtype = np.uint8)[:-1])],
     )
+
+
+@pytest.fixture
+def qwen35_cpu(monkeypatch):
+    # These native-model tests use the current raw-logit TopKRouter contract.
+    pytest.importorskip("transformers", minversion = "5.17.0")
+    qwen35 = pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
+    # Use Transformers' real PyTorch references even when CUDA-only kernels are installed.
+    for name in ("causal_conv1d_fn", "causal_conv1d_update", "torch_chunk_gated_delta_rule",
+                 "torch_recurrent_gated_delta_rule"):
+        monkeypatch.setattr(qwen35, name, inspect.unwrap(getattr(qwen35, name)))
+
+
+def _qwen35_model(text_only = False):
+    qwen35 = pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
+    from transformers import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig
+
+    torch.manual_seed(31)
+    text_config = Qwen3_5MoeTextConfig(
+        vocab_size = 64, hidden_size = 32, num_hidden_layers = 4,
+        num_attention_heads = 4, num_key_value_heads = 2, head_dim = 8,
+        linear_num_key_heads = 2, linear_num_value_heads = 4,
+        linear_key_head_dim = 8, linear_value_head_dim = 8,
+        moe_intermediate_size = 16, shared_expert_intermediate_size = 16,
+        num_experts = NUM_EXPERTS, num_experts_per_tok = TOP_K,
+        pad_token_id = PAD, use_cache = False,
+        rope_parameters = {"rope_type": "default", "rope_theta": 10000.0,
+                           "partial_rotary_factor": 1.0, "mrope_section": [1, 1, 2]},
+    )
+    if text_only:
+        model = qwen35.Qwen3_5MoeForCausalLM(text_config)
+        decoder = model.model
+    else:
+        config = Qwen3_5MoeConfig(
+            text_config = text_config,
+            vision_config = dict(depth = 1, hidden_size = 32, intermediate_size = 64,
+                                 num_heads = 4, out_hidden_size = 32, num_position_embeddings = 64,
+                                 patch_size = 2, temporal_patch_size = 2, spatial_merge_size = 2),
+            image_token_id = 60, video_token_id = 61, vision_start_token_id = 62,
+            vision_end_token_id = 63,
+        )
+        model = qwen35.Qwen3_5MoeForConditionalGeneration(config)
+        decoder = model.model.language_model
+    # Keep all four native layers: three linear-attention layers and one full-attention layer.
+    assert decoder.config.layer_types == ["linear_attention"] * 3 + ["full_attention"]
+    for layer in decoder.layers:
+        layer.mlp.gate.weight.data.normal_(0, 0.5)
+    return model.float().eval(), decoder
+
+
+def _qwen35_router_ids(model, decoder, ids, **kwargs):
+    captured = {}
+    handles = [layer.mlp.gate.register_forward_hook(
+        lambda m, a, out, i = i: captured.__setitem__(i, out[2].detach().clone())
+    ) for i, layer in enumerate(decoder.layers)]
+    try:
+        with torch.no_grad():
+            model(input_ids = ids, **kwargs)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return torch.stack([captured[i] for i in range(len(decoder.layers))], dim = 1)
+
+
+@pytest.mark.parametrize("text_only,peft_wrapper", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("positional", [False, True])
+def test_qwen35_wrapper_replays_captured_routes(replay, qwen35_cpu, text_only, peft_wrapper, positional):
+    model, decoder = _qwen35_model(text_only)
+    if peft_wrapper:
+        peft = pytest.importorskip("peft")
+        model = peft.get_peft_model(model, peft.LoraConfig(
+            r = 2, target_modules = ["q_proj", "v_proj"], task_type = "CAUSAL_LM",
+        ))
+    ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11]])
+    natural = _qwen35_router_ids(model, decoder, ids)
+    with torch.no_grad():
+        expected = model(input_ids = ids).logits
+    assert rr.install_routing_replay(model, tokenizer = SimpleNamespace(pad_token_id = PAD)) == 4
+    assert rr.install_routing_replay(model) == 0
+    rr.record_routed_experts([_request(ids[0, :3].tolist(), ids[0, 3:].tolist(), natural.numpy())])
+    with torch.no_grad():
+        actual = model(ids).logits if positional else model(input_ids = ids).logits
+    stats = rr.routing_replay_stats()
+    assert stats["router_calls_replayed"] == 4
+    assert stats["router_calls_natural"] == 0
+    assert stats["forwards"] == 1
+    assert stats["changed_selections"] == 0
+    torch.testing.assert_close(actual, expected, rtol = 1e-5, atol = 1e-6)
+
+
+def test_qwen35_wrapper_replays_reordered_padding_and_real_pad_tokens(replay, qwen35_cpu):
+    model, decoder = _qwen35_model()
+    sequences = [[5, PAD, 6, 7, 30, 31, PAD], [8, 9, 40, 41, 42]]
+    forced = [(_qwen35_router_ids(model, decoder, torch.tensor([ids])) + 2) % NUM_EXPERTS
+              for ids in sequences]
+    assert rr.install_routing_replay(model, tokenizer = SimpleNamespace(pad_token_id = PAD)) == 4
+    rr.record_routed_experts([_request(ids[:2], ids[2:], routes.numpy())
+                             for ids, routes in zip(sequences, forced)])
+    ids = torch.tensor([[PAD, PAD] + sequences[1], sequences[0]])
+    mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1], [1] * 7])
+    actual = _qwen35_router_ids(model, decoder, ids, attention_mask = mask).reshape(2, 7, 4, TOP_K)
+    torch.testing.assert_close(actual[0, 2:-1], forced[1][:-1])
+    torch.testing.assert_close(actual[1, :-1], forced[0][:-1])
+    stats = rr.routing_replay_stats()
+    assert stats["router_calls_replayed"] == 4
+    assert stats["replayed_tokens"] == sum(map(len, sequences))
+    assert stats["unmatched_tokens"] == 0
+    assert stats["changed_selections"] > 0
+
+
+@pytest.mark.parametrize("fail_parent", [False, True])
+def test_qwen35_parent_ids_do_not_leak_into_later_embedding_calls(replay, qwen35_cpu, fail_parent):
+    model, decoder = _qwen35_model()
+    ids = torch.tensor([[5, 6, 7, 8, 9]])
+    natural = _qwen35_router_ids(model, decoder, ids)
+    assert rr.install_routing_replay(model, tokenizer = SimpleNamespace(pad_token_id = PAD)) == 4
+    rr.record_routed_experts([_request(ids[0, :2].tolist(), ids[0, 2:].tolist(), natural.numpy())])
+
+    def fail(module, args):
+        raise RuntimeError("parent forward failed")
+
+    if fail_parent:
+        handle = model.model.register_forward_pre_hook(fail)
+        try:
+            with pytest.raises(RuntimeError, match = "parent forward failed"):
+                model(input_ids = ids)
+        finally:
+            handle.remove()
+    else:
+        with torch.no_grad():
+            model(input_ids = ids)
+        assert rr.routing_replay_stats()["router_calls_replayed"] == 4
+
+    before = rr.routing_replay_stats()["router_calls_replayed"]
+    with torch.no_grad():
+        # Bypassing the parent with real token IDs must still work.
+        decoder(input_ids = ids)
+        embeds = decoder.embed_tokens(ids)
+        # Neither a direct decoder call nor a fresh outer call can borrow the old IDs.
+        decoder(inputs_embeds = embeds)
+        model(inputs_embeds = embeds)
+    stats = rr.routing_replay_stats()
+    assert stats["router_calls_replayed"] == before + 4
+    assert stats["router_calls_natural"] == 8
+    assert not rr._STATE.in_forward
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_qwen35_wrapper_checkpoint_recomputes_each_training_forward(replay, qwen35_cpu, use_reentrant):
+    model, decoder = _qwen35_model()
+    sequences = [[5, 6, 7, 30, 31, 32, 33], [8, 9, 10, 40, 41, 42, 43]]
+    forced = [(_qwen35_router_ids(model, decoder, torch.tensor([ids])) + 2) % NUM_EXPERTS
+              for ids in sequences]
+
+    def run(checkpointing):
+        m, d = _qwen35_model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
+        rr.reset_routing_replay()
+        assert rr.install_routing_replay(m, tokenizer = SimpleNamespace(pad_token_id = PAD)) == 4
+        rr.record_routed_experts([_request(ids[:3], ids[3:], routes.numpy())
+                                 for ids, routes in zip(sequences, forced)])
+        # GRPO can make several equal-shape chunk forwards before running backward.
+        losses = [m(input_ids = torch.tensor([ids])).logits.float().square().mean() for ids in sequences]
+        assert rr.routing_replay_stats()["router_calls_replayed"] == 8
+        sum(losses).backward()
+        grads = [layer.mlp.gate.weight.grad.clone() for layer in d.layers]
+        for grad in grads:
+            assert torch.isfinite(grad).all() and grad.abs().sum() > 0
+        return torch.stack([loss.detach() for loss in losses]), grads
+
+    expected_loss, expected_grads = run(False)
+    actual_loss, actual_grads = run(True)
+    stats = rr.routing_replay_stats()
+    assert stats["router_calls_recomputed"] == 8
+    assert stats["router_calls_replayed"] == 16
+    torch.testing.assert_close(actual_loss, expected_loss, rtol = 1e-5, atol = 1e-6)
+    for actual, expected in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual, expected, rtol = 1e-4, atol = 1e-6)
 
 
 @pytest.fixture
