@@ -16,6 +16,7 @@
 
 """MoE routing replay (UNSLOTH_GRPO_ROUTING_REPLAY): forcing the rollout's expert ids. CPU only."""
 
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -82,6 +83,62 @@ def _request(prompt, completion, routed):
         prompt_token_ids = list(prompt),
         outputs = [SimpleNamespace(token_ids = list(completion), routed_experts = np.asarray(routed, dtype = np.uint8)[:-1])],
     )
+
+
+def test_qwen35_wrapper_replays_captured_routes(replay, monkeypatch):
+    pytest.importorskip("transformers", minversion = "5.17.0")
+    from transformers import Qwen3_5MoeConfig
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen35
+
+    # Run the native hybrid model on CPU, even when CUDA-only kernels are installed.
+    for name in ("causal_conv1d_fn", "torch_chunk_gated_delta_rule"):
+        monkeypatch.setattr(qwen35, name, inspect.unwrap(getattr(qwen35, name)))
+    config = Qwen3_5MoeConfig(
+        text_config = dict(
+            vocab_size = 64, hidden_size = 32, num_hidden_layers = 4,
+            num_attention_heads = 4, num_key_value_heads = 2, head_dim = 8,
+            linear_num_key_heads = 2, linear_num_value_heads = 4,
+            linear_key_head_dim = 8, linear_value_head_dim = 8,
+            moe_intermediate_size = 16, shared_expert_intermediate_size = 16,
+            num_experts = NUM_EXPERTS, num_experts_per_tok = TOP_K,
+            pad_token_id = PAD, use_cache = False,
+            rope_parameters = {"rope_type": "default", "rope_theta": 10000.0,
+                               "partial_rotary_factor": 1.0, "mrope_section": [1, 1, 2]},
+        ),
+        vision_config = dict(depth = 1, hidden_size = 32, intermediate_size = 64,
+                             num_heads = 4, out_hidden_size = 32, num_position_embeddings = 64),
+    )
+    torch.manual_seed(31)
+    model = qwen35.Qwen3_5MoeForConditionalGeneration(config).float().eval()
+    decoder = model.model.language_model
+    assert decoder.config.layer_types == ["linear_attention"] * 3 + ["full_attention"]
+    captured, handles = [], []
+    for layer in decoder.layers:
+        layer.mlp.gate.weight.data.normal_(0, 0.5)
+        handles.append(layer.mlp.gate.register_forward_hook(
+            lambda m, a, out: captured.append(out[2].detach())
+        ))
+    ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11]])
+    with torch.no_grad():
+        expected = model(input_ids = ids).logits
+    for handle in handles:
+        handle.remove()
+    natural = torch.stack(captured, dim = 1)
+
+    assert rr.install_routing_replay(model, tokenizer = SimpleNamespace(pad_token_id = PAD)) == 4
+    rr.record_routed_experts([_request(ids[0, :3].tolist(), ids[0, 3:].tolist(), natural.numpy())])
+    with torch.no_grad():
+        actual = model(input_ids = ids).logits
+    stats = rr.routing_replay_stats()
+    assert stats["router_calls_replayed"] == 4
+    assert stats["router_calls_natural"] == 0
+    assert stats["forwards"] == 1
+    torch.testing.assert_close(actual, expected, rtol = 1e-5, atol = 1e-6)
+    # A later embedding-only call must not inherit the previous parent's token IDs.
+    with torch.no_grad():
+        decoder(inputs_embeds = decoder.embed_tokens(ids))
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 4
+    assert rr.routing_replay_stats()["router_calls_natural"] == 4
 
 
 @pytest.fixture

@@ -323,10 +323,19 @@ def _build_replay(input_ids, position_ids, attention_mask = None):
     return out.to(input_ids.device, non_blocking = True).long()
 
 
-def _decoder_pre_hook(module, args, kwargs):
+def _input_ids(args, kwargs):
     input_ids = kwargs.get("input_ids", None)
     if input_ids is None and len(args) > 0 and torch.is_tensor(args[0]) and not args[0].is_floating_point():
         input_ids = args[0]
+    return input_ids
+
+
+def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
+    input_ids = _input_ids(args, kwargs)
+    if input_ids is None and parent_input_ids:
+        parent_ids, embeds = parent_input_ids[-1], kwargs.get("inputs_embeds")
+        if torch.is_tensor(parent_ids) and torch.is_tensor(embeds) and embeds.shape[:2] == parent_ids.shape:
+            input_ids = parent_ids
     _STATE.stats["forwards"] += 1
     _STATE.forwarded_since_record = True
     _STATE.in_forward = True
@@ -540,6 +549,7 @@ def install_routing_replay(model, llm = None, tokenizer = None):
         elif decoder is None and isinstance(getattr(module, "layers", None), torch.nn.ModuleList) \
                 and hasattr(module, "embed_tokens"):
             decoder = module
+            decoder_name = name
     if not routers or decoder is None:
         warnings.warn(
             "Unsloth: routing replay found no transformers >= 5 TopKRouter modules on this "
@@ -548,7 +558,23 @@ def install_routing_replay(model, llm = None, tokenizer = None):
         return 0
     for layer_index, module in routers:
         module.register_forward_hook(_router_hook(layer_index))
-    decoder.register_forward_pre_hook(_decoder_pre_hook, with_kwargs = True)
+    parent_input_ids = []
+    if decoder_name:
+        # Qwen3.5 embeds tokens in the parent. Keep its IDs only until that forward exits.
+        parent = model.get_submodule(decoder_name.rpartition(".")[0])
+
+        def parent_pre_hook(module, args, kwargs):
+            parent_input_ids.append(_input_ids(args, kwargs))
+
+        def parent_post_hook(module, args, output):
+            if parent_input_ids:
+                parent_input_ids.pop()
+
+        parent.register_forward_pre_hook(parent_pre_hook, with_kwargs = True)
+        parent.register_forward_hook(parent_post_hook, always_call = True)
+    decoder.register_forward_pre_hook(
+        functools.partial(_decoder_pre_hook, parent_input_ids = parent_input_ids), with_kwargs = True,
+    )
     decoder.register_forward_hook(_decoder_post_hook, always_call = True)
     model._unsloth_routing_replay_installed = True
     print(f"Unsloth: MoE routing replay is on for {len(routers)} routers.")
