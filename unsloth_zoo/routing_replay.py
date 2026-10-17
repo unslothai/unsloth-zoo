@@ -330,8 +330,12 @@ def _input_ids(args, kwargs):
     return input_ids
 
 
-def _decoder_pre_hook(module, args, kwargs):
+def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
     input_ids = _input_ids(args, kwargs)
+    if input_ids is None and parent_input_ids:
+        parent_ids, embeds = parent_input_ids[-1], kwargs.get("inputs_embeds")
+        if torch.is_tensor(parent_ids) and torch.is_tensor(embeds) and embeds.shape[:2] == parent_ids.shape:
+            input_ids = parent_ids
     _STATE.stats["forwards"] += 1
     _STATE.forwarded_since_record = True
     _STATE.in_forward = True
@@ -358,42 +362,6 @@ def _decoder_post_hook(module, args, output):
     _STATE.in_forward = False
     _STATE.record = None
     return None
-
-
-def _install_decoder_hooks(model, decoder, decoder_name):
-    pre_hook = _decoder_pre_hook
-    if decoder_name:
-        parent = model.get_submodule(decoder_name.rpartition(".")[0])
-        active_inputs = []
-
-        def parent_pre_hook(module, args, kwargs):
-            active_inputs.append((_input_ids(args, kwargs), kwargs.get("position_ids"), kwargs.get("attention_mask")))
-
-        def parent_post_hook(module, args, output):
-            if active_inputs:
-                active_inputs.pop()
-
-        def pre_hook(module, args, kwargs):
-            # VLM wrappers (e.g. Qwen3.5) embed the tokens before calling their decoder.
-            # Borrow token metadata only within that parent's forward, never from an old batch.
-            if _input_ids(args, kwargs) is None and active_inputs:
-                input_ids, position_ids, attention_mask = active_inputs[-1]
-                embeds = kwargs.get("inputs_embeds")
-                if torch.is_tensor(input_ids) and input_ids.dim() == 2 \
-                        and torch.is_tensor(embeds) and embeds.dim() == 3 \
-                        and embeds.shape[:2] == input_ids.shape:
-                    # This copy is only for route lookup: the decoder still receives embeddings alone.
-                    kwargs = dict(kwargs, input_ids = input_ids)
-                    if kwargs.get("position_ids") is None:
-                        kwargs["position_ids"] = position_ids
-                    if kwargs.get("attention_mask") is None:
-                        kwargs["attention_mask"] = attention_mask
-            return _decoder_pre_hook(module, args, kwargs)
-
-        parent.register_forward_pre_hook(parent_pre_hook, with_kwargs = True)
-        parent.register_forward_hook(parent_post_hook, always_call = True)
-    decoder.register_forward_pre_hook(pre_hook, with_kwargs = True)
-    decoder.register_forward_hook(_decoder_post_hook, always_call = True)
 
 
 def _uses_checkpointing(decoder):
@@ -590,7 +558,24 @@ def install_routing_replay(model, llm = None, tokenizer = None):
         return 0
     for layer_index, module in routers:
         module.register_forward_hook(_router_hook(layer_index))
-    _install_decoder_hooks(model, decoder, decoder_name)
+    parent_input_ids = []
+    if decoder_name:
+        # Qwen3.5 embeds tokens in the parent. Keep its IDs only until that forward exits.
+        parent = model.get_submodule(decoder_name.rpartition(".")[0])
+
+        def parent_pre_hook(module, args, kwargs):
+            parent_input_ids.append(_input_ids(args, kwargs))
+
+        def parent_post_hook(module, args, output):
+            if parent_input_ids:
+                parent_input_ids.pop()
+
+        parent.register_forward_pre_hook(parent_pre_hook, with_kwargs = True)
+        parent.register_forward_hook(parent_post_hook, always_call = True)
+    decoder.register_forward_pre_hook(
+        functools.partial(_decoder_pre_hook, parent_input_ids = parent_input_ids), with_kwargs = True,
+    )
+    decoder.register_forward_hook(_decoder_post_hook, always_call = True)
     model._unsloth_routing_replay_installed = True
     print(f"Unsloth: MoE routing replay is on for {len(routers)} routers.")
     return len(routers)
