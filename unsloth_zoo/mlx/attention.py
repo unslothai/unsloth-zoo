@@ -654,11 +654,11 @@ def fast_prefill_attention(queries, keys, values, block_indices, query_ends, sca
 # The same prefill on simdgroup matrices, for GPUs without tensor units: MLX's steel flash attention
 # (steel/attn/kernels/steel_attention.h and mma.h, Copyright © 2024-25 Apple Inc., MIT) over gathered keys.
 # A threadgroup is one (query row, KV head); its two simdgroups own 8 of the 16 padded query-head rows each.
-# Keys come 128 at a time in the tensor-unit kernel's order, and each 32-wide slice of D is gathered with
-# its query slice into threadgroup memory, so a tile costs 10 KB and several threadgroups share a core.
+# Keys come 64 at a time in the tensor-unit kernel's order, and each 32-wide slice of D is gathered with
+# its query slice into threadgroup memory, so a tile costs 5 KB and several threadgroups share a core.
 _SIMD_PREFILL_SOURCE = """
     constexpr int D = 256;
-    constexpr int BK = 128;
+    constexpr int BK = 64;
     constexpr int DC = 32;
     const ushort tid = thread_index_in_threadgroup;
     const ushort lane = thread_index_in_simdgroup;
@@ -762,7 +762,8 @@ _SIMD_PREFILL_SOURCE = """
         o[d].thread_elements()[1] *= factor;
       }
 
-      for (short c = 0; c < D; c += DC) {
+      // Unrolled, so the o[] fragments this chunk updates are known at compile time and stay in registers.
+      UNROLL for (short c = 0; c < D; c += DC) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int i = tid; i < BK * DC / 8; i += 64) {
           const int r = i / (DC / 8), cc = (i % (DC / 8)) * 8;
