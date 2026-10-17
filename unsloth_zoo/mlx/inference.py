@@ -4208,7 +4208,9 @@ _EXACT_ATTENTION_ROWS = """
 
     const device T* kp = k + b * k_strides[0] + h * k_strides[1] + block * k_strides[2] + lane * qk;
     const device T* vp = v + b * v_strides[0] + h * v_strides[1] + block * v_strides[2] + lane * qk;
-    for (int i = block; i < prefix + min(r0 + 2, L); i += BLOCKS) {
+    // The last threadgroup's spare row-pair slots load nothing.
+    const int end = r0 < L ? prefix + min(r0 + 2, L) : 0;
+    for (int i = block; i < end; i += BLOCKS) {
         float kr[qk], vr[qk];
         for (int j = 0; j < qk; j++) {
             kr[j] = kp[j];
@@ -4297,8 +4299,9 @@ _EXACT_ATTENTION_REDUCE = """
 """
 # Below this many keys attention is too small a share of a verify round to time; above it, the kernel is timed.
 _EXACT_ATTENTION_MIN_KEYS = 8192
-# Whether the kernel timed faster, per (batch, width, heads, kv heads, dtype, power-of-two bucket of the first row's keys).
+# Per timing key: True once the kernel timed faster, else [timings, calls left before retiming], as short of memory the kernel can run slow for a while.
 _EXACT_ATTENTION_TIMED = {}
+_EXACT_ATTENTION_TIMINGS, _EXACT_ATTENTION_RETRY = 3, 128
 
 
 @functools.cache
@@ -4359,15 +4362,21 @@ def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
     fused = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
     # Each bucket is timed on its own: the kernel's advantage is not monotone in the key count (odd widths leave a pair half empty).
     timing = (queries.shape[0], length, queries.shape[1], keys.shape[1], queries.dtype, first.bit_length())
-    if (faster := _EXACT_ATTENTION_TIMED.get(timing)) is None:
+    if (lost := _EXACT_ATTENTION_TIMED.get(timing)) is not True:
+        if lost is not None:
+            lost[1] -= 1
+            if lost[1] > 0 or lost[0] >= _EXACT_ATTENTION_TIMINGS:
+                return per_row()
         try:
             mx.eval(queries, keys, values)
         except (RuntimeError, ValueError) as error:
             _unless_failed_buffer(error)
             return per_row()  # inside a function transformation, which cannot evaluate; timed later
-        faster = _EXACT_ATTENTION_TIMED[timing] = _exact_attention_faster(per_row, fused)
-    if not faster:
-        return per_row()
+        if not _exact_attention_faster(per_row, fused):
+            timings = 1 if lost is None else lost[0] + 1
+            _EXACT_ATTENTION_TIMED[timing] = [timings, _EXACT_ATTENTION_RETRY << timings]
+            return per_row()
+        _EXACT_ATTENTION_TIMED[timing] = True
     key = ((queries.shape[0], length), "attention", queries.shape[1], keys.shape[1], queries.dtype, blocks)
     return _verify_admitted(key, per_row, fused)
 

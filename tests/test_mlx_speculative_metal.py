@@ -728,6 +728,14 @@ def test_exact_attention_engages_where_timed_faster_and_caches_each_bucket_verdi
     assert timings == [9000, 20000, 40000]
     # Each width is timed apart, and a loss in a larger bucket leaves a smaller one to its own timing.
     assert attend(40000, q[:, :, :3]) == 40000 and attend(9500, q[:, :, :3]) == "kernel" and timings == [9000, 20000, 40000, 40000, 9500]
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_RETRY", 1)
+    q5 = mx.zeros((1, 24, 5, 256), mx.bfloat16)
+    del timings[:]
+    seen = [(attend(9800, q5), len(timings)) for _ in range(20)]
+    assert {out for out, _ in seen} == {9800} and [n for _, n in seen] == [1, 1, 2, 2, 2, 2] + [3] * 14
+    first = attend(17000, q5)
+    wins.add(17000)
+    assert [first] + [attend(17000, q5) for _ in range(4)] == [17000, 17000, "kernel", "kernel", "kernel"] and timings == [9800] * 3 + [17000] * 2
     # The kernel must beat the one-row calls by 5% on the medians of three alternating runs; each run advances the clock by its own time.
     for rows, kernel, verdict in (((10, 30, 10), (9.4, 9.4, 30), True), ((10, 10, 40), (9.4, 9.6, 9.6), False)):
         now, spent, order = [0.0], [0.0], []
