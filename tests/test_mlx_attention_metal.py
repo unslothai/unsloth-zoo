@@ -62,8 +62,11 @@ from unsloth_zoo.mlx.attention import (
     fused_kernel_exists,
     install_quantized_attention,
     probe_fast_prefill,
+    probe_simd_prefill,
     quantized_sdpa_over,
     select_blocks,
+    simd_prefill_attention,
+    simd_prefill_supported,
 )
 
 GS = 64
@@ -697,3 +700,35 @@ def test_qsa_fast_prefill_covers_only_the_measured_layout(change):
     }.get(change, (B, H, KV, D, L, topk, block, dtype))
     queries, keys = mx.zeros((B, H, L, D), dtype), mx.zeros((B, KV, 4096, D), dtype)
     assert fast_prefill_supported(queries, keys, mx.zeros((B, L, topk), mx.int32), block) == (change is None)
+
+
+def test_qsa_simd_prefill_matches_the_native_kernel():
+    probe_simd_prefill()
+
+
+@pytest.mark.parametrize("heads, topk", [(4, 512), (32, 512), (24, 256)])
+def test_qsa_simd_prefill_matches_other_query_groups(heads, topk):
+    from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
+    L, N = 64, 2400
+    q = mx.random.normal((1, heads, L, 256), key = mx.random.key(1)).astype(mx.bfloat16)
+    k, v = (mx.random.normal((1, 2, N, 256), key = mx.random.key(i)).astype(mx.bfloat16) for i in (2, 3))
+    ends = mx.arange(N - L + 1, N + 1, dtype = mx.int32)[None]
+    picks = mx.argsort(mx.random.uniform(shape = (1, L, 584), key = mx.random.key(4)), axis = -1)[..., :topk]  # complete blocks
+    native = qsa_sparse_attention(q, k, v, picks, ends, scale = 0.0625, block_size = 4).astype(mx.float32)
+    got = simd_prefill_attention(q, k, v, picks, ends, 0.0625).astype(mx.float32)
+    assert mx.abs(got - native).max().item() <= 0.02 * mx.abs(native).max().item()
+
+
+@pytest.mark.parametrize("change", [None, "group", "topk", "batch", "uneven", "wide_group", "width", "dtype", "block",
+                                    "rows"])
+def test_qsa_simd_prefill_covers_query_groups_up_to_16(change):
+    B, H, KV, D, L, topk, block, dtype = {
+        "group": (1, 8, 1, 256, 64, 512, 4, mx.bfloat16), "topk": (1, 24, 2, 256, 64, 256, 4, mx.bfloat16),
+        "batch": (2, 24, 2, 256, 64, 512, 4, mx.bfloat16), "uneven": (1, 24, 5, 256, 64, 512, 4, mx.bfloat16),
+        "wide_group": (1, 34, 2, 256, 64, 512, 4, mx.bfloat16), "width": (1, 24, 2, 128, 64, 512, 4, mx.bfloat16),
+        "dtype": (1, 24, 2, 256, 64, 512, 4, mx.float16), "block": (1, 24, 2, 256, 64, 512, 8, mx.bfloat16),
+        "rows": (1, 24, 2, 256, 63, 512, 4, mx.bfloat16),
+    }.get(change, (1, 24, 2, 256, 64, 512, 4, mx.bfloat16))
+    queries, keys = mx.zeros((B, H, L, D), dtype), mx.zeros((B, KV, 4096, D), dtype)
+    covered = change in (None, "group", "topk")
+    assert simd_prefill_supported(queries, keys, mx.zeros((B, L, topk), mx.int32), block) == covered

@@ -934,6 +934,26 @@ def test_qsa_prefill_route_takes_indexed_prefill_and_restores(monkeypatch):
     assert calls == [20, 30, 41] and qwen4.dispatch_qsa_attention is native
 
 
+def test_qsa_prefill_route_takes_the_simdgroup_kernel_without_tensor_units(monkeypatch):
+    from mlx_vlm.models.qwen4_exp import qsa_kernel
+    attention, calls, probe = _qsa_layer(), [], nax.kernel_probe_passed
+    _qsa_prefill_scope(monkeypatch, [])
+    monkeypatch.setattr(nax, "kernel_probe_passed", probe)
+    monkeypatch.setattr(nax, "nax_available", lambda: False)
+    monkeypatch.setattr(nax, "_PROBES", {})
+    monkeypatch.setattr(nax, "_stored_probes", lambda: {})
+    monkeypatch.setattr(nax, "_store_probe", lambda *args: None)
+    monkeypatch.setattr(nax, "_run_probe", lambda module, function: "")
+    monkeypatch.setattr(mlx_attention, "simd_prefill_supported", lambda queries, *args: queries.shape[2] >= 20)
+    monkeypatch.setattr(mlx_attention, "simd_prefill_attention", lambda q, k, v, blocks, ends, scale: calls.append(
+        q.shape[2]) or qsa_kernel.qsa_sparse_attention(q, k, v, blocks, ends, scale = scale, block_size = 4))
+    expected = _qsa_run(attention)
+    with decode.inference_scopes(attention):
+        for actual, out in zip(_qsa_run(attention), expected):
+            _equal(actual, out)
+    assert calls == [20, 30, 41]
+
+
 @pytest.mark.parametrize("reason", ["switch", "probe", "body"])
 def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
     attention, calls = _qsa_layer(), []

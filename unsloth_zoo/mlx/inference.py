@@ -4680,14 +4680,14 @@ _QSA_PREFILL_CONTRACT = {
 }
 
 
-def _qsa_prefill_route(native, bindings, plan_of, indexed):
+def _qsa_prefill_route(native, bindings, plan_of, indexed, supported, attend):
     def dispatch_qsa_attention(queries, keys, values, block_indices, query_ends, *, cache, scale, block_size,
                                causal, mask, mask_factory, allow_sparse_decode = False):
         if (_bindings_intact(bindings) and plan_of(queries, keys, values, block_indices, query_ends,
                                                    block_size = block_size, causal = causal,
                                                    allow_sparse_decode = allow_sparse_decode) is indexed
-                and attention.fast_prefill_supported(queries, keys, block_indices, block_size)):
-            return attention.fast_prefill_attention(queries, keys, values, block_indices, query_ends, scale)
+                and supported(queries, keys, block_indices, block_size)):
+            return attend(queries, keys, values, block_indices, query_ends, scale)
         return native(queries, keys, values, block_indices, query_ends, cache = cache, scale = scale,
                       block_size = block_size, causal = causal, mask = mask, mask_factory = mask_factory,
                       allow_sparse_decode = allow_sparse_decode)
@@ -4746,17 +4746,25 @@ def fused_qsa_attention(model, *, _modules = None):
 
 
 def fast_qsa_prefill(model, *, _modules = None):
-    """Run mlx-vlm's indexed QSA prefill of the Qwen3.8 layout on the neural accelerators once its kernel
-    passes a probe; not bitwise, as its fp32 sums run in another order. Other calls keep the native kernel.
-    `dispatch_qsa_attention` is rebound process-wide while any scope is open."""
+    """Run mlx-vlm's indexed QSA prefill on the neural accelerators (Qwen3.8 layout), or on GPUs without
+    them on simdgroup matrices, once the kernel passes a probe; not bitwise, as its fp32 sums run in
+    another order. Other calls keep the native kernel. `dispatch_qsa_attention` is rebound process-wide
+    while any scope is open."""
     def enter(entered, language, indexer):
         kernels = sys.modules.get("mlx_vlm.models.qwen4_exp.qsa_kernel")
-        if kernels is not None and nax.kernel_probe_passed(
-                attention.PREFILL_PROBE_KEY, attention.__name__, "probe_fast_prefill"):
-            _qsa_enter(entered, "prefill", _QSA_PREFILL_CONTRACT, language, "dispatch_qsa_attention",
-                       lambda native, bindings: _qsa_prefill_route(
-                           native, bindings, kernels.select_qsa_execution_plan,
-                           kernels.QSAExecutionPlan.INDEXED_SPARSE_PREFILL))
+        if kernels is None:
+            return
+        if nax.kernel_probe_passed(attention.PREFILL_PROBE_KEY, attention.__name__, "probe_fast_prefill"):
+            supported, attend = attention.fast_prefill_supported, attention.fast_prefill_attention
+        elif nax.kernel_probe_passed(attention.SIMD_PREFILL_PROBE_KEY, attention.__name__, "probe_simd_prefill",
+                                     mx.metal.is_available):
+            supported, attend = attention.simd_prefill_supported, attention.simd_prefill_attention
+        else:
+            return
+        _qsa_enter(entered, "prefill", _QSA_PREFILL_CONTRACT, language, "dispatch_qsa_attention",
+                   lambda native, bindings: _qsa_prefill_route(
+                       native, bindings, kernels.select_qsa_execution_plan,
+                       kernels.QSAExecutionPlan.INDEXED_SPARSE_PREFILL, supported, attend))
 
     return _qsa_routes(model, _modules, enter)
 

@@ -411,6 +411,21 @@ def select_blocks(scores, complete, topk, head_dim):
     return out
 
 
+# Reductions over a fragment row: its lanes differ in bits 0 and 3 in both kernels' layouts.
+_ROW_REDUCE = """
+template <typename T>
+inline T row_max(T x) {
+  x = metal::max(x, simd_shuffle_xor(x, ushort(1)));
+  return metal::max(x, simd_shuffle_xor(x, ushort(8)));
+}
+
+template <typename T>
+inline T row_sum(T x) {
+  x += simd_shuffle_xor(x, ushort(1));
+  return x + simd_shuffle_xor(x, ushort(8));
+}
+"""
+
 # Tensor-unit QSA prefill attention over the selected blocks (inexact: fp32 sums in another order).
 _PREFILL_HEADER = """
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -442,18 +457,7 @@ inline void nax_mma(thread vec<C, 8>& c0, thread vec<C, 8>& c1, const thread vec
   }
 }
 
-template <typename T>
-inline T row_max(T x) {
-  x = metal::max(x, simd_shuffle_xor(x, ushort(1)));
-  return metal::max(x, simd_shuffle_xor(x, ushort(8)));
-}
-
-template <typename T>
-inline T row_sum(T x) {
-  x += simd_shuffle_xor(x, ushort(1));
-  return x + simd_shuffle_xor(x, ushort(8));
-}
-"""
+""" + _ROW_REDUCE[1:]
 
 # MLX's NAX flash attention (steel_attention_nax.h) over gathered keys. A threadgroup is one (query row, KV head);
 # fragment rows are that KV head's query heads. Simdgroup sg scores half of D, the halves meet in threadgroup
@@ -641,7 +645,192 @@ def fast_prefill_attention(queries, keys, values, block_indices, query_ends, sca
     )[0]
 
 
+# The same prefill on simdgroup matrices, for GPUs without tensor units: MLX's steel flash attention
+# (steel/attn/kernels/steel_attention.h and mma.h, Copyright © 2024-25 Apple Inc., MIT) over gathered keys.
+# A threadgroup is one (query row, KV head); its two simdgroups own 8 of the 16 padded query-head rows each.
+# Keys come 128 at a time in the tensor-unit kernel's order, and each 32-wide slice of D is gathered with
+# its query slice into threadgroup memory, so a tile costs 10 KB and several threadgroups share a core.
+_SIMD_PREFILL_SOURCE = """
+    constexpr int D = 256;
+    constexpr int BK = 128;
+    constexpr int DC = 32;
+    const ushort tid = thread_index_in_threadgroup;
+    const ushort lane = thread_index_in_simdgroup;
+    const short sg = simdgroup_index_in_threadgroup;
+    const int tq = threadgroup_position_in_grid.x;
+    const int kvh = threadgroup_position_in_grid.y;
+    const int kL = params[0];
+    const int L = params[1];
+    const float scale2 = scale[0] * 1.44269504089f;
+    threadgroup bfloat qs[16 * DC];
+    threadgroup bfloat ts[BK * DC];
+    threadgroup int rows[BK];
+
+    // MLX's 8x8 fragment layout (steel/attn/mma.h): this lane holds row fm, columns fn and fn + 1.
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) + ((lane >> 1) & 3);
+    const short fn = (qid & 2) * 2 + (lane & 1) * 2;
+    const short qrow = sg * 8 + fm;
+
+    const int qe = query_ends[tq];
+    const int complete = qe >> 2;
+    const int nsel = min(TOPK, complete);
+    const int ntail = qe - (complete << 2);
+    const int NK = 4 * (nsel + (ntail > 0 ? 1 : 0));
+    const device int* blk = sel + size_t(tq) * TOPK + (TOPK - nsel);
+    const device bfloat* qh = (const device bfloat*)q + size_t(kvh * GQA) * L * D + size_t(tq) * D;
+    const device bfloat* kh = (const device bfloat*)k + size_t(kvh) * kL * D;
+    const device bfloat* vh = (const device bfloat*)v + size_t(kvh) * kL * D;
+
+    simdgroup_matrix<float, 8, 8> o[D / 8];
+    UNROLL for (short d = 0; d < D / 8; d++) o[d] = simdgroup_matrix<float, 8, 8>(0);
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int t0 = 0; t0 < NK; t0 += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int s = tid; s < BK; s += 64) {
+        const int slot = t0 + s, u = slot >> 2, j = slot & 3;
+        int r = -1;
+        if (u < nsel) {
+          const int b = blk[u];
+          // mlx-vlm sends no pick outside [0, complete); skipping them keeps any input from addressing past the keys.
+          if (uint(b) < uint(complete)) r = 4 * b + j;
+        } else if (slot < NK && j < ntail) {
+          r = 4 * complete + j;
+        }
+        rows[s] = r < kL ? r : -1;
+      }
+
+      simdgroup_matrix<float, 8, 8> sc[BK / 8];
+      UNROLL for (short j = 0; j < BK / 8; j++) sc[j] = simdgroup_matrix<float, 8, 8>(0);
+      for (short c = 0; c < D; c += DC) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < BK * DC / 8; i += 64) {
+          const int r = i / (DC / 8), cc = (i % (DC / 8)) * 8;
+          *(threadgroup vec<bfloat, 8>*)(ts + r * DC + cc) =
+              *(const device vec<bfloat, 8>*)(kh + size_t(max(rows[r], 0)) * D + c + cc);
+        }
+        for (int i = tid; i < 16 * DC / 8; i += 64) {
+          const int r = i / (DC / 8), cc = (i % (DC / 8)) * 8;
+          *(threadgroup vec<bfloat, 8>*)(qs + r * DC + cc) =
+              r < GQA ? *(const device vec<bfloat, 8>*)(qh + size_t(r) * L * D + c + cc) : vec<bfloat, 8>(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        UNROLL for (short kk = 0; kk < DC; kk += 8) {
+          simdgroup_matrix<float, 8, 8> a;
+          a.thread_elements()[0] = float(qs[qrow * DC + kk + fn]);
+          a.thread_elements()[1] = float(qs[qrow * DC + kk + fn + 1]);
+          UNROLL for (short j = 0; j < BK / 8; j++) {
+            simdgroup_matrix<float, 8, 8> b;  // b[r][n] = K[key 8j + n][dim kk + r]
+            b.thread_elements()[0] = float(ts[(8 * j + fn) * DC + kk + fm]);
+            b.thread_elements()[1] = float(ts[(8 * j + fn + 1) * DC + kk + fm]);
+            simdgroup_multiply_accumulate(sc[j], a, b, sc[j]);
+          }
+        }
+      }
+
+      float smax = -INFINITY;
+      UNROLL for (short j = 0; j < BK / 8; j++) {
+        UNROLL for (short e = 0; e < 2; e++) {
+          const float x = rows[8 * j + fn + e] >= 0 ? sc[j].thread_elements()[e] * scale2 : -INFINITY;
+          sc[j].thread_elements()[e] = x;
+          smax = metal::max(smax, x);
+        }
+      }
+      const float mnew = metal::max(m, row_max(smax));
+      const float mref = mnew == -INFINITY ? 0.0f : mnew;
+      const float factor = fast::exp2(m - mref);
+      m = mnew;
+      float psum = 0.0f;
+      UNROLL for (short j = 0; j < BK / 8; j++) {
+        UNROLL for (short e = 0; e < 2; e++) {
+          const float p = fast::exp2(sc[j].thread_elements()[e] - mref);
+          sc[j].thread_elements()[e] = p;
+          psum += p;
+        }
+      }
+      l = l * factor + row_sum(psum);
+      UNROLL for (short d = 0; d < D / 8; d++) {
+        o[d].thread_elements()[0] *= factor;
+        o[d].thread_elements()[1] *= factor;
+      }
+
+      for (short c = 0; c < D; c += DC) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < BK * DC / 8; i += 64) {
+          const int r = i / (DC / 8), cc = (i % (DC / 8)) * 8;
+          *(threadgroup vec<bfloat, 8>*)(ts + r * DC + cc) =
+              *(const device vec<bfloat, 8>*)(vh + size_t(max(rows[r], 0)) * D + c + cc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        UNROLL for (short dd = 0; dd < DC; dd += 8) {
+          UNROLL for (short j = 0; j < BK / 8; j++) {
+            simdgroup_matrix<float, 8, 8> b;  // b[r][n] = V[key 8j + r][dim dd + n]
+            b.thread_elements()[0] = float(ts[(8 * j + fm) * DC + dd + fn]);
+            b.thread_elements()[1] = float(ts[(8 * j + fm) * DC + dd + fn + 1]);
+            simdgroup_multiply_accumulate(o[(c + dd) / 8], sc[j], b, o[(c + dd) / 8]);
+          }
+        }
+      }
+    }
+
+    if (qrow < GQA) {
+      const float rr = l == 0.0f ? 0.0f : 1.0f / l;
+      device bfloat* orow = (device bfloat*)out + (size_t(kvh * GQA + qrow) * L + tq) * D + fn;
+      UNROLL for (short d = 0; d < D / 8; d++) {
+        vec<bfloat, 2> w;
+        w[0] = bfloat(o[d].thread_elements()[0] * rr);
+        w[1] = bfloat(o[d].thread_elements()[1] * rr);
+        *(device vec<bfloat, 2>*)(orow + 8 * d) = w;
+      }
+    }"""
+
+_SIMD_PREFILL_HEADER = '\n#define UNROLL _Pragma("clang loop unroll(full)")\n' + _ROW_REDUCE
+SIMD_PREFILL_PROBE_KEY = "qsa_simd_prefill:" + hashlib.sha256(
+    (_SIMD_PREFILL_HEADER + _SIMD_PREFILL_SOURCE).encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _simd_prefill_kernel():
+    return mx.fast.metal_kernel(
+        name = "unsloth_qsa_simd_prefill", input_names = ["q", "k", "v", "sel", "query_ends", "params", "scale"],
+        output_names = ["out"], header = _SIMD_PREFILL_HEADER, source = _SIMD_PREFILL_SOURCE,
+    )
+
+
+def simd_prefill_supported(queries, keys, block_indices, block_size):
+    """Whether `simd_prefill_attention` covers this indexed prefill call."""
+    B, H, L, D = queries.shape
+    KV = keys.shape[1]
+    return (B == 1 and D == 256 and block_size == 4 and H % KV == 0 and H // KV <= 16 and L >= PREFILL_MIN_ROWS
+            and queries.dtype == keys.dtype == mx.bfloat16)
+
+
+def simd_prefill_attention(queries, keys, values, block_indices, query_ends, scale):
+    """mlx-vlm's indexed QSA prefill attention on simdgroup matrices, for `simd_prefill_supported` calls."""
+    _, H, L, D = queries.shape
+    return _simd_prefill_kernel()(
+        inputs = [queries, keys, values, mx.sort(block_indices.astype(mx.int32), axis = -1),
+                  query_ends.astype(mx.int32), mx.array([keys.shape[2], L], dtype = mx.int32),
+                  mx.array([scale], dtype = mx.float32)],
+        template = [("GQA", H // keys.shape[1]), ("TOPK", block_indices.shape[-1])],
+        grid = (64 * L, keys.shape[1], 1), threadgroup = (64, 1, 1),
+        output_shapes = [(1, H, L, D)], output_dtypes = [queries.dtype],
+    )[0]
+
+
 def probe_fast_prefill():
+    """Check the tensor-unit kernel against the native one."""
+    _probe_prefill(fast_prefill_attention)
+
+
+def probe_simd_prefill():
+    """Check the simdgroup kernel against the native one."""
+    _probe_prefill(simd_prefill_attention)
+
+
+def _probe_prefill(attend):
     """Compare with the native kernel on shuffled picks, -1 picks, tail blocks and rows with no visible key."""
     from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
     for L, N in ((64, 4101), (96, 1501), (64, 63)):
@@ -658,7 +847,7 @@ def probe_fast_prefill():
         shuffle = mx.argsort(mx.random.uniform(shape = picks.shape, key = mx.random.key(4)), axis = -1)
         picks = mx.take_along_axis(picks, shuffle, axis = -1)
         native = qsa_sparse_attention(q, k, v, picks, ends, scale = 256 ** -0.5, block_size = 4)
-        got = fast_prefill_attention(q, k, v, picks, ends, 256 ** -0.5)
+        got = attend(q, k, v, picks, ends, 256 ** -0.5)
         error = mx.abs(got.astype(mx.float32) - native.astype(mx.float32)).max().item()
         assert error <= 0.02 * mx.abs(native.astype(mx.float32)).max().item(), (L, N, error)
         # Only rounding differs (fp32 summation order, P's last bits), so nearly every bf16 output matches.
