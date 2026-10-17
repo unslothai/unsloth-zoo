@@ -120,6 +120,44 @@ def test_images_are_validated_then_refused_as_unsupported():
     assert model.answer(text_only, question, images = [])["answers"]
 
 
+def test_a_model_that_reads_images_gets_them_decoded_and_out_of_the_state(monkeypatch):
+    import base64
+    import io
+
+    Image = pytest.importorskip("PIL.Image")
+    seen = []
+
+    class Reader(_Scripted):
+        reads_images = True
+
+        def _scores(self, state, questions, images = ()):
+            seen.append((state, [image.size for image in images]))
+            return [[[0.0, 0.0]]], 3
+
+    def url(size):
+        buffer = io.BytesIO()
+        Image.new("RGB", size).save(buffer, "PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    part, text, question = {"type": "image_url", "image_url": {"url": url((3, 2))}}, {"type": "text", "text": "t"}, {"q": {"type": "noul", "instructions": "i"}}
+    wrapped = {"messages": [{"role": "user", "content": [text, part]}, "x"], "k": 1}
+    Reader(None).answer(wrapped, question, images = [url((5, 4))])
+    Reader(None).answer([{"content": [text]}, {"content": [part, text, part]}], question)
+    Reader(None).answer("s", question)
+    # The images of the field come first; the state keeps everything but its image parts, and is not edited in place.
+    assert seen == [({"messages": [{"role": "user", "content": [text]}, "x"], "k": 1}, [(5, 4), (3, 2)]), ([{"content": [text]}, {"content": [text]}], [(3, 2)] * 2), ("s", [])]
+    assert wrapped["messages"][0]["content"] == [text, part]
+    # Not base64, not an image, and an image cut short.
+    cut = "data:image/png;base64," + base64.b64encode(base64.b64decode(url((64, 64)).partition(",")[2])[:60]).decode()
+    for broken in ("data:image/png;base64,A", "data:image/png;base64,AA==", cut):
+        with pytest.raises(DecisionRequestError, match = "could not be decoded"):
+            Reader(None).answer("s", question, images = [broken])
+    monkeypatch.setattr(decision, "_MAX_IMAGE_PIXELS", 19)
+    Reader(None).answer("s", question, images = [url((19, 1))])
+    with pytest.raises(DecisionRequestError, match = "larger than 19 pixels"):
+        Reader(None).answer("s", question, images = [url((5, 4))])
+
+
 @pytest.fixture
 def marker_checkpoint(tmp_path, monkeypatch):
     words = [f"w{i}" for i in range(80)] + 'choice score noul question : level 0 1 k yes no , the statement holds does not hold true false " { }'.split()
@@ -200,7 +238,7 @@ def decoder_family(monkeypatch):
     monkeypatch.setattr(loader.FastMLXModel, "from_pretrained", load)
     monkeypatch.setattr(decision, "_merge_lora", lambda model, folder: loads.append(folder))
     monkeypatch.setattr(generate, "generation_mode", lambda model: contextlib.nullcontext())
-    monkeypatch.setattr(decision._QwenModel, "_hidden_states", lambda self, prompts: iter(prompts))
+    monkeypatch.setattr(decision._QwenModel, "_hidden_states", lambda self, prompts, *images: iter(prompts))
     monkeypatch.setattr(decision._LabelModel, "_read", lambda self, question, ids, hidden: [float(i * i) for i in range(self._label_count(question))])
     return loads, prompts
 
@@ -277,6 +315,34 @@ def test_openjev_letters_the_options_and_reads_noul_yes_first(tmp_path, decoder_
     assert model.answer("s", {"many": {"type": "choice", "instructions": "i", "criteria": dict.fromkeys(map(str, range(52)))}})["answers"]["many"]["choice"] == "51"
 
 
+def test_openjev_puts_its_screenshots_before_the_state(tmp_path, decoder_family, monkeypatch):
+    (tmp_path / "MANIFEST.json").write_text(json.dumps({"model": "OpenJev MLX 4-bit"}))
+    model, image = load_decision_model(tmp_path), "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg=="
+    question = {"sure": {"type": "noul", "instructions": "i"}, "level": {"type": "score", "instructions": "i", "criteria": ["low", "high"]}}
+    with pytest.raises(DecisionUnsupportedError):
+        model.answer("s", question, images = [image])
+    # The processor spends two placeholders on the first image and one on the second; the tokenizer reads one for each.
+    spent, characters = [501, 500, 500, 502, 501, 500, 502], model.tokenizer.encode
+    model.model.config = types.SimpleNamespace(model_type = "qwen3_5")
+    processor = lambda text, images, return_tensors: {"input_ids": np.array([spent]), "pixel_values": np.zeros((3, 4)), "image_grid_thw": np.ones((2, 3))}
+    processor.image_processor = True
+    model.model.vision_tower, model.model._processor = object(), processor
+    model.tokenizer.encode = lambda text, add_special_tokens: [token for index, piece in enumerate(text.split(model._IMAGE)) for token in ([501, 500, 502] * bool(index) + characters(piece, add_special_tokens))]
+    passes = []
+    monkeypatch.setattr(decision._QwenModel, "_hidden_states", lambda self, prompts, *images: passes.append((prompts, *images)) or iter(prompts))
+    usage = model.answer("s", question, images = [image, image])["usage"]
+    (prompts, media, images_end), opening = passes[0], [ord(c) for c in "<|im_start|>user\n"]
+    head, tail = "The screenshot shows the current screen.\nState:\ns\n\nQuestion: i", "\nAnswer with the letter of the best option only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    listed = ("\nOptions:\n[A] yes: The statement is true.\n[B] no: The statement is false.\n", " Rate along the ordered levels below (lowest first).\nOptions:\n[A] 0: low\n[B] 1: high\n")
+    assert prompts == [opening + spent + [ord(c) for c in head + options + tail] for options in listed]
+    assert images_end == len(opening) + 7 and usage["input_tokens"] == sum(map(len, prompts))
+    assert media["pixel_values"].shape == (3, 4) and media["image_grid_thw"].shape == (2, 3)
+    # A family that was not trained on images refuses them whatever its decoder holds.
+    monkeypatch.setattr(type(model), "takes_images", False)
+    with pytest.raises(DecisionUnsupportedError):
+        model.answer("s", question, images = [image])
+
+
 def _safetensors(path, metadata = None):
     header = json.dumps({"__metadata__": metadata} if metadata else {}).encode()
     path.write_bytes(len(header).to_bytes(8, "little") + header)
@@ -330,3 +396,71 @@ def test_folder_keyword_still_loads(tmp_path):
     # Callers written against the Laya-only loader pass the checkpoint as folder=.
     with pytest.raises(ValueError, match = "not a decision model"):
         load_decision_model(folder = tmp_path)
+
+
+def test_records_without_encoded_clips_do_not_need_pyav(monkeypatch):
+    import sys
+
+    # As if PyAV were not installed: image-only and already decoded clips are read without it.
+    monkeypatch.setitem(sys.modules, "av", None)
+    clip = {"array": np.zeros(1600, np.float32), "sampling_rate": 16000}
+    assert decision._decode_audio([]) == [] and decision._clips(()) == []
+    assert [samples.shape for samples in decision._clips([clip])] == [(1600,)]
+    with pytest.raises(DecisionUnsupportedError, match = "PyAV"):
+        decision._clips(["data:audio/wav;base64,AAAA"])
+
+
+def test_an_adapter_on_two_towers_of_the_same_layer_numbers_is_refused(tmp_path):
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    pytest.importorskip("mlx_lm")
+
+    # A decoder under `language_model.model.layers`, as the vision-language wrappers hold it.
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    model.language_model.model.layers = [nn.Linear(4, 4)]
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 2}))
+    pair = {"lora_A.weight": mx.zeros((2, 4)), "lora_B.weight": mx.zeros((4, 2))}
+    decoder, audio = "base_model.model.thinker.model.layers.0.self_attn.q_proj", "base_model.model.thinker.audio_tower.layers.0.self_attn.q_proj"
+    # Together they collapse into one key; alone the tower's would land on the decoder's layer of its number. MiniCPM
+    # names its towers `vpm` and `apm`, which say nothing of what they read.
+    towers = (
+        (decoder, audio), (audio,), ("base_model.model.thinker.talker.model.layers.1.mlp.up_proj",), ("base_model.model.multi_modal_projector.linear_1",),
+        ("base_model.model.apm.encoder.layers.0.self_attn.q_proj",), ("base_model.model.vpm.encoder.layers.0.mlp.fc1",),
+    )
+    for stems in towers:
+        mx.save_safetensors(str(tmp_path / "adapter_model.safetensors"), {f"{stem}.{name}": value for stem in stems for name, value in pair.items()})
+        with pytest.raises(ValueError, match = "tower besides the decoder"):
+            decision._attach_lora(model, tmp_path)
+    kept = (decoder, "base_model.model.model.language_model.layers.3.mlp.down_proj", "base_model.model.llm.model.layers.2.self_attn.o_proj", "language_model.model.layers.0")
+    assert not any(decision._off_decoder(stem, {"model"}) for stem in kept)
+
+
+def test_decoded_clips_share_the_audio_duration_budget(monkeypatch):
+    monkeypatch.setattr(decision, "_MAX_AUDIO_SECONDS", 1)
+    clip = {"array": np.zeros(12000, np.float32), "sampling_rate": 16000}
+    assert len(decision._clips([clip])) == 1
+    with pytest.raises(DecisionRequestError, match = "longer than 1 seconds"):
+        decision._clips([clip, clip])
+
+
+def test_minicpm_decoder_weights_map_back_to_its_llm_namespace():
+    wrapper = {"language_model": None}
+    path = "language_model.model.layers.0.self_attn.q_proj.weight"
+    # A checkpoint that keeps the causal LM under `llm.`, as MiniCPM-o's does; others keep the vision-language names.
+    assert decision._decoder_tensor_name(wrapper, path, {"llm.model.layers.0.self_attn.q_proj.weight"}) == "llm.model.layers.0.self_attn.q_proj.weight"
+    assert decision._decoder_tensor_name(wrapper, "language_model.lm_head.weight", {"llm.lm_head.weight"}) == "llm.lm_head.weight"
+    assert decision._decoder_tensor_name(wrapper, path, {"model.language_model.layers.0.self_attn.q_proj.weight"}) == "model.language_model.layers.0.self_attn.q_proj.weight"
+    assert decision._decoder_tensor_name(wrapper, path) == "model.language_model.layers.0.self_attn.q_proj.weight"
+
+
+def test_phi4_multimodal_decoder_weights_map_to_its_bare_and_wrapped_names():
+    wrapper = {"language_model": None}
+    stored = {"model.embed_tokens.weight", "model.layers.0.self_attn.qkv_proj.base_layer.weight", "model.layers.1.self_attn.qkv_proj.weight"}
+    assert decision._decoder_tensor_name(wrapper, "language_model.model.embed_tokens.weight", stored) == "model.embed_tokens.weight"
+    for layer, held in ((0, "base_layer.weight"), (1, "weight")):
+        path = f"language_model.model.layers.{layer}.self_attn.qkv_proj.weight"
+        assert decision._decoder_tensor_name(wrapper, path, stored) == f"model.layers.{layer}.self_attn.qkv_proj.{held}"
+        # Its adapter is saved and resumed under the linear's own name, which is what PEFT and the merge read.
+        assert decision._adapter_stem(wrapper, path.removesuffix(".weight"), stored) == f"base_model.model.model.layers.{layer}.self_attn.qkv_proj"

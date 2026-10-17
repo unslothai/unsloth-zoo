@@ -145,6 +145,27 @@ def _fused_expert_model():
     return get_peft_model(TinyMoE(), config)
 
 
+# Shape of get_peft_regex's output: it also fullmatches the pre-fusion `layers.0.experts.gate_proj`.
+UNSLOTH_STYLE_REGEX = r"(?:\blayers\.[\d]{1,}(?!.*\.experts\.\d)\..*?(?:q_proj|gate_proj|up_proj|down_proj))"
+
+
+def test_fused_expert_regex_is_narrowed_to_the_wrapped_modules():
+    model = _fused_expert_model()
+    regex = MU.portable_lora_target_modules(model, "default", UNSLOTH_STYLE_REGEX)
+    names = [n for n, _ in model.get_base_model().named_modules()] + [
+        f"layers.{i}.experts.{leaf}" for i in range(2) for leaf in ("gate_proj", "up_proj", "down_proj")
+    ]
+    assert {n for n in names if re.fullmatch(regex, n)} == {"layers.0.q_proj", "layers.1.q_proj"}
+    # Experts only: nothing else is wrapped, so no module target is left.
+    experts_only = get_peft_model(TinyMoE(), LoraConfig(
+        r = 2, target_modules = [], target_parameters = ["experts.gate_up_proj", "experts.down_proj"],
+    ))
+    assert MU.portable_lora_target_modules(experts_only, "default", UNSLOTH_STYLE_REGEX) == []
+    # A dense adapter's regex is never touched.
+    dense = get_peft_model(TwoTowers(), LoraConfig(r = 2, target_modules = r".*text\.\d+\.q_proj"))
+    assert MU.portable_lora_target_modules(dense, "default", r".*text\.\d+\.q_proj") is None
+
+
 def test_fused_expert_adapter_drops_leaf_names_that_wrapped_nothing():
     model = _fused_expert_model()
     out = MU.portable_lora_target_modules(
@@ -170,7 +191,8 @@ def test_dropped_names_stop_pefts_v5_moe_conversion_doubling_the_rank():
 
     def converted(target_modules):
         config = LoraConfig(
-            r = 2, lora_alpha = 4, target_modules = list(target_modules),
+            r = 2, lora_alpha = 4,
+            target_modules = target_modules if isinstance(target_modules, str) else list(target_modules),
             target_parameters = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
         )
         model = TinyMoE()
@@ -181,6 +203,12 @@ def test_dropped_names_stop_pefts_v5_moe_conversion_doubling_the_rank():
     model = _fused_expert_model()
     kept = MU.portable_lora_target_modules(model, "default", ["q_proj", "gate_proj", "up_proj"])
     assert converted(kept) == {}
+    if takes_model_type:
+        return  # PEFT 0.19 cannot convert a str target at all (it iterates the characters).
+    # FastLanguageModel.get_peft_model saves a get_peft_regex string, not a list.
+    assert converted(UNSLOTH_STYLE_REGEX)
+    rewritten = MU.portable_lora_target_modules(model, "default", UNSLOTH_STYLE_REGEX)
+    assert isinstance(rewritten, str) and converted(rewritten) == {}
 
 
 def test_dense_adapter_is_left_alone():
@@ -196,6 +224,12 @@ def test_save_pretrained_hook_writes_the_portable_targets(tmp_path, monkeypatch)
     model.save_pretrained(str(tmp_path))
     saved = json.loads((tmp_path / "adapter_config.json").read_text())["target_modules"]
     assert saved == ["q_proj"]
+
+    model = _fused_expert_model()
+    model.peft_config["default"].target_modules = UNSLOTH_STYLE_REGEX
+    model.save_pretrained(str(tmp_path / "regex"))
+    saved = json.loads((tmp_path / "regex" / "adapter_config.json").read_text())["target_modules"]
+    assert re.fullmatch(saved, "layers.0.q_proj") and not re.fullmatch(saved, "layers.0.experts.gate_proj")
 
 
 def test_embedding_lora_target_is_kept():

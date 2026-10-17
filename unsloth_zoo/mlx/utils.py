@@ -487,7 +487,7 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
         mx.array.__getitem__ = current._unsloth_index_original
 
 
-# Training SDPA runs MLX's unfused fallback, scoring every key even outside the window.
+# Array-masked training SDPA runs MLX's unfused fallback, scoring every key even outside the window.
 _TRAINING_ATTENTION_BLOCK = 512
 _WINDOW_MASKS = {}
 
@@ -563,10 +563,21 @@ def _windowing_pays(q, k, block):
     return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
 
 
+def _as_array_mask(q, k, mask):
+    T, S = q.shape[-2], k.shape[-2]
+    if mask is None:
+        return mx.ones((T, S), dtype=mx.bool_)
+    return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
+
+
 def _wrap_training_sdpa(original):
     @wraps(original)
     def wrapper(q, k, v, *, scale, mask=None, **kwargs):
         T = q.shape[-2]
+        # mlx 0.32.4's fused VJP raises for the vector kernel (<= 8 queries) and sinks: an array mask goes unfused.
+        if (T <= 8 or kwargs.get("sinks") is not None) and (
+                mask is None or isinstance(mask, str) and mask == "causal") and mlx_training_patches_active():
+            mask = _as_array_mask(q, k, mask)
         if (isinstance(mask, mx.array) and mask.shape == (T, T) and k.shape[-2] == T
                 and all(value is None for value in kwargs.values())):
             window = _registered_window(mask)
@@ -1076,7 +1087,13 @@ def _get_text_model(model):
 def _get_text_backbone(model):
     """Get a separable hidden-state backbone when the model exposes one."""
     tm = _get_text_model(model)
-    return getattr(tm, "model", None)
+    backbone = getattr(tm, "model", None)
+    if backbone is None and getattr(tm, "lm_head", None) is not None:
+        # The Mamba lineage (Nemotron-H) names its stack `backbone`.
+        backbone = getattr(tm, "backbone", None)
+        if not callable(backbone):
+            return None
+    return backbone
 
 
 def _get_encoder_decoder_backbone(model):
@@ -1594,13 +1611,13 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
         return hidden
     tm = _get_text_model(model)
     if (inputs_embeds is None and getattr(model, "_unsloth_text_only_vlm", False)
-            and _get_backbone_embed_kwarg(getattr(tm, "model", tm)) is not None
+            and _get_backbone_embed_kwarg(_get_text_backbone(model) or tm) is not None
             and callable(getattr(model, "get_input_embeddings", None))):
         inputs_embeds, embed_kwargs = _unpack_embed_result(
             model.get_input_embeddings(inputs, None), model, input_ids=inputs,
         )
         kwargs = {**embed_kwargs, **kwargs}
-    backbone = getattr(tm, "model", None)
+    backbone = _get_text_backbone(model)
     if backbone is not None:
         if (
             inputs_embeds is not None
@@ -2299,8 +2316,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     # Backboneless models (e.g. a stack not exposed as `.model` or as direct
     # embed_tokens/layers/norm attributes) cannot yield pre-head hidden states,
     # so the full model forward is the only faithful loss.
-    tm = _get_text_model(model)
-    if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
+    if _get_text_backbone(model) is None and not _has_direct_hidden_stack(model):
         print("Unsloth: text model does not expose a separable hidden-state "
               "backbone for CCE; falling back to standard cross-entropy.")
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
@@ -3071,6 +3087,64 @@ def _trim_sequence_aligned_vlm_kwargs(extra_kwargs, seq_len):
     return extra_kwargs
 
 
+def _vlm_forward_logits(model, batch_dict):
+    """Logits for every position of a collated VLM batch dict."""
+    input_ids = batch_dict["input_ids"]
+    pixel_values = batch_dict.get("pixel_values")
+    attention_mask = batch_dict.get("attention_mask")
+
+    # The full sequence, left for the caller to shift (Qwen3-VL mRoPE/deepstack
+    # need it); mirrors `_vlm_hidden_states` so use_cce={True,False} stay in parity.
+    inputs = input_ids
+
+    # Extras (e.g. image_grid_thw) pass through; `_unsloth_*` carriers do not.
+    fwd_kwargs = {
+        k: v for k, v in batch_dict.items()
+        if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+        and not k.startswith("_unsloth_")
+        and v is not None
+    }
+    _apply_static_vlm_metadata(model, batch_dict, fwd_kwargs)
+    fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
+    # Always sent: 13 families declare `mask` without a default (None = their own).
+    fwd_kwargs["mask"] = (
+        attention_mask if _keeps_forwarded_mask(model) else None
+    )
+    shared_kv = _build_shared_kv_caches(model)
+    if shared_kv is not None:
+        fwd_kwargs["cache"] = shared_kv
+    # gemma3n scales embeddings only on the ids path; merge + rescale here as
+    # `_vlm_cce_forward` does, or text embeddings train ~45x too small.
+    scaled_embeds = None
+    # Self-routed generation wrappers consume premerged embeddings, not pixels.
+    if (_vlm_embed_scale(model) is not None
+            or getattr(model, "language_model", None) is model):
+        embed_result = model.get_input_embeddings(
+            inputs,
+            pixel_values,
+            mask=fwd_kwargs.get("mask"),
+            **{k: v for k, v in fwd_kwargs.items()
+               if k not in ("mask", "cache")},
+        )
+        merged_embeds, embed_kwargs = _unpack_embed_result(
+            embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+        )
+        scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
+        # per_layer_inputs etc. come from the merge; do not recompute from ids.
+        for key, value in embed_kwargs.items():
+            fwd_kwargs.setdefault(key, value)
+    if scaled_embeds is not None:
+        # Not `model(...)`: mlx-vlm <= 0.4.4 re-embeds from ids there and drops
+        # `inputs_embeds`, losing the rescale.
+        output = _get_text_model(model)(
+            inputs, inputs_embeds=scaled_embeds,
+            **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),
+        )
+    else:
+        output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
+    return _model_logits(output)
+
+
 def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                               ignore_token_ids=None):
     """Create a standard cross-entropy loss function for VLMs.
@@ -3089,72 +3163,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
 
     def loss_fn(model, batch_dict, return_correct=False):
         input_ids = batch_dict["input_ids"]
-        pixel_values = batch_dict.get("pixel_values")
         attention_mask = batch_dict.get("attention_mask")
         labels = batch_dict.get("labels")
-
-        # Forward full sequence then shift (Qwen3-VL mRoPE/deepstack need it);
-        # mirrors `_vlm_cce_forward` so use_cce={True,False} stay in parity.
-        inputs = input_ids
-
-        # Pass through extras (e.g. image_grid_thw); strip the private
-        # `_unsloth_*` carriers, matching _vlm_cce_forward's filter.
-        fwd_kwargs = {
-            k: v for k, v in batch_dict.items()
-            if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
-            and not k.startswith("_unsloth_")
-            and v is not None
-        }
-        _apply_static_vlm_metadata(model, batch_dict, fwd_kwargs)
-        fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
-        # Always sent: 13 families declare `mask` without a default. None lets
-        # them build the mask they would use for generation.
-        fwd_kwargs["mask"] = (
-            attention_mask if _keeps_forwarded_mask(model) else None
-        )
-        shared_kv = _build_shared_kv_caches(model)
-        if shared_kv is not None:
-            fwd_kwargs["cache"] = shared_kv
-        # gemma3n scales token embeddings by sqrt(hidden_size) on the ids path
-        # only, and `Model.__call__` sends ids through `get_input_embeddings`,
-        # which does not scale. Handing the model ids therefore trains on text
-        # embeddings ~45x too small beside merged features. `_vlm_cce_forward`
-        # already merges and rescales itself; do the same here so
-        # use_cce={True,False} stay in parity instead of differing by that.
-        scaled_embeds = None
-        # Self-routed generation wrappers consume premerged embeddings, not pixels.
-        if (_vlm_embed_scale(model) is not None
-                or getattr(model, "language_model", None) is model):
-            embed_result = model.get_input_embeddings(
-                inputs,
-                pixel_values,
-                mask=fwd_kwargs.get("mask"),
-                **{k: v for k, v in fwd_kwargs.items()
-                   if k not in ("mask", "cache")},
-            )
-            merged_embeds, embed_kwargs = _unpack_embed_result(
-                embed_result, model, input_ids=inputs, attention_mask=attention_mask,
-            )
-            scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
-            # per_layer_inputs and friends: the merge produced them, and
-            # recomputing from ids inside the stack would redo the work.
-            for key, value in embed_kwargs.items():
-                fwd_kwargs.setdefault(key, value)
-        if scaled_embeds is not None:
-            # Not `model(...)`: mlx-vlm up to 0.4.4 -- the floor this package
-            # declares -- re-embeds from ids inside `Model.__call__` and drops
-            # a supplied `inputs_embeds`, so the rescale above would be thrown
-            # away on exactly the versions that need it. 0.5.0 onwards honors
-            # it by forwarding straight to the language model; do that here on
-            # every version, which is what `_vlm_cce_forward` already does.
-            output = _get_text_model(model)(
-                inputs, inputs_embeds=scaled_embeds,
-                **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),
-            )
-        else:
-            output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
-        logits = _model_logits(output)
-        logits = logits.astype(mx.float32)
+        logits = _vlm_forward_logits(model, batch_dict).astype(mx.float32)
         # Drop the final position so logits predict the next token.
         logits = logits[:, :-1, :]
 
@@ -3236,6 +3247,18 @@ def _apply_static_vlm_metadata(model, batch_dict, kwargs):
         not getattr(model, "training", False) or kwargs.get("position_ids") is None
     ):
         return
+    if not keys:
+        # Compile only: an unpatched tower (`patch_mode="unpatched"`) still
+        # calls `.tolist()` on what it is handed.
+        decision = getattr(model, "_unsloth_compile_decision", None)
+        if decision is None or not getattr(decision, "enabled", False):
+            return
+        keys = _VLM_STATIC_METADATA_MODEL_TYPES.get(
+            _mlx_vlm_canonical_model_type(
+                _config_get(getattr(model, "config", None), "model_type")
+            ),
+            (),
+        )
     static = batch_dict.get("_unsloth_static_vlm_metadata", {})
     for key in keys:
         if key in static:
@@ -3329,15 +3352,13 @@ def _filter_backbone_kwargs(backbone, kwargs):
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
-def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
-                     assistant_token_id=0):
-    """Shared VLM CCE forward: embed -> backbone -> hidden + masked_targets + ntoks."""
+def _vlm_hidden_states(model, batch_dict):
+    """Pre-lm_head hidden states for every position of a collated VLM batch dict."""
     input_ids = batch_dict["input_ids"]
     pixel_values = batch_dict.get("pixel_values")
     attention_mask = batch_dict.get("attention_mask")
-    labels = batch_dict.get("labels")
 
-    # Forward full sequence then shift hidden[:, :-1] (Qwen3-VL mRoPE/deepstack).
+    # The full sequence, left for the caller to shift (Qwen3-VL mRoPE/deepstack).
     inputs = input_ids
     fwd_attn_mask = attention_mask
 
@@ -3395,13 +3416,21 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     if shared_kv is not None:
         backbone_kwargs["cache"] = shared_kv
 
-    hidden = _forward_text_hidden_states(
+    return _forward_text_hidden_states(
         model,
         inputs,
         inputs_embeds=merged_embeds,
         **backbone_kwargs,
     )
-    hidden = hidden[:, :-1, :]
+
+
+def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
+                     assistant_token_id=0):
+    """Shared VLM CCE forward: embed -> backbone -> hidden + masked_targets + ntoks."""
+    input_ids = batch_dict["input_ids"]
+    attention_mask = batch_dict.get("attention_mask")
+    labels = batch_dict.get("labels")
+    hidden = _vlm_hidden_states(model, batch_dict)[:, :-1, :]
 
     if labels is not None:
         # Extra mask keeps externally supplied labels compatible.
@@ -3454,6 +3483,11 @@ def _config_get(config, key, default=None):
     if isinstance(config, dict):
         return config.get(key, default)
     return getattr(config, key, default)
+
+
+def _multimodal_config(config):
+    # Qwen3-Omni keeps its multimodal settings under the thinker.
+    return _config_get(config, "thinker_config", None) or config
 
 
 def _config_to_mapping(config):
@@ -3526,10 +3560,27 @@ def _mlx_vlm_canonical_model_type(model_type):
 _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm4v",
     "glm_ocr",
-    # Not compile-patched, and opens with `grid_thw.tolist()`.
     "muse_glimmer",
     "glm5_next",
 })
+
+
+# Towers that read these keys on the host (a tracer under mx.compile): handed the
+# processor's Python values. Per family, since a tuple raises in the towers above.
+_VLM_STATIC_METADATA_MODEL_TYPES = {
+    # Its embedder reads only the image grid; there is no video pixel path.
+    "dots_ocr": ("image_grid_thw",),
+    "minimax_m3_vl": ("image_grid_thw", "video_grid_thw"),
+    "muse_glimmer": ("image_grid_thw", "video_grid_thw"),
+    "kimi_k3": ("grid_thws", "image_grid_hws", "video_grid_hws"),
+    "ernie4_5_moe_vl": ("image_grid_thw", "video_grid_thw"),
+    "glm5_next": ("image_grid_thw", "video_grid_thw"),
+    # One `_as_grid_list` call reads whichever of the two the batch carries.
+    "mage_vl": ("image_grid_thw", "video_grid_thw"),
+    # Pixtral's vision tower, which mistral3 and mistral4 checkpoints also load.
+    "mistral3": ("image_sizes",),
+    "pixtral": ("image_sizes",),
+}
 
 
 def _normalize_size_tuples(values):
@@ -3967,6 +4018,10 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_5_moe",
     "qwen4_exp",
     "prism_hadamard_qwen35",
+    # Their upstream `get_rope_index` computes the same positions.
+    "qwen3_omni_moe",
+    "glm4v",
+    "glm4v_moe",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
@@ -4208,6 +4263,11 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
 
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
+    # Kimi's processor names the same `(t, h, w)` metadata differently and emits
+    # two-element rows for stills.
+    grid_thws = _normalize_grid_thw(batch_dict.get("grid_thws"))
+    image_grid_hws = _normalize_grid_thw(batch_dict.get("image_grid_hws"))
+    video_grid_hws = _normalize_grid_thw(batch_dict.get("video_grid_hws"))
     image_sizes = _normalize_size_tuples(batch_dict.get("image_sizes"))
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
@@ -4224,6 +4284,9 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         ("spatial_shapes", spatial_shapes),
         ("image_sizes", image_sizes),
         ("images_spatial_crop", images_spatial_crop),
+        ("grid_thws", grid_thws),
+        ("image_grid_hws", image_grid_hws),
+        ("video_grid_hws", video_grid_hws),
     ):
         if normalized is not None:
             value = batch_dict[key]
@@ -4408,6 +4471,7 @@ def _vlm_positions_for_compile(batch_dict, config):
     expansion and planned padding, whose tails never shift a content
     position)."""
     model_type = _config_get(config, "model_type")
+    config = _multimodal_config(config)
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
@@ -4495,8 +4559,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
-    tm = _get_text_model(model)
-    if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
+    if _get_text_backbone(model) is None and not _has_direct_hidden_stack(model):
         import warnings
         warnings.warn(
             "VLM text stack does not expose a separable hidden-state backbone for CCE; "
@@ -4505,7 +4568,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
-    backbone = getattr(tm, "model", None)
+    backbone = _get_text_backbone(model)
     token_ids_only = (
         backbone is not None and _get_backbone_embed_kwarg(backbone) is None
         and _get_encoder_decoder_backbone(model) is None
@@ -5090,7 +5153,14 @@ def _collapse_vlm_assistant_content(messages):
     return collapsed
 
 
-def _flatten_vlm_content_for_text_template(messages, image_token=None):
+def _vlm_numbered_audio_stem(processor):
+    # mlx-vlm states the stem where its processor expands `<|audio_N|>` (Phi-4).
+    module = sys.modules.get(type(processor).__module__)
+    stem = getattr(module, "AUDIO_PLACEHOLDER_PATTERN", None)
+    return stem if isinstance(stem, str) and stem.startswith("<|") else None
+
+
+def _flatten_vlm_content_for_text_template(messages, image_token=None, audio_stem=None):
     """Render list-style VLM content as text for text-only chat templates.
 
     Rebuilt shallowly rather than deep-copied: only `content` is replaced, and a
@@ -5098,6 +5168,7 @@ def _flatten_vlm_content_for_text_template(messages, image_token=None):
     sample, so that cost is the whole collator's.
     """
     flattened = []
+    clips = 0
     for message in messages:
         content = message.get("content", "")
         if not isinstance(content, list):
@@ -5109,6 +5180,12 @@ def _flatten_vlm_content_for_text_template(messages, image_token=None):
                 texts.append(str(part.get("text", "")))
             elif isinstance(part, dict) and part.get("type") == "image" and image_token:
                 texts.append(image_token)
+            elif audio_stem and _is_vlm_audio_part(part):
+                # Back-to-back runs of one soft token would count as one clip.
+                if clips and "".join(texts).endswith(f"{audio_stem}{clips}|>"):
+                    texts.append("\n")
+                clips += 1
+                texts.append(f"{audio_stem}{clips}|>")
             elif isinstance(part, str):
                 texts.append(part)
         flattened.append({**message, "content": "".join(texts)})
@@ -5274,6 +5351,7 @@ def _render_vlm_messages(
     messages,
     *,
     add_generation_prompt=False,
+    **template_options,
 ):
     if isinstance(messages, str):
         return messages
@@ -5282,10 +5360,13 @@ def _render_vlm_messages(
     tokenizer = _get_processor_tokenizer(processor)
     renderer = processor if callable(getattr(processor, "apply_chat_template", None)) else tokenizer
     image_token = _vlm_image_token(processor)
+    audio_stem = _vlm_numbered_audio_stem(processor)
     if not _has_chat_template(renderer):
         return "\n".join(
             message.get("content", "")
-            for message in _flatten_vlm_content_for_text_template(messages, image_token)
+            for message in _flatten_vlm_content_for_text_template(
+                messages, image_token, audio_stem,
+            )
         )
 
     render_messages = _vlm_token_messages(processor, messages)
@@ -5301,7 +5382,7 @@ def _render_vlm_messages(
         yield render_messages
         marked = _mark_vlm_image_parts(render_messages, image_token)
         yield marked
-        yield _flatten_vlm_content_for_text_template(messages, image_token)
+        yield _flatten_vlm_content_for_text_template(messages, image_token, audio_stem)
         yield _flatten_vlm_messages_to_content_parts(marked)
         if rendered is None:
             yield messages
@@ -5316,6 +5397,7 @@ def _render_vlm_messages(
                 candidate,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
+                **template_options,
             )
         except Exception as exc:
             error = exc
@@ -7707,6 +7789,15 @@ def _normalize_audio_clip(clip, expected_rate):
     return _AudioClip(np.asarray(samples, dtype=np.float32), int(rate))
 
 
+def _is_vlm_audio_part(part):
+    # Key-only `{"audio": clip}` too: the template renders a placeholder for
+    # it, so skipping it left the row a waveform short.
+    return isinstance(part, dict) and (
+        part.get("type") in _AUDIO_PART_TYPES
+        or any(key in part for key in _AUDIO_PART_TYPES)
+    )
+
+
 def _vlm_audio_part_state(messages):
     bare_placeholders = False
     payloads = []
@@ -7719,13 +7810,7 @@ def _vlm_audio_part_state(messages):
         if not isinstance(content, list):
             continue
         for part in content:
-            if not isinstance(part, dict):
-                continue
-            # Key-only `{"audio": clip}` too: the template renders a
-            # placeholder for it, so skipping it left the row a waveform short.
-            if part.get("type") not in _AUDIO_PART_TYPES and not any(
-                key in part for key in _AUDIO_PART_TYPES
-            ):
+            if not _is_vlm_audio_part(part):
                 continue
             payload = None
             for key in _AUDIO_PART_TYPES:
@@ -8055,9 +8140,64 @@ def _extractor_window_samples(processor):
     )
     samples = getattr(extractor, "n_samples", None)
     try:
+        if samples is None:
+            # Gemma's extractors state the window as call defaults instead.
+            defaults = inspect.signature(extractor.__call__).parameters
+            if defaults["truncation"].default is True:
+                samples = defaults["max_length"].default
         return int(samples) if samples is not None else None
-    except (TypeError, ValueError):
+    except (AttributeError, KeyError, TypeError, ValueError):
         return None
+
+
+def _audio_run_cap_samples(processor):
+    length = getattr(processor, "audio_seq_length", None)
+    period = getattr(processor, "audio_ms_per_token", None)
+    rate = audio_extractor_sampling_rate(processor)
+    # A corrected count follows the audio the extractor keeps, not the cap.
+    corrected = _audio_family_from_processor(processor) in _AUDIO_PROCESSOR_REPAIRS
+    if corrected or not (length and period and rate):
+        return None
+    return int(length) * int(period) * int(rate) // 1000
+
+
+def _audio_clip_limit_samples(processor):
+    limits = (_extractor_window_samples(processor), _audio_run_cap_samples(processor))
+    return min((limit for limit in limits if limit), default=None)
+
+
+def _split_audio_past_the_window(messages, clips, processor):
+    """Split clips past the processor's limit into near-equal pieces (none too
+    short to frame), one placeholder each. Returns its arguments unchanged otherwise."""
+    if not clips:
+        return messages, clips
+    limit = _audio_clip_limit_samples(processor)
+    counts = [max(1, -(-len(clip) // limit)) if limit else 1 for clip in clips]
+    # Rows the dataset rendered itself reach here as a string.
+    if max(counts, default=1) < 2 or not isinstance(messages, list):
+        return messages, clips
+    parts = sum(
+        _is_vlm_audio_part(part) for message in messages
+        if isinstance(message.get("content"), list) for part in message["content"]
+    )
+    if parts != len(clips):
+        return messages, clips
+    repeats = iter(counts)
+    split = [
+        {**message, "content": [
+            copy for part in message["content"]
+            for copy in [part] * (next(repeats) if _is_vlm_audio_part(part) else 1)
+        ]} if isinstance(message.get("content"), list) else message
+        for message in messages
+    ]
+    pieces = []
+    for clip, count in zip(clips, counts):
+        if count == 1:
+            pieces.append(clip)
+            continue
+        size = -(-len(clip) // count)
+        pieces.extend(clip[start:start + size] for start in range(0, len(clip), size))
+    return split, pieces
 
 
 def _audio_delimiter_strings(processor):
@@ -8141,6 +8281,46 @@ def _assert_audio_clips_fit_the_extractor(clips, processor):
             )
 
 
+_reported_cut_audio = set()
+
+
+def _assert_audio_runs_cover_their_clips(clips, processor):
+    """Refuse a long clip whose surplus frames would land on the next clip's
+    positions (Gemma 4 unified caps the run, keeps every frame); warn once on a
+    plain cut. Message rows are split before this."""
+    if not any(clips or ()):
+        return
+    advice = "Split the clip, or give the row as messages."
+    limit = _audio_clip_limit_samples(processor)
+    cut = limit == _extractor_window_samples(processor)
+    name = type(processor).__name__
+    if not limit:
+        return
+    rate = audio_extractor_sampling_rate(processor)
+    seconds = f" ({limit / rate:.0f}s)" if rate else ""
+    batch = [(index, clip) for index, row in enumerate(clips) for clip in row or ()]
+    for position, (index, clip) in enumerate(batch):
+        length = int(np.asarray(clip).shape[0])
+        if length <= limit:
+            continue
+        if not cut and position + 1 < len(batch):
+            raise ValueError(
+                f"Unsloth MLX: row {index} carries a {length}-sample audio "
+                f"clip but {name} writes placeholders for at most {limit} "
+                f"samples of one clip{seconds} while keeping all of its "
+                f"audio, so the surplus lands on the next clip's positions. "
+                f"{advice}"
+            )
+        if name not in _reported_cut_audio:
+            _reported_cut_audio.add(name)
+            warnings.warn(
+                f"Unsloth MLX: {name} uses only the first {limit} samples of "
+                f"an audio clip{seconds} and this dataset has a longer one "
+                f"({length} samples), so the rest is not trained on. {advice}",
+                stacklevel=2,
+            )
+
+
 def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
                               truncated=True, clips=None):
     """Reject rows whose audio placeholder runs did not survive tokenization.
@@ -8158,9 +8338,9 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
 
     Processors that state their spans take a different route, since their run
     carries no identifying token. Those rows are held to the conditions in
-    ``_assert_audio_bounds_intact`` instead of the two above, and additionally
-    to one the run path has no equivalent of: a clip may not be longer than the
-    window its feature extractor keeps.
+    ``_assert_audio_bounds_intact`` instead of the two above, and their clips
+    may not be longer than the window the feature extractor keeps. On the run
+    path a clip may not be longer than a cap on its run that its audio ignores.
     """
     ids = inputs.get("input_ids") if isinstance(inputs, Mapping) else None
     if ids is None:
@@ -8198,6 +8378,7 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
     # Placeholders with nothing behind them misalign the sequence however they
     # got there -- e.g. a formatter that kept the text but dropped the clip.
     _assert_audio_features_present(inputs, total_runs, processor)
+    _assert_audio_runs_cover_their_clips(clips, processor)
 
 
 def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
@@ -9384,6 +9565,19 @@ def _collate_vlm_prompt_completion_batch(
             prompt = [{"role": "user", "content": prompt}]
         prompt_messages = prompt if isinstance(prompt, list) else None
         completion_messages = completion if isinstance(completion, list) else None
+        # Audio conditions the response, so it belongs to the prompt half;
+        # scanning the completion keeps a misplaced clip from passing the gate.
+        if any(_vlm_audio_part_state(completion_messages or [])):
+            raise ValueError(
+                "Unsloth MLX: audio in the completion half is not supported; "
+                "put the audio in the prompt so it conditions the response."
+            )
+        audio = _extract_vlm_audio(item, prompt_messages or [], processor)
+        if prompt_messages is not None:
+            prompt_messages, audio = _split_audio_past_the_window(
+                prompt_messages, audio, processor,
+            )
+        all_audio.append(audio)
 
         if prompt_messages is not None:
             prompt_text = _render_vlm_messages(
@@ -9413,16 +9607,6 @@ def _collate_vlm_prompt_completion_batch(
         prompt_texts.append(prompt_text)
         completion_texts.append(completion_text)
         all_images.append(images)
-        # Audio conditions the response, so it belongs to the prompt half;
-        # scanning the completion keeps a misplaced clip from passing the gate.
-        if any(_vlm_audio_part_state(completion_messages or [])):
-            raise ValueError(
-                "Unsloth MLX: audio in the completion half is not supported; "
-                "put the audio in the prompt so it conditions the response."
-            )
-        all_audio.append(
-            _extract_vlm_audio(item, prompt_messages or [], processor)
-        )
 
     prompt_inputs = _processor_vlm_inputs(
         processor,
@@ -9452,6 +9636,7 @@ def _collate_vlm_prompt_completion_batch(
         )
     _assert_audio_runs_intact(
         prompt_inputs, audio_counts, processor, None, truncated=False,
+        clips=all_audio,
     )
     audio_budget = _audio_fixed_budget(processor)
     audio_soft_ids = (
@@ -9684,6 +9869,12 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             )
         images = _extract_vlm_images(item, messages, image_size)
         audio = _extract_vlm_audio(item, messages, processor)
+        if raw is not item or isinstance(item, list):
+            split, audio = _split_audio_past_the_window(messages, audio, processor)
+            if split is not messages and raw is item:
+                text = render_mlx_chat_example(processor, split, is_vlm=True)
+            elif split is not messages:
+                text = _render_vlm_messages(processor, split)
         all_texts.append(text)
         all_images.append(images)
         all_audio.append(audio)
@@ -17496,6 +17687,65 @@ def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
             return
 
 
+def _confirmed_mlx_moe_merge_recipe(sanitizers, staged, groups, recipes):
+    """(first natively confirmed recipe, a tensor name some replay wanted)."""
+    wanted = None
+    for width in _MOE_MERGE_PROBE_WIDTHS:
+        for sanitizer in sanitizers:
+            for recipe, missing in _proved_mlx_moe_merge_recipe(
+                sanitizer, staged, groups, recipes, width
+            ):
+                if recipe is None:
+                    wanted = wanted or missing
+                    continue
+                # A float32 corner can support a recipe the tensor contradicts: confirm natively.
+                if any(
+                    confirmed is not None
+                    for confirmed, _ in _proved_mlx_moe_merge_recipe(
+                        sanitizer, staged, groups, [recipe], None, native=True
+                    )
+                ):
+                    return recipe, wanted
+    return None, wanted
+
+
+def _mlx_moe_restored_module(name):
+    return name.removesuffix(".weight").rsplit(".", 1)[0]
+
+
+def _completed_mlx_moe_merge_plan(sanitizers, staged, arrivals, groups, substitutions,
+                                  recipe):
+    """mlx-vlm 0.7.8 expert helpers skip a missing sibling and accept `<name>.weight`,
+    so extend the plan to siblings and drop `.weight` while replay still proves it."""
+    modules = {_mlx_moe_restored_module(target) for target in groups}
+    claimed = {part for parts in groups.values() for part in parts}
+    tried = set(substitutions)
+    for name in staged:
+        if name in claimed:
+            continue
+        for target, companion in arrivals.get(name, {}).items():
+            if companion in tried or _mlx_moe_restored_module(target) not in modules:
+                continue
+            tried.add(companion)
+            extended = _mlx_moe_merge_groups(staged, substitutions + [companion])
+            if (any(extended.get(t) != parts for t, parts in groups.items())
+                    or set(extended) & set(staged)):
+                continue
+            if _confirmed_mlx_moe_merge_recipe(
+                sanitizers, staged, extended, [recipe]
+            )[0] is not None:
+                groups, substitutions = extended, substitutions + [companion]
+                claimed = {part for parts in groups.values() for part in parts}
+    bare = {target.removesuffix(".weight"): parts for target, parts in groups.items()}
+    if (bare.keys() != groups.keys() and len(bare) == len(groups)
+            and not set(bare) & set(staged)
+            and _confirmed_mlx_moe_merge_recipe(
+                sanitizers, staged, bare, [recipe])[0] is not None):
+        groups = bare
+    return {merged: _mlx_moe_group_recipe(group, recipe)
+            for merged, group in groups.items()}
+
+
 def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutions,
                                attempted):
     """The rewrite one set of substitutions proves, completed from what it fails on."""
@@ -17519,27 +17769,11 @@ def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutio
         if grouping in attempted:
             return None
         attempted.add(grouping)
-        wanted = None
-        for width in _MOE_MERGE_PROBE_WIDTHS:
-            for sanitizer in sanitizers:
-                for recipe, missing in _proved_mlx_moe_merge_recipe(
-                    sanitizer, staged, groups, _mlx_moe_merge_recipes(shapes), width
-                ):
-                    if recipe is None:
-                        wanted = wanted or missing
-                        continue
-                    # A float32 corner can support a recipe the tensor contradicts: confirm natively.
-                    if not any(
-                        confirmed is not None
-                        for confirmed, _ in _proved_mlx_moe_merge_recipe(
-                            sanitizer, staged, groups, [recipe], None, native=True
-                        )
-                    ):
-                        continue
-                    return {
-                        merged: _mlx_moe_group_recipe(group, recipe)
-                        for merged, group in groups.items()
-                    }
+        recipe, wanted = _confirmed_mlx_moe_merge_recipe(
+            sanitizers, staged, groups, list(_mlx_moe_merge_recipes(shapes)))
+        if recipe is not None:
+            return _completed_mlx_moe_merge_plan(
+                sanitizers, staged, arrivals, groups, substitutions, recipe)
         # A sanitizer popping a sibling throws naming what it wanted: read the companion off it.
         claimed = {part for group in groups.values() for part in group}
         companion = next(

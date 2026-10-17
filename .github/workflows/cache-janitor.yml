@@ -85,13 +85,27 @@ name: Cache janitor
 # can answer nothing -- unreachable refs, generations past keep, and entries on an
 # open PR that nothing has read in open_pr_idle_days.
 #
+# pip-* is the one exception to "keep is the dial", and only for a generation
+# nothing reads. Its restore has a prefix fallback that returns the newest
+# generation, so generation 2 answers only an exact-key hit from a ref still on
+# the old dependency hash (an unrebased PR, a re-run). Once no run has read it
+# for PIP_IDLE_HOURS it is answering nothing, and at 1-3 GiB a generation
+# (pip-collect is 3.2 GiB) keeping it anyway held the repo at 14.5 of 20 GiB on
+# 2026-10-14 with two copies of every family. A generation still being read
+# stays (measured that day: pip-mlx-macOS generation 2 was read an hour after
+# generation 1 was written), and the read time is re-checked just before the
+# delete, the same way as the open-PR rule.
+#
 # Everything else is left alone. The hf-* / *-gguf-* model caches use exact keys,
 # so an entry that looks superseded is the only one its key will ever match and
 # deleting it costs a multi-GB re-download.
 
 on:
   schedule:
-    - cron: '17 6 * * *'
+    # Every two hours. The sweep is API-only and finishes in seconds; once a day
+    # left a dependency bump's previous generation resident for up to a day on a
+    # 20 GiB budget.
+    - cron: '17 */2 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -119,7 +133,11 @@ permissions:
 jobs:
   prune:
     name: Prune superseded caches
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: that label's queue is shared with unslothai/unsloth's
+    # merge bursts, and zoo jobs waited a median 161 minutes for it on
+    # 2026-10-13/14 while the arm label started jobs in a median 1.3 minutes.
+    # The sweep is API-only (gh, GNU date/awk/sed/sort), all on the arm image.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
       actions: write
@@ -134,6 +152,8 @@ jobs:
           DELETE: ${{ (github.event_name == 'schedule' || inputs.mode == 'delete') && 'yes' || 'no' }}
           KEEP: ${{ inputs.keep || '2' }}
           OPEN_PR_IDLE_DAYS: ${{ inputs.open_pr_idle_days || '3' }}
+          # A superseded pip-* generation goes once nothing has read it this long.
+          PIP_IDLE_HOURS: '6'
         run: |
           set -euo pipefail
           repo="$GITHUB_REPOSITORY"
@@ -154,6 +174,8 @@ jobs:
             *) echo "::warning::invalid open_pr_idle_days=$OPEN_PR_IDLE_DAYS, using 3"; OPEN_PR_IDLE_DAYS=3 ;;
           esac
           open_pr_cutoff=$(date -u -d "$OPEN_PR_IDLE_DAYS days ago" +%s)
+          case "$PIP_IDLE_HOURS" in [1-9]|[1-9][0-9]) ;; *) PIP_IDLE_HOURS=6 ;; esac
+          pip_idle_cutoff=$(date -u -d "$PIP_IDLE_HOURS hours ago" +%s)
 
           gib() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
 
@@ -202,7 +224,7 @@ jobs:
           count=$(grep -c . "$all" || true)
           echo "$count caches, $(gib "$total") GiB, delete=$DELETE keep=$KEEP"
 
-          freed=0; deleted=0; stale_pr=0; idle_open_pr=0
+          freed=0; deleted=0; stale_pr=0; idle_open_pr=0; idle_pip=0
 
           # Pass 1: caches belonging to a PR that is no longer open. Unreachable
           # regardless of generation, so this runs before ranking and removes
@@ -302,16 +324,29 @@ jobs:
             # compression change mints a new version that is restored
             # independently. Ranking them together lets two entries from one
             # scope evict every usable entry of another.
-            printf '%s\t%s\t%s\t%s\n' "$ref|$ver|$pre" "$created" "$id" "$size" >> "$grouped"
+            # Column 5 marks the pip-* family, whose superseded generation goes once
+            # it is idle (see the header); setup-python keeps plain ranking.
+            pipidle=0
+            [[ "$key" == pip-* ]] && pipidle=1
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ref|$ver|$pre" "$created" "$id" "$size" \
+              "$pipidle" "$accessed" "$ref" "$key" >> "$grouped"
           done < "$live"
 
           sort -t"$(printf '\t')" -k1,1 -k2,2r -o "$grouped" "$grouped"
 
           prev=""; n=0; superseded=0
-          while IFS=$'\t' read -r pre created id size; do
+          while IFS=$'\t' read -r pre created id size pipidle accessed ref key; do
             [ -z "${pre:-}" ] && continue
             if [ "$pre" != "$prev" ]; then prev="$pre"; n=1; else n=$(( n + 1 )); fi
-            [ "$n" -le "$KEEP" ] && continue
+            # The newest generation always stays. Within keep, a superseded pip-*
+            # generation stays only while something still reads it.
+            [ "$n" -eq 1 ] && continue
+            if [ "$n" -le "$KEEP" ]; then
+              [ "$pipidle" = "1" ] || continue
+              idle_since "$id" "$accessed" "$ref" "$key" "$pip_idle_cutoff" < /dev/null || continue
+              echo "idle superseded pip generation ($(gib "$size") GiB, last read $accessed): $key"
+              idle_pip=$(( idle_pip + 1 ))
+            fi
             superseded=$(( superseded + 1 ))
             if [ "$DELETE" != "yes" ]; then
               freed=$(( freed + size )); deleted=$(( deleted + 1 )); continue
@@ -336,6 +371,7 @@ jobs:
             echo "| closed-PR candidates | $stale_pr |"
             echo "| idle open-PR candidates | $idle_open_pr |"
             echo "| superseded candidates | $superseded |"
+            echo "| of which idle pip generations within keep | $idle_pip |"
             echo "| candidates $verb | $deleted |"
             echo "| freed | $(gib "$freed") GiB |"
             echo "| usage before | $(gib "$total") GiB of 20 GiB |"

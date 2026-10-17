@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from unsloth_zoo import compiler
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 
 # DeepseekOcr2SamVisionSdpaAttention.forward (5.10.1+, trimmed): guard without a super() return.
 DEEPSEEK_OCR2_SDPA = '''
@@ -211,12 +212,16 @@ def _route_frozen_head(source, bias):
     def ForCausalLMLoss(*args, **kwargs):
         taken.append("loss_function")
         return torch.zeros(())
+    ForCausalLMLoss._unsloth_fused_loss = ForCausalLMLoss
 
-    ns = dict(
+    from _compiled_module_names import fused_loss_header_names
+
+    ns = fused_loss_header_names()
+    ns.update(
         torch = torch, os = os, EMPTY_LOGITS = torch.empty(0),
         UNSLOTH_ENABLE_CCE = True, HAS_CUT_CROSS_ENTROPY = True, UNSLOTH_COMPILE_DISABLE = True,
         fused_linear_cross_entropy = fused_linear_cross_entropy,
-        unsloth_fused_ce_loss = unsloth_fused_ce_loss,
+        unsloth_fused_ce_loss = unsloth_fused_ce_loss, _can_fuse_loss = _can_fuse_loss,
     )
     exec(textwrap.dedent(new_source), ns)
     lm_head = torch.nn.Linear(8, 16, bias = bias).to(torch.float16).requires_grad_(False)

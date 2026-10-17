@@ -21,6 +21,8 @@ except ImportError:
     # torch and they are never called on MLX, so keep the module importable so the
     # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
     torch = None
+import copy
+import copyreg
 import functools
 import gc
 import inspect
@@ -91,22 +93,122 @@ def mean_of_trained_tokens(model, eps = 1e-16):
 pass
 
 
+def _vocab_pad_multiple(pad_to_multiple_of = None):
+    """Opt-in row alignment for grown embeddings: kwarg, else UNSLOTH_VOCAB_PAD_MULTIPLE, else off (None)."""
+    if pad_to_multiple_of is None:
+        import os
+        env = os.environ.get("UNSLOTH_VOCAB_PAD_MULTIPLE", "").strip()
+        if not env: return None
+        try: pad_to_multiple_of = int(env)
+        except ValueError:
+            logger.warning(f"Unsloth: ignoring UNSLOTH_VOCAB_PAD_MULTIPLE={env!r} (not an integer).")
+            return None
+    elif type(pad_to_multiple_of) is not int:
+        raise ValueError(f"Unsloth: pad_to_multiple_of must be an integer, got {pad_to_multiple_of!r}")
+    return pad_to_multiple_of if pad_to_multiple_of > 1 else None
+pass
+
+
+def _round_up_vocab(n_rows, pad_to_multiple_of):
+    if not pad_to_multiple_of: return n_rows
+    return -(-n_rows // pad_to_multiple_of) * pad_to_multiple_of
+pass
+
+
+# On the text config so they survive save / load and reach vLLM through the model config:
+# every alignment row (no token has it: vLLM biases these), and the subset of those Unsloth itself
+# put in suppress_tokens (only these are released when a row becomes a token).
+_VOCAB_PAD_IDS_KEY = "unsloth_vocab_pad_ids"
+_VOCAB_PAD_SUPPRESSED_KEY = "unsloth_vocab_pad_suppressed_ids"
+
+
+def _vocab_pad_config(model):
+    config = getattr(model, "config", None)
+    get_text_config = getattr(config, "get_text_config", None)
+    return get_text_config() if callable(get_text_config) else config
+pass
+
+
+def _set_or_drop(config, key, ids):
+    if ids:
+        setattr(config, key, ids)
+    elif hasattr(config, key):
+        delattr(config, key)
+pass
+
+
+def _suppress_padded_rows(model, start, end, now_valid = range(0), old_rows = None):
+    """Alignment rows [start, end) have no token: keep HF generate from ever sampling them.
+    Ids in `now_valid` were alignment rows of an earlier call and are real tokens now; only
+    rows suppressed here are released, suppression the model or caller set is kept."""
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None: return
+    config = _vocab_pad_config(model)
+    rows = list(getattr(config, _VOCAB_PAD_IDS_KEY, None) or []) if config is not None else []
+    owned = getattr(config, _VOCAB_PAD_SUPPRESSED_KEY, None) if config is not None else None
+    owned = list(owned) if owned is not None else list(rows)
+    suppress = getattr(generation_config, "suppress_tokens", None) or []
+    if suppress and not rows and len(now_valid) and config is not None and not hasattr(config, _VOCAB_PAD_IDS_KEY):
+        # Saved by padding code that did not record its rows: those are exactly every row past the
+        # tokenizer, all suppressed. A model suppressing only some spare rows keeps them. Rows from
+        # a resize in this call are not legacy rows, so bound by the pre-resize count.
+        if old_rows is None:
+            embeddings = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+            old_rows = getattr(getattr(embeddings, "weight", None), "shape", (0,))[0]
+        legacy = range(now_valid.start, old_rows)
+        if len(legacy) and set(legacy).issubset(suppress):
+            rows = list(legacy)
+            owned = list(legacy)
+    pass
+    if not rows and end <= start: return
+    suppress = list(suppress)
+    now_valid = set(now_valid)
+    suppress = [i for i in suppress if not (i in now_valid and i in owned)]
+    rows  = [i for i in rows  if i not in now_valid]
+    owned = [i for i in owned if i not in now_valid]
+    for i in range(start, end):
+        if i not in rows: rows.append(i)
+        if i not in suppress:
+            suppress.append(i)
+            owned.append(i)
+    pass
+    generation_config.suppress_tokens = suppress or None
+    if config is not None:
+        _set_or_drop(config, _VOCAB_PAD_IDS_KEY, rows)
+        _set_or_drop(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
+    pass
+pass
+
+
 def add_new_tokens(
     model,
     tokenizer,
     new_tokens = [],
     method = "mean",
     interpolation = 0.5,
+    pad_to_multiple_of = None,
 ):
     """
     Resize the tokenizer and add new tokens to the model, excluding untrained
     tokens from the mean calculation.
+
+    pad_to_multiple_of (or UNSLOTH_VOCAB_PAD_MULTIPLE) is opt-in: when the
+    embedding has to grow, round its row count up to that multiple (e.g. 64).
+    The tokenizer length is unchanged; the extra rows hold the trained mean,
+    are never labels, and are added to generation_config.suppress_tokens so HF
+    generate cannot emit them. They are also recorded as config.unsloth_vocab_pad_ids,
+    which load_vllm reads to bias them out of vLLM sampling (vLLM ignores
+    suppress_tokens). config.vocab_size becomes the padded row count.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     assert(isinstance(new_tokens, (list, tuple)))
     assert(len(new_tokens) > 0)
     assert(method == "mean" or method == "interpolation")
     assert(interpolation >= 0 and interpolation <= 1)
+
+    # Vision models hand back a processor; its inner tokenizer owns the vocab.
+    if not hasattr(tokenizer, "add_tokens") and hasattr(tokenizer, "tokenizer"):
+        tokenizer = tokenizer.tokenizer
 
     # Check if tokens already exist
     overlapping_tokens = set(new_tokens) & set(tokenizer.vocab.keys())
@@ -132,7 +234,8 @@ def add_new_tokens(
     old_output_embedding = model.get_output_embeddings().weight
     old_input_length  = old_input_embedding .shape[0]
     old_output_length = old_output_embedding.shape[0]
-    old_config_size   = model.config.vocab_size
+    # Composite configs (Gemma3Config) keep vocab_size on text_config.
+    text_config       = model.config.get_text_config()
 
     # Check for tied weights as well
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \
@@ -156,6 +259,12 @@ def add_new_tokens(
     # new_vocab_length already includes the freshly added tokens, so do NOT add
     # their count again here.
     resize_target = max(old_input_length, old_output_length, new_vocab_length)
+    # Align only when the new tokens overflow the existing rows.
+    pad_to_multiple_of = _vocab_pad_multiple(pad_to_multiple_of)
+    old_rows = max(old_input_length, old_output_length)
+    if pad_to_multiple_of is not None and resize_target > old_rows:
+        resize_target = _round_up_vocab(resize_target, pad_to_multiple_of)
+    pass
     # Also resizes lm_head as well!
     model.resize_token_embeddings(resize_target)
 
@@ -176,7 +285,7 @@ def add_new_tokens(
         raise RuntimeError(
             "Unsloth: LM Head matrix size did not get resized properly. Please file a bug report!"
         )
-    if model.config.vocab_size   != resize_target:
+    if text_config.vocab_size    != resize_target:
         raise RuntimeError(
             "Unsloth: Model's config vocab_size did not get resized properly. Please file a bug report!"
         )
@@ -212,6 +321,20 @@ def add_new_tokens(
         with torch.no_grad():
             embedding_matrix[old_length:new_vocab_length] = mean_embedding
             lm_head_matrix  [old_length:new_vocab_length] = mean_lm_head
+    pass
+
+    # Deterministic mean init for alignment rows (HF mean_resizing samples them randomly).
+    pad_start = max(old_rows, new_vocab_length)
+    padded = pad_to_multiple_of is not None and resize_target > pad_start
+    if padded:
+        with torch.no_grad():
+            embedding_matrix[pad_start:resize_target] = mean_embedding
+            lm_head_matrix  [pad_start:resize_target] = mean_lm_head
+    # A later call reuses earlier alignment rows for its new tokens: those ids must not stay suppressed.
+    _suppress_padded_rows(
+        model, pad_start, resize_target if padded else pad_start, range(old_length, new_vocab_length),
+        old_rows = old_rows,
+    )
     pass
 
     # We set a flag to say we need to train embeddings
@@ -348,6 +471,18 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             f"embedding."
         )
         return
+    # DeepSpeed ZeRO-3 partitioned the weights to empty placeholders: gather them outside inference mode
+    # (all-gather writes param.data) and let rank 0's reset reach every partition (unsloth#225).
+    partitioned = []
+    for weight in (embeddings.weight, lm_head.weight):
+        status = getattr(getattr(weight, "ds_status", None), "name", None)
+        if status == "NOT_AVAILABLE" and all(weight is not w for w in partitioned):
+            partitioned.append(weight)
+    if partitioned:
+        import deepspeed
+        with torch.inference_mode(False), \
+            deepspeed.zero.GatheredParameters(partitioned, modifier_rank = 0), torch.inference_mode():
+            return fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES, eps)
     embedding_matrix = embeddings.weight
     lm_head_matrix   = lm_head.weight
     chat_template = getattr(tokenizer, "chat_template", None)
@@ -683,6 +818,35 @@ def _is_conversation_format(text):
 pass
 
 
+def _patched_processor_reduce_ex(self, protocol):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Patched class is not importable by name, so pickle as the stock class (spawn workers, AsyncGRPO).
+    state = dict(self.__dict__)
+    state.pop("_unsloth_patched_call", None)
+    # copyreg.__newobj__ insists on the instance's own class; _reconstructor does not.
+    return (copyreg._reconstructor, (type(self)._unsloth_original_class, object, None), state)
+pass
+
+
+def _patched_processor_copy(self):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # In-process copies keep the patched class (__reduce_ex__ would drop it).
+    new = type(self).__new__(type(self))
+    new.__dict__.update(self.__dict__)
+    return new
+pass
+
+
+def _patched_processor_deepcopy(self, memo):
+    # All Unsloth Zoo code licensed under LGPLv3
+    new = type(self).__new__(type(self))
+    memo[id(self)] = new
+    for key, value in self.__dict__.items():
+        new.__dict__[key] = copy.deepcopy(value, memo)
+    return new
+pass
+
+
 def patch_processor_call(processor):
     """
     Patch processor's __call__ to auto-apply the chat template when text is in
@@ -736,6 +900,10 @@ def patch_processor_call(processor):
             "__call__": patched_call,
             "__module__": original_class.__module__,
             "__qualname__": original_class.__qualname__,
+            "_unsloth_original_class": original_class,
+            "__reduce_ex__": _patched_processor_reduce_ex,
+            "__copy__": _patched_processor_copy,
+            "__deepcopy__": _patched_processor_deepcopy,
         }
     )
     processor.__class__ = patched_class

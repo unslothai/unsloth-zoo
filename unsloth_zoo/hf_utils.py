@@ -50,13 +50,17 @@ def dtype_from_config(config):
             dtype = getattr(config, dtype_name, None)
     return dtype
 
+def _as_torch_dtype(dtype):
+    # 5.x only converts a string dtype in __init__; later strings reach torch ops (#1556)
+    return getattr(torch, dtype, dtype) if isinstance(dtype, str) else dtype
+
 def set_dtype_in_config(config, dtype):
     try:
         string_dtype = str(dtype).split(".")[-1] if isinstance(dtype, torch.dtype) else dtype
         if HAS_TORCH_DTYPE:
             setattr(config, "torch_dtype", string_dtype)
         else:
-            setattr(config, "dtype", string_dtype)
+            setattr(config, "dtype", _as_torch_dtype(dtype))
     except:
         set_dtype_in_config_fallback(config, string_dtype)
 
@@ -66,7 +70,7 @@ def set_dtype_in_config_fallback(config, dtype):
         if HAS_TORCH_DTYPE:
             config.__dict__["torch_dtype"] = string_dtype
         else:
-            config.__dict__["dtype"] = string_dtype
+            config.__dict__["dtype"] = _as_torch_dtype(dtype)
     except:
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Failed to set dtype in config, fallback failed too")

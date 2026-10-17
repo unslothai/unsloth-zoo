@@ -527,6 +527,7 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
             A_MODE = a_mode, ROW_SCALE = row_scale is not None, HAS_BIAS = bias is not None, IEEE = ieee,
             E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, ENDS = bool(ends),
             num_warps = warps, num_stages = stages, **extra,
+            enable_fp_fusion = True,
         )
     CALLS["gemm"] += 1
     return out
@@ -564,6 +565,7 @@ def grouped_wgrad(g, x, counts, out_dtype, num_experts = None, backend = None, c
             g.stride(0), x.stride(0), dw.stride(0), dw.stride(1), dw.stride(2),
             IEEE = ieee, E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, ENDS = bool(ends),
             num_warps = warps, num_stages = stages,
+            enable_fp_fusion = True,
         )
     CALLS["wgrad"] += 1
     return dw
@@ -736,11 +738,13 @@ def unavailable_reason():
 # Generic MoE path (moe_utils.grouped_mm_triton): torch._grouped_mm semantics on bf16 / fp16 operands of one dtype.
 
 
-def generic_grouped_mm(inputs, weight, offsets):
-    """torch._grouped_mm semantics; offsets are read on device (no host sync). Rows past offsets[-1] stay unwritten."""
+def generic_grouped_mm(inputs, weight, offsets, config_rows = None):
+    """torch._grouped_mm semantics; offsets are read on device (no host sync). Rows past offsets[-1] stay unwritten.
+    config_rows = (M, E) of the whole problem picks the tiles when this call is one slice of it."""
     M, K = inputs.shape
     E, _, N = weight.shape
-    config = generic_gemm_config(M, E, N, K, inputs.device, inputs.dtype)
+    config_M, config_E = config_rows or (M, E)
+    config = generic_gemm_config(config_M, config_E, N, K, inputs.device, inputs.dtype)
     out = grouped_gemm(inputs, weight, offsets, inputs.dtype, b_trans = False, num_experts = E,
                        config = config, backend = "triton", ends = True)
     GENERIC_CALLS["gemm"] += 1

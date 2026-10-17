@@ -2469,8 +2469,9 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
 
     def fake_hf(trainer, *, instruction_part=None, response_part=None,
                 force_match=True, tokenizer=None, return_function=False,
-                num_proc=None, last_response_only=False):
+                num_proc=None, last_response_only=False, mask_out_tokens=None):
         received["last_response_only"] = last_response_only
+        received["mask_out_tokens"] = mask_out_tokens
         return lambda batch: batch
 
     monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
@@ -2482,9 +2483,11 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
         tokenizer=tokenizer,
         return_function=True,
         last_response_only=True,
+        mask_out_tokens=["</think>"],
     )
 
     assert received["last_response_only"] is True
+    assert received["mask_out_tokens"] == ["</think>"]
 
 
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
@@ -2972,7 +2975,7 @@ def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    forward_source = inspect.getsource(mlx_utils._vlm_cce_forward)
+    forward_source = inspect.getsource(mlx_utils._vlm_hidden_states)
     unpack_source = inspect.getsource(mlx_utils._unpack_embed_result)
     # The marker is set by the position-recording prepare phase.
     prepare_source = inspect.getsource(mlx_utils._vlm_positions_for_compile)

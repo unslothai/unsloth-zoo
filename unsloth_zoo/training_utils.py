@@ -26,7 +26,7 @@ import time
 from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
-from .device_type import DEVICE_TYPE
+from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
@@ -677,7 +677,7 @@ def unsloth_train(trainer):
     #     .to(device = "cuda:0", non_blocking = True)[0]
 
     # Mixed precision scaling
-    _amp_device = "npu" if DEVICE_TYPE == "npu" else "cuda"
+    _amp_device = DEVICE_TYPE_TORCH if DEVICE_TYPE in ("xpu", "npu") else "cuda"
     torch_version = torch.__version__
     config_dtype = dtype_from_config(model.config)
     if config_dtype == torch.float16:
@@ -711,8 +711,20 @@ def unsloth_train(trainer):
         )
     pass
 
+    # Batches go where the inputs run (an offloaded embedding is meta: use its hook's execution device).
+    from .device_map_planner import _first_execution_device
+    try:
+        train_device = _first_execution_device(model.get_input_embeddings())
+    except Exception:
+        train_device = None
+    if train_device is None:
+        train_device = next(
+            (p.device for p in model.parameters() if p.device.type != "meta"),
+            torch.device(f"{DEVICE_TYPE_TORCH}:0"),
+        )
+    train_device = torch.device(train_device)
     step = 0
-    accumulated_loss = torch.zeros(1, device = f"{_amp_device}:0", dtype = torch.float32)[0]
+    accumulated_loss = torch.zeros(1, device = train_device, dtype = torch.float32)[0]
     debug_info = \
         f'==((====))==  Unsloth - 2x faster free finetuning | Num GPUs = {training_args.world_size}\n'\
         f'    \\   /|    Num examples = {n_training_samples:,} | Num Epochs = {num_train_epochs:,}\n'\
@@ -758,13 +770,18 @@ def unsloth_train(trainer):
 
                 # Gradient accumulation
                 for batch in batches:
-                    input_ids = batch["input_ids"].pin_memory().to(device = f"{_amp_device}:0", non_blocking = True)
-                    labels    = batch["labels"]   .pin_memory().to(device = f"{_amp_device}:0", non_blocking = True)
+                    input_ids = batch["input_ids"]
+                    labels    = batch["labels"]
+                    if train_device.type != "cpu":
+                        input_ids = input_ids.pin_memory()
+                        labels    = labels   .pin_memory()
+                    input_ids = input_ids.to(device = train_device, non_blocking = True)
+                    labels    = labels   .to(device = train_device, non_blocking = True)
 
                     with autocast_context_manager:
                         loss = model(input_ids = input_ids, labels = labels, n_items = n_items).loss
                         # loss = loss * inverse_gradient_accumulation_steps
-                        accumulated_loss += loss.detach()
+                        accumulated_loss += loss.detach().to(train_device)
                     pass
 
                     if float16_scaler is None:  loss.backward()
@@ -772,11 +789,13 @@ def unsloth_train(trainer):
                 pass
 
                 if float16_scaler is None:
-                    clip_grad_norm_(trainable_parameters, max_grad_norm)
+                    if max_grad_norm is not None and max_grad_norm > 0:
+                        clip_grad_norm_(trainable_parameters, max_grad_norm)
                     optimizer.step()
                 else:
                     float16_scaler.unscale_(optimizer)
-                    clip_grad_norm_(trainable_parameters, max_grad_norm)
+                    if max_grad_norm is not None and max_grad_norm > 0:
+                        clip_grad_norm_(trainable_parameters, max_grad_norm)
                     float16_scaler.step(optimizer)
                     float16_scaler.update()
                 lr_scheduler.step()
@@ -789,8 +808,9 @@ def unsloth_train(trainer):
                 progress_bar.update(1)
 
                 step += 1
-                if step == max_steps: break
+                if step >= max_steps: break
             pass
+            if step >= max_steps: break
         pass
     pass
     unset_training(model)

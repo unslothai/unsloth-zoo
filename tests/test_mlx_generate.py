@@ -352,6 +352,15 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
     Generator.eos = True
     eos = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
     assert eos.token_ids == [1] and eos.finish_reason == "stop"
+    tokenizer.eos_token_ids = (2, 3)
+    for chosen, stops in ((None, [[2], [3]]), ([5, 6, 5], [[5], [6]])):
+        adapter.defaults = GenerationDefaults(stop_token_ids=chosen)
+        _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
+        assert Generator.instances[-1].kwargs["stop_tokens"] == stops
+    assert GenerationDefaults(256, SamplingParams(), (), 2, 3, 16).max_kv_size == 16
+    for bad in ([True], [-1], [1.5]):
+        with pytest.raises(ValueError, match="non-negative integer"):
+            GenerationDefaults(stop_token_ids=bad)
     Generator.eos = False
     Generator.fail = True
     Generator.close_fail = True
@@ -493,9 +502,11 @@ def test_vlm_requests_accept_stop_strings():
                                   GenerationDefaults(stop_strings=("STOP",)))
 
 
-def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
+def test_vlm_requests_reject_token_ids_with_media_and_unsupported_controls():
     from unsloth_zoo.mlx.generate import _validate_vlm_requests
-    cases = ((GenerationRequest(prompt_token_ids=[1]), GenerationDefaults(), "rendered prompt string"),
+    assert _validate_vlm_requests([GenerationRequest(prompt_token_ids=iter((1, 2)))], GenerationDefaults())[0].prompt_token_ids == (1, 2)  # noqa: E501
+    cases = ((GenerationRequest(prompt_token_ids=[1], image="i.png"), GenerationDefaults(), "token ids with media"),
+        (GenerationRequest(prompt="a", prompt_token_ids=[1]), GenerationDefaults(), "exactly one"),
         (GenerationRequest(prompt=""), GenerationDefaults(), "must not be empty"),
         (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
         # One mlx-vlm would drop rather than apply is refused: an inert start or bogus scheme,
@@ -1101,7 +1112,8 @@ def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches()
     assert results[1].token_ids == [1]
 
 
-def test_vision_generation_resolves_the_saved_processor(monkeypatch):
+@pytest.mark.parametrize("audio", [None, [0.0, 0.1]])
+def test_vision_generation_resolves_the_saved_processor(monkeypatch, audio):
     # A text-only multimodal load publishes its inner tokenizer, so the typed
     # core resolves the saved processor for both it and fast_generate.
     from unsloth_zoo.mlx.generate import generate_batch as engine_generate_batch
@@ -1112,11 +1124,11 @@ def test_vision_generation_resolves_the_saved_processor(monkeypatch):
         def stream(self, requests):
             return iter([GenerationEvent(index=0, result="ok")])
     monkeypatch.setattr(engine, "_VLMBatchAdapter", _Adapter)
-    monkeypatch.setattr(engine, "generation_mode", lambda model: contextlib.nullcontext())
+    monkeypatch.setattr(engine, "generation_mode", lambda model, call: seen.update(call=call) or contextlib.nullcontext())
     processor = object()
     model = types.SimpleNamespace(_is_vlm_model=True, _processor=processor)
-    assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a")]) == ["ok"]
-    assert seen["tok"] is processor
+    assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a", audio=audio)]) == ["ok"]
+    assert seen["tok"] is processor and seen["call"] == ("batch", "vision", *(() if audio is None else ("audio",)))
 
 
 def _knob_sampler(**knobs):
@@ -1376,6 +1388,7 @@ def _vlm_adapter(generator_type = None):
         _VLMBatchAdapter._row_logits_processors, adapter)
     adapter._wired_limit = lambda: _wired_ctx(adapter.wired)
     adapter._decode_image = lambda request: request
+    adapter._prompt_inputs = types.MethodType(_VLMBatchAdapter._prompt_inputs, adapter)
     adapter._add_special_tokens = lambda: True
     adapter._split_prompt_kwargs = lambda kwargs, n: [dict(kwargs)] * n
     adapter._admission_stalled = lambda generator: False
@@ -1436,6 +1449,49 @@ def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
     keeping = [Deep, Opaque, Subscript, Unpacked]
     for model in (Clean, Deep, Circular, Tower, Opaque, Subscript, Unpacked):
         assert _keeps_what_it_prepared(model()) is (model in keeping), model.__name__
+
+
+def test_a_method_is_read_once_and_never_outlives_its_model(monkeypatch):
+    import gc, weakref
+    from unsloth_zoo.mlx import generate
+
+    class Model:
+        def _measure(self, ids): return len(ids)
+        def get_input_embeddings(self, ids): return self._measure(ids)
+
+    reads = []
+    source = inspect.getsource
+    monkeypatch.setattr(inspect, "getsource", lambda target: reads.append(target) or source(target))
+    assert not generate._keeps_what_it_prepared(Model())
+    assert not generate._keeps_what_it_prepared(Model())
+    assert not generate._draws_by_position(Model, "_measure") and not generate._draws_by_position(Model(), "_measure")
+    assert reads == [Model.get_input_embeddings, Model._measure, Model._measure]
+    assert generate._binds_self(Model._measure) is generate._binds_self(Model._measure)
+
+    # A method a model defines around itself is remembered only while that model lives.
+    model = Model()
+    def measure(ids, model = model): return len(ids) + len(vars(model))
+    model._measure = measure
+    assert not generate._keeps_what_it_prepared(model)
+    alive = weakref.ref(model)
+    del model, measure, reads[:]
+    gc.collect()
+    assert alive() is None
+
+    def keeping(self, ids): self._ids = ids
+
+    class Wrapper:
+        def __init__(self, wrapped): self.__wrapped__ = wrapped
+        def __call__(self, ids): return self.__wrapped__(self, ids)
+
+    wrapper = Wrapper(Model.get_input_embeddings)
+    wrapped = types.SimpleNamespace(get_input_embeddings = wrapper, _measure = len)
+    assert not generate._keeps_what_it_prepared(wrapped)
+    wrapper.__wrapped__ = keeping
+    assert generate._keeps_what_it_prepared(wrapped)
+
+    Model._measure.__code__ = keeping.__code__
+    assert generate._keeps_what_it_prepared(Model())
 
 
 def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
@@ -1506,6 +1562,20 @@ def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     assert session.add(GenerationRequest(prompt = "fg")) == 1
 
 
+def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
+    session = _vlm_session()
+    session.adapter.prepare_inputs = lambda *a, **k: pytest.fail("processed")
+    assert session.add(GenerationRequest(prompt_token_ids = (7, 8, 9))) == 0
+    assert session.generator.inserted[0][0] == [[7, 8, 9]]
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.processor, adapter.batches_observable = types.SimpleNamespace(tokenizer = _CharTokenizer()), True
+    rows = [GenerationRequest(prompt_token_ids = (1, 2)), GenerationRequest(prompt_token_ids = (3, 4))]
+    assert adapter._group_key(rows[0]) != adapter._group_key(GenerationRequest(prompt = "ab"))
+    inputs = _VLMBatchAdapter._prompt_inputs(adapter, rows)
+    assert [inputs[k].tolist() for k in ("input_ids", "attention_mask")] == [[[1, 2], [3, 4]], [[1, 1]] * 2]
+
+
 def test_a_processor_is_shown_its_own_row_s_history_from_its_own_offset():
     """Rows rarely share a prompt length, so each latches its own offset."""
     from unsloth_zoo.mlx.generate import _row_processors
@@ -1573,7 +1643,7 @@ def test_kv_quant_controls_and_processor_rows_are_refused_before_they_reach_a_ca
 
 def test_the_preflight_refuses_defaults_every_add_would():
     from unsloth_zoo.mlx.generate import stream_unavailable_reason
-    assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed")))  # noqa: E501
+    assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed"), ({"_is_vlm_model": True, "language_model": object()}, {"stop_token_ids": (5,)}, "stop_token_ids")))  # noqa: E501
 
 
 def test_a_cache_with_model_specific_state_refuses_a_quantized_batch_before_it_starts():
@@ -1606,8 +1676,9 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     # these tests hand it plain stand-ins. The decode scope reads a module's own dict
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
-    from unsloth_zoo.mlx.inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                                           fused_moe_router, fused_residual_norm, fused_residual_norm_handoff)
+    from unsloth_zoo.mlx.inference import (exact_speculative_verify, fused_decode_conv_silu, fused_moe_gate_up,
+                                           fused_moe_routed_experts, fused_moe_router, fused_packed_gated_delta,
+                                           fused_residual_norm, fused_residual_norm_handoff, fused_verify_attention)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1616,28 +1687,123 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
             named_modules = lambda: [("plain", stub)],
         )
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
-                fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model):
+                fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model), \
+                exact_speculative_verify(model), fused_packed_gated_delta(model), fused_verify_attention(model):
             pass
 
 
-def test_generation_paths_enter_every_inference_fusion(monkeypatch):
-    # A scope missing from generation_mode or a loader generate site silently leaves that path native.
+def test_every_inference_scope_is_registered_and_every_generation_path_enters_the_registry(monkeypatch):
+    # A scope missing from the registry silently leaves every path native.
     import ast
 
     from unsloth_zoo.mlx import generate as generate_module, inference, loader
-    scopes = {name for name, value in vars(inference).items()
-              if name.startswith(("fused_", "nax_", "dense_")) and getattr(value, "__module__", None) == inference.__name__}
+    scopes = {value for name, value in vars(inference).items() if inspect.isfunction(value)
+              and name != "inference_scopes" and "_modules" in inspect.signature(value).parameters}
+    assert scopes == {scope.enter for scope in inference.INFERENCE_SCOPES}
     entered = []
-    for name in scopes:
-        monkeypatch.setattr(inference, name, lambda model, *args, name=name, **kwargs: entered.append(name) or contextlib.nullcontext(model))
-    with generate_module.generation_mode(types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [])):
-        pass
-    assert sorted(entered) == sorted(scopes)
-    sites = [{item.context_expr.func.id for item in node.items
-              if isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name)}
-             for node in ast.walk(ast.parse(inspect.getsource(loader))) if isinstance(node, ast.With)]
-    sites = [site for site in sites if any(name.startswith(("fused_", "nax_", "dense_")) for name in site)]
-    assert len(sites) == 2 and all(site == scopes for site in sites)
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [inference.InferenceScope(
+        lambda model, _modules: entered.append((model, _modules)) or contextlib.nullcontext())])
+    model = types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [("", stub)])
+    stub = types.SimpleNamespace(training=False)
+    with generate_module.generation_mode(model):
+        assert entered == [(model, (("", stub),))]
+    calls = [node for node in ast.walk(ast.parse(inspect.getsource(loader)))
+             if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "inference_scopes"]
+    # The loader's generate sites run no speculative verify rounds.
+    assert [ast.literal_eval(call.args[1]) for call in calls] == [("vision",), ()]
+
+
+def _recording_scopes(monkeypatch, entered, *scopes):
+    from unsloth_zoo.mlx import inference
+
+    def scope(name, fails = False):
+        @contextlib.contextmanager
+        def enter(model, *args, _modules):
+            assert type(_modules) is tuple   # the one walk every scope shares
+            if fails:
+                raise RuntimeError(name)
+            entered.append((name, args))
+            try:
+                yield model
+            finally:
+                entered.append(("exit " + name, ()))
+        enter.__name__ = name
+        return enter
+
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [
+        inference.InferenceScope(scope(name, **options.pop("scope", {})), **options) for name, options in scopes])
+    return inference.inference_scopes
+
+
+@pytest.mark.parametrize("call, opt_in, names", [
+    (None, None, ["every", "drafted", "vision"]),
+    ((), None, ["every"]),
+    (("vision", "speculative"), "1", ["every", "drafted", "vision", "opt_in"]),
+    ("speculative", "0", ["every", "drafted"]),
+    (("a trait this zoo does not know",), "true", ["every"]),
+    ("one-shot iterator", None, ["every", "vision"]),
+])
+def test_inference_scopes_enter_what_the_call_is_served_by_and_opt_in_only_when_switched_on(monkeypatch, call, opt_in, names):
+    entered = []
+    compose = _recording_scopes(monkeypatch, entered, ("every", {}), ("drafted", {"serves": frozenset({"speculative"})}),
+                                ("vision", {"serves": frozenset({"vision", "audio"})}),
+                                ("opt_in", {"opt_in": "UNSLOTH_MLX_TEST_SCOPE"}))
+    if opt_in is None:
+        monkeypatch.delenv("UNSLOTH_MLX_TEST_SCOPE", raising = False)
+    else:
+        monkeypatch.setenv("UNSLOTH_MLX_TEST_SCOPE", opt_in)
+    if call == "one-shot iterator":
+        call = iter(("vision", "audio"))
+    model = types.SimpleNamespace()
+    with compose(model, call) as active:
+        assert active is model and [name for name, _ in entered] == names
+    assert [name for name, _ in entered[len(names):]] == ["exit " + name for name in reversed(names)]
+
+
+def test_an_open_text_batch_holds_the_scopes_a_batch_is_served_by(monkeypatch):
+    entered = []
+    _recording_scopes(monkeypatch, entered, ("every", {}), ("batch", {"serves": frozenset({"batch"})}),
+                      ("drafted", {"serves": frozenset({"speculative"})}), ("vision", {"serves": frozenset({"vision"})}))
+    _open_stream(monkeypatch).close()
+    assert [name for name, _ in entered] == ["every", "batch", "exit batch", "exit every"]
+
+
+@pytest.mark.parametrize("vlm, speculative, call", [
+    (False, None, ("batch",)), (True, None, ("batch", "vision")), (True, object(), ("batch", "vision", "speculative"))])
+def test_a_batch_stream_describes_its_call_to_generation_mode(monkeypatch, vlm, speculative, call):
+    from unsloth_zoo.mlx import generate as module
+
+    seen = []
+    session = lambda *args: types.SimpleNamespace(close = lambda: None)
+    monkeypatch.setattr(module, "_stream_setup", lambda *args: (vlm, object()))
+    monkeypatch.setattr(module, "generation_mode", lambda model, call: seen.append(call) or contextlib.nullcontext())
+    for name in ("_generation_cache_hygiene", "_TextBatchSession", "_VLMBatchSession", "_SpeculativeBatchSession"):
+        monkeypatch.setattr(module, name, session if name.endswith("Session") else contextlib.nullcontext)
+    module.BatchStream(object(), object(), speculative = speculative).close()
+    assert seen == [call]
+
+
+def test_inference_scopes_pass_int8_prefill_only_where_registered_and_report_or_raise_refusals(monkeypatch):
+    entered, refused = [], []
+    compose = _recording_scopes(monkeypatch, entered, ("first", {"int8_prefill": True}),
+                                ("refuses", {"scope": {"fails": True}}), ("last", {}))
+    with compose(object(), int8_prefill = False, on_error = lambda name, error: refused.append((name, str(error)))):
+        assert entered == [("first", (False,)), ("last", ())] and refused == [("refuses", "refuses")]
+    entered.clear()
+    with pytest.raises(RuntimeError, match = "refuses"):
+        with compose(object()):
+            pass  # pragma: no cover
+    assert entered == [("first", (None,)), ("exit first", ())]
+
+
+@pytest.mark.parametrize("int8_prefill", [None, True])
+def test_warm_inference_generates_greedily_under_the_int8_decision(int8_prefill):
+    from unsloth_zoo.mlx.inference import warm_inference
+
+    calls = []
+    warm_inference(types.SimpleNamespace(generate = lambda prompt, **kwargs: calls.append((prompt.tolist(), kwargs))),
+                   int8_prefill = int8_prefill)
+    assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill})]
 
 
 def test_cache_layout_tells_quantized_packings_apart():
@@ -1670,3 +1836,58 @@ def test_row_quantizer_starts_uniform_rows_at_the_first_token():
     assert uniform.keywords == {"kv_group_size": 64, "quantized_kv_start": 0, "kv_bits": 4}
     turbo = _row_quantizer(module, {"kv_bits": 3.5, "kv_quant_scheme": "turboquant"})
     assert turbo.keywords["quantized_kv_start"] == 5000
+
+
+_SINGLE_ROW_MODEL = '''
+def _is_single_row_batch_cache(entry):
+    return entry.rows == 1
+
+
+def _extract_row_cache(entry, row):
+    return entry
+
+
+class Model(dict):
+    fa_idx = 0
+
+    def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, position_ids=None,
+                 capture_layer_ids=None, hidden_sink=None):
+        taken = hidden_sink is None and _is_single_row_batch_cache(cache[self.fa_idx])
+        if taken:
+            cache[self.fa_idx] = _extract_row_cache(cache[self.fa_idx], 0)
+        self.seen.append(taken)
+        return taken
+'''
+
+
+def test_single_row_decode_skips_the_shortcut_only_for_an_unpadded_decode_step():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.generate import single_row_batch_decode
+
+    namespace = {}
+    exec(_SINGLE_ROW_MODEL, namespace)
+    Model, native = namespace["Model"], namespace["_is_single_row_batch_cache"]
+    inner = Model()
+    inner.seen = []
+    model = types.SimpleNamespace(named_modules = lambda: [("stub", types.SimpleNamespace()), ("model", inner)])
+    row = lambda pad, rows = 1: types.SimpleNamespace(rows = rows, left_padding = mx.array([pad] * rows))
+    step, prefill = mx.zeros((1, 1)), mx.zeros((1, 4))
+    with single_row_batch_decode(model):
+        with single_row_batch_decode(model):
+            patched = type(inner)
+        assert type(inner) is patched and patched is not Model
+        # A call filling a hidden sink never takes the shortcut, so it is never run twice to compare.
+        inner(step, cache = [row(0)], hidden_sink = [])
+        # The first-use comparison runs on Metal; here the class is taken as already verified.
+        patched._unsloth_single_row_verdict = True
+        for cache, inputs in ((row(0), step), (row(2), step), (row(0), prefill), (row(0, rows = 2), mx.zeros((2, 1)))):
+            inner(inputs, cache = [cache])
+        assert inner.seen == [False, False, True, True, False]
+        patched._unsloth_single_row_verdict = False
+        inner(step, cache = [row(0)])
+        assert inner.seen[-1] is True
+    assert type(inner) is Model and "_unsloth_single_row_scopes" not in vars(inner)
+    # The stand-in predicate answers as mlx-vlm's own outside a skipped call.
+    assert namespace["_is_single_row_batch_cache"]._unsloth_native is native
+    assert namespace["_is_single_row_batch_cache"](row(0)) is True

@@ -24,6 +24,7 @@ import shutil
 import stat
 import tempfile
 import sys
+import threading
 import time
 import warnings
 import importlib
@@ -482,9 +483,11 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 # Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop; one Triton launch beats it for small experts.
 # Measured max average rows per expert per class: "lora" (a dim <= 32), "many" / "few" (>= / < 64 experts),
 # "dw" (base weight grad). sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100 have native grouped GEMMs.
+# sm121 (GB10 / DGX Spark) takes sm120's tiles and limits (1.15x on Qwen3.5-35B-A3B QLoRA, unsloth-zoo#1661).
 _TRITON_GROUPED_MM_AUTO_ROWS = {
     (8, 0):  {"lora": -1, "many": 2048, "few": 256, "dw": 128},
     (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
+    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
     (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0},
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
@@ -567,8 +570,12 @@ def _triton_grouped_mm_wanted(inputs, weight) -> bool:
     E, K, N = weight.shape
     if E == 0 or inputs.shape[1] != K or N == 0:
         return False
+    return _triton_grouped_mm_rows_ok(device, inputs.shape[0], E, K, N)
+
+
+def _triton_grouped_mm_rows_ok(device, M, E, K, N):
     limit = _triton_grouped_mm_max_rows(device.index, _triton_grouped_mm_kind(K, N, E))
-    return _rows_within(limit, inputs.shape[0], E)
+    return _rows_within(limit, M, E)
 
 
 def _grouped_mm_triton_impl(inputs, weight, offsets):
@@ -1082,11 +1089,248 @@ class _GroupedMMRecompute(torch.autograd.Function):
         return grad_input, None, None
 
 
-def _base_grouped_mm(inputs, offsets, weight_provider, recompute):
-    """recompute -> rebuild W in backward; else the prior eager grouped_mm."""
+def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
+    """recompute -> rebuild W in backward; else the prior eager grouped_mm.
+    plan (recompute only): rebuild just the planned experts, chunk by chunk."""
     if recompute:
+        if plan is not None:
+            return _GroupedMMSelectiveRecompute.apply(inputs, weight_provider, plan)
         return _GroupedMMRecompute.apply(inputs, offsets, weight_provider)
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
+
+
+# UNSLOTH_MOE_SELECTIVE_DEQUANT=1: dequantize only routed experts. Opt-in because the plan
+# reads token counts on the host (one sync per MoE layer forward; not capturable).
+SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
+
+
+class _SelectiveDequantPlan:
+    __slots__ = ("num_experts", "num_rows", "chunks")
+
+    def __init__(self, num_experts, num_rows, chunks):
+        self.num_experts = num_experts
+        self.num_rows = num_rows
+        self.chunks = chunks   # [(expert slice or int64 ids, row_lo, row_hi, offsets relative to row_lo)]
+
+
+def _selective_dequant_chunk_experts() -> int:
+    try:
+        return max(int(os.environ.get("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "0")), 0)
+    except ValueError:
+        return 0
+
+
+def _bnb4bit_expert_split(param):
+    """(E, per-expert shape) when every expert of this Params4bit owns whole packed elements
+    and whole absmax blocks, so a gather of experts is exact."""
+    while hasattr(param, "base_layer"):
+        param = param.base_layer
+    if not (HAS_BNB and isinstance(param, Params4bit)):
+        return None
+    qs = getattr(param, "quant_state", None)
+    if qs is None or param.requires_grad:
+        return None
+    shape = getattr(param, "_original_shape", None) or qs.shape
+    if shape is None or len(shape) != 3:
+        return None
+    E, per_expert = int(shape[0]), int(shape[1]) * int(shape[2])
+    weights_per_element = 2 * param.data.element_size()
+    if E == 0 or per_expert == 0 or per_expert % qs.blocksize or per_expert % weights_per_element:
+        return None
+    if param.data.numel() * weights_per_element != E * per_expert or qs.absmax.numel() != E * (per_expert // qs.blocksize):
+        return None
+    return E, tuple(int(x) for x in shape[1:])
+
+
+# Gathered ids are decoded in pieces of at least _SELECTIVE_GATHER_MIN experts and at most 1/8 of
+# the request, so the packed copy stays near 1/32 of the fp16 output without a launch per expert.
+_SELECTIVE_GATHER_PIECES = 8
+_SELECTIVE_GATHER_MIN = 32
+
+
+def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
+    """Dequantize only `experts` of a packed 4-bit stack: a slice reads views of the packed bytes
+    and absmax blocks, an int64 id tensor gathers them in a few pieces. Each piece is a smaller
+    QuantState decoded by the same kernels, so every element matches the full-stack read."""
+    from bitsandbytes.functional import QuantState
+
+    while hasattr(param, "base_layer"):
+        param = param.base_layer
+    E, inner = _bnb4bit_expert_split(param)
+    qs = param.quant_state
+    blocks = inner[0] * inner[1] // qs.blocksize
+    packed_all = param.data.reshape(E, -1)
+    absmax_all, offset, absmax2_all = qs.absmax, qs.offset, None
+    if qs.nested:
+        s2 = qs.state2
+        if blocks % s2.blocksize == 0:
+            absmax2_all = s2.absmax.reshape(E, -1)
+        else:
+            # Second-level blocks straddle experts: denest as bitsandbytes does (multiply, then
+            # add the offset in fp32), which is what both 4-bit decoders compute per block.
+            absmax_all = (bnb.functional.dequantize_blockwise(absmax_all, s2) + offset).float()
+            offset = None
+    absmax_all = absmax_all.reshape(E, blocks)
+
+    if isinstance(experts, slice):
+        n = len(range(*experts.indices(E)))
+        pieces = [experts]
+    else:
+        n = int(experts.numel())
+        pieces = list(experts.split(max(_SELECTIVE_GATHER_MIN, -(-n // _SELECTIVE_GATHER_PIECES))))
+
+    def take(t, piece):
+        return t[piece] if isinstance(piece, slice) else t.index_select(0, piece)
+
+    out = None
+    if len(pieces) > 1:
+        out = torch.empty((n,) + inner, dtype = qs.dtype, device = packed_all.device)
+    row = 0
+    for piece in pieces:
+        packed = take(packed_all, piece)
+        k = packed.shape[0]
+        dest = out[row : row + k] if out is not None else None
+        state2 = None
+        if absmax2_all is not None:
+            state2 = QuantState(
+                absmax = take(absmax2_all, piece).reshape(-1), code = qs.state2.code,
+                blocksize = qs.state2.blocksize, quant_type = qs.state2.quant_type, dtype = qs.state2.dtype,
+            )
+        piece_shape = (k,) + inner
+        sub = QuantState(
+            absmax = take(absmax_all, piece).reshape(-1), shape = torch.Size(piece_shape), code = qs.code,
+            blocksize = qs.blocksize, quant_type = qs.quant_type, dtype = qs.dtype, offset = offset, state2 = state2,
+        )
+        weight = None
+        try:
+            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+            weight = nf4_dequant_triton(packed, sub, piece_shape, out = dest)
+        except ImportError:
+            pass
+        if weight is None:
+            sub_param = torch.Tensor._make_subclass(Params4bit, packed.reshape(-1, 1))
+            sub_param.quant_state = sub
+            sub_param._original_shape = torch.Size(piece_shape)
+            slicer = _get_dequantize_4bit_in_slices()
+            weight = slicer(sub_param) if slicer is not None else None
+            if weight is None:
+                weight = bnb.functional.dequantize_4bit(packed.reshape(-1, 1), sub)
+        del packed, sub, state2
+        if dest is None:
+            out = weight.reshape(piece_shape)
+        elif weight.data_ptr() != dest.data_ptr():
+            dest.copy_(weight.reshape(piece_shape))
+        row += k
+        del weight, dest
+    SELECTIVE_DEQUANT_STATS["dequant_calls"] += 1
+    SELECTIVE_DEQUANT_STATS["experts_dequantized"] += n
+    SELECTIVE_DEQUANT_STATS["experts_total"] += E
+    return out.to(target_dtype) if target_dtype is not None else out
+
+
+def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
+    """Chunks of experts to dequantize, or None to keep the full-stack path (off, traced,
+    capturing, a source that cannot be split exactly, or nothing to save)."""
+    selective = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "0") == "1"
+    chunk = _selective_dequant_chunk_experts()
+    if not selective and chunk == 0:
+        return None
+    if torch.compiler.is_compiling():
+        return None
+    device = num_tokens_per_expert.device
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return None
+    E = int(num_tokens_per_expert.numel())
+    for source in sources:
+        split = _bnb4bit_expert_split(source)
+        if split is None or split[0] != E:
+            return None
+    counts = num_tokens_per_expert.tolist()
+    experts = [e for e, c in enumerate(counts) if c > 0] if selective else list(range(E))
+    if not experts:
+        return None
+    if not chunk and 8 * len(experts) > 7 * E:
+        return None   # under 1/8 of the stack to save, not worth the gathers
+    chunk = chunk or len(experts)
+    ends = []
+    total = 0
+    for c in counts:
+        total += c
+        ends.append(total)
+    chunks = []
+    for i in range(0, len(experts), chunk):
+        ids = experts[i : i + chunk]
+        row_lo = ends[ids[0]] - counts[ids[0]]
+        row_hi = ends[ids[-1]]
+        contiguous = ids[-1] - ids[0] + 1 == len(ids)
+        chunks.append((
+            slice(ids[0], ids[-1] + 1) if contiguous else torch.tensor(ids, dtype = torch.int64, device = device),
+            row_lo,
+            row_hi,
+            torch.tensor([ends[e] - row_lo for e in ids], dtype = torch.int32, device = device),
+        ))
+    SELECTIVE_DEQUANT_STATS["plans"] += 1
+    return _SelectiveDequantPlan(E, num_rows, chunks)
+
+
+def _grouped_mm_slice(inputs, weight, offsets, plan):
+    """_grouped_mm_with_backward_fix for a slice of a planned problem: the Triton choice and
+    its tiles follow the whole (rows, experts) problem, so each group's result matches it."""
+    E, K, N = weight.shape
+    if (
+        _GROUPED_MM_TRITON_OP is not None
+        and inputs.device.type == "cuda"
+        and inputs.dtype in (torch.bfloat16, torch.float16)
+        and weight.dtype == inputs.dtype
+        and _triton_grouped_mm_rows_ok(inputs.device, plan.num_rows, plan.num_experts, K, N)
+    ):
+        from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+        if mg.triton_grouped_available(inputs.device):
+            return mg.generic_grouped_mm(
+                inputs.contiguous(), weight, offsets, config_rows = (plan.num_rows, plan.num_experts),
+            )
+    return _grouped_mm_eager(inputs, weight, offsets)
+
+
+def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
+    if len(plan.chunks) == 1:
+        experts, _, _, offsets = plan.chunks[0]
+        weight = weight_provider(experts)
+        if transpose:
+            weight = weight.transpose(-2, -1).contiguous()
+        return _grouped_mm_slice(inputs, weight, offsets, plan)
+    out = None
+    for experts, row_lo, row_hi, offsets in plan.chunks:
+        weight = weight_provider(experts)
+        if transpose:
+            weight = weight.transpose(-2, -1).contiguous()
+        rows = inputs[row_lo : row_hi]
+        if rows.data_ptr() % 16:
+            rows = rows.clone()   # grouped GEMMs want 16-byte aligned operands
+        part = _grouped_mm_slice(rows, weight, offsets, plan)
+        del weight
+        if out is None:
+            out = inputs.new_empty((inputs.shape[0], part.shape[-1]))
+        out[row_lo : row_hi] = part
+        del part
+    return out
+
+
+class _GroupedMMSelectiveRecompute(torch.autograd.Function):
+    """_GroupedMMRecompute over a _SelectiveDequantPlan: forward and dX read only the planned experts."""
+
+    @staticmethod
+    def forward(ctx, inputs, weight_provider, plan):
+        ctx.weight_provider = weight_provider
+        ctx.plan = plan
+        with torch.no_grad():
+            return _selective_grouped_mm(inputs, weight_provider, plan, False)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        with torch.no_grad():
+            grad_input = _selective_grouped_mm(grad_output.contiguous(), ctx.weight_provider, ctx.plan, True)
+        return grad_input, None, None
 
 
 def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_module):
@@ -1187,12 +1431,67 @@ def _check_torch_grouped_mm_supported():
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
 
+# Some ROCm GPUs segfault in grouped_mm instead of raising (unsloth#12391): run the kernels in a throwaway interpreter first.
+_GROUPED_MM_CRASH_PROBE = r"""
+import sys
+if sys.platform == "win32":   # no "python.exe has stopped working" dialog when the kernel faults
+    import ctypes; ctypes.windll.kernel32.SetErrorMode(0x0003)
+import torch
+d = torch.device("cuda", int(sys.argv[1]))
+def probe(x, w, offs):
+    offs = torch.tensor(offs, device = d, dtype = torch.int32)
+    try: torch._grouped_mm(x, w, offs = offs); torch.cuda.synchronize(d)
+    except Exception: pass   # a Python error is caught in-process too; only a crash or hang matters here
+half = dict(device = d, dtype = torch.float16)
+bf16 = dict(device = d, dtype = torch.bfloat16)
+w_t  = torch.ones(4, 64, 32, **bf16).transpose(-2, -1)
+probe(torch.ones(1, 8, **half), torch.ones(1, 8, 8, **half), [1])
+probe(torch.ones(32, 32, **bf16), w_t, [8, 16, 24, 32])
+probe(torch.ones(32, 32, **bf16), w_t.contiguous(), [8, 16, 24, 32])
+"""
+_GROUPED_MM_SURVIVES = None
+_GROUPED_MM_SURVIVES_LOCK = threading.Lock()
+
+
+def _grouped_mm_survives_out_of_process(device):
+    global _GROUPED_MM_SURVIVES
+    if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
+    # Publish once known: concurrent first callers wait for the child, never run the kernel.
+    with _GROUPED_MM_SURVIVES_LOCK:
+        if _GROUPED_MM_SURVIVES is None: _GROUPED_MM_SURVIVES = _run_grouped_mm_crash_probe(device)
+    return _GROUPED_MM_SURVIVES
+
+
+def _run_grouped_mm_crash_probe(device):
+    # AMD only: CUDA and XPU keep the in-process probe.
+    if getattr(torch.version, "hip", None) is None or device.type != "cuda": return True
+    # Studio's Python _grouped_mm fallback (gfx120X) is active: this process never runs the native kernel.
+    try:
+        dump = torch._C._dispatch_dump("aten::_grouped_mm").splitlines()
+        if any(l.startswith("CUDA:") and ".cpp:" not in l for l in dump): return True
+    except Exception:
+        pass
+    import subprocess
+    # Not multiprocessing: spawn re-imports the caller's __main__.
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _GROUPED_MM_CRASH_PROBE, str(device.index)],
+            stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL, timeout = 180,
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).returncode
+    except Exception as e:
+        result = type(e).__name__
+    if result == 0: return True
+    _log_info(f"Unsloth: torch._grouped_mm probe crashed on this ROCm GPU ({result}); disabling grouped_mm.")
+    return False
+
+
 def _probe_torch_grouped_mm_supported():
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
     device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
-    if device is None:
+    if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -1237,7 +1536,7 @@ def _probe_transposed_view_grouped_mm_is_safe():
     safe = False
     try:
         device = _grouped_mm_probe_device()
-        if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
+        if _TORCH_GROUPED_MM_AVAILABLE and device is not None and _grouped_mm_survives_out_of_process(device):
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
             gen = torch.Generator(device=device).manual_seed(0)
@@ -1339,6 +1638,9 @@ def _check_grouped_gemm_available():
         _GROUPED_GEMM_AVAILABLE = True
         _init_triton_allocator()
     except (ImportError, ModuleNotFoundError):
+        # A temporary patch asking while unsloth itself imports: circular, not absent. Decide later.
+        if _unsloth_importing():
+            return False
         _GROUPED_GEMM_AVAILABLE = False
     return _GROUPED_GEMM_AVAILABLE
 
@@ -1346,14 +1648,47 @@ def _check_grouped_gemm_available():
 from functools import lru_cache, wraps
 
 
-@lru_cache(maxsize=1)
+def _unsloth_importing():
+    return bool(getattr(getattr(sys.modules.get("unsloth"), "__spec__", None), "_initializing", False))
+
+
+_SELECTED_MOE_BACKEND = None
+
+
 def select_moe_backend():
     """Select MoE backend from UNSLOTH_MOE_BACKEND + availability.
 
     Choices: "grouped_mm", "unsloth_triton", "native_torch" (default "grouped_mm").
     """
     # This Unsloth Zoo code section is licensed under AGPL3
+    global _SELECTED_MOE_BACKEND
+    if _SELECTED_MOE_BACKEND is not None:
+        return _SELECTED_MOE_BACKEND
+    backend = _select_moe_backend()
+    # Chosen while unsloth imports (its Triton kernels cannot load yet): choose again on the next call.
+    if not _unsloth_importing():
+        _SELECTED_MOE_BACKEND = backend
+    return backend
 
+
+def _clear_selected_moe_backend():
+    global _SELECTED_MOE_BACKEND
+    _SELECTED_MOE_BACKEND = None
+
+
+select_moe_backend.cache_clear = _clear_selected_moe_backend
+
+
+def select_moe_backend_for_interleaved_gate_up():
+    """select_moe_backend() for interleaved gate_up (GPT-OSS), which Triton cannot run: grouped_mm, not the loop."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    backend = select_moe_backend()
+    if backend == "unsloth_triton" and _check_torch_grouped_mm_supported():
+        return "grouped_mm"
+    return backend
+
+
+def _select_moe_backend():
     requested = os.environ.get("UNSLOTH_MOE_BACKEND")
     if requested:
         if requested == "grouped_mm" and _check_torch_grouped_mm_supported():
@@ -2176,13 +2511,17 @@ def _get_dequantize_4bit_in_slices():
     return _DEQUANTIZE_4BIT_IN_SLICES
 
 
-def _get_base_weight(param, target_dtype=None, token_counts=None):
+def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
-    providers) restores the packed Params4bit to its logical shape and casts."""
+    providers) restores the packed Params4bit to its logical shape and casts. experts (a
+    _SelectiveDequantPlan chunk) returns only those experts of a packed 4-bit stack."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     while hasattr(param, "base_layer"):
         param = param.base_layer
+
+    if experts is not None:
+        return _dequantize_bnb4bit_experts(param, experts, target_dtype)
 
     if is_mxfp4_expert_param(param):
         return param.dequantize(dtype = target_dtype, token_counts = token_counts)
@@ -2260,7 +2599,24 @@ def native_moe_grouped_mm(
     return _grouped_mm_with_backward_fix(inputs, weight, offsets)
 
 
-def _pad_lora_rank_for_grouped_mm(first_weight, second_weight):
+def _lora_rank_pad_needed(inputs, first_weight) -> bool:
+    """False when both LoRA GEMMs take Triton (masks any K / N, no 16-byte stride rule).
+    rank <= 32 keeps both GEMMs (min(K, N) = rank) in the same "lora" row class."""
+    if inputs is None or first_weight.shape[-1] > 32:
+        return True
+    if os.environ.get("UNSLOTH_MOE_LORA_PAD_ALWAYS", "0") == "1":
+        return True
+    if not _triton_grouped_mm_wanted(inputs, first_weight):
+        return True
+    # A failed self-check falls back to torch._grouped_mm, which needs the pad.
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+    if torch.compiler.is_compiling():
+        # Never run the self-check while tracing; skip the pad only if it already passed.
+        return not (mg._GENERIC_DISABLED_REASON is None and mg._GENERIC_SELF_CHECKED.get(inputs.device.index) is True)
+    return not mg.triton_grouped_available(inputs.device)
+
+
+def _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inputs = None):
     """Zero-pad the LoRA rank of (E, in, R) / (E, R, out) so torch._grouped_mm gets 16-byte
     aligned rows (bf16 rank 4 or 6 fell back to the per-expert loop, and aborted compile).
     Zero columns meet zero rows, so the product is exact. Minimum 8 even for fp32: autocast
@@ -2268,7 +2624,7 @@ def _pad_lora_rank_for_grouped_mm(first_weight, second_weight):
     align = max(8, 16 // first_weight.element_size())
     rank = first_weight.shape[-1]
     pad = (-rank) % align
-    if pad == 0:
+    if pad == 0 or not _lora_rank_pad_needed(inputs, first_weight):
         return first_weight, second_weight
     first_weight = F.pad(first_weight, (0, pad))
     second_weight = F.pad(second_weight, (0, 0, 0, pad))
@@ -2289,7 +2645,7 @@ def _apply_lora_grouped_mm(
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    lora_B, lora_A = _pad_lora_rank_for_grouped_mm(lora_B, lora_A)
+    lora_B, lora_A = _pad_lora_rank_for_grouped_mm(lora_B, lora_A, inputs)
     # X @ B then result @ A; both already in native (E, ...) layout, no transpose.
     lora_intermediate = grouped_mm_func(inputs, lora_B.contiguous(), offsets)
     lora_delta = grouped_mm_func(lora_intermediate, lora_A.contiguous(), offsets)
@@ -3815,13 +4171,53 @@ def _target_regex_for(names, all_names):
     return "(?:" + "|".join(re.escape(n) for n in sorted(wanted)) + ")"
 
 
+# Pre-fusion expert names PEFT's v5 MoE conversion probes under a fused expert container.
+_PRE_FUSION_EXPERT_NAMES = ("gate_proj", "up_proj", "down_proj", "w1", "w2", "w3")
+
+
+def _all_target_names(base_model):
+    return [
+        n for n, _ in base_model.named_modules()
+        if n and not (set(n.split(".")) & _LORA_INTERNAL_NAMES)
+    ]
+
+
+def _portable_regex_target_modules(base_model, adapter_name, regex):
+    """Exact regex over the wrapped modules when `regex` also fullmatches `<experts>.gate_proj`.
+
+    Unsloth's get_peft_regex matches `mlp.experts.gate_proj` / `up_proj`, which PEFT's v5 MoE conversion
+    reads as a v4 adapter and doubles gate_up_proj's rank, so plain PEFT fails to load (unsloth#6930).
+    """
+    import re
+    wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
+    if not has_param_lora:
+        return None
+    containers = set()
+    for name, module in base_model.named_modules():
+        if getattr(module, "parameter_name", None):
+            while name.endswith(".base_layer"):
+                name = name[: -len(".base_layer")]
+            containers.add(name)
+    try:
+        if not any(
+            re.fullmatch(regex, f"{container}.{leaf}")
+            for container in containers for leaf in _PRE_FUSION_EXPERT_NAMES
+        ):
+            return None
+    except re.error:
+        return None
+    if not wrapped:
+        return []
+    return _target_regex_for(wrapped, _all_target_names(base_model))
+
+
 def portable_lora_target_modules(peft_model, adapter_name, target_modules):
-    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine (list form only).
+    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine.
 
     Gemma 4: LoRA sits on the inner `.linear`; plain PEFT would pick the unsupported wrapper, so write a regex.
     Fused experts: unmatched gate_proj / up_proj make PEFT's v5 MoE conversion double gate_up_proj's rank; drop them.
     """
-    if not isinstance(target_modules, (list, tuple, set)) or not target_modules:
+    if not target_modules or not isinstance(target_modules, (str, list, tuple, set)):
         return None
     try:
         base_model = peft_model.get_base_model()
@@ -3829,6 +4225,8 @@ def portable_lora_target_modules(peft_model, adapter_name, target_modules):
         base_model = getattr(getattr(peft_model, "base_model", None), "model", None)
     if base_model is None:
         return None
+    if isinstance(target_modules, str):
+        return _portable_regex_target_modules(base_model, adapter_name, target_modules)
     wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
     targets = [t for t in target_modules if isinstance(t, str)]
     if len(targets) != len(target_modules):
@@ -3842,11 +4240,7 @@ def portable_lora_target_modules(peft_model, adapter_name, target_modules):
         if n.endswith(".linear") and any(hit(n[: -len(".linear")], t) for t in targets)
     ]
     if redirected:
-        all_names = [
-            n for n, _ in base_model.named_modules()
-            if n and not (set(n.split(".")) & _LORA_INTERNAL_NAMES)
-        ]
-        return _target_regex_for(wrapped, all_names)
+        return _target_regex_for(wrapped, _all_target_names(base_model))
     if has_param_lora:
         kept = [t for t in targets if any(hit(n, t) for n in wrapped)]
         if len(kept) != len(targets):
@@ -3964,11 +4358,32 @@ def _save_pretrained_argument(name, default, args, kwargs):
     return default
 
 
+def _stamp_fused_expert_lora_layout(peft_model, selected_adapters):
+    """Put the layout in `auto_mapping` too, which PEFT writes with the config itself: the
+    post-save marker write can fail, and a marker-less Unsloth adapter reads as pre-2026.9.6."""
+    try:
+        names = selected_adapters or list(peft_model.peft_config.keys())
+        for adapter_name in names:
+            auto_mapping = getattr(peft_model.peft_config.get(adapter_name), "auto_mapping", None)
+            if not isinstance(auto_mapping, dict):
+                continue
+            detail = fused_expert_lora_layout(peft_model, adapter_name)
+            auto_mapping.pop(FUSED_EXPERT_LORA_LAYOUT_KEY, None)
+            auto_mapping.pop(FUSED_EXPERT_LORA_DETAIL_KEY, None)
+            if detail is not None:
+                auto_mapping[FUSED_EXPERT_LORA_DETAIL_KEY] = detail
+    except Exception:
+        pass
+
+
 def _patched_peft_model_save_pretrained(self, save_directory, *args, **kwargs):
     """Add the fused expert layout marker to what PEFT saved. Never fails a save: the
     adapter itself is already on disk by the time this runs."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    _stamp_fused_expert_lora_layout(
+        self, _save_pretrained_argument("selected_adapters", None, args, kwargs),
+    )
     result = _original_peft_model_save_pretrained(self, save_directory, *args, **kwargs)
     if _save_pretrained_argument("is_main_process", True, args, kwargs):
         try:
@@ -4028,6 +4443,259 @@ def _patch_peft_save_pretrained_for_moe_layout():
     return True
 
 
+# Families whose experts forward read lora_B grouped by expert from #450 to #1269 (2026.9.6);
+# every other family stayed on PEFT's forward, i.e. rank_major.
+_LEGACY_GROUPED_LORA_B_FAMILIES = frozenset((
+    "deepseek_v3", "ernie4_5_moe", "ernie4_5_vl_moe", "gemma4", "glm4_moe", "glm4_moe_lite",
+    "gpt_oss", "lfm2_moe", "mixtral", "qwen3_5_moe", "qwen3_moe", "qwen3_next", "qwen3_vl_moe",
+))
+_legacy_lora_b_converted_logged = set()
+_original_peft_model_load_adapter = None
+
+
+def _experts_family(module):
+    """`qwen3_moe` for Qwen3MoeExperts from `transformers.models.qwen3_moe.modeling_qwen3_moe`
+    or from Unsloth's compiled copy, `unsloth_compiled_module_qwen3_moe`."""
+    if type(module).__name__ == "Mxfp4GptOssExperts":
+        return "gpt_oss"
+    name = type(module).__module__
+    leaf = name.rsplit(".", 1)[-1]
+    if leaf.startswith("unsloth_compiled_module_"):
+        return leaf[len("unsloth_compiled_module_"):]
+    parts = name.split(".")
+    if len(parts) > 2 and parts[:2] == ["transformers", "models"]:
+        return parts[2]
+    return None
+
+
+def _declared_lora_b_layouts(source) -> Optional[dict]:
+    detail = source.get(FUSED_EXPERT_LORA_DETAIL_KEY)
+    if isinstance(detail, dict) and isinstance(detail.get("parameters"), dict):
+        return {
+            name: entry.get("lora_B_layout")
+            for name, entry in detail["parameters"].items()
+            if isinstance(entry, dict) and entry.get("lora_B_layout") in _LORA_B_LAYOUTS
+        }
+    marker = source.get(FUSED_EXPERT_LORA_LAYOUT_KEY)
+    if marker in _LORA_B_LAYOUTS:
+        return {name: marker for name in _SEPARATED_MOE_LORA_PARAMETER_NAMES}
+    return None
+
+
+def saved_lora_b_layouts(config) -> dict:
+    """{parameter_name: layout} from the #1232 marker (top level, or the copy in
+    `auto_mapping`), else {None: grouped_by_expert} for a marker-less Unsloth save
+    (`unsloth_fixed`) with fused expert targets: Unsloth only wrote `target_parameters`
+    from #450 (2026-02-05), so that is the 2026.9.5-or-older window."""
+    if not isinstance(config, dict):
+        return {}
+    auto_mapping = config.get("auto_mapping")
+    auto_mapping = auto_mapping if isinstance(auto_mapping, dict) else {}
+    for source in (config, auto_mapping):
+        declared = _declared_lora_b_layouts(source)
+        if declared is not None:
+            return declared
+    # UNSLOTH_MOE_LORA_MERGED=1 trained on PEFT's own forward (rank_major); a process
+    # still set that way most likely loads such an adapter.
+    if config.get("target_parameters") and auto_mapping.get("unsloth_fixed") and _should_use_separated_lora():
+        return {None: LORA_B_LAYOUT_GROUPED_BY_EXPERT}
+    return {}
+
+
+def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
+    """Repack `adapter_name`'s grouped-by-expert fused expert lora_B into PEFT's rank_major,
+    in place, per `saved_lora_b_layouts(config)`. Lossless: column `e * r + j` moves to
+    `j * num_experts + e`. Returns how many tensors moved."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    layouts = saved_lora_b_layouts(config)
+    if not layouts:
+        return 0
+    targets = []
+    for module in peft_model.modules():
+        parameter_name = getattr(module, "parameter_name", None)
+        if parameter_name not in _SEPARATED_MOE_LORA_PARAMETER_NAMES:
+            continue
+        num_experts = int(getattr(module, "num_experts", 1) or 1)
+        if num_experts <= 1 or not _wrapper_has_adapter(module, adapter_name):
+            continue
+        layout = layouts.get(parameter_name)
+        if layout is None and None in layouts:
+            experts = module.get_base_layer()
+            while hasattr(experts, "base_layer"):
+                experts = experts.base_layer
+            if _experts_family(experts) in _LEGACY_GROUPED_LORA_B_FAMILIES:
+                layout = layouts[None]
+        if layout != LORA_B_LAYOUT_GROUPED_BY_EXPERT:
+            continue
+        weight = module.lora_B[adapter_name].weight
+        rank = weight.shape[1] // num_experts
+        if rank <= 1 or rank * num_experts != weight.shape[1]:
+            continue
+        targets.append((weight, num_experts, rank))
+    if any(weight.device.type == "meta" for weight, _, _ in targets):
+        # Accelerate holds disk-offloaded weights elsewhere; repacking only some would mix layouts.
+        raise RuntimeError(
+            "fused expert lora_B is offloaded, so it cannot be repacked in place; set "
+            "UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert to load this pre-2026.9.6 adapter"
+        )
+    for weight, num_experts, rank in targets:
+        permutation = _moe_lora_b_column_permutation(num_experts, rank, weight.device, invert = True)
+        with torch.no_grad():
+            weight.copy_(weight.index_select(1, permutation))
+        # A resumed Trainer restores optimizer state in the old column order after this.
+        weight._unsloth_lora_b_repacked = (num_experts, rank)
+    return len(targets)
+
+
+def repack_optimizer_state_for_legacy_lora_b(optimizer) -> Tuple[int, int]:
+    """Move the optimizer state of lora_B tensors `convert_legacy_lora_b` repacked into the
+    same column order; state that cannot be permuted (8-bit blockwise) is dropped and
+    re-initialised on the next step. Returns (moved, reset)."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    moved = reset = 0
+    for group in getattr(optimizer, "param_groups", ()):
+        for param in group["params"]:
+            repacked = getattr(param, "_unsloth_lora_b_repacked", None)
+            if repacked is None:
+                continue
+            del param._unsloth_lora_b_repacked
+            state = optimizer.state.get(param)
+            if not state:
+                continue
+            permutation = _moe_lora_b_column_permutation(*repacked, param.device, invert = True)
+            tensors = [v for v in state.values() if torch.is_tensor(v) and v.shape == param.shape]
+            if tensors and all(v.is_floating_point() for v in tensors) and not any(
+                torch.is_tensor(v) and v.dim() > 0 and v.shape != param.shape for v in state.values()
+            ):
+                with torch.no_grad():
+                    for value in tensors:
+                        value.copy_(value.index_select(1, permutation.to(value.device)))
+                moved += 1
+            else:
+                optimizer.state.pop(param, None)
+                reset += 1
+    return moved, reset
+
+
+_original_trainer_load_optimizer_and_scheduler = None
+
+
+def _patched_trainer_load_optimizer_and_scheduler(self, checkpoint, *args, **kwargs):
+    result = _original_trainer_load_optimizer_and_scheduler(self, checkpoint, *args, **kwargs)
+    try:
+        moved, reset = repack_optimizer_state_for_legacy_lora_b(self.optimizer) if checkpoint else (0, 0)
+    except Exception:
+        moved = reset = 0
+    if moved or reset:
+        print(
+            f"Unsloth: resumed optimizer state for repacked fused MoE expert lora_B: {moved} "
+            f"tensors moved to the new column order, {reset} reset (8-bit state cannot be permuted)."
+        )
+    return result
+
+
+def _patch_trainer_resume_for_legacy_lora_b():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_trainer_load_optimizer_and_scheduler
+    try:
+        from transformers import Trainer
+    except Exception:
+        return False
+    method = getattr(Trainer, "_load_optimizer_and_scheduler", None)
+    if method is None or getattr(method, "_unsloth_moe_layout_patched", False):
+        return method is not None
+    if _original_trainer_load_optimizer_and_scheduler is None:
+        _original_trainer_load_optimizer_and_scheduler = method
+    patched = wraps(method)(_patched_trainer_load_optimizer_and_scheduler)
+    patched._unsloth_moe_layout_patched = True
+    Trainer._load_optimizer_and_scheduler = patched
+    return True
+
+
+def _has_fused_expert_lora(peft_model, adapter_name) -> bool:
+    return any(
+        getattr(module, "parameter_name", None) in _SEPARATED_MOE_LORA_PARAMETER_NAMES
+        and int(getattr(module, "num_experts", 1) or 1) > 1
+        and _wrapper_has_adapter(module, adapter_name)
+        for module in peft_model.modules()
+    )
+
+
+def _read_adapter_config(model_id, kwargs):
+    subfolder = kwargs.get("subfolder") or ""
+    path = os.path.join(str(model_id), subfolder, "adapter_config.json")
+    if not os.path.isfile(path):
+        from huggingface_hub import hf_hub_download
+        # The Hub options PEFT was given (cache_dir, local_files_only, ...), so this finds
+        # the same file PEFT just loaded.
+        accepted = inspect.signature(hf_hub_download).parameters
+        download = {k: v for k, v in kwargs.items() if k in accepted}
+        if download.get("token") is None and kwargs.get("use_auth_token") is not None:
+            download["token"] = kwargs["use_auth_token"]
+        download.update(repo_id = str(model_id), filename = "adapter_config.json", subfolder = subfolder or None)
+        try:
+            path = hf_hub_download(**{**download, "local_files_only": True})
+        except Exception:
+            path = hf_hub_download(**download)
+    with open(path, "r", encoding = "utf-8") as f:
+        return json.load(f)
+
+
+def _patched_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs):
+    """PEFT's load_adapter, then repack a pre-2026.9.6 Unsloth fused expert lora_B into
+    rank_major so the forward, merge and the next save all agree (unsloth#6930). An explicit
+    `UNSLOTH_MOE_LORA_B_LAYOUT` keeps the caller's setting and skips this."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    result = _original_peft_model_load_adapter(self, model_id, adapter_name, *args, **kwargs)
+    if os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") or not _has_fused_expert_lora(self, adapter_name):
+        return result
+    try:
+        converted = convert_legacy_lora_b(self, adapter_name, _read_adapter_config(model_id, kwargs))
+    except Exception as exception:
+        converted = 0
+        logger = _moe_utils_logger()
+        if logger is not None:
+            logger.warning(
+                f"Unsloth: could not check {model_id}'s fused MoE expert LoRA layout "
+                f"({type(exception).__name__}: {exception})."
+            )
+    if converted and (str(model_id), adapter_name) not in _legacy_lora_b_converted_logged:
+        _legacy_lora_b_converted_logged.add((str(model_id), adapter_name))
+        print(
+            f"Unsloth: {model_id} was trained before unsloth_zoo 2026.9.6 with the old fused "
+            f"MoE expert LoRA packing; repacked {converted} lora_B tensors to PEFT's layout. "
+            f"Save it again to update the file (UNSLOTH_MOE_LORA_B_LAYOUT=rank_major loads "
+            f"it unchanged)."
+        )
+    return result
+
+
+def _patch_peft_load_adapter_for_moe_layout():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_peft_model_load_adapter
+
+    try:
+        from peft import PeftModel
+    except Exception:
+        return False
+
+    if getattr(PeftModel.load_adapter, "_unsloth_moe_layout_patched", False):
+        return True
+
+    if _original_peft_model_load_adapter is None:
+        _original_peft_model_load_adapter = PeftModel.load_adapter
+
+    patched = wraps(_original_peft_model_load_adapter)(_patched_peft_model_load_adapter)
+    patched._unsloth_moe_layout_patched = True
+    PeftModel.load_adapter = patched
+    return True
+
+
 def patch_param_wrapper_for_moe():
     """Patch PEFT's ParamWrapper.forward for MoE separated LoRA (call after PEFT import)."""
     # This Unsloth Zoo code section is licensed under AGPL3
@@ -4062,6 +4730,8 @@ def patch_param_wrapper_for_moe():
             ParamWrapper.get_delta_weight = patched
 
         _patch_peft_save_pretrained_for_moe_layout()
+        _patch_peft_load_adapter_for_moe_layout()
+        _patch_trainer_resume_for_legacy_lora_b()
         _patch_peft_get_peft_model_for_moe()
 
         return True
@@ -4240,14 +4910,15 @@ def forward_native_grouped_mm(
         )
 
     own_gate_up = None
+    selective_plan = None
     if hasattr(self, "gate_up_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _gate_up_src = self.gate_up_proj
 
         # Provider re-derives the base weight on demand so Fix 3 can recompute it in
         # backward instead of pinning it (grouped_mm needs contiguous weights).
-        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
-            return preprocess_weight(_get_base_weight(_src, _dt, _n), "gate_up", _h, _mt, experts_module=_mod)
+        def _gate_up_provider(experts=None, _src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
+            return preprocess_weight(_get_base_weight(_src, _dt, _n, experts), "gate_up", _h, _mt, experts_module=_mod)
         _gate_up_layout = _mxfp4_expert_layout(_gate_up_src, "gate_up", hidden_dim, model_type, self)
         if _gate_up_layout is not None:
             mm1_out = _mxfp4_base_grouped_mm(
@@ -4255,8 +4926,13 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype), _gate_up_layout,
             )
         else:
+            _recompute = _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype)
+            if _recompute:
+                selective_plan = _selective_dequant_plan(
+                    (_gate_up_src, getattr(self, "down_proj", None)), num_tokens_per_expert, permuted_input.shape[0],
+                )
             mm1_out = _base_grouped_mm(
-                permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype),
+                permuted_input, offsets, _gate_up_provider, _recompute, selective_plan,
             )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
@@ -4266,7 +4942,7 @@ def forward_native_grouped_mm(
             # Cast to input dtype (LoRA is float32) and make contiguous for grouped_mm.
             first_weight = first_weight.to(permuted_input.dtype).contiguous()
             second_weight = second_weight.to(permuted_input.dtype).contiguous()
-            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight)
+            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight, permuted_input)
 
             try:
                 lora_out = _grouped_mm_with_backward_fix(permuted_input, first_weight, offsets)
@@ -4342,7 +5018,7 @@ def forward_native_grouped_mm(
                 if w1_lora is not None:
                     lora_A, lora_B, scaling = w1_lora
                     lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
-                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1), permuted_input
                     )
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
@@ -4355,7 +5031,7 @@ def forward_native_grouped_mm(
                 if w3_lora is not None:
                     lora_A, lora_B, scaling = w3_lora
                     lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
-                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1), permuted_input
                     )
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
@@ -4435,8 +5111,8 @@ def forward_native_grouped_mm(
     if hasattr(self, "down_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _down_src = self.down_proj
-        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
-            return preprocess_weight(_get_base_weight(_src, _dt, _n), "down", _h, _mt, experts_module=_mod)
+        def _down_provider(experts=None, _src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
+            return preprocess_weight(_get_base_weight(_src, _dt, _n, experts), "down", _h, _mt, experts_module=_mod)
         _down_layout = _mxfp4_expert_layout(_down_src, "down", hidden_dim, model_type, self)
         if _down_layout is not None:
             mm2_out = _mxfp4_base_grouped_mm(
@@ -4444,8 +5120,9 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype), _down_layout,
             )
         else:
+            _recompute = _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype)
             mm2_out = _base_grouped_mm(
-                inter, offsets, _down_provider, _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype),
+                inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None,
             )
 
         if down_lora is not None:
@@ -4454,7 +5131,7 @@ def forward_native_grouped_mm(
             # Cast to input dtype (LoRA is float32) and make contiguous for grouped_mm.
             first_weight = first_weight.to(inter.dtype).contiguous()
             second_weight = second_weight.to(inter.dtype).contiguous()
-            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight)
+            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inter)
 
             lora_out = _grouped_mm_with_backward_fix(inter, first_weight, offsets)
             lora_out = lora_out.contiguous()
@@ -4497,7 +5174,7 @@ def forward_native_grouped_mm(
             if w2_lora is not None:
                 lora_A, lora_B, scaling = w2_lora
                 lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
-                    lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                    lora_A.transpose(-2, -1), lora_B.transpose(-2, -1), inter
                 )
                 lora_A_out = _grouped_mm_with_backward_fix(inter, lora_A_t.contiguous(), offsets)
                 lora_B_t = lora_B_t.contiguous()
@@ -4600,20 +5277,20 @@ def forward_triton_grouped_gemm(
         else:
             intermediate_dim = self.gate_up_proj.shape[1] // 2
 
-        # Autotune first GEMM.
+        # The autotuner doubles intermediate_dim itself: a doubled N can tune a BLOCK_SIZE_N the real N does not divide.
         gemm1_configs = get_or_autotune_moe_kernels(
             num_experts=self.num_experts,
             hidden_dim=hidden_dim,
-            intermediate_dim=intermediate_dim * 2,
+            intermediate_dim=intermediate_dim,
             top_k=top_k,
             dtype=hidden_states.dtype,
         )
 
-        # Autotune second GEMM (output dim is hidden_dim).
+        # Second GEMM: K = intermediate_dim, N = hidden_dim.
         gemm2_configs = get_or_autotune_moe_kernels(
             num_experts=self.num_experts,
             hidden_dim=intermediate_dim,
-            intermediate_dim=hidden_dim,
+            intermediate_dim=hidden_dim // 2 if hidden_dim % 2 == 0 else hidden_dim,
             top_k=top_k,
             dtype=hidden_states.dtype,
         )

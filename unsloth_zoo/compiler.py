@@ -103,7 +103,12 @@ OLD_CUDA_ARCH_VERSION = False
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
-        OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+        # Any visible pre-Turing card, not just the current one: a device_map can place
+        # layers on it, and Inductor fails there.
+        from .device_type import _visible_cuda_capabilities
+        OLD_CUDA_ARCH_VERSION = any(
+            (_major <= 7) and (_minor < 5) for _major, _minor in _visible_cuda_capabilities()
+        )
     else:
         # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
         # ask whether a device is present before asking what it can do. There is
@@ -286,6 +291,40 @@ def calls_disable_compile_function(source, disable_compile_functions):
         for name in disable_compile_functions
         if re.search(r"[^\w.]" + re.escape(name) + r"[\s]{0,}\(", source)
     )
+
+
+def function_defined_elsewhere(modeling_file, name):
+    """True if `modeling_file.<name>` is imported from another file (a same-named method can match `def <name>`)."""
+    try:
+        function = inspect.unwrap(getattr(modeling_file, name))
+        if not inspect.isfunction(function):
+            return False
+        function_file = inspect.getsourcefile(function)
+        modeling_source_file = inspect.getsourcefile(modeling_file)
+    except Exception:
+        return False
+    if function_file is None or modeling_source_file is None:
+        return False
+    return os.path.realpath(function_file) != os.path.realpath(modeling_source_file)
+
+
+def signature_with_string_annotations(signature):
+    """Quote annotations: module-path names the generated file never imports raise NameError."""
+    empty = inspect.Parameter.empty
+    def stringify(annotation):
+        if annotation is empty or isinstance(annotation, str):
+            return annotation
+        return inspect.formatannotation(annotation)
+    try:
+        return signature.replace(
+            parameters = [
+                parameter.replace(annotation = stringify(parameter.annotation))
+                for parameter in signature.parameters.values()
+            ],
+            return_annotation = stringify(signature.return_annotation),
+        )
+    except Exception:
+        return signature
 
 
 def function_has_tensor_inputs(source: str) -> bool:
@@ -481,6 +520,33 @@ except:
     torch_compiler_set_stance = None
 pass
 
+# The stance is process wide, so whether Unsloth owns it lives in unsloth_zoo, shared by
+# every generated module: inference in one model's module, training in another's.
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED, unsloth_claim_eager_stance, unsloth_owns_stance, unsloth_release_stance
+
+def unsloth_training_stance():
+    # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
+    # in a later training step (new sequence length, model.train() without for_training)
+    # would silently run the eager body. Training forwards restore the default stance,
+    # unless the user chose eager_on_recompile themselves. Every set_stance call installs a
+    # fresh stance object, so ours is still active only if the current one `is` it; a user
+    # set_stance since then (even to eager_on_recompile again) is theirs and stays.
+    global INFERENCE_RUNS
+    INFERENCE_RUNS = 0
+    if len(UNSLOTH_EAGER_STANCE_OWNED) != 0 and torch_dynamo_eval_frame is not None:
+        current = torch_dynamo_eval_frame._stance
+        # Ownership is only dropped once ours is reset: a temporary stance scope's exit restores
+        # one of our exact objects, which a later training forward must still recognise.
+        if current.stance == "eager_on_recompile" and unsloth_owns_stance(current):
+            # Only the reset object: an outer scope may still restore another one of ours.
+            # Put back what the caller had before Unsloth switched (force_eager, a backend, ...).
+            previous = unsloth_release_stance(current)
+            if previous is not None and hasattr(torch_dynamo_eval_frame, "_set_stance"):
+                torch_dynamo_eval_frame._set_stance(previous)
+            else:
+                torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+pass
+
 from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
 from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
 """
@@ -499,6 +565,9 @@ from unsloth_zoo.loss_utils import (
     unsloth_fused_ce_loss,
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
+from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
 @torch.compiler.disable(recursive = False)
@@ -734,7 +803,7 @@ def _unique_suffix(source):
     suffix, counter = "", 0
     while any(f"{n}{suffix}" in source for n in (
         "_aiter_fn", "_aiter_ok", "_aiter_q", "_aiter_k", "_aiter_v",
-        "_aiter_out", "_call_aiter_safe", "_get_aiter_fn",
+        "_aiter_out", "_call_aiter_safe", "_aiter_device_type",
     )):
         counter += 1
         suffix = f"_{counter}"
@@ -801,7 +870,7 @@ def replace_sdpa_with_amd_aiter(source):
     ok_var  = f"_aiter_ok{suffix}"
     out_tmp = f"_aiter_out{suffix}"
     safe_fn = f"_call_aiter_safe{suffix}"
-    get_fn  = f"_get_aiter_fn{suffix}"
+    dt_mod  = f"_aiter_device_type{suffix}"
     qt, kt, vt = f"_aiter_q{suffix}", f"_aiter_k{suffix}", f"_aiter_v{suffix}"
 
     # Bottom up so earlier line numbers stay valid.
@@ -818,8 +887,11 @@ def replace_sdpa_with_amd_aiter(source):
 
         block = [
             f"{indent}{_AITER_MARKER}, requires: pip install amd-aiter (ROCm >= 7.0)",
-            f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func as {get_fn}",
-            f"{indent}{fn_var} = {get_fn}()",
+            f"{indent}import unsloth_zoo.device_type as {dt_mod}",
+            f"{indent}{fn_var} = (",
+            f"{indent}    {dt_mod}.get_amd_flash_attn_func({q_var}.device)",
+            f"{indent}    if {dt_mod}.AMD_PER_DEVICE_CACHES else {dt_mod}.get_amd_flash_attn_func()",
+            f"{indent})",
             f"{indent}{ok_var} = (",
             f"{indent}    {fn_var} is not None",
             # SDPA aligns causal masks top-left, aiter bottom-right; they agree
@@ -2007,11 +2079,15 @@ def create_new_function(
             new_source = _insert_kwargs_alias(new_source, name, kwargs_alias)
     pass
 
-    # Import items to make the function executable
+    # Import items to make the function executable; a same-named method is not a local def
     items = [
         x
         for x in functions
-        if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))
+        if (
+            (x in new_source)
+            and (x != name)
+            and not re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE)
+        )
     ]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
@@ -2069,6 +2145,9 @@ def create_new_function(
         # upstream source can reference functools too. Neither the license header
         # nor the model module's own imports are guaranteed to provide it.
         imports += "import functools\n"
+    if "transformers." in new_source:
+        # The signature fix-up spells annotations fully qualified (`transformers.cache_utils.Cache`).
+        imports += "import transformers\n"
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
@@ -2936,9 +3015,20 @@ def create_standalone_class(
 
     # Add **loss_kwargs
     if add_loss_kwargs and "**" not in parameters:
-        parameters += ", **loss_kwargs"
-        definition = re.sub(r"(\,[\n][\s]{1,}\))", r",**loss_kwargs\1", definition)
-        source = re.sub(r"(\,[\n]\) \-\>)", r",**loss_kwargs\1", source)
+        # Reuse a var-keyword the count-aware rewrite already spliced in: a second one is a SyntaxError.
+        spliced = None
+        try:
+            for node in ast.walk(ast.parse(textwrap.dedent(source))):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    spliced = node.args.kwarg.arg if node.args.kwarg is not None else None
+                    break
+        except SyntaxError:
+            spliced = None
+        name = spliced or "loss_kwargs"
+        parameters += f", **{name}"
+        definition = re.sub(r"(\,[\n][\s]{1,}\))", rf",**{name}\1", definition)
+        if spliced is None:
+            source = re.sub(r"(\,[\n]\) \-\>)", r",**loss_kwargs\1", source)
     pass
 
     source = f"{compile}\n{source}\n"
@@ -3133,7 +3223,13 @@ __DYNAMO__RECOMPILING__ = """
             old_stance = None
         if old_stance is not None and INFERENCE_RUNS == 1:
             # Skip guards and return to eager -> we still need guards!
-            torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+            # Already eager (another model's inference, or the user's choice): leave that stance
+            # object, and so its ownership, as it is. Otherwise switch and claim the new object.
+            if old_stance != "eager_on_recompile":
+                previous = getattr(torch_dynamo_eval_frame, "_stance", None)
+                torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+                # The stance object itself, or True where torch keeps no such object.
+                unsloth_claim_eager_stance(getattr(torch_dynamo_eval_frame, "_stance", True), previous)
             if UNSLOTH_ENABLE_LOGGING:
                 logger_compiler.info(
                     f"Unsloth: Removing compiler guards after 1 inference run. "\\
@@ -3154,6 +3250,41 @@ __DYNAMO__RECOMPILING__ = """
             INFERENCE_RUNS = 0
         INFERENCE_RUNS += 1
 """
+
+# is_compiling() first: Dynamo folds it to True, so traced forwards skip the call.
+__DYNAMO__TRAINING_STANCE__ = """if not torch.compiler.is_compiling() and torch.is_grad_enabled() and getattr(self, "training", False):
+    unsloth_training_stance()"""
+
+_TRAINING_STANCE_MARKER = "__UNSLOTH_TRAINING_STANCE_MARKER__"
+_TRAINING_STANCE_MARKER_LINE = re.compile(r"^([ \t]*)" + _TRAINING_STANCE_MARKER + r"[ \t]*\n", re.MULTILINE)
+
+
+def _place_training_stance(forward):
+    """Reset at forward entry: at the logits site the decoder body already ran eager."""
+    def at_marker(match):
+        return textwrap.indent(__DYNAMO__TRAINING_STANCE__, match.group(1)) + "\n"
+    try:
+        dedented = textwrap.dedent(forward)
+        tree = ast.parse(dedented)
+        function = next(x for x in tree.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        body = function.body
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant) \
+            and isinstance(first.value.value, str):
+            first = body[1]  # after the docstring
+        lines = forward.split("\n")
+        line = lines[first.lineno - 1]
+        indent = line[: len(line) - len(line.lstrip())]
+        shift = len(line) - len(dedented.split("\n")[first.lineno - 1])
+        if first.lineno == function.lineno or first.col_offset + shift != len(indent) or not indent:
+            raise ValueError("forward body does not start on its own line")
+        lines.insert(first.lineno - 1, textwrap.indent(__DYNAMO__TRAINING_STANCE__, indent))
+        placed = "\n".join(lines)
+        placed = _TRAINING_STANCE_MARKER_LINE.sub("", placed)
+        ast.parse(textwrap.dedent(placed))
+        return placed
+    except Exception:
+        return _TRAINING_STANCE_MARKER_LINE.sub(at_marker, forward)
 
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
@@ -3200,9 +3331,11 @@ if n_items is None:
             break
 pass
 
+if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3221,7 +3354,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3293,10 +3426,17 @@ if n_items is None:
                 if n_items is None: n_items = __kwargs.get("n_items", None)
                 break
 pass
+# Stock ForCausalLMLoss uses caller pre-shifted targets (context parallel, padding-free) as is.
+explicit_shift_labels = None
+if (\\9) != () and type(\\9) is dict:
+    explicit_shift_labels = (\\9).get("shift_labels", None)
+    if not torch.is_tensor(explicit_shift_labels): explicit_shift_labels = None
 
+if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3315,7 +3455,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3323,20 +3463,21 @@ elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENT
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and NOT_RETURN_LOGITS:
+elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LOGITS:
     lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
+    _labels = labels if explicit_shift_labels is None else explicit_shift_labels
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(_labels, _labels.dim() - 1)
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
+        labels               = _labels,
         mask                 = None,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
@@ -3345,8 +3486,9 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
+        shift_labels         = explicit_shift_labels is None,
     )
-elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+elif _can_fuse_loss(self.loss_function) and labels is not None and not NOT_RETURN_LOGITS:
     # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
     # already materialised the full lm_head matmul; apply the captured logit
     # scale/softcap transforms and route loss through self.loss_function on
@@ -3370,7 +3512,7 @@ else:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-    loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
+    loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9__UNSLOTH_NON_CAUSAL__)
 """.replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_3 = """
@@ -3417,9 +3559,11 @@ if n_items is None:
             break
 pass
 
+if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3603,8 +3747,6 @@ def _guard_loss_function_replacement(replacement, condition, block):
             ("and not requires_grad_:", 'getattr(self.lm_head, "bias", None) is None:', "and NOT_RETURN_LOGITS:")
         ):
             line = f"{line[:-1]} and not ({condition}):"
-        elif stripped == 'elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:':
-            line = f"{line[:-1]} and not NOT_RETURN_LOGITS:"
         lines.append(line)
         if stripped.startswith("loss = self.loss_function(logits, labels.to("):
             lines.extend(indent + x if x.strip() else x for x in block.rstrip("\n").split("\n"))
@@ -3885,10 +4027,16 @@ def _apply_fused_lm_head(forward, module=None):
             "vocab_size = (",
             forward,
         )
-        # Fix , **
-        forward = forward.replace(", **)", ")")
-        forward = forward.replace(",**)", ")")
-        forward = forward.replace(",** )", ")")
+        # Stock call took no kwargs: the fallbacks get the count too, but only for a loss that accepts it.
+        forward = forward.replace(
+            ", **__UNSLOTH_NON_CAUSAL__)",
+            ", **unsloth_loss_count_kwargs(self.loss_function, n_items))",
+        )
+        forward = forward.replace("__UNSLOTH_NON_CAUSAL__)", ")")
+        forward = forward.replace(", **)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = forward.replace(",**)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = forward.replace(",** )", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = _place_training_stance(forward)
         # print(forward)
         return forward, True
     pass
@@ -4634,12 +4782,22 @@ pass
 COMPILED_LORA_FORWARD = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
+torch_is_compiling = torch.compiler.is_compiling
+# torch 2.8 / 2.9 inductor miscompiles addmm(alpha = scaling, beta = 1) traced inside a
+# compiled block (e.g. the VLM decoder MLP), forward and backward; fixed in 2.10 (unsloth#3271).
+torch_lora_no_compiled_addmm = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 10)
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     # Use result.dtype (bfloat16 from base layer) since x may have been cast to float32
     # by _cast_input_dtype when autocast is disabled
     target_dtype = result.dtype
     xA = dropout(x).to(target_dtype) @ lora_A.weight.to(target_dtype).t()
+    if torch_lora_no_compiled_addmm and torch_is_compiling():
+        output = result + scaling * (xA @ lora_B.weight.to(target_dtype).t())
+        bias = lora_B.bias
+        if bias is not None:
+            output = output + scaling * bias.to(target_dtype)
+        return output
     # output = result + scaling * xA @ lora_B.weight.t()
     shape = result.shape
     output = torch_addmm(
@@ -4666,6 +4824,9 @@ COMPILED_LORA_FORWARD_forced_float32 = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
 torch_float16 = torch.float16
+torch_is_compiling = torch.compiler.is_compiling
+# See COMPILED_LORA_FORWARD (unsloth#3271).
+torch_lora_no_compiled_addmm = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 10)
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
@@ -4674,6 +4835,12 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     # 66795) overflows if rounded to float16 here. Float16 results take the same kernel.
     shape = result.shape
     result_dtype = result.dtype
+    if torch_lora_no_compiled_addmm and torch_is_compiling():
+        output = result + scaling * (xA.to(result_dtype) @ lora_B.weight.to(result_dtype).t())
+        bias = lora_B.bias
+        if bias is not None:
+            output = output + scaling * bias.to(result_dtype)
+        return output
     output = torch_addmm(
         result.view(-1, shape[-1]),
         xA.view(-1, xA.shape[-1]).to(result_dtype),
@@ -5065,31 +5232,72 @@ def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
         return None
     if module_class is not None and not _head_built_as_linear(module_class, cap.head_attr):
         return None
+    if cap.aligned or cap.aligned_target:
+        _mark_counts_unshifted_labels(module_class)
+    return new_source
+
+
+def _mark_counts_unshifted_labels(module_class):
+    if module_class is None:
+        return
+    try:
+        module_class._unsloth_counts_unshifted_labels = True
+    except Exception:
+        pass
+
+
+def _count_aware_ce_fallback(source, module = None, module_class = None):
+    """A forward no fused route took whose own mean token CE becomes count-aware, else None."""
+    if "unsloth_fused_lm_head_loss" in source or "unsloth_count_aware_cross_entropy" in source:
+        return None
+    try:
+        from unsloth_zoo.fused_losses.ast_rewriter import rewrite_count_aware_ce_spliced
+        new_source, shifted = rewrite_count_aware_ce_spliced(source)
+    except Exception as e:
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print(f"Unsloth: count aware cross entropy rewrite failed for {module}: {e}")
+        return None
+    if new_source is None:
+        return None
+    # A term the aux rewrite cannot weight would get G times its weight once Trainer stops dividing.
+    from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms
+    new_source = rewrite_aux_loss_ga(new_source)
+    if unscaled_extra_loss_terms(new_source):
+        return None
+    if not shifted:
+        _mark_counts_unshifted_labels(module_class)
     return new_source
 
 
 def fused_lm_head_forward(module, module_class, modeling_module_name, source):
-    """The compiler's fused-CE rewrite of one GenerationMixin forward.
-
-    Returns (new_source, route, supports_return_hidden_states); route is "regex", "ast" or None.
-    Pure on the source, so tests/test_fused_ce_coverage.py runs the same decision without compiling.
-    """
+    """Fused-CE rewrite of one forward: (new_source, "regex" | "ast" | None, supports_return_hidden_states)."""
     # Fix some arguments up like for Gemma 3N
     new_source = fixup_fused_lm_head(source)
     new_source = fixup_dropped_logit_scale(new_source, module)
     # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
     from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
+    defined_here = getattr(module_class, "__module__", None) == modeling_module_name
     if not _head_built_as_linear(module_class, "lm_head"):
+        count_source = _count_aware_ce_fallback(new_source, module, module_class) if defined_here else None
+        if count_source is not None:
+            from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
+            return rewrite_aux_loss_ga(count_source), "count", False
         return new_source, None, False
     fused_source, supports_return_hidden_states = apply_fused_lm_head(new_source, module)
     route = "regex" if supports_return_hidden_states else None
-    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
-    if not supports_return_hidden_states and \
-            getattr(module_class, "__module__", None) == modeling_module_name:
+    if not supports_return_hidden_states and defined_here:
         # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
         ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
         if ast_source is not None:
             fused_source, route = ast_source, "ast"
+        else:
+            count_source = _count_aware_ce_fallback(new_source, module, module_class)
+            if count_source is not None:
+                fused_source, route = count_source, "count"
+    if route is not None:
+        from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
+        fused_source = rewrite_aux_loss_ga(fused_source)
     return fused_source, route, supports_return_hidden_states
 
 
@@ -6141,6 +6349,8 @@ def unsloth_compile_transformers(
             r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags=re.DOTALL
         )
         if len(defined) != 0 and len(called) != 0:
+            if function_defined_elsewhere(modeling_file, function):
+                continue
             called_functions.append(function)
     pass
 
@@ -6875,7 +7085,8 @@ def unsloth_compile_transformers(
                 continue
             else:
                 try:
-                    parameters = inspect.signature(function)
+                    # Match inspect.getsource, which unwraps past a wrapper's own __signature__.
+                    parameters = inspect.signature(inspect.unwrap(function))
                 except Exception as e:
                     print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
                     continue
@@ -6886,6 +7097,9 @@ def unsloth_compile_transformers(
                 source = inspect.getsource(function)
             except Exception as e:
                 print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
+                continue
+            # A wrapper borrowing the original's __signature__ would be emitted with its closure body (unsloth#13245).
+            if re.search(rf"^\s*def\s+{re.escape(module)}\s*\(", source, flags = re.MULTILINE) is None:
                 continue
 
             # str(inspect.signature) can disagree with source on quote
@@ -6910,6 +7124,7 @@ def unsloth_compile_transformers(
             if len(bad_params) == 0:
                 continue
 
+            parameters = signature_with_string_annotations(parameters)
             for bad_param in bad_params:
                 parameters = re.sub(
                     re.escape(bad_param) + r"[\s]{0,}\=[\s]{0,}None[\s]{0,}\,",
@@ -7127,6 +7342,13 @@ def unsloth_compile_transformers(
     # Import and replace with new module
     replacement_classes = {}
     for module in all_standalone_classes.keys():
+        try:
+            # The compiled replacement class must keep the counting convention the rewrite marked.
+            original = getattr(modeling_file, module, None)
+            if getattr(original, "_unsloth_counts_unshifted_labels", False) is True:
+                _mark_counts_unshifted_labels(getattr(combined_module, module, None))
+        except Exception:
+            pass
         try:
             exec(
                 f"{model_location}.{module} = combined_module.{module}",

@@ -85,10 +85,17 @@ GRANITE_SPEECH = """    def forward(self, input_ids=None, attention_mask=None, l
 """
 
 
+# The rewrite takes ~20 ms. This bound only has to catch the exponential backtracking #1571 fixed,
+# which never finished, so it is generous and counts this process's CPU time: wall time on a
+# shared runner also counts time spent descheduled, which once read 1.6 s for this call.
+_REWRITE_CPU_BUDGET_S = 5.0
+
+
 def _fused(source, name):
-    start = time.time()
+    start = time.process_time()
     new, fused = compiler.apply_fused_lm_head(source, name)
-    assert time.time() - start < 0.5
+    spent = time.process_time() - start
+    assert spent < _REWRITE_CPU_BUDGET_S, f"apply_fused_lm_head spent {spent:.2f}s of CPU on {name}"
     return new, fused
 
 
@@ -155,8 +162,10 @@ def test_inner_model_logits_are_not_fused():
 
 
 def _granite_loss(source, attention_mask):
+    from _compiled_module_names import fused_loss_header_names
     from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_ce_loss
-    ns = dict(
+    ns = fused_loss_header_names()
+    ns.update(
         torch = torch, nn = torch.nn, os = os, EMPTY_LOGITS = torch.empty(0), UNSLOTH_ENABLE_CCE = False,
         HAS_CUT_CROSS_ENTROPY = False, UNSLOTH_COMPILE_DISABLE = True,
         unsloth_fused_ce_loss = unsloth_fused_ce_loss, __DYNAMO__RECOMPILING__ = None,

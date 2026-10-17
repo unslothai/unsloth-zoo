@@ -107,7 +107,11 @@ class Gap(NamedTuple):
 _GAPS = {
     # A few rows of a transposed quantized matmul run qmv/qmv_wide below the qmv batch limit,
     # then qmm_t_splitk until the output is wide enough for qmm_nax.
-    "small_m_qmm": Gap(open_in = ("0.32.2", "0.32.3"), closed_on_main = False),
+    "small_m_qmm": Gap(open_in = ("0.32.2", "0.32.3", "0.32.4"), closed_on_main = False),
+    # Without NAX the same rows run qmv_wide (plain qmv before generation 15), then qmm_t_splitk.
+    "small_m_qmm_simd": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
+    # MLX's sorted gather kernel runs 32-row tiles below 64 rows per expert, with two barriers per K step.
+    "sorted_gather_qmm": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
 }
 
 
@@ -171,14 +175,15 @@ def _run_probe(module, function):
     return lines[-1] if lines else f"exit code {result.returncode}"
 
 
-def kernel_probe_passed(key: str, module: str, function: str) -> bool:
+def kernel_probe_passed(key: str, module: str, function: str, available = None) -> bool:
     """Run `module.function()` once in a subprocess; cache pass/fail per (macOS build, MLX version, key).
 
-    A Metal build failure inside `mx.fast.metal_kernel` can abort the process, so each NAX kernel is
-    first built and checked here, where a failure only disables it.
+    A Metal build failure inside `mx.fast.metal_kernel` can abort the process, so each kernel is
+    first built and checked here, where a failure only disables it. `available` says whether the
+    kernel's route exists on this GPU; by default, whether NAX does.
     """
     try:
-        if not nax_available():
+        if not (available or nax_available)():
             return False
         entry = f"{platform.mac_ver()[0]}|{_os_build()}|{mx.__version__}|{key}"
         with _PROBE_LOCK:
@@ -190,12 +195,12 @@ def kernel_probe_passed(key: str, module: str, function: str) -> bool:
                     if failure is not None:  # a timeout is retried by the next process
                         _store_probe(entry, passed)
                     if not passed:
-                        logger.warning("NAX kernel %s failed its probe (%s); the native path stays in use",
+                        logger.warning("kernel %s failed its probe (%s); the native path stays in use",
                                        key, failure or "timed out")
                 _PROBES[entry] = passed
             return _PROBES[entry]
     except Exception as error:
-        logger.warning("NAX kernel %s could not be probed (%s); the native path stays in use", key, error)
+        logger.warning("kernel %s could not be probed (%s); the native path stays in use", key, error)
         return False
 
 
@@ -423,14 +428,18 @@ _QMM_ROWS_UNMEASURED = (
 )
 
 
-def small_m_qmm_row_range(N, K, group_size, bits):
-    """The row counts (lowest, highest) where the kernel is measured faster than stock for `[N, K]`."""
-    for entry in _QMM_ROWS_BY_GPU.get(_gpu_generation(), _QMM_ROWS_UNMEASURED):
-        entry_bits, entry_group_size, fewest, widest, low, high = entry
+def _measured_row_range(table, most, N, K, group_size, bits):
+    for entry_bits, entry_group_size, fewest, widest, low, high in table:
         if (bits == entry_bits and entry_group_size in (None, group_size) and N * K >= fewest
                 and (widest is None or N <= widest)):
-            return max(low, 2), min(high, _QMM_MAX_ROWS)  # one row stays on stock qmv, at the bandwidth roofline
+            return max(low, 2), min(high, most)  # one row stays on stock qmv, at the bandwidth roofline
     return 0, -1
+
+
+def small_m_qmm_row_range(N, K, group_size, bits):
+    """The row counts (lowest, highest) where the kernel is measured faster than stock for `[N, K]`."""
+    table = _QMM_ROWS_BY_GPU.get(_gpu_generation(), _QMM_ROWS_UNMEASURED)
+    return _measured_row_range(table, _QMM_MAX_ROWS, N, K, group_size, bits)
 
 
 def probe_small_m_qmm():
@@ -448,7 +457,6 @@ def probe_small_m_qmm():
                     got = small_m_qmm(x, w, scales, biases, group_size, bits).astype(mx.float32)
                     error = mx.abs(got - native).max().item()
                     assert error <= 0.02 * mx.abs(native).max().item(), (bits, group_size, M, error)
-
 
 
 # Prefill `x @ W^T` with int8 activations (oMLX's QxA8 design), reading the stock packed codes,
@@ -780,7 +788,7 @@ _INT8_GATHER_QMM_SIMDGROUPS = {bits: (1, 2) for bits in _INT8_QMM_BITS}
 
 
 @functools.cache
-def _differentiable_int8_qmm(group_size, bits, gather):
+def _differentiable_qmm(group_size, bits, gather, int8 = True):
     """The kernel call with the stock op's vjp for x, scales and biases (Metal kernels have none); packed
     weights and indices, which stock cannot differentiate, get zeros."""
     def stock(x, w, scales, biases, indices = None, token_rows = None):
@@ -792,6 +800,8 @@ def _differentiable_int8_qmm(group_size, bits, gather):
 
     @mx.custom_function
     def routed(x, w, scales, biases, *indices):
+        if not int8:
+            return _sorted_gather_qmm(x, w, scales, biases, group_size, bits, *indices)
         if gather:
             return _int8_gather_qmm(x, w, scales, biases, group_size, bits, *indices)
         return _int8_qmm(x, w, scales, biases, group_size, bits, _INT8_QMM_SIMDGROUPS[bits])
@@ -808,7 +818,7 @@ def _differentiable_int8_qmm(group_size, bits, gather):
 def int8_qmm(x, w, scales, biases, bits):
     """`quantized_matmul(x, w, scales, biases, transpose=True)` for a 2-D x, with int8 activations and
     the group size the scales imply; x, scales and biases must be float16 or bfloat16."""
-    return _differentiable_int8_qmm(x.shape[-1] // scales.shape[-1], bits, False)(x, w, scales, biases)
+    return _differentiable_qmm(x.shape[-1] // scales.shape[-1], bits, False)(x, w, scales, biases)
 
 
 def int8_gather_qmm(x, w, scales, biases, indices, bits, token_rows = None):
@@ -816,20 +826,24 @@ def int8_gather_qmm(x, w, scales, biases, indices, bits, token_rows = None):
     shape [T, K] and sorted expert indices [T], with int8 activations; returns [T, N]. x, scales and
     biases must be float16 or bfloat16. With `token_rows`, row i reads `x[token_rows[i]]`, so each
     row of x is quantized once however many experts it is routed to."""
-    routed = _differentiable_int8_qmm(x.shape[-1] // scales.shape[-1], bits, True)
+    routed = _differentiable_qmm(x.shape[-1] // scales.shape[-1], bits, True)
     if token_rows is None:
         return routed(x, w, scales, biases, indices)
     return routed(x, w, scales, biases, indices, token_rows)
 
 
-def _int8_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_rows = None):
-    E = w.shape[0]
-    rows = 32 * _INT8_GATHER_QMM_SIMDGROUPS[bits][0]
-    starts = (indices[None, :] < mx.arange(E + 1, dtype = indices.dtype)[:, None]).sum(axis = 1).astype(mx.int32)
-    counts = starts[1:] - starts[:-1]
-    tiles = mx.concatenate([mx.zeros((1,), mx.int32), mx.cumsum((counts + rows - 1) // rows)])
+def _expert_tiles(indices, E, rows):
+    """Each expert's first sorted row and first `rows`-row tile, and a bound on the tile count."""
+    zero = mx.zeros((1,), mx.int32)
+    counts = mx.zeros((E,), mx.int32).at[indices].add(1)
+    starts = mx.concatenate([zero, mx.cumsum(counts)])
+    tiles = mx.concatenate([zero, mx.cumsum((counts + rows - 1) // rows)])
     # Each expert adds at most one partial tile; threadgroups past the last tile return at once.
-    row_tiles = indices.shape[0] // rows + min(E, indices.shape[0])
+    return starts, tiles, indices.shape[0] // rows + min(E, indices.shape[0])
+
+
+def _int8_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_rows = None):
+    starts, tiles, row_tiles = _expert_tiles(indices, w.shape[0], 32 * _INT8_GATHER_QMM_SIMDGROUPS[bits][0])
     return _int8_qmm(x, w, scales, biases, group_size, bits, _INT8_GATHER_QMM_SIMDGROUPS[bits], starts, tiles,
                      row_tiles, token_rows)
 
@@ -881,3 +895,213 @@ def probe_int8_qmm():
                         native = native.astype(mx.float32)
                         error = mx.abs(got.astype(mx.float32) - native).max().item()
                         assert error <= 0.05 * mx.abs(native).max().item(), (bits, group_size, M, error)
+
+
+# Bit-identical to MLX's sorted NAX gather (same ops, same K order); only the schedule differs.
+# MAP reads row i from row `rmap[i]` of x.
+_SORTED_GATHER_BITS = (4, 8)
+_SORTED_GATHER_GROUP_SIZES = (32, 64, 128)
+_SORTED_GATHER_TILE = 64
+_SORTED_GATHER_TILES_PER_X = 32
+# What `mx.fast.metal_kernel` already prepends to a kernel.
+_MLX_KERNEL_PREAMBLE = ("utils.h", "bf16.h", "bf16_math.h", "complex.h", "defines.h", "logging.h")
+
+_SORTED_GATHER_SOURCE = """
+    static_assert(sizeof(T) == 2, "16-bit activations, scales and biases only");
+    constexpr int KW = K * BITS / 32;   // packed words per weight row
+    constexpr int KG = K / GS;
+    constexpr int STEPS = K / 64;
+    constexpr int LD = 72;              // padded row stride of a dequantized weight tile
+    const int E = w_shape[0];
+    const int N = w_shape[1];
+    const int NB = N / 64;
+    const uint simd = simdgroup_index_in_threadgroup;
+    const ushort lane = thread_index_in_simdgroup;
+    const int tile = int(threadgroup_position_in_grid.y / NB) * GX + int(threadgroup_position_in_grid.x);
+    if (tile >= tiles[E]) return;
+    int lo = 0, hi = E;   // tiles[lo] <= tile < tiles[hi]
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if (tiles[mid] <= tile) lo = mid; else hi = mid;
+    }
+    const int row_lo = starts[lo] + (tile - tiles[lo]) * 64;
+    const int rows = min(64, starts[lo + 1] - row_lo);
+    const int col = int(threadgroup_position_in_grid.y % NB) * 64;
+    const int tm = int(simd / 2) * 32;   // the simdgroup's 32 x 32 block of the tile
+    const int tn = int(simd % 2) * 32;
+
+    // Each thread dequantizes 32 codes of one weight row per K step.
+    threadgroup T tgw[2 * 64 * LD];
+    const int wn = int(simd * 32 + lane) >> 1;
+    const int wk = int(lane & 1) * 32;
+    const ulong wrow = ulong(lo) * N + col + wn;
+    const device uint* wp = w + wrow * KW + wk * BITS / 32;
+    const device T* sp = scales + wrow * KG;
+    const device T* bp = biases + wrow * KG;
+    uint4 codes[BITS / 4];
+    float wscale, wbias;
+    auto fetch = [&](int step) {
+        const device packed_uint4* p = (const device packed_uint4*)(wp + step * (64 * BITS / 32));
+        _Pragma("clang loop unroll(full)")
+        for (int i = 0; i < BITS / 4; ++i) codes[i] = p[i];
+        const int g = (step * 64 + wk) / GS;
+        wscale = float(sp[g]);
+        wbias = float(bp[g]);
+    };
+    auto put = [&](int buffer) {
+        threadgroup T* dst = tgw + buffer * (64 * LD) + wn * LD + wk;
+        _Pragma("clang loop unroll(full)")
+        for (int i = 0; i < 32; ++i) {
+            const int word = i * BITS / 32;
+            const uint q = (codes[word >> 2][word & 3] >> ((i * BITS) & 31)) & ((1u << BITS) - 1);
+            dst[i] = static_cast<T>(wscale * q + wbias);
+        }
+    };
+
+    // Rows past the tile read its last row and are never stored.
+    const short2 coord = mlx::steel::BaseNAXFrag::get_coord();
+    const device T* xr[2][2];
+    bool active[2];
+    _Pragma("clang loop unroll(full)")
+    for (int mm = 0; mm < 2; ++mm) {
+        active[mm] = tm + mm * 16 < rows;
+        _Pragma("clang loop unroll(full)")
+        for (int i = 0; i < 2; ++i) {
+            const int r = min(row_lo + tm + mm * 16 + coord.y + i * 8, row_lo + rows - 1);
+            xr[mm][i] = x + ulong(MAP ? int(rmap[r]) : r) * K + coord.x;
+        }
+    }
+    mlx::steel::NAXTile<float, 1, 2> acc[2];
+    acc[0].clear();
+    acc[1].clear();
+
+    fetch(0);
+    put(0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int step = 0; step < STEPS; ++step) {
+        const bool more = step + 1 < STEPS;
+        if (more) fetch(step + 1);
+        const threadgroup T* wt = tgw + (step & 1) * (64 * LD) + tn * LD;
+        for (int kk = 0; kk < 64; kk += 32) {
+            mlx::steel::NAXTile<T, 2, 2> wtile;
+            wtile.template load<T, LD, 1>(wt + kk);
+            _Pragma("clang loop unroll(full)")
+            for (int mm = 0; mm < 2; ++mm) {
+                if (!active[mm]) continue;
+                mlx::steel::NAXTile<T, 1, 2> xtile;
+                _Pragma("clang loop unroll(full)")
+                for (int f = 0; f < 2; ++f)
+                    _Pragma("clang loop unroll(full)")
+                    for (int i = 0; i < 2; ++i)
+                        _Pragma("clang loop unroll(full)")
+                        for (int j = 0; j < 4; ++j)
+                            xtile.frag_at(0, f)[i * 4 + j] = xr[mm][i][step * 64 + kk + f * 16 + j];
+                mlx::steel::tile_matmad_nax(acc[mm], xtile, metal::bool_constant<false>{}, wtile,
+                                            metal::bool_constant<true>{});
+            }
+        }
+        if (more) put((step + 1) & 1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    _Pragma("clang loop unroll(full)")
+    for (int mm = 0; mm < 2; ++mm) {
+        if (!active[mm]) continue;
+        acc[mm].store_safe(y + ulong(row_lo + tm + mm * 16) * N + col + tn, N,
+                           short2(32, short(rows - tm - mm * 16)));
+    }
+"""
+
+SORTED_GATHER_PROBE_KEY = "sorted_gather_qmm:" + hashlib.sha256(_SORTED_GATHER_SOURCE.encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _mlx_kernel_header(name):
+    """An installed MLX kernel header with the MLX headers it includes inlined, or None without them."""
+    root, kernels = os.path.join(os.path.dirname(mx.__file__), "include"), "mlx/backend/metal/kernels/"
+    seen = {kernels + preamble for preamble in _MLX_KERNEL_PREAMBLE}
+
+    def inline(path):
+        if path in seen:
+            return []
+        seen.add(path)
+        lines = []
+        with open(os.path.join(root, path)) as file:
+            for line in file.read().splitlines():
+                if line.strip().startswith('#include "mlx/'):
+                    lines += inline(line.split('"')[1])
+                elif line.strip() != "#pragma once":
+                    lines.append(line)
+        return lines
+
+    try:
+        return "\n".join(inline(kernels + name)) + "\n"
+    except OSError:
+        return None
+
+
+@functools.cache
+def _sorted_gather_kernel():
+    header = _mlx_kernel_header("steel/gemm/nax.h")
+    return header and mx.fast.metal_kernel(
+        name = "unsloth_nax_sorted_gather_qmm", input_names = ["x", "w", "scales", "biases", "starts", "tiles", "rmap"],
+        output_names = ["y"], header = header, source = _SORTED_GATHER_SOURCE)
+
+
+def sorted_gather_qmm_supported(N, K, group_size, bits, mode):
+    return (mode == "affine" and bits in _SORTED_GATHER_BITS and group_size in _SORTED_GATHER_GROUP_SIZES
+            and N > 0 and N % 64 == 0 and K > 0 and K % 64 == 0 and K % group_size == 0)
+
+
+def sorted_gather_qmm(x, w, scales, biases, indices, bits, token_rows = None):
+    """Sorted transposed `gather_qmm` of 16-bit float x [T, K] by expert indices [T], bit for bit;
+    returns [T, N]. With `token_rows`, row i reads `x[token_rows[i]]` in place."""
+    routed = _differentiable_qmm(x.shape[-1] // scales.shape[-1], bits, True, False)
+    if token_rows is None:
+        return routed(x, w, scales, biases, indices)
+    return routed(x, w, scales, biases, indices, token_rows)
+
+
+def _sorted_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_rows = None):
+    starts, tiles, row_tiles = _expert_tiles(indices, w.shape[0], _SORTED_GATHER_TILE)
+    N, mapped = w.shape[1], token_rows is not None
+    per_x = _SORTED_GATHER_TILES_PER_X
+    return _sorted_gather_kernel()(
+        inputs = [x, w, scales, biases, starts, tiles, token_rows if mapped else starts],
+        template = [("T", x.dtype), ("K", x.shape[1]), ("GS", group_size), ("BITS", bits), ("GX", per_x),
+                    ("MAP", mapped)],
+        grid = (per_x * 32, -(-row_tiles // per_x) * (N // 64) * 2, 2), threadgroup = (32, 2, 2),
+        output_shapes = [(indices.shape[0], N)], output_dtypes = [x.dtype])[0]
+
+
+# Rows per expert (fewest, most) by bits measured faster than MLX 0.32.3 on an M5 Pro, real MoE routing.
+_SORTED_GATHER_ROWS_BY_GPU = {17: {4: (4, 128), 8: (4, 128)}}
+# Below these rows per expert and per call MLX runs per-row kernels, which round differently.
+_SORTED_GATHER_STOCK_MIN_ROWS, _SORTED_GATHER_STOCK_MIN_CALL = 4, 16
+# Past this the stock reference drops `sorted_indices` (ml-explore/mlx#3856): first-use checks would not cover it.
+_SORTED_GATHER_MAX_CALL = 32768
+
+
+def sorted_gather_row_range(E, bits):
+    low, high = _SORTED_GATHER_ROWS_BY_GPU.get(_gpu_generation(), {}).get(bits, (0, -1))
+    return (max(max(low, _SORTED_GATHER_STOCK_MIN_ROWS) * E, _SORTED_GATHER_STOCK_MIN_CALL),
+            min(high * E, _SORTED_GATHER_MAX_CALL))
+
+
+def probe_sorted_gather_qmm():
+    """Subprocess probe: every kernel variant bitwise against stock."""
+    assert _sorted_gather_kernel(), "the installed MLX ships no kernel headers"
+    for dtype in (mx.bfloat16, mx.float16):
+        for bits in _SORTED_GATHER_BITS:
+            for (N, K), group_size in itertools.product(((128, 256), (64, 384)), _SORTED_GATHER_GROUP_SIZES):
+                w = mx.random.normal((40, N, K), key = mx.random.key(group_size)) * 0.05
+                w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
+                counts = [70, 0, 5, 33, 64, 17, 140, 11] + [9] * 32
+                indices = mx.array([e for e, count in enumerate(counts) for _ in range(count)], mx.uint32)
+                M = indices.shape[0]
+                x = mx.random.normal((M, K), key = mx.random.key(M)).astype(dtype)
+                tokens = mx.random.randint(0, M, (M,), key = mx.random.key(3)).astype(mx.uint32)
+                for rows, token_rows in ((x, None), (x[tokens], tokens)):
+                    native = mx.gather_qmm(rows[:, None], w, scales, biases, rhs_indices = indices, transpose = True,
+                                           group_size = group_size, bits = bits, sorted_indices = True)[:, 0]
+                    got = sorted_gather_qmm(x, w, scales, biases, indices, bits, token_rows)
+                    assert mx.array_equal(got.view(mx.uint16), native.view(mx.uint16)).item(), (bits, group_size, N)

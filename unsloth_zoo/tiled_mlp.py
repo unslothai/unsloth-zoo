@@ -20,6 +20,7 @@ import math
 from collections import OrderedDict
 from types import MethodType
 import functools
+import weakref
 from fnmatch import fnmatch
 import torch
 from torch.utils.checkpoint import (
@@ -74,26 +75,42 @@ def get_max_flat_qlen(
 pass
 
 
-def _default_target_gb():
+def _default_target_gb(device = None):
     # Size the tile memory budget from the free memory actually available on the
     # current backend, so a device with little memory left does not pick chunks
     # that immediately OOM. Mirror the CUDA path: query free memory and keep half.
+    # None means the current device, never index 0: under torchrun asking GPU 0
+    # reads the wrong card and opens a CUDA context on a GPU the rank never uses.
+    index = None
+    if device is not None:
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+        if device.type in ("cpu", "meta", "mps"):
+            return _host_target_gb()
+        index = device.index
     if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
         # torch.cuda.mem_get_info also covers ROCm (PyTorch aliases the cuda API).
-        return torch.cuda.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+        free = torch.cuda.mem_get_info(index)[0]
+        return free / 1024 / 1024 / 1024 * 0.5
     if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
         # Present from torch 2.6, but raises on some Intel GPUs (e.g. Arc B580,
         # Lunar Lake). When the accelerator cannot report free memory, use a small
         # bounded default: host RAM would overshoot VRAM and still OOM the tiler.
         try:
-            return torch.xpu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+            free = torch.xpu.mem_get_info(index)[0]
+            return free / 1024 / 1024 / 1024 * 0.5
         except Exception:
             return 4.0
     if DEVICE_TYPE == "npu" and hasattr(torch, "npu"):
         try:
-            return torch.npu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+            free = torch.npu.mem_get_info(index)[0]
+            return free / 1024 / 1024 / 1024 * 0.5
         except Exception:
             return 4.0
+    return _host_target_gb()
+pass
+
+def _host_target_gb():
     # CPU / MPS / unified-memory backends: activations live in host RAM, budget from it.
     try:
         import psutil
@@ -249,13 +266,49 @@ def _mxfp4_instance_forward(mlp_module):
     return None
 
 
-def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length = 128):
-    preserve_rng_state = False
-    for n, m in mlp_module.named_modules():
-        if isinstance(m, torch.nn.Dropout):
-            preserve_rng_state = True
-            break
+_DROPOUT_TYPES = (getattr(torch.nn.modules.dropout, "_DropoutNd", torch.nn.Dropout),)
 
+# Bumped when a submodule is registered under a tiled MLP (e.g. PEFT adding lora_dropout) to
+# invalidate dropout lists. Only MLP subtrees count: transformers slices `self.layers[:n]` every
+# forward, which re-registers every layer and would otherwise force a rescan per layer per token.
+_MODULE_TREE_VERSION = [0]
+# id -> module, weak: a freed module's id reused by a sliced ModuleList must not match, and
+# keying on id avoids hashing arbitrary modules inside a process-wide hook.
+_TRACKED_MODULES = weakref.WeakValueDictionary()
+
+def _bump_module_tree_version(module, name, submodule):
+    if _TRACKED_MODULES.get(id(module)) is module:
+        _MODULE_TREE_VERSION[0] += 1
+    return None
+pass
+
+try:
+    torch.nn.modules.module.register_module_module_registration_hook(_bump_module_tree_version)
+    _HAS_MODULE_TREE_VERSION = True
+except Exception:
+    _HAS_MODULE_TREE_VERSION = False
+pass
+
+def _mlp_needs_rng_state(mlp_module):
+    # Per forward, not at patch time: unsloth patches before get_peft_model adds lora_dropout,
+    # so a patch time scan missed it and the recompute drew different masks (wrong grads).
+    cached = mlp_module.__dict__.get("_unsloth_tiled_dropouts")
+    # id check: a deepcopy carries the cache but its subtree is not tracked yet.
+    if cached is None or not _HAS_MODULE_TREE_VERSION or \
+        cached[0] != _MODULE_TREE_VERSION[0] or cached[1] != id(mlp_module):
+        modules = tuple(mlp_module.modules())
+        _TRACKED_MODULES.update((id(m), m) for m in modules)
+        dropouts = tuple(m for m in modules if isinstance(m, _DROPOUT_TYPES))
+        cached = (_MODULE_TREE_VERSION[0], id(mlp_module), dropouts)
+        # __dict__, not setattr: these are already children, do not register them twice.
+        mlp_module.__dict__["_unsloth_tiled_dropouts"] = cached
+    for m in cached[2]:
+        if m.training and m.p > 0:
+            return True
+    return False
+pass
+
+def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length = 128):
     # unbound
     forward = _mxfp4_instance_forward(mlp_module) or mlp_module.__class__.forward
     mlp_module._original_forward = forward
@@ -263,8 +316,10 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
     mlp_module._unsloth_forward = forward
 
 
+    # Per device: device_map can place layers on different GPUs.
+    auto_target_gb = {}
+
     def tiled_forward_target_gb(self, x):
-        nonlocal target_gb
         bsz, qlen, hd = x.shape
         flat_qlen = bsz*qlen
         try:
@@ -274,14 +329,17 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
         except:
             intermediate_size = hd * 4
 
-        if target_gb is None:
-            target_gb = _default_target_gb()
+        budget_gb = target_gb
+        if budget_gb is None:
+            budget_gb = auto_target_gb.get(x.device)
+            if budget_gb is None:
+                budget_gb = auto_target_gb[x.device] = _default_target_gb(x.device)
 
         max_flat_qlen = get_max_flat_qlen(
             hd = hd,
             mlp_size = intermediate_size,
             nbytes = x.element_size(),
-            target_gb = target_gb,
+            target_gb = budget_gb,
             padded_length = padded_length,
         )
         n_shards, remainder = divmod(flat_qlen, max_flat_qlen)
@@ -289,6 +347,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
+        preserve_rng_state = _mlp_needs_rng_state(mlp_module)
         return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, max_flat_qlen)
 
     def tiled_forward_arctic_size(self, x):
@@ -301,6 +360,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
+        preserve_rng_state = _mlp_needs_rng_state(mlp_module)
         return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, chunk_size)
 
     if target_arctic:

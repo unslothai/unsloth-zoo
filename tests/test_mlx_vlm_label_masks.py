@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import warnings
 
 import numpy as np
 import pytest
@@ -1006,7 +1007,7 @@ class _PlainModel:
 
 @pytest.mark.parametrize(
     "model_type",
-    ["muse_glimmer", "qwen4_exp", "glm5_next", "lfm2_vl", "mage_vl", "kimi_k3"],
+    ["qwen4_exp", "glm5_next", "lfm2_vl", "mage_vl"],
 )
 def test_vlm_only_families_reach_the_text_path_without_being_listed(model_type):
     """Against the installed packages rather than a monkeypatched resolver."""
@@ -3871,6 +3872,179 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
     assert _phi4mm_token_ids({"audio_token_index": 11}) == (expected[0], 11)
 
 
+def test_phi4mm_switches_to_its_speech_weights_under_lora_adapters():
+    from types import SimpleNamespace
+
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import compile as patches
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_speech_lora, apply_base_weights = phi4mm.set_modality, phi4mm.apply_speech_lora, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.layers = [nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)]
+    model.layers[0] = LoRALinear.from_base(model.layers[0], r=1)
+    keys = [f"layers.{index}.weight" for index in range(2)]
+    model._base_weights = {key: mx.ones((2, 2)) for key in keys}
+    model._speech_lora_a = {key: mx.ones((1, 2)) for key in keys}
+    model._speech_lora_b = {key: mx.ones((2, 1)) for key in keys}
+    model._speech_lora_scale, model._active_lora = 2.0, "vision"
+    model.set_modality(has_audio=True)
+    # A fresh adapter adds nothing, so either linear computes with base + scale * B @ A = 3 everywhere.
+    assert [layer(mx.ones((1, 2))).tolist() for layer in model.layers] == [[[6.0, 6.0]]] * 2
+    # A row of text alone switches back to the base weights, as the reference model's does.
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert [layer(mx.ones((1, 2))).tolist() for layer in model.layers] == [[[2.0, 2.0]]] * 2
+
+
+@pytest.mark.parametrize("full_finetuning", [True, False])
+def test_phi4mm_full_finetuning_keeps_one_set_of_decoder_weights(full_finetuning):
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_both_loras, apply_base_weights = phi4mm.set_modality, phi4mm.apply_both_loras, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.layers = [nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)]
+    keys = [f"layers.{index}.weight" for index in range(2)]
+    model._base_weights = {key: mx.ones((2, 2)) for key in keys}
+    for kind, scale in (("vision", 1.0), ("speech", 2.0)):
+        setattr(model, f"_{kind}_lora_a", {key: mx.ones((1, 2)) for key in keys})
+        setattr(model, f"_{kind}_lora_b", {key: mx.ones((2, 1)) for key in keys})
+        setattr(model, f"_{kind}_lora_scale", scale)
+    model._active_lora, model._unsloth_full_finetuning = "vision", full_finetuning
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    _finish_load(model, None)
+    # What training changed, then a row of text alone.
+    model.layers[1].weight = model.layers[1].weight + 1
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    outputs = [layer(mx.ones((1, 2))).tolist() for layer in model.layers]
+    # Base 1 with both adapters merged (+1, +2) is 4 everywhere; swapping sets the base 1 back.
+    assert outputs == ([[[8.0, 8.0]], [[10.0, 10.0]]] if full_finetuning else [[[2.0, 2.0]]] * 2)
+
+
+@pytest.mark.parametrize("full_finetuning", [True, False])
+def test_phi4mm_weight_swaps_keep_the_requested_dtype(full_finetuning):
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_both_loras, apply_base_weights = phi4mm.set_modality, phi4mm.apply_both_loras, phi4mm.apply_base_weights
+        apply_speech_lora = phi4mm.apply_speech_lora
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    # The loader has cast the decoder to float32; the copies the sanitizer kept are the checkpoint's bfloat16.
+    model.layers = [nn.Linear(2, 2, bias=False)]
+    model.layers[0].weight = mx.ones((2, 2), dtype=mx.float32)
+    key = "layers.0.weight"
+    model._base_weights = {key: mx.ones((2, 2), dtype=mx.bfloat16)}
+    for kind in ("vision", "speech"):
+        setattr(model, f"_{kind}_lora_a", {key: mx.ones((1, 2), dtype=mx.bfloat16)})
+        setattr(model, f"_{kind}_lora_b", {key: mx.ones((2, 1), dtype=mx.bfloat16)})
+        setattr(model, f"_{kind}_lora_scale", 1.0)
+    model._active_lora, model._unsloth_full_finetuning = "vision", full_finetuning
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    _finish_load(model, None)
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert model.layers[0].weight.dtype == mx.float32
+    model.set_modality(has_audio=True)
+    assert model.layers[0].weight.dtype == mx.float32
+
+
+def test_phi4mm_weight_swaps_run_on_a_thread_other_than_the_loader():
+    import threading
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_speech_lora, apply_base_weights = phi4mm.set_modality, phi4mm.apply_speech_lora, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.layers = [nn.Linear(2, 2, bias=False)]
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: mx.zeros((1, 2, 2))))
+    key = "layers.0.weight"
+
+    def load():
+        # The tables a checkpoint load leaves lazy on the loading thread's stream.
+        model.layers[0].weight = mx.ones((2, 2), dtype=mx.float32)
+        model._base_weights = {key: mx.ones((2, 2), dtype=mx.bfloat16) * 1}
+        model._speech_lora_a, model._speech_lora_b = {key: mx.ones((1, 2), dtype=mx.bfloat16) * 1}, {key: mx.ones((2, 1), dtype=mx.bfloat16) * 1}
+        model._speech_lora_scale, model._active_lora = 1.0, "vision"
+        _finish_load(model, None)
+
+    loader = threading.Thread(target=load)
+    loader.start()
+    loader.join()
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert model.layers[0](mx.ones((1, 2))).tolist() == [[2.0, 2.0]]
+    model.set_modality(has_audio=True)
+    assert model.layers[0](mx.ones((1, 2))).tolist() == [[4.0, 4.0]]
+
+
+def test_phi4mm_keeps_a_merged_decision_adapter_across_its_weight_swaps(tmp_path):
+    import json
+
+    from unsloth_zoo.mlx import compile as patches
+    from unsloth_zoo.mlx.decision import _merge_lora
+
+    phi4mm = pytest.importorskip("mlx_vlm.models.phi4mm.phi4mm").Model
+    patches._install_phi4_multimodal_patches()
+
+    class Decoder(nn.Module):
+        set_modality, apply_vision_lora, apply_base_weights = phi4mm.set_modality, phi4mm.apply_vision_lora, phi4mm.apply_base_weights
+        _set_weight_by_key, get_input_embeddings = phi4mm._set_weight_by_key, phi4mm.get_input_embeddings
+
+    model = Decoder()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    model.language_model.model.layers = [nn.Linear(2, 2, bias=False)]
+    model.language_model.model.embed_tokens = lambda ids: mx.zeros((1, 2, 2))
+    key = "language_model.model.layers.0.weight"
+    model._base_weights = {key: mx.ones((2, 2))}
+    model._vision_lora_a, model._vision_lora_b, model._vision_lora_scale = {key: mx.ones((1, 2))}, {key: mx.ones((2, 1))}, 1.0
+    model.language_model.model.layers[0].weight = mx.ones((2, 2)) * 2
+    model._active_lora = "vision"
+    mx.save_safetensors(str(tmp_path / "adapter_model.safetensors"), {
+        "base_model.model.model.layers.0.lora_A.weight": mx.ones((1, 2)), "base_model.model.model.layers.0.lora_B.weight": mx.ones((2, 1)) * 5,
+    })
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 1, "lora_alpha": 1, "target_modules": ["layers.0"]}))
+    _merge_lora(model, tmp_path)
+
+    def layer():
+        return model.language_model.model.layers[0](mx.ones((1, 2))).tolist()
+
+    # Base 1, vision +1, adapter +5: a row of text runs on base and adapter, an image adds the vision weights back.
+    assert layer() == [[14.0, 14.0]]
+    model.get_input_embeddings(mx.array([[1, 2]]))
+    assert layer() == [[12.0, 12.0]]
+    model.set_modality(has_image=True)
+    assert layer() == [[14.0, 14.0]]
+
+
 def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
     """The regression this guards is in the compile-preparation branch, not the
     helper: training threads the checkpoint mapping, which declares neither
@@ -3953,6 +4127,70 @@ def test_qwen_mrope_families_get_pipeline_built_position_ids():
 
     # GLM-5.x reaches its vision grid directly instead, so it must not be here.
     assert "position_ids" not in _prepared_positions("glm5_next")
+
+
+def test_qwen3_omni_pipeline_positions_equal_its_upstream_rope_index():
+    """It has no builder of its own; the qwen one has to reproduce upstream
+    across rows, several images, and right padding."""
+    from types import SimpleNamespace
+
+    arch = "qwen3_omni_moe"
+    language = pytest.importorskip(f"mlx_vlm.models.{arch}.language")
+    from unsloth_zoo.mlx.utils import _vlm_positions_for_compile
+
+    image, start, end = 151343, 151339, 151340
+    config = {"model_type": arch, "image_token_id": image, "video_token_id": 151344,
+              "vision_start_token_id": start, "vision_config": {"spatial_merge_size": 2}}
+    grids = ((1, 8, 8), (1, 8, 12), (1, 4, 8))
+    rows = [[5, start] + [image] * 16 + [end, 6, 7],
+            [5, start] + [image] * 24 + [end, 6, start] + [image] * 8 + [end, 7]]
+    width = max(map(len, rows))
+    ids = np.array([row + [0] * (width - len(row)) for row in rows], np.int32)
+    mask = np.array([[1] * len(row) + [0] * (width - len(row)) for row in rows], np.int32)
+
+    # Qwen3-Omni nests its multimodal settings under the thinker.
+    outer = {"model_type": arch, "thinker_config": config}
+    built = _vlm_positions_for_compile(
+        {"input_ids": ids, "attention_mask": mask, "image_grid_thw": grids}, outer)
+    upstream, _ = language.LanguageModel.get_rope_index(
+        SimpleNamespace(config=SimpleNamespace(**{
+            **config, "vision_config": SimpleNamespace(spatial_merge_size=2)})),
+        mx.array(ids), mx.array(grids), None, mx.array(mask))
+
+    real = mask.astype(bool)
+    np.testing.assert_array_equal(
+        np.asarray(built["position_ids"])[:, real], np.asarray(upstream)[:, real])
+
+
+@pytest.mark.parametrize("arch", ["glm4v", "glm4v_moe"])
+def test_glm4v_pipeline_positions_equal_its_upstream_rope_index(arch):
+    """glm4v has no builder of its own; the qwen one has to reproduce upstream
+    across rows, several images, and right padding."""
+    from types import SimpleNamespace
+
+    language = pytest.importorskip(f"mlx_vlm.models.{arch}.language")
+    from unsloth_zoo.mlx.utils import _vlm_positions_for_compile
+
+    image, start, end = 151343, 151339, 151340
+    config = {"model_type": arch, "image_token_id": image, "video_token_id": 151344,
+              "vision_start_token_id": start, "vision_config": {"spatial_merge_size": 2}}
+    grids = ((1, 8, 8), (1, 8, 12), (1, 4, 8))
+    rows = [[5, start] + [image] * 16 + [end, 6, 7],
+            [5, start] + [image] * 24 + [end, 6, start] + [image] * 8 + [end, 7]]
+    width = max(map(len, rows))
+    ids = np.array([row + [0] * (width - len(row)) for row in rows], np.int32)
+    mask = np.array([[1] * len(row) + [0] * (width - len(row)) for row in rows], np.int32)
+
+    built = _vlm_positions_for_compile(
+        {"input_ids": ids, "attention_mask": mask, "image_grid_thw": grids}, config)
+    upstream, _ = language.LanguageModel.get_rope_index(
+        SimpleNamespace(config=SimpleNamespace(**{
+            **config, "vision_config": SimpleNamespace(spatial_merge_size=2)})),
+        mx.array(ids), mx.array(grids), None, mx.array(mask))
+
+    real = mask.astype(bool)
+    np.testing.assert_array_equal(
+        np.asarray(built["position_ids"])[:, real], np.asarray(upstream)[:, real])
 
 
 # --- audio alignment from stated spans, for families whose run carries no id ---
@@ -4260,6 +4498,66 @@ def test_nemotron_sound_modules_are_frozen_and_not_quantized():
     assert all(getattr(model, name).frozen for name in names)
     predicate = mlx_loader._compose_mlx_quant_predicate(model, mlx_loader._MLXQuantizationSpec(), is_vlm=True)
     assert all(not predicate(name, object()) for name in names)
+
+
+def test_connectors_between_a_tower_and_the_decoder_are_not_quantized():
+    import unsloth_zoo.mlx.loader as mlx_loader
+    predicate = mlx_loader._compose_mlx_quant_predicate(object(), mlx_loader._MLXQuantizationSpec(), is_vlm=True)
+    kept = ("resampler.attn.q_proj", "audio_projection_layer.linear1", "resampler_model.mlp", "mlp1.layers.1", "mlp1.3", "model.mlp1.1")
+    assert [path for path in kept if predicate(path, object())] == []
+    # Whole path components only: a decoder layer whose name merely contains one is still quantized.
+    quantized = ("language_model.model.layers.0.mlp.down_proj", "language_model.model.layers.0.mlp1x.proj", "language_model.upsampler.proj")
+    assert all(predicate(path, object()) for path in quantized)
+    # A text model's own layers of the same names are still quantized.
+    text = mlx_loader._compose_mlx_quant_predicate(object(), mlx_loader._MLXQuantizationSpec(), is_vlm=False)
+    assert all(text(path, object()) for path in kept)
+
+
+def _module_tree(base=nn.Module, **children):
+    module = base()
+    for name, child in children.items():
+        setattr(module, name, child)
+    return module
+
+
+def test_a_quantizing_load_skips_whatever_sits_beside_the_text_decoder():
+    import unsloth_zoo.mlx.loader as mlx_loader
+    linear = lambda: nn.Linear(2, 2)
+
+    class _Nested(nn.Module):
+        language_model = property(lambda self: self.thinker.language_model)
+
+    # A decoder may hold layers named like a connector or a speech module (Gemma's `per_layer_projection`).
+    decoder = _module_tree(per_layer_projection=linear(), image_proj=linear(), tts=linear(), layers=[_module_tree(q_proj=linear())])
+    model = _module_tree(
+        _Nested,
+        thinker=_module_tree(language_model=decoder, bridge=linear(), language_model_norm=linear()),
+        image_proj=_module_tree(linear1=linear()),
+        spatial_projectors=[_module_tree(dense=linear())],
+        tts_adapter=linear(),
+        talker=_module_tree(text_projection=linear(), code_predictor=linear()),
+        wrapper=_module_tree(tts=_module_tree(head=linear())),
+    )
+
+    def quantized(model, spec=mlx_loader._MLXQuantizationSpec(), is_vlm=True):
+        predicate = mlx_loader._compose_mlx_quant_predicate(model, spec, is_vlm=is_vlm)
+        return {path for path, module in model.named_modules() if hasattr(module, "to_quantized") and predicate(path, module)}
+
+    inside = {f"thinker.language_model.{leaf}" for leaf in ("per_layer_projection", "image_proj", "tts", "layers.0.q_proj")}
+    # Speech generators are quantized like the decoder, wherever they sit; mlx-vlm keeps the code predictor dense.
+    assert quantized(model) == inside | {"talker.text_projection", "wrapper.tts.head"}
+    # Naming a module beside the decoder does not bring it back.
+    assert quantized(model, mlx_loader._MLXQuantizationSpec(quantize_modules=("image_proj",))) == {"thinker.language_model.image_proj"}
+    assert "image_proj.linear1" in quantized(model, is_vlm=False)
+    predicate =mlx_loader._compose_mlx_quant_predicate(model, mlx_loader._MLXQuantizationSpec(), is_vlm=True)
+    assert predicate("thinker.language_model.layers.0.q_proj", linear())
+
+    # Without a decoder of its own to go by (Molmo Point), only names are skipped.
+    class _Flat(nn.Module):
+        language_model = property(lambda self: self)
+
+    flat = _module_tree(_Flat, lm=_module_tree(q_proj=linear()), point_predictor=linear(), build_vit_embedding=linear())
+    assert quantized(flat) == {"lm.q_proj", "point_predictor"}
 
 
 def test_qwen3_omni_nested_audio_tower_is_frozen():
@@ -4716,8 +5014,167 @@ def test_collation_hands_the_clip_lengths_to_the_window_check(monkeypatch):
 
     processor = _Spans()
     _qualify(monkeypatch, processor=processor)
+    # Pre-rendered text cannot be given a placeholder per piece.
     with pytest.raises(ValueError, match="audio clip"):
-        _finalized_collate([_audio_row(_CLIP)], processor, 16, None)
+        _finalized_collate([{"text": "<audio>", "audio": [_CLIP]}], processor, 16, None)
+
+
+def _run_capped_processor(window=None, n_samples=None, cap=True):
+    """A cap of 8 samples: two tokens of 250 ms at 16 Hz."""
+    class _Extractor:
+        sampling_rate = 16
+
+    if window is not None:
+        _Extractor.__call__ = lambda self, audio, max_length=window, truncation=True: None
+    if n_samples is not None:
+        _Extractor.n_samples = n_samples
+
+    class _Processor:
+        feature_extractor = _Extractor()
+        audio_seq_length = 2 if cap else None
+        audio_ms_per_token = 250 if cap else None
+
+    return _Processor()
+
+
+@pytest.mark.parametrize("window", [None, 16])
+def test_a_clip_longer_than_its_capped_run_is_refused_when_its_audio_is_kept(
+        monkeypatch, window):
+    """Gemma 4 unified caps the run but keeps every frame, and the model fills
+    placeholders from the batch's frames in order, so the surplus is merged into
+    the next clip's positions."""
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_reported_cut_audio", set())
+    processor = _run_capped_processor(window=window)
+    fits, long = np.zeros(8, np.float32), np.zeros(9, np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        utils._assert_audio_runs_cover_their_clips([[fits], [fits, fits]], processor)
+    # The batch's last clip has no next one for its surplus to land on.
+    with pytest.warns(UserWarning, match="first 8 samples"):
+        utils._assert_audio_runs_cover_their_clips([[fits], [fits, long]], processor)
+    with pytest.raises(ValueError, match="row 1 carries a 9-sample.*at most 8 samples"):
+        utils._assert_audio_runs_cover_their_clips([[fits], [long, fits]], processor)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(window=8), dict(window=6), dict(n_samples=8, cap=False),
+    dict(window=8, cap=False),
+])
+def test_a_clip_its_extractor_cuts_is_warned_about_once(monkeypatch, kwargs):
+    """Gemma 4, Gemma 3n and Qwen3-Omni cut the waveform and size the run from
+    what is left, so the row stays aligned and only loses audio."""
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_reported_cut_audio", set())
+    processor = _run_capped_processor(**kwargs)
+    limit = kwargs.get("window") or kwargs["n_samples"]
+    fits, long = np.zeros(limit, np.float32), np.zeros(limit + 1, np.float32)
+    rows = [[fits, long], [fits]]
+    with pytest.warns(UserWarning, match=f"first {limit} samples"):
+        utils._assert_audio_runs_cover_their_clips(rows, processor)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        utils._assert_audio_runs_cover_their_clips(rows, processor)
+        utils._assert_audio_runs_cover_their_clips(
+            rows, _run_capped_processor(cap=False))
+
+
+def test_a_cap_the_corrected_count_ignores_refuses_nothing(monkeypatch):
+    """Gemma 4's placeholder count is replaced by one read off the extractor's
+    frames, so a clip past its configured cap is still fully covered."""
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_reported_cut_audio", set())
+    processor = _run_capped_processor(window=16)
+    monkeypatch.setattr(utils, "_AUDIO_PROCESSOR_REPAIRS", {
+        utils._audio_family_from_processor(processor): None})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        utils._assert_audio_runs_cover_their_clips(
+            [[np.zeros(16, np.float32)]], processor)
+    with pytest.warns(UserWarning, match="first 16 samples"):
+        utils._assert_audio_runs_cover_their_clips(
+            [[np.zeros(17, np.float32)]], processor)
+
+
+@pytest.mark.parametrize("row", ["messages", "prompt_completion"])
+def test_collation_hands_the_clip_lengths_to_the_run_cap_check(monkeypatch, row):
+    class _Capped(_FakeGemmaAudioProcessor):  # a cap of 16 samples
+        audio_seq_length = 1
+        audio_ms_per_token = 1
+
+    processor = _Capped()
+    _qualify(monkeypatch, processor=processor)
+    # Pre-rendered text cannot be given a placeholder per piece.
+    audio = [{"array": np.zeros(17, np.float32), "sampling_rate": 16000}]
+    item = {"text": "<audio>", "audio": audio}
+    if row == "prompt_completion":
+        item = {"prompt": "<audio>", "completion": "ok", "audio": audio}
+    with pytest.raises(ValueError, match="Split the clip"):
+        _finalized_collate([item, item], processor, 16, None)
+
+
+def test_a_clip_past_the_window_is_split_into_near_equal_pieces():
+    from unsloth_zoo.mlx.utils import _AudioClip, _split_audio_past_the_window
+
+    processor = _run_capped_processor()  # keeps 8 samples of a clip
+    short = _AudioClip(np.arange(8, dtype=np.float32), 16)
+    long = _AudioClip(np.arange(17, dtype=np.float32), 16)
+    messages = [
+        {"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": "A"}]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": "B"}, {"type": "audio"}]},
+    ]
+    split, pieces = _split_audio_past_the_window(messages, [short, long], processor)
+    assert [[part["type"] for part in m["content"]] if isinstance(m["content"], list)
+            else m["content"] for m in split] == [
+        ["audio", "text"], "ok", ["text", "audio", "audio", "audio"]]
+    assert [len(piece) for piece in pieces] == [8, 6, 6, 5]
+    assert np.array_equal(np.concatenate(pieces[1:]), long)
+    assert {piece.sampling_rate for piece in pieces} == {16}
+
+    empty = _AudioClip(np.zeros(0, dtype=np.float32), 16)
+    split, pieces = _split_audio_past_the_window(messages, [empty, long], processor)
+    assert pieces[0] is empty and [len(piece) for piece in pieces[1:]] == [6, 6, 5]
+
+    for unsplit in ([short, short], [long]):  # nothing over; parts and clips differ
+        same, clips = _split_audio_past_the_window(messages, unsplit, processor)
+        assert same is messages and clips is unsplit
+    for rendered, clips in (("Hello.", []), ("<audio>", [long])):
+        assert _split_audio_past_the_window(rendered, clips, processor)[0] is rendered
+
+
+@pytest.mark.parametrize("row", ["messages", "bare_list", "prompt_completion"])
+def test_collation_gives_each_piece_of_a_long_clip_its_own_run(monkeypatch, row):
+    """Otherwise the audio past the window is never trained on."""
+    seen = {}
+
+    class _Capped(_FakeGemmaAudioProcessor):  # a cap of 16 samples
+        audio_seq_length = 1
+        audio_ms_per_token = 1
+
+        def __call__(self, text, audio=None, max_length=None, **kwargs):
+            seen["audio"] = audio or seen.get("audio")
+            return super().__call__(text, audio, max_length, **kwargs)
+
+    processor = _Capped()
+    _qualify(monkeypatch, processor=processor)
+    wave = np.arange(32, dtype=np.float32)
+    item = _audio_row({"array": wave, "sampling_rate": 16000})
+    if row == "prompt_completion":
+        item = {"prompt": item["messages"][:1], "completion": item["messages"][1:]}
+    if row == "bare_list":
+        item = item["messages"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        batch = _finalized_collate([item], processor, 64, None)
+    batch = batch[0] if isinstance(batch, tuple) else batch
+    assert [np.asarray(piece).tolist() for piece in seen["audio"]] == [
+        wave[:16].tolist(), wave[16:].tolist()]
+    ids = np.asarray(batch["input_ids"])[0].tolist()
+    assert ids.count(301) == 2 and ids.count(300) == 2 * processor.soft_tokens
 
 
 def test_ids_the_run_path_rejects_are_rejected_on_the_bounds_path_too():
@@ -5878,6 +6335,45 @@ def test_rendering_does_not_copy_the_row_media():
     assert copied == []
 
 
+@pytest.mark.parametrize("stem, expected", [
+    ("<|audio_", "<user><|audio_1|>A<|audio_2|>B<assistant>ok"
+                 "<user>D<|audio_3|>\n<|audio_4|>C"),
+    (None, "<user>AB<assistant>ok<user>DC"),
+])
+def test_string_only_templates_number_the_audio_parts_a_processor_declares(
+        monkeypatch, stem, expected):
+    """Phi-4's template concatenates content as a string, so a typed audio part
+    reaches it only as the `<|audio_N|>` its processor module declares."""
+    import sys
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    monkeypatch.setattr(sys.modules[__name__], "AUDIO_PLACEHOLDER_PATTERN", stem,
+                        raising=False)
+
+    class _Processor:
+        image_token = None
+        boi_token = None
+        chat_template = ("{% for m in messages %}"
+                         "{{ '<' + m['role'] + '>' + m['content'] }}{% endfor %}")
+
+        def apply_chat_template(self, messages, **kwargs):
+            import jinja2
+            return jinja2.Template(self.chat_template).render(messages=messages)
+
+    clip = {"array": np.zeros(8, dtype=np.float32), "sampling_rate": 16000}
+    messages = [
+        {"role": "user", "content": [
+            {"type": "audio", "audio": clip}, {"type": "text", "text": "A"},
+            {"type": "audio", "audio": clip}, {"type": "text", "text": "B"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        # Back to back, the two expanded runs would read as one clip.
+        {"role": "user", "content": [
+            {"type": "text", "text": "D"}, {"type": "audio"}, {"type": "text", "text": ""},
+            {"type": "audio"}, {"type": "text", "text": "C"}]},
+    ]
+    assert _render_vlm_messages(_Processor(), messages) == expected
+
+
 def test_compile_preparation_adds_no_metadata_key_without_metadata():
     """Every VLM batch goes through the compile preparation, so writing the
     static-metadata dict unconditionally puts a new key in every text-only
@@ -5931,6 +6427,273 @@ def test_a_processor_emitted_grid_array_is_never_downgraded():
         phase="content")
     assert isinstance(out["image_grid_thw"], mx.array)
     assert out["_unsloth_static_vlm_metadata"]["image_grid_thw"] == ((1, 16, 16),)
+
+
+@pytest.mark.parametrize("model_type,declared,undeclared", [
+    ("pixtral", "image_sizes", "image_grid_thw"),
+    ("mistral3", "image_sizes", "image_grid_thw"),
+    ("mage_vl", "image_grid_thw", "image_sizes"),
+    ("mage_vl", "video_grid_thw", "image_sizes"),
+    ("dots_ocr", "image_grid_thw", "video_grid_thw"),
+    ("muse_glimmer", "video_grid_thw", "image_sizes"),
+    ("minimax_m3_vl", "image_grid_thw", "image_sizes"),
+    ("kimi_k3", "grid_thws", "image_grid_thw"),
+    ("kimi_k3", "image_grid_hws", "image_grid_thw"),
+    ("kimi_k3", "video_grid_hws", "image_grid_thw"),
+    ("ernie4_5_moe_vl", "image_grid_thw", "image_sizes"),
+    ("glm5_next", "image_grid_thw", "image_sizes"),
+])
+def test_a_family_without_a_patched_embedder_still_gets_its_static_metadata(
+    model_type, declared, undeclared,
+):
+    """These towers read the metadata on the host, where the processor's array is
+    a tracer under mx.compile, and none of them has a patched embedder to declare
+    the key on. Keys the family does not read stay as the processor emitted them."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type=model_type),
+        _unsloth_compile_decision=SimpleNamespace(enabled=True))
+    batch = {"_unsloth_static_vlm_metadata": {
+        declared: ((1, 16, 16),), undeclared: ((2, 8, 8),)}}
+    kwargs = {declared: mx.array([[1, 16, 16]]), undeclared: mx.array([[2, 8, 8]])}
+
+    _apply_static_vlm_metadata(model, batch, kwargs)
+
+    assert kwargs[declared] == ((1, 16, 16),)
+    assert isinstance(kwargs[undeclared], mx.array)
+
+
+@pytest.mark.parametrize("ids,rows,expected_rows", [
+    ([[10, 20, 10]], 2, [0, None, 1]),
+    ([[20, 5, 20]], 2, [0, None, 1]),
+    # One image placeholder, so one feature row: the video token stays text.
+    ([[10, 20, 20]], 1, [0, None, None]),
+    # Image token away from position zero: reading presence off the first token
+    # alone would pick the video placeholders here.
+    ([[20, 10, 10]], 2, [None, 0, 1]),
+])
+def test_the_exclusive_merge_fills_video_placeholders_only_without_images(
+    ids, rows, expected_rows,
+):
+    """dots_ocr and glm_ocr upstream fall back to the video placeholder only when
+    the sequence carries no image one, so a sequence holding both fills the image
+    positions alone."""
+    from unsloth_zoo.mlx.compile import _merge_exclusive_special_token_features
+
+    inputs_embeds = mx.zeros((1, 3, 2))
+    features = mx.array([[1.0, 1.0], [2.0, 2.0]])[:rows]
+
+    merged = _merge_exclusive_special_token_features(
+        10, 20, features, inputs_embeds, mx.array(ids))
+
+    for position, row in enumerate(expected_rows):
+        got = merged[0, position].tolist()
+        assert got == ([0.0, 0.0] if row is None else features[row].tolist()), position
+
+
+def test_the_exclusive_merge_carries_the_dots_ocr_count_contract():
+    """Its upstream prefix-slices the block per row, so a trailing feature row is
+    ignored and only a shortfall is refused. Requiring equality here is the
+    mistake this wiring exists to avoid."""
+    from unsloth_zoo.mlx.compile import _merge_exclusive_special_token_features
+
+    inputs_embeds = mx.zeros((1, 3, 2))
+    features = mx.array([[1.0, 1.0], [2.0, 2.0]])
+
+    surplus = _merge_exclusive_special_token_features(
+        10, 20, features, inputs_embeds, mx.array([[10, 0, 0]]))
+    assert surplus[0, 0].tolist() == [1.0, 1.0]
+
+    untouched = _merge_exclusive_special_token_features(
+        10, 20, features, inputs_embeds, mx.array([[0, 0, 0]]))
+    assert untouched[0, 0].tolist() == [0.0, 0.0]
+
+    with pytest.raises(ValueError, match="tokens=3, features=2"):
+        _merge_exclusive_special_token_features(
+            10, 20, features, inputs_embeds, mx.array([[10, 10, 10]]))
+
+
+@pytest.mark.parametrize("key", ["grid_thws", "image_grid_hws", "video_grid_hws"])
+@pytest.mark.parametrize("row", [[1, 16, 16], [16, 16]])
+def test_the_kimi_grid_key_names_are_measured_too(key, row):
+    """Kimi's processor names the grid differently and drops the frame axis for
+    stills, so the measured value has to keep whatever width the row had."""
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    raw = mx.array([row])
+    out = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), key: raw},
+        {"model_type": "kimi_k3"},
+        phase="content")
+
+    assert out[key] is raw
+    assert out["_unsloth_static_vlm_metadata"][key] == (tuple(row),)
+
+
+def test_a_tower_that_indexes_the_grid_as_an_array_is_left_alone():
+    """glm4v opens with `grid_thw.tolist()` and `mx.max(grid_thw[:, 1:])` on the
+    same object, so substituting the Python value would break it instead."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="glm4v"),
+        _unsloth_compile_decision=SimpleNamespace(enabled=True))
+    kwargs = {"image_grid_thw": mx.array([[1, 16, 16]])}
+
+    _apply_static_vlm_metadata(
+        model, {"_unsloth_static_vlm_metadata": {"image_grid_thw": ((1, 16, 16),)}}, kwargs)
+
+    assert isinstance(kwargs["image_grid_thw"], mx.array)
+
+
+# Two placeholders two elements wide: every layout holding four elements can
+# fill them, and (2, 1) cannot however its axes are read.
+@pytest.mark.parametrize("shape,fills", [
+    ((2, 2), True), ((1, 2, 2), True), ((2, 1, 2), True), ((4,), True),
+    ((1, 4), True), ((2, 1), False), ((1, 1, 2), False),
+])
+def test_the_count_is_of_placeholders_the_features_can_fill(shape, fills):
+    """minimax_m3_vl compares the elements it scatters rather than a row count,
+    so a folded or leading axis is not a mismatch there. Measuring an axis
+    instead refuses a batch its upstream accepts."""
+    from unsloth_zoo.mlx.compile import _raise_on_feature_count_mismatch
+
+    mask, inputs_embeds = mx.array([[True, True, False]]), mx.zeros((1, 3, 2))
+
+    if fills:
+        _raise_on_feature_count_mismatch(mask, mx.zeros(shape), inputs_embeds)
+    else:
+        with pytest.raises(ValueError, match="tokens=2, features=[01]"):
+            _raise_on_feature_count_mismatch(mask, mx.zeros(shape), inputs_embeds)
+
+
+def test_a_block_that_does_not_divide_into_rows_fills_nothing():
+    """Three elements cannot be read as rows two wide. Counting them as one row
+    would pass the surplus-tolerant check and then fail to reshape in the merge,
+    which is the shape of every mistake this guard has already made."""
+    from unsloth_zoo.mlx.compile import _raise_on_feature_count_mismatch
+
+    with pytest.raises(ValueError, match="tokens=1, features=0"):
+        _raise_on_feature_count_mismatch(
+            mx.array([[True, False, False]]), mx.zeros((3,)), mx.zeros((1, 3, 2)),
+            exact=False)
+
+
+@pytest.mark.parametrize("shape", [(2, 2), (1, 2, 2), (2, 1, 2), (4,), (1, 4)])
+def test_the_merge_indexes_a_folded_feature_block_by_its_elements(shape):
+    """Upstream scatters the block's elements, so a leading or folded axis holds
+    the same features in a different shape. Accepting one at the count and then
+    failing to index it would be worse than refusing it."""
+    from unsloth_zoo.mlx.compile import _merge_sequence_mask_features
+
+    merged, _ = _merge_sequence_mask_features(
+        mx.array([[True, True, False]]),
+        mx.array([0.0, 1.0, 2.0, 3.0]).reshape(shape),
+        mx.zeros((1, 3, 2)),
+    )
+
+    assert merged.tolist() == [[[0.0, 1.0], [2.0, 3.0], [0.0, 0.0]]]
+
+
+def test_the_shared_merge_itself_refuses_nothing():
+    """Idefics hands it a feature row per padded image slot, so the count
+    belongs to each tower rather than to the merge they share."""
+    from unsloth_zoo.mlx.compile import _merge_sequence_mask_features
+
+    merged, _ = _merge_sequence_mask_features(
+        mx.array([[True, False, False]]),
+        mx.array([[1.0, 1.0], [2.0, 2.0]]),
+        mx.zeros((1, 3, 2)),
+    )
+
+    assert merged[0, 0].tolist() == [1.0, 1.0]
+
+
+def test_the_count_check_steps_aside_for_a_mask_it_cannot_read():
+    """A mask derived from a compiled function's own inputs is a tracer, and the
+    comparison has no host value to make."""
+    from unsloth_zoo.mlx.compile import _raise_on_feature_count_mismatch
+
+    features = mx.array([[1.0, 1.0], [2.0, 2.0]])
+
+    @mx.compile
+    def check(input_ids):
+        _raise_on_feature_count_mismatch(
+            input_ids == 1, features, mx.zeros((1, 3, 2)))
+        return input_ids * 2
+
+    assert check(mx.array([[1, 0, 0]])).shape == (1, 3)
+
+
+@pytest.mark.parametrize("decision", [None, "disabled"])
+def test_the_family_table_stays_off_when_compile_is_not_running(decision):
+    """Its keys name what a patched tower reads. `patch_mode="unpatched"` leaves
+    the upstream tower in place, and that one still calls `.tolist()` on the
+    array it was handed."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    model = SimpleNamespace(config=SimpleNamespace(model_type="mage_vl"))
+    if decision == "disabled":
+        model._unsloth_compile_decision = SimpleNamespace(enabled=False)
+    kwargs = {"image_grid_thw": mx.array([[1, 16, 16]])}
+
+    _apply_static_vlm_metadata(
+        model, {"_unsloth_static_vlm_metadata": {"image_grid_thw": ((1, 16, 16),)}}, kwargs)
+
+    assert isinstance(kwargs["image_grid_thw"], mx.array)
+
+
+def test_a_patched_embedder_declaration_still_applies_without_a_decision():
+    """The patch that declares the keys is the tower that reads them, so the
+    declaration cannot outlive the patch the way the table can."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    def embedder():
+        raise AssertionError("never called")
+
+    embedder._unsloth_static_vlm_metadata = ("image_grid_thw",)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="phi3_v"), get_input_embeddings=embedder)
+    kwargs = {"image_grid_thw": mx.array([[1, 16, 16]])}
+
+    _apply_static_vlm_metadata(
+        model, {"_unsloth_static_vlm_metadata": {"image_grid_thw": ((1, 16, 16),)}}, kwargs)
+
+    assert kwargs["image_grid_thw"] == ((1, 16, 16),)
+
+
+def test_a_patched_embedder_declaration_wins_over_the_family_table():
+    """A compile patch knows which keys its own rewritten tower reads."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    def embedder():
+        raise AssertionError("never called")
+
+    embedder._unsloth_static_vlm_metadata = ("image_grid_thw",)
+    # An enabled decision, so the competing table path is live: pixtral's entry
+    # names `image_sizes`, which the declaration has to keep out of the kwargs.
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="pixtral"), get_input_embeddings=embedder,
+        _unsloth_compile_decision=SimpleNamespace(enabled=True))
+    kwargs = {"image_sizes": mx.array([[16, 16]]),
+              "image_grid_thw": mx.array([[1, 16, 16]])}
+
+    _apply_static_vlm_metadata(model, {"_unsloth_static_vlm_metadata": {
+        "image_sizes": ((16, 16),), "image_grid_thw": ((1, 16, 16),)}}, kwargs)
+
+    assert kwargs["image_grid_thw"] == ((1, 16, 16),)
+    assert isinstance(kwargs["image_sizes"], mx.array)
 
 
 def test_a_sidecar_symlink_out_of_the_model_is_not_dereferenced(tmp_path):

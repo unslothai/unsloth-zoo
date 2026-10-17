@@ -78,11 +78,20 @@ def patch_tokenizer_convert_added_tokens():
     if hasattr(original_convert_added_tokens, "_unsloth_patched"):
         return
 
+    # TRL tools= response parsers hold {"content": "text"} field dicts: converting them breaks save.
+    parser_keys = ("response_template", "response_schema")
+
     @classmethod
     def patched_convert_added_tokens(cls, obj, save=False, add_type_field=True):
-        # Only convert when "content" is a string (AddedToken expects str).
-        if isinstance(obj, dict) and "content" in obj and "__type" not in obj and isinstance(obj["content"], str):
-            return AddedToken(**obj)
+        if isinstance(obj, dict):
+            # Only convert when "content" is a string (AddedToken expects str); never on save.
+            if not save and "content" in obj and "__type" not in obj and isinstance(obj["content"], str):
+                return AddedToken(**obj)
+            if any(key in obj for key in parser_keys):
+                return {
+                    key: value if key in parser_keys else cls.convert_added_tokens(value, save=save, add_type_field=add_type_field)
+                    for key, value in obj.items()
+                }
         return original_convert_added_tokens.__func__(cls, obj, save=save, add_type_field=add_type_field)
 
     patched_convert_added_tokens._unsloth_patched = True
@@ -594,8 +603,11 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 # Compiled, `_ignore_causal_mask_sdpa` always refuses, so SDPA loses its `is_causal` kernels.
 # Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
-CAUSAL_MASK_SKIP_STATS = {"skipped": 0}
+CAUSAL_MASK_SKIP_STATS = {"skipped": 0, "right_padded": 0}
 _SKIP_CAUSAL_MASK_ENV = "UNSLOTH_SKIP_CAUSAL_MASK"
+# Opt-in: right-padded rows also run `is_causal` instead of a [bsz, 1, q, q] mask. Real tokens never
+# see the pad tail under causal attention, so only the outputs at pad positions change.
+_SKIP_RIGHT_PADDING_MASK_ENV = "UNSLOTH_SKIP_RIGHT_PADDING_MASK"
 # Any other non-None argument (or/and_mask_function, encoder_hidden_states, ...) keeps the mask.
 _PLAIN_CAUSAL_MASK_ARGUMENTS = frozenset((
     "config", "inputs_embeds", "input_embeds", "attention_mask", "cache_position",
@@ -677,6 +689,79 @@ def _flex_routes_maskless_to_sdpa(config):
     return not _a_model_overrides_flex_locally()
 
 
+_ATTENTION_DROPOUT_NAMES = ("attention_dropout", "attn_dropout", "attn_pdrop", "attention_probs_dropout_prob")
+_FLASH_SDPA_ACCEPTS_CACHE = {}
+
+
+def _flash_sdpa_accepts(device, dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
+    # Ask torch's own dispatcher: flash also rejects by arch, torch version, dropout and grad
+    # (torch 2.6 has no flash past sm90; sm86 / sm89 / sm120 refuse head_dim > 224 training with dropout).
+    key = (str(device), dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad)
+    accepts = _FLASH_SDPA_ACCEPTS_CACHE.get(key, None)
+    if accepts is not None:
+        return accepts
+    try:
+        # The arch checks read the current device's properties, so probe on the embeds' device.
+        with torch.cuda.device(device):
+            query = torch.empty((1, num_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
+            key_value = torch.empty((1, num_kv_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
+            try:
+                params = torch.backends.cuda.SDPAParams(query, key_value, key_value, None, dropout, True, True)
+            except TypeError:
+                # torch < 2.5 has no enable_gqa argument, so only equal head counts can be probed.
+                if num_heads != num_kv_heads:
+                    raise
+                params = torch.backends.cuda.SDPAParams(query, key_value, key_value, None, dropout, True)
+            accepts = torch.backends.cuda.can_use_flash_attention(params, False) is True
+    except Exception:
+        accepts = False
+    _FLASH_SDPA_ACCEPTS_CACHE[key] = accepts
+    return accepts
+
+
+def _flash_sdpa_takes_causal(config, embeds):
+    """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; anything
+    else falls to the math kernel and its [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
+    if embeds.dtype not in (torch.float16, torch.bfloat16) or not embeds.is_cuda:
+        return False
+    if torch.version.hip is not None or not torch.backends.cuda.flash_sdp_enabled():
+        return False
+    if torch.cuda.get_device_capability(embeds.device) < (8, 0):
+        return False
+    try:
+        configs = [config] if not getattr(config, "is_heterogeneous", False) else list(config.per_layer_config)
+    except Exception:
+        return False
+    # Training mode is unknown here, so any configured attention dropout counts.
+    requires_grad = torch.is_grad_enabled()
+    for layer_config in configs:
+        # transformers >= 5.17 heterogeneous configs raise a RuntimeError on a global per-layer attribute.
+        try:
+            head_dim = getattr(layer_config, "head_dim", None)
+            if not isinstance(head_dim, int):
+                head_dim = layer_config.hidden_size // layer_config.num_attention_heads
+            num_heads = layer_config.num_attention_heads
+            num_kv_heads = getattr(layer_config, "num_key_value_heads", None)
+            if num_kv_heads is None:
+                num_kv_heads = num_heads
+            dropout = 0.0
+            for name in _ATTENTION_DROPOUT_NAMES:
+                value = getattr(layer_config, name, None)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    dropout = max(dropout, float(value))
+        except Exception:
+            return False
+        if not (0 < head_dim <= 256 and head_dim % 8 == 0):
+            return False
+        if not isinstance(num_heads, int) or not isinstance(num_kv_heads, int):
+            return False
+        if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+            return False
+        if not _flash_sdpa_accepts(embeds.device, embeds.dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
+            return False
+    return True
+
+
 def _maskless_causal_arguments(signature, args, kwargs):
     """Arguments for an eager create_causal_mask call that may return None, else None.
 
@@ -743,13 +828,24 @@ def _maskless_causal_arguments(signature, args, kwargs):
             or position_ids.shape[-1] != q_length
         ):
             return None
+    right_padded = False
     if attention_mask is not None and not bool(attention_mask.all()):
-        return None
+        if os.environ.get(_SKIP_RIGHT_PADDING_MASK_ENV, "0") != "1":
+            return None
+        if not _flash_sdpa_takes_causal(config, embeds):
+            return None
+        # Every row starts real and stays padded after its first pad; left padding keeps the mask.
+        mask = attention_mask.bool()
+        if not bool(mask[:, 0].all() & (mask[:, 1:] <= mask[:, :-1]).all()):
+            return None
+        right_padded = True
     if position_ids is not None and not bool((position_ids.diff(dim = -1) == 1).all()):
         return None
     for name in ("attention_mask", "position_ids"):
         if name in arguments:
             arguments[name] = None
+    if right_padded:
+        CAUSAL_MASK_SKIP_STATS["right_padded"] += 1
     return arguments
 
 
@@ -858,6 +954,9 @@ def patch_transformers_masks():
                         CAUSAL_MASK_SKIP_STATS["skipped"] += 1
                     return mask
             return f(*args, **kwargs)
+        # Remote code (Nemotron-Labs-Diffusion's prefill) filters its arguments by inspect.signature(create_causal_mask).
+        if signature is not None:
+            return_attention_mask.__signature__ = signature
         return return_attention_mask
     pass
 
@@ -1305,53 +1404,108 @@ pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
-def patch_mamba_ssm_pre_ampere_fallback():
-    """Force the Mamba slow path on pre-Ampere GPUs.
+# Kaggle T4, mamba_ssm 2.3.1: Triton 3.2 fails (`map::at`), 3.3 fails (`PassManager::run failed`), 3.4-3.6 train.
+_MAMBA_SM75_MIN_TRITON = (3, 4)
 
-    mamba_ssm's Triton kernels need sm_80+. On a T4 the package imports fine
-    and `is_fast_path_available` is True, so transformers routes into
-    `cuda_kernels_forward` and Triton only fails once training starts, with an
-    opaque `RuntimeError: PassManager::run failed`.
 
-    `is_fast_path_available` is baked in at module import, so flip both the
-    availability predicates (for modules imported later) and the flag on
-    already-imported modules. A capability check rather than a trial launch
-    like the causal_conv1d probe above, which would pay a Triton compile at
-    every import just to watch it fail. Real NVIDIA CUDA only.
+def _weakest_cuda_capability():
+    """Lowest capability across visible GPUs: a model can be split over all of them."""
+    count = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 1
+    return min(tuple(torch.cuda.get_device_capability(i)) for i in range(max(count, 1)))
+pass
+
+
+def _mamba_ssm_fast_path_blocker(capability):
+    """None if mamba_ssm's Triton kernels can run, else why. UNSLOTH_MAMBA_PRE_AMPERE_FAST=1/0 forces it below sm_80."""
+    if tuple(capability) >= (8, 0):
+        return None
+    major, minor = capability
+    forced = os.environ.get("UNSLOTH_MAMBA_PRE_AMPERE_FAST", "").strip()
+    if forced == "1":
+        return None
+    if forced == "0":
+        return "UNSLOTH_MAMBA_PRE_AMPERE_FAST=0 is set"
+    if tuple(capability) < (7, 5):
+        return f"they need compute capability 7.5+ (this GPU is {major}.{minor})"
+    try:
+        import re as _re
+        import triton
+        _match = _re.match(r"(\d+)\.(\d+)", triton.__version__)
+        version = (int(_match.group(1)), int(_match.group(2))) if _match else None
+    except Exception:
+        version = None
+    if version is None or version < _MAMBA_SM75_MIN_TRITON:
+        found = "is missing" if version is None else f"is {triton.__version__}"
+        return (
+            f"on compute capability {major}.{minor} they need Triton "
+            f"{'.'.join(map(str, _MAMBA_SM75_MIN_TRITON))}+ (torch 2.8+), "
+            f"and Triton {found}"
+        )
+    return None
+pass
+
+
+def _single_mamba_ssm_autotune_config(extra_packages = ()):
+    """Keep one autotune config per mamba_ssm kernel (and per kernel in `extra_packages`).
+
+    Compiling every config before step 1 takes minutes on a T4. Keeps the config
+    mamba_ssm's deterministic mode picks: least shared memory.
     """
-    if not torch.cuda.is_available():
-        return
-    if getattr(torch.version, "hip", None) is not None:
-        return  # ROCm: mamba_ssm's requirements are a different question
-    try:
-        major, minor = torch.cuda.get_device_capability()
-    except Exception:
-        return
-    if (major, minor) >= (8, 0):
-        return  # Ampere or newer; the fast path is fine
-
     import sys
-
-    # 0. transformers 5 can also fetch these kernels from the Hub, through
-    #    `lazy_load_kernel`, which needs no local wheel and never consults the
-    #    predicates below. Drop the registry entries so it returns None and the
-    #    fast path stays unavailable. Before the local-wheel check, since the
-    #    Hub path is exactly the one that reaches a pre-Ampere GPU without one.
     try:
-        from transformers.integrations import hub_kernels as _hk
-        for _kernel in ("mamba-ssm", "falcon_mamba-ssm", "causal-conv1d"):
-            _hk._HUB_KERNEL_MAPPING.pop(_kernel, None)
-            # An already-resolved module has to go too. None is enough:
-            # lazy_load_kernel only short-circuits on a real module object.
-            _hk._KERNEL_MODULE_MAPPING[_kernel] = None
+        from triton.runtime.autotuner import Autotuner
     except Exception:
-        pass
-    pass
+        return 0
+    def _cost(config):
+        cost = getattr(config, "num_stages", 1) or 1
+        for key, value in getattr(config, "kwargs", {}).items():
+            if key.startswith("BLOCK_SIZE_"):
+                cost *= value
+        return cost
+    prefixes = ("mamba_ssm.ops.triton.",) + tuple(f"{p}." for p in extra_packages)
+    pruned = 0
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name.startswith(prefixes) or name in extra_packages):
+            continue
+        for obj in list(module.__dict__.values()):
+            if isinstance(obj, Autotuner) and len(getattr(obj, "configs", ())) > 1:
+                try:
+                    obj.configs = [min(obj.configs, key = _cost)]
+                    pruned += 1
+                except Exception:
+                    pass
+    return pruned
+pass
+
+
+def _retrim_mamba_ssm_autotune():
+    """Re-trim after fix_mamba_ssm_float32 reloads ssd_chunk_scan (trust_remote_code has no later pass)."""
+    try:
+        if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
+            return 0
+        capability = _weakest_cuda_capability()
+        if capability >= (8, 0) or _mamba_ssm_fast_path_blocker(capability) is not None:
+            return 0
+        return _single_mamba_ssm_autotune_config()
+    except Exception:
+        return 0
+pass
+
+
+def _force_slow_path_on_raising_mamba_mixers():
+    """Make Jamba / Zamba take the slow path where they would raise instead.
+
+    Both bind `use_fast_kernels = config.use_mamba_kernels` (True by default)
+    and raise `Fast Mamba kernels are not available` when the kernels are
+    missing (Jamba on transformers 4.x, Zamba up to 5.14), where every other
+    Mamba family falls back to its PyTorch path. Idempotent.
+    """
+    import sys
 
     # 0b. Jamba and Zamba bind `self.use_fast_kernels = config.use_mamba_kernels`
     #     (True by default) at construction and RAISE inside that branch when the
-    #     fast path is unavailable, so step 0 above and step 1 below turn their
-    #     forward into `ValueError: Fast Mamba kernels are not available` instead
+    #     fast path is unavailable, so the pre-Ampere steps 0 and 1, or a missing
+    #     mamba_ssm / causal_conv1d, turn their forward into `ValueError: Fast Mamba kernels are not available` instead
     #     of the slow path this guard promises. Wrapping the mixer is the only
     #     thing that clears the instance flag, so it must not hang off the
     #     module's `is_fast_path_available`:
@@ -1440,6 +1594,70 @@ def patch_mamba_ssm_pre_ampere_fallback():
             pass
         pass
     pass
+pass
+
+
+def patch_mamba_ssm_pre_ampere_fallback():
+    """Force the Mamba slow path where mamba_ssm's Triton kernels cannot compile.
+
+    Below sm_80 with Triton < 3.4 the kernels fail only once training starts
+    (`PassManager::run failed`). `is_fast_path_available` is baked in at import,
+    so flip the predicates (later imports) and the flag (already imported).
+    A version check, not a trial compile at every import. Real NVIDIA CUDA only.
+    """
+    if not torch.cuda.is_available():
+        return
+    if getattr(torch.version, "hip", None) is not None:
+        return  # ROCm: mamba_ssm's requirements are a different question
+    try:
+        major, minor = _weakest_cuda_capability()
+    except Exception:
+        return
+    blocker = _mamba_ssm_fast_path_blocker((major, minor))
+    if blocker is None:
+        if (major, minor) < (8, 0):
+            # Route mamba-ssm to the local package (patch_lazy_load_kernel_local_packages), which is trimmed.
+            # falcon_mamba-ssm stays: Mamba-1 CUDA kernels, nothing autotuned, no local fallback.
+            # An already-resolved Hub module may be bound into a modeling module: trim it too.
+            _hub_packages = ()
+            try:
+                from transformers.integrations import hub_kernels as _hk
+                _hk._HUB_KERNEL_MAPPING.pop("mamba-ssm", None)
+                _resolved = _hk._KERNEL_MODULE_MAPPING.get("mamba-ssm", None)
+                if isinstance(getattr(_resolved, "__name__", None), str):
+                    _hub_packages = (_resolved.__name__,)
+                if "mamba-ssm" in _hk._KERNEL_MODULE_MAPPING:
+                    _hk._KERNEL_MODULE_MAPPING["mamba-ssm"] = None
+            except Exception:
+                pass
+            # `import mamba_ssm` loads every ssd kernel module.
+            try:
+                import mamba_ssm  # noqa: F401
+            except Exception:
+                pass
+            _single_mamba_ssm_autotune_config(_hub_packages)
+        return  # Ampere or newer, or a Triton that compiles the kernels on sm_75
+
+    import sys
+
+    # 0. transformers 5 can also fetch these kernels from the Hub, through
+    #    `lazy_load_kernel`, which needs no local wheel and never consults the
+    #    predicates below. Drop the registry entries so it returns None and the
+    #    fast path stays unavailable. Before the local-wheel check, since the
+    #    Hub path is exactly the one that reaches a pre-Ampere GPU without one.
+    try:
+        from transformers.integrations import hub_kernels as _hk
+        for _kernel in ("mamba-ssm", "falcon_mamba-ssm", "causal-conv1d"):
+            _hk._HUB_KERNEL_MAPPING.pop(_kernel, None)
+            # An already-resolved module has to go too. None is enough:
+            # lazy_load_kernel only short-circuits on a real module object.
+            _hk._KERNEL_MODULE_MAPPING[_kernel] = None
+    except Exception:
+        pass
+    pass
+
+    # 0b / 0c. Jamba and Zamba raise instead of taking the slow path.
+    _force_slow_path_on_raising_mamba_mixers()
 
     try:
         import mamba_ssm  # noqa: F401
@@ -1472,6 +1690,12 @@ def patch_mamba_ssm_pre_ampere_fallback():
         # phase, and can propagate an ImportError out of `import unsloth`.
         if not _mod.__dict__.get("is_fast_path_available", False):
             continue
+        # LFM2 / Qwen3-Next derive this flag from causal_conv1d / fla only.
+        if not any(_mod.__dict__.get(_sym, None) is not None for _sym in (
+            "selective_state_update", "mamba_chunk_scan_combined",
+            "mamba_split_conv1d_scan_combined", "selective_scan_fn", "mamba_inner_fn",
+        )):
+            continue
         try:
             _mod.is_fast_path_available = False
             for _sym in (
@@ -1488,14 +1712,50 @@ def patch_mamba_ssm_pre_ampere_fallback():
     pass
 
     print(
-        f"Unsloth: mamba_ssm's Triton kernels need compute capability 8.0+ "
-        f"(this GPU is {major}.{minor}). Using the PyTorch slow path for "
-        f"Mamba models."
+        f"Unsloth: Using the PyTorch slow path for Mamba models, since "
+        f"mamba_ssm's Triton kernels cannot run here: {blocker}."
     )
     return _touched
 
 
 TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
+
+
+def _mamba_fast_kernels_missing():
+    """True only when Jamba / Zamba cannot get the fast kernels from anywhere."""
+    import importlib.util
+    for _pkg in ("mamba_ssm", "causal_conv1d"):
+        try:
+            if importlib.util.find_spec(_pkg) is None:
+                break
+        except Exception:
+            return False  # Unknown: keep upstream behaviour
+    else:
+        return False
+    # transformers 5 can fetch the kernels from the Hub: mirror lazy_load_kernel's own gate.
+    try:
+        from transformers.integrations import hub_kernels as _hk
+        if "mamba-ssm" not in getattr(_hk, "_HUB_KERNEL_MAPPING", {}):
+            return True
+        if "_kernels_available" in _hk.__dict__:
+            return not _hk._kernels_available  # 5.2 - 5.10: `from kernels import ...` succeeded
+        return not (_hk.is_kernels_available() and _hk.__dict__.get("_kernels_enabled", True))
+    except Exception:
+        return True
+pass
+
+
+def patch_mamba_kernels_missing_fallback():
+    """Without mamba_ssm / causal_conv1d, Jamba and Zamba raise on any device.
+
+    transformers 4.57 Jamba and Zamba up to 5.14 raise `Fast Mamba kernels are
+    not available` in the first forward unless `use_mamba_kernels=False`;
+    transformers 5.15 falls back to the slow path instead (#47527). Do the same.
+    """
+    if _mamba_fast_kernels_missing():
+        _force_slow_path_on_raising_mamba_mixers()
+pass
+TEMPORARY_PATCHES.append(patch_mamba_kernels_missing_fallback)
 
 
 def _mamba_fused_split_needs_causal_conv1d_unusable():
@@ -1617,7 +1877,7 @@ def _local_kernel_fallback_allowed():
     if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
         return False
     try:
-        return torch.cuda.get_device_capability() >= (8, 0)
+        return _mamba_ssm_fast_path_blocker(_weakest_cuda_capability()) is None
     except Exception:
         return False
 pass
@@ -1645,6 +1905,8 @@ def patch_lazy_load_kernel_local_packages():
             if submodule is not None:
                 # Import ssd_combined so a broken install falls back to None, not a mid-forward crash.
                 importlib.import_module(f"{package}.{submodule}")
+            if package == "mamba_ssm":
+                _retrim_mamba_ssm_autotune()
             return module
         except Exception as e:
             logger.info(f"Unsloth: local {package} unusable for kernel {kernel_name}: {e}")
@@ -2050,6 +2312,7 @@ def fix_mamba_ssm_float32():
             importlib.reload(module)
         except Exception as e:
             return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+        _retrim_mamba_ssm_autotune()
         return
 
     # Atomic rename, not open("w"): truncation lets a concurrent patcher read and write back an empty module.
@@ -2065,6 +2328,7 @@ def fix_mamba_ssm_float32():
         tmp_file = None
         # Reload module since we editted it
         importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
+        _retrim_mamba_ssm_autotune()
     except Exception as e:
         if tmp_file is not None:
             try: os.unlink(tmp_file)
@@ -3218,6 +3482,42 @@ def _list_main_input_numel(value):
     return None
 
 
+def _stock_flops_owner(trainer, model, delegates):
+    # Whose num_parameters the stock 6 * tokens * num_parameters uses; None if 4.x's model.floating_point_ops is overridden.
+    if not delegates:
+        return model if hasattr(model, "num_parameters") else None
+    try:
+        from transformers.modeling_utils import ModuleUtilsMixin
+    except Exception:
+        return None
+    flops = getattr(model, "floating_point_ops", None)
+    owner = getattr(flops, "__self__", None)
+    if getattr(flops, "__func__", None) is not ModuleUtilsMixin.floating_point_ops or owner is None:
+        return None
+    tokens = getattr(owner, "estimate_tokens", None)
+    if getattr(tokens, "__func__", None) is not ModuleUtilsMixin.estimate_tokens:
+        return None
+    return owner
+
+
+def _cached_flops(trainer, original, delegates, model, inputs):
+    # num_parameters walks the whole model every step: count once per train() (each rebuilds trainer.state).
+    owner = _stock_flops_owner(trainer, model, delegates)
+    main_input = getattr(owner, "main_input_name", None)
+    value = inputs.get(main_input, None) if owner is not None and hasattr(inputs, "get") else None
+    if not isinstance(value, torch.Tensor):
+        return original(trainer, inputs)
+    state = getattr(trainer, "state", None)
+    cache = getattr(trainer, "_unsloth_flops_params", None)
+    if cache is None or cache[0] is not owner or cache[1] is not state:
+        cache = (owner, state, owner.num_parameters(exclude_embeddings = True))
+        try:
+            trainer._unsloth_flops_params = cache
+        except Exception:
+            pass
+    return 6 * value.numel() * cache[2]
+
+
 def patch_trainer_flops_list_main_input():
     # Nemotron-3-Nano-Omni's main_input_name is pixel_values, a list of ragged tiles: Trainer's `.numel()` crashes.
     try:
@@ -3227,6 +3527,10 @@ def patch_trainer_flops_list_main_input():
     original = Trainer.__dict__.get("floating_point_ops")
     if original is None or getattr(original, "_unsloth_list_main_input", False):
         return
+    try:
+        delegates = "model.floating_point_ops" in inspect.getsource(original)
+    except Exception:
+        delegates = True
 
     @functools.wraps(original)
     def floating_point_ops(self, inputs):
@@ -3239,6 +3543,8 @@ def patch_trainer_flops_list_main_input():
             if numel is None:
                 return 0
             return 6 * numel * model.num_parameters(exclude_embeddings = True)
+        if isinstance(value, torch.Tensor):
+            return _cached_flops(self, original, delegates, model, inputs)
         return original(self, inputs)
 
     floating_point_ops._unsloth_list_main_input = True

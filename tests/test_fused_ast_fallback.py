@@ -29,7 +29,9 @@ from unsloth_zoo.fused_losses.ast_rewriter import (
     rewrite_forward_source,
     rewrite_forward_source_spliced,
 )
+from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy
 from unsloth_zoo.fused_losses.forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 
 # transformers 5.16.0+ CohereCompassForConditionalGeneration: guarded logit scale.
 COHERE_COMPASS = """
@@ -170,8 +172,10 @@ def _ns():
         CrossEntropyLoss = CrossEntropyLoss,
         can_return_tuple = lambda f: f,
         unsloth_fused_lm_head_loss = unsloth_fused_lm_head_loss,
+        unsloth_count_aware_cross_entropy = unsloth_count_aware_cross_entropy,
         EMPTY_LOGITS = EMPTY_LOGITS,
         ForCausalLMLoss = ForCausalLMLoss,
+        _can_fuse_loss = _can_fuse_loss,
     )
 
 
@@ -230,6 +234,8 @@ def test_fused_matches_original(name, logit_scale, monkeypatch):
     original = _compile(src)
     fused = _compile(rewrite_forward_source_spliced(src)[0])
     model = _model(logit_scale)
+    if name in ("mamba", "clvp"):
+        del model.loss_function  # Legacy CE does not consult this attribute.
     torch.manual_seed(1)
     hidden = torch.randn(2, 9, H)
     labels = torch.randint(0, V, (2, 9))

@@ -117,6 +117,33 @@ def test_native_name_sanitizer_preserves_vlm_expert_export(monkeypatch, tmp_path
         assert mx.array_equal(actual[name], source[name]).item()
 
 
+@metal_only
+def test_vlm_fused_expert_export_restores_every_checkpoint_name(tmp_path):
+    from types import SimpleNamespace
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import utils
+
+    Model = pytest.importorskip("mlx_vlm.models.gemma4.gemma4").Model
+    model = Model.__new__(Model)
+    nn.Module.__init__(model)
+    model.audio_tower = None
+    model.config = SimpleNamespace(
+        text_config=SimpleNamespace(num_experts=2),
+        vision_config=SimpleNamespace(use_clipped_linears=False),
+    )
+    source = {}
+    for layer in range(2):
+        prefix = f"language_model.model.layers.{layer}.experts"
+        source[f"{prefix}.gate_up_proj"] = mx.arange(48).reshape(2, 6, 4).astype(mx.float32) + layer * 100
+        source[f"{prefix}.down_proj"] = mx.arange(24).reshape(2, 4, 3).astype(mx.float32) + layer * 100
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), model.sanitize(dict(source)))
+    assert utils._prepare_moe_gguf_export_directory(tmp_path, model=model) > 0
+    restored = mx.load(str(tmp_path / "model.safetensors"))
+    assert restored.keys() == source.keys()
+    for name in source:
+        assert mx.array_equal(restored[name], source[name]).item()
+
+
 @pytest.mark.parametrize("source_form", ["converted", "unsanitized_layout", "extra_key"])
 def test_native_name_sanitizer_keeps_converted_norms(source_form):
     import mlx.nn as nn

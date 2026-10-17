@@ -58,8 +58,7 @@ from .compile import (
     trace_compile_application,
 )
 from .attention import install_quantized_attention
-from .inference import (dense_prefill_linear, fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                        fused_moe_router, fused_residual_norm, fused_residual_norm_handoff, nax_quantized_linear)
+from .inference import inference_scopes
 
 _vlm_model_types_cache = None
 _VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
@@ -228,7 +227,13 @@ def _mlx_lora_type_specs(*, include_convolutions=False):
     ]
     vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
     if vlm_switch_module is not None:
-        vlm_lora_module = importlib.import_module("mlx_vlm.trainer.lora_layers")
+        try:
+            vlm_lora_module = importlib.import_module("mlx_vlm.trainer.peft.lora_layers")
+        except ModuleNotFoundError as exc:
+            # mlx-vlm moved its LoRA layers into trainer.peft in 0.7.8.
+            if exc.name not in ("mlx_vlm.trainer.peft", "mlx_vlm.trainer.peft.lora_layers"):
+                raise
+            vlm_lora_module = importlib.import_module("mlx_vlm.trainer.lora_layers")
         specs.append(
             _MLXLoRATypeSpec(
                 (
@@ -629,6 +634,54 @@ def _raise_if_incomplete_mlx_config(
     ) from error
 
 
+def _hf_config_default(model_type, key):
+    try:
+        from transformers import CONFIG_MAPPING
+        return getattr(CONFIG_MAPPING[model_type](), key, None)
+    except Exception:
+        return None
+
+
+# Re-saves through transformers drop keys mlx-lm requires (unsloth#8126): v5 moves rope_theta
+# into rope_parameters, to_diff_dict drops class defaults, lfm2's block_ff_dim is intermediate_size.
+# Each value is what transformers itself loads; anything else keeps the incomplete-config error.
+_MLX_LM_CONFIG_BACKFILLS = {
+    "rope_theta": lambda config: (
+        config["rope_parameters"].get("rope_theta")
+        if isinstance(config.get("rope_parameters"), dict) else None
+    ),
+    "block_ff_dim": lambda config: config.get("intermediate_size"),
+    "tie_word_embeddings": lambda config: _hf_config_default(config.get("model_type"), "tie_word_embeddings"),
+}
+
+
+def _mlx_lm_config_backfill(model_name, model_path, model_config):
+    """model_config plus the required mlx-lm ModelArgs fields config.json lacks but implies."""
+    try:
+        from mlx_lm.utils import _get_classes
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as file:
+            config = {**json.load(file), **model_config}
+        if config.get("model_file") is not None:
+            return model_config
+        _, args_class = _get_classes(config=config)
+        parameters = inspect.signature(args_class).parameters
+    except Exception:
+        return model_config
+    filled = {}
+    for key, derive in _MLX_LM_CONFIG_BACKFILLS.items():
+        parameter = parameters.get(key)
+        if parameter is None or parameter.default is not inspect.Parameter.empty or key in config:
+            continue
+        value = derive(config)
+        if value is not None:
+            filled[key] = value
+    if not filled:
+        return model_config
+    listed = ", ".join(f"{key}={value!r}" for key, value in filled.items())
+    print(f"Unsloth: {model_name}'s config.json is missing {listed}; filled in as transformers reads it.")
+    return {**model_config, **filled}
+
+
 def _raise_if_qk_norm_version_gap(model_type, message, error):
     """A strict load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too old for
     this QK-norm arch; dropping those weights breaks the model, so raise instead."""
@@ -1005,7 +1058,8 @@ def _raise_mlx_remote_code_refusal(model_path, error, *, tokenizer_only=False):
             ) from error
 
 
-# mlx-lm < 0.32 and mlx-vlm exec a config.json `model_file` unchecked; trust is scoped here.
+# mlx-lm < 0.32 and mlx-vlm exec a config.json `model_file` unchecked; trust is scoped here and
+# handed to the releases that take their own `trust_remote_code`.
 _MLX_MODEL_FILE_TRUST = contextvars.ContextVar("unsloth_mlx_model_file_trust", default=False)
 
 
@@ -1048,9 +1102,9 @@ def _guard_mlx_model_file_loader(module, name, declared_model_file, required_par
         signature = inspect.signature(original)
     except (TypeError, ValueError):
         return
-    # Newer releases gate model_file on their own trust_remote_code; older ones never exec it.
-    if "trust_remote_code" in signature.parameters or required_parameter not in signature.parameters:
+    if required_parameter not in signature.parameters:
         return
+    forwards_trust = "trust_remote_code" in signature.parameters
 
     @wraps(original)
     def guarded(*args, **kwargs):
@@ -1065,12 +1119,14 @@ def _guard_mlx_model_file_loader(module, name, declared_model_file, required_par
                 f"Unsloth: The model at {model_path} names a model_file ({model_file!r}) outside "
                 "its own folder. Refusing to run it."
             )
-        if model_file and not _MLX_MODEL_FILE_TRUST.get():
+        if model_file and not (_MLX_MODEL_FILE_TRUST.get() or forwards_trust and arguments.get("trust_remote_code")):
             raise ValueError(
                 f"Unsloth: The model at {model_path} requires importing and running a custom "
                 f"module ({model_file!r}) to build its architecture. This is disabled by "
                 "default. Pass trust_remote_code=True if you trust this model."
             )
+        if forwards_trust and "trust_remote_code" not in arguments:
+            kwargs["trust_remote_code"] = _MLX_MODEL_FILE_TRUST.get()
         return original(*args, **kwargs)
 
     guarded._unsloth_model_file_guard = True
@@ -1237,6 +1293,7 @@ def _load_mlx_lm_with_strict_fallback(
 
     with _temporary_hf_token_env(hf_token):
         model_path = _download(model_name, revision=revision)
+    model_config = _mlx_lm_config_backfill(model_name, model_path, model_config)
 
     try:
         model, config = load_model(
@@ -1403,6 +1460,7 @@ def _load_mlx_lm_distributed(
             revision=revision,
             allow_patterns=_mlx_lm_metadata_allow_patterns(),
         )
+        model_config = _mlx_lm_config_backfill(model_name, model_path, model_config)
         with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
             try:
                 model, config = load_model(
@@ -3532,6 +3590,29 @@ def _freeze_text_only_full_finetune(model) -> None:
         _freeze_outside_language_model(model)
 
 
+def _fix_full_finetune_modality_weights(model) -> None:
+    """Phi-4-multimodal sets its decoder weights from frozen copies for each input's modality, over what full
+    fine-tuning changed; it keeps one set with every adapter merged instead, as its quantized load does."""
+    if not getattr(model, "_base_weights", None):
+        return
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    # The copies keep the checkpoint's dtype; the decoder they are written over may since have been cast to the requested one.
+    current = dict(tree_flatten(model.parameters()))
+    tables = [getattr(model, name, None) or {} for name in ("_base_weights", "_vision_lora_a", "_vision_lora_b", "_speech_lora_a", "_speech_lora_b")]
+    for table in tables:
+        for key, value in table.items():
+            if key in current and mx.issubdtype(current[key].dtype, mx.floating) and value.dtype != current[key].dtype:
+                table[key] = value.astype(current[key].dtype)
+    if getattr(model, "_unsloth_full_finetuning", False):
+        model.apply_both_loras()
+        model._base_weights = {}
+    else:
+        # Lazy on this thread's stream, which a model served from another thread cannot evaluate.
+        mx.eval([value for table in tables for value in table.values()])
+
+
 def _freeze_outside_language_model(model) -> None:
     """Text batches never reach the towers, so train only the language model, as mlx-lm does."""
     language_model = getattr(model, "language_model", None)
@@ -3588,8 +3669,17 @@ _LFM2_PROJECTOR_INIT_TOKEN_SHA256 = (
 _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
     "4405529c372e5bc69cf782c1038b674b55b46434e9a515d9db46a2a92e0414fa"
 )
+_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256 = (
+    "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576"
+)
+_MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256 = (
+    "f995c993dd959cc55a43f70f8f87c115d18833179e464426d63153022f4770ec"
+)
 _GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 = (
     "e859b50eb966089f8966a38ca2e69c3b68ccf48c5b4a264fbc01f415be60003f"
+)
+_XING4_0_HYPER_CONNECTION_CALL_TOKEN_SHA256 = (
+    "d33c41e769c36a1d01595314a684092576323fb12077090b3caf83325cf7bf64"
 )
 
 
@@ -3702,6 +3792,59 @@ def _ensure_lfm2_projector_layernorm(model_type) -> None:
 
     patched._unsloth_disabled_layernorm = True
     projector.__init__ = patched
+
+
+def _ensure_xing4_0_sliced_hyper_connection_base(model_type) -> None:
+    """Slice Xing4.0's hyper-connection base where the installed forward splits it."""
+
+    if model_type != "xing4_0":
+        return
+    try:
+        module = importlib.import_module("mlx_vlm.models.xing4_0.language")
+    except Exception:
+        return
+    connection = getattr(module, "HyperConnection", None)
+    if not isinstance(connection, type) or connection.__module__ != module.__name__:
+        return
+    installed_call = connection.__call__
+    if (
+        getattr(installed_call, "_unsloth_sliced_base", False)
+        or _source_token_sha256(_safe_getsource(installed_call))
+        != _XING4_0_HYPER_CONNECTION_CALL_TOKEN_SHA256
+    ):
+        return
+    import mlx.core as mx
+
+    # mx.compile raises `unordered_map::at` when a gradient-checkpointed layer
+    # splits a frozen parameter; the three parts as slices trace cleanly.
+    @wraps(installed_call)
+    def patched(self, x):
+        config = self.config
+        hc = config.hc_mult
+        flat = x.reshape(*x.shape[:2], -1).astype(mx.float32)
+        flat = flat * mx.rsqrt(
+            mx.mean(flat * flat, axis=-1, keepdims=True) + config.rms_norm_eps
+        )
+        mix = (flat.astype(x.dtype) @ self.hc_fn.astype(x.dtype).T).astype(mx.float32)
+        pre, post, comb = mx.split(mix, [hc, 2 * hc], axis=-1)
+        pre_b = self.hc_base[:hc]
+        post_b = self.hc_base[hc : 2 * hc]
+        comb_b = self.hc_base[2 * hc :]
+        pre = mx.sigmoid(pre * self.hc_scale[0] + pre_b)
+        post = 2 * mx.sigmoid(post * self.hc_scale[1] + post_b)
+        comb = comb.reshape(*comb.shape[:-1], hc, hc) * self.hc_scale[
+            2
+        ] + comb_b.reshape(hc, hc)
+        comb = mx.clip(comb, config.mhc_h_res_clamp_min, config.mhc_h_res_clamp_max)
+        comb = mx.exp(comb - comb.max(axis=-1, keepdims=True))
+        for _ in range(config.hc_sinkhorn_iters):
+            comb = comb / (comb.sum(axis=-1, keepdims=True) + config.hc_eps)
+            comb = comb / (comb.sum(axis=-2, keepdims=True) + config.hc_eps)
+        collapsed = (pre[..., None].astype(x.dtype) * x).sum(axis=2)
+        return post.astype(x.dtype), comb.astype(x.dtype), collapsed
+
+    patched._unsloth_sliced_base = True
+    connection.__call__ = patched
 
 
 def _gemma4_unused_shared_kv_weight(model, key) -> bool:
@@ -3968,6 +4111,81 @@ def _ensure_minicpmo_vision_dtype(model_type: str) -> None:
         cls.get_vision_embedding = adapted
 
 
+def _minicpmv4_7_text_positions_adapter(cls):
+    """Lay out MiniCPM-V 4.7 positions on device for a training batch without visuals.
+
+    The installed method builds canvas M-RoPE positions on the host for every
+    batch, which mx.compile cannot trace. Without visual input the canvas holds
+    only text, where each attended token's position is its rank among them.
+    """
+
+    original = cls.__dict__.get("get_input_embeddings")
+    rope = getattr(sys.modules.get(cls.__module__), "CanvasRoPE", None)
+    if (
+        getattr(original, "_unsloth_minicpmv4_7_text_positions", False)
+        or _source_token_sha256(_safe_getsource(original))
+        != _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
+        or _source_token_sha256(_safe_getsource(getattr(rope, "get_rope_index", None)))
+        != _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256
+    ):
+        return original
+    import mlx.core as mx
+
+    features_cls = original.__globals__["InputEmbeddingsFeatures"]
+
+    @wraps(original)
+    def patched(self, input_ids, pixel_values=None, **kwargs):
+        mask = kwargs.get("attention_mask", kwargs.get("mask"))
+        if (
+            not getattr(self, "training", False)
+            or pixel_values is not None
+            or kwargs.get("cached_image_features") is not None
+            or kwargs.get("tgt_sizes") is not None
+            or kwargs.get("downsample_mode", self.config.downsample_mode)
+            not in ("4x", "16x")
+            or not isinstance(input_ids, mx.array)
+            or input_ids.ndim != 2
+            or mask is not None
+            and (not isinstance(mask, mx.array) or mask.shape != input_ids.shape)
+        ):
+            return original(self, input_ids, pixel_values, **kwargs)
+        # A traced step cannot read token values, so a literal visual placeholder in a text row trains as a token.
+        embeddings = super(cls, self).get_input_embeddings(
+            input_ids, pixel_values=None, **kwargs
+        )
+        batch, width = input_ids.shape
+        if mask is None:
+            positions = mx.arange(width, dtype=mx.int32)
+        else:
+            valid = mask.astype(mx.bool_)
+            positions = mx.where(
+                valid, mx.cumsum(valid.astype(mx.int32), axis=-1) - 1, 0
+            )
+        positions = mx.broadcast_to(positions, (3, batch, width))
+        deltas = positions.max(axis=(0, 2))[:, None] + 1 - width
+        self.language_model._position_ids = positions
+        self.language_model._rope_deltas = deltas
+        return features_cls(
+            inputs_embeds=embeddings.inputs_embeds,
+            position_ids=positions,
+            rope_deltas=deltas,
+        )
+
+    patched._unsloth_minicpmv4_7_text_positions = True
+    return patched
+
+
+def _ensure_minicpmv4_7_text_positions(model_type: str) -> None:
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if (
+        cls is None
+        or cls.__module__ != "mlx_vlm.models.minicpmv4_7.minicpmv4_7"
+        or "get_input_embeddings" not in cls.__dict__
+    ):
+        return
+    cls.get_input_embeddings = _minicpmv4_7_text_positions_adapter(cls)
+
+
 def _lookup_module_array(root, dotted_key):
     """Resolve a parameter (mx.array) by its checkpoint dotted key, else None."""
     obj = root
@@ -4052,6 +4270,50 @@ def _ensure_audio_conv_sanitize(model_type: str) -> None:
 
     cls.sanitize = patched_sanitize
     _AUDIO_CONV_SANITIZE_PATCHED.add(model_type)
+
+
+def _encode_audio_clips_one_at_a_time(get_audio_features):
+    @wraps(get_audio_features)
+    def per_clip(self, input_features, feature_attention_mask=None,
+                 audio_feature_lengths=None):
+        if input_features.ndim != 3 or input_features.shape[0] < 2:
+            return get_audio_features(
+                self, input_features, feature_attention_mask, audio_feature_lengths,
+            )
+        import mlx.core as mx
+
+        return mx.concatenate([
+            get_audio_features(
+                self,
+                input_features[index:index + 1],
+                None if feature_attention_mask is None
+                else feature_attention_mask[index:index + 1],
+                None if audio_feature_lengths is None
+                else audio_feature_lengths[index:index + 1],
+            )
+            for index in range(input_features.shape[0])
+        ], axis=0)
+
+    return per_clip
+
+
+def _ensure_qwen3_omni_audio_per_clip(model_type: str) -> None:
+    """mlx-vlm <= 0.7.4 masks audio chunks by clip index, so later clips read the
+    first clip's chunks; encode clips one at a time. Gated on the tower's source."""
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if cls is None or cls.__module__ != "mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe":
+        return
+    thinker = importlib.import_module("mlx_vlm.models.qwen3_omni_moe.thinker").Thinker
+    audio = importlib.import_module("mlx_vlm.models.qwen3_omni_moe.audio")
+    source = _safe_getsource(audio.AudioModel.__call__) or ""
+    if (
+        "enumerate(feature_lens_after_cnn)" not in source
+        or getattr(thinker.get_audio_features, "__wrapped__", None) is not None
+    ):
+        return
+    thinker.get_audio_features = _encode_audio_clips_one_at_a_time(
+        thinker.get_audio_features,
+    )
 
 
 def _fp16_needs_bf16_modules(model):
@@ -4161,7 +4423,14 @@ _MULTIMODAL_SKIP_FRAGMENTS = (
     "vision_tower", "vision_model", "vision_encoder", "visual",
     "embed_vision", "vision_embed_tokens", "img_processor", "img_projection",
     "audio_encoder", "audio_projection", "embed_audio", "sound_encoder", "sound_projection",
+    # Connectors no name above matches: MiniCPM-o's two, ERNIE 4.5's, and the one of InternVL-style models.
+    "resampler", "audio_projection_layer", "resampler_model", "mlp1",
+    # Molmo Point's, whose decoder is not a module of its own to tell it from.
+    "build_vit_embedding",
 )
+
+# Speech generators beside the decoder are language models of their own, quantized like it.
+_SPEECH_OUTPUT_MODULES = ("talker", "code2wav", "tts")
 
 _MLX_QUANT_MODE_DEFAULTS = {
     "affine": (64, 4),
@@ -5519,6 +5788,24 @@ def _path_matches_any(path, patterns):
     )
 
 
+def _text_decoder_paths(model):
+    """Where the text decoder sits in ``model``; empty when it is not a module of its own."""
+    from .utils import _get_text_model
+    text_model = _get_text_model(model)
+    if text_model is model or not hasattr(model, "named_modules"):
+        return ()
+    return tuple(path for path, module in model.named_modules() if module is text_model)
+
+
+def _beside_text_decoder(path, decoder_paths):
+    """Whether ``path`` is a tower, a connector or a head on one: outside the decoder, and no speech generator."""
+    return (
+        bool(decoder_paths)
+        and not _under_any(path, decoder_paths)
+        and not any(name in path.split(".") for name in _SPEECH_OUTPUT_MODULES)
+    )
+
+
 def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
     model_predicate = getattr(model, "quant_predicate", None)
     include_patterns = spec.quantize_modules
@@ -5526,6 +5813,8 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
         from mlx_vlm.utils import skip_multimodal_module
     except ImportError:
         skip_multimodal_module = None
+    # By path, not identity: a forced requantize replaces the decoder's modules first.
+    decoder_paths = _text_decoder_paths(model)
 
     def predicate(path: str, module):
         path_parts = path.split(".")
@@ -5537,6 +5826,8 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
             if skip_multimodal_module is not None and skip_multimodal_module(path):
                 return False
             if any(fragment in path_parts for fragment in _MULTIMODAL_SKIP_FRAGMENTS):
+                return False
+            if _beside_text_decoder(path, decoder_paths):
                 return False
 
         if not explicitly_included:
@@ -6675,6 +6966,51 @@ def _ensure_vlm_prompt_utils_patched():
     _vlm_prompt_utils_patched = True
 
 
+_exact_verify_sums_promoted = False
+_LOW_PRECISION_SUM = re.compile(r"sum \+= x\[i\][^;]*;")
+_SUMMED_ELEMENT = re.compile(r"\bx\[i(?: \+ \d+)?\]")
+# Header strings and header builders of mlx-vlm's exact verify kernels, which copy MLX's qmv input sum.
+_EXACT_VERIFY_SUM_SOURCES = {
+    "mlx_vlm.models.quantized_verifier": ("_AFFINE_MOE_HC_HEADER", "_target_verify_qlinear_header"),
+    "mlx_vlm.models.fast_ops": ("_AFFINE5_SWITCH_HEADER", "_AFFINE4_SWITCH_HEADER"),
+    "mlx_vlm.models.glm_moe_dsa.speculative_verifier": ("_quantized_head_header",),
+}
+
+
+def _promote_partial_sums(source):
+    return _LOW_PRECISION_SUM.sub(
+        lambda statement: _SUMMED_ELEMENT.sub(lambda x: f"float({x.group(0)})", statement.group(0)), source)
+
+
+def _ensure_exact_verify_sums_promoted():
+    """MLX 0.32.4's qmv sums its input in float32; mlx-vlm <= 0.7.8's exact verify kernels still sum in the
+    input dtype, so verify no longer matches decode. Rewrite the old-form sums (gated on MLX and source)."""
+    global _exact_verify_sums_promoted
+
+    if _exact_verify_sums_promoted:
+        return
+    import mlx.core as mx
+    from packaging.version import Version
+
+    if Version(mx.__version__) >= Version("0.32.4"):
+        for module_name, names in _EXACT_VERIFY_SUM_SOURCES.items():
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                continue
+            for name in names:
+                source = getattr(module, name, None)
+                if isinstance(source, str):
+                    setattr(module, name, _promote_partial_sums(source))
+                elif isinstance(source, types.FunctionType) and _LOW_PRECISION_SUM.search(_safe_getsource(source) or ""):
+                    setattr(module, name, wraps(source)(lambda *a, _build = source, **k: _promote_partial_sums(_build(*a, **k))))
+            # A verify run before this load built kernels from the old sources.
+            for value in list(vars(module).values()):
+                if getattr(value, "__module__", None) == module_name and callable(getattr(value, "cache_clear", None)):
+                    value.cache_clear()
+    _exact_verify_sums_promoted = True
+
+
 def _ensure_vlm_processor_inputs_patched():
     """Patch mlx-vlm's processor call without replacing its input preparation."""
 
@@ -7079,10 +7415,7 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     generated_ids = []
     last_generation_tokens = None
-    with fused_moe_gate_up(self), fused_decode_conv_silu(self), fused_residual_norm(self), \
-            fused_moe_router(self), fused_moe_routed_experts(self), nax_quantized_linear(self, int8_prefill), \
-            dense_prefill_linear(self), \
-            fused_residual_norm_handoff(self):
+    with inference_scopes(self, ("vision",), int8_prefill = int8_prefill):
         for response in stream_generate(
             self,
             processor,
@@ -7206,11 +7539,9 @@ def _mlx_generate(self, *args, **kwargs):
     generated_ids = []
     eos_restore_state = _mlx_override_tokenizer_eos_ids(tokenizer, eos_token_id)
     try:
-        with fused_moe_gate_up(self), fused_decode_conv_silu(self), fused_residual_norm(self), \
-                fused_moe_router(self), fused_moe_routed_experts(self), nax_quantized_linear(self, int8_prefill), \
-                dense_prefill_linear(self), \
-                fused_residual_norm_handoff(self):
-            for response in stream_generate(
+        with inference_scopes(self, (), int8_prefill = int8_prefill):
+            # mlx-lm 0.32 refuses max_tokens=0; the reply is then just the prompt.
+            for response in () if max_tokens == 0 else stream_generate(
                 self,
                 tokenizer,
                 prompt_ids,
@@ -8351,6 +8682,7 @@ def _finish_load(model, tokenizer):
     # A call, not an if: tests/test_mlx_attention_metal.py keeps this body straight-line so the
     # attention patch above can never sit behind a branch.
     _freeze_text_only_full_finetune(model)
+    _fix_full_finetune_modality_weights(model)
     _materialize_weights(model)
     return model, tokenizer
 
@@ -9254,9 +9586,13 @@ class FastMLXModel:
                 install_mlx_compile_patches()
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_exact_verify_sums_promoted()
+            _ensure_xing4_0_sliced_hyper_connection_base(model_type)
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
+            _ensure_minicpmv4_7_text_positions(model_type)
             _ensure_audio_conv_sanitize(model_type)
+            _ensure_qwen3_omni_audio_per_clip(model_type)
             _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(
