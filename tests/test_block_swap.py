@@ -905,6 +905,37 @@ def test_stats_reports_placement_and_timings_after_a_step():
     sw.remove()
 
 
+def test_pre_keeps_an_in_flight_timing_sample_for_harvest():
+    if not torch.cuda.is_available():
+        return
+
+    class Ev:
+        done, recorded = False, 0
+
+        def record(self, stream):
+            self.recorded += 1
+
+        def query(self):
+            return self.done
+
+        def elapsed_time(self, other):
+            return 1.0
+
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
+    sw = BlockSwap(blocks, [1, 3], prefetch_depth = "auto", device = "cuda")
+    b = sw.blocks[0]
+    marks = [Ev(), Ev(), Ev()]
+    b.marks, b.mark_open = marks, 2
+    # The backward recompute reaches the block before its forward sample finished on the card.
+    sw._pre(0)(blocks[1], (), {})
+    assert b.mark_open == 2 and b.marks is marks and all(m.recorded == 0 for m in marks)
+    marks[2].done = True
+    layers = sw._tot["layers"]
+    sw._harvest()
+    assert sw._tot["layers"] == layers + 1
+    sw.remove()
+
+
 def _auto(n = 8, depth = 1, sample = 1):
     _mod._AUTO_SAMPLE = sample
     sw = _scheduler(n, depth = depth)
@@ -1053,6 +1084,17 @@ def test_block_swap_refuses_host_loaded_layers_without_room_to_pack(monkeypatch)
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
     with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
         BlockSwap(blocks, 6, device = "cuda")
+
+
+def test_host_fit_splits_free_ram_between_local_ranks(monkeypatch):
+    import sys, pytest
+    # 20 GiB free less a 4.8 GiB reserve is 15.2 GiB: 10 GiB fits one rank, not each of two.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    _mod._check_host_fit([_GiB // 2] * 20)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    with pytest.raises(ValueError, match = "At most 15 layers"):
+        _mod._check_host_fit([_GiB // 2] * 20)
 
 
 def test_host_fit_is_skipped_without_psutil(monkeypatch):

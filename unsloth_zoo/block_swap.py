@@ -108,7 +108,8 @@ def _check_host_fit(sizes, on_host = 0):
     except Exception:
         return
     need = sum(sizes)
-    avail = vm.available + on_host - _host_reserve(vm)
+    # Every local rank reads the same free RAM, so each may only plan for its share, like _pin_budget.
+    avail = (vm.available - _host_reserve(vm)) // _local_world_size() + on_host
     if need <= avail:
         return
     fit, used = 0, 0
@@ -502,7 +503,9 @@ class BlockSwap:
                 self._note_peak(b.home)
             self._fetch(b, steal = True)
             marks = getattr(b, "marks", None)
-            if marks is not None:
+            # A sample still in flight (backward recompute queued behind its forward) is kept for _harvest,
+            # not overwritten: recording into the same events would lose it.
+            if marks is not None and not (b.mark_open == 2 and not marks[2].query()):
                 self._harvest_marks(b)
                 stream = torch.cuda.current_stream(b.home)
                 marks[0].record(stream)
