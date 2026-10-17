@@ -40,6 +40,8 @@ def patch_PixtralAttention():
         self.head_dim = self.embed_dim // self.num_heads
 
         self.scale = self.head_dim**-0.5
+        self.scaling = self.scale
+        self.is_causal = False
         self.dropout = config.attention_dropout
 
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
@@ -56,6 +58,19 @@ def patch_PixtralAttention():
         output_attentions: Optional[bool] = False,
         **kwargs: KWARGS_TYPE,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
+        if "flash" in (self.config._attn_implementation or ""):
+            # FA uses position resets to isolate images; SDPA without a mask cannot.
+            position_ids = kwargs.get("position_ids")
+            if position_ids is not None and position_ids.shape == (hidden_states.shape[1], 2):
+                # Axial (row, col) coordinates: only (0, 0) starts a new image.
+                offsets = torch.arange(position_ids.shape[0], device = position_ids.device)
+                starts = offsets.masked_fill(position_ids.ne(0).any(-1), 0)
+                kwargs["position_ids"] = (offsets - starts.cummax(0).values).unsqueeze(0)
+            return _original_forward(
+                self, hidden_states, attention_mask = attention_mask,
+                position_embeddings = position_embeddings, output_attentions = output_attentions, **kwargs,
+            )
 
         batch_size, patches, _ = hidden_states.size()
 
@@ -88,7 +103,8 @@ def patch_PixtralAttention():
     # v5), but keep the original __signature__ so inspect.signature (used by
     # transformers._validate_model_kwargs) still sees the real named parameters.
     target_cls = transformers.models.pixtral.modeling_pixtral.PixtralAttention
-    _original_forward_signature = inspect.signature(target_cls.forward)
+    _original_forward = target_cls.forward
+    _original_forward_signature = inspect.signature(_original_forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
