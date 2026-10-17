@@ -377,26 +377,31 @@ class Qwen3DSparkDrafter(nn.Module):
         return self.confidence_head(feats).float()
 
 
-def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher, labels):
+def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher_hidden, teacher_w, labels):
     logits = (hidden @ lm_w.T).float()
     if prev_emb is not None:
         logits = logits + (prev_emb @ mk_w2.T).float()
     logp = logits.log_softmax(-1)
     ce = -logp.gather(-1, labels[:, None]).squeeze(-1)
     correct = (logits.argmax(-1) == labels).float()
-    if teacher is None:
+    if teacher_hidden is None:
         return ce, torch.zeros_like(ce), correct
+    # Recompute the frozen teacher inside the checkpoint, so its [rows, V] probabilities
+    # are not retained for every chunk until backward.
+    with torch.no_grad():
+        teacher = (teacher_hidden @ teacher_w.T).float().softmax(-1)
     l1 = (logp.exp() - teacher).abs().sum(-1)
     return ce, l1, correct
 
 
 def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 0.9,
                 confidence_alpha = 1.0, decay_gamma = 4.0, chunk_size = 1024, teacher_lm_head_weight = None):
-    """DeepSpec DSpark loss, chunked over supervised rows so [rows, vocab] logits never coexist.
+    """DeepSpec DSpark loss, chunked over supervised rows with per-chunk recomputation.
 
     teacher_hidden: target post-norm states [B, S, H]; slot j's teacher is the target's own
     prediction at label_index - 1, projected with `teacher_lm_head_weight` (the target's lm_head;
-    defaults to the drafter's copy). Returns (loss, stats).
+    defaults to the drafter's copy). Teacher probabilities are recomputed during backward
+    instead of being retained for every chunk. Returns (loss, stats).
     """
     eval_mask = out["eval_mask"]
     rows = eval_mask.nonzero(as_tuple = True)
@@ -421,11 +426,8 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
     ce_all, l1_all, correct_all = [], [], []
     for s in range(0, hidden.shape[0], chunk_size):
         e = slice(s, s + chunk_size)
-        teacher = None
-        if teacher_rows is not None:
-            with torch.no_grad():
-                teacher = (teacher_rows[e] @ teacher_w.T).float().softmax(-1)
-        args = (hidden[e], None if prev_emb is None else prev_emb[e], lm_w, None if mk is None else mk.markov_w2.weight, teacher, labels[e])
+        args = (hidden[e], None if prev_emb is None else prev_emb[e], lm_w, None if mk is None else mk.markov_w2.weight,
+                None if teacher_rows is None else teacher_rows[e], None if teacher_rows is None else teacher_w, labels[e])
         if torch.is_grad_enabled() and hidden.requires_grad:
             ce, l1, correct = checkpoint(_row_terms, *args, use_reentrant = False)
         else:
