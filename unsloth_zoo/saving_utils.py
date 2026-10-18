@@ -5926,6 +5926,37 @@ def merge_and_overwrite_lora(
     return save_directory
 pass
 
+def _cached_file_matching_revision(repo_id, filename, hf_cache_dir, token, revision):
+    # The cached `main` snapshot's file, only if its blob is the file at `revision`: cache blobs
+    # are named by content hash (LFS sha256, xet hash, or git blob id for small files).
+    # Anything unverifiable returns None.
+    from huggingface_hub import HfApi
+    try:
+        cached = hf_hub_download(
+            repo_id = repo_id,
+            filename = filename,
+            local_files_only = True,
+            repo_type = "model",
+            cache_dir = hf_cache_dir,
+            token = token,
+        )
+        infos = HfApi(token = token).get_paths_info(repo_id, [filename], revision = revision)
+    except Exception:
+        return None
+    for info in infos:
+        if getattr(info, "path", None) != filename:
+            continue
+        lfs = getattr(info, "lfs", None)
+        expected = {
+            getattr(lfs, "sha256", None) if lfs is not None else getattr(info, "blob_id", None),
+            getattr(info, "xet_hash", None),
+        } - {None, ""}
+        if os.path.basename(os.path.realpath(cached)) in expected:
+            return cached
+    return None
+pass
+
+
 def _try_copy_all_from_cache(
     repo_id: str,
     filenames_to_check: List[str],
@@ -5962,6 +5993,15 @@ def _try_copy_all_from_cache(
             )
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
+            # Pinned to a Hub commit the cache has no snapshot for (the repo moved since it was
+            # cached, often only a README edit): reuse the cached `main` copy when it is the
+            # same file at that commit, instead of downloading every shard again.
+            cached_path_str = _cached_file_matching_revision(
+                repo_id, filename, hf_cache_dir, token, revision,
+            ) if revision is not None else None
+            if cached_path_str is not None:
+                cached_paths_map[filename] = Path(cached_path_str)
+                continue
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose
             all_found = False
             break
