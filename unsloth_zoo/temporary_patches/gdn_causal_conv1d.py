@@ -586,8 +586,8 @@ def _try_fast_update(x, conv_state, weight, bias, activation):
         return None
     # The raw launch has no backward: anything autograd would track takes the torch path.
     if torch.is_grad_enabled() and (
-        getattr(x, "requires_grad", False) or getattr(weight, "requires_grad", False)
-        or getattr(bias, "requires_grad", False)
+        getattr(x, "requires_grad", False) or getattr(conv_state, "requires_grad", False)
+        or getattr(weight, "requires_grad", False) or getattr(bias, "requires_grad", False)
     ):
         return None
     try:
