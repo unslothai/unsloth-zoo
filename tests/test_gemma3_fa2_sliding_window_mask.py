@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma3 sliding layers keep their window when transformers hands them no mask.
-
-With attn_implementation="flash_attention_2" an unpadded batch gets
-attention_mask=None and the window is left to the FA2 kernel, but the patched
-Gemma3 attention runs SDPA, so a None mask used to mean full causal attention.
-The reference is the same patched forward under "sdpa", where transformers
-builds the explicit 4D sliding mask itself.
-"""
+"""Gemma3 sliding layers keep their window when FA2 hands the patched SDPA forward
+attention_mask=None. Reference: the same forward under "sdpa", where transformers
+builds the 4D sliding mask."""
 
 import pytest
 import torch

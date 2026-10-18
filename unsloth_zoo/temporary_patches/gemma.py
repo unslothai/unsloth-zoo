@@ -196,8 +196,7 @@ def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states
     if attention_mask is None:
         if sliding_window is None: return None
         q_len, kv_len = query_states.shape[2], key_states.shape[2]
-        # FA2 drops an all-valid padding mask and applies the window in its kernel.
-        # SDPA needs an explicit window, and an offset causal mask for cached chunks.
+        # FA2 leaves the window (and cached-chunk offset) to its kernel; SDPA needs them explicit.
         # Batch-invariant [1, 1, q, kv]: no larger than transformers' own sdpa sliding mask.
         if kv_len > sliding_window or (1 < q_len < kv_len):
             return _gemma3_causal_window_mask(q_len, kv_len, sliding_window, query_states.device)
