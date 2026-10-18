@@ -1259,6 +1259,10 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
     weights = completion_mask.to(torch.float32)
     if entropy_mask is not None:
         weights = weights * entropy_mask
+    sample_weight = loss_kwargs.get("sample_weight", None)
+    if sample_weight is not None:
+        # Zero-variance exclusion drops a completion from the whole loss, the entropy bonus included.
+        weights = weights * (sample_weight.to(weights.device) > 0).to(weights.dtype).unsqueeze(-1)
     if trl_version is None:
         try:
             import trl
@@ -1268,6 +1272,16 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
     from packaging.version import Version
     loss_type = loss_kwargs.get("loss_type", "grpo")
     if Version(trl_version) < Version("1.10.0") and loss_type in ("cispo", "dapo", "vespo"):
+        if sample_weight is not None:
+            # The policy term is normalised by sample_weight (kept tokens only, grpo_compute_loss),
+            # and TRL 1.8 / 1.9 divide the bonus by the policy's own normaliser: the same here, so
+            # excluded rows do not dilute it. Without exclusion this equals the branch below.
+            normalizer = 1.0 / loss_kwargs.get("num_processes", 1)
+            steps_per_generation = loss_kwargs.get("steps_per_generation", None)
+            if steps_per_generation:
+                normalizer = normalizer * loss_kwargs.get("current_gradient_accumulation_steps", 1) / steps_per_generation
+            row_weight = sample_weight.to(device = weights.device, dtype = weights.dtype).unsqueeze(-1)
+            return weights * row_weight * (-entropy_coef / normalizer)
         # TRL 1.8 / 1.9 used num_items_in_batch / num_processes as is, before 1.10 rescaled it to
         # one accumulation window (grpo_compute_loss always rescales the policy term).
         num_items_in_batch = loss_kwargs.get("num_items_in_batch", None)
@@ -1300,11 +1314,15 @@ def _high_entropy_mask_pads(method):
 pass
 
 
-def grpo_high_entropy_mask(trainer, entropies, mask, threshold):
+def grpo_high_entropy_mask(trainer, entropies, mask, threshold, sample_weight = None):
     """trainer.get_high_entropy_mask, except on a multi-process run whose method gathers without
     padding (TRL < 0.24): a rank with no valid tokens returns before the gather the other ranks
     enter, so training hangs, and uneven token counts break the gather. Those runs take TRL >= 0.24's
-    padded gather, which sees the same quantile population; a single process is unchanged."""
+    padded gather, which sees the same quantile population; a single process is unchanged.
+    sample_weight: rows with weight 0 (zero-variance exclusion) leave the loss, so they are left
+    out of the quantile population too."""
+    if sample_weight is not None:
+        mask = mask * (sample_weight.to(mask.device) > 0).to(mask.dtype).unsqueeze(-1)
     accelerator = getattr(trainer, "accelerator", None)
     if getattr(accelerator, "num_processes", 1) > 1 and not _high_entropy_mask_pads(trainer.get_high_entropy_mask):
         local = entropies[mask.bool()].float()
@@ -1992,6 +2010,12 @@ def grpo_parse_is_clip(spec, mode):
     """Parse UNSLOTH_GRPO_VLLM_IS_CLIP "lower_upper" (either side may be empty) into (lower, upper).
     Applied after GRPOConfig validation, so it checks the bounds itself: reversed bounds collapse
     every truncated ratio to one value and make the mask modes reject every token."""
+    if "_" not in str(spec):
+        # A bare "2.0" would otherwise become a lower bound and floor / reject every on-policy ratio.
+        raise ValueError(
+            f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP must be 'lower_upper' (either side may be empty, "
+            f"e.g. '_{spec}' for an upper cap), got {spec!r}."
+        )
     lower, _, upper = str(spec).partition("_")
     lower = float(lower) if lower.strip() else None
     upper = float(upper) if upper.strip() else None
@@ -3147,7 +3171,10 @@ def grpo_accumulated_loss(
             if _entropy_mask_on:
                 # TRL's own method, so its quantile population, ties and empty-batch rule match per version
                 # (multi-process TRL < 0.24 takes the padded gather so an empty rank cannot hang the rest).
-                entropy_mask = _grpo_high_entropy_mask(trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile)
+                entropy_mask = _grpo_high_entropy_mask(
+                    trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile,
+                    sample_weight = kwargs.get("sample_weight", None),
+                )
                 kwargs["entropy_mask"] = entropy_mask
 
         # DeepSpeed (no scaler) only: undo training_step's 1/GAS, which transformers >= 5.19 skips when
