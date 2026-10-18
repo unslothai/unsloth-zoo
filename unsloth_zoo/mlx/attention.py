@@ -828,18 +828,35 @@ def simd_prefill_attention(queries, keys, values, block_indices, query_ends, sca
 
 
 def probe_fast_prefill():
-    """Check the tensor-unit kernel against the native one."""
+    """Check the tensor-unit kernel against fp32 attention."""
     _probe_prefill(fast_prefill_attention)
 
 
 def probe_simd_prefill():
-    """Check the simdgroup kernel against the native one."""
+    """Check the simdgroup kernel against fp32 attention."""
     _probe_prefill(simd_prefill_attention)
 
 
-def _probe_prefill(attend):
-    """Compare with the native kernel on shuffled picks, -1 picks, tail blocks and rows with no visible key."""
-    from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
+def _fp32_prefill(queries, keys, values, picks, ends, scale):
+    """fp32 attention over each row's visible keys: its picked complete blocks and its partial tail block. On the
+    CPU, as some GPUs run fp32 matmuls at reduced precision; no import of mlx-vlm, which costs seconds."""
+    with mx.stream(mx.cpu):
+        _, H, L, _ = queries.shape
+        kL, nb = keys.shape[2], (keys.shape[2] + 3) // 4
+        complete, end, token = ends[0, :, None] // 4, ends[0, :, None], mx.arange(kL)
+        picks = mx.where((picks[0] >= 0) & (picks[0] < complete), picks[0], nb)  # unused picks: a column no key reads
+        blocks = mx.put_along_axis(mx.zeros((L, nb + 1), mx.bool_), picks, mx.array(True), axis = -1)
+        visible = mx.take(blocks, token // 4, axis = 1) | ((token // 4 == complete) & (token < end))
+        k, v = (mx.repeat(x[0].astype(mx.float32), H // keys.shape[1], axis = 0) for x in (keys, values))
+        s = mx.where(visible, queries[0].astype(mx.float32) @ k.transpose(0, 2, 1) * scale, -mx.inf)
+        m = mx.max(s, axis = -1, keepdims = True)
+        w = mx.where(visible, mx.exp(s - mx.where(m == -mx.inf, 0, m)), 0)
+        total = w.sum(-1, keepdims = True)
+        return ((w @ v) / mx.where(total == 0, 1, total)).astype(queries.dtype)[None]
+
+
+def _probe_cases():
+    """Shuffled picks, -1 picks, tail blocks and rows with no visible key, as (q, k, v, picks, ends)."""
     for L, N in ((64, 4101), (96, 1501), (64, 63)):
         q = mx.random.normal((1, 24, L, 256), key = mx.random.key(N + L)).astype(mx.bfloat16)
         k, v = (mx.random.normal((1, 2, N, 256), key = mx.random.key(N + i)).astype(mx.bfloat16) for i in (0, 1))
@@ -852,10 +869,18 @@ def _probe_prefill(attend):
         drop = (mx.random.uniform(shape = picks.shape, key = mx.random.key(5)) < 0.05) | (ends[..., None] == 4)
         picks = mx.where((picks < complete[..., None]) & ~drop, picks, -1)
         shuffle = mx.argsort(mx.random.uniform(shape = picks.shape, key = mx.random.key(4)), axis = -1)
-        picks = mx.take_along_axis(picks, shuffle, axis = -1)
-        native = qsa_sparse_attention(q, k, v, picks, ends, scale = 256 ** -0.5, block_size = 4)
-        got = attend(q, k, v, picks, ends, 256 ** -0.5)
-        error = mx.abs(got.astype(mx.float32) - native.astype(mx.float32)).max().item()
-        assert error <= 0.02 * mx.abs(native.astype(mx.float32)).max().item(), (L, N, error)
-        # Only rounding differs (fp32 summation order, P's last bits), so nearly every bf16 output matches.
-        assert mx.mean(got == native).item() >= 0.99, (L, N)
+        yield q, k, v, mx.take_along_axis(picks, shuffle, axis = -1), ends
+
+
+def _assert_rounding_close(got, want, case):
+    error = mx.abs(got.astype(mx.float32) - want.astype(mx.float32)).max().item()
+    assert error <= 0.02 * mx.abs(want.astype(mx.float32)).max().item(), (case, error)
+    # Only rounding differs (fp32 summation order; the tensor units also round P's last bits), so nearly
+    # every bf16 output matches.
+    assert mx.mean(got == want).item() >= 0.99, case
+
+
+def _probe_prefill(attend):
+    for q, k, v, picks, ends in _probe_cases():
+        _assert_rounding_close(attend(q, k, v, picks, ends, 256 ** -0.5),
+                               _fp32_prefill(q, k, v, picks, ends, 256 ** -0.5), q.shape[2:3] + k.shape[2:3])

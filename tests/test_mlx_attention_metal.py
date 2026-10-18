@@ -56,6 +56,9 @@ from unsloth_zoo.mlx import nax
 from unsloth_zoo.mlx.attention import (
     _PATCH_FLAG,
     _PATCH_TARGETS,
+    _assert_rounding_close,
+    _fp32_prefill,
+    _probe_cases,
     dequantized_sdpa,
     dequantizing_is_smaller,
     fast_prefill_supported,
@@ -683,7 +686,7 @@ def test_qsa_block_selection_picks_argpartitions_set(kind):
         assert mx.array_equal(select_blocks(scores, complete, 512, 128), _stock_selection(scores, complete, 512)).item()
 
 
-def test_qsa_fast_prefill_matches_the_native_kernel():
+def test_qsa_fast_prefill_matches_fp32_attention():
     if not nax.nax_available():
         pytest.skip("needs the neural accelerators")
     probe_fast_prefill()
@@ -702,7 +705,15 @@ def test_qsa_fast_prefill_covers_only_the_measured_layout(change):
     assert fast_prefill_supported(queries, keys, mx.zeros((B, L, topk), mx.int32), block) == (change is None)
 
 
-def test_qsa_simd_prefill_matches_the_native_kernel():
+def test_qsa_prefill_reference_matches_mlx_vlm():
+    from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
+    for q, k, v, picks, ends in _probe_cases():
+        _assert_rounding_close(_fp32_prefill(q, k, v, picks, ends, 256 ** -0.5),
+                               qsa_sparse_attention(q, k, v, picks, ends, scale = 256 ** -0.5, block_size = 4),
+                               q.shape[2:3] + k.shape[2:3])
+
+
+def test_qsa_simd_prefill_matches_fp32_attention():
     probe_simd_prefill()
 
 
