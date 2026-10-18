@@ -196,3 +196,19 @@ def test_compact_moe_rows_map_to_their_decoder_layers(replay):
     assert torch.equal(seen[1][:-1].sort(-1).values, forced[:-1, 0].long().sort(-1).values)
     assert torch.equal(seen[2][:-1].sort(-1).values, forced[:-1, 1].long().sort(-1).values)
     assert rr.routing_replay_stats()["router_calls_natural"] == 0
+
+
+def test_input_signature_tells_apart_inputs_with_equal_token_sums():
+    # Zero-centred router inputs (LayerNorm) give every token the same sum, so a sum cannot tell
+    # two forwards apart; the projections must, and must repeat bit for bit on identical inputs.
+    torch.manual_seed(0)
+    a = torch.randn(5, 32)
+    a = a - a.mean(-1, keepdim = True)
+    b = a[:, torch.randperm(32)]
+    b = b.flip(-1)
+    assert torch.allclose(a.sum(-1), b.sum(-1), atol = 1e-5)
+    sig_a = rr._input_signature((a,), 5)
+    assert sig_a.shape == (5, 2) and sig_a.dtype == torch.float32
+    assert torch.equal(sig_a, rr._input_signature((a.clone(),), 5))
+    assert not torch.equal(sig_a, rr._input_signature((b,), 5))
+    assert torch.equal(rr._input_signature((a.to(torch.bfloat16),), 5), rr._input_signature((a.to(torch.bfloat16),), 5))

@@ -382,14 +382,35 @@ def _fingerprint(ids):
 _NATURAL = object()
 
 
+_SIGNATURE_PROJECTIONS = {}
+_SIGNATURE_CHUNK = 4096
+
+
+def _signature_projection(width, device):
+    key = (width, str(device))
+    projection = _SIGNATURE_PROJECTIONS.get(key)
+    if projection is None:
+        generator = torch.Generator().manual_seed(0x5EED)
+        projection = torch.randn(width, 2, generator = generator, dtype = torch.float32).to(device)
+        _SIGNATURE_PROJECTIONS[key] = projection
+    return projection
+
+
 def _input_signature(args, tokens):
-    # Per token fp32 sum of the router input. The recompute feeds the router the same bits as
-    # the forward did, so this tells apart forwards whose natural routes are equal.
+    # Per token fp32 random projections of the router input. The recompute feeds the router the
+    # same bits as the forward did, so this tells apart forwards whose natural routes are equal.
+    # Random directions, not a plain sum: zero-centred (LayerNorm) inputs all sum to about zero.
     x = args[0] if args and torch.is_tensor(args[0]) else None
     if x is None or not x.is_floating_point() or tokens == 0 or x.numel() % tokens != 0:
         return None
     with torch.no_grad():
-        return x.detach().reshape(tokens, -1).sum(-1, dtype = torch.float32)
+        x = x.detach().reshape(tokens, -1)
+        projection = _signature_projection(x.shape[-1], x.device)
+        # Chunked so the fp32 upcast stays bounded for long sequences.
+        return torch.cat([
+            x[a : a + _SIGNATURE_CHUNK].float() @ projection
+            for a in range(0, tokens, _SIGNATURE_CHUNK)
+        ])
 
 
 def _recomputed_routes(layer_index, ids2, signature = None):
