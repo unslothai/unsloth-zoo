@@ -508,3 +508,28 @@ def test_return_args_warns_for_padded_vocab(capsys):
     exits = [n for n in ast.walk(load_vllm) if isinstance(n, ast.If) and ast.unparse(n.test) == "return_args"
              and any(isinstance(b, ast.Return) for b in ast.walk(n))]
     assert exits and all("_warn_padded_vocab_for_serve(config)" in ast.unparse(n) for n in exits)
+
+
+def test_caller_suppression_kept_after_owned_rows_run_out(monkeypatch):
+    # Once every row Unsloth suppressed has become a token, the remaining alignment row is still
+    # the caller's: the empty ownership record must not fall back to "all rows are ours".
+    from unsloth_zoo.tokenizer_utils import _round_up_vocab
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    n0 = len(tokenizer)
+    padded = _round_up_vocab(n0 + 1, 64)
+    assert padded - (n0 + 1) >= 2
+    model.generation_config.suppress_tokens = [7, padded - 1]
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    n1 = len(tokenizer)
+    assert model.get_input_embeddings().weight.shape[0] == padded
+    assert model.config.unsloth_vocab_pad_suppressed_ids == list(range(n1, padded - 1))
+
+    add_new_tokens(model, tokenizer, new_tokens = [f"<unsloth_b{i}>" for i in range(padded - 1 - n1)])
+    assert len(tokenizer) == padded - 1
+    assert model.config.unsloth_vocab_pad_ids == [padded - 1]
+
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_c>"])
+    assert tokenizer.convert_tokens_to_ids("<unsloth_c>") == padded - 1
+    assert sorted(model.generation_config.suppress_tokens) == [7, padded - 1]
+
