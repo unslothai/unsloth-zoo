@@ -2285,6 +2285,51 @@ def torch_compiler_disable_unless_decode(func = None, *, recursive = False):
     return forward
 
 
+# (device type, index) pairs Inductor cannot compile bf16 for; None until the first fullgraph call.
+_NO_NATIVE_BF16 = None
+
+
+def _devices_without_native_bf16():
+    global _NO_NATIVE_BF16
+    if _NO_NATIVE_BF16 is None:
+        found = set()
+        try:
+            if torch.cuda.is_available() and torch.version.hip is None:
+                found = {("cuda", i) for i in range(torch.cuda.device_count())
+                         if torch.cuda.get_device_capability(i) < (8, 0)}
+        except Exception:
+            pass
+        _NO_NATIVE_BF16 = frozenset(found)
+    return _NO_NATIVE_BF16
+
+
+def _bf16_on(devices, args, kwargs):
+    for value in (*args, *kwargs.values()):
+        if (isinstance(value, torch.Tensor) and value.dtype == torch.bfloat16
+                and (value.device.type, value.device.index) in devices):
+            return True
+    return False
+
+
+def _eager_for_bf16_without_native_support(func, compiled):
+    """Run bf16 calls eagerly on GPUs without native bf16 (sm < 80: T4, V100).
+
+    Inductor skips those graphs (``SkipFrame("BF16 is not supported")``). Up to torch 2.12 a skipped fullgraph
+    call ran eagerly; from 2.13 it raises "found no compiled frames" and the frame then fails for every later
+    dtype too. GPT OSS MXFP4 training hits it on T4 in fp16, since matmul_ogs returns bf16 rows. Every other
+    call, and every call on sm_80+, is compiled as before."""
+    @functools.wraps(compiled)  # keeps the compiled markers, as _eager_during_decode does
+    def wrapper(*args, **kwargs):
+        if not torch.compiler.is_compiling():
+            devices = _NO_NATIVE_BF16 if _NO_NATIVE_BF16 is not None else _devices_without_native_bf16()
+            if devices and _bf16_on(devices, args, kwargs):
+                return func(*args, **kwargs)
+        return compiled(*args, **kwargs)
+    wrapper.__wrapped__ = func
+    wrapper._unsloth_compiled_func = getattr(compiled, "_unsloth_compiled_func", compiled)
+    return wrapper
+
+
 def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     """`torch.compile` that survives cache exhaustion under `fullgraph = True`.
 
@@ -2317,6 +2362,7 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
             compiled = _fall_back_to_eager_on_recompile_limit(
                 compiled, func, getattr(func, "__qualname__", None) or repr(func),
             )
+            return _eager_for_bf16_without_native_support(func, _eager_during_decode(func, compiled))
         return _eager_during_decode(func, compiled)
     return _decorate
 
