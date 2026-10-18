@@ -117,6 +117,7 @@ def _build_kernels():
         HAS_BIAS: tl.constexpr,
         ACTIVATION: tl.constexpr,
         HAS_SEQ_IDX: tl.constexpr,
+        PAD_NEG: tl.constexpr,
     ):
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
@@ -148,6 +149,9 @@ def _build_kernels():
             # The torch path stores the conv output in the input dtype, then SiLU.
             acc = acc.to(y.dtype.element_ty).to(tl.float32)
             acc = acc * tl.sigmoid(acc)
+        if PAD_NEG:
+            # causal_conv1d's rule: padding (seq_idx < 0) outputs 0; it never feeds a real position.
+            acc = tl.where((b_s >= 0)[:, None], acc, 0.0)
         p_y = y + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
         tl.store(p_y, acc.to(y.dtype.element_ty), mask = (o_t < T)[:, None] & m_d[None, :])
 
@@ -212,6 +216,7 @@ def _build_kernels():
         NEED_DW: tl.constexpr,
         NEED_DB: tl.constexpr,
         HAS_SEQ_IDX: tl.constexpr,
+        PAD_NEG: tl.constexpr,
     ):
         # Pass 2: dx[s] = sum_k w[W - 1 - k] g[s + k]; per-tile dw[j] = sum_t g[t] x[t - (W - 1) + j]
         # and db = sum_t g[t]; taps never cross a seq_idx boundary.
@@ -232,6 +237,9 @@ def _build_kernels():
                 m_r = r_t < T
                 if HAS_SEQ_IDX:
                     m_r = m_r & (tl.load(p_s + r_t, mask = m_r, other = -1) == b_s)
+                if PAD_NEG:
+                    # A padding output is the constant 0: no gradient flows back through it.
+                    m_r = m_r & (b_s >= 0)
                 b_g = tl.load(
                     p_g + r_t.to(tl.int64)[:, None] * stride_g_t + o_d64[None, :] * stride_g_d,
                     mask = m_r[:, None] & m_d[None, :], other = 0,
@@ -240,9 +248,12 @@ def _build_kernels():
             p_dx = dx + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
             tl.store(p_dx, b_dx.to(dx.dtype.element_ty), mask = (o_t < T)[:, None] & m_d[None, :])
         if NEED_DW or NEED_DB:
+            m_g0 = o_t < T
+            if PAD_NEG:
+                m_g0 = m_g0 & (b_s >= 0)
             b_g0 = tl.load(
                 p_g + o_t.to(tl.int64)[:, None] * stride_g_t + o_d64[None, :] * stride_g_d,
-                mask = (o_t < T)[:, None] & m_d[None, :], other = 0,
+                mask = m_g0[:, None] & m_d[None, :], other = 0,
             ).to(tl.float32)
             row = (tl.cast(i_b, tl.int64) * NT + i_t) * D + o_d
             if NEED_DB:
@@ -271,7 +282,7 @@ _BWD_CONFIG = (32, 64, 2)
 _MAX_GRID_YZ = 65535
 
 
-def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None):
+def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None, pad_negative = False):
     fwd, _ = _build_kernels()
     _BT, _BD, _NUM_WARPS = _FWD_CONFIG
     B, T, D = x_btd.shape
@@ -280,12 +291,12 @@ def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None):
     grid = ((D + _BD - 1) // _BD, (T + _BT - 1) // _BT, B)
     ptrs = (x_btd, weight, bias if bias is not None else weight, y, seq_idx if seq_idx is not None else weight)
     ints = (T, D, *x_btd.stride())
-    consts = (W, _BT, _BD, bias is not None, activation is not None, seq_idx is not None)
+    consts = (W, _BT, _BD, bias is not None, activation is not None, seq_idx is not None, pad_negative and seq_idx is not None)
     _conv_launch("fwd", fwd, grid, ptrs, ints, consts, _NUM_WARPS, (y,))
     return y
 
 
-def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_db, seq_idx = None):
+def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_db, seq_idx = None, pad_negative = False):
     _, (bwd_g, bwd_dxdw) = _build_kernels()
     _BT, _BD, _NUM_WARPS = _BWD_CONFIG
     B, T, D = x_btd.shape
@@ -312,7 +323,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
             (x_btd, weight, g, dx if dx is not None else x_btd, dw if dw is not None else weight,
              db if db is not None else weight, seq_ptr),
             (T, D, NT, *x_btd.stride(), *g.stride()),
-            (W, _BT, _BD, need_dx, need_dw, need_db, seq_idx is not None), _NUM_WARPS,
+            (W, _BT, _BD, need_dx, need_dw, need_db, seq_idx is not None, pad_negative and seq_idx is not None), _NUM_WARPS,
             tuple(t for t in (dx, dw, db) if t is not None),
         )
     if dw is not None:
@@ -742,14 +753,18 @@ def _check_seq_idx(x, seq_idx):
     return seq_idx.to(device = x.device, non_blocking = x.device.type != "cpu")
 
 
-def _eligible(x, weight, bias, activation, seq_idx = None):
+def _eligible(x, weight, bias, activation, seq_idx = None, mixed_dtypes = False):
+    # mixed_dtypes: weight / bias may differ from x (one dtype between them), as causal_conv1d's
+    # entry points allow under autocast; the kernels load every operand in its own dtype.
+    wdtype = weight.dtype if mixed_dtypes else x.dtype
     if not (
         x.is_cuda and x.dim() == 3 and x.numel() > 0 and x.dtype in _SUPPORTED_DTYPES
-        and weight.dim() == 2 and weight.dtype == x.dtype and weight.device == x.device
+        and weight.dim() == 2 and weight.dtype == wdtype and wdtype in _SUPPORTED_DTYPES
+        and weight.device == x.device
         and weight.is_contiguous() and weight.shape[0] == x.shape[1]
         and 1 <= weight.shape[1] <= _MAX_WIDTH and activation in _ACTIVATIONS
         and (bias is None or (
-            bias.dtype == x.dtype and bias.device == x.device
+            bias.dtype == wdtype and bias.device == x.device
             and bias.shape == (x.shape[1],) and bias.is_contiguous()
         ))
         and (seq_idx is None or seq_idx.device == x.device)
@@ -831,8 +846,9 @@ def _make_hub_dispatch(torch_function):
     return _own_signature(causal_conv1d_fn)
 
 
-def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
-    """Torch causal conv whose taps do not cross `seq_idx` (B, T) boundaries."""
+def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx, pad_negative = False):
+    """Torch causal conv whose taps do not cross `seq_idx` (B, T) boundaries. *pad_negative*:
+    causal_conv1d's rule that seq_idx < 0 marks padding, whose output is 0."""
     import torch.nn.functional as F
     seq_idx = _check_seq_idx(x, seq_idx)
     if seq_idx is None:
@@ -852,6 +868,8 @@ def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
     out = out.to(weight.dtype)
     if activation is not None:
         out = _act(activation)(out)
+    if pad_negative:
+        out = out * (seq_idx.to(torch.int64) >= 0).unsqueeze(1)
     return out.to(x.dtype)
 
 
@@ -965,10 +983,8 @@ _MAMBA_FUSED_MARK = "_unsloth_triton_mamba_fused"
 
 
 def _mamba_conv_operands(x_bds, weight, bias):
-    if weight.dtype != x_bds.dtype:
-        weight = weight.to(x_bds.dtype)
-    if bias is not None and bias.dtype != x_bds.dtype:
-        bias = bias.to(x_bds.dtype)
+    # Kept in their own dtype (an fp32 parameter under bf16 autocast): the kernels accumulate in
+    # fp32 and dW / db come back in the parameter dtype, as causal_conv1d's entry points do.
     return weight.contiguous(), (bias.contiguous() if bias is not None else None)
 
 
@@ -985,10 +1001,10 @@ def mamba_causal_conv1d_fwd_function(x, weight, bias, seq_idx, initial_states, f
         seq_idx = seq_idx.to(torch.int64)
     # mamba_ssm calls this inside its autograd.Function (grad mode off); a raw launch has no
     # backward, so anything autograd would track takes the differentiable torch reference.
-    if _autograd_tracks(x, weight, bias) or not _eligible(x, w, b, activation, seq_idx):
-        return _causal_conv1d_reference_seq_idx(x, w, b, activation, seq_idx)
+    if _autograd_tracks(x, weight, bias) or not _eligible(x, w, b, activation, seq_idx, mixed_dtypes = True):
+        return _causal_conv1d_reference_seq_idx(x, w, b, activation, seq_idx, pad_negative = True)
     GDN_CAUSAL_CONV1D_STATS["mamba_fused_fwd"] += 1
-    return _launch_fwd(x.transpose(1, 2), w, b, activation, seq_idx).transpose(1, 2)
+    return _launch_fwd(x.transpose(1, 2), w, b, activation, seq_idx, pad_negative = True).transpose(1, 2)
 
 
 def mamba_causal_conv1d_bwd_function(x, weight, bias, dout, seq_idx, initial_states, dfinal_states, dx, return_dinitial_states, silu_activation):
@@ -998,11 +1014,11 @@ def mamba_causal_conv1d_bwd_function(x, weight, bias, dout, seq_idx, initial_sta
     w, b = _mamba_conv_operands(x, weight, bias)
     if seq_idx is not None and seq_idx.dtype not in (torch.int32, torch.int64):
         seq_idx = seq_idx.to(torch.int64)
-    if not _autograd_tracks(x, weight, bias, dout) and _eligible(x, w, b, activation, seq_idx):
+    if not _autograd_tracks(x, weight, bias, dout) and _eligible(x, w, b, activation, seq_idx, mixed_dtypes = True):
         GDN_CAUSAL_CONV1D_STATS["mamba_fused_bwd"] += 1
         dx_btd, dw, db = _launch_bwd(
             x.transpose(1, 2), w, b, dout.transpose(1, 2), activation,
-            True, True, b is not None, seq_idx = seq_idx,
+            True, True, b is not None, seq_idx = seq_idx, pad_negative = True,
         )
         dx_new = dx_btd.transpose(1, 2)
     else:
@@ -1010,7 +1026,7 @@ def mamba_causal_conv1d_bwd_function(x, weight, bias, dout, seq_idx, initial_sta
             xr = x.detach().requires_grad_(True)
             wr = w.detach().requires_grad_(True)
             br = b.detach().requires_grad_(True) if b is not None else None
-            y = _causal_conv1d_reference_seq_idx(xr, wr, br, activation, seq_idx)
+            y = _causal_conv1d_reference_seq_idx(xr, wr, br, activation, seq_idx, pad_negative = True)
             grads = torch.autograd.grad(y, [t for t in (xr, wr, br) if t is not None], dout)
         dx_new, dw = grads[0], grads[1]
         db = grads[2] if b is not None else None

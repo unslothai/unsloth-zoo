@@ -543,3 +543,106 @@ def test_mamba_drop_ins_take_the_torch_path_when_autograd_tracks(monkeypatch):
     y = gcc.mamba_causal_conv1d_fwd_function(x, w, None, None, None, None, True)
     assert not called and y.requires_grad
     torch.testing.assert_close(y, gcc.causal_conv1d_reference(x, w, None, "silu"))
+
+
+def _oracle_seq(x, w, b, seq_idx, act = "silu"):
+    """fp64 per-position oracle with causal_conv1d's packing rules: taps stay in their segment and
+    a padding position (seq_idx < 0) outputs 0."""
+    x, w = x.double(), w.double()
+    b = b.double() if b is not None else None
+    B, D, T = x.shape
+    W = w.shape[1]
+    cols = []
+    for t in range(T):
+        acc = torch.zeros(B, D, dtype = torch.float64, device = x.device)
+        for j in range(W):
+            s = t - (W - 1) + j
+            if s < 0:
+                continue
+            same = (seq_idx[:, s] == seq_idx[:, t]).double().unsqueeze(1)
+            acc = acc + x[:, :, s] * w[:, j] * same
+        if b is not None:
+            acc = acc + b
+        if act is not None:
+            acc = torch.nn.functional.silu(acc)
+        cols.append(acc * (seq_idx[:, t] >= 0).double().unsqueeze(1))
+    return torch.stack(cols, -1)
+
+
+@requires_cuda
+@pytest.mark.parametrize("wdtype", [torch.float32, torch.bfloat16])
+def test_mamba_drop_ins_keep_the_parameter_dtype(wdtype):
+    # Autocast hands causal_conv1d a bf16 x with the fp32 parameter: no downcast, fp32 accumulate,
+    # output in x's dtype, dW / db in the parameter's dtype (causal_conv1d's DISPATCH_WTYPE).
+    B, T, D, W = 2, 70, 96, 4
+    g = torch.Generator(device = "cuda").manual_seed(0)
+    x = torch.randn(B, T, D, device = "cuda", generator = g).to(torch.bfloat16).transpose(1, 2)
+    w = (torch.randn(D, W, device = "cuda", generator = g) * 0.5).to(wdtype)
+    b = (torch.randn(D, device = "cuda", generator = g) * 0.1).to(wdtype)
+    dout = torch.randn(B, T, D, device = "cuda", generator = g).to(torch.bfloat16).transpose(1, 2)
+    before = dict(gcc.GDN_CAUSAL_CONV1D_STATS)
+    y = gcc.mamba_causal_conv1d_fwd_function(x, w, b, None, None, None, True)
+    dx, dw, db, _ = gcc.mamba_causal_conv1d_bwd_function(x, w, b, dout, None, None, None, None, False, True)
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["mamba_fused_fwd"] == before["mamba_fused_fwd"] + 1
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["mamba_fused_bwd"] == before["mamba_fused_bwd"] + 1
+    assert y.dtype == dx.dtype == torch.bfloat16 and dw.dtype == db.dtype == wdtype
+    xr, wr, br = (t.detach().double().requires_grad_(True) for t in (x, w, b))
+    ref = gcc.causal_conv1d_reference(xr, wr, br, "silu")
+    ref.backward(dout.double())
+    assert _rel(y, ref.detach()) < 2e-2
+    assert _rel(dx, xr.grad) < 2e-2
+    assert _rel(dw, wr.grad) < 2e-2
+    assert _rel(db, br.grad) < 2e-2
+
+
+@requires_cuda
+@pytest.mark.parametrize("act", ["silu", None])
+def test_negative_seq_idx_is_padding(act):
+    # causal_conv1d zeroes the output at seq_idx < 0 and never lets a padding tap reach a real
+    # position; the exact gradient of a constant 0 is 0, so padding adds nothing to dx / dW / db.
+    B, T, D, W = 2, 40, 64, 4
+    g = torch.Generator(device = "cuda").manual_seed(1)
+    x = torch.randn(B, T, D, device = "cuda", generator = g).to(torch.bfloat16).transpose(1, 2)
+    w = (torch.randn(D, W, device = "cuda", generator = g) * 0.5).to(torch.bfloat16)
+    b = (torch.randn(D, device = "cuda", generator = g) * 0.1).to(torch.bfloat16)
+    dout = torch.randn(B, T, D, device = "cuda", generator = g).to(torch.bfloat16).transpose(1, 2)
+    seq_idx = torch.zeros(B, T, dtype = torch.int32, device = "cuda")
+    seq_idx[0, :5] = -1          # left padding
+    seq_idx[0, 20:] = 1
+    seq_idx[1, 25:30] = -1       # padding between two segments
+    seq_idx[1, 30:] = 2
+    seq_idx[1, 36:] = -1         # right padding
+    silu = act is not None
+    y = gcc.mamba_causal_conv1d_fwd_function(x, w, b, seq_idx, None, None, silu)
+    dx, dw, db, _ = gcc.mamba_causal_conv1d_bwd_function(x, w, b, dout, seq_idx, None, None, None, False, silu)
+    pad = (seq_idx < 0).unsqueeze(1).expand_as(y)
+    assert torch.count_nonzero(y[pad]) == 0
+
+    xr, wr, br = (t.detach().double().requires_grad_(True) for t in (x, w, b))
+    ref = _oracle_seq(xr, wr, br, seq_idx, act)
+    ref.backward(dout.double())
+    assert _rel(y, ref.detach()) < 2e-2
+    assert _rel(dx, xr.grad) < 2e-2
+    assert _rel(dw, wr.grad) < 2e-2
+    assert _rel(db, br.grad) < 2e-2
+    # The torch reference the drop-ins fall back to follows the same rule.
+    xr2, wr2, br2 = (t.detach().double().requires_grad_(True) for t in (x, w, b))
+    ref2 = gcc._causal_conv1d_reference_seq_idx(xr2, wr2, br2, act, seq_idx, pad_negative = True)
+    ref2.backward(dout.double())
+    torch.testing.assert_close(ref2, ref.detach())
+    torch.testing.assert_close(wr2.grad, wr.grad)
+    torch.testing.assert_close(xr2.grad, xr.grad)
+
+
+@requires_cuda
+def test_mamba_drop_ins_launch_with_the_fp32_parameter(monkeypatch):
+    # No bf16 copy of an fp32 weight / bias: the kernels read the parameter itself.
+    seen = []
+    real_fwd, real_bwd = gcc._launch_fwd, gcc._launch_bwd
+    monkeypatch.setattr(gcc, "_launch_fwd", lambda x, w, b, *a, **k: seen.append((w.dtype, b.dtype)) or real_fwd(x, w, b, *a, **k))
+    monkeypatch.setattr(gcc, "_launch_bwd", lambda x, w, b, *a, **k: seen.append((w.dtype, b.dtype)) or real_bwd(x, w, b, *a, **k))
+    x = torch.randn(1, 40, 64, device = "cuda").to(torch.bfloat16).transpose(1, 2)
+    w, b = torch.randn(64, 4, device = "cuda"), torch.randn(64, device = "cuda")
+    gcc.mamba_causal_conv1d_fwd_function(x, w, b, None, None, None, True)
+    gcc.mamba_causal_conv1d_bwd_function(x, w, b, torch.randn_like(x), None, None, None, None, False, True)
+    assert seen == [(torch.float32, torch.float32)] * 2
