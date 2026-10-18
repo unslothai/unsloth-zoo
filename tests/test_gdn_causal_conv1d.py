@@ -413,3 +413,73 @@ def test_fallback_counter_is_not_read_while_tracing(monkeypatch):
     gcc._legacy_causal_conv1d_fn(x, w, None, activation = "silu")
     gcc._make_hub_dispatch(gcc.causal_conv1d_reference)(x, w, None, "silu")
     assert gcc.GDN_CAUSAL_CONV1D_STATS == before
+
+
+@requires_cuda
+@pytest.mark.parametrize("seq", [False, True])
+def test_mamba_fused_conv_functions_match_reference(seq):
+    B, T, D, W = 2, 70, 96, 4
+    g = torch.Generator(device = "cuda").manual_seed(0)
+    # mamba passes a (b, d, s) view of a channel-last slice of zxbcdt.
+    big = torch.randn(B, T, D + 10, device = "cuda", generator = g).to(torch.bfloat16)
+    x = big[:, :, 5:5 + D].transpose(1, 2)
+    w = (torch.randn(D, W, device = "cuda", generator = g) * 0.5).to(torch.bfloat16)
+    b = (torch.randn(D, device = "cuda", generator = g) * 0.1).to(torch.bfloat16)
+    dout = torch.randn(B, T, D, device = "cuda", generator = g).to(torch.bfloat16).transpose(1, 2)
+    seq_idx = None
+    if seq:
+        seq_idx = torch.zeros(B, T, dtype = torch.int32, device = "cuda")
+        seq_idx[:, 30:] = 1
+        seq_idx[1, 55:] = 2
+    y = gcc.mamba_causal_conv1d_fwd_function(x, w, b, seq_idx, None, None, True)
+    dx_buf = torch.empty_like(x)
+    dx, dw, db, dinit = gcc.mamba_causal_conv1d_bwd_function(x, w, b, dout, seq_idx, None, None, dx_buf, False, True)
+    assert dinit is None and dx is dx_buf
+
+    xr, wr, br = (t.detach().double().requires_grad_(True) for t in (x, w, b))
+    ref = gcc._causal_conv1d_reference_seq_idx(xr, wr, br, "silu", seq_idx)
+    ref.backward(dout.double())
+    assert _rel(y, ref.detach()) < 2e-2
+    assert _rel(dx, xr.grad) < 2e-2
+    assert _rel(dw, wr.grad) < 2e-2
+    assert _rel(db, br.grad) < 2e-2
+    with pytest.raises(NotImplementedError):
+        gcc.mamba_causal_conv1d_fwd_function(x, w, b, None, torch.zeros(B, D, W - 1, device = "cuda"), None, True)
+
+
+def test_install_mamba_ssm_triton_conv_only_fills_missing_functions(monkeypatch):
+    import importlib
+    import importlib.util
+    import sys
+    import types
+    pytest.importorskip("triton")
+    fake = types.ModuleType("mamba_ssm.ops.triton.ssd_combined")
+    fake.causal_conv1d_fwd_function = None
+    fake.causal_conv1d_bwd_function = None
+    monkeypatch.setitem(sys.modules, "mamba_ssm.ops.triton.ssd_combined", fake)
+    real_import = importlib.import_module
+    monkeypatch.setattr(importlib, "import_module", lambda name, *a: fake if name == fake.__name__ else real_import(name, *a))
+    real_find = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: object() if name == "mamba_ssm" else real_find(name, *a, **k))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
+    monkeypatch.delenv(gcc._KILL_SWITCH, raising = False)
+
+    assert gcc.install_mamba_ssm_triton_conv()
+    assert fake.causal_conv1d_fwd_function is gcc.mamba_causal_conv1d_fwd_function
+    assert gcc.mamba_fused_uses_triton_conv()
+    assert gcc.install_mamba_ssm_triton_conv()  # idempotent
+
+    real = lambda *a: None
+    fake.causal_conv1d_fwd_function = real
+    fake.causal_conv1d_bwd_function = real
+    assert not gcc.install_mamba_ssm_triton_conv()
+    assert fake.causal_conv1d_fwd_function is real
+
+    fake.causal_conv1d_fwd_function = fake.causal_conv1d_bwd_function = None
+    monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: True)
+    assert not gcc.install_mamba_ssm_triton_conv()
+    monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    assert not gcc.install_mamba_ssm_triton_conv()

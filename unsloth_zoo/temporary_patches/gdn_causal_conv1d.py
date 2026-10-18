@@ -63,7 +63,7 @@ _GDN_LEAVES = frozenset(
 
 GDN_CAUSAL_CONV1D_STATS = {
     "triton_fwd": 0, "triton_bwd": 0, "triton_seq_idx": 0, "fallback": 0,
-    "triton_update": 0, "update_fallback": 0,
+    "triton_update": 0, "update_fallback": 0, "mamba_fused_fwd": 0, "mamba_fused_bwd": 0,
 }
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -888,6 +888,101 @@ def _rebind_module(module, patched_decorator):
     if "causal_conv1d_fn" not in names:
         return False
     return _rebind_name(module, "causal_conv1d_fn", lambda: _legacy_causal_conv1d_fn, patched_decorator)
+
+
+# mamba_ssm's fused split path (`mamba_split_conv1d_scan_combined`, the training fast path of every
+# Mamba2 mixer) calls causal_conv1d's C++ entry points directly. These keep their signatures so the
+# fused path, with its recompute-in-backward memory savings, runs on the Triton conv instead.
+_MAMBA_FUSED_MARK = "_unsloth_triton_mamba_fused"
+
+
+def _mamba_conv_operands(x_bds, weight, bias):
+    if weight.dtype != x_bds.dtype:
+        weight = weight.to(x_bds.dtype)
+    if bias is not None and bias.dtype != x_bds.dtype:
+        bias = bias.to(x_bds.dtype)
+    return weight.contiguous(), (bias.contiguous() if bias is not None else None)
+
+
+def mamba_causal_conv1d_fwd_function(x, weight, bias, seq_idx, initial_states, final_states_out, silu_activation):
+    if initial_states is not None or final_states_out is not None:
+        raise NotImplementedError("Unsloth: Triton causal conv has no initial / final states")
+    activation = "silu" if silu_activation else None
+    w, b = _mamba_conv_operands(x, weight, bias)
+    if seq_idx is not None and seq_idx.dtype not in (torch.int32, torch.int64):
+        seq_idx = seq_idx.to(torch.int64)
+    if not _eligible(x, w, b, activation, seq_idx):
+        return _causal_conv1d_reference_seq_idx(x, w, b, activation, seq_idx)
+    GDN_CAUSAL_CONV1D_STATS["mamba_fused_fwd"] += 1
+    return _launch_fwd(x.transpose(1, 2), w, b, activation, seq_idx).transpose(1, 2)
+
+
+def mamba_causal_conv1d_bwd_function(x, weight, bias, dout, seq_idx, initial_states, dfinal_states, dx, return_dinitial_states, silu_activation):
+    if initial_states is not None or dfinal_states is not None or return_dinitial_states:
+        raise NotImplementedError("Unsloth: Triton causal conv has no initial / final states")
+    activation = "silu" if silu_activation else None
+    w, b = _mamba_conv_operands(x, weight, bias)
+    if seq_idx is not None and seq_idx.dtype not in (torch.int32, torch.int64):
+        seq_idx = seq_idx.to(torch.int64)
+    if _eligible(x, w, b, activation, seq_idx):
+        GDN_CAUSAL_CONV1D_STATS["mamba_fused_bwd"] += 1
+        dx_btd, dw, db = _launch_bwd(
+            x.transpose(1, 2), w, b, dout.transpose(1, 2), activation,
+            True, True, b is not None, seq_idx = seq_idx,
+        )
+        dx_new = dx_btd.transpose(1, 2)
+    else:
+        with torch.enable_grad():
+            xr = x.detach().requires_grad_(True)
+            wr = w.detach().requires_grad_(True)
+            br = b.detach().requires_grad_(True) if b is not None else None
+            y = _causal_conv1d_reference_seq_idx(xr, wr, br, activation, seq_idx)
+            grads = torch.autograd.grad(y, [t for t in (xr, wr, br) if t is not None], dout)
+        dx_new, dw = grads[0], grads[1]
+        db = grads[2] if b is not None else None
+    if dx is not None:
+        dx.copy_(dx_new)
+        dx_new = dx
+    dw = dw.to(weight.dtype)
+    db = db.to(bias.dtype) if db is not None else None
+    return dx_new, dw, db, None
+
+
+setattr(mamba_causal_conv1d_fwd_function, _MAMBA_FUSED_MARK, True)
+setattr(mamba_causal_conv1d_bwd_function, _MAMBA_FUSED_MARK, True)
+
+
+def mamba_fused_uses_triton_conv():
+    module = sys.modules.get("mamba_ssm.ops.triton.ssd_combined")
+    return module is not None and getattr(vars(module).get("causal_conv1d_fwd_function"), _MAMBA_FUSED_MARK, False)
+
+
+def install_mamba_ssm_triton_conv():
+    """Point mamba_ssm's fused split path at the Triton conv when causal_conv1d is unusable.
+    True when installed (or already installed); False leaves the caller's fallback in charge."""
+    if _disabled() or _real_causal_conv1d_available():
+        return False
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        return False
+    try:
+        import triton  # noqa: F401
+        if importlib.util.find_spec("mamba_ssm") is None:
+            return False
+        ssd_combined = importlib.import_module("mamba_ssm.ops.triton.ssd_combined")
+    except Exception:
+        return False
+    names = vars(ssd_combined)
+    if getattr(names.get("causal_conv1d_fwd_function"), _MAMBA_FUSED_MARK, False):
+        return True
+    if names.get("causal_conv1d_fwd_function", None) is not None or names.get("causal_conv1d_bwd_function", None) is not None:
+        return False  # a real (or other) implementation is bound: leave it
+    if "causal_conv1d_fwd_function" not in names:
+        return False  # not the mamba_ssm layout this was written against
+    ssd_combined.causal_conv1d_fwd_function = mamba_causal_conv1d_fwd_function
+    ssd_combined.causal_conv1d_bwd_function = mamba_causal_conv1d_bwd_function
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: mamba_ssm fused split path uses the Triton causal conv")
+    return True
 
 
 def patch_gdn_causal_conv1d():
