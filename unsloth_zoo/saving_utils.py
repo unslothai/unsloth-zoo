@@ -6715,20 +6715,35 @@ def _convert_lora_keys_to_safetensor_format(
             # New LoRA keys, old shard. Where a target has several sources, prefer one whose
             # result the shard can back: taking the first match blind reverses a two-renaming
             # model onto a prefix its checkpoint does not use.
+            backed_key = _reverse_renamed_backed_key(
+                converted_key_for_lookup, reverse_mapping, shard_key_set, shard_valid_prefixes,
+            )
             fallback_key = None
-            for pattern, literals in reverse_mapping.items():
-                for literal in literals:
-                    temp_key, n_replace = re.subn(pattern, literal, converted_key_for_lookup)
-                    if n_replace == 0: continue
-                    if fallback_key is None: fallback_key = temp_key
-                    if _lora_key_has_backing(temp_key, shard_key_set,
-                                             valid_prefixes = shard_valid_prefixes):
-                        converted_key_for_lookup = temp_key
-                        applied_conversion_for_this_key = True
+            if backed_key is None:
+                for pattern, literals in reverse_mapping.items():
+                    for literal in literals:
+                        temp_key, n_replace = re.subn(pattern, literal, converted_key_for_lookup)
+                        if n_replace == 0: continue
+                        fallback_key = temp_key
                         break
-                if applied_conversion_for_this_key: break
-            if not applied_conversion_for_this_key and fallback_key is not None:
-                converted_key_for_lookup = fallback_key
+                    if fallback_key is not None: break
+            if backed_key is not None or fallback_key is not None:
+                converted_key_for_lookup = backed_key if backed_key is not None else fallback_key
+                applied_conversion_for_this_key = True
+
+        elif (
+            lora_key_format_assumed == "new"
+            and not _lora_key_has_backing(converted_key_for_lookup, shard_key_set,
+                                          valid_prefixes = shard_valid_prefixes)
+        ):
+            # detect_keys_format only sees start-anchored renamings, so a shard holding old names
+            # under an unanchored one (bailing_hybrid `\.attention\.` -> `.self_attn.`) reads as
+            # "new" unless it also holds an anchored key. Reverse only onto a tensor it holds.
+            backed_key = _reverse_renamed_backed_key(
+                converted_key_for_lookup, reverse_mapping, shard_key_set, shard_valid_prefixes,
+            )
+            if backed_key is not None:
+                converted_key_for_lookup = backed_key
                 applied_conversion_for_this_key = True
 
         elif lora_key_format_assumed == "old" and shard_key_format == "new":
@@ -6750,6 +6765,36 @@ def _convert_lora_keys_to_safetensor_format(
         converted_lora_weights_output, mapped_from_original, lora_weights, safetensor_keys,
         key_set = shard_key_set, valid_prefixes = shard_valid_prefixes,
     )
+pass
+
+
+def _reverse_renamed_backed_key(key, reverse_mapping, key_set, valid_prefixes, max_depth = 3):
+    r"""The checkpoint key a renamed module path loads from, if the shard backs one.
+
+    Renamings chain: bailing_hybrid loads `attention.dense` through `\.attention\.` ->
+    `.self_attn.` and then `\.self_attn\.dense\.` -> `.self_attn.o_proj.`, so its MLA
+    `self_attn.o_proj` is two reversals away. Breadth first, so a single reversal still wins.
+    """
+    frontier, seen = [key], {key}
+    for _ in range(max_depth):
+        next_frontier = []
+        for current in frontier:
+            for pattern, literals in reverse_mapping.items():
+                for literal in literals:
+                    candidate, n_replace = re.subn(pattern, literal, current)
+                    if n_replace == 0:
+                        # A target ending in "." (`.self_attn.o_proj.`) needs the tensor suffix.
+                        candidate, n_replace = re.subn(pattern, literal, current + ".weight")
+                        if n_replace == 0 or not candidate.endswith(".weight"): continue
+                        candidate = candidate[: -len(".weight")]
+                    if candidate in seen: continue
+                    if _lora_key_has_backing(candidate, key_set, valid_prefixes = valid_prefixes):
+                        return candidate
+                    seen.add(candidate)
+                    next_frontier.append(candidate)
+        frontier = next_frontier
+        if not frontier: break
+    return None
 pass
 
 
