@@ -36,7 +36,7 @@ def _merged_vs_peft(tmp_path, target_modules):
 
     H.set_offline_cpu_env()
     if not H.family_available("llama"):
-        pytest.skip("llama unavailable")
+        pytest.skip(reason = "installed transformers has no llama model_type")
     base_dir = os.path.join(str(tmp_path), "base")
     out_dir = os.path.join(str(tmp_path), "merged")
 
