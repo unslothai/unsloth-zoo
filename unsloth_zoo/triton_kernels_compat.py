@@ -220,11 +220,12 @@ class TritonKernelsBackend:
                 precision_config = precision_config, **kwargs,
             )
         # matmul leaves the k-sum to the caller. As matmul_ogs (split_k = 1): rows in the output dtype, fp32 sum.
+        # torch sums bf16 / fp16 in fp32 and rounds once, so no (tokens, hidden) fp32 temporary is needed.
         rows = self.mm.matmul(
             x, weight, bias, a_ragged_metadata = routing_data.expt_data, scatter_indx = scatter_indx.dst_indx,
             precision_config = precision_config, **kwargs,
         )
-        return rows.view(-1, k, rows.shape[-1]).sum(1, dtype = torch.float32).to(rows.dtype)
+        return rows.view(-1, k, rows.shape[-1]).sum(1)
 
     def gate_up(self, x, weight, bias, routing_data, gather_indx, precision_config, fused_activation = None):
         return self.matmul_ogs(
@@ -354,9 +355,18 @@ def triton_kernels_alias():
             sys.modules.pop("triton_kernels", None)
 
 
+def convert_layout_shared(tensor_module, tensor, layout, **layout_opts):
+    """``convert_layout`` that keeps the storage when ``tensor`` already has ``layout``. release/3.7.x copies even
+    then (3.8 returns the tensor), which duplicates every packed expert stack and, inside a CUDA graph tree's
+    warmup, leaves the copy as an untracked allocation in the graph pool."""
+    if not layout_opts and not isinstance(layout, type) and getattr(tensor.storage, "layout", None) == layout:
+        return tensor
+    return tensor_module.convert_layout(tensor, layout, **layout_opts)
+
+
 def mxfp4_ogs_weight(blocks, scales):
     """GPT-OSS checkpoint (E, out, in / 32, 16) blocks + (E, out, in / 32) scales -> (weight, PrecisionConfig)
-    for matmul_ogs, with the (E, in, out) logical shape its kernels expect. Copies: the layout swizzles."""
+    for matmul_ogs, with the (E, in, out) logical shape its kernels expect. Copies only when the layout swizzles."""
     from unsloth_zoo.temporary_patches.gpt_oss import _mxfp4_layout_arguments
     E, N, G, _ = blocks.shape
     with triton_kernels_alias() as tk:
@@ -364,9 +374,9 @@ def mxfp4_ogs_weight(blocks, scales):
         tensor, layout = backend.tensor, backend.layout
         values = blocks.reshape(E, N, G * 16).transpose(-2, -1)
         value_layout, value_opts, strided = _mxfp4_layout_arguments(layout, values)
-        weight = tensor.convert_layout(tensor.wrap_torch_tensor(values, dtype = tensor.FP4), value_layout, **value_opts)
+        weight = convert_layout_shared(tensor, tensor.wrap_torch_tensor(values, dtype = tensor.FP4), value_layout, **value_opts)
         weight.shape = torch.Size([E, G * 32, N])
-        scale = tensor.convert_layout(tensor.wrap_torch_tensor(scales.transpose(-2, -1)), strided)
+        scale = convert_layout_shared(tensor, tensor.wrap_torch_tensor(scales.transpose(-2, -1)), strided)
         return weight, backend.precision(scale)
 
 

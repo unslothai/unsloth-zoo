@@ -629,3 +629,93 @@ def test_dense_training_follows_the_copy_the_patched_forward_launches(fresh):
     module.__dict__["_unsloth_tk_root"] = "triton_kernels"
     assert go._ogs_root_for(weight, routing_data, module) == "triton_kernels"
     assert go._ogs_backend_for(weight, routing_data, module).name == "triton_kernels"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA for allocator peaks")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("k", [1, 2, 4, 8])
+def test_new_generation_k_sum_needs_no_fp32_temporary(k, dtype):
+    # The k-sum of the down rows must not materialise a (tokens, hidden) fp32 copy: 3.5's matmul_ogs does not.
+    import types as _types
+    T, H = 2048, 2880
+    gen = torch.Generator(device = "cuda").manual_seed(k)
+    rows = torch.randn(T * k, H, device = "cuda", generator = gen).to(dtype)
+    backend = object.__new__(tkc.TritonKernelsBackend)
+    backend.api = tkc.API_MATMUL_RAGGED
+    backend.mm = _types.SimpleNamespace(matmul = lambda *args, **kwargs: rows)
+    routing_data = _types.SimpleNamespace(n_expts_act = k, expt_data = None)
+    scatter = _types.SimpleNamespace(src_indx = None, dst_indx = None)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    out = backend.matmul_ogs(rows, None, None, routing_data, scatter_indx = scatter)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    assert out.dtype == dtype and out.shape == (T, H)
+    assert peak <= out.numel() * out.element_size() * 1.25, peak
+    want = rows.view(T, k, H).sum(1, dtype = torch.float32).to(dtype)
+    assert torch.equal(out.view(torch.int16), want.view(torch.int16))
+
+
+def test_strided_conversion_to_the_layout_already_held_keeps_the_storage():
+    # release/3.7.x's convert_layout always copies: the packed stacks must stay shared (no duplicate, no allocation
+    # inside a CUDA graph tree warmup).
+    @dataclasses.dataclass(frozen = True)
+    class StridedLayout:
+        major_dim: int = -1
+
+    calls = []
+
+    def convert_layout(tensor, layout, **opts):
+        calls.append(layout)
+        return types.SimpleNamespace(storage = types.SimpleNamespace(data = tensor.storage.data.clone(), layout = layout))
+
+    tensor_module = types.SimpleNamespace(convert_layout = convert_layout)
+    data = torch.zeros(2, 4, 3).transpose(-2, -1)
+    held = types.SimpleNamespace(storage = types.SimpleNamespace(data = data, layout = StridedLayout(-2)))
+    assert tkc.convert_layout_shared(tensor_module, held, StridedLayout(-2)) is held and not calls
+    other = tkc.convert_layout_shared(tensor_module, held, StridedLayout(-1))
+    assert calls == [StridedLayout(-1)] and other.storage.data.data_ptr() != data.data_ptr()
+    # A class contract (old API) or extra options always go through convert_layout.
+    tkc.convert_layout_shared(tensor_module, held, StridedLayout)
+    tkc.convert_layout_shared(tensor_module, held, StridedLayout(-2), mx_axis = 1)
+    assert len(calls) == 3
+
+
+def test_hopper_value_layout_gets_a_negative_k_axis_on_dataclass_layouts():
+    # 3.7+ HopperMXValueLayout asserts mx_axis in (-1, -2); 3.5 / 3.6 take the positional axis 1 of (E, K, N).
+    seen = []
+
+    @dataclasses.dataclass(frozen = True)
+    class StridedLayout:
+        major_dim: int = -1
+
+    @dataclasses.dataclass(frozen = True)
+    class HopperMXValueLayout:
+        mx_axis: int
+        mma_version: int = 3
+
+        def __post_init__(self):
+            assert self.mx_axis in [-1, -2]
+
+    def make_default_matmul_mxfp4_w_layout(mx_axis):
+        seen.append(mx_axis)
+        return HopperMXValueLayout(mx_axis = mx_axis, mma_version = 3)
+
+    layout = types.SimpleNamespace(
+        StridedLayout = StridedLayout, HopperMXValueLayout = HopperMXValueLayout,
+        make_default_matmul_mxfp4_w_layout = make_default_matmul_mxfp4_w_layout,
+    )
+    value_layout, opts, strided = go._mxfp4_layout_arguments(layout, torch.zeros(1, 4, 2, dtype = torch.uint8))
+    assert seen == [-2] and value_layout == HopperMXValueLayout(-2) and opts == {} and strided == StridedLayout(-2)
+
+    class OldStrided:  # 3.6: classes taking the shape, positional axis
+        pass
+
+    seen.clear()
+    old = types.SimpleNamespace(
+        StridedLayout = OldStrided,
+        make_default_matmul_mxfp4_w_layout = lambda mx_axis: (seen.append(mx_axis), (OldStrided, {}))[1],
+    )
+    go._mxfp4_layout_arguments(old, torch.zeros(1, 4, 2, dtype = torch.uint8))
+    assert seen == [1]

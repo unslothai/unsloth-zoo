@@ -208,13 +208,15 @@ _MXFP4_STRIDED_VALUES_WARNED = False
 def _mxfp4_layout_arguments(layout_module, w):
     """(layout_arg, ctor_kwargs, strided_arg) for this weight. strided_arg is a class or
     an instance to match the installed convert_layout, and is reused for the scales."""
-    selection = layout_module.make_default_matmul_mxfp4_w_layout(mx_axis = 1)
+    StridedLayout = layout_module.StridedLayout
+    dataclass_layouts = "major_dim" in getattr(StridedLayout, "__dataclass_fields__", {})
+    # The K axis of the (E, K, N) stack: 3.7+ layouts take it as a negative axis (HopperMXValueLayout asserts it).
+    selection = layout_module.make_default_matmul_mxfp4_w_layout(mx_axis = -2 if dataclass_layouts else 1)
     class_contract = _mxfp4_layout_selection_is_class_contract(selection)
     value_layout, value_layout_opts = _normalize_mxfp4_value_layout(selection)
-    StridedLayout = layout_module.StridedLayout
     if class_contract:
         strided_argument = StridedLayout
-    elif "major_dim" in getattr(StridedLayout, "__dataclass_fields__", {}):
+    elif dataclass_layouts:
         # Values and scales arrive transposed (unit stride on dim -2): keep that order, no copy.
         strided_argument = StridedLayout(major_dim = -2)
     else:
@@ -2220,9 +2222,10 @@ def _ogs_weight(blocks, scales, in_dim):
     E, out_dim = blocks.shape[:2]
     rows = blocks.reshape(E, out_dim, -1)
     value_layout, value_opts, strided = _mxfp4_layout_arguments(L, rows)
-    w = T.convert_layout(T.wrap_torch_tensor(rows.transpose(-2, -1), dtype = T.FP4), value_layout, **value_opts)
+    from unsloth_zoo.triton_kernels_compat import convert_layout_shared
+    w = convert_layout_shared(T, T.wrap_torch_tensor(rows.transpose(-2, -1), dtype = T.FP4), value_layout, **value_opts)
     w.shape = torch.Size([E, in_dim, out_dim])
-    w_scale = T.convert_layout(T.wrap_torch_tensor(scales.reshape(E, out_dim, -1).transpose(-2, -1)), strided)
+    w_scale = convert_layout_shared(T, T.wrap_torch_tensor(scales.reshape(E, out_dim, -1).transpose(-2, -1)), strided)
     precision = backend.precision(w_scale)
     _OGS_WEIGHTS[key] = (w, precision)
     return w, precision
