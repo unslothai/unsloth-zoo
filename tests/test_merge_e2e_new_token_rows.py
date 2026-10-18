@@ -48,8 +48,7 @@ def _merged_vs_peft(tmp_path, target_modules, new_vocab = NEW_VOCAB, tie = False
     model.save_pretrained(base_dir, safe_serialization = True)
     model.config._name_or_path = base_dir
 
-    # add_new_tokens: grow (or reuse the last spare rows), then seed the new rows from the
-    # others, offset so neither a zero row nor the checkpoint row can pass.
+    # Offset so neither a zero row nor the checkpoint row can pass.
     model.resize_token_embeddings(new_vocab)
     new_rows = slice(H._VOCAB, new_vocab) if new_vocab > H._VOCAB else slice(new_vocab - 4, new_vocab)
     with torch.no_grad():
@@ -75,7 +74,6 @@ def _merged_vs_peft(tmp_path, target_modules, new_vocab = NEW_VOCAB, tie = False
     return H.read_safetensors_dir(out_dir), expected, out_dir
 
 
-# The untargeted vocab matrix was resized too, so both must carry the new rows.
 @pytest.mark.parametrize("target_modules", [
     ["embed_tokens", "lm_head", "q_proj"], ["lm_head"], ["embed_tokens"],
 ])
@@ -177,7 +175,6 @@ def test_live_vocab_rows_edit_in_place_without_copying_the_table():
     live[3] += 1
     before = W.clone()
     out = _with_live_vocab_rows(W, live)
-    # Same-size edits land in the caller's buffer instead of a full copy.
     assert out is W and torch.equal(out[3], live[3].float())
     assert torch.equal(out[:3], before[:3]) and torch.equal(out[4:], before[4:])
 
@@ -199,8 +196,6 @@ def _tiny(arch):
     return getattr(T, arch)(**common)
 
 
-# Phi's lm_head has a bias that resizes with the vocab. A tied lm_head adapter merges onto the
-# embed_tokens key, so only module identity (not the key name) marks it as a vocab matrix.
 @pytest.mark.parametrize("arch, target_modules, new_vocab, tie", [
     ("PhiConfig", ["q_proj"], NEW_VOCAB, False),
     ("PhiConfig", ["lm_head", "q_proj"], NEW_VOCAB, False),

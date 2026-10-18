@@ -523,18 +523,15 @@ pass
 
 
 def _with_live_vocab_rows(W, live, chunk = 8192):
-    # add_new_tokens seeds rows only in memory (grown, or reusing a padded checkpoint's spare
-    # rows). A frozen live row that differs from the checkpoint cast to its dtype was changed there.
-    # Float8 / integer live weights are codes with a separate scale, not comparable values.
+    # Frozen live rows differ from the checkpoint only where add_new_tokens seeded them. Edits W in
+    # place (callers pass a private buffer); float8 / int live weights are scaled codes, skipped.
     if not live.dtype.is_floating_point or live.element_size() < 2: return W
-    # Edits W in place (callers pass a private merge buffer or a freshly read shard tensor);
-    # only a grown vocab allocates.
     rows, old = live.shape[0], W.shape[0]
     out = W if rows == old else W[:rows] if rows < old else torch.cat([W, W.new_zeros(rows - old, *W.shape[1:])])
     for i in range(0, min(rows, old), chunk):
         k = min(i + chunk, rows, old)
         live_rows = live[i:k].detach()
-        # Compared on W's device: an unchanged CPU table never stages chunks on the accelerator.
+        # On W's device, so an unchanged CPU table is never staged on the accelerator.
         live_rows = live_rows.to(W.device)
         changed = (W[i:k].to(live_rows.dtype) != live_rows).reshape(k - i, -1).any(1)
         if changed.any(): out[i:k][changed] = live_rows.to(W.dtype)[changed]
@@ -1016,9 +1013,7 @@ def _get_bias_overrides(biases, safetensor_keys, model_class_name):
 pass
 
 def _untargeted_vocab_modules(base_model, lora_weights, tie_word_embeddings):
-    # add_new_tokens changes vocab matrices in memory; one with no adapter or saved copy would
-    # keep the checkpoint's rows while config.json takes the new vocab_size. Returns
-    # {name: (weight, bias)}; a LoRA-merged head contributes only its bias (bias="none" skips it).
+    # {name: (weight, bias)} of vocab layers nothing else writes; a LoRA-merged head gives only its bias.
     modules = []
     for getter in ("get_input_embeddings", "get_output_embeddings"):
         try: modules.append(getattr(base_model, getter)())
@@ -1026,7 +1021,6 @@ def _untargeted_vocab_modules(base_model, lora_weights, tie_word_embeddings):
     named = [(n, m) for n, m in base_model.named_modules() if any(m is x for x in modules)]
     saved = [getattr(m, "modules_to_save", None) is not None for _, m in named]
     merged = [n in lora_weights and not s for (n, _), s in zip(named, saved)]
-    # Tied: the merged or saved partner already writes the one shared weight.
     skip_weights = tie_word_embeddings and any(m or s for m, s in zip(merged, saved))
     out = {}
     for (name, module), is_saved, is_merged in zip(named, saved, merged):
@@ -1043,7 +1037,6 @@ def _untargeted_vocab_modules(base_model, lora_weights, tie_word_embeddings):
 pass
 
 def _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name, bias_overrides = ()):
-    # Weights keyed by module (the merge loop's lora_key), biases by their full `.bias` shard key.
     # A bias the trained-bias overrides already write (lora_bias, bias="all") stays theirs.
     if not vocab_modules: return {}
     overrides = dict(_convert_lora_keys_to_safetensor_format(
