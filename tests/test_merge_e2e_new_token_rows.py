@@ -94,3 +94,34 @@ def test_shrunk_vocab_merges_onto_the_kept_rows():
     stats = LoraStats(None, A, B, 0.5)
     merged = _merge_lora(W.clone(), stats, "lm_head")
     assert torch.allclose(merged.cpu(), W[:6] + 0.5 * (B @ A), atol = 1e-6)
+
+
+@pytest.mark.parametrize("quant_type", [None, "fp8", "mxfp4"])
+def test_untargeted_vocab_override_reaches_every_shard_writer(tmp_path, quant_type):
+    from collections import defaultdict
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora, LoraStats
+
+    torch.manual_seed(0)
+    old = torch.randn(64, 8, dtype = torch.bfloat16)
+    live = torch.cat([old, torch.randn(8, 8, dtype = torch.bfloat16)])
+    shard = tmp_path / "model.safetensors"
+    tensors = {"lm_head.weight": old, "model.norm.weight": torch.ones(8, dtype = torch.bfloat16)}
+    if quant_type == "fp8":
+        tensors["model.layers.0.mlp.down_proj.weight"] = torch.randn(8, 8).to(torch.float8_e4m3fn)
+        tensors["model.layers.0.mlp.down_proj.weight_scale"] = torch.ones(8, 1, dtype = torch.bfloat16)
+    save_file(tensors, str(shard), metadata = {"format": "pt"})
+
+    _merge_and_overwrite_lora(
+        save_directory = str(tmp_path),
+        filename = "model.safetensors",
+        lora_weights = defaultdict(lambda: LoraStats(None, None, None, 0)),
+        output_dtype = torch.bfloat16,
+        model_class_name = "LlamaForCausalLM",
+        base_model_is_quantized = quant_type is not None,
+        quant_type = quant_type,
+        vocab_weights = {"lm_head": live},
+    )
+    with safe_open(str(shard), framework = "pt", device = "cpu") as f:
+        assert torch.equal(f.get_tensor("lm_head.weight"), live)
