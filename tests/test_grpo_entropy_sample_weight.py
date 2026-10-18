@@ -79,3 +79,21 @@ def test_excluded_rows_do_not_set_the_entropy_quantile():
     assert torch.equal(seen[-1], torch.tensor([[1.0] * 4, [0.0] * 4, [1.0] * 4]))
     rr.grpo_high_entropy_mask(Trainer(), entropies, mask, 0.8)
     assert torch.equal(seen[-1], mask)
+
+
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
+def test_legacy_bonus_of_kept_rows_matches_running_them_alone(loss_type):
+    # TRL 1.8 / 1.9 divide the bonus by the policy normaliser; excluded rows must not dilute it.
+    gen = torch.Generator().manual_seed(5)
+    mask = torch.ones((2, 6), dtype = torch.long)
+    entropies = torch.rand(2, 6, generator = gen, dtype = torch.float64)
+    # sample_weight as _unsloth_grpo_sample_weight builds it: 1 / kept tokens, 0 for excluded rows.
+    kwargs = _kwargs(torch.tensor([1.0 / 6, 0.0]), loss_type)
+    weights = rr.grpo_entropy_bonus_weights(mask, None, 0.2, kwargs, trl_version = "1.8.0")
+    alone = dict(_kwargs(None, loss_type), num_items_in_batch = torch.tensor(6.0))
+    want = rr.grpo_entropy_bonus_weights(mask[:1], None, 0.2, alone, trl_version = "1.8.0")
+    torch.testing.assert_close((weights[:1].double() * entropies[:1]).sum(), (want.double() * entropies[:1]).sum())
+    assert (weights[1] == 0).all()
+    # No exclusion: identical to the num_items_in_batch normaliser.
+    full = rr.grpo_entropy_bonus_weights(mask, None, 0.2, _kwargs(torch.full((2,), 1.0 / 12), loss_type), trl_version = "1.8.0")
+    torch.testing.assert_close(full, rr.grpo_entropy_bonus_weights(mask, None, 0.2, _kwargs(None, loss_type), trl_version = "1.8.0"))
