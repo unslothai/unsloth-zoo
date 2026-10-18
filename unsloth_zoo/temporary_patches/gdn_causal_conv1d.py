@@ -152,102 +152,121 @@ def _build_kernels():
         tl.store(p_y, acc.to(y.dtype.element_ty), mask = (o_t < T)[:, None] & m_d[None, :])
 
     @triton.jit
-    def _causal_conv1d_bwd_kernel(
-        x, weight, bias, dy, dx, dw, db, seq_idx,
-        T, D, NT,
+    def _causal_conv1d_bwd_g_kernel(
+        x, weight, bias, dy, g, seq_idx,
+        T, D,
         stride_x_b, stride_x_t, stride_x_d,
         stride_dy_b, stride_dy_t, stride_dy_d,
         W: tl.constexpr,
         BT: tl.constexpr,
         BD: tl.constexpr,
         HAS_BIAS: tl.constexpr,
-        ACTIVATION: tl.constexpr,
-        NEED_DX: tl.constexpr,
-        NEED_DW: tl.constexpr,
-        NEED_DB: tl.constexpr,
         HAS_SEQ_IDX: tl.constexpr,
     ):
+        # Pass 1: g = d(loss)/d(pre-activation) through SiLU, once per position (the pre-activation
+        # is recomputed exactly as the forward does), stored channel-last in the input dtype.
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
         o_d = i_d * BD + tl.arange(0, BD)
         m_d = o_d < D
         o_d64 = o_d.to(tl.int64)
         p_x = x + tl.cast(i_b, tl.int64) * stride_x_b
-        p_dy = dy + tl.cast(i_b, tl.int64) * stride_dy_b
         if HAS_SEQ_IDX:
             p_s = seq_idx + tl.cast(i_b, tl.int64) * T
             b_s = tl.load(p_s + o_t, mask = o_t < T, other = -1)
-        if HAS_BIAS:
-            b_bias = tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)
-
-        b_dx = tl.zeros((BT, BD), dtype = tl.float32)
-        # dx[s] += w[W - 1 - k] * g[s + k], g = d(loss)/d(pre-activation).
-        for k in tl.static_range(W):
-            r_t = o_t + k
-            m_r = r_t < T
+        acc = tl.zeros((BT, BD), dtype = tl.float32)
+        for i_w in tl.static_range(W):
+            s_t = o_t - (W - 1) + i_w
+            m_t = (s_t >= 0) & (s_t < T)
             if HAS_SEQ_IDX:
-                b_sr = tl.load(p_s + r_t, mask = m_r, other = -1)
-            b_g = tl.load(
-                p_dy + r_t.to(tl.int64)[:, None] * stride_dy_t + o_d64[None, :] * stride_dy_d,
-                mask = m_r[:, None] & m_d[None, :], other = 0,
+                m_t = m_t & (tl.load(p_s + s_t, mask = m_t, other = -2) == b_s)
+            b_x = tl.load(
+                p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
+                mask = m_t[:, None] & m_d[None, :], other = 0,
             ).to(tl.float32)
-            if ACTIVATION:
-                b_pre = tl.zeros((BT, BD), dtype = tl.float32)
-                for j in tl.static_range(W):
-                    s_t = r_t - (W - 1) + j
-                    m_t = (s_t >= 0) & (s_t < T)
-                    if HAS_SEQ_IDX:
-                        m_t = m_t & (tl.load(p_s + s_t, mask = m_t, other = -2) == b_sr)
-                    m = m_t[:, None] & m_d[None, :]
-                    b_xs = tl.load(
-                        p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
-                        mask = m, other = 0,
-                    ).to(tl.float32)
-                    b_wj = tl.load(weight + o_d * W + j, mask = m_d, other = 0).to(tl.float32)
-                    b_pre += b_xs * b_wj[None, :]
-                if HAS_BIAS:
-                    b_pre += b_bias[None, :]
-            if ACTIVATION:
-                b_pre = b_pre.to(dx.dtype.element_ty).to(tl.float32)
-                b_sig = tl.sigmoid(b_pre)
-                b_g = b_g * b_sig * (1 + b_pre * (1 - b_sig))
-                # torch's silu_backward stores the gradient in the input dtype.
-                b_g = b_g.to(dx.dtype.element_ty).to(tl.float32)
-            if k == 0:
-                if NEED_DB:
-                    tl.store(db + (tl.cast(i_b, tl.int64) * NT + i_t) * D + o_d, tl.sum(b_g, 0), mask = m_d)
-                if NEED_DW:
-                    # dw[j] = sum_t g[t] * x[t - (W - 1) + j] over this tile's rows.
-                    for j in tl.static_range(W):
-                        s_t = o_t - (W - 1) + j
-                        m_t = (s_t >= 0) & (s_t < T)
-                        if HAS_SEQ_IDX:
-                            m_t = m_t & (tl.load(p_s + s_t, mask = m_t, other = -2) == b_s)
-                        m = m_t[:, None] & m_d[None, :]
-                        b_xs = tl.load(
-                            p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
-                            mask = m, other = 0,
-                        ).to(tl.float32)
-                        tl.store(
-                            dw + ((tl.cast(i_b, tl.int64) * NT + i_t) * D + o_d) * W + j,
-                            tl.sum(b_g * b_xs, 0), mask = m_d,
-                        )
-            if NEED_DX:
-                b_wk = tl.load(weight + o_d * W + (W - 1 - k), mask = m_d, other = 0).to(tl.float32)
-                if HAS_SEQ_IDX:
-                    b_g = tl.where((b_sr == b_s)[:, None], b_g, 0.0)
-                b_dx += b_g * b_wk[None, :]
+            acc += b_x * tl.load(weight + o_d * W + i_w, mask = m_d, other = 0).to(tl.float32)[None, :]
+        if HAS_BIAS:
+            acc += tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)[None, :]
+        m = (o_t < T)[:, None] & m_d[None, :]
+        b_dy = tl.load(
+            dy + tl.cast(i_b, tl.int64) * stride_dy_b + o_t.to(tl.int64)[:, None] * stride_dy_t + o_d64[None, :] * stride_dy_d,
+            mask = m, other = 0,
+        ).to(tl.float32)
+        pre = acc.to(g.dtype.element_ty).to(tl.float32)
+        sig = tl.sigmoid(pre)
+        # torch's silu_backward stores the gradient in the input dtype.
+        b_g = b_dy * sig * (1 + pre * (1 - sig))
+        p_g = g + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
+        tl.store(p_g, b_g.to(g.dtype.element_ty), mask = m)
+
+    @triton.jit
+    def _causal_conv1d_bwd_dxdw_kernel(
+        x, weight, g, dx, dw, db, seq_idx,
+        T, D, NT,
+        stride_x_b, stride_x_t, stride_x_d,
+        stride_g_b, stride_g_t, stride_g_d,
+        W: tl.constexpr,
+        BT: tl.constexpr,
+        BD: tl.constexpr,
+        NEED_DX: tl.constexpr,
+        NEED_DW: tl.constexpr,
+        NEED_DB: tl.constexpr,
+        HAS_SEQ_IDX: tl.constexpr,
+    ):
+        # Pass 2: dx[s] = sum_k w[W - 1 - k] g[s + k]; per-tile dw[j] = sum_t g[t] x[t - (W - 1) + j]
+        # and db = sum_t g[t]; taps never cross a seq_idx boundary.
+        i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        o_t = i_t * BT + tl.arange(0, BT)
+        o_d = i_d * BD + tl.arange(0, BD)
+        m_d = o_d < D
+        o_d64 = o_d.to(tl.int64)
+        p_x = x + tl.cast(i_b, tl.int64) * stride_x_b
+        p_g = g + tl.cast(i_b, tl.int64) * stride_g_b
+        if HAS_SEQ_IDX:
+            p_s = seq_idx + tl.cast(i_b, tl.int64) * T
+            b_s = tl.load(p_s + o_t, mask = o_t < T, other = -1)
         if NEED_DX:
+            b_dx = tl.zeros((BT, BD), dtype = tl.float32)
+            for k in tl.static_range(W):
+                r_t = o_t + k
+                m_r = r_t < T
+                if HAS_SEQ_IDX:
+                    m_r = m_r & (tl.load(p_s + r_t, mask = m_r, other = -1) == b_s)
+                b_g = tl.load(
+                    p_g + r_t.to(tl.int64)[:, None] * stride_g_t + o_d64[None, :] * stride_g_d,
+                    mask = m_r[:, None] & m_d[None, :], other = 0,
+                ).to(tl.float32)
+                b_dx += b_g * tl.load(weight + o_d * W + (W - 1 - k), mask = m_d, other = 0).to(tl.float32)[None, :]
             p_dx = dx + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
             tl.store(p_dx, b_dx.to(dx.dtype.element_ty), mask = (o_t < T)[:, None] & m_d[None, :])
+        if NEED_DW or NEED_DB:
+            b_g0 = tl.load(
+                p_g + o_t.to(tl.int64)[:, None] * stride_g_t + o_d64[None, :] * stride_g_d,
+                mask = (o_t < T)[:, None] & m_d[None, :], other = 0,
+            ).to(tl.float32)
+            row = (tl.cast(i_b, tl.int64) * NT + i_t) * D + o_d
+            if NEED_DB:
+                tl.store(db + row, tl.sum(b_g0, 0), mask = m_d)
+            if NEED_DW:
+                for j in tl.static_range(W):
+                    s_t = o_t - (W - 1) + j
+                    m_t = (s_t >= 0) & (s_t < T)
+                    if HAS_SEQ_IDX:
+                        m_t = m_t & (tl.load(p_s + s_t, mask = m_t, other = -2) == b_s)
+                    b_xs = tl.load(
+                        p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
+                        mask = m_t[:, None] & m_d[None, :], other = 0,
+                    ).to(tl.float32)
+                    tl.store(dw + row * W + j, tl.sum(b_g0 * b_xs, 0), mask = m_d)
 
-    _kernels = (_causal_conv1d_fwd_kernel, _causal_conv1d_bwd_kernel)
+    _kernels = (_causal_conv1d_fwd_kernel, (_causal_conv1d_bwd_g_kernel, _causal_conv1d_bwd_dxdw_kernel))
     return _kernels
 
 
-# (BT, BD, num_warps). Small: backward recomputes W pre-activations per tile and spills.
+# (BT, BD, num_warps). The backward is two forward-sized passes (g, then dx / dw / db): one
+# W-tap recompute per position instead of W per tap, 2.3-3.3x faster than the single-pass kernel on a T4.
 _FWD_CONFIG = (32, 64, 2)
-_BWD_CONFIG = (16, 64, 2)
+_BWD_CONFIG = (32, 64, 2)
 # CUDA caps grid dims 1 and 2 at 65535: T tiles ride dim 1, batch rides dim 2.
 _MAX_GRID_YZ = 65535
 
@@ -267,25 +286,35 @@ def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None):
 
 
 def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_db, seq_idx = None):
-    _, bwd = _build_kernels()
+    _, (bwd_g, bwd_dxdw) = _build_kernels()
     _BT, _BD, _NUM_WARPS = _BWD_CONFIG
     B, T, D = x_btd.shape
     W = weight.shape[1]
     NT = (T + _BT - 1) // _BT
+    grid = ((D + _BD - 1) // _BD, NT, B)
+    seq_ptr = seq_idx if seq_idx is not None else weight
+    if activation is not None:
+        g = torch.empty((B, T, D), dtype = x_btd.dtype, device = x_btd.device)
+        _conv_launch(
+            "bwd_g", bwd_g, grid,
+            (x_btd, weight, bias if bias is not None else weight, dy_btd, g, seq_ptr),
+            (T, D, *x_btd.stride(), *dy_btd.stride()),
+            (W, _BT, _BD, bias is not None, seq_idx is not None), _NUM_WARPS, (g,),
+        )
+    else:
+        g = dy_btd  # no activation: the pre-activation gradient is dy itself
     dx = torch.empty((B, T, D), dtype = x_btd.dtype, device = x_btd.device) if need_dx else None
     dw = torch.empty((B * NT, D, W), dtype = torch.float32, device = x_btd.device) if need_dw else None
     db = torch.empty((B * NT, D), dtype = torch.float32, device = x_btd.device) if need_db else None
-    grid = ((D + _BD - 1) // _BD, NT, B)
-    ptrs = (
-        x_btd, weight, bias if bias is not None else weight, dy_btd,
-        dx if dx is not None else x_btd,
-        dw if dw is not None else weight,
-        db if db is not None else weight,
-        seq_idx if seq_idx is not None else weight,
-    )
-    ints = (T, D, NT, *x_btd.stride(), *dy_btd.stride())
-    consts = (W, _BT, _BD, bias is not None, activation is not None, need_dx, need_dw, need_db, seq_idx is not None)
-    _conv_launch("bwd", bwd, grid, ptrs, ints, consts, _NUM_WARPS, tuple(t for t in (dx, dw, db) if t is not None))
+    if need_dx or need_dw or need_db:
+        _conv_launch(
+            "bwd_dxdw", bwd_dxdw, grid,
+            (x_btd, weight, g, dx if dx is not None else x_btd, dw if dw is not None else weight,
+             db if db is not None else weight, seq_ptr),
+            (T, D, NT, *x_btd.stride(), *g.stride()),
+            (W, _BT, _BD, need_dx, need_dw, need_db, seq_idx is not None), _NUM_WARPS,
+            tuple(t for t in (dx, dw, db) if t is not None),
+        )
     if dw is not None:
         dw = dw.sum(0).to(weight.dtype)
     if db is not None:

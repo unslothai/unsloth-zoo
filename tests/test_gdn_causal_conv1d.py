@@ -499,8 +499,8 @@ def test_conv_launches_reuse_a_cached_plan(monkeypatch):
         y = gcc._launch_fwd(x.transpose(1, 2), w, b, "silu", seq_idx)
         dx, dw, db = gcc._launch_bwd(x.transpose(1, 2), w, b, dy.transpose(1, 2), "silu", True, True, True, seq_idx)
         outs.append((y, dx, dw, db))
-    assert gcc._conv_fast_ok == {"fwd": True, "bwd": True}
-    assert len(gcc._conv_plans) == 2
+    assert gcc._conv_fast_ok == {"fwd": True, "bwd_g": True, "bwd_dxdw": True}
+    assert len(gcc._conv_plans) == 3
     for later in outs[1:]:
         for a, r in zip(later, outs[0]):
             assert torch.equal(a, r)
