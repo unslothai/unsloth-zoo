@@ -2299,8 +2299,7 @@ def grpo_accumulated_loss(
         lm_head_bias = getattr(output_embeddings, "bias", None)
 
         def _refresh_lm_head():
-            # FSDP2 replaces Parameters during forward's unshard. The bindings above
-            # are only safe for metadata until that forward has finished.
+            # FSDP2's forward unshard swaps the Parameters: the bindings above are metadata-only until then.
             nonlocal lm_head, lm_head_bias
             from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fsdp_unshard
             unsloth_fsdp_unshard(output_embeddings)
