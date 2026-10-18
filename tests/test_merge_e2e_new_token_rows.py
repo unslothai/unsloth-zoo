@@ -64,23 +64,25 @@ def _merged_vs_peft(tmp_path, target_modules):
         k: v.detach().clone() for k, v in copy.deepcopy(pm).merge_and_unload().state_dict().items()
     }
     H.run_merge(pm, base_dir, out_dir, save_dtype = torch.float32)
-    return H.read_safetensors_dir(out_dir), expected
+    return H.read_safetensors_dir(out_dir), expected, out_dir
 
 
-@pytest.mark.parametrize("target_modules, keys", [
-    (["embed_tokens", "lm_head", "q_proj"], ("model.embed_tokens.weight", "lm_head.weight")),
-    (["lm_head"], ("lm_head.weight",)),
-    (["embed_tokens"], ("model.embed_tokens.weight",)),
+# The untargeted vocab matrix was resized too, so both must carry the new rows.
+@pytest.mark.parametrize("target_modules", [
+    ["embed_tokens", "lm_head", "q_proj"], ["lm_head"], ["embed_tokens"],
 ])
-def test_new_token_rows_keep_their_base_values(tmp_path, target_modules, keys):
-    merged, expected = _merged_vs_peft(tmp_path, target_modules)
-    for key in keys:
+def test_new_token_rows_keep_their_base_values(tmp_path, target_modules):
+    from transformers import AutoModelForCausalLM
+
+    merged, expected, out_dir = _merged_vs_peft(tmp_path, target_modules)
+    for key in ("model.embed_tokens.weight", "lm_head.weight"):
         assert merged[key].shape[0] == NEW_VOCAB
         new_rows, want = merged[key][H._VOCAB:], expected[key][H._VOCAB:]
         assert torch.allclose(new_rows, want, atol = 1e-5, rtol = 1e-5), (
             f"{key} new rows: max diff {(new_rows - want).abs().max().item():.4f}"
         )
         assert torch.allclose(merged[key][:H._VOCAB], expected[key][:H._VOCAB], atol = 1e-5, rtol = 1e-5)
+    AutoModelForCausalLM.from_pretrained(out_dir)
 
 
 def test_shrunk_vocab_merges_onto_the_kept_rows():
