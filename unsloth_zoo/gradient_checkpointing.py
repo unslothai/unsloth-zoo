@@ -254,7 +254,10 @@ def _empty_host_cache():
     if DEVICE_TYPE not in ("cuda", "hip"): return False
     ours = sum(k * v for k, v in _PINNED_CACHED.items())
     free = _host_allocator_free_bytes()
-    if not (ours if free is None else free): return False
+    # host_memory_stats() does not process pending copy events, so a dead block whose last use was a
+    # non_blocking copy (every pinned offload slot) still reads as active there: our own released
+    # blocks are reason enough to flush, and _host_emptyCache processes those events first.
+    if not (ours or free): return False
     try: torch._C._host_emptyCache()
     except Exception: return False
     GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - ours)
