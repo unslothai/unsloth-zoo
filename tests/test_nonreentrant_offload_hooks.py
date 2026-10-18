@@ -242,3 +242,39 @@ def test_capped_pinning_survives_blocks_freed_after_async_copies(gc_module, monk
     assert pinned == [3, 3, 3, 3]
     assert gc_module._host_allocator_held_bytes() - base <= 3 * block
 
+
+
+def test_a_probe_that_pins_a_new_block_releases_it(gc_module):
+    # Another pinned user holds the cached block, so the probe pins a fresh one: it must not stay
+    # cached past the cap.
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    torch.cuda.synchronize()
+    torch._C._host_emptyCache()
+    block = 1 << 20
+    other = torch.empty(block, dtype = torch.uint8, pin_memory = True)  # holds the only cached block
+    held = gc_module._host_allocator_held_bytes()
+    assert gc_module._host_cache_reuses_block(block) is False
+    assert gc_module._host_allocator_held_bytes() <= held
+    del other
+
+
+def test_a_probe_failure_other_than_oom_is_raised(gc_module, monkeypatch):
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    real_empty = torch.empty
+
+    def broken(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", broken)
+    with pytest.raises(RuntimeError, match = "illegal memory access"):
+        gc_module._host_cache_reuses_block(1 << 20)
+
+    def oom(*args, **kwargs):
+        raise RuntimeError("CUDA error: out of memory")
+
+    monkeypatch.setattr(torch, "empty", oom)
+    assert gc_module._host_cache_reuses_block(1 << 20) is False

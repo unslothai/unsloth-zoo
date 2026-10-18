@@ -224,16 +224,19 @@ def _host_cache_reuses_block(block):
     """A pinned block freed after a non_blocking copy waits in torch's event queue, which only an
     allocation drains (host_memory_stats does not), so it reads as not free. Allocate and drop a
     block of that size to drain it: True if the allocator reused a cached block, False if it had
-    to pin a new one (that one stays cached free for the next request of this size)."""
+    to pin a new one, which is released again so the probe never holds pinned memory past the cap."""
     held = _host_allocator_held_bytes()
     if held is None: return False
     try:
         probe = torch.empty(block, dtype = torch.uint8, device = "cpu", pin_memory = True)
-    except Exception:
+    except Exception as exception:
+        if not _is_host_alloc_oom(exception): raise
         return False
     after = _host_allocator_held_bytes()
     del probe
-    return after is not None and after <= held
+    if after is not None and after <= held: return True
+    _empty_host_cache()
+    return False
 
 
 def _compute_pinned_cap():
