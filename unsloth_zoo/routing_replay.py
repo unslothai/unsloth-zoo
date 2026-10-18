@@ -474,9 +474,14 @@ def _split_router_output(output):
     return None
 
 
-def _router_hook(layer_index):
+def _router_hook(layer_index, compact = None):
+    # compact: (position among the MoE layers, number of MoE layers) when some decoder layers are
+    # dense. vLLM 0.21 numbers routed experts by MoE layer only, so its rows skip dense layers.
     def hook(module, args, output):
         replay = _STATE.current
+        row = layer_index
+        if compact is not None and replay is not None and replay.dim() == 3 and replay.shape[1] == compact[1]:
+            row = compact[0]
         positions = _split_router_output(output)
         if positions is None:
             if not getattr(module, "_unsloth_replay_warned", False):
@@ -512,7 +517,7 @@ def _router_hook(layer_index):
             return None
         if recomputed is None and (
             replay.shape[0] != ids2.shape[0]
-            or layer_index >= replay.shape[1]
+            or row >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
         ):
             _STATE.stats["router_calls_natural"] += 1
@@ -549,7 +554,7 @@ def _router_hook(layer_index):
 
         if recomputed is None:
             # Replay rows live on the input ids' device; a device map can put this layer elsewhere.
-            forced = replay[:, layer_index, :].to(ids2.device, non_blocking = True)
+            forced = replay[:, row, :].to(ids2.device, non_blocking = True)
             valid = (forced >= 0).all(dim = -1, keepdim = True)
             forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
             if _STATE.record is not None:
@@ -613,8 +618,11 @@ def install_routing_replay(model, llm = None, tokenizer = None):
             "model (older transformers route inside the MoE block); routing replay is off."
         )
         return 0
+    moe_layers = sorted({layer_index for layer_index, _ in routers})
+    dense = len(moe_layers) < len(decoder.layers)
     for layer_index, module in routers:
-        module.register_forward_hook(_router_hook(layer_index))
+        compact = (moe_layers.index(layer_index), len(moe_layers)) if dense else None
+        module.register_forward_hook(_router_hook(layer_index, compact))
     parent_input_ids = []
     if decoder_name:
         # Qwen3.5 embeds tokens in the parent. Keep its IDs only until that forward exits.

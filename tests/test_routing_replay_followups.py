@@ -157,3 +157,42 @@ def test_unnormalised_router_is_never_read_as_renormalised(replay):
     expected = logits.double().softmax(-1).gather(-1, ids)
     torch.testing.assert_close(weights.double(), expected, rtol = 1e-5, atol = 1e-7)
     assert router._unsloth_replay_formula == "softmax"
+
+
+def test_compact_moe_rows_map_to_their_decoder_layers(replay):
+    # vLLM 0.21 numbers routed experts by MoE layer only (moe_layer_id), so a model with a dense
+    # first layer returns [tokens, 2, k] for decoder layers 1 and 2.
+    model = _model(num_layers = 3, mlp_only_layers = [0])
+    prompt, completion = [5, 6, 7], [9, 10, 11]
+    ids = prompt + completion
+    captured = {}
+    hooks = [
+        model.model.layers[i].mlp.gate.register_forward_hook(
+            lambda m, a, out, i = i: captured.__setitem__(i, out[2].detach().clone())
+        )
+        for i in (1, 2)
+    ]
+    with torch.no_grad():
+        model(input_ids = torch.tensor([ids]))
+    for h in hooks:
+        h.remove()
+    natural = torch.stack([captured[1], captured[2]], dim = 1)  # [T, 2 MoE layers, k]
+    forced = (natural + 3) % NUM_EXPERTS
+    forced[-1] = natural[-1]
+
+    _install(model, 2)
+    rr.record_routed_experts([_request(prompt, completion, forced.numpy())])
+    seen = {}
+    hooks = [
+        model.model.layers[i].mlp.gate.register_forward_hook(
+            lambda m, a, out, i = i: seen.__setitem__(i, out[2].detach().clone())
+        )
+        for i in (1, 2)
+    ]
+    with torch.no_grad():
+        model(input_ids = torch.tensor([ids]))
+    for h in hooks:
+        h.remove()
+    assert torch.equal(seen[1][:-1].sort(-1).values, forced[:-1, 0].long().sort(-1).values)
+    assert torch.equal(seen[2][:-1].sort(-1).values, forced[:-1, 1].long().sort(-1).values)
+    assert rr.routing_replay_stats()["router_calls_natural"] == 0
