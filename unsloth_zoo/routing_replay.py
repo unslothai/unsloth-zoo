@@ -403,7 +403,8 @@ def _input_signature(args, tokens):
     x = args[0] if args and torch.is_tensor(args[0]) else None
     if x is None or not x.is_floating_point() or tokens == 0 or x.numel() % tokens != 0:
         return None
-    with torch.no_grad():
+    # Autocast would run the projection in bf16 / fp16 and merge nearby inputs.
+    with torch.no_grad(), torch.autocast(device_type = x.device.type, enabled = False):
         x = x.detach().reshape(tokens, -1)
         projection = _signature_projection(x.shape[-1], x.device)
         # Chunked so the fp32 upcast stays bounded for long sequences.

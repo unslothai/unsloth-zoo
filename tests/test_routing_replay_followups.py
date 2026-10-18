@@ -212,3 +212,13 @@ def test_input_signature_tells_apart_inputs_with_equal_token_sums():
     assert torch.equal(sig_a, rr._input_signature((a.clone(),), 5))
     assert not torch.equal(sig_a, rr._input_signature((b,), 5))
     assert torch.equal(rr._input_signature((a.to(torch.bfloat16),), 5), rr._input_signature((a.to(torch.bfloat16),), 5))
+
+
+def test_input_signature_stays_fp32_under_autocast():
+    torch.manual_seed(1)
+    a = torch.randn(4, 32)
+    plain = rr._input_signature((a,), 4)
+    with torch.autocast(device_type = "cpu", dtype = torch.bfloat16):
+        cast = rr._input_signature((a,), 4)
+    assert cast.dtype == torch.float32
+    assert torch.equal(cast, plain)
