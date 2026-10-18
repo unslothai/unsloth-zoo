@@ -527,21 +527,20 @@ def _with_live_vocab_rows(W, live, chunk = 8192):
     # rows). A frozen live row that differs from the checkpoint cast to its dtype was changed there.
     # Float8 / integer live weights are codes with a separate scale, not comparable values.
     if not live.dtype.is_floating_point or live.element_size() < 2: return W
+    # Edits W in place (callers pass a private merge buffer or a freshly read shard tensor);
+    # only a grown vocab allocates.
     rows, old = live.shape[0], W.shape[0]
-    out = None if rows == old else (
-        W[:rows].clone() if rows < old else torch.cat([W, W.new_zeros(rows - old, *W.shape[1:])]))
+    out = W if rows == old else W[:rows] if rows < old else torch.cat([W, W.new_zeros(rows - old, *W.shape[1:])])
     for i in range(0, min(rows, old), chunk):
         k = min(i + chunk, rows, old)
         live_rows = live[i:k].detach()
         # Compared on W's device: an unchanged CPU table never stages chunks on the accelerator.
         live_rows = live_rows.to(W.device)
         changed = (W[i:k].to(live_rows.dtype) != live_rows).reshape(k - i, -1).any(1)
-        if not changed.any(): continue
-        if out is None: out = W.clone()
-        out[i:k][changed] = live_rows.to(W.dtype)[changed]
+        if changed.any(): out[i:k][changed] = live_rows.to(W.dtype)[changed]
     if rows > old:
         out[old:] = live[old:].detach().to(W.device, W.dtype)
-    return W if out is None else out
+    return out
 pass
 
 

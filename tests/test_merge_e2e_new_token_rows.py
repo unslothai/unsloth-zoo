@@ -168,15 +168,18 @@ def test_vocab_wrapped_only_by_an_inactive_adapter_still_grows(tmp_path):
     AutoModelForCausalLM.from_pretrained(out_dir)
 
 
-def test_live_vocab_rows_copy_nothing_unless_a_row_changed():
+def test_live_vocab_rows_edit_in_place_without_copying_the_table():
     from unsloth_zoo.saving_utils import _with_live_vocab_rows
 
     W = torch.randn(16, 4).to(torch.bfloat16).float()
     assert _with_live_vocab_rows(W, W.to(torch.bfloat16)) is W
     live = W.to(torch.bfloat16).clone()
     live[3] += 1
+    before = W.clone()
     out = _with_live_vocab_rows(W, live)
-    assert out is not W and torch.equal(out[3], live[3].float()) and torch.equal(out[4:], W[4:])
+    # Same-size edits land in the caller's buffer instead of a full copy.
+    assert out is W and torch.equal(out[3], live[3].float())
+    assert torch.equal(out[:3], before[:3]) and torch.equal(out[4:], before[4:])
 
 
 def test_float8_live_codes_are_never_copied_over_the_checkpoint():
