@@ -59,7 +59,8 @@ def patch_PixtralAttention():
         **kwargs: KWARGS_TYPE,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
-        if "flash" in (self.config._attn_implementation or ""):
+        # Transformers 4.52 still passes the block mask under FA; masked SDPA below handles it.
+        if attention_mask is None and "flash" in (self.config._attn_implementation or ""):
             # FA uses position resets to isolate images; SDPA without a mask cannot.
             position_ids = kwargs.get("position_ids")
             if position_ids is not None and position_ids.shape == (hidden_states.shape[1], 2):
@@ -67,6 +68,9 @@ def patch_PixtralAttention():
                 offsets = torch.arange(position_ids.shape[0], device = position_ids.device)
                 starts = offsets.masked_fill(position_ids.ne(0).any(-1), 0)
                 kwargs["position_ids"] = (offsets - starts.cummax(0).values).unsqueeze(0)
+            elif position_ids is not None and position_ids.dim() == 1:
+                # 4.57 passes flat ids (zero at each image start) that FA's packing check cannot index.
+                kwargs["position_ids"] = position_ids.unsqueeze(0)
             return _original_forward(
                 self, hidden_states, attention_mask = attention_mask,
                 position_embeddings = position_embeddings, output_attentions = output_attentions, **kwargs,

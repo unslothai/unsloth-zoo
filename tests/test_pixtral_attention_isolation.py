@@ -13,7 +13,7 @@ def test_pixtral_flash_attention_keeps_images_isolated(monkeypatch):
     pixtral = pytest.importorskip("transformers.models.pixtral.modeling_pixtral")
     if not any(getattr(pixtral.PixtralVisionModel, name, False)
                for name in ("_supports_flash_attn", "_supports_flash_attn_2")):
-        pytest.skip("this Transformers version does not offer Pixtral FlashAttention")
+        pytest.skip(reason = "this Transformers version does not offer Pixtral FlashAttention")
     from transformers.integrations import flash_attention
     from unsloth_zoo.temporary_patches import pixtral as patch
 
@@ -22,10 +22,17 @@ def test_pixtral_flash_attention_keeps_images_isolated(monkeypatch):
     monkeypatch.setattr(patch, "patch_function", lambda cls, name, fn, **kw: monkeypatch.setattr(cls, name, fn))
     patch.patch_PixtralAttention()
 
-    def flash_reference(q, k, v, attention_mask, *, position_ids, is_causal, softmax_scale, **kwargs):
+    def flash_reference(q, k, v, attention_mask, *, is_causal, softmax_scale,
+                        position_ids = None, cu_seq_lens_q = None, **kwargs):
         assert attention_mask is None and not is_causal
-        assert position_ids.shape == (1, q.shape[1])
-        image_ids = (position_ids == 0).cumsum(-1)
+        if cu_seq_lens_q is not None:
+            # Transformers 5.20+ passes the image boundaries directly.
+            starts = torch.zeros(1, q.shape[1], dtype = torch.long)
+            starts[0, cu_seq_lens_q[:-1].long()] = 1
+            image_ids = starts.cumsum(-1)
+        else:
+            assert position_ids.shape == (1, q.shape[1])
+            image_ids = (position_ids == 0).cumsum(-1)
         mask = (image_ids[:, :, None] == image_ids[:, None, :]).unsqueeze(1)
         return F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
