@@ -527,7 +527,7 @@ def _router_hook(layer_index):
         new_weights = torch.where(valid, new_weights, weights2)
         with torch.no_grad():
             changed = (forced.sort(-1).values != ids2.long().sort(-1).values).any(-1).sum()
-            _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed
+            _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed.to(_STATE.changed.device)
         _STATE.stats["router_calls_replayed"] += 1
 
         if dense:
