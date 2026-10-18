@@ -78,3 +78,15 @@ def test_the_resolver_never_builds_a_device(monkeypatch):
     assert mg._resolve_decode_mode(0) == 2
     assert seen == [0] and not isinstance(seen[0], torch.device)
     assert mg._asm_ok(torch.device("cuda", 0)) == 2  # device and index share one cache entry
+
+
+@pytest.mark.parametrize("cvt_env", ["1", "auto"])
+def test_hip_never_probes_the_hardware_convert(monkeypatch, cvt_env):
+    # gfx11 reports capability 11.x, which passed the major >= 10 check and launched the inline-PTX probe.
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (11, 5))
+    monkeypatch.setenv("UNSLOTH_MXFP4_CVT", cvt_env)
+    launched = []
+    monkeypatch.setattr(mg, "_decode_probe_kernel", type("K", (), {"__getitem__": lambda self, grid: launched.append(grid)})())
+    assert mg._cvt_ok(0, eager = True) is False
+    assert not launched

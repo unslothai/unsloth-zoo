@@ -493,6 +493,8 @@ def _cvt_ok(index, eager = False):
     so auto only enables sm_120. None = cannot probe here (inside a trace or a CUDA graph capture)."""
     import os
     mode = os.environ.get("UNSLOTH_MXFP4_CVT", "auto").strip().lower()
+    if torch.version.hip is not None:
+        return False  # inline PTX; ROCm reports gfx11 as capability 11.x
     major = torch.cuda.get_device_capability(index)[0]
     if mode == "0" or major < 10 or (mode != "1" and major != 12):
         return False
