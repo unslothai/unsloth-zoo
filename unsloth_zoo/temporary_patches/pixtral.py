@@ -61,7 +61,6 @@ def patch_PixtralAttention():
 
         # Transformers 4.52 still passes the block mask under FA; masked SDPA below handles it.
         if attention_mask is None and "flash" in (self.config._attn_implementation or ""):
-            # FA uses position resets to isolate images; SDPA without a mask cannot.
             position_ids = kwargs.get("position_ids")
             if position_ids is not None and position_ids.shape == (hidden_states.shape[1], 2):
                 # Axial (row, col) coordinates: only (0, 0) starts a new image.

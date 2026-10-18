@@ -17,8 +17,7 @@ def test_pixtral_flash_attention_keeps_images_isolated(monkeypatch):
     from transformers.integrations import flash_attention
     from unsloth_zoo.temporary_patches import pixtral as patch
 
-    # Restore the class after applying the real patch; use a CPU reference only at
-    # the CUDA-kernel boundary, keeping HF's attention dispatch and the vision tower.
+    # Real patch and HF dispatch; only the FA kernel call is replaced by a CPU reference.
     monkeypatch.setattr(patch, "patch_function", lambda cls, name, fn, **kw: monkeypatch.setattr(cls, name, fn))
     patch.patch_PixtralAttention()
 
