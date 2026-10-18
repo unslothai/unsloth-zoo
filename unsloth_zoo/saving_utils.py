@@ -496,8 +496,7 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         old_size = W.shape[0]
         W_new = torch.zeros(new_size, W.shape[1], dtype=W.dtype, device=W.device)
         W_new[:min(old_size, new_size)] = W[:new_size]
-        # Rows past the checkpoint were added in memory (add_new_tokens seeds them), so the
-        # adapter trained against the live base rows, not zeros.
+        # Rows past the checkpoint exist only in memory (add_new_tokens seeds them), not zeros.
         live = getattr(getattr(lora_stats, "module", None), "weight", None)
         if new_size > old_size and live is not None and live.device.type != "meta" \
                 and tuple(live.shape) == tuple(W_new.shape):
