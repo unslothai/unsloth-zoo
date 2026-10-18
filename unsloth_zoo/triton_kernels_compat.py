@@ -407,11 +407,20 @@ def _self_check(device):
     return True
 
 
+_CAPABILITY = {}
+
+
 def _device_capability(device):
-    device = torch.device(device)
+    # Asked on every expert forward (each decode token), so cached per explicit device.
+    device = device if isinstance(device, torch.device) else torch.device(device)
     if device.type != "cuda" or torch.version.hip is not None:
         return None
-    return tuple(torch.cuda.get_device_capability(device))
+    capability = _CAPABILITY.get(device.index) if device.index is not None else None
+    if capability is None:
+        capability = tuple(torch.cuda.get_device_capability(device))
+        if device.index is not None:
+            _CAPABILITY[device.index] = capability
+    return capability
 
 
 def native_mxfp4_matmul_ok(device, backend) -> bool:

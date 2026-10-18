@@ -34,6 +34,11 @@ def _backend(api):
     return types.SimpleNamespace(api = api, name = "fake_triton_kernels")
 
 
+@pytest.fixture(autouse = True)
+def _fresh_capability_cache(monkeypatch):
+    monkeypatch.setattr(compat, "_CAPABILITY", {})
+
+
 @pytest.mark.parametrize("capability, api, native", [
     ((12, 0), compat.API_OGS_RAGGED, False),
     ((12, 1), compat.API_OGS_RAGGED, False),
@@ -58,6 +63,17 @@ def test_hip_cpu_and_no_backend_keep_the_current_route(monkeypatch):
     assert compat.native_mxfp4_matmul_ok("cuda:0", None)
     monkeypatch.setattr(torch.version, "hip", "6.4")
     assert compat.native_mxfp4_matmul_ok("cuda:0", ragged)
+
+
+def test_capability_is_read_once_per_device(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", None)
+    reads = []
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: reads.append(device) or (12, 0))
+    ragged = _backend(compat.API_OGS_RAGGED)
+    for _ in range(3):
+        assert not compat.native_mxfp4_matmul_ok(torch.device("cuda", 0), ragged)
+    assert not compat.native_mxfp4_matmul_ok("cuda:1", ragged)
+    assert len(reads) == 2
 
 
 class _Recorder:
