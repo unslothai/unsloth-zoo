@@ -450,7 +450,7 @@ def _launch_update(x, conv_state, weight, bias, activation, y = None):
 # steps; None = ineligible.
 _update_plans = {}
 # Which argument list the cached launcher takes on this Triton: None = not checked yet,
-# "all" (3.3+: every parameter), "runtime" (older: constexprs dropped), False = full launches only.
+# "all" (every parameter, Triton 3.6+), False = full launches only.
 _fast_launch_mode = None
 
 
@@ -498,12 +498,27 @@ def _fast_launch(mode, plan, x, conv_state, weight, bias, y):
     )
 
 
+def _triton_launcher_verified():
+    """Triton 3.6+ (torch 2.10+): the launcher convention _fast_launch uses was checked there."""
+    try:
+        import triton
+        major, minor = (int(part) for part in triton.__version__.split(".")[:2])
+    except Exception:
+        return False
+    return (major, minor) >= (3, 6)
+
+
 def _check_fast_launch(plan, x, conv_state, weight, bias, activation):
     """Once per process: launch through the cached launcher and compare with a full launch on
     copies; pick the argument convention this Triton takes, or keep full launches."""
     global _fast_launch_mode
+    if not _triton_launcher_verified():
+        # A wrong argument list can fault on the device instead of raising, which no fallback
+        # survives, so only the launcher convention checked on real hardware is tried.
+        _fast_launch_mode = False
+        return _launch_update(x, conv_state, weight, bias, activation)[0]
     state_before = conv_state.clone()
-    for mode in ("all", "runtime"):
+    for mode in ("all",):
         ref_state = state_before.clone()
         y_ref = _launch_update(x, ref_state, weight, bias, activation)[0]
         y = torch.empty_like(x)

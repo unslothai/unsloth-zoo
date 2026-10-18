@@ -160,9 +160,9 @@ def test_cached_launch_matches_reference_over_many_steps(monkeypatch, dtype):
         # Same kernel either way: the cached launch is bitwise the full launch.
         assert torch.equal(ours, full), step
         assert _rel(ours, ref) < (1e-5 if dtype == torch.float32 else 5e-3), step
-    # One plan for the repeated shape, and this Triton took one of the two launcher conventions.
+    # One plan for the repeated shape, and the cached launcher is used only where it was verified.
     assert len(gcc._update_plans) == 1
-    assert gcc._fast_launch_mode in ("all", "runtime")
+    assert gcc._fast_launch_mode == ("all" if gcc._triton_launcher_verified() else False)
 
 
 @requires_cuda
