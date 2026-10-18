@@ -533,3 +533,24 @@ def test_caller_suppression_kept_after_owned_rows_run_out(monkeypatch):
     assert tokenizer.convert_tokens_to_ids("<unsloth_c>") == padded - 1
     assert sorted(model.generation_config.suppress_tokens) == [7, padded - 1]
 
+
+
+def test_merged_export_config_keeps_vocab_pad_records():
+    # merge_and_overwrite_lora writes the base checkpoint's config with the trained vocab_size:
+    # the alignment-row records must travel with it, or vLLM samples the tokenless rows.
+    from transformers import LlamaConfig
+    from unsloth_zoo.saving_utils import _carry_over_vocab_size
+    from unsloth_zoo.vllm_utils import _padded_vocab_ids
+    base = LlamaConfig(vocab_size = 100)
+    trained = LlamaConfig(vocab_size = 128)
+    trained.unsloth_vocab_pad_ids = list(range(101, 128))
+    trained.unsloth_vocab_pad_suppressed_ids = list(range(102, 128))
+    _carry_over_vocab_size(base, trained)
+    assert base.vocab_size == 128
+    assert _padded_vocab_ids(base) == list(range(101, 128))
+    assert base.unsloth_vocab_pad_suppressed_ids == list(range(102, 128))
+    # An unpadded model adds nothing to the exported config.
+    plain = LlamaConfig(vocab_size = 100)
+    _carry_over_vocab_size(plain, LlamaConfig(vocab_size = 101))
+    assert not hasattr(plain, "unsloth_vocab_pad_ids")
+    assert not hasattr(plain, "unsloth_vocab_pad_suppressed_ids")

@@ -3948,6 +3948,20 @@ def _config_vocab_size(config):
 pass
 
 
+def _carry_over_vocab_pad_records(base_config, trained_config):
+    def text_config(config):
+        get_text_config = getattr(config, "get_text_config", None)
+        return get_text_config() if callable(get_text_config) else config
+    source, target = text_config(trained_config), text_config(base_config)
+    for key in ("unsloth_vocab_pad_ids", "unsloth_vocab_pad_suppressed_ids"):
+        ids = getattr(source, key, None)
+        if ids is None: continue
+        try: setattr(target, key, list(ids))
+        except Exception: pass
+    pass
+pass
+
+
 def _carry_over_vocab_size(base_config, trained_config):
     # The merge writes the trained (possibly resized) embeddings, so the base checkpoint's own
     # `vocab_size` would rebuild smaller layers and fail the reload. Only the text vocab moves.
@@ -3967,6 +3981,9 @@ def _carry_over_vocab_size(base_config, trained_config):
         try: holder.vocab_size = trained_vocab_size
         except Exception: pass  # read-only on some composite configs
     pass
+    # Alignment rows from add_new_tokens(pad_to_multiple_of = ...) are recorded on the text config;
+    # vLLM only biases recorded rows, so the records go with the resized vocab.
+    _carry_over_vocab_pad_records(base_config, trained_config)
     # Never silently ship a config that disagrees with the rows we are about to write.
     if _config_vocab_size(base_config) != trained_vocab_size:
         warnings.warn(
