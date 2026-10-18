@@ -255,6 +255,30 @@ def test_aiter_choice_follows_set_device(amd_host):
     assert device_type.get_amd_flash_attn_func() is None
 
 
+def test_single_hip_device_runs_aiter_discovery_once(monkeypatch):
+    # One HIP device keeps the plain cache: the no-argument setup gate and the flash-attn lookup
+    # must share one get_amd_attention_implementation entry.
+    monkeypatch.setattr(device_type, "is_hip", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda i: types.SimpleNamespace(gcnArchName = "gfx942:sramecc+:xnack-"))
+    monkeypatch.setattr(torch.version, "hip", "7.0.1", raising = False)
+    aiter = types.ModuleType("aiter")
+    aiter.__spec__ = importlib.machinery.ModuleSpec("aiter", None)
+    aiter.flash_attn_func = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    for name in _AMD_CACHED:
+        fn = inspect.unwrap(getattr(device_type, name))
+        monkeypatch.setattr(device_type, name, device_type._per_device_cache(fn))
+    _clear_amd_caches()
+    assert device_type.get_amd_attention_implementation() == "amd_aiter"
+    assert device_type.get_amd_flash_attn_func() is aiter.flash_attn_func
+    assert device_type.get_amd_attention_implementation.cache_info().currsize == 1
+    _clear_amd_caches()
+
+
 def test_plain_cache_by_default():
     calls = []
 
