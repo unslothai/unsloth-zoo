@@ -1982,6 +1982,12 @@ def grpo_parse_is_clip(spec, mode):
     """Parse UNSLOTH_GRPO_VLLM_IS_CLIP "lower_upper" (either side may be empty) into (lower, upper).
     Applied after GRPOConfig validation, so it checks the bounds itself: reversed bounds collapse
     every truncated ratio to one value and make the mask modes reject every token."""
+    if "_" not in str(spec):
+        # A bare "2.0" would otherwise become a lower bound and floor / reject every on-policy ratio.
+        raise ValueError(
+            f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP must be 'lower_upper' (either side may be empty, "
+            f"e.g. '_{spec}' for an upper cap), got {spec!r}."
+        )
     lower, _, upper = str(spec).partition("_")
     lower = float(lower) if lower.strip() else None
     upper = float(upper) if upper.strip() else None
