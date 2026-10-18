@@ -259,19 +259,10 @@ def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None):
     W = weight.shape[1]
     y = torch.empty((B, T, D), dtype = x_btd.dtype, device = x_btd.device)
     grid = ((D + _BD - 1) // _BD, (T + _BT - 1) // _BT, B)
-    with torch.cuda.device(x_btd.device):
-        fwd[grid](
-            x_btd, weight, bias if bias is not None else weight, y,
-            seq_idx if seq_idx is not None else weight,
-            T, D,
-            x_btd.stride(0), x_btd.stride(1), x_btd.stride(2),
-            W = W, BT = _BT, BD = _BD,
-            HAS_BIAS = bias is not None,
-            ACTIVATION = activation is not None,
-            HAS_SEQ_IDX = seq_idx is not None,
-            num_warps = _NUM_WARPS,
-            enable_fp_fusion = True,
-        )
+    ptrs = (x_btd, weight, bias if bias is not None else weight, y, seq_idx if seq_idx is not None else weight)
+    ints = (T, D, *x_btd.stride())
+    consts = (W, _BT, _BD, bias is not None, activation is not None, seq_idx is not None)
+    _conv_launch("fwd", fwd, grid, ptrs, ints, consts, _NUM_WARPS, (y,))
     return y
 
 
@@ -285,29 +276,77 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
     dw = torch.empty((B * NT, D, W), dtype = torch.float32, device = x_btd.device) if need_dw else None
     db = torch.empty((B * NT, D), dtype = torch.float32, device = x_btd.device) if need_db else None
     grid = ((D + _BD - 1) // _BD, NT, B)
-    with torch.cuda.device(x_btd.device):
-        bwd[grid](
-            x_btd, weight, bias if bias is not None else weight, dy_btd,
-            dx if dx is not None else x_btd,
-            dw if dw is not None else weight,
-            db if db is not None else weight,
-            seq_idx if seq_idx is not None else weight,
-            T, D, NT,
-            x_btd.stride(0), x_btd.stride(1), x_btd.stride(2),
-            dy_btd.stride(0), dy_btd.stride(1), dy_btd.stride(2),
-            W = W, BT = _BT, BD = _BD,
-            HAS_BIAS = bias is not None,
-            ACTIVATION = activation is not None,
-            NEED_DX = need_dx, NEED_DW = need_dw, NEED_DB = need_db,
-            HAS_SEQ_IDX = seq_idx is not None,
-            num_warps = _NUM_WARPS,
-            enable_fp_fusion = True,
-        )
+    ptrs = (
+        x_btd, weight, bias if bias is not None else weight, dy_btd,
+        dx if dx is not None else x_btd,
+        dw if dw is not None else weight,
+        db if db is not None else weight,
+        seq_idx if seq_idx is not None else weight,
+    )
+    ints = (T, D, NT, *x_btd.stride(), *dy_btd.stride())
+    consts = (W, _BT, _BD, bias is not None, activation is not None, need_dx, need_dw, need_db, seq_idx is not None)
+    _conv_launch("bwd", bwd, grid, ptrs, ints, consts, _NUM_WARPS, tuple(t for t in (dx, dw, db) if t is not None))
     if dw is not None:
         dw = dw.sum(0).to(weight.dtype)
     if db is not None:
         db = db.sum(0).to(bias.dtype)
     return dx, dw, db
+
+
+# Training and prefill call the conv once per layer per step with the same shapes, so the Triton
+# launch (specialization + argument binding, ~20-30 us of host time) is cached per shape like the
+# decode update below: key -> (grid, compiled kernel). Same gates: Triton 3.6+ launcher convention,
+# a bitwise self-check per kernel on first use, full launches under profiler hooks, for unaligned
+# pointers (Triton specializes on 16-byte alignment) and off the current device.
+_conv_plans = {}
+_conv_fast_ok = {}
+
+
+def _conv_full_launch(kernel, grid, ptrs, ints, consts, num_warps):
+    args = ptrs + ints + consts
+    if ptrs[0].get_device() != torch._C._cuda_getDevice():
+        with torch.cuda.device(ptrs[0].device):
+            return kernel[grid](*args, num_warps = num_warps, enable_fp_fusion = True)
+    return kernel[grid](*args, num_warps = num_warps, enable_fp_fusion = True)
+
+
+def _conv_fast_launch(plan, ptrs, ints, consts):
+    grid, compiled = plan
+    compiled.run(
+        grid[0], grid[1], grid[2], torch._C._cuda_getCurrentRawStream(ptrs[0].get_device()),
+        compiled.function, compiled.packed_metadata, None, None, None,
+        *ptrs, *ints, *consts,
+    )
+
+
+def _conv_launch(name, kernel, grid, ptrs, ints, consts, num_warps, outs):
+    """One conv kernel launch, through the cached launcher when it is safe. `outs` are the tensors
+    the kernel writes (and only writes), compared bitwise on the first cached launch."""
+    aligned = not (functools.reduce(lambda acc, t: acc | t.data_ptr(), ptrs, 0) & 15)
+    key = (name, grid, ints, consts, tuple(t.dtype for t in ptrs), ptrs[0].get_device())
+    plan = _conv_plans.get(key) if aligned else None
+    if (
+        plan is None or _conv_fast_ok.get(name) is False or _launch_hooks_set()
+        or ptrs[0].get_device() != torch._C._cuda_getDevice()
+    ):
+        compiled = _conv_full_launch(kernel, grid, ptrs, ints, consts, num_warps)
+        if aligned and plan is None and compiled is not None and _triton_launcher_verified():
+            _conv_plans[key] = (grid, compiled)
+        return
+    if name not in _conv_fast_ok:
+        _conv_full_launch(kernel, grid, ptrs, ints, consts, num_warps)
+        refs = [t.clone() for t in outs]
+        try:
+            _conv_fast_launch(plan, ptrs, ints, consts)
+            ok = all(torch.equal(t, r) for t, r in zip(outs, refs))
+        except Exception:
+            ok = False
+        _conv_fast_ok[name] = ok
+        if not ok:
+            for t, r in zip(outs, refs):
+                t.copy_(r)
+        return
+    _conv_fast_launch(plan, ptrs, ints, consts)
 
 
 class _CausalConv1dFunction(torch.autograd.Function):
@@ -904,6 +943,10 @@ def _mamba_conv_operands(x_bds, weight, bias):
     return weight.contiguous(), (bias.contiguous() if bias is not None else None)
 
 
+def _autograd_tracks(*tensors):
+    return torch.is_grad_enabled() and any(getattr(t, "requires_grad", False) for t in tensors)
+
+
 def mamba_causal_conv1d_fwd_function(x, weight, bias, seq_idx, initial_states, final_states_out, silu_activation):
     if initial_states is not None or final_states_out is not None:
         raise NotImplementedError("Unsloth: Triton causal conv has no initial / final states")
@@ -911,7 +954,9 @@ def mamba_causal_conv1d_fwd_function(x, weight, bias, seq_idx, initial_states, f
     w, b = _mamba_conv_operands(x, weight, bias)
     if seq_idx is not None and seq_idx.dtype not in (torch.int32, torch.int64):
         seq_idx = seq_idx.to(torch.int64)
-    if not _eligible(x, w, b, activation, seq_idx):
+    # mamba_ssm calls this inside its autograd.Function (grad mode off); a raw launch has no
+    # backward, so anything autograd would track takes the differentiable torch reference.
+    if _autograd_tracks(x, weight, bias) or not _eligible(x, w, b, activation, seq_idx):
         return _causal_conv1d_reference_seq_idx(x, w, b, activation, seq_idx)
     GDN_CAUSAL_CONV1D_STATS["mamba_fused_fwd"] += 1
     return _launch_fwd(x.transpose(1, 2), w, b, activation, seq_idx).transpose(1, 2)
@@ -924,7 +969,7 @@ def mamba_causal_conv1d_bwd_function(x, weight, bias, dout, seq_idx, initial_sta
     w, b = _mamba_conv_operands(x, weight, bias)
     if seq_idx is not None and seq_idx.dtype not in (torch.int32, torch.int64):
         seq_idx = seq_idx.to(torch.int64)
-    if _eligible(x, w, b, activation, seq_idx):
+    if not _autograd_tracks(x, weight, bias, dout) and _eligible(x, w, b, activation, seq_idx):
         GDN_CAUSAL_CONV1D_STATS["mamba_fused_bwd"] += 1
         dx_btd, dw, db = _launch_bwd(
             x.transpose(1, 2), w, b, dout.transpose(1, 2), activation,

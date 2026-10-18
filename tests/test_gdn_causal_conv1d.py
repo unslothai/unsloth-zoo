@@ -483,3 +483,49 @@ def test_install_mamba_ssm_triton_conv_only_fills_missing_functions(monkeypatch)
     monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
     monkeypatch.setattr(torch.version, "hip", "7.0")
     assert not gcc.install_mamba_ssm_triton_conv()
+
+
+@requires_cuda
+def test_conv_launches_reuse_a_cached_plan(monkeypatch):
+    if not gcc._triton_launcher_verified():
+        pytest.skip("cached launcher needs Triton 3.6+")
+    monkeypatch.setattr(gcc, "_conv_plans", {})
+    monkeypatch.setattr(gcc, "_conv_fast_ok", {})
+    x, w, b, dy = _inputs(2, 96, 70, 4, torch.bfloat16, True, True)
+    seq_idx = torch.zeros(2, 70, dtype = torch.int32, device = "cuda")
+    seq_idx[:, 40:] = 1
+    outs = []
+    for _ in range(3):  # full launch (plan cached), self-checked cached launch, cached launch
+        y = gcc._launch_fwd(x.transpose(1, 2), w, b, "silu", seq_idx)
+        dx, dw, db = gcc._launch_bwd(x.transpose(1, 2), w, b, dy.transpose(1, 2), "silu", True, True, True, seq_idx)
+        outs.append((y, dx, dw, db))
+    assert gcc._conv_fast_ok == {"fwd": True, "bwd": True}
+    assert len(gcc._conv_plans) == 2
+    for later in outs[1:]:
+        for a, r in zip(later, outs[0]):
+            assert torch.equal(a, r)
+
+
+@requires_cuda
+def test_conv_launch_skips_the_cache_when_unsafe(monkeypatch):
+    monkeypatch.setattr(gcc, "_conv_plans", {})
+    monkeypatch.setattr(gcc, "_conv_fast_ok", {})
+    x, w, b, _ = _inputs(2, 64, 33, 4, torch.float16, True, False)
+    monkeypatch.setattr(gcc, "_triton_launcher_verified", lambda: False)
+    gcc._launch_fwd(x.transpose(1, 2), w, b, "silu")
+    assert gcc._conv_plans == {}
+    monkeypatch.setattr(gcc, "_triton_launcher_verified", lambda: True)
+    # 2-byte offset: Triton would have specialized the plan on 16-byte alignment.
+    xu = torch.empty(x.numel() + 1, dtype = x.dtype, device = "cuda")[1:].view_as(x).copy_(x)
+    gcc._launch_fwd(xu.transpose(1, 2), w, b, "silu")
+    assert gcc._conv_plans == {}
+
+
+def test_mamba_drop_ins_take_the_torch_path_when_autograd_tracks(monkeypatch):
+    called = []
+    monkeypatch.setattr(gcc, "_launch_fwd", lambda *a, **k: called.append(1))
+    x = torch.randn(1, 8, 5, requires_grad = True)
+    w = torch.randn(8, 4)
+    y = gcc.mamba_causal_conv1d_fwd_function(x, w, None, None, None, None, True)
+    assert not called and y.requires_grad
+    torch.testing.assert_close(y, gcc.causal_conv1d_reference(x, w, None, "silu"))
