@@ -4247,12 +4247,15 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
 
         def routed():
             # The verifier's own routing, shared expert and shared gate; the routed kernels take every row at once.
-            gates = mx.softmax(self._linear(feed_forward.gate, x), axis = -1, precise = True)
-            indices = mx.argpartition(gates, kth = -feed_forward.top_k, axis = -1)[..., -feed_forward.top_k:]
-            scores = mx.take_along_axis(gates, indices, axis = -1)
-            scores = scores / scores.sum(axis = -1, keepdims = True)
+            logits, gate = self._linear(feed_forward.gate, x), self._linear(feed_forward.shared_expert_gate, x)
+            routing = _fused_moe_router_shared(logits, gate, feed_forward.top_k, True)
+            if routing is None:
+                gates = mx.softmax(logits, axis = -1, precise = True)
+                indices = mx.argpartition(gates, kth = -feed_forward.top_k, axis = -1)[..., -feed_forward.top_k:]
+                scores = mx.take_along_axis(gates, indices, axis = -1)
+                routing = indices, scores / scores.sum(axis = -1, keepdims = True), mx.sigmoid(gate)
+            indices, scores, scale = routing
             shared = self._feed_forward(feed_forward.shared_expert, x)
-            scale = mx.sigmoid(self._linear(feed_forward.shared_expert_gate, x))
             rows = (x.shape[0] * x.shape[1], 1, -1)
             out = experts(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale, shared)))
             return None if out is None else out.reshape(*x.shape[:2], -1)

@@ -684,15 +684,17 @@ def test_verify_blocks_run_their_routed_experts_on_the_decode_kernels_bitwise(mo
     expected = [native()._feed_forward(block, x) for x in xs]
     verifier = fusion._exact_verify_class(native, "verify", True, *(vars(native).get(name) for name in fusion._VERIFY_METHODS))()
     monkeypatch.setattr(fusion, "_VERIFY_VERDICTS", {})
-    gathers = _counting_gather_qmm(monkeypatch)
+    gathers, partitions = _counting_gather_qmm(monkeypatch), _counting_argpartition(monkeypatch)
     with fusion.fused_moe_routed_experts(block):
         for serving in (False, True):
             monkeypatch.setattr(fusion._VERIFY_STATE, "serving", serving, raising = False)
             for x, out in zip(xs, expected):
                 mx.eval(verifier._feed_forward(block, x))  # a served shape's first block is compared and returned native
                 gathers.clear()
+                partitions.clear()
                 _identical(verifier._feed_forward(block, x), out)
                 assert len(gathers) == (1 if serving else 4)  # mlx-vlm gathers for the shared gate, then per expert projection
+                assert bool(partitions) is not serving  # served blocks route in the fused router's launch
         assert len(fusion._VERIFY_VERDICTS) >= 2 and all(fusion._VERIFY_VERDICTS.values())
         block.switch_mlp.down_proj.unfreeze()
         gathers.clear()
