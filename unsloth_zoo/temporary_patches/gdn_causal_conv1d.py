@@ -21,6 +21,8 @@ writing channel-last directly to skip the transpose copies. Layout follows fla's
 `causal_conv1d` (fla-org/flash-linear-attention, MIT), without initial state; `seq_idx`
 (B, T) keeps taps inside one packed sequence.
 Numerics match torch: fp32 accumulate, pre-activation and SiLU grad rounded to input dtype.
+Cached decode gets a Triton `causal_conv1d_update` too (in-place conv state, one launch instead
+of torch's cat / copy / conv / SiLU chain), so these models need no causal-conv1d binary.
 ``UNSLOTH_DISABLE_TRITON_CAUSAL_CONV1D=1`` keeps the torch fallback; a usable
 `causal_conv1d` package always wins.
 """
@@ -54,14 +56,22 @@ _GDN_LEAVES = frozenset(
     for prefix in ("modeling", "unsloth_compiled_module")
 )
 
-GDN_CAUSAL_CONV1D_STATS = {"triton_fwd": 0, "triton_bwd": 0, "triton_seq_idx": 0, "fallback": 0}
+GDN_CAUSAL_CONV1D_STATS = {
+    "triton_fwd": 0, "triton_bwd": 0, "triton_seq_idx": 0, "fallback": 0,
+    "triton_update": 0, "update_fallback": 0,
+}
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MAX_WIDTH = 8
 _ACTIVATIONS = (None, "silu", "swish")
 
+# Decode steps feed one token, speculative / chunked ones a few; longer runs use torch.
+_MAX_UPDATE_T = 64
+
 _kernels = None
+_update_kernel = None
 _broken = False
+_update_broken = False
 
 
 def _disabled():
@@ -317,6 +327,170 @@ class _CausalConv1dFunction(torch.autograd.Function):
         return (dx.transpose(1, 2) if dx is not None else None), dw, db, None, None
 
 
+def _build_update_kernel():
+    global _update_kernel, tl
+    if _update_kernel is not None:
+        return _update_kernel
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _causal_conv1d_update_kernel(
+        x, state, weight, bias, y,
+        D, T,
+        stride_x_b, stride_x_d, stride_x_t,
+        stride_s_b, stride_s_d, stride_s_l,
+        L: tl.constexpr,
+        LP: tl.constexpr,
+        W: tl.constexpr,
+        BD: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        ACTIVATION: tl.constexpr,
+    ):
+        # Taps index c = [state (L) | x (T)]: output t sees c[L + t - (W - 1) + i_w], the new
+        # state is c[T:T + L]. Same as the torch path's cat + copy_ + conv1d(padding = 0).
+        i_d, i_b = tl.program_id(0), tl.program_id(1)
+        o_d = i_d * BD + tl.arange(0, BD)
+        m_d = o_d < D
+        o_d64 = o_d.to(tl.int64)
+        p_x = x + tl.cast(i_b, tl.int64) * stride_x_b + o_d64 * stride_x_d
+        p_s = state + tl.cast(i_b, tl.int64) * stride_s_b + o_d64 * stride_s_d
+        p_y = y + tl.cast(i_b, tl.int64) * T * D + o_d64
+        if HAS_BIAS:
+            b_bias = tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)
+        for t in range(T):
+            acc = tl.zeros((BD,), dtype = tl.float32)
+            for i_w in tl.static_range(W):
+                c = L + t - (W - 1) + i_w
+                b_c = tl.load(p_s + c * stride_s_l, mask = m_d & (c < L), other = 0).to(tl.float32)
+                b_c += tl.load(p_x + (c - L) * stride_x_t, mask = m_d & (c >= L), other = 0).to(tl.float32)
+                acc += b_c * tl.load(weight + o_d * W + i_w, mask = m_d, other = 0).to(tl.float32)
+            if HAS_BIAS:
+                acc += b_bias
+            if ACTIVATION:
+                # The torch path stores the conv output in the input dtype, then SiLU.
+                acc = acc.to(y.dtype.element_ty).to(tl.float32)
+                acc = acc * tl.sigmoid(acc)
+            tl.store(p_y + t * D, acc.to(y.dtype.element_ty), mask = m_d)
+        o_l = tl.arange(0, LP)
+        c = T + o_l
+        m_l = (o_l < L)[:, None] & m_d[None, :]
+        b_new = tl.load(
+            p_s[None, :] + (tl.minimum(c, L - 1) * stride_s_l)[:, None],
+            mask = m_l & (c < L)[:, None], other = 0,
+        )
+        b_new += tl.load(
+            p_x[None, :] + (tl.maximum(c - L, 0) * stride_x_t)[:, None],
+            mask = m_l & (c >= L)[:, None], other = 0,
+        )
+        # The state is updated in place, and other threads may still be reading the old values.
+        tl.debug_barrier()
+        tl.store(p_s[None, :] + (o_l * stride_s_l)[:, None], b_new, mask = m_l)
+
+    _update_kernel = _causal_conv1d_update_kernel
+    return _update_kernel
+
+
+# (BD, num_warps): a decode step is a few KB, so this is launch bound.
+_UPDATE_CONFIG = (128, 4)
+
+
+def triton_causal_conv1d_update(x, conv_state, weight, bias = None, activation = None):
+    """x (B, D, T), conv_state (B, D, L) updated in place, weight (D, W) -> (B, D, T) stored channel-last."""
+    kernel = _build_update_kernel()
+    _BD, _NUM_WARPS = _UPDATE_CONFIG
+    B, D, T = x.shape
+    L, W = conv_state.shape[-1], weight.shape[1]
+    y = torch.empty((B, T, D), dtype = x.dtype, device = x.device)
+    grid = ((D + _BD - 1) // _BD, B)
+    with torch.cuda.device(x.device):
+        kernel[grid](
+            x, conv_state, weight, bias if bias is not None else weight, y,
+            D, T,
+            x.stride(0), x.stride(1), x.stride(2),
+            conv_state.stride(0), conv_state.stride(1), conv_state.stride(2),
+            L = L, LP = triton_next_power_of_2(L), W = W, BD = _BD,
+            HAS_BIAS = bias is not None,
+            ACTIVATION = activation is not None,
+            num_warps = _NUM_WARPS,
+            enable_fp_fusion = True,
+        )
+    return y.transpose(1, 2)
+
+
+def triton_next_power_of_2(n):
+    return 1 << max(0, int(n) - 1).bit_length()
+
+
+def _update_eligible(x, conv_state, weight, bias, activation):
+    return (
+        x.is_cuda and x.dim() == 3 and x.numel() > 0 and x.dtype in _SUPPORTED_DTYPES
+        and 1 <= x.shape[2] <= _MAX_UPDATE_T and x.shape[0] <= _MAX_GRID_YZ
+        and isinstance(conv_state, torch.Tensor) and conv_state.dim() == 3
+        and conv_state.dtype == x.dtype and conv_state.device == x.device
+        and conv_state.shape[:2] == x.shape[:2]
+        and weight.dim() == 2 and weight.dtype == x.dtype and weight.device == x.device
+        and weight.is_contiguous() and weight.shape[0] == x.shape[1]
+        and 1 <= weight.shape[1] <= _MAX_WIDTH
+        # Fewer than W - 1 cached taps: the torch path returns a shorter output.
+        and weight.shape[1] - 1 <= conv_state.shape[2] <= 4 * _MAX_WIDTH
+        and activation in _ACTIVATIONS
+        and (bias is None or (
+            bias.dtype == x.dtype and bias.device == x.device
+            and bias.shape == (x.shape[1],) and bias.is_contiguous()
+        ))
+    )
+
+
+def _try_fast_update(x, conv_state, weight, bias, activation):
+    """Run the Triton update, or return None to use the torch fallback."""
+    global _update_broken
+    if _update_broken or torch.compiler.is_compiling() or _disabled():
+        return None
+    if not _update_eligible(x, conv_state, weight, bias, activation):
+        return None
+    try:
+        out = triton_causal_conv1d_update(x, conv_state, weight, bias, activation)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception as e:
+        _update_broken = True
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Triton causal_conv1d_update failed, using torch: {e}")
+        return None
+    GDN_CAUSAL_CONV1D_STATS["triton_update"] += 1
+    return out
+
+
+def causal_conv1d_update_reference(hidden_states, conv_state, weight, bias = None, activation = None):
+    """The transformers 5.x torch fallback: conv_state (B, D, L) is updated in place."""
+    import torch.nn.functional as F
+    hidden_size, seq_len = hidden_states.shape[1], hidden_states.shape[2]
+    state_len = conv_state.shape[-1]
+    hidden_states_new = torch.cat([conv_state, hidden_states], dim = -1).to(weight.dtype)
+    conv_state.copy_(hidden_states_new[:, :, -state_len:])
+    out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding = 0, groups = hidden_size)
+    out = out[:, :, -seq_len:]
+    if activation is not None:
+        out = _act(activation)(out)
+    return out.to(hidden_states.dtype)
+
+
+def _make_update_dispatch(torch_function):
+    """Wrap a torch `causal_conv1d_update` fallback with the Triton update."""
+    @functools.wraps(torch_function)
+    def causal_conv1d_update(hidden_states, conv_state, weight, bias = None, activation = None):
+        out = _try_fast_update(hidden_states, conv_state, weight, bias, activation)
+        if out is not None:
+            return out
+        if not torch.compiler.is_compiling():
+            GDN_CAUSAL_CONV1D_STATS["update_fallback"] += 1
+        return torch_function(hidden_states, conv_state, weight, bias, activation)
+
+    setattr(causal_conv1d_update, _MARK, True)
+    return _own_signature(causal_conv1d_update)
+
+
 def _act(activation):
     from transformers.activations import ACT2FN
     return ACT2FN[activation]
@@ -518,10 +692,14 @@ def _patch_hub_decorator():
     @functools.wraps(original)
     def use_kernel_func_from_hub_with_fallback(func_name, package, *args, **kwargs):
         decorator = original(func_name, package, *args, **kwargs)
-        if func_name != "causal_conv1d_fn" or package != "causal_conv1d":
+        if package != "causal_conv1d":
             return decorator
         # A usable package still wins: the hub wrapper only calls this torch fallback without it.
-        return lambda fn: _hub_gdn_function(decorator, fn) if _is_gdn_function(fn) else decorator(fn)
+        if func_name == "causal_conv1d_fn":
+            return lambda fn: _hub_gdn_function(decorator, fn) if _is_gdn_function(fn) else decorator(fn)
+        if func_name == "causal_conv1d_update":
+            return lambda fn: decorator(_make_update_dispatch(fn)) if _is_gdn_function(fn) else decorator(fn)
+        return decorator
 
     setattr(use_kernel_func_from_hub_with_fallback, _HUB_MARK, True)
     hub_kernels.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
@@ -530,26 +708,39 @@ def _patch_hub_decorator():
     return use_kernel_func_from_hub_with_fallback
 
 
-def _rebind_module(module, patched_decorator):
-    """Rebind an imported module; True if it now dispatches to Triton. Re-decorating
-    also replaces a wrapper that captured a since-disabled package kernel."""
-    names = vars(module)
-    if patched_decorator is not None and "use_kernel_func_from_hub_with_fallback" in names:
-        module.use_kernel_func_from_hub_with_fallback = patched_decorator
-    if "causal_conv1d_fn" not in names:
-        return False
-    current = module.causal_conv1d_fn
+def _legacy_update(module):
+    """`causal_conv1d_update` stand-in for transformers < 5.15, falling back to the module's own
+    torch update (4.57's `torch_causal_conv1d_update` always applies SiLU)."""
+    torch_function = vars(module).get("torch_causal_conv1d_update") or causal_conv1d_update_reference
+    return _make_update_dispatch(torch_function)
+
+
+def _rebind_name(module, name, legacy, patched_decorator):
+    current = vars(module)[name]
     if current is None:
         # transformers < 5.15: None unless the package imported; copied in layer __init__.
-        module.causal_conv1d_fn = _legacy_causal_conv1d_fn
+        setattr(module, name, legacy())
         return True
     if _is_marked(current):
         return True
     torch_function = getattr(current, "__wrapped__", None)
     if torch_function is None or patched_decorator is None:
         return False
-    module.causal_conv1d_fn = patched_decorator("causal_conv1d_fn", "causal_conv1d")(torch_function)
-    return _is_marked(module.causal_conv1d_fn)
+    setattr(module, name, patched_decorator(name, "causal_conv1d")(torch_function))
+    return _is_marked(getattr(module, name))
+
+
+def _rebind_module(module, patched_decorator):
+    """Rebind an imported module; True if its conv now dispatches to Triton. Re-decorating
+    also replaces a wrapper that captured a since-disabled package kernel."""
+    names = vars(module)
+    if patched_decorator is not None and "use_kernel_func_from_hub_with_fallback" in names:
+        module.use_kernel_func_from_hub_with_fallback = patched_decorator
+    if "causal_conv1d_update" in names:
+        _rebind_name(module, "causal_conv1d_update", lambda: _legacy_update(module), patched_decorator)
+    if "causal_conv1d_fn" not in names:
+        return False
+    return _rebind_name(module, "causal_conv1d_fn", lambda: _legacy_causal_conv1d_fn, patched_decorator)
 
 
 def patch_gdn_causal_conv1d():

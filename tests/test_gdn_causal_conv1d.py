@@ -253,7 +253,9 @@ def test_hub_decorator_wraps_only_gdn_fallbacks(hub_kernels):
     gdn_fn = _gdn_fn("transformers.models.qwen3_5.modeling_qwen3_5")
     assert gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(gdn_fn))
     assert not gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(_gdn_fn("transformers.models.mamba2.modeling_mamba2")))
-    assert not gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(gdn_fn))
+    # The decode update is wrapped too, still only for GatedDeltaNet modules.
+    assert gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(gdn_fn))
+    assert not gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(_gdn_fn("transformers.models.mamba2.modeling_mamba2")))
 
     import types
     legacy = types.ModuleType("legacy")
