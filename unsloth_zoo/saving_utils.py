@@ -525,21 +525,22 @@ pass
 def _with_live_vocab_rows(W, live, chunk = 8192):
     # add_new_tokens seeds rows only in memory (grown, or reusing a padded checkpoint's spare
     # rows). A frozen live row that differs from the checkpoint cast to its dtype was changed there.
+    # Float8 / integer live weights are codes with a separate scale, not comparable values.
+    if not live.dtype.is_floating_point or live.element_size() < 2: return W
     rows, old = live.shape[0], W.shape[0]
-    out = W[:rows].clone() if rows <= old else torch.cat([W, W.new_zeros(rows - old, *W.shape[1:])])
-    for i in range(0, rows, chunk):
-        j = min(i + chunk, rows)
-        live_rows = live[i:j].detach()
-        k = min(j, old)
-        if i < k:
-            changed = (W[i:k].to(live_rows.device, live_rows.dtype) != live_rows[:k - i]).flatten(1).any(1)
-            if changed.any():
-                changed = changed.to(W.device)
-                out[i:k][changed] = live_rows[:k - i].to(W.device, W.dtype)[changed]
-        if j > old:
-            s0 = max(i, old)
-            out[s0:j] = live_rows[s0 - i:].to(W.device, W.dtype)
-    return out
+    out = None if rows == old else (
+        W[:rows].clone() if rows < old else torch.cat([W, W.new_zeros(rows - old, *W.shape[1:])]))
+    for i in range(0, min(rows, old), chunk):
+        k = min(i + chunk, rows, old)
+        live_rows = live[i:k].detach()
+        changed = (W[i:k].to(live_rows.device, live_rows.dtype) != live_rows).flatten(1).any(1)
+        if not changed.any(): continue
+        if out is None: out = W.clone()
+        changed = changed.to(W.device)
+        out[i:k][changed] = live_rows.to(W.device, W.dtype)[changed]
+    if rows > old:
+        out[old:] = live[old:].detach().to(W.device, W.dtype)
+    return W if out is None else out
 pass
 
 

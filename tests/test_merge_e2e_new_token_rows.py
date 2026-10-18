@@ -160,3 +160,21 @@ def test_vocab_wrapped_only_by_an_inactive_adapter_still_grows(tmp_path):
         assert merged[key].shape[0] == NEW_VOCAB
         assert torch.allclose(merged[key], expected[key], atol = 1e-5, rtol = 1e-5), key
     AutoModelForCausalLM.from_pretrained(out_dir)
+
+
+def test_live_vocab_rows_copy_nothing_unless_a_row_changed():
+    from unsloth_zoo.saving_utils import _with_live_vocab_rows
+
+    W = torch.randn(16, 4).to(torch.bfloat16).float()
+    assert _with_live_vocab_rows(W, W.to(torch.bfloat16)) is W
+    live = W.to(torch.bfloat16).clone()
+    live[3] += 1
+    out = _with_live_vocab_rows(W, live)
+    assert out is not W and torch.equal(out[3], live[3].float()) and torch.equal(out[4:], W[4:])
+
+
+def test_float8_live_codes_are_never_copied_over_the_checkpoint():
+    from unsloth_zoo.saving_utils import _with_live_vocab_rows
+
+    W = torch.randn(16, 4)
+    assert _with_live_vocab_rows(W, (W * 7).to(torch.float8_e4m3fn)) is W
