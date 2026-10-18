@@ -230,7 +230,8 @@ def test_bonus_gradient_ignores_grad_output_like_the_policy_term():
 
 def test_grpo_accumulated_loss_wires_mask_and_bonus():
     source = inspect.getsource(rr.grpo_accumulated_loss)
-    assert "_grpo_high_entropy_mask(trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile)" in source
+    assert "trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile," in source
+    assert 'sample_weight = kwargs.get("sample_weight", None),' in source
     assert 'kwargs["entropy_mask"] = entropy_mask' in source
     assert "_UnslothGRPOEntropyBonus.apply(" in source
     assert "and not _need_entropy" in source

@@ -61,3 +61,21 @@ def test_no_sample_weight_is_unchanged():
     weights = rr.grpo_entropy_bonus_weights(mask, None, 0.2, kwargs, trl_version = "1.15.0")
     want = mask.to(torch.float32) * (-0.2 / mask.to(torch.float32).sum().clamp(min = 1.0) / 1)
     assert torch.equal(weights, want)
+
+
+def test_excluded_rows_do_not_set_the_entropy_quantile():
+    # High-entropy excluded completions would otherwise take the top quantile and then be dropped.
+    seen = []
+
+    class Trainer:
+        def get_high_entropy_mask(self, entropies, mask, threshold):
+            seen.append(mask.clone())
+            return mask.bool()
+
+    entropies = torch.rand(3, 4)
+    mask = torch.ones(3, 4)
+    sample_weight = torch.tensor([1.0, 0.0, 2.0])
+    rr.grpo_high_entropy_mask(Trainer(), entropies, mask, 0.8, sample_weight = sample_weight)
+    assert torch.equal(seen[-1], torch.tensor([[1.0] * 4, [0.0] * 4, [1.0] * 4]))
+    rr.grpo_high_entropy_mask(Trainer(), entropies, mask, 0.8)
+    assert torch.equal(seen[-1], mask)

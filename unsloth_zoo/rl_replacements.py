@@ -1290,11 +1290,15 @@ def _high_entropy_mask_pads(method):
 pass
 
 
-def grpo_high_entropy_mask(trainer, entropies, mask, threshold):
+def grpo_high_entropy_mask(trainer, entropies, mask, threshold, sample_weight = None):
     """trainer.get_high_entropy_mask, except on a multi-process run whose method gathers without
     padding (TRL < 0.24): a rank with no valid tokens returns before the gather the other ranks
     enter, so training hangs, and uneven token counts break the gather. Those runs take TRL >= 0.24's
-    padded gather, which sees the same quantile population; a single process is unchanged."""
+    padded gather, which sees the same quantile population; a single process is unchanged.
+    sample_weight: rows with weight 0 (zero-variance exclusion) leave the loss, so they are left
+    out of the quantile population too."""
+    if sample_weight is not None:
+        mask = mask * (sample_weight.to(mask.device) > 0).to(mask.dtype).unsqueeze(-1)
     accelerator = getattr(trainer, "accelerator", None)
     if getattr(accelerator, "num_processes", 1) > 1 and not _high_entropy_mask_pads(trainer.get_high_entropy_mask):
         local = entropies[mask.bool()].float()
@@ -3143,7 +3147,10 @@ def grpo_accumulated_loss(
             if _entropy_mask_on:
                 # TRL's own method, so its quantile population, ties and empty-batch rule match per version
                 # (multi-process TRL < 0.24 takes the padded gather so an empty rank cannot hang the rest).
-                entropy_mask = _grpo_high_entropy_mask(trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile)
+                entropy_mask = _grpo_high_entropy_mask(
+                    trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile,
+                    sample_weight = kwargs.get("sample_weight", None),
+                )
                 kwargs["entropy_mask"] = entropy_mask
 
         # DeepSpeed (no scaler) only: undo training_step's 1/GAS, which transformers >= 5.19 skips when
