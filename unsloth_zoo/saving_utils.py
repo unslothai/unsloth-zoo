@@ -3949,14 +3949,15 @@ pass
 
 
 def _carry_over_vocab_pad_records(base_config, trained_config):
-    def text_config(config):
-        get_text_config = getattr(config, "get_text_config", None)
-        return get_text_config() if callable(get_text_config) else config
-    source, target = text_config(trained_config), text_config(base_config)
+    # Runs on every merged export, so it must not raise: _text_configs tolerates composite configs
+    # whose get_text_config() needs an encoder / decoder choice, and nothing moves without records.
+    sources = _text_configs(trained_config) + [trained_config]
+    targets = _text_configs(base_config) or [base_config]
     for key in ("unsloth_vocab_pad_ids", "unsloth_vocab_pad_suppressed_ids"):
-        ids = getattr(source, key, None)
+        ids = next((getattr(h, key) for h in sources if getattr(h, key, None) is not None), None)
         if ids is None: continue
-        try: setattr(target, key, list(ids))
+        # The first holder is get_text_config(), which vllm_utils._padded_vocab_ids reads.
+        try: setattr(targets[0], key, list(ids))
         except Exception: pass
     pass
 pass

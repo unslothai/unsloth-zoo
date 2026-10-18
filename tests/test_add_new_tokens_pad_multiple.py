@@ -554,3 +554,21 @@ def test_merged_export_config_keeps_vocab_pad_records():
     _carry_over_vocab_size(plain, LlamaConfig(vocab_size = 101))
     assert not hasattr(plain, "unsloth_vocab_pad_ids")
     assert not hasattr(plain, "unsloth_vocab_pad_suppressed_ids")
+
+
+def test_merged_export_tolerates_an_ambiguous_text_config():
+    # get_text_config() raises on configs with several text sections; the export must not abort.
+    from types import SimpleNamespace
+    from unsloth_zoo.saving_utils import _carry_over_vocab_pad_records
+
+    class Ambiguous(SimpleNamespace):
+        def get_text_config(self):
+            raise ValueError("specify decoder = True or encoder = True")
+
+    base = Ambiguous(text_config = SimpleNamespace(vocab_size = 100))
+    trained = Ambiguous(text_config = SimpleNamespace(vocab_size = 128, unsloth_vocab_pad_ids = [101, 102]))
+    _carry_over_vocab_pad_records(base, trained)
+    assert base.text_config.unsloth_vocab_pad_ids == [101, 102]
+    plain_base, plain = Ambiguous(text_config = SimpleNamespace()), Ambiguous(text_config = SimpleNamespace())
+    _carry_over_vocab_pad_records(plain_base, plain)
+    assert not hasattr(plain_base.text_config, "unsloth_vocab_pad_ids")
