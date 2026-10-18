@@ -490,17 +490,16 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     W = W.to(device, dtype = torch.float32, non_blocking = True)
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
     lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
+    module = getattr(lora_stats, "module", None)
+    live = getattr(module, "weight", None)
+    if live is not None and live.device.type != "meta" and tuple(live.shape) == (lora_B.shape[0], W.shape[1]) \
+            and (live.shape[0] != W.shape[0] or isinstance(module, torch.nn.Embedding) or "lm_head" in name.split(".")):
+        W = _with_live_vocab_rows(W, live)
     # Handle vocab resize: LoRA may have more rows than base safetensors weight
     if lora_B.shape[0] != W.shape[0]:
         new_size = lora_B.shape[0]
-        old_size = W.shape[0]
         W_new = torch.zeros(new_size, W.shape[1], dtype=W.dtype, device=W.device)
-        W_new[:min(old_size, new_size)] = W[:new_size]
-        # Rows past the checkpoint exist only in memory (add_new_tokens seeds them), not zeros.
-        live = getattr(getattr(lora_stats, "module", None), "weight", None)
-        if new_size > old_size and live is not None and live.device.type != "meta" \
-                and tuple(live.shape) == tuple(W_new.shape):
-            W_new[old_size:] = live[old_size:].detach().to(W.device, dtype = W.dtype)
+        W_new[:min(W.shape[0], new_size)] = W[:new_size]
         W = W_new.addmm_(lora_B, lora_A, alpha=lora_stats.alpha)
     else:
         W = W.addmm_(lora_B, lora_A, alpha=lora_stats.alpha)
@@ -520,6 +519,27 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     if not torch.isfinite(torch.amax(W)).item():
         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
     return W
+pass
+
+
+def _with_live_vocab_rows(W, live, chunk = 8192):
+    # add_new_tokens seeds rows only in memory (grown, or reusing a padded checkpoint's spare
+    # rows). A frozen live row that differs from the checkpoint cast to its dtype was changed there.
+    rows, old = live.shape[0], W.shape[0]
+    out = W[:rows].clone() if rows <= old else torch.cat([W, W.new_zeros(rows - old, *W.shape[1:])])
+    for i in range(0, rows, chunk):
+        j = min(i + chunk, rows)
+        live_rows = live[i:j].detach()
+        k = min(j, old)
+        if i < k:
+            changed = (W[i:k].to(live_rows.device, live_rows.dtype) != live_rows[:k - i]).flatten(1).any(1)
+            if changed.any():
+                changed = changed.to(W.device)
+                out[i:k][changed] = live_rows[:k - i].to(W.device, W.dtype)[changed]
+        if j > old:
+            s0 = max(i, old)
+            out[s0:j] = live_rows[s0 - i:].to(W.device, W.dtype)
+    return out
 pass
 
 
@@ -986,19 +1006,23 @@ def _get_bias_overrides(biases, safetensor_keys, model_class_name):
 pass
 
 def _untargeted_vocab_weights(base_model, lora_weights, tie_word_embeddings):
-    # add_new_tokens grows both vocab matrices in memory; one with no adapter or saved copy
-    # would keep the checkpoint's row count while config.json takes the new vocab_size.
-    if tie_word_embeddings: return {}
+    # add_new_tokens changes vocab matrices in memory; one with no adapter or saved copy would
+    # keep the checkpoint's rows while config.json takes the new vocab_size.
     modules = []
     for getter in ("get_input_embeddings", "get_output_embeddings"):
         try: modules.append(getattr(base_model, getter)())
         except Exception: pass
+    named = [(n, m) for n, m in base_model.named_modules() if any(m is x for x in modules)]
+    handled = [n in lora_weights or getattr(m, "modules_to_save", None) is not None for n, m in named]
+    # Tied: the merged or saved partner already writes the one shared tensor.
+    if tie_word_embeddings and any(handled): return {}
     out = {}
-    for name, module in base_model.named_modules():
-        if not any(module is m for m in modules) or name in lora_weights: continue
+    for (name, module), done in zip(named, handled):
+        if done: continue
+        # A wrapper left here holds only an inactive adapter.
+        while hasattr(module, "base_layer"): module = module.base_layer
         weight = getattr(module, "weight", None)
         if weight is None or weight.device.type == "meta" or check_if_quantized(module): continue
-        if hasattr(module, "base_layer") or getattr(module, "modules_to_save", None) is not None: continue
         out[name] = weight
     return out
 pass
@@ -1012,9 +1036,8 @@ pass
 
 def _apply_vocab_override(W, vocab_overrides, lora_key, lora_stats):
     live = vocab_overrides.get(lora_key) if lora_stats is None and W is not None else None
-    if live is None or live.shape[0] == W.shape[0] or tuple(live.shape[1:]) != tuple(W.shape[1:]):
-        return W
-    return live.detach().to("cpu", dtype = W.dtype)
+    if live is None or W.dim() != 2 or tuple(live.shape[1:]) != tuple(W.shape[1:]): return W
+    return _with_live_vocab_rows(W, live)
 pass
 
 @torch.inference_mode

@@ -30,7 +30,7 @@ import _merge_e2e_helpers as H
 NEW_VOCAB = 72  # base vocab is 64 (H._VOCAB)
 
 
-def _merged_vs_peft(tmp_path, target_modules):
+def _merged_vs_peft(tmp_path, target_modules, new_vocab = NEW_VOCAB, tie = False, inactive_targets = None):
     from transformers import AutoModelForCausalLM
     from peft import LoraConfig, get_peft_model
 
@@ -41,19 +41,26 @@ def _merged_vs_peft(tmp_path, target_modules):
     out_dir = os.path.join(str(tmp_path), "merged")
 
     torch.manual_seed(H.SEED)
-    model = AutoModelForCausalLM.from_config(H.make_spec("llama").config).to(torch.float32)
+    config = H.make_spec("llama").config
+    config.tie_word_embeddings = tie
+    model = AutoModelForCausalLM.from_config(config).to(torch.float32)
     model.save_pretrained(base_dir, safe_serialization = True)
     model.config._name_or_path = base_dir
 
-    # add_new_tokens: grow, then seed the new rows from the old ones (offset so a zero row can't pass).
-    model.resize_token_embeddings(NEW_VOCAB)
+    # add_new_tokens: grow (or reuse the last spare rows), then seed the new rows from the
+    # others, offset so neither a zero row nor the checkpoint row can pass.
+    model.resize_token_embeddings(new_vocab)
+    new_rows = slice(H._VOCAB, new_vocab) if new_vocab > H._VOCAB else slice(new_vocab - 4, new_vocab)
     with torch.no_grad():
         for w in (model.get_input_embeddings().weight, model.get_output_embeddings().weight):
-            w[H._VOCAB:] = w[:H._VOCAB].mean(0) + 0.5
+            w[new_rows] = w[:new_rows.start].mean(0) + 0.5
 
     torch.manual_seed(H.SEED)
     pm = get_peft_model(model, LoraConfig(
         r = 4, lora_alpha = 8, lora_dropout = 0.0, bias = "none", target_modules = target_modules))
+    if inactive_targets is not None:
+        pm.add_adapter("other", LoraConfig(r = 4, lora_alpha = 8, target_modules = inactive_targets))
+        pm.set_adapter("default")
     H.seed_lora(pm)
     with torch.no_grad():
         for name, p in pm.named_parameters():
@@ -125,3 +132,31 @@ def test_untargeted_vocab_override_reaches_every_shard_writer(tmp_path, quant_ty
     )
     with safe_open(str(shard), framework = "pt", device = "cpu") as f:
         assert torch.equal(f.get_tensor("lm_head.weight"), live)
+
+
+@pytest.mark.parametrize("target_modules", [["embed_tokens", "lm_head", "q_proj"], ["lm_head"]])
+def test_new_tokens_on_spare_padding_rows_keep_their_seeded_values(tmp_path, target_modules):
+    merged, expected, _ = _merged_vs_peft(tmp_path, target_modules, new_vocab = H._VOCAB)
+    for key in ("model.embed_tokens.weight", "lm_head.weight"):
+        assert torch.allclose(merged[key], expected[key], atol = 1e-5, rtol = 1e-5), key
+
+
+def test_tied_shared_vocab_grows_without_a_vocab_adapter(tmp_path):
+    from transformers import AutoModelForCausalLM
+
+    merged, expected, out_dir = _merged_vs_peft(tmp_path, ["q_proj"], tie = True)
+    key = "model.embed_tokens.weight"
+    assert merged[key].shape[0] == NEW_VOCAB
+    assert torch.allclose(merged[key], expected[key], atol = 1e-5, rtol = 1e-5)
+    AutoModelForCausalLM.from_pretrained(out_dir)
+
+
+def test_vocab_wrapped_only_by_an_inactive_adapter_still_grows(tmp_path):
+    from transformers import AutoModelForCausalLM
+
+    merged, expected, out_dir = _merged_vs_peft(
+        tmp_path, ["q_proj"], inactive_targets = ["embed_tokens", "lm_head"])
+    for key in ("model.embed_tokens.weight", "lm_head.weight"):
+        assert merged[key].shape[0] == NEW_VOCAB
+        assert torch.allclose(merged[key], expected[key], atol = 1e-5, rtol = 1e-5), key
+    AutoModelForCausalLM.from_pretrained(out_dir)
