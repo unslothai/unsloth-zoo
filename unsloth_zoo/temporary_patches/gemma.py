@@ -188,9 +188,10 @@ def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states
         q_len, kv_len = query_states.shape[2], key_states.shape[2]
         # FA2 drops an all-valid padding mask and applies the window in its kernel.
         # SDPA needs an explicit window, and an offset causal mask for cached chunks.
+        # Batch 1: the mask is batch-invariant, SDPA broadcasts it.
         if kv_len > sliding_window or (1 < q_len < kv_len):
             attention_mask = torch.ones(
-                (query_states.shape[0], kv_len), dtype=torch.bool, device=query_states.device,
+                (1, kv_len), dtype=torch.bool, device=query_states.device,
             )
     if attention_mask is None or attention_mask.dim() != 2:
         return attention_mask
