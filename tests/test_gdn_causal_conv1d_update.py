@@ -137,6 +137,28 @@ def test_dispatch_fallbacks_and_kill_switch(monkeypatch):
 
 
 @requires_cuda
+@pytest.mark.parametrize("which", ["x", "weight", "bias"])
+def test_grad_tracked_inputs_take_the_torch_path(monkeypatch, which):
+    """The raw launch has no backward, so a grad-tracked decode step must keep autograd's graph."""
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    x, state, w, b = _inputs(1, 64, 1, 4, 4, torch.float32, True)
+    leaf = {"x": x, "weight": w, "bias": b}[which].detach().requires_grad_(True)
+    args = {"x": x, "weight": w, "bias": b, which: leaf}
+    fn = gcc._make_update_dispatch(gcc.causal_conv1d_update_reference)
+    before = dict(gcc.GDN_CAUSAL_CONV1D_STATS)
+    out = fn(args["x"], state.clone(), args["weight"], args["bias"], "silu")
+    assert out.requires_grad
+    out.sum().backward()
+    assert leaf.grad is not None and leaf.grad.abs().sum() > 0
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_update"] == before["triton_update"]
+    # Same tensors under no_grad: the Triton path is back.
+    with torch.no_grad():
+        fn(args["x"], state.clone(), args["weight"], args["bias"], "silu")
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_update"] == before["triton_update"] + 1
+
+
+@requires_cuda
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_cached_launch_matches_reference_over_many_steps(monkeypatch, dtype):
     # Decode steps after the first go through the cached launcher; every one must match torch.

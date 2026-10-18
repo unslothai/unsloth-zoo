@@ -584,6 +584,12 @@ def _try_fast_update(x, conv_state, weight, bias, activation):
     global _update_broken
     if _update_broken or _update_disabled or torch.compiler.is_compiling():
         return None
+    # The raw launch has no backward: anything autograd would track takes the torch path.
+    if torch.is_grad_enabled() and (
+        getattr(x, "requires_grad", False) or getattr(weight, "requires_grad", False)
+        or getattr(bias, "requires_grad", False)
+    ):
+        return None
     try:
         out = _run_update(x, conv_state, weight, bias, activation)
     except torch.cuda.OutOfMemoryError:
