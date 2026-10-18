@@ -4747,12 +4747,13 @@ def fused_qsa_attention(model, *, _modules = None):
 
 def fast_qsa_prefill(model, *, _modules = None):
     """Run mlx-vlm's indexed QSA prefill on the neural accelerators (Qwen3.8 layout), or on GPUs without
-    them on simdgroup matrices, once the kernel passes a probe; not bitwise, as its fp32 sums run in
-    another order. Other calls keep the native kernel. `dispatch_qsa_attention` is rebound process-wide
-    while any scope is open."""
+    them on simdgroup matrices, once the kernel passes a probe. Not bitwise, as its fp32 sums run in another
+    order, but measured no less accurate than stock against fp32 attention. Other calls keep the native
+    kernel. `dispatch_qsa_attention` is rebound process-wide while any scope is open.
+    `UNSLOTH_MLX_FAST_QSA=0` turns the route off."""
     def enter(entered, language, indexer):
         kernels = sys.modules.get("mlx_vlm.models.qwen4_exp.qsa_kernel")
-        if kernels is None:
+        if kernels is None or os.environ.get("UNSLOTH_MLX_FAST_QSA", "1") == "0":
             return
         if nax.kernel_probe_passed(attention.PREFILL_PROBE_KEY, attention.__name__, "probe_fast_prefill"):
             supported, attend = attention.fast_prefill_supported, attention.fast_prefill_attention
@@ -4786,7 +4787,8 @@ class InferenceScope(NamedTuple):
         return call is None or not self.serves or not self.serves.isdisjoint(call)
 
 
-# Outermost first; every generation path (Studio included) enters these. An inexact scope sets `opt_in`.
+# Outermost first; every generation path (Studio included) enters these. A scope that is not bitwise stock
+# and not measured at least as accurate as stock against an fp32 reference (max and mean error) sets `opt_in`.
 # Call traits: "batch", "speculative" (drafts verified in blocks), "vision" (mlx-vlm), "audio".
 INFERENCE_SCOPES = [
     InferenceScope(fused_moe_gate_up),
@@ -4798,7 +4800,7 @@ INFERENCE_SCOPES = [
     InferenceScope(dense_prefill_linear),
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_qsa_attention),
-    InferenceScope(fast_qsa_prefill, opt_in = "UNSLOTH_MLX_FAST_QSA"),
+    InferenceScope(fast_qsa_prefill),
     InferenceScope(fused_residual_norm_handoff),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),

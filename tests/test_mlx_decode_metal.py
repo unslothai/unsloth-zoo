@@ -912,7 +912,7 @@ def test_qsa_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
 
 def _qsa_prefill_scope(monkeypatch, calls):
     from mlx_vlm.models.qwen4_exp import qsa_kernel
-    monkeypatch.setenv("UNSLOTH_MLX_FAST_QSA", "1")
+    monkeypatch.delenv("UNSLOTH_MLX_FAST_QSA", raising = False)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
     monkeypatch.setattr(mlx_attention, "fast_prefill_supported", lambda queries, *args: queries.shape[2] >= 20)
     monkeypatch.setattr(mlx_attention, "fast_prefill_attention", lambda q, k, v, blocks, ends, scale: calls.append(
@@ -959,7 +959,7 @@ def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
     attention, calls = _qsa_layer(), []
     _qsa_prefill_scope(monkeypatch, calls)
     if reason == "switch":
-        monkeypatch.delenv("UNSLOTH_MLX_FAST_QSA")
+        monkeypatch.setenv("UNSLOTH_MLX_FAST_QSA", "0")
     elif reason == "probe":
         monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: False)
     else:
