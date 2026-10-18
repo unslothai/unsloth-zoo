@@ -66,3 +66,25 @@ def test_pageable_fallback_frees_block_last_used_by_async_copy(gc_module, monkey
     assert torch.cuda.host_memory_stats()["allocated_bytes.current"] > base
     assert gc_module._empty_host_cache() is True
     assert torch.cuda.host_memory_stats()["allocated_bytes.current"] == base
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA pinned memory")
+def test_flush_waits_for_a_copy_still_in_flight(gc_module):
+    # A released block whose non_blocking copy has not finished stays queued in torch's host
+    # cache; the flush must not drop its bookkeeping while the allocator still holds it.
+    torch.cuda.synchronize()
+    torch._C._host_emptyCache()
+    base = torch.cuda.host_memory_stats()["allocated_bytes.current"]
+    n = 4 << 20
+    x = gc_module._mark_host_buffer(torch.empty(n, dtype = torch.float16, pin_memory = True))
+    block = gc_module._pinned_block_bytes(gc_module._storage_bytes(x))
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(200_000_000)  # keep the copy in flight while we flush
+        torch.ones(n, device = "cuda", dtype = torch.float16).copy_(x, non_blocking = True)
+    del x
+    gc_module._PINNED_CACHED[block] = 1
+    gc_module.GC_PINNED_BYTES = block
+    assert gc_module._empty_host_cache() is True
+    assert not gc_module._PINNED_CACHED and gc_module.GC_PINNED_BYTES == 0
+    assert torch.cuda.host_memory_stats()["allocated_bytes.current"] == base

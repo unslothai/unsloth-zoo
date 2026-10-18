@@ -277,6 +277,11 @@ def _empty_host_cache():
     # non_blocking copy (every pinned offload slot) still reads as active there: our own released
     # blocks are reason enough to flush, and _host_emptyCache processes those events first.
     if not (ours or free): return False
+    if ours:
+        # _host_emptyCache only frees blocks whose copy events completed: wait for our released
+        # blocks' last non_blocking copies, or the bookkeeping below drops blocks still held.
+        try: torch.cuda.synchronize()
+        except Exception: pass
     try: torch._C._host_emptyCache()
     except Exception: return False
     GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - ours)

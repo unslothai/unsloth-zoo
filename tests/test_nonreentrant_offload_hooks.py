@@ -244,6 +244,7 @@ def test_capped_pinning_survives_blocks_freed_after_async_copies(gc_module, monk
 
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_a_probe_that_pins_a_new_block_releases_it(gc_module):
     # Another pinned user holds the cached block, so the probe pins a fresh one: it must not stay
     # cached past the cap.
@@ -259,6 +260,7 @@ def test_a_probe_that_pins_a_new_block_releases_it(gc_module):
     del other
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_a_probe_failure_other_than_oom_is_raised(gc_module, monkeypatch):
     if not hasattr(torch.cuda, "host_memory_stats"):
         pytest.skip("torch < 2.7 has no host_memory_stats")
