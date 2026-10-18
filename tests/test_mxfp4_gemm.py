@@ -76,6 +76,8 @@ def _cvt_supported():
 
 
 def _need_cvt(asm):
+    if asm and (torch.version.hip is not None or torch.cuda.get_device_capability() < (8, 0)):
+        pytest.skip("the inline-PTX decodes are CUDA sm_80+ only; _asm_ok keeps the plain decode here")
     if asm == 2 and not _cvt_supported():
         pytest.skip("hardware e2m1 convert needs sm_100+ / sm_120 and ptxas with PTX 9.2")
 
@@ -101,7 +103,9 @@ def test_decode_mode_dispatch_and_off_switch(monkeypatch):
         monkeypatch.setenv("UNSLOTH_MXFP4_CVT", env)
         monkeypatch.setattr(mg, "_ASM_OK", {})
         mode = mg._asm_ok(torch.device("cuda", index))
-        assert (mode == 2) == want and mode  # never drops below the fma decode on sm_80+
+        # sm_75 and HIP keep the plain Triton decode (False); sm_80+ CUDA never drops below the fma decode.
+        fma_eligible = torch.version.hip is None and torch.cuda.get_device_capability(index) >= (8, 0)
+        assert (mode == 2) == want and bool(mode) == fma_eligible
     monkeypatch.setenv("UNSLOTH_MXFP4_ASM", "0")
     monkeypatch.setattr(mg, "_ASM_OK", {})
     assert mg._asm_ok(torch.device("cuda", index)) is False
