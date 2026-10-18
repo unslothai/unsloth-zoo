@@ -1,0 +1,63 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Zero-variance exclusion (sample_weight == 0) must drop a completion from the entropy bonus too."""
+import pytest
+import torch
+
+import unsloth_zoo.rl_replacements as rr
+
+
+def _kwargs(sample_weight, loss_type = "dapo"):
+    return dict(
+        loss_type = loss_type, num_items_in_batch = torch.tensor(12.0), num_processes = 1,
+        current_gradient_accumulation_steps = 1, steps_per_generation = 1, sample_weight = sample_weight,
+    )
+
+
+@pytest.mark.parametrize("trl_version", ["1.8.0", "1.15.0"])
+def test_fully_excluded_batch_gets_no_entropy_gradient(trl_version):
+    mask = torch.ones((2, 3), dtype = torch.long)
+    logits = torch.randn(2, 3, 4, generator = torch.Generator().manual_seed(0), requires_grad = True)
+    logp = logits.log_softmax(-1)
+    entropies = -(logp.exp() * logp).sum(-1)
+    kwargs = _kwargs(torch.zeros(2))
+    weights = rr.grpo_entropy_bonus_weights(mask, None, 0.1, kwargs, trl_version = trl_version)
+    bonus = rr.UnslothGRPOEntropyBonus.apply(entropies, weights, 1.0, None)
+    bonus.backward()
+    assert bonus.item() == 0.0
+    assert logits.grad.abs().max().item() == 0.0
+
+
+def test_partial_exclusion_matches_masked_mean():
+    gen = torch.Generator().manual_seed(3)
+    mask = (torch.rand(4, 5, generator = gen) > 0.2).long()
+    entropies = torch.rand(4, 5, generator = gen, dtype = torch.float64)
+    sample_weight = torch.tensor([0.0, 0.1, 0.0, 0.05])
+    weights = rr.grpo_entropy_bonus_weights(mask, None, 0.3, _kwargs(sample_weight), trl_version = "1.15.0")
+    kept = mask.double() * (sample_weight > 0).double().unsqueeze(-1)
+    want = -0.3 * (entropies * kept).sum() / kept.sum().clamp(min = 1.0)
+    torch.testing.assert_close((weights.double() * entropies).sum(), want)
+    assert (weights[sample_weight == 0] == 0).all()
+
+
+def test_no_sample_weight_is_unchanged():
+    gen = torch.Generator().manual_seed(4)
+    mask = (torch.rand(3, 6, generator = gen) > 0.3).long()
+    kwargs = _kwargs(None)
+    weights = rr.grpo_entropy_bonus_weights(mask, None, 0.2, kwargs, trl_version = "1.15.0")
+    want = mask.to(torch.float32) * (-0.2 / mask.to(torch.float32).sum().clamp(min = 1.0) / 1)
+    assert torch.equal(weights, want)

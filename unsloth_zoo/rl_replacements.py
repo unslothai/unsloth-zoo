@@ -1245,6 +1245,10 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
     weights = completion_mask.to(torch.float32)
     if entropy_mask is not None:
         weights = weights * entropy_mask
+    sample_weight = loss_kwargs.get("sample_weight", None)
+    if sample_weight is not None:
+        # Zero-variance exclusion drops a completion from the whole loss, the entropy bonus included.
+        weights = weights * (sample_weight.to(weights.device) > 0).to(weights.dtype).unsqueeze(-1)
     if trl_version is None:
         try:
             import trl
