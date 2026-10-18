@@ -290,6 +290,11 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     ),
     lm_head_bias: Optional[torch.Tensor] = None,
     return_entropy: bool = False,
+    # Same flag and default as chunked_hidden_states_selective_log_softmax, which scores old / ref
+    # logps: entropy and recompute scoring must project the head in the same precision.
+    fp32_lm_head: bool = (
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+    ),
 ):
     # All Unsloth Zoo code licensed under AGPL3
     self_fn = chunked_hidden_states_selective_log_softmax_recompute
@@ -476,7 +481,16 @@ def chunked_hidden_states_selective_log_softmax_recompute(
         float(logit_scale_multiply), float(logit_scale_divide),
         float(logit_softcapping), float(temperature), bool(return_entropy),
     )
-    logps, entropies = function.apply(flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms)
+    if fp32_lm_head:
+        # One fp32 head copy (autograd casts its gradient back), and no autocast, which would
+        # downcast the matmul; forward saves the disabled state, so backward recomputes in fp32 too.
+        lm_head = lm_head.to(torch.float32)
+        if lm_head_bias is not None:
+            lm_head_bias = lm_head_bias.to(torch.float32)
+        with torch.autocast(device_type = lm_head.device.type, enabled = False):
+            logps, entropies = function.apply(flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms)
+    else:
+        logps, entropies = function.apply(flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms)
     logps = logps.reshape(hidden_states.shape[0], hidden_states.shape[1])
     if return_entropy:
         return logps, entropies.reshape(hidden_states.shape[0], hidden_states.shape[1])
