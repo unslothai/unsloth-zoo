@@ -220,6 +220,22 @@ def _host_allocator_free_bytes():
     except Exception: return None
 
 
+def _host_cache_reuses_block(block):
+    """A pinned block freed after a non_blocking copy waits in torch's event queue, which only an
+    allocation drains (host_memory_stats does not), so it reads as not free. Allocate and drop a
+    block of that size to drain it: True if the allocator reused a cached block, False if it had
+    to pin a new one (that one stays cached free for the next request of this size)."""
+    held = _host_allocator_held_bytes()
+    if held is None: return False
+    try:
+        probe = torch.empty(block, dtype = torch.uint8, device = "cpu", pin_memory = True)
+    except Exception:
+        return False
+    after = _host_allocator_held_bytes()
+    del probe
+    return after is not None and after <= held
+
+
 def _compute_pinned_cap():
     env = os.environ.get("UNSLOTH_GC_PINNED_MAX_GB")
     if env:
@@ -292,7 +308,11 @@ def _reserve_pinned(nbytes):
     if _PINNED_CACHED.get(block, 0) > 0:
         _PINNED_CACHED[block] -= 1
         free = _host_allocator_free_bytes()
-        if free is None or free >= block:
+        # Under a fixed cap a refusal here is sticky (pageable copies never drain the queue), so
+        # check the event queue; the per block mode re-checks host RAM below instead.
+        if free is None or free >= block or (
+            GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0 and _host_cache_reuses_block(block)
+        ):
             return True  # the allocator hands back the cached block, already charged
         # Another pinned user took the block: it is no longer ours, and this request is new.
         GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)

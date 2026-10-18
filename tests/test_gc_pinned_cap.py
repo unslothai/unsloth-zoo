@@ -175,6 +175,8 @@ def test_cached_block_taken_by_another_user_is_not_reused_past_the_cap(monkeypat
     free = {"bytes": 0}
     monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: held["bytes"])
     monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: free["bytes"])
+    # Draining torch's event queue finds no free block of this size: the other user has it.
+    monkeypatch.setattr(gc_module, "_host_cache_reuses_block", lambda block: False, raising = False)
     assert gc_module._reserve_pinned(4096)
     held["bytes"] = 4096
     gc_module._release_pinned(4096)                 # cached, but a pinned DataLoader takes it

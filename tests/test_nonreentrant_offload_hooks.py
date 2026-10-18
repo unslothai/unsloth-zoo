@@ -210,3 +210,35 @@ def test_distributed_default_bounds_inflight_copies(gc_module, monkeypatch):
     assert gc_module.NonReentrantActivationOffloader().max_inflight == 1
     monkeypatch.setenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", "3")
     assert gc_module.NonReentrantActivationOffloader().max_inflight == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_capped_pinning_survives_blocks_freed_after_async_copies(gc_module, monkeypatch):
+    # unpack's non_blocking H2D leaves each freed host block in torch's event queue, and
+    # host_memory_stats() does not drain it, so the cached blocks read as not free. Once the
+    # cap was reached, every later layer used to go pageable for the rest of training.
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    torch.cuda.synchronize()
+    torch._C._host_emptyCache()
+    base = gc_module._host_allocator_held_bytes()  # live pinned memory of earlier tests
+    block = 1 << 20
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(3 * block / (1 << 30)))
+    monkeypatch.setattr(gc_module, "_WARNED_ABOUT_PINNED_CAP", True, raising = False)
+    monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
+    layers = [torch.nn.Linear(1024, 1024).cuda() for _ in range(6)]
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    pinned = []
+    for _ in range(4):
+        before = offloader.stats["pinned"]
+        h = torch.randn(256, 1024, device = "cuda", requires_grad = True)  # 1 MiB per layer input
+        for layer in layers:
+            with offloader.hooks():
+                h = ckpt.checkpoint(layer, h, use_reentrant = False)
+        h.sum().backward()
+        torch.cuda.synchronize()
+        pinned.append(offloader.stats["pinned"] - before)
+    # 3 blocks fit the cap: every step reuses them, none pins past it.
+    assert pinned == [3, 3, 3, 3]
+    assert gc_module._host_allocator_held_bytes() - base <= 3 * block
+
