@@ -76,6 +76,8 @@ def _cvt_supported():
 
 
 def _need_cvt(asm):
+    if asm and (torch.version.hip is not None or torch.cuda.get_device_capability() < (8, 0)):
+        pytest.skip("the inline-PTX decodes are CUDA sm_80+ only; _asm_ok keeps the plain decode here")
     if asm == 2 and not _cvt_supported():
         pytest.skip("hardware e2m1 convert needs sm_100+ / sm_120 and ptxas with PTX 9.2")
 
