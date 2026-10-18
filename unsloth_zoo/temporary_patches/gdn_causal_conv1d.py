@@ -340,6 +340,7 @@ def _build_update_kernel():
         D, T,
         stride_x_b, stride_x_d, stride_x_t,
         stride_s_b, stride_s_d, stride_s_l,
+        stride_y_b, stride_y_d, stride_y_t,
         L: tl.constexpr,
         LP: tl.constexpr,
         W: tl.constexpr,
@@ -355,7 +356,7 @@ def _build_update_kernel():
         o_d64 = o_d.to(tl.int64)
         p_x = x + tl.cast(i_b, tl.int64) * stride_x_b + o_d64 * stride_x_d
         p_s = state + tl.cast(i_b, tl.int64) * stride_s_b + o_d64 * stride_s_d
-        p_y = y + tl.cast(i_b, tl.int64) * T * D + o_d64
+        p_y = y + tl.cast(i_b, tl.int64) * stride_y_b + o_d64 * stride_y_d
         if HAS_BIAS:
             b_bias = tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)
         for t in range(T):
@@ -371,7 +372,7 @@ def _build_update_kernel():
                 # The torch path stores the conv output in the input dtype, then SiLU.
                 acc = acc.to(y.dtype.element_ty).to(tl.float32)
                 acc = acc * tl.sigmoid(acc)
-            tl.store(p_y + t * D, acc.to(y.dtype.element_ty), mask = m_d)
+            tl.store(p_y + t * stride_y_t, acc.to(y.dtype.element_ty), mask = m_d)
         o_l = tl.arange(0, LP)
         c = T + o_l
         m_l = (o_l < L)[:, None] & m_d[None, :]
@@ -395,38 +396,83 @@ def _build_update_kernel():
 _UPDATE_CONFIG = (128, 4)
 
 
-def triton_causal_conv1d_update(x, conv_state, weight, bias = None, activation = None):
-    """x (B, D, T), conv_state (B, D, L) updated in place, weight (D, W) -> (B, D, T) stored channel-last."""
-    kernel = _build_update_kernel()
-    _BD, _NUM_WARPS = _UPDATE_CONFIG
-    B, D, T = x.shape
-    L, W = conv_state.shape[-1], weight.shape[1]
-    y = torch.empty((B, T, D), dtype = x.dtype, device = x.device)
-    grid = ((D + _BD - 1) // _BD, B)
-    with torch.cuda.device(x.device):
-        kernel[grid](
-            x, conv_state, weight, bias if bias is not None else weight, y,
-            D, T,
-            x.stride(0), x.stride(1), x.stride(2),
-            conv_state.stride(0), conv_state.stride(1), conv_state.stride(2),
-            L = L, LP = triton_next_power_of_2(L), W = W, BD = _BD,
-            HAS_BIAS = bias is not None,
-            ACTIVATION = activation is not None,
-            num_warps = _NUM_WARPS,
-            enable_fp_fusion = True,
-        )
-    return y.transpose(1, 2)
-
-
 def triton_next_power_of_2(n):
     return 1 << max(0, int(n) - 1).bit_length()
 
 
+_runtime_hooks = None
+
+
+def _launch_hooks_set():
+    global _runtime_hooks
+    if _runtime_hooks is None:
+        try:
+            from triton import knobs
+            _runtime_hooks = knobs.runtime
+        except Exception:
+            from triton.compiler.compiler import CompiledKernel
+            _runtime_hooks = CompiledKernel
+    return _hook_active(_runtime_hooks.launch_enter_hook) or _hook_active(_runtime_hooks.launch_exit_hook)
+
+
+def _hook_active(hook):
+    # Triton 3.6+ keeps an always-present HookChain; empty means no profiler hooked in.
+    return hook is not None and bool(getattr(hook, "calls", True))
+
+
+def triton_causal_conv1d_update(x, conv_state, weight, bias = None, activation = None):
+    """x (B, D, T), conv_state (B, D, L) updated in place, weight (D, W) -> (B, D, T) in x's layout.
+    Always the full Triton launch (specialization + argument binding); the decode path caches it."""
+    return _launch_update(x, conv_state, weight, bias, activation)[0]
+
+
+def _launch_update(x, conv_state, weight, bias, activation, y = None):
+    kernel = _build_update_kernel()
+    _BD, _NUM_WARPS = _UPDATE_CONFIG
+    B, D, T = x.shape
+    L, W = conv_state.shape[-1], weight.shape[1]
+    if y is None:
+        # Keeps x's strides (the modeling code hands a transposed channel-last view): no extra copy.
+        y = torch.empty_like(x)
+    grid = ((D + _BD - 1) // _BD, B)
+    ints = (D, T, *x.stride(), *conv_state.stride(), *y.stride())
+    tail = (L, triton_next_power_of_2(L), W, _BD, bias is not None, activation is not None)
+    args = (x, conv_state, weight, bias if bias is not None else weight, y) + ints + tail
+    if x.get_device() != torch._C._cuda_getDevice():
+        with torch.cuda.device(x.device):
+            compiled = kernel[grid](*args, num_warps = _NUM_WARPS, enable_fp_fusion = True)
+    else:
+        compiled = kernel[grid](*args, num_warps = _NUM_WARPS, enable_fp_fusion = True)
+    return y, (grid, compiled, ints, ints + tail)
+
+
+# key -> (grid, compiled kernel, runtime ints, runtime ints + constexprs) for repeated decode
+# steps; None = ineligible.
+_update_plans = {}
+# Which argument list the cached launcher takes on this Triton: None = not checked yet,
+# "all" (3.3+: every parameter), "runtime" (older: constexprs dropped), False = full launches only.
+_fast_launch_mode = None
+
+
+def _update_key(x, conv_state, weight, bias, activation):
+    # Everything the eligibility check and Triton's specialization read: shapes, strides, dtypes,
+    # devices and the integer values (==1, %16). Pointer alignment is checked by the caller.
+    return (
+        x.shape, x.stride(), x.dtype, x.get_device(),
+        conv_state.shape, conv_state.stride(), conv_state.dtype, conv_state.get_device(),
+        weight.shape, weight.stride(), weight.dtype, weight.get_device(),
+        None if bias is None else (bias.shape, bias.stride(), bias.dtype, bias.get_device()),
+        activation,
+    )
+
+
 def _update_eligible(x, conv_state, weight, bias, activation):
     return (
-        x.is_cuda and x.dim() == 3 and x.numel() > 0 and x.dtype in _SUPPORTED_DTYPES
+        isinstance(x, torch.Tensor) and isinstance(conv_state, torch.Tensor)
+        and isinstance(weight, torch.Tensor) and (bias is None or isinstance(bias, torch.Tensor))
+        and x.is_cuda and x.dim() == 3 and x.numel() > 0 and x.dtype in _SUPPORTED_DTYPES
         and 1 <= x.shape[2] <= _MAX_UPDATE_T and x.shape[0] <= _MAX_GRID_YZ
-        and isinstance(conv_state, torch.Tensor) and conv_state.dim() == 3
+        and conv_state.dim() == 3
         and conv_state.dtype == x.dtype and conv_state.device == x.device
         and conv_state.shape[:2] == x.shape[:2]
         and weight.dim() == 2 and weight.dtype == x.dtype and weight.device == x.device
@@ -442,15 +488,89 @@ def _update_eligible(x, conv_state, weight, bias, activation):
     )
 
 
+def _fast_launch(mode, plan, x, conv_state, weight, bias, y):
+    grid, compiled, ints, all_ints = plan
+    compiled.run(
+        grid[0], grid[1], 1, torch._C._cuda_getCurrentRawStream(x.get_device()),
+        compiled.function, compiled.packed_metadata, None, None, None,
+        x, conv_state, weight, bias if bias is not None else weight, y,
+        *(all_ints if mode == "all" else ints),
+    )
+
+
+def _check_fast_launch(plan, x, conv_state, weight, bias, activation):
+    """Once per process: launch through the cached launcher and compare with a full launch on
+    copies; pick the argument convention this Triton takes, or keep full launches."""
+    global _fast_launch_mode
+    state_before = conv_state.clone()
+    for mode in ("all", "runtime"):
+        ref_state = state_before.clone()
+        y_ref = _launch_update(x, ref_state, weight, bias, activation)[0]
+        y = torch.empty_like(x)
+        try:
+            _fast_launch(mode, plan, x, conv_state, weight, bias, y)
+            ok = torch.equal(y, y_ref) and torch.equal(conv_state, ref_state)
+        except Exception:
+            ok = False
+        if ok:
+            _fast_launch_mode = mode
+            return y
+        conv_state.copy_(state_before)
+    _fast_launch_mode = False
+    return _launch_update(x, conv_state, weight, bias, activation)[0]
+
+
+def _run_update(x, conv_state, weight, bias, activation):
+    """Triton update for repeated decode steps: one dict lookup on the cached plan, then a direct
+    launcher call (no re-specialization or argument binding). None = use the torch fallback."""
+    try:
+        key = _update_key(x, conv_state, weight, bias, activation)
+    except (AttributeError, TypeError):
+        return None  # not tensors: the torch path decides
+    plan = _update_plans.get(key, 0)
+    if plan is None:
+        return None
+    if plan == 0:
+        if not _update_eligible(x, conv_state, weight, bias, activation):
+            _update_plans[key] = None
+            return None
+        y, plan = _launch_update(x, conv_state, weight, bias, activation)
+        # Triton specializes pointers on 16-byte alignment: cache only the all-aligned plan.
+        if not _unaligned(x, conv_state, weight, bias):
+            _update_plans[key] = plan
+        return y
+    if (
+        _fast_launch_mode is False or _unaligned(x, conv_state, weight, bias) or _launch_hooks_set()
+        or x.get_device() != torch._C._cuda_getDevice()
+    ):
+        return _launch_update(x, conv_state, weight, bias, activation)[0]
+    if _fast_launch_mode is None:
+        return _check_fast_launch(plan, x, conv_state, weight, bias, activation)
+    y = torch.empty_like(x)
+    _fast_launch(_fast_launch_mode, plan, x, conv_state, weight, bias, y)
+    return y
+
+
+def _unaligned(x, conv_state, weight, bias):
+    return (x.data_ptr() | conv_state.data_ptr() | weight.data_ptr() | (0 if bias is None else bias.data_ptr())) & 15
+
+
+# Read once: the decode path runs per token per layer. `_refresh_kill_switch` re-reads it.
+_update_disabled = _disabled()
+
+
+def _refresh_kill_switch():
+    global _update_disabled
+    _update_disabled = _disabled()
+
+
 def _try_fast_update(x, conv_state, weight, bias, activation):
     """Run the Triton update, or return None to use the torch fallback."""
     global _update_broken
-    if _update_broken or torch.compiler.is_compiling() or _disabled():
-        return None
-    if not _update_eligible(x, conv_state, weight, bias, activation):
+    if _update_broken or _update_disabled or torch.compiler.is_compiling():
         return None
     try:
-        out = triton_causal_conv1d_update(x, conv_state, weight, bias, activation)
+        out = _run_update(x, conv_state, weight, bias, activation)
     except torch.cuda.OutOfMemoryError:
         raise
     except Exception as e:
@@ -458,7 +578,8 @@ def _try_fast_update(x, conv_state, weight, bias, activation):
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: Triton causal_conv1d_update failed, using torch: {e}")
         return None
-    GDN_CAUSAL_CONV1D_STATS["triton_update"] += 1
+    if out is not None:
+        GDN_CAUSAL_CONV1D_STATS["triton_update"] += 1
     return out
 
 
@@ -744,6 +865,7 @@ def _rebind_module(module, patched_decorator):
 
 
 def patch_gdn_causal_conv1d():
+    _refresh_kill_switch()
     if _disabled() or _real_causal_conv1d_available():
         return
     if not torch.cuda.is_available() or torch.version.hip is not None:

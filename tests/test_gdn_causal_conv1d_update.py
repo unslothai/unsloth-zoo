@@ -127,22 +127,85 @@ def test_dispatch_fallbacks_and_kill_switch(monkeypatch):
     fn(long_x, state, w, b, "silu")                                                     # long T
     assert len(calls) == 4
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")
+    gcc._refresh_kill_switch()  # read once, not per call
     fn(x, state, w, b, "silu")
+    monkeypatch.delenv(gcc._KILL_SWITCH)
+    gcc._refresh_kill_switch()
     assert len(calls) == 5
     assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_update"] == before["triton_update"] + 1
     assert gcc.GDN_CAUSAL_CONV1D_STATS["update_fallback"] == before["update_fallback"] + 5
 
 
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_cached_launch_matches_reference_over_many_steps(monkeypatch, dtype):
+    # Decode steps after the first go through the cached launcher; every one must match torch.
+    monkeypatch.setattr(gcc, "_update_plans", {})
+    monkeypatch.setattr(gcc, "_fast_launch_mode", None)
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    B, D, W, L = 2, 640, 4, 4
+    g = torch.Generator(device = "cuda").manual_seed(3)
+    w = (torch.randn(D, W, device = "cuda", generator = g) * 0.5).to(dtype)
+    b = (torch.randn(D, device = "cuda", generator = g) * 0.1).to(dtype)
+    state = torch.randn(B, D, L, device = "cuda", generator = g).to(dtype)
+    ref_state = state.clone()
+    for step in range(6):
+        x = torch.randn(B, 1, D, device = "cuda", generator = g).to(dtype).transpose(1, 2)
+        full = gcc.triton_causal_conv1d_update(x, state.clone(), w, b, "silu")
+        ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, "silu")
+        ours = gcc._try_fast_update(x, state, w, b, "silu")
+        assert ours is not None and ours.stride() == x.stride()
+        assert torch.equal(state, ref_state), step
+        # Same kernel either way: the cached launch is bitwise the full launch.
+        assert torch.equal(ours, full), step
+        assert _rel(ours, ref) < (1e-5 if dtype == torch.float32 else 5e-3), step
+    # One plan for the repeated shape, and this Triton took one of the two launcher conventions.
+    assert len(gcc._update_plans) == 1
+    assert gcc._fast_launch_mode in ("all", "runtime")
+
+
+@requires_cuda
+def test_unaligned_and_uncached_paths(monkeypatch):
+    monkeypatch.setattr(gcc, "_update_plans", {})
+    monkeypatch.setattr(gcc, "_fast_launch_mode", False)  # a Triton whose launcher did not check out
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    x, state, w, b = _inputs(1, 256, 1, 4, 4, torch.bfloat16, True)
+    for _ in range(3):
+        ref_state = state.clone()
+        ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, "silu")
+        assert _rel(gcc._try_fast_update(x, state, w, b, "silu"), ref) < 5e-3
+        assert torch.equal(state, ref_state)
+    # A 2-byte offset view: not 16-byte aligned, so never served from the cached plan.
+    buf = torch.randn(1, 256 * 2 + 1, device = "cuda").to(torch.bfloat16)
+    xu = buf[:, 1:257].unsqueeze(-1)
+    monkeypatch.setattr(gcc, "_fast_launch_mode", None)
+    for _ in range(3):
+        ref_state = state.clone()
+        ref = gcc.causal_conv1d_update_reference(xu, ref_state, w, b, "silu")
+        assert _rel(gcc._try_fast_update(xu, state, w, b, "silu"), ref) < 5e-3
+        assert torch.equal(state, ref_state)
+    assert gcc._fast_launch_mode is None  # the unaligned input never reached the cached launcher
+
+
+def test_non_tensor_arguments_fall_back_without_disabling(monkeypatch):
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    assert gcc._try_fast_update(torch.zeros(1, 4, 1), None, torch.zeros(4, 4), None, "silu") is None
+    assert gcc._update_broken is False
+
+
 def test_failure_disables_update_but_oom_propagates(monkeypatch):
     monkeypatch.delenv(gcc._KILL_SWITCH, raising = False)
     monkeypatch.setattr(gcc, "_update_broken", False)
-    monkeypatch.setattr(gcc, "_update_eligible", lambda *a: True)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
     x = torch.zeros(1, 4, 1)
 
     def oom(*a):
         raise torch.cuda.OutOfMemoryError("CUDA out of memory")
 
-    monkeypatch.setattr(gcc, "triton_causal_conv1d_update", oom)
+    monkeypatch.setattr(gcc, "_run_update", oom)
     with pytest.raises(torch.cuda.OutOfMemoryError):
         gcc._try_fast_update(x, x, x[0], None, "silu")
     assert gcc._update_broken is False
@@ -150,7 +213,7 @@ def test_failure_disables_update_but_oom_propagates(monkeypatch):
     def fail(*a):
         raise RuntimeError("triton launch failed")
 
-    monkeypatch.setattr(gcc, "triton_causal_conv1d_update", fail)
+    monkeypatch.setattr(gcc, "_run_update", fail)
     assert gcc._try_fast_update(x, x, x[0], None, "silu") is None
     assert gcc._update_broken is True
 
