@@ -1913,7 +1913,7 @@ def fused_residual_norm_handoff(model, *, _modules = None):
 _QWEN_ROUTING, _GEMMA_ROUTING = 0, 1  # kernel MODE
 
 # The kernel emulates the chain's rounding: softmax partials and reciprocal, stable tie order,
-# sequential bf16 sum over <= 8 values. `_moe_router_verified` checks that at first use.
+# sequential bf16 sum of the top-k scores. `_moe_router_verified` checks that at first use.
 # unary_ops.h's Sigmoid, as mx.sigmoid evaluates the shared-expert gate.
 _MOE_ROUTER_SIGMOID = """
     template <typename T>
@@ -1924,14 +1924,24 @@ _MOE_ROUTER_SIGMOID = """
 """
 
 
+# MLX's block softmax adds per-simdgroup totals with one simd_sum over lanes; past two
+# simdgroups (256 experts) that differs from adding them in turn, so wide routing has its own source.
+_MOE_ROUTER_GROUP_TOTAL = "total += simd_sum(partial);"
+_MOE_ROUTER_WIDE_GROUP_TOTAL = """
+                        const float group = simd_sum(partial);
+                        if (lane == uint(g)) total = group;
+                        if (g == R / 4 - 1) total = simd_sum(total);"""
+
+
 @functools.cache
-def _moe_router_kernel(shared = False):
-    """The routing kernel; `shared` also writes the sigmoid of each row's shared-expert gate logit."""
+def _moe_router_kernel(shared = False, wide = False):
+    """The routing kernel; `shared` also writes the sigmoid of each row's shared-expert gate logit,
+    `wide` serves Qwen routing over more than 256 experts."""
     try:
         if not mx.metal.is_available():
             return None
         return mx.fast.metal_kernel(
-            name = "unsloth_moe_router_shared" if shared else "unsloth_moe_router",
+            name = "unsloth_moe_router" + ("_wide" if wide else "") + ("_shared" if shared else ""),
             input_names = ["logits", "scale"] + (["shared_logit"] if shared else []),
             output_names = ["inds", "weights"] + (["shared"] if shared else []),
             compile_options = {"math_mode": "safe"},
@@ -1970,7 +1980,7 @@ def _moe_router_kernel(shared = False):
                             v[4 * g + i] = fast::exp(v[4 * g + i] - m);
                             partial += v[4 * g + i];
                         }
-                        total += simd_sum(partial);
+                        GROUP_TOTAL
                     }
                     const float normalizer = 1 / total;
                     for (int r = 0; r < R; ++r) v[r] = float(T(v[r] * normalizer));
@@ -2021,7 +2031,8 @@ def _moe_router_kernel(shared = False):
                         ow[k] = OUT_T(float(T(e[k] * recip)) * float(scale[sel_idx[k]]));
                     }
                 }
-            """.replace("SHARED_SCALE", "shared[row] = unsloth_sigmoid(shared_logit[row]);" if shared else ""),
+            """.replace("SHARED_SCALE", "shared[row] = unsloth_sigmoid(shared_logit[row]);" if shared else "")
+               .replace("GROUP_TOTAL", _MOE_ROUTER_WIDE_GROUP_TOTAL if wide else _MOE_ROUTER_GROUP_TOTAL),
         )
     except (AttributeError, TypeError):
         return None
@@ -2031,16 +2042,15 @@ _MOE_ROUTER_DTYPES = (mx.bfloat16, mx.float16, mx.float32)
 
 
 def _moe_router_shape_ok(experts, top_k, mode):
-    # Qwen sums softmax partials of at most two simdgroups in the native order;
-    # the 32-bit `taken` mask caps both modes at 1024.
-    return experts % 32 == 0 and experts <= (256 if mode == _QWEN_ROUTING else 1024) and 1 <= top_k <= 8
+    # The 32-bit `taken` mask caps both modes at 1024; Gemma's top-k softmax sums at most two parts.
+    return experts % 32 == 0 and experts <= 1024 and 1 <= top_k <= (16 if mode == _QWEN_ROUTING else 8)
 
 
 def _run_moe_router(logits, scale, top_k, mode, normalize, out_dtype, shared_logit = None):
     experts = logits.shape[-1]
     rows = logits.size // experts
     shared = shared_logit is not None
-    outputs = _moe_router_kernel(shared)(
+    outputs = _moe_router_kernel(shared, mode == _QWEN_ROUTING and experts > 256)(
         inputs = [logits.reshape(rows, experts), scale] + ([shared_logit.reshape(rows)] if shared else []),
         template = [("T", logits.dtype), ("OUT_T", out_dtype), ("E", experts), ("K", top_k),
                     ("MODE", mode), ("NORM", int(normalize))],
