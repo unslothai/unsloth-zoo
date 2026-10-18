@@ -138,3 +138,22 @@ def test_nonreentrant_recompute_of_a_natural_forward_adds_no_ops(replay):
     rr.record_routed_experts([_request([5, 6], [7, 8], np.zeros((4, 2, TOP_K)) + [[0, 1]])])
     model(input_ids = torch.tensor([[11, 12, 13, 14]])).logits.float().square().mean().backward()
     assert model.model.layers[0].mlp.gate.weight.grad is not None
+
+
+def test_unnormalised_router_is_never_read_as_renormalised(replay):
+    # norm_topk_prob=False, but the natural top-k mass is ~1: the weights of forced experts must
+    # stay plain softmax probabilities, not be renormalised to sum to one.
+    from transformers import Qwen3MoeConfig
+
+    config = Qwen3MoeConfig(hidden_size = 4, num_experts = 4, num_experts_per_tok = 2, norm_topk_prob = False)
+    router = Qwen3MoeTopKRouter(config)
+    with torch.no_grad():
+        router.weight.copy_(torch.eye(4))
+    router.register_forward_hook(rr._router_hook(0))
+    rr._STATE.current = torch.tensor([[[2, 3]]])
+    rr._STATE.in_forward = True
+    logits, weights, ids = router(torch.tensor([[8.0, 7.0, 0.0, -1.0]]))
+    assert ids.tolist() == [[2, 3]]
+    expected = logits.double().softmax(-1).gather(-1, ids)
+    torch.testing.assert_close(weights.double(), expected, rtol = 1e-5, atol = 1e-7)
+    assert router._unsloth_replay_formula == "softmax"

@@ -523,8 +523,13 @@ def _router_hook(layer_index):
             # Pick the weight formula that reproduces this router's own natural weights.
             # Probabilities must never be softmaxed again: near ties would pass the check below.
             probs = _looks_like_probs(logits2)
+            # A router that states whether it renormalises the top-k decides it: top-k mass near
+            # one would otherwise pass a normalised formula for an unnormalised router.
+            renorm = getattr(module, "norm_topk_prob", None)
             for name, fn in _formulas().items():
                 if name.startswith("probs") != probs:
+                    continue
+                if isinstance(renorm, bool) and name.endswith("_renorm") != renorm:
                     continue
                 with torch.no_grad():
                     candidate = fn(logits2, ids2).to(weights2.dtype).float()
