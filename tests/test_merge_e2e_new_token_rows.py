@@ -30,7 +30,8 @@ import _merge_e2e_helpers as H
 NEW_VOCAB = 72  # base vocab is 64 (H._VOCAB)
 
 
-def _merged_vs_peft(tmp_path, target_modules, new_vocab = NEW_VOCAB, tie = False, inactive_targets = None):
+def _merged_vs_peft(tmp_path, target_modules, new_vocab = NEW_VOCAB, tie = False, inactive_targets = None,
+                    config = None):
     from transformers import AutoModelForCausalLM
     from peft import LoraConfig, get_peft_model
 
@@ -41,7 +42,7 @@ def _merged_vs_peft(tmp_path, target_modules, new_vocab = NEW_VOCAB, tie = False
     out_dir = os.path.join(str(tmp_path), "merged")
 
     torch.manual_seed(H.SEED)
-    config = H.make_spec("llama").config
+    config = config or H.make_spec("llama").config
     config.tie_word_embeddings = tie
     model = AutoModelForCausalLM.from_config(config).to(torch.float32)
     model.save_pretrained(base_dir, safe_serialization = True)
@@ -114,7 +115,11 @@ def test_untargeted_vocab_override_reaches_every_shard_writer(tmp_path, quant_ty
     old = torch.randn(64, 8, dtype = torch.bfloat16)
     live = torch.cat([old, torch.randn(8, 8, dtype = torch.bfloat16)])
     shard = tmp_path / "model.safetensors"
-    tensors = {"lm_head.weight": old, "model.norm.weight": torch.ones(8, dtype = torch.bfloat16)}
+    head = torch.nn.Linear(8, 72, dtype = torch.bfloat16)
+    with torch.no_grad():
+        head.weight.copy_(live)
+    tensors = {"lm_head.weight": old, "lm_head.bias": head.bias.detach()[:64].clone(),
+               "model.norm.weight": torch.ones(8, dtype = torch.bfloat16)}
     if quant_type == "fp8":
         tensors["model.layers.0.mlp.down_proj.weight"] = torch.randn(8, 8).to(torch.float8_e4m3fn)
         tensors["model.layers.0.mlp.down_proj.weight_scale"] = torch.ones(8, 1, dtype = torch.bfloat16)
@@ -128,10 +133,11 @@ def test_untargeted_vocab_override_reaches_every_shard_writer(tmp_path, quant_ty
         model_class_name = "LlamaForCausalLM",
         base_model_is_quantized = quant_type is not None,
         quant_type = quant_type,
-        vocab_weights = {"lm_head": live},
+        vocab_modules = {"lm_head": head},
     )
     with safe_open(str(shard), framework = "pt", device = "cpu") as f:
         assert torch.equal(f.get_tensor("lm_head.weight"), live)
+        assert torch.equal(f.get_tensor("lm_head.bias"), head.bias.detach())
 
 
 @pytest.mark.parametrize("target_modules", [["embed_tokens", "lm_head", "q_proj"], ["lm_head"]])
@@ -178,3 +184,30 @@ def test_float8_live_codes_are_never_copied_over_the_checkpoint():
 
     W = torch.randn(16, 4)
     assert _with_live_vocab_rows(W, (W * 7).to(torch.float8_e4m3fn)) is W
+
+
+def _tiny(arch):
+    import transformers as T
+
+    common = dict(vocab_size = H._VOCAB, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 2,
+                  num_attention_heads = 4, max_position_embeddings = 64)
+    if not hasattr(T, arch):
+        pytest.skip(reason = f"installed transformers has no {arch}")
+    return getattr(T, arch)(**common)
+
+
+# Phi's lm_head has a bias that resizes with the vocab. A tied lm_head adapter merges onto the
+# embed_tokens key, so only module identity (not the key name) marks it as a vocab matrix.
+@pytest.mark.parametrize("arch, target_modules, new_vocab, tie", [
+    ("PhiConfig", ["q_proj"], NEW_VOCAB, False),
+    (None, ["lm_head"], H._VOCAB, True),
+])
+def test_every_exported_tensor_matches_peft_after_new_tokens(tmp_path, arch, target_modules, new_vocab, tie):
+    from transformers import AutoModelForCausalLM
+
+    config = _tiny(arch) if arch else None
+    _, expected, out_dir = _merged_vs_peft(
+        tmp_path, target_modules, new_vocab = new_vocab, tie = tie, config = config)
+    reloaded = AutoModelForCausalLM.from_pretrained(out_dir, dtype = torch.float32).state_dict()
+    for key, want in expected.items():
+        assert torch.allclose(reloaded[key].float(), want.float(), atol = 1e-5, rtol = 1e-5), key

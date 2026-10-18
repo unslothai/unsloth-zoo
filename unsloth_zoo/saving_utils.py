@@ -493,7 +493,7 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     module = getattr(lora_stats, "module", None)
     live = getattr(module, "weight", None)
     if live is not None and live.device.type != "meta" and tuple(live.shape) == (lora_B.shape[0], W.shape[1]) \
-            and (live.shape[0] != W.shape[0] or isinstance(module, torch.nn.Embedding) or "lm_head" in name.split(".")):
+            and (live.shape[0] != W.shape[0] or getattr(lora_stats, "is_vocab", False)):
         W = _with_live_vocab_rows(W, live)
     # Handle vocab resize: LoRA may have more rows than base safetensors weight
     if lora_B.shape[0] != W.shape[0]:
@@ -533,7 +533,7 @@ def _with_live_vocab_rows(W, live, chunk = 8192):
     for i in range(0, min(rows, old), chunk):
         k = min(i + chunk, rows, old)
         live_rows = live[i:k].detach()
-        changed = (W[i:k].to(live_rows.device, live_rows.dtype) != live_rows).flatten(1).any(1)
+        changed = (W[i:k].to(live_rows.device, live_rows.dtype) != live_rows).reshape(k - i, -1).any(1)
         if not changed.any(): continue
         if out is None: out = W.clone()
         changed = changed.to(W.device)
@@ -657,6 +657,7 @@ class LoraStats:
     magnitude : object = None   # DoRA lora_magnitude_vector weight (None for plain LoRA)
     parameter_name : object = None  # PEFT ParamWrapper target (MoE experts), e.g. "up_proj"
     lora_B_bias : object = None     # PEFT lora_bias=True: lora_B's bias, merged into the base bias
+    is_vocab : bool = False         # base layer of the input / output embeddings
 pass
 
 
@@ -948,6 +949,14 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
     if return_state_dict: assert_same_keys(model, state_dict)
     for _key in _untargeted_keys | _keep_downloaded_keys: lora_weights.pop(_key, None)
+    _vocab_layers = []
+    for _getter in ("get_input_embeddings", "get_output_embeddings"):
+        try: _layer = getattr(inner_model, _getter)()
+        except Exception: continue
+        while hasattr(_layer, "base_layer"): _layer = _layer.base_layer
+        _vocab_layers.append(_layer)
+    for _stats in lora_weights.values():
+        if any(_stats.module is _layer for _layer in _vocab_layers): _stats.is_vocab = True
     return lora_weights, state_dict
 pass
 
@@ -1006,7 +1015,7 @@ def _get_bias_overrides(biases, safetensor_keys, model_class_name):
     return overrides
 pass
 
-def _untargeted_vocab_weights(base_model, lora_weights, tie_word_embeddings):
+def _untargeted_vocab_modules(base_model, lora_weights, tie_word_embeddings):
     # add_new_tokens changes vocab matrices in memory; one with no adapter or saved copy would
     # keep the checkpoint's rows while config.json takes the new vocab_size.
     modules = []
@@ -1024,20 +1033,27 @@ def _untargeted_vocab_weights(base_model, lora_weights, tie_word_embeddings):
         while hasattr(module, "base_layer"): module = module.base_layer
         weight = getattr(module, "weight", None)
         if weight is None or weight.device.type == "meta" or check_if_quantized(module): continue
-        out[name] = weight
+        out[name] = module
     return out
 pass
 
-def _get_vocab_overrides(vocab_weights, safetensor_keys, model_class_name):
-    if not vocab_weights: return {}
-    return _convert_lora_keys_to_safetensor_format(
-        defaultdict(lambda: None, vocab_weights), safetensor_keys, model_class_name = model_class_name,
-    )
+def _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name):
+    # Weights keyed by module (the merge loop's lora_key), biases by their full `.bias` shard key.
+    if not vocab_modules: return {}
+    overrides = dict(_convert_lora_keys_to_safetensor_format(
+        defaultdict(lambda: None, {n: m.weight for n, m in vocab_modules.items()}),
+        safetensor_keys, model_class_name = model_class_name,
+    ))
+    biases = defaultdict(lambda: None, {
+        n: m.bias for n, m in vocab_modules.items() if isinstance(getattr(m, "bias", None), torch.Tensor)
+    })
+    overrides.update(_get_bias_overrides(biases, safetensor_keys, model_class_name))
+    return overrides
 pass
 
 def _apply_vocab_override(W, vocab_overrides, lora_key, lora_stats):
     live = vocab_overrides.get(lora_key) if lora_stats is None and W is not None else None
-    if live is None or W.dim() != 2 or tuple(live.shape[1:]) != tuple(W.shape[1:]): return W
+    if live is None or W.dim() != live.dim() or tuple(live.shape[1:]) != tuple(W.shape[1:]): return W
     return _with_live_vocab_rows(W, live)
 pass
 
@@ -1056,7 +1072,7 @@ def _merge_and_overwrite_lora(
     weight_block_size = None,
     use_dequant_base = False,
     biases = None,
-    vocab_weights = None,
+    vocab_modules = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -1067,7 +1083,7 @@ def _merge_and_overwrite_lora(
         return _merge_and_overwrite_lora_mxfp4(
             save_directory, filename, lora_weights, output_dtype,
             model_class_name, base_model_is_quantized, quant_type,
-            biases = biases, vocab_weights = vocab_weights,
+            biases = biases, vocab_modules = vocab_modules,
         )
     pass
 
@@ -1085,7 +1101,7 @@ def _merge_and_overwrite_lora(
             save_directory, filename, lora_weights, output_dtype,
             model_class_name, tie_word_embeddings = tie_word_embeddings,
             weight_block_size = weight_block_size,
-            biases = biases, vocab_weights = vocab_weights,
+            biases = biases, vocab_modules = vocab_modules,
         )
     pass
 
@@ -1120,7 +1136,7 @@ def _merge_and_overwrite_lora(
             safetensor_keys = list(file.keys())
             safetensor_keys_seen.update(safetensor_keys)
             bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
-            vocab_overrides = _get_vocab_overrides(vocab_weights, safetensor_keys, model_class_name)
+            vocab_overrides = _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name)
 
             # Pre-compute number of experts per layer prefix from shard keys
             moe_num_experts = {}
@@ -2564,7 +2580,7 @@ pass
 
 
 @torch.inference_mode
-def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None, biases=None, vocab_weights=None):
+def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None, biases=None, vocab_modules=None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename_original = os.path.join(save_directory, filename)  # Original file path
@@ -2587,7 +2603,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
         bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
-        vocab_overrides = _get_vocab_overrides(vocab_weights, safetensor_keys, model_class_name)
+        vocab_overrides = _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name)
 
         # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
@@ -3071,7 +3087,7 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames, prerewrit
     return removed
 pass
 
-def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None, vocab_weights = None):
+def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None, vocab_modules = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
     filename_original = os.path.join(save_directory, filename)
@@ -3084,7 +3100,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
         bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
-        vocab_overrides = _get_vocab_overrides(vocab_weights, safetensor_keys, model_class_name)
+        vocab_overrides = _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name)
 
         # Read the header to skip scale companions without a tensor read. Read-only: the merge
         # writes a temp file and os.replace()s it, so no write handle is needed (and "r+b"
@@ -5755,7 +5771,7 @@ def merge_and_overwrite_lora(
         if key.endswith(".bias") and isinstance(value, torch.Tensor)
         and ("all" in bias_modes or key[:-len(".bias")] in bias_modules)
     })
-    _vocab_weights = _untargeted_vocab_weights(
+    _vocab_modules = _untargeted_vocab_modules(
         _merge_base_model, lora_weights, _merge_tie_word_embeddings,
     ) if save_method == "merged_16bit" else {}
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
@@ -5780,7 +5796,7 @@ def merge_and_overwrite_lora(
             weight_block_size = _merge_weight_block_size,
             use_dequant_base = _use_dequant_base,
             biases = biases,
-            vocab_weights = _vocab_weights,
+            vocab_modules = _vocab_modules,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
