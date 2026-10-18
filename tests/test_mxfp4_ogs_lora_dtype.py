@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Native MXFP4 expert LoRA runs its grouped GEMMs in the adapter's dtype. matmul_ogs rows are bf16, but T4 trains in
-fp16, so fp16 adapters met bf16 inputs and grouped_mm raised "expected mat1 and mat2 to have the same dtype". CPU
-only: the triton_kernels matmuls are replaced by bf16 stand-ins."""
+"""Expert LoRA GEMMs run in the adapter's dtype: fp16 adapters on T4 met bf16 matmul_ogs rows and grouped_mm
+raised a dtype mismatch. CPU only."""
 
 import types
 

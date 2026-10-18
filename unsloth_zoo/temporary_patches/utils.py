@@ -2312,12 +2312,8 @@ def _bf16_on(devices, args, kwargs):
 
 
 def _eager_for_bf16_without_native_support(func, compiled):
-    """Run bf16 calls eagerly on GPUs without native bf16 (sm < 80: T4, V100).
-
-    Inductor skips those graphs (``SkipFrame("BF16 is not supported")``). Up to torch 2.12 a skipped fullgraph
-    call ran eagerly; from 2.13 it raises "found no compiled frames" and the frame then fails for every later
-    dtype too. GPT OSS MXFP4 training hits it on T4 in fp16, since matmul_ogs returns bf16 rows. Every other
-    call, and every call on sm_80+, is compiled as before."""
+    """Run bf16 calls eagerly on sm < 80. Inductor skips bf16 there, and from torch 2.13 a skipped fullgraph call
+    raises "found no compiled frames" instead of running eagerly (GPT OSS MXFP4 on T4: matmul_ogs returns bf16)."""
     @functools.wraps(compiled)  # keeps the compiled markers, as _eager_during_decode does
     def wrapper(*args, **kwargs):
         if not torch.compiler.is_compiling():

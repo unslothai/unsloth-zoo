@@ -2600,13 +2600,12 @@ def _ogs_native_training_ok(device, backend):
 
 
 def _ogs_native_inference_ok(device, backend):
-    """No-grad twin of ``_ogs_native_training_ok``: where the native matmul cannot run, the no-grad forward takes
-    ``mxfp4_ogs_experts_forward``, whose ``_OgsGateUp`` / ``_OgsDown`` then use the exact bf16 decode."""
+    """No-grad twin of ``_ogs_native_training_ok``."""
     return _ogs_native_training_ok(device, backend)
 
 
 def _ogs_module_backend(module):
-    """The triton_kernels copy ``module``'s experts launch with, without touching the (decoding) weight properties."""
+    """The triton_kernels backend for ``module``, without decoding its weights."""
     from unsloth_zoo.triton_kernels_compat import triton_kernels_backend_for
     try:
         return triton_kernels_backend_for(_triton_kernels_root(module))
@@ -2615,7 +2614,7 @@ def _ogs_module_backend(module):
 
 
 def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_config):
-    """matmul_ogs gate_up semantics on exact bf16 decodes: expert-sorted rows ``x[src // k] @ W[e] + b[e]``."""
+    """matmul_ogs gate_up on bf16 decodes: ``x[src // k] @ W[e] + b[e]``."""
     k = routing_data.n_expts_act
     rows = gather_idx.src_indx.long()
     x = x.to(torch.bfloat16)
@@ -2637,8 +2636,7 @@ def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_co
 
 
 def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precision_config):
-    """matmul_ogs down semantics on exact bf16 decodes: ``out[dst // k] += gamma * (h @ W[e] + b[e])``. Rows land
-    in their (token, slot) place and are summed over k in a fixed order (no atomics, so the result is deterministic)."""
+    """matmul_ogs down on bf16 decodes: ``out[dst // k] += gamma * (h @ W[e] + b[e])``, summed without atomics."""
     k = routing_data.n_expts_act
     dst = scatter_idx.dst_indx.long()
     h = h.to(torch.bfloat16)

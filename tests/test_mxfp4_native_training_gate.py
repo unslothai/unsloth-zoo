@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""sm_12x + triton_kernels release/3.6.x (matmul_ogs+ragged) trips ``assert num_stages >= 1`` in opt_flags, so
-the native MXFP4 training forward falls back to exact bf16 decodes there; every other cell stays native. CPU only:
-the capability and the backend generation are faked."""
+"""sm_12x + release/3.6.x trips ``assert num_stages >= 1`` in opt_flags, so training falls back to bf16
+decodes there. CPU only."""
 
 import types
 

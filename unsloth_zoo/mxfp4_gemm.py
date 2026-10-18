@@ -467,8 +467,7 @@ _ASM_OK = {}
 def _asm_ok(device, eager = False):
     """Decode mode (the kernels' ASM constexpr): 0 plain Triton, 1 inline-PTX bf16x2 fma decode (Kimi-K3 port, sm_80+
     CUDA; UNSLOTH_MXFP4_ASM=0 turns it off), 2 the hardware e2m1 convert where ``_cvt_ok`` passes."""
-    # ``device`` may be a plain index: the compiled-region resolver must not build a torch.device (Dynamo cannot
-    # trace ``torch.device.__new__`` when it ends up tracing that frame, as on T4).
+    # May be a plain index: Dynamo cannot trace ``torch.device.__new__`` (hit on T4).
     key = device if device is None or isinstance(device, int) else device.index
     ok = _ASM_OK.get(key)
     if ok is None:
@@ -634,16 +633,13 @@ _assume_constant_result = getattr(torch.compiler, "assume_constant_result", None
 def _resolve_decode_mode(index):
     # Dynamo runs this eagerly on real tensors at trace time, so a cold compiled region bakes in the probed mode
     # instead of the fma fallback the op body (traced on FakeTensors) would see.
-    # The index, not torch.device(...): when Dynamo traces this frame instead of running it, a cached mode is then a
-    # plain dict read and nothing here constructs a device.
+    # Pass the index so a traced call never constructs a torch.device.
     return _asm_ok(index, eager = True)
 
 
 def _never_a_root_frame(fn):
-    """Run ``fn`` (and what it calls) eagerly when Dynamo would compile it as its own frame. That happens when the
-    caller's frame is skipped, e.g. Inductor's ``SkipFrame("BF16 is not supported")`` on sm_75: the nested call is
-    then compiled alone, its int argument turns symbolic under ``dynamic=True`` and ``fullgraph`` raises. Calls
-    traced from a compiled region still take the ``assume_constant_result`` path."""
+    """Never compile ``fn`` as its own frame. When the caller is skipped (sm_75 BF16 SkipFrame), its int arg turns
+    symbolic under ``dynamic=True`` and ``fullgraph`` raises."""
     try:
         from torch._dynamo.eval_frame import set_code_exec_strategy
         from torch._dynamo.types import FrameAction, FrameExecStrategy

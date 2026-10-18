@@ -357,9 +357,8 @@ def triton_kernels_alias():
 
 
 def convert_layout_shared(tensor_module, tensor, layout, **layout_opts):
-    """``convert_layout`` that keeps the storage when ``tensor`` already has ``layout``. release/3.7.x copies even
-    then (3.8 returns the tensor), which duplicates every packed expert stack and, inside a CUDA graph tree's
-    warmup, leaves the copy as an untracked allocation in the graph pool."""
+    """``convert_layout`` that skips the copy release/3.7.x makes when ``tensor`` already has ``layout``; that copy
+    duplicates every expert stack and leaks into the CUDA graph pool."""
     if not layout_opts and not isinstance(layout, type) and getattr(tensor.storage, "layout", None) == layout:
         return tensor
     return tensor_module.convert_layout(tensor, layout, **layout_opts)
@@ -424,9 +423,8 @@ def _device_capability(device):
 
 
 def native_mxfp4_matmul_ok(device, backend) -> bool:
-    """False where the native expert matmul is known to fail: sm_12x (RTX 50xx / PRO 6000, about 100 KB shared
-    memory per block) with the matmul_ogs+ragged generation (release/3.6.x), whose Blackwell tiles do not fit and
-    trip ``assert num_stages >= 1`` in opt_flags. release/3.5.x and 3.7+ and every other GPU keep the native path."""
+    """False on sm_12x (about 100 KB shared memory) with release/3.6.x matmul_ogs+ragged, whose Blackwell tiles
+    trip ``assert num_stages >= 1`` in opt_flags."""
     capability = _device_capability(device)
     if capability is None or backend is None:
         return True

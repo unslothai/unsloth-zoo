@@ -665,8 +665,7 @@ def test_new_generation_k_sum_needs_no_fp32_temporary(k, dtype):
 
 
 def test_strided_conversion_to_the_layout_already_held_keeps_the_storage():
-    # release/3.7.x's convert_layout always copies: the packed stacks must stay shared (no duplicate, no allocation
-    # inside a CUDA graph tree warmup).
+    # release/3.7.x's convert_layout always copies: the packed stacks must stay shared.
     @dataclasses.dataclass(frozen = True)
     class StridedLayout:
         major_dim: int = -1

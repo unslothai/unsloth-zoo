@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fullgraph regions run bf16 calls eagerly on GPUs Inductor cannot compile bf16 for (sm < 80). torch 2.13+ turns
-Inductor's bf16 SkipFrame into "found no compiled frames" under fullgraph, and the frame then fails for fp16 and
-fp32 calls too. CPU only: the device set is pointed at the CPU and the skip is reproduced with a SkipFrame backend."""
+"""bf16 fullgraph calls run eagerly on sm < 80, where torch 2.13+ turns the bf16 SkipFrame into
+"found no compiled frames". CPU only: the skip is faked with a SkipFrame backend."""
 
 import pytest
 import torch

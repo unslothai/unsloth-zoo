@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The compiled-region decode-mode resolver must be trace-safe. On sm_75 Inductor raises
-``SkipFrame("BF16 is not supported")``, Dynamo then compiles ``_resolve_decode_mode`` as its own frame with a
-symbolic index, and ``torch.device("cuda", SymInt)`` raised Unsupported under fullgraph. CPU only: the capability,
-the hardware-convert probe and the skipping backend are faked."""
+"""``_resolve_decode_mode`` must be trace-safe: on sm_75 it is compiled as its own frame with a symbolic
+index, where ``torch.device("cuda", SymInt)`` raised under fullgraph. CPU only."""
 
 import pytest
 import torch
