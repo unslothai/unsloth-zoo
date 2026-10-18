@@ -103,7 +103,9 @@ def _run_packed_block(hidden_states = False, need_entropy = False):
         "chunked_selective_log_softmax": rr.chunked_selective_log_softmax,
         "create_completion_attention_mask": rr.create_completion_attention_mask,
         "device_synchronize": lambda *a, **k: None,
-        "UNSLOTH_ENABLE_LOGGING": False,
+        # On: the block swallows its own exceptions, so its log line is the
+        # only record of why the packed path was rejected.
+        "UNSLOTH_ENABLE_LOGGING": True,
         "trainer": SimpleNamespace(processing_class = SimpleNamespace(pad_token_id = PAD_ID)),
         "unwrapped_model": model,
         "lm_head": lm_head,
@@ -129,6 +131,12 @@ def _run_packed_block(hidden_states = False, need_entropy = False):
     }
     exec(_packed_block_source(), ns)
     return ns, model, input_ids, max_left_pad
+
+
+def _rejected(ns, capsys):
+    """Why the block fell back: its own log line (exception or verify diff)."""
+    reason = capsys.readouterr().out.strip() or "no log line"
+    return f"packed path rejected; nothing to compare (verify diff={ns.get('_pack_diff')}): {reason}"
 
 
 def _reference_logprobs(model, input_ids, max_left_pad):
@@ -163,10 +171,10 @@ def test_verifier_survives_a_forward_that_returns_real_logits():
 
 
 @pytest.mark.parametrize("hidden_states", [False, True])
-def test_verified_packed_result_matches_the_per_row_logprobs(hidden_states):
+def test_verified_packed_result_matches_the_per_row_logprobs(hidden_states, capsys):
     ns, model, input_ids, max_left_pad = _run_packed_block(hidden_states = hidden_states)
     if not ns["_pack_use"]:
-        pytest.fail("packed path rejected; nothing to compare")
+        pytest.fail(_rejected(ns, capsys))
     mask = rr.create_completion_attention_mask(
         input_ids[:, -(KEEP + max_left_pad):],
         rr.calculate_pad_tokens_in_prompt(input_ids, KEEP, PAD_ID),
@@ -178,10 +186,10 @@ def test_verified_packed_result_matches_the_per_row_logprobs(hidden_states):
 
 
 @pytest.mark.parametrize("hidden_states", [False, True])
-def test_packed_entropies_match_the_per_row_entropies(hidden_states):
+def test_packed_entropies_match_the_per_row_entropies(hidden_states, capsys):
     ns, model, input_ids, max_left_pad = _run_packed_block(hidden_states = hidden_states, need_entropy = True)
     if not ns["_pack_use"]:
-        pytest.fail("packed path rejected; nothing to compare")
+        pytest.fail(_rejected(ns, capsys))
     width = KEEP + max_left_pad
     mask = rr.create_completion_attention_mask(
         input_ids[:, -width:], rr.calculate_pad_tokens_in_prompt(input_ids, KEEP, PAD_ID), max_left_pad, PAD_ID,

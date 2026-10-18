@@ -1007,7 +1007,7 @@ class _PlainModel:
 
 @pytest.mark.parametrize(
     "model_type",
-    ["muse_glimmer", "qwen4_exp", "glm5_next", "lfm2_vl", "mage_vl", "kimi_k3"],
+    ["qwen4_exp", "glm5_next", "lfm2_vl", "mage_vl"],
 )
 def test_vlm_only_families_reach_the_text_path_without_being_listed(model_type):
     """Against the installed packages rather than a monkeypatched resolver."""

@@ -81,6 +81,21 @@ def test_growth_within_the_cap_stays_pinned(monkeypatch, gc_module, pin_requests
     assert gc_module.GC_PINNED_BYTES == 8192 + 2048
 
 
+def test_pageable_slot_is_pinned_again_when_it_grows_after_ram_frees(monkeypatch, gc_module, pin_requests):
+    # A low-RAM moment sends one growth pageable; the next growth must not stay pageable for good.
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    gib = 1 << 30
+    host = _fake_host(monkeypatch, total_gib = 12, available_gib = 8)
+    a = gc_module._new_host_buffer(1000, torch.float16)
+    host.available = 0
+    b = gc_module._grow_host_buffer(a, 4000)
+    assert not getattr(b, gc_module.HOST_PINNED_ATTR)
+    host.available = 8 * gib
+    c = gc_module._grow_host_buffer(b, 8000)
+    assert c.numel() == 8000 and getattr(c, gc_module.HOST_PINNED_ATTR)
+    assert pin_requests == [True, False, True]
+
+
 def test_cap_is_free_ram_minus_reserve_split_by_local_ranks(monkeypatch, gc_module):
     gib = 1 << 30
     fake = types.SimpleNamespace(
@@ -179,3 +194,68 @@ def test_regrowth_within_retained_storage_reserves_nothing(monkeypatch, gc_modul
     grown = gc_module._grow_host_buffer(a, 3000)            # 6000 bytes fit the 8000 storage
     assert grown is a and getattr(grown, gc_module.HOST_PINNED_ATTR)
     assert gc_module.GC_PINNED_BYTES == 8192 and gc_module._PINNED_CACHED == {}
+
+
+def _fake_host(monkeypatch, total_gib, available_gib):
+    gib = 1 << 30
+    host = types.SimpleNamespace(total = int(total_gib * gib), available = int(available_gib * gib))
+    fake = types.SimpleNamespace(virtual_memory = lambda: host)
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake)
+    return host
+
+
+def test_single_rank_low_ram_host_still_pins_what_fits(monkeypatch, gc_module, pin_requests):
+    # 8 GiB host with 3 GiB available: the 4 GiB reserve meant for other ranks must not
+    # force a single process to pageable copies that pinned fine before the cap existed.
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    _fake_host(monkeypatch, total_gib = 8, available_gib = 3)
+    for _ in range(8):
+        gc_module._new_host_buffer(16 << 20, torch.float16)   # 32 MiB each
+    assert pin_requests == [True] * 8
+
+
+def test_single_rank_refuses_a_block_that_does_not_fit_now(monkeypatch, gc_module, pin_requests):
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    gib = 1 << 30
+    host = _fake_host(monkeypatch, total_gib = 12, available_gib = 3)
+    assert gc_module._reserve_pinned(1 * gib)
+    # Available RAM is re-read per new block: the host filled up since the first one.
+    host.available = int(1.5 * gib)
+    assert not gc_module._reserve_pinned(1 * gib)
+    host.available = 4 * gib
+    assert gc_module._reserve_pinned(1 * gib)
+
+
+def test_several_local_ranks_keep_the_split_cap(monkeypatch, gc_module):
+    _fake_host(monkeypatch, total_gib = 8, available_gib = 3)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    assert gc_module._compute_pinned_cap() == 0
+    assert not gc_module._reserve_pinned(32 << 20)
+
+
+def test_single_rank_frees_dead_cached_blocks_before_going_pageable(monkeypatch, gc_module):
+    # A grown pinned buffer leaves its old block in torch's host cache. When RAM runs short
+    # those blocks are returned to the OS first, so they do not sit beside the pageable copies.
+    gib = 1 << 30
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
+    host = _fake_host(monkeypatch, total_gib = 8, available_gib = 3)
+    half = gib // 2
+    assert gc_module._reserve_pinned(half)
+    gc_module._release_pinned(half)                  # 512 MiB block now dead in the host cache
+    emptied = []
+
+    def empty_host_cache():
+        emptied.append(True)
+        host.available += half
+
+    monkeypatch.setattr(torch._C, "_host_emptyCache", empty_host_cache, raising = False)
+    # 1 GiB + 0.8 GiB headroom does not fit in 1.5 GiB, but does once the dead block is freed.
+    host.available = int(1.5 * gib)
+    assert gc_module._reserve_pinned(1 * gib)
+    assert emptied == [True]
+    assert gc_module.GC_PINNED_BYTES == 1 * gib and gc_module._PINNED_CACHED == {}
+    # Nothing cached any more: a block that still does not fit goes pageable without a flush.
+    host.available = int(1.5 * gib)
+    assert not gc_module._reserve_pinned(1 * gib)
+    assert emptied == [True]

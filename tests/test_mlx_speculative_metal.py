@@ -33,6 +33,8 @@ PAST_WINDOW = "Summarize these notes in one paragraph:\n" + "The planets orbit t
 
 def _load(repo, *extra):
     from mlx_vlm import load
+    from unsloth_zoo.mlx.loader import _ensure_exact_verify_sums_promoted
+    _ensure_exact_verify_sums_promoted()  # as FastMLXModel's VLM load does
     model, processor = load(repo)
     model._processor, tok = processor, processor.tokenizer
     ids = [
@@ -40,6 +42,56 @@ def _load(repo, *extra):
         for p in [*PROMPTS, *extra]
     ]
     return model, ids
+
+
+# Every mlx-vlm 0.7.8 kernel source that copies MLX's qmv input sum.
+EXACT_VERIFY_SUMS = [("mlx_vlm.models.quantized_verifier", "_AFFINE_MOE_HC_HEADER"),
+                     ("mlx_vlm.models.quantized_verifier", "_target_verify_qlinear_header"),
+                     ("mlx_vlm.models.fast_ops", "_AFFINE5_SWITCH_HEADER"), ("mlx_vlm.models.fast_ops", "_AFFINE4_SWITCH_HEADER"),
+                     ("mlx_vlm.models.glm_moe_dsa.speculative_verifier", "_quantized_head_header")]
+
+
+def _verify_sources(monkeypatch):
+    """The listed sources as they stand, restored after the test, with promotion not yet done."""
+    import importlib
+    from unsloth_zoo.mlx import loader
+    monkeypatch.setattr(loader, "_exact_verify_sums_promoted", False)
+    modules = {module: importlib.import_module(module) for module, _ in EXACT_VERIFY_SUMS}
+    before = {(module, name): getattr(modules[module], name) for module, name in EXACT_VERIFY_SUMS}
+    for (module, name), source in before.items():
+        monkeypatch.setattr(modules[module], name, source)
+    return modules, before
+
+
+def _assert_promoted(modules, before, promoted):
+    for (module, name), source in before.items():
+        after = getattr(modules[module], name)
+        if not promoted:  # MLX before 0.32.4 adds in the input dtype, as the kernels do
+            assert after is source, name
+        else:
+            text = after if isinstance(after, str) else after(4, 64)
+            assert "sum += x[i] + x[i + 1]" not in text and "sum += float(x[i]) + float(x[i + 1])" in text, name
+
+
+# First in the file: the model fixtures promote the sums for the rest of the session.
+@pytest.mark.parametrize("version", ["0.32.3", "0.32.4"])
+def test_exact_verify_kernels_sum_their_input_as_the_installed_mlx_decode_does(monkeypatch, version):
+    from unsloth_zoo.mlx import loader
+    modules, before = _verify_sources(monkeypatch)
+    monkeypatch.setattr(mx, "__version__", version)
+    built = modules["mlx_vlm.models.quantized_verifier"]._target_verify_qmv_kernel
+    built(4, 64, mx.bfloat16, 2, 64, 64)
+    loader._ensure_exact_verify_sums_promoted()
+    assert (built.cache_info().currsize > 0) == (version == "0.32.3")  # a kernel built earlier keeps its sums
+    _assert_promoted(modules, before, version == "0.32.4")
+
+
+def test_a_fast_mlx_model_load_promotes_the_verify_sums(monkeypatch):
+    from packaging.version import Version
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    modules, before = _verify_sources(monkeypatch)
+    FastMLXModel.from_pretrained(QUANTIZED)
+    _assert_promoted(modules, before, Version(mx.__version__) >= Version("0.32.4"))
 
 
 @pytest.fixture(scope = "module")
@@ -375,6 +427,113 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
             patch.setattr(native, name, lambda self, *args: None)
             with inference.exact_speculative_verify(model):
                 assert type(verifier) is native
+
+
+def _verify_call(lm, cache, block):
+    run = _clone(cache)
+    return run, lm(block, cache = run, speculative_verify = True, **_captured(lm))
+
+
+@pytest.mark.parametrize("width", [3, 5])
+def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit, monkeypatch, width):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.speculative import _join
+    model, ids, _ = qwen_4bit
+    lm, cache, fresh = model.language_model, None, make_prompt_cache(model.language_model)
+    for row, prompt in enumerate([ids[0][:24], ids[0][:17], ids[0][:31]]):
+        entries = make_prompt_cache(lm)
+        mx.eval(lm(mx.array([prompt]), cache = entries).logits)
+        cache = _join(cache, entries, row)
+    block = mx.array([ids[0][start : start + width] for start in (24, 30, 36)])
+    keeps = [[1, width, 1 + width // 2], [width] * 3, [1] * 3, [0, width, 1], [0] * 3]
+    native = [_verified(lm, cache, block, keep) for keep in keeps]
+    # A row with no recurrent state yet.
+    native_fresh = [_verified(lm, fresh, block[:1], keep) for keep in ([0], [1])]
+    monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    with inference.exact_speculative_verify(model):
+        _verified(lm, cache, block, 0)
+        _verified(lm, fresh, block[:1], 0)
+        run, out = _verify_call(lm, cache, block)
+        assert len(out.gdn_states._unsloth_tapes) == sum(layer.is_linear for layer in lm.model.layers)
+        # A refused commit keeps the tapes, and the retained lengths may come from any iterable.
+        with pytest.raises(ValueError):
+            out.gdn_states.commit(width + 1)
+        out.gdn_states.commit(iter(keeps[0]))
+        assert _same(native[0], _state(out, run))
+        run, out = _verify_call(lm, cache, block[:, :2])
+        assert "_unsloth_tapes" not in vars(out.gdn_states)
+        out.gdn_states.abort()
+        assert all(_same(expected, _verified(lm, cache, block, keep)) for keep, expected in zip(keeps, native))
+        _, out = _verify_call(lm, fresh, block[:1])
+        assert len(out.gdn_states._unsloth_tapes) == sum(layer.is_linear for layer in lm.model.layers)
+        out.gdn_states.abort()
+        assert all(_same(expected, _verified(lm, fresh, block[:1], keep)) for keep, expected in zip(([0], [1]), native_fresh))
+        assert _same(native[2], _verified(lm, cache, block, 1))
+        run, out = _verify_call(lm, cache, block)
+        out.gdn_states.commit(mx.array(keeps[0]))
+        assert _same(native[0], _state(out, run))
+        assert set(inference._TAPE_VERDICTS.values()) == {True}
+        # A replay that does not reproduce stock keeps that key on stock.
+        inference._TAPE_VERDICTS.clear()
+        monkeypatch.setattr(inference, "_replay_matches", lambda *args: False)
+        _verified(lm, cache, block, 0)
+        run, out = _verify_call(lm, cache, block)
+        assert "_unsloth_tapes" not in vars(out.gdn_states) and list(inference._TAPE_VERDICTS.values()) == [False]
+        out.gdn_states.commit(keeps[0])
+        assert _same(native[0], _state(out, run))
+
+
+def _recurrence(rows, steps, heads = 4, width = 128):
+    q, k, v = (mx.random.normal((rows, steps, heads, width), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in range(3))
+    a, b = (mx.random.normal((rows, steps, heads), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in (3, 4))
+    return q, k, v, a, b, mx.zeros((heads,)), mx.ones((heads,))
+
+
+def test_replay_admission_refuses_a_replay_one_bit_off_or_misreading_retained_lengths():
+    from functools import partial
+    from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_update_with_states
+    from unsloth_zoo.mlx.inference import _replay_matches
+    rows, steps = 3, 4
+    q, k, v, a, b, A_log, dt_bias = _recurrence(rows, steps)
+    initial = mx.random.normal((rows, *v.shape[2:], k.shape[3]), key = mx.random.key(5))
+    stock = gated_delta_update_with_states(q, k, v, a, b, A_log, dt_bias, initial, state_steps = steps - 1)
+    replay = partial(gated_delta_update_with_states, q, k, v, a, b, A_log, dt_bias, initial, state_steps = 0)
+    bits = stock[2].view(mx.uint32)
+    nudged = mx.where(mx.arange(bits.size).reshape(bits.shape) == 7, bits + 1, bits).view(mx.float32)
+    assert _replay_matches(stock, replay, None, initial)
+    assert not _replay_matches((*stock[:2], nudged), replay, None, initial)
+    assert not _replay_matches(stock, lambda mask: replay(mask = None), None, initial)
+    # Rows all retaining the first row's length, or retaining one step where they retained none.
+    assert not _replay_matches(stock, lambda mask: replay(mask = None if mask is None else mx.broadcast_to(mask[:1], mask.shape)), None, initial)
+    assert not _replay_matches(stock, lambda mask: replay(mask = None if mask is None else mask | (mx.arange(steps) == 0)), None, initial)
+
+
+def test_a_block_on_an_entry_state_of_another_batch_commits_what_stock_commits(monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import gated_delta
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+    from unsloth_zoo.mlx import inference
+    route = inference._taped_update(gated_delta.gated_delta_update, gated_delta.gated_delta_update_with_states)
+    inputs = _recurrence(3, 4)
+
+    def committed(tapes):
+        entry = ArraysCache(2)
+        entry[1] = mx.full((1, *inputs[2].shape[2:], inputs[1].shape[3]), 10.0)
+        transaction = start_speculative_cache([entry], 4)
+        monkeypatch.setattr(inference._VERIFY_STATE, "tapes", tapes, raising = False)
+        route(*inputs, cache = entry)
+        if tapes:
+            transaction.__class__ = inference._taped_transaction_class(type(transaction))
+            transaction._unsloth_tapes = tapes
+        transaction.commit([0, 1, 4])
+        return entry[1]
+    monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    stock, tapes = committed(None), []
+    committed([])
+    assert mx.array_equal(stock[0], mx.full(stock.shape[1:], 10.0)).item()
+    assert mx.array_equal(stock.view(mx.uint8), committed(tapes).view(mx.uint8)).item() and not tapes
+    assert not inference._TAPE_VERDICTS
 
 
 def _submissions(monkeypatch):

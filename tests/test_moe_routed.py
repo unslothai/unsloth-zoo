@@ -1300,6 +1300,7 @@ def test_routed_lora_a_b_match_fp64(adt, r, K, N, row_div, cfg, monkeypatch):
     g_max, g_mean = _err(got - base, ref)
     o_max, o_mean = _err(old, ref)
     assert g_max <= 1.5 * o_max + 1e-6 and g_mean <= 1.05 * o_mean + 1e-7, (g_max, o_max, g_mean, o_mean)
+    torch._dynamo.reset()  # 144 cases share this lambda's code object: past 8 shapes dynamo refuses to recompile
     with torch.no_grad():
         compiled = torch.compile(lambda *a: MR.routed_lora_add(*a, row_div), fullgraph = True)
         assert torch.equal(compiled(base, x, idx, terms), got)

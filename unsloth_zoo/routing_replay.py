@@ -85,6 +85,28 @@ def _config_is_moe(config):
     return False
 
 
+def _config_is_hybrid_attention(config):
+    # Mixed layer kinds (sliding + full, linear / mamba + full) give vLLM several KV cache groups.
+    for sub in (config, getattr(config, "text_config", None)):
+        if sub is None:
+            continue
+        for name in ("layer_types", "layers_block_type", "hybrid_override_pattern"):
+            value = getattr(sub, name, None)
+            if isinstance(value, (list, tuple, str)) and len(set(value)) > 1:
+                return True
+    return False
+
+
+def _vllm_at_least(major, minor):
+    try:
+        from importlib.metadata import version
+        release = version("vllm").split("+")[0].split(".")
+        return (int(release[0]), int(re.match(r"\d+", release[1]).group(0))) >= (major, minor)
+    except Exception:
+        # Unknown version: trust the engine arg check above.
+        return True
+
+
 def routing_replay_engine_args(config):
     """Extra vLLM engine args, empty unless requested, supported and the model is MoE."""
     if not routing_replay_requested() or not _config_is_moe(config):
@@ -92,8 +114,18 @@ def routing_replay_engine_args(config):
     if not vllm_supports_routed_experts():
         warnings.warn(
             f"Unsloth: {ROUTING_REPLAY_ENV}=1 needs a vLLM with enable_return_routed_experts "
-            "(0.14 or newer, 0.22 or newer for hybrid attention MoE). "
+            "(0.14 or newer, 0.21 or newer for hybrid attention MoE). "
             "Routing replay is off.",
+            stacklevel = 2,
+        )
+        return {}
+    if _config_is_hybrid_attention(config) and not _vllm_at_least(0, 21):
+        # vLLM 0.14 to 0.20 size the shared capture buffer by KV cache tokens of one group but
+        # index it by slot, so a hybrid model's first generate dies with an IndexError. 0.21
+        # keeps per-request buffers indexed by position.
+        warnings.warn(
+            f"Unsloth: {ROUTING_REPLAY_ENV}=1 needs vLLM 0.21 or newer for hybrid attention MoE "
+            "models. Routing replay is off.",
             stacklevel = 2,
         )
         return {}
@@ -330,10 +362,9 @@ def _uses_checkpointing(decoder):
 
 
 def _fingerprint(ids):
-    # Order-free per token, position-weighted int64 hash of the natural top-k ids (wraps on overflow).
-    ids = ids.long().sort(-1).values
-    weights = torch.arange(1, ids.numel() + 1, device = ids.device, dtype = torch.long).view(ids.shape)
-    return ((ids + 1) * (weights * 2654435761)).sum()
+    # The natural top-k ids, order-free per token. Kept whole rather than hashed: two forwards
+    # whose routes merely hash alike would otherwise swap their replays in the recompute.
+    return ids.sort(-1).values.to(torch.int16)
 
 
 def _recomputed_routes(layer_index, ids2):
@@ -346,10 +377,15 @@ def _recomputed_routes(layer_index, ids2):
     if not candidates:
         return ids2.long(), torch.zeros((ids2.shape[0], 1), dtype = torch.bool, device = ids2.device)
     fp = _fingerprint(ids2)
-    match = torch.stack([c[0] == fp for c in candidates])
+    match = torch.stack([(c[0] == fp).all() for c in candidates])
     pick = match.to(torch.int32).argmax()
-    forced = torch.stack([c[1] for c in candidates])[pick]
-    valid = torch.stack([c[2] for c in candidates])[pick] & match.any()
+    forced_all = torch.stack([c[1] for c in candidates])
+    forced = forced_all[pick]
+    # Several forwards with the same natural routing but different replays cannot be told
+    # apart, so keep the natural routing there rather than guess. Only the expert set counts:
+    # the same experts in another order route and weight every token identically.
+    agree = ((forced_all.sort(-1).values == forced.sort(-1).values).flatten(1).all(-1) | ~match).all()
+    valid = torch.stack([c[2] for c in candidates])[pick] & match.any() & agree
     return forced, valid
 
 

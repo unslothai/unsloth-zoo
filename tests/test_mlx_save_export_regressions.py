@@ -302,6 +302,21 @@ def test_bound_gguf_push_filters_kwargs(monkeypatch):
     }
 
 
+def test_text_generate_with_no_new_tokens_returns_the_prompt(monkeypatch):
+    import mlx_lm
+    import unsloth_zoo.mlx.loader as loader
+
+    def refusing_stream_generate(*args, max_tokens=None, **kwargs):
+        raise ValueError("Maximum number of tokens must be non-zero (use -1 for no limit).")
+        yield
+
+    monkeypatch.setattr(mlx_lm, "stream_generate", refusing_stream_generate)
+    tokenizer = types.SimpleNamespace(bos_token=None, eos_token_ids={2})
+    model = types.SimpleNamespace(_tokenizer=tokenizer, _is_vlm_model=False)
+    for limit in ({"max_length": 2}, {"max_new_tokens": 0}):
+        assert loader._mlx_generate(model, input_ids=[[1, 2]], **limit).tolist() == [[1, 2]]
+
+
 def test_text_generate_honors_do_sample_false(monkeypatch):
     import mlx_lm
     import mlx_lm.sample_utils as sample_utils

@@ -329,7 +329,7 @@ def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, 
 @pytest.mark.parametrize("runtime", ["mlx_lm", "mlx_vlm"])
 def test_a_batched_mask_the_pinned_runtime_cannot_broadcast(runtime):
     """A per-row `[B, 1, L, S]` mask over grouped heads, which above the tie no longer reaches the
-    runtime. `mlx_lm` 0.31.3 and `mlx_vlm` 0.6.4 both raise on it; the fused kernel takes it as
+    runtime. `mlx_lm` 0.31.3 and `mlx_vlm` 0.6.4 raise on it (mlx_lm 0.32 broadcasts it); the fused kernel takes it as
     given, so gate on a float32 reference rather than on their answer."""
     unfused = _runtime(runtime)
     B, HQ, HKV, S, L, D, bits = 2, 32, 8, 640, 256, 128, 4

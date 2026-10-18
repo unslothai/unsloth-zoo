@@ -1089,22 +1089,65 @@ def _fetch_release_json_asset(assets, asset_name):
         return None
 
 
+# iGPUs a discrete card shadows; mirrors SHADOWING_INTEGRATED_GFX in unsloth's installer.
+_SHADOWING_INTEGRATED_GFX = frozenset(
+    ("gfx90c", "gfx1013", "gfx1033", "gfx1035", "gfx1036", "gfx1103", "gfx1153")
+)
+
+
 def _detect_gpu_target():
     """Return ("cuda", sm, "cuda12"/"cuda13"/None) or ("rocm", "gfxNNNN")
-    from torch, or None when no GPU target is detectable."""
+    from torch, or None when no GPU target is detectable.
+
+    The bundle serves every visible device, not just device 0. CUDA: sm is the minimum
+    visible SM, and a mixed host appends the sorted visible SMs as a 4th element so
+    _select_gpu_assets only offers bundles covering all of them. ROCm: the current
+    device's arch (a discrete card's when the current one is a shadowing iGPU) when every
+    discrete card shares its bundle family, else None (a source build, which _gpu_cmake_flags targets at every visible arch)."""
     if torch is None:
         return None
     try:
         if not torch.cuda.is_available():
             return None
+        count = max(1, torch.cuda.device_count())
         if getattr(torch.version, "hip", None):
-            gfx = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "") or ""
-            gfx = gfx.split(":")[0]
-            return ("rocm", gfx) if gfx.startswith("gfx") else None
-        major, minor = torch.cuda.get_device_capability(0)
+            archs = []
+            for i in range(count):
+                try:
+                    props = torch.cuda.get_device_properties(i)
+                except Exception:
+                    props = None  # unreadable: skipped below, the readable cards still decide
+                archs.append((getattr(props, "gcnArchName", "") or "").split(":")[0])
+            try:
+                current = torch.cuda.current_device()
+            except Exception:
+                current = 0
+            gfx = archs[current] if 0 <= current < count else archs[0]
+            discrete = [a for a in archs if a.startswith("gfx") and a not in _SHADOWING_INTEGRATED_GFX]
+            if (gfx in _SHADOWING_INTEGRATED_GFX or not gfx.startswith("gfx")) and discrete:
+                # The installer's #7776 rule; an unreadable current card defers the same way.
+                gfx = discrete[0]
+            elif not gfx.startswith("gfx"):
+                gfx = next((a for a in archs if a.startswith("gfx")), gfx)
+            if not gfx.startswith("gfx"):
+                return None
+            # Windows source builds are CUDA-only (_gpu_cmake_flags), so keep the prebuilt there.
+            if not IS_WINDOWS and any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in discrete):
+                return None
+            return ("rocm", gfx)
+        caps = []
+        for i in range(count):
+            try:
+                caps.append(torch.cuda.get_device_capability(i))
+            except Exception:
+                continue  # unreadable: the readable cards, current device included, still count
+        caps = caps or [torch.cuda.get_device_capability()]
+        sms = sorted({major * 10 + minor for major, minor in caps})
         cuda_version = getattr(torch.version, "cuda", None)
         line = f"cuda{cuda_version.split('.')[0]}" if cuda_version else None
-        return ("cuda", major * 10 + minor, line)
+        if len(sms) > 1:
+            return ("cuda", sms[0], line, tuple(sms))
+        return ("cuda", sms[0], line)
     except Exception:
         return None
 
@@ -1134,13 +1177,16 @@ def _gpu_cmake_flags(gpu_support):
     # Every visible arch, not just device 0, so a mixed-arch host gets code objects for each card.
     targets = []
     try:
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                gfx = (getattr(torch.cuda.get_device_properties(i), "gcnArchName", "") or "").split(":")[0]
-                if gfx.startswith("gfx") and gfx not in targets:
-                    targets.append(gfx)
+        count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     except Exception:
-        pass
+        count = 0
+    for i in range(count):
+        try:  # per device: one unreadable card must not drop the archs after it
+            gfx = (getattr(torch.cuda.get_device_properties(i), "gcnArchName", "") or "").split(":")[0]
+        except Exception:
+            continue
+        if gfx.startswith("gfx") and gfx not in targets:
+            targets.append(gfx)
     if targets:
         flags.append(f"-DGPU_TARGETS={';'.join(targets)}")
     print(f"Unsloth: Detected ROCm - building llama.cpp with HIP ({' '.join(flags)})")
@@ -1185,7 +1231,9 @@ def _select_gpu_assets(tag, assets, manifest, target = None):
             and a.get("asset_name") in assets
         ]
 
-    _, sm, preferred_line = target
+    _, sm, preferred_line = target[:3]
+    # Mixed host: every visible SM must be covered, not just the minimum.
+    required = set(target[3]) if len(target) > 3 else {sm}
     if system == "Windows":
         kind = "windows-cuda"
     elif system == "Linux":
@@ -1205,7 +1253,7 @@ def _select_gpu_assets(tag, assets, manifest, target = None):
         portable = None
         for a in (a for a in kind_artifacts if a.get("runtime_line") == line):
             supported = {int(s) for s in a.get("supported_sms", []) if str(s).isdigit()}
-            if sm not in supported:
+            if not required <= supported:
                 continue
             if a.get("coverage_class") == "portable":
                 portable = a

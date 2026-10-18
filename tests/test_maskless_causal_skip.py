@@ -567,6 +567,7 @@ def test_flash_sdpa_check_reads_heterogeneous_head_dims(monkeypatch):
     monkeypatch.setattr(torch.version, "hip", None)
     monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (9, 0))
+    monkeypatch.setattr(misc, "_flash_sdpa_accepts", lambda *args: True)
     embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
     wide = Gemma4UnifiedTextConfig(num_hidden_layers = 4)
     assert wide.is_heterogeneous
@@ -574,3 +575,124 @@ def test_flash_sdpa_check_reads_heterogeneous_head_dims(monkeypatch):
     narrow = Gemma4UnifiedTextConfig(num_hidden_layers = 4, global_head_dim = 128)
     assert misc._flash_sdpa_takes_causal(narrow, embeds) is True
     assert misc._flash_sdpa_takes_causal(_config(), embeds) is True
+
+
+def _flash_rule(capability, torch_2_6):
+    # can_use_flash_attention for dense square causal enable_gqa inputs (torch 2.6 / 2.13 sdp_utils.cpp).
+    def accepts(device, dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
+        if torch_2_6:
+            if not ((8, 0) <= capability <= (9, 0)): return False
+            narrow = (8, 6) <= capability <= (8, 9)
+        else:
+            if not ((8, 0) <= capability <= (12, 1)): return False
+            narrow = (8, 6) <= capability <= (8, 9) or (12, 0) <= capability <= (12, 1)
+        if requires_grad and narrow and (192 < head_dim <= 224 or (head_dim > 224 and dropout > 0)):
+            return False
+        return True
+    return accepts
+
+
+@pytest.mark.parametrize("torch_2_6", [True, False], ids = ["torch2.6", "torch2.13"])
+@pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (12, 0)])
+@pytest.mark.parametrize("head_dim", [128, 200, 256])
+@pytest.mark.parametrize("dropout", [0.0, 0.1])
+@pytest.mark.parametrize("grad", [True, False])
+def test_flash_sdpa_check_defers_to_the_dispatcher(monkeypatch, torch_2_6, capability, head_dim, dropout, grad):
+    # Gemma-2B GQA training (head_dim 256, 8:1 heads, dropout 0.1) on sm86 / sm89 must keep the mask:
+    # without it flash refuses and SDPA falls to the quadratic math kernel.
+    import types
+    from transformers import GemmaConfig
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: capability)
+    seen = []
+    rule = _flash_rule(capability, torch_2_6)
+    def fake_accepts(*args):
+        seen.append(args)
+        return rule(*args)
+    monkeypatch.setattr(misc, "_flash_sdpa_accepts", fake_accepts)
+    config = GemmaConfig(hidden_size = 2048, num_attention_heads = 8, num_key_value_heads = 1,
+                         head_dim = head_dim, attention_dropout = dropout)
+    config._attn_implementation = "sdpa"
+    embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
+    with torch.set_grad_enabled(grad):
+        got = misc._flash_sdpa_takes_causal(config, embeds)
+    assert seen == [("cuda:0", torch.bfloat16, 8, 1, head_dim, dropout, grad)]
+    assert got is rule("cuda:0", torch.bfloat16, 8, 1, head_dim, dropout, grad)
+
+
+def test_flash_sdpa_check_keeps_the_mask_when_the_probe_fails(monkeypatch):
+    import types
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (9, 0))
+    monkeypatch.setattr(misc, "_FLASH_SDPA_ACCEPTS_CACHE", {})
+    def broken(*args, **kwargs):
+        raise RuntimeError("no SDPAParams")
+    monkeypatch.setattr(torch.backends.cuda, "SDPAParams", broken)
+    embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
+    assert misc._flash_sdpa_takes_causal(_config(), embeds) is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "needs an NVIDIA GPU")
+def test_flash_sdpa_check_matches_the_real_dispatcher():
+    from transformers import GemmaConfig
+    device = torch.device("cuda", torch.cuda.current_device())
+    embeds = torch.zeros(1, 2, 8, device = device, dtype = torch.bfloat16)
+    for head_dim, dropout in ((128, 0.0), (256, 0.1), (200, 0.0)):
+        config = GemmaConfig(hidden_size = 2048, num_attention_heads = 8, num_key_value_heads = 1,
+                             head_dim = head_dim, attention_dropout = dropout)
+        config._attn_implementation = "sdpa"
+        query = torch.randn(1, 8, 64, head_dim, device = device, dtype = torch.bfloat16, requires_grad = True)
+        key = torch.randn(1, 1, 64, head_dim, device = device, dtype = torch.bfloat16, requires_grad = True)
+        params = torch.backends.cuda.SDPAParams(query, key, key, None, dropout, True, True)
+        expected = torch.backends.cuda.flash_sdp_enabled() and torch.cuda.get_device_capability(device) >= (8, 0) \
+            and torch.backends.cuda.can_use_flash_attention(params, False)
+        assert misc._flash_sdpa_takes_causal(config, embeds) is bool(expected)
+
+
+class _FakeProbe:
+    """Stands in for torch's CUDA probe on a CPU host: records the current device per flash check."""
+    def __init__(self, monkeypatch, gqa_argument = True, accepts_on = ("cuda:1",)):
+        import contextlib
+        self.current = "cuda:0"
+        self.checked_on = []
+        self.param_counts = []
+        real_empty = torch.empty
+        monkeypatch.setattr(misc, "_FLASH_SDPA_ACCEPTS_CACHE", {})
+        monkeypatch.setattr(torch, "empty", lambda shape, device = None, **kwargs: real_empty(shape, **kwargs))
+        @contextlib.contextmanager
+        def device(target):
+            previous, self.current = self.current, str(target)
+            try:
+                yield
+            finally:
+                self.current = previous
+        monkeypatch.setattr(torch.cuda, "device", device)
+        def params(*args):
+            if len(args) == 7 and not gqa_argument:
+                raise TypeError("SDPAParams takes 6 arguments")
+            self.param_counts.append(len(args))
+            return args
+        monkeypatch.setattr(torch.backends.cuda, "SDPAParams", params)
+        def can_use(params, debug = False):
+            self.checked_on.append(self.current)
+            return self.current in accepts_on
+        monkeypatch.setattr(torch.backends.cuda, "can_use_flash_attention", can_use)
+
+
+def test_flash_probe_runs_on_the_embeds_device(monkeypatch):
+    # torch reads the current device's arch: with device_map across mixed GPUs a cuda:1 probe must not ask cuda:0.
+    probe = _FakeProbe(monkeypatch, accepts_on = ("cuda:1",))
+    assert misc._flash_sdpa_accepts("cuda:1", torch.bfloat16, 8, 1, 256, 0.1, True) is True
+    assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 1, 256, 0.1, True) is False
+    assert probe.checked_on == ["cuda:1", "cuda:0"]
+    assert probe.current == "cuda:0"
+
+
+def test_flash_probe_without_enable_gqa_argument(monkeypatch):
+    # torch 2.4 SDPAParams has no enable_gqa: MHA is still probed, GQA keeps the mask.
+    probe = _FakeProbe(monkeypatch, gqa_argument = False, accepts_on = ("cuda:0",))
+    assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 8, 128, 0.0, True) is True
+    assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 1, 128, 0.0, True) is False
+    assert probe.param_counts == [6]
