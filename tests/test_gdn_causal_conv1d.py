@@ -231,10 +231,10 @@ def _unpatched_decorator(decorator):
     return decorator.__wrapped__ if getattr(decorator, gcc._HUB_MARK, False) else decorator
 
 
-def _real_gdn_modeling(monkeypatch):
-    modeling = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
-    if getattr(modeling, "causal_conv1d_fn", None) is None:
-        pytest.skip("transformers < 5.15 GatedDeltaNet")
+def _real_gdn_modeling(monkeypatch, name = "transformers.models.qwen3_5.modeling_qwen3_5"):
+    modeling = pytest.importorskip(name)
+    if getattr(modeling, "causal_conv1d_fn", None) is None or not hasattr(modeling, "use_kernel_func_from_hub_with_fallback"):
+        pytest.skip(f"transformers < 5.15 {name}")
     decorator = _unpatched_decorator(modeling.use_kernel_func_from_hub_with_fallback)
     # Both names: the patch rebinds the decode update too, and a test that leaves it patched
     # changes what the next test starts from.
@@ -257,10 +257,14 @@ def test_hub_decorator_wraps_only_gdn_fallbacks(hub_kernels):
     assert gcc._patch_hub_decorator() is patched
     gdn_fn = _gdn_fn("transformers.models.qwen3_5.modeling_qwen3_5")
     assert gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(gdn_fn))
-    assert not gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(_gdn_fn("transformers.models.mamba2.modeling_mamba2")))
-    # The decode update is wrapped too, still only for GatedDeltaNet modules.
+    # Mamba2 mixers share both dispatches; models outside both lists keep the hub wrapper.
+    for name in ("transformers.models.mamba2.modeling_mamba2", "transformers.models.nemotron_h.modeling_nemotron_h"):
+        assert gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(_gdn_fn(name)))
+        assert gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(_gdn_fn(name)))
     assert gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(gdn_fn))
-    assert not gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(_gdn_fn("transformers.models.mamba2.modeling_mamba2")))
+    lfm2 = _gdn_fn("transformers.models.lfm2.modeling_lfm2")
+    assert not gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(lfm2))
+    assert not gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(lfm2))
 
     import types
     legacy = types.ModuleType("legacy")
@@ -338,6 +342,35 @@ def test_gated_delta_net_layer_engages_triton(hub_kernels, monkeypatch):
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")
     run()
     assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_fwd"] == stats["triton_fwd"] + 1
+
+
+@requires_cuda
+def test_mamba2_mixer_engages_triton(hub_kernels, monkeypatch):
+    modeling = _real_gdn_modeling(monkeypatch, "transformers.models.mamba2.modeling_mamba2")
+    from transformers import Mamba2Config
+    config = Mamba2Config(
+        hidden_size = 64, num_heads = 4, head_dim = 32, expand = 2, n_groups = 1, state_size = 16,
+        num_hidden_layers = 1, chunk_size = 16,
+    )
+    torch.manual_seed(0)
+    layer = modeling.Mamba2Mixer(config, 0).cuda().to(torch.bfloat16)
+    x = torch.randn(2, 33, 64, device = "cuda", dtype = torch.bfloat16)
+
+    def run():
+        layer.zero_grad(set_to_none = True)
+        xr = x.clone().requires_grad_(True)
+        y = layer(xr)
+        y.float().square().sum().backward()
+        return y.detach(), xr.grad, layer.conv1d.weight.grad
+
+    ref = run()
+    stats = dict(gcc.GDN_CAUSAL_CONV1D_STATS)
+    gcc.patch_gdn_causal_conv1d()
+    ours = run()
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_fwd"] == stats["triton_fwd"] + 1
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_bwd"] == stats["triton_bwd"] + 1
+    for o, r in zip(ours, ref):
+        assert _rel(o, r) < 2e-2
 
 
 def test_legacy_modeling_imported_at_patch_time(monkeypatch):

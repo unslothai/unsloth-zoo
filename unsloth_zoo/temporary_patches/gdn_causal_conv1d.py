@@ -14,9 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Triton causal depthwise conv (+ SiLU) for GatedDeltaNet when `causal_conv1d` is missing.
+"""Triton causal depthwise conv (+ SiLU) for GatedDeltaNet and Mamba2 when `causal_conv1d` is missing.
 
-Replaces the transformers `F.conv1d` fallback (Qwen3.5/3.6, Qwen3-Next), reading and
+Replaces the transformers `F.conv1d` fallback (Qwen3.5/3.6, Qwen3-Next; on transformers >= 5.15
+also the Mamba2 mixers of Nemotron-H, Falcon-H1, Granite-4.0-H, Bamba, Zamba2), reading and
 writing channel-last directly to skip the transpose copies. Layout follows fla's
 `causal_conv1d` (fla-org/flash-linear-attention, MIT), without initial state; `seq_idx`
 (B, T) keeps taps inside one packed sequence.
@@ -51,8 +52,12 @@ _MARK = "_unsloth_triton_causal_conv1d"
 _HUB_MARK = "_unsloth_triton_causal_conv1d_hub"
 
 _GDN_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
+# Mamba2 mixers call the same depthwise causal conv (x (B, D, T), weight (D, W), SiLU) through the
+# same hub decorator, so they share the dispatch on transformers >= 5.15. Older releases gate the
+# whole Mamba2 fast path on the causal_conv1d package itself, so there is nothing to rebind there.
+_MAMBA2_MODELING = ("nemotron_h", "falcon_h1", "granitemoehybrid", "bamba", "zamba2", "mamba2")
 _GDN_LEAVES = frozenset(
-    f"{prefix}_{package}" for package in _GDN_MODELING
+    f"{prefix}_{package}" for package in _GDN_MODELING + _MAMBA2_MODELING
     for prefix in ("modeling", "unsloth_compiled_module")
 )
 
@@ -898,6 +903,8 @@ def patch_gdn_causal_conv1d():
 
     patched_decorator = _patch_hub_decorator()
     names = [f"transformers.models.{p}.modeling_{p}" for p in _GDN_MODELING]
+    if patched_decorator is not None:
+        names += [f"transformers.models.{p}.modeling_{p}" for p in _MAMBA2_MODELING]
     if patched_decorator is None:
         # transformers < 5.15 has no decorator to hook: import modeling modules now.
         for name in names:
