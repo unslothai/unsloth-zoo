@@ -379,6 +379,9 @@ def _fingerprint(ids):
     return ids.sort(-1).values.to(torch.int16)
 
 
+_NATURAL = object()
+
+
 def _input_signature(args, tokens):
     # Per token fp32 sum of the router input. The recompute feeds the router the same bits as
     # the forward did, so this tells apart forwards whose natural routes are equal.
@@ -397,7 +400,9 @@ def _recomputed_routes(layer_index, ids2, signature = None):
     _STATE.recomputed = True
     candidates = [r[layer_index] for r in _STATE.pending if layer_index in r and r[layer_index][1].shape == ids2.shape]
     if not candidates:
-        return ids2.long(), torch.zeros((ids2.shape[0], 1), dtype = torch.bool, device = ids2.device)
+        # No forward replayed this layer: recompute it exactly as it ran, with no extra ops
+        # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
+        return _NATURAL
     fp = _fingerprint(ids2)
     match = torch.stack([(c[0] == fp).all() for c in candidates])
     if signature is not None:
@@ -499,6 +504,9 @@ def _router_hook(layer_index):
         recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature)
         if recomputed is not None:
             _STATE.stats["router_calls_recomputed"] += 1
+        if recomputed is _NATURAL:
+            _STATE.stats["router_calls_natural"] += 1
+            return None
         if recomputed is None and replay is None:
             _STATE.stats["router_calls_natural"] += 1
             return None

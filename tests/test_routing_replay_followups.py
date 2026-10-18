@@ -126,3 +126,15 @@ def test_recompute_replays_forwards_with_equal_natural_routes_but_different_repl
     assert grads_gc.keys() == grads_plain.keys()
     for name in grads_plain:
         torch.testing.assert_close(grads_gc[name], grads_plain[name], rtol = 1e-4, atol = 1e-6, msg = name)
+
+
+def test_nonreentrant_recompute_of_a_natural_forward_adds_no_ops(replay):
+    # No rollout matches, so the forward keeps its natural routing. The non-reentrant checkpoint
+    # recompute must run the same ops, or torch raises a CheckpointError.
+    model = _model()
+    model.train()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+    _install(model, 2)
+    rr.record_routed_experts([_request([5, 6], [7, 8], np.zeros((4, 2, TOP_K)) + [[0, 1]])])
+    model(input_ids = torch.tensor([[11, 12, 13, 14]])).logits.float().square().mean().backward()
+    assert model.model.layers[0].mlp.gate.weight.grad is not None
