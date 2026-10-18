@@ -432,6 +432,8 @@ def matmul_ogs_available(device = None) -> bool:
     device = torch.device(device)
     key = str(device)
     ok = _DEVICE_OK.get(key)
+    if ok is None and not native_mxfp4_matmul_ok(device, get_triton_kernels_backend()):
+        ok = _DEVICE_OK[key] = False  # known not to run here: no probe launch
     if ok is None:
         on_cuda = torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext()
         try:

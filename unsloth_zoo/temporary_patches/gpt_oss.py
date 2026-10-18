@@ -739,7 +739,9 @@ def patch_gpt_oss():
             with torch_cuda_device(hidden_states.device):
                 if not hasattr(self, "act"):
                     self.act = tk_backend.swiglu_activation(self.alpha, self.limit)
-                if not (torch.is_grad_enabled() and hidden_states.requires_grad):
+                if not (torch.is_grad_enabled() and hidden_states.requires_grad) and _ogs_native_inference_ok(
+                    hidden_states.device, tk_backend,
+                ):
                     intermediate_cache1 = tk_backend.gate_up(
                         hidden_states.to(torch.bfloat16),  # tl.dot_scaled upcasts to BF16 for old hardware
                         self.gate_up_proj,
@@ -2590,10 +2592,26 @@ def _ogs_native_training_ok(device, backend):
         logger.warning(
             f"Unsloth: triton_kernels {backend.api} cannot run MXFP4 expert matmuls on sm_{major}{minor}; "
             "GPT OSS MXFP4 experts are "
-            "dequantized to bf16 per expert chunk for training. Install triton_kernels release/3.7.x or newer "
+            "dequantized to bf16 per expert chunk (training and no-grad forward). Install triton_kernels "
+            "release/3.7.x or newer "
             "for the native path."
         )
     return False
+
+
+def _ogs_native_inference_ok(device, backend):
+    """No-grad twin of ``_ogs_native_training_ok``: where the native matmul cannot run, the no-grad forward takes
+    ``mxfp4_ogs_experts_forward``, whose ``_OgsGateUp`` / ``_OgsDown`` then use the exact bf16 decode."""
+    return _ogs_native_training_ok(device, backend)
+
+
+def _ogs_module_backend(module):
+    """The triton_kernels copy ``module``'s experts launch with, without touching the (decoding) weight properties."""
+    from unsloth_zoo.triton_kernels_compat import triton_kernels_backend_for
+    try:
+        return triton_kernels_backend_for(_triton_kernels_root(module))
+    except Exception:
+        return None
 
 
 def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_config):
@@ -2863,6 +2881,7 @@ def forward_mxfp4_gpt_oss_with_lora(
         if (
             gate_up_lora is None and down_lora is None
             and not (torch.is_grad_enabled() and hidden_states.requires_grad)
+            and _ogs_native_inference_ok(hidden_states.device, _ogs_module_backend(self))
         ):
             out = self._original_forward(hidden_states, routing_data, gather_idx, scatter_idx)
         else:

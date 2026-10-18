@@ -174,3 +174,61 @@ def test_the_fallback_returns_the_native_shapes_and_dtypes(monkeypatch):
     down = go._ogs_dequant_down(h, routing.gate_scal, module.down_proj, module.down_proj_bias, routing, scatter, None)
     assert whole.dtype == torch.bfloat16 and whole.shape == (T * K, 2 * I)
     assert down.dtype == torch.bfloat16 and down.shape == (T, H)
+
+
+class _NoGradExperts:
+    """The LoRA-patched experts forward's view of a module: dense stacks, no adapters, a recording native forward."""
+
+    def __init__(self, module):
+        self.__dict__.update(module.__dict__)
+        self.original_calls = 0
+
+    def _original_forward(self, *args, **kwargs):
+        self.original_calls += 1
+        return torch.zeros(T, H)
+
+
+@pytest.mark.parametrize("capability, api, native", [
+    ((12, 0), compat.API_OGS_RAGGED, False),
+    ((12, 0), compat.API_MATMUL_RAGGED, True),
+    ((10, 0), compat.API_OGS_RAGGED, True),
+])
+def test_no_grad_forward_without_lora_fails_closed_on_the_rejected_cell(monkeypatch, capability, api, native):
+    import contextlib
+    monkeypatch.setattr(compat, "_device_capability", lambda device: capability)
+    monkeypatch.setattr(go, "_OGS_NATIVE_REJECT_WARNED", False)
+    monkeypatch.setattr(go.logger, "warning", lambda *args, **kwargs: None)
+    backend = _Recorder(api)
+    monkeypatch.setattr(go, "_ogs_backend_for", lambda *args, **kwargs: backend)
+    monkeypatch.setattr(go, "_ogs_module_backend", lambda module: backend)
+    monkeypatch.setattr(go, "is_triton_kernels_available", lambda: True)
+    monkeypatch.setattr(go, "_get_lora_wrapper_for_param", lambda module, name: None)
+    monkeypatch.setattr(go, "torch_cuda_device", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(
+        go, "_mxfp4_experts_routing",
+        lambda module, hs, rd, gather, scatter, ri, rw: (hs, rd, gather, scatter, None),
+    )
+    module, x, logits = _problem(seed = 6)
+    experts = _NoGradExperts(module)
+    routing, gather, scatter, top, weights = _routing(logits)
+    with torch.no_grad():
+        out = go.forward_mxfp4_gpt_oss_with_lora(experts, x, routing, gather, scatter)
+    assert experts.original_calls == (1 if native else 0)
+    if not native:
+        assert backend.calls == 0
+        ref = _reference(module, x.float(), top, weights)
+        assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-2
+
+
+def test_matmul_ogs_available_rejects_the_cell_without_probing(monkeypatch):
+    probes = []
+    monkeypatch.setattr(compat, "_DEVICE_OK", {})
+    monkeypatch.setattr(compat, "_self_check", lambda device: probes.append(device) or True)
+    monkeypatch.setattr(compat, "get_triton_kernels_backend", lambda: _backend(compat.API_OGS_RAGGED))
+    monkeypatch.setattr(compat, "_device_capability", lambda device: (12, 0))
+    assert compat.matmul_ogs_available("cuda:0") is False and probes == []
+    import contextlib
+    monkeypatch.setattr(compat, "_DEVICE_OK", {})
+    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(compat, "_device_capability", lambda device: (10, 0))
+    assert compat.matmul_ogs_available("cuda:0") is True and len(probes) == 1

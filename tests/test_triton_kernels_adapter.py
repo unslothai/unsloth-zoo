@@ -595,10 +595,17 @@ def test_real_routing_matches_a_dense_moe_across_experts():
     x = torch.randn(T, K, device = "cuda", generator = g).to(torch.bfloat16)
     logits = torch.randn(T, E, device = "cuda", generator = g)
     rdata, gather, scatter = backend.routing(logits, k)
-    out = backend.matmul_ogs(
-        x, w, None, rdata, gather_indx = gather, scatter_indx = scatter,
-        precision_config = precision, gammas = rdata.gate_scal,
-    ).float()
+    if tkc.native_mxfp4_matmul_ok(x.device, backend):
+        out = backend.matmul_ogs(
+            x, w, None, rdata, gather_indx = gather, scatter_indx = scatter,
+            precision_config = precision, gammas = rdata.gate_scal,
+        ).float()
+    else:
+        # sm_12x + release/3.6.x: the matmul cannot run there, so the experts take the exact bf16 decode instead.
+        from unsloth_zoo.temporary_patches import gpt_oss as go
+        assert tkc.matmul_ogs_available(x.device) is False
+        rows = x[torch.div(gather.src_indx.long(), k, rounding_mode = "floor")]
+        out = go._ogs_dequant_down(rows, rdata.gate_scal, w, None, rdata, scatter, precision).float()
     vals, idx = torch.topk(logits, k, dim = 1)
     ref = torch.einsum("tk,tkn->tn", torch.softmax(vals, dim = 1), torch.einsum("tc,tknc->tkn", x.float(), dense[idx]))
     assert ((out - ref).norm() / ref.norm()).item() < 1e-2
