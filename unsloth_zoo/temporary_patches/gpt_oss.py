@@ -2822,7 +2822,8 @@ def mxfp4_ogs_experts_forward(self, hidden_states, routing_data, gather_idx, sca
     pre_activation = _OgsGateUp.apply(hidden_states, self.gate_up_proj_bias, self, routing_data, gather_idx)
     if gate_up_lora is not None:
         first, second, scaling, _ = gate_up_lora
-        permuted = hidden_states[gather_idx.src_indx.long() // k].to(torch.bfloat16)
+        # The adapter's dtype, not bf16: fp16 adapters on T4 failed grouped_mm's same-dtype check.
+        permuted = hidden_states[gather_idx.src_indx.long() // k].to(first.dtype)
         pre_activation = pre_activation + _apply_lora_grouped_mm(
             permuted, first, second, _ogs_lora_offsets(routing_data), scaling,
             grouped_mm_func = native_moe_grouped_mm,
@@ -2832,7 +2833,7 @@ def mxfp4_ogs_experts_forward(self, hidden_states, routing_data, gather_idx, sca
     if down_lora is not None:
         first, second, scaling, _ = down_lora
         delta = _apply_lora_grouped_mm(
-            swiglu_output, first, second, _ogs_lora_offsets(routing_data), scaling,
+            swiglu_output.to(first.dtype), first, second, _ogs_lora_offsets(routing_data), scaling,
             grouped_mm_func = native_moe_grouped_mm,
         )
         dst = scatter_idx.dst_indx.long()
