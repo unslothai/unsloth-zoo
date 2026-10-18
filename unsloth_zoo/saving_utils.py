@@ -5927,19 +5927,17 @@ def merge_and_overwrite_lora(
 pass
 
 def _cached_file_matching_revision(repo_id, filename, hf_cache_dir, token, revision):
-    # The cached `main` snapshot's file, only if its blob is the file at `revision`: cache blobs
-    # are named by content hash (LFS sha256, xet hash, or git blob id for small files).
-    # Anything unverifiable returns None.
+    # A cached blob of the file at `revision`, whichever snapshot fetched it (refs/main may have
+    # moved on, or the shard came by commit SHA): cache blobs are named by content hash (LFS
+    # sha256, xet hash, or git blob id for small files). Anything unverifiable returns None.
     from huggingface_hub import HfApi
     try:
-        cached = hf_hub_download(
-            repo_id = repo_id,
-            filename = filename,
-            local_files_only = True,
-            repo_type = "model",
-            cache_dir = hf_cache_dir,
-            token = token,
+        from huggingface_hub.constants import HF_HUB_CACHE
+        from huggingface_hub.file_download import repo_folder_name
+        blobs = os.path.join(
+            hf_cache_dir or HF_HUB_CACHE, repo_folder_name(repo_id = repo_id, repo_type = "model"), "blobs",
         )
+        if not os.path.isdir(blobs): return None
         infos = HfApi(token = token).get_paths_info(repo_id, [filename], revision = revision)
     except Exception:
         return None
@@ -5951,8 +5949,10 @@ def _cached_file_matching_revision(repo_id, filename, hf_cache_dir, token, revis
             getattr(lfs, "sha256", None) if lfs is not None else getattr(info, "blob_id", None),
             getattr(info, "xet_hash", None),
         } - {None, ""}
-        if os.path.basename(os.path.realpath(cached)) in expected:
-            return cached
+        for name in expected:
+            # A partial download is "<hash>.incomplete", never the bare hash.
+            candidate = os.path.join(blobs, name)
+            if os.path.isfile(candidate): return candidate
     return None
 pass
 

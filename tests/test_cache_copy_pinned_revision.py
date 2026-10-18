@@ -83,3 +83,24 @@ def test_pinned_commit_offline_still_misses(tmp_path, monkeypatch):
 
     monkeypatch.setattr(huggingface_hub.HfApi, "get_paths_info", offline)
     assert not S._try_copy_all_from_cache("org/m", ["model.safetensors"], str(tmp_path / "out"), cache, None, revision = SHA2)
+
+
+def test_pinned_commit_finds_the_blob_from_an_older_snapshot(tmp_path, monkeypatch):
+    # refs/main already points at a newer, partially cached commit without the shard; the
+    # unchanged shard is still under the older snapshot that fetched it.
+    cache = _cache(tmp_path)
+    repo = tmp_path / "cache" / "models--org--m"
+    (repo / "snapshots" / SHA2).mkdir()
+    (repo / "refs" / "main").write_text(SHA2)
+    _hub_reports(monkeypatch, ETAG)
+    out = tmp_path / "out"
+    assert S._try_copy_all_from_cache("org/m", ["model.safetensors"], str(out), cache, None, revision = "3" * 40)
+    assert (out / "model.safetensors").read_bytes() == b"weights"
+
+
+def test_pinned_commit_ignores_an_incomplete_blob(tmp_path, monkeypatch):
+    cache = _cache(tmp_path)
+    blobs = tmp_path / "cache" / "models--org--m" / "blobs"
+    (blobs / ETAG).rename(blobs / f"{ETAG}.incomplete")
+    _hub_reports(monkeypatch, ETAG)
+    assert not S._try_copy_all_from_cache("org/m", ["model.safetensors"], str(tmp_path / "out"), cache, None, revision = SHA2)
