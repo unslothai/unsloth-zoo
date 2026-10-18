@@ -85,7 +85,7 @@ def _request(prompt, completion, routed):
     )
 
 
-def test_qwen35_wrapper_replays_captured_routes(replay, monkeypatch):
+def _qwen35_model(monkeypatch):
     pytest.importorskip("transformers", minversion = "5.17.0")
     from transformers import Qwen3_5MoeConfig
     from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen35
@@ -107,9 +107,14 @@ def test_qwen35_wrapper_replays_captured_routes(replay, monkeypatch):
         ),
         vision_config = dict(depth = 1, hidden_size = 32, intermediate_size = 64,
                              num_heads = 4, out_hidden_size = 32, num_position_embeddings = 64),
+        image_token_id = 3, vision_start_token_id = 2,
     )
     torch.manual_seed(31)
-    model = qwen35.Qwen3_5MoeForConditionalGeneration(config).float().eval()
+    return qwen35.Qwen3_5MoeForConditionalGeneration(config).float().eval()
+
+
+def test_qwen35_wrapper_replays_captured_routes(replay, monkeypatch):
+    model = _qwen35_model(monkeypatch)
     decoder = model.model.language_model
     assert decoder.config.layer_types == ["linear_attention"] * 3 + ["full_attention"]
     captured, handles = [], []
@@ -140,6 +145,30 @@ def test_qwen35_wrapper_replays_captured_routes(replay, monkeypatch):
     assert rr.routing_replay_stats()["router_calls_replayed"] == 4
     assert rr.routing_replay_stats()["router_calls_natural"] == 4
 
+
+
+def test_qwen35_image_forward_keeps_natural_routing(replay, monkeypatch):
+    # Routes are keyed by token ids alone: an image behind the same tokens must not take them.
+    model = _qwen35_model(monkeypatch)
+    for layer in model.model.language_model.layers:
+        layer.mlp.gate.weight.data.normal_(0, 0.5)
+    ids = torch.tensor([[5, 2, 3, 6, 7, 8, 9]])
+    image = dict(pixel_values = torch.randn(4, 3 * 2 * 16 * 16), image_grid_thw = torch.tensor([[1, 2, 2]]),
+                 mm_token_type_ids = (ids == 3).long())
+    with torch.no_grad():
+        expected = model(input_ids = ids, **image).logits
+    routes = np.random.default_rng(0).integers(0, NUM_EXPERTS, (ids.shape[1], 4, TOP_K))
+    routes[..., 1] = (routes[..., 0] + 1) % NUM_EXPERTS
+
+    assert rr.install_routing_replay(model, tokenizer = SimpleNamespace(pad_token_id = PAD)) == 4
+    rr.record_routed_experts([_request(ids[0, :3].tolist(), ids[0, 3:].tolist(), routes)])
+    with torch.no_grad():
+        actual = model(input_ids = ids, **image).logits
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 0
+    torch.testing.assert_close(actual, expected, rtol = 1e-5, atol = 1e-6)
+    with torch.no_grad():
+        model(input_ids = ids)
+    assert rr.routing_replay_stats()["router_calls_replayed"] == 4
 
 @pytest.fixture
 def replay(monkeypatch):
@@ -234,6 +263,41 @@ def _reference_forced_forward(model, ids, forced):
     finally:
         for layer, original in zip(model.model.layers, originals):
             layer.mlp.gate.forward = original
+
+
+def test_probability_router_outputs_are_not_softmaxed_again(replay):
+    # transformers 5.2 - 5.7 Qwen MoE routers return softmax probabilities in the logits slot.
+    model = _model()
+    for layer in model.model.layers:
+        gate = layer.mlp.gate
+
+        def forward(hidden_states, gate = gate):
+            probs = F.softmax(F.linear(hidden_states.reshape(-1, gate.hidden_dim), gate.weight), dtype = torch.float, dim = -1)
+            top, idx = torch.topk(probs, TOP_K, dim = -1)
+            return probs, (top / top.sum(-1, keepdim = True)).to(probs.dtype), idx
+
+        gate.forward = forward
+    prompt, completion = [5, 6, 7], [20, 21, 22, 23]
+    ids = prompt + completion
+    natural = _natural_ids(model, ids)
+    forced = natural.clone()
+    forced[2:5] = (forced[2:5] + 3) % NUM_EXPERTS
+    forced[-1] = natural[-1]
+    model.zero_grad()
+    expected = _reference_forced_forward(model, ids, forced)
+    expected.sum().backward()
+    ref_grad = model.model.layers[0].mlp.gate.weight.grad.clone()
+
+    _install(model)
+    rr.record_routed_experts([_request(prompt, completion, forced.numpy())])
+    model.zero_grad()
+    out = model(input_ids = torch.tensor([ids])).logits
+    out.sum().backward()
+
+    torch.testing.assert_close(out, expected, rtol = 1e-5, atol = 1e-6)
+    torch.testing.assert_close(model.model.layers[0].mlp.gate.weight.grad, ref_grad, rtol = 1e-4, atol = 1e-6)
+    assert {layer.mlp.gate._unsloth_replay_formula for layer in model.model.layers} == {"probs_renorm"}
+    assert rr.routing_replay_stats()["changed_selections"] == 3 * NUM_LAYERS
 
 
 def test_different_ids_change_output_only_through_ids(replay):

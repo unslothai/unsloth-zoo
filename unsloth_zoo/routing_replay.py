@@ -323,6 +323,9 @@ def _build_replay(input_ids, position_ids, attention_mask = None):
     return out.to(input_ids.device, non_blocking = True).long()
 
 
+_MEDIA_KWARGS = ("pixel_values", "pixel_values_videos", "input_features")
+
+
 def _input_ids(args, kwargs):
     input_ids = kwargs.get("input_ids", None)
     if input_ids is None and len(args) > 0 and torch.is_tensor(args[0]) and not args[0].is_floating_point():
@@ -403,12 +406,25 @@ def _softmax_gather(logits, ids, renorm):
     return w / w.sum(dim = -1, keepdim = True) if renorm else w
 
 
+def _probs_gather(probs, ids, renorm):
+    w = probs.float().gather(-1, ids)
+    return w / w.sum(dim = -1, keepdim = True) if renorm else w
+
+
 def _formulas():
     # softmax_renorm also covers gpt-oss style softmax over the top-k logits: they are equal.
+    # probs_*: transformers 5.2 - 5.7 Qwen MoE routers return softmax probabilities as "logits".
     return OrderedDict(
         softmax_renorm = lambda logits, ids: _softmax_gather(logits, ids, True),
         softmax = lambda logits, ids: _softmax_gather(logits, ids, False),
+        probs_renorm = lambda probs, ids: _probs_gather(probs, ids, True),
+        probs = lambda probs, ids: _probs_gather(probs, ids, False),
     )
+
+
+def _looks_like_probs(logits2):
+    with torch.no_grad():
+        return bool(((logits2 >= 0).all() & ((logits2.float().sum(-1) - 1).abs() < 1e-3).all()).item())
 
 
 def _split_router_output(output):
@@ -474,7 +490,11 @@ def _router_hook(layer_index):
         formula = getattr(module, "_unsloth_replay_formula", None)
         if formula is None:
             # Pick the weight formula that reproduces this router's own natural weights.
+            # Probabilities must never be softmaxed again: near ties would pass the check below.
+            probs = _looks_like_probs(logits2)
             for name, fn in _formulas().items():
+                if name.startswith("probs") != probs:
+                    continue
                 with torch.no_grad():
                     candidate = fn(logits2, ids2).to(weights2.dtype).float()
                 if torch.allclose(candidate, weights2.float(), rtol = 2e-2, atol = 2e-3):
@@ -492,7 +512,8 @@ def _router_hook(layer_index):
             return None
 
         if recomputed is None:
-            forced = replay[:, layer_index, :]
+            # Replay rows live on the input ids' device; a device map can put this layer elsewhere.
+            forced = replay[:, layer_index, :].to(ids2.device, non_blocking = True)
             valid = (forced >= 0).all(dim = -1, keepdim = True)
             forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
             if _STATE.record is not None:
@@ -564,7 +585,10 @@ def install_routing_replay(model, llm = None, tokenizer = None):
         parent = model.get_submodule(decoder_name.rpartition(".")[0])
 
         def parent_pre_hook(module, args, kwargs):
-            parent_input_ids.append(_input_ids(args, kwargs))
+            # Routes are keyed by token ids alone, so two images behind the same tokens would swap
+            # routes: media forwards keep their natural routing.
+            media = any(kwargs.get(k) is not None for k in _MEDIA_KWARGS)
+            parent_input_ids.append(None if media else _input_ids(args, kwargs))
 
         def parent_post_hook(module, args, output):
             if parent_input_ids:
