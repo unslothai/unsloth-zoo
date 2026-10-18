@@ -122,6 +122,8 @@ def _run_pg_forward(hidden_states):
         "chunked_hidden_states_selective_log_softmax":
             rr.chunked_hidden_states_selective_log_softmax,
         "chunked_selective_log_softmax": rr.chunked_selective_log_softmax,
+        # The enclosing function re-reads the (FSDP2-unsharded) head after each forward.
+        "_refresh_lm_head": lambda: None, "lm_head_bias": None,
         "device_synchronize": lambda *a, **k: None,
         "unwrapped_model": model,
         "lm_head": model.head.weight,          # [vocab, hidden]
