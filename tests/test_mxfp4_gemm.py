@@ -101,7 +101,9 @@ def test_decode_mode_dispatch_and_off_switch(monkeypatch):
         monkeypatch.setenv("UNSLOTH_MXFP4_CVT", env)
         monkeypatch.setattr(mg, "_ASM_OK", {})
         mode = mg._asm_ok(torch.device("cuda", index))
-        assert (mode == 2) == want and mode  # never drops below the fma decode on sm_80+
+        # sm_75 and HIP keep the plain Triton decode (False); sm_80+ CUDA never drops below the fma decode.
+        fma_eligible = torch.version.hip is None and torch.cuda.get_device_capability(index) >= (8, 0)
+        assert (mode == 2) == want and bool(mode) == fma_eligible
     monkeypatch.setenv("UNSLOTH_MXFP4_ASM", "0")
     monkeypatch.setattr(mg, "_ASM_OK", {})
     assert mg._asm_ok(torch.device("cuda", index)) is False
