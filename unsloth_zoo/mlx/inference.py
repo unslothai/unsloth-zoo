@@ -138,11 +138,19 @@ def _bindings_intact(bindings):
 
 
 _FAILED_BUFFER = "[METAL] Command buffer execution failed"
+# One-off work run so far: each first-use check settles through `_settled`, and each timing counts one.
+_FIRST_USE_WORK = [0]
+
+
+def first_use_work():
+    """How much one-off first-use work (bitwise checks, timings) this process has run; a call that changed it paid for some."""
+    return _FIRST_USE_WORK[0]
 
 
 def _settled(verdict):
     """`verdict`, after synchronizing on a mismatch: a failed command buffer's garbage reads as one, and MLX
     raises that error only at the next synchronize."""
+    _FIRST_USE_WORK[0] += 1
     if not verdict:
         mx.synchronize()
     return verdict
@@ -4144,8 +4152,9 @@ def _taped_update(native, with_states):
                                     state_steps = steps)
                 if verdict is None:
                     try:
-                        verdict = _replay_matches(stock, replay, mask, initial)
-                    except (RuntimeError, ValueError):
+                        verdict = _settled(_replay_matches(stock, replay, mask, initial))
+                    except (RuntimeError, ValueError) as error:
+                        _unless_failed_buffer(error)
                         return stock  # inside a function transformation, which cannot evaluate; checked later
                     _TAPE_VERDICTS[key] = verdict
                     if not verdict:
@@ -4372,6 +4381,7 @@ def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
         except (RuntimeError, ValueError) as error:
             _unless_failed_buffer(error)
             return per_row()  # inside a function transformation, which cannot evaluate; timed later
+        _FIRST_USE_WORK[0] += 1
         if not _exact_attention_faster(per_row, fused):
             timings = 1 if lost is None else lost[0] + 1
             _EXACT_ATTENTION_TIMED[timing] = [timings, _EXACT_ATTENTION_RETRY << timings]

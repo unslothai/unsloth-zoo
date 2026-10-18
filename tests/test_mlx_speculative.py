@@ -183,6 +183,20 @@ def test_fused_rounds_learn_how_much_drafting_they_hide():
     assert controller._split_due(fused).split
 
 
+def test_a_round_running_first_use_work_updates_no_cost_and_is_measured_again():
+    controller = DraftController(max_depth = 2, can_copy = False)
+    state = [RowState(controller.new_reply())]
+    plan = controller.plan(state)
+    controller.record_round(plan, state, [1], seconds = 9.0, draft_seconds = 3.0, first_use = True)
+    controller.record_round(RoundPlan("round", rows = (RowPlan("draft", 2),)), state, [1], seconds = 9.0, first_use = True)
+    assert controller.verify_cost == {} and controller.draft_cost[2].value is None and controller.hidden_drafting == {}
+    assert controller.draft_acceptance[0].count == 3 and controller.steps == 4 and controller._measured_at == {}
+    assert controller.plan(state) == plan and plan.split
+    controller.record_round(plan, state, [1], seconds = 1.5, draft_seconds = 0.5)
+    assert (controller.verify_cost[1][3].value, controller.draft_cost[2].value) == pytest.approx((1.0, 0.5))
+    assert controller._measured_at == {(1, "round", 3): 6}
+
+
 def test_short_budgets_never_plan_empty_drafts():
     controller = DraftController(max_depth = 3, can_copy = False)
     for budgets in ([1], [1, 10], [0, 1]):

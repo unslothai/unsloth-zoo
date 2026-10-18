@@ -603,11 +603,13 @@ class DraftController:
         seconds: float,
         draft_seconds: float = 0.0,
         catch_up_seconds: float = 0.0,
+        first_use: bool = False,
     ) -> None:
         """Account a finished round; ``accepted[i]`` counts row ``i``'s accepted drafts.
 
         ``seconds`` is the whole round. A split round times its parts apart; a fused round,
         whose drafting overlaps building its verify, measures how much of the drafting it hid.
+        A ``first_use`` round, which also ran one-off first-use work, updates no cost and leaves its width unmeasured.
         """
         bucket = _bucket(len(rows))
         alpha = self.acceptance_alpha
@@ -636,6 +638,9 @@ class DraftController:
             if row.source in stats.probe_at:
                 stats.probe_at[row.source] = stats.tokens + stats.backoff[row.source]
         self._probing_sources, self._reference = {}, None
+        self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
+        if first_use:
+            return
 
         depths = [row.length for row in plan.rows if row.source == "draft" and row.length]
         catch_up = sum(state.catch_up for row, state in zip(plan.rows, rows) if row.source == "draft")
@@ -658,7 +663,6 @@ class DraftController:
                 verify.update(seconds, self.cost_alpha)
         if depths and self._warmup and self._warmup[0] >= max(depths):
             self._warmup.pop(0)
-        self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
         self._measured_at[self._identity(plan, bucket)] = self.steps
 
 
@@ -1062,6 +1066,8 @@ class SpeculativeEngine:
         self.controller.record_plain(states, steps, end - start, (end - started) / ran if ran > 0 else None)
 
     def _round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]] | None:
+        from .inference import first_use_work
+
         rows, width = self._rows, plan.width
         proposals = [
             row.proposer.propose(row.tokens, spec.length) if spec.source == "copy" else []
@@ -1071,7 +1077,7 @@ class SpeculativeEngine:
         inputs = mx.array(
             [[row.pending, *proposal] + [row.pending] * (width - 1 - len(proposal)) for row, proposal in zip(rows, proposals)]
         )
-        start = time.perf_counter()
+        start, work = time.perf_counter(), first_use_work()
         depth = max((spec.length for spec in plan.rows if spec.source == "draft"), default = 0)
         draft_rows = [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)]
         drafts, draft_seconds = None, 0.0
@@ -1155,7 +1161,8 @@ class SpeculativeEngine:
                 self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
             emitted.append(taken)
         self.controller.record_round(
-            plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds
+            plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds,
+            first_use = first_use_work() != work,
         )
         return emitted
 

@@ -512,9 +512,11 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         # A replay that does not reproduce stock keeps that key on stock.
         inference._TAPE_VERDICTS.clear()
         monkeypatch.setattr(inference, "_replay_matches", lambda *args: False)
+        work = inference.first_use_work()
         _verified(lm, cache, block, 0)
         run, out = _verify_call(lm, cache, block)
         assert "_unsloth_tapes" not in vars(out.gdn_states) and list(inference._TAPE_VERDICTS.values()) == [False]
+        assert inference.first_use_work() > work
         out.gdn_states.commit(keeps[0])
         assert _same(native[0], _state(out, run))
 
@@ -603,17 +605,21 @@ def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ra
     ban = lambda history, logits: logits + mx.where(mx.arange(logits.shape[-1]) == 13, -1e9, 0)
 
     def run():
-        scores = []
+        scores, first_use, verified = [], [], []
         def scored(engine):
-            engine.logprobs, step = True, engine.step
+            engine.logprobs, step, record, verify = True, engine.step, engine.controller.record_round, engine._verify
             engine.step = lambda *args: (scores.append(out.logprobs) or out for out in step(*args))
+            engine.controller.record_round = lambda *args, **kwargs: first_use.append(kwargs["first_use"]) or record(*args, **kwargs)
+            engine._verify = lambda inputs: (work := inference.first_use_work(), out := verify(inputs), verified.append(inference.first_use_work() != work))[1]
         out, drafted, _ = _run(model, [ids[0], ids[1], ids[0]], 96, _script(("copy", 16)), SamplingParams(), processors = {2: [ban]}, patch = scored)
-        return out, scores, drafted
-    closed, scores, drafted = run()
+        return out, scores, drafted, (first_use, verified)
+    closed, scores, drafted, _ = run()
     inference._VERIFY_VERDICTS.clear()
     with inference.exact_speculative_verify(model):
         opened = run()
     assert opened[:2] == (closed, scores) and any(scores) and drafted[0][1] > 8 and len({accepted for _, accepted in drafted.values()}) > 1
+    # Exactly the rounds whose verify ran a first-use check are flagged, so the controller leaves just those out of its costs.
+    assert opened[3][0] == opened[3][1] and any(opened[3][0]) and not all(opened[3][0])
     wide = [key for key, verdict in inference._VERIFY_VERDICTS.items() if key[0][0] == 3 and key[0][1] > 8 and verdict]
     # Each admitted key's replacement ran once for the comparison, then again for every later round it served.
     assert any(served.count(key) > 1 for key in wide)
@@ -723,9 +729,10 @@ def test_exact_attention_engages_where_timed_faster_and_caches_each_bucket_verdi
     monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
     q, k, wins = mx.zeros((1, 24, 4, 256), mx.bfloat16), mx.zeros((1, 4, 40000, 256), mx.bfloat16), {20000, 9500}
     attend = lambda keys, rows = q: inference._exact_attention(rows, k[:, :, :keys], k[:, :, :keys], 0.0625, None, None, lambda: keys)
+    work = inference.first_use_work()
     # Below the bottom limit nothing is timed; above it each power-of-two bucket is timed once, and its verdict holds for it alone.
     assert [attend(n) for n in (5000, 9000, 12000, 20000, 30000, 40000, 10000)] == [5000, 9000, 12000, "kernel", "kernel", 40000, 10000]
-    assert timings == [9000, 20000, 40000]
+    assert timings == [9000, 20000, 40000] and inference.first_use_work() == work + 3
     # Each width is timed apart, and a loss in a larger bucket leaves a smaller one to its own timing.
     assert attend(40000, q[:, :, :3]) == 40000 and attend(9500, q[:, :, :3]) == "kernel" and timings == [9000, 20000, 40000, 40000, 9500]
     monkeypatch.setattr(inference, "_EXACT_ATTENTION_RETRY", 1)
