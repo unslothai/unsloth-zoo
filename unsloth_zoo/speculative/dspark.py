@@ -386,8 +386,7 @@ def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher_hidden, teacher_w, labels)
     correct = (logits.argmax(-1) == labels).float()
     if teacher_hidden is None:
         return ce, torch.zeros_like(ce), correct
-    # Recompute the frozen teacher inside the checkpoint, so its [rows, V] probabilities
-    # are not retained for every chunk until backward.
+    # Inside the checkpoint so each chunk's [rows, V] teacher probs are not kept until backward.
     with torch.no_grad():
         teacher = (teacher_hidden @ teacher_w.T).float().softmax(-1)
     l1 = (logp.exp() - teacher).abs().sum(-1)
@@ -400,8 +399,7 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
 
     teacher_hidden: target post-norm states [B, S, H]; slot j's teacher is the target's own
     prediction at label_index - 1, projected with `teacher_lm_head_weight` (the target's lm_head;
-    defaults to the drafter's copy). Teacher probabilities are recomputed during backward
-    instead of being retained for every chunk. Returns (loss, stats).
+    defaults to the drafter's copy). Returns (loss, stats).
     """
     eval_mask = out["eval_mask"]
     rows = eval_mask.nonzero(as_tuple = True)

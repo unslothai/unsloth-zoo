@@ -219,7 +219,6 @@ def test_loss_does_not_save_vocab_sized_teacher_activations(chunk_size):
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         loss, _ = dspark_loss(drafter, out, teacher_hidden = final,
                               teacher_lm_head_weight = teacher_w, chunk_size = chunk_size)
-    # Chunking must bound retained activations as well as each projection's workspace.
     assert not saved_vocab_shapes, saved_vocab_shapes
     loss.backward()
     assert final.grad is None and teacher_w.grad is None
