@@ -1,0 +1,176 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""sm_12x + triton_kernels release/3.6.x (matmul_ogs+ragged) trips ``assert num_stages >= 1`` in opt_flags, so
+the native MXFP4 training forward falls back to exact bf16 decodes there; every other cell stays native. CPU only:
+the capability and the backend generation are faked."""
+
+import types
+
+import pytest
+import torch
+
+from unsloth_zoo import triton_kernels_compat as compat
+from unsloth_zoo.temporary_patches import gpt_oss as go
+
+E, H, I, T, K = 4, 64, 32, 16, 2
+ALPHA, LIMIT = 1.702, 7.0
+
+
+def _backend(api):
+    return types.SimpleNamespace(api = api, name = "fake_triton_kernels")
+
+
+@pytest.mark.parametrize("capability, api, native", [
+    ((12, 0), compat.API_OGS_RAGGED, False),
+    ((12, 1), compat.API_OGS_RAGGED, False),
+    ((12, 0), compat.API_MATMUL_RAGGED, True),
+    ((12, 0), compat.API_OGS_ROUTING, True),
+    ((10, 0), compat.API_OGS_RAGGED, True),
+    ((10, 0), compat.API_MATMUL_RAGGED, True),
+    ((9, 0), compat.API_OGS_RAGGED, True),
+    ((8, 0), compat.API_OGS_RAGGED, True),
+    ((7, 5), compat.API_OGS_RAGGED, True),
+])
+def test_only_sm12x_with_the_matmul_ogs_ragged_generation_is_rejected(monkeypatch, capability, api, native):
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: capability)
+    assert compat.native_mxfp4_matmul_ok("cuda:0", _backend(api)) is native
+
+
+def test_hip_cpu_and_no_backend_keep_the_current_route(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (12, 0))
+    ragged = _backend(compat.API_OGS_RAGGED)
+    assert compat.native_mxfp4_matmul_ok("cpu", ragged)
+    assert compat.native_mxfp4_matmul_ok("cuda:0", None)
+    monkeypatch.setattr(torch.version, "hip", "6.4")
+    assert compat.native_mxfp4_matmul_ok("cuda:0", ragged)
+
+
+class _Recorder:
+    """Backend stand-in: counts native launches and answers them with the dequant math."""
+
+    def __init__(self, api):
+        self.api, self.name, self.calls = api, "fake_triton_kernels", 0
+
+    def gate_up(self, x, weight, bias, routing_data, gather_idx, precision_config, fused_activation = None):
+        self.calls += 1
+        return go._ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_config)
+
+    def down(self, h, weight, bias, routing_data, scatter_idx, precision_config, gammas = None):
+        self.calls += 1
+        return go._ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precision_config)
+
+
+def _problem(seed = 0):
+    gen = torch.Generator().manual_seed(seed)
+    module = types.SimpleNamespace(alpha = ALPHA, limit = LIMIT, num_experts = E)
+    # Dense (E, in, out) bf16 stacks: the still-packed transformers 5 path hands _OgsGateUp / _OgsDown these.
+    module.gate_up_proj = (torch.randn(E, H, 2 * I, generator = gen) * 0.1).to(torch.bfloat16)
+    module.down_proj = (torch.randn(E, I, H, generator = gen) * 0.1).to(torch.bfloat16)
+    module.gate_up_proj_precision_config = module.down_proj_precision_config = None
+    module.gate_up_proj_bias = torch.nn.Parameter(torch.randn(E, 2 * I, generator = gen) * 0.1)
+    module.down_proj_bias = torch.nn.Parameter(torch.randn(E, H, generator = gen) * 0.1)
+    x = torch.randn(T, H, generator = gen).to(torch.bfloat16)
+    logits = torch.randn(T, E, generator = gen)
+    return module, x, logits
+
+
+def _routing(logits):
+    values, experts = torch.topk(logits, K, dim = -1)
+    weights = torch.softmax(values, -1)
+    gate_scal, hist, combine, dispatch = go.topk_to_routing_tensors(experts, weights, E)
+    routing = compat.RoutingData(gate_scal, hist, E, K)
+    gather = compat.GatherIndx(src_indx = combine, dst_indx = dispatch)
+    scatter = compat.ScatterIndx(src_indx = dispatch, dst_indx = combine)
+    return routing, gather, scatter, experts, weights
+
+
+def _swiglu(pre):
+    gate, linear = pre[..., ::2].clamp(max = LIMIT), pre[..., 1::2].clamp(-LIMIT, LIMIT)
+    return gate * torch.sigmoid(ALPHA * gate) * (linear + 1)
+
+
+def _reference(module, x, experts, weights):
+    gu, dn = module.gate_up_proj.float(), module.down_proj.float()
+    out = 0
+    for slot in range(K):
+        e = experts[:, slot]
+        pre = torch.bmm(x.unsqueeze(1), gu[e]).squeeze(1) + module.gate_up_proj_bias[e]
+        y = torch.bmm(_swiglu(pre).unsqueeze(1), dn[e]).squeeze(1) + module.down_proj_bias[e]
+        out = out + weights[:, slot : slot + 1] * y
+    return out
+
+
+def _train_step(monkeypatch, capability, api):
+    monkeypatch.setattr(compat, "_device_capability", lambda device: capability)
+    monkeypatch.setattr(go, "_OGS_NATIVE_REJECT_WARNED", False)
+    backend = _Recorder(api)
+    monkeypatch.setattr(go, "_ogs_backend_for", lambda *args, **kwargs: backend)
+    module, x0, logits0 = _problem()
+    grad = torch.randn(T, H, generator = torch.Generator().manual_seed(1))
+
+    x, logits = x0.clone().requires_grad_(), logits0.clone().requires_grad_()
+    routing, gather, scatter, _, _ = _routing(logits)
+    out = go.mxfp4_ogs_experts_forward(module, x, routing, gather, scatter)
+    (out.float() * grad).sum().backward()
+    ours = {"out": out.detach().float(), "x": x.grad.float(), "logits": logits.grad,
+            "gate_up_bias": module.gate_up_proj_bias.grad, "down_bias": module.down_proj_bias.grad}
+    module.gate_up_proj_bias.grad = module.down_proj_bias.grad = None
+
+    x_ref, logits_ref = x0.float().requires_grad_(), logits0.clone().requires_grad_()
+    _, experts, weights = _routing(logits_ref)[2:]
+    ref = _reference(module, x_ref, experts, weights)
+    (ref * grad).sum().backward()
+    theirs = {"out": ref.detach(), "x": x_ref.grad, "logits": logits_ref.grad,
+              "gate_up_bias": module.gate_up_proj_bias.grad, "down_bias": module.down_proj_bias.grad}
+    errors = {key: ((ours[key] - theirs[key]).norm() / theirs[key].norm()).item() for key in theirs}
+    return backend.calls, errors
+
+
+@pytest.mark.parametrize("capability, api, native", [
+    ((12, 0), compat.API_OGS_RAGGED, False),  # RTX 50xx / PRO 6000 + Studio's release/3.6.x pin
+    ((10, 0), compat.API_OGS_RAGGED, True),   # B200
+    ((12, 0), compat.API_MATMUL_RAGGED, True),  # sm_120 + release/3.8.x
+])
+def test_training_step_route_and_parity(monkeypatch, capability, api, native):
+    warnings = []
+    monkeypatch.setattr(go.logger, "warning", lambda message, *args, **kwargs: warnings.append(message))
+    calls, errors = _train_step(monkeypatch, capability, api)
+    assert (calls == 2) is native and (calls == 0) is (not native), calls
+    assert all(error < 2e-2 for error in errors.values()), errors
+    assert len([w for w in warnings if "dequantized to bf16" in w]) == (0 if native else 1)
+
+
+def test_the_fallback_warns_once(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(go.logger, "warning", lambda message, *args, **kwargs: warnings.append(message))
+    monkeypatch.setattr(compat, "_device_capability", lambda device: (12, 0))
+    monkeypatch.setattr(go, "_OGS_NATIVE_REJECT_WARNED", False)
+    ragged = _Recorder(compat.API_OGS_RAGGED)
+    for _ in range(3):
+        assert go._ogs_native_training_ok(torch.device("cuda", 0), ragged) is False
+    assert len(warnings) == 1 and "sm_120" in warnings[0]
+
+
+def test_the_fallback_returns_the_native_shapes_and_dtypes(monkeypatch):
+    module, x, logits = _problem(seed = 4)
+    routing, gather, scatter, _, _ = _routing(logits)
+    whole = go._ogs_dequant_gate_up(x, module.gate_up_proj, module.gate_up_proj_bias, routing, gather, None)
+    h = go._OgsSwiglu.apply(whole, ALPHA, LIMIT)
+    down = go._ogs_dequant_down(h, routing.gate_scal, module.down_proj, module.down_proj_bias, routing, scatter, None)
+    assert whole.dtype == torch.bfloat16 and whole.shape == (T * K, 2 * I)
+    assert down.dtype == torch.bfloat16 and down.shape == (T, H)

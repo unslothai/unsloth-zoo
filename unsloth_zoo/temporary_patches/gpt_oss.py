@@ -2575,6 +2575,76 @@ def _matmul_ogs_for(weight, routing_data = None):
     return _ogs_backend_for(weight, routing_data).matmul_ogs
 
 
+_OGS_NATIVE_REJECT_WARNED = False
+
+
+def _ogs_native_training_ok(device, backend):
+    """Whether the training forward may launch triton_kernels; else the exact bf16 dequant forward is used."""
+    from unsloth_zoo import triton_kernels_compat as compat
+    if compat.native_mxfp4_matmul_ok(device, backend):
+        return True
+    global _OGS_NATIVE_REJECT_WARNED
+    if not _OGS_NATIVE_REJECT_WARNED:
+        _OGS_NATIVE_REJECT_WARNED = True
+        major, minor = compat._device_capability(device)
+        logger.warning(
+            f"Unsloth: triton_kernels {backend.api} cannot run MXFP4 expert matmuls on sm_{major}{minor}; "
+            "GPT OSS MXFP4 experts are "
+            "dequantized to bf16 per expert chunk for training. Install triton_kernels release/3.7.x or newer "
+            "for the native path."
+        )
+    return False
+
+
+def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_config):
+    """matmul_ogs gate_up semantics on exact bf16 decodes: expert-sorted rows ``x[src // k] @ W[e] + b[e]``."""
+    k = routing_data.n_expts_act
+    rows = gather_idx.src_indx.long()
+    x = x.to(torch.bfloat16)
+    offsets = _ogs_expert_offsets(routing_data)
+    out = None
+    for first, last, dense in _ogs_dense_chunks(weight, precision_config, torch.bfloat16):
+        if out is None:
+            out = x.new_zeros((rows.shape[0], dense.shape[-1]))
+        for e in range(first, last):
+            lo, hi = offsets[e], offsets[e + 1]
+            if hi == lo:
+                continue
+            y = (x[rows[lo:hi] // k] @ dense[e - first]).float()
+            if bias is not None:
+                y = y + bias[e].float()
+            out[lo:hi] = y.to(out.dtype)
+        del dense
+    return out
+
+
+def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precision_config):
+    """matmul_ogs down semantics on exact bf16 decodes: ``out[dst // k] += gamma * (h @ W[e] + b[e])``. Rows land
+    in their (token, slot) place and are summed over k in a fixed order (no atomics, so the result is deterministic)."""
+    k = routing_data.n_expts_act
+    dst = scatter_idx.dst_indx.long()
+    h = h.to(torch.bfloat16)
+    offsets = _ogs_expert_offsets(routing_data)
+    slots = None
+    for first, last, dense in _ogs_dense_chunks(weight, precision_config, torch.bfloat16):
+        if slots is None:
+            slots = torch.zeros((dst.shape[0], dense.shape[-1]), dtype = torch.float32, device = h.device)
+        for e in range(first, last):
+            lo, hi = offsets[e], offsets[e + 1]
+            if hi == lo:
+                continue
+            y = (h[lo:hi] @ dense[e - first]).float()
+            if bias is not None:
+                y = y + bias[e].float()
+            if gammas is not None:
+                y = y * gammas[lo:hi].float().unsqueeze(-1)
+            where = dst[lo:hi]
+            keep = where >= 0
+            slots[where[keep]] = y[keep]
+        del dense
+    return slots.view(-1, k, slots.shape[-1]).sum(1).to(h.dtype)
+
+
 class _OgsGateUp(torch.autograd.Function):
     """Expert-sorted rows ``x[src // k] @ W[e] + b[e]`` via matmul_ogs; frozen MXFP4 ``W``."""
 
@@ -2582,9 +2652,13 @@ class _OgsGateUp(torch.autograd.Function):
     def forward(ctx, x, bias, module, routing_data, gather_idx):
         # One read: on the still-packed path each property access decodes the whole stack.
         weight = module.gate_up_proj
-        out = _ogs_backend_for(weight, routing_data, module).gate_up(
-            x.to(torch.bfloat16), weight, bias, routing_data, gather_idx, module.gate_up_proj_precision_config,
-        )
+        backend = _ogs_backend_for(weight, routing_data, module)
+        if _ogs_native_training_ok(x.device, backend):
+            out = backend.gate_up(
+                x.to(torch.bfloat16), weight, bias, routing_data, gather_idx, module.gate_up_proj_precision_config,
+            )
+        else:
+            out = _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, module.gate_up_proj_precision_config)
         ctx.module, ctx.routing_data, ctx.gather_idx = module, routing_data, gather_idx
         ctx.x_shape, ctx.x_dtype = x.shape, x.dtype
         return out
@@ -2629,10 +2703,17 @@ class _OgsDown(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h, gammas, bias, module, routing_data, scatter_idx):
         weight = module.down_proj
-        out = _ogs_backend_for(weight, routing_data, module).down(
-            h, weight, bias, routing_data, scatter_idx, module.down_proj_precision_config,
-            gammas = None if gammas is None else gammas.detach(),
-        )
+        backend = _ogs_backend_for(weight, routing_data, module)
+        if _ogs_native_training_ok(h.device, backend):
+            out = backend.down(
+                h, weight, bias, routing_data, scatter_idx, module.down_proj_precision_config,
+                gammas = None if gammas is None else gammas.detach(),
+            )
+        else:
+            out = _ogs_dequant_down(
+                h, None if gammas is None else gammas.detach(), weight, bias, routing_data, scatter_idx,
+                module.down_proj_precision_config,
+            )
         ctx.module, ctx.routing_data, ctx.scatter_idx = module, routing_data, scatter_idx
         ctx.h_dtype, ctx.bias = h.dtype, bias
         # h only feeds the routing-weight gradient.

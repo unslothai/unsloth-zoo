@@ -35,6 +35,7 @@ __all__ = [
     "triton_kernels_alias",
     "mxfp4_ogs_weight",
     "matmul_ogs_available",
+    "native_mxfp4_matmul_ok",
     "MATMUL_OGS_RTOL",
     "API_OGS_ROUTING",
     "API_OGS_RAGGED",
@@ -404,6 +405,23 @@ def _self_check(device):
             if not torch.allclose(got, want, rtol = MATMUL_OGS_RTOL, atol = MATMUL_OGS_RTOL * want.abs().max().item()):
                 return False
     return True
+
+
+def _device_capability(device):
+    device = torch.device(device)
+    if device.type != "cuda" or torch.version.hip is not None:
+        return None
+    return tuple(torch.cuda.get_device_capability(device))
+
+
+def native_mxfp4_matmul_ok(device, backend) -> bool:
+    """False where the native expert matmul is known to fail: sm_12x (RTX 50xx / PRO 6000, about 100 KB shared
+    memory per block) with the matmul_ogs+ragged generation (release/3.6.x), whose Blackwell tiles do not fit and
+    trip ``assert num_stages >= 1`` in opt_flags. release/3.5.x and 3.7+ and every other GPU keep the native path."""
+    capability = _device_capability(device)
+    if capability is None or backend is None:
+        return True
+    return not (capability[0] == 12 and backend.api == API_OGS_RAGGED)
 
 
 def matmul_ogs_available(device = None) -> bool:
