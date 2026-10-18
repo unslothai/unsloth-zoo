@@ -183,17 +183,26 @@ def _publish_boundary_helpers(modeling_module):
 pass
 
 
+def _gemma3_causal_window_mask(q_len, kv_len, sliding_window, device):
+    q_positions = torch.arange(q_len, device=device)[:, None] + (kv_len - q_len)
+    k_positions = torch.arange(kv_len, device=device)[None, :]
+    causal_mask = k_positions <= q_positions
+    if sliding_window is not None:
+        causal_mask &= k_positions > (q_positions - sliding_window)
+    return causal_mask[None, None, :, :]
+
+
 def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states, sliding_window=None):
-    if attention_mask is None and sliding_window is not None:
+    if attention_mask is None:
+        if sliding_window is None: return None
         q_len, kv_len = query_states.shape[2], key_states.shape[2]
         # FA2 drops an all-valid padding mask and applies the window in its kernel.
         # SDPA needs an explicit window, and an offset causal mask for cached chunks.
-        # Batch 1: the mask is batch-invariant, SDPA broadcasts it.
+        # Batch-invariant [1, 1, q, kv]: no larger than transformers' own sdpa sliding mask.
         if kv_len > sliding_window or (1 < q_len < kv_len):
-            attention_mask = torch.ones(
-                (1, kv_len), dtype=torch.bool, device=query_states.device,
-            )
-    if attention_mask is None or attention_mask.dim() != 2:
+            return _gemma3_causal_window_mask(q_len, kv_len, sliding_window, query_states.device)
+        return None
+    if attention_mask.dim() != 2:
         return attention_mask
 
     q_len = query_states.shape[2]
@@ -212,14 +221,7 @@ def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states
     padding_mask = attention_mask[:, None, None, :].to(query_states.device) != 0
     if q_len == 1 and (sliding_window is None or kv_len <= sliding_window):
         return padding_mask
-
-    q_positions = torch.arange(q_len, device=query_states.device)[:, None]
-    k_positions = torch.arange(kv_len, device=query_states.device)[None, :]
-    cache_offset = kv_len - q_len
-    causal_mask = k_positions <= (q_positions + cache_offset)
-    if sliding_window is not None:
-        causal_mask = causal_mask & (k_positions > (q_positions + cache_offset - sliding_window))
-    return padding_mask & causal_mask[None, None, :, :]
+    return padding_mask & _gemma3_causal_window_mask(q_len, kv_len, sliding_window, query_states.device)
 
 
 def _gemma3_rms_norm(x, weight, eps, out_dtype):
