@@ -88,3 +88,31 @@ def test_flush_waits_for_a_copy_still_in_flight(gc_module):
     assert gc_module._empty_host_cache() is True
     assert not gc_module._PINNED_CACHED and gc_module.GC_PINNED_BYTES == 0
     assert torch.cuda.host_memory_stats()["allocated_bytes.current"] == base
+
+
+def test_flush_syncs_every_used_device_and_only_those(gc_module, monkeypatch):
+    synced = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda index: 0 if index == 1 else 1 << 20)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda index = None: synced.append(index))
+    gc_module._synchronize_used_devices()
+    assert synced == [0, 2]  # cuda:1 was never used: no context is created there
+
+
+def test_flush_raises_a_device_error_from_the_sync(gc_module, monkeypatch):
+    monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 0, raising = False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda index: 1 << 20)
+
+    def broken(index = None):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", broken)
+    gc_module._PINNED_CACHED[1 << 24] = 1
+    gc_module.GC_PINNED_BYTES = 1 << 24
+    with pytest.raises(RuntimeError, match = "illegal memory access"):
+        gc_module._empty_host_cache()
+    assert gc_module._PINNED_CACHED == {1 << 24: 1}  # bookkeeping kept

@@ -266,6 +266,17 @@ def _block_fits_host_ram(block):
     return block + min(_PIN_HEADROOM_BYTES, vm.total // 10) <= vm.available
 
 
+def _synchronize_used_devices():
+    """Wait for this process's work on every device it already uses (a split model offloads on
+    devices other than the current one). Devices it never touched are skipped, so no context is
+    created on them. A failure here is a real device error and is raised."""
+    if not torch.cuda.is_available(): return
+    for index in range(torch.cuda.device_count()):
+        if torch.cuda.memory_reserved(index) > 0:
+            torch.cuda.synchronize(index)
+pass
+
+
 def _empty_host_cache():
     """Return cached free pinned blocks to the OS. A pinned buffer that grows leaves its old block
     in torch's host cache, and once growth goes pageable nothing reuses it. True if any were freed."""
@@ -280,8 +291,7 @@ def _empty_host_cache():
     if ours:
         # _host_emptyCache only frees blocks whose copy events completed: wait for our released
         # blocks' last non_blocking copies, or the bookkeeping below drops blocks still held.
-        try: torch.cuda.synchronize()
-        except Exception: pass
+        _synchronize_used_devices()
     try: torch._C._host_emptyCache()
     except Exception: return False
     GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - ours)
