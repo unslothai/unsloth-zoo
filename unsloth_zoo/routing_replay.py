@@ -379,7 +379,17 @@ def _fingerprint(ids):
     return ids.sort(-1).values.to(torch.int16)
 
 
-def _recomputed_routes(layer_index, ids2):
+def _input_signature(args, tokens):
+    # Per token fp32 sum of the router input. The recompute feeds the router the same bits as
+    # the forward did, so this tells apart forwards whose natural routes are equal.
+    x = args[0] if args and torch.is_tensor(args[0]) else None
+    if x is None or not x.is_floating_point() or tokens == 0 or x.numel() % tokens != 0:
+        return None
+    with torch.no_grad():
+        return x.detach().reshape(tokens, -1).sum(-1, dtype = torch.float32)
+
+
+def _recomputed_routes(layer_index, ids2, signature = None):
     # A router call outside a decoder forward is a checkpoint recompute: pick the recorded forward
     # whose natural routing it reproduces, without a host sync. None when no forward was recorded.
     if not _STATE.pending:
@@ -390,6 +400,16 @@ def _recomputed_routes(layer_index, ids2):
         return ids2.long(), torch.zeros((ids2.shape[0], 1), dtype = torch.bool, device = ids2.device)
     fp = _fingerprint(ids2)
     match = torch.stack([(c[0] == fp).all() for c in candidates])
+    if signature is not None:
+        # Narrow the natural matches to the forwards whose router input was the same too. Only a
+        # refinement: when no input matches exactly, the natural matches stand as before.
+        same = [
+            (c[3] == signature).all() if len(c) > 3 and c[3] is not None and c[3].shape == signature.shape
+            else torch.zeros((), dtype = torch.bool, device = match.device)
+            for c in candidates
+        ]
+        exact = match & torch.stack(same).to(match.device)
+        match = torch.where(exact.any(), exact, match)
     pick = match.to(torch.int32).argmax()
     forced_all = torch.stack([c[1] for c in candidates])
     forced = forced_all[pick]
@@ -473,7 +493,10 @@ def _router_hook(layer_index):
             weights2 = scores2.gather(-1, ids2.long())
         else:
             weights2 = weights.reshape(ids2.shape)
-        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2)
+        signature = None
+        if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
+            signature = _input_signature(args, ids2.shape[0])
+        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature)
         if recomputed is not None:
             _STATE.stats["router_calls_recomputed"] += 1
         if recomputed is None and replay is None:
@@ -518,7 +541,7 @@ def _router_hook(layer_index):
             forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
             if _STATE.record is not None:
                 # A copy: the output ids may alias forced, and MoE blocks can reuse them in place.
-                _STATE.record[layer_index] = (_fingerprint(ids2), forced.clone(), valid)
+                _STATE.record[layer_index] = (_fingerprint(ids2), forced.clone(), valid, signature)
         else:
             forced, valid = recomputed
             forced = torch.where(valid, forced, ids2.long())
