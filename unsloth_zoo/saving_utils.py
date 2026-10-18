@@ -533,11 +533,12 @@ def _with_live_vocab_rows(W, live, chunk = 8192):
     for i in range(0, min(rows, old), chunk):
         k = min(i + chunk, rows, old)
         live_rows = live[i:k].detach()
-        changed = (W[i:k].to(live_rows.device, live_rows.dtype) != live_rows).reshape(k - i, -1).any(1)
+        # Compared on W's device: an unchanged CPU table never stages chunks on the accelerator.
+        live_rows = live_rows.to(W.device)
+        changed = (W[i:k].to(live_rows.dtype) != live_rows).reshape(k - i, -1).any(1)
         if not changed.any(): continue
         if out is None: out = W.clone()
-        changed = changed.to(W.device)
-        out[i:k][changed] = live_rows.to(W.device, W.dtype)[changed]
+        out[i:k][changed] = live_rows.to(W.dtype)[changed]
     if rows > old:
         out[old:] = live[old:].detach().to(W.device, W.dtype)
     return W if out is None else out
@@ -1017,37 +1018,42 @@ pass
 
 def _untargeted_vocab_modules(base_model, lora_weights, tie_word_embeddings):
     # add_new_tokens changes vocab matrices in memory; one with no adapter or saved copy would
-    # keep the checkpoint's rows while config.json takes the new vocab_size.
+    # keep the checkpoint's rows while config.json takes the new vocab_size. Returns
+    # {name: (weight, bias)}; a LoRA-merged head contributes only its bias (bias="none" skips it).
     modules = []
     for getter in ("get_input_embeddings", "get_output_embeddings"):
         try: modules.append(getattr(base_model, getter)())
         except Exception: pass
     named = [(n, m) for n, m in base_model.named_modules() if any(m is x for x in modules)]
-    handled = [n in lora_weights or getattr(m, "modules_to_save", None) is not None for n, m in named]
-    # Tied: the merged or saved partner already writes the one shared tensor.
-    if tie_word_embeddings and any(handled): return {}
+    saved = [getattr(m, "modules_to_save", None) is not None for _, m in named]
+    merged = [n in lora_weights and not s for (n, _), s in zip(named, saved)]
+    # Tied: the merged or saved partner already writes the one shared weight.
+    skip_weights = tie_word_embeddings and any(m or s for m, s in zip(merged, saved))
     out = {}
-    for (name, module), done in zip(named, handled):
-        if done: continue
+    for (name, module), is_saved, is_merged in zip(named, saved, merged):
+        if is_saved: continue
         # A wrapper left here holds only an inactive adapter.
         while hasattr(module, "base_layer"): module = module.base_layer
         weight = getattr(module, "weight", None)
         if weight is None or weight.device.type == "meta" or check_if_quantized(module): continue
-        out[name] = module
+        bias = getattr(module, "bias", None)
+        bias = bias if isinstance(bias, torch.Tensor) else None
+        weight = None if is_merged or skip_weights else weight
+        if weight is not None or bias is not None: out[name] = (weight, bias)
     return out
 pass
 
-def _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name):
+def _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name, bias_overrides = ()):
     # Weights keyed by module (the merge loop's lora_key), biases by their full `.bias` shard key.
+    # A bias the trained-bias overrides already write (lora_bias, bias="all") stays theirs.
     if not vocab_modules: return {}
     overrides = dict(_convert_lora_keys_to_safetensor_format(
-        defaultdict(lambda: None, {n: m.weight for n, m in vocab_modules.items()}),
+        defaultdict(lambda: None, {n: w for n, (w, _) in vocab_modules.items() if w is not None}),
         safetensor_keys, model_class_name = model_class_name,
     ))
-    biases = defaultdict(lambda: None, {
-        n: m.bias for n, m in vocab_modules.items() if isinstance(getattr(m, "bias", None), torch.Tensor)
-    })
-    overrides.update(_get_bias_overrides(biases, safetensor_keys, model_class_name))
+    biases = defaultdict(lambda: None, {n: b for n, (_, b) in vocab_modules.items() if b is not None})
+    for key, bias in _get_bias_overrides(biases, safetensor_keys, model_class_name).items():
+        if key not in bias_overrides: overrides[key] = bias
     return overrides
 pass
 
@@ -1136,7 +1142,7 @@ def _merge_and_overwrite_lora(
             safetensor_keys = list(file.keys())
             safetensor_keys_seen.update(safetensor_keys)
             bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
-            vocab_overrides = _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name)
+            vocab_overrides = _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name, bias_overrides)
 
             # Pre-compute number of experts per layer prefix from shard keys
             moe_num_experts = {}
@@ -2603,7 +2609,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
         bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
-        vocab_overrides = _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name)
+        vocab_overrides = _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name, bias_overrides)
 
         # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
@@ -3100,7 +3106,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
         bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
-        vocab_overrides = _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name)
+        vocab_overrides = _get_vocab_overrides(vocab_modules, safetensor_keys, model_class_name, bias_overrides)
 
         # Read the header to skip scale companions without a tensor read. Read-only: the merge
         # writes a temp file and os.replace()s it, so no write handle is needed (and "r+b"

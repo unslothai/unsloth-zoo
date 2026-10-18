@@ -133,7 +133,7 @@ def test_untargeted_vocab_override_reaches_every_shard_writer(tmp_path, quant_ty
         model_class_name = "LlamaForCausalLM",
         base_model_is_quantized = quant_type is not None,
         quant_type = quant_type,
-        vocab_modules = {"lm_head": head},
+        vocab_modules = {"lm_head": (head.weight, head.bias)},
     )
     with safe_open(str(shard), framework = "pt", device = "cpu") as f:
         assert torch.equal(f.get_tensor("lm_head.weight"), live)
@@ -200,6 +200,7 @@ def _tiny(arch):
 # embed_tokens key, so only module identity (not the key name) marks it as a vocab matrix.
 @pytest.mark.parametrize("arch, target_modules, new_vocab, tie", [
     ("PhiConfig", ["q_proj"], NEW_VOCAB, False),
+    ("PhiConfig", ["lm_head", "q_proj"], NEW_VOCAB, False),
     (None, ["lm_head"], H._VOCAB, True),
 ])
 def test_every_exported_tensor_matches_peft_after_new_tokens(tmp_path, arch, target_modules, new_vocab, tie):
