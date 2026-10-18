@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import ast
+import functools
 import importlib
 import inspect
 import math
@@ -954,11 +955,36 @@ def test_qsa_prefill_route_takes_the_simdgroup_kernel_without_tensor_units(monke
     assert calls == [20, 30, 41]
 
 
-@pytest.mark.parametrize("reason", ["switch", "probe", "body"])
+def test_qsa_prefill_route_keeps_working_after_training(monkeypatch):
+    from unsloth_zoo.mlx import utils
+    attention, calls = _qsa_layer(), []
+    native = getattr(qwen4.dispatch_qsa_attention, "_unsloth_sparse_attention_original", qwen4.dispatch_qsa_attention)
+    # What the trainer leaves bound for the rest of the process.
+    trained = mlx_attention._training_wrapper(native, mlx_attention._qsa_attention_training_over)
+    monkeypatch.setattr(qwen4, "dispatch_qsa_attention", trained)
+    _qsa_prefill_scope(monkeypatch, calls)
+    expected = _qsa_run(attention)
+    with decode.inference_scopes(attention):
+        for actual, out in zip(_qsa_run(attention), expected):
+            _equal(actual, out)
+        assert calls == [20, 30, 41]
+        token = utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+        try:
+            _qsa_run(attention)
+        finally:
+            utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert calls == [20, 30, 41] and qwen4.dispatch_qsa_attention is trained
+
+
+@pytest.mark.parametrize("reason", ["switch", "probe", "body", "wrapped"])
 def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
     attention, calls = _qsa_layer(), []
     _qsa_prefill_scope(monkeypatch, calls)
-    if reason == "switch":
+    if reason == "wrapped":  # around the training wrapper, which functools.wraps copies the marker from
+        native = getattr(qwen4.dispatch_qsa_attention, "_unsloth_sparse_attention_original", qwen4.dispatch_qsa_attention)
+        trained = mlx_attention._training_wrapper(native, mlx_attention._qsa_attention_training_over)
+        monkeypatch.setattr(qwen4, "dispatch_qsa_attention", functools.wraps(trained)(lambda *args, **kwargs: None))
+    elif reason == "switch":
         monkeypatch.setenv("UNSLOTH_MLX_FAST_QSA", "0")
     elif reason == "probe":
         monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: False)

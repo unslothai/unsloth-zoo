@@ -206,6 +206,13 @@ def _qsa_attention_training_over(original):
     return attention
 
 
+def _training_wrapper(original, wrap):
+    # The inference routes' source contracts read the marker to see through the wrapper.
+    wrapped = wrap(original)
+    wrapped._unsloth_sparse_attention_original = original
+    return wrapped
+
+
 def install_sparse_attention_training():
     """Route loaded custom attention kernels through differentiable training paths."""
     import sys
@@ -225,8 +232,7 @@ def install_sparse_attention_training():
             wrapped = original
             original = wrapped._unsloth_sparse_attention_original
         else:
-            wrapped = wrap(original)
-            wrapped._unsloth_sparse_attention_original = original
+            wrapped = _training_wrapper(original, wrap)
         for path, consumer in list(sys.modules.items()):
             if path.startswith("mlx_vlm.") and consumer is not None:
                 for alias, value in list(vars(consumer).items()):

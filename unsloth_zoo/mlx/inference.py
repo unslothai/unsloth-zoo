@@ -101,12 +101,16 @@ def _resolved_bindings(contract):
             owner, _, name = path.rpartition(".")
             holder = _resolve_dotted(module, owner) if owner else module
             target = getattr(holder, name, None)
+            # The sparse-attention training wrapper outlives training and calls what it wraps outside it. A wrapper
+            # around it inherits the marker through functools.wraps, but its own __wrapped__ is not the marked one.
+            marked = getattr(target, "_unsloth_sparse_attention_original", None)
+            source = marked if marked is not None and getattr(target, "__wrapped__", None) is marked else target
             try:
                 # inspect follows __wrapped__ to the original source, so a wrapped target is refused.
                 accepted = (expected,) if isinstance(expected, str) else expected
                 matches = target is not None and (expected is None or (
-                    not hasattr(target, "__wrapped__") and _ast_fingerprint(target) in accepted
-                    and all(target.__globals__.get(alias, mod) is mod for alias, mod in _ALIASES)))
+                    not hasattr(source, "__wrapped__") and _ast_fingerprint(source) in accepted
+                    and all(source.__globals__.get(alias, mod) is mod for alias, mod in _ALIASES)))
             except (OSError, TypeError, SyntaxError, AttributeError):
                 matches = False
             if matches:
@@ -114,8 +118,8 @@ def _resolved_bindings(contract):
                 raw = vars(holder).get(name)
                 found[id(holder), name] = (vars(holder), name, raw if isinstance(raw, staticmethod) else target)
                 for alias, mod in (_ALIASES if expected is not None else ()):
-                    if alias in target.__globals__:
-                        found[id(target.__globals__), alias] = (target.__globals__, alias, mod)
+                    if alias in source.__globals__:
+                        found[id(source.__globals__), alias] = (source.__globals__, alias, mod)
             else:
                 holds = False
                 if (module_name, path) not in _CONTRACT_MISSES:
@@ -4683,9 +4687,10 @@ _QSA_PREFILL_CONTRACT = {
 def _qsa_prefill_route(native, bindings, plan_of, indexed, supported, attend):
     def dispatch_qsa_attention(queries, keys, values, block_indices, query_ends, *, cache, scale, block_size,
                                causal, mask, mask_factory, allow_sparse_decode = False):
-        if (_bindings_intact(bindings) and plan_of(queries, keys, values, block_indices, query_ends,
-                                                   block_size = block_size, causal = causal,
-                                                   allow_sparse_decode = allow_sparse_decode) is indexed
+        from .utils import mlx_training_patches_active  # training takes native, the training wrapper once installed
+        if (not mlx_training_patches_active() and _bindings_intact(bindings)
+                and plan_of(queries, keys, values, block_indices, query_ends, block_size = block_size, causal = causal,
+                            allow_sparse_decode = allow_sparse_decode) is indexed
                 and supported(queries, keys, block_indices, block_size)):
             return attend(queries, keys, values, block_indices, query_ends, scale)
         return native(queries, keys, values, block_indices, query_ends, cache = cache, scale = scale,
