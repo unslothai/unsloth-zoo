@@ -293,3 +293,24 @@ def test_cap_flushes_our_released_blocks_before_going_pageable(monkeypatch, gc_m
     # Nothing of ours cached: at the cap it goes pageable without a flush.
     assert not gc_module._reserve_pinned(7000)
     assert emptied == [True]
+
+
+def test_cap_flush_counts_only_blocks_the_allocator_released(monkeypatch, gc_module):
+    # Our released 4096 block was taken by another pinned user (a DataLoader): the flush cannot
+    # free it, so an 8192 request still does not fit under a 10000 cap.
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
+    monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
+    monkeypatch.setattr(gc_module, "_synchronize_used_devices", lambda: None)
+    monkeypatch.setattr(gc_module, "_host_allocator_free_bytes", lambda: 0)
+    held = {"bytes": 0}
+    monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: held["bytes"])
+    emptied = []
+    monkeypatch.setattr(torch._C, "_host_emptyCache", lambda: emptied.append(True), raising = False)
+    assert gc_module._reserve_pinned(3000)          # 4096 block
+    held["bytes"] = 4096
+    gc_module._release_pinned(3000)                 # cached, then reused by another pinned user
+    assert not gc_module._reserve_pinned(7000)
+    assert emptied == [True]
+    # Once the allocator really frees it, the same request fits.
+    held["bytes"] = 0
+    assert gc_module._reserve_pinned(7000)

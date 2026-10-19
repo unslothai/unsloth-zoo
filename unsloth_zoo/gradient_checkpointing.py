@@ -395,7 +395,12 @@ def _flushed_cached_fits(block, used):
     """Cap mode: flush our cached released blocks; True if `block` then fits under the cap."""
     ours = sum(k * v for k, v in _PINNED_CACHED.items())
     if not _empty_host_cache(): return False
-    return max(0, used - ours) + block <= GC_PINNED_CAP
+    held = _host_allocator_held_bytes()
+    if held is None or _HOST_HELD_BASELINE is None:
+        return max(0, used - ours) + block <= GC_PINNED_CAP
+    # Re-read the allocator: a released block another pinned user took is still held after the
+    # flush, so only what was really returned to the OS makes room under the cap.
+    return max(GC_PINNED_BYTES, held - _HOST_HELD_BASELINE) + block <= GC_PINNED_CAP
 
 
 def _release_pinned(nbytes):
