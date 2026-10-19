@@ -340,3 +340,22 @@ def test_preference_explicit_chunk_budget_keeps_the_chunked_function(monkeypatch
     before = _calls("logprobs")
     pl.fused_linear_token_logps(hidden.detach(), weight, None, labels, mask)
     assert _calls("logprobs") > before
+
+
+def test_overwrite_keeps_the_in_place_ce_path(monkeypatch):
+    # overwrite=True writes the hidden-state gradient into hidden_states: a memory opt-in only the old path implements.
+    from unsloth_zoo.fused_losses import cross_entropy_loss as cel_mod
+
+    seen = []
+    real = cel_mod._chunked_ce
+    monkeypatch.setattr(cel_mod, "_chunked_ce", lambda *a, **k: seen.append(1) or real(*a, **k))
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 6, 8, requires_grad = True)
+    weight = torch.randn(32, 8)
+    labels = torch.randint(0, 32, (2, 6))
+    plain = cel_mod.unsloth_fused_ce_loss(None, hidden, weight, None, labels, torch_compile = False)
+    assert seen == [1]
+    kept = cel_mod.unsloth_fused_ce_loss(None, hidden.detach().clone().requires_grad_(True), weight, None, labels,
+                                         torch_compile = False, overwrite = True)
+    assert seen == [1]
+    torch.testing.assert_close(kept, plain, atol = 1e-5, rtol = 1e-5)

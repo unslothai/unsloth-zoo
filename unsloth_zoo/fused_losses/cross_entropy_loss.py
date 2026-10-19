@@ -812,7 +812,8 @@ def unsloth_fused_ce_loss(
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
 
-    if _use_chunked_ce(kwargs, target_gb):
+    # overwrite=True (gradient written into hidden_states) is a memory opt-in the old path implements.
+    if not overwrite and _use_chunked_ce(kwargs, target_gb):
         return _chunked_ce(
             hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,
         )
