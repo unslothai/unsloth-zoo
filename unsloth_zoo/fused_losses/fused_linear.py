@@ -541,7 +541,8 @@ def _split_block():
 
 def _tiled_vocab(V):
     # The no-grad pass merges vocab splits only past two of them (else one row kernel), so the tiled forward (always
-    # split) is bit-identical to it only there; smaller vocabularies stay on the chunked path.
+    # split) runs the same statistics only there; smaller vocabularies stay on the chunked path. Its logits GEMMs
+    # are TRL-shaped tiles, so values match the no-grad pass to fp32 GEMM rounding (<= ~5e-5), not bit for bit.
     return _SPLIT_COLS > 0 and -(-V // _SPLIT_COLS) > 2
 
 
@@ -1080,7 +1081,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
         w = weight.to(compute_dtype)
         outs = (("ent", ent, want_ent), ("sum", mean, want_mean), ("lssp", lssp, want_lssp), ("top1", top1, want_top1))
         if tiled and rows <= 0 and _tiled_vocab(V) and _use_triton(device):
-            # No-grad calls stay chunked, bit-identical to a forward-gradient policy pass.
+            # No-grad calls stay chunked: bit-identical to a frozen-head (forward-gradient) policy pass.
             full = n_keep == N
             dst = {"logp": logps, "lse": lse, "ent": ent if want_ent else None, "sum": mean if want_mean else None,
                    "lssp": lssp if want_lssp else None, "top1": top1 if want_top1 else None}

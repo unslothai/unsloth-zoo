@@ -529,7 +529,8 @@ def grpo_chunked_hidden_states_logprobs(
     **extra_kwargs,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
-    # Never keeps tokens x vocab logits; no-grad scoring runs the same kernel so a policy ratio starts at exactly 1.
+    # Never keeps tokens x vocab logits; no-grad scoring runs the same kernel, so a policy ratio starts at 1 (exactly
+    # for a frozen head; within fp32 GEMM rounding, <= ~5e-5, for a trainable head or entropy gradient).
     # Truncated-support scoring and the fp32 head are the old function's: hand those calls to it.
     fp32_head = extra_kwargs.get(
         "fp32_lm_head",
