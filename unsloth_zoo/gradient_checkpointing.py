@@ -220,6 +220,25 @@ def _host_allocator_free_bytes():
     except Exception: return None
 
 
+def _host_cache_reuses_block(block):
+    """A pinned block freed after a non_blocking copy waits in torch's event queue, which only an
+    allocation drains (host_memory_stats does not), so it reads as not free. Allocate and drop a
+    block of that size to drain it: True if the allocator reused a cached block, False if it had
+    to pin a new one, which is released again so the probe never holds pinned memory past the cap."""
+    held = _host_allocator_held_bytes()
+    if held is None: return False
+    try:
+        probe = torch.empty(block, dtype = torch.uint8, device = "cpu", pin_memory = True)
+    except Exception as exception:
+        if not _is_host_alloc_oom(exception): raise
+        return False
+    after = _host_allocator_held_bytes()
+    del probe
+    if after is not None and after <= held: return True
+    _empty_host_cache()
+    return False
+
+
 def _compute_pinned_cap():
     env = os.environ.get("UNSLOTH_GC_PINNED_MAX_GB")
     if env:
@@ -247,6 +266,17 @@ def _block_fits_host_ram(block):
     return block + min(_PIN_HEADROOM_BYTES, vm.total // 10) <= vm.available
 
 
+def _synchronize_used_devices():
+    """Wait for this process's work on every device it already uses (a split model offloads on
+    devices other than the current one). Devices it never touched are skipped, so no context is
+    created on them. A failure here is a real device error and is raised."""
+    if not torch.cuda.is_available(): return
+    for index in range(torch.cuda.device_count()):
+        if torch.cuda.memory_reserved(index) > 0:
+            torch.cuda.synchronize(index)
+pass
+
+
 def _empty_host_cache():
     """Return cached free pinned blocks to the OS. A pinned buffer that grows leaves its old block
     in torch's host cache, and once growth goes pageable nothing reuses it. True if any were freed."""
@@ -254,7 +284,14 @@ def _empty_host_cache():
     if DEVICE_TYPE not in ("cuda", "hip"): return False
     ours = sum(k * v for k, v in _PINNED_CACHED.items())
     free = _host_allocator_free_bytes()
-    if not (ours if free is None else free): return False
+    # host_memory_stats() does not process pending copy events, so a dead block whose last use was a
+    # non_blocking copy (every pinned offload slot) still reads as active there: our own released
+    # blocks are reason enough to flush, and _host_emptyCache processes those events first.
+    if not (ours or free): return False
+    if ours:
+        # _host_emptyCache only frees blocks whose copy events completed: wait for our released
+        # blocks' last non_blocking copies, or the bookkeeping below drops blocks still held.
+        _synchronize_used_devices()
     try: torch._C._host_emptyCache()
     except Exception: return False
     GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - ours)
@@ -289,7 +326,11 @@ def _reserve_pinned(nbytes):
     if _PINNED_CACHED.get(block, 0) > 0:
         _PINNED_CACHED[block] -= 1
         free = _host_allocator_free_bytes()
-        if free is None or free >= block:
+        # Under a fixed cap a refusal here is sticky (pageable copies never drain the queue), so
+        # check the event queue; the per block mode re-checks host RAM below instead.
+        if free is None or free >= block or (
+            GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0 and _host_cache_reuses_block(block)
+        ):
             return True  # the allocator hands back the cached block, already charged
         # Another pinned user took the block: it is no longer ours, and this request is new.
         GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
