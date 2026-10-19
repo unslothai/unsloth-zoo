@@ -71,3 +71,20 @@ def test_all_zero_blocks_still_raise_attribute_error(experts_cls):
     ex = experts_cls(cfg)
     assert not hasattr(ex, "gate_up_proj")
     assert not hasattr(ex, "down_proj")
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_forward_returns_the_input_dtype(experts_cls, monkeypatch, native):
+    """The native kernels run in bf16; an fp16 residual (T4) that got bf16 back was promoted to fp32."""
+    ex = _make(experts_cls)
+    x = torch.randn(3, 64, dtype = torch.float16)
+    monkeypatch.setattr(G, "torch_cuda_device", lambda device: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(G, "_mxfp4_experts_routing", lambda self, h, *a: (h, None, None, None, None))
+    monkeypatch.setattr(G, "_ogs_native_inference_ok", lambda device, backend: native)
+    rows = lambda *a, **k: torch.ones(3, 64, dtype = torch.bfloat16)
+    monkeypatch.setattr(G, "mxfp4_ogs_experts_forward", rows)
+    backend = G._top_level_triton_kernels_backend()
+    monkeypatch.setattr(type(backend), "gate_up", lambda self, *a, **k: rows())
+    monkeypatch.setattr(type(backend), "down", lambda self, *a, **k: rows())
+    out = ex(x, routing_data = None, gather_idx = None, scatter_idx = None)
+    assert out.dtype == torch.float16
