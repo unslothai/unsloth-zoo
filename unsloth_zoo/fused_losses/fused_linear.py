@@ -90,6 +90,11 @@ _HIP_TILES = torch.version.hip is not None
 _BWD_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_ROWS", 1024 if _HIP_TILES else 4096)), 1)
 _BWD_TILE_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_TILE_MB", 8 if _HIP_TILES else 256) * 1024**2), 1)
 _HALF = (torch.float16, torch.bfloat16)
+# Frozen head on CUDA with fp32 logits: the forward gradient is accumulated over vocab tiles (flash-style), and the
+# no-grad pass makes the same tiled calls, so a policy pass stays bit-identical to its reference. 0: [rows, V] chunks.
+_FLASH = os.environ.get("UNSLOTH_FUSED_LINEAR_FLASH", "1") != "0"
+# Widest vocab tile of the tiled forward (a multiple of the split width; 0 = the tile byte budget alone).
+_FWD_TILE_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 16384)), 0)
 # ROCm's half-in / fp32-out GEMM is a slow fallback (6-14x).
 _IS_HIP = torch.version.hip is not None
 # Op names carry a schema version: Inductor's FX graph / AOTAutograd caches do not key on a custom op's schema, so a
@@ -98,7 +103,7 @@ _LP_OP = "fused_linear_logprobs_v2"
 _LP_BWD_OP = "fused_linear_logprobs_bwd_v2"
 
 CALLS = {"ce": 0, "logprobs": 0, "logprobs_bwd": 0, "triton": 0, "torch": 0, "tiled": 0, "exact_top": 0,
-         "bwd_single": 0}
+         "bwd_single": 0, "flash": 0}
 
 
 @functools.cache
@@ -213,10 +218,18 @@ if _HAS_TRITON:
         @triton.jit
         def _fl_tanh(x):
             return _libdevice.tanh(x)
+
+        @triton.jit
+        def _fl_expm1(x):
+            return _libdevice.expm1(x)
     except Exception:
         @triton.jit
         def _fl_tanh(x):
             return 2.0 * tl.sigmoid(2.0 * x) - 1.0
+
+        @triton.jit
+        def _fl_expm1(x):
+            return tl.exp(x) - 1.0
 
     @triton.jit
     def _fl_transform(x, scale, cap, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr):
@@ -507,6 +520,87 @@ if _HAS_TRITON:
 
 
     @triton.jit
+    def _fl_flash_p_kernel(
+        x_ptr, x_stride, p_ptr, p_stride, n_cols, n_rows, col0, split0, n_splits, stride_k, part_ptr,
+        tgt_ptr, bias_ptr, m_ptr, acc_ptr, acc_stride, H,
+        inv_t, scale, cap, gscale,
+        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, SPLITS: tl.constexpr,
+        BLOCK: tl.constexpr, BLOCK_H: tl.constexpr,
+    ):
+        # Flash-style forward gradient, one vocab tile: m_run takes the tile's split maxima, the fp32 accumulator
+        # row is rescaled only when its max moved, and p = gscale inv_t d exp(z - m_run) (target column zeroed:
+        # its term is added exactly at the end) overwrites the tile in place (p is a half view of x's bytes).
+        row = tl.program_id(0).to(tl.int64)
+        k = tl.arange(0, SPLITS)
+        ms = tl.load(part_ptr + (split0 + k).to(tl.int64) * n_rows + row, mask = k < n_splits, other = -float("inf"))
+        m_old = tl.load(m_ptr + row)
+        m_new = tl.maximum(m_old, tl.max(ms, axis = 0))
+        if (m_new > m_old) & (m_old > -float("inf")):
+            r = tl.exp(m_old - m_new)
+            hc = tl.arange(0, BLOCK_H)
+            for hs in range(0, H, BLOCK_H):
+                ho = hs + hc
+                a = tl.load(acc_ptr + row * acc_stride + ho, mask = ho < H, other = 0.0)
+                tl.store(acc_ptr + row * acc_stride + ho, a * r, mask = ho < H)
+        x_row = x_ptr + row * x_stride
+        p_row = p_ptr + row * p_stride
+        tgt = tl.load(tgt_ptr + row).to(tl.int64) - col0
+        cols = tl.arange(0, BLOCK)
+        c = inv_t * gscale
+        for start in range(0, n_cols, BLOCK):
+            offs = start + cols
+            ok = offs < n_cols
+            x = tl.load(x_row + offs, mask = ok, other = 0.0).to(tl.float32)
+            # All loads of this block land before any store (the half view overlaps this row's fp32 bytes).
+            tl.debug_barrier()
+            if HAS_BIAS:
+                x += tl.load(bias_ptr + offs, mask = ok, other = 0.0).to(tl.float32)
+            x, d = _fl_transform(x, scale, cap, HAS_SCALE, HAS_CAP)
+            e = tl.exp(x * inv_t - m_new) * c * d
+            e = tl.where(offs == tgt, 0.0, e)
+            tl.store(p_row + offs, e.to(p_ptr.dtype.element_ty), mask = ok)
+        # Every warp has read m_old before it is replaced (a scalar store is not ordered against other warps' loads).
+        tl.debug_barrier()
+        tl.store(m_ptr + row, m_new)
+
+    @triton.jit
+    def _fl_flash_u_kernel(
+        acc_ptr, acc_stride, w_ptr, w_stride, u_ptr, u_stride, map_ptr, row0, H, n_rows, stride_k, split_cols,
+        part_ptr, tgt_ptr, logp_ptr, lse_ptr, m_ptr, g_ptr,
+        inv_t, scale, cap, inv_gscale,
+        HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_MAP: tl.constexpr, HAS_G: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        # u = inv_t d_t (1 - p_t) w_t - (sum_{j != t} p_j inv_t d_j w_j): the target term in fp32, the rest from acc.
+        # HAS_G: times the 0-dim fp32 g before the one rounding (cross entropy's -scaling / divisor).
+        row = tl.program_id(0).to(tl.int64)
+        tgt = tl.load(tgt_ptr + row).to(tl.int64)
+        xt = tl.load(part_ptr + 7 * stride_k + (tgt // split_cols) * n_rows + row)
+        dt = 1.0
+        if HAS_SCALE:
+            dt = scale
+        if HAS_CAP:
+            tt = xt / cap
+            dt = dt * (1.0 - tt * tt)
+        ct = -inv_t * dt * _fl_expm1(tl.load(logp_ptr + row))
+        r = tl.exp(tl.load(m_ptr + row) - tl.load(lse_ptr + row)) * inv_gscale
+        if HAS_G:
+            g = tl.load(g_ptr)
+            ct = ct * g
+            r = r * g
+        if HAS_MAP:
+            out = tl.load(map_ptr + row).to(tl.int64)
+        else:
+            out = row0 + row
+        hc = tl.arange(0, BLOCK_H)
+        for hs in range(0, H, BLOCK_H):
+            ho = hs + hc
+            ok = ho < H
+            w = tl.load(w_ptr + tgt * w_stride + ho, mask = ok, other = 0.0).to(tl.float32)
+            a = tl.load(acc_ptr + row * acc_stride + ho, mask = ok, other = 0.0)
+            tl.store(u_ptr + out * u_stride + ho, (ct * w - a * r).to(u_ptr.dtype.element_ty), mask = ok)
+
+    @triton.jit
     def _fl_scale_kernel(x_ptr, g_ptr, out_ptr, n, cols, PER_ROW: tl.constexpr, BLOCK: tl.constexpr):
         # fp32 multiply rounded once, one read + write (torch upcast: 4.5 vs 1.7 ms).
         offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -540,9 +634,10 @@ def _split_block():
 
 
 def _tiled_vocab(V):
-    # The no-grad pass merges vocab splits only past two of them (else one row kernel), so the tiled forward (always
-    # split) runs the same statistics only there; smaller vocabularies stay on the chunked path. Its logits GEMMs
-    # are TRL-shaped tiles, so values match the no-grad pass to fp32 GEMM rounding (<= ~5e-5), not bit for bit.
+    # The chunked pass merges vocab splits only past two of them (else one row kernel), so the tiled forward (always
+    # split) runs the same statistics only there; smaller vocabularies stay chunked. Under _FLASH no-grad, frozen
+    # and trainable passes all take the tiles (bit-identical); without it the recompute pass's TRL-shaped tiles
+    # match the chunked no-grad pass to fp32 GEMM rounding (<= ~5e-5), not bit for bit.
     return _SPLIT_COLS > 0 and -(-V // _SPLIT_COLS) > 2
 
 
@@ -810,25 +905,41 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
     return out, dz
 
 
+def _tiled_layout(n_keep, V, cap_rows, bpl, device):
+    """(rows, vocab tile) of the tiled forward; every pass of one call shape (no-grad, frozen, trainable) gets the
+    same, so their logits GEMMs and statistics are the same calls."""
+    budget = min(_BWD_TILE_BYTES, _budget_bytes(device))
+    R = max(min(_BWD_ROWS, n_keep, cap_rows if cap_rows > 0 else n_keep, budget // (_SPLIT_COLS * bpl)), 1)
+    tile = max(budget // max(R * bpl, 1), _SPLIT_COLS)
+    if _FWD_TILE_COLS > 0:
+        tile = min(tile, max(_FWD_TILE_COLS, _SPLIT_COLS))
+    tile = min(tile - tile % _SPLIT_COLS, -(-V // _SPLIT_COLS) * _SPLIT_COLS)
+    return R, tile
+
+
 def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, scalars, want, fp32_logits,
-                   compute_dtype, outs, cap_rows, block_top = None):
+                   compute_dtype, outs, cap_rows, block_top = None, u = None, gscale = 1.0, g = None):
     """Recompute-path statistics from TRL-shaped tiles (4096-row GEMM: 16% faster than small chunks on B200).
-    block_top [n_keep, 2 groups] (compacted rows) receives the two top logits of every _top_cols() columns."""
+    block_top [n_keep, 2 groups] (compacted rows) receives the two top logits of every _top_cols() columns.
+    u [N, H] (fp32 logits only) receives d logp / d hidden, accumulated flash-style over the vocab tiles: the head
+    is read twice and the transient is [rows, tile] instead of [rows, V]. g (0-dim fp32) scales u before rounding."""
     inv_t, scale, cap = scalars
     want_ent, want_sum, want_lssp, want_top1 = want
     N, H = hidden.shape
     V = w.shape[0]
     f32 = dict(device = device, dtype = torch.float32)
     bpl = _bytes_per_logit(fp32_logits, compute_dtype)
-    budget = min(_BWD_TILE_BYTES, _budget_bytes(device))
-    R = max(min(_BWD_ROWS, n_keep, cap_rows if cap_rows > 0 else n_keep, budget // (_SPLIT_COLS * bpl)), 1)
-    tile = max(budget // max(R * bpl, 1), _SPLIT_COLS)
-    tile = min(tile - tile % _SPLIT_COLS, -(-V // _SPLIT_COLS) * _SPLIT_COLS)
+    R, tile = _tiled_layout(n_keep, V, cap_rows, bpl, device)
     splits = -(-V // _SPLIT_COLS)
     buf = _Buffers(R, tile, device, fp32_logits, compute_dtype)
     flags = dict(HAS_BIAS = bias is not None, HAS_SCALE = scale != 1.0, HAS_CAP = cap != 0.0,
                  WANT_ENT = want_ent, WANT_SUM = want_sum, WANT_LSSP = want_lssp, WANT_TOP1 = want_top1)
     scal = (float(inv_t), float(scale), float(cap) if cap != 0.0 else 1.0)
+    if u is not None:
+        assert fp32_logits, "the flash forward gradient writes p into the fp32 logits' bytes"
+        acc = torch.empty((R, H), **f32)
+        m_run = torch.empty(R, **f32)
+        block_h = min(triton.next_power_of_2(H), 1024)
     for a in range(0, n_keep, R):
         b = min(a + R, n_keep)
         n = b - a
@@ -836,6 +947,9 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
         t = targets[a:b] if n_keep == N else targets.index_select(0, idx[a:b])
         part = torch.empty((8, splits, n), **f32)
         top = block_top[a:b] if block_top is not None else part
+        if u is not None:
+            acc[:n].zero_()
+            m_run[:n].fill_(-float("inf"))
         for first in range(0, V, tile):
             last = min(first + tile, V)
             x = _logits_into(h, w[first:last], buf.buf[:n, : last - first], fp32_logits)
@@ -849,7 +963,21 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
                     WANT_TGT = True, WANT_BLOCK_TOP = block_top is not None, SUB = _top_cols(),
                     BLOCK = _split_block(), num_warps = 4, enable_fp_fusion = True, **flags,
                 )
+                if u is None:
+                    return
+                n_split = -(-(last - first) // _SPLIT_COLS)
+                p = buf.buf.view(compute_dtype)[:n, : last - first]
+                _fl_flash_p_kernel[(n,)](
+                    x, x.stride(0), p, p.stride(0), last - first, n, first, first // _SPLIT_COLS, n_split,
+                    splits * n, part, t, bias_t if bias_t is not None else part, m_run, acc, acc.stride(0), H,
+                    *scal, float(gscale), HAS_BIAS = bias_t is not None, HAS_SCALE = scale != 1.0,
+                    HAS_CAP = cap != 0.0, SPLITS = max(triton.next_power_of_2(n_split), 2),
+                    BLOCK = min(_BLOCK, triton.next_power_of_2(last - first)), BLOCK_H = block_h,
+                    num_warps = _num_warps(), enable_fp_fusion = True,
+                )
             _launch(device, run)
+            if u is not None:
+                _dz_w_acc(acc[:n], buf.buf.view(compute_dtype)[:n, : last - first], w[first:last])
         exact = _exact_target(h, w, bias, t) if exact_mode else None
         o = {k: outs[k][a:b] for k in ("logp", "lse", "ent", "sum", "lssp", "top1") if outs.get(k) is not None}
         lse = o["lse"]
@@ -862,9 +990,20 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
                 *scal, HAS_EXACT = exact is not None, HAS_TGT = True,
                 SPLITS = max(triton.next_power_of_2(splits), 2), num_warps = 1, enable_fp_fusion = True, **flags,
             )
+            if u is None:
+                return
+            rowmap = idx[a:b] if n_keep != N else None
+            _fl_flash_u_kernel[(n,)](
+                acc, acc.stride(0), w, w.stride(0), u, u.stride(0), rowmap if rowmap is not None else t, a, H, n,
+                splits * n, _SPLIT_COLS, part, t, o["logp"], lse, m_run, g if g is not None else lse,
+                float(inv_t), float(scale), scal[2], 1.0 / float(gscale), HAS_SCALE = scale != 1.0,
+                HAS_CAP = cap != 0.0, HAS_MAP = rowmap is not None, HAS_G = g is not None, BLOCK_H = block_h, num_warps = 4, enable_fp_fusion = True,
+            )
         _launch(device, run)
         CALLS["triton"] += 1
     CALLS["tiled"] += 1
+    if u is not None:
+        CALLS["flash"] += 1
 
 
 def _row_backward(device, x, dz_out, tgt, bias_slice, lse, ent, g, ge, scalars, col0, n_total, smooth = (1.0, 0.0),
@@ -990,21 +1129,36 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
         R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         w = weight.to(compute_dtype)
-        buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
         coef = (scaling.to(**f32) / divisor.to(**f32)).reshape(())
+        lp_all = torch.empty(n_keep, **f32)
+        lse_all = torch.empty(n_keep, **f32) if eps != 0.0 else None
+        sum_all = torch.empty(n_keep, **f32) if eps != 0.0 else None
+        # Frozen head, no label smoothing: the log-prob op's tiled forward, which writes the gradient times -coef
+        # rounded once (no [rows, V] buffer, no half coef).
+        if (_FLASH and fp32_logits and not _IS_HIP and compute_dtype in _HALF and eps == 0.0 and rows <= 0
+                and not need_w and not need_b and _tiled_vocab(V) and _use_triton(device)):
+            gscale = 1.0
+            if need_h and compute_dtype == torch.float16:
+                gscale = 2.0 ** max(math.floor(math.log2(16384.0 / max(abs(scale), 1e-30))), 0)
+            with torch.autocast(device.type, enabled = False):
+                _tiled_forward(device, hidden, idx, n_keep, w, full_bias, targets, False, (inv_t, scale, cap),
+                               (False, False, False, False), True, compute_dtype,
+                               {"logp": lp_all, "lse": torch.empty(n_keep, **f32)}, -rows, None,
+                               grad_h if need_h else None, gscale, -coef if need_h else None)
+            n_chunked = 0
+        else:
+            n_chunked = n_keep
+            buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
         ratio = None
-        if grad and compute_dtype in _HALF and (not need_w or acc_w.dtype == torch.float32):
+        if n_chunked and grad and compute_dtype in _HALF and (not need_w or acc_w.dtype == torch.float32):
             # Early on p(target) ~ 0, so each row's largest gradient entry is ~ -coef: written into the half buffer it
             # rounds to half(coef) on every row, a systematic scale error (up to 0.4% in bf16 with coef = 1 / n_items).
             # The buffer takes a power of two instead (exact in any format) and the fp32 results take the rest; a half
             # head-gradient accumulator keeps coef (rescaling its rounded sum would round it twice).
             pow2 = torch.exp2(torch.round(torch.log2(coef)))
             ratio, coef = coef / pow2, pow2
-        lp_all = torch.empty(n_keep, **f32)
-        lse_all = torch.empty(n_keep, **f32) if eps != 0.0 else None
-        sum_all = torch.empty(n_keep, **f32) if eps != 0.0 else None
         with torch.autocast(device.type, enabled = False):
-            for a in range(0, n_keep, R):
+            for a in range(0, n_chunked, R):
                 b = min(a + R, n_keep)
                 n = b - a
                 h = _rows_of(hidden, idx, a, b, n_keep, N).to(compute_dtype)
@@ -1080,8 +1234,15 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
             fp32_logits = False
         w = weight.to(compute_dtype)
         outs = (("ent", ent, want_ent), ("sum", mean, want_mean), ("lssp", lssp, want_lssp), ("top1", top1, want_top1))
-        if tiled and rows <= 0 and _tiled_vocab(V) and _use_triton(device):
-            # No-grad calls stay chunked: bit-identical to a frozen-head (forward-gradient) policy pass.
+        # fp16: onehot - p (~1e-8) flushes to 0, so scale by a power of two (exact) and divide out after the GEMM.
+        u_scale = 1.0
+        if want_u and compute_dtype == torch.float16:
+            u_scale = 2.0 ** max(math.floor(math.log2(16384.0 / max(abs(inv_t * scale), 1e-30))), 0)
+        # Decided without want_u / tiled, so no-grad, frozen and trainable passes of one shape take the same route.
+        flash = _FLASH and fp32_logits and not _IS_HIP and compute_dtype in _HALF
+        if (tiled or flash) and rows <= 0 and _tiled_vocab(V) and _use_triton(device):
+            # Trainable / entropy-gradient (recompute) passes always; no-grad and frozen-head passes under _FLASH,
+            # which keeps all three bit-identical. Without it they stay chunked (and identical to each other).
             full = n_keep == N
             dst = {"logp": logps, "lse": lse, "ent": ent if want_ent else None, "sum": mean if want_mean else None,
                    "lssp": lssp if want_lssp else None, "top1": top1 if want_top1 else None}
@@ -1095,7 +1256,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
             with torch.autocast(device.type, enabled = False):
                 _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, (inv_t, scale, cap),
                                (want_ent, want_mean, want_lssp, want_top1), fp32_logits, compute_dtype, dst, -rows,
-                               top)
+                               top, u if want_u else None, u_scale)
             if want_mean:
                 dst["sum"].div_(V)
             if not full:
@@ -1109,10 +1270,6 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
         R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
-        # fp16: onehot - p (~1e-8) flushes to 0, so scale by a power of two (exact) and divide out after the GEMM.
-        u_scale = 1.0
-        if want_u and compute_dtype == torch.float16:
-            u_scale = 2.0 ** max(math.floor(math.log2(16384.0 / max(abs(inv_t * scale), 1e-30))), 0)
         coef = torch.full((), -u_scale, **f32)
         with torch.autocast(device.type, enabled = False):
             for a in range(0, n_keep, R):
