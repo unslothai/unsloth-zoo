@@ -627,11 +627,52 @@ def test_flash_sdpa_check_keeps_the_mask_when_the_probe_fails(monkeypatch):
     monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (9, 0))
     monkeypatch.setattr(misc, "_FLASH_SDPA_ACCEPTS_CACHE", {})
+    monkeypatch.setattr(misc, "_EFFICIENT_SDPA_ACCEPTS_CACHE", {}, raising = False)
     def broken(*args, **kwargs):
         raise RuntimeError("no SDPAParams")
     monkeypatch.setattr(torch.backends.cuda, "SDPAParams", broken)
     embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
     assert misc._flash_sdpa_takes_causal(_config(), embeds) is False
+
+
+@pytest.mark.parametrize("kv_heads", [8, 1], ids = ["mha", "gqa"])
+@pytest.mark.parametrize("efficient", [True, False])
+@pytest.mark.parametrize("efficient_enabled", [True, False])
+def test_mha_rejected_by_flash_runs_maskless_on_the_efficient_kernel(monkeypatch, kv_heads, efficient, efficient_enabled):
+    # sm86 / sm89 / sm120 flash refuses some training shapes. Equal head counts need no enable_gqa,
+    # so mem-efficient SDPA still runs the maskless causal call; GQA would fall to the math kernel.
+    import types
+    from transformers import LlamaConfig
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: efficient_enabled)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (8, 9))
+    monkeypatch.setattr(misc, "_flash_sdpa_accepts", lambda *args: False)
+    asked = []
+    def efficient_accepts(*args):
+        asked.append(args)
+        return efficient
+    monkeypatch.setattr(misc, "_efficient_sdpa_accepts_mha", efficient_accepts, raising = False)
+    config = LlamaConfig(hidden_size = 2048, num_attention_heads = 8, num_key_value_heads = kv_heads, head_dim = 256)
+    config._attn_implementation = "sdpa"
+    embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
+    got = misc._flash_sdpa_takes_causal(config, embeds)
+    assert got is (kv_heads == 8 and efficient and efficient_enabled)
+    if kv_heads == 1 or not efficient_enabled:
+        assert asked == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "needs an NVIDIA GPU")
+def test_efficient_mha_probe_matches_a_real_maskless_call(monkeypatch):
+    monkeypatch.setattr(misc, "_EFFICIENT_SDPA_ACCEPTS_CACHE", {}, raising = False)
+    device = torch.device("cuda", torch.cuda.current_device())
+    assert misc._efficient_sdpa_accepts_mha(device, torch.bfloat16, 8, 128, 0.0, True) is True
+    q = torch.randn(1, 8, 64, 128, device = device, dtype = torch.bfloat16, requires_grad = True)
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+        out = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal = True)
+        out.float().sum().backward()
+    assert torch.isfinite(q.grad).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "needs an NVIDIA GPU")

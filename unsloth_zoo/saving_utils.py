@@ -5251,6 +5251,32 @@ def merge_and_overwrite_lora(
         pass
     pass
 
+    _stale_shards = set()
+    if save_method not in ("merged_4bit", "forced_merged_4bit"):
+        # Before the tokenizer, config and index writes below, so a refused refresh changes nothing.
+        # Only shard entries decide it, and none of those writes touches a shard.
+        # An earlier export's shard is already merged and the fetches below can keep it
+        # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
+        # Each one is replaced in turn by a staged copy renamed over it, so no second copy of the
+        # checkpoint is kept, and a disk that cannot finish the refresh is refused before it starts.
+        _stale_shards = set(_previous_export_shards(
+            safetensors_list, save_directory, model_name if is_local_path else None,
+        ))
+        if _stale_shards:
+            if is_local_path:
+                _new_sizes = {
+                    f : os.path.getsize(os.path.join(model_name, f)) for f in safetensors_list
+                    if os.path.exists(os.path.join(model_name, f)) and (
+                        f in _stale_shards or not os.path.lexists(os.path.join(save_directory, f))
+                    )
+                }
+            else:
+                _new_sizes = {
+                    f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
+                }
+            _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
+        pass
+
     # Save config / generation_config via no state_dict and tokenizer
     if tokenizer is not None:
         tokenizer.save_pretrained(save_directory = save_directory)
@@ -5468,28 +5494,6 @@ def merge_and_overwrite_lora(
         pass
     pass
 
-    # An earlier export's shard is already merged and the fetches below can keep it
-    # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
-    # Each one is replaced in turn by a staged copy renamed over it, so no second copy of the
-    # checkpoint is kept, and a disk that cannot finish the refresh is refused before it starts.
-    _stale_shards = set(_previous_export_shards(
-        safetensors_list, save_directory, model_name if is_local_path else None,
-    ))
-    if _stale_shards:
-        if is_local_path:
-            _new_sizes = {
-                f : os.path.getsize(os.path.join(model_name, f)) for f in safetensors_list
-                if os.path.exists(os.path.join(model_name, f)) and (
-                    f in _stale_shards or not os.path.lexists(os.path.join(save_directory, f))
-                )
-            }
-        else:
-            _new_sizes = {
-                f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
-            }
-        _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
-    pass
-
     _replaced_shards = []
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
@@ -5549,19 +5553,30 @@ def merge_and_overwrite_lora(
         # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
         for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
             file_path = os.path.join(save_directory, filename)
-            _materialize_shard_that_resolves_outside(file_path, save_directory)
-            # Before the copy, not only at the writers: those run much later, so a linked
-            # output component (`save_directory/weights -> /outside`) was followed by
-            # `makedirs` and `copy2` before anything refused.
-            _assert_shard_is_inside(file_path, save_directory)
+            # Overwrite unless it IS the source (in-place export): an earlier export's shard is already merged.
+            # Decided before the shard is materialised: a link to the base shard is the source, so
+            # materialising it is its one copy, not a reason to copy the base shard a second time.
+            local_file_path = os.path.join(model_name, filename) if is_local_path else None
+            _replace_from_local = is_local_path and os.path.exists(local_file_path) and not (
+                os.path.exists(file_path) and os.path.samefile(file_path, local_file_path)
+            )
+            _replace_from_hub = not copied_all_from_cache and not is_local_path and filename in _stale_shards
+            # Both replacements `os.replace` the directory entry and never follow a linked leaf, so
+            # a shard link (dangling or not) under a contained parent is replaced, not copied first
+            # and not refused. The full check runs once the regular file is in place.
+            _replaces_link_entry = (_replace_from_local or _replace_from_hub) and \
+                os.path.islink(file_path) and \
+                _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory)
+            if not _replaces_link_entry:
+                _materialize_shard_that_resolves_outside(file_path, save_directory)
+                # Before the copy, not only at the writers: those run much later, so a linked
+                # output component (`save_directory/weights -> /outside`) was followed by
+                # `makedirs` and `copy2` before anything refused.
+                _assert_shard_is_inside(file_path, save_directory)
             # Only download if we didn't get everything from cache AND this specific file doesn't exist
             # AND we're in low disk space mode
             # For local models, copy the file if needed
-            # Overwrite unless it IS the source (in-place export): an earlier export's shard is already merged.
-            local_file_path = os.path.join(model_name, filename) if is_local_path else None
-            if is_local_path and os.path.exists(local_file_path) and not (
-                os.path.exists(file_path) and os.path.samefile(file_path, local_file_path)
-            ):
+            if _replace_from_local:
                 # A nested name has no parent here yet, so the copy would raise
                 # FileNotFoundError. The name is known to stay inside LEXICALLY, no
                 # stronger: a symlinked component still resolves wherever it points.
@@ -5570,7 +5585,7 @@ def merge_and_overwrite_lora(
                 print(f"Copied {filename} from local model directory")
                 if filename in _stale_shards: _replaced_shards.append(filename)
 
-            elif not copied_all_from_cache and not is_local_path and filename in _stale_shards:
+            elif _replace_from_hub:
                 _download_shard_over_previous_export(
                     model_name, filename, save_directory, _hf_cache_dir, token, revision = _hub_revision,
                 )
@@ -5587,6 +5602,8 @@ def merge_and_overwrite_lora(
                     revision = _hub_revision,
                 )
             pass
+            if _replaces_link_entry:
+                _assert_shard_is_inside(file_path, save_directory)
 
             if needs_splitting:
                 resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)

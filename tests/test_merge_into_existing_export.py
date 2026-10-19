@@ -443,7 +443,93 @@ def test_refresh_refused_when_free_space_is_below_the_largest_shard(tmp_path, mo
             return real_hf(repo_id, filename, local_dir = local_dir, **k)
         monkeypatch.setattr(S, "hf_hub_download", _hf)
 
+    # The message says nothing was changed, so the metadata written before the shards stays too.
+    _metadata = [f for f in ("config.json", "generation_config.json", "model.safetensors.index.json")
+                 if os.path.exists(os.path.join(out, f))]
+    assert "config.json" in _metadata and "model.safetensors.index.json" in _metadata
+    for f in _metadata:
+        with open(os.path.join(out, f), "ab") as handle:
+            handle.write(b"\n")
+    metadata_before = {f : open(os.path.join(out, f), "rb").read() for f in _metadata}
+
     with pytest.raises(RuntimeError, match = "Nothing was changed"):
         H.run_merge(peft_model, base, out, save_dtype = None, low_disk_space_usage = low_disk)
     assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _metadata} == metadata_before
     assert _no_staging_left(out)
+
+
+@pytest.mark.parametrize("source", ["local", "hub", "hub_low_disk"])
+def test_dangling_shard_link_out_of_the_output_is_replaced(tmp_path, source):
+    # A shard entry left as a dangling link out of the output (a deleted cache blob) is a stale
+    # entry the refresh replaces with os.replace, which never follows the link: not a refusal.
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        base, peft_model = _build(tmp_path)
+        fresh = str(tmp_path / "fresh")
+        H.run_merge(peft_model, base, fresh, save_dtype = torch.float32)
+        expected = H.read_safetensors_dir(fresh)
+        if source != "local":
+            _fake_hub(monkeypatch, base, fail = False)
+        out = tmp_path / "out"
+        out.mkdir()
+        missing = tmp_path / "deleted_outside.safetensors"
+        (out / "model.safetensors").symlink_to(missing)
+        H.run_merge(peft_model, base, str(out), save_dtype = torch.float32,
+                    low_disk_space_usage = source == "hub_low_disk")
+        assert not os.path.islink(out / "model.safetensors") and not missing.exists()
+        got = H.read_safetensors_dir(str(out))
+        assert sorted(got) == sorted(expected)
+        assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
+        assert _no_staging_left(str(out))
+    finally:
+        monkeypatch.undo()
+
+
+def test_live_shard_link_out_survives_a_failed_hub_fetch(tmp_path, monkeypatch):
+    # The fetch replaces the entry, so the link is not copied first: a failed fetch leaves it as it was.
+    base, peft_model = _build(tmp_path)
+    _fake_hub(monkeypatch, base, fail = True)
+    out = tmp_path / "out"
+    out.mkdir()
+    outside = tmp_path / "outside.safetensors"
+    outside.write_bytes(b"external-payload")
+    (out / "model.safetensors").symlink_to(outside)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, str(out), save_dtype = torch.float32)
+    assert os.path.islink(out / "model.safetensors")
+    assert outside.read_bytes() == b"external-payload"
+    assert _no_staging_left(str(out))
+
+
+def test_shard_link_to_the_local_base_shard_is_copied_once(tmp_path, monkeypatch):
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path)
+    fresh = str(tmp_path / "fresh")
+    H.run_merge(peft_model, base, fresh, save_dtype = torch.float32)
+    expected = H.read_safetensors_dir(fresh)
+    base_before = open(os.path.join(base, "model.safetensors"), "rb").read()
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "model.safetensors").symlink_to(os.path.join(base, "model.safetensors"))
+    copies = []
+    real_copy, real_materialize = S._copy_file_from_source, S._materialize_shard_that_resolves_outside
+    def _copy(src, target_dir, filename):
+        if str(filename).endswith(".safetensors"):
+            copies.append("copy_from_source")
+        return real_copy(src, target_dir, filename)
+    def _materialize(file_path, save_directory):
+        was_link = os.path.islink(file_path)
+        real_materialize(file_path, save_directory)
+        if was_link and not os.path.islink(file_path):
+            copies.append("materialize")
+    monkeypatch.setattr(S, "_copy_file_from_source", _copy)
+    monkeypatch.setattr(S, "_materialize_shard_that_resolves_outside", _materialize)
+    H.run_merge(peft_model, base, str(out), save_dtype = torch.float32)
+
+    assert len(copies) == 1, copies
+    assert open(os.path.join(base, "model.safetensors"), "rb").read() == base_before
+    got = H.read_safetensors_dir(str(out))
+    assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
