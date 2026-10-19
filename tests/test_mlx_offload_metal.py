@@ -75,17 +75,17 @@ def _table(kind):
 _MLX_PREFIX, _HF_PREFIX = "language_model.model.", "model.language_model."
 
 
-def _lazy_copy(build, directory, hf_names = False):
-    """``build()``'s model with its weights lazily mapped from ``directory``, saved there once,
-    under the Hugging Face layout's names if ``hf_names``."""
+def _lazy_copy(build, directory, layout = _MLX_PREFIX):
+    """``build()``'s model with its weights lazily mapped from ``directory``, saved there once, its
+    ``language_model.model.`` names under ``layout``."""
     model = build()
     path = os.path.join(directory, "model.safetensors")
-    rename = (lambda name, a, b: b + name[len(a):]) if hf_names else (lambda name, a, b: name)
+    rename = lambda name, a, b: b + name[len(a):] if name.startswith(a) else name
     if not os.path.exists(path):
         mx.save_safetensors(path, {
-            rename(name, _MLX_PREFIX, _HF_PREFIX): value for name, value in tree_flatten(model.parameters())
+            rename(name, _MLX_PREFIX, layout): value for name, value in tree_flatten(model.parameters())
         })
-    model.load_weights([(rename(name, _HF_PREFIX, _MLX_PREFIX), value) for name, value in mx.load(path).items()])
+    model.load_weights([(rename(name, layout, _MLX_PREFIX), value) for name, value in mx.load(path).items()])
     return model
 
 
@@ -117,7 +117,9 @@ def _bits(array):
 @pytest.mark.parametrize("fraction", [1.0, 0.5])
 def test_offloaded_table_matches_stock(tmp_path, kind, fraction):
     name, module = _table(kind)
-    model = _lazy_copy(lambda: _holder(name, module), str(tmp_path), hf_names = kind == "quantized")
+    # Checkpoint layouts: Hugging Face's VLM, and a text checkpoint mlx-vlm wraps as its language model.
+    layout = {"quantized": _HF_PREFIX, "mxfp4": "model."}.get(kind, _MLX_PREFIX)
+    model = _lazy_copy(lambda: _holder(name, module), str(tmp_path), layout)
     # Repeats, unsorted, and rows on both sides of the held prefix of several shards; the second
     # lookup mixes rows the first one read with new ones.
     rng = np.random.default_rng(0)

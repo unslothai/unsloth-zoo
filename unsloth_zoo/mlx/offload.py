@@ -330,14 +330,15 @@ def ple_sites(model):
 
 
 def _checkpoint_name(store, name):
-    """The checkpoint's name for a parameter: its MLX name, or the Hugging Face layout of it."""
+    """The checkpoint's name for a parameter: its MLX name, the Hugging Face layout of it, or, for a
+    text checkpoint mlx-vlm wraps as its language model, the text layout."""
     if name in store.specs:
         return name
     prefix = "language_model.model."
     if name.startswith(prefix):
-        alternate = "model.language_model." + name[len(prefix):]
-        if alternate in store.specs:
-            return alternate
+        for alternate in ("model.language_model.", "model."):
+            if alternate + name[len(prefix):] in store.specs:
+                return alternate + name[len(prefix):]
     return None
 
 
