@@ -497,6 +497,21 @@ def test_a_wide_prefill_step_runs_layer_by_layer_on_full_tables(tmp_path, monkey
     np.testing.assert_array_equal(_bits(got), _bits(want))
 
 
+def test_deepseek_v4_blocks_prefill_layer_by_layer(tmp_path):
+    v4 = pytest.importorskip("mlx_vlm.models.deepseek_v4.deepseek_v4")
+    lm = v4.Model(v4.ModelConfig(vocab_size = 512, hidden_size = 512, moe_intermediate_size = 64, num_hidden_layers = 4, n_routed_experts = 16, head_dim = 64,
+        num_attention_heads = 4, q_lora_rank = 64, qk_rope_head_dim = 32, compress_ratios = [0, 4, 128, 0], o_groups = 2, o_lora_rank = 32, index_topk = 64)).language_model.eval()
+    # Hash-routed blocks pick experts by token id: distinct ids, distinct experts.
+    lm.load_weights([(f"model.layers.{i}.ffn.gate.tid2eid", mx.argsort(mx.random.uniform(shape = (512, 16)), axis = -1)[:, :6]) for i in range(3)], strict = False)
+    nn.quantize(lm, group_size = 32, bits = 4, class_predicate = lambda _, module: type(module).__name__ == "SwitchLinear")
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), dict(tree_flatten(lm.parameters())))
+    tokens = mx.random.randint(0, 512, (1, 2 * 2048 + 5), key = mx.random.key(3))
+    expected = [lm.model(tokens[:, i:i + 2048], cache = cache, skip_final_norm = True) for cache in [lm.make_cache()] for i in range(0, tokens.shape[1], 2048)]
+    offload_experts(lm, str(tmp_path), 0.75)
+    np.testing.assert_array_equal(_bits(lm.model(tokens, cache = lm.make_cache(), skip_final_norm = True)), _bits(mx.concatenate(expected, axis = 1)))
+    assert [block.ffn.switch_mlp._slots.misses for block in lm.model.layers] == [0] * 4  # full tables, the slots untouched
+
+
 def test_offloaded_experts_are_never_loaded(tmp_path):
     model = _lazy_copy(lambda: _moe("lm", hidden = 512), str(tmp_path))
     table_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))

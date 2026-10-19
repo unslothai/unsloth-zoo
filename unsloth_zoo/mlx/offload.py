@@ -486,13 +486,31 @@ _SORT_ROUTES = 64
 _RUN_BYTES = 8 << 20
 # The prefill step a wide decoder layer call runs in: mlx-vlm's and mlx-lm's default.
 _PREFILL_STEP = 2048
+
+
+def _deepseek_v4_step_mask(layer, arguments):
+    """DeepSeek V4 builds one sliding-window mask array for the whole call; each step rebuilds it from
+    the block's own rotating cache, as chunked prefill does. Calls with image tokens are not causal."""
+    if not arguments.get("causal") or arguments.get("position_offset") is not None:
+        return None
+    from mlx_vlm.models.base import create_attention_mask
+    from mlx_vlm.models.cache import CacheList
+
+    cache = arguments["cache"]
+    local = cache[0] if isinstance(cache, CacheList) else cache
+    window = layer.attn.config.sliding_window
+    return lambda h: create_attention_mask(h[:, :, 0, :], local, window_size = window, return_array = True)
+
+
 # Decoder layers whose call wider than a prefill step may run as consecutive steps on the layer's
-# own cache (no state shared with other layers): each token-indexed argument's token axis, and the
-# masks under which the layer attends causally.
+# own cache (no state shared with other layers): each token-indexed argument's token axis, and either
+# the masks under which the layer attends causally, or a function of (layer, arguments) giving each
+# step's mask from its hidden states (None when the call is not causal).
 _WIDE_LAYERS = {
     "mlx_vlm.models.qwen4_exp.language.Qwen4ExpDecoderLayer": (
         {"hidden_states": 1, "input_ids": 1, "position_ids": -1}, (None, "causal")),
     "mlx_lm.models.qwen3_moe.Qwen3MoeDecoderLayer": ({"x": 1}, ("causal",)),
+    "mlx_vlm.models.deepseek_v4.language.DeepseekV4Block": ({"h": 1, "input_ids": 1}, _deepseek_v4_step_mask),
 }
 _table_reader_pool = None
 
@@ -912,8 +930,9 @@ class _WideLayer:
         if not isinstance(hidden, mx.array) or hidden.ndim < 2 or hidden.shape[0] != 1 or hidden.shape[1] <= _PREFILL_STEP:
             return super().__call__(*args, **kwargs)
         bound = self._wide_signature.bind(self, *args, **kwargs)
-        cache, mask = bound.arguments.get("cache"), bound.arguments.get("mask")
-        causal = (mask is None or isinstance(mask, str)) and mask in self._wide_masks
+        cache, mask, masks = bound.arguments.get("cache"), bound.arguments.get("mask"), self._wide_masks
+        step_mask = masks(self, bound.arguments) if callable(masks) and cache is not None else None
+        causal = step_mask is not None if callable(masks) else (mask is None or isinstance(mask, str)) and mask in masks
         switch = self._offload_switch
         if cache is None or not causal or not switch._wide(read_next = True):
             return super().__call__(*args, **kwargs)
@@ -924,6 +943,8 @@ class _WideLayer:
                 for name, axis in axes.items():
                     if given[name] is not None:
                         bound.arguments[name] = _token_slice(given[name], axis, start, start + _PREFILL_STEP)
+                if step_mask is not None:
+                    bound.arguments["mask"] = step_mask(bound.arguments[first])
                 output = super().__call__(*bound.args[1:], **bound.kwargs)
                 mx.eval(output, cache.state)
                 outputs.append(output)
@@ -949,7 +970,7 @@ def _widen_layers(model, switches):
             continue
         if base not in _WIDE_CLASSES:
             _WIDE_CLASSES[base] = type(base.__name__, (_WideLayer, base), {
-                "_wide_axes": spec[0], "_wide_masks": spec[1], "_wide_signature": inspect.signature(base.__call__),
+                "_wide_axes": spec[0], "_wide_masks": staticmethod(spec[1]) if callable(spec[1]) else spec[1], "_wide_signature": inspect.signature(base.__call__),
             })
         layer.__class__ = _WIDE_CLASSES[base]
         object.__setattr__(layer, "_offload_switch", held[0])
