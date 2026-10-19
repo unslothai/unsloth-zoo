@@ -1703,6 +1703,9 @@ def test_tiled_prefill_serves_wherever_stock_runs_no_nax(monkeypatch):
     monkeypatch.setenv("UNSLOTH_MLX_TILED_PREFILL", "0")
     assert not inference._tiled_prefill_enabled()
     monkeypatch.delenv("UNSLOTH_MLX_TILED_PREFILL")
+    monkeypatch.setenv("UNSLOTH_MLX_DENSE_PREFILL", "0")
+    assert not inference._tiled_prefill_enabled()
+    monkeypatch.delenv("UNSLOTH_MLX_DENSE_PREFILL")
     monkeypatch.setattr(inference, "_tiled_qmm_kernel", lambda: None)   # an installed header it does not know
     assert not inference._tiled_prefill_enabled()
     monkeypatch.setattr(inference, "_tiled_qmm_kernel", lambda: object())

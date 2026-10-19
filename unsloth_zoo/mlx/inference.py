@@ -3991,7 +3991,9 @@ def probe_tiled_qmm():
 
 def _tiled_prefill_enabled():
     """Whether the tile serves here: on, stock runs no NAX kernels, and its kernel built and passed its probe."""
-    if os.environ.get("UNSLOTH_MLX_TILED_PREFILL", "1") == "0" or mx.__version__ not in _TILED_QMM_DISPATCH_MLX:
+    # It runs inside the dense prefill scope, so that scope's opt-out turns it off too.
+    if (any(os.environ.get(name, "1") == "0" for name in ("UNSLOTH_MLX_TILED_PREFILL", "UNSLOTH_MLX_DENSE_PREFILL"))
+            or mx.__version__ not in _TILED_QMM_DISPATCH_MLX):
         return False
     # Where stock runs its NAX kernels (another tile and K order) it keeps them, whatever `UNSLOTH_MLX_NAX` says.
     return (qmm.simd_qmm_available() and _tiled_qmm_kernel() is not None and nax.kernel_probe_passed(
