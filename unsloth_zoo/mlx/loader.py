@@ -719,6 +719,31 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
     ) from error
 
 
+# The layers mlx-vlm's glm5_next sanitize fuses, each by its first source projection.
+_GLM5_NEXT_FUSED = {"gate_up_proj": "gate_proj", "qkv_proj": "q_proj", "fbg_a_proj": "f_a_proj", "qkv_a_proj": "q_a_proj"}
+
+
+def _patch_glm5_next_quantization_aliases(model_type):
+    """mlx-vlm fuses glm5_next projections (``_GLM5_NEXT_FUSED``) but gives a fused layer no alias
+    to its sources' per-module quantization, so a mixed-bit checkpoint's (as GLM-5.3-Flash-4bit's
+    6-bit shared experts) is built at the default bits and fails to load."""
+    if model_type != "glm5_next":
+        return
+    try:
+        from mlx_vlm.models.glm5_next.glm5_next import Model as model
+    except Exception:
+        return
+    if hasattr(model, "quantization_path_aliases"):
+        return
+
+    def quantization_path_aliases(self, path):
+        path = path[len("language_model."):] if path.startswith("language_model.") else path
+        parent, _, name = path.rpartition(".")
+        return [f"{parent}.{_GLM5_NEXT_FUSED[name]}"] if name in _GLM5_NEXT_FUSED else []
+
+    model.quantization_path_aliases = quantization_path_aliases
+
+
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
     """Let DeepSeek-OCR remote config imports survive newer Transformers.
 
@@ -1636,6 +1661,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
     registered mismatch signatures and exact allow-listed keys only.
     """
     _patch_deepseek_ocr_transformers_import_compat(model_type)
+    _patch_glm5_next_quantization_aliases(model_type)
     try:
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
