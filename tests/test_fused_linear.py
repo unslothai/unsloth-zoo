@@ -599,9 +599,9 @@ def test_bf16_on_pre_ampere_keeps_triton(monkeypatch):
         lp.sum().backward()
         assert torch.isfinite(lp).all() and torch.isfinite(h.grad).all()
         assert not fl._TRITON_BROKEN and fl._logits_mode(h.device, torch.bfloat16) == (False, False)
-        # fp16 keeps fp32 logits where torch has the fp32-output GEMM at all (2.8+).
+        # fp16 keeps fp32 logits where torch has the fp32-output GEMM at all (2.8+); ROCm takes plain half logits.
         has_out_dtype = tuple(int(x) for x in torch.__version__.split(".")[:2]) >= (2, 8)
-        assert fl._logits_mode(h.device, torch.float16) == (has_out_dtype, False)
+        assert fl._logits_mode(h.device, torch.float16) == (has_out_dtype and not fl._IS_HIP, False)
     finally:
         fl._fp32_out_ok.cache_clear()
 
