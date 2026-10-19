@@ -1917,7 +1917,7 @@ def fused_residual_norm_handoff(model, *, _modules = None):
 _QWEN_ROUTING, _GEMMA_ROUTING = 0, 1  # kernel MODE
 
 # The kernel emulates the chain's rounding: softmax partials and reciprocal, stable tie order,
-# sequential bf16 sum over <= 8 values. `_moe_router_verified` checks that at first use.
+# sequential bf16 sum of the top-k scores. `_moe_router_verified` checks that at first use.
 # unary_ops.h's Sigmoid, as mx.sigmoid evaluates the shared-expert gate.
 _MOE_ROUTER_SIGMOID = """
     template <typename T>
@@ -1928,14 +1928,24 @@ _MOE_ROUTER_SIGMOID = """
 """
 
 
+# MLX's block softmax adds per-simdgroup totals with one simd_sum over lanes; past two
+# simdgroups (256 experts) that differs from adding them in turn, so wide routing has its own source.
+_MOE_ROUTER_GROUP_TOTAL = "total += simd_sum(partial);"
+_MOE_ROUTER_WIDE_GROUP_TOTAL = """
+                        const float group = simd_sum(partial);
+                        if (lane == uint(g)) total = group;
+                        if (g == R / 4 - 1) total = simd_sum(total);"""
+
+
 @functools.cache
-def _moe_router_kernel(shared = False):
-    """The routing kernel; `shared` also writes the sigmoid of each row's shared-expert gate logit."""
+def _moe_router_kernel(shared = False, wide = False):
+    """The routing kernel; `shared` also writes the sigmoid of each row's shared-expert gate logit,
+    `wide` serves Qwen routing over more than 256 experts."""
     try:
         if not mx.metal.is_available():
             return None
         return mx.fast.metal_kernel(
-            name = "unsloth_moe_router_shared" if shared else "unsloth_moe_router",
+            name = "unsloth_moe_router" + ("_wide" if wide else "") + ("_shared" if shared else ""),
             input_names = ["logits", "scale"] + (["shared_logit"] if shared else []),
             output_names = ["inds", "weights"] + (["shared"] if shared else []),
             compile_options = {"math_mode": "safe"},
@@ -1974,7 +1984,7 @@ def _moe_router_kernel(shared = False):
                             v[4 * g + i] = fast::exp(v[4 * g + i] - m);
                             partial += v[4 * g + i];
                         }
-                        total += simd_sum(partial);
+                        GROUP_TOTAL
                     }
                     const float normalizer = 1 / total;
                     for (int r = 0; r < R; ++r) v[r] = float(T(v[r] * normalizer));
@@ -2025,7 +2035,8 @@ def _moe_router_kernel(shared = False):
                         ow[k] = OUT_T(float(T(e[k] * recip)) * float(scale[sel_idx[k]]));
                     }
                 }
-            """.replace("SHARED_SCALE", "shared[row] = unsloth_sigmoid(shared_logit[row]);" if shared else ""),
+            """.replace("SHARED_SCALE", "shared[row] = unsloth_sigmoid(shared_logit[row]);" if shared else "")
+               .replace("GROUP_TOTAL", _MOE_ROUTER_WIDE_GROUP_TOTAL if wide else _MOE_ROUTER_GROUP_TOTAL),
         )
     except (AttributeError, TypeError):
         return None
@@ -2035,16 +2046,15 @@ _MOE_ROUTER_DTYPES = (mx.bfloat16, mx.float16, mx.float32)
 
 
 def _moe_router_shape_ok(experts, top_k, mode):
-    # Qwen sums softmax partials of at most two simdgroups in the native order;
-    # the 32-bit `taken` mask caps both modes at 1024.
-    return experts % 32 == 0 and experts <= (256 if mode == _QWEN_ROUTING else 1024) and 1 <= top_k <= 8
+    # The 32-bit `taken` mask caps both modes at 1024; Gemma's top-k softmax sums at most two parts.
+    return experts % 32 == 0 and experts <= 1024 and 1 <= top_k <= (16 if mode == _QWEN_ROUTING else 8)
 
 
 def _run_moe_router(logits, scale, top_k, mode, normalize, out_dtype, shared_logit = None):
     experts = logits.shape[-1]
     rows = logits.size // experts
     shared = shared_logit is not None
-    outputs = _moe_router_kernel(shared)(
+    outputs = _moe_router_kernel(shared, mode == _QWEN_ROUTING and experts > 256)(
         inputs = [logits.reshape(rows, experts), scale] + ([shared_logit.reshape(rows)] if shared else []),
         template = [("T", logits.dtype), ("OUT_T", out_dtype), ("E", experts), ("K", top_k),
                     ("MODE", mode), ("NORM", int(normalize))],
@@ -2185,10 +2195,11 @@ _QDOT = r"""
 #define UNROLL _Pragma("clang loop unroll(full)")
 
 #ifdef UNSLOTH_AFFINE
-template <typename T, int bits>
+// qmv_fast reads two packs per lane (one at 2 bits); qmv reads one.
+template <typename T, int bits, int fast>
 struct Lane {
   typedef T scale_t;
-  static constexpr constant int packs = bits == 2 ? 1 : 2;
+  static constexpr constant int packs = fast && bits != 2 ? 2 : 1;
   static constexpr constant int pack_factor = get_pack_factor<bits, 32>();
   static constexpr constant int bytes_per_pack = get_bytes_per_pack<bits, 32>();
 };
@@ -2355,7 +2366,7 @@ struct Terms<U, values_per_thread, 8> {
   }
 };
 #else
-template <typename T, int bits>
+template <typename T, int bits, int fast>
 struct Lane {
   typedef uint8_t scale_t;
   static constexpr constant int packs = 2;
@@ -2433,10 +2444,10 @@ struct ExpertParams {
   int64_t w[2][3]; // per-expert byte strides of (weight, scales, biases) per projection
 };
 
-template <typename T, int group_size, int bits, int out>
+template <typename T, int group_size, int bits, int out, int fast>
 struct Dots {
   typedef float U;
-  typedef Lane<T, bits> lane;
+  typedef Lane<T, bits, fast> lane;
   static constexpr constant int values_per_thread = lane::pack_factor * lane::packs;
   static constexpr constant int block_size = values_per_thread * SIMD_SIZE;
   static constexpr constant int scale_step = group_size / values_per_thread;
@@ -2478,13 +2489,16 @@ struct Dots {
     Terms<U, values_per_thread, bits> terms;
     x += lane_id * values_per_thread;
     for (int k = 0; k < K; k += block_size) {
+      // qmv's last block: lanes past K add nothing.
+      if (fast || k + lane_id * values_per_thread < K) {
 #ifdef UNSLOTH_AFFINE
-      sum = load_vector<T, U, values_per_thread, bits>(x, xt);
+        sum = load_vector<T, U, values_per_thread, bits>(x, xt);
 #else
-      load_vector<T, U, values_per_thread>(x, xt);
+        load_vector<T, U, values_per_thread>(x, xt);
 #endif
-      UNROLL for (int j = 0; j < P; j++) {
-        rows(p[j], K, terms, xt, sum, result + j * out);
+        UNROLL for (int j = 0; j < P; j++) {
+          rows(p[j], K, terms, xt, sum, result + j * out);
+        }
       }
       UNROLL for (int j = 0; j < P; j++) {
         p[j].w += block_size * lane::bytes_per_pack / lane::pack_factor;
@@ -2499,7 +2513,7 @@ struct Dots {
   }
 };
 
-template <typename T, int group_size, int bits, int out, typename Inds>
+template <typename T, int group_size, int bits, int out, int fast, typename Inds>
 METAL_FUNC void gate_up_rows(
     const device uint8_t* wg,
     const device uint8_t* sg,
@@ -2513,7 +2527,7 @@ METAL_FUNC void gate_up_rows(
     ExpertParams p,
     uint3 tid,
     uint3 lid) {
-  typedef Dots<T, group_size, bits, out> dots;
+  typedef Dots<T, group_size, bits, out, fast> dots;
   const int lane = lid.x;
   const int n0 = tid.x * (2 * out) + lid.y * out;
   const int64_t e = inds[tid.y];
@@ -2536,7 +2550,7 @@ METAL_FUNC void gate_up_rows(
   }
 }
 
-template <typename T, int group_size, int bits, int out, typename Inds, typename Scores, typename Shared, typename S>
+template <typename T, int group_size, int bits, int out, int fast, typename Inds, typename Scores, typename Shared, typename S>
 METAL_FUNC void down_rows(
     const device uint8_t* w,
     const device uint8_t* ws,
@@ -2552,7 +2566,7 @@ METAL_FUNC void down_rows(
     uint3 tid,
     uint3 lid,
     uint3 lsize) {
-  typedef Dots<T, group_size, bits, out> dots;
+  typedef Dots<T, group_size, bits, out, fast> dots;
   const int lane = lid.x;
   const int n0 = tid.x * out;
   const size_t route = size_t(tid.y) * p.top_k;
@@ -2581,7 +2595,7 @@ _BODIES = {
   const ExpertParams p{k, n, top_k, {
       {wg_strides[0] * int64_t(sizeof(*wg)), sg_strides[0] * int64_t(sizeof(*sg)), bg_strides[0] * int64_t(sizeof(*bg))},
       {wu_strides[0] * int64_t(sizeof(*wu)), su_strides[0] * int64_t(sizeof(*su)), bu_strides[0] * int64_t(sizeof(*bu))}}};
-  gate_up_rows<T, group_size, bits, out>(
+  gate_up_rows<T, group_size, bits, out, fast>(
       (const device uint8_t*)wg, (const device uint8_t*)sg, (const device uint8_t*)bg,
       (const device uint8_t*)wu, (const device uint8_t*)su, (const device uint8_t*)bu,
       x, inds, y, p, threadgroup_position_in_grid, thread_position_in_threadgroup);
@@ -2589,7 +2603,7 @@ _BODIES = {
     "down": r"""
   threadgroup T products[31 * out];
   const ExpertParams p{k, n, top_k, {{w_strides[0] * int64_t(sizeof(*w)), ws_strides[0] * int64_t(sizeof(*ws)), wb_strides[0] * int64_t(sizeof(*wb))}, {}}};
-  down_rows<T, group_size, bits, out>(
+  down_rows<T, group_size, bits, out, fast>(
       (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb, x, inds, scores, shared, s, y, p,
       products, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup);
 """,
@@ -2647,19 +2661,20 @@ def _scalar(value):
     return mx.array(value, mx.int32)
 
 
-def _values_per_thread(mode, bits):
+def _values_per_thread(mode, bits, fast = True):
     if mode != "affine":
         return 2 * 32 // bits
     pack_factor = 8 if bits in (3, 5) else 4 if bits == 6 else 32 // bits
-    return pack_factor * (1 if bits == 2 else 2)
+    return pack_factor * (1 if bits == 2 or not fast else 2)
 
 
 def _trailing(a, dtype, rows, cols):
     return a.dtype == dtype and a.ndim >= 2 and a.shape[-2:] == (rows, cols)
 
 
-def _one_row_fast(mode, group_size, bits, dtype, k, n, w, scales, biases):
-    """Whether MLX's one-row gather kernel for (K, N) is qmv_fast / fp_qmv_fast for these weights."""
+def _one_row_kernel(mode, group_size, bits, dtype, k, n, w, scales, biases):
+    """MLX's one-row gather kernel for (K, N) with these weights: 1 for qmv_fast / fp_qmv_fast, 0 for the affine
+    qmv, -1 for one the routed kernels do not reproduce."""
     affine = mode == "affine"
     known = (
         (affine and 2 <= bits <= 8 and bits != 7 and group_size in (32, 64, 128))
@@ -2668,15 +2683,17 @@ def _one_row_fast(mode, group_size, bits, dtype, k, n, w, scales, biases):
         or (mode == "nvfp4" and bits == 4 and group_size == 16)
     )
     if not known or scales is None or affine != (biases is not None):
-        return False
-    per_thread = _values_per_thread(mode, bits)
-    if n % 8 != 0 or n < 16 or k % (per_thread * 32) != 0 or group_size < per_thread:
-        return False
-    return (
+        return -1
+    # MLX's qmv_fast_k_alignment: qmv_fast's K step.
+    fast = k % (_values_per_thread(mode, bits) * 32) == 0
+    if n % 8 != 0 or n < 16 or not (fast or affine) or group_size < _values_per_thread(mode, bits, fast):
+        return -1
+    shaped = (
         _trailing(w, mx.uint32, n, k * bits // 32)
         and _trailing(scales, dtype if affine else mx.uint8, n, k // group_size)
         and (not affine or _trailing(biases, dtype, n, k // group_size))
     )
+    return int(fast) if shaped else -1
 
 
 def _key(a):
@@ -2696,12 +2713,13 @@ def _specs(keys):
 
 
 def _projection(t, mode, group_size, bits, dtype, k):
-    """N of one projection's (weight, scales[, biases]) with one fast-kernel weight per expert, else -1."""
+    """(N, MLX's one-row kernel) of one projection's (weight, scales[, biases]) with one weight per expert, else (-1, -1)."""
     if len(t) != (3 if mode == "affine" else 2) or any(a.ndim != 3 or a.shape[0] != t[0].shape[0] for a in t):
-        return -1
+        return -1, -1
     n = t[0].shape[-2]
     scales, biases = (list(t[1:]) + [None])[:2]
-    return n if _one_row_fast(mode, group_size, bits, dtype, k, n, t[0], scales, biases) else -1
+    fast = _one_row_kernel(mode, group_size, bits, dtype, k, n, t[0], scales, biases)
+    return (n, fast) if fast >= 0 else (-1, -1)
 
 
 def _launch(name, affine, dtype, quant, out_rows, per, projections, experts, shape, grid, threadgroup, k, n, top_k, routes):
@@ -2710,7 +2728,7 @@ def _launch(name, affine, dtype, quant, out_rows, per, projections, experts, sha
         return None
     scalars = [_scalar(k), _scalar(n), _scalar(top_k)]
     args = dict(
-        template = [("T", dtype), ("group_size", quant[0]), ("bits", quant[1]), ("out", out_rows)],
+        template = [("T", dtype), ("group_size", quant[0]), ("bits", quant[1]), ("out", out_rows), ("fast", quant[2])],
         grid = grid,
         threadgroup = threadgroup,
         output_shapes = [shape],
@@ -2743,16 +2761,16 @@ def _gate_up_plan(x, inds, gate, up, group_size, bits, mode):
     ):
         return None
     k = x.shape[-1]
-    n = _projection(gate, mode, group_size, bits, x.dtype, k)
+    n, fast = _projection(gate, mode, group_size, bits, x.dtype, k)
     if (n < 0 or n % (2 * _GATE_UP_ROWS) != 0
-            or _projection(up, mode, group_size, bits, x.dtype, k) != n
+            or _projection(up, mode, group_size, bits, x.dtype, k) != (n, fast)
             or gate[0].shape[0] != up[0].shape[0]):
         return None
     shape, routes = (*inds.shape, n), math.prod(inds.shape)
     if routes == 0:
         return shape, x.dtype
     return _launch(
-        "gate_up", mode == "affine", x.dtype, (group_size, bits), _GATE_UP_ROWS, len(gate), 2,
+        "gate_up", mode == "affine", x.dtype, (group_size, bits, fast), _GATE_UP_ROWS, len(gate), 2,
         gate[0].shape[0], shape, grid = (32 * n // (2 * _GATE_UP_ROWS), 2 * routes, 1),
         threadgroup = (32, 2, 1), k = k, n = n, top_k = inds.shape[-1], routes = routes,
     )
@@ -2779,7 +2797,7 @@ def _down_plan(x, inds, scores, shared, s, w, group_size, bits, mode):
     w = _specs(w)
     if x.ndim < 2 or inds.dtype not in _INDS or inds.shape != scores.shape:
         return None
-    n = _projection(w, mode, group_size, bits, x.dtype, x.shape[-1])
+    n, fast = _projection(w, mode, group_size, bits, x.dtype, x.shape[-1])
     if n < 0 or n % _DOWN_ROWS != 0 or not _combinable(x, scores, shared, s, n):
         return None
     routes, top_k = math.prod(inds.shape), scores.shape[-1]
@@ -2787,7 +2805,7 @@ def _down_plan(x, inds, scores, shared, s, w, group_size, bits, mode):
         return s.shape, x.dtype
     simds = min(top_k, _MAX_SIMDS)
     return _launch(
-        "down", mode == "affine", x.dtype, (group_size, bits), _DOWN_ROWS, len(w), 1, w[0].shape[0],
+        "down", mode == "affine", x.dtype, (group_size, bits, fast), _DOWN_ROWS, len(w), 1, w[0].shape[0],
         s.shape, grid = (32 * n // _DOWN_ROWS, simds * (routes // top_k), 1),
         threadgroup = (32, simds, 1), k = x.shape[-1], n = n, top_k = top_k, routes = routes,
     )
@@ -4001,9 +4019,22 @@ _EXACT_VERIFY_CONTRACT = {
         "supports_optimized_affine_head": "b0611c0de3000a20",
     },
 }
+# qwen4_exp runs its decode steps as well as its verify blocks on one batch-invariant forward, entered at
+# `__call__`, whose `_model` already submits each layer. It inherits the Qwen3.5 bodies pinned above.
+_QWEN4_FORWARD_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.language": {
+        "Qwen4ExpBatchInvariantForward.__call__": "d7a813b4f944d125",
+        "Qwen4ExpBatchInvariantForward._layer": "537ce3afba7c9732",
+    },
+}
+# (language module, its forward object, the forward's module and class, the entry that serves, wrap `_layer`)
+_QWEN3_5_VERIFIER = ("mlx_vlm.models.qwen3_5.language", "_EXACT_SPECULATIVE_VERIFIER",
+                     "mlx_vlm.models.qwen3_5.speculative_verifier", "Qwen3_5BatchInvariantForward", "verify", True)
+_QWEN4_FORWARD = ("mlx_vlm.models.qwen4_exp.language", "_QWEN4_BATCH_INVARIANT_FORWARD",
+                  "mlx_vlm.models.qwen4_exp.language", "Qwen4ExpBatchInvariantForward", "__call__", False)
 # mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
 _VERIFY_FUSED_ROWS = 8
-_VERIFY_METHODS = ("verify", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta")
+_VERIFY_METHODS = ("verify", "__call__", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta")
 _VERIFY_LOCK = RLock()
 _VERIFY_VERDICTS = {}
 # The verifier is one object per process: whether a call is served is kept per thread, not on it.
@@ -4150,15 +4181,17 @@ def _taped_transaction_class(base):
 
 
 @functools.cache
-def _exact_verify_class(base, *cache_key):
-    bindings = _resolved_bindings(_EXACT_VERIFY_CONTRACT)
+def _exact_verify_class(base, entry, submit_layers, *cache_key):
+    contract = _EXACT_VERIFY_CONTRACT if entry == "verify" else {**_EXACT_VERIFY_CONTRACT, **_QWEN4_FORWARD_CONTRACT}
+    bindings = _resolved_bindings(contract)
     eligible = getattr(sys.modules.get("mlx_vlm.models.quantized_verifier"), "_can_optimized_affine_linear", None)
     if bindings is None or eligible is None:
         return None
+    native_entry = getattr(base, entry)
     tape_bindings = _resolved_bindings(_VERIFY_TAPE_CONTRACT)
     gated_delta, kernels = vars(base).get("_gated_delta"), sys.modules.get("mlx_vlm.models.qwen3_5.gated_delta")
     taped = None
-    if (tape_bindings is not None and gated_delta is not None and kernels is not None
+    if (entry == "verify" and tape_bindings is not None and gated_delta is not None and kernels is not None
             and gated_delta.__globals__.get("gated_delta_update") is kernels.gated_delta_update):
         route = _taped_update(kernels.gated_delta_update, kernels.gated_delta_update_with_states)
         taped = FunctionType(gated_delta.__code__, {**gated_delta.__globals__, "gated_delta_update": route},
@@ -4178,6 +4211,15 @@ def _exact_verify_class(base, *cache_key):
             return output
         finally:
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer, outer_tapes
+
+    def entered(self, language_model, *args, **kwargs):
+        outer = getattr(_VERIFY_STATE, "serving", False)
+        _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
+                                     and not language_model.training and _bindings_intact(bindings))
+        try:
+            return native_entry(self, language_model, *args, **kwargs)
+        finally:
+            _VERIFY_STATE.serving = outer
 
     def taped_gated_delta(self, layer, inputs, mask, cache):
         if getattr(_VERIFY_STATE, "tapes", None) is None:
@@ -4209,12 +4251,15 @@ def _exact_verify_class(base, *cache_key):
 
         def routed():
             # The verifier's own routing, shared expert and shared gate; the routed kernels take every row at once.
-            gates = mx.softmax(self._linear(feed_forward.gate, x), axis = -1, precise = True)
-            indices = mx.argpartition(gates, kth = -feed_forward.top_k, axis = -1)[..., -feed_forward.top_k:]
-            scores = mx.take_along_axis(gates, indices, axis = -1)
-            scores = scores / scores.sum(axis = -1, keepdims = True)
+            logits, gate = self._linear(feed_forward.gate, x), self._linear(feed_forward.shared_expert_gate, x)
+            routing = _fused_moe_router_shared(logits, gate, feed_forward.top_k, True)
+            if routing is None:
+                gates = mx.softmax(logits, axis = -1, precise = True)
+                indices = mx.argpartition(gates, kth = -feed_forward.top_k, axis = -1)[..., -feed_forward.top_k:]
+                scores = mx.take_along_axis(gates, indices, axis = -1)
+                routing = indices, scores / scores.sum(axis = -1, keepdims = True), mx.sigmoid(gate)
+            indices, scores, scale = routing
             shared = self._feed_forward(feed_forward.shared_expert, x)
-            scale = mx.sigmoid(self._linear(feed_forward.shared_expert_gate, x))
             rows = (x.shape[0] * x.shape[1], 1, -1)
             out = experts(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale, shared)))
             return None if out is None else out.reshape(*x.shape[:2], -1)
@@ -4223,10 +4268,51 @@ def _exact_verify_class(base, *cache_key):
                *((p.weight.shape, p.bits, p.group_size, p.mode) for p in projections))
         return _verify_admitted(key, lambda: base._feed_forward(self, feed_forward, x), routed)
 
-    return type(f"_ScopedVerify{base.__name__}", (base,), {
-        "verify": verify, "_linear": sliced_linear, "_linears": sliced_linears, "_layer": submitted_layer,
-        "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base,
-        **({"_gated_delta": taped_gated_delta} if taped is not None else {})})
+    methods = {entry: verify if entry == "verify" else entered, "_linear": sliced_linear, "_linears": sliced_linears,
+               "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base}
+    if submit_layers:
+        methods["_layer"] = submitted_layer
+    if taped is not None:
+        methods["_gated_delta"] = taped_gated_delta
+    return type(f"_ScopedVerify{base.__name__}", (base,), methods)
+
+
+@contextmanager
+def _exact_forwards(model, forwards, modules):
+    """Serve each of `forwards` (as `_QWEN3_5_VERIFIER`) for the language models of `model` it belongs to."""
+    owners, verifiers = [], []
+    try:
+        with _VERIFY_LOCK:
+            usable = not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and mx.metal.is_available()
+            for language_name, target_name, native_module, native_name, entry, submit in forwards if usable else ():
+                language = sys.modules.get(language_name)
+                native = getattr(sys.modules.get(native_module), native_name, None)
+                call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
+                target = getattr(language, target_name, None)
+                if (call is None or native is None
+                        or getattr(type(target), "_unsloth_verify_native", type(target)) is not native):
+                    continue
+                # qwen3_5_moe inherits the call; a shared module is yielded once per path.
+                found = {id(module): module for _, module in _fusion_modules(model, modules)
+                         if getattr(type(module), "__call__", None) is call}
+                methods = [getattr(native, name, None) for name in _VERIFY_METHODS]
+                patched = _exact_verify_class(native, entry, submit, *methods) if found else None
+                if patched is not None:
+                    target.__class__ = patched
+                    target._unsloth_verify_scopes = getattr(target, "_unsloth_verify_scopes", 0) + 1
+                    verifiers.append(target)
+                    for module in found.values():
+                        module._unsloth_verify_scopes = getattr(module, "_unsloth_verify_scopes", 0) + 1
+                        owners.append(module)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for owner in owners + verifiers:
+                owner._unsloth_verify_scopes -= 1
+                if not owner._unsloth_verify_scopes:
+                    owner.__dict__.pop("_unsloth_verify_scopes", None)
+                    if any(owner is verifier for verifier in verifiers):
+                        owner.__class__ = type(owner)._unsloth_verify_native
 
 
 @contextmanager
@@ -4242,39 +4328,23 @@ def exact_speculative_verify(model, *, _modules = None):
     every per-step state bit for bit. Only verify calls of the language models found here are served; other,
     training and distributed models, and an mlx-vlm whose verifier drifted, keep the native methods.
     """
-    owners, verifier = [], None
-    try:
-        with _VERIFY_LOCK:
-            language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
-            native = getattr(sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier"),
-                             "Qwen3_5BatchInvariantForward", None)
-            call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
-            target = getattr(language, "_EXACT_SPECULATIVE_VERIFIER", None)
-            if (call is not None and native is not None
-                    and getattr(type(target), "_unsloth_verify_native", type(target)) is native
-                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
-                    and mx.metal.is_available()):
-                # qwen3_5_moe inherits the call; a shared module is yielded once per path.
-                found = {id(module): module for _, module in _fusion_modules(model, _modules)
-                         if getattr(type(module), "__call__", None) is call}
-                methods = [vars(native).get(name) for name in _VERIFY_METHODS]
-                patched = _exact_verify_class(native, *methods) if found else None
-                if patched is not None:
-                    target.__class__ = patched
-                    target._unsloth_verify_scopes = getattr(target, "_unsloth_verify_scopes", 0) + 1
-                    verifier = target
-                    for module in found.values():
-                        module._unsloth_verify_scopes = getattr(module, "_unsloth_verify_scopes", 0) + 1
-                        owners.append(module)
+    with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
         yield model
-    finally:
-        with _VERIFY_LOCK:
-            for owner in owners + ([verifier] if verifier is not None else []):
-                owner._unsloth_verify_scopes -= 1
-                if not owner._unsloth_verify_scopes:
-                    owner.__dict__.pop("_unsloth_verify_scopes", None)
-                    if owner is verifier:
-                        verifier.__class__ = type(verifier)._unsloth_verify_native
+
+
+@contextmanager
+def exact_batch_invariant_decode(model, *, _modules = None):
+    """Speed up the batch-invariant forward qwen4_exp runs its one-token decode steps and its speculative verify blocks
+    on, during serialized inference.
+
+    As `exact_speculative_verify` does for the Qwen3.5 verifier, frozen quantized projections in blocks wider than
+    eight rows run over balanced row slices and sparse blocks' routed experts run on the decode kernels, each once its
+    first call of that shape matched the native call bit for bit. The forward already submits each layer. Only calls
+    of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
+    forward drifted, keep the native methods.
+    """
+    with _exact_forwards(model, (_QWEN4_FORWARD,), _modules):
+        yield model
 
 
 # MLX's sdpa_vector_2pass_1/2 (mlx/backend/metal/kernels/sdpa_vector.h, Copyright © 2024 Apple Inc., MIT),
@@ -4808,6 +4878,8 @@ INFERENCE_SCOPES = [
     InferenceScope(fused_qsa_attention),
     InferenceScope(fast_qsa_prefill),
     InferenceScope(fused_residual_norm_handoff),
+    # qwen4_exp decodes on the forward its verify blocks run on, so every generation holds this one.
+    InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
 ]
