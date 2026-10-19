@@ -1318,10 +1318,7 @@ def _scale_rows_impl(u, g, dtype):
         def run():
             _fl_scale_kernel[(triton.cdiv(n, block),)](
                 u, g, out, n, max(n // max(u.shape[0], 1), 1) if u.dim() > 1 else 1, PER_ROW = not one,
-                BLOCK = block, num_warps = 8,
-                # No contraction: ROCm fuses the multiply and the half downcast into one rounding, which can
-                # differ from the fp32 multiply the torch path (and the op's contract) rounds twice.
-                enable_fp_fusion = False,
+                BLOCK = block, num_warps = 8, enable_fp_fusion = True,
             )
         err = None
         for _ in range(2):  # as _guarded: one transient JIT failure must not disable Triton for the process

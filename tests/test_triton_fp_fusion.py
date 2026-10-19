@@ -37,7 +37,6 @@ _NOT_LAUNCHES = {
 # Launches that deliberately disable contraction to match an eager reference bit for bit.
 _DELIBERATE_FALSE = {
     "merged_rollout_exact.py:_exact_merge_kernel",
-    "fused_losses/fused_linear.py:_fl_scale_kernel",
     "temporary_patches/gpt_oss_grouped_qlora.py:_nf4_dequant_stack_kernel",
     "temporary_patches/moe_routed.py:_nf4_select_dequant_kernel",
     "temporary_patches/moe_triton_kernels.py:kernel",

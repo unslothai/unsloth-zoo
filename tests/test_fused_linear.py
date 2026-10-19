@@ -17,6 +17,7 @@
 """Fused linear CE / log-probs (torch.library ops, Triton row kernels on GPU) against an fp64 oracle, the chunked CE
 it replaces, and torch.compile(fullgraph=True)."""
 
+import numpy
 import pytest
 import torch
 
@@ -136,9 +137,15 @@ def test_ce_incoming_gradient_scales_in_fp32(device):
         loss = fused_linear_cross_entropy(h, w, b, t, divisor = 50)
         go = torch.tensor(0.37, device = device)
         scaled = torch.autograd.grad(loss, (h, w, b), go)
+        g32 = torch.tensor(0.37, dtype = torch.float32)
         for x, y in zip(scaled, base):
-            want = (y.float() * torch.tensor(0.37, dtype = torch.float32, device = device)).to(dtype)
-            assert torch.equal(x, want), f"{dtype}: incoming gradient not applied in fp32"
+            want = (y.float() * g32.to(device)).to(dtype)
+            # ROCm rounds the exact product once (a tie of the fp32 product can land 1 ulp the other way); numpy
+            # rounds float64 -> float16 directly, torch goes through float32.
+            exact = y.double().cpu() * g32.double()
+            once = torch.from_numpy(exact.numpy().astype(numpy.float16)).to(device = device).to(dtype) \
+                if dtype == torch.float16 else exact.to(dtype).to(device)
+            assert ((x == want) | (x == once)).all(), f"{dtype}: incoming gradient not applied in fp32"
 
 
 def test_ce_all_masked_and_no_grad():
