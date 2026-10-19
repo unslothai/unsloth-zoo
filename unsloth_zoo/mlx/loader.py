@@ -158,7 +158,7 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) else v,
         model.parameters(),
     ))
-    mx.eval(model.parameters())
+    mx.eval(_resident_parameters(model))
 
 
 def _keep_norm_parameters_float32(model) -> None:
@@ -8646,6 +8646,16 @@ def _coerce_list_extra_special_tokens():
 _LAZY_WEIGHTS_ENV = "UNSLOTH_MLX_LAZY_WEIGHTS"
 
 
+def _resident_parameters(model):
+    """``model``'s parameters but the tables mlx-vlm reads row by row from disk (DeepSeek V4.1's Engram)."""
+    from mlx.utils import tree_flatten
+
+    mapped = tuple(path + "." for path, module in model.named_modules() if type(module).__name__ == "OffloadedEngramEmbedding")
+    if not mapped:
+        return model.parameters()
+    return [value for name, value in tree_flatten(model.parameters()) if not name.startswith(mapped)]
+
+
 def _materialize_weights(model):
     """Left mapped, the first GPU kernel to touch a weight can stall long enough for
     Apple's watchdog to kill the process's queue."""
@@ -8654,7 +8664,7 @@ def _materialize_weights(model):
     import mlx.core as mx
 
     try:
-        mx.eval(model.parameters())
+        mx.eval(_resident_parameters(model))
     except Exception as error:
         # Not fatal: the weights stay lazy, as before.
         print(f"Unsloth: Could not read {type(model).__name__} weights at load time: {error}")

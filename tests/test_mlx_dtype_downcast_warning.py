@@ -38,6 +38,8 @@ class _FakeModel:
     def update(self, new_params):
         self._params = new_params
 
+    named_modules = lambda self: []
+
 
 def _make_model(dtype_map):
     return _FakeModel({name: _FakeArray(dt) for name, dt in dtype_map.items()})

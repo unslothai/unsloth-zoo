@@ -15,7 +15,7 @@ import sys
 
 import mlx.nn as nn
 from mlx.utils import tree_flatten
-from unsloth_zoo.mlx.loader import _MLXQuantizationSpec, _apply_mlx_quantization, _finish_load
+from unsloth_zoo.mlx.loader import _MLXQuantizationSpec, _apply_mlx_quantization, _convert_mlx_dtype, _finish_load
 
 _SIDES = (2048, 1024, 512)
 _BYTES = sum(side * side * 4 for side in _SIDES)
@@ -78,6 +78,14 @@ def test_finish_load_returns_resident_weights(tmp_path):
     returned, tokenizer = _finish_load(model, "tokenizer")
     assert (returned, tokenizer) == (model, "tokenizer")
     assert mx.get_active_memory() - before >= _BYTES
+
+
+def test_tables_mlx_vlm_reads_from_disk_stay_there(tmp_path):  # as it exposes DeepSeek V4.1's Engram
+    model, before = _lazy_model(tmp_path), mx.get_active_memory()
+    for layer in model.layers[:2]:  # V4.1 has two
+        layer.__class__ = type("OffloadedEngramEmbedding", (nn.Linear,), {})
+    _finish_load(_convert_mlx_dtype(model, mx.bfloat16) or model, None)
+    assert 0 < mx.get_active_memory() - before < _SIDES[1] ** 2 * 2
 
 
 def test_lazy_weights_env_leaves_the_load_lazy(tmp_path, monkeypatch):
