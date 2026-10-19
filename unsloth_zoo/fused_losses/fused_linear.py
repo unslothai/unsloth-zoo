@@ -542,7 +542,9 @@ def _tiled_vocab(V):
 
 
 def _block_top_shape(N, V, device, compute_dtype, recompute):
-    # Static (the fake uses it): the forward returns [N, groups] whenever the exact-top backward may run.
+    # Static (the fake uses it): the forward returns [N, groups] whenever the exact-top backward may run. Trainable
+    # heads only: on B200 the group tops cost a frozen head's entropy-gradient pass +4% device time (G4 -3%, A100
+    # -1%, L4 tie), so that path keeps fp32 recompute logits.
     if not (recompute and _BWD_EXACT_TOP and _RECOMPUTE_FP32 and _TRITON and _HAS_TRITON and not _IS_HIP
             and device.type == "cuda" and compute_dtype in _HALF and _tiled_vocab(V)):
         return (0,)
@@ -1029,7 +1031,7 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
 
 @_guarded
 def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
-                   want_ent, want_mean, want_lssp, want_top1, want_u, rows, tiled = False):
+                   want_ent, want_mean, want_lssp, want_top1, want_u, rows, tiled = False, head_grad = False):
     device = weight.device
     N, H = hidden.shape
     V = weight.shape[0]
@@ -1047,7 +1049,8 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
     u_dtype = _u_dtype(hidden.dtype)
     u = torch.zeros((N, H), device = device, dtype = u_dtype) if want_u else hidden.new_empty(0)
     # Left unwritten unless _block_top_live: the backward reads it under the same condition only.
-    block_top = torch.empty(_block_top_shape(N, V, device, compute_dtype, tiled), device = device, dtype = torch.float32)
+    block_top = torch.empty(_block_top_shape(N, V, device, compute_dtype, tiled and head_grad), device = device,
+                            dtype = torch.float32)
     inv_t, scale, cap = _scalars(temperature, mul, div, cap)
     if n_keep > 0:
         fp32_logits, exact_mode = _logits_mode(device, compute_dtype)
@@ -1356,7 +1359,7 @@ if _OPS is None:
         CALLS["logprobs"] += 1
         return _OPS["lp_impl"](hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
                                want_ent, want_mean, want_lssp, want_top1, want_u, rows,
-                               (need_h or need_w or need_b) and not want_u)
+                               (need_h or need_w or need_b) and not want_u, need_w)
 
     @_lp_op.register_fake
     def _lp_fake(hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
@@ -1375,7 +1378,7 @@ if _OPS is None:
             else hidden.new_empty(0),
             torch.empty(N, **f32),
             torch.empty(_block_top_shape(N, weight.shape[0], weight.device, compute_dtype,
-                                         (need_h or need_w or need_b) and not want_u), **f32),
+                                         (need_h or need_w or need_b) and not want_u and need_w), **f32),
         )
 
     def _lp_setup(ctx, inputs, output):

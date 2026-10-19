@@ -1080,3 +1080,21 @@ def test_opcheck_exact_top_outputs():
         (h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, dtype, True, False, False, False, False, True, True, True, 0),
         test_utils = ("test_faketensor",),
     )
+
+
+@CUDA
+def test_frozen_head_entropy_gradient_keeps_fp32_recompute():
+    # Exact-top is for trainable heads; the frozen entropy-gradient backward stays on fp32 recompute logits.
+    if not fl._HAS_TRITON:
+        pytest.skip("needs Triton")
+    dtype = torch.bfloat16 if _half_ok("cuda") else torch.float16
+    h, w, t = _peaked("cuda", dtype, 64, 64, 40000)
+    h.requires_grad_(True)
+    tiled, exact = fl.CALLS["tiled"], fl.CALLS["exact_top"]
+    lp, ent = fused_linear_logprobs(h, w, t, return_entropy = True)
+    (lp.sum() + ent.sum()).backward()
+    assert fl.CALLS["tiled"] == tiled + 1 and fl.CALLS["exact_top"] == exact
+    w.requires_grad_(True)
+    lp, ent = fused_linear_logprobs(h, w, t, return_entropy = True)
+    (lp.sum() + ent.sum()).backward()
+    assert fl.CALLS["exact_top"] > exact
