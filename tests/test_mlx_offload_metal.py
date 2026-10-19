@@ -547,6 +547,13 @@ def test_auto_offload(tmp_path, monkeypatch):
     with pytest.warns(UserWarning, match = "cannot be priced. .*'auto' stay off"):
         assert _auto_offload(model, str(tmp_path), 0.5, "auto", 4096, mx.bfloat16) == (0.5, None, None)
 
+    # A caller's own plan decides "auto" in place of the rule, with the downloaded checkpoint.
+    monkeypatch.setattr(offload_plan, "plan_offload", None)
+    asked = []
+    fresh = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    _apply_offload(fresh, str(tmp_path), "auto", "auto", None, 4096, lambda *a: asked.append(a) or (None, 0.75))
+    assert asked == [(str(tmp_path), "auto", "auto")] and set(fresh._unsloth_offload) == {"experts"}
+
     assert _settle_offload("auto", 0.5, False, "refused") == ("auto", 0.5)
     assert _settle_offload("auto", None, True, "refused") == (None, None)
     with pytest.raises(ValueError, match = "refused"):

@@ -258,13 +258,17 @@ def _auto_offload(model, model_dir, ple_offload, expert_offload, max_seq_length,
     return (*resolved, plan)
 
 
-def _apply_offload(model, model_dir, ple_offload, expert_offload, target_dtype, max_seq_length) -> None:
+def _apply_offload(
+    model, model_dir, ple_offload, expert_offload, target_dtype, max_seq_length, offload_plan=None,
+) -> None:
     """Swap the still-lazy PLE tables and routed experts for ones read from ``model_dir``'s shards."""
     from .offload import offload_experts, offload_ple
 
     if not model_dir:
         raise ValueError("Unsloth: offloading weights needs a local copy of the checkpoint.")
-    if "auto" in (ple_offload, expert_offload):
+    if "auto" in (ple_offload, expert_offload) and offload_plan is not None:
+        ple_offload, expert_offload = offload_plan(model_dir, ple_offload, expert_offload)
+    elif "auto" in (ple_offload, expert_offload):
         ple_offload, expert_offload, model._unsloth_offload_plan = _auto_offload(
             model, model_dir, ple_offload, expert_offload, max_seq_length, target_dtype,
         )
@@ -8883,6 +8887,7 @@ class FastMLXModel:
         tensor_group=None,
         ple_offload=None,
         expert_offload=None,
+        offload_plan=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -8925,6 +8930,11 @@ class FastMLXModel:
                 for each offload it turns on; it turns off where offloading
                 cannot apply (adapters, runtime quantization, training,
                 distributed loads) instead of refusing.
+            offload_plan: Optional callable deciding the ``"auto"`` knobs in place
+                of the rule above, for a caller that prices loads its own way:
+                ``offload_plan(model_dir, ple_offload, expert_offload)`` with the
+                downloaded checkpoint, before any weight is read, returns the
+                ``(ple_offload, expert_offload)`` fractions (``None`` for off).
 
         Reloading a saved LoRA/DoRA adapter directory returns a model whose
         base is frozen and whose adapter parameters are trainable, so it can be
@@ -9904,7 +9914,7 @@ class FastMLXModel:
                 if ple_offload is not None or expert_offload is not None:
                     _apply_offload(
                         model, original_local_path or local_path,
-                        ple_offload, expert_offload, target_dtype, max_seq_length,
+                        ple_offload, expert_offload, target_dtype, max_seq_length, offload_plan,
                     )
 
             processor = _run_with_vlm_config_view(
@@ -10080,7 +10090,7 @@ class FastMLXModel:
                 if ple_offload is not None or expert_offload is not None:
                     _apply_offload(
                         model, original_local_path or local_path,
-                        ple_offload, expert_offload, target_dtype, max_seq_length,
+                        ple_offload, expert_offload, target_dtype, max_seq_length, offload_plan,
                     )
 
             if want_runtime_quant:
