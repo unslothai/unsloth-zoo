@@ -486,7 +486,7 @@ def test_opcheck():
     )
     mask = t != -100
     torch.library.opcheck(
-        torch.ops.unsloth_zoo.fused_linear_logprobs.default,
+        getattr(torch.ops.unsloth_zoo, fl._LP_OP).default,
         (h, w, b, t.clamp(min = 0), mask, 0.8, 0.0, 0.0, 0.0, torch.float32, True, True, True, True, False,
          True, True, True, 4),
     )
@@ -626,14 +626,14 @@ def test_opcheck_with_disabled_outputs():
         test_utils = ("test_faketensor",),
     )
     torch.library.opcheck(
-        torch.ops.unsloth_zoo.fused_linear_logprobs.default,
+        getattr(torch.ops.unsloth_zoo, fl._LP_OP).default,
         (h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, torch.float32, False, False, False, False, True,
          True, False, False, 4),
         test_utils = ("test_faketensor",),
     )
     n = h.shape[0]
     torch.library.opcheck(
-        torch.ops.unsloth_zoo.fused_linear_logprobs_bwd.default,
+        getattr(torch.ops.unsloth_zoo, fl._LP_BWD_OP).default,
         (h, w, b, t, None, torch.zeros(n), torch.empty(0), torch.ones(n), torch.empty(0), torch.empty(0), 1.0, 0.0,
          0.0, 0.0, torch.float32, True, False, False, 4),
         test_utils = ("test_faketensor",),
@@ -909,7 +909,7 @@ def test_trainable_head_long_context_backward(device):
         _close(x, y, _tol(torch.float32), name)
 
 
-@CUDA
+@TRITON
 def test_trainable_head_long_context_skips_the_rows_accumulator():
     N, H, V = 16384, 256, 128
     h, w, _, t = _make("cuda", torch.float32, N, H, V, train_head = True)
@@ -1082,11 +1082,11 @@ def test_opcheck_exact_top_outputs():
         pytest.skip("needs Triton")
     dtype = torch.bfloat16 if _half_ok("cuda") else torch.float16
     h, w, b, t = _make("cuda", dtype, 40, 16, 40000, train_head = True, with_bias = True)
-    out = torch.ops.unsloth_zoo.fused_linear_logprobs.default(
+    out = getattr(torch.ops.unsloth_zoo, fl._LP_OP).default(
         h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, dtype, True, False, False, False, False, True, True, True, 0)
     assert out[7].shape == fl._block_top_shape(40, 40000, h.device, dtype, True) and out[7].numel() > 0
     torch.library.opcheck(
-        torch.ops.unsloth_zoo.fused_linear_logprobs.default,
+        getattr(torch.ops.unsloth_zoo, fl._LP_OP).default,
         (h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, dtype, True, False, False, False, False, True, True, True, 0),
         test_utils = ("test_faketensor",),
     )

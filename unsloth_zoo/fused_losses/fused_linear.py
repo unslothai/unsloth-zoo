@@ -92,6 +92,10 @@ _BWD_TILE_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_TILE_MB", 8 if _H
 _HALF = (torch.float16, torch.bfloat16)
 # ROCm's half-in / fp32-out GEMM is a slow fallback (6-14x).
 _IS_HIP = torch.version.hip is not None
+# Op names carry a schema version: Inductor's FX graph / AOTAutograd caches do not key on a custom op's schema, so a
+# warm cache would replay calls with the old arguments after a change. Bump the suffix whenever an op's schema changes.
+_LP_OP = "fused_linear_logprobs_v2"
+_LP_BWD_OP = "fused_linear_logprobs_bwd_v2"
 
 CALLS = {"ce": 0, "logprobs": 0, "logprobs_bwd": 0, "triton": 0, "torch": 0, "tiled": 0, "exact_top": 0,
          "bwd_single": 0}
@@ -1348,7 +1352,7 @@ if _OPS is None:
 
     _ce_op.register_autograd(_ce_backward, setup_context = _ce_setup)
 
-    @custom_op("unsloth_zoo::fused_linear_logprobs", mutates_args = ())
+    @custom_op(f"unsloth_zoo::{_LP_OP}", mutates_args = ())
     def _lp_op(
         hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], targets: torch.Tensor,
         mask: Optional[torch.Tensor], temperature: float, mul: float, div: float, cap: float,
@@ -1412,7 +1416,7 @@ if _OPS is None:
         g = g_logps.float() if g_logps is not None else torch.zeros_like(lse)
         ge = g_ent.float() if (g_ent is not None and ent.numel() > 0) else lse.new_empty(0)
         temperature, mul, div, cap, compute_dtype, rows = ctx.args
-        gh, gw, gb = torch.ops.unsloth_zoo.fused_linear_logprobs_bwd(
+        gh, gw, gb = getattr(torch.ops.unsloth_zoo, _LP_BWD_OP)(
             hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul, div, cap, compute_dtype,
             need_h, need_w, need_b, rows,
         )
@@ -1420,7 +1424,7 @@ if _OPS is None:
 
     _lp_op.register_autograd(_lp_backward, setup_context = _lp_setup)
 
-    @custom_op("unsloth_zoo::fused_linear_logprobs_bwd", mutates_args = ())
+    @custom_op(f"unsloth_zoo::{_LP_BWD_OP}", mutates_args = ())
     def _lp_bwd_op(
         hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], targets: torch.Tensor,
         mask: Optional[torch.Tensor], lse: torch.Tensor, ent: torch.Tensor, g: torch.Tensor, ge: torch.Tensor,
@@ -1615,7 +1619,7 @@ def fused_linear_logprobs(
     bias = _head_bias(bias, weight)
     ent_grad = bool(return_entropy) and bool(entropy_requires_grad)
     want_u = _FORWARD_GRAD and need_h and not need_w and not need_b and not ent_grad
-    logps, ent, mean, lssp, top1, u, lse, _ = torch.ops.unsloth_zoo.fused_linear_logprobs(
+    logps, ent, mean, lssp, top1, u, lse, _ = getattr(torch.ops.unsloth_zoo, _LP_OP)(
         hidden2, weight, bias, targets2, mask2, float(temperature),
         float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
         _compute_dtype(hidden, weight), bool(return_entropy), bool(return_mean_logits),
