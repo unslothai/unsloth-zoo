@@ -161,39 +161,49 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     mx.eval(model.parameters())
 
 
-def _apply_ple_offload(model, model_dir, fraction, target_dtype) -> None:
-    """Swap the still-lazy PLE tables for ones read from ``model_dir``'s shards."""
-    from .offload import offload_ple
+def _apply_offload(model, model_dir, ple_offload, expert_offload, target_dtype) -> None:
+    """Swap the still-lazy PLE tables and routed experts for ones read from ``model_dir``'s shards."""
+    from .offload import offload_experts, offload_ple
 
     if not model_dir:
-        raise ValueError("Unsloth: ple_offload needs a local copy of the checkpoint.")
-    report = offload_ple(model, model_dir, fraction, cast_dtype=target_dtype)
-    for path, reason in report["skipped"]:
-        warnings.warn(f"Unsloth: kept the PLE table {path} in memory: {reason}.", stacklevel=3)
-    if not report["tables"]:
-        if not report["skipped"]:
-            warnings.warn("Unsloth: ple_offload is set, but this model has no PLE table.", stacklevel=3)
-        return
-    print(
-        f"Unsloth: PLE offload reads {report['on_disk_bytes'] / 2**30:.2f} GiB from the checkpoint "
-        f"on demand and holds {report['resident_bytes'] / 2**30:.2f} GiB in memory."
-    )
-    model._unsloth_offload = {"ple": report}
+        raise ValueError("Unsloth: offloading weights needs a local copy of the checkpoint.")
+    reports = {}
+    for key, fraction, offload, count, what, label in (
+        ("ple", ple_offload, offload_ple, "tables", "PLE table", "PLE"),
+        ("experts", expert_offload, offload_experts, "layers", "quantized MoE experts", "Expert"),
+    ):
+        if fraction is None:
+            continue
+        report = offload(model, model_dir, fraction, cast_dtype=target_dtype)
+        for path, reason in report["skipped"]:
+            warnings.warn(f"Unsloth: kept the {what} at {path} in memory: {reason}.", stacklevel=3)
+        if not report[count]:
+            if not report["skipped"]:
+                warnings.warn(f"Unsloth: {label.lower()}_offload is set, but this model has no {what}.", stacklevel=3)
+            continue
+        print(
+            f"Unsloth: {label} offload reads {report['on_disk_bytes'] / 2**30:.2f} GiB from the "
+            f"checkpoint on demand and holds {report['resident_bytes'] / 2**30:.2f} GiB in memory."
+        )
+        reports[key] = report
+    if reports:
+        model._unsloth_offload = reports
 
 
-def _refuse_ple_offload_runtime_quant(ple_offload, want_runtime_quant) -> None:
-    if ple_offload is not None and want_runtime_quant:
+def _refuse_offload_runtime_quant(offloading, want_runtime_quant) -> None:
+    if offloading and want_runtime_quant:
         raise ValueError(
-            "Unsloth: ple_offload reads the checkpoint's tables as stored, so it cannot be "
-            "combined with runtime quantization. Load the checkpoint in its own quantization."
+            "Unsloth: ple_offload and expert_offload read the checkpoint's tensors as stored, so "
+            "they cannot be combined with runtime quantization. Load the checkpoint in its own "
+            "quantization."
         )
 
 
 def _refuse_offloaded(model, action) -> None:
     if getattr(model, "_unsloth_offload", None):
         raise ValueError(
-            f"Unsloth: this model was loaded with ple_offload, which is for inference only; "
-            f"{action} needs the model loaded without offload."
+            f"Unsloth: this model was loaded with ple_offload or expert_offload, which are for "
+            f"inference only; {action} needs the model loaded without offload."
         )
 
 
@@ -8772,6 +8782,7 @@ class FastMLXModel:
         pipeline_group=None,
         tensor_group=None,
         ple_offload=None,
+        expert_offload=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -8804,6 +8815,11 @@ class FastMLXModel:
                 each per-layer embedding (PLE) table to leave in the
                 checkpoint's safetensors and read by row on lookup. Inference
                 only; the rest of the table stays in memory.
+            expert_offload: ``"off"`` / ``None`` (default), or the fraction of
+                each quantized MoE layer's experts to leave in the checkpoint's
+                safetensors; the rest is held in slots that experts are read
+                into as tokens route to them (at least ``max(8, top_k)``).
+                Inference only.
 
         Reloading a saved LoRA/DoRA adapter directory returns a model whose
         base is frozen and whose adapter parameters are trainable, so it can be
@@ -8821,12 +8837,14 @@ class FastMLXModel:
         _mlx_active_distributed_groups(pipeline_group, tensor_group)
         from .offload import offload_fraction
         ple_offload = offload_fraction("ple_offload", ple_offload)
-        if ple_offload is not None and (
+        expert_offload = offload_fraction("expert_offload", expert_offload)
+        offloading = ple_offload is not None or expert_offload is not None
+        if offloading and (
             full_finetuning or _mlx_distributed_requested(pipeline_group, tensor_group)
         ):
             raise ValueError(
-                "Unsloth: ple_offload is for single-process inference and cannot be "
-                "combined with full_finetuning or distributed loading."
+                "Unsloth: ple_offload and expert_offload are for single-process inference and "
+                "cannot be combined with full_finetuning or distributed loading."
             )
 
         model_name, revision, _bnb_remapped_from = _remap_unsloth_bnb_hub_id_for_mlx(
@@ -9014,10 +9032,11 @@ class FastMLXModel:
             and isinstance(_existing_quant, dict)
             and _existing_quant.get("quant_method") == "bitsandbytes"
         )
-        if ple_offload is not None and (_is_adapter_dir or _is_bnb_checkpoint):
+        if offloading and (_is_adapter_dir or _is_bnb_checkpoint):
             raise ValueError(
-                "Unsloth: ple_offload reads an MLX checkpoint's own safetensors, so it "
-                "cannot be used with a LoRA adapter directory or a bitsandbytes checkpoint."
+                "Unsloth: ple_offload and expert_offload read an MLX checkpoint's own "
+                "safetensors, so they cannot be used with a LoRA adapter directory or a "
+                "bitsandbytes checkpoint."
             )
         if _is_bnb_checkpoint:
             _suggested = re.sub(
@@ -9672,7 +9691,7 @@ class FastMLXModel:
                     "using existing compatible MLX quantization.",
                     stacklevel=2,
                 )
-            _refuse_ple_offload_runtime_quant(ple_offload, want_runtime_quant)
+            _refuse_offload_runtime_quant(offloading, want_runtime_quant)
 
             if want_runtime_quant:
                 import mlx.core as mx
@@ -9777,9 +9796,10 @@ class FastMLXModel:
                     vlm_kwargs,
                     hf_token=token,
                 )
-                if ple_offload is not None:
-                    _apply_ple_offload(
-                        model, original_local_path or local_path, ple_offload, target_dtype,
+                if offloading:
+                    _apply_offload(
+                        model, original_local_path or local_path,
+                        ple_offload, expert_offload, target_dtype,
                     )
 
             processor = _run_with_vlm_config_view(
@@ -9909,7 +9929,7 @@ class FastMLXModel:
                 want_runtime_quant=want_runtime_quant,
             )
 
-            _refuse_ple_offload_runtime_quant(ple_offload, want_runtime_quant)
+            _refuse_offload_runtime_quant(offloading, want_runtime_quant)
             if want_runtime_quant:
                 print(
                     f"Unsloth: Loading {model_name} via mlx-lm "
@@ -9950,9 +9970,10 @@ class FastMLXModel:
                     mlx_load_kwargs,
                     hf_token=token,
                 )
-                if ple_offload is not None:
-                    _apply_ple_offload(
-                        model, original_local_path or local_path, ple_offload, target_dtype,
+                if offloading:
+                    _apply_offload(
+                        model, original_local_path or local_path,
+                        ple_offload, expert_offload, target_dtype,
                     )
 
             if want_runtime_quant:

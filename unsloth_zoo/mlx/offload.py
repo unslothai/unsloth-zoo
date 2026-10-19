@@ -19,9 +19,12 @@
 Per-layer embedding (PLE) tables -- Qwen4-Exp's 128-shard n-gram table, Gemma's per-layer token
 embeddings -- are large, and a call reads a few of their rows. ``offload_ple`` replaces them,
 before the load evaluates anything, with tables that read the rows a call asks for straight from
-the shards, so the offloaded bytes are never loaded. Nothing is converted or written to disk.
+the shards. ``offload_experts`` does the same for the routed experts of quantized MoE layers, read
+into a fixed number of slots as calls route to them. The offloaded bytes are never loaded, and
+nothing is converted or written to disk.
 """
 
+import copy
 import glob
 import json
 import os
@@ -33,7 +36,15 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-__all__ = ["CheckpointTensors", "DiskEmbedding", "offload_fraction", "offload_ple", "read_ranges"]
+__all__ = [
+    "CheckpointTensors",
+    "DiskEmbedding",
+    "OffloadSwitchGLU",
+    "offload_experts",
+    "offload_fraction",
+    "offload_ple",
+    "read_ranges",
+]
 
 # safetensors dtype -> (numpy transport dtype, mlx dtype)
 _DTYPES = {
@@ -137,14 +148,22 @@ def offload_fraction(name, value):
 
 
 class _Field:
-    __slots__ = ("name", "fd", "offset", "row_bytes", "transport", "dtype", "width", "cast", "map")
+    """One checkpoint tensor, read by its leading index (a table row or an expert)."""
 
-    def __init__(self, name, fd, offset, row_bytes, transport, dtype, width, cast, map):
-        self.name, self.fd, self.offset, self.row_bytes = name, fd, offset, row_bytes
-        self.transport, self.dtype, self.width, self.cast, self.map = transport, dtype, width, cast, map
+    __slots__ = ("name", "fd", "offset", "row_bytes", "transport", "dtype", "shape", "cast", "map")
+
+    def __init__(self, store, name, tensor, cast, mapped = False):
+        path, dtype, shape, offset = store.specs[tensor]
+        self.transport, self.dtype = _DTYPES[dtype]
+        self.name, self.fd, self.offset, self.cast = name, store.fd(path), offset, cast
+        self.shape = tuple(shape[1:])
+        self.row_bytes = int(np.prod(self.shape)) * np.dtype(self.transport).itemsize
+        self.map = None
+        if mapped:
+            self.map = np.memmap(path, dtype = np.uint8, mode = "r", offset = offset, shape = (shape[0], self.row_bytes))
 
     def to_mx(self, buffer):
-        array = mx.array(buffer.view(self.transport).reshape(-1, self.width))
+        array = mx.array(buffer.view(self.transport).reshape(-1, *self.shape))
         if array.dtype != self.dtype:
             array = array.view(self.dtype)  # bf16 travels as uint16
         return array if self.cast is None else array.astype(self.cast)
@@ -161,17 +180,11 @@ class _RowTable:
         self.fields = []
         rows = None
         for field, name in names.items():
-            path, dtype, shape, offset = store.specs[name]
+            shape = store.specs[name][2]
             if rows is not None and shape[0] != rows:
                 raise ValueError(f"{name} has {shape[0]} rows, its table {rows}")
             rows = shape[0]
-            transport, mx_dtype = _DTYPES[dtype]
-            width = int(np.prod(shape[1:]))
-            row_bytes = width * np.dtype(transport).itemsize
-            self.fields.append(_Field(
-                field, store.fd(path), offset, row_bytes, transport, mx_dtype, width, casts.get(field),
-                np.memmap(path, dtype = np.uint8, mode = "r", offset = offset, shape = (rows, row_bytes)),
-            ))
+            self.fields.append(_Field(store, field, name, casts.get(field), mapped = True))
         self.rows = rows
         self.seen = np.zeros((rows + 7) // 8, dtype = np.uint8)
         self.resident = min(int(resident), rows)
@@ -330,6 +343,32 @@ def _quantization_of(module):
     return (module.group_size, module.bits, module.mode)
 
 
+def _checkpoint_tensor(store, parameter, expected):
+    """``(name, None)`` when the checkpoint stores ``parameter`` as the model holds it, else ``(None, reason)``."""
+    name = _checkpoint_name(store, parameter)
+    if name is None:
+        return None, f"the checkpoint has no tensor for {parameter}"
+    _, dtype, shape, _ = store.specs[name]
+    if dtype not in _DTYPES or shape != tuple(expected.shape) or _DTYPES[dtype][1] != expected.dtype:
+        return None, (
+            f"{name} is {dtype} {list(shape)} in the checkpoint, "
+            f"{expected.dtype} {list(expected.shape)} in the model"
+        )
+    return name, None
+
+
+def _cast_rule(model, cast_dtype):
+    """The cast the load gives a float parameter: ``cast_dtype`` under the model's ``cast_predicate``."""
+    cast_predicate = getattr(model, "cast_predicate", lambda _: True)
+
+    def cast_for(parameter, dtype):
+        if cast_dtype is None or not mx.issubdtype(dtype, mx.floating) or dtype == cast_dtype:
+            return None
+        return cast_dtype if cast_predicate(parameter) else None
+
+    return cast_for
+
+
 def _table_for(store, module, path, fraction, cast_for):
     """A ``_RowTable`` over ``module``'s tensors, or the reason they cannot be read from the checkpoint."""
     fields = ["weight"]
@@ -338,18 +377,11 @@ def _table_for(store, module, path, fraction, cast_for):
     names, casts = {}, {}
     for field in fields:
         parameter = f"{path}.{field}"
-        name = _checkpoint_name(store, parameter)
-        if name is None:
-            return None, f"the checkpoint has no tensor for {parameter}"
-        _, dtype, shape, _ = store.specs[name]
-        expected = module[field]
-        if dtype not in _DTYPES or shape != tuple(expected.shape) or _DTYPES[dtype][1] != expected.dtype:
-            return None, (
-                f"{name} is {dtype} {list(shape)} in the checkpoint, "
-                f"{expected.dtype} {list(expected.shape)} in the model"
-            )
+        name, reason = _checkpoint_tensor(store, parameter, module[field])
+        if reason is not None:
+            return None, reason
         names[field] = name
-        casts[field] = cast_for(parameter, expected.dtype)
+        casts[field] = cast_for(parameter, module[field].dtype)
     resident = int(module["weight"].shape[0] * (1 - fraction))
     return _RowTable(store, names, resident, casts), None
 
@@ -360,13 +392,7 @@ def offload_ple(model, model_dir, fraction, *, cast_dtype = None):
     tables. ``cast_dtype`` is the float dtype the load casts parameters to; offloaded float tensors
     get the cast they would have had as parameters.
     Returns ``{"tables", "on_disk_bytes", "resident_bytes", "skipped": [(path, reason)]}``."""
-    cast_predicate = getattr(model, "cast_predicate", lambda _: True)
-
-    def cast_for(parameter, dtype):
-        if cast_dtype is None or not mx.issubdtype(dtype, mx.floating) or dtype == cast_dtype:
-            return None
-        return cast_dtype if cast_predicate(parameter) else None
-
+    cast_for = _cast_rule(model, cast_dtype)
     store = CheckpointTensors(model_dir)
     report = {"tables": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}
     for path, module in list(ple_sites(model)):
@@ -405,3 +431,379 @@ def _replace_module(model, path, replacement):
     for key in keys[:-1]:
         parent = parent[int(key)] if isinstance(parent, list) else parent[key]
     setattr(parent, keys[-1], replacement)
+
+
+# Routed experts. The slot cache follows oMLX's MoE expert offload (Apache-2.0,
+# omlx/patches/moe_expert_offload.py): contiguous per-layer slot arrays, decayed-frequency
+# eviction, the call's own experts never evicted, and over-capacity calls run expert by expert.
+
+_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+_EXPERT_FIELDS = ("weight", "scales", "biases", "bias")
+# The stock SwitchGLU sorts a call's routes from this many on.
+_SORT_ROUTES = 64
+_SCORE_DECAY, _SCORE_DECAY_EVERY = 0.7, 4
+
+
+def _picks_rhs(rows, routes, experts):
+    """Whether MLX runs a sorted ``gather_qmm`` as ``gather_qmm_rhs`` (``GatherQMM::eval_gpu``)."""
+    return rows == 1 and routes >= 16 and routes // experts >= 4
+
+
+class _FullTableKernels:
+    """Mixed into a slot table's ``QuantizedSwitchLinear``. MLX chooses a sorted call's kernel from
+    the table size, and the slot table is smaller than the expert table: where the full table gets
+    the per-route kernel, the call runs unsorted, which computes each route alone just as the
+    sorted per-route kernel does."""
+
+    def __call__(self, x, indices, sorted_indices = False):
+        if sorted_indices and not _picks_rhs(x.shape[-2], indices.size, self.full_experts):
+            sorted_indices = False
+        return super().__call__(x, indices, sorted_indices = sorted_indices)
+
+    def gather(self, x, indices, sorted_indices):
+        return super().__call__(x, indices, sorted_indices = sorted_indices)
+
+
+_SLOT_CLASSES = {}
+
+
+def _slot_projection(projection, arrays, full_experts):
+    base = type(projection)
+    if base not in _SLOT_CLASSES:
+        _SLOT_CLASSES[base] = type(f"Slot{base.__name__}", (_FullTableKernels, base), {})
+    slot = copy.copy(projection)
+    slot.__class__ = _SLOT_CLASSES[base]
+    for name, array in arrays.items():
+        slot[name] = array
+    slot.full_experts = full_experts
+    return slot
+
+
+class _ExpertSlots:
+    """One layer's experts in ``capacity`` slots. A miss evicts the expert with the lowest decayed
+    routing count (+1 per route, x0.7 every 4 calls) among those the call does not use."""
+
+    def __init__(self, fields, experts, capacity):
+        self.fields = fields  # [(projection, name, _Field)]
+        self.capacity = capacity
+        self.arrays = {
+            (projection, name): mx.zeros((capacity, *field.shape), dtype = field.cast or field.dtype)
+            for projection, name, field in fields
+        }
+        mx.eval(list(self.arrays.values()))
+        self.slot_of = np.full(experts, -1, dtype = np.int64)
+        self.expert_of = np.full(capacity, -1, dtype = np.int64)
+        self.map = mx.zeros((experts,), dtype = mx.int32)  # expert -> slot, valid while resident
+        self.score = np.zeros(experts, dtype = np.float32)
+        self.expert_bytes = sum(field.row_bytes for _, _, field in fields)
+        self.calls = self.hits = self.misses = 0
+
+    def ensure(self, routes, experts):
+        """Make ``experts`` (unique, at most ``capacity``) resident; ``routes`` are the call's routes."""
+        np.add.at(self.score, routes, 1.0)
+        self.calls += 1
+        if self.calls % _SCORE_DECAY_EVERY == 0:
+            self.score *= _SCORE_DECAY
+        missing = experts[self.slot_of[experts] < 0]
+        self.hits += experts.size - missing.size
+        if not missing.size:
+            return
+        self.misses += missing.size
+        slots = self._reserve(missing.size, experts)
+        buffers = [np.empty((missing.size, field.row_bytes), dtype = np.uint8) for _, _, field in self.fields]
+        jobs = [
+            (field.fd, field.offset + expert * field.row_bytes, memoryview(buffer[i]))
+            for (_, _, field), buffer in zip(self.fields, buffers)
+            for i, expert in enumerate(missing.tolist())
+        ]
+        read_ranges(jobs)
+        at = mx.array(slots.astype(np.int32))
+        for (projection, name, field), buffer in zip(self.fields, buffers):
+            self.arrays[projection, name][at] = field.to_mx(buffer)
+        self.slot_of[missing] = slots
+        self.expert_of[slots] = missing
+        self.map[mx.array(missing.astype(np.int32))] = at
+
+    def slot_indices(self, indices):
+        return self.map[indices].astype(indices.dtype)
+
+    def _reserve(self, count, protected):
+        free = np.flatnonzero(self.expert_of < 0)
+        if free.size >= count:
+            return free[:count]
+        held = np.flatnonzero((self.expert_of >= 0) & ~np.isin(self.expert_of, protected))
+        victims = held[np.argsort(self.score[self.expert_of[held]], kind = "stable")[:count - free.size]]
+        self.slot_of[self.expert_of[victims]] = -1
+        return np.concatenate([free, victims])
+
+
+class _GLUPart:
+    """``up_proj`` / ``gate_proj`` / ``activation`` / ``down_proj`` of an ``OffloadSwitchGLU``, for
+    callers that run the GLU's steps themselves (mlx-vlm's batch-invariant verifier)."""
+
+    def __init__(self, owner, name):
+        self._owner, self._name = owner, name
+
+    def __call__(self, *args, **kwargs):
+        return self._owner._part(self._name, *args, **kwargs)
+
+
+class OffloadSwitchGLU(nn.Module):
+    """Stands in for a ``SwitchGLU`` of quantized experts that stay in the checkpoint. A call reads
+    the experts it routes to into the slots, then runs a copy of the original module (kept out of
+    the module tree) on the slots, so the stock code and kernels compute it. A call routing to more
+    experts than the slots hold runs expert by expert, each expert read once (once per position
+    where the stock call runs a decode block position by position)."""
+
+    def __init__(self, glu, slots, experts):
+        super().__init__()
+        object.__setattr__(self, "_glu", glu)
+        object.__setattr__(self, "_slots", slots)
+        object.__setattr__(self, "_parts", None)
+        self.experts = experts
+        for name in ("up_proj", "gate_proj", "activation", "down_proj"):
+            object.__setattr__(self, name, _GLUPart(self, name))
+
+    def _stock(self):
+        glu = self._glu
+        if glu.training != self.training:
+            glu.train(self.training)
+        return glu
+
+    def _routes(self, indices):
+        routes = np.asarray(indices).reshape(-1).astype(np.int64)
+        return routes, np.unique(routes)
+
+    def __call__(self, x, indices):
+        glu = self._stock()
+        routes, experts = self._routes(indices)
+        slots = self._slots
+        if experts.size <= slots.capacity:
+            slots.ensure(routes, experts)
+            return glu(x, slots.slot_indices(indices))
+        # Over the slots: expert by expert, each route computed as the stock call computes it.
+        rows = x.reshape(-1, x.shape[-1])
+        token = np.arange(routes.size) // indices.shape[-1]
+        block = _decode_block(glu, x)
+        if block and x.shape[0] * indices.shape[-1] >= _SORT_ROUTES:  # stock runs the block one position at a time
+            return mx.concatenate([self(x[:, i:i + 1], indices[:, i:i + 1]) for i in range(x.shape[1])], axis = 1)
+        if block and x.shape[0] == 1:
+            run = self._block_run(glu, rows, indices.dtype)
+        else:  # mlx-vlm computes a batch's decode block one route at a time, as an unsorted gather does
+            sort = not block and indices.size >= _SORT_ROUTES and _picks_rhs(1, indices.size, self.experts)
+            run = self._gather_run(rows, lambda r, s, srt: (self._glu_rows(glu, r, s, srt)[3],), sort)
+        (routed,) = self._by_expert(token, routes, run)
+        return routed.reshape(*indices.shape, -1)
+
+    @staticmethod
+    def _glu_rows(glu, rows, slots, sort):
+        """``(up, gate, activated, down)`` of one route per row, by the stock projections' kernels."""
+        up = glu.up_proj.gather(rows, slots, sort)
+        gate = glu.gate_proj.gather(rows, slots, sort)
+        activated = glu.activation(up, gate)
+        return up, gate, activated, glu.down_proj.gather(activated, slots, sort)
+
+    def _by_expert(self, row_of_route, routes, run):
+        """``run(experts, rows)`` over every route, expert by expert in chunks the slots can hold, each
+        chunk evaluated before the next is read. ``run`` gets each route's expert and source row and
+        returns per-route outputs; returns each output as ``[routes, dims]`` in route order."""
+        slots = self._slots
+        resident = slots.slot_of[routes] >= 0
+        # Resident experts first, so a chunk's misses evict only experts already used.
+        order = np.lexsort((routes, ~resident))
+        ordered = routes[order]
+        starts = np.flatnonzero(np.concatenate([[True], ordered[1:] != ordered[:-1]]))
+        bounds = list(starts[::slots.capacity]) + [routes.size]
+        outputs = []
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            chunk = ordered[start:end]
+            slots.ensure(chunk, np.unique(chunk))
+            parts = run(chunk, row_of_route[order[start:end]])
+            mx.eval(parts)
+            outputs.append(parts)
+        inverse = mx.array(np.argsort(order, kind = "stable").astype(np.int32))
+        return tuple(mx.concatenate(column)[inverse] for column in zip(*outputs))
+
+    def _gather_run(self, rows, compute, sort):
+        """Chunks as stock gathers, one route per row. ``sort`` keeps a chunk on
+        ``gather_qmm_rhs`` by sorting it and padding it to the slot table's minimum for that kernel."""
+        slots = self._slots
+        floor = max(16, 4 * slots.capacity)
+
+        def run(chunk, source):
+            count = chunk.size
+            if sort and count < floor:
+                chunk, source = (np.pad(a, (0, floor - count), mode = "edge") for a in (chunk, source))
+            index = slots.map[mx.array(chunk.astype(np.int32))]
+            taken = rows[mx.array(source.astype(np.int32))]
+            if sort:  # the stock sorted layout: one [1, dims] row per route, flat indices
+                index_order = mx.argsort(index)
+                parts = compute(mx.expand_dims(taken[index_order], -2), index[index_order], True)
+                inverse = mx.argsort(index_order)
+                parts = tuple(part[inverse] for part in parts)
+            else:
+                parts = compute(mx.expand_dims(taken, (-2, -3)), index.reshape(-1, 1), False)
+            return tuple(part.reshape(part.shape[0], -1)[:count] for part in parts)
+
+        return run
+
+    def _block_run(self, glu, rows, dtype):
+        """Chunks as mlx-vlm decode blocks of the chunk's tokens. Those kernels give a route the same
+        result whatever the block's other positions and routes are, so a token's routes in the chunk
+        make up its position, padded by repeating one of them, at least two positions per block."""
+        slots = self._slots
+        from mlx_vlm.models.linear import DECODE_BLOCK_SIZE
+
+        def run(chunk, source):
+            tokens, position = np.unique(source, return_inverse = True)
+            by_position = np.argsort(position, kind = "stable")
+            first = np.searchsorted(position[by_position], np.arange(tokens.size))
+            column = np.empty(chunk.size, dtype = np.int64)
+            column[by_position] = np.arange(chunk.size) - first[position[by_position]]
+            grid = np.repeat(chunk[by_position[first]][:, None], column.max() + 1, axis = 1)
+            grid[position, column] = chunk
+            outputs = []
+            for at in range(0, tokens.size, DECODE_BLOCK_SIZE):
+                block_tokens, block_grid = tokens[at:at + DECODE_BLOCK_SIZE], grid[at:at + DECODE_BLOCK_SIZE]
+                size = block_tokens.size
+                if size == 1:  # the decode-block path needs two positions
+                    block_tokens, block_grid = np.repeat(block_tokens, 2), np.repeat(block_grid, 2, axis = 0)
+                index = slots.map[mx.array(block_grid.astype(np.int32))].astype(dtype)
+                block = rows[mx.array(block_tokens.astype(np.int32))]
+                outputs.append(glu(block[None], index[None])[0][:size])
+            routed = mx.concatenate(outputs)
+            return (routed[mx.array(position.astype(np.int32)), mx.array(column.astype(np.int32))],)
+
+        return run
+
+    def _part(self, name, *args, **kwargs):
+        glu = self._stock()
+        if name == "activation":
+            up, gate = args
+            parts = self._parts
+            if parts is not None and parts[1] is up and parts[2] is gate:
+                return parts[3]
+            return glu.activation(up, gate)
+        x, indices = args[:2]
+        sorted_indices = kwargs.get("sorted_indices", args[2] if len(args) > 2 else False)
+        parts = self._parts
+        if name != "up_proj" and parts is not None:
+            if name == "gate_proj" and parts[0][0] is x and parts[0][1] is indices:
+                return parts[2]
+            if name == "down_proj" and parts[3] is x and parts[0][1] is indices:
+                return parts[4]
+        routes, experts = self._routes(indices)
+        slots = self._slots
+        if experts.size <= slots.capacity:
+            slots.ensure(routes, experts)
+            index = slots.slot_indices(indices)
+            if name != "up_proj":
+                return getattr(glu, name)(x, index, sorted_indices = sorted_indices)
+            up = glu.up_proj(x, index, sorted_indices = sorted_indices)
+            gate = glu.gate_proj(x, index, sorted_indices = sorted_indices)
+            activated = glu.activation(up, gate)
+            down = glu.down_proj(activated, index, sorted_indices = sorted_indices)
+        else:
+            # Over the slots: one row per route, unsorted (each route alone), as the caller's
+            # per-route kernels compute it.
+            if sorted_indices:
+                raise ValueError("Unsloth: a sorted call over more experts than the offload slots hold")
+            per_route = x.shape[-3] == indices.shape[-1]
+            rows = x.reshape(-1, x.shape[-1])
+            row_of_route = np.arange(routes.size) // (1 if per_route else indices.shape[-1])
+            shape = (*indices.shape, 1, -1)
+            if name != "up_proj":
+                (out,) = self._by_expert(row_of_route, routes, self._gather_run(
+                    rows, lambda r, s, srt: (getattr(glu, name).gather(r, s, srt),), False))
+                return out.reshape(shape)
+            up, gate, activated, down = (part.reshape(shape) for part in self._by_expert(
+                row_of_route, routes, self._gather_run(rows, lambda r, s, srt: self._glu_rows(glu, r, s, srt), False)))
+        object.__setattr__(self, "_parts", ((x, indices), up, gate, activated, down))
+        return up
+
+    def offload_bytes(self):
+        """``(on disk, resident)`` bytes of the experts this stands in for."""
+        slots = self._slots
+        return self.experts * slots.expert_bytes, sum(array.nbytes for array in slots.arrays.values())
+
+
+def _decode_block(glu, x):
+    """Whether the stock call takes mlx-vlm's decode-block path."""
+    if type(glu).__module__ != "mlx_vlm.models.switch_layers":
+        return False
+    from mlx_vlm.models.linear import DECODE_BLOCK_SIZE
+    return not glu.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE
+
+
+def expert_sites(model):
+    """``(path, module)`` of every ``SwitchGLU`` of quantized experts in ``model``."""
+    for path, module in model.named_modules():
+        if type(module).__name__ == "SwitchGLU" and all(
+            type(getattr(module, name, None)).__name__ == "QuantizedSwitchLinear" for name in _PROJECTIONS
+        ):
+            yield path, module
+
+
+def _top_k(model, path):
+    parent = model
+    for key in path.split(".")[:-1]:
+        parent = parent[int(key)] if isinstance(parent, list) else parent[key]
+    for name in ("top_k", "num_experts_per_tok", "n_activated_experts", "experts_per_token"):
+        value = getattr(parent, name, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
+    """Replace every ``SwitchGLU`` of quantized experts in ``model`` with an ``OffloadSwitchGLU``
+    that reads experts from ``model_dir``'s shards into slots for ``1 - fraction`` of each layer's
+    experts, at least ``max(8, top_k)``. Must run before anything evaluates the experts;
+    ``cast_dtype`` as for ``offload_ple``.
+    Returns ``{"layers", "on_disk_bytes", "resident_bytes", "skipped": [(path, reason)]}``."""
+    cast_for = _cast_rule(model, cast_dtype)
+    store = CheckpointTensors(model_dir)
+    report = {"layers": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}
+    for path, glu in list(expert_sites(model)):
+        experts = glu.up_proj["weight"].shape[0]
+        top_k = _top_k(model, path)
+        if top_k is None:
+            report["skipped"].append((path, "its routing top-k is unknown"))
+            continue
+        capacity = max(8, top_k, int(experts * (1 - fraction)))
+        if capacity >= experts:
+            report["skipped"].append((path, f"{experts} experts fit in {capacity} slots"))
+            continue
+        fields, reason = [], None
+        for projection in _PROJECTIONS:
+            linear = getattr(glu, projection)
+            if getattr(linear, "global_scale", None) is not None:
+                reason = "its experts have global scales"
+                break
+            for name in _EXPERT_FIELDS:
+                if linear.get(name) is None:
+                    continue
+                parameter = f"{path}.{projection}.{name}"
+                tensor, reason = _checkpoint_tensor(store, parameter, linear[name])
+                if reason is not None:
+                    break
+                fields.append((projection, name, _Field(store, name, tensor, cast_for(parameter, linear[name].dtype))))
+            if reason is not None:
+                break
+        if reason is not None:
+            report["skipped"].append((path, reason))
+            continue
+        slots = _ExpertSlots(fields, experts, capacity)
+        stock = copy.copy(glu)
+        for projection in _PROJECTIONS:
+            arrays = {name: slots.arrays[p, name] for p, name, _ in fields if p == projection}
+            setattr(stock, projection, _slot_projection(getattr(glu, projection), arrays, experts))
+        slots.store = store
+        replacement = OffloadSwitchGLU(stock, slots, experts)
+        replacement.train(glu.training)
+        _replace_module(model, path, replacement)
+        on_disk, resident = replacement.offload_bytes()
+        report["layers"] += 1
+        report["on_disk_bytes"] += on_disk
+        report["resident_bytes"] += resident
+    return report

@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""PLE offload: tables read by row from the checkpoint are the stock modules, bit for bit."""
+"""PLE and expert offload: weights read from the checkpoint compute the stock modules' outputs, bit for bit."""
 
 import os
 
@@ -32,7 +32,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map
 
 from unsloth_zoo.mlx.loader import FastMLXModel, _convert_mlx_dtype, _mlx_save_pretrained_merged
-from unsloth_zoo.mlx.offload import DiskEmbedding, offload_fraction, offload_ple
+from unsloth_zoo.mlx.offload import DiskEmbedding, OffloadSwitchGLU, offload_experts, offload_fraction, offload_ple
 
 
 @pytest.fixture(autouse = True)
@@ -165,6 +165,114 @@ def test_offloaded_floats_get_the_load_cast(tmp_path, cast):
     assert report["resident_bytes"] == sum(column.nbytes for column in held) > 0
 
 
+def _moe(lib, dims = 512, hidden = 32, scales = mx.bfloat16, eval = True, quantized = True):
+    """One MoE layer of 64 quantized experts, top-4, from mlx-vlm's or mlx-lm's ``SwitchGLU``; 512
+    wide, as mlx-vlm's decode-block kernels require."""
+    switch_layers = pytest.importorskip(f"mlx_{lib}.models.switch_layers")
+    mx.random.seed(0)
+    block = nn.Module()
+    block.top_k = 4
+    block.switch_mlp = switch_layers.SwitchGLU(dims, hidden, 64)
+    model = nn.Module()
+    model.layers = [block]
+    if not quantized:
+        return model
+    nn.quantize(block, group_size = 32, bits = 4, class_predicate = lambda _, module: hasattr(module, "to_quantized"))
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        linear = block.switch_mlp[name]
+        linear.scales, linear.biases = linear.scales.astype(scales), linear.biases.astype(scales)
+    model.train(not eval)
+    return model
+
+
+def _routes(shape, seed, among = 64):
+    """Top-4 of 64 experts per position, drawn from the first ``among``."""
+    logits = mx.random.normal((*shape, 64), key = mx.random.key(seed))
+    logits = mx.where(mx.arange(64) < among, logits + 100, logits)
+    return mx.argpartition(logits, kth = -4, axis = -1)[..., -4:]
+
+
+def _moe_calls(dtype):
+    # A decode block whose positions route to disjoint experts, so over 8 slots its last chunk holds
+    # one position; then (batch, length, experts routed among): decode, batched decode, decode blocks
+    # (mlx-vlm's block kernels; one position at a time, here on gather_qmm_rhs, once batch x top-k
+    # reaches 64), prefill on the per-route kernel, prefill on gather_qmm_rhs (from exactly 4 routes
+    # per expert), prefill among 12 experts, which a 16-slot table alone would run on gather_qmm_rhs
+    # and 64 experts do not, and a batch's decode blocks under 64 routes.
+    disjoint = mx.arange(12, dtype = mx.uint32).reshape(1, 3, 4)
+    calls = [(mx.random.normal((1, 3, 512), key = mx.random.key(99)).astype(dtype), disjoint)]
+    shapes = [(1, 1, 64), (8, 1, 64), (1, 4, 64), (64, 2, 64), (1, 20, 64), (1, 64, 64), (2, 300, 64), (1, 30, 12), (8, 2, 64)]
+    calls += [
+        (mx.random.normal((batch, length, 512), key = mx.random.key(i)).astype(dtype), _routes((batch, length), 100 + i, among))
+        for i, (batch, length, among) in enumerate(shapes)
+    ]
+    # gather_qmm_rhs prefill whose rarely routed experts leave a chunk too small for that kernel.
+    skewed = mx.concatenate([_routes((1, 290), 7, 12), _routes((1, 10), 8)], axis = 1)
+    return calls + [(mx.random.normal((1, 300, 512), key = mx.random.key(9)).astype(dtype), skewed)]
+
+
+def _verifier_steps(glu, x, indices):
+    """mlx-vlm's batch-invariant verifier runs the projections itself, unsorted; then a down
+    projection of another input."""
+    x, indices = mx.expand_dims(x.reshape(-1, x.shape[-1]), (-2, -3)), indices.reshape(-1, 4)
+    up = glu.up_proj(x, indices, sorted_indices = False)
+    gate = glu.gate_proj(x, indices, sorted_indices = False)
+    activated = glu.activation(up, gate)
+    down = glu.down_proj(activated, indices, sorted_indices = False)
+    return mx.concatenate([down, glu.down_proj(activated * 2, indices, sorted_indices = False)])
+
+
+@pytest.mark.parametrize("lib", ["vlm", "lm"])
+@pytest.mark.parametrize("fraction", [1.0, 0.75, 0.1])
+def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
+    stock = _lazy_copy(lambda: _moe(lib), str(tmp_path))
+    calls = _moe_calls(mx.bfloat16)
+    expected = [stock.layers[0].switch_mlp(*call) for call in calls]
+    expected += [_verifier_steps(stock.layers[0].switch_mlp, *call) for call in calls[5:7]]
+    table_bytes = sum(value.nbytes for _, value in tree_flatten(stock.parameters()))
+
+    model = _lazy_copy(lambda: _moe(lib), str(tmp_path))
+    report = offload_experts(model, str(tmp_path), fraction)
+
+    glu = model.layers[0].switch_mlp
+    assert isinstance(glu, OffloadSwitchGLU) and not tree_flatten(model.parameters())
+    assert report["layers"] == 1 and report["on_disk_bytes"] == table_bytes
+    slots = max(8, int(64 * (1 - fraction)))
+    assert glu._slots.capacity == slots and report["resident_bytes"] == table_bytes * slots // 64
+    actual = [glu(*call) for call in calls]
+    actual += [_verifier_steps(glu, *call) for call in calls[5:7]]
+    for got, want in zip(actual, expected):
+        assert got.shape == want.shape
+        np.testing.assert_array_equal(_bits(got), _bits(want))
+
+
+def test_offloaded_experts_are_never_loaded(tmp_path):
+    model = _lazy_copy(lambda: _moe("lm", hidden = 512), str(tmp_path))
+    table_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
+    mx.synchronize()
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    offload_experts(model, str(tmp_path), 1.0)
+    mx.eval(model.layers[0].switch_mlp(mx.ones((1, 1, 512), mx.bfloat16), _routes((1, 1), 0)))
+    assert mx.get_peak_memory() - before < table_bytes // 4
+
+
+def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
+    # Loaded in training mode and switched to eval afterwards, as generation does.
+    stock = _lazy_copy(lambda: _moe("vlm", scales = mx.float16, eval = False), str(tmp_path))
+    offloaded = _lazy_copy(lambda: _moe("vlm", scales = mx.float16, eval = False), str(tmp_path))
+    _convert_mlx_dtype(stock, mx.bfloat16)
+    offload_experts(offloaded, str(tmp_path), 0.75, cast_dtype = mx.bfloat16)
+    stock.eval()
+    offloaded.eval()
+    for x, indices in _moe_calls(mx.bfloat16)[::2]:
+        expected = stock.layers[0].switch_mlp(x, indices)
+        actual = offloaded.layers[0].switch_mlp(x, indices)
+        assert actual.dtype == expected.dtype == mx.bfloat16
+        np.testing.assert_array_equal(_bits(actual), _bits(expected))
+
+
 def test_offload_controls_and_refusals(tmp_path):
     for off in (None, False, 0, "off"):
         assert offload_fraction("ple_offload", off) is None
@@ -174,8 +282,20 @@ def test_offload_controls_and_refusals(tmp_path):
         with pytest.raises(ValueError, match = "ple_offload"):
             offload_fraction("ple_offload", bad)
 
-    with pytest.raises(ValueError, match = "full_finetuning"):
-        FastMLXModel.from_pretrained("unused", ple_offload = 0.5, full_finetuning = True)
+    for knob in ("ple_offload", "expert_offload"):
+        with pytest.raises(ValueError, match = "full_finetuning"):
+            FastMLXModel.from_pretrained("unused", full_finetuning = True, **{knob: 0.5})
+
+    dense = tmp_path / "dense"
+    dense.mkdir()
+    model = _lazy_copy(lambda: _moe("vlm", quantized = False), str(dense))
+    assert offload_experts(model, str(dense), 1.0) == {"layers": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}
+    top_12 = tmp_path / "top_12"
+    top_12.mkdir()
+    model = _lazy_copy(lambda: _moe("lm"), str(top_12))
+    model.layers[0].top_k = 12  # the slots hold at least one token's routes
+    offload_experts(model, str(top_12), 1.0)
+    assert model.layers[0].switch_mlp._slots.capacity == 12
 
     model = _lazy_copy(lambda: _holder("embed_tokens_per_layer", nn.Embedding(16, 8)), str(tmp_path))
     model.update(tree_map(lambda value: value.astype(mx.bfloat16), model.parameters()))
