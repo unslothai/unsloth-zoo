@@ -455,7 +455,12 @@ def _softmax_gather(logits, ids, renorm):
 
 def _probs_gather(probs, ids, renorm):
     w = probs.float().gather(-1, ids)
-    return w / w.sum(dim = -1, keepdim = True) if renorm else w
+    if not renorm:
+        return w
+    # Forced experts whose probabilities all underflowed to 0 have no weights to renormalise:
+    # divide by 1 there instead of 0 / 0 (the router hook keeps natural routing on those rows).
+    total = w.sum(dim = -1, keepdim = True)
+    return w / torch.where(total > 0, total, torch.ones_like(total))
 
 
 def _formulas():
@@ -496,6 +501,13 @@ def _split_router_output(output):
     return None
 
 
+def _count(name):
+    # Python counters read inside a compiled region become Dynamo guards whose value changes every
+    # call, recompiling the router each step. They are diagnostics only, so skip them there.
+    if not torch.compiler.is_compiling():
+        _STATE.stats[name] += 1
+
+
 def _router_hook(layer_index, compact = None):
     # compact: (position among the MoE layers, number of MoE layers) when some decoder layers are
     # dense. vLLM 0.21 numbers routed experts by MoE layer only, so its rows skip dense layers.
@@ -513,7 +525,7 @@ def _router_hook(layer_index, compact = None):
                     f"{type(module).__name__} (it routes inside the MoE block); this layer keeps "
                     f"its natural routing."
                 )
-            _STATE.stats["router_calls_natural"] += 1
+            _count("router_calls_natural")
             return None
         li, wi, ii, dense = positions
         logits, weights, ids = output[li], output[wi], output[ii]
@@ -530,19 +542,19 @@ def _router_hook(layer_index, compact = None):
             signature = _input_signature(args, ids2.shape[0])
         recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature)
         if recomputed is not None:
-            _STATE.stats["router_calls_recomputed"] += 1
+            _count("router_calls_recomputed")
         if recomputed is _NATURAL:
-            _STATE.stats["router_calls_natural"] += 1
+            _count("router_calls_natural")
             return None
         if recomputed is None and replay is None:
-            _STATE.stats["router_calls_natural"] += 1
+            _count("router_calls_natural")
             return None
         if recomputed is None and (
             replay.shape[0] != ids2.shape[0]
             or row >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
         ):
-            _STATE.stats["router_calls_natural"] += 1
+            _count("router_calls_natural")
             return None
 
         formula = getattr(module, "_unsloth_replay_formula", None)
@@ -571,7 +583,7 @@ def _router_hook(layer_index, compact = None):
                 )
             module._unsloth_replay_formula = formula
         if formula is False:
-            _STATE.stats["router_calls_natural"] += 1
+            _count("router_calls_natural")
             return None
 
         if recomputed is None:
@@ -586,12 +598,17 @@ def _router_hook(layer_index, compact = None):
             forced, valid = recomputed
             forced = torch.where(valid, forced, ids2.long())
         reweight = _formulas()[formula]
-        new_weights = reweight(logits2, forced).to(weights2.dtype)
+        new_weights = reweight(logits2, forced)
+        if formula == "probs_renorm":
+            # Every forced probability is 0: nothing to replay with, so keep the natural routing.
+            valid = valid & (new_weights.sum(dim = -1, keepdim = True) > 0)
+            forced = torch.where(valid, forced, ids2.long())
+        new_weights = new_weights.to(weights2.dtype)
         new_weights = torch.where(valid, new_weights, weights2)
         with torch.no_grad():
             changed = (forced.sort(-1).values != ids2.long().sort(-1).values).any(-1).sum()
             _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed.to(_STATE.changed.device)
-        _STATE.stats["router_calls_replayed"] += 1
+        _count("router_calls_replayed")
 
         if dense:
             new_weights = torch.zeros_like(scores2).scatter(-1, forced, new_weights)
