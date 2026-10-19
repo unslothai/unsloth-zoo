@@ -161,6 +161,42 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     mx.eval(model.parameters())
 
 
+def _apply_ple_offload(model, model_dir, fraction, target_dtype) -> None:
+    """Swap the still-lazy PLE tables for ones read from ``model_dir``'s shards."""
+    from .offload import offload_ple
+
+    if not model_dir:
+        raise ValueError("Unsloth: ple_offload needs a local copy of the checkpoint.")
+    report = offload_ple(model, model_dir, fraction, cast_dtype=target_dtype)
+    for path, reason in report["skipped"]:
+        warnings.warn(f"Unsloth: kept the PLE table {path} in memory: {reason}.", stacklevel=3)
+    if not report["tables"]:
+        if not report["skipped"]:
+            warnings.warn("Unsloth: ple_offload is set, but this model has no PLE table.", stacklevel=3)
+        return
+    print(
+        f"Unsloth: PLE offload reads {report['on_disk_bytes'] / 2**30:.2f} GiB from the checkpoint "
+        f"on demand and holds {report['resident_bytes'] / 2**30:.2f} GiB in memory."
+    )
+    model._unsloth_offload = {"ple": report}
+
+
+def _refuse_ple_offload_runtime_quant(ple_offload, want_runtime_quant) -> None:
+    if ple_offload is not None and want_runtime_quant:
+        raise ValueError(
+            "Unsloth: ple_offload reads the checkpoint's tables as stored, so it cannot be "
+            "combined with runtime quantization. Load the checkpoint in its own quantization."
+        )
+
+
+def _refuse_offloaded(model, action) -> None:
+    if getattr(model, "_unsloth_offload", None):
+        raise ValueError(
+            f"Unsloth: this model was loaded with ple_offload, which is for inference only; "
+            f"{action} needs the model loaded without offload."
+        )
+
+
 def _keep_norm_parameters_float32(model) -> None:
     """Prepare MLX training by keeping normalization parameters in fp32."""
     import mlx.core as mx
@@ -7024,6 +7060,7 @@ def _ensure_vlm_processor_inputs_patched():
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import collect_mlx_lora_adapter_tensors, save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
     if "save_method" not in kwargs and not collect_mlx_lora_adapter_tensors(self):
@@ -7090,6 +7127,7 @@ def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
 
 def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
     kwargs = _mlx_supported_kwargs(
@@ -7102,6 +7140,7 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
 
 
 def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import push_to_hub_merged
     tokenizer = tokenizer or self._tokenizer
     # Default save_directory to repo_id; callers that already saved locally
@@ -7112,6 +7151,7 @@ def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, 
 
 def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
     kwargs = _mlx_supported_kwargs(
@@ -8731,6 +8771,7 @@ class FastMLXModel:
         float32_mixed_precision=None,
         pipeline_group=None,
         tensor_group=None,
+        ple_offload=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -8759,6 +8800,10 @@ class FastMLXModel:
                 parallel text or VLM inference.
             tensor_group: Optional MLX distributed group for tensor parallel
                 text or VLM inference.
+            ple_offload: ``"off"`` / ``None`` (default), or the fraction of
+                each per-layer embedding (PLE) table to leave in the
+                checkpoint's safetensors and read by row on lookup. Inference
+                only; the rest of the table stays in memory.
 
         Reloading a saved LoRA/DoRA adapter directory returns a model whose
         base is frozen and whose adapter parameters are trainable, so it can be
@@ -8774,6 +8819,15 @@ class FastMLXModel:
         _warn_block_swap(kwargs)
         _coerce_list_extra_special_tokens()
         _mlx_active_distributed_groups(pipeline_group, tensor_group)
+        from .offload import offload_fraction
+        ple_offload = offload_fraction("ple_offload", ple_offload)
+        if ple_offload is not None and (
+            full_finetuning or _mlx_distributed_requested(pipeline_group, tensor_group)
+        ):
+            raise ValueError(
+                "Unsloth: ple_offload is for single-process inference and cannot be "
+                "combined with full_finetuning or distributed loading."
+            )
 
         model_name, revision, _bnb_remapped_from = _remap_unsloth_bnb_hub_id_for_mlx(
             model_name, revision
@@ -8955,11 +9009,17 @@ class FastMLXModel:
         _is_adapter_dir = bool(local_path) and os.path.exists(
             os.path.join(local_path, "adapter_config.json")
         )
-        if (
+        _is_bnb_checkpoint = (
             not _is_adapter_dir
             and isinstance(_existing_quant, dict)
             and _existing_quant.get("quant_method") == "bitsandbytes"
-        ):
+        )
+        if ple_offload is not None and (_is_adapter_dir or _is_bnb_checkpoint):
+            raise ValueError(
+                "Unsloth: ple_offload reads an MLX checkpoint's own safetensors, so it "
+                "cannot be used with a LoRA adapter directory or a bitsandbytes checkpoint."
+            )
+        if _is_bnb_checkpoint:
             _suggested = re.sub(
                 r"-(?:unsloth-)?bnb-\d+bit$", "", model_name,
             ) or model_name
@@ -9612,6 +9672,7 @@ class FastMLXModel:
                     "using existing compatible MLX quantization.",
                     stacklevel=2,
                 )
+            _refuse_ple_offload_runtime_quant(ple_offload, want_runtime_quant)
 
             if want_runtime_quant:
                 import mlx.core as mx
@@ -9716,6 +9777,10 @@ class FastMLXModel:
                     vlm_kwargs,
                     hf_token=token,
                 )
+                if ple_offload is not None:
+                    _apply_ple_offload(
+                        model, original_local_path or local_path, ple_offload, target_dtype,
+                    )
 
             processor = _run_with_vlm_config_view(
                 _repair_degraded_vlm_processor,
@@ -9844,6 +9909,7 @@ class FastMLXModel:
                 want_runtime_quant=want_runtime_quant,
             )
 
+            _refuse_ple_offload_runtime_quant(ple_offload, want_runtime_quant)
             if want_runtime_quant:
                 print(
                     f"Unsloth: Loading {model_name} via mlx-lm "
@@ -9884,6 +9950,10 @@ class FastMLXModel:
                     mlx_load_kwargs,
                     hf_token=token,
                 )
+                if ple_offload is not None:
+                    _apply_ple_offload(
+                        model, original_local_path or local_path, ple_offload, target_dtype,
+                    )
 
             if want_runtime_quant:
                 model, config = _apply_mlx_quantization(
@@ -9969,6 +10039,7 @@ class FastMLXModel:
         when the model was loaded with ``full_finetuning=True``.
         """
         _warn_block_swap(kwargs)
+        _refuse_offloaded(model, "LoRA training")
         loftq_config = kwargs.pop("loftq_config", None)
         if loftq_config is not None:
             raise NotImplementedError(
