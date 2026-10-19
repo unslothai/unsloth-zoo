@@ -31,7 +31,7 @@ import functools
 import math
 import os
 import sys
-from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
 from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bounds
 from unsloth_zoo.device_type import DEVICE_TYPE
 from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
@@ -494,7 +494,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         global _FUSED_CE_COMPILE_SUPPORTED
         uncompiled_accumulate_chunk = accumulate_chunk
 
-        if torch_compile and _FUSED_CE_COMPILE_SUPPORTED is not False:
+        # UNSLOTH_COMPILE_DISABLE runs the same chunks eagerly; callers that pass no torch_compile default to True.
+        if torch_compile and not UNSLOTH_COMPILE_DISABLE and _FUSED_CE_COMPILE_SUPPORTED is not False:
             try:
                 accumulate_chunk = torch.compile(
                     accumulate_chunk,

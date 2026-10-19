@@ -5,8 +5,8 @@ torch._grouped_mm forward replaces the per-expert loop. It must be:
 
   * ON by default,
   * OFF when UNSLOTH_GPTOSS_GROUPED=0 (explicit opt-out of the grouped path),
-  * OFF when UNSLOTH_COMPILE_DISABLE=1 (the grouped stacks are meant to run under
-    the compiled cache; disabling compilation opts into the plain eager loop).
+  * still ON when UNSLOTH_COMPILE_DISABLE=1 / partial (that switch only skips
+    torch.compile; grouped_qlora_forward is torch.compiler.disable'd anyway).
 
 The probe is self-contained (local imports, reads os.environ directly) so the
 compiler can copy its source into the standalone compiled cache. These are the
@@ -88,10 +88,11 @@ def test_grouped_disabled_by_gptoss_grouped_zero(experts, monkeypatch):
     assert _ready(experts) is False
 
 
-def test_grouped_disabled_by_compile_disable(experts, monkeypatch):
+@pytest.mark.parametrize("value", ["1", "partial"])
+def test_compile_disable_keeps_grouped_on(experts, monkeypatch, value):
     monkeypatch.delenv("UNSLOTH_GPTOSS_GROUPED", raising=False)
-    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
-    assert _ready(experts) is False
+    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", value)
+    assert _ready(experts) is True
 
 
 def test_compile_disable_zero_keeps_grouped_on(experts, monkeypatch):

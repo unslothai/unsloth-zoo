@@ -2353,6 +2353,8 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     """
     def _decorate(func):
         func = unwrap_already_compiled(func)
+        if UNSLOTH_COMPILE_DISABLE:
+            return func
         compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
         if fullgraph:
             compiled = _fall_back_to_eager_on_recompile_limit(
