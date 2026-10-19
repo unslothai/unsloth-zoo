@@ -341,6 +341,26 @@ def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
         np.testing.assert_array_equal(_bits(got), _bits(want))
 
 
+def test_experts_a_checkpoint_stores_apart(tmp_path):
+    # As GLM-5's: one tensor per expert, which mlx-vlm stacks at load.
+    stock = _moe("lm")
+    stacked = dict(tree_flatten(stock.parameters()))
+    for shard in range(2):  # an expert's tensors may sit in any shard
+        mx.save_safetensors(str(tmp_path / f"model-{shard}.safetensors"), {
+            name.replace("switch_mlp.", f"experts.{expert}."): value[expert]
+            for name, value in stacked.items() for expert in range(shard, value.shape[0], 2)
+        })
+    (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 4}))
+    model = _moe("lm").load_weights(list(stacked.items()))
+    table_bytes = sum(value.nbytes for value in stacked.values())
+    inventory = offload_inventory(str(tmp_path))
+    assert (inventory["expert_bytes"], inventory["experts_per_layer"]) == (table_bytes, 64)
+    report = offload_experts(model, str(tmp_path), 0.75)
+    assert report["layers"] == 1 and report["on_disk_bytes"] == table_bytes
+    for call in _moe_calls(mx.bfloat16)[::3]:
+        np.testing.assert_array_equal(_bits(model.layers[0].switch_mlp(*call)), _bits(stock.layers[0].switch_mlp(*call)))
+
+
 def test_offloaded_experts_are_never_loaded(tmp_path):
     model = _lazy_copy(lambda: _moe("lm", hidden = 512), str(tmp_path))
     table_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
@@ -398,6 +418,11 @@ def test_offload_controls_and_refusals(tmp_path):
     top_12.mkdir()
     model = _lazy_copy(lambda: _moe("lm"), str(top_12))
     model.layers[0].top_k = 12  # the slots hold at least one token's routes
+    offload_experts(model, str(top_12), 1.0)
+    assert model.layers[0].switch_mlp._slots.capacity == 12
+    model = _lazy_copy(lambda: _moe("lm"), str(top_12))
+    model.layers[0].gate = nn.Module()  # on the router, as GLM-5 and DeepSeek V4 keep it
+    model.layers[0].gate.top_k, model.layers[0].top_k = 12, None
     offload_experts(model, str(top_12), 1.0)
     assert model.layers[0].switch_mlp._slots.capacity == 12
     # A planned fraction keeps exactly its whole experts, whatever the float rounding.

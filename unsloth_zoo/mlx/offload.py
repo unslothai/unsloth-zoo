@@ -172,19 +172,30 @@ def _knob(name, value):
 
 
 class _Field:
-    """One checkpoint tensor, read by its leading index (a table row or an expert)."""
+    """One checkpoint tensor, read by its leading index (a table row or an expert); or, for experts a
+    checkpoint stores apart, one tensor per expert."""
 
-    __slots__ = ("name", "fd", "offset", "row_bytes", "transport", "dtype", "shape", "cast", "map")
+    __slots__ = ("name", "fd", "offset", "row_bytes", "transport", "dtype", "shape", "cast", "map", "apart")
 
     def __init__(self, store, name, tensor, cast, mapped = False):
-        path, dtype, shape, offset = store.specs[tensor]
+        tensors = tensor if isinstance(tensor, list) else [tensor]
+        path, dtype, shape, offset = store.specs[tensors[0]]
         self.transport, self.dtype = _DTYPES[dtype]
         self.name, self.fd, self.offset, self.cast = name, store.fd(path), offset, cast
-        self.shape = tuple(shape[1:])
+        self.shape = tuple(shape[1:]) if tensor is tensors[0] else tuple(shape)
         self.row_bytes = int(np.prod(self.shape)) * np.dtype(self.transport).itemsize
         self.map = None
         if mapped:
             self.map = np.memmap(path, dtype = np.uint8, mode = "r", offset = offset, shape = (shape[0], self.row_bytes))
+        self.apart = None
+        if tensor is not tensors[0]:
+            self.apart = [(store.fd(store.specs[t][0]), store.specs[t][3]) for t in tensors]
+
+    def location(self, index):
+        """``(fd, offset)`` of row or expert ``index``."""
+        if self.apart is not None:
+            return self.apart[index]
+        return self.fd, self.offset + index * self.row_bytes
 
     def to_mx(self, buffer):
         array = mx.array(buffer.view(self.transport).reshape(-1, *self.shape))
@@ -544,7 +555,7 @@ class _ExpertSlots:
         slots = self._reserve(missing.size, experts)
         buffers = [np.empty((missing.size, field.row_bytes), dtype = np.uint8) for _, _, field in self.fields]
         jobs = [
-            (field.fd, field.offset + expert * field.row_bytes, memoryview(buffer[i]))
+            (*field.location(expert), memoryview(buffer[i]))
             for (_, _, field), buffer in zip(self.fields, buffers)
             for i, expert in enumerate(missing.tolist())
         ]
@@ -780,11 +791,33 @@ def _top_k(model, path):
     parent = model
     for key in path.split(".")[:-1]:
         parent = parent[int(key)] if isinstance(parent, list) else parent[key]
-    for name in ("top_k", "num_experts_per_tok", "n_activated_experts", "experts_per_token"):
-        value = getattr(parent, name, None)
-        if isinstance(value, int):
-            return value
+    # On the MoE block, or on its router (GLM-5, DeepSeek V4).
+    for holder in (parent, getattr(parent, "gate", None)):
+        for name in ("top_k", "num_experts_per_tok", "n_activated_experts", "experts_per_token"):
+            value = getattr(holder, name, None)
+            if isinstance(value, int):
+                return value
     return None
+
+
+def _expert_tensors(store, path, projection, name, expected):
+    """``(names, None)`` of a stacked expert parameter's per-expert tensors, for a checkpoint that
+    stores each expert apart (mlx-vlm stacks them at load, as for GLM-5), ``(None, reason)`` when they
+    do not match, or ``None`` when the checkpoint has none."""
+    if not path.endswith(".switch_mlp"):
+        return None
+    base = path[:-len("switch_mlp")] + "experts."
+    names = [_checkpoint_name(store, f"{base}{expert}.{projection}.{name}") for expert in range(expected.shape[0])]
+    if None in names:
+        return None
+    for tensor in names:
+        _, dtype, shape, _ = store.specs[tensor]
+        if dtype not in _DTYPES or shape != tuple(expected.shape[1:]) or _DTYPES[dtype][1] != expected.dtype:
+            return None, (
+                f"{tensor} is {dtype} {list(shape)} in the checkpoint, "
+                f"{expected.dtype} {list(expected.shape[1:])} an expert in the model"
+            )
+    return names, None
 
 
 def _expert_fields(model, store, path, glu, cast_for):
@@ -802,6 +835,8 @@ def _expert_fields(model, store, path, glu, cast_for):
                 continue
             parameter = f"{path}.{projection}.{name}"
             tensor, reason = _checkpoint_tensor(store, parameter, linear[name])
+            if reason is not None:
+                tensor, reason = _expert_tensors(store, path, projection, name, linear[name]) or (tensor, reason)
             if reason is not None:
                 return None, None, reason
             fields.append((projection, name, _Field(store, name, tensor, cast_for(parameter, linear[name].dtype))))
@@ -884,6 +919,8 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
 OFFLOAD_CONTEXT_STEP = 256
 _PLE_TENSORS = (".embed_tokens_per_layer.", ".ngram_embedding.shards.")
 _EXPERT_TENSOR = re.compile(r"\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias|global_scale)$")
+# An expert a checkpoint stores apart, stacked into ``switch_mlp`` at load.
+_EXPERT_APART = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias|global_scale)$")
 _FLOAT_BYTES = {"F16": 2, "BF16": 2, "F32": 4, "F64": 8}
 _NESTED_CONFIGS = ("text_config", "thinker_config", "language_config", "llm_config")
 _TOP_K = ("num_experts_per_tok", "top_k", "n_activated_experts", "experts_per_token")
@@ -943,14 +980,18 @@ def offload_inventory(model_dir, dtype_bytes = None):
             ple += size
             continue
         match = _EXPERT_TENSOR.search(name)
-        if match is not None:
-            layer = layers.setdefault(name[:match.start()], [0, 0, set(), False])
+        apart = None if match is not None else _EXPERT_APART.search(name)
+        if match is not None or apart is not None:
+            layer = layers.setdefault(name[:(match or apart).start()], [0, 0, set(), False])
             layer[0] += size
-            if name.endswith(".up_proj.weight"):
+            projection, field = match.groups() if match is not None else apart.groups()[1:]
+            if match is not None and name.endswith(".up_proj.weight"):
                 layer[1] = shape[0]
-            if match.group(2) == "scales":
-                layer[2].add(match.group(1))
-            layer[3] |= match.group(2) == "global_scale"
+            if apart is not None:
+                layer[1] = max(layer[1], int(apart.group(1)) + 1)
+            if field == "scales":
+                layer[2].add(projection)
+            layer[3] |= field == "global_scale"
     config = _text_config(model_dir)
     top_k = next((config[key] for key in _TOP_K if isinstance(config.get(key), int)), None)
     quantized = [layer[:2] for layer in layers.values() if len(layer[2]) == 3 and layer[1] and not layer[3]]
