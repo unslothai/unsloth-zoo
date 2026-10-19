@@ -2472,8 +2472,20 @@ def grpo_accumulated_loss(
 
         def _raw_logits_entropies(logits):
             # The forward already scaled / softcapped these; same temperature as the logprobs.
-            log_p = torch.log_softmax(logits.to(torch.float32) / temperature, dim = -1)
-            return -(log_p.exp() * log_p).sum(-1)
+            if _entropy_bonus_on:
+                log_p = torch.log_softmax(logits.to(torch.float32) / temperature, dim = -1)
+                return -(log_p.exp() * log_p).sum(-1)
+            # Mask only (top_entropy_quantile): TRL scores entropies under no_grad, so no graph is kept,
+            # and rows go in slices so the fp32 copies stay near 64M elements, not the whole [B, T, V].
+            with torch.no_grad():
+                flat = logits.reshape(-1, logits.shape[-1])
+                out = torch.empty(flat.shape[0], dtype = torch.float32, device = logits.device)
+                step = max(1, (1 << 26) // max(int(flat.shape[-1]), 1))
+                for lo in range(0, flat.shape[0], step):
+                    log_p = torch.log_softmax(flat[lo : lo + step].to(torch.float32) / temperature, dim = -1)
+                    out[lo : lo + step] = -(log_p.exp() * log_p).sum(-1)
+                    del log_p
+                return out.reshape(logits.shape[:-1])
 
         import math
         total_samples = input_ids.shape[0]
