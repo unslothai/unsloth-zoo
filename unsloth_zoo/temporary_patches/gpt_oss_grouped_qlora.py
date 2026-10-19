@@ -178,17 +178,20 @@ def nf4_dequant_expert_stack(tb, dtype, out = None):
 
 
 class _StackProvider:
-    """weight_provider for moe_utils._base_grouped_mm: () -> [E, K, N] view; .transposed() -> [E, N, K]."""
+    """weight_provider for moe_utils._base_grouped_mm: () -> [E, K, N] view; .transposed() -> [E, N, K].
+    `refresh` (FSDP2 all-gathered experts) re-reads the pointer table on every call: the backward
+    recompute runs after FSDP2 re-gathered the weights into storage that may sit elsewhere."""
 
-    __slots__ = ("tb", "dtype", "fallback")
+    __slots__ = ("tb", "dtype", "fallback", "refresh")
 
-    def __init__(self, tb, dtype, fallback):
-        self.tb, self.dtype, self.fallback = tb, dtype, fallback
+    def __init__(self, tb, dtype, fallback, refresh = None):
+        self.tb, self.dtype, self.fallback, self.refresh = tb, dtype, fallback, refresh
 
     def transposed(self):
         w = None
-        if self.tb is not None and self.tb.get("dtype") == self.dtype:
-            w = nf4_dequant_expert_stack(self.tb, self.dtype)
+        tb = self.tb if self.refresh is None else self.refresh()
+        if tb is not None and tb.get("dtype") == self.dtype:
+            w = nf4_dequant_expert_stack(tb, self.dtype)
         if w is None:
             w = self.fallback()
         return w
@@ -513,8 +516,14 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     dn_bias = torch.stack([_base_layer_params(p)["bias"] for p in dn_projs]).detach()
     gu_tb = state["gate_up"] if state is not None else None
     dn_tb = state["down"] if state is not None else None
-    gu_w = _StackProvider(gu_tb, dtype, lambda: _bnb_fallback_stack(gu_projs, dtype))
-    dn_w = _StackProvider(dn_tb, dtype, lambda: _bnb_fallback_stack(dn_projs, dtype))
+    gu_refresh = dn_refresh = None
+    if getattr(getattr(gu_projs[0], "base_layer", gu_projs[0]).weight, _ready_epoch.FSDP2_GATHERED, False):
+        def _table(kind):
+            fresh = _tables(experts, dtype)
+            return fresh[kind] if fresh is not None else None
+        gu_refresh, dn_refresh = (lambda: _table("gate_up")), (lambda: _table("down"))
+    gu_w = _StackProvider(gu_tb, dtype, lambda: _bnb_fallback_stack(gu_projs, dtype), gu_refresh)
+    dn_w = _StackProvider(dn_tb, dtype, lambda: _bnb_fallback_stack(dn_projs, dtype), dn_refresh)
 
     xg = hidden_states[sorted_tokens]
     gate_up = mu._base_grouped_mm(xg, offsets, gu_w, recompute).to(acc_dtype)
