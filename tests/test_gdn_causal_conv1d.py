@@ -236,12 +236,17 @@ def _real_gdn_modeling(monkeypatch):
     if getattr(modeling, "causal_conv1d_fn", None) is None:
         pytest.skip("transformers < 5.15 GatedDeltaNet")
     decorator = _unpatched_decorator(modeling.use_kernel_func_from_hub_with_fallback)
-    fn = modeling.causal_conv1d_fn
-    if gcc._is_marked(fn):
-        # Patched at import on a CUDA host: rebuild the unpatched hub function.
-        dispatch = inspect.unwrap(fn, stop = lambda f: getattr(f, gcc._MARK, False))
-        fn = decorator("causal_conv1d_fn", "causal_conv1d")(dispatch.__wrapped__)
-    monkeypatch.setattr(modeling, "causal_conv1d_fn", fn)
+    # Both names: the patch rebinds the decode update too, and a test that leaves it patched
+    # changes what the next test starts from.
+    for name in ("causal_conv1d_fn", "causal_conv1d_update"):
+        fn = getattr(modeling, name, None)
+        if fn is None:
+            continue
+        if gcc._is_marked(fn):
+            # Patched at import on a CUDA host: rebuild the unpatched hub function.
+            dispatch = inspect.unwrap(fn, stop = lambda f: getattr(f, gcc._MARK, False))
+            fn = decorator(name, "causal_conv1d")(dispatch.__wrapped__)
+        monkeypatch.setattr(modeling, name, fn)
     monkeypatch.setattr(modeling, "use_kernel_func_from_hub_with_fallback", decorator)
     return modeling
 
@@ -253,7 +258,9 @@ def test_hub_decorator_wraps_only_gdn_fallbacks(hub_kernels):
     gdn_fn = _gdn_fn("transformers.models.qwen3_5.modeling_qwen3_5")
     assert gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(gdn_fn))
     assert not gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(_gdn_fn("transformers.models.mamba2.modeling_mamba2")))
-    assert not gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(gdn_fn))
+    # The decode update is wrapped too, still only for GatedDeltaNet modules.
+    assert gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(gdn_fn))
+    assert not gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(_gdn_fn("transformers.models.mamba2.modeling_mamba2")))
 
     import types
     legacy = types.ModuleType("legacy")
