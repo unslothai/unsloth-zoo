@@ -5549,19 +5549,30 @@ def merge_and_overwrite_lora(
         # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
         for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
             file_path = os.path.join(save_directory, filename)
-            _materialize_shard_that_resolves_outside(file_path, save_directory)
-            # Before the copy, not only at the writers: those run much later, so a linked
-            # output component (`save_directory/weights -> /outside`) was followed by
-            # `makedirs` and `copy2` before anything refused.
-            _assert_shard_is_inside(file_path, save_directory)
+            # Overwrite unless it IS the source (in-place export): an earlier export's shard is already merged.
+            # Decided before the shard is materialised: a link to the base shard is the source, so
+            # materialising it is its one copy, not a reason to copy the base shard a second time.
+            local_file_path = os.path.join(model_name, filename) if is_local_path else None
+            _replace_from_local = is_local_path and os.path.exists(local_file_path) and not (
+                os.path.exists(file_path) and os.path.samefile(file_path, local_file_path)
+            )
+            _replace_from_hub = not copied_all_from_cache and not is_local_path and filename in _stale_shards
+            # Both replacements `os.replace` the directory entry and never follow a linked leaf, so
+            # a shard link (dangling or not) under a contained parent is replaced, not copied first
+            # and not refused. The full check runs once the regular file is in place.
+            _replaces_link_entry = (_replace_from_local or _replace_from_hub) and \
+                os.path.islink(file_path) and \
+                _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory)
+            if not _replaces_link_entry:
+                _materialize_shard_that_resolves_outside(file_path, save_directory)
+                # Before the copy, not only at the writers: those run much later, so a linked
+                # output component (`save_directory/weights -> /outside`) was followed by
+                # `makedirs` and `copy2` before anything refused.
+                _assert_shard_is_inside(file_path, save_directory)
             # Only download if we didn't get everything from cache AND this specific file doesn't exist
             # AND we're in low disk space mode
             # For local models, copy the file if needed
-            # Overwrite unless it IS the source (in-place export): an earlier export's shard is already merged.
-            local_file_path = os.path.join(model_name, filename) if is_local_path else None
-            if is_local_path and os.path.exists(local_file_path) and not (
-                os.path.exists(file_path) and os.path.samefile(file_path, local_file_path)
-            ):
+            if _replace_from_local:
                 # A nested name has no parent here yet, so the copy would raise
                 # FileNotFoundError. The name is known to stay inside LEXICALLY, no
                 # stronger: a symlinked component still resolves wherever it points.
@@ -5570,7 +5581,7 @@ def merge_and_overwrite_lora(
                 print(f"Copied {filename} from local model directory")
                 if filename in _stale_shards: _replaced_shards.append(filename)
 
-            elif not copied_all_from_cache and not is_local_path and filename in _stale_shards:
+            elif _replace_from_hub:
                 _download_shard_over_previous_export(
                     model_name, filename, save_directory, _hf_cache_dir, token, revision = _hub_revision,
                 )
@@ -5587,6 +5598,8 @@ def merge_and_overwrite_lora(
                     revision = _hub_revision,
                 )
             pass
+            if _replaces_link_entry:
+                _assert_shard_is_inside(file_path, save_directory)
 
             if needs_splitting:
                 resulting_files = split_safetensor_file(filename, save_directory, max_shard_size_gb=1.5)
