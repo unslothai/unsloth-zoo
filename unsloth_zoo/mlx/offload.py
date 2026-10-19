@@ -27,6 +27,7 @@ nothing is converted or written to disk.
 import copy
 import glob
 import json
+import math
 import os
 import struct
 import threading
@@ -43,6 +44,7 @@ __all__ = [
     "offload_experts",
     "offload_fraction",
     "offload_ple",
+    "offloadable",
     "read_ranges",
 ]
 
@@ -131,9 +133,11 @@ class CheckpointTensors:
 
 
 def offload_fraction(name, value):
-    """``None`` (off) or the fraction to offload in (0, 1]."""
+    """``None`` (off), ``"auto"``, or the fraction to offload in (0, 1]."""
     if value is None or value is False or value == 0 or value == "off":
         return None
+    if value is True or value == "auto":
+        return "auto"
     fraction = None
     if not isinstance(value, (bool, str)):
         try:
@@ -142,7 +146,7 @@ def offload_fraction(name, value):
             pass
     if fraction is None or not 0 < fraction <= 1:
         raise ValueError(
-            f"Unsloth: {name} must be 'off' or the fraction to offload in (0, 1], got {value!r}."
+            f"Unsloth: {name} must be 'off', 'auto' or the fraction to offload in (0, 1], got {value!r}."
         )
     return fraction
 
@@ -369,8 +373,8 @@ def _cast_rule(model, cast_dtype):
     return cast_for
 
 
-def _table_for(store, module, path, fraction, cast_for):
-    """A ``_RowTable`` over ``module``'s tensors, or the reason they cannot be read from the checkpoint."""
+def _table_fields(store, module, path, cast_for):
+    """The checkpoint names and casts of ``module``'s tensors, or the reason they cannot be read."""
     fields = ["weight"]
     if _quantization_of(module) is not None:
         fields += ["scales"] + (["biases"] if module.get("biases") is not None else [])
@@ -382,8 +386,25 @@ def _table_for(store, module, path, fraction, cast_for):
             return None, reason
         names[field] = name
         casts[field] = cast_for(parameter, module[field].dtype)
-    resident = int(module["weight"].shape[0] * (1 - fraction))
-    return _RowTable(store, names, resident, casts), None
+    return (names, casts), None
+
+
+def _ple_parts(store, path, module, cast_for):
+    """``[(part, (names, casts))]`` and the quantization of a PLE table, or why it stays in memory."""
+    if type(module).__name__ == "ShardedEmbedding":
+        parts = [(f"{path}.shards.{i}", shard) for i, shard in enumerate(module.shards)]
+    else:
+        parts = [(path, module)]
+    quantizations = {_quantization_of(part) for _, part in parts}
+    if len(quantizations) != 1:
+        return None, None, "its shards are quantized differently"
+    found = []
+    for part_path, part in parts:
+        fields, reason = _table_fields(store, part, part_path, cast_for)
+        if reason is not None:
+            return None, None, reason
+        found.append((part, fields))
+    return found, quantizations.pop(), None
 
 
 def offload_ple(model, model_dir, fraction, *, cast_dtype = None):
@@ -396,25 +417,15 @@ def offload_ple(model, model_dir, fraction, *, cast_dtype = None):
     store = CheckpointTensors(model_dir)
     report = {"tables": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}
     for path, module in list(ple_sites(model)):
-        sharded = type(module).__name__ == "ShardedEmbedding"
-        if sharded:
-            parts = [(f"{path}.shards.{i}", shard) for i, shard in enumerate(module.shards)]
-        else:
-            parts = [(path, module)]
-        quantizations = {_quantization_of(part) for _, part in parts}
-        if len(quantizations) != 1:
-            report["skipped"].append((path, "its shards are quantized differently"))
-            continue
-        tables, reason = [], None
-        for part_path, part in parts:
-            table, reason = _table_for(store, part, part_path, fraction, cast_for)
-            if table is None:
-                break
-            tables.append(table)
+        parts, quantization, reason = _ple_parts(store, path, module, cast_for)
         if reason is not None:
             report["skipped"].append((path, reason))
             continue
-        quantization = quantizations.pop()
+        tables = [
+            _RowTable(store, names, int(part["weight"].shape[0] * (1 - fraction)), casts)
+            for part, (names, casts) in parts
+        ]
+        sharded = type(module).__name__ == "ShardedEmbedding"
         dims = module.dims if sharded or quantization is not None else module["weight"].shape[-1]
         replacement = DiskEmbedding(tables, quantization, dims, normalize_zero = sharded)
         _replace_module(model, path, replacement)
@@ -755,6 +766,63 @@ def _top_k(model, path):
     return None
 
 
+def _expert_fields(model, store, path, glu, cast_for):
+    """``(fields, top_k)`` of a ``SwitchGLU`` whose experts can be read from disk, or why not."""
+    top_k = _top_k(model, path)
+    if top_k is None:
+        return None, None, "its routing top-k is unknown"
+    fields = []
+    for projection in _PROJECTIONS:
+        linear = getattr(glu, projection)
+        if getattr(linear, "global_scale", None) is not None:
+            return None, None, "its experts have global scales"
+        for name in _EXPERT_FIELDS:
+            if linear.get(name) is None:
+                continue
+            parameter = f"{path}.{projection}.{name}"
+            tensor, reason = _checkpoint_tensor(store, parameter, linear[name])
+            if reason is not None:
+                return None, None, reason
+            fields.append((projection, name, _Field(store, name, tensor, cast_for(parameter, linear[name].dtype))))
+    return fields, top_k, None
+
+
+def offloadable(model, model_dir, *, cast_dtype = None):
+    """What ``offload_ple`` / ``offload_experts`` could take from the unevaluated ``model``, at the
+    load's cast: bytes, the experts kept at full offload, and ``ple`` / ``experts``, ``None`` or why not."""
+    cast_for = _cast_rule(model, cast_dtype)
+    store = CheckpointTensors(model_dir)
+    loaded = lambda array, cast: array.size * (cast or array.dtype).size
+    found = {
+        "ple_bytes": 0, "expert_bytes": 0, "expert_floor_bytes": 0, "experts_per_layer": 0,
+        "expert_layer_bytes": 0, "ple": "the model has no per-layer embedding table",
+        "experts": "the model has no stacked quantized routed experts",
+    }
+    skipped = {"ple": None, "experts": None}
+    for path, module in ple_sites(model):
+        parts, _, reason = _ple_parts(store, path, module, cast_for)
+        if reason is not None:
+            skipped["ple"] = skipped["ple"] or reason
+            continue
+        found["ple_bytes"] += sum(loaded(part[field], casts[field]) for part, (names, casts) in parts for field in names)
+    for path, glu in expert_sites(model):
+        fields, top_k, reason = _expert_fields(model, store, path, glu, cast_for)
+        experts = glu.up_proj["weight"].shape[0]
+        if reason is None and max(8, top_k) >= experts:
+            reason = f"its {experts} experts per layer all stay resident"
+        if reason is not None:
+            skipped["experts"] = skipped["experts"] or reason
+            continue
+        size = sum(loaded(getattr(glu, projection)[name], field.cast) for projection, name, field in fields)
+        found["expert_bytes"] += size
+        found["expert_floor_bytes"] += size * max(8, top_k) // experts
+        found["experts_per_layer"] = max(found["experts_per_layer"], experts)
+        found["expert_layer_bytes"] = max(found["expert_layer_bytes"], size)
+    for key, size in (("ple", "ple_bytes"), ("experts", "expert_bytes")):
+        found[key] = None if found[size] else skipped[key] or found[key]
+    return found
+
+
 def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
     """Replace every ``SwitchGLU`` of quantized experts in ``model`` with an ``OffloadSwitchGLU``
     that reads experts from ``model_dir``'s shards into slots for ``1 - fraction`` of each layer's
@@ -766,32 +834,13 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
     report = {"layers": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}
     for path, glu in list(expert_sites(model)):
         experts = glu.up_proj["weight"].shape[0]
-        top_k = _top_k(model, path)
-        if top_k is None:
-            report["skipped"].append((path, "its routing top-k is unknown"))
-            continue
-        capacity = max(8, top_k, int(experts * (1 - fraction)))
-        if capacity >= experts:
-            report["skipped"].append((path, f"{experts} experts fit in {capacity} slots"))
-            continue
-        fields, reason = [], None
-        for projection in _PROJECTIONS:
-            linear = getattr(glu, projection)
-            if getattr(linear, "global_scale", None) is not None:
-                reason = "its experts have global scales"
-                break
-            for name in _EXPERT_FIELDS:
-                if linear.get(name) is None:
-                    continue
-                parameter = f"{path}.{projection}.{name}"
-                tensor, reason = _checkpoint_tensor(store, parameter, linear[name])
-                if reason is not None:
-                    break
-                fields.append((projection, name, _Field(store, name, tensor, cast_for(parameter, linear[name].dtype))))
-            if reason is not None:
-                break
+        fields, top_k, reason = _expert_fields(model, store, path, glu, cast_for)
         if reason is not None:
             report["skipped"].append((path, reason))
+            continue
+        capacity = max(8, top_k, experts - math.ceil(experts * fraction - 1e-9))
+        if capacity >= experts:
+            report["skipped"].append((path, f"{experts} experts fit in {capacity} slots"))
             continue
         slots = _ExpertSlots(fields, experts, capacity)
         stock = copy.copy(glu)

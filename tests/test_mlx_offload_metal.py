@@ -17,7 +17,9 @@
 """PLE and expert offload: weights read from the checkpoint compute the stock modules' outputs, bit for bit."""
 
 import gc
+import json
 import os
+import warnings
 
 import numpy as np
 import pytest
@@ -32,8 +34,14 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map
 
-from unsloth_zoo.mlx.loader import FastMLXModel, _apply_offload, _convert_mlx_dtype, _mlx_save_pretrained_merged
-from unsloth_zoo.mlx.offload import DiskEmbedding, OffloadSwitchGLU, offload_experts, offload_fraction, offload_ple
+from unsloth_zoo.mlx import offload_plan
+from unsloth_zoo.mlx.loader import (
+    FastMLXModel, _apply_offload, _auto_offload, _convert_mlx_dtype, _mlx_save_pretrained_merged, _settle_offload,
+)
+from unsloth_zoo.mlx.offload import (
+    DiskEmbedding, OffloadSwitchGLU, offload_experts, offload_fraction, offload_ple, offloadable,
+)
+from unsloth_zoo.mlx.offload_plan import context_bytes, offload_inventory, plan_offload
 
 
 @pytest.fixture(autouse = True)
@@ -172,14 +180,14 @@ def test_offloaded_floats_get_the_load_cast(tmp_path, cast):
     assert report["resident_bytes"] == sum(column.nbytes for column in held) > 0
 
 
-def _moe(lib, dims = 512, hidden = 32, scales = mx.bfloat16, eval = True, quantized = True):
+def _moe(lib, dims = 512, hidden = 32, scales = mx.bfloat16, eval = True, quantized = True, experts = 64):
     """One MoE layer of 64 quantized experts, top-4, from mlx-vlm's or mlx-lm's ``SwitchGLU``; 512
     wide, as mlx-vlm's decode-block kernels require."""
     switch_layers = pytest.importorskip(f"mlx_{lib}.models.switch_layers")
     mx.random.seed(0)
     block = nn.Module()
     block.top_k = 4
-    block.switch_mlp = switch_layers.SwitchGLU(dims, hidden, 64)
+    block.switch_mlp = switch_layers.SwitchGLU(dims, hidden, experts)
     model = nn.Module()
     model.layers = [block]
     if not quantized:
@@ -285,7 +293,8 @@ def test_offload_controls_and_refusals(tmp_path):
         assert offload_fraction("ple_offload", off) is None
     assert offload_fraction("ple_offload", 0.25) == 0.25
     assert offload_fraction("ple_offload", 1) == 1.0
-    for bad in (1.5, -0.1, True, "auto", "0.5"):
+    assert offload_fraction("ple_offload", "auto") == offload_fraction("ple_offload", True) == "auto"
+    for bad in (1.5, -0.1, "on", "0.5"):
         with pytest.raises(ValueError, match = "ple_offload"):
             offload_fraction("ple_offload", bad)
 
@@ -303,6 +312,12 @@ def test_offload_controls_and_refusals(tmp_path):
     model.layers[0].top_k = 12  # the slots hold at least one token's routes
     offload_experts(model, str(top_12), 1.0)
     assert model.layers[0].switch_mlp._slots.capacity == 12
+    # A planned fraction keeps exactly its whole experts, whatever the float rounding.
+    sixty = tmp_path / "sixty"
+    sixty.mkdir()
+    model = _lazy_copy(lambda: _moe("lm", experts = 60), str(sixty))
+    offload_experts(model, str(sixty), (60 - 25) / 60)
+    assert model.layers[0].switch_mlp._slots.capacity == 25
 
     # An offloaded load caps MLX's buffer cache at 1 GiB (keeping a lower limit) while it lives;
     # one that offloads nothing leaves it alone.
@@ -312,7 +327,7 @@ def test_offload_controls_and_refusals(tmp_path):
             mx.set_cache_limit(limit)
             models = [_lazy_copy(lambda: _moe("lm"), str(top_12)) for _ in range(2)]
             for offloaded in models:
-                _apply_offload(offloaded, str(top_12), None, 1.0, None)
+                _apply_offload(offloaded, str(top_12), None, 1.0, None, 2048)
             del offloaded
             assert _cache_limit() == capped
             del models[0]
@@ -323,17 +338,18 @@ def test_offload_controls_and_refusals(tmp_path):
             assert _cache_limit() == limit
         mx.set_cache_limit(4 << 30)
         ple = _lazy_copy(lambda: _holder("embed_tokens_per_layer", nn.Embedding(16, 8)), str(tmp_path))
-        _apply_offload(ple, str(tmp_path), 1.0, None, None)
+        _apply_offload(ple, str(tmp_path), 1.0, None, None, 2048)
         assert _cache_limit() == 1 << 30
         del ple
         gc.collect()
         model = _lazy_copy(lambda: _moe("lm", quantized = False), str(dense))
-        _apply_offload(model, str(dense), None, 1.0, None)
+        with pytest.warns(UserWarning, match = "expert_offload is set, but this model has no quantized MoE experts"):
+            _apply_offload(model, str(dense), None, 1.0, None, 2048)
         assert _cache_limit() == 4 << 30
         # A limit set since the cap, lower or higher, stays when the model goes.
         for newer in (256 << 20, 2 << 30):
             ple = _lazy_copy(lambda: _holder("embed_tokens_per_layer", nn.Embedding(16, 8)), str(tmp_path))
-            _apply_offload(ple, str(tmp_path), 1.0, None, None)
+            _apply_offload(ple, str(tmp_path), 1.0, None, None, 2048)
             mx.set_cache_limit(newer)
             del ple
             gc.collect()
@@ -354,3 +370,178 @@ def test_offload_controls_and_refusals(tmp_path):
     with pytest.raises(ValueError, match = "inference only"):
         _mlx_save_pretrained_merged(model, str(tmp_path / "merged"), tokenizer = object())
     assert not (tmp_path / "merged").exists()
+
+
+def test_offloadable(tmp_path):
+    def build():
+        model = _moe("lm")
+        model.language_model = _holder(*_table("quantized")).language_model
+        return model
+
+    # What it counts is what the offload then takes, and in float32 the bytes the load would hold.
+    model = _lazy_copy(build, str(tmp_path))
+    found = offloadable(model, str(tmp_path))
+    wide = lambda prefix: sum(
+        v.size * 4 if mx.issubdtype(v.dtype, mx.floating) else v.nbytes
+        for k, v in tree_flatten(model.parameters()) if k.startswith(prefix)
+    )
+    assert offloadable(model, str(tmp_path), cast_dtype = mx.float32) == {
+        **found, "ple_bytes": wide("language_model"), "expert_bytes": wide("layers"),
+        "expert_floor_bytes": wide("layers") * 8 // 64, "expert_layer_bytes": wide("layers"),
+    }
+    assert wide("layers") > found["expert_bytes"]
+    ple, experts = (offload(model, str(tmp_path), 1.0) for offload in (offload_ple, offload_experts))
+    assert found == {
+        "ple_bytes": ple["on_disk_bytes"], "expert_bytes": experts["on_disk_bytes"],
+        "expert_floor_bytes": experts["resident_bytes"], "experts_per_layer": 64,
+        "expert_layer_bytes": experts["on_disk_bytes"], "ple": None, "experts": None,
+    }
+    # Experts the offload keeps in memory are not counted, with its reason.
+    for change, reason in ((lambda block: delattr(block, "top_k"), "its routing top-k is unknown"),
+                           (lambda block: setattr(block, "top_k", 64), "its 64 experts per layer all stay resident")):
+        model = _lazy_copy(build, str(tmp_path))
+        change(model.layers[0])
+        found = offloadable(model, str(tmp_path))
+        assert (found["expert_bytes"], found["experts"]) == (0, reason) and found["ple"] is None
+
+
+def _inventory(ple = 30, experts = 64, floor = 2, per_layer = 64):
+    return {
+        "total_bytes": 0, "ple_bytes": ple, "expert_bytes": experts, "expert_floor_bytes": floor,
+        "experts_per_layer": per_layer, "expert_layer_bytes": 0, "ple": None, "experts": None,
+    }
+
+
+def _plan(budget, inventory = None, cost = lambda t, step: t // 256 + (step // 2048 - 1) * 4, **kwargs):
+    # Sizes in arbitrary units: a unit per 256 tokens of context, 4 more per 2048 tokens of prefill
+    # step beyond the first.
+    return plan_offload(
+        budget = budget, resident = 4, inventory = inventory or _inventory(), context_cost = cost,
+        ple_overhead = 1, expert_overhead = 2, ceiling = 8192, minimum = 1024, **{"margin": (0, 0), **kwargs},
+    )
+
+
+def test_offload_inventory(tmp_path):
+    lazy = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    experts = sum(value.nbytes for _, value in tree_flatten(lazy.parameters()))
+    table = mx.zeros((32, 8), mx.bfloat16)
+    mx.save_safetensors(str(tmp_path / "extra.safetensors"), {
+        "language_model.model.embed_tokens_per_layer.weight": table,
+        # the drafter head is never offloaded
+        **{f"mtp.layers.0.switch_mlp.{p}.{f}": table for p in ("gate_proj", "up_proj", "down_proj") for f in ("weight", "scales")},
+    })
+    config = {"text_config": {"num_experts_per_tok": 4}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    inventory = offload_inventory(str(tmp_path))
+    assert inventory == {
+        "total_bytes": experts + 7 * table.nbytes, "ple_bytes": table.nbytes, "expert_bytes": experts,
+        "expert_floor_bytes": experts * 8 // 64, "experts_per_layer": 64, "expert_layer_bytes": experts,
+        "ple": None, "experts": None,
+    }
+    # Loaded at four bytes an element, floating-point tensors (bf16 here) double; packed weights do not.
+    widened = sum(v.size * 4 if mx.issubdtype(v.dtype, mx.floating) else v.nbytes for _, v in tree_flatten(lazy.parameters()))
+    inventory = offload_inventory(str(tmp_path), 4)
+    assert (inventory["ple_bytes"], inventory["expert_bytes"]) == (2 * table.nbytes, widened) and widened > experts
+
+    (tmp_path / "config.json").write_text("{}")
+    assert offload_inventory(str(tmp_path))["experts"] == "its routing top-k is unknown"
+    dense = tmp_path / "dense"
+    dense.mkdir()
+    _lazy_copy(lambda: _moe("lm", quantized = False), str(dense))
+    (dense / "config.json").write_text(json.dumps(config))
+    inventory = offload_inventory(str(dense))
+    assert inventory["experts"] == "its routed experts are not quantized" and inventory["expert_bytes"] == 0
+    assert inventory["ple"] == "the model has no per-layer embedding table"
+    # offload_experts keeps experts with global scales in memory, so they are not offloadable.
+    scaled = tmp_path / "scaled"
+    scaled.mkdir()
+    lazy = _lazy_copy(lambda: _moe("lm"), str(scaled))
+    up = next(k for k, _ in tree_flatten(lazy.parameters()) if k.endswith("up_proj.weight"))
+    mx.save_safetensors(str(scaled / "scale.safetensors"), {up.replace(".weight", ".global_scale"): mx.ones((64,))})
+    (scaled / "config.json").write_text(json.dumps(config))
+    inventory = offload_inventory(str(scaled))
+    assert inventory["experts"] == "its experts have global scales" and inventory["expert_bytes"] == 0
+    # A layer counts only with all three projections quantized.
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    mx.save_safetensors(str(partial / "model.safetensors"), {
+        k: v for k, v in tree_flatten(lazy.parameters()) if not k.startswith(up.replace("up_proj.weight", "down_proj.s"))
+    })
+    (partial / "config.json").write_text(json.dumps(config))
+    assert offload_inventory(str(partial))["experts"] == "its routed experts are not quantized"
+
+
+def test_plan_offload_rule():
+    plan = lambda ple, experts, context, step: {"ple": ple, "experts": experts, "context": context, "prefill_step": step}
+    # 8192 tokens (32 units) is the ceiling; without offloaded experts the step stays 2048.
+    assert _plan(200) == plan(None, None, 8192, 2048)
+    assert _plan(4 + 32 + 94) == plan(None, None, 8192, 2048)
+    assert _plan(4 + 32 + 93) == plan(1.0, None, 8192, 2048)
+    # 40 units of room: context takes half (5120 tokens) and experts pay, in whole experts. At step
+    # 2048, 20 - PLE overhead 1 - expert overhead 2 = 17 of 64 stay (47 offloaded, 47/2048 per
+    # token); at 4096, 13 stay (51/4096 per token: fewer re-read bytes); 8192 is past the context.
+    assert _plan(44) == plan(1.0, 51 / 64, 5120, 4096)
+    assert _plan(44, prefill_step = 2048) == plan(1.0, 47 / 64, 5120, 2048)
+    # A pinned context keeps its size; with the PLE knob off, experts alone pay; 8192 does not fit.
+    assert _plan(4 + 32 + 42, context = 8192, ple_offload = None) == plan(None, 58 / 64, 8192, 4096)
+    assert _plan(40, context = 8192) == plan(None, None, None, None)
+    # Nothing fits next to half the room: context drops to what the smallest footprint leaves.
+    assert _plan(24, _inventory(floor = 8)) == plan(1.0, 56 / 64, 2304, 2048)
+    assert _plan(18, _inventory(floor = 8)) == plan(None, None, None, None)
+    # The safety margin, absolute or a fraction of the estimate, comes off the budget first.
+    assert _plan(4 + 32 + 94 + 10, margin = (10, 0)) == plan(None, None, 8192, 2048)
+    assert _plan(4 + 32 + 94 + 9, margin = (10, 0)) == plan(1.0, None, 8192, 2048)
+    assert _plan(134, margin = (0, 0.03)) == plan(None, None, 8192, 2048)
+    assert _plan(133, margin = (0, 0.03)) == plan(1.0, None, 8192, 2048)
+    # A hand-set fraction is kept; only the auto knob and the step are chosen.
+    assert _plan(200, expert_offload = 0.5) == plan(None, 0.5, 8192, 8192)
+
+
+def test_context_bytes(tmp_path):
+    config = {"num_hidden_layers": 8, "full_attention_interval": 4, "num_key_value_heads": 2, "head_dim": 64, "vocab_size": 0}
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": config}))
+    assert context_bytes(str(tmp_path), 1000) == 2 * 2 * 2 * 64 * 2 * 2 * 1000 + (2 << 30)
+    # Omni models keep the decoder's config under the thinker; the talker's is not the one priced.
+    talker = {**config, "num_key_value_heads": 64}
+    (tmp_path / "config.json").write_text(json.dumps({"talker_config": {"text_config": talker}, "thinker_config": {"text_config": config}}))
+    assert context_bytes(str(tmp_path), 1000) == 2 * 2 * 2 * 64 * 2 * 2 * 1000 + (2 << 30)
+    (tmp_path / "config.json").write_text(json.dumps({"vision_config": config}))
+    with pytest.raises(ValueError, match = "cannot be priced"):
+        context_bytes(str(tmp_path), 1000)
+    config.update(layer_types = ["sliding_attention", "full_attention", "linear_attention"], sliding_window = 100, vocab_size = 10)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert context_bytes(str(tmp_path), 1000, 4096) == 2 * 2 * 2 * 64 * 2 * (1000 + 100) + 4 * 4096 * 10 + (2 << 30)
+
+
+def test_auto_offload(tmp_path, monkeypatch):
+    model = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 4, "vocab_size": 16, "num_hidden_layers": 2, "num_key_value_heads": 2, "head_dim": 8}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # nothing to offload, nothing said
+        assert _auto_offload(model, str(tmp_path), "auto", "auto", 4096, mx.bfloat16)[:2] == (None, None)
+    seen = {}
+    monkeypatch.setattr(offload_plan, "plan_offload", lambda **k: seen.update(k) or {"ple": None, "experts": 0.75, "context": 4096, "prefill_step": 8192})
+    with pytest.warns(UserWarning, match = r"expert_offload='auto' leaves 75% .*fit in .*prefill_step_size=8192"):
+        assert _auto_offload(model, str(tmp_path), 0.5, "auto", 4096, mx.float32)[:2] == (0.5, 0.75)
+    # The checkpoint's size and what this model can offload, at the dtype the load converts to.
+    assert seen["inventory"] == {**offload_inventory(str(tmp_path), 4), **offloadable(model, str(tmp_path), cast_dtype = mx.float32)}
+    assert seen["inventory"]["expert_bytes"] > offloadable(model, str(tmp_path))["expert_bytes"]
+    assert seen["context_cost"](1000, 4096) == context_bytes(str(tmp_path), 1000, 4096, 4)
+    monkeypatch.setattr(offload_plan, "plan_offload", lambda **_: {"ple": None, "experts": None, "context": None, "prefill_step": None})
+    with pytest.warns(UserWarning) as record:  # all that can go to disk does; there is no PLE table
+        assert _auto_offload(model, str(tmp_path), "auto", "auto", 4096, mx.bfloat16)[:2] == (None, 1.0)
+    said = [str(w.message) for w in record]
+    assert len(said) == 2 and "do not fit" in said[0] and "leaves 100%" in said[1] and "fit in" not in said[1]
+
+    monkeypatch.setattr(offload_plan, "plan_offload", lambda **k: seen.update(k) or {"ple": None, "experts": None, "context": 4096, "prefill_step": 2048})
+    del model.layers[0].top_k  # the experts this model's offload keeps, the headers alone would count
+    assert _auto_offload(model, str(tmp_path), None, "auto", 4096, mx.bfloat16)[:2] == (None, None)
+    assert seen["inventory"]["expert_bytes"] == 0 < offload_inventory(str(tmp_path))["expert_bytes"]
+    (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 4}))  # a context it cannot price
+    with pytest.warns(UserWarning, match = "cannot be priced. .*'auto' stay off"):
+        assert _auto_offload(model, str(tmp_path), 0.5, "auto", 4096, mx.bfloat16) == (0.5, None, None)
+
+    assert _settle_offload("auto", 0.5, False, "refused") == ("auto", 0.5)
+    assert _settle_offload("auto", None, True, "refused") == (None, None)
+    with pytest.raises(ValueError, match = "refused"):
+        _settle_offload("auto", 0.5, True, "refused")
