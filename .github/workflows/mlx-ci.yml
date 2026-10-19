@@ -191,13 +191,9 @@ jobs:
         run: python -m pytest tests/test_mlx_decode_metal.py -v -rs
 
       - name: tests/test_mlx_load_residency_metal.py
-        # A finished load must own its weights.
+        # A finished load must own its weights; an offloaded one reads PLE rows and
+        # experts from the checkpoint, bit-exact against the stock modules.
         run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
-
-      - name: tests/test_mlx_offload_metal.py
-        # PLE tables read by row from the checkpoint: bit-exact against the stock
-        # embeddings, never loaded, cast like the load, and refused for training.
-        run: python -m pytest tests/test_mlx_offload_metal.py -v -rs
 
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
