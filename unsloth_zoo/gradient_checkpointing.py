@@ -1658,7 +1658,7 @@ pass
 
 class _OffloadedActivation:
     """One saved activation: a host copy (`copied` marks the D2H), or still a device tensor."""
-    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "index", "pinned_bytes", "unpacked", "__weakref__")
+    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "index", "pinned_bytes", "unpacked", "group", "__weakref__")
 
     def __init__(self, device, index):
         self.device        = device
@@ -1669,6 +1669,7 @@ class _OffloadedActivation:
         self.index         = index
         self.pinned_bytes  = 0
         self.unpacked      = False
+        self.group         = 0     # which hooks() entry (checkpoint call) packed it
 
     def __del__(self):
         try:
@@ -1688,7 +1689,7 @@ class NonReentrantActivationOffloader:
     UNSLOTH_GC_OFFLOAD_BACKEND=unsloth_stream (from the datta0/unsloth-zoo FSDP2 prototype)
     also keeps the last UNSLOTH_GC_STREAM_KEEP_LAST (default 1) activations on the device,
     whose backward comes first, and reloads layer i-1 on a second side stream while layer i
-    recomputes. Costs up to one more activation of VRAM each way.
+    recomputes. Costs up to one more layer's checkpoint inputs of VRAM each way.
     """
     def __init__(self, stream_mode = None):
         if stream_mode is None:
@@ -1713,6 +1714,7 @@ class NonReentrantActivationOffloader:
         # Weak, so a graph dropped without backward frees its activations. Forward order.
         self.order = []
         self.backward_started = False
+        self.group = 0
         self.stats = {"pinned": 0, "pageable": 0, "kept": 0, "prefetched": 0, "prefetch_hits": 0}
     pass
 
@@ -1777,6 +1779,7 @@ class NonReentrantActivationOffloader:
             self.backward_started = False
             self.order = []
         record = _OffloadedActivation(x.device, len(self.order))
+        record.group = self.group
         self.order.append(weakref.ref(record))
         x = x.detach()
         if self.stream_mode and self.keep_last > 0:
@@ -1804,7 +1807,10 @@ class NonReentrantActivationOffloader:
         side = self._stream(self.h2d_streams, device_index)
         # Allocated on the compute stream, which consumes it; the side stream waits for
         # that stream's earlier users of the block and for this record's D2H.
-        x = torch.empty_like(record.host, device = record.device)
+        try:
+            x = torch.empty_like(record.host, device = record.device)
+        except torch.cuda.OutOfMemoryError:
+            return  # unpack reloads it in place instead
         side.wait_stream(compute)
         if record.copied is not None: side.wait_event(record.copied)
         with torch.cuda.stream(side):
@@ -1816,14 +1822,21 @@ class NonReentrantActivationOffloader:
         self.stats["prefetched"] += 1
     pass
 
-    def _prefetch_target(self, index):
+    def _prefetch_target(self, index, group):
         """The newest record before `index` still to be reloaded. A checkpoint with several saved
         inputs unpacks them back to back: skipping its own handed out inputs and the ones already
         prefetched makes each unpack queue one input of the previous checkpoint, so all of them
-        are reloaded early, not only the one at index - 1. Single input checkpoints get index - 1."""
-        index -= 1
+        are reloaded early, not only the one at index - 1. Single input checkpoints get index - 1.
+        Never past the previous checkpoint, so at most its inputs wait on the device, and only
+        index - 1 when the hooks were not entered per checkpoint (one group for every record)."""
+        start = index - 1
+        index = start
         while index >= 0:
             record = self.order[index]() if index < len(self.order) else None
+            if record is not None and (record.group < group - 1 or (
+                record.group == group and not record.unpacked and index != start
+            )):
+                return -1
             if record is None or not (record.unpacked or record.device_tensor is not None): break
             index -= 1
         return index
@@ -1848,11 +1861,13 @@ class NonReentrantActivationOffloader:
         else:
             if record.copied is not None: compute.wait_event(record.copied)
             x = record.host.to(record.device, non_blocking = True)
-        if self.stream_mode: self._prefetch(self._prefetch_target(record.index))
+        if self.stream_mode: self._prefetch(self._prefetch_target(record.index, record.group))
         return x
     pass
 
     def hooks(self):
+        # One call per checkpoint (vision.py wraps each checkpoint call): groups its saved inputs.
+        self.group += 1
         return torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack)
     pass
 pass

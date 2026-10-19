@@ -187,6 +187,71 @@ def test_stream_prefetch_reloads_every_input_of_the_previous_checkpoint(gc_modul
     assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"]
 
 
+class _ThreeInputLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Linear(256, 256)
+
+    def forward(self, h, g, k):
+        return torch.tanh(self.a(h) + g + k)
+
+
+def _max_prefetched_waiting(offloader, monkeypatch):
+    # Largest number of reloads sitting on the device ahead of their unpack at any point.
+    peak = [0]
+    original = offloader._prefetch
+
+    def counting(index):
+        original(index)
+        live = (ref() for ref in offloader.order)
+        peak[0] = max(peak[0], sum(1 for r in live if r is not None and r.ready is not None))
+
+    monkeypatch.setattr(offloader, "_prefetch", counting)
+    return peak
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_stream_prefetch_never_reaches_past_the_previous_checkpoint(gc_module, monkeypatch):
+    # A three input checkpoint after single input ones: its three unpacks may only reload the
+    # one input of the checkpoint before it, not walk on into older checkpoints.
+    monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", "0")
+    torch.manual_seed(0)
+    singles = [torch.nn.Linear(256, 256).cuda() for _ in range(3)]
+    last = _ThreeInputLayer().cuda()
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = True)
+    peak = _max_prefetched_waiting(offloader, monkeypatch)
+    h = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    g = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    for layer in singles:
+        with offloader.hooks():
+            h = ckpt.checkpoint(layer, h, use_reentrant = False)
+    with offloader.hooks():
+        out = ckpt.checkpoint(last, h, g, h * 2, use_reentrant = False)
+    out.float().square().mean().backward()
+    torch.cuda.synchronize()
+    assert peak[0] == 1
+    assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"] == len(singles) - 1 + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_stream_prefetch_is_one_step_when_hooks_span_every_checkpoint(gc_module, monkeypatch):
+    # One hooks() entry around all checkpoints gives no checkpoint boundaries: keep to index - 1,
+    # so at most the next reload is queued while one still waits, however deep the stack is.
+    monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", "0")
+    torch.manual_seed(0)
+    layers = [_TwoInputLayer().cuda() for _ in range(8)]
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = True)
+    peak = _max_prefetched_waiting(offloader, monkeypatch)
+    h = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    g = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    with offloader.hooks():
+        for layer in layers:
+            h, g = ckpt.checkpoint(layer, h, g, use_reentrant = False)
+    (h.float().square().mean() + g.float().mean()).backward()
+    torch.cuda.synchronize()
+    assert peak[0] <= 2
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_low_ram_growth_fallback_frees_the_old_pinned_block(gc_module, monkeypatch):
     # One local rank, host RAM short: the grown slot goes pageable and its old pinned block must
