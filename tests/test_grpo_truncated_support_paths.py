@@ -76,7 +76,7 @@ class _Model(torch.nn.Module):
         return types.SimpleNamespace(logits = hidden)
 
 
-def _new_logps(monkeypatch, support, recompute = False, entropy = False):
+def _new_logps(monkeypatch, support, recompute = False, entropy = False, refused = False):
     """The new logprobs grpo_accumulated_loss hands to the loss for a top_k = 2 vLLM rollout."""
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
@@ -103,6 +103,9 @@ def _new_logps(monkeypatch, support, recompute = False, entropy = False):
         accelerator = types.SimpleNamespace(unwrap_model = lambda m, keep_fp32_wrapper = False: m, scaler = None),
         use_vllm = True, beta = 0.0, vllm_importance_sampling_correction = False, _autocast_dtype = None,
     )
+    if refused:
+        # Set by unsloth when the scored policy is not the sampler (e.g. vLLM weight sync skipped).
+        trainer._unsloth_truncated_support_refused = True
     if entropy:
         args.top_entropy_quantile = 0.5
         trainer.get_high_entropy_mask = lambda ent, mask, q: torch.ones_like(mask, dtype = torch.bool)
@@ -124,6 +127,14 @@ def test_recompute_helper_takes_the_truncated_support(monkeypatch):
     torch.testing.assert_close(_new_logps(monkeypatch, support = True, recompute = True), truncated)
     # Off, the recompute helper is untouched.
     torch.testing.assert_close(_new_logps(monkeypatch, support = False, recompute = True), full)
+
+
+def test_refused_trainer_scores_the_full_vocabulary(monkeypatch):
+    # No old / ref logps here (beta = 0, efficient path): only unsloth's refusal can tell the loss
+    # that the current policy's kept set is not the sampler's.
+    full = _new_logps(monkeypatch, support = False)
+    torch.testing.assert_close(_new_logps(monkeypatch, support = True, refused = True), full)
+    assert not torch.allclose(_new_logps(monkeypatch, support = True), full)
 
 
 def test_entropy_scoring_keeps_the_truncated_support(monkeypatch):
