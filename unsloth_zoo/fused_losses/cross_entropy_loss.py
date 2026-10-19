@@ -34,6 +34,7 @@ import sys
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bounds
 from unsloth_zoo.device_type import DEVICE_TYPE
+from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
         
 
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
@@ -696,32 +697,79 @@ def _fused_loss_opaque(*args):
 # UNSLOTH_CHUNKED_CE=0 keeps the torch.func path below for every call.
 _CHUNKED_CE = os.environ.get("UNSLOTH_CHUNKED_CE", "1") != "0"
 _CHUNKED_CE_KWARGS = frozenset(("ignore_index", "logit_scale_multiply", "logit_scale_divide", "logit_softcapping"))
+# The fused linear kernel also implements these; UNSLOTH_FUSED_LINEAR=0 sends them back to the torch.func path.
+_FUSED_LINEAR_CE_KWARGS = _CHUNKED_CE_KWARGS | frozenset(("label_smoothing", "logits_bias"))
 
 
 def _use_chunked_ce(kwargs, target_gb):
-    # Plain token CE only: label smoothing, logits_bias, n_chunks and explicit memory targets keep the old path.
+    # n_chunks and explicit memory targets keep the old path.
     if not _CHUNKED_CE or target_gb is not None or TARGET_GB or N_CHUNKS:
         return False
-    # Opt-ins only the old path implements: fp32 head-gradient accumulation, no fused-CE compile.
-    if FP32_HEAD_GRAD or _FUSED_CE_COMPILE_DISABLED:
+    # The fused-CE compile opt-out keeps the path it was written for.
+    if _FUSED_CE_COMPILE_DISABLED:
+        return False
+    if _chunked_logprob._FUSED_LINEAR:
+        return all(k in _FUSED_LINEAR_CE_KWARGS for k in kwargs)
+    # Without the fused linear kernel: plain token CE only, fp32 head-gradient accumulation stays on the old path.
+    if FP32_HEAD_GRAD:
         return False
     if float(kwargs.get("label_smoothing", 0.0) or 0.0) != 0.0:
         return False
     return all(k in _CHUNKED_CE_KWARGS or k == "label_smoothing" for k in kwargs)
 
 
+def _scaler_scale(scaling):
+    """GradScaler -> its scale as a device tensor (get_scale() is a host sync, and a graph break when compiled)."""
+    if not hasattr(scaling, "get_scale"):
+        return scaling
+    # GradScaler's attributes, not is_enabled() / get_scale(): dynamo skips torch.amp methods, so each call was a
+    # graph break in every compiled step.
+    enabled = getattr(scaling, "_enabled", None)
+    if enabled is None and hasattr(scaling, "is_enabled"):
+        enabled = scaling.is_enabled()
+    if enabled is False:
+        return None
+    scale = getattr(scaling, "_scale", None)
+    if torch.is_tensor(scale):
+        return scale.detach().reshape(())
+    # Step 0: the first scaler.scale() has not allocated the scale yet, so it is still the initial value.
+    init = getattr(scaling, "_init_scale", None)
+    return float(init) if init is not None else scaling.get_scale()
+
+
+def _chunked_ce(hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs):
+    # Traceable with the fused linear op: the row compaction and every chunk loop run inside it, so a compiled forward
+    # keeps one graph through the loss. Without it (UNSLOTH_FUSED_LINEAR=0) the eager chunked path boolean-indexes
+    # rows and reads the scale on the host, so it stays opaque to dynamo as before.
+    if not _chunked_logprob._FUSED_LINEAR:
+        return _chunked_ce_opaque(
+            hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,
+        )
+    return _chunked_ce_traced(
+        hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,
+    )
+
+
+def _chunked_ce_traced(hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels,
+                       kwargs):
+    return _chunked_logprob.unsloth_chunked_ce_loss(
+        hidden_states, lm_head_weight, lm_head_bias, labels, mask = mask, n_items = n_items,
+        scaling = _scaler_scale(scaling), shift_labels = shift_labels,
+        ignore_index = int(kwargs.get("ignore_index", -100)),
+        logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0),
+        logit_scale_divide = kwargs.get("logit_scale_divide", 0.0),
+        logit_softcapping = kwargs.get("logit_softcapping", 0.0),
+        label_smoothing = float(kwargs.get("label_smoothing", 0.0) or 0.0),
+        logits_bias = kwargs.get("logits_bias", None),
+        fp32_head_grad = FP32_HEAD_GRAD,
+    )
+
+
 @torch.compiler.disable
 def _chunked_ce_opaque(hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels,
-                       ignore_index, logit_scale_multiply, logit_scale_divide, logit_softcapping):
-    from unsloth_zoo.fused_losses.chunked_logprob import _CHUNK_GB, unsloth_chunked_ce_loss
-
-    # Same device-aware budget as the path below, capped at the chunked kernel's own chunk size.
-    target_gb = min(_CHUNK_GB, _free_target_gb(lm_head_weight.device))
-    return unsloth_chunked_ce_loss(
-        hidden_states, lm_head_weight, lm_head_bias, labels, mask = mask, n_items = n_items, scaling = scaling,
-        shift_labels = shift_labels, ignore_index = ignore_index, logit_scale_multiply = logit_scale_multiply,
-        logit_scale_divide = logit_scale_divide, logit_softcapping = logit_softcapping,
-        target_gb = target_gb if target_gb > 0 else None,
+                       kwargs):
+    return _chunked_ce_traced(
+        hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,
     )
 
 
@@ -753,9 +801,8 @@ def unsloth_fused_ce_loss(
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     """
     scaler = trainer.accelerator.scaler if trainer is not None else None
-    # Get mixed precision scaling if seen
-    scaling = scaler.get_scale() if scaler is not None else scaling
-    if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
+    # Get mixed precision scaling if seen (read lazily: get_scale() syncs the host)
+    scaling = scaler if scaler is not None else scaling
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
 
@@ -768,12 +815,10 @@ def unsloth_fused_ce_loss(
         hidden_states = hidden_states.to(device = device)
 
     if _use_chunked_ce(kwargs, target_gb):
-        return _chunked_ce_opaque(
-            hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels,
-            int(kwargs.get("ignore_index", -100)),
-            kwargs.get("logit_scale_multiply", 0.0), kwargs.get("logit_scale_divide", 0.0),
-            kwargs.get("logit_softcapping", 0.0),
+        return _chunked_ce(
+            hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,
         )
+    if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
 
     mapping = dict(
         loss_function = compute_fused_ce_loss,

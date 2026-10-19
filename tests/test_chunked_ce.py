@@ -20,6 +20,7 @@ the torch.func fused CE it replaces in unsloth_fused_ce_loss."""
 import pytest
 import torch
 
+import unsloth_zoo.fused_losses.chunked_logprob as cl
 import unsloth_zoo.fused_losses.cross_entropy_loss as cel
 from unsloth_zoo.fused_losses.chunked_logprob import UnslothChunkedCE, unsloth_chunked_ce_loss
 
@@ -94,29 +95,33 @@ def test_unlabelled_rows_never_reach_the_head(monkeypatch):
         return forward(ctx, hidden, *args)
 
     monkeypatch.setattr(UnslothChunkedCE, "forward", staticmethod(spy))
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     labels = torch.randint(0, V, (B, S))
     labels[:, :30] = -100
     unsloth_chunked_ce_loss(torch.randn(B, S, H), torch.randn(V, H), None, labels)
     assert seen == [B * (S - 30)]  # shifted: positions 29..38 predict tokens 30..39
 
 
+@pytest.mark.parametrize("fused_linear", [True, False])
 @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
-def test_fused_ce_routes_plain_ce_only(monkeypatch, label_smoothing):
+def test_fused_ce_routes_plain_ce_only(monkeypatch, label_smoothing, fused_linear):
     calls = {"new": 0}
-    real = cel._chunked_ce_opaque
+    real = cel._chunked_ce
 
     def spy(*args):
         calls["new"] += 1
         return real(*args)
 
-    monkeypatch.setattr(cel, "_chunked_ce_opaque", spy)
+    monkeypatch.setattr(cel, "_chunked_ce", spy)
     monkeypatch.setattr(cel, "_CHUNKED_CE", True)
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", fused_linear)
     torch.manual_seed(1)
     hidden = torch.randn(B, S, H, requires_grad = True)
     weight = torch.randn(V, H)
     labels = torch.randint(0, V, (B, S))
     loss = cel.unsloth_fused_ce_loss(None, hidden, weight, None, labels, label_smoothing = label_smoothing)
-    assert calls["new"] == (1 if label_smoothing == 0.0 else 0)
+    # The fused linear kernel implements label smoothing; the older chunked CE leaves it to the torch.func path.
+    assert calls["new"] == (1 if label_smoothing == 0.0 or fused_linear else 0)
     loss.backward()
     monkeypatch.setattr(cel, "_CHUNKED_CE", False)
     hidden2 = hidden.detach().clone().requires_grad_(True)
@@ -134,13 +139,37 @@ def test_zero_scaling_gives_finite_gradients():
     assert torch.isfinite(hidden.grad).all() and hidden.grad.abs().sum() > 0
 
 
-@pytest.mark.parametrize("flag", ["FP32_HEAD_GRAD", "_FUSED_CE_COMPILE_DISABLED"])
-def test_old_path_opt_ins_keep_the_old_path(monkeypatch, flag):
+@pytest.mark.parametrize("flag,fused_linear", [
+    ("FP32_HEAD_GRAD", False), ("_FUSED_CE_COMPILE_DISABLED", False), ("_FUSED_CE_COMPILE_DISABLED", True),
+])
+def test_old_path_opt_ins_keep_the_old_path(monkeypatch, flag, fused_linear):
     calls = {"new": 0}
-    monkeypatch.setattr(cel, "_chunked_ce_opaque", lambda *a: calls.__setitem__("new", 1))
+    monkeypatch.setattr(cel, "_chunked_ce", lambda *a: calls.__setitem__("new", 1))
     monkeypatch.setattr(cel, "_CHUNKED_CE", True)
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", fused_linear)
     monkeypatch.setattr(cel, flag, True)
     hidden = torch.randn(B, S, H, requires_grad = True)
     loss = cel.unsloth_fused_ce_loss(None, hidden, torch.randn(V, H), None, torch.randint(0, V, (B, S)))
     loss.backward()
     assert calls["new"] == 0 and torch.isfinite(hidden.grad).all()
+
+
+def test_grad_scaler_scale_is_read_without_a_graph_break():
+    # The fp16 GradScaler's scale is read from its attributes: GradScaler.is_enabled / get_scale are skipped by
+    # dynamo (a graph break every compiled step), and get_scale() syncs the host.
+    from torch._dynamo.testing import CompileCounter
+    from torch._dynamo.utils import counters
+
+    scaler = torch.amp.GradScaler("cpu", init_scale = 1024.0)
+    assert cel._scaler_scale(scaler) == 1024.0  # step 0: not allocated yet
+    scaler._lazy_init_scale_growth_tracker(torch.device("cpu"))
+    torch._dynamo.reset()
+    counters.clear()
+    cnt = CompileCounter()
+    f = torch.compile(lambda x, s: x * cel._scaler_scale(s), backend = cnt)
+    for _ in range(3):
+        out = f(torch.ones(3), scaler)
+    assert out.tolist() == [1024.0] * 3
+    assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
+    assert cnt.frame_count == 1
+    assert cel._scaler_scale(torch.amp.GradScaler("cpu", enabled = False)) is None

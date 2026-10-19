@@ -156,7 +156,9 @@ def _old(*args, **kwargs):
 
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("transform", [(0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 30.0, 0.7), (1.5, 2.0, 0.0, 1.2)], ids = str)
-def test_grpo_route_gradient_equals_old_function(bias, transform):
+def test_grpo_route_gradient_equals_old_function(monkeypatch, bias, transform):
+    # The pre-fused-linear engine, kept behind UNSLOTH_FUSED_LINEAR=0 (tests/test_fused_linear_routing.py covers the default).
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     states, weight, b, index, upstream = _inputs(shape = (4, 9), bias = bias, seed = 1)
     calls = []
     real = cl.UnslothChunkedLogProbs.apply
@@ -174,7 +176,9 @@ def test_grpo_route_gradient_equals_old_function(bias, transform):
     _assert_close(got, ref, atol = 1e-5)
 
 
-def test_grpo_route_no_grad_is_the_old_function_bitwise():
+def test_grpo_route_no_grad_is_the_old_function_bitwise(monkeypatch):
+    # The pre-fused-linear engine, kept behind UNSLOTH_FUSED_LINEAR=0 (tests/test_fused_linear_routing.py covers the default).
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     states, weight, _, index, _ = _inputs()
     calls = []
     real = cl.UnslothChunkedLogProbs.apply
@@ -206,6 +210,8 @@ def test_grpo_route_kill_switch(monkeypatch):
 
 
 def test_grpo_route_honours_max_rows_per_chunk(monkeypatch):
+    # The pre-fused-linear engine, kept behind UNSLOTH_FUSED_LINEAR=0 (tests/test_fused_linear_routing.py covers the default).
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     seen = []
     real = cl.UnslothChunkedLogProbs.apply
     def spy(*a):
@@ -226,7 +232,10 @@ def test_fp32_output_gemm_only_where_fast(monkeypatch, fp32_out_gemm):
     monkeypatch.setattr(cl, "_FP32_OUT_GEMM", fp32_out_gemm)
     a = torch.randn(8, 16, device = "cuda", dtype = torch.bfloat16)
     w = torch.randn(32, 16, device = "cuda", dtype = torch.bfloat16)
-    want = torch.float32 if fp32_out_gemm else torch.bfloat16
+    # bf16 in / fp32 out exists only on sm >= 80 and torch >= 2.8: elsewhere the bf16 result is kept (and must be).
+    has_out_dtype = tuple(int(x) for x in torch.__version__.split(".")[:2]) >= (2, 8)
+    want = torch.float32 if fp32_out_gemm and has_out_dtype and torch.cuda.get_device_capability() >= (8, 0) \
+        else torch.bfloat16
     assert cl._mm_fp32(a, w.t()).dtype == want
     assert cl._project(a, w, None, torch.bfloat16, fp32_out = True).dtype == want
     hidden = a.float().requires_grad_(True)
@@ -258,6 +267,8 @@ def test_chunk_budget_reads_the_head_device(monkeypatch):
 
 
 def test_forward_casts_the_head_once(monkeypatch):
+    # The pre-fused-linear engine, kept behind UNSLOTH_FUSED_LINEAR=0 (tests/test_fused_linear_routing.py covers the default).
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     weights = []
     project = cl._project
 
@@ -300,3 +311,20 @@ def test_grpo_route_hands_support_and_fp32_head_calls_to_the_old_function(monkey
     hidden = torch.randn(1, 4, 8, requires_grad = True)
     out = rr.grpo_chunked_hidden_states_logprobs(hidden, torch.randn(16, 8), torch.randint(0, 16, (1, 4)), **extra)
     assert out == "old" and all(seen[0][k] == v for k, v in extra.items())
+
+
+def test_masked_logprobs_forwards_max_rows_per_chunk(monkeypatch):
+    # unsloth_chunked_logprobs takes max_rows_per_chunk; the masked variant must accept and forward it too.
+    from unsloth_zoo.fused_losses import fused_linear as fl
+
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", True)
+    seen = {}
+    real = fl.fused_linear_logprobs
+    monkeypatch.setattr(fl, "fused_linear_logprobs", lambda *a, **k: seen.update(k) or real(*a, **k))
+    states = torch.randn(1, 6, 8)
+    weight = torch.randn(16, 8)
+    labels = torch.randint(0, 16, (1, 6))
+    labels[0, 0] = -100
+    out = unsloth_masked_logprobs(states, weight, labels, max_rows_per_chunk = 2)
+    assert seen["max_rows_per_chunk"] == 2
+    torch.testing.assert_close(out, unsloth_masked_logprobs(states, weight, labels))

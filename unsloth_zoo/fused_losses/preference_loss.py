@@ -62,6 +62,14 @@ def _transform_logits(logits, scale_multiply, scale_divide, softcapping):
 
 _MM_OUT_DTYPE_OK = {}
 
+# UNSLOTH_FUSED_LINEAR=0 keeps this module's own chunked autograd Function. A float64 head (the tests' oracle
+# precision) always does: the fused linear kernel scores in float32.
+_FUSED_LINEAR = os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
+
+
+def _use_fused_linear(weight):
+    return _FUSED_LINEAR and weight.dtype != torch.float64
+
 
 def _linear_float32(hidden, weight, bias):
     # A half-precision head rounds its logits to bf16 / fp16 before the softmax; that rounding
@@ -294,6 +302,24 @@ def fused_linear_token_logps(
     """
     mask = mask.to(device = hidden_states.device, dtype = torch.bool)
     labels = labels.to(hidden_states.device)
+    if _use_fused_linear(lm_head_weight):
+        from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
+
+        outs = fused_linear_logprobs(
+            hidden_states, lm_head_weight, labels, bias = lm_head_bias, mask = mask,
+            logit_scale_multiply = float(logit_scale_multiply), logit_scale_divide = float(logit_scale_divide),
+            logit_softcapping = float(logit_softcapping), return_mean_logits = bool(return_mean_logits),
+            return_log_sum_sq_probs = bool(return_log_sum_sq_probs),
+            rows_per_chunk = chunk_size if chunk_size is not None and chunk_size > 0 else None,
+        )
+        outs = outs if isinstance(outs, tuple) else (outs,)
+        output = {"per_token_logps": outs[0]}
+        extra = iter(outs[1:])
+        if return_mean_logits:
+            output["mean_logits"] = next(extra)
+        if return_log_sum_sq_probs:
+            output["log_sum_sq_probs"] = next(extra)
+        return output
     selected_hidden = hidden_states[mask]
     selected_labels = labels[mask]
     rows = _rows_per_chunk(selected_hidden.shape[0], lm_head_weight.shape[0], chunk_size)
@@ -338,6 +364,16 @@ def linear_mean_logits(
             out = out + lm_head_bias.to(dtype).mean()
         out = _transform_logits(out, float(logit_scale_multiply), float(logit_scale_divide), 0.0)
         return out.to(hidden_states.device).reshape(shape)
+    if _use_fused_linear(lm_head_weight):
+        from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
+
+        _, mean = fused_linear_logprobs(
+            hidden_states, lm_head_weight, torch.zeros(shape, dtype = torch.long, device = hidden_states.device),
+            bias = lm_head_bias, logit_scale_multiply = float(logit_scale_multiply),
+            logit_scale_divide = float(logit_scale_divide), logit_softcapping = float(logit_softcapping),
+            return_mean_logits = True, rows_per_chunk = chunk_size if chunk_size is not None and chunk_size > 0 else None,
+        )
+        return mean
     rows = _rows_per_chunk(flat.shape[0], lm_head_weight.shape[0], chunk_size)
     transforms = (float(logit_scale_multiply), float(logit_scale_divide), float(logit_softcapping))
     dtype = torch.promote_types(lm_head_weight.dtype, torch.float32)

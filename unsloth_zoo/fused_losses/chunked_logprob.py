@@ -79,6 +79,10 @@ def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None, device = N
     return max(rows, 2)
 
 
+# UNSLOTH_FUSED_LINEAR=0 keeps the autograd Functions below for every public entry point.
+_FUSED_LINEAR = os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
+
+
 def _transform(z, scalars, has_mul: bool, has_div: bool, has_cap: bool):
     # scalars = [1 / temperature, multiply, divide, softcap] as a tensor, so new values never recompile.
     if has_mul:
@@ -277,17 +281,29 @@ def unsloth_chunked_logprobs(
     lm_head_bias  : Optional[torch.Tensor] = None,
     rows_per_chunk: Optional[int] = None,
     return_mean_logits: bool = False,
+    max_rows_per_chunk: Optional[int] = None,
 ):
     """Per-token log-probs for hidden_states [..., H] and index [...] (valid token ids), shape [...] float32.
 
     Same contract as chunked_hidden_states_selective_log_softmax, but backward recomputes logits per chunk instead of
     keeping them. On a split model the math runs on the head's device and the result comes back to the caller's.
     """
+    if _FUSED_LINEAR:
+        from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
+
+        return fused_linear_logprobs(
+            hidden_states, lm_head, index, bias = lm_head_bias, temperature = temperature,
+            logit_scale_multiply = logit_scale_multiply or 0.0, logit_scale_divide = logit_scale_divide or 0.0,
+            logit_softcapping = logit_softcapping or 0.0, return_mean_logits = return_mean_logits,
+            rows_per_chunk = rows_per_chunk, max_rows_per_chunk = max_rows_per_chunk,
+        )
     lead_shape = index.shape
     hidden = hidden_states.reshape(-1, hidden_states.shape[-1]).to(lm_head.device)
     targets = index.reshape(-1).to(lm_head.device)
     if rows_per_chunk is None:
         rows_per_chunk = chunked_logprob_rows(lm_head.shape[0], n_rows = hidden.shape[0], device = lm_head.device)
+        if max_rows_per_chunk:
+            rows_per_chunk = min(rows_per_chunk, int(max_rows_per_chunk))
     logps, mean_logits = UnslothChunkedLogProbs.apply(
         hidden, lm_head, lm_head_bias, targets, int(rows_per_chunk), float(temperature),
         float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
@@ -299,12 +315,34 @@ def unsloth_chunked_logprobs(
     return logps
 
 
+_MASKED_LOGPROBS_KWARGS = frozenset((
+    "temperature", "logit_scale_multiply", "logit_scale_divide", "logit_softcapping", "lm_head_bias",
+    "rows_per_chunk", "return_mean_logits", "max_rows_per_chunk",
+))
+
+
 def unsloth_masked_logprobs(hidden_states, lm_head, labels, mask = None, ignore_index = -100, **kwargs):
     """Like unsloth_chunked_logprobs, but only rows where `mask` (default labels != ignore_index) is set reach the head;
     the rest are 0. `masked_scatter` keeps an all-masked batch connected to the graph as a differentiable zero."""
     if mask is None:
         mask = labels != ignore_index
     mask = mask.to(hidden_states.device)
+    if _FUSED_LINEAR:
+        from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
+
+        unknown = set(kwargs) - _MASKED_LOGPROBS_KWARGS
+        if unknown:
+            raise TypeError(f"unsloth_masked_logprobs got unexpected keyword arguments {sorted(unknown)}")
+        # The op compacts the scored rows itself, so no data dependent shape reaches a compiled caller.
+        return fused_linear_logprobs(
+            hidden_states, lm_head, labels, bias = kwargs.get("lm_head_bias"), mask = mask,
+            temperature = kwargs.get("temperature", 1.0),
+            logit_scale_multiply = kwargs.get("logit_scale_multiply") or 0.0,
+            logit_scale_divide = kwargs.get("logit_scale_divide") or 0.0,
+            logit_softcapping = kwargs.get("logit_softcapping") or 0.0,
+            return_mean_logits = kwargs.get("return_mean_logits", False),
+            rows_per_chunk = kwargs.get("rows_per_chunk"), max_rows_per_chunk = kwargs.get("max_rows_per_chunk"),
+        )
     out = unsloth_chunked_logprobs(hidden_states[mask], lm_head, labels.to(mask.device)[mask], **kwargs)
     if isinstance(out, tuple):
         return tuple(x.new_zeros(mask.shape).masked_scatter(mask, x) for x in out)
@@ -378,32 +416,67 @@ class UnslothChunkedCE(torch.autograd.Function):
         return grads[0], grads[1], grads[2], None, None, None, None, None, None, None
 
 
-def unsloth_chunked_ce_loss(
-    hidden_states, lm_head_weight, lm_head_bias, labels, mask = None, n_items = None, scaling = None,
-    shift_labels = True, ignore_index = -100, logit_scale_multiply = 0.0, logit_scale_divide = 0.0,
-    logit_softcapping = 0.0, rows_per_chunk = None,
-    target_gb = None,
-):
-    """Drop-in for the chunked fused CE (same shift / mask / n_items / scaling contract), scoring only labelled rows.
-    A zero `scaling` stores unscaled gradients, so a collapsed GradScaler gives zeros rather than 0 * inf."""
-    device = lm_head_weight.device
+def _ce_targets(labels, mask, shift_labels, ignore_index, device):
+    """Flat next-token targets with unlabelled (and `mask == 0`) positions at ignore_index, in plain torch so a compiled
+    caller traces it. A pre-shifted `labels` (shift_labels=False) takes `mask` at the same positions."""
     labels = labels.to(device)
+    if mask is not None:
+        mask = mask.to(device)
     if shift_labels:
-        shifted = torch.full_like(labels, ignore_index)
-        shifted[..., :-1] = labels[..., 1:]
+        pad = torch.full_like(labels[..., :1], ignore_index)
+        labels = torch.cat((labels[..., 1:], pad), dim = -1)
         if mask is not None:
-            shifted[..., :-1][mask.to(device)[..., 1:] == 0] = ignore_index
-        labels = shifted
-    labels = labels.reshape(-1)
-    hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
-    keep = labels != ignore_index
-    divisor = n_items if n_items is not None else keep.sum()
+            mask = torch.cat((mask[..., 1:], torch.ones_like(mask[..., :1])), dim = -1)
+    if mask is not None:
+        labels = labels.masked_fill(mask == 0, ignore_index)
+    return labels.reshape(-1)
+
+
+def _ce_divisor(n_items, targets, ignore_index, device):
+    divisor = n_items if n_items is not None else (targets != ignore_index).sum()
     if not torch.is_tensor(divisor):
         divisor = torch.tensor(divisor, dtype = torch.float32)
     if divisor.numel() != 1:
         divisor = divisor.ravel()[0]
-    divisor = divisor.to(device = device, dtype = torch.float32)
-    divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)  # all-masked batch: loss 0, not 0 / 0
+    divisor = divisor.to(device = device, dtype = torch.float32).reshape(())
+    return torch.where(divisor == 0, torch.ones_like(divisor), divisor)  # all-masked batch: loss 0, not 0 / 0
+
+
+def unsloth_chunked_ce_loss(
+    hidden_states, lm_head_weight, lm_head_bias, labels, mask = None, n_items = None, scaling = None,
+    shift_labels = True, ignore_index = -100, logit_scale_multiply = 0.0, logit_scale_divide = 0.0,
+    logit_softcapping = 0.0, rows_per_chunk = None,
+    target_gb = None, label_smoothing = 0.0, logits_bias = None, fp32_head_grad = False,
+):
+    """Drop-in for the chunked fused CE (same shift / mask / n_items / scaling contract), scoring only labelled rows.
+    A zero `scaling` stores unscaled gradients, so a collapsed GradScaler gives zeros rather than 0 * inf."""
+    device = lm_head_weight.device
+    targets = _ce_targets(labels, mask, shift_labels, ignore_index, device)
+    divisor = _ce_divisor(n_items, targets, ignore_index, device)
+    hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    if _FUSED_LINEAR:
+        from unsloth_zoo.fused_losses.fused_linear import fused_linear_cross_entropy
+
+        if logits_bias is not None:
+            # Bart's final_logits_bias is [1, vocab].
+            logits_bias = logits_bias.reshape(-1)
+
+        if rows_per_chunk is None and target_gb is not None:
+            rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0], target_gb = target_gb, device = device)
+
+        # Unlabelled rows are dropped inside the op: the compacted row count never reaches a compiled caller.
+        return fused_linear_cross_entropy(
+            hidden, lm_head_weight, lm_head_bias, targets, divisor = divisor, scaling = scaling,
+            ignore_index = ignore_index, logit_scale_multiply = logit_scale_multiply or 0.0,
+            logit_scale_divide = logit_scale_divide or 0.0, logit_softcapping = logit_softcapping or 0.0,
+            label_smoothing = label_smoothing or 0.0, logits_bias = logits_bias, fp32_head_grad = fp32_head_grad,
+            rows_per_chunk = rows_per_chunk,
+        )
+    if (label_smoothing or 0.0) != 0.0 or logits_bias is not None or fp32_head_grad:
+        raise NotImplementedError("Unsloth: label smoothing, logits_bias and fp32 head grads need UNSLOTH_FUSED_LINEAR=1")
+    if torch.is_tensor(scaling):
+        scaling = float(scaling)
+    keep = targets != ignore_index
     # Unlabelled rows (prompts in completion-only training) never reach the head.
     hidden = hidden[keep.to(hidden.device)].to(device)
     if rows_per_chunk is None:
@@ -411,7 +484,7 @@ def unsloth_chunked_ce_loss(
             lm_head_weight.shape[0], target_gb = target_gb, n_rows = hidden.shape[0], device = device
         )
     return UnslothChunkedCE.apply(
-        hidden, lm_head_weight, lm_head_bias, labels[keep], divisor, float(scaling or 1.0),
+        hidden, lm_head_weight, lm_head_bias, targets[keep], divisor, float(scaling or 1.0),
         int(rows_per_chunk), float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0),
         float(logit_softcapping or 0.0),
     )
