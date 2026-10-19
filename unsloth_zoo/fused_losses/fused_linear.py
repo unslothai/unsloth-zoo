@@ -63,6 +63,18 @@ _U_FP32 = os.environ.get("UNSLOTH_LOGPROB_U_FP32", "0") == "1"
 # than TRL, for 7-11% on GDDR / A100. fp32 forward + half backward is WRONG (3x worse gradient). Both passes read
 # this flag so the saved lse matches the recomputed logits.
 _RECOMPUTE_FP32 = os.environ.get("UNSLOTH_FUSED_LINEAR_RECOMPUTE_FP32", "1") != "0"
+# With fp32 recompute: the backward re-projects in half and swaps the two largest logits of every _TOP_COLS columns
+# back to their fp32 values (kept by the forward), under the forward's fp32 lse. Gradient error at the fp32
+# recompute's (fp64 oracle) for half the backward logit traffic; plain half logits under an fp32 lse were 3x worse
+# than TRL (the top logits' rounding no longer cancels). 0: fp32 recompute logits.
+_BWD_EXACT_TOP = os.environ.get("UNSLOTH_FUSED_LINEAR_BWD_EXACT_TOP", "1") != "0"
+# Trainable head: one row chunk when every kept row fits the budget at >= this many vocab columns, so the head
+# gradient tile comes from one GEMM over all rows instead of an fp32 accumulator re-read per row chunk.
+_SINGLE_MIN_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_SINGLE_MIN_COLS", 8192)), 0)
+# Exact-top granularity: the two largest logits of every TOP_COLS columns stay fp32 (8 bytes per row per 128 columns,
+# 78 MB at 8k tokens x 152k vocab). 128: +12% stats / +14% backward kernel on B200 and gradients within 7% of fp32
+# recompute with 8-30 likely tokens in one 2048-column block (2048: 3x, as frequent tokens sit at low ids).
+_TOP_COLS = 1 << max(int(math.log2(max(int(_env_float("UNSLOTH_FUSED_LINEAR_TOP_COLS", 128)), 16))), 4)
 _CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 2.0)
 # Smallest chunk: 512 rows x 151936 logits, >= 512 rows; fewer starve the K = vocab GEMM (DPO 98 vs 81 ms on G4).
 _MIN_LOGITS = 512 * 151936
@@ -81,7 +93,8 @@ _HALF = (torch.float16, torch.bfloat16)
 # ROCm's half-in / fp32-out GEMM is a slow fallback (6-14x).
 _IS_HIP = torch.version.hip is not None
 
-CALLS = {"ce": 0, "logprobs": 0, "logprobs_bwd": 0, "triton": 0, "torch": 0, "tiled": 0}
+CALLS = {"ce": 0, "logprobs": 0, "logprobs_bwd": 0, "triton": 0, "torch": 0, "tiled": 0, "exact_top": 0,
+         "bwd_single": 0}
 
 
 @functools.cache
@@ -295,13 +308,15 @@ if _HAS_TRITON:
     @triton.jit
     def _fl_partial_kernel(
         x_ptr, x_stride, n_cols, n_rows, split_cols, stride_k, col0, split0, bias_ptr, tgt_ptr, part_ptr,
-        inv_t, scale, cap,
+        inv_t, scale, cap, top_ptr, top_stride,
         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr,
         WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,
-        WANT_TGT: tl.constexpr, BLOCK: tl.constexpr,
+        WANT_TGT: tl.constexpr, WANT_BLOCK_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,
     ):
         # Split width depends only on the vocabulary, so a row's statistics do not depend on chunk size.
         # WANT_TGT keeps the target logit (part[7]) for the merge since a vocab tile is gone by then.
+        # WANT_BLOCK_TOP: top_ptr[row, 2 k + {0, 1}] = the two largest z of the k-th SUB-wide column group (absolute,
+        # SUB-aligned). Values only: a column index needs an indexed reduction (+18-43% on B200).
         row = tl.program_id(0).to(tl.int64)
         split = tl.program_id(1).to(tl.int64)
         x_row = x_ptr + row * x_stride
@@ -326,6 +341,15 @@ if _HAS_TRITON:
                 tot += tl.sum(tl.where(ok, x, 0.0), axis = 0)
             z = tl.where(ok, x * inv_t, -float("inf"))
             bm = tl.max(z, axis = 0)
+            if WANT_BLOCK_TOP:
+                zg = tl.reshape(z, (BLOCK // SUB, SUB))
+                t1 = tl.max(zg, axis = 1)
+                t2 = tl.max(tl.where(zg == t1[:, None], -float("inf"), zg), axis = 1)
+                k = tl.arange(0, BLOCK // SUB)
+                tp = top_ptr + row * top_stride + ((start + col0) // SUB + k) * 2
+                kok = start + k * SUB < c1
+                tl.store(tp, t1, mask = kok)
+                tl.store(tp + 1, t2, mask = kok)
             if WANT_TOP1:
                 bi = tl.argmax(z, axis = 0).to(tl.int64) + start + col0
                 take = bm > best
@@ -426,12 +450,15 @@ if _HAS_TRITON:
     def _fl_backward_kernel(
         x_ptr, x_stride, dz_ptr, dz_stride, n_cols, col0, n_total,
         tgt_ptr, bias_ptr, lse_ptr, ent_ptr, g_ptr, g_stride, ge_ptr,
-        inv_t, scale, cap, smooth_keep, smooth_each,
+        inv_t, scale, cap, smooth_keep, smooth_each, top_ptr, top_stride,
         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_ENT_GRAD: tl.constexpr,
-        ALIASED: tl.constexpr, BLOCK: tl.constexpr,
+        ALIASED: tl.constexpr, HAS_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,
     ):
         # dz = g * (keep * onehot + each - p) - ge * p * (z - lse + H); dz is x or a half view of its bytes.
-        # g_stride 1: per-row g, 0: one scalar.
+        # g_stride 1: per-row g, 0: one scalar. HAS_TOP: x is half; the two largest z of every SUB columns take the
+        # forward's fp32 values (top_ptr[row, 2 k + {0, 1}], col0 SUB-aligned). Rounding keeps order, so they sit at
+        # the group's half max and next value; when the two round alike, every tied position takes their mean (off
+        # by <= half an ulp, as the rounding itself). Under the forward's fp32 lse.
         row = tl.program_id(0).to(tl.int64)
         x_row = x_ptr + row * x_stride
         dz_row = dz_ptr + row * dz_stride
@@ -454,6 +481,19 @@ if _HAS_TRITON:
                 x += tl.load(bias_ptr + offs, mask = ok, other = 0.0).to(tl.float32)
             x, d = _fl_transform(x, scale, cap, HAS_SCALE, HAS_CAP)
             z = x * inv_t
+            if HAS_TOP:
+                k = tl.arange(0, BLOCK // SUB)
+                kok = start + k * SUB < n_cols
+                tp = top_ptr + row * top_stride + ((col0 + start) // SUB + k) * 2
+                t1 = tl.load(tp, mask = kok, other = 0.0)[:, None]
+                t2 = tl.load(tp + 1, mask = kok, other = 0.0)[:, None]
+                zg = tl.reshape(tl.where(ok, z, -float("inf")), (BLOCK // SUB, SUB))
+                h1 = tl.max(zg, axis = 1)[:, None]
+                is1 = zg == h1
+                one = (tl.sum(is1.to(tl.int32), axis = 1) == 1)[:, None]
+                h2 = tl.max(tl.where(is1, -float("inf"), zg), axis = 1)[:, None]
+                zg = tl.where(is1, tl.where(one, t1, 0.5 * (t1 + t2)), tl.where(one & (zg == h2), t2, zg))
+                z = tl.where(ok, tl.reshape(zg, (BLOCK,)), z)
             p = tl.exp(z - lse)
             dz = g * (tl.where(offs + col0 == tgt, smooth_keep, 0.0) + smooth_each - p)
             if HAS_ENT_GRAD:
@@ -493,6 +533,24 @@ def _num_warps():
 
 def _split_block():
     return min(triton.next_power_of_2(_SPLIT_BLOCK), triton.next_power_of_2(max(_SPLIT_COLS, 16)))
+
+
+def _block_top_shape(N, V, device, compute_dtype, recompute):
+    # Static (the fake uses it): the forward returns [N, blocks] whenever the exact-top backward may run.
+    if not (recompute and _BWD_EXACT_TOP and _RECOMPUTE_FP32 and _TRITON and _HAS_TRITON and not _IS_HIP
+            and device.type == "cuda" and compute_dtype in _HALF):
+        return (0,)
+    return (N, 2 * -(-V // _top_cols()))
+
+
+def _block_top_live(device, compute_dtype, rows, fp32_logits):
+    # Runtime, evaluated alike by forward and backward: True iff the tiled Triton forward wrote the block tops.
+    return (_BWD_EXACT_TOP and _RECOMPUTE_FP32 and bool(fp32_logits) and compute_dtype in _HALF and rows <= 0
+            and _use_triton(device) and _SPLIT_COLS > 0 and _SPLIT_COLS % _split_block() == 0)
+
+
+def _top_cols():
+    return min(_TOP_COLS, _split_block())
 
 
 def _stat_dtype(dtype):
@@ -685,13 +743,15 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
             scal = (float(inv_t), float(scale), float(cap) if cap != 0.0 else 1.0)
             _fl_partial_kernel[(n, splits)](
                 x, x.stride(0), V, n, _SPLIT_COLS, splits * n, 0, 0, bias if bias is not None else lse, tgt, part,
-                *scal, WANT_TGT = False, BLOCK = _split_block(), num_warps = 4, enable_fp_fusion = True, **flags,
+                *scal, part, 0, WANT_TGT = False, WANT_BLOCK_TOP = False, SUB = 1, BLOCK = _split_block(),
+                num_warps = 4, enable_fp_fusion = True, **flags,
             )
             _fl_combine_kernel[(n,)](
                 x, x.stride(0), V, n, splits, splits * n, _SPLIT_COLS, part,
                 tgt, exact if exact is not None else lse, bias if bias is not None else lse,
                 logp, lse, ent, tot, lssp, top1, *scal,
-                HAS_EXACT = exact is not None, HAS_TGT = False, SPLITS = max(triton.next_power_of_2(splits), 2),
+                HAS_EXACT = exact is not None, HAS_TGT = False,
+                SPLITS = max(triton.next_power_of_2(splits), 2),
                 num_warps = 1, enable_fp_fusion = True, **flags,
             )
 
@@ -738,8 +798,9 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
 
 
 def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, scalars, want, fp32_logits,
-                   compute_dtype, outs, cap_rows):
-    """Recompute-path statistics from TRL-shaped tiles (4096-row GEMM: 16% faster than small chunks on B200)."""
+                   compute_dtype, outs, cap_rows, block_top = None):
+    """Recompute-path statistics from TRL-shaped tiles (4096-row GEMM: 16% faster than small chunks on B200).
+    block_top [n_keep, 2 groups] (compacted rows) receives the two top logits of every _top_cols() columns."""
     inv_t, scale, cap = scalars
     want_ent, want_sum, want_lssp, want_top1 = want
     N, H = hidden.shape
@@ -761,6 +822,7 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
         h = _rows_of(hidden, idx, a, b, n_keep, N).to(compute_dtype)
         t = targets[a:b] if n_keep == N else targets.index_select(0, idx[a:b])
         part = torch.empty((8, splits, n), **f32)
+        top = block_top[a:b] if block_top is not None else part
         for first in range(0, V, tile):
             last = min(first + tile, V)
             x = _logits_into(h, w[first:last], buf.buf[:n, : last - first], fp32_logits)
@@ -770,7 +832,9 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
                 _fl_partial_kernel[(n, -(-(last - first) // _SPLIT_COLS))](
                     x, x.stride(0), last - first, n, _SPLIT_COLS, splits * n, first, first // _SPLIT_COLS,
                     bias_t if bias_t is not None else part, t, part, *scal,
-                    WANT_TGT = True, BLOCK = _split_block(), num_warps = 4, enable_fp_fusion = True, **flags,
+                    top, top.stride(0) if block_top is not None else 0,
+                    WANT_TGT = True, WANT_BLOCK_TOP = block_top is not None, SUB = _top_cols(),
+                    BLOCK = _split_block(), num_warps = 4, enable_fp_fusion = True, **flags,
                 )
             _launch(device, run)
         exact = _exact_target(h, w, bias, t) if exact_mode else None
@@ -790,13 +854,15 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
     CALLS["tiled"] += 1
 
 
-def _row_backward(device, x, dz_out, tgt, bias_slice, lse, ent, g, ge, scalars, col0, n_total, smooth = (1.0, 0.0)):
-    """Writes dz of x [n, Vs] into dz_out (x or a half view of it). g is per row [n] or 0-dim."""
+def _row_backward(device, x, dz_out, tgt, bias_slice, lse, ent, g, ge, scalars, col0, n_total, smooth = (1.0, 0.0),
+                  block_top = None):
+    """Writes dz of x [n, Vs] into dz_out (x or a half view of it). g is per row [n] or 0-dim. block_top [n, 2 groups]
+    (Triton only): x holds half logits whose group tops are swapped for the forward's fp32 values."""
     inv_t, scale, cap = scalars
     smooth_keep, smooth_each = smooth
     n, Vs = x.shape
     if _use_triton(device) and n > 0:
-        block = min(_BLOCK, triton.next_power_of_2(Vs))
+        block = _split_block() if block_top is not None else min(_BLOCK, triton.next_power_of_2(Vs))
 
         def run():
             _fl_backward_kernel[(n,)](
@@ -804,13 +870,17 @@ def _row_backward(device, x, dz_out, tgt, bias_slice, lse, ent, g, ge, scalars, 
                 tgt, bias_slice if bias_slice is not None else lse, lse, ent if ent is not None else lse,
                 g, 0 if g.dim() == 0 else 1, ge if ge is not None else g,
                 float(inv_t), float(scale), float(cap) if cap != 0.0 else 1.0, float(smooth_keep), float(smooth_each),
+                block_top if block_top is not None else lse, block_top.stride(0) if block_top is not None else 0,
                 HAS_BIAS = bias_slice is not None, HAS_SCALE = scale != 1.0, HAS_CAP = cap != 0.0,
-                HAS_ENT_GRAD = ge is not None, ALIASED = dz_out.dtype != x.dtype, BLOCK = block,
-                num_warps = _num_warps(), enable_fp_fusion = True,
+                HAS_ENT_GRAD = ge is not None, ALIASED = dz_out.dtype != x.dtype, HAS_TOP = block_top is not None,
+                SUB = _top_cols() if block_top is not None else 1, BLOCK = block, num_warps = _num_warps(), enable_fp_fusion = True,
             )
         _launch(device, run)
         CALLS["triton"] += 1
+        if block_top is not None:
+            CALLS["exact_top"] += 1
         return dz_out
+    assert block_top is None, "exact-top backward needs the Triton kernel"
     CALLS["torch"] += 1
     dz = _torch_dz(x, bias_slice, tgt, lse, inv_t, scale, cap, -g, smooth_keep, smooth_each, col0 = col0, ge = ge,
                    ent = ent, n_total = n_total)
@@ -970,6 +1040,8 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                                                                                                dtype = torch.bool)
     u_dtype = _u_dtype(hidden.dtype)
     u = torch.zeros((N, H), device = device, dtype = u_dtype) if want_u else hidden.new_empty(0)
+    # Left unwritten unless _block_top_live: the backward reads it under the same condition only.
+    block_top = torch.empty(_block_top_shape(N, V, device, compute_dtype, tiled), device = device, dtype = torch.float32)
     inv_t, scale, cap = _scalars(temperature, mul, div, cap)
     if n_keep > 0:
         fp32_logits, exact_mode = _logits_mode(device, compute_dtype)
@@ -987,9 +1059,14 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
             if not full:
                 dst = {k: (torch.empty(n_keep, dtype = v.dtype, device = device) if v is not None else None)
                        for k, v in dst.items()}
+            top = None
+            if block_top.numel() > 0 and _block_top_live(device, compute_dtype, rows, fp32_logits):
+                top = block_top if full else torch.empty((n_keep,) + block_top.shape[1:], device = device,
+                                                         dtype = torch.float32)
             with torch.autocast(device.type, enabled = False):
                 _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, (inv_t, scale, cap),
-                               (want_ent, want_mean, want_lssp, want_top1), fp32_logits, compute_dtype, dst, -rows)
+                               (want_ent, want_mean, want_lssp, want_top1), fp32_logits, compute_dtype, dst, -rows,
+                               top)
             if want_mean:
                 dst["sum"].div_(V)
             if not full:
@@ -997,7 +1074,9 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                                  ("top1", top1)):
                     if dst[key] is not None:
                         out.index_copy_(0, idx, dst[key])
-            return logps, ent, mean, lssp, top1, u, lse
+                if top is not None:
+                    block_top.index_copy_(0, idx, top)
+            return logps, ent, mean, lssp, top1, u, lse, block_top
         R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
@@ -1034,11 +1113,55 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                         put(dst, st[key] / V if key == "sum" else st[key])
                 if want_u:
                     put(u, _dz_w(dz, w) if u_scale == 1.0 else _dz_w(dz, w).div_(u_scale))
-    return logps, ent, mean, lssp, top1, u, lse
+    return logps, ent, mean, lssp, top1, u, lse, block_top
+
+
+def _mm_into(out, a, b):
+    """out = a @ b accumulated in fp32 and rounded once to out's dtype (no reduced-precision split-K reduction)."""
+    if out.dtype == torch.float32:
+        _mm_fp32(a, b, out = out)
+        return
+    if a.is_cuda and a.dtype == out.dtype == b.dtype and a.dtype in _HALF:
+        flags = torch.backends.cuda.matmul
+        name = "allow_bf16_reduced_precision_reduction" if a.dtype == torch.bfloat16 else \
+            "allow_fp16_reduced_precision_reduction"
+        old = getattr(flags, name)
+        setattr(flags, name, False)
+        try:
+            torch.mm(a, b, out = out)
+        finally:
+            setattr(flags, name, old)
+        return
+    out.copy_(_mm_fp32(a, b))
+
+
+def _dz_t_h_into(out, dz, h):
+    """out[V, H] = dz[n, V].T @ h."""
+    V8 = _aligned(dz.shape[1])
+    _mm_into(out[:V8], dz[:, :V8].t(), h)
+    if V8 < dz.shape[1]:
+        _mm_into(out[V8:], dz[:, V8:].t(), h)
+
+
+def _bwd_layout(n_keep, V, H, rows, bpl, budget, need_w, single, align):
+    """(rows per chunk, vocab tile) for the recompute backward."""
+    if single:
+        R, tile = n_keep, budget // max(n_keep * bpl, 1)
+    else:
+        # TRL-shaped tiles: 512-row chunks re-read the fp32 head-gradient accumulator 16x (2.5x TRL's dW time).
+        R = max(min(rows if rows > 0 else (min(_BWD_ROWS, -rows) if rows < 0 else _BWD_ROWS), n_keep), 1)
+        if rows <= 0:
+            R = min(R, max(budget // (min(V, 256) * bpl), 1))
+        tile = budget // max(R * bpl, 1)
+        if need_w:
+            tile = min(tile, budget // (4 * H))  # the per-tile fp32 head-gradient accumulator, same budget
+    tile = max(tile, 8)
+    tile = min(V, tile - tile % (align if tile >= align else 8))
+    return R, tile
 
 
 @_guarded
-def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, temperature, mul, div, cap,
+def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul, div, cap,
                        compute_dtype, need_h, need_w, need_b, rows):
     device = weight.device
     N, H = hidden.shape
@@ -1050,28 +1173,43 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, tem
     # Autograd hands in stride-0 gradients (from .sum()); the kernels index rows directly.
     g, ge, lse, ent, targets = g.contiguous(), ge.contiguous(), lse.contiguous(), ent.contiguous(), targets.contiguous()
     bias = bias.contiguous() if bias is not None else None
-    grad_h = torch.zeros((N, H), device = device, dtype = hidden.dtype) if need_h else hidden.new_empty(0)
-    grad_w = torch.zeros_like(weight) if need_w else hidden.new_empty(0)
-    grad_b = torch.zeros(V, device = device, dtype = bias.dtype) if need_b else hidden.new_empty(0)
     if n_keep == 0:
-        return grad_h, grad_w, grad_b
+        return (torch.zeros((N, H), device = device, dtype = hidden.dtype) if need_h else hidden.new_empty(0),
+                torch.zeros_like(weight) if need_w else hidden.new_empty(0),
+                torch.zeros(V, device = device, dtype = bias.dtype) if need_b else hidden.new_empty(0))
+    # Every kept row and every head row is written below; only dropped rows need zeros.
+    grad_h = (torch.empty if n_keep == N else torch.zeros)((N, H), device = device, dtype = hidden.dtype) \
+        if need_h else hidden.new_empty(0)
+    grad_w = torch.empty_like(weight) if need_w else hidden.new_empty(0)
+    grad_b = torch.zeros(V, device = device, dtype = bias.dtype) if need_b else hidden.new_empty(0)
     fp32_logits, _ = _logits_mode(device, compute_dtype)
     if compute_dtype not in _HALF or not _RECOMPUTE_FP32:
         fp32_logits = False
-    bpl = _bytes_per_logit(fp32_logits, compute_dtype)
     budget = min(_BWD_TILE_BYTES, _budget_bytes(device))
+    head_acc_mode = need_w and need_h and n_keep > V
+    exact_top = block_top.numel() > 0 and _block_top_live(device, compute_dtype, rows, fp32_logits)
+    for _ in range(2):
+        bpl = _bytes_per_logit(fp32_logits and not exact_top, compute_dtype)
+        single = (need_w and not head_acc_mode and not _HIP_TILES and _SINGLE_MIN_COLS > 0
+                  and (rows == 0 or (rows < 0 and n_keep <= -rows))
+                  and n_keep * bpl * min(V, _SINGLE_MIN_COLS) <= budget)
+        align = _top_cols() if exact_top else 256
+        R, tile = _bwd_layout(n_keep, V, H, rows, bpl, budget, need_w, single, align)
+        if not exact_top or tile == V or tile % align == 0:
+            break
+        exact_top = False  # a budget below one block: the forward's block tops cannot line up
+    if exact_top:
+        fp32_logits = False
     w = weight.to(compute_dtype)
-    # TRL-shaped tiles: 512-row chunks re-read the fp32 head-gradient accumulator 16x (2.5x TRL's dW time).
-    R = max(min(rows if rows > 0 else (min(_BWD_ROWS, -rows) if rows < 0 else _BWD_ROWS), n_keep), 1)
-    if rows <= 0:
-        R = min(R, max(budget // (min(V, 256) * bpl), 1))
-    tile = budget // max(R * bpl, 1)
-    if need_w:
-        tile = min(tile, budget // (4 * H))  # the per-tile fp32 head-gradient accumulator, same budget
-    tile = max(tile, 8)
-    tile = min(V, tile - tile % (256 if tile >= 256 else 8))
     buf = _Buffers(R, tile, device, fp32_logits, compute_dtype)
-    gather = (lambda v, a, b: v[a:b]) if n_keep == N else (lambda v, a, b: v.index_select(0, idx[a:b]))
+    # Kept-row vectors gathered once (per tile, the gathers were ~60 launches per DPO backward).
+    if n_keep == N:
+        tk, lk, ek, gk, gek, topk = targets, lse, ent, g, ge, block_top
+    else:
+        tk, lk, gk = targets.index_select(0, idx), lse.index_select(0, idx), g.index_select(0, idx)
+        ek = ent.index_select(0, idx) if has_ge else ent
+        gek = ge.index_select(0, idx) if has_ge else ge
+        topk = block_top.index_select(0, idx) if exact_top else block_top
     acc_b = torch.zeros(V, **f32) if need_b else None
 
     def tile_grad(h, a, b, first, last):
@@ -1079,9 +1217,9 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, tem
         x = _logits_into(h, w[first:last], buf.buf[:n, : last - first], fp32_logits)
         dz_out = buf.buf.view(compute_dtype)[:n, : last - first] if fp32_logits else x
         dz = _row_backward(
-            device, x, dz_out, gather(targets, a, b), bias[first:last] if bias is not None else None,
-            gather(lse, a, b), gather(ent, a, b) if has_ge else None,
-            gather(g, a, b), gather(ge, a, b) if has_ge else None, (inv_t, scale, cap), first, V,
+            device, x, dz_out, tk[a:b], bias[first:last] if bias is not None else None,
+            lk[a:b], ek[a:b] if has_ge else None, gk[a:b], gek[a:b] if has_ge else None, (inv_t, scale, cap), first,
+            V, block_top = topk[a:b] if exact_top else None,
         )
         if acc_b is not None:
             acc_b[first:last] += dz.sum(0, dtype = torch.float32)
@@ -1094,9 +1232,22 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, tem
             grad_h.index_copy_(0, idx[a:b], gh.to(grad_h.dtype))
 
     # Pick the smaller fp32 accumulator: [rows, H] (vocab-major) or [V, H] (row-major).
-    head_acc = torch.zeros((V, H), **f32) if (need_w and need_h and n_keep > V) else None
+    head_acc = torch.zeros((V, H), **f32) if head_acc_mode else None
     with torch.autocast(device.type, enabled = False):
-        if need_w and head_acc is None:
+        if single:
+            # All kept rows at once: each head-gradient tile is one GEMM, rounded once into grad_w.
+            CALLS["bwd_single"] += 1
+            hk = _rows_of(hidden, idx, 0, n_keep, n_keep, N).to(compute_dtype)
+            acc_h = torch.zeros((n_keep, H), **f32) if need_h else None
+            for first in range(0, V, tile):
+                last = min(first + tile, V)
+                dz = tile_grad(hk, 0, n_keep, first, last)
+                if acc_h is not None:
+                    _dz_w_acc(acc_h, dz, w[first:last])
+                _dz_t_h_into(grad_w[first:last], dz, hk)
+            if acc_h is not None:
+                put_h(0, n_keep, acc_h)
+        elif need_w and head_acc is None:
             acc_h = torch.zeros((n_keep, H), **f32) if need_h else None
             for first in range(0, V, tile):
                 last = min(first + tile, V)
@@ -1194,7 +1345,8 @@ if _OPS is None:
         mask: Optional[torch.Tensor], temperature: float, mul: float, div: float, cap: float,
         compute_dtype: torch.dtype, want_ent: bool, want_mean: bool, want_lssp: bool, want_top1: bool,
         want_u: bool, need_h: bool, need_w: bool, need_b: bool, rows: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
         CALLS["logprobs"] += 1
         return _OPS["lp_impl"](hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
                                want_ent, want_mean, want_lssp, want_top1, want_u, rows,
@@ -1216,11 +1368,13 @@ if _OPS is None:
             torch.empty((N, hidden.shape[1]), device = weight.device, dtype = u_dtype) if want_u
             else hidden.new_empty(0),
             torch.empty(N, **f32),
+            torch.empty(_block_top_shape(N, weight.shape[0], weight.device, compute_dtype,
+                                         (need_h or need_w or need_b) and not want_u), **f32),
         )
 
     def _lp_setup(ctx, inputs, output):
-        logps, ent, mean, lssp, top1, u, lse = output
-        ctx.mark_non_differentiable(mean, lssp, top1, u, lse)
+        logps, ent, mean, lssp, top1, u, lse, block_top = output
+        ctx.mark_non_differentiable(mean, lssp, top1, u, lse, block_top)
         ctx.set_materialize_grads(False)
         (hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
          want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows) = inputs
@@ -1233,7 +1387,7 @@ if _OPS is None:
         if want_u:
             ctx.save_for_backward(u)
         else:
-            ctx.save_for_backward(hidden, weight, bias, targets, mask, lse, ent)
+            ctx.save_for_backward(hidden, weight, bias, targets, mask, lse, ent, block_top)
 
     def _lp_backward(ctx, g_logps, g_ent, *_):
         need_h, need_w, need_b = ctx.need
@@ -1243,14 +1397,14 @@ if _OPS is None:
             if g_logps is None or not need_h:
                 return (None,) + none
             return (torch.ops.unsloth_zoo.fused_linear_scale_rows(u, g_logps, ctx.hidden_dtype),) + none
-        hidden, weight, bias, targets, mask, lse, ent = ctx.saved_tensors
+        hidden, weight, bias, targets, mask, lse, ent, block_top = ctx.saved_tensors
         if g_logps is None and g_ent is None:
             return (None,) + none
         g = g_logps.float() if g_logps is not None else torch.zeros_like(lse)
         ge = g_ent.float() if (g_ent is not None and ent.numel() > 0) else lse.new_empty(0)
         temperature, mul, div, cap, compute_dtype, rows = ctx.args
         gh, gw, gb = torch.ops.unsloth_zoo.fused_linear_logprobs_bwd(
-            hidden, weight, bias, targets, mask, lse, ent, g, ge, temperature, mul, div, cap, compute_dtype,
+            hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul, div, cap, compute_dtype,
             need_h, need_w, need_b, rows,
         )
         return (gh if need_h else None, gw if need_w else None, gb if need_b else None) + (None,) * 16
@@ -1261,15 +1415,15 @@ if _OPS is None:
     def _lp_bwd_op(
         hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], targets: torch.Tensor,
         mask: Optional[torch.Tensor], lse: torch.Tensor, ent: torch.Tensor, g: torch.Tensor, ge: torch.Tensor,
-        temperature: float, mul: float, div: float, cap: float, compute_dtype: torch.dtype,
+        block_top: torch.Tensor, temperature: float, mul: float, div: float, cap: float, compute_dtype: torch.dtype,
         need_h: bool, need_w: bool, need_b: bool, rows: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         CALLS["logprobs_bwd"] += 1
-        return _OPS["lp_bwd_impl"](hidden, weight, bias, targets, mask, lse, ent, g, ge, temperature, mul, div,
-                                   cap, compute_dtype, need_h, need_w, need_b, rows)
+        return _OPS["lp_bwd_impl"](hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul,
+                                   div, cap, compute_dtype, need_h, need_w, need_b, rows)
 
     @_lp_bwd_op.register_fake
-    def _lp_bwd_fake(hidden, weight, bias, targets, mask, lse, ent, g, ge, temperature, mul, div, cap,
+    def _lp_bwd_fake(hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul, div, cap,
                      compute_dtype, need_h, need_w, need_b, rows):
         return (
             hidden.new_empty(hidden.shape) if need_h else hidden.new_empty(0),
@@ -1452,7 +1606,7 @@ def fused_linear_logprobs(
     bias = _head_bias(bias, weight)
     ent_grad = bool(return_entropy) and bool(entropy_requires_grad)
     want_u = _FORWARD_GRAD and need_h and not need_w and not need_b and not ent_grad
-    logps, ent, mean, lssp, top1, u, lse = torch.ops.unsloth_zoo.fused_linear_logprobs(
+    logps, ent, mean, lssp, top1, u, lse, _ = torch.ops.unsloth_zoo.fused_linear_logprobs(
         hidden2, weight, bias, targets2, mask2, float(temperature),
         float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
         _compute_dtype(hidden, weight), bool(return_entropy), bool(return_mean_logits),
