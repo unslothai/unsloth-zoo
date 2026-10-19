@@ -1094,3 +1094,52 @@ def test_qsa_trim_scope_leaves_other_models_drifted_bodies_and_foreign_bindings(
     monkeypatch.setattr(decode, "_QSA_TRIM_CONTRACT", contract)
     with decode.exact_qsa_trim(attention):
         assert qwen4.QSAKVCache.trim is stock
+
+
+def _dilated_conv(dtype = mx.bfloat16, channels = 320, dilation = 3, bias = False, groups = None, out = None):
+    mx.random.seed(channels + dilation)
+    conv = nn.Conv1d(channels, out or channels, 4, dilation = dilation, groups = groups or channels, bias = bias)
+    if bias:
+        conv.bias = mx.random.normal(conv.bias.shape)
+    conv.set_dtype(dtype)
+    conv.eval()
+    return conv
+
+
+@pytest.mark.parametrize("dtype, dilation, bias", [(mx.bfloat16, 3, False), (mx.float16, 2, True),
+                                                   (mx.float32, 5, False)])
+def test_dilated_depthwise_conv_matches_mx_conv1d_bitwise_and_restores(dtype, dilation, bias):
+    conv = _dilated_conv(dtype, dilation = dilation, bias = bias)
+    inputs = [(mx.random.normal((batch, rows + 3 * dilation, 320), key = mx.random.key(rows)) * 8).astype(dtype)
+              for batch, rows in ((1, 1), (2, 5), (1, 300))]
+    expected = [conv(x) for x in inputs]
+    with decode.exact_dilated_depthwise_conv(conv):
+        assert type(conv) is not nn.Conv1d
+        for x, reference in zip(inputs, expected):
+            _equal(conv(x), reference)
+    assert type(conv) is nn.Conv1d
+
+
+def test_dilated_depthwise_conv_scope_leaves_other_convs_and_a_differing_kernel(monkeypatch, caplog):
+    # Two output channels per group still has one input channel per weight row.
+    for conv in (_dilated_conv(dilation = 1), _dilated_conv(channels = 32, out = 64), _dilated_conv().train()):
+        with decode.exact_dilated_depthwise_conv(conv):
+            assert type(conv) is nn.Conv1d
+    conv = _dilated_conv(channels = 96)
+    with decode.exact_dilated_depthwise_conv(conv):
+        with decode.exact_dilated_depthwise_conv(conv):
+            pass
+        assert type(conv) is not nn.Conv1d
+    assert type(conv) is nn.Conv1d
+    monkeypatch.setattr(decode, "_depthwise_conv", lambda x, weight, dilation: mx.zeros(
+        (x.shape[0], x.shape[1] - 3 * dilation, x.shape[2]), x.dtype))
+    monkeypatch.setattr(decode, "_depthwise_conv_verified", functools.cache(decode._depthwise_conv_verified.__wrapped__))
+    with monkeypatch.context() as failing:  # a failed command buffer reads as a mismatch until the next synchronize
+        failing.setattr(mx, "synchronize", lambda: (_ for _ in ()).throw(RuntimeError(decode._FAILED_BUFFER)))
+        with pytest.raises(RuntimeError, match = "Command buffer"):
+            with decode.exact_dilated_depthwise_conv(_dilated_conv(channels = 64)):
+                pytest.fail("the generation ran past a failed command buffer")
+    assert decode._depthwise_conv_verified.cache_info().currsize == 0 and "differs" not in caplog.text
+    with caplog.at_level("WARNING"), decode.exact_dilated_depthwise_conv(_dilated_conv(channels = 64)) as conv:
+        assert type(conv) is nn.Conv1d
+    assert "differs from mx.conv1d" in caplog.text
