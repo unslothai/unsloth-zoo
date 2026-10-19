@@ -26,6 +26,8 @@ from unsloth_zoo.fused_losses.fused_linear import fused_linear_cross_entropy, fu
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+# Tests of the Triton kernels themselves (AMD's Windows wheels, for one, ship no Triton: the torch path runs there).
+TRITON = pytest.mark.skipif(not (torch.cuda.is_available() and fl._HAS_TRITON), reason = "needs CUDA and Triton")
 
 
 @pytest.fixture(autouse = True)
@@ -241,7 +243,7 @@ def test_logprobs_trainable_head_bias_over_vocab_slices(monkeypatch, device):
             assert fl.CALLS["torch"] == torch_calls
 
 
-@CUDA
+@TRITON
 @pytest.mark.parametrize("split_cols", [0, 512, 1000])
 @pytest.mark.parametrize("mode", ["1", "2"])
 def test_split_statistics_match_oracle(monkeypatch, split_cols, mode):
@@ -282,7 +284,7 @@ def test_split_statistics_match_oracle(monkeypatch, split_cols, mode):
         _close(loss, want, tol, f"ce {dtype} split {split_cols}")
 
 
-@CUDA
+@TRITON
 @pytest.mark.parametrize("train_head,with_bias,ent_grad", [(False, False, True), (True, True, False), (True, True, True)])
 @pytest.mark.parametrize("mode,recompute_fp32", [("1", False), ("1", True), ("2", False)])
 def test_recompute_forward_tiles_match_oracle(monkeypatch, train_head, with_bias, ent_grad, mode, recompute_fp32):
@@ -423,6 +425,8 @@ def test_logprobs_lead_shape_and_out_of_range_targets():
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("kind", ["ce", "lp_frozen", "lp_trainable"])
 def test_fullgraph_compile_no_breaks_no_recompile(kind, device):
+    if device == "cuda" and not fl._HAS_TRITON:
+        pytest.skip("Inductor compiles GPU code through Triton")
     import torch._dynamo
     from torch._dynamo.testing import CompileCounterWithBackend
     from torch._dynamo.utils import counters
@@ -488,7 +492,7 @@ def test_opcheck():
     )
 
 
-@CUDA
+@TRITON
 @pytest.mark.parametrize("V", [4096, 4096 * 3 + 5, 151936])
 @pytest.mark.parametrize("mode", ["0", "1", "2"])
 def test_gpu_accuracy_modes_and_inplace(monkeypatch, V, mode):
@@ -559,8 +563,7 @@ def test_gpu_grad_on_other_device_returns_home():
     assert g.device == h.device
 
 
-@CUDA
-@CUDA
+@TRITON
 def test_one_transient_triton_failure_is_retried(monkeypatch):
     # One launch failure is retried; a persistent one still falls back.
     real = fl._launch
