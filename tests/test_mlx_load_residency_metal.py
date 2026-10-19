@@ -358,8 +358,10 @@ def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
     assert isinstance(glu, OffloadSwitchGLU) and not tree_flatten(model.parameters())
     assert report["layers"] == 1 and report["on_disk_bytes"] == table_bytes
     slots = max(8, int(64 * (1 - fraction)))
+    assert glu._slots.views is not None  # misses read straight into the slots
     assert glu._slots.capacity == slots and report["resident_bytes"] == table_bytes * slots // 64
-    actual = [glu(*call) for call in calls]
+    # Only a downstream expression of each output is kept, while later calls evict its experts.
+    actual = [glu(*call) * 1 for call in calls]
     actual += [_verifier_steps(glu, *call) for call in calls[5:7]]
     for got, want in zip(actual, expected):
         assert got.shape == want.shape
@@ -443,6 +445,7 @@ def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
     offloaded = _lazy_copy(lambda: _moe("vlm", scales = mx.float16, eval = False), str(tmp_path))
     _convert_mlx_dtype(stock, mx.bfloat16)
     offload_experts(offloaded, str(tmp_path), 0.75, cast_dtype = mx.bfloat16)
+    assert offloaded.layers[0].switch_mlp._slots.views is None
     stock.eval()
     offloaded.eval()
     for x, indices in _moe_calls(mx.bfloat16)[::2]:

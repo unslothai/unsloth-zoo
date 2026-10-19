@@ -482,6 +482,8 @@ _EXPERT_FIELDS = ("weight", "scales", "biases", "bias")
 # The stock SwitchGLU sorts a call's routes from this many on.
 _SORT_ROUTES = 64
 _SCORE_DECAY, _SCORE_DECAY_EVERY = 0.7, 4
+# Pending outputs a slot table keeps before evaluating them (decode has evaluated them by then).
+_PENDING_READERS, _PENDING_BYTES = 8, 32 << 20
 
 
 def _picks_rhs(rows, routes, experts):
@@ -533,6 +535,12 @@ class _ExpertSlots:
         self.map = mx.zeros((experts,), dtype = mx.int32)  # expert -> slot, valid while resident
         # Built here: MLX streams are thread-bound, so a lazy table would fail on any other thread.
         mx.eval(list(self.arrays.values()), self.map)
+        # Misses are read straight into the slots' memory, unless a field is cast at load.
+        self.views = None if any(field.cast is not None for _, _, field in fields) else [
+            memoryview(self.arrays[projection, name]).cast("B") for projection, name, _ in fields
+        ]
+        # Outputs computed from the slots that may still be pending; evaluated before a read overwrites them.
+        self.readers = []
         self.slot_of = np.full(experts, -1, dtype = np.int64)
         self.expert_of = np.full(capacity, -1, dtype = np.int64)
         self.score = np.zeros(experts, dtype = np.float32)
@@ -551,22 +559,40 @@ class _ExpertSlots:
             return
         self.misses += missing.size
         slots = self._reserve(missing.size, experts)
-        buffers = [np.empty((missing.size, field.row_bytes), dtype = np.uint8) for _, _, field in self.fields]
-        jobs = [
-            (*field.location(expert), memoryview(buffer[i]))
-            for (_, _, field), buffer in zip(self.fields, buffers)
-            for i, expert in enumerate(missing.tolist())
-        ]
-        read_ranges(jobs)
         at = mx.array(slots.astype(np.int32))
-        for (projection, name, field), buffer in zip(self.fields, buffers):
-            self.arrays[projection, name][at] = field.to_mx(buffer)
+        if self.views is not None:
+            if self.readers:
+                mx.eval(self.readers)
+                self.readers.clear()
+            read_ranges([
+                (*field.location(expert), view[slot * field.row_bytes:(slot + 1) * field.row_bytes])
+                for (_, _, field), view in zip(self.fields, self.views)
+                for expert, slot in zip(missing.tolist(), slots.tolist())
+            ])
+        else:
+            buffers = [np.empty((missing.size, field.row_bytes), dtype = np.uint8) for _, _, field in self.fields]
+            read_ranges([
+                (*field.location(expert), memoryview(buffer[i]))
+                for (_, _, field), buffer in zip(self.fields, buffers)
+                for i, expert in enumerate(missing.tolist())
+            ])
+            for (projection, name, field), buffer in zip(self.fields, buffers):
+                self.arrays[projection, name][at] = field.to_mx(buffer)
         self.slot_of[missing] = slots
         self.expert_of[slots] = missing
         self.map[mx.array(missing.astype(np.int32))] = at
 
     def slot_indices(self, indices):
         return self.map[indices].astype(indices.dtype)
+
+    def read_by(self, *outputs):
+        """Keep ``outputs``, computed from the slots, for the next miss to evaluate first; a large
+        output, or more than a few, are evaluated now."""
+        large = sum(output.nbytes for output in outputs) > _PENDING_BYTES
+        self.readers.extend(outputs)
+        if large or len(self.readers) > _PENDING_READERS:
+            mx.eval(self.readers)
+            self.readers.clear()
 
     def _reserve(self, count, protected):
         free = np.flatnonzero(self.expert_of < 0)
@@ -621,7 +647,9 @@ class OffloadSwitchGLU(nn.Module):
         slots = self._slots
         if experts.size <= slots.capacity:
             slots.ensure(routes, experts)
-            return glu(x, slots.slot_indices(indices), *weights)
+            out = glu(x, slots.slot_indices(indices), *weights)
+            slots.read_by(out)
+            return out
         # Over the slots: expert by expert, each route computed as the stock call computes it.
         rows = x.reshape(-1, x.shape[-1])
         token = np.arange(routes.size) // indices.shape[-1]
@@ -746,11 +774,14 @@ class OffloadSwitchGLU(nn.Module):
             slots.ensure(routes, experts)
             index = slots.slot_indices(indices)
             if name != "up_proj":
-                return getattr(glu, name)(x, index, sorted_indices = sorted_indices)
+                out = getattr(glu, name)(x, index, sorted_indices = sorted_indices)
+                slots.read_by(out)
+                return out
             up = glu.up_proj(x, index, sorted_indices = sorted_indices)
             gate = glu.gate_proj(x, index, sorted_indices = sorted_indices)
             activated = glu.activation(up, gate)
             down = glu.down_proj(activated, index, sorted_indices = sorted_indices)
+            slots.read_by(up, gate, down)
         else:
             # Over the slots: one unsorted row per route, as the caller's per-route kernels compute it.
             if sorted_indices:
