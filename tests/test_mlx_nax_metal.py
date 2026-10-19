@@ -118,6 +118,7 @@ def test_kernel_probe_runs_once_per_build_and_survives_a_bad_cache(monkeypatch, 
     monkeypatch.setattr(nax, "nax_available", lambda: False)
     assert nax.kernel_probe_passed("good", "unsloth_probe_target", "good") is False
     assert not log.exists()
+    assert nax.kernel_probe_passed("good", "unsloth_probe_target", "good", lambda: True) is True   # a route without NAX
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     assert nax.kernel_probe_passed("good", "unsloth_probe_target", "good") is True
     assert nax.kernel_probe_passed("bad", "unsloth_probe_target", "bad") is False

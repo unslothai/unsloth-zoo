@@ -34,6 +34,7 @@ def patched():
 @pytest.fixture(autouse = True)
 def _skip_enabled(monkeypatch):
     monkeypatch.delenv("UNSLOTH_SKIP_CAUSAL_MASK", raising = False)
+    monkeypatch.delenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", raising = False)
 
 
 def _signature(patched):
@@ -464,3 +465,275 @@ def test_a_local_flex_registered_after_the_scan_keeps_the_mask(patched, monkeypa
     assert patched.create_causal_mask(**kwargs) is not None
     del interface["flex_attention"]
     assert patched.create_causal_mask(**kwargs) is None
+
+
+def _right_padded(batch = 3, length = 8):
+    attention_mask = torch.ones(batch, length, dtype = torch.long)
+    attention_mask[1, -3:] = 0
+    attention_mask[2, -5:] = 0
+    return attention_mask
+
+
+def test_right_padding_skips_the_mask_when_opted_in(patched, monkeypatch):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    before = dict(misc.CAUSAL_MASK_SKIP_STATS)
+    assert patched.create_causal_mask(**kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["skipped"] == before["skipped"] + 1
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before["right_padded"] + 1
+    # Every real query row of the mask it replaces is exactly causal.
+    reference = _reference(patched, kwargs)
+    real = _right_padded().bool()
+    for row in range(3):
+        n = int(real[row].sum())
+        assert torch.equal(reference[row, 0, :n, :n], _causal(n))
+        assert not reference[row, 0, :n, n:].any()
+
+
+@pytest.mark.parametrize("attention_mask", [
+    torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]]),
+    torch.tensor([[1, 1, 1, 1], [1, 0, 1, 1]]),
+    torch.tensor([[1, 1, 1, 1], [0, 0, 0, 0]]),
+], ids = ["left", "hole", "empty_row"])
+def test_other_padding_keeps_the_mask_when_opted_in(patched, monkeypatch, attention_mask):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
+    kwargs = _kwargs(patched, batch = 2, length = 4, attention_mask = attention_mask)
+    assert _decide(patched, **kwargs) is None
+    assert isinstance(patched.create_causal_mask(**kwargs), torch.Tensor)
+
+
+@pytest.mark.parametrize("attn", ["sdpa", "eager"])
+def test_right_padded_training_matches_the_masked_path(patched, monkeypatch, attn):
+    from transformers import LlamaForCausalLM
+    import transformers.models.llama.modeling_llama as modeling_llama
+    monkeypatch.setattr(modeling_llama, "create_causal_mask", patched.create_causal_mask, raising = False)
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(_config(attn)).train()
+    ids = torch.randint(0, 64, (3, 8), generator = torch.Generator().manual_seed(1))
+    attention_mask = _right_padded()
+    labels = ids.masked_fill(attention_mask == 0, -100)
+
+    def run():
+        model.zero_grad(set_to_none = True)
+        hidden = model.model(input_ids = ids, attention_mask = attention_mask, use_cache = False).last_hidden_state
+        logits = model.lm_head(hidden)
+        loss = torch.nn.functional.cross_entropy(logits[:, :-1].flatten(0, 1), labels[:, 1:].flatten())
+        loss.backward()
+        grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+        return loss.detach(), hidden.detach(), grads
+
+    base_loss, base_logits, base_grads = run()
+    monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    head_loss, head_logits, head_grads = run()
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] - before == (1 if attn == "sdpa" else 0)
+
+    torch.testing.assert_close(head_loss, base_loss, rtol = 1e-5, atol = 1e-6)
+    real = attention_mask.bool()
+    torch.testing.assert_close(head_logits[real], base_logits[real], rtol = 1e-5, atol = 1e-5)
+    assert head_grads.keys() == base_grads.keys()
+    for name in base_grads:
+        torch.testing.assert_close(head_grads[name], base_grads[name], rtol = 1e-4, atol = 1e-6)
+
+    # The pad tail cannot reach a real token.
+    changed = ids.clone()
+    changed[~real] = (changed[~real] + 7) % 64
+    with torch.no_grad():
+        moved = model.model(input_ids = changed, attention_mask = attention_mask, use_cache = False).last_hidden_state
+    torch.testing.assert_close(moved[real], head_logits[real], rtol = 1e-5, atol = 1e-5)
+
+
+def test_right_padding_keeps_the_mask_without_flash_sdpa(patched, monkeypatch):
+    # fp32 / CPU / pre-sm80 SDPA would run enable_gqa on the math kernel: keep the mask there.
+    monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    assert _decide(patched, **kwargs) is None
+    assert isinstance(patched.create_causal_mask(**kwargs), torch.Tensor)
+    config = _config()
+    assert not misc._flash_sdpa_takes_causal(config, torch.zeros(1, 2, 16, dtype = torch.bfloat16))
+    assert not misc._flash_sdpa_takes_causal(config, torch.zeros(1, 2, 16))
+
+
+def test_flash_sdpa_check_reads_heterogeneous_head_dims(monkeypatch):
+    # transformers >= 5.17 raises on config.head_dim when it varies per layer (Gemma4Unified).
+    try:
+        from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
+    except Exception:
+        pytest.skip("this transformers has no heterogeneous Gemma4UnifiedTextConfig")
+    import types
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (9, 0))
+    monkeypatch.setattr(misc, "_flash_sdpa_accepts", lambda *args: True)
+    embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
+    wide = Gemma4UnifiedTextConfig(num_hidden_layers = 4)
+    assert wide.is_heterogeneous
+    assert misc._flash_sdpa_takes_causal(wide, embeds) is False  # 512-dim full-attention layers
+    narrow = Gemma4UnifiedTextConfig(num_hidden_layers = 4, global_head_dim = 128)
+    assert misc._flash_sdpa_takes_causal(narrow, embeds) is True
+    assert misc._flash_sdpa_takes_causal(_config(), embeds) is True
+
+
+def _flash_rule(capability, torch_2_6):
+    # can_use_flash_attention for dense square causal enable_gqa inputs (torch 2.6 / 2.13 sdp_utils.cpp).
+    def accepts(device, dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
+        if torch_2_6:
+            if not ((8, 0) <= capability <= (9, 0)): return False
+            narrow = (8, 6) <= capability <= (8, 9)
+        else:
+            if not ((8, 0) <= capability <= (12, 1)): return False
+            narrow = (8, 6) <= capability <= (8, 9) or (12, 0) <= capability <= (12, 1)
+        if requires_grad and narrow and (192 < head_dim <= 224 or (head_dim > 224 and dropout > 0)):
+            return False
+        return True
+    return accepts
+
+
+@pytest.mark.parametrize("torch_2_6", [True, False], ids = ["torch2.6", "torch2.13"])
+@pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (12, 0)])
+@pytest.mark.parametrize("head_dim", [128, 200, 256])
+@pytest.mark.parametrize("dropout", [0.0, 0.1])
+@pytest.mark.parametrize("grad", [True, False])
+def test_flash_sdpa_check_defers_to_the_dispatcher(monkeypatch, torch_2_6, capability, head_dim, dropout, grad):
+    # Gemma-2B GQA training (head_dim 256, 8:1 heads, dropout 0.1) on sm86 / sm89 must keep the mask:
+    # without it flash refuses and SDPA falls to the quadratic math kernel.
+    import types
+    from transformers import GemmaConfig
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: capability)
+    seen = []
+    rule = _flash_rule(capability, torch_2_6)
+    def fake_accepts(*args):
+        seen.append(args)
+        return rule(*args)
+    monkeypatch.setattr(misc, "_flash_sdpa_accepts", fake_accepts)
+    config = GemmaConfig(hidden_size = 2048, num_attention_heads = 8, num_key_value_heads = 1,
+                         head_dim = head_dim, attention_dropout = dropout)
+    config._attn_implementation = "sdpa"
+    embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
+    with torch.set_grad_enabled(grad):
+        got = misc._flash_sdpa_takes_causal(config, embeds)
+    assert seen == [("cuda:0", torch.bfloat16, 8, 1, head_dim, dropout, grad)]
+    assert got is rule("cuda:0", torch.bfloat16, 8, 1, head_dim, dropout, grad)
+
+
+def test_flash_sdpa_check_keeps_the_mask_when_the_probe_fails(monkeypatch):
+    import types
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (9, 0))
+    monkeypatch.setattr(misc, "_FLASH_SDPA_ACCEPTS_CACHE", {})
+    monkeypatch.setattr(misc, "_EFFICIENT_SDPA_ACCEPTS_CACHE", {}, raising = False)
+    def broken(*args, **kwargs):
+        raise RuntimeError("no SDPAParams")
+    monkeypatch.setattr(torch.backends.cuda, "SDPAParams", broken)
+    embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
+    assert misc._flash_sdpa_takes_causal(_config(), embeds) is False
+
+
+@pytest.mark.parametrize("kv_heads", [8, 1], ids = ["mha", "gqa"])
+@pytest.mark.parametrize("efficient", [True, False])
+@pytest.mark.parametrize("efficient_enabled", [True, False])
+def test_mha_rejected_by_flash_runs_maskless_on_the_efficient_kernel(monkeypatch, kv_heads, efficient, efficient_enabled):
+    # sm86 / sm89 / sm120 flash refuses some training shapes. Equal head counts need no enable_gqa,
+    # so mem-efficient SDPA still runs the maskless causal call; GQA would fall to the math kernel.
+    import types
+    from transformers import LlamaConfig
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: efficient_enabled)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (8, 9))
+    monkeypatch.setattr(misc, "_flash_sdpa_accepts", lambda *args: False)
+    asked = []
+    def efficient_accepts(*args):
+        asked.append(args)
+        return efficient
+    monkeypatch.setattr(misc, "_efficient_sdpa_accepts_mha", efficient_accepts, raising = False)
+    config = LlamaConfig(hidden_size = 2048, num_attention_heads = 8, num_key_value_heads = kv_heads, head_dim = 256)
+    config._attn_implementation = "sdpa"
+    embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
+    got = misc._flash_sdpa_takes_causal(config, embeds)
+    assert got is (kv_heads == 8 and efficient and efficient_enabled)
+    if kv_heads == 1 or not efficient_enabled:
+        assert asked == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "needs an NVIDIA GPU")
+def test_efficient_mha_probe_matches_a_real_maskless_call(monkeypatch):
+    monkeypatch.setattr(misc, "_EFFICIENT_SDPA_ACCEPTS_CACHE", {}, raising = False)
+    device = torch.device("cuda", torch.cuda.current_device())
+    assert misc._efficient_sdpa_accepts_mha(device, torch.bfloat16, 8, 128, 0.0, True) is True
+    q = torch.randn(1, 8, 64, 128, device = device, dtype = torch.bfloat16, requires_grad = True)
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+        out = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal = True)
+        out.float().sum().backward()
+    assert torch.isfinite(q.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "needs an NVIDIA GPU")
+def test_flash_sdpa_check_matches_the_real_dispatcher():
+    from transformers import GemmaConfig
+    device = torch.device("cuda", torch.cuda.current_device())
+    embeds = torch.zeros(1, 2, 8, device = device, dtype = torch.bfloat16)
+    for head_dim, dropout in ((128, 0.0), (256, 0.1), (200, 0.0)):
+        config = GemmaConfig(hidden_size = 2048, num_attention_heads = 8, num_key_value_heads = 1,
+                             head_dim = head_dim, attention_dropout = dropout)
+        config._attn_implementation = "sdpa"
+        query = torch.randn(1, 8, 64, head_dim, device = device, dtype = torch.bfloat16, requires_grad = True)
+        key = torch.randn(1, 1, 64, head_dim, device = device, dtype = torch.bfloat16, requires_grad = True)
+        params = torch.backends.cuda.SDPAParams(query, key, key, None, dropout, True, True)
+        expected = torch.backends.cuda.flash_sdp_enabled() and torch.cuda.get_device_capability(device) >= (8, 0) \
+            and torch.backends.cuda.can_use_flash_attention(params, False)
+        assert misc._flash_sdpa_takes_causal(config, embeds) is bool(expected)
+
+
+class _FakeProbe:
+    """Stands in for torch's CUDA probe on a CPU host: records the current device per flash check."""
+    def __init__(self, monkeypatch, gqa_argument = True, accepts_on = ("cuda:1",)):
+        import contextlib
+        self.current = "cuda:0"
+        self.checked_on = []
+        self.param_counts = []
+        real_empty = torch.empty
+        monkeypatch.setattr(misc, "_FLASH_SDPA_ACCEPTS_CACHE", {})
+        monkeypatch.setattr(torch, "empty", lambda shape, device = None, **kwargs: real_empty(shape, **kwargs))
+        @contextlib.contextmanager
+        def device(target):
+            previous, self.current = self.current, str(target)
+            try:
+                yield
+            finally:
+                self.current = previous
+        monkeypatch.setattr(torch.cuda, "device", device)
+        def params(*args):
+            if len(args) == 7 and not gqa_argument:
+                raise TypeError("SDPAParams takes 6 arguments")
+            self.param_counts.append(len(args))
+            return args
+        monkeypatch.setattr(torch.backends.cuda, "SDPAParams", params)
+        def can_use(params, debug = False):
+            self.checked_on.append(self.current)
+            return self.current in accepts_on
+        monkeypatch.setattr(torch.backends.cuda, "can_use_flash_attention", can_use)
+
+
+def test_flash_probe_runs_on_the_embeds_device(monkeypatch):
+    # torch reads the current device's arch: with device_map across mixed GPUs a cuda:1 probe must not ask cuda:0.
+    probe = _FakeProbe(monkeypatch, accepts_on = ("cuda:1",))
+    assert misc._flash_sdpa_accepts("cuda:1", torch.bfloat16, 8, 1, 256, 0.1, True) is True
+    assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 1, 256, 0.1, True) is False
+    assert probe.checked_on == ["cuda:1", "cuda:0"]
+    assert probe.current == "cuda:0"
+
+
+def test_flash_probe_without_enable_gqa_argument(monkeypatch):
+    # torch 2.4 SDPAParams has no enable_gqa: MHA is still probed, GQA keeps the mask.
+    probe = _FakeProbe(monkeypatch, gqa_argument = False, accepts_on = ("cuda:0",))
+    assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 8, 128, 0.0, True) is True
+    assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 1, 128, 0.0, True) is False
+    assert probe.param_counts == [6]

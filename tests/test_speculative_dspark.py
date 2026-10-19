@@ -201,6 +201,32 @@ def test_chunks_respect_the_logits_budget(monkeypatch):
     assert torch.allclose(capped, full, atol = 1e-9)
 
 
+@pytest.mark.parametrize("chunk_size", [1, 3, 1024])
+def test_loss_does_not_save_vocab_sized_teacher_activations(chunk_size):
+    target = _target()
+    drafter = _drafter(target).freeze_shared()
+    ids, lm = _batch()
+    cap, _, out = _run(drafter, target, ids, lm)
+    final = cap["final"].double().requires_grad_()
+    teacher_w = drafter.lm_head.weight.detach().clone().requires_grad_()
+    saved_vocab_shapes = []
+
+    def pack(tensor):
+        if tensor.ndim == 2 and tensor.shape[-1] == VOCAB:
+            saved_vocab_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        loss, _ = dspark_loss(drafter, out, teacher_hidden = final,
+                              teacher_lm_head_weight = teacher_w, chunk_size = chunk_size)
+    assert not saved_vocab_shapes, saved_vocab_shapes
+    loss.backward()
+    assert final.grad is None and teacher_w.grad is None
+    assert drafter.fc.weight.grad is not None
+    assert drafter.markov_head.markov_w2.weight.grad is not None
+    assert drafter.confidence_head.proj.weight.grad is not None
+
+
 def test_save_round_trip_and_schema(tmp_path):
     target = _target()
     drafter = _drafter(target)
@@ -309,6 +335,49 @@ def test_trainer_evaluates_and_resumes(tmp_path):
                                    eval_dataset = rows, data_collator = MTPDataCollator(pad_token_id = 0))
     resumed.train(resume_from_checkpoint = str(tmp_path / "checkpoint-2"))
     assert resumed.state.global_step == 4
+
+
+def test_default_ddp_reduces_the_loss_only_heads(tmp_path):
+    """Trainer wraps an nn.Module in DDP(find_unused_parameters=True): the Markov and confidence heads, used
+    only by the loss, must be in forward()'s output graph or backward raises "mark a variable ready only once"."""
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel
+    target = _target().float()
+    drafter = Qwen3DSparkDrafter.from_target(target, target_layer_ids = LAYERS, mask_token_id = VOCAB - 1,
+                                             num_draft_layers = 1, block_size = BS, num_anchors = 6, markov_rank = 8,
+                                             confidence_head = True).train()
+    ids = torch.randint(0, VOCAB - 1, (2, 16), generator = torch.Generator().manual_seed(0))
+    args = DSparkTrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True,
+                                   dspark_num_anchors = 6, save_strategy = "no")
+    trainer = UnslothDSparkTrainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist(), "labels": ids[0].tolist()}]),
+                                   data_collator = MTPDataCollator(pad_token_id = 0))
+    dist.init_process_group("gloo", store = dist.HashStore(), rank = 0, world_size = 1)
+    try:
+        ddp = DistributedDataParallel(drafter, find_unused_parameters = True)
+        trainer.compute_loss(ddp, {"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones_like(ids)}).backward()
+    finally:
+        dist.destroy_process_group()
+    assert drafter.markov_head.markov_w2.weight.grad is not None
+    assert all(p.grad is not None for p in drafter.confidence_head.parameters())
+
+
+def test_data_parallel_scores_after_the_gather(tmp_path):
+    """nn.DataParallel scatters forward kwargs along dim 0 (the lm_head too) and cannot gather Python stats."""
+    target = _target().float()
+    drafter = Qwen3DSparkDrafter.from_target(target, target_layer_ids = LAYERS, mask_token_id = VOCAB - 1,
+                                             num_draft_layers = 1, block_size = BS, num_anchors = 6, markov_rank = 8).train()
+    seen = []
+    hook = drafter.register_forward_pre_hook(lambda m, a, k: seen.append("loss_kwargs" in k), with_kwargs = True)
+    ids = torch.randint(0, VOCAB - 1, (2, 16), generator = torch.Generator().manual_seed(0))
+    args = DSparkTrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True,
+                                   dspark_num_anchors = 6, save_strategy = "no")
+    trainer = UnslothDSparkTrainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist(), "labels": ids[0].tolist()}]),
+                                   data_collator = MTPDataCollator(pad_token_id = 0))
+    loss = trainer.compute_loss(torch.nn.DataParallel(drafter), {"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones_like(ids)})
+    hook.remove()
+    assert seen == [False] and torch.isfinite(loss)
 
 
 def test_layer_minus_one_is_the_embedding_output(tmp_path):

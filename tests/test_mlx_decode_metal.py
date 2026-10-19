@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import ast
+import functools
 import importlib
 import inspect
+import math
 import textwrap
 from types import FunctionType, SimpleNamespace
 
@@ -442,11 +444,13 @@ try:
 except ImportError:  # mlx-vlm < 0.6 layers call mlx-lm's module
     vlm_gated_delta = lm_gated_delta
 
-# The scope leaves a module that packs on its own (mlx-vlm 0.7.8) alone, so the route is exercised on one that does not.
+# The scope leaves a module that packs on its own (mlx-vlm 0.7.8, mlx-lm 0.32) alone, so the route is exercised on one
+# that does not, when one is installed.
 _PACKED_SOURCES = [case for case in [(native, vlm_gated_delta, native.Qwen3_5GatedDeltaNet, native.ArraysCache),
                                      (lm_qwen3_5, lm_gated_delta, lm_qwen3_5.GatedDeltaNet, lm_cache.ArraysCache)]
                    if not hasattr(case[1], "_gated_delta_kernel_packed")]
-_, routed_gated_delta, _ROUTED_LAYER, _ = _PACKED_SOURCES[0]
+_, routed_gated_delta, _ROUTED_LAYER, _ = _PACKED_SOURCES[0] if _PACKED_SOURCES else (None,) * 4
+_needs_unpacked_source = pytest.mark.skipif(not _PACKED_SOURCES, reason = "every installed gated-delta module packs")
 
 
 def _packable_model(layer = _ROUTED_LAYER):
@@ -510,6 +514,7 @@ def test_packed_scope_preserves_prefill_and_decode_and_restores(consumer, source
     assert source.gated_delta_kernel is stock
 
 
+@_needs_unpacked_source
 def test_packed_route_keeps_other_shapes_and_a_differing_kernel_on_the_generic_kernel(monkeypatch, caplog):
     stock, packed = routed_gated_delta.gated_delta_kernel, decode._packed_gated_delta
     monkeypatch.setattr(decode, "_GATED_DELTA_VERDICTS", {})
@@ -539,6 +544,7 @@ def test_packed_route_keeps_other_shapes_and_a_differing_kernel_on_the_generic_k
         route(*_recurrence(mx.bfloat16))
 
 
+@_needs_unpacked_source
 @pytest.mark.parametrize("reason", ["switch", "upstream", "body", "kernel", "distributed", "model"])
 def test_packed_scope_steps_aside(reason, monkeypatch, caplog):
     stock, model = routed_gated_delta.gated_delta_kernel, _packable_model()
@@ -559,6 +565,7 @@ def test_packed_scope_steps_aside(reason, monkeypatch, caplog):
     assert ("differs from the version" in caplog.text) == (reason == "body")
 
 
+@_needs_unpacked_source
 def test_packed_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
     stock, model, foreign = routed_gated_delta.gated_delta_kernel, _packable_model(), lambda *args: None
     with decode.fused_packed_gated_delta(model):
@@ -671,6 +678,11 @@ def _attention_block(gqa, rows, keys, dtype = mx.bfloat16, heads = 8):
     return queries, buffer[0, ..., :keys, :] * 0.5, buffer[1, ..., :keys, :]
 
 
+def _mlx_vector_launch_fits(simds):
+    # Before M3, MLX 0.32.4's unrolled head-dim-512 vector kernel holds 448 threads per threadgroup.
+    return decode._gpu_generation() >= 15 or 32 * simds <= 448
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("gqa", [4, 8])
 @pytest.mark.parametrize("rows", [2, 3, 5, 8])
@@ -688,10 +700,11 @@ def test_verify_attention_matches_mlx_vector_kernel_and_decode_rows_bitwise(gqa,
             for i in range(rows)], axis = 2))
     monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # MLX's own vector kernel over each launch's rows
     step = decode._launch_simds() // gqa
-    _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
-        queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
-        values[..., : 4500 - rows + min(i + step, rows), :], scale = 1.0, mask = "causal")
-        for i in range(0, rows, step)], axis = 2))
+    if _mlx_vector_launch_fits(gqa * min(step, rows)):
+        _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
+            queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
+            values[..., : 4500 - rows + min(i + step, rows), :], scale = 1.0, mask = "causal")
+            for i in range(0, rows, step)], axis = 2))
     assert not mx.array_equal(out[:, :, :1], out[:, :, 1:2]).item()
 
 
@@ -739,12 +752,14 @@ def test_verify_scope_serves_only_marked_global_blocks_and_restores(monkeypatch)
     native = lambda *args: _attend(gemma4, full, *args, call = gemma4.Attention.__call__)
     with monkeypatch.context() as patch:
         patch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # the native call on MLX's vector kernel
-        vector = native(x)
+        vector = native(x) if _mlx_vector_launch_fits(8 * 3) else None
     with decode.fused_verify_attention(layers):
         assert type(sliding) is gemma4.Attention and type(full) is not gemma4.Attention
         _equal(_attend(gemma4, full, x), native(x))
         with decode.verify_block_attention():
-            _equal(_attend(gemma4, full, x), vector)
+            served = _attend(gemma4, full, x)
+            if vector is not None:
+                _equal(served, vector)
             assert launched == [3]
             # A decode step, an unmasked block, and too few keys for MLX's two-pass kernel stay native.
             for args in [(x[:, :1],), (x, 4096, None), (x, 600)]:
@@ -787,3 +802,212 @@ def test_a_launch_straddling_a_block_count_boundary_is_not_judged(monkeypatch):
         monkeypatch.setattr(decode, "_vector_attention", lambda *args: pytest.fail("a straddling launch ran"))
         assert decode._verify_attention(*_attention_block(8, 4, keys), None, 1.0, "causal", None) is None
         assert decode._VERIFY_ATTENTION_VERDICTS == admitted
+
+
+try:
+    from mlx_vlm.models.qwen4_exp import language as qwen4
+    from mlx_vlm.models.qwen4_exp.config import TextConfig as Qwen4TextConfig
+except ImportError:  # mlx-vlm before qwen4_exp
+    qwen4 = None
+from unsloth_zoo.mlx import attention as mlx_attention, nax
+
+
+def _qsa_layer():
+    if qwen4 is None:
+        pytest.skip("mlx-vlm without qwen4_exp")
+    config = Qwen4TextConfig(
+        model_type = "qwen4_exp_text", hidden_size = 64, num_hidden_layers = 4, num_attention_heads = 4,
+        linear_num_value_heads = 2, linear_num_key_heads = 2, linear_key_head_dim = 16, linear_value_head_dim = 16,
+        linear_conv_kernel_dim = 4, num_experts = 4, num_experts_per_tok = 2, shared_expert_intermediate_size = 16,
+        moe_intermediate_size = 16, rms_norm_eps = 1e-6, vocab_size = 128, num_key_value_heads = 2,
+        max_position_embeddings = 4096, hc_count = 2, hc_lowrank = 8, head_dim = 32, indexer_head_dim = 32,
+        indexer_budget = 32, ngram_vocab_size_base = 100,
+    )
+    mx.random.seed(0)
+    attention = qwen4.Qwen4ExpAttention(config)
+    attention.set_dtype(mx.bfloat16)
+    attention.eval()
+    attention.freeze()
+    return attention
+
+
+def _qsa_run(attention):
+    # Dense while the prefix fits the eight-block budget, then sparse prefill chunks and decode.
+    cache, outs = qwen4.QSAKVCache(), []
+    mx.random.seed(1)
+    for n in (20, 30, 41, 1, 1, 1, 2):
+        out = attention(mx.random.normal((1, n, 64)).astype(mx.bfloat16), cache = cache)
+        mx.eval(out, cache.state)
+        outs.append(out)
+    return outs
+
+
+def test_qsa_scope_preserves_attention_and_restores(monkeypatch):
+    attention, native = _qsa_layer(), qwen4.Qwen4ExpQSAIndexer.select_from_projected
+    expected, select, calls = _qsa_run(attention), mlx_attention.select_blocks, []
+    monkeypatch.setattr(decode, "_QSA_VERDICTS", {})
+    monkeypatch.setattr(mlx_attention, "select_blocks", lambda *args: calls.append(args[0].shape[2]) or select(*args))
+    with pytest.raises(RuntimeError, match = "cancel"):
+        with decode.fused_qsa_attention(attention):
+            route = qwen4.Qwen4ExpQSAIndexer.select_from_projected
+            with decode.fused_qsa_attention(attention):
+                assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is route is not native
+            for actual, out in zip(_qsa_run(attention), expected):
+                _equal(actual, out)
+            assert calls == [30, 41, 1, 1, 1, 2] and all(decode._QSA_VERDICTS.values())
+            raise RuntimeError("cancel")
+    assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is native
+
+
+def test_qsa_scope_keeps_native_picks_when_the_kernel_disagrees(monkeypatch, caplog):
+    attention = _qsa_layer()
+    expected, select = _qsa_run(attention), mlx_attention.select_blocks
+    monkeypatch.setattr(decode, "_QSA_VERDICTS", {})
+    monkeypatch.setattr(mlx_attention, "select_blocks", lambda *args: mx.maximum(select(*args) - 1, -1))
+    with caplog.at_level("WARNING"), decode.fused_qsa_attention(attention):
+        for actual, out in zip(_qsa_run(attention), expected):
+            _equal(actual, out)
+    assert decode._QSA_VERDICTS and not any(decode._QSA_VERDICTS.values())
+    assert caplog.text.count("picked other blocks than argpartition") == len(decode._QSA_VERDICTS)
+
+
+@pytest.mark.parametrize("where", ["check", "synchronize"])
+def test_qsa_selection_check_raises_a_failed_command_buffer(where, monkeypatch):
+    attention, failed = _qsa_layer(), RuntimeError("[METAL] Command buffer execution failed: Internal Error")
+    monkeypatch.setattr(decode, "_QSA_VERDICTS", {})
+
+    def fail(*_, **__):
+        raise failed
+
+    if where == "check":
+        monkeypatch.setattr(mx, "array_equal", fail)
+    else:
+        monkeypatch.setattr(mx, "array_equal", lambda *_, **__: mx.array(False))
+        monkeypatch.setattr(mx, "synchronize", fail)
+    with decode.fused_qsa_attention(attention), pytest.raises(RuntimeError) as raised:
+        _qsa_run(attention)
+    assert raised.value is failed and not decode._QSA_VERDICTS
+
+
+@pytest.mark.parametrize("reason", ["switch", "body", "training", "distributed", "model"])
+def test_qsa_scope_steps_aside(reason, monkeypatch, caplog):
+    attention, native = _qsa_layer(), qwen4.Qwen4ExpQSAIndexer.select_from_projected
+    if reason == "switch":
+        monkeypatch.setenv("UNSLOTH_MLX_QSA_SELECT", "0")
+    elif reason == "body":
+        monkeypatch.setattr(qwen4.Qwen4ExpQSAIndexer, "select_from_projected", lambda *args: native(*args))
+        native = qwen4.Qwen4ExpQSAIndexer.select_from_projected
+    elif reason == "training":
+        attention.train()
+    elif reason == "distributed":
+        attention._unsloth_mlx_distributed_parallel_mode = "tensor"
+    else:
+        attention = attention.q_proj
+    with caplog.at_level("WARNING"), decode.fused_qsa_attention(attention):
+        assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is native
+    assert ("differs from the version" in caplog.text) == (reason == "body")
+
+
+def test_qsa_route_skips_an_indexer_in_training(monkeypatch):
+    attention, calls = _qsa_layer(), []
+    monkeypatch.setattr(mlx_attention, "select_blocks", lambda *args: calls.append(args) or None)
+    with decode.fused_qsa_attention(attention):
+        attention.indexer.train()
+        _qsa_run(attention)
+    assert calls == []
+
+
+def test_qsa_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
+    attention, foreign = _qsa_layer(), lambda *args: None
+    native = qwen4.Qwen4ExpQSAIndexer.select_from_projected
+    with decode.fused_qsa_attention(attention):
+        monkeypatch.setattr(qwen4.Qwen4ExpQSAIndexer, "select_from_projected", foreign)
+    assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is foreign
+    monkeypatch.setattr(qwen4.Qwen4ExpQSAIndexer, "select_from_projected", native)
+    with decode.fused_qsa_attention(attention):
+        assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is not native
+    assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is native
+
+
+def _qsa_prefill_scope(monkeypatch, calls):
+    from mlx_vlm.models.qwen4_exp import qsa_kernel
+    monkeypatch.delenv("UNSLOTH_MLX_FAST_QSA", raising = False)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(mlx_attention, "fast_prefill_supported", lambda queries, *args: queries.shape[2] >= 20)
+    monkeypatch.setattr(mlx_attention, "fast_prefill_attention", lambda q, k, v, blocks, ends, scale: calls.append(
+        q.shape[2]) or qsa_kernel.qsa_sparse_attention(q, k, v, blocks, ends, scale = scale, block_size = 4))
+
+
+def test_qsa_prefill_route_takes_indexed_prefill_and_restores(monkeypatch):
+    attention, native, calls = _qsa_layer(), qwen4.dispatch_qsa_attention, []
+    expected = _qsa_run(attention)
+    _qsa_prefill_scope(monkeypatch, calls)
+    q, kv = mx.zeros((1, 4, 20, 32), mx.bfloat16), mx.zeros((1, 2, 20, 32), mx.bfloat16)
+    picks, ends = mx.zeros((1, 20, 8), mx.int32), mx.arange(1, 21, dtype = mx.int32)[None]
+    with decode.inference_scopes(attention):
+        assert qwen4.dispatch_qsa_attention is not native
+        for actual, out in zip(_qsa_run(attention), expected):
+            _equal(actual, out)
+        qwen4.dispatch_qsa_attention(q, kv, kv, picks, ends, cache = None, scale = 1.0, block_size = 4, causal = False,
+                                     mask = None, mask_factory = lambda: mx.ones((20, 20), mx.bool_))
+    assert calls == [20, 30, 41] and qwen4.dispatch_qsa_attention is native
+
+
+def test_qsa_prefill_route_takes_the_simdgroup_kernel_without_tensor_units(monkeypatch):
+    from mlx_vlm.models.qwen4_exp import qsa_kernel
+    attention, calls, probe = _qsa_layer(), [], nax.kernel_probe_passed
+    _qsa_prefill_scope(monkeypatch, [])
+    monkeypatch.setattr(nax, "kernel_probe_passed", probe)
+    monkeypatch.setattr(nax, "nax_available", lambda: False)
+    monkeypatch.setattr(nax, "_PROBES", {})
+    monkeypatch.setattr(nax, "_stored_probes", lambda: {})
+    monkeypatch.setattr(nax, "_store_probe", lambda *args: None)
+    monkeypatch.setattr(nax, "_run_probe", lambda module, function: "")
+    monkeypatch.setattr(mlx_attention, "simd_prefill_supported", lambda queries, *args: queries.shape[2] >= 20)
+    monkeypatch.setattr(mlx_attention, "simd_prefill_attention", lambda q, k, v, blocks, ends, scale: calls.append(
+        q.shape[2]) or qsa_kernel.qsa_sparse_attention(q, k, v, blocks, ends, scale = scale, block_size = 4))
+    expected = _qsa_run(attention)
+    with decode.inference_scopes(attention):
+        for actual, out in zip(_qsa_run(attention), expected):
+            _equal(actual, out)
+    assert calls == [20, 30, 41]
+
+
+def test_qsa_prefill_route_keeps_working_after_training(monkeypatch):
+    from unsloth_zoo.mlx import utils
+    attention, calls = _qsa_layer(), []
+    native = getattr(qwen4.dispatch_qsa_attention, "_unsloth_sparse_attention_original", qwen4.dispatch_qsa_attention)
+    # What the trainer leaves bound for the rest of the process.
+    trained = mlx_attention._training_wrapper(native, mlx_attention._qsa_attention_training_over)
+    monkeypatch.setattr(qwen4, "dispatch_qsa_attention", trained)
+    _qsa_prefill_scope(monkeypatch, calls)
+    expected = _qsa_run(attention)
+    with decode.inference_scopes(attention):
+        for actual, out in zip(_qsa_run(attention), expected):
+            _equal(actual, out)
+        assert calls == [20, 30, 41]
+        token = utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+        try:
+            _qsa_run(attention)
+        finally:
+            utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert calls == [20, 30, 41] and qwen4.dispatch_qsa_attention is trained
+
+
+@pytest.mark.parametrize("reason", ["switch", "probe", "body", "wrapped"])
+def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
+    attention, calls = _qsa_layer(), []
+    _qsa_prefill_scope(monkeypatch, calls)
+    if reason == "wrapped":  # around the training wrapper, which functools.wraps copies the marker from
+        native = getattr(qwen4.dispatch_qsa_attention, "_unsloth_sparse_attention_original", qwen4.dispatch_qsa_attention)
+        trained = mlx_attention._training_wrapper(native, mlx_attention._qsa_attention_training_over)
+        monkeypatch.setattr(qwen4, "dispatch_qsa_attention", functools.wraps(trained)(lambda *args, **kwargs: None))
+    elif reason == "switch":
+        monkeypatch.setenv("UNSLOTH_MLX_FAST_QSA", "0")
+    elif reason == "probe":
+        monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: False)
+    else:
+        monkeypatch.setattr(qwen4, "dispatch_qsa_attention", lambda *args, **kwargs: None)
+    native = qwen4.dispatch_qsa_attention
+    with decode.inference_scopes(attention):
+        assert qwen4.dispatch_qsa_attention is native

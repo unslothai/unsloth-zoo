@@ -99,19 +99,19 @@ if triton is not None:
     @triton.jit
     def _nf4_dot(W, A, A2, C2, offset, LUT, rows64, rmask, x_chunk, k0, K,
                  BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,
-                 BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+                 BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr):
         # rows64 index the flat buffer's rows: absmax / state2 blocks are global indices.
         HALF_K: tl.constexpr = BLOCK_K // 2
         NB: tl.constexpr = BLOCK_K // BLOCKSIZE
         half_k = tl.arange(0, HALF_K)
         nbs = tl.arange(0, NB)
-        kmask = (k0 + 2 * half_k) < K
+        kmask = ((k0 + 2 * half_k) < K) | EVEN_K
         b = tl.load(W + rows64[:, None] * (K // 2) + (k0 // 2 + half_k)[None, :],
                     mask = rmask[:, None] & kmask[None, :], other = 0).to(tl.int32)
         # High nibble is the earlier element, as bitsandbytes packs it.
         w = tl.reshape(tl.join(tl.load(LUT + (b >> 4)), tl.load(LUT + (b & 15))), (BLOCK_N, BLOCK_K))
         part = tl.sum(tl.reshape(w * x_chunk[None, :], (BLOCK_N, NB, BLOCKSIZE)), axis = 2)
-        bmask = rmask[:, None] & ((k0 + nbs * BLOCKSIZE) < K)[None, :]
+        bmask = rmask[:, None] & (((k0 + nbs * BLOCKSIZE) < K) | EVEN_K)[None, :]
         blk = rows64[:, None] * (K // BLOCKSIZE) + (k0 // BLOCKSIZE + nbs)[None, :]
         if NESTED:
             q = tl.load(A + blk, mask = bmask, other = 0).to(tl.int32)
@@ -206,7 +206,7 @@ if triton is not None:
         TOP_K: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,
         STACKED: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr,
         BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,
-        LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,
     ):
         # Each program owns BLOCK_N // 2 intermediate columns; its rows alternate gate, up.
         alpha = alpha.to(tl.float32)
@@ -230,9 +230,9 @@ if triton is not None:
         x_row = X + (p // TOP_K).to(tl.int64) * K
         acc = tl.zeros([BLOCK_N], dtype = tl.float32)
         for k0 in range(0, K, BLOCK_K):
-            x = tl.load(x_row + k0 + ks, mask = (k0 + ks) < K, other = 0.0).to(tl.float32)
+            x = tl.load(x_row + k0 + ks, mask = ((k0 + ks) < K) | EVEN_K, other = 0.0).to(tl.float32)
             acc += _nf4_dot(W, A, A2, C2, offset, LUT, wrows, rmask, x, k0, K,
-                            BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K)
+                            BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K, EVEN_K)
         if BIAS_KIND != 0:
             acc += _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND)
         if HAS_LORA:
@@ -250,7 +250,7 @@ if triton is not None:
         TOP_K: tl.constexpr, DENSE_RW: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr,
         NESTED: tl.constexpr, STACKED: tl.constexpr, BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr,
         R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
+        BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,
     ):
         # Fixed-order top-k sum, one store: no atomics, deterministic.
         t = tl.program_id(0)
@@ -273,9 +273,9 @@ if triton is not None:
                 wrows = rows64
             acc = tl.zeros([BLOCK_N], dtype = tl.float32)
             for k0 in range(0, K, BLOCK_K):
-                x = tl.load(X + s * K + k0 + ks, mask = (k0 + ks) < K, other = 0.0).to(tl.float32)
+                x = tl.load(X + s * K + k0 + ks, mask = ((k0 + ks) < K) | EVEN_K, other = 0.0).to(tl.float32)
                 acc += _nf4_dot(W, A, A2, C2, offset, LUT, wrows, rmask, x, k0, K,
-                                BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K)
+                                BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K, EVEN_K)
             if BIAS_KIND != 0:
                 acc += _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND)
             if HAS_LORA:
@@ -450,6 +450,11 @@ def _block_k(K, blocksize):
     return max(blocksize, min(1024, triton.next_power_of_2(K)))
 
 
+def _even_k(K, block_k):
+    # Same values without the K masks; HIP keeps the masked kernel (unmeasured there).
+    return K % block_k == 0 and torch.version.hip is None
+
+
 def _lora_args(lora, dummy):
     if lora is None:
         return dummy, dummy, 0.0, 1, (0, 0, 0), 0
@@ -475,6 +480,7 @@ def _bias_args(tb):
 
 
 def _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act = ACT_GPTOSS, interleaved = True):
+    block_k = _block_k(tb["K"], tb["blocksize"])
     B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
     bias, bias_kind = _bias_args(tb)
     # Triton launches on the current device, not the tensors' (multi-GPU device_map).
@@ -486,13 +492,14 @@ def _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act = ACT_GPTOSS, inter
             TOP_K = top_k, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"], NESTED = tb["nested"],
             STACKED = tb.get("stacked", False), ACT = act, INTERLEAVED = interleaved,
             BIAS_KIND = bias_kind, HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
-            LORA_KIND = kind, BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
+            LORA_KIND = kind, BLOCK_N = 4, BLOCK_K = block_k, EVEN_K = _even_k(tb["K"], block_k), num_warps = 4,
             enable_fp_fusion = True,
         )
     return out
 
 
 def _down(x, idx, rw, dense_rw, tb, top_k, lora, out):
+    block_k = _block_k(tb["K"], tb["blocksize"])
     B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
     bias, bias_kind = _bias_args(tb)
     with torch.cuda.device(x.device):
@@ -503,7 +510,7 @@ def _down(x, idx, rw, dense_rw, tb, top_k, lora, out):
             TOP_K = top_k, DENSE_RW = dense_rw, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"],
             NESTED = tb["nested"], STACKED = tb.get("stacked", False), BIAS_KIND = bias_kind,
             HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r), LORA_KIND = kind,
-            BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
+            BLOCK_N = 4, BLOCK_K = block_k, EVEN_K = _even_k(tb["K"], block_k), num_warps = 4,
             enable_fp_fusion = True,
         )
     return out

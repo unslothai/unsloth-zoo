@@ -2791,6 +2791,10 @@ def sft_prepare_dataset(
                     return False
             _is_conv = _sft_is_conversational(_first_ex)
             if not _is_conv:
+                if getattr(args, "assistant_only_loss", False):
+                    raise ValueError(
+                        "Unsloth: assistant_only_loss needs conversational prompt/completion messages, not plain strings."
+                    )
                 test_text = _first_ex["prompt"]
             else:
                 test_text = None  # chat template handles BOS
@@ -2843,58 +2847,7 @@ def sft_prepare_dataset(
         else:
             map_kwargs["batch_size"] = _iterable_batch_size(dataset)
 
-        if do_prompt_completion:
-            _eos_token = getattr(tokenizer, 'eos_token', None)
-
-            def _tokenize_pc(example):
-                if _is_conv:
-                    prompt_ids = processing_class.apply_chat_template(
-                        example["prompt"], tokenize=True,
-                        add_generation_prompt=True, return_dict=False,
-                        tools=example.get("tools"),
-                        **(example.get("chat_template_kwargs") or {}),
-                    )
-                    if prompt_ids and isinstance(prompt_ids[0], list):
-                        prompt_ids = prompt_ids[0]
-                    pc_processed = processing_class.apply_chat_template(
-                        example["prompt"] + example["completion"],
-                        return_dict=True, tokenize=True,
-                        tools=example.get("tools"),
-                        **(example.get("chat_template_kwargs") or {}),
-                    )
-                    if isinstance(pc_processed.get("input_ids", [None])[0], list):
-                        pc_processed = {k: v[0] for k, v in pc_processed.items()}
-                    pc_ids = pc_processed["input_ids"]
-                else:
-                    _completion = example["completion"]
-                    if _eos_token and not _completion.endswith(_eos_token):
-                        _completion = _completion + _eos_token
-                    prompt_ids = tokenizer(
-                        example["prompt"], add_special_tokens=add_special_tokens,
-                    )["input_ids"]
-                    pc_ids = tokenizer(
-                        example["prompt"] + _completion,
-                        add_special_tokens=add_special_tokens,
-                    )["input_ids"]
-                if do_truncation and max_seq_length > 0:
-                    pc_ids = pc_ids[:max_seq_length]
-                n_prompt = min(len(prompt_ids), len(pc_ids))
-                completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
-                result = {"input_ids": pc_ids, "completion_mask": completion_mask}
-                if _needs_token_type_ids:
-                    result["token_type_ids"] = [0] * len(pc_ids)
-                return result
-
-            if use_desc:
-                map_kwargs["desc"] = 'Unsloth: Tokenizing ["prompt"+"completion"]'
-            import warnings as _w
-            with _w.catch_warnings():
-                _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
-                dataset = dataset.map(
-                    _tokenize_pc, batched=False,
-                    remove_columns=list(column_names), **map_kwargs,
-                )
-        elif do_messages:
+        if do_messages or do_prompt_completion:
             assistant_only_loss = bool(getattr(args, "assistant_only_loss", False))
             training_chat_template = getattr(self, "chat_template", None)
             # No {% generation %} markers (or no TRL training template): assistant masks would be all zeros,
@@ -2921,15 +2874,88 @@ def sft_prepare_dataset(
                         response_part = "<|start|>assistant",
                     )
                 response_labels = _response_labels(
-                    None, tokenizer = tokenizer, return_function = True, **marker_kwargs,
+                    None, tokenizer = processing_class, return_function = True, **marker_kwargs,
                 )
+            if assistant_only_loss:
+                used_column_names.append("assistant_masks")
+
+        if do_prompt_completion:
+            _eos_token = getattr(tokenizer, 'eos_token', None)
+
+            def _tokenize_pc(example):
+                if _is_conv:
+                    template_kwargs = dict(example.get("chat_template_kwargs") or {})
+                    if training_chat_template is not None:
+                        template_kwargs["chat_template"] = training_chat_template
+                    prompt_ids = processing_class.apply_chat_template(
+                        example["prompt"], tokenize=True,
+                        add_generation_prompt=True, return_dict=False,
+                        tools=example.get("tools"),
+                        **template_kwargs,
+                    )
+                    if prompt_ids and isinstance(prompt_ids[0], list):
+                        prompt_ids = prompt_ids[0]
+                    pc_processed = processing_class.apply_chat_template(
+                        example["prompt"] + example["completion"],
+                        return_dict=True, tokenize=True,
+                        return_assistant_tokens_mask=assistant_only_loss and not marker_masks,
+                        tools=example.get("tools"),
+                        **template_kwargs,
+                    )
+                    if isinstance(pc_processed.get("input_ids", [None])[0], list):
+                        pc_processed = {k: v[0] for k, v in pc_processed.items()}
+                    pc_ids = pc_processed["input_ids"]
+                else:
+                    _completion = example["completion"]
+                    if _eos_token and not _completion.endswith(_eos_token):
+                        _completion = _completion + _eos_token
+                    prompt_ids = tokenizer(
+                        example["prompt"], add_special_tokens=add_special_tokens,
+                    )["input_ids"]
+                    pc_ids = tokenizer(
+                        example["prompt"] + _completion,
+                        add_special_tokens=add_special_tokens,
+                    )["input_ids"]
+                n_prompt = min(len(prompt_ids), len(pc_ids))
+                completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
+                result = {"input_ids": pc_ids, "completion_mask": completion_mask}
+                if assistant_only_loss:
+                    if marker_masks:
+                        labels = response_labels({"input_ids": [pc_ids]})["labels"][0]
+                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                    else:
+                        result["assistant_masks"] = list(pc_processed["assistant_masks"])
+                if do_truncation and max_seq_length > 0:
+                    result = {k: v[:max_seq_length] for k, v in result.items()}
+                if _needs_token_type_ids:
+                    result["token_type_ids"] = [0] * len(result["input_ids"])
+                return result
+
+            if use_desc:
+                map_kwargs["desc"] = 'Unsloth: Tokenizing ["prompt"+"completion"]'
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
+                dataset = dataset.map(
+                    _tokenize_pc, batched=False,
+                    remove_columns=list(column_names), **map_kwargs,
+                )
+            if assistant_only_loss:
+                # Prompt-history assistant turns are no target while completion_mask applies.
+                pc_completion_only = getattr(self, "completion_only_loss", None)
+                if pc_completion_only is None:
+                    pc_completion_only = getattr(args, "completion_only_loss", None)
+                if pc_completion_only is None or pc_completion_only:
+                    dataset = dataset.filter(
+                        lambda row: any(a and c for a, c in zip(row["assistant_masks"], row["completion_mask"]))
+                    )
+                else:
+                    dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
+        elif do_messages:
             truncate_messages = do_truncation and isinstance(max_seq_length, int) and max_seq_length > 0 and \
                 not locals().get("_unsloth_wrapped_packing", False)
             message_cut = slice(-max_seq_length, None) if truncate_messages and \
                 getattr(args, "truncation_mode", "keep_start") == "keep_end" else slice(None, max_seq_length)
-            if assistant_only_loss:
-                used_column_names.append("assistant_masks")
-
             def _tokenize_messages(example):
                 template_kwargs = dict(example.get("chat_template_kwargs") or {})
                 if training_chat_template is not None:

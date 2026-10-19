@@ -893,3 +893,60 @@ def test_fp32_down_operands_match_the_loop_down_exactly_enough(gemm, monkeypatch
         dref[s0:s0 + c] = g[s0:s0 + c] @ W
         s0 += c
     assert _rel(y.detach(), ref) < 1e-6 and _rel(x.grad, dref) < 1e-6, (_rel(y.detach(), ref), _rel(x.grad, dref))
+
+
+# ---------------------------------------------------------------------------------------------
+# FSDP2 all-gathered experts (unsloth fsdp2_qlora marks them `_unsloth_fsdp2_gathered`): FSDP2
+# frees the forward all-gather and re-gathers before backward, possibly at another address. The
+# backward recompute of both grouped paths (bf16 _StackProvider, fp16 _Fp16StackProvider) must
+# dequantize from the current weights, not from the pointer table captured in forward.
+# ---------------------------------------------------------------------------------------------
+def _regather_elsewhere(ex):
+    # What FSDP2 does between forward and backward, made deterministic: the weights move to new
+    # storage and the old storage is overwritten (NF4 code 0 everywhere = -1.0 * absmax).
+    for p in list(ex.gate_up_projs) + list(ex.down_projs):
+        old = p.weight.data
+        p.weight.data = old.clone()
+        old.zero_()
+
+
+@pytest.mark.parametrize("marked", ["all", "down_only"])
+@pytest.mark.parametrize("mode", ["bf16", "fp16", "fp16_windows"])
+def test_fsdp2_gathered_backward_reads_current_weights(mode, marked, monkeypatch):
+    if mode == "bf16" and not (torch.cuda.is_bf16_supported() and _check_torch_grouped_mm_supported()):
+        pytest.skip("torch._grouped_mm / bf16 unavailable")
+    if mode != "bf16" and not FP16_OK:
+        pytest.skip("fp16 grouped GEMM unavailable")
+    if not STACKED:
+        pytest.skip("pointer tables need the stacked NF4 dequant kernel")
+    if mode == "fp16_windows":
+        monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW", "3")
+    monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "1")
+    monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "1")
+    ex = (_Experts(dtype = DT) if mode == "bf16" else _fp16_experts()).train()
+    # down_only: FSDP2 wrapping a subset of the experts still marks only those weights.
+    marked_projs = list(ex.down_projs) if marked == "down_only" else list(ex.gate_up_projs) + list(ex.down_projs)
+    for p in marked_projs:
+        setattr(p.weight, moe_ready_epoch.FSDP2_GATHERED, True)
+    T = 48
+    xdt = DT if mode == "bf16" else F16
+    x = torch.randn(1, T, H, device = "cuda", dtype = xdt)
+    idx, w = _routing(T) if mode == "bf16" else _routing32(T)
+    up = torch.randn(1, T, H, device = "cuda")
+
+    def run(move):
+        xx = x.detach().clone().requires_grad_(True)
+        before = dict(gq.CALLS)
+        out = ex(xx, idx, w)
+        if move:
+            _regather_elsewhere(ex)
+        out.backward(up.view_as(out).to(out.dtype))
+        calls = {k: gq.CALLS[k] - before[k] for k in before}
+        return out.detach().float(), xx.grad.detach().float(), calls
+
+    ref_out, ref_dx, calls = run(move = False)
+    assert calls["forward_fp16" if mode != "bf16" else "forward"] == 1
+    assert calls["stacked_dequant"] >= 4 and calls["bnb_fallback_dequant"] == 0
+    out, dx, _ = run(move = True)
+    assert torch.equal(out, ref_out)
+    assert torch.equal(dx, ref_dx), f"stale table in backward: max |dX - ref| {(dx - ref_dx).abs().max().item()}"

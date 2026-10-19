@@ -338,6 +338,50 @@ def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
 
 
 @metal_only
+def test_training_attention_keeps_the_fused_mask_outside_a_training_context():
+    seen = []
+    sdpa = mlx_utils._wrap_training_sdpa(lambda q, k, v, *, scale, mask=None, **kwargs: seen.append(mask))
+    q = mx.zeros((1, 1, 4, 8))
+    sdpa(q, q, q, scale=1.0, mask="causal")   # e.g. a paused evaluation while another run holds the patch
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+    try:
+        sdpa(q, q, q, scale=1.0, mask="causal")
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert seen[0] == "causal" and isinstance(seen[1], mx.array)
+
+
+@metal_only
+@pytest.mark.parametrize("T, mask, sinks", [
+    (1, None, False), (4, "causal", False), (8, "causal", False), (16, "causal", True), (16, None, True)])
+def test_training_attention_differentiates_short_queries_and_sinks(T, mask, sinks):
+    mx.random.seed(0)
+    q, k, v = (mx.random.normal((1, 4, T, 64)) for _ in range(3))
+    sink = mx.random.normal((4,)) if sinks else None
+
+    def reference(q):
+        scores = (q * 0.125) @ k.swapaxes(-1, -2)
+        if mask == "causal":
+            scores = mx.where(mx.arange(T)[None] <= mx.arange(T)[:, None], scores, -mx.inf)
+        if sink is not None:
+            scores = mx.concatenate([mx.broadcast_to(sink[None, :, None, None], (1, 4, T, 1)), scores], axis=-1)
+        probs = mx.softmax(scores, axis=-1)
+        return ((probs[..., 1:] if sink is not None else probs) @ v).sum()
+
+    def fused(q):
+        extra = {} if sink is None else {"sinks": sink}
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=0.125, mask=mask, **extra).sum()
+
+    mlx_utils.acquire_mlx_training_patches()
+    try:
+        got = mx.grad(fused)(q)
+        mx.eval(got)
+    finally:
+        mlx_utils.release_mlx_training_patches()
+    assert mx.allclose(got, mx.grad(reference)(q), atol=1e-4)
+
+
+@metal_only
 @pytest.mark.parametrize("family", ["gemma4", "gemma3n"])
 @pytest.mark.parametrize("T", [2048, 5200])
 def test_windowed_attention_trains_kv_shared_gemma(monkeypatch, family, T):
@@ -2893,16 +2937,24 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     from mlx_vlm.models.gemma4.config import TextConfig
     from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
 
-    # Two interpreters: a fresh one can still read low on all five repeats (one run
-    # read unshared 160329148 throughout), and low stretches do not cross processes.
+    # Four interpreters, always: a fresh one can still read low on all five repeats (one
+    # run read unshared 160329148 throughout), low stretches do not cross processes, and
+    # two were not enough (run 39234730657 read unshared at most 150494752 across both,
+    # about 18% under exact). Readings only ever err low, so a ceiling over more
+    # interpreters sits closer to the exact value on BOTH sides. The count is fixed rather
+    # than "until the bound holds", which would give an under-read shared peak repeated
+    # chances to hide a real regression.
     readings = {"shared": [], "unshared": []}
-    for _ in range(2):
+    per_run = []
+    for _ in range(4):
         run = subprocess.run(
             [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
             capture_output=True, text=True, timeout=900,
         )
         assert run.returncode == 0, run.stderr[-4000:]
-        for side, values in json.loads(run.stdout.strip().splitlines()[-1]).items():
+        measured = json.loads(run.stdout.strip().splitlines()[-1])
+        per_run.append(measured)
+        for side, values in measured.items():
             readings[side] += values
 
     def ceiling(side):
@@ -2911,7 +2963,9 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         return max(kept)
 
     shared_peak, unshared_peak = ceiling("shared"), ceiling("unshared")
-    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak, readings)
+    assert shared_peak < 1.25 * unshared_peak, (
+        f"shared {shared_peak} >= 1.25 x unshared {unshared_peak}; per interpreter: {json.dumps(per_run)}"
+    )
 
     # Checkpointing must not change what the shared model computes.
     seq_len = 512

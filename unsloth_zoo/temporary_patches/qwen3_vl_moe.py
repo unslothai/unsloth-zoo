@@ -50,6 +50,21 @@ from .moe_utils import (
 from .qwen3_moe import _make_qwen_moe_lora_extractor
 
 
+try:
+    from .moe_utils_bnb4bit import _moe_uses_bnb4bit_expert_weights, forward_moe_backend_bnb4bit
+except ImportError:
+    _moe_uses_bnb4bit_expert_weights = None
+
+
+def _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights):
+    """Packed bnb 4-bit experts: dequantize then dispatch. The Triton kernels and the per-expert loop
+    index the stack and cannot read a packed Params4bit; None otherwise."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if _moe_uses_bnb4bit_expert_weights is None or not _moe_uses_bnb4bit_expert_weights(self):
+        return None
+    return forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
+
+
 def patch_qwen3_vl_moe():
     # This Unsloth Zoo code section is licensed under AGPL3
 
@@ -256,6 +271,9 @@ def patch_qwen3_vl_moe():
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
                 """Grouped-GEMM MoE forward via Triton kernels (fused permutation, cached configs)."""
+                output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
+                if output is not None:
+                    return output
                 return forward_triton_grouped_gemm(
                     self, hidden_states, top_k_index, top_k_weights
                 )
@@ -270,6 +288,9 @@ def patch_qwen3_vl_moe():
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
                 # Same loop fallback logic as Qwen3MoeExperts
+                output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
+                if output is not None:
+                    return output
                 return forward_native_moe_loop(
                     self, hidden_states, top_k_index, top_k_weights
                 )

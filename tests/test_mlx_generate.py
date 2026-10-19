@@ -1112,7 +1112,8 @@ def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches()
     assert results[1].token_ids == [1]
 
 
-def test_vision_generation_resolves_the_saved_processor(monkeypatch):
+@pytest.mark.parametrize("audio", [None, [0.0, 0.1]])
+def test_vision_generation_resolves_the_saved_processor(monkeypatch, audio):
     # A text-only multimodal load publishes its inner tokenizer, so the typed
     # core resolves the saved processor for both it and fast_generate.
     from unsloth_zoo.mlx.generate import generate_batch as engine_generate_batch
@@ -1123,11 +1124,11 @@ def test_vision_generation_resolves_the_saved_processor(monkeypatch):
         def stream(self, requests):
             return iter([GenerationEvent(index=0, result="ok")])
     monkeypatch.setattr(engine, "_VLMBatchAdapter", _Adapter)
-    monkeypatch.setattr(engine, "generation_mode", lambda model: contextlib.nullcontext())
+    monkeypatch.setattr(engine, "generation_mode", lambda model, call: seen.update(call=call) or contextlib.nullcontext())
     processor = object()
     model = types.SimpleNamespace(_is_vlm_model=True, _processor=processor)
-    assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a")]) == ["ok"]
-    assert seen["tok"] is processor
+    assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a", audio=audio)]) == ["ok"]
+    assert seen["tok"] is processor and seen["call"] == ("batch", "vision", *(() if audio is None else ("audio",)))
 
 
 def _knob_sampler(**knobs):
@@ -1675,9 +1676,10 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     # these tests hand it plain stand-ins. The decode scope reads a module's own dict
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
-    from unsloth_zoo.mlx.inference import (exact_speculative_verify, fused_decode_conv_silu, fused_moe_gate_up,
-                                           fused_moe_routed_experts, fused_moe_router, fused_packed_gated_delta,
-                                           fused_residual_norm, fused_residual_norm_handoff, fused_verify_attention)
+    from unsloth_zoo.mlx.inference import (exact_batch_invariant_decode, exact_speculative_verify, fused_decode_conv_silu,
+                                           fused_moe_gate_up, fused_moe_routed_experts, fused_moe_router,
+                                           fused_packed_gated_delta, fused_residual_norm, fused_residual_norm_handoff,
+                                           fused_verify_attention)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1687,30 +1689,123 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
         )
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
                 fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model), \
-                exact_speculative_verify(model), fused_packed_gated_delta(model), fused_verify_attention(model):
+                exact_speculative_verify(model), exact_batch_invariant_decode(model), fused_packed_gated_delta(model), \
+                fused_verify_attention(model):
             pass
 
 
-def test_generation_paths_enter_every_inference_fusion(monkeypatch):
-    # A scope missing from generation_mode or a loader generate site silently leaves that path native.
+def test_every_inference_scope_is_registered_and_every_generation_path_enters_the_registry(monkeypatch):
+    # A scope missing from the registry silently leaves every path native.
     import ast
 
     from unsloth_zoo.mlx import generate as generate_module, inference, loader
-    prefixes = ("fused_", "nax_", "dense_", "exact_")
-    scopes = {name for name, value in vars(inference).items()
-              if name.startswith(prefixes) and getattr(value, "__module__", None) == inference.__name__}
+    scopes = {value for name, value in vars(inference).items() if inspect.isfunction(value)
+              and name != "inference_scopes" and "_modules" in inspect.signature(value).parameters}
+    assert scopes == {scope.enter for scope in inference.INFERENCE_SCOPES}
     entered = []
-    for name in scopes:
-        monkeypatch.setattr(inference, name, lambda model, *args, name=name, **kwargs: entered.append(name) or contextlib.nullcontext(model))
-    with generate_module.generation_mode(types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [])):
-        pass
-    assert sorted(entered) == sorted(scopes)
-    sites = [{item.context_expr.func.id for item in node.items
-              if isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name)}
-             for node in ast.walk(ast.parse(inspect.getsource(loader))) if isinstance(node, ast.With)]
-    sites = [site for site in sites if any(name.startswith(prefixes) for name in site)]
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [inference.InferenceScope(
+        lambda model, _modules: entered.append((model, _modules)) or contextlib.nullcontext())])
+    model = types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [("", stub)])
+    stub = types.SimpleNamespace(training=False)
+    with generate_module.generation_mode(model):
+        assert entered == [(model, (("", stub),))]
+    calls = [node for node in ast.walk(ast.parse(inspect.getsource(loader)))
+             if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "inference_scopes"]
     # The loader's generate sites run no speculative verify rounds.
-    assert len(sites) == 2 and all(site == scopes - {"exact_speculative_verify", "fused_verify_attention"} for site in sites)
+    assert [ast.literal_eval(call.args[1]) for call in calls] == [("vision",), ()]
+
+
+def _recording_scopes(monkeypatch, entered, *scopes):
+    from unsloth_zoo.mlx import inference
+
+    def scope(name, fails = False):
+        @contextlib.contextmanager
+        def enter(model, *args, _modules):
+            assert type(_modules) is tuple   # the one walk every scope shares
+            if fails:
+                raise RuntimeError(name)
+            entered.append((name, args))
+            try:
+                yield model
+            finally:
+                entered.append(("exit " + name, ()))
+        enter.__name__ = name
+        return enter
+
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [
+        inference.InferenceScope(scope(name, **options.pop("scope", {})), **options) for name, options in scopes])
+    return inference.inference_scopes
+
+
+@pytest.mark.parametrize("call, opt_in, names", [
+    (None, None, ["every", "drafted", "vision"]),
+    ((), None, ["every"]),
+    (("vision", "speculative"), "1", ["every", "drafted", "vision", "opt_in"]),
+    ("speculative", "0", ["every", "drafted"]),
+    (("a trait this zoo does not know",), "true", ["every"]),
+    ("one-shot iterator", None, ["every", "vision"]),
+])
+def test_inference_scopes_enter_what_the_call_is_served_by_and_opt_in_only_when_switched_on(monkeypatch, call, opt_in, names):
+    entered = []
+    compose = _recording_scopes(monkeypatch, entered, ("every", {}), ("drafted", {"serves": frozenset({"speculative"})}),
+                                ("vision", {"serves": frozenset({"vision", "audio"})}),
+                                ("opt_in", {"opt_in": "UNSLOTH_MLX_TEST_SCOPE"}))
+    if opt_in is None:
+        monkeypatch.delenv("UNSLOTH_MLX_TEST_SCOPE", raising = False)
+    else:
+        monkeypatch.setenv("UNSLOTH_MLX_TEST_SCOPE", opt_in)
+    if call == "one-shot iterator":
+        call = iter(("vision", "audio"))
+    model = types.SimpleNamespace()
+    with compose(model, call) as active:
+        assert active is model and [name for name, _ in entered] == names
+    assert [name for name, _ in entered[len(names):]] == ["exit " + name for name in reversed(names)]
+
+
+def test_an_open_text_batch_holds_the_scopes_a_batch_is_served_by(monkeypatch):
+    entered = []
+    _recording_scopes(monkeypatch, entered, ("every", {}), ("batch", {"serves": frozenset({"batch"})}),
+                      ("drafted", {"serves": frozenset({"speculative"})}), ("vision", {"serves": frozenset({"vision"})}))
+    _open_stream(monkeypatch).close()
+    assert [name for name, _ in entered] == ["every", "batch", "exit batch", "exit every"]
+
+
+@pytest.mark.parametrize("vlm, speculative, call", [
+    (False, None, ("batch",)), (True, None, ("batch", "vision")), (True, object(), ("batch", "vision", "speculative"))])
+def test_a_batch_stream_describes_its_call_to_generation_mode(monkeypatch, vlm, speculative, call):
+    from unsloth_zoo.mlx import generate as module
+
+    seen = []
+    session = lambda *args: types.SimpleNamespace(close = lambda: None)
+    monkeypatch.setattr(module, "_stream_setup", lambda *args: (vlm, object()))
+    monkeypatch.setattr(module, "generation_mode", lambda model, call: seen.append(call) or contextlib.nullcontext())
+    for name in ("_generation_cache_hygiene", "_TextBatchSession", "_VLMBatchSession", "_SpeculativeBatchSession"):
+        monkeypatch.setattr(module, name, session if name.endswith("Session") else contextlib.nullcontext)
+    module.BatchStream(object(), object(), speculative = speculative).close()
+    assert seen == [call]
+
+
+def test_inference_scopes_pass_int8_prefill_only_where_registered_and_report_or_raise_refusals(monkeypatch):
+    entered, refused = [], []
+    compose = _recording_scopes(monkeypatch, entered, ("first", {"int8_prefill": True}),
+                                ("refuses", {"scope": {"fails": True}}), ("last", {}))
+    with compose(object(), int8_prefill = False, on_error = lambda name, error: refused.append((name, str(error)))):
+        assert entered == [("first", (False,)), ("last", ())] and refused == [("refuses", "refuses")]
+    entered.clear()
+    with pytest.raises(RuntimeError, match = "refuses"):
+        with compose(object()):
+            pass  # pragma: no cover
+    assert entered == [("first", (None,)), ("exit first", ())]
+
+
+@pytest.mark.parametrize("int8_prefill", [None, True])
+def test_warm_inference_generates_greedily_under_the_int8_decision(int8_prefill):
+    from unsloth_zoo.mlx.inference import warm_inference
+
+    calls = []
+    warm_inference(types.SimpleNamespace(generate = lambda prompt, **kwargs: calls.append((prompt.tolist(), kwargs))),
+                   int8_prefill = int8_prefill)
+    assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill})]
 
 
 def test_cache_layout_tells_quantized_packings_apart():

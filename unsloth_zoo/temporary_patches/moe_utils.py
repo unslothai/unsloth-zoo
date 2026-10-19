@@ -570,8 +570,12 @@ def _triton_grouped_mm_wanted(inputs, weight) -> bool:
     E, K, N = weight.shape
     if E == 0 or inputs.shape[1] != K or N == 0:
         return False
+    return _triton_grouped_mm_rows_ok(device, inputs.shape[0], E, K, N)
+
+
+def _triton_grouped_mm_rows_ok(device, M, E, K, N):
     limit = _triton_grouped_mm_max_rows(device.index, _triton_grouped_mm_kind(K, N, E))
-    return _rows_within(limit, inputs.shape[0], E)
+    return _rows_within(limit, M, E)
 
 
 def _grouped_mm_triton_impl(inputs, weight, offsets):
@@ -1085,11 +1089,252 @@ class _GroupedMMRecompute(torch.autograd.Function):
         return grad_input, None, None
 
 
-def _base_grouped_mm(inputs, offsets, weight_provider, recompute):
-    """recompute -> rebuild W in backward; else the prior eager grouped_mm."""
+def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
+    """recompute -> rebuild W in backward; else the prior eager grouped_mm.
+    plan (recompute only): rebuild just the planned experts, chunk by chunk."""
     if recompute:
+        if plan is not None:
+            return _GroupedMMSelectiveRecompute.apply(inputs, weight_provider, plan)
         return _GroupedMMRecompute.apply(inputs, offsets, weight_provider)
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
+
+
+# UNSLOTH_MOE_SELECTIVE_DEQUANT=1: dequantize only routed experts. Opt-in because the plan
+# reads token counts on the host (one sync per MoE layer forward; not capturable).
+SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
+
+
+class _SelectiveDequantPlan:
+    __slots__ = ("num_experts", "num_rows", "chunks")
+
+    def __init__(self, num_experts, num_rows, chunks):
+        self.num_experts = num_experts
+        self.num_rows = num_rows
+        self.chunks = chunks   # [(expert slice or int64 ids, row_lo, row_hi, offsets relative to row_lo)]
+
+
+def _selective_dequant_chunk_experts() -> int:
+    try:
+        return max(int(os.environ.get("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "0")), 0)
+    except ValueError:
+        return 0
+
+
+def _bnb4bit_expert_split(param):
+    """(E, per-expert shape) when every expert of this Params4bit owns whole packed elements
+    and whole absmax blocks, so a gather of experts is exact."""
+    while hasattr(param, "base_layer"):
+        param = param.base_layer
+    if not (HAS_BNB and isinstance(param, Params4bit)):
+        return None
+    qs = getattr(param, "quant_state", None)
+    if qs is None or param.requires_grad:
+        return None
+    shape = getattr(param, "_original_shape", None) or qs.shape
+    if shape is None or len(shape) != 3:
+        return None
+    E, per_expert = int(shape[0]), int(shape[1]) * int(shape[2])
+    weights_per_element = 2 * param.data.element_size()
+    if E == 0 or per_expert == 0 or per_expert % qs.blocksize or per_expert % weights_per_element:
+        return None
+    if param.data.numel() * weights_per_element != E * per_expert or qs.absmax.numel() != E * (per_expert // qs.blocksize):
+        return None
+    return E, tuple(int(x) for x in shape[1:])
+
+
+# Gathered ids are decoded in pieces of at least _SELECTIVE_GATHER_MIN experts and at most 1/8 of
+# the request, so the packed copy stays near 1/32 of the fp16 output without a launch per expert.
+_SELECTIVE_GATHER_PIECES = 8
+_SELECTIVE_GATHER_MIN = 32
+
+
+def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
+    """Dequantize only `experts` of a packed 4-bit stack: a slice reads views of the packed bytes
+    and absmax blocks, an int64 id tensor gathers them in a few pieces. Each piece is a smaller
+    QuantState decoded by the same kernels, so every element matches the full-stack read."""
+    from bitsandbytes.functional import QuantState
+
+    while hasattr(param, "base_layer"):
+        param = param.base_layer
+    E, inner = _bnb4bit_expert_split(param)
+    qs = param.quant_state
+    blocks = inner[0] * inner[1] // qs.blocksize
+    packed_all = param.data.reshape(E, -1)
+    absmax_all, offset, absmax2_all = qs.absmax, qs.offset, None
+    if qs.nested:
+        s2 = qs.state2
+        if blocks % s2.blocksize == 0:
+            absmax2_all = s2.absmax.reshape(E, -1)
+        else:
+            # Second-level blocks straddle experts: denest as bitsandbytes does (multiply, then
+            # add the offset in fp32), which is what both 4-bit decoders compute per block.
+            absmax_all = (bnb.functional.dequantize_blockwise(absmax_all, s2) + offset).float()
+            offset = None
+    absmax_all = absmax_all.reshape(E, blocks)
+
+    if isinstance(experts, slice):
+        n = len(range(*experts.indices(E)))
+        pieces = [experts]
+    else:
+        n = int(experts.numel())
+        pieces = list(experts.split(max(_SELECTIVE_GATHER_MIN, -(-n // _SELECTIVE_GATHER_PIECES))))
+
+    def take(t, piece):
+        return t[piece] if isinstance(piece, slice) else t.index_select(0, piece)
+
+    out = None
+    if len(pieces) > 1:
+        out = torch.empty((n,) + inner, dtype = qs.dtype, device = packed_all.device)
+    row = 0
+    for piece in pieces:
+        packed = take(packed_all, piece)
+        k = packed.shape[0]
+        dest = out[row : row + k] if out is not None else None
+        state2 = None
+        if absmax2_all is not None:
+            state2 = QuantState(
+                absmax = take(absmax2_all, piece).reshape(-1), code = qs.state2.code,
+                blocksize = qs.state2.blocksize, quant_type = qs.state2.quant_type, dtype = qs.state2.dtype,
+            )
+        piece_shape = (k,) + inner
+        sub = QuantState(
+            absmax = take(absmax_all, piece).reshape(-1), shape = torch.Size(piece_shape), code = qs.code,
+            blocksize = qs.blocksize, quant_type = qs.quant_type, dtype = qs.dtype, offset = offset, state2 = state2,
+        )
+        weight = None
+        try:
+            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+            weight = nf4_dequant_triton(packed, sub, piece_shape, out = dest)
+        except ImportError:
+            pass
+        if weight is None:
+            sub_param = torch.Tensor._make_subclass(Params4bit, packed.reshape(-1, 1))
+            sub_param.quant_state = sub
+            sub_param._original_shape = torch.Size(piece_shape)
+            slicer = _get_dequantize_4bit_in_slices()
+            weight = slicer(sub_param) if slicer is not None else None
+            if weight is None:
+                weight = bnb.functional.dequantize_4bit(packed.reshape(-1, 1), sub)
+        del packed, sub, state2
+        if dest is None:
+            out = weight.reshape(piece_shape)
+        elif weight.data_ptr() != dest.data_ptr():
+            dest.copy_(weight.reshape(piece_shape))
+        row += k
+        del weight, dest
+    SELECTIVE_DEQUANT_STATS["dequant_calls"] += 1
+    SELECTIVE_DEQUANT_STATS["experts_dequantized"] += n
+    SELECTIVE_DEQUANT_STATS["experts_total"] += E
+    return out.to(target_dtype) if target_dtype is not None else out
+
+
+def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
+    """Chunks of experts to dequantize, or None to keep the full-stack path (off, traced,
+    capturing, a source that cannot be split exactly, or nothing to save)."""
+    selective = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "0") == "1"
+    chunk = _selective_dequant_chunk_experts()
+    if not selective and chunk == 0:
+        return None
+    if torch.compiler.is_compiling():
+        return None
+    device = num_tokens_per_expert.device
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return None
+    E = int(num_tokens_per_expert.numel())
+    for source in sources:
+        split = _bnb4bit_expert_split(source)
+        if split is None or split[0] != E:
+            return None
+    counts = num_tokens_per_expert.tolist()
+    experts = [e for e, c in enumerate(counts) if c > 0] if selective else list(range(E))
+    if not experts:
+        return None
+    if not chunk and 8 * len(experts) > 7 * E:
+        return None   # under 1/8 of the stack to save, not worth the gathers
+    chunk = chunk or len(experts)
+    ends = []
+    total = 0
+    for c in counts:
+        total += c
+        ends.append(total)
+    chunks = []
+    for i in range(0, len(experts), chunk):
+        ids = experts[i : i + chunk]
+        row_lo = ends[ids[0]] - counts[ids[0]]
+        row_hi = ends[ids[-1]]
+        if row_hi == row_lo:
+            continue   # chunked without selective: no token routed to any of these experts
+        contiguous = ids[-1] - ids[0] + 1 == len(ids)
+        chunks.append((
+            slice(ids[0], ids[-1] + 1) if contiguous else torch.tensor(ids, dtype = torch.int64, device = device),
+            row_lo,
+            row_hi,
+            torch.tensor([ends[e] - row_lo for e in ids], dtype = torch.int32, device = device),
+        ))
+    if not chunks:
+        return None
+    SELECTIVE_DEQUANT_STATS["plans"] += 1
+    return _SelectiveDequantPlan(E, num_rows, chunks)
+
+
+def _grouped_mm_slice(inputs, weight, offsets, plan):
+    """_grouped_mm_with_backward_fix for a slice of a planned problem: the Triton choice and
+    its tiles follow the whole (rows, experts) problem, so each group's result matches it."""
+    E, K, N = weight.shape
+    if (
+        _GROUPED_MM_TRITON_OP is not None
+        and inputs.device.type == "cuda"
+        and inputs.dtype in (torch.bfloat16, torch.float16)
+        and weight.dtype == inputs.dtype
+        and _triton_grouped_mm_rows_ok(inputs.device, plan.num_rows, plan.num_experts, K, N)
+    ):
+        from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+        if mg.triton_grouped_available(inputs.device):
+            return mg.generic_grouped_mm(
+                inputs.contiguous(), weight, offsets, config_rows = (plan.num_rows, plan.num_experts),
+            )
+    return _grouped_mm_eager(inputs, weight, offsets)
+
+
+def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
+    if len(plan.chunks) == 1:
+        experts, _, _, offsets = plan.chunks[0]
+        weight = weight_provider(experts)
+        if transpose:
+            weight = weight.transpose(-2, -1).contiguous()
+        return _grouped_mm_slice(inputs, weight, offsets, plan)
+    out = None
+    for experts, row_lo, row_hi, offsets in plan.chunks:
+        weight = weight_provider(experts)
+        if transpose:
+            weight = weight.transpose(-2, -1).contiguous()
+        rows = inputs[row_lo : row_hi]
+        if rows.data_ptr() % 16:
+            rows = rows.clone()   # grouped GEMMs want 16-byte aligned operands
+        part = _grouped_mm_slice(rows, weight, offsets, plan)
+        del weight
+        if out is None:
+            out = inputs.new_empty((inputs.shape[0], part.shape[-1]))
+        out[row_lo : row_hi] = part
+        del part
+    return out
+
+
+class _GroupedMMSelectiveRecompute(torch.autograd.Function):
+    """_GroupedMMRecompute over a _SelectiveDequantPlan: forward and dX read only the planned experts."""
+
+    @staticmethod
+    def forward(ctx, inputs, weight_provider, plan):
+        ctx.weight_provider = weight_provider
+        ctx.plan = plan
+        with torch.no_grad():
+            return _selective_grouped_mm(inputs, weight_provider, plan, False)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        with torch.no_grad():
+            grad_input = _selective_grouped_mm(grad_output.contiguous(), ctx.weight_provider, ctx.plan, True)
+        return grad_input, None, None
 
 
 def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_module):
@@ -1397,6 +1642,9 @@ def _check_grouped_gemm_available():
         _GROUPED_GEMM_AVAILABLE = True
         _init_triton_allocator()
     except (ImportError, ModuleNotFoundError):
+        # A temporary patch asking while unsloth itself imports: circular, not absent. Decide later.
+        if _unsloth_importing():
+            return False
         _GROUPED_GEMM_AVAILABLE = False
     return _GROUPED_GEMM_AVAILABLE
 
@@ -1404,14 +1652,47 @@ def _check_grouped_gemm_available():
 from functools import lru_cache, wraps
 
 
-@lru_cache(maxsize=1)
+def _unsloth_importing():
+    return bool(getattr(getattr(sys.modules.get("unsloth"), "__spec__", None), "_initializing", False))
+
+
+_SELECTED_MOE_BACKEND = None
+
+
 def select_moe_backend():
     """Select MoE backend from UNSLOTH_MOE_BACKEND + availability.
 
     Choices: "grouped_mm", "unsloth_triton", "native_torch" (default "grouped_mm").
     """
     # This Unsloth Zoo code section is licensed under AGPL3
+    global _SELECTED_MOE_BACKEND
+    if _SELECTED_MOE_BACKEND is not None:
+        return _SELECTED_MOE_BACKEND
+    backend = _select_moe_backend()
+    # Chosen while unsloth imports (its Triton kernels cannot load yet): choose again on the next call.
+    if not _unsloth_importing():
+        _SELECTED_MOE_BACKEND = backend
+    return backend
 
+
+def _clear_selected_moe_backend():
+    global _SELECTED_MOE_BACKEND
+    _SELECTED_MOE_BACKEND = None
+
+
+select_moe_backend.cache_clear = _clear_selected_moe_backend
+
+
+def select_moe_backend_for_interleaved_gate_up():
+    """select_moe_backend() for interleaved gate_up (GPT-OSS), which Triton cannot run: grouped_mm, not the loop."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    backend = select_moe_backend()
+    if backend == "unsloth_triton" and _check_torch_grouped_mm_supported():
+        return "grouped_mm"
+    return backend
+
+
+def _select_moe_backend():
     requested = os.environ.get("UNSLOTH_MOE_BACKEND")
     if requested:
         if requested == "grouped_mm" and _check_torch_grouped_mm_supported():
@@ -1461,15 +1742,24 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     (re-registers hooks, unnecessary for read-only temp tensors). Used by the
     FP8 and bnb4bit MoE dispatchers.
     """
-    original_gate_up = experts_module.gate_up_proj
-    original_down = experts_module.down_proj
+    # object.__setattr__ writes the instance __dict__, which shadows `_parameters`. Restore by
+    # removing those entries again rather than writing the original Parameter into __dict__: a
+    # Parameter left there hides every later `_parameters[name] = ...` swap, e.g. FSDP2 installing
+    # its sharded / all-gathered parameter around each forward, so the next call would read a
+    # stale, freed all-gather buffer.
+    instance_dict = experts_module.__dict__
+    missing = object()
+    saved = {name: instance_dict.get(name, missing) for name in ("gate_up_proj", "down_proj")}
     object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
     object.__setattr__(experts_module, "down_proj", down_proj)
     try:
         return forward_fn(experts_module, *args)
     finally:
-        object.__setattr__(experts_module, "gate_up_proj", original_gate_up)
-        object.__setattr__(experts_module, "down_proj", original_down)
+        for name, value in saved.items():
+            if value is missing:
+                instance_dict.pop(name, None)
+            else:
+                instance_dict[name] = value
 
 
 def forward_moe_backend(
@@ -2234,13 +2524,17 @@ def _get_dequantize_4bit_in_slices():
     return _DEQUANTIZE_4BIT_IN_SLICES
 
 
-def _get_base_weight(param, target_dtype=None, token_counts=None):
+def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
-    providers) restores the packed Params4bit to its logical shape and casts."""
+    providers) restores the packed Params4bit to its logical shape and casts. experts (a
+    _SelectiveDequantPlan chunk) returns only those experts of a packed 4-bit stack."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     while hasattr(param, "base_layer"):
         param = param.base_layer
+
+    if experts is not None:
+        return _dequantize_bnb4bit_experts(param, experts, target_dtype)
 
     if is_mxfp4_expert_param(param):
         return param.dequantize(dtype = target_dtype, token_counts = token_counts)
@@ -4629,14 +4923,15 @@ def forward_native_grouped_mm(
         )
 
     own_gate_up = None
+    selective_plan = None
     if hasattr(self, "gate_up_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _gate_up_src = self.gate_up_proj
 
         # Provider re-derives the base weight on demand so Fix 3 can recompute it in
         # backward instead of pinning it (grouped_mm needs contiguous weights).
-        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
-            return preprocess_weight(_get_base_weight(_src, _dt, _n), "gate_up", _h, _mt, experts_module=_mod)
+        def _gate_up_provider(experts=None, _src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
+            return preprocess_weight(_get_base_weight(_src, _dt, _n, experts), "gate_up", _h, _mt, experts_module=_mod)
         _gate_up_layout = _mxfp4_expert_layout(_gate_up_src, "gate_up", hidden_dim, model_type, self)
         if _gate_up_layout is not None:
             mm1_out = _mxfp4_base_grouped_mm(
@@ -4644,8 +4939,13 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype), _gate_up_layout,
             )
         else:
+            _recompute = _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype)
+            if _recompute:
+                selective_plan = _selective_dequant_plan(
+                    (_gate_up_src, getattr(self, "down_proj", None)), num_tokens_per_expert, permuted_input.shape[0],
+                )
             mm1_out = _base_grouped_mm(
-                permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype),
+                permuted_input, offsets, _gate_up_provider, _recompute, selective_plan,
             )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
@@ -4824,8 +5124,8 @@ def forward_native_grouped_mm(
     if hasattr(self, "down_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _down_src = self.down_proj
-        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
-            return preprocess_weight(_get_base_weight(_src, _dt, _n), "down", _h, _mt, experts_module=_mod)
+        def _down_provider(experts=None, _src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
+            return preprocess_weight(_get_base_weight(_src, _dt, _n, experts), "down", _h, _mt, experts_module=_mod)
         _down_layout = _mxfp4_expert_layout(_down_src, "down", hidden_dim, model_type, self)
         if _down_layout is not None:
             mm2_out = _mxfp4_base_grouped_mm(
@@ -4833,8 +5133,9 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype), _down_layout,
             )
         else:
+            _recompute = _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype)
             mm2_out = _base_grouped_mm(
-                inter, offsets, _down_provider, _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype),
+                inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None,
             )
 
         if down_lora is not None:
@@ -4989,20 +5290,20 @@ def forward_triton_grouped_gemm(
         else:
             intermediate_dim = self.gate_up_proj.shape[1] // 2
 
-        # Autotune first GEMM.
+        # The autotuner doubles intermediate_dim itself: a doubled N can tune a BLOCK_SIZE_N the real N does not divide.
         gemm1_configs = get_or_autotune_moe_kernels(
             num_experts=self.num_experts,
             hidden_dim=hidden_dim,
-            intermediate_dim=intermediate_dim * 2,
+            intermediate_dim=intermediate_dim,
             top_k=top_k,
             dtype=hidden_states.dtype,
         )
 
-        # Autotune second GEMM (output dim is hidden_dim).
+        # Second GEMM: K = intermediate_dim, N = hidden_dim.
         gemm2_configs = get_or_autotune_moe_kernels(
             num_experts=self.num_experts,
             hidden_dim=intermediate_dim,
-            intermediate_dim=hidden_dim,
+            intermediate_dim=hidden_dim // 2 if hidden_dim % 2 == 0 else hidden_dim,
             top_k=top_k,
             dtype=hidden_states.dtype,
         )

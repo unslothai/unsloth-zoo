@@ -312,9 +312,16 @@ class Qwen3DSparkDrafter(nn.Module):
         ctx = ctx & keep[:, q_block][..., None]
         return torch.cat([ctx, own], dim = -1)[:, None]
 
-    def forward(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None):
-        # Wrappers such as DDP only sync gradients for calls that go through forward().
-        return self.forward_train(context, input_ids, loss_mask, num_anchors, generator, anchors)
+    def forward(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None,
+                *, loss_kwargs = None):
+        out = self.forward_train(context, input_ids, loss_mask, num_anchors, generator, anchors)
+        if loss_kwargs is not None:
+            # Include the Markov/confidence heads in DDP's unused-parameter search.
+            teacher_hidden = loss_kwargs.get("teacher_hidden")
+            if teacher_hidden is not None:
+                loss_kwargs = dict(loss_kwargs, teacher_hidden = teacher_hidden.to(out["hidden"].device))
+            return dspark_loss(self, out, **loss_kwargs)
+        return out
 
     def forward_train(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None):
         """Teacher-forced DeepSpec training forward over sampled anchor blocks.
@@ -370,22 +377,25 @@ class Qwen3DSparkDrafter(nn.Module):
         return self.confidence_head(feats).float()
 
 
-def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher, labels):
+def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher_hidden, teacher_w, labels):
     logits = (hidden @ lm_w.T).float()
     if prev_emb is not None:
         logits = logits + (prev_emb @ mk_w2.T).float()
     logp = logits.log_softmax(-1)
     ce = -logp.gather(-1, labels[:, None]).squeeze(-1)
     correct = (logits.argmax(-1) == labels).float()
-    if teacher is None:
+    if teacher_hidden is None:
         return ce, torch.zeros_like(ce), correct
+    # Inside the checkpoint so each chunk's [rows, V] teacher probs are not kept until backward.
+    with torch.no_grad():
+        teacher = (teacher_hidden @ teacher_w.T).float().softmax(-1)
     l1 = (logp.exp() - teacher).abs().sum(-1)
     return ce, l1, correct
 
 
 def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 0.9,
                 confidence_alpha = 1.0, decay_gamma = 4.0, chunk_size = 1024, teacher_lm_head_weight = None):
-    """DeepSpec DSpark loss, chunked over supervised rows so [rows, vocab] logits never coexist.
+    """DeepSpec DSpark loss, chunked over supervised rows with per-chunk recomputation.
 
     teacher_hidden: target post-norm states [B, S, H]; slot j's teacher is the target's own
     prediction at label_index - 1, projected with `teacher_lm_head_weight` (the target's lm_head;
@@ -414,11 +424,8 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
     ce_all, l1_all, correct_all = [], [], []
     for s in range(0, hidden.shape[0], chunk_size):
         e = slice(s, s + chunk_size)
-        teacher = None
-        if teacher_rows is not None:
-            with torch.no_grad():
-                teacher = (teacher_rows[e] @ teacher_w.T).float().softmax(-1)
-        args = (hidden[e], None if prev_emb is None else prev_emb[e], lm_w, None if mk is None else mk.markov_w2.weight, teacher, labels[e])
+        args = (hidden[e], None if prev_emb is None else prev_emb[e], lm_w, None if mk is None else mk.markov_w2.weight,
+                None if teacher_rows is None else teacher_rows[e], None if teacher_rows is None else teacher_w, labels[e])
         if torch.is_grad_enabled() and hidden.requires_grad:
             ce, l1, correct = checkpoint(_row_terms, *args, use_reentrant = False)
         else:
@@ -510,14 +517,20 @@ class UnslothDSparkTrainer(Trainer):
                                      layer_ids = [i for i in ids if i >= 0], embed = -1 in ids)
         if -1 in ids:
             captured[-1] = captured.pop("embed")
-        dtype = next(p for p in drafter.parameters()).dtype
-        out = model(drafter.context_states(captured).to(dtype), input_ids, loss_mask, self.args.dspark_num_anchors)
-        loss, stats = dspark_loss(
-            drafter, out, teacher_hidden = captured["final"].to(device = out["hidden"].device, dtype = dtype), ce_alpha = self.args.dspark_ce_alpha,
+        param = next(p for p in drafter.parameters())
+        context = drafter.context_states(captured).to(param.dtype)
+        loss_kwargs = dict(
+            teacher_hidden = captured["final"].to(device = param.device, dtype = param.dtype), ce_alpha = self.args.dspark_ce_alpha,
             l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
             decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
             teacher_lm_head_weight = resolve_text_parts(self.target_model)["lm_head"].weight,
         )
+        if isinstance(model, nn.DataParallel):
+            # DataParallel scatters forward kwargs along dim 0 and cannot gather Python stats: score after the gather.
+            out = model(context, input_ids, loss_mask, self.args.dspark_num_anchors)
+            loss, stats = dspark_loss(drafter, out, **loss_kwargs)
+        else:
+            loss, stats = model(context, input_ids, loss_mask, self.args.dspark_num_anchors, loss_kwargs = loss_kwargs)
         if model.training:
             self._dspark_log.append(stats)
         return (loss, None) if return_outputs else loss

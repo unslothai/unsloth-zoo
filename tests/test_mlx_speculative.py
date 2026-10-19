@@ -318,13 +318,59 @@ def test_probes_pay_their_measured_regret_within_the_budget():
 
 
 
-def test_only_the_verify_forward_is_built_as_a_verify_block():
-    from unsloth_zoo.mlx import inference
+def _init_attributes(cls) -> set[str]:
+    """Every ``self.<name> = ...`` target in ``cls.__init__``."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cls.__init__)))
+    names = set()
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else [getattr(node, "target", None)]
+        for target in targets:
+            for leaf in ast.walk(target) if target is not None else ():
+                if isinstance(leaf, ast.Attribute) and isinstance(leaf.value, ast.Name) and leaf.value.id == "self":
+                    names.add(leaf.attr)
+    return names
+
+
+def _bare_engine(cls, **attrs):
+    """An engine without __init__ (which imports mlx_vlm), every attribute __init__ sets present and off.
+
+    Built by hand, a flag added to __init__ later (#1871's _invariant) is simply missing and the
+    method under test dies with AttributeError instead of taking its default path. Defaulting every
+    __init__ attribute to None keeps the hand-built engine on the plain path whatever flags join.
+    """
+    engine = object.__new__(cls)
+    for name in _init_attributes(cls):
+        setattr(engine, name, None)
+    for name, value in attrs.items():
+        setattr(engine, name, value)
+    return engine
+
+
+def test_the_bare_engine_has_every_attribute_init_sets():
     from unsloth_zoo.mlx.speculative import SpeculativeEngine
 
+    names = _init_attributes(SpeculativeEngine)
+    # The flags _verify branches on: if the reader stops finding them, the helper is reading nothing.
+    assert {"_exact", "_invariant", "lm", "cache", "_verify_forward"} <= names
+    engine = _bare_engine(SpeculativeEngine)
+    assert all(getattr(engine, name) is None for name in names)
+
+
+def test_only_the_verify_forward_is_built_as_a_verify_block():
+    import importlib
+    from unsloth_zoo.mlx.speculative import SpeculativeEngine
+
+    # The module _verify's `from .inference import` resolves, i.e. sys.modules. The package
+    # attribute can be a stale copy after the shim tests purge and restore unsloth_zoo.mlx.
+    inference = importlib.import_module("unsloth_zoo.mlx.inference")
+
     marked = lambda: getattr(inference._VERIFY_STATE, "attention", False)
-    engine, seen = object.__new__(SpeculativeEngine), []
-    engine._exact, engine.lm, engine.cache, engine._kwargs, engine._hidden = False, None, None, dict, lambda out: None
+    seen = []
+    engine = _bare_engine(SpeculativeEngine, _kwargs = dict, _hidden = lambda out: None)
     engine._verify_forward = lambda lm, inputs, cache: seen.append(marked()) or (type("Out", (), {"logits": None}), None)
     engine._verify(None)
     assert seen == [True] and not marked()

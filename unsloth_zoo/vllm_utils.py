@@ -2689,7 +2689,7 @@ def vllm_supports_flashinfer(config) -> bool:
         from vllm.model_executor.models.registry import ModelRegistry
     except Exception as e:
         print(
-            f"Unsloth: Failed loading vLLM model class for arch {arch} "
+            "Unsloth: Failed loading vLLM's model registry "
             f"during `vllm_supports_flashinfer`.\n{e}"
         )
         return True
@@ -3495,6 +3495,314 @@ def _patch_vllm_replayssm_gdn():
     return _widen_vllm_replayssm_capability(GDN_REPLAYSSM_ARCHITECTURES)
 
 
+def _vllm_suffix_decoding_config():
+    # UNSLOTH_VLLM_SUFFIX_DECODING=1, or a JSON object of extra speculative_config keys
+    # (e.g. {"num_speculative_tokens": 16}). None when unset; raises when vLLM cannot run it.
+    value = os.environ.get("UNSLOTH_VLLM_SUFFIX_DECODING", "").strip()
+    if value.lower() in ("", "0", "false", "off", "no"):
+        return None
+    extra = {}
+    if value.startswith("{"):
+        try:
+            extra = json.loads(value)
+        except ValueError as error:
+            raise ValueError(f"Unsloth: UNSLOTH_VLLM_SUFFIX_DECODING is not valid JSON: {error}")
+        if not isinstance(extra, dict):
+            raise ValueError("Unsloth: UNSLOTH_VLLM_SUFFIX_DECODING must be 1 or a JSON object.")
+    elif value.lower() not in ("1", "true", "on", "yes"):
+        raise ValueError(f"Unsloth: UNSLOTH_VLLM_SUFFIX_DECODING={value!r} must be 1 or a JSON object.")
+
+    installed = globals().get("vllm_version", "not installed")
+    try:
+        from typing import get_args
+        from vllm.config.speculative import SpeculativeMethod
+        supported = "suffix" in get_args(SpeculativeMethod)
+    except Exception:
+        supported = False
+    if not supported:
+        raise RuntimeError(
+            f"Unsloth: suffix decoding needs vLLM >= 0.11.1 (speculative method 'suffix'), but found "
+            f"vLLM {installed}. Upgrade vLLM or unset UNSLOTH_VLLM_SUFFIX_DECODING."
+        )
+    if importlib.util.find_spec("arctic_inference") is None:
+        raise RuntimeError(
+            "Unsloth: suffix decoding needs the Arctic Inference package. Install it with "
+            "`pip install arctic-inference` (vLLM suggests arctic-inference==0.1.1), or unset "
+            "UNSLOTH_VLLM_SUFFIX_DECODING."
+        )
+    return {**extra, "method": "suffix"}
+
+
+def _speculation_lookahead(speculative_config):
+    # Tokens proposed per step (k). Suffix decoding defaults k to its tree depth (24). None for a
+    # malformed value (null, negative, not a number): vLLM's own validation then names it.
+    k = speculative_config.get("num_speculative_tokens")
+    if k is None:
+        k = speculative_config.get("suffix_decoding_max_tree_depth", 24)
+    if isinstance(k, bool):
+        return None
+    try:
+        k = int(k)
+    except (TypeError, ValueError, OverflowError):  # OverflowError: json.loads gives inf for 1e309
+        return None
+    return k if k >= 0 else None
+
+
+def _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config):
+    # vLLM with LoRA + speculation refuses max_num_batched_tokens < max_num_seqs * (k + 1)
+    # (EngineArgs.create_engine_config).
+    k = _speculation_lookahead(speculative_config)
+    if k is None:
+        return int(max_num_seqs)
+    return min(int(max_num_seqs), max(int(max_num_batched_tokens) // (k + 1), 1))
+
+
+def _fit_max_num_batched_tokens_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config):
+    # max_num_seqs never drops below 1, so a budget under k + 1 tokens needs the budget raised.
+    k = _speculation_lookahead(speculative_config)
+    if k is None:
+        return int(max_num_batched_tokens)
+    return max(int(max_num_batched_tokens), int(max_num_seqs) * (k + 1))
+
+
+def _shrink_for_memory_retry(max_num_seqs, max_num_batched_tokens, max_seq_length, speculative_config = None):
+    # Memory retry: 3/4 of the sequences, tokens capped at a full batch of them, then refit the
+    # LoRA + speculation lower bound the shrink can break.
+    max_num_seqs = max(int(max_num_seqs * 0.75), 1)
+    max_num_batched_tokens = min(max_num_batched_tokens, max_num_seqs * max_seq_length)
+    if speculative_config is not None:
+        max_num_seqs = _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config)
+        max_num_batched_tokens = _fit_max_num_batched_tokens_to_speculation(
+            max_num_seqs, max_num_batched_tokens, speculative_config,
+        )
+    return max_num_seqs, max_num_batched_tokens
+
+
+def _padded_vocab_ids(config):
+    # Written by tokenizer_utils._suppress_padded_rows (add_new_tokens(pad_to_multiple_of = ...)).
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config() if callable(get_text_config) else config
+    return list(getattr(text_config, "unsloth_vocab_pad_ids", None) or [])
+pass
+
+
+def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
+    """vLLM samples every row of config.vocab_size and ignores generation_config.suppress_tokens,
+    so alignment rows from add_new_tokens(pad_to_multiple_of = ...) could be emitted as ids no
+    tokenizer token has. Bias them to -100 on every request the engine core receives.
+    Idempotent."""
+    if speculative:
+        # SamplingParams._validate_spec_decode rejects any logit_bias under speculative decoding
+        # (vLLM 0.29; older V1 drops it with a warning), so biasing would fail every request.
+        print(
+            "Unsloth: vLLM does not support logit_bias with speculative decoding, so this padded "
+            "vocabulary's alignment rows stay sampleable."
+        )
+        return llm
+    bias = {int(i): -100.0 for i in padded_ids}
+    try:
+        # Model Runner V2 refuses a request with more logit_bias entries than this.
+        from vllm.v1.worker.gpu.sample.logit_bias import MAX_NUM_LOGIT_BIAS_TOKENS as max_bias
+    except Exception:
+        max_bias = 1024
+    warned = []
+
+    def _bias_request(request):
+        params = getattr(request, "sampling_params", None)
+        if params is None or not hasattr(params, "logit_bias"):
+            # Pooling request: nothing is sampled.
+            return
+        current = params.logit_bias or {}
+        if all(current.get(i) == -100.0 for i in bias):
+            return
+        merged = {**current, **bias}
+        if len(merged) > max_bias:
+            if not warned:
+                warned.append(True)
+                print(
+                    f"Unsloth: {len(merged)} logit_bias entries exceed vLLM's limit of {max_bias}, so "
+                    "this padded vocabulary's alignment rows stay sampleable for such requests."
+                )
+            return
+        params = copy.copy(params)
+        params.logit_bias = merged
+        request.sampling_params = params
+
+    # Every request reaches the engine core as an EngineCoreRequest through the frontend client's
+    # add_request / add_request_async: LLM.generate / chat / enqueue, LLMEngine and AsyncLLM
+    # add_request (also with a prebuilt EngineCoreRequest), n > 1 children and AsyncLLM streaming
+    # input chunks. Biasing there covers them all, once per request.
+    engine = getattr(llm, "llm_engine", None) or llm
+    client = getattr(engine, "engine_core", None)
+    hooked = False
+    for name in ("add_request", "add_request_async"):
+        method = getattr(client, name, None) if client is not None else None
+        if method is None:
+            continue
+        hooked = True
+        if getattr(method, "_unsloth_padded_vocab", False):
+            continue
+        if inspect.iscoroutinefunction(method):
+            @functools.wraps(method)
+            async def add_request_without_padded_vocab(request, *args, _method = method, **kwargs):
+                _bias_request(request)
+                return await _method(request, *args, **kwargs)
+        else:
+            @functools.wraps(method)
+            def add_request_without_padded_vocab(request, *args, _method = method, **kwargs):
+                _bias_request(request)
+                return _method(request, *args, **kwargs)
+        add_request_without_padded_vocab._unsloth_padded_vocab = True
+        setattr(client, name, add_request_without_padded_vocab)
+    if not hooked:
+        # V0 engine (vLLM < 0.11, or 0.10.x choosing V0): LLMEngine.add_request and
+        # _AsyncLLMEngine.add_request_async both end in _add_processed_request(params = ...),
+        # as do n > 1 children. V0 rejects logit_bias ids >= len(tokenizer), which alignment rows
+        # are by definition, so append a per-request logits processor applying the same bias.
+        v0 = engine if hasattr(engine, "_add_processed_request") else getattr(engine, "engine", None)
+        if (getattr(getattr(v0, "scheduler_config", None), "num_scheduler_steps", 1) or 1) > 1:
+            # V0 multi-step decoding rejects logits processors (LLMEngine.add_request).
+            print("Unsloth: vLLM multi-step decoding takes no logits processors, so padded vocabulary rows stay sampleable.")
+            return llm
+        method = getattr(v0, "_add_processed_request", None)
+        if method is None:
+            print("Unsloth: this vLLM engine has no known request ingress, so padded vocabulary rows stay sampleable.")
+            return llm
+        if not getattr(method, "_unsloth_padded_vocab", False):
+            indices = {}
+            pad_ids = list(bias)
+
+            def _bias_padded_rows(token_ids, logits):
+                index = indices.get(logits.device)
+                if index is None:
+                    index = indices[logits.device] = torch.tensor(pad_ids, dtype = torch.long, device = logits.device)
+                logits[index] += -100.0
+                return logits
+
+            @functools.wraps(method)
+            def _add_processed_request_without_padded_vocab(*args, **kwargs):
+                params = kwargs.get("params", None)
+                if params is not None and hasattr(params, "logits_processors"):
+                    processors = list(params.logits_processors or [])
+                    if _bias_padded_rows not in processors:
+                        params = copy.copy(params)
+                        # A fresh list: V0 extends it in place with its own processors.
+                        params.logits_processors = processors + [_bias_padded_rows]
+                        kwargs["params"] = params
+                return method(*args, **kwargs)
+
+            _add_processed_request_without_padded_vocab._unsloth_padded_vocab = True
+            v0._add_processed_request = _add_processed_request_without_padded_vocab
+    return llm
+pass
+
+
+def _warn_padded_vocab_for_serve(config):
+    # return_args builds a separate `vllm serve`: no engine here to hook, and neither
+    # --generation-config nor --override-generation-config can carry logit_bias (vLLM only reads
+    # temperature, top_p, top_k, min_p, repetition_penalty and max_new_tokens from it).
+    padded_ids = _padded_vocab_ids(config)
+    if padded_ids:
+        print(
+            f"Unsloth: this model has {len(padded_ids)} padded vocabulary rows ({min(padded_ids)} to "
+            f"{max(padded_ids)}) that no token has, and `vllm serve` does not suppress them. Send "
+            f"logit_bias = {{id: -100}} for those ids with every request (the OpenAI API accepts it)."
+        )
+    return padded_ids
+pass
+
+
+def _fp32_lm_head_requested():
+    return os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _vllm_supports_fp32_lm_head():
+    # Generation models honour hf_overrides head_dtype from vLLM 0.26.0 (LogitsProcessor._apply_head);
+    # older versions silently ignore it, so detect the method rather than trust the override.
+    try:
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    except Exception:
+        return False
+    return hasattr(LogitsProcessor, "_apply_head")
+
+
+def _patch_vllm_fp32_lm_head_excluded_quant():
+    # vLLM 0.26.0 - 0.28.x only accept UnquantizedEmbeddingMethod for a head_dtype override, but a
+    # quant config that excludes lm_head (ModelOpt FP8 / NVFP4) hands out UnquantizedLinearMethod,
+    # so _apply_head raises although the weight is plain. Backport the 0.29.0 guard: swap in an
+    # UnquantizedEmbeddingMethod for that one call. Only reached with UNSLOTH_VLLM_FP32_LM_HEAD=1.
+    try:
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
+    except Exception:
+        return False
+    original = getattr(LogitsProcessor, "_apply_head", None)
+    if original is None or getattr(original, "_unsloth_excluded_quant_patched", False):
+        return False
+    code = getattr(original, "__code__", None)
+    if code is None or "UnquantizedLinearMethod" in code.co_names:
+        # vLLM >= 0.29.0 already accepts both.
+        return False
+    embedding_method = UnquantizedEmbeddingMethod()
+
+    def _apply_head(self, lm_head, hidden_states, embedding_bias):
+        quant_method = getattr(lm_head, "quant_method", None)
+        if (
+            getattr(self, "head_dtype", None) is not None
+            and self.head_dtype != hidden_states.dtype
+            and isinstance(quant_method, UnquantizedLinearMethod)
+            and not isinstance(quant_method, UnquantizedEmbeddingMethod)
+        ):
+            lm_head.quant_method = embedding_method
+            try:
+                return original(self, lm_head, hidden_states, embedding_bias)
+            finally:
+                lm_head.quant_method = quant_method
+        return original(self, lm_head, hidden_states, embedding_bias)
+
+    _apply_head._unsloth_excluded_quant_patched = True
+    _apply_head.__wrapped__ = original
+    LogitsProcessor._apply_head = _apply_head
+    return True
+
+
+def _vllm_fp32_lm_head_overrides(training):
+    # Raises rather than half-applying: the trainer reads the same flag, and only both sides in fp32 pays off.
+    if not training or not _fp32_lm_head_requested():
+        return {}
+    if not _vllm_supports_fp32_lm_head():
+        raise RuntimeError(
+            f"Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 needs vLLM >= 0.26.0 for an fp32 lm_head, "
+            f"but found vLLM {vllm_version}. Upgrade vLLM or unset UNSLOTH_VLLM_FP32_LM_HEAD."
+        )
+    _patch_vllm_fp32_lm_head_excluded_quant()
+    return {"head_dtype": "float32"}
+
+
+def _warn_fp32_lm_head_set_late():
+    # The trainer's logprob projectors read UNSLOTH_VLLM_FP32_LM_HEAD as a def-time default (a Dynamo
+    # constant), so a flag set after `import unsloth` reaches vLLM only and old / new logps disagree.
+    rl = sys.modules.get("unsloth_zoo.rl_replacements")
+    if rl is None:
+        return False
+    stale = []
+    for name in ("chunked_hidden_states_selective_log_softmax", "chunked_hidden_states_selective_log_softmax_recompute"):
+        try:
+            default = inspect.signature(getattr(rl, name)).parameters["fp32_lm_head"].default
+        except Exception:
+            continue
+        if default is False:
+            stale.append(name)
+    if stale:
+        print(
+            "Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 was set after Unsloth was imported, so vLLM scores "
+            "rollouts with an fp32 lm_head but the trainer still projects in 16-bit. Set it before "
+            "`import unsloth` for matching logprobs."
+        )
+    return bool(stale)
+
+
 def _vllm_replayssm_mode():
     # "auto" (unset), "on" or "off".
     value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
@@ -3518,8 +3826,10 @@ def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
 
 
 def _is_vllm_replayssm_refusal(error_text):
-    # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2).
-    return "replayssm" in str(error_text).lower()
+    # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2). With
+    # speculative decoding vLLM 0.29 turns ReplaySSM into RecoverSSM, which only Kimi KDA supports.
+    error_text = str(error_text).lower()
+    return "replayssm" in error_text or "recoverssm" in error_text
 
 
 def _is_memory_profiling_race_error(error_text):
@@ -4327,6 +4637,9 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
+        if not use_async and not use_engine:
+            from .routing_replay import routing_replay_engine_args
+            engine_args.update(routing_replay_engine_args(config))
         if fp8_moe is not None:
             # Only the Triton FP8 MoE kernel keeps the expert layout training aliases.
             engine_args["moe_backend"] = "triton"
@@ -4404,6 +4717,41 @@ def load_vllm(
                 rope_overrides["max_position_embeddings"] = max_seq_length
             engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **rope_overrides}
 
+        # return_args callers (SyntheticDataKit's `vllm serve`) turn every value into a CLI flag with
+        # str(), and vLLM parses --speculative-config as JSON, so a dict here kills the server.
+        suffix_config = None if return_args else _vllm_suffix_decoding_config()
+        if suffix_config is not None:
+            engine_args["speculative_config"] = suffix_config
+            if enable_lora:
+                fitted_max_num_seqs = _fit_max_num_seqs_to_speculation(
+                    engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], suffix_config,
+                )
+                if fitted_max_num_seqs < engine_args["max_num_seqs"]:
+                    print(
+                        f"Unsloth: Lowering vLLM max_num_seqs from {engine_args['max_num_seqs']} to "
+                        f"{fitted_max_num_seqs} so LoRA fits the suffix decoding lookahead."
+                    )
+                    approx_max_num_seqs = fitted_max_num_seqs
+                    engine_args["max_num_seqs"] = fitted_max_num_seqs
+                fitted_max_num_batched_tokens = _fit_max_num_batched_tokens_to_speculation(
+                    engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], suffix_config,
+                )
+                if fitted_max_num_batched_tokens > engine_args["max_num_batched_tokens"]:
+                    print(
+                        f"Unsloth: Raising vLLM max_num_batched_tokens from {engine_args['max_num_batched_tokens']} "
+                        f"to {fitted_max_num_batched_tokens} so one LoRA sequence fits the suffix decoding lookahead."
+                    )
+                    max_num_batched_tokens = fitted_max_num_batched_tokens
+                    engine_args["max_num_batched_tokens"] = fitted_max_num_batched_tokens
+            print(f"Unsloth: vLLM uses suffix decoding for generation with speculative_config = {suffix_config}.")
+        # Same str() problem for return_args: vLLM json-parses --hf-overrides, and a `vllm serve`
+        # has no trainer whose logprobs the fp32 head would have to match.
+        fp32_head_overrides = {} if return_args else _vllm_fp32_lm_head_overrides(training)
+        if fp32_head_overrides:
+            engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **fp32_head_overrides}
+            print("Unsloth: vLLM computes rollout logits with an fp32 lm_head (UNSLOTH_VLLM_FP32_LM_HEAD=1).")
+            _warn_fp32_lm_head_set_late()
+
         # Pin the backend for the worker, which the sys.modules block only reaches under
         # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is
         # not valid for this configuration" instead of falling through, and FLASH_ATTN
@@ -4456,6 +4804,7 @@ def load_vllm(
 
         # Quick exit. The finally below restores the patch on the way out.
         if return_args:
+            _warn_padded_vocab_for_serve(config)
             # No engine is built here, so nothing will ever reach delete_vllm to lift the
             # block, and the failure arm below is not reached either. Hand flashinfer back
             # rather than poisoning the session for good.
@@ -4580,9 +4929,11 @@ def load_vllm(
                     raise RuntimeError(error)
 
                 if "gpu_memory_utilization" in error or "memory" in error:
-                    approx_max_num_seqs = max(int(approx_max_num_seqs * 0.75), 1)
+                    approx_max_num_seqs, max_num_batched_tokens = _shrink_for_memory_retry(
+                        approx_max_num_seqs, max_num_batched_tokens, max_seq_length,
+                        engine_args.get("speculative_config") if enable_lora else None,
+                    )
                     engine_args["max_num_seqs"] = approx_max_num_seqs
-                    max_num_batched_tokens = min(max_num_batched_tokens, approx_max_num_seqs * max_seq_length)
                     engine_args["max_num_batched_tokens"] = max_num_batched_tokens
                     engine_args["gpu_memory_utilization"] *= 0.85
                     print(
@@ -4620,6 +4971,14 @@ def load_vllm(
         pass
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
         llm.approx_max_num_seqs = approx_max_num_seqs
+        if engine_args.get("enable_return_routed_experts", False):
+            from .routing_replay import wrap_vllm_generate
+            wrap_vllm_generate(llm)
+        padded_ids = _padded_vocab_ids(config)
+        if padded_ids:
+            suppress_vllm_padded_vocab(
+                llm, padded_ids, speculative = engine_args.get("speculative_config", None) is not None,
+            )
         if _merged_rollout_enabled():
             llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)

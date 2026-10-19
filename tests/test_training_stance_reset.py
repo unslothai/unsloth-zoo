@@ -98,6 +98,9 @@ def _generated_module(compiled, name = "unsloth_compiled_module_test"):
     module = types.ModuleType(name)
     sys.modules[name] = module
     namespace = module.__dict__
+    from _compiled_module_names import fused_loss_header_names
+
+    namespace.update(fused_loss_header_names())
     namespace.update({
         "torch": torch,
         "os": os,
@@ -143,6 +146,9 @@ def _snippet_module(compiled):
     module = types.ModuleType("unsloth_compiled_module_snippet")
     sys.modules[module.__name__] = module
     namespace = module.__dict__
+    from _compiled_module_names import fused_loss_header_names
+
+    namespace.update(fused_loss_header_names())
     namespace.update({
         "torch": torch,
         "UNSLOTH_DECODE_COMPILE": UNSLOTH_DECODE_COMPILE,
