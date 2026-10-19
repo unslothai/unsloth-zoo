@@ -175,7 +175,10 @@ def _suppress_padded_rows(model, start, end, now_valid = range(0), old_rows = No
     generation_config.suppress_tokens = suppress or None
     if config is not None:
         _set_or_drop(config, _VOCAB_PAD_IDS_KEY, rows)
-        _set_or_drop(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
+        # An empty ownership list beside remaining rows is kept: dropping it would read back as
+        # "every row is ours" and release suppression the caller set on those rows.
+        if rows: setattr(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
+        else: _set_or_drop(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
     pass
 pass
 

@@ -35,6 +35,7 @@ __all__ = [
     "triton_kernels_alias",
     "mxfp4_ogs_weight",
     "matmul_ogs_available",
+    "native_mxfp4_matmul_ok",
     "MATMUL_OGS_RTOL",
     "API_OGS_ROUTING",
     "API_OGS_RAGGED",
@@ -220,11 +221,12 @@ class TritonKernelsBackend:
                 precision_config = precision_config, **kwargs,
             )
         # matmul leaves the k-sum to the caller. As matmul_ogs (split_k = 1): rows in the output dtype, fp32 sum.
+        # torch sums bf16 / fp16 in fp32 and rounds once, so no (tokens, hidden) fp32 temporary is needed.
         rows = self.mm.matmul(
             x, weight, bias, a_ragged_metadata = routing_data.expt_data, scatter_indx = scatter_indx.dst_indx,
             precision_config = precision_config, **kwargs,
         )
-        return rows.view(-1, k, rows.shape[-1]).sum(1, dtype = torch.float32).to(rows.dtype)
+        return rows.view(-1, k, rows.shape[-1]).sum(1)
 
     def gate_up(self, x, weight, bias, routing_data, gather_indx, precision_config, fused_activation = None):
         return self.matmul_ogs(
@@ -354,9 +356,17 @@ def triton_kernels_alias():
             sys.modules.pop("triton_kernels", None)
 
 
+def convert_layout_shared(tensor_module, tensor, layout, **layout_opts):
+    """``convert_layout`` that skips the copy release/3.7.x makes when ``tensor`` already has ``layout``; that copy
+    duplicates every expert stack and leaks into the CUDA graph pool."""
+    if not layout_opts and not isinstance(layout, type) and getattr(tensor.storage, "layout", None) == layout:
+        return tensor
+    return tensor_module.convert_layout(tensor, layout, **layout_opts)
+
+
 def mxfp4_ogs_weight(blocks, scales):
     """GPT-OSS checkpoint (E, out, in / 32, 16) blocks + (E, out, in / 32) scales -> (weight, PrecisionConfig)
-    for matmul_ogs, with the (E, in, out) logical shape its kernels expect. Copies: the layout swizzles."""
+    for matmul_ogs, with the (E, in, out) logical shape its kernels expect. Copies only when the layout swizzles."""
     from unsloth_zoo.temporary_patches.gpt_oss import _mxfp4_layout_arguments
     E, N, G, _ = blocks.shape
     with triton_kernels_alias() as tk:
@@ -364,9 +374,9 @@ def mxfp4_ogs_weight(blocks, scales):
         tensor, layout = backend.tensor, backend.layout
         values = blocks.reshape(E, N, G * 16).transpose(-2, -1)
         value_layout, value_opts, strided = _mxfp4_layout_arguments(layout, values)
-        weight = tensor.convert_layout(tensor.wrap_torch_tensor(values, dtype = tensor.FP4), value_layout, **value_opts)
+        weight = convert_layout_shared(tensor, tensor.wrap_torch_tensor(values, dtype = tensor.FP4), value_layout, **value_opts)
         weight.shape = torch.Size([E, G * 32, N])
-        scale = tensor.convert_layout(tensor.wrap_torch_tensor(scales.transpose(-2, -1)), strided)
+        scale = convert_layout_shared(tensor, tensor.wrap_torch_tensor(scales.transpose(-2, -1)), strided)
         return weight, backend.precision(scale)
 
 
@@ -396,6 +406,31 @@ def _self_check(device):
     return True
 
 
+_CAPABILITY = {}
+
+
+def _device_capability(device):
+    # Asked on every expert forward (each decode token), so cached per explicit device.
+    device = device if isinstance(device, torch.device) else torch.device(device)
+    if device.type != "cuda" or torch.version.hip is not None:
+        return None
+    capability = _CAPABILITY.get(device.index) if device.index is not None else None
+    if capability is None:
+        capability = tuple(torch.cuda.get_device_capability(device))
+        if device.index is not None:
+            _CAPABILITY[device.index] = capability
+    return capability
+
+
+def native_mxfp4_matmul_ok(device, backend) -> bool:
+    """False on sm_12x (about 100 KB shared memory) with release/3.6.x matmul_ogs+ragged, whose Blackwell tiles
+    trip ``assert num_stages >= 1`` in opt_flags."""
+    capability = _device_capability(device)
+    if capability is None or backend is None:
+        return True
+    return not (capability[0] == 12 and backend.api == API_OGS_RAGGED)
+
+
 def matmul_ogs_available(device = None) -> bool:
     if device is None:
         if not torch.cuda.is_available():
@@ -404,6 +439,8 @@ def matmul_ogs_available(device = None) -> bool:
     device = torch.device(device)
     key = str(device)
     ok = _DEVICE_OK.get(key)
+    if ok is None and not native_mxfp4_matmul_ok(device, get_triton_kernels_backend()):
+        ok = _DEVICE_OK[key] = False  # known not to run here: no probe launch
     if ok is None:
         on_cuda = torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext()
         try:

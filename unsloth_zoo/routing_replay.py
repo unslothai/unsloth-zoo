@@ -323,10 +323,22 @@ def _build_replay(input_ids, position_ids, attention_mask = None):
     return out.to(input_ids.device, non_blocking = True).long()
 
 
-def _decoder_pre_hook(module, args, kwargs):
+_MEDIA_KWARGS = ("pixel_values", "pixel_values_videos", "input_features")
+
+
+def _input_ids(args, kwargs):
     input_ids = kwargs.get("input_ids", None)
     if input_ids is None and len(args) > 0 and torch.is_tensor(args[0]) and not args[0].is_floating_point():
         input_ids = args[0]
+    return input_ids
+
+
+def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
+    input_ids = _input_ids(args, kwargs)
+    if input_ids is None and parent_input_ids:
+        parent_ids, embeds = parent_input_ids[-1], kwargs.get("inputs_embeds")
+        if torch.is_tensor(parent_ids) and torch.is_tensor(embeds) and embeds.shape[:2] == parent_ids.shape:
+            input_ids = parent_ids
     _STATE.stats["forwards"] += 1
     _STATE.forwarded_since_record = True
     _STATE.in_forward = True
@@ -367,7 +379,42 @@ def _fingerprint(ids):
     return ids.sort(-1).values.to(torch.int16)
 
 
-def _recomputed_routes(layer_index, ids2):
+_NATURAL = object()
+
+
+_SIGNATURE_PROJECTIONS = {}
+_SIGNATURE_CHUNK = 4096
+
+
+def _signature_projection(width, device):
+    key = (width, str(device))
+    projection = _SIGNATURE_PROJECTIONS.get(key)
+    if projection is None:
+        generator = torch.Generator().manual_seed(0x5EED)
+        projection = torch.randn(width, 2, generator = generator, dtype = torch.float32).to(device)
+        _SIGNATURE_PROJECTIONS[key] = projection
+    return projection
+
+
+def _input_signature(args, tokens):
+    # Per token fp32 random projections of the router input. The recompute feeds the router the
+    # same bits as the forward did, so this tells apart forwards whose natural routes are equal.
+    # Random directions, not a plain sum: zero-centred (LayerNorm) inputs all sum to about zero.
+    x = args[0] if args and torch.is_tensor(args[0]) else None
+    if x is None or not x.is_floating_point() or tokens == 0 or x.numel() % tokens != 0:
+        return None
+    # Autocast would run the projection in bf16 / fp16 and merge nearby inputs.
+    with torch.no_grad(), torch.autocast(device_type = x.device.type, enabled = False):
+        x = x.detach().reshape(tokens, -1)
+        projection = _signature_projection(x.shape[-1], x.device)
+        # Chunked so the fp32 upcast stays bounded for long sequences.
+        return torch.cat([
+            x[a : a + _SIGNATURE_CHUNK].float() @ projection
+            for a in range(0, tokens, _SIGNATURE_CHUNK)
+        ])
+
+
+def _recomputed_routes(layer_index, ids2, signature = None):
     # A router call outside a decoder forward is a checkpoint recompute: pick the recorded forward
     # whose natural routing it reproduces, without a host sync. None when no forward was recorded.
     if not _STATE.pending:
@@ -375,9 +422,21 @@ def _recomputed_routes(layer_index, ids2):
     _STATE.recomputed = True
     candidates = [r[layer_index] for r in _STATE.pending if layer_index in r and r[layer_index][1].shape == ids2.shape]
     if not candidates:
-        return ids2.long(), torch.zeros((ids2.shape[0], 1), dtype = torch.bool, device = ids2.device)
+        # No forward replayed this layer: recompute it exactly as it ran, with no extra ops
+        # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
+        return _NATURAL
     fp = _fingerprint(ids2)
     match = torch.stack([(c[0] == fp).all() for c in candidates])
+    if signature is not None:
+        # Narrow the natural matches to the forwards whose router input was the same too. Only a
+        # refinement: when no input matches exactly, the natural matches stand as before.
+        same = [
+            (c[3] == signature).all() if len(c) > 3 and c[3] is not None and c[3].shape == signature.shape
+            else torch.zeros((), dtype = torch.bool, device = match.device)
+            for c in candidates
+        ]
+        exact = match & torch.stack(same).to(match.device)
+        match = torch.where(exact.any(), exact, match)
     pick = match.to(torch.int32).argmax()
     forced_all = torch.stack([c[1] for c in candidates])
     forced = forced_all[pick]
@@ -394,12 +453,25 @@ def _softmax_gather(logits, ids, renorm):
     return w / w.sum(dim = -1, keepdim = True) if renorm else w
 
 
+def _probs_gather(probs, ids, renorm):
+    w = probs.float().gather(-1, ids)
+    return w / w.sum(dim = -1, keepdim = True) if renorm else w
+
+
 def _formulas():
     # softmax_renorm also covers gpt-oss style softmax over the top-k logits: they are equal.
+    # probs_*: transformers 5.2 - 5.7 Qwen MoE routers return softmax probabilities as "logits".
     return OrderedDict(
         softmax_renorm = lambda logits, ids: _softmax_gather(logits, ids, True),
         softmax = lambda logits, ids: _softmax_gather(logits, ids, False),
+        probs_renorm = lambda probs, ids: _probs_gather(probs, ids, True),
+        probs = lambda probs, ids: _probs_gather(probs, ids, False),
     )
+
+
+def _looks_like_probs(logits2):
+    with torch.no_grad():
+        return bool(((logits2 >= 0).all() & ((logits2.float().sum(-1) - 1).abs() < 1e-3).all()).item())
 
 
 def _split_router_output(output):
@@ -424,9 +496,14 @@ def _split_router_output(output):
     return None
 
 
-def _router_hook(layer_index):
+def _router_hook(layer_index, compact = None):
+    # compact: (position among the MoE layers, number of MoE layers) when some decoder layers are
+    # dense. vLLM 0.21 numbers routed experts by MoE layer only, so its rows skip dense layers.
     def hook(module, args, output):
         replay = _STATE.current
+        row = layer_index
+        if compact is not None and replay is not None and replay.dim() == 3 and replay.shape[1] == compact[1]:
+            row = compact[0]
         positions = _split_router_output(output)
         if positions is None:
             if not getattr(module, "_unsloth_replay_warned", False):
@@ -448,15 +525,21 @@ def _router_hook(layer_index):
             weights2 = scores2.gather(-1, ids2.long())
         else:
             weights2 = weights.reshape(ids2.shape)
-        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2)
+        signature = None
+        if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
+            signature = _input_signature(args, ids2.shape[0])
+        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature)
         if recomputed is not None:
             _STATE.stats["router_calls_recomputed"] += 1
+        if recomputed is _NATURAL:
+            _STATE.stats["router_calls_natural"] += 1
+            return None
         if recomputed is None and replay is None:
             _STATE.stats["router_calls_natural"] += 1
             return None
         if recomputed is None and (
             replay.shape[0] != ids2.shape[0]
-            or layer_index >= replay.shape[1]
+            or row >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
         ):
             _STATE.stats["router_calls_natural"] += 1
@@ -465,7 +548,16 @@ def _router_hook(layer_index):
         formula = getattr(module, "_unsloth_replay_formula", None)
         if formula is None:
             # Pick the weight formula that reproduces this router's own natural weights.
+            # Probabilities must never be softmaxed again: near ties would pass the check below.
+            probs = _looks_like_probs(logits2)
+            # A router that states whether it renormalises the top-k decides it: top-k mass near
+            # one would otherwise pass a normalised formula for an unnormalised router.
+            renorm = getattr(module, "norm_topk_prob", None)
             for name, fn in _formulas().items():
+                if name.startswith("probs") != probs:
+                    continue
+                if isinstance(renorm, bool) and name.endswith("_renorm") != renorm:
+                    continue
                 with torch.no_grad():
                     candidate = fn(logits2, ids2).to(weights2.dtype).float()
                 if torch.allclose(candidate, weights2.float(), rtol = 2e-2, atol = 2e-3):
@@ -483,12 +575,13 @@ def _router_hook(layer_index):
             return None
 
         if recomputed is None:
-            forced = replay[:, layer_index, :]
+            # Replay rows live on the input ids' device; a device map can put this layer elsewhere.
+            forced = replay[:, row, :].to(ids2.device, non_blocking = True)
             valid = (forced >= 0).all(dim = -1, keepdim = True)
             forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
             if _STATE.record is not None:
                 # A copy: the output ids may alias forced, and MoE blocks can reuse them in place.
-                _STATE.record[layer_index] = (_fingerprint(ids2), forced.clone(), valid)
+                _STATE.record[layer_index] = (_fingerprint(ids2), forced.clone(), valid, signature)
         else:
             forced, valid = recomputed
             forced = torch.where(valid, forced, ids2.long())
@@ -497,7 +590,7 @@ def _router_hook(layer_index):
         new_weights = torch.where(valid, new_weights, weights2)
         with torch.no_grad():
             changed = (forced.sort(-1).values != ids2.long().sort(-1).values).any(-1).sum()
-            _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed
+            _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed.to(_STATE.changed.device)
         _STATE.stats["router_calls_replayed"] += 1
 
         if dense:
@@ -540,15 +633,38 @@ def install_routing_replay(model, llm = None, tokenizer = None):
         elif decoder is None and isinstance(getattr(module, "layers", None), torch.nn.ModuleList) \
                 and hasattr(module, "embed_tokens"):
             decoder = module
+            decoder_name = name
     if not routers or decoder is None:
         warnings.warn(
             "Unsloth: routing replay found no transformers >= 5 TopKRouter modules on this "
             "model (older transformers route inside the MoE block); routing replay is off."
         )
         return 0
+    moe_layers = sorted({layer_index for layer_index, _ in routers})
+    dense = len(moe_layers) < len(decoder.layers)
     for layer_index, module in routers:
-        module.register_forward_hook(_router_hook(layer_index))
-    decoder.register_forward_pre_hook(_decoder_pre_hook, with_kwargs = True)
+        compact = (moe_layers.index(layer_index), len(moe_layers)) if dense else None
+        module.register_forward_hook(_router_hook(layer_index, compact))
+    parent_input_ids = []
+    if decoder_name:
+        # Qwen3.5 embeds tokens in the parent. Keep its IDs only until that forward exits.
+        parent = model.get_submodule(decoder_name.rpartition(".")[0])
+
+        def parent_pre_hook(module, args, kwargs):
+            # Routes are keyed by token ids alone, so two images behind the same tokens would swap
+            # routes: media forwards keep their natural routing.
+            media = any(kwargs.get(k) is not None for k in _MEDIA_KWARGS)
+            parent_input_ids.append(None if media else _input_ids(args, kwargs))
+
+        def parent_post_hook(module, args, output):
+            if parent_input_ids:
+                parent_input_ids.pop()
+
+        parent.register_forward_pre_hook(parent_pre_hook, with_kwargs = True)
+        parent.register_forward_hook(parent_post_hook, always_call = True)
+    decoder.register_forward_pre_hook(
+        functools.partial(_decoder_pre_hook, parent_input_ids = parent_input_ids), with_kwargs = True,
+    )
     decoder.register_forward_hook(_decoder_post_hook, always_call = True)
     model._unsloth_routing_replay_installed = True
     print(f"Unsloth: MoE routing replay is on for {len(routers)} routers.")

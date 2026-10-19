@@ -201,6 +201,32 @@ def test_chunks_respect_the_logits_budget(monkeypatch):
     assert torch.allclose(capped, full, atol = 1e-9)
 
 
+@pytest.mark.parametrize("chunk_size", [1, 3, 1024])
+def test_loss_does_not_save_vocab_sized_teacher_activations(chunk_size):
+    target = _target()
+    drafter = _drafter(target).freeze_shared()
+    ids, lm = _batch()
+    cap, _, out = _run(drafter, target, ids, lm)
+    final = cap["final"].double().requires_grad_()
+    teacher_w = drafter.lm_head.weight.detach().clone().requires_grad_()
+    saved_vocab_shapes = []
+
+    def pack(tensor):
+        if tensor.ndim == 2 and tensor.shape[-1] == VOCAB:
+            saved_vocab_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        loss, _ = dspark_loss(drafter, out, teacher_hidden = final,
+                              teacher_lm_head_weight = teacher_w, chunk_size = chunk_size)
+    assert not saved_vocab_shapes, saved_vocab_shapes
+    loss.backward()
+    assert final.grad is None and teacher_w.grad is None
+    assert drafter.fc.weight.grad is not None
+    assert drafter.markov_head.markov_w2.weight.grad is not None
+    assert drafter.confidence_head.proj.weight.grad is not None
+
+
 def test_save_round_trip_and_schema(tmp_path):
     target = _target()
     drafter = _drafter(target)

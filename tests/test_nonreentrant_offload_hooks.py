@@ -210,3 +210,73 @@ def test_distributed_default_bounds_inflight_copies(gc_module, monkeypatch):
     assert gc_module.NonReentrantActivationOffloader().max_inflight == 1
     monkeypatch.setenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", "3")
     assert gc_module.NonReentrantActivationOffloader().max_inflight == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_capped_pinning_survives_blocks_freed_after_async_copies(gc_module, monkeypatch):
+    # unpack's non_blocking H2D leaves each freed host block in torch's event queue, and
+    # host_memory_stats() does not drain it, so the cached blocks read as not free. Once the
+    # cap was reached, every later layer used to go pageable for the rest of training.
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    torch.cuda.synchronize()
+    torch._C._host_emptyCache()
+    base = gc_module._host_allocator_held_bytes()  # live pinned memory of earlier tests
+    block = 1 << 20
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(3 * block / (1 << 30)))
+    monkeypatch.setattr(gc_module, "_WARNED_ABOUT_PINNED_CAP", True, raising = False)
+    monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
+    layers = [torch.nn.Linear(1024, 1024).cuda() for _ in range(6)]
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    pinned = []
+    for _ in range(4):
+        before = offloader.stats["pinned"]
+        h = torch.randn(256, 1024, device = "cuda", requires_grad = True)  # 1 MiB per layer input
+        for layer in layers:
+            with offloader.hooks():
+                h = ckpt.checkpoint(layer, h, use_reentrant = False)
+        h.sum().backward()
+        torch.cuda.synchronize()
+        pinned.append(offloader.stats["pinned"] - before)
+    # 3 blocks fit the cap: every step reuses them, none pins past it.
+    assert pinned == [3, 3, 3, 3]
+    assert gc_module._host_allocator_held_bytes() - base <= 3 * block
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_a_probe_that_pins_a_new_block_releases_it(gc_module):
+    # Another pinned user holds the cached block, so the probe pins a fresh one: it must not stay
+    # cached past the cap.
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    torch.cuda.synchronize()
+    torch._C._host_emptyCache()
+    block = 1 << 20
+    other = torch.empty(block, dtype = torch.uint8, pin_memory = True)  # holds the only cached block
+    held = gc_module._host_allocator_held_bytes()
+    assert gc_module._host_cache_reuses_block(block) is False
+    assert gc_module._host_allocator_held_bytes() <= held
+    del other
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_a_probe_failure_other_than_oom_is_raised(gc_module, monkeypatch):
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    real_empty = torch.empty
+
+    def broken(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", broken)
+    with pytest.raises(RuntimeError, match = "illegal memory access"):
+        gc_module._host_cache_reuses_block(1 << 20)
+
+    def oom(*args, **kwargs):
+        raise RuntimeError("CUDA error: out of memory")
+
+    monkeypatch.setattr(torch, "empty", oom)
+    assert gc_module._host_cache_reuses_block(1 << 20) is False

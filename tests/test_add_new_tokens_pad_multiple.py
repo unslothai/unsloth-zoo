@@ -508,3 +508,67 @@ def test_return_args_warns_for_padded_vocab(capsys):
     exits = [n for n in ast.walk(load_vllm) if isinstance(n, ast.If) and ast.unparse(n.test) == "return_args"
              and any(isinstance(b, ast.Return) for b in ast.walk(n))]
     assert exits and all("_warn_padded_vocab_for_serve(config)" in ast.unparse(n) for n in exits)
+
+
+def test_caller_suppression_kept_after_owned_rows_run_out(monkeypatch):
+    # Once every row Unsloth suppressed has become a token, the remaining alignment row is still
+    # the caller's: the empty ownership record must not fall back to "all rows are ours".
+    from unsloth_zoo.tokenizer_utils import _round_up_vocab
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    n0 = len(tokenizer)
+    padded = _round_up_vocab(n0 + 1, 64)
+    assert padded - (n0 + 1) >= 2
+    model.generation_config.suppress_tokens = [7, padded - 1]
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    n1 = len(tokenizer)
+    assert model.get_input_embeddings().weight.shape[0] == padded
+    assert model.config.unsloth_vocab_pad_suppressed_ids == list(range(n1, padded - 1))
+
+    add_new_tokens(model, tokenizer, new_tokens = [f"<unsloth_b{i}>" for i in range(padded - 1 - n1)])
+    assert len(tokenizer) == padded - 1
+    assert model.config.unsloth_vocab_pad_ids == [padded - 1]
+
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_c>"])
+    assert tokenizer.convert_tokens_to_ids("<unsloth_c>") == padded - 1
+    assert sorted(model.generation_config.suppress_tokens) == [7, padded - 1]
+
+
+
+def test_merged_export_config_keeps_vocab_pad_records():
+    # merge_and_overwrite_lora writes the base checkpoint's config with the trained vocab_size:
+    # the alignment-row records must travel with it, or vLLM samples the tokenless rows.
+    from transformers import LlamaConfig
+    from unsloth_zoo.saving_utils import _carry_over_vocab_size
+    from unsloth_zoo.vllm_utils import _padded_vocab_ids
+    base = LlamaConfig(vocab_size = 100)
+    trained = LlamaConfig(vocab_size = 128)
+    trained.unsloth_vocab_pad_ids = list(range(101, 128))
+    trained.unsloth_vocab_pad_suppressed_ids = list(range(102, 128))
+    _carry_over_vocab_size(base, trained)
+    assert base.vocab_size == 128
+    assert _padded_vocab_ids(base) == list(range(101, 128))
+    assert base.unsloth_vocab_pad_suppressed_ids == list(range(102, 128))
+    # An unpadded model adds nothing to the exported config.
+    plain = LlamaConfig(vocab_size = 100)
+    _carry_over_vocab_size(plain, LlamaConfig(vocab_size = 101))
+    assert not hasattr(plain, "unsloth_vocab_pad_ids")
+    assert not hasattr(plain, "unsloth_vocab_pad_suppressed_ids")
+
+
+def test_merged_export_tolerates_an_ambiguous_text_config():
+    # get_text_config() raises on configs with several text sections; the export must not abort.
+    from types import SimpleNamespace
+    from unsloth_zoo.saving_utils import _carry_over_vocab_pad_records
+
+    class Ambiguous(SimpleNamespace):
+        def get_text_config(self):
+            raise ValueError("specify decoder = True or encoder = True")
+
+    base = Ambiguous(text_config = SimpleNamespace(vocab_size = 100))
+    trained = Ambiguous(text_config = SimpleNamespace(vocab_size = 128, unsloth_vocab_pad_ids = [101, 102]))
+    _carry_over_vocab_pad_records(base, trained)
+    assert base.text_config.unsloth_vocab_pad_ids == [101, 102]
+    plain_base, plain = Ambiguous(text_config = SimpleNamespace()), Ambiguous(text_config = SimpleNamespace())
+    _carry_over_vocab_pad_records(plain_base, plain)
+    assert not hasattr(plain_base.text_config, "unsloth_vocab_pad_ids")
