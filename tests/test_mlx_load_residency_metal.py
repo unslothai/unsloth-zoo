@@ -504,7 +504,9 @@ def _inventory(ple = 30, experts = 64, floor = 2, per_layer = 64):
 
 @pytest.fixture
 def units(monkeypatch):
-    # Sizes in arbitrary units: PLE offload's working memory is 1, an expert offload's 2, no margin.
+    # Sizes in arbitrary units: PLE offload's working memory is 1, an expert offload's 2, no margin;
+    # experts stay resident while 4096 tokens of context (16) fit beside them.
+    monkeypatch.setattr(zoo_offload, "_OFFLOAD_CONTEXT", 4096)
     monkeypatch.setattr(zoo_offload, "_PLE_OVERHEAD", 1)
     monkeypatch.setattr(zoo_offload, "_CACHE_CAP", 2)
     monkeypatch.setattr(zoo_offload, "SAFETY_MARGIN", (0, 0))
@@ -575,11 +577,27 @@ def test_plan_offload_rule(units):
     assert _plan(200) == plan(None, None, 8192, 2048)
     assert _plan(4 + 32 + 94) == plan(None, None, 8192, 2048)
     assert _plan(4 + 32 + 93) == plan(1.0, None, 8192, 2048)
-    # 40 units of room: context takes half (5120 tokens) and experts pay, in whole experts. At step
-    # 2048, 20 - PLE overhead 1 - expert overhead 2 = 17 of 64 stay (47 offloaded, 47/2048 per
-    # token); at 4096, 13 stay (51/4096 per token: fewer re-read bytes); 8192 is past the context.
-    assert _plan(44) == plan(1.0, 51 / 64, 5120, 4096)
-    assert _plan(44, prefill_step = 2048) == plan(1.0, 47 / 64, 5120, 2048)
+    # Experts stay resident (65 with PLE offloaded) while 4096 tokens fit beside them, and the
+    # context then takes all that is left.
+    assert _plan(4 + 65 + 16) == plan(1.0, None, 4096, 2048)
+    assert _plan(4 + 65 + 23) == plan(1.0, None, 5888, 2048)
+    assert _plan(4 + 65 + 23, _inventory(ple = 4)) == plan(None, None, 5120, 2048)  # the least offload
+    # Short of that, experts pay for 4096 tokens, in whole experts: 80 - 16 - PLE overhead 1 -
+    # expert overhead 2 = 61 of 64 stay at step 2048 (3/2048 per token; 7/4096 at step 4096).
+    assert _plan(4 + 65 + 15) == plan(1.0, 3 / 64, 4096, 2048)
+    # Whole experts of 4 units each leave slack the context then takes: 24 - (1 + 4 + 2) = 17 units.
+    assert _plan(28, _inventory(per_layer = 16)) == plan(1.0, 15 / 16, 4352, 2048)
+    assert _plan(4 + 65 + 15, context = 8192) == plan(1.0, 31 / 64, 8192, 8192)  # a pinned context is kept
+    # 40 units of room: at step 2048, 24 - 3 = 21 stay (43/2048 per token); at 4096, 17 stay
+    # (47/4096: fewer re-read bytes); 8192 is past the context.
+    assert _plan(44) == plan(1.0, 47 / 64, 4096, 4096)
+    assert _plan(44, prefill_step = 2048) == plan(1.0, 43 / 64, 4096, 2048)
+    # The context experts pay for stays within the minimum and the ceiling.
+    units.setattr(zoo_offload, "_OFFLOAD_CONTEXT", 512)
+    assert _plan(44) == plan(1.0, 31 / 64, 1024, 2048)
+    units.setattr(zoo_offload, "_OFFLOAD_CONTEXT", 16384)
+    assert _plan(4 + 65 + 15) == plan(1.0, 31 / 64, 8192, 8192)
+    units.setattr(zoo_offload, "_OFFLOAD_CONTEXT", 4096)
     # A pinned context keeps its size; with the PLE knob off, experts alone pay; 8192 does not fit.
     assert _plan(4 + 32 + 42, context = 8192, offload = _parts(experts = "auto")) == plan(None, 58 / 64, 8192, 4096)
     assert _plan(40, context = 8192) == plan(None, None, None, None)

@@ -895,6 +895,9 @@ PREFILL_STEPS = (2048, 4096, 8192)
 # Kept free on top of the estimate: the larger of 2 GiB and 3% of it. The estimate is fitted to
 # measured peaks; being slightly off must not run the machine out of memory.
 SAFETY_MARGIN = (2 << 30, 0.03)
+# Experts read from disk cost several times the decode speed whatever the fraction, so, as llama.cpp's
+# fitter does before it spills weights, an unpinned context shrinks to this before they leave memory.
+_OFFLOAD_CONTEXT = 8192
 _TRANSIENT_RESERVE = 2 << 30
 
 
@@ -1043,10 +1046,12 @@ def plan_offload(
 ):
     """The 50/50 rule: context takes at most half of what the resident weights leave of ``budget``
     less ``SAFETY_MARGIN`` (more only to reach ``minimum``), and the least offload that fits the rest
-    is taken -- none, PLE, then PLE and as many experts as needed. With experts offloaded, each
-    prefill step re-reads them, so the step with the fewest offloaded bytes per prompt token is
-    taken. ``context_cost(tokens, step)`` prices the context. A ``context``, ``prefill_step`` or
-    ``offload`` part (as ``from_pretrained`` takes it) not ``"auto"`` is kept as given.
+    is taken -- none, PLE, then PLE and as many experts as needed. Experts leave memory only when an
+    unpinned context of ``_OFFLOAD_CONTEXT`` tokens (within ``minimum`` and ``ceiling``) does not fit
+    beside them, and then as many as that context needs. With experts offloaded, each prefill step
+    re-reads them, so the step with the fewest offloaded bytes per prompt token is taken.
+    ``context_cost(tokens, step)`` prices the context. A ``context``, ``prefill_step`` or ``offload``
+    part (as ``from_pretrained`` takes it) not ``"auto"`` is kept as given.
     Returns ``{"ple", "experts", "context", "prefill_step"}``, all ``None`` when nothing fits."""
     offload = offload_setting(offload)
     ple_offload, expert_offload = offload["ple"], offload["experts"]
@@ -1089,6 +1094,11 @@ def plan_offload(
     chosen = choose(room - context_cost(target, first))
     if chosen is None:
         return nothing
+    if context is None and expert_auto and chosen[1]:
+        useful = min(max(minimum, _OFFLOAD_CONTEXT), ceiling)
+        at_useful = choose(room - context_cost(useful, first))
+        if at_useful is not None:
+            chosen, target = at_useful, useful
     step = first
     if prefill_step is None and chosen[1]:
         # Offloaded expert bytes re-read per prompt token; disk speed scales every step alike.
