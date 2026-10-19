@@ -5870,7 +5870,7 @@ def _gemma3n_language_contract(method):
     if (
         "cache[self.first_full_idx]" in source
         and "window_size=self.config.sliding_window" in source
-        and "raw_offset.max().item()" in source
+        and ("raw_offset.max().item()" in source or "cache_position_offset(c0)" in source)
     ):
         return "current"
     return None

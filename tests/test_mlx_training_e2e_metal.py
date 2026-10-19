@@ -3036,6 +3036,13 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
 
 
 @metal_only
+def test_gemma3n_compile_patches_recognise_the_installed_language_call():
+    from mlx_vlm.models.gemma3n.language import Gemma3Model
+    import unsloth_zoo.mlx.compile as mc
+    assert mc._gemma3n_language_contract(Gemma3Model.__call__) == "current"
+
+
+@metal_only
 def test_cce_hidden_forward_preserves_wrapper_embeddings_and_image_mask():
     from types import SimpleNamespace
 
