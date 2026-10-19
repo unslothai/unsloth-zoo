@@ -629,7 +629,7 @@ _DECODE_STEP_SOURCE = """
         }
         acc = simd_sum(acc);
         acc = simd_sum(lane == 0 ? acc : 0.0f);
-        float inv = metal::precise::rsqrt(acc / Dk + 1e-6f);
+        float inv = metal::precise::rsqrt(acc / Dk + qk_eps[0]);
         for (int i = 0; i < 4; i++) {
             T normed = static_cast<T>(1) * static_cast<T>(thread_x[i] * inv);
             x[lane * 4 + i] = Multiply()(scale, normed);
@@ -707,7 +707,7 @@ def _decode_step_kernel():
         return binary and mx.fast.metal_kernel(
             name = "unsloth_gated_delta_decode_step",
             input_names = ["conv_state", "qkv", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight",
-                           "q_scale", "k_scale", "norm_eps", "state_in"],
+                           "q_scale", "k_scale", "qk_eps", "norm_eps", "state_in"],
             output_names = ["window", "y", "state_out"], header = header + binary,
             compile_options = {"math_mode": "safe"}, source = _DECODE_STEP_SOURCE,
         ) or None
@@ -716,20 +716,21 @@ def _decode_step_kernel():
 
 
 @functools.lru_cache(maxsize = 64)
-def _decode_step_scalars(head_dim, dtype, eps):
+def _decode_step_scalars(head_dim, dtype, qk_eps, eps):
     # `inv_scale * x` converts the Python scale to x's dtype; going through the same multiply keeps its rounding.
     inv_scale, one = head_dim ** -0.5, mx.ones((1,), dtype)
-    scalars = ((inv_scale ** 2) * one, inv_scale * one, mx.array([eps], mx.float32))
+    scalars = ((inv_scale ** 2) * one, inv_scale * one, mx.array([qk_eps], mx.float32), mx.array([eps], mx.float32))
     mx.eval(*scalars)
     return scalars
 
 
-def _decode_step(conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, eps, state, key_heads):
+def _decode_step(conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads):
     B, value_heads, Dv, Dk = state.shape
     dtype = qkv.dtype
-    q_scale, k_scale, norm_eps = _decode_step_scalars(Dk, dtype, eps)
+    q_scale, k_scale, qk_norm_eps, norm_eps = _decode_step_scalars(Dk, dtype, qk_eps, eps)
     return _decode_step_kernel()(
-        inputs = [conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, norm_eps, state],
+        inputs = [conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, qk_norm_eps,
+                  norm_eps, state],
         template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[0]),
                     ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv), ("TY", _DECODE_STEP_ROWS)],
         grid = (32, _DECODE_STEP_ROWS, B * value_heads), threadgroup = (32, _DECODE_STEP_ROWS, 1),
@@ -738,12 +739,14 @@ def _decode_step(conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, 
     )
 
 
+# The `_normalize_qk` bodies the decode step mirrors, by the RMSNorm epsilon each uses for a head width.
+_NORMALIZE_QK_EPS = {"8f16e229aec08b7a": lambda width: 1e-6, "f23945a25dd3df5f": lambda width: 1e-6 / width}
 # Bodies the decode step mirrors. `gated_delta_kernel` is left out: the packed scope rebinds it, and its
 # single-token route is the generic kernel whose arithmetic `_make_gated_delta_kernel` pins.
 _DECODE_STEP_CONTRACT = {
     "mlx_vlm.models.qwen3_5.language": {
         "Qwen3_5GatedDeltaNet.__call__": "f8deff65c803d4da",
-        "Qwen3_5GatedDeltaNet._normalize_qk": "8f16e229aec08b7a",
+        "Qwen3_5GatedDeltaNet._normalize_qk": tuple(_NORMALIZE_QK_EPS),
         "Qwen3_5GatedDeltaNet._project_gates": "817d9767396ec3f8",
         "Qwen3_5RMSNormGated.__call__": "7c0c74be3b59d596",
         "_precise_swiglu": "d5cc9afa38657b66",
@@ -786,10 +789,12 @@ def _decode_step_contract(base):
     except (OSError, TypeError, SyntaxError, AttributeError):
         return None
     return (language, bound, update, cache.ArraysCache.update_window, cache.ArraysCache.update_recurrent,
-            language._qwen3_5_advance_lengths_info, language.Qwen3_5RMSNormGated.__call__)
+            language._qwen3_5_advance_lengths_info, language.Qwen3_5RMSNormGated.__call__,
+            _NORMALIZE_QK_EPS[_ast_fingerprint(layer._normalize_qk)])
 
 
-def _decode_step_route(language, bound, update, update_window, update_recurrent, advance_lengths, norm_call):
+def _decode_step_route(language, bound, update, update_window, update_recurrent, advance_lengths, norm_call,
+                       qk_eps):
     bindings = _resolved_bindings(_DECODE_STEP_CONTRACT)  # this resolution's, not a later one's
     if bindings is None:
         return None
@@ -834,7 +839,7 @@ def _decode_step_route(language, bound, update, update_window, update_recurrent,
                 mx.eval(cached[1])
                 self.__dict__["_unsloth_decode_step_weight"] = cached
             fused = lambda: _decode_step(conv_state, mixed_qkv, cached[1], a, b, self.A_log, self.dt_bias, z,
-                                         self.norm.weight, self.norm.eps, state, self.num_k_heads)
+                                         self.norm.weight, qk_eps(Dk), self.norm.eps, state, self.num_k_heads)
         if fits and verdict:
             window, out, new_state = fused()
         else:
