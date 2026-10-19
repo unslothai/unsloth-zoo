@@ -316,8 +316,8 @@ def _build_replay(input_ids, position_ids, attention_mask = None):
             out = torch.full((rows * T,) + tuple(routed.shape[1:]), -1, dtype = torch.int16)
         out[torch.tensor(cols) + row * T] = routed
         replayed += len(cols)
-    _STATE.stats["replayed_tokens"] += replayed
-    _STATE.stats["unmatched_tokens"] += unmatched
+    _count("replayed_tokens", replayed)
+    _count("unmatched_tokens", unmatched)
     if out is None:
         return None
     return out.to(input_ids.device, non_blocking = True).long()
@@ -339,7 +339,7 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
         parent_ids, embeds = parent_input_ids[-1], kwargs.get("inputs_embeds")
         if torch.is_tensor(parent_ids) and torch.is_tensor(embeds) and embeds.shape[:2] == parent_ids.shape:
             input_ids = parent_ids
-    _STATE.stats["forwards"] += 1
+    _count("forwards")
     _STATE.forwarded_since_record = True
     _STATE.in_forward = True
     _STATE.record = None
@@ -501,11 +501,12 @@ def _split_router_output(output):
     return None
 
 
-def _count(name):
+def _count(name, amount = 1):
     # Python counters read inside a compiled region become Dynamo guards whose value changes every
-    # call, recompiling the router each step. They are diagnostics only, so skip them there.
+    # call, recompiling the router (or a compiled decoder) each step. They are diagnostics only,
+    # so skip them there.
     if not torch.compiler.is_compiling():
-        _STATE.stats[name] += 1
+        _STATE.stats[name] += amount
 
 
 def _router_hook(layer_index, compact = None):

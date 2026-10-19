@@ -90,3 +90,25 @@ def test_underflowed_forced_probabilities_keep_natural_routing(replay):
     torch.testing.assert_close(weights[1], forced / forced.sum())
     weights.square().sum().backward()
     assert torch.isfinite(x.grad).all(), x.grad
+
+
+def test_hooked_decoder_inside_compiled_model_does_not_recompile(replay):
+    # An outer torch.compile traces the decoder pre hook too: its forward counter must not
+    # become a guard either.
+    class _Decoder(torch.nn.Module):
+        def forward(self, inputs_embeds):
+            return inputs_embeds * 2
+
+    decoder = _Decoder()
+    decoder.register_forward_pre_hook(replay._decoder_pre_hook, with_kwargs = True)
+    decoder.register_forward_hook(replay._decoder_post_hook)
+    x = torch.ones(1, 3, 4)
+    torch._dynamo.reset()
+    compiled = torch.compile(decoder, backend = "eager")
+    frames = []
+    for _ in range(4):
+        before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        torch.testing.assert_close(compiled(inputs_embeds = x), x * 2)
+        frames.append(torch._dynamo.utils.counters["stats"]["unique_graphs"] - before)
+    torch._dynamo.reset()
+    assert frames[1:] == [0, 0, 0], frames
