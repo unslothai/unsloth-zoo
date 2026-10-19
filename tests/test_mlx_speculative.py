@@ -16,7 +16,7 @@ from math import prod
 import pytest
 
 pytest.importorskip("mlx.core")
-from unsloth_zoo.mlx.speculative import DraftController, NgramProposer, RoundPlan, RowPlan, RowState, _Ema
+from unsloth_zoo.mlx.speculative import DraftController, NgramProposer, RoundPlan, RowPlan, RowState, _Ema, _upper
 
 
 def test_ngram_prefers_longer_then_newer_match():
@@ -260,6 +260,18 @@ def test_unlucky_rounds_do_not_end_drafting():
     _run(controller := DraftController(max_depth = 3, can_copy = False), machine := _Machine(draft_slope = 0.3), [([0.7] * 3, None)], rounds = 1000)
     _run(controller, machine, [([0.0] * 3, None)], rounds = 80)  # one reply's rejected tail, then the next reply's rejected first round
     assert _run(controller, machine, [([0.0] * 3, None)], rounds = 1, states = (states := [])) and max(controller.score(controller._round_at(width, states), states) for width in range(2, 5)) > controller.score(RoundPlan("plain", 1), states)
+
+
+def test_plain_must_beat_drafting_at_the_rates_the_loads_samples_allow():
+    # Depth 2 at rates 0.8 runs 1.13x plain at these costs, at 0.4 0.72x: four samples of 0.4 do not rule 0.8 out, forty do.
+    for optimistic, first in ((True, "round"), (False, "plain")):
+        controller = DraftController(max_depth = 2, can_copy = False, **({} if optimistic else {"optimism": 0.0}))
+        controller._warmup, controller._next_probe, controller.plain_cost[1], controller.draft_acceptance, controller.verify_cost[1], controller.draft_cost = [], float("inf"), _Ema(1.0), [_Ema(0.4, 4) for _ in range(2)], {w: _Ema(1.7 + 0.03 * (w - 1)) for w in (2, 3)}, {d: _Ema(0.2 * d) for d in (1, 2)}
+        choose = lambda states: controller._choose([RoundPlan("plain", 8)] + [controller._round_at(w, states) for w in (2, 3)], states, 1)[0].kind
+        assert choose(states := [RowState(controller.new_reply())]) == first
+        controller.draft_acceptance[:] = [_Ema(0.4, 40) for _ in range(2)]  # samples the load gathers while this reply runs
+        assert choose(states) == "plain"
+    assert _upper(0.0, 8, 2.0) == pytest.approx(1 / 3) and 0.4 < _upper(0.4, 4000, 2.0) < 0.42
 
 
 def test_a_fresh_loads_first_reply_drafts_on_its_own_accepted_rounds():

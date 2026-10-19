@@ -161,6 +161,7 @@ class ReplyStats:
         self.draft = [seed(ema) for ema in draft]
         self.draft_seen = [ema.count > 1 for ema in draft]
         self.copy = seed(copy)
+        self.load_draft, self.load_copy = draft, copy
         self.tokens = 0
         # Per source: the doubling back-off, and the token count to retry an unused source at.
         self.backoff = {"copy": backoff, "draft": backoff}
@@ -172,12 +173,25 @@ class ReplyStats:
             return self.draft[position].value
         return min(self.draft[position].value, self.draft_rate(position - 1))
 
-    def expected(self, row: RowPlan) -> float:
+    def expected(self, row: RowPlan, optimism: float = 0.0) -> float:
+        """Expected emitted tokens; ``optimism`` > 0 takes each rate at that many standard errors above, on the load's samples."""
         expected, reach = 1.0, 1.0
         for position in range(row.length):
-            reach *= self.draft_rate(position) if row.source == "draft" else self.copy.value
+            if row.source == "draft":
+                rate, samples = self.draft_rate(position), self.load_draft[position].count
+            else:
+                rate, samples = self.copy.value, self.load_copy.count
+            reach *= _upper(rate, samples, optimism) if optimism else rate
             expected += reach
         return expected
+
+
+def _upper(rate: float, samples: int, z: float) -> float:
+    # Wilson score bound, which stays below 1 and needs few samples to rule out a rate near 0.
+    samples, z2 = max(samples, 1), z * z
+    centre = rate + z2 / (2 * samples)
+    spread = z * (rate * (1.0 - rate) / samples + z2 / (4 * samples * samples)) ** 0.5
+    return min(1.0, (centre + spread) / (1.0 + z2 / samples))
 
 
 @dataclass
@@ -226,6 +240,7 @@ class DraftController:
         cost_alpha: float = 0.2,
         hysteresis: float = 1.03,
         plain_margin: float = 1.05,
+        optimism: float = 2.0,
         probe_margin: float = 1.15,
         probe_every: int = 64,
         probe_rounds: int = 3,
@@ -250,6 +265,7 @@ class DraftController:
         self.cost_alpha = cost_alpha
         self.hysteresis = hysteresis
         self.plain_margin = plain_margin
+        self.optimism = optimism
         self.probe_margin = probe_margin
         self.probe_every = probe_every
         self.probe_rounds = probe_rounds
@@ -357,10 +373,10 @@ class DraftController:
         drafting = sum(self._row_seconds(row, state) for row, state in zip(plan.rows, rows))
         return self._verify_seconds(bucket, width or plan.width) + self._drafting_paid(bucket, drafting)
 
-    def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
+    def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None, optimism: float = 0.0) -> float:
         if plan.kind == "plain":
             return len(rows) / self._plain_step(_bucket(len(rows)))
-        expected = sum(state.stats.expected(row) for row, state in zip(plan.rows, rows))
+        expected = sum(state.stats.expected(row, optimism) for row, state in zip(plan.rows, rows))
         return expected / self.round_seconds(plan, rows, width)
 
     @staticmethod
@@ -487,9 +503,15 @@ class DraftController:
                 self._reference = max(self.score(plan, rows) for plan in candidates)
                 return self._shorten(probe), True
             self._probe_left = 0
-        best = max(candidates, key = lambda plan: self._worth(plan, rows))
+        # Plain decoding samples no acceptance, so it must beat drafting at the rates the load's samples still allow.
+        rounds = [plan for plan in candidates if plan.kind == "round"]
+        doubt = 1.0 if not rounds else (
+            max(self.score(plan, rows) for plan in rounds) / max(self.score(plan, rows, optimism = self.optimism) for plan in rounds)
+        )
+        worth = lambda plan: self._worth(plan, rows) * (doubt if plan.kind == "plain" else 1.0)
+        best = max(candidates, key = worth)
         current = next((p for p in candidates if self._identity(p, bucket) == self._current), None)
-        if current is not None and self._worth(best, rows) < self._worth(current, rows) * self.hysteresis:
+        if current is not None and worth(best) < worth(current) * self.hysteresis:
             best = current
         if self.steps >= self._next_probe:
             self._next_probe = self.steps + self.probe_every
