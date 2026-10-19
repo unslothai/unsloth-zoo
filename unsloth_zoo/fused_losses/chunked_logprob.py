@@ -324,7 +324,7 @@ def unsloth_masked_logprobs(hidden_states, lm_head, labels, mask = None, ignore_
     the rest are 0. `masked_scatter` keeps an all-masked batch connected to the graph as a differentiable zero."""
     if mask is None:
         mask = labels != ignore_index
-    mask = mask.to(hidden_states.device)
+    mask = mask.to(device = hidden_states.device, dtype = torch.bool)  # a 0 / 1 integer mask selects, never indexes
     if _FUSED_LINEAR:
         from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
 

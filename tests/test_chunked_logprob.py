@@ -128,6 +128,18 @@ def test_masked_helper_matches_oracle_and_zeroes_masked_rows():
     assert (got[0][~keep] == 0).all()
 
 
+@pytest.mark.parametrize("fused_linear", [False, True])
+def test_integer_mask_selects_rows(monkeypatch, fused_linear):
+    # TRL's completion masks are 0 / 1 integers: they must select rows on both engines, not index them.
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", fused_linear)
+    states, weight, _, index, _ = _inputs()
+    keep = torch.ones_like(index, dtype = torch.bool)
+    keep[0, :3] = False
+    want = unsloth_masked_logprobs(states, weight, index, mask = keep)
+    got = unsloth_masked_logprobs(states, weight, index, mask = keep.long())
+    assert torch.equal(got, want)
+
+
 def test_all_masked_batch_is_a_connected_zero():
     states, weight, _, index, _ = _inputs()
     labels = torch.full_like(index, -100)
