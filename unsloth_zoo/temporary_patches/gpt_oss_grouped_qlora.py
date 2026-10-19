@@ -426,8 +426,13 @@ def _fsdp2_table_refresh(experts, dtype):
     """(gate_up, down) refresh callables for FSDP2 all-gathered experts, else (None, None).
     FSDP2 frees the forward all-gather and re-gathers before backward, possibly at another
     address, so a backward recompute must re-read the pointer table, not the forward one."""
-    proj = experts.gate_up_projs[0]
-    if not getattr(getattr(proj, "base_layer", proj).weight, _ready_epoch.FSDP2_GATHERED, False):
+    # Any expert of either projection: FSDP2 can wrap a subset of them (a later expert, or only
+    # the down projections), and one stale table is enough for wrong input gradients.
+    if not any(
+        getattr(getattr(proj, "base_layer", proj).weight, _ready_epoch.FSDP2_GATHERED, False)
+        for projs in (experts.gate_up_projs, experts.down_projs)
+        for proj in projs
+    ):
         return None, None
 
     def _table(kind):

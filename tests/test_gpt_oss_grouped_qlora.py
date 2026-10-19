@@ -910,8 +910,9 @@ def _regather_elsewhere(ex):
         old.zero_()
 
 
+@pytest.mark.parametrize("marked", ["all", "down_only"])
 @pytest.mark.parametrize("mode", ["bf16", "fp16", "fp16_windows"])
-def test_fsdp2_gathered_backward_reads_current_weights(mode, monkeypatch):
+def test_fsdp2_gathered_backward_reads_current_weights(mode, marked, monkeypatch):
     if mode == "bf16" and not (torch.cuda.is_bf16_supported() and _check_torch_grouped_mm_supported()):
         pytest.skip("torch._grouped_mm / bf16 unavailable")
     if mode != "bf16" and not FP16_OK:
@@ -923,7 +924,9 @@ def test_fsdp2_gathered_backward_reads_current_weights(mode, monkeypatch):
     monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "1")
     monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "1")
     ex = (_Experts(dtype = DT) if mode == "bf16" else _fp16_experts()).train()
-    for p in list(ex.gate_up_projs) + list(ex.down_projs):
+    # down_only: FSDP2 wrapping a subset of the experts still marks only those weights.
+    marked_projs = list(ex.down_projs) if marked == "down_only" else list(ex.gate_up_projs) + list(ex.down_projs)
+    for p in marked_projs:
         setattr(p.weight, moe_ready_epoch.FSDP2_GATHERED, True)
     T = 48
     xdt = DT if mode == "bf16" else F16
