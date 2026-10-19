@@ -168,6 +168,26 @@ def test_stream_prefetch_skips_inputs_already_unpacked(gc_module, monkeypatch, k
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+@pytest.mark.parametrize("keep_last", ["0", "1"])
+def test_stream_prefetch_reloads_every_input_of_the_previous_checkpoint(gc_module, monkeypatch, keep_last):
+    # Each unpack queues the newest input still on the host, so both inputs of checkpoint i-1
+    # are reloaded while checkpoint i recomputes; only the last checkpoint's inputs load cold.
+    monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", keep_last)
+    torch.manual_seed(0)
+    layers = [_TwoInputLayer().cuda() for _ in range(5)]
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = True)
+    h = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    g = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    for layer in layers:
+        with offloader.hooks():
+            h, g = ckpt.checkpoint(layer, h, g, use_reentrant = False)
+    (h.float().square().mean() + g.float().mean()).backward()
+    torch.cuda.synchronize()
+    assert offloader.stats["prefetched"] == 2 * (len(layers) - 1)
+    assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_low_ram_growth_fallback_frees_the_old_pinned_block(gc_module, monkeypatch):
     # One local rank, host RAM short: the grown slot goes pageable and its old pinned block must
     # be returned to the OS, not left cached in torch's host allocator beside the pageable copy.

@@ -1816,6 +1816,19 @@ class NonReentrantActivationOffloader:
         self.stats["prefetched"] += 1
     pass
 
+    def _prefetch_target(self, index):
+        """The newest record before `index` still to be reloaded. A checkpoint with several saved
+        inputs unpacks them back to back: skipping its own handed out inputs and the ones already
+        prefetched makes each unpack queue one input of the previous checkpoint, so all of them
+        are reloaded early, not only the one at index - 1. Single input checkpoints get index - 1."""
+        index -= 1
+        while index >= 0:
+            record = self.order[index]() if index < len(self.order) else None
+            if record is None or not (record.unpacked or record.device_tensor is not None): break
+            index -= 1
+        return index
+    pass
+
     def unpack(self, packed):
         if type(packed) is tuple:
             device, x = packed
@@ -1835,7 +1848,7 @@ class NonReentrantActivationOffloader:
         else:
             if record.copied is not None: compute.wait_event(record.copied)
             x = record.host.to(record.device, non_blocking = True)
-        if self.stream_mode: self._prefetch(record.index - 1)
+        if self.stream_mode: self._prefetch(self._prefetch_target(record.index))
         return x
     pass
 
