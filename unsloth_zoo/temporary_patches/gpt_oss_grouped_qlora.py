@@ -422,6 +422,20 @@ def _tables(experts, dtype):
     return state
 
 
+def _fsdp2_table_refresh(experts, dtype):
+    """(gate_up, down) refresh callables for FSDP2 all-gathered experts, else (None, None).
+    FSDP2 frees the forward all-gather and re-gathers before backward, possibly at another
+    address, so a backward recompute must re-read the pointer table, not the forward one."""
+    proj = experts.gate_up_projs[0]
+    if not getattr(getattr(proj, "base_layer", proj).weight, _ready_epoch.FSDP2_GATHERED, False):
+        return None, None
+
+    def _table(kind):
+        fresh = _tables(experts, dtype)
+        return fresh[kind] if fresh is not None else None
+    return (lambda: _table("gate_up")), (lambda: _table("down"))
+
+
 def _proj_dtypes(projs):
     """{(compute_dtype, _pre_set_compute_dtype, quant_state.dtype)} over the experts of one projection."""
     out = set()
@@ -516,12 +530,7 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     dn_bias = torch.stack([_base_layer_params(p)["bias"] for p in dn_projs]).detach()
     gu_tb = state["gate_up"] if state is not None else None
     dn_tb = state["down"] if state is not None else None
-    gu_refresh = dn_refresh = None
-    if getattr(getattr(gu_projs[0], "base_layer", gu_projs[0]).weight, _ready_epoch.FSDP2_GATHERED, False):
-        def _table(kind):
-            fresh = _tables(experts, dtype)
-            return fresh[kind] if fresh is not None else None
-        gu_refresh, dn_refresh = (lambda: _table("gate_up")), (lambda: _table("down"))
+    gu_refresh, dn_refresh = _fsdp2_table_refresh(experts, dtype)
     gu_w = _StackProvider(gu_tb, dtype, lambda: _bnb_fallback_stack(gu_projs, dtype), gu_refresh)
     dn_w = _StackProvider(dn_tb, dtype, lambda: _bnb_fallback_stack(dn_projs, dtype), dn_refresh)
 
@@ -547,11 +556,11 @@ class _Fp16StackProvider:
     table (one Triton launch; an fp32 quant state rounds once, fp32 -> fp16) or bitsandbytes.
     windows() splits the experts when a whole stack does not fit in free memory."""
 
-    __slots__ = ("tb", "projs", "N", "K", "num_experts", "dtype", "chunk", "pin")
+    __slots__ = ("tb", "projs", "N", "K", "num_experts", "dtype", "chunk", "pin", "refresh")
 
-    def __init__(self, tb, projs, recompute, dtype = torch.float16):
+    def __init__(self, tb, projs, recompute, dtype = torch.float16, refresh = None):
         qs = getattr(projs[0], "base_layer", projs[0]).weight.quant_state
-        self.tb, self.projs = tb, projs
+        self.tb, self.projs, self.refresh = tb, projs, refresh
         self.N, self.K = int(qs.shape[0]), int(qs.shape[1])
         self.num_experts = len(projs)
         self.dtype = dtype
@@ -569,7 +578,8 @@ class _Fp16StackProvider:
         return [(lo, min(lo + c, E)) for lo in range(0, E, c)]
 
     def __call__(self, lo, hi):
-        tb = self.tb
+        # FSDP2 all-gathered experts (refresh set): the table of the current all-gather, as _StackProvider.
+        tb = self.tb if self.refresh is None else self.refresh()
         # fp16 from an fp16 or fp32 quant state (one rounding); fp32 only from an fp32 one (exact).
         ok = (torch.float16, torch.float32) if self.dtype is torch.float16 else (torch.float32,)
         if tb is not None and tb.get("dtype") in ok:
@@ -682,8 +692,9 @@ def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_
     gu_projs, dn_projs = experts.gate_up_projs, experts.down_projs
     gu_bias = torch.stack([getattr(p, "base_layer", p).bias for p in gu_projs]).detach()
     dn_bias = torch.stack([getattr(p, "base_layer", p).bias for p in dn_projs]).detach()
-    gu_w = _Fp16StackProvider(state["gate_up"] if state is not None else None, gu_projs, recompute)
-    dn_w = _Fp16StackProvider(state["down"] if state is not None else None, dn_projs, recompute, dn_operand)
+    gu_refresh, dn_refresh = _fsdp2_table_refresh(experts, f16)
+    gu_w = _Fp16StackProvider(state["gate_up"] if state is not None else None, gu_projs, recompute, refresh = gu_refresh)
+    dn_w = _Fp16StackProvider(state["down"] if state is not None else None, dn_projs, recompute, dn_operand, dn_refresh)
 
     xs = hidden_states[sorted_tokens]
     # Linear4bit: x.to(compute dtype), bias in the epilogue, output back in the input's dtype.
