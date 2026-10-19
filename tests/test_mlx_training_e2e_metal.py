@@ -2945,13 +2945,16 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     # than "until the bound holds", which would give an under-read shared peak repeated
     # chances to hide a real regression.
     readings = {"shared": [], "unshared": []}
+    per_run = []
     for _ in range(4):
         run = subprocess.run(
             [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
             capture_output=True, text=True, timeout=900,
         )
         assert run.returncode == 0, run.stderr[-4000:]
-        for side, values in json.loads(run.stdout.strip().splitlines()[-1]).items():
+        measured = json.loads(run.stdout.strip().splitlines()[-1])
+        per_run.append(measured)
+        for side, values in measured.items():
             readings[side] += values
 
     def ceiling(side):
@@ -2960,7 +2963,9 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         return max(kept)
 
     shared_peak, unshared_peak = ceiling("shared"), ceiling("unshared")
-    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak, readings)
+    assert shared_peak < 1.25 * unshared_peak, (
+        f"shared {shared_peak} >= 1.25 x unshared {unshared_peak}; per interpreter: {json.dumps(per_run)}"
+    )
 
     # Checkpointing must not change what the shared model computes.
     seq_len = 512
