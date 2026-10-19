@@ -357,7 +357,8 @@ _register(MTPFamily(
     name = "nemotron_h", model_types = ("nemotron_h",), module = "nemotron_h",
     layer_cls = "NemotronHBlock", norm_cls = "NemotronHRMSNorm", rotary_cls = None,
     style = "nemotron", blocks = ({"layer_types": "full_attention"}, {"layer_types": "moe"}),
-    head_norm = "layer",
+    # NVIDIA/vLLM use RMSNorm; llama.cpp currently uses LayerNorm here.
+    llama_cpp = "partial",
 ))
 
 

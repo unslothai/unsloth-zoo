@@ -408,6 +408,14 @@ def test_is_clip_env_parse_and_validation():
             rr.grpo_parse_is_clip(bad, mode)
 
 
+@pytest.mark.parametrize("mode", ["token_truncate", "token_mask", "geometric_mask"])
+@pytest.mark.parametrize("spec", ["2.0", "0.5", " 3 "])
+def test_is_clip_without_separator_is_rejected(spec, mode):
+    # A bare number used to parse as a lower bound, flooring (truncate) or rejecting (mask) every ratio below it.
+    with pytest.raises(ValueError, match = "lower_upper"):
+        rr.grpo_parse_is_clip(spec, mode)
+
+
 @pytest.mark.parametrize("spec", ["2_1", "_"])
 def test_reversed_or_empty_is_clip_override_is_rejected(monkeypatch, spec):
     monkeypatch.setenv("UNSLOTH_GRPO_VLLM_IS_CLIP", spec)

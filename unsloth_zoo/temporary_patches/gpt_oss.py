@@ -208,13 +208,15 @@ _MXFP4_STRIDED_VALUES_WARNED = False
 def _mxfp4_layout_arguments(layout_module, w):
     """(layout_arg, ctor_kwargs, strided_arg) for this weight. strided_arg is a class or
     an instance to match the installed convert_layout, and is reused for the scales."""
-    selection = layout_module.make_default_matmul_mxfp4_w_layout(mx_axis = 1)
+    StridedLayout = layout_module.StridedLayout
+    dataclass_layouts = "major_dim" in getattr(StridedLayout, "__dataclass_fields__", {})
+    # The K axis of the (E, K, N) stack: 3.7+ layouts take it as a negative axis (HopperMXValueLayout asserts it).
+    selection = layout_module.make_default_matmul_mxfp4_w_layout(mx_axis = -2 if dataclass_layouts else 1)
     class_contract = _mxfp4_layout_selection_is_class_contract(selection)
     value_layout, value_layout_opts = _normalize_mxfp4_value_layout(selection)
-    StridedLayout = layout_module.StridedLayout
     if class_contract:
         strided_argument = StridedLayout
-    elif "major_dim" in getattr(StridedLayout, "__dataclass_fields__", {}):
+    elif dataclass_layouts:
         # Values and scales arrive transposed (unit stride on dim -2): keep that order, no copy.
         strided_argument = StridedLayout(major_dim = -2)
     else:
@@ -737,7 +739,9 @@ def patch_gpt_oss():
             with torch_cuda_device(hidden_states.device):
                 if not hasattr(self, "act"):
                     self.act = tk_backend.swiglu_activation(self.alpha, self.limit)
-                if not (torch.is_grad_enabled() and hidden_states.requires_grad):
+                if not (torch.is_grad_enabled() and hidden_states.requires_grad) and _ogs_native_inference_ok(
+                    hidden_states.device, tk_backend,
+                ):
                     intermediate_cache1 = tk_backend.gate_up(
                         hidden_states.to(torch.bfloat16),  # tl.dot_scaled upcasts to BF16 for old hardware
                         self.gate_up_proj,
@@ -2220,9 +2224,10 @@ def _ogs_weight(blocks, scales, in_dim):
     E, out_dim = blocks.shape[:2]
     rows = blocks.reshape(E, out_dim, -1)
     value_layout, value_opts, strided = _mxfp4_layout_arguments(L, rows)
-    w = T.convert_layout(T.wrap_torch_tensor(rows.transpose(-2, -1), dtype = T.FP4), value_layout, **value_opts)
+    from unsloth_zoo.triton_kernels_compat import convert_layout_shared
+    w = convert_layout_shared(T, T.wrap_torch_tensor(rows.transpose(-2, -1), dtype = T.FP4), value_layout, **value_opts)
     w.shape = torch.Size([E, in_dim, out_dim])
-    w_scale = T.convert_layout(T.wrap_torch_tensor(scales.reshape(E, out_dim, -1).transpose(-2, -1)), strided)
+    w_scale = convert_layout_shared(T, T.wrap_torch_tensor(scales.reshape(E, out_dim, -1).transpose(-2, -1)), strided)
     precision = backend.precision(w_scale)
     _OGS_WEIGHTS[key] = (w, precision)
     return w, precision
@@ -2572,6 +2577,90 @@ def _matmul_ogs_for(weight, routing_data = None):
     return _ogs_backend_for(weight, routing_data).matmul_ogs
 
 
+_OGS_NATIVE_REJECT_WARNED = False
+
+
+def _ogs_native_training_ok(device, backend):
+    """Whether the training forward may launch triton_kernels; else the exact bf16 dequant forward is used."""
+    from unsloth_zoo import triton_kernels_compat as compat
+    if compat.native_mxfp4_matmul_ok(device, backend):
+        return True
+    global _OGS_NATIVE_REJECT_WARNED
+    if not _OGS_NATIVE_REJECT_WARNED:
+        _OGS_NATIVE_REJECT_WARNED = True
+        major, minor = compat._device_capability(device)
+        logger.warning(
+            f"Unsloth: triton_kernels {backend.api} cannot run MXFP4 expert matmuls on sm_{major}{minor}; "
+            "GPT OSS MXFP4 experts are "
+            "dequantized to bf16 per expert chunk (training and no-grad forward). Install triton_kernels "
+            "release/3.7.x or newer "
+            "for the native path."
+        )
+    return False
+
+
+def _ogs_native_inference_ok(device, backend):
+    """No-grad twin of ``_ogs_native_training_ok``."""
+    return _ogs_native_training_ok(device, backend)
+
+
+def _ogs_module_backend(module):
+    """The triton_kernels backend for ``module``, without decoding its weights."""
+    from unsloth_zoo.triton_kernels_compat import triton_kernels_backend_for
+    try:
+        return triton_kernels_backend_for(_triton_kernels_root(module))
+    except Exception:
+        return None
+
+
+def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_config):
+    """matmul_ogs gate_up on bf16 decodes: ``x[src // k] @ W[e] + b[e]``."""
+    k = routing_data.n_expts_act
+    rows = gather_idx.src_indx.long()
+    x = x.to(torch.bfloat16)
+    offsets = _ogs_expert_offsets(routing_data)
+    out = None
+    for first, last, dense in _ogs_dense_chunks(weight, precision_config, torch.bfloat16):
+        if out is None:
+            out = x.new_zeros((rows.shape[0], dense.shape[-1]))
+        for e in range(first, last):
+            lo, hi = offsets[e], offsets[e + 1]
+            if hi == lo:
+                continue
+            y = (x[rows[lo:hi] // k] @ dense[e - first]).float()
+            if bias is not None:
+                y = y + bias[e].float()
+            out[lo:hi] = y.to(out.dtype)
+        del dense
+    return out
+
+
+def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precision_config):
+    """matmul_ogs down on bf16 decodes: ``out[dst // k] += gamma * (h @ W[e] + b[e])``, summed without atomics."""
+    k = routing_data.n_expts_act
+    dst = scatter_idx.dst_indx.long()
+    h = h.to(torch.bfloat16)
+    offsets = _ogs_expert_offsets(routing_data)
+    slots = None
+    for first, last, dense in _ogs_dense_chunks(weight, precision_config, torch.bfloat16):
+        if slots is None:
+            slots = torch.zeros((dst.shape[0], dense.shape[-1]), dtype = torch.float32, device = h.device)
+        for e in range(first, last):
+            lo, hi = offsets[e], offsets[e + 1]
+            if hi == lo:
+                continue
+            y = (h[lo:hi] @ dense[e - first]).float()
+            if bias is not None:
+                y = y + bias[e].float()
+            if gammas is not None:
+                y = y * gammas[lo:hi].float().unsqueeze(-1)
+            where = dst[lo:hi]
+            keep = where >= 0
+            slots[where[keep]] = y[keep]
+        del dense
+    return slots.view(-1, k, slots.shape[-1]).sum(1).to(h.dtype)
+
+
 class _OgsGateUp(torch.autograd.Function):
     """Expert-sorted rows ``x[src // k] @ W[e] + b[e]`` via matmul_ogs; frozen MXFP4 ``W``."""
 
@@ -2579,9 +2668,13 @@ class _OgsGateUp(torch.autograd.Function):
     def forward(ctx, x, bias, module, routing_data, gather_idx):
         # One read: on the still-packed path each property access decodes the whole stack.
         weight = module.gate_up_proj
-        out = _ogs_backend_for(weight, routing_data, module).gate_up(
-            x.to(torch.bfloat16), weight, bias, routing_data, gather_idx, module.gate_up_proj_precision_config,
-        )
+        backend = _ogs_backend_for(weight, routing_data, module)
+        if _ogs_native_training_ok(x.device, backend):
+            out = backend.gate_up(
+                x.to(torch.bfloat16), weight, bias, routing_data, gather_idx, module.gate_up_proj_precision_config,
+            )
+        else:
+            out = _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, module.gate_up_proj_precision_config)
         ctx.module, ctx.routing_data, ctx.gather_idx = module, routing_data, gather_idx
         ctx.x_shape, ctx.x_dtype = x.shape, x.dtype
         return out
@@ -2626,10 +2719,17 @@ class _OgsDown(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h, gammas, bias, module, routing_data, scatter_idx):
         weight = module.down_proj
-        out = _ogs_backend_for(weight, routing_data, module).down(
-            h, weight, bias, routing_data, scatter_idx, module.down_proj_precision_config,
-            gammas = None if gammas is None else gammas.detach(),
-        )
+        backend = _ogs_backend_for(weight, routing_data, module)
+        if _ogs_native_training_ok(h.device, backend):
+            out = backend.down(
+                h, weight, bias, routing_data, scatter_idx, module.down_proj_precision_config,
+                gammas = None if gammas is None else gammas.detach(),
+            )
+        else:
+            out = _ogs_dequant_down(
+                h, None if gammas is None else gammas.detach(), weight, bias, routing_data, scatter_idx,
+                module.down_proj_precision_config,
+            )
         ctx.module, ctx.routing_data, ctx.scatter_idx = module, routing_data, scatter_idx
         ctx.h_dtype, ctx.bias = h.dtype, bias
         # h only feeds the routing-weight gradient.
@@ -2720,7 +2820,8 @@ def mxfp4_ogs_experts_forward(self, hidden_states, routing_data, gather_idx, sca
     pre_activation = _OgsGateUp.apply(hidden_states, self.gate_up_proj_bias, self, routing_data, gather_idx)
     if gate_up_lora is not None:
         first, second, scaling, _ = gate_up_lora
-        permuted = hidden_states[gather_idx.src_indx.long() // k].to(torch.bfloat16)
+        # The adapter's dtype, not bf16: fp16 adapters on T4 failed grouped_mm's same-dtype check.
+        permuted = hidden_states[gather_idx.src_indx.long() // k].to(first.dtype)
         pre_activation = pre_activation + _apply_lora_grouped_mm(
             permuted, first, second, _ogs_lora_offsets(routing_data), scaling,
             grouped_mm_func = native_moe_grouped_mm,
@@ -2730,7 +2831,7 @@ def mxfp4_ogs_experts_forward(self, hidden_states, routing_data, gather_idx, sca
     if down_lora is not None:
         first, second, scaling, _ = down_lora
         delta = _apply_lora_grouped_mm(
-            swiglu_output, first, second, _ogs_lora_offsets(routing_data), scaling,
+            swiglu_output.to(first.dtype), first, second, _ogs_lora_offsets(routing_data), scaling,
             grouped_mm_func = native_moe_grouped_mm,
         )
         dst = scatter_idx.dst_indx.long()
@@ -2779,6 +2880,7 @@ def forward_mxfp4_gpt_oss_with_lora(
         if (
             gate_up_lora is None and down_lora is None
             and not (torch.is_grad_enabled() and hidden_states.requires_grad)
+            and _ogs_native_inference_ok(hidden_states.device, _ogs_module_backend(self))
         ):
             out = self._original_forward(hidden_states, routing_data, gather_idx, scatter_idx)
         else:

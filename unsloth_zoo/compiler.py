@@ -2168,6 +2168,9 @@ def create_new_function(
             "except Exception:\n"
             "    pass\n"
         )
+    if "_bnb4bit_experts_forward_or_none" in new_source:
+        # The patched Qwen3-VL-MoE expert forwards call it first, before any weight check.
+        imports += "from unsloth_zoo.temporary_patches.qwen3_vl_moe import _bnb4bit_experts_forward_or_none\n"
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )

@@ -467,10 +467,12 @@ _ASM_OK = {}
 def _asm_ok(device, eager = False):
     """Decode mode (the kernels' ASM constexpr): 0 plain Triton, 1 inline-PTX bf16x2 fma decode (Kimi-K3 port, sm_80+
     CUDA; UNSLOTH_MXFP4_ASM=0 turns it off), 2 the hardware e2m1 convert where ``_cvt_ok`` passes."""
-    ok = _ASM_OK.get(device.index)
+    # May be a plain index: Dynamo cannot trace ``torch.device.__new__`` (hit on T4).
+    key = device if device is None or isinstance(device, int) else device.index
+    ok = _ASM_OK.get(key)
     if ok is None:
         import os
-        index = device.index if device.index is not None else torch.cuda.current_device()
+        index = key if key is not None else torch.cuda.current_device()
         ok = (
             torch.version.hip is None
             and torch.cuda.get_device_capability(index) >= (8, 0)
@@ -481,7 +483,7 @@ def _asm_ok(device, eager = False):
             if cvt is None:
                 return True  # traced before any eager call: decide (and cache) on the next eager launch
             ok = 2 if cvt else True
-        _ASM_OK[device.index] = ok
+        _ASM_OK[key] = ok
     return ok
 
 
@@ -490,6 +492,8 @@ def _cvt_ok(index, eager = False):
     so auto only enables sm_120. None = cannot probe here (inside a trace or a CUDA graph capture)."""
     import os
     mode = os.environ.get("UNSLOTH_MXFP4_CVT", "auto").strip().lower()
+    if torch.version.hip is not None:
+        return False  # inline PTX; ROCm reports gfx11 as capability 11.x
     major = torch.cuda.get_device_capability(index)[0]
     if mode == "0" or major < 10 or (mode != "1" and major != 12):
         return False
@@ -629,7 +633,27 @@ _assume_constant_result = getattr(torch.compiler, "assume_constant_result", None
 def _resolve_decode_mode(index):
     # Dynamo runs this eagerly on real tensors at trace time, so a cold compiled region bakes in the probed mode
     # instead of the fma fallback the op body (traced on FakeTensors) would see.
-    return _asm_ok(torch.device("cuda", index), eager = True)
+    # Pass the index so a traced call never constructs a torch.device.
+    return _asm_ok(index, eager = True)
+
+
+def _never_a_root_frame(fn):
+    """Never compile ``fn`` as its own frame. When the caller is skipped (sm_75 BF16 SkipFrame), its int arg turns
+    symbolic under ``dynamic=True`` and ``fullgraph`` raises."""
+    try:
+        from torch._dynamo.eval_frame import set_code_exec_strategy
+        from torch._dynamo.types import FrameAction, FrameExecStrategy
+        set_code_exec_strategy(fn.__code__, FrameExecStrategy(FrameAction.SKIP, FrameAction.SKIP))
+    except Exception:
+        try:
+            from torch._dynamo.eval_frame import skip_code
+            skip_code(fn.__code__)
+        except Exception:
+            pass
+    return fn
+
+
+_never_a_root_frame(_resolve_decode_mode)
 
 
 def mxfp4_grouped_mm_compiled(x, blocks, scales, counts, transpose_b):
