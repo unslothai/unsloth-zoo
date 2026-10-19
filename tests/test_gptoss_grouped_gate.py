@@ -32,6 +32,11 @@ try:
 except Exception as e:  # pragma: no cover - unsloth_zoo import needs an accelerator
     pytest.skip(f"cannot import unsloth_zoo gpt_oss patches: {e}", allow_module_level=True)
 
+from unsloth_zoo.stubs.bitsandbytes_stub import real_bitsandbytes_available
+
+if not real_bitsandbytes_available():
+    pytest.skip("bitsandbytes is the unsloth_zoo stub on this host", allow_module_level=True)
+
 
 _NF4_CODE = torch.linspace(-1, 1, 16)
 
