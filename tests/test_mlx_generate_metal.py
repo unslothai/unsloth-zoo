@@ -1685,6 +1685,23 @@ def test_tiled_qmm_shape_rule(M, N, loses):
 
 
 @real_mlx_only
+def test_tiled_prefill_probes_only_for_a_quantized_linear(monkeypatch):
+    from unsloth_zoo.mlx import inference
+
+    asked = []
+    monkeypatch.setattr(inference, "_tiled_prefill_enabled", lambda: asked.append(1) or False)
+    with inference.dense_prefill_linear(nn.Sequential(nn.Linear(64, 64)).eval()):
+        assert not asked
+    with inference.dense_prefill_linear(nn.Sequential(nn.QuantizedLinear(64, 64, group_size = 64, bits = 4)).eval()):
+        assert asked == [1]
+    linear = nn.QuantizedLinear(64, 64, group_size = 64, bits = 4).eval()
+    monkeypatch.setattr(inference, "_tiled_prefill_enabled", lambda: (_ for _ in ()).throw(KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        with inference.dense_prefill_linear(nn.Sequential(linear)):
+            pass
+    assert type(linear) is nn.QuantizedLinear and "_unsloth_dense_qmm_scopes" not in linear.__dict__
+
+
 def test_tiled_prefill_serves_wherever_stock_runs_no_nax(monkeypatch):
     from unsloth_zoo.mlx import inference, nax, qmm
 

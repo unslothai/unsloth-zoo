@@ -4112,7 +4112,7 @@ def dense_prefill_linear(model, *, _modules = None):
             if (os.environ.get("UNSLOTH_MLX_DENSE_PREFILL", "1") != "0"
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 fused = _dense_qmm_class(nn.QuantizedLinear.__call__)
-                tiled = _tiled_prefill_enabled()
+                tiled = None   # its probe waits for a linear it could serve
             if fused is not None:
                 seen = set()
                 for _, module in _fusion_modules(model, _modules):
@@ -4127,6 +4127,8 @@ def dense_prefill_linear(model, *, _modules = None):
                     elif module.training or type(module) is fused:
                         continue
                     else:
+                        if tiled is None:   # before this module changes, so an interrupted probe leaves none behind
+                            tiled = _tiled_prefill_enabled()
                         if type(module) is nn.QuantizedLinear:
                             module.__class__ = fused
                         module._unsloth_dense_qmm_scopes = 1
