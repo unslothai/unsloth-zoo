@@ -1110,3 +1110,23 @@ def test_frozen_head_entropy_gradient_keeps_fp32_recompute():
     lp, ent = fused_linear_logprobs(h, w, t, return_entropy = True)
     (lp.sum() + ent.sum()).backward()
     assert fl.CALLS["exact_top"] > exact
+
+
+@CUDA
+def test_ce_gradient_scale_is_not_rounded_to_half():
+    # p(target) ~ 0 (an untrained head): each row's largest gradient entry is ~ -1 / n_items. Written into the half
+    # buffer as such it rounds to half(1 / n) on every row; n = 255 puts that 0.39% off in bf16.
+    if not _half_ok("cuda"):
+        pytest.skip("needs bf16")
+    g = torch.Generator(device = "cpu").manual_seed(0)
+    N, H, V, n = 255, 64, 4096, 255
+    h = (torch.randn(N, H, generator = g) * 4).cuda().bfloat16().requires_grad_(True)
+    w = (torch.randn(V, H, generator = g) * 4).cuda().bfloat16()
+    t = torch.randint(0, V, (N,), generator = g).cuda()
+    loss = fused_linear_cross_entropy(h, w, None, t, divisor = n)
+    (got,) = torch.autograd.grad(loss, (h,))
+    h64 = h.detach().double().requires_grad_(True)
+    ref = torch.nn.functional.cross_entropy(h64 @ w.double().t(), t, reduction = "sum") / n
+    (want,) = torch.autograd.grad(ref, (h64,))
+    ratio = float(got.double().norm() / want.norm())
+    assert abs(ratio - 1.0) < 1e-3, ratio

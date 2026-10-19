@@ -991,6 +991,14 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
         w = weight.to(compute_dtype)
         buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
         coef = (scaling.to(**f32) / divisor.to(**f32)).reshape(())
+        ratio = None
+        if grad and compute_dtype in _HALF and (not need_w or acc_w.dtype == torch.float32):
+            # Early on p(target) ~ 0, so each row's largest gradient entry is ~ -coef: written into the half buffer it
+            # rounds to half(coef) on every row, a systematic scale error (up to 0.4% in bf16 with coef = 1 / n_items).
+            # The buffer takes a power of two instead (exact in any format) and the fp32 results take the rest; a half
+            # head-gradient accumulator keeps coef (rescaling its rounded sum would round it twice).
+            pow2 = torch.exp2(torch.round(torch.log2(coef)))
+            ratio, coef = coef / pow2, pow2
         lp_all = torch.empty(n_keep, **f32)
         lse_all = torch.empty(n_keep, **f32) if eps != 0.0 else None
         sum_all = torch.empty(n_keep, **f32) if eps != 0.0 else None
@@ -1013,6 +1021,8 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
                 if grad:
                     if need_h:
                         gh = _dz_w(dz, w)
+                        if ratio is not None:
+                            gh.mul_(ratio)
                         if n_keep == N:
                             grad_h[a:b].copy_(gh)
                         else:
@@ -1028,6 +1038,11 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
         else:
             nll = -lp_all.to(acc)
         loss = (nll.sum() / divisor.to(acc)).float()
+    if n_keep > 0 and ratio is not None:
+        if need_w:
+            acc_w.mul_(ratio)
+        if need_b:
+            acc_b.mul_(ratio)
     grad_w = acc_w.to(weight.dtype) if need_w else hidden.new_empty(0)
     grad_b = acc_b.to(bias.dtype) if need_b else hidden.new_empty(0)
     return loss, grad_h, grad_w, grad_b
