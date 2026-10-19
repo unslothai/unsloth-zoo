@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import sys
 
 import pytest
@@ -51,14 +52,24 @@ if mlx_is_simulated():
         allow_module_level = True,
     )
 
+from unsloth_zoo.mlx import nax
 from unsloth_zoo.mlx.attention import (
     _PATCH_FLAG,
     _PATCH_TARGETS,
+    _assert_rounding_close,
+    _fp32_prefill,
+    _probe_cases,
     dequantized_sdpa,
     dequantizing_is_smaller,
+    fast_prefill_supported,
     fused_kernel_exists,
     install_quantized_attention,
+    probe_fast_prefill,
+    probe_simd_prefill,
     quantized_sdpa_over,
+    select_blocks,
+    simd_prefill_attention,
+    simd_prefill_supported,
 )
 
 GS = 64
@@ -651,3 +662,84 @@ def test_qsa_wrapper_forwards_unknown_kwargs_outside_training():
     wrapped = attention._qsa_attention_training_over(dispatch)
     assert wrapped(*[None] * 5, cache=None, scale=1., block_size=4, causal=True,
                    mask=None, mask_factory=None, future_flag="kept") == "kept"
+
+
+def _stock_selection(scores, complete, topk):
+    # mlx-vlm 0.7.4 Qwen4ExpQSAIndexer.select_from_projected after the per-head scores, sorted.
+    blocks = mx.sum(mx.maximum(scores, 0), axis = 1) / math.sqrt(128)
+    blocks = mx.where(mx.arange(scores.shape[-1])[None, None] < complete[..., None], blocks, -mx.inf)
+    picks = mx.argpartition(blocks, kth = -topk, axis = -1)[..., -topk:].astype(mx.int32)
+    return mx.sort(mx.where(picks < complete[..., None], picks, -1), axis = -1)
+
+
+@pytest.mark.parametrize("kind", ["normal", "ties", "zeros", "nan", "negzero"])
+def test_qsa_block_selection_picks_argpartitions_set(kind):
+    mx.random.seed(len(kind))
+    for B, L, nb in [(1, 1, 1025), (1, 2, 70000), (2, 3, 4096), (1, 300, 1500), (1, 64, 40000)]:
+        scores = mx.random.normal((B, 4, L, nb))
+        draw = mx.random.uniform(shape = scores.shape)
+        scores = {"ties": mx.round(scores * 2) / 2, "zeros": mx.where(draw < 0.9, -1.0, scores),
+                  "nan": mx.where(draw < 0.001, mx.nan, scores), "negzero": mx.where(draw < 0.5, -0.0, scores),
+                  }.get(kind, scores)
+        # Rows straddle the top-k: some see fewer complete blocks than it, the rest more.
+        complete = mx.broadcast_to(nb - L + mx.arange(L, dtype = mx.int32), (B, L)) - (B * L > 3) * (nb - 600)
+        assert mx.array_equal(select_blocks(scores, complete, 512, 128), _stock_selection(scores, complete, 512)).item()
+
+
+def test_qsa_fast_prefill_matches_fp32_attention():
+    if not nax.nax_available():
+        pytest.skip("needs the neural accelerators")
+    probe_fast_prefill()
+
+
+@pytest.mark.parametrize("change", [None, "batch", "heads", "kv_heads", "width", "dtype", "topk", "block", "rows"])
+def test_qsa_fast_prefill_covers_only_the_measured_layout(change):
+    B, H, KV, D, L, topk, block, dtype = 1, 24, 2, 256, 64, 512, 4, mx.bfloat16
+    B, H, KV, D, L, topk, block, dtype = {
+        "batch": (2, H, KV, D, L, topk, block, dtype), "heads": (B, 12, KV, D, L, topk, block, dtype),
+        "kv_heads": (B, H, 4, D, L, topk, block, dtype), "width": (B, H, KV, 128, L, topk, block, dtype),
+        "dtype": (B, H, KV, D, L, topk, block, mx.float16), "topk": (B, H, KV, D, L, 256, block, dtype),
+        "block": (B, H, KV, D, L, topk, 8, dtype), "rows": (B, H, KV, D, 63, topk, block, dtype),
+    }.get(change, (B, H, KV, D, L, topk, block, dtype))
+    queries, keys = mx.zeros((B, H, L, D), dtype), mx.zeros((B, KV, 4096, D), dtype)
+    assert fast_prefill_supported(queries, keys, mx.zeros((B, L, topk), mx.int32), block) == (change is None)
+
+
+def test_qsa_prefill_reference_matches_mlx_vlm():
+    from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
+    for q, k, v, picks, ends in _probe_cases():
+        _assert_rounding_close(_fp32_prefill(q, k, v, picks, ends, 256 ** -0.5),
+                               qsa_sparse_attention(q, k, v, picks, ends, scale = 256 ** -0.5, block_size = 4),
+                               q.shape[2:3] + k.shape[2:3])
+
+
+def test_qsa_simd_prefill_matches_fp32_attention():
+    probe_simd_prefill()
+
+
+@pytest.mark.parametrize("heads, topk", [(4, 512), (32, 512), (24, 256)])
+def test_qsa_simd_prefill_matches_other_query_groups(heads, topk):
+    from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
+    L, N = 64, 2400
+    q = mx.random.normal((1, heads, L, 256), key = mx.random.key(1)).astype(mx.bfloat16)
+    k, v = (mx.random.normal((1, 2, N, 256), key = mx.random.key(i)).astype(mx.bfloat16) for i in (2, 3))
+    ends = mx.arange(N - L + 1, N + 1, dtype = mx.int32)[None]
+    picks = mx.argsort(mx.random.uniform(shape = (1, L, 584), key = mx.random.key(4)), axis = -1)[..., :topk]  # complete blocks
+    native = qsa_sparse_attention(q, k, v, picks, ends, scale = 0.0625, block_size = 4).astype(mx.float32)
+    got = simd_prefill_attention(q, k, v, picks, ends, 0.0625).astype(mx.float32)
+    assert mx.abs(got - native).max().item() <= 0.02 * mx.abs(native).max().item()
+
+
+@pytest.mark.parametrize("change", [None, "group", "topk", "batch", "uneven", "wide_group", "width", "dtype", "block",
+                                    "rows"])
+def test_qsa_simd_prefill_covers_query_groups_up_to_16(change):
+    B, H, KV, D, L, topk, block, dtype = {
+        "group": (1, 8, 1, 256, 64, 512, 4, mx.bfloat16), "topk": (1, 24, 2, 256, 64, 256, 4, mx.bfloat16),
+        "batch": (2, 24, 2, 256, 64, 512, 4, mx.bfloat16), "uneven": (1, 24, 5, 256, 64, 512, 4, mx.bfloat16),
+        "wide_group": (1, 34, 2, 256, 64, 512, 4, mx.bfloat16), "width": (1, 24, 2, 128, 64, 512, 4, mx.bfloat16),
+        "dtype": (1, 24, 2, 256, 64, 512, 4, mx.float16), "block": (1, 24, 2, 256, 64, 512, 8, mx.bfloat16),
+        "rows": (1, 24, 2, 256, 63, 512, 4, mx.bfloat16),
+    }.get(change, (1, 24, 2, 256, 64, 512, 4, mx.bfloat16))
+    queries, keys = mx.zeros((B, H, L, D), dtype), mx.zeros((B, KV, 4096, D), dtype)
+    covered = change in (None, "group", "topk")
+    assert simd_prefill_supported(queries, keys, mx.zeros((B, L, topk), mx.int32), block) == covered

@@ -449,8 +449,11 @@ def _recomputed_routes(layer_index, ids2, signature = None):
 
 
 def _softmax_gather(logits, ids, renorm):
-    w = F.softmax(logits.float(), dim = -1).gather(-1, ids)
-    return w / w.sum(dim = -1, keepdim = True) if renorm else w
+    if renorm:
+        # Equal to softmax over all experts gathered then renormalised, but without the 0 / 0 NaN
+        # when every forced expert underflows (forced logits far below the natural top-k).
+        return F.softmax(logits.float().gather(-1, ids), dim = -1)
+    return F.softmax(logits.float(), dim = -1).gather(-1, ids)
 
 
 def _probs_gather(probs, ids, renorm):

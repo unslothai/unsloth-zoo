@@ -326,9 +326,12 @@ class _DriverModel(torch.nn.Module):
         return __import__("types").SimpleNamespace(logits = hidden)
 
 
-def _drive(monkeypatch, correction, training = True, should_evaluate = False, loss_type = "dapo", is_mode = None, args_mode = None, use_vllm = True):
+def _drive(monkeypatch, correction, training = True, should_evaluate = False, loss_type = "dapo", is_mode = None, args_mode = None, use_vllm = True,
+           ratio = None, sampling_shift = 0.1, state = None):
     import collections
     import types
+
+    mask = _DRIVER_MASK
 
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
@@ -342,14 +345,19 @@ def _drive(monkeypatch, correction, training = True, should_evaluate = False, lo
         def apply(*args):
             zero = torch.zeros(())
             # What the real forward returns: empty when the IS correction is off, else ratio * mask.
-            ratio = _DRIVER_MASK.double() if correction else torch.tensor([])
-            return zero, zero, zero, zero, ratio, zero
+            out = (mask.double() if ratio is None else ratio) if correction else torch.tensor([])
+            return zero, zero, zero, zero, out, zero
 
     monkeypatch.setattr(rr, "UnslothEfficientGRPO", _Loss)
     model = _DriverModel()
     model.train(training)
     metrics = {"train": collections.defaultdict(list), "eval": collections.defaultdict(list)}
-    trainer = types.SimpleNamespace(
+    if state is not None and "trainer" in state:
+        trainer = state["trainer"]
+        metrics = trainer._metrics
+    else:
+        trainer = None
+    trainer = trainer or types.SimpleNamespace(
         args = types.SimpleNamespace(
             unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1, off_policy_mask_threshold = 0.5,
             vllm_importance_sampling_mode = args_mode,
@@ -367,11 +375,13 @@ def _drive(monkeypatch, correction, training = True, should_evaluate = False, lo
         beta = 0.0,
         loss_type = loss_type,
     )
-    logps = torch.zeros(_DRIVER_MASK.shape, dtype = torch.float64)
+    if state is not None:
+        state["trainer"] = trainer
+    logps = torch.zeros(mask.shape, dtype = torch.float64)
     rr.grpo_accumulated_loss(
-        trainer, _DRIVER_IDS, (_DRIVER_IDS != 0).long(), 3, _DRIVER_MASK,
+        trainer, _DRIVER_IDS, (_DRIVER_IDS != 0).long(), 3, mask,
         torch.zeros(_DRIVER_IDS.shape[0]), logps, None,
-        loss_type = loss_type, sampling_per_token_logps = logps - 0.1,
+        loss_type = loss_type, sampling_per_token_logps = logps - sampling_shift,
     )
     return metrics
 
@@ -441,3 +451,58 @@ def test_unknown_trl_is_mode_is_ignored_without_is_correction(monkeypatch, use_v
     _drive(monkeypatch, correction = correction, use_vllm = use_vllm, args_mode = "some_future_mode")
     with pytest.raises(ValueError, match = "importance sampling mode"):
         _drive(monkeypatch, correction = True, args_mode = "some_future_mode")
+
+
+@pytest.mark.parametrize("spec", ["1_1", "0.5_0.5", "2_2"])
+def test_is_clip_equal_bounds_are_rejected(spec):
+    # TRL GRPOConfig: vllm_importance_sampling_clip_min must be less than clip_max.
+    with pytest.raises(ValueError, match = "UNSLOTH_GRPO_VLLM_IS_CLIP"):
+        rr.grpo_parse_is_clip(spec, "token_truncate")
+    assert rr.grpo_parse_is_clip("0.99_1", "token_mask") == (0.99, 1.0)
+
+
+@pytest.mark.parametrize("gap", [25.0, 49.0, -30.0])
+def test_mismatch_k1_k3_are_not_clamped(gap):
+    # verl compute_offpolicy_metrics: kl = mean(rollout - old), k3_kl = mean(exp(lr) - lr - 1), no clamp.
+    old = torch.zeros(1, 4, dtype = torch.float64)
+    sampling = old - gap
+    mask = torch.tensor([[1, 1, 1, 0]])
+    got = rr.grpo_rollout_mismatch_metrics(rr.grpo_rollout_mismatch_stats(old, sampling, mask, torch.ones(1, 4, dtype = torch.float64)))
+    k3 = math.expm1(gap) - gap
+    assert got["sampling/rollout_kl_k1/mean"] == pytest.approx(-gap, rel = 1e-12)
+    assert got["sampling/rollout_kl_k3/mean"] == pytest.approx(k3, rel = 1e-12)
+    assert got["sampling/rollout_kl_k3/max"] == pytest.approx(k3, rel = 1e-12)
+
+
+def test_mismatch_stats_stay_finite_on_infinite_logps():
+    old = torch.zeros(1, 3, dtype = torch.float64)
+    sampling = torch.tensor([[0.0, -float("inf"), -1.0]], dtype = torch.float64)
+    stats = rr.grpo_rollout_mismatch_stats(old, sampling, torch.ones(1, 3, dtype = torch.long), torch.ones(1, 3, dtype = torch.float64))
+    assert torch.isfinite(stats).all()
+
+
+def test_mismatch_stats_stay_finite_on_many_saturated_tokens():
+    # Every token at +inf log ratio: the per token cap must leave the float64 K3 sum finite too.
+    n = 20000
+    old = torch.zeros(1, n, dtype = torch.float64)
+    sampling = torch.full((1, n), -float("inf"), dtype = torch.float64)
+    stats = rr.grpo_rollout_mismatch_stats(old, sampling, torch.ones(1, n, dtype = torch.long), torch.ones(1, n, dtype = torch.float64))
+    assert torch.isfinite(stats).all()
+
+
+def test_rollout_metrics_pool_micro_batches_until_log(monkeypatch):
+    # Docstring promise: sums pooled over micro-batches before dividing, not a mean of per-micro-batch ratios.
+    state = {}
+    skewed = torch.tensor([[2.0, 0, 0], [0, 0, 0]], dtype = torch.float64)
+    flat = torch.ones(2, 3, dtype = torch.float64)
+    first = _drive(monkeypatch, correction = True, ratio = skewed, state = state)["train"]
+    n = len(first) and first["sampling/importance_sampling_ess"][0]
+    metrics = _drive(monkeypatch, correction = True, ratio = flat, state = state)["train"]
+    tokens = 6  # tokens each micro-batch scores
+    want = (2 + tokens) ** 2 / (2 * tokens * (4 + tokens))
+    assert n == pytest.approx(4 / (tokens * 4), rel = 1e-12)
+    assert metrics["sampling/importance_sampling_ess"] == [pytest.approx(want, rel = 1e-12)]
+    # TRL log() clears the bucket: the next window starts from the next micro-batch alone.
+    metrics.clear()
+    metrics = _drive(monkeypatch, correction = True, ratio = flat, state = state)["train"]
+    assert metrics["sampling/importance_sampling_ess"] == [pytest.approx(1.0, rel = 1e-12)]

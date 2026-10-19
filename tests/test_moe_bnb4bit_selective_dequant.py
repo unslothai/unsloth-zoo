@@ -159,3 +159,32 @@ def test_plan_declines_unsplittable_or_plain_weights(monkeypatch):
     assert mu._selective_dequant_plan((plain,), counts, 2) is None
     odd = _quantized((E, 3, 7), False)   # 21 weights per expert: blocks straddle experts
     assert mu._selective_dequant_plan((odd,), counts, 2) is None
+
+
+def test_chunked_without_selective_skips_empty_chunks(monkeypatch):
+    # UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS alone covers every expert; chunks no token reaches used to
+    # be dequantized and multiplied with zero rows anyway.
+    torch.manual_seed(0)
+    experts = _Experts(False)
+    T = 16
+    hidden = torch.randn(T, H, dtype = torch.bfloat16, device = DEVICE)
+    pool = torch.tensor([0, 2, 5, 7], device = DEVICE)   # only chunks [0, 4) and [4, 8)
+    top_k_index = pool[torch.stack([torch.randperm(4, device = DEVICE)[:TOP_K] for _ in range(T)])]
+    top_k_weights = torch.rand(T, TOP_K, dtype = torch.bfloat16, device = DEVICE)
+    lora = {
+        "gate_up_proj": (torch.randn(E, H, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, 2 * I, device = DEVICE) * 0.1),
+        "down_proj": (torch.randn(E, I, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, H, device = DEVICE) * 0.1),
+    }
+    base_out, base_grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "4")
+    out, grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert torch.equal(out, base_out)
+    for got, want in zip(grads, base_grads):
+        assert torch.equal(got, want)
+    stats = mu.SELECTIVE_DEQUANT_STATS
+    # gate_up + down, forward and backward, two non-empty chunks of 4 experts each.
+    assert stats["dequant_calls"] == 4 * 2
+    assert stats["experts_dequantized"] == 4 * 8
+
+    sources = (experts.gate_up_proj, experts.down_proj)
+    assert mu._selective_dequant_plan(sources, torch.zeros(E, dtype = torch.int32, device = DEVICE), 0) is None

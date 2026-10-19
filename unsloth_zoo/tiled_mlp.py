@@ -289,9 +289,22 @@ except Exception:
     _HAS_MODULE_TREE_VERSION = False
 pass
 
+try:
+    from torch.compiler import is_compiling as _is_compiling
+except Exception:
+    try: from torch._dynamo import is_compiling as _is_compiling
+    except Exception: _is_compiling = lambda: False
+pass
+
 def _mlp_needs_rng_state(mlp_module):
     # Per forward, not at patch time: unsloth patches before get_peft_model adds lora_dropout,
     # so a patch time scan missed it and the recompute drew different masks (wrong grads).
+    if _is_compiling():
+        # Traced: scan directly. Refreshing the cache would create weakrefs (unsupported under
+        # fullgraph=True) and guard every graph on the process-wide tree version.
+        return any(
+            m.training and m.p > 0 for m in mlp_module.modules() if isinstance(m, _DROPOUT_TYPES)
+        )
     cached = mlp_module.__dict__.get("_unsloth_tiled_dropouts")
     # id check: a deepcopy carries the cache but its subtree is not tracked yet.
     if cached is None or not _HAS_MODULE_TREE_VERSION or \
