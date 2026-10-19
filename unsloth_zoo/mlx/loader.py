@@ -161,6 +161,32 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     mx.eval(model.parameters())
 
 
+_OFFLOAD_CACHE_LIMIT = 1 << 30
+_offload_cache_cap = {"models": 0, "previous": None, "applied": None}
+
+
+def _cap_cache_while_alive(model) -> None:
+    """Cap MLX's buffer cache while ``model`` lives: offloaded reads free buffers of ever-changing
+    sizes, which the cache would keep until the memory limit."""
+    import mlx.core as mx
+
+    cap = _offload_cache_cap
+    if not cap["models"]:
+        cap["previous"] = mx.set_cache_limit(_OFFLOAD_CACHE_LIMIT)
+        cap["applied"] = min(cap["previous"], _OFFLOAD_CACHE_LIMIT)
+        mx.set_cache_limit(cap["applied"])
+    cap["models"] += 1
+
+    def release():
+        cap["models"] -= 1
+        if not cap["models"]:
+            current = mx.set_cache_limit(cap["previous"])
+            if current != cap["applied"]:  # set by someone else since: theirs stays
+                mx.set_cache_limit(current)
+
+    weakref.finalize(model, release)
+
+
 def _apply_offload(model, model_dir, ple_offload, expert_offload, target_dtype) -> None:
     """Swap the still-lazy PLE tables and routed experts for ones read from ``model_dir``'s shards."""
     from .offload import offload_experts, offload_ple
@@ -188,6 +214,7 @@ def _apply_offload(model, model_dir, ple_offload, expert_offload, target_dtype) 
         reports[key] = report
     if reports:
         model._unsloth_offload = reports
+        _cap_cache_while_alive(model)
 
 
 def _refuse_offload_runtime_quant(offloading, want_runtime_quant) -> None:

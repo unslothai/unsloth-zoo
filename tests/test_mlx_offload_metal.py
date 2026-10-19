@@ -16,6 +16,7 @@
 
 """PLE and expert offload: weights read from the checkpoint compute the stock modules' outputs, bit for bit."""
 
+import gc
 import os
 
 import numpy as np
@@ -31,7 +32,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map
 
-from unsloth_zoo.mlx.loader import FastMLXModel, _convert_mlx_dtype, _mlx_save_pretrained_merged
+from unsloth_zoo.mlx.loader import FastMLXModel, _apply_offload, _convert_mlx_dtype, _mlx_save_pretrained_merged
 from unsloth_zoo.mlx.offload import DiskEmbedding, OffloadSwitchGLU, offload_experts, offload_fraction, offload_ple
 
 
@@ -92,6 +93,12 @@ def _holder(name, module):
 
 def _site(model, name):
     return getattr(model.language_model.model, name)
+
+
+def _cache_limit():
+    limit = mx.set_cache_limit(0)
+    mx.set_cache_limit(limit)
+    return limit
 
 
 def _bits(array):
@@ -296,6 +303,43 @@ def test_offload_controls_and_refusals(tmp_path):
     model.layers[0].top_k = 12  # the slots hold at least one token's routes
     offload_experts(model, str(top_12), 1.0)
     assert model.layers[0].switch_mlp._slots.capacity == 12
+
+    # An offloaded load caps MLX's buffer cache at 1 GiB (keeping a lower limit) while it lives;
+    # one that offloads nothing leaves it alone.
+    previous = mx.set_cache_limit(4 << 30)
+    try:
+        for limit, capped in ((4 << 30, 1 << 30), (512 << 20, 512 << 20)):
+            mx.set_cache_limit(limit)
+            models = [_lazy_copy(lambda: _moe("lm"), str(top_12)) for _ in range(2)]
+            for offloaded in models:
+                _apply_offload(offloaded, str(top_12), None, 1.0, None)
+            del offloaded
+            assert _cache_limit() == capped
+            del models[0]
+            gc.collect()
+            assert _cache_limit() == capped
+            del models[0]
+            gc.collect()
+            assert _cache_limit() == limit
+        mx.set_cache_limit(4 << 30)
+        ple = _lazy_copy(lambda: _holder("embed_tokens_per_layer", nn.Embedding(16, 8)), str(tmp_path))
+        _apply_offload(ple, str(tmp_path), 1.0, None, None)
+        assert _cache_limit() == 1 << 30
+        del ple
+        gc.collect()
+        model = _lazy_copy(lambda: _moe("lm", quantized = False), str(dense))
+        _apply_offload(model, str(dense), None, 1.0, None)
+        assert _cache_limit() == 4 << 30
+        # A limit set since the cap, lower or higher, stays when the model goes.
+        for newer in (256 << 20, 2 << 30):
+            ple = _lazy_copy(lambda: _holder("embed_tokens_per_layer", nn.Embedding(16, 8)), str(tmp_path))
+            _apply_offload(ple, str(tmp_path), 1.0, None, None)
+            mx.set_cache_limit(newer)
+            del ple
+            gc.collect()
+            assert _cache_limit() == newer
+    finally:
+        mx.set_cache_limit(previous)
 
     model = _lazy_copy(lambda: _holder("embed_tokens_per_layer", nn.Embedding(16, 8)), str(tmp_path))
     model.update(tree_map(lambda value: value.astype(mx.bfloat16), model.parameters()))
