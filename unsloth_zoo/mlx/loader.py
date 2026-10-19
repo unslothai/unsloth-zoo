@@ -3320,9 +3320,20 @@ def _mlx_vlm_only_text_model(config: dict, model_type: str) -> bool:
         spec = importlib.util.find_spec(f"mlx_lm.models.{module_name}")
     except (ImportError, ValueError):
         return False
-    if spec is not None:
+    if spec is not None and not _mlx_lm_refuses_config(module_name, config):
         return False
     return _resolve_mlx_vlm_model_class(model_type) is not None
+
+
+def _mlx_lm_refuses_config(module_name, config):
+    """Whether mlx_lm's model arguments refuse ``config``, as its DeepSeek V4.1 refuses Engram layers."""
+    try:
+        importlib.import_module(f"mlx_lm.models.{module_name}").ModelArgs.from_dict(config)
+    except ValueError:
+        return True
+    except (Exception, SystemExit):
+        return False
+    return False
 
 
 class _NativeVLMWeightSanitizer:

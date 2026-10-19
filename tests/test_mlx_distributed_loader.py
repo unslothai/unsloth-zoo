@@ -120,6 +120,10 @@ def test_vlm_only_text_routing_checks_remapped_module_presence(monkeypatch):
     assert seen == ["mlx_lm.models.remapped"]
     monkeypatch.setattr(loader.importlib.util, "find_spec", lambda _: object())
     assert not loader._mlx_vlm_only_text_model({"model_type": "alias"}, "alias")
+    for error, routed in ((ValueError("engram layers"), True), (TypeError("missing field"), False), (None, False)):
+        args = types.SimpleNamespace(from_dict = lambda config, error = error: error and (_ for _ in ()).throw(error))
+        monkeypatch.setattr(loader.importlib, "import_module", lambda name: types.SimpleNamespace(ModelArgs = args))
+        assert loader._mlx_vlm_only_text_model({"model_type": "alias"}, "alias") is routed
     monkeypatch.setattr(loader.importlib.util, "find_spec", lambda _: None)
     monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: None)
     assert not loader._mlx_vlm_only_text_model({"model_type": "absent"}, "absent")
