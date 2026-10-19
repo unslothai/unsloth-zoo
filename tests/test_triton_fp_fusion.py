@@ -29,6 +29,7 @@ ZOO = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
 # Subscript calls that are not Triton launches.
 _NOT_LAUNCHES = {
+    "fused_losses/fused_linear.py": {"_OPS"},
     "temporary_patches/gpt_oss.py": {"self.gate_up_projs", "self.down_projs"},
     "temporary_patches/moe_grouped_modulelist.py": {"spec"},
     "temporary_patches/moe_utils.py": {"registry"},

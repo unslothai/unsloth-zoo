@@ -156,24 +156,22 @@ def _old(*args, **kwargs):
 
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("transform", [(0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 30.0, 0.7), (1.5, 2.0, 0.0, 1.2)], ids = str)
-def test_grpo_route_gradient_equals_old_function(monkeypatch, bias, transform):
-    # The pre-fused-linear engine, kept behind UNSLOTH_FUSED_LINEAR=0 (tests/test_fused_linear_routing.py covers the default).
+def test_grpo_kill_switch_gradient_is_the_old_function(monkeypatch, bias, transform):
+    # UNSLOTH_FUSED_LINEAR=0 scores grad calls with the old function too, so the policy pass and its old / reference
+    # log-probs share one scorer (tests/test_fused_linear_routing.py covers the default).
     monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     states, weight, b, index, upstream = _inputs(shape = (4, 9), bias = bias, seed = 1)
     calls = []
     real = cl.UnslothChunkedLogProbs.apply
-    def counting(*a):
-        calls.append(1)
-        return real(*a)
-    cl.UnslothChunkedLogProbs.apply = counting
+    cl.UnslothChunkedLogProbs.apply = lambda *a: calls.append(1) or real(*a)
     try:
         got = _grads(lambda: rr.grpo_chunked_hidden_states_logprobs(states, weight, index, 8, *transform, lm_head_bias = b),
                      states, weight, b, index, upstream)
     finally:
         cl.UnslothChunkedLogProbs.apply = real
-    assert len(calls) == 1, "the gradient path did not reach the recompute kernel"
+    assert not calls
     ref = _grads(lambda: _old(states, weight, index, 8, *transform, lm_head_bias = b), states, weight, b, index, upstream)
-    _assert_close(got, ref, atol = 1e-5)
+    _assert_close(got, ref, atol = 0)
 
 
 def test_grpo_route_no_grad_is_the_old_function_bitwise(monkeypatch):
@@ -209,20 +207,17 @@ def test_grpo_route_kill_switch(monkeypatch):
     _assert_close(got, ref, atol = 0)
 
 
-def test_grpo_route_honours_max_rows_per_chunk(monkeypatch):
-    # The pre-fused-linear engine, kept behind UNSLOTH_FUSED_LINEAR=0 (tests/test_fused_linear_routing.py covers the default).
+def test_grpo_kill_switch_passes_max_rows_per_chunk(monkeypatch):
     monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     seen = []
-    real = cl.UnslothChunkedLogProbs.apply
-    def spy(*a):
-        seen.append(a[4])
-        return real(*a)
-    monkeypatch.setattr(cl.UnslothChunkedLogProbs, "apply", spy)
+    real = rr.chunked_hidden_states_selective_log_softmax
+    monkeypatch.setattr(rr, "chunked_hidden_states_selective_log_softmax",
+                        lambda *a, **k: seen.append(k.get("max_rows_per_chunk")) or real(*a, **k))
     states, weight, _, index, _ = _inputs()
     rr.grpo_chunked_hidden_states_logprobs(states, weight, index, 4, max_rows_per_chunk = 3)
-    monkeypatch.setenv("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "5")
     rr.grpo_chunked_hidden_states_logprobs(states, weight, index, 4)
-    assert seen == [3, 5]
+    # Unset, the old function keeps its own import-time UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK default.
+    assert seen == [3, None]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "the fp32-output GEMM path only runs on a GPU")

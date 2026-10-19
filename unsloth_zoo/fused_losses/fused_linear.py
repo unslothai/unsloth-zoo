@@ -143,6 +143,11 @@ def fused_linear_rows(n_rows, hidden_size, vocab_size, bytes_per_logit = 4, devi
     return max(min(rows, max(n_rows, 1)), 1)
 
 
+def _bytes_per_logit(fp32_logits, compute_dtype):
+    # Element size of the logits buffer: fp32 logits, else the compute dtype (fp32 / fp64 for an fp32 / fp64 head).
+    return 4 if fp32_logits else compute_dtype.itemsize
+
+
 def _chunk_rows(rows, n_rows, hidden_size, vocab_size, bytes_per_logit, device):
     # rows > 0 sets the chunk, rows < 0 caps the automatic one at -rows, 0 is automatic.
     if rows > 0:
@@ -668,6 +673,10 @@ def _project(h, w, buf, n, fp32_logits):
 def _dz_w(dz, w):
     """dz[n, V] @ w[V, H] with an fp32 result rounded once."""
     V8 = _aligned(w.shape[0])
+    if V8 < w.shape[0] and dz.is_cuda and dz.dtype == torch.float16 and (_IS_HIP or not _fp32_out_ok(dz.device, dz.dtype)):
+        # Half GEMM fallback: the aligned columns' fp16 partial can pass 65504 before the left-over columns cancel it,
+        # so take one GEMM over the whole vocabulary, rounded once.
+        return (dz @ w).float()
     out = _mm_fp32(dz[:, :V8], w[:V8])
     if V8 < w.shape[0]:
         _addmm_fp32(out, dz[:, V8:], w[V8:])
@@ -700,6 +709,14 @@ def _exact_target(h, w, bias, tgt):
     return x
 
 
+def _u_dtype(hidden_dtype):
+    # d logp / d hidden (frozen head) is a unit derivative, stored before the incoming (GradScaler-scaled) gradient
+    # exists: in fp16 its small entries flush to zero (a confident token's whole row), so fp16 keeps it in fp32.
+    if hidden_dtype == torch.float16 or (_U_FP32 and hidden_dtype in _HALF):
+        return torch.float32
+    return hidden_dtype
+
+
 def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write_grad, outs = None):
     """Statistics of a chunk of raw logits x [n, V]; with write_grad also writes dz into dz_out (may alias x).
     `outs` optionally gives contiguous [n] destinations per statistic, written directly by the kernel."""
@@ -728,14 +745,14 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
             scal = (float(inv_t), float(scale), float(cap) if cap != 0.0 else 1.0)
             _fl_partial_kernel[(n, splits)](
                 x, x.stride(0), V, n, _SPLIT_COLS, splits * n, 0, 0, bias if bias is not None else lse, tgt, part,
-                *scal, WANT_TGT = False, BLOCK = _split_block(), num_warps = 4, **flags,
+                *scal, WANT_TGT = False, BLOCK = _split_block(), num_warps = 4, enable_fp_fusion = True, **flags,
             )
             _fl_combine_kernel[(n,)](
                 x, x.stride(0), V, n, splits, splits * n, _SPLIT_COLS, part,
                 tgt, exact if exact is not None else lse, bias if bias is not None else lse,
                 logp, lse, ent, tot, lssp, top1, *scal,
                 HAS_EXACT = exact is not None, HAS_TGT = False, SPLITS = max(triton.next_power_of_2(splits), 2),
-                num_warps = 1, **flags,
+                num_warps = 1, enable_fp_fusion = True, **flags,
             )
 
         def run():
@@ -749,15 +766,19 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
                 HAS_BIAS = bias is not None, HAS_SCALE = scale != 1.0, HAS_CAP = cap != 0.0,
                 HAS_EXACT = exact is not None,
                 WANT_ENT = want_ent, WANT_SUM = want_sum, WANT_LSSP = want_lssp, WANT_TOP1 = want_top1,
-                BLOCK = block, num_warps = 8,
+                BLOCK = block, num_warps = 8, enable_fp_fusion = True,
             )
         _launch(device, run)
         CALLS["triton"] += 1
         out = {"logp": logp, "lse": lse}
-        if want_ent: out["ent"] = ent
-        if want_sum: out["sum"] = tot
-        if want_lssp: out["lssp"] = lssp
-        if want_top1: out["top1"] = top1
+        if want_ent:
+            out["ent"] = ent
+        if want_sum:
+            out["sum"] = tot
+        if want_lssp:
+            out["lssp"] = lssp
+        if want_top1:
+            out["top1"] = top1
         dz = None
         if write_grad:
             # dz = coef * (p - keep onehot - each): the gradient kernel with the scalar g = -coef.
@@ -787,9 +808,11 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
     N, H = hidden.shape
     V = w.shape[0]
     f32 = dict(device = device, dtype = torch.float32)
-    bpl = 4 if fp32_logits else 2
-    R = max(min(_BWD_ROWS, n_keep, cap_rows if cap_rows > 0 else n_keep), 1)
-    tile = max(_BWD_TILE_BYTES // max(R * bpl, 1), _SPLIT_COLS)
+    bpl = _bytes_per_logit(fp32_logits, compute_dtype)
+    # The tile allowance, within the device budget (half the free memory) as every other chunk.
+    budget = min(_BWD_TILE_BYTES, _budget_bytes(device))
+    R = max(min(_BWD_ROWS, n_keep, cap_rows if cap_rows > 0 else n_keep, budget // (_SPLIT_COLS * bpl)), 1)
+    tile = max(budget // max(R * bpl, 1), _SPLIT_COLS)
     tile = min(tile - tile % _SPLIT_COLS, -(-V // _SPLIT_COLS) * _SPLIT_COLS)
     splits = -(-V // _SPLIT_COLS)
     buf = _Buffers(R, tile, device, fp32_logits, compute_dtype)
@@ -811,7 +834,7 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
                 _fl_partial_kernel[(n, -(-(last - first) // _SPLIT_COLS))](
                     x, x.stride(0), last - first, n, _SPLIT_COLS, splits * n, first, first // _SPLIT_COLS,
                     bias_t if bias_t is not None else part, t, part, *scal,
-                    WANT_TGT = True, BLOCK = _split_block(), num_warps = 4, **flags,
+                    WANT_TGT = True, BLOCK = _split_block(), num_warps = 4, enable_fp_fusion = True, **flags,
                 )
             _launch(device, run)
         exact = _exact_target(h, w, bias, t) if exact_mode else None
@@ -824,7 +847,7 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
                 t, exact if exact is not None else lse, lse,
                 o["logp"], lse, o.get("ent", lse), o.get("sum", lse), o.get("lssp", lse), o.get("top1", o["logp"]),
                 *scal, HAS_EXACT = exact is not None, HAS_TGT = True,
-                SPLITS = max(triton.next_power_of_2(splits), 2), num_warps = 1, **flags,
+                SPLITS = max(triton.next_power_of_2(splits), 2), num_warps = 1, enable_fp_fusion = True, **flags,
             )
         _launch(device, run)
         CALLS["triton"] += 1
@@ -848,7 +871,7 @@ def _row_backward(device, x, dz_out, tgt, bias_slice, lse, ent, g, ge, scalars, 
                 float(inv_t), float(scale), float(cap) if cap != 0.0 else 1.0, float(smooth_keep), float(smooth_each),
                 HAS_BIAS = bias_slice is not None, HAS_SCALE = scale != 1.0, HAS_CAP = cap != 0.0,
                 HAS_ENT_GRAD = ge is not None, ALIASED = dz_out.dtype != x.dtype, BLOCK = block,
-                num_warps = _num_warps(),
+                num_warps = _num_warps(), enable_fp_fusion = True,
             )
         _launch(device, run)
         CALLS["triton"] += 1
@@ -941,14 +964,16 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
     full_bias = None
     if bias is not None or logits_bias is not None:
         full_bias = torch.zeros(V, **f32)
-        if bias is not None: full_bias += bias.float()
-        if logits_bias is not None: full_bias += logits_bias.float()
+        if bias is not None:
+            full_bias += bias.float()
+        if logits_bias is not None:
+            full_bias += logits_bias.float()
     if n_keep > 0:
         grad = need_h or need_w or need_b
         fp32_logits, exact_mode = _logits_mode(device, compute_dtype)
         if compute_dtype not in _HALF:
             fp32_logits, exact_mode = False, False
-        R = _chunk_rows(rows, n_keep, H, V, 4 if fp32_logits else 2, device)
+        R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         w = weight.to(compute_dtype)
         buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
@@ -976,8 +1001,10 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
                 if grad:
                     if need_h:
                         gh = _dz_w(dz, w)
-                        if n_keep == N: grad_h[a:b].copy_(gh)
-                        else: grad_h.index_copy_(0, idx[a:b], gh.to(grad_h.dtype))
+                        if n_keep == N:
+                            grad_h[a:b].copy_(gh)
+                        else:
+                            grad_h.index_copy_(0, idx[a:b], gh.to(grad_h.dtype))
                     if need_w:
                         _dz_t_h(acc_w, dz, h)
                     if need_b:
@@ -1012,7 +1039,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
     lssp = torch.zeros(N, **f32) if want_lssp else logps.new_empty(0)
     top1 = torch.zeros(N, device = device, dtype = torch.bool) if want_top1 else torch.empty(0, device = device,
                                                                                                dtype = torch.bool)
-    u_dtype = torch.float32 if _U_FP32 and hidden.dtype in _HALF else hidden.dtype
+    u_dtype = _u_dtype(hidden.dtype)
     u = torch.zeros((N, H), device = device, dtype = u_dtype) if want_u else hidden.new_empty(0)
     inv_t, scale, cap = _scalars(temperature, mul, div, cap)
     if n_keep > 0:
@@ -1043,10 +1070,16 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                     if dst[key] is not None:
                         out.index_copy_(0, idx, dst[key])
             return logps, ent, mean, lssp, top1, u, lse
-        R = _chunk_rows(rows, n_keep, H, V, 4 if fp32_logits else 2, device)
+        R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
-        coef = torch.full((), -1.0, **f32)
+        # fp16: a confident token's onehot - p (~1e-8) flushes to 0 in the half gradient buffer before any incoming
+        # (GradScaler-scaled) gradient exists, so it is written times a power of two (|dz| <= inv_t * |scale|) and
+        # divided back out of the fp32 GEMM result, exactly.
+        u_scale = 1.0
+        if want_u and compute_dtype == torch.float16:
+            u_scale = 2.0 ** max(math.floor(math.log2(16384.0 / max(abs(inv_t * scale), 1e-30))), 0)
+        coef = torch.full((), -u_scale, **f32)
         with torch.autocast(device.type, enabled = False):
             for a in range(0, n_keep, R):
                 b = min(a + R, n_keep)
@@ -1075,7 +1108,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                     if on and (direct is None or key == "sum"):
                         put(dst, st[key] / V if key == "sum" else st[key])
                 if want_u:
-                    put(u, _dz_w(dz, w))
+                    put(u, _dz_w(dz, w) if u_scale == 1.0 else _dz_w(dz, w).div_(u_scale))
     return logps, ent, mean, lssp, top1, u, lse
 
 
@@ -1100,18 +1133,21 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, tem
     fp32_logits, _ = _logits_mode(device, compute_dtype)
     if compute_dtype not in _HALF or not _RECOMPUTE_FP32:
         fp32_logits = False
-    bpl = 4 if fp32_logits else 2
+    bpl = _bytes_per_logit(fp32_logits, compute_dtype)
+    budget = min(_BWD_TILE_BYTES, _budget_bytes(device))
     w = weight.to(compute_dtype)
     # Tiles of up to 4096 rows x a vocab tile (UNSLOTH_FUSED_LINEAR_BWD_TILE_MB), as TRL: the head gradient then
     # accumulates over K = rows per GEMM (512-row chunks re-read a whole fp32 slice accumulator 16x per 8k tokens,
     # 2.5x TRL's dW time) and the hidden gradient over K = tile columns.
     # rows < 0 (max_rows_per_chunk) caps the tile rows, as in forward.
     R = max(min(rows if rows > 0 else (min(_BWD_ROWS, -rows) if rows < 0 else _BWD_ROWS), n_keep), 1)
-    tile = _BWD_TILE_BYTES // max(R * bpl, 1)
+    if rows <= 0:
+        R = min(R, max(budget // (min(V, 256) * bpl), 1))
+    tile = budget // max(R * bpl, 1)
     if need_w:
-        tile = min(tile, _BWD_TILE_BYTES // (4 * H))  # the per-tile fp32 head-gradient accumulator, same budget
-    tile = max(tile, 256)
-    tile = min(V, tile - tile % 256)
+        tile = min(tile, budget // (4 * H))  # the per-tile fp32 head-gradient accumulator, same budget
+    tile = max(tile, 8)
+    tile = min(V, tile - tile % (256 if tile >= 256 else 8))
     buf = _Buffers(R, tile, device, fp32_logits, compute_dtype)
     gather = (lambda v, a, b: v[a:b]) if n_keep == N else (lambda v, a, b: v.index_select(0, idx[a:b]))
     acc_b = torch.zeros(V, **f32) if need_b else None
@@ -1130,11 +1166,16 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, tem
         return dz
 
     def put_h(a, b, gh):
-        if n_keep == N: grad_h[a:b].copy_(gh)
-        else: grad_h.index_copy_(0, idx[a:b], gh.to(grad_h.dtype))
+        if n_keep == N:
+            grad_h[a:b].copy_(gh)
+        else:
+            grad_h.index_copy_(0, idx[a:b], gh.to(grad_h.dtype))
 
+    # Vocab-major holds an fp32 [rows, H] hidden-gradient accumulator; past `vocab` rows (long contexts, small vocab)
+    # the row-major loop's fp32 [V, H] head-gradient accumulator is the smaller one.
+    head_acc = torch.zeros((V, H), **f32) if (need_w and need_h and n_keep > V) else None
     with torch.autocast(device.type, enabled = False):
-        if need_w:
+        if need_w and head_acc is None:
             # Vocab-major: each fp32 head-gradient tile is finished over every row before it is cast into place.
             acc_h = torch.zeros((n_keep, H), **f32) if need_h else None
             for first in range(0, V, tile):
@@ -1162,6 +1203,8 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, tem
                 for first in range(0, V, tile):
                     last = min(first + tile, V)
                     dz = tile_grad(h, a, b, first, last)
+                    if head_acc is not None:
+                        _dz_t_h(head_acc[first:last], dz, h)
                     if not need_h:
                         continue
                     if acc_h is None:
@@ -1170,6 +1213,8 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, tem
                         _dz_w_acc(acc_h[: b - a], dz, w[first:last])
                 if acc_h is not None:
                     put_h(a, b, acc_h[: b - a])
+            if head_acc is not None:
+                grad_w.copy_(head_acc)
     if acc_b is not None:
         grad_b.copy_(acc_b)
     return grad_h, grad_w, grad_b
@@ -1218,7 +1263,9 @@ if _OPS is None:
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32  # MPS: no fp64
         s = grad_loss.to(acc) / scaling.to(acc)
         need_h, need_w, need_b = ctx.need
-        scale = lambda x: torch.ops.unsloth_zoo.fused_linear_scale_rows(x, s, x.dtype)
+        def scale(x):
+            return torch.ops.unsloth_zoo.fused_linear_scale_rows(x, s, x.dtype)
+
         out_h = scale(grad_h) if need_h else None
         out_w = scale(grad_w) if need_w else None
         out_b = scale(grad_b) if need_b else None
@@ -1244,7 +1291,7 @@ if _OPS is None:
         N = hidden.shape[0]
         f32 = dict(device = weight.device, dtype = torch.float32)
         e = lambda: torch.empty(0, **f32)  # noqa: E731  (a fresh one per slot: outputs must not alias)
-        u_dtype = torch.float32 if _U_FP32 and hidden.dtype in _HALF else hidden.dtype
+        u_dtype = _u_dtype(hidden.dtype)
         return (
             torch.empty(N, **f32),
             torch.empty(N, **f32) if want_ent else e(),
@@ -1327,8 +1374,19 @@ if _OPS is None:
     _OPS = {}
     torch._unsloth_fused_linear_ops = _OPS
 
+def _ce_checked(hidden, weight, bias, targets, divisor, scaling, ignore_index, *args):
+    # A non-ignored target outside the head raises as F.cross_entropy does (it would otherwise drop out of the sum
+    # but stay in the caller's divisor). Inside the op, so a compiled caller does not graph-break on the check.
+    V = weight.shape[0]
+    bad = (targets != ignore_index) & ((targets < 0) | (targets >= V))
+    if bool(bad.any()):
+        raise IndexError(f"Unsloth: cross entropy target {int(targets[bad][0])} is out of bounds for a vocabulary "
+                         f"of {V} (ignore_index = {ignore_index}).")
+    return _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, *args)
+
+
 # Bodies are looked up at call time, so a reloaded module serves the registered ops with its own code.
-_OPS["ce_impl"] = _ce_impl
+_OPS["ce_impl"] = _ce_checked
 _OPS["lp_impl"] = _logprobs_impl
 _OPS["lp_bwd_impl"] = _logprobs_bwd_impl
 
@@ -1349,19 +1407,22 @@ def _scale_rows_impl(u, g, dtype):
         def run():
             _fl_scale_kernel[(triton.cdiv(n, block),)](
                 u, g, out, n, max(n // max(u.shape[0], 1), 1) if u.dim() > 1 else 1, PER_ROW = not one,
-                BLOCK = block, num_warps = 8,
+                BLOCK = block, num_warps = 8, enable_fp_fusion = True,
             )
-        try:
-            _launch(u.device, run)
-            return out
-        except torch.OutOfMemoryError:
-            raise
-        except Exception as e:
-            if type(e).__module__.startswith("torch._dynamo"):
+        err = None
+        for _ in range(2):  # as _guarded: one transient JIT failure must not disable Triton for the process
+            try:
+                _launch(u.device, run)
+                return out
+            except torch.OutOfMemoryError:
                 raise
-            _TRITON_BROKEN.add(u.device)
-            warnings.warn(f"Unsloth: fused linear Triton kernel failed on {u.device} ({type(e).__name__}: {e}); "
-                          f"using the torch path.", stacklevel = 2)
+            except Exception as e:
+                if type(e).__module__.startswith("torch._dynamo"):
+                    raise
+                err = e
+        _TRITON_BROKEN.add(u.device)
+        warnings.warn(f"Unsloth: fused linear Triton kernel failed on {u.device} ({type(err).__name__}: {err}); "
+                      f"using the torch path.", stacklevel = 2)
     u2, out2 = (u.reshape(-1, 1), out.reshape(-1, 1)) if u.dim() == 1 else (u, out)
     step = 8192
     for a in range(0, u2.shape[0], step):
@@ -1394,6 +1455,16 @@ def _requires_grad(x):
     return x is not None and x.requires_grad
 
 
+def _head_bias(bias, weight):
+    # One entry per head row, flattened ([1, V] too) and on the head's device outside the op, so autograd hands the
+    # gradient back in the caller's shape and device; the kernels read V entries.
+    if bias is None:
+        return None
+    if bias.numel() != weight.shape[0]:
+        raise ValueError(f"Unsloth: lm_head bias has {bias.numel()} entries for a vocabulary of {weight.shape[0]}.")
+    return bias.reshape(-1).to(weight.device)
+
+
 def fused_linear_cross_entropy(
     hidden, weight, bias, targets, *,
     divisor,
@@ -1417,6 +1488,10 @@ def fused_linear_cross_entropy(
     need_h = grad_on and hidden.requires_grad
     need_w = grad_on and weight.requires_grad
     need_b = grad_on and _requires_grad(bias)
+    bias = _head_bias(bias, weight)
+    label_smoothing = float(label_smoothing or 0.0)
+    if not 0.0 <= label_smoothing <= 1.0:
+        raise ValueError(f"Unsloth: label_smoothing must be between 0.0 and 1.0, got {label_smoothing}.")
     f32 = dict(device = device, dtype = torch.float32)
     divisor = torch.as_tensor(divisor).to(**f32).reshape(-1)[:1].reshape(())
     divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
@@ -1467,6 +1542,7 @@ def fused_linear_logprobs(
     need_h = grad_on and hidden.requires_grad
     need_w = grad_on and weight.requires_grad
     need_b = grad_on and _requires_grad(bias)
+    bias = _head_bias(bias, weight)
     ent_grad = bool(return_entropy) and bool(entropy_requires_grad)
     want_u = _FORWARD_GRAD and need_h and not need_w and not need_b and not ent_grad
     logps, ent, mean, lssp, top1, u, lse = torch.ops.unsloth_zoo.fused_linear_logprobs(

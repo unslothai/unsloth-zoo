@@ -393,7 +393,7 @@ class UnslothChunkedCE(torch.autograd.Function):
                     dz = _run("bwd", _logits_grad, logits, targets[a:b], lse, g_row[: b - a], scalars, *flags, compute_dtype)
                     del logits
                     if need_h:
-                        grad_hidden[a:b] = (dz @ w).to(grad_hidden.dtype)
+                        grad_hidden[a:b] = _mm_fp32(dz, w).to(grad_hidden.dtype)
                     if need_w:
                         grad_weight.add_(dz.t() @ h)
                     if need_b:
@@ -483,6 +483,11 @@ def unsloth_chunked_ce_loss(
         rows_per_chunk = chunked_logprob_rows(
             lm_head_weight.shape[0], target_gb = target_gb, n_rows = hidden.shape[0], device = device
         )
+    if not torch.is_grad_enabled():
+        # requires_grad survives an outer no_grad, and forward builds every gradient eagerly: drop it for eval.
+        hidden = hidden.detach()
+        lm_head_weight = lm_head_weight.detach()
+        lm_head_bias = None if lm_head_bias is None else lm_head_bias.detach()
     return UnslothChunkedCE.apply(
         hidden, lm_head_weight, lm_head_bias, targets[keep], divisor, float(scaling or 1.0),
         int(rows_per_chunk), float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0),

@@ -177,6 +177,8 @@ def test_kill_switch_ce_still_compiles(device):
     import subprocess
     import sys
     env = dict(os.environ, UNSLOTH_FUSED_LINEAR = "0", UNSLOTH_IS_PRESENT = "1")
+    if device == "cpu":
+        env["CUDA_VISIBLE_DEVICES"] = ""  # no CUDA context (and no VRAM) for the CPU leg
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
     p = subprocess.run([sys.executable, "-c", _KILL_SWITCH_SCRIPT.format(device = device)], env = env,
@@ -250,6 +252,22 @@ def test_grpo_truncated_support_keeps_the_old_function():
     assert _calls("logprobs") == before
 
 
+def test_grpo_kill_switch_keeps_one_scorer_for_every_pass(monkeypatch):
+    # UNSLOTH_FUSED_LINEAR=0: the policy pass (grad) and the old / reference pass (no grad) both take the old function,
+    # so the on-policy ratio still starts at exactly 1.
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
+    seen = []
+    real = rr.chunked_hidden_states_selective_log_softmax
+    monkeypatch.setattr(rr, "chunked_hidden_states_selective_log_softmax",
+                        lambda *a, **k: seen.append(torch.is_grad_enabled()) or real(*a, **k))
+    states, weight, index, _ = _grpo_inputs()
+    got = rr.grpo_chunked_hidden_states_logprobs(states, weight, index, 4)
+    with torch.no_grad():
+        scored = rr.grpo_chunked_hidden_states_logprobs(states, weight, index, 4)
+    assert seen == [True, False]
+    assert torch.equal(scored, got.detach())
+
+
 def test_recompute_entropy_route_matches_the_torch_loop():
     states, weight, index, upstream = _grpo_inputs(seed = 3)
     gen = torch.Generator().manual_seed(4)
@@ -300,3 +318,27 @@ def test_linear_mean_logits_softcap_matches_the_torch_loop(monkeypatch):
     monkeypatch.setattr(pl, "_FUSED_LINEAR", False)
     want = pl.linear_mean_logits(hidden, weight, bias, 1.5, 0.0, 4.0)
     torch.testing.assert_close(got, want, atol = 1e-5, rtol = 1e-5)
+
+
+def test_preference_explicit_chunk_budget_keeps_the_chunked_function(monkeypatch):
+    # An explicit UNSLOTH_FUSED_PREFERENCE_CHUNK_MB is a memory setting for the chunked Function; it keeps that path
+    # (as an explicit CE memory target keeps the old CE path) instead of being silently ignored.
+    import importlib
+    torch.manual_seed(0)
+    hidden = torch.randn(B, S, H, requires_grad = True)
+    weight = torch.randn(V, H)
+    labels = torch.randint(0, V, (B, S))
+    mask = labels % 3 != 0
+    monkeypatch.setenv("UNSLOTH_FUSED_PREFERENCE_CHUNK_MB", "1")
+    try:
+        importlib.reload(pl)
+        before = _calls("logprobs")
+        out = pl.fused_linear_token_logps(hidden, weight, None, labels, mask)
+        assert _calls("logprobs") == before
+        out["per_token_logps"].sum().backward()
+    finally:
+        monkeypatch.delenv("UNSLOTH_FUSED_PREFERENCE_CHUNK_MB")
+        importlib.reload(pl)
+    before = _calls("logprobs")
+    pl.fused_linear_token_logps(hidden.detach(), weight, None, labels, mask)
+    assert _calls("logprobs") > before

@@ -65,10 +65,13 @@ _MM_OUT_DTYPE_OK = {}
 # UNSLOTH_FUSED_LINEAR=0 keeps this module's own chunked autograd Function. A float64 head (the tests' oracle
 # precision) always does: the fused linear kernel scores in float32.
 _FUSED_LINEAR = os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
+# An explicit UNSLOTH_FUSED_PREFERENCE_CHUNK_MB keeps the chunked Function it sizes, as an explicit CE memory target
+# keeps the old CE path (the fused kernel sizes its chunks from the device budget instead).
+_EXPLICIT_CHUNK_MB = "UNSLOTH_FUSED_PREFERENCE_CHUNK_MB" in os.environ
 
 
 def _use_fused_linear(weight):
-    return _FUSED_LINEAR and weight.dtype != torch.float64
+    return _FUSED_LINEAR and not _EXPLICIT_CHUNK_MB and weight.dtype != torch.float64
 
 
 def _linear_float32(hidden, weight, bias):

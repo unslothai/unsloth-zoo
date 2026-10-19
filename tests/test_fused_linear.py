@@ -365,9 +365,10 @@ def test_logits_mode_per_backend(monkeypatch):
     assert fl._logits_mode(torch.device("cpu")) == (False, False)
 
 
-def test_default_rows_follow_the_vocabulary():
+def test_default_rows_follow_the_vocabulary(monkeypatch):
     # 512 rows of a 151936 vocab, more for a small vocab, never fewer than 512 (256 rows of a 262k vocab starved the
-    # K = vocab GEMM: slower than TRL on G4).
+    # K = vocab GEMM: slower than TRL on G4). A fixed 2 GB budget: the free memory of a shared card must not matter.
+    monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: 2 * 1024**3)
     for V, want in ((32001, 2048), (151936, 512), (262144, 512)):
         assert fl.fused_linear_rows(8192, 2560, V) == want, V
 
@@ -722,3 +723,222 @@ def test_fp16_tile_partials_do_not_overflow_without_fp32_out_gemm(monkeypatch, b
     lp = fused_linear_logprobs(h, w, t)
     (lp * 32768.0).sum().backward()
     assert h.grad.isfinite().all() and w.grad.isfinite().all()
+
+
+# ------------------------------------------------------------------------------------------------ review fixes (PR 1866)
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("bad", [-1, 64, 1000])
+def test_ce_rejects_out_of_range_targets(device, bad):
+    # F.cross_entropy raises on a non-ignored target outside the vocabulary; dropping it silently kept it in the
+    # caller's divisor (loss biased low). ignore_index rows stay legal.
+    h, w, _, t = _make(device, torch.float32, 8, 16, 64)
+    t[0] = -100
+    fused_linear_cross_entropy(h, w, None, t, divisor = 7.0)
+    t[3] = bad
+    with pytest.raises(IndexError, match = "out of bounds"):
+        fused_linear_cross_entropy(h, w, None, t, divisor = 7.0)
+    assert not fl._TRITON_BROKEN
+
+
+def test_ce_rejects_invalid_label_smoothing():
+    h, w, _, t = _make("cpu", torch.float32, 8, 16, 64)
+    for eps in (1.1, -0.1):
+        with pytest.raises(ValueError, match = "label_smoothing"):
+            fused_linear_cross_entropy(h, w, None, t, divisor = 8.0, label_smoothing = eps)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_head_bias_shape_is_checked_and_broadcast_bias_works(device):
+    N, H, V = 9, 16, 40
+    h, w, _, t = _make(device, torch.float32, N, H, V, train_head = True)
+    short = torch.zeros(V // 2, device = device)
+    with pytest.raises(ValueError, match = "bias"):
+        fused_linear_logprobs(h, w, t, bias = short)
+    with pytest.raises(ValueError, match = "bias"):
+        fused_linear_cross_entropy(h, w, short, t, divisor = 1.0)
+    # A [1, V] bias: values and gradients (in the caller's shape) as a 1-D one.
+    b2 = (torch.randn(1, V) * 0.1).to(device).requires_grad_(True)
+    for fn in ("ce", "lp"):
+        b1 = b2.detach().reshape(-1).requires_grad_(True)
+        outs = []
+        for b in (b2, b1):
+            if fn == "ce":
+                y = fused_linear_cross_entropy(h, w, b, t, divisor = 3.0)
+            else:
+                y = (fused_linear_logprobs(h, w, t, bias = b) * torch.arange(N, device = device)).sum()
+            outs.append((y,) + torch.autograd.grad(y, (h, w, b)))
+        (y2, gh2, gw2, gb2), (y1, gh1, gw1, gb1) = outs
+        assert gb2.shape == b2.shape
+        torch.testing.assert_close(y2, y1)
+        torch.testing.assert_close(gb2.reshape(-1), gb1)
+        torch.testing.assert_close(gh2, gh1)
+        torch.testing.assert_close(gw2, gw1)
+
+
+@CUDA
+def test_bias_on_another_device_follows_the_head():
+    h, w, _, t = _make("cuda", torch.float32, 6, 16, 32, train_head = True)
+    b = torch.zeros(32, requires_grad = True)  # CPU bias, CUDA head
+    lp = fused_linear_logprobs(h, w, t, bias = b)
+    lp.sum().backward()
+    assert b.grad is not None and b.grad.device.type == "cpu"
+    loss = fused_linear_cross_entropy(h, w, b, t, divisor = 1.0)
+    loss.backward()
+
+
+def _record_buffers(monkeypatch):
+    sizes = []
+    real = fl._Buffers
+
+    class Rec(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            sizes.append(self.buf.numel() * self.buf.element_size())
+
+    monkeypatch.setattr(fl, "_Buffers", Rec)
+    return sizes
+
+
+@pytest.mark.parametrize("kind", ["ce", "lp", "lp_trainable"])
+def test_fp32_head_chunks_stay_within_the_budget(monkeypatch, kind):
+    # An fp32 head keeps fp32 logits even though fp32_logits is off: the chunk sizing counted them as 2 bytes, so a
+    # chunk (and the recompute backward tile) took twice the device budget.
+    budget = 64 * 1024
+    monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: budget)
+    sizes = _record_buffers(monkeypatch)
+    h, w, _, t = _make("cpu", torch.float32, 1024, 16, 64, train_head = kind == "lp_trainable")
+    if kind == "ce":
+        fused_linear_cross_entropy(h, w, None, t, divisor = 1.0).backward()
+    else:
+        fused_linear_logprobs(h, w, t).sum().backward()
+    assert sizes and max(sizes) <= budget, (sizes, budget)
+
+
+def test_recompute_backward_tiles_follow_the_budget(monkeypatch):
+    # The recompute backward sized its tiles from the static 256 MB allowance alone, ignoring the device budget.
+    N, H, V = 37, 32, 136
+    budget = 20 * 16 * H
+    monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: budget)
+    sizes = _record_buffers(monkeypatch)
+    cols = []
+    real = fl._row_backward
+
+    def spy(device, x, *a, **k):
+        cols.append(a[-2])
+        return real(device, x, *a, **k)
+
+    monkeypatch.setattr(fl, "_row_backward", spy)
+    h, w, b, t = _make("cpu", torch.float32, N, H, V, train_head = True, with_bias = True)
+    fused_linear_logprobs(h, w, t, bias = b).sum().backward()
+    assert max(sizes) <= budget, (sizes, budget)
+    assert len(set(cols)) >= 2, cols  # several vocab slices
+
+
+@CUDA
+def test_tiled_forward_follows_the_budget(monkeypatch):
+    if not fl._HAS_TRITON:
+        pytest.skip("needs Triton")
+    budget = 4 * 16384 * 4
+    monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: budget)
+    sizes = _record_buffers(monkeypatch)
+    h, w, _, t = _make("cuda", torch.float32, 300, 32, 20000, train_head = True)
+    tiled = fl.CALLS["tiled"]
+    lp = fused_linear_logprobs(h, w, t)
+    assert fl.CALLS["tiled"] == tiled + 1
+    assert max(sizes) <= budget, (sizes, budget)
+    ref = fused_linear_logprobs(h.detach(), w.detach(), t)
+    torch.testing.assert_close(lp.detach(), ref, rtol = 1e-5, atol = 1e-5)
+
+
+@CUDA
+@pytest.mark.parametrize("backend", ["no_fp32_out", "hip"])
+def test_fp16_odd_vocab_hidden_gradient_does_not_overflow(monkeypatch, backend):
+    # Without an fp16-in / fp32-out GEMM the aligned columns' fp16 partial (8 x 8 x 1e4 = 6.4e5) overflowed before the
+    # left-over column cancelled it.
+    if backend == "hip":
+        monkeypatch.setattr(fl, "_IS_HIP", True)
+    else:
+        monkeypatch.setattr(fl, "_fp32_out_ok", lambda device, dtype = None: False)
+    dz = torch.tensor([[8.0] * 8 + [-56.0]], device = "cuda", dtype = torch.float16)
+    w = torch.full((9, 1), 10000.0, device = "cuda", dtype = torch.float16)
+    w[8] = 11428.0
+    out = fl._dz_w(dz, w)
+    ref = dz.double() @ w.double()
+    assert out.isfinite().all()
+    torch.testing.assert_close(out.double(), ref, rtol = 0, atol = 64.0)
+
+
+@CUDA
+def test_fp16_frozen_head_keeps_small_unit_gradients():
+    # The frozen-head d logp / d hidden is formed before the (GradScaler-scaled) incoming gradient exists. In fp16 a
+    # confident token's p_j ~ 4e-8 rounded to a subnormal (+45%) in the half gradient buffer, and the ~1e-7 entries
+    # of d logp / d hidden lost their bits when stored in fp16; fp32 math resolves both.
+    H, V = 4, 4096
+    w = torch.zeros(V, H)
+    w[1:, 0] = -17.0
+    w[1:, 1] = 0.001
+    h = torch.zeros(1, H)
+    h[0, 0] = 1.0
+    t = torch.zeros(1, dtype = torch.long)
+    w16 = w.to("cuda", torch.float16)
+    hd = h.double().requires_grad_(True)
+    ref = torch.autograd.grad((hd @ w16.double().cpu().t()).log_softmax(-1)[0, 0] * 32768.0, hd)[0]
+    hh = h.to("cuda", torch.float16).requires_grad_(True)
+    lp = fused_linear_logprobs(hh, w16, t.cuda())
+    (gh,) = torch.autograd.grad(lp.sum() * 32768.0, hh)
+    assert ref[0, 1].abs() > 1e-3
+    torch.testing.assert_close(gh.double().cpu(), ref, rtol = 2e-2, atol = 1e-6)
+
+
+@CUDA
+def test_scale_rows_retries_one_transient_failure(monkeypatch):
+    real = fl._launch
+    fails = {"left": 1}
+
+    def flaky(device, fn):
+        if fails["left"] > 0:
+            fails["left"] -= 1
+            raise RuntimeError("simulated transient Triton failure")
+        return real(device, fn)
+
+    monkeypatch.setattr(fl, "_launch", flaky)
+    u = torch.randn(64, 32, device = "cuda")
+    g = torch.randn(64, device = "cuda")
+    out = torch.ops.unsloth_zoo.fused_linear_scale_rows(u, g, torch.float32)
+    assert not fl._TRITON_BROKEN
+    torch.testing.assert_close(out, u * g[:, None])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_trainable_head_long_context_backward(device):
+    # Past `vocab` rows the trainable head + hidden backward runs row-major with an fp32 [V, H] head accumulator
+    # instead of an fp32 [rows, H] hidden one; both orders match the oracle.
+    N, H, V = 300, 16, 40
+    h, w, b, t = _make(device, torch.float32, N, H, V, train_head = True, with_bias = True)
+    lp = fused_linear_logprobs(h, w, t, bias = b, rows_per_chunk = 64)
+    g = torch.randn(N, device = device, dtype = torch.float64)
+    grads = torch.autograd.grad((lp.double() * g).sum(), (h, w, b))
+    hd, wd, bd = (x.detach().double().requires_grad_(True) for x in (h, w, b))
+    ref = _lp_oracle(hd, wd, bd, t, torch.ones(N, dtype = torch.bool, device = device), 1.0, 0.0, 0.0, 0.0)[0]
+    refs = torch.autograd.grad((ref * g).sum(), (hd, wd, bd))
+    for name, x, y in zip(("hidden", "weight", "bias"), grads, refs):
+        _close(x, y, _tol(torch.float32), name)
+
+
+@CUDA
+def test_trainable_head_long_context_skips_the_rows_accumulator():
+    N, H, V = 16384, 256, 128
+    h, w, _, t = _make("cuda", torch.float32, N, H, V, train_head = True)
+    fused_linear_logprobs(h, w, t).sum().backward()  # warm up: GEMM workspaces are not the accumulator
+    h.grad = w.grad = None
+    lp = fused_linear_logprobs(h, w, t)
+    loss = lp.sum()
+    torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    loss.backward()
+    torch.cuda.synchronize()
+    extra = torch.cuda.max_memory_allocated() - base
+    # grad_h (N H fp32) + one [R, H] hidden-gradient tile + one [R, V] logits tile; the vocab-major order added an
+    # fp32 [N, H] accumulator on top of grad_h.
+    assert extra < N * H * 4 * 1.75, extra / 2**20

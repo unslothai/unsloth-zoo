@@ -532,11 +532,6 @@ def grpo_chunked_hidden_states_logprobs(
     # Same contract as chunked_hidden_states_selective_log_softmax, but never keeps tokens x vocab logits: under grad
     # the fused linear kernel keeps per row state only, and no-grad scoring (old / reference logprobs) runs the same
     # kernel, so a ratio against the policy's own logprobs starts at exactly 1.
-    needs_grad = torch.is_grad_enabled() and (
-        hidden_states.requires_grad
-        or lm_head.requires_grad
-        or (lm_head_bias is not None and lm_head_bias.requires_grad)
-    )
     # Truncated-support scoring and the fp32 head are the old function's: hand those calls to it.
     fp32_head = extra_kwargs.get(
         "fp32_lm_head",
@@ -550,7 +545,9 @@ def grpo_chunked_hidden_states_logprobs(
     )
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
     fused_linear = _chunked_logprob._FUSED_LINEAR
-    if (not needs_grad and not fused_linear) or custom or os.environ.get("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "1") == "0":
+    # UNSLOTH_FUSED_LINEAR=0 sends grad and no-grad calls alike to the old function, so a policy pass and its old /
+    # reference log-probs keep one scorer (a ratio starts at exactly 1).
+    if (not fused_linear) or custom or os.environ.get("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "1") == "0":
         kwargs = dict(extra_kwargs)
         if max_rows_per_chunk is not None:
             kwargs["max_rows_per_chunk"] = max_rows_per_chunk
@@ -562,15 +559,9 @@ def grpo_chunked_hidden_states_logprobs(
     if max_rows_per_chunk is None:
         env_rows = os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip()
         max_rows_per_chunk = int(env_rows) if env_rows.isdigit() else 0
-    max_rows = None
-    if fused_linear:
-        # The kernel sizes its own chunks; UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK caps them.
-        rows_per_chunk = None
-        max_rows = max_rows_per_chunk if max_rows_per_chunk > 0 else None
-    else:
-        rows_per_chunk = _chunked_logprob.chunked_logprob_rows(lm_head.shape[0], n_rows = index.numel(), device = lm_head.device)
-        if max_rows_per_chunk > 0:
-            rows_per_chunk = min(rows_per_chunk, max_rows_per_chunk)
+    # The kernel sizes its own chunks; UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK caps them.
+    rows_per_chunk = None
+    max_rows = max_rows_per_chunk if max_rows_per_chunk > 0 else None
     return _chunked_logprob.unsloth_chunked_logprobs(
         hidden_states, lm_head, index,
         temperature = temperature,
