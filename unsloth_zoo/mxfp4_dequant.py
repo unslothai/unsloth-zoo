@@ -42,10 +42,15 @@ except Exception:
 # Bounds the torch path's temporaries to ~256 MB (a whole gpt-oss-120b stack would be 8.5 GB).
 _TORCH_CHUNK_BYTES = 256 << 20
 
+# torch < 2.12's ldexp forms 2^e in the input dtype: inf from 2^16 in fp16, and from 2^128 (e8m0 255) in fp32,
+# where 0 * inf = NaN. The fused kernel then failed its self-check on every GPU.
+_LDEXP_EXACT = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 12)
+
 
 def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False, out = None):
     """Reference: transformers' convert_moe_packed_tensors arithmetic, in row chunks."""
-    lut = torch.tensor(_FP4_VALUES, dtype = torch.float32, device = blocks.device)
+    work = dtype if _LDEXP_EXACT else torch.float32
+    lut = torch.tensor(_FP4_VALUES, dtype = work, device = blocks.device)
     *prefix, G, B = blocks.shape
     if transpose and not prefix:
         raise ValueError("Unsloth: transpose needs MXFP4 blocks with a row dim")
@@ -63,14 +68,16 @@ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = F
         # Advance to r1, not by step: a chunk cut at an expert edge is shorter.
         r1 = min(r0 + step, (r0 // N + 1) * N if transpose else R)
         b = rows_in[r0:r1]
-        piece = torch.empty(r1 - r0, G, B * 2, dtype = torch.float32, device = blocks.device)
+        piece = torch.empty(r1 - r0, G, B * 2, dtype = work, device = blocks.device)
         piece[..., 0::2] = lut[(b & 0x0F).long()]
         piece[..., 1::2] = lut[(b >> 4).long()]
-        # Exact in fp32, then one rounding. torch < 2.12 forms 2^e in the input dtype: inf from 2^16 in fp16,
-        # and 2^128 (e8m0 255) in fp32, where 0 * inf = NaN. Hence fp32, and 2^127 then 2 for 255.
         exponent = (scales_in[r0:r1].to(torch.int32) - 127).unsqueeze(-1)
-        piece = torch.ldexp(piece, exponent.clamp(max = 127))
-        piece = torch.where(exponent == 128, piece * 2, piece).to(dtype)
+        if _LDEXP_EXACT:
+            piece = torch.ldexp(piece, exponent).to(dtype)
+        else:
+            # Exact in fp32, then one rounding; 255 as 2^127 then 2.
+            piece = torch.ldexp(piece, exponent.clamp(max = 127))
+            piece = torch.where(exponent == 128, piece * 2, piece).to(dtype)
         piece = piece.reshape(r1 - r0, G * B * 2)
         if transpose:
             e, i0 = divmod(r0, N)
