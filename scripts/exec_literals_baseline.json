@@ -331,13 +331,6 @@
     {
       "file": "unsloth_zoo/peft_utils.py",
       "sink": "exec",
-      "digest": "9c8c2a17a2a67b45",
-      "count": 1,
-      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
-    },
-    {
-      "file": "unsloth_zoo/peft_utils.py",
-      "sink": "exec",
       "digest": "d467bcd0b437db95",
       "count": 1,
       "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
