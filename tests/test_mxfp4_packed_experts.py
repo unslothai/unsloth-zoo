@@ -74,8 +74,7 @@ def test_torch_reference_matches_transformers():
 @pytest.mark.parametrize("old_torch_path", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_torch_reference_is_exact_on_every_torch(monkeypatch, dtype, old_torch_path):
-    # Every byte under every e8m0 scale against fp64 rounded once. torch < 2.12's ldexp gave NaN at 255 and
-    # inf from 2^16 in fp16, so the fused kernel failed its self-check and was never used.
+    # Every byte under every e8m0 scale against fp64 rounded once (the fused kernel's self-check needs this).
     if old_torch_path:
         monkeypatch.setattr(mxd, "_LDEXP_EXACT", False)
     blocks = torch.arange(256, dtype = torch.uint8).reshape(16, 1, 16).repeat(256, 1, 1)

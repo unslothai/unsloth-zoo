@@ -42,8 +42,7 @@ except Exception:
 # Bounds the torch path's temporaries to ~256 MB (a whole gpt-oss-120b stack would be 8.5 GB).
 _TORCH_CHUNK_BYTES = 256 << 20
 
-# torch < 2.12's ldexp forms 2^e in the input dtype: inf from 2^16 in fp16, and from 2^128 (e8m0 255) in fp32,
-# where 0 * inf = NaN. The fused kernel then failed its self-check on every GPU.
+# torch < 2.12's ldexp forms 2^e in the input dtype: inf from 2^16 in fp16, and from 2^128 (e8m0 255) in fp32 (0 -> NaN).
 _LDEXP_EXACT = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 12)
 
 
