@@ -338,6 +338,10 @@ def _reserve_pinned(nbytes):
     if GC_PINNED_CAP is None:
         GC_PINNED_CAP = _compute_pinned_cap()
         _HOST_HELD_BASELINE = None if held is None else max(0, held - GC_PINNED_BYTES)
+    elif _HOST_HELD_BASELINE is None and held is not None:
+        # host_memory_stats() is empty before CUDA initialises, so a cap computed first has no
+        # baseline yet: take it at the first reading instead of never.
+        _HOST_HELD_BASELINE = max(0, held - GC_PINNED_BYTES)
     used = GC_PINNED_BYTES
     if held is not None:
         if held < GC_PINNED_BYTES:
@@ -358,7 +362,12 @@ def _reserve_pinned(nbytes):
                     "set UNSLOTH_GC_PINNED_MAX_GB to set a fixed pinned cap instead."
                 )
             return False
-    elif GC_PINNED_CAP >= 0 and used + block > GC_PINNED_CAP:
+    elif GC_PINNED_CAP >= 0 and used + block > GC_PINNED_CAP and not (
+        # Our released blocks (old blocks of grown slots) still count against the cap: return
+        # them to the OS once and retry before going pageable for good. Only when some exist,
+        # so a full cap with nothing of ours cached costs no device sync.
+        _PINNED_CACHED and any(_PINNED_CACHED.values()) and _flushed_cached_fits(block, used)
+    ):
         if not _WARNED_ABOUT_PINNED_CAP:
             _WARNED_ABOUT_PINNED_CAP = True
             print(
@@ -370,6 +379,13 @@ def _reserve_pinned(nbytes):
         return False
     GC_PINNED_BYTES += block
     return True
+
+
+def _flushed_cached_fits(block, used):
+    """Cap mode: flush our cached released blocks; True if `block` then fits under the cap."""
+    ours = sum(k * v for k, v in _PINNED_CACHED.items())
+    if not _empty_host_cache(): return False
+    return max(0, used - ours) + block <= GC_PINNED_CAP
 
 
 def _release_pinned(nbytes):

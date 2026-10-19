@@ -138,6 +138,7 @@ def test_rounded_block_counts_against_the_cap(monkeypatch, gc_module):
 
 def test_released_blocks_stay_charged_and_are_reused(monkeypatch, gc_module):
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
+    monkeypatch.setattr(gc_module, "_empty_host_cache", lambda: False)  # no flush available
     assert gc_module._reserve_pinned(3000)          # 4096 block
     gc_module._release_pinned(3000)
     assert gc_module.GC_PINNED_BYTES == 4096
@@ -260,4 +261,35 @@ def test_single_rank_frees_dead_cached_blocks_before_going_pageable(monkeypatch,
     # Nothing cached any more: a block that still does not fit goes pageable without a flush.
     host.available = int(1.5 * gib)
     assert not gc_module._reserve_pinned(1 * gib)
+    assert emptied == [True]
+
+
+def test_baseline_is_taken_once_host_stats_appear(monkeypatch, gc_module):
+    # The cap can be computed before CUDA initialises (host_memory_stats() is empty then): the
+    # foreign-bytes baseline must be latched at the first reading, not stay unset for good.
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
+    held = {"bytes": None}
+    monkeypatch.setattr(gc_module, "_host_allocator_held_bytes", lambda: held["bytes"])
+    assert gc_module._reserve_pinned(4096)
+    held["bytes"] = 1000 + 4096                     # 1000 bytes pinned by someone else
+    assert gc_module._reserve_pinned(1024)
+    held["bytes"] = 1000 + 5120 + 4096              # a cached block of ours was taken by another user
+    assert not gc_module._reserve_pinned(2048)      # 9216 past the baseline + 2048 > 10000
+
+
+def test_cap_flushes_our_released_blocks_before_going_pageable(monkeypatch, gc_module):
+    # A grown slot's old block counts against the cap until torch frees it. At the cap those dead
+    # blocks are returned to the OS once, so a bigger block can still be pinned.
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
+    monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
+    monkeypatch.setattr(gc_module, "_synchronize_used_devices", lambda: None)
+    emptied = []
+    monkeypatch.setattr(torch._C, "_host_emptyCache", lambda: emptied.append(True), raising = False)
+    assert gc_module._reserve_pinned(3000)          # 4096 block
+    gc_module._release_pinned(3000)                 # the slot grew: 4096 is dead in the host cache
+    assert gc_module._reserve_pinned(7000)          # 8192 fits once the 4096 is gone
+    assert emptied == [True]
+    assert gc_module.GC_PINNED_BYTES == 8192 and gc_module._PINNED_CACHED == {}
+    # Nothing of ours cached: at the cap it goes pageable without a flush.
+    assert not gc_module._reserve_pinned(7000)
     assert emptied == [True]
