@@ -871,6 +871,24 @@ def test_qsa_scope_keeps_native_picks_when_the_kernel_disagrees(monkeypatch, cap
     assert caplog.text.count("picked other blocks than argpartition") == len(decode._QSA_VERDICTS)
 
 
+@pytest.mark.parametrize("where", ["check", "synchronize"])
+def test_qsa_selection_check_raises_a_failed_command_buffer(where, monkeypatch):
+    attention, failed = _qsa_layer(), RuntimeError("[METAL] Command buffer execution failed: Internal Error")
+    monkeypatch.setattr(decode, "_QSA_VERDICTS", {})
+
+    def fail(*_, **__):
+        raise failed
+
+    if where == "check":
+        monkeypatch.setattr(mx, "array_equal", fail)
+    else:
+        monkeypatch.setattr(mx, "array_equal", lambda *_, **__: mx.array(False))
+        monkeypatch.setattr(mx, "synchronize", fail)
+    with decode.fused_qsa_attention(attention), pytest.raises(RuntimeError) as raised:
+        _qsa_run(attention)
+    assert raised.value is failed and not decode._QSA_VERDICTS
+
+
 @pytest.mark.parametrize("reason", ["switch", "body", "training", "distributed", "model"])
 def test_qsa_scope_steps_aside(reason, monkeypatch, caplog):
     attention, native = _qsa_layer(), qwen4.Qwen4ExpQSAIndexer.select_from_projected

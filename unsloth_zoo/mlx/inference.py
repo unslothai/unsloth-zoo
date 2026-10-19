@@ -4664,8 +4664,9 @@ def _qsa_select_route(native, bindings):
         verdict = _QSA_VERDICTS.get(key)
         if verdict is None:
             try:
-                verdict = bool(mx.array_equal(mx.sort(selection.selected_blocks, axis = -1), picks).item())
-            except (RuntimeError, ValueError):
+                verdict = _settled(bool(mx.array_equal(mx.sort(selection.selected_blocks, axis = -1), picks).item()))
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
                 return selection  # inside a function transformation, which cannot evaluate; checked later
             _QSA_VERDICTS[key] = verdict
             if not verdict:
