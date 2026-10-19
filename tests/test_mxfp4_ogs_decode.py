@@ -134,3 +134,18 @@ def test_the_cached_ogs_views_follow_their_experts(ogs):
     del model, experts, mlp
     gc.collect()
     assert len(gpt_oss._OGS_WEIGHTS) == 0
+
+
+def test_auto_prefers_the_fused_packed_decode(ogs, monkeypatch):
+    model, experts = _tiny_gpt_oss("cuda")
+    mlp = model.model.layers[0].mlp
+    monkeypatch.delenv("UNSLOTH_MXFP4_OGS")
+    fused = gpt_oss._mxfp4_fused_decode_enabled(experts.gate_up_proj, torch.bfloat16)
+    with torch.no_grad():
+        auto = gpt_oss._mxfp4_ogs_decode(mlp, _inputs()[0])
+        out = gpt_oss.moe_forward_inference_bf16(mlp, _inputs()[0])
+    assert torch.isfinite(out).all()
+    if fused:
+        assert auto is None and ogs["op"] == 0
+    else:
+        assert (ogs["op"] > 0) is _native_here()
