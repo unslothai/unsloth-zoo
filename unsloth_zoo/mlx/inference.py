@@ -17,7 +17,8 @@
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
 small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
-Qwen exact speculative verify blocks, Gemma 4 verify-block attention, and Qwen sparse attention block selection."""
+Qwen exact speculative verify blocks, Gemma 4 verify-block attention, Qwen sparse attention block selection,
+and QSA indexer blocks kept across cache trims."""
 
 import ast
 import functools
@@ -101,6 +102,7 @@ def _resolved_bindings(contract):
             owner, _, name = path.rpartition(".")
             holder = _resolve_dotted(module, owner) if owner else module
             target = getattr(holder, name, None)
+            target = _exact_route_native(target) or target
             # The sparse-attention training wrapper outlives training and calls what it wraps outside it. A wrapper
             # around it inherits the marker through functools.wraps, but its own __wrapped__ is not the marked one.
             marked = getattr(target, "_unsloth_sparse_attention_original", None)
@@ -129,9 +131,17 @@ def _resolved_bindings(contract):
     return list(found.values()) if holds else None
 
 
+def _exact_route_native(function):
+    """The native a route marked `_unsloth_exact_route_of` runs unchanged, so a contract on that native holds.
+    functools.wraps copies the mark onto a wrapper around the route, whose own __wrapped__ gives it away."""
+    native = getattr(function, "_unsloth_exact_route_of", None)
+    return None if native is None or hasattr(function, "__wrapped__") else native
+
+
 def _bindings_intact(bindings):
     for namespace, name, target in bindings:
-        if namespace.get(name) is not target:
+        current = namespace.get(name)
+        if current is not target and _exact_route_native(current) is not target:
             return False
     return True
 
@@ -4746,6 +4756,7 @@ def _qsa_select_route(native, bindings):
             selection.selected_blocks = picks
         return selection
 
+    select_from_projected._unsloth_exact_route_of = native
     return select_from_projected
 
 
@@ -4845,6 +4856,73 @@ def fast_qsa_prefill(model, *, _modules = None):
 
     return _qsa_routes(model, _modules, enter)
 
+# mlx-vlm's QSA caches drop every pooled indexer block on trim, so the indexer call after a speculative
+# rollback re-pools the whole context on each QSA layer.
+_QSA_LANGUAGE = "mlx_vlm.models.qwen4_exp.language"
+_QSA_TRIM_CACHES = ("QSAKVCache", "QSAQuantizedKVCache", "BatchQSAKVCache")
+_QSA_TRIM_CONTRACT = {_QSA_LANGUAGE: {
+    "QSAKVCache.trim": "408373696f053090",
+    "QSAQuantizedKVCache.trim": "408373696f053090",
+    "BatchQSAKVCache.trim": "c26b5cd8d0d2cc19",
+    # Extends a cached prefix of pooled blocks, pooling only the blocks after it.
+    "Qwen4ExpQSAIndexer.select_from_projected": "379bb821075d65a8",
+}}
+_QSA_TRIM_LOCK = RLock()
+_QSA_TRIM_HELD = []  # [open scopes, [(cache class, native trim, route)]]
+
+
+def _qsa_trim_route(native, bindings):
+    def trim(self, n):
+        blocks, ratio = self.index_block_keys, self.index_block_ratio
+        trimmed = native(self, n)
+        if blocks is not None and ratio and self.index_keys is not None and _bindings_intact(bindings):
+            # A block below the kept complete-block count pools only keys the trim left in place.
+            length = getattr(self, "index_offset", self.index_keys.shape[1])
+            self.index_block_keys, self.index_block_ratio = blocks[:, :, : length // ratio], ratio
+        return trimmed
+
+    return trim
+
+
+@contextmanager
+def exact_qsa_trim(model, *, _modules = None):
+    """Keep the pooled QSA indexer blocks a cache trim leaves complete; the indexer re-pools only the tail.
+
+    The kept blocks are the ones a re-pool would rebuild bit for bit. The QSA caches' `trim` is rebound
+    process-wide while any scope is open. `UNSLOTH_MLX_QSA_TRIM_KEEPS_BLOCKS=0` turns this off.
+    """
+    entered = False
+    try:
+        with _QSA_TRIM_LOCK:
+            language = sys.modules.get(_QSA_LANGUAGE)
+            indexer = getattr(language, "Qwen4ExpQSAIndexer", None)
+            if (os.environ.get("UNSLOTH_MLX_QSA_TRIM_KEEPS_BLOCKS", "1") != "0" and indexer is not None
+                    and any(isinstance(module, indexer) for _, module in _fusion_modules(model, _modules))):
+                if not _QSA_TRIM_HELD:
+                    bindings = _resolved_bindings(_QSA_TRIM_CONTRACT)
+                    if bindings is not None:
+                        classes = [getattr(language, name) for name in _QSA_TRIM_CACHES]
+                        natives = [vars(cls)["trim"] for cls in classes]
+                        kept = [binding for binding in bindings if binding[2] not in natives]
+                        routes = [(cls, native, _qsa_trim_route(native, kept)) for cls, native in zip(classes, natives)]
+                        for cls, _, route in routes:
+                            cls.trim = route
+                        _QSA_TRIM_HELD[:] = [0, routes]
+                if _QSA_TRIM_HELD:
+                    _QSA_TRIM_HELD[0] += 1
+                    entered = True
+        yield model
+    finally:
+        with _QSA_TRIM_LOCK:
+            if entered:
+                _QSA_TRIM_HELD[0] -= 1
+                if not _QSA_TRIM_HELD[0]:
+                    for cls, native, route in _QSA_TRIM_HELD[1]:
+                        if vars(cls).get("trim") is route:
+                            cls.trim = native
+                    _QSA_TRIM_HELD.clear()
+
+
 class InferenceScope(NamedTuple):
     """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
     `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
@@ -4882,6 +4960,7 @@ INFERENCE_SCOPES = [
     InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
+    InferenceScope(exact_qsa_trim),
 ]
 
 

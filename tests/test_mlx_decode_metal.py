@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import ast
+import contextlib
 import functools
 import importlib
 import inspect
@@ -920,6 +921,8 @@ def test_qsa_route_skips_an_indexer_in_training(monkeypatch):
 def test_qsa_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
     attention, foreign = _qsa_layer(), lambda *args: None
     native = qwen4.Qwen4ExpQSAIndexer.select_from_projected
+    # Recorded first so teardown restores the native method, not the route open below.
+    monkeypatch.setattr(qwen4.Qwen4ExpQSAIndexer, "select_from_projected", native)
     with decode.fused_qsa_attention(attention):
         monkeypatch.setattr(qwen4.Qwen4ExpQSAIndexer, "select_from_projected", foreign)
     assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is foreign
@@ -1011,3 +1014,83 @@ def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
     native = qwen4.dispatch_qsa_attention
     with decode.inference_scopes(attention):
         assert qwen4.dispatch_qsa_attention is native
+
+
+def _qsa_attention():
+    if qwen4 is None:
+        pytest.skip("mlx-vlm without qwen4_exp")
+    mx.random.seed(5)
+    attention = qwen4.Qwen4ExpAttention(Qwen4TextConfig(
+        model_type = "qwen4_exp", hidden_size = 64, num_hidden_layers = 4, num_attention_heads = 2, num_key_value_heads = 1,
+        linear_num_value_heads = 1, linear_num_key_heads = 1, linear_key_head_dim = 16, linear_value_head_dim = 16,
+        linear_conv_kernel_dim = 4, num_experts = 2, num_experts_per_tok = 1, shared_expert_intermediate_size = 16,
+        moe_intermediate_size = 16, rms_norm_eps = 1e-6, vocab_size = 64, max_position_embeddings = 4096, head_dim = 64,
+        indexer_n_heads = 2, indexer_head_dim = 32, indexer_budget = 16, rope_parameters = {
+            "type": "default", "mrope_section": [3, 3, 2], "rope_theta": 10000, "partial_rotary_factor": 0.25}))
+    attention.set_dtype(mx.bfloat16)
+    attention.eval()
+    return attention
+
+
+def _speculative_rounds(attention, cache):
+    # Rejections that do and do not cross a pooled-block boundary, and a full acceptance. Each round
+    # brings new rows, as a corrected token replaces a rejected draft.
+    x = mx.random.normal((1, 81, 64), key = mx.random.key(9)).astype(mx.bfloat16)
+    steps = [attention(x[:, :61], cache = cache), cache.index_block_keys]
+    for start, reject in zip(range(61, 81, 4), (3, 1, 0, 2, 3)):
+        steps += [attention(x[:, start:start + 4], cache = cache), cache.index_block_keys]
+        cache.trim(reject)
+        steps.append(cache.index_block_keys)
+    return steps
+
+
+@pytest.mark.parametrize("cache, args", [("QSAKVCache", {}), ("QSAQuantizedKVCache", {"group_size": 32, "bits": 8}),
+                                         ("BatchQSAKVCache", {"left_padding": [0]})])
+@pytest.mark.parametrize("scopes", [("exact_qsa_trim",), ("fused_qsa_attention", "exact_qsa_trim"),
+                                    ("exact_qsa_trim", "fused_qsa_attention")])
+def test_qsa_trim_keeps_the_blocks_a_repool_rebuilds_bitwise(cache, args, scopes):
+    attention, select = _qsa_attention(), qwen4.Qwen4ExpQSAIndexer.select_from_projected
+    stock = _speculative_rounds(attention, getattr(qwen4, cache)(**args))
+    with contextlib.ExitStack() as stack:
+        for scope in scopes:
+            stack.enter_context(getattr(decode, scope)(attention))
+        assert (qwen4.Qwen4ExpQSAIndexer.select_from_projected is select) == (len(scopes) == 1)
+        kept = _speculative_rounds(attention, getattr(qwen4, cache)(**args))
+    for index, (a, b) in enumerate(zip(stock, kept)):
+        if index % 3 == 1 and index > 1:  # just after a trim: stock drops every block, the scope keeps a prefix
+            assert a is None and b.shape[2] > 0
+        else:
+            _equal(a, b)
+
+
+def test_qsa_trim_scope_leaves_other_models_drifted_bodies_and_foreign_bindings(monkeypatch):
+    attention, stock = _qsa_attention(), qwen4.QSAKVCache.trim
+    monkeypatch.setattr(qwen4.QSAKVCache, "trim", stock)
+    with decode.exact_qsa_trim(_model()):
+        assert qwen4.QSAKVCache.trim is stock
+    with decode.exact_qsa_trim(attention):
+        assert qwen4.QSAKVCache.trim is not stock
+        with decode.exact_qsa_trim(attention):
+            pass
+        assert qwen4.QSAKVCache.trim is not stock
+    assert qwen4.QSAKVCache.trim is stock
+    with decode.exact_qsa_trim(attention):
+        qwen4.QSAKVCache.trim = foreign = lambda self, n: n
+    assert qwen4.QSAKVCache.trim is foreign
+    qwen4.QSAKVCache.trim = stock
+    indexer = qwen4.Qwen4ExpQSAIndexer
+    monkeypatch.setattr(indexer, "select_from_projected", indexer.select_from_projected)  # teardown restores native
+    for wrap_first in (True, False):  # functools.wraps carries the fused route's mark onto a foreign wrapper
+        with decode.fused_qsa_attention(attention):
+            route = indexer.select_from_projected
+            wrapper = functools.wraps(route)(lambda *args: route(*args))
+            indexer.select_from_projected = wrapper if wrap_first else route
+            with decode.exact_qsa_trim(attention):
+                indexer.select_from_projected = wrapper
+                assert _speculative_rounds(attention, qwen4.QSAKVCache())[4] is None
+            indexer.select_from_projected = route
+    contract ={name: dict(names) for name, names in decode._QSA_TRIM_CONTRACT.items()}
+    contract[decode._QSA_LANGUAGE]["Qwen4ExpQSAIndexer.select_from_projected"] = "0" * 16
+    monkeypatch.setattr(decode, "_QSA_TRIM_CONTRACT", contract)
+    with decode.exact_qsa_trim(attention):
+        assert qwen4.QSAKVCache.trim is stock
