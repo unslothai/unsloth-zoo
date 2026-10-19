@@ -2937,20 +2937,15 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     from mlx_vlm.models.gemma4.config import TextConfig
     from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
 
-    # Two interpreters at least: a fresh one can still read low on all five repeats (one
-    # run read unshared 160329148 throughout), and low stretches do not cross processes.
-    # Up to four when the bound is not met yet: readings only ever err LOW, so another
-    # interpreter can only raise the unshared ceiling toward its exact value, and a real
-    # regression (shared truly above 1.25x) fails on every attempt. Run 39234730657 read
-    # unshared at most 150494752 across both interpreters, about 18% under exact.
+    # Four interpreters, always: a fresh one can still read low on all five repeats (one
+    # run read unshared 160329148 throughout), low stretches do not cross processes, and
+    # two were not enough (run 39234730657 read unshared at most 150494752 across both,
+    # about 18% under exact). Readings only ever err low, so a ceiling over more
+    # interpreters sits closer to the exact value on BOTH sides. The count is fixed rather
+    # than "until the bound holds", which would give an under-read shared peak repeated
+    # chances to hide a real regression.
     readings = {"shared": [], "unshared": []}
-
-    def ceiling(side):
-        kept = [p for p, produced in readings[side] if p >= produced]
-        assert kept, f"every {side} repeat read a peak below its gradients: {readings[side]}"
-        return max(kept)
-
-    for attempt in range(4):
+    for _ in range(4):
         run = subprocess.run(
             [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
             capture_output=True, text=True, timeout=900,
@@ -2958,8 +2953,11 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         assert run.returncode == 0, run.stderr[-4000:]
         for side, values in json.loads(run.stdout.strip().splitlines()[-1]).items():
             readings[side] += values
-        if attempt >= 1 and ceiling("shared") < 1.25 * ceiling("unshared"):
-            break
+
+    def ceiling(side):
+        kept = [p for p, produced in readings[side] if p >= produced]
+        assert kept, f"every {side} repeat read a peak below its gradients: {readings[side]}"
+        return max(kept)
 
     shared_peak, unshared_peak = ceiling("shared"), ceiling("unshared")
     assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak, readings)
