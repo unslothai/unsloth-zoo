@@ -2363,6 +2363,10 @@ def grpo_accumulated_loss(
                 )
                 trainer._unsloth_truncated_support_refused = True
             _support_kwargs = {}
+        if _support_kwargs and getattr(trainer, "_unsloth_truncated_support_refused", False):
+            # Unsloth found the scored policy is not the sampler (an unsynced vLLM sampler, a reference
+            # model, reused rollouts): the current policy's own kept set would not be vLLM's either.
+            _support_kwargs = {}
         if _support_kwargs:
             from functools import partial
             if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
