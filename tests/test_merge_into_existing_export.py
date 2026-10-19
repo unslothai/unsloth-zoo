@@ -443,9 +443,19 @@ def test_refresh_refused_when_free_space_is_below_the_largest_shard(tmp_path, mo
             return real_hf(repo_id, filename, local_dir = local_dir, **k)
         monkeypatch.setattr(S, "hf_hub_download", _hf)
 
+    # The message says nothing was changed, so the metadata written before the shards stays too.
+    _metadata = [f for f in ("config.json", "generation_config.json", "model.safetensors.index.json")
+                 if os.path.exists(os.path.join(out, f))]
+    assert "config.json" in _metadata and "model.safetensors.index.json" in _metadata
+    for f in _metadata:
+        with open(os.path.join(out, f), "ab") as handle:
+            handle.write(b"\n")
+    metadata_before = {f : open(os.path.join(out, f), "rb").read() for f in _metadata}
+
     with pytest.raises(RuntimeError, match = "Nothing was changed"):
         H.run_merge(peft_model, base, out, save_dtype = None, low_disk_space_usage = low_disk)
     assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _metadata} == metadata_before
     assert _no_staging_left(out)
 
 

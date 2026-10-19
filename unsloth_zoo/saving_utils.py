@@ -5251,6 +5251,32 @@ def merge_and_overwrite_lora(
         pass
     pass
 
+    _stale_shards = set()
+    if save_method not in ("merged_4bit", "forced_merged_4bit"):
+        # Before the tokenizer, config and index writes below, so a refused refresh changes nothing.
+        # Only shard entries decide it, and none of those writes touches a shard.
+        # An earlier export's shard is already merged and the fetches below can keep it
+        # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
+        # Each one is replaced in turn by a staged copy renamed over it, so no second copy of the
+        # checkpoint is kept, and a disk that cannot finish the refresh is refused before it starts.
+        _stale_shards = set(_previous_export_shards(
+            safetensors_list, save_directory, model_name if is_local_path else None,
+        ))
+        if _stale_shards:
+            if is_local_path:
+                _new_sizes = {
+                    f : os.path.getsize(os.path.join(model_name, f)) for f in safetensors_list
+                    if os.path.exists(os.path.join(model_name, f)) and (
+                        f in _stale_shards or not os.path.lexists(os.path.join(save_directory, f))
+                    )
+                }
+            else:
+                _new_sizes = {
+                    f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
+                }
+            _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
+        pass
+
     # Save config / generation_config via no state_dict and tokenizer
     if tokenizer is not None:
         tokenizer.save_pretrained(save_directory = save_directory)
@@ -5466,28 +5492,6 @@ def merge_and_overwrite_lora(
         if push_to_hub and safe_tensor_index_files:
             upload_items("model.safetensors.index.json")
         pass
-    pass
-
-    # An earlier export's shard is already merged and the fetches below can keep it
-    # (local_dir metadata is trusted for 1s after a download), merging the LoRA twice.
-    # Each one is replaced in turn by a staged copy renamed over it, so no second copy of the
-    # checkpoint is kept, and a disk that cannot finish the refresh is refused before it starts.
-    _stale_shards = set(_previous_export_shards(
-        safetensors_list, save_directory, model_name if is_local_path else None,
-    ))
-    if _stale_shards:
-        if is_local_path:
-            _new_sizes = {
-                f : os.path.getsize(os.path.join(model_name, f)) for f in safetensors_list
-                if os.path.exists(os.path.join(model_name, f)) and (
-                    f in _stale_shards or not os.path.lexists(os.path.join(save_directory, f))
-                )
-            }
-        else:
-            _new_sizes = {
-                f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
-            }
-        _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
     pass
 
     _replaced_shards = []
