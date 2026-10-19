@@ -425,6 +425,78 @@ def test_experts_a_checkpoint_stores_apart(tmp_path, v41):
         np.testing.assert_array_equal(_bits(model.layers[0].switch_mlp(*call)), _bits(stock.layers[0].switch_mlp(*call)))
 
 
+def _qwen3_moe():
+    qwen3_moe = pytest.importorskip("mlx_lm.models.qwen3_moe")
+    mx.random.seed(0)
+    model = qwen3_moe.Model(qwen3_moe.ModelArgs(
+        model_type = "qwen3_moe", hidden_size = 256, num_hidden_layers = 3, intermediate_size = 256,
+        num_attention_heads = 4, num_experts = 16, num_experts_per_tok = 4, decoder_sparse_step = 1,
+        mlp_only_layers = [], moe_intermediate_size = 64, rms_norm_eps = 1e-6, vocab_size = 512,
+        num_key_value_heads = 2, head_dim = 64, rope_theta = 1e6, tie_word_embeddings = False,
+        max_position_embeddings = 8192, norm_topk_prob = True,
+    ))
+    nn.quantize(model, group_size = 32, bits = 4, class_predicate = lambda _, module: type(module).__name__ == "QuantizedSwitchLinear" or hasattr(module, "num_experts"))
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize("apart", [False, True])
+def test_a_wide_prefill_step_runs_layer_by_layer_on_full_tables(tmp_path, monkeypatch, apart):
+    # Runs of adjacent experts read in pieces that end mid-expert.
+    monkeypatch.setattr(zoo_offload, "_RUN_BYTES", 3000)
+    cache_module = pytest.importorskip("mlx_lm.models.cache")
+    tokens = mx.random.randint(0, 512, (1, 2 * 2048 + 5), key = mx.random.key(3))
+    stock = _lazy_copy(_qwen3_moe, str(tmp_path))
+    if apart:  # one tensor per expert, half the experts in each of two shards, with gaps between them
+        stacked = mx.load(str(tmp_path / "model.safetensors"))
+        os.remove(tmp_path / "model.safetensors")
+        for shard in range(2):
+            mx.save_safetensors(str(tmp_path / f"model-{shard}.safetensors"), {
+                name.replace("switch_mlp.", f"experts.{expert}."): value[expert]
+                for name, value in stacked.items() if "switch_mlp." in name for expert in range(shard * 8, shard * 8 + 8)
+            } | ({name: value for name, value in stacked.items() if "switch_mlp." not in name} if shard else {}))
+    expected_cache = cache_module.make_prompt_cache(stock)
+    expected = []
+    for start in range(0, tokens.shape[1], 2048):
+        expected.append(stock.model(tokens[:, start:start + 2048], cache = expected_cache))
+        mx.eval(expected[-1], [c.state for c in expected_cache])
+
+    model = _qwen3_moe().load_weights(list(tree_flatten(stock.parameters())))
+    offload_experts(model, str(tmp_path), 0.75)
+    switches = [layer.mlp.switch_mlp for layer in model.model.layers]
+    assert all(isinstance(glu, OffloadSwitchGLU) and (glu._slots.fields[0][2].apart is not None) == apart for glu in switches)
+    assert [glu._next for glu in switches] == switches[1:] + [None]
+    # Some experts resident first, which the full tables copy from the slots.
+    mx.eval(model(tokens[:, :3], cache = cache_module.make_prompt_cache(model)))
+    slots = lambda: [(s.misses, s.calls, s.slot_of.tolist(), s.score.tolist()) for s in (glu._slots for glu in switches)]
+    before = slots()
+    assert all(misses for misses, *_ in before)
+    reads, read = [], zoo_offload.read_ranges
+    monkeypatch.setattr(zoo_offload, "read_ranges", lambda jobs: (reads.extend(len(view) for *_, view in jobs), read(jobs)))
+    cache = cache_module.make_prompt_cache(model)
+    hidden = model.model(tokens, cache = cache)
+    mx.eval(hidden, [c.state for c in cache])
+    # Each missing expert read once; adjacent experts of a stacked tensor merged, never those stored apart.
+    missing = [(glu._slots.slot_of < 0).sum() for glu in switches]
+    rows = [field.row_bytes for _, _, field in switches[0]._slots.fields]
+    assert max(reads) <= 3000 and sum(reads) == sum(missing) * sum(rows)
+    unmerged = sum(missing) * sum(-(-row // 3000) for row in rows)
+    assert len(reads) == unmerged if apart else len(reads) < unmerged
+    # Every expert came from a full table: the slots decode uses were left alone.
+    assert slots() == before
+    assert all(glu._ahead is None and glu._full is None for glu in switches)
+    np.testing.assert_array_equal(_bits(hidden), _bits(mx.concatenate(expected, axis = 1)))
+    for (_, got), (_, want) in zip(tree_flatten([c.state for c in cache]), tree_flatten([c.state for c in expected_cache]), strict = True):
+        np.testing.assert_array_equal(*(_bits(a) if isinstance(a, mx.array) else a for a in (got, want)))
+    step = tokens[:, -1:]
+    np.testing.assert_array_equal(_bits(model(step, cache = cache)), _bits(stock(step, cache = expected_cache)))
+    # Without a causal mask the layer attends to the whole call, which consecutive steps cannot.
+    x = stock.model.embed_tokens(tokens)
+    layers = (model.model.layers[0], stock.model.layers[0])
+    got, want = (layer(x, None, cache_module.KVCache()) for layer in layers)
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+
+
 def test_offloaded_experts_are_never_loaded(tmp_path):
     model = _lazy_copy(lambda: _moe("lm", hidden = 512), str(tmp_path))
     table_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))

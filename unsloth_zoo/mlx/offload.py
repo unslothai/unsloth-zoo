@@ -27,6 +27,7 @@ load, priced from the safetensors headers before anything is built.
 
 import copy
 import glob
+import inspect
 import json
 import math
 import os
@@ -481,6 +482,44 @@ _SWITCH_GLUS = ("SwitchGLU", "DeepseekV41SwitchGLU")
 _EXPERT_FIELDS = ("weight", "scales", "biases", "bias")
 # The stock SwitchGLU sorts a call's routes from this many on.
 _SORT_ROUTES = 64
+# Largest single read when a full table reads runs of adjacent experts.
+_RUN_BYTES = 8 << 20
+# The prefill step a wide decoder layer call runs in: mlx-vlm's and mlx-lm's default.
+_PREFILL_STEP = 2048
+# Decoder layers whose call wider than a prefill step may run as consecutive steps on the layer's
+# own cache (no state shared with other layers): each token-indexed argument's token axis, and the
+# masks under which the layer attends causally.
+_WIDE_LAYERS = {
+    "mlx_vlm.models.qwen4_exp.language.Qwen4ExpDecoderLayer": (
+        {"hidden_states": 1, "input_ids": 1, "position_ids": -1}, (None, "causal")),
+    "mlx_lm.models.qwen3_moe.Qwen3MoeDecoderLayer": ({"x": 1}, ("causal",)),
+}
+_table_reader_pool = None
+
+
+def _runs(field, experts):
+    """``[fd, offset, first expert, count]`` covering the sorted ``experts``, consecutive experts
+    stored back to back in one file merged into one run."""
+    runs = []
+    for expert in experts.tolist():
+        fd, offset = field.location(expert)
+        last = runs[-1] if runs else None
+        if last and last[0] == fd and last[2] + last[3] == expert and last[1] + last[3] * field.row_bytes == offset:
+            last[3] += 1
+        else:
+            runs.append([fd, offset, expert, 1])
+    return runs
+
+
+def _table_reader():
+    """Fills read-ahead tables one at a time (each spreads its reads over the reader pool)."""
+    global _table_reader_pool
+    with _pool_lock:
+        if _table_reader_pool is None:
+            _table_reader_pool = ThreadPoolExecutor(1, thread_name_prefix = "unsloth-offload-table")
+        return _table_reader_pool
+
+
 _SCORE_DECAY, _SCORE_DECAY_EVERY = 0.7, 4
 
 
@@ -601,6 +640,9 @@ class OffloadSwitchGLU(nn.Module):
         object.__setattr__(self, "_glu", glu)
         object.__setattr__(self, "_slots", slots)
         object.__setattr__(self, "_parts", None)
+        object.__setattr__(self, "_full", None)  # the stock module on a full table, while a wide layer runs
+        object.__setattr__(self, "_ahead", None)  # (future, module) of a table being read ahead
+        object.__setattr__(self, "_next", None)  # the next offloaded layer a wide prefill reaches
         self.experts = experts
         for name in ("up_proj", "gate_proj", "activation", "down_proj"):
             object.__setattr__(self, name, _GLUPart(self, name))
@@ -615,7 +657,82 @@ class OffloadSwitchGLU(nn.Module):
         routes = np.asarray(indices).reshape(-1).astype(np.int64)
         return routes, np.unique(routes)
 
+    def _table(self):
+        """The stock module on a new table of all this layer's experts, and the function filling it:
+        resident experts copied from the slots, the others read in runs of adjacent experts. ``None``
+        when a field is cast at load, so its bytes on disk are not the table's."""
+        slots = self._slots
+        if any(field.cast is not None for _, _, field in slots.fields):
+            return None
+        arrays = {
+            (projection, name): mx.zeros((self.experts, *field.shape), dtype = field.dtype)
+            for projection, name, field in slots.fields
+        }
+        mx.eval(list(arrays.values()))
+        # Taken here: buffers of evaluated arrays, which the filling thread only copies into.
+        views = [
+            (field, memoryview(arrays[projection, name]).cast("B"), memoryview(slots.arrays[projection, name]).cast("B"))
+            for projection, name, field in slots.fields
+        ]
+        held = np.flatnonzero(slots.slot_of >= 0)
+        where, missing = slots.slot_of[held], np.flatnonzero(slots.slot_of < 0)
+
+        def fill():
+            jobs = []
+            for field, table, resident in views:
+                row = field.row_bytes
+                rows = np.frombuffer(table, dtype = np.uint8).reshape(self.experts, row)
+                rows[held] = np.frombuffer(resident, dtype = np.uint8).reshape(-1, row)[where]
+                for fd, offset, first, count in _runs(field, missing):
+                    start, size = first * row, count * row
+                    jobs += [(fd, offset + at, table[start + at:start + min(size, at + _RUN_BYTES)])
+                             for at in range(0, size, _RUN_BYTES)]
+            read_ranges(jobs)
+
+        glu = copy.copy(self._glu)
+        for projection in _PROJECTIONS:
+            linear = copy.copy(getattr(self._glu, projection))
+            for (owner, name), array in arrays.items():
+                if owner == projection:
+                    linear[name] = array
+            setattr(glu, projection, linear)
+        return glu, fill
+
+    def _join_ahead(self):
+        """The module a read-ahead filled, once it is filled; ``None`` when none was started."""
+        ahead = self._ahead
+        if ahead is None:
+            return None
+        object.__setattr__(self, "_ahead", None)
+        ahead[0].result()
+        return ahead[1]
+
+    def _wide(self, read_next):
+        """Run calls on a full table until ``_narrow``, reading the next offloaded layer's ahead."""
+        glu = self._join_ahead()
+        if glu is None:
+            made = self._table()
+            if made is None:
+                return False
+            glu, fill = made
+            fill()
+        glu.train(self.training)
+        object.__setattr__(self, "_full", glu)
+        following = self._next
+        if read_next and following is not None and following._ahead is None:
+            made = following._table()
+            if made is not None:
+                object.__setattr__(following, "_ahead", (_table_reader().submit(made[1]), made[0]))
+        return True
+
+    def _narrow(self):
+        object.__setattr__(self, "_full", None)
+
     def __call__(self, x, indices, *weights):
+        if self._full is not None:
+            return self._full(x, indices, *weights)
+        # A read-ahead nothing used must finish before the slots change under its copy.
+        self._join_ahead()
         glu = self._stock()
         routes, experts = self._routes(indices)
         slots = self._slots
@@ -725,6 +842,7 @@ class OffloadSwitchGLU(nn.Module):
         return run
 
     def _part(self, name, *args, **kwargs):
+        self._join_ahead()
         glu = self._stock()
         if name == "activation":
             up, gate = args
@@ -772,6 +890,76 @@ class OffloadSwitchGLU(nn.Module):
         """``(on disk, resident)`` bytes of the experts this stands in for."""
         slots = self._slots
         return self.experts * slots.expert_bytes, sum(array.nbytes for array in slots.arrays.values())
+
+
+def _token_slice(value, axis, start, end):
+    index = [slice(None)] * value.ndim
+    index[axis] = slice(start, end)
+    return value[tuple(index)]
+
+
+class _WideLayer:
+    """Mixed into a decoder layer of ``_WIDE_LAYERS`` holding offloaded experts. A call wider than
+    ``_PREFILL_STEP`` tokens runs as consecutive steps of it on the layer's cache, which is what a
+    chunked prefill computes for the layer, on a table of all its experts read once for the call while
+    the next offloaded layer's table is read ahead. A prefill step of several chunks then reads each
+    layer's experts once, and leaves the slots decode uses alone."""
+
+    def __call__(self, *args, **kwargs):
+        axes = self._wide_axes
+        first = next(iter(axes))
+        hidden = args[0] if args else kwargs.get(first)
+        if not isinstance(hidden, mx.array) or hidden.ndim < 2 or hidden.shape[0] != 1 or hidden.shape[1] <= _PREFILL_STEP:
+            return super().__call__(*args, **kwargs)
+        bound = self._wide_signature.bind(self, *args, **kwargs)
+        cache, mask = bound.arguments.get("cache"), bound.arguments.get("mask")
+        causal = (mask is None or isinstance(mask, str)) and mask in self._wide_masks
+        switch = self._offload_switch
+        if cache is None or not causal or not switch._wide(read_next = True):
+            return super().__call__(*args, **kwargs)
+        given = {name: bound.arguments.get(name) for name in axes}
+        outputs = []
+        try:
+            for start in range(0, hidden.shape[1], _PREFILL_STEP):
+                for name, axis in axes.items():
+                    if given[name] is not None:
+                        bound.arguments[name] = _token_slice(given[name], axis, start, start + _PREFILL_STEP)
+                output = super().__call__(*bound.args[1:], **bound.kwargs)
+                mx.eval(output, cache.state)
+                outputs.append(output)
+        finally:
+            switch._narrow()
+        return mx.concatenate(outputs, axis = axes[first])
+
+
+_WIDE_CLASSES = {}
+
+
+def _widen_layers(model, switches):
+    """Give each ``_WIDE_LAYERS`` layer holding one of ``switches`` (path -> ``OffloadSwitchGLU``) its
+    wide calls, and chain each offloaded layer to the next one of its stack for read-ahead."""
+    stacks = {}
+    for path, layer in model.named_modules():
+        base = type(layer)
+        spec = _WIDE_LAYERS.get(f"{base.__module__}.{base.__qualname__}")
+        if spec is None:
+            continue
+        held = [switch for inner, switch in switches.items() if inner.startswith(path + ".")]
+        if len(held) != 1:
+            continue
+        if base not in _WIDE_CLASSES:
+            _WIDE_CLASSES[base] = type(base.__name__, (_WideLayer, base), {
+                "_wide_axes": spec[0], "_wide_masks": spec[1], "_wide_signature": inspect.signature(base.__call__),
+            })
+        layer.__class__ = _WIDE_CLASSES[base]
+        object.__setattr__(layer, "_offload_switch", held[0])
+        parent, _, index = path.rpartition(".")
+        if index.isdigit():
+            stacks.setdefault(parent, []).append((int(index), held[0]))
+    for stack in stacks.values():
+        stack.sort(key = lambda item: item[0])
+        for (_, switch), (_, following) in zip(stack, stack[1:]):
+            object.__setattr__(switch, "_next", following)
 
 
 def _decode_block(glu, x):
@@ -895,6 +1083,7 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
     cast_for = _cast_rule(model, cast_dtype)
     store = CheckpointTensors(model_dir)
     report = {"layers": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}
+    replaced = {}
     for path, glu in list(expert_sites(model)):
         experts = glu.up_proj["weight"].shape[0]
         fields, top_k, reason = _expert_fields(model, store, path, glu, cast_for)
@@ -914,10 +1103,12 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
         replacement = OffloadSwitchGLU(stock, slots, experts)
         replacement.train(glu.training)
         _replace_module(model, path, replacement)
+        replaced[path] = replacement
         on_disk, resident = replacement.offload_bytes()
         report["layers"] += 1
         report["on_disk_bytes"] += on_disk
         report["resident_bytes"] += resident
+    _widen_layers(model, replaced)
     return report
 
 
