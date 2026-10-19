@@ -1810,6 +1810,13 @@ def patch_mamba_fused_split_without_causal_conv1d():
     reference (None) so modeling code takes the split path (torch conv1d + mamba_ssm chunk scan)."""
     if not _mamba_fused_split_needs_causal_conv1d_unusable():
         return
+    # Keep the fused path when its conv can run on Triton instead of causal_conv1d's C++ kernels.
+    try:
+        from .gdn_causal_conv1d import install_mamba_ssm_triton_conv
+        if install_mamba_ssm_triton_conv():
+            return
+    except Exception:
+        pass
     try:
         import transformers.integrations as _integrations
         from transformers.integrations import hub_kernels as _hk
