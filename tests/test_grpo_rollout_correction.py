@@ -481,6 +481,15 @@ def test_mismatch_stats_stay_finite_on_infinite_logps():
     assert torch.isfinite(stats).all()
 
 
+def test_mismatch_stats_stay_finite_on_many_saturated_tokens():
+    # Every token at +inf log ratio: the per token cap must leave the float64 K3 sum finite too.
+    n = 20000
+    old = torch.zeros(1, n, dtype = torch.float64)
+    sampling = torch.full((1, n), -float("inf"), dtype = torch.float64)
+    stats = rr.grpo_rollout_mismatch_stats(old, sampling, torch.ones(1, n, dtype = torch.long), torch.ones(1, n, dtype = torch.float64))
+    assert torch.isfinite(stats).all()
+
+
 def test_rollout_metrics_pool_micro_batches_until_log(monkeypatch):
     # Docstring promise: sums pooled over micro-batches before dividing, not a mean of per-micro-batch ratios.
     state = {}

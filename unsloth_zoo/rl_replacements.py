@@ -2087,8 +2087,9 @@ def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
         maskd = keep.to(torch.float64)
         log_ratio = torch.nan_to_num(log_ratio, nan = 0.0) * maskd
         # verl compute_offpolicy_metrics does not clamp: a +-20 clamp capped K1 at 20 and K3 near
-        # exp(20). Only keep exp() finite in float64 (and -inf logps out of inf - inf).
-        log_ratio = torch.clamp(log_ratio, min = -700.0, max = 700.0)
+        # exp(20). Only keep the float64 sums finite (and -inf logps out of inf - inf): exp(670)
+        # leaves room for 1e15 saturated tokens below the float64 max (exp(709.8)).
+        log_ratio = torch.clamp(log_ratio, min = -670.0, max = 670.0)
         k3 = (torch.expm1(log_ratio) - log_ratio) * maskd
         w = torch.broadcast_to(is_weights.to(torch.float64), maskd.shape) * maskd
         rejected = ((w == 0) & keep).to(torch.float64)

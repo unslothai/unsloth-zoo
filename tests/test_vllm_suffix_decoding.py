@@ -222,6 +222,7 @@ def test_memory_retry_raises_a_budget_below_lookahead():
     {"method": "suffix", "num_speculative_tokens": -1},
     {"method": "suffix", "num_speculative_tokens": "many"},
     {"method": "suffix", "num_speculative_tokens": True},
+    {"method": "suffix", "num_speculative_tokens": float("inf")},
 ])
 def test_malformed_lookahead_is_left_to_vllm(config):
     # Was TypeError / ZeroDivisionError from the fitter; now vLLM's own validation reports the value.

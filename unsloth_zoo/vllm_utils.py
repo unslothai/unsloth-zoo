@@ -3543,7 +3543,7 @@ def _speculation_lookahead(speculative_config):
         return None
     try:
         k = int(k)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: json.loads gives inf for 1e309
         return None
     return k if k >= 0 else None
 
