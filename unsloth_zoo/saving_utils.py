@@ -5926,6 +5926,37 @@ def merge_and_overwrite_lora(
     return save_directory
 pass
 
+def _cached_file_matching_revision(repo_id, filename, hf_cache_dir, token, revision):
+    # A cached blob of the file at `revision`, whichever snapshot fetched it (refs/main may have
+    # moved on, or the shard came by commit SHA): cache blobs are named by content hash (LFS
+    # sha256, xet hash, or git blob id for small files). Anything unverifiable returns None.
+    from huggingface_hub import HfApi
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+        from huggingface_hub.file_download import repo_folder_name
+        blobs = os.path.join(
+            hf_cache_dir or HF_HUB_CACHE, repo_folder_name(repo_id = repo_id, repo_type = "model"), "blobs",
+        )
+        if not os.path.isdir(blobs): return None
+        infos = HfApi(token = token).get_paths_info(repo_id, [filename], revision = revision)
+    except Exception:
+        return None
+    for info in infos:
+        if getattr(info, "path", None) != filename:
+            continue
+        lfs = getattr(info, "lfs", None)
+        expected = {
+            getattr(lfs, "sha256", None) if lfs is not None else getattr(info, "blob_id", None),
+            getattr(info, "xet_hash", None),
+        } - {None, ""}
+        for name in expected:
+            # A partial download is "<hash>.incomplete", never the bare hash.
+            candidate = os.path.join(blobs, name)
+            if os.path.isfile(candidate): return candidate
+    return None
+pass
+
+
 def _try_copy_all_from_cache(
     repo_id: str,
     filenames_to_check: List[str],
@@ -5962,6 +5993,15 @@ def _try_copy_all_from_cache(
             )
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
+            # Pinned to a Hub commit the cache has no snapshot for (the repo moved since it was
+            # cached, often only a README edit): reuse the cached `main` copy when it is the
+            # same file at that commit, instead of downloading every shard again.
+            cached_path_str = _cached_file_matching_revision(
+                repo_id, filename, hf_cache_dir, token, revision,
+            ) if revision is not None else None
+            if cached_path_str is not None:
+                cached_paths_map[filename] = Path(cached_path_str)
+                continue
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose
             all_found = False
             break
