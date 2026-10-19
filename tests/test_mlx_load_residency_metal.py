@@ -260,14 +260,15 @@ def test_offloaded_floats_get_the_load_cast(tmp_path, cast):
     assert report["resident_bytes"] == sum(column.nbytes for column in held) > 0
 
 
-def _moe(lib, dims = 512, hidden = 32, scales = mx.bfloat16, eval = True, quantized = True, experts = 64):
+def _moe(lib, dims = 512, hidden = 32, scales = mx.bfloat16, eval = True, quantized = True, experts = 64, v41 = False):
     """One MoE layer of 64 quantized experts, top-4, from mlx-vlm's or mlx-lm's ``SwitchGLU``; 512
     wide, as mlx-vlm's decode-block kernels require."""
     switch_layers = pytest.importorskip(f"mlx_{lib}.models.switch_layers")
     mx.random.seed(0)
     block = nn.Module()
     block.top_k = 4
-    block.switch_mlp = switch_layers.SwitchGLU(dims, hidden, experts)
+    v41 = v41 and pytest.importorskip("mlx_vlm.models.deepseek_v41.language")
+    block.switch_mlp = v41.DeepseekV41SwitchGLU(dims, hidden, experts, activation = v41.DeepseekV41SwiGLU(10.0)) if v41 else switch_layers.SwitchGLU(dims, hidden, experts)
     model = nn.Module()
     model.layers = [block]
     if not quantized:
@@ -341,23 +342,27 @@ def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
         np.testing.assert_array_equal(_bits(got), _bits(want))
 
 
-def test_experts_a_checkpoint_stores_apart(tmp_path):
-    # As GLM-5's: one tensor per expert, which mlx-vlm stacks at load.
-    stock = _moe("lm")
+@pytest.mark.parametrize("v41", [False, True])
+def test_experts_a_checkpoint_stores_apart(tmp_path, v41):
+    # As GLM-5's: one tensor per expert, which mlx-vlm stacks at load; DeepSeek V4.1's, under reference names.
+    stock = _moe("vlm" if v41 else "lm", v41 = v41)
     stacked = dict(tree_flatten(stock.parameters()))
+    names = {p: (p, n) for p, n in (("gate_proj", "w1"), ("down_proj", "w2"), ("up_proj", "w3"))} if v41 else {}
     for shard in range(2):  # an expert's tensors may sit in any shard
         mx.save_safetensors(str(tmp_path / f"model-{shard}.safetensors"), {
-            name.replace("switch_mlp.", f"experts.{expert}."): value[expert]
+            name.replace("switch_mlp.", f"experts.{expert}.").replace(*names.get(name.split(".")[-2], ("", ""))): value[expert]
             for name, value in stacked.items() for expert in range(shard, value.shape[0], 2)
         })
     (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 4}))
-    model = _moe("lm").load_weights(list(stacked.items()))
+    model = _moe("vlm" if v41 else "lm", v41 = v41).load_weights(list(stacked.items()))
     table_bytes = sum(value.nbytes for value in stacked.values())
     inventory = offload_inventory(str(tmp_path))
     assert (inventory["expert_bytes"], inventory["experts_per_layer"]) == (table_bytes, 64)
     report = offload_experts(model, str(tmp_path), 0.75)
     assert report["layers"] == 1 and report["on_disk_bytes"] == table_bytes
-    for call in _moe_calls(mx.bfloat16)[::3]:
+    for x, indices in _moe_calls(mx.bfloat16):  # V4.1's on 3 routes a token, not the layer's top-k
+        indices = indices[..., :3] if v41 else indices
+        call = (x, indices, mx.random.uniform(shape = indices.shape, key = mx.random.key(indices.size)))[:3 if v41 else 2]
         np.testing.assert_array_equal(_bits(model.layers[0].switch_mlp(*call)), _bits(stock.layers[0].switch_mlp(*call)))
 
 
@@ -552,6 +557,7 @@ def test_offload_inventory(tmp_path):
     table = mx.zeros((32, 8), mx.bfloat16)
     mx.save_safetensors(str(tmp_path / "extra.safetensors"), {
         "language_model.model.embed_tokens_per_layer.weight": table,
+        "language_model.layers.1.engram.embed.weight": table,  # mlx-vlm maps it, never resident
         # the drafter head is never offloaded
         **{f"mtp.layers.0.switch_mlp.{p}.{f}": table for p in ("gate_proj", "up_proj", "down_proj") for f in ("weight", "scales")},
     })

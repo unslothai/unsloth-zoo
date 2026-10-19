@@ -481,6 +481,10 @@ def _replace_module(model, path, replacement):
 # eviction, the call's own experts never evicted, and over-capacity calls run expert by expert.
 
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+# DeepSeek's reference names for them, which DeepSeek V4.1 checkpoints keep.
+_REFERENCE_NAMES = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+# DeepSeek V4.1's also takes each route's weight into its activation.
+_SWITCH_GLUS = ("SwitchGLU", "DeepseekV41SwitchGLU")
 _EXPERT_FIELDS = ("weight", "scales", "biases", "bias")
 # The stock SwitchGLU sorts a call's routes from this many on.
 _SORT_ROUTES = 64
@@ -617,13 +621,13 @@ class OffloadSwitchGLU(nn.Module):
         routes = np.asarray(indices).reshape(-1).astype(np.int64)
         return routes, np.unique(routes)
 
-    def __call__(self, x, indices):
+    def __call__(self, x, indices, *weights):
         glu = self._stock()
         routes, experts = self._routes(indices)
         slots = self._slots
         if experts.size <= slots.capacity:
             slots.ensure(routes, experts)
-            return glu(x, slots.slot_indices(indices))
+            return glu(x, slots.slot_indices(indices), *weights)
         # Over the slots: expert by expert, each route computed as the stock call computes it.
         rows = x.reshape(-1, x.shape[-1])
         token = np.arange(routes.size) // indices.shape[-1]
@@ -634,16 +638,16 @@ class OffloadSwitchGLU(nn.Module):
             run = self._block_run(glu, rows, indices.dtype)
         else:  # mlx-vlm computes a batch's decode block one route at a time, as an unsorted gather does
             sort = not block and indices.size >= _SORT_ROUTES and _picks_rhs(1, indices.size, self.experts)
-            run = self._gather_run(rows, lambda r, s, srt: (self._glu_rows(glu, r, s, srt)[3],), sort)
-        (routed,) = self._by_expert(token, routes, run)
+            run = self._gather_run(rows, lambda r, s, srt, *w: (self._glu_rows(glu, r, s, srt, *w)[3],), sort, *weights)
+        (routed,) = self._by_expert(np.arange(routes.size) if weights else token, routes, run)
         return routed.reshape(*indices.shape, -1)
 
     @staticmethod
-    def _glu_rows(glu, rows, slots, sort):
+    def _glu_rows(glu, rows, slots, sort, *weights):
         """``(up, gate, activated, down)`` of one route per row, by the stock projections' kernels."""
         up = glu.up_proj.gather(rows, slots, sort)
         gate = glu.gate_proj.gather(rows, slots, sort)
-        activated = glu.activation(up, gate)
+        activated = glu.activation(up, gate, *weights)
         return up, gate, activated, glu.down_proj.gather(activated, slots, sort)
 
     def _by_expert(self, row_of_route, routes, run):
@@ -667,9 +671,10 @@ class OffloadSwitchGLU(nn.Module):
         inverse = mx.array(np.argsort(order, kind = "stable").astype(np.int32))
         return tuple(mx.concatenate(column)[inverse] for column in zip(*outputs))
 
-    def _gather_run(self, rows, compute, sort):
+    def _gather_run(self, rows, compute, sort, weights = None):
         """Chunks as stock gathers, one route per row. ``sort`` keeps a chunk on
-        ``gather_qmm_rhs`` by sorting it and padding it to the slot table's minimum for that kernel."""
+        ``gather_qmm_rhs`` by sorting it and padding it to the slot table's minimum for that kernel.
+        With ``weights`` (``[..., top_k]``), sources are routes and ``compute`` also gets their weights."""
         slots = self._slots
         floor = max(16, 4 * slots.capacity)
 
@@ -678,14 +683,20 @@ class OffloadSwitchGLU(nn.Module):
             if sort and count < floor:
                 chunk, source = (np.pad(a, (0, floor - count), mode = "edge") for a in (chunk, source))
             index = slots.map[mx.array(chunk.astype(np.int32))]
-            taken = rows[mx.array(source.astype(np.int32))]
+            source = mx.array(source.astype(np.int32))
+            if weights is None:
+                taken, weight = rows[source], ()
+            else:
+                taken, weight = rows[source // weights.shape[-1]], (weights.reshape(-1)[source],)
             if sort:  # the stock sorted layout: one [1, dims] row per route, flat indices
                 index_order = mx.argsort(index)
-                parts = compute(mx.expand_dims(taken[index_order], -2), index[index_order], True)
+                weight = tuple(w[index_order][:, None, None] for w in weight)
+                parts = compute(mx.expand_dims(taken[index_order], -2), index[index_order], True, *weight)
                 inverse = mx.argsort(index_order)
                 parts = tuple(part[inverse] for part in parts)
             else:
-                parts = compute(mx.expand_dims(taken, (-2, -3)), index.reshape(-1, 1), False)
+                weight = tuple(w[:, None, None, None] for w in weight)
+                parts = compute(mx.expand_dims(taken, (-2, -3)), index.reshape(-1, 1), False, *weight)
             return tuple(part.reshape(part.shape[0], -1)[:count] for part in parts)
 
         return run
@@ -781,7 +792,7 @@ def _decode_block(glu, x):
 def expert_sites(model):
     """``(path, module)`` of every ``SwitchGLU`` of quantized experts in ``model``."""
     for path, module in model.named_modules():
-        if type(module).__name__ == "SwitchGLU" and all(
+        if type(module).__name__ in _SWITCH_GLUS and all(
             type(getattr(module, name, None)).__name__ == "QuantizedSwitchLinear" for name in _PROJECTIONS
         ):
             yield path, module
@@ -807,8 +818,11 @@ def _expert_tensors(store, path, projection, name, expected):
     if not path.endswith(".switch_mlp"):
         return None
     base = path[:-len("switch_mlp")] + "experts."
-    names = [_checkpoint_name(store, f"{base}{expert}.{projection}.{name}") for expert in range(expected.shape[0])]
-    if None in names:
+    for key in (projection, _REFERENCE_NAMES[projection]):
+        names = [_checkpoint_name(store, f"{base}{expert}.{key}.{name}") for expert in range(expected.shape[0])]
+        if None not in names:
+            break
+    else:
         return None
     for tensor in names:
         _, dtype, shape, _ = store.specs[tensor]
@@ -918,9 +932,11 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
 
 OFFLOAD_CONTEXT_STEP = 256
 _PLE_TENSORS = (".embed_tokens_per_layer.", ".ngram_embedding.shards.")
+# Tables mlx-vlm always reads row by row from the checkpoint, never resident: DeepSeek V4.1's Engram.
+_MAPPED_TENSORS = (".engram.embed.",)
 _EXPERT_TENSOR = re.compile(r"\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias|global_scale)$")
 # An expert a checkpoint stores apart, stacked into ``switch_mlp`` at load.
-_EXPERT_APART = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias|global_scale)$")
+_EXPERT_APART = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj|w1|w2|w3)\.(weight|scales|biases|bias|global_scale)$")
 _FLOAT_BYTES = {"F16": 2, "BF16": 2, "F32": 4, "F64": 8}
 _NESTED_CONFIGS = ("text_config", "thinker_config", "language_config", "llm_config")
 _TOP_K = ("num_experts_per_tok", "top_k", "n_activated_experts", "experts_per_token")
@@ -973,6 +989,8 @@ def offload_inventory(model_dir, dtype_bytes = None):
     total = ple = 0
     layers = {}  # prefix -> [bytes, experts, quantized projections, global scales]
     for name, shape, size in _tensors(model_dir, dtype_bytes):
+        if any(part in name for part in _MAPPED_TENSORS):
+            continue
         total += size
         if name.startswith("mtp."):
             continue
