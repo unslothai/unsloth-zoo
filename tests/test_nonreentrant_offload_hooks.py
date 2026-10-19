@@ -167,6 +167,30 @@ def test_stream_prefetch_skips_inputs_already_unpacked(gc_module, monkeypatch, k
     assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_low_ram_growth_fallback_frees_the_old_pinned_block(gc_module, monkeypatch):
+    # One local rank, host RAM short: the grown slot goes pageable and its old pinned block must
+    # be returned to the OS, not left cached in torch's host allocator beside the pageable copy.
+    monkeypatch.setattr(gc_module, "PINNED_MEMORY_AVAILABLE", True, raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
+    monkeypatch.setattr(gc_module, "GC_PINNED_CAP", gc_module._PIN_PER_BLOCK, raising = False)
+    torch.cuda.init()
+    torch._C._host_emptyCache()
+    fits = {"ok": True}
+    monkeypatch.setattr(gc_module, "_block_fits_host_ram", lambda block: fits["ok"])
+    held = lambda: int(torch.cuda.host_memory_stats()["allocated_bytes.current"])
+    before = held()
+    slot = gc_module._new_host_buffer(1 << 20, torch.uint8)       # 1 MiB pinned block
+    assert slot.is_pinned() and held() - before == 1 << 20
+    slot.copy_(torch.ones(1 << 20, dtype = torch.uint8))
+    fits["ok"] = False
+    grown = gc_module._grow_host_buffer(slot, 4 << 20)
+    del slot                                                      # the caller replaces the slot
+    assert not grown.is_pinned() and grown.numel() == 4 << 20
+    assert held() - before == 0
+    assert gc_module.GC_PINNED_BYTES == 0 and not any(gc_module._PINNED_CACHED.values())
+
+
 def _forward_peak_active(hooks, n_layers = 12):
     torch.cuda.synchronize()
     torch.cuda.empty_cache()

@@ -166,7 +166,17 @@ def _grow_host_buffer(buffer, new_size):
     # resize_ takes a new pinned block and hands the old one back to the host cache.
     if pinned and not _reserve_pinned(new_bytes):
         _release_pinned(old_bytes)
-        return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+        replacement = _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+        if GC_PINNED_CAP == _PIN_PER_BLOCK:
+            # Host RAM is short and the flush inside _reserve_pinned ran while this slot still held
+            # its old block. The caller replaces the slot (its contents are rewritten before every
+            # read), so free the old block now instead of leaving it cached beside the pageable copy.
+            try:
+                buffer.resize_(0)
+                buffer.untyped_storage().resize_(0)  # Tensor.resize_ alone never shrinks a storage
+            except Exception: pass
+            else: _empty_host_cache()
+        return replacement
     try:
         buffer.resize_(new_size)
         if pinned: _release_pinned(old_bytes)
