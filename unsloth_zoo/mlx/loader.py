@@ -3670,7 +3670,8 @@ _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
     "4405529c372e5bc69cf782c1038b674b55b46434e9a515d9db46a2a92e0414fa"
 )
 _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256 = (
-    "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576"
+    "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576",
+    "ae6c02d68719bee0ce97ab68458eed1f092aa2ab0398f0b903d5a9bf68cfc7ab",
 )
 _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256 = (
     "f995c993dd959cc55a43f70f8f87c115d18833179e464426d63153022f4770ec"
@@ -4124,7 +4125,7 @@ def _minicpmv4_7_text_positions_adapter(cls):
     if (
         getattr(original, "_unsloth_minicpmv4_7_text_positions", False)
         or _source_token_sha256(_safe_getsource(original))
-        != _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
+        not in _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
         or _source_token_sha256(_safe_getsource(getattr(rope, "get_rope_index", None)))
         != _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256
     ):

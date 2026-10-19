@@ -118,7 +118,7 @@ def test_minicpmv4_7_text_batch_matches_upstream_and_compiles(monkeypatch):
     upstream = getattr(installed, "__wrapped__", installed)
     monkeypatch.setattr(module.Model, "get_input_embeddings", upstream)
     with monkeypatch.context() as changed:
-        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", "0" * 64)
+        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", ("0" * 64,))
         assert loader._minicpmv4_7_text_positions_adapter(module.Model) is upstream
     loader._ensure_minicpmv4_7_text_positions("minicpmv4_7")
     patched = module.Model.get_input_embeddings
