@@ -549,6 +549,9 @@ pass
 
 def patch_gpt_oss():
     try:
+        # UNSLOTH_MXFP4_MATMUL_OGS=0 turns triton_kernels off here too, as triton_kernels_compat does.
+        if os.environ.get("UNSLOTH_MXFP4_MATMUL_OGS", "1") == "0":
+            raise ImportError("UNSLOTH_MXFP4_MATMUL_OGS=0")
         import triton_kernels
 
         HAS_TRITON_KERNELS = True
