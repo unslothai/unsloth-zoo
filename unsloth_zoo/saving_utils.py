@@ -6128,12 +6128,12 @@ _PUSHING_CODE = \
 PushToHubMixin._upload_modified_files(
     PushToHubMixin,
     working_dir = save_directory,
-    repo_id = '{repo_id}',
+    repo_id = {repo_id!r},
     files_timestamps = files_timestamps,
     commit_message = "Upload Unsloth finetuned model",
     token = token,
     create_pr = False,
-    revision = {revision},
+    revision = {revision!r},
     commit_description = "Upload Unsloth finetuned model",
 )
 if {use_temp_file} and temp_file is not None: temp_file.cleanup()
