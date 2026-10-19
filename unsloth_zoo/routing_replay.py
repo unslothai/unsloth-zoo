@@ -456,14 +456,23 @@ def _softmax_gather(logits, ids, renorm):
     return F.softmax(logits.float(), dim = -1).gather(-1, ids)
 
 
+# Below this the forced experts' probability mass is gone: 1 / total would reach 1e20 in the
+# backward, and the router could not have picked them anyway.
+_MIN_RENORM_TOTAL = 1e-20
+
+
 def _probs_gather(probs, ids, renorm):
     w = probs.float().gather(-1, ids)
     if not renorm:
         return w
-    # Forced experts whose probabilities all underflowed to 0 have no weights to renormalise:
-    # divide by 1 there instead of 0 / 0 (the router hook keeps natural routing on those rows).
+    # Forced experts whose probabilities (nearly) all underflowed have no weights to renormalise:
+    # w / total there is 0 / 0, and a subnormal total still overflows the backward (~1 / total).
+    # Those rows return zeros (the router hook then keeps the natural routing); dividing by 1
+    # there keeps the masked-out branch's gradient finite.
     total = w.sum(dim = -1, keepdim = True)
-    return w / torch.where(total > 0, total, torch.ones_like(total))
+    ok = total > _MIN_RENORM_TOTAL
+    out = w / torch.where(ok, total, torch.ones_like(total))
+    return torch.where(ok, out, torch.zeros_like(out))
 
 
 def _formulas():
@@ -604,7 +613,8 @@ def _router_hook(layer_index, compact = None):
         reweight = _formulas()[formula]
         new_weights = reweight(logits2, forced)
         if formula == "probs_renorm":
-            # Every forced probability is 0: nothing to replay with, so keep the natural routing.
+            # The forced probabilities (nearly) all underflowed: nothing to replay with, so keep the
+            # natural routing (_probs_gather returns zeros there).
             valid = valid & (new_weights.sum(dim = -1, keepdim = True) > 0)
             forced = torch.where(valid, forced, ids2.long())
         new_weights = new_weights.to(weights2.dtype)

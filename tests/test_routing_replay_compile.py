@@ -112,3 +112,20 @@ def test_hooked_decoder_inside_compiled_model_does_not_recompile(replay):
         frames.append(torch._dynamo.utils.counters["stats"]["unique_graphs"] - before)
     torch._dynamo.reset()
     assert frames[1:] == [0, 0, 0], frames
+
+
+@pytest.mark.parametrize("far", [90.0, 200.0])
+def test_subnormal_forced_probabilities_keep_natural_routing(replay, far):
+    # Logits ~90 below the natural top-2 give nonzero subnormal fp32 probabilities: renormalising
+    # them gives finite weights but a backward of ~1 / total, which overflows to NaN.
+    replay._STATE.in_forward = True
+    replay._STATE.current = torch.tensor([[[2, 3]]])
+    router = _ProbsRouter()
+    router.register_forward_hook(replay._router_hook(0))
+    x = torch.tensor([[0.0, -1.0, -far, -far - 1.0]], requires_grad = True)
+    _, weights, ids = router(x)
+    assert ids[0].tolist() == [0, 1]
+    natural = x[0].detach().softmax(-1)[[0, 1]]
+    torch.testing.assert_close(weights[0], natural / natural.sum())
+    weights.square().sum().backward()
+    assert torch.isfinite(x.grad).all(), x.grad
