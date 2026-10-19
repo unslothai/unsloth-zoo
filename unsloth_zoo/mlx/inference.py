@@ -4382,7 +4382,12 @@ def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
             _unless_failed_buffer(error)
             return per_row()  # inside a function transformation, which cannot evaluate; timed later
         _FIRST_USE_WORK[0] += 1
-        if not _exact_attention_faster(per_row, fused):
+        try:
+            faster = _exact_attention_faster(per_row, fused)
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            faster = False  # the kernel cannot build or launch here: a loss
+        if not faster:
             timings = 1 if lost is None else lost[0] + 1
             _EXACT_ATTENTION_TIMED[timing] = [timings, _EXACT_ATTENTION_RETRY << timings]
             return per_row()

@@ -9,6 +9,7 @@
 # into a different convergence basin (probe 31 = 67% vs probe 33-37 = 40-53%,
 # see danielhanchen/unsloth-staging-2).
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -751,6 +752,12 @@ def test_exact_attention_engages_where_timed_faster_and_caches_each_bucket_verdi
     first = attend(17000, q5)
     wins.add(17000)
     assert [first] + [attend(17000, q5) for _ in range(4)] == [17000, 17000, "kernel", "kernel", "kernel"] and timings == [9800] * 3 + [17000] * 2
+    # A kernel that cannot build is a loss, while a failed command buffer still raises.
+    for message, raised in (("Unable to build metal library from source", False), (inference._FAILED_BUFFER, True)):
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
+        monkeypatch.setattr(inference, "_exact_attention_faster", lambda per_row, fused: (_ for _ in ()).throw(RuntimeError(message)))
+        with pytest.raises(RuntimeError) if raised else contextlib.nullcontext():
+            assert attend(17000, q5) == 17000 and list(inference._EXACT_ATTENTION_TIMED.values()) == [[1, 2]]
     # The kernel must beat the one-row calls by 5% on the medians of three alternating runs; each run advances the clock by its own time.
     for rows, kernel, verdict in (((10, 30, 10), (9.4, 9.4, 30), True), ((10, 10, 40), (9.4, 9.6, 9.6), False)):
         now, spent, order = [0.0], [0.0], []
