@@ -550,6 +550,10 @@ class _MlxModuleWorlds:
     def pytest_runtest_teardown(self, item, nextitem):
         # trylast: after module-scoped fixtures are finalised (see the leak guard above).
         if nextitem is None or nextitem.getparent(_pytest.Module) is not item.getparent(_pytest.Module):
+            # Kept for a later visit (interleaved node IDs): a session fixture that installed
+            # the shim here will not run again.
+            if self.active is not None:
+                self.worlds[self.active] = self._capture()
             self._install(self.base)
             self.active = None
 
