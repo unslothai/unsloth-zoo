@@ -75,7 +75,6 @@ def test_all_zero_blocks_still_raise_attribute_error(experts_cls):
 
 @pytest.mark.parametrize("native", [True, False])
 def test_forward_returns_the_input_dtype(experts_cls, monkeypatch, native):
-    """The native kernels run in bf16; an fp16 residual (T4) that got bf16 back was promoted to fp32."""
     ex = _make(experts_cls)
     x = torch.randn(3, 64, dtype = torch.float16)
     monkeypatch.setattr(G, "torch_cuda_device", lambda device: __import__("contextlib").nullcontext())

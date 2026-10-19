@@ -733,8 +733,7 @@ def patch_gpt_oss():
             router_indices = None, routing_weights = None,
         ) -> torch.Tensor:
             self.__dict__["_unsloth_tk_root"] = tk_backend.name
-            # The native kernels take bf16 and return bf16 rows; an fp16 residual (T4) must get its own dtype
-            # back, or the add promotes it to fp32 and the next layer's projections reject the input.
+            # The native kernels return bf16; an fp16 residual (T4) would be promoted to fp32 by the add.
             input_dtype = hidden_states.dtype
             hidden_states, routing_data, gather_idx, scatter_idx, leading_shape = _mxfp4_experts_routing(
                 self, hidden_states, routing_data, gather_idx, scatter_idx, router_indices, routing_weights,
