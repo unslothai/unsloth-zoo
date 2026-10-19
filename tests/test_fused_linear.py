@@ -819,7 +819,7 @@ def test_tiled_forward_follows_the_budget(monkeypatch):
     budget = 4 * 16384 * 4
     monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: budget)
     sizes = _record_buffers(monkeypatch)
-    h, w, _, t = _make("cuda", torch.float32, 300, 32, 20000, train_head = True)
+    h, w, _, t = _make("cuda", torch.float32, 300, 32, 40000, train_head = True)  # > 2 splits: tiled
     tiled = fl.CALLS["tiled"]
     lp = fused_linear_logprobs(h, w, t)
     assert fl.CALLS["tiled"] == tiled + 1
@@ -967,8 +967,8 @@ def _peaked_grads(monkeypatch, dtype, exact_top, recompute_fp32, ent_grad, N = 1
 
 @CUDA
 @pytest.mark.parametrize("ent_grad", [False, True])
-# 20 blocks; one block (runner-up beside top); 8 likely tokens in the first 2048 ids
-@pytest.mark.parametrize("shape", [(192, 512, 40000), (256, 64, 1003), (192, 512, 40000, 8)])
+# random likely pair; heavy tail (H 64); 2 / 8 likely tokens in the first 2048 ids
+@pytest.mark.parametrize("shape", [(192, 512, 40000), (256, 64, 40000), (192, 512, 40000, 2), (192, 512, 40000, 8)])
 def test_exact_top_backward_keeps_fp32_gradient_accuracy(monkeypatch, ent_grad, shape):
     # Half recompute logits with each block's top logit swapped back to its fp32 value, under the fp32 lse: the
     # gradient stays at the fp32 recompute's error. Plain half logits under the fp32 lse were 3x worse than TRL.
@@ -984,19 +984,23 @@ def test_exact_top_backward_keeps_fp32_gradient_accuracy(monkeypatch, ent_grad, 
         # Forward values do not depend on the backward mode.
         assert torch.equal(lp, lp_f) and torch.equal(ent, ent_f)
         # Measured (B200): within 1-5% of fp32 (also at H 2560, V 151936), 0.2-0.3x all-half. Only each 2048-block's
-        # top-1 left the runner-up in half (4-5x fp32, one block); the top-2 per 2048 columns, 6 of 8 clustered
+        # top-1 left a same-block runner-up in half (4-5x fp32); the top-2 per 2048 columns, 6 of 8 clustered
         # tokens (3x).
         assert eh <= 1.1 * fh and ew <= 1.1 * fw, (dtype, eh, fh, ew, fw)
-        assert eh < 0.4 * hh and ew < 0.4 * hw, (dtype, eh, hh, ew, hw)
+        if hh > 2 * fh:  # where half logits cost accuracy at all (not fp16 with a heavy tail)
+            assert eh < 0.4 * hh and ew < 0.4 * hw, (dtype, eh, hh, ew, hw)
 
 
 @CUDA
-def test_trainable_head_grad_and_no_grad_passes_are_bit_identical(monkeypatch):
+@pytest.mark.parametrize("V", [1003, 20001, 40000])
+def test_trainable_head_grad_and_no_grad_passes_are_bit_identical(monkeypatch, V):
     # The exact-top forward (several vocab splits, compacted rows) must not move the statistics a no-grad pass sees.
+    # Up to two splits the no-grad pass runs one row kernel; the tiled (split) forward differed there (oracle
+    # COMPILED_DRIFT under no_grad), so those vocabularies stay chunked.
     if not fl._HAS_TRITON:
         pytest.skip("needs Triton")
     for dtype in _dtypes("cuda"):
-        h, w, t = _peaked("cuda", dtype, 96, 64, 40000)
+        h, w, t = _peaked("cuda", dtype, 96, 64, V)
         mask = torch.ones(96, dtype = torch.bool, device = "cuda")
         mask[3::7] = False
         with torch.no_grad():
@@ -1005,9 +1009,9 @@ def test_trainable_head_grad_and_no_grad_passes_are_bit_identical(monkeypatch):
         h.requires_grad_(True)
         tiled = fl.CALLS["tiled"]
         out = fused_linear_logprobs(h, w, t, mask = mask, return_entropy = True)
-        assert fl.CALLS["tiled"] == tiled + 1
+        assert fl.CALLS["tiled"] == tiled + (V > 2 * fl._SPLIT_COLS)
         for x, y in zip(out, ref):
-            assert torch.equal(x.detach(), y), dtype
+            assert torch.equal(x.detach(), y), (dtype, V)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -1067,10 +1071,10 @@ def test_opcheck_exact_top_outputs():
     if not fl._HAS_TRITON:
         pytest.skip("needs Triton")
     dtype = torch.bfloat16 if _half_ok("cuda") else torch.float16
-    h, w, b, t = _make("cuda", dtype, 40, 16, 5000, train_head = True, with_bias = True)
+    h, w, b, t = _make("cuda", dtype, 40, 16, 40000, train_head = True, with_bias = True)
     out = torch.ops.unsloth_zoo.fused_linear_logprobs.default(
         h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, dtype, True, False, False, False, False, True, True, True, 0)
-    assert out[7].shape == fl._block_top_shape(40, 5000, h.device, dtype, True) and out[7].numel() > 0
+    assert out[7].shape == fl._block_top_shape(40, 40000, h.device, dtype, True) and out[7].numel() > 0
     torch.library.opcheck(
         torch.ops.unsloth_zoo.fused_linear_logprobs.default,
         (h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, dtype, True, False, False, False, False, True, True, True, 0),

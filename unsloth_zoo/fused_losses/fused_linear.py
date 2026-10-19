@@ -535,18 +535,24 @@ def _split_block():
     return min(triton.next_power_of_2(_SPLIT_BLOCK), triton.next_power_of_2(max(_SPLIT_COLS, 16)))
 
 
+def _tiled_vocab(V):
+    # The no-grad pass merges vocab splits only past two of them (else one row kernel), so the tiled forward (always
+    # split) is bit-identical to it only there; smaller vocabularies stay on the chunked path.
+    return _SPLIT_COLS > 0 and -(-V // _SPLIT_COLS) > 2
+
+
 def _block_top_shape(N, V, device, compute_dtype, recompute):
-    # Static (the fake uses it): the forward returns [N, blocks] whenever the exact-top backward may run.
+    # Static (the fake uses it): the forward returns [N, groups] whenever the exact-top backward may run.
     if not (recompute and _BWD_EXACT_TOP and _RECOMPUTE_FP32 and _TRITON and _HAS_TRITON and not _IS_HIP
-            and device.type == "cuda" and compute_dtype in _HALF):
+            and device.type == "cuda" and compute_dtype in _HALF and _tiled_vocab(V)):
         return (0,)
     return (N, 2 * -(-V // _top_cols()))
 
 
-def _block_top_live(device, compute_dtype, rows, fp32_logits):
+def _block_top_live(device, compute_dtype, rows, fp32_logits, V):
     # Runtime, evaluated alike by forward and backward: True iff the tiled Triton forward wrote the block tops.
     return (_BWD_EXACT_TOP and _RECOMPUTE_FP32 and bool(fp32_logits) and compute_dtype in _HALF and rows <= 0
-            and _use_triton(device) and _SPLIT_COLS > 0 and _SPLIT_COLS % _split_block() == 0)
+            and _use_triton(device) and _tiled_vocab(V) and _SPLIT_COLS % _split_block() == 0)
 
 
 def _top_cols():
@@ -1051,7 +1057,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
             fp32_logits = False
         w = weight.to(compute_dtype)
         outs = (("ent", ent, want_ent), ("sum", mean, want_mean), ("lssp", lssp, want_lssp), ("top1", top1, want_top1))
-        if tiled and rows <= 0 and _SPLIT_COLS > 0 and _use_triton(device):
+        if tiled and rows <= 0 and _tiled_vocab(V) and _use_triton(device):
             # No-grad calls stay chunked, bit-identical to a forward-gradient policy pass.
             full = n_keep == N
             dst = {"logp": logps, "lse": lse, "ent": ent if want_ent else None, "sum": mean if want_mean else None,
@@ -1060,7 +1066,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                 dst = {k: (torch.empty(n_keep, dtype = v.dtype, device = device) if v is not None else None)
                        for k, v in dst.items()}
             top = None
-            if block_top.numel() > 0 and _block_top_live(device, compute_dtype, rows, fp32_logits):
+            if block_top.numel() > 0 and _block_top_live(device, compute_dtype, rows, fp32_logits, V):
                 top = block_top if full else torch.empty((n_keep,) + block_top.shape[1:], device = device,
                                                          dtype = torch.float32)
             with torch.autocast(device.type, enabled = False):
@@ -1187,7 +1193,7 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, blo
         fp32_logits = False
     budget = min(_BWD_TILE_BYTES, _budget_bytes(device))
     head_acc_mode = need_w and need_h and n_keep > V
-    exact_top = block_top.numel() > 0 and _block_top_live(device, compute_dtype, rows, fp32_logits)
+    exact_top = block_top.numel() > 0 and _block_top_live(device, compute_dtype, rows, fp32_logits, V)
     for _ in range(2):
         bpl = _bytes_per_logit(fp32_logits and not exact_top, compute_dtype)
         single = (need_w and not head_acc_mode and not _HIP_TILES and _SINGLE_MIN_COLS > 0
