@@ -155,8 +155,7 @@ def test_old_path_opt_ins_keep_the_old_path(monkeypatch, flag, fused_linear):
 
 
 def test_grad_scaler_scale_is_read_without_a_graph_break():
-    # The fp16 GradScaler's scale is read from its attributes: GradScaler.is_enabled / get_scale are skipped by
-    # dynamo (a graph break every compiled step), and get_scale() syncs the host.
+    # Scale read from attributes: is_enabled / get_scale graph-break under dynamo and get_scale() syncs.
     from torch._dynamo.testing import CompileCounter
     from torch._dynamo.utils import counters
 

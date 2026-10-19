@@ -529,9 +529,7 @@ def grpo_chunked_hidden_states_logprobs(
     **extra_kwargs,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
-    # Same contract as chunked_hidden_states_selective_log_softmax, but never keeps tokens x vocab logits: under grad
-    # the fused linear kernel keeps per row state only, and no-grad scoring (old / reference logprobs) runs the same
-    # kernel, so a ratio against the policy's own logprobs starts at exactly 1.
+    # Never keeps tokens x vocab logits; no-grad scoring runs the same kernel so a policy ratio starts at exactly 1.
     # Truncated-support scoring and the fp32 head are the old function's: hand those calls to it.
     fp32_head = extra_kwargs.get(
         "fp32_lm_head",
@@ -545,8 +543,7 @@ def grpo_chunked_hidden_states_logprobs(
     )
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
     fused_linear = _chunked_logprob._FUSED_LINEAR
-    # UNSLOTH_FUSED_LINEAR=0 sends grad and no-grad calls alike to the old function, so a policy pass and its old /
-    # reference log-probs keep one scorer (a ratio starts at exactly 1).
+    # UNSLOTH_FUSED_LINEAR=0 sends grad and no-grad calls alike to the old function: one scorer for both.
     if (not fused_linear) or custom or os.environ.get("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "1") == "0":
         kwargs = dict(extra_kwargs)
         if max_rows_per_chunk is not None:
@@ -2223,7 +2220,6 @@ def grpo_accumulated_loss(
     from unsloth_zoo.rl_replacements import (
         grpo_shared_vision_inputs as _grpo_get_vision_inputs,
         grpo_vision_chunks as _grpo_vision_chunks,
-        # Never keeps tokens x vocab logits (the fused linear kernel, with or without grad).
         grpo_chunked_hidden_states_logprobs as chunked_hidden_states_selective_log_softmax,
         chunked_selective_log_softmax,
     )

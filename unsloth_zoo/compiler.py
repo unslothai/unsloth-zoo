@@ -5950,8 +5950,7 @@ def unsloth_compile_transformers(
     except:
         return
     # All Unsloth Zoo code licensed under LGPLv3
-    # UNSLOTH_COMPILE_DISABLE ("1" or "partial") only drops the torch.compile decorators: the rewritten
-    # forwards (fused CE, fast LoRA, ...) still install and run eagerly. Only `disable = True` skips them.
+    # UNSLOTH_COMPILE_DISABLE only drops torch.compile; rewritten forwards still run eagerly.
     full_disable = disable
     disable = full_disable or os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial")
     if fast_residual_stream:

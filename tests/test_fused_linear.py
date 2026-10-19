@@ -29,8 +29,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 
 @pytest.fixture(autouse = True)
 def _triton_never_fell_back():
-    # A Triton kernel that fails to compile falls back to the torch body with a warning, which would pass every
-    # accuracy test here without testing the kernels. No test may leave a device marked broken.
+    # A silent torch fallback would pass every accuracy test; no test may leave a device marked broken.
     yield
     broken = set(fl._TRITON_BROKEN)
     fl._TRITON_BROKEN.clear()
@@ -85,7 +84,6 @@ def _leaves(*xs):
     return [x for x in xs if x is not None and x.requires_grad]
 
 
-# ------------------------------------------------------------------------------------------------ cross entropy
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("train_head,with_bias", [(False, False), (True, True), (False, True)])
 @pytest.mark.parametrize("mul,div,cap,eps", [(0.0, 0.0, 0.0, 0.0), (1.5, 0.0, 30.0, 0.0), (0.0, 2.0, 0.0, 0.1)])
@@ -130,9 +128,7 @@ def test_ce_matches_chunked_ce():
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_ce_incoming_gradient_scales_in_fp32(device):
-    # A non-unit incoming gradient (1 / accumulation steps, a loss weight) multiplies the stored gradient in fp32:
-    # half * a 0-dim fp32 tensor would first round the factor to half (0.37 -> 0.369, 0.2% off every gradient), and
-    # eager would then disagree with a compiled backward.
+    # The incoming gradient multiplies in fp32: half * 0-dim fp32 rounds the factor to half (0.2% off).
     for dtype in _dtypes(device):
         h, w, b, t = _make(device, dtype, 50, 32, 131, train_head = True, with_bias = True)
         loss = fused_linear_cross_entropy(h, w, b, t, divisor = 50)
@@ -160,7 +156,6 @@ def test_ce_all_masked_and_no_grad():
     assert loss.grad_fn is None and fl.CALLS["ce"] == before["ce"] + 1
 
 
-# ------------------------------------------------------------------------------------------------ log-probs
 def _lp_oracle(h, w, b, t, mask, T, mul, div, cap):
     z = h.double() @ w.double().t() + (b.double() if b is not None else 0)
     z = _transform(z, mul, div, cap)
@@ -236,7 +231,6 @@ def test_logprobs_trainable_head_bias_over_vocab_slices(monkeypatch, device):
         for name, x, y in zip(("hidden", "weight", "bias"), grads, refs):
             _close(x, y, _tol(dtype), f"{name} grad {dtype}")
         if device == "cuda" and fl._HAS_TRITON:
-            # The Triton bodies ran: a kernel that fails to compile falls back to torch and would pass silently.
             assert fl.CALLS["torch"] == torch_calls
 
 
@@ -244,8 +238,7 @@ def test_logprobs_trainable_head_bias_over_vocab_slices(monkeypatch, device):
 @pytest.mark.parametrize("split_cols", [0, 512, 1000])
 @pytest.mark.parametrize("mode", ["1", "2"])
 def test_split_statistics_match_oracle(monkeypatch, split_cols, mode):
-    # The vocab-split statistics kernel (+ merge) against the fp64 oracle, with split edges that do not line up with
-    # the block (1000) and a tie for the top logit straddling a split edge (first index wins, as torch.argmax).
+    # Split edges off the block and a top-1 tie across a split edge (first index wins, as torch.argmax).
     monkeypatch.setattr(fl, "_SPLIT_COLS", split_cols)
     monkeypatch.setattr(fl, "_ACCURACY", mode)
     N, H, V = 45, 32, 4103
@@ -286,9 +279,7 @@ def test_split_statistics_match_oracle(monkeypatch, split_cols, mode):
 @pytest.mark.parametrize("train_head,with_bias,ent_grad", [(False, False, True), (True, True, False), (True, True, True)])
 @pytest.mark.parametrize("mode,recompute_fp32", [("1", False), ("1", True), ("2", False)])
 def test_recompute_forward_tiles_match_oracle(monkeypatch, train_head, with_bias, ent_grad, mode, recompute_fp32):
-    # Recompute paths score rows from (rows x vocab tile) GEMMs whose split statistics merge across tiles: small
-    # tiles / splits / row chunks force several of each, a ragged last tile, compacted rows and a top-1 tie
-    # straddling two tiles.
+    # Small tiles / splits / chunks: ragged last tile, compacted rows, top-1 tie across two tiles.
     monkeypatch.setattr(fl, "_SPLIT_COLS", 256)
     monkeypatch.setattr(fl, "_BWD_ROWS", 16)
     monkeypatch.setattr(fl, "_BWD_TILE_BYTES", 16 * 600 * 4)
@@ -332,8 +323,7 @@ def test_recompute_forward_tiles_match_oracle(monkeypatch, train_head, with_bias
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_logprobs_bit_identical_with_and_without_grad(device):
-    # A DPO policy and its reference (or a GRPO policy and its old logprobs) on the same weights must agree exactly,
-    # so the on-policy ratio starts at exactly 1: the statistics kernel is the same launch in both modes.
+    # Policy and reference on the same weights must agree exactly (on-policy ratio starts at 1).
     for dtype in _dtypes(device):
         V = 4103 if device == "cuda" else 131
         h, w, b, t = _make(device, dtype, 300, 64, V)
@@ -349,8 +339,7 @@ def test_logprobs_bit_identical_with_and_without_grad(device):
 
 
 def test_logits_mode_per_backend(monkeypatch):
-    # fp32 logits only where the fp32-output GEMM is fast; ROCm (and torch < 2.8) default to plain half logits,
-    # which matched the old path's gradients exactly on gfx1151; the exact-target mode is opt-in everywhere.
+    # fp32 logits only where fp32-output GEMM is fast (not ROCm / torch < 2.8); exact-target mode is opt-in.
     dev = torch.device("cuda", 0)
     monkeypatch.setattr(fl, "_fp32_out_ok", lambda device, dtype = None: True)
     for hip, acc, want in ((False, "1", (True, False)), (True, "1", (False, False)), (True, "2", (False, True)),
@@ -366,8 +355,7 @@ def test_logits_mode_per_backend(monkeypatch):
 
 
 def test_default_rows_follow_the_vocabulary(monkeypatch):
-    # 512 rows of a 151936 vocab, more for a small vocab, never fewer than 512 (256 rows of a 262k vocab starved the
-    # K = vocab GEMM: slower than TRL on G4). A fixed 2 GB budget: the free memory of a shared card must not matter.
+    # >= 512 rows (fewer starved the K = vocab GEMM); fixed 2 GB budget so a shared card's free memory is irrelevant.
     monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: 2 * 1024**3)
     for V, want in ((32001, 2048), (151936, 512), (262144, 512)):
         assert fl.fused_linear_rows(8192, 2560, V) == want, V
@@ -425,7 +413,6 @@ def test_logprobs_lead_shape_and_out_of_range_targets():
     _close(lp[keep], ref[keep], 1e-5, "logp")
 
 
-# ------------------------------------------------------------------------------------------------ compile
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("kind", ["ce", "lp_frozen", "lp_trainable"])
 def test_fullgraph_compile_no_breaks_no_recompile(kind, device):
@@ -494,7 +481,6 @@ def test_opcheck():
     )
 
 
-# ------------------------------------------------------------------------------------------------ GPU only
 @CUDA
 @pytest.mark.parametrize("V", [4096, 4096 * 3 + 5, 151936])
 @pytest.mark.parametrize("mode", ["0", "1", "2"])
@@ -523,8 +509,7 @@ def test_gpu_accuracy_modes_and_inplace(monkeypatch, V, mode):
 
 @CUDA
 def test_gpu_exact_target_keeps_half_gradients(monkeypatch):
-    # Exact-target mode only changes the returned values: its gradients use the lse of the logits the gradient pass
-    # reads, so they equal plain half mode bit for bit (a mixed lse biased them 2.5x on gfx1151).
+    # Exact-target mode changes only values; gradients equal plain half mode bit for bit.
     dtype = torch.bfloat16 if _half_ok("cuda") else torch.float16
     N, H, V = 300, 64, 4103
     h, w, b, t = _make("cuda", dtype, N, H, V, seed = 2)
@@ -570,8 +555,7 @@ def test_gpu_grad_on_other_device_returns_home():
 @CUDA
 @CUDA
 def test_one_transient_triton_failure_is_retried(monkeypatch):
-    # A single launch failure (e.g. a race on a shared Triton cache) is retried instead of sending the process to
-    # the torch bodies for good; a persistent one still falls back.
+    # One launch failure is retried; a persistent one still falls back.
     real = fl._launch
     fails = {"left": 1}
 
@@ -598,8 +582,7 @@ def test_one_transient_triton_failure_is_retried(monkeypatch):
 
 @CUDA
 def test_bf16_on_pre_ampere_keeps_triton(monkeypatch):
-    # A T4 has no bf16-in / fp32-out GEMM: the probe is per dtype, so a bf16 call takes half logits instead of
-    # raising inside the op and sending the whole process to the torch path.
+    # T4 lacks bf16-in / fp32-out GEMM: the probe is per dtype, so bf16 takes half logits instead of raising.
     real = torch.mm
 
     def mm(a, b, *args, out_dtype = None, **kw):
@@ -658,8 +641,7 @@ def test_two_dim_logits_bias(device):
 
 
 def test_detached_entropy_skips_the_entropy_backward(monkeypatch):
-    # entropy_requires_grad=False with a trainable head recomputes in backward; the detached entropy must not arrive
-    # as a materialised zero gradient that runs the entropy term over every logit.
+    # A detached entropy must not arrive as a zero gradient that runs the entropy term.
     seen = []
     real = fl._OPS["lp_bwd_impl"]
     monkeypatch.setitem(fl._OPS, "lp_bwd_impl", lambda *a: seen.append(a[8].numel()) or real(*a))
@@ -710,8 +692,7 @@ def test_input_error_does_not_disable_triton(monkeypatch):
 @CUDA
 @pytest.mark.parametrize("backend", ["no_fp32_out", "hip"])
 def test_fp16_tile_partials_do_not_overflow_without_fp32_out_gemm(monkeypatch, backend):
-    # torch < 2.8 or ROCm: no fp16-in / fp32-out GEMM. One vocab tile's hidden-gradient partial is past 65504 while
-    # the tiles cancel to 0, so an fp16 GEMM output gave inf.
+    # No fp16-in / fp32-out GEMM: one tile's partial passes 65504 while the tiles cancel, so fp16 output gave inf.
     if backend == "hip":
         monkeypatch.setattr(fl, "_IS_HIP", True)
     else:
@@ -725,12 +706,10 @@ def test_fp16_tile_partials_do_not_overflow_without_fp32_out_gemm(monkeypatch, b
     assert h.grad.isfinite().all() and w.grad.isfinite().all()
 
 
-# ------------------------------------------------------------------------------------------------ review fixes (PR 1866)
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("bad", [-1, 64, 1000])
 def test_ce_rejects_out_of_range_targets(device, bad):
-    # F.cross_entropy raises on a non-ignored target outside the vocabulary; dropping it silently kept it in the
-    # caller's divisor (loss biased low). ignore_index rows stay legal.
+    # Out-of-vocab targets raise as F.cross_entropy (else they stay in the divisor); ignore_index stays legal.
     h, w, _, t = _make(device, torch.float32, 8, 16, 64)
     t[0] = -100
     fused_linear_cross_entropy(h, w, None, t, divisor = 7.0)
@@ -801,8 +780,7 @@ def _record_buffers(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["ce", "lp", "lp_trainable"])
 def test_fp32_head_chunks_stay_within_the_budget(monkeypatch, kind):
-    # An fp32 head keeps fp32 logits even though fp32_logits is off: the chunk sizing counted them as 2 bytes, so a
-    # chunk (and the recompute backward tile) took twice the device budget.
+    # An fp32 head's logits were sized as 2 bytes, so chunks took twice the budget.
     budget = 64 * 1024
     monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: budget)
     sizes = _record_buffers(monkeypatch)
@@ -853,8 +831,7 @@ def test_tiled_forward_follows_the_budget(monkeypatch):
 @CUDA
 @pytest.mark.parametrize("backend", ["no_fp32_out", "hip"])
 def test_fp16_odd_vocab_hidden_gradient_does_not_overflow(monkeypatch, backend):
-    # Without an fp16-in / fp32-out GEMM the aligned columns' fp16 partial (8 x 8 x 1e4 = 6.4e5) overflowed before the
-    # left-over column cancelled it.
+    # Aligned columns' fp16 partial overflowed before the left-over column cancelled it.
     if backend == "hip":
         monkeypatch.setattr(fl, "_IS_HIP", True)
     else:
@@ -870,9 +847,7 @@ def test_fp16_odd_vocab_hidden_gradient_does_not_overflow(monkeypatch, backend):
 
 @CUDA
 def test_fp16_frozen_head_keeps_small_unit_gradients():
-    # The frozen-head d logp / d hidden is formed before the (GradScaler-scaled) incoming gradient exists. In fp16 a
-    # confident token's p_j ~ 4e-8 rounded to a subnormal (+45%) in the half gradient buffer, and the ~1e-7 entries
-    # of d logp / d hidden lost their bits when stored in fp16; fp32 math resolves both.
+    # fp16: a confident token's p ~ 4e-8 went subnormal and ~1e-7 u entries lost bits; fp32 math resolves both.
     H, V = 4, 4096
     w = torch.zeros(V, H)
     w[1:, 0] = -17.0
@@ -911,8 +886,7 @@ def test_scale_rows_retries_one_transient_failure(monkeypatch):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_trainable_head_long_context_backward(device):
-    # Past `vocab` rows the trainable head + hidden backward runs row-major with an fp32 [V, H] head accumulator
-    # instead of an fp32 [rows, H] hidden one; both orders match the oracle.
+    # Past `vocab` rows backward runs row-major; both orders match the oracle.
     N, H, V = 300, 16, 40
     h, w, b, t = _make(device, torch.float32, N, H, V, train_head = True, with_bias = True)
     lp = fused_linear_logprobs(h, w, t, bias = b, rows_per_chunk = 64)
@@ -939,6 +913,5 @@ def test_trainable_head_long_context_skips_the_rows_accumulator():
     loss.backward()
     torch.cuda.synchronize()
     extra = torch.cuda.max_memory_allocated() - base
-    # grad_h (N H fp32) + one [R, H] hidden-gradient tile + one [R, V] logits tile; the vocab-major order added an
-    # fp32 [N, H] accumulator on top of grad_h.
+    # Vocab-major added an fp32 [N, H] accumulator on top of grad_h.
     assert extra < N * H * 4 * 1.75, extra / 2**20

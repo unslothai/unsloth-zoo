@@ -170,9 +170,7 @@ print("KILL_SWITCH_OK")
 
 @pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
 def test_kill_switch_ce_still_compiles(device):
-    # UNSLOTH_FUSED_LINEAR=0 (read at import, hence a fresh process): the eager chunked CE (boolean row indexing,
-    # torch._dynamo.maybe_mark_dynamic, host-side scale) must stay opaque to dynamo, so a compiled forward
-    # graph-breaks at the loss as before instead of failing to trace it.
+    # UNSLOTH_FUSED_LINEAR=0 (read at import: fresh process): the eager chunked CE must stay opaque to dynamo.
     import os
     import subprocess
     import sys
@@ -253,8 +251,7 @@ def test_grpo_truncated_support_keeps_the_old_function():
 
 
 def test_grpo_kill_switch_keeps_one_scorer_for_every_pass(monkeypatch):
-    # UNSLOTH_FUSED_LINEAR=0: the policy pass (grad) and the old / reference pass (no grad) both take the old function,
-    # so the on-policy ratio still starts at exactly 1.
+    # UNSLOTH_FUSED_LINEAR=0: grad and no-grad passes both take the old function.
     monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     seen = []
     real = rr.chunked_hidden_states_selective_log_softmax
@@ -321,8 +318,7 @@ def test_linear_mean_logits_softcap_matches_the_torch_loop(monkeypatch):
 
 
 def test_preference_explicit_chunk_budget_keeps_the_chunked_function(monkeypatch):
-    # An explicit UNSLOTH_FUSED_PREFERENCE_CHUNK_MB is a memory setting for the chunked Function; it keeps that path
-    # (as an explicit CE memory target keeps the old CE path) instead of being silently ignored.
+    # An explicit UNSLOTH_FUSED_PREFERENCE_CHUNK_MB keeps the chunked Function rather than being ignored.
     import importlib
     torch.manual_seed(0)
     hidden = torch.randn(B, S, H, requires_grad = True)

@@ -157,8 +157,7 @@ def _old(*args, **kwargs):
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("transform", [(0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 30.0, 0.7), (1.5, 2.0, 0.0, 1.2)], ids = str)
 def test_grpo_kill_switch_gradient_is_the_old_function(monkeypatch, bias, transform):
-    # UNSLOTH_FUSED_LINEAR=0 scores grad calls with the old function too, so the policy pass and its old / reference
-    # log-probs share one scorer (tests/test_fused_linear_routing.py covers the default).
+    # UNSLOTH_FUSED_LINEAR=0 scores grad calls with the old function too (one scorer).
     monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     states, weight, b, index, upstream = _inputs(shape = (4, 9), bias = bias, seed = 1)
     calls = []

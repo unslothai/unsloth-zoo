@@ -53,7 +53,6 @@ _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 
 @functools.cache
 def _default_chunk_gb(device = None):
-    # Half the head device's free memory, read once per device, as the fused CE it replaces does.
     try:
         from unsloth_zoo.tiled_mlp import _default_target_gb
 
@@ -84,7 +83,7 @@ _FUSED_LINEAR = os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
 
 
 def _transform(z, scalars, has_mul: bool, has_div: bool, has_cap: bool):
-    # scalars = [1 / temperature, multiply, divide, softcap] as a tensor, so new values never recompile.
+    # Scalars as a tensor so new values never recompile.
     if has_mul:
         z = z * scalars[1]
     if has_div:
@@ -148,12 +147,11 @@ def _run(name, fn, *args):
     except torch.OutOfMemoryError:
         raise
     except Exception:
-        # No compiler (CPU without a toolchain), an unsupported backend, or the recompile budget.
         _eager.add(name)
         return fn(*args)
 
 
-# ROCm's half-in / fp32-out GEMM is a slow fallback (gfx1151: 6-14x a bf16-out GEMM), so HIP keeps half outputs.
+# ROCm's half-in / fp32-out GEMM is a slow fallback (6-14x), so HIP keeps half outputs.
 _FP32_OUT_GEMM = torch.version.hip is None
 
 
@@ -333,7 +331,6 @@ def unsloth_masked_logprobs(hidden_states, lm_head, labels, mask = None, ignore_
         unknown = set(kwargs) - _MASKED_LOGPROBS_KWARGS
         if unknown:
             raise TypeError(f"unsloth_masked_logprobs got unexpected keyword arguments {sorted(unknown)}")
-        # The op compacts the scored rows itself, so no data dependent shape reaches a compiled caller.
         return fused_linear_logprobs(
             hidden_states, lm_head, labels, bias = kwargs.get("lm_head_bias"), mask = mask,
             temperature = kwargs.get("temperature", 1.0),
@@ -464,7 +461,6 @@ def unsloth_chunked_ce_loss(
         if rows_per_chunk is None and target_gb is not None:
             rows_per_chunk = chunked_logprob_rows(lm_head_weight.shape[0], target_gb = target_gb, device = device)
 
-        # Unlabelled rows are dropped inside the op: the compacted row count never reaches a compiled caller.
         return fused_linear_cross_entropy(
             hidden, lm_head_weight, lm_head_bias, targets, divisor = divisor, scaling = scaling,
             ignore_index = ignore_index, logit_scale_multiply = logit_scale_multiply or 0.0,
@@ -477,14 +473,13 @@ def unsloth_chunked_ce_loss(
     if torch.is_tensor(scaling):
         scaling = float(scaling)
     keep = targets != ignore_index
-    # Unlabelled rows (prompts in completion-only training) never reach the head.
     hidden = hidden[keep.to(hidden.device)].to(device)
     if rows_per_chunk is None:
         rows_per_chunk = chunked_logprob_rows(
             lm_head_weight.shape[0], target_gb = target_gb, n_rows = hidden.shape[0], device = device
         )
     if not torch.is_grad_enabled():
-        # requires_grad survives an outer no_grad, and forward builds every gradient eagerly: drop it for eval.
+        # requires_grad survives an outer no_grad and forward builds gradients eagerly: drop it for eval.
         hidden = hidden.detach()
         lm_head_weight = lm_head_weight.detach()
         lm_head_bias = None if lm_head_bias is None else lm_head_bias.detach()

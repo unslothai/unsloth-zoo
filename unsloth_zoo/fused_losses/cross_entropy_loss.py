@@ -711,7 +711,7 @@ def _use_chunked_ce(kwargs, target_gb):
         return False
     if _chunked_logprob._FUSED_LINEAR:
         return all(k in _FUSED_LINEAR_CE_KWARGS for k in kwargs)
-    # Without the fused linear kernel: plain token CE only, fp32 head-gradient accumulation stays on the old path.
+    # Fused kernel: plain token CE only; fp32 head-gradient accumulation stays on the old path.
     if FP32_HEAD_GRAD:
         return False
     if float(kwargs.get("label_smoothing", 0.0) or 0.0) != 0.0:
@@ -723,8 +723,7 @@ def _scaler_scale(scaling):
     """GradScaler -> its scale as a device tensor (get_scale() is a host sync, and a graph break when compiled)."""
     if not hasattr(scaling, "get_scale"):
         return scaling
-    # GradScaler's attributes, not is_enabled() / get_scale(): dynamo skips torch.amp methods, so each call was a
-    # graph break in every compiled step.
+    # Attributes, not is_enabled() / get_scale(): dynamo skips torch.amp methods (graph break every step).
     enabled = getattr(scaling, "_enabled", None)
     if enabled is None and hasattr(scaling, "is_enabled"):
         enabled = scaling.is_enabled()
@@ -739,9 +738,7 @@ def _scaler_scale(scaling):
 
 
 def _chunked_ce(hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs):
-    # Traceable with the fused linear op: the row compaction and every chunk loop run inside it, so a compiled forward
-    # keeps one graph through the loss. Without it (UNSLOTH_FUSED_LINEAR=0) the eager chunked path boolean-indexes
-    # rows and reads the scale on the host, so it stays opaque to dynamo as before.
+    # Traceable with the fused linear op (compaction and chunk loops are inside it); otherwise opaque to dynamo.
     if not _chunked_logprob._FUSED_LINEAR:
         return _chunked_ce_opaque(
             hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,

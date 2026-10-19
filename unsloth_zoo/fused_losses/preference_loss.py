@@ -62,11 +62,9 @@ def _transform_logits(logits, scale_multiply, scale_divide, softcapping):
 
 _MM_OUT_DTYPE_OK = {}
 
-# UNSLOTH_FUSED_LINEAR=0 keeps this module's own chunked autograd Function. A float64 head (the tests' oracle
-# precision) always does: the fused linear kernel scores in float32.
+# UNSLOTH_FUSED_LINEAR=0 or a float64 head (kernel scores in fp32) keep this module's chunked Function.
 _FUSED_LINEAR = os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
-# An explicit UNSLOTH_FUSED_PREFERENCE_CHUNK_MB keeps the chunked Function it sizes, as an explicit CE memory target
-# keeps the old CE path (the fused kernel sizes its chunks from the device budget instead).
+# So does an explicit UNSLOTH_FUSED_PREFERENCE_CHUNK_MB.
 _EXPLICIT_CHUNK_MB = "UNSLOTH_FUSED_PREFERENCE_CHUNK_MB" in os.environ
 
 
@@ -78,7 +76,7 @@ def _linear_float32(hidden, weight, bias):
     # A half-precision head rounds its logits to bf16 / fp16 before the softmax; that rounding
     # dominates the logp error, so ask the GEMM for float32 output (torch >= 2.8) where it can.
     key = (hidden.device.type, weight.dtype)
-    # Not on ROCm: its half-in / fp32-out GEMM is a slow fallback (gfx1151: 6-14x a half GEMM).
+    # Not on ROCm: half-in / fp32-out GEMM is a slow fallback (6-14x).
     if torch.version.hip is None and weight.dtype in (torch.float16, torch.bfloat16) and _MM_OUT_DTYPE_OK.get(key, True):
         try:
             logits = torch.mm(hidden, weight.t(), out_dtype = torch.float32)
