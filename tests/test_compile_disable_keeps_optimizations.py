@@ -28,6 +28,10 @@ import sys
 
 import pytest
 
+# The subprocess builds a PEFT LoRA model: a stack without peft (the zoo macOS / MLX leg) cannot run it.
+pytest.importorskip("peft")
+pytest.importorskip("transformers")
+
 _CHILD = r'''
 import os, io, json, contextlib, re
 os.environ["UNSLOTH_COMPILE_LOCATION"] = os.path.abspath("unsloth_compiled_cache")

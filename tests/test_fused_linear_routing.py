@@ -134,6 +134,8 @@ def _graph_breaks(fn, *args):
     return out, breaks
 
 
+@pytest.mark.skipif(type(torch.Tensor.to).__name__ != "method_descriptor",
+                    reason = "Tensor.to is patched (Unsloth's Apple Silicon MLX mode), which Dynamo cannot trace")
 def test_fused_ce_traces_as_one_graph():
     torch.manual_seed(0)
     weight = torch.randn(V, H)
