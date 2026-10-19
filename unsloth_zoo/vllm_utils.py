@@ -2689,7 +2689,7 @@ def vllm_supports_flashinfer(config) -> bool:
         from vllm.model_executor.models.registry import ModelRegistry
     except Exception as e:
         print(
-            f"Unsloth: Failed loading vLLM model class for arch {arch} "
+            "Unsloth: Failed loading vLLM's model registry "
             f"during `vllm_supports_flashinfer`.\n{e}"
         )
         return True
