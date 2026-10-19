@@ -2195,7 +2195,8 @@ def _ogs_modules():
 
 
 def _ogs_kernels():
-    """UNSLOTH_MXFP4_OGS=0 keeps decode on the exact packed path; read per call so tests can flip it."""
+    """UNSLOTH_MXFP4_OGS: 0 keeps decode on the exact packed path, 1 prefers matmul_ogs, auto (default) uses
+    matmul_ogs only where the fused packed decode is off. Read per call so tests can flip it."""
     if os.environ.get("UNSLOTH_MXFP4_OGS", "1") == "0":
         return None
     return _ogs_modules()
@@ -2283,6 +2284,10 @@ def _mxfp4_ogs_decode(self, hidden_states):
     if not (is_mxfp4_expert_param(gate_up) and is_mxfp4_expert_param(down)):
         return None
     if not (gate_up.mxfp4_transposed and down.mxfp4_transposed) or gate_up.device in _OGS_FAILED:
+        return None
+    # The fused packed decode beat matmul_ogs at every decode batch measured (A100 / H100 / B200, 1-64 rows),
+    # and matmul_ogs also caches a second, swizzled copy of every expert stack.
+    if os.environ.get("UNSLOTH_MXFP4_OGS", "auto") != "1" and _mxfp4_fused_decode_enabled(gate_up, hidden_states.dtype):
         return None
     from unsloth_zoo.triton_kernels_compat import matmul_ogs_available
     if not matmul_ogs_available(gate_up.device):  # once per device: import, layout, launch and accuracy
