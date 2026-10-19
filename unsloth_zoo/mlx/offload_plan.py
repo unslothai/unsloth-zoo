@@ -29,6 +29,7 @@ __all__ = [
     "SAFETY_MARGIN",
     "context_bytes",
     "expert_offload_overhead",
+    "offload_footprint",
     "offload_inventory",
     "plan_offload",
 ]
@@ -135,6 +136,17 @@ def expert_offload_overhead(inventory):
     return 2 * inventory["expert_layer_bytes"] + _CACHE_CAP
 
 
+def offload_footprint(inventory, ple, experts, ple_overhead = OFFLOAD_PLE_OVERHEAD, expert_overhead = None):
+    """What the offloadable PLE tables and experts hold in memory with ``ple`` / ``experts`` offloaded
+    (``None`` for off), working memory included; the rest of the weights stay as they are."""
+    ple_bytes = inventory["ple_bytes"] if inventory["ple"] is None else 0
+    held = ple_bytes * (1 - (ple or 0)) + (ple_overhead if ple and ple_bytes else 0)
+    if experts and inventory["expert_bytes"]:
+        overhead = expert_offload_overhead(inventory) if expert_overhead is None else expert_overhead
+        return held + max(inventory["expert_floor_bytes"], inventory["expert_bytes"] * (1 - experts)) + overhead
+    return held + inventory["expert_bytes"]
+
+
 def context_bytes(model_dir, tokens, prefill_step = PREFILL_STEPS[0], dtype_bytes = 2):
     """What ``tokens`` of context cost, from the config: the attention KV cache doubled (the
     transients that grow with it), a prefill step's logits and a reserve. Fitted above
@@ -200,12 +212,7 @@ def plan_offload(
     nothing = {"ple": None, "experts": None, "context": None, "prefill_step": None}
 
     def footprint(ple, experts):
-        held = ple_bytes * (1 - (ple or 0)) + (ple_overhead if ple else 0)
-        if experts:
-            held += max(floor, expert_bytes * (1 - experts)) + expert_overhead
-        else:
-            held += expert_bytes
-        return held
+        return offload_footprint(inventory, ple, experts, ple_overhead, expert_overhead)
 
     ple_choices = [ple_offload] if ple_offload != "auto" else ([None, 1.0] if ple_bytes else [None])
     expert_auto = expert_offload == "auto" and expert_bytes > 0

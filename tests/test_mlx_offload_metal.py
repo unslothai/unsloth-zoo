@@ -41,7 +41,7 @@ from unsloth_zoo.mlx.loader import (
 from unsloth_zoo.mlx.offload import (
     DiskEmbedding, OffloadSwitchGLU, offload_experts, offload_fraction, offload_ple, offloadable,
 )
-from unsloth_zoo.mlx.offload_plan import context_bytes, offload_inventory, plan_offload
+from unsloth_zoo.mlx.offload_plan import context_bytes, offload_footprint, offload_inventory, plan_offload
 
 
 @pytest.fixture(autouse = True)
@@ -495,6 +495,12 @@ def test_plan_offload_rule():
     assert _plan(133, margin = (0, 0.03)) == plan(1.0, None, 8192, 2048)
     # A hand-set fraction is kept; only the auto knob and the step are chosen.
     assert _plan(200, expert_offload = 0.5) == plan(None, 0.5, 8192, 8192)
+    # What a resolved offload holds: PLE rows and experts kept (never under the floor) plus working memory.
+    inventory = _inventory()
+    assert offload_footprint(inventory, None, None, 1, 2) == 30 + 64
+    assert offload_footprint(inventory, 1.0, 0.5, 1, 2) == 1 + 32 + 2
+    assert offload_footprint(inventory, 0.5, 1.0, 1, 2) == 15 + 1 + 2 + 2
+    assert offload_footprint({**inventory, "ple": "no table", "expert_bytes": 0}, 1.0, 1.0, 1, 2) == 0
 
 
 def test_context_bytes(tmp_path):
