@@ -113,12 +113,19 @@ def test_load_vllm_passes_speculative_config_before_arg_filter():
     assert -1 < call < assign < arg_filter
 
 
-def _fit():
-    nodes = [n for n in _tree().body if isinstance(n, ast.FunctionDef) and n.name == "_fit_max_num_seqs_to_speculation"]
-    assert len(nodes) == 1, "_fit_max_num_seqs_to_speculation is missing from vllm_utils.py"
+_FIT_HELPERS = ("_speculation_lookahead", "_fit_max_num_seqs_to_speculation", "_fit_max_num_batched_tokens_to_speculation")
+
+
+def _fit_ns():
+    nodes = [n for n in _tree().body if isinstance(n, ast.FunctionDef) and n.name in _FIT_HELPERS]
+    assert len(nodes) == len(_FIT_HELPERS), "speculation fit helpers are missing from vllm_utils.py"
     ns = {}
     exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_fit", "exec"), ns)
-    return ns["_fit_max_num_seqs_to_speculation"]
+    return ns
+
+
+def _fit():
+    return _fit_ns()["_fit_max_num_seqs_to_speculation"]
 
 
 @pytest.mark.parametrize("seqs, tokens, config, expected", [
@@ -148,9 +155,9 @@ def test_load_vllm_fits_max_num_seqs_with_lora():
 
 
 def _shrink():
-    names = ("_fit_max_num_seqs_to_speculation", "_shrink_for_memory_retry")
+    names = _FIT_HELPERS + ("_shrink_for_memory_retry",)
     nodes = [n for n in _tree().body if isinstance(n, ast.FunctionDef) and n.name in names]
-    assert len(nodes) == 2, "memory retry helpers are missing from vllm_utils.py"
+    assert len(nodes) == len(names), "memory retry helpers are missing from vllm_utils.py"
     ns = {}
     exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_shrink", "exec"), ns)
     return ns["_shrink_for_memory_retry"]
@@ -188,3 +195,45 @@ def test_return_args_callers_get_no_speculative_config():
     assert len(assigns) == 1
     value = ast.unparse(assigns[0].value)
     assert "return_args" in value and "_vllm_suffix_decoding_config()" in value
+
+
+@pytest.mark.parametrize("seqs, tokens, config, expected", [
+    # A budget below k + 1 cannot be met by max_num_seqs = 1: vLLM needs tokens >= seqs * (k + 1).
+    (4, 16, {"method": "suffix"}, (1, 25)),
+    (4, 16, {"method": "suffix", "num_speculative_tokens": 32}, (1, 33)),
+    (256, 8192, {"method": "suffix"}, (256, 8192)),
+])
+def test_lora_speculation_budget_below_lookahead_is_raised(seqs, tokens, config, expected):
+    ns = _fit_ns()
+    fitted = ns["_fit_max_num_seqs_to_speculation"](seqs, tokens, config)
+    got = (fitted, ns["_fit_max_num_batched_tokens_to_speculation"](fitted, tokens, config))
+    assert got == expected
+    k = config.get("num_speculative_tokens", 24)
+    assert got[1] >= got[0] * (k + 1)
+
+
+def test_memory_retry_raises_a_budget_below_lookahead():
+    got = _shrink()(2, 64, 8, {"method": "suffix"})
+    assert got == (1, 25)
+
+
+@pytest.mark.parametrize("config", [
+    {"method": "suffix", "suffix_decoding_max_tree_depth": None},
+    {"method": "suffix", "num_speculative_tokens": -1},
+    {"method": "suffix", "num_speculative_tokens": "many"},
+    {"method": "suffix", "num_speculative_tokens": True},
+])
+def test_malformed_lookahead_is_left_to_vllm(config):
+    # Was TypeError / ZeroDivisionError from the fitter; now vLLM's own validation reports the value.
+    ns = _fit_ns()
+    assert ns["_fit_max_num_seqs_to_speculation"](8, 512, config) == 8
+    assert ns["_fit_max_num_batched_tokens_to_speculation"](8, 512, config) == 512
+
+
+def test_load_vllm_raises_the_lora_speculation_budget():
+    load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+    src = ast.unparse(load_vllm)
+    lowered = src.find("engine_args['max_num_seqs'] = fitted_max_num_seqs")
+    raised = src.find("engine_args['max_num_batched_tokens'] = fitted_max_num_batched_tokens", max(lowered, 0))
+    arg_filter = src.find("good_keys = inspect.signature(AsyncEngineArgs", max(raised, 0))
+    assert -1 < lowered < raised < arg_filter

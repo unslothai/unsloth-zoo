@@ -3533,13 +3533,36 @@ def _vllm_suffix_decoding_config():
     return {**extra, "method": "suffix"}
 
 
-def _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config):
-    # vLLM with LoRA + speculation refuses max_num_batched_tokens < max_num_seqs * (k + 1)
-    # (EngineArgs.create_engine_config). Suffix decoding defaults k to its tree depth (24).
+def _speculation_lookahead(speculative_config):
+    # Tokens proposed per step (k). Suffix decoding defaults k to its tree depth (24). None for a
+    # malformed value (null, negative, not a number): vLLM's own validation then names it.
     k = speculative_config.get("num_speculative_tokens")
     if k is None:
         k = speculative_config.get("suffix_decoding_max_tree_depth", 24)
-    return min(int(max_num_seqs), max(int(max_num_batched_tokens) // (int(k) + 1), 1))
+    if isinstance(k, bool):
+        return None
+    try:
+        k = int(k)
+    except (TypeError, ValueError):
+        return None
+    return k if k >= 0 else None
+
+
+def _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config):
+    # vLLM with LoRA + speculation refuses max_num_batched_tokens < max_num_seqs * (k + 1)
+    # (EngineArgs.create_engine_config).
+    k = _speculation_lookahead(speculative_config)
+    if k is None:
+        return int(max_num_seqs)
+    return min(int(max_num_seqs), max(int(max_num_batched_tokens) // (k + 1), 1))
+
+
+def _fit_max_num_batched_tokens_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config):
+    # max_num_seqs never drops below 1, so a budget under k + 1 tokens needs the budget raised.
+    k = _speculation_lookahead(speculative_config)
+    if k is None:
+        return int(max_num_batched_tokens)
+    return max(int(max_num_batched_tokens), int(max_num_seqs) * (k + 1))
 
 
 def _shrink_for_memory_retry(max_num_seqs, max_num_batched_tokens, max_seq_length, speculative_config = None):
@@ -3549,6 +3572,9 @@ def _shrink_for_memory_retry(max_num_seqs, max_num_batched_tokens, max_seq_lengt
     max_num_batched_tokens = min(max_num_batched_tokens, max_num_seqs * max_seq_length)
     if speculative_config is not None:
         max_num_seqs = _fit_max_num_seqs_to_speculation(max_num_seqs, max_num_batched_tokens, speculative_config)
+        max_num_batched_tokens = _fit_max_num_batched_tokens_to_speculation(
+            max_num_seqs, max_num_batched_tokens, speculative_config,
+        )
     return max_num_seqs, max_num_batched_tokens
 
 
@@ -3754,6 +3780,29 @@ def _vllm_fp32_lm_head_overrides(training):
     return {"head_dtype": "float32"}
 
 
+def _warn_fp32_lm_head_set_late():
+    # The trainer's logprob projectors read UNSLOTH_VLLM_FP32_LM_HEAD as a def-time default (a Dynamo
+    # constant), so a flag set after `import unsloth` reaches vLLM only and old / new logps disagree.
+    rl = sys.modules.get("unsloth_zoo.rl_replacements")
+    if rl is None:
+        return False
+    stale = []
+    for name in ("chunked_hidden_states_selective_log_softmax", "chunked_hidden_states_selective_log_softmax_recompute"):
+        try:
+            default = inspect.signature(getattr(rl, name)).parameters["fp32_lm_head"].default
+        except Exception:
+            continue
+        if default is False:
+            stale.append(name)
+    if stale:
+        print(
+            "Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 was set after Unsloth was imported, so vLLM scores "
+            "rollouts with an fp32 lm_head but the trainer still projects in 16-bit. Set it before "
+            "`import unsloth` for matching logprobs."
+        )
+    return bool(stale)
+
+
 def _vllm_replayssm_mode():
     # "auto" (unset), "on" or "off".
     value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
@@ -3777,8 +3826,10 @@ def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
 
 
 def _is_vllm_replayssm_refusal(error_text):
-    # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2).
-    return "replayssm" in str(error_text).lower()
+    # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2). With
+    # speculative decoding vLLM 0.29 turns ReplaySSM into RecoverSSM, which only Kimi KDA supports.
+    error_text = str(error_text).lower()
+    return "replayssm" in error_text or "recoverssm" in error_text
 
 
 def _is_memory_profiling_race_error(error_text):
@@ -4682,11 +4733,24 @@ def load_vllm(
                     )
                     approx_max_num_seqs = fitted_max_num_seqs
                     engine_args["max_num_seqs"] = fitted_max_num_seqs
+                fitted_max_num_batched_tokens = _fit_max_num_batched_tokens_to_speculation(
+                    engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], suffix_config,
+                )
+                if fitted_max_num_batched_tokens > engine_args["max_num_batched_tokens"]:
+                    print(
+                        f"Unsloth: Raising vLLM max_num_batched_tokens from {engine_args['max_num_batched_tokens']} "
+                        f"to {fitted_max_num_batched_tokens} so one LoRA sequence fits the suffix decoding lookahead."
+                    )
+                    max_num_batched_tokens = fitted_max_num_batched_tokens
+                    engine_args["max_num_batched_tokens"] = fitted_max_num_batched_tokens
             print(f"Unsloth: vLLM uses suffix decoding for generation with speculative_config = {suffix_config}.")
-        fp32_head_overrides = _vllm_fp32_lm_head_overrides(training)
+        # Same str() problem for return_args: vLLM json-parses --hf-overrides, and a `vllm serve`
+        # has no trainer whose logprobs the fp32 head would have to match.
+        fp32_head_overrides = {} if return_args else _vllm_fp32_lm_head_overrides(training)
         if fp32_head_overrides:
             engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **fp32_head_overrides}
             print("Unsloth: vLLM computes rollout logits with an fp32 lm_head (UNSLOTH_VLLM_FP32_LM_HEAD=1).")
+            _warn_fp32_lm_head_set_late()
 
         # Pin the backend for the worker, which the sys.modules block only reaches under
         # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is
