@@ -1262,6 +1262,8 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
         ids = experts[i : i + chunk]
         row_lo = ends[ids[0]] - counts[ids[0]]
         row_hi = ends[ids[-1]]
+        if row_hi == row_lo:
+            continue   # chunked without selective: no token routed to any of these experts
         contiguous = ids[-1] - ids[0] + 1 == len(ids)
         chunks.append((
             slice(ids[0], ids[-1] + 1) if contiguous else torch.tensor(ids, dtype = torch.int64, device = device),
@@ -1269,6 +1271,8 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
             row_hi,
             torch.tensor([ends[e] - row_lo for e in ids], dtype = torch.int32, device = device),
         ))
+    if not chunks:
+        return None
     SELECTIVE_DEQUANT_STATS["plans"] += 1
     return _SelectiveDequantPlan(E, num_rows, chunks)
 
