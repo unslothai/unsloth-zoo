@@ -22,6 +22,11 @@ import torch
 from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize_torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+# Inductor skips bf16 graphs on GPUs without native bf16 (T4), so a bf16 fullgraph compile finds no frames there.
+needs_native_bf16 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(including_emulation = False),
+    reason = "needs native bf16 for a bf16 torch.compile",
+)
 
 
 def _stack(E, R, C, seed, lo = 118, hi = 130):
@@ -196,6 +201,7 @@ def test_autograd_gives_dx_of_the_dense_product():
     torch.testing.assert_close(x.grad.float(), xr.grad, rtol = 2e-2, atol = 2e-2 * xr.grad.abs().max().item())
 
 
+@needs_native_bf16
 def test_custom_op_compiles_without_graph_breaks():
     from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm, mxfp4_grouped_mm_op
     if mxfp4_grouped_mm_op is None:
@@ -305,6 +311,7 @@ def test_decode_rows_take_the_grouped_gemv(E, rows, asm, monkeypatch):
     torch.testing.assert_close(got, want, rtol = 1e-2, atol = 1e-2 * want.abs().max().item())
 
 
+@needs_native_bf16
 def test_compiled_region_switches_between_gemv_and_tile_kernel_by_row_count():
     # The choice has to be a dynamo guard: made inside the op, the first traced size would fix it for every size.
     import unsloth_zoo.mxfp4_gemm as mg
