@@ -222,3 +222,17 @@ def test_input_signature_stays_fp32_under_autocast():
         cast = rr._input_signature((a,), 4)
     assert cast.dtype == torch.float32
     assert torch.equal(cast, plain)
+
+
+def test_softmax_renorm_survives_underflowed_forced_experts():
+    # Forced experts with logits ~200 below the natural top-k underflow in a full-vocab softmax:
+    # gather-then-renormalise gave 0 / 0 = NaN. Softmax over the gathered logits is the same function.
+    logits = torch.tensor([[200.0, 199.0, 0.0, -1.0], [1.0, 2.0, 0.5, -0.3]], requires_grad = True)
+    ids = torch.tensor([[2, 3], [1, 2]])
+    got = rr._formulas()["softmax_renorm"](logits, ids)
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got[0], torch.softmax(torch.tensor([0.0, -1.0]), -1))
+    ref = torch.softmax(logits.detach().double(), -1)[1].gather(-1, ids[1])
+    torch.testing.assert_close(got[1].double(), ref / ref.sum(), rtol = 1e-6, atol = 1e-7)
+    got.sum().backward()
+    assert torch.isfinite(logits.grad).all()
