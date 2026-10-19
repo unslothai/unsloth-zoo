@@ -1026,6 +1026,8 @@ def test_trainable_head_grad_and_no_grad_passes_are_bit_identical(monkeypatch, V
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_trainable_head_single_row_chunk_backward(monkeypatch, device):
+    if fl._HIP_TILES:
+        pytest.skip("ROCm keeps its small backward tiles (no single row chunk)")
     # Every kept row in one chunk: the head-gradient tile is one GEMM straight into grad_w (no fp32 accumulator
     # re-read per row chunk); ragged last tile, odd vocabulary, dropped rows.
     N, H, V = 70, 24, 4103 if device == "cuda" else 523
@@ -1078,8 +1080,8 @@ def test_mm_into_restores_the_reduction_flags():
 @CUDA
 def test_opcheck_exact_top_outputs():
     # The block-top output's shape comes from the fake as well (compile / AOT), not only the real op.
-    if not fl._HAS_TRITON:
-        pytest.skip("needs Triton")
+    if not fl._HAS_TRITON or fl._IS_HIP:
+        pytest.skip("exact-top backward: Triton on NVIDIA only")
     dtype = torch.bfloat16 if _half_ok("cuda") else torch.float16
     h, w, b, t = _make("cuda", dtype, 40, 16, 40000, train_head = True, with_bias = True)
     out = getattr(torch.ops.unsloth_zoo, fl._LP_OP).default(
@@ -1095,8 +1097,8 @@ def test_opcheck_exact_top_outputs():
 @CUDA
 def test_frozen_head_entropy_gradient_keeps_fp32_recompute():
     # Exact-top is for trainable heads; the frozen entropy-gradient backward stays on fp32 recompute logits.
-    if not fl._HAS_TRITON:
-        pytest.skip("needs Triton")
+    if not fl._HAS_TRITON or fl._IS_HIP:
+        pytest.skip("exact-top backward: Triton on NVIDIA only")
     dtype = torch.bfloat16 if _half_ok("cuda") else torch.float16
     h, w, t = _peaked("cuda", dtype, 64, 64, 40000)
     h.requires_grad_(True)
