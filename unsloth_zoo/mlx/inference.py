@@ -4318,7 +4318,7 @@ def _exact_attention_kernels():
     try:
         if not mx.metal.is_available():
             return None
-        return (mx.fast.metal_kernel(name = "unsloth_exact_attention_rows", input_names = ["q", "k", "v", "N", "scale"],
+        return (mx.fast.metal_kernel(name = "unsloth_exact_attention_rows", input_names = ["q", "k", "v", "N", "L", "scale"],
                                      output_names = ["partials", "sums", "maxs"], source = _EXACT_ATTENTION_ROWS,
                                      ensure_row_contiguous = False),
                 mx.fast.metal_kernel(name = "unsloth_exact_attention_reduce", input_names = ["partials", "sums", "maxs"],
@@ -4344,8 +4344,8 @@ def _exact_attention_rows(queries, keys, values, scale, blocks):
     rows = batch * heads * length
     first, second = _exact_attention_kernels()
     partials, sums, maxs = first(
-        inputs = [queries, keys, values, keys.shape[2], scale],
-        template = [("T", queries.dtype), ("D", dim), ("G", gqa), ("L", length), ("BLOCKS", blocks)],
+        inputs = [queries, keys, values, keys.shape[2], length, scale],
+        template = [("T", queries.dtype), ("D", dim), ("G", gqa), ("BLOCKS", blocks)],
         grid = (32 * kv_heads, gqa * batch, per_group * blocks * groups), threadgroup = (32, gqa, per_group),
         output_shapes = [(rows * blocks * dim,), (rows * blocks,), (rows * blocks,)],
         output_dtypes = [queries.dtype, mx.float32, mx.float32])

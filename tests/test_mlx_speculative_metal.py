@@ -693,8 +693,12 @@ def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qw
 def test_a_block_read_in_one_pass_over_the_kv_prefix_matches_one_row_sdpa_calls_bit_for_bit(heads, monkeypatch):
     from unsloth_zoo.mlx import inference
     gqa = heads[0] // heads[1]
+    first, second = inference._exact_attention_kernels()
+    templates = set()
+    monkeypatch.setattr(inference, "_exact_attention_kernels", lambda: (lambda **kw: templates.add(tuple(kw["template"])) or first(**kw), second))
     # Batched rows, a row count past one threadgroup's, and key counts on each side of MLX's block-count steps.
-    for batch, width, keys, dtype in ((1, 3, 5000, mx.bfloat16), (2, 5, 9000, mx.float16), (1, 8, 40000, mx.bfloat16), (1, 13, 70000, mx.bfloat16)):
+    cases = ((1, 3, 5000, mx.bfloat16), (2, 5, 9000, mx.float16), (1, 8, 40000, mx.bfloat16), (1, 13, 70000, mx.bfloat16), (1, 4, 70000, mx.bfloat16))
+    for batch, width, keys, dtype in cases:
         blocks = inference._sdpa_vector_blocks(gqa, keys - width + 1)
         assert blocks == inference._sdpa_vector_blocks(gqa, keys)
         # Cache-shaped: a capacity-padded buffer cut to `keys`, and queries transposed from (B, L, H, D).
@@ -704,6 +708,10 @@ def test_a_block_read_in_one_pass_over_the_kv_prefix_matches_one_row_sdpa_calls_
             q[:, :, i : i + 1], k[:, :, : keys - width + i + 1], v[:, :, : keys - width + i + 1], scale = 0.0625)
             for i in range(width)], axis = 2)
         assert mx.array_equal(inference._exact_attention_rows(q, k, v, 0.0625, blocks).view(mx.uint16), rows.view(mx.uint16)).item()
+    # One compile per layout serves every width: the row count is an input, not a template parameter.
+    assert templates == {(("T", dtype), ("D", 256), ("G", gqa), ("BLOCKS", inference._sdpa_vector_blocks(gqa, keys - width + 1)))
+                         for _, width, keys, dtype in cases}
+    monkeypatch.undo()
     # Rows on both sides of a block-count step stay one-row calls, as do array masks, quantized caches and float32 rows.
     monkeypatch.setattr(inference, "_EXACT_ATTENTION_MIN_KEYS", 0)
     monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
