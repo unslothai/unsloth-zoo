@@ -549,6 +549,9 @@ pass
 
 def patch_gpt_oss():
     try:
+        # As in triton_kernels_compat.
+        if os.environ.get("UNSLOTH_MXFP4_MATMUL_OGS", "1") == "0":
+            raise ImportError("UNSLOTH_MXFP4_MATMUL_OGS=0")
         import triton_kernels
 
         HAS_TRITON_KERNELS = True
