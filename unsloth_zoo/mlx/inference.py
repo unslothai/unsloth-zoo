@@ -4012,7 +4012,8 @@ _EXACT_VERIFY_CONTRACT = {
         "Qwen3_5BatchInvariantForward._feed_forward": ("d1c424074fbf0c21", "b04b66c926777a23"),
         "Qwen3_5BatchInvariantForward._switch_glu": "6aa1f4defb45f54a",
         "_target_verify_linear": "190517e318ba4d7b",
-        "_target_verify_linears": "2d4c9adbc50be66e",
+        # 0.7.9 also batches NVFP4 scaled linears, which are not affine, so the slices never take them.
+        "_target_verify_linears": ("2d4c9adbc50be66e", "ae9a374ec7aad3e4"),
     },
     "mlx_vlm.speculative.ops.linear": {
         "_target_verify_quantized_linear": "539dce1a6026f87e",

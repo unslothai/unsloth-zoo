@@ -3682,6 +3682,12 @@ _GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 = (
 _XING4_0_HYPER_CONNECTION_CALL_TOKEN_SHA256 = (
     "d33c41e769c36a1d01595314a684092576323fb12077090b3caf83325cf7bf64"
 )
+_QWEN3_5_VERIFY_QK_TOKEN_SHA256 = (
+    "e6f9df6af39d81908f992befef96ce200dd55c55c6fe14cd15c8267a9904dc87"
+)
+_QWEN3_5_DIVIDED_QK_TOKEN_SHA256 = (
+    "bb94a73450a3430389fab37f6c066725705ce042d059289587a9e6f4795e631e"
+)
 
 
 def _source_token_sha256(source: str) -> str:
@@ -7012,6 +7018,39 @@ def _ensure_exact_verify_sums_promoted():
     _exact_verify_sums_promoted = True
 
 
+def _ensure_verify_qk_norm_matches_decode():
+    """mlx-vlm 0.7.9's Qwen3.5 layer divides its q/k RMSNorm epsilon by the head width while the
+    exact verifier keeps 1e-6, so verify no longer matches decode. Verify with the layer's own norm."""
+    try:
+        language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+        verifier = importlib.import_module("mlx_vlm.models.qwen3_5.speculative_verifier")
+    except Exception:
+        return
+    forward = getattr(verifier, "Qwen3_5BatchInvariantForward", None)
+    layer = getattr(language, "Qwen3_5GatedDeltaNet", None)
+    if not isinstance(forward, type) or not isinstance(layer, type):
+        return
+    decode = vars(layer).get("_normalize_qk")
+    native = vars(forward).get("_normalize_gated_delta_qk")
+    if (
+        not isinstance(native, staticmethod)
+        or _source_token_sha256(_safe_getsource(native.__func__))
+        != _QWEN3_5_VERIFY_QK_TOKEN_SHA256
+        or _source_token_sha256(_safe_getsource(decode))
+        != _QWEN3_5_DIVIDED_QK_TOKEN_SHA256
+    ):
+        return
+    original = native.__func__
+
+    def normalize(layer, q, k):
+        if getattr(type(layer), "_normalize_qk", None) is decode:
+            return decode(layer, q, k)
+        return original(layer, q, k)
+
+    # Not wrapped: getsource would follow __wrapped__ back to the guarded body and patch twice.
+    forward._normalize_gated_delta_qk = staticmethod(normalize)
+
+
 def _ensure_vlm_processor_inputs_patched():
     """Patch mlx-vlm's processor call without replacing its input preparation."""
 
@@ -9588,6 +9627,7 @@ class FastMLXModel:
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
             _ensure_exact_verify_sums_promoted()
+            _ensure_verify_qk_norm_matches_decode()
             _ensure_xing4_0_sliced_hyper_connection_base(model_type)
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
