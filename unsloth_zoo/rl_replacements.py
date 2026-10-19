@@ -2021,8 +2021,10 @@ def grpo_parse_is_clip(spec, mode):
     upper = float(upper) if upper.strip() else None
     if (lower is not None and not (0 <= lower < math.inf)) or (upper is not None and not (0 < upper < math.inf)):
         raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP needs a finite lower >= 0 and upper > 0, got {spec!r}.")
-    if lower is not None and upper is not None and lower > upper:
-        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP lower bound exceeds upper bound in {spec!r}.")
+    if lower is not None and upper is not None and lower >= upper:
+        # TRL GRPOConfig rejects clip_min >= clip_max: equal bounds make truncate a constant weight
+        # and the mask modes keep only ratios exactly equal to it.
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP lower bound must be below the upper bound in {spec!r}.")
     if lower is None and upper is None and str(mode).endswith("_truncate"):
         raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP={spec!r} gives no bound for {mode}.")
     return lower, upper
@@ -2084,7 +2086,9 @@ def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
         keep = mask.to(torch.bool) & ~torch.isnan(log_ratio)
         maskd = keep.to(torch.float64)
         log_ratio = torch.nan_to_num(log_ratio, nan = 0.0) * maskd
-        log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
+        # verl compute_offpolicy_metrics does not clamp: a +-20 clamp capped K1 at 20 and K3 near
+        # exp(20). Only keep exp() finite in float64 (and -inf logps out of inf - inf).
+        log_ratio = torch.clamp(log_ratio, min = -700.0, max = 700.0)
         k3 = (torch.expm1(log_ratio) - log_ratio) * maskd
         w = torch.broadcast_to(is_weights.to(torch.float64), maskd.shape) * maskd
         rejected = ((w == 0) & keep).to(torch.float64)
@@ -3219,10 +3223,26 @@ def grpo_accumulated_loss(
             _rollout_stats = trainer.accelerator.gather(_rollout_stats.reshape(1, -1)).reshape(-1, _rollout_stats.numel())
             _rollout_stats = torch.cat([_rollout_stats[:, :3].sum(0), _rollout_stats[:, 3:4].amax(0), _rollout_stats[:, 4:].sum(0)])
             _metrics = trainer._metrics
+            _bucket = "train" if _training else "eval"
             if "train" in _metrics:
-                _metrics = _metrics["train" if _training else "eval"]
+                _metrics = _metrics[_bucket]
+            # Pool the sums over every micro-batch since the last log instead of averaging
+            # per-micro-batch ratios: TRL's log() clears _metrics, which restarts the window.
+            _rollout_acc = getattr(trainer, "_unsloth_rollout_mismatch_stats", None)
+            if not isinstance(_rollout_acc, dict):
+                _rollout_acc = {}
+                trainer._unsloth_rollout_mismatch_stats = _rollout_acc
+            _prev = _rollout_acc.get(_bucket)
+            if _prev is not None and "sampling/rollout_kl_k1/mean" in _metrics:
+                _prev = _prev.to(_rollout_stats.device)
+                _rollout_stats = torch.cat([
+                    _prev[:3] + _rollout_stats[:3],
+                    torch.maximum(_prev[3:4], _rollout_stats[3:4]),
+                    _prev[4:] + _rollout_stats[4:],
+                ])
+            _rollout_acc[_bucket] = _rollout_stats.detach()
             for _name, _value in _grpo_rollout_mismatch_metrics(_rollout_stats).items():
-                _metrics[_name].append(_value)
+                _metrics[_name] = [_value]
         if _entropy_bonus_on:
             _entropy_weights = _grpo_entropy_bonus_weights(
                 completion_mask, entropy_mask, _entropy_coef, kwargs, training = _training,
