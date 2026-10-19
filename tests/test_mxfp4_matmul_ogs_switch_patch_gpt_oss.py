@@ -2,7 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""UNSLOTH_MXFP4_MATMUL_OGS=0 must keep patch_gpt_oss off triton_kernels, like triton_kernels_compat."""
+"""UNSLOTH_MXFP4_MATMUL_OGS=0 keeps patch_gpt_oss off triton_kernels."""
 import importlib.util, os, subprocess, sys
 import pytest
 
