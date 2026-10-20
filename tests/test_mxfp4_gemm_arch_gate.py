@@ -86,6 +86,7 @@ def test_unindexed_device_resolves_the_current_gpu(gpu, monkeypatch, device):
     gpu((8, 0))
     caps = {0: (8, 0), 1: (7, 5)}
     current = [0]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d = None: caps[torch.device(d).index])
     monkeypatch.setitem(mg._AVAILABLE_DTYPE, (str(torch.device("cuda", 1)), torch.float16), True)
