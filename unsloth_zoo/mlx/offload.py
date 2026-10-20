@@ -530,10 +530,11 @@ class _ExpertSlots:
             (projection, name): mx.zeros((capacity, *field.shape), dtype = field.cast or field.dtype)
             for projection, name, field in fields
         }
-        mx.eval(list(self.arrays.values()))
+        self.map = mx.zeros((experts,), dtype = mx.int32)  # expert -> slot, valid while resident
+        # Built here: MLX streams are thread-bound, so a lazy table would fail on any other thread.
+        mx.eval(list(self.arrays.values()), self.map)
         self.slot_of = np.full(experts, -1, dtype = np.int64)
         self.expert_of = np.full(capacity, -1, dtype = np.int64)
-        self.map = mx.zeros((experts,), dtype = mx.int32)  # expert -> slot, valid while resident
         self.score = np.zeros(experts, dtype = np.float32)
         self.expert_bytes = sum(field.row_bytes for _, _, field in fields)
         self.calls = self.hits = self.misses = 0

@@ -8,6 +8,7 @@ import gc
 import json
 import os
 import sys
+import threading
 import warnings
 
 import numpy as np
@@ -342,6 +343,31 @@ def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
         np.testing.assert_array_equal(_bits(got), _bits(want))
 
 
+def test_offloaded_experts_run_on_another_thread(tmp_path):
+    # Loaded here and generated on a server's request thread, which has its own MLX stream.
+    stock = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    model = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    offload_experts(model, str(tmp_path), 1.0)
+    calls = _moe_calls(mx.bfloat16)[:4]
+    expected = [stock.layers[0].switch_mlp(*call) for call in calls]
+    mx.eval(calls, expected)
+    results = []
+
+    def run():
+        with mx.stream(mx.new_stream(mx.gpu)):
+            for call in calls:
+                out = model.layers[0].switch_mlp(*call)
+                mx.eval(out)
+                results.append(_bits(out))
+
+    thread = threading.Thread(target = run)
+    thread.start()
+    thread.join(timeout = 120)
+    assert len(results) == len(calls)
+    for got, want in zip(results, expected):
+        np.testing.assert_array_equal(got, _bits(want))
+
+
 @pytest.mark.parametrize("v41", [False, True])
 def test_experts_a_checkpoint_stores_apart(tmp_path, v41):
     # As GLM-5's: one tensor per expert, which mlx-vlm stacks at load; DeepSeek V4.1's, under reference names.
@@ -670,6 +696,9 @@ def test_context_bytes(tmp_path):
 
 
 def test_auto_offload(tmp_path, monkeypatch):
+    # The rule keeps 4 GiB of margin and reserve, so a small runner's own budget fits nothing.
+    device_info = mx.device_info
+    monkeypatch.setattr(mx, "device_info", lambda: {**device_info(), "max_recommended_working_set_size": 64 << 30})
     model = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
     (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 4, "vocab_size": 16, "num_hidden_layers": 2, "num_key_value_heads": 2, "head_dim": 8}))
     with warnings.catch_warnings():
