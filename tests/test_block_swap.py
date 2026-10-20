@@ -891,3 +891,68 @@ def test_pin_budget_is_split_across_the_ranks_on_this_host(monkeypatch):
     for bad in ("0", "-2", "x"):
         monkeypatch.setenv("LOCAL_WORLD_SIZE", bad)
         assert _mod._pin_budget() == spare
+
+
+class _Ple(nn.Module):
+    """Decoder layer with a Qwen4Exp-style n-gram table the loader keeps in host RAM."""
+
+    def __init__(self, table):
+        super().__init__()
+        self.mlp = nn.Linear(64, 64, bias = False)
+        if table:
+            self.ple = nn.Module()
+            self.ple.ple_embedding = nn.Module()
+            self.ple.ple_embedding.ngram_embedding = nn.Embedding(4096, 64)
+
+
+class _PleModel(nn.Module):
+    _no_placement_params = ["ple.ple_embedding.ngram_embedding.weight"]
+
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_Ple(i == 1) for i in range(3)]).requires_grad_(False)
+
+
+def _cpu_block(layer, monkeypatch):
+    # The real _Block, with CPU standing in for the card: only the CUDA event needs faking.
+    monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: object())
+    cpu = torch.device("cpu")
+    return _mod._Block(layer, {cpu: None}, cpu)
+
+
+def test_no_placement_table_is_never_packed_into_a_slot(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", raising = False)
+    model = _PleModel()
+    layers = find_decoder_layers(model)
+    table = model.layers[1].ple.ple_embedding.ngram_embedding.weight
+    assert [n for n, _ in _mod._swappable(layers[1])] == ["mlp.weight"]
+    block = _cpu_block(layers[1], monkeypatch)
+    assert all(p is not table for p in block.params)
+    assert block.nbytes() == 64 * 64 * 4
+    assert _mod._layer_signature(_mod._swappable(layers[1])) == _mod._layer_signature(_mod._swappable(layers[0]))
+
+
+def test_placing_no_placement_params_makes_them_swappable_again(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "1")
+    layers = find_decoder_layers(_PleModel())
+    assert len(_mod._swappable(layers[1])) == 2
+
+
+def test_auto_swap_indices_does_not_count_a_host_kept_table():
+    if not torch.cuda.is_available():
+        return
+
+    class Model(_PleModel):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.layers = nn.ModuleList([_Ple(i == 7) for i in range(8)]).requires_grad_(False)
+
+    model = Model()
+    model.layers.cuda()
+    model.layers[7].ple.cpu()
+    layers = find_decoder_layers(model)
+    dev = layers[0].mlp.weight.device
+    layer = 64 * 64 * 4
+    # Same signature as its neighbours, so it shares their pool: four layers (two pool slots) free two.
+    idx, left = auto_swap_indices(layers, 2 * layer, 1, free_bytes = {dev: 0})
+    assert idx == [1, 3, 5, 7] and left == 0
