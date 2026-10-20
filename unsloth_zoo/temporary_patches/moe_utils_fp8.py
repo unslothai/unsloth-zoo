@@ -81,7 +81,7 @@ _TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE = {}
 
 
 def _check_torch_scaled_grouped_mm_supported(device=None):
-    # A non-None module value is a forced answer (tests, overrides).
+    # Non-None module value = forced answer.
     if _TORCH_SCALED_GROUPED_MM_SUPPORTED is not None:
         return _TORCH_SCALED_GROUPED_MM_SUPPORTED
 
@@ -101,10 +101,7 @@ def _check_torch_scaled_grouped_mm_supported(device=None):
     if supported is not None:
         return supported
 
-    # The symbol can exist on unsupported GPUs, and the light probe can still
-    # pass on SM100 while real MoE kernels later emit incompatible MMA
-    # instructions and poison the CUDA context asynchronously. Restrict the
-    # FP8 scaled_grouped_mm path to Hopper (SM 9.x) only for now.
+    # Hopper only: on SM100 the probe passes but real MoE kernels emit bad MMA and poison the CUDA context.
     major, _minor = torch.cuda.get_device_capability(device_index)
     if major != 9:
         supported = False
