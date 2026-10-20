@@ -1439,8 +1439,7 @@ def _grouped_mm_probe_devices(device):
             p = backend.get_device_properties(i)
             return (p.name, getattr(p, "major", None), getattr(p, "minor", None), getattr(p, "gcnArchName", None))
         except Exception:
-            return i   # unknown: probe it
-    # Homogeneous hosts keep one probe: no context or child process on the other cards.
+            return i
     devices, seen = [device], {model(device.index)}
     for i in range(count):
         kind = model(i)
@@ -1538,7 +1537,7 @@ def _probe_torch_grouped_mm_supported():
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
         dtype = torch.float16
 
-        # 1 expert, 1 token, dim 8 (safe alignment). Every visible GPU model must pass (mixed hosts).
+        # 1 expert, 1 token, dim 8 (safe alignment).
         for d in _grouped_mm_probe_devices(device):
             x = torch.ones((1, 8), device=d, dtype=dtype)
             w = torch.ones((1, 8, 8), device=d, dtype=dtype)

@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Mixed hosts (MI300X + RX 9070, H100 + A100): a device_map can put experts on any card, so the
-grouped_mm support probe and the ROCm crash probe must cover every visible GPU model, not just the current card.
-Homogeneous hosts keep a single probe."""
+"""grouped_mm and ROCm crash probes must cover every visible GPU model (device_map spans cards)."""
 import subprocess
 import types
 
@@ -29,7 +27,7 @@ from unsloth_zoo.temporary_patches import moe_utils
 @pytest.fixture
 def spoof(monkeypatch):
     def make(count, failing = (), hip = None, current = 0, models = None):
-        models = models or [f"GPU{i}" for i in range(count)]   # mixed host unless given
+        models = models or [f"GPU{i}" for i in range(count)]
         def props(i): return types.SimpleNamespace(name = models[i], major = 9, minor = 0, gcnArchName = models[i])
         monkeypatch.setattr(torch.cuda, "get_device_properties", props)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -64,9 +62,9 @@ def spoof(monkeypatch):
 
 
 @pytest.mark.parametrize("count, failing, expected, probed", [
-    (1, (), True, [0]),           # single GPU: one probe, today's answer
+    (1, (), True, [0]),
     (1, (0,), False, [0]),
-    (2, (), True, [0, 1]),        # mixed models
+    (2, (), True, [0, 1]),
     (3, (), True, [0, 1, 2]),
     (2, (1,), False, [0, 1]),     # experts on card 1 must not run grouped_mm unprobed
     (3, (2,), False, [0, 1, 2]),
@@ -78,7 +76,7 @@ def test_support_probe_covers_every_visible_device(spoof, count, failing, expect
     assert seen == probed
     assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is expected
     assert moe_utils._probe_torch_grouped_mm_supported() is expected
-    assert seen == probed   # cached process-wide: no re-probe
+    assert seen == probed
 
 
 @pytest.mark.parametrize("count", [2, 3, 8])
@@ -144,7 +142,7 @@ def test_rocm_crash_probe_one_child_per_device(spoof, monkeypatch, count):
     assert moe_utils._probe_torch_grouped_mm_supported() is True
     assert children == [("0", (str(i), str(i))) for i in range(count)]
     assert moe_utils._grouped_mm_survives_out_of_process(torch.device("cuda", 0)) is True
-    assert len(children) == count   # cached
+    assert len(children) == count
 
 
 def test_rocm_crash_on_second_card_disables_grouped_mm(spoof, monkeypatch):

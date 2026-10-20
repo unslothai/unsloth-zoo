@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The persistent Triton scratch buffer must never be handed to a kernel launched on another card
-(device_map with experts on several GPUs)."""
+"""The persistent Triton scratch buffer must never cross cards."""
 import sys
 import types
 
@@ -56,7 +55,7 @@ def test_each_card_gets_its_own_scratch(allocator):
     assert other is not first
     assert other.fake_device == torch.device("cuda", 1)
     current["d"] = 0
-    assert alloc(100, 128, None) is first   # still reused on its own card
+    assert alloc(100, 128, None) is first
     current["d"] = 1
     assert alloc(100, 128, None) is other
 
