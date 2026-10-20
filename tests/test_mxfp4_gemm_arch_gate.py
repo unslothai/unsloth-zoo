@@ -18,7 +18,6 @@ from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam
 def gpu(monkeypatch):
     """A verified CUDA device 0 of a chosen capability, no GPU needed."""
     def make(capability, hip = None):
-        monkeypatch.setattr(mg, "_TILES_FAST", {})
         monkeypatch.setattr(mg, "_AVAILABLE_DTYPE", {
             (str(torch.device("cuda", 0)), dtype): True for dtype in (torch.float16, torch.bfloat16)
         })

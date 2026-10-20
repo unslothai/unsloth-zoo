@@ -803,38 +803,36 @@ def _probe_dense(device, dtype):
     return True
 
 
-_TILES_FAST = {}
-
-
-def _tiles_fast(device):
-    """Below sm_80 (T4) the MMA tile kernel runs 30-300x slower than decode + cuBLAS; the grouped GEMV does not."""
-    device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    ok = _TILES_FAST.get(index)
-    if ok is None:
-        ok = _TILES_FAST[index] = torch.version.hip is not None or torch.cuda.get_device_capability(index) >= (8, 0)
-    return ok
-
-
 def mxfp4_gemm_available(device = None, dtype = torch.bfloat16) -> bool:
     """Self-checked once per (device, dtype), bf16 / fp16, sm_80+ (``UNSLOTH_MXFP4_FUSED_GEMM=1`` also below);
     ``UNSLOTH_MXFP4_FUSED_GEMM=0`` turns it off."""
-    if not mxfp4_grouped_gemv_available(device, dtype):
-        return False
-    import os
-    return os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto") == "1" or _tiles_fast(device)
+    return _available(device, dtype, True)
 
 
 def mxfp4_grouped_gemv_available(device = None, dtype = torch.bfloat16) -> bool:
     """``mxfp4_gemm_available`` without the arch floor: decode rows (``_gemv_rows``) run the GEMV on any GPU."""
+    return _available(device, dtype, False)
+
+
+def _available(device, dtype, tiles):
     if dtype not in (torch.bfloat16, torch.float16):
         return False
     import os
-    if os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto") in ("0", "dequant"):
+    mode = os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto")
+    if mode in ("0", "dequant"):
         return False
     key = (None if device is None else str(device), dtype)
+    if tiles and mode != "1":
+        # Below sm_80 (T4) the MMA tile kernel runs 8-34x slower than dequantize + cuBLAS; the grouped GEMV does not.
+        key += ("tiles",)
     ok = _AVAILABLE_DTYPE.get(key)
     if ok is not None:
+        return ok
+    if len(key) == 3:
+        ok = _available(device, dtype, False) and (
+            torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)
+        )
+        _AVAILABLE_DTYPE[key] = ok
         return ok
     ok = mxfp4_grouped_mm_available(device)
     if ok:
