@@ -510,8 +510,20 @@ def _deepseek_v4_step_mask(layer, arguments):
 _WIDE_LAYERS = {
     "mlx_vlm.models.qwen4_exp.language.Qwen4ExpDecoderLayer": (
         {"hidden_states": 1, "input_ids": 1, "position_ids": -1}, (None, "causal")),
-    "mlx_lm.models.qwen3_moe.Qwen3MoeDecoderLayer": ({"x": 1}, ("causal",)),
     "mlx_vlm.models.deepseek_v4.language.DeepseekV4Block": ({"h": 1, "input_ids": 1}, _deepseek_v4_step_mask),
+    "mlx_vlm.models.qwen3_5_moe.language.Qwen3_5MoeDecoderLayer": (
+        {"x": 1, "position_ids": -1, "position_embeddings": -2}, (None, "causal")),
+    "mlx_vlm.models.qwen3_vl_moe.language.Qwen3VLMoEDecoderLayer": (
+        {"x": 1, "position_ids": -1, "position_embeddings": -2}, ("causal",)),
+    **{
+        f"{module}.{layer}": ({"x": 1}, masks)
+        for family, layer, masks in (
+            ("qwen3_next", "Qwen3NextDecoderLayer", (None, "causal")), ("qwen3_moe", "Qwen3MoeDecoderLayer", ("causal",)),
+            ("minimax", "MiniMaxDecoderLayer", ("causal",)), ("mixtral", "MixtralDecoderLayer", ("causal",)),
+            ("glm4_moe", "DecoderLayer", ("causal",)),
+        )
+        for module in (f"mlx_lm.models.{family}", f"mlx_vlm.models.{family}.language")
+    },
 }
 _table_reader_pool = None
 
@@ -912,9 +924,27 @@ class OffloadSwitchGLU(nn.Module):
 
 
 def _token_slice(value, axis, start, end):
+    if isinstance(value, tuple):  # rotary (cos, sin)
+        return tuple(_token_slice(part, axis, start, end) for part in value)
     index = [slice(None)] * value.ndim
     index[axis] = slice(start, end)
     return value[tuple(index)]
+
+
+def _cache_mask(cache, rows):
+    if not hasattr(cache, "make_mask"):
+        return None
+    try:
+        return cache.make_mask(rows, return_array = False, window_size = None)
+    except TypeError:  # a linear-attention cache, masked as create_ssm_mask does
+        return cache.make_mask(rows)
+
+
+def _is_cache_mask(mask, built):
+    return (
+        isinstance(mask, mx.array) and isinstance(built, mx.array)
+        and mask.shape == built.shape and mask.dtype == built.dtype and mx.array_equal(mask, built).item()
+    )
 
 
 class _WideLayer:
@@ -932,8 +962,17 @@ class _WideLayer:
             return self._whole(hidden, args, kwargs)
         bound = self._wide_signature.bind(self, *args, **kwargs)
         cache, mask, masks = bound.arguments.get("cache"), bound.arguments.get("mask"), self._wide_masks
-        step_mask = masks(self, bound.arguments) if callable(masks) and cache is not None else None
-        causal = step_mask is not None if callable(masks) else (mask is None or isinstance(mask, str)) and mask in masks
+        if callable(masks):
+            step_mask = masks(self, bound.arguments) if cache is not None else None
+            causal = step_mask is not None
+        elif isinstance(mask, mx.array) and _is_cache_mask(mask, _cache_mask(cache, hidden.shape[1])):
+            # The cache's own mask (a rotating cache past its window): each step builds its own, as chunked prefill does.
+            step_mask, causal = (lambda h: _cache_mask(cache, h.shape[1])), True
+        else:
+            # Only the mask the cache itself builds steps: None over a KV cache is full attention.
+            built = _cache_mask(cache, hidden.shape[1]) if hasattr(cache, "make_mask") else mask
+            step_mask = None
+            causal = (mask is None or isinstance(mask, str)) and mask in masks and not isinstance(built, mx.array) and mask == built
         if cache is None or not causal:
             return self._whole(hidden, args, kwargs)
         switch = self._offload_switch

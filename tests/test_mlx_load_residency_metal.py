@@ -5,6 +5,7 @@ one reads PLE rows and experts from the checkpoint instead, computing the stock 
 bit for bit."""
 
 import gc
+import inspect
 import json
 import os
 import sys
@@ -511,18 +512,24 @@ def test_a_wide_prefill_step_runs_layer_by_layer_on_full_tables(tmp_path, monkey
     # Without a causal mask the layer attends to the whole call, which consecutive steps cannot.
     x = stock.model.embed_tokens(tokens)
     layers = (model.model.layers[0], stock.model.layers[0])
-    got, want = (layer(x, None, cache_module.KVCache()) for layer in layers)
-    np.testing.assert_array_equal(_bits(got), _bits(want))
+    full = mx.ones((x.shape[1], x.shape[1]), dtype = mx.bool_)
+    monkeypatch.setattr(type(layers[0]), "_wide_masks", (None, "causal"))
+    rotating = lambda: cache_module.RotatingKVCache(2048)
+    scores = rotating().make_mask(x.shape[1], return_array = False, window_size = None).astype(mx.float32)  # additive, not kept
+    for mask, cache in ((None, cache_module.KVCache), (full, cache_module.KVCache), (full, rotating), (scores, rotating)):
+        got, want = (layer(x, mask, cache()) for layer in layers)
+        np.testing.assert_array_equal(_bits(got), _bits(want))
     monkeypatch.setattr(model.model.layers[-1], "__class__", type(stock.model.layers[-1]))
     monkeypatch.setattr(model.model.layers[-1], "mlp", stock.model.layers[-1].mlp)
     assert zoo_offload.wide_prefill_step(model) is None  # an unwidened layer runs a call whole
 
 
-def test_a_layer_without_a_table_steps_on_its_slots(tmp_path, monkeypatch):
+@pytest.mark.parametrize("window", [None, 2048])  # a rotating cache past its window masks with an array
+def test_a_layer_without_a_table_steps_on_its_slots(tmp_path, monkeypatch, window):
     cache_module = pytest.importorskip("mlx_lm.models.cache")
     tokens = mx.random.randint(0, 512, (1, 2 * 2048 + 5), key = mx.random.key(4))
     stock = _lazy_copy(lambda: _qwen3_moe([0]), str(tmp_path))
-    expected_cache = cache_module.make_prompt_cache(stock)
+    expected_cache = cache_module.make_prompt_cache(stock, max_kv_size = window)
     expected = [stock.model(tokens[:, i:i + 2048], cache = expected_cache) for i in range(0, tokens.shape[1], 2048)]
     model = _qwen3_moe([0]).load_weights(list(tree_flatten(stock.parameters())))
     offload_experts(model, str(tmp_path), 0.75)
@@ -530,10 +537,19 @@ def test_a_layer_without_a_table_steps_on_its_slots(tmp_path, monkeypatch):
     assert isinstance(dense, zoo_offload._WideLayer) and dense._offload_switch is None
     assert zoo_offload.wide_prefill_step(model) == 2048
     monkeypatch.setattr(cast.mlp.switch_mlp, "_table", lambda: None)
-    cache = cache_module.make_prompt_cache(model)
+    cache = cache_module.make_prompt_cache(model, max_kv_size = window)
     np.testing.assert_array_equal(_bits(model.model(tokens, cache = cache)), _bits(mx.concatenate(expected, axis = 1)))
     for (_, got), (_, want) in zip(tree_flatten([c.state for c in cache]), tree_flatten([c.state for c in expected_cache]), strict = True):
         np.testing.assert_array_equal(*(_bits(a) if isinstance(a, mx.array) else a for a in (got, want)))
+
+
+def test_every_wide_layer_still_takes_its_token_arguments():
+    for name, (axes, _) in zoo_offload._WIDE_LAYERS.items():
+        module, _, layer = name.rpartition(".")
+        assert {*axes, "cache"} <= set(inspect.signature(getattr(pytest.importorskip(module), layer).__call__).parameters), name
+    assert zoo_offload._cache_mask(pytest.importorskip("mlx_lm.models.cache").ArraysCache(2), 4097) is None
+    rotary = zoo_offload._token_slice(tuple(mx.arange(6).reshape(1, 6, 1) + shift for shift in (0, 10)), -2, 2, 4)
+    assert [part.tolist() for part in rotary] == [[[[2], [3]]], [[[12], [13]]]]
 
 
 def test_deepseek_v4_blocks_prefill_layer_by_layer(tmp_path):
