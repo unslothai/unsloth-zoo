@@ -3,7 +3,7 @@ requires = [
     # setuptools 83+ needs Python 3.10, and we still support 3.9 source installs.
     "setuptools==84.0.0; python_version >= '3.10'",
     "setuptools==80.9.0; python_version < '3.10'",
-    "setuptools-scm==9.2.0",
+    "setuptools-scm==10.3.4",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -67,8 +67,8 @@ dependencies = [
     #
     # Ceiling = newest release the matrix ran on CUDA and Apple Silicon (CEILING gate in
     # consolidated-tests-ci.yml). Every `!=` is a tested, rejected release.
-    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
+    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.19.0",
+    "datasets>=4.0,<5.2",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
@@ -115,8 +115,8 @@ mlx = [
 core = [
     "packaging>=24.1",
     "tyro",
-    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
+    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.19.0",
+    "datasets>=4.0,<5.2",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
