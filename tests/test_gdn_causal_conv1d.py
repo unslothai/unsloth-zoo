@@ -537,7 +537,6 @@ def test_conv_launch_skips_the_cache_when_unsafe(monkeypatch):
 
 @requires_cuda
 def test_conv_plan_cache_stays_bounded_over_variable_lengths(monkeypatch):
-    # T is in the plan key, so packed batches must not grow the cache per length.
     if not gcc._triton_launcher_verified():
         pytest.skip("cached launcher needs Triton 3.6+")
     monkeypatch.setattr(gcc, "_conv_plans", {})

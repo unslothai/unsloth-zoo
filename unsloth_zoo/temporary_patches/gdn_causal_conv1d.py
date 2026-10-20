@@ -338,7 +338,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
 # decode update below: key -> (grid, compiled kernel). Same gates: Triton 3.6+ launcher convention,
 # a bitwise self-check per kernel on first use, full launches under profiler hooks, for unaligned
 # pointers (Triton specializes on 16-byte alignment) and off the current device.
-# T is in the key, so variable-length batches grow it: cap it, evicting the oldest.
+# T is in the key: cap it (FIFO) so variable lengths do not grow it unbounded.
 _conv_plans = {}
 _CONV_PLANS_MAX = 256
 _conv_fast_ok = {}
