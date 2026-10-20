@@ -36,8 +36,7 @@ from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bou
 from unsloth_zoo.device_type import DEVICE_TYPE
         
 
-# Not F.linear: ZeRO-3 replaces it process wide (deepspeed/runtime/zero/linear.py), and under
-# torch.compile + torch.func.grad_and_value that gives a zero lm_head gradient.
+# Not F.linear: ZeRO-3 patches it process wide, giving a zero lm_head grad under compile + grad_and_value.
 _aten_linear = torch._C._nn.linear
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
 N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
