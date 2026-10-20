@@ -1600,8 +1600,8 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
             return None
         if mode == "grouped":
             # torch._grouped_mm takes bf16 only (its fake impl rejects fp16 under compile).
-            from .moe_utils import _check_torch_grouped_mm_supported, moe_compute_dtype
-            if moe_compute_dtype(hidden_states) != torch.bfloat16 or not _check_torch_grouped_mm_supported():
+            from .moe_utils import _grouped_mm_supported_on, moe_compute_dtype
+            if moe_compute_dtype(hidden_states) != torch.bfloat16 or not _grouped_mm_supported_on(hidden_states.device):
                 return None
     else:
         if mode == "grouped":

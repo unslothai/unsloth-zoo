@@ -393,7 +393,7 @@ def _grouped_mm_eager(inputs, weight, offsets):
     # LoRA delta still routed here. torch 2.8 hard-raises unless `dprops->major == 9`
     # (Blas.cpp, sm90_only) and 2.6/2.7 have no `_grouped_mm`, so a LoRA MoE died on
     # every card but an H100; 2.9 falls back internally. Probe is cached: one read.
-    if not _check_torch_grouped_mm_supported():
+    if not _grouped_mm_supported_on(inputs.device):
         return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
         weight = weight.contiguous()   # view path unproven on this device -> safe copy
@@ -414,7 +414,7 @@ def _grouped_mm_eager(inputs, weight, offsets):
 def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
     """dW[g] = inputs[g]^T @ grad_output[g] per group, as [G, K, N]; empty groups are zero."""
     try:
-        if _check_torch_grouped_mm_supported():
+        if _grouped_mm_supported_on(inputs.device):
             return torch._grouped_mm(inputs.transpose(-2, -1), grad_output, offs = offsets).contiguous()
     except RuntimeError:
         pass
@@ -1424,40 +1424,61 @@ def _grouped_mm_probe_device():
     return None
 
 
-def _grouped_mm_probe_devices(device):
-    """`device` first, then one card per other GPU model visible: a device_map can put experts on any of them."""
-    if device.type not in ("cuda", "xpu"): return [device]
-    backend = getattr(torch, device.type)
+def _grouped_mm_device_kind(backend, index):
     try:
-        count = backend.device_count()
+        p = backend.get_device_properties(index)
+        return (p.name, getattr(p, "major", None), getattr(p, "minor", None), getattr(p, "gcnArchName", None))
     except Exception:
-        count = 1
-    if count <= 1: return [device]
-
-    def model(i):
-        try:
-            p = backend.get_device_properties(i)
-            return (p.name, getattr(p, "major", None), getattr(p, "minor", None), getattr(p, "gcnArchName", None))
-        except Exception:
-            return i
-    devices, seen = [device], {model(device.index)}
-    for i in range(count):
-        kind = model(i)
-        if i != device.index and kind not in seen:
-            seen.add(kind)
-            devices.append(torch.device(device.type, i))
-    return devices
+        return index
 
 
-def _check_torch_grouped_mm_supported():
-    """Check torch._grouped_mm support on every visible GPU model; a runtime probe is the only reliable check."""
+_GROUPED_MM_FOREIGN = {}   # (type, index) -> None if same GPU model as the probe device, else its model
+
+
+def _grouped_mm_foreign_kind(device):
+    """None when `device` shares the current device's GPU model (the process-wide flags answer), else its model."""
+    if device is None or device.type not in ("cuda", "xpu") or device.index is None: return None
+    key = (device.type, device.index)
+    if key in _GROUPED_MM_FOREIGN: return _GROUPED_MM_FOREIGN[key]
+    return _run_probe_eagerly(lambda: _resolve_grouped_mm_foreign_kind(device, key))
+
+
+def _resolve_grouped_mm_foreign_kind(device, key):
+    home, kind = _grouped_mm_probe_device(), None
+    if home is not None and home.type == device.type and home.index != device.index:
+        backend = getattr(torch, device.type)
+        kind = _grouped_mm_device_kind(backend, device.index)
+        if kind == _grouped_mm_device_kind(backend, home.index): kind = None
+    _GROUPED_MM_FOREIGN[key] = kind
+    return kind
+
+
+# Per GPU model other than the current device's: a card the model never uses is never probed.
+_TORCH_GROUPED_MM_SUPPORTED_BY_KIND = {}
+
+
+def _check_torch_grouped_mm_supported(device = None):
+    """Check torch._grouped_mm support on `device` (default: current); a runtime probe is the only reliable check."""
     global _TORCH_GROUPED_MM_SUPPORTED
+    if device is not None:
+        kind = _grouped_mm_foreign_kind(device)
+        if kind is not None:
+            supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
+            if supported is not None: return supported
+            if not _TORCH_GROUPED_MM_AVAILABLE: return False
+            return _run_probe_eagerly(lambda: _probe_torch_grouped_mm_supported(device))
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
     # Definitive negatives stay traceable so fullgraph traces don't break.
     if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
+
+
+def _grouped_mm_supported_on(device):
+    """Call-site gate for the card the tensor lives on; same-model cards go through the no-arg check."""
+    if _grouped_mm_foreign_kind(device) is None: return _check_torch_grouped_mm_supported()
+    return _check_torch_grouped_mm_supported(device)
 
 
 # Some ROCm GPUs segfault in grouped_mm instead of raising (unsloth#12391): run the kernels in a throwaway interpreter first.
@@ -1479,16 +1500,22 @@ probe(torch.ones(32, 32, **bf16), w_t, [8, 16, 24, 32])
 probe(torch.ones(32, 32, **bf16), w_t.contiguous(), [8, 16, 24, 32])
 """
 _GROUPED_MM_SURVIVES = None
+_GROUPED_MM_SURVIVES_BY_KIND = {}
 _GROUPED_MM_SURVIVES_LOCK = threading.Lock()
 
 
 def _grouped_mm_survives_out_of_process(device):
     global _GROUPED_MM_SURVIVES
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is not None:
+        with _GROUPED_MM_SURVIVES_LOCK:
+            if kind not in _GROUPED_MM_SURVIVES_BY_KIND:
+                _GROUPED_MM_SURVIVES_BY_KIND[kind] = _run_grouped_mm_crash_probe(device)
+        return _GROUPED_MM_SURVIVES_BY_KIND[kind]
     if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
     # Publish once known: concurrent first callers wait for the child, never run the kernel.
     with _GROUPED_MM_SURVIVES_LOCK:
-        if _GROUPED_MM_SURVIVES is None:
-            _GROUPED_MM_SURVIVES = all(_run_grouped_mm_crash_probe(d) for d in _grouped_mm_probe_devices(device))
+        if _GROUPED_MM_SURVIVES is None: _GROUPED_MM_SURVIVES = _run_grouped_mm_crash_probe(device)
     return _GROUPED_MM_SURVIVES
 
 
@@ -1524,8 +1551,32 @@ def _run_grouped_mm_crash_probe(device):
     return False
 
 
-def _probe_torch_grouped_mm_supported():
+def _grouped_mm_runs_on(device):
+    try:
+        # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
+        dtype = torch.float16
+
+        # 1 expert, 1 token, dim 8 (safe alignment).
+        x = torch.ones((1, 8), device=device, dtype=dtype)
+        w = torch.ones((1, 8, 8), device=device, dtype=dtype)
+        offs = torch.tensor([1], device=device, dtype=torch.int32)
+
+        torch._grouped_mm(x, w, offs=offs)
+        del x, w, offs
+        return True
+    except Exception:
+        return False
+
+
+def _probe_torch_grouped_mm_supported(device = None):
     global _TORCH_GROUPED_MM_SUPPORTED
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is not None:
+        supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
+        if supported is None:
+            supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
+            _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
+        return supported
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
     device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
@@ -1533,22 +1584,7 @@ def _probe_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
-    try:
-        # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
-        dtype = torch.float16
-
-        # 1 expert, 1 token, dim 8 (safe alignment).
-        for d in _grouped_mm_probe_devices(device):
-            x = torch.ones((1, 8), device=d, dtype=dtype)
-            w = torch.ones((1, 8, 8), device=d, dtype=dtype)
-            offs = torch.tensor([1], device=d, dtype=torch.int32)
-
-            torch._grouped_mm(x, w, offs=offs)
-            del x, w, offs
-        _TORCH_GROUPED_MM_SUPPORTED = True
-    except Exception:
-        _TORCH_GROUPED_MM_SUPPORTED = False
-
+    _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
     return _TORCH_GROUPED_MM_SUPPORTED
 
 
