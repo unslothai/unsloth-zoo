@@ -611,9 +611,8 @@ def device_empty_cache():
 pass
 
 def _xpu_bf16_supported():
-    """False only when an XPU lacks native bf16 (is_bf16_supported() counts emulation). SYCL reads
-    these aspects through libocloc, which torch-xpu wheels lack, so every aspect is then False on every
-    device: the probe is trusted only once some aspect reads True. Unknown answers True."""
+    """is_bf16_supported() counts emulation. Without libocloc (absent in torch-xpu wheels) every SYCL
+    aspect reads False, so trust has_bfloat16_conversions only once some aspect reads True."""
     aspects = (
         "has_bfloat16_conversions",
         "has_subgroup_matrix_multiply_accumulate",
@@ -636,7 +635,7 @@ def _xpu_bf16_supported():
 pass
 
 def _apple_bf16_supported():
-    """M1 (applegpu_g13) and M2 (g14) lack native bf16; M3+ have it. Matches unsloth's MLX answer."""
+    """M1 (g13) and M2 (g14) lack native bf16. Matches unsloth's MLX answer."""
     try:
         import mlx.core as mx
         info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()

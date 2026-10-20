@@ -123,7 +123,7 @@ def get_mem_info():
         try:
             free_memory, total_memory = torch.xpu.mem_get_info()
         except Exception:
-            # Raises on some Intel GPUs (e.g. Arc B580, Lunar Lake): estimate as total - reserved.
+            # Raises on some Intel GPUs (Arc B580, Lunar Lake)
             index = torch.xpu.current_device()
             total_memory = torch.xpu.get_device_properties(index).total_memory
             free_memory = total_memory - torch.xpu.memory_reserved(index)

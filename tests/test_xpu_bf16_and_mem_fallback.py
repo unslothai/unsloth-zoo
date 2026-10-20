@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Intel XPU free-memory fallback, native bf16 detection, and the Apple MLX bf16 answer.
-
-torch.xpu.mem_get_info raises on some Intel GPUs (Arc B580, Lunar Lake), and
-torch.xpu.is_bf16_supported() counts emulation so it is always True. Everything
-here runs on a CPU box with spoofed torch.xpu / mlx.core.
-"""
+"""XPU mem fallback, XPU native bf16 and Apple MLX bf16, on CPU with spoofed torch.xpu / mlx.core."""
 import ast
 import inspect
 import sys
@@ -35,7 +30,7 @@ _GB = 1024 ** 3
 _MISSING = object()
 
 
-_PROVEN_NO_BF16 = "proven-no-bf16"  # bf16 False while another aspect reads True: the probe works
+_PROVEN_NO_BF16 = "proven-no-bf16"
 
 
 def _props(flag = _MISSING, total = 16 * _GB):
@@ -65,13 +60,11 @@ def _fake_xpu(flags = (True,), mem_get_info = None, is_bf16 = True, props_raise 
         mem_get_info = mem_get_info,
     )
     if is_bf16 is not None:
-        # torch's default including_emulation=True: always True whatever the card.
         xpu.is_bf16_supported = lambda including_emulation = True: is_bf16
     return xpu
 
 
 
-# XPU and CUDA never run on macOS, where zoo imports down the MLX path; spoofing them there tests nothing.
 not_on_macos = pytest.mark.skipif(sys.platform == "darwin", reason = "XPU / CUDA paths do not run on macOS")
 
 @pytest.fixture
@@ -85,20 +78,18 @@ def on_xpu(monkeypatch):
     return install
 
 
-# ---- device_is_bf16_supported on XPU ----
-
 @not_on_macos
 @pytest.mark.parametrize(
     "flags, expected",
     [
-        ((True,), True),                 # single native card: unchanged
-        ((True, True), True),            # homogeneous: unchanged
-        ((False,), True),                # no libocloc reads False everywhere: unproven, unchanged
+        ((True,), True),               
+        ((True, True), True),          
+        ((False,), True),                # no libocloc: unproven
         ((False, False), True),
-        ((_PROVEN_NO_BF16,), False),     # emulation only (torch still says True)
-        ((True, False), False),          # mixed: weakest card decides, the native card proves the probe
+        ((_PROVEN_NO_BF16,), False),     # emulation only
+        ((True, False), False),          # mixed: weakest card decides
         ((False, True), False),
-        ((_MISSING,), True),             # older torch without the attribute: unchanged
+        ((_MISSING,), True),           
         ((_MISSING, _MISSING), True),
     ],
 )
@@ -127,8 +118,6 @@ def test_cuda_bf16_still_asks_torch_cuda(monkeypatch):
         monkeypatch.setattr(torch, "cuda", fake_cuda)
         assert dt.device_is_bf16_supported() is answer
 
-
-# ---- gradient checkpointing offload dtype on XPU ----
 
 @not_on_macos
 def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
@@ -168,8 +157,6 @@ def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
     assert got[(_PROVEN_NO_BF16,)] is torch.float16
     assert got[(True, False)] is torch.float16
 
-
-# ---- vllm_utils ----
 
 @pytest.fixture
 def vu():
@@ -212,8 +199,6 @@ def test_vllm_xpu_dtype_asks_native_bf16_and_old_gpu_message_is_actionable(vu):
     assert "{major_version}.{minor_version}" in source
 
 
-# ---- Apple MLX ----
-
 @pytest.mark.parametrize(
     "info, expected",
     [
@@ -222,7 +207,6 @@ def test_vllm_xpu_dtype_asks_native_bf16_and_old_gpu_message_is_actionable(vu):
         ({"architecture": "applegpu_g15p", "device_name": "Apple M3 Pro"}, True),
         ({"architecture": "applegpu_g16s", "device_name": "Apple M4 Max"}, True),
         ({"architecture": "applegpu_g17g", "device_name": "Apple M5"}, True),
-        # Unparsable architecture: fall back to unsloth's name check.
         ({"architecture": "", "device_name": "Apple M2 Ultra"}, False),
         ({"architecture": "", "device_name": "Apple M4 Pro"}, True),
         ({}, True),
