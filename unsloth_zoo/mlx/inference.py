@@ -18,7 +18,7 @@
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
 small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
 Qwen exact speculative verify blocks, Gemma 4 verify-block attention, Qwen sparse attention block selection,
-and SSD-backed PLE row reads."""
+QSA indexer blocks kept across cache trims, dilated depthwise convolutions, and SSD-backed PLE row reads."""
 
 import ast
 import functools
@@ -104,6 +104,7 @@ def _resolved_bindings(contract):
             owner, _, name = path.rpartition(".")
             holder = _resolve_dotted(module, owner) if owner else module
             target = getattr(holder, name, None)
+            target = _exact_route_native(target) or target
             # The sparse-attention training wrapper outlives training and calls what it wraps outside it. A wrapper
             # around it inherits the marker through functools.wraps, but its own __wrapped__ is not the marked one.
             marked = getattr(target, "_unsloth_sparse_attention_original", None)
@@ -132,9 +133,17 @@ def _resolved_bindings(contract):
     return list(found.values()) if holds else None
 
 
+def _exact_route_native(function):
+    """The native a route marked `_unsloth_exact_route_of` runs unchanged, so a contract on that native holds.
+    functools.wraps copies the mark onto a wrapper around the route, whose own __wrapped__ gives it away."""
+    native = getattr(function, "_unsloth_exact_route_of", None)
+    return None if native is None or hasattr(function, "__wrapped__") else native
+
+
 def _bindings_intact(bindings):
     for namespace, name, target in bindings:
-        if namespace.get(name) is not target:
+        current = namespace.get(name)
+        if current is not target and _exact_route_native(current) is not target:
             return False
     return True
 
@@ -4908,6 +4917,7 @@ def _qsa_select_route(native, bindings):
             selection.selected_blocks = picks
         return selection
 
+    select_from_projected._unsloth_exact_route_of = native
     return select_from_projected
 
 
@@ -5213,6 +5223,196 @@ def exact_ple_row_reads(model, *, _modules = None):
                         table.__class__ = type(table).__base__
 
 
+# mlx-vlm's QSA caches drop every pooled indexer block on trim, so the indexer call after a speculative
+# rollback re-pools the whole context on each QSA layer.
+_QSA_LANGUAGE = "mlx_vlm.models.qwen4_exp.language"
+_QSA_TRIM_CACHES = ("QSAKVCache", "QSAQuantizedKVCache", "BatchQSAKVCache")
+_QSA_TRIM_CONTRACT = {_QSA_LANGUAGE: {
+    "QSAKVCache.trim": "408373696f053090",
+    "QSAQuantizedKVCache.trim": "408373696f053090",
+    "BatchQSAKVCache.trim": "c26b5cd8d0d2cc19",
+    # Extends a cached prefix of pooled blocks, pooling only the blocks after it.
+    "Qwen4ExpQSAIndexer.select_from_projected": "379bb821075d65a8",
+}}
+_QSA_TRIM_LOCK = RLock()
+_QSA_TRIM_HELD = []  # [open scopes, [(cache class, native trim, route)]]
+
+
+def _qsa_trim_route(native, bindings):
+    def trim(self, n):
+        blocks, ratio = self.index_block_keys, self.index_block_ratio
+        trimmed = native(self, n)
+        if blocks is not None and ratio and self.index_keys is not None and _bindings_intact(bindings):
+            # A block below the kept complete-block count pools only keys the trim left in place.
+            length = getattr(self, "index_offset", self.index_keys.shape[1])
+            self.index_block_keys, self.index_block_ratio = blocks[:, :, : length // ratio], ratio
+        return trimmed
+
+    return trim
+
+
+@contextmanager
+def exact_qsa_trim(model, *, _modules = None):
+    """Keep the pooled QSA indexer blocks a cache trim leaves complete; the indexer re-pools only the tail.
+
+    The kept blocks are the ones a re-pool would rebuild bit for bit. The QSA caches' `trim` is rebound
+    process-wide while any scope is open. `UNSLOTH_MLX_QSA_TRIM_KEEPS_BLOCKS=0` turns this off.
+    """
+    entered = False
+    try:
+        with _QSA_TRIM_LOCK:
+            language = sys.modules.get(_QSA_LANGUAGE)
+            indexer = getattr(language, "Qwen4ExpQSAIndexer", None)
+            if (os.environ.get("UNSLOTH_MLX_QSA_TRIM_KEEPS_BLOCKS", "1") != "0" and indexer is not None
+                    and any(isinstance(module, indexer) for _, module in _fusion_modules(model, _modules))):
+                if not _QSA_TRIM_HELD:
+                    bindings = _resolved_bindings(_QSA_TRIM_CONTRACT)
+                    if bindings is not None:
+                        classes = [getattr(language, name) for name in _QSA_TRIM_CACHES]
+                        natives = [vars(cls)["trim"] for cls in classes]
+                        kept = [binding for binding in bindings if binding[2] not in natives]
+                        routes = [(cls, native, _qsa_trim_route(native, kept)) for cls, native in zip(classes, natives)]
+                        for cls, _, route in routes:
+                            cls.trim = route
+                        _QSA_TRIM_HELD[:] = [0, routes]
+                if _QSA_TRIM_HELD:
+                    _QSA_TRIM_HELD[0] += 1
+                    entered = True
+        yield model
+    finally:
+        with _QSA_TRIM_LOCK:
+            if entered:
+                _QSA_TRIM_HELD[0] -= 1
+                if not _QSA_TRIM_HELD[0]:
+                    for cls, native, route in _QSA_TRIM_HELD[1]:
+                        if vars(cls).get("trim") is route:
+                            cls.trim = native
+                    _QSA_TRIM_HELD.clear()
+
+
+# MLX takes its depthwise kernel only without dilation, so a dilated depthwise convolution (the Qwen4-Exp
+# PLE short conv) runs as a grouped implicit GEMM with one group per channel.
+_DEPTHWISE_CONV_CONTRACT = {"mlx.nn.layers.convolution": {"Conv1d.__call__": "e6c4e02415104dd1"}}
+_DEPTHWISE_CONV_DTYPES = (mx.bfloat16, mx.float16, mx.float32)
+_DEPTHWISE_CONV_LOCK = RLock()
+_DEPTHWISE_CONV_CLASS = []
+_DEPTHWISE_CONV_SOURCE = """
+    uint c = thread_position_in_grid.x;
+    uint t = thread_position_in_grid.y;
+    uint b = thread_position_in_grid.z;
+    size_t rows = threads_per_grid.y;
+    const device T* src = x + ((size_t)b * (rows + (K - 1) * DIL) + t) * C + c;
+    float acc = 0.0f;
+    for (int i = 0; i < K; ++i) {
+        acc += static_cast<float>(src[(size_t)i * DIL * C]) * static_cast<float>(w[c * K + i]);
+    }
+    y[((size_t)b * rows + t) * C + c] = static_cast<T>(acc);
+"""
+
+
+@functools.cache
+def _depthwise_conv_kernel():
+    return mx.fast.metal_kernel(name = "unsloth_depthwise_conv1d", input_names = ["x", "w"],
+                                output_names = ["y"], source = _DEPTHWISE_CONV_SOURCE)
+
+
+def _depthwise_conv(x, weight, dilation):
+    batch, rows, channels = x.shape
+    taps = weight.shape[1]
+    rows -= (taps - 1) * dilation
+    return _depthwise_conv_kernel()(
+        inputs = [x, weight], template = [("T", x.dtype), ("C", channels), ("K", taps), ("DIL", dilation)],
+        grid = (channels, rows, batch), threadgroup = (min(channels, 256), 1, 1),
+        output_shapes = [(batch, rows, channels)], output_dtypes = [x.dtype],
+    )[0]
+
+
+@functools.cache
+def _depthwise_conv_verified(dtype, channels, taps, dilation):
+    keys = mx.random.split(mx.random.key(channels), 3)
+    weight = mx.random.normal((channels, taps, 1), key = keys[0]).astype(dtype)
+    for rows, scale, key in ((1, 1, keys[1]), (67, 64, keys[2])):
+        x = (mx.random.normal((2, rows + (taps - 1) * dilation, channels), key = key) * scale).astype(dtype)
+        native, fused = mx.conv1d(x, weight, dilation = dilation, groups = channels), _depthwise_conv(x, weight, dilation)
+        if not _settled(mx.array_equal(fused.view(mx.uint8), native.view(mx.uint8)).item()):
+            logger.warning("the depthwise convolution kernel differs from mx.conv1d for %s, %d channels, %d taps "
+                           "and dilation %d; the native convolution stays in use", dtype, channels, taps, dilation)
+            return False
+    return True
+
+
+def _depthwise_conv_class(bindings):
+    if not _DEPTHWISE_CONV_CLASS:  # built on the first resolution, whose bindings it rechecks
+        native = nn.Conv1d.__call__
+
+        def __call__(self, x):
+            weight = self.weight
+            # The scope verified this weight's dtype and geometry before switching the layer.
+            if (self.training or not _bindings_intact(bindings) or x.ndim != 3 or x.dtype != weight.dtype
+                    or x.shape[2] != weight.shape[0] or x.shape[1] <= (weight.shape[1] - 1) * self.dilation
+                    or mx.default_device() != mx.gpu):
+                return native(self, x)
+            y = _depthwise_conv(x, weight, self.dilation)
+            if "bias" in self:
+                y = y + self.bias
+            return y
+
+        _DEPTHWISE_CONV_CLASS.append(type("_DepthwiseConv1d", (nn.Conv1d,), {"__call__": __call__}))
+    return _DEPTHWISE_CONV_CLASS[0]
+
+
+def _depthwise_conv_eligible(module):
+    weight = module.get("weight")
+    return (type(module) is nn.Conv1d and not module.training and isinstance(weight, mx.array)
+            and weight.ndim == 3 and weight.shape[2] == 1 and weight.dtype in _DEPTHWISE_CONV_DTYPES
+            and module.groups == weight.shape[0] and module.stride == 1 and module.padding == 0
+            and module.dilation > 1)
+
+
+@contextmanager
+def exact_dilated_depthwise_conv(model, *, _modules = None):
+    """Run dilated depthwise `nn.Conv1d` layers on a depthwise kernel, bit-identical to `mx.conv1d`.
+
+    Each dtype and geometry is compared bit for bit against `mx.conv1d` before a layer is switched,
+    and layers return to `nn.Conv1d` when the last scope holding them exits.
+    """
+    changed = []
+    try:
+        with _DEPTHWISE_CONV_LOCK:
+            if mx.metal.is_available() and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                bindings = None
+                for _, module in _fusion_modules(model, _modules):
+                    if not isinstance(module, nn.Module):
+                        continue
+                    if module.__dict__.get("_unsloth_depthwise_scopes"):
+                        module._unsloth_depthwise_scopes += 1
+                        changed.append(module)
+                        continue
+                    if not _depthwise_conv_eligible(module):
+                        continue
+                    if bindings is None:
+                        bindings = _resolved_bindings(_DEPTHWISE_CONV_CONTRACT) or ()
+                    try:
+                        if not bindings or not _depthwise_conv_verified(module.weight.dtype, *module.weight.shape[:2],
+                                                                        module.dilation):
+                            continue
+                    except RuntimeError as error:  # nothing was cached, so a later scope retries
+                        _unless_failed_buffer(error)
+                        continue
+                    module.__class__ = _depthwise_conv_class(bindings)
+                    module._unsloth_depthwise_scopes = 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _DEPTHWISE_CONV_LOCK:
+            for module in reversed(changed):
+                module._unsloth_depthwise_scopes -= 1
+                if not module._unsloth_depthwise_scopes:
+                    del module._unsloth_depthwise_scopes
+                    if _DEPTHWISE_CONV_CLASS and type(module) is _DEPTHWISE_CONV_CLASS[0]:
+                        module.__class__ = nn.Conv1d
+
+
 class InferenceScope(NamedTuple):
     """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
     `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
@@ -5251,6 +5451,8 @@ INFERENCE_SCOPES = [
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
     InferenceScope(exact_ple_row_reads),
+    InferenceScope(exact_qsa_trim),
+    InferenceScope(exact_dilated_depthwise_conv),
 ]
 
 
