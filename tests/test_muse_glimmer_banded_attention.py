@@ -225,9 +225,7 @@ def _sdpa_registry():
 
 
 def test_compiled_deferral_does_not_recompile(_clean_router):
-    """Unsloth compiles each decoder layer, so the router is traced. A counter dynamo guards on
-    recompiled every sliding call, and under DDP the recompute's recompile raised CheckpointError
-    (unsloth#14063)."""
+    """A traced counter recompiled every call; under DDP that raised CheckpointError (unsloth#14063)."""
     from torch._dynamo.testing import CompileCounter
 
     mg._ORIG_SDPA[0] = lambda module, q, k, v, mask, **kw: (q.transpose(1, 2) * 2, None)
