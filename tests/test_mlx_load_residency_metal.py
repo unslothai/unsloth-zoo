@@ -425,13 +425,13 @@ def test_experts_a_checkpoint_stores_apart(tmp_path, v41):
         np.testing.assert_array_equal(_bits(model.layers[0].switch_mlp(*call)), _bits(stock.layers[0].switch_mlp(*call)))
 
 
-def _qwen3_moe():
+def _qwen3_moe(mlp_only_layers = ()):
     qwen3_moe = pytest.importorskip("mlx_lm.models.qwen3_moe")
     mx.random.seed(0)
     model = qwen3_moe.Model(qwen3_moe.ModelArgs(
         model_type = "qwen3_moe", hidden_size = 256, num_hidden_layers = 3, intermediate_size = 256,
         num_attention_heads = 4, num_experts = 16, num_experts_per_tok = 4, decoder_sparse_step = 1,
-        mlp_only_layers = [], moe_intermediate_size = 64, rms_norm_eps = 1e-6, vocab_size = 512,
+        mlp_only_layers = list(mlp_only_layers), moe_intermediate_size = 64, rms_norm_eps = 1e-6, vocab_size = 512,
         num_key_value_heads = 2, head_dim = 64, rope_theta = 1e6, tie_word_embeddings = False,
         max_position_embeddings = 8192, norm_topk_prob = True,
     ))
@@ -515,11 +515,25 @@ def test_a_wide_prefill_step_runs_layer_by_layer_on_full_tables(tmp_path, monkey
     np.testing.assert_array_equal(_bits(got), _bits(want))
     monkeypatch.setattr(model.model.layers[-1], "__class__", type(stock.model.layers[-1]))
     monkeypatch.setattr(model.model.layers[-1], "mlp", stock.model.layers[-1].mlp)
-    assert zoo_offload.wide_prefill_step(model) is None  # a dense layer runs a call whole
-    monkeypatch.undo()
+    assert zoo_offload.wide_prefill_step(model) is None  # an unwidened layer runs a call whole
+
+
+def test_a_layer_without_a_table_steps_on_its_slots(tmp_path, monkeypatch):
+    cache_module = pytest.importorskip("mlx_lm.models.cache")
+    tokens = mx.random.randint(0, 512, (1, 2 * 2048 + 5), key = mx.random.key(4))
+    stock = _lazy_copy(lambda: _qwen3_moe([0]), str(tmp_path))
+    expected_cache = cache_module.make_prompt_cache(stock)
+    expected = [stock.model(tokens[:, i:i + 2048], cache = expected_cache) for i in range(0, tokens.shape[1], 2048)]
+    model = _qwen3_moe([0]).load_weights(list(tree_flatten(stock.parameters())))
+    offload_experts(model, str(tmp_path), 0.75)
+    dense, cast, _ = model.model.layers
+    assert isinstance(dense, zoo_offload._WideLayer) and dense._offload_switch is None
     assert zoo_offload.wide_prefill_step(model) == 2048
-    monkeypatch.setattr(switches[-1]._slots.fields[-1][2], "cast", mx.bfloat16)
-    assert zoo_offload.wide_prefill_step(model) is None
+    monkeypatch.setattr(cast.mlp.switch_mlp, "_table", lambda: None)
+    cache = cache_module.make_prompt_cache(model)
+    np.testing.assert_array_equal(_bits(model.model(tokens, cache = cache)), _bits(mx.concatenate(expected, axis = 1)))
+    for (_, got), (_, want) in zip(tree_flatten([c.state for c in cache]), tree_flatten([c.state for c in expected_cache]), strict = True):
+        np.testing.assert_array_equal(*(_bits(a) if isinstance(a, mx.array) else a for a in (got, want)))
 
 
 def test_deepseek_v4_blocks_prefill_layer_by_layer(tmp_path):

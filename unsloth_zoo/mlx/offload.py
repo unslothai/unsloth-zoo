@@ -918,7 +918,7 @@ def _token_slice(value, axis, start, end):
 
 
 class _WideLayer:
-    """Mixed into a decoder layer of ``_WIDE_LAYERS`` holding offloaded experts. A call wider than
+    """Mixed into a decoder layer of ``_WIDE_LAYERS`` in a stack holding offloaded experts. A call wider than
     ``_PREFILL_STEP`` tokens runs as consecutive steps of it on the layer's cache, which is what a
     chunked prefill computes for the layer, on a table of all its experts read once for the call while
     the next offloaded layer's table is read ahead. A prefill step of several chunks then reads each
@@ -934,9 +934,10 @@ class _WideLayer:
         cache, mask, masks = bound.arguments.get("cache"), bound.arguments.get("mask"), self._wide_masks
         step_mask = masks(self, bound.arguments) if callable(masks) and cache is not None else None
         causal = step_mask is not None if callable(masks) else (mask is None or isinstance(mask, str)) and mask in masks
-        switch = self._offload_switch
-        if cache is None or not causal or not switch._wide(read_next = True):
+        if cache is None or not causal:
             return self._whole(hidden, args, kwargs)
+        switch = self._offload_switch
+        table = switch is not None and switch._wide(read_next = True)
         given = {name: bound.arguments.get(name) for name in axes}
         capture = getattr(_prefill_capture, "request", None)
         outputs = []
@@ -953,7 +954,8 @@ class _WideLayer:
                 if capture is not None and min(start + _PREFILL_STEP, hidden.shape[1]) == capture[0]:
                     capture[2][id(cache)] = capture[1](cache)
         finally:
-            switch._narrow()
+            if table:
+                switch._narrow()
         return mx.concatenate(outputs, axis = axes[first])
 
     def _whole(self, hidden, args, kwargs):
@@ -973,17 +975,14 @@ _prefill_capture = threading.local()
 
 def wide_prefill_step(model):
     """The step every wide single-row prefill call of ``model`` runs in, exactly as a prefill chunked at
-    it, or ``None`` when some layer may run a call whole (dense layers, DeepSeek V4's image rows, cast fields)."""
+    it, or ``None`` when some layer may run a call whole (an unregistered layer, DeepSeek V4's image rows)."""
     modules = dict(model.named_modules())
     switches = [module for module in modules.values() if isinstance(module, OffloadSwitchGLU)]
     wide = {path for path, layer in modules.items() if isinstance(layer, _WideLayer)}
     stacks = {path.rpartition(".")[0] for path in wide}
     stacked = {path for path in modules if path.rpartition(".")[0] in stacks and path.rpartition(".")[2].isdigit()}
     held = {id(modules[path]._offload_switch) for path in wide if not callable(modules[path]._wide_masks)}
-    if not switches or stacked - wide or any(
-        id(switch) not in held or any(field.cast is not None for _, _, field in switch._slots.fields)
-        for switch in switches
-    ):
+    if not switches or stacked - wide or any(id(switch) not in held for switch in switches):
         return None
     return _PREFILL_STEP
 
@@ -1001,25 +1000,27 @@ def capture_prefill_rows(rows, copy):
 
 
 def _widen_layers(model, switches):
-    """Give each ``_WIDE_LAYERS`` layer holding one of ``switches`` (path -> ``OffloadSwitchGLU``) its
+    """Give each ``_WIDE_LAYERS`` layer of a stack holding ``switches`` (path -> ``OffloadSwitchGLU``) its
     wide calls, and chain each offloaded layer to the next one of its stack for read-ahead."""
-    stacks = {}
+    layers = []
     for path, layer in model.named_modules():
         base = type(layer)
         spec = _WIDE_LAYERS.get(f"{base.__module__}.{base.__qualname__}")
-        if spec is None:
-            continue
-        held = [switch for inner, switch in switches.items() if inner.startswith(path + ".")]
-        if len(held) != 1:
+        if spec is not None:
+            layers.append((path, layer, base, spec, [s for inner, s in switches.items() if inner.startswith(path + ".")]))
+    offloaded = {path.rpartition(".")[0] for path, *_, held in layers if held}
+    stacks = {}
+    for path, layer, base, spec, held in layers:
+        if len(held) > 1 or not held and path.rpartition(".")[0] not in offloaded:
             continue
         if base not in _WIDE_CLASSES:
             _WIDE_CLASSES[base] = type(base.__name__, (_WideLayer, base), {
                 "_wide_axes": spec[0], "_wide_masks": staticmethod(spec[1]) if callable(spec[1]) else spec[1], "_wide_signature": inspect.signature(base.__call__),
             })
         layer.__class__ = _WIDE_CLASSES[base]
-        object.__setattr__(layer, "_offload_switch", held[0])
+        object.__setattr__(layer, "_offload_switch", held[0] if held else None)
         parent, _, index = path.rpartition(".")
-        if index.isdigit():
+        if held and index.isdigit():
             stacks.setdefault(parent, []).append((int(index), held[0]))
     for stack in stacks.values():
         stack.sort(key = lambda item: item[0])
