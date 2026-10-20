@@ -64,6 +64,10 @@ def _fake_xpu(flags = (True,), mem_get_info = None, is_bf16 = True, props_raise 
     return xpu
 
 
+
+# XPU and CUDA never run on macOS, where zoo imports down the MLX path; spoofing them there tests nothing.
+not_on_macos = pytest.mark.skipif(sys.platform == "darwin", reason = "XPU / CUDA paths do not run on macOS")
+
 @pytest.fixture
 def on_xpu(monkeypatch):
     fake_cuda = types.SimpleNamespace(is_available = lambda: False)
@@ -77,6 +81,7 @@ def on_xpu(monkeypatch):
 
 # ---- device_is_bf16_supported on XPU ----
 
+@not_on_macos
 @pytest.mark.parametrize(
     "flags, expected",
     [
@@ -94,16 +99,19 @@ def test_xpu_bf16_uses_native_conversions_on_every_device(on_xpu, flags, expecte
     assert dt.device_is_bf16_supported() is expected
 
 
+@not_on_macos
 def test_xpu_bf16_unreadable_properties_keep_todays_answer(on_xpu):
     on_xpu(_fake_xpu((False,), props_raise = True))
     assert dt.device_is_bf16_supported() is True
 
 
+@not_on_macos
 def test_xpu_bf16_partial_build_still_false(on_xpu):
     on_xpu(_fake_xpu((True,), is_bf16 = None))
     assert dt.device_is_bf16_supported() is False
 
 
+@not_on_macos
 def test_cuda_bf16_still_asks_torch_cuda(monkeypatch):
     for answer in (True, False):
         fake_cuda = types.SimpleNamespace(is_available = lambda: True, is_bf16_supported = lambda a = answer: a)
@@ -114,6 +122,7 @@ def test_cuda_bf16_still_asks_torch_cuda(monkeypatch):
 
 # ---- gradient checkpointing offload dtype on XPU ----
 
+@not_on_macos
 def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
     from unsloth_zoo import gradient_checkpointing as gc
     tree = ast.parse(inspect.getsource(gc.initialize_unsloth_gradient_checkpointing).lstrip())
@@ -162,6 +171,7 @@ def vu():
     return vllm_utils
 
 
+@not_on_macos
 def test_get_mem_info_xpu_falls_back_when_mem_get_info_raises(monkeypatch, vu):
     def boom(*a, **k):
         raise RuntimeError("The device (Intel(R) Arc(TM) B580 Graphics) doesn't support querying the available free memory")
@@ -170,18 +180,21 @@ def test_get_mem_info_xpu_falls_back_when_mem_get_info_raises(monkeypatch, vu):
     assert vu.get_mem_info() == (13 * _GB, 16 * _GB)
 
 
+@not_on_macos
 def test_get_mem_info_xpu_uses_mem_get_info_when_it_works(monkeypatch, vu):
     monkeypatch.setattr(vu, "DEVICE_TYPE", "xpu")
     monkeypatch.setattr(torch, "xpu", _fake_xpu(mem_get_info = lambda: (5, 7)), raising = False)
     assert vu.get_mem_info() == (5, 7)
 
 
+@not_on_macos
 def test_get_mem_info_cuda_unchanged(monkeypatch, vu):
     monkeypatch.setattr(vu, "DEVICE_TYPE", "cuda")
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a: (11, 22))
     assert vu.get_mem_info() == (11, 22)
 
 
+@not_on_macos
 def test_vllm_xpu_dtype_asks_native_bf16_and_old_gpu_message_is_actionable(vu):
     source = inspect.getsource(vu.load_vllm)
     assert "_xpu_bf16_supported()" in source
