@@ -918,7 +918,6 @@ def test_qsa_route_skips_an_indexer_in_training(monkeypatch):
 
 
 def test_qsa_route_skips_a_zero_block_budget(monkeypatch):
-    # An indexer budget under one block gives block_topk 0; the kernel would write past a (B, L, 0) output.
     attention, calls = _qsa_layer(), []
     attention.indexer.block_topk = 0
     expected = _qsa_run(attention)
