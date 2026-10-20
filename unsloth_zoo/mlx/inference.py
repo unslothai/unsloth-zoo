@@ -17,7 +17,8 @@
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
 small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
-Qwen exact speculative verify blocks, Gemma 4 verify-block attention, and Qwen sparse attention block selection."""
+Qwen exact speculative verify blocks, Gemma 4 verify-block attention, Qwen sparse attention block selection,
+and SSD-backed PLE row reads."""
 
 import ast
 import functools
@@ -41,6 +42,7 @@ from typing import Callable, NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from . import attention, nax, qmm
 
@@ -5005,6 +5007,212 @@ def fast_qsa_prefill(model, *, _modules = None):
 
     return _qsa_routes(model, _modules, enter)
 
+# mlx-vlm gathers SSD-backed Qwen4-Exp PLE rows by fancy-indexing memory maps: a row on a page that is not in
+# core is a serial page fault taken with the GIL held, and even a cached page costs a fault to map. Cold rows are
+# read with concurrent preads instead, which release the GIL, and handed to the unchanged gather in place of the
+# memory map reads it would make.
+_PLE_STORAGE = "mlx_vlm.models.qwen4_exp.ple_storage"
+_PLE_READ_CONTRACT = {_PLE_STORAGE: {"QuantizedMMapNGramEmbedding._read_rows": "4a31310895b56550"}}
+_PLE_READ_LOCK = RLock()
+_PLE_READ_CLASSES = {}
+_PLE_PENDING = local()  # this thread's reads for the gather it is running
+_PLE_READ_WORKERS = 32
+# A pread costs a few microseconds of Python per row, more than a gather from mapped resident pages, so a gather
+# whose sampled new rows are all in core keeps the memory map read; one cold page in a hundred already costs more.
+_PLE_RESIDENT_SAMPLE = 256
+_PLE_RESIDENT = 0.99
+
+
+@functools.cache
+def _ple_read_pool():
+    from concurrent.futures import ThreadPoolExecutor
+    return ThreadPoolExecutor(_PLE_READ_WORKERS, thread_name_prefix = "unsloth-ple-read")
+
+
+@functools.cache
+def _mincore():
+    import ctypes
+    import ctypes.util
+    try:
+        function = ctypes.CDLL(ctypes.util.find_library("c"), use_errno = True).mincore
+    except (OSError, AttributeError, TypeError):
+        return None
+    function.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+    function.restype = ctypes.c_int
+    return function
+
+
+def _ple_resident(reads):
+    """Fraction of a fixed-stride sample of these (memmap, rows) reads' pages in core; 0 when it cannot tell."""
+    import ctypes
+    mincore, page = _mincore(), os.sysconf("SC_PAGESIZE")
+    step = max(1, sum(len(rows) for _, rows in reads) // _PLE_RESIDENT_SAMPLE)
+    taken, probed, resident = 0, 0, 0
+    vector = ctypes.create_string_buffer(2)
+    for memmap, rows in reads:
+        stride = memmap.strides[0]
+        for row in rows[(-taken) % step::step].tolist():
+            address = memmap.ctypes.data + row * stride
+            start = address - address % page
+            pages = -(-(address + stride - start) // page)
+            if pages > len(vector) or mincore(start, pages * page, vector) != 0:
+                return 0.0
+            probed += pages
+            resident += sum(byte & 1 for byte in vector.raw[:pages])
+        taken += len(rows)
+    return resident / probed if probed else 1.0
+
+
+class _PreadMap:
+    """A row-major memory map; a gather of the rows this thread already read returns those reads."""
+
+    def __init__(self, memmap):
+        self.memmap = memmap
+
+    def __getitem__(self, index):
+        read = (getattr(_PLE_PENDING, "reads", None) or {}).get(id(self))
+        if read is not None and np.array_equal(index, read[0]):
+            return read[1]
+        return self.memmap[index]
+
+    def __getattr__(self, name):
+        return getattr(self.memmap, name)
+
+
+def _ple_read(chunk):
+    for descriptor, offset, view in chunk:
+        while view:  # a regular file reads short only at its end, which the manifest's ranges never pass
+            count = os.preadv(descriptor, [view], offset)
+            if count <= 0:
+                raise OSError("short PLE read")
+            view, offset = view[count:], offset + count
+
+
+def _ple_pread_rows(table, row_ids):
+    """{id(map): (rows, values)} for each map of a gather whose new rows are cold, those rows read concurrently."""
+    ids = np.asarray(row_ids, dtype = np.int64)
+    cache = table._cache
+    missing = ids if not cache else ids[np.fromiter((row not in cache for row in ids.tolist()), bool, len(ids))]
+    # Rows this table already read are taken as resident, so a gather of only those skips the residency probe.
+    seen = table.__dict__.get("_unsloth_ple_seen")
+    if seen is None:
+        seen = table._unsloth_ple_seen = np.zeros(-(-table.row_count // 8), np.uint8)
+    byte, bit = missing >> 3, np.left_shift(1, missing & 7).astype(np.uint8)
+    new = (seen[byte] & bit) == 0
+    if not new.any():
+        return None
+    np.bitwise_or.at(seen, byte[new], bit[new])
+    if table._interleaved is not None:
+        parts = [([table._interleaved], missing, new)]
+    else:
+        # The gather slices each shard's rows in the order it meets them, and a read must match that slice.
+        shard = np.searchsorted(np.array([end for _, end, _ in table._shards]), missing, side = "right")
+        parts = []
+        for index in np.unique(shard[new]).tolist():
+            start, _, arrays = table._shards[index]
+            part = np.flatnonzero(shard == index)
+            parts.append((list(arrays.values()), missing[part] - start, new[part]))
+    # A row's scales and biases are read with its weights, so the first map's pages stand for all of them.
+    if _ple_resident([(maps[0].memmap, rows[fresh]) for maps, rows, fresh in parts]) >= _PLE_RESIDENT:
+        return None
+    files, work, pending = {}, [], {}
+    try:
+        for maps, rows, fresh in parts:
+            for wrapped in maps:
+                memmap = wrapped.memmap
+                if memmap.filename not in files:
+                    files[memmap.filename] = os.open(memmap.filename, os.O_RDONLY)
+                values = np.empty((len(rows), *memmap.shape[1:]), memmap.dtype)
+                if not fresh.all():
+                    values[~fresh] = memmap[rows[~fresh]]
+                pending[id(wrapped)] = rows, values
+                views, stride = memoryview(values.reshape(-1).view(np.uint8)), memmap.strides[0]
+                work += [(files[memmap.filename], memmap.offset + row * stride, views[i * stride:(i + 1) * stride])
+                         for i, row in zip(np.flatnonzero(fresh).tolist(), rows[fresh].tolist())]
+        step = -(-len(work) // _PLE_READ_WORKERS)
+        list(_ple_read_pool().map(_ple_read, [work[i:i + step] for i in range(0, len(work), step)]))
+    finally:
+        for descriptor in files.values():
+            os.close(descriptor)
+    return pending
+
+
+def _ple_read_class(base, bindings):
+    if base not in _PLE_READ_CLASSES:  # built on the first resolution, whose bindings it rechecks
+
+        def _read_rows(self, row_ids):
+            pending = None
+            if _bindings_intact(bindings):
+                try:
+                    pending = _ple_pread_rows(self, row_ids)
+                except OSError:
+                    pass  # the gather reads the memory maps itself
+            _PLE_PENDING.reads = pending
+            try:
+                return base._read_rows(self, row_ids)
+            finally:
+                _PLE_PENDING.reads = None
+
+        _PLE_READ_CLASSES[base] = type(f"_Pread{base.__name__}", (base,), {"_read_rows": _read_rows})
+    return _PLE_READ_CLASSES[base]
+
+
+def _ple_wrap_maps(table):
+    table._shards = [(start, end, {name: _PreadMap(memmap) for name, memmap in arrays.items()})
+                     for start, end, arrays in table._shards]
+    if table._interleaved is not None:
+        table._interleaved = _PreadMap(table._interleaved)
+
+
+def _ple_unwrap_maps(table):
+    table._shards = [(start, end, {name: getattr(wrapped, "memmap", wrapped) for name, wrapped in arrays.items()})
+                     for start, end, arrays in table._shards]
+    table._interleaved = getattr(table._interleaved, "memmap", table._interleaved)
+
+
+@contextmanager
+def exact_ple_row_reads(model, *, _modules = None):
+    """Read cold SSD-backed Qwen4-Exp PLE rows with concurrent preads, byte for byte the memory map's rows.
+
+    mlx-vlm's own gather still assembles every row. Tables return to their own class and memory maps when the
+    last scope holding them exits.
+    """
+    changed = []
+    try:
+        with _PLE_READ_LOCK:
+            base = getattr(sys.modules.get(_PLE_STORAGE), "QuantizedMMapNGramEmbedding", None)
+            if base is not None and hasattr(os, "preadv") and _mincore() is not None:
+                bindings = None
+                for _, module in _fusion_modules(model, _modules):
+                    table = getattr(module, "ngram_embedding", None)
+                    if not isinstance(table, base):
+                        continue
+                    if table.__dict__.get("_unsloth_ple_scopes"):
+                        table._unsloth_ple_scopes += 1
+                        changed.append(table)
+                        continue
+                    if type(table) is not base:
+                        continue
+                    if bindings is None:
+                        bindings = _resolved_bindings(_PLE_READ_CONTRACT) or ()
+                    if not bindings:
+                        break
+                    _ple_wrap_maps(table)
+                    table.__class__ = _ple_read_class(base, bindings)
+                    table._unsloth_ple_scopes = 1
+                    changed.append(table)
+        yield model
+    finally:
+        with _PLE_READ_LOCK:
+            for table in reversed(changed):
+                table._unsloth_ple_scopes -= 1
+                if not table._unsloth_ple_scopes:
+                    del table._unsloth_ple_scopes
+                    _ple_unwrap_maps(table)
+                    if type(table) in _PLE_READ_CLASSES.values():
+                        table.__class__ = type(table).__base__
+
+
 class InferenceScope(NamedTuple):
     """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
     `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
@@ -5042,6 +5250,7 @@ INFERENCE_SCOPES = [
     InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
+    InferenceScope(exact_ple_row_reads),
 ]
 
 

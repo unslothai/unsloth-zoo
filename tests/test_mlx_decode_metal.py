@@ -3,7 +3,9 @@ import ast
 import functools
 import importlib
 import inspect
+import json
 import math
+import os
 import textwrap
 from types import FunctionType, SimpleNamespace
 
@@ -1022,3 +1024,110 @@ def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
     native = qwen4.dispatch_qsa_attention
     with decode.inference_scopes(attention):
         assert qwen4.dispatch_qsa_attention is native
+def _ple_table(path, cache_rows = 0, layout = "ranges"):
+    storage = pytest.importorskip("mlx_vlm.models.qwen4_exp.ple_storage")
+    prefix, weights = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards", {}
+    rng = np.random.default_rng(0)
+    with mx.stream(mx.cpu):
+        for shard, rows in enumerate((300, 500)):
+            weights[f"{prefix}.{shard}.weight"] = mx.array(rng.integers(0, 1 << 32, (rows, 8), dtype = np.uint32))
+            for name in ("scales", "biases"):
+                weights[f"{prefix}.{shard}.{name}"] = mx.array(rng.standard_normal((rows, 2), np.float32)).astype(mx.bfloat16)
+        mx.save_safetensors(str(path / "model.safetensors"), weights)
+    (path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": dict.fromkeys(weights, "model.safetensors")}))
+    (path / "config.json").write_text(json.dumps({"quantization": {"bits": 4, "group_size": 32, "mode": "affine"}}))
+    if layout == "ranges":
+        storage.build_quantized_ple_manifest(path, path / "ple.json")
+    else:
+        storage.materialize_interleaved_ple_store(path, path / "ple.json")
+    table = storage.QuantizedMMapNGramEmbedding(path / "ple.json", cache_rows = cache_rows)
+    return table, SimpleNamespace(named_modules = lambda: [("ple", SimpleNamespace(ngram_embedding = table))])
+
+
+def _row_bytes(table, rows):
+    if table._interleaved is not None:
+        return sorted(table._interleaved[row].tobytes() for row in rows)
+    return sorted(arrays[name][row - start].tobytes() for row in rows for start, end, arrays in table._shards
+                  if start <= row < end for name in ("weight", "scales", "biases"))
+
+
+def _recorded_reads(monkeypatch):
+    read, native = [], os.preadv
+
+    def preadv(descriptor, buffers, offset):
+        read.append(bytes(buffers[0][:(count := native(descriptor, buffers, offset))]))
+        return count
+
+    monkeypatch.setattr(os, "preadv", preadv)
+    return read
+
+
+def _same_rows(got, expected):
+    for a, b in zip(got, expected):
+        assert a.dtype == b.dtype and np.array_equal(a, b)
+
+
+@pytest.mark.parametrize("layout", ["ranges", "interleaved"])
+def test_ple_reads_warm_exactly_the_cold_uncached_rows_and_return_stock_bytes(layout, tmp_path, monkeypatch):
+    table, model = _ple_table(tmp_path, cache_rows = 4, layout = layout)
+    rows = np.array([2, 299, 300, 301, 799])
+    table._read_rows(np.array([299, 301]))  # now in the row cache, so not read again
+    expected = type(table)(tmp_path / "ple.json")._read_rows(rows)
+    read, gathered, native = _recorded_reads(monkeypatch), [], np.memmap.__getitem__
+    monkeypatch.setattr(decode, "_ple_resident", lambda parts: 0.0)
+    with decode.exact_ple_row_reads(model):
+        assert type(table).__name__ != "QuantizedMMapNGramEmbedding"
+        # The cold rows come from the reads, not a fault-taking gather over the memory map.
+        monkeypatch.setattr(np.memmap, "__getitem__", lambda self, index: gathered.append(index) or native(self, index))
+        got = table._read_rows(rows)
+        monkeypatch.setattr(np.memmap, "__getitem__", native)
+    assert gathered == [] and sorted(read) == _row_bytes(table, (2, 300, 799))
+    _same_rows(got, expected)
+
+
+def test_ple_reads_probe_and_read_only_rows_the_table_has_not_read(tmp_path, monkeypatch):
+    table, model = _ple_table(tmp_path)
+    expected = type(table)(tmp_path / "ple.json")._read_rows(np.array([2, 3, 300, 799]))
+    read, probed = _recorded_reads(monkeypatch), []
+    monkeypatch.setattr(decode, "_ple_resident", lambda parts: probed.append([rows.tolist() for _, rows in parts]) or 0.0)
+    with decode.exact_ple_row_reads(model):
+        table._read_rows(np.array([2, 300]))
+        del probed[:], read[:]
+        table._read_rows(np.array([300, 2]))
+        assert probed == [] and read == []
+        got = table._read_rows(np.array([2, 3, 300, 799]))
+    assert probed == [[[3], [499]]] and sorted(read) == _row_bytes(table, (3, 799))
+    _same_rows(got, expected)
+
+
+@pytest.mark.parametrize("layout", ["ranges", "interleaved"])
+def test_ple_reads_keep_concurrent_gathers_of_one_table_apart(layout, tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    table, model = _ple_table(tmp_path, layout = layout)
+    reference = type(table)(tmp_path / "ple.json")
+    monkeypatch.setattr(decode, "_ple_resident", lambda parts: 0.0)
+    barrier, prepare = threading.Barrier(2), decode._ple_pread_rows
+    # Both gathers run while the other's reads are pending.
+    monkeypatch.setattr(decode, "_ple_pread_rows", lambda *args: (prepare(*args), barrier.wait(5))[0])
+    picks = [np.array([1, 302, 650]), np.array([5, 299, 777])]
+    with decode.exact_ple_row_reads(model), ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(table._read_rows, picks))
+    for rows, got in zip(picks, results):
+        _same_rows(got, reference._read_rows(rows))
+
+
+def test_ple_reads_skip_resident_tables_drifted_bodies_and_restore(tmp_path, monkeypatch):
+    table, model = _ple_table(tmp_path)
+    read, stock = _recorded_reads(monkeypatch), type(table)
+    with decode.exact_ple_row_reads(model):
+        with decode.exact_ple_row_reads(model):
+            pass
+        assert type(table) is not stock
+        table._read_rows(np.arange(0, 800, 7))  # just written, so every page is in core
+    assert type(table) is stock and read == [] and all(
+        type(memmap) is np.memmap for _, _, arrays in table._shards for memmap in arrays.values())
+    contract = {name: dict.fromkeys(names, "0" * 16) for name, names in decode._PLE_READ_CONTRACT.items()}
+    monkeypatch.setattr(decode, "_PLE_READ_CONTRACT", contract)
+    with decode.exact_ple_row_reads(model):
+        assert type(table) is stock
