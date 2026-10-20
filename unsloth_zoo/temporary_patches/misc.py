@@ -719,6 +719,30 @@ def _flash_sdpa_accepts(device, dtype, num_heads, num_kv_heads, head_dim, dropou
     return accepts
 
 
+_EFFICIENT_SDPA_ACCEPTS_CACHE = {}
+
+
+def _efficient_sdpa_accepts_mha(device, dtype, num_heads, head_dim, dropout, requires_grad):
+    # Equal head counts need no enable_gqa, so the mem-efficient kernel also runs a maskless causal
+    # call. transformers < 5 still passes enable_gqa = True there, so both forms must be accepted.
+    key = (str(device), dtype, num_heads, head_dim, dropout, requires_grad)
+    accepts = _EFFICIENT_SDPA_ACCEPTS_CACHE.get(key, None)
+    if accepts is not None:
+        return accepts
+    try:
+        with torch.cuda.device(device):
+            query = torch.empty((1, num_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
+            accepts = torch.backends.cuda.can_use_efficient_attention(
+                torch.backends.cuda.SDPAParams(query, query, query, None, dropout, True, False), False
+            ) is True and torch.backends.cuda.can_use_efficient_attention(
+                torch.backends.cuda.SDPAParams(query, query, query, None, dropout, True, True), False
+            ) is True
+    except Exception:
+        accepts = False  # torch < 2.5: no enable_gqa argument, keep the mask
+    _EFFICIENT_SDPA_ACCEPTS_CACHE[key] = accepts
+    return accepts
+
+
 def _flash_sdpa_takes_causal(config, embeds):
     """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; anything
     else falls to the math kernel and its [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
@@ -758,7 +782,9 @@ def _flash_sdpa_takes_causal(config, embeds):
         if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
             return False
         if not _flash_sdpa_accepts(embeds.device, embeds.dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
-            return False
+            if num_heads != num_kv_heads or not torch.backends.cuda.mem_efficient_sdp_enabled() or \
+                not _efficient_sdpa_accepts_mha(embeds.device, embeds.dtype, num_heads, head_dim, dropout, requires_grad):
+                return False
     return True
 
 
@@ -1784,6 +1810,13 @@ def patch_mamba_fused_split_without_causal_conv1d():
     reference (None) so modeling code takes the split path (torch conv1d + mamba_ssm chunk scan)."""
     if not _mamba_fused_split_needs_causal_conv1d_unusable():
         return
+    # Keep the fused path when its conv can run on Triton instead of causal_conv1d's C++ kernels.
+    try:
+        from .gdn_causal_conv1d import install_mamba_ssm_triton_conv
+        if install_mamba_ssm_triton_conv():
+            return
+    except Exception:
+        pass
     try:
         import transformers.integrations as _integrations
         from transformers.integrations import hub_kernels as _hk

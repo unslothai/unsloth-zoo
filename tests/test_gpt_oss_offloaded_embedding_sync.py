@@ -110,13 +110,15 @@ def test_offloaded_embedding_op_under_cuda_graphs(ids_in_graph):
         pytest.skip("torch.library.custom_op unavailable")
     import torch._inductor.config as inductor_config
     torch.manual_seed(0)
+    # Inductor skips bf16 graphs on GPUs without native bf16 (T4), where models run in fp16 anyway.
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation = False) else torch.float16
     V, H = 50021, 64
-    weight = torch.randn(V, H, dtype = torch.bfloat16)
-    proj = torch.randn(H, V, device = "cuda", dtype = torch.bfloat16)
+    weight = torch.randn(V, H, dtype = dtype)
+    proj = torch.randn(H, V, device = "cuda", dtype = dtype)
 
     def lookup(ids):
         emb = _offloaded_embedding(ids, weight)
-        return (emb[:, 0].float() @ proj.float()).to(torch.bfloat16)
+        return (emb[:, 0].float() @ proj.float()).to(dtype)
 
     def step(logits):
         # Next ids come from a GPU op, as in generate, then go through the CPU table.
@@ -128,7 +130,7 @@ def test_offloaded_embedding_op_under_cuda_graphs(ids_in_graph):
         compiled, prep, config = lookup, (lambda x: x.argmax(-1, keepdim = True)), \
             dict(memory_planning = True, memory_pool = "none")
     compiled = torch.compile(compiled, fullgraph = True, mode = "reduce-overhead")
-    logits = torch.randn(4, V, device = "cuda", dtype = torch.bfloat16)
+    logits = torch.randn(4, V, device = "cuda", dtype = dtype)
     ref = logits.clone()
     with torch.no_grad(), inductor_config.patch(config):
         for _ in range(12):

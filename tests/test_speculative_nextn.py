@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import copy
 import dataclasses
 import json
 import math
@@ -172,6 +173,46 @@ def test_load_build_export_round_trip(tmp_path):
     assert set(loaded.mtp_state_dict()) == set(state_dict)
     assert all(torch.equal(loaded.mtp_state_dict()[k], v) for k, v in state_dict.items())
     assert mtp_family_name(config) == "glm4_moe"
+
+
+def test_nemotron_mtp_output_norm_matches_rms_after_reload(tmp_path):
+    native = pytest.importorskip("transformers.models.nemotron_h.modeling_nemotron_h")
+    config = native.NemotronHConfig(
+        vocab_size = VOCAB, hidden_size = HIDDEN, intermediate_size = 128,
+        num_hidden_layers = 2, hybrid_override_pattern = "*E",
+        num_attention_heads = 4, num_key_value_heads = 2, head_dim = 16,
+        n_routed_experts = 4, num_experts_per_tok = 2, n_shared_experts = 1,
+        moe_intermediate_size = 32, moe_shared_expert_intermediate_size = 64, moe_latent_size = 32,
+        num_nextn_predict_layers = 1, mtp_hybrid_override_pattern = "*E",
+        attn_implementation = "eager",
+    )
+    head = _randomise(build_nextn_head(config))
+    reference = copy.deepcopy(head)
+    # NVIDIA/vLLM's final_layernorm is RMSNorm, with the same serialized weight.
+    norm = native.NemotronHRMSNorm(HIDDEN, eps = config.layer_norm_epsilon)
+    norm.load_state_dict(head.heads[0].shared_head_norm.state_dict(), strict = True)
+    reference.heads[0].shared_head_norm = norm
+    ckpt = _write_target_checkpoint(tmp_path / "nemotron", config, head)
+    state, _ = load_mtp_state_dict(str(ckpt))
+    loaded = build_mtp_head(config, state_dict = state, dtype = torch.float32, strict = True).eval()
+
+    torch.manual_seed(31)
+    embed = torch.nn.Embedding(VOCAB, HIDDEN)
+    ids, hidden = torch.randint(VOCAB, (2, 9)), torch.randn(2, 9, HIDDEN)
+    lm_head = torch.randn(VOCAB, HIDDEN) / math.sqrt(HIDDEN)
+
+    def run(model):
+        steps = model.forward_train(hidden, ids, embed, num_steps = 3)
+        logits = [torch.nn.functional.linear(step["hidden"][step["valid"]], lm_head) for step in steps]
+        grad, = torch.autograd.grad(sum(x.square().mean() for x in logits), model.heads[0].eh_proj.weight)
+        return logits, grad
+
+    expected, expected_grad = run(reference)
+    for candidate in (head, loaded):
+        actual, actual_grad = run(candidate)
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want)
+        torch.testing.assert_close(actual_grad, expected_grad)
 
 
 def test_head_serialized_copies(tmp_path):

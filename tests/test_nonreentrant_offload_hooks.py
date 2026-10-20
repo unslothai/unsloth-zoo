@@ -167,6 +167,115 @@ def test_stream_prefetch_skips_inputs_already_unpacked(gc_module, monkeypatch, k
     assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+@pytest.mark.parametrize("keep_last", ["0", "1"])
+def test_stream_prefetch_reloads_every_input_of_the_previous_checkpoint(gc_module, monkeypatch, keep_last):
+    # Each unpack queues the newest input still on the host, so both inputs of checkpoint i-1
+    # are reloaded while checkpoint i recomputes; only the last checkpoint's inputs load cold.
+    monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", keep_last)
+    torch.manual_seed(0)
+    layers = [_TwoInputLayer().cuda() for _ in range(5)]
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = True)
+    h = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    g = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    for layer in layers:
+        with offloader.hooks():
+            h, g = ckpt.checkpoint(layer, h, g, use_reentrant = False)
+    (h.float().square().mean() + g.float().mean()).backward()
+    torch.cuda.synchronize()
+    assert offloader.stats["prefetched"] == 2 * (len(layers) - 1)
+    assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"]
+
+
+class _ThreeInputLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Linear(256, 256)
+
+    def forward(self, h, g, k):
+        return torch.tanh(self.a(h) + g + k)
+
+
+def _max_prefetched_waiting(offloader, monkeypatch):
+    # Largest number of reloads sitting on the device ahead of their unpack at any point.
+    peak = [0]
+    original = offloader._prefetch
+
+    def counting(index):
+        original(index)
+        live = (ref() for ref in offloader.order)
+        peak[0] = max(peak[0], sum(1 for r in live if r is not None and r.ready is not None))
+
+    monkeypatch.setattr(offloader, "_prefetch", counting)
+    return peak
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_stream_prefetch_never_reaches_past_the_previous_checkpoint(gc_module, monkeypatch):
+    # A three input checkpoint after single input ones: its three unpacks may only reload the
+    # one input of the checkpoint before it, not walk on into older checkpoints.
+    monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", "0")
+    torch.manual_seed(0)
+    singles = [torch.nn.Linear(256, 256).cuda() for _ in range(3)]
+    last = _ThreeInputLayer().cuda()
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = True)
+    peak = _max_prefetched_waiting(offloader, monkeypatch)
+    h = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    g = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    for layer in singles:
+        with offloader.hooks():
+            h = ckpt.checkpoint(layer, h, use_reentrant = False)
+    with offloader.hooks():
+        out = ckpt.checkpoint(last, h, g, h * 2, use_reentrant = False)
+    out.float().square().mean().backward()
+    torch.cuda.synchronize()
+    assert peak[0] == 1
+    assert offloader.stats["prefetch_hits"] == offloader.stats["prefetched"] == len(singles) - 1 + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_stream_prefetch_is_one_step_when_hooks_span_every_checkpoint(gc_module, monkeypatch):
+    # One hooks() entry around all checkpoints gives no checkpoint boundaries: keep to index - 1,
+    # so at most the next reload is queued while one still waits, however deep the stack is.
+    monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", "0")
+    torch.manual_seed(0)
+    layers = [_TwoInputLayer().cuda() for _ in range(8)]
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = True)
+    peak = _max_prefetched_waiting(offloader, monkeypatch)
+    h = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    g = torch.randn(4, 64, 256, device = "cuda", requires_grad = True)
+    with offloader.hooks():
+        for layer in layers:
+            h, g = ckpt.checkpoint(layer, h, g, use_reentrant = False)
+    (h.float().square().mean() + g.float().mean()).backward()
+    torch.cuda.synchronize()
+    assert peak[0] <= 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_low_ram_growth_fallback_frees_the_old_pinned_block(gc_module, monkeypatch):
+    # One local rank, host RAM short: the grown slot goes pageable and its old pinned block must
+    # be returned to the OS, not left cached in torch's host allocator beside the pageable copy.
+    monkeypatch.setattr(gc_module, "PINNED_MEMORY_AVAILABLE", True, raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
+    monkeypatch.setattr(gc_module, "GC_PINNED_CAP", gc_module._PIN_PER_BLOCK, raising = False)
+    torch.cuda.init()
+    torch._C._host_emptyCache()
+    fits = {"ok": True}
+    monkeypatch.setattr(gc_module, "_block_fits_host_ram", lambda block: fits["ok"])
+    held = lambda: int(torch.cuda.host_memory_stats()["allocated_bytes.current"])
+    before = held()
+    slot = gc_module._new_host_buffer(1 << 20, torch.uint8)       # 1 MiB pinned block
+    assert slot.is_pinned() and held() - before == 1 << 20
+    slot.copy_(torch.ones(1 << 20, dtype = torch.uint8))
+    fits["ok"] = False
+    grown = gc_module._grow_host_buffer(slot, 4 << 20)
+    del slot                                                      # the caller replaces the slot
+    assert not grown.is_pinned() and grown.numel() == 4 << 20
+    assert held() - before == 0
+    assert gc_module.GC_PINNED_BYTES == 0 and not any(gc_module._PINNED_CACHED.values())
+
+
 def _forward_peak_active(hooks, n_layers = 12):
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
@@ -210,3 +319,73 @@ def test_distributed_default_bounds_inflight_copies(gc_module, monkeypatch):
     assert gc_module.NonReentrantActivationOffloader().max_inflight == 1
     monkeypatch.setenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", "3")
     assert gc_module.NonReentrantActivationOffloader().max_inflight == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_capped_pinning_survives_blocks_freed_after_async_copies(gc_module, monkeypatch):
+    # unpack's non_blocking H2D leaves each freed host block in torch's event queue, and
+    # host_memory_stats() does not drain it, so the cached blocks read as not free. Once the
+    # cap was reached, every later layer used to go pageable for the rest of training.
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    torch.cuda.synchronize()
+    torch._C._host_emptyCache()
+    base = gc_module._host_allocator_held_bytes()  # live pinned memory of earlier tests
+    block = 1 << 20
+    monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(3 * block / (1 << 30)))
+    monkeypatch.setattr(gc_module, "_WARNED_ABOUT_PINNED_CAP", True, raising = False)
+    monkeypatch.setattr(gc_module, "_HOST_HELD_BASELINE", None, raising = False)
+    layers = [torch.nn.Linear(1024, 1024).cuda() for _ in range(6)]
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    pinned = []
+    for _ in range(4):
+        before = offloader.stats["pinned"]
+        h = torch.randn(256, 1024, device = "cuda", requires_grad = True)  # 1 MiB per layer input
+        for layer in layers:
+            with offloader.hooks():
+                h = ckpt.checkpoint(layer, h, use_reentrant = False)
+        h.sum().backward()
+        torch.cuda.synchronize()
+        pinned.append(offloader.stats["pinned"] - before)
+    # 3 blocks fit the cap: every step reuses them, none pins past it.
+    assert pinned == [3, 3, 3, 3]
+    assert gc_module._host_allocator_held_bytes() - base <= 3 * block
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_a_probe_that_pins_a_new_block_releases_it(gc_module):
+    # Another pinned user holds the cached block, so the probe pins a fresh one: it must not stay
+    # cached past the cap.
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    torch.cuda.synchronize()
+    torch._C._host_emptyCache()
+    block = 1 << 20
+    other = torch.empty(block, dtype = torch.uint8, pin_memory = True)  # holds the only cached block
+    held = gc_module._host_allocator_held_bytes()
+    assert gc_module._host_cache_reuses_block(block) is False
+    assert gc_module._host_allocator_held_bytes() <= held
+    del other
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+def test_a_probe_failure_other_than_oom_is_raised(gc_module, monkeypatch):
+    if not hasattr(torch.cuda, "host_memory_stats"):
+        pytest.skip("torch < 2.7 has no host_memory_stats")
+    real_empty = torch.empty
+
+    def broken(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", broken)
+    with pytest.raises(RuntimeError, match = "illegal memory access"):
+        gc_module._host_cache_reuses_block(1 << 20)
+
+    def oom(*args, **kwargs):
+        raise RuntimeError("CUDA error: out of memory")
+
+    monkeypatch.setattr(torch, "empty", oom)
+    assert gc_module._host_cache_reuses_block(1 << 20) is False

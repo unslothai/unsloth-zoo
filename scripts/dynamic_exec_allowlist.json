@@ -330,14 +330,6 @@
       "reason": "`_hooks` is one of the two literals '_forward_hooks' / '_forward_pre_hooks' passed at the call sites in this function."
     },
     {
-      "path": "unsloth_zoo/peft_utils.py",
-      "qualname": "requires_grad_for_gradient_checkpointing.register_other_hooks",
-      "sink": "exec",
-      "kind": "f-string",
-      "hash": "9c8c2a17a2a67b45",
-      "reason": "`_hooks` is one of the two literals '_forward_hooks' / '_forward_pre_hooks' passed at the call sites in this function."
-    },
-    {
       "path": "unsloth_zoo/saving_utils.py",
       "qualname": "merge_and_dequantize_lora",
       "sink": "exec",

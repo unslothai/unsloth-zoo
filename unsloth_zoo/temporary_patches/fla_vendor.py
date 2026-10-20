@@ -1066,7 +1066,9 @@ def _make_flashqla_chunk_gated_delta_rule(original):
                 f"Unsloth: FlashQLA failed on {dtype} ({type(e).__name__}: {message[:200]}); "
                 f"using the fla Triton kernels for {dtype}."
             )
-            return original(*args, **kwargs)
+        # Outside the handler: the traceback, and the failed FlashQLA buffers its frames
+        # hold, are released before fla allocates its own.
+        return original(*args, **kwargs)
 
     setattr(chunk_gated_delta_rule, _GDN_BACKEND_MARK, "flashqla")
     return chunk_gated_delta_rule

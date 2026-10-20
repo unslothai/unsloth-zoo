@@ -444,7 +444,10 @@ def get_amd_flash_attn_func(device = None):
     Shapes: q/k/v = (batch, seqlen, nheads, headdim), float16 or bfloat16
     Returns: output tensor, same shape as q
     """
-    if get_amd_attention_implementation(device) != "amd_aiter":
+    # No-argument call when device is None: the plain single-device cache keys () and (None,)
+    # apart, so forwarding None would miss the entry the setup gates filled.
+    impl = get_amd_attention_implementation() if device is None else get_amd_attention_implementation(device)
+    if impl != "amd_aiter":
         return None
     try:
         import aiter as _aiter

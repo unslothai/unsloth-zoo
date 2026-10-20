@@ -290,6 +290,11 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     ),
     lm_head_bias: Optional[torch.Tensor] = None,
     return_entropy: bool = False,
+    # Same flag and default as chunked_hidden_states_selective_log_softmax, which scores old / ref
+    # logps: entropy and recompute scoring must project the head in the same precision.
+    fp32_lm_head: bool = (
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+    ),
 ):
     # All Unsloth Zoo code licensed under AGPL3
     self_fn = chunked_hidden_states_selective_log_softmax_recompute
@@ -476,7 +481,16 @@ def chunked_hidden_states_selective_log_softmax_recompute(
         float(logit_scale_multiply), float(logit_scale_divide),
         float(logit_softcapping), float(temperature), bool(return_entropy),
     )
-    logps, entropies = function.apply(flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms)
+    if fp32_lm_head:
+        # One fp32 head copy (autograd casts its gradient back), and no autocast, which would
+        # downcast the matmul; forward saves the disabled state, so backward recomputes in fp32 too.
+        lm_head = lm_head.to(torch.float32)
+        if lm_head_bias is not None:
+            lm_head_bias = lm_head_bias.to(torch.float32)
+        with torch.autocast(device_type = lm_head.device.type, enabled = False):
+            logps, entropies = function.apply(flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms)
+    else:
+        logps, entropies = function.apply(flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms)
     logps = logps.reshape(hidden_states.shape[0], hidden_states.shape[1])
     if return_entropy:
         return logps, entropies.reshape(hidden_states.shape[0], hidden_states.shape[1])
@@ -1245,6 +1259,10 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
     weights = completion_mask.to(torch.float32)
     if entropy_mask is not None:
         weights = weights * entropy_mask
+    sample_weight = loss_kwargs.get("sample_weight", None)
+    if sample_weight is not None:
+        # Zero-variance exclusion drops a completion from the whole loss, the entropy bonus included.
+        weights = weights * (sample_weight.to(weights.device) > 0).to(weights.dtype).unsqueeze(-1)
     if trl_version is None:
         try:
             import trl
@@ -1254,6 +1272,16 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
     from packaging.version import Version
     loss_type = loss_kwargs.get("loss_type", "grpo")
     if Version(trl_version) < Version("1.10.0") and loss_type in ("cispo", "dapo", "vespo"):
+        if sample_weight is not None:
+            # The policy term is normalised by sample_weight (kept tokens only, grpo_compute_loss),
+            # and TRL 1.8 / 1.9 divide the bonus by the policy's own normaliser: the same here, so
+            # excluded rows do not dilute it. Without exclusion this equals the branch below.
+            normalizer = 1.0 / loss_kwargs.get("num_processes", 1)
+            steps_per_generation = loss_kwargs.get("steps_per_generation", None)
+            if steps_per_generation:
+                normalizer = normalizer * loss_kwargs.get("current_gradient_accumulation_steps", 1) / steps_per_generation
+            row_weight = sample_weight.to(device = weights.device, dtype = weights.dtype).unsqueeze(-1)
+            return weights * row_weight * (-entropy_coef / normalizer)
         # TRL 1.8 / 1.9 used num_items_in_batch / num_processes as is, before 1.10 rescaled it to
         # one accumulation window (grpo_compute_loss always rescales the policy term).
         num_items_in_batch = loss_kwargs.get("num_items_in_batch", None)
@@ -1286,11 +1314,15 @@ def _high_entropy_mask_pads(method):
 pass
 
 
-def grpo_high_entropy_mask(trainer, entropies, mask, threshold):
+def grpo_high_entropy_mask(trainer, entropies, mask, threshold, sample_weight = None):
     """trainer.get_high_entropy_mask, except on a multi-process run whose method gathers without
     padding (TRL < 0.24): a rank with no valid tokens returns before the gather the other ranks
     enter, so training hangs, and uneven token counts break the gather. Those runs take TRL >= 0.24's
-    padded gather, which sees the same quantile population; a single process is unchanged."""
+    padded gather, which sees the same quantile population; a single process is unchanged.
+    sample_weight: rows with weight 0 (zero-variance exclusion) leave the loss, so they are left
+    out of the quantile population too."""
+    if sample_weight is not None:
+        mask = mask * (sample_weight.to(mask.device) > 0).to(mask.dtype).unsqueeze(-1)
     accelerator = getattr(trainer, "accelerator", None)
     if getattr(accelerator, "num_processes", 1) > 1 and not _high_entropy_mask_pads(trainer.get_high_entropy_mask):
         local = entropies[mask.bool()].float()
@@ -1978,13 +2010,21 @@ def grpo_parse_is_clip(spec, mode):
     """Parse UNSLOTH_GRPO_VLLM_IS_CLIP "lower_upper" (either side may be empty) into (lower, upper).
     Applied after GRPOConfig validation, so it checks the bounds itself: reversed bounds collapse
     every truncated ratio to one value and make the mask modes reject every token."""
+    if "_" not in str(spec):
+        # A bare "2.0" would otherwise become a lower bound and floor / reject every on-policy ratio.
+        raise ValueError(
+            f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP must be 'lower_upper' (either side may be empty, "
+            f"e.g. '_{spec}' for an upper cap), got {spec!r}."
+        )
     lower, _, upper = str(spec).partition("_")
     lower = float(lower) if lower.strip() else None
     upper = float(upper) if upper.strip() else None
     if (lower is not None and not (0 <= lower < math.inf)) or (upper is not None and not (0 < upper < math.inf)):
         raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP needs a finite lower >= 0 and upper > 0, got {spec!r}.")
-    if lower is not None and upper is not None and lower > upper:
-        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP lower bound exceeds upper bound in {spec!r}.")
+    if lower is not None and upper is not None and lower >= upper:
+        # TRL GRPOConfig rejects clip_min >= clip_max: equal bounds make truncate a constant weight
+        # and the mask modes keep only ratios exactly equal to it.
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP lower bound must be below the upper bound in {spec!r}.")
     if lower is None and upper is None and str(mode).endswith("_truncate"):
         raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP={spec!r} gives no bound for {mode}.")
     return lower, upper
@@ -2046,7 +2086,10 @@ def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
         keep = mask.to(torch.bool) & ~torch.isnan(log_ratio)
         maskd = keep.to(torch.float64)
         log_ratio = torch.nan_to_num(log_ratio, nan = 0.0) * maskd
-        log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
+        # verl compute_offpolicy_metrics does not clamp: a +-20 clamp capped K1 at 20 and K3 near
+        # exp(20). Only keep the float64 sums finite (and -inf logps out of inf - inf): exp(670)
+        # leaves room for 1e15 saturated tokens below the float64 max (exp(709.8)).
+        log_ratio = torch.clamp(log_ratio, min = -670.0, max = 670.0)
         k3 = (torch.expm1(log_ratio) - log_ratio) * maskd
         w = torch.broadcast_to(is_weights.to(torch.float64), maskd.shape) * maskd
         rejected = ((w == 0) & keep).to(torch.float64)
@@ -2297,11 +2340,15 @@ def grpo_accumulated_loss(
         output_embeddings = trainer.model.get_output_embeddings()
         lm_head = output_embeddings.weight
         lm_head_bias = getattr(output_embeddings, "bias", None)
-        if lm_head_bias is not None:
-            from functools import partial
-            chunked_hidden_states_selective_log_softmax = partial(
-                chunked_hidden_states_selective_log_softmax, lm_head_bias = lm_head_bias,
-            )
+
+        def _refresh_lm_head():
+            # FSDP2's forward unshard swaps the Parameters: the bindings above are metadata-only until then.
+            nonlocal lm_head, lm_head_bias
+            from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fsdp_unshard
+            unsloth_fsdp_unshard(output_embeddings)
+            lm_head = output_embeddings.weight
+            lm_head_bias = getattr(output_embeddings, "bias", None)
+
         from unsloth_zoo.rl_replacements import grpo_truncated_support_kwargs
         _support_kwargs = grpo_truncated_support_kwargs(trainer)
         # old / ref logps come from Unsloth's _get_per_token_logps, which marks the trainer when
@@ -2316,15 +2363,15 @@ def grpo_accumulated_loss(
                 )
                 trainer._unsloth_truncated_support_refused = True
             _support_kwargs = {}
+        if _support_kwargs and getattr(trainer, "_unsloth_truncated_support_refused", False):
+            # Unsloth found the scored policy is not the sampler (an unsynced vLLM sampler, a reference
+            # model, reused rollouts): the current policy's own kept set would not be vLLM's either.
+            _support_kwargs = {}
         if _support_kwargs:
             from functools import partial
             if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
                 # The recompute helper scores the full vocabulary only, so the kept set uses the plain helper
                 from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax
-                if lm_head_bias is not None:
-                    chunked_hidden_states_selective_log_softmax = partial(
-                        chunked_hidden_states_selective_log_softmax, lm_head_bias = lm_head_bias,
-                    )
                 if not getattr(trainer, "_unsloth_truncated_support_recompute_warned", False):
                     from unsloth_zoo.log import logger as _zoo_logger
                     _zoo_logger.warning(
@@ -2424,13 +2471,26 @@ def grpo_accumulated_loss(
                 logps = chunked_hidden_states_selective_log_softmax(
                     hidden_states, lm_head, ids, chunks,
                     logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                    lm_head_bias = lm_head_bias,
                 )
             return logps, entropies
 
         def _raw_logits_entropies(logits):
             # The forward already scaled / softcapped these; same temperature as the logprobs.
-            log_p = torch.log_softmax(logits.to(torch.float32) / temperature, dim = -1)
-            return -(log_p.exp() * log_p).sum(-1)
+            if _entropy_bonus_on:
+                log_p = torch.log_softmax(logits.to(torch.float32) / temperature, dim = -1)
+                return -(log_p.exp() * log_p).sum(-1)
+            # Mask only (top_entropy_quantile): TRL scores entropies under no_grad, so no graph is kept,
+            # and rows go in slices so the fp32 copies stay near 64M elements, not the whole [B, T, V].
+            with torch.no_grad():
+                flat = logits.reshape(-1, logits.shape[-1])
+                out = torch.empty(flat.shape[0], dtype = torch.float32, device = logits.device)
+                step = max(1, (1 << 26) // max(int(flat.shape[-1]), 1))
+                for lo in range(0, flat.shape[0], step):
+                    log_p = torch.log_softmax(flat[lo : lo + step].to(torch.float32) / temperature, dim = -1)
+                    out[lo : lo + step] = -(log_p.exp() * log_p).sum(-1)
+                    del log_p
+                return out.reshape(logits.shape[:-1])
 
         import math
         total_samples = input_ids.shape[0]
@@ -2643,6 +2703,7 @@ def grpo_accumulated_loss(
                             packed_seq_lengths = _pack_psl,
                             use_cache = False,
                         ).logits
+                        _refresh_lm_head()
                         # `.logits` carries hidden states only when the forward is the
                         # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
                         # otherwise it is real [T, vocab] logits and the lm_head matmul
@@ -2657,6 +2718,7 @@ def grpo_accumulated_loss(
                                 _pack_sel = chunked_hidden_states_selective_log_softmax(
                                     _pack_h, lm_head, _pack_tid, _pack_chunks,
                                     logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                    lm_head_bias = lm_head_bias,
                                 )[0]
                         else:
                             # Raw logits: the forward already applied scale/softcap.
@@ -2696,6 +2758,7 @@ def grpo_accumulated_loss(
                                 _pack_real = input_ids[_pack_i][_pack_rmask].unsqueeze(0)
                                 _pack_rpos = torch.arange(_pack_ni, device = input_ids.device).unsqueeze(0)
                                 _pack_rh = unwrapped_model(input_ids = _pack_real, position_ids = _pack_rpos, use_cache = False).logits
+                                _refresh_lm_head()
                                 # same width dispatch as the packed call above: this forward
                                 # returns raw logits whenever that one did, and the first
                                 # packed batch always lands here
@@ -2703,6 +2766,7 @@ def grpo_accumulated_loss(
                                     _pack_rsel = chunked_hidden_states_selective_log_softmax(
                                         _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
                                         logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                        lm_head_bias = lm_head_bias,
                                     )[0]
                                 else:
                                     _pack_rsel = chunked_selective_log_softmax(
@@ -2777,6 +2841,7 @@ def grpo_accumulated_loss(
                     prefix_seg_info = _pg_layout.prefix_seg_info,
                     use_cache = False,
                 ).logits
+                _refresh_lm_head()
                 # Same width dispatch as the packed path and compute_logprobs_chunk.
                 # `.logits` carries hidden states only when the forward is the Unsloth
                 # generated one honouring UNSLOTH_RETURN_HIDDEN_STATES; otherwise it is
@@ -2785,6 +2850,9 @@ def grpo_accumulated_loss(
                 # that same signature, which skips the lm_head matmul and the scale /
                 # softcap the forward already applied.
                 _pg_fn = chunked_hidden_states_selective_log_softmax
+                if lm_head_bias is not None:
+                    from functools import partial
+                    _pg_fn = partial(_pg_fn, lm_head_bias = lm_head_bias)
                 if _h.shape[-1] != lm_head.shape[1]:
                     def _pg_fn(_pg_h, _pg_lm, _pg_ids, _pg_n, _pg_lsm, _pg_lsd, _pg_lsc, _pg_t):
                         return chunked_selective_log_softmax(
@@ -3047,6 +3115,7 @@ def grpo_accumulated_loss(
                 )
 
         def compute_logprobs_chunk(new_hidden_states_chunk, completion_ids, input_ids_chunk):
+            _refresh_lm_head()
             # Hidden states -> lm_head matmul path; raw logits -> skip matmul and
             # skip scale/softcap (model forward already applied them).
             chunks = input_ids_chunk.shape[0] * multiplier
@@ -3123,7 +3192,10 @@ def grpo_accumulated_loss(
             if _entropy_mask_on:
                 # TRL's own method, so its quantile population, ties and empty-batch rule match per version
                 # (multi-process TRL < 0.24 takes the padded gather so an empty rank cannot hang the rest).
-                entropy_mask = _grpo_high_entropy_mask(trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile)
+                entropy_mask = _grpo_high_entropy_mask(
+                    trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile,
+                    sample_weight = kwargs.get("sample_weight", None),
+                )
                 kwargs["entropy_mask"] = entropy_mask
 
         # DeepSpeed (no scaler) only: undo training_step's 1/GAS, which transformers >= 5.19 skips when
@@ -3168,10 +3240,26 @@ def grpo_accumulated_loss(
             _rollout_stats = trainer.accelerator.gather(_rollout_stats.reshape(1, -1)).reshape(-1, _rollout_stats.numel())
             _rollout_stats = torch.cat([_rollout_stats[:, :3].sum(0), _rollout_stats[:, 3:4].amax(0), _rollout_stats[:, 4:].sum(0)])
             _metrics = trainer._metrics
+            _bucket = "train" if _training else "eval"
             if "train" in _metrics:
-                _metrics = _metrics["train" if _training else "eval"]
+                _metrics = _metrics[_bucket]
+            # Pool the sums over every micro-batch since the last log instead of averaging
+            # per-micro-batch ratios: TRL's log() clears _metrics, which restarts the window.
+            _rollout_acc = getattr(trainer, "_unsloth_rollout_mismatch_stats", None)
+            if not isinstance(_rollout_acc, dict):
+                _rollout_acc = {}
+                trainer._unsloth_rollout_mismatch_stats = _rollout_acc
+            _prev = _rollout_acc.get(_bucket)
+            if _prev is not None and "sampling/rollout_kl_k1/mean" in _metrics:
+                _prev = _prev.to(_rollout_stats.device)
+                _rollout_stats = torch.cat([
+                    _prev[:3] + _rollout_stats[:3],
+                    torch.maximum(_prev[3:4], _rollout_stats[3:4]),
+                    _prev[4:] + _rollout_stats[4:],
+                ])
+            _rollout_acc[_bucket] = _rollout_stats.detach()
             for _name, _value in _grpo_rollout_mismatch_metrics(_rollout_stats).items():
-                _metrics[_name].append(_value)
+                _metrics[_name] = [_value]
         if _entropy_bonus_on:
             _entropy_weights = _grpo_entropy_bonus_weights(
                 completion_mask, entropy_mask, _entropy_coef, kwargs, training = _training,

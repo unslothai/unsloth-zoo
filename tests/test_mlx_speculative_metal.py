@@ -114,6 +114,36 @@ def qwen_4bit():
 
 
 @pytest.fixture(scope = "module")
+def qwen4():
+    """A small random qwen4_exp quantized like the 4-bit releases, so its decode takes the batch-invariant forward, with
+    their expert and hyper-connection widths, which pick the projections' kernels."""
+    import mlx.nn as nn
+    from mlx.utils import tree_map
+    from mlx_vlm.models import qwen4_exp
+    from unsloth_zoo.mlx.loader import _ensure_exact_verify_sums_promoted
+    _ensure_exact_verify_sums_promoted()  # as FastMLXModel's VLM load does
+    text = dict(model_type = "qwen4_exp_text", hidden_size = 512, num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 2,
+                head_dim = 128, linear_num_key_heads = 2, linear_num_value_heads = 6, linear_key_head_dim = 128, linear_value_head_dim = 128,
+                linear_conv_kernel_dim = 4, num_experts = 64, num_experts_per_tok = 10, moe_intermediate_size = 640,
+                shared_expert_intermediate_size = 640, hc_lowrank = 320, rms_norm_eps = 1e-6, vocab_size = 1024, max_position_embeddings = 4096,
+                ple_layer_ids = [2], ngram_vocab_size_base = 4096, split_ngram_parts = 4, eos_token_id = 1)
+    vision = dict(depth = 1, hidden_size = 64, num_heads = 2, intermediate_size = 128, out_hidden_size = 512)
+    model = qwen4_exp.Model(qwen4_exp.ModelConfig.from_dict(dict(model_type = "qwen4_exp", text_config = text, vision_config = vision)))
+    # Constructors zero gates and residual scales, which would cut the paths under test.
+    model.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05
+                          if mx.issubdtype(a.dtype, mx.floating) and not mx.any(a).item() else a, model.parameters()))
+    model.set_dtype(mx.bfloat16)
+    gates = {"group_size": 64, "bits": 8, "mode": "affine"}
+    nn.quantize(model.language_model, group_size = 32, bits = 4, class_predicate = lambda path, module: hasattr(module, "to_quantized") and (
+        gates if path.endswith(("mlp.gate", "shared_expert_gate")) else True))
+    model.eval()
+    mx.eval(model.parameters())
+    assert model.language_model._supports_batch_invariant_decode()
+    ids = [[(7 * i + 3) % 1000 + 2 for i in range(29)] * 2, [(11 * i + 5) % 1000 + 2 for i in range(23)]]
+    return model, ids
+
+
+@pytest.fixture(scope = "module")
 def gemma():
     from unsloth_zoo.mlx.speculative import companion_drafter
     # The bf16 per-layer embedding table is one 5.6 GB buffer, past the Metal buffer cap of 8 GB machines.
@@ -582,6 +612,70 @@ def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ra
     wide = [key for key, verdict in inference._VERIFY_VERDICTS.items() if key[0][0] == 3 and key[0][1] > 8 and verdict]
     # Each admitted key's replacement ran once for the comparison, then again for every later round it served.
     assert any(served.count(key) > 1 for key in wide)
+
+
+def _decoded(lm, prompt, steps, block):
+    """`steps` one-token decode steps after `prompt`, then a verify block on a copy of that cache, and that copy's state."""
+    from mlx_vlm.models.cache import make_prompt_cache
+    cache = make_prompt_cache(lm)
+    lm(mx.array([prompt]), cache = cache)
+    outs = [lm(mx.array([[token]]), cache = cache, return_hidden = True) for token in steps]
+    hidden, _, transaction, logits = lm.speculative_verify_logits(mx.array([block]), run := _clone(cache), lambda logits: logits)
+    transaction.commit([len(block)])
+    stepped = SimpleNamespace(logits = mx.concatenate([out.logits for out in outs], 1), hidden_states = [mx.concatenate([out.hidden_states[-1] for out in outs], 1)])
+    return _state(stepped, cache) + _state(SimpleNamespace(logits = logits, hidden_states = [hidden]), run)
+
+
+def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit(qwen4, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import language
+    from unsloth_zoo.mlx import inference
+    (model, ids), served = qwen4, _serving(monkeypatch)
+    lm, native = model.language_model, type(language._QWEN4_BATCH_INVARIANT_FORWARD)
+    args = (lm, ids[0][:20], ids[0][20:26], ids[0][26:31])
+    expected = _decoded(*args)
+    # The scopes a plain, undrafted generation holds.
+    with inference.inference_scopes(model, ()):
+        assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is not native
+        assert _same(expected, _decoded(*args))
+    assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is native and "_unsloth_verify_scopes" not in vars(lm)
+    # The first decode step and the verify block each matched on their first layer, then served every other one.
+    admitted = [key for key, verdict in inference._VERIFY_VERDICTS.items() if verdict]
+    assert {key[0] for key in admitted} == {(1, 1), (1, 5)}
+    assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted)
+
+
+def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qwen4):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import EngineRow, SpeculativeEngine
+    (model, ids), greedy = qwen4, SamplingParams()
+    lm, engine, stepped = model.language_model, SpeculativeEngine(model, _rounds_only()), []
+    prompts, streams = [ids[0][:30], ids[1][:16], ids[0][:23]], [ids[0][30:44], ids[0][2:16], ids[0][23:37]]
+    # Rows of different MRoPE deltas, as image prompts leave them; the last row's is the model's own afterwards.
+    for uid, (prompt, stream, delta) in enumerate(zip(prompts, streams, (0, -4, 7))):
+        cache = make_prompt_cache(lm)
+        lm(mx.array([prompt]), cache = cache)
+        engine.add(EngineRow(cache = _clone(cache), pending = stream[0], prompt = prompt, sampling = greedy, max_tokens = 32,
+                             uid = uid, rope_delta = delta))
+        outs = [lm(mx.array([[token]]), cache = cache, rope_deltas = mx.array([[delta]]), return_hidden = True) for token in stream]
+        stepped.append((mx.concatenate([out.logits for out in outs], 1), mx.concatenate([out.hidden_states[-1] for out in outs], 1)))
+    for row in engine._rows:
+        row.draft = object()  # a drafting row, so verify returns the hidden states an MTP head reads
+    assert engine._invariant and engine._batch_rounds
+    # Blocks of each row's own stream, kept raggedly, so a rejected tail left in any cache shows in the next block.
+    starts = [0, 0, 0]
+    for keeps in ((5, 2, 3), (1, 5, 2), (4, 3, 1)):
+        logits, hidden, transaction = engine._verify(mx.array([stream[start : start + 5] for stream, start in zip(streams, starts)]))
+        assert all(_same([("logits", want_logits[:, start : start + 5]), ("hidden", want_hidden[:, start : start + 5])],
+                         [("logits", logits[i : i + 1]), ("hidden", hidden[i : i + 1])])
+                   for i, ((want_logits, want_hidden), start) in enumerate(zip(stepped, starts)))
+        transaction.commit(list(keeps))
+        for entry in engine.cache:  # as a round does after a ragged commit
+            padding = getattr(entry, "left_padding", None)
+            if isinstance(padding, mx.array) and not hasattr(entry, "metadata_revision"):
+                entry.left_padding = padding + 0
+        starts = [start + keep for start, keep in zip(starts, keeps)]
+    assert not any("keys" in vars(entry) for entry in engine.cache)  # the commit's view of the QSA keys is gone
 
 
 def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
