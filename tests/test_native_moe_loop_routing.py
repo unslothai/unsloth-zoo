@@ -14,8 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""forward_native_moe_loop: one sort + one host read, bit-identical to the one_hot / torch.where routing."""
-
 import pytest
 import torch
 import torch.nn as nn

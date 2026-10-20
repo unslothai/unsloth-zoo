@@ -5493,7 +5493,7 @@ def forward_native_moe_loop(
             _down_scaling,
         )
 
-    # Stable sort keeps torch.where(one_hot)'s per-expert (slot, token) row order, so results stay bit-identical.
+    # Stable sort keeps torch.where(one_hot)'s (slot, token) row order: bit-identical results.
     with torch.no_grad():
         n_tokens = top_k_index.shape[0]
         slot_major = top_k_index.t().reshape(-1)   # position = top_k_pos * n_tokens + token
