@@ -610,18 +610,47 @@ def device_empty_cache():
             torch.npu.empty_cache()
 pass
 
+def _xpu_bf16_supported():
+    """Native bf16 on every visible XPU. torch.xpu.is_bf16_supported() counts emulation, so it
+    is always True. Torch without has_bfloat16_conversions, or an unreadable card, answers True."""
+    try:
+        flags = [
+            getattr(torch.xpu.get_device_properties(index), "has_bfloat16_conversions", True)
+            for index in range(torch.xpu.device_count())
+        ]
+    except Exception:
+        return True
+    return all(flags)
+pass
+
+def _apple_bf16_supported():
+    """M1 (applegpu_g13) and M2 (g14) lack native bf16; M3+ have it. Matches unsloth's MLX answer."""
+    try:
+        import mlx.core as mx
+        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        match = re.fullmatch(r"applegpu_g(\d+)[a-z]", str(info.get("architecture", "")))
+        if match:
+            return int(match.group(1)) >= 15
+        name = info.get("device_name", "") or ""
+        return not name.startswith(("Apple M1", "Apple M2"))
+    except Exception:
+        return True
+pass
+
 def device_is_bf16_supported():
-    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, HIP or NPU)."""
+    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, HIP, NPU or Apple MLX)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             return torch.cuda.is_bf16_supported()
     elif DEVICE_TYPE == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "is_bf16_supported"):
-                return torch.xpu.is_bf16_supported()
+                return torch.xpu.is_bf16_supported() and _xpu_bf16_supported()
     elif DEVICE_TYPE == "npu":
         if npu_is_available() and hasattr(torch.npu, "is_bf16_supported"):
             return torch.npu.is_bf16_supported()
+    elif DEVICE_TYPE == "mlx":
+        return _apple_bf16_supported()
     return False
 pass
 
