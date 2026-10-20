@@ -35,9 +35,15 @@ _GB = 1024 ** 3
 _MISSING = object()
 
 
+_PROVEN_NO_BF16 = "proven-no-bf16"  # bf16 False while another aspect reads True: the probe works
+
+
 def _props(flag = _MISSING, total = 16 * _GB):
     props = types.SimpleNamespace(total_memory = total)
-    if flag is not _MISSING:
+    if flag == _PROVEN_NO_BF16:
+        props.has_bfloat16_conversions = False
+        props.has_subgroup_2d_block_io = True
+    elif flag is not _MISSING:
         props.has_bfloat16_conversions = flag
     return props
 
@@ -87,8 +93,10 @@ def on_xpu(monkeypatch):
     [
         ((True,), True),                 # single native card: unchanged
         ((True, True), True),            # homogeneous: unchanged
-        ((False,), False),               # emulation only (torch still says True)
-        ((True, False), False),          # mixed: weakest card decides
+        ((False,), True),                # no libocloc reads False everywhere: unproven, unchanged
+        ((False, False), True),
+        ((_PROVEN_NO_BF16,), False),     # emulation only (torch still says True)
+        ((True, False), False),          # mixed: weakest card decides, the native card proves the probe
         ((False, True), False),
         ((_MISSING,), True),             # older torch without the attribute: unchanged
         ((_MISSING, _MISSING), True),
@@ -142,7 +150,7 @@ def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
     monkeypatch.setattr(gc, "DEVICE_TYPE_TORCH", "cuda")
     try:
         got = {}
-        for flags in ((True,), (False,), (_MISSING,), (True, False)):
+        for flags in ((True,), (False,), (_PROVEN_NO_BF16,), (_MISSING,), (True, False)):
             monkeypatch.setattr(torch, "xpu", _fake_xpu(flags), raising = False)
             gc.CPU_BUFFERS = []
             gc.initialize_unsloth_gradient_checkpointing()
@@ -156,7 +164,8 @@ def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
                 setattr(gc, name, value)
     assert got[(True,)] is torch.bfloat16
     assert got[(_MISSING,)] is torch.bfloat16
-    assert got[(False,)] is torch.float16
+    assert got[(False,)] is torch.bfloat16
+    assert got[(_PROVEN_NO_BF16,)] is torch.float16
     assert got[(True, False)] is torch.float16
 
 

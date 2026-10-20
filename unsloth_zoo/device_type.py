@@ -611,15 +611,28 @@ def device_empty_cache():
 pass
 
 def _xpu_bf16_supported():
-    """Native bf16 on every XPU (is_bf16_supported() counts emulation); unknown answers True."""
+    """False only when an XPU lacks native bf16 (is_bf16_supported() counts emulation). SYCL reads
+    these aspects through libocloc, which torch-xpu wheels lack, so every aspect is then False on every
+    device: the probe is trusted only once some aspect reads True. Unknown answers True."""
+    aspects = (
+        "has_bfloat16_conversions",
+        "has_subgroup_matrix_multiply_accumulate",
+        "has_subgroup_matrix_multiply_accumulate_tensor_float32",
+        "has_subgroup_2d_block_io",
+    )
     try:
-        flags = [
-            getattr(torch.xpu.get_device_properties(index), "has_bfloat16_conversions", True)
-            for index in range(torch.xpu.device_count())
-        ]
+        count = torch.xpu.device_count()
     except Exception:
         return True
-    return all(flags)
+    lacks_bf16 = probe_works = False
+    for index in range(count):
+        try:
+            props = torch.xpu.get_device_properties(index)
+        except Exception:
+            continue
+        lacks_bf16 |= getattr(props, "has_bfloat16_conversions", True) is False
+        probe_works |= any(getattr(props, name, False) is True for name in aspects)
+    return not (lacks_bf16 and probe_works)
 pass
 
 def _apple_bf16_supported():
