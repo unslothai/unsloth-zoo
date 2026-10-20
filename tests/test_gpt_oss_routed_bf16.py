@@ -28,6 +28,11 @@ DT = getattr(torch, os.environ.get("UNSLOTH_TEST_DTYPE", "")) if os.environ.get(
     torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16)
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
+# The 16-bit routed kernels are sm80+ only (they lose to grouped_mm on T4, fp16 too): below that nothing is eligible.
+needs_16bit_routing = pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8),
+    reason = "16-bit routed decode runs on sm80+ only (test_routed_decode_arch_gates.py covers the decline)",
+)
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "Triton kernels need CUDA")
 
 peft = pytest.importorskip("peft")
@@ -129,6 +134,7 @@ def test_routed_gemm_matches_reference(T):
     torch.testing.assert_close(routed_bf16_gemm(x, flat, wt, b, row_div = TOP_K), got, atol = 1e-4, rtol = 1e-4)
 
 
+@needs_16bit_routing
 @pytest.mark.parametrize("lora", [False, True], ids = ["base", "lora"])
 @pytest.mark.parametrize("T", [1, 5])
 def test_routed_forward_matches_effective_weights(lora, T):
@@ -150,6 +156,7 @@ def test_routed_forward_matches_effective_weights(lora, T):
             assert (off - got).abs().max() > 1e-2  # the adapter is really applied
 
 
+@needs_16bit_routing
 def test_grad_enabled_fp32_and_kill_switch_are_not_eligible(monkeypatch):
     _, mlp = _toy(False)
     x = torch.randn(1, 1, H, device = "cuda").to(DT)
@@ -202,6 +209,7 @@ def test_decode_path_applies_expert_lora():
     torch.testing.assert_close(got.reshape(ref.shape), ref, atol = 2e-2, rtol = 2e-2)
 
 
+@needs_16bit_routing
 def test_param_wrapper_hook_routes_only_at_the_outermost_wrapper():
     from unsloth_zoo.temporary_patches.moe_utils import _gpt_oss_routed_wrapper_forward
     _, mlp = _toy(lora = True)
@@ -221,6 +229,7 @@ def test_param_wrapper_hook_routes_only_at_the_outermost_wrapper():
     assert _gpt_oss_routed_wrapper_forward(outer, base, x, (), {"router_indices": idx, "routing_weights": weights}) is None
 
 
+@needs_16bit_routing
 @pytest.mark.parametrize("lora", [False, True])
 @pytest.mark.parametrize("B", [1, 3])
 def test_routed_mlp_forward_matches_module_on_batched_decode(monkeypatch, lora, B):
@@ -258,6 +267,7 @@ def test_routed_kernels_launch_on_the_tensors_device():
     torch.testing.assert_close(out, ref, atol = 2e-2, rtol = 2e-2)
 
 
+@needs_16bit_routing
 def test_mixed_adapter_batch_is_left_to_peft():
     from functools import partial
     from peft.tuners.lora.model import _adapter_names_pre_forward_hook

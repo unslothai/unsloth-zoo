@@ -1523,12 +1523,26 @@ def _bf16_supported(device):
     return _bf16_supported_index(device.index if device.index is not None else torch.cuda.current_device())
 
 
+# torch.device -> sm80+: one dict hit per decode call (the 16-bit routed kernels lose to grouped_mm below sm80).
+_ROUTED_16BIT_BY_DEVICE = {}
+
+
+def routed_16bit_supported(device):
+    ok = _ROUTED_16BIT_BY_DEVICE.get(device)
+    if ok is None:
+        ok = _bf16_supported(device)
+        if device.index is not None:  # a bare "cuda" follows the current device
+            _ROUTED_16BIT_BY_DEVICE[device] = ok
+    return ok
+
+
 def _bf16_plan(experts, gu, dn, hidden_dim):
     if gu.dim() != 3 or dn.dim() != 3:
         return None
     if getattr(gu, "quant_state", None) is not None or gu.dtype not in (torch.bfloat16, torch.float16) or dn.dtype != gu.dtype:
         return None
-    if not gu.is_cuda or (gu.dtype == torch.bfloat16 and not _bf16_supported(gu.device)):
+    # Below sm80 (T4) the 16-bit routed kernels lose to grouped_mm in fp16 too (4.9-7.8x at decode sizes).
+    if not gu.is_cuda or not routed_16bit_supported(gu.device):
         return None
     if getattr(experts, "is_transposed", False) or not getattr(experts, "has_gate", True):
         return None

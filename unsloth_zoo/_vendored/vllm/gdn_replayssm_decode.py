@@ -11,13 +11,29 @@ import triton.language as tl
 
 
 # Modified by Unsloth: the upstream launch-config table (vllm replayssm_config.py,
-# "gdn_decode" entry of vllm-project/vllm#48792) is inlined, since released vLLM has no GDN entry.
-def get_replayssm_config(kernel: str, L: int = 16) -> tuple:
-    """(block_v, num_warps, num_stages, nk) for the GDN ReplaySSM decode kernel."""
-    major, _ = torch.cuda.get_device_capability()
-    if major >= 10:
+# "gdn_decode" entry of vllm-project/vllm#48792) is inlined, since released vLLM has no GDN entry,
+# plus a T4 (sm75) entry: (64, 1, 3, 2) there is 2-25x slower (B=1..64) than (32, 1, 1, 4) and
+# 9.5x slower than fla fused_recurrent at B=64; (32, 1, 1, 4) is 1.7-2.7x faster than fla.
+# Cached per device: this runs once per GDN layer per decode step.
+_REPLAYSSM_CONFIG_BY_DEVICE = {}
+
+
+def _gdn_decode_config(capability) -> tuple:
+    if capability[0] >= 10:
         return 128, 1, 3, 4
+    if tuple(capability) == (7, 5):
+        return 32, 1, 1, 4
     return 64, 1, 3, 2
+
+
+def get_replayssm_config(kernel: str, L: int = 16, device = None) -> tuple:
+    """(block_v, num_warps, num_stages, nk) for the GDN ReplaySSM decode kernel."""
+    if device is None or device.index is None:
+        return _gdn_decode_config(torch.cuda.get_device_capability(device))
+    cfg = _REPLAYSSM_CONFIG_BY_DEVICE.get(device)
+    if cfg is None:
+        cfg = _REPLAYSSM_CONFIG_BY_DEVICE[device] = _gdn_decode_config(torch.cuda.get_device_capability(device))
+    return cfg
 
 
 @triton.jit
@@ -342,7 +358,7 @@ def fused_recurrent_gated_delta_rule_replayssm(
     max_cache_len = d_cache.shape[2]
 
     # Explicit launch parameters override the defaults for this buffer length.
-    cfg_bv, cfg_nw, cfg_ns, cfg_nk = get_replayssm_config("gdn_decode", L=max_cache_len)
+    cfg_bv, cfg_nw, cfg_ns, cfg_nk = get_replayssm_config("gdn_decode", L=max_cache_len, device=mixed_qkv.device)
     if block_v is None:
         block_v = cfg_bv
     if num_warps is None:
