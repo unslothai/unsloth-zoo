@@ -1094,6 +1094,8 @@ class _HostLoad:
         self.layers, self.indices, self.prefixes = None, [], {}
         self.done, self.done_bytes = set(), []
         self.embedding_prefixes, self.embeddings, self.embedding_bytes = {}, [], []
+        # Each selected layer's bytes as declared on meta, to scale a loaded layer's size to the others'.
+        self.shape_bytes, self.last_done = {}, None
 
     def bind(self, model):
         if self.layers is not None:
@@ -1105,8 +1107,17 @@ class _HostLoad:
             else sorted({int(i) % len(layers) for i in self.n})
         if name is not None:
             self.prefixes = {f"{name}.{i}.": i for i in self.indices}
+        self.shape_bytes = {i: sum(p.nbytes for p in layers[i].parameters()) for i in self.indices}
         if self.want_embeddings:
             self.embedding_prefixes = {f"{n}.": m for n, m in extra_input_embeddings(model)}
+
+    def _layers_to_come(self, size, ref):
+        """Bytes of the selected layers not moved yet, scaled from layer `ref`, which takes `size` bytes loaded."""
+        left = [j for j in self.indices if j not in self.done]
+        base = self.shape_bytes.get(ref, 0)
+        if not base:
+            return [size] * len(left)
+        return [size * self.shape_bytes.get(j, base) // base for j in left]
 
     def _pending_embedding_bytes(self, skip = None):
         # Streamed tables still to come; a meta weight already knows its size.
@@ -1117,9 +1128,8 @@ class _HostLoad:
         weight = getattr(module, "weight", None)
         if module in self.embeddings or weight is None or weight.device.type == "meta":
             return
-        left = max(len(self.indices) - len(self.done), 0)
         size = self.done_bytes[-1] if self.done_bytes else 0
-        _check_host_fit(self.done_bytes + self.embedding_bytes + [weight.nbytes] + [size] * left,
+        _check_host_fit(self.done_bytes + self.embedding_bytes + [weight.nbytes] + self._layers_to_come(size, self.last_done),
                         sum(self.done_bytes) + sum(self.embedding_bytes) + (weight.nbytes if weight.device.type == "cpu" else 0))
         with torch.no_grad():
             weight.requires_grad_(False)
@@ -1135,10 +1145,9 @@ class _HostLoad:
         params = list(layer.parameters())
         if not force and any(p.device.type == "meta" for p in params):
             return
-        # Layers still to come are sized like this one; the first check runs before any layer has moved.
+        # Layers still to come are scaled from this one by their meta sizes; the first check runs before any moved.
         size = sum(p.nbytes for p in params if p.device.type != "meta")
-        left = len(self.indices) - len(self.done)
-        _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + [size] * left,
+        _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + self._layers_to_come(size, i),
                         sum(self.done_bytes) + sum(self.embedding_bytes) + sum(p.nbytes for p in params if p.device.type == "cpu"))
         with torch.no_grad():
             for p in params:
@@ -1148,6 +1157,7 @@ class _HostLoad:
                     p.data = p.data.to("cpu")
         self.done.add(i)
         self.done_bytes.append(size)
+        self.last_done = i
 
     def on_param(self, model, target_name):
         self.bind(model)

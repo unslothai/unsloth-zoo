@@ -1302,3 +1302,21 @@ def test_find_decoder_layers_remembers_the_model_without_holding_it():
     del model
     gc.collect()
     assert _mod._LAYER_OWNERS.get(layers) is None or _mod._LAYER_OWNERS[layers]() is None
+
+
+def test_host_load_sizes_each_layer_still_to_come(monkeypatch):
+    import sys
+    # A 256 KiB layer then two 16 KiB ones: 288 KiB in all, not three times the first.
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 300 * 1024, total))
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Linear(w, w, bias = False).to("meta") for w in (64, 256, 64, 64)])
+    state = _mod._HostLoad(3, "tail")
+    state.bind(model)
+    # Loaded, as each would be when its first weight lands (CUDA, so none counts as already on host).
+    for i in (1, 2, 3):
+        model.layers[i].to_empty(device = "cuda" if torch.cuda.is_available() else "cpu")
+    for i in (1, 2, 3):
+        state.evict(i)
+    assert state.done == {1, 2, 3}
