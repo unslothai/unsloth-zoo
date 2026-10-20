@@ -25,8 +25,7 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
         triton.Config({}, num_warps=num_warps)
         for num_warps in [1, 2, 4, 8]
     ],
-    # Unsloth: B is neither an autotune key nor a constexpr in these four kernels (none reads it), so padded
-    # batches do not re-tune and recompile per batch size.
+    # Unsloth: unread B dropped so batch sizes do not re-tune or recompile.
     key=['H', 'BT', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs,
 )

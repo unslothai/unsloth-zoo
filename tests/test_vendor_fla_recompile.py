@@ -19,7 +19,6 @@ os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
 ZOO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 VENDORED = ZOO_ROOT / "unsloth_zoo" / "_vendored" / "fla"
 
-# kernel file -> (kernels, argument that must be neither an autotune key nor a constexpr)
 CASES = {
     "modules/conv/triton/kernels.py": (("causal_conv1d_fwd_kernel", "causal_conv1d_bwd_kernel"), "NB"),
     "ops/utils/cumsum.py": (
@@ -58,7 +57,6 @@ def test_shape_buckets_are_not_autotune_keys_or_constexprs(rel):
         assert key is not None, name
         assert arg not in key, (name, key)
         assert arg not in [a.arg for a in fn.args.args], name
-        # And nothing in the body reads it.
         assert not any(isinstance(n, ast.Name) and n.id == arg for n in ast.walk(fn)), name
 
 
@@ -135,6 +133,5 @@ def test_conv_and_cumsum_tune_and_compile_once_across_buckets():
     assert proc.returncode == 0, proc.stderr[-3000:]
     line = [ln for ln in proc.stdout.splitlines() if ln.startswith("COUNTS")][-1]
     counts = json.loads(line[len("COUNTS"):])
-    # [autotune entries, JIT compiles] with one config: no tuning entry, and compiles do not follow the
-    # six buckets / batch sizes (at most two: Triton still specializes pointers on 16-byte alignment).
+    # Triton still specializes pointers on 16-byte alignment, hence up to two compiles.
     assert all(tuned == 0 and compiles <= 2 for tuned, compiles in counts.values()), counts

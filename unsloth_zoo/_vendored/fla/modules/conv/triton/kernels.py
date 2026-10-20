@@ -30,8 +30,7 @@ STATIC_WARPS = 32 if not IS_AMD else 16
         for BD in [16, 32, 64, 128]
         for num_warps in NUM_WARPS_AUTOTUNE
     ],
-    # Unsloth: backported from fla PRs #1154 / #1388: NB = cdiv(B*T, 1024) is no longer an autotune key or
-    # constexpr (neither kernel reads it), so new 1024-token buckets do not re-tune or recompile.
+    # Unsloth: backport of fla PRs #1154 / #1388: unread NB dropped so token buckets do not recompile.
     key=['D', 'W'],
     **autotune_cache_kwargs,
 )
@@ -152,7 +151,7 @@ def causal_conv1d_fwd_kernel(
         for BD in [16, 32, 64, 128]
         for num_warps in [4, 8, 16, 32]
     ],
-    # Unsloth: backported from fla PRs #1154 / #1388 (NB dropped, see the forward kernel).
+    # Unsloth: backport of fla PRs #1154 / #1388.
     key=['D', 'W'],
     **autotune_cache_kwargs,
 )
