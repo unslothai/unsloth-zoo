@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""grpo_accumulated_loss under DeepSpeed ZeRO-3 reads the output head after the model forward.
-
-ZeRO-3 gathers a parameter only around its own module's forward; afterwards ``lm_head.weight`` is a
-0-element placeholder (``ds_status`` NOT_AVAILABLE). The GRPO scoring head never calls lm_head, so it
-used to read that placeholder (``lm_head.shape[1]`` IndexError, or a matmul against nothing). A fake
-ZeRO-3 parameter (the attributes DeepSpeed sets plus a ``GatheredParameters`` that restores the data)
-stands in for DeepSpeed, so this runs on CPU without it. Loss and LoRA-side gradients must match an
-unpartitioned reference; a trainable head is refused rather than silently left without a gradient.
-"""
+"""grpo_accumulated_loss must gather the ZeRO-3-released lm_head (0-element placeholder); fake ZeRO-3 on CPU."""
 
 import json
 import os
@@ -176,7 +168,6 @@ def test_grpo_loss_gathers_the_released_zero3_head(tmp_path, bias):
     assert "error" not in result, result["error"]
     assert result["loss_err"] < 1e-6, result
     assert result["grad_err"] < 1e-6, result
-    # Read-only gathers (modifier_rank None), one per loss call, and the head is released again after.
     assert result["read_only_gathers"], result
     assert result["n_gathers"] == 2 * (1 + bias), result
     assert result["placeholder_after"], result

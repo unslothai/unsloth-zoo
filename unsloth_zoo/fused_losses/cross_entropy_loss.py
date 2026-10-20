@@ -115,13 +115,9 @@ pass
 
 def unsloth_zero3_gathered(tensor):
     # All Unsloth Zoo code licensed under LGPLv3
-    """A full, detached copy of a ZeRO-3 partitioned parameter; anything else is returned unchanged.
+    """Detached gathered copy of a ZeRO-3 partitioned parameter (all ranks call it at the same point).
 
-    ZeRO-3 gathers a parameter only around its own module's forward (or, inside the engine forward,
-    on attribute access). The GRPO scoring head reads lm_head.weight after the model forward has
-    released it, which leaves a 0-element placeholder for both its forward and its backward. Every rank
-    calls this at the same point, so the all-gather is matched. The copy carries no gradient: a
-    trainable head under ZeRO-3 is refused instead of silently dropping its update.
+    The copy has no gradient, so a trainable head is refused rather than silently not updated.
     """
     if not unsloth_zero3_partitioned(tensor):
         return tensor

@@ -2340,8 +2340,7 @@ def grpo_accumulated_loss(
         output_embeddings = trainer.model.get_output_embeddings()
         lm_head = output_embeddings.weight
         lm_head_bias = getattr(output_embeddings, "bias", None)
-        # DeepSpeed ZeRO-3 released the head after the forward: score with one gathered copy per call
-        # (the weights do not change inside it). None elsewhere, so other runs keep the live Parameters.
+        # ZeRO-3 released the head after the forward: score with one gathered copy per call.
         _zero3_head = None
         from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_zero3_partitioned, unsloth_zero3_gathered
         if unsloth_zero3_partitioned(lm_head) or unsloth_zero3_partitioned(lm_head_bias):
