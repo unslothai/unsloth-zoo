@@ -28,7 +28,10 @@ A cached verdict is reused only while the stamp (or the lean key), the call cont
 signature of the first and last expert all match (see Record / valid). LoRA dropout is the one
 input that depends on train / eval, so non-Identity dropouts are compared on every call instead
 of wrapping Module.train (Trainer calls model.train() over every module each step). Subtrees with
-accelerate hooks (`_hf_hook`, which swap `_parameters` every forward) never get a record.
+accelerate hooks (`_hf_hook`, which swap `_parameters` every forward) never get a record, nor do
+subtrees holding FSDP2 all-gathered weights (marked `_unsloth_fsdp2_gathered` by unsloth's
+fsdp2_qlora): FSDP2 frees and re-allocates their storage around every forward and backward, so
+their addresses move without any hook firing.
 
 UNSLOTH_MOE_FAST_READY=0 (read per call) runs the full checks on every call.
 """
@@ -45,6 +48,8 @@ _EPOCH = [0, 0]            # [struct, step]
 _INSTALLED = [None]        # None: not tried, True / False
 _TRACKED = "_unsloth_moe_ready_tracked"
 VALID = "_unsloth_moe_ready_valid"   # experts.__dict__: (stamp, gen) storage verified at stamp
+# Set by unsloth (models/fsdp2_qlora.py) on a weight FSDP2 all-gathered: its address moves per call.
+FSDP2_GATHERED = "_unsloth_fsdp2_gathered"
 # Engagement counters: full checks, step re-validations (lean key), cheap hits, table hits / rebuilds.
 COUNTS = {"full": 0, "lean": 0, "cheap": 0, "table_full": 0, "table_cheap": 0}
 _PEFT_METHODS = (
@@ -182,6 +187,11 @@ def scan(root):
         _OWNER[m] = ref
         if "_hf_hook" in d:
             hooked = True
+        elif not hooked:
+            for p in d["_parameters"].values():
+                if p is not None and p.__dict__.get(FSDP2_GATHERED):
+                    hooked = True
+                    break
         if isinstance(m, dropout):
             drops.append(m)
         stack += [c for c in d["_modules"].values() if c is not None]

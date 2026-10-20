@@ -21,10 +21,12 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import sys
 import time
 from dataclasses import dataclass, field, replace
 from itertools import combinations
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Literal, Sequence
 
 import mlx.core as mx
@@ -838,6 +840,30 @@ def _language_call(family: str):
     return module.LanguageModel.__call__
 
 
+def _rows_trimmed(transaction):
+    """``transaction`` committing a ragged block row by row in qwen4_exp's QSA caches too.
+
+    Their ``prepare``/``finalize`` roll each row's rejected tail out, but mlx-vlm's commit takes that path only for a
+    cache exposing ``keys``, which ``BatchQSAKVCache`` does not, so it trimmed every row to the longest acceptance."""
+    qsa = getattr(sys.modules.get("mlx_vlm.models.qwen4_exp.language"), "BatchQSAKVCache", None)
+    if qsa is None or hasattr(qsa, "keys"):
+        return transaction
+    commit = transaction.commit
+
+    def commit_rows(lengths):
+        shown = [cache for cache in transaction.caches if isinstance(cache, qsa) and "keys" not in vars(cache)]
+        for cache in shown:
+            cache.keys = cache.kv_cache.keys
+        try:
+            return commit(lengths)
+        finally:
+            for cache in shown:
+                del cache.keys
+
+    transaction.commit = commit_rows
+    return transaction
+
+
 def _join(batch: list | None, new: list, size: int) -> list:
     if not size:
         return list(new)
@@ -882,8 +908,14 @@ class SpeculativeEngine:
         # a capture list keeps the forward off the per-row paths that replace cache objects.
         call = type(self.lm).__call__
         self._exact = call is _language_call("qwen3_5")
+        # qwen4_exp decodes on its batch-invariant forward wherever its head allows, and its verify method
+        # runs blocks on that same forward; it returns the last hidden state alone, all an MTP head reads.
+        supports = getattr(self.lm, "_supports_batch_invariant_decode", None)
+        self._invariant = (call is _language_call("qwen4_exp") and callable(supports) and supports()
+                           and callable(getattr(self.lm, "speculative_verify_logits", None))
+                           and getattr(drafter, "features", None) is None)
         # Families whose verify forward was measured to commit ragged acceptance correctly.
-        self._batch_rounds = self._exact or call is _language_call("gemma4")
+        self._batch_rounds = self._exact or self._invariant or call is _language_call("gemma4")
         self._mrope = hasattr(self.lm, "_rope_deltas")
         self._rows: list[_Row] = []
         self.cache: list | None = None
@@ -977,6 +1009,12 @@ class SpeculativeEngine:
         if self._exact:
             out = self.lm(inputs, cache = self.cache, speculative_verify = True, **{"capture_layer_ids": [], **self._kwargs()})
             return out.logits, self._hidden(out), out.gdn_states
+        if self._invariant:
+            if self._mrope:
+                # As a decode step's call would, so the verifier positions each row by its own delta.
+                self.lm._rope_deltas = self._position_kwargs()["rope_deltas"]
+            hidden, _, transaction, logits = self.lm.speculative_verify_logits(inputs, self.cache, lambda logits: logits)
+            return logits, self._hidden(SimpleNamespace(hidden_states = [hidden])), _rows_trimmed(transaction)
         from .inference import verify_block_attention
         with verify_block_attention():
             out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._kwargs())

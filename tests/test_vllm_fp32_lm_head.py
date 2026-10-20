@@ -282,3 +282,55 @@ def test_excluded_quant_patch_not_reached_when_off(monkeypatch):
     # Inference-only engines never request the override, so they never patch either.
     assert ns["_vllm_fp32_lm_head_overrides"](False) == {}
     assert LogitsProcessor._apply_head is original
+
+
+def test_return_args_callers_get_no_fp32_head_override():
+    # SyntheticDataKit turns load_vllm(return_args = True) into `vllm serve` flags with str();
+    # vLLM json-parses --hf-overrides, so a dict from this flag would make the server exit.
+    load_vllm = next(
+        n for n in ast.walk(_vllm_utils_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm"
+    )
+    assigns = [
+        n for n in ast.walk(load_vllm)
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "fp32_head_overrides" for t in n.targets)
+    ]
+    assert len(assigns) == 1
+    value = ast.unparse(assigns[0].value)
+    assert "return_args" in value and "_vllm_fp32_lm_head_overrides(training)" in value
+
+
+def _late_warning_helper():
+    nodes = [n for n in _vllm_utils_tree().body if isinstance(n, ast.FunctionDef) and n.name == "_warn_fp32_lm_head_set_late"]
+    assert len(nodes) == 1
+    import inspect
+    ns = {"sys": sys, "inspect": inspect}
+    exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_late", "exec"), ns)
+    return ns["_warn_fp32_lm_head_set_late"]
+
+
+@pytest.mark.parametrize("trainer_default, warns", [(False, True), (True, False)])
+def test_flag_set_after_import_warns(monkeypatch, capsys, trainer_default, warns):
+    rl = types.ModuleType("unsloth_zoo.rl_replacements")
+    def chunked_hidden_states_selective_log_softmax(hidden, fp32_lm_head = trainer_default): pass
+    def chunked_hidden_states_selective_log_softmax_recompute(hidden, fp32_lm_head = trainer_default): pass
+    rl.chunked_hidden_states_selective_log_softmax = chunked_hidden_states_selective_log_softmax
+    rl.chunked_hidden_states_selective_log_softmax_recompute = chunked_hidden_states_selective_log_softmax_recompute
+    monkeypatch.setitem(sys.modules, "unsloth_zoo.rl_replacements", rl)
+    assert _late_warning_helper()() is warns
+    assert ("set after Unsloth was imported" in capsys.readouterr().out) is warns
+
+
+def test_flag_set_late_against_the_real_projectors(monkeypatch, capsys):
+    # The real module was imported with the flag off in this process: its defaults are False.
+    import unsloth_zoo.rl_replacements as rl
+    monkeypatch.setitem(sys.modules, "unsloth_zoo.rl_replacements", rl)
+    assert _late_warning_helper()() is (os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0") != "1")
+
+
+def test_load_vllm_warns_when_the_override_is_applied():
+    load_vllm = next(
+        n for n in ast.walk(_vllm_utils_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm"
+    )
+    src = ast.unparse(load_vllm)
+    merge = src.find("**fp32_head_overrides")
+    assert -1 < merge < src.find("_warn_fp32_lm_head_set_late()", merge)

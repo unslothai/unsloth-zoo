@@ -473,21 +473,27 @@ def requires_grad_for_gradient_checkpointing(model):
     # non language models that don't just use .embed_tokens
     def register_other_hooks(name1, name2, module, _hooks):
         old_hooks = eval(f"module.{_hooks}")
+        # Hooks registered with_kwargs = True (Unsloth's inputs_embeds pre-hook) take (module, args,
+        # kwargs): re-register them the same way, or the next forward calls them with two arguments.
+        with_kwargs = set(getattr(module, f"{_hooks}_with_kwargs", None) or ())
         other_hooks = []
-        for value in old_hooks.values():
+        for key, value in old_hooks.items():
             qualname = getattr(value, "__qualname__", "")
             name     = getattr(value, "__name__", "")
             if name1 in qualname or name2 in qualname: pass
             elif name2 in name or name2 in name: pass
-            else: other_hooks.append(value)
+            else: other_hooks.append((value, key in with_kwargs))
         pass
         # Keep none input requires grad hooks
         exec(f"module.{_hooks} = OrderedDict()")
-        if _hooks == "_forward_pre_hooks":
-            if hasattr(module, "_forward_pre_hooks_with_kwargs"):
-                module._forward_pre_hooks_with_kwargs.clear()
-        for hook in other_hooks:
-            exec(f"module.register{_hooks[:-1]}(hook)")
+        if hasattr(module, f"{_hooks}_with_kwargs"):
+            getattr(module, f"{_hooks}_with_kwargs").clear()
+        register = getattr(module, f"register{_hooks[:-1]}")
+        for hook, kwargs_hook in other_hooks:
+            if kwargs_hook:
+                register(hook, with_kwargs = True)
+            else:
+                register(hook)
         pass
     pass
 

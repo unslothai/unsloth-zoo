@@ -142,6 +142,47 @@ def test_flashqla_failure_falls_back_once_per_dtype(monkeypatch, fake_env):
     assert built == ["float16", "bfloat16"]
 
 
+def test_flashqla_failure_releases_its_buffers_before_fla(monkeypatch, fake_env):
+    # The fallback must not run inside the except block: the traceback would keep the
+    # failed backend's scratch alive while fla allocates, an avoidable OOM.
+    import gc
+    import weakref
+    torch = pytest.importorskip("torch")
+    gdr, _, _ = fake_env
+    monkeypatch.setenv("UNSLOTH_GDN_BACKEND", "flashqla")
+    _supported_only_when(monkeypatch, lambda q: True)
+    scratch = []
+
+    def flash_chunk(**kwargs):
+        buffer = torch.empty(16)
+        scratch.append(weakref.ref(buffer))
+        raise RuntimeError("Compilation error")
+
+    alive_in_fla = []
+
+    def fla_chunk(
+        q, k, v, g, beta, scale = None, initial_state = None, output_final_state = False,
+        use_qk_l2norm_in_kernel = False, use_beta_sigmoid_in_kernel = False,
+        allow_neg_eigval = False, state_v_first = False, cu_seqlens = None,
+        cu_seqlens_cpu = None, cp_context = None, **kwargs,
+    ):
+        alive_in_fla.append(scratch[-1]() is not None)
+        return ("fla", kwargs)
+
+    monkeypatch.setattr(gdr, "chunk_gated_delta_rule", fla_chunk)
+    fv._flashqla_state["module"] = types.SimpleNamespace(chunk_gated_delta_rule = flash_chunk)
+    monkeypatch.setattr(fv, "_load_flashqla", lambda: fv._flashqla_state["module"])
+    monkeypatch.setattr(fv.logger, "warning", lambda msg, *a, **k: None)
+    assert fv._install_gdn_backend() is True
+    gc.disable()
+    try:
+        out = gdr.chunk_gated_delta_rule(types.SimpleNamespace(dtype = "float16"), "k", "v", "g", "beta")
+    finally:
+        gc.enable()
+    assert out[0] == "fla"
+    assert alive_in_fla == [False]
+
+
 def test_flashqla_oom_is_not_swallowed(monkeypatch, fake_env):
     torch = pytest.importorskip("torch")
     gdr, _, _ = fake_env

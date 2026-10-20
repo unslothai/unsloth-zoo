@@ -464,14 +464,14 @@ def _inputs(dtype, experts, rows, mode):
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
-@pytest.mark.parametrize("experts, top_k", [(32, 1), (64, 5), (128, 8), (160, 3), (256, 8), (1024, 8)])
+@pytest.mark.parametrize("experts, top_k", [(32, 1), (64, 5), (128, 8), (160, 3), (256, 8), (288, 8), (512, 10), (1024, 8), (1024, 16)])
 @pytest.mark.parametrize("mode, normalize", [(QWEN, True), (QWEN, False), (GEMMA, False)])
 def test_kernel_reproduces_native_routing(dtype, experts, top_k, mode, normalize):
     for rows in (0, 1, 8, 4096):
         mx.random.seed(rows + experts + top_k)
         logits, scale = _inputs(dtype, experts, rows, mode)
         fused = fusion._fused_moe_router(logits, scale, top_k, mode, normalize)
-        if rows == 0 or (mode == QWEN and experts > 256):
+        if rows == 0 or (mode == GEMMA and top_k > 8):
             assert fused is None
             continue
         assert fused is not None
@@ -553,14 +553,16 @@ def test_scope_fuses_routing_composes_with_gate_up_in_either_order_and_restores(
     assert partitions
 
 
-def test_unnormalized_top_k_and_subclass_bodies_are_fused(monkeypatch):
+def test_unnormalized_wide_and_subclass_bodies_are_fused(monkeypatch):
     class Scaled(vlm_qwen.Qwen3_5MoeSparseMoeBlock):  # qwen4_exp inherits the body and overrides the shared gate
         def _shared_expert_scale(self, x):
             return 2 * super()._shared_expert_scale(x)
 
     partitions = _counting_argpartition(monkeypatch)
+    # qwen3_next and qwen4_exp route 512 experts to 10
     for block in (_block(lm_qwen, norm_topk_prob = False), _block(vlm_qwen, norm_topk_prob = False),
-                  _block(vlm_qwen, cls = Scaled)):
+                  _block(vlm_qwen, cls = Scaled), _block(lm_qwen, experts = 512, top_k = 10),
+                  _block(vlm_qwen, experts = 512, top_k = 10, cls = Scaled)):
         samples = _routing_samples(block)
         base = type(block)
         with fusion.fused_moe_router(block):
@@ -632,9 +634,9 @@ def _routed(block):
         yield
 
 
-def _expert_block(native, quantization, dtype):
+def _expert_block(native, quantization, dtype, widths = (512, 512)):
     mx.random.seed(23)
-    args = SimpleNamespace(hidden_size = 512, moe_intermediate_size = 512, num_experts = 32, num_experts_per_tok = 8,
+    args = SimpleNamespace(hidden_size = widths[0], moe_intermediate_size = widths[1], num_experts = 32, num_experts_per_tok = 8,
                            shared_expert_intermediate_size = 512, norm_topk_prob = True)
     block = (vlm_qwen.Qwen3_5MoeSparseMoeBlock if native is vlm_qwen else lm_qwen.Qwen3NextSparseMoeBlock)(args)
     block.set_dtype(dtype)
@@ -648,11 +650,16 @@ def _expert_block(native, quantization, dtype):
 
 @pytest.mark.parametrize("native", [vlm_qwen, lm_qwen])
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("quantization", [(8, "affine", 64), (4, "affine", 32), (4, "mxfp4", 32), (4, "nvfp4", 16)])
-def test_routed_experts_run_on_the_decode_kernels_bitwise(native, dtype, quantization, monkeypatch):
-    block = _expert_block(native, quantization, dtype)
+# (hidden, expert) widths: MLX runs qmv for a K its bit width's qmv_fast step does not divide (512 at 4 bits, 256 at 8),
+# here the down projection, gate/up, both, and neither at 8 bits.
+@pytest.mark.parametrize("quantization, widths", [((8, "affine", 64), (512, 512)), ((4, "affine", 32), (512, 512)), ((4, "mxfp4", 32), (512, 512)),
+                                                  ((4, "nvfp4", 16), (512, 512)), ((4, "affine", 32), (512, 640)), ((4, "affine", 32), (640, 512)),
+                                                  ((8, "affine", 32), (640, 640)), ((6, "affine", 32), (640, 640)), ((2, "affine", 32), (640, 640)),
+                                                  ((8, "affine", 64), (768, 768))])
+def test_routed_experts_run_on_the_decode_kernels_bitwise(native, dtype, quantization, widths, monkeypatch):
+    block = _expert_block(native, quantization, dtype, widths)
     # decode rows, the last row alone, and the first sorted width, whose 64 routes stay native
-    xs = [mx.random.normal((rows, 1, 512)).astype(dtype) for rows in (1, 7, 8)]
+    xs = [mx.random.normal((rows, 1, widths[0])).astype(dtype) for rows in (1, 7, 8)]
     xs.insert(2, xs[1][6:])
     expected = [block(x) for x in xs]
     gathers = _counting_gather_qmm(monkeypatch)
@@ -675,17 +682,19 @@ def test_verify_blocks_run_their_routed_experts_on_the_decode_kernels_bitwise(mo
     block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
     xs = [mx.random.normal(shape).astype(mx.bfloat16) for shape in ((2, 5, 512), (1, 9, 512))]
     expected = [native()._feed_forward(block, x) for x in xs]
-    verifier = fusion._exact_verify_class(native, *(vars(native)[name] for name in fusion._VERIFY_METHODS))()
+    verifier = fusion._exact_verify_class(native, "verify", True, *(vars(native).get(name) for name in fusion._VERIFY_METHODS))()
     monkeypatch.setattr(fusion, "_VERIFY_VERDICTS", {})
-    gathers = _counting_gather_qmm(monkeypatch)
+    gathers, partitions = _counting_gather_qmm(monkeypatch), _counting_argpartition(monkeypatch)
     with fusion.fused_moe_routed_experts(block):
         for serving in (False, True):
             monkeypatch.setattr(fusion._VERIFY_STATE, "serving", serving, raising = False)
             for x, out in zip(xs, expected):
                 mx.eval(verifier._feed_forward(block, x))  # a served shape's first block is compared and returned native
                 gathers.clear()
+                partitions.clear()
                 _identical(verifier._feed_forward(block, x), out)
                 assert len(gathers) == (1 if serving else 4)  # mlx-vlm gathers for the shared gate, then per expert projection
+                assert bool(partitions) is not serving  # served blocks route in the fused router's launch
         assert len(fusion._VERIFY_VERDICTS) >= 2 and all(fusion._VERIFY_VERDICTS.values())
         block.switch_mlp.down_proj.unfreeze()
         gathers.clear()
@@ -896,7 +905,7 @@ def _unpinned_call(self, x):
 @pytest.mark.parametrize("reason", ["training", "top_k", "experts", "few_experts", "unpinned", "sharded", "no_kernel", "distributed"])
 def test_ineligible_modules_keep_native(reason, monkeypatch):
     module = (_router(vlm_gemma, experts = 4, top_k = 2) if reason == "few_experts"
-              else _block(lm_qwen, experts = 288 if reason == "experts" else 256, top_k = 10 if reason == "top_k" else 8))
+              else _block(lm_qwen, experts = 1056 if reason == "experts" else 256, top_k = 17 if reason == "top_k" else 8))
     base = type(module)
     if reason == "training":
         module.train()

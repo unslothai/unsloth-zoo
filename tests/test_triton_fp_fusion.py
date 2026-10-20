@@ -147,7 +147,7 @@ def exercise(device = "cuda"):
         "moe_grouped_fp16._grouped_wgrad_kernel": mg._grouped_wgrad_kernel,
     }
     if gcc._kernels is not None:
-        kernels["gdn_causal_conv1d.fwd"], kernels["gdn_causal_conv1d.bwd"] = gcc._kernels
+        kernels["gdn_causal_conv1d.fwd"], (kernels["gdn_causal_conv1d.bwd_g"], kernels["gdn_causal_conv1d.bwd_dxdw"]) = gcc._kernels
     meta = {name: _compiled_options(k) for name, k in kernels.items()}
     return out, {name: v for name, v in meta.items() if v}
 
@@ -193,7 +193,7 @@ def test_compiled_kernels_keep_fp_fusion(tmp_path, default):
     line = [l for l in proc.stdout.splitlines() if l.startswith("A1META ")]
     assert proc.returncode == 0 and line, proc.stdout[-3000:] + proc.stderr[-6000:]
     meta = json.loads(line[-1][len("A1META ") :])
-    expected = ["gdn_causal_conv1d.fwd", "gdn_causal_conv1d.bwd"]
+    expected = ["gdn_causal_conv1d.fwd", "gdn_causal_conv1d.bwd_g", "gdn_causal_conv1d.bwd_dxdw"]
     if _triton_at_least(3, 3):
         expected += ["moe_grouped_fp16._grouped_gemm_kernel", "moe_grouped_fp16._grouped_wgrad_kernel"]
     if _has_bf16():

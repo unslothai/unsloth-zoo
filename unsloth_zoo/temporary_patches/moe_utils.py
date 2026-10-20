@@ -1262,6 +1262,8 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
         ids = experts[i : i + chunk]
         row_lo = ends[ids[0]] - counts[ids[0]]
         row_hi = ends[ids[-1]]
+        if row_hi == row_lo:
+            continue   # chunked without selective: no token routed to any of these experts
         contiguous = ids[-1] - ids[0] + 1 == len(ids)
         chunks.append((
             slice(ids[0], ids[-1] + 1) if contiguous else torch.tensor(ids, dtype = torch.int64, device = device),
@@ -1269,6 +1271,8 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
             row_hi,
             torch.tensor([ends[e] - row_lo for e in ids], dtype = torch.int32, device = device),
         ))
+    if not chunks:
+        return None
     SELECTIVE_DEQUANT_STATS["plans"] += 1
     return _SelectiveDequantPlan(E, num_rows, chunks)
 
@@ -1738,15 +1742,24 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     (re-registers hooks, unnecessary for read-only temp tensors). Used by the
     FP8 and bnb4bit MoE dispatchers.
     """
-    original_gate_up = experts_module.gate_up_proj
-    original_down = experts_module.down_proj
+    # object.__setattr__ writes the instance __dict__, which shadows `_parameters`. Restore by
+    # removing those entries again rather than writing the original Parameter into __dict__: a
+    # Parameter left there hides every later `_parameters[name] = ...` swap, e.g. FSDP2 installing
+    # its sharded / all-gathered parameter around each forward, so the next call would read a
+    # stale, freed all-gather buffer.
+    instance_dict = experts_module.__dict__
+    missing = object()
+    saved = {name: instance_dict.get(name, missing) for name in ("gate_up_proj", "down_proj")}
     object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
     object.__setattr__(experts_module, "down_proj", down_proj)
     try:
         return forward_fn(experts_module, *args)
     finally:
-        object.__setattr__(experts_module, "gate_up_proj", original_gate_up)
-        object.__setattr__(experts_module, "down_proj", original_down)
+        for name, value in saved.items():
+            if value is missing:
+                instance_dict.pop(name, None)
+            else:
+                instance_dict[name] = value
 
 
 def forward_moe_backend(

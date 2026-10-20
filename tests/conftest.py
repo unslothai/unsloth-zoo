@@ -417,3 +417,147 @@ def pytest_runtest_teardown(item, nextitem):
             f"monkeypatch.setitem(sys.modules, ...), which restores on teardown, or"
             f"save and restore the entry by hand where the import itself installs it."
         )
+
+
+# Where real mlx is installed, it and the torch-backed shim would share one sys.modules,
+# so a session's results depended on which test modules it collected
+# (unslothai/unsloth#8138). Each test module runs under the mlx modules it was imported
+# with, as in a process of its own, and the session's come back after it. Inert without
+# real mlx.
+_PLATFORM_ATTRS = ("system", "machine", "_orig_system_for_mlx_shim", "_orig_machine_for_mlx_shim")
+_MISSING = object()
+
+
+def _in_mlx_world(name):
+    top, _, rest = name.partition(".")
+    if top in ("mlx", "mlx_lm", "mlx_vlm", "mlx_simulation") or name == "unsloth_zoo.gated_delta_vjp":
+        return True
+    return top in ("unsloth", "unsloth_zoo") and "mlx" in rest
+
+
+def _is_shim(obj):
+    if not isinstance(obj, types.ModuleType):
+        return type(obj).__module__.startswith("mlx_simulation.")
+    return "mlx_simulation" in f"{obj.__name__} {getattr(obj, '__file__', '') or ''}"
+
+
+class _RealMlxKeeper:
+    """Hands back the real-mlx modules a world hid instead of importing them again: a
+    second mlx.core import aborts the interpreter (nanobind refuses to register its
+    types twice), and a second unsloth_zoo.mlx.utils patches mlx_vlm classes the first
+    one already patched. Never under the shim, which gets copies of its own."""
+
+    def __init__(self):
+        self.modules = {}
+
+    def find_spec(self, name, path = None, target = None):
+        if name not in self.modules or _is_shim(sys.modules.get("mlx.core")):
+            return None
+        return importlib.util.spec_from_loader(name, self)
+
+    def create_module(self, spec):
+        return self.modules[spec.name][0]
+
+    def exec_module(self, module):
+        module.__spec__ = self.modules[module.__name__][1]
+
+
+class _MlxModuleWorlds:
+    def __init__(self):
+        self.keeper = _RealMlxKeeper()
+        sys.meta_path.insert(0, self.keeper)
+        self.base = self._capture()
+        self.worlds = {}
+        self.active = None
+
+    def _capture(self):
+        import platform
+
+        return {
+            "modules": {n: m for n, m in sys.modules.items() if _in_mlx_world(n)},
+            "finders": [f for f in sys.meta_path if _is_shim(f)],
+            "platform": {a: getattr(platform, a, _MISSING) for a in _PLATFORM_ATTRS},
+        }
+
+    def _install(self, world):
+        import platform
+
+        if not _is_shim(sys.modules.get("mlx.core")):
+            for name, module in list(sys.modules.items()):
+                if _in_mlx_world(name) and module is not None and not _is_shim(module):
+                    self.keeper.modules.setdefault(name, (module, module.__spec__))
+        current = [n for n in sys.modules if _in_mlx_world(n)]
+        for name in current:
+            del sys.modules[name]
+        sys.modules.update(world["modules"])
+        simulated = _is_shim(sys.modules.get("mlx.core"))
+        # Parent attributes too, or `import a.b as m` and `from a.b import x` see two copies.
+        for name in sorted(set(current) | set(world["modules"]), key = lambda n: n.count(".")):
+            parent_name, _, child = name.rpartition(".")
+            parent = sys.modules.get(parent_name)
+            if parent is None:
+                continue
+            if name in sys.modules:
+                setattr(parent, child, sys.modules[name])
+            elif name in self.keeper.modules and not simulated:
+                setattr(parent, child, self.keeper.modules[name][0])
+            elif child in vars(parent):
+                delattr(parent, child)
+        sys.meta_path[:] = world["finders"] + [f for f in sys.meta_path if not _is_shim(f)]
+        for attr, value in world["platform"].items():
+            if value is not _MISSING:
+                setattr(platform, attr, value)
+            elif hasattr(platform, attr):
+                delattr(platform, attr)
+
+    def _world_for(self, module, world):
+        """A module that never installs the shim also sees every real mlx, mlx_lm and mlx_vlm
+        module loaded so far: zoo caches what it finds in sys.modules (_resolved_bindings),
+        so hiding them there decides differently from the real session."""
+        try:
+            installs_shim = "simulate_mlx_on_torch(" in module.path.read_text(encoding = "utf-8")
+        except (AttributeError, OSError):
+            installs_shim = True
+        if installs_shim:
+            return world
+        shared = {
+            name: kept for name, (kept, _) in self.keeper.modules.items()
+            if name.partition(".")[0] in ("mlx", "mlx_lm", "mlx_vlm")
+        }
+        return {**world, "modules": {**shared, **world["modules"]}}
+
+    @_pytest.hookimpl(hookwrapper = True)
+    def pytest_make_collect_report(self, collector):
+        if not isinstance(collector, _pytest.Module):
+            yield
+            return
+        self._install(self._world_for(collector, self.base))
+        try:
+            yield
+        finally:
+            self.worlds[collector.nodeid] = self._capture()
+            self._install(self.base)
+
+    @_pytest.hookimpl(tryfirst = True)
+    def pytest_runtest_setup(self, item):
+        module = item.getparent(_pytest.Module)
+        key = module.nodeid if module is not None else None
+        if key != self.active:
+            self._install(self._world_for(module, self.worlds.get(key, self.base)))
+            self.active = key
+
+    @_pytest.hookimpl(trylast = True)
+    def pytest_runtest_teardown(self, item, nextitem):
+        # trylast: after module-scoped fixtures are finalised (see the leak guard above).
+        if nextitem is None or nextitem.getparent(_pytest.Module) is not item.getparent(_pytest.Module):
+            # Kept for a later visit (interleaved node IDs): a session fixture that installed
+            # the shim here will not run again.
+            if self.active is not None:
+                self.worlds[self.active] = self._capture()
+            self._install(self.base)
+            self.active = None
+
+
+def pytest_configure(config):
+    if importlib.util.find_spec("mlx") is not None:
+        config.pluginmanager.register(_MlxModuleWorlds(), "unsloth-mlx-module-worlds")
