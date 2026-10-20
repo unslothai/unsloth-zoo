@@ -98,16 +98,31 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
 
+    # Dense masks up to this many elements (bool bytes) are built eagerly when the compiled
+    # builder cannot be trusted; above it the compiled builder keeps memory O(blocks).
+    _EAGER_BLOCK_MASK_MAX_ELEMENTS = 1 << 27
+
+    def _compile_block_mask(bsz, head, M, N):
+        """False when a sequence fits one sparse block and the dense mask is small. torch 2.10's
+        dynamic create_block_mask graph miscompiles that case: its block count reductions run
+        R0_BLOCK = 2 unmasked over one block, so kv_num_blocks / q_num_blocks come out 2 instead
+        of 1 and read one int32 past the buffer (illegal memory access on gpt-oss training)."""
+        if M > FLEX_ATTENTION_BLOCK_SIZE and N > FLEX_ATTENTION_BLOCK_SIZE:
+            return True
+        return (bsz or 1) * (head or 1) * M * N > _EAGER_BLOCK_MASK_MAX_ELEMENTS
+
     def compiled_create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         # See https://github.com/meta-pytorch/attention-gym/issues/15#issuecomment-2284148665
         # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
-        return _create_block_mask(mask_mod, None, None, M, N, device = device, _compile = True)
+        return _create_block_mask(mask_mod, None, None, M, N, device = device,
+                                  _compile = _compile_block_mask(None, None, M, N))
 
     def compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
-        return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = True)
+        return _create_block_mask(mask_mod, bsz, head, M, N, device = device,
+                                  _compile = _compile_block_mask(bsz, head, M, N))
 
     # Block masks for stateless mask_mods (causal / sliding window) only depend on the
     # mask_mod and shapes, so every layer, pass and checkpoint replay can share one.
