@@ -821,13 +821,14 @@ def _available(device, dtype, tiles):
     mode = os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto")
     if mode in ("0", "dequant"):
         return False
-    key = (None if device is None else str(device), dtype)
+    # Keyed by the resolved GPU, so an unindexed device cannot reuse another GPU's answer.
+    name = None if device is None else str(device)
+    if name in (None, "cuda") and torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+        name = str(device)
+    key = (name, dtype)
     if tiles and mode != "1":
         # Below sm_80 (T4) the tile kernel loses to dequantize + cuBLAS; the grouped GEMV does not.
-        # Keyed by the resolved GPU, so an unindexed device cannot reuse another GPU's arch answer.
-        if key[0] in (None, "cuda") and torch.cuda.is_available():
-            device = torch.device("cuda", torch.cuda.current_device())
-            key = (str(device), dtype)
         key += ("tiles",)
     ok = _AVAILABLE_DTYPE.get(key)
     if ok is not None:

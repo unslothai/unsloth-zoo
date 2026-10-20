@@ -104,3 +104,19 @@ def test_no_cuda_answers_false_instead_of_raising(monkeypatch, device):
     monkeypatch.delenv("UNSLOTH_MXFP4_FUSED_GEMM", raising = False)
     assert not mg.mxfp4_gemm_available(device, torch.bfloat16)
     assert not mg.mxfp4_grouped_gemv_available(device, torch.bfloat16)
+
+
+@pytest.mark.parametrize("device", [None, "cuda"])
+def test_unindexed_device_resolves_the_current_gpu_for_the_gemv_probe(monkeypatch, device):
+    # The self-check result of cuda:0 must not answer for cuda:1.
+    monkeypatch.setattr(mg, "_AVAILABLE_DTYPE", {
+        (str(torch.device("cuda", 0)), torch.float16): True,
+        (str(torch.device("cuda", 1)), torch.float16): False,
+    })
+    current = [0]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.delenv("UNSLOTH_MXFP4_FUSED_GEMM", raising = False)
+    assert mg.mxfp4_grouped_gemv_available(device, torch.float16)
+    current[0] = 1
+    assert not mg.mxfp4_grouped_gemv_available(device, torch.float16)
