@@ -34,7 +34,8 @@ import torch
 from .moe_routed import (
     ACT_GPTOSS,
     ROUTED_MAX_SLOTS,
-    routed_16bit_supported,
+    _bf16_supported,
+    sub_sm80_devices,
     _lora_delta,
     routed_bf16_gemm,
     routed_bf16_moe,
@@ -447,8 +448,11 @@ def routed_bf16_eligible(experts, hidden_states):
         # fp32 weights would hit tl.dot's TF32 path; bf16 needs hardware support (not T4).
         if not isinstance(w, torch.Tensor) or w.dim() != 3 or w.dtype not in (torch.bfloat16, torch.float16):
             return False
-    # Below sm80 (T4) the kernels lose to grouped_mm in fp16 too.
-    return routed_16bit_supported(w.device)
+        if w.dtype == torch.bfloat16 and not _bf16_supported(w.device):
+            return False
+    # Below sm80 (T4) only one-token decode routes (moe_routed.sub_sm80_devices).
+    sub = sub_sm80_devices()
+    return not sub or w.device.index not in sub or hidden_states.numel() == hidden_states.shape[-1]
 
 
 def routed_bf16_forward(experts, hidden_states, router_indices, routing_weights):

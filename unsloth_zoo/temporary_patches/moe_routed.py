@@ -1523,17 +1523,26 @@ def _bf16_supported(device):
     return _bf16_supported_index(device.index if device.index is not None else torch.cuda.current_device())
 
 
-# torch.device -> sm80+: one dict hit per decode call (the 16-bit routed kernels lose to grouped_mm below sm80).
-_ROUTED_16BIT_BY_DEVICE = {}
+# Below sm80 (T4) the 16-bit routed kernels only pay off for one-token decode: measured on T4 fp16 they are
+# 4-9x slower than grouped_mm from 4 tokens (32 slots) up, while at one token grouped_mm's host syncs cost
+# more end to end (Qwen3-MoE shapes 55 vs 43 tok/s). Visible CUDA devices below sm80, built once.
+_SUB_SM80_DEVICES = None
+
+
+def sub_sm80_devices():
+    global _SUB_SM80_DEVICES
+    if _SUB_SM80_DEVICES is None:
+        _SUB_SM80_DEVICES = frozenset(
+            i for i in range(torch.cuda.device_count()) if torch.cuda.get_device_capability(i)[0] < 8
+        )
+    return _SUB_SM80_DEVICES
 
 
 def routed_16bit_supported(device):
-    ok = _ROUTED_16BIT_BY_DEVICE.get(device)
-    if ok is None:
-        ok = _bf16_supported(device)
-        if device.index is not None:  # a bare "cuda" follows the current device
-            _ROUTED_16BIT_BY_DEVICE[device] = ok
-    return ok
+    sub = sub_sm80_devices()
+    if not sub:
+        return True
+    return (device.index if device.index is not None else torch.cuda.current_device()) not in sub
 
 
 def _bf16_plan(experts, gu, dn, hidden_dim):
@@ -1541,8 +1550,7 @@ def _bf16_plan(experts, gu, dn, hidden_dim):
         return None
     if getattr(gu, "quant_state", None) is not None or gu.dtype not in (torch.bfloat16, torch.float16) or dn.dtype != gu.dtype:
         return None
-    # Below sm80 (T4) the 16-bit routed kernels lose to grouped_mm in fp16 too (4.9-7.8x at decode sizes).
-    if not gu.is_cuda or not routed_16bit_supported(gu.device):
+    if not gu.is_cuda or (gu.dtype == torch.bfloat16 and not _bf16_supported(gu.device)):
         return None
     if getattr(experts, "is_transposed", False) or not getattr(experts, "has_gate", True):
         return None
@@ -1557,7 +1565,8 @@ def _bf16_plan(experts, gu, dn, hidden_dim):
     dn_shape = tuple(dn.shape) if dn_in else (dn.shape[0], dn.shape[2], dn.shape[1])
     if gu_shape[1] != hidden_dim or dn_shape[2] != hidden_dim or gu_shape[2] != 2 * dn_shape[1]:
         return None
-    return gu_in, dn_in, act, bool(_gate_up_interleaved(experts))
+    # Last: one-token calls only (below sm80, see sub_sm80_devices).
+    return gu_in, dn_in, act, bool(_gate_up_interleaved(experts)), not routed_16bit_supported(gu.device)
 
 
 def _bf16_views(experts, hidden_dim):
@@ -1584,10 +1593,10 @@ def _bf16_views(experts, hidden_dim):
             experts.__dict__["_unsloth_routed_bf16"] = (key, plan, sem)
     if plan is None:
         return None
-    gu_in, dn_in, act, interleaved = plan
+    gu_in, dn_in, act, interleaved, one_token = plan
     w_gu = gu if gu_in else gu.transpose(1, 2)
     w_dn = dn if dn_in else dn.transpose(1, 2)
-    return w_gu, w_dn, act, interleaved
+    return w_gu, w_dn, act, interleaved, one_token
 
 
 def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
@@ -1621,7 +1630,7 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
         if mode == "grouped":
             return None
         views = _bf16_views(experts, hidden_dim)
-        if views is None or top_k_index.numel() > BF16_MAX_SLOTS:
+        if views is None or top_k_index.numel() > BF16_MAX_SLOTS or (views[4] and top_k_index.shape[0] > 1):
             return None
     lora = _stash_lora(experts)
     if lora is False:
@@ -1650,7 +1659,7 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
             return None
         out = fn(state, x, top_k_index, rw, top_k, gu_lora, dn_lora, out_dtype)
     else:
-        w_gu, w_dn, act, interleaved = views
+        w_gu, w_dn, act, interleaved, _ = views
         biases = (getattr(experts, "gate_up_proj_bias", None), getattr(experts, "down_proj_bias", None))
         for b, n in zip(biases, (I2, hidden_dim)):
             # The kernel reads bias[e] + n: rows of a contiguous [E, N] tensor only.

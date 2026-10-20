@@ -27,13 +27,13 @@ DEV = "cuda"
 DT = getattr(torch, os.environ.get("UNSLOTH_TEST_DTYPE", "")) if os.environ.get("UNSLOTH_TEST_DTYPE") else (
     torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16)
 E, H, I = 8, 256, 192
-# The 16-bit routed kernels are sm80+ only (they lose to grouped_mm on T4, fp16 too): below that the hook declines.
+# Below sm80 (T4) the 16-bit routed kernels take one-token decode only (they lose to grouped_mm above that).
 ROUTED_16BIT = torch.cuda.get_device_capability()[0] >= 8
 
 
 def _needs_16bit_routing():
     if not ROUTED_16BIT:
-        pytest.skip("16-bit routed decode runs on sm80+ only (test_routed_decode_arch_gates.py covers the decline)")
+        pytest.skip("below sm80 16-bit routed decode is one-token only (test_routed_decode_arch_gates.py covers it)")
 
 
 @pytest.fixture(autouse = True)

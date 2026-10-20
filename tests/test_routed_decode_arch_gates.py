@@ -16,8 +16,9 @@
 
 """Per-arch decode routing: which kernel a T4 (sm75) and sm80+ cards take, with the capability faked.
 
-Measured on Colab T4 fp16 (torch 2.10 and 2.14): the 16-bit routed MoE kernels are 2.5-7.8x slower than the
-grouped_mm path they replace, so sm75 declines them; stacked NF4 routing still wins or ties there and stays.
+Measured on Colab T4 fp16 (torch 2.10 and 2.14): from 4 decode tokens up the 16-bit routed MoE kernels are 4-9x
+slower than the grouped_mm path they replace, so sm75 routes one-token decode only (there grouped_mm's host syncs
+cost more end to end); stacked NF4 routing wins or ties at every routed size and keeps its sm80+ limits.
 """
 
 import os
@@ -45,10 +46,9 @@ def fake_cap(monkeypatch):
     def set_cap(cap):
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: cap)
         MR._bf16_supported_index.cache_clear()
-        getattr(MR, "_ROUTED_16BIT_BY_DEVICE", {}).clear()
+        monkeypatch.setattr(MR, "_SUB_SM80_DEVICES", None, raising = False)
     yield set_cap
     MR._bf16_supported_index.cache_clear()
-    getattr(MR, "_ROUTED_16BIT_BY_DEVICE", {}).clear()
 
 
 def _dtypes():
@@ -91,7 +91,7 @@ def _route(T, dtype):
 @pytest.mark.parametrize("cap", CAPS, ids = lambda c: "sm%d%d" % c)
 @pytest.mark.parametrize("dtype", _dtypes(), ids = str)
 @pytest.mark.parametrize("T", [1, 4])
-def test_16bit_routed_moe_runs_only_on_sm80_plus(cap, dtype, T, fake_cap, monkeypatch):
+def test_16bit_routed_moe_t4_routes_one_token_only(cap, dtype, T, fake_cap, monkeypatch):
     fake_cap(cap)
     monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
     calls = []
@@ -101,19 +101,21 @@ def test_16bit_routed_moe_runs_only_on_sm80_plus(cap, dtype, T, fake_cap, monkey
     x, idx, w = _route(T, dtype)
     with torch.no_grad():
         out = MR.routed_moe_forward(ex, x, idx, w)
-    routed = cap[0] >= 8
+    # bf16 never routes below sm80 (no bf16 tensor cores); fp16 routes one-token decode there.
+    routed = cap[0] >= 8 or (T == 1 and dtype == torch.float16)
     assert (out is not None) == routed, f"sm{cap[0]}{cap[1]} {dtype}: routed={out is not None}, want {routed}"
     assert bool(calls) == routed
 
 
 @pytest.mark.parametrize("cap", CAPS, ids = lambda c: "sm%d%d" % c)
 @pytest.mark.parametrize("dtype", _dtypes(), ids = str)
-def test_gpt_oss_16bit_routed_eligible_only_on_sm80_plus(cap, dtype, fake_cap):
+@pytest.mark.parametrize("T", [1, 4])
+def test_gpt_oss_16bit_routed_eligible_t4_one_token_only(cap, dtype, T, fake_cap):
     fake_cap(cap)
     ex = GptOssExperts(dtype).eval()
-    x = torch.randn(1, 1, H, dtype = dtype, device = "cuda")
+    x = torch.randn(1, T, H, dtype = dtype, device = "cuda")
     with torch.no_grad():
-        assert GR.routed_bf16_eligible(ex, x) == (cap[0] >= 8)
+        assert GR.routed_bf16_eligible(ex, x) == (cap[0] >= 8 or (T == 1 and dtype == torch.float16))
 
 
 @pytest.mark.parametrize("cap", [(7, 5), (8, 0), (10, 0)], ids = lambda c: "sm%d%d" % c)

@@ -28,10 +28,10 @@ DT = getattr(torch, os.environ.get("UNSLOTH_TEST_DTYPE", "")) if os.environ.get(
     torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16)
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-# The 16-bit routed kernels are sm80+ only (they lose to grouped_mm on T4, fp16 too): below that nothing is eligible.
+# Below sm80 (T4) the 16-bit routed kernels take one-token decode only (they lose to grouped_mm above that).
 needs_16bit_routing = pytest.mark.skipif(
     not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8),
-    reason = "16-bit routed decode runs on sm80+ only (test_routed_decode_arch_gates.py covers the decline)",
+    reason = "below sm80 16-bit routed decode is one-token only (test_routed_decode_arch_gates.py covers it)",
 )
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "Triton kernels need CUDA")
 
