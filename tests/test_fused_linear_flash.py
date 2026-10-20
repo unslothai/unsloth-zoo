@@ -34,6 +34,7 @@ def _flash_on(monkeypatch):
     if not fl._logits_mode(torch.device("cuda"), torch.float16)[0]:
         pytest.skip("needs fp32-output GEMMs (torch >= 2.8)")
     monkeypatch.setattr(fl, "_FLASH", True)
+    monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", 0)
     yield
     broken = set(fl._TRITON_BROKEN)
     fl._TRITON_BROKEN.clear()
@@ -207,6 +208,7 @@ def test_flash_transient_is_one_vocab_tile(monkeypatch):
         real(self, rows, n_cols, *a, **k)
 
     monkeypatch.setattr(fl._Buffers, "__init__", record)
+    monkeypatch.setattr(fl, "_FWD_TILE_COLS", 16384)
     h, w, _, t, _ = _inputs(_dtypes()[-1], 64, 64, 70001, seed = 5)
     _frozen(h, w, t, torch.ones(64, device = "cuda", dtype = torch.float64))
     assert shapes and all(cols <= max(fl._FWD_TILE_COLS, fl._SPLIT_COLS) for _, cols in shapes), shapes
@@ -238,3 +240,18 @@ def test_flash_fullgraph_compile_no_breaks(kind):
     assert torch.equal(hc.grad, he.grad)
     assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
     assert cnt.frame_count == 1
+
+
+def test_below_min_rows_frozen_and_no_grad_stay_chunked_and_identical(monkeypatch):
+    # The default keeps small batches on the [rows, V] chunks (faster there on G4 / A100); both passes decide alike.
+    monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", 4096)
+    h, w, _, t, mask = _inputs(_dtypes()[-1], 300, 64, 40001, seed = 7)
+    n, tiled = fl.CALLS["flash"], fl.CALLS["tiled"]
+    with torch.no_grad():
+        ref = fused_linear_logprobs(h, w, t, mask = mask)
+    lp, _ = _frozen(h, w, t, torch.ones(300, device = "cuda", dtype = torch.float64), mask = mask)
+    assert fl.CALLS["flash"] == n and fl.CALLS["tiled"] == tiled
+    assert torch.equal(lp, ref)
+    monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", int(mask.sum()))
+    lp, _ = _frozen(h, w, t, torch.ones(300, device = "cuda", dtype = torch.float64), mask = mask)
+    assert fl.CALLS["flash"] == n + 1
