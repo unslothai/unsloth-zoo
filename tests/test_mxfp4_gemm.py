@@ -215,8 +215,10 @@ def test_custom_op_compiles_without_graph_breaks():
 
 
 def test_stacked_experts_calling_convention():
-    from unsloth_zoo.mxfp4_gemm import mxfp4_gemm_available, mxfp4_grouped_matmul, mxfp4_grouped_mm
-    assert mxfp4_gemm_available(torch.device("cuda")) and not mxfp4_gemm_available(dtype = torch.float32)
+    from unsloth_zoo.mxfp4_gemm import mxfp4_gemm_available, mxfp4_grouped_gemv_available, mxfp4_grouped_matmul, mxfp4_grouped_mm
+    # sm_75 verifies the kernel but leaves it to decode rows (tile kernel too slow there).
+    assert mxfp4_grouped_gemv_available(torch.device("cuda")) and not mxfp4_gemm_available(dtype = torch.float32)
+    assert mxfp4_gemm_available(torch.device("cuda")) is (torch.cuda.get_device_capability() >= (8, 0))
     blocks, scales = _stack(3, 128, 64, seed = 4)
     counts = torch.tensor([3, 0, 5], dtype = torch.int64, device = "cuda")
     x = torch.randn(8, 64, dtype = torch.bfloat16, device = "cuda")
@@ -257,8 +259,8 @@ def test_single_weight_decode_is_bit_exact_for_every_scale(asm, monkeypatch):
 @pytest.mark.parametrize("rows", [1, 8, 33, 64, 130])
 @pytest.mark.parametrize("trans", [False, True])
 def test_single_weight_matmul_matches_dequantize_then_matmul(rows, trans, dtype):
-    from unsloth_zoo.mxfp4_gemm import mxfp4_gemm_available, mxfp4_matmul
-    assert mxfp4_gemm_available(torch.device("cuda"), dtype)
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_gemv_available, mxfp4_matmul
+    assert mxfp4_grouped_gemv_available(torch.device("cuda"), dtype)
     N, K = 320, 256
     blocks, scales = _single(N, K, seed = rows + trans)
     w = mxfp4_dequantize_torch(blocks, scales, dtype = torch.float32)
