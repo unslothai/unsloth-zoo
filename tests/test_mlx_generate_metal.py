@@ -1823,6 +1823,23 @@ def _first_use_checks():
         with I.dense_prefill_linear(model):
             return model(rows(1, 2048, 512))
 
+    class TapedCache:
+        history_capacity = 3
+
+        def __getitem__(self, index):
+            return mx.zeros((1, 2))
+
+        def update_recurrent(self, index, length, update):
+            return update(None, length)
+
+    def tape():
+        with_states = lambda *args, mask = None, use_kernel = True, state_steps = None: (rows(1, 3, 2), rows(1, 2), rows(1, 3, 2))
+        I._VERIFY_STATE.tapes = []
+        try:
+            return I._taped_update(None, with_states)(*(rows(1, 3, 1, 2) for _ in range(7)), cache = TapedCache())
+        finally:
+            del I._VERIFY_STATE.tapes
+
     return {
         "add_norm": (lambda: I._add_norm_verified(mx.bfloat16, 256), "_ADD_NORM_VERDICTS"),
         "router": (lambda: I._moe_router_verified(mx.bfloat16, mx.float32, 64, 4, I._QWEN_ROUTING, True), None),
@@ -1831,12 +1848,13 @@ def _first_use_checks():
         "gated_delta": (lambda: I._packed_gated_delta_route(gated_delta_kernel, [])(*delta), "_GATED_DELTA_VERDICTS"),
         "verify": (lambda: I._verify_admitted("key", lambda: rows(2, 4), lambda: rows(2, 4)), "_VERIFY_VERDICTS"),
         "dense": (dense, "_DENSE_QMM_VERIFIED"),
+        "tape": (tape, "_TAPE_VERDICTS"),
     }
 
 
 @real_mlx_only
 @metal_only
-@pytest.mark.parametrize("site", ["add_norm", "router", "router_shared", "combine", "gated_delta", "verify", "dense"])
+@pytest.mark.parametrize("site", ["add_norm", "router", "router_shared", "combine", "gated_delta", "verify", "dense", "tape"])
 def test_a_first_use_mismatch_from_a_failed_command_buffer_raises_instead_of_recording(monkeypatch, site):
     from unsloth_zoo.mlx import inference
 

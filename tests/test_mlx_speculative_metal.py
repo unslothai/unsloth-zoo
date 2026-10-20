@@ -9,6 +9,7 @@
 # into a different convergence basin (probe 31 = 67% vs probe 33-37 = 40-53%,
 # see danielhanchen/unsloth-staging-2).
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -462,6 +463,11 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
             patch.setattr(native, name, lambda self, *args: None)
             with inference.exact_speculative_verify(model):
                 assert type(verifier) is native
+    # A drifted attention body leaves only the attention route native.
+    with monkeypatch.context() as patch:
+        patch.setattr(native, "_attention", lambda self, *args: None)
+        with inference.exact_speculative_verify(model):
+            assert type(verifier) is not native and "_attention" not in vars(type(verifier))
 
 
 def _verify_call(lm, cache, block):
@@ -512,9 +518,11 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         # A replay that does not reproduce stock keeps that key on stock.
         inference._TAPE_VERDICTS.clear()
         monkeypatch.setattr(inference, "_replay_matches", lambda *args: False)
+        work = inference.first_use_work()
         _verified(lm, cache, block, 0)
         run, out = _verify_call(lm, cache, block)
         assert "_unsloth_tapes" not in vars(out.gdn_states) and list(inference._TAPE_VERDICTS.values()) == [False]
+        assert inference.first_use_work() > work
         out.gdn_states.commit(keeps[0])
         assert _same(native[0], _state(out, run))
 
@@ -603,17 +611,21 @@ def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ra
     ban = lambda history, logits: logits + mx.where(mx.arange(logits.shape[-1]) == 13, -1e9, 0)
 
     def run():
-        scores = []
+        scores, first_use, verified = [], [], []
         def scored(engine):
-            engine.logprobs, step = True, engine.step
+            engine.logprobs, step, record, verify = True, engine.step, engine.controller.record_round, engine._verify
             engine.step = lambda *args: (scores.append(out.logprobs) or out for out in step(*args))
+            engine.controller.record_round = lambda *args, **kwargs: first_use.append(kwargs["first_use"]) or record(*args, **kwargs)
+            engine._verify = lambda inputs: (work := inference.first_use_work(), out := verify(inputs), verified.append(inference.first_use_work() != work))[1]
         out, drafted, _ = _run(model, [ids[0], ids[1], ids[0]], 96, _script(("copy", 16)), SamplingParams(), processors = {2: [ban]}, patch = scored)
-        return out, scores, drafted
-    closed, scores, drafted = run()
+        return out, scores, drafted, (first_use, verified)
+    closed, scores, drafted, _ = run()
     inference._VERIFY_VERDICTS.clear()
     with inference.exact_speculative_verify(model):
         opened = run()
     assert opened[:2] == (closed, scores) and any(scores) and drafted[0][1] > 8 and len({accepted for _, accepted in drafted.values()}) > 1
+    # Exactly the rounds whose verify ran a first-use check are flagged, so the controller leaves just those out of its costs.
+    assert opened[3][0] == opened[3][1] and any(opened[3][0]) and not all(opened[3][0])
     wide = [key for key, verdict in inference._VERIFY_VERDICTS.items() if key[0][0] == 3 and key[0][1] > 8 and verdict]
     # Each admitted key's replacement ran once for the comparison, then again for every later round it served.
     assert any(served.count(key) > 1 for key in wide)
@@ -683,6 +695,134 @@ def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qw
     assert not any("keys" in vars(entry) for entry in engine.cache)  # the commit's view of the QSA keys is gone
 
 
+@pytest.mark.parametrize("heads", [(24, 4), (16, 2), (8, 2)])
+def test_a_block_read_in_one_pass_over_the_kv_prefix_matches_one_row_sdpa_calls_bit_for_bit(heads, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    gqa = heads[0] // heads[1]
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_THREADS", {})
+    first, second = inference._exact_attention_kernels()
+    templates = set()
+    monkeypatch.setattr(inference, "_exact_attention_kernels", lambda: (lambda **kw: templates.add(tuple(kw["template"])) or first(**kw), second))
+    # Batched rows, a row count past one threadgroup's, and key counts on each side of MLX's block-count steps.
+    cases = ((1, 3, 5000, mx.bfloat16), (2, 5, 9000, mx.float16), (1, 8, 40000, mx.bfloat16), (1, 13, 70000, mx.bfloat16), (1, 4, 70000, mx.bfloat16))
+    for batch, width, keys, dtype in cases:
+        blocks = inference._sdpa_vector_blocks(gqa, keys - width + 1)
+        assert blocks == inference._sdpa_vector_blocks(gqa, keys)
+        # Cache-shaped: a capacity-padded buffer cut to `keys`, and queries transposed from (B, L, H, D).
+        k, v = (mx.random.normal((batch, heads[1], keys + 100, 256)).astype(dtype)[..., :keys, :] for _ in range(2))
+        q = (2 * mx.random.normal((batch, width, heads[0], 256))).astype(dtype).transpose(0, 2, 1, 3)
+        rows = mx.concatenate([mx.fast.scaled_dot_product_attention(
+            q[:, :, i : i + 1], k[:, :, : keys - width + i + 1], v[:, :, : keys - width + i + 1], scale = 0.0625)
+            for i in range(width)], axis = 2)
+        try:
+            out = inference._exact_attention_rows(q, k, v, 0.0625, blocks)
+            mx.eval(out)
+        except ValueError as error:
+            # A device whose limit refuses the widest threadgroup (M1-class GPUs) launches fewer row pairs per threadgroup.
+            assert inference._fit_threadgroup(error, dtype, gqa)
+            out = inference._exact_attention_rows(q, k, v, 0.0625, blocks)
+        assert mx.array_equal(out.view(mx.uint16), rows.view(mx.uint16)).item()
+        # One row pair per threadgroup, the narrowest any limit leaves, reads the same bits.
+        with monkeypatch.context() as patch:
+            patch.setitem(inference._EXACT_ATTENTION_THREADS, (dtype, gqa), 32 * gqa)
+            narrow = inference._exact_attention_rows(q, k, v, 0.0625, blocks)
+            assert mx.array_equal(narrow.view(mx.uint16), rows.view(mx.uint16)).item()
+    # One compile per layout serves every width: the row count is an input, not a template parameter.
+    assert templates == {(("T", dtype), ("D", 256), ("G", gqa), ("BLOCKS", inference._sdpa_vector_blocks(gqa, keys - width + 1)))
+                         for _, width, keys, dtype in cases}
+    monkeypatch.undo()
+    # Rows on both sides of a block-count step stay one-row calls, as do array masks, quantized caches and float32 rows.
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_MIN_KEYS", 0)
+    monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
+    monkeypatch.setattr(inference, "_exact_attention_faster", lambda per_row, fused: True)
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
+    blocks = lambda n: inference._sdpa_vector_blocks(gqa, n)
+    q, k = mx.zeros((1, heads[0], 4, 256), mx.bfloat16), mx.zeros((1, heads[1], 70000, 256), mx.bfloat16)
+    for n in (1024, 4096, 8192, 16384, 32768, 65536):
+        if blocks(n - 1) != blocks(n) or blocks(n) != blocks(n + 1):
+            assert inference._exact_attention(q, k[:, :, : n + 1], k[:, :, : n + 1], 0.0625, None, None, lambda: "rows") == "rows"
+    for args in ((q, k, k, 0.0625, None, mx.ones((1, 1, 4, k.shape[2]), mx.bool_)), (q, k, k, 0.0625, SimpleNamespace(bits = 8), None),
+                 (q.astype(mx.float32), k.astype(mx.float32), k.astype(mx.float32), 0.0625, None, None)):
+        assert inference._exact_attention(*args, lambda: "rows") == "rows"
+    assert isinstance(inference._exact_attention(q, k, k, 0.0625, None, None, lambda: q), mx.array) and inference._VERIFY_VERDICTS
+
+
+def test_exact_attention_engages_where_timed_faster_and_caches_each_bucket_verdict(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    timings, timed = [], inference._exact_attention_faster
+    faster = lambda per_row, fused: timings.append(per_row()) or timings[-1] in wins
+    monkeypatch.setattr(inference, "_exact_attention_faster", faster)
+    monkeypatch.setattr(inference, "_verify_admitted", lambda key, native, fused: "kernel")
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
+    q, k, wins = mx.zeros((1, 24, 4, 256), mx.bfloat16), mx.zeros((1, 4, 40000, 256), mx.bfloat16), {20000, 9500}
+    attend = lambda keys, rows = q: inference._exact_attention(rows, k[:, :, :keys], k[:, :, :keys], 0.0625, None, None, lambda: keys)
+    work = inference.first_use_work()
+    # Below the bottom limit nothing is timed; above it each power-of-two bucket is timed once, and its verdict holds for it alone.
+    assert [attend(n) for n in (5000, 9000, 12000, 20000, 30000, 40000, 10000)] == [5000, 9000, 12000, "kernel", "kernel", 40000, 10000]
+    assert timings == [9000, 20000, 40000] and inference.first_use_work() == work + 3
+    # Each width is timed apart, and a loss in a larger bucket leaves a smaller one to its own timing.
+    assert attend(40000, q[:, :, :3]) == 40000 and attend(9500, q[:, :, :3]) == "kernel" and timings == [9000, 20000, 40000, 40000, 9500]
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_RETRY", 1)
+    q5 = mx.zeros((1, 24, 5, 256), mx.bfloat16)
+    del timings[:]
+    seen = [(attend(9800, q5), len(timings)) for _ in range(20)]
+    assert {out for out, _ in seen} == {9800} and [n for _, n in seen] == [1, 1, 2, 2, 2, 2] + [3] * 14
+    first = attend(17000, q5)
+    wins.add(17000)
+    assert [first] + [attend(17000, q5) for _ in range(4)] == [17000, 17000, "kernel", "kernel", "kernel"] and timings == [9800] * 3 + [17000] * 2
+    # A kernel that cannot build is a loss, while a failed command buffer still raises.
+    for message, raised in (("Unable to build metal library from source", False), (inference._FAILED_BUFFER, True)):
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
+        monkeypatch.setattr(inference, "_exact_attention_faster", lambda per_row, fused: (_ for _ in ()).throw(RuntimeError(message)))
+        with pytest.raises(RuntimeError) if raised else contextlib.nullcontext():
+            assert attend(17000, q5) == 17000 and list(inference._EXACT_ATTENTION_TIMED.values()) == [[1, 2]]
+    # A threadgroup over the device's limit is retimed at the limit MLX quotes; a limit below one row pair's is a loss.
+    refusal = "Thread group size (1024) is greater than  the maximum allowed threads per threadgroup (%d)."
+    for limit, kernel in ((640, True), (96, False)):
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_THREADS", {})
+        refused = []
+        def faster(per_row, fused):
+            if not refused:
+                refused.append(1)
+                raise ValueError(refusal % limit)
+            return True
+        monkeypatch.setattr(inference, "_exact_attention_faster", faster)
+        assert (attend(17000, q5) == "kernel") is kernel
+        assert inference._EXACT_ATTENTION_THREADS == ({(mx.bfloat16, 6): 640} if kernel else {})
+    # The kernel must beat the one-row calls by 5% on the medians of three alternating runs; each run advances the clock by its own time.
+    for rows, kernel, verdict in (((10, 30, 10), (9.4, 9.4, 30), True), ((10, 10, 40), (9.4, 9.6, 9.6), False)):
+        now, spent, order = [0.0], [0.0], []
+        def clock():
+            now[0], spent[0] = now[0] + spent[0], 0.0
+            return now[0]
+        run = lambda durations, value: (lambda it: lambda: order.append(value.item()) or spent.__setitem__(0, next(it)) or value)(iter((0,) + durations))
+        assert timed(run(rows, mx.zeros(())), run(kernel, mx.ones(())), clock) is verdict and order == [0, 1] * 4
+
+
+def test_long_verify_blocks_read_attention_in_one_pass_and_match_the_native_verifier(qwen_4bit, monkeypatch):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    model, ids, _ = qwen_4bit
+    lm, block = model.language_model, mx.array([ids[0][24:30]])
+    cache, prompt = make_prompt_cache(lm), (ids[0] * 64)[:4200]
+    lm(mx.array([prompt]), cache = cache, skip_logits = True)
+    mx.eval([entry.state for entry in cache])
+    native, unscoped = {keep: _verified(lm, cache, block, keep) for keep in (0, 2, 6)}, __import__("copy").copy(lm)
+    attention = lambda: [key for key in served if key[1] == "attention"]
+    served = _serving(monkeypatch)
+    with inference.exact_speculative_verify(model):
+        assert _same(native[0], _verified(lm, cache, block, 0)) and not attention()
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_MIN_KEYS", 4096)
+        monkeypatch.setattr(inference, "_exact_attention_faster", lambda per_row, fused: True)
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
+        # An unscoped copy of the model stays on the one-row calls.
+        assert _same(native[0], _verified(unscoped, cache, block, 0)) and not attention()
+        assert all(_same(expected, _verified(lm, cache, block, keep)) for keep, expected in native.items())
+    layers = sum(not layer.is_linear for layer in lm.model.layers)
+    assert len(attention()) == layers * len(native) and all(inference._VERIFY_VERDICTS[key] for key in attention())
+
+
 def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
     from unsloth_zoo.mlx.generate import SamplingParams
     from unsloth_zoo.mlx.inference import exact_speculative_verify
@@ -726,20 +866,27 @@ def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(mo
 
 
 @pytest.mark.parametrize("max_lag", [128, 4])
-def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag):
+def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag, monkeypatch):
+    from mlx_vlm.speculative.common import generation_stream
     from unsloth_zoo.mlx.generate import SamplingParams
     model, ids = qwen_mtp
     controller = _script(("plain", 8), ("draft", 3), ("copy", 4), ("draft", 3))
-    accepted = []
+    accepted, apart, synced = [], [], []
+    monkeypatch.setattr(mx, "synchronize", lambda stream = None, sync = mx.synchronize: synced.append(stream) or sync(stream))
     record = controller.record_round
     def record_drafts(plan, rows, counts, **kwargs):
         accepted.extend((count, row.length) for row, count in zip(plan.rows, counts) if row.source == "draft")
+        if any(row.source == "draft" for row in plan.rows):
+            apart.append(kwargs["catch_up_seconds"] > 0 and synced == [generation_stream])
+        synced.clear()
         record(plan, rows, counts, **kwargs)
-    controller.record_round = record_drafts
+    controller.record_round, controller.interrupts_plain = record_drafts, lambda rows: False
     drafter = _drafter(model, max_lag = max_lag)
     (out,), _, _ = _run(model, ids[:1], 128, controller, SamplingParams(), drafter = drafter)
     assert out == _solo(model, ids[0], 128, SamplingParams())
     assert any(drafter.dropped.values()) == (max_lag < 8)
+    # Only a plain window leaves more pairs than a round does: its replay is timed apart from drafting.
+    assert apart[:4] == [max_lag >= 8, False] * 2
     # A head that dropped context past max_lag accepts less; a misaligned catch-up would accept next to nothing.
     assert sum(count for count, _ in accepted) >= (0.6 if max_lag >= 8 else 0.5) * sum(length for _, length in accepted)
 

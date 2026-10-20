@@ -34,6 +34,7 @@ import re
 import struct
 import sys
 import textwrap
+import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import RLock, local
@@ -149,11 +150,19 @@ def _bindings_intact(bindings):
 
 
 _FAILED_BUFFER = "[METAL] Command buffer execution failed"
+# One-off work run so far: each first-use check settles through `_settled`, and each timing counts one.
+_FIRST_USE_WORK = [0]
+
+
+def first_use_work():
+    """How much one-off first-use work (bitwise checks, timings) this process has run; a call that changed it paid for some."""
+    return _FIRST_USE_WORK[0]
 
 
 def _settled(verdict):
     """`verdict`, after synchronizing on a mismatch: a failed command buffer's garbage reads as one, and MLX
     raises that error only at the next synchronize."""
+    _FIRST_USE_WORK[0] += 1
     if not verdict:
         mx.synchronize()
     return verdict
@@ -4204,7 +4213,10 @@ _QWEN4_FORWARD = ("mlx_vlm.models.qwen4_exp.language", "_QWEN4_BATCH_INVARIANT_F
                   "mlx_vlm.models.qwen4_exp.language", "Qwen4ExpBatchInvariantForward", "__call__", False)
 # mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
 _VERIFY_FUSED_ROWS = 8
-_VERIFY_METHODS = ("verify", "__call__", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta")
+# Pinned apart, so a drifted attention body leaves only the attention route native.
+_EXACT_ATTENTION_CONTRACT = {"mlx_vlm.models.qwen3_5.speculative_verifier": {
+    "Qwen3_5BatchInvariantForward._attention": "0c8e3b361ee34362"}}
+_VERIFY_METHODS = ("verify", "__call__", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta", "_attention")
 _VERIFY_LOCK = RLock()
 _VERIFY_VERDICTS = {}
 # The verifier is one object per process: whether a call is served is kept per thread, not on it.
@@ -4310,8 +4322,9 @@ def _taped_update(native, with_states):
                                     state_steps = steps)
                 if verdict is None:
                     try:
-                        verdict = _replay_matches(stock, replay, mask, initial)
-                    except (RuntimeError, ValueError):
+                        verdict = _settled(_replay_matches(stock, replay, mask, initial))
+                    except (RuntimeError, ValueError) as error:
+                        _unless_failed_buffer(error)
                         return stock  # inside a function transformation, which cannot evaluate; checked later
                     _TAPE_VERDICTS[key] = verdict
                     if not verdict:
@@ -4348,6 +4361,239 @@ def _taped_transaction_class(base):
         base.abort(self)
 
     return type(f"_Taped{base.__name__}", (base,), {"commit": commit, "abort": abort})
+# MLX 0.32.3's sdpa_vector_2pass_1 and _2 over a causal block of rows, each row's arithmetic and
+# order the one-row call's: key i goes to block i % BLOCKS, and a row skips the keys past its own.
+# Each simdgroup carries two rows, so a K/V load serves both; the row pairs of a threadgroup share it through L1.
+_EXACT_ATTENTION_ROWS = """
+    constexpr int qk = D / 32;
+    const int h = threadgroup_position_in_grid.x;
+    const int b = threadgroup_position_in_grid.y;
+    const int block = threadgroup_position_in_grid.z % BLOCKS;
+    const int r0 = 2 * (threadgroup_position_in_grid.z / BLOCKS * threads_per_threadgroup.z + thread_position_in_threadgroup.z);
+    const int g = thread_position_in_threadgroup.y;
+    const int lane = thread_index_in_simdgroup;
+    const int prefix = N - L;
+
+    float qr[2][qk], o[2][qk], m[2], s[2];
+    for (int r = 0; r < 2; r++) {
+        const device T* qp = q + b * q_strides[0] + (h * G + g) * q_strides[1] + min(r0 + r, L - 1) * q_strides[2] + lane * qk;
+        for (int j = 0; j < qk; j++) {
+            qr[r][j] = static_cast<float>(scale) * qp[j];
+            o[r][j] = 0;
+        }
+        m[r] = Limits<float>::finite_min;
+        s[r] = 0;
+    }
+
+    const device T* kp = k + b * k_strides[0] + h * k_strides[1] + block * k_strides[2] + lane * qk;
+    const device T* vp = v + b * v_strides[0] + h * v_strides[1] + block * v_strides[2] + lane * qk;
+    // The last threadgroup's spare row-pair slots load nothing.
+    const int end = r0 < L ? prefix + min(r0 + 2, L) : 0;
+    for (int i = block; i < end; i += BLOCKS) {
+        float kr[qk], vr[qk];
+        for (int j = 0; j < qk; j++) {
+            kr[j] = kp[j];
+            vr[j] = vp[j];
+        }
+        for (int r = 0; r < 2; r++) {
+            if (r0 + r < L && i <= prefix + r0 + r) {
+                float score = 0;
+                for (int j = 0; j < qk; j++) {
+                    score += qr[r][j] * kr[j];
+                }
+                score = simd_sum(score);
+                float new_max = max(m[r], score);
+                float factor = fast::exp(m[r] - new_max);
+                float exp_score = fast::exp(score - new_max);
+                m[r] = new_max;
+                s[r] = s[r] * factor + exp_score;
+                for (int j = 0; j < qk; j++) {
+                    o[r][j] = o[r][j] * factor + exp_score * vr[j];
+                }
+            }
+        }
+        kp += BLOCKS * k_strides[2];
+        vp += BLOCKS * v_strides[2];
+    }
+
+    for (int r = 0; r < 2 && r0 + r < L; r++) {
+        const int row = ((b * threadgroups_per_grid.x + h) * G + g) * L + r0 + r;
+        for (int j = 0; j < qk; j++) {
+            partials[(row * BLOCKS + block) * D + lane * qk + j] = static_cast<T>(o[r][j]);
+        }
+        if (lane == 0) {
+            sums[row * BLOCKS + block] = s[r];
+            maxs[row * BLOCKS + block] = m[r];
+        }
+    }
+"""
+_EXACT_ATTENTION_REDUCE = """
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int elem_per_thread = D / BD;
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+
+    float o[elem_per_thread] = {0};
+    threadgroup float outputs[BN * BD];
+
+    const int q_offset = threadgroup_position_in_grid.x * threadgroups_per_grid.y + threadgroup_position_in_grid.y;
+    partials += q_offset * BLOCKS * D + simd_gid * D + simd_lid * elem_per_thread;
+    sums += q_offset * BLOCKS;
+    maxs += q_offset * BLOCKS;
+    out += q_offset * D + simd_gid * elem_per_thread;
+
+    float sum_exp_score = 0.0;
+    float max_score = Limits<float>::finite_min;
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        max_score = max(max_score, maxs[simd_lid + BN * b]);
+    }
+    max_score = simd_max(max_score);
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        float factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
+        sum_exp_score += factor * sums[simd_lid + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        float factor = fast::exp(maxs[simd_gid] - max_score);
+        for (int i = 0; i < elem_per_thread; i++) {
+            o[i] += factor * static_cast<float>(partials[i]);
+        }
+        maxs += BN;
+        sums += BN;
+        partials += BN * D;
+    }
+    for (int i = 0; i < elem_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (simd_lid == 0) {
+        for (int i = 0; i < elem_per_thread; i++) {
+            out[i] = static_cast<T>(o[i]);
+        }
+    }
+"""
+# Below this many keys attention is too small a share of a verify round to time; above it, the kernel is timed.
+_EXACT_ATTENTION_MIN_KEYS = 8192
+# Per timing key: True once the kernel timed faster, else [timings, calls left before retiming], as short of memory the kernel can run slow for a while.
+_EXACT_ATTENTION_TIMED = {}
+_EXACT_ATTENTION_TIMINGS, _EXACT_ATTENTION_RETRY = 3, 128
+# Per (dtype, query heads per KV head): the rows kernel's threadgroup limit on this device, once a launch was refused
+# (640 on M1-class GPUs). Row pairs per threadgroup only share loads through L1, so fewer leave every row's bits as they are.
+_EXACT_ATTENTION_THREADS = {}
+
+
+@functools.cache
+def _exact_attention_kernels():
+    try:
+        if not mx.metal.is_available():
+            return None
+        return (mx.fast.metal_kernel(name = "unsloth_exact_attention_rows", input_names = ["q", "k", "v", "N", "L", "scale"],
+                                     output_names = ["partials", "sums", "maxs"], source = _EXACT_ATTENTION_ROWS,
+                                     ensure_row_contiguous = False),
+                mx.fast.metal_kernel(name = "unsloth_exact_attention_reduce", input_names = ["partials", "sums", "maxs"],
+                                     output_names = ["out"], source = _EXACT_ATTENTION_REDUCE))
+    except (AttributeError, TypeError):
+        return None
+
+
+def _sdpa_vector_blocks(gqa, keys):
+    """The block count of MLX 0.32.3's 2-pass vector SDPA for one head-dim-256 query row over `keys` keys, or None off that kernel."""
+    device = nax._gpu_architecture()[-1:]
+    if not ((device in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)) or os.environ.get("MLX_SDPA_BLOCKS"):
+        return None
+    return _vector_blocks(gqa, keys)
+
+
+def _exact_attention_rows(queries, keys, values, scale, blocks):
+    batch, heads, length, dim = queries.shape
+    kv_heads, gqa = keys.shape[1], heads // keys.shape[1]
+    pairs = -(-length // 2)
+    per_group = min(pairs, 32 // gqa, max(1, _EXACT_ATTENTION_THREADS.get((queries.dtype, gqa), 1024) // (32 * gqa)))
+    groups = -(-pairs // per_group)
+    rows = batch * heads * length
+    first, second = _exact_attention_kernels()
+    partials, sums, maxs = first(
+        inputs = [queries, keys, values, keys.shape[2], length, scale],
+        template = [("T", queries.dtype), ("D", dim), ("G", gqa), ("BLOCKS", blocks)],
+        grid = (32 * kv_heads, gqa * batch, per_group * blocks * groups), threadgroup = (32, gqa, per_group),
+        output_shapes = [(rows * blocks * dim,), (rows * blocks,), (rows * blocks,)],
+        output_dtypes = [queries.dtype, mx.float32, mx.float32])
+    return second(inputs = [partials, sums, maxs], template = [("T", queries.dtype), ("D", dim), ("BLOCKS", blocks)],
+                  grid = (1024 * batch * heads, length, 1), threadgroup = (1024, 1, 1),
+                  output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
+
+
+def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
+    """`per_row()`, mlx-vlm's one-row SDPA calls over a causal verify block, read in one pass over the KV prefix where that is faster."""
+    if (not isinstance(keys, mx.array) or not isinstance(values, mx.array) or isinstance(mask, mx.array)
+            or hasattr(cache, "bits") or hasattr(cache, "decode_attention") or queries.ndim != 4
+            or queries.dtype not in (mx.bfloat16, mx.float16) or keys.dtype != queries.dtype or values.dtype != queries.dtype
+            or queries.shape[-1] != 256 or keys.shape[-1] != 256 or values.shape[-1] != 256
+            or keys.shape[0] != queries.shape[0] or queries.shape[1] % keys.shape[1] or queries.shape[1] > 32 * keys.shape[1]
+            or _exact_attention_kernels() is None):
+        return per_row()
+    length, gqa = queries.shape[2], queries.shape[1] // keys.shape[1]
+    first = keys.shape[2] - length + 1
+    blocks = _sdpa_vector_blocks(gqa, first)
+    if first < _EXACT_ATTENTION_MIN_KEYS or blocks is None or blocks != _sdpa_vector_blocks(gqa, keys.shape[2]):
+        return per_row()
+    fused = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
+    # Each bucket is timed on its own: the kernel's advantage is not monotone in the key count (odd widths leave a pair half empty).
+    timing = (queries.shape[0], length, queries.shape[1], keys.shape[1], queries.dtype, first.bit_length())
+    if (lost := _EXACT_ATTENTION_TIMED.get(timing)) is not True:
+        if lost is not None:
+            lost[1] -= 1
+            if lost[1] > 0 or lost[0] >= _EXACT_ATTENTION_TIMINGS:
+                return per_row()
+        try:
+            mx.eval(queries, keys, values)
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return per_row()  # inside a function transformation, which cannot evaluate; timed later
+        _FIRST_USE_WORK[0] += 1
+        while True:
+            try:
+                faster = _exact_attention_faster(per_row, fused)
+                break
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                faster = False  # the kernel cannot build or launch here: a loss
+                if not _fit_threadgroup(error, queries.dtype, gqa):
+                    break
+        if not faster:
+            timings = 1 if lost is None else lost[0] + 1
+            _EXACT_ATTENTION_TIMED[timing] = [timings, _EXACT_ATTENTION_RETRY << timings]
+            return per_row()
+        _EXACT_ATTENTION_TIMED[timing] = True
+    key = ((queries.shape[0], length), "attention", queries.shape[1], keys.shape[1], queries.dtype, blocks)
+    return _verify_admitted(key, per_row, fused)
+
+
+def _fit_threadgroup(error, dtype, gqa):
+    """Whether a rows-kernel launch refused for its threadgroup size now launches within the limit MLX quoted."""
+    found = re.search(r"maximum allowed threads per threadgroup \((\d+)\)", str(error))
+    limit = int(found.group(1)) if found else 0
+    if limit < 32 * gqa or _EXACT_ATTENTION_THREADS.get((dtype, gqa), 1024) <= limit:
+        return False
+    _EXACT_ATTENTION_THREADS[(dtype, gqa)] = limit
+    return True
+
+
+def _exact_attention_faster(per_row, fused, clock = time.perf_counter):
+    """Whether `fused()` beats `per_row()` by 5% on the median of three alternating runs, after one warm run of each."""
+    mx.eval(per_row(), fused())
+    seconds = ([], [])
+    for _ in range(3):
+        for run, spent in zip((per_row, fused), seconds):
+            mx.synchronize()
+            start = clock()
+            mx.eval(run())
+            spent.append(clock() - start)
+    return sorted(seconds[1])[1] < 0.95 * sorted(seconds[0])[1]
 
 
 @functools.cache
@@ -4444,7 +4690,39 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         methods["_layer"] = submitted_layer
     if taped is not None:
         methods["_gated_delta"] = taped_gated_delta
-    return type(f"_ScopedVerify{base.__name__}", (base,), methods)
+    attention_bindings = _resolved_bindings(_EXACT_ATTENTION_CONTRACT)
+    module = sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier")
+    # Qwen3.5's verify blocks only: qwen4_exp's forward also routes its sparse attention through `_attention`.
+    if entry != "verify" or attention_bindings is None or module is None:
+        return type(f"_ScopedVerify{base.__name__}", (base,), methods)
+
+    def block_attention(self, attention, x, mask, cache, position_ids, position_embeddings):
+        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] <= 2
+                or not _bindings_intact(attention_bindings)):
+            return base._attention(self, attention, x, mask, cache, position_ids, position_embeddings)
+        # The native body for a block wider than two rows, with its one-row SDPA calls handed to `_exact_attention`.
+        batch, length, _ = x.shape
+        q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
+        queries, keys, values, gate, mask = attention._prepare_projected_qkv(
+            q_proj_output, keys, values, cache, position_ids, position_embeddings, mask)
+        if isinstance(mask, str) and mask == "left_padded_decode":
+            mask = None
+        output = self._helpers()._qwen3_5_left_padded_attention(
+            queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
+        if output is None:
+            prefix = module.kv_sequence_length(keys) - length
+
+            def per_row():
+                return mx.concatenate([module.scaled_dot_product_attention(
+                    queries[:, :, i : i + 1, :], module.slice_kv_sequence(keys, prefix + i + 1),
+                    module.slice_kv_sequence(values, prefix + i + 1), cache = cache, scale = attention.scale,
+                    mask = mask[..., i : i + 1, : prefix + i + 1] if isinstance(mask, mx.array) and mask.ndim >= 4 else None,
+                ) for i in range(length)], axis = 2)
+            output = _exact_attention(queries, keys, values, attention.scale, cache, mask, per_row)
+        output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        return self._linear(attention.o_proj, output * mx.sigmoid(gate))
+
+    return type(f"_ScopedVerify{base.__name__}", (base,), {**methods, "_attention": block_attention})
 
 
 @contextmanager
@@ -4492,11 +4770,13 @@ def exact_speculative_verify(model, *, _modules = None):
     Each layer of a verify block is submitted for evaluation as it is built, so the GPU runs while the host builds on.
     A verify block wider than the eight rows mlx-vlm's fused verify kernels serve runs each frozen
     quantized projection over balanced row slices, once its first block of that shape matched the
-    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition.
-    A block's gated-delta layers write only their final state, and the commit replays each layer over the retained
-    prefix with the same kernel instead of keeping every step's state, once replays of a key's first block matched
-    every per-step state bit for bit. Only verify calls of the language models found here are served; other,
-    training and distributed models, and an mlx-vlm whose verifier drifted, keep the native methods.
+    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition, and
+    over a long KV cache a block wider than two rows reads each full-attention layer's keys and values once per
+    pair of rows instead of once per row, where that measured faster on this device. A block's gated-delta layers
+    write only their final state, and the commit replays each layer over the retained prefix with the same kernel
+    instead of keeping every step's state, once replays of a key's first block matched every per-step state bit
+    for bit. Only verify calls of the language models found here are served; other, training and distributed
+    models, and an mlx-vlm whose verifier drifted, keep the native methods.
     """
     with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
         yield model
