@@ -488,7 +488,14 @@ def test_opcheck():
     torch.library.opcheck(
         getattr(torch.ops.unsloth_zoo, fl._LP_OP).default,
         (h, w, b, t.clamp(min = 0), mask, 0.8, 0.0, 0.0, 0.0, torch.float32, True, True, True, True, False,
-         True, True, True, 4),
+         True, True, True, 4, False),
+    )
+    # Frozen head with a lazy entropy: forward-gradient outputs, entropy gradient recomputed in backward.
+    hf = h.detach().clone().requires_grad_(True)
+    torch.library.opcheck(
+        getattr(torch.ops.unsloth_zoo, fl._LP_OP).default,
+        (hf, w.detach(), None, t.clamp(min = 0), mask, 0.8, 0.0, 0.0, 0.0, torch.float32, True, False, False, False,
+         True, True, False, False, 4, True),
     )
 
 
@@ -628,7 +635,7 @@ def test_opcheck_with_disabled_outputs():
     torch.library.opcheck(
         getattr(torch.ops.unsloth_zoo, fl._LP_OP).default,
         (h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, torch.float32, False, False, False, False, True,
-         True, False, False, 4),
+         True, False, False, 4, False),
         test_utils = ("test_faketensor",),
     )
     n = h.shape[0]
@@ -1082,11 +1089,11 @@ def test_opcheck_exact_top_outputs():
     dtype = torch.bfloat16 if _half_ok("cuda") else torch.float16
     h, w, b, t = _make("cuda", dtype, 40, 16, 40000, train_head = True, with_bias = True)
     out = getattr(torch.ops.unsloth_zoo, fl._LP_OP).default(
-        h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, dtype, True, False, False, False, False, True, True, True, 0)
+        h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, dtype, True, False, False, False, False, True, True, True, 0, False)
     assert out[7].shape == fl._block_top_shape(40, 40000, h.device, dtype, True) and out[7].numel() > 0
     torch.library.opcheck(
         getattr(torch.ops.unsloth_zoo, fl._LP_OP).default,
-        (h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, dtype, True, False, False, False, False, True, True, True, 0),
+        (h, w, b, t, None, 1.0, 0.0, 0.0, 0.0, dtype, True, False, False, False, False, True, True, True, 0, False),
         test_utils = ("test_faketensor",),
     )
 
@@ -1210,3 +1217,93 @@ def test_softcap_keeps_the_fp32_recompute():
             lp = fused_linear_logprobs(h, w, t, logit_softcapping = cap)
             torch.autograd.grad(lp.sum(), (h, w))
             assert (fl.CALLS["exact_top"] > before) == engaged, (dtype, cap)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("V", [3001, 40001])
+def test_lazy_entropy_only_logged_keeps_the_forward_gradient(device, V):
+    # entropy_requires_grad=None and the entropy only logged (TRL 1.15 DPO): a frozen head takes the forward gradient,
+    # bit for bit the entropy_requires_grad=False path, and no recompute backward runs.
+    for dtype in _dtypes(device):
+        h, w, b, t = _make(device, dtype, 37, 24, V, with_bias = True)
+        g = torch.randn(37, device = device, dtype = torch.float64)
+
+        def run(erg):
+            hh = h.detach().clone().requires_grad_(True)
+            lp, ent = fused_linear_logprobs(hh, w, t, bias = b, return_entropy = True, entropy_requires_grad = erg,
+                                            temperature = 0.7)
+            (gh,) = torch.autograd.grad((lp.double() * g).sum(), (hh,))
+            return lp.detach(), ent.detach(), gh
+
+        bwd = fl.CALLS["logprobs_bwd"]
+        lazy = run(None)
+        assert fl.CALLS["logprobs_bwd"] == bwd, "a logged entropy must not run the recompute backward"
+        off = run(False)
+        for x, y in zip(lazy, off):
+            assert torch.equal(x, y), (device, dtype)
+        on = run(True)  # the eager entropy gradient: the recompute route
+        assert fl.CALLS["logprobs_bwd"] > bwd
+        assert torch.equal(lazy[0], on[0]) and torch.equal(lazy[1], on[1])  # same forward statistics
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("V", [3001, 40001])
+def test_lazy_entropy_gradient_when_used(device, V):
+    # A lazy entropy that does reach the loss (GRPO entropy bonus) gets its gradient: forward gradient for the
+    # log-probs plus a recomputed entropy term, as accurate as the eager entropy gradient against fp64.
+    for dtype in _dtypes(device):
+        h, w, b, t = _make(device, dtype, 37, 24, V, with_bias = True)
+        g = torch.randn(37, device = device, dtype = torch.float64)
+        ge = 0.3 * torch.randn(37, device = device, dtype = torch.float64)
+        mask = torch.ones(37, dtype = torch.bool, device = device)
+        mask[::5] = False
+
+        def run(erg):
+            hh = h.detach().clone().requires_grad_(True)
+            lp, ent = fused_linear_logprobs(hh, w, t, bias = b, mask = mask, return_entropy = True,
+                                            entropy_requires_grad = erg, temperature = 0.7)
+            (gh,) = torch.autograd.grad((lp.double() * g).sum() + (ent.double() * ge).sum(), (hh,))
+            return gh
+
+        bwd = fl.CALLS["logprobs_bwd"]
+        lazy = run(None)
+        assert fl.CALLS["logprobs_bwd"] == bwd + 1
+        eager = run(True)
+        hd = h.detach().double().requires_grad_(True)
+        lp, ent = _lp_oracle(hd, w.double(), b.double(), t, mask, 0.7, 0.0, 0.0, 0.0)[:2]
+        (ref,) = torch.autograd.grad((lp * g).sum() + (ent * ge).sum(), (hd,))
+        _close(lazy, ref, _tol(dtype), f"lazy {device} {dtype}")
+        # Same backward as the eager entropy gradient (one recompute, rounded once).
+        assert _rel(lazy, ref) <= 1.05 * _rel(eager, ref) + 1e-9, (device, dtype, _rel(lazy, ref), _rel(eager, ref))
+        assert (lazy[~mask] == 0).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_lazy_entropy_with_a_trainable_head_recomputes(device):
+    # A trainable head has no forward gradient: a lazy entropy is then simply differentiable (recompute route).
+    h, w, b, t = _make(device, torch.float32, 20, 16, 501, train_head = True, with_bias = True)
+    lp, ent = fused_linear_logprobs(h, w, t, bias = b, return_entropy = True, entropy_requires_grad = None)
+    got = torch.autograd.grad(lp.sum() + ent.sum(), (h, w, b))
+    lp2, ent2 = fused_linear_logprobs(h, w, t, bias = b, return_entropy = True, entropy_requires_grad = True)
+    want = torch.autograd.grad(lp2.sum() + ent2.sum(), (h, w, b))
+    for x, y in zip(got, want):
+        assert torch.equal(x, y)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+@pytest.mark.parametrize("use_ent", [False, True])
+def test_lazy_entropy_compiles_without_graph_breaks(use_ent):
+    import torch._dynamo
+    torch._dynamo.reset()
+    h, w, _, t = _make("cuda", _dtypes("cuda")[-1], 64, 32, 40001)
+
+    def f(hh):
+        lp, ent = fused_linear_logprobs(hh, w, t, return_entropy = True, entropy_requires_grad = None)
+        return lp.float().sum() + (0.1 * ent.float().sum() if use_ent else 0.0 * ent.detach().float().sum())
+
+    hh = h.detach().clone().requires_grad_(True)
+    compiled = torch.compile(f, fullgraph = True)
+    (gc,) = torch.autograd.grad(compiled(hh), (hh,))
+    he = h.detach().clone().requires_grad_(True)
+    (ge,) = torch.autograd.grad(f(he), (he,))
+    torch.testing.assert_close(gc.float(), ge.float(), rtol = 0, atol = 0)

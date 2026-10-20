@@ -98,9 +98,10 @@ _FLASH_MIN_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS", 4096
 _FWD_TILE_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 0)), 0)
 # ROCm's half-in / fp32-out GEMM is a slow fallback (6-14x).
 _IS_HIP = torch.version.hip is not None
-# Op names carry a schema version: Inductor's FX graph / AOTAutograd caches do not key on a custom op's schema, so a
-# warm cache would replay calls with the old arguments after a change. Bump the suffix whenever an op's schema changes.
-_LP_OP = "fused_linear_logprobs_v2"
+# Op names carry a version: Inductor's FX graph / AOTAutograd caches key on neither a custom op's schema nor its
+# registered backward, so a warm cache replays the old arguments or gradient formula. Bump the suffix whenever an
+# op's schema or backward changes.
+_LP_OP = "fused_linear_logprobs_v4"
 _LP_BWD_OP = "fused_linear_logprobs_bwd_v2"
 
 CALLS = {"ce": 0, "logprobs": 0, "logprobs_bwd": 0, "triton": 0, "torch": 0, "tiled": 0, "exact_top": 0,
@@ -1532,7 +1533,7 @@ if _OPS is None:
         hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], targets: torch.Tensor,
         mask: Optional[torch.Tensor], temperature: float, mul: float, div: float, cap: float,
         compute_dtype: torch.dtype, want_ent: bool, want_mean: bool, want_lssp: bool, want_top1: bool,
-        want_u: bool, need_h: bool, need_w: bool, need_b: bool, rows: int,
+        want_u: bool, need_h: bool, need_w: bool, need_b: bool, rows: int, ent_lazy: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor]:
         CALLS["logprobs"] += 1
@@ -1542,7 +1543,7 @@ if _OPS is None:
 
     @_lp_op.register_fake
     def _lp_fake(hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
-                 want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows):
+                 want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows, ent_lazy):
         N = hidden.shape[0]
         f32 = dict(device = weight.device, dtype = torch.float32)
         e = lambda: torch.empty(0, **f32)  # noqa: E731  (a fresh one per slot: outputs must not alias)
@@ -1565,26 +1566,43 @@ if _OPS is None:
         ctx.mark_non_differentiable(mean, lssp, top1, u, lse, block_top)
         ctx.set_materialize_grads(False)
         (hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
-         want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows) = inputs
+         want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows, ent_lazy) = inputs
         ctx.want_u = want_u
+        # Frozen head with a lazily differentiable entropy: the forward gradient serves the log-probs, and the
+        # entropy gradient is recomputed only when one arrives (entropy kept for a metric costs nothing).
+        ctx.ent_lazy = bool(want_u and ent_lazy and want_ent)
         ctx.need = (need_h, need_w, need_b)
         ctx.args = (temperature, mul, div, cap, compute_dtype, rows)
         ctx.has_bias = bias is not None
         ctx.has_mask = mask is not None
         ctx.hidden_dtype = hidden.dtype
-        if want_u:
+        if ctx.ent_lazy:
+            ctx.save_for_backward(u, hidden, weight, bias, targets, mask, lse, ent)
+        elif want_u:
             ctx.save_for_backward(u)
         else:
             ctx.save_for_backward(hidden, weight, bias, targets, mask, lse, ent, block_top)
 
     def _lp_backward(ctx, g_logps, g_ent, *_):
         need_h, need_w, need_b = ctx.need
-        none = (None,) * 18
+        none = (None,) * 19
         if ctx.want_u:
-            (u,) = ctx.saved_tensors
-            if g_logps is None or not need_h:
+            if not need_h:
                 return (None,) + none
-            return (torch.ops.unsloth_zoo.fused_linear_scale_rows(u, g_logps, ctx.hidden_dtype),) + none
+            if ctx.ent_lazy and g_ent is not None:
+                # The entropy reached the loss: one recompute with both upstream gradients, rounded once (the eager
+                # entropy gradient's backward), instead of adding a half entropy term to the forward gradient's.
+                _, hidden, weight, bias, targets, mask, lse, ent = ctx.saved_tensors
+                temperature, mul, div, cap, compute_dtype, rows = ctx.args
+                g = g_logps.float() if g_logps is not None else torch.zeros_like(lse)
+                gh, _, _ = getattr(torch.ops.unsloth_zoo, _LP_BWD_OP)(
+                    hidden, weight, bias, targets, mask, lse, ent, g, g_ent.float(), lse.new_empty(0),
+                    temperature, mul, div, cap, compute_dtype, True, False, False, rows,
+                )
+                return (gh,) + none
+            if g_logps is None:
+                return (None,) + none
+            return (torch.ops.unsloth_zoo.fused_linear_scale_rows(ctx.saved_tensors[0], g_logps, ctx.hidden_dtype),) + none
         hidden, weight, bias, targets, mask, lse, ent, block_top = ctx.saved_tensors
         if g_logps is None and g_ent is None:
             return (None,) + none
@@ -1595,7 +1613,7 @@ if _OPS is None:
             hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul, div, cap, compute_dtype,
             need_h, need_w, need_b, rows,
         )
-        return (gh if need_h else None, gw if need_w else None, gb if need_b else None) + (None,) * 16
+        return (gh if need_h else None, gw if need_w else None, gb if need_b else None) + (None,) * 17
 
     _lp_op.register_autograd(_lp_backward, setup_context = _lp_setup)
 
@@ -1778,7 +1796,8 @@ def fused_linear_logprobs(
     """Per-token log_softmax(transform(hidden @ weight.T + bias) / temperature)[targets], float32 [...].
 
     Rows outside `mask` (and rows with an out-of-range target) return 0 and never reach the head. Extras in order:
-    entropy (differentiable unless entropy_requires_grad=False), vocab mean of the transformed logits before
+    entropy (differentiable unless entropy_requires_grad=False; None: differentiable, but its gradient is recomputed
+    only if one arrives, so a frozen head keeps the forward gradient when the entropy is only logged), vocab mean of the transformed logits before
     temperature, log sum p^2, argmax == target. `max_rows_per_chunk` caps the automatic chunk size
     (`rows_per_chunk` sets it). With a frozen head, forward keeps d logp / d hidden per row and
     backward is one multiply; a trainable head / bias or a differentiable entropy recompute the logits instead."""
@@ -1792,19 +1811,22 @@ def fused_linear_logprobs(
     need_w = grad_on and weight.requires_grad
     need_b = grad_on and _requires_grad(bias)
     bias = _head_bias(bias, weight)
-    ent_grad = bool(return_entropy) and bool(entropy_requires_grad)
-    want_u = _FORWARD_GRAD and need_h and not need_w and not need_b and not ent_grad
+    lazy = entropy_requires_grad is None
+    ent_grad = bool(return_entropy) and (lazy or bool(entropy_requires_grad))
+    head_grad = need_w or need_b
+    # A lazy entropy needs the recompute only for a trainable head; a frozen one keeps the forward gradient.
+    want_u = _FORWARD_GRAD and need_h and not head_grad and (not ent_grad or lazy)
     logps, ent, mean, lssp, top1, u, lse, _ = getattr(torch.ops.unsloth_zoo, _LP_OP)(
         hidden2, weight, bias, targets2, mask2, float(temperature),
         float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
         _compute_dtype(hidden, weight), bool(return_entropy), bool(return_mean_logits),
         bool(return_log_sum_sq_probs), bool(return_is_top1), want_u, need_h, need_w, need_b,
-        int(rows_per_chunk or 0) or -int(max_rows_per_chunk or 0),
+        int(rows_per_chunk or 0) or -int(max_rows_per_chunk or 0), bool(lazy and ent_grad),
     )
     out_device = hidden.device
     result = [logps.reshape(lead).to(out_device)]
     if return_entropy:
-        e = ent if entropy_requires_grad else ent.detach()
+        e = ent if (lazy or entropy_requires_grad) else ent.detach()
         result.append(e.reshape(lead).to(out_device))
     if return_mean_logits:
         result.append(mean.reshape(lead).to(out_device))
