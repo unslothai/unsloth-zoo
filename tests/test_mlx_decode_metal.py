@@ -917,6 +917,19 @@ def test_qsa_route_skips_an_indexer_in_training(monkeypatch):
     assert calls == []
 
 
+def test_qsa_route_skips_a_zero_block_budget(monkeypatch):
+    # An indexer budget under one block gives block_topk 0; the kernel would write past a (B, L, 0) output.
+    attention, calls = _qsa_layer(), []
+    attention.indexer.block_topk = 0
+    monkeypatch.setattr(mlx_attention, "select_blocks", lambda *args: calls.append(args) or None)
+    with decode.fused_qsa_attention(attention):
+        try:
+            _qsa_run(attention)
+        except Exception:  # whatever mlx-vlm does with the budget, it is its own bounds-checked path
+            pass
+    assert calls == []
+
+
 def test_qsa_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
     attention, foreign = _qsa_layer(), lambda *args: None
     native = qwen4.Qwen4ExpQSAIndexer.select_from_projected
