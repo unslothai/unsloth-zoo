@@ -15,7 +15,9 @@ import sys
 
 import mlx.nn as nn
 from mlx.utils import tree_flatten
-from unsloth_zoo.mlx.loader import _MLXQuantizationSpec, _apply_mlx_quantization, _finish_load
+from unsloth_zoo.mlx.loader import (
+    _MLXQuantizationSpec, _apply_mlx_quantization, _convert_mlx_dtype, _finish_load, _load_mlx_vlm_with_extra_weight_filter,
+)
 
 _SIDES = (2048, 1024, 512)
 _BYTES = sum(side * side * 4 for side in _SIDES)
@@ -78,6 +80,29 @@ def test_finish_load_returns_resident_weights(tmp_path):
     returned, tokenizer = _finish_load(model, "tokenizer")
     assert (returned, tokenizer) == (model, "tokenizer")
     assert mx.get_active_memory() - before >= _BYTES
+
+
+def test_tables_mlx_vlm_reads_from_disk_stay_there(tmp_path):  # as it exposes DeepSeek V4.1's Engram
+    model, before = _lazy_model(tmp_path), mx.get_active_memory()
+    for layer in model.layers[:2]:  # V4.1 has two
+        layer.__class__ = type("OffloadedEngramEmbedding", (nn.Linear,), {})
+    _finish_load(_convert_mlx_dtype(model, mx.bfloat16) or model, None)
+    assert 0 < mx.get_active_memory() - before < _SIDES[1] ** 2 * 2
+
+
+def test_glm5_next_fused_layers_take_their_checkpoint_bits(monkeypatch):
+    glm = pytest.importorskip("mlx_vlm.models.glm5_next.glm5_next")
+    from mlx_vlm.utils import _quantization_for_module_path
+
+    monkeypatch.delattr(glm.Model, "quantization_path_aliases", raising = False)
+    fused = {"mlp.shared_experts.gate_up_proj": "mlp.shared_experts.gate_proj", "self_attn.qkv_proj": "self_attn.q_proj",
+             "self_attn.fbg_a_proj": "self_attn.f_a_proj", "self_attn.qkv_a_proj": "self_attn.q_a_proj"}
+    # Bits of their own, as GLM-5.3-Flash-4bit's 6-bit shared experts beside its 4-bit default.
+    bits = [{"group_size": 64, "bits": 5 + i} for i in range(len(fused))]
+    quantization = {f"model.layers.3.{source}": b for source, b in zip(fused.values(), bits)}
+    model = glm.Model.__new__(glm.Model)
+    load = lambda *_, **__: [_quantization_for_module_path(quantization, f"language_model.model.layers.3.{p}", model) for p in fused]
+    assert _load_mlx_vlm_with_extra_weight_filter("glm", "glm5_next", load, {}) == bits
 
 
 def test_lazy_weights_env_leaves_the_load_lazy(tmp_path, monkeypatch):

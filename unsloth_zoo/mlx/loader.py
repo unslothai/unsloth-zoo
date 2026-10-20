@@ -158,7 +158,7 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) else v,
         model.parameters(),
     ))
-    mx.eval(model.parameters())
+    mx.eval(_resident_parameters(model))
 
 
 def _keep_norm_parameters_float32(model) -> None:
@@ -717,6 +717,31 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
         f"or dependency policy for your environment; Studio users should rerun "
         f"installer/repair. Do not bypass this error with strict=False.{installed}"
     ) from error
+
+
+# The layers mlx-vlm's glm5_next sanitize fuses, each by its first source projection.
+_GLM5_NEXT_FUSED = {"gate_up_proj": "gate_proj", "qkv_proj": "q_proj", "fbg_a_proj": "f_a_proj", "qkv_a_proj": "q_a_proj"}
+
+
+def _patch_glm5_next_quantization_aliases(model_type):
+    """mlx-vlm fuses glm5_next projections (``_GLM5_NEXT_FUSED``) but gives a fused layer no alias
+    to its sources' per-module quantization, so a mixed-bit checkpoint's (as GLM-5.3-Flash-4bit's
+    6-bit shared experts) is built at the default bits and fails to load."""
+    if model_type != "glm5_next":
+        return
+    try:
+        from mlx_vlm.models.glm5_next.glm5_next import Model as model
+    except Exception:
+        return
+    if hasattr(model, "quantization_path_aliases"):
+        return
+
+    def quantization_path_aliases(self, path):
+        path = path[len("language_model."):] if path.startswith("language_model.") else path
+        parent, _, name = path.rpartition(".")
+        return [f"{parent}.{_GLM5_NEXT_FUSED[name]}"] if name in _GLM5_NEXT_FUSED else []
+
+    model.quantization_path_aliases = quantization_path_aliases
 
 
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
@@ -1636,6 +1661,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
     registered mismatch signatures and exact allow-listed keys only.
     """
     _patch_deepseek_ocr_transformers_import_compat(model_type)
+    _patch_glm5_next_quantization_aliases(model_type)
     try:
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
@@ -1715,6 +1741,7 @@ def _load_mlx_vlm_distributed(
     model_label = f"'{model_name}'"
     if model_type:
         model_label = f"{model_label} (model_type={model_type!r})"
+    _patch_glm5_next_quantization_aliases(model_type)
 
     try:
         from mlx_vlm.utils import get_model_path, sharded_load
@@ -3294,9 +3321,20 @@ def _mlx_vlm_only_text_model(config: dict, model_type: str) -> bool:
         spec = importlib.util.find_spec(f"mlx_lm.models.{module_name}")
     except (ImportError, ValueError):
         return False
-    if spec is not None:
+    if spec is not None and not _mlx_lm_refuses_config(module_name, config):
         return False
     return _resolve_mlx_vlm_model_class(model_type) is not None
+
+
+def _mlx_lm_refuses_config(module_name, config):
+    """Whether mlx_lm's model arguments refuse ``config``, as its DeepSeek V4.1 refuses Engram layers."""
+    try:
+        importlib.import_module(f"mlx_lm.models.{module_name}").ModelArgs.from_dict(config)
+    except ValueError:
+        return True
+    except (Exception, SystemExit):
+        return False
+    return False
 
 
 class _NativeVLMWeightSanitizer:
@@ -8686,6 +8724,16 @@ def _coerce_list_extra_special_tokens():
 _LAZY_WEIGHTS_ENV = "UNSLOTH_MLX_LAZY_WEIGHTS"
 
 
+def _resident_parameters(model):
+    """``model``'s parameters but the tables mlx-vlm reads row by row from disk (DeepSeek V4.1's Engram)."""
+    from mlx.utils import tree_flatten
+
+    mapped = tuple(path + "." for path, module in model.named_modules() if type(module).__name__ == "OffloadedEngramEmbedding")
+    if not mapped:
+        return model.parameters()
+    return [value for name, value in tree_flatten(model.parameters()) if not name.startswith(mapped)]
+
+
 def _materialize_weights(model):
     """Left mapped, the first GPU kernel to touch a weight can stall long enough for
     Apple's watchdog to kill the process's queue."""
@@ -8694,7 +8742,7 @@ def _materialize_weights(model):
     import mlx.core as mx
 
     try:
-        mx.eval(model.parameters())
+        mx.eval(_resident_parameters(model))
     except Exception as error:
         # Not fatal: the weights stay lazy, as before.
         print(f"Unsloth: Could not read {type(model).__name__} weights at load time: {error}")
