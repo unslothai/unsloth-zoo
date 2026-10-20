@@ -81,8 +81,7 @@ _MIN_LOGITS = 512 * 151936
 _MIN_ROWS = int(_env_float("UNSLOTH_FUSED_LINEAR_MIN_ROWS", 0))
 _MAX_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_MAX_ROWS", 4096)), 1)
 _BLOCK = int(_env_float("UNSLOTH_FUSED_LINEAR_BLOCK", 4096))
-# Vocab split width for row statistics; one program per row is latency bound at 256-512 rows (~2x slower on B200).
-# 0 = one program per row.
+# Vocab split width for row statistics (0 = one program per row: latency bound at 256-512 rows, ~2x slower on B200).
 _SPLIT_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_SPLIT_COLS", 16384)), 0)
 _SPLIT_BLOCK = max(int(_env_float("UNSLOTH_FUSED_LINEAR_SPLIT_BLOCK", 2048)), 16)
 # Recompute backward tiles: ROCm small (gfx1151: 4096 x 256 MB 609 ms vs 348 at 1024 x 8 MB), CUDA TRL's shape.
@@ -90,12 +89,9 @@ _HIP_TILES = torch.version.hip is not None
 _BWD_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_ROWS", 1024 if _HIP_TILES else 4096)), 1)
 _BWD_TILE_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_TILE_MB", 8 if _HIP_TILES else 256) * 1024**2), 1)
 _HALF = (torch.float16, torch.bfloat16)
-# Frozen head on CUDA with fp32 logits: the forward gradient is accumulated over vocab tiles (flash-style), and the
-# no-grad pass makes the same tiled calls, so a policy pass stays bit-identical to its reference (and to a trainable
-# head's). 0: [rows, V] chunks. From FLASH_MIN_ROWS kept rows only: there the [4096, tile] GEMMs beat [512, V] chunks
-# on every tier (8k-32k tokens: L4 -6 to -11%, G4 -1 to -4%, A100 0 to -2%). Fewer rows leave too few GEMM blocks per
-# tile: 2k tokens cost G4 / A100 2-5% (L4 still -3 to -6%), so they keep the chunks. FLASH_MIN_ROWS=0 with
-# FWD_TILE_COLS=16384 trades that for TRL's peak at 2k tokens (0.127 vs 0.309 GiB).
+# Frozen CUDA head, fp32 logits: flash-style forward gradient over vocab tiles; no-grad makes the same calls, so policy
+# == reference bit for bit. 0: [rows, V] chunks. Only from FLASH_MIN_ROWS kept rows: 8k-32k tokens L4 -6 to -11%,
+# G4 -1 to -4%, A100 0 to -2%; 2k tokens cost G4 / A100 2-5%, so they keep the chunks.
 _FLASH = os.environ.get("UNSLOTH_FUSED_LINEAR_FLASH", "1") != "0"
 _FLASH_MIN_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS", 4096)), 0)
 # Widest vocab tile of the tiled forward (a multiple of the split width; 0 = the tile byte budget alone).
@@ -177,7 +173,6 @@ def _fp32_out_ok(device, dtype = torch.float16):
 
 
 def _logits_mode(device, dtype = torch.float16):
-    # -> (fp32 logits buffer, exact fp32 target logit).
     if device.type != "cuda":
         return False, False
     if _ACCURACY == "0":
@@ -776,7 +771,6 @@ def _aligned(V):
 
 
 def _logits_into(h, w, out, fp32_logits):
-    """out[n, V] = h @ w.T (fp32 result when fp32_logits)."""
     V8 = _aligned(w.shape[0])
     parts = ((0, V8), (V8, w.shape[0])) if V8 < w.shape[0] else ((0, V8),)
     for a, b in parts:
@@ -804,7 +798,6 @@ def _dz_w(dz, w):
 
 
 def _dz_w_acc(acc, dz, w):
-    """acc[n, H] (fp32) += dz[n, V] @ w[V, H], in place."""
     V8 = _aligned(w.shape[0])
     _addmm_fp32(acc, dz[:, :V8], w[:V8])
     if V8 < w.shape[0]:
@@ -812,7 +805,6 @@ def _dz_w_acc(acc, dz, w):
 
 
 def _dz_t_h(acc, dz, h):
-    """acc[V, H] += dz[n, V].T @ h."""
     V8 = _aligned(dz.shape[1])
     _addmm_fp32(acc[:V8], dz[:, :V8].t(), h)
     if V8 < dz.shape[1]:
@@ -1163,10 +1155,8 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
             buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
         ratio = None
         if n_chunked and grad and compute_dtype in _HALF and (not need_w or acc_w.dtype == torch.float32):
-            # Early on p(target) ~ 0, so each row's largest gradient entry is ~ -coef: written into the half buffer it
-            # rounds to half(coef) on every row, a systematic scale error (up to 0.4% in bf16 with coef = 1 / n_items).
-            # The buffer takes a power of two instead (exact in any format) and the fp32 results take the rest; a half
-            # head-gradient accumulator keeps coef (rescaling its rounded sum would round it twice).
+            # p(target) ~ 0 early: half(coef) on every row is a 0.4% bf16 scale error, so the buffer takes a power of
+            # two and fp32 the rest; a half head-gradient accumulator keeps coef (else rounded twice).
             pow2 = torch.exp2(torch.round(torch.log2(coef)))
             ratio, coef = coef / pow2, pow2
         with torch.autocast(device.type, enabled = False):
@@ -1334,7 +1324,6 @@ def _mm_into(out, a, b):
 
 
 def _dz_t_h_into(out, dz, h):
-    """out[V, H] = dz[n, V].T @ h."""
     V8 = _aligned(dz.shape[1])
     _mm_into(out[:V8], dz[:, :V8].t(), h)
     if V8 < dz.shape[1]:
@@ -1342,7 +1331,6 @@ def _dz_t_h_into(out, dz, h):
 
 
 def _bwd_layout(n_keep, V, H, rows, bpl, budget, need_w, single, align):
-    """(rows per chunk, vocab tile) for the recompute backward."""
     if single:
         R, tile = n_keep, budget // max(n_keep * bpl, 1)
     else:
@@ -1429,7 +1417,6 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, blo
         else:
             grad_h.index_copy_(0, idx[a:b], gh.to(grad_h.dtype))
 
-    # Pick the smaller fp32 accumulator: [rows, H] (vocab-major) or [V, H] (row-major).
     head_acc = torch.zeros((V, H), **f32) if head_acc_mode else None
     with torch.autocast(device.type, enabled = False):
         if single:

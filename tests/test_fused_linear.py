@@ -991,11 +991,8 @@ def test_exact_top_backward_keeps_fp32_gradient_accuracy(monkeypatch, ent_grad, 
         fh, fw, off, lp_f, ent_f = _peaked_grads(monkeypatch, dtype, False, True, ent_grad, *shape)
         hh, hw, _, _, _ = _peaked_grads(monkeypatch, dtype, False, False, ent_grad, *shape)
         assert engaged > 0 and off == 0, (engaged, off)
-        # Forward values do not depend on the backward mode.
         assert torch.equal(lp, lp_f) and torch.equal(ent, ent_f)
-        # Measured (B200): within 1-5% of fp32 (also at H 2560, V 151936), 0.2-0.3x all-half. Only each 2048-block's
-        # top-1 left a same-block runner-up in half (4-5x fp32); the top-2 per 2048 columns, 6 of 8 clustered
-        # tokens (3x).
+        # B200: within 1-5% of fp32, 0.2-0.3x all-half (top-1 only per 2048 block: 4-5x fp32).
         assert eh <= 1.1 * fh and ew <= 1.1 * fw, (dtype, eh, fh, ew, fw)
         if hh > 2 * fh:  # where half logits cost accuracy at all (not fp16 with a heavy tail)
             assert eh < 0.4 * hh and ew < 0.4 * hw, (dtype, eh, hh, ew, hw)
