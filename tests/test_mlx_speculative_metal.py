@@ -694,6 +694,7 @@ def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qw
 def test_a_block_read_in_one_pass_over_the_kv_prefix_matches_one_row_sdpa_calls_bit_for_bit(heads, monkeypatch):
     from unsloth_zoo.mlx import inference
     gqa = heads[0] // heads[1]
+    monkeypatch.setattr(inference, "_EXACT_ATTENTION_THREADS", {})
     first, second = inference._exact_attention_kernels()
     templates = set()
     monkeypatch.setattr(inference, "_exact_attention_kernels", lambda: (lambda **kw: templates.add(tuple(kw["template"])) or first(**kw), second))
@@ -708,7 +709,19 @@ def test_a_block_read_in_one_pass_over_the_kv_prefix_matches_one_row_sdpa_calls_
         rows = mx.concatenate([mx.fast.scaled_dot_product_attention(
             q[:, :, i : i + 1], k[:, :, : keys - width + i + 1], v[:, :, : keys - width + i + 1], scale = 0.0625)
             for i in range(width)], axis = 2)
-        assert mx.array_equal(inference._exact_attention_rows(q, k, v, 0.0625, blocks).view(mx.uint16), rows.view(mx.uint16)).item()
+        try:
+            out = inference._exact_attention_rows(q, k, v, 0.0625, blocks)
+            mx.eval(out)
+        except ValueError as error:
+            # A device whose limit refuses the widest threadgroup (M1-class GPUs) launches fewer row pairs per threadgroup.
+            assert inference._fit_threadgroup(error, dtype, gqa)
+            out = inference._exact_attention_rows(q, k, v, 0.0625, blocks)
+        assert mx.array_equal(out.view(mx.uint16), rows.view(mx.uint16)).item()
+        # One row pair per threadgroup, the narrowest any limit leaves, reads the same bits.
+        with monkeypatch.context() as patch:
+            patch.setitem(inference._EXACT_ATTENTION_THREADS, (dtype, gqa), 32 * gqa)
+            narrow = inference._exact_attention_rows(q, k, v, 0.0625, blocks)
+            assert mx.array_equal(narrow.view(mx.uint16), rows.view(mx.uint16)).item()
     # One compile per layout serves every width: the row count is an input, not a template parameter.
     assert templates == {(("T", dtype), ("D", 256), ("G", gqa), ("BLOCKS", inference._sdpa_vector_blocks(gqa, keys - width + 1)))
                          for _, width, keys, dtype in cases}
@@ -758,6 +771,20 @@ def test_exact_attention_engages_where_timed_faster_and_caches_each_bucket_verdi
         monkeypatch.setattr(inference, "_exact_attention_faster", lambda per_row, fused: (_ for _ in ()).throw(RuntimeError(message)))
         with pytest.raises(RuntimeError) if raised else contextlib.nullcontext():
             assert attend(17000, q5) == 17000 and list(inference._EXACT_ATTENTION_TIMED.values()) == [[1, 2]]
+    # A threadgroup over the device's limit is retimed at the limit MLX quotes; a limit below one row pair's is a loss.
+    refusal = "Thread group size (1024) is greater than  the maximum allowed threads per threadgroup (%d)."
+    for limit, kernel in ((640, True), (96, False)):
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
+        monkeypatch.setattr(inference, "_EXACT_ATTENTION_THREADS", {})
+        refused = []
+        def faster(per_row, fused):
+            if not refused:
+                refused.append(1)
+                raise ValueError(refusal % limit)
+            return True
+        monkeypatch.setattr(inference, "_exact_attention_faster", faster)
+        assert (attend(17000, q5) == "kernel") is kernel
+        assert inference._EXACT_ATTENTION_THREADS == ({(mx.bfloat16, 6): 640} if kernel else {})
     # The kernel must beat the one-row calls by 5% on the medians of three alternating runs; each run advances the clock by its own time.
     for rows, kernel, verdict in (((10, 30, 10), (9.4, 9.4, 30), True), ((10, 10, 40), (9.4, 9.6, 9.6), False)):
         now, spent, order = [0.0], [0.0], []

@@ -4311,6 +4311,9 @@ _EXACT_ATTENTION_MIN_KEYS = 8192
 # Per timing key: True once the kernel timed faster, else [timings, calls left before retiming], as short of memory the kernel can run slow for a while.
 _EXACT_ATTENTION_TIMED = {}
 _EXACT_ATTENTION_TIMINGS, _EXACT_ATTENTION_RETRY = 3, 128
+# Per (dtype, query heads per KV head): the rows kernel's threadgroup limit on this device, once a launch was refused
+# (640 on M1-class GPUs). Row pairs per threadgroup only share loads through L1, so fewer leave every row's bits as they are.
+_EXACT_ATTENTION_THREADS = {}
 
 
 @functools.cache
@@ -4339,7 +4342,7 @@ def _exact_attention_rows(queries, keys, values, scale, blocks):
     batch, heads, length, dim = queries.shape
     kv_heads, gqa = keys.shape[1], heads // keys.shape[1]
     pairs = -(-length // 2)
-    per_group = min(pairs, 32 // gqa)
+    per_group = min(pairs, 32 // gqa, max(1, _EXACT_ATTENTION_THREADS.get((queries.dtype, gqa), 1024) // (32 * gqa)))
     groups = -(-pairs // per_group)
     rows = batch * heads * length
     first, second = _exact_attention_kernels()
@@ -4382,11 +4385,15 @@ def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
             _unless_failed_buffer(error)
             return per_row()  # inside a function transformation, which cannot evaluate; timed later
         _FIRST_USE_WORK[0] += 1
-        try:
-            faster = _exact_attention_faster(per_row, fused)
-        except (RuntimeError, ValueError) as error:
-            _unless_failed_buffer(error)
-            faster = False  # the kernel cannot build or launch here: a loss
+        while True:
+            try:
+                faster = _exact_attention_faster(per_row, fused)
+                break
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                faster = False  # the kernel cannot build or launch here: a loss
+                if not _fit_threadgroup(error, queries.dtype, gqa):
+                    break
         if not faster:
             timings = 1 if lost is None else lost[0] + 1
             _EXACT_ATTENTION_TIMED[timing] = [timings, _EXACT_ATTENTION_RETRY << timings]
@@ -4394,6 +4401,16 @@ def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
         _EXACT_ATTENTION_TIMED[timing] = True
     key = ((queries.shape[0], length), "attention", queries.shape[1], keys.shape[1], queries.dtype, blocks)
     return _verify_admitted(key, per_row, fused)
+
+
+def _fit_threadgroup(error, dtype, gqa):
+    """Whether a rows-kernel launch refused for its threadgroup size now launches within the limit MLX quoted."""
+    found = re.search(r"maximum allowed threads per threadgroup \((\d+)\)", str(error))
+    limit = int(found.group(1)) if found else 0
+    if limit < 32 * gqa or _EXACT_ATTENTION_THREADS.get((dtype, gqa), 1024) <= limit:
+        return False
+    _EXACT_ATTENTION_THREADS[(dtype, gqa)] = limit
+    return True
 
 
 def _exact_attention_faster(per_row, fused, clock = time.perf_counter):
