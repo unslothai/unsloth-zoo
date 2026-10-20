@@ -1293,6 +1293,8 @@ def test_lazy_entropy_with_a_trainable_head_recomputes(device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 @pytest.mark.parametrize("use_ent", [False, True])
 def test_lazy_entropy_compiles_without_graph_breaks(use_ent):
+    if not fl._HAS_TRITON:
+        pytest.skip("Inductor compiles GPU code through Triton")
     import torch._dynamo
     torch._dynamo.reset()
     h, w, _, t = _make("cuda", _dtypes("cuda")[-1], 64, 32, 40001)
