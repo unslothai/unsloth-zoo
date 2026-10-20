@@ -21,6 +21,8 @@ __all__ = [
     "unsloth_count_aware_cross_entropy",
     "unsloth_loss_count_kwargs",
     "unsloth_fsdp_unshard",
+    "unsloth_zero3_partitioned",
+    "unsloth_zero3_gathered",
 ]
 
 import torch
@@ -98,6 +100,40 @@ def unsloth_fsdp_unshard(module):
         if isinstance(submodule, FSDPModule):
             # No-op once unsharded; post-backward reshards it and reduce-scatters its gradient.
             _fsdp_unshard(submodule)
+pass
+
+def unsloth_zero3_partitioned(tensor):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """True for a DeepSpeed ZeRO-3 parameter that may be a released placeholder outside its module's forward."""
+    return (
+        tensor is not None
+        and hasattr(tensor, "ds_id")
+        and hasattr(tensor, "ds_status")
+        and not getattr(tensor, "ds_persist", False)
+    )
+pass
+
+def unsloth_zero3_gathered(tensor):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """A full, detached copy of a ZeRO-3 partitioned parameter; anything else is returned unchanged.
+
+    ZeRO-3 gathers a parameter only around its own module's forward (or, inside the engine forward,
+    on attribute access). The GRPO scoring head reads lm_head.weight after the model forward has
+    released it, which leaves a 0-element placeholder for both its forward and its backward. Every rank
+    calls this at the same point, so the all-gather is matched. The copy carries no gradient: a
+    trainable head under ZeRO-3 is refused instead of silently dropping its update.
+    """
+    if not unsloth_zero3_partitioned(tensor):
+        return tensor
+    if tensor.requires_grad and torch.is_grad_enabled():
+        raise NotImplementedError(
+            "Unsloth: the output head (lm_head) is trainable under DeepSpeed ZeRO-3, and the GRPO "
+            "scoring head reads it outside the model forward, so its gradient cannot reach ZeRO-3. "
+            "Freeze lm_head (do not list it in modules_to_save), or use ZeRO-2 / FSDP2."
+        )
+    import deepspeed
+    with deepspeed.zero.GatheredParameters([tensor], modifier_rank = None):
+        return tensor.data.detach().clone()
 pass
 
 def apply_autograd_function(autograd, mapping):
