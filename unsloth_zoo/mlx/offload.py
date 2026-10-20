@@ -32,6 +32,7 @@ import math
 import os
 import re
 import struct
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -776,11 +777,11 @@ class OffloadSwitchGLU(nn.Module):
 
 
 def _decode_block(glu, x):
-    """Whether the stock call takes mlx-vlm's decode-block path."""
+    """Whether the stock call takes mlx-vlm's decode-block path (from 0.7.1; none before)."""
     if type(glu).__module__ != "mlx_vlm.models.switch_layers":
         return False
-    from mlx_vlm.models.linear import DECODE_BLOCK_SIZE
-    return not glu.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE
+    size = getattr(sys.modules[type(glu).__module__], "DECODE_BLOCK_SIZE", 0)
+    return not glu.training and x.ndim == 3 and 1 < x.shape[1] <= size
 
 
 def expert_sites(model):

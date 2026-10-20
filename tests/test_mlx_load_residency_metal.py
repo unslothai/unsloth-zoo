@@ -343,6 +343,16 @@ def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
         np.testing.assert_array_equal(_bits(got), _bits(want))
 
 
+def test_decode_blocks_follow_the_installed_mlx_vlm(monkeypatch):
+    switch_layers = pytest.importorskip("mlx_vlm.models.switch_layers")
+    glu = _moe("vlm").layers[0].switch_mlp
+    short = mx.zeros((1, 2, 512), mx.bfloat16)
+    monkeypatch.setattr(switch_layers, "DECODE_BLOCK_SIZE", 8, raising = False)  # as from 0.7.1
+    assert zoo_offload._decode_block(glu, short)
+    monkeypatch.delattr(switch_layers, "DECODE_BLOCK_SIZE")  # as before mlx-vlm 0.7.1
+    assert not zoo_offload._decode_block(glu, short)
+
+
 def test_offloaded_experts_run_on_another_thread(tmp_path):
     # Loaded here and generated on a server's request thread, which has its own MLX stream.
     stock = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
