@@ -12,9 +12,7 @@ import triton.language as tl
 
 # Modified by Unsloth: the upstream launch-config table (vllm replayssm_config.py,
 # "gdn_decode" entry of vllm-project/vllm#48792) is inlined, since released vLLM has no GDN entry,
-# plus a T4 (sm75) entry: (64, 1, 3, 2) there is 2-25x slower (B=1..64) than (32, 1, 1, 4) and
-# 9.5x slower than fla fused_recurrent at B=64; (32, 1, 1, 4) is 1.7-2.7x faster than fla.
-# Cached per device: this runs once per GDN layer per decode step.
+# plus a T4 (sm75) entry 2-25x faster there than (64, 1, 3, 2) (B=1..64). Cached per device.
 _REPLAYSSM_CONFIG_BY_DEVICE = {}
 
 

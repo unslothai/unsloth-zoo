@@ -139,7 +139,6 @@ def test_stacked_nf4_routing_is_kept_on_t4(cap, fake_cap, monkeypatch):
         assert MR.routed_moe_forward(ex, x, idx, w) is not None
 
 
-# ---------------------------------------------------------------- GDN ReplaySSM decode launch config
 from unsloth_zoo._vendored.vllm import gdn_replayssm_decode as GDN  # noqa: E402
 
 # Upstream (vllm-project/vllm#48792) table, unchanged off T4; T4 measured (Colab T4, torch 2.10 / 2.14, B=1/8/64):
