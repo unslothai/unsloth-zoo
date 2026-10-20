@@ -24,6 +24,7 @@ import functools
 import copy
 import hashlib
 import inspect
+import itertools
 import json
 import logging
 import math
@@ -3812,6 +3813,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         nax.SORTED_GATHER_PROBE_KEY, nax.__name__, "probe_sorted_gather_qmm"):
                     fresh = [(module, rows, int8, False) for module, rows, int8, _ in fresh]
                 fresh = [entry for entry in fresh if entry[1] is not None or entry[2] or entry[3]]
+                tiled = any(rows is not None for _, rows, _, _ in fresh) and _tiled_prefill_enabled()
                 for module, rows, int8_prefill_rows, gather in fresh:
                     if type(module) in switches:
                         if int8_prefill_rows:
@@ -3822,7 +3824,8 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         continue
                     module._unsloth_nax_qmm_rows = (0, -1) if rows is None else rows
                     K = module["weight"].shape[-1] * 32 // module.bits
-                    after = min(row for row in (_DENSE_QMM_MIN_ROWS, int8_prefill_rows) if row)
+                    prefill = _TILED_QMM_MIN_ROWS if tiled else _DENSE_QMM_MIN_ROWS
+                    after = min(row for row in (prefill, int8_prefill_rows) if row)
                     module._unsloth_nax_qmm_floor = min(after, rows[0] if rows else after) * K
                     module._unsloth_nax_qmm_ceiling = (rows[1] if rows else -1) * K
                     module._unsloth_nax_qmm_next = after * K
@@ -3874,12 +3877,136 @@ def _dense_qmm_rows(M, N, K):
             2 * widest > K, next((rows for rows in (128, 64, 32) if M % rows == 0), 0))
 
 
+# Stock's transposed affine qmm (`qmm_t_impl`) at a 64x32x64 tile instead of 32x32x32: every output element
+# still sums its 32-wide K steps in the same order, so it reproduces stock's plain qmm bit for bit.
+_TILED_QMM_BITS = (2, 3, 4, 5, 6, 8)
+_TILED_QMM_GROUP_SIZES = (32, 64, 128)
+_TILED_QMM_TILE = {"BM": 64, "BK": 32, "BN": 64}
+_TILED_QMM_ARGUMENTS = ("w", "scales", "biases", "x", "y", "Xs", "Ws", "K", "N", "M", "K_eff",
+                        "tid", "lid", "simd_gid", "simd_lid")
+_TILED_QMM_SOURCE = """
+    constexpr int BM = {BM}, BK = {BK}, BN = {BN};
+    constexpr int BK_padded = (BK + 16 / sizeof(T));
+    threadgroup T Xs[BM * BK_padded];
+    threadgroup T Ws[BN * BK_padded];
+    qmm_t_impl<{template}>(w, scales, biases, x, y, Xs, Ws, K, N, M, K, threadgroup_position_in_grid,
+        thread_index_in_threadgroup, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+"""
+TILED_QMM_PROBE_KEY = "tiled_qmm:" + hashlib.sha256(
+    _TILED_QMM_SOURCE.format(template = "", **_TILED_QMM_TILE).encode()).hexdigest()[:12]
+# Releases whose quantized matmul dispatch `_tile_shape_loses` keeps clear of split-K and qmv.
+_TILED_QMM_DISPATCH_MLX = ("0.32.3", "0.32.4")
+# Stock may run qmv up to 32 rows, and fewer rows pad one 64-row tile past stock's 32-row one.
+_TILED_QMM_MIN_ROWS = _TILED_QMM_TILE["BM"] // 2 + 1
+
+
+def _tiled_qmm_source(header):
+    """The kernel body calling `header`'s `qmm_t_impl` at the wider tile; None for a signature it does not know."""
+    found = re.search(r"template\s*<([^<>]*)>\s*METAL_FUNC void qmm_t_impl\s*\(([^)]*)\)", header)
+    if found is None:
+        return None
+    named = {"T": "T", "group_size": "GS", "bits": "BITS", "aligned_N": "true", "U": "T",
+             **{name: name for name in _TILED_QMM_TILE}}
+    parameters = [parameter.partition("=")[0].split()[-1] for parameter in found.group(1).split(",")]
+    arguments = tuple(re.sub(r"\[\[.*?\]\]", "", argument).split()[-1].lstrip("*&")
+                      for argument in found.group(2).split(","))
+    if (not set(parameters) <= named.keys() or not {"aligned_N", *_TILED_QMM_TILE} <= set(parameters)
+            or arguments != _TILED_QMM_ARGUMENTS):
+        return None
+    return _TILED_QMM_SOURCE.format(template = ", ".join(named[name] for name in parameters), **_TILED_QMM_TILE)
+
+
+@functools.cache
+def _tiled_qmm_kernel():
+    try:
+        if not mx.metal.is_available():
+            return None
+        seen = set()
+        _inline("mlx/backend/metal/kernels/utils.h", seen)   # already in metal_kernel's preamble
+        header = "".join(_inline(f"mlx/backend/metal/kernels/{name}", seen, None, stop) for name, stop in (
+            ("steel/gemm/loader.h", None), ("steel/gemm/mma.h", None), ("quantized.h", "qmm_n_impl")))
+        source = _tiled_qmm_source(header)
+        return source and mx.fast.metal_kernel(
+            name = "unsloth_tiled_qmm", input_names = ["w", "scales", "biases", "x", "K", "N", "M"],
+            output_names = ["y"], header = header, source = source)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+# Stock's qmm_splitk splits K to bring its grid up to about this many threadgroups, enough to fill the GPU.
+_QMM_SPLITK_THREADGROUPS = 512
+
+
+def _tile_shape_loses(M, N):
+    """Whether the tile pads more rows than stock's 32-row tiles, or its grid has fewer threadgroups than stock's
+    split-K aims for: a quarter of stock's grid leaves the GPU idle between a layer's dependent calls.
+
+    Otherwise stock runs plain qmm: its grid is four times the tile's, and 33+ rows are past its qmv limit."""
+    BM, BN = _TILED_QMM_TILE["BM"], _TILED_QMM_TILE["BN"]
+    return -(-M // BM) * BM > -(-M // 32) * 32 or (N // BN) * -(-M // BM) < _QMM_SPLITK_THREADGROUPS
+
+
+def tiled_qmm(x, w, scales, biases, group_size, bits):
+    """`quantized_matmul(x, w, scales, biases, transpose=True)` for a 2-D x, as stock's plain qmm computes it."""
+    (M, K), N = x.shape, w.shape[0]
+    return _tiled_qmm_kernel()(
+        inputs = [w, scales, biases, x, _scalar(K), _scalar(N), _scalar(M)],
+        template = [("T", x.dtype), ("GS", group_size), ("BITS", bits)],
+        grid = (128 * (N // _TILED_QMM_TILE["BN"]), -(-M // _TILED_QMM_TILE["BM"]), 1), threadgroup = (128, 1, 1),
+        output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
+
+
+@functools.cache
+def _differentiable_tiled_qmm(group_size, bits):
+    """`tiled_qmm` with stock's vjp (Metal kernels have none); the packed weight gets zeros."""
+    def stock(x, w, scales, biases):
+        return mx.quantized_matmul(x, w, scales, biases, transpose = True, group_size = group_size, bits = bits)
+
+    @mx.custom_function
+    def routed(x, w, scales, biases):
+        return tiled_qmm(x, w, scales, biases, group_size, bits)
+
+    @routed.vjp
+    def routed_vjp(primals, cotangent, output):
+        x, w, scales, biases = primals
+        with mx.stream(mx.gpu):   # where the forward ran, as stock's vjp keeps its op's stream
+            _, (dx, ds, db) = mx.vjp(lambda x, s, b: stock(x, w, s, b), (x, scales, biases), (cotangent,))
+        return dx, mx.zeros_like(w), ds, db
+
+    return routed
+
+
+def probe_tiled_qmm():
+    """Subprocess probe: bit-identical to stock at each bit width and group size, ragged and full row tiles."""
+    for dtype, bits, group_size in itertools.product((mx.bfloat16, mx.float16), _TILED_QMM_BITS,
+                                                     _TILED_QMM_GROUP_SIZES):
+        w = mx.random.normal((4096, 512), key = mx.random.key(group_size)) * 0.05
+        w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
+        for M in (100, 256):
+            x = mx.random.normal((M, 512), key = mx.random.key(M)).astype(dtype)
+            native = mx.quantized_matmul(x, w, scales, biases, transpose = True, group_size = group_size, bits = bits)
+            got = tiled_qmm(x, w, scales, biases, group_size, bits)
+            assert mx.array_equal(got.view(mx.uint16), native.view(mx.uint16)).item(), (dtype, bits, group_size, M)
+
+
+def _tiled_prefill_enabled():
+    """Whether the tile serves here: on, stock runs no NAX kernels, and its kernel built and passed its probe."""
+    # It runs inside the dense prefill scope, so that scope's opt-out turns it off too.
+    if (any(os.environ.get(name, "1") == "0" for name in ("UNSLOTH_MLX_TILED_PREFILL", "UNSLOTH_MLX_DENSE_PREFILL"))
+            or mx.__version__ not in _TILED_QMM_DISPATCH_MLX):
+        return False
+    # Where stock runs its NAX kernels (another tile and K order) it keeps them, whatever `UNSLOTH_MLX_NAX` says.
+    return (qmm.simd_qmm_available() and _tiled_qmm_kernel() is not None and nax.kernel_probe_passed(
+        TILED_QMM_PROBE_KEY, __name__, "probe_tiled_qmm", qmm.simd_qmm_available))
+
+
 def _dense_prefill_qmm(module, x, bindings):
     """`x` times the dequantized weight for a prefill-sized call, or None when it takes the native call.
 
     MLX's quantized matmul dequantizes inside every tile; dequantizing once is the same arithmetic.
     Compared bit for bit on first use per (`_dense_qmm_rows`, shape, quantization, dtypes). Another MLX or a
     one-column output (matvec, kernel picked per row count) would need a check per prompt length: native.
+    Calls it declines go to the tiled route when that is on, exact by construction and not compared.
     """
     if mx.__version__ not in _DENSE_QMM_DISPATCH_MLX:
         return None
@@ -3893,6 +4020,8 @@ def _dense_prefill_qmm(module, x, bindings):
         return None
     if (M < _DENSE_QMM_MIN_ROWS or N == 1 or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
             or N * K > _DENSE_QMM_MAX_WEIGHTS or module.training or not _bindings_intact(bindings)):
+        if module.__dict__.get("_unsloth_tiled_qmm"):
+            return _tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings)
         return None
     group_size, bits, mode = module.group_size, module.bits, module.mode
     family = (N, K, bits, group_size, mode, x.dtype, w.dtype, scales.dtype, getattr(biases, "dtype", None))
@@ -3918,6 +4047,19 @@ def _dense_prefill_qmm(module, x, bindings):
                            "%s group %d %s at %d rows; the native call stays in use",
                            N, K, bits, mode, group_size, x.dtype, M)
     return dense if verified else None
+
+
+def _tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings):
+    group_size, bits, mode = module.group_size, module.bits, module.mode
+    if (mx.default_device() != mx.gpu or mode != "affine" or bits not in _TILED_QMM_BITS
+            or group_size not in _TILED_QMM_GROUP_SIZES
+            or not isinstance(biases, mx.array) or not x.dtype == scales.dtype == biases.dtype
+            or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32) or K % group_size
+            or scales.shape != (N, K // group_size) or biases.shape != scales.shape
+            or N % _TILED_QMM_TILE["BN"] or _tile_shape_loses(M, N)
+            or module.training or not _bindings_intact(bindings)):
+        return None
+    return _differentiable_tiled_qmm(group_size, bits)(x.reshape(M, K), w, scales, biases).reshape(*x.shape[:-1], N)
 
 
 @functools.cache
@@ -3957,6 +4099,11 @@ def dense_prefill_linear(model, *, _modules = None):
     training, and any shape that fails its first-use comparison keep the native call. A linear the
     NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
     `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
+
+    Where stock MLX runs no NAX kernels, affine calls this route leaves to stock's plain quantized matmul
+    run that kernel at a 64x32x64 tile instead. It sums K in stock's order, so it is bit-identical by
+    construction (checked once per MLX version by a probe, not per shape); `UNSLOTH_MLX_TILED_PREFILL=0`
+    turns that off.
     """
     changed = []
     try:
@@ -3965,6 +4112,7 @@ def dense_prefill_linear(model, *, _modules = None):
             if (os.environ.get("UNSLOTH_MLX_DENSE_PREFILL", "1") != "0"
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 fused = _dense_qmm_class(nn.QuantizedLinear.__call__)
+                tiled = None   # its probe waits for a linear it could serve
             if fused is not None:
                 seen = set()
                 for _, module in _fusion_modules(model, _modules):
@@ -3979,9 +4127,13 @@ def dense_prefill_linear(model, *, _modules = None):
                     elif module.training or type(module) is fused:
                         continue
                     else:
+                        if tiled is None:   # before this module changes, so an interrupted probe leaves none behind
+                            tiled = _tiled_prefill_enabled()
                         if type(module) is nn.QuantizedLinear:
                             module.__class__ = fused
                         module._unsloth_dense_qmm_scopes = 1
+                        if tiled:
+                            module.__dict__["_unsloth_tiled_qmm"] = True
                     changed.append((module, fused))
         yield model
     finally:
@@ -3992,6 +4144,7 @@ def dense_prefill_linear(model, *, _modules = None):
                     if type(module) is fused:   # a NAX-routed linear keeps the NAX scope's class
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
+                    module.__dict__.pop("_unsloth_tiled_qmm", None)
 
 
 # The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
