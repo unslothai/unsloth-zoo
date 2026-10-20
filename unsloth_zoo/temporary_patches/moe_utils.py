@@ -5584,11 +5584,14 @@ def forward_native_moe_loop(
             _down_scaling,
         )
 
-    # Expert mask -> which experts have tokens.
+    # Stable sort keeps torch.where(one_hot)'s (slot, token) row order: bit-identical results.
     with torch.no_grad():
-        expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-        expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        n_tokens = top_k_index.shape[0]
+        slot_major = top_k_index.t().reshape(-1)   # position = top_k_pos * n_tokens + token
+        order = torch.argsort(slot_major, stable=True)
+        routed_token_idx = order % n_tokens
+        routed_top_k_pos = order // n_tokens
+        expert_counts = torch.bincount(slot_major, minlength=self.num_experts).tolist()
 
     # A declared (E, in, out) layout (_unsloth_grouped_mm_format) wins over the shape test, which a square stack defeats.
     grouped_mm_format = bool(_module_flag(self, "_unsloth_grouped_mm_format", False)) or (
@@ -5600,10 +5603,13 @@ def forward_native_moe_loop(
     is_gpt_oss = "GptOssExperts" in self.__class__.__name__
     own_apply_gate = _uses_own_apply_gate(self)
 
-    for expert_idx_t in expert_hit:
-        expert_idx = expert_idx_t.item()
-
-        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+    row_end = 0
+    for expert_idx, count in enumerate(expert_counts):
+        row_start, row_end = row_end, row_end + count
+        if count == 0:
+            continue
+        token_idx = routed_token_idx[row_start:row_end]
+        top_k_pos = routed_top_k_pos[row_start:row_end]
         current_state = hidden_states[token_idx]
 
         # gate_up projection for this expert ('gate_up_proj' or 'w1'/'w3').
