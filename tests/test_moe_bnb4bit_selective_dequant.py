@@ -241,6 +241,6 @@ def test_default_capped_plan_declines_when_rows_cover_the_stack(monkeypatch):
     monkeypatch.delenv("UNSLOTH_MOE_SELECTIVE_DEQUANT")
     assert mu._selective_dequant_plan((plain,), counts, 2) is None
     counts = torch.zeros(E, dtype = torch.int32, device = DEVICE)
-    counts[5], counts[9] = 2, 1   # 3 rows on 2 experts: one unrouted expert pads the plan
+    counts[5], counts[9] = 2, 1   # unrouted expert pads
     ids, row_lo, row_hi, offsets = mu._selective_dequant_plan(sources, counts, 3).chunks[0]
     assert (row_lo, row_hi) == (0, 3) and ids.tolist() == [5, 9, 0] and offsets.tolist() == [2, 3, 3]

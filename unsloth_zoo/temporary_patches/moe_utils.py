@@ -1099,8 +1099,8 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
-# UNSLOTH_MOE_SELECTIVE_DEQUANT (bnb 4-bit recompute): "auto" (default) = num_rows experts picked on device
-# (sync-free, capturable) when rows < 7/8 of experts; "1" = exact routed set via one host sync; "0" = full stack.
+# UNSLOTH_MOE_SELECTIVE_DEQUANT: "auto" = num_rows experts on device (sync-free) if rows <= 7/8 E;
+# "1" = exact routed set (one host sync); "0" = full stack.
 SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
 
 
