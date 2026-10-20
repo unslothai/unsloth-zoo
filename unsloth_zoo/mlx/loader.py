@@ -1741,6 +1741,7 @@ def _load_mlx_vlm_distributed(
     model_label = f"'{model_name}'"
     if model_type:
         model_label = f"{model_label} (model_type={model_type!r})"
+    _patch_glm5_next_quantization_aliases(model_type)
 
     try:
         from mlx_vlm.utils import get_model_path, sharded_load

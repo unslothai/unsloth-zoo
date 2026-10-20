@@ -363,6 +363,14 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
     assert calls[0][1:3] == (tensor_group, None)
     assert all(call[1:3] == (None, pipeline_group) for call in calls[1:])
     assert len(bound_calls) == 5
+    # A mixed-bit GLM-5-Next checkpoint needs the fused-layer aliases on this path too.
+    patched = []
+    monkeypatch.setattr(
+        loader, "_patch_glm5_next_quantization_aliases", lambda t: patched.append((t, len(calls)))
+    )
+    loaded = len(calls)
+    _load_mlx_vlm_distributed("fake/vlm", "glm5_next", tensor_group=tensor_group)
+    assert patched == [("glm5_next", loaded)] and len(calls) == loaded + 1
 
 
 def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatch, tmp_path):
