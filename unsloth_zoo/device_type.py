@@ -611,8 +611,7 @@ def device_empty_cache():
 pass
 
 def _xpu_bf16_supported():
-    """Native bf16 on every visible XPU. torch.xpu.is_bf16_supported() counts emulation, so it
-    is always True. Torch without has_bfloat16_conversions, or an unreadable card, answers True."""
+    """Native bf16 on every XPU (is_bf16_supported() counts emulation); unknown answers True."""
     try:
         flags = [
             getattr(torch.xpu.get_device_properties(index), "has_bfloat16_conversions", True)
