@@ -33,8 +33,9 @@ PAST_WINDOW = "Summarize these notes in one paragraph:\n" + "The planets orbit t
 
 def _load(repo, *extra):
     from mlx_vlm import load
-    from unsloth_zoo.mlx.loader import _ensure_exact_verify_sums_promoted
+    from unsloth_zoo.mlx.loader import _ensure_exact_verify_sums_promoted, _ensure_verify_qk_norm_matches_decode
     _ensure_exact_verify_sums_promoted()  # as FastMLXModel's VLM load does
+    _ensure_verify_qk_norm_matches_decode()
     model, processor = load(repo)
     model._processor, tok = processor, processor.tokenizer
     ids = [
@@ -88,10 +89,14 @@ def test_exact_verify_kernels_sum_their_input_as_the_installed_mlx_decode_does(m
 
 def test_a_fast_mlx_model_load_promotes_the_verify_sums(monkeypatch):
     from packaging.version import Version
+    from unsloth_zoo.mlx import loader
     from unsloth_zoo.mlx.loader import FastMLXModel
     modules, before = _verify_sources(monkeypatch)
+    repointed, repoint = [], loader._ensure_verify_qk_norm_matches_decode
+    monkeypatch.setattr(loader, "_ensure_verify_qk_norm_matches_decode", lambda: repointed.append(1) or repoint())
     FastMLXModel.from_pretrained(QUANTIZED)
     _assert_promoted(modules, before, Version(mx.__version__) >= Version("0.32.4"))
+    assert repointed
 
 
 @pytest.fixture(scope = "module")

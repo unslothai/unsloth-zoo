@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import ast
+import contextlib
 import functools
 import importlib
 import inspect
+import json
 import math
+import os
 import textwrap
 from types import FunctionType, SimpleNamespace
 
@@ -931,6 +934,8 @@ def test_qsa_route_skips_a_zero_block_budget(monkeypatch):
 def test_qsa_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
     attention, foreign = _qsa_layer(), lambda *args: None
     native = qwen4.Qwen4ExpQSAIndexer.select_from_projected
+    # Recorded first so teardown restores the native method, not the route open below.
+    monkeypatch.setattr(qwen4.Qwen4ExpQSAIndexer, "select_from_projected", native)
     with decode.fused_qsa_attention(attention):
         monkeypatch.setattr(qwen4.Qwen4ExpQSAIndexer, "select_from_projected", foreign)
     assert qwen4.Qwen4ExpQSAIndexer.select_from_projected is foreign
@@ -1022,3 +1027,241 @@ def test_qsa_prefill_route_steps_aside(reason, monkeypatch):
     native = qwen4.dispatch_qsa_attention
     with decode.inference_scopes(attention):
         assert qwen4.dispatch_qsa_attention is native
+
+
+def _qsa_attention():
+    if qwen4 is None:
+        pytest.skip("mlx-vlm without qwen4_exp")
+    mx.random.seed(5)
+    attention = qwen4.Qwen4ExpAttention(Qwen4TextConfig(
+        model_type = "qwen4_exp", hidden_size = 64, num_hidden_layers = 4, num_attention_heads = 2, num_key_value_heads = 1,
+        linear_num_value_heads = 1, linear_num_key_heads = 1, linear_key_head_dim = 16, linear_value_head_dim = 16,
+        linear_conv_kernel_dim = 4, num_experts = 2, num_experts_per_tok = 1, shared_expert_intermediate_size = 16,
+        moe_intermediate_size = 16, rms_norm_eps = 1e-6, vocab_size = 64, max_position_embeddings = 4096, head_dim = 64,
+        indexer_n_heads = 2, indexer_head_dim = 32, indexer_budget = 16, rope_parameters = {
+            "type": "default", "mrope_section": [3, 3, 2], "rope_theta": 10000, "partial_rotary_factor": 0.25}))
+    attention.set_dtype(mx.bfloat16)
+    attention.eval()
+    return attention
+
+
+def _speculative_rounds(attention, cache):
+    # Rejections that do and do not cross a pooled-block boundary, and a full acceptance. Each round
+    # brings new rows, as a corrected token replaces a rejected draft.
+    x = mx.random.normal((1, 81, 64), key = mx.random.key(9)).astype(mx.bfloat16)
+    steps = [attention(x[:, :61], cache = cache), cache.index_block_keys]
+    for start, reject in zip(range(61, 81, 4), (3, 1, 0, 2, 3)):
+        steps += [attention(x[:, start:start + 4], cache = cache), cache.index_block_keys]
+        cache.trim(reject)
+        steps.append(cache.index_block_keys)
+    return steps
+
+
+@pytest.mark.parametrize("cache, args", [("QSAKVCache", {}), ("QSAQuantizedKVCache", {"group_size": 32, "bits": 8}),
+                                         ("BatchQSAKVCache", {"left_padding": [0]})])
+@pytest.mark.parametrize("scopes", [("exact_qsa_trim",), ("fused_qsa_attention", "exact_qsa_trim"),
+                                    ("exact_qsa_trim", "fused_qsa_attention")])
+def test_qsa_trim_keeps_the_blocks_a_repool_rebuilds_bitwise(cache, args, scopes):
+    attention, select = _qsa_attention(), qwen4.Qwen4ExpQSAIndexer.select_from_projected
+    stock = _speculative_rounds(attention, getattr(qwen4, cache)(**args))
+    with contextlib.ExitStack() as stack:
+        for scope in scopes:
+            stack.enter_context(getattr(decode, scope)(attention))
+        assert (qwen4.Qwen4ExpQSAIndexer.select_from_projected is select) == (len(scopes) == 1)
+        kept = _speculative_rounds(attention, getattr(qwen4, cache)(**args))
+    for index, (a, b) in enumerate(zip(stock, kept)):
+        if index % 3 == 1 and index > 1:  # just after a trim: stock drops every block, the scope keeps a prefix
+            assert a is None and b.shape[2] > 0
+        else:
+            _equal(a, b)
+
+
+def test_qsa_trim_scope_leaves_other_models_drifted_bodies_and_foreign_bindings(monkeypatch):
+    attention, stock = _qsa_attention(), qwen4.QSAKVCache.trim
+    monkeypatch.setattr(qwen4.QSAKVCache, "trim", stock)
+    with decode.exact_qsa_trim(_model()):
+        assert qwen4.QSAKVCache.trim is stock
+    with decode.exact_qsa_trim(attention):
+        assert qwen4.QSAKVCache.trim is not stock
+        with decode.exact_qsa_trim(attention):
+            pass
+        assert qwen4.QSAKVCache.trim is not stock
+    assert qwen4.QSAKVCache.trim is stock
+    with decode.exact_qsa_trim(attention):
+        qwen4.QSAKVCache.trim = foreign = lambda self, n: n
+    assert qwen4.QSAKVCache.trim is foreign
+    qwen4.QSAKVCache.trim = stock
+    indexer = qwen4.Qwen4ExpQSAIndexer
+    monkeypatch.setattr(indexer, "select_from_projected", indexer.select_from_projected)  # teardown restores native
+    for wrap_first in (True, False):  # functools.wraps carries the fused route's mark onto a foreign wrapper
+        with decode.fused_qsa_attention(attention):
+            route = indexer.select_from_projected
+            wrapper = functools.wraps(route)(lambda *args: route(*args))
+            indexer.select_from_projected = wrapper if wrap_first else route
+            with decode.exact_qsa_trim(attention):
+                indexer.select_from_projected = wrapper
+                assert _speculative_rounds(attention, qwen4.QSAKVCache())[4] is None
+            indexer.select_from_projected = route
+    contract ={name: dict(names) for name, names in decode._QSA_TRIM_CONTRACT.items()}
+    contract[decode._QSA_LANGUAGE]["Qwen4ExpQSAIndexer.select_from_projected"] = "0" * 16
+    monkeypatch.setattr(decode, "_QSA_TRIM_CONTRACT", contract)
+    with decode.exact_qsa_trim(attention):
+        assert qwen4.QSAKVCache.trim is stock
+
+
+def _dilated_conv(dtype = mx.bfloat16, channels = 320, dilation = 3, bias = False, groups = None, out = None):
+    mx.random.seed(channels + dilation)
+    conv = nn.Conv1d(channels, out or channels, 4, dilation = dilation, groups = groups or channels, bias = bias)
+    if bias:
+        conv.bias = mx.random.normal(conv.bias.shape)
+    conv.set_dtype(dtype)
+    conv.eval()
+    return conv
+
+
+@pytest.mark.parametrize("dtype, dilation, bias", [(mx.bfloat16, 3, False), (mx.float16, 2, True),
+                                                   (mx.float32, 5, False)])
+def test_dilated_depthwise_conv_matches_mx_conv1d_bitwise_and_restores(dtype, dilation, bias):
+    conv = _dilated_conv(dtype, dilation = dilation, bias = bias)
+    inputs = [(mx.random.normal((batch, rows + 3 * dilation, 320), key = mx.random.key(rows)) * 8).astype(dtype)
+              for batch, rows in ((1, 1), (2, 5), (1, 300))]
+    expected = [conv(x) for x in inputs]
+    with decode.exact_dilated_depthwise_conv(conv):
+        assert type(conv) is not nn.Conv1d
+        for x, reference in zip(inputs, expected):
+            _equal(conv(x), reference)
+    assert type(conv) is nn.Conv1d
+
+
+def test_dilated_depthwise_conv_scope_leaves_other_convs_and_a_differing_kernel(monkeypatch, caplog):
+    # Two output channels per group still has one input channel per weight row.
+    for conv in (_dilated_conv(dilation = 1), _dilated_conv(channels = 32, out = 64), _dilated_conv().train()):
+        with decode.exact_dilated_depthwise_conv(conv):
+            assert type(conv) is nn.Conv1d
+    conv = _dilated_conv(channels = 96)
+    with decode.exact_dilated_depthwise_conv(conv):
+        with decode.exact_dilated_depthwise_conv(conv):
+            pass
+        assert type(conv) is not nn.Conv1d
+    assert type(conv) is nn.Conv1d
+    monkeypatch.setattr(decode, "_depthwise_conv", lambda x, weight, dilation: mx.zeros(
+        (x.shape[0], x.shape[1] - 3 * dilation, x.shape[2]), x.dtype))
+    monkeypatch.setattr(decode, "_depthwise_conv_verified", functools.cache(decode._depthwise_conv_verified.__wrapped__))
+    with monkeypatch.context() as failing:  # a failed command buffer reads as a mismatch until the next synchronize
+        failing.setattr(mx, "synchronize", lambda: (_ for _ in ()).throw(RuntimeError(decode._FAILED_BUFFER)))
+        with pytest.raises(RuntimeError, match = "Command buffer"):
+            with decode.exact_dilated_depthwise_conv(_dilated_conv(channels = 64)):
+                pytest.fail("the generation ran past a failed command buffer")
+    assert decode._depthwise_conv_verified.cache_info().currsize == 0 and "differs" not in caplog.text
+    with caplog.at_level("WARNING"), decode.exact_dilated_depthwise_conv(_dilated_conv(channels = 64)) as conv:
+        assert type(conv) is nn.Conv1d
+    assert "differs from mx.conv1d" in caplog.text
+
+
+def _ple_table(path, cache_rows = 0, layout = "ranges"):
+    storage = pytest.importorskip("mlx_vlm.models.qwen4_exp.ple_storage")
+    prefix, weights = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards", {}
+    rng = np.random.default_rng(0)
+    with mx.stream(mx.cpu):
+        for shard, rows in enumerate((300, 500)):
+            weights[f"{prefix}.{shard}.weight"] = mx.array(rng.integers(0, 1 << 32, (rows, 8), dtype = np.uint32))
+            for name in ("scales", "biases"):
+                weights[f"{prefix}.{shard}.{name}"] = mx.array(rng.standard_normal((rows, 2), np.float32)).astype(mx.bfloat16)
+        mx.save_safetensors(str(path / "model.safetensors"), weights)
+    (path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": dict.fromkeys(weights, "model.safetensors")}))
+    (path / "config.json").write_text(json.dumps({"quantization": {"bits": 4, "group_size": 32, "mode": "affine"}}))
+    if layout == "ranges":
+        storage.build_quantized_ple_manifest(path, path / "ple.json")
+    else:
+        storage.materialize_interleaved_ple_store(path, path / "ple.json")
+    table = storage.QuantizedMMapNGramEmbedding(path / "ple.json", cache_rows = cache_rows)
+    return table, SimpleNamespace(named_modules = lambda: [("ple", SimpleNamespace(ngram_embedding = table))])
+
+
+def _row_bytes(table, rows):
+    if table._interleaved is not None:
+        return sorted(table._interleaved[row].tobytes() for row in rows)
+    return sorted(arrays[name][row - start].tobytes() for row in rows for start, end, arrays in table._shards
+                  if start <= row < end for name in ("weight", "scales", "biases"))
+
+
+def _recorded_reads(monkeypatch):
+    read, native = [], os.preadv
+
+    def preadv(descriptor, buffers, offset):
+        read.append(bytes(buffers[0][:(count := native(descriptor, buffers, offset))]))
+        return count
+
+    monkeypatch.setattr(os, "preadv", preadv)
+    return read
+
+
+def _same_rows(got, expected):
+    for a, b in zip(got, expected):
+        assert a.dtype == b.dtype and np.array_equal(a, b)
+
+
+@pytest.mark.parametrize("layout", ["ranges", "interleaved"])
+def test_ple_reads_warm_exactly_the_cold_uncached_rows_and_return_stock_bytes(layout, tmp_path, monkeypatch):
+    table, model = _ple_table(tmp_path, cache_rows = 4, layout = layout)
+    rows = np.array([2, 299, 300, 301, 799])
+    table._read_rows(np.array([299, 301]))  # now in the row cache, so not read again
+    expected = type(table)(tmp_path / "ple.json")._read_rows(rows)
+    read, gathered, native = _recorded_reads(monkeypatch), [], np.memmap.__getitem__
+    monkeypatch.setattr(decode, "_ple_resident", lambda parts: 0.0)
+    with decode.exact_ple_row_reads(model):
+        assert type(table).__name__ != "QuantizedMMapNGramEmbedding"
+        # The cold rows come from the reads, not a fault-taking gather over the memory map.
+        monkeypatch.setattr(np.memmap, "__getitem__", lambda self, index: gathered.append(index) or native(self, index))
+        got = table._read_rows(rows)
+        monkeypatch.setattr(np.memmap, "__getitem__", native)
+    assert gathered == [] and sorted(read) == _row_bytes(table, (2, 300, 799))
+    _same_rows(got, expected)
+
+
+def test_ple_reads_probe_and_read_only_rows_the_table_has_not_read(tmp_path, monkeypatch):
+    table, model = _ple_table(tmp_path)
+    expected = type(table)(tmp_path / "ple.json")._read_rows(np.array([2, 3, 300, 799]))
+    read, probed = _recorded_reads(monkeypatch), []
+    monkeypatch.setattr(decode, "_ple_resident", lambda parts: probed.append([rows.tolist() for _, rows in parts]) or 0.0)
+    with decode.exact_ple_row_reads(model):
+        table._read_rows(np.array([2, 300]))
+        del probed[:], read[:]
+        table._read_rows(np.array([300, 2]))
+        assert probed == [] and read == []
+        got = table._read_rows(np.array([2, 3, 300, 799]))
+    assert probed == [[[3], [499]]] and sorted(read) == _row_bytes(table, (3, 799))
+    _same_rows(got, expected)
+
+
+@pytest.mark.parametrize("layout", ["ranges", "interleaved"])
+def test_ple_reads_keep_concurrent_gathers_of_one_table_apart(layout, tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    table, model = _ple_table(tmp_path, layout = layout)
+    reference = type(table)(tmp_path / "ple.json")
+    monkeypatch.setattr(decode, "_ple_resident", lambda parts: 0.0)
+    barrier, prepare = threading.Barrier(2), decode._ple_pread_rows
+    # Both gathers run while the other's reads are pending.
+    monkeypatch.setattr(decode, "_ple_pread_rows", lambda *args: (prepare(*args), barrier.wait(5))[0])
+    picks = [np.array([1, 302, 650]), np.array([5, 299, 777])]
+    with decode.exact_ple_row_reads(model), ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(table._read_rows, picks))
+    for rows, got in zip(picks, results):
+        _same_rows(got, reference._read_rows(rows))
+
+
+def test_ple_reads_skip_resident_tables_drifted_bodies_and_restore(tmp_path, monkeypatch):
+    table, model = _ple_table(tmp_path)
+    read, stock = _recorded_reads(monkeypatch), type(table)
+    with decode.exact_ple_row_reads(model):
+        with decode.exact_ple_row_reads(model):
+            pass
+        assert type(table) is not stock
+        table._read_rows(np.arange(0, 800, 7))  # just written, so every page is in core
+    assert type(table) is stock and read == [] and all(
+        type(memmap) is np.memmap for _, _, arrays in table._shards for memmap in arrays.values())
+    contract = {name: dict.fromkeys(names, "0" * 16) for name, names in decode._PLE_READ_CONTRACT.items()}
+    monkeypatch.setattr(decode, "_PLE_READ_CONTRACT", contract)
+    with decode.exact_ple_row_reads(model):
+        assert type(table) is stock

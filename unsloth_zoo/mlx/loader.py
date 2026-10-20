@@ -158,7 +158,7 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) else v,
         model.parameters(),
     ))
-    mx.eval(model.parameters())
+    mx.eval(_resident_parameters(model))
 
 
 _OFFLOAD_CACHE_LIMIT = 1 << 30
@@ -860,6 +860,31 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
         f"or dependency policy for your environment; Studio users should rerun "
         f"installer/repair. Do not bypass this error with strict=False.{installed}"
     ) from error
+
+
+# The layers mlx-vlm's glm5_next sanitize fuses, each by its first source projection.
+_GLM5_NEXT_FUSED = {"gate_up_proj": "gate_proj", "qkv_proj": "q_proj", "fbg_a_proj": "f_a_proj", "qkv_a_proj": "q_a_proj"}
+
+
+def _patch_glm5_next_quantization_aliases(model_type):
+    """mlx-vlm fuses glm5_next projections (``_GLM5_NEXT_FUSED``) but gives a fused layer no alias
+    to its sources' per-module quantization, so a mixed-bit checkpoint's (as GLM-5.3-Flash-4bit's
+    6-bit shared experts) is built at the default bits and fails to load."""
+    if model_type != "glm5_next":
+        return
+    try:
+        from mlx_vlm.models.glm5_next.glm5_next import Model as model
+    except Exception:
+        return
+    if hasattr(model, "quantization_path_aliases"):
+        return
+
+    def quantization_path_aliases(self, path):
+        path = path[len("language_model."):] if path.startswith("language_model.") else path
+        parent, _, name = path.rpartition(".")
+        return [f"{parent}.{_GLM5_NEXT_FUSED[name]}"] if name in _GLM5_NEXT_FUSED else []
+
+    model.quantization_path_aliases = quantization_path_aliases
 
 
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
@@ -1779,6 +1804,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
     registered mismatch signatures and exact allow-listed keys only.
     """
     _patch_deepseek_ocr_transformers_import_compat(model_type)
+    _patch_glm5_next_quantization_aliases(model_type)
     try:
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
@@ -1858,6 +1884,7 @@ def _load_mlx_vlm_distributed(
     model_label = f"'{model_name}'"
     if model_type:
         model_label = f"{model_label} (model_type={model_type!r})"
+    _patch_glm5_next_quantization_aliases(model_type)
 
     try:
         from mlx_vlm.utils import get_model_path, sharded_load
@@ -3437,9 +3464,20 @@ def _mlx_vlm_only_text_model(config: dict, model_type: str) -> bool:
         spec = importlib.util.find_spec(f"mlx_lm.models.{module_name}")
     except (ImportError, ValueError):
         return False
-    if spec is not None:
+    if spec is not None and not _mlx_lm_refuses_config(module_name, config):
         return False
     return _resolve_mlx_vlm_model_class(model_type) is not None
+
+
+def _mlx_lm_refuses_config(module_name, config):
+    """Whether mlx_lm's model arguments refuse ``config``, as its DeepSeek V4.1 refuses Engram layers."""
+    try:
+        importlib.import_module(f"mlx_lm.models.{module_name}").ModelArgs.from_dict(config)
+    except ValueError:
+        return True
+    except (Exception, SystemExit):
+        return False
+    return False
 
 
 class _NativeVLMWeightSanitizer:
@@ -3813,7 +3851,8 @@ _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
     "4405529c372e5bc69cf782c1038b674b55b46434e9a515d9db46a2a92e0414fa"
 )
 _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256 = (
-    "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576"
+    "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576",
+    "ae6c02d68719bee0ce97ab68458eed1f092aa2ab0398f0b903d5a9bf68cfc7ab",
 )
 _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256 = (
     "f995c993dd959cc55a43f70f8f87c115d18833179e464426d63153022f4770ec"
@@ -3823,6 +3862,12 @@ _GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 = (
 )
 _XING4_0_HYPER_CONNECTION_CALL_TOKEN_SHA256 = (
     "d33c41e769c36a1d01595314a684092576323fb12077090b3caf83325cf7bf64"
+)
+_QWEN3_5_VERIFY_QK_TOKEN_SHA256 = (
+    "e6f9df6af39d81908f992befef96ce200dd55c55c6fe14cd15c8267a9904dc87"
+)
+_QWEN3_5_DIVIDED_QK_TOKEN_SHA256 = (
+    "bb94a73450a3430389fab37f6c066725705ce042d059289587a9e6f4795e631e"
 )
 
 
@@ -4267,7 +4312,7 @@ def _minicpmv4_7_text_positions_adapter(cls):
     if (
         getattr(original, "_unsloth_minicpmv4_7_text_positions", False)
         or _source_token_sha256(_safe_getsource(original))
-        != _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
+        not in _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
         or _source_token_sha256(_safe_getsource(getattr(rope, "get_rope_index", None)))
         != _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256
     ):
@@ -7154,6 +7199,39 @@ def _ensure_exact_verify_sums_promoted():
     _exact_verify_sums_promoted = True
 
 
+def _ensure_verify_qk_norm_matches_decode():
+    """mlx-vlm 0.7.9's Qwen3.5 layer divides its q/k RMSNorm epsilon by the head width while the
+    exact verifier keeps 1e-6, so verify no longer matches decode. Verify with the layer's own norm."""
+    try:
+        language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+        verifier = importlib.import_module("mlx_vlm.models.qwen3_5.speculative_verifier")
+    except Exception:
+        return
+    forward = getattr(verifier, "Qwen3_5BatchInvariantForward", None)
+    layer = getattr(language, "Qwen3_5GatedDeltaNet", None)
+    if not isinstance(forward, type) or not isinstance(layer, type):
+        return
+    decode = vars(layer).get("_normalize_qk")
+    native = vars(forward).get("_normalize_gated_delta_qk")
+    if (
+        not isinstance(native, staticmethod)
+        or _source_token_sha256(_safe_getsource(native.__func__))
+        != _QWEN3_5_VERIFY_QK_TOKEN_SHA256
+        or _source_token_sha256(_safe_getsource(decode))
+        != _QWEN3_5_DIVIDED_QK_TOKEN_SHA256
+    ):
+        return
+    original = native.__func__
+
+    def normalize(layer, q, k):
+        if getattr(type(layer), "_normalize_qk", None) is decode:
+            return decode(layer, q, k)
+        return original(layer, q, k)
+
+    # Not wrapped: getsource would follow __wrapped__ back to the guarded body and patch twice.
+    forward._normalize_gated_delta_qk = staticmethod(normalize)
+
+
 def _ensure_vlm_processor_inputs_patched():
     """Patch mlx-vlm's processor call without replacing its input preparation."""
 
@@ -8793,6 +8871,16 @@ def _coerce_list_extra_special_tokens():
 _LAZY_WEIGHTS_ENV = "UNSLOTH_MLX_LAZY_WEIGHTS"
 
 
+def _resident_parameters(model):
+    """``model``'s parameters but the tables mlx-vlm reads row by row from disk (DeepSeek V4.1's Engram)."""
+    from mlx.utils import tree_flatten
+
+    mapped = tuple(path + "." for path, module in model.named_modules() if type(module).__name__ == "OffloadedEngramEmbedding")
+    if not mapped:
+        return model.parameters()
+    return [value for name, value in tree_flatten(model.parameters()) if not name.startswith(mapped)]
+
+
 def _materialize_weights(model):
     """Left mapped, the first GPU kernel to touch a weight can stall long enough for
     Apple's watchdog to kill the process's queue."""
@@ -8801,7 +8889,7 @@ def _materialize_weights(model):
     import mlx.core as mx
 
     try:
-        mx.eval(model.parameters())
+        mx.eval(_resident_parameters(model))
     except Exception as error:
         # Not fatal: the weights stay lazy, as before.
         print(f"Unsloth: Could not read {type(model).__name__} weights at load time: {error}")
@@ -9765,6 +9853,7 @@ class FastMLXModel:
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
             _ensure_exact_verify_sums_promoted()
+            _ensure_verify_qk_norm_matches_decode()
             _ensure_xing4_0_sliced_hyper_connection_base(model_type)
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
