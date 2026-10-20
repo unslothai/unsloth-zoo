@@ -180,6 +180,8 @@ def test_grpo_loss_refuses_a_trainable_zero3_head(tmp_path):
 
 
 def test_gather_helper_leaves_ordinary_tensors_alone():
+    import types
+
     import torch
     from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_zero3_gathered, unsloth_zero3_partitioned
 
@@ -191,3 +193,8 @@ def test_gather_helper_leaves_ordinary_tensors_alone():
     w.ds_id, w.ds_status, w.ds_persist = 1, "AVAILABLE", True
     assert not unsloth_zero3_partitioned(w)
     assert unsloth_zero3_gathered(w) is w
+    # Persistent but not gathered yet (or released again): still a placeholder.
+    w.ds_status = types.SimpleNamespace(name = "NOT_AVAILABLE")
+    assert unsloth_zero3_partitioned(w)
+    w.ds_status = types.SimpleNamespace(name = "AVAILABLE")
+    assert not unsloth_zero3_partitioned(w)

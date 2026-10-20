@@ -105,12 +105,13 @@ pass
 def unsloth_zero3_partitioned(tensor):
     # All Unsloth Zoo code licensed under LGPLv3
     """True for a DeepSpeed ZeRO-3 parameter that may be a released placeholder outside its module's forward."""
-    return (
-        tensor is not None
-        and hasattr(tensor, "ds_id")
-        and hasattr(tensor, "ds_status")
-        and not getattr(tensor, "ds_persist", False)
-    )
+    if tensor is None or not hasattr(tensor, "ds_id") or not hasattr(tensor, "ds_status"):
+        return False
+    if not getattr(tensor, "ds_persist", False):
+        return True
+    # Persistent params start partitioned and can be released again (cache partitioning): check the status.
+    status = getattr(tensor.ds_status, "name", tensor.ds_status)
+    return status != "AVAILABLE"
 pass
 
 def unsloth_zero3_gathered(tensor):
