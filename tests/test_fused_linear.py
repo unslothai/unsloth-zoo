@@ -1245,7 +1245,13 @@ def test_lazy_entropy_only_logged_keeps_the_forward_gradient(device, V):
             assert torch.equal(x, y), (device, dtype)
         on = run(True)  # the eager entropy gradient: the recompute route
         assert fl.CALLS["logprobs_bwd"] > bwd
-        assert torch.equal(lazy[0], on[0]) and torch.equal(lazy[1], on[1])  # same forward statistics
+        # Same log-probs; the recompute route's entropy agrees bit for bit in half precision and to fp32 rounding
+        # order (an ulp or two, equally accurate against fp64) with fp32 inputs.
+        assert torch.equal(lazy[0], on[0])
+        if dtype == torch.float32:
+            torch.testing.assert_close(lazy[1], on[1], rtol = 0, atol = 4e-6)
+        else:
+            assert torch.equal(lazy[1], on[1])
 
 
 @pytest.mark.parametrize("device", DEVICES)
