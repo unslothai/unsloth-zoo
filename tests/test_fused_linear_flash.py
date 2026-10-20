@@ -249,7 +249,8 @@ def test_flash_fullgraph_compile_no_breaks(kind):
     compiled(hc, t, mask).backward()
     he = h.clone().requires_grad_(True)
     step(he, t, mask).backward()
-    assert fl.CALLS["flash"] == n + 2
+    # Turing cross entropy stays on the chunked path; the compiled graph must still hold it without a break.
+    assert fl.CALLS["flash"] == n + (2 if kind == "lp" or fl._flash_ce_ok(h.device) else 0)
     assert torch.equal(hc.grad, he.grad)
     assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
     assert cnt.frame_count == 1
