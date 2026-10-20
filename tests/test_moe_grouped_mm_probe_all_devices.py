@@ -108,6 +108,18 @@ def test_a_current_device_switch_does_not_borrow_the_first_cards_answer(spoof, m
     assert seen == [0, 1]
 
 
+def test_first_callers_on_different_cards_agree_on_the_home_card(spoof, monkeypatch):
+    # Two first callers on different-model cards, neither probed yet: the second must not also claim "home".
+    seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
+    assert moe_utils._grouped_mm_foreign_kind(cuda(0)) is None
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert moe_utils._grouped_mm_foreign_kind(cuda(1)) is not None
+    # The shared answer is probed on the anchored card, not on whichever is current now.
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    assert moe_utils._grouped_mm_supported_on(cuda(1)) is False
+    assert seen == [0, 1]
+
+
 @pytest.mark.parametrize("count", [2, 3, 8])
 def test_homogeneous_host_keeps_one_probe(spoof, count):
     seen = spoof(count, models = ["MI300X"] * count)

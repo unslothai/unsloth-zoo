@@ -1435,6 +1435,19 @@ def _grouped_mm_device_kind(backend, index):
 _GROUPED_MM_FOREIGN = {}   # (type, index) -> None if same GPU model as the probe device, else its model
 # (type, index) the process-wide flags were probed on; a later current-device switch must not move it.
 _GROUPED_MM_HOME = None
+_GROUPED_MM_HOME_LOCK = threading.Lock()
+
+
+def _grouped_mm_home():
+    """The card the process-wide flags describe, anchored once (under a lock: concurrent first callers on
+    different cards must agree on it before either compares against it)."""
+    global _GROUPED_MM_HOME
+    if _GROUPED_MM_HOME is None:
+        device = _grouped_mm_probe_device()
+        with _GROUPED_MM_HOME_LOCK:
+            if _GROUPED_MM_HOME is None and device is not None and device.index is not None:
+                _GROUPED_MM_HOME = (device.type, device.index)
+    return torch.device(*_GROUPED_MM_HOME) if _GROUPED_MM_HOME is not None else _grouped_mm_probe_device()
 
 
 def _grouped_mm_foreign_kind(device):
@@ -1446,7 +1459,7 @@ def _grouped_mm_foreign_kind(device):
 
 
 def _resolve_grouped_mm_foreign_kind(device, key):
-    home = torch.device(*_GROUPED_MM_HOME) if _GROUPED_MM_HOME is not None else _grouped_mm_probe_device()
+    home = _grouped_mm_home()
     kind = None
     if home is not None and home.type == device.type and home.index != device.index:
         backend = getattr(torch, device.type)
@@ -1507,12 +1520,6 @@ _GROUPED_MM_SURVIVES_BY_KIND = {}
 _GROUPED_MM_SURVIVES_LOCK = threading.Lock()
 
 
-def _anchor_grouped_mm_home(device):
-    global _GROUPED_MM_HOME
-    if _GROUPED_MM_HOME is None and device is not None and device.index is not None:
-        _GROUPED_MM_HOME = (device.type, device.index)
-
-
 def _grouped_mm_survives_out_of_process(device):
     global _GROUPED_MM_SURVIVES
     kind = _grouped_mm_foreign_kind(device)
@@ -1524,9 +1531,7 @@ def _grouped_mm_survives_out_of_process(device):
     if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
     # Publish once known: concurrent first callers wait for the child, never run the kernel.
     with _GROUPED_MM_SURVIVES_LOCK:
-        if _GROUPED_MM_SURVIVES is None:
-            _anchor_grouped_mm_home(device)
-            _GROUPED_MM_SURVIVES = _run_grouped_mm_crash_probe(device)
+        if _GROUPED_MM_SURVIVES is None: _GROUPED_MM_SURVIVES = _run_grouped_mm_crash_probe(device)
     return _GROUPED_MM_SURVIVES
 
 
@@ -1590,8 +1595,8 @@ def _probe_torch_grouped_mm_supported(device = None):
         return supported
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
-    device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
-    _anchor_grouped_mm_home(device)
+    # The anchored card, not whichever is current now: the flags must describe one card.
+    device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else None
     if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
