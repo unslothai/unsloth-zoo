@@ -80,8 +80,6 @@ def test_swap_restores_plain_instance_attributes_and_raises_through():
 
 
 def test_swap_traces_without_graph_break_and_restores_under_compile():
-    # The bnb 4-bit dispatcher calls this from compiled code. An `object()` sentinel broke the
-    # graph there, and the resumed frame left the dense tensors installed in __dict__.
     from torch._dynamo.utils import counters
 
     experts = _Experts()
@@ -104,6 +102,6 @@ def test_swap_traces_without_graph_break_and_restores_under_compile():
     assert "down_proj" not in experts.__dict__
     assert experts.gate_up_proj is experts._parameters["gate_up_proj"]
     assert experts.down_proj is experts._parameters["down_proj"]
-    # torch < 2.13 cannot trace a __dict__ delete (one break); the sentinel added two more.
+    # torch < 2.13 cannot trace a __dict__ delete (one break).
     major_minor = tuple(int(v) for v in torch.__version__.split(".")[:2])
     assert sum(breaks.values()) <= (0 if major_minor >= (2, 13) else 1), breaks
