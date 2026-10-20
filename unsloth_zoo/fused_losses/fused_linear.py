@@ -90,12 +90,15 @@ _BWD_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_ROWS", 1024 if _HIP_TIL
 _BWD_TILE_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_TILE_MB", 8 if _HIP_TILES else 256) * 1024**2), 1)
 _HALF = (torch.float16, torch.bfloat16)
 # Frozen CUDA head, fp32 logits: flash-style forward gradient over vocab tiles; no-grad makes the same calls, so policy
-# == reference bit for bit. 0: [rows, V] chunks. Only from FLASH_MIN_ROWS kept rows: 8k-32k tokens L4 -6 to -11%,
-# G4 -1 to -4%, A100 0 to -2%; 2k tokens cost G4 / A100 2-5%, so they keep the chunks.
+# == reference bit for bit. 0: [rows, V] chunks. 8k-32k tokens: L4 -6 to -11%, G4 -1 to -4%, A100 0 to -2% vs chunks.
+# Below 4096 kept rows the [rows, 16384] fp32 tile is TRL's [rows, 32768] bf16 transient (2k tokens: 0.127 vs 0.123
+# GiB; chunks 0.31 / 0.52 at V 151936 / 262144) and stays faster than TRL; vs chunks: T4 DPO / GRPO -7 to -20%,
+# G4 -8 to +6%, A100 +2 to +17%. FLASH_MIN_ROWS=4096 restores those chunks.
 _FLASH = os.environ.get("UNSLOTH_FUSED_LINEAR_FLASH", "1") != "0"
-_FLASH_MIN_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS", 4096)), 0)
-# Widest vocab tile of the tiled forward (a multiple of the split width; 0 = the tile byte budget alone).
-_FWD_TILE_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 0)), 0)
+_FLASH_MIN_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS", 0)), 0)
+# Widest fp32 vocab tile of the tiled forward (a multiple of the split width; 0 = the tile byte budget alone). From
+# 4096 rows the budget already gives 16384; half-logit tiles keep the budget.
+_FWD_TILE_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 16384)), 0)
 # ROCm's half-in / fp32-out GEMM is a slow fallback (6-14x).
 _IS_HIP = torch.version.hip is not None
 # Op names carry a version: Inductor's FX graph / AOTAutograd caches key on neither a custom op's schema nor its
@@ -918,7 +921,7 @@ def _tiled_layout(n_keep, V, cap_rows, bpl, device):
     budget = min(_BWD_TILE_BYTES, _budget_bytes(device))
     R = max(min(_BWD_ROWS, n_keep, cap_rows if cap_rows > 0 else n_keep, budget // (_SPLIT_COLS * bpl)), 1)
     tile = max(budget // max(R * bpl, 1), _SPLIT_COLS)
-    if _FWD_TILE_COLS > 0:
+    if _FWD_TILE_COLS > 0 and bpl == 4:
         tile = min(tile, max(_FWD_TILE_COLS, _SPLIT_COLS))
     tile = min(tile - tile % _SPLIT_COLS, -(-V // _SPLIT_COLS) * _SPLIT_COLS)
     return R, tile

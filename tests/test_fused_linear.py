@@ -17,6 +17,8 @@
 """Fused linear CE / log-probs (torch.library ops, Triton row kernels on GPU) against an fp64 oracle, the chunked CE
 it replaces, and torch.compile(fullgraph=True)."""
 
+import os
+
 import numpy
 import pytest
 import torch
@@ -1309,3 +1311,57 @@ def test_lazy_entropy_compiles_without_graph_breaks(use_ent):
     he = h.detach().clone().requires_grad_(True)
     (ge,) = torch.autograd.grad(f(he), (he,))
     torch.testing.assert_close(gc.float(), ge.float(), rtol = 0, atol = 0)
+
+
+@CUDA
+@pytest.mark.parametrize("n_keep", [1, 777, 4095, 4096, 4097])
+def test_default_small_batches_take_the_tile_and_stay_bit_identical(monkeypatch, n_keep):
+    # Defaults (no env): below 4096 kept rows too, the frozen pass and its no-grad reference take [rows, <= 16384]
+    # fp32 tiles (TRL's [rows, 32768] bf16 transient), and no-grad, frozen and trainable passes are bit-identical.
+    if not fl._HAS_TRITON or fl._IS_HIP:
+        pytest.skip("needs Triton on CUDA")
+    for name in ("UNSLOTH_FUSED_LINEAR_FLASH", "UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS", "UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS"):
+        if os.environ.get(name) is not None:
+            pytest.skip(f"{name} is set")
+    shapes = []
+    real = fl._Buffers.__init__
+
+    def record(self, rows, n_cols, *a, **k):
+        shapes.append(n_cols)
+        real(self, rows, n_cols, *a, **k)
+
+    monkeypatch.setattr(fl._Buffers, "__init__", record)
+    V, H, N = 70001, 64, n_keep + 3
+    for dtype in _dtypes("cuda")[1:]:
+        if not fl._logits_mode(torch.device("cuda"), dtype)[0]:
+            continue
+        gen = torch.Generator().manual_seed(n_keep)
+        h = torch.randn(N, H, generator = gen).cuda().to(dtype)
+        w = (torch.randn(V, H, generator = gen) / 8).cuda().to(dtype)
+        t = torch.randint(0, V, (N,), generator = gen).cuda()
+        mask = torch.ones(N, dtype = torch.bool, device = "cuda")
+        mask[:3] = False
+        with torch.no_grad():
+            ref = fused_linear_logprobs(h, w, t, mask = mask)
+        shapes.clear()
+        flash = fl.CALLS["flash"]
+        frozen = fused_linear_logprobs(h.clone().requires_grad_(True), w, t, mask = mask)
+        assert fl.CALLS["flash"] == flash + 1, (dtype, n_keep)
+        assert shapes and max(shapes) <= 16384, shapes
+        trainable = fused_linear_logprobs(h.clone().requires_grad_(True), w.clone().requires_grad_(True), t, mask = mask)
+        assert torch.equal(frozen.detach(), ref) and torch.equal(trainable.detach(), ref), (dtype, n_keep)
+
+
+def test_tile_cap_leaves_large_and_half_layouts_alone(monkeypatch):
+    # From 4096 rows the fp32 budget tile is already 16384 columns; half-logit layouts keep the budget tile.
+    dev = torch.device("cpu")
+    monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: 2 * 1024**3)
+    for n in (4096, 8192, 65536):
+        for bpl in (2, 4):
+            capped = fl._tiled_layout(n, 151936, 0, bpl, dev)
+            monkeypatch.setattr(fl, "_FWD_TILE_COLS", 0)
+            budget = fl._tiled_layout(n, 151936, 0, bpl, dev)
+            monkeypatch.setattr(fl, "_FWD_TILE_COLS", 16384)
+            assert capped == budget, (n, bpl, capped, budget)
+    assert fl._tiled_layout(1536, 151936, 0, 4, dev)[1] == 16384
+    assert fl._tiled_layout(1536, 151936, 0, 2, dev)[1] > 16384
