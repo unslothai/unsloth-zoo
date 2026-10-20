@@ -206,7 +206,7 @@ def test_saves_no_logits_for_backward():
 
     saved.clear()
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-        rr.chunked_hidden_states_selective_log_softmax(states, head, index, 4)
+        rr.chunked_hidden_states_selective_log_softmax(states, head, index, 4, fused_linear = False)
     assert sum(saved) >= rows * vocab
 
 

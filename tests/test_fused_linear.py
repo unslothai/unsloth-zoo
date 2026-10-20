@@ -1127,3 +1127,65 @@ def test_ce_gradient_scale_is_not_rounded_to_half():
     (want,) = torch.autograd.grad(ref, (h64,))
     ratio = float(got.double().norm() / want.norm())
     assert abs(ratio - 1.0) < 1e-3, ratio
+
+
+@CUDA
+@pytest.mark.parametrize("ent_grad", [False, True])
+def test_exact_top_backward_with_tied_maxima(monkeypatch, ent_grad):
+    # Repeated (or zero-initialised) head rows tie a column group's top logit; its second top is the tied value, not
+    # the next distinct one (that gave ~0.5 hidden gradients and NaN entropy gradients).
+    if not fl._HAS_TRITON or fl._IS_HIP:
+        pytest.skip("needs Triton on CUDA (ROCm has no exact-top backward)")
+    N, H, V = 64, 64, 40000
+    gen = torch.Generator().manual_seed(0)
+    w0 = torch.randn(V, H, generator = gen) / H**0.5
+    w0[:4096] = w0[0]
+    h0 = torch.randn(N, H, generator = gen)
+    t = torch.randint(0, V, (N,), generator = gen).cuda()
+    g = torch.randn(N, generator = gen).cuda().double()
+    for dtype in _dtypes("cuda")[1:]:  # half only: fp32 heads have no exact-top backward
+        if not fl._logits_mode(torch.device("cuda"), dtype)[0]:
+            continue
+
+        def grads(exact):
+            monkeypatch.setattr(fl, "_BWD_EXACT_TOP", exact)
+            h = h0.cuda().to(dtype).requires_grad_(True)
+            w = w0.cuda().to(dtype).requires_grad_(True)
+            lp, ent = fused_linear_logprobs(h, w, t, return_entropy = True, entropy_requires_grad = ent_grad)
+            obj = (lp.double() * g).sum() + (0.1 * ent.double().sum() if ent_grad else 0)
+            return torch.autograd.grad(obj, (h, w))
+
+        before = fl.CALLS["exact_top"]
+        eh, ew = grads(True)
+        assert fl.CALLS["exact_top"] > before
+        fh, fw = grads(False)
+        hd = h0.cuda().to(dtype).double().requires_grad_(True)
+        wd = w0.cuda().to(dtype).double().requires_grad_(True)
+        lp, ent = _lp_oracle(hd, wd, None, t, torch.ones(N, dtype = torch.bool, device = "cuda"), 1.0, 0.0, 0.0, 0.0)[:2]
+        rh, rw = torch.autograd.grad((lp * g).sum() + (0.1 * ent.sum() if ent_grad else 0), (hd, wd))
+        assert torch.isfinite(eh).all() and torch.isfinite(ew).all()
+        assert _rel(eh, rh) <= 1.5 * _rel(fh, rh) + 1e-6 and _rel(ew, rw) <= 1.5 * _rel(fw, rw) + 1e-6, \
+            (dtype, _rel(eh, rh), _rel(fh, rh), _rel(ew, rw), _rel(fw, rw))
+    monkeypatch.setattr(fl, "_BWD_EXACT_TOP", True)
+
+
+@CUDA
+@pytest.mark.parametrize("V", [20000, 20003])
+def test_fp16_without_fp32_output_gemms_does_not_overflow(monkeypatch, V):
+    # torch < 2.8 / ROCm: no fp32-output GEMM. The frozen head's forward gradient is scaled up in fp16, so a half GEMM
+    # result can pass 65504 even when the true gradient is representable.
+    monkeypatch.setattr(fl, "_fp32_out_ok", lambda *a, **k: False)
+    N, H = 64, 64
+    gen = torch.Generator().manual_seed(1)
+    w = (16 * torch.randn(V, H, generator = gen) / H**0.5).cuda().half()
+    h0 = (0.1 * torch.randn(N, H, generator = gen)).cuda().half()
+    t = torch.randint(0, V, (N,), generator = gen).cuda()
+    h = h0.clone().requires_grad_(True)
+    (gh,) = torch.autograd.grad(fused_linear_logprobs(h, w, t).double().sum(), (h,))
+    hd = h0.double().requires_grad_(True)
+    lp = _lp_oracle(hd, w.double(), None, t, torch.ones(N, dtype = torch.bool, device = "cuda"), 1.0, 0.0, 0.0, 0.0)[0]
+    (rh,) = torch.autograd.grad(lp.sum(), (hd,))
+    assert torch.isfinite(gh).all() and _rel(gh, rh) < 2e-2, _rel(gh, rh)
+    h = h0.clone().requires_grad_(True)
+    (gc,) = torch.autograd.grad(fused_linear_cross_entropy(h, w, None, t, divisor = N), (h,))
+    assert torch.isfinite(gc).all()

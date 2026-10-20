@@ -190,8 +190,8 @@ def _mm_fp32(a, b, out = None):
         if not _IS_HIP and _fp32_out_ok(a.device, a.dtype):
             return torch.mm(a, b, out_dtype = torch.float32, out = out) if out is not None \
                 else torch.mm(a, b, out_dtype = torch.float32)
-        # Upcast fp32 GEMM would be several times slower.
-        r = (a @ b).float()
+        # bf16 keeps fp32's range; an fp16 result can pass 65504 (the forward gradient is scaled up), so upcast.
+        r = torch.mm(a.float(), b.float()) if a.dtype == torch.float16 else (a @ b).float()
     else:
         r = a.float() @ b.float() if a.dtype != torch.float64 else a @ b
     if out is not None:
@@ -368,7 +368,9 @@ if _HAS_TRITON:
             if WANT_BLOCK_TOP:
                 zg = tl.reshape(z, (BLOCK // SUB, SUB))
                 t1 = tl.max(zg, axis = 1)
-                t2 = tl.max(tl.where(zg == t1[:, None], -float("inf"), zg), axis = 1)
+                # Drop one max position only: tied maxima (repeated or zero-initialised head rows) keep t2 == t1.
+                i1 = tl.argmax(zg, axis = 1)
+                t2 = tl.max(tl.where(tl.arange(0, SUB)[None, :] == i1[:, None], -float("inf"), zg), axis = 1)
                 k = tl.arange(0, BLOCK // SUB)
                 tp = top_ptr + row * top_stride + ((start + col0) // SUB + k) * 2
                 kok = start + k * SUB < c1
@@ -572,7 +574,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fl_flash_u_kernel(
-        acc_ptr, acc_stride, w_ptr, w_stride, u_ptr, u_stride, map_ptr, row0, H, n_rows, stride_k, split_cols,
+        acc_ptr, acc_stride, w_ptr, w_stride, w_stride_h, u_ptr, u_stride, map_ptr, row0, H, n_rows, stride_k, split_cols,
         part_ptr, tgt_ptr, logp_ptr, lse_ptr, m_ptr, g_ptr,
         inv_t, scale, cap, inv_gscale,
         HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_MAP: tl.constexpr, HAS_G: tl.constexpr,
@@ -603,7 +605,7 @@ if _HAS_TRITON:
         for hs in range(0, H, BLOCK_H):
             ho = hs + hc
             ok = ho < H
-            w = tl.load(w_ptr + tgt * w_stride + ho, mask = ok, other = 0.0).to(tl.float32)
+            w = tl.load(w_ptr + tgt * w_stride + ho * w_stride_h, mask = ok, other = 0.0).to(tl.float32)
             a = tl.load(acc_ptr + row * acc_stride + ho, mask = ok, other = 0.0)
             tl.store(u_ptr + out * u_stride + ho, (ct * w - a * r).to(u_ptr.dtype.element_ty), mask = ok)
 
@@ -789,8 +791,8 @@ def _dz_w(dz, w):
     """dz[n, V] @ w[V, H] with an fp32 result rounded once."""
     V8 = _aligned(w.shape[0])
     if V8 < w.shape[0] and dz.is_cuda and dz.dtype == torch.float16 and (_IS_HIP or not _fp32_out_ok(dz.device, dz.dtype)):
-        # One GEMM over the whole vocab: an aligned fp16 partial can pass 65504 before the rest cancels it.
-        return (dz @ w).float()
+        # An fp16 result (or an aligned partial) can pass 65504 before the rest cancels it.
+        return torch.mm(dz.float(), w.float())
     out = _mm_fp32(dz[:, :V8], w[:V8])
     if V8 < w.shape[0]:
         _addmm_fp32(out, dz[:, V8:], w[V8:])
@@ -998,7 +1000,7 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
                 return
             rowmap = idx[a:b] if n_keep != N else None
             _fl_flash_u_kernel[(n,)](
-                acc, acc.stride(0), w, w.stride(0), u, u.stride(0), rowmap if rowmap is not None else t, a, H, n,
+                acc, acc.stride(0), w, w.stride(0), w.stride(1), u, u.stride(0), rowmap if rowmap is not None else t, a, H, n,
                 splits * n, _SPLIT_COLS, part, t, o["logp"], lse, m_run, g if g is not None else lse,
                 float(inv_t), float(scale), scal[2], 1.0 / float(gscale), HAS_SCALE = scale != 1.0,
                 HAS_CAP = cap != 0.0, HAS_MAP = rowmap is not None, HAS_G = g is not None, BLOCK_H = block_h, num_warps = 4, enable_fp_fusion = True,

@@ -159,11 +159,12 @@ def test_chunk_rows_floor():
 def test_grpo_accumulated_loss_routes_through_the_recompute_kernel():
     src = inspect.getsource(rr.grpo_accumulated_loss)
     assert "grpo_chunked_hidden_states_logprobs as chunked_hidden_states_selective_log_softmax" in src
-    assert "Unsloth_Offloaded_Log_Softmax.apply(" not in src
+    # Only the old scorer's fallback offloads (test_efficient_log_softmax_offloads_only_for_the_old_scorer).
+    assert "_keeps_logits()" in src
 
 
 def _old(*args, **kwargs):
-    return rr.chunked_hidden_states_selective_log_softmax(*args, **kwargs)
+    return rr.chunked_hidden_states_selective_log_softmax(*args, fused_linear = False, **kwargs)
 
 
 @pytest.mark.parametrize("bias", [False, True])
@@ -334,3 +335,91 @@ def test_masked_logprobs_forwards_max_rows_per_chunk(monkeypatch):
     out = unsloth_masked_logprobs(states, weight, labels, max_rows_per_chunk = 2)
     assert seen["max_rows_per_chunk"] == 2
     torch.testing.assert_close(out, unsloth_masked_logprobs(states, weight, labels))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_public_scorer_matches_the_grpo_policy_scorer():
+    # Unsloth builds before grpo_chunked_hidden_states_logprobs score old / reference log-probs with the public
+    # function, while grpo_accumulated_loss scores the policy with the fused kernel: identical frozen weights must
+    # give a ratio of exactly 1.
+    if not cl._FUSED_LINEAR:
+        pytest.skip("UNSLOTH_FUSED_LINEAR=0")
+    gen = torch.Generator().manual_seed(0)
+    for dtype in (torch.float16, torch.bfloat16):
+        h = torch.randn(2, 33, 64, generator = gen).cuda().to(dtype)
+        w = (torch.randn(40000, 64, generator = gen) / 8).cuda().to(dtype)
+        idx = torch.randint(0, 40000, (2, 33), generator = gen).cuda()
+        with torch.no_grad():
+            ref = rr.chunked_hidden_states_selective_log_softmax(h, w, idx)
+        pol = rr.grpo_chunked_hidden_states_logprobs(h.clone().requires_grad_(True), w, idx)
+        assert ref.shape == pol.shape == idx.shape
+        assert torch.equal(pol.detach(), ref), dtype
+        old = rr.chunked_hidden_states_selective_log_softmax(h, w, idx, fused_linear = False)
+        assert old.shape == idx.shape
+
+
+def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_GRPO_CHUNKED_LOGPROBS", raising = False)
+    monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", True)
+    assert not rr.grpo_scorer_keeps_logits()
+    assert rr.grpo_scorer_keeps_logits({"support_top_k": 20})
+    assert rr.grpo_scorer_keeps_logits({"support_top_p": 0.9})
+    assert rr.grpo_scorer_keeps_logits(fp32_lm_head = True)
+    monkeypatch.setenv("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "0")
+    assert rr.grpo_scorer_keeps_logits()
+    monkeypatch.delenv("UNSLOTH_GRPO_CHUNKED_LOGPROBS")
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
+    assert rr.grpo_scorer_keeps_logits()
+
+
+@pytest.mark.parametrize("fused, support, length, batch, offloaded", [
+    (True, {}, 2000, 16, False),            # fused scorer: recomputes in backward, never offloads
+    (False, {}, 2000, 16, True),            # kill switch: the old scorer keeps logits, long completions offload
+    (True, {"support_top_k": 20}, 2000, 16, True),
+    (False, {}, 100, 4, False),             # short completions: the plain path, as before
+])
+def test_efficient_log_softmax_offloads_only_for_the_old_scorer(monkeypatch, fused, support, length, batch, offloaded):
+    import os, textwrap
+    monkeypatch.delenv("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", raising = False)
+    monkeypatch.delenv("UNSLOTH_GRPO_CHUNKED_LOGPROBS", raising = False)
+    monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
+    monkeypatch.setattr(cl, "_FUSED_LINEAR", fused)
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    start = src.rindex("\n", 0, src.index("def to_device")) + 1
+    end = src.rindex("\n", 0, src.index("def compute_logprobs_chunk")) + 1
+    calls = []
+    ns = {"torch": torch, "os": os, "_support_kwargs": support,
+          "chunked_hidden_states_selective_log_softmax": lambda *a, **k: calls.append("plain")}
+    exec(textwrap.dedent(src[start:end]), ns)
+    ns["Unsloth_Offloaded_Log_Softmax"].apply = staticmethod(lambda *a: calls.append("offloaded"))
+    hidden = torch.zeros(batch, length, 4)
+    ns["efficient_log_softmax"](hidden, torch.zeros(8, 4), torch.zeros(batch, length, dtype = torch.long), batch_size = batch)
+    assert calls == ["offloaded" if offloaded else "plain"]
+
+
+@pytest.mark.parametrize("flag", ["UNSLOTH_GRPO_CHUNKED_LOGPROBS", "UNSLOTH_FUSED_LINEAR"])
+def test_grpo_switches_keep_entropy_policy_and_reference_on_one_scorer(flag):
+    # Either switch sends old / ref scoring to the old chunked function, so the entropy policy pass (the recompute
+    # function) must leave the fused kernel too: identical policies then score bit-identically (ratio 1).
+    import json, os, subprocess, sys
+    child = (
+        "import json, torch\n"
+        "from unsloth_zoo import rl_replacements as rr\n"
+        "dev = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
+        "g = torch.Generator().manual_seed(0)\n"
+        "h = torch.randn(2, 17, 32, generator = g).to(dev, torch.bfloat16 if dev == 'cuda' else torch.float32)\n"
+        "w = (torch.randn(5000, 32, generator = g) / 6).to(dev, h.dtype)\n"
+        "idx = torch.randint(0, 5000, (2, 17), generator = g).to(dev)\n"
+        "with torch.no_grad():\n"
+        "    ref = rr.chunked_hidden_states_selective_log_softmax(h, w, idx, 4)\n"
+        "pol, ent = rr.chunked_hidden_states_selective_log_softmax_recompute(h.clone().requires_grad_(True), w, idx, 4, return_entropy = True)\n"
+        "print('RESULT ' + json.dumps({'equal': bool(torch.equal(pol.detach().reshape(ref.shape), ref)),\n"
+        "    'maxdiff': float((pol.detach().reshape(ref.shape) - ref).abs().max())}))\n"
+    )
+    env = dict(os.environ, **{flag: "0", "UNSLOTH_IS_PRESENT": "1"})
+    p = subprocess.run([sys.executable, "-c", child], env = env, capture_output = True, text = True, timeout = 900)
+    line = [x for x in p.stdout.splitlines() if x.startswith("RESULT ")]
+    assert line, p.stdout[-2000:] + p.stderr[-2000:]
+    r = json.loads(line[-1][7:])
+    assert r["equal"], r

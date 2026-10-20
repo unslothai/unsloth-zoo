@@ -50,6 +50,11 @@ from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
 from unsloth_zoo.temporary_patches.misc import patch_sdpa_bool_causal_mask
 import transformers.integrations.sdpa_attention as sdpa_mod
 patch_sdpa_bool_causal_mask()
+from unsloth_zoo.temporary_patches.misc import patch_transformers_masks
+import transformers.masking_utils as masking_utils
+patch_transformers_masks()
+# The wrapped mask builder must not be torch.compiler.disable'd: a fullgraph user compile would refuse it.
+_mask_cells = [c.cell_contents for c in (masking_utils.create_causal_mask.__closure__ or ()) if callable(c.cell_contents)]
 def plain(x): return x + 1
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_ce_loss
 torch.manual_seed(0)
@@ -66,6 +71,7 @@ print("RESULT " + json.dumps({
     "compile_decos"   : len(re.findall(r"@torch_compile_with_fallback\([^\n]*\)\n(?:@[^\n]*\n)*def Llama", generated)),
     "fallback_is_id"  : torch_compile_with_fallback(fullgraph = True, dynamic = True)(plain) is plain,
     "sdpa_fix"        : bool(getattr(sdpa_mod.sdpa_attention_forward, "__unsloth_bool_causal_mask_fix__", False)),
+    "mask_disabled"   : any(bool(getattr(c, "_torchdynamo_disable", False)) for c in _mask_cells),
     "loss"            : float(loss),
     "frames"          : int(dynamo_utils.counters["frames"]["total"]),
 }))
@@ -94,6 +100,7 @@ def test_compile_disable_keeps_optimizations(tmp_path, value):
     assert r["mlp_module"].startswith("unsloth_compiled_module_llama"), r
     assert r["lora_forward"] == "unsloth_forward", r
     assert r["sdpa_fix"] is True, r
+    assert r["mask_disabled"] is False, r
     if value is None:
         assert r["compile_decos"] > 0 and r["fallback_is_id"] is False, r
         return

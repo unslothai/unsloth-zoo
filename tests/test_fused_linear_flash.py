@@ -268,3 +268,21 @@ def test_below_min_rows_frozen_and_no_grad_stay_chunked_and_identical(monkeypatc
     monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", int(mask.sum()))
     lp, _ = _frozen(h, w, t, torch.ones(300, device = "cuda", dtype = torch.float64), mask = mask)
     assert fl.CALLS["flash"] == n + 1
+
+
+def test_flash_reads_a_strided_head(monkeypatch):
+    # A transposed-storage head (w.t().contiguous().t()): the forward gradient's target row is read with both strides.
+    h, w, _, t, _ = _inputs(_dtypes()[-1], 300, 64, 40001, seed = 7)
+    ws = w.t().contiguous().t()
+    assert ws.stride(1) != 1 and torch.equal(ws, w)
+
+    def grad(weight):
+        hh = h.detach().clone().requires_grad_(True)
+        (g,) = torch.autograd.grad(fused_linear_logprobs(hh, weight, t).double().sum(), (hh,))
+        return g
+
+    n = fl.CALLS["flash"]
+    a, b = grad(w), grad(ws)
+    assert fl.CALLS["flash"] == n + 2
+    # cuBLAS may pick another kernel for the transposed storage: same values to GEMM rounding (the bug was ~100%).
+    assert float((b.double() - a.double()).norm() / a.double().norm()) < 1e-2
