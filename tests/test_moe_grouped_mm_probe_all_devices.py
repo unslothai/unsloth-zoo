@@ -116,7 +116,6 @@ def test_first_callers_on_different_cards_agree_on_the_home_card(spoof, monkeypa
     assert moe_utils._grouped_mm_foreign_kind(cuda(0)) is None
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
     assert moe_utils._grouped_mm_foreign_kind(cuda(1)) is not None
-    # The shared answer is probed on the anchored card, not on whichever is current now.
     assert moe_utils._check_torch_grouped_mm_supported() is True
     assert moe_utils._grouped_mm_supported_on(cuda(1)) is False
     assert seen == [0, 1]
@@ -164,7 +163,7 @@ def test_call_site_gate_routes_same_model_cards_to_the_no_arg_check(spoof, monke
     seen = spoof(3, failing = (2,), models = ["H100", "H100", "RTX4090"])
     assert [moe_utils._grouped_mm_supported_on(cuda(i)) for i in range(3)] == [True, True, False]
     assert seen == [0, 2]
-    monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: "patched")   # zero-arg patches keep working
+    monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: "patched")
     assert moe_utils._grouped_mm_supported_on(cuda(1)) == "patched"
     assert moe_utils._grouped_mm_supported_on(torch.device("cpu")) == "patched"
 
@@ -202,7 +201,7 @@ def test_rocm_single_gpu_child_unchanged(spoof, monkeypatch):
     spoof(1, hip = "7.1.0")
     children = _record_children(monkeypatch)
     assert moe_utils._probe_torch_grouped_mm_supported() is True
-    assert children == [("0", None)]   # inherited env, device index argv, exactly one child
+    assert children == [("0", None)]
 
 
 def test_rocm_homogeneous_host_one_child(spoof, monkeypatch):
@@ -216,7 +215,7 @@ def test_rocm_crash_probe_one_child_per_used_model(spoof, monkeypatch):
     spoof(3, hip = "7.1.0")
     children = _record_children(monkeypatch)
     assert moe_utils._probe_torch_grouped_mm_supported() is True
-    assert children == [("0", ("0", "0"))]   # cards 1 and 2 unused: no child for them
+    assert children == [("0", ("0", "0"))]
     assert moe_utils._check_torch_grouped_mm_supported(cuda(2)) is True
     assert children == [("0", ("0", "0")), ("0", ("2", "2"))]
     assert moe_utils._grouped_mm_survives_out_of_process(cuda(2)) is True

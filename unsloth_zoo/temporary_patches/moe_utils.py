@@ -1439,8 +1439,7 @@ _GROUPED_MM_HOME_LOCK = threading.Lock()
 
 
 def _grouped_mm_home():
-    """The card the process-wide flags describe, anchored once (under a lock: concurrent first callers on
-    different cards must agree on it before either compares against it)."""
+    """Card the process-wide flags describe; locked so concurrent first callers on different cards agree."""
     global _GROUPED_MM_HOME
     if _GROUPED_MM_HOME is None:
         device = _grouped_mm_probe_device()
@@ -1451,7 +1450,6 @@ def _grouped_mm_home():
 
 
 def _grouped_mm_foreign_kind(device):
-    """None when `device` shares the current device's GPU model (the process-wide flags answer), else its model."""
     if device is None or device.type not in ("cuda", "xpu") or device.index is None: return None
     key = (device.type, device.index)
     if key in _GROUPED_MM_FOREIGN: return _GROUPED_MM_FOREIGN[key]
@@ -1493,7 +1491,6 @@ def _check_torch_grouped_mm_supported(device = None):
 
 
 def _grouped_mm_supported_on(device):
-    """Call-site gate for the card the tensor lives on; same-model cards go through the no-arg check."""
     if _grouped_mm_foreign_kind(device) is None: return _check_torch_grouped_mm_supported()
     return _check_torch_grouped_mm_supported(device)
 
@@ -1547,11 +1544,10 @@ def _run_grouped_mm_crash_probe(device):
         pass
     import subprocess
     index, env = device.index, None
-    # ROCr / ordinal selectors compose with the HIP mask in ways a child mask cannot mirror: keep the parent's env and
-    # index there, which always name the same card.
+    # ROCr / ordinal selectors compose with the HIP mask unmirrorably: keep the parent's env and index.
     layered = any((os.environ.get(var) or "").strip() for var in ("ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"))
     if torch.cuda.device_count() > 1 and not layered:
-        # Child sees only this card (a crash on another must not blame it); HIP indexes into the inherited mask.
+        # Child sees only this card; HIP indexes into the inherited mask.
         mask = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
         # clr keeps the first of a repeated entry.
         mask = list(dict.fromkeys(m.strip() for m in mask.split(","))) if mask else None
