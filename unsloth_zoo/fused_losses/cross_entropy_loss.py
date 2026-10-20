@@ -391,6 +391,16 @@ class UnslothFusedLoss(torch.autograd.Function):
         if not compute_gradients:
             __grad_inputs = (None,) * len(__shift_states)
 
+        chunk_triples = list(zip(__grad_inputs, __shift_states, __shift_labels))
+        if loss_function is compute_fused_ce_loss and not torch.compiler.is_compiling() and chunk_triples:
+            has_valid = torch.stack([(l != ignore_index).any() for l in __shift_labels]).tolist()
+            if not all(has_valid):
+                if compute_gradients:
+                    for (grad_inputs_j, _, _), valid in zip(chunk_triples, has_valid):
+                        if not valid:
+                            grad_inputs_j.zero_()
+                chunk_triples = [t for t, valid in zip(chunk_triples, has_valid) if valid]
+
         def accumulate_chunk(
             n_chunks,
             grad_inputs_j,
@@ -507,9 +517,9 @@ class UnslothFusedLoss(torch.autograd.Function):
 
         # Probe path: first-ever forward pass, test if compiled version works
         if _FUSED_CE_COMPILE_SUPPORTED is None and torch_compile and \
-            accumulate_chunk is not uncompiled_accumulate_chunk:
+            accumulate_chunk is not uncompiled_accumulate_chunk and chunk_triples:
 
-            _iter = iter(zip(__grad_inputs, __shift_states, __shift_labels))
+            _iter = iter(chunk_triples)
             grad_inputs_j, hidden_states_j, labels_j = next(_iter)
             try:
                 accumulate_chunk(
@@ -569,8 +579,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                 )
         else:
             # Fast path: compile status already known, original main branch loop
-            for (grad_inputs_j, hidden_states_j, labels_j,) in \
-                zip(__grad_inputs, __shift_states, __shift_labels,):
+            for (grad_inputs_j, hidden_states_j, labels_j,) in chunk_triples:
                 accumulate_chunk(
                     n_chunks = n_chunks,
                     grad_inputs_j = grad_inputs_j,
