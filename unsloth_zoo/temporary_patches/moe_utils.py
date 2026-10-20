@@ -1099,8 +1099,12 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
-# UNSLOTH_MOE_SELECTIVE_DEQUANT=1: dequantize only routed experts. Opt-in because the plan
-# reads token counts on the host (one sync per MoE layer forward; not capturable).
+# bnb 4-bit recompute path, which experts to dequantize (UNSLOTH_MOE_SELECTIVE_DEQUANT):
+#   unset / "auto": when there are fewer routed rows than 7/8 of the experts, dequantize a fixed
+#     number of experts (one per row, an upper bound on the experts used) chosen on the device:
+#     no host sync, capturable, same shapes for the same row count. Otherwise the full stack.
+#   "1": exactly the routed experts, read from the host (one sync per MoE layer forward).
+#   "0": always the full stack.
 SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
 
 
@@ -1222,19 +1226,23 @@ def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
             dest.copy_(weight.reshape(piece_shape))
         row += k
         del weight, dest
-    SELECTIVE_DEQUANT_STATS["dequant_calls"] += 1
-    SELECTIVE_DEQUANT_STATS["experts_dequantized"] += n
-    SELECTIVE_DEQUANT_STATS["experts_total"] += E
+    if not torch.compiler.is_compiling():   # a traced global write re-traces every call
+        SELECTIVE_DEQUANT_STATS["dequant_calls"] += 1
+        SELECTIVE_DEQUANT_STATS["experts_dequantized"] += n
+        SELECTIVE_DEQUANT_STATS["experts_total"] += E
     return out.to(target_dtype) if target_dtype is not None else out
 
 
 def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
     """Chunks of experts to dequantize, or None to keep the full-stack path (off, traced,
     capturing, a source that cannot be split exactly, or nothing to save)."""
-    selective = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "0") == "1"
+    mode = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "auto")
+    selective = mode == "1"
     chunk = _selective_dequant_chunk_experts()
     if not selective and chunk == 0:
-        return None
+        if mode == "0":
+            return None
+        return _capped_dequant_plan(sources, num_tokens_per_expert, num_rows)
     if torch.compiler.is_compiling():
         return None
     device = num_tokens_per_expert.device
@@ -1275,6 +1283,26 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
         return None
     SELECTIVE_DEQUANT_STATS["plans"] += 1
     return _SelectiveDequantPlan(E, num_rows, chunks)
+
+
+def _capped_dequant_plan(sources, num_tokens_per_expert, num_rows):
+    """Sync-free plan: num_rows experts (each row uses one, so the routed experts fit), the routed
+    ones in ascending id order followed by unrouted ones with no rows. Decided from shapes only, so
+    it stays on the device under torch.compile and CUDA graph capture."""
+    E = int(num_tokens_per_expert.numel())
+    if num_rows <= 0 or 8 * num_rows > 7 * E:
+        return None   # under 1/8 of the stack to save, not worth the gathers
+    for source in sources:
+        split = _bnb4bit_expert_split(source)
+        if split is None or split[0] != E:
+            return None
+    counts = num_tokens_per_expert
+    unrouted_last = (counts == 0).to(torch.int64) * E + torch.arange(E, device = counts.device)
+    experts = torch.argsort(unrouted_last)[:num_rows]
+    offsets = torch.cumsum(counts.index_select(0, experts), dim = 0, dtype = torch.int32)
+    if not torch.compiler.is_compiling():
+        SELECTIVE_DEQUANT_STATS["plans"] += 1
+    return _SelectiveDequantPlan(E, num_rows, [(experts, 0, num_rows, offsets)])
 
 
 def _grouped_mm_slice(inputs, weight, offsets, plan):
