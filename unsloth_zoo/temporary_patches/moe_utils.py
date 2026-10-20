@@ -1742,12 +1742,9 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     (re-registers hooks, unnecessary for read-only temp tensors). Used by the
     FP8 and bnb4bit MoE dispatchers.
     """
-    # object.__setattr__ writes the instance __dict__, which shadows `_parameters`. Restore by
-    # removing those entries again rather than writing the original Parameter into __dict__: a
-    # Parameter left there hides every later `_parameters[name] = ...` swap, e.g. FSDP2 installing
-    # its sharded / all-gathered parameter around each forward, so the next call would read a
-    # stale, freed all-gather buffer.
-    # No `object()` sentinel: its graph break left the temporary tensors installed after a compiled call.
+    # Restore by popping the __dict__ entries, never writing the Parameter there: it would shadow
+    # later `_parameters` swaps (FSDP2 all-gather) and read a freed buffer. No `object()` sentinel:
+    # its graph break left the temporary tensors installed after a compiled call.
     instance_dict = experts_module.__dict__
     names = ("gate_up_proj", "down_proj")
     saved = {name: instance_dict[name] for name in names if name in instance_dict}
