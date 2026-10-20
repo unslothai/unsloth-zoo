@@ -1424,8 +1424,34 @@ def _grouped_mm_probe_device():
     return None
 
 
+def _grouped_mm_probe_devices(device):
+    """`device` first, then one card per other GPU model visible: a device_map can put experts on any of them."""
+    if device.type not in ("cuda", "xpu"): return [device]
+    backend = getattr(torch, device.type)
+    try:
+        count = backend.device_count()
+    except Exception:
+        count = 1
+    if count <= 1: return [device]
+
+    def model(i):
+        try:
+            p = backend.get_device_properties(i)
+            return (p.name, getattr(p, "major", None), getattr(p, "minor", None), getattr(p, "gcnArchName", None))
+        except Exception:
+            return i   # unknown: probe it
+    # Homogeneous hosts keep one probe: no context or child process on the other cards.
+    devices, seen = [device], {model(device.index)}
+    for i in range(count):
+        kind = model(i)
+        if i != device.index and kind not in seen:
+            seen.add(kind)
+            devices.append(torch.device(device.type, i))
+    return devices
+
+
 def _check_torch_grouped_mm_supported():
-    """Check torch._grouped_mm support on the current GPU; a runtime probe is the only reliable check."""
+    """Check torch._grouped_mm support on every visible GPU model; a runtime probe is the only reliable check."""
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
     # Definitive negatives stay traceable so fullgraph traces don't break.
@@ -1462,7 +1488,8 @@ def _grouped_mm_survives_out_of_process(device):
     if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
     # Publish once known: concurrent first callers wait for the child, never run the kernel.
     with _GROUPED_MM_SURVIVES_LOCK:
-        if _GROUPED_MM_SURVIVES is None: _GROUPED_MM_SURVIVES = _run_grouped_mm_crash_probe(device)
+        if _GROUPED_MM_SURVIVES is None:
+            _GROUPED_MM_SURVIVES = all(_run_grouped_mm_crash_probe(d) for d in _grouped_mm_probe_devices(device))
     return _GROUPED_MM_SURVIVES
 
 
@@ -1476,17 +1503,25 @@ def _run_grouped_mm_crash_probe(device):
     except Exception:
         pass
     import subprocess
+    index, env = device.index, None
+    if torch.cuda.device_count() > 1:
+        # Child sees only this card (a crash on another must not blame it); HIP indexes into the inherited mask.
+        mask = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
+        mask = [m.strip() for m in mask.split(",")] if mask else None
+        if mask is None or index < len(mask):
+            visible = mask[index] if mask else str(index)
+            index, env = 0, dict(os.environ, HIP_VISIBLE_DEVICES = visible, CUDA_VISIBLE_DEVICES = visible)
     # Not multiprocessing: spawn re-imports the caller's __main__.
     try:
         result = subprocess.run(
-            [sys.executable, "-c", _GROUPED_MM_CRASH_PROBE, str(device.index)],
+            [sys.executable, "-c", _GROUPED_MM_CRASH_PROBE, str(index)], env = env,
             stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL, timeout = 180,
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).returncode
     except Exception as e:
         result = type(e).__name__
     if result == 0: return True
-    _log_info(f"Unsloth: torch._grouped_mm probe crashed on this ROCm GPU ({result}); disabling grouped_mm.")
+    _log_info(f"Unsloth: torch._grouped_mm probe crashed on ROCm GPU {device.index} ({result}); disabling grouped_mm.")
     return False
 
 
@@ -1503,13 +1538,14 @@ def _probe_torch_grouped_mm_supported():
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
         dtype = torch.float16
 
-        # 1 expert, 1 token, dim 8 (safe alignment).
-        x = torch.ones((1, 8), device=device, dtype=dtype)
-        w = torch.ones((1, 8, 8), device=device, dtype=dtype)
-        offs = torch.tensor([1], device=device, dtype=torch.int32)
+        # 1 expert, 1 token, dim 8 (safe alignment). Every visible GPU model must pass (mixed hosts).
+        for d in _grouped_mm_probe_devices(device):
+            x = torch.ones((1, 8), device=d, dtype=dtype)
+            w = torch.ones((1, 8, 8), device=d, dtype=dtype)
+            offs = torch.tensor([1], device=d, dtype=torch.int32)
 
-        torch._grouped_mm(x, w, offs=offs)
-        del x, w, offs
+            torch._grouped_mm(x, w, offs=offs)
+            del x, w, offs
         _TORCH_GROUPED_MM_SUPPORTED = True
     except Exception:
         _TORCH_GROUPED_MM_SUPPORTED = False
