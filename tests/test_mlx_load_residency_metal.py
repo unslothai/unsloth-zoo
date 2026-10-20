@@ -457,9 +457,14 @@ def test_a_wide_prefill_step_runs_layer_by_layer_on_full_tables(tmp_path, monkey
             } | ({name: value for name, value in stacked.items() if "switch_mlp." not in name} if shard else {}))
     expected_cache = cache_module.make_prompt_cache(stock)
     expected = []
+    copy = lambda c: [_bits(a) if isinstance(a, mx.array) else a for _, a in tree_flatten(c.state)]
     for start in range(0, tokens.shape[1], 2048):
         expected.append(stock.model(tokens[:, start:start + 2048], cache = expected_cache))
         mx.eval(expected[-1], [c.state for c in expected_cache])
+        if start == 0:
+            first = [copy(c) for c in expected_cache]
+        if start == 2048:
+            second = [copy(c) for c in expected_cache]
 
     model = _qwen3_moe().load_weights(list(tree_flatten(stock.parameters())))
     offload_experts(model, str(tmp_path), 0.75)
@@ -474,8 +479,12 @@ def test_a_wide_prefill_step_runs_layer_by_layer_on_full_tables(tmp_path, monkey
     reads, read = [], zoo_offload.read_ranges
     monkeypatch.setattr(zoo_offload, "read_ranges", lambda jobs: (reads.extend(len(view) for *_, view in jobs), read(jobs)))
     cache = cache_module.make_prompt_cache(model)
-    hidden = model.model(tokens, cache = cache)
-    mx.eval(hidden, [c.state for c in cache])
+    assert zoo_offload.wide_prefill_step(model) == 2048 and zoo_offload.wide_prefill_step(stock) is None
+    # Each layer's cache as a 2048-chunked prefill holds it after two chunks.
+    with zoo_offload.capture_prefill_rows(4096, copy) as captured:
+        hidden = model.model(tokens, cache = cache)
+        mx.eval(hidden, [c.state for c in cache])
+    assert list(captured) == [id(c) for c in cache]
     # Each missing expert read once; adjacent experts of a stacked tensor merged, never those stored apart.
     missing = [(glu._slots.slot_of < 0).sum() for glu in switches]
     rows = [field.row_bytes for _, _, field in switches[0]._slots.fields]
@@ -489,12 +498,28 @@ def test_a_wide_prefill_step_runs_layer_by_layer_on_full_tables(tmp_path, monkey
     for (_, got), (_, want) in zip(tree_flatten([c.state for c in cache]), tree_flatten([c.state for c in expected_cache]), strict = True):
         np.testing.assert_array_equal(*(_bits(a) if isinstance(a, mx.array) else a for a in (got, want)))
     step = tokens[:, -1:]
-    np.testing.assert_array_equal(_bits(model(step, cache = cache)), _bits(stock(step, cache = expected_cache)))
+    with zoo_offload.capture_prefill_rows(2048, copy) as narrow:
+        np.testing.assert_array_equal(_bits(model(step, cache = cache)), _bits(stock(step, cache = expected_cache)))
+    assert not narrow
+    # A call no wider than a step runs whole and fills a request it ends at.
+    with zoo_offload.capture_prefill_rows(2048, copy) as short:
+        mx.eval(model.model(tokens[:, :2048], cache = cache_module.make_prompt_cache(model)))
+    for request, want in ((captured, second), (short, first)):
+        assert len(request) == len(cache)
+        for got, held in zip(request.values(), want, strict = True):
+            assert all(np.array_equal(a, b) for a, b in zip(got, held, strict = True))
     # Without a causal mask the layer attends to the whole call, which consecutive steps cannot.
     x = stock.model.embed_tokens(tokens)
     layers = (model.model.layers[0], stock.model.layers[0])
     got, want = (layer(x, None, cache_module.KVCache()) for layer in layers)
     np.testing.assert_array_equal(_bits(got), _bits(want))
+    monkeypatch.setattr(model.model.layers[-1], "__class__", type(stock.model.layers[-1]))
+    monkeypatch.setattr(model.model.layers[-1], "mlp", stock.model.layers[-1].mlp)
+    assert zoo_offload.wide_prefill_step(model) is None  # a dense layer runs a call whole
+    monkeypatch.undo()
+    assert zoo_offload.wide_prefill_step(model) == 2048
+    monkeypatch.setattr(switches[-1]._slots.fields[-1][2], "cast", mx.bfloat16)
+    assert zoo_offload.wide_prefill_step(model) is None
 
 
 def test_deepseek_v4_blocks_prefill_layer_by_layer(tmp_path):
@@ -508,6 +533,7 @@ def test_deepseek_v4_blocks_prefill_layer_by_layer(tmp_path):
     tokens = mx.random.randint(0, 512, (1, 2 * 2048 + 5), key = mx.random.key(3))
     expected = [lm.model(tokens[:, i:i + 2048], cache = cache, skip_final_norm = True) for cache in [lm.make_cache()] for i in range(0, tokens.shape[1], 2048)]
     offload_experts(lm, str(tmp_path), 0.75)
+    assert zoo_offload.wide_prefill_step(lm) is None  # a call with image rows runs whole
     np.testing.assert_array_equal(_bits(lm.model(tokens, cache = lm.make_cache(), skip_final_norm = True)), _bits(mx.concatenate(expected, axis = 1)))
     assert [block.ffn.switch_mlp._slots.misses for block in lm.model.layers] == [0] * 4  # full tables, the slots untouched
 

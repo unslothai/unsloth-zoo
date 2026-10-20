@@ -25,6 +25,7 @@ nothing is converted or written to disk. ``plan_offload`` decides how much of ea
 load, priced from the safetensors headers before anything is built.
 """
 
+import contextlib
 import copy
 import glob
 import inspect
@@ -928,15 +929,16 @@ class _WideLayer:
         first = next(iter(axes))
         hidden = args[0] if args else kwargs.get(first)
         if not isinstance(hidden, mx.array) or hidden.ndim < 2 or hidden.shape[0] != 1 or hidden.shape[1] <= _PREFILL_STEP:
-            return super().__call__(*args, **kwargs)
+            return self._whole(hidden, args, kwargs)
         bound = self._wide_signature.bind(self, *args, **kwargs)
         cache, mask, masks = bound.arguments.get("cache"), bound.arguments.get("mask"), self._wide_masks
         step_mask = masks(self, bound.arguments) if callable(masks) and cache is not None else None
         causal = step_mask is not None if callable(masks) else (mask is None or isinstance(mask, str)) and mask in masks
         switch = self._offload_switch
         if cache is None or not causal or not switch._wide(read_next = True):
-            return super().__call__(*args, **kwargs)
+            return self._whole(hidden, args, kwargs)
         given = {name: bound.arguments.get(name) for name in axes}
+        capture = getattr(_prefill_capture, "request", None)
         outputs = []
         try:
             for start in range(0, hidden.shape[1], _PREFILL_STEP):
@@ -948,12 +950,54 @@ class _WideLayer:
                 output = super().__call__(*bound.args[1:], **bound.kwargs)
                 mx.eval(output, cache.state)
                 outputs.append(output)
+                if capture is not None and min(start + _PREFILL_STEP, hidden.shape[1]) == capture[0]:
+                    capture[2][id(cache)] = capture[1](cache)
         finally:
             switch._narrow()
         return mx.concatenate(outputs, axis = axes[first])
 
+    def _whole(self, hidden, args, kwargs):
+        output = super().__call__(*args, **kwargs)
+        capture = getattr(_prefill_capture, "request", None)
+        if capture is not None and isinstance(hidden, mx.array) and hidden.ndim >= 2 and hidden.shape[1] == capture[0]:
+            cache = self._wide_signature.bind(self, *args, **kwargs).arguments.get("cache")
+            if cache is not None:
+                mx.eval(output, cache.state)
+                capture[2][id(cache)] = capture[1](cache)
+        return output
+
 
 _WIDE_CLASSES = {}
+_prefill_capture = threading.local()
+
+
+def wide_prefill_step(model):
+    """The step every wide single-row prefill call of ``model`` runs in, exactly as a prefill chunked at
+    it, or ``None`` when some layer may run a call whole (dense layers, DeepSeek V4's image rows, cast fields)."""
+    modules = dict(model.named_modules())
+    switches = [module for module in modules.values() if isinstance(module, OffloadSwitchGLU)]
+    wide = {path for path, layer in modules.items() if isinstance(layer, _WideLayer)}
+    stacks = {path.rpartition(".")[0] for path in wide}
+    stacked = {path for path in modules if path.rpartition(".")[0] in stacks and path.rpartition(".")[2].isdigit()}
+    held = {id(modules[path]._offload_switch) for path in wide if not callable(modules[path]._wide_masks)}
+    if not switches or stacked - wide or any(
+        id(switch) not in held or any(field.cast is not None for _, _, field in switch._slots.fields)
+        for switch in switches
+    ):
+        return None
+    return _PREFILL_STEP
+
+
+@contextlib.contextmanager
+def capture_prefill_rows(rows, copy):
+    """Yields ``{id(cache): copy(cache)}``, filled by each wide layer of a prefill call in this thread
+    once the call's first ``rows`` rows (a multiple of ``wide_prefill_step``) are in its cache."""
+    captured = {}
+    _prefill_capture.request = (rows, copy, captured)
+    try:
+        yield captured
+    finally:
+        _prefill_capture.request = None
 
 
 def _widen_layers(model, switches):
