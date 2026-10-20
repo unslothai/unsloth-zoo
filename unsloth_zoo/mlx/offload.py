@@ -56,7 +56,6 @@ __all__ = [
     "read_ranges",
 ]
 
-# safetensors dtype -> (numpy transport dtype, mlx dtype)
 _DTYPES = {
     "BF16": (np.uint16, mx.bfloat16),
     "F16": (np.float16, mx.float16),
@@ -753,8 +752,7 @@ class OffloadSwitchGLU(nn.Module):
             activated = glu.activation(up, gate)
             down = glu.down_proj(activated, index, sorted_indices = sorted_indices)
         else:
-            # Over the slots: one row per route, unsorted (each route alone), as the caller's
-            # per-route kernels compute it.
+            # Over the slots: one unsorted row per route, as the caller's per-route kernels compute it.
             if sorted_indices:
                 raise ValueError("Unsloth: a sorted call over more experts than the offload slots hold")
             per_route = x.shape[-3] == indices.shape[-1]
@@ -923,28 +921,22 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
     return report
 
 
-# Planning: how much to offload for a load, from the safetensors headers alone.
-
 OFFLOAD_CONTEXT_STEP = 256
 _PLE_TENSORS = (".embed_tokens_per_layer.", ".ngram_embedding.shards.")
 # Tables mlx-vlm always reads row by row from the checkpoint, never resident: DeepSeek V4.1's Engram.
 _MAPPED_TENSORS = (".engram.embed.",)
 _EXPERT_TENSOR = re.compile(r"\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias|global_scale)$")
-# An expert a checkpoint stores apart, stacked into ``switch_mlp`` at load.
 _EXPERT_APART = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj|w1|w2|w3)\.(weight|scales|biases|bias|global_scale)$")
 _FLOAT_BYTES = {"F16": 2, "BF16": 2, "F32": 4, "F64": 8}
 _NESTED_CONFIGS = ("text_config", "thinker_config", "language_config", "llm_config")
 _TOP_K = ("num_experts_per_tok", "top_k", "n_activated_experts", "experts_per_token")
-# MLX's buffer cache, capped while an offloaded model lives.
 _CACHE_CAP = 1 << 30
 # The seen-row bitmaps and read buffers of offloaded PLE tables, and the capped cache.
 _PLE_OVERHEAD = (256 << 20) + _CACHE_CAP
 PREFILL_STEPS = (2048, 4096, 8192)
-# Kept free on top of the estimate: the larger of 2 GiB and 3% of it. The estimate is fitted to
-# measured peaks; being slightly off must not run the machine out of memory.
+# Kept free on top of the estimate (max of 2 GiB and 3%): it is fitted to measured peaks.
 SAFETY_MARGIN = (2 << 30, 0.03)
-# Experts read from disk cost several times the decode speed whatever the fraction, so, as llama.cpp's
-# fitter does before it spills weights, an unpinned context shrinks to this before they leave memory.
+# Disk experts cost ~4x decode at any fraction, so (as llama.cpp's fitter) an unset context shrinks first.
 _OFFLOAD_CONTEXT = 8192
 _TRANSIENT_RESERVE = 2 << 30
 
