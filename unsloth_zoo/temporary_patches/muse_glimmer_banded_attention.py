@@ -205,7 +205,11 @@ def _sdpa_maybe_muse_glimmer_banded(module, query, key, value, attention_mask,
             except Exception as e:
                 logger.warning_once(
                     f"Unsloth: Muse Glimmer banded sliding fell back to SDPA ({e})")
-        _DEFERRED[0] += 1
+        # Not while compiling: dynamo guards on the counter's value, so every sliding call in a
+        # compiled block recompiled, and a recompile in a non-reentrant checkpoint's recompute
+        # (outside DDP's forward, so not split by DDPOptimizer) saved a different tensor count.
+        if not torch.compiler.is_compiling():
+            _DEFERRED[0] += 1
     return _ORIG_SDPA[0](module, query, key, value, attention_mask,
                          dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs)
 
