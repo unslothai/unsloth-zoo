@@ -118,7 +118,7 @@ def test_minicpmv4_7_text_batch_matches_upstream_and_compiles(monkeypatch):
     upstream = getattr(installed, "__wrapped__", installed)
     monkeypatch.setattr(module.Model, "get_input_embeddings", upstream)
     with monkeypatch.context() as changed:
-        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", "0" * 64)
+        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", ("0" * 64,))
         assert loader._minicpmv4_7_text_positions_adapter(module.Model) is upstream
     loader._ensure_minicpmv4_7_text_positions("minicpmv4_7")
     patched = module.Model.get_input_embeddings
@@ -3033,6 +3033,13 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
             del Gemma3Model._kv_sharing_patched
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
+
+
+@metal_only
+def test_gemma3n_compile_patches_recognise_the_installed_language_call():
+    from mlx_vlm.models.gemma3n.language import Gemma3Model
+    import unsloth_zoo.mlx.compile as mc
+    assert mc._gemma3n_language_contract(Gemma3Model.__call__) == "current"
 
 
 @metal_only
