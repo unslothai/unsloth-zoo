@@ -1188,9 +1188,12 @@ def load_layers_to_host(n, placement = "spread", embeddings = False):
         # transformers 5: the one sink every loaded parameter goes through.
         @functools.wraps(original)
         def set_param_for_module(*args, **kwargs):
-            out = original(*args, **kwargs)
             model = kwargs.get("model", args[0] if args else None)
             name = kwargs.get("target_name", args[1] if len(args) > 1 else None)
+            if model is not None:
+                # Before the first weight lands, so bind() reads every layer's size on meta.
+                state.bind(model)
+            out = original(*args, **kwargs)
             if model is not None and isinstance(name, str):
                 state.on_param(model, name)
             return out
@@ -1203,8 +1206,8 @@ def load_layers_to_host(n, placement = "spread", embeddings = False):
 
         @functools.wraps(original)
         def _load_state_dict_into_meta_model(model, *args, **kwargs):
-            out = original(model, *args, **kwargs)
             state.bind(model)
+            out = original(model, *args, **kwargs)
             for i in state.indices:
                 state.evict(i)
             # The plan counted streamed tables off the card during the load, so they leave per shard too.

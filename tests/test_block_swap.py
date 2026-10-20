@@ -1320,3 +1320,22 @@ def test_host_load_sizes_each_layer_still_to_come(monkeypatch):
     for i in (1, 2, 3):
         state.evict(i)
     assert state.done == {1, 2, 3}
+
+
+def test_host_load_reads_layer_sizes_before_the_first_weight_lands(monkeypatch):
+    # transformers 5: set_param_for_module materializes the weight; bind() must have read the meta sizes first.
+    import sys, types
+    seen = {}
+
+    def set_param_for_module(model, target_name, *a, **k):
+        seen.setdefault("bound", state.shape_bytes.get(1))
+        model.layers[1].to_empty(device = "cpu")
+
+    core = types.ModuleType("transformers.core_model_loading")
+    core.set_param_for_module = set_param_for_module
+    monkeypatch.setitem(sys.modules, "transformers.core_model_loading", core)
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Linear(64, 64, bias = False).to("meta") for _ in range(2)])
+    with _mod.load_layers_to_host(1, placement = "tail") as state:
+        core.set_param_for_module(model, "layers.1.weight")
+    assert seen["bound"] == 64 * 64 * 4
