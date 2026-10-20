@@ -78,3 +78,17 @@ def test_stacked_experts_on_sm80_fuse_every_shape(gpu, rows):
     param = _expert_param(E = 32)
     assert mse._fused(_rows(rows, device), param, True)
     assert mse._fused(_rows(rows, device), param, False)
+
+
+@pytest.mark.parametrize("device", [None, "cuda"])
+def test_unindexed_device_resolves_the_current_gpu(gpu, monkeypatch, device):
+    # Mixed GPUs: the arch answer for cuda:0 (sm80) must not be reused once cuda:1 (sm75) is current.
+    gpu((8, 0))
+    caps = {0: (8, 0), 1: (7, 5)}
+    current = [0]
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d = None: caps[torch.device(d).index])
+    monkeypatch.setitem(mg._AVAILABLE_DTYPE, (str(torch.device("cuda", 1)), torch.float16), True)
+    assert mg.mxfp4_gemm_available(device, torch.float16)
+    current[0] = 1
+    assert not mg.mxfp4_gemm_available(device, torch.float16)

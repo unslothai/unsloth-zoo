@@ -824,6 +824,10 @@ def _available(device, dtype, tiles):
     key = (None if device is None else str(device), dtype)
     if tiles and mode != "1":
         # Below sm_80 (T4) the MMA tile kernel runs 8-34x slower than dequantize + cuBLAS; the grouped GEMV does not.
+        # Keyed by the resolved GPU, so an unindexed device cannot reuse another GPU's arch answer.
+        if key[0] in (None, "cuda"):
+            device = torch.device("cuda", torch.cuda.current_device())
+            key = (str(device), dtype)
         key += ("tiles",)
     ok = _AVAILABLE_DTYPE.get(key)
     if ok is not None:
