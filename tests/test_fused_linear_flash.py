@@ -159,6 +159,7 @@ def test_no_grad_frozen_and_trainable_passes_are_bit_identical(monkeypatch, flas
 
 @pytest.mark.parametrize("cap,mul,scaling", [(0.0, 0.0, None), (30.0, 0.5, 1024.0)])
 def test_flash_cross_entropy(monkeypatch, cap, mul, scaling):
+    monkeypatch.setattr(fl, "_flash_ce_ok", lambda device: True)
     for dtype in _dtypes():
         h, w, _, t, _ = _inputs(dtype, 200, 64, 40001, seed = 3)
         t[::4] = -100
@@ -188,6 +189,18 @@ def test_flash_cross_entropy(monkeypatch, cap, mul, scaling):
         assert _rel(grad, grad64) < 1e-2 and _rel(grad, grad64) <= 1.05 * _rel(grad_c, grad64) + 1e-6, \
             (dtype, _rel(grad, grad64), _rel(grad_c, grad64))
         assert not grad[~keep].any()
+
+
+def test_turing_cross_entropy_keeps_the_chunked_path(monkeypatch):
+    # T4: cross entropy stays chunked (faster there); the log-prob passes still take the tiles.
+    monkeypatch.setattr(fl, "_flash_ce_ok", lambda device: False)
+    h, w, _, t, _ = _inputs(_dtypes()[-1], 200, 64, 40001, seed = 4)
+    n = fl.CALLS["flash"]
+    fused_linear_cross_entropy(h.requires_grad_(True), w, None, t, divisor = 200).backward()
+    assert fl.CALLS["flash"] == n
+    monkeypatch.setattr(fl, "_flash_ce_ok", lambda device: True)
+    fused_linear_cross_entropy(h.detach().requires_grad_(True), w, None, t, divisor = 200).backward()
+    assert fl.CALLS["flash"] == n + 1
 
 
 def test_trainable_head_cross_entropy_keeps_the_chunked_path():

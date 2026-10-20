@@ -123,6 +123,13 @@ def _budget_bytes(device):
     return max(int(gb * 1024**3), 1)
 
 
+@functools.cache
+def _flash_ce_ok(device):
+    # Cross entropy's chunks beat the tiled pass on Turing (T4 fp16, 32k tokens: V 151936 +9.3%, V 262144 +6.3%),
+    # though the log-prob passes there gain 9-14% from it.
+    return device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8
+
+
 def _pow2(x):
     return 1 << max(int(math.ceil(math.log2(max(x, 1)))), 0)
 
@@ -1141,7 +1148,7 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
         # Frozen head, no label smoothing: the log-prob op's tiled forward, which writes the gradient times -coef
         # rounded once (no [rows, V] buffer, no half coef).
         if (_FLASH and fp32_logits and not _IS_HIP and compute_dtype in _HALF and eps == 0.0 and rows <= 0
-                and n_keep >= _FLASH_MIN_ROWS and not need_w and not need_b and _tiled_vocab(V) and _use_triton(device)):
+                and n_keep >= _FLASH_MIN_ROWS and not need_w and not need_b and _tiled_vocab(V) and _use_triton(device) and _flash_ce_ok(device)):
             gscale = 1.0
             if need_h and compute_dtype == torch.float16:
                 gscale = 2.0 ** max(math.floor(math.log2(16384.0 / max(abs(scale), 1e-30))), 0)
