@@ -81,6 +81,12 @@ def unsloth_fused_lm_head_loss(
         target = labels
         do_shift = True
 
+    # fp16: the GradScaler the trainer attached to the model. The kernel computes the gradient
+    # in the forward, so without the loss scale it underflows in fp16 (#3529).
+    accelerator_scaler = kwargs.pop("accelerator_scaler", None)
+    if kwargs.get("scaling", None) is None and accelerator_scaler is not None:
+        kwargs["scaling"] = accelerator_scaler
+
     unsloth_fsdp_unshard(lm_head)
     loss = unsloth_fused_ce_loss(
         trainer        = None,
