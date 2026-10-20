@@ -225,17 +225,10 @@ class _RowTable:
         self.resident = min(int(resident), rows)
         self.held = []
         if self.resident:
-            buffers = self.buffers(self.resident)
-            piece, jobs = 64 << 20, []
-            for field, buffer in zip(self.fields, buffers):
-                flat = memoryview(buffer.reshape(-1))
-                jobs.extend(
-                    (field.fd, field.offset + start, flat[start:start + piece])
-                    for start in range(0, self.resident * field.row_bytes, piece)
-                )
-            read_ranges(jobs)
-            self.held = [field.to_mx(buffer) for field, buffer in zip(self.fields, buffers)]
-            mx.eval(self.held)
+            # Copied from the map, a field at a time: a staging buffer would hold the prefix twice.
+            for field in self.fields:
+                self.held.append(field.to_mx(field.map[:self.resident]))
+                mx.eval(self.held[-1])
 
     def buffers(self, count):
         return [np.empty((count, field.row_bytes), dtype = np.uint8) for field in self.fields]
