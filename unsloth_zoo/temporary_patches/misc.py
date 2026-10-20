@@ -605,8 +605,8 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 # Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
 CAUSAL_MASK_SKIP_STATS = {"skipped": 0, "right_padded": 0}
 _SKIP_CAUSAL_MASK_ENV = "UNSLOTH_SKIP_CAUSAL_MASK"
-# Opt-in: right-padded rows also run `is_causal` instead of a [bsz, 1, q, q] mask. Real tokens never
-# see the pad tail under causal attention, so only the outputs at pad positions change.
+# Right-padded rows also run `is_causal` instead of a [bsz, 1, q, q] mask. Real tokens never see the
+# pad tail under causal attention, so only the outputs at pad positions change. UNSLOTH_SKIP_RIGHT_PADDING_MASK=0 disables.
 _SKIP_RIGHT_PADDING_MASK_ENV = "UNSLOTH_SKIP_RIGHT_PADDING_MASK"
 # Any other non-None argument (or/and_mask_function, encoder_hidden_states, ...) keeps the mask.
 _PLAIN_CAUSAL_MASK_ARGUMENTS = frozenset((
@@ -856,7 +856,7 @@ def _maskless_causal_arguments(signature, args, kwargs):
             return None
     right_padded = False
     if attention_mask is not None and not bool(attention_mask.all()):
-        if os.environ.get(_SKIP_RIGHT_PADDING_MASK_ENV, "0") != "1":
+        if os.environ.get(_SKIP_RIGHT_PADDING_MASK_ENV, "1") == "0":
             return None
         if not _flash_sdpa_takes_causal(config, embeds):
             return None

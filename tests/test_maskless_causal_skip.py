@@ -491,6 +491,24 @@ def test_right_padding_skips_the_mask_when_opted_in(patched, monkeypatch):
         assert not reference[row, 0, :n, n:].any()
 
 
+def test_right_padding_skip_is_on_by_default(patched, monkeypatch):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert patched.create_causal_mask(**kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 1
+
+
+@pytest.mark.parametrize("env", [("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "0"), ("UNSLOTH_SKIP_CAUSAL_MASK", "0")])
+def test_right_padding_kill_switch_keeps_the_mask(patched, monkeypatch, env):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    monkeypatch.setenv(*env)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert isinstance(patched.create_causal_mask(**kwargs), torch.Tensor)
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before
+
+
 @pytest.mark.parametrize("attention_mask", [
     torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]]),
     torch.tensor([[1, 1, 1, 1], [1, 0, 1, 1]]),
