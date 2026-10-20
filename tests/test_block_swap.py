@@ -1216,3 +1216,40 @@ def test_pin_budget_is_split_across_the_ranks_on_this_host(monkeypatch):
     for bad in ("0", "-2", "x"):
         monkeypatch.setenv("LOCAL_WORLD_SIZE", bad)
         assert _mod._pin_budget() == spare
+
+
+def test_chunked_fallback_size_matches_what_pack_allocates(monkeypatch):
+    # The host-fit check charges the chunked fallback's rounding: it must be the bytes _pack really takes.
+    monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
+    monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: object())
+    monkeypatch.setattr(_mod, "_CHUNK_BYTES", 1 << 16)
+    cpu = torch.device("cpu")
+    layers = [nn.Linear(n, 96, bias = False).requires_grad_(False) for n in (40, 200, 72, 72, 130)]
+    sw = BlockSwap.__new__(BlockSwap)
+    sw.blocks = [_mod._Block(layer, {cpu: None}, cpu) for layer in layers]
+    sw.free, sw._chunks, sw.pinned_bytes = {}, [], 0
+    expected = _mod._chunked_bytes([b.sizes for b in sw.blocks])
+    sw._pack()
+    assert sum(c.numel() for c in sw._chunks) == expected > sum(b.nbytes() for b in sw.blocks)
+
+
+def test_host_fit_charges_the_chunked_fallback_rounding(monkeypatch):
+    import sys, pytest
+    # One 17 GiB layer packs into a 32 GiB chunk when it cannot be registered in place.
+    monkeypatch.setattr(_mod, "_host_reserve", lambda vm: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(21 * _GiB))
+    size = 17 * _GiB
+    slack = _mod._chunked_bytes([{"cuda": size}]) - size
+    assert slack == 15 * _GiB
+    _mod._check_host_fit([size])
+    with pytest.raises(ValueError):
+        _mod._check_host_fit([size], slack = slack)
+
+
+def test_auto_depth_without_timing_is_the_fixed_default(monkeypatch):
+    monkeypatch.setattr(_mod, "_TIMING", False)
+    sw = BlockSwap(nn.ModuleList([nn.Linear(4, 4)]), 0, prefetch_depth = "auto")
+    assert (sw._auto, sw._settled, sw.depth) == (False, True, 2)
+    monkeypatch.setattr(_mod, "_TIMING", True)
+    sw = BlockSwap(nn.ModuleList([nn.Linear(4, 4)]), 0, prefetch_depth = "auto")
+    assert (sw._auto, sw._settled, sw.depth) == (True, False, 1)

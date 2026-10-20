@@ -99,20 +99,21 @@ def _pin_budget():
         return 0
 
 
-def _check_host_fit(sizes, on_host = 0):
+def _check_host_fit(sizes, on_host = 0, slack = 0):
     """Refuse an offload whose layers (`sizes`, bytes each) would not fit in free host RAM: running it out
-    freezes the machine. `on_host` bytes of them already sit in host RAM and are counted as available."""
+    freezes the machine. `on_host` bytes of them already sit in host RAM and are counted as available;
+    `slack` is allocator rounding on top of the packed bytes."""
     try:
         import psutil
         vm = psutil.virtual_memory()
     except Exception:
         return
-    need = sum(sizes)
+    need = sum(sizes) + slack
     # Every local rank reads the same free RAM, so each may only plan for its share, like _pin_budget.
     avail = (vm.available - _host_reserve(vm)) // _local_world_size() + on_host
     if need <= avail:
         return
-    fit, used = 0, 0
+    fit, used = 0, slack
     for size in sorted(sizes, reverse = True):
         if used + size > avail:
             break
@@ -159,6 +160,27 @@ def _host_chunk(nbytes, budget):
             if "out of memory" not in text and "cudaerrormemoryallocation" not in text: raise
             _PINNED_MEMORY_AVAILABLE = False
     return torch.empty(nbytes, dtype = torch.uint8), 0
+
+
+def _can_register():
+    return (_PINNED_MEMORY_AVAILABLE and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1"
+            and hasattr(torch.cuda.cudart(), "cudaHostRegister"))
+
+
+def _chunked_bytes(block_sizes):
+    """Host bytes _pack's chunked fallback allocates for blocks with these {device: bytes} sizes (same walk)."""
+    left = sum(sum(s.values()) for s in block_sizes)
+    chunk = max(_CHUNK_BYTES, _pow2_ceil(max((max(s.values(), default = 0) for s in block_sizes), default = 0)))
+    total, cap, used = 0, None, 0
+    for sizes in block_sizes:
+        for need in sizes.values():
+            if cap is None or used + need > cap:
+                cap = chunk if left >= chunk else _pow2_ceil(left)
+                total += cap
+                used = 0
+            used += need
+            left -= need
+    return total
 
 
 _CHECKPOINT_FILE = os.path.join("torch", "utils", "checkpoint.py")
@@ -322,9 +344,11 @@ class BlockSwap:
 
     def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail"):
         self.blocks, self.handles = [], []
-        self._auto = prefetch_depth == "auto"
+        auto = prefetch_depth == "auto"
+        # Auto tunes from the timing events; with UNSLOTH_OFFLOAD_STATS=0 it is the fixed default.
+        self._auto = auto and _TIMING
         self._settled = not self._auto
-        self.depth = 1 if self._auto else max(1, int(prefetch_depth))
+        self.depth = 1 if self._auto else 2 if auto else max(1, int(prefetch_depth))
         self.total = len(layers)
         self._tot = dict.fromkeys(_STAT_KEYS, 0.0)
         self._seen = dict(self._tot)
@@ -356,7 +380,9 @@ class BlockSwap:
         shared = {pid for pid, o in owners.items() if len(o) > 1}
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
         # No credit for weights already in host RAM: packing holds both copies while it runs.
-        _check_host_fit([b.nbytes() for b in self.blocks])
+        sizes = [b.nbytes() for b in self.blocks]
+        # The chunked fallback rounds chunks up to powers of two: up to twice the packed bytes.
+        _check_host_fit(sizes, slack = 0 if _can_register() else _chunked_bytes([b.sizes for b in self.blocks]) - sum(sizes))
         homes = {b.home for b in self.blocks if b.home is not None}
         for li, layer in enumerate(layers):
             if li not in self.pos:
@@ -419,8 +445,7 @@ class BlockSwap:
     def _pack_registered(self):
         # One exact-size pageable arena, page-locked in place up to the budget (cudaHostRegister).
         global _PINNED_MEMORY_AVAILABLE
-        if (not _PINNED_MEMORY_AVAILABLE or os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1"
-                or not hasattr(torch.cuda.cudart(), "cudaHostRegister")):
+        if not _can_register():
             return False
         total = sum(b.nbytes() for b in self.blocks)
         arena = torch.empty(total, dtype = torch.uint8)
