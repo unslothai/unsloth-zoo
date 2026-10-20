@@ -1608,13 +1608,13 @@ def _probe_transposed_view_grouped_mm_is_safe():
 
 
 _TRITON_ALLOCATOR_INITIALIZED = False
-_PERSISTENT_BUFFER = None
+_PERSISTENT_BUFFER = {}   # per device index: a card must never be handed another card's scratch
 _original_peft_get_peft_model = None
 
 
 def _init_triton_allocator():
     """Initialize a persistent Triton allocator to avoid per-call allocation overhead."""
-    global _TRITON_ALLOCATOR_INITIALIZED, _PERSISTENT_BUFFER
+    global _TRITON_ALLOCATOR_INITIALIZED
     if _TRITON_ALLOCATOR_INITIALIZED: return
 
     try:
@@ -1622,21 +1622,23 @@ def _init_triton_allocator():
 
         # Persistent buffer that grows as needed, avoiding per-kernel allocations.
         def persistent_alloc_fn(size: int, alignment: int, stream):
-            global _PERSISTENT_BUFFER
+            # Triton launches on, and asks for scratch on, the current device.
+            device = torch.cuda.current_device()
+            buffer = _PERSISTENT_BUFFER.get(device)
             # Round up to nearest 128 bytes for alignment / fewer reallocations.
             rounded_size = ((size + 128 - 1) // 128) * 128
 
             if (
-                _PERSISTENT_BUFFER is None
-                or _PERSISTENT_BUFFER.numel() * _PERSISTENT_BUFFER.element_size()
+                buffer is None
+                or buffer.numel() * buffer.element_size()
                 < rounded_size
             ):
                 # 10% headroom; uint8 for raw byte storage.
-                _PERSISTENT_BUFFER = torch.empty(
-                    int(rounded_size * 1.1), device="cuda", dtype=torch.uint8
+                buffer = _PERSISTENT_BUFFER[device] = torch.empty(
+                    int(rounded_size * 1.1), device=torch.device("cuda", device), dtype=torch.uint8
                 )
-                _PERSISTENT_BUFFER.__hibernate__ = {"type": "ignore"}
-            return _PERSISTENT_BUFFER
+                buffer.__hibernate__ = {"type": "ignore"}
+            return buffer
 
         triton.set_allocator(persistent_alloc_fn)
         triton._unsloth_allocator_set = True
