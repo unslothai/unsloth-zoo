@@ -393,7 +393,7 @@ def _grouped_mm_eager(inputs, weight, offsets):
     # LoRA delta still routed here. torch 2.8 hard-raises unless `dprops->major == 9`
     # (Blas.cpp, sm90_only) and 2.6/2.7 have no `_grouped_mm`, so a LoRA MoE died on
     # every card but an H100; 2.9 falls back internally. Probe is cached: one read.
-    if not _check_torch_grouped_mm_supported():
+    if not _grouped_mm_supported_on(inputs.device):
         return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
         weight = weight.contiguous()   # view path unproven on this device -> safe copy
@@ -414,7 +414,7 @@ def _grouped_mm_eager(inputs, weight, offsets):
 def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
     """dW[g] = inputs[g]^T @ grad_output[g] per group, as [G, K, N]; empty groups are zero."""
     try:
-        if _check_torch_grouped_mm_supported():
+        if _grouped_mm_supported_on(inputs.device):
             return torch._grouped_mm(inputs.transpose(-2, -1), grad_output, offs = offsets).contiguous()
     except RuntimeError:
         pass
@@ -1424,15 +1424,75 @@ def _grouped_mm_probe_device():
     return None
 
 
-def _check_torch_grouped_mm_supported():
-    """Check torch._grouped_mm support on the current GPU; a runtime probe is the only reliable check."""
+def _grouped_mm_device_kind(backend, index):
+    try:
+        p = backend.get_device_properties(index)
+        return (p.name, getattr(p, "major", None), getattr(p, "minor", None), getattr(p, "gcnArchName", None))
+    except Exception:
+        return index
+
+
+_GROUPED_MM_FOREIGN = {}   # (type, index) -> None if same GPU model as the probe device, else its model
+# (type, index) the process-wide flags were probed on; a later current-device switch must not move it.
+_GROUPED_MM_HOME = None
+_GROUPED_MM_HOME_LOCK = threading.Lock()
+
+
+def _grouped_mm_home():
+    """Card the process-wide flags describe; locked so concurrent first callers on different cards agree."""
+    global _GROUPED_MM_HOME
+    if _GROUPED_MM_HOME is None:
+        device = _grouped_mm_probe_device()
+        with _GROUPED_MM_HOME_LOCK:
+            if _GROUPED_MM_HOME is None and device is not None and device.index is not None:
+                _GROUPED_MM_HOME = (device.type, device.index)
+    return torch.device(*_GROUPED_MM_HOME) if _GROUPED_MM_HOME is not None else _grouped_mm_probe_device()
+
+
+def _grouped_mm_foreign_kind(device):
+    if device is None or device.type not in ("cuda", "xpu") or device.index is None: return None
+    key = (device.type, device.index)
+    if key in _GROUPED_MM_FOREIGN: return _GROUPED_MM_FOREIGN[key]
+    return _run_probe_eagerly(lambda: _resolve_grouped_mm_foreign_kind(device, key))
+
+
+def _resolve_grouped_mm_foreign_kind(device, key):
+    home = _grouped_mm_home()
+    kind = None
+    if home is not None and (home.type, home.index) != (device.type, device.index):
+        # Typed: a CUDA home must not answer for an XPU card (or the reverse) on a host with both.
+        kind = (device.type, _grouped_mm_device_kind(getattr(torch, device.type), device.index))
+        if home.type == device.type and kind == (home.type, _grouped_mm_device_kind(getattr(torch, home.type), home.index)):
+            kind = None
+    _GROUPED_MM_FOREIGN[key] = kind
+    return kind
+
+
+# Per GPU model other than the current device's: a card the model never uses is never probed.
+_TORCH_GROUPED_MM_SUPPORTED_BY_KIND = {}
+
+
+def _check_torch_grouped_mm_supported(device = None):
+    """Check torch._grouped_mm support on `device` (default: current); a runtime probe is the only reliable check."""
     global _TORCH_GROUPED_MM_SUPPORTED
+    if device is not None:
+        kind = _grouped_mm_foreign_kind(device)
+        if kind is not None:
+            supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
+            if supported is not None: return supported
+            if not _TORCH_GROUPED_MM_AVAILABLE: return False
+            return _run_probe_eagerly(lambda: _probe_torch_grouped_mm_supported(device))
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
     # Definitive negatives stay traceable so fullgraph traces don't break.
     if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
+
+
+def _grouped_mm_supported_on(device):
+    if _grouped_mm_foreign_kind(device) is None: return _check_torch_grouped_mm_supported()
+    return _check_torch_grouped_mm_supported(device)
 
 
 # Some ROCm GPUs segfault in grouped_mm instead of raising (unsloth#12391): run the kernels in a throwaway interpreter first.
@@ -1454,11 +1514,18 @@ probe(torch.ones(32, 32, **bf16), w_t, [8, 16, 24, 32])
 probe(torch.ones(32, 32, **bf16), w_t.contiguous(), [8, 16, 24, 32])
 """
 _GROUPED_MM_SURVIVES = None
+_GROUPED_MM_SURVIVES_BY_KIND = {}
 _GROUPED_MM_SURVIVES_LOCK = threading.Lock()
 
 
 def _grouped_mm_survives_out_of_process(device):
     global _GROUPED_MM_SURVIVES
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is not None:
+        with _GROUPED_MM_SURVIVES_LOCK:
+            if kind not in _GROUPED_MM_SURVIVES_BY_KIND:
+                _GROUPED_MM_SURVIVES_BY_KIND[kind] = _run_grouped_mm_crash_probe(device)
+        return _GROUPED_MM_SURVIVES_BY_KIND[kind]
     if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
     # Publish once known: concurrent first callers wait for the child, never run the kernel.
     with _GROUPED_MM_SURVIVES_LOCK:
@@ -1476,29 +1543,32 @@ def _run_grouped_mm_crash_probe(device):
     except Exception:
         pass
     import subprocess
+    index, env = device.index, None
+    # ROCr / ordinal selectors compose with the HIP mask unmirrorably: keep the parent's env and index.
+    layered = any((os.environ.get(var) or "").strip() for var in ("ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"))
+    if torch.cuda.device_count() > 1 and not layered:
+        # Child sees only this card; HIP indexes into the inherited mask.
+        mask = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
+        # clr keeps the first of a repeated entry.
+        mask = list(dict.fromkeys(m.strip() for m in mask.split(","))) if mask else None
+        if mask is None or index < len(mask):
+            visible = mask[index] if mask else str(index)
+            index, env = 0, dict(os.environ, HIP_VISIBLE_DEVICES = visible, CUDA_VISIBLE_DEVICES = visible)
     # Not multiprocessing: spawn re-imports the caller's __main__.
     try:
         result = subprocess.run(
-            [sys.executable, "-c", _GROUPED_MM_CRASH_PROBE, str(device.index)],
+            [sys.executable, "-c", _GROUPED_MM_CRASH_PROBE, str(index)], env = env,
             stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL, timeout = 180,
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).returncode
     except Exception as e:
         result = type(e).__name__
     if result == 0: return True
-    _log_info(f"Unsloth: torch._grouped_mm probe crashed on this ROCm GPU ({result}); disabling grouped_mm.")
+    _log_info(f"Unsloth: torch._grouped_mm probe crashed on ROCm GPU {device.index} ({result}); disabling grouped_mm.")
     return False
 
 
-def _probe_torch_grouped_mm_supported():
-    global _TORCH_GROUPED_MM_SUPPORTED
-    if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
-
-    device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
-    if device is None or not _grouped_mm_survives_out_of_process(device):
-        _TORCH_GROUPED_MM_SUPPORTED = False
-        return False
-
+def _grouped_mm_runs_on(device):
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
         dtype = torch.float16
@@ -1510,10 +1580,29 @@ def _probe_torch_grouped_mm_supported():
 
         torch._grouped_mm(x, w, offs=offs)
         del x, w, offs
-        _TORCH_GROUPED_MM_SUPPORTED = True
+        return True
     except Exception:
-        _TORCH_GROUPED_MM_SUPPORTED = False
+        return False
 
+
+def _probe_torch_grouped_mm_supported(device = None):
+    global _TORCH_GROUPED_MM_SUPPORTED
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is not None:
+        supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
+        if supported is None:
+            supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
+            _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
+        return supported
+    if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
+
+    # The anchored card, not whichever is current now: the flags must describe one card.
+    device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else None
+    if device is None or not _grouped_mm_survives_out_of_process(device):
+        _TORCH_GROUPED_MM_SUPPORTED = False
+        return False
+
+    _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
     return _TORCH_GROUPED_MM_SUPPORTED
 
 
@@ -1572,13 +1661,13 @@ def _probe_transposed_view_grouped_mm_is_safe():
 
 
 _TRITON_ALLOCATOR_INITIALIZED = False
-_PERSISTENT_BUFFER = None
+_PERSISTENT_BUFFER = {}   # per device index: a card must never be handed another card's scratch
 _original_peft_get_peft_model = None
 
 
 def _init_triton_allocator():
     """Initialize a persistent Triton allocator to avoid per-call allocation overhead."""
-    global _TRITON_ALLOCATOR_INITIALIZED, _PERSISTENT_BUFFER
+    global _TRITON_ALLOCATOR_INITIALIZED
     if _TRITON_ALLOCATOR_INITIALIZED: return
 
     try:
@@ -1586,21 +1675,23 @@ def _init_triton_allocator():
 
         # Persistent buffer that grows as needed, avoiding per-kernel allocations.
         def persistent_alloc_fn(size: int, alignment: int, stream):
-            global _PERSISTENT_BUFFER
+            # Triton launches on, and asks for scratch on, the current device.
+            device = torch.cuda.current_device()
+            buffer = _PERSISTENT_BUFFER.get(device)
             # Round up to nearest 128 bytes for alignment / fewer reallocations.
             rounded_size = ((size + 128 - 1) // 128) * 128
 
             if (
-                _PERSISTENT_BUFFER is None
-                or _PERSISTENT_BUFFER.numel() * _PERSISTENT_BUFFER.element_size()
+                buffer is None
+                or buffer.numel() * buffer.element_size()
                 < rounded_size
             ):
                 # 10% headroom; uint8 for raw byte storage.
-                _PERSISTENT_BUFFER = torch.empty(
-                    int(rounded_size * 1.1), device="cuda", dtype=torch.uint8
+                buffer = _PERSISTENT_BUFFER[device] = torch.empty(
+                    int(rounded_size * 1.1), device=torch.device("cuda", device), dtype=torch.uint8
                 )
-                _PERSISTENT_BUFFER.__hibernate__ = {"type": "ignore"}
-            return _PERSISTENT_BUFFER
+                buffer.__hibernate__ = {"type": "ignore"}
+            return buffer
 
         triton.set_allocator(persistent_alloc_fn)
         triton._unsloth_allocator_set = True
