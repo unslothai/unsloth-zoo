@@ -120,6 +120,17 @@ def test_first_callers_on_different_cards_agree_on_the_home_card(spoof, monkeypa
     assert seen == [0, 1]
 
 
+def test_an_xpu_card_never_borrows_the_cuda_answer(spoof, monkeypatch):
+    # CUDA and XPU on one host: an XPU tensor is a different backend, so it gets its own answer.
+    spoof(1, models = ["H100"])
+    monkeypatch.setattr(torch, "xpu", types.SimpleNamespace(
+        get_device_properties = lambda i: types.SimpleNamespace(name = "Arc B580", major = None, minor = None),
+    ), raising = False)
+    assert moe_utils._grouped_mm_foreign_kind(cuda(0)) is None
+    kind = moe_utils._grouped_mm_foreign_kind(torch.device("xpu", 0))
+    assert kind is not None and kind[0] == "xpu"
+
+
 @pytest.mark.parametrize("count", [2, 3, 8])
 def test_homogeneous_host_keeps_one_probe(spoof, count):
     seen = spoof(count, models = ["MI300X"] * count)

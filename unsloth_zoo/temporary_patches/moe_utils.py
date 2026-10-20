@@ -1461,10 +1461,11 @@ def _grouped_mm_foreign_kind(device):
 def _resolve_grouped_mm_foreign_kind(device, key):
     home = _grouped_mm_home()
     kind = None
-    if home is not None and home.type == device.type and home.index != device.index:
-        backend = getattr(torch, device.type)
-        kind = _grouped_mm_device_kind(backend, device.index)
-        if kind == _grouped_mm_device_kind(backend, home.index): kind = None
+    if home is not None and (home.type, home.index) != (device.type, device.index):
+        # Typed: a CUDA home must not answer for an XPU card (or the reverse) on a host with both.
+        kind = (device.type, _grouped_mm_device_kind(getattr(torch, device.type), device.index))
+        if home.type == device.type and kind == (home.type, _grouped_mm_device_kind(getattr(torch, home.type), home.index)):
+            kind = None
     _GROUPED_MM_FOREIGN[key] = kind
     return kind
 
