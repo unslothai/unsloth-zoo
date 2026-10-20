@@ -1126,7 +1126,10 @@ def test_ce_gradient_scale_is_not_rounded_to_half():
     ref = torch.nn.functional.cross_entropy(h64 @ w.double().t(), t, reduction = "sum") / n
     (want,) = torch.autograd.grad(ref, (h64,))
     ratio = float(got.double().norm() / want.norm())
-    assert abs(ratio - 1.0) < 1e-3, ratio
+    # Without an fp32-output GEMM (ROCm, torch < 2.8) dz @ W is already rounded to half, so the leftover factor
+    # rounds a second time (+0.2% here); still under the 0.39% that writing half(1 / 255) itself costs.
+    half_gemm = fl._IS_HIP or not fl._fp32_out_ok(h.device, h.dtype)
+    assert abs(ratio - 1.0) < (3e-3 if half_gemm else 1e-3), ratio
 
 
 @CUDA

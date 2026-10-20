@@ -403,6 +403,9 @@ def test_grpo_switches_keep_entropy_policy_and_reference_on_one_scorer(flag):
     # Either switch sends old / ref scoring to the old chunked function, so the entropy policy pass (the recompute
     # function) must leave the fused kernel too: identical policies then score bit-identically (ratio 1).
     import json, os, subprocess, sys
+    from unsloth_zoo.fused_losses import fused_linear as fl
+    if torch.cuda.is_available() and not fl._HAS_TRITON:
+        pytest.skip("the old scorers compile through Inductor, which needs Triton for GPU code")
     child = (
         "import json, torch\n"
         "from unsloth_zoo import rl_replacements as rr\n"
