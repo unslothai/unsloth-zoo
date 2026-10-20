@@ -407,7 +407,7 @@ def select_blocks(scores, complete, topk, head_dim):
     kernel sorts any selection into.
     """
     B, H, L, nb = scores.shape
-    if topk < 1:  # the kernel would write picks past a zero-width output
+    if topk < 1:
         raise ValueError(f"Unsloth: QSA block selection needs topk >= 1, got {topk}")
     out, _ = _select_kernel()(
         inputs = [mx.contiguous(scores), mx.contiguous(complete.astype(mx.int32)), _divisor(head_dim),
