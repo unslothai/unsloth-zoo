@@ -359,7 +359,12 @@ def test_shaped_gives_evicted_expert_weights_their_shape_without_memory():
         except ImportError:
             ParamWrapper = None
         if ParamWrapper is not None:
-            pw = ParamWrapper(layers[0], "default", parameter_name = "gate_up_proj", r = 2, lora_alpha = 2)
+            import inspect
+            kwargs = {}
+            if "config" in inspect.signature(ParamWrapper.__init__).parameters:
+                from peft import LoraConfig  # peft >= 0.19 takes the adapter config
+                kwargs["config"] = LoraConfig(r = 2, lora_alpha = 2)
+            pw = ParamWrapper(layers[0], "default", parameter_name = "gate_up_proj", r = 2, lora_alpha = 2, **kwargs)
             assert pw.num_experts == 4
     assert w.numel() == 0
     sw.remove()
