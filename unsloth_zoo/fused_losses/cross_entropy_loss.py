@@ -109,17 +109,14 @@ def unsloth_zero3_partitioned(tensor):
         return False
     if not getattr(tensor, "ds_persist", False):
         return True
-    # Persistent params start partitioned and can be released again (cache partitioning): check the status.
+    # Persistent params can still be released (cache partitioning).
     status = getattr(tensor.ds_status, "name", tensor.ds_status)
     return status != "AVAILABLE"
 pass
 
 def unsloth_zero3_gathered(tensor):
     # All Unsloth Zoo code licensed under LGPLv3
-    """Detached gathered copy of a ZeRO-3 partitioned parameter (all ranks call it at the same point).
-
-    The copy has no gradient, so a trainable head is refused rather than silently not updated.
-    """
+    """Detached gathered copy of a ZeRO-3 param (collective: all ranks call it); no grad, so trainable heads are refused."""
     if not unsloth_zero3_partitioned(tensor):
         return tensor
     if tensor.requires_grad and torch.is_grad_enabled():

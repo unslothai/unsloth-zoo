@@ -189,11 +189,9 @@ def test_gather_helper_leaves_ordinary_tensors_alone():
     assert unsloth_zero3_gathered(w) is w
     assert unsloth_zero3_gathered(None) is None
     assert not unsloth_zero3_partitioned(w)
-    # A persistent ZeRO-3 parameter (below stage3_param_persistence_threshold) is never released.
     w.ds_id, w.ds_status, w.ds_persist = 1, "AVAILABLE", True
     assert not unsloth_zero3_partitioned(w)
     assert unsloth_zero3_gathered(w) is w
-    # Persistent but not gathered yet (or released again): still a placeholder.
     w.ds_status = types.SimpleNamespace(name = "NOT_AVAILABLE")
     assert unsloth_zero3_partitioned(w)
     w.ds_status = types.SimpleNamespace(name = "AVAILABLE")
