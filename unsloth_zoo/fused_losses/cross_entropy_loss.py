@@ -36,11 +36,8 @@ from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bou
 from unsloth_zoo.device_type import DEVICE_TYPE
         
 
-# `torch.nn.functional.linear` is this builtin, unless DeepSpeed ZeRO-3 replaced it process wide with its
-# memory_efficient_linear autograd.Function (deepspeed/runtime/zero/linear.py, on by default and kept
-# after deepspeed.initialize). Under torch.compile that Function inside torch.func.grad_and_value returns
-# a zero lm_head gradient, so a full finetune never updated its untied head. The builtin is what
-# F.linear is everywhere else, so nothing else changes.
+# Not F.linear: ZeRO-3 replaces it process wide (deepspeed/runtime/zero/linear.py), and under
+# torch.compile + torch.func.grad_and_value that gives a zero lm_head gradient.
 _aten_linear = torch._C._nn.linear
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
 N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)

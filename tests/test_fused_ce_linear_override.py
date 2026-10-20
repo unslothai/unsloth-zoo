@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The fused CE head gradient survives DeepSpeed ZeRO-3's process-wide F.linear override.
-
-`deepspeed.initialize` with ZeRO-3 (memory_efficient_linear, on by default) replaces
-torch.nn.functional.linear with an autograd.Function and keeps it replaced. Inside the compiled
-torch.func.grad_and_value chunk loop that Function produced a zero lm_head gradient, so a ZeRO-3
-full finetune never trained an untied head (grad norm 0 for lm_head.weight, the rest matching one
-GPU). The stand-in below is deepspeed/runtime/zero/linear.py's LinearFunctionForZeroStage3 reduced
-to its math.
-"""
+"""Fused CE head gradient survives ZeRO-3's process-wide F.linear override (stand-in: LinearFunctionForZeroStage3)."""
 
 import pytest
 import torch
