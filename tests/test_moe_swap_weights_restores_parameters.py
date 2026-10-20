@@ -77,3 +77,33 @@ def test_swap_restores_plain_instance_attributes_and_raises_through():
         raise AssertionError("expected the forward's error")
     assert experts.__dict__["gate_up_proj"] is plain_gu
     assert experts.__dict__["down_proj"] is plain_dn
+
+
+def test_swap_traces_without_graph_break_and_restores_under_compile():
+    # The bnb 4-bit dispatcher calls this from compiled code. An `object()` sentinel broke the
+    # graph there, and the resumed frame left the dense tensors installed in __dict__.
+    from torch._dynamo.utils import counters
+
+    experts = _Experts()
+    dense_gu, dense_dn = torch.ones(2, 8, 4), torch.ones(2, 4, 4)
+
+    def forward_fn(module, x):
+        return x + module.gate_up_proj.sum() + module.down_proj.sum()
+
+    @torch.compile(backend = "eager", fullgraph = False)
+    def call(x):
+        return swap_moe_weights_for_call(experts, dense_gu, dense_dn, forward_fn, x) * 2
+
+    torch._dynamo.reset()
+    counters.clear()
+    out = call(torch.zeros(1))
+    breaks = dict(counters["graph_break"])
+    torch._dynamo.reset()
+    assert out.item() == 2 * (64 + 32)
+    assert "gate_up_proj" not in experts.__dict__
+    assert "down_proj" not in experts.__dict__
+    assert experts.gate_up_proj is experts._parameters["gate_up_proj"]
+    assert experts.down_proj is experts._parameters["down_proj"]
+    # torch < 2.13 cannot trace a __dict__ delete (one break); the sentinel added two more.
+    major_minor = tuple(int(v) for v in torch.__version__.split(".")[:2])
+    assert sum(breaks.values()) <= (0 if major_minor >= (2, 13) else 1), breaks

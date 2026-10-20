@@ -1747,19 +1747,21 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     # Parameter left there hides every later `_parameters[name] = ...` swap, e.g. FSDP2 installing
     # its sharded / all-gathered parameter around each forward, so the next call would read a
     # stale, freed all-gather buffer.
+    # No `object()` sentinel: dynamo cannot trace it, and the graph break it caused left the
+    # temporary tensors installed after a compiled call.
     instance_dict = experts_module.__dict__
-    missing = object()
-    saved = {name: instance_dict.get(name, missing) for name in ("gate_up_proj", "down_proj")}
+    names = ("gate_up_proj", "down_proj")
+    saved = {name: instance_dict[name] for name in names if name in instance_dict}
     object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
     object.__setattr__(experts_module, "down_proj", down_proj)
     try:
         return forward_fn(experts_module, *args)
     finally:
-        for name, value in saved.items():
-            if value is missing:
-                instance_dict.pop(name, None)
+        for name in names:
+            if name in saved:
+                instance_dict[name] = saved[name]
             else:
-                instance_dict[name] = value
+                instance_dict.pop(name, None)
 
 
 def forward_moe_backend(
