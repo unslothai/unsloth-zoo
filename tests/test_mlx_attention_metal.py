@@ -686,6 +686,12 @@ def test_qsa_block_selection_picks_argpartitions_set(kind):
         assert mx.array_equal(select_blocks(scores, complete, 512, 128), _stock_selection(scores, complete, 512)).item()
 
 
+def test_qsa_block_selection_refuses_a_zero_budget():
+    scores, complete = mx.random.normal((1, 4, 2, 64)), mx.full((1, 2), 64, dtype = mx.int32)
+    with pytest.raises(ValueError, match = "topk >= 1"):
+        select_blocks(scores, complete, 0, 128)
+
+
 def test_qsa_fast_prefill_matches_fp32_attention():
     if not nax.nax_available():
         pytest.skip("needs the neural accelerators")

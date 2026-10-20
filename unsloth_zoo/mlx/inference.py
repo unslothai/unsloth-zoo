@@ -4720,7 +4720,8 @@ def _qsa_select_route(native, bindings):
         selection = native(self, qk, cache, position_ids)
         pooled = getattr(cache, "index_block_keys", None)
         # The native top-k is still lazy; once the picks replace it, it is never evaluated.
-        if (selection is None or not selection.zero_padding or not isinstance(pooled, mx.array)
+        # The kernel needs a positive budget: a config whose indexer budget is under one block leaves it at 0.
+        if (selection is None or not selection.zero_padding or not isinstance(pooled, mx.array) or self.block_topk < 1
                 or pooled.shape[2] <= self.block_topk or self.training or not _bindings_intact(bindings)):
             return selection
         batch, rows, _ = qk.shape
