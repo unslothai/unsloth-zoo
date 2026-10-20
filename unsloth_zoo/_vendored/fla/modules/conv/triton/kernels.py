@@ -30,7 +30,7 @@ STATIC_WARPS = 32 if not IS_AMD else 16
         for BD in [16, 32, 64, 128]
         for num_warps in NUM_WARPS_AUTOTUNE
     ],
-    # Unsloth: backport of fla PRs #1154 / #1388: unread NB dropped so token buckets do not recompile.
+    # Unsloth: fla PRs #1154 / #1388 drop unread NB so token buckets do not recompile.
     key=['D', 'W'],
     **autotune_cache_kwargs,
 )
