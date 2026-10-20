@@ -161,6 +161,149 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     mx.eval(_resident_parameters(model))
 
 
+_OFFLOAD_CACHE_LIMIT = 1 << 30
+_offload_cache_cap = {"models": 0, "previous": None, "applied": None}
+# Reentrant: a collected model's finalizer can run on a thread inside this lock.
+_OFFLOAD_CACHE_LOCK = threading.RLock()
+
+
+def _cap_cache_while_alive(model) -> None:
+    """Cap MLX's buffer cache while ``model`` lives: offloaded reads free buffers of ever-changing
+    sizes, which the cache would keep until the memory limit."""
+    import mlx.core as mx
+
+    cap = _offload_cache_cap
+    with _OFFLOAD_CACHE_LOCK:
+        if not cap["models"]:
+            cap["previous"] = mx.set_cache_limit(_OFFLOAD_CACHE_LIMIT)
+            cap["applied"] = min(cap["previous"], _OFFLOAD_CACHE_LIMIT)
+            mx.set_cache_limit(cap["applied"])
+        cap["models"] += 1
+
+    def release():
+        with _OFFLOAD_CACHE_LOCK:
+            cap["models"] -= 1
+            if not cap["models"]:
+                current = mx.set_cache_limit(cap["previous"])
+                if current != cap["applied"]:  # set by someone else since: theirs stays
+                    mx.set_cache_limit(current)
+
+    weakref.finalize(model, release)
+
+
+def _settle_offload(offload, conflict, message):
+    """Refuse an offload set to a fraction that ``conflict`` rules out; ``auto`` or a caller's
+    planner turns off."""
+    if not conflict:
+        return offload
+    if not callable(offload) and any(value not in (None, "auto") for value in offload.values()):
+        raise ValueError(message)
+    return {"ple": None, "experts": None}
+
+
+def _auto_offload(model, model_dir, offload, max_seq_length, target_dtype):
+    """Resolve ``auto`` parts to the least offload that fits the weights and ``max_seq_length``
+    tokens of context in 0.85 of the GPU's recommended working set, warning for each it turns on."""
+    import mlx.core as mx
+    from .offload import context_bytes, offload_inventory, offloadable, plan_offload
+
+    dtype_bytes = target_dtype.size if target_dtype is not None else 2
+    try:
+        context_bytes(model_dir, 0)
+    except ValueError as error:
+        warnings.warn(f"{error} offload 'auto' stays off.", stacklevel=4)
+        return {key: None if value == "auto" else value for key, value in offload.items()}
+    # The checkpoint's size, and what this model's offload can actually take from it.
+    inventory = {**offload_inventory(model_dir, dtype_bytes), **offloadable(model, model_dir, cast_dtype=target_dtype)}
+    budget = int(0.85 * mx.device_info()["max_recommended_working_set_size"])
+    plan = plan_offload(
+        budget=budget,
+        resident=inventory["total_bytes"] - inventory["ple_bytes"] - inventory["expert_bytes"],
+        inventory=inventory,
+        context_cost=lambda tokens, step: context_bytes(model_dir, tokens, step, dtype_bytes),
+        ceiling=max_seq_length,
+        context=max_seq_length,
+        offload=offload,
+    )
+    fits = plan["context"] is not None
+    if not fits:
+        warnings.warn(
+            f"Unsloth: the weights and max_seq_length={max_seq_length} do not fit in "
+            f"{budget / 2**30:.1f} GiB even with every offload; offloading all that can be.",
+            stacklevel=4,
+        )
+    resolved = dict(offload)
+    step = plan["prefill_step"] or 2048
+    for key, what in (("ple", "per-layer embedding rows"), ("experts", "routed experts")):
+        if offload[key] != "auto":
+            continue
+        chosen = resolved[key] = plan[key] if fits else (None if inventory[key] else 1.0)
+        if chosen is not None:
+            warnings.warn(
+                f"Unsloth: offload 'auto' leaves {chosen:.0%} of the {what} on disk, read on demand"
+                + (f", so the weights and max_seq_length={max_seq_length} fit in {budget / 2**30:.1f} GiB. "
+                   if fits else ". ")
+                + (f"Prefill with prefill_step_size={step}: each step re-reads the offloaded experts. "
+                   if key == "experts" and step != 2048 else "")
+                + f"Set offload's {key!r} to 'off' to keep them in memory.",
+                stacklevel=4,
+            )
+    return resolved
+
+
+def _apply_offload(model, model_dir, offload, target_dtype, max_seq_length) -> None:
+    """Swap the still-lazy PLE tables and routed experts for ones read from ``model_dir``'s shards."""
+    from .offload import offload_experts, offload_ple, offload_setting
+
+    if not callable(offload) and not any(offload.values()):
+        return
+    if not model_dir:
+        raise ValueError("Unsloth: offloading weights needs a local copy of the checkpoint.")
+    if callable(offload):
+        offload = offload_setting(offload(model_dir))
+    if "auto" in offload.values():
+        offload = _auto_offload(model, model_dir, offload, max_seq_length, target_dtype)
+    reports, missing = {}, []
+    for key, apply, count, what, label in (
+        ("ple", offload_ple, "tables", "PLE table", "PLE"),
+        ("experts", offload_experts, "layers", "quantized MoE experts", "Expert"),
+    ):
+        if offload[key] is None:
+            continue
+        report = apply(model, model_dir, offload[key], cast_dtype=target_dtype)
+        for path, reason in report["skipped"]:
+            warnings.warn(f"Unsloth: kept the {what} at {path} in memory: {reason}.", stacklevel=3)
+        if not report[count]:
+            missing += [] if report["skipped"] else [what]
+            continue
+        print(
+            f"Unsloth: {label} offload reads {report['on_disk_bytes'] / 2**30:.2f} GiB from the "
+            f"checkpoint on demand and holds {report['resident_bytes'] / 2**30:.2f} GiB in memory."
+        )
+        reports[key] = report
+    # One knob sets both parts, so a part the model lacks is news only when nothing was offloaded.
+    if missing and not reports:
+        warnings.warn(f"Unsloth: offload is set, but this model has no {' or '.join(missing)}.", stacklevel=3)
+    if reports:
+        model._unsloth_offload = reports
+        _cap_cache_while_alive(model)
+
+
+_OFFLOAD_RUNTIME_QUANT = (
+    "Unsloth: offload reads the checkpoint's tensors as stored, so "
+    "they cannot be combined with runtime quantization. Load the checkpoint in its own "
+    "quantization."
+)
+
+
+def _refuse_offloaded(model, action) -> None:
+    if getattr(model, "_unsloth_offload", None):
+        raise ValueError(
+            f"Unsloth: this model was loaded with offload, which is for inference only; "
+            f"{action} needs the model loaded without offload."
+        )
+
+
 def _keep_norm_parameters_float32(model) -> None:
     """Prepare MLX training by keeping normalization parameters in fp32."""
     import mlx.core as mx
@@ -7102,6 +7245,7 @@ def _ensure_vlm_processor_inputs_patched():
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import collect_mlx_lora_adapter_tensors, save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
     if "save_method" not in kwargs and not collect_mlx_lora_adapter_tensors(self):
@@ -7168,6 +7312,7 @@ def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
 
 def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
     kwargs = _mlx_supported_kwargs(
@@ -7180,6 +7325,7 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
 
 
 def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import push_to_hub_merged
     tokenizer = tokenizer or self._tokenizer
     # Default save_directory to repo_id; callers that already saved locally
@@ -7190,6 +7336,7 @@ def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, 
 
 def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
     kwargs = _mlx_supported_kwargs(
@@ -8819,6 +8966,7 @@ class FastMLXModel:
         float32_mixed_precision=None,
         pipeline_group=None,
         tensor_group=None,
+        offload=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -8847,6 +8995,23 @@ class FastMLXModel:
                 parallel text or VLM inference.
             tensor_group: Optional MLX distributed group for tensor parallel
                 text or VLM inference.
+            offload: Inference only: leave weights in the checkpoint's
+                safetensors and read them on demand. ``"off"`` / ``None``
+                (default), ``"auto"``, or a fraction in (0, 1] for both parts,
+                or ``{"ple": ..., "experts": ...}`` per part (a missing part is
+                off). ``"ple"`` is each per-layer embedding table's share read
+                by row on lookup; ``"experts"`` is each quantized MoE layer's
+                share of experts, the rest held in slots experts are read into
+                as tokens route to them (at least ``max(8, top_k)``).
+                ``"auto"`` offloads only what the weights and
+                ``max_seq_length`` need to fit in 0.85 of the GPU's recommended
+                working set, PLE tables first, and warns for each offload it
+                turns on; it turns off where offloading cannot apply
+                (adapters, runtime quantization, training, distributed loads)
+                instead of refusing. A callable decides in place of that rule,
+                for a caller that prices loads its own way: called with the
+                downloaded checkpoint's directory before any weight is read, it
+                returns either of the forms above.
 
         Reloading a saved LoRA/DoRA adapter directory returns a model whose
         base is frozen and whose adapter parameters are trainable, so it can be
@@ -8862,6 +9027,13 @@ class FastMLXModel:
         _warn_block_swap(kwargs)
         _coerce_list_extra_special_tokens()
         _mlx_active_distributed_groups(pipeline_group, tensor_group)
+        from .offload import offload_setting
+        offload = _settle_offload(
+            offload_setting(offload),
+            full_finetuning or _mlx_distributed_requested(pipeline_group, tensor_group),
+            "Unsloth: offload is for single-process inference and cannot be combined with "
+            "full_finetuning or distributed loading.",
+        )
 
         model_name, revision, _bnb_remapped_from = _remap_unsloth_bnb_hub_id_for_mlx(
             model_name, revision
@@ -9043,11 +9215,17 @@ class FastMLXModel:
         _is_adapter_dir = bool(local_path) and os.path.exists(
             os.path.join(local_path, "adapter_config.json")
         )
-        if (
+        _is_bnb_checkpoint = (
             not _is_adapter_dir
             and isinstance(_existing_quant, dict)
             and _existing_quant.get("quant_method") == "bitsandbytes"
-        ):
+        )
+        offload = _settle_offload(
+            offload, _is_adapter_dir or _is_bnb_checkpoint,
+            "Unsloth: offload reads an MLX checkpoint's own safetensors, so it cannot be used "
+            "with a LoRA adapter directory or a bitsandbytes checkpoint.",
+        )
+        if _is_bnb_checkpoint:
             _suggested = re.sub(
                 r"-(?:unsloth-)?bnb-\d+bit$", "", model_name,
             ) or model_name
@@ -9701,6 +9879,7 @@ class FastMLXModel:
                     "using existing compatible MLX quantization.",
                     stacklevel=2,
                 )
+            offload = _settle_offload(offload, want_runtime_quant, _OFFLOAD_RUNTIME_QUANT)
 
             if want_runtime_quant:
                 import mlx.core as mx
@@ -9804,6 +9983,9 @@ class FastMLXModel:
                     vlm_load,
                     vlm_kwargs,
                     hf_token=token,
+                )
+                _apply_offload(
+                    model, original_local_path or local_path, offload, target_dtype, max_seq_length,
                 )
 
             processor = _run_with_vlm_config_view(
@@ -9933,6 +10115,7 @@ class FastMLXModel:
                 want_runtime_quant=want_runtime_quant,
             )
 
+            offload = _settle_offload(offload, want_runtime_quant, _OFFLOAD_RUNTIME_QUANT)
             if want_runtime_quant:
                 print(
                     f"Unsloth: Loading {model_name} via mlx-lm "
@@ -9972,6 +10155,9 @@ class FastMLXModel:
                     mlx_load,
                     mlx_load_kwargs,
                     hf_token=token,
+                )
+                _apply_offload(
+                    model, original_local_path or local_path, offload, target_dtype, max_seq_length,
                 )
 
             if want_runtime_quant:
@@ -10058,6 +10244,7 @@ class FastMLXModel:
         when the model was loaded with ``full_finetuning=True``.
         """
         _warn_block_swap(kwargs)
+        _refuse_offloaded(model, "LoRA training")
         loftq_config = kwargs.pop("loftq_config", None)
         if loftq_config is not None:
             raise NotImplementedError(
