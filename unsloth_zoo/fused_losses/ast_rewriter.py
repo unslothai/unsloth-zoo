@@ -662,8 +662,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
         if name not in already
     )
     kwargs_unpack = f", **{cap.kwargs_name}" if cap.kwargs_name else ""
-    # The kernel saves d(loss * scale)/d(hidden) in the forward, so an fp16 run needs the
-    # GradScaler the trainer attaches as `accelerator_scaler` (None under bf16 / fp32).
+    # fp16: the kernel computes grads in the forward, so it needs the trainer's GradScaler.
     scaler_kw = ", accelerator_scaler=getattr(self, 'accelerator_scaler', None)"
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"

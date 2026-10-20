@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""fp16 training through the auto-installed fused lm_head + CE forward must use the GradScaler.
-
-The fused kernel computes d(loss)/d(hidden) inside the forward and only rescales it in the
-backward. Unless the forward sees the trainer's loss scale (`model.accelerator_scaler`, which
-unsloth attaches in compute_loss), that gradient is computed unscaled and stored in fp16, where
-per-logit gradients of ~1 / (vocab * tokens) underflow. FastModel LoRA on a T4 then diverged
-(Qwen3-0.6B loss 12.6 -> 14.4) where FastLanguageModel, whose own forward passes the scale,
-converged.
-"""
+"""fp16 fused lm_head + CE forward must see the GradScaler: the kernel saves d(loss)/d(hidden) in the forward, unscaled it underflows."""
 
 import pytest
 
@@ -20,13 +12,11 @@ SCALE = 65536.0
 
 
 class _FakeScaler:
-    # The kernel accepts a GradScaler or anything with get_scale().
     def get_scale(self):
         return SCALE
 
 
 def _hidden_grad(model, ids, scaler):
-    # d(loss)/d(final hidden states): what the fused kernel saves in its forward.
     seen = {}
 
     def hook(module, args, output):
@@ -62,14 +52,12 @@ def test_fused_forward_fp16_uses_accelerator_scaler(monkeypatch):
         ref = LlamaForCausalLM(config).float()
         half = LlamaForCausalLM(config).half()
         half.load_state_dict(ref.state_dict())
-        # 8k tokens: per-element hidden gradients ~1e-6, below fp16's normal range unscaled.
         ids = torch.randint(0, config.vocab_size, (8, 1024), generator = torch.Generator().manual_seed(0))
 
         g_ref = _hidden_grad(ref, ids, None)
         g_half = _hidden_grad(half, ids, _FakeScaler())
         assert torch.isfinite(g_half).all()
         rel = ((g_half - g_ref).norm() / g_ref.norm()).item()
-        # Scaled: ~5e-4. Unscaled (the bug): ~2e-2, the fp16 subnormal rounding of the saved gradient.
         assert rel < 5e-3, rel
     finally:
         if not was_patched:
@@ -79,7 +67,6 @@ def test_fused_forward_fp16_uses_accelerator_scaler(monkeypatch):
 
 
 def test_fused_forward_bf16_without_scaler_is_unchanged(monkeypatch):
-    # bf16 / fp32: no scaler attached, the kernel gets scaling=None exactly as before.
     monkeypatch.setenv("UNSLOTH_FUSED_FORWARD", "1")
     from unsloth_zoo.fused_losses import forward_adapter as fa
 
@@ -97,6 +84,5 @@ def test_fused_forward_bf16_without_scaler_is_unchanged(monkeypatch):
     assert "scaling" not in seen and "accelerator_scaler" not in seen
     fa.unsloth_fused_lm_head_loss(h, head, labels, accelerator_scaler = _FakeScaler())
     assert isinstance(seen["scaling"], _FakeScaler)
-    # An explicit scaling wins over the attached scaler.
     fa.unsloth_fused_lm_head_loss(h, head, labels, scaling = 2.0, accelerator_scaler = _FakeScaler())
     assert seen["scaling"] == 2.0
