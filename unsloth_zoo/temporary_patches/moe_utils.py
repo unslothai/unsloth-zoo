@@ -433,8 +433,7 @@ def _is_transposed_stack(weight):
 
 
 def _wgrad_in_weight_layout(wgrad, inputs, grad, offsets, transposed):
-    # dW^T built contiguous, returned as its view: the gradient matches the leaf's layout, so AccumulateGrad
-    # does not copy a full-size [E, N, K] gradient.
+    # dW^T built contiguous and returned as its view: the leaf's layout, so AccumulateGrad does not copy it.
     if transposed:
         return wgrad(grad, inputs, offsets).transpose(-2, -1)
     return wgrad(inputs, grad, offsets)

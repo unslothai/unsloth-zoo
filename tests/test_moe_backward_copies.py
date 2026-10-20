@@ -160,7 +160,6 @@ def _run(m, x, topi, w, dy, mode, lora, monkeypatch, forward = None):
     handles = []
     for n, prm in m.named_parameters():
         if prm.requires_grad:
-            # the gradient AccumulateGrad receives: same strides as the leaf means no copy
             handles.append(prm.register_hook(lambda g, n = n, prm = prm: layouts.__setitem__(n, g.stride() == prm.stride())))
     monkeypatch.setattr(mu, "take_moe_lora_stash", lambda module, name: lora.get(name))
     xg = x.detach().clone().requires_grad_(True)
@@ -214,7 +213,6 @@ def test_grads_match_fp32_reference(kind, mode, triton, lora, monkeypatch):
     if mode == "full":
         assert set(layouts) == {n for n, _ in m.named_parameters()}
         if triton:
-            # The transposed Qwen3 stacks (and gpt-oss's contiguous ones) get dW in the leaf's own layout
             assert all(layouts.values()), layouts
         for n in ("gate_up_proj_bias", "down_proj_bias"):
             if n in grads:
@@ -239,7 +237,6 @@ def test_recompute_backward_passes_the_frozen_stack_as_a_view(kind, monkeypatch)
     monkeypatch.setattr(mu, "_grouped_mm_with_backward_fix", spy)
     out, dx, grads, _ = _run(m, x, topi, w, dy, "frozen", {}, monkeypatch)
     monkeypatch.setattr(mu, "_grouped_mm_with_backward_fix", real)
-    # forward (no_grad inside the Function) + backward, for gate_up and down
     assert len(seen) == 4, seen
     assert all(seen), seen
     _check_parity(m, x, topi, w, dy, out, dx, grads, {}, _TOL)
