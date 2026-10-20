@@ -163,6 +163,8 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
 
 _OFFLOAD_CACHE_LIMIT = 1 << 30
 _offload_cache_cap = {"models": 0, "previous": None, "applied": None}
+# Reentrant: a collected model's finalizer can run on a thread inside this lock.
+_OFFLOAD_CACHE_LOCK = threading.RLock()
 
 
 def _cap_cache_while_alive(model) -> None:
@@ -171,18 +173,20 @@ def _cap_cache_while_alive(model) -> None:
     import mlx.core as mx
 
     cap = _offload_cache_cap
-    if not cap["models"]:
-        cap["previous"] = mx.set_cache_limit(_OFFLOAD_CACHE_LIMIT)
-        cap["applied"] = min(cap["previous"], _OFFLOAD_CACHE_LIMIT)
-        mx.set_cache_limit(cap["applied"])
-    cap["models"] += 1
+    with _OFFLOAD_CACHE_LOCK:
+        if not cap["models"]:
+            cap["previous"] = mx.set_cache_limit(_OFFLOAD_CACHE_LIMIT)
+            cap["applied"] = min(cap["previous"], _OFFLOAD_CACHE_LIMIT)
+            mx.set_cache_limit(cap["applied"])
+        cap["models"] += 1
 
     def release():
-        cap["models"] -= 1
-        if not cap["models"]:
-            current = mx.set_cache_limit(cap["previous"])
-            if current != cap["applied"]:  # set by someone else since: theirs stays
-                mx.set_cache_limit(current)
+        with _OFFLOAD_CACHE_LOCK:
+            cap["models"] -= 1
+            if not cap["models"]:
+                current = mx.set_cache_limit(cap["previous"])
+                if current != cap["applied"]:  # set by someone else since: theirs stays
+                    mx.set_cache_limit(current)
 
     weakref.finalize(model, release)
 

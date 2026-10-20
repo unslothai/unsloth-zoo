@@ -429,6 +429,37 @@ def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
         np.testing.assert_array_equal(_bits(actual), _bits(expected))
 
 
+def test_concurrent_offloaded_loads_restore_the_cache_limit(monkeypatch):
+    # Two loads finishing at once must not both take the cap as the first model's: the second
+    # would save the capped limit as the one to restore.
+    import unsloth_zoo.mlx.loader as zoo_loader
+
+    state = {"limit": 8 << 30}
+    both_first = threading.Barrier(2, timeout = 1)
+
+    def set_cache_limit(value):
+        if value == zoo_loader._OFFLOAD_CACHE_LIMIT:
+            try:
+                both_first.wait()
+            except threading.BrokenBarrierError:
+                pass
+        state["limit"], old = value, state["limit"]
+        return old
+
+    monkeypatch.setattr(mx, "set_cache_limit", set_cache_limit)
+    monkeypatch.setattr(zoo_loader, "_offload_cache_cap", {"models": 0, "previous": None, "applied": None})
+    models = [type("Model", (), {})() for _ in range(2)]
+    threads = [threading.Thread(target = zoo_loader._cap_cache_while_alive, args = (m,)) for m in models]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout = 10)
+    assert state["limit"] == zoo_loader._OFFLOAD_CACHE_LIMIT
+    del models, threads
+    gc.collect()
+    assert state["limit"] == 8 << 30
+
+
 def _parts(ple = None, experts = None):
     return {"ple": ple, "experts": experts}
 
