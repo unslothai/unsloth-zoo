@@ -37,6 +37,7 @@ def spoof(monkeypatch):
         monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_AVAILABLE", True)
         monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", None)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", None)
+        monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOME", None, raising = False)
         for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND"):
             monkeypatch.setattr(moe_utils, name, {}, raising = False)
         monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising = False)
@@ -95,6 +96,16 @@ def test_mixed_host_current_card_unsupported(spoof):
     assert seen == [1]
     assert moe_utils._check_torch_grouped_mm_supported() is False
     assert seen == [1, 0]
+
+
+def test_a_current_device_switch_does_not_borrow_the_first_cards_answer(spoof, monkeypatch):
+    # Model parallel moves the current device; cuda:1 must not reuse the answer probed on cuda:0.
+    seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
+    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert moe_utils._grouped_mm_supported_on(cuda(1)) is False
+    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+    assert seen == [0, 1]
 
 
 @pytest.mark.parametrize("count", [2, 3, 8])
