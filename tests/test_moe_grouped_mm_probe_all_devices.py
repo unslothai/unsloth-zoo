@@ -41,6 +41,8 @@ def spoof(monkeypatch):
         for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND"):
             monkeypatch.setattr(moe_utils, name, {}, raising = False)
         monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising = False)
+        monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising = False)
+        monkeypatch.delenv("GPU_DEVICE_ORDINAL", raising = False)
         monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising = False)
         probed, last = [], {}
         real_ones, real_tensor = torch.ones, torch.tensor
@@ -237,6 +239,24 @@ def test_rocm_crash_probe_indexes_into_inherited_mask(spoof, monkeypatch, var):
     children = _record_children(monkeypatch)
     assert all(moe_utils._check_torch_grouped_mm_supported(cuda(i)) for i in range(3))
     assert [c[1] for c in children] == [("5", "5"), ("2", "2"), ("7", "7")]
+
+
+@pytest.mark.parametrize("var", ["ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"])
+def test_rocm_layered_selector_keeps_the_parents_env_and_index(spoof, monkeypatch, var):
+    # A child HIP mask would compose with ROCr / GPU_DEVICE_ORDINAL and could name another card.
+    spoof(3, hip = "7.1.0")
+    monkeypatch.setenv(var, "1,3,4")
+    children = _record_children(monkeypatch)
+    assert all(moe_utils._check_torch_grouped_mm_supported(cuda(i)) for i in range(3))
+    assert children == [("0", None), ("1", None), ("2", None)]
+
+
+def test_rocm_repeated_hip_entries_follow_clr(spoof, monkeypatch):
+    spoof(2, hip = "7.1.0")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "5,5,7")
+    children = _record_children(monkeypatch)
+    assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is True
+    assert children[-1] == ("0", ("7", "7"))
 
 
 def test_crash_probe_never_spawns_on_multi_gpu_nvidia(spoof, monkeypatch):

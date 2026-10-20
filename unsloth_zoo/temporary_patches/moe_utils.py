@@ -1547,10 +1547,14 @@ def _run_grouped_mm_crash_probe(device):
         pass
     import subprocess
     index, env = device.index, None
-    if torch.cuda.device_count() > 1:
+    # ROCr / ordinal selectors compose with the HIP mask in ways a child mask cannot mirror: keep the parent's env and
+    # index there, which always name the same card.
+    layered = any((os.environ.get(var) or "").strip() for var in ("ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"))
+    if torch.cuda.device_count() > 1 and not layered:
         # Child sees only this card (a crash on another must not blame it); HIP indexes into the inherited mask.
         mask = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
-        mask = [m.strip() for m in mask.split(",")] if mask else None
+        # clr keeps the first of a repeated entry.
+        mask = list(dict.fromkeys(m.strip() for m in mask.split(","))) if mask else None
         if mask is None or index < len(mask):
             visible = mask[index] if mask else str(index)
             index, env = 0, dict(os.environ, HIP_VISIBLE_DEVICES = visible, CUDA_VISIBLE_DEVICES = visible)
