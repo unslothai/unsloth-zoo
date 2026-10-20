@@ -427,6 +427,19 @@ def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
     return out
 
 
+def _is_transposed_stack(weight):
+    # [E, K, N] view of a contiguous [E, N, K] parameter (HF stores gate_up_proj / down_proj as [E, out, in]).
+    return weight.dim() == 3 and not weight.is_contiguous() and weight.transpose(-2, -1).is_contiguous()
+
+
+def _wgrad_in_weight_layout(wgrad, inputs, grad, offsets, transposed):
+    # A transposed weight gets dW^T built contiguous and handed back as its view: the leaf then receives a
+    # gradient in its own layout and AccumulateGrad does not copy a full-size [E, N, K] gradient.
+    if transposed:
+        return wgrad(grad, inputs, offsets).transpose(-2, -1)
+    return wgrad(inputs, grad, offsets)
+
+
 def _register_grouped_mm_fp16_op():
     """torch._grouped_mm on float16 as an opaque op for compiled callers. The eager kernel takes float16
     (torch 2.10 - 2.14), but its meta/fake impl rejects it (2.14 accepts only with cuBLASLt grouped GEMM,
@@ -460,6 +473,7 @@ def _register_grouped_mm_fp16_op():
         def _setup_context(ctx, inputs, output):
             x, w, offs = inputs
             ctx.save_for_backward(x, w, offs)
+            ctx.w_transposed = _is_transposed_stack(w)
 
         def _backward(ctx, grad):
             x, w, offs = ctx.saved_tensors
@@ -468,7 +482,9 @@ def _register_grouped_mm_fp16_op():
             if ctx.needs_input_grad[0]:
                 gx = torch.ops.unsloth_zoo.grouped_mm_fp16(grad, w.transpose(-2, -1), offs)
             if ctx.needs_input_grad[1]:
-                gw = torch.ops.unsloth_zoo.grouped_mm_fp16_wgrad(x.contiguous(), grad, offs)
+                gw = _wgrad_in_weight_layout(
+                    torch.ops.unsloth_zoo.grouped_mm_fp16_wgrad, x.contiguous(), grad, offs, ctx.w_transposed,
+                )
             return gx, gw, None
 
         grouped_mm_fp16.register_autograd(_backward, setup_context = _setup_context)
@@ -606,6 +622,7 @@ class _GroupedMMTriton(torch.autograd.Function):
         ctx.save_for_backward(
             inputs if ctx.needs_input_grad[1] else None, weight if ctx.needs_input_grad[0] else None, offsets,
         )
+        ctx.w_transposed = _is_transposed_stack(weight)
         return _grouped_mm_triton_impl(inputs, weight, offsets)
 
     @staticmethod
@@ -617,7 +634,7 @@ class _GroupedMMTriton(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             gx = _grouped_mm_triton_impl(grad, w.transpose(-2, -1), offs)
         if ctx.needs_input_grad[1]:
-            gw = _grouped_mm_triton_wgrad_impl(x, grad, offs)
+            gw = _wgrad_in_weight_layout(_grouped_mm_triton_wgrad_impl, x, grad, offs, ctx.w_transposed)
         return gx, gw, None
 
 
@@ -667,6 +684,7 @@ def _register_grouped_mm_triton_op():
             x, w, offs = inputs
             # Only what each gradient reads: a frozen base keeps no activation alive for a dW it never takes.
             ctx.save_for_backward(x if w.requires_grad else None, w if x.requires_grad else None, offs)
+            ctx.w_transposed = _is_transposed_stack(w)
 
         def _backward(ctx, grad):
             x, w, offs = ctx.saved_tensors
@@ -676,7 +694,9 @@ def _register_grouped_mm_triton_op():
             if ctx.needs_input_grad[0]:
                 gx = torch.ops.unsloth_zoo.grouped_mm_triton(grad, w.transpose(-2, -1), offs)
             if ctx.needs_input_grad[1]:
-                gw = torch.ops.unsloth_zoo.grouped_mm_triton_wgrad(x, grad, offs)
+                gw = _wgrad_in_weight_layout(
+                    torch.ops.unsloth_zoo.grouped_mm_triton_wgrad, x, grad, offs, ctx.w_transposed,
+                )
             return gx, gw, None
 
         grouped_mm_triton.register_autograd(_backward, setup_context = _setup_context)
@@ -1084,9 +1104,37 @@ class _GroupedMMRecompute(torch.autograd.Function):
         (offsets,) = ctx.saved_tensors
         with torch.no_grad():
             transposed = getattr(ctx.weight_provider, "transposed", None)
-            weight_t = transposed() if transposed is not None else ctx.weight_provider().transpose(-2, -1).contiguous()
+            # The view, not a copy: _grouped_mm_with_backward_fix copies only where the view path is unproven.
+            weight_t = transposed() if transposed is not None else ctx.weight_provider().transpose(-2, -1)
             grad_input = _grouped_mm_with_backward_fix(grad_output.contiguous(), weight_t, offsets)
         return grad_input, None, None
+
+
+class _ExpertBiasGather(torch.autograd.Function):
+    """bias.index_select(0, expert_ids) whose backward is one-hot(expert_ids) @ grad: one GEMM with fp32
+    accumulation instead of index_select's 16-bit index_add_, which sm80 emulates with CAS loops (66-80% of
+    a gpt-oss full finetune MoE step on A100) and which rounds every partial sum (gpt-oss bias grad rel err
+    vs fp32: 1.4e-2 -> 1.7e-3)."""
+
+    @staticmethod
+    def forward(ctx, bias, expert_ids):
+        ctx.save_for_backward(expert_ids)
+        ctx.num_experts = bias.shape[0]
+        return bias.index_select(0, expert_ids)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (expert_ids,) = ctx.saved_tensors
+        experts = torch.arange(ctx.num_experts, device = expert_ids.device, dtype = expert_ids.dtype)
+        one_hot = (expert_ids.unsqueeze(0) == experts.unsqueeze(1)).to(grad.dtype)
+        return one_hot @ grad, None
+
+
+def _gather_expert_bias(bias, expert_ids):
+    expert_ids = expert_ids.to(bias.device)
+    if bias.requires_grad and torch.is_grad_enabled() and bias.dim() == 2:
+        return _ExpertBiasGather.apply(bias, expert_ids)
+    return bias.index_select(0, expert_ids)
 
 
 def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
@@ -5092,9 +5140,7 @@ def forward_native_grouped_mm(
             # already in expert order, so gathering by expert id matches it, sync-free
             # (74 us -> 8 us host at E=128 x 16384 rows).
             sorted_expert_ids = flat_top_k[sorted_indices]
-            bias_expanded = self.gate_up_proj_bias.index_select(
-                0, sorted_expert_ids.to(self.gate_up_proj_bias.device)
-            )
+            bias_expanded = _gather_expert_bias(self.gate_up_proj_bias, sorted_expert_ids)
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
         if _gate_up_is_interleaved(self):
@@ -5263,9 +5309,7 @@ def forward_native_grouped_mm(
         if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
             # Capture-safe gather; see gate_up_proj_bias above.
             sorted_expert_ids = flat_top_k[sorted_indices]
-            bias_expanded = self.down_proj_bias.index_select(
-                0, sorted_expert_ids.to(self.down_proj_bias.device)
-            ).to(mm2_out.device)
+            bias_expanded = _gather_expert_bias(self.down_proj_bias, sorted_expert_ids).to(mm2_out.device)
             mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
 
     elif hasattr(self, "w2"):
