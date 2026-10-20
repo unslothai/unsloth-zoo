@@ -535,6 +535,29 @@ def test_conv_launch_skips_the_cache_when_unsafe(monkeypatch):
     assert gcc._conv_plans == {}
 
 
+@requires_cuda
+def test_conv_plan_cache_stays_bounded_over_variable_lengths(monkeypatch):
+    # Packed batches change T every step and T is in the plan key: the cache must not grow per length.
+    if not gcc._triton_launcher_verified():
+        pytest.skip("cached launcher needs Triton 3.6+")
+    monkeypatch.setattr(gcc, "_conv_plans", {})
+    monkeypatch.setattr(gcc, "_conv_fast_ok", {})
+    cap = getattr(gcc, "_CONV_PLANS_MAX", 256)
+    sizes = []
+    for T in range(8, 8 + cap + 64):
+        x, w, b, _ = _inputs(1, 64, T, 4, torch.bfloat16, True, True, seed = T)
+        y = gcc._launch_fwd(x.transpose(1, 2), w, b, "silu")
+        ref = gcc._launch_fwd(x.transpose(1, 2), w, b, "silu")  # cached (or self-checked) launch
+        assert torch.equal(y, ref)
+        sizes.append(len(gcc._conv_plans))
+    assert max(sizes) <= cap
+    # Evicted lengths come back through a full launch and cache again.
+    x, w, b, _ = _inputs(1, 64, 8, 4, torch.bfloat16, True, True, seed = 8)
+    y = gcc._launch_fwd(x.transpose(1, 2), w, b, "silu")
+    assert torch.equal(y, gcc._launch_fwd(x.transpose(1, 2), w, b, "silu"))
+    assert len(gcc._conv_plans) <= cap
+
+
 def test_mamba_drop_ins_take_the_torch_path_when_autograd_tracks(monkeypatch):
     called = []
     monkeypatch.setattr(gcc, "_launch_fwd", lambda *a, **k: called.append(1))
