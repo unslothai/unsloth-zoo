@@ -506,7 +506,7 @@ def _deepseek_v4_step_mask(layer, arguments):
 # Decoder layers whose call wider than a prefill step may run as consecutive steps on the layer's
 # own cache (no state shared with other layers): each token-indexed argument's token axis, and either
 # the masks under which the layer attends causally, or a function of (layer, arguments) giving each
-# step's mask from its hidden states (None when the call is not causal).
+# step's mask from its hidden states (None when the call is not causal); "array" for a cache asked for arrays.
 _WIDE_LAYERS = {
     "mlx_vlm.models.qwen4_exp.language.Qwen4ExpDecoderLayer": (
         {"hidden_states": 1, "input_ids": 1, "position_ids": -1}, (None, "causal")),
@@ -520,7 +520,7 @@ _WIDE_LAYERS = {
         for family, layer, masks in (
             ("qwen3_next", "Qwen3NextDecoderLayer", (None, "causal")), ("qwen3_moe", "Qwen3MoeDecoderLayer", ("causal",)),
             ("minimax", "MiniMaxDecoderLayer", ("causal",)), ("mixtral", "MixtralDecoderLayer", ("causal",)),
-            ("glm4_moe", "DecoderLayer", ("causal",)),
+            ("glm4_moe", "DecoderLayer", ("causal",)), ("deepseek_v3", "DeepseekV3DecoderLayer", ("array",)),
         )
         for module in (f"mlx_lm.models.{family}", f"mlx_vlm.models.{family}.language")
     },
@@ -931,11 +931,11 @@ def _token_slice(value, axis, start, end):
     return value[tuple(index)]
 
 
-def _cache_mask(cache, rows):
+def _cache_mask(cache, rows, as_array = False):
     if not hasattr(cache, "make_mask"):
         return None
     try:
-        return cache.make_mask(rows, return_array = False, window_size = None)
+        return cache.make_mask(rows, return_array = as_array, window_size = None)
     except TypeError:  # a linear-attention cache, masked as create_ssm_mask does
         return cache.make_mask(rows)
 
@@ -965,9 +965,8 @@ class _WideLayer:
         if callable(masks):
             step_mask = masks(self, bound.arguments) if cache is not None else None
             causal = step_mask is not None
-        elif isinstance(mask, mx.array) and _is_cache_mask(mask, _cache_mask(cache, hidden.shape[1])):
-            # The cache's own mask (a rotating cache past its window): each step builds its own, as chunked prefill does.
-            step_mask, causal = (lambda h: _cache_mask(cache, h.shape[1])), True
+        elif isinstance(mask, mx.array) and _is_cache_mask(mask, _cache_mask(cache, hidden.shape[1], "array" in masks)):
+            step_mask, causal = (lambda h: _cache_mask(cache, h.shape[1], "array" in masks)), True
         else:
             # Only the mask the cache itself builds steps: None over a KV cache is full attention.
             built = _cache_mask(cache, hidden.shape[1]) if hasattr(cache, "make_mask") else mask
