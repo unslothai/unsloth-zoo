@@ -361,3 +361,28 @@ def test_expert_bias_gather_grad_and_compile():
     bias.grad = None
     torch.compile(f, fullgraph = True)(bias, ids, base).backward(g)
     assert _rel(bias.grad, want) < 4e-3
+
+
+@needs_cuda
+def test_expert_bias_gather_chunks_bound_one_hot(monkeypatch):
+    """Long contexts: the one-hot stays at most _EXPERT_BIAS_ONE_HOT_ELEMENTS, ragged last chunk included."""
+    gen = torch.Generator().manual_seed(0)
+    E, D, M = 128, 64, 65536 + 300
+    monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", 1 << 20)
+    ids = torch.randint(0, E, (M,), generator = gen).sort().values.cuda()
+    bias = (torch.randn(E, D, generator = gen) * 0.02).to("cuda", DT).requires_grad_(True)
+    g = torch.randn(M, D, generator = gen).to("cuda", DT)
+    mu._gather_expert_bias(bias, ids).backward(g)  # cuBLAS workspace
+    bias.grad = None
+    out = mu._gather_expert_bias(bias, ids)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    out.backward(g)
+    torch.cuda.synchronize()
+    extra = torch.cuda.max_memory_allocated() - before
+    # unchunked: 25 MB (bool + bf16 one-hot); chunked: 5 MB
+    assert extra < 8 * 2**20, extra
+    want = torch.zeros(E, D, dtype = torch.float64, device = "cuda").index_add_(0, ids, g.double())
+    assert bias.grad.dtype == DT
+    assert _rel(bias.grad, want) < 4e-3, _rel(bias.grad, want)

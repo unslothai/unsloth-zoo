@@ -1110,6 +1110,9 @@ class _GroupedMMRecompute(torch.autograd.Function):
         return grad_input, None, None
 
 
+_EXPERT_BIAS_ONE_HOT_ELEMENTS = 1 << 24
+
+
 class _ExpertBiasGather(torch.autograd.Function):
     """bias.index_select(0, expert_ids) whose backward is one-hot(expert_ids) @ grad: one fp32-accumulating
     GEMM instead of a 16-bit index_add_, which sm80 emulates with CAS loops and which rounds every partial sum."""
@@ -1123,9 +1126,17 @@ class _ExpertBiasGather(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         (expert_ids,) = ctx.saved_tensors
-        experts = torch.arange(ctx.num_experts, device = expert_ids.device, dtype = expert_ids.dtype)
-        one_hot = (expert_ids.unsqueeze(0) == experts.unsqueeze(1)).to(grad.dtype)
-        return one_hot @ grad, None
+        experts = torch.arange(ctx.num_experts, device = expert_ids.device, dtype = expert_ids.dtype).unsqueeze(1)
+        # The one-hot is at most _EXPERT_BIAS_ONE_HOT_ELEMENTS: long contexts go in row chunks, summed in fp32.
+        chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // ctx.num_experts)
+        rows = grad.shape[0]
+        if rows <= chunk:
+            return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
+        out = torch.zeros(ctx.num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
+        for start in range(0, rows, chunk):
+            one_hot = (expert_ids[start : start + chunk].unsqueeze(0) == experts).to(grad.dtype)
+            out += (one_hot @ grad[start : start + chunk]).float()
+        return out.to(grad.dtype), None
 
 
 def _gather_expert_bias(bias, expert_ids):
