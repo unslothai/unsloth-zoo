@@ -92,3 +92,14 @@ def test_unindexed_device_resolves_the_current_gpu(gpu, monkeypatch, device):
     assert mg.mxfp4_gemm_available(device, torch.float16)
     current[0] = 1
     assert not mg.mxfp4_gemm_available(device, torch.float16)
+
+
+@pytest.mark.parametrize("device", [None, "cuda"])
+def test_no_cuda_answers_false_instead_of_raising(monkeypatch, device):
+    monkeypatch.setattr(mg, "_AVAILABLE_DTYPE", {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: pytest.fail("resolved a GPU without CUDA"))
+    monkeypatch.setattr(mg, "mxfp4_grouped_mm_available", lambda device = None: False)
+    monkeypatch.delenv("UNSLOTH_MXFP4_FUSED_GEMM", raising = False)
+    assert not mg.mxfp4_gemm_available(device, torch.bfloat16)
+    assert not mg.mxfp4_grouped_gemv_available(device, torch.bfloat16)
