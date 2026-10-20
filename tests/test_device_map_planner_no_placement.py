@@ -86,3 +86,18 @@ def test_planned_map_has_no_ancestor_of_the_table(monkeypatch):
     assert plan.device_map == {
         "layers.0": 0, "layers.2": 1, "layers.1.mlp": 1, "layers.1.ple.key_proj": 1,
     }
+
+
+def test_block_swap_plan_from_a_checkpoint_does_not_charge_the_table(monkeypatch):
+    from unsloth_zoo import device_map_planner
+
+    monkeypatch.delenv("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", raising = False)
+    with torch.device("meta"):
+        model = Model()
+    table = 4000 * 64 * 4
+    resident = sum(p.numel() * 4 for p in model.parameters()) - table
+    monkeypatch.setattr(device_map_planner, "_usable_devices", lambda max_memory: [0])
+    monkeypatch.setattr(device_map_planner, "build_meta_model", lambda *a, **k: (model, None, None))
+    # Room for every weight but the table, which the loader keeps in host RAM: nothing needs to swap.
+    plan = device_map_planner.plan_block_swap("x", max_memory = {0: resident + 1000}, reserve_bytes = 1000)
+    assert plan.layers == 0
