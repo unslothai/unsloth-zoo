@@ -5493,9 +5493,7 @@ def forward_native_moe_loop(
             _down_scaling,
         )
 
-    # Group the routed (top-k slot, token) pairs by expert in one stable sort: per expert they keep
-    # the (slot, token) order torch.where(one_hot mask) gave, so every expert sees the same rows.
-    # One host read of the counts per call replaces nonzero + an .item() and a torch.where per expert.
+    # Stable sort keeps torch.where(one_hot)'s per-expert (slot, token) row order, so results stay bit-identical.
     with torch.no_grad():
         n_tokens = top_k_index.shape[0]
         slot_major = top_k_index.t().reshape(-1)   # position = top_k_pos * n_tokens + token
