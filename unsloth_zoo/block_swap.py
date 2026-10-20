@@ -277,15 +277,6 @@ class BlockSwap:
         self.spans_devices, self.layer_device = False, None
         if not self.indices:
             return
-        # Accelerate leaves layers that did not fit at load on `meta`, with the real weights behind its hooks.
-        for li in self.indices:
-            name = next((n for n, p in _swappable(layers[li]) if p.device.type == "meta"), None)
-            if name is not None:
-                raise ValueError(
-                    f"Unsloth: offload_layers cannot swap layer {li}: its weight {name} is on the meta device, "
-                    "so the model did not fit on the GPU at load and accelerate offloaded it to CPU or disk. "
-                    "Pass offload_layers to from_pretrained instead, so those layers load straight to host memory."
-                )
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         self.device = torch.device(device)
@@ -296,6 +287,16 @@ class BlockSwap:
             for _, p in _swappable(layer):
                 owners.setdefault(id(p), set()).add(li)
         shared = {pid for pid, o in owners.items() if len(o) > 1}
+        # Accelerate leaves layers that did not fit at load on `meta`, with the real weights behind its hooks.
+        for li in self.indices:
+            name = next((n for n, p in _swappable(layers[li])
+                         if p.device.type == "meta" and id(p) not in shared), None)
+            if name is not None:
+                raise ValueError(
+                    f"Unsloth: offload_layers cannot swap layer {li}: its weight {name} is on the meta device, "
+                    "so the model did not fit on the GPU at load and accelerate offloaded it to CPU or disk. "
+                    "Pass offload_layers to from_pretrained instead, so those layers load straight to host memory."
+                )
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
         homes = {b.home for b in self.blocks if b.home is not None}
         for li, layer in enumerate(layers):
