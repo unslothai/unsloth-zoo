@@ -214,7 +214,7 @@ def test_grads_match_fp32_reference(kind, mode, triton, lora, monkeypatch):
     if mode == "full":
         assert set(layouts) == {n for n, _ in m.named_parameters()}
         if triton:
-            # P3: the transposed Qwen3 stacks (and gpt-oss's contiguous ones) get dW in the leaf's own layout
+            # The transposed Qwen3 stacks (and gpt-oss's contiguous ones) get dW in the leaf's own layout
             assert all(layouts.values()), layouts
         for n in ("gate_up_proj_bias", "down_proj_bias"):
             if n in grads:

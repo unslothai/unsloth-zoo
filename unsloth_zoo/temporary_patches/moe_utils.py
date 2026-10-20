@@ -433,8 +433,8 @@ def _is_transposed_stack(weight):
 
 
 def _wgrad_in_weight_layout(wgrad, inputs, grad, offsets, transposed):
-    # A transposed weight gets dW^T built contiguous and handed back as its view: the leaf then receives a
-    # gradient in its own layout and AccumulateGrad does not copy a full-size [E, N, K] gradient.
+    # dW^T built contiguous, returned as its view: the gradient matches the leaf's layout, so AccumulateGrad
+    # does not copy a full-size [E, N, K] gradient.
     if transposed:
         return wgrad(grad, inputs, offsets).transpose(-2, -1)
     return wgrad(inputs, grad, offsets)
@@ -1111,10 +1111,8 @@ class _GroupedMMRecompute(torch.autograd.Function):
 
 
 class _ExpertBiasGather(torch.autograd.Function):
-    """bias.index_select(0, expert_ids) whose backward is one-hot(expert_ids) @ grad: one GEMM with fp32
-    accumulation instead of index_select's 16-bit index_add_, which sm80 emulates with CAS loops (66-80% of
-    a gpt-oss full finetune MoE step on A100) and which rounds every partial sum (gpt-oss bias grad rel err
-    vs fp32: 1.4e-2 -> 1.7e-3)."""
+    """bias.index_select(0, expert_ids) whose backward is one-hot(expert_ids) @ grad: one fp32-accumulating
+    GEMM instead of a 16-bit index_add_, which sm80 emulates with CAS loops and which rounds every partial sum."""
 
     @staticmethod
     def forward(ctx, bias, expert_ids):
