@@ -1227,7 +1227,8 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
     u_dtype = _u_dtype(hidden.dtype)
     u = torch.zeros((N, H), device = device, dtype = u_dtype) if want_u else hidden.new_empty(0)
     # Left unwritten unless _block_top_live: the backward reads it under the same condition only.
-    block_top = torch.empty(_block_top_shape(N, V, device, compute_dtype, tiled and head_grad), device = device,
+    # A softcap keeps the fp32 recompute: at cap 5 the half recompute's error was 3.4x it (cap 30 / none: equal).
+    block_top = torch.empty(_block_top_shape(N, V, device, compute_dtype, tiled and head_grad and not cap), device = device,
                             dtype = torch.float32)
     inv_t, scale, cap = _scalars(temperature, mul, div, cap)
     if n_keep > 0:
@@ -1556,7 +1557,7 @@ if _OPS is None:
             else hidden.new_empty(0),
             torch.empty(N, **f32),
             torch.empty(_block_top_shape(N, weight.shape[0], weight.device, compute_dtype,
-                                         (need_h or need_w or need_b) and not want_u and need_w), **f32),
+                                         (need_h or need_w or need_b) and not want_u and need_w and not cap), **f32),
         )
 
     def _lp_setup(ctx, inputs, output):

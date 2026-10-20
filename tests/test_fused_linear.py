@@ -1189,3 +1189,21 @@ def test_fp16_without_fp32_output_gemms_does_not_overflow(monkeypatch, V):
     h = h0.clone().requires_grad_(True)
     (gc,) = torch.autograd.grad(fused_linear_cross_entropy(h, w, None, t, divisor = N), (h,))
     assert torch.isfinite(gc).all()
+
+
+@CUDA
+def test_softcap_keeps_the_fp32_recompute():
+    # A hard softcap (5) made the half recompute's head / hidden gradient ~3.4x the fp32 recompute's error.
+    if not fl._HAS_TRITON or fl._IS_HIP:
+        pytest.skip("needs Triton on CUDA")
+    for dtype in _dtypes("cuda")[1:]:
+        if not fl._logits_mode(torch.device("cuda"), dtype)[0]:
+            continue
+        h, w, t = _peaked("cuda", dtype, 128, 64, 40000)
+        h.requires_grad_(True)
+        w.requires_grad_(True)
+        for cap, engaged in ((5.0, False), (0.0, True)):
+            before = fl.CALLS["exact_top"]
+            lp = fused_linear_logprobs(h, w, t, logit_softcapping = cap)
+            torch.autograd.grad(lp.sum(), (h, w))
+            assert (fl.CALLS["exact_top"] > before) == engaged, (dtype, cap)
