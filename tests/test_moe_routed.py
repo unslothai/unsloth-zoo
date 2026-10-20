@@ -31,9 +31,9 @@ E, H, I = 8, 256, 192
 ROUTED_16BIT = torch.cuda.get_device_capability()[0] >= 8
 
 
-def _needs_16bit_routing():
-    if not ROUTED_16BIT:
-        pytest.skip("below sm80 16-bit routed decode is one-token only (test_routed_decode_arch_gates.py covers it)")
+def _needs_16bit_routing(tokens = 2):
+    if not ROUTED_16BIT and tokens > 1:
+        pytest.skip("below sm80 16-bit routed decode is one-token only")
 
 
 @pytest.fixture(autouse = True)
@@ -274,7 +274,7 @@ def test_selective_dequant_is_bit_exact_to_bitsandbytes():
 @pytest.mark.parametrize("use_lora", [False, True])
 @pytest.mark.parametrize("T", [1, 4])
 def test_bf16_experts_match_reference(act, use_lora, T, monkeypatch):
-    _needs_16bit_routing()
+    _needs_16bit_routing(T)
     ex = _make(act, quant = False)
     lora = _lora(ex) if use_lora else None
     _stash(ex, lora)
