@@ -27,6 +27,7 @@ from contextlib import contextmanager, nullcontext
 import functools
 import gc
 import importlib
+import weakref
 
 __all__ = [
     "BlockSwap",
@@ -397,6 +398,14 @@ class BlockSwap:
 
         # Evict before building the pool (originals + pool would OOM); roll back on any failure.
         try:
+            try:
+                owner = _LAYER_OWNERS.get(layers)
+            except TypeError:  # a plain list of layers
+                owner = None
+            owner = owner() if owner is not None else None
+            if self._auto and owner is not None:
+                # Logits and loss run after the last layer, so only the model's output sees the step's peak.
+                self.handles.append(owner.register_forward_hook(self._output_peak))
             for i, layer in enumerate(swapped):
                 self.handles.append(layer.register_forward_pre_hook(self._pre(i), with_kwargs = True))
                 self.handles.append(layer.register_forward_hook(self._post(i)))
@@ -730,12 +739,35 @@ class BlockSwap:
             print(f"Unsloth: offload_layers prefetch_depth = 'auto' settled on {self.depth} "
                   f"(copies stalled {100 * stall:.1f}% of the swapped layers' time).")
 
-    def _note_peak(self, dv):
+    def _output_peak(self, module, args, output):
+        if not self._auto or self._settled:
+            return
+        homes = {b.home for b in self.blocks if b.home is not None}
+        for dv in homes:
+            self._note_peak(dv)
+        out = getattr(output, "logits", None)
+        if not isinstance(out, torch.Tensor):
+            out = output[0] if isinstance(output, (tuple, list)) and output else output
+        node = getattr(out, "grad_fn", None) if isinstance(out, torch.Tensor) else None
+        if node is not None:
+            # When the output's grad lands, the op that consumed the output (the loss) has just held the output,
+            # its grad and a temporary of the same size; only the grad is still allocated. A node hook, not a
+            # tensor hook: callers keep only the loss, and a tensor hook dies with the dropped output.
+            dev, size = out.device, out.nbytes
+
+            def grad_peak(*_):
+                if self._auto and not self._settled:
+                    for dv in homes:
+                        self._note_peak(dv, extra = 2 * size if torch.device(dv) == dev else 0)
+            register = getattr(node, "register_prehook", None) or node.register_hook
+            register(_opaque(grad_peak))
+
+    def _note_peak(self, dv, extra = 0):
         # Our own per-step high-water mark: torch's peak counter still holds the load and the pre-swap model.
         if self._step_peak is None:
             self._step_peak = {}
         k = torch.device(dv).index
-        self._step_peak[k] = max(self._step_peak.get(k, 0), torch.cuda.memory_allocated(dv))
+        self._step_peak[k] = max(self._step_peak.get(k, 0), torch.cuda.memory_allocated(dv) + extra)
 
     def _grow_pool(self):
         """One more slot for every pool that can use one, if each card still has room for it."""
@@ -931,7 +963,20 @@ def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = No
     return sorted(chosen), left
 
 
+# Layer list -> the model find_decoder_layers found it in: BlockSwap watches that model's output for the step peak.
+_LAYER_OWNERS = weakref.WeakKeyDictionary()
+
+
 def find_decoder_layers(model):
+    layers = _find_decoder_layers(model)
+    try:
+        _LAYER_OWNERS[layers] = weakref.ref(model)
+    except TypeError:
+        pass
+    return layers
+
+
+def _find_decoder_layers(model):
     m = model
     for _ in range(6):
         for attr in ("model", "base_model", "transformer", "language_model"):

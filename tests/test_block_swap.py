@@ -25,6 +25,8 @@ import, neither of which this module needs or should be exercised through."""
 import importlib.util
 import os
 
+import types
+
 import torch
 import torch.nn as nn
 
@@ -1253,3 +1255,50 @@ def test_auto_depth_without_timing_is_the_fixed_default(monkeypatch):
     monkeypatch.setattr(_mod, "_TIMING", True)
     sw = BlockSwap(nn.ModuleList([nn.Linear(4, 4)]), 0, prefetch_depth = "auto")
     assert (sw._auto, sw._settled, sw.depth) == (True, False, 1)
+
+
+class _HeadModel(nn.Module):
+    """Swapped layers, then a large head and the loss inside forward, as HF models do: the step's peak comes
+    after the last layer ran, and the logits' grad is gone before any layer's backward."""
+
+    def __init__(self, d, n, vocab):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_XBlock(d) for _ in range(n)])
+        self.head = nn.Linear(d, vocab, bias = False).requires_grad_(False)
+
+    def forward(self, x):
+        h = x
+        for layer in self.model.layers:
+            h = layer(h, x)
+        logits = self.head(h)
+        return types.SimpleNamespace(loss = logits.logsumexp(-1).mean(), logits = logits)
+
+
+def test_auto_depth_peak_includes_the_model_output():
+    if not torch.cuda.is_available():
+        return
+    torch.manual_seed(0)
+    model = _HeadModel(256, 8, 1 << 15).cuda()
+    # Swapped layers end early (explicit indices), so no swapped layer's hook runs while the head output is alive.
+    sw = BlockSwap(find_decoder_layers(model), [0, 1], prefetch_depth = "auto", device = "cuda")
+    x = torch.randn(1024, 256, device = "cuda", requires_grad = True)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    model(x).loss.backward()
+    true_peak = torch.cuda.max_memory_allocated()
+    k = torch.device("cuda").index or 0
+    # One step done: its peak is the headroom _grow_pool keeps. Without the output hook it stops at the last
+    # swapped layer, a fifth of the true peak here; hooks see op boundaries, not the loss op's own temporaries.
+    assert sw._steps == 1 and sw._last_peak.get(k, 0) >= 0.75 * true_peak, (sw._last_peak, true_peak)
+    sw.remove()
+
+
+def test_find_decoder_layers_remembers_the_model_without_holding_it():
+    import gc
+    model = _HeadModel(8, 2, 16)
+    layers = find_decoder_layers(model)
+    assert _mod._LAYER_OWNERS[layers]() is model
+    del model
+    gc.collect()
+    assert _mod._LAYER_OWNERS.get(layers) is None or _mod._LAYER_OWNERS[layers]() is None
