@@ -1099,12 +1099,8 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
-# bnb 4-bit recompute path, which experts to dequantize (UNSLOTH_MOE_SELECTIVE_DEQUANT):
-#   unset / "auto": when there are fewer routed rows than 7/8 of the experts, dequantize a fixed
-#     number of experts (one per row, an upper bound on the experts used) chosen on the device:
-#     no host sync, capturable, same shapes for the same row count. Otherwise the full stack.
-#   "1": exactly the routed experts, read from the host (one sync per MoE layer forward).
-#   "0": always the full stack.
+# UNSLOTH_MOE_SELECTIVE_DEQUANT (bnb 4-bit recompute): "auto" (default) = num_rows experts picked on device
+# (sync-free, capturable) when rows < 7/8 of experts; "1" = exact routed set via one host sync; "0" = full stack.
 SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
 
 
@@ -1286,12 +1282,10 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
 
 
 def _capped_dequant_plan(sources, num_tokens_per_expert, num_rows):
-    """Sync-free plan: num_rows experts (each row uses one, so the routed experts fit), the routed
-    ones in ascending id order followed by unrouted ones with no rows. Decided from shapes only, so
-    it stays on the device under torch.compile and CUDA graph capture."""
+    """Sync-free plan from shapes only: num_rows experts, routed ids ascending, then unrouted padding."""
     E = int(num_tokens_per_expert.numel())
     if num_rows <= 0 or 8 * num_rows > 7 * E:
-        return None   # under 1/8 of the stack to save, not worth the gathers
+        return None
     for source in sources:
         split = _bnb4bit_expert_split(source)
         if split is None or split[0] != E:

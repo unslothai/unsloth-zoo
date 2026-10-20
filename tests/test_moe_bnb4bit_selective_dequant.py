@@ -193,8 +193,6 @@ def test_chunked_without_selective_skips_empty_chunks(monkeypatch):
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("T", [1, 3, 5])
 def test_default_capped_plan_is_sync_free_and_bit_exact(nested, T, monkeypatch):
-    # Default (no env): fewer routed rows than 7/8 of the experts dequantizes one expert per row,
-    # chosen on the device, and matches the full stack (UNSLOTH_MOE_SELECTIVE_DEQUANT=0) bit for bit.
     torch.manual_seed(T)
     experts = _Experts(nested)
     hidden = torch.randn(T, H, dtype = torch.bfloat16, device = DEVICE)
@@ -207,7 +205,7 @@ def test_default_capped_plan_is_sync_free_and_bit_exact(nested, T, monkeypatch):
     }
     monkeypatch.setenv("UNSLOTH_MOE_SELECTIVE_DEQUANT", "0")
     base_out, base_grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
-    assert mu.SELECTIVE_DEQUANT_STATS["dequant_calls"] == 0   # kill switch: the full stack
+    assert mu.SELECTIVE_DEQUANT_STATS["dequant_calls"] == 0
     monkeypatch.delenv("UNSLOTH_MOE_SELECTIVE_DEQUANT")
 
     host_reads = []
@@ -224,7 +222,6 @@ def test_default_capped_plan_is_sync_free_and_bit_exact(nested, T, monkeypatch):
         assert torch.equal(got, want)
     stats = mu.SELECTIVE_DEQUANT_STATS
     assert stats["plans"] == 1
-    # gate_up + down, forward and backward, one expert per routed row.
     assert stats["dequant_calls"] == 4
     assert stats["experts_dequantized"] == 4 * T * TOP_K
 
