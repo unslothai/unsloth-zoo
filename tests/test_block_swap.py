@@ -1339,3 +1339,32 @@ def test_host_load_reads_layer_sizes_before_the_first_weight_lands(monkeypatch):
     with _mod.load_layers_to_host(1, placement = "tail") as state:
         core.set_param_for_module(model, "layers.1.weight")
     assert seen["bound"] == 64 * 64 * 4
+
+
+def test_auto_depth_peak_with_a_layer_list_passed_directly():
+    if not torch.cuda.is_available():
+        return
+    model = _HeadModel(256, 4, 1 << 12).cuda()
+    layers = nn.ModuleList(list(model.model.layers))  # not from find_decoder_layers
+    without = BlockSwap(layers, [0], prefetch_depth = "auto", device = "cuda")
+    assert len(without.handles) == 3
+    without.remove()
+    sw = BlockSwap(layers, [0], prefetch_depth = "auto", device = "cuda", model = model)
+    assert len(sw.handles) == 4
+    sw.remove()
+
+
+def test_host_load_embedding_check_counts_the_other_tables_to_come(monkeypatch):
+    import sys, pytest
+    if not torch.cuda.is_available():
+        return
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    # Room for one 1 MiB table, not two: refuse at the first, before anything moved.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 1536 * 1024, total))
+    state = _mod._HostLoad(0, "tail", embeddings = True)
+    a, b = nn.Embedding(1024, 256).cuda(), nn.Embedding(1024, 256).to("meta")
+    state.layers, state.embedding_prefixes = nn.ModuleList(), {"a.": a, "b.": b}
+    with pytest.raises(ValueError):
+        state.evict_embedding(a)
+    assert state.embeddings == []

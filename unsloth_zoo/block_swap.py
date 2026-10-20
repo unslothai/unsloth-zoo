@@ -327,7 +327,8 @@ def swap_indices(total, n, placement = "spread"):
 
 class BlockSwap:
     """Install on a layer list; layers at `n` (a count or explicit indices) live on the host.
-    `prefetch_depth = "auto"` starts at 1 and deepens while copies stall a step that could hide them."""
+    `prefetch_depth = "auto"` starts at 1 and deepens while copies stall a step that could hide them; `model`
+    (found automatically for lists from `find_decoder_layers`) lets it see the step peak after the last layer."""
 
     # Defaults for instances built without __init__ (the scheduler tests).
     total = 0
@@ -343,7 +344,7 @@ class BlockSwap:
     _step_peak = None
     _last_peak = None
 
-    def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail"):
+    def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail", model = None):
         self.blocks, self.handles = [], []
         auto = prefetch_depth == "auto"
         # Auto tunes from the timing events; with UNSLOTH_OFFLOAD_STATS=0 it is the fixed default.
@@ -398,11 +399,13 @@ class BlockSwap:
 
         # Evict before building the pool (originals + pool would OOM); roll back on any failure.
         try:
-            try:
-                owner = _LAYER_OWNERS.get(layers)
-            except TypeError:  # a plain list of layers
-                owner = None
-            owner = owner() if owner is not None else None
+            owner = model
+            if owner is None:
+                try:
+                    owner = _LAYER_OWNERS.get(layers)
+                except TypeError:  # a plain list of layers
+                    owner = None
+                owner = owner() if owner is not None else None
             if self._auto and owner is not None:
                 # Logits and loss run after the last layer, so only the model's output sees the step's peak.
                 self.handles.append(owner.register_forward_hook(self._output_peak))
@@ -1129,7 +1132,8 @@ class _HostLoad:
         if module in self.embeddings or weight is None or weight.device.type == "meta":
             return
         size = self.done_bytes[-1] if self.done_bytes else 0
-        _check_host_fit(self.done_bytes + self.embedding_bytes + [weight.nbytes] + self._layers_to_come(size, self.last_done),
+        _check_host_fit(self.done_bytes + self.embedding_bytes + [weight.nbytes] + self._pending_embedding_bytes(skip = module)
+                        + self._layers_to_come(size, self.last_done),
                         sum(self.done_bytes) + sum(self.embedding_bytes) + (weight.nbytes if weight.device.type == "cpu" else 0))
         with torch.no_grad():
             weight.requires_grad_(False)
