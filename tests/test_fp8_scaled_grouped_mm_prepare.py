@@ -123,12 +123,10 @@ def _mixed_host(monkeypatch, probes):
 def test_scaled_grouped_mm_capability_is_per_device(monkeypatch):
     probes = []
     _mixed_host(monkeypatch, probes)
-    # Probing the current Hopper device first must not answer for the Ampere card.
     assert m._check_torch_scaled_grouped_mm_supported() is True
     assert m._check_torch_scaled_grouped_mm_supported(torch.device("cuda", 1)) is False
     assert m._check_torch_scaled_grouped_mm_supported(torch.device("cuda", 0)) is True
     assert m._check_torch_scaled_grouped_mm_supported(torch.device("cpu")) is False
-    # Cached per device: one real probe for the Hopper card only.
     assert probes == [0]
 
 

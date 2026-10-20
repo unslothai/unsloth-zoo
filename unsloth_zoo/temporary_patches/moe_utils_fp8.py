@@ -76,15 +76,12 @@ def _probe_torch_scaled_grouped_mm(device_index: int) -> bool:
         return False
 
 
-# Probe result per CUDA device index. A device_map spread over GPUs keeps
-# torch.cuda.current_device() at cuda:0 while the experts (and the operands)
-# live elsewhere, so a single answer probed on the current device is wrong on
-# hosts that mix architectures.
+# Per device index: a multi-GPU device_map keeps current_device() at cuda:0 while operands live elsewhere.
 _TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE = {}
 
 
 def _check_torch_scaled_grouped_mm_supported(device=None):
-    # A non None module value is a forced answer (tests, manual overrides).
+    # A non-None module value is a forced answer (tests, overrides).
     if _TORCH_SCALED_GROUPED_MM_SUPPORTED is not None:
         return _TORCH_SCALED_GROUPED_MM_SUPPORTED
 
@@ -94,7 +91,6 @@ def _check_torch_scaled_grouped_mm_supported(device=None):
         return False
     if device is not None:
         device = torch.device(device)
-        # Operands off CUDA can never use the CUDA kernel.
         if device.type != "cuda":
             return False
         device_index = device.index if device.index is not None else torch.cuda.current_device()
