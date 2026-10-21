@@ -13,29 +13,11 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Fused MoE expert activation over the first grouped GEMM output (gate_up), saving only gate_up.
+"""Fused MoE SwiGLU / gpt-oss clamped SwiGLU over gate_up that saves only gate_up for backward.
 
-  moe_fused_swiglu(gate_up, act, interleaved, alpha, limit)   gate_up [..., 2I] -> [..., N]
-    act ACT_SILU:   silu(gate) * up
-    act ACT_GPTOSS: gate = gate.clamp(max = limit); up = up.clamp(-limit, limit)
-                    (up + 1) * (gate * sigmoid(gate * alpha))
-    interleaved False: gate = gate_up[..., :N], up = gate_up[..., N:]   (gate first, torch.chunk)
-    interleaved True:  gate = gate_up[..., 0::2], up = gate_up[..., 1::2] (gpt-oss)
-
-The eager expression keeps gate, up and every intermediate alive for backward (silu: gate_up + silu(gate),
-gpt-oss: gate_up + four [.., N] tensors). Here backward recomputes the activation from gate_up alone.
-
-Rounding. eager_rounding=True (default) replays the eager ATen op chain element by element: each op in
-fp32 (ATen opmath), rounded to the storage dtype between ops, IEEE division, the accurate expf, and the
-single fma nvcc contracts inside silu_backward, so forward and backward match the eager expression bit
-for bit (fp16 / bf16 / fp32). eager_rounding=False computes the whole chain in fp32 and rounds once.
-The kernels launch with enable_fp_fusion=False, so no product is fused into a later add.
-
-Dispatch: an autograd.Function in eager, the opaque custom op `unsloth_zoo::moe_fused_swiglu` (register_fake +
-register_autograd) under torch.compile, so compiled frames keep no graph break. UNSLOTH_MOE_FUSED_SWIGLU=0 turns
-it off, =2 also routes compiled frames through it (default: eager frames only) (read once at import; refresh_fused_swiglu_enabled() re-reads it). CUDA only (no ROCm:
-the kernel pins div.rn / fma through libdevice); a failed launch warns once, disables the kernel and replays
-the eager ATen chain (same bits)."""
+eager_rounding=True replays the eager ATen op chain (bit-identical fwd + bwd); False rounds once.
+UNSLOTH_MOE_FUSED_SWIGLU: 0 off, 1 eager frames only (default), 2 also compiled frames. CUDA only
+(no ROCm: div.rn / fma pinned through PTX / libdevice); a failed launch falls back to the eager chain."""
 
 __all__ = [
     "ACT_SILU",
@@ -67,23 +49,16 @@ except Exception:  # pragma: no cover - no Triton / libdevice, no fused kernel
 ACT_SILU = 0
 ACT_GPTOSS = 1
 
-# Launch counters for engagement tests: [forward launches, backward launches]. Eager only (a compiled
-# graph calls the op impl, which also bumps them, but Dynamo does not trace the increment).
+# [forward, backward] launches, for engagement tests.
 FUSED_SWIGLU_CALLS = [0, 0]
 _STATE = {"failed": False, "enabled": False, "compiled": False}
-# Eager-only caches (self-check verdicts, device capability): compiled frames never read this dict, so its
-# new keys cannot invalidate their guards.
+# Eager-only cache: compiled frames never read it, so new keys cannot invalidate their guards.
 _CACHE = {}
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def refresh_fused_swiglu_enabled() -> bool:
-    """Re-read UNSLOTH_MOE_FUSED_SWIGLU (tests). Kept in a module dict so compiled frames read a guarded
-    constant instead of tracing os.environ.
-      "0"          off everywhere
-      "1" default  eager frames only; a compiled frame keeps the eager expression, which Inductor already
-                   fuses and recomputes from gate_up (same saved bytes, its own fp32 rounding)
-      "2"          also inside compiled frames (round-once mode, nearest to Inductor's numerics)"""
+    """Re-read UNSLOTH_MOE_FUSED_SWIGLU into _STATE so compiled frames never trace os.environ."""
     mode = os.environ.get("UNSLOTH_MOE_FUSED_SWIGLU", "1").strip().lower()
     _STATE["enabled"] = triton is not None and mode not in ("0", "false", "off")
     _STATE["compiled"] = _STATE["enabled"] and mode in ("2", "compile", "compiled", "always")
@@ -91,7 +66,6 @@ def refresh_fused_swiglu_enabled() -> bool:
 
 
 def fused_swiglu_enabled() -> bool:
-    """UNSLOTH_MOE_FUSED_SWIGLU != "0" and Triton + libdevice import (read once at import)."""
     return _STATE["enabled"]
 
 
@@ -99,8 +73,7 @@ refresh_fused_swiglu_enabled()
 
 
 def _bf16_capable(gate_up) -> bool:
-    # bf16 only on sm80+ in eager frames (a T4 trains in fp16; sm75 has no bf16 conversion instructions).
-    # Compiled frames only get here with the opt-in UNSLOTH_MOE_FUSED_SWIGLU=2 and do not read the cache.
+    # sm75 has no bf16 conversion instructions.
     if torch.compiler.is_compiling():
         return True
     ok = _CACHE.get("bf16_ok")
@@ -111,7 +84,6 @@ def _bf16_capable(gate_up) -> bool:
 
 
 def fused_swiglu_supported(gate_up: torch.Tensor) -> bool:
-    """Whether the fused op takes this tensor (else the caller keeps its eager expression)."""
     return (
         _STATE["enabled"]
         and not _STATE["failed"]
@@ -128,9 +100,7 @@ def fused_swiglu_supported(gate_up: torch.Tensor) -> bool:
 
 @functools.lru_cache(maxsize = 1)
 def _clamp_grad_boundaries():
-    """Whether clamp's gradient passes at x == bound: (max-only clamp at max, clamp(min, max) at max, at min).
-    torch <= 2.13 passes it (inclusive), torch 2.14 zeroes it, so probe the running torch once (CPU, same
-    derivative formula as CUDA)."""
+    """clamp's gradient at x == bound passes up to torch 2.13 and is zeroed from 2.14: probe it."""
     try:
         with torch.inference_mode(False), torch.enable_grad():
             a = torch.tensor([2.0], requires_grad = True)
@@ -149,9 +119,6 @@ def _le(x, bound, inclusive):
     return x <= bound if inclusive else x < bound
 
 
-# ---------------------------------------------------------------------------------------------------
-# Eager ATen replay: the reference the kernels match, and the fallback after a failed launch.
-# ---------------------------------------------------------------------------------------------------
 def _split(gate_up, interleaved):
     if interleaved:
         return gate_up[..., 0::2], gate_up[..., 1::2]
@@ -159,7 +126,6 @@ def _split(gate_up, interleaved):
 
 
 def moe_swiglu_reference(gate_up, act = ACT_SILU, interleaved = False, alpha = 1.702, limit = 7.0, eager_rounding = True):
-    """The eager expression the MoE paths compute today (eager_rounding=False: fp32 chain, one rounding)."""
     dtype = gate_up.dtype
     if not eager_rounding:
         gate_up = gate_up.float()
@@ -175,7 +141,6 @@ def moe_swiglu_reference(gate_up, act = ACT_SILU, interleaved = False, alpha = 1
 
 
 def moe_swiglu_backward_reference(grad, gate_up, act = ACT_SILU, interleaved = False, alpha = 1.702, limit = 7.0, eager_rounding = True):
-    """d gate_up of moe_swiglu_reference, by the same ATen ops autograd runs (differentiable under grad mode)."""
     dtype = gate_up.dtype
     if not eager_rounding:
         gate_up, grad = gate_up.float(), grad.float()
@@ -215,14 +180,10 @@ def moe_swiglu_backward_reference(grad, gate_up, act = ACT_SILU, interleaved = F
     return d.to(dtype)
 
 
-# ---------------------------------------------------------------------------------------------------
-# Triton kernels
-# ---------------------------------------------------------------------------------------------------
 if triton is not None:
 
     @triton.jit
     def _rnd(x, ROUND: tl.constexpr, DT: tl.constexpr):
-        # Round to the storage dtype between ops, as the eager op chain does.
         if ROUND:
             return x.to(DT).to(tl.float32)
         return x
@@ -242,15 +203,13 @@ if triton is not None:
 
     @triton.jit
     def _clamp_gptoss(g, u, LIMIT, ROUND: tl.constexpr, DT: tl.constexpr):
-        # clamp keeps NaN (comparisons are False), as ATen's clamp does.
         gc = _rnd(tl.where(g > LIMIT, LIMIT, g), ROUND, DT)
         uc = _rnd(tl.where(u > LIMIT, LIMIT, tl.where(u < -LIMIT, -LIMIT, u)), ROUND, DT)
         return gc, uc
 
     @triton.jit
     def _div_rn(a, b):
-        # IEEE division without flush-to-zero: libdevice.div_rn links as div.rn.ftz.f32 under Triton,
-        # which zeroes the subnormal results ATen keeps (silu of a subnormal gate).
+        # Not libdevice.div_rn: it links as div.rn.ftz.f32 and flushes subnormals ATen keeps.
         return tl.inline_asm_elementwise("div.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype = tl.float32, is_pure = True, pack = 1)
 
     @triton.jit
@@ -259,7 +218,6 @@ if triton is not None:
 
     @triton.jit
     def _sigmoid(x):
-        # ATen sigmoid / silu: 1 / (1 + expf(-x)) with IEEE division and the accurate expf.
         return _rcp_rn(1.0 + libdevice.exp(-x))
 
     @triton.jit
@@ -308,12 +266,9 @@ if triton is not None:
             d_glu = _rnd(dy * u1, ROUND, DT)
             d_gc_a = _rnd(d_glu * sg, ROUND, DT)
             d_sg = _rnd(d_glu * gc, ROUND, DT)
-            # ATen sigmoid_backward: dy * (1 - y) * y in the storage dtype (fp16 / bf16 round after each op).
             d_t = _rnd(_rnd(d_sg * _rnd(1.0 - sg, ROUND, DT), ROUND, DT) * sg, ROUND, DT)
             d_gc_b = _rnd(d_t * ALPHA, ROUND, DT)
             d_gc = d_gc_a + d_gc_b
-            # clamp_backward: where(mask, grad, 0), NaN input -> 0; boundaries inclusive up to torch 2.13,
-            # exclusive from 2.14 (probed, _clamp_grad_boundaries)
             if G_MAX_INC:
                 g_in = g <= LIMIT
             else:
@@ -333,12 +288,12 @@ if triton is not None:
             s = _rnd(_div_rn(g, 1.0 + libdevice.exp(-g)), ROUND, DT)
             d_up = dy * s
             d_s = _rnd(dy * u, ROUND, DT)
-            # ATen silu_backward: dy * s * (1 + x * (1 - s)), nvcc contracts the inner mul-add to an fma.
+            # nvcc contracts silu_backward's inner mul-add to an fma.
             d_gate = (d_s * sig) * libdevice.fma(g, 1.0 - sig, 1.0)
         d_gate = d_gate.to(DT)
         d_up = d_up.to(DT)
         if INTERLEAVED:
-            # Eager accumulates two slice_backward buffers: a -0 gradient comes out +0.
+            # Eager sums two slice_backward buffers: -0 comes out +0.
             d_gate = tl.where(d_gate == 0, 0.0, d_gate).to(DT)
             d_up = tl.where(d_up == 0, 0.0, d_up).to(DT)
         out_row = DGU + rows[:, None] * s_om
@@ -347,8 +302,7 @@ if triton is not None:
 
 
 def _blocks(N):
-    # Column tile with the least padding (N = I = 768: 256, not 1024 with a quarter of the lanes masked);
-    # a smaller tile (>= 128) wins only if it saves more than 1/8 of a row (I = 2880 keeps 1024). About 2048 elements per program.
+    # Least-padding column tile (>= 128, must save > N/8), ~2048 elements per program.
     N = max(int(N), 1)
     bn = min(1024, triton.next_power_of_2(N))
     best_bn, best_waste = bn, triton.cdiv(N, bn) * bn - N
@@ -413,7 +367,7 @@ def _launch_bwd(grad, gate_up, act, interleaved, alpha, limit, eager_rounding):
 
 
 def _launch_failed(err):
-    # Never swallow compiler / OOM errors: a swallowed Dynamo error disables the kernel process-wide.
+    # Never swallow OOM / Dynamo errors: that would disable the kernel process-wide.
     if isinstance(err, torch.cuda.OutOfMemoryError) or type(err).__module__.startswith("torch._dynamo"):
         return False
     if not _STATE["failed"]:
@@ -466,7 +420,6 @@ class _FusedSwiGLU(torch.autograd.Function):
 
 
 def _register_ops():
-    """Opaque custom ops for compiled callers. Registered once per process."""
     if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
         return None
     try:
@@ -525,11 +478,7 @@ def _bits_equal(a, b):
 
 
 def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limit = 7.0) -> bool:
-    """Once per (device, dtype, act, layout, alpha, limit): fused fwd + bwd against real autograd over the eager
-    expression on a probe with random, boundary (+-limit), zero and signed-zero values. The eager op chain
-    differs across torch releases (2.14 zeroes clamp's gradient at the bound), so a release whose eager bits the
-    kernel does not reproduce keeps the eager expression. Never runs inside a compiled frame or a graph capture
-    (returns the cached verdict, False if none)."""
+    """Cached bitwise probe of fused fwd + bwd vs eager autograd; eager ATen bits change across torch releases."""
     key = ("self_check", str(device), dtype, int(act), bool(interleaved), float(alpha), float(limit))
     hit = _CACHE.get(key)
     if hit is not None:
@@ -568,8 +517,7 @@ def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limi
 
 
 def moe_fused_swiglu(gate_up, act = ACT_SILU, interleaved = False, alpha = 1.702, limit = 7.0, eager_rounding = True):
-    """Fused activation over gate_up [..., 2I] -> [..., I]; saves only gate_up for backward.
-    Callers check fused_swiglu_supported(gate_up) first and keep their eager expression otherwise."""
+    """Callers check fused_swiglu_supported(gate_up) first."""
     act, interleaved, alpha, limit, eager_rounding = int(act), bool(interleaved), float(alpha), float(limit), bool(eager_rounding)
     if torch.compiler.is_compiling():
         if _FUSED_SWIGLU_OP is None:

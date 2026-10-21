@@ -2147,20 +2147,16 @@ except Exception:
 def _act_fn_is_silu(act_fn) -> bool:
     if act_fn is F.silu:
         return True
-    # transformers' ACT2FN["silu"] is nn.SiLU (older releases: SiLUActivation); exact types only, a
-    # subclass may override forward.
+    # Exact types only: a subclass may override forward.
     return type(act_fn) is torch.nn.SiLU or type(act_fn).__name__ == "SiLUActivation"
 
 
 def _fused_moe_activation(module, gate_up, interleaved, allow_gptoss = True):
-    """The fused SwiGLU / gpt-oss clamped SwiGLU over gate_up (saves only gate_up for backward),
-    or None when it does not apply (kill switch UNSLOTH_MOE_FUSED_SWIGLU=0, non-CUDA, another act_fn);
-    the caller then runs its eager expression, which the fused op matches bit for bit."""
+    """Fused (clamped) SwiGLU over gate_up, or None so the caller runs its bit-identical eager path."""
     _sw = _MOE_FUSED_SWIGLU
     if _sw is None or not _sw.fused_swiglu_supported(gate_up):
         return None
-    # Eager frames replay the eager rounding (bit-identical); compiled frames (UNSLOTH_MOE_FUSED_SWIGLU=2)
-    # round once, as Inductor's fusion of the eager expression does.
+    # Compiled frames round once, matching Inductor's fusion of the eager expression.
     eager_rounding = not torch.compiler.is_compiling()
     alpha, limit = 1.702, 7.0
     if "GptOssExperts" in module.__class__.__name__:
@@ -2173,7 +2169,6 @@ def _fused_moe_activation(module, gate_up, interleaved, allow_gptoss = True):
         if act_fn is not None and callable(act_fn) and not _act_fn_is_silu(act_fn):
             return None
         act = _sw.ACT_SILU
-    # Eager frames: only where a one-off probe shows this torch's eager bits are reproduced.
     if eager_rounding and not _sw.fused_swiglu_self_check(gate_up.device, gate_up.dtype, act, interleaved, alpha, limit):
         return None
     return _sw.moe_fused_swiglu(gate_up, act, interleaved, alpha, limit, eager_rounding)

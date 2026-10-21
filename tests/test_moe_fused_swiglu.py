@@ -13,10 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Fused MoE SwiGLU / gpt-oss clamped SwiGLU (moe_fused_swiglu) against the eager expression it replaces.
-
-GPU only; runs from the zoo tree alone (pytest tests/test_moe_fused_swiglu.py). On a T4 (sm75) the bf16 cases
-skip and fp16 / fp32 run. Bitwise = torch.equal plus equal sign bits (catches -0 vs +0)."""
+"""moe_fused_swiglu against the eager expression it replaces (GPU only; bitwise includes sign bits)."""
 
 import importlib
 import os
@@ -380,8 +377,7 @@ def test_gptoss_forward_then_grads_vs_independent_fp64(dtype, layout):
     gu = _pack(gate, up, interleaved).requires_grad_()
     y = sw.moe_fused_swiglu(gu, sw.ACT_GPTOSS, interleaved)
     y_ref, dg_ref, du_ref = _gptoss_fp64(gate, up)
-    # 1) forward intermediate first. Bound = per-op rounding x the conditioning of sigmoid(alpha * gate): rounding
-    #    t = alpha * gate moves sigmoid by |t| (1 - s) relative, so the eager chain itself is only that close.
+    # Bound = per-op rounding x conditioning of sigmoid(alpha * gate), which eager itself only meets.
     eps = torch.finfo(dtype).eps
     gc = torch.where(gate.double() > LIMIT, torch.full_like(gate.double(), LIMIT), gate.double())
     uc = up.double().clamp(-LIMIT, LIMIT)
@@ -391,17 +387,14 @@ def test_gptoss_forward_then_grads_vs_independent_fp64(dtype, layout):
     assert torch.isfinite(y).all()
     err_y = (y.double() - y_ref).abs()
     assert (err_y <= 4 * eps * cond * y_ref.abs() + tiny).all(), err_y.max()
-    # the eager expression has exactly this error too (fused is bit-identical to it); it is not a looser formula
     y_eager = eager_expr(gu.detach(), "gptoss", interleaved)
     assert bitwise(y.detach(), y_eager)
-    # 2) then derivatives, unit upstream grad; bit-identical to eager autograd first
     y.backward(torch.ones_like(y))
     x_e = gu.detach().clone().requires_grad_()
     eager_expr(x_e, "gptoss", interleaved).backward(torch.ones_like(y))
     assert bitwise(gu.grad, x_e.grad)
     dg, du = _unpack(gu.grad, interleaved)
-    # fp16 only: eager rounds d_sigmoid = d_glu * gate to fp16, which overflows for |gate| >~ 8e3 and then
-    # inf * sigmoid'(0) = nan. Fused replays that bit for bit (see test_fp16_eager_overflow_large_negative_gate).
+    # fp16: eager's d_sigmoid overflows for |gate| >~ 8e3 giving nan; fused replays it.
     ok = torch.isfinite(dg)
     if dtype != torch.float16:
         assert ok.all()
@@ -411,7 +404,6 @@ def test_gptoss_forward_then_grads_vs_independent_fp64(dtype, layout):
     err_g = (dg.double() - dg_ref).abs()
     assert (err_g[ok] <= (8 * eps * cond * scale_g + tiny)[ok]).all(), err_g[ok].max()
     assert ((du.double() - du_ref).abs() <= 4 * eps * cond * du_ref.abs() + tiny).all()
-    # outside the clamp range the derivative is exactly zero
     assert (dg[gate > LIMIT] == 0).all() and (du[(up > LIMIT) | (up < -LIMIT)] == 0).all()
 
 
@@ -469,8 +461,7 @@ def test_gptoss_matches_transformers_apply_gate():
 @pytest.mark.parametrize("act", ACTS)
 @pytest.mark.parametrize("layout", LAYOUTS)
 def test_fp16_extremes_gradscaler(act, layout):
-    # T4 path: fp16 storage, fp32 math inside. Upstream grads at GradScaler size (x 2**16) and fp16 extremes must give
-    # exactly eager's bits, including where eager overflows to inf / nan.
+    # GradScaler-sized grads and fp16 extremes must match eager bits, inf / nan included.
     interleaved = layout == "interleaved"
     dtype = torch.float16
     gu = make_gate_up(64, 96, dtype, scale = 6.0, seed = 31)
