@@ -66,8 +66,7 @@ def test_cold_mask_cache_is_traceable(kind):
         return (q_idx >= kv_idx) & mask(batch_idx, head_idx, q_idx, kv_idx)
 
     block_mask = create_block_mask(causal_mask, 1, None, 8, 8, device = "cpu")
-    # Building metadata warmed this device. A miss here exercises the same
-    # branch as a BlockMask first reused on another model-parallel device.
+    # Cold miss, as on a model-parallel device the BlockMask was not built on.
     cache.clear()
     torch.manual_seed(0)
     # Forward only: newer torch has no FlexAttention backward on CPU.
