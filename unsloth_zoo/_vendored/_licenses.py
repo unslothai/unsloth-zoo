@@ -520,8 +520,9 @@ modifications =
       fused_recurrent_replayssm.py from the commit above with one change, marked
       "Modified by Unsloth": the launch-config lookup imported from
       vllm.model_executor.layers.mamba.ops.replayssm_config is inlined (released
-      vLLM has no "gdn_decode" entry), with the same values as the PR, and the
-      kernel imports triton directly instead of vllm.triton_utils.
+      vLLM has no "gdn_decode" entry), with the same values as the PR plus a
+      T4 (sm75) entry (32, 1, 1, 4) and a per-device cache, and the kernel
+      imports triton directly instead of vllm.triton_utils.
     - The runtime integration (state page, metadata builder, layer dispatch) is
       Unsloth's own code in unsloth_zoo/vllm_gdn_replayssm.py, ported from the
       same PR.
