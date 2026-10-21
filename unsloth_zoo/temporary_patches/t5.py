@@ -102,9 +102,7 @@ def _patch_umt5_forward(modeling):
 
 
 def patch_UMT5_scale_decoder_outputs():
-    """transformers 5 forces UMT5Config.tie_word_embeddings = True, so every untied UMT5
-    checkpoint (all of google/umt5-*) rescales logits by d_model**-0.5 before its own lm_head.
-    Record the checkpoint's tie flag as `scale_decoder_outputs`, as T5Config does upstream."""
+    """transformers 5 forces tie_word_embeddings, so untied UMT5 logits get d_model**-0.5 (T5 fix: transformers#43681)."""
     try:
         import transformers.models.umt5.modeling_umt5 as modeling
         from transformers.models.umt5.configuration_umt5 import UMT5Config
@@ -139,8 +137,7 @@ def _architecture_model_types():
 
 
 def patch_config_model_type_from_architectures():
-    """transformers 5 dropped AutoConfig's repo-name fallback, so configs without `model_type`
-    (google/umt5-*) raise "Unrecognized model". Infer it from an unambiguous `architectures`."""
+    """transformers 5 dropped AutoConfig's repo-name fallback: infer a missing model_type (google/umt5-*) from architectures."""
     try:
         import transformers
         from packaging.version import Version
