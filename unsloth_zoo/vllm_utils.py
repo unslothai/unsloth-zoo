@@ -4235,7 +4235,8 @@ def load_vllm(
         _dtype = torch.bfloat16
     else:
         _dtype = torch.float16
-    if dtype == torch.bfloat16 and _dtype == torch.float16:
+    # XPU runs an explicit bf16 request (emulated if need be), as before the native-bf16 probe.
+    if dtype == torch.bfloat16 and _dtype == torch.float16 and DEVICE_TYPE != "xpu":
         print("Unsloth: We switched to dtype = torch.float16 since your GPU does not support torch.bfloat16")
         dtype = torch.float16
     elif dtype is None:
