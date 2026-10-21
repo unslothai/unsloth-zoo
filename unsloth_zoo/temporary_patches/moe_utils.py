@@ -5541,6 +5541,26 @@ def _experts_are_input_major(module, name, in_dim) -> bool:
     return getattr(module, name).shape[-1] != in_dim
 
 
+TRITON_MOE_COMPUTE_DTYPE_STATS = {"cast": 0, "kept_fp32": 0}
+
+
+def _triton_moe_compute_dtype(module, hidden_states):
+    """bf16 for float32 activations into bf16 experts (matches autocast); float16 is left alone (overflow)."""
+    if hidden_states.dtype != torch.float32:
+        return hidden_states.dtype
+    for name in ("gate_up_proj", "down_proj"):
+        weight = getattr(module, name, None)
+        if not isinstance(weight, torch.Tensor) or weight.dtype != torch.bfloat16:
+            return hidden_states.dtype
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+        return hidden_states.dtype
+    keep = os.environ.get("UNSLOTH_MOE_TRITON_FP32", "0") == "1"
+    # Eager only: Dynamo would recompile on every counter value.
+    if not torch.compiler.is_compiling():
+        TRITON_MOE_COMPUTE_DTYPE_STATS["kept_fp32" if keep else "cast"] += 1
+    return hidden_states.dtype if keep else torch.bfloat16
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -5586,6 +5606,8 @@ def forward_triton_grouped_gemm(
         num_tokens, hidden_dim = hidden_states.shape
 
     top_k = top_k_index.shape[1]
+    # gate_up still reads float32 X (dX stays float32); everything after it runs in compute_dtype.
+    compute_dtype = _triton_moe_compute_dtype(self, hidden_states)
 
     # Cache model dims and kernel configs on first call.
     if self._unsloth_moe_configs is None:
@@ -5609,7 +5631,7 @@ def forward_triton_grouped_gemm(
             hidden_dim=intermediate_dim,
             intermediate_dim=hidden_dim // 2 if hidden_dim % 2 == 0 else hidden_dim,
             top_k=top_k,
-            dtype=hidden_states.dtype,
+            dtype=compute_dtype,
         )
 
         self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)
@@ -5660,6 +5682,9 @@ def forward_triton_grouped_gemm(
             grouped_mm_func=native_moe_grouped_mm,
         )
         first_gemm_output = first_gemm_output + gate_up_lora_delta
+
+    if first_gemm_output.dtype != compute_dtype:
+        first_gemm_output = first_gemm_output.to(compute_dtype)
 
     # Activation + gate*up.
     fused_intermediate = None
