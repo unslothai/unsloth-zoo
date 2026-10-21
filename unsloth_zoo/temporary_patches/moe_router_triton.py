@@ -28,8 +28,6 @@ Logits a float32 ulp apart can rank differently from eager. NaN unsupported; bia
 Opt-in: UNSLOTH_MOE_FUSED_ROUTER=1, read every eager call.
 """
 
-from __future__ import annotations
-
 __all__ = [
     "moe_router",
     "moe_router_reference",
@@ -44,7 +42,7 @@ import contextlib
 import inspect
 import os
 import re
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -247,7 +245,7 @@ def _router_fwd_impl(logits, bias, top_k, mode, renorm, n_group, topk_group, sca
             K = top_k, BLOCK_K = max(2, triton.next_power_of_2(top_k)), MODE = mode, RENORM = bool(renorm),
             HAS_BIAS = has_bias, N_GROUP = max(n_group, 1), TOPK_GROUP = max(topk_group, 1),
             BLOCK_G = max(2, triton.next_power_of_2(max(n_group, 1))),
-            BLOCK_T = BLOCK_T, BLOCK_E = BLOCK_E, num_warps = 4,
+            BLOCK_T = BLOCK_T, BLOCK_E = BLOCK_E, num_warps = 4, enable_fp_fusion = True,
         )
     return w, ids
 
@@ -256,7 +254,7 @@ def _router_fwd_impl(logits, bias, top_k, mode, renorm, n_group, topk_group, sca
 def _router_fwd_op(
     logits: torch.Tensor, bias: Optional[torch.Tensor], top_k: int, mode: int, renorm: bool,
     n_group: int, topk_group: int, scale: float, mask_zero: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     return _router_fwd_impl(logits, bias, top_k, mode, renorm, n_group, topk_group, scale, mask_zero)
 
 
@@ -280,7 +278,7 @@ def _router_bwd_impl(logits, ids, dw, mode, renorm, scale):
         _router_bwd_kernel[(triton.cdiv(T, BLOCK_T),)](
             z, ids, dw, dz, T, E, z.stride(0), dw.stride(0), float(scale),
             K = ids.shape[1], MODE = mode, RENORM = bool(renorm),
-            BLOCK_T = BLOCK_T, BLOCK_E = BLOCK_E, num_warps = 4,
+            BLOCK_T = BLOCK_T, BLOCK_E = BLOCK_E, num_warps = 4, enable_fp_fusion = True,
         )
     return dz
 
