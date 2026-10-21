@@ -316,3 +316,28 @@ def test_probe_through_the_custom_op_sees_the_module(monkeypatch):
     monkeypatch.setattr(S, "_SONIC_MODULE", None)
     monkeypatch.delenv("UNSLOTH_DISABLE_MOE_SONIC", raising = False)
     assert S.get_sonic_module() is fake
+
+
+def test_forward_uses_the_shared_routing_sort_and_skips_the_cache_when_compiling():
+    # Source-level (the forward itself needs the SM100 kernels): routing goes through
+    # moe_utils.moe_routing_sort, and the eager-only duplicate cache is never entered while
+    # compiling or with a zero budget (a fullgraph trace would otherwise break on it).
+    import ast
+    import inspect
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(S.forward_sonic_moe))
+    tree = ast.parse(src)
+    calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "moe_routing_sort" in calls and "argsort" not in src
+    guarded = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.If) and any(
+            isinstance(b, ast.Assign) and isinstance(b.value, ast.Call)
+            and getattr(b.value.func, "id", None) == "_interleaved_gate_up"
+            for b in n.body
+        )
+    ]
+    assert guarded, "duplicate-cache call must sit under a guard"
+    test = ast.unparse(guarded[0].test)
+    assert "_interleave_budget_bytes() > 0" in test and "is_compiling()" in test

@@ -1007,13 +1007,10 @@ def forward_sonic_moe(
     hidden_states = hidden_states.view(-1, hidden_dim)
 
     # Routing: identical to forward_native_grouped_mm.
-    flat_top_k = top_k_index.view(-1)
-    from .moe_utils import count_tokens_per_expert
-    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
-    sorted_indices = torch.argsort(flat_top_k, stable=True)
+    from .moe_utils import moe_routing_sort
+    _, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     cu_seqlens = _cu_seqlens_from_offsets(offsets)
 
     use_separated_lora = _should_use_separated_lora()
@@ -1047,7 +1044,8 @@ def forward_sonic_moe(
             and _is_k_major_gate_up(gate_up_provider(), _base_tensor(gate_up_source))
         ):
             gated_mode = "zero_copy"
-        else:
+        elif _interleave_budget_bytes() > 0 and not torch.compiler.is_compiling():
+            # The cache is only filled eagerly; a compiled frame takes the unfused path.
             interleaved = _interleaved_gate_up(gate_up_provider())
             if interleaved is not None:
                 gated_mode = "duplicate"
