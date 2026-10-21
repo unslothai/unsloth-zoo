@@ -227,6 +227,27 @@ def test_torch_decode_fallback_matches_kernel(kn_layout, monkeypatch):
     assert _err(y2, y.double())[1] < 5e-3 and _err(dx2, dx.double())[1] < 5e-3
 
 
+def test_launch_failure_falls_back_per_shape(monkeypatch):
+    torch.manual_seed(8)
+    E, K, N = 4, 64, 128
+    dt = torch.bfloat16 if HAS_BF16 else torch.float16
+    p = _stack((E, N, K), dt, False)
+    spec = _spec(p, False, dt)
+    offsets = _routing(E, [3, 0, 5, 2])
+    x = torch.randn(10, K, device = DEVICE, dtype = dt)
+    want = nf.nf4_grouped_mm(x, offsets, spec)
+    monkeypatch.setattr(nf, "FAILED_SHAPES", {})
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated launch failure")
+    monkeypatch.setattr(nf, "_run_kernel", boom)
+    got = nf.nf4_grouped_mm(x, offsets, spec)
+    assert _err(got, want.double())[1] < 5e-3
+    assert list(nf.FAILED_SHAPES) == [(K, N, 1, K)]
+    pre = lambda w: w.transpose(-2, -1)
+    monkeypatch.setenv("UNSLOTH_MOE_NF4_FUSED", MODE)
+    assert nf.maybe_nf4_grouped_mm(x, offsets, p, pre) is None   # that stack now keeps the dequant path
+
+
 def test_opcheck():
     torch.manual_seed(3)
     p = _stack((5, 96, 64), torch.float16, True)

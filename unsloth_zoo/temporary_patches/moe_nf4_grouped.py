@@ -55,7 +55,8 @@ except Exception:  # pragma: no cover
 # calls / fallbacks: eager dispatch decisions; launches: kernel runs (forward and dX), counted
 # inside the op so a compiled caller is counted too.
 NF4_FUSED_STATS = {"calls": 0, "fallbacks": 0, "launches": 0}
-_DISABLED_REASON = None
+_DISABLED_REASON = None   # set by hand / tests: every stack takes the dequant path
+FAILED_SHAPES = {}        # (inner, outer, s_i, s_j) -> reason: a build or launch failed for that GEMM
 _OP_NS = "unsloth_zoo"
 
 
@@ -229,7 +230,6 @@ if triton is not None:
 
 
 def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j, blocksize, blocksize2, nested, w_dtype):
-    global _DISABLED_REASON
     M = a.shape[0]
     out = a.new_empty((M, outer))
     if M == 0:
@@ -244,7 +244,8 @@ def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer,
     # Autotune bucket: average rows per expert, rounded to a power of two.
     m_hint = triton.next_power_of_2(max(1, M // max(E, 1)))
     grid = lambda meta: (triton.cdiv(M, meta["BM"]) + E, triton.cdiv(outer, meta["BN"]))
-    if _DISABLED_REASON is not None:
+    key = (inner, outer, s_i, s_j)
+    if _DISABLED_REASON is not None or key in FAILED_SHAPES:
         return _launch_eager(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
                              blocksize, blocksize2, nested, w_dtype)
     NF4_FUSED_STATS["launches"] += 1
@@ -252,9 +253,10 @@ def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer,
         _run_kernel(a, out, grid, packed, absmax, code2, absmax2, offset, code, ends, M, m_hint, E,
                     inner, outer, s_i, s_j, pair, blocksize, blocksize2, nested, w_dtype)
     except Exception as exc:
-        # A Triton build or launch failure: decode in torch for this call, later calls take the dequant path.
-        _DISABLED_REASON = f"{type(exc).__name__}: {exc}"[:500]
-        logger.warning(f"Unsloth: the NF4 fused grouped GEMM is disabled for this process: {_DISABLED_REASON}")
+        # A Triton build or launch failure: decode in torch for this call; the stack takes the dequant path after.
+        NF4_FUSED_STATS["launches"] -= 1
+        FAILED_SHAPES[key] = f"{type(exc).__name__}: {exc}"[:800]
+        logger.warning(f"Unsloth: the NF4 fused grouped GEMM failed for {key}, using the dequant path: {FAILED_SHAPES[key]}")
         return _launch_eager(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
                              blocksize, blocksize2, nested, w_dtype)
     return out
@@ -264,12 +266,13 @@ def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer,
 # different MMA instructions round differently, so a timing-picked config would make the bits
 # depend on the run. UNSLOTH_MOE_NF4_AUTOTUNE=1 tunes per shape instead.
 # The select-tree codebook (LUT 1) beat the gather 3-6x in every tuned shape; pairs along N take
-# BN 64 so a tile row stays in one 64-element absmax block (one scale per row).
+# BN 64 so a tile row stays in one 64-element absmax block (one scale per row); per-element decode
+# (odd contiguous dim) takes small tiles, its int64 index tiles are register heavy.
 def _fixed_config(m_hint, inner, outer, pair):
     bm = 16 if m_hint <= 16 else 32 if m_hint <= 32 else 64 if m_hint <= 64 else 128
-    bn = 64 if pair == 1 else 128
+    bn = 128 if pair == 2 else 64
     bn = min(bn, max(16, triton.next_power_of_2(outer)))
-    bk = 64 if inner >= 64 or pair == 2 else max(16, triton.next_power_of_2(inner))
+    bk = 64 if pair == 2 else 32 if pair == 0 else min(64, max(16, triton.next_power_of_2(inner)))
     warps = 8 if bm * bn >= 128 * 128 else 4
     return {"BM": bm, "BN": bn, "BK": bk, "LUT": 1}, warps, 3
 
@@ -495,7 +498,6 @@ def nf4_grouped_spec(param, preprocess, compute_dtype, mode = None):
 
 def maybe_nf4_grouped_mm(inputs, offsets, source, preprocess):
     """Fused NF4 base GEMM for a frozen 4-bit expert stack, or None to keep the current path."""
-    global _DISABLED_REASON
     try:
         spec = nf4_grouped_spec(source, preprocess, inputs.dtype)
     except Exception:
@@ -509,6 +511,11 @@ def maybe_nf4_grouped_mm(inputs, offsets, source, preprocess):
         or inputs.device != spec["packed"].device
     ):
         return None
+    if FAILED_SHAPES:
+        K, N = spec["K"], spec["N"]
+        s_k, s_n = _strides(spec["kn_layout"], K, N)
+        if (K, N, s_k, s_n) in FAILED_SHAPES or (N, K, s_n, s_k) in FAILED_SHAPES:
+            return None
     offsets = offsets if offsets.dtype == torch.int32 else offsets.to(torch.int32)
     out = nf4_grouped_mm(inputs, offsets, spec)
     if not torch.compiler.is_compiling():
