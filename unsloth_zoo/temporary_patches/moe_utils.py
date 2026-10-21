@@ -496,13 +496,10 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 
 # Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop; one Triton launch beats it for small experts.
-# Measured max average rows per expert per class: "lora" (a dim <= 32), "many" / "few" (>= / < 64 experts),
-# "dw" / "dw_few" (base weight grad, >= / < 64 experts). sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100
-# have native grouped GEMMs. sm121 (GB10 / DGX Spark) takes sm120's tiles and limits (1.15x on Qwen3.5-35B-A3B
-# QLoRA, unsloth-zoo#1661) except sm120's "dw" 256, measured on RTX PRO 6000 only.
-# sm80 "few" 512: Triton forward + dX are 4-40% faster than cuBLAS at 257-512 rows on A100 (gpt-oss-20b, Mixtral,
-# Qwen1.5-MoE). sm120 "dw" 256: Triton dW is 13-26% faster at 65-256 rows for Qwen3-30B-A3B; "dw_few" stays 64,
-# as Triton dW loses ~10% on Mixtral's gate_up there.
+# Measured max average rows per expert: "lora" (a dim <= 32), "many" / "few" and "dw" / "dw_few" (base dW) at >= / < 64
+# experts. sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100 have native grouped GEMMs. sm121 (GB10) takes sm120's
+# limits (unsloth-zoo#1661) except "dw" 256, measured on RTX PRO 6000 only. sm80 "few" 512: Triton 4-40% faster at 257-512
+# rows on A100. sm120 "dw" 256: 13-26% faster at 65-256 rows; "dw_few" stays 64 (Triton loses ~10% on Mixtral gate_up).
 _TRITON_GROUPED_MM_AUTO_ROWS = {
     (8, 0):  {"lora": -1, "many": 2048, "few": 512, "dw": 128, "dw_few": 128},
     (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
