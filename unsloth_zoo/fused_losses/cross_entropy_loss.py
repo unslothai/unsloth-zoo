@@ -38,6 +38,8 @@ from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bou
 from unsloth_zoo.device_type import DEVICE_TYPE
         
 
+# Not F.linear: ZeRO-3 patches it process wide, giving a zero lm_head grad under compile + grad_and_value.
+_aten_linear = torch._C._nn.linear
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
 N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
 # Opt-in: accumulate a trainable lm_head weight gradient across chunks in float32 (one
@@ -172,7 +174,7 @@ def compute_fused_ce_loss(
         labels = _labels
     pass
 
-    logits = torch.nn.functional.linear(
+    logits = _aten_linear(
         hidden_states.to(dtype = lm_head_weight.dtype, device = device),
         lm_head_weight,
         lm_head_bias,

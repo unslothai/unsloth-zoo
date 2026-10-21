@@ -491,6 +491,24 @@ def test_right_padding_skips_the_mask_when_opted_in(patched, monkeypatch):
         assert not reference[row, 0, :n, n:].any()
 
 
+def test_right_padding_skip_is_on_by_default(patched, monkeypatch):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert patched.create_causal_mask(**kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 1
+
+
+@pytest.mark.parametrize("env", [("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "0"), ("UNSLOTH_SKIP_CAUSAL_MASK", "0")])
+def test_right_padding_kill_switch_keeps_the_mask(patched, monkeypatch, env):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    monkeypatch.setenv(*env)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert isinstance(patched.create_causal_mask(**kwargs), torch.Tensor)
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before
+
+
 @pytest.mark.parametrize("attention_mask", [
     torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]]),
     torch.tensor([[1, 1, 1, 1], [1, 0, 1, 1]]),
@@ -737,3 +755,53 @@ def test_flash_probe_without_enable_gqa_argument(monkeypatch):
     assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 8, 128, 0.0, True) is True
     assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 1, 128, 0.0, True) is False
     assert probe.param_counts == [6]
+
+
+class _SplitModel(torch.nn.Module):
+    """Stands in for a decoder whose forward builds the mask; `devices` fakes where its layers live."""
+
+    def __init__(self, devices = None, hf_device_map = None):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(torch.nn.Linear(2, 2) for _ in range(2))
+        self._devices = devices
+        if hf_device_map is not None:
+            self.hf_device_map = hf_device_map
+
+    def parameters(self, recurse = True):
+        if self._devices is None:
+            yield from super().parameters(recurse)
+            return
+        for device in self._devices:
+            yield torch.empty(0, device = device)
+
+    def forward(self, create_causal_mask, kwargs):
+        return create_causal_mask(**kwargs)
+
+
+@pytest.mark.parametrize("model", [
+    lambda: _SplitModel(devices = ["cpu", "meta"]),
+    lambda: _SplitModel(hf_device_map = {"model.embed_tokens": 0, "model.layers.1": 1}),
+], ids = ["layer_devices", "hf_device_map"])
+def test_right_padding_keeps_the_mask_on_a_split_model_by_default(patched, monkeypatch, model):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    model = model()
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert isinstance(model(patched.create_causal_mask, kwargs), torch.Tensor)
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before
+    # The explicit opt-in keeps skipping on split models.
+    monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
+    assert model(patched.create_causal_mask, kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 1
+
+
+@pytest.mark.parametrize("hf_device_map", [None, {"": 0}, {"model.embed_tokens": 0, "lm_head": "cuda:0"}])
+def test_right_padding_skips_on_a_single_device_model(patched, monkeypatch, hf_device_map):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    model = _SplitModel(hf_device_map = hf_device_map)
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert model(patched.create_causal_mask, kwargs) is None
+    assert model(patched.create_causal_mask, kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 2
+    assert misc._MODEL_SPANS_DEVICES[model] is False

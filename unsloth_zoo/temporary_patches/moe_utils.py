@@ -1911,24 +1911,22 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     (re-registers hooks, unnecessary for read-only temp tensors). Used by the
     FP8 and bnb4bit MoE dispatchers.
     """
-    # object.__setattr__ writes the instance __dict__, which shadows `_parameters`. Restore by
-    # removing those entries again rather than writing the original Parameter into __dict__: a
-    # Parameter left there hides every later `_parameters[name] = ...` swap, e.g. FSDP2 installing
-    # its sharded / all-gathered parameter around each forward, so the next call would read a
-    # stale, freed all-gather buffer.
+    # Restore by popping the __dict__ entries, never writing the Parameter there: it would shadow
+    # later `_parameters` swaps (FSDP2 all-gather) and read a freed buffer. No `object()` sentinel:
+    # its graph break left the temporary tensors installed after a compiled call.
     instance_dict = experts_module.__dict__
-    missing = object()
-    saved = {name: instance_dict.get(name, missing) for name in ("gate_up_proj", "down_proj")}
+    names = ("gate_up_proj", "down_proj")
+    saved = {name: instance_dict[name] for name in names if name in instance_dict}
     object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
     object.__setattr__(experts_module, "down_proj", down_proj)
     try:
         return forward_fn(experts_module, *args)
     finally:
-        for name, value in saved.items():
-            if value is missing:
-                instance_dict.pop(name, None)
+        for name in names:
+            if name in saved:
+                instance_dict[name] = saved[name]
             else:
-                instance_dict[name] = value
+                instance_dict.pop(name, None)
 
 
 def forward_moe_backend(
