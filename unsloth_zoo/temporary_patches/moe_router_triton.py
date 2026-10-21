@@ -13,29 +13,19 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Fused MoE router: logits -> (routing weights fp32 [T, k], expert ids int64 [T, k]) in one
-Triton launch, with a Triton backward giving the eager autograd gradient for the logits.
+"""Fused MoE router: logits -> (fp32 weights [T, k], int64 ids [T, k]) in one Triton launch,
+plus a Triton backward matching eager autograd for the logits.
 
 Modes:
-  MODE_SOFTMAX_TOPK  softmax(fp32) -> top_k -> optional renorm (Qwen3-MoE, Qwen2-MoE, OLMoE,
-                     Mixtral, Qwen3-VL-MoE, Qwen3.5-MoE). Unselected logits get the gradient
-                     through the full softmax denominator, as eager autograd does.
-  MODE_TOPK_SOFTMAX  top_k on the logits -> softmax over the selected (gpt-oss).
-  MODE_SIGMOID       sigmoid -> + e_score_correction_bias -> group-limited top_k on the biased
-                     scores -> UNBIASED scores gathered -> optional renorm (+1e-20) ->
-                     * routed_scaling_factor (DeepSeek-V3, GLM4-MoE). Unselected groups are
-                     masked to -inf (transformers 5) or 0.0 (transformers 4 get_topk_indices).
+  MODE_SOFTMAX_TOPK  softmax(fp32) -> top_k -> optional renorm (Qwen3/Qwen2/OLMoE/Mixtral MoE).
+  MODE_TOPK_SOFTMAX  top_k on logits -> softmax over the selected (gpt-oss).
+  MODE_SIGMOID       sigmoid + e_score_correction_bias -> group top_k -> UNBIASED scores ->
+                     renorm (+1e-20) * routed_scaling_factor (DeepSeek-V3, GLM4-MoE). Masked
+                     groups use -inf (transformers 5) or 0.0 (transformers 4).
 
-Score math is fp32 whatever the logits dtype; the gradient is returned in the logits dtype.
-Ties: at the k-th boundary the lower expert (and group) index is selected, the same set
-torch.topk returns on CUDA (tests/test_moe_router_triton.py checks explicit ties). Inside a run
-of exactly equal scores the kernel lists the lower index first while torch.topk's sort is not
-stable, so the (weight, id) pairs can come out permuted there; the set of pairs, and so every
-downstream sum over k, is the same. Selection uses scores computed in-kernel, so two logits a
-float32 ulp apart can rank differently from eager. NaN logits are unsupported. The ids are not differentiable and the bias gets no gradient. Auxiliary
-load-balancing / z-loss terms read router_logits directly, so their gradients are untouched.
-
-Opt-in: UNSLOTH_MOE_FUSED_ROUTER=1 (read every eager call; 0 or unset keeps the eager routing).
+Ties pick the lower index (same set as CUDA torch.topk; order inside exact ties may differ).
+Logits a float32 ulp apart can rank differently from eager. NaN unsupported; bias gets no grad.
+Opt-in: UNSLOTH_MOE_FUSED_ROUTER=1, read every eager call.
 """
 
 from __future__ import annotations
@@ -187,7 +177,6 @@ if HAS_TRITON:
         r64 = rows.to(tl.int64)
         z = tl.load(Z + r64[:, None] * stride_z + cols[None, :], mask = ok, other = 0.0).to(tl.float32)
         NEG = float("-inf")
-        # Scatter the upstream weight gradient onto the selected experts.
         g = tl.zeros((BLOCK_T, BLOCK_E), tl.float32)
         sel = tl.zeros((BLOCK_T, BLOCK_E), tl.int32)
         for j in tl.static_range(K):
