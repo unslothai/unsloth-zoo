@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# GQA SDPA for the forced float32 attention patches. Before torch 2.14 the mem-efficient kernel
-# rejects enable_gqa and flash / cuDNN reject fp32, so SDPA falls to the math kernel and keeps
-# [B, H, T, T] scores. Repeating k/v lets mem-efficient run instead.
+# Pre torch 2.14 mem-efficient rejects enable_gqa and flash rejects fp32, so GQA SDPA falls to math; repeat k/v instead.
 
 import torch
 
@@ -48,7 +46,7 @@ def _efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, enable_
         try:
             params = torch.backends.cuda.SDPAParams(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
         except TypeError:
-            # torch 2.4: six-argument SDPAParams, no GQA support to probe.
+            # torch 2.4: six-argument SDPAParams.
             if enable_gqa:
                 return False
             params = torch.backends.cuda.SDPAParams(query, key, value, attn_mask, dropout_p, is_causal)
@@ -58,8 +56,6 @@ def _efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, enable_
 
 
 def make_gqa_sdpa(scaled_dot_product_attention):
-    """SDPA with enable_gqa = groups != 1 that repeats k/v when only that reaches the mem-efficient kernel."""
-
     @torch.compiler.disable(recursive = True)
     def gqa_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale, groups):
         if groups != 1 and query.is_cuda and torch.backends.cuda.mem_efficient_sdp_enabled() and \

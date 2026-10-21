@@ -133,7 +133,7 @@ def _run(module, args, kwargs):
     module.zero_grad(set_to_none = True)
     kwargs = dict(kwargs)
     if kwargs.get("shared_kv_states") is not None:
-        # Gemma4 producer layers write graph-carrying k/v here; keep each run's graph separate.
+        # Gemma4 producer layers write graph-carrying k/v here.
         kwargs["shared_kv_states"] = {k: tuple(t.detach() for t in v) for k, v in kwargs["shared_kv_states"].items()}
     hidden = (args[0] if args else kwargs.pop("hidden_states")).detach().clone().requires_grad_()
     out = module(hidden, *args[1:], **kwargs)[0]
@@ -195,8 +195,7 @@ def test_gqa_kept_when_flash_takes_it(site):
     dtype = torch.bfloat16 if name == "gemma3_generic" else torch.float16
     if not torch.backends.cuda.flash_sdp_enabled() or not _probe(dtype, 4, 2, True):
         pytest.skip("flash does not take half precision GQA here")
-    # Flash cannot take a mask, and whether the model builds one inside the window depends on what
-    # else patched transformers (an imported unsloth does), so call each layer maskless.
+    # Flash takes no mask, and whether one is built depends on other patches, so call layers maskless.
     captured = _capture(model, 1, 48, False)
     calls.clear()
     for module, args, kwargs in captured:

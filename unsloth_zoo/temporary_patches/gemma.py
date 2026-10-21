@@ -860,7 +860,7 @@ def patch_Gemma3Attention():
                 attn_mask_for_sdpa,
                 self.attention_dropout if self.training else 0.0,
                 is_causal,
-                getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
+                getattr(self, "scaling", None),
                 getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_weights = None # Defaulting to None
@@ -1112,7 +1112,7 @@ def patch_Gemma3Attention_generic():
                 attn_mask_for_sdpa,
                 self.attention_dropout if self.training else 0.0,
                 is_causal,
-                getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
+                getattr(self, "scaling", None),
                 getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_weights = None # Defaulting to None
