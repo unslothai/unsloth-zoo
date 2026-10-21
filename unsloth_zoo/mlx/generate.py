@@ -177,6 +177,7 @@ class GenerationDefaults:
     kv_quant_scheme: str | None = None
     quantized_kv_start: int | None = None
     stop_token_ids: tuple[int, ...] | None = None
+    prefill_step_size: int | None = None  # None: the runtime's own
 
     def __post_init__(self):
         _validate_positive_int(self.max_tokens, "defaults.max_tokens")
@@ -190,6 +191,9 @@ class GenerationDefaults:
         )
         if self.max_kv_size is not None:
             _validate_positive_int(self.max_kv_size, "defaults.max_kv_size")
+        if self.prefill_step_size is not None:
+            _validate_positive_int(self.prefill_step_size, "defaults.prefill_step_size")
+            object.__setattr__(self, "prefill_step_size", int(self.prefill_step_size))
         if self.kv_bits is not None:
             if isinstance(self.kv_bits, bool) or not isinstance(self.kv_bits, Real):
                 raise TypeError("defaults.kv_bits must be a number.")
@@ -415,6 +419,17 @@ def _kv_quant_options(defaults: GenerationDefaults) -> dict:
         for name in _KV_QUANT_CONTROLS
         if getattr(defaults, name) is not None
     }
+
+
+def _prefill_step_option(defaults: GenerationDefaults, constructor = None) -> dict:
+    """``prefill_step_size`` when one was asked for and ``constructor`` (if given) takes it."""
+    if defaults.prefill_step_size is None:
+        return {}
+    if constructor is not None:
+        params = inspect.signature(constructor).parameters
+        if "prefill_step_size" not in params and not any(p.kind is p.VAR_KEYWORD for p in params.values()):
+            return {}
+    return {"prefill_step_size": defaults.prefill_step_size}
 
 
 def _batch_kv_quant_options(defaults: GenerationDefaults) -> dict:
@@ -1612,6 +1627,7 @@ class _TextBatchSession:
             prefill_batch_size=defaults.prefill_batch_size,
             completion_batch_size=defaults.completion_batch_size,
             max_kv_size=defaults.max_kv_size,
+            **_prefill_step_option(defaults, adapter.batch_generator_type),
         )
         self._row_signature = None
         self._pending: dict[int, _PendingResult] = {}
@@ -2949,6 +2965,7 @@ class _VLMBatchAdapter:
             max_tokens=int(request.max_tokens or self.defaults.max_tokens),
             logits_processors=_row_processors(request),
             **_kv_quant_options(self.defaults),
+            **_prefill_step_option(self.defaults),
             sampler=(
                 _seeded_sampler(self.sample_utils, sampling)
                 if _draws_seeded(sampling)
@@ -3055,6 +3072,7 @@ class _VLMBatchAdapter:
         if "compute_logprobs" in self.constructor_params:
             options["compute_logprobs"] = True
         options.update(_batch_kv_quant_options(self.defaults))
+        options.update(_prefill_step_option(self.defaults))
         max_tokens = [
             int(request.max_tokens or self.defaults.max_tokens) for request in chunk
         ]
@@ -3678,6 +3696,7 @@ class _VLMBatchSession:
             "sampler": self.sampler,
             "compute_logprobs": True,
             **_batch_kv_quant_options(defaults),
+            **_prefill_step_option(defaults),
         }
         generator = adapter.generator_type(
             adapter.model.language_model,
@@ -3792,7 +3811,7 @@ class _SpeculativeBatchSession:
         )
         # The engine row keeps the whole prompt, for copies and the drafter; only the forward starts past the prefix.
         with self._embedded(len(pending.prompt) - prefix):
-            admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra)
+            admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra, **_prefill_step_option(adapter.defaults))
         finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
         if not finished:
             try:

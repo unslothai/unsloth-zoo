@@ -1114,6 +1114,18 @@ def test_speculative_batch_stream_leaves_no_row_behind_when_admission_fails(qwen
         assert stream.add(replace(request, max_tokens = 12)) is not None and (state := stream._session.engine._rows[0]) and next(events := stream.iter_step()) and (before := state.emitted) and stream.close() is None and (list(events), state.emitted) == ([], before)
 
 
+def test_speculative_batch_rows_prefill_on_the_batch_step(qwen, monkeypatch):
+    from unsloth_zoo.mlx import generate
+    from unsloth_zoo.mlx.speculative import SpeculativeDraft
+    model, seen, admit = qwen[0], [], SpeculativeDraft.admit
+    monkeypatch.setattr(model, "_is_vlm_model", True, raising = False)
+    monkeypatch.setattr(SpeculativeDraft, "admit", lambda self, *args, **kwargs: (seen.append(kwargs.get("prefill_step_size")), admit(self, *args, **kwargs))[1])
+    for step in (None, 8):
+        with generate.BatchStream(model, None, defaults = generate.GenerationDefaults(max_tokens = 2, prefill_step_size = step), speculative = SpeculativeDraft(_rounds_only())) as stream:
+            stream.add(generate.GenerationRequest(prompt = "Name three colours."))
+    assert seen == [None, 8]
+
+
 def _tiny_companion(model, repo):
     from mlx_vlm.speculative.drafters import dflash2, dspark, qwen3_dflash
     from mlx_vlm.utils import load_config
