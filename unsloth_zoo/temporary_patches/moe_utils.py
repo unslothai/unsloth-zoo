@@ -395,7 +395,7 @@ def _grouped_mm_eager(inputs, weight, offsets):
     # every card but an H100; 2.9 falls back internally. Probe is cached: one read.
     if not _grouped_mm_supported_on(inputs.device):
         return _manual_grouped_mm(inputs, weight, offsets)
-    if not _transposed_view_grouped_mm_is_safe():
+    if not _transposed_view_safe_on(inputs.device):
         weight = weight.contiguous()   # view path unproven on this device -> safe copy
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
@@ -1157,6 +1157,18 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
+def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_type, experts_module):
+    """UNSLOTH_MOE_NF4_FUSED grouped GEMM on a frozen NF4 stack; None keeps the dequant path."""
+    if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
+        return None
+    try:
+        from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm
+    except ImportError:
+        return None
+    preprocess = lambda w: preprocess_weight(w, proj_type, hidden_dim, model_type, experts_module = experts_module)
+    return maybe_nf4_grouped_mm(inputs, offsets, source, preprocess)
+
+
 # UNSLOTH_MOE_SELECTIVE_DEQUANT: "auto" = num_rows experts on device (sync-free) if rows <= 7/8 E;
 # "1" = exact routed set (one host sync); "0" = full stack.
 SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
@@ -1523,9 +1535,22 @@ def _grouped_mm_home():
     global _GROUPED_MM_HOME
     if _GROUPED_MM_HOME is None:
         device = _grouped_mm_probe_device()
+        anchored = False
         with _GROUPED_MM_HOME_LOCK:
             if _GROUPED_MM_HOME is None and device is not None and device.index is not None:
                 _GROUPED_MM_HOME = (device.type, device.index)
+                _GROUPED_MM_FOREIGN.setdefault(_GROUPED_MM_HOME, None)
+                anchored = True
+        # Classify the other visible cards now (metadata only, no kernel probe): a traced first use of
+        # another card must not reach the compiler-disabled resolver (graph break / fullgraph error).
+        if anchored:
+            try:
+                count = getattr(torch, device.type).device_count()
+            except Exception:
+                count = 0
+            for i in range(count):
+                if (device.type, i) not in _GROUPED_MM_FOREIGN:
+                    _resolve_grouped_mm_foreign_kind(torch.device(device.type, i), (device.type, i))
     return torch.device(*_GROUPED_MM_HOME) if _GROUPED_MM_HOME is not None else _grouped_mm_probe_device()
 
 
@@ -1571,7 +1596,9 @@ def _check_torch_grouped_mm_supported(device = None):
 
 
 def _grouped_mm_supported_on(device):
-    if _grouped_mm_foreign_kind(device) is None: return _check_torch_grouped_mm_supported()
+    # Absent symbol (torch 2.6/2.7): the traceable definitive negative, no classification.
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_foreign_kind(device) is None:
+        return _check_torch_grouped_mm_supported()
     return _check_torch_grouped_mm_supported(device)
 
 
@@ -1629,9 +1656,15 @@ def _run_grouped_mm_crash_probe(device):
     if torch.cuda.device_count() > 1 and not layered:
         # Child sees only this card; HIP indexes into the inherited mask.
         mask = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
+        mask = (mask or "").strip()
+        if len(mask) >= 2 and mask[0] == mask[-1] == '"': mask = mask[1:-1]
         # clr keeps the first of a repeated entry.
         mask = list(dict.fromkeys(m.strip() for m in mask.split(","))) if mask else None
-        if mask is None or index < len(mask):
+        # Only plain ordinals map token -> logical index (UUIDs alias them); PAL (Windows) enumerates in physical order.
+        plain = mask is None or (
+            all(m.isdigit() for m in mask) and (sys.platform != "win32" or mask == sorted(mask, key = int))
+        )
+        if plain and (mask is None or index < len(mask)):
             visible = mask[index] if mask else str(index)
             index, env = 0, dict(os.environ, HIP_VISIBLE_DEVICES = visible, CUDA_VISIBLE_DEVICES = visible)
     # Not multiprocessing: spawn re-imports the caller's __main__.
@@ -1673,6 +1706,9 @@ def _probe_torch_grouped_mm_supported(device = None):
         if supported is None:
             supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
             _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
+            # Same eager region: a traced first use of this model must not break again on the view check.
+            if supported and kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
+                _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = _transposed_view_probe(device)
         return supported
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
@@ -1701,14 +1737,35 @@ def _transposed_view_grouped_mm_is_safe():
     return _run_probe_eagerly(_probe_transposed_view_grouped_mm_is_safe)
 
 
-def _probe_transposed_view_grouped_mm_is_safe():
+_TRANSPOSED_VIEW_SAFE_BY_KIND = {}
+
+
+def _transposed_view_safe_on(device):
+    """View probe on `device`'s GPU model; the home model keeps the process-wide flag."""
+    if not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is None: return _transposed_view_grouped_mm_is_safe()
+    safe = _TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind)
+    if safe is not None: return safe
+    return _run_probe_eagerly(lambda: _probe_transposed_view_grouped_mm_is_safe(device))
+
+
+def _probe_transposed_view_grouped_mm_is_safe(device = None):
     global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is not None:
+        if kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
+            _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = _transposed_view_probe(device)
+        return _TRANSPOSED_VIEW_SAFE_BY_KIND[kind]
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
         return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    _TRANSPOSED_VIEW_GROUPED_MM_SAFE = _transposed_view_probe(_grouped_mm_home())
+    return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
 
+
+def _transposed_view_probe(device):
     safe = False
     try:
-        device = _grouped_mm_probe_device()
         if _TORCH_GROUPED_MM_AVAILABLE and device is not None and _grouped_mm_survives_out_of_process(device):
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
@@ -1735,8 +1792,6 @@ def _probe_transposed_view_grouped_mm_is_safe():
             safe = ok
     except Exception:
         safe = False   # anything unexpected -> keep the safe contiguous copy
-
-    _TRANSPOSED_VIEW_GROUPED_MM_SAFE = safe
     return safe
 
 
@@ -5183,6 +5238,8 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype), _gate_up_layout,
             )
         else:
+            mm1_out = _nf4_fused_base_mm(permuted_input, offsets, _gate_up_src, "gate_up", hidden_dim, model_type, self)
+        if _gate_up_layout is None and mm1_out is None:
             _recompute = _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype)
             if _recompute:
                 selective_plan = _selective_dequant_plan(
@@ -5380,6 +5437,8 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype), _down_layout,
             )
         else:
+            mm2_out = _nf4_fused_base_mm(inter, offsets, _down_src, "down", hidden_dim, model_type, self)
+        if _down_layout is None and mm2_out is None:
             _recompute = _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype)
             mm2_out = _base_grouped_mm(
                 inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None,

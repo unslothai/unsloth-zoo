@@ -342,12 +342,12 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
     tokenizer, adapter = _CharTokenizer(), object.__new__(_TextBatchAdapter)
     tokenizer.eos_token_ids = ()
     adapter.model, adapter.tokenizer = object(), tokenizer
-    adapter.defaults = GenerationDefaults(stop_strings=("<STOP>",), prefill_batch_size=2, completion_batch_size=3, max_kv_size=16)
+    adapter.defaults = GenerationDefaults(stop_strings=("<STOP>",), prefill_batch_size=2, completion_batch_size=3, max_kv_size=16, prefill_step_size=8192)
     adapter.batch_generator_type = Generator
     adapter.make_sampler = lambda **_kwargs: None
     result = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
     assert result.token_ids == [1] and Generator.instances[-1].removed == [7]
-    assert tuple(Generator.instances[-1].kwargs[name] for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size")) == (2, 3, 16)
+    assert tuple(Generator.instances[-1].kwargs[name] for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size", "prefill_step_size")) == (2, 3, 16, 8192)
     assert Generator.instances[-1].closed is True
     Generator.eos = True
     eos = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
@@ -357,6 +357,12 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
         adapter.defaults = GenerationDefaults(stop_token_ids=chosen)
         _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
         assert Generator.instances[-1].kwargs["stop_tokens"] == stops
+        assert "prefill_step_size" not in Generator.instances[-1].kwargs  # the runtime's own step
+    # A runtime whose BatchGenerator takes no step keeps its own.
+    adapter.defaults = GenerationDefaults(prefill_step_size=8192)
+    adapter.batch_generator_type = type("Stepless", (Generator,), {"__init__": lambda self, model, max_tokens, stop_tokens, prefill_batch_size, completion_batch_size, max_kv_size: Generator.__init__(self, max_kv_size=max_kv_size)})  # noqa: E501
+    _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
+    assert Generator.instances[-1].kwargs == {"max_kv_size": None}
     assert GenerationDefaults(256, SamplingParams(), (), 2, 3, 16).max_kv_size == 16
     for bad in ([True], [-1], [1.5]):
         with pytest.raises(ValueError, match="non-negative integer"):
@@ -626,10 +632,10 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     ids, embeds = (types.SimpleNamespace(tolist=lambda: [[1], [2]]),
                    types.SimpleNamespace(to_dict=lambda: {"inputs_embeds": "E", "position_ids": None}))
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
-    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant")
+    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant", prefill_step_size=8192)
     adapter.per_row_prompt_kwargs = True
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
-    adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens", "kv_bits", "kv_quant_scheme", "quantized_kv_start"}  # noqa: E501
+    adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens", "kv_bits", "kv_quant_scheme", "quantized_kv_start", "prefill_step_size"}  # noqa: E501
     adapter.prepare_inputs = lambda *a, **k: {"input_ids": ids, "extra": "D", "position_ids": "P"}  # noqa: E501
     adapter.make_sampler = lambda **k: object()
     adapter._add_special_tokens = lambda: True
@@ -658,6 +664,11 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     # Per-row keeps configured sizes; EOS stays with the processor.
     assert (seen["ctor"]["prefill_batch_size"], seen["ctor"]["completion_batch_size"]) == (8, 32)
     assert "stop_tokens" not in seen["ctor"]
+    assert seen["ctor"]["prefill_step_size"] == 8192
+    # A model that must not chunk its prefill still prefills whole.
+    adapter._chunked_prefill_kwargs = lambda **kw: {"prefill_step_size": None}
+    list(adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1]))
+    assert seen["ctor"]["prefill_step_size"] is None
 
 
 @pytest.mark.parametrize("nested", (True, False))
@@ -1026,7 +1037,10 @@ def test_audio_fallback_forwards_the_request_to_the_stream():
     assert (kwargs["audio"], kwargs["max_tokens"]) == ("a.wav", 9)
     assert kwargs["sampler"] is adapter.sampler
     assert (adapter.sampler_kwargs["temp"], adapter.sampler_kwargs["top_k"]) == (0.25, 7)
-    assert kwargs["logits_processors"] == []
+    assert kwargs["logits_processors"] == [] and "prefill_step_size" not in kwargs
+    adapter.defaults = GenerationDefaults(prefill_step_size=8192)
+    _audio_row(adapter, GenerationRequest(prompt="p", audio="a.wav"))
+    assert adapter.stream_calls.pop()[1]["prefill_step_size"] == 8192
     # Decoding alone is not a reason to drop what the request asked for.
     shown = []
     _result, _ = _audio_row(adapter, GenerationRequest(
@@ -1410,6 +1424,8 @@ def test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given():
         assert [session.generator.kwargs[n] for n in ("kv_bits", "kv_group_size")] == [8, 32]
     with contextlib.closing(_vlm_session(kv_bits = 4, kv_quant_scheme = "turboquant", quantized_kv_start = None)) as session:  # noqa: E501
         assert session.generator.kwargs["quantized_kv_start"] == 0  # from the first token, not mlx-vlm's 5000
+    with contextlib.closing(_vlm_session(prefill_step_size = 8192)) as session:
+        assert session.generator.kwargs["prefill_step_size"] == 8192
 
 
 def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
@@ -1633,7 +1649,7 @@ def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
 
 
 def test_kv_quant_controls_and_processor_rows_are_refused_before_they_reach_a_cache():
-    assert [type(pytest.raises((TypeError, ValueError), GenerationDefaults, **kw).value) for kw in ({"kv_bits": True}, {"kv_bits": float("nan")}, {"kv_bits": float("inf")}, {"kv_group_size": True}, {"kv_group_size": -1}, {"kv_quant_scheme": 3}, {"quantized_kv_start": -1})] == [TypeError, ValueError, ValueError, TypeError, ValueError, TypeError, ValueError] and GenerationDefaults(kv_bits = 4.5, kv_group_size = 32, kv_quant_scheme = "turboquant", quantized_kv_start = 0).kv_bits == 4.5  # noqa: E501
+    assert [type(pytest.raises((TypeError, ValueError), GenerationDefaults, **kw).value) for kw in ({"kv_bits": True}, {"kv_bits": float("nan")}, {"kv_bits": float("inf")}, {"kv_group_size": True}, {"kv_group_size": -1}, {"kv_quant_scheme": 3}, {"quantized_kv_start": -1}, {"prefill_step_size": True}, {"prefill_step_size": 0})] == [TypeError, ValueError, ValueError, TypeError, ValueError, TypeError, ValueError, TypeError, ValueError] and GenerationDefaults(kv_bits = 4.5, kv_group_size = 32, kv_quant_scheme = "turboquant", quantized_kv_start = 0).kv_bits == 4.5  # noqa: E501
     with contextlib.closing(_vlm_session()) as session:
         session.adapter.row_logits_processors = False
         with pytest.raises(ValueError, match = "cannot carry") as refusal:

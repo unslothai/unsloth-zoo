@@ -192,7 +192,7 @@ def _launch(top_k_index, num_experts, single_block_max = None, block = None):
             _route_single_kernel[(1,)](
                 ids, N, K_COLS, s_row, s_col, E, counts, offsets, out,
                 BLOCK = BLOCK, NUM_BINS = _pow2(E + 2),
-                num_warps = 4 if BLOCK <= 1024 else 8,
+                num_warps = 4 if BLOCK <= 1024 else 8, enable_fp_fusion = True,
             )
             return counts, out, offsets
         BLOCK = _MULTI_BLOCK if block is None else block
@@ -202,17 +202,20 @@ def _launch(top_k_index, num_experts, single_block_max = None, block = None):
         hist, rank_base, starts = scratch[:size], scratch[size: 2 * size], scratch[2 * size:]
         _route_hist_kernel[(NB,)](
             ids, N, K_COLS, s_row, s_col, E, hist, rank_base,
-            BLOCK = BLOCK, NUM_BINS = _pow2(E + 2), num_warps = _WARPS[0],
+            BLOCK = BLOCK, NUM_BINS = _pow2(E + 2), num_warps = _WARPS[0], enable_fp_fusion = True,
         )
         EC = min(_SCAN_EXPERTS, _pow2((E + 32) // 32))
         _route_scan_kernel[((E + EC) // EC,)](
             hist, rank_base, counts, NB, E,
             EC = EC, BB = min(_SCAN_BLOCKS, max(_pow2(NB), 16)), num_warps = _WARPS[1],
+            enable_fp_fusion = True,
         )
-        _route_starts_kernel[(1,)](counts, starts, offsets, E, EP = _pow2(E + 1), num_warps = 4)
+        _route_starts_kernel[(1,)](
+            counts, starts, offsets, E, EP = _pow2(E + 1), num_warps = 4, enable_fp_fusion = True,
+        )
         _route_scatter_kernel[(NB,)](
             ids, N, K_COLS, s_row, s_col, E, rank_base, starts, out,
-            BLOCK = BLOCK, num_warps = _WARPS[2],
+            BLOCK = BLOCK, num_warps = _WARPS[2], enable_fp_fusion = True,
         )
     return counts, out, offsets
 
