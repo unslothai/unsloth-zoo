@@ -34,6 +34,7 @@ path. UNSLOTH_MOE_NF4_AUTOTUNE=1 tunes tiles per shape (run-to-run bits then fol
 __all__ = [
     "NF4_FUSED_STATS",
     "nf4_fused_mode",
+    "nf4_auto_fused",
     "nf4_grouped_mm",
     "nf4_grouped_spec",
     "maybe_nf4_grouped_mm",
@@ -63,13 +64,31 @@ _OP_NS = "unsloth_zoo"
 
 
 def nf4_fused_mode() -> str:
-    """'0' off (default), '1' sm80+ CUDA, 'force' any CUDA device."""
+    """'0' off (default), '1' sm80+ CUDA, 'auto' sm80+ CUDA at or below AUTO_MAX_ROWS rows per expert,
+    'force' any CUDA device."""
     mode = os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0").strip().lower()
     if mode in ("1", "true", "on", "yes"):
         return "1"
-    if mode == "force":
-        return "force"
+    if mode in ("auto", "force"):
+        return mode
     return "0"
+
+
+# Average rows per expert (tokens * top_k / E) at or below which "auto" fuses: the dequant pass is
+# then most of the current path's time. Measured crossover on L4 bf16.
+AUTO_MAX_ROWS = 128
+
+
+def nf4_auto_max_rows() -> int:
+    try:
+        return int(os.environ.get("UNSLOTH_MOE_NF4_AUTO_MAX_ROWS", AUTO_MAX_ROWS))
+    except ValueError:
+        return AUTO_MAX_ROWS
+
+
+def nf4_auto_fused(rows, num_experts) -> bool:
+    """Shapes only (no host sync); under torch.compile this guards on the row count."""
+    return rows <= nf4_auto_max_rows() * num_experts
 
 
 if triton is not None:
@@ -83,7 +102,7 @@ if triton is not None:
                     for lut in (0, 1):
                         if warps == 8 and bm * bn < 64 * 64:
                             continue
-                        out.append(c({"BM": bm, "BN": bn, "BK": 64, "LUT": lut}, num_warps = warps, num_stages = 3))
+                        out.append(c({"BM": bm, "BN": bn, "BK": 64, "LUT": lut, "MSUB": 1}, num_warps = warps, num_stages = 3))
         return out
 
     def _prune(configs, named_args, **kwargs):
@@ -158,6 +177,7 @@ if triton is not None:
         PAIR: tl.constexpr,                 # 1: bytes pair along J, 2: along I, 0: per element
         BS: tl.constexpr, BS2: tl.constexpr, NESTED: tl.constexpr, W_DT: tl.constexpr,
         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, LUT: tl.constexpr,
+        MSUB: tl.constexpr,                 # M sub-tiles sharing one decoded weight tile
     ):
         pid = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -166,7 +186,7 @@ if triton is not None:
         e_ok = e_idx < NUM_E
         ends = tl.load(ENDS + e_idx, mask = e_ok, other = 0).to(tl.int32)
         starts = tl.load(ENDS + e_idx - 1, mask = e_ok & (e_idx > 0), other = 0).to(tl.int32)
-        tiles = tl.where(e_ok, (ends - starts + BM - 1) // BM, 0)
+        tiles = tl.where(e_ok, (ends - starts + BM * MSUB - 1) // (BM * MSUB), 0)
         cum = tl.cumsum(tiles, 0)
         if pid >= tl.sum(tiles, 0):
             return
@@ -176,15 +196,18 @@ if triton is not None:
         row_hi = tl.sum(tl.where(sel, ends, 0), 0)
         local = pid - tl.sum(tl.where(sel, cum - tiles, 0), 0)
 
-        offs_m = row_lo + local * BM + tl.arange(0, BM)
+        offs_m = row_lo + local * (BM * MSUB) + tl.arange(0, BM)
         mask_m = offs_m < row_hi
         offs_m = offs_m.to(tl.int64)
+        offs_m1 = offs_m + BM
+        mask_m1 = offs_m1 < row_hi
         offs_n = pid_n * BN + tl.arange(0, BN)
         mask_n = offs_n < J
         w_base = e.to(tl.int64) * (I * J)       # even whenever PAIR != 0
         out_dt = C.dtype.element_ty
 
         acc = tl.zeros((BM, BN), dtype = tl.float32)
+        acc1 = tl.zeros((BM, BN), dtype = tl.float32)
         for k0 in range(0, I, BK):
             offs_k = k0 + tl.arange(0, BK)
             mask_k = offs_k < I
@@ -226,7 +249,12 @@ if triton is not None:
             # Masked weights decode to finite values (code[0] * offset at most) against zero A columns
             # or unstored output columns, so no select is needed here.
             acc = tl.dot(a, b, acc)
+            if MSUB == 2:
+                a1 = tl.load(A + offs_m1[:, None] * I + offs_k[None, :], mask = mask_m1[:, None] & mask_k[None, :], other = 0.0)
+                acc1 = tl.dot(a1, b, acc1)
         tl.store(C + offs_m[:, None] * J + offs_n[None, :], acc.to(out_dt), mask = mask_m[:, None] & mask_n[None, :])
+        if MSUB == 2:
+            tl.store(C + offs_m1[:, None] * J + offs_n[None, :], acc1.to(out_dt), mask = mask_m1[:, None] & mask_n[None, :])
 
     _TL_DTYPES = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
 
@@ -245,7 +273,7 @@ def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer,
         pair = 0
     # Autotune bucket: average rows per expert, rounded to a power of two.
     m_hint = triton.next_power_of_2(max(1, M // max(E, 1)))
-    grid = lambda meta: (triton.cdiv(M, meta["BM"]) + E, triton.cdiv(outer, meta["BN"]))
+    grid = lambda meta: (triton.cdiv(M, meta["BM"] * meta["MSUB"]) + E, triton.cdiv(outer, meta["BN"]))
     key = (inner, outer, s_i, s_j)
     if _DISABLED_REASON is not None or key in FAILED_SHAPES:
         return _launch_eager(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
@@ -276,7 +304,7 @@ def _fixed_config(m_hint, inner, outer, pair):
     bn = min(bn, max(16, triton.next_power_of_2(outer)))
     bk = 64 if pair == 2 else 32 if pair == 0 else min(64, max(16, triton.next_power_of_2(inner)))
     warps = 8 if bm * bn >= 128 * 128 else 4
-    return {"BM": bm, "BN": bn, "BK": bk, "LUT": 1}, warps, 3
+    return {"BM": bm, "BN": bn, "BK": bk, "LUT": 1, "MSUB": 1}, warps, 3
 
 
 CONFIGS_USED = {}
@@ -500,6 +528,8 @@ def nf4_grouped_spec(param, preprocess, compute_dtype, mode = None):
 
 def maybe_nf4_grouped_mm(inputs, offsets, source, preprocess):
     """Fused NF4 base GEMM for a frozen 4-bit expert stack, or None to keep the current path."""
+    if nf4_fused_mode() == "auto" and not nf4_auto_fused(inputs.shape[0], offsets.shape[0]):
+        return None
     try:
         spec = nf4_grouped_spec(source, preprocess, inputs.dtype)
     except Exception:

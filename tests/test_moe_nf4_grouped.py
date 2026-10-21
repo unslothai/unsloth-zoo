@@ -174,6 +174,26 @@ def test_run_to_run_bitwise(monkeypatch):
     assert all(torch.equal(ys[0], y) for y in ys[1:])
 
 
+@pytest.mark.parametrize("kn_layout", [True, False])
+def test_two_m_subtiles_match_one(kn_layout, monkeypatch):
+    # MSUB 2 reuses one decoded weight tile for two BM row blocks: same per-row sums, same bits.
+    torch.manual_seed(11)
+    E, K, N = 6, 192, 256
+    dt = torch.bfloat16 if HAS_BF16 else torch.float16
+    p = _stack((E, K, N) if kn_layout else (E, N, K), dt, True)
+    spec = _spec(p, kn_layout, dt)
+    offsets = _routing(E, [70, 0, 129, 1, 64, 300])
+    x = torch.randn(564, K, device = DEVICE, dtype = dt, requires_grad = True)
+    dy = torch.randn(564, N, device = DEVICE, dtype = dt)
+    outs = []
+    for msub in (1, 2):
+        monkeypatch.setattr(nf, "_fixed_config", lambda m, i, o, pair, msub = msub: (
+            {"BM": 64, "BN": 64 if pair == 1 else 128, "BK": 64, "LUT": 1, "MSUB": msub}, 4, 3))
+        y = nf.nf4_grouped_mm(x, offsets, spec)
+        outs.append((y, torch.autograd.grad(y, x, dy)[0]))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+
+
 def _saved(spec, offsets):
     return (
         spec["packed"], spec["absmax"], spec["code"], spec["absmax2"], spec["code2"], spec["offset"], offsets,
@@ -246,6 +266,70 @@ def test_launch_failure_falls_back_per_shape(monkeypatch):
     pre = lambda w: w.transpose(-2, -1)
     monkeypatch.setenv("UNSLOTH_MOE_NF4_FUSED", MODE)
     assert nf.maybe_nf4_grouped_mm(x, offsets, p, pre) is None   # that stack now keeps the dequant path
+
+
+def test_auto_switch_boundary(monkeypatch):
+    # auto: fused at or below the rows-per-expert limit (from shapes), the dequant path above it.
+    torch.manual_seed(9)
+    E, K, N = 8, 128, 192
+    dt = torch.bfloat16 if HAS_BF16 else torch.float16
+    p = _stack((E, N, K), dt, True)
+    w = _logical(_dequant(p), False)
+    pre = lambda t: t.transpose(-2, -1)
+    monkeypatch.setenv("UNSLOTH_MOE_NF4_FUSED", "auto" if HAS_BF16 else "force")
+    monkeypatch.setenv("UNSLOTH_MOE_NF4_AUTO_MAX_ROWS", "4")
+    if not HAS_BF16:
+        pytest.skip("auto needs sm80+")
+    for M, fused in ((31, True), (32, True), (33, False), (64, False)):
+        counts = [M // E] * E
+        counts[0] += M - sum(counts)
+        offsets = _routing(E, counts)
+        x = torch.randn(M, K, device = DEVICE, dtype = dt)
+        before = nf.NF4_FUSED_STATS["launches"]
+        y = nf.maybe_nf4_grouped_mm(x, offsets, p, pre)
+        assert (y is not None) == fused and (nf.NF4_FUSED_STATS["launches"] > before) == fused
+        if fused:
+            y64, yd = _oracle(x, w, offsets)
+            assert _err(y, y64)[1] <= 2 * _err(yd, y64)[1] + 1e-6
+    monkeypatch.setenv("UNSLOTH_MOE_NF4_FUSED", "1")
+    assert nf.maybe_nf4_grouped_mm(x, offsets, p, pre) is not None   # "1" ignores the limit
+
+
+def test_auto_branch_fullgraph(monkeypatch):
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+
+    if not HAS_BF16 or not hasattr(torch, "_grouped_mm"):
+        pytest.skip("auto needs sm80+ and torch._grouped_mm")
+    monkeypatch.setenv("UNSLOTH_MOE_NF4_AUTO_MAX_ROWS", "4")
+    torch.manual_seed(10)
+    E, K, N = 8, 128, 192
+    p = _stack((E, N, K), torch.bfloat16, True)
+    spec = _spec(p, False, torch.bfloat16)
+    w = _logical(_dequant(p), False).contiguous()
+
+    def fn(h, offsets):
+        if nf.nf4_auto_fused(h.shape[0], E):
+            y = nf.nf4_grouped_mm(h, offsets, spec)
+        else:
+            y = torch._grouped_mm(h, w, offs = offsets)
+        return y.float().square().sum()
+
+    torch._dynamo.reset()
+    counters.clear()
+    compiled = torch.compile(fn, fullgraph = True)
+    for M in (16, 24, 32, 40, 64, 48):
+        h = torch.randn(M, K, device = DEVICE, dtype = torch.bfloat16, requires_grad = True)
+        torch._dynamo.mark_dynamic(h, 0)
+        offsets = _routing(E, [M // E] * E)
+        loss = compiled(h, offsets)
+        (g,) = torch.autograd.grad(loss, h)
+        h2 = h.detach().clone().requires_grad_()
+        (g_ref,) = torch.autograd.grad(_oracle_loss(h2, torch.eye(K, device = DEVICE, dtype = torch.bfloat16), w, offsets), h2)
+        assert _err(g, g_ref.double())[1] < 2e-2
+    assert sum(counters["graph_break"].values()) == 0
+    # One graph per side of the row guard: the boundary costs exactly one recompile.
+    assert counters["stats"]["unique_graphs"] == 2
 
 
 def test_opcheck():
