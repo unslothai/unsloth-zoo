@@ -535,7 +535,6 @@ class _ExpertSlots:
         self.map = mx.zeros((experts,), dtype = mx.int32)  # expert -> slot, valid while resident
         # Built here: MLX streams are thread-bound, so a lazy table would fail on any other thread.
         mx.eval(list(self.arrays.values()), self.map)
-        # Misses are read straight into the slots' memory, unless a field is cast at load.
         self.views = None if any(field.cast is not None for _, _, field in fields) else [
             memoryview(self.arrays[projection, name]).cast("B") for projection, name, _ in fields
         ]
@@ -585,8 +584,7 @@ class _ExpertSlots:
         return self.map[indices].astype(indices.dtype)
 
     def read_by(self, *outputs):
-        """Keep ``outputs``, computed from the slots, for the next miss to evaluate first; once more
-        than a few, or more than ``_PENDING_BYTES`` in all, are kept, they are evaluated now."""
+        """Keep ``outputs`` (slot readers) for the next miss to evaluate; too many or too large: now."""
         if self.views is None:  # misses scatter into new arrays: nothing pending can see them
             return
         if self.reader_thread is not threading.current_thread():
@@ -598,8 +596,7 @@ class _ExpertSlots:
             self._settle_readers()
 
     def _settle_readers(self):
-        # Another thread's lazy readers cannot be evaluated here (MLX command encoders are thread
-        # local from 0.31.2); that thread's call has returned, so they are dropped, not evaluated.
+        # Another thread's lazy readers cannot be evaluated here (thread-local MLX encoders, >= 0.31.2): drop them.
         if self.readers and self.reader_thread is threading.current_thread():
             mx.eval(self.readers)
         self.readers.clear()

@@ -358,7 +358,7 @@ def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
     assert isinstance(glu, OffloadSwitchGLU) and not tree_flatten(model.parameters())
     assert report["layers"] == 1 and report["on_disk_bytes"] == table_bytes
     slots = max(8, int(64 * (1 - fraction)))
-    assert glu._slots.views is not None  # misses read straight into the slots
+    assert glu._slots.views is not None
     assert glu._slots.capacity == slots and report["resident_bytes"] == table_bytes * slots // 64
     # Only a downstream expression of each output is kept, while later calls evict its experts.
     actual = [glu(*call) * 1 for call in calls]
@@ -431,7 +431,7 @@ def test_a_request_threads_lazy_output_does_not_fail_the_next(tmp_path):
         thread = threading.Thread(target = run, args = args)
         thread.start()
         thread.join(timeout = 120)
-    assert not errors and len(results) == 3 and glu._slots.misses > misses[1]  # the second thread read
+    assert not errors and len(results) == 3 and glu._slots.misses > misses[1]
     for got, want in zip(results, expected):
         np.testing.assert_array_equal(got, _bits(want))
 
@@ -486,15 +486,15 @@ def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
         actual = offloaded.layers[0].switch_mlp(x, indices)
         assert actual.dtype == expected.dtype == mx.bfloat16
         np.testing.assert_array_equal(_bits(actual), _bits(expected))
-    assert not offloaded.layers[0].switch_mlp._slots.readers  # buffered misses keep no readers
+    assert not offloaded.layers[0].switch_mlp._slots.readers
 
 
 def test_slot_readers_kept_are_bounded_in_bytes(monkeypatch):
     monkeypatch.setattr(zoo_offload, "_PENDING_BYTES", 1000)
     slots = zoo_offload._ExpertSlots([], 4, 2)
     for _ in range(3):
-        slots.read_by(mx.zeros((100,), dtype = mx.float32) + 1)  # 400 bytes each
-    assert len(slots.readers) == 0  # 1200 bytes kept in all: evaluated, not held
+        slots.read_by(mx.zeros((100,), dtype = mx.float32) + 1)
+    assert len(slots.readers) == 0
 
 
 def test_concurrent_offloaded_loads_restore_the_cache_limit(monkeypatch):
