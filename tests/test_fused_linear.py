@@ -1364,6 +1364,9 @@ def test_tile_cap_leaves_large_and_half_layouts_alone(monkeypatch):
     # From 4096 rows the fp32 budget tile is already 16384 columns; half-logit layouts keep the budget tile.
     dev = torch.device("cpu")
     monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: 2 * 1024**3)
+    # The CUDA tile budget (ROCm's 8 MB one already keeps half tiles under 16384 columns) and an explicit cap.
+    monkeypatch.setattr(fl, "_BWD_TILE_BYTES", 256 * 1024**2)
+    monkeypatch.setattr(fl, "_FWD_TILE_COLS", 16384)
     for n in (4096, 8192, 65536):
         for bpl in (2, 4):
             capped = fl._tiled_layout(n, 151936, 0, bpl, dev)
