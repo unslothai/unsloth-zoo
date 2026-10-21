@@ -5541,18 +5541,11 @@ def _experts_are_input_major(module, name, in_dim) -> bool:
     return getattr(module, name).shape[-1] != in_dim
 
 
-# Eager engagement of _triton_moe_compute_dtype: "cast" = float32 activations into bf16 experts ran
-# the GEMMs after gate_up in bf16, "kept_fp32" = the same case with UNSLOTH_MOE_TRITON_FP32=1.
 TRITON_MOE_COMPUTE_DTYPE_STATS = {"cast": 0, "kept_fp32": 0}
 
 
 def _triton_moe_compute_dtype(module, hidden_states):
-    """bf16 for float32 activations into bf16 experts (full finetuning upcasts the norms), else the input's.
-
-    transformers' experts under autocast, the grouped_mm backend and autocast's non-MoE Linears all
-    run these GEMMs on bf16 operands with bf16 outputs. UNSLOTH_MOE_TRITON_FP32=1 keeps float32.
-    Float16 experts and UNSLOTH_FORCE_FLOAT32 are left alone: a float16 output can overflow.
-    """
+    """bf16 for float32 activations into bf16 experts (matches autocast); float16 is left alone (overflow)."""
     if hidden_states.dtype != torch.float32:
         return hidden_states.dtype
     for name in ("gate_up_proj", "down_proj"):
@@ -5562,7 +5555,7 @@ def _triton_moe_compute_dtype(module, hidden_states):
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
         return hidden_states.dtype
     keep = os.environ.get("UNSLOTH_MOE_TRITON_FP32", "0") == "1"
-    # Eager only: Dynamo would specialise on the counter value and recompile on every call.
+    # Eager only: Dynamo would recompile on every counter value.
     if not torch.compiler.is_compiling():
         TRITON_MOE_COMPUTE_DTYPE_STATS["kept_fp32" if keep else "cast"] += 1
     return hidden_states.dtype if keep else torch.bfloat16
@@ -5613,8 +5606,7 @@ def forward_triton_grouped_gemm(
         num_tokens, hidden_dim = hidden_states.shape
 
     top_k = top_k_index.shape[1]
-    # Float32 activations into bf16 experts: gate_up still reads the float32 X (the kernel rounds it
-    # to bf16 itself, and its dX stays float32 through the top-k sum), everything after it is bf16.
+    # gate_up still reads float32 X (dX stays float32); everything after it runs in compute_dtype.
     compute_dtype = _triton_moe_compute_dtype(self, hidden_states)
 
     # Cache model dims and kernel configs on first call.

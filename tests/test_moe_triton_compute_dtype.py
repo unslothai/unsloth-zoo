@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Full finetuning feeds float32 activations (upcast norms) into bf16 experts. The Triton backend
-kept every GEMM after gate_up in float32 (TF32 dW, float32 activations), unlike transformers under
-autocast and the grouped_mm backend, which run them on bf16 operands. gate_up keeps its float32 X
-(the kernel rounds X to bf16 itself and its dX stays float32 through the top-k sum); the rest runs
-in bf16, and the routing weights and the top-k sum stay float32. UNSLOTH_MOE_TRITON_FP32=1 restores
-the float32 path.
-"""
+"""Float32 activations into bf16 experts: the Triton MoE path runs post-gate_up GEMMs in bf16."""
 
 import sys
 import types
@@ -125,7 +119,6 @@ def _run(experts, dtype):
 def test_float32_activations_run_down_in_bf16(setup):
     out, dX, dgu, ddn = _run(_experts(torch.bfloat16), torch.float32)
     assert CALLS == [("gate_up", torch.float32), ("down", torch.bfloat16)]
-    # Routing weights and the top-k sum stay float32, as does the gate_up input gradient.
     assert out.dtype == torch.float32 and dX.dtype == torch.float32
     assert dgu.dtype == torch.bfloat16 and ddn.dtype == torch.bfloat16
     assert TUNED == [torch.float32, torch.bfloat16]
@@ -142,7 +135,6 @@ def test_kill_switch_keeps_float32(setup):
 
 
 def test_bf16_matches_transformers_under_autocast(setup):
-    # transformers' eager experts loop under autocast(bf16) on the same float32 input.
     experts = _experts(torch.bfloat16)
     X, idx, w = _inputs(torch.float32)
     ours = forward_triton_grouped_gemm(experts, X, idx, w)
@@ -153,7 +145,6 @@ def test_bf16_matches_transformers_under_autocast(setup):
             gate, up = (X[t].to(torch.bfloat16) @ experts.gate_up_proj[e].T).chunk(2, dim = -1)
             h = F.silu(gate) * up
             ref[t] += (h @ experts.down_proj[e].T).float() * w[t, k]
-    # gate_up rounds its float32 accumulator once (float32 then bf16) where autocast rounds once.
     torch.testing.assert_close(ours, ref, rtol = 2e-2, atol = 2e-2)
 
 
