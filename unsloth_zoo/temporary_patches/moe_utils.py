@@ -1157,6 +1157,19 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
+def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_type, experts_module):
+    """UNSLOTH_MOE_NF4_FUSED: a frozen NF4 Params4bit stack decoded inside the grouped GEMM (forward
+    and dX), no dense dequantized stack. None (off, or an unsupported stack) keeps the path below."""
+    if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
+        return None
+    try:
+        from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm
+    except ImportError:
+        return None
+    preprocess = lambda w: preprocess_weight(w, proj_type, hidden_dim, model_type, experts_module = experts_module)
+    return maybe_nf4_grouped_mm(inputs, offsets, source, preprocess)
+
+
 # UNSLOTH_MOE_SELECTIVE_DEQUANT: "auto" = num_rows experts on device (sync-free) if rows <= 7/8 E;
 # "1" = exact routed set (one host sync); "0" = full stack.
 SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
@@ -5183,6 +5196,8 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype), _gate_up_layout,
             )
         else:
+            mm1_out = _nf4_fused_base_mm(permuted_input, offsets, _gate_up_src, "gate_up", hidden_dim, model_type, self)
+        if _gate_up_layout is None and mm1_out is None:
             _recompute = _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype)
             if _recompute:
                 selective_plan = _selective_dequant_plan(
@@ -5380,6 +5395,8 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype), _down_layout,
             )
         else:
+            mm2_out = _nf4_fused_base_mm(inter, offsets, _down_src, "down", hidden_dim, model_type, self)
+        if _down_layout is None and mm2_out is None:
             _recompute = _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype)
             mm2_out = _base_grouped_mm(
                 inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None,
