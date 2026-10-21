@@ -99,18 +99,18 @@ def test_xpu_bf16_uses_native_conversions(on_xpu, flags, expected):
 
 
 @not_on_macos
+@pytest.mark.parametrize("current", [0, 1])
 @pytest.mark.parametrize(
-    "flags, current, expected",
+    "flags, expected",
     [
-        ((True, _PROVEN_NO_BF16), 0, True),   # unused non-native iGPU beside the used dGPU
-        ((_PROVEN_NO_BF16, True), 1, True),
-        ((True, _PROVEN_NO_BF16), 1, False),  # the used device is the non-native one
-        ((_PROVEN_NO_BF16, True), 0, False),
-        ((True, False), 1, True),             # aspects unreadable on the used device: unproven
-        ((False, True), 1, True),
+        ((True, _PROVEN_NO_BF16), False),  # any visible proven non-native XPU, whichever is current
+        ((_PROVEN_NO_BF16, True), False),
+        ((True, False), True),             # aspects unreadable on that device: unproven there
+        ((False, True), True),
+        ((_PROVEN_NO_BF16, False), False),
     ],
 )
-def test_xpu_bf16_judges_the_current_device_only(on_xpu, flags, current, expected):
+def test_xpu_bf16_judges_each_device_by_its_own_aspects(on_xpu, flags, current, expected):
     on_xpu(_fake_xpu(flags, current = current))
     assert dt.device_is_bf16_supported() is expected
     assert dt._xpu_bf16_supported() is expected
@@ -168,7 +168,7 @@ def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
     monkeypatch.setattr(gc, "DEVICE_TYPE_TORCH", "cuda")
     try:
         got = {}
-        for flags in ((True,), (False,), (_PROVEN_NO_BF16,), (_MISSING,), (True, _PROVEN_NO_BF16), (_PROVEN_NO_BF16, True)):
+        for flags in ((True,), (False,), (_PROVEN_NO_BF16,), (_MISSING,), (True, _PROVEN_NO_BF16), (_PROVEN_NO_BF16, True), (True, False)):
             monkeypatch.setattr(torch, "xpu", _fake_xpu(flags), raising = False)
             gc.CPU_BUFFERS = []
             gc.initialize_unsloth_gradient_checkpointing()
@@ -184,8 +184,9 @@ def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
     assert got[(_MISSING,)] is torch.bfloat16
     assert got[(False,)] is torch.bfloat16
     assert got[(_PROVEN_NO_BF16,)] is torch.float16
-    assert got[(True, _PROVEN_NO_BF16)] is torch.float16  # current device is the last one
-    assert got[(_PROVEN_NO_BF16, True)] is torch.bfloat16
+    assert got[(True, _PROVEN_NO_BF16)] is torch.float16
+    assert got[(_PROVEN_NO_BF16, True)] is torch.float16
+    assert got[(True, False)] is torch.bfloat16
 
 
 @pytest.fixture
@@ -245,7 +246,8 @@ def _vllm_dtype_block(vu):
         ((_PROVEN_NO_BF16,), "bfloat16", "bfloat16"),  # explicit bf16 still runs (emulated)
         ((_PROVEN_NO_BF16,), "float16", "float16"),
         ((True,), None, "bfloat16"),
-        ((True, _PROVEN_NO_BF16), None, "float16"),    # current device is the last one
+        ((True, _PROVEN_NO_BF16), None, "float16"),    # any visible non-native XPU
+        ((_PROVEN_NO_BF16, True), None, "float16"),
     ],
 )
 def test_vllm_xpu_dtype_keeps_explicit_bf16(on_xpu, vu, flags, dtype, expected):

@@ -612,9 +612,10 @@ def device_empty_cache():
 pass
 
 def _xpu_bf16_supported():
-    """is_bf16_supported() counts emulation. Judge the current XPU only, not unused visible ones.
-    Without libocloc (absent in torch-xpu wheels) every SYCL aspect reads False, so trust
-    has_bfloat16_conversions only once some aspect reads True on that same device."""
+    """is_bf16_supported() counts emulation. Process-wide like CUDA: any visible XPU proven to lack
+    native bf16 turns it off, since neither the load target nor vLLM's device is known here. Each
+    device is judged by its own aspects: without libocloc (absent in torch-xpu wheels) every SYCL
+    aspect reads False, so trust has_bfloat16_conversions only once some aspect reads True there."""
     # An older unsloth still answers bf16 on XPU: keep that so loading and training agree.
     unsloth_device_type = sys.modules.get("unsloth.device_type")
     if unsloth_device_type is not None and not hasattr(unsloth_device_type, "xpu_supports_native_bf16"):
@@ -626,13 +627,18 @@ def _xpu_bf16_supported():
         "has_subgroup_2d_block_io",
     )
     try:
-        index = 0 if torch.xpu.device_count() <= 1 else torch.xpu.current_device()
-        props = torch.xpu.get_device_properties(index)
+        count = torch.xpu.device_count()
     except Exception:
         return True
-    lacks_bf16 = getattr(props, "has_bfloat16_conversions", True) is False
-    probe_works = any(getattr(props, name, False) is True for name in aspects)
-    return not (lacks_bf16 and probe_works)
+    for index in range(count):
+        try:
+            props = torch.xpu.get_device_properties(index)
+        except Exception:
+            continue
+        lacks_bf16 = getattr(props, "has_bfloat16_conversions", True) is False
+        if lacks_bf16 and any(getattr(props, name, False) is True for name in aspects):
+            return False
+    return True
 pass
 
 def _apple_bf16_supported():
