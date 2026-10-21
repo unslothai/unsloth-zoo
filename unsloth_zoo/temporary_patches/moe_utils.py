@@ -1158,8 +1158,7 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
 
 
 def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_type, experts_module):
-    """UNSLOTH_MOE_NF4_FUSED: a frozen NF4 Params4bit stack decoded inside the grouped GEMM (forward
-    and dX), no dense dequantized stack. None (off, or an unsupported stack) keeps the path below."""
+    """UNSLOTH_MOE_NF4_FUSED grouped GEMM on a frozen NF4 stack; None keeps the dequant path."""
     if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
         return None
     try:

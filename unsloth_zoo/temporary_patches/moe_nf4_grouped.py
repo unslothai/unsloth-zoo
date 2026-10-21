@@ -13,24 +13,13 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Grouped GEMM over expert-sorted rows that decodes bitsandbytes NF4 expert stacks in the K loop.
+"""Grouped GEMM over expert-sorted rows decoding bitsandbytes NF4 expert stacks in the K loop.
 
-  y[m] = x[m] @ W[e(m)]      W: frozen Params4bit stack, logical [E, K, N], never dequantized whole
-
-The packed bytes, absmax (plain fp32 or nested uint8 codes + second-level absmax + offset) and the
-codebook are read tile by tile and decoded exactly as bitsandbytes does (nested: code2[q] * absmax2
-then + offset in fp32; element: code[nibble] * absmax in fp32, rounded to the stack dtype, then to
-the compute dtype), so each decoded weight equals the dequantize_4bit one. Backward is dX only
-(dX = dY @ W[e].T) through the same kernel with the element strides swapped: it reads the original
-packed indexing and scales, never a transposed copy. No dense expert stack is allocated in forward
-or backward; only the packed tensors are saved for backward.
-
-Opt-in: UNSLOTH_MOE_NF4_FUSED=1 (CUDA sm80+, not ROCm), =auto (sm80+ and at most
-UNSLOTH_MOE_NF4_AUTO_MAX_ROWS, default 128, average rows per expert, from shapes) or =force (any
-CUDA device Triton runs on; sm75 lowers tl.dot to CUDA-core FMA, 60x+ slower on T4). Measured on L4
-bf16 (Qwen3-30B-A3B layer shapes): faster than dequant + grouped_mm up to 128 rows per expert,
-slower from 256, always without the dense stack. Anything unsupported returns None and the caller keeps the dequantize + grouped_mm
-path. UNSLOTH_MOE_NF4_AUTOTUNE=1 tunes tiles per shape (run-to-run bits then follow the pick)."""
+Decode matches dequantize_4bit bitwise (same fp32 rounding order); backward is dX only via swapped
+strides on the packed tensors, so no dense expert stack is ever allocated.
+UNSLOTH_MOE_NF4_FUSED=1 (CUDA sm80+, not ROCm), =auto (sm80+, at most UNSLOTH_MOE_NF4_AUTO_MAX_ROWS,
+default 128, rows per expert: slower than dequant from 256 on L4), =force (any CUDA; sm75 is 60x+
+slower). UNSLOTH_MOE_NF4_AUTOTUNE=1 tunes tiles per shape (bits then follow the pick)."""
 
 __all__ = [
     "NF4_FUSED_STATS",
@@ -247,8 +236,7 @@ if triton is not None:
                 nib = tl.where((flat % 2) == 0, q >> 4, q & 15).to(tl.int32)
                 s = _scale(flat // BS, bmask, ABSMAX, CODE2, ABSMAX2, OFFSET, BS2, NESTED)
                 b = (_code(nib, CODE, LUT) * s).to(W_DT).to(out_dt)
-            # Masked weights decode to finite values (code[0] * offset at most) against zero A columns
-            # or unstored output columns, so no select is needed here.
+            # Masked weights decode finite against zero A / unstored columns: no select needed.
             acc = tl.dot(a, b, acc)
             if MSUB == 2:
                 a1 = tl.load(A + offs_m1[:, None] * I + offs_k[None, :], mask = mask_m1[:, None] & mask_k[None, :], other = 0.0)
@@ -272,7 +260,6 @@ def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer,
         pair = 2
     else:
         pair = 0
-    # Autotune bucket: average rows per expert, rounded to a power of two.
     m_hint = triton.next_power_of_2(max(1, M // max(E, 1)))
     grid = lambda meta: (triton.cdiv(M, meta["BM"] * meta["MSUB"]) + E, triton.cdiv(outer, meta["BN"]))
     key = (inner, outer, s_i, s_j)
@@ -369,7 +356,6 @@ _W_DTYPE_ID = {v: k for k, v in _W_DTYPE_CODE.items()}
 
 
 def _strides(kn_layout, K, N):
-    # Element (k, n) of one expert: stored [K, N] row major (kn_layout) or [N, K] row major.
     return (N, 1) if kn_layout else (1, K)
 
 

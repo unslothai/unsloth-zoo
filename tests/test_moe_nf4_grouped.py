@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_MOE_NF4_FUSED: NF4 decode inside the grouped GEMM. Decode is bitwise the bitsandbytes
-dequant, forward and dX sit within the dequant + same-dtype GEMM error of an fp64 oracle, the op
-compiles fullgraph without graph breaks or recompiles, and the MoE forward with LoRA matches the
-dequant path in output and every gradient."""
+"""UNSLOTH_MOE_NF4_FUSED: bitwise bnb decode, fp64-oracle accuracy, fullgraph compile, LoRA parity."""
 import os
 
 import pytest
@@ -145,7 +142,6 @@ def test_forward_and_dx_vs_fp64_oracle(case, dtype):
 @pytest.mark.parametrize("kn_layout", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_decode_is_bitwise_bitsandbytes(nested, kn_layout, dtype, lut, monkeypatch):
-    # Identity rows pick each weight out exactly (one product per output, fp32 accumulate).
     fixed = nf._fixed_config
     monkeypatch.setattr(nf, "_fixed_config", lambda *a: ({**fixed(*a)[0], "LUT": lut},) + fixed(*a)[1:])
     torch.manual_seed(1)
@@ -178,7 +174,6 @@ def test_run_to_run_bitwise(monkeypatch):
 
 @pytest.mark.parametrize("kn_layout", [True, False])
 def test_two_m_subtiles_match_one(kn_layout, monkeypatch):
-    # MSUB 2 reuses one decoded weight tile for two BM row blocks: same per-row sums, same bits.
     torch.manual_seed(11)
     E, K, N = 6, 192, 256
     dt = torch.bfloat16 if HAS_BF16 else torch.float16
