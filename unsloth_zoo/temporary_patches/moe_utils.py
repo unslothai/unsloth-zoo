@@ -1856,9 +1856,21 @@ def select_moe_backend_for_interleaved_gate_up():
     """select_moe_backend() for interleaved gate_up (GPT-OSS), which Triton cannot run: grouped_mm, not the loop."""
     # This Unsloth Zoo code section is licensed under AGPL3
     backend = select_moe_backend()
-    if backend == "unsloth_triton" and _check_torch_grouped_mm_supported():
+    if backend in ("unsloth_triton", "sonic_moe") and _check_torch_grouped_mm_supported():
         return "grouped_mm"
     return backend
+
+
+def _check_sonic_moe_available():
+    """Opt-in kernels-community/sonic-moe backend. Lazy, guarded import: safe with no CUDA,
+    no `kernels` and no sonic-moe installed."""
+    if os.environ.get("UNSLOTH_DISABLE_MOE_SONIC", "0") == "1":
+        return False
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils_sonic import sonic_moe_available
+        return sonic_moe_available()
+    except Exception:
+        return False
 
 
 def _select_moe_backend():
@@ -1870,6 +1882,15 @@ def _select_moe_backend():
             return "unsloth_triton"
         if requested == "native_torch":
             return "native_torch"
+        # Opt-in only, never auto-selected; it still needs torch._grouped_mm for the
+        # rank-r LoRA GEMMs and every shape it falls back on.
+        if (
+            requested == "sonic_moe"
+            and _check_torch_grouped_mm_supported()
+            and _check_sonic_moe_available()
+        ):
+            _log_info("Unsloth: Using MoE backend 'sonic_moe'")
+            return "sonic_moe"
         _log_info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
     if _check_torch_grouped_mm_supported():
@@ -1981,6 +2002,17 @@ def forward_moe_backend(
             return result
 
     backend = select_moe_backend()
+    if backend == "sonic_moe":
+        # Absolute import for the unsloth_compiled_cache copy of this function. It falls
+        # back to forward_native_grouped_mm itself for anything it cannot run.
+        forward_sonic_moe = None
+        try:
+            from unsloth_zoo.temporary_patches.moe_utils_sonic import forward_sonic_moe
+        except ImportError:
+            pass
+        if forward_sonic_moe is not None:
+            return forward_sonic_moe(self, hidden_states, top_k_index, top_k_weights)
+        backend = "grouped_mm"
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
     # Triton kernels assume split gate_up, SiLU, no bias: interleaved GPT-OSS gate_up takes the eager loop.
