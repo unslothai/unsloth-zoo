@@ -392,8 +392,10 @@ def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
     assert isinstance(glu, OffloadSwitchGLU) and not tree_flatten(model.parameters())
     assert report["layers"] == 1 and report["on_disk_bytes"] == table_bytes
     slots = max(8, int(64 * (1 - fraction)))
+    assert glu._slots.views is not None
     assert glu._slots.capacity == slots and report["resident_bytes"] == table_bytes * slots // 64
-    actual = [glu(*call) for call in calls]
+    # Only a downstream expression of each output is kept, while later calls evict its experts.
+    actual = [glu(*call) * 1 for call in calls]
     actual += [_verifier_steps(glu, *call) for call in calls[5:7]]
     for got, want in zip(actual, expected):
         assert got.shape == want.shape
@@ -431,6 +433,39 @@ def test_offloaded_experts_run_on_another_thread(tmp_path):
     thread.start()
     thread.join(timeout = 120)
     assert len(results) == len(calls)
+    for got, want in zip(results, expected):
+        np.testing.assert_array_equal(got, _bits(want))
+
+
+def test_a_request_threads_lazy_output_does_not_fail_the_next(tmp_path):
+    # A prefill drops its last layer's output unevaluated; the next request runs on another thread.
+    stock = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    model = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    offload_experts(model, str(tmp_path), 0.75)
+    glu = model.layers[0].switch_mlp
+    calls = _moe_calls(mx.bfloat16)
+    expected = [stock.layers[0].switch_mlp(*call) for call in calls[1:4]]
+    mx.eval(calls, expected)
+    results, errors = [], []
+
+    def run(evaluate, *chosen):
+        try:
+            with mx.stream(mx.new_stream(mx.gpu)):
+                for call in chosen:
+                    out = glu(*call)
+                    if evaluate:
+                        mx.eval(out)
+                        results.append(_bits(out))
+        except Exception as error:
+            errors.append(error)
+
+    misses = []
+    for args in ((False, calls[0]), (True, *calls[1:4])):
+        misses.append(glu._slots.misses)
+        thread = threading.Thread(target = run, args = args)
+        thread.start()
+        thread.join(timeout = 120)
+    assert not errors and len(results) == 3 and glu._slots.misses > misses[1]
     for got, want in zip(results, expected):
         np.testing.assert_array_equal(got, _bits(want))
 
@@ -641,6 +676,7 @@ def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
     offloaded = _lazy_copy(lambda: _moe("vlm", scales = mx.float16, eval = False), str(tmp_path))
     _convert_mlx_dtype(stock, mx.bfloat16)
     offload_experts(offloaded, str(tmp_path), 0.75, cast_dtype = mx.bfloat16)
+    assert offloaded.layers[0].switch_mlp._slots.views is None
     stock.eval()
     offloaded.eval()
     for x, indices in _moe_calls(mx.bfloat16)[::2]:
@@ -648,6 +684,15 @@ def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
         actual = offloaded.layers[0].switch_mlp(x, indices)
         assert actual.dtype == expected.dtype == mx.bfloat16
         np.testing.assert_array_equal(_bits(actual), _bits(expected))
+    assert not offloaded.layers[0].switch_mlp._slots.readers
+
+
+def test_slot_readers_kept_are_bounded_in_bytes(monkeypatch):
+    monkeypatch.setattr(zoo_offload, "_PENDING_BYTES", 1000)
+    slots = zoo_offload._ExpertSlots([], 4, 2)
+    for _ in range(3):
+        slots.read_by(mx.zeros((100,), dtype = mx.float32) + 1)
+    assert len(slots.readers) == 0
 
 
 def test_concurrent_offloaded_loads_restore_the_cache_limit(monkeypatch):
