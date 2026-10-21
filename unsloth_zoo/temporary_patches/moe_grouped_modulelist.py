@@ -146,8 +146,8 @@ def _view_weight_ok(w):
     if w.stride() != (K * N, 1, K) or (K * n) % 16 or (K * N * n) % 16:
         return False
     try:
-        from .moe_utils import _transposed_view_grouped_mm_is_safe
-        return bool(_transposed_view_grouped_mm_is_safe())
+        from .moe_utils import _transposed_view_safe_on
+        return bool(_transposed_view_safe_on(w.device))
     except Exception:
         return False
 
@@ -1054,6 +1054,7 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lo
         cache = os.environ.get("UNSLOTH_MOE_GROUPED_CACHE") == "1"
     n = 0
     warmed = False
+    warmed_devices = set()
     for module in model.modules():
         spec = _block_is_eligible(module)
         if spec is None:
@@ -1080,6 +1081,20 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lo
             try:
                 from .moe_utils import _transposed_view_grouped_mm_is_safe
                 _transposed_view_grouped_mm_is_safe()
+            except Exception:
+                pass
+        # Same for each other card these experts sit on (device_map="auto" over two GPU models):
+        # only cards holding experts are probed.
+        try:
+            device = next(module.parameters()).device
+        except Exception:
+            device = None
+        if device is not None and device.type in ("cuda", "xpu") and device not in warmed_devices:
+            warmed_devices.add(device)
+            try:
+                from .moe_utils import _grouped_mm_supported_on, _transposed_view_safe_on
+                _grouped_mm_supported_on(device)
+                _transposed_view_safe_on(device)
             except Exception:
                 pass
     if verbose and n:

@@ -16,12 +16,27 @@
 
 """grouped_mm and ROCm crash probes answer per GPU model, probing only the cards experts actually run on."""
 import subprocess
+import sys
 import types
 
 import pytest
 import torch
 
 from unsloth_zoo.temporary_patches import moe_utils
+
+
+@pytest.fixture(autouse = True)
+def _fresh_dynamo_rules():
+    # Torn down after monkeypatch restores torch: a compile under the mocks caches Dynamo's torch
+    # rule map without the real _grouped_mm, which breaks later compiled MoE tests in this process.
+    yield
+    import torch._dynamo
+    import torch._dynamo.trace_rules as trace_rules
+    for name in dir(trace_rules):
+        clear = getattr(getattr(trace_rules, name), "cache_clear", None)
+        if callable(clear):
+            clear()
+    torch._dynamo.reset()
 
 
 @pytest.fixture
@@ -38,7 +53,9 @@ def spoof(monkeypatch):
         monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", None)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", None)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOME", None, raising = False)
-        for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND"):
+        monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
+        for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND",
+                     "_TRANSPOSED_VIEW_SAFE_BY_KIND"):
             monkeypatch.setattr(moe_utils, name, {}, raising = False)
         monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising = False)
         monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising = False)
@@ -234,6 +251,7 @@ def test_rocm_crash_on_unused_card_keeps_grouped_mm(spoof, monkeypatch):
 @pytest.mark.parametrize("var", ["HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"])
 def test_rocm_crash_probe_indexes_into_inherited_mask(spoof, monkeypatch, var):
     spoof(3, hip = "7.1.0")
+    monkeypatch.setattr(sys, "platform", "linux")  # an unsorted mask is not mask order on Windows (below)
     monkeypatch.setenv(var, "5, 2,7")
     children = _record_children(monkeypatch)
     assert all(moe_utils._check_torch_grouped_mm_supported(cuda(i)) for i in range(3))
@@ -283,3 +301,85 @@ def test_routed_grouped_gate_asks_for_the_hidden_states_device():
     import inspect
     from unsloth_zoo.temporary_patches import moe_routed
     assert "_grouped_mm_supported_on(hidden_states.device)" in inspect.getsource(moe_routed)
+
+
+def _fullgraph_gate(monkeypatch, device):
+    import torch._dynamo
+    torch._dynamo.reset()
+    # Dynamo initialises CUDA when told it exists; probes are done by now, so stop spoofing it.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    @torch.compile(fullgraph = True, backend = "eager")
+    def f(x):
+        return x + 1 if moe_utils._grouped_mm_supported_on(device) else x - 1
+    return f(torch.zeros(2))
+
+
+@pytest.mark.parametrize("count, index", [(1, 0), (2, 1), (4, 3)])
+def test_warmed_gate_traces_without_a_break_on_every_same_model_card(spoof, monkeypatch, count, index):
+    # The no-arg warmup leaves every same-model card resolved: a fullgraph trace must not reach the compiler-disabled resolver.
+    seen = spoof(count, models = ["H100"] * count)
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    assert _fullgraph_gate(monkeypatch, cuda(index)).tolist() == [1.0, 1.0]
+    assert seen == [0]
+
+
+def test_absent_grouped_mm_symbol_gate_stays_traceable(spoof, monkeypatch):
+    # torch 2.6 / 2.7: no torch._grouped_mm, the gate is a traceable definitive negative.
+    spoof(1)
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_AVAILABLE", False)
+    assert moe_utils._check_torch_grouped_mm_supported() is False
+    assert _fullgraph_gate(monkeypatch, cuda(0)).tolist() == [-1.0, -1.0]
+
+
+def test_view_probe_runs_on_the_input_card(spoof, monkeypatch):
+    # cuda:0 (unsupported, unused) must not decide whether cuda:1 copies its weights.
+    spoof(2, failing = (0,), models = ["RTX4090", "H100"])
+    probed = []
+    monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: probed.append(d.index) or d.index == 1)
+    assert moe_utils._grouped_mm_supported_on(cuda(1)) is True
+    # Probed with support, in the same eager region: the view check opens no second one.
+    assert probed == [1]
+    def no_second_region(fn): raise AssertionError("second compiler-disabled region")
+    monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_second_region)
+    assert moe_utils._transposed_view_safe_on(cuda(1)) is True
+    assert moe_utils._transposed_view_safe_on(cuda(1)) is True
+    assert probed == [1]
+    assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is None
+
+
+def test_view_probe_same_model_keeps_the_process_wide_flag(spoof, monkeypatch):
+    spoof(2, models = ["H100", "H100"])
+    probed = []
+    monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: probed.append(d.index) or True)
+    assert moe_utils._transposed_view_safe_on(cuda(1)) is True
+    assert moe_utils._transposed_view_grouped_mm_is_safe() is True
+    assert probed == [0]
+
+
+def test_rocm_quoted_mask_is_unquoted(spoof, monkeypatch):
+    spoof(3, hip = "7.1.0")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", '"5,2,7"')
+    children = _record_children(monkeypatch)
+    assert all(moe_utils._check_torch_grouped_mm_supported(cuda(i)) for i in range(3))
+    assert [c[1] for c in children] == [("5", "5"), ("2", "2"), ("7", "7")]
+
+
+@pytest.mark.parametrize("platform, mask, rewritten", [
+    ("linux", "0,GPU-4d2a6f1e8c3b,1", False),   # a UUID may alias an ordinal: keep the parent's view
+    ("win32", "1,0", False),                    # PAL enumerates in physical order, not mask order
+    ("win32", "0,1", True),
+    ("linux", "1,0", True),
+])
+def test_rocm_mask_rewritten_only_when_token_order_is_logical_order(spoof, monkeypatch, platform, mask, rewritten):
+    spoof(2, hip = "7.1.0")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", mask)
+    monkeypatch.setattr(moe_utils.sys, "platform", platform)
+    children = _record_children(monkeypatch)
+    assert all(moe_utils._check_torch_grouped_mm_supported(cuda(i)) for i in range(2))
+    if rewritten:
+        tokens = mask.split(",")
+        assert children == [("0", (tokens[0],) * 2), ("0", (tokens[1],) * 2)]
+    else:
+        assert children == [("0", None), ("1", None)]
