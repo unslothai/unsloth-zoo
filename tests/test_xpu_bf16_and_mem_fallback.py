@@ -260,6 +260,25 @@ def test_vllm_xpu_dtype_keeps_explicit_bf16(on_xpu, vu, flags, dtype, expected):
     assert scope["dtype"] is getattr(torch, expected)
 
 
+@not_on_macos
+@pytest.mark.parametrize("core_keeps, expected", [(True, "bfloat16"), (False, "float16")])
+def test_vllm_xpu_explicit_bf16_follows_the_loading_unsloth(on_xpu, vu, monkeypatch, core_keeps, expected):
+    # An unsloth that downgrades an explicit bf16 load to fp16 shares fp16 weights: vLLM must match.
+    on_xpu(_fake_xpu((_PROVEN_NO_BF16,)))
+    core = types.ModuleType("unsloth.device_type")
+    core.xpu_supports_native_bf16 = lambda: False
+    if core_keeps:
+        core.xpu_keeps_explicit_bf16 = lambda: True
+    monkeypatch.setitem(sys.modules, "unsloth.device_type", core)
+    assert dt.XPU_KEEPS_EXPLICIT_BF16 is True
+    scope = {
+        "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
+        "__package__": "unsloth_zoo", "dtype": torch.bfloat16,
+    }
+    exec(_vllm_dtype_block(vu), scope)
+    assert scope["dtype"] is getattr(torch, expected)
+
+
 @pytest.mark.parametrize(
     "info, expected",
     [

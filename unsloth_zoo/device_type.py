@@ -611,6 +611,17 @@ def device_empty_cache():
             torch.npu.empty_cache()
 pass
 
+# unsloth reads this: an explicit bf16 load on XPU stays bf16 only where vLLM keeps it too.
+XPU_KEEPS_EXPLICIT_BF16 = True
+
+
+def _xpu_keeps_explicit_bf16():
+    """An explicit bf16 request on XPU stays bf16 (emulated if need be), unless an older unsloth
+    loading the same model downgrades it to fp16: then vLLM must too, or the shared weights split."""
+    unsloth_device_type = sys.modules.get("unsloth.device_type")
+    return unsloth_device_type is None or hasattr(unsloth_device_type, "xpu_keeps_explicit_bf16")
+pass
+
 def _xpu_bf16_supported():
     """is_bf16_supported() counts emulation. Process-wide like CUDA: any visible XPU proven to lack
     native bf16 turns it off, since neither the load target nor vLLM's device is known here. Each
