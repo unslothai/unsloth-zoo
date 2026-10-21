@@ -205,7 +205,9 @@ def _sdpa_maybe_muse_glimmer_banded(module, query, key, value, attention_mask,
             except Exception as e:
                 logger.warning_once(
                     f"Unsloth: Muse Glimmer banded sliding fell back to SDPA ({e})")
-        _DEFERRED[0] += 1
+        # Not while compiling: dynamo guards on the value, recompiling every call (unsloth#14063).
+        if not torch.compiler.is_compiling():
+            _DEFERRED[0] += 1
     return _ORIG_SDPA[0](module, query, key, value, attention_mask,
                          dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs)
 

@@ -3809,6 +3809,73 @@ def _warn_fp32_lm_head_set_late():
     return bool(stale)
 
 
+# vLLM's "auto" keeps the Gated DeltaNet state in the model dtype unless the config names one
+# (Qwen3-Next does not); training uses float32, so a bf16 rollout state drifts logprobs.
+_VLLM_MAMBA_SSM_DTYPE_ALIASES = {"fp32": "float32", "bf16": "bfloat16", "fp16": "float16"}
+
+
+def _vllm_mamba_dtype_choices():
+    # vLLM 0.11.2 accepts "auto" / "float32"; later ones add "float16" / "bfloat16".
+    try:
+        import typing
+        from vllm.config.cache import MambaDType
+        choices = tuple(typing.get_args(MambaDType))
+        if choices:
+            return choices
+    except Exception:
+        pass
+    return ("auto", "float32")
+
+
+def _vllm_gdn_reads_ssm_dtype():
+    # Before vLLM 0.17 the Gated DeltaNet state ignores mamba_ssm_cache_dtype.
+    try:
+        import inspect
+        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
+        fn = MambaStateDtypeCalculator.gated_delta_net_state_dtype
+        return "mamba_ssm_cache_dtype" in inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+
+def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices = None, gdn_reads_ssm = None):
+    # (engine args to add, message or None). Unset env: nothing is passed.
+    value = os.environ.get("UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE", "").strip().lower()
+    value = _VLLM_MAMBA_SSM_DTYPE_ALIASES.get(value, value)
+    has_arg = "mamba_ssm_cache_dtype" in engine_arg_keys
+    # Gated DeltaNet only: MiniMax ignores the field and KDA rejects float16.
+    text_config = getattr(config, "text_config", None) or config
+    is_gdn = getattr(text_config, "linear_key_head_dim", None) is not None
+    if is_gdn and has_arg and gdn_reads_ssm is None:
+        gdn_reads_ssm = _vllm_gdn_reads_ssm_dtype()
+    if not value:
+        if (training and has_arg and is_gdn and gdn_reads_ssm
+                and getattr(text_config, "mamba_ssm_dtype", None) is None):
+            return {}, (
+                "Unsloth: vLLM keeps this model's Gated DeltaNet state in the model dtype during "
+                "rollouts. Set UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE=float32 to match training more closely."
+            )
+        return {}, None
+    if not has_arg:
+        return {}, "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: this vLLM has no mamba_ssm_cache_dtype."
+    choices = _vllm_mamba_dtype_choices() if choices is None else choices
+    if value not in choices:
+        return {}, (
+            f"Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE={value!r} ignored: this vLLM accepts {', '.join(choices)}."
+        )
+    if not is_gdn:
+        return {}, (
+            "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: it is only supported for Gated DeltaNet "
+            "models (Qwen3-Next, Qwen3.5)."
+        )
+    if not gdn_reads_ssm:
+        return {}, (
+            "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: this vLLM sizes the Gated DeltaNet "
+            "state from mamba_cache_dtype only (vLLM < 0.17)."
+        )
+    return {"mamba_ssm_cache_dtype": value}, None
+
+
 def _vllm_replayssm_mode():
     # "auto" (unset), "on" or "off".
     value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
@@ -4801,6 +4868,10 @@ def load_vllm(
                 print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
             pass
         pass
+        ssm_dtype_args, ssm_dtype_message = _vllm_mamba_ssm_cache_dtype_args(config, good_keys, training)
+        engine_args.update(ssm_dtype_args)
+        if ssm_dtype_message is not None:
+            print(ssm_dtype_message)
 
         # Read back from engine_args, after the filter above, so the banner can only
         # report what vLLM was given: swap_space left EngineArgs in vLLM 0.18.0.
