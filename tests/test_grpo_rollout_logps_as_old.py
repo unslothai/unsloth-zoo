@@ -69,6 +69,7 @@ def _zoo(new, rollout, advantages, mask, loss_type, delta, sampling = "dropped")
         current_gradient_accumulation_steps = 1, steps_per_generation = 1, num_processes = 1,
         importance_sampling_level = "token", use_vllm = True, vllm_importance_sampling_correction = True,
         vllm_importance_sampling_mode = "token_truncate", vllm_importance_sampling_clip_max = 3.0,
+        rollout_logps_as_old = True,
     )
     return rr.grpo_compute_loss(
         None, new, old.to(new.dtype), sampling_logps, torch.zeros_like(mask), mask, 0.0, advantages, **kwargs,
@@ -98,12 +99,10 @@ DS = [0.0, 1e-8, -1e-8, 1e-4, -1e-4, 1.0, -1.0, 20.0, -20.0, 88.0, -88.0]
 def test_loss_matches_verl_bypass_ppo_clip(d, loss_type, delta):
     new, rollout, advantages, mask = _data(d)
     got = _zoo(new, rollout, advantages, mask, loss_type, delta)[0]
-    # The zoo ratio is not clamped at +-20 like verl's: compare where the two definitions agree.
-    rollout64 = rollout.double()
-    if abs(d) < 20:
-        want = _agg(_verl_bypass_ppo_clip(new.detach(), rollout64, advantages, mask, delta), mask, loss_type)
-        torch.testing.assert_close(got.detach(), want, rtol = 1e-9, atol = 1e-12)
-    assert torch.isfinite(got) or delta is None
+    # Both clamp the log ratio to [-20, 20], so they agree at every gap, 88 nats included.
+    want = _agg(_verl_bypass_ppo_clip(new.detach(), rollout.double(), advantages, mask, delta), mask, loss_type)
+    torch.testing.assert_close(got.detach(), want, rtol = 1e-9, atol = 1e-12)
+    assert torch.isfinite(got)
 
 
 @pytest.mark.parametrize("d", [1e-4, 1.0, 20.0])
@@ -135,6 +134,7 @@ def test_gradcheck_float64():
             loss_type = "dapo", epsilon_low = EPS_LOW, epsilon_high = EPS_HIGH, delta = 3.0,
             max_completion_length = 4, num_items_in_batch = mask.sum(), current_gradient_accumulation_steps = 1,
             steps_per_generation = 1, num_processes = 1, importance_sampling_level = "token",
+            rollout_logps_as_old = True,
         )
         return rr.grpo_compute_loss(None, x, old, None, torch.zeros_like(mask), mask, 0.0, advantages, **kwargs)[0]
 
@@ -143,6 +143,51 @@ def test_gradcheck_float64():
     x = (rollout + 2.0).requires_grad_(True)
     f(x).backward()
     assert torch.all(x.grad[(advantages < 0).unsqueeze(1).expand_as(x) & mask.bool()] == 0)
+
+
+@pytest.mark.parametrize("d", [30.0, 89.0, 100.0, 300.0])
+@pytest.mark.parametrize("delta", [None, 3.0])
+def test_large_rollout_gap_keeps_float32_grads_finite(d, delta):
+    # exp(new - rollout) overflows float32 past ~88.7 nats; the clipped branch's backward is then 0 * inf.
+    new64, rollout, advantages, mask = _data(d)
+    new = new64.detach().float().requires_grad_(True)
+    loss = _zoo(new, rollout, advantages.float(), mask, "dapo", delta)[0]
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(new.grad).all()
+
+
+def test_clamped_path_compiles_fullgraph():
+    torch._dynamo.reset()
+    new64, rollout, advantages, mask = _data(100.0)
+    new = new64.detach().float()
+    old, sampling = rr.grpo_rollout_logps_as_old(rollout)
+    kwargs = dict(
+        loss_type = "dapo", epsilon_low = EPS_LOW, epsilon_high = EPS_HIGH, delta = 3.0, num_items_in_batch = mask.sum(),
+        steps_per_generation = 1, num_processes = 1, rollout_logps_as_old = True,
+    )
+    args = (None, new, old, sampling, torch.zeros_like(mask), mask, 0.0, advantages.float())
+    eager = rr.grpo_compute_loss(*args, **kwargs)
+    compiled = torch.compile(rr.grpo_compute_loss, fullgraph = True, dynamic = True)(*args, **kwargs)
+    torch.testing.assert_close(compiled[0], eager[0], rtol = 1e-5, atol = 1e-6)
+    assert torch.isfinite(compiled[0])
+
+
+def test_default_path_is_not_clamped():
+    # The clamp is only for rollout logprobs as pi_old: the trainer's own pi_old keeps TRL's formula.
+    new, rollout, advantages, mask = _data(30.0)
+    old = rollout.double()
+    kwargs = dict(
+        loss_type = "dapo", epsilon_low = EPS_LOW, epsilon_high = EPS_HIGH, delta = 3.0,
+        max_completion_length = new.shape[1], num_items_in_batch = mask.sum(), current_gradient_accumulation_steps = 1,
+        steps_per_generation = 1, num_processes = 1, importance_sampling_level = "token",
+    )
+    got = rr.grpo_compute_loss(None, new, old, None, torch.zeros_like(mask), mask, 0.0, advantages, **kwargs)
+    coef = (new.detach() - old).exp()  # unclamped
+    a = advantages.unsqueeze(1)
+    per_token = -torch.min(coef.clamp(max = 3.0) * a, coef.clamp(1 - EPS_LOW, 1 + EPS_HIGH) * a)
+    want = (per_token * mask).sum() / mask.sum()
+    torch.testing.assert_close(got[0].detach(), want, rtol = 1e-12, atol = 0)
+    assert float(got[5].detach().max()) > float(torch.tensor(20.0, dtype = torch.float64).exp())
 
 
 def test_helper_refuses_bad_inputs():
@@ -209,7 +254,8 @@ class _Model(torch.nn.Module):
         return types.SimpleNamespace(logits = hidden)
 
 
-def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = True, coef_1 = None, metrics_on = True):
+def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = True, coef_1 = None, metrics_on = True,
+           unscored = None):
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
     monkeypatch.setenv("UNSLOTH_RETURN_HIDDEN_STATES", "0")
@@ -219,7 +265,8 @@ def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = 
     class _Loss:
         @staticmethod
         def apply(new, old, ref, sampling, lm_head, ids, mask, adv, beta, scaler, n_chunks, kwargs, upstream):
-            seen.update(old = old, sampling = sampling, mask = mask.clone(), ids = ids.clone())
+            seen.update(new = new.detach().clone(), old = old, sampling = sampling, mask = mask.clone(), ids = ids.clone(),
+                        kwargs = dict(kwargs))
             zero = torch.zeros(())
             c = torch.ones(mask.shape) if coef_1 is None else coef_1(mask)
             if sampling is not None and correction:
@@ -250,6 +297,8 @@ def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = 
     )
     # Distinct values per row and column, so a misaligned copy cannot pass.
     sampling = -(torch.arange(9, dtype = torch.float32).view(3, 3) + 1) / 10
+    if unscored is not None:
+        sampling[unscored] = float("nan")
     kwargs = dict(loss_type = "dapo", sampling_per_token_logps = sampling)
     if as_old:
         kwargs["rollout_logps_as_old"] = True
@@ -314,6 +363,34 @@ def test_accumulated_loss_metrics_stay_finite_on_an_overflowed_ratio(monkeypatch
         values = metrics["train"][name]
         assert values and all(v == v and abs(v) != float("inf") for v in values), name
     assert torch.isfinite(out[3]).all()
+
+
+def test_unscored_rollout_tokens_get_ratio_one(monkeypatch):
+    # vLLM returns NaN for a token it could not score; the IS path turns that into a neutral ratio.
+    probe = -(torch.arange(9, dtype = torch.float32).view(3, 3) + 1) / 10
+    probe[1, 1] = float("nan")
+
+    def coef_of(mask):
+        # A ratio far from 1 at the unscored token: it must not reach the mismatch sums.
+        return torch.where(torch.isnan(rr.align_logprobs_with_mask(probe, mask)), 5.0, 1.0)
+
+    seen, sampling, out, metrics = _drive(monkeypatch, True, unscored = (1, 1), coef_1 = coef_of)
+    old, new, mask = seen["old"], seen["new"], seen["mask"]
+    assert torch.isfinite(old).all()
+    hole = torch.isnan(rr.align_logprobs_with_mask(sampling, mask))
+    assert hole.sum() == 1 and mask[hole].all()
+    torch.testing.assert_close(old[hole], new[hole].to(old.dtype))
+    keep = mask.bool() & ~hole
+    torch.testing.assert_close(old[keep], rr.align_logprobs_with_mask(sampling, mask)[keep])
+    assert seen["kwargs"]["rollout_logps_as_old"] is True
+    # Left out of the mismatch sums, like the IS path's unscored tokens.
+    assert metrics["train"]["sampling/rollout_kl_k3/mean"] == [0.0]
+    assert metrics["train"]["sampling/rollout_kl_k1/mean"] == [0.0]
+
+
+def test_default_batch_does_not_ask_for_the_clamp(monkeypatch):
+    seen, _, _, _ = _drive(monkeypatch, False)
+    assert "rollout_logps_as_old" not in seen["kwargs"]
 
 
 def test_marker_with_trainer_old_logps_is_refused(monkeypatch):

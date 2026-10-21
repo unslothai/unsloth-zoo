@@ -920,6 +920,11 @@ def grpo_compute_loss(
         log_ratio = new - old
     else:
         log_ratio = new - new.detach()
+    if kwargs.get("rollout_logps_as_old", False):
+        # pi_old is the rollout engine here, whose gap to pi_theta can pass 88 nats: exp overflows in
+        # float32 and the clipped branch's backward is 0 * inf = nan. verl compute_policy_loss_vanilla
+        # clamps the same log ratio to [-20, 20] before exponentiating.
+        log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
 
     if importance_sampling_level == "token":
         log_importance_weights = log_ratio
@@ -2147,6 +2152,17 @@ pass
 RL_REPLACEMENTS["grpo_rollout_logps_as_old"] = grpo_rollout_logps_as_old
 
 
+def grpo_rollout_old_fill_unscored(old_logps, new_logps):
+    """Tokens the rollout engine could not score (vLLM returns NaN) take the current policy's own
+    logprob as pi_old, so their ratio is exactly 1: no correction, as the vLLM importance-sampling
+    path treats them (TRL zeroes their log ratio). Returns (old, unscored mask)."""
+    unscored = ~torch.isfinite(old_logps)
+    filled = torch.where(unscored, new_logps.detach().to(old_logps.dtype), old_logps)
+    return filled, unscored
+pass
+RL_REPLACEMENTS["grpo_rollout_old_fill_unscored"] = grpo_rollout_old_fill_unscored
+
+
 def grpo_rollout_as_old_ratio_metrics(coef_1, mask):
     """(|log r|, r) zero-filled outside the mask, r = pi_theta / pi_rollout per token, for the
     sampling_logp_difference / importance_sampling_ratio metrics when pi_old is the rollout policy.
@@ -2194,6 +2210,7 @@ def grpo_accumulated_loss(
         chunked_selective_log_softmax,
         grpo_rollout_logps_as_old,
         grpo_rollout_as_old_ratio_metrics,
+        grpo_rollout_old_fill_unscored,
     )
     if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
         from unsloth_zoo.rl_replacements import (
@@ -3268,6 +3285,11 @@ def grpo_accumulated_loss(
             if not loss_is_scaled_for_ga:
                 upstream_scale = float(kwargs.get("current_gradient_accumulation_steps", 1))
 
+        _rollout_unscored = None
+        if _rollout_logps_as_old:
+            old_logps, _rollout_unscored = grpo_rollout_old_fill_unscored(old_logps, new_logprobs)
+            # Only on this path: grpo_compute_loss clamps pi_theta / pi_rollout's log to [-20, 20] like verl.
+            kwargs["rollout_logps_as_old"] = True
         with autocaster:
             loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
                 new_logprobs,
@@ -3293,6 +3315,9 @@ def grpo_accumulated_loss(
                     torch.log(coef_1.detach().to(torch.float64)), nan = 0.0, posinf = 670.0, neginf = -670.0,
                 )
                 _log_ratio = torch.where(completion_mask.to(torch.bool), _log_ratio, torch.zeros_like(_log_ratio))
+                if _rollout_unscored is not None:
+                    # Unscored tokens carry no mismatch information: NaN leaves them out of the sums.
+                    _log_ratio = torch.where(_rollout_unscored, torch.full_like(_log_ratio, float("nan")), _log_ratio)
                 # An overflowed ratio is capped (finite squares) so ESS tends to its 1 / N limit, not nan.
                 _ess_weights = torch.clamp(flat_is_ratio.to(torch.float64), max = 1e100)
                 _rollout_stats_args = (_log_ratio, torch.zeros_like(_log_ratio), completion_mask, _ess_weights)
