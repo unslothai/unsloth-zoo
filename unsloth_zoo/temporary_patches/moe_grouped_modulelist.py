@@ -112,6 +112,12 @@ try:
 except Exception:
     _triton_grouped_mm = _triton_grouped_mm_wanted = None
 
+try:
+    from .moe_router_triton import fused_route_or_none as _fused_route_or_none
+except Exception:
+    def _fused_route_or_none(*args, **kwargs):
+        return None
+
 # Hot-path helpers are read as module attributes (one lookup per call, no import machinery);
 # monkeypatching moe_utils / gpt_oss_grouped_qlora still reaches them.
 try:
@@ -198,6 +204,9 @@ def _expert_weight(lin, dtype):
 
 def _route_softmax_topk(self, router_logits, top_k):
     """softmax(fp32) -> top_k -> optional renorm (Mixtral has no norm_topk_prob attr -> True)."""
+    fused = _fused_route_or_none(router_logits, top_k, "softmax_topk", bool(getattr(self, "norm_topk_prob", True)))
+    if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1: one Triton launch, same ids / weights / grads
+        return fused
     rw = F.softmax(router_logits, dim=1, dtype=torch.float32)
     rw, sel = torch.topk(rw, top_k, dim=-1)
     if getattr(self, "norm_topk_prob", True):
@@ -1089,6 +1098,11 @@ def auto_enable_grouped_moe(model):
             enable_grouped_moe(model, verbose=True, stack_lora=True)
     except Exception:
         pass  # optional speedup; never block model loading
+    try:   # UNSLOTH_MOE_FUSED_ROUTER=1: routers re-created by the compiler
+        from .moe_router_triton import enable_fused_router
+        enable_fused_router(model)
+    except Exception:
+        pass
     try:
         # gpt-oss experts have their own grouped path (no torch._grouped_mm needed on fp16).
         if model is not None and hasattr(model, "modules"):

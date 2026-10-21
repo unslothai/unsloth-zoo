@@ -38,6 +38,11 @@ from .utils import (
     Cache,
     process_return,
 )
+try:
+    from .moe_router_triton import fused_route_or_none as _fused_route_or_none
+except Exception:
+    def _fused_route_or_none(*args, **kwargs):
+        return None
 from .moe_utils import (
     _check_grouped_gemm_available,
     _TORCH_GROUPED_MM_AVAILABLE,
@@ -146,14 +151,18 @@ def patch_qwen3_vl_moe():
         def router_forward(self, hidden_states):
             router_logits = self.gate(hidden_states)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
-            if self.norm_topk_prob:
-                routing_weights = routing_weights / routing_weights.sum(
-                    dim=-1, keepdim=True
+            fused = _fused_route_or_none(router_logits, self.top_k, "softmax_topk", bool(self.norm_topk_prob))
+            if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+                routing_weights, selected_experts = fused
+            else:
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
+                routing_weights, selected_experts = torch.topk(
+                    routing_weights, self.top_k, dim=-1
                 )
+                if self.norm_topk_prob:
+                    routing_weights = routing_weights / routing_weights.sum(
+                        dim=-1, keepdim=True
+                    )
             routing_weights = routing_weights.to(hidden_states.dtype)
             router_scores = torch.zeros_like(
                 router_logits, dtype=hidden_states.dtype
@@ -324,14 +333,18 @@ def patch_qwen3_vl_moe():
                     self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True)
                 )
 
-                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-                routing_weights, selected_experts = torch.topk(
-                    routing_weights, top_k, dim=-1
-                )
-                if norm_topk_prob:
-                    routing_weights = routing_weights / routing_weights.sum(
-                        dim=-1, keepdim=True
+                fused = _fused_route_or_none(router_logits, top_k, "softmax_topk", bool(norm_topk_prob))
+                if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+                    routing_weights, selected_experts = fused
+                else:
+                    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+                    routing_weights, selected_experts = torch.topk(
+                        routing_weights, top_k, dim=-1
                     )
+                    if norm_topk_prob:
+                        routing_weights = routing_weights / routing_weights.sum(
+                            dim=-1, keepdim=True
+                        )
                 routing_weights = routing_weights.to(hidden_states.dtype)
             final_hidden_states = self.experts(
                 hidden_states_reshaped, selected_experts, routing_weights
