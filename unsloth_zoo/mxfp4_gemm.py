@@ -32,6 +32,7 @@ __all__ = [
     "mxfp4_expert_grouped_mm",
     "mxfp4_grouped_matmul",
     "mxfp4_gemm_available",
+    "mxfp4_grouped_gemv_available",
     "mxfp4_matmul",
 ]
 
@@ -803,15 +804,40 @@ def _probe_dense(device, dtype):
 
 
 def mxfp4_gemm_available(device = None, dtype = torch.bfloat16) -> bool:
-    """Self-checked once per (device, dtype), bf16 / fp16; ``UNSLOTH_MXFP4_FUSED_GEMM=0`` turns it off."""
+    """Self-checked once per (device, dtype), bf16 / fp16, sm_80+ (``UNSLOTH_MXFP4_FUSED_GEMM=1`` also below);
+    ``UNSLOTH_MXFP4_FUSED_GEMM=0`` turns it off."""
+    return _available(device, dtype, True)
+
+
+def mxfp4_grouped_gemv_available(device = None, dtype = torch.bfloat16) -> bool:
+    """``mxfp4_gemm_available`` without the arch floor: decode rows (``_gemv_rows``) run the GEMV on any GPU."""
+    return _available(device, dtype, False)
+
+
+def _available(device, dtype, tiles):
     if dtype not in (torch.bfloat16, torch.float16):
         return False
     import os
-    if os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto") in ("0", "dequant"):
+    mode = os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto")
+    if mode in ("0", "dequant"):
         return False
-    key = (None if device is None else str(device), dtype)
+    # Keyed by the resolved GPU, so an unindexed device cannot reuse another GPU's answer.
+    name = None if device is None else str(device)
+    if name in (None, "cuda") and torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+        name = str(device)
+    key = (name, dtype)
+    if tiles and mode != "1":
+        # Below sm_80 (T4) the tile kernel loses to dequantize + cuBLAS; the grouped GEMV does not.
+        key += ("tiles",)
     ok = _AVAILABLE_DTYPE.get(key)
     if ok is not None:
+        return ok
+    if len(key) == 3:
+        ok = _available(device, dtype, False) and (
+            torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)
+        )
+        _AVAILABLE_DTYPE[key] = ok
         return ok
     ok = mxfp4_grouped_mm_available(device)
     if ok:

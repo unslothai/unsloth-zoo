@@ -188,3 +188,59 @@ def test_chunked_without_selective_skips_empty_chunks(monkeypatch):
 
     sources = (experts.gate_up_proj, experts.down_proj)
     assert mu._selective_dequant_plan(sources, torch.zeros(E, dtype = torch.int32, device = DEVICE), 0) is None
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("T", [1, 3, 5])
+def test_default_capped_plan_is_sync_free_and_bit_exact(nested, T, monkeypatch):
+    torch.manual_seed(T)
+    experts = _Experts(nested)
+    hidden = torch.randn(T, H, dtype = torch.bfloat16, device = DEVICE)
+    pool = torch.tensor([2, 7, 11, 12, 15], device = DEVICE)
+    top_k_index = pool[torch.stack([torch.randperm(5, device = DEVICE)[:TOP_K] for _ in range(T)])]
+    top_k_weights = torch.rand(T, TOP_K, dtype = torch.bfloat16, device = DEVICE)
+    lora = {
+        "gate_up_proj": (torch.randn(E, H, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, 2 * I, device = DEVICE) * 0.1),
+        "down_proj": (torch.randn(E, I, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, H, device = DEVICE) * 0.1),
+    }
+    monkeypatch.setenv("UNSLOTH_MOE_SELECTIVE_DEQUANT", "0")
+    base_out, base_grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert mu.SELECTIVE_DEQUANT_STATS["dequant_calls"] == 0
+    monkeypatch.delenv("UNSLOTH_MOE_SELECTIVE_DEQUANT")
+
+    host_reads = []
+    item, tolist = torch.Tensor.item, torch.Tensor.tolist
+    monkeypatch.setattr(torch.Tensor, "item", lambda self: host_reads.append("item") or item(self))
+    monkeypatch.setattr(torch.Tensor, "tolist", lambda self: host_reads.append("tolist") or tolist(self))
+    out, grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    monkeypatch.setattr(torch.Tensor, "item", item)
+    monkeypatch.setattr(torch.Tensor, "tolist", tolist)
+
+    assert host_reads == []
+    assert torch.equal(out, base_out)
+    for got, want in zip(grads, base_grads):
+        assert torch.equal(got, want)
+    stats = mu.SELECTIVE_DEQUANT_STATS
+    assert stats["plans"] == 1
+    assert stats["dequant_calls"] == 4
+    assert stats["experts_dequantized"] == 4 * T * TOP_K
+
+
+def test_default_capped_plan_declines_when_rows_cover_the_stack(monkeypatch):
+    experts = _Experts(False)
+    sources = (experts.gate_up_proj, experts.down_proj)
+    counts = torch.zeros(E, dtype = torch.int32, device = DEVICE)
+    counts[:2] = 7
+    assert mu._selective_dequant_plan(sources, counts, 14) is not None   # 14 of 16: exactly 7/8
+    counts[2] = 1
+    assert mu._selective_dequant_plan(sources, counts, 15) is None
+    assert mu._selective_dequant_plan(sources, torch.zeros(E, dtype = torch.int32, device = DEVICE), 0) is None
+    monkeypatch.setenv("UNSLOTH_MOE_SELECTIVE_DEQUANT", "0")
+    assert mu._selective_dequant_plan(sources, counts, 2) is None
+    plain = torch.zeros(E, 2 * I, H, dtype = torch.bfloat16, device = DEVICE)
+    monkeypatch.delenv("UNSLOTH_MOE_SELECTIVE_DEQUANT")
+    assert mu._selective_dequant_plan((plain,), counts, 2) is None
+    counts = torch.zeros(E, dtype = torch.int32, device = DEVICE)
+    counts[5], counts[9] = 2, 1   # unrouted expert pads
+    ids, row_lo, row_hi, offsets = mu._selective_dequant_plan(sources, counts, 3).chunks[0]
+    assert (row_lo, row_hi) == (0, 3) and ids.tolist() == [5, 9, 0] and offsets.tolist() == [2, 3, 3]

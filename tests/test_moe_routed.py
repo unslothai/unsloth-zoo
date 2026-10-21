@@ -27,6 +27,13 @@ DEV = "cuda"
 DT = getattr(torch, os.environ.get("UNSLOTH_TEST_DTYPE", "")) if os.environ.get("UNSLOTH_TEST_DTYPE") else (
     torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16)
 E, H, I = 8, 256, 192
+# Below sm80 (T4) the 16-bit routed kernels take one-token decode only (they lose to grouped_mm above that).
+ROUTED_16BIT = torch.cuda.get_device_capability()[0] >= 8
+
+
+def _needs_16bit_routing(tokens = 2):
+    if not ROUTED_16BIT and tokens > 1:
+        pytest.skip("below sm80 16-bit routed decode is one-token only")
 
 
 @pytest.fixture(autouse = True)
@@ -267,6 +274,7 @@ def test_selective_dequant_is_bit_exact_to_bitsandbytes():
 @pytest.mark.parametrize("use_lora", [False, True])
 @pytest.mark.parametrize("T", [1, 4])
 def test_bf16_experts_match_reference(act, use_lora, T, monkeypatch):
+    _needs_16bit_routing(T)
     ex = _make(act, quant = False)
     lora = _lora(ex) if use_lora else None
     _stash(ex, lora)
@@ -425,7 +433,7 @@ def test_compiled_bf16_retrace_rechecks_the_plan(change, monkeypatch):
     # A retrace after a recast must not route FP32 weights through the bf16 / fp16 kernels.
     monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
     ex = _make("silu", quant = False)
-    x, idx, w = _route(2)
+    x, idx, w = _route(2 if ROUTED_16BIT else 1)
     torch._dynamo.reset()
     fn = torch.compile(lambda a, b, c: MR.routed_moe_forward(ex, a, b, c), fullgraph = True)
     with torch.no_grad():
@@ -449,6 +457,8 @@ def test_changed_expert_semantics_are_not_cached(quant, compiled, change, monkey
     # Same weights, different activation or gate layout: the routed result must follow the module.
     if compiled and quant and not MR._LIVE_QUANT:
         pytest.skip("compiled NF4 keeps the current path before torch 2.10")
+    if not quant:
+        _needs_16bit_routing()
     monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
     ex = _make("silu", quant = quant)
     x, idx, w = _route(2)
@@ -495,6 +505,8 @@ def test_bias_attached_after_compiled_warmup_is_not_dropped(monkeypatch):
 @pytest.mark.parametrize("quant", [True, False])
 def test_training_mode_keeps_the_current_path(quant):
     # Reentrant checkpointing runs the forward under no_grad and replays it with grad.
+    if not quant:
+        _needs_16bit_routing()
     ex = _make("silu", quant = quant)
     x, idx, w = _route(2)
     with torch.no_grad():
@@ -532,6 +544,8 @@ def test_a_declined_module_is_rechecked_once_it_changes():
 def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):
     if mode == "grouped" and (not MU._check_torch_grouped_mm_supported() or DT != torch.bfloat16):
         pytest.skip("torch._grouped_mm: bf16 on a supported GPU only")
+    if mode == "bf16":
+        _needs_16bit_routing()
     monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1" if mode == "bf16" else mode)
     ex = _make("gelu_tanh", quant = mode != "bf16")
     _stash(ex, _lora(ex) if use_lora else None)
@@ -631,6 +645,8 @@ def _real_experts(kind):
 @pytest.mark.parametrize("quant", [True, False])
 @pytest.mark.parametrize("B", [1, 4])
 def test_real_experts_classes(kind, quant, B, monkeypatch):
+    if not quant:
+        _needs_16bit_routing(B)
     try:
         ex, cfg = _real_experts(kind)
     except Exception as exc:  # pragma: no cover - older transformers
