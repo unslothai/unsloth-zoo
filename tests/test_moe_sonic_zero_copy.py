@@ -173,3 +173,38 @@ def test_triton_swiglu_backward_matches_torch(monkeypatch):
     monkeypatch.setenv("UNSLOTH_MOE_SONIC_TRITON_DGATED", "0")
     ref = S._swiglu_backward_interleaved(pre, g)
     torch.testing.assert_close(got.float(), ref.float(), rtol=1e-2, atol=1e-2)
+
+
+def test_interleave_cache_is_tied_to_the_source_weight(monkeypatch):
+    # data_ptr is reused after a model is freed: a dead or different owner must never hit.
+    import gc
+
+    monkeypatch.setenv("UNSLOTH_MOE_SONIC_CACHE_GIB", "1")
+    S._INTERLEAVE_CACHE.clear()
+    param = torch.randn(2, 8, 6)
+    view = param.transpose(-2, -1).transpose(-2, -1)
+    first = S._interleaved_gate_up(view)
+    assert S._interleaved_gate_up(param.transpose(-2, -1).transpose(-2, -1)) is first
+    key = next(iter(S._INTERLEAVE_CACHE))
+    other = torch.randn(2, 8, 6)
+    entry = S._INTERLEAVE_CACHE[key]
+    S._INTERLEAVE_CACHE[key] = entry[:4] + (__import__("weakref").ref(other),)
+    assert S._interleaved_gate_up(param.transpose(-2, -1).transpose(-2, -1)) is not first
+    del param, view, first
+    gc.collect()
+    assert not S._INTERLEAVE_CACHE
+
+
+def test_sonic_availability_probe_runs_outside_dynamo(monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_utils as MU
+
+    seen = []
+    monkeypatch.setattr(S, "sonic_moe_available", lambda: seen.append(torch.compiler.is_compiling()) or False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_MOE_SONIC", raising = False)
+
+    @torch.compile(backend = "eager")
+    def f(x):
+        return x + int(MU._check_sonic_moe_available())
+
+    f(torch.zeros(1))
+    assert seen == [False]

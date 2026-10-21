@@ -65,6 +65,7 @@ no longer applies (B200, kernels-community/sonic-moe v2 = quack 0.6.1):
 ``UNSLOTH_MOE_SONIC_GATED=0`` turns the fusion off (plain GEMM + eager SwiGLU).
 """
 import os
+import weakref
 import sys
 import torch
 import torch.nn.functional as F
@@ -480,6 +481,12 @@ def _cached_bytes():
     return sum(v[3].numel() * v[3].element_size() for v in _INTERLEAVE_CACHE.values())
 
 
+def _drop_interleaved(key, ref):
+    hit = _INTERLEAVE_CACHE.get(key)
+    if hit is not None and hit[4] is ref:
+        del _INTERLEAVE_CACHE[key]
+
+
 def _interleaved_gate_up(weight):
     """`weight` [E, H, 2I] chunked [gate | up] -> [E, H, 2I] interleaved
     [g0, u0, g1, u1, ...], which is what sonic's gemm_gated consumes.
@@ -492,8 +499,11 @@ def _interleaved_gate_up(weight):
     # copy until the budget ran out). The storage + layout identifies the weight.
     key = (weight.data_ptr(), tuple(weight.shape), tuple(weight.stride()), weight.dtype)
     stamp = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
+    # data_ptr is reused once a model is freed: tie the entry to the owning tensor's lifetime.
+    owner = weight._base if weight._base is not None else weight
     hit = _INTERLEAVE_CACHE.get(key)
-    if hit is not None and hit[:3] == stamp[:3] and hit[3].dtype == weight.dtype:
+    if (hit is not None and hit[4]() is owner and hit[:3] == stamp[:3]
+            and hit[3].dtype == weight.dtype):
         return hit[3]
 
     nbytes = weight.numel() * weight.element_size()
@@ -510,7 +520,8 @@ def _interleaved_gate_up(weight):
     perm[1::2] = torch.arange(half, two_i, device=weight.device)
     with torch.no_grad():
         interleaved = weight[:, :, perm].contiguous()
-    _INTERLEAVE_CACHE[key] = (stamp[0], stamp[1], stamp[2], interleaved)
+    _INTERLEAVE_CACHE[key] = (stamp[0], stamp[1], stamp[2], interleaved,
+                              weakref.ref(owner, lambda ref, k = key: _drop_interleaved(k, ref)))
     return interleaved
 
 

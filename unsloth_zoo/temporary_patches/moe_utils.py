@@ -1868,7 +1868,8 @@ def _check_sonic_moe_available():
         return False
     try:
         from unsloth_zoo.temporary_patches.moe_utils_sonic import sonic_moe_available
-        return sonic_moe_available()
+        # Cold import, kernel probes and op registration must not run under Dynamo tracing.
+        return _run_probe_eagerly(sonic_moe_available)
     except Exception:
         return False
 
