@@ -329,3 +329,156 @@ def test_clamp_boundary_probe_matches_autograd():
     x.clamp(min = -7.0, max = 7.0).sum().backward()
     _, u_max, u_min = sw._clamp_grad_boundaries()
     assert (x.grad[0] != 0) == u_max and (x.grad[1] != 0) == u_min and x.grad[2] == 1
+
+
+# ---- gpt-oss formula traps: clamp the INPUTS (gate max, up +-limit), not the sigmoid argument -----------------
+ALPHA, LIMIT = 1.702, 7.0
+
+
+def _gptoss_fp64(gate, up, alpha = ALPHA, limit = LIMIT):
+    """Independent fp64 reference (no torch.clamp / autograd): value and analytic d/dgate, d/dup per unit grad.
+    Boundary ties follow the running torch's clamp gradient (inclusive <= 2.13, exclusive on 2.14)."""
+    g, u = gate.double(), up.double()
+    gc = torch.where(g > limit, torch.full_like(g, limit), g)
+    uc = torch.where(u > limit, torch.full_like(u, limit), torch.where(u < -limit, torch.full_like(u, -limit), u))
+    s = 1.0 / (1.0 + torch.exp(-alpha * gc))
+    glu = gc * s
+    y = (uc + 1.0) * glu
+    g_max, u_max, u_min = sw._clamp_grad_boundaries()
+    g_in = (g <= limit) if g_max else (g < limit)
+    u_in = ((u <= limit) if u_max else (u < limit)) & ((u >= -limit) if u_min else (u > -limit))
+    dg = torch.where(g_in, (uc + 1.0) * (s + gc * alpha * s * (1.0 - s)), torch.zeros_like(g))
+    du = torch.where(u_in, glu, torch.zeros_like(u))
+    return y, dg, du
+
+
+def _boundary_grid(dtype):
+    nxt = lambda x, d: torch.nextafter(torch.tensor(x, dtype = dtype), torch.tensor(d, dtype = dtype)).item()  # noqa: E731
+    vals = [0.0, 1.0, -1.0, 3.5, -3.5, LIMIT, -LIMIT, nxt(LIMIT, 100.0), nxt(LIMIT, 0.0), nxt(-LIMIT, -100.0), nxt(-LIMIT, 0.0),
+            10.0, -10.0, 20.0, -20.0, 30.0, -30.0, -88.0, -200.0, -1000.0, -30000.0, 30000.0]
+    return torch.tensor(vals, dtype = torch.float32).to(dtype)
+
+
+def _pack(gate, up, interleaved):
+    if interleaved:
+        return torch.stack((gate, up), -1).flatten(-2)
+    return torch.cat((gate, up), -1)
+
+
+def _unpack(t, interleaved):
+    n = t.shape[-1] // 2
+    return (t[..., 0::2], t[..., 1::2]) if interleaved else (t[..., :n], t[..., n:])
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_gptoss_forward_then_grads_vs_independent_fp64(dtype, layout):
+    interleaved = layout == "interleaved"
+    v = _boundary_grid(dtype)
+    gate = v.repeat_interleave(v.numel()).view(1, -1).to(DEV)
+    up = v.repeat(v.numel()).view(1, -1).to(DEV)
+    gu = _pack(gate, up, interleaved).requires_grad_()
+    y = sw.moe_fused_swiglu(gu, sw.ACT_GPTOSS, interleaved)
+    y_ref, dg_ref, du_ref = _gptoss_fp64(gate, up)
+    # 1) forward intermediate first. Bound = per-op rounding x the conditioning of sigmoid(alpha * gate): rounding
+    #    t = alpha * gate moves sigmoid by |t| (1 - s) relative, so the eager chain itself is only that close.
+    eps = torch.finfo(dtype).eps
+    gc = torch.where(gate.double() > LIMIT, torch.full_like(gate.double(), LIMIT), gate.double())
+    uc = up.double().clamp(-LIMIT, LIMIT)
+    s = torch.sigmoid(ALPHA * gc)
+    cond = 3.0 + ALPHA * gc.abs() * (1.0 - s)
+    tiny = torch.finfo(dtype).tiny
+    assert torch.isfinite(y).all()
+    err_y = (y.double() - y_ref).abs()
+    assert (err_y <= 4 * eps * cond * y_ref.abs() + tiny).all(), err_y.max()
+    # the eager expression has exactly this error too (fused is bit-identical to it); it is not a looser formula
+    y_eager = eager_expr(gu.detach(), "gptoss", interleaved)
+    assert bitwise(y.detach(), y_eager)
+    # 2) then derivatives, unit upstream grad; bit-identical to eager autograd first
+    y.backward(torch.ones_like(y))
+    x_e = gu.detach().clone().requires_grad_()
+    eager_expr(x_e, "gptoss", interleaved).backward(torch.ones_like(y))
+    assert bitwise(gu.grad, x_e.grad)
+    dg, du = _unpack(gu.grad, interleaved)
+    # fp16 only: eager rounds d_sigmoid = d_glu * gate to fp16, which overflows for |gate| >~ 8e3 and then
+    # inf * sigmoid'(0) = nan. Fused replays that bit for bit (see test_fp16_eager_overflow_large_negative_gate).
+    ok = torch.isfinite(dg)
+    if dtype != torch.float16:
+        assert ok.all()
+    else:
+        assert (gate[~ok] < -8000).all()
+    scale_g = (uc + 1.0).abs() * (s + ALPHA * gc.abs() * s * (1.0 - s)) + dg_ref.abs()
+    err_g = (dg.double() - dg_ref).abs()
+    assert (err_g[ok] <= (8 * eps * cond * scale_g + tiny)[ok]).all(), err_g[ok].max()
+    assert ((du.double() - du_ref).abs() <= 4 * eps * cond * du_ref.abs() + tiny).all()
+    # outside the clamp range the derivative is exactly zero
+    assert (dg[gate > LIMIT] == 0).all() and (du[(up > LIMIT) | (up < -LIMIT)] == 0).all()
+
+
+def test_fp16_eager_overflow_large_negative_gate():
+    # Documents an eager fp16 hazard the default (bit-identical) mode inherits and round-once mode avoids.
+    gate = torch.tensor([[-30000.0, -9000.0, -5000.0]], device = DEV)
+    up = torch.tensor([[7.0, 7.0, 7.0]], device = DEV)
+    gu = _pack(gate, up, True).half()
+    grads = {}
+    for er in (True, False):
+        x = gu.clone().requires_grad_()
+        sw.moe_fused_swiglu(x, sw.ACT_GPTOSS, True, eager_rounding = er).backward(torch.ones(1, 3, device = DEV).half())
+        grads[er] = _unpack(x.grad, True)[0]
+    x_e = gu.clone().requires_grad_()
+    eager_expr(x_e, "gptoss", True).backward(torch.ones(1, 3, device = DEV).half())
+    assert bitwise(grads[True], _unpack(x_e.grad, True)[0])
+    assert torch.isnan(grads[True][0, :2]).all() and torch.isfinite(grads[True][0, 2])
+    assert torch.isfinite(grads[False]).all() and (grads[False] == 0).all()
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_gptoss_not_sigmoid_argument_clamp(layout):
+    # Saturated gate / up: clamping the sigmoid argument instead of the inputs is off by hundreds here.
+    interleaved = layout == "interleaved"
+    gate = torch.tensor([[20.0, 9.0, -20.0]], device = DEV)
+    up = torch.tensor([[20.0, -9.0, 9.0]], device = DEV)
+    y = sw.moe_fused_swiglu(_pack(gate, up, interleaved), sw.ACT_GPTOSS, interleaved)
+    right, _, _ = _gptoss_fp64(gate, up)
+    wrong = (up + 1) * gate * torch.sigmoid((gate * ALPHA).clamp(-LIMIT, LIMIT))
+    assert torch.allclose(y.double(), right, rtol = 1e-6, atol = 1e-6)
+    assert (y - wrong).abs().max() > 100
+
+
+def test_gptoss_matches_transformers_apply_gate():
+    mod = pytest.importorskip("transformers.models.gpt_oss.modeling_gpt_oss")
+    cfg_cls = pytest.importorskip("transformers").GptOssConfig
+    cfg = cfg_cls(hidden_size = 16, intermediate_size = 8, num_local_experts = 2, num_hidden_layers = 1,
+                  num_attention_heads = 2, num_key_value_heads = 1, head_dim = 8, vocab_size = 32)
+    experts = mod.GptOssExperts(cfg)
+    if not hasattr(experts, "_apply_gate"):
+        pytest.skip("this transformers has no GptOssExperts._apply_gate")
+    for dtype in DTYPES:
+        v = _boundary_grid(dtype)
+        gu = _pack(v.repeat_interleave(v.numel()).view(1, -1), v.repeat(v.numel()).view(1, -1), True).to(DEV)
+        grad = torch.randn(1, v.numel() ** 2, device = DEV).to(dtype)
+        x_t = gu.clone().requires_grad_()
+        y_t = experts._apply_gate(x_t)
+        y_t.backward(grad)
+        x_f = gu.clone().requires_grad_()
+        y_f = sw.moe_fused_swiglu(x_f, sw.ACT_GPTOSS, True, float(experts.alpha), float(experts.limit))
+        y_f.backward(grad)
+        assert bitwise(y_f, y_t.detach()) and bitwise(x_f.grad, x_t.grad)
+
+
+@pytest.mark.parametrize("act", ACTS)
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_fp16_extremes_gradscaler(act, layout):
+    # T4 path: fp16 storage, fp32 math inside. Upstream grads at GradScaler size (x 2**16) and fp16 extremes must give
+    # exactly eager's bits, including where eager overflows to inf / nan.
+    interleaved = layout == "interleaved"
+    dtype = torch.float16
+    gu = make_gate_up(64, 96, dtype, scale = 6.0, seed = 31)
+    gu[0, :8] = torch.tensor([65504.0, -65504.0, 6e-8, -6e-8, 7.0, -7.0, 1e4, -1e4], dtype = dtype)
+    for scale in (2.0 ** 16, 2.0 ** 10, 2.0 ** -24):
+        grad = (torch.randn(64, 96, device = DEV) * 1e-3 * scale).to(dtype)
+        grad[1, :4] = torch.tensor([65504.0, -65504.0, 6e-8, 0.0], dtype = dtype)
+        y_e, g_e, y_f, g_f = run_both(gu, grad, act, interleaved)
+        assert bitwise(y_f, y_e)
+        assert bitwise(g_f, g_e)
+        assert torch.equal(torch.isfinite(g_f), torch.isfinite(g_e))
