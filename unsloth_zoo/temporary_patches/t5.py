@@ -83,6 +83,8 @@ def _patch_umt5_forward(modeling):
     lines[test.lineno - 1] = line.decode("utf-8")
 
     tests[0].test = ast.copy_location(ast.parse(_SCALE_TEST, mode = "eval").body, test)
+    # Keep co_firstlineno on the first decorator, so inspect.getsource still returns them.
+    forward_node.lineno = min([forward_node.lineno] + [d.lineno for d in forward_node.decorator_list])
     forward_node.decorator_list = []
     ast.fix_missing_locations(forward_node)
     namespace = {}
