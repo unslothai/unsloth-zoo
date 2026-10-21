@@ -98,16 +98,31 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
 
+    # Largest dense mask (bool elements) built eagerly; above it the compiled builder keeps memory O(blocks).
+    _EAGER_BLOCK_MASK_MAX_ELEMENTS = 1 << 27
+
+    def _compile_block_mask(bsz, head, M, N):
+        # torch 2.10's dynamic create_block_mask graph miscompiles one-block lengths: its block
+        # counts come out 2 instead of 1 and read past the buffer (illegal memory access).
+        blk = FLEX_ATTENTION_BLOCK_SIZE
+        if M > blk and N > blk:
+            return True
+        # The eager builder pads both lengths to whole blocks before reducing the dense mask.
+        padded = -(-M // blk) * blk * (-(-N // blk) * blk)
+        return (bsz or 1) * (head or 1) * padded > _EAGER_BLOCK_MASK_MAX_ELEMENTS
+
     def compiled_create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         # See https://github.com/meta-pytorch/attention-gym/issues/15#issuecomment-2284148665
         # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
-        return _create_block_mask(mask_mod, None, None, M, N, device = device, _compile = True)
+        return _create_block_mask(mask_mod, None, None, M, N, device = device,
+                                  _compile = _compile_block_mask(None, None, M, N))
 
     def compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
-        return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = True)
+        return _create_block_mask(mask_mod, bsz, head, M, N, device = device,
+                                  _compile = _compile_block_mask(bsz, head, M, N))
 
     # Block masks for stateless mask_mods (causal / sliding window) only depend on the
     # mask_mod and shapes, so every layer, pass and checkpoint replay can share one.

@@ -81,6 +81,11 @@ def unsloth_fused_lm_head_loss(
         target = labels
         do_shift = True
 
+    # fp16: grads are computed in the forward and underflow without the loss scale (#3529).
+    accelerator_scaler = kwargs.pop("accelerator_scaler", None)
+    if kwargs.get("scaling", None) is None and accelerator_scaler is not None:
+        kwargs["scaling"] = accelerator_scaler
+
     unsloth_fsdp_unshard(lm_head)
     loss = unsloth_fused_ce_loss(
         trainer        = None,

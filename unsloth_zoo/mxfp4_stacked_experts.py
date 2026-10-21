@@ -22,7 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequantize
-from .mxfp4_gemm import mxfp4_gemm_available, mxfp4_grouped_matmul
+from .mxfp4_gemm import _gemv_rows, mxfp4_gemm_available, mxfp4_grouped_gemv_available, mxfp4_grouped_matmul
 
 __all__ = [
     "Mxfp4StackedExperts",
@@ -84,10 +84,15 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
     return out
 
 
-def _fused(inputs, param):
+def _fused(inputs, param, transpose = True):
+    if not (inputs.is_cuda and is_mxfp4_expert_param(param) and param.mxfp4_transposed):
+        return False
+    if mxfp4_gemm_available(inputs.device, inputs.dtype):
+        return True
+    # sm_75: only decode rows, which take the GEMV; the tile kernel loses to dequantize + grouped GEMM there.
     return (
-        inputs.is_cuda and is_mxfp4_expert_param(param) and param.mxfp4_transposed
-        and mxfp4_gemm_available(inputs.device, inputs.dtype)
+        _gemv_rows(inputs.shape[0], param.shape[0], transpose)
+        and mxfp4_grouped_gemv_available(inputs.device, inputs.dtype)
     )
 
 
@@ -99,7 +104,7 @@ def _scales(param):
 
 
 def _grouped(inputs, param, counts, ends, transpose):
-    if _fused(inputs, param):
+    if _fused(inputs, param, transpose):
         return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
     if ends is None:
         ends = torch.cumsum(counts, 0).tolist()
