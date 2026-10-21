@@ -921,9 +921,8 @@ def grpo_compute_loss(
     else:
         log_ratio = new - new.detach()
     if kwargs.get("rollout_logps_as_old", False):
-        # pi_old is the rollout engine here, whose gap to pi_theta can pass 88 nats: exp overflows in
-        # float32 and the clipped branch's backward is 0 * inf = nan. verl compute_policy_loss_vanilla
-        # clamps the same log ratio to [-20, 20] before exponentiating.
+        # Rollout gap can pass 88 nats (float32 exp overflow, 0 * inf backward); verl
+        # compute_policy_loss_vanilla clamps the log ratio to [-20, 20] too.
         log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
 
     if importance_sampling_level == "token":
@@ -1370,7 +1369,6 @@ def _warn_unsupported_grpo_options(trainer):
     if not (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False)):
         _names = ("UNSLOTH_GRPO_VLLM_IS_MODE", "UNSLOTH_GRPO_VLLM_IS_CLIP", "UNSLOTH_GRPO_ROLLOUT_RS", "UNSLOTH_GRPO_ROLLOUT_METRICS")
         if os.environ.get("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", "0") == "1":
-            # Rollout logprobs as pi_old report the mismatch from the clipped ratio instead.
             _names = _names[:-1]
         for name in _names:
             if os.environ.get(name, "") not in ("", "0"):
@@ -2260,8 +2258,7 @@ def grpo_accumulated_loss(
     # either way); the IS ratio stays gated on the correction flag inside grpo_compute_loss. On the
     # plain vLLM path (neither active) they are dropped so nothing pays for an unused aligned/compiled
     # input and grpo_compute_loss returns None (not empty) delta/flat_is_ratio.
-    # Set by unsloth per generation batch when it skipped the old-policy forward because
-    # UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1: the rollout logprobs are pi_old here.
+    # Set by unsloth when UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 skipped the old-policy forward.
     _rollout_logps_as_old = bool(kwargs.pop("rollout_logps_as_old", False))
     _sampling_logps_used = (
         getattr(trainer, "vllm_importance_sampling_correction", False)
@@ -3308,7 +3305,6 @@ def grpo_accumulated_loss(
             )
         _rollout_stats_args = None
         if _rollout_logps_as_old:
-            # No IS weight was applied, so report the ratio the clip saw: current policy vs rollout.
             delta, flat_is_ratio = grpo_rollout_as_old_ratio_metrics(coef_1, completion_mask)
             if _rollout_metrics_on and flat_is_ratio is not None:
                 _log_ratio = torch.nan_to_num(

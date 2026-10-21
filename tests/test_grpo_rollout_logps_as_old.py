@@ -115,7 +115,6 @@ def test_float32_error_stays_at_float32_level(d):
 
 
 def test_rollout_as_old_drops_the_is_weight():
-    # With the rollout as pi_old an IS weight on top would count the mismatch twice (verl bypass note).
     new, rollout, advantages, mask = _data(0.3)
     dropped = _zoo(new, rollout, advantages, mask, "dapo", 3.0)
     assert dropped[3] is not None and dropped[3].numel() == 0  # no vLLM IS block ran
@@ -139,7 +138,6 @@ def test_gradcheck_float64():
         return rr.grpo_compute_loss(None, x, old, None, torch.zeros_like(mask), mask, 0.0, advantages, **kwargs)[0]
 
     assert torch.autograd.gradcheck(f, (new,), eps = 1e-6, atol = 1e-8)
-    # The dual clip zeroes the gradient where A < 0 and r > delta, exactly as verl's min(l, -A c).
     x = (rollout + 2.0).requires_grad_(True)
     f(x).backward()
     assert torch.all(x.grad[(advantages < 0).unsqueeze(1).expand_as(x) & mask.bool()] == 0)
@@ -173,7 +171,6 @@ def test_clamped_path_compiles_fullgraph():
 
 
 def test_default_path_is_not_clamped():
-    # The clamp is only for rollout logprobs as pi_old: the trainer's own pi_old keeps TRL's formula.
     new, rollout, advantages, mask = _data(30.0)
     old = rollout.double()
     kwargs = dict(
@@ -229,9 +226,7 @@ def test_sequence_level_ratio_reports_nothing():
     assert rr.grpo_rollout_as_old_ratio_metrics(coef_1, torch.ones(3, 4)) == (None, None)
 
 
-# grpo_accumulated_loss on CPU with a fake model and a recording UnslothEfficientGRPO, as
-# test_grpo_rollout_correction.py drives it. Left padding makes the layout matter: the rollout
-# logprobs arrive right padded (TRL) and must be moved into the left-packed completion columns.
+# Rollout logprobs arrive right padded (TRL) and must land in the left-packed completion columns.
 _IDS = torch.tensor([[0, 0, 1, 2, 3, 4, 5], [1, 2, 6, 7, 3, 4, 6], [0, 1, 2, 3, 5, 0, 0]])
 _MASK = torch.tensor([[1, 1, 1], [1, 1, 1], [1, 0, 0]])
 
@@ -310,13 +305,11 @@ def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = 
 
 @pytest.mark.parametrize("use_vllm, correction", [(True, True), (True, False), (False, False)])
 def test_accumulated_loss_scores_against_the_aligned_rollout(monkeypatch, use_vllm, correction):
-    # use_vllm False: TRL's rollout_func also returns rollout logprobs.
     seen, sampling, _, _ = _drive(monkeypatch, True, use_vllm = use_vllm, correction = correction)
     assert seen["sampling"] is None
     assert seen["old"] is not None and seen["old"].shape == seen["mask"].shape
     want = rr.align_logprobs_with_mask(sampling, seen["mask"])
     torch.testing.assert_close(seen["old"], want)
-    # Every completion token carries its own rollout logprob, row by row.
     for row in range(3):
         n = int(_MASK[row].sum())
         torch.testing.assert_close(seen["old"][row][seen["mask"][row].bool()], sampling[row, :n])
@@ -366,12 +359,10 @@ def test_accumulated_loss_metrics_stay_finite_on_an_overflowed_ratio(monkeypatch
 
 
 def test_unscored_rollout_tokens_get_ratio_one(monkeypatch):
-    # vLLM returns NaN for a token it could not score; the IS path turns that into a neutral ratio.
     probe = -(torch.arange(9, dtype = torch.float32).view(3, 3) + 1) / 10
     probe[1, 1] = float("nan")
 
     def coef_of(mask):
-        # A ratio far from 1 at the unscored token: it must not reach the mismatch sums.
         return torch.where(torch.isnan(rr.align_logprobs_with_mask(probe, mask)), 5.0, 1.0)
 
     seen, sampling, out, metrics = _drive(monkeypatch, True, unscored = (1, 1), coef_1 = coef_of)
@@ -383,7 +374,6 @@ def test_unscored_rollout_tokens_get_ratio_one(monkeypatch):
     keep = mask.bool() & ~hole
     torch.testing.assert_close(old[keep], rr.align_logprobs_with_mask(sampling, mask)[keep])
     assert seen["kwargs"]["rollout_logps_as_old"] is True
-    # Left out of the mismatch sums, like the IS path's unscored tokens.
     assert metrics["train"]["sampling/rollout_kl_k3/mean"] == [0.0]
     assert metrics["train"]["sampling/rollout_kl_k1/mean"] == [0.0]
 
