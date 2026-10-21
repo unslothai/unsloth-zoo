@@ -272,3 +272,21 @@ def test_alignment_verdict_survives_compile_and_declines_unverified():
     assert not S._is_k_major_gate_up(misaligned.transpose(-2, -1), misaligned)
     assert run(aligned.transpose(-2, -1), aligned) == 2
     assert run(misaligned.transpose(-2, -1), misaligned) == 3
+
+
+def test_interleave_cache_fills_once_under_compile(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_MOE_SONIC_CACHE_GIB", "1")
+    S._INTERLEAVE_CACHE.clear()
+    param = torch.randn(2, 8, 6)
+
+    @torch.compile(backend = "eager", fullgraph = False)
+    def f(w):
+        return S._interleaved_gate_up(w.transpose(-2, -1).transpose(-2, -1)) * 1.0
+
+    a = f(param)
+    assert len(S._INTERLEAVE_CACHE) == 1
+    cached = next(iter(S._INTERLEAVE_CACHE.values()))[3]
+    f(param)
+    assert len(S._INTERLEAVE_CACHE) == 1 and next(iter(S._INTERLEAVE_CACHE.values()))[3] is cached
+    torch.testing.assert_close(a, cached)
+    S._INTERLEAVE_CACHE.clear()

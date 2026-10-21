@@ -523,12 +523,14 @@ def _drop_interleaved(key, ref):
         del _INTERLEAVE_CACHE[key]
 
 
+@torch.compiler.disable
 def _interleaved_gate_up(weight):
     """`weight` [E, H, 2I] chunked [gate | up] -> [E, H, 2I] interleaved
     [g0, u0, g1, u1, ...], which is what sonic's gemm_gated consumes.
 
     Cached, because the permutation is a full copy of the expert stack. Returns None
-    when the copy would not fit the configured budget.
+    when the copy would not fit the configured budget. Runs eagerly: Dynamo would not keep
+    the cache insert, so a compiled caller would rebuild the copy on every call.
     """
     # Not id(weight): the provider hands out a fresh transpose view every call, so an
     # id key never hits and every forward re-copied the stack (and kept the stale
