@@ -203,10 +203,17 @@ def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
 
 @pytest.fixture
 def vu():
+    import traceback
+
     try:
         from unsloth_zoo import vllm_utils
-    except (ImportError, RuntimeError) as e:  # bitsandbytes raises RuntimeError on a CUDA mismatch
+    except ImportError as e:
         pytest.skip(f"vllm_utils does not import here: {e}")
+    except RuntimeError as e:
+        # Only bitsandbytes' CUDA-mismatch error is an environment gap; anything else is a regression.
+        if "bitsandbytes" not in "".join(traceback.format_exception(e)).lower():
+            raise
+        pytest.skip(f"bitsandbytes does not load here: {e}")
     return vllm_utils
 
 
