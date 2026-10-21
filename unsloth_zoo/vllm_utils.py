@@ -3847,11 +3847,10 @@ def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices 
     value = os.environ.get("UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE", "").strip().lower()
     value = _VLLM_MAMBA_SSM_DTYPE_ALIASES.get(value, value)
     has_arg = "mamba_ssm_cache_dtype" in engine_arg_keys
-    # Gated DeltaNet configs carry linear_key_head_dim (Qwen3-Next, Qwen3.5). Other linear_attention
-    # layers (MiniMax lightning attention) size their state from mamba_cache_dtype only.
+    # Only Gated DeltaNet (linear_key_head_dim: Qwen3-Next, Qwen3.5) is supported: other recurrent
+    # layers either ignore mamba_ssm_cache_dtype (MiniMax) or accept fewer dtypes (KDA rejects float16).
     text_config = getattr(config, "text_config", None) or config
     is_gdn = getattr(text_config, "linear_key_head_dim", None) is not None
-    other_linear = not is_gdn and _config_has_gdn_layers(config)
     if is_gdn and has_arg and gdn_reads_ssm is None:
         gdn_reads_ssm = _vllm_gdn_reads_ssm_dtype()
     if not value:
@@ -3869,12 +3868,12 @@ def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices 
         return {}, (
             f"Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE={value!r} ignored: this vLLM accepts {', '.join(choices)}."
         )
-    if other_linear:
+    if not is_gdn:
         return {}, (
-            "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: this model's linear attention state "
-            "does not use mamba_ssm_cache_dtype in vLLM."
+            "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: it is only supported for Gated DeltaNet "
+            "models (Qwen3-Next, Qwen3.5)."
         )
-    if is_gdn and not gdn_reads_ssm:
+    if not gdn_reads_ssm:
         return {}, (
             "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: this vLLM sizes the Gated DeltaNet "
             "state from mamba_cache_dtype only (vLLM < 0.17)."

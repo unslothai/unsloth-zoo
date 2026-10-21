@@ -59,6 +59,8 @@ QWEN3_5 = SimpleNamespace(
                                   linear_key_head_dim = 128, mamba_ssm_dtype = "float32"),
 )
 MINIMAX = SimpleNamespace(model_type = "minimax", layer_types = ["linear_attention", "full_attention"])
+KIMI_LINEAR = SimpleNamespace(model_type = "kimi_linear", linear_attn_config = {"kda_layers": [1, 2]})
+NEMOTRON_H = SimpleNamespace(model_type = "nemotron_h", hybrid_override_pattern = "M-M*", mamba_head_dim = 64)
 LLAMA = SimpleNamespace(model_type = "llama")
 
 
@@ -114,10 +116,10 @@ def test_latest_vllm_accepts(monkeypatch, fake_vllm, value, expected):
 
 @pytest.mark.parametrize("value, passed", [("float32", True), ("auto", True), ("bfloat16", False), ("fp16", False)])
 def test_vllm_0_11_2_only_takes_auto_and_float32(monkeypatch, fake_vllm, value, passed):
-    # Mamba hybrids read mamba_ssm_cache_dtype on 0.11.2; Gated DeltaNet does not (next test).
-    fake_vllm(VLLM_0_11_2, gdn = GDN_OLD)
+    # The value set alone (0.11.2 Gated DeltaNet ignores the field: next test).
+    fake_vllm(VLLM_0_11_2, gdn = GDN_NEW)
     monkeypatch.setenv(ENV, value)
-    args, message = NS["_vllm_mamba_ssm_cache_dtype_args"](LLAMA, KEYS, True)
+    args, message = NS["_vllm_mamba_ssm_cache_dtype_args"](QWEN3_NEXT, KEYS, True)
     if passed:
         assert args == {"mamba_ssm_cache_dtype": value} and message is None
     else:
@@ -178,11 +180,13 @@ def test_gdn_support_unreadable_refuses(monkeypatch):
     assert NS["_vllm_gdn_reads_ssm_dtype"]() is False
 
 
-def test_non_gdn_linear_attention_is_refused_and_not_hinted(monkeypatch, fake_vllm):
+@pytest.mark.parametrize("config", [MINIMAX, KIMI_LINEAR, NEMOTRON_H, LLAMA])
+def test_non_gdn_models_are_refused_and_not_hinted(monkeypatch, fake_vllm, config):
     fake_vllm(VLLM_LATEST)
     fn = NS["_vllm_mamba_ssm_cache_dtype_args"]
-    monkeypatch.setenv(ENV, "float32")
-    args, message = fn(MINIMAX, KEYS, True)
-    assert args == {} and "linear attention" in message
+    for value in ("float32", "float16"):
+        monkeypatch.setenv(ENV, value)
+        args, message = fn(config, KEYS, True)
+        assert args == {} and "only supported for Gated DeltaNet" in message
     monkeypatch.delenv(ENV)
-    assert fn(MINIMAX, KEYS, True) == ({}, None)
+    assert fn(config, KEYS, True) == ({}, None)
