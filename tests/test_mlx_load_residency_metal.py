@@ -403,6 +403,39 @@ def test_offloaded_experts_run_on_another_thread(tmp_path):
         np.testing.assert_array_equal(got, _bits(want))
 
 
+def test_a_request_threads_lazy_output_does_not_fail_the_next(tmp_path):
+    # A prefill drops its last layer's output unevaluated; the next request runs on another thread.
+    stock = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    model = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    offload_experts(model, str(tmp_path), 0.75)
+    glu = model.layers[0].switch_mlp
+    calls = _moe_calls(mx.bfloat16)
+    expected = [stock.layers[0].switch_mlp(*call) for call in calls[1:4]]
+    mx.eval(calls, expected)
+    results, errors = [], []
+
+    def run(evaluate, *chosen):
+        try:
+            with mx.stream(mx.new_stream(mx.gpu)):
+                for call in chosen:
+                    out = glu(*call)
+                    if evaluate:
+                        mx.eval(out)
+                        results.append(_bits(out))
+        except Exception as error:
+            errors.append(error)
+
+    misses = []
+    for args in ((False, calls[0]), (True, *calls[1:4])):
+        misses.append(glu._slots.misses)
+        thread = threading.Thread(target = run, args = args)
+        thread.start()
+        thread.join(timeout = 120)
+    assert not errors and len(results) == 3 and glu._slots.misses > misses[1]  # the second thread read
+    for got, want in zip(results, expected):
+        np.testing.assert_array_equal(got, _bits(want))
+
+
 @pytest.mark.parametrize("v41", [False, True])
 def test_experts_a_checkpoint_stores_apart(tmp_path, v41):
     # As GLM-5's: one tensor per expert, which mlx-vlm stacks at load; DeepSeek V4.1's, under reference names.

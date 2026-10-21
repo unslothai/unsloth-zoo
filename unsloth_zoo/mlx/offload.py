@@ -540,7 +540,7 @@ class _ExpertSlots:
             memoryview(self.arrays[projection, name]).cast("B") for projection, name, _ in fields
         ]
         # Outputs computed from the slots that may still be pending; evaluated before a read overwrites them.
-        self.readers = []
+        self.readers, self.reader_thread = [], None
         self.slot_of = np.full(experts, -1, dtype = np.int64)
         self.expert_of = np.full(capacity, -1, dtype = np.int64)
         self.score = np.zeros(experts, dtype = np.float32)
@@ -559,11 +559,8 @@ class _ExpertSlots:
             return
         self.misses += missing.size
         slots = self._reserve(missing.size, experts)
-        at = mx.array(slots.astype(np.int32))
         if self.views is not None:
-            if self.readers:
-                mx.eval(self.readers)
-                self.readers.clear()
+            self._settle_readers()
             read_ranges([
                 (*field.location(expert), view[slot * field.row_bytes:(slot + 1) * field.row_bytes])
                 for (_, _, field), view in zip(self.fields, self.views)
@@ -576,11 +573,13 @@ class _ExpertSlots:
                 for (_, _, field), buffer in zip(self.fields, buffers)
                 for i, expert in enumerate(missing.tolist())
             ])
+            at = mx.array(slots.astype(np.int32))
             for (projection, name, field), buffer in zip(self.fields, buffers):
                 self.arrays[projection, name][at] = field.to_mx(buffer)
         self.slot_of[missing] = slots
         self.expert_of[slots] = missing
-        self.map[mx.array(missing.astype(np.int32))] = at
+        # Rebuilt from the host copy, not scattered: a lazy update would tie the next call to this thread's stream.
+        self.map = mx.array(np.maximum(self.slot_of, 0).astype(np.int32))
 
     def slot_indices(self, indices):
         return self.map[indices].astype(indices.dtype)
@@ -590,11 +589,20 @@ class _ExpertSlots:
         than a few, or more than ``_PENDING_BYTES`` in all, are kept, they are evaluated now."""
         if self.views is None:  # misses scatter into new arrays: nothing pending can see them
             return
+        if self.reader_thread is not threading.current_thread():
+            self._settle_readers()
+            self.reader_thread = threading.current_thread()
         self.readers.extend(outputs)
         large = sum(reader.nbytes for reader in self.readers) > _PENDING_BYTES
         if large or len(self.readers) > _PENDING_READERS:
+            self._settle_readers()
+
+    def _settle_readers(self):
+        # Another thread's lazy readers cannot be evaluated here (MLX command encoders are thread
+        # local from 0.31.2); that thread's call has returned, so they are dropped, not evaluated.
+        if self.readers and self.reader_thread is threading.current_thread():
             mx.eval(self.readers)
-            self.readers.clear()
+        self.readers.clear()
 
     def _reserve(self, count, protected):
         free = np.flatnonzero(self.expert_of < 0)
