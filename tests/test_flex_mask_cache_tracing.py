@@ -23,7 +23,9 @@ from textwrap import dedent
 
 import pytest
 import torch
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+_flex = pytest.importorskip("torch.nn.attention.flex_attention")
+create_block_mask, flex_attention = _flex.create_block_mask, _flex.flex_attention
 
 
 MISC = Path(__file__).resolve().parents[1] / "unsloth_zoo" / "temporary_patches" / "misc.py"
