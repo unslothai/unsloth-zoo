@@ -170,7 +170,6 @@ def patch_Qwen3MoeAttention_float32():
         _flash_sdpa_accepts = None
 
     def flash_takes_gqa(query, key, attn_mask, dropout_p):
-        # Under fp16 / bf16 autocast a maskless call can already run flash with enable_gqa (sm80+).
         if attn_mask is not None or _flash_sdpa_accepts is None or not torch.backends.cuda.flash_sdp_enabled():
             return False
         if not torch.is_autocast_enabled("cuda"):
@@ -193,8 +192,7 @@ def patch_Qwen3MoeAttention_float32():
 
     @torch.compiler.disable(recursive = True)
     def float32_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale, groups):
-        # Before torch 2.14 the mem-efficient kernel rejects enable_gqa, so without flash SDPA falls to the
-        # math kernel and keeps [b, h, q, k] float32 scores for backward. Repeated k/v let it run.
+        # Pre torch 2.14 mem-efficient rejects enable_gqa (math fallback keeps fp32 scores); repeat k/v instead.
         if groups != 1 and query.is_cuda and torch.backends.cuda.mem_efficient_sdp_enabled() and \
             not flash_takes_gqa(query, key, attn_mask, dropout_p) and \
             not efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, True):

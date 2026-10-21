@@ -126,7 +126,6 @@ def test_efficient_only_matches_math_reference(attn, mask_name):
     hidden = torch.randn(2, 256, HIDDEN, device = "cuda", dtype = torch.float16, generator = torch.Generator(device = "cuda").manual_seed(2))
     with sdpa_kernel([SDPBackend.MATH]):
         ref_out, ref_grads = _run(module, rope, hidden, mask)
-    # enable_gqa on float32 has no fused kernel before torch 2.14, so this raises without repeated k/v.
     with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
         out, grads = _run(module, rope, hidden, mask)
     assert torch.isfinite(out).all()
@@ -187,7 +186,6 @@ def test_peak_memory_without_flash(attn):
     _peak_mib(module, rope, hidden, [SDPBackend.MATH])
     math_peak = _peak_mib(module, rope, hidden, [SDPBackend.MATH])
     head_peak = _peak_mib(module, rope, hidden, [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
-    # Math keeps [1, 16, 2048, 2048] float32 scores and their grads; the mem-efficient kernel keeps none.
     assert head_peak < 0.4 * math_peak, (head_peak, math_peak)
 
 
@@ -206,7 +204,7 @@ def test_attention_op_matches_fp64(attn, mask_name):
     q, k, v = (torch.randn(1, h, 256, HEAD_DIM, device = "cuda", requires_grad = True) for h in (HEADS, KV_HEADS, KV_HEADS))
     if helper is not None:
         out = helper(q, k, v, mask, 0.0, causal, scale, HEADS // KV_HEADS)
-    else:  # older tree without the helper: its SDPA call
+    else:
         out = _ORIGINAL_SDPA(q, k, v, attn_mask = mask, is_causal = causal, scale = scale, enable_gqa = True)
     grad = torch.randn(out.shape, device = "cuda", dtype = torch.float64, generator = torch.Generator(device = "cuda").manual_seed(3))
     out.backward(grad.float())
