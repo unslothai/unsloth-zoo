@@ -44,7 +44,7 @@ import contextlib
 import inspect
 import os
 import re
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -256,7 +256,7 @@ def _router_fwd_impl(logits, bias, top_k, mode, renorm, n_group, topk_group, sca
 def _router_fwd_op(
     logits: torch.Tensor, bias: Optional[torch.Tensor], top_k: int, mode: int, renorm: bool,
     n_group: int, topk_group: int, scale: float, mask_zero: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:  # torch 2.6 cannot resolve typing.Tuple here
     return _router_fwd_impl(logits, bias, top_k, mode, renorm, n_group, topk_group, scale, mask_zero)
 
 
