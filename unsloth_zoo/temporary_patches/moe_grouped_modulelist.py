@@ -140,8 +140,8 @@ def _view_weight_ok(w):
     if w.stride() != (K * N, 1, K) or (K * n) % 16 or (K * N * n) % 16:
         return False
     try:
-        from .moe_utils import _transposed_view_grouped_mm_is_safe
-        return bool(_transposed_view_grouped_mm_is_safe())
+        from .moe_utils import _transposed_view_safe_on
+        return bool(_transposed_view_safe_on(w.device))
     except Exception:
         return False
 
