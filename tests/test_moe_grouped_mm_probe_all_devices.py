@@ -25,6 +25,20 @@ import torch
 from unsloth_zoo.temporary_patches import moe_utils
 
 
+@pytest.fixture(autouse = True)
+def _fresh_dynamo_rules():
+    # Torn down after monkeypatch restores torch: a compile under the mocks caches Dynamo's torch
+    # rule map without the real _grouped_mm, which breaks later compiled MoE tests in this process.
+    yield
+    import torch._dynamo
+    import torch._dynamo.trace_rules as trace_rules
+    for name in dir(trace_rules):
+        clear = getattr(getattr(trace_rules, name), "cache_clear", None)
+        if callable(clear):
+            clear()
+    torch._dynamo.reset()
+
+
 @pytest.fixture
 def spoof(monkeypatch):
     def make(count, failing = (), hip = None, current = 0, models = None):
