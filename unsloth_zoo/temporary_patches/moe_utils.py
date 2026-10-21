@@ -5605,6 +5605,13 @@ def forward_triton_grouped_gemm(
     else:
         num_tokens, hidden_dim = hidden_states.shape
 
+    # As in forward_native_grouped_mm: the Triton grouped GEMM is not autocast-cast, so the float32
+    # hidden states of fp32 norms (bf16 full finetuning) would run every expert GEMM in float32.
+    if hidden_states.dtype == torch.float32:
+        _stack = self._parameters.get("gate_up_proj")
+        if _stack is not None and _stack.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(_stack.dtype)
+
     top_k = top_k_index.shape[1]
     # gate_up still reads float32 X (dX stays float32); everything after it runs in compute_dtype.
     compute_dtype = _triton_moe_compute_dtype(self, hidden_states)
