@@ -2140,6 +2140,47 @@ def _silu_and_mul(x):
     return F.silu(gate) * up
 
 
+try:
+    from unsloth_zoo.temporary_patches import moe_fused_swiglu as _MOE_FUSED_SWIGLU
+except Exception:
+    _MOE_FUSED_SWIGLU = None
+
+
+def _act_fn_is_silu(act_fn) -> bool:
+    if act_fn is F.silu:
+        return True
+    # transformers' ACT2FN["silu"] is nn.SiLU (older releases: SiLUActivation); exact types only, a
+    # subclass may override forward.
+    return type(act_fn) is torch.nn.SiLU or type(act_fn).__name__ == "SiLUActivation"
+
+
+def _fused_moe_activation(module, gate_up, interleaved, allow_gptoss = True):
+    """The fused SwiGLU / gpt-oss clamped SwiGLU over gate_up (saves only gate_up for backward),
+    or None when it does not apply (kill switch UNSLOTH_MOE_FUSED_SWIGLU=0, non-CUDA, another act_fn);
+    the caller then runs its eager expression, which the fused op matches bit for bit."""
+    _sw = _MOE_FUSED_SWIGLU
+    if _sw is None or not _sw.fused_swiglu_supported(gate_up):
+        return None
+    # Eager frames replay the eager rounding (bit-identical); compiled frames (UNSLOTH_MOE_FUSED_SWIGLU=2)
+    # round once, as Inductor's fusion of the eager expression does.
+    eager_rounding = not torch.compiler.is_compiling()
+    alpha, limit = 1.702, 7.0
+    if "GptOssExperts" in module.__class__.__name__:
+        if not allow_gptoss:
+            return None
+        act = _sw.ACT_GPTOSS
+        alpha, limit = float(getattr(module, "alpha", 1.702)), float(getattr(module, "limit", 7.0))
+    else:
+        act_fn = getattr(module, "act_fn", None)
+        if act_fn is not None and callable(act_fn) and not _act_fn_is_silu(act_fn):
+            return None
+        act = _sw.ACT_SILU
+    # Eager frames: only where a one-off probe shows this torch's eager bits are reproduced.
+    if eager_rounding and not _sw.fused_swiglu_self_check(gate_up.device, gate_up.dtype, act, interleaved, alpha, limit):
+        return None
+    return _sw.moe_fused_swiglu(gate_up, act, interleaved, alpha, limit, eager_rounding)
+
+
 # Separated LoRA helpers.
 
 
@@ -5092,6 +5133,7 @@ def forward_native_grouped_mm(
         )
 
     own_gate_up = None
+    fused_inter = None
     selective_plan = None
     if hasattr(self, "gate_up_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
@@ -5173,12 +5215,15 @@ def forward_native_grouped_mm(
             bias_expanded = _gather_expert_bias(self.gate_up_proj_bias, sorted_expert_ids)
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
-        if _gate_up_is_interleaved(self):
+        _interleaved = _gate_up_is_interleaved(self)
+        if _interleaved:
             gate = mm1_out[..., ::2]
             up = mm1_out[..., 1::2]
         else:
             gate, up = mm1_out.chunk(2, dim=-1)
         own_gate_up = mm1_out if _uses_own_apply_gate(self) else None
+        if own_gate_up is None:
+            fused_inter = _fused_moe_activation(self, mm1_out, _interleaved)
 
     elif hasattr(self, "w1") and hasattr(self, "w3"):
         # Separate w1/w3 weights (older models).
@@ -5224,6 +5269,8 @@ def forward_native_grouped_mm(
     # Activation
     if own_gate_up is not None:
         inter = self._apply_gate(own_gate_up)
+    elif fused_inter is not None:
+        inter = fused_inter
     elif "GptOssExperts" in self.__class__.__name__:
         # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
@@ -5525,8 +5572,13 @@ def forward_triton_grouped_gemm(
         first_gemm_output = first_gemm_output + gate_up_lora_delta
 
     # Activation + gate*up.
+    fused_intermediate = None
+    if not _uses_own_apply_gate(self):
+        fused_intermediate = _fused_moe_activation(self, first_gemm_output, False, allow_gptoss = False)
     if _uses_own_apply_gate(self):
         intermediate = self._apply_gate(first_gemm_output)
+    elif fused_intermediate is not None:
+        intermediate = fused_intermediate
     elif hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
