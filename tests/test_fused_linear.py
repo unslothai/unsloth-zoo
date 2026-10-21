@@ -1024,7 +1024,8 @@ def test_trainable_head_single_row_chunk_backward(monkeypatch, device):
 def test_mm_into_restores_the_reduction_flags():
     flags = torch.backends.cuda.matmul
     before = (flags.allow_bf16_reduced_precision_reduction, flags.allow_fp16_reduced_precision_reduction)
-    a, b = torch.randn(8, 16), torch.randn(16, 4)
+    g = torch.Generator().manual_seed(0)
+    a, b = torch.randn(8, 16, generator = g), torch.randn(16, 4, generator = g)
     out = torch.empty(8, 4)
     fl._mm_into(out, a, b)
     torch.testing.assert_close(out, a @ b)
@@ -1033,7 +1034,10 @@ def test_mm_into_restores_the_reduction_flags():
             ac, bc = a.cuda().to(dtype), b.cuda().to(dtype)
             outc = torch.empty(8, 4, device = "cuda", dtype = dtype)
             fl._mm_into(outc, ac, bc)
-            torch.testing.assert_close(outc.float(), (ac.float() @ bc.float()).to(dtype).float())
+            ref = (ac.float() @ bc.float()).to(dtype).float()
+            # ROCm GEMMs accumulate in a different order: 1 ulp of the output dtype.
+            tol = dict(atol = 1e-5, rtol = torch.finfo(dtype).eps) if fl._IS_HIP else {}
+            torch.testing.assert_close(outc.float(), ref, **tol)
     assert (flags.allow_bf16_reduced_precision_reduction, flags.allow_fp16_reduced_precision_reduction) == before
 
 
@@ -1315,6 +1319,7 @@ def test_flash_min_rows_follows_the_card_size(monkeypatch):
             self.total_memory = int(gib * 1024**3)
 
     monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", None)
+    monkeypatch.setattr(fl, "_IS_HIP", False)
     for gib, want in ((15, 0), (22.5, 0), (24, 0), (40, 4096), (80, 4096), (96, 4096), (180, 4096)):
         fl._flash_min_rows_auto.cache_clear()
         monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device, gib = gib: Props(gib))
