@@ -703,10 +703,8 @@ _FUSED_LINEAR_CE_KWARGS = _CHUNKED_CE_KWARGS | frozenset(("label_smoothing", "lo
 
 
 def _use_chunked_ce(kwargs, target_gb):
-    # n_chunks and explicit memory targets keep the old path.
     if not _CHUNKED_CE or target_gb is not None or TARGET_GB or N_CHUNKS:
         return False
-    # The fused-CE compile opt-out keeps the path it was written for.
     if _FUSED_CE_COMPILE_DISABLED:
         return False
     if _chunked_logprob._FUSED_LINEAR:
@@ -732,13 +730,12 @@ def _scaler_scale(scaling):
     scale = getattr(scaling, "_scale", None)
     if torch.is_tensor(scale):
         return scale.detach().reshape(())
-    # Step 0: the first scaler.scale() has not allocated the scale yet, so it is still the initial value.
+    # Step 0: scale not allocated yet.
     init = getattr(scaling, "_init_scale", None)
     return float(init) if init is not None else scaling.get_scale()
 
 
 def _chunked_ce(hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs):
-    # Traceable with the fused linear op (compaction and chunk loops are inside it); otherwise opaque to dynamo.
     if not _chunked_logprob._FUSED_LINEAR:
         return _chunked_ce_opaque(
             hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,

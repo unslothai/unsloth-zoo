@@ -120,7 +120,6 @@ def test_fused_ce_routes_plain_ce_only(monkeypatch, label_smoothing, fused_linea
     weight = torch.randn(V, H)
     labels = torch.randint(0, V, (B, S))
     loss = cel.unsloth_fused_ce_loss(None, hidden, weight, None, labels, label_smoothing = label_smoothing)
-    # The fused linear kernel implements label smoothing; the older chunked CE leaves it to the torch.func path.
     assert calls["new"] == (1 if label_smoothing == 0.0 or fused_linear else 0)
     loss.backward()
     monkeypatch.setattr(cel, "_CHUNKED_CE", False)
@@ -155,7 +154,6 @@ def test_old_path_opt_ins_keep_the_old_path(monkeypatch, flag, fused_linear):
 
 
 def test_grad_scaler_scale_is_read_without_a_graph_break():
-    # Scale read from attributes: is_enabled / get_scale graph-break under dynamo and get_scale() syncs.
     from torch._dynamo.testing import CompileCounter
     from torch._dynamo.utils import counters
 

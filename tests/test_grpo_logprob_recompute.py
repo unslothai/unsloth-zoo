@@ -223,7 +223,6 @@ def test_compiled_kernels_match_eager():
     leaves = [states, head, head_bias]
     results = []
     for function in (eager, compiled):
-        # The torch chunk loop behind UNSLOTH_FUSED_LINEAR=0, whose compiled bodies this checks.
         out = function(
             states, head, index, 3, 0.5, 0.0, 4.0, 0.9, lm_head_bias = head_bias, return_entropy = True,
             fused_linear = False,
@@ -252,7 +251,6 @@ def test_cuda_autocast_matches_plain_function(rows, head_dtype, fused_linear):
     for function in (rr.chunked_hidden_states_selective_log_softmax, rr.chunked_hidden_states_selective_log_softmax_recompute):
         with torch.autocast("cuda", dtype = amp):
             if function is rr.chunked_hidden_states_selective_log_softmax_recompute:
-                # The fused linear op by default; fused_linear=False is the compiled torch chunk loop.
                 out = function(states, head, index, 16, 0.0, 0.0, 30.0, 0.8, fused_linear = fused_linear)
             else:
                 out = function(states, head, index, 16, 0.0, 0.0, 30.0, 0.8)

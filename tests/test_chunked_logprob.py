@@ -95,7 +95,6 @@ def test_matches_fp64_oracle(bias, transform, rows_per_chunk):
         states, weight, b, index, upstream,
     )
     ref = _grads(lambda: _oracle(states, weight, index, b, **transform), states, weight, b, index, upstream)
-    # The kernel runs its transforms in fp32, so fp64 inputs agree to fp32 rounding.
     _assert_close(got, ref, atol = 2e-5)
 
 
@@ -130,7 +129,6 @@ def test_masked_helper_matches_oracle_and_zeroes_masked_rows():
 
 @pytest.mark.parametrize("fused_linear", [False, True])
 def test_integer_mask_selects_rows(monkeypatch, fused_linear):
-    # TRL's completion masks are 0 / 1 integers: they must select rows on both engines, not index them.
     monkeypatch.setattr(cl, "_FUSED_LINEAR", fused_linear)
     states, weight, _, index, _ = _inputs()
     keep = torch.ones_like(index, dtype = torch.bool)
@@ -154,12 +152,10 @@ def test_chunk_rows_floor():
     assert cl.chunked_logprob_rows(10**12) == 2
 
 
-# The GRPO path: grpo_accumulated_loss imports grpo_chunked_hidden_states_logprobs under the old helper's name.
 
 def test_grpo_accumulated_loss_routes_through_the_recompute_kernel():
     src = inspect.getsource(rr.grpo_accumulated_loss)
     assert "grpo_chunked_hidden_states_logprobs as chunked_hidden_states_selective_log_softmax" in src
-    # Only the old scorer's fallback offloads (test_efficient_log_softmax_offloads_only_for_the_old_scorer).
     assert "_keeps_logits()" in src
 
 
@@ -170,7 +166,6 @@ def _old(*args, **kwargs):
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("transform", [(0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 30.0, 0.7), (1.5, 2.0, 0.0, 1.2)], ids = str)
 def test_grpo_kill_switch_gradient_is_the_old_function(monkeypatch, bias, transform):
-    # UNSLOTH_FUSED_LINEAR=0 scores grad calls with the old function too (one scorer).
     monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     states, weight, b, index, upstream = _inputs(shape = (4, 9), bias = bias, seed = 1)
     calls = []
@@ -187,7 +182,6 @@ def test_grpo_kill_switch_gradient_is_the_old_function(monkeypatch, bias, transf
 
 
 def test_grpo_route_no_grad_is_the_old_function_bitwise(monkeypatch):
-    # The pre-fused-linear engine, kept behind UNSLOTH_FUSED_LINEAR=0 (tests/test_fused_linear_routing.py covers the default).
     monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     states, weight, _, index, _ = _inputs()
     calls = []
@@ -228,18 +222,15 @@ def test_grpo_kill_switch_passes_max_rows_per_chunk(monkeypatch):
     states, weight, _, index, _ = _inputs()
     rr.grpo_chunked_hidden_states_logprobs(states, weight, index, 4, max_rows_per_chunk = 3)
     rr.grpo_chunked_hidden_states_logprobs(states, weight, index, 4)
-    # Unset, the old function keeps its own import-time UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK default.
     assert seen == [3, None]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "the fp32-output GEMM path only runs on a GPU")
 @pytest.mark.parametrize("fp32_out_gemm", [True, False])
 def test_fp32_output_gemm_only_where_fast(monkeypatch, fp32_out_gemm):
-    # HIP sets the flag False: its half-in / fp32-out GEMM is several times slower than a half GEMM.
     monkeypatch.setattr(cl, "_FP32_OUT_GEMM", fp32_out_gemm)
     a = torch.randn(8, 16, device = "cuda", dtype = torch.bfloat16)
     w = torch.randn(32, 16, device = "cuda", dtype = torch.bfloat16)
-    # bf16 in / fp32 out exists only on sm >= 80 and torch >= 2.8: elsewhere the bf16 result is kept (and must be).
     has_out_dtype = tuple(int(x) for x in torch.__version__.split(".")[:2]) >= (2, 8)
     want = torch.float32 if fp32_out_gemm and has_out_dtype and torch.cuda.get_device_capability() >= (8, 0) \
         else torch.bfloat16
@@ -274,7 +265,6 @@ def test_chunk_budget_reads_the_head_device(monkeypatch):
 
 
 def test_forward_casts_the_head_once(monkeypatch):
-    # The pre-fused-linear engine, kept behind UNSLOTH_FUSED_LINEAR=0 (tests/test_fused_linear_routing.py covers the default).
     monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     weights = []
     project = cl._project
@@ -321,7 +311,6 @@ def test_grpo_route_hands_support_and_fp32_head_calls_to_the_old_function(monkey
 
 
 def test_masked_logprobs_forwards_max_rows_per_chunk(monkeypatch):
-    # unsloth_chunked_logprobs takes max_rows_per_chunk; the masked variant must accept and forward it too.
     from unsloth_zoo.fused_losses import fused_linear as fl
 
     monkeypatch.setattr(cl, "_FUSED_LINEAR", True)
@@ -339,7 +328,6 @@ def test_masked_logprobs_forwards_max_rows_per_chunk(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_public_scorer_matches_the_grpo_policy_scorer():
-    # Unsloth builds before grpo_chunked_hidden_states_logprobs score old / reference log-probs with the public
     # function, while grpo_accumulated_loss scores the policy with the fused kernel: identical frozen weights must
     # give a ratio of exactly 1.
     if not cl._FUSED_LINEAR:
@@ -400,8 +388,6 @@ def test_efficient_log_softmax_offloads_only_for_the_old_scorer(monkeypatch, fus
 
 @pytest.mark.parametrize("flag", ["UNSLOTH_GRPO_CHUNKED_LOGPROBS", "UNSLOTH_FUSED_LINEAR"])
 def test_grpo_switches_keep_entropy_policy_and_reference_on_one_scorer(flag):
-    # Either switch sends old / ref scoring to the old chunked function, so the entropy policy pass (the recompute
-    # function) must leave the fused kernel too: identical policies then score bit-identically (ratio 1).
     import json, os, subprocess, sys
     from unsloth_zoo.fused_losses import fused_linear as fl
     if torch.cuda.is_available() and not fl._HAS_TRITON:

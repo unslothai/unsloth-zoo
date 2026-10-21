@@ -16,9 +16,7 @@
 
 """Per-token log-probabilities of `hidden @ lm_head.T` without keeping `[tokens, vocab]` logits for backward.
 
-Forward projects a fixed number of rows at a time and keeps only the per-token logsumexp; backward recomputes each
-chunk's logits and turns them into the logits gradient. Peak memory is one chunk, whatever the sequence length.
-Autograd over a chunked loop instead keeps every chunk's logits until backward (bf16 tokens x vocab).
+Forward keeps only per-token logsumexp; backward recomputes each chunk's logits. Peak memory is one chunk.
 """
 
 __all__ = [
@@ -45,7 +43,6 @@ def _env_float(name, default):
         return default
 
 
-# Per chunk: fp32 logits (log-probs) or half logits (CE) plus a half logits gradient; the compiled bodies fuse the rest.
 _BYTES_PER_LOGIT = 8.0
 _CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 2.0)
 _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
@@ -63,22 +60,18 @@ def _default_chunk_gb(device = None):
 
 
 def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None, device = None):
-    """Rows per chunk so that one chunk's logits stay near `target_gb`, and with `n_rows` at most an eighth of them
-    (min `UNSLOTH_LOGPROB_MIN_ROWS`, 512), so a short batch is not projected in one or two
-    near-full chunks. At least 2: a one-row head gradient
-    is a K=1 matmul Inductor mis-lowers under dynamic shapes (see chunked_hidden_states_selective_log_softmax)."""
+    """Rows per chunk keeping one chunk's logits near `target_gb`. At least 2: a one-row head gradient is a K=1
+    matmul Inductor mis-lowers under dynamic shapes."""
     target_gb = _default_chunk_gb(device) if target_gb is None else target_gb
     rows = int(target_gb * (1024**3) / (max(int(vocab_size), 1) * _BYTES_PER_LOGIT))
     if n_rows is not None:
         rows = min(rows, max(_MIN_ROWS, -(-int(n_rows) // 8)))
-    # UNSLOTH_CE_CHUNK_ALIGN=1: whole 128-row tiles, as chunk_row_bounds does, unless that shrinks a chunk by > 1/4.
     aligned = (rows // CHUNK_ALIGN_ROWS) * CHUNK_ALIGN_ROWS if CHUNK_ALIGN_ROWS > 1 else 0
     if aligned and 4 * aligned >= 3 * rows:
         rows = aligned
     return max(rows, 2)
 
 
-# UNSLOTH_FUSED_LINEAR=0 keeps the autograd Functions below for every public entry point.
 _FUSED_LINEAR = os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
 
 
@@ -103,7 +96,6 @@ def _forward_stats(logits, targets, scalars, has_mul: bool, has_div: bool, has_c
 
 
 def _logits_grad(logits, targets, lse, grad, scalars, has_mul: bool, has_div: bool, has_cap: bool, out_dtype):
-    # d logp_t / d z_v = onehot(t)_v - softmax(z)_v, chained back through temperature, softcap and scale.
     x = logits.float()
     if has_mul:
         x = x * scalars[1]
@@ -139,7 +131,6 @@ def _run(name, fn, *args):
         # Only rows are dynamic: a symbolic vocab makes Inductor's row reductions ~3x slower.
         compiled = _compiled[name] = torch.compile(fn, dynamic = None, fullgraph = True, options = torch_compile_options)
     for x in args:
-        # Else the second row count recompiles each body.
         if torch.is_tensor(x) and x.dim() >= 1 and x.shape[0] > 1:
             torch._dynamo.maybe_mark_dynamic(x, 0)
     try:
@@ -151,12 +142,12 @@ def _run(name, fn, *args):
         return fn(*args)
 
 
-# ROCm's half-in / fp32-out GEMM is a slow fallback (6-14x), so HIP keeps half outputs.
+# ROCm's half-in / fp32-out GEMM is a slow fallback.
 _FP32_OUT_GEMM = torch.version.hip is None
 
 
 def _mm_fp32(a, b):
-    """a @ b with an fp32 result for half inputs, so a vocab-long sum is rounded once, when cast to the grad dtype."""
+    """a @ b with an fp32 result for half inputs, so a vocab-long sum is rounded once."""
     if _FP32_OUT_GEMM and a.dtype in (torch.float16, torch.bfloat16) and a.is_cuda:
         try:
             return torch.mm(a, b, out_dtype = torch.float32)
@@ -186,8 +177,7 @@ def _project(hidden, weight, bias, compute_dtype, fp32_out = False):
 class UnslothChunkedLogProbs(torch.autograd.Function):
     """logp[i] = log_softmax(transform(hidden[i] @ weight.T + bias) / temperature)[targets[i]] for hidden [N, H].
 
-    Returns (logps [N] float32, mean_logits [N] float32 or None). mean_logits is the vocab mean of the transformed
-    logits before temperature (what `logits.mean()` metrics read), not differentiable.
+    Returns (logps [N] float32, mean_logits [N] float32 or None, non-differentiable, pre-temperature).
     """
 
     @staticmethod
@@ -240,7 +230,7 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
         grad_logps = grad_logps.float()
         n = hidden.shape[0]
         grad_hidden = torch.empty_like(hidden) if need_h else None
-        # In the head's dtype, like the fused CE path: an fp32 [V, H] buffer costs GiBs on a trainable half head.
+        # Head dtype: an fp32 [V, H] buffer costs GiBs on a trainable half head.
         grad_weight = torch.zeros_like(weight) if need_w else None
         grad_bias = torch.zeros(bias.shape, device = bias.device, dtype = torch.float32) if need_b else None
         w = weight.to(compute_dtype)
@@ -283,8 +273,7 @@ def unsloth_chunked_logprobs(
 ):
     """Per-token log-probs for hidden_states [..., H] and index [...] (valid token ids), shape [...] float32.
 
-    Same contract as chunked_hidden_states_selective_log_softmax, but backward recomputes logits per chunk instead of
-    keeping them. On a split model the math runs on the head's device and the result comes back to the caller's.
+    Same contract as chunked_hidden_states_selective_log_softmax, but backward recomputes logits per chunk.
     """
     if _FUSED_LINEAR:
         from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
@@ -321,7 +310,7 @@ _MASKED_LOGPROBS_KWARGS = frozenset((
 
 def unsloth_masked_logprobs(hidden_states, lm_head, labels, mask = None, ignore_index = -100, **kwargs):
     """Like unsloth_chunked_logprobs, but only rows where `mask` (default labels != ignore_index) is set reach the head;
-    the rest are 0. `masked_scatter` keeps an all-masked batch connected to the graph as a differentiable zero."""
+    the rest are 0. `masked_scatter` keeps an all-masked batch connected to the graph."""
     if mask is None:
         mask = labels != ignore_index
     mask = mask.to(device = hidden_states.device, dtype = torch.bool)  # a 0 / 1 integer mask selects, never indexes
@@ -349,10 +338,7 @@ def unsloth_masked_logprobs(hidden_states, lm_head, labels, mask = None, ignore_
 class UnslothChunkedCE(torch.autograd.Function):
     """sum(-logp[i] for labelled rows) / divisor, with the gradient taken chunk by chunk in forward.
 
-    Cross entropy is a sum over tokens, so unlike preference losses its gradient is known in forward: each chunk's
-    logits gradient is (softmax - onehot) / divisor, turned into the hidden (and head) gradient right away and the
-    logits freed. No recompute, one chunk resident. `scaling` (fp16 GradScaler) multiplies the stored gradients so
-    they do not underflow in half precision; backward divides it back out.
+    `scaling` (fp16 GradScaler) multiplies the stored gradients; backward divides it back out.
     """
 
     @staticmethod
@@ -414,8 +400,7 @@ class UnslothChunkedCE(torch.autograd.Function):
 
 
 def _ce_targets(labels, mask, shift_labels, ignore_index, device):
-    """Flat next-token targets with unlabelled (and `mask == 0`) positions at ignore_index, in plain torch so a compiled
-    caller traces it. A pre-shifted `labels` (shift_labels=False) takes `mask` at the same positions."""
+    """Flat next-token targets with unlabelled (and `mask == 0`) positions at ignore_index; plain torch so it traces."""
     labels = labels.to(device)
     if mask is not None:
         mask = mask.to(device)
@@ -455,7 +440,6 @@ def unsloth_chunked_ce_loss(
         from unsloth_zoo.fused_losses.fused_linear import fused_linear_cross_entropy
 
         if logits_bias is not None:
-            # Bart's final_logits_bias is [1, vocab].
             logits_bias = logits_bias.reshape(-1)
 
         if rows_per_chunk is None and target_gb is not None:

@@ -28,7 +28,6 @@ import sys
 
 import pytest
 
-# The subprocess builds a PEFT LoRA model: a stack without peft (the zoo macOS / MLX leg) cannot run it.
 pytest.importorskip("peft")
 pytest.importorskip("transformers")
 
@@ -96,7 +95,6 @@ def _probe(tmp_path, value):
 @pytest.mark.parametrize("value", [None, "1", "partial"], ids = ["unset", "1", "partial"])
 def test_compile_disable_keeps_optimizations(tmp_path, value):
     r = _probe(tmp_path, value)
-    # The rewritten classes and the fast LoRA forward install in every mode.
     assert r["mlp_module"].startswith("unsloth_compiled_module_llama"), r
     assert r["lora_forward"] == "unsloth_forward", r
     assert r["sdpa_fix"] is True, r
@@ -104,7 +102,6 @@ def test_compile_disable_keeps_optimizations(tmp_path, value):
     if value is None:
         assert r["compile_decos"] > 0 and r["fallback_is_id"] is False, r
         return
-    # Only torch.compile is off: no decorator written, no Dynamo frame traced.
     assert r["compile_decos"] == 0, r
     assert r["fallback_is_id"] is True, r
     assert r["frames"] == 0, r

@@ -221,7 +221,6 @@ def test_grpo_route_reaches_the_op_with_and_without_grad(transform):
     with torch.no_grad():
         scored = rr.grpo_chunked_hidden_states_logprobs(states, weight, index, 4, *transform)
     assert _calls("logprobs") == before + 2
-    # Old / reference logprobs and the policy's come from one kernel: the on-policy ratio starts at exactly 1.
     assert torch.equal(scored, got.detach())
     ref_states = states.detach().clone().requires_grad_(True)
     ref = rr.chunked_hidden_states_selective_log_softmax(ref_states, weight, index, 4, *transform)
@@ -233,7 +232,6 @@ def test_grpo_route_reaches_the_op_with_and_without_grad(transform):
 def test_grpo_route_passes_max_rows_per_chunk(monkeypatch):
     seen = []
     real = fl.fused_linear_logprobs
-    # A cap on the kernel's own chunk size, never a fixed chunk (that would bypass the memory budget).
     monkeypatch.setattr(fl, "fused_linear_logprobs",
                         lambda *a, **k: seen.append((k.get("rows_per_chunk"), k.get("max_rows_per_chunk"))) or real(*a, **k))
     states, weight, index, _ = _grpo_inputs()
@@ -253,7 +251,6 @@ def test_grpo_truncated_support_keeps_the_old_function():
 
 
 def test_grpo_kill_switch_keeps_one_scorer_for_every_pass(monkeypatch):
-    # UNSLOTH_FUSED_LINEAR=0: grad and no-grad passes both take the old function.
     monkeypatch.setattr(cl, "_FUSED_LINEAR", False)
     seen = []
     real = rr.chunked_hidden_states_selective_log_softmax
@@ -320,7 +317,6 @@ def test_linear_mean_logits_softcap_matches_the_torch_loop(monkeypatch):
 
 
 def test_preference_explicit_chunk_budget_keeps_the_chunked_function(monkeypatch):
-    # An explicit UNSLOTH_FUSED_PREFERENCE_CHUNK_MB keeps the chunked Function rather than being ignored.
     import importlib
     torch.manual_seed(0)
     hidden = torch.randn(B, S, H, requires_grad = True)
@@ -343,7 +339,6 @@ def test_preference_explicit_chunk_budget_keeps_the_chunked_function(monkeypatch
 
 
 def test_overwrite_keeps_the_in_place_ce_path(monkeypatch):
-    # overwrite=True writes the hidden-state gradient into hidden_states: a memory opt-in only the old path implements.
     from unsloth_zoo.fused_losses import cross_entropy_loss as cel_mod
 
     seen = []

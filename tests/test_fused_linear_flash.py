@@ -54,8 +54,6 @@ def _transform(z, mul, cap):
 
 
 def _inputs(dtype, N, H, V, seed = 0, late_max = False, with_bias = False):
-    # Peaked rows (p ~ 0.6 / 0.3). late_max: the likely tokens sit in the last vocab tile, so every row's running
-    # max moves after the first tiles and the accumulator is rescaled.
     g = torch.Generator().manual_seed(seed)
     w = torch.randn(V, H, generator = g)
     w = w / w.norm(dim = 1, keepdim = True)
@@ -105,13 +103,10 @@ def test_flash_matches_oracle_and_is_never_less_accurate_than_chunks(monkeypatch
         assert float((lp.double() - lp64).abs().max()) < 2e-4, dtype
         assert _rel(grad, grad64) < 1e-2, (dtype, _rel(grad, grad64))
         assert _rel(grad, grad64) <= 1.05 * _rel(grad_c, grad64) + 1e-6, (dtype, _rel(grad, grad64), _rel(grad_c, grad64))
-        # Dropped rows get no gradient.
         assert not grad[~mask].any()
 
 
 def test_flash_rescales_when_the_row_max_moves_late(monkeypatch):
-    # Every row's max is in the last tile; more rows than one wave of programs (a cross-warp race on the running max
-    # only showed past the first wave), and several row chunks.
     monkeypatch.setattr(fl, "_BWD_ROWS", 1536)
     dtype = _dtypes()[-1]
     h, w, _, t, mask = _inputs(dtype, 4096, 64, 40001, seed = 1, late_max = True)
@@ -122,7 +117,6 @@ def test_flash_rescales_when_the_row_max_moves_late(monkeypatch):
     lp64, grad64 = _oracle(h, w, None, t, mask, 1.0, 0.0, 0.0, g)
 
     def rows(x):
-        # Rows with p(target) ~ 1 have a ~1e-6 gradient: the relative error there is the same on both paths.
         return ((x.double() - grad64).norm(dim = 1) / grad64.norm(dim = 1).clamp_min(1e-30))[mask]
 
     assert _rel(grad, grad64) <= 1.05 * _rel(grad_c, grad64) + 1e-6, (_rel(grad, grad64), _rel(grad_c, grad64))
@@ -133,8 +127,6 @@ def test_flash_rescales_when_the_row_max_moves_late(monkeypatch):
 
 @pytest.mark.parametrize("flash", [True, False])
 def test_no_grad_frozen_and_trainable_passes_are_bit_identical(monkeypatch, flash):
-    # Several row chunks and vocab tiles, compacted rows. Under the kill switch the frozen and no-grad passes stay
-    # chunked (still identical to each other) and the flash path never runs.
     monkeypatch.setattr(fl, "_FLASH", flash)
     monkeypatch.setattr(fl, "_BWD_ROWS", 48)
     for dtype in _dtypes():
@@ -192,7 +184,6 @@ def test_flash_cross_entropy(monkeypatch, cap, mul, scaling):
 
 
 def test_turing_cross_entropy_keeps_the_chunked_path(monkeypatch):
-    # T4: cross entropy stays chunked (faster there); the log-prob passes still take the tiles.
     monkeypatch.setattr(fl, "_flash_ce_ok", lambda device: False)
     h, w, _, t, _ = _inputs(_dtypes()[-1], 200, 64, 40001, seed = 4)
     n = fl.CALLS["flash"]
@@ -212,7 +203,6 @@ def test_trainable_head_cross_entropy_keeps_the_chunked_path():
 
 
 def test_flash_transient_is_one_vocab_tile(monkeypatch):
-    # The forward gradient's logits buffer is [rows, tile], not [rows, V].
     shapes = []
     real = fl._Buffers.__init__
 
@@ -249,7 +239,6 @@ def test_flash_fullgraph_compile_no_breaks(kind):
     compiled(hc, t, mask).backward()
     he = h.clone().requires_grad_(True)
     step(he, t, mask).backward()
-    # Turing cross entropy stays on the chunked path; the compiled graph must still hold it without a break.
     assert fl.CALLS["flash"] == n + (2 if kind == "lp" or fl._flash_ce_ok(h.device) else 0)
     assert torch.equal(hc.grad, he.grad)
     assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
@@ -257,7 +246,6 @@ def test_flash_fullgraph_compile_no_breaks(kind):
 
 
 def test_below_min_rows_frozen_and_no_grad_stay_chunked_and_identical(monkeypatch):
-    # The default keeps small batches on the [rows, V] chunks (faster there on G4 / A100); both passes decide alike.
     monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", 4096)
     h, w, _, t, mask = _inputs(_dtypes()[-1], 300, 64, 40001, seed = 7)
     n, tiled = fl.CALLS["flash"], fl.CALLS["tiled"]
@@ -272,7 +260,6 @@ def test_below_min_rows_frozen_and_no_grad_stay_chunked_and_identical(monkeypatc
 
 
 def test_flash_reads_a_strided_head(monkeypatch):
-    # A transposed-storage head (w.t().contiguous().t()): the forward gradient's target row is read with both strides.
     h, w, _, t, _ = _inputs(_dtypes()[-1], 300, 64, 40001, seed = 7)
     ws = w.t().contiguous().t()
     assert ws.stride(1) != 1 and torch.equal(ws, w)
@@ -285,5 +272,4 @@ def test_flash_reads_a_strided_head(monkeypatch):
     n = fl.CALLS["flash"]
     a, b = grad(w), grad(ws)
     assert fl.CALLS["flash"] == n + 2
-    # cuBLAS may pick another kernel for the transposed storage: same values to GEMM rounding (the bug was ~100%).
     assert float((b.double() - a.double()).norm() / a.double().norm()) < 1e-2
