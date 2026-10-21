@@ -107,6 +107,8 @@ CASES = [
     (3, 96, 160, [100, 0, 300], True, True, 128),
     (3, 96, 160, [0, 0, 0], True, False, 64),            # every expert empty
     (16, 256, 128, [12] * 16, False, True, 256),
+    (2, 128, 192, [300, 260], False, True, 64),          # >= 256 rows per expert: two M sub-tiles
+    (2, 128, 192, [300, 260], True, False, 64),
 ]
 
 

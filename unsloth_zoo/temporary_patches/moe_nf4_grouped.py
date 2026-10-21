@@ -298,13 +298,18 @@ def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer,
 # The select-tree codebook (LUT 1) beat the gather 3-6x in every tuned shape; pairs along N take
 # BN 64 so a tile row stays in one 64-element absmax block (one scale per row); per-element decode
 # (odd contiguous dim) takes small tiles, its int64 index tiles are register heavy.
+# From 256 rows per expert two BM 64 row blocks share each decoded tile (MSUB 2): 3-7% faster on
+# L4 than BM 128 / 256 there; BM 256 and MSUB 2 at BM 128 were slower everywhere.
 def _fixed_config(m_hint, inner, outer, pair):
     bm = 16 if m_hint <= 16 else 32 if m_hint <= 32 else 64 if m_hint <= 64 else 128
+    msub = 1
+    if m_hint >= 256:
+        bm, msub = 64, 2
     bn = 128 if pair == 2 else 64
     bn = min(bn, max(16, triton.next_power_of_2(outer)))
     bk = 64 if pair == 2 else 32 if pair == 0 else min(64, max(16, triton.next_power_of_2(inner)))
     warps = 8 if bm * bn >= 128 * 128 else 4
-    return {"BM": bm, "BN": bn, "BK": bk, "LUT": 1, "MSUB": 1}, warps, 3
+    return {"BM": bm, "BN": bn, "BK": bk, "LUT": 1, "MSUB": msub}, warps, 3
 
 
 CONFIGS_USED = {}
