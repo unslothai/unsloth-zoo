@@ -290,3 +290,29 @@ def test_interleave_cache_fills_once_under_compile(monkeypatch):
     assert len(S._INTERLEAVE_CACHE) == 1 and next(iter(S._INTERLEAVE_CACHE.values()))[3] is cached
     torch.testing.assert_close(a, cached)
     S._INTERLEAVE_CACHE.clear()
+
+
+def test_probe_through_the_custom_op_sees_the_module(monkeypatch):
+    # UNSLOTH_MOE_SONIC_FASTCALL=0: the probe runs the custom op, whose eager body calls
+    # get_sonic_module() again before the first call has returned.
+    import sys
+    import types
+
+    fake = types.SimpleNamespace(name = "sonic")
+    kernels = types.ModuleType("kernels")
+    kernels.get_kernel = lambda *a, **k: fake
+    monkeypatch.setitem(sys.modules, "kernels", kernels)
+    for name in ("_apply_cutlass_dsl_shim", "_install_sonic_module_path", "_record_device_capabilities",
+                 "_concat_layout_supported", "_pinned_ops"):
+        monkeypatch.setattr(S, name, lambda *a, **k: None)
+    monkeypatch.setattr(S, "_device_is_supported", lambda: (True, None))
+
+    def probe(module):
+        if S.get_sonic_module() is not module:
+            raise RuntimeError("custom op saw no module")
+
+    monkeypatch.setattr(S, "_probe_sonic", probe)
+    monkeypatch.setattr(S, "_SONIC_PROBED", False)
+    monkeypatch.setattr(S, "_SONIC_MODULE", None)
+    monkeypatch.delenv("UNSLOTH_DISABLE_MOE_SONIC", raising = False)
+    assert S.get_sonic_module() is fake

@@ -248,13 +248,16 @@ def get_sonic_module():
         _SONIC_REASON = f"could not load kernels-community/sonic-moe: {exc}"
         return None
     _install_sonic_module_path(module)
+    # Published before the probe: with UNSLOTH_MOE_SONIC_FASTCALL=0 the probe goes through the
+    # custom op, whose eager body calls get_sonic_module() again.
+    _SONIC_MODULE = module
     try:
         _probe_sonic(module)
     except Exception as exc:
+        _SONIC_MODULE = None
         _SONIC_REASON = f"sonic-moe probe call failed: {exc}"
         return None
 
-    _SONIC_MODULE = module
     _SONIC_REASON = None
     _record_device_capabilities()
     _log("Unsloth: sonic-moe MoE backend is available.")
