@@ -275,8 +275,9 @@ def _env_flag(name, default):
 # Every level above was verified bit-identical (rel max err 0.000e+00) to the
 # public entry point at every M.
 #
-# The custom op is still used verbatim when `torch.compiler.is_compiling()`, so
-# anything that traces this code still sees a registered, fake-implemented op.
+# Under `torch.compiler.is_compiling()` the same pinned call goes through a
+# registered, fake-implemented custom op (`_pinned_ops`), so tracing sees one op
+# and runs the same config as eager.
 # ---------------------------------------------------------------------------
 
 _GEMM_INTERFACE = None
