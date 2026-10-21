@@ -497,13 +497,17 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 # Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop; one Triton launch beats it for small experts.
 # Measured max average rows per expert per class: "lora" (a dim <= 32), "many" / "few" (>= / < 64 experts),
-# "dw" (base weight grad). sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100 have native grouped GEMMs.
-# sm121 (GB10 / DGX Spark) takes sm120's tiles and limits (1.15x on Qwen3.5-35B-A3B QLoRA, unsloth-zoo#1661).
+# "dw" / "dw_few" (base weight grad, >= / < 64 experts). sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100
+# have native grouped GEMMs. sm121 (GB10 / DGX Spark) takes sm120's tiles and limits (1.15x on Qwen3.5-35B-A3B
+# QLoRA, unsloth-zoo#1661) except sm120's "dw" 256, measured on RTX PRO 6000 only.
+# sm80 "few" 512: Triton forward + dX are 4-40% faster than cuBLAS at 257-512 rows on A100 (gpt-oss-20b, Mixtral,
+# Qwen1.5-MoE). sm120 "dw" 256: Triton dW is 13-26% faster at 65-256 rows for Qwen3-30B-A3B; "dw_few" stays 64,
+# as Triton dW loses ~10% on Mixtral's gate_up there.
 _TRITON_GROUPED_MM_AUTO_ROWS = {
-    (8, 0):  {"lora": -1, "many": 2048, "few": 256, "dw": 128},
-    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
-    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
-    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0},
+    (8, 0):  {"lora": -1, "many": 2048, "few": 512, "dw": 128, "dw_few": 128},
+    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
+    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64,  "dw_few": 64},
+    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
@@ -607,7 +611,8 @@ def _grouped_mm_triton_wgrad_impl(inputs, grad, offsets):
         mg.GENERIC_CALLS["fallback"] += 1
         return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
     E, K, N = offsets.shape[0], inputs.shape[1], grad.shape[1]
-    if min(K, N) > 32 and not _rows_within(_triton_grouped_mm_max_rows(inputs.device.index, "dw"), inputs.shape[0], E):
+    dw_kind = "dw" if E >= 64 else "dw_few"
+    if min(K, N) > 32 and not _rows_within(_triton_grouped_mm_max_rows(inputs.device.index, dw_kind), inputs.shape[0], E):
         # A trainable base stack's dW (full finetuning): cuBLAS beats the Triton reduction at these sizes.
         return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
     return mg.generic_grouped_wgrad(inputs, grad, offsets, E)
