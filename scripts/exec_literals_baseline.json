@@ -450,16 +450,16 @@
     {
       "file": "unsloth_zoo/temporary_patches/t5.py",
       "sink": "compile",
-      "digest": "fd08cdddd870c92c",
+      "digest": "db03349e3b7fe7de",
       "count": 1,
-      "reason": "Installs a UMT5 method compiled from an AST this file built from transformers source, with one literal expression swapped."
+      "reason": "Installs the UMT5ForConditionalGeneration.forward compiled from an AST this file built from transformers source, with one literal test swapped."
     },
     {
       "file": "unsloth_zoo/temporary_patches/t5.py",
       "sink": "exec",
-      "digest": "b1fc3325e476ee2f",
+      "digest": "41daf1963df86e7e",
       "count": 1,
-      "reason": "Installs a UMT5 method compiled from an AST this file built from transformers source, with one literal expression swapped."
+      "reason": "Installs the UMT5ForConditionalGeneration.forward compiled from an AST this file built from transformers source, with one literal test swapped."
     },
     {
       "file": "unsloth_zoo/vllm_gdn_replayssm.py",

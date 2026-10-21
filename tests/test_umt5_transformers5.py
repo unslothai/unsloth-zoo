@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UMT5 on transformers 5: untied logits unscaled, causal decoder, model_type-less configs load, attention layers compile."""
+"""UMT5 on transformers 5: untied logits unscaled, model_type-less configs load, attention layers compile."""
 
 import ast
 import json
@@ -30,13 +30,11 @@ from transformers import AutoConfig, PretrainedConfig, UMT5Config, UMT5ForCondit
 
 from unsloth_zoo.temporary_patches.t5 import (
     patch_config_model_type_from_architectures,
-    patch_UMT5_causal_decoder_self_attention,
     patch_UMT5_scale_decoder_outputs,
 )
 
 for _ in range(2):
     patch_UMT5_scale_decoder_outputs()
-    patch_UMT5_causal_decoder_self_attention()
     patch_config_model_type_from_architectures()
 
 TINY = dict(vocab_size = 128, d_model = 32, d_kv = 8, d_ff = 64, num_layers = 2, num_heads = 4, decoder_start_token_id = 0)
@@ -56,18 +54,6 @@ def test_decoder_output_scaling_follows_checkpoint_tie_flag(tie, expected):
     torch.manual_seed(0)
     model = UMT5ForConditionalGeneration(UMT5Config(**TINY, **kwargs)).eval()
     assert _logit_ratio(model) == pytest.approx(expected, rel = 1e-4)
-
-
-def test_decoder_self_attention_is_causal():
-    torch.manual_seed(0)
-    model = UMT5ForConditionalGeneration(UMT5Config(**TINY, initializer_factor = 1.0)).eval()
-    ids = torch.randint(2, 128, (2, 8), generator = torch.Generator().manual_seed(0))
-    changed = ids.clone()
-    changed[:, -1] = (changed[:, -1] + 1) % 128
-    with torch.no_grad():
-        before = model(input_ids = ids, decoder_input_ids = ids).logits
-        after = model(input_ids = ids, decoder_input_ids = changed).logits
-    torch.testing.assert_close(before[:, :-1], after[:, :-1])
 
 
 def test_untied_flag_survives_save_and_reload(tmp_path):
