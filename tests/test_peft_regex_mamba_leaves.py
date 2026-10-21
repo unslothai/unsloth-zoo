@@ -84,7 +84,6 @@ def test_wrapped_mamba_language_model_is_recognised():
 
 
 def test_nemotron_3_5_bolt_language_model_is_recognised():
-    # Bolt's remote-code Omni config nests its language model as llm_config.model_type = "nemotron_h_puzzle".
     model = _Model("nemotron_h_omni")
     model.config.llm_config = SimpleNamespace(model_type = "nemotron_h_puzzle")
     matched = _matched(model, get_peft_regex(model))
