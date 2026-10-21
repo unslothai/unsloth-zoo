@@ -455,6 +455,14 @@ def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
         np.testing.assert_array_equal(_bits(actual), _bits(expected))
 
 
+def test_slot_readers_kept_are_bounded_in_bytes(monkeypatch):
+    monkeypatch.setattr(zoo_offload, "_PENDING_BYTES", 1000)
+    slots = zoo_offload._ExpertSlots([], 4, 2)
+    for _ in range(3):
+        slots.read_by(mx.zeros((100,), dtype = mx.float32) + 1)  # 400 bytes each
+    assert len(slots.readers) == 0  # 1200 bytes kept in all: evaluated, not held
+
+
 def test_concurrent_offloaded_loads_restore_the_cache_limit(monkeypatch):
     # Two loads finishing at once must not both take the cap as the first model's: the second
     # would save the capped limit as the one to restore.

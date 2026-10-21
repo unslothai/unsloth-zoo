@@ -586,10 +586,10 @@ class _ExpertSlots:
         return self.map[indices].astype(indices.dtype)
 
     def read_by(self, *outputs):
-        """Keep ``outputs``, computed from the slots, for the next miss to evaluate first; a large
-        output, or more than a few, are evaluated now."""
-        large = sum(output.nbytes for output in outputs) > _PENDING_BYTES
+        """Keep ``outputs``, computed from the slots, for the next miss to evaluate first; once more
+        than a few, or more than ``_PENDING_BYTES`` in all, are kept, they are evaluated now."""
         self.readers.extend(outputs)
+        large = sum(reader.nbytes for reader in self.readers) > _PENDING_BYTES
         if large or len(self.readers) > _PENDING_READERS:
             mx.eval(self.readers)
             self.readers.clear()
