@@ -19,8 +19,6 @@ The CPU tests pin the layout facts the zero-copy path depends on, emulating quac
 `concat_to_interleave(t, 1 - t.leading_dim)` with `as_strided`. The GPU test runs only
 where the kernels-community/sonic-moe build loads (sm90 / sm100 with `kernels`).
 """
-import os
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -41,8 +39,8 @@ def _quack_concat_view_b(weight_t):
 
 
 def test_concat_view_of_k_major_is_the_interleaved_weight():
-    E, H, I = 3, 16, 8
-    W = torch.randn(E, 2 * I, H)            # HF storage [E, 2I, H]
+    E, H, inter = 3, 16, 8
+    W = torch.randn(E, 2 * inter, H)            # HF storage [E, 2I, H]
     Wt = W.transpose(-2, -1)                # grouped_mm view [E, H, 2I], K-major
     assert S._is_k_major_gate_up(Wt)
     assert torch.equal(_quack_concat_view_b(Wt), S._interleave_columns(Wt))
@@ -51,8 +49,8 @@ def test_concat_view_of_k_major_is_the_interleaved_weight():
 def test_concat_view_of_n_major_interleaves_the_contraction_dim():
     # The old probe passed a contiguous [E, H, 2I]: concat then permutes K (= H),
     # which is not the gate/up interleave and is rejected by the eligibility check.
-    E, H, I = 2, 16, 8
-    Wn = torch.randn(E, H, 2 * I)
+    E, H, inter = 2, 16, 8
+    Wn = torch.randn(E, H, 2 * inter)
     assert not S._is_k_major_gate_up(Wn)
     assert not torch.equal(_quack_concat_view_b(Wn), S._interleave_columns(Wn))
 
@@ -60,9 +58,9 @@ def test_concat_view_of_n_major_interleaves_the_contraction_dim():
 def test_dx_concat_on_hf_storage_matches_chunked_dx():
     # dX = d_pre @ W: B is the HF [E, 2I, H] storage (N-major), concat interleaves K = 2I,
     # so an interleaved d_pre gives the same dX as the chunked d_pre on the plain weight.
-    E, H, I, M = 1, 16, 8, 5
-    W = torch.randn(E, 2 * I, H, dtype=torch.float64)
-    dpre = torch.randn(M, 2 * I, dtype=torch.float64)
+    E, H, inter, M = 1, 16, 8, 5
+    W = torch.randn(E, 2 * inter, H, dtype=torch.float64)
+    dpre = torch.randn(M, 2 * inter, dtype=torch.float64)
     dx_ref = dpre @ W[0]
     dx = S._interleave_columns(dpre) @ _quack_concat_view_b(W)[0]
     torch.testing.assert_close(dx, dx_ref)
@@ -77,10 +75,10 @@ def test_sqrt2_signature_of_column_order_mismatch():
 
 
 def test_interleaved_lora_up_projection_gives_interleaved_delta():
-    E, H, I, R, M = 1, 16, 8, 4, 6
+    H, inter, R, M = 16, 8, 4, 6
     x = torch.randn(M, H, dtype=torch.float64)
     A = torch.randn(H, R, dtype=torch.float64)
-    B = torch.randn(R, 2 * I, dtype=torch.float64, requires_grad=True)
+    B = torch.randn(R, 2 * inter, dtype=torch.float64, requires_grad=True)
     delta_il = (x @ A) @ S._interleave_columns(B)
     torch.testing.assert_close(delta_il, S._interleave_columns((x @ A) @ B))
     g = torch.randn_like(delta_il)
@@ -93,10 +91,10 @@ def test_interleaved_lora_up_projection_gives_interleaved_delta():
 
 
 def test_swiglu_backward_interleaved_matches_autograd():
-    M, I = 7, 12
-    pre = torch.randn(M, 2 * I, dtype=torch.float64, requires_grad=True)
-    out = F.silu(pre[:, :I]) * pre[:, I:]
-    g = torch.randn(M, I, dtype=torch.float64)
+    M, inter = 7, 12
+    pre = torch.randn(M, 2 * inter, dtype=torch.float64, requires_grad=True)
+    out = F.silu(pre[:, :inter]) * pre[:, inter:]
+    g = torch.randn(M, inter, dtype=torch.float64)
     (out * g).sum().backward()
     d_il = S._swiglu_backward_interleaved(S._interleave_columns(pre.detach()), g)
     torch.testing.assert_close(d_il, S._interleave_columns(pre.grad))
@@ -106,6 +104,7 @@ def test_k_major_check_rejects_misaligned_strides():
     W = torch.randn(2, 6, 7, dtype=torch.bfloat16)   # H=7: 14-byte stride, not TMA aligned
     assert not S._is_k_major_gate_up(W.transpose(-2, -1))
     assert not S._is_k_major_gate_up(torch.randn(2, 7, 16).transpose(-2, -1))  # odd 2I
+    assert not S._is_k_major_gate_up(torch.randn(2, 24, 16).transpose(-2, -1))  # inter=12, rows not 16B
 
 
 def _sonic_ready():
@@ -126,18 +125,18 @@ def test_zero_copy_matches_grouped_mm(lora, monkeypatch):
 
     torch.manual_seed(0)
     dev = torch.device("cuda")
-    H, I, E, K, T, R = 256, 128, 8, 2, 512, 8
-    cfg = Qwen3MoeConfig(hidden_size=H, moe_intermediate_size=I, num_experts=E,
+    H, inter, E, K, T, R = 256, 128, 8, 2, 512, 8
+    cfg = Qwen3MoeConfig(hidden_size=H, moe_intermediate_size=inter, num_experts=E,
                          num_experts_per_tok=K, hidden_act="silu")
     experts = Qwen3MoeExperts(cfg).to(dev)
     with torch.no_grad():
         experts.gate_up_proj.normal_(0, H ** -0.5)
-        experts.down_proj.normal_(0, I ** -0.5)
+        experts.down_proj.normal_(0, inter ** -0.5)
     experts = experts.to(torch.bfloat16).requires_grad_(False)
     X0 = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
     topv, topi = torch.randn(T, E, device=dev).topk(K, dim=-1)
     W0 = torch.softmax(topv, -1).to(torch.bfloat16)
-    lora_w = [torch.randn(E, H, R, device=dev) * H ** -0.5, torch.randn(E, R, 2 * I, device=dev) * 0.05]
+    lora_w = [torch.randn(E, H, R, device=dev) * H ** -0.5, torch.randn(E, R, 2 * inter, device=dev) * 0.05]
 
     def run(fn):
         X = X0.clone().requires_grad_(True)

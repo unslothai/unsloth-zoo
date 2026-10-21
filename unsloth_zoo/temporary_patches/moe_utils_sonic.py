@@ -222,6 +222,12 @@ def get_sonic_module():
     _SONIC_REASON = None
     _log("Unsloth: sonic-moe MoE backend is available.")
     _concat_layout_supported(module)
+    try:
+        # Register the custom ops now: registering them while Dynamo traces the
+        # first compiled forward is a graph break.
+        _pinned_ops()
+    except Exception as exc:
+        _log(f"Unsloth: sonic-moe custom op registration failed ({exc}).")
     return module
 
 
@@ -627,7 +633,9 @@ def _swiglu_backward_interleaved(preact, grad_post):
 def _is_k_major_gate_up(weight):
     """[E, H, 2I] view with H at stride 1 and TMA-aligned strides: the layout
     concat_layout=("B",) reinterprets as interleaved without a copy."""
-    if weight.dim() != 3 or weight.shape[-1] % 2 != 0:
+    # 2I even, and I a multiple of 8 so the [M, I] post-activation and [M, 2I]
+    # pre-activation rows are 16-byte aligned for TMA.
+    if weight.dim() != 3 or weight.shape[-1] % 16 != 0:
         return False
     if weight.stride(-2) != 1:
         return False
