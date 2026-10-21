@@ -5561,6 +5561,22 @@ def _triton_moe_compute_dtype(module, hidden_states):
     return hidden_states.dtype if keep else torch.bfloat16
 
 
+@torch.compiler.disable
+def _moe_weight_dtype_kwargs(tuner, module, name, dtype):
+    """weight_dtype for get_or_autotune_moe_kernels when the experts differ from the activations
+    (bf16 experts under float32 activations), so tuning and the fallback configs see the real W."""
+    weight = getattr(module, name, None)
+    weight_dtype = getattr(weight, "dtype", None)
+    if weight_dtype not in (torch.float32, torch.bfloat16, torch.float16) or weight_dtype == dtype:
+        return {}
+    try:
+        if "weight_dtype" not in inspect.signature(tuner).parameters:
+            return {}  # older unsloth
+    except (TypeError, ValueError):
+        return {}
+    return {"weight_dtype": weight_dtype}
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -5623,6 +5639,7 @@ def forward_triton_grouped_gemm(
             intermediate_dim=intermediate_dim,
             top_k=top_k,
             dtype=hidden_states.dtype,
+            **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "gate_up_proj", hidden_states.dtype),
         )
 
         # Second GEMM: K = intermediate_dim, N = hidden_dim.
@@ -5632,6 +5649,7 @@ def forward_triton_grouped_gemm(
             intermediate_dim=hidden_dim // 2 if hidden_dim % 2 == 0 else hidden_dim,
             top_k=top_k,
             dtype=compute_dtype,
+            **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "down_proj", compute_dtype),
         )
 
         self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)
