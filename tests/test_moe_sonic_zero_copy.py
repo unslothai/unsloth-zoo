@@ -376,3 +376,24 @@ def test_concurrent_first_probe_waits_for_the_result(monkeypatch):
     got["second"] = S.get_sonic_module()
     first.join()
     assert got["first"] is fake and got["second"] is fake
+
+
+def test_rejected_operand_falls_back_by_its_own_device(monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_utils as MU
+
+    calls = []
+    monkeypatch.setattr(S, "_sonic_eligible", lambda *a: (False, "unsupported operand device"))
+    monkeypatch.setattr(MU, "forward_native_grouped_mm", lambda *a: calls.append("grouped_mm"))
+    monkeypatch.setattr(MU, "forward_native_moe_loop", lambda *a: calls.append("loop"))
+    seen = []
+    monkeypatch.setattr(MU, "_check_torch_grouped_mm_supported", lambda device = None: seen.append(device) or False)
+
+    class FakeCuda:
+        is_cuda = True
+        device = "cuda:1"
+
+    S.forward_sonic_moe(object(), FakeCuda(), None, None)
+    assert calls == ["loop"] and seen == ["cuda:1"]
+    monkeypatch.setattr(MU, "_check_torch_grouped_mm_supported", lambda device = None: True)
+    S.forward_sonic_moe(object(), FakeCuda(), None, None)
+    assert calls == ["loop", "grouped_mm"]

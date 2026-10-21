@@ -1009,7 +1009,11 @@ def forward_sonic_moe(
     if not ok:
         if reason not in _WARNED_FALLBACK:
             _WARNED_FALLBACK.add(reason)
-            _log(f"Unsloth: sonic-moe backend falling back to grouped_mm: {reason}.")
+            _log(f"Unsloth: sonic-moe backend falling back: {reason}.")
+        # The operand may sit on another card than the one grouped_mm was probed on.
+        from .moe_utils import _check_torch_grouped_mm_supported, forward_native_moe_loop
+        if hidden_states.is_cuda and not _check_torch_grouped_mm_supported(hidden_states.device):
+            return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
 
     module = get_sonic_module()
