@@ -800,7 +800,11 @@ def _module_spans_devices(module):
             try:
                 mapped.add(str(torch.device(value)))  # 0 and "cuda:0" are one device
             except (RuntimeError, TypeError, ValueError):
-                mapped.add(str(value))  # "disk"
+                if isinstance(value, int) and not isinstance(value, bool):
+                    # No accelerator to resolve a bare index (CPU-only torch): accelerate's ints are CUDA.
+                    mapped.add(f"cuda:{value}")
+                else:
+                    mapped.add(str(value))  # "disk"
         if len(mapped) > 1:
             return True
     devices = {parameter.device for parameter in module.parameters()}
