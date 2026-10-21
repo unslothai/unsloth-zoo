@@ -47,8 +47,7 @@ def test_concat_view_of_k_major_is_the_interleaved_weight():
 
 
 def test_concat_view_of_n_major_interleaves_the_contraction_dim():
-    # The old probe passed a contiguous [E, H, 2I]: concat then permutes K (= H),
-    # which is not the gate/up interleave and is rejected by the eligibility check.
+    # Contiguous [E, H, 2I] interleaves K instead: rejected.
     E, H, inter = 2, 16, 8
     Wn = torch.randn(E, H, 2 * inter)
     assert not S._is_k_major_gate_up(Wn)
@@ -56,8 +55,6 @@ def test_concat_view_of_n_major_interleaves_the_contraction_dim():
 
 
 def test_dx_concat_on_hf_storage_matches_chunked_dx():
-    # dX = d_pre @ W: B is the HF [E, 2I, H] storage (N-major), concat interleaves K = 2I,
-    # so an interleaved d_pre gives the same dX as the chunked d_pre on the plain weight.
     E, H, inter, M = 1, 16, 8, 5
     W = torch.randn(E, 2 * inter, H, dtype=torch.float64)
     dpre = torch.randn(M, 2 * inter, dtype=torch.float64)
@@ -293,8 +290,7 @@ def test_interleave_cache_fills_once_under_compile(monkeypatch):
 
 
 def test_probe_through_the_custom_op_sees_the_module(monkeypatch):
-    # UNSLOTH_MOE_SONIC_FASTCALL=0: the probe runs the custom op, whose eager body calls
-    # get_sonic_module() again before the first call has returned.
+    # FASTCALL=0: the probe re-enters get_sonic_module() via the custom op.
     import sys
     import types
 
@@ -320,9 +316,7 @@ def test_probe_through_the_custom_op_sees_the_module(monkeypatch):
 
 
 def test_forward_uses_the_shared_routing_sort_and_skips_the_cache_when_compiling():
-    # Source-level (the forward itself needs the SM100 kernels): routing goes through
-    # moe_utils.moe_routing_sort, and the eager-only duplicate cache is never entered while
-    # compiling or with a zero budget (a fullgraph trace would otherwise break on it).
+    # Source-level: the forward needs SM100 kernels.
     import ast
     import inspect
     import textwrap

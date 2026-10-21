@@ -1864,13 +1864,12 @@ def select_moe_backend_for_interleaved_gate_up():
 
 
 def _check_sonic_moe_available():
-    """Opt-in kernels-community/sonic-moe backend. Lazy, guarded import: safe with no CUDA,
-    no `kernels` and no sonic-moe installed."""
+    """Opt-in kernels-community/sonic-moe backend; guarded import."""
     if os.environ.get("UNSLOTH_DISABLE_MOE_SONIC", "0") == "1":
         return False
     try:
         from unsloth_zoo.temporary_patches.moe_utils_sonic import sonic_moe_available
-        # Cold import, kernel probes and op registration must not run under Dynamo tracing.
+        # Probes must not run under Dynamo tracing.
         return _run_probe_eagerly(sonic_moe_available)
     except Exception:
         return False
@@ -1885,8 +1884,7 @@ def _select_moe_backend():
             return "unsloth_triton"
         if requested == "native_torch":
             return "native_torch"
-        # Opt-in only, never auto-selected; it still needs torch._grouped_mm for the
-        # rank-r LoRA GEMMs and every shape it falls back on.
+        # Opt-in only; still needs torch._grouped_mm for LoRA GEMMs and fallbacks.
         if (
             requested == "sonic_moe"
             and _check_torch_grouped_mm_supported()
@@ -2004,8 +2002,7 @@ def forward_moe_backend(
 
     backend = select_moe_backend()
     if backend == "sonic_moe":
-        # Absolute import for the unsloth_compiled_cache copy of this function. It falls
-        # back to forward_native_grouped_mm itself for anything it cannot run.
+        # Absolute import: this function is copied into unsloth_compiled_cache.
         forward_sonic_moe = None
         try:
             from unsloth_zoo.temporary_patches.moe_utils_sonic import forward_sonic_moe
