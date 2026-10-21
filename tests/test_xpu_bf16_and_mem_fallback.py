@@ -211,7 +211,7 @@ def vu():
         pytest.skip(f"vllm_utils does not import here: {e}")
     except RuntimeError as e:
         # Only bitsandbytes' CUDA-mismatch error is an environment gap; anything else is a regression.
-        if "bitsandbytes" not in "".join(traceback.format_exception(e)).lower():
+        if "bitsandbytes" not in traceback.format_exc().lower():
             raise
         pytest.skip(f"bitsandbytes does not load here: {e}")
     return vllm_utils
