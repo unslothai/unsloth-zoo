@@ -274,6 +274,16 @@ modifications =
       fla PR #1330 in ops/cp/chunk_delta_h.py: merge_fwd_bwd_kernel's autotune
       key named BT, which is not a kernel argument; triton main rejects that at
       import, which made the whole vendored tree fail to inject.
+    - Backported fla PR #1388 (with the #1154 key change it completes) in
+      modules/conv/triton/{kernels,ops}.py: NB = cdiv(B*T, 1024) is dropped from
+      the causal_conv1d forward / backward autotune keys, signatures and
+      launches (neither kernel reads it), so every new 1024-token bucket no
+      longer re-tunes and recompiles both kernels.
+    - Modified by Unsloth in ops/utils/cumsum.py (inline "Unsloth:" comment, not
+      upstream as of fla 9d478fa): B is dropped from the autotune keys and
+      constexpr arguments of the four chunk_{local,global}_cumsum_{scalar,vector}
+      kernels (none reads it; the grid carries B * H), so padded batches no
+      longer re-tune and recompile per batch size.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
@@ -520,8 +530,9 @@ modifications =
       fused_recurrent_replayssm.py from the commit above with one change, marked
       "Modified by Unsloth": the launch-config lookup imported from
       vllm.model_executor.layers.mamba.ops.replayssm_config is inlined (released
-      vLLM has no "gdn_decode" entry), with the same values as the PR, and the
-      kernel imports triton directly instead of vllm.triton_utils.
+      vLLM has no "gdn_decode" entry), with the same values as the PR plus a
+      T4 (sm75) entry (32, 1, 1, 4) and a per-device cache, and the kernel
+      imports triton directly instead of vllm.triton_utils.
     - The runtime integration (state page, metadata builder, layer dispatch) is
       Unsloth's own code in unsloth_zoo/vllm_gdn_replayssm.py, ported from the
       same PR.

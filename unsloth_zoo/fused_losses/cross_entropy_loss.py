@@ -21,6 +21,8 @@ __all__ = [
     "unsloth_count_aware_cross_entropy",
     "unsloth_loss_count_kwargs",
     "unsloth_fsdp_unshard",
+    "unsloth_zero3_partitioned",
+    "unsloth_zero3_gathered",
 ]
 
 import torch
@@ -100,6 +102,34 @@ def unsloth_fsdp_unshard(module):
         if isinstance(submodule, FSDPModule):
             # No-op once unsharded; post-backward reshards it and reduce-scatters its gradient.
             _fsdp_unshard(submodule)
+pass
+
+def unsloth_zero3_partitioned(tensor):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """True for a DeepSpeed ZeRO-3 parameter that may be a released placeholder outside its module's forward."""
+    if tensor is None or not hasattr(tensor, "ds_id") or not hasattr(tensor, "ds_status"):
+        return False
+    if not getattr(tensor, "ds_persist", False):
+        return True
+    # Persistent params can still be released (cache partitioning).
+    status = getattr(tensor.ds_status, "name", tensor.ds_status)
+    return status != "AVAILABLE"
+pass
+
+def unsloth_zero3_gathered(tensor):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Detached gathered copy of a ZeRO-3 param (collective: all ranks call it); no grad, so trainable heads are refused."""
+    if not unsloth_zero3_partitioned(tensor):
+        return tensor
+    if tensor.requires_grad and torch.is_grad_enabled():
+        raise NotImplementedError(
+            "Unsloth: the output head (lm_head) is trainable under DeepSpeed ZeRO-3, and the GRPO "
+            "scoring head reads it outside the model forward, so its gradient cannot reach ZeRO-3. "
+            "Freeze lm_head (do not list it in modules_to_save), or use ZeRO-2 / FSDP2."
+        )
+    import deepspeed
+    with deepspeed.zero.GatheredParameters([tensor], modifier_rank = None):
+        return tensor.data.detach().clone()
 pass
 
 def apply_autograd_function(autograd, mapping):

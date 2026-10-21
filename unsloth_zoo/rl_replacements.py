@@ -2340,10 +2340,19 @@ def grpo_accumulated_loss(
         output_embeddings = trainer.model.get_output_embeddings()
         lm_head = output_embeddings.weight
         lm_head_bias = getattr(output_embeddings, "bias", None)
+        # ZeRO-3 released the head after the forward: score with one gathered copy per call.
+        _zero3_head = None
+        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_zero3_partitioned, unsloth_zero3_gathered
+        if unsloth_zero3_partitioned(lm_head) or unsloth_zero3_partitioned(lm_head_bias):
+            _zero3_head = (unsloth_zero3_gathered(lm_head), unsloth_zero3_gathered(lm_head_bias))
+            lm_head, lm_head_bias = _zero3_head
 
         def _refresh_lm_head():
             # FSDP2's forward unshard swaps the Parameters: the bindings above are metadata-only until then.
             nonlocal lm_head, lm_head_bias
+            if _zero3_head is not None:
+                lm_head, lm_head_bias = _zero3_head
+                return
             from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fsdp_unshard
             unsloth_fsdp_unshard(output_embeddings)
             lm_head = output_embeddings.weight
