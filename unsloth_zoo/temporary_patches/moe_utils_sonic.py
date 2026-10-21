@@ -67,6 +67,7 @@ no longer applies (B200, kernels-community/sonic-moe v2 = quack 0.6.1):
 import os
 import weakref
 import sys
+import threading
 import torch
 import torch.nn.functional as F
 
@@ -94,10 +95,12 @@ def _log(message):
 
 def reset_sonic_moe_state():
     """Forget the availability probe (tests; a device change)."""
-    global _SONIC_MODULE, _SONIC_REASON, _SONIC_PROBED, _GEMM_INTERFACE, _CONCAT_SUPPORTED, _HOME_CAPABILITY
+    global _SONIC_MODULE, _SONIC_REASON, _SONIC_PROBED, _SONIC_DONE, _GEMM_INTERFACE, _CONCAT_SUPPORTED
+    global _HOME_CAPABILITY
     _SONIC_MODULE = None
     _SONIC_REASON = None
     _SONIC_PROBED = False
+    _SONIC_DONE = False
     _GEMM_INTERFACE = None
     _CONCAT_SUPPORTED = None
     _DEVICE_OK.clear()
@@ -217,11 +220,27 @@ def _probe_sonic(module):
         raise RuntimeError("sonic-moe fast call path disagrees with functional.gemm")
 
 
+_SONIC_DONE = False
+_SONIC_LOCK = threading.RLock()
+
+
 def get_sonic_module():
     """The sonic-moe kernel module, or None. Probed once, never raises."""
-    global _SONIC_MODULE, _SONIC_REASON, _SONIC_PROBED
-    if _SONIC_PROBED:
+    global _SONIC_DONE
+    if _SONIC_DONE:
         return _SONIC_MODULE
+    # Other threads wait for the first probe; the probing thread re-enters (custom-op probe path).
+    with _SONIC_LOCK:
+        if _SONIC_PROBED:  # finished by another thread, or this thread's probe re-entering
+            return _SONIC_MODULE
+        try:
+            return _probe_sonic_module_once()
+        finally:
+            _SONIC_DONE = True
+
+
+def _probe_sonic_module_once():
+    global _SONIC_MODULE, _SONIC_REASON, _SONIC_PROBED
     _SONIC_PROBED = True
 
     if os.environ.get("UNSLOTH_DISABLE_MOE_SONIC", "0") == "1":

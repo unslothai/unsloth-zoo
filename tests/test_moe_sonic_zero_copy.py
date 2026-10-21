@@ -313,6 +313,7 @@ def test_probe_through_the_custom_op_sees_the_module(monkeypatch):
 
     monkeypatch.setattr(S, "_probe_sonic", probe)
     monkeypatch.setattr(S, "_SONIC_PROBED", False)
+    monkeypatch.setattr(S, "_SONIC_DONE", False)
     monkeypatch.setattr(S, "_SONIC_MODULE", None)
     monkeypatch.delenv("UNSLOTH_DISABLE_MOE_SONIC", raising = False)
     assert S.get_sonic_module() is fake
@@ -341,3 +342,37 @@ def test_forward_uses_the_shared_routing_sort_and_skips_the_cache_when_compiling
     assert guarded, "duplicate-cache call must sit under a guard"
     test = ast.unparse(guarded[0].test)
     assert "_interleave_budget_bytes() > 0" in test and "is_compiling()" in test
+
+
+def test_concurrent_first_probe_waits_for_the_result(monkeypatch):
+    import sys
+    import threading
+    import time
+    import types
+
+    fake = types.SimpleNamespace(name = "sonic")
+    kernels = types.ModuleType("kernels")
+    kernels.get_kernel = lambda *a, **k: fake
+    monkeypatch.setitem(sys.modules, "kernels", kernels)
+    for name in ("_apply_cutlass_dsl_shim", "_install_sonic_module_path", "_record_device_capabilities",
+                 "_concat_layout_supported", "_pinned_ops"):
+        monkeypatch.setattr(S, name, lambda *a, **k: None)
+    monkeypatch.setattr(S, "_device_is_supported", lambda: (True, None))
+    started = threading.Event()
+
+    def slow_probe(module):
+        started.set()
+        time.sleep(0.3)
+
+    monkeypatch.setattr(S, "_probe_sonic", slow_probe)
+    monkeypatch.setattr(S, "_SONIC_PROBED", False)
+    monkeypatch.setattr(S, "_SONIC_DONE", False)
+    monkeypatch.setattr(S, "_SONIC_MODULE", None)
+    monkeypatch.delenv("UNSLOTH_DISABLE_MOE_SONIC", raising = False)
+    got = {}
+    first = threading.Thread(target = lambda: got.__setitem__("first", S.get_sonic_module()))
+    first.start()
+    started.wait(5)
+    got["second"] = S.get_sonic_module()
+    first.join()
+    assert got["first"] is fake and got["second"] is fake
