@@ -3,9 +3,9 @@
 
 """bf16 full finetuning keeps norm weights in float32, so Qwen3-MoE / Mixtral RMSNorm hands the
 experts float32 hidden states. Autocast casts F.linear (native loop) and forward_native_grouped_mm
-casts explicitly, but the Triton grouped GEMM is a custom op autocast never sees: every expert GEMM
-ran float32 x bf16 (3-10x slower). It now casts to the bf16 / fp16 expert weight dtype, as
-torch._grouped_mm and plain transformers bf16 training do; float32 weights keep float32."""
+casts explicitly, but the Triton grouped GEMM is a custom op autocast never sees, so its gate_up GEMM
+ran float32 x bf16 (3-10x slower). X now follows _triton_moe_compute_dtype into every GEMM, as plain
+transformers bf16 training does; float16 weights and the FP32 flags keep float32."""
 
 import sys
 import types
@@ -50,12 +50,26 @@ def _run(monkeypatch, x_dtype, w_dtype):
     return tuned, gemm_inputs
 
 
-@pytest.mark.parametrize("w_dtype", [torch.bfloat16, torch.float16])
-def test_float32_activations_run_the_gemms_in_the_weight_dtype(monkeypatch, w_dtype):
-    tuned, gemm_inputs = _run(monkeypatch, torch.float32, w_dtype)
-    assert gemm_inputs == [(w_dtype, w_dtype)] * 2
+def test_float32_activations_run_the_gemms_in_bf16(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_FORCE_FLOAT32", raising = False)
+    monkeypatch.delenv("UNSLOTH_MOE_TRITON_FP32", raising = False)
+    tuned, gemm_inputs = _run(monkeypatch, torch.float32, torch.bfloat16)
+    assert gemm_inputs == [(torch.bfloat16, torch.bfloat16)] * 2
     # The kernels are tuned for the dtype they then run in.
-    assert tuned == [w_dtype] * 2
+    assert tuned == [torch.bfloat16] * 2
+
+
+def test_float16_weights_keep_float32_activations(monkeypatch):
+    # float16 has no bf16 range: the intermediate gradient can overflow, so X stays float32.
+    tuned, gemm_inputs = _run(monkeypatch, torch.float32, torch.float16)
+    assert gemm_inputs[0] == (torch.float32, torch.float16)
+
+
+@pytest.mark.parametrize("flag", ["UNSLOTH_FORCE_FLOAT32", "UNSLOTH_MOE_TRITON_FP32"])
+def test_fp32_flags_keep_float32_activations(monkeypatch, flag):
+    monkeypatch.setenv(flag, "1")
+    tuned, gemm_inputs = _run(monkeypatch, torch.float32, torch.bfloat16)
+    assert gemm_inputs[0] == (torch.float32, torch.bfloat16)
 
 
 @pytest.mark.parametrize(

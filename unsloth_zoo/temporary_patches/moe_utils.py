@@ -5605,16 +5605,12 @@ def forward_triton_grouped_gemm(
     else:
         num_tokens, hidden_dim = hidden_states.shape
 
-    # As in forward_native_grouped_mm: the Triton grouped GEMM is not autocast-cast, so the float32
-    # hidden states of fp32 norms (bf16 full finetuning) would run every expert GEMM in float32.
-    if hidden_states.dtype == torch.float32:
-        _stack = self._parameters.get("gate_up_proj")
-        if _stack is not None and _stack.dtype in (torch.float16, torch.bfloat16):
-            hidden_states = hidden_states.to(_stack.dtype)
-
     top_k = top_k_index.shape[1]
-    # gate_up still reads float32 X (dX stays float32); everything after it runs in compute_dtype.
     compute_dtype = _triton_moe_compute_dtype(self, hidden_states)
+    # The gate_up GEMM reads X in compute_dtype too, as plain bf16 training does: a float32 X runs it in
+    # float32, whose default tile does not fit L4 shared memory. float16 and the FP32 flags keep float32.
+    # LoRA and the routing sum keep the caller's dtype.
+    gemm_hidden_states = hidden_states if hidden_states.dtype == compute_dtype else hidden_states.to(compute_dtype)
 
     # Cache model dims and kernel configs on first call.
     if self._unsloth_moe_configs is None:
@@ -5629,7 +5625,7 @@ def forward_triton_grouped_gemm(
             hidden_dim=hidden_dim,
             intermediate_dim=intermediate_dim,
             top_k=top_k,
-            dtype=hidden_states.dtype,
+            dtype=gemm_hidden_states.dtype,
         )
 
         # Second GEMM: K = intermediate_dim, N = hidden_dim.
@@ -5658,7 +5654,7 @@ def forward_triton_grouped_gemm(
 
     # First grouped GEMM: gate_up projection.
     first_gemm_output = grouped_gemm(
-        X=hidden_states,
+        X=gemm_hidden_states,
         W=w1,
         m_sizes=token_counts_by_expert,
         topk=top_k,
