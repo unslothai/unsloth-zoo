@@ -676,13 +676,10 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
 
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.view(-1, hidden_dim)
-    flat_top_k = top_k_index.view(-1)
-    from .moe_utils import count_tokens_per_expert
-    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
-    sorted_indices = torch.argsort(flat_top_k, stable=True)
+    from .moe_utils import moe_routing_sort
+    num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     from .moe_utils import (
         _should_use_separated_lora,
         combine_permuted_moe_outputs,

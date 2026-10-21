@@ -2046,6 +2046,29 @@ else:
     count_tokens_per_expert = _count_tokens_per_expert
 
 
+def moe_routing_sort(top_k_index, num_experts):
+    """(counts int32 [E], flat.argsort(stable = True) int64 [N], cumsum(counts) int32 [E]), sync-free.
+
+    CUDA: a stable Triton counting sort (moe_routing_triton), bit-identical to the torch path and
+    CUDA graph capturable; UNSLOTH_MOE_TRITON_ROUTING=0 turns it off. Everywhere else, or when
+    that module cannot load: count_tokens_per_expert + stable argsort + int32 cumsum.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if _TRITON_ROUTING is not None:
+        return _TRITON_ROUTING(top_k_index, num_experts)
+    flat_experts = top_k_index.reshape(-1)
+    counts = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
+    # stable=True preserves order within each expert.
+    sorted_indices = flat_experts.argsort(stable=True)
+    return counts, sorted_indices, torch.cumsum(counts, dim=0, dtype=torch.int32)
+
+
+try:
+    from unsloth_zoo.temporary_patches.moe_routing_triton import moe_routing_sort as _TRITON_ROUTING
+except Exception:
+    _TRITON_ROUTING = None
+
+
 @torch.no_grad()
 def _get_routing_indices(selected_experts, num_experts):
     """Compute token->expert mapping for grouped GEMM.
@@ -2054,14 +2077,7 @@ def _get_routing_indices(selected_experts, num_experts):
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    flat_experts = selected_experts.view(-1)
-
-    # Sync-free; see count_tokens_per_expert.
-    token_counts_by_expert = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
-
-    # stable=True preserves order within each expert.
-    gather_indices = flat_experts.argsort(stable=True)
-
+    token_counts_by_expert, gather_indices, _ = moe_routing_sort(selected_experts, num_experts)
     return token_counts_by_expert, gather_indices
 
 
@@ -5068,11 +5084,9 @@ def forward_native_grouped_mm(
 
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
-    sorted_indices = torch.argsort(flat_top_k, stable=True)
+    num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
     # Gate + Up projection with optional separated LoRA (default).
     use_separated_lora = _should_use_separated_lora()
@@ -5480,10 +5494,8 @@ def forward_triton_grouped_gemm(
     fwd_config_1, bwd_dX_config_1, bwd_dW_config_1 = gemm1_configs
     fwd_config_2, bwd_dX_config_2, bwd_dW_config_2 = gemm2_configs
 
-    token_counts_by_expert, gather_indices = _get_routing_indices(
-        top_k_index, self.num_experts
-    )
-    offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
+    with torch.no_grad():
+        token_counts_by_expert, gather_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
 
     if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
@@ -5662,10 +5674,11 @@ def forward_native_moe_loop(
     with torch.no_grad():
         n_tokens = top_k_index.shape[0]
         slot_major = top_k_index.t().reshape(-1)   # position = top_k_pos * n_tokens + token
-        order = torch.argsort(slot_major, stable=True)
+        expert_counts, order, _ = moe_routing_sort(slot_major, self.num_experts)
         routed_token_idx = order % n_tokens
         routed_top_k_pos = order // n_tokens
-        expert_counts = torch.bincount(slot_major, minlength=self.num_experts).tolist()
+        # The loop below slices on host ints: one sync for the counts (bincount added a second).
+        expert_counts = expert_counts.tolist()
 
     # A declared (E, in, out) layout (_unsloth_grouped_mm_format) wins over the shape test, which a square stack defeats.
     grouped_mm_format = bool(_module_flag(self, "_unsloth_grouped_mm_format", False)) or (
