@@ -742,18 +742,24 @@ class OffloadSwitchGLU(nn.Module):
         """Run calls on a full table until ``_narrow``, reading the next offloaded layer's ahead."""
         glu = self._join_ahead()
         if glu is None:
+            # A pass starts here: a read-ahead an aborted pass left further on goes before a new table.
+            layer = self._next
+            while layer is not None:
+                layer._join_ahead()
+                layer = layer._next
             made = self._table()
             if made is None:
                 return False
             glu, fill = made
             fill()
         glu.train(self.training)
-        object.__setattr__(self, "_full", glu)
         following = self._next
         if read_next and following is not None and following._ahead is None:
             made = following._table()
             if made is not None:
                 object.__setattr__(following, "_ahead", (_table_reader().submit(made[1]), made[0]))
+        # Set last: a failure above leaves this layer on its slots.
+        object.__setattr__(self, "_full", glu)
         return True
 
     def _narrow(self):

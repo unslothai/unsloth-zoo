@@ -524,6 +524,28 @@ def test_a_wide_prefill_step_runs_layer_by_layer_on_full_tables(tmp_path, monkey
     assert zoo_offload.wide_prefill_step(model) is None  # an unwidened layer runs a call whole
 
 
+def test_a_failed_wide_pass_leaves_no_table_behind(tmp_path, monkeypatch):
+    model = _qwen3_moe().load_weights(list(tree_flatten(_lazy_copy(_qwen3_moe, str(tmp_path)).parameters())))
+    offload_experts(model, str(tmp_path), 0.75)
+    switches = [layer.mlp.switch_mlp for layer in model.model.layers]
+    for glu in switches[:2]:  # a pass aborted after the second layer: the third holds its read-ahead
+        assert glu._wide(read_next = True)
+        glu._narrow()
+    assert switches[2]._ahead is not None
+    table = OffloadSwitchGLU._table
+
+    def fail(self):
+        if self is switches[1]:
+            raise MemoryError
+        return table(self)
+
+    monkeypatch.setattr(OffloadSwitchGLU, "_table", fail)
+    with pytest.raises(MemoryError):
+        switches[0]._wide(read_next = True)
+    # The retry dropped the stale read-ahead, and its failed read-ahead left the first layer on its slots.
+    assert switches[2]._ahead is None and switches[0]._full is None
+
+
 @pytest.mark.parametrize("window", [None, 2048])  # a rotating cache past its window masks with an array
 def test_a_layer_without_a_table_steps_on_its_slots(tmp_path, monkeypatch, window):
     cache_module = pytest.importorskip("mlx_lm.models.cache")
