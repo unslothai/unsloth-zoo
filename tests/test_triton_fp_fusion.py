@@ -32,12 +32,16 @@ _NOT_LAUNCHES = {
     "temporary_patches/gpt_oss.py": {"self.gate_up_projs", "self.down_projs"},
     "temporary_patches/moe_grouped_modulelist.py": {"spec"},
     "temporary_patches/moe_utils.py": {"registry"},
+    # Custom ops out of the pinned-op tuple, and a weakref read out of a cache entry.
+    "temporary_patches/moe_utils_sonic.py": {"_pinned_ops()", "hit"},
 }
 # Launches that deliberately disable contraction to match an eager reference bit for bit.
 _DELIBERATE_FALSE = {
     "merged_rollout_exact.py:_exact_merge_kernel",
     "temporary_patches/gpt_oss_grouped_qlora.py:_nf4_dequant_stack_kernel",
     "temporary_patches/moe_routed.py:_nf4_select_dequant_kernel",
+    "temporary_patches/moe_fused_swiglu.py:_swiglu_fwd_kernel",
+    "temporary_patches/moe_fused_swiglu.py:_swiglu_bwd_kernel",
     "temporary_patches/moe_triton_kernels.py:kernel",
     "temporary_patches/moe_triton_kernels.py:fwd",
     "temporary_patches/moe_triton_kernels.py:bwd_dy",

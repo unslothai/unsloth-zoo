@@ -504,7 +504,7 @@ def _swiglu_backward_interleaved(preact, grad_post):
         if n_pairs:
             BLOCK = 1024
             _swiglu_bwd_interleaved_kernel[(triton.cdiv(n_pairs, BLOCK),)](
-                preact_c, grad_c, out, n_pairs, BLOCK=BLOCK,
+                preact_c, grad_c, out, n_pairs, BLOCK=BLOCK, enable_fp_fusion=True,
             )
         return out
     gate = preact[..., 0::2].float()
