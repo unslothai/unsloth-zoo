@@ -4920,13 +4920,22 @@ def _vector_attention_kernels():
             mx.fast.metal_kernel(name = "unsloth_vector_attention_pass1",
                                  input_names = ["queries", "keys", "values", "scale"],
                                  output_names = ["partials", "sums", "maxs"],
-                                 source = _VECTOR_ATTENTION_PASS1, ensure_row_contiguous = False),
+                                 source = _vector_attention_source(), ensure_row_contiguous = False),
             mx.fast.metal_kernel(name = "unsloth_vector_attention_pass2",
                                  input_names = ["partials", "sums", "maxs"], output_names = ["out"],
                                  source = _VECTOR_ATTENTION_PASS2),
         )
     except (AttributeError, TypeError):
         return None
+
+
+def _vector_attention_source():
+    # Specialize unit feature strides while keeping row/head pitches dynamic.
+    contiguous = _VECTOR_ATTENTION_PASS1
+    for name in ("queries", "keys", "values"):
+        contiguous = contiguous.replace(f" * {name}_strides[3]", "")
+    return ("if (queries_strides[3] == 1 && keys_strides[3] == 1 && values_strides[3] == 1) {\n"
+            + contiguous + "\n} else {\n" + _VECTOR_ATTENTION_PASS1 + "\n}")
 
 
 @functools.cache

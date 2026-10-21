@@ -811,6 +811,29 @@ wide_decode_only = pytest.mark.skipif(mx.__version__ != "0.32.4", reason = "MLX 
 
 
 @wide_decode_only
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_vector_attention_preserves_bits_when_feature_layouts_change(dtype, rows, reverse, monkeypatch):
+    monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")
+    monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
+    arrays = _attention_block(8, rows, 4500, dtype)
+    reference = mx.fast.scaled_dot_product_attention(*arrays, scale = 1.0, mask = "causal")
+    strided = [mx.stack([x, mx.full(x.shape, -7, dtype)], axis = -1).reshape(
+        *x.shape[:-1], 2 * x.shape[-1])[..., ::2] for x in arrays]
+    layouts = [(False, False, False), (True, False, False), (False, True, False),
+               (False, False, True), (True, True, True), (False, False, False)]
+    for layout in reversed(layouts) if reverse else layouts:
+        inputs = [strided[i] if use_stride else arrays[i] for i, use_stride in enumerate(layout)]
+        if rows == 1 and dtype == mx.bfloat16:
+            out = decode._wide_head_decode_attention(*inputs, 1.0, "causal")
+            assert out is not None and all(decode._WIDE_ATTENTION_VERDICTS.values())
+        else:
+            out = decode._vector_attention(*inputs, 1.0, decode._vector_blocks(8 * rows, 4500))
+        _equal(out, reference)
+
+
+@wide_decode_only
 @pytest.mark.parametrize("heads,keys", [(8, 1024), (8, 1025), (16, 4224), (8, 8192), (16, 8193)])
 def test_wide_decode_attention_is_native_bitwise_over_strided_caches(heads, keys, monkeypatch):
     monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
