@@ -40,6 +40,8 @@ _DELIBERATE_FALSE = {
     "merged_rollout_exact.py:_exact_merge_kernel",
     "temporary_patches/gpt_oss_grouped_qlora.py:_nf4_dequant_stack_kernel",
     "temporary_patches/moe_routed.py:_nf4_select_dequant_kernel",
+    "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel",
+    "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel.fn",
     "temporary_patches/moe_fused_swiglu.py:_swiglu_fwd_kernel",
     "temporary_patches/moe_fused_swiglu.py:_swiglu_bwd_kernel",
     "temporary_patches/moe_triton_kernels.py:kernel",
@@ -47,6 +49,33 @@ _DELIBERATE_FALSE = {
     "temporary_patches/moe_triton_kernels.py:bwd_dy",
     "temporary_patches/moe_triton_kernels.py:bwd_dw",
 }
+
+
+def _kwargs_dicts(tree):
+    """id(launch call) -> the dict(...) / {...} each `**name` it splats was assigned in its function."""
+    out = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        dicts = {}
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                dicts[node.targets[0].id] = node.value
+        for node in ast.walk(func):
+            if isinstance(node, ast.Call):
+                splats = [k.value.id for k in node.keywords if k.arg is None and isinstance(k.value, ast.Name)]
+                out[id(node)] = [dicts[n] for n in splats if n in dicts]
+    return out
+
+
+def _fp_fusion_values(node, splatted):
+    values = [k.value for k in node.keywords if k.arg == "enable_fp_fusion"]
+    for value in splatted:
+        if isinstance(value, ast.Call) and getattr(value.func, "id", None) == "dict":
+            values += [k.value for k in value.keywords if k.arg == "enable_fp_fusion"]
+        elif isinstance(value, ast.Dict):
+            values += [v for k, v in zip(value.keys, value.values) if isinstance(k, ast.Constant) and k.value == "enable_fp_fusion"]
+    return values
 
 
 def _launch_sites():
@@ -57,20 +86,22 @@ def _launch_sites():
         src = path.read_text(encoding = "utf-8")
         if "triton" not in src:
             continue
-        for node in ast.walk(ast.parse(src)):
+        tree = ast.parse(src)
+        splats = _kwargs_dicts(tree)
+        for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript):
                 name = ast.get_source_segment(src, node.func.value)
                 if name in _NOT_LAUNCHES.get(rel, ()):
                     continue
-                yield rel, name, node
+                yield rel, name, node, splats.get(id(node), [])
 
 
 def test_every_launch_states_fp_fusion():
     sites = list(_launch_sites())
-    assert len(sites) >= 20, [(r, n) for r, n, _ in sites]
+    assert len(sites) >= 20, [(r, n) for r, n, _, _ in sites]
     missing, wrong = [], []
-    for rel, name, node in sites:
-        values = [k.value for k in node.keywords if k.arg == "enable_fp_fusion"]
+    for rel, name, node, splatted in sites:
+        values = _fp_fusion_values(node, splatted)
         if not values:
             missing.append(f"{rel}:{node.lineno}:{name}")
             continue
