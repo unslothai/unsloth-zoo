@@ -433,7 +433,7 @@ def test_compiled_bf16_retrace_rechecks_the_plan(change, monkeypatch):
     # A retrace after a recast must not route FP32 weights through the bf16 / fp16 kernels.
     monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
     ex = _make("silu", quant = False)
-    x, idx, w = _route(2)
+    x, idx, w = _route(2 if ROUTED_16BIT else 1)
     torch._dynamo.reset()
     fn = torch.compile(lambda a, b, c: MR.routed_moe_forward(ex, a, b, c), fullgraph = True)
     with torch.no_grad():
@@ -645,6 +645,8 @@ def _real_experts(kind):
 @pytest.mark.parametrize("quant", [True, False])
 @pytest.mark.parametrize("B", [1, 4])
 def test_real_experts_classes(kind, quant, B, monkeypatch):
+    if not quant:
+        _needs_16bit_routing(B)
     try:
         ex, cfg = _real_experts(kind)
     except Exception as exc:  # pragma: no cover - older transformers
