@@ -3809,11 +3809,8 @@ def _warn_fp32_lm_head_set_late():
     return bool(stale)
 
 
-# UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE sets vLLM's mamba_ssm_cache_dtype, the dtype of the
-# recurrent state Mamba / Gated DeltaNet layers carry from one decode step to the next. vLLM's
-# "auto" keeps it in the model dtype unless the HF config names one (Qwen3.5 asks for float32,
-# Qwen3-Next does not), while training runs the chunked kernels with a float32 state, so a
-# bfloat16 state drifts rollout logprobs from the trainer's as the completion grows.
+# vLLM's "auto" keeps the Gated DeltaNet state in the model dtype unless the config names one
+# (Qwen3-Next does not); training uses float32, so a bf16 rollout state drifts logprobs.
 _VLLM_MAMBA_SSM_DTYPE_ALIASES = {"fp32": "float32", "bf16": "bfloat16", "fp16": "float16"}
 
 
@@ -3831,8 +3828,7 @@ def _vllm_mamba_dtype_choices():
 
 
 def _vllm_gdn_reads_ssm_dtype():
-    # Gated DeltaNet state dtype follows mamba_ssm_cache_dtype only from vLLM 0.17; before that it
-    # comes from mamba_cache_dtype alone, so the override would be accepted and silently unused.
+    # Before vLLM 0.17 the Gated DeltaNet state ignores mamba_ssm_cache_dtype.
     try:
         import inspect
         from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
@@ -3847,8 +3843,7 @@ def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices 
     value = os.environ.get("UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE", "").strip().lower()
     value = _VLLM_MAMBA_SSM_DTYPE_ALIASES.get(value, value)
     has_arg = "mamba_ssm_cache_dtype" in engine_arg_keys
-    # Only Gated DeltaNet (linear_key_head_dim: Qwen3-Next, Qwen3.5) is supported: other recurrent
-    # layers either ignore mamba_ssm_cache_dtype (MiniMax) or accept fewer dtypes (KDA rejects float16).
+    # Gated DeltaNet only: MiniMax ignores the field and KDA rejects float16.
     text_config = getattr(config, "text_config", None) or config
     is_gdn = getattr(text_config, "linear_key_head_dim", None) is not None
     if is_gdn and has_arg and gdn_reads_ssm is None:
