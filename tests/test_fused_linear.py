@@ -1321,14 +1321,16 @@ def test_lazy_entropy_compiles_without_graph_breaks(use_ent):
 
 @CUDA
 @pytest.mark.parametrize("n_keep", [1, 777, 4095, 4096, 4097])
-def test_default_small_batches_take_the_tile_and_stay_bit_identical(monkeypatch, n_keep):
-    # Defaults (no env): below 4096 kept rows too, the frozen pass and its no-grad reference take [rows, <= 16384]
-    # fp32 tiles (TRL's [rows, 32768] bf16 transient), and no-grad, frozen and trainable passes are bit-identical.
+def test_small_batches_take_the_tile_and_stay_bit_identical(monkeypatch, n_keep):
+    # The small-card rule (threshold 0): below 4096 kept rows too, the frozen pass and its no-grad reference take
+    # [rows, <= 16384] fp32 tiles (TRL's [rows, 32768] bf16 transient), and no-grad, frozen and trainable passes are
+    # bit-identical.
     if not fl._HAS_TRITON or fl._IS_HIP:
         pytest.skip("needs Triton on CUDA")
-    for name in ("UNSLOTH_FUSED_LINEAR_FLASH", "UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS", "UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS"):
+    for name in ("UNSLOTH_FUSED_LINEAR_FLASH", "UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS"):
         if os.environ.get(name) is not None:
             pytest.skip(f"{name} is set")
+    monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", 0)
     shapes = []
     real = fl._Buffers.__init__
 
@@ -1371,3 +1373,22 @@ def test_tile_cap_leaves_large_and_half_layouts_alone(monkeypatch):
             assert capped == budget, (n, bpl, capped, budget)
     assert fl._tiled_layout(1536, 151936, 0, 4, dev)[1] == 16384
     assert fl._tiled_layout(1536, 151936, 0, 2, dev)[1] > 16384
+
+
+def test_flash_min_rows_follows_the_card_size(monkeypatch):
+    # Up to 24 GiB (T4 / L4 / consumer cards) the tiles are faster and TRL-sized at every row count; larger cards keep
+    # [rows, V] chunks below 4096 rows, where they are faster (A100 2-17%). The env setting wins everywhere.
+    class Props:
+        def __init__(self, gib):
+            self.total_memory = int(gib * 1024**3)
+
+    monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", None)
+    for gib, want in ((15, 0), (22.5, 0), (24, 0), (40, 4096), (80, 4096), (96, 4096), (180, 4096)):
+        fl._flash_min_rows_auto.cache_clear()
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device, gib = gib: Props(gib))
+        assert fl._flash_min_rows(torch.device("cuda", 0)) == want, gib
+    fl._flash_min_rows_auto.cache_clear()
+    assert fl._flash_min_rows(torch.device("cpu")) == 4096
+    monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", 123)
+    assert fl._flash_min_rows(torch.device("cuda", 0)) == 123
+    fl._flash_min_rows_auto.cache_clear()

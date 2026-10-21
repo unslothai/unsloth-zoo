@@ -93,12 +93,35 @@ _HALF = (torch.float16, torch.bfloat16)
 # == reference bit for bit. 0: [rows, V] chunks. 8k-32k tokens: L4 -6 to -11%, G4 -1 to -4%, A100 0 to -2% vs chunks.
 # Below 4096 kept rows the [rows, 16384] fp32 tile is TRL's [rows, 32768] bf16 transient (2k tokens: 0.127 vs 0.123
 # GiB; chunks 0.31 / 0.52 at V 151936 / 262144) and stays faster than TRL; vs chunks: T4 DPO / GRPO -7 to -20%,
-# G4 -8 to +6%, A100 +2 to +17%. FLASH_MIN_ROWS=4096 restores those chunks.
+# L4 -2 to -6%, G4 -8 to +6%, A100 +2 to +17%. So cards up to 24 GiB tile at every row count and larger ones keep the
+# chunks below 4096 rows (_flash_min_rows); UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS sets the threshold everywhere.
 _FLASH = os.environ.get("UNSLOTH_FUSED_LINEAR_FLASH", "1") != "0"
-_FLASH_MIN_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS", 0)), 0)
+_FLASH_MIN_ROWS = (max(int(_env_float("UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS", 0)), 0)
+                   if os.environ.get("UNSLOTH_FUSED_LINEAR_FLASH_MIN_ROWS") is not None else None)
+_SMALL_CARD_BYTES = 24.5 * 1024**3
+
+
+def _flash_min_rows(device):
+    """Kept rows from which a frozen / no-grad pass takes the tiled forward. One value per device, so a policy pass and
+    its reference (same device) always take the same route."""
+    if _FLASH_MIN_ROWS is not None:
+        return _FLASH_MIN_ROWS
+    return _flash_min_rows_auto(device)
+
+
+@functools.cache
+def _flash_min_rows_auto(device):
+    if device.type != "cuda":
+        return 4096
+    try:
+        total = torch.cuda.get_device_properties(device).total_memory
+    except Exception:
+        return 4096
+    return 0 if total <= _SMALL_CARD_BYTES else 4096
 # Widest fp32 vocab tile of the tiled forward (a multiple of the split width; 0 = the tile byte budget alone). From
 # 4096 rows the budget already gives 16384; half-logit tiles keep the budget.
-_FWD_TILE_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 16384)), 0)
+_FWD_TILE_COLS = (max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 0)), 0)
+                  if os.environ.get("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS") is not None else None)
 # ROCm's half-in / fp32-out GEMM is a slow fallback (6-14x).
 _IS_HIP = torch.version.hip is not None
 # Op names carry a version: Inductor's FX graph / AOTAutograd caches key on neither a custom op's schema nor its
@@ -649,7 +672,7 @@ def _split_block():
 def _tiled_vocab(V):
     # The chunked pass merges vocab splits only past two of them (else one row kernel), so the tiled forward (always
     # split) runs the same statistics only there; smaller vocabularies stay chunked. Under _FLASH (from
-    # _FLASH_MIN_ROWS kept rows) no-grad, frozen and trainable passes all take the tiles (bit-identical); otherwise
+    # _flash_min_rows kept rows) no-grad, frozen and trainable passes all take the tiles (bit-identical); otherwise
     # the recompute pass's TRL-shaped tiles match the chunked no-grad pass to fp32 GEMM rounding (<= ~5e-5).
     return _SPLIT_COLS > 0 and -(-V // _SPLIT_COLS) > 2
 
@@ -921,8 +944,10 @@ def _tiled_layout(n_keep, V, cap_rows, bpl, device):
     budget = min(_BWD_TILE_BYTES, _budget_bytes(device))
     R = max(min(_BWD_ROWS, n_keep, cap_rows if cap_rows > 0 else n_keep, budget // (_SPLIT_COLS * bpl)), 1)
     tile = max(budget // max(R * bpl, 1), _SPLIT_COLS)
-    if _FWD_TILE_COLS > 0 and bpl == 4:
-        tile = min(tile, max(_FWD_TILE_COLS, _SPLIT_COLS))
+    # Unset: 16384 where small batches tile (_flash_min_rows 0), else the budget alone (it gives 16384 from 4096 rows).
+    cols = _FWD_TILE_COLS if _FWD_TILE_COLS is not None else (16384 if _flash_min_rows(device) == 0 else 0)
+    if cols > 0 and bpl == 4:
+        tile = min(tile, max(cols, _SPLIT_COLS))
     tile = min(tile - tile % _SPLIT_COLS, -(-V // _SPLIT_COLS) * _SPLIT_COLS)
     return R, tile
 
@@ -1146,7 +1171,7 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
         # Frozen head, no label smoothing: the log-prob op's tiled forward, which writes the gradient times -coef
         # rounded once (no [rows, V] buffer, no half coef).
         if (_FLASH and fp32_logits and not _IS_HIP and compute_dtype in _HALF and eps == 0.0 and rows <= 0
-                and n_keep >= _FLASH_MIN_ROWS and not need_w and not need_b and _tiled_vocab(V) and _use_triton(device) and _flash_ce_ok(device)):
+                and n_keep >= _flash_min_rows(device) and not need_w and not need_b and _tiled_vocab(V) and _use_triton(device) and _flash_ce_ok(device)):
             gscale = 1.0
             if need_h and compute_dtype == torch.float16:
                 gscale = 2.0 ** max(math.floor(math.log2(16384.0 / max(abs(scale), 1e-30))), 0)
@@ -1248,7 +1273,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
         if want_u and compute_dtype == torch.float16:
             u_scale = 2.0 ** max(math.floor(math.log2(16384.0 / max(abs(inv_t * scale), 1e-30))), 0)
         # Decided without want_u / tiled, so no-grad, frozen and trainable passes of one shape take the same route.
-        flash = _FLASH and fp32_logits and not _IS_HIP and compute_dtype in _HALF and n_keep >= _FLASH_MIN_ROWS
+        flash = _FLASH and fp32_logits and not _IS_HIP and compute_dtype in _HALF and n_keep >= _flash_min_rows(device)
         if (tiled or flash) and rows <= 0 and _tiled_vocab(V) and _use_triton(device):
             # Trainable / entropy-gradient (recompute) passes always; no-grad and frozen-head passes under _FLASH,
             # which keeps all three bit-identical. Without it they stay chunked (and identical to each other).
