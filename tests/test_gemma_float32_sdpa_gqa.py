@@ -195,16 +195,20 @@ def test_gqa_kept_when_flash_takes_it(site):
     dtype = torch.bfloat16 if name == "gemma3_generic" else torch.float16
     if not torch.backends.cuda.flash_sdp_enabled() or not _probe(dtype, 4, 2, True):
         pytest.skip("flash does not take half precision GQA here")
-    # Inside the sliding window nothing needs a mask, and flash cannot take one (nor head_dim 512).
+    # Flash cannot take a mask, and whether the model builds one inside the window depends on what
+    # else patched transformers (an imported unsloth does), so call each layer maskless.
     captured = _capture(model, 1, 48, False)
     calls.clear()
     for module, args, kwargs in captured:
+        kwargs = dict(kwargs, attention_mask = None)
         if name == "gemma3_generic":
             _run(module, args, kwargs)
         else:
             with torch.autocast("cuda", dtype = torch.float16):
                 _run(module, args, kwargs)
-    flash_calls = [c for c in calls if not c["masked"] and c["head_dim"] == HEAD_DIM]
+    assert calls and not any(c["masked"] for c in calls), calls
+    # Flash takes head_dim 256 GQA; Gemma4's head_dim 512 global layers are left to the helper.
+    flash_calls = [c for c in calls if c["head_dim"] == HEAD_DIM]
     assert flash_calls and all(c["enable_gqa"] and c["kv_heads"] < c["q_heads"] for c in flash_calls), calls
 
 
