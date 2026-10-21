@@ -26,8 +26,10 @@ packed indexing and scales, never a transposed copy. No dense expert stack is al
 or backward; only the packed tensors are saved for backward.
 
 Opt-in: UNSLOTH_MOE_NF4_FUSED=1 (CUDA sm80+, not ROCm) or =force (any CUDA device Triton runs on;
-sm75 lowers tl.dot to CUDA-core FMA, so it is slow there). Anything unsupported returns None and
-the caller keeps the dequantize + grouped_mm path."""
+sm75 lowers tl.dot to CUDA-core FMA, 60x+ slower on T4). Measured on L4 bf16 (Qwen3-30B-A3B layer
+shapes): faster than dequant + grouped_mm at 64 rows per expert, slower at 256, always without the
+dense stack. Anything unsupported returns None and the caller keeps the dequantize + grouped_mm
+path. UNSLOTH_MOE_NF4_AUTOTUNE=1 tunes tiles per shape (run-to-run bits then follow the pick)."""
 
 __all__ = [
     "NF4_FUSED_STATS",
