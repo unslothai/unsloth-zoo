@@ -66,7 +66,7 @@ def test_nemotron_h_leaves_out_proj_and_conv1d_out():
 
 
 def test_every_mamba_family_answers_the_same():
-    for model_type in ("mamba", "mamba2", "falcon_mamba", "falcon_h1", "nemotron_h"):
+    for model_type in ("mamba", "mamba2", "falcon_mamba", "falcon_h1", "nemotron_h", "nemotron_h_puzzle"):
         assert _mamba_only_leaves(_Model(model_type)) == frozenset(("out_proj", "conv1d")), model_type
 
 
@@ -81,6 +81,15 @@ def test_wrapped_mamba_language_model_is_recognised():
     model = _Model("omni-wrapper")
     model.config.llm_config = SimpleNamespace(model_type = "nemotron_h")
     assert _mamba_only_leaves(model) == frozenset(("out_proj", "conv1d"))
+
+
+def test_nemotron_3_5_bolt_language_model_is_recognised():
+    # Bolt's remote-code Omni config nests its language model as llm_config.model_type = "nemotron_h_puzzle".
+    model = _Model("nemotron_h_omni")
+    model.config.llm_config = SimpleNamespace(model_type = "nemotron_h_puzzle")
+    matched = _matched(model, get_peft_regex(model))
+    assert not any(n.endswith(".out_proj") or n.endswith(".conv1d") for n in matched), sorted(matched)
+    assert "model.layers.0.mixer.in_proj" in matched
 
 
 def test_explicit_target_modules_are_the_caller_s_decision():
