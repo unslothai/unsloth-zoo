@@ -98,15 +98,12 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
 
-    # Dense masks up to this many elements (bool bytes) are built eagerly when the compiled
-    # builder cannot be trusted; above it the compiled builder keeps memory O(blocks).
+    # Largest dense mask (bool elements) built eagerly; above it the compiled builder keeps memory O(blocks).
     _EAGER_BLOCK_MASK_MAX_ELEMENTS = 1 << 27
 
     def _compile_block_mask(bsz, head, M, N):
-        """False when a sequence fits one sparse block and the dense mask is small. torch 2.10's
-        dynamic create_block_mask graph miscompiles that case: its block count reductions run
-        R0_BLOCK = 2 unmasked over one block, so kv_num_blocks / q_num_blocks come out 2 instead
-        of 1 and read one int32 past the buffer (illegal memory access on gpt-oss training)."""
+        # torch 2.10's dynamic create_block_mask graph miscompiles one-block lengths: its block
+        # counts come out 2 instead of 1 and read past the buffer (illegal memory access).
         if M > FLEX_ATTENTION_BLOCK_SIZE and N > FLEX_ATTENTION_BLOCK_SIZE:
             return True
         return (bsz or 1) * (head or 1) * M * N > _EAGER_BLOCK_MASK_MAX_ELEMENTS
