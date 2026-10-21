@@ -56,8 +56,9 @@ QWEN3_NEXT = SimpleNamespace(model_type = "qwen3_next", linear_key_head_dim = 12
 QWEN3_5 = SimpleNamespace(
     model_type = "qwen3_5",
     text_config = SimpleNamespace(model_type = "qwen3_5_text", layer_types = ["linear_attention", "full_attention"],
-                                  mamba_ssm_dtype = "float32"),
+                                  linear_key_head_dim = 128, mamba_ssm_dtype = "float32"),
 )
+MINIMAX = SimpleNamespace(model_type = "minimax", layer_types = ["linear_attention", "full_attention"])
 LLAMA = SimpleNamespace(model_type = "llama")
 
 
@@ -175,3 +176,13 @@ def test_gdn_override_is_refused_where_vllm_does_not_read_it(monkeypatch, fake_v
 def test_gdn_support_unreadable_refuses(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.mamba.mamba_utils", None)
     assert NS["_vllm_gdn_reads_ssm_dtype"]() is False
+
+
+def test_non_gdn_linear_attention_is_refused_and_not_hinted(monkeypatch, fake_vllm):
+    fake_vllm(VLLM_LATEST)
+    fn = NS["_vllm_mamba_ssm_cache_dtype_args"]
+    monkeypatch.setenv(ENV, "float32")
+    args, message = fn(MINIMAX, KEYS, True)
+    assert args == {} and "linear attention" in message
+    monkeypatch.delenv(ENV)
+    assert fn(MINIMAX, KEYS, True) == ({}, None)
