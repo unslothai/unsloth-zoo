@@ -333,6 +333,7 @@ _HF_ROUTERS = [
     ("qwen2_moe", "Qwen2MoeTopKRouter", "Qwen2MoeConfig", dict(num_experts = 60, num_experts_per_tok = 4, norm_topk_prob = False)),
     ("olmoe", "OlmoeTopKRouter", "OlmoeConfig", dict(num_experts = 64, num_experts_per_tok = 8, norm_topk_prob = False)),
     ("mixtral", "MixtralTopKRouter", "MixtralConfig", dict(num_local_experts = 8, num_experts_per_tok = 2)),
+    ("qwen3_vl_moe", "Qwen3VLMoeTextTopKRouter", "Qwen3VLMoeTextConfig", dict(num_experts = 128, num_experts_per_tok = 8)),
     ("qwen3_5_moe", "Qwen3_5MoeTopKRouter", "Qwen3_5MoeTextConfig", dict(num_experts = 256, num_experts_per_tok = 8)),
     ("gpt_oss", "GptOssTopKRouter", "GptOssConfig", dict(num_local_experts = 32, num_experts_per_tok = 4)),
     ("deepseek_v3", "DeepseekV3TopkRouter", "DeepseekV3Config",
