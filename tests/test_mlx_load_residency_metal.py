@@ -247,6 +247,39 @@ def test_offloaded_table_matches_stock(tmp_path, kind, fraction):
     assert sorted(os.listdir(tmp_path)) == listing  # nothing is written next to the checkpoint
 
 
+def test_offloaded_rows_the_page_cache_dropped_are_read_again(tmp_path, monkeypatch):
+    name, module = _table("sharded_quantized")
+    model = _lazy_copy(lambda: _holder(name, module), str(tmp_path))
+    ids, many = mx.array([[7, 400, 999, 3]]), mx.arange(0, 1000, 5)[None]
+    expected, expected_many = _site(model, name)(ids), _site(model, name)(many)
+    offload_ple(model, str(tmp_path), 1.0)
+    reads, read, in_core = [], zoo_offload.read_ranges, zoo_offload._in_core
+    monkeypatch.setattr(zoo_offload, "read_ranges", lambda jobs: (reads.append(len(jobs)), read(jobs)))
+    table = _site(model, name)
+    fields = sum(len(t.fields) for t in table._tables[:1])
+    for evicted in (False, False, True):
+        if evicted:
+            monkeypatch.setattr(zoo_offload, "_in_core", lambda mapped, rows, row_bytes: rows >= 10)
+        np.testing.assert_array_equal(_bits(table(ids)), _bits(expected))
+    assert reads == [4 * fields, 0, 2 * fields]
+    # More seen rows than the sample: a spread sample of every field checked row by row; all rows when one
+    # was evicted (here late rows of the scales and biases).
+    table(many)
+    for evicted in (False, True):
+        checks = []  # (field, rows checked, first row, last row)
+        monkeypatch.setattr(zoo_offload, "_in_core", lambda mapped, rows, row_bytes: (checks.append((id(mapped), rows.size, rows[0], rows[-1])), (rows < 100) | (row_bytes > 8) | (not evicted))[1])
+        np.testing.assert_array_equal(_bits(table(many)), _bits(expected_many))
+        assert (max(check[1] for check in checks) > 1) == evicted
+        if not evicted:  # every field of every shard, from its first seen rows to its last
+            assert len({check[0] for check in checks}) == sum(len(shard.fields) for shard in table._tables)
+            assert min(check[2] for check in checks) < 10 and max(check[3] for check in checks) > 130
+    import mmap
+    pages = np.frombuffer(mmap.mmap(-1, 6 * mmap.PAGESIZE), dtype = np.uint8)
+    pages[[2 * mmap.PAGESIZE + 5, 3 * mmap.PAGESIZE, 5 * mmap.PAGESIZE]] = 1
+    assert in_core(pages, np.array([0, 2, 3]), mmap.PAGESIZE).tolist() == [False, True, True]
+    assert in_core(pages, np.array([0, 1]), 3 * mmap.PAGESIZE).tolist() == [False, False]
+
+
 def test_offloaded_rows_are_never_loaded(tmp_path):
     rows, dims = 8192, 2048  # 64 MiB of float32
     model = _lazy_copy(lambda: _holder("embed_tokens_per_layer", nn.Embedding(rows, dims)), str(tmp_path))

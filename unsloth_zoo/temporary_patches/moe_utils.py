@@ -496,14 +496,15 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 
 # Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop; one Triton launch beats it for small experts.
-# Measured max average rows per expert per class: "lora" (a dim <= 32), "many" / "few" (>= / < 64 experts),
-# "dw" (base weight grad). sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100 have native grouped GEMMs.
-# sm121 (GB10 / DGX Spark) takes sm120's tiles and limits (1.15x on Qwen3.5-35B-A3B QLoRA, unsloth-zoo#1661).
+# Measured max average rows per expert: "lora" (a dim <= 32), "many" / "few" and "dw" / "dw_few" (base dW) at >= / < 64
+# experts. sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100 have native grouped GEMMs. sm121 (GB10) takes sm120's
+# limits (unsloth-zoo#1661) except "dw" 256, measured on RTX PRO 6000 only. sm80 "few" 512: Triton 4-40% faster at 257-512
+# rows on A100. sm120 "dw" 256: 13-26% faster at 65-256 rows; "dw_few" stays 64 (Triton loses ~10% on Mixtral gate_up).
 _TRITON_GROUPED_MM_AUTO_ROWS = {
-    (8, 0):  {"lora": -1, "many": 2048, "few": 256, "dw": 128},
-    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
-    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
-    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0},
+    (8, 0):  {"lora": -1, "many": 2048, "few": 512, "dw": 128, "dw_few": 128},
+    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
+    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64,  "dw_few": 64},
+    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
@@ -607,7 +608,8 @@ def _grouped_mm_triton_wgrad_impl(inputs, grad, offsets):
         mg.GENERIC_CALLS["fallback"] += 1
         return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
     E, K, N = offsets.shape[0], inputs.shape[1], grad.shape[1]
-    if min(K, N) > 32 and not _rows_within(_triton_grouped_mm_max_rows(inputs.device.index, "dw"), inputs.shape[0], E):
+    dw_kind = "dw" if E >= 64 else "dw_few"
+    if min(K, N) > 32 and not _rows_within(_triton_grouped_mm_max_rows(inputs.device.index, dw_kind), inputs.shape[0], E):
         # A trainable base stack's dW (full finetuning): cuBLAS beats the Triton reduction at these sizes.
         return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
     return mg.generic_grouped_wgrad(inputs, grad, offsets, E)
@@ -1911,24 +1913,22 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     (re-registers hooks, unnecessary for read-only temp tensors). Used by the
     FP8 and bnb4bit MoE dispatchers.
     """
-    # object.__setattr__ writes the instance __dict__, which shadows `_parameters`. Restore by
-    # removing those entries again rather than writing the original Parameter into __dict__: a
-    # Parameter left there hides every later `_parameters[name] = ...` swap, e.g. FSDP2 installing
-    # its sharded / all-gathered parameter around each forward, so the next call would read a
-    # stale, freed all-gather buffer.
+    # Restore by popping the __dict__ entries, never writing the Parameter there: it would shadow
+    # later `_parameters` swaps (FSDP2 all-gather) and read a freed buffer. No `object()` sentinel:
+    # its graph break left the temporary tensors installed after a compiled call.
     instance_dict = experts_module.__dict__
-    missing = object()
-    saved = {name: instance_dict.get(name, missing) for name in ("gate_up_proj", "down_proj")}
+    names = ("gate_up_proj", "down_proj")
+    saved = {name: instance_dict[name] for name in names if name in instance_dict}
     object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
     object.__setattr__(experts_module, "down_proj", down_proj)
     try:
         return forward_fn(experts_module, *args)
     finally:
-        for name, value in saved.items():
-            if value is missing:
-                instance_dict.pop(name, None)
+        for name in names:
+            if name in saved:
+                instance_dict[name] = saved[name]
             else:
-                instance_dict[name] = value
+                instance_dict.pop(name, None)
 
 
 def forward_moe_backend(
@@ -2046,6 +2046,23 @@ else:
     count_tokens_per_expert = _count_tokens_per_expert
 
 
+def moe_routing_sort(top_k_index, num_experts):
+    """(counts int32 [E], stable argsort int64 [N], cumsum(counts) int32 [E]), sync-free; Triton on CUDA."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if _TRITON_ROUTING is not None:
+        return _TRITON_ROUTING(top_k_index, num_experts)
+    flat_experts = top_k_index.reshape(-1)
+    counts = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
+    sorted_indices = flat_experts.argsort(stable=True)
+    return counts, sorted_indices, torch.cumsum(counts, dim=0, dtype=torch.int32)
+
+
+try:
+    from unsloth_zoo.temporary_patches.moe_routing_triton import moe_routing_sort as _TRITON_ROUTING
+except Exception:
+    _TRITON_ROUTING = None
+
+
 @torch.no_grad()
 def _get_routing_indices(selected_experts, num_experts):
     """Compute token->expert mapping for grouped GEMM.
@@ -2054,14 +2071,7 @@ def _get_routing_indices(selected_experts, num_experts):
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    flat_experts = selected_experts.view(-1)
-
-    # Sync-free; see count_tokens_per_expert.
-    token_counts_by_expert = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
-
-    # stable=True preserves order within each expert.
-    gather_indices = flat_experts.argsort(stable=True)
-
+    token_counts_by_expert, gather_indices, _ = moe_routing_sort(selected_experts, num_experts)
     return token_counts_by_expert, gather_indices
 
 
@@ -2138,6 +2148,42 @@ def _silu_and_mul(x):
     """Fused SiLU + element-wise multiply for gate/up projections."""
     gate, up = x.chunk(2, dim=-1)
     return F.silu(gate) * up
+
+
+try:
+    from unsloth_zoo.temporary_patches import moe_fused_swiglu as _MOE_FUSED_SWIGLU
+except Exception:
+    _MOE_FUSED_SWIGLU = None
+
+
+def _act_fn_is_silu(act_fn) -> bool:
+    if act_fn is F.silu:
+        return True
+    # Exact types only: a subclass may override forward.
+    return type(act_fn) is torch.nn.SiLU or type(act_fn).__name__ == "SiLUActivation"
+
+
+def _fused_moe_activation(module, gate_up, interleaved, allow_gptoss = True):
+    """Fused (clamped) SwiGLU over gate_up, or None so the caller runs its bit-identical eager path."""
+    _sw = _MOE_FUSED_SWIGLU
+    if _sw is None or not _sw.fused_swiglu_supported(gate_up):
+        return None
+    # Compiled frames round once, matching Inductor's fusion of the eager expression.
+    eager_rounding = not torch.compiler.is_compiling()
+    alpha, limit = 1.702, 7.0
+    if "GptOssExperts" in module.__class__.__name__:
+        if not allow_gptoss:
+            return None
+        act = _sw.ACT_GPTOSS
+        alpha, limit = float(getattr(module, "alpha", 1.702)), float(getattr(module, "limit", 7.0))
+    else:
+        act_fn = getattr(module, "act_fn", None)
+        if act_fn is not None and callable(act_fn) and not _act_fn_is_silu(act_fn):
+            return None
+        act = _sw.ACT_SILU
+    if eager_rounding and not _sw.fused_swiglu_self_check(gate_up.device, gate_up.dtype, act, interleaved, alpha, limit):
+        return None
+    return _sw.moe_fused_swiglu(gate_up, act, interleaved, alpha, limit, eager_rounding)
 
 
 # Separated LoRA helpers.
@@ -5068,11 +5114,9 @@ def forward_native_grouped_mm(
 
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
-    sorted_indices = torch.argsort(flat_top_k, stable=True)
+    num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
     # Gate + Up projection with optional separated LoRA (default).
     use_separated_lora = _should_use_separated_lora()
@@ -5092,6 +5136,7 @@ def forward_native_grouped_mm(
         )
 
     own_gate_up = None
+    fused_inter = None
     selective_plan = None
     if hasattr(self, "gate_up_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
@@ -5173,12 +5218,15 @@ def forward_native_grouped_mm(
             bias_expanded = _gather_expert_bias(self.gate_up_proj_bias, sorted_expert_ids)
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
-        if _gate_up_is_interleaved(self):
+        _interleaved = _gate_up_is_interleaved(self)
+        if _interleaved:
             gate = mm1_out[..., ::2]
             up = mm1_out[..., 1::2]
         else:
             gate, up = mm1_out.chunk(2, dim=-1)
         own_gate_up = mm1_out if _uses_own_apply_gate(self) else None
+        if own_gate_up is None:
+            fused_inter = _fused_moe_activation(self, mm1_out, _interleaved)
 
     elif hasattr(self, "w1") and hasattr(self, "w3"):
         # Separate w1/w3 weights (older models).
@@ -5224,6 +5272,8 @@ def forward_native_grouped_mm(
     # Activation
     if own_gate_up is not None:
         inter = self._apply_gate(own_gate_up)
+    elif fused_inter is not None:
+        inter = fused_inter
     elif "GptOssExperts" in self.__class__.__name__:
         # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
@@ -5480,10 +5530,8 @@ def forward_triton_grouped_gemm(
     fwd_config_1, bwd_dX_config_1, bwd_dW_config_1 = gemm1_configs
     fwd_config_2, bwd_dX_config_2, bwd_dW_config_2 = gemm2_configs
 
-    token_counts_by_expert, gather_indices = _get_routing_indices(
-        top_k_index, self.num_experts
-    )
-    offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
+    with torch.no_grad():
+        token_counts_by_expert, gather_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
 
     if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
@@ -5525,8 +5573,13 @@ def forward_triton_grouped_gemm(
         first_gemm_output = first_gemm_output + gate_up_lora_delta
 
     # Activation + gate*up.
+    fused_intermediate = None
+    if not _uses_own_apply_gate(self):
+        fused_intermediate = _fused_moe_activation(self, first_gemm_output, False, allow_gptoss = False)
     if _uses_own_apply_gate(self):
         intermediate = self._apply_gate(first_gemm_output)
+    elif fused_intermediate is not None:
+        intermediate = fused_intermediate
     elif hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
@@ -5662,10 +5715,10 @@ def forward_native_moe_loop(
     with torch.no_grad():
         n_tokens = top_k_index.shape[0]
         slot_major = top_k_index.t().reshape(-1)   # position = top_k_pos * n_tokens + token
-        order = torch.argsort(slot_major, stable=True)
+        expert_counts, order, _ = moe_routing_sort(slot_major, self.num_experts)
         routed_token_idx = order % n_tokens
         routed_top_k_pos = order // n_tokens
-        expert_counts = torch.bincount(slot_major, minlength=self.num_experts).tolist()
+        expert_counts = expert_counts.tolist()
 
     # A declared (E, in, out) layout (_unsloth_grouped_mm_format) wins over the shape test, which a square stack defeats.
     grouped_mm_format = bool(_module_flag(self, "_unsloth_grouped_mm_format", False)) or (

@@ -920,6 +920,10 @@ def grpo_compute_loss(
         log_ratio = new - old
     else:
         log_ratio = new - new.detach()
+    if kwargs.get("rollout_logps_as_old", False):
+        # Rollout gap can pass 88 nats (float32 exp overflow, 0 * inf backward); verl
+        # compute_policy_loss_vanilla clamps the log ratio to [-20, 20] too.
+        log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
 
     if importance_sampling_level == "token":
         log_importance_weights = log_ratio
@@ -1363,7 +1367,10 @@ def _warn_unsupported_grpo_options(trainer):
         unsupported.append("use_adaptive_entropy=True")
     # These only act on vLLM sampling logprobs, which exist with vllm_importance_sampling_correction.
     if not (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False)):
-        for name in ("UNSLOTH_GRPO_VLLM_IS_MODE", "UNSLOTH_GRPO_VLLM_IS_CLIP", "UNSLOTH_GRPO_ROLLOUT_RS", "UNSLOTH_GRPO_ROLLOUT_METRICS"):
+        _names = ("UNSLOTH_GRPO_VLLM_IS_MODE", "UNSLOTH_GRPO_VLLM_IS_CLIP", "UNSLOTH_GRPO_ROLLOUT_RS", "UNSLOTH_GRPO_ROLLOUT_METRICS")
+        if os.environ.get("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", "0") == "1":
+            _names = _names[:-1]
+        for name in _names:
             if os.environ.get(name, "") not in ("", "0"):
                 unsupported.append(f"{name}={os.environ[name]} (needs use_vllm and vllm_importance_sampling_correction=True)")
 
@@ -2127,6 +2134,51 @@ pass
 RL_REPLACEMENTS["grpo_rollout_mismatch_metrics"] = grpo_rollout_mismatch_metrics
 
 
+def grpo_rollout_logps_as_old(sampling_logps, old_logps = None):
+    """UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD (verl rollout_correction bypass_mode with loss_type
+    ppo_clip, vime --use-rollout-logprobs): the rollout engine's logprobs are pi_old, so the PPO
+    ratio is pi_theta / pi_rollout and its clip is the off-policy correction. Returns the
+    (old, sampling) pair for grpo_compute_loss: sampling is dropped so no importance weight
+    multiplies that ratio a second time (verl compute_policy_loss_bypass_mode: "would be
+    double-counting"; vime refuses use_tis with use_rollout_logprobs)."""
+    if sampling_logps is None:
+        raise ValueError("Unsloth: rollout_logps_as_old needs the rollout engine's sampling logprobs.")
+    if old_logps is not None:
+        raise ValueError("Unsloth: rollout_logps_as_old batches must not carry trainer-scored old logprobs.")
+    return sampling_logps.to(torch.float32), None
+pass
+RL_REPLACEMENTS["grpo_rollout_logps_as_old"] = grpo_rollout_logps_as_old
+
+
+def grpo_rollout_old_fill_unscored(old_logps, new_logps):
+    """Tokens the rollout engine could not score (vLLM returns NaN) take the current policy's own
+    logprob as pi_old, so their ratio is exactly 1: no correction, as the vLLM importance-sampling
+    path treats them (TRL zeroes their log ratio). Returns (old, unscored mask)."""
+    unscored = ~torch.isfinite(old_logps)
+    filled = torch.where(unscored, new_logps.detach().to(old_logps.dtype), old_logps)
+    return filled, unscored
+pass
+RL_REPLACEMENTS["grpo_rollout_old_fill_unscored"] = grpo_rollout_old_fill_unscored
+
+
+def grpo_rollout_as_old_ratio_metrics(coef_1, mask):
+    """(|log r|, r) zero-filled outside the mask, r = pi_theta / pi_rollout per token, for the
+    sampling_logp_difference / importance_sampling_ratio metrics when pi_old is the rollout policy.
+    verl measures the bypass mismatch the same way (compute_rollout_correction_and_rejection_mask
+    with old_log_prob = the current log_prob). None for a sequence-level ratio."""
+    if coef_1 is None or coef_1.shape != mask.shape:
+        return None, None
+    with torch.no_grad():
+        keep = mask.to(torch.bool)
+        ratio = coef_1.detach().to(torch.float32)
+        log_ratio = torch.nan_to_num(torch.log(ratio), nan = 0.0, posinf = 670.0, neginf = -670.0)
+        # where, not * mask: an overflowed ratio (inf) on a padded column would leave inf * 0 = nan.
+        zero = torch.zeros_like(ratio)
+        return torch.where(keep, log_ratio.abs(), zero), torch.where(keep, ratio, zero)
+pass
+RL_REPLACEMENTS["grpo_rollout_as_old_ratio_metrics"] = grpo_rollout_as_old_ratio_metrics
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -2154,6 +2206,9 @@ def grpo_accumulated_loss(
         grpo_vision_chunks as _grpo_vision_chunks,
         chunked_hidden_states_selective_log_softmax,
         chunked_selective_log_softmax,
+        grpo_rollout_logps_as_old,
+        grpo_rollout_as_old_ratio_metrics,
+        grpo_rollout_old_fill_unscored,
     )
     if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
         from unsloth_zoo.rl_replacements import (
@@ -2203,9 +2258,12 @@ def grpo_accumulated_loss(
     # either way); the IS ratio stays gated on the correction flag inside grpo_compute_loss. On the
     # plain vLLM path (neither active) they are dropped so nothing pays for an unused aligned/compiled
     # input and grpo_compute_loss returns None (not empty) delta/flat_is_ratio.
+    # Set by unsloth when UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 skipped the old-policy forward.
+    _rollout_logps_as_old = bool(kwargs.pop("rollout_logps_as_old", False))
     _sampling_logps_used = (
         getattr(trainer, "vllm_importance_sampling_correction", False)
         or getattr(trainer.args, "off_policy_mask_threshold", None) is not None
+        or _rollout_logps_as_old
     )
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if _sampling_logps_used else None
     temperature = kwargs.get("temperature", 1.0)
@@ -2446,7 +2504,7 @@ def grpo_accumulated_loss(
             completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
             completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
 
-            if trainer.use_vllm and sampling_per_token_logps is not None:
+            if (trainer.use_vllm or _rollout_logps_as_old) and sampling_per_token_logps is not None:
                 sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
             else:
                 sampling_per_token_logps = None
@@ -2456,6 +2514,9 @@ def grpo_accumulated_loss(
         else:
             completion_input_ids = input_ids[:, -logits_to_keep:]
             completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
+
+        if _rollout_logps_as_old:
+            old_logps, sampling_per_token_logps = grpo_rollout_logps_as_old(sampling_per_token_logps, old_logps)
 
         unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
@@ -3221,6 +3282,11 @@ def grpo_accumulated_loss(
             if not loss_is_scaled_for_ga:
                 upstream_scale = float(kwargs.get("current_gradient_accumulation_steps", 1))
 
+        _rollout_unscored = None
+        if _rollout_logps_as_old:
+            old_logps, _rollout_unscored = grpo_rollout_old_fill_unscored(old_logps, new_logprobs)
+            # Only on this path: grpo_compute_loss clamps pi_theta / pi_rollout's log to [-20, 20] like verl.
+            kwargs["rollout_logps_as_old"] = True
         with autocaster:
             loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
                 new_logprobs,
@@ -3237,15 +3303,31 @@ def grpo_accumulated_loss(
                 kwargs,
                 upstream_scale,
             )
-        if (
+        _rollout_stats_args = None
+        if _rollout_logps_as_old:
+            delta, flat_is_ratio = grpo_rollout_as_old_ratio_metrics(coef_1, completion_mask)
+            if _rollout_metrics_on and flat_is_ratio is not None:
+                _log_ratio = torch.nan_to_num(
+                    torch.log(coef_1.detach().to(torch.float64)), nan = 0.0, posinf = 670.0, neginf = -670.0,
+                )
+                _log_ratio = torch.where(completion_mask.to(torch.bool), _log_ratio, torch.zeros_like(_log_ratio))
+                if _rollout_unscored is not None:
+                    # Unscored tokens carry no mismatch information: NaN leaves them out of the sums.
+                    _log_ratio = torch.where(_rollout_unscored, torch.full_like(_log_ratio, float("nan")), _log_ratio)
+                # An overflowed ratio is capped (finite squares) so ESS tends to its 1 / N limit, not nan.
+                _ess_weights = torch.clamp(flat_is_ratio.to(torch.float64), max = 1e100)
+                _rollout_stats_args = (_log_ratio, torch.zeros_like(_log_ratio), completion_mask, _ess_weights)
+        elif (
             _rollout_metrics_on and old_logps is not None and sampling_per_token_logps is not None
             and flat_is_ratio is not None and flat_is_ratio.numel() > 0
         ):
+            _rollout_stats_args = (old_logps, sampling_per_token_logps, completion_mask, flat_is_ratio)
+        if _rollout_stats_args is not None:
             from unsloth_zoo.rl_replacements import (
                 grpo_rollout_mismatch_stats as _grpo_rollout_mismatch_stats,
                 grpo_rollout_mismatch_metrics as _grpo_rollout_mismatch_metrics,
             )
-            _rollout_stats = _grpo_rollout_mismatch_stats(old_logps, sampling_per_token_logps, completion_mask, flat_is_ratio)
+            _rollout_stats = _grpo_rollout_mismatch_stats(*_rollout_stats_args)
             _rollout_stats = trainer.accelerator.gather(_rollout_stats.reshape(1, -1)).reshape(-1, _rollout_stats.numel())
             _rollout_stats = torch.cat([_rollout_stats[:, :3].sum(0), _rollout_stats[:, 3:4].amax(0), _rollout_stats[:, 4:].sum(0)])
             _metrics = trainer._metrics

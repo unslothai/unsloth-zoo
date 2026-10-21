@@ -27,10 +27,12 @@ load, priced from the safetensors headers before anything is built.
 
 import contextlib
 import copy
+import ctypes
 import glob
 import inspect
 import json
 import math
+import mmap
 import os
 import re
 import struct
@@ -206,6 +208,34 @@ class _Field:
         return array if self.cast is None else array.astype(self.cast)
 
 
+_mincore = None
+# Seen rows of a lookup checked one at a time before checking all of them.
+_RESIDENCY_SAMPLE = 16
+
+
+def _in_core(mapped, rows, row_bytes):
+    """Whether each of ``rows`` of ``mapped`` is in the page cache (all ``True`` without ``mincore``)."""
+    global _mincore
+    if _mincore is None:
+        try:
+            libc = ctypes.CDLL(None, use_errno = True)
+            libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+            _mincore = libc.mincore
+        except (OSError, AttributeError):
+            _mincore = False
+    if not _mincore or not rows.size:
+        return np.ones(rows.size, dtype = bool)
+    start = mapped.ctypes.data + rows * row_bytes
+    end = start + row_bytes - 1
+    first = int(start.min()) // mmap.PAGESIZE * mmap.PAGESIZE
+    pages = np.empty((int(end.max()) - first) // mmap.PAGESIZE + 1, dtype = np.uint8)
+    if _mincore(first, pages.size * mmap.PAGESIZE, pages.ctypes.data) != 0:
+        return np.ones(rows.size, dtype = bool)
+    resident = np.concatenate([[0], np.cumsum(pages & 1)])
+    low, high = (start - first) // mmap.PAGESIZE, (end - first) // mmap.PAGESIZE
+    return resident[high + 1] - resident[low] == high - low + 1
+
+
 class _RowTable:
     """A ``[rows, ...]`` tensor and its quantization siblings, read by row. The first ``resident``
     rows are read once at load and held in memory. A row's first lookup reads it with ``pread``,
@@ -239,9 +269,19 @@ class _RowTable:
         return rows * sum(field.row_bytes for field in self.fields)
 
     def fill(self, local, buffers, at, jobs):
-        """Put rows ``local`` (unique, all past the held prefix) into ``buffers`` at ``at``: rows
-        read before are copied now, new ones queued on ``jobs``. Returns the new rows."""
+        """Put rows ``local`` (unique, all past the held prefix) into ``buffers`` at ``at``: rows read
+        before and still in the page cache are copied now, the rest queued on ``jobs`` and returned."""
         seen = (self.seen[local >> 3] >> (local & 7).astype(np.uint8)) & 1 == 1
+        if seen.any():
+            # Through the map, an evicted row is a page fault taken with the GIL held. A check walks
+            # every page its rows span, so a spread sample is checked row by row before all rows are.
+            rows = local[seen]
+            sample = rows[np.linspace(0, rows.size - 1, min(rows.size, _RESIDENCY_SAMPLE)).astype(np.int64)]
+            if not all(_in_core(field.map, sample[i:i + 1], field.row_bytes)[0] for field in self.fields for i in range(sample.size)):
+                kept = np.ones(rows.size, dtype = bool)
+                for field in self.fields:
+                    kept &= _in_core(field.map, rows, field.row_bytes)
+                seen[np.flatnonzero(seen)[~kept]] = False
         new, new_at = local[~seen], at[~seen].tolist()
         for field, buffer in zip(self.fields, buffers):
             if seen.any():
