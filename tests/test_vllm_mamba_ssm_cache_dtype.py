@@ -27,7 +27,8 @@ import pytest
 
 VLLM_UTILS = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo" / "vllm_utils.py"
 TREE = ast.parse(VLLM_UTILS.read_text(encoding = "utf-8-sig"))
-HELPERS = ("_config_has_gdn_layers", "_vllm_mamba_dtype_choices", "_vllm_mamba_ssm_cache_dtype_args")
+HELPERS = ("_config_has_gdn_layers", "_vllm_mamba_dtype_choices", "_vllm_gdn_reads_ssm_dtype",
+           "_vllm_mamba_ssm_cache_dtype_args")
 CONSTANTS = ("_VLLM_MAMBA_SSM_DTYPE_ALIASES",)
 ENV = "UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE"
 
@@ -60,14 +61,23 @@ QWEN3_5 = SimpleNamespace(
 LLAMA = SimpleNamespace(model_type = "llama")
 
 
+# MambaStateDtypeCalculator.gated_delta_net_state_dtype (vllm/model_executor/layers/mamba/mamba_utils.py).
+GDN_OLD = "def gated_delta_net_state_dtype(cls, model_dtype, mamba_cache_dtype): pass"  # <= 0.16
+GDN_NEW = 'def gated_delta_net_state_dtype(cls, model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype = "auto"): pass'
+
+
 @pytest.fixture
 def fake_vllm(monkeypatch):
-    def install(source):
+    def install(source, gdn = GDN_NEW):
         module = types.ModuleType("vllm.config.cache")
         exec("from typing import Literal\n" + source, module.__dict__)
-        monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
-        monkeypatch.setitem(sys.modules, "vllm.config", types.ModuleType("vllm.config"))
+        mamba_utils = types.ModuleType("vllm.model_executor.layers.mamba.mamba_utils")
+        exec("class MambaStateDtypeCalculator:\n    @classmethod\n    " + gdn, mamba_utils.__dict__)
+        for name in ("vllm", "vllm.config", "vllm.model_executor", "vllm.model_executor.layers",
+                     "vllm.model_executor.layers.mamba"):
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
         monkeypatch.setitem(sys.modules, "vllm.config.cache", module)
+        monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.mamba.mamba_utils", mamba_utils)
     return install
 
 
@@ -79,7 +89,8 @@ def test_unset_passes_nothing(monkeypatch, config):
         assert args == {}
 
 
-def test_unset_hints_only_for_training_gdn_without_a_config_dtype(monkeypatch):
+def test_unset_hints_only_for_training_gdn_without_a_config_dtype(monkeypatch, fake_vllm):
+    fake_vllm(VLLM_LATEST)
     monkeypatch.delenv(ENV, raising = False)
     fn = NS["_vllm_mamba_ssm_cache_dtype_args"]
     assert ENV in fn(QWEN3_NEXT, KEYS, True)[1]
@@ -102,9 +113,10 @@ def test_latest_vllm_accepts(monkeypatch, fake_vllm, value, expected):
 
 @pytest.mark.parametrize("value, passed", [("float32", True), ("auto", True), ("bfloat16", False), ("fp16", False)])
 def test_vllm_0_11_2_only_takes_auto_and_float32(monkeypatch, fake_vllm, value, passed):
-    fake_vllm(VLLM_0_11_2)
+    # Mamba hybrids read mamba_ssm_cache_dtype on 0.11.2; Gated DeltaNet does not (next test).
+    fake_vllm(VLLM_0_11_2, gdn = GDN_OLD)
     monkeypatch.setenv(ENV, value)
-    args, message = NS["_vllm_mamba_ssm_cache_dtype_args"](QWEN3_NEXT, KEYS, True)
+    args, message = NS["_vllm_mamba_ssm_cache_dtype_args"](LLAMA, KEYS, True)
     if passed:
         assert args == {"mamba_ssm_cache_dtype": value} and message is None
     else:
@@ -144,3 +156,22 @@ def test_load_vllm_applies_it_after_the_engine_arg_filter():
     assert call < source.index("engine_args.update(ssm_dtype_args)") < source.index("if return_args:")
     # Engines are built only after the update, so every LLM / LLMEngine / AsyncLLMEngine gets it.
     assert source.index("engine_args.update(ssm_dtype_args)") < source.index("llm = LLM(**engine_args)")
+
+
+@pytest.mark.parametrize("value", ["float32", "auto"])
+def test_gdn_override_is_refused_where_vllm_does_not_read_it(monkeypatch, fake_vllm, value):
+    fake_vllm(VLLM_0_11_2, gdn = GDN_OLD)
+    monkeypatch.setenv(ENV, value)
+    fn = NS["_vllm_mamba_ssm_cache_dtype_args"]
+    args, message = fn(QWEN3_NEXT, KEYS, True)
+    assert args == {} and "vLLM < 0.17" in message
+    monkeypatch.delenv(ENV)
+    assert fn(QWEN3_NEXT, KEYS, True) == ({}, None)  # no hint either: the override cannot work here
+    fake_vllm(VLLM_0_11_2, gdn = GDN_NEW)
+    monkeypatch.setenv(ENV, value)
+    assert fn(QWEN3_NEXT, KEYS, True) == ({"mamba_ssm_cache_dtype": value}, None)
+
+
+def test_gdn_support_unreadable_refuses(monkeypatch):
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.mamba.mamba_utils", None)
+    assert NS["_vllm_gdn_reads_ssm_dtype"]() is False

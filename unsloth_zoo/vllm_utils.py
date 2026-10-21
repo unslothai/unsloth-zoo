@@ -3830,14 +3830,29 @@ def _vllm_mamba_dtype_choices():
     return ("auto", "float32")
 
 
-def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices = None):
+def _vllm_gdn_reads_ssm_dtype():
+    # Gated DeltaNet state dtype follows mamba_ssm_cache_dtype only from vLLM 0.17; before that it
+    # comes from mamba_cache_dtype alone, so the override would be accepted and silently unused.
+    try:
+        import inspect
+        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
+        fn = MambaStateDtypeCalculator.gated_delta_net_state_dtype
+        return "mamba_ssm_cache_dtype" in inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+
+def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices = None, gdn_reads_ssm = None):
     # (engine args to add, message or None). Unset env: nothing is passed.
     value = os.environ.get("UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE", "").strip().lower()
     value = _VLLM_MAMBA_SSM_DTYPE_ALIASES.get(value, value)
     has_arg = "mamba_ssm_cache_dtype" in engine_arg_keys
+    is_gdn = _config_has_gdn_layers(config)
+    if is_gdn and has_arg and gdn_reads_ssm is None:
+        gdn_reads_ssm = _vllm_gdn_reads_ssm_dtype()
     if not value:
         text_config = getattr(config, "text_config", None) or config
-        if (training and has_arg and _config_has_gdn_layers(config)
+        if (training and has_arg and is_gdn and gdn_reads_ssm
                 and getattr(text_config, "mamba_ssm_dtype", None) is None):
             return {}, (
                 "Unsloth: vLLM keeps this model's Gated DeltaNet state in the model dtype during "
@@ -3850,6 +3865,11 @@ def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices 
     if value not in choices:
         return {}, (
             f"Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE={value!r} ignored: this vLLM accepts {', '.join(choices)}."
+        )
+    if is_gdn and not gdn_reads_ssm:
+        return {}, (
+            "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: this vLLM sizes the Gated DeltaNet "
+            "state from mamba_cache_dtype only (vLLM < 0.17)."
         )
     return {"mamba_ssm_cache_dtype": value}, None
 
