@@ -14,78 +14,54 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch.library.custom_op annotations resolve on the torch floor.
+"""torch.library.custom_op functions live in modules without postponed annotations.
 
-Under `from __future__ import annotations` every annotation is a string. torch 2.6's infer_schema
-evals that string in its own module, not the function's, so only the names that module imports
-resolve: `Tuple[torch.Tensor, torch.Tensor]` raised "Unsupported type annotation" at import and took
-the whole module down on the torch 2.6 lane (#1934). Newer torch resolves the function's globals, so
-only the floor sees it; this checks every custom op against the floor's namespace on any torch.
+Under `from __future__ import annotations` every annotation is a string, and the torch floor cannot
+read those: torch 2.4's infer_schema rejects a string `torch.Tensor` parameter outright, and torch
+2.6 evals the string in its own module, where `Tuple` does not exist. #1934's fused router hit both
+at import, which `temporary_patches/__init__.py` does unconditionally. Newer torch reads the strings
+fine, so only the floor lanes see it; this static check catches it on any torch.
 """
 
 import ast
-import builtins
 import pathlib
-import typing
-
-import pytest
-
-torch = pytest.importorskip("torch")
 
 ZOO = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo"
-
-# torch/_library/infer_schema.py (torch 2.6) module globals, which its eval() sees.
-_FLOOR_NAMESPACE = {
-    **vars(builtins),
-    "inspect": __import__("inspect"),
-    "typing": typing,
-    "List": typing.List,
-    "Optional": typing.Optional,
-    "Sequence": typing.Sequence,
-    "Union": typing.Union,
-    "torch": torch,
-    "device": torch.device,
-    "dtype": torch.dtype,
-    "Tensor": torch.Tensor,
-    "types": torch.types,
-}
 
 
 def _is_custom_op(decorator):
     target = decorator.func if isinstance(decorator, ast.Call) else decorator
-    return isinstance(target, (ast.Attribute, ast.Name)) and getattr(target, "attr", getattr(target, "id", None)) == "custom_op"
+    name = getattr(target, "attr", getattr(target, "id", None))
+    return name == "custom_op"
 
 
-def _custom_op_annotations():
+def _postponed(tree):
+    return any(
+        isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
+        for n in tree.body
+    )
+
+
+def _custom_ops():
     for path in sorted(ZOO.rglob("*.py")):
-        rel = path.relative_to(ZOO).as_posix()
         src = path.read_text(encoding = "utf-8")
         if "custom_op" not in src:
             continue
         tree = ast.parse(src)
-        postponed = any(
-            isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
-            for n in tree.body
-        )
-        if not postponed:
-            continue
         for func in ast.walk(tree):
             if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(map(_is_custom_op, func.decorator_list)):
-                args = func.args.posonlyargs + func.args.args + func.args.kwonlyargs
-                for node in [a.annotation for a in args] + [func.returns]:
-                    if node is not None:
-                        yield f"{rel}:{func.lineno}:{func.name}", ast.unparse(node)
+                yield path.relative_to(ZOO).as_posix(), func, _postponed(tree)
 
 
 def test_the_scan_sees_custom_ops():
-    assert any("moe_router_triton.py" in where for where, _ in _custom_op_annotations())
+    found = {rel for rel, _, _ in _custom_ops()}
+    assert {"temporary_patches/moe_router_triton.py", "fp16_emulation.py"} <= found, found
 
 
-def test_custom_op_annotations_resolve_in_the_torch_floor_namespace():
-    bad = []
-    for where, annotation in _custom_op_annotations():
-        try:
-            eval(annotation, dict(_FLOOR_NAMESPACE))
-        except Exception as e:
-            bad.append(f"{where} {annotation!r}: {type(e).__name__}: {e}")
-    assert not bad, "torch 2.6 rejects these custom_op annotations at import; use builtin / torch names: " + "; ".join(bad)
+def test_no_custom_op_has_string_annotations():
+    bad = sorted(f"{rel}:{func.lineno}:{func.name}" for rel, func, postponed in _custom_ops() if postponed)
+    assert not bad, (
+        "torch.library.custom_op in a module with `from __future__ import annotations`: torch 2.4 rejects "
+        "string annotations at definition (2.6 only resolves torch / some typing names), so the module "
+        "fails to import on the floor: " + ", ".join(bad)
+    )

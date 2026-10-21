@@ -28,8 +28,6 @@ Logits a float32 ulp apart can rank differently from eager. NaN unsupported; bia
 Opt-in: UNSLOTH_MOE_FUSED_ROUTER=1, read every eager call.
 """
 
-from __future__ import annotations
-
 __all__ = [
     "moe_router",
     "moe_router_reference",
@@ -256,7 +254,7 @@ def _router_fwd_impl(logits, bias, top_k, mode, renorm, n_group, topk_group, sca
 def _router_fwd_op(
     logits: torch.Tensor, bias: Optional[torch.Tensor], top_k: int, mode: int, renorm: bool,
     n_group: int, topk_group: int, scale: float, mask_zero: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:  # torch 2.6 cannot resolve typing.Tuple here
+) -> tuple[torch.Tensor, torch.Tensor]:
     return _router_fwd_impl(logits, bias, top_k, mode, renorm, n_group, topk_group, scale, mask_zero)
 
 
