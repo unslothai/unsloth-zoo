@@ -104,9 +104,12 @@ try:
     def _compile_block_mask(bsz, head, M, N):
         # torch 2.10's dynamic create_block_mask graph miscompiles one-block lengths: its block
         # counts come out 2 instead of 1 and read past the buffer (illegal memory access).
-        if M > FLEX_ATTENTION_BLOCK_SIZE and N > FLEX_ATTENTION_BLOCK_SIZE:
+        blk = FLEX_ATTENTION_BLOCK_SIZE
+        if M > blk and N > blk:
             return True
-        return (bsz or 1) * (head or 1) * M * N > _EAGER_BLOCK_MASK_MAX_ELEMENTS
+        # The eager builder pads both lengths to whole blocks before reducing the dense mask.
+        padded = -(-M // blk) * blk * (-(-N // blk) * blk)
+        return (bsz or 1) * (head or 1) * padded > _EAGER_BLOCK_MASK_MAX_ELEMENTS
 
     def compiled_create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
