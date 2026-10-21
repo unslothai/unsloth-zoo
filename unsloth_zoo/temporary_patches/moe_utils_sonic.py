@@ -33,32 +33,36 @@ median of 15 timed batches; see `scripts/sonic_probe.py`, `scripts/sonic_probe2.
 
 dH and the rank-r LoRA GEMMs are regressions, so they keep ``torch._grouped_mm``.
 
-The fused ``gemm_gated`` (gate_up GEMM + SwiGLU in one kernel, 0.291 -> 0.188 ms) is
-implemented but DEFAULTS OFF, for three measured reasons:
+The fused ``gemm_gated`` (gate_up GEMM + SwiGLU in one kernel) runs on the HF weight
+with NO copy (`_SonicGatedZeroCopy`). What the first integration measured, and why it
+no longer applies (B200, kernels-community/sonic-moe v2 = quack 0.6.1):
 
-  1. It needs an INTERLEAVED gate/up weight (silu(even_cols) * odd_cols) while
-     Qwen/torch store the CHUNKED layout. sonic's ``concat_layout=("B",)`` advertises
-     the chunked layout but produces garbage here: rel err 1.41 for both stride
-     orders, so interleaving has to be a real column permutation.
-  2. A cached interleaved copy is a FULL DUPLICATE of the gate_up stack: 1.07 GiB per
-     layer on Qwen3.5-35B-A3B, 43 GiB over its 40 layers. Permuting per step instead
-     moves ~2 GiB per layer per step, far more than the 0.1 ms it saves.
-  3. ``gemm_gated(store_preact=True, tuned=True)`` is WRONG on some inputs, and
-     nondeterministically so. At E=96 H=768 I=384 M=6144 the post-activation has rel
-     err ~1.0; two IDENTICAL back-to-back calls disagree with each other by 0.76 in
-     the pre-activation, i.e. the kernel returns raced / uninitialized memory. The
-     failure is not a function of the weight shape alone, nor of (shape, M): a probe
-     run at the exact shape and the exact row count can pass and the very next real
-     call at the same shape and row count still returns garbage. That is why there is
-     no self-probe here -- a nondeterministic kernel cannot be gated by sampling it.
-     ``tuned=False`` is correct but slow, and ``store_preact=False`` is correct but
-     forces a second gate_up GEMM in backward, which erases the win. Plain ``gemm`` is
-     exact (rel err 0.00000) on every shape, row count and routing tested.
+  1. "concat_layout=("B",) gives garbage, rel err 1.41". It does not: quack rewrites a
+     concat operand's NON-contiguous dim as interleaved. On the K-major view
+     ``W.transpose(-2, -1)`` of the HF [E, 2I, H] storage that dim is 2I and the result
+     matches an interleaved reference to bf16 rounding (rel 1.7e-3). Its PRE-activation
+     comes back interleaved; compared against a chunked reference that is rel sqrt(2)
+     = 1.41, which is the number that was seen. A contiguous [E, H, 2I] B instead gets
+     its contraction dim interleaved (1.41 against both orders). dX passes concat on
+     the [E, 2I, H] storage (its K is then interleaved); "C" in concat_layout
+     interleaves a row-major C's M dim (rel 0.19), so the LoRA delta is produced
+     interleaved instead. Details at `_SonicGatedZeroCopy`.
+  2. "A cached interleaved copy is a FULL DUPLICATE of gate_up" (1.07 GiB per layer on
+     Qwen3.5-35B-A3B, 43 GiB over 40 layers). Not needed any more; the legacy copy
+     path stays behind ``UNSLOTH_MOE_SONIC_ZERO_COPY=0`` (plus a
+     ``UNSLOTH_MOE_SONIC_CACHE_GIB`` budget) and is the automatic fallback when the
+     installed build has no working concat_layout or the weight is not K-major.
+  3. "gemm_gated(tuned=True) is nondeterministically wrong". Reproduced, and it is the
+     config, not the shape: every sm100 config with tile_m=128 and cluster_m=2 returns
+     different bytes for identical calls (post-activation rel err ~1.0), and the CLC
+     (dynamic persistent) scheduler intermittently leaves output tiles unwritten. The
+     autotuner keys on shapes and stride classes only and picks by speed, so it can
+     land on either. Nothing autotunes by default any more (``UNSLOTH_MOE_SONIC_GEMM_TUNED=1``
+     re-enables it for the plain GEMMs only): every sonic call runs one pinned
+     config (`_pinned_config`: 256x256, cluster 2x1, static scheduler), which was
+     correct and bitwise reproducible on every shape, op and repeat tested.
 
-The gated code below is therefore NOT REACHABLE by any boolean flag. It runs only with
-the literal ``UNSLOTH_MOE_SONIC_GATED=unsafe`` plus a non-zero
-``UNSLOTH_MOE_SONIC_CACHE_GIB``, and warns on every engagement. Do not enable it until
-the upstream kernel is fixed; it is kept so the integration is ready when that happens.
+``UNSLOTH_MOE_SONIC_GATED=0`` turns the fusion off (plain GEMM + eager SwiGLU).
 """
 import os
 import sys
@@ -89,13 +93,15 @@ def _log(message):
 
 def reset_sonic_moe_state():
     """Forget the availability probe (tests; a device change)."""
-    global _SONIC_MODULE, _SONIC_REASON, _SONIC_PROBED, _GEMM_INTERFACE
+    global _SONIC_MODULE, _SONIC_REASON, _SONIC_PROBED, _GEMM_INTERFACE, _CONCAT_SUPPORTED
     _SONIC_MODULE = None
     _SONIC_REASON = None
     _SONIC_PROBED = False
     _GEMM_INTERFACE = None
+    _CONCAT_SUPPORTED = None
     _INTERLEAVE_CACHE.clear()
     _CONFIG_CACHE.clear()
+    _PINNED_CONFIG.clear()
 
 
 def _apply_cutlass_dsl_shim():
@@ -165,12 +171,11 @@ def _probe_sonic(module):
     a = torch.ones((8, 16), device=device, dtype=torch.bfloat16)
     b = torch.ones((2, 16, 16), device=device, dtype=torch.bfloat16)
     cu = torch.tensor([0, 4, 8], device=device, dtype=torch.int32)
-    out = module.functional.gemm(a, b, cu_seqlens_m=cu, tuned=True)
+    out = module.functional.gemm(a, b, cu_seqlens_m=cu, tuned=False)
     if out.shape != (8, 16):
         raise RuntimeError(f"sonic-moe probe returned {tuple(out.shape)}, expected (8, 16)")
     # The low-overhead path reaches internals `functional.gemm` hides, so probe it
-    # too and make sure it agrees exactly. Its own try/except would otherwise hide
-    # a permanently-broken fast path behind a silent per-call fallback.
+    # too and make sure it agrees exactly (all-ones inputs: every config gives 16).
     fast = _sonic_gemm(module, a, b, cu)
     if fast.shape != out.shape or not torch.equal(fast, out):
         raise RuntimeError("sonic-moe fast call path disagrees with functional.gemm")
@@ -216,6 +221,7 @@ def get_sonic_module():
     _SONIC_MODULE = module
     _SONIC_REASON = None
     _log("Unsloth: sonic-moe MoE backend is available.")
+    _concat_layout_supported(module)
     return module
 
 
@@ -295,14 +301,124 @@ def _shape_key(t):
             t.dtype)
 
 
-def _sonic_gemm(module, A, B, cu_seqlens_m):
-    """`module.functional.gemm(A, B, cu_seqlens_m=..., tuned=True)` without the
-    custom-op boundary and without the per-call autotune key.
+_PINNED_CONFIG = {}
 
-    Same output tensor, same kernel, same config. Falls back to the public entry
-    point under torch.compile tracing or if anything at all goes wrong.
+
+def _pinned_config(module, device):
+    """The one GemmConfig every non-autotuned sonic call uses: the kernel's default,
+    with the dynamic (CLC) tile scheduler turned off on sm100.
+
+    Measured on the v2 build (quack 0.6.1), B200, varlen_m, NaN-poisoned outputs:
+      * every config with tile_m=128 and cluster_m=2 makes gemm_gated return
+        different bytes for identical calls (post-activation rel err ~1.0);
+      * the CLC scheduler intermittently leaves output tiles unwritten: 128x64 at
+        M=32768 every time, and the default 256x256 cluster 2x1 in 2 of 30
+        back-to-back gemm_gated calls at E=32 H=2880 I=2880 M=16384;
+      * 256x256 cluster 2x1 with the static persistent scheduler: 0 wrong and
+        bitwise identical over every shape, op and repeat tested, and within 2% of
+        the fastest correct config at the Qwen3 shape.
     """
-    if not _env_flag("UNSLOTH_MOE_SONIC_FASTCALL", "1") or torch.compiler.is_compiling():
+    cap = torch.cuda.get_device_capability(device)[0]
+    cfg = _PINNED_CONFIG.get(cap)
+    if cfg is None:
+        import dataclasses
+        cfg = _gemm_interface(module).default_config(device)
+        if cap == 10 and getattr(cfg, "is_dynamic_persistent", False):
+            cfg = dataclasses.replace(cfg, is_dynamic_persistent=False)
+        _PINNED_CONFIG[cap] = cfg
+    return cfg
+
+
+def _pinned_gemm_eager(module, A, B, cu_seqlens_m, concat_b):
+    out = torch.empty((A.shape[0], B.shape[-1]), dtype=A.dtype, device=A.device)
+    if out.numel() == 0:
+        return out
+    if A.numel() == 0:
+        # K=0: the kernel rejects it; the empty contraction is a zero matrix.
+        return out.zero_()
+    extra = {"concat_layout": ("B",)} if concat_b else {}
+    _gemm_interface(module).gemm_tuned.fn(
+        A, B, out, cu_seqlens_m=cu_seqlens_m, dynamic_scheduler=False,
+        config=_pinned_config(module, A.device), **extra,
+    )
+    return out
+
+
+def _pinned_gated_eager(module, A, B, C, cu_seqlens_m, concat_b):
+    M, two_i = A.shape[0], B.shape[-1]
+    preact = torch.empty((M, two_i), dtype=A.dtype, device=A.device)
+    postact = torch.empty((M, two_i // 2), dtype=A.dtype, device=A.device)
+    if M == 0:
+        return preact, postact
+    extra = {"concat_layout": ("B",)} if concat_b else {}
+    _gemm_interface(module).gemm_gated_tuned.fn(
+        A, B, preact, postact, C, None, "swiglu", cu_seqlens_m, None, False,
+        config=_pinned_config(module, A.device), **extra,
+    )
+    return preact, postact
+
+
+_PINNED_OPS = None
+
+
+def _pinned_ops():
+    """(gemm, gemm_gated) as torch.library custom ops over the pinned-config calls, so
+    torch.compile traces them without a graph break and runs the same config as eager.
+    Registered on first use; a re-import reuses the registered ops."""
+    global _PINNED_OPS
+    if _PINNED_OPS is not None:
+        return _PINNED_OPS
+    from typing import Optional, Tuple
+    try:
+        gemm_op = torch.ops.unsloth_sonic.gemm
+        gated_op = torch.ops.unsloth_sonic.gemm_gated
+    except (AttributeError, RuntimeError):
+
+        @torch.library.custom_op("unsloth_sonic::gemm", mutates_args=())
+        def gemm_op(A: torch.Tensor, B: torch.Tensor, cu_seqlens_m: torch.Tensor,
+                    concat_b: bool) -> torch.Tensor:
+            return _pinned_gemm_eager(get_sonic_module(), A, B, cu_seqlens_m, concat_b)
+
+        @gemm_op.register_fake
+        def _(A, B, cu_seqlens_m, concat_b):
+            return A.new_empty((A.shape[0], B.shape[-1]))
+
+        @torch.library.custom_op("unsloth_sonic::gemm_gated", mutates_args=())
+        def gated_op(A: torch.Tensor, B: torch.Tensor, C: Optional[torch.Tensor],
+                     cu_seqlens_m: torch.Tensor, concat_b: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+            return _pinned_gated_eager(get_sonic_module(), A, B, C, cu_seqlens_m, concat_b)
+
+        @gated_op.register_fake
+        def _(A, B, C, cu_seqlens_m, concat_b):
+            return (A.new_empty((A.shape[0], B.shape[-1])),
+                    A.new_empty((A.shape[0], B.shape[-1] // 2)))
+
+    _PINNED_OPS = (gemm_op, gated_op)
+    return _PINNED_OPS
+
+
+def _sonic_gemm(module, A, B, cu_seqlens_m, concat_b=False):
+    """grouped A @ B[e] on sonic, pinned config (see `_pinned_config`).
+
+    Calls `gemm_tuned.fn` directly: the public `functional.gemm` custom op with 18
+    arguments costs ~0.15 ms of host time per call (see above). Under torch.compile
+    the same pinned call goes through `_pinned_ops()`.
+
+    `concat_b=True` passes ``concat_layout=("B",)``: the kernel reads B's
+    non-contiguous dim as interleaved [g0, u0, g1, u1, ...] over a chunked
+    [gate | up] buffer, with no copy (see `_SonicGatedZeroCopy`).
+
+    ``UNSLOTH_MOE_SONIC_GEMM_TUNED=1`` restores the autotuned plain (non-concat)
+    calls of the first integration. concat calls never autotune: the Autotuner's
+    key ignores concat_layout, so it would reuse the plain layout's winner.
+    """
+    tune = (not concat_b) and _env_flag("UNSLOTH_MOE_SONIC_GEMM_TUNED", "0")
+    compiling = torch.compiler.is_compiling()
+    if not tune:
+        if compiling or not _env_flag("UNSLOTH_MOE_SONIC_FASTCALL", "1"):
+            return _pinned_ops()[0](A, B, cu_seqlens_m, concat_b)
+        return _pinned_gemm_eager(module, A, B, cu_seqlens_m, concat_b)
+    if compiling or not _env_flag("UNSLOTH_MOE_SONIC_FASTCALL", "1"):
         return module.functional.gemm(A, B, cu_seqlens_m=cu_seqlens_m, tuned=True)
     try:
         gi = _gemm_interface(module)
@@ -311,7 +427,6 @@ def _sonic_gemm(module, A, B, cu_seqlens_m):
         if out.numel() == 0:
             return out
         if A.numel() == 0:
-            # K=0: the kernel rejects it; the empty contraction is a zero matrix.
             out.zero_()
             return out
         key = (_shape_key(A), _shape_key(B), _shape_key(out), _shape_key(cu_seqlens_m))
@@ -342,7 +457,7 @@ def _cu_seqlens_from_offsets(offsets):
 
 
 # Cached interleaved gate_up weights for the fused gemm_gated path.
-# Keyed by id(tensor); the entry records the storage pointer, the autograd version
+# Keyed by storage pointer + layout; the entry also records the autograd version
 # counter and the shape, so an in-place edit, a realloc or a reshape invalidates it.
 _INTERLEAVE_CACHE = {}
 
@@ -365,7 +480,10 @@ def _interleaved_gate_up(weight):
     Cached, because the permutation is a full copy of the expert stack. Returns None
     when the copy would not fit the configured budget.
     """
-    key = id(weight)
+    # Not id(weight): the provider hands out a fresh transpose view every call, so an
+    # id key never hits and every forward re-copied the stack (and kept the stale
+    # copy until the budget ran out). The storage + layout identifies the weight.
+    key = (weight.data_ptr(), tuple(weight.shape), tuple(weight.stride()), weight.dtype)
     stamp = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
     hit = _INTERLEAVE_CACHE.get(key)
     if hit is not None and hit[:3] == stamp[:3] and hit[3].dtype == weight.dtype:
@@ -395,6 +513,222 @@ def _interleave_columns(tensor):
     half = two_i // 2
     gate, up = tensor[..., :half], tensor[..., half:]
     return torch.stack((gate, up), dim=-1).reshape(*tensor.shape[:-1], two_i)
+
+
+# ---------------------------------------------------------------------------
+# Zero-copy fused gate_up GEMM + SwiGLU (concat_layout=("B",))
+#
+# quack's sm90/sm100 GEMMs rewrite every operand named in `concat_layout` with
+# `concat_to_interleave(t, 1 - t.leading_dim)`: the NON-contiguous dim of size 2N is
+# split into (2, N) with strides (N * s, s), so logical column 2j reads row j of the
+# first half and 2j + 1 reads row j of the second half. No data moves.
+#
+#   * gate_up forward: B must be K-major, i.e. `W.transpose(-2, -1)` of the HF
+#     [E, 2I, H] storage (H at stride 1). Then the N (= 2I) dim is the one that gets
+#     interleaved and the kernel sees exactly the interleaved weight it wants.
+#     A contiguous [E, H, 2I] (N-major) B has K as its non-contiguous dim, so concat
+#     interleaves the CONTRACTION dim instead: wrong numbers.
+#   * The pre-activation it stores is therefore INTERLEAVED (col 2j gate_j, 2j + 1
+#     up_j); the post-activation is in natural order.
+#   * dX = d_pre @ W: B is the HF storage [E, 2I, H] itself (N-major), whose
+#     non-contiguous dim is K = 2I, so concat_layout=("B",) interleaves K to match the
+#     interleaved d_pre. Same buffer, no copy.
+#   * A residual C (the separated-LoRA delta) must be in the interleaved order too.
+#     "C" in concat_layout would interleave C's non-contiguous dim, which for a
+#     row-major [M, 2I] C is M, so instead the LoRA up-projection's columns
+#     ([E, r, 2I], tiny) are interleaved and the delta comes out interleaved.
+#
+# Comparing that interleaved pre-activation against a chunked reference gives a
+# relative error of sqrt(2) = 1.41 (two independent vectors of equal norm), which is
+# the "garbage" the first integration measured.
+# ---------------------------------------------------------------------------
+
+_CONCAT_SUPPORTED = None
+
+
+def _zero_copy_requested():
+    return os.environ.get("UNSLOTH_MOE_SONIC_ZERO_COPY", "1") != "0"
+
+
+def _gated_requested():
+    # "unsafe" is the old literal opt-in; keep it meaning "on".
+    return os.environ.get("UNSLOTH_MOE_SONIC_GATED", "1") in ("1", "unsafe")
+
+
+def _sonic_gated(module, A, B, C, cu_seqlens_m, concat_b=True):
+    """(preact, postact) = gemm_gated(A, B [+ C], swiglu), pinned config, no autotuner.
+
+    concat_b: B is the K-major [E, H, 2I] view of chunked storage and
+    concat_layout=("B",) reads it interleaved; else B is already interleaved.
+    preact comes back interleaved, postact in natural order.
+    """
+    if torch.compiler.is_compiling() or not _env_flag("UNSLOTH_MOE_SONIC_FASTCALL", "1"):
+        return _pinned_ops()[1](A, B, C, cu_seqlens_m, concat_b)
+    return _pinned_gated_eager(module, A, B, C, cu_seqlens_m, concat_b)
+
+
+try:
+    import triton
+    import triton.language as tl
+except Exception:
+    triton = None
+
+if triton is not None:
+
+    @triton.jit
+    def _swiglu_bwd_interleaved_kernel(PRE, GRAD, OUT, n_pairs, BLOCK: tl.constexpr):
+        # PRE / OUT: [M, 2I] interleaved (g0, u0, g1, u1, ...); GRAD: [M, I]. One pair
+        # per lane, fp32 math, one rounding on store: same formula as the torch path.
+        offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_pairs
+        g = tl.load(PRE + 2 * offs, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(PRE + 2 * offs + 1, mask=mask, other=0.0).to(tl.float32)
+        go = tl.load(GRAD + offs, mask=mask, other=0.0).to(tl.float32)
+        sig = tl.sigmoid(g)
+        silu = g * sig
+        d_gate = go * u * (sig + silu * (1.0 - sig))
+        d_up = go * silu
+        tl.store(OUT + 2 * offs, d_gate.to(OUT.dtype.element_ty), mask=mask)
+        tl.store(OUT + 2 * offs + 1, d_up.to(OUT.dtype.element_ty), mask=mask)
+
+
+def _swiglu_backward_interleaved(preact, grad_post):
+    """d(silu(g) * u) for an interleaved preact; returns d_preact interleaved, fp32 math.
+
+    One Triton pass on CUDA (no fp32 temporaries: the torch form below holds ~7 fp32
+    [M, I] buffers at once, +540 MiB transient at M=32768 I=768); torch elsewhere.
+    """
+    if (
+        triton is not None
+        and preact.is_cuda
+        and preact.dim() == 2
+        and _env_flag("UNSLOTH_MOE_SONIC_TRITON_DGATED", "1")
+    ):
+        preact_c = preact.contiguous()
+        grad_c = grad_post.contiguous()
+        out = torch.empty_like(preact_c)
+        n_pairs = grad_c.numel()
+        if n_pairs:
+            BLOCK = 1024
+            _swiglu_bwd_interleaved_kernel[(triton.cdiv(n_pairs, BLOCK),)](
+                preact_c, grad_c, out, n_pairs, BLOCK=BLOCK,
+            )
+        return out
+    gate = preact[..., 0::2].float()
+    up = preact[..., 1::2].float()
+    sig = torch.sigmoid(gate)
+    silu = gate * sig
+    grad_post_f = grad_post.float()
+    d_gate = grad_post_f * up * (sig + silu * (1.0 - sig))
+    d_up = grad_post_f * silu
+    return torch.stack((d_gate, d_up), dim=-1).reshape(preact.shape).to(preact.dtype)
+
+
+def _is_k_major_gate_up(weight):
+    """[E, H, 2I] view with H at stride 1 and TMA-aligned strides: the layout
+    concat_layout=("B",) reinterprets as interleaved without a copy."""
+    if weight.dim() != 3 or weight.shape[-1] % 2 != 0:
+        return False
+    if weight.stride(-2) != 1:
+        return False
+    esize = weight.element_size()
+    if (weight.stride(-1) * esize) % 16 != 0 or (weight.stride(0) * esize) % 16 != 0:
+        return False
+    # The base pointer must be 16-byte aligned too. Allocations are 256-byte aligned,
+    # so it is the storage offset that matters; Dynamo cannot trace storage_offset(),
+    # and a parameter view (what the provider returns) starts at offset 0 anyway.
+    if torch.compiler.is_compiling():
+        return True
+    return (weight.storage_offset() * esize) % 16 == 0
+
+
+def _concat_layout_supported(module):
+    """Whether this sonic / quack build takes concat_layout on gemm + gemm_gated and
+    gets it right. One tiny deterministic probe, cached; any failure -> False.
+    Probed eagerly by get_sonic_module(), so a compiled region only reads the flag."""
+    global _CONCAT_SUPPORTED
+    if _CONCAT_SUPPORTED is not None:
+        return _CONCAT_SUPPORTED
+    if torch.compiler.is_compiling():
+        return False
+    ok = False
+    try:
+        import inspect
+        gi = _gemm_interface(module)
+        for fn in (gi.gemm_gated_tuned.fn, gi.gemm_tuned.fn, gi.gemm_act, gi.gemm):
+            if "concat_layout" not in inspect.signature(fn).parameters:
+                raise RuntimeError(f"{fn.__name__} has no concat_layout")
+        device = torch.device("cuda", torch.cuda.current_device())
+        gen = torch.Generator(device=device).manual_seed(0)
+        E, H, inter, rows = 2, 64, 64, (40, 24)
+        W = (torch.randn(E, 2 * inter, H, device=device, generator=gen) / 8).to(torch.bfloat16)
+        X = torch.randn(sum(rows), H, device=device, generator=gen).to(torch.bfloat16)
+        cu = torch.tensor([0, rows[0], sum(rows)], device=device, dtype=torch.int32)
+        Wt = W.transpose(-2, -1)
+        preact, postact = _sonic_gated(module, X, Wt, None, cu)
+        ref = torch.cat([X[:rows[0]].float() @ Wt[0].float(), X[rows[0]:].float() @ Wt[1].float()])
+        ref_post = F.silu(ref[:, :inter]) * ref[:, inter:]
+        dpre = torch.randn(sum(rows), 2 * inter, device=device, generator=gen).to(torch.bfloat16)
+        dx = _sonic_gemm(module, dpre, W, cu, concat_b=True)
+        dpre_c = torch.cat([dpre[:, 0::2], dpre[:, 1::2]], dim=-1).float()
+        ref_dx = torch.cat([dpre_c[:rows[0]] @ W[0].float(), dpre_c[rows[0]:] @ W[1].float()])
+
+        def _rel(a, b):
+            return ((a.float() - b).norm() / b.norm()).item()
+
+        errs = (_rel(preact, _interleave_columns(ref)), _rel(postact, ref_post), _rel(dx, ref_dx))
+        if not all(e < 2e-2 for e in errs):
+            raise RuntimeError(f"concat_layout probe mismatch, rel errs {errs}")
+        ok = True
+    except Exception as exc:
+        _log(f"Unsloth: sonic-moe zero-copy gate_up unavailable ({exc}); "
+             f"falling back to the interleaved copy / unfused path.")
+        ok = False
+    _CONCAT_SUPPORTED = ok
+    return ok
+
+
+class _SonicGatedZeroCopy(torch.autograd.Function):
+    """post = swiglu(X @ W_gate_up [+ residual]) with NO interleaved weight copy.
+
+    `weight_provider()` returns the K-major [E, H, 2I] view of the HF [E, 2I, H]
+    storage; concat_layout=("B",) makes the kernel read it interleaved. `residual`
+    (LoRA delta) must already be interleaved. Saves only the interleaved preact.
+    dX reuses the same storage through concat_layout=("B",) on its N-major
+    transpose; d_residual is d_preact, interleaved like the residual.
+    """
+
+    @staticmethod
+    def forward(ctx, inputs, residual, offsets, cu_seqlens, weight_provider, recompute):
+        module = get_sonic_module()
+        weight = weight_provider()
+        with torch.no_grad():
+            preact, post = _sonic_gated(
+                module, inputs.contiguous(), weight,
+                None if residual is None else residual.contiguous(), cu_seqlens,
+            )
+        ctx.has_residual = residual is not None
+        if recompute:
+            ctx.weight_provider = weight_provider
+            ctx.save_for_backward(preact, cu_seqlens)
+        else:
+            ctx.weight_provider = None
+            ctx.save_for_backward(preact, cu_seqlens, weight)
+        return post
+
+    @staticmethod
+    def backward(ctx, grad_post):
+        if ctx.weight_provider is not None:
+            preact, cu_seqlens = ctx.saved_tensors
+            weight = ctx.weight_provider()
+        else:
+            preact, cu_seqlens, weight = ctx.saved_tensors
+        with torch.no_grad():
+            d_pre = _swiglu_backward_interleaved(preact, grad_post)
+            grad_input = _sonic_gemm(
+                get_sonic_module(), d_pre, weight.transpose(-2, -1), cu_seqlens, concat_b=True
+            )
+        return grad_input, (d_pre if ctx.has_residual else None), None, None, None, None
 
 
 class _SonicGroupedMM(torch.autograd.Function):
@@ -455,14 +789,10 @@ class _SonicGatedGroupedMM(torch.autograd.Function):
     def forward(ctx, inputs, residual, cu_seqlens, weight_interleaved, offsets):
         module = get_sonic_module()
         with torch.no_grad():
-            preact, post = module.functional.gemm_gated(
-                inputs.contiguous(),
-                weight_interleaved,
-                C=None if residual is None else residual.contiguous(),
-                activation="swiglu",
-                cu_seqlens_m=cu_seqlens,
-                store_preact=True,
-                tuned=True,
+            preact, post = _sonic_gated(
+                module, inputs.contiguous(), weight_interleaved,
+                None if residual is None else residual.contiguous(), cu_seqlens,
+                concat_b=False,
             )
         ctx.has_residual = residual is not None
         ctx.save_for_backward(preact, cu_seqlens, weight_interleaved, offsets)
@@ -472,14 +802,7 @@ class _SonicGatedGroupedMM(torch.autograd.Function):
     def backward(ctx, grad_post):
         preact, cu_seqlens, weight_interleaved, offsets = ctx.saved_tensors
         with torch.no_grad():
-            gate = preact[..., 0::2].float()
-            up = preact[..., 1::2].float()
-            sig = torch.sigmoid(gate)
-            silu = gate * sig
-            grad_post_f = grad_post.float()
-            d_gate = grad_post_f * up * (sig + silu * (1.0 - sig))
-            d_up = grad_post_f * silu
-            d_pre = torch.stack((d_gate, d_up), dim=-1).reshape(preact.shape).to(preact.dtype)
+            d_pre = _swiglu_backward_interleaved(preact, grad_post)
             grad_input = _sonic_gemm(
                 get_sonic_module(), d_pre, weight_interleaved.transpose(-2, -1), cu_seqlens
             )
@@ -572,8 +895,10 @@ def forward_sonic_moe(
         _moe_gategrad_enabled,
         _MoEGateGradIdentity,
         _pad_lora_rank_for_grouped_mm,
+        combine_permuted_moe_outputs,
         preprocess_weight,
         take_moe_lora_stash,
+        weighted_unpermute,
     )
 
     ok, reason = _sonic_eligible(self, hidden_states)
@@ -584,12 +909,9 @@ def forward_sonic_moe(
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
 
     module = get_sonic_module()
-    sonic_gemm = module.functional.gemm
     use_sonic_down = _env_flag("UNSLOTH_MOE_SONIC_DOWN", "1")
     use_sonic_dh = _env_flag("UNSLOTH_MOE_SONIC_DH", "0")
-    # Not a boolean: the fused kernel is nondeterministically wrong (docstring
-    # reason 3), so it takes a literal opt-in nobody sets by accident.
-    use_gated = os.environ.get("UNSLOTH_MOE_SONIC_GATED", "") == "unsafe"
+    use_gated = _gated_requested()
 
     is_2d_input = hidden_states.dim() == 2
     if is_2d_input:
@@ -628,14 +950,35 @@ def forward_sonic_moe(
             _get_base_weight(_src, _dt), "gate_up", _h, _mt, experts_module=_mod
         )
 
-    # LoRA delta, unchanged: ((X @ A) @ B) * scaling on torch._grouped_mm, which beats
-    # sonic 3:1 at rank 8.
+    # Fused gate_up + SwiGLU: zero-copy concat_layout on the K-major view when this
+    # build supports it (default), else the cached interleaved duplicate (only with a
+    # UNSLOTH_MOE_SONIC_CACHE_GIB budget), else the unfused GEMM + eager SwiGLU.
+    gated_mode = None
+    interleaved = None
+    if use_gated:
+        if (
+            _zero_copy_requested()
+            and _concat_layout_supported(module)
+            and _is_k_major_gate_up(gate_up_provider())
+        ):
+            gated_mode = "zero_copy"
+        else:
+            interleaved = _interleaved_gate_up(gate_up_provider())
+            if interleaved is not None:
+                gated_mode = "duplicate"
+
+    # LoRA delta: ((X @ A) @ B) * scaling on torch._grouped_mm, which beats sonic 3:1
+    # at rank 8. For zero-copy the up-projection's [E, r, 2I] columns are interleaved
+    # (a tiny copy, differentiable) so the delta lands in the kernel's column order.
     lora_delta = None
     lora_scaling = None
     if gate_up_lora is not None:
         first_weight, second_weight, lora_scaling = gate_up_lora
         first_weight = first_weight.to(permuted_input.dtype).contiguous()
-        second_weight = second_weight.to(permuted_input.dtype).contiguous()
+        second_weight = second_weight.to(permuted_input.dtype)
+        if gated_mode == "zero_copy":
+            second_weight = _interleave_columns(second_weight)
+        second_weight = second_weight.contiguous()
         first_weight, second_weight = _pad_lora_rank_for_grouped_mm(
             first_weight, second_weight, permuted_input
         )
@@ -649,18 +992,18 @@ def forward_sonic_moe(
         else:
             lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
 
-    interleaved = _interleaved_gate_up(gate_up_provider()) if use_gated else None
-    if interleaved is not None and "gated" not in _WARNED_FALLBACK:
-        _WARNED_FALLBACK.add("gated")
-        print(
-            "Unsloth: UNSLOTH_MOE_SONIC_GATED=unsafe -- using sonic gemm_gated, which "
-            "returns nondeterministically wrong results on this build (identical calls "
-            "disagree by ~0.76 in the pre-activation). Training on this is unsound.",
-            file=sys.stderr,
+    if gated_mode is not None and gated_mode not in _WARNED_FALLBACK:
+        _WARNED_FALLBACK.add(gated_mode)
+        _log(f"Unsloth: sonic-moe fused gate_up + SwiGLU ({gated_mode}).")
+    if gated_mode == "zero_copy":
+        residual = None if lora_delta is None else lora_delta * lora_scaling
+        inter = _SonicGatedZeroCopy.apply(
+            permuted_input, residual, offsets, cu_seqlens, gate_up_provider,
+            _moe_recompute_enabled(gate_up_source),
         )
-    if interleaved is not None:
-        # Fused gate_up GEMM + SwiGLU. The residual must be in the kernel's
-        # interleaved column order too.
+    elif gated_mode == "duplicate":
+        # Legacy: fused kernel on a cached interleaved COPY of gate_up. The residual
+        # must be in the kernel's interleaved column order too.
         residual = None
         if lora_delta is not None:
             residual = _interleave_columns(lora_delta * lora_scaling)
@@ -730,18 +1073,24 @@ def forward_sonic_moe(
         lora_delta_down = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
         mm2_out = mm2_out + lora_delta_down * scaling
 
+    # Weighted combine: the same deterministic unpermute + sum as
+    # forward_native_grouped_mm (an index_add_ here is bf16 atomics, so the output
+    # changed bit-for-bit from call to call).
     if _gategrad:
-        mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
+        permuted_weights = permuted_weights.detach()
     else:
         permuted_weights = top_k_weights.reshape(-1)[sorted_indices]
-        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
-
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
+    num_tokens = batch_size * sequence_length
+    final_hidden_states = weighted_unpermute(
+        mm2_out, sorted_indices, permuted_weights, num_tokens, top_k_index.shape[-1],
+        out_dtype=hidden_states.dtype,
     )
-    final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
+    if final_hidden_states is None:
+        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+        final_hidden_states = combine_permuted_moe_outputs(
+            mm2_out, sorted_indices, num_tokens, top_k_index.shape[-1],
+            out_dtype=hidden_states.dtype,
+        )
 
     if is_2d_input:
         return final_hidden_states
