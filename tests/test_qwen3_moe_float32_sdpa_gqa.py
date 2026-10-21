@@ -146,6 +146,24 @@ def test_gqa_not_forwarded_when_efficient_rejects_it(attn):
     assert calls and all(not c["enable_gqa"] and c["kv_heads"] == c["q_heads"] for c in calls), calls
 
 
+def test_six_argument_sdpa_params_still_repeats_kv(attn, monkeypatch):
+    # torch 2.4: SDPAParams takes no enable_gqa argument.
+    real = torch.backends.cuda.SDPAParams
+
+    def six_args(query, key, value, attn_mask, dropout_p, is_causal, *extra):
+        if extra:
+            raise TypeError("SDPAParams takes 6 arguments")
+        return real(query, key, value, attn_mask, dropout_p, is_causal, False)
+
+    monkeypatch.setattr(torch.backends.cuda, "SDPAParams", six_args)
+    module, rope, calls = attn
+    hidden = torch.randn(1, 128, HIDDEN, device = "cuda", dtype = torch.float16)
+    calls.clear()
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+        _run(module, rope, hidden, None)
+    assert calls and all(not c["enable_gqa"] and c["kv_heads"] == c["q_heads"] for c in calls), calls
+
+
 def test_gqa_kept_when_flash_takes_it_under_autocast(attn):
     if not torch.backends.cuda.flash_sdp_enabled() or not _flash_takes_fp16_gqa():
         pytest.skip("flash does not take fp16 GQA here")

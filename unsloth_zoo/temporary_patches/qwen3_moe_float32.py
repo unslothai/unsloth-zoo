@@ -184,7 +184,13 @@ def patch_Qwen3MoeAttention_float32():
 
     def efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa):
         try:
-            params = torch.backends.cuda.SDPAParams(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
+            try:
+                params = torch.backends.cuda.SDPAParams(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
+            except TypeError:
+                # torch 2.4: six-argument SDPAParams, no GQA support to probe.
+                if enable_gqa:
+                    return False
+                params = torch.backends.cuda.SDPAParams(query, key, value, attn_mask, dropout_p, is_causal)
             return torch.backends.cuda.can_use_efficient_attention(params, False) is True
         except Exception:
             return False
