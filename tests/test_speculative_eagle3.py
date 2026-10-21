@@ -487,7 +487,10 @@ def test_aux_id_equal_to_the_layer_count_is_refused():
 
 def test_teacher_matches_softcapped_target_logits(tmp_path):
     """Gemma 4 softcaps its final logits: the trainer's teacher must be the distribution the target samples."""
-    from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+    try:
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+    except ImportError:
+        pytest.skip("transformers has no Gemma 4")
     torch.manual_seed(0)
     cfg = Gemma4TextConfig(vocab_size = VOCAB, hidden_size = 64, intermediate_size = 128, num_hidden_layers = LAYERS,
                            num_attention_heads = 4, num_key_value_heads = 2, head_dim = 16, global_head_dim = 16,
