@@ -5563,15 +5563,14 @@ def _triton_moe_compute_dtype(module, hidden_states):
 
 @torch.compiler.disable
 def _moe_weight_dtype_kwargs(tuner, module, name, dtype):
-    """weight_dtype for get_or_autotune_moe_kernels when the experts differ from the activations
-    (bf16 experts under float32 activations), so tuning and the fallback configs see the real W."""
+    """weight_dtype kwarg when expert weights differ from activations (bf16 W, float32 X)."""
     weight = getattr(module, name, None)
     weight_dtype = getattr(weight, "dtype", None)
     if weight_dtype not in (torch.float32, torch.bfloat16, torch.float16) or weight_dtype == dtype:
         return {}
     try:
         if "weight_dtype" not in inspect.signature(tuner).parameters:
-            return {}  # older unsloth
+            return {}
     except (TypeError, ValueError):
         return {}
     return {"weight_dtype": weight_dtype}
