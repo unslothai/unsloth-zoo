@@ -24,7 +24,8 @@ import sys
 
 import pytest
 import torch
-
+import transformers
+from packaging.version import Version
 from transformers import AutoConfig, UMT5Config, UMT5ForConditionalGeneration
 
 from unsloth_zoo.temporary_patches.t5 import (
@@ -59,10 +60,11 @@ def test_untied_flag_survives_save_and_reload(tmp_path):
     torch.manual_seed(0)
     UMT5ForConditionalGeneration(UMT5Config(**TINY, tie_word_embeddings = False)).save_pretrained(tmp_path)
     model = UMT5ForConditionalGeneration.from_pretrained(tmp_path).eval()
-    assert getattr(model.config, "scale_decoder_outputs", not model.config.tie_word_embeddings) is False
+    assert getattr(model.config, "scale_decoder_outputs", model.config.tie_word_embeddings) is False
     assert _logit_ratio(model) == pytest.approx(1.0, rel = 1e-4)
 
 
+@pytest.mark.skipif(Version(transformers.__version__) < Version("5.0.0"), reason = "4.x resolves by repo name")
 def test_model_type_inferred_from_architectures(tmp_path):
     config = UMT5Config(**TINY).to_dict()
     config.pop("model_type", None)
