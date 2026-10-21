@@ -927,6 +927,54 @@ def _maskless_causal_arguments(signature, args, kwargs):
     return arguments
 
 
+def _warm_mask_device_cache(cache, mask, device):
+    if device not in cache:
+        cache[device] = mask.to(device, non_blocking = True)
+
+
+def _warm_mask_mod_devices(mask_mod, device):
+    # Walk and_masks / offset closures to Unsloth's per-device mask caches.
+    stack, seen = [mask_mod], set()
+    while stack and len(seen) < 64:
+        fn = stack.pop()
+        if id(fn) in seen:
+            continue
+        seen.add(id(fn))
+        if isinstance(fn, (tuple, list)):
+            stack.extend(fn)
+            continue
+        warm = getattr(fn, "_unsloth_mask_to_device", None)
+        if warm is not None:
+            warm(device)
+        for cell in getattr(fn, "__closure__", None) or ():
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            if callable(value) or isinstance(value, (tuple, list)):
+                stack.append(value)
+
+
+def _patch_block_mask_to():
+    # Inductor cannot lower a device copy inside Flex's mask subgraph, so copy
+    # captured masks when accelerate moves the BlockMask to the next device.
+    try:
+        from torch.nn.attention.flex_attention import BlockMask
+    except Exception:
+        return
+    if hasattr(BlockMask.to, "_unsloth_original_to"):
+        return
+    _original_to = BlockMask.to
+    @functools.wraps(_original_to)
+    def block_mask_to(self, device):
+        moved = _original_to(self, device)
+        if not torch.compiler.is_compiling() and moved.kv_num_blocks.device != self.kv_num_blocks.device:
+            _warm_mask_mod_devices(self.mask_mod, moved.kv_num_blocks.device)
+        return moved
+    block_mask_to._unsloth_original_to = _original_to
+    BlockMask.to = block_mask_to
+
+
 def patch_transformers_masks():
     # No UNSLOTH_COMPILE_DISABLE early return: `_torch_compile` is already a no-op there, and the kwarg fixes still apply.
     try:
@@ -1106,8 +1154,11 @@ def patch_transformers_masks():
                 pm = _cache.get(device)
                 if pm is None:
                     pm = padding_mask.to(device, non_blocking=True)
-                    _cache[device] = pm
+                    # Flex traces mask_mod as a pure higher-order subgraph.
+                    if not torch.compiler.is_compiling():
+                        _cache[device] = pm
                 return pm[batch_idx, kv_idx]
+            inner_mask._unsloth_mask_to_device = functools.partial(_warm_mask_device_cache, _cache, padding_mask)
             return inner_mask
         masking_utils.padding_mask_function = padding_mask_wrapper
 
@@ -1124,10 +1175,14 @@ def patch_transformers_masks():
                 pm = _cache.get(device)
                 if pm is None:
                     pm = packed_sequence_mask.to(device, non_blocking=True)
-                    _cache[device] = pm
+                    if not torch.compiler.is_compiling():
+                        _cache[device] = pm
                 return pm[batch_idx, q_idx] == pm[batch_idx, kv_idx]
+            inner_mask._unsloth_mask_to_device = functools.partial(_warm_mask_device_cache, _cache, packed_sequence_mask)
             return inner_mask
         masking_utils.packed_sequence_mask_function = packed_sequence_mask_wrapper
+
+    _patch_block_mask_to()
 
     masking_utils.__unsloth_mask_patch__ = True
 pass
