@@ -138,11 +138,14 @@ def test_forward_and_dx_vs_fp64_oracle(case, dtype):
         assert abs_err <= 2 * base_abs + 1e-6, (abs_err, base_abs)
 
 
+@pytest.mark.parametrize("lut", [0, 1])
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("kn_layout", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_decode_is_bitwise_bitsandbytes(nested, kn_layout, dtype):
+def test_decode_is_bitwise_bitsandbytes(nested, kn_layout, dtype, lut, monkeypatch):
     # Identity rows pick each weight out exactly (one product per output, fp32 accumulate).
+    fixed = nf._fixed_config
+    monkeypatch.setattr(nf, "_fixed_config", lambda *a: ({**fixed(*a)[0], "LUT": lut},) + fixed(*a)[1:])
     torch.manual_seed(1)
     E, K, N = 3, 64, 130
     p = _stack((E, K, N) if kn_layout else (E, N, K), dtype, nested)
@@ -155,6 +158,20 @@ def test_decode_is_bitwise_bitsandbytes(nested, kn_layout, dtype):
     offsets = _routing(E, [N] * E)
     dx = torch.ops.unsloth_zoo.nf4_grouped_mm_dx(dy, *_saved(_spec(p, kn_layout, dtype), offsets))
     assert torch.equal(dx.view(E, N, K), w.transpose(-2, -1))
+
+
+def test_run_to_run_bitwise(monkeypatch):
+    # Fixed tiles per shape (no timing-picked config): the same inputs give the same bits.
+    monkeypatch.delenv("UNSLOTH_MOE_NF4_AUTOTUNE", raising = False)
+    torch.manual_seed(7)
+    E, K, N = 8, 256, 192
+    dt = torch.bfloat16 if HAS_BF16 else torch.float16
+    p = _stack((E, N, K), dt, True)
+    spec = _spec(p, False, dt)
+    offsets = _routing(E, [30, 0, 70, 1, 0, 16, 9, 2])
+    x = torch.randn(128, K, device = DEVICE, dtype = dt)
+    ys = [nf.nf4_grouped_mm(x, offsets, spec) for _ in range(3)]
+    assert all(torch.equal(ys[0], y) for y in ys[1:])
 
 
 def _saved(spec, offsets):

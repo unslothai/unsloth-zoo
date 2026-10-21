@@ -73,15 +73,15 @@ if triton is not None:
 
     def _configs():
         c = triton.Config
-        return [
-            c({"BM": 16,  "BN": 128, "BK": 64},  num_warps = 4, num_stages = 3),
-            c({"BM": 32,  "BN": 128, "BK": 64},  num_warps = 4, num_stages = 3),
-            c({"BM": 64,  "BN": 64,  "BK": 64},  num_warps = 4, num_stages = 3),
-            c({"BM": 64,  "BN": 128, "BK": 64},  num_warps = 4, num_stages = 3),
-            c({"BM": 64,  "BN": 128, "BK": 32},  num_warps = 4, num_stages = 4),
-            c({"BM": 128, "BN": 128, "BK": 64},  num_warps = 8, num_stages = 3),
-            c({"BM": 128, "BN": 64,  "BK": 64},  num_warps = 4, num_stages = 3),
-        ]
+        out = []
+        for bm in (16, 32, 64, 128):
+            for bn in (64, 128):
+                for warps in (4, 8):
+                    for lut in (0, 1):
+                        if warps == 8 and bm * bn < 64 * 64:
+                            continue
+                        out.append(c({"BM": bm, "BN": bn, "BK": 64, "LUT": lut}, num_warps = warps, num_stages = 3))
+        return out
 
     def _prune(configs, named_args, **kwargs):
         # Shared memory and the pair layout need BK, BN >= 16 and even; small dims drop huge tiles.
@@ -100,9 +100,38 @@ if triton is not None:
         return keep or configs[:1]
 
     @triton.jit
-    def _decode_pairs(q, scale, CODE, W_DT: tl.constexpr, OUT_DT: tl.constexpr):
-        hi = tl.load(CODE + (q >> 4).to(tl.int32))
-        lo = tl.load(CODE + (q & 15).to(tl.int32))
+    def _nf4_select(nib, CODE):
+        # code[nib] as a select tree on the nibble bits (bitsandbytes' dDequantizeNF4 shape): no gather.
+        b0 = (nib & 1) != 0
+        b1 = (nib & 2) != 0
+        b2 = (nib & 4) != 0
+        b3 = (nib & 8) != 0
+        v0 = tl.where(b0, tl.load(CODE + 1), tl.load(CODE + 0))
+        v1 = tl.where(b0, tl.load(CODE + 3), tl.load(CODE + 2))
+        v2 = tl.where(b0, tl.load(CODE + 5), tl.load(CODE + 4))
+        v3 = tl.where(b0, tl.load(CODE + 7), tl.load(CODE + 6))
+        v4 = tl.where(b0, tl.load(CODE + 9), tl.load(CODE + 8))
+        v5 = tl.where(b0, tl.load(CODE + 11), tl.load(CODE + 10))
+        v6 = tl.where(b0, tl.load(CODE + 13), tl.load(CODE + 12))
+        v7 = tl.where(b0, tl.load(CODE + 15), tl.load(CODE + 14))
+        w0 = tl.where(b1, v1, v0)
+        w1 = tl.where(b1, v3, v2)
+        w2 = tl.where(b1, v5, v4)
+        w3 = tl.where(b1, v7, v6)
+        x0 = tl.where(b2, w1, w0)
+        x1 = tl.where(b2, w3, w2)
+        return tl.where(b3, x1, x0)
+
+    @triton.jit
+    def _code(nib, CODE, LUT: tl.constexpr):
+        if LUT == 1:
+            return _nf4_select(nib, CODE)
+        return tl.load(CODE + nib)
+
+    @triton.jit
+    def _decode_pairs(q, scale, CODE, W_DT: tl.constexpr, OUT_DT: tl.constexpr, LUT: tl.constexpr):
+        hi = _code((q >> 4).to(tl.int32), CODE, LUT)
+        lo = _code((q & 15).to(tl.int32), CODE, LUT)
         hi = (hi * scale).to(W_DT).to(OUT_DT)
         lo = (lo * scale).to(W_DT).to(OUT_DT)
         return hi, lo
@@ -125,7 +154,7 @@ if triton is not None:
         I: tl.constexpr, J: tl.constexpr, S_I: tl.constexpr, S_J: tl.constexpr,
         PAIR: tl.constexpr,                 # 1: bytes pair along J, 2: along I, 0: per element
         BS: tl.constexpr, BS2: tl.constexpr, NESTED: tl.constexpr, W_DT: tl.constexpr,
-        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, LUT: tl.constexpr,
     ):
         pid = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -169,7 +198,7 @@ if triton is not None:
                     s = _scale(blk, mask_k, ABSMAX, CODE2, ABSMAX2, OFFSET, BS2, NESTED)[:, None]
                 else:
                     s = _scale(byte // (BS // 2), bmask, ABSMAX, CODE2, ABSMAX2, OFFSET, BS2, NESTED)
-                hi, lo = _decode_pairs(q, s, CODE, W_DT, out_dt)
+                hi, lo = _decode_pairs(q, s, CODE, W_DT, out_dt, LUT)
                 b = tl.reshape(tl.join(hi, lo), (BK, BN))
             elif PAIR == 2:
                 # W[k, n] at w_base + n * I + k: a byte holds rows 2p and 2p + 1 of one column.
@@ -182,7 +211,7 @@ if triton is not None:
                     s = _scale(blk, mask_n, ABSMAX, CODE2, ABSMAX2, OFFSET, BS2, NESTED)[:, None]
                 else:
                     s = _scale(byte // (BS // 2), bmask, ABSMAX, CODE2, ABSMAX2, OFFSET, BS2, NESTED)
-                hi, lo = _decode_pairs(q, s, CODE, W_DT, out_dt)
+                hi, lo = _decode_pairs(q, s, CODE, W_DT, out_dt, LUT)
                 b = tl.trans(tl.reshape(tl.join(hi, lo), (BN, BK)))
             else:
                 bmask = mask_k[:, None] & mask_n[None, :]
@@ -190,7 +219,7 @@ if triton is not None:
                 q = tl.load(Q + flat // 2, mask = bmask, other = 0)
                 nib = tl.where((flat % 2) == 0, q >> 4, q & 15).to(tl.int32)
                 s = _scale(flat // BS, bmask, ABSMAX, CODE2, ABSMAX2, OFFSET, BS2, NESTED)
-                b = (tl.load(CODE + nib) * s).to(W_DT).to(out_dt)
+                b = (_code(nib, CODE, LUT) * s).to(W_DT).to(out_dt)
             # Masked weights decode to finite values (code[0] * offset at most) against zero A columns
             # or unstored output columns, so no select is needed here.
             acc = tl.dot(a, b, acc)
@@ -231,17 +260,42 @@ def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer,
     return out
 
 
+# Tiles by average rows per expert. Fixed, not autotuned by default: configs that lower tl.dot to
+# different MMA instructions round differently, so a timing-picked config would make the bits
+# depend on the run. UNSLOTH_MOE_NF4_AUTOTUNE=1 tunes per shape instead.
+# The select-tree codebook (LUT 1) beat the gather 3-6x in every tuned shape; pairs along N take
+# BN 64 so a tile row stays in one 64-element absmax block (one scale per row).
+def _fixed_config(m_hint, inner, outer, pair):
+    bm = 16 if m_hint <= 16 else 32 if m_hint <= 32 else 64 if m_hint <= 64 else 128
+    bn = 64 if pair == 1 else 128
+    bn = min(bn, max(16, triton.next_power_of_2(outer)))
+    bk = 64 if inner >= 64 or pair == 2 else max(16, triton.next_power_of_2(inner))
+    warps = 8 if bm * bn >= 128 * 128 else 4
+    return {"BM": bm, "BN": bn, "BK": bk, "LUT": 1}, warps, 3
+
+
+CONFIGS_USED = {}
+
+
 def _run_kernel(a, out, grid, packed, absmax, code2, absmax2, offset, code, ends, M, m_hint, E,
                 inner, outer, s_i, s_j, pair, blocksize, blocksize2, nested, w_dtype):
+    args = (a, packed, absmax, code2, absmax2, offset, code, ends, out, M, m_hint)
+    kwargs = dict(
+        NUM_E = E, E_POW2 = max(16, triton.next_power_of_2(E)),
+        I = inner, J = outer, S_I = s_i, S_J = s_j, PAIR = pair,
+        BS = blocksize, BS2 = blocksize2, NESTED = nested, W_DT = _TL_DTYPES[w_dtype],
+        enable_fp_fusion = False,
+    )
     with torch.cuda.device(a.device):
-        _nf4_grouped_kernel[grid](
-            a, packed, absmax, code2, absmax2, offset, code, ends, out,
-            M, m_hint,
-            NUM_E = E, E_POW2 = max(16, triton.next_power_of_2(E)),
-            I = inner, J = outer, S_I = s_i, S_J = s_j, PAIR = pair,
-            BS = blocksize, BS2 = blocksize2, NESTED = nested, W_DT = _TL_DTYPES[w_dtype],
-            enable_fp_fusion = False,
-        )
+        if os.environ.get("UNSLOTH_MOE_NF4_AUTOTUNE", "0") == "1":
+            _nf4_grouped_kernel[grid](*args, **kwargs)
+            key = ("autotune", inner, outer, m_hint, pair)
+            if key not in CONFIGS_USED and getattr(_nf4_grouped_kernel, "best_config", None) is not None:
+                CONFIGS_USED[key] = str(_nf4_grouped_kernel.best_config)
+            return
+        cfg, warps, stages = _fixed_config(m_hint, inner, outer, pair)
+        CONFIGS_USED.setdefault((inner, outer, m_hint, pair), f"{cfg} warps {warps} stages {stages}")
+        _nf4_grouped_kernel.fn[grid(cfg)](*args, **kwargs, **cfg, num_warps = warps, num_stages = stages)
 
 
 def _decode_torch(packed, absmax, code2, absmax2, offset, code, numel, blocksize, blocksize2, nested, w_dtype):
