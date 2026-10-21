@@ -111,7 +111,8 @@ def _flash_min_rows(device):
 
 @functools.cache
 def _flash_min_rows_auto(device):
-    if device.type != "cuda":
+    # ROCm never takes the flash forward and keeps its own tiles: unchanged there.
+    if device.type != "cuda" or _IS_HIP:
         return 4096
     try:
         total = torch.cuda.get_device_properties(device).total_memory

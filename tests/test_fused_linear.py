@@ -1366,6 +1366,7 @@ def test_tile_cap_leaves_large_and_half_layouts_alone(monkeypatch):
     monkeypatch.setattr(fl, "_budget_bytes", lambda device = None: 2 * 1024**3)
     # The CUDA tile budget (ROCm's 8 MB one already keeps half tiles under 16384 columns) and an explicit cap.
     monkeypatch.setattr(fl, "_BWD_TILE_BYTES", 256 * 1024**2)
+    monkeypatch.setattr(fl, "_BWD_ROWS", 4096)
     monkeypatch.setattr(fl, "_FWD_TILE_COLS", 16384)
     for n in (4096, 8192, 65536):
         for bpl in (2, 4):
@@ -1392,6 +1393,11 @@ def test_flash_min_rows_follows_the_card_size(monkeypatch):
         assert fl._flash_min_rows(torch.device("cuda", 0)) == want, gib
     fl._flash_min_rows_auto.cache_clear()
     assert fl._flash_min_rows(torch.device("cpu")) == 4096
+    monkeypatch.setattr(fl, "_IS_HIP", True)  # ROCm keeps the previous threshold on any card size
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: Props(16))
+    fl._flash_min_rows_auto.cache_clear()
+    assert fl._flash_min_rows(torch.device("cuda", 0)) == 4096
+    monkeypatch.setattr(fl, "_IS_HIP", False)
     monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", 123)
     assert fl._flash_min_rows(torch.device("cuda", 0)) == 123
     fl._flash_min_rows_auto.cache_clear()
