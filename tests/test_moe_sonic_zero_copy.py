@@ -151,6 +151,7 @@ def test_zero_copy_matches_grouped_mm(lora, monkeypatch):
         grads = [X.grad, Wt.grad] + ([t.grad for t in lw] if lora else [])
         return [out] + grads
 
+    assert S._sonic_eligible(experts, X0) == (True, None), S._sonic_eligible(experts, X0)
     ref = run(MU.forward_native_grouped_mm)
     monkeypatch.setenv("UNSLOTH_MOE_SONIC_GATED", "1")
     monkeypatch.setenv("UNSLOTH_MOE_SONIC_ZERO_COPY", "1")
@@ -208,3 +209,66 @@ def test_sonic_availability_probe_runs_outside_dynamo(monkeypatch):
 
     f(torch.zeros(1))
     assert seen == [False]
+
+
+def _cpu_experts(act_fn):
+    """A CPU Qwen3-style experts module that passes every _sonic_eligible check but the one under test."""
+    mod = torch.nn.Module()
+    mod.gate_up_proj = torch.nn.Parameter(torch.randn(4, 32, 16, dtype=torch.bfloat16), requires_grad=False)
+    mod.down_proj = torch.nn.Parameter(torch.randn(4, 16, 16, dtype=torch.bfloat16), requires_grad=False)
+    mod.num_experts = 4
+    if act_fn is not None:
+        mod.act_fn = act_fn
+    return mod
+
+
+def test_eligibility_rejects_non_silu_activations(monkeypatch):
+    monkeypatch.setattr(S, "sonic_moe_available", lambda: True)
+    monkeypatch.setattr(S, "_device_ok", lambda device: True, raising=False)
+    x = torch.zeros(3, 16, dtype=torch.bfloat16)
+    for act in (torch.nn.Hardswish(), torch.nn.GELU(), torch.tanh):
+        ok, reason = S._sonic_eligible(_cpu_experts(act), x)
+        assert not ok and "not SiLU" in reason, (act, reason)
+    for act in (torch.nn.SiLU(), F.silu, None):
+        assert S._sonic_eligible(_cpu_experts(act), x) == (True, None), act
+
+
+def test_eligibility_checks_the_operand_device(monkeypatch):
+    monkeypatch.setattr(S, "sonic_moe_available", lambda: True)
+    ok, reason = S._sonic_eligible(_cpu_experts(torch.nn.SiLU()), torch.zeros(3, 16, dtype=torch.bfloat16))
+    assert not ok and "device" in reason
+
+
+def test_device_ok_trusts_only_the_probed_capability(monkeypatch):
+    caps = {0: (10, 0), 1: (8, 9), 2: (10, 0)}
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i=None: caps[i])
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
+    monkeypatch.setattr(S, "_DEVICE_OK", {})
+    monkeypatch.setattr(S, "_HOME_CAPABILITY", None)
+    S._record_device_capabilities()
+    assert S._device_ok(torch.device("cuda", 0)) and S._device_ok(torch.device("cuda", 2))
+    assert not S._device_ok(torch.device("cuda", 1))
+    assert not S._device_ok(torch.device("cpu"))
+
+
+def test_alignment_verdict_survives_compile_and_declines_unverified():
+    def run(weight, source):
+        @torch.compile(backend="eager", fullgraph=True)
+        def f(w):
+            return w.sum() * (2.0 if S._is_k_major_gate_up(w, source) else 3.0)
+        torch._dynamo.reset()
+        return round((f(weight) / weight.sum()).item())
+
+    aligned = torch.nn.Parameter(torch.randn(2, 32, 16, dtype=torch.bfloat16), requires_grad=False)
+    flat = torch.randn(2 * 32 * 16 + 1, dtype=torch.bfloat16)
+    misaligned = torch.nn.Parameter(flat[1:].view(2, 32, 16), requires_grad=False)  # 2-byte offset
+    assert misaligned.storage_offset() == 1
+    # No eager verdict yet: zero-copy is declined under compile, not assumed.
+    assert run(aligned.transpose(-2, -1), aligned) == 3
+    assert run(misaligned.transpose(-2, -1), misaligned) == 3
+    # Eager verdicts, then the compiled region reads them.
+    assert S._is_k_major_gate_up(aligned.transpose(-2, -1), aligned)
+    assert not S._is_k_major_gate_up(misaligned.transpose(-2, -1), misaligned)
+    assert run(aligned.transpose(-2, -1), aligned) == 2
+    assert run(misaligned.transpose(-2, -1), misaligned) == 3

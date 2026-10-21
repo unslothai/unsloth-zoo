@@ -94,12 +94,14 @@ def _log(message):
 
 def reset_sonic_moe_state():
     """Forget the availability probe (tests; a device change)."""
-    global _SONIC_MODULE, _SONIC_REASON, _SONIC_PROBED, _GEMM_INTERFACE, _CONCAT_SUPPORTED
+    global _SONIC_MODULE, _SONIC_REASON, _SONIC_PROBED, _GEMM_INTERFACE, _CONCAT_SUPPORTED, _HOME_CAPABILITY
     _SONIC_MODULE = None
     _SONIC_REASON = None
     _SONIC_PROBED = False
     _GEMM_INTERFACE = None
     _CONCAT_SUPPORTED = None
+    _DEVICE_OK.clear()
+    _HOME_CAPABILITY = None
     _INTERLEAVE_CACHE.clear()
     _CONFIG_CACHE.clear()
     _PINNED_CONFIG.clear()
@@ -166,6 +168,39 @@ def _device_is_supported():
     return True, None
 
 
+# CUDA device index -> whether sonic may run there. The kernel and the concat_layout
+# probes ran on ONE card (the current device at load); only cards of that exact compute
+# capability are trusted. Filled for every visible card at load, outside any trace, so a
+# compiled region only reads it.
+_DEVICE_OK = {}
+_HOME_CAPABILITY = None
+
+
+def _record_device_capabilities():
+    global _HOME_CAPABILITY
+    try:
+        _HOME_CAPABILITY = tuple(torch.cuda.get_device_capability(torch.cuda.current_device()))
+        for index in range(torch.cuda.device_count()):
+            _DEVICE_OK[index] = tuple(torch.cuda.get_device_capability(index)) == _HOME_CAPABILITY
+    except Exception as exc:
+        _log(f"Unsloth: sonic-moe device capability scan failed ({exc}).")
+
+
+def _device_ok(device):
+    """Whether `device` is a CUDA card with the probed card's compute capability."""
+    if device.type != "cuda":
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _DEVICE_OK:
+        if torch.compiler.is_compiling() or _HOME_CAPABILITY is None:
+            return False
+        try:
+            _DEVICE_OK[index] = tuple(torch.cuda.get_device_capability(index)) == _HOME_CAPABILITY
+        except Exception:
+            _DEVICE_OK[index] = False
+    return _DEVICE_OK[index]
+
+
 def _probe_sonic(module):
     """One tiny real call. The import succeeding does not mean the kernel runs."""
     device = torch.device("cuda", torch.cuda.current_device())
@@ -221,6 +256,7 @@ def get_sonic_module():
 
     _SONIC_MODULE = module
     _SONIC_REASON = None
+    _record_device_capabilities()
     _log("Unsloth: sonic-moe MoE backend is available.")
     _concat_layout_supported(module)
     try:
@@ -642,9 +678,15 @@ def _swiglu_backward_interleaved(preact, grad_post):
     return torch.stack((d_gate, d_up), dim=-1).reshape(preact.shape).to(preact.dtype)
 
 
-def _is_k_major_gate_up(weight):
+_ALIGNED_ATTR = "_unsloth_sonic_zc_aligned"
+
+
+def _is_k_major_gate_up(weight, source=None):
     """[E, H, 2I] view with H at stride 1 and TMA-aligned strides: the layout
-    concat_layout=("B",) reinterprets as interleaved without a copy."""
+    concat_layout=("B",) reinterprets as interleaved without a copy.
+
+    `source` is the base weight tensor the view comes from; the eager base-pointer
+    verdict is cached on it, because Dynamo cannot trace storage_offset()."""
     # 2I even, and I a multiple of 8 so the [M, I] post-activation and [M, 2I]
     # pre-activation rows are 16-byte aligned for TMA.
     if weight.dim() != 3 or weight.shape[-1] % 16 != 0:
@@ -655,11 +697,19 @@ def _is_k_major_gate_up(weight):
     if (weight.stride(-1) * esize) % 16 != 0 or (weight.stride(0) * esize) % 16 != 0:
         return False
     # The base pointer must be 16-byte aligned too. Allocations are 256-byte aligned,
-    # so it is the storage offset that matters; Dynamo cannot trace storage_offset(),
-    # and a parameter view (what the provider returns) starts at offset 0 anyway.
+    # so it is the storage offset that matters. Dynamo cannot trace storage_offset()
+    # (not even aten.sym_storage_offset), so the eager verdict is stored as an
+    # attribute on the source tensor (Dynamo guards on it: setting it recompiles) and a
+    # compiled region only reads it. No eager verdict yet -> decline zero-copy.
     if torch.compiler.is_compiling():
-        return True
-    return (weight.storage_offset() * esize) % 16 == 0
+        return source is not None and getattr(source, _ALIGNED_ATTR, None) is True
+    aligned = (weight.storage_offset() * esize) % 16 == 0
+    if isinstance(source, torch.Tensor):
+        try:
+            setattr(source, _ALIGNED_ATTR, aligned)
+        except Exception:
+            pass
+    return aligned
 
 
 def _concat_layout_supported(module):
@@ -850,6 +900,8 @@ def _sonic_eligible(self, hidden_states):
     """(ok, reason). Anything unhandled falls back to grouped_mm, never to a crash."""
     if not sonic_moe_available():
         return False, f"sonic-moe unavailable ({sonic_moe_unavailable_reason()})"
+    if not _device_ok(hidden_states.device):
+        return False, f"device {hidden_states.device} is not the compute capability sonic was probed on"
     if hidden_states.dtype not in _SUPPORTED_DTYPES:
         return False, f"dtype {hidden_states.dtype} is not bf16/fp16"
     if not (hasattr(self, "gate_up_proj") and hasattr(self, "down_proj")):
@@ -857,16 +909,16 @@ def _sonic_eligible(self, hidden_states):
     cls = self.__class__.__name__
     if "GptOss" in cls:
         return False, "GptOss uses a clamped non-SwiGLU activation"
-    from .moe_utils import _gate_up_is_interleaved, _uses_own_apply_gate
+    from .moe_utils import _act_fn_is_silu, _gate_up_is_interleaved, _uses_own_apply_gate
     if _gate_up_is_interleaved(self):
         return False, "gate_up is stored interleaved"
     if _uses_own_apply_gate(self):
         return False, "experts apply their own gate"
     act = getattr(self, "act_fn", None)
-    if act is not None:
-        name = getattr(act, "__name__", type(act).__name__).lower()
-        if "silu" not in name and "swish" not in name:
-            return False, f"activation {name} is not SiLU"
+    # Exact SiLU types only (F.silu, nn.SiLU, SiLUActivation): the fused kernel always
+    # computes SiLU, and a name match let e.g. nn.Hardswish through.
+    if act is not None and not _act_fn_is_silu(act):
+        return False, f"activation {type(act).__name__} is not SiLU"
     if getattr(self, "gate_up_proj_bias", None) is not None:
         return False, "gate_up_proj_bias is unsupported"
     if getattr(self, "down_proj_bias", None) is not None:
@@ -887,6 +939,14 @@ def _sonic_eligible(self, hidden_states):
             if base.dim() != 3:
                 return False, f"{name} base is not a 3D expert stack"
     return True, None
+
+
+def _base_tensor(source):
+    """The plain tensor under a PEFT wrapper chain, or None."""
+    base = source
+    while hasattr(base, "base_layer"):
+        base = base.base_layer
+    return base if isinstance(base, torch.Tensor) else None
 
 
 _WARNED_FALLBACK = set()
@@ -979,7 +1039,7 @@ def forward_sonic_moe(
         if (
             _zero_copy_requested()
             and _concat_layout_supported(module)
-            and _is_k_major_gate_up(gate_up_provider())
+            and _is_k_major_gate_up(gate_up_provider(), _base_tensor(gate_up_source))
         ):
             gated_mode = "zero_copy"
         else:
