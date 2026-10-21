@@ -41,21 +41,22 @@ device = get_device_type()
 gpu_available = device in ("cuda", "xpu")
 
 
-# Reset module state between tests so install registries don't bleed.
+# Empty registries for each test, then the previous contents back. Clearing on the way out
+# dropped the entries for classes patched before this file ran while their rewritten forward
+# stayed, so a later test in the same worker could not install on them again.
 @pytest.fixture
 def fresh_install():
     from unsloth_zoo.fused_losses import forward_install as fi
+    registries = (fi._PATCHED, fi._UNMATCHED, fi._FAILED, fi._CANONICAL_FORWARDS)
     with fi._REGISTRY_LOCK:
-        fi._PATCHED.clear()
-        fi._UNMATCHED.clear()
-        fi._FAILED.clear()
-        fi._CANONICAL_FORWARDS.clear()
+        saved = [dict(registry) for registry in registries]
+        for registry in registries:
+            registry.clear()
     yield fi
     with fi._REGISTRY_LOCK:
-        fi._PATCHED.clear()
-        fi._UNMATCHED.clear()
-        fi._FAILED.clear()
-        fi._CANONICAL_FORWARDS.clear()
+        for registry, contents in zip(registries, saved):
+            registry.clear()
+            registry.update(contents)
 
 
 @pytest.fixture
