@@ -16,6 +16,7 @@
 
 """grouped_mm and ROCm crash probes answer per GPU model, probing only the cards experts actually run on."""
 import subprocess
+import sys
 import types
 
 import pytest
@@ -236,6 +237,7 @@ def test_rocm_crash_on_unused_card_keeps_grouped_mm(spoof, monkeypatch):
 @pytest.mark.parametrize("var", ["HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"])
 def test_rocm_crash_probe_indexes_into_inherited_mask(spoof, monkeypatch, var):
     spoof(3, hip = "7.1.0")
+    monkeypatch.setattr(sys, "platform", "linux")  # an unsorted mask is not mask order on Windows (below)
     monkeypatch.setenv(var, "5, 2,7")
     children = _record_children(monkeypatch)
     assert all(moe_utils._check_torch_grouped_mm_supported(cuda(i)) for i in range(3))
@@ -322,6 +324,10 @@ def test_view_probe_runs_on_the_input_card(spoof, monkeypatch):
     probed = []
     monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: probed.append(d.index) or d.index == 1)
     assert moe_utils._grouped_mm_supported_on(cuda(1)) is True
+    # Probed with support, in the same eager region: the view check opens no second one.
+    assert probed == [1]
+    def no_second_region(fn): raise AssertionError("second compiler-disabled region")
+    monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_second_region)
     assert moe_utils._transposed_view_safe_on(cuda(1)) is True
     assert moe_utils._transposed_view_safe_on(cuda(1)) is True
     assert probed == [1]
@@ -339,6 +345,7 @@ def test_view_probe_same_model_keeps_the_process_wide_flag(spoof, monkeypatch):
 
 def test_rocm_quoted_mask_is_unquoted(spoof, monkeypatch):
     spoof(3, hip = "7.1.0")
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", '"5,2,7"')
     children = _record_children(monkeypatch)
     assert all(moe_utils._check_torch_grouped_mm_supported(cuda(i)) for i in range(3))

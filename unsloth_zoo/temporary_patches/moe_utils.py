@@ -1692,6 +1692,9 @@ def _probe_torch_grouped_mm_supported(device = None):
         if supported is None:
             supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
             _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
+            # Same eager region: a traced first use of this model must not break again on the view check.
+            if supported and kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
+                _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = _transposed_view_probe(device)
         return supported
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
