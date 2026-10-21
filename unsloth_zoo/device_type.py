@@ -627,10 +627,17 @@ def _xpu_bf16_supported():
     native bf16 turns it off, since neither the load target nor vLLM's device is known here. Each
     device is judged by its own aspects: without libocloc (absent in torch-xpu wheels) every SYCL
     aspect reads False, so trust has_bfloat16_conversions only once some aspect reads True there."""
-    # An older unsloth still answers bf16 on XPU: keep that so loading and training agree.
+    # Beside unsloth, give its answer so loading and training agree whatever the two versions:
+    # an older unsloth still answers bf16 on XPU.
     unsloth_device_type = sys.modules.get("unsloth.device_type")
-    if unsloth_device_type is not None and not hasattr(unsloth_device_type, "xpu_supports_native_bf16"):
-        return True
+    if unsloth_device_type is not None:
+        core_answer = getattr(unsloth_device_type, "xpu_supports_native_bf16", None)
+        if core_answer is None:
+            return True
+        try:
+            return bool(core_answer())
+        except Exception:
+            pass
     aspects = (
         "has_bfloat16_conversions",
         "has_subgroup_matrix_multiply_accumulate",

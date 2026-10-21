@@ -127,6 +127,18 @@ def test_xpu_bf16_keeps_old_answer_beside_an_older_unsloth(on_xpu, monkeypatch):
 
 
 @not_on_macos
+@pytest.mark.parametrize("core_answer", [True, False])
+def test_xpu_bf16_gives_the_loaded_unsloths_answer(on_xpu, monkeypatch, core_answer):
+    # Mixed aspect reads where unsloth main (one probe across devices) and this zoo (per device)
+    # differ: the loaded unsloth decides, so the two never pick different dtypes.
+    on_xpu(_fake_xpu((True, False)))
+    core = types.ModuleType("unsloth.device_type")
+    core.xpu_supports_native_bf16 = lambda: core_answer
+    monkeypatch.setitem(sys.modules, "unsloth.device_type", core)
+    assert dt._xpu_bf16_supported() is core_answer
+
+
+@not_on_macos
 def test_xpu_bf16_unreadable_properties_keep_todays_answer(on_xpu):
     on_xpu(_fake_xpu((False,), props_raise = True))
     assert dt.device_is_bf16_supported() is True
