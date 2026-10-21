@@ -919,15 +919,12 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     rw, sel = spec[3](self, router_logits, top_k)
     rw = rw.to(dtype)
 
-    flat_e = sel.reshape(-1)
     flat_w = rw.reshape(-1)
     tok_of_pair = torch.arange(T, device=dev).repeat_interleave(top_k)
-    # int64 matches what bincount returned, so cumsum is unchanged.
-    counts = _moe_utils.count_tokens_per_expert(flat_e, num_experts, torch.int64)
-    order = torch.argsort(flat_e, stable=True)
+    # Same offsets as the int64 count + cumsum this replaced (counts < 2**31).
+    _, order, offsets = _moe_utils.moe_routing_sort(sel, num_experts)
     sorted_tok = tok_of_pair[order]
     sorted_w = flat_w[order]
-    offsets = torch.cumsum(counts, dim=0).to(torch.int32)
     permuted = hidden_states[sorted_tok]
 
     recompute = getattr(self, "_moe_recompute", False)
