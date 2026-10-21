@@ -14,38 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Stable counting sort of MoE routing assignments on device.
-
-``moe_routing_sort(top_k_index, num_experts)`` returns ``(counts, sorted_indices, offsets)``:
-
-    counts         int32 [E]  tokens routed to each expert
-    sorted_indices int64 [N]  == top_k_index.reshape(-1).argsort(stable = True), N = T * top_k
-    offsets        int32 [E]  == torch.cumsum(counts, 0, dtype = torch.int32)
-
-bit for bit equal to the torch path (scatter_add count + stable argsort + cumsum), without a
-host sync, with output shapes fixed by the input shape (CUDA graph capturable).
-
-Why a counting sort: keys are expert ids in [0, E), E <= a few hundred, so a radix sort over all
-64 bits of an int64 key (what argsort does) is mostly wasted passes.
-
-Design (no atomics anywhere, so the result is deterministic and stable by construction):
-- N <= one block: one program histograms the keys (counts, offsets) and sorts the composite key
-  ``expert * BLOCK + position``; the sorted order is already the global order. One launch.
-- Otherwise three launches:
-  1. per block histogram hist[e, b];
-  2. one program scans hist with a carry over blocks:
-     R[e, b] = (rows of expert e in blocks before b) - (rows of experts < e inside block b),
-     plus counts, offsets and the expert starts;
-  3. per block: sort the block's composite keys (stable within the block, since the position is
-     the low part of the key); the element at sorted position p with expert e goes to
-     starts[e] + R[e, b] + p, which is its stable rank in the whole array.
-Out of range ids (the torch path's precondition is [0, E)) are not counted and are sorted to the
-tail, so the output is still a permutation and nothing is written out of bounds.
-
-The torch path stays as the fallback: CPU / non CUDA tensors, ROCm (unless forced on), Triton
-missing, a failed launch, and the kill switch ``UNSLOTH_MOE_TRITON_ROUTING=0`` (``=1`` forces it on
-where it is off by default, e.g. ROCm). The first call per (device, E, launch shape) also runs the
-torch path and compares bit for bit; a mismatch disables the kernel for the process.
+"""Stable on-device counting sort of MoE routing ids, bit-identical to scatter_add count +
+stable argsort + int32 cumsum, sync free and CUDA graph capturable. No atomics, so deterministic.
+Out of range ids are not counted and go to the tail. UNSLOTH_MOE_TRITON_ROUTING=0 kills it, =1
+forces it (e.g. ROCm); the first call per (device, E, launch shape) is verified against torch.
 """
 
 __all__ = [
@@ -80,11 +52,9 @@ _SCAN_EXPERTS = 8
 _SCAN_BLOCKS = 256
 _WARPS = (4, 4, 4)   # hist, scan, scatter
 
-# Runtime counters: incremented inside the eager impl (the custom op body), so never traced.
 ROUTING_CALLS = {"triton": 0, "torch": 0, "fallback": 0}
 
 _DISABLED_REASON = None
-# (device index, E, single block) -> verified against the torch path on its first real call.
 _VERIFIED = {}
 
 
@@ -215,7 +185,6 @@ def _launch(top_k_index, num_experts, single_block_max = None, block = None):
     K_COLS = max(ids.shape[1], 1)
     s_row, s_col = ids.stride(0), ids.stride(1)
     single_block_max = _SINGLE_BLOCK_MAX if single_block_max is None else single_block_max
-    # Triton launches on the current device: switch only when the input lives elsewhere.
     on_device = device.index == torch.cuda.current_device()
     with contextlib.nullcontext() if on_device else torch.cuda.device(device):
         if N <= single_block_max:
@@ -235,7 +204,6 @@ def _launch(top_k_index, num_experts, single_block_max = None, block = None):
             ids, N, K_COLS, s_row, s_col, E, hist, rank_base,
             BLOCK = BLOCK, NUM_BINS = _pow2(E + 2), num_warps = _WARPS[0],
         )
-        # Experts per scan program: about 32 programs for small E, at most _SCAN_EXPERTS wide.
         EC = min(_SCAN_EXPERTS, _pow2((E + 32) // 32))
         _route_scan_kernel[((E + EC) // EC,)](
             hist, rank_base, counts, NB, E,
@@ -357,9 +325,7 @@ _OP = _register_op() if triton is not None else None
 def moe_routing_sort(top_k_index, num_experts):
     """(counts int32 [E], argsort(flat, stable) int64 [N], cumsum(counts) int32 [E]), sync free.
 
-    The static gate below reads only the device, module constants and the shape, so it never
-    guards on data. Eager calls skip the custom op's dispatch cost; compiled frames call the
-    opaque op, whose body still falls back to torch on its own.
+    The gate reads only device, constants and shape, so it never guards on data.
     """
     num_experts = int(num_experts)
     if (

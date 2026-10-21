@@ -2045,18 +2045,12 @@ else:
 
 
 def moe_routing_sort(top_k_index, num_experts):
-    """(counts int32 [E], flat.argsort(stable = True) int64 [N], cumsum(counts) int32 [E]), sync-free.
-
-    CUDA: a stable Triton counting sort (moe_routing_triton), bit-identical to the torch path and
-    CUDA graph capturable; UNSLOTH_MOE_TRITON_ROUTING=0 turns it off. Everywhere else, or when
-    that module cannot load: count_tokens_per_expert + stable argsort + int32 cumsum.
-    """
+    """(counts int32 [E], stable argsort int64 [N], cumsum(counts) int32 [E]), sync-free; Triton on CUDA."""
     # This Unsloth Zoo code section is licensed under AGPL3
     if _TRITON_ROUTING is not None:
         return _TRITON_ROUTING(top_k_index, num_experts)
     flat_experts = top_k_index.reshape(-1)
     counts = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
-    # stable=True preserves order within each expert.
     sorted_indices = flat_experts.argsort(stable=True)
     return counts, sorted_indices, torch.cumsum(counts, dim=0, dtype=torch.int32)
 
@@ -5675,7 +5669,6 @@ def forward_native_moe_loop(
         expert_counts, order, _ = moe_routing_sort(slot_major, self.num_experts)
         routed_token_idx = order % n_tokens
         routed_top_k_pos = order // n_tokens
-        # The loop below slices on host ints: one sync for the counts (bincount added a second).
         expert_counts = expert_counts.tolist()
 
     # A declared (E, in, out) layout (_unsloth_grouped_mm_format) wins over the shape test, which a square stack defeats.

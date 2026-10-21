@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""moe_routing_triton: the Triton counting sort against the torch routing path, bit for bit.
-
-* counts / sorted indices / offsets equal scatter_add + argsort(stable = True) + cumsum over
-  E in {8 .. 384}, top_k in {1 .. 8}, T from 1 to 64k, random / skewed / one expert / empty
-  experts, int32 and int64 ids, non-contiguous top-k tensors; the multi-block path is also forced
-  at tiny sizes (block 16) so block boundaries are hit on every case.
-* no host sync (sync debug mode "error"), CUDA graph capture + replay, torch.compile fullgraph
-  with 0 graph breaks (static and dynamic=True over T), kill switch, launch-failure fallback.
-GPU only; runs from the zoo tree alone (only torch + triton are needed).
-"""
+"""moe_routing_triton vs the torch routing path, bit for bit: sizes, sync-free, graphs, compile, fallbacks. GPU only."""
 import importlib
 import importlib.util
 import os
