@@ -453,6 +453,7 @@ def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
         actual = offloaded.layers[0].switch_mlp(x, indices)
         assert actual.dtype == expected.dtype == mx.bfloat16
         np.testing.assert_array_equal(_bits(actual), _bits(expected))
+    assert not offloaded.layers[0].switch_mlp._slots.readers  # buffered misses keep no readers
 
 
 def test_slot_readers_kept_are_bounded_in_bytes(monkeypatch):

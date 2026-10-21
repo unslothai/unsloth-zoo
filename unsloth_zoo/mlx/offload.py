@@ -588,6 +588,8 @@ class _ExpertSlots:
     def read_by(self, *outputs):
         """Keep ``outputs``, computed from the slots, for the next miss to evaluate first; once more
         than a few, or more than ``_PENDING_BYTES`` in all, are kept, they are evaluated now."""
+        if self.views is None:  # misses scatter into new arrays: nothing pending can see them
+            return
         self.readers.extend(outputs)
         large = sum(reader.nbytes for reader in self.readers) > _PENDING_BYTES
         if large or len(self.readers) > _PENDING_READERS:
