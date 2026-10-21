@@ -747,6 +747,7 @@ class OffloadSwitchGLU(nn.Module):
         object.__setattr__(self, "_full", None)  # the stock module on a full table, while a wide layer runs
         object.__setattr__(self, "_ahead", None)  # (future, module) of a table being read ahead
         object.__setattr__(self, "_next", None)  # the next offloaded layer a wide prefill reaches
+        object.__setattr__(self, "_spare", None)  # a table the previous offloaded layer is done with
         self.experts = experts
         for name in ("up_proj", "gate_proj", "activation", "down_proj"):
             object.__setattr__(self, name, _GLUPart(self, name))
@@ -758,21 +759,21 @@ class OffloadSwitchGLU(nn.Module):
         return glu
 
     def _routes(self, indices):
+        object.__setattr__(self, "_spare", None)
         routes = np.asarray(indices).reshape(-1).astype(np.int64)
         return routes, np.unique(routes)
 
-    def _table(self):
-        """The stock module on a new table of all this layer's experts, and the function filling it:
+    def _table(self, spare = None):
+        """The stock module on ``spare`` or a new table of all this layer's experts, and the function filling it:
         resident experts copied from the slots, the others read in runs of adjacent experts. ``None``
         when a field is cast at load, so its bytes on disk are not the table's."""
         slots = self._slots
         if any(field.cast is not None for _, _, field in slots.fields):
             return None
-        arrays = {
-            (projection, name): mx.zeros((self.experts, *field.shape), dtype = field.dtype)
-            for projection, name, field in slots.fields
-        }
-        mx.eval(list(arrays.values()))
+        arrays = spare
+        if arrays is None:
+            arrays = {key: mx.zeros(shape, dtype = dtype) for key, (shape, dtype) in self._layout().items()}
+            mx.eval(list(arrays.values()))
         # Taken here: buffers of evaluated arrays, which the filling thread only copies into.
         views = [
             (field, memoryview(arrays[projection, name]).cast("B"), memoryview(slots.arrays[projection, name]).cast("B"))
@@ -813,14 +814,18 @@ class OffloadSwitchGLU(nn.Module):
 
     def _wide(self, read_next):
         """Run calls on a full table until ``_narrow``, reading the next offloaded layer's ahead."""
+        spare = self._spare
+        object.__setattr__(self, "_spare", None)
         glu = self._join_ahead()
         if glu is None:
-            # A pass starts here: a read-ahead an aborted pass left further on goes before a new table.
+            # A pass starts here: an unfitting spare, and any table an aborted pass left further on, go before a new one.
             layer = self._next
             while layer is not None:
+                object.__setattr__(layer, "_spare", None)
                 layer._join_ahead()
                 layer = layer._next
-            made = self._table()
+            spare = self._fits(spare)
+            made, spare = self._table(spare), None
             if made is None:
                 return False
             glu, fill = made
@@ -828,15 +833,29 @@ class OffloadSwitchGLU(nn.Module):
         glu.train(self.training)
         following = self._next
         if read_next and following is not None and following._ahead is None:
-            made = following._table()
+            spare = following._fits(spare)
+            made = following._table(spare)
             if made is not None:
                 object.__setattr__(following, "_ahead", (_table_reader().submit(made[1]), made[0]))
         # Set last: a failure above leaves this layer on its slots.
         object.__setattr__(self, "_full", glu)
         return True
 
+    def _layout(self):
+        return {(projection, name): ((self.experts, *field.shape), field.dtype) for projection, name, field in self._slots.fields}
+
+    def _fits(self, spare):
+        if spare is not None and {key: (tuple(array.shape), array.dtype) for key, array in spare.items()} == self._layout():
+            return spare
+        return None
+
     def _narrow(self):
+        # Every step on the table was evaluated and a fill rewrites every row, so the next layer may refill it.
+        glu = self._full
         object.__setattr__(self, "_full", None)
+        if glu is not None and self._next is not None:
+            object.__setattr__(self._next, "_spare", {
+                (projection, name): getattr(glu, projection)[name] for projection, name, _ in self._slots.fields})
 
     def __call__(self, x, indices, *weights):
         if self._full is not None:
