@@ -146,6 +146,21 @@ def _old_cuda_arch_version(caps, current, cuda_caps):
     return namespace["OLD_CUDA_ARCH_VERSION"]
 
 
+def _old_cuda_arch_indices(caps, current, cuda_caps):
+    import unsloth_zoo.compiler as compiler
+    tree = ast.parse(inspect.getsource(compiler))
+    block = next(
+        node for node in tree.body
+        if isinstance(node, ast.If) and "OLD_CUDA_ARCH_INDICES" in ast.unparse(node)
+        and "get_device_capability" in ast.unparse(node)
+    )
+    cuda_caps(caps, current)
+    namespace = {"__name__": "unsloth_zoo.compiler", "__package__": "unsloth_zoo",
+                 "torch": torch, "DEVICE_TYPE": "cuda"}
+    exec(compile(ast.Module(body = [block], type_ignores = []), "compiler_block", "exec"), namespace)
+    return namespace["OLD_CUDA_ARCH_INDICES"]
+
+
 @pytest.mark.parametrize("current", [0, 1])
 @pytest.mark.parametrize("caps", [[(8, 0), (6, 1)], [(6, 1), (8, 0)], [(8, 9), (7, 0)]])
 def test_lm_head_fusion_switch_follows_the_current_device(cuda_caps, caps, current):
@@ -157,6 +172,65 @@ def test_lm_head_fusion_switch_follows_the_current_device(cuda_caps, caps, curre
 def test_compile_switch_homogeneous_unchanged(cuda_caps):
     assert _old_cuda_arch_version([(8, 0), (8, 0)], 1, cuda_caps) is False
     assert _old_cuda_arch_version([(7, 0)], 0, cuda_caps) is True
+
+
+def test_lm_head_fusion_records_every_old_card(cuda_caps):
+    # sm89 current beside an sm61 card: the rewrite installs, and the sm61 index is recorded
+    # so a forward whose LM head lands there skips Inductor and CCE.
+    assert _old_cuda_arch_version([(8, 9), (6, 1)], 0, cuda_caps) is False
+    assert _old_cuda_arch_indices([(8, 9), (6, 1)], 0, cuda_caps) == frozenset({1})
+    assert _old_cuda_arch_indices([(8, 9)], 0, cuda_caps) == frozenset()
+    assert _old_cuda_arch_indices([(8, 0), (8, 0)], 1, cuda_caps) == frozenset()
+
+
+def test_an_unreadable_card_counts_as_old(cuda_caps, monkeypatch):
+    cuda_caps([(8, 9), (8, 9)], 0)
+
+    def capability(device = None):
+        if device == 1:
+            raise RuntimeError("unreadable")
+        return (8, 9)
+
+    import unsloth_zoo.compiler as compiler
+    tree = ast.parse(inspect.getsource(compiler))
+    block = next(
+        node for node in tree.body
+        if isinstance(node, ast.If) and "OLD_CUDA_ARCH_INDICES" in ast.unparse(node)
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    namespace = {"__name__": "unsloth_zoo.compiler", "__package__": "unsloth_zoo",
+                 "torch": torch, "DEVICE_TYPE": "cuda"}
+    exec(compile(ast.Module(body = [block], type_ignores = []), "compiler_block", "exec"), namespace)
+    assert namespace["OLD_CUDA_ARCH_INDICES"] == frozenset({1})
+
+
+def test_lm_head_on_old_cuda_arch_reads_the_weight_device(monkeypatch):
+    import unsloth_zoo.compiler as compiler
+    on = lambda device: types.SimpleNamespace(device = device)
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset({1}))
+    assert compiler.lm_head_on_old_cuda_arch(on(torch.device("cuda", 1))) is True
+    assert compiler.lm_head_on_old_cuda_arch(on(torch.device("cuda", 0))) is False
+    assert compiler.lm_head_on_old_cuda_arch(on(torch.device("cpu"))) is False
+    assert compiler.lm_head_on_old_cuda_arch(None) is False
+    # No old card visible (one-GPU and homogeneous hosts): never true.
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset())
+    assert compiler.lm_head_on_old_cuda_arch(on(torch.device("cuda", 1))) is False
+
+
+def test_the_fused_lm_head_templates_consult_the_head_device():
+    import unsloth_zoo.compiler as compiler
+    templates = [compiler.cross_entropy_replacement_1, compiler.cross_entropy_replacement_2,
+                 compiler.cross_entropy_replacement_3]
+    for template in templates:
+        calls = template.count("loss = unsloth_fused_ce_loss(")
+        assert calls == template.count(
+            "torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),"
+        )
+        assert template.count("(UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY)") == template.count(
+            "(UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight)"
+        )
+        assert calls >= 1
+    assert "from unsloth_zoo.compiler import lm_head_on_old_cuda_arch" in compiler._disabled_sdpa_code
 
 
 # Z1: tiled-MLP free memory ------------------------------------------------------------
