@@ -3,6 +3,10 @@
 
 """fp16 fused lm_head + CE forward must see the GradScaler: the kernel saves d(loss)/d(hidden) in the forward, unscaled it underflows."""
 
+import inspect
+import os
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -86,3 +90,59 @@ def test_fused_forward_bf16_without_scaler_is_unchanged(monkeypatch):
     assert isinstance(seen["scaling"], _FakeScaler)
     fa.unsloth_fused_lm_head_loss(h, head, labels, scaling = 2.0, accelerator_scaler = _FakeScaler())
     assert seen["scaling"] == 2.0
+    fa.unsloth_fused_lm_head_loss(h, head, labels, scaling = 0.0, accelerator_scaler = _FakeScaler())
+    assert seen["scaling"] == 0.0
+
+
+class _TinyHead(torch.nn.Module):
+    def __init__(self, train_head):
+        super().__init__()
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
+        self.config = SimpleNamespace(vocab_size = 2048)
+        self.lm_head = torch.nn.Linear(16, self.config.vocab_size, bias = False).half()
+        self.lm_head.requires_grad_(train_head)
+        self.loss_function = ForCausalLMLoss
+        self.accelerator_scaler = _FakeScaler()
+
+    def forward(self, hidden_states, labels = None, **kwargs):
+        logits = self.lm_head(hidden_states)
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits, labels, self.config.vocab_size, **kwargs)
+        return loss, logits
+
+
+@pytest.mark.parametrize("train_head", [False, True])
+def test_ast_fp16_gradients_match_scaled_reference(monkeypatch, train_head):
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+    from unsloth_zoo.fused_losses import forward_adapter as fa, forward_install as fi
+
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
+    torch.manual_seed(0)
+    model = _TinyHead(train_head)
+    hidden = torch.randn(2, 128, 16, dtype = torch.float16, requires_grad = True)
+    labels = torch.randint(0, model.config.vocab_size, (2, 128))
+    inputs = (hidden, model.lm_head.weight) if train_head else (hidden,)
+
+    reference_loss, _ = model(hidden, labels)
+    reference_grads = torch.autograd.grad(reference_loss * SCALE, inputs)
+
+    source, capture = rewrite_forward_source(inspect.getsource(_TinyHead.forward))
+    assert source is not None and capture is not None
+    namespace = dict(
+        os = os, unsloth_fused_lm_head_loss = fa.unsloth_fused_lm_head_loss,
+        EMPTY_LOGITS = fa.EMPTY_LOGITS, _can_fuse_loss = fi._can_fuse_loss,
+    )
+    exec(compile(source, "<fp16-scaler-test>", "exec"), namespace)
+    # One eager chunk makes the arithmetic match the reference exactly.
+    loss, logits = namespace["forward"](
+        model, hidden, labels, torch_compile = False, n_chunks = 1,
+    )
+    assert logits.numel() == 0, "the fused CE forward did not run"
+    grads = torch.autograd.grad(loss * SCALE, inputs)
+
+    torch.testing.assert_close(loss, reference_loss, rtol = 0, atol = 0)
+    for actual, expected in zip(grads, reference_grads):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol = 0, atol = 0)
