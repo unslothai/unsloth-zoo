@@ -1131,9 +1131,8 @@ class _ExpertBiasGather(torch.autograd.Function):
         # The one-hot is at most _EXPERT_BIAS_ONE_HOT_ELEMENTS: long contexts go in row chunks, summed in fp32.
         chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // ctx.num_experts)
         rows = grad.shape[0]
-        # Autocast off: `mm` is on its lower-precision list, so an fp32 grad under fp16 autocast (eager
-        # backward inside the context, or compiled backward's "same_as_forward") would round the per-expert
-        # sum to fp16 and overflow past 65504, where index_add_ in fp32 stayed finite.
+        # Autocast off: under fp16 autocast (incl. compiled backward's "same_as_forward") `mm` rounds the
+        # per-expert sum to fp16 and overflows past 65504; index_add_ in fp32 stays finite.
         with torch.autocast(device_type = grad.device.type, enabled = False):
             if rows <= chunk:
                 return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
