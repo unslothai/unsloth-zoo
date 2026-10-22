@@ -3595,8 +3595,11 @@ pass
 def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
     """vLLM samples every row of config.vocab_size and ignores generation_config.suppress_tokens,
     so alignment rows from add_new_tokens(pad_to_multiple_of = ...) could be emitted as ids no
-    tokenizer token has. Bias them to -100 on every request the engine core receives.
+    tokenizer token has. Bias them to -inf on every request the engine core receives: a finite bias
+    such as the OpenAI API's -100 only shifts the row, so a large enough logit could still win.
+    Records the bias on llm._unsloth_padded_vocab_bias so GRPO support scoring can apply it too.
     Idempotent."""
+    pad_bias = float("-inf")
     if speculative:
         # SamplingParams._validate_spec_decode rejects any logit_bias under speculative decoding
         # (vLLM 0.29; older V1 drops it with a warning), so biasing would fail every request.
@@ -3605,7 +3608,7 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
             "vocabulary's alignment rows stay sampleable."
         )
         return llm
-    bias = {int(i): -100.0 for i in padded_ids}
+    bias = {int(i): pad_bias for i in padded_ids}
     try:
         # Model Runner V2 refuses a request with more logit_bias entries than this.
         from vllm.v1.worker.gpu.sample.logit_bias import MAX_NUM_LOGIT_BIAS_TOKENS as max_bias
@@ -3619,7 +3622,7 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
             # Pooling request: nothing is sampled.
             return
         current = params.logit_bias or {}
-        if all(current.get(i) == -100.0 for i in bias):
+        if all(current.get(i) == pad_bias for i in bias):
             return
         merged = {**current, **bias}
         if len(merged) > max_bias:
@@ -3682,7 +3685,7 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
                 index = indices.get(logits.device)
                 if index is None:
                     index = indices[logits.device] = torch.tensor(pad_ids, dtype = torch.long, device = logits.device)
-                logits[index] += -100.0
+                logits[index] = pad_bias
                 return logits
 
             @functools.wraps(method)
@@ -3699,6 +3702,13 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
 
             _add_processed_request_without_padded_vocab._unsloth_padded_vocab = True
             v0._add_processed_request = _add_processed_request_without_padded_vocab
+    elif len(bias) > max_bias:
+        # Every request is refused the bias in _bias_request: nothing is suppressed.
+        return llm
+    try:
+        llm._unsloth_padded_vocab_bias = (tuple(bias), pad_bias)
+    except Exception:
+        pass
     return llm
 pass
 
