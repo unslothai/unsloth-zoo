@@ -379,6 +379,20 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                     self_fn._use_compiled = False
             return eager(*args)
 
+        # aten::mm.dtype (torch >= 2.8) has CUDA / ROCm kernels only.
+        mm_out_dtype = {"cuda": hasattr(torch.ops.aten.mm, "dtype")}
+
+        def mm_float32(a, b):
+            # fp16 GEMM with float32 output where it exists, else a float32 matmul of the chunk.
+            if mm_out_dtype.get(a.device.type, False):
+                try:
+                    return torch.mm(a, b, out_dtype = torch.float32)
+                except torch.cuda.OutOfMemoryError:
+                    raise
+                except (TypeError, RuntimeError, NotImplementedError):
+                    mm_out_dtype[a.device.type] = False
+            return torch.mm(a.float(), b.float())
+
         def chunk_logits(chunk_hidden_states, lm_head, lm_head_bias):
             chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
             if lm_head_bias is None:
@@ -440,19 +454,31 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                     del logits
                     if head is None:
                         head = lm_head if lm_head.dtype == grad_logits.dtype else lm_head.to(grad_logits.dtype)
+                        half_to_float32 = grad_logits.dtype == torch.float16
                     if need_hidden:
-                        grad_hidden[a:b] = (grad_logits @ head).to(device = hidden_states.device, dtype = hidden_states.dtype)
+                        if half_to_float32 and hidden_states.dtype != torch.float16:
+                            # A bf16 / fp32 hidden state can hold a row sum an fp16 product cannot.
+                            grad_chunk = mm_float32(grad_logits, head)
+                        else:
+                            grad_chunk = grad_logits @ head
+                        grad_hidden[a:b] = grad_chunk.to(device = hidden_states.device, dtype = hidden_states.dtype)
+                        del grad_chunk
                     if need_head:
                         x = chunk_hidden_states.to(device = device, dtype = grad_logits.dtype)
                         if grad_head is None:
                             # Accumulate in place in the head's own dtype when the matmul ran in it,
-                            # as autograd does; a float32 head under autocast accumulates in float32.
+                            # as autograd does, except fp16: its chunk products and running sum can
+                            # leave the fp16 range before opposite signed chunks cancel. fp16 and a
+                            # float32 head under autocast accumulate in float32, cast once at the end.
+                            same_dtype = lm_head.dtype == grad_logits.dtype and not half_to_float32
                             grad_head = torch.zeros(
                                 lm_head.shape, device = device,
-                                dtype = grad_logits.dtype if lm_head.dtype == grad_logits.dtype else torch.float32,
+                                dtype = grad_logits.dtype if same_dtype else torch.float32,
                             )
                         if grad_head.dtype == grad_logits.dtype:
                             grad_head.addmm_(grad_logits.t(), x)
+                        elif half_to_float32:
+                            grad_head.add_(mm_float32(grad_logits.t(), x))
                         else:
                             grad_head.add_(grad_logits.t() @ x)
                     if need_bias:
@@ -467,6 +493,10 @@ def chunked_hidden_states_selective_log_softmax_recompute(
         self_fn._use_compiled = getattr(self_fn, "_use_compiled", True)
         self_fn._autograd_function = function = ChunkedSelectiveLogSoftmax
 
+    if hidden_states is None:
+        # Build-only call, made once at import: a cold outer torch.compile(fullgraph = True) cannot
+        # trace the setup above (class creation, compile wrappers), only the cached function.
+        return function
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
     n_rows = flat_hidden_states.shape[0]
@@ -496,6 +526,7 @@ def chunked_hidden_states_selective_log_softmax_recompute(
         return logps, entropies.reshape(hidden_states.shape[0], hidden_states.shape[1])
     return logps
 pass
+chunked_hidden_states_selective_log_softmax_recompute(None, None, None)
 RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_selective_log_softmax_recompute
 
 def calculate_pad_tokens_in_prompt(
