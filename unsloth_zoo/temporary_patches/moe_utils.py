@@ -1133,15 +1133,12 @@ class _ExpertBiasGather(torch.autograd.Function):
         rows = grad.shape[0]
         if rows <= chunk:
             return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
-        # Every path is a GEMM (no index_add_ atomics), so the grad is reproducible, and each partial sum
-        # stays fp32 until the one final cast: a 16-bit chunk sum can overflow to inf (inf - inf = NaN)
-        # even when the total is finite.
+        # GEMMs only (no index_add_ atomics) for reproducibility; fp32 partials, since 16-bit chunk sums can overflow to inf.
         if torch.compiler.is_compiling():
-            # A Python loop over a symbolic row count would specialize it: one GEMM over every row. Its
-            # one-hot is num_experts / hidden of grad's size, not capped.
+            # A loop over symbolic rows would specialize them: one uncapped GEMM instead.
             return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
         if not _mm_fp32_out_ok(grad):
-            # The fallback upcasts each chunk of grad to fp32: cap that copy too.
+            # The fallback upcasts each grad chunk to fp32: cap that copy too.
             chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(ctx.num_experts, grad.shape[1]))
         out = torch.zeros(ctx.num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
         for start in range(0, rows, chunk):

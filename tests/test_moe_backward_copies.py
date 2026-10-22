@@ -400,7 +400,7 @@ def test_expert_bias_gather_chunks_sum_in_fp32_before_rounding(device, fp32_out,
     ids[-1] = 1
     g = torch.ones(2 * chunk, D, dtype = torch.float16, device = device)
     g[chunk:] = -1
-    g[-1] = 3  # expert 1: one row
+    g[-1] = 3
     bias = torch.zeros(E, D, dtype = torch.float16, device = device, requires_grad = True)
     mu._gather_expert_bias(bias, ids).backward(g)
     want = torch.zeros(E, D, dtype = torch.float64, device = device).index_add_(0, ids, g.double())
@@ -461,7 +461,7 @@ def test_expert_bias_gather_long_backward_is_reproducible(path, dtype, monkeypat
     monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", E * 1024)
     if path == "eager_upcast":
         monkeypatch.setattr(mu, "_MM_OUT_DTYPE", False, raising = False)
-    # Sorted with long runs per expert: the contention pattern where atomic adds reorder.
+    # Long sorted runs per expert: where atomic adds would reorder.
     ids = torch.randint(0, E, (M,), generator = gen).sort().values.cuda()
     g = torch.randn(M, D, generator = gen).to("cuda", dtype)
     base = torch.zeros(M, D, dtype = dtype, device = "cuda")
