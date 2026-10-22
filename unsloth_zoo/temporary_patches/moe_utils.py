@@ -395,7 +395,7 @@ def _grouped_mm_eager(inputs, weight, offsets):
     # every card but an H100; 2.9 falls back internally. Probe is cached: one read.
     if not _grouped_mm_supported_on(inputs.device):
         return _manual_grouped_mm(inputs, weight, offsets)
-    if not _transposed_view_grouped_mm_is_safe():
+    if not _transposed_view_safe_on(inputs.device):
         weight = weight.contiguous()   # view path unproven on this device -> safe copy
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
@@ -1157,6 +1157,18 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
+def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_type, experts_module):
+    """UNSLOTH_MOE_NF4_FUSED grouped GEMM on a frozen NF4 stack; None keeps the dequant path."""
+    if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
+        return None
+    try:
+        from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm
+    except ImportError:
+        return None
+    preprocess = lambda w: preprocess_weight(w, proj_type, hidden_dim, model_type, experts_module = experts_module)
+    return maybe_nf4_grouped_mm(inputs, offsets, source, preprocess)
+
+
 # UNSLOTH_MOE_SELECTIVE_DEQUANT: "auto" = num_rows experts on device (sync-free) if rows <= 7/8 E;
 # "1" = exact routed set (one host sync); "0" = full stack.
 SELECTIVE_DEQUANT_STATS = {"plans": 0, "dequant_calls": 0, "experts_dequantized": 0, "experts_total": 0}
@@ -1523,9 +1535,22 @@ def _grouped_mm_home():
     global _GROUPED_MM_HOME
     if _GROUPED_MM_HOME is None:
         device = _grouped_mm_probe_device()
+        anchored = False
         with _GROUPED_MM_HOME_LOCK:
             if _GROUPED_MM_HOME is None and device is not None and device.index is not None:
                 _GROUPED_MM_HOME = (device.type, device.index)
+                _GROUPED_MM_FOREIGN.setdefault(_GROUPED_MM_HOME, None)
+                anchored = True
+        # Classify the other visible cards now (metadata only, no kernel probe): a traced first use of
+        # another card must not reach the compiler-disabled resolver (graph break / fullgraph error).
+        if anchored:
+            try:
+                count = getattr(torch, device.type).device_count()
+            except Exception:
+                count = 0
+            for i in range(count):
+                if (device.type, i) not in _GROUPED_MM_FOREIGN:
+                    _resolve_grouped_mm_foreign_kind(torch.device(device.type, i), (device.type, i))
     return torch.device(*_GROUPED_MM_HOME) if _GROUPED_MM_HOME is not None else _grouped_mm_probe_device()
 
 
@@ -1571,7 +1596,9 @@ def _check_torch_grouped_mm_supported(device = None):
 
 
 def _grouped_mm_supported_on(device):
-    if _grouped_mm_foreign_kind(device) is None: return _check_torch_grouped_mm_supported()
+    # Absent symbol (torch 2.6/2.7): the traceable definitive negative, no classification.
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_foreign_kind(device) is None:
+        return _check_torch_grouped_mm_supported()
     return _check_torch_grouped_mm_supported(device)
 
 
@@ -1629,9 +1656,15 @@ def _run_grouped_mm_crash_probe(device):
     if torch.cuda.device_count() > 1 and not layered:
         # Child sees only this card; HIP indexes into the inherited mask.
         mask = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
+        mask = (mask or "").strip()
+        if len(mask) >= 2 and mask[0] == mask[-1] == '"': mask = mask[1:-1]
         # clr keeps the first of a repeated entry.
         mask = list(dict.fromkeys(m.strip() for m in mask.split(","))) if mask else None
-        if mask is None or index < len(mask):
+        # Only plain ordinals map token -> logical index (UUIDs alias them); PAL (Windows) enumerates in physical order.
+        plain = mask is None or (
+            all(m.isdigit() for m in mask) and (sys.platform != "win32" or mask == sorted(mask, key = int))
+        )
+        if plain and (mask is None or index < len(mask)):
             visible = mask[index] if mask else str(index)
             index, env = 0, dict(os.environ, HIP_VISIBLE_DEVICES = visible, CUDA_VISIBLE_DEVICES = visible)
     # Not multiprocessing: spawn re-imports the caller's __main__.
@@ -1673,6 +1706,9 @@ def _probe_torch_grouped_mm_supported(device = None):
         if supported is None:
             supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
             _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
+            # Same eager region: a traced first use of this model must not break again on the view check.
+            if supported and kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
+                _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = _transposed_view_probe(device)
         return supported
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
@@ -1701,14 +1737,35 @@ def _transposed_view_grouped_mm_is_safe():
     return _run_probe_eagerly(_probe_transposed_view_grouped_mm_is_safe)
 
 
-def _probe_transposed_view_grouped_mm_is_safe():
+_TRANSPOSED_VIEW_SAFE_BY_KIND = {}
+
+
+def _transposed_view_safe_on(device):
+    """View probe on `device`'s GPU model; the home model keeps the process-wide flag."""
+    if not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is None: return _transposed_view_grouped_mm_is_safe()
+    safe = _TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind)
+    if safe is not None: return safe
+    return _run_probe_eagerly(lambda: _probe_transposed_view_grouped_mm_is_safe(device))
+
+
+def _probe_transposed_view_grouped_mm_is_safe(device = None):
     global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is not None:
+        if kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
+            _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = _transposed_view_probe(device)
+        return _TRANSPOSED_VIEW_SAFE_BY_KIND[kind]
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
         return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    _TRANSPOSED_VIEW_GROUPED_MM_SAFE = _transposed_view_probe(_grouped_mm_home())
+    return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
 
+
+def _transposed_view_probe(device):
     safe = False
     try:
-        device = _grouped_mm_probe_device()
         if _TORCH_GROUPED_MM_AVAILABLE and device is not None and _grouped_mm_survives_out_of_process(device):
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
@@ -1735,8 +1792,6 @@ def _probe_transposed_view_grouped_mm_is_safe():
             safe = ok
     except Exception:
         safe = False   # anything unexpected -> keep the safe contiguous copy
-
-    _TRANSPOSED_VIEW_GROUPED_MM_SAFE = safe
     return safe
 
 
@@ -1858,9 +1913,21 @@ def select_moe_backend_for_interleaved_gate_up():
     """select_moe_backend() for interleaved gate_up (GPT-OSS), which Triton cannot run: grouped_mm, not the loop."""
     # This Unsloth Zoo code section is licensed under AGPL3
     backend = select_moe_backend()
-    if backend == "unsloth_triton" and _check_torch_grouped_mm_supported():
+    if backend in ("unsloth_triton", "sonic_moe") and _check_torch_grouped_mm_supported():
         return "grouped_mm"
     return backend
+
+
+def _check_sonic_moe_available():
+    """Opt-in kernels-community/sonic-moe backend; guarded import."""
+    if os.environ.get("UNSLOTH_DISABLE_MOE_SONIC", "0") == "1":
+        return False
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils_sonic import sonic_moe_available
+        # Probes must not run under Dynamo tracing.
+        return _run_probe_eagerly(sonic_moe_available)
+    except Exception:
+        return False
 
 
 def _select_moe_backend():
@@ -1872,6 +1939,14 @@ def _select_moe_backend():
             return "unsloth_triton"
         if requested == "native_torch":
             return "native_torch"
+        # Opt-in only; still needs torch._grouped_mm for LoRA GEMMs and fallbacks.
+        if (
+            requested == "sonic_moe"
+            and _check_torch_grouped_mm_supported()
+            and _check_sonic_moe_available()
+        ):
+            _log_info("Unsloth: Using MoE backend 'sonic_moe'")
+            return "sonic_moe"
         _log_info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
     if _check_torch_grouped_mm_supported():
@@ -1981,6 +2056,16 @@ def forward_moe_backend(
             return result
 
     backend = select_moe_backend()
+    if backend == "sonic_moe":
+        # Absolute import: this function is copied into unsloth_compiled_cache.
+        forward_sonic_moe = None
+        try:
+            from unsloth_zoo.temporary_patches.moe_utils_sonic import forward_sonic_moe
+        except ImportError:
+            pass
+        if forward_sonic_moe is not None:
+            return forward_sonic_moe(self, hidden_states, top_k_index, top_k_weights)
+        backend = "grouped_mm"
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
     # Triton kernels assume split gate_up, SiLU, no bias: interleaved GPT-OSS gate_up takes the eager loop.
@@ -2142,6 +2227,46 @@ def combine_permuted_moe_outputs(
     if out_dtype is not None:
         combined = combined.to(out_dtype)
     return combined
+
+
+class _RoutedRowGather(torch.autograd.Function):
+    """hidden_states[sorted_indices // top_k] with a fixed-order backward: Inductor lowers the
+    default index_put backward to tl.atomic_add (non-reproducible LoRA grads). An unrolled top_k
+    sum was miscompiled under dynamic shapes (torch 2.13), so do not use it."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, hidden_states, sorted_indices, top_k):
+        ctx.save_for_backward(sorted_indices)
+        ctx.num_tokens = hidden_states.shape[0]
+        ctx.top_k = top_k
+        return hidden_states.index_select(0, sorted_indices // top_k)
+
+    @staticmethod
+    def backward(ctx, grad_rows):
+        (sorted_indices,) = ctx.saved_tensors
+        grad = combine_permuted_moe_outputs(grad_rows, sorted_indices, ctx.num_tokens, ctx.top_k)
+        return grad, None, None
+
+
+# Default from top_k 8 (L4: -55% at k 8, +22% at k 4). Env =1: every top_k > 2, =0: never.
+_DETERMINISTIC_GATHER = os.environ.get("UNSLOTH_MOE_DETERMINISTIC_GATHER", "")
+_DETERMINISTIC_GATHER_MIN_TOP_K = {"1": 3, "0": 1 << 30}.get(_DETERMINISTIC_GATHER, 8)
+
+
+def gather_routed_rows(hidden_states, sorted_indices, top_k):
+    """sorted_indices must be the full argsort from moe_routing_sort. Eager backward is already
+    reproducible, so it keeps plain indexing."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if (
+        top_k >= _DETERMINISTIC_GATHER_MIN_TOP_K
+        and torch.compiler.is_compiling()
+        and hidden_states.requires_grad
+        and torch.is_grad_enabled()
+        and sorted_indices.numel() == hidden_states.shape[0] * top_k
+    ):
+        return _RoutedRowGather.apply(hidden_states, sorted_indices, top_k)
+    return hidden_states[sorted_indices // top_k]
 
 
 def _silu_and_mul(x):
@@ -5115,8 +5240,7 @@ def forward_native_grouped_mm(
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
     num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
-    token_indices = sorted_indices // top_k_index.shape[-1]
-    permuted_input = hidden_states[token_indices]
+    permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
 
     # Gate + Up projection with optional separated LoRA (default).
     use_separated_lora = _should_use_separated_lora()
@@ -5153,6 +5277,8 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype), _gate_up_layout,
             )
         else:
+            mm1_out = _nf4_fused_base_mm(permuted_input, offsets, _gate_up_src, "gate_up", hidden_dim, model_type, self)
+        if _gate_up_layout is None and mm1_out is None:
             _recompute = _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype)
             if _recompute:
                 selective_plan = _selective_dequant_plan(
@@ -5350,6 +5476,8 @@ def forward_native_grouped_mm(
                 _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype), _down_layout,
             )
         else:
+            mm2_out = _nf4_fused_base_mm(inter, offsets, _down_src, "down", hidden_dim, model_type, self)
+        if _down_layout is None and mm2_out is None:
             _recompute = _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype)
             mm2_out = _base_grouped_mm(
                 inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None,
@@ -5452,6 +5580,41 @@ def _experts_are_input_major(module, name, in_dim) -> bool:
     return getattr(module, name).shape[-1] != in_dim
 
 
+TRITON_MOE_COMPUTE_DTYPE_STATS = {"cast": 0, "kept_fp32": 0}
+
+
+def _triton_moe_compute_dtype(module, hidden_states):
+    """bf16 for float32 activations into bf16 experts (matches autocast); float16 is left alone (overflow)."""
+    if hidden_states.dtype != torch.float32:
+        return hidden_states.dtype
+    for name in ("gate_up_proj", "down_proj"):
+        weight = getattr(module, name, None)
+        if not isinstance(weight, torch.Tensor) or weight.dtype != torch.bfloat16:
+            return hidden_states.dtype
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+        return hidden_states.dtype
+    keep = os.environ.get("UNSLOTH_MOE_TRITON_FP32", "0") == "1"
+    # Eager only: Dynamo would recompile on every counter value.
+    if not torch.compiler.is_compiling():
+        TRITON_MOE_COMPUTE_DTYPE_STATS["kept_fp32" if keep else "cast"] += 1
+    return hidden_states.dtype if keep else torch.bfloat16
+
+
+@torch.compiler.disable
+def _moe_weight_dtype_kwargs(tuner, module, name, dtype):
+    """weight_dtype kwarg when expert weights differ from activations (bf16 W, float32 X)."""
+    weight = getattr(module, name, None)
+    weight_dtype = getattr(weight, "dtype", None)
+    if weight_dtype not in (torch.float32, torch.bfloat16, torch.float16) or weight_dtype == dtype:
+        return {}
+    try:
+        if "weight_dtype" not in inspect.signature(tuner).parameters:
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    return {"weight_dtype": weight_dtype}
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -5497,6 +5660,11 @@ def forward_triton_grouped_gemm(
         num_tokens, hidden_dim = hidden_states.shape
 
     top_k = top_k_index.shape[1]
+    compute_dtype = _triton_moe_compute_dtype(self, hidden_states)
+    # The gate_up GEMM reads X in compute_dtype too, as plain bf16 training does: a float32 X runs it in
+    # float32, whose default tile does not fit L4 shared memory. float16 and the FP32 flags keep float32.
+    # LoRA and the routing sum keep the caller's dtype.
+    gemm_hidden_states = hidden_states if hidden_states.dtype == compute_dtype else hidden_states.to(compute_dtype)
 
     # Cache model dims and kernel configs on first call.
     if self._unsloth_moe_configs is None:
@@ -5511,7 +5679,8 @@ def forward_triton_grouped_gemm(
             hidden_dim=hidden_dim,
             intermediate_dim=intermediate_dim,
             top_k=top_k,
-            dtype=hidden_states.dtype,
+            dtype=gemm_hidden_states.dtype,
+            **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "gate_up_proj", gemm_hidden_states.dtype),
         )
 
         # Second GEMM: K = intermediate_dim, N = hidden_dim.
@@ -5520,7 +5689,8 @@ def forward_triton_grouped_gemm(
             hidden_dim=intermediate_dim,
             intermediate_dim=hidden_dim // 2 if hidden_dim % 2 == 0 else hidden_dim,
             top_k=top_k,
-            dtype=hidden_states.dtype,
+            dtype=compute_dtype,
+            **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "down_proj", compute_dtype),
         )
 
         self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)
@@ -5540,7 +5710,7 @@ def forward_triton_grouped_gemm(
 
     # First grouped GEMM: gate_up projection.
     first_gemm_output = grouped_gemm(
-        X=hidden_states,
+        X=gemm_hidden_states,
         W=w1,
         m_sizes=token_counts_by_expert,
         topk=top_k,
@@ -5561,7 +5731,7 @@ def forward_triton_grouped_gemm(
         first_weight, second_weight, scaling = gate_up_lora
         first_weight = first_weight.to(hidden_states.dtype)
         second_weight = second_weight.to(hidden_states.dtype)
-        permuted_hidden = hidden_states[gather_indices // top_k]
+        permuted_hidden = gather_routed_rows(hidden_states, gather_indices, top_k)
         gate_up_lora_delta = _apply_lora_grouped_mm(
             permuted_hidden,
             first_weight,
@@ -5571,6 +5741,9 @@ def forward_triton_grouped_gemm(
             grouped_mm_func=native_moe_grouped_mm,
         )
         first_gemm_output = first_gemm_output + gate_up_lora_delta
+
+    if first_gemm_output.dtype != compute_dtype:
+        first_gemm_output = first_gemm_output.to(compute_dtype)
 
     # Activation + gate*up.
     fused_intermediate = None

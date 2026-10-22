@@ -4302,7 +4302,12 @@ def load_vllm(
         _dtype = torch.bfloat16
     else:
         _dtype = torch.float16
-    if dtype == torch.bfloat16 and _dtype == torch.float16:
+    # XPU runs an explicit bf16 request (emulated if need be), as before the native-bf16 probe.
+    _keep_bf16 = False
+    if DEVICE_TYPE == "xpu":
+        from .device_type import _xpu_keeps_explicit_bf16
+        _keep_bf16 = _xpu_keeps_explicit_bf16()
+    if dtype == torch.bfloat16 and _dtype == torch.float16 and not _keep_bf16:
         print("Unsloth: We switched to dtype = torch.float16 since your GPU does not support torch.bfloat16")
         dtype = torch.float16
     elif dtype is None:
@@ -4311,6 +4316,12 @@ def load_vllm(
     elif dtype == torch.float16 or dtype == torch.bfloat16: pass
     else:
         raise NotImplementedError(f"Unsloth: We do not support dtype = {dtype} yet!")
+    if DEVICE_TYPE == "xpu" and dtype == torch.bfloat16:
+        # Fail early and agree with unsloth's loader rather than raise inside vLLM's engine.
+        from .device_type import _unsloth_follows_vllm_bf16_refusal, _xpu_vllm_refuses_bf16
+        if _xpu_vllm_refuses_bf16() and _unsloth_follows_vllm_bf16_refusal():
+            print("Unsloth: vLLM does not accept torch.bfloat16 on this Intel GPU, so we switched to dtype = torch.float16.")
+            dtype = torch.float16
 
     free_memory, total_memory = get_mem_info()
 

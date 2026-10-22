@@ -271,6 +271,47 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     assert all(r.text == "" or not r.text.startswith(results[0].text + results[1].text) for r in results)  # noqa: E501
 
 
+def _record_widths(monkeypatch, module):
+    widths, call = [], type(module).__call__
+    def recording(self, *args, **kwargs):
+        shown = [v for v in (*args[:1], kwargs.get("inputs"), kwargs.get("inputs_embeds")) if isinstance(v, mx.array) and v.ndim >= 2]
+        widths.append(max((v.shape[1] for v in shown), default=0))
+        return call(self, *args, **kwargs)
+    monkeypatch.setattr(type(module), "__call__", recording)
+    return widths
+
+
+@metal_only
+@pytest.mark.parametrize("vlm", (False, True))
+def test_batch_rows_prefill_in_the_given_step_and_decode_as_a_single_request_would(monkeypatch, vlm):
+    from mlx_lm.sample_utils import make_sampler
+    from unsloth_zoo.mlx.generate import GenerationDefaults, GenerationRequest, generate_batch
+    if vlm:
+        from PIL import Image
+        from mlx_vlm import load, stream_generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+        model, processor = load(VLM_MODEL)
+        model._is_vlm_model, step = True, 16
+        prompt = apply_chat_template(processor, model.config, "Name the colour.", num_images=1)
+        requests = [GenerationRequest(prompt=prompt, image=Image.new("RGB", (64, 64), c), max_tokens=4) for c in ("red", "blue")]
+        sequential = lambda r: stream_generate(model, processor, r.prompt, image=[r.image], max_tokens=4, sampler=make_sampler(temp=0.0), prefill_step_size=step)  # noqa: E731, E501
+        widths = _record_widths(monkeypatch, model.language_model)
+    else:
+        from mlx_lm import load, stream_generate
+        model, processor = load(MODEL)
+        step = 2
+        requests = [GenerationRequest(prompt=p, max_tokens=4) for p in ("The capital of France is", "Two plus two equals")]
+        sequential = lambda r: stream_generate(model, processor, processor.encode(r.prompt, add_special_tokens=False), max_tokens=4, sampler=make_sampler(temp=0.0), prefill_step_size=step)  # noqa: E731, E501
+        widths = _record_widths(monkeypatch, model)
+    generate_batch(model, processor, requests, defaults=GenerationDefaults(max_tokens=4))
+    assert max(widths) > step  # the runtime's own step takes these prompts whole
+    widths.clear()
+    results = generate_batch(model, processor, requests, defaults=GenerationDefaults(max_tokens=4, prefill_step_size=step))
+    assert widths and max(widths) <= step
+    for request, result in zip(requests, results):
+        assert result.token_ids == [int(e.token) for e in sequential(request) if e.finish_reason != "stop"]
+
+
 def _own_copy(value):
     if isinstance(value, mx.array):
         return value + 0

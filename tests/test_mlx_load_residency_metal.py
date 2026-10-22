@@ -5,11 +5,13 @@ one reads PLE rows and experts from the checkpoint instead, computing the stock 
 bit for bit."""
 
 import gc
+import inspect
 import json
 import os
 import sys
 import threading
 import warnings
+import weakref
 
 import numpy as np
 import pytest
@@ -391,8 +393,10 @@ def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
     assert isinstance(glu, OffloadSwitchGLU) and not tree_flatten(model.parameters())
     assert report["layers"] == 1 and report["on_disk_bytes"] == table_bytes
     slots = max(8, int(64 * (1 - fraction)))
+    assert glu._slots.views is not None
     assert glu._slots.capacity == slots and report["resident_bytes"] == table_bytes * slots // 64
-    actual = [glu(*call) for call in calls]
+    # Only a downstream expression of each output is kept, while later calls evict its experts.
+    actual = [glu(*call) * 1 for call in calls]
     actual += [_verifier_steps(glu, *call) for call in calls[5:7]]
     for got, want in zip(actual, expected):
         assert got.shape == want.shape
@@ -434,6 +438,39 @@ def test_offloaded_experts_run_on_another_thread(tmp_path):
         np.testing.assert_array_equal(got, _bits(want))
 
 
+def test_a_request_threads_lazy_output_does_not_fail_the_next(tmp_path):
+    # A prefill drops its last layer's output unevaluated; the next request runs on another thread.
+    stock = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    model = _lazy_copy(lambda: _moe("lm"), str(tmp_path))
+    offload_experts(model, str(tmp_path), 0.75)
+    glu = model.layers[0].switch_mlp
+    calls = _moe_calls(mx.bfloat16)
+    expected = [stock.layers[0].switch_mlp(*call) for call in calls[1:4]]
+    mx.eval(calls, expected)
+    results, errors = [], []
+
+    def run(evaluate, *chosen):
+        try:
+            with mx.stream(mx.new_stream(mx.gpu)):
+                for call in chosen:
+                    out = glu(*call)
+                    if evaluate:
+                        mx.eval(out)
+                        results.append(_bits(out))
+        except Exception as error:
+            errors.append(error)
+
+    misses = []
+    for args in ((False, calls[0]), (True, *calls[1:4])):
+        misses.append(glu._slots.misses)
+        thread = threading.Thread(target = run, args = args)
+        thread.start()
+        thread.join(timeout = 120)
+    assert not errors and len(results) == 3 and glu._slots.misses > misses[1]
+    for got, want in zip(results, expected):
+        np.testing.assert_array_equal(got, _bits(want))
+
+
 @pytest.mark.parametrize("v41", [False, True])
 def test_experts_a_checkpoint_stores_apart(tmp_path, v41):
     # As GLM-5's: one tensor per expert, which mlx-vlm stacks at load; DeepSeek V4.1's, under reference names.
@@ -458,6 +495,203 @@ def test_experts_a_checkpoint_stores_apart(tmp_path, v41):
         np.testing.assert_array_equal(_bits(model.layers[0].switch_mlp(*call)), _bits(stock.layers[0].switch_mlp(*call)))
 
 
+def _qwen3_moe(mlp_only_layers = (), bits = lambda path: 4):
+    qwen3_moe = pytest.importorskip("mlx_lm.models.qwen3_moe")
+    mx.random.seed(0)
+    model = qwen3_moe.Model(qwen3_moe.ModelArgs(
+        model_type = "qwen3_moe", hidden_size = 256, num_hidden_layers = 3, intermediate_size = 256,
+        num_attention_heads = 4, num_experts = 16, num_experts_per_tok = 4, decoder_sparse_step = 1,
+        mlp_only_layers = list(mlp_only_layers), moe_intermediate_size = 64, rms_norm_eps = 1e-6, vocab_size = 512,
+        num_key_value_heads = 2, head_dim = 64, rope_theta = 1e6, tie_word_embeddings = False,
+        max_position_embeddings = 8192, norm_topk_prob = True,
+    ))
+    nn.quantize(model, class_predicate = lambda path, module: (type(module).__name__ == "QuantizedSwitchLinear" or hasattr(module, "num_experts"))
+                and {"group_size": 32, "bits": bits(path)})
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize("apart", [False, True])
+def test_a_wide_prefill_step_runs_layer_by_layer_on_full_tables(tmp_path, monkeypatch, apart):
+    # Runs of adjacent experts read in pieces that end mid-expert.
+    monkeypatch.setattr(zoo_offload, "_RUN_BYTES", 3000)
+    cache_module = pytest.importorskip("mlx_lm.models.cache")
+    tokens = mx.random.randint(0, 512, (1, 2 * 2048 + 5), key = mx.random.key(3))
+    stock = _lazy_copy(_qwen3_moe, str(tmp_path))
+    if apart:  # one tensor per expert, half the experts in each of two shards, with gaps between them
+        stacked = mx.load(str(tmp_path / "model.safetensors"))
+        os.remove(tmp_path / "model.safetensors")
+        for shard in range(2):
+            mx.save_safetensors(str(tmp_path / f"model-{shard}.safetensors"), {
+                name.replace("switch_mlp.", f"experts.{expert}."): value[expert]
+                for name, value in stacked.items() if "switch_mlp." in name for expert in range(shard * 8, shard * 8 + 8)
+            } | ({name: value for name, value in stacked.items() if "switch_mlp." not in name} if shard else {}))
+    expected_cache = cache_module.make_prompt_cache(stock)
+    expected = []
+    copy = lambda c: [_bits(a) if isinstance(a, mx.array) else a for _, a in tree_flatten(c.state)]
+    for start in range(0, tokens.shape[1], 2048):
+        expected.append(stock.model(tokens[:, start:start + 2048], cache = expected_cache))
+        mx.eval(expected[-1], [c.state for c in expected_cache])
+        if start == 0:
+            first = [copy(c) for c in expected_cache]
+        if start == 2048:
+            second = [copy(c) for c in expected_cache]
+
+    model = _qwen3_moe().load_weights(list(tree_flatten(stock.parameters())))
+    offload_experts(model, str(tmp_path), 0.75)
+    switches = [layer.mlp.switch_mlp for layer in model.model.layers]
+    assert all(isinstance(glu, OffloadSwitchGLU) and (glu._slots.fields[0][2].apart is not None) == apart for glu in switches)
+    assert [glu._next for glu in switches] == switches[1:] + [None]
+    # Some experts resident first, which the full tables copy from the slots.
+    mx.eval(model(tokens[:, :3], cache = cache_module.make_prompt_cache(model)))
+    slots = lambda: [(s.misses, s.calls, s.slot_of.tolist(), s.score.tolist()) for s in (glu._slots for glu in switches)]
+    before = slots()
+    assert all(misses for misses, *_ in before)
+    reads, read = [], zoo_offload.read_ranges
+    monkeypatch.setattr(zoo_offload, "read_ranges", lambda jobs: (reads.extend(len(view) for *_, view in jobs), read(jobs)))
+    tables, table = [], OffloadSwitchGLU._table
+    monkeypatch.setattr(OffloadSwitchGLU, "_table", lambda self, spare = None: (made := table(self, spare), tables.append(
+        spare is not None and made[0].down_proj["weight"] is spare["down_proj", "weight"]))[0])
+    cache = cache_module.make_prompt_cache(model)
+    assert zoo_offload.wide_prefill_step(model) == 2048 and zoo_offload.wide_prefill_step(stock) is None
+    # Each layer's cache as a 2048-chunked prefill holds it after two chunks.
+    with zoo_offload.capture_prefill_rows(4096, copy) as captured:
+        hidden = model.model(tokens, cache = cache)
+        mx.eval(hidden, [c.state for c in cache])
+    assert list(captured) == [id(c) for c in cache]
+    # The last layer refilled the first's table, and none is left spare.
+    assert tables == [False, False, True] and all(glu._spare is None for glu in switches)
+    # Each missing expert read once; adjacent experts of a stacked tensor merged, never those stored apart.
+    missing = [(glu._slots.slot_of < 0).sum() for glu in switches]
+    rows = [field.row_bytes for _, _, field in switches[0]._slots.fields]
+    assert max(reads) <= 3000 and sum(reads) == sum(missing) * sum(rows)
+    unmerged = sum(missing) * sum(-(-row // 3000) for row in rows)
+    assert len(reads) == unmerged if apart else len(reads) < unmerged
+    # Every expert came from a full table: the slots decode uses were left alone.
+    assert slots() == before
+    assert all(glu._ahead is None and glu._full is None for glu in switches)
+    np.testing.assert_array_equal(_bits(hidden), _bits(mx.concatenate(expected, axis = 1)))
+    for (_, got), (_, want) in zip(tree_flatten([c.state for c in cache]), tree_flatten([c.state for c in expected_cache]), strict = True):
+        np.testing.assert_array_equal(*(_bits(a) if isinstance(a, mx.array) else a for a in (got, want)))
+    step = tokens[:, -1:]
+    with zoo_offload.capture_prefill_rows(2048, copy) as narrow:
+        np.testing.assert_array_equal(_bits(model(step, cache = cache)), _bits(stock(step, cache = expected_cache)))
+    assert not narrow
+    # A call no wider than a step runs whole and fills a request it ends at.
+    with zoo_offload.capture_prefill_rows(2048, copy) as short:
+        mx.eval(model.model(tokens[:, :2048], cache = cache_module.make_prompt_cache(model)))
+    for request, want in ((captured, second), (short, first)):
+        assert len(request) == len(cache)
+        for got, held in zip(request.values(), want, strict = True):
+            assert all(np.array_equal(a, b) for a, b in zip(got, held, strict = True))
+    # Without a causal mask the layer attends to the whole call, which consecutive steps cannot.
+    x = stock.model.embed_tokens(tokens)
+    layers = (model.model.layers[0], stock.model.layers[0])
+    full = mx.ones((x.shape[1], x.shape[1]), dtype = mx.bool_)
+    monkeypatch.setattr(type(layers[0]), "_wide_masks", (None, "causal"))
+    rotating = lambda: cache_module.RotatingKVCache(2048)
+    scores = rotating().make_mask(x.shape[1], return_array = False, window_size = None).astype(mx.float32)  # additive, not kept
+    for mask, cache in ((None, cache_module.KVCache), (full, cache_module.KVCache), (full, rotating), (scores, rotating)):
+        got, want = (layer(x, mask, cache()) for layer in layers)
+        np.testing.assert_array_equal(_bits(got), _bits(want))
+    monkeypatch.setattr(model.model.layers[-1], "__class__", type(stock.model.layers[-1]))
+    monkeypatch.setattr(model.model.layers[-1], "mlp", stock.model.layers[-1].mlp)
+    assert zoo_offload.wide_prefill_step(model) is None  # an unwidened layer runs a call whole
+
+
+def test_a_failed_wide_pass_leaves_no_table_behind(tmp_path, monkeypatch):
+    model = _qwen3_moe().load_weights(list(tree_flatten(_lazy_copy(_qwen3_moe, str(tmp_path)).parameters())))
+    offload_experts(model, str(tmp_path), 0.75)
+    switches = [layer.mlp.switch_mlp for layer in model.model.layers]
+    for glu in switches[:2]:  # a pass aborted after the second layer: the third holds its read-ahead
+        assert glu._wide(read_next = True)
+        glu._narrow()
+    assert switches[2]._ahead is not None
+    table = OffloadSwitchGLU._table
+
+    def fail(self, spare = None):
+        if self is switches[1]:
+            raise MemoryError
+        return table(self, spare)
+
+    monkeypatch.setattr(OffloadSwitchGLU, "_table", fail)
+    with pytest.raises(MemoryError):
+        switches[0]._wide(read_next = True)
+    # The retry dropped the stale read-ahead, and its failed read-ahead left the first layer on its slots.
+    assert switches[2]._ahead is None and switches[0]._full is None
+
+
+@pytest.mark.parametrize("window", [None, 2048])  # a rotating cache past its window masks with an array
+def test_a_layer_without_a_table_steps_on_its_slots(tmp_path, monkeypatch, window):
+    cache_module = pytest.importorskip("mlx_lm.models.cache")
+    tokens = mx.random.randint(0, 512, (1, 2 * 2048 + 5), key = mx.random.key(4))
+    stock = _lazy_copy(lambda: _qwen3_moe([0]), str(tmp_path))
+    expected_cache = cache_module.make_prompt_cache(stock, max_kv_size = window)
+    expected = [stock.model(tokens[:, i:i + 2048], cache = expected_cache) for i in range(0, tokens.shape[1], 2048)]
+    model = _qwen3_moe([0]).load_weights(list(tree_flatten(stock.parameters())))
+    offload_experts(model, str(tmp_path), 0.75)
+    dense, cast, _ = model.model.layers
+    assert isinstance(dense, zoo_offload._WideLayer) and dense._offload_switch is None
+    assert zoo_offload.wide_prefill_step(model) == 2048
+    monkeypatch.setattr(cast.mlp.switch_mlp, "_table", lambda spare = None: None)
+    cache = cache_module.make_prompt_cache(model, max_kv_size = window)
+    np.testing.assert_array_equal(_bits(model.model(tokens, cache = cache)), _bits(mx.concatenate(expected, axis = 1)))
+    for (_, got), (_, want) in zip(tree_flatten([c.state for c in cache]), tree_flatten([c.state for c in expected_cache]), strict = True):
+        np.testing.assert_array_equal(*(_bits(a) if isinstance(a, mx.array) else a for a in (got, want)))
+
+
+def test_every_wide_layer_still_takes_its_token_arguments():
+    for name, (axes, _) in zoo_offload._WIDE_LAYERS.items():
+        module, _, layer = name.rpartition(".")
+        assert {*axes, "cache"} <= set(inspect.signature(getattr(pytest.importorskip(module), layer).__call__).parameters), name
+    assert zoo_offload._cache_mask(pytest.importorskip("mlx_lm.models.cache").ArraysCache(2), 4097) is None
+    rotary = zoo_offload._token_slice(tuple(mx.arange(6).reshape(1, 6, 1) + shift for shift in (0, 10)), -2, 2, 4)
+    assert [part.tolist() for part in rotary] == [[[[2], [3]]], [[[12], [13]]]]
+
+
+def test_a_spare_table_of_another_layout_is_gone_before_the_next_is_made(tmp_path, monkeypatch):
+    build = lambda: _qwen3_moe(bits = lambda path: 4 if ".layers.0." in path else 8)
+    model = build().load_weights(list(tree_flatten(_lazy_copy(build, str(tmp_path)).parameters())))
+    offload_experts(model, str(tmp_path), 0.75)
+    alive, made, table = [], [], OffloadSwitchGLU._table
+
+    def spy(self, spare = None):
+        gc.collect()
+        alive.append(sum(ref() is not None for ref in made))
+        out = table(self, spare)
+        made.append(weakref.ref(out[0].down_proj["weight"]))
+        return out
+
+    monkeypatch.setattr(OffloadSwitchGLU, "_table", spy)
+    tokens = mx.random.randint(0, 512, (1, 2 * 2048 + 5), key = mx.random.key(3))
+    mx.eval(model.model(tokens, cache = pytest.importorskip("mlx_lm.models.cache").make_prompt_cache(model)))
+    # The 4-bit first layer's table fits neither 8-bit layer: two tables at most, as without reuse.
+    assert alive == [0, 1, 1]
+    alive.clear()
+    switches = [layer.mlp.switch_mlp for layer in model.model.layers]
+    switches[0]._wide(read_next = True)
+    switches[0]._narrow()
+    # A pass aborted after the first layer left the second its read-ahead and a spare: its retry holds neither.
+    switches[0]._wide(read_next = True)
+    assert alive == [0, 1, 0, 1]
+
+
+def test_deepseek_v4_blocks_prefill_layer_by_layer(tmp_path):
+    v4 = pytest.importorskip("mlx_vlm.models.deepseek_v4.deepseek_v4")
+    lm = v4.Model(v4.ModelConfig(vocab_size = 512, hidden_size = 512, moe_intermediate_size = 64, num_hidden_layers = 4, n_routed_experts = 16, head_dim = 64,
+        num_attention_heads = 4, q_lora_rank = 64, qk_rope_head_dim = 32, compress_ratios = [0, 4, 128, 0], o_groups = 2, o_lora_rank = 32, index_topk = 64)).language_model.eval()
+    # Hash-routed blocks pick experts by token id: distinct ids, distinct experts.
+    lm.load_weights([(f"model.layers.{i}.ffn.gate.tid2eid", mx.argsort(mx.random.uniform(shape = (512, 16)), axis = -1)[:, :6]) for i in range(3)], strict = False)
+    nn.quantize(lm, group_size = 32, bits = 4, class_predicate = lambda _, module: type(module).__name__ == "SwitchLinear")
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), dict(tree_flatten(lm.parameters())))
+    tokens = mx.random.randint(0, 512, (1, 2 * 2048 + 5), key = mx.random.key(3))
+    expected = [lm.model(tokens[:, i:i + 2048], cache = cache, skip_final_norm = True) for cache in [lm.make_cache()] for i in range(0, tokens.shape[1], 2048)]
+    offload_experts(lm, str(tmp_path), 0.75)
+    assert zoo_offload.wide_prefill_step(lm) is None  # a call with image rows runs whole
+    np.testing.assert_array_equal(_bits(lm.model(tokens, cache = lm.make_cache(), skip_final_norm = True)), _bits(mx.concatenate(expected, axis = 1)))
+    assert [block.ffn.switch_mlp._slots.misses for block in lm.model.layers] == [0] * 4  # full tables, the slots untouched
+
+
 def test_offloaded_experts_are_never_loaded(tmp_path):
     model = _lazy_copy(lambda: _moe("lm", hidden = 512), str(tmp_path))
     table_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
@@ -476,6 +710,7 @@ def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
     offloaded = _lazy_copy(lambda: _moe("vlm", scales = mx.float16, eval = False), str(tmp_path))
     _convert_mlx_dtype(stock, mx.bfloat16)
     offload_experts(offloaded, str(tmp_path), 0.75, cast_dtype = mx.bfloat16)
+    assert offloaded.layers[0].switch_mlp._slots.views is None
     stock.eval()
     offloaded.eval()
     for x, indices in _moe_calls(mx.bfloat16)[::2]:
@@ -483,6 +718,15 @@ def test_offloaded_expert_floats_get_the_load_cast(tmp_path):
         actual = offloaded.layers[0].switch_mlp(x, indices)
         assert actual.dtype == expected.dtype == mx.bfloat16
         np.testing.assert_array_equal(_bits(actual), _bits(expected))
+    assert not offloaded.layers[0].switch_mlp._slots.readers
+
+
+def test_slot_readers_kept_are_bounded_in_bytes(monkeypatch):
+    monkeypatch.setattr(zoo_offload, "_PENDING_BYTES", 1000)
+    slots = zoo_offload._ExpertSlots([], 4, 2)
+    for _ in range(3):
+        slots.read_by(mx.zeros((100,), dtype = mx.float32) + 1)
+    assert len(slots.readers) == 0
 
 
 def test_concurrent_offloaded_loads_restore_the_cache_limit(monkeypatch):

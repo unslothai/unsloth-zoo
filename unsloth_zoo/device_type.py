@@ -37,6 +37,7 @@ import inspect
 import os
 import re
 import shutil
+import sys
 import subprocess
 import urllib.request
 
@@ -610,9 +611,56 @@ def device_empty_cache():
             torch.npu.empty_cache()
 pass
 
+# unsloth reads this: an explicit bf16 load on XPU stays bf16 only where vLLM keeps it too.
+XPU_KEEPS_EXPLICIT_BF16 = True
+
+
+def _xpu_keeps_explicit_bf16():
+    """An explicit bf16 request on XPU stays bf16 (emulated if need be), unless an older unsloth
+    loading the same model downgrades it to fp16: then vLLM must too, or the shared weights split."""
+    unsloth_device_type = sys.modules.get("unsloth.device_type")
+    return unsloth_device_type is None or hasattr(unsloth_device_type, "xpu_keeps_explicit_bf16")
+pass
+
+def _unsloth_follows_vllm_bf16_refusal():
+    """The loaded unsloth (if any) also loads fp16 when vLLM refuses bf16, so the shared weights agree.
+    An older unsloth keeps bf16 on the Hugging Face side: then vLLM keeps it too and refuses as before."""
+    unsloth_device_type = sys.modules.get("unsloth.device_type")
+    return unsloth_device_type is None or hasattr(unsloth_device_type, "xpu_vllm_refuses_bf16")
+pass
+
+def _xpu_vllm_refuses_bf16():
+    """True when the installed vLLM's own platform check refuses bf16 on this XPU (Arc A770, for a
+    known accuracy issue). Older vLLM without the hook, or any other failure, refuses nothing."""
+    try:
+        from vllm.platforms import current_platform
+        check = getattr(current_platform, "check_if_supports_dtype", None)
+        if check is None:
+            return False
+        check(torch.bfloat16)
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+pass
+
 def _xpu_bf16_supported():
-    """is_bf16_supported() counts emulation. Without libocloc (absent in torch-xpu wheels) every SYCL
-    aspect reads False, so trust has_bfloat16_conversions only once some aspect reads True."""
+    """is_bf16_supported() counts emulation. Process-wide like CUDA: any visible XPU proven to lack
+    native bf16 turns it off, since neither the load target nor vLLM's device is known here. Each
+    device is judged by its own aspects: without libocloc (absent in torch-xpu wheels) every SYCL
+    aspect reads False, so trust has_bfloat16_conversions only once some aspect reads True there."""
+    # Beside unsloth, give its answer so loading and training agree whatever the two versions:
+    # an older unsloth still answers bf16 on XPU.
+    unsloth_device_type = sys.modules.get("unsloth.device_type")
+    if unsloth_device_type is not None:
+        core_answer = getattr(unsloth_device_type, "xpu_supports_native_bf16", None)
+        if core_answer is None:
+            return True
+        try:
+            return bool(core_answer())
+        except Exception:
+            pass
     aspects = (
         "has_bfloat16_conversions",
         "has_subgroup_matrix_multiply_accumulate",
@@ -623,15 +671,15 @@ def _xpu_bf16_supported():
         count = torch.xpu.device_count()
     except Exception:
         return True
-    lacks_bf16 = probe_works = False
     for index in range(count):
         try:
             props = torch.xpu.get_device_properties(index)
         except Exception:
             continue
-        lacks_bf16 |= getattr(props, "has_bfloat16_conversions", True) is False
-        probe_works |= any(getattr(props, name, False) is True for name in aspects)
-    return not (lacks_bf16 and probe_works)
+        lacks_bf16 = getattr(props, "has_bfloat16_conversions", True) is False
+        if lacks_bf16 and any(getattr(props, name, False) is True for name in aspects):
+            return False
+    return True
 pass
 
 def _apple_bf16_supported():

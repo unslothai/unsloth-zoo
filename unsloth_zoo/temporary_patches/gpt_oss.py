@@ -40,6 +40,11 @@ from .common import (
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
+try:
+    from .moe_router_triton import fused_route_or_none as _fused_route_or_none
+except Exception:
+    def _fused_route_or_none(*args, **kwargs):
+        return None
 from .gpt_oss_routed import ROUTED_MAX_SLOTS, prepare_routed_experts, routed_experts_forward, routed_mlp_forward
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
@@ -1156,8 +1161,12 @@ class GptOssTopKRouter(nn.Module):
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+        fused = _fused_route_or_none(router_logits, self.top_k, "topk_softmax")
+        if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+            router_top_value, router_indices = fused[0].to(router_logits.dtype), fused[1]
+        else:
+            router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+            router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
         router_scores = torch.zeros_like(router_logits, dtype=router_logits.dtype).scatter_(1, router_indices, router_top_value)
         if transformers_version >= Version("5.0.0"):
             return router_logits, router_scores, router_indices
@@ -1501,9 +1510,13 @@ class GptOssTopKRouterBnb4bit(nn.Module):
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = torch.nn.functional.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
         dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+        fused = _fused_route_or_none(router_logits, self.top_k, "topk_softmax")
+        if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+            router_top_value, router_indices = fused[0].to(dtype), fused[1]
+        else:
+            router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
+            router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
         router_scores = torch.zeros_like(router_logits, dtype=dtype).scatter_(1, router_indices, router_top_value)
         if transformers_version >= Version("5.0.0"):
             return router_logits, router_scores, router_indices

@@ -53,7 +53,8 @@ class _Experts(nn.Module):
 
 @pytest.fixture(autouse = True)
 def _env(monkeypatch):
-    for key in ("UNSLOTH_MOE_SELECTIVE_DEQUANT", "UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "UNSLOTH_MOE_RECOMPUTE"):
+    # These pin the dequant path they test: the fused NF4 GEMM (UNSLOTH_MOE_NF4_FUSED) dequantizes nothing.
+    for key in ("UNSLOTH_MOE_SELECTIVE_DEQUANT", "UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "UNSLOTH_MOE_RECOMPUTE", "UNSLOTH_MOE_NF4_FUSED"):
         monkeypatch.delenv(key, raising = False)
     if DEVICE == "cpu":
         monkeypatch.setattr(mu, "_check_torch_grouped_mm_supported", lambda: True)

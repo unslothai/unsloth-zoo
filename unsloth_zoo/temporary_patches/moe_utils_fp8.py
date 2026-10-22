@@ -690,10 +690,9 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
 
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.view(-1, hidden_dim)
-    from .moe_utils import moe_routing_sort
+    from .moe_utils import gather_routed_rows, moe_routing_sort
     num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
-    token_indices = sorted_indices // top_k_index.shape[-1]
-    permuted_input = hidden_states[token_indices]
+    permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
     from .moe_utils import (
         _should_use_separated_lora,
         combine_permuted_moe_outputs,
