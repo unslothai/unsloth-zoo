@@ -5868,7 +5868,9 @@ def _patch_torch_dtype_modules(
                 import re as _re
                 m = _re.search(r"def forward\(self,\s*(\w+)", source)
                 param_name = m.group(1) if m else "input"
-                if disable:
+                # F.batch_norm has no autocast rule, so a float32 input against a bfloat16 weight
+                # (Canary's conformer under QLoRA) raises compiled too; matching dtypes make the cast a no-op.
+                if disable or module.startswith("BatchNorm"):
                     # Eager F.layer_norm needs input dtype == weight dtype: cast in
                     # and out. Compiled path left untouched (adding the cast there
                     # changes batched numerics). weight is None when affine=False.
