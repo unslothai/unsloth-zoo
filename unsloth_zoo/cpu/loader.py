@@ -174,8 +174,8 @@ class FastCPUModel:
         if getattr(model.config, "pad_token_id", None) is None:
             model.config.pad_token_id = tokenizer.pad_token_id
 
-        if use_4bit:
-            _disable_bnb_cpu_weight_packing(model)
+        # Also for a checkpoint that ships its own 4-bit quantization_config.
+        _disable_bnb_cpu_weight_packing(model)
         model.max_seq_length = max_seq_length
         model._unsloth_cpu_gradient_checkpointing = use_gradient_checkpointing
         if full_finetuning:
@@ -254,6 +254,7 @@ class FastCPUModel:
             use_rslora = use_rslora,
             modules_to_save = modules_to_save,
             init_lora_weights = init_lora_weights,
+            **({"loftq_config": loftq_config} if loftq_config is not None else {}),
             task_type = "CAUSAL_LM",
             **kwargs,
         )

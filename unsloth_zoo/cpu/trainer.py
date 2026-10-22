@@ -102,14 +102,15 @@ def _patch_sft_compute_loss(sft_trainer_cls):
         if chunked is None:
             return original(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch, **kwargs)
         if str(_name(getattr(self.args, "loss_type", None) or "nll")) != "nll":
-            # TRL's other SFT objectives (dft, ...) weight per-token logits, so run the stock forward.
-            chunked._unsloth_cpu_chunked_ce_active = False
-            try:
-                return original(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch, **kwargs)
-            finally:
-                chunked._unsloth_cpu_chunked_ce_active = True
+            # TRL's other SFT objectives (dft, ...) weight per-token logits: stock forward.
+            return original(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch, **kwargs)
+        # Only this SFT step turns the chunked loss on; DPO / KTO / ORPO and plain forwards keep logits.
         inputs["use_cache"] = False
-        return Trainer.compute_loss(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch)
+        chunked._unsloth_cpu_chunked_ce_active = True
+        try:
+            return Trainer.compute_loss(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch)
+        finally:
+            chunked._unsloth_cpu_chunked_ce_active = False
 
     compute_loss._unsloth_cpu = True
     sft_trainer_cls.compute_loss = compute_loss

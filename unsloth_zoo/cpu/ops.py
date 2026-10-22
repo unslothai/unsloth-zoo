@@ -168,7 +168,7 @@ def patch_chunked_causal_lm_loss(model):
         shift_labels = kwargs.pop("shift_labels", None)
         head_weight = _plain_head_weight(self.get_output_embeddings())
         if (labels is None and shift_labels is None) or not torch.is_grad_enabled() \
-                or not getattr(self, "_unsloth_cpu_chunked_ce_active", True) or head_weight is None:
+                or not getattr(self, "_unsloth_cpu_chunked_ce_active", False) or head_weight is None:
             if shift_labels is not None:
                 kwargs["shift_labels"] = shift_labels
             return original_forward(

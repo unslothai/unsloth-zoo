@@ -500,7 +500,10 @@ def cpu_backend_allowed():
         return True
     if _detect_amd_rocm_runtime():
         return False
-    if os.path.exists("/proc/driver/nvidia/version") or shutil.which("nvidia-smi") is not None:
+    # Linux: the loaded kernel driver, not a stray nvidia-smi in a CPU container image.
+    if os.path.exists("/proc/driver/nvidia/version") or (
+        not sys.platform.startswith("linux") and shutil.which("nvidia-smi") is not None
+    ):
         return False
     return True
 
