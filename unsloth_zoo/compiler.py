@@ -3226,7 +3226,12 @@ pass
 
 
 def mask_attention_mask_out(labels = None, attention_mask = None):
-    if labels is not None and attention_mask is not None:
+    # Only a mask over the labels' own positions: MusicGen's attention_mask is the text encoder's,
+    # while its labels are decoder codebook frames.
+    if (
+        labels is not None and attention_mask is not None
+        and tuple(attention_mask.shape) == tuple(labels.shape[:attention_mask.dim()])
+    ):
         attention_mask = attention_mask.to(device = labels.device)
         labels[attention_mask == 0] = -100
     return labels
