@@ -41,3 +41,9 @@ def test_text_encoder_mask_leaves_musicgen_codebook_labels_alone():
     labels = torch.randint(0, 10, (2, 50, 4))  # decoder frames x codebooks
     out = _helper()(labels.clone(), torch.ones(2, 7, dtype = torch.long))  # text encoder mask
     assert torch.equal(out, labels)
+
+
+def test_codebook_labels_are_left_alone_even_when_lengths_match():
+    labels = torch.randint(0, 10, (2, 7, 4))  # 7 decoder frames, 7 text tokens: same length, other modality
+    mask = torch.tensor([[1] * 7, [1] * 5 + [0] * 2])
+    assert torch.equal(_helper()(labels.clone(), mask), labels)

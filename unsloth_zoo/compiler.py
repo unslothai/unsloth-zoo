@@ -3230,7 +3230,7 @@ def mask_attention_mask_out(labels = None, attention_mask = None):
     # while its labels are decoder codebook frames.
     if (
         labels is not None and attention_mask is not None
-        and tuple(attention_mask.shape) == tuple(labels.shape[:attention_mask.dim()])
+        and tuple(attention_mask.shape) == tuple(labels.shape)
     ):
         attention_mask = attention_mask.to(device = labels.device)
         labels[attention_mask == 0] = -100
