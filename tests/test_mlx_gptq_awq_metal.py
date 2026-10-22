@@ -26,7 +26,7 @@ try:
     import mlx.core as mx
     _METAL = mx.metal.is_available()
 except Exception:
-    pytest.skip("requires mlx", allow_module_level=True)
+    pytest.skip("real GPTQ/AWQ loads need mlx + mlx-lm (Apple Silicon only)", allow_module_level=True)
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 
 GPTQ_MODEL = "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4"

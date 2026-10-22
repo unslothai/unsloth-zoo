@@ -53,8 +53,10 @@ def _ensure_bitsandbytes_importable():
 
 
 @pytest.fixture(autouse=True)
-def _install_shim(monkeypatch):
+def _install_shim(monkeypatch, tmp_path):
     import sys
+    # Scratch checkpoints from direct _materialize calls land in tmp_path, not the shared TMPDIR.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     # Per test, through monkeypatch: conftest checks these entries are restored after every test.
     for name in ("bitsandbytes", "bitsandbytes.nn", "bitsandbytes.functional"):
         if name in sys.modules:
