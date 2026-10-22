@@ -101,8 +101,7 @@ try:
     # Largest dense mask (bool elements) built eagerly; above it the compiled builder keeps memory O(blocks).
     _EAGER_BLOCK_MASK_MAX_ELEMENTS = 1 << 27
 
-    # torch 2.10's dynamic create_block_mask graph miscompiles one-block lengths; 2.13 and 2.14 do not
-    # (2.11 / 2.12 untested, so they keep the workaround). Fixed versions keep the O(blocks) builder.
+    # Fixed in 2.13 / 2.14; 2.11 / 2.12 untested, so they keep the workaround.
     _ONE_BLOCK_MISCOMPILE = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 13)
 
     def _compile_block_mask(bsz, head, M, N):
@@ -115,8 +114,7 @@ try:
         padded = -(-M // blk) * blk * (-(-N // blk) * blk)
         return (bsz or 1) * (head or 1) * padded > _EAGER_BLOCK_MASK_MAX_ELEMENTS
 
-    # An enclosing torch.compile would trace _compile=False into its own graph and hit the same
-    # miscompile, so the eager build runs outside it (a graph break, only on affected versions).
+    # Keep the eager build out of an enclosing torch.compile graph, which would hit the same miscompile.
     @torch.compiler.disable
     def _eager_create_block_mask(mask_mod, bsz, head, M, N, device):
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = False)
