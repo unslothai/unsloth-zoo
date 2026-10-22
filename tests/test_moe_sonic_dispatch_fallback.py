@@ -196,3 +196,28 @@ def test_qwen3_vl_moe_experts_forward(monkeypatch, selected, backend, expected):
     Q.patch_qwen3_vl_moe()
     experts_cls.forward(_Experts(), *_inputs())
     assert calls == [expected]
+
+
+def test_without_sonic_takes_the_loop_on_a_card_without_grouped_mm(monkeypatch):
+    # Mixed host: sonic_moe was selected on a grouped_mm card, the expert runs on one without it.
+    monkeypatch.setattr(M, "select_moe_backend", lambda: "sonic_moe")
+    monkeypatch.setattr(M, "_check_torch_grouped_mm_supported", lambda device = None: False)
+    assert M.select_moe_backend_without_sonic(torch.device("cuda", 1)) == "native_torch"
+    assert M.select_moe_backend_without_sonic(torch.device("cpu")) == "grouped_mm"
+    monkeypatch.setattr(M, "_check_torch_grouped_mm_supported", lambda device = None: True)
+    assert M.select_moe_backend_without_sonic(torch.device("cuda", 1)) == "grouped_mm"
+
+
+def test_compiled_qwen3_vl_moe_sonic_forward_resolves_dispatcher(tmp_path, monkeypatch):
+    # The Qwen3-VL experts forward is copied into the compiled cache: forward_sonic_moe must be imported.
+    from unsloth_zoo import compiler
+    from unsloth_zoo.temporary_patches import moe_utils_sonic
+
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path))
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+    source = "def _probe(self, x):\n    return forward_sonic_moe(self, x, None, None)\n"
+    module = compiler.create_new_function(
+        "UnslothSonicDispatchImportProbe", source,
+        "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe", [], overwrite = True,
+    )
+    assert module.forward_sonic_moe is moe_utils_sonic.forward_sonic_moe

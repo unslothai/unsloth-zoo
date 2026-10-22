@@ -386,7 +386,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 
     # Same recompute-vs-pin policy as forward_native_grouped_mm; recompute keeps the packed Params4bit.
     if (
-        select_moe_backend_without_sonic() == "grouped_mm"
+        select_moe_backend_without_sonic(hidden_states.device) == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)
         and _is_bnb4bit_param(self.down_proj)
         and _moe_recompute_enabled(self.gate_up_proj, dtype=target_dtype)
@@ -400,7 +400,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
     if gate_up_weight is None or down_weight is None:
         return None  # not bnb4bit (mixed state) — fall through to caller
 
-    backend = select_moe_backend_without_sonic()
+    backend = select_moe_backend_without_sonic(hidden_states.device)
     if backend == "grouped_mm":
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-grouped_mm.")
         forward_fn = forward_native_grouped_mm

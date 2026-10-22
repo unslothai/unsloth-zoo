@@ -2168,6 +2168,14 @@ def create_new_function(
             "except Exception:\n"
             "    pass\n"
         )
+    if "forward_sonic_moe" in new_source:
+        # The patched Qwen3-VL-MoE expert forward on the sonic_moe backend.
+        imports += (
+            "try:\n"
+            "    from unsloth_zoo.temporary_patches.moe_utils_sonic import forward_sonic_moe\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
     if "_bnb4bit_experts_forward_or_none" in new_source:
         # The patched Qwen3-VL-MoE expert forwards call it first, before any weight check.
         imports += "from unsloth_zoo.temporary_patches.qwen3_vl_moe import _bnb4bit_experts_forward_or_none\n"
