@@ -147,6 +147,12 @@ def lm_head_on_old_cuda_arch(weight):
     return device is not None and device.type == "cuda" and device.index in OLD_CUDA_ARCH_INDICES
 pass
 
+# AST-rewritten forwards and the import hook reach the CE kernel through the shared adapter, not
+# the regex templates; it asks the same question. fused_losses never imports this module.
+from unsloth_zoo.fused_losses import forward_adapter as _forward_adapter
+_forward_adapter.lm_head_on_old_cuda_arch = lm_head_on_old_cuda_arch
+del _forward_adapter
+
 OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
 
 # Check if Unsloth Studio is allowed

@@ -37,6 +37,12 @@ from .cross_entropy_loss import unsloth_fsdp_unshard, unsloth_fused_ce_loss
 EMPTY_LOGITS = torch.empty(0)
 
 
+def lm_head_on_old_cuda_arch(weight):
+    """Replaced by unsloth_zoo.compiler.lm_head_on_old_cuda_arch when the compiler imports (it owns
+    the visible pre-Turing card set). Until then, and on hosts without such a card, always False."""
+    return False
+
+
 def unsloth_fused_lm_head_loss(
     hidden_states,
     lm_head,
@@ -85,6 +91,11 @@ def unsloth_fused_lm_head_loss(
     accelerator_scaler = kwargs.pop("accelerator_scaler", None)
     if kwargs.get("scaling", None) is None and accelerator_scaler is not None:
         kwargs["scaling"] = accelerator_scaler
+
+    # A head a device_map put on a pre-Turing card keeps the chunked loss without Inductor, as the
+    # regex templates do. An empty-set read on hosts without one; an explicit False stays False.
+    if kwargs.get("torch_compile", True) and lm_head_on_old_cuda_arch(lm_head.weight):
+        kwargs["torch_compile"] = False
 
     unsloth_fsdp_unshard(lm_head)
     loss = unsloth_fused_ce_loss(

@@ -233,6 +233,68 @@ def test_the_fused_lm_head_templates_consult_the_head_device():
     assert "from unsloth_zoo.compiler import lm_head_on_old_cuda_arch" in compiler._disabled_sdpa_code
 
 
+
+def _adapter_dispatch(monkeypatch, device, **kwargs):
+    """torch_compile the shared adapter hands the CE kernel for an LM head on `device`."""
+    from unsloth_zoo.fused_losses import forward_adapter as adapter
+    from unsloth_zoo.fused_losses import cross_entropy_loss as ce
+    seen = []
+
+    def spy(**call):
+        bound = inspect.signature(ce.unsloth_fused_ce_loss).bind(**call)
+        bound.apply_defaults()
+        seen.append(bound.arguments["torch_compile"])
+        return 1.0
+
+    monkeypatch.setattr(adapter, "unsloth_fused_ce_loss", spy)
+    monkeypatch.setattr(adapter, "unsloth_fsdp_unshard", lambda head: None)
+    head = types.SimpleNamespace(weight = types.SimpleNamespace(device = device))
+    adapter.unsloth_fused_lm_head_loss(None, head, None, **kwargs)
+    return seen[0]
+
+
+def test_the_shared_adapter_skips_inductor_for_a_head_on_an_old_card(monkeypatch):
+    # AST-rewritten forwards (GPT-Neo, CLVP, ...) and the import hook call the adapter, not the
+    # regex templates: it must ask the same per-head question, or a head a device_map put on a
+    # Pascal card beside the current A100 still asks Inductor for the chunked CE.
+    import unsloth_zoo.compiler as compiler
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset({1}))
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 1)) is False
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 1), torch_compile = True) is False
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 0)) is True
+    # An explicit disable is never turned back on.
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 0), torch_compile = False) is False
+    # One-GPU and homogeneous hosts: no old card, the default is untouched.
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset())
+    assert _adapter_dispatch(monkeypatch, torch.device("cuda", 1)) is True
+
+
+def test_ast_rewritten_lm_head_forwards_go_through_the_guarded_adapter():
+    # The route the regex templates cannot take: real HF forwards whose fused call is spliced
+    # by the AST rewriter. It must call the adapter (which holds the per-head gate) and not pass
+    # a torch_compile of its own that would bypass it.
+    import importlib
+    import textwrap
+    import unsloth_zoo.compiler as compiler
+    rewritten = []
+    for name, cls_name in [("opt", "OPTForCausalLM"), ("biogpt", "BioGptForCausalLM"),
+                           ("xglm", "XGLMForCausalLM"), ("clvp", "ClvpForCausalLM"),
+                           ("gpt_neo", "GPTNeoForCausalLM")]:
+        try:
+            module = importlib.import_module(f"transformers.models.{name}.modeling_{name}")
+            cls = getattr(module, cls_name)
+            source = textwrap.dedent(inspect.getsource(cls.forward))
+        except Exception:
+            continue
+        new, route, _ = compiler.fused_lm_head_forward(cls_name, cls, cls.__module__, source)
+        if route == "ast":
+            rewritten.append(cls_name)
+            assert "unsloth_fused_lm_head_loss(" in new
+            assert "torch_compile" not in new
+    if not rewritten:
+        pytest.skip("no checked HF forward takes the AST route on this transformers")
+
+
 # Z1: tiled-MLP free memory ------------------------------------------------------------
 
 def _fake_cuda():
