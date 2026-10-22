@@ -1528,11 +1528,14 @@ _GROUPED_MM_FOREIGN = {}   # (type, index) -> None if same GPU model as the prob
 # (type, index) the process-wide flags were probed on; a later current-device switch must not move it.
 _GROUPED_MM_HOME = None
 _GROUPED_MM_HOME_LOCK = threading.Lock()
+# True once every visible accelerator is the home card's model: the per-call gates then read the
+# process-wide flags directly (no device classification per GEMM). Set eagerly with the home anchor.
+_GROUPED_MM_HOMOGENEOUS = False
 
 
 def _grouped_mm_home():
     """Card the process-wide flags describe; locked so concurrent first callers on different cards agree."""
-    global _GROUPED_MM_HOME
+    global _GROUPED_MM_HOME, _GROUPED_MM_HOMOGENEOUS
     if _GROUPED_MM_HOME is None:
         device = _grouped_mm_probe_device()
         anchored = False
@@ -1551,7 +1554,20 @@ def _grouped_mm_home():
             for i in range(count):
                 if (device.type, i) not in _GROUPED_MM_FOREIGN:
                     _resolve_grouped_mm_foreign_kind(torch.device(device.type, i), (device.type, i))
+            _GROUPED_MM_HOMOGENEOUS = _grouped_mm_all_cards_alike(device.type, count)
     return torch.device(*_GROUPED_MM_HOME) if _GROUPED_MM_HOME is not None else _grouped_mm_probe_device()
+
+
+def _grouped_mm_all_cards_alike(home_type, count):
+    """Every visible card of the home's type is its model, and no other accelerator type has cards."""
+    if count < 1 or any(_GROUPED_MM_FOREIGN.get((home_type, i), 0) is not None for i in range(count)):
+        return False
+    other = "xpu" if home_type == "cuda" else "cuda"
+    try:
+        backend = getattr(torch, other, None)
+        return not (backend is not None and backend.is_available() and backend.device_count() > 0)
+    except Exception:
+        return False
 
 
 def _grouped_mm_foreign_kind(device):
@@ -1597,8 +1613,16 @@ def _check_torch_grouped_mm_supported(device = None):
 
 def _grouped_mm_supported_on(device):
     # Absent symbol (torch 2.6/2.7): the traceable definitive negative, no classification.
-    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_foreign_kind(device) is None:
+    # One GPU model on the host: the process-wide flag answers for every card.
+    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE:
         return _check_torch_grouped_mm_supported()
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is None:
+        return _check_torch_grouped_mm_supported()
+    # Never probe while tracing (graph break; an error under fullgraph): an unprobed model takes the
+    # per-group fallback in this graph, and the next eager call probes and caches it.
+    if torch.compiler.is_compiling() and kind not in _TORCH_GROUPED_MM_SUPPORTED_BY_KIND:
+        return False
     return _check_torch_grouped_mm_supported(device)
 
 
@@ -1742,11 +1766,14 @@ _TRANSPOSED_VIEW_SAFE_BY_KIND = {}
 
 def _transposed_view_safe_on(device):
     """View probe on `device`'s GPU model; the home model keeps the process-wide flag."""
-    if not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
+    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
     kind = _grouped_mm_foreign_kind(device)
     if kind is None: return _transposed_view_grouped_mm_is_safe()
     safe = _TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind)
     if safe is not None: return safe
+    # Unknown while tracing (a block moved to an unwarmed card): probing would break the graph, so use
+    # the home card's verdict as before per-model view checks; never probed yet means the contiguous copy.
+    if torch.compiler.is_compiling(): return bool(_TRANSPOSED_VIEW_GROUPED_MM_SAFE)
     return _run_probe_eagerly(lambda: _probe_transposed_view_grouped_mm_is_safe(device))
 
 
