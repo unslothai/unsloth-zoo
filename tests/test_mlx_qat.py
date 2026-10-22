@@ -21,6 +21,7 @@ Runs on real mlx (CPU or Metal), no downloads: a tiny mlx-lm llama is built in-p
 
 import importlib
 import sys
+from functools import partial
 
 import pytest
 
@@ -134,7 +135,7 @@ def test_get_peft_model_qat_trains_compiled_and_survives_the_merged_4bit_save(tm
     grad_fn = nn.value_and_grad(model, loss)
     state = [model.state, opt.state]
 
-    @mx.compile
+    @partial(mx.compile, inputs=state, outputs=state)
     def step():
         value, grads = grad_fn(model)
         opt.update(model, grads)
@@ -157,6 +158,17 @@ def test_get_peft_model_qat_trains_compiled_and_survives_the_merged_4bit_save(tm
     save_merged_model(model, _Tok(), tmp_path, dequantize=False, quantize_unquantized=True)
     reloaded, _ = load_model(tmp_path)
     assert mx.array_equal(reloaded(ids), logits).item()
+
+
+def test_peft_format_adapter_save_matches_plain_lora(tmp_path):
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+
+    files = {}
+    for scheme in ("auto", None):
+        out = tmp_path / str(scheme)
+        save_lora_adapters(_peft(_tiny_llama(), qat_scheme=scheme), out, adapter_format="peft")
+        files[scheme] = {p.name: p.read_bytes() for p in out.iterdir()}
+    assert files["auto"] == files[None]
 
 
 def _set_full_finetuning(model):
