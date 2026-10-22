@@ -55,7 +55,6 @@ def spoof(monkeypatch):
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", None)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOME", None, raising = False)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOMOGENEOUS", False, raising = False)
-        monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOME_INFO", None, raising = False)
         monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
         for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND",
                      "_TRANSPOSED_VIEW_SAFE_BY_KIND"):
@@ -427,17 +426,18 @@ def test_tracing_an_unprobed_card_never_runs_a_probe(spoof, monkeypatch):
     assert moe_utils._transposed_view_safe_on(cuda(1)) is False   # nothing probed at all: the contiguous copy
 
 
-def test_tracing_an_unprobed_older_card_takes_the_manual_loop(spoof, monkeypatch):
-    # H100 home + A100 expert card on torch 2.8 (grouped_mm sm90+): the home answer would name a kernel
-    # the A100 lacks, so a trace there takes the manual loop; a newer or same-generation card keeps it.
-    spoof(3, models = ["H100", "A100", "B200"], caps = [(9, 0), (8, 0), (10, 0)])
+@pytest.mark.parametrize("sm90_only,expected", [(True, [False, True, False]), (False, [True, True, True])])
+def test_tracing_an_unprobed_card_follows_torchs_own_grouped_mm_rule(spoof, monkeypatch, sm90_only, expected):
+    # torch 2.8 refuses grouped_mm off sm90, so a trace on an unprobed A100 or B200 beside an H100 home
+    # takes the manual loop there; 2.9+ falls back internally, so every card keeps the home answer.
+    spoof(4, models = ["H100", "A100", "H200", "B200"], caps = [(9, 0), (8, 0), (9, 0), (10, 0)])
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SM90_ONLY", sm90_only)
     monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
     assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
     def no_probe(_probe): raise AssertionError("probe ran while tracing")
     monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_probe)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    assert moe_utils._grouped_mm_supported_on(cuda(1)) is False
-    assert moe_utils._grouped_mm_supported_on(cuda(2)) is True
+    assert [moe_utils._grouped_mm_supported_on(cuda(i)) for i in (1, 2, 3)] == expected
 
 
 def test_tracing_a_card_of_another_accelerator_type_never_resolves_it(spoof, monkeypatch):
