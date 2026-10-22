@@ -2665,7 +2665,9 @@ def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_co
             lo, hi = offsets[e], offsets[e + 1]
             if hi == lo:
                 continue
-            y = (x[rows[lo:hi] // k] @ dense[e - first]).float()
+            # Explicit bf16: an fp16 autocast would recast the matmul and overflow before the bias cancels it.
+            with torch.autocast(device_type = x.device.type, enabled = False):
+                y = (x[rows[lo:hi] // k] @ dense[e - first]).float()
             if bias is not None:
                 y = y + bias[e].float()
             out[lo:hi] = y.to(out.dtype)
@@ -2687,7 +2689,9 @@ def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precis
             lo, hi = offsets[e], offsets[e + 1]
             if hi == lo:
                 continue
-            y = (h[lo:hi] @ dense[e - first]).float()
+            # As above: fp16 autocast would overflow here before the routing weight scales it down.
+            with torch.autocast(device_type = h.device.type, enabled = False):
+                y = (h[lo:hi] @ dense[e - first]).float()
             if bias is not None:
                 y = y + bias[e].float()
             if gammas is not None:
