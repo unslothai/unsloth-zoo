@@ -280,6 +280,8 @@ modifications =
       with Triton < 3.8 (same TMEM tl.dot race as #1228 / triton-lang/triton#10590).
       Unlike upstream, the existing chunk_fwd_kernel_o 8-warp drop stays on
       every Blackwell Triton version. Off Blackwell the config lists are unchanged.
+      ops/utils/cache.py ignores an FLA_CACHE_MODE disk config whose num_warps the
+      kernel's config list no longer offers, so a cached 8-warp entry cannot return.
     - Backported fla PR #1388 (with the #1154 key change it completes) in
       modules/conv/triton/{kernels,ops}.py: NB = cdiv(B*T, 1024) is dropped from
       the causal_conv1d forward / backward autotune keys, signatures and

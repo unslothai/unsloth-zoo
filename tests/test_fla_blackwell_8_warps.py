@@ -236,3 +236,25 @@ def test_dv_local_every_offered_config_is_deterministic_and_correct(monkeypatch)
         tuner.cache.clear()
     assert not failures, failures
     assert offered_warps == expected_warps
+
+
+@pytest.mark.parametrize("cached_warps, used", [(8, False), (4, True)])
+def test_disk_cached_config_outside_the_offered_warps_is_ignored(monkeypatch, cached_warps, used):
+    # FLA_CACHE_MODE disk configs go straight into the tuner cache: an 8-warp entry written on
+    # another host (or before the Blackwell drop) must not bring back the racy config.
+    pytest.importorskip("triton")
+    import triton
+    cache_mod = pytest.importorskip("unsloth_zoo._vendored.fla.ops.utils.cache")
+
+    entry = {"kwargs": {}, "num_warps": cached_warps, "num_stages": 2, "num_ctas": 1}
+    monkeypatch.setattr(cache_mod, "load_cached_config", lambda name, key: entry)
+    tuner = types.SimpleNamespace(
+        kernel_name = "chunk_bwd_kernel_dv_local",
+        configs = [triton.Config({}, num_warps = w, num_stages = s) for w in (2, 4) for s in (2, 3, 4)],
+        cache = {},
+    )
+    key = types.SimpleNamespace(autotune_key = ("k",))
+    cache_mod.CachedAutotuner.maybe_load_cached_config(tuner, key)
+    assert (("k",) in tuner.cache) is used
+    if used:
+        assert tuner.cache[("k",)].num_warps == cached_warps
