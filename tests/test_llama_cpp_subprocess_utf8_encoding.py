@@ -56,3 +56,14 @@ def test_llama_cpp_text_mode_subprocess_calls_pin_utf8():
         if not (isinstance(_kw(node, "encoding"), ast.Constant) and _kw(node, "encoding").value == "utf-8")
     ]
     assert not offenders, f'text-mode subprocess calls missing encoding="utf-8" at lines {offenders}'
+
+
+def test_try_execute_reads_non_locale_utf8_output():
+    # U+201D encodes as E2 80 9D; 0x9D is undefined in cp1252, so a locale decode raises.
+    import sys
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    child = "import sys; sys.stdout.buffer.write(('tensor ' + chr(0x201D) + ' ok' + chr(10)).encode('utf-8'))"
+    lines = []
+    llama_cpp.try_execute(f'"{sys.executable}" -c "{child}"', print_outputs = lines)
+    assert "".join(lines) == "tensor ” ok\n"
