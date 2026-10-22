@@ -7865,8 +7865,9 @@ def _mlx_lm_image_inputs(tokenizer, processor, images, text=None, *, return_tens
         text = text[0]
     if not isinstance(text, str):
         raise ValueError("Unsloth MLX: image inputs of an mlx_lm model take one prompt string.")
+    # Arrays pass as given: the processor refuses non-uint8 ones, where a cast would corrupt [0, 1] floats.
     images = [
-        np.asarray(image.convert("RGB") if isinstance(image, Image.Image) else image, dtype=np.uint8)
+        np.asarray(image.convert("RGB")) if isinstance(image, Image.Image) else np.asarray(image)
         for image in (images if isinstance(images, (list, tuple)) else [images])
     ]
     text, pixel_values = processor(text, images=images)

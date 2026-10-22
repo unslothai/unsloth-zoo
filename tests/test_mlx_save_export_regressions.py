@@ -522,6 +522,9 @@ def test_tokenizer_wrapper_takes_images_through_an_mlx_lm_image_processor():
     positional = tokenizer(image, "<s>aP")
     assert positional["input_ids"] == [[60, 115, 62, 97, 80, 80]]
     assert tokenizer("a", "b") == ("text", ("a", "b"), {})
+    # A [0, 1] float array reaches the processor's uint8 check instead of being cast to near-black.
+    with pytest.raises(AssertionError):
+        tokenizer(images=[np.full((2, 3, 3), 0.5, np.float32)], text="aP")
 
 
 def test_vlm_prompt_patch_preserves_model_specific_media_markers(monkeypatch):
