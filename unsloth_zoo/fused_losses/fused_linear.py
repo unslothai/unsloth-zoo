@@ -616,8 +616,17 @@ if _HAS_TRITON:
 _TRITON_BROKEN = set()
 
 
+@functools.cache
+def _triton_arch_ok(device):
+    # Pre-Volta and gfx906 run with torch.compile off (Triton codegen is unsupported or broken there): torch bodies.
+    if _IS_HIP:
+        arch = str(getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")).split(":")[0].lower()
+        return arch != "gfx906"
+    return torch.cuda.get_device_capability(device)[0] >= 7
+
+
 def _use_triton(device):
-    return _TRITON and _HAS_TRITON and device.type == "cuda" and device not in _TRITON_BROKEN
+    return _TRITON and _HAS_TRITON and device.type == "cuda" and device not in _TRITON_BROKEN and _triton_arch_ok(device)
 
 
 def _launch(device, fn):

@@ -1334,3 +1334,26 @@ def test_flash_min_rows_follows_the_card_size(monkeypatch):
     monkeypatch.setattr(fl, "_FLASH_MIN_ROWS", 123)
     assert fl._flash_min_rows(torch.device("cuda", 0)) == 123
     fl._flash_min_rows_auto.cache_clear()
+
+
+@pytest.mark.parametrize("hip, arch, cap, ok", [
+    (False, "", (6, 0), False),
+    (False, "", (7, 0), True),
+    (False, "", (7, 5), True),
+    (False, "", (12, 0), True),
+    (True, "gfx906:sramecc+:xnack-", (9, 0), False),
+    (True, "gfx1151", (11, 5), True),
+    (True, "gfx942:sramecc+:xnack-", (9, 4), True),
+])
+def test_triton_skipped_where_core_turns_compile_off(monkeypatch, hip, arch, cap, ok):
+    # Core sets UNSLOTH_COMPILE_DISABLE=1 on pre-Volta and gfx906; the Triton kernels must not run there either.
+    monkeypatch.setattr(fl, "_IS_HIP", hip)
+    monkeypatch.setattr(fl, "_TRITON", True)
+    monkeypatch.setattr(fl, "_HAS_TRITON", True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: cap)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device = None: type("P", (), {"gcnArchName": arch})())
+    fl._triton_arch_ok.cache_clear()
+    try:
+        assert fl._use_triton(torch.device("cuda", 0)) is ok
+    finally:
+        fl._triton_arch_ok.cache_clear()
