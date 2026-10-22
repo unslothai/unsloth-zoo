@@ -1985,23 +1985,29 @@ def moe_compute_dtype(hidden_states):
 def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_fn, *args):
     """Temporarily install dequantized weights for one forward call, then restore.
 
-    Uses object.__setattr__ to bypass nn.Module Parameter (de)registration
-    (re-registers hooks, unnecessary for read-only temp tensors). Used by the
-    FP8 and bnb4bit MoE dispatchers.
+    Registered parameters are swapped in place in `_parameters` (no nn.Module
+    __setattr__, so no (de)registration or hooks); any other attribute goes through
+    object.__setattr__. Used by the FP8 and bnb4bit MoE dispatchers.
     """
-    # Restore by popping the __dict__ entries, never writing the Parameter there: it would shadow
-    # later `_parameters` swaps (FSDP2 all-gather) and read a freed buffer. No `object()` sentinel:
-    # its graph break left the temporary tensors installed after a compiled call.
-    instance_dict = experts_module.__dict__
+    # Swap `_parameters` entries only: a __dict__ write shadows later FSDP2 swaps (freed buffer), and
+    # `__dict__.pop` / `del` / an `object()` sentinel graph-break; dict setitem traces on every torch.
     names = ("gate_up_proj", "down_proj")
-    saved = {name: instance_dict[name] for name in names if name in instance_dict}
-    object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
-    object.__setattr__(experts_module, "down_proj", down_proj)
+    params = experts_module._parameters
+    instance_dict = experts_module.__dict__
+    registered = {name: params[name] for name in names if name in params}
+    saved = {name: instance_dict[name] for name in names if name not in registered and name in instance_dict}
+    for name, tensor in zip(names, (gate_up_proj, down_proj)):
+        if name in registered:
+            params[name] = tensor
+        else:
+            object.__setattr__(experts_module, name, tensor)
     try:
         return forward_fn(experts_module, *args)
     finally:
         for name in names:
-            if name in saved:
+            if name in registered:
+                params[name] = registered[name]
+            elif name in saved:
                 instance_dict[name] = saved[name]
             else:
                 instance_dict.pop(name, None)
