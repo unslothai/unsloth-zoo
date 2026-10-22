@@ -43,6 +43,7 @@ import os
 import ast
 import sys
 import traceback
+import warnings
 import shutil
 import torch
 from torch import __version__ as torch_version
@@ -3898,6 +3899,58 @@ def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
     return None
 
 
+# True while VLLM_USE_V2_MODEL_RUNNER=0 in os.environ is the one load_vllm set for ReplaySSM (it is
+# left set across loads), so a later load may take it back.
+_UNSLOTH_SET_V1_RUNNER = False
+
+
+def _vllm_disable_envs_cache():
+    # vLLM caches its env reads once an engine is up (envs.enable_envs_cache); a changed env must
+    # reach the next engine.
+    try:
+        import vllm.envs as vllm_envs
+        disable = getattr(vllm_envs, "disable_envs_cache", None)
+        if disable is not None:
+            disable()
+    except Exception:
+        pass
+
+
+def _routing_replay_model_runner(engine_args):
+    """vLLM 0.31+ captures routed experts only on Model Runner V2 (VllmConfig
+    _verify_aux_output_compatibility). A V1 runner left by an earlier ReplaySSM load is taken back;
+    a V1 runner the user chose turns routing replay off for this engine instead. Returns the
+    action taken: None, "restored_v2" or "replay_off"."""
+    global _UNSLOTH_SET_V1_RUNNER
+    if not engine_args.get("enable_return_routed_experts"):
+        return None
+    from .routing_replay import _vllm_at_least, ROUTING_REPLAY_ENV
+    if not _vllm_at_least(0, 31):
+        return None
+    value = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", None)
+    try:
+        v1 = value is not None and not bool(int(value.strip()))
+    except ValueError:
+        v1 = False
+    if not v1:
+        return None
+    if _UNSLOTH_SET_V1_RUNNER:
+        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+        _UNSLOTH_SET_V1_RUNNER = False
+        _vllm_disable_envs_cache()
+        print("Unsloth: routing replay needs vLLM Model Runner V2; dropping the V1 runner an earlier ReplaySSM load set.")
+        return "restored_v2"
+    engine_args.pop("enable_return_routed_experts", None)
+    engine_args.pop("async_scheduling", None)
+    warnings.warn(
+        f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: VLLM_USE_V2_MODEL_RUNNER=0 selects "
+        "Model Runner V1, and this vLLM captures routed experts only on V2. Unset "
+        "VLLM_USE_V2_MODEL_RUNNER to use routing replay.",
+        stacklevel = 2,
+    )
+    return "replay_off"
+
+
 def _is_vllm_replayssm_refusal(error_text):
     # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2). With
     # speculative decoding vLLM 0.29 turns ReplaySSM into RecoverSSM, which only Kimi KDA supports.
@@ -4105,7 +4158,7 @@ def load_vllm(
             "vLLM state at import, so installing into a live session is not enough."
         )
 
-    global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS
+    global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS, _UNSLOTH_SET_V1_RUNNER
     _UNSLOTH_FLASHINFER_UNUSABLE = False
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
@@ -4950,9 +5003,12 @@ def load_vllm(
                 if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
                     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
                     replayssm_set_runner = True
+                    _UNSLOTH_SET_V1_RUNNER = True
             elif replayssm_mode == "on":
                 print(f"Unsloth: UNSLOTH_VLLM_REPLAYSSM=1 ignored: {replayssm_skip}.")
         pass
+        # Routing replay on vLLM 0.31+ needs Model Runner V2, also when ReplaySSM is off here.
+        _routing_replay_model_runner(engine_args)
 
         # Keep trying until success (2 times)
         trials = 0
@@ -4987,6 +5043,7 @@ def load_vllm(
                     engine_args.pop("use_replayssm")
                     if replayssm_set_runner:
                         os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                        _UNSLOTH_SET_V1_RUNNER = False
                     print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
                     continue
                 # A transient race: retry the *identical* load rather than fall

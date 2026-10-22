@@ -18,6 +18,7 @@
 async scheduling), duplicate completions and checkpoint recompute identity. CPU only."""
 
 import ast
+import os
 import pathlib
 from types import SimpleNamespace
 
@@ -198,3 +199,174 @@ def test_replayssm_yields_to_routing_replay_on_vllm_031():
     guard = body.find('engine_args.get("enable_return_routed_experts")')
     assert guard != -1 and "_vllm_at_least(0, 31)" in body[guard : guard + 600]
     assert guard < body.find('engine_args["use_replayssm"] = True')
+
+
+class _NoStream:
+    def wait_stream(self, other):
+        pass
+
+    def wait_event(self, event):
+        pass
+
+
+@pytest.fixture
+def offloaded_gc(monkeypatch):
+    """Unsloth's offloaded checkpoint (UnslothCheckpointFunction) with its offload branch on, CPU
+    tensors standing in for the device: the first activation is copied to a host buffer in forward
+    and rebuilt in the one reused staging buffer for every recompute, as on a GPU."""
+    import contextlib
+
+    from unsloth_zoo import gradient_checkpointing as gc
+    staging = torch.empty(0, dtype = torch.float32)
+    for name, value in (
+        ("FIRST_PASS", True), ("LAST_GC_INDEX", 0), ("CURRENT_GC_INDEX", 0),
+        ("MINIMUM_SIZE", 0),  # every activation is above the offload threshold
+        ("CPU_INDEX", 0), ("CPU_BUFFERS", [torch.empty(1)]), ("BACKWARD_PASS", False),
+        ("USE_DOUBLE_BUFFER", False), ("GPU_BUFFERS", {None: staging}), ("GPU_BUFFERS_B", None),
+        ("EXTRA_STREAMS", {None: _NoStream()}), ("NEXT_BUFFER_SLOT", {None: 0}),
+        ("FP32_OFFLOAD_EXACT", True), ("GC_PREFETCH", False), ("OFFLOAD_SLOT_META", []),
+        ("USE_UNSLOTH_GC", False), ("PINNED_MEMORY_AVAILABLE", False),
+    ):
+        monkeypatch.setattr(gc, name, value, raising = False)
+    monkeypatch.setattr(gc, "_compute_stream", lambda device_index: _NoStream())
+    monkeypatch.setattr(gc, "torch_gpu_stream", lambda stream: contextlib.nullcontext(), raising = False)
+    monkeypatch.setattr(gc, "_ensure_device_buffers", lambda device_index: None)
+    return gc, staging
+
+
+@pytest.mark.parametrize("prior", ["plain", "offloaded"])
+def test_recompute_identity_survives_offloaded_checkpointing(replay, offloaded_gc, prior):
+    # Same scenario as above (identical tokens, two replays, one backward) on Unsloth's
+    # use_gradient_checkpointing = "unsloth" path: the recompute's hidden states live in the
+    # staging buffer, not at the forward's address.
+    gc, staging = offloaded_gc
+    ids = [5, 6, 7, 30, 31, 32]
+    with torch.no_grad():
+        m = _moe()
+        captured = {}
+        for i, layer in enumerate(m.model.layers):
+            layer.mlp.gate.register_forward_hook(lambda mod, a, out, i = i: captured.__setitem__(i, out[2].clone()))
+        m(input_ids = torch.tensor([ids]))
+        natural = torch.stack([captured[i] for i in range(LAYERS)], dim = 1).numpy()
+    shifted = [((natural + s) % 8).astype(np.int16) for s in (2, 5)]
+
+    def run(checkpointing):
+        m = _moe()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+            for layer in m.model.layers:
+                layer._gradient_checkpointing_func = gc.unsloth_offloaded_gradient_checkpoint
+        m.model.embed_tokens.weight.requires_grad_(True)
+        rr.reset_routing_replay()
+        assert rr.install_routing_replay(m, None, SimpleNamespace(pad_token_id = PAD)) == LAYERS
+        recompute_inputs = []
+        m.model.layers[0].register_forward_pre_hook(
+            lambda mod, args: recompute_inputs.append(args[0].data_ptr()) if not rr._STATE.in_forward else None
+        )
+        losses = []
+        for routed in shifted:
+            rr.record_routed_experts([SimpleNamespace(
+                prompt_token_ids = ids[:3], outputs = [SimpleNamespace(token_ids = ids[3:], routed_experts = routed[:-1])],
+            )])
+            losses.append(m(input_ids = torch.tensor([ids])).logits.float().square().mean())
+        if checkpointing:
+            # Every layer input of both forwards went to the host buffers; after the first step the
+            # very last checkpoint stays on the device (LAST_GC_INDEX), as in training.
+            assert gc.CPU_INDEX >= 2 * LAYERS - 1
+        sum(losses).backward()
+        if checkpointing:
+            # Both recomputes of layer 0 read the one staging buffer.
+            assert len(recompute_inputs) == 2 and set(recompute_inputs) == {staging.data_ptr()}
+        return torch.stack([l.detach() for l in losses]), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    if prior == "offloaded":
+        run(True)  # a finished step first: buffers are reused, the step after must still match
+    losses_plain, grads_plain = run(False)
+    losses_gc, grads_gc = run(True)
+    torch.testing.assert_close(losses_gc, losses_plain, rtol = 1e-5, atol = 1e-6)
+    assert grads_gc.keys() == grads_plain.keys()
+    for name in grads_plain:
+        torch.testing.assert_close(grads_gc[name], grads_plain[name], rtol = 1e-4, atol = 1e-6, msg = name)
+
+
+@pytest.fixture
+def runner_env(monkeypatch):
+    import importlib.metadata
+
+    import unsloth_zoo.vllm_utils as vu
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising = False)
+    monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", False)
+    versions = {"vllm": "0.32.0"}
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: versions[name])
+    return vu, versions
+
+
+def _replay_args():
+    return {"enable_return_routed_experts": True, "moe_backend": "triton", "model": "m"}
+
+
+def test_v1_runner_left_by_an_earlier_replayssm_load_is_taken_back(runner_env, monkeypatch):
+    # An earlier load_vllm turned ReplaySSM on and left VLLM_USE_V2_MODEL_RUNNER=0 set; vLLM 0.31
+    # _verify_aux_output_compatibility refuses routed experts capture on V1.
+    vu, _ = runner_env
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", True)
+    args = _replay_args()
+    assert vu._routing_replay_model_runner(args) == "restored_v2"
+    assert "VLLM_USE_V2_MODEL_RUNNER" not in os.environ and not vu._UNSLOTH_SET_V1_RUNNER
+    assert args == _replay_args()
+
+
+@pytest.mark.parametrize("value", ["0", " 0 "])
+def test_user_chosen_v1_runner_turns_routing_replay_off_with_a_warning(runner_env, monkeypatch, value):
+    vu, _ = runner_env
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", value)
+    args = dict(_replay_args(), async_scheduling = False)
+    with pytest.warns(UserWarning, match = "Model Runner V1"):
+        assert vu._routing_replay_model_runner(args) == "replay_off"
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == value  # the user's choice stays
+    assert "enable_return_routed_experts" not in args and "async_scheduling" not in args
+
+
+@pytest.mark.parametrize("version, env, owned", [
+    ("0.30.0", "0", True),   # before 0.31 V1 captures routed experts: nothing to do
+    ("0.32.0", None, False),
+    ("0.32.0", "1", False),
+])
+def test_runner_is_left_alone_when_there_is_no_conflict(runner_env, monkeypatch, version, env, owned):
+    vu, versions = runner_env
+    versions["vllm"] = version
+    if env is not None:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", env)
+    monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", owned)
+    args = _replay_args()
+    assert vu._routing_replay_model_runner(args) is None
+    assert args == _replay_args() and os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == env
+    assert vu._routing_replay_model_runner({"model": "m"}) is None
+
+
+def test_load_vllm_checks_the_runner_even_when_replayssm_is_off():
+    # The check sits after the ReplaySSM block at its own level, and load_vllm records when it is the
+    # one that set the V1 runner.
+    import unsloth_zoo.vllm_utils as vu
+    path = pathlib.Path(vu.__file__)
+    tree = ast.parse(path.read_text(encoding = "utf-8-sig"))
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+    for node in ast.walk(fn):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        ifs = [i for i, s in enumerate(body) if isinstance(s, ast.If) and ast.unparse(s.test) == "replayssm_mode != 'off'"]
+        calls = [
+            i for i, s in enumerate(body)
+            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+            and getattr(s.value.func, "id", None) == "_routing_replay_model_runner"
+        ]
+        if ifs and calls:
+            assert calls[0] > ifs[0]
+            break
+    else:
+        raise AssertionError("_routing_replay_model_runner is not called beside the ReplaySSM block")
+    src = ast.get_source_segment(path.read_text(encoding = "utf-8-sig"), fn)
+    assert 'os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"\n                    replayssm_set_runner = True\n                    _UNSLOTH_SET_V1_RUNNER = True' in src

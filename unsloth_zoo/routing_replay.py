@@ -155,7 +155,7 @@ class _ReplayState:
         self.record = None
         self.pending = []
         self.recomputed = False
-        # Address of each MoE decoder layer's input in the call running now (see _layer_pre_hook).
+        # Addresses of each MoE decoder layer's inputs in the call running now (see _layer_pre_hook).
         self.layer_inputs = {}
         self.stats = dict(
             recorded = 0,
@@ -472,12 +472,16 @@ def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
         return None
     _STATE.recomputed = True
     candidates = [r[layer_index] for r in _STATE.pending if layer_index in r and r[layer_index][1].shape == ids2.shape]
-    if layer_input is not None:
-        # A checkpointed layer recomputes from the very input tensor its forward saved, so the
-        # input address names the forward even when several have the same router input.
-        own = [c for c in candidates if len(c) > 4 and c[4] == layer_input]
-        if len(own) == 1:
-            candidates = own
+    if layer_input:
+        # A checkpointed layer recomputes from the very tensors its forward was called with, so
+        # their addresses name the forward even when several have the same router input. Unsloth's
+        # offloaded checkpointing rebuilds the hidden states in a reused staging buffer, but keeps
+        # the other inputs (rotary cos / sin, masks, position ids) as they were: the forward
+        # sharing the most addresses is the one recomputed. A tie keeps all candidates.
+        shared = [len(c[4] & layer_input) if len(c) > 4 and isinstance(c[4], frozenset) else 0 for c in candidates]
+        best = max(shared, default = 0)
+        if best > 0 and shared.count(best) == 1:
+            candidates = [candidates[shared.index(best)]]
     if not candidates:
         # No forward replayed this layer: recompute it exactly as it ran, with no extra ops
         # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
@@ -697,11 +701,21 @@ def _router_hook(layer_index, compact = None):
     return hook
 
 
+def _tensor_addresses(values):
+    out = set()
+    for value in values:
+        for x in (value if isinstance(value, (tuple, list)) else (value,)):
+            if torch.is_tensor(x) and x.numel() > 0:
+                out.add(x.data_ptr())
+    return out
+
+
 def _layer_pre_hook(layer_index):
     def hook(module, args, kwargs):
-        x = args[0] if args else kwargs.get("hidden_states", None)
-        _STATE.layer_inputs[layer_index] = (
-            x.data_ptr() if torch.is_tensor(x) and not torch.compiler.is_compiling() else None
+        # Addresses of every tensor this decoder layer call gets (one level into tuples, e.g. the
+        # rotary (cos, sin)): the checkpoint recompute is called with the same tensors.
+        _STATE.layer_inputs[layer_index] = None if torch.compiler.is_compiling() else (
+            frozenset(_tensor_addresses(list(args) + list(kwargs.values()))) or None
         )
         return None
 
