@@ -62,6 +62,19 @@ def _compile_layers(model):
     return len(layers)
 
 
+def _disable_bnb_cpu_weight_packing(model):
+    """bitsandbytes (0.50) repacks a Linear4bit weight in place for its AVX512-BF16 kernel on the first
+    eval forward without grad, and never unpacks it: backward through the packed weight is then wrong,
+    so a single evaluation or generate() before / during training silently stalls QLoRA learning.
+    Keep every layer on the trainable layout."""
+    count = 0
+    for module in model.modules():
+        if hasattr(module, "support_avx512bf16_for_cpu"):
+            module.support_avx512bf16_for_cpu = False
+            count += 1
+    return count
+
+
 class FastCPUModel:
     """FastLanguageModel for hosts with no accelerator: stock transformers + PEFT on CPU."""
 
@@ -138,6 +151,8 @@ class FastCPUModel:
         if getattr(model.config, "pad_token_id", None) is None:
             model.config.pad_token_id = tokenizer.pad_token_id
 
+        if use_4bit:
+            _disable_bnb_cpu_weight_packing(model)
         model.max_seq_length = max_seq_length
         model._unsloth_cpu_gradient_checkpointing = use_gradient_checkpointing
         if full_finetuning:

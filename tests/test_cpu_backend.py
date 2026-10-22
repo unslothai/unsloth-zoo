@@ -91,3 +91,27 @@ def test_bf16_policy_override(monkeypatch):
     monkeypatch.setenv("UNSLOTH_CPU_BF16", "1")
     assert runtime.cpu_bf16_supported() is True
     runtime.cpu_bf16_supported.cache_clear()
+
+
+def test_bnb_cpu_4bit_grads_survive_eval_forward():
+    """bitsandbytes repacks Linear4bit weights for its AVX512-BF16 kernel on an eval no-grad forward,
+    after which backward is wrong. The CPU loader turns that repacking off; check grads after an eval."""
+    bnb = pytest.importorskip("bitsandbytes")
+    from unsloth_zoo.cpu.loader import _disable_bnb_cpu_weight_packing
+    torch.manual_seed(0)
+    layer = bnb.nn.Linear4bit(256, 128, bias = False, compute_dtype = torch.bfloat16, quant_type = "nf4")
+    layer.weight = layer.weight._quantize("cpu")
+    model = torch.nn.Sequential(layer)
+    assert _disable_bnb_cpu_weight_packing(model) == 1
+    dense = bnb.functional.dequantize_4bit(layer.weight.data, layer.weight.quant_state).to(torch.bfloat16)
+    model.eval()
+    with torch.no_grad():
+        model(torch.randn(3, 256, dtype = torch.bfloat16))
+    model.train()
+    x = torch.randn(8, 256, dtype = torch.bfloat16, requires_grad = True)
+    grad = torch.randn(8, 128, dtype = torch.bfloat16)
+    (model(x) * grad).sum().backward()
+    x_ref = x.detach().clone().requires_grad_()
+    ((x_ref @ dense.t()) * grad).sum().backward()
+    assert x.grad is not None
+    torch.testing.assert_close(x.grad, x_ref.grad)
