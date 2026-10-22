@@ -818,7 +818,10 @@ def test_vector_attention_preserves_bits_when_feature_layouts_change(dtype, rows
     monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")
     monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
     arrays = _attention_block(8, rows, 4500, dtype)
-    reference = mx.fast.scaled_dot_product_attention(*arrays, scale = 1.0, mask = "causal")
+    # Before M3, MLX's own launch for 3 rows exceeds the threadgroup limit, so the contiguous layout is the reference.
+    reference = (mx.fast.scaled_dot_product_attention(*arrays, scale = 1.0, mask = "causal")
+                 if _mlx_vector_launch_fits(8 * rows) else
+                 decode._vector_attention(*arrays, 1.0, decode._vector_blocks(8 * rows, 4500)))
     strided = [mx.stack([x, mx.full(x.shape, -7, dtype)], axis = -1).reshape(
         *x.shape[:-1], 2 * x.shape[-1])[..., ::2] for x in arrays]
     layouts = [(False, False, False), (True, False, False), (False, True, False),
@@ -844,6 +847,9 @@ def test_wide_decode_attention_is_native_bitwise_over_strided_caches(heads, keys
     v = mx.random.normal((1, heads // 8, keys + 128, 1536)).astype(mx.bfloat16)[:, :, :keys, ::3]
     for mask, scale in [(None, 512 ** -.5), ("causal", .125)]:
         out = decode._wide_head_decode_attention(q, k, v, scale, mask)
+        if not decode._two_pass_keys(keys):   # below this GPU's two-pass threshold, MLX's single-pass kernel stays
+            assert out is None
+            continue
         assert out is not None
         _equal(out, mx.fast.scaled_dot_product_attention(q, k, v, scale = scale, mask = mask))
         _equal(out, decode._vector_attention(mx.contiguous(q), mx.contiguous(k), mx.contiguous(v),
