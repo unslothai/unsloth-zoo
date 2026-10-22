@@ -234,8 +234,9 @@ def test_the_fused_lm_head_templates_consult_the_head_device():
 
 
 
-def _adapter_dispatch(monkeypatch, device, **kwargs):
-    """torch_compile the shared adapter hands the CE kernel for an LM head on `device`."""
+def _adapter_dispatch(monkeypatch, device, unshard_to = None, **kwargs):
+    """torch_compile the shared adapter hands the CE kernel for an LM head on `device`. unshard_to:
+    the device FSDP2's unshard gathers the weight onto (CPUOffloadPolicy keeps the shard on CPU)."""
     from unsloth_zoo.fused_losses import forward_adapter as adapter
     from unsloth_zoo.fused_losses import cross_entropy_loss as ce
     seen = []
@@ -247,7 +248,11 @@ def _adapter_dispatch(monkeypatch, device, **kwargs):
         return 1.0
 
     monkeypatch.setattr(adapter, "unsloth_fused_ce_loss", spy)
-    monkeypatch.setattr(adapter, "unsloth_fsdp_unshard", lambda head: None)
+    def unshard(head):
+        if unshard_to is not None:
+            head.weight = types.SimpleNamespace(device = unshard_to)
+
+    monkeypatch.setattr(adapter, "unsloth_fsdp_unshard", unshard)
     head = types.SimpleNamespace(weight = types.SimpleNamespace(device = device))
     adapter.unsloth_fused_lm_head_loss(None, head, None, **kwargs)
     return seen[0]
@@ -267,6 +272,16 @@ def test_the_shared_adapter_skips_inductor_for_a_head_on_an_old_card(monkeypatch
     # One-GPU and homogeneous hosts: no old card, the default is untouched.
     monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset())
     assert _adapter_dispatch(monkeypatch, torch.device("cuda", 1)) is True
+
+
+def test_the_shared_adapter_checks_the_head_after_fsdp_unshards_it(monkeypatch):
+    # FSDP2 CPUOffloadPolicy: the sharded head weight sits on CPU until unshard gathers it onto the
+    # compute card, so the device question must be asked of the unsharded weight.
+    import unsloth_zoo.compiler as compiler
+    monkeypatch.setattr(compiler, "OLD_CUDA_ARCH_INDICES", frozenset({1}))
+    cpu = torch.device("cpu")
+    assert _adapter_dispatch(monkeypatch, cpu, unshard_to = torch.device("cuda", 1)) is False
+    assert _adapter_dispatch(monkeypatch, cpu, unshard_to = torch.device("cuda", 0)) is True
 
 
 def test_ast_rewritten_lm_head_forwards_go_through_the_guarded_adapter():
