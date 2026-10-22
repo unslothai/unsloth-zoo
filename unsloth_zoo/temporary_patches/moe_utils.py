@@ -1133,11 +1133,37 @@ class _ExpertBiasGather(torch.autograd.Function):
         rows = grad.shape[0]
         if rows <= chunk:
             return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
+        # Every path is a GEMM (no index_add_ atomics), so the grad is reproducible, and each partial sum
+        # stays fp32 until the one final cast: a 16-bit chunk sum can overflow to inf (inf - inf = NaN)
+        # even when the total is finite.
+        if torch.compiler.is_compiling():
+            # A Python loop over a symbolic row count would specialize it: one GEMM over every row. Its
+            # one-hot is num_experts / hidden of grad's size, not capped.
+            return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
+        if not _mm_fp32_out_ok(grad):
+            # The fallback upcasts each chunk of grad to fp32: cap that copy too.
+            chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(ctx.num_experts, grad.shape[1]))
         out = torch.zeros(ctx.num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
         for start in range(0, rows, chunk):
-            one_hot = (expert_ids[start : start + chunk].unsqueeze(0) == experts).to(grad.dtype)
-            out += (one_hot @ grad[start : start + chunk]).float()
+            out += _one_hot_mm_fp32(expert_ids[start : start + chunk].unsqueeze(0) == experts, grad[start : start + chunk])
         return out.to(grad.dtype), None
+
+
+# torch.mm(..., out_dtype = torch.float32): 16-bit inputs, fp32 output (aten::mm.dtype, CUDA only, torch 2.9+).
+_MM_OUT_DTYPE = "dtype" in torch.ops.aten.mm.overloads()
+
+
+def _mm_fp32_out_ok(grad):
+    return _MM_OUT_DTYPE and grad.is_cuda and torch.version.hip is None and grad.dtype in (torch.float16, torch.bfloat16)
+
+
+def _one_hot_mm_fp32(one_hot, grad):
+    """one_hot (bool [E, rows]) @ grad as fp32 [E, D], with no 16-bit rounding of the sum."""
+    if grad.dtype == torch.float32:
+        return one_hot.to(grad.dtype) @ grad
+    if _mm_fp32_out_ok(grad):
+        return torch.mm(one_hot.to(grad.dtype), grad, out_dtype = torch.float32)
+    return one_hot.to(torch.float32) @ grad.float()
 
 
 def _gather_expert_bias(bias, expert_ids):
