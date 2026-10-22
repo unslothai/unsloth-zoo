@@ -422,6 +422,28 @@ def test_vllm_xpu_bf16_refusal_switches_beside_any_unsloth(on_xpu, vu, monkeypat
 
 
 @not_on_macos
+@pytest.mark.parametrize("flags", [(True,), (_PROVEN_NO_BF16,)])
+@pytest.mark.parametrize("dtype", [None, "bfloat16"])
+def test_vllm_xpu_a770_refusal_beside_released_unsloth_main(on_xpu, vu, monkeypatch, flags, dtype):
+    # zoo#1947 / zoo#1929 / unsloth#14493: unsloth main exports xpu_supports_native_bf16 (every
+    # visible XPU) and xpu_keeps_explicit_bf16, but no xpu_vllm_refuses_bf16. Neither an explicit
+    # nor an automatic bf16 may reach vLLM's A770 refusal beside it.
+    on_xpu(_fake_xpu(flags))
+    _fake_vllm_platforms(monkeypatch, refuses = True)
+    core = types.ModuleType("unsloth.device_type")
+    core.xpu_supports_native_bf16 = lambda: not any(f == _PROVEN_NO_BF16 for f in flags)
+    core.xpu_keeps_explicit_bf16 = lambda: True
+    core.zoo_shares_xpu_bf16 = lambda: True
+    monkeypatch.setitem(sys.modules, "unsloth.device_type", core)
+    scope = {
+        "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
+        "__package__": "unsloth_zoo", "dtype": None if dtype is None else getattr(torch, dtype),
+    }
+    exec(_vllm_dtype_block(vu), scope)
+    assert scope["dtype"] is torch.float16
+
+
+@not_on_macos
 def test_vllm_cuda_dtype_never_asks_the_xpu_check(vu, monkeypatch):
     _fake_vllm_platforms(monkeypatch, refuses = True)
     scope = {
