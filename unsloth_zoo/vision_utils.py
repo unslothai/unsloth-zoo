@@ -1694,7 +1694,12 @@ class UnslothVisionDataCollator:
         audio_call_kwarg = _audio_call_kwarg(processor)
         if not has_images:
             if not _audio_sub_processors(processor):
-                raise TypeError("Unsloth: UnslothVisionDataCollator requires an image or audio processor!")
+                raise TypeError(
+                    f"Unsloth: UnslothVisionDataCollator requires an image or audio processor, but got "
+                    f"{type(processor).__name__}, which is text only. Pass the processor returned by "
+                    "FastVisionModel.from_pretrained, not AutoTokenizer. If you loaded a local folder, it is "
+                    "missing preprocessor_config.json: copy it from the original model repo."
+                )
             if audio_call_kwarg is None:
                 raise TypeError(
                     f"Unsloth: UnslothVisionDataCollator does not support {type(processor).__name__}: "
