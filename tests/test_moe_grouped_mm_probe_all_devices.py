@@ -425,6 +425,21 @@ def test_tracing_an_unprobed_card_never_runs_a_probe(spoof, monkeypatch):
     assert moe_utils._transposed_view_safe_on(cuda(1)) is False   # nothing probed at all: the contiguous copy
 
 
+def test_tracing_a_card_of_another_accelerator_type_never_resolves_it(spoof, monkeypatch):
+    # Mixed CUDA/XPU: the eager anchor classifies only the home type, so an XPU card first seen in a
+    # trace must not reach the compiler-disabled resolver; it takes the home answers.
+    spoof(2, models = ["H100", "RTX4090"])
+    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
+    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+    def no_probe(_probe): raise AssertionError("resolver ran while tracing")
+    monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_probe)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    xpu = types.SimpleNamespace(type = "xpu", index = 0)
+    assert moe_utils._grouped_mm_supported_on(xpu) is True
+    assert moe_utils._transposed_view_safe_on(xpu) is True
+    assert ("xpu", 0) not in moe_utils._GROUPED_MM_FOREIGN
+
+
 def test_a_fullgraph_compile_on_an_unprobed_card_traces(spoof, monkeypatch):
     spoof(2, models = ["H100", "RTX4090"])
     monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)

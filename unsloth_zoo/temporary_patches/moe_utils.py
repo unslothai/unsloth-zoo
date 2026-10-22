@@ -1570,6 +1570,13 @@ def _grouped_mm_all_cards_alike(home_type, count):
         return False
 
 
+def _grouped_mm_unclassified_while_tracing(device):
+    # A card the eager anchor did not classify (another accelerator type on a mixed CUDA/XPU host)
+    # must not reach the compiler-disabled resolver from a trace: the caller takes the home answer.
+    return (torch.compiler.is_compiling() and device is not None and device.index is not None
+            and (device.type, device.index) not in _GROUPED_MM_FOREIGN)
+
+
 def _grouped_mm_foreign_kind(device):
     if device is None or device.type not in ("cuda", "xpu") or device.index is None: return None
     key = (device.type, device.index)
@@ -1614,7 +1621,7 @@ def _check_torch_grouped_mm_supported(device = None):
 def _grouped_mm_supported_on(device):
     # Absent symbol (torch 2.6/2.7): the traceable definitive negative, no classification.
     # One GPU model on the host: the process-wide flag answers for every card.
-    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE:
+    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_unclassified_while_tracing(device):
         return _check_torch_grouped_mm_supported()
     kind = _grouped_mm_foreign_kind(device)
     if kind is None:
@@ -1768,6 +1775,7 @@ _TRANSPOSED_VIEW_SAFE_BY_KIND = {}
 def _transposed_view_safe_on(device):
     """View probe on `device`'s GPU model; the home model keeps the process-wide flag."""
     if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
+    if _grouped_mm_unclassified_while_tracing(device): return bool(_TRANSPOSED_VIEW_GROUPED_MM_SAFE)
     kind = _grouped_mm_foreign_kind(device)
     if kind is None: return _transposed_view_grouped_mm_is_safe()
     safe = _TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind)
