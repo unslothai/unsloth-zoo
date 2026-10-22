@@ -1531,11 +1531,13 @@ _GROUPED_MM_HOME_LOCK = threading.Lock()
 # True once every visible accelerator is the home card's model: the per-call gates then read the
 # process-wide flags directly (no device classification per GEMM). Set eagerly with the home anchor.
 _GROUPED_MM_HOMOGENEOUS = False
+# The home card's model, read once when the home is anchored (traced calls never query a device).
+_GROUPED_MM_HOME_INFO = None
 
 
 def _grouped_mm_home():
     """Card the process-wide flags describe; locked so concurrent first callers on different cards agree."""
-    global _GROUPED_MM_HOME, _GROUPED_MM_HOMOGENEOUS
+    global _GROUPED_MM_HOME, _GROUPED_MM_HOMOGENEOUS, _GROUPED_MM_HOME_INFO
     if _GROUPED_MM_HOME is None:
         device = _grouped_mm_probe_device()
         anchored = False
@@ -1547,6 +1549,7 @@ def _grouped_mm_home():
         # Classify the other visible cards now (metadata only, no kernel probe): a traced first use of
         # another card must not reach the compiler-disabled resolver (graph break / fullgraph error).
         if anchored:
+            _GROUPED_MM_HOME_INFO = _grouped_mm_device_kind(getattr(torch, device.type), device.index)
             try:
                 count = getattr(torch, device.type).device_count()
             except Exception:
@@ -1618,6 +1621,17 @@ def _check_torch_grouped_mm_supported(device = None):
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
 
+def _grouped_mm_kind_is_older(kind):
+    """True when a classified card's (major, minor) is below the home card's. A trace on such a card
+    takes the manual loop: the home answer may name a kernel an older card does not have (torch 2.8
+    grouped_mm is sm90+), and probing would break the graph. Unknown models keep the home answer."""
+    home = _GROUPED_MM_HOME_INFO
+    info = kind[1] if isinstance(kind, tuple) and len(kind) == 2 else None
+    if not (isinstance(home, tuple) and isinstance(info, tuple)): return False
+    if None in (home[1], home[2], info[1], info[2]): return False
+    return (info[1], info[2]) < (home[1], home[2])
+
+
 def _grouped_mm_supported_on(device):
     # Absent symbol (torch 2.6/2.7): the traceable definitive negative, no classification.
     # One GPU model on the host: the process-wide flag answers for every card.
@@ -1630,7 +1644,7 @@ def _grouped_mm_supported_on(device):
     # home card's answer, which every card used before per-model probes. Answering False would bake
     # the slow loop into the graph, or route to the compiler-disabled per-group fallback.
     if torch.compiler.is_compiling() and kind not in _TORCH_GROUPED_MM_SUPPORTED_BY_KIND:
-        return _check_torch_grouped_mm_supported()
+        return _check_torch_grouped_mm_supported() and not _grouped_mm_kind_is_older(kind)
     return _check_torch_grouped_mm_supported(device)
 
 
