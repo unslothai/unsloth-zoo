@@ -922,9 +922,9 @@ def _find_lib_path(lib_name):
     try:
         result = subprocess.run(
             ['gcc', f'-print-file-name={lib_name}'],
-            capture_output=True, text=True, encoding="utf-8", errors="replace"
+            capture_output=True,
         )
-        path = os.path.realpath(result.stdout.strip())
+        path = os.path.realpath(os.fsdecode(result.stdout).strip())
         if os.path.isabs(path) and os.path.exists(path):
             return path
     except Exception as exc:
