@@ -5370,12 +5370,9 @@ def _is_moe_expert_lora_key(key):
 
 
 def _is_moe_per_expert_lora_key(key):
-    """True for a per-expert 2D adapter key (`experts.<i>.gate_proj`, Mixtral's `experts.<i>.w1`).
+    """True for a per-expert 2D adapter key (`experts.<i>.gate_proj`, Mixtral `experts.<i>.w1`).
 
-    Transformers 4.x keeps Qwen3-MoE / Mixtral experts as one nn.Linear per expert, so the
-    adapter is a plain 2D LoRA per expert. That is the layout vLLM's 2D FusedMoEWithLoRA
-    reads: `get_packed_modules_mapping` maps `experts` to `experts.<i>.<proj>` exactly when
-    the model is not `is_3d_moe_weight` (vllm/lora/utils.py), so it is not a stacked tensor.
+    vLLM's 2D FusedMoEWithLoRA reads this layout when the model is not `is_3d_moe_weight` (vllm/lora/utils.py).
     """
     # All Unsloth Zoo code licensed under LGPLv3
     parts = key.split(".")
@@ -5794,8 +5791,7 @@ def _check_lora_is_servable(model, keys, source, peft_config):
     """
     # All Unsloth Zoo code licensed under LGPLv3
     expert_keys = [k for k in keys if _is_moe_expert_lora_key(k)]
-    # Per-expert 2D keys (transformers 4.x Qwen3-MoE / Mixtral experts.<i>.<proj>) and stacked
-    # keys need opposite vLLM wrappers, so each group is checked against its own.
+    # Per-expert 2D and stacked keys need opposite vLLM wrappers.
     per_expert_keys = [k for k in expert_keys if _is_moe_per_expert_lora_key(k)]
     stacked_keys = [k for k in expert_keys if not _is_moe_per_expert_lora_key(k)]
     for per_expert, expert_keys in ((False, stacked_keys), (True, per_expert_keys)):

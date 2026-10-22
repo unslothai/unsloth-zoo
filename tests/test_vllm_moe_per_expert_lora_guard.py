@@ -13,13 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Per-expert 2D MoE LoRA (transformers 4.x Qwen3-MoE / Mixtral `experts.<i>.<proj>`) is servable on a 2D vLLM model.
-
-vLLM maps `experts` to `experts.<i>.<proj>` for the 2D FusedMoEWithLoRA exactly when the model
-is not `is_3d_moe_weight` (vllm/lora/utils.py), so those keys are its native layout. The guard
-used to treat every `.experts.` key as a stacked tensor and refuse it there. No vLLM needed:
-the engine lookups are stubbed.
-"""
+"""Per-expert 2D MoE LoRA (`experts.<i>.<proj>`) is servable on a 2D vLLM model; engine lookups are stubbed."""
 import types
 
 import pytest
@@ -84,7 +78,6 @@ def test_per_expert_adapter_on_a_3d_model_is_refused(engine):
     engine.is_3d = True
     with pytest.raises(NotImplementedError, match = "per-expert"):
         vu._check_lora_is_servable(_model(), PER_EXPERT_KEYS, "the training model", {"r": 16})
-    # enable_mixed_moe_lora_format forces the 2D wrapper, which reads per-expert adapters.
     engine.mixed = True
     vu._check_lora_is_servable(_model(), PER_EXPERT_KEYS, "the training model", {"r": 16})
 
