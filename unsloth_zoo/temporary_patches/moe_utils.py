@@ -2230,17 +2230,9 @@ def combine_permuted_moe_outputs(
 
 
 class _RoutedRowGather(torch.autograd.Function):
-    """hidden_states[sorted_indices // top_k] with a fixed-order backward.
-
-    Autograd's backward of that gather is an accumulating index_put over top_k duplicate
-    rows per token. Eager CUDA sorts first and is reproducible, but Inductor (block compile)
-    lowers it to tl.atomic_add, so every LoRA grad upstream of the first MoE backward changed
-    between two identical steps. The backward here is the same top_k sum in a fixed order,
-    spelled as combine_permuted_moe_outputs (inverse-permutation gather + sum). An unrolled
-    fp32 sum over the top_k slots is faster but Inductor miscompiled it under dynamic shapes
-    (torch 2.13: wrong, run-to-run varying dX), so it is not used.
-    With top_k <= 2 every token row gets at most two addends onto zero, which is order
-    independent, so the plain gather is kept there."""
+    """hidden_states[sorted_indices // top_k] with a fixed-order backward: Inductor lowers the
+    default index_put backward to tl.atomic_add (non-reproducible LoRA grads). An unrolled top_k
+    sum was miscompiled under dynamic shapes (torch 2.13), so do not use it."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     @staticmethod
@@ -2257,16 +2249,14 @@ class _RoutedRowGather(torch.autograd.Function):
         return grad, None, None
 
 
-# Fixed-order gather from top_k 8 (measured faster on L4: -55% at k 8; k 4 was +22% on the gather
-# alone). UNSLOTH_MOE_DETERMINISTIC_GATHER=1 uses it for every top_k > 2, =0 never.
+# Default from top_k 8 (L4: -55% at k 8, +22% at k 4). Env =1: every top_k > 2, =0: never.
 _DETERMINISTIC_GATHER = os.environ.get("UNSLOTH_MOE_DETERMINISTIC_GATHER", "")
 _DETERMINISTIC_GATHER_MIN_TOP_K = {"1": 3, "0": 1 << 30}.get(_DETERMINISTIC_GATHER, 8)
 
 
 def gather_routed_rows(hidden_states, sorted_indices, top_k):
-    """Rows of a 2D hidden_states in routed (expert-sorted) order; sorted_indices must be the
-    full argsort permutation from moe_routing_sort. Eager keeps plain indexing: its sorted
-    index_put backward is already reproducible and needs no [T * top_k, H] buffer."""
+    """sorted_indices must be the full argsort from moe_routing_sort. Eager backward is already
+    reproducible, so it keeps plain indexing."""
     # This Unsloth Zoo code section is licensed under AGPL3
     if (
         top_k >= _DETERMINISTIC_GATHER_MIN_TOP_K

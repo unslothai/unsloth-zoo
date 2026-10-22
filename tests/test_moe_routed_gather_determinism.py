@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The routed gather hidden_states[sorted_indices // top_k] must have a reproducible backward
-under torch.compile (Unsloth block compile puts the MoE inside one Inductor region).
-
-Autograd differentiates that gather into an accumulating index_put with top_k duplicate rows
-per token. Inductor lowers it to tl.atomic_add, so two identical backward passes in one
-process gave different dX, and every LoRA gradient upstream of the first MoE layer differed
-(attention LoRA included, even with frozen experts). gather_routed_rows sums the top_k rows in
-a fixed order instead.
-"""
+"""Compiled routed-gather backward must avoid tl.atomic_add and be bitwise reproducible."""
 
 import pytest
 import torch
@@ -67,15 +59,14 @@ def test_compiled_grouped_mm_backward_has_no_atomics_and_is_bitwise_reproducible
 
     m, x, topi, w, dy, lora = _case(k = top_k)
     monkeypatch.setattr(mu, "take_moe_lora_stash", lambda module, name: lora.get(name))
-    # top_k 4 takes the fixed-order gather only under UNSLOTH_MOE_DETERMINISTIC_GATHER=1.
+    # Force the fixed-order gather for top_k 4 too.
     monkeypatch.setattr(mu, "_DETERMINISTIC_GATHER_MIN_TOP_K", 3)
-    # Eager reference: the sorted index_put backward, reproducible but not the compiled path.
     xe = x.detach().clone().requires_grad_(True)
     mu.forward_native_grouped_mm(m, xe, topi, w).backward(dy)
     for a, b, _ in lora.values():
         a.grad = b.grad = None
     torch._dynamo.reset()
-    # Block compile marks the sequence dim dynamic; an unrolled spelling was wrong only there.
+    # Block compile marks the sequence dim dynamic.
     compiled = torch.compile(mu.forward_native_grouped_mm, fullgraph = False, dynamic = dynamic)
 
     def step():
@@ -88,7 +79,6 @@ def test_compiled_grouped_mm_backward_has_no_atomics_and_is_bitwise_reproducible
 
     with torch._inductor.config.patch(fx_graph_cache = False):
         first, codes = run_and_get_code(step)
-        # The gather's backward is the only accumulating scatter in this region.
         assert not any("tl.atomic_add(" in c for c in codes), "routed gather backward lowered to atomics"
         rel = ((first[0].double() - xe.grad.double()).norm() / xe.grad.double().norm()).item()
         assert rel < 2e-2, rel
@@ -120,7 +110,6 @@ def test_gather_routed_rows_matches_indexing(top_k):
     assert torch.equal(got, ref)
     torch.testing.assert_close(xc.grad, xr.grad, rtol = 0, atol = 1e-12)
 
-    # Eager keeps plain indexing (identical forward and backward to before).
     xe = x.clone().requires_grad_(True)
     mu.gather_routed_rows(xe, sorted_indices, top_k).backward(g)
     assert torch.equal(xe.grad, xr.grad)
