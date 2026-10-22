@@ -1440,13 +1440,37 @@ def _flatten_message_content(messages, placeholders):
 pass
 
 
+def _template_drops_audio(processor) -> bool:
+    """Granite Speech templates drop an audio part or print the content list's repr; the model expects
+    the audio token inside a string turn instead."""
+    token = getattr(processor, "audio_token", None)
+    if not isinstance(token, str) or not token or not _audio_sub_processors(processor):
+        return False
+    try:
+        with_audio = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": "Hello!"}]}], tokenize = False,
+        )
+        text_only = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], tokenize = False,
+        )
+        as_string = processor.apply_chat_template(
+            [{"role": "user", "content": f"{token}\nHello!"}], tokenize = False,
+        )
+    except Exception:
+        return False
+    if not isinstance(with_audio, str) or token not in str(as_string):
+        return False
+    return with_audio == text_only or _renders_content_list_as_repr(with_audio, "Hello!")
+pass
+
+
 def _template_needs_string_content(processor) -> bool:
     """List content raises TypeError but the same turn as a string renders."""
     try:
         processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], tokenize = False,
         )
-        return False
+        return _template_drops_audio(processor)
     except TypeError:
         pass
     except Exception:
