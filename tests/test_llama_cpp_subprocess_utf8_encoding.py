@@ -63,7 +63,12 @@ def test_try_execute_reads_non_locale_utf8_output():
     import sys
     import unsloth_zoo.llama_cpp as llama_cpp
 
-    child = "import sys; sys.stdout.buffer.write(('tensor ' + chr(0x201D) + ' ok' + chr(10)).encode('utf-8'))"
+    raw = "import sys; sys.stdout.buffer.write(('tensor ' + chr(0x201D) + ' ok' + chr(10)).encode('utf-8'))"
     lines = []
-    llama_cpp.try_execute(f'"{sys.executable}" -c "{child}"', print_outputs = lines)
+    llama_cpp.try_execute(f'"{sys.executable}" -c "{raw}"', print_outputs = lines)
     assert "".join(lines) == "tensor ” ok\n"
+
+    # A Python child printing to the pipe (the GGUF converter) must emit UTF-8 too.
+    lines = []
+    llama_cpp.try_execute(f'"{sys.executable}" -c "print(chr(0x201D) + chr(0xE9) + chr(0x4E2D))"', print_outputs = lines)
+    assert "".join(lines) == "”é中\n"

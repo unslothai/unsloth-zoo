@@ -829,10 +829,15 @@ def check_pip():
 pass
 
 
+def _utf8_child_env():
+    # Python children write piped stdio in the ANSI code page on Windows; make them emit the UTF-8 we decode.
+    return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian", ignore_deprecation = False):
     # All Unsloth Zoo code licensed under LGPLv3
 
-    with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True, encoding="utf-8", errors="replace") as sp:
+    with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, env = _utf8_child_env(), text=True, encoding="utf-8", errors="replace") as sp:
         stdout, stderr = sp.communicate()
         stdout = stdout or ""
         stderr = stderr or ""
@@ -4782,6 +4787,7 @@ def _convert_to_gguf(command, output_filename, print_output = False, print_outpu
         universal_newlines = True,
         encoding = "utf-8",
         errors = "replace",
+        env = _utf8_child_env(),
         shell = True,
     )
     ProgressBar._instances.clear()
