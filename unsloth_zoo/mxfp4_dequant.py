@@ -76,6 +76,9 @@ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = F
         exponent = (scales_in[r0:r1].to(torch.int32) - 127).unsqueeze(-1)
         if _LDEXP_EXACT:
             piece = torch.ldexp(piece, exponent).to(dtype)
+        elif work == torch.float64:
+            # Old float64 ldexp rounds on CUDA; 2^e from its float64 bits is exact for every e8m0 scale.
+            piece.mul_(((exponent.to(torch.int64) + 1023) << 52).view(torch.float64))
         else:
             # Exact in fp32, then one rounding; 255 as 2^127 then 2.
             piece = torch.ldexp(piece, exponent.clamp(max = 127))

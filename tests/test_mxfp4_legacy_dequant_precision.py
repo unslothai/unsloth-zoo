@@ -37,16 +37,38 @@ def _every_byte_and_scale():
     return blocks, scales, (want * torch.exp2(scales.double() - 127).unsqueeze(-1)).reshape(4096, 32)
 
 
+_DEVICES = ["cpu", pytest.param("cuda", marks = pytest.mark.skipif(not torch.cuda.is_available(), reason = "no CUDA"))]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("old_torch_path", [False, True])
-def test_float64_output_is_exact_on_every_torch(monkeypatch, old_torch_path):
+def test_float64_output_is_exact_on_every_torch(monkeypatch, old_torch_path, device):
     if old_torch_path:
         monkeypatch.setattr(mxd, "_LDEXP_EXACT", False)
     blocks, scales, want = _every_byte_and_scale()
-    got = mxfp4_dequantize_torch(blocks, scales, dtype = torch.float64)
-    assert torch.equal(got, want)
+    # Old CUDA float64 ldexp rounds (0x11 at scale 14 gave 4.8148e-35, not 2^-114).
+    got = mxfp4_dequantize_torch(blocks.to(device), scales.to(device), dtype = torch.float64).cpu()
+    assert int((got != want).sum()) == 0
     # 6 * 2^128: finite in float64, inf if it passes through fp32.
-    top = mxfp4_dequantize_torch(torch.full((1, 1, 16), 0x77, dtype = torch.uint8), torch.full((1, 1), 255, dtype = torch.uint8), dtype = torch.float64)
-    assert torch.equal(top, torch.full((1, 32), 6 * 2.0 ** 128, dtype = torch.float64))
+    top = mxfp4_dequantize_torch(torch.full((1, 1, 16), 0x77, dtype = torch.uint8, device = device), torch.full((1, 1), 255, dtype = torch.uint8, device = device), dtype = torch.float64)
+    assert torch.equal(top.cpu(), torch.full((1, 32), 6 * 2.0 ** 128, dtype = torch.float64))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "no CUDA")
+@pytest.mark.parametrize("old_torch_path", [False, True])
+def test_float64_temporaries_stay_within_the_chunk_budget(monkeypatch, old_torch_path):
+    if old_torch_path:
+        monkeypatch.setattr(mxd, "_LDEXP_EXACT", False)
+    blocks = torch.full((8192, 128, 16), 0x77, dtype = torch.uint8, device = "cuda")
+    scales = torch.full((8192, 128), 127, dtype = torch.uint8, device = "cuda")
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    out = mxfp4_dequantize_torch(blocks, scales, dtype = torch.float64)
+    temp = torch.cuda.max_memory_allocated() - base - out.numel() * out.element_size()
+    # Merge base peaks at 516 MiB here on every torch; the old float64 ldexp + where path reached 773 MiB.
+    assert temp <= 2 * mxd._TORCH_CHUNK_BYTES + (8 << 20), temp / 2**20
 
 
 @pytest.mark.parametrize("block_bytes", [8, 16])
