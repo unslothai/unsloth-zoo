@@ -481,7 +481,7 @@ def layer_norm_gated_fwd(
     # heuristics for number of warps
 
     if D <= 512:
-        # Unsloth: NB (unread by the kernels) is no longer a constexpr / autotune key, so no recompile per bucket.
+        # Unsloth: NB dropped (unread), so no recompile per 65536-row bucket.
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -570,7 +570,7 @@ def layer_norm_gated_bwd(
     grid = (NS,)
 
     if D <= 512:
-        # Unsloth: NB (unread by the kernels) is no longer a constexpr / autotune key, so no recompile per bucket.
+        # Unsloth: NB dropped (unread), so no recompile per 65536-row bucket.
 
         layer_norm_gated_bwd_kernel[grid](
             x=x,

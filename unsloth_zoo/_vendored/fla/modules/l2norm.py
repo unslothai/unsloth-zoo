@@ -163,7 +163,7 @@ def l2norm_fwd(
 
     rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
     if D <= 512:
-        # Unsloth: NB (unread by the kernels) is no longer a constexpr / autotune key, so no recompile per bucket.
+        # Unsloth: NB dropped (unread), so no recompile per 65536-row bucket.
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -209,7 +209,7 @@ def l2norm_bwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        # Unsloth: NB (unread by the kernels) is no longer a constexpr / autotune key, so no recompile per bucket.
+        # Unsloth: NB dropped (unread), so no recompile per 65536-row bucket.
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
