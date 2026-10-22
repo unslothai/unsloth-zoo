@@ -1595,7 +1595,7 @@ def _resolve_grouped_mm_foreign_kind(device, key):
     return kind
 
 
-# Per GPU model other than the home card's; a mixed host probes each visible model once, with the home probe.
+# Per GPU model other than the home card's; probed once, eagerly, when the experts or a call first use it.
 _TORCH_GROUPED_MM_SUPPORTED_BY_KIND = {}
 
 
@@ -1654,9 +1654,9 @@ def _grouped_mm_supported_on(device):
 
 
 def _grouped_mm_supported_while_tracing(device):
-    # Never probes a card here (graph break; an error under fullgraph). The home probe, eager or one
-    # graph break if nothing warmed it, also probes every other visible GPU model on a mixed host, so
-    # a card is unprobed only if it appeared later. Trade-off for that card: the home answer only where
+    # Never probes a card here (graph break; an error under fullgraph). The eager warm-up probes the
+    # home card and each other GPU model the experts sit on, so a card is unprobed only if the experts
+    # reached it later (or it ran no eager call first). Trade-off for that card: the home answer only where
     # torch falls back internally; elsewhere the manual loop, which is safe but breaks a fullgraph trace.
     home = _check_torch_grouped_mm_supported()
     kind = _grouped_mm_traced_kind(device)
@@ -1782,30 +1782,25 @@ def _probe_torch_grouped_mm_supported(device = None):
         _TORCH_GROUPED_MM_SUPPORTED = False
     else:
         _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
-    if device is not None: _warm_other_grouped_mm_kinds()
     return _TORCH_GROUPED_MM_SUPPORTED
 
 
-def _warm_other_grouped_mm_kinds():
-    """Mixed host only, eagerly with the home probe: probe one card of every other visible GPU model,
-    so a later trace on any of them reads its own answers, never the home card's."""
+def _warm_grouped_mm_devices(devices):
+    """Mixed host only, eagerly: probe one card of each other GPU model among `devices` (the cards
+    holding this process's expert weights), so a later trace there reads its own answers. Never a
+    card the process does not use: torchrun ranks see every GPU, and probing foreign ones would put
+    a CUDA context and a grouped_mm call from every rank on one representative card."""
     if _GROUPED_MM_HOMOGENEOUS or torch.compiler.is_compiling(): return
     seen = set()
-    for device_type in ("cuda", "xpu"):
+    for device in devices:
         try:
-            backend = getattr(torch, device_type, None)
-            count = backend.device_count() if backend is not None and backend.is_available() else 0
+            if device is None or device.type not in ("cuda", "xpu") or device.index is None: continue
+            kind = _grouped_mm_foreign_kind(device)
+            if kind is None or kind in seen: continue
+            seen.add(kind)
+            _check_torch_grouped_mm_supported(device)
         except Exception:
-            count = 0
-        for i in range(count):
-            device = torch.device(device_type, i)
-            try:
-                kind = _grouped_mm_foreign_kind(device)
-                if kind is None or kind in seen: continue
-                seen.add(kind)
-                _check_torch_grouped_mm_supported(device)
-            except Exception:
-                pass
+            pass
 
 
 # One-time check that torch._grouped_mm on a transposed bf16 view matches the contiguous copy. Insurance

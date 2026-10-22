@@ -318,6 +318,7 @@ def _warm_moe_backend(model) -> None:
         backend_module = sys.modules.get(getattr(backend, "__module__", None) or "", moe_utils)
     except Exception:
         return
+    devices = _expert_devices(model)
     # The package module and the compiled-cache copy each cache their own probe results.
     for module in (moe_utils,) if backend_module is moe_utils else (moe_utils, backend_module):
         for probe in ("_check_torch_grouped_mm_supported", "_transposed_view_grouped_mm_is_safe"):
@@ -325,6 +326,28 @@ def _warm_moe_backend(model) -> None:
                 getattr(module, probe)()
             except Exception:
                 pass
+        # Mixed host: also each other GPU model the experts sit on (only those: never a card this process does not use).
+        warm = getattr(module, "_warm_grouped_mm_devices", None)
+        if devices and callable(warm):
+            try:
+                warm(devices)
+            except Exception:
+                pass
+
+
+def _expert_devices(model) -> list:
+    """Accelerator devices holding the stacked expert weights (meta / CPU while still loading: none)."""
+    devices = []
+    try:
+        for module in model.modules():
+            params = getattr(module, "_parameters", None) or {}
+            for name in _EXPERT_STACK_NAMES:
+                device = getattr(params.get(name), "device", None)
+                if device is not None and device.type in ("cuda", "xpu") and device not in devices:
+                    devices.append(device)
+    except Exception:
+        return devices
+    return devices
 
 
 def _patch_decode_switch():
