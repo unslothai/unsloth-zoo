@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import copy
+import gc
 import importlib
 import json
+import os
 import re
 import sys
 import time
@@ -1834,7 +1836,21 @@ class ContextDrafter:
         return [0] * len(rows)
 
 
-def _built(wrapper, model: nn.Module, target: nn.Module, **kwargs):
+def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, quantize: bool = False, **kwargs):
+    quantized = any(key.endswith(".scales") for key, _ in tree_flatten(model.parameters()))
+    if quantize and wrapper in (MTPDrafter, ContextDrafter) and not quantized and (bits := int(os.environ.get("UNSLOTH_MLX_DRAFTER_BITS", "4"))):
+        # At 4 bits these drafters accept within ~2% of bf16 at under a third of the memory, and verification keeps
+        # the output exact either way. A checkpoint that quantized its drafter chose what to leave in full precision.
+        nn.quantize(model, group_size = 64, bits = bits, class_predicate = lambda name, layer: (
+            hasattr(layer, "to_quantized") and not isinstance(layer, nn.Embedding)
+            and not name.endswith(("mlp.gate", "shared_expert_gate")) and layer.weight.shape[-1] % 64 == 0
+        ))
+        # The replaced layers sit in reference cycles: until collected, their weights would be loaded and kept.
+        gc.collect()
+    if not lazy:
+        # An array at a time, so a lazily loaded drafter quantized above never holds its full-precision weights whole.
+        for _, value in tree_flatten(model.parameters()):
+            mx.eval(value)
     # Counted before the wrapper binds the target (a bound DFlash drafter holds its embedding and head); ``lazy``
     # factories evaluate nothing mlx-vlm's loader leaves lazy (it converts ModelOpt/compressed-tensors exports eagerly).
     weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
@@ -1861,15 +1877,20 @@ def _dense_table(model: nn.Module) -> nn.Module:
 def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter | MTPDrafter | HeadDrafter:
     """A drafter from a separate DFlash, DFlash2, DSpark, EAGLE-3, Gemma 4 assistant or MTP head checkpoint, checked against ``target``."""
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+    from mlx_vlm.utils import get_model_path
 
-    model, kind = load_drafter(str(model_path), lazy = lazy)
+    # Loaded lazily whatever ``lazy`` is, so quantizing reads the full-precision weights only as it goes; mlx-vlm
+    # reads a head out of a whole model's checkpoint eagerly, so only a drafter's own checkpoint is quantized.
+    model, kind = load_drafter(str(model_path), lazy = True)
+    quantize = get_mtp_splitter(source_config = json.loads((get_model_path(str(model_path)) / "config.json").read_text())) is None
     if kind not in ("dflash", "eagle3", "mtp"):
         raise ValueError(f"{kind} companion drafters are not supported")
     validate_drafter_compatibility(target, model, kind)
     if kind == "mtp":
         assistant = str(getattr(model.config, "model_type", "")).endswith("_assistant")
-        return _built(AssistantDrafter, _dense_table(model), target) if assistant else _head_drafter(model, target, **kwargs)
-    return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, **kwargs)
+        return _built(AssistantDrafter, _dense_table(model), target, lazy = lazy) if assistant else _head_drafter(model, target, lazy = lazy, quantize = quantize, **kwargs)
+    return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, lazy = lazy, quantize = quantize, **kwargs)
 
 
 def _checkpoint_keys(path: Path) -> dict[str, Path]:
@@ -1967,10 +1988,8 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool 
             ),
         )
     model.load_weights(list(weights.items()), strict = True)
-    if not lazy:
-        mx.eval(model.parameters())
     from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
 
     if DRAFTER_KIND_BY_MODEL_TYPE.get(splitter.output_model_type) == "dflash":
-        return _built(ContextDrafter, model, target, **kwargs)
-    return _head_drafter(model, target, **kwargs)
+        return _built(ContextDrafter, model, target, lazy = lazy, **kwargs)
+    return _head_drafter(model, target, lazy = lazy, **kwargs)

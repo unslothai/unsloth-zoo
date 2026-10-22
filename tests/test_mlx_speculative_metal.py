@@ -1023,12 +1023,15 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
 
 @pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
 def test_a_lazy_drafter_weighs_its_checkpoint_and_holds_a_started_row_without_allocating(request, companion):
-    from mlx_vlm.utils import get_model_path, load
+    from mlx_vlm.utils import load
     from unsloth_zoo.mlx import speculative
     model = request.getfixturevalue("qwen_mtp")[0] if companion is None else load("mlx-community/Qwen3.5-4B-4bit", lazy = True)[0]
     before, lazy = mx.get_active_memory(), _drafter(model, lazy = True) if companion is None else speculative.companion_drafter(companion, model, lazy = True)
     grown = speculative.probe_drafter(model, lazy, 40) and mx.get_active_memory() - before  # before any eager build below
-    stored = _drafter(model).weight_bytes if companion is None else sum(a.nbytes for a in mx.load(str(get_model_path(companion) / "model.safetensors")).values())
+    mx.reset_peak_memory()
+    held, stored = mx.get_active_memory(), (_drafter(model) if companion is None else speculative.companion_drafter(companion, model)).weight_bytes
+    # An eager build quantizes a bf16 DFlash drafter before evaluating it, so never holds the bf16 weights whole.
+    assert companion is None or mx.get_peak_memory() - held < 2 * stored
     assert grown < lazy.weight_bytes / 100 and lazy.weight_bytes == stored > 0 and (companion or _probe_matches_a_started_row(model, _drafter(model), list(range(1, 41)), lambda started: started[1]))
 
 
@@ -1186,6 +1189,33 @@ def _tiny_companion(model, repo):
     config["dflash_config"].update(target_layer_ids = [1, n // 2, n - 2], num_target_layers = n, selector_rank = 16, markov_rank = 16)
     module = {"DFlash2DraftModel": dflash2, "DSparkDraftModel": dspark}.get(config["architectures"][0], qwen3_dflash)
     return module.Model(module.ModelConfig.from_dict(config))
+
+
+def test_unquantized_companion_mtp_heads_and_dflash_drafters_load_at_4_bits_unless_turned_off(qwen, qwen_mtp, monkeypatch, tmp_path):
+    import shutil
+    import mlx.nn as nn
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
+    from unsloth_zoo.mlx import speculative
+    detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(split := tmp_path / "bf16"))
+    shutil.copytree(split, packed := tmp_path / "packed")  # the same head with only its MLP stored at 4 bits
+    for file in split.glob("*.safetensors"):
+        tensors = mx.load(str(file))
+        for key in [key for key in tensors if ".mlp." in key and key.endswith("_proj.weight")]:
+            tensors[key], tensors[key[: -len("weight")] + "scales"], tensors[key[: -len("weight")] + "biases"] = mx.quantize(tensors[key], 64, 4)
+        mx.save_safetensors(str(packed / file.name), tensors, metadata = {"format": "mlx"})
+    (packed / "config.json").write_text(json.dumps({**json.loads((split / "config.json").read_text()), "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}))
+    def built(bits):
+        monkeypatch.delenv("UNSLOTH_MLX_DRAFTER_BITS", raising = False) if bits is None else monkeypatch.setenv("UNSLOTH_MLX_DRAFTER_BITS", bits)
+        dflash = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
+        return speculative.companion_drafter(split, qwen_mtp[0]), speculative._built(speculative.ContextDrafter, dflash, qwen[0].language_model, quantize = True)
+    head, dflash = built(None)
+    # A head stored partly quantized keeps its full-precision layers; one read whole out of a model's checkpoint, as
+    # its own head or a companion, stays as stored.
+    kept, native, whole = (build(path, qwen_mtp[0]) for build, path in ((speculative.companion_drafter, packed), (speculative.native_mtp_drafter, source), (speculative.companion_drafter, source)))
+    plain_head, plain_dflash = built("0")
+    assert head.model.fc.bits == head.model.layers[0].mlp.up_proj.bits == dflash.model.fc.bits == dflash.model.layers[0].mlp.up_proj.bits == 4
+    assert type(plain_head.model.fc) is type(plain_dflash.model.fc) is nn.Linear and head.weight_bytes < plain_head.weight_bytes
+    assert type(kept.model.fc) is type(native.model.fc) is type(whole.model.fc) is nn.Linear and kept.model.layers[0].mlp.up_proj.bits == 4
 
 
 @pytest.mark.parametrize("repo", ["z-lab/Qwen3.5-4B-DFlash", "incoai/Qwen3.8-27B-DFlash2", "RadixArk/Qwen3.8-27B-DSpark"])
