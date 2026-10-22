@@ -508,8 +508,7 @@ def _cvt_ok(index, eager = False):
         except Exception:
             pass
     try:
-        # The probe syncs (torch.equal); inside a CUDA graph capture that would invalidate it. Asked on the
-        # operand's device: the capturing stream is current only there (GPU 1 capturing while GPU 0 is current).
+        # Probe syncs (invalidates a capture); ask the operand's device, the only one whose stream is capturing.
         with torch.cuda.device(index):
             if torch.cuda.is_current_stream_capturing():
                 return None

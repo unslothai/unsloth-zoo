@@ -140,8 +140,7 @@ def test_first_call_inside_cuda_graph_capture_does_not_probe(monkeypatch):
 
 
 def test_capture_on_a_non_current_operand_device_does_not_probe(monkeypatch):
-    # GPU 1's stream captures while GPU 0 is current: the capture check must ask GPU 1, else the cold probe
-    # syncs inside the capture (cudaErrorStreamCaptureInvalidated) and caches the fma fallback.
+    # Capture check must ask GPU 1, else the probe syncs mid-capture and caches the fma fallback.
     import unsloth_zoo.mxfp4_gemm as mg
     if torch.cuda.device_count() < 2:
         pytest.skip("needs two GPUs")
