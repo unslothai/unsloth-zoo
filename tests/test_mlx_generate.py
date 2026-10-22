@@ -1695,8 +1695,9 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     from unsloth_zoo.mlx.inference import (exact_batch_invariant_decode, exact_dilated_depthwise_conv,
                                            exact_ple_row_reads, exact_qsa_trim, exact_speculative_verify,
                                            fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                                           fused_moe_router, fused_packed_gated_delta, fused_residual_norm,
-                                           fused_residual_norm_handoff, fused_verify_attention)
+                                           fused_moe_router, fused_packed_gated_delta, fused_qwen4_decode,
+                                           fused_qwen4_prefill, fused_residual_norm, fused_residual_norm_handoff,
+                                           fused_verify_attention)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1708,7 +1709,7 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
                 fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model), \
                 exact_speculative_verify(model), exact_batch_invariant_decode(model), fused_packed_gated_delta(model), \
                 fused_verify_attention(model), exact_ple_row_reads(model), exact_qsa_trim(model), \
-                exact_dilated_depthwise_conv(model):
+                exact_dilated_depthwise_conv(model), fused_qwen4_prefill(model), fused_qwen4_decode(model):
             pass
 
 
