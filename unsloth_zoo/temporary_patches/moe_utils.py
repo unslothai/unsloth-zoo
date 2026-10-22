@@ -1133,11 +1133,49 @@ class _ExpertBiasGather(torch.autograd.Function):
         rows = grad.shape[0]
         if rows <= chunk:
             return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
-        out = torch.zeros(ctx.num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
-        for start in range(0, rows, chunk):
-            one_hot = (expert_ids[start : start + chunk].unsqueeze(0) == experts).to(grad.dtype)
-            out += (one_hot @ grad[start : start + chunk]).float()
-        return out.to(grad.dtype), None
+        if _EXPERT_BIAS_GRAD_OP is not None:
+            # Opaque to Dynamo: a Python loop over the row count would specialize it (dynamic shapes).
+            return _EXPERT_BIAS_GRAD_OP(expert_ids, grad, ctx.num_experts), None
+        return _expert_bias_grad_chunked(expert_ids, grad, ctx.num_experts), None
+
+
+def _expert_bias_grad_chunked(expert_ids, grad, num_experts):
+    """one-hot(expert_ids) @ grad in row chunks, each GEMM in fp32: a 16-bit chunk result can overflow to inf
+    and the fp32 sum then turns +inf + -inf into NaN, while the exact total is finite. The fp32 one-hot and grad
+    chunk together stay at most _EXPERT_BIAS_ONE_HOT_ELEMENTS elements."""
+    chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // (num_experts + grad.shape[1]))
+    experts = torch.arange(num_experts, device = expert_ids.device, dtype = expert_ids.dtype).unsqueeze(1)
+    out = torch.zeros(num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
+    for start in range(0, grad.shape[0], chunk):
+        one_hot = (expert_ids[start : start + chunk].unsqueeze(0) == experts).float()
+        out.addmm_(one_hot, grad[start : start + chunk].float())
+    return out.to(grad.dtype)
+
+
+def _register_expert_bias_grad_op():
+    """_expert_bias_grad_chunked as an opaque op for compiled backwards. Registered once per process:
+    the compiled-cache copy of this file reuses the first registration."""
+    if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
+        return None
+    try:
+        return torch.ops.unsloth_zoo.expert_bias_grad_chunked.default
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        @torch.library.custom_op("unsloth_zoo::expert_bias_grad_chunked", mutates_args = ())
+        def expert_bias_grad_chunked(expert_ids: torch.Tensor, grad: torch.Tensor, num_experts: int) -> torch.Tensor:
+            return _expert_bias_grad_chunked(expert_ids, grad, num_experts)
+
+        @expert_bias_grad_chunked.register_fake
+        def _(expert_ids, grad, num_experts):
+            return grad.new_empty((num_experts, grad.shape[1]))
+
+        return torch.ops.unsloth_zoo.expert_bias_grad_chunked.default
+    except Exception:
+        return None
+
+
+_EXPERT_BIAS_GRAD_OP = _register_expert_bias_grad_op()
 
 
 def _gather_expert_bias(bias, expert_ids):

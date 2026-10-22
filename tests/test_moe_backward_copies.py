@@ -383,3 +383,40 @@ def test_expert_bias_gather_chunks_bound_one_hot(monkeypatch):
     want = torch.zeros(E, D, dtype = torch.float64, device = "cuda").index_add_(0, ids, g.double())
     assert bias.grad.dtype == DT
     assert _rel(bias.grad, want) < 4e-3, _rel(bias.grad, want)
+
+
+def test_expert_bias_gather_chunks_sum_fp32_no_overflow(monkeypatch):
+    """Chunk sums of +-65536 overflow float16, the exact total is 0: a 16-bit chunk result gave inf - inf = NaN."""
+    monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", 1 << 12)
+    E, M = 4, 2048
+    ids = torch.zeros(M, dtype = torch.long)
+    g = torch.full((M, 1), 64.0, dtype = torch.float16)
+    g[M // 2 :] = -64.0
+    bias = torch.zeros(E, 1, dtype = torch.float16, requires_grad = True)
+    mu._gather_expert_bias(bias, ids).backward(g)
+    want = torch.zeros(E, 1, dtype = torch.float64).index_add_(0, ids, g.double())
+    assert torch.isfinite(bias.grad).all(), bias.grad
+    assert torch.equal(bias.grad.double(), want), (bias.grad, want)
+
+
+def test_expert_bias_gather_chunks_dynamic_rows(monkeypatch):
+    """The chunked backward must not specialize the routed row count: dynamic=True + mark_dynamic compiles once."""
+    monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", 1 << 12)
+    E = 8
+    chunk = (1 << 12) // E
+    torch._dynamo.reset()
+    counters = torch._dynamo.utils.counters
+    counters.clear()
+    f = torch.compile(mu._gather_expert_bias, backend = "aot_eager", fullgraph = True, dynamic = True)
+    for rows in (chunk + 1, 2 * chunk + 3, 3 * chunk + 5):
+        gen = torch.Generator().manual_seed(rows)
+        ids = torch.randint(0, E, (rows,), generator = gen)
+        torch._dynamo.mark_dynamic(ids, 0)
+        g = torch.randn(rows, 4, generator = gen)
+        bias = torch.zeros(E, 4, requires_grad = True)
+        f(bias, ids).backward(g)
+        want = torch.zeros(E, 4, dtype = torch.float64).index_add_(0, ids, g.double())
+        torch.testing.assert_close(bias.grad.double(), want, rtol = 1e-5, atol = 1e-5)
+    assert counters["stats"]["unique_graphs"] == 1, dict(counters["stats"])
+    assert not counters["graph_break"], dict(counters["graph_break"])
+    torch._dynamo.reset()
