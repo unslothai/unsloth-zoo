@@ -711,8 +711,7 @@ def _sonic_eligible(self, hidden_states):
         return False, f"device {hidden_states.device} is not the compute capability sonic was probed on"
     if hidden_states.dtype not in _SUPPORTED_DTYPES:
         return False, f"dtype {hidden_states.dtype} is not bf16/fp16"
-    # quack's GEMM wants 16-byte aligned row strides on A, B and D (8 bf16/fp16 elements);
-    # grouped_mm pads or loops over such shapes, sonic raises "expected to be divisible by 8".
+    # Row strides of A, B and D must be 16-byte aligned, else sonic raises "divisible by 8".
     align = 16 // hidden_states.element_size()
     if hidden_states.shape[-1] % align != 0:
         return False, f"hidden size {hidden_states.shape[-1]} is not a multiple of {align}"
