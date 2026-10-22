@@ -310,8 +310,7 @@ def _fake_vllm_platforms(monkeypatch, refuses = False, has_check = True, missing
 
     if has_check:
         def check_if_supports_dtype(dtype):
-            # By name: on macOS the module under test may hold a different torch object.
-            if refuses and str(dtype).endswith("bfloat16"):
+            if refuses and dtype is torch.bfloat16:
                 raise ValueError("Intel Arc A770 have bfloat16 accuracy known issue.")
         _Platform.check_if_supports_dtype = staticmethod(check_if_supports_dtype)
     mod = types.ModuleType("vllm.platforms")
@@ -319,6 +318,7 @@ def _fake_vllm_platforms(monkeypatch, refuses = False, has_check = True, missing
     monkeypatch.setitem(sys.modules, "vllm.platforms", mod)
 
 
+@not_on_macos
 @pytest.mark.parametrize(
     "fake, expected",
     [
@@ -350,6 +350,25 @@ def test_vllm_xpu_dtype_follows_vllms_bf16_check(on_xpu, vu, monkeypatch, flags,
     scope = {
         "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
         "__package__": "unsloth_zoo", "dtype": None if dtype is None else getattr(torch, dtype),
+    }
+    exec(_vllm_dtype_block(vu), scope)
+    assert scope["dtype"] is getattr(torch, expected)
+
+
+@not_on_macos
+@pytest.mark.parametrize("core_has_rule, expected", [(True, "float16"), (False, "bfloat16")])
+def test_vllm_xpu_bf16_refusal_follows_the_loaded_unsloth(on_xpu, vu, monkeypatch, core_has_rule, expected):
+    # An older unsloth keeps the Hugging Face side bf16: vLLM must not switch alone and split the weights.
+    on_xpu(_fake_xpu((_PROVEN_NO_BF16,)))
+    _fake_vllm_platforms(monkeypatch, refuses = True)
+    core = types.ModuleType("unsloth.device_type")
+    core.xpu_keeps_explicit_bf16 = lambda: True
+    if core_has_rule:
+        core.xpu_vllm_refuses_bf16 = lambda: True
+    monkeypatch.setitem(sys.modules, "unsloth.device_type", core)
+    scope = {
+        "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
+        "__package__": "unsloth_zoo", "dtype": torch.bfloat16,
     }
     exec(_vllm_dtype_block(vu), scope)
     assert scope["dtype"] is getattr(torch, expected)

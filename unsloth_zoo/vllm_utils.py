@@ -4318,8 +4318,8 @@ def load_vllm(
         raise NotImplementedError(f"Unsloth: We do not support dtype = {dtype} yet!")
     if DEVICE_TYPE == "xpu" and dtype == torch.bfloat16:
         # Fail early and agree with unsloth's loader rather than raise inside vLLM's engine.
-        from .device_type import _xpu_vllm_refuses_bf16
-        if _xpu_vllm_refuses_bf16():
+        from .device_type import _unsloth_follows_vllm_bf16_refusal, _xpu_vllm_refuses_bf16
+        if _xpu_vllm_refuses_bf16() and _unsloth_follows_vllm_bf16_refusal():
             print("Unsloth: vLLM does not accept torch.bfloat16 on this Intel GPU, so we switched to dtype = torch.float16.")
             dtype = torch.float16
 
