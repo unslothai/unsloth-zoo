@@ -4971,6 +4971,10 @@ def load_vllm(
 
         # Only for engines built here: return_args callers (e.g. `vllm serve`) start
         # their own process without the runner setting below.
+        # Routing replay on vLLM 0.31+ needs Model Runner V2, also when ReplaySSM is off here. Runs
+        # before the ReplaySSM conflict test below: a V1 runner the user chose turns routing replay
+        # off here, which leaves ReplaySSM free to stay on (it runs on V1).
+        _routing_replay_model_runner(engine_args)
         replayssm_set_runner = False
         replayssm_mode = _vllm_replayssm_mode()
         # A runner the user forced to V2 would only get the engine refused and rebuilt.
@@ -5009,8 +5013,6 @@ def load_vllm(
             elif replayssm_mode == "on":
                 print(f"Unsloth: UNSLOTH_VLLM_REPLAYSSM=1 ignored: {replayssm_skip}.")
         pass
-        # Routing replay on vLLM 0.31+ needs Model Runner V2, also when ReplaySSM is off here.
-        _routing_replay_model_runner(engine_args)
 
         # Keep trying until success (2 times)
         trials = 0

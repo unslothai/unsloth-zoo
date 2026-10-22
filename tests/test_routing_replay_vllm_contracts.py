@@ -385,8 +385,8 @@ def test_runner_is_left_alone_when_there_is_no_conflict(runner_env, monkeypatch,
 
 
 def test_load_vllm_checks_the_runner_even_when_replayssm_is_off():
-    # The check sits after the ReplaySSM block at its own level, and load_vllm records when it is the
-    # one that set the V1 runner.
+    # The check sits before the ReplaySSM block at its own level (so its conflict test sees routing
+    # replay after a user V1 runner turned it off), and load_vllm records when it set the V1 runner.
     import unsloth_zoo.vllm_utils as vu
     path = pathlib.Path(vu.__file__)
     tree = ast.parse(path.read_text(encoding = "utf-8-sig"))
@@ -402,9 +402,86 @@ def test_load_vllm_checks_the_runner_even_when_replayssm_is_off():
             and getattr(s.value.func, "id", None) == "_routing_replay_model_runner"
         ]
         if ifs and calls:
-            assert calls[0] > ifs[0]
+            assert calls[0] < ifs[0]
             break
     else:
         raise AssertionError("_routing_replay_model_runner is not called beside the ReplaySSM block")
     src = ast.get_source_segment(path.read_text(encoding = "utf-8-sig"), fn)
     assert 'os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"\n                    replayssm_set_runner = True\n                    _UNSLOTH_SET_V1_RUNNER = True' in src
+
+
+def _runner_and_replayssm_block(vu):
+    # The load_vllm statements from the runner check through the ReplaySSM block, wherever the
+    # check sits, compiled on their own: load_vllm itself needs a GPU.
+    path = pathlib.Path(vu.__file__)
+    src = path.read_text(encoding = "utf-8-sig")
+    fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+    for node in ast.walk(fn):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        ifs = [i for i, s in enumerate(body) if isinstance(s, ast.If) and ast.unparse(s.test) == "replayssm_mode != 'off'"]
+        if not ifs:
+            continue
+        calls = [
+            i for i, s in enumerate(body)
+            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+            and getattr(s.value.func, "id", None) == "_routing_replay_model_runner"
+        ]
+        start = next(i for i, s in enumerate(body) if ast.unparse(s) == "replayssm_set_runner = False")
+        span = body[min([start, *calls]) : max([ifs[0], *calls]) + 1]
+        module = ast.Module(body = [ast.Global(names = ["_UNSLOTH_SET_V1_RUNNER"]), *span], type_ignores = [])
+        fn_src = "def _block():\n" + "\n".join("    " + line for line in ast.unparse(module).splitlines())
+        return compile(fn_src, str(path), "exec")
+    raise AssertionError("ReplaySSM block not found in load_vllm")
+
+
+def _run_block(vu, monkeypatch, engine_args):
+    ns = dict(vars(vu))
+    ns.update(
+        config = SimpleNamespace(model_type = "nemotron_h"),
+        good_keys = {"model", "use_replayssm", "enable_return_routed_experts"},
+        DEVICE_TYPE = "cuda",
+        engine_args = engine_args,
+    )
+    exec(_runner_and_replayssm_block(vu), ns)
+    ns["_block"]()
+    return ns
+
+
+def test_user_v1_runner_keeps_replayssm_when_it_turns_routing_replay_off(runner_env, monkeypatch, capsys):
+    # UNSLOTH_VLLM_REPLAYSSM=1 plus a user VLLM_USE_V2_MODEL_RUNNER=0 on vLLM 0.31+: the user's V1
+    # runner drops routing replay (vLLM refuses it on V1), and ReplaySSM, which runs on V1, stays on.
+    vu, _ = runner_env
+    monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    args = _replay_args()
+    with pytest.warns(UserWarning, match = "Model Runner V1"):
+        _run_block(vu, monkeypatch, args)
+    assert "enable_return_routed_experts" not in args
+    assert args.get("use_replayssm") is True
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert "ignored" not in capsys.readouterr().out
+
+
+def test_inherited_v1_runner_keeps_routing_replay_and_says_replayssm_was_dropped(runner_env, monkeypatch, capsys):
+    # VLLM_USE_V2_MODEL_RUNNER=0 left by an earlier ReplaySSM load: routing replay wins, V2 comes back.
+    vu, _ = runner_env
+    monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", True)
+    args = _replay_args()
+    _run_block(vu, monkeypatch, args)
+    assert args.get("enable_return_routed_experts") is True and "use_replayssm" not in args
+    assert "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
+    assert "UNSLOTH_VLLM_REPLAYSSM=1 ignored: routing replay" in capsys.readouterr().out
+
+
+def test_unset_runner_keeps_routing_replay_on_v2(runner_env, monkeypatch, capsys):
+    vu, _ = runner_env
+    monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "1")
+    args = _replay_args()
+    _run_block(vu, monkeypatch, args)
+    assert args.get("enable_return_routed_experts") is True and "use_replayssm" not in args
+    assert "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
+    assert "UNSLOTH_VLLM_REPLAYSSM=1 ignored: routing replay" in capsys.readouterr().out
