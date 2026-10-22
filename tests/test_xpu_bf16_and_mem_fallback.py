@@ -70,6 +70,8 @@ not_on_macos = pytest.mark.skipif(sys.platform == "darwin", reason = "XPU / CUDA
 @pytest.fixture
 def on_xpu(monkeypatch):
     fake_cuda = types.SimpleNamespace(is_available = lambda: False)
+    for name in ("LOCAL_WORLD_SIZE", "WORLD_SIZE", "LOCAL_RANK", "RANK"):
+        monkeypatch.delenv(name, raising = False)
 
     def install(xpu):
         monkeypatch.delitem(sys.modules, "unsloth.device_type", raising = False)
@@ -138,6 +140,26 @@ def test_xpu_bf16_judges_the_current_device_by_its_own_aspects(on_xpu, flags, cu
 def test_xpu_bf16_judges_the_devices_a_model_uses(on_xpu, device, expected):
     on_xpu(_fake_xpu((True, _PROVEN_NO_BF16), current = 0))
     assert dt._xpu_bf16_supported(device) is expected
+
+
+@not_on_macos
+@pytest.mark.parametrize(
+    "flags, env, expected",
+    [
+        ((True, _PROVEN_NO_BF16), {"LOCAL_WORLD_SIZE": "2", "WORLD_SIZE": "2"}, False),  # every rank agrees
+        ((True, True), {"LOCAL_WORLD_SIZE": "2", "WORLD_SIZE": "2"}, True),
+        ((True, _PROVEN_NO_BF16), {"LOCAL_WORLD_SIZE": "1", "WORLD_SIZE": "2"}, True),   # one rank per node
+        ((True,), {"LOCAL_WORLD_SIZE": "2", "WORLD_SIZE": "2"}, True),                    # one XPU visible per rank
+        ((True, _PROVEN_NO_BF16), {"LOCAL_WORLD_SIZE": "1", "WORLD_SIZE": "1"}, True),   # not a launch
+    ],
+)
+def test_xpu_bf16_under_a_launch_judges_every_rank_xpu(on_xpu, monkeypatch, flags, env, expected):
+    # torchrun imports before prepare_device_map selects the rank's XPU: current reads 0 everywhere.
+    on_xpu(_fake_xpu(flags, current = 0))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert dt._xpu_bf16_supported() is expected
+    assert dt._xpu_bf16_supported(1 if len(flags) > 1 else 0) is (flags[-1] is True)  # an explicit device still wins
 
 
 @not_on_macos
