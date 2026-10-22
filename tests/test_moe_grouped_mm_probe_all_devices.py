@@ -385,20 +385,39 @@ def test_rocm_mask_rewritten_only_when_token_order_is_logical_order(spoof, monke
         assert children == [("0", None), ("1", None)]
 
 
+class _OnCard(torch.Tensor):
+    """CPU tensor reporting a CUDA device, so a device_map split is modelled without a GPU."""
+    @property
+    def device(self):
+        return self._card
+
+
+def _on(device, *shape):
+    t = torch.Tensor._make_subclass(_OnCard, torch.zeros(*shape))
+    t._card = device
+    return t
+
+
 class _FakeExperts(torch.nn.Module):
-    """Stacked experts whose weights sit on `device` (device_map split over GPU models), CPU only."""
+    """Stacked 3D expert weights on `device`."""
     def __init__(self, device):
         super().__init__()
         self.num_experts = 4
-        self._device = device
-
-    def parameters(self, recurse = True):
-        yield types.SimpleNamespace(device = self._device)
+        self.gate_up_proj = _on(device, 4, 8, 4)
+        self.down_proj = _on(device, 4, 4, 4)
 
 
-def _split_model(*devices):
+class _FakeLinear(torch.nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.weight = _on(device, 4, 4)
+
+
+def _split_model(*devices, others = ()):
     model = torch.nn.Module()
+    model.num_experts = 4   # transformers wrappers (GptOssForCausalLM, OlmoeForCausalLM) expose it too
     model.layers = torch.nn.ModuleList(_FakeExperts(d) for d in devices)
+    model.lm_head = torch.nn.ModuleList(_FakeLinear(d) for d in others)
     return model
 
 
@@ -419,4 +438,17 @@ def test_loader_warm_adds_no_probe_on_one_gpu_or_one_model(spoof, models):
     seen = spoof(len(models), models = models)
     assert moe_utils._check_torch_grouped_mm_supported() is True
     auto_enable_grouped_moe(_split_model(*(cuda(i) for i in range(len(models)))))
+    assert seen == [0]
+
+
+def test_loader_warm_skips_cards_holding_only_non_expert_weights(spoof, monkeypatch):
+    # A wrapper exposing num_experts with its LM head on an A100: the experts all sit on the H100 home,
+    # so the A100 must not be probed (nor the L4 that holds nothing).
+    from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
+    from unsloth_zoo.temporary_patches.moe_experts_interface import _expert_devices
+    seen = spoof(3, models = ["H100", "A100", "L4"])
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    model = _split_model(cuda(0), cuda(0), others = (cuda(1),))
+    assert _expert_devices(model) == [cuda(0)]
+    auto_enable_grouped_moe(model)
     assert seen == [0]

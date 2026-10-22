@@ -327,14 +327,25 @@ def _warm_moe_backend(model) -> None:
                 pass
 
 
+_EXPERT_WEIGHT_NAMES = ("gate_up_proj", "down_proj", "w1", "w2", "w3")
+
+
 def _expert_devices(model):
+    # Only the stacked expert weights: a wrapper exposing num_experts (GptOssForCausalLM) must not pull in
+    # the cards holding its embeddings, attention or LM head.
+    is_experts = getattr(_moe_utils_module(), "_is_moe_experts_module", None)
+    if is_experts is None:
+        return []
     devices = set()
     for module in model.modules():
-        if getattr(module, "num_experts", None) is None and not type(module).__name__.endswith("Experts"):
+        try:
+            if not is_experts(module):
+                continue
+        except Exception:
             continue
-        for param in module.parameters():
-            device = param.device
-            if device.type in ("cuda", "xpu") and device.index is not None:
+        for name in _EXPERT_WEIGHT_NAMES:
+            device = getattr(getattr(module, name, None), "device", None)
+            if isinstance(device, torch.device) and device.type in ("cuda", "xpu") and device.index is not None:
                 devices.add(device)
     return sorted(devices, key = lambda d: (d.type, d.index))
 
