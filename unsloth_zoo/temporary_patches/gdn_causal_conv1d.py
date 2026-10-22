@@ -648,6 +648,9 @@ def _run_update(x, conv_state, weight, bias, activation):
     ):
         return _launch_update(x, conv_state, weight, bias, activation)[0]
     if _fast_launch_mode is None:
+        if torch.cuda.is_current_stream_capturing():
+            # The one-off check compares on the host, which would invalidate a CUDA graph capture.
+            return _launch_update(x, conv_state, weight, bias, activation)[0]
         return _check_fast_launch(plan, x, conv_state, weight, bias, activation)
     y = torch.empty_like(x)
     _fast_launch(_fast_launch_mode, plan, x, conv_state, weight, bias, y)

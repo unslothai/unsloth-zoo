@@ -189,6 +189,37 @@ def test_cached_launch_matches_reference_over_many_steps(monkeypatch, dtype):
 
 
 @requires_cuda
+def test_cuda_graph_capture_after_one_eager_step(monkeypatch):
+    # One warmup step caches the plan but leaves the launcher check pending: capturing the next
+    # step must not run that check, whose host comparison invalidates the capture.
+    monkeypatch.setattr(gcc, "_update_plans", {})
+    monkeypatch.setattr(gcc, "_fast_launch_mode", None)
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    x, state, w, b = _inputs(2, 256, 1, 4, 4, torch.bfloat16, True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        assert gcc._try_fast_update(x, state, w, b, "silu") is not None
+    torch.cuda.current_stream().wait_stream(stream)
+    start = state.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = gcc._try_fast_update(x, state, w, b, "silu")
+    assert y is not None and not gcc._update_broken
+    state.copy_(start)
+    graph.replay()
+    torch.cuda.synchronize()
+    ref_state = start.clone()
+    ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, "silu")
+    assert torch.equal(state, ref_state)
+    assert _rel(y, ref) < 5e-3
+    # Eager steps after the capture still verify and use the cached launcher.
+    gcc._try_fast_update(x, state, w, b, "silu")
+    assert gcc._fast_launch_mode == ("all" if gcc._triton_launcher_verified() else False)
+
+
+@requires_cuda
 def test_unaligned_and_uncached_paths(monkeypatch):
     monkeypatch.setattr(gcc, "_update_plans", {})
     monkeypatch.setattr(gcc, "_fast_launch_mode", False)  # a Triton whose launcher did not check out
