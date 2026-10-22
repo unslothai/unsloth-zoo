@@ -2229,6 +2229,46 @@ def combine_permuted_moe_outputs(
     return combined
 
 
+class _RoutedRowGather(torch.autograd.Function):
+    """hidden_states[sorted_indices // top_k] with a fixed-order backward: Inductor lowers the
+    default index_put backward to tl.atomic_add (non-reproducible LoRA grads). An unrolled top_k
+    sum was miscompiled under dynamic shapes (torch 2.13), so do not use it."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, hidden_states, sorted_indices, top_k):
+        ctx.save_for_backward(sorted_indices)
+        ctx.num_tokens = hidden_states.shape[0]
+        ctx.top_k = top_k
+        return hidden_states.index_select(0, sorted_indices // top_k)
+
+    @staticmethod
+    def backward(ctx, grad_rows):
+        (sorted_indices,) = ctx.saved_tensors
+        grad = combine_permuted_moe_outputs(grad_rows, sorted_indices, ctx.num_tokens, ctx.top_k)
+        return grad, None, None
+
+
+# Default from top_k 8 (L4: -55% at k 8, +22% at k 4). Env =1: every top_k > 2, =0: never.
+_DETERMINISTIC_GATHER = os.environ.get("UNSLOTH_MOE_DETERMINISTIC_GATHER", "")
+_DETERMINISTIC_GATHER_MIN_TOP_K = {"1": 3, "0": 1 << 30}.get(_DETERMINISTIC_GATHER, 8)
+
+
+def gather_routed_rows(hidden_states, sorted_indices, top_k):
+    """sorted_indices must be the full argsort from moe_routing_sort. Eager backward is already
+    reproducible, so it keeps plain indexing."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if (
+        top_k >= _DETERMINISTIC_GATHER_MIN_TOP_K
+        and torch.compiler.is_compiling()
+        and hidden_states.requires_grad
+        and torch.is_grad_enabled()
+        and sorted_indices.numel() == hidden_states.shape[0] * top_k
+    ):
+        return _RoutedRowGather.apply(hidden_states, sorted_indices, top_k)
+    return hidden_states[sorted_indices // top_k]
+
+
 def _silu_and_mul(x):
     """Fused SiLU + element-wise multiply for gate/up projections."""
     gate, up = x.chunk(2, dim=-1)
@@ -5200,8 +5240,7 @@ def forward_native_grouped_mm(
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
     num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
-    token_indices = sorted_indices // top_k_index.shape[-1]
-    permuted_input = hidden_states[token_indices]
+    permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
 
     # Gate + Up projection with optional separated LoRA (default).
     use_separated_lora = _should_use_separated_lora()
@@ -5692,7 +5731,7 @@ def forward_triton_grouped_gemm(
         first_weight, second_weight, scaling = gate_up_lora
         first_weight = first_weight.to(hidden_states.dtype)
         second_weight = second_weight.to(hidden_states.dtype)
-        permuted_hidden = hidden_states[gather_indices // top_k]
+        permuted_hidden = gather_routed_rows(hidden_states, gather_indices, top_k)
         gate_up_lora_delta = _apply_lora_grouped_mm(
             permuted_hidden,
             first_weight,
