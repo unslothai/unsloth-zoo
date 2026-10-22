@@ -571,6 +571,12 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
+    if os.environ.get("UNSLOTH_MXFP4_MATMUL_OGS", "1") == "0":
+        # With the `kernels` package installed, transformers would otherwise fetch the hub triton_kernels
+        # (matmul_ogs) instead of dequantizing to bf16, so the switch must also hide those.
+        transformers.quantizers.quantizer_mxfp4.is_kernels_available = lambda *args, **kwargs: False
+        return
+
     if HAS_TRITON_KERNELS and _mxfp4_hub_kernel_unreachable():
         # Claiming kernels skips the bf16 fallback, then the hub load raises ImportError (vLLM triton_kernels).
         if UNSLOTH_ENABLE_LOGGING:
