@@ -177,6 +177,13 @@ modifications =
       the causal_conv1d forward / backward autotune keys, signatures and
       launches (neither kernel reads it), so every new 1024-token bucket no
       longer re-tunes and recompiles both kernels.
+    - Modified by Unsloth in modules/l2norm.py and modules/fused_norm_gate.py (not
+      upstream as of fla 9d478fa), the same change as the #1388 conv backport above:
+      NB = cdiv(T, 65536) is dropped from the l2norm_{fwd,bwd}_kernel and
+      layer_norm_gated_{fwd,bwd}_kernel autotune keys, signatures and launches
+      (no kernel reads it; zoo's _ReuseBestCache already reuses one config across
+      buckets), so a new 65536-row bucket no longer recompiles them. The three
+      layer_norm_gated kernels also get do_not_specialize=['T'], as upstream has.
     - Modified by Unsloth in ops/utils/cumsum.py (inline "Unsloth:" comment, not
       upstream as of fla 9d478fa): B is dropped from the autotune keys and
       constexpr arguments of the four chunk_{local,global}_cumsum_{scalar,vector}
