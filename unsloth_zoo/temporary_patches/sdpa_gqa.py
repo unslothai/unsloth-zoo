@@ -51,9 +51,7 @@ def _efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, enable_
             if enable_gqa:
                 return False
             params = torch.backends.cuda.SDPAParams(query, key, value, attn_mask, dropout_p, is_causal)
-        # The arch checks read the current device's properties, so probe on the operands' device.
-        with torch.cuda.device(query.device):
-            return torch.backends.cuda.can_use_efficient_attention(params, False) is True
+        return torch.backends.cuda.can_use_efficient_attention(params, False) is True
     except Exception:
         return False
 

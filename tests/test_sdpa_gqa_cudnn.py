@@ -167,8 +167,8 @@ def test_cudnn_gqa_retains_no_repeated_kv(cudnn_gqa):
     assert mine == native, (mine, native, 2 * B * H * SEQ * HEAD_DIM * 2)
 
 
-def test_probes_run_on_the_operands_device(monkeypatch, cudnn_sdp_on):
-    # Capability checks read the current device, so they must run under the operands' device.
+def test_cudnn_probe_runs_on_the_operands_device(monkeypatch, cudnn_sdp_on):
+    # The cuDNN choice reads the current device, so it must run under the operands' device.
     seen = []
     real_device = torch.cuda.device
 
@@ -179,6 +179,5 @@ def test_probes_run_on_the_operands_device(monkeypatch, cudnn_sdp_on):
 
     monkeypatch.setattr(torch.cuda, "device", recording_device)
     q, k, v, mask = _inputs()
-    sdpa_gqa._efficient_takes(q, k, v, mask, 0.0, False, True)
     sdpa_gqa._cudnn_takes_gqa(q, k, v, mask, 0.0, False, None)
-    assert seen.count(q.device) >= 2, seen
+    assert seen.count(q.device) >= 1, seen
