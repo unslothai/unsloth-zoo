@@ -230,6 +230,28 @@ def test_eligibility_rejects_non_silu_activations(monkeypatch):
         assert S._sonic_eligible(_cpu_experts(act), x) == (True, None), act
 
 
+def test_eligibility_rejects_unaligned_expert_dims(monkeypatch):
+    """quack needs 16-byte row strides: an unaligned hidden or intermediate size must take
+    the grouped_mm fallback instead of raising inside sonic."""
+    monkeypatch.setattr(S, "sonic_moe_available", lambda: True)
+    monkeypatch.setattr(S, "_device_ok", lambda device: True, raising=False)
+
+    def experts(H, I):
+        mod = _cpu_experts(torch.nn.SiLU())
+        mod.gate_up_proj = torch.nn.Parameter(torch.randn(4, 2 * I, H, dtype=torch.bfloat16), requires_grad=False)
+        mod.down_proj = torch.nn.Parameter(torch.randn(4, H, I, dtype=torch.bfloat16), requires_grad=False)
+        return mod
+
+    assert S._sonic_eligible(experts(64, 64), torch.zeros(3, 64, dtype=torch.bfloat16)) == (True, None)
+    assert S._sonic_eligible(experts(72, 24), torch.zeros(3, 72, dtype=torch.bfloat16)) == (True, None)
+    ok, reason = S._sonic_eligible(experts(65, 64), torch.zeros(3, 65, dtype=torch.bfloat16))
+    assert not ok and "hidden size" in reason, reason
+    ok, reason = S._sonic_eligible(experts(64, 65), torch.zeros(3, 64, dtype=torch.bfloat16))
+    assert not ok and "expert dims" in reason, reason
+    ok, reason = S._sonic_eligible(experts(64, 68), torch.zeros(3, 64, dtype=torch.bfloat16))
+    assert not ok and "down_proj" in reason, reason
+
+
 def test_eligibility_checks_the_operand_device(monkeypatch):
     monkeypatch.setattr(S, "sonic_moe_available", lambda: True)
     ok, reason = S._sonic_eligible(_cpu_experts(torch.nn.SiLU()), torch.zeros(3, 16, dtype=torch.bfloat16))
