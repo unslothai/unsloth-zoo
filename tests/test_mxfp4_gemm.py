@@ -147,7 +147,9 @@ def test_capture_on_a_non_current_operand_device_does_not_probe(monkeypatch):
     _need_cvt(2)
     monkeypatch.setenv("UNSLOTH_MXFP4_CVT", "1")
     for index in (0, 1):
-        assert mg._cvt_ok(index, True) is True  # warm the probe kernels outside the capture
+        # _need_cvt only asked the current GPU: a mixed host may lack the convert on GPU 0 or 1.
+        if mg._cvt_ok(index, True) is not True:  # also warms the probe kernels outside the capture
+            pytest.skip(f"GPU {index} has no hardware e2m1 convert")
     monkeypatch.setattr(mg, "_ASM_OK", {})
     torch.cuda.synchronize(0)
     torch.cuda.synchronize(1)
