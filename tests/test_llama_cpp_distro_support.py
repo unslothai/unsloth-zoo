@@ -196,6 +196,117 @@ def test_do_we_need_sudo_detects_non_root_refresh(llama_cpp, monkeypatch, system
         return _FakePopen([line] if not cmd.startswith("sudo ") else [])(cmd)
 
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp.os, "geteuid", lambda: 1000, raising = False)
     monkeypatch.setattr(llama_cpp.subprocess, "Popen", fake_popen)
     assert llama_cpp.do_we_need_sudo(system_type) is True
     assert calls[-1].startswith("sudo ")
+
+
+def _record_popen(monkeypatch, llama_cpp, unprivileged_lines):
+    calls = []
+
+    def fake_popen(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return _FakePopen(unprivileged_lines if not cmd.startswith("sudo ") else [])(cmd)
+
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp.subprocess, "Popen", fake_popen)
+    return calls
+
+
+@pytest.mark.parametrize("euid", [0, 1000])
+def test_a_working_unprivileged_refresh_is_not_repeated_under_sudo(llama_cpp, monkeypatch, euid):
+    monkeypatch.setattr(llama_cpp.os, "geteuid", lambda: euid, raising = False)
+    calls = _record_popen(monkeypatch, llama_cpp, ["Reading package lists... Done\n"])
+    assert llama_cpp.do_we_need_sudo("debian") is False
+    assert calls == ["apt-get update -y"]
+
+
+def test_root_never_runs_sudo_even_when_the_refresh_reports_a_lock(llama_cpp, monkeypatch):
+    monkeypatch.setattr(llama_cpp.os, "geteuid", lambda: 0, raising = False)
+    calls = _record_popen(monkeypatch, llama_cpp, ["E: Could not open lock file /var/lib/apt/lists/lock\n"])
+    assert llama_cpp.do_we_need_sudo("debian") is False
+    assert not any(cmd.startswith("sudo") for cmd in calls)
+
+
+@pytest.mark.parametrize(
+    "tty, expected",
+    [(True, "sudo apt-get update -y"), (False, "sudo -n apt-get update -y")],
+)
+def test_sudo_refresh_does_not_wait_on_a_password_without_a_terminal(llama_cpp, monkeypatch, tty, expected):
+    import types
+
+    monkeypatch.setattr(llama_cpp.os, "geteuid", lambda: 1000, raising = False)
+    monkeypatch.setattr(llama_cpp.sys, "stdin", types.SimpleNamespace(isatty = lambda: tty))
+    calls = _record_popen(
+        monkeypatch, llama_cpp, ["E: Could not open lock file - open (13: Permission denied)\n"]
+    )
+    assert llama_cpp.do_we_need_sudo("debian") is True
+    assert calls[-1] == expected
+
+
+@pytest.mark.parametrize(
+    "tty, expected",
+    [(True, "sudo apt-get install cmake -y"), (False, "sudo -n apt-get install cmake -y")],
+)
+def test_sudo_install_does_not_wait_on_a_password_without_a_terminal(llama_cpp, monkeypatch, tty, expected):
+    import builtins
+    import types
+
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp, "IS_KAGGLE_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp, "_auto_install_enabled", lambda: True)
+    monkeypatch.setattr(llama_cpp.sys, "stdin", types.SimpleNamespace(isatty = lambda: tty))
+    monkeypatch.setattr(builtins, "input", lambda *a: "")
+    calls = _record_popen(monkeypatch, llama_cpp, [])
+    llama_cpp.install_package("cmake", True, system_type = "debian")
+    assert calls == [expected]
+
+
+def test_install_llama_cpp_does_not_refresh_packages_when_nothing_is_missing(llama_cpp, monkeypatch, tmp_path):
+    """The probe refreshes package lists (under sudo when needed), so it must only run when a
+    package is actually missing. A build that only needed the clone and compile still ran a
+    privileged package-list refresh."""
+    probed = []
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp, "_auto_install_enabled", lambda: True)
+    monkeypatch.setattr(llama_cpp, "_maybe_install_llama_cpp_prebuilt", lambda *a, **k: None)
+    monkeypatch.setattr(llama_cpp, "check_build_requirements", lambda *a, **k: ([], "debian"))
+    monkeypatch.setattr(llama_cpp, "do_we_need_sudo", lambda *a, **k: probed.append(a) or True)
+
+    class _Stop(Exception):
+        pass
+
+    def stop(*a, **k):
+        raise _Stop()
+
+    # Everything after the requirements check runs through these; stop at the first one.
+    monkeypatch.setattr(llama_cpp, "try_execute_with_auto_install", stop)
+    monkeypatch.setattr(llama_cpp, "try_execute", stop)
+    with pytest.raises(_Stop):
+        llama_cpp.install_llama_cpp(llama_cpp_folder = str(tmp_path / "llama.cpp"))
+    assert probed == []
+
+
+def test_install_llama_cpp_still_probes_when_a_package_is_missing(llama_cpp, monkeypatch, tmp_path):
+    probed, installed = [], []
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp, "_auto_install_enabled", lambda: True)
+    monkeypatch.setattr(llama_cpp, "_maybe_install_llama_cpp_prebuilt", lambda *a, **k: None)
+    monkeypatch.setattr(llama_cpp, "check_build_requirements", lambda *a, **k: (["cmake"], "debian"))
+    monkeypatch.setattr(llama_cpp, "do_we_need_sudo", lambda *a, **k: probed.append(a) or True)
+    monkeypatch.setattr(llama_cpp, "install_package", lambda pkg, sudo, **k: installed.append((pkg, sudo)))
+
+    class _Stop(Exception):
+        pass
+
+    def stop(*a, **k):
+        raise _Stop()
+
+    monkeypatch.setattr(llama_cpp, "try_execute_with_auto_install", stop)
+    monkeypatch.setattr(llama_cpp, "try_execute", stop)
+    with pytest.raises(_Stop):
+        llama_cpp.install_llama_cpp(llama_cpp_folder = str(tmp_path / "llama.cpp"))
+    assert probed == [("debian",)]
+    assert installed == [("cmake", True)]

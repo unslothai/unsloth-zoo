@@ -548,6 +548,16 @@ def _stdin_is_usable() -> bool:
     return True
 
 
+def _sudo_prefix():
+    # With no terminal to type a password into, -n makes sudo fail at once instead of waiting on
+    # a prompt nobody can answer (a notebook kernel, or Studio's backend started from a shell).
+    try:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    return "sudo " if interactive else "sudo -n "
+
+
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
 
@@ -610,17 +620,17 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
     # Choose package manager based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}{pkg_manager} install {package} -y"
     elif system_type == "arch":
-        install_cmd = f"{'sudo ' if sudo else ''}pacman -S --noconfirm {package}"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}pacman -S --noconfirm {package}"
     elif system_type == "alpine":
-        install_cmd = f"{'sudo ' if sudo else ''}apk add {package}"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}apk add {package}"
     elif system_type == "suse":
-        install_cmd = f"{'sudo ' if sudo else ''}zypper --non-interactive install {package}"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}zypper --non-interactive install {package}"
     elif system_type == "gentoo":
-        install_cmd = f"{'sudo ' if sudo else ''}emerge --ask=n {package}"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}emerge --ask=n {package}"
     else:  # Default to debian/apt-get
-        install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}apt-get install {package} -y"
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
@@ -747,8 +757,14 @@ def do_we_need_sudo(system_type="debian"):
         pass
     pass
 
+    # The unprivileged refresh worked (root, or a manager that needs none), so there is
+    # nothing to elevate. Root never needs sudo either. Re-running the refresh under sudo
+    # anyway ran a privileged package-manager command nobody asked for.
+    if not sudo or os.geteuid() == 0:
+        return False
+
     # Update all package lists as well
-    update_cmd_sudo = f"sudo {update_cmd}"
+    update_cmd_sudo = f"{_sudo_prefix()}{update_cmd}"
 
     start_time = time.time()
     with subprocess.Popen(update_cmd_sudo, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
@@ -2385,7 +2401,9 @@ def install_llama_cpp(
 
     print_outputs = []
     missing_packages, system_type = check_build_requirements()
-    sudo = do_we_need_sudo(system_type)
+    # Only probe (which refreshes the package lists, possibly under sudo) when something is
+    # actually missing.
+    sudo = do_we_need_sudo(system_type) if missing_packages else False
     kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
 
     if not missing_packages:
