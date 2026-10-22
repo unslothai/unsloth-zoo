@@ -53,7 +53,7 @@ jobs:
     steps:
       # harden-runner block-mode is Linux-only; stay in audit on macOS for parity.
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           egress-policy: audit
 
@@ -107,14 +107,7 @@ jobs:
         # silently remove the very check that is supposed to tell us whether the
         # next release is safe to adopt.
         #
-        # mlx-vlm is upgraded past its `<=0.7.1` ceiling too. The ceiling exists
-        # because the current mlx-vlm wants transformers>=5.14.0 against the
-        # darwin + arm64 half of this repo's transformers cap, which stays at
-        # <=5.5.0 for exactly that reason while the other half is now <=5.17.0.
-        # Leaving it out would mean the one lane that could ever justify lifting
-        # the MLX half never tests the version it would be lifted to. Letting
-        # transformers move with it is the point of this leg, and is why it does
-        # not gate.
+        # Also past mlx-vlm's <=0.7.9 ceiling (and transformers with it): non-gating.
         if: matrix.mlx == 'latest'
         run: |
           pip install --upgrade mlx mlx-lm mlx-vlm
@@ -198,7 +191,8 @@ jobs:
         run: python -m pytest tests/test_mlx_decode_metal.py -v -rs
 
       - name: tests/test_mlx_load_residency_metal.py
-        # A finished load must own its weights.
+        # A finished load must own its weights; an offloaded one reads PLE rows and
+        # experts from the checkpoint, bit-exact against the stock modules.
         run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
 
       - name: tests/test_mlx_generate_metal.py

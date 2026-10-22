@@ -316,7 +316,7 @@ def test_generate_batch_installs_before_it_generates(monkeypatch):
 
     monkeypatch.setattr(engine, "_install_arrays_cache_advance_fix", record_install)
     monkeypatch.setattr(engine, "_TextBatchAdapter", Adapter)
-    monkeypatch.setattr(engine, "generation_mode", lambda model: contextlib.nullcontext())
+    monkeypatch.setattr(engine, "generation_mode", lambda model, **_: contextlib.nullcontext())
     monkeypatch.setattr(
         engine, "_generation_cache_hygiene", lambda: contextlib.nullcontext()
     )

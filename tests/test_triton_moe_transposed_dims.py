@@ -38,7 +38,7 @@ def test_triton_backend_tunes_for_the_real_intermediate_size(monkeypatch, transp
     with pytest.raises(_Stop):
         moe_utils.forward_triton_grouped_gemm(experts, hidden, top_k_index, top_k_weights)
     assert seen and seen[0]["hidden_dim"] == H
-    assert seen[0]["intermediate_dim"] == 2 * I
+    assert seen[0]["intermediate_dim"] == I  # the autotuner builds the (E, 2 * I, H) gate_up itself
 
 
 @pytest.mark.parametrize("name, interleaved", [("GptOssExperts", True), ("Qwen3MoeExperts", False)])

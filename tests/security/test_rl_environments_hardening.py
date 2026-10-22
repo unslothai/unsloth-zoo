@@ -120,6 +120,128 @@ def test_binding_a_dunder_name_is_not_itself_refused(name, source, args, expecte
     assert create_locked_down_function(source)(*args) == expected
 
 
+# Deferred annotation evaluation and __match_args__ lookups, refused before the code runs.
+
+DEFERRED_EVALUATION = [
+    ("singledispatch", "def strategy(board):\n    import functools\n    return functools.singledispatch\n"),
+    ("singledispatchmethod", "def strategy(board):\n    from functools import singledispatchmethod\n    return singledispatchmethod\n"),
+    ("string_param", 'def strategy(board: "list") -> str:\n    return "W"\n'),
+    ("string_return", 'def strategy(board) -> "str":\n    return "W"\n'),
+    ("string_in_generic", 'def strategy(board: list["int"]):\n    return "W"\n'),
+    ("string_local", 'def strategy(board):\n    move: "str" = "W"\n    return move\n'),
+    ("rebound_literal", 'def strategy(board):\n    Literal = list\n    move: Literal["int"] = "W"\n    return move\n'),
+    ("aliased_literal", 'def strategy(board):\n    from typing import List as Literal\n    move: Literal["int"] = "W"\n    return move\n'),
+    ("string_nested_in_literal", 'def strategy(board):\n    from typing import Literal\n    move: Literal[list["int"]] = "W"\n    return move\n'),
+    ("module_name_forward_ref", 'def strategy(board: "sys"):\n    return "W"\n'),
+    ("private_forward_ref", 'def strategy(board: "_x"):\n    return "W"\n'),
+    ("fullwidth_builtin_forward_ref", 'def strategy(board: "\uff45\uff56\uff41\uff4c"):\n    return "W"\n'),
+    ("builtin_named_forward_ref", "def strategy(board):\n    class open:\n        pass\n    def g(x: 'open'):\n        return 1\n    return 'W'\n"),
+    ("custom_class_positional", "def strategy(board):\n    class K:\n        pass\n    match board:\n        case K(a):\n            return a\n    return 'W'\n"),
+]
+
+
+@pytest.mark.parametrize("name,source", DEFERRED_EVALUATION, ids = [n for n, _ in DEFERRED_EVALUATION])
+def test_deferred_evaluation_primitives_rejected(name, source):
+    with pytest.raises((AttributeError, ImportError, RuntimeError)):
+        create_locked_down_function(source)([[2, 0], [0, 2]])
+
+
+def test_ordinary_annotations_and_literals_still_work():
+    """Type hints a 2048 or sudoku strategy writes keep working, Literal included."""
+    source = (
+        "def strategy(board: list[list[int]]) -> Literal['W', 'A', 'S', 'D']:\n"
+        "    from typing import Literal, Optional\n"
+        "    import typing\n"
+        "    best: Optional[str] = None\n"
+        "    moves: list[typing.Literal['W', 'A']] = ['W', 'A']\n"
+        "    for move in moves:\n"
+        "        match board:\n"
+        "            case list(rows) if rows:\n"
+        "                best = move\n"
+        "    return best or 'S'\n"
+    )
+    assert create_locked_down_function(source)([[2, 0], [0, 2]]) == "A"
+
+
+def test_forward_reference_to_own_class_still_works():
+    """Model-written helper classes annotate with their own quoted name."""
+    source = (
+        "def matmul(A, B):\n"
+        "    class Matrix:\n"
+        "        def __init__(self, rows):\n"
+        "            self.rows = rows\n"
+        "        def __mul__(self, other: 'Matrix') -> 'Matrix':\n"
+        "            cols = list(zip(*other.rows))\n"
+        "            return Matrix([[sum(a * b for a, b in zip(r, c)) for c in cols] for r in self.rows])\n"
+        "    return (Matrix(A) * Matrix(B)).rows\n"
+    )
+    assert create_locked_down_function(source)([[1, 2]], [[3], [4]]) == [[11]]
+    # A quoted name the code never defines is a NameError at most, never code.
+    assert create_locked_down_function(
+        "def matmul(A: 'Matrix', B) -> 'Matrix':\n    return A\n"
+    )([[1]], [[2]]) == [[1]]
+
+
+def test_forward_ref_evaluate_is_denied_where_it_exists():
+    # 3.14 ForwardRef.evaluate runs its string with the real builtins.
+    escape = (
+        "def strategy(board):\n"
+        "    import typing\n"
+        "    return typing.get_args(typing.List['1 + 1'])[0].evaluate()\n"
+    )
+    own_method = (
+        "def strategy(board):\n"
+        "    class Board:\n"
+        "        def evaluate(self):\n"
+        "            return 'W'\n"
+        "    return Board().evaluate()\n"
+    )
+    if sys.version_info >= (3, 14):
+        with pytest.raises(RuntimeError, match = "evaluate"):
+            create_locked_down_function(escape)([[2]])
+    else:
+        with pytest.raises(AttributeError):
+            create_locked_down_function(escape)([[2]])
+        assert create_locked_down_function(own_method)([[2]]) == "W"
+
+
+def test_literal_through_typing_aliases_still_works():
+    source = (
+        "def strategy(board):\n"
+        "    import typing as t\n"
+        "    from typing import Literal as L\n"
+        "    a: t.Literal['W', 'A'] = 'W'\n"
+        "    b: L['S', 'D'] = 'S'\n"
+        "    return a\n"
+    )
+    assert create_locked_down_function(source)([[2]]) == "W"
+
+
+@pytest.mark.parametrize("rebind", ["int = object", "import os as int", "def int(): pass"])
+def test_rebound_builtin_gets_no_positional_pattern_exemption(rebind):
+    source = (
+        "def strategy(board):\n"
+        f"    {rebind}\n"
+        "    match board:\n"
+        "        case int(x):\n"
+        "            return x\n"
+        "    return 'W'\n"
+    )
+    with pytest.raises((ImportError, RuntimeError)):
+        create_locked_down_function(source)([[2]])
+
+
+def test_checker_only_uses_ast_nodes_present_on_this_python(monkeypatch):
+    """Python 3.9 has no match or type-parameter nodes; the binding scan must not assume them."""
+    for name in ("MatchAs", "MatchStar", "MatchMapping", "MatchClass", "TypeVar", "ParamSpec", "TypeVarTuple"):
+        monkeypatch.delattr(rl_env.ast, name, raising=False)
+    monkeypatch.setattr(rl_env, "_NAMED_BINDING_NODES", rl_env._ast_nodes("MatchAs", "MatchStar", "TypeVar"))
+    monkeypatch.setattr(rl_env, "_MATCH_MAPPING_NODES", rl_env._ast_nodes("MatchMapping"))
+    tree = rl_env.ast.parse("def strategy(board: list) -> str:\n    x: int = 1\n    return 'W'\n")
+    bound, literal_names, typing_names = rl_env._bound_names(tree)
+    assert {"strategy", "board", "x"} <= bound and "Literal" in literal_names and "typing" in typing_names
+
+
 # --- none of the hardening may cost ordinary generated code ------------------
 
 def test_ordinary_match_statements_still_work():

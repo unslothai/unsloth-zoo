@@ -516,13 +516,14 @@ def test_no_module_sets_a_variable_xet_core_does_not_read():
     import pathlib
     import re
 
-    root = pathlib.Path(tuning.__file__).parent
+    light = pathlib.Path(tuning.__file__).parent
     unknown: dict[str, set] = {}
-    for path in root.rglob("*.py"):
-        # Only quoted names: this skips prose ("any explicit HF_XET_RECONSTRUCTION_* cap") unparsed.
-        for name in re.findall(r"[\"'](HF_XET_[A-Z_]+)[\"']", path.read_text(errors = "ignore")):
-            if name not in XET_CORE_VARS:
-                unknown.setdefault(name, set()).add(path.relative_to(root).as_posix())
+    for root in (light, light.parent / "unsloth_zoo"):
+        for path in root.rglob("*.py"):
+            # Only quoted names: this skips prose ("any explicit HF_XET_RECONSTRUCTION_* cap") unparsed.
+            for name in re.findall(r"[\"'](HF_XET_[A-Z_]+)[\"']", path.read_text(errors = "ignore")):
+                if name not in XET_CORE_VARS:
+                    unknown.setdefault(name, set()).add(path.relative_to(root.parent).as_posix())
     assert not unknown, f"names xet-core does not read: { {k: sorted(v) for k, v in unknown.items()} }"
 
 

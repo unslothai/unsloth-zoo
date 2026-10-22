@@ -141,7 +141,7 @@ def logical_numel(param, name = ""):
     - bitsandbytes packs two 4-bit parameters per uint8 and hangs the real
       shape off `quant_state`, so a model-wide sum of `numel()` under-counts
       a 4-bit load by nearly 2x.
-    - MXFP4 (gpt-oss kept packed by `UNSLOTH_MXFP4_NO_DEQUANTIZE=1`) has no
+    - MXFP4 (gpt-oss loaded with packed `_blocks` / `_scales`) has no
       `quant_state` at all: `convert_moe_packed_tensors` expands `..._blocks`
       from `(..., G, B)` to `(..., G, B * 2)` and consumes `..._scales`. So
       blocks are worth twice their `numel()`, scales nothing, and they are the

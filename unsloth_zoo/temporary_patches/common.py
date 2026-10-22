@@ -29,6 +29,8 @@ __all__ = [
     "unwrap_already_compiled",
     "flatten_for_elementwise_norm",
     "unwrap_norm_weight",
+    "CHUNK_ALIGN_ROWS",
+    "chunk_row_bounds",
     "publish_to_modeling_module",
     "RESCOPE_PATCH_FLAG",
     "WRAPPER_INNER_ATTR",
@@ -292,7 +294,8 @@ def _compile_or_fall_back(*args, **kwargs):
         _compile = torch_compile_with_fallback(**kwargs)
     else:
         def _compile(function):
-            return torch.compile(function, **kwargs)
+            from .utils import eager_under_zero3
+            return eager_under_zero3(function, torch.compile(function, **kwargs))
 
     def decorate(function):
         function = unwrap_already_compiled(function)
@@ -345,6 +348,23 @@ def flatten_for_elementwise_norm(hidden_states):
     """
     shape = hidden_states.shape
     return hidden_states.reshape(-1, shape[-1]), shape
+pass
+
+
+# Opt-in: aligned boundaries reorder the float32 per-chunk sums.
+CHUNK_ALIGN_ROWS = 128 if os.environ.get("UNSLOTH_CE_CHUNK_ALIGN", "0").strip() == "1" else 0
+
+def chunk_row_bounds(n_rows, chunks, align = CHUNK_ALIGN_ROWS):
+    """``align``-multiple row ranges no larger than ``ceil(n_rows / chunks)`` (may add ranges).
+    None means keep torch.chunk."""
+    if align <= 1 or chunks <= 1:
+        return None
+    cap = -(-n_rows // chunks)
+    size = (cap // align) * align
+    # A 1-row tail hits the K=1 head-gradient matmul bug (see test_chunked_log_softmax_one_row_chunk).
+    if size == 0 or 4 * size < 3 * cap or n_rows % size == 1:
+        return None
+    return list(range(0, n_rows, size)) + [n_rows]
 pass
 
 

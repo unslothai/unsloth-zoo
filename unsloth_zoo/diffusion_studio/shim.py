@@ -455,7 +455,7 @@ def main():
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--port", type=int, default=8123)
-    ap.add_argument("--gpu", default=os.environ.get("DG_GPU", "0"))
+    ap.add_argument("--gpu", default=os.environ.get("DG_GPU"))
     ap.add_argument("--maxtok", type=int, default=0,
                     help="per-turn context budget; 0 = auto-size the largest that fits VRAM")
     ap.add_argument("--ngl", type=int, default=None,
@@ -464,8 +464,9 @@ def main():
     args = ap.parse_args()
 
     _STATE["host"] = args.host
-    _STATE["player"] = open(_PLAYER_TEMPLATE).read()
-    print(f"loading {args.gguf} on GPU {args.gpu} (optimized visual decoder) ...", flush=True)
+    with open(_PLAYER_TEMPLATE, encoding="utf-8") as player_template:
+        _STATE["player"] = player_template.read()
+    print(f"loading {args.gguf} on GPU {V._first_visible_gpu(os.environ.get('CUDA_VISIBLE_DEVICES')) if args.gpu is None else args.gpu} (optimized visual decoder) ...", flush=True)
     _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok, ngl=args.ngl)
     print(f"gpu layers (NGL) = {_STATE['server'].ngl}", flush=True)
     print(f"DiffusionGemma OpenAI shim ready on http://{args.host}:{args.port}  (model={MODEL_ID})",

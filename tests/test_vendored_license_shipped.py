@@ -44,3 +44,11 @@ def test_embedded_text_matches_canonical_files():
     assert lic.FLA_LICENSE.strip() == _read("fla", "LICENSE").strip()
     assert lic.NOTICE.strip() == _read("NOTICE").strip()
     assert lic.FLA_MANIFEST.strip() == _read("fla", "MANIFEST").strip()
+
+
+def test_embedded_vllm_license_is_apache_and_matches():
+    lic = _load_licenses_module()
+    assert "Apache License" in lic.VLLM_LICENSE and "Version 2.0" in lic.VLLM_LICENSE
+    assert lic.VLLM_LICENSE.strip() == _read("vllm", "LICENSE").strip()
+    assert lic.VLLM_MANIFEST.strip() == _read("vllm", "MANIFEST").strip()
+    assert "vllm-project/vllm/pull/48792" in lic.NOTICE

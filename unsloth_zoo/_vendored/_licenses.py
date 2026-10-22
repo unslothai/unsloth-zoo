@@ -81,6 +81,22 @@ flash-linear-attention (fla-core)
   gated-deltanet models get the Triton kernels without an extra
   `pip install flash-linear-attention`. Package __init__ exports were narrowed;
   all other files retain their original upstream MIT headers verbatim.
+
+--------------------------------------------------------------------------------
+vLLM (Gated DeltaNet ReplaySSM decode kernel)
+--------------------------------------------------------------------------------
+  Source:    https://github.com/vllm-project/vllm/pull/48792
+  Commit:    ccd8197ae9818607cb7e904ffbb83a7ce0fe31fa
+  License:   Apache-2.0
+  Copyright: Copyright contributors to the vLLM project
+  Location:  unsloth_zoo/_vendored/vllm/
+  License text + provenance: unsloth_zoo/_vendored/vllm/LICENSE and
+                             unsloth_zoo/_vendored/vllm/MANIFEST
+                             (also embedded verbatim in the shipped module
+                             unsloth_zoo/_vendored/_licenses.py).
+
+  One Triton kernel file (gdn_replayssm_decode.py), with its launch-config lookup
+  inlined; see the MANIFEST for the exact change.
 """
 
 # fla-core snapshot provenance, verbatim from unsloth_zoo/_vendored/fla/MANIFEST.
@@ -97,11 +113,13 @@ description =
     Minimal, pinned, pruned snapshot of fla-core 0.5.1. Only the transitive file
     closure needed by the gated-delta-rule fast path is vendored, so Unsloth can
     enable the Triton kernels for the Qwen3.5 / Qwen3.6 / Qwen3-Next
-    gated-deltanet models and the GLM-5.3-Flash / Kimi-Linear Kimi delta
-    attention models without requiring `pip install flash-linear-attention`.
+    gated-deltanet models, the GLM-5.3-Flash / Kimi-Linear Kimi delta
+    attention models and the Ling 2.5 / 2.6 / 3.0 remote-code models without
+    requiring `pip install flash-linear-attention`.
 
 exported_api =
     fla.modules.FusedRMSNormGated
+    fla.modules.ShortConvolution
     fla.ops.gated_delta_rule.chunk_gated_delta_rule
     fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule
     fla.ops.kda.chunk_kda
@@ -176,6 +194,30 @@ modifications =
       (reference implementations; the first needs einops). The KDA files share
       the vendored ops/common/chunk_delta_h.py, ops/cp and ops/utils, so they
       run on the #953 fix above.
+    - Added the fla.modules ShortConvolution closure for Ling 3.0
+      (BailingMoeV3) remote code, which imports it beside the KDA ops
+      (`from fla.modules import FusedRMSNormGated, ShortConvolution`):
+      modules/conv/{short_conv,causal_conv1d}.py, modules/conv/triton/{__init__,
+      kernels,ops}.py, modules/conv/cp/{__init__,ops}.py and
+      modules/conv/cuda/{__init__,ops}.py verbatim from fla-core 0.5.1, plus
+      two upstream fixes in short_conv.py: fla PR #1257 (FLA_CONV_BACKEND=cuda
+      without causal-conv1d installed now falls back to Triton instead of
+      calling the missing function) and the short_conv hunk of fla PR #1203
+      (a packed batch takes the single-token decode shortcut only when every
+      sequence has exactly one token).
+      modules/conv/__init__.py is narrowed to ShortConvolution and
+      causal_conv1d (long_conv.py is not vendored), and modules/backends/
+      __init__.py registers no backend, since the Triton-Ascend NPU kernels
+      under modules/backends/triton_ascend are not vendored and the tree is
+      only injected on CUDA. fla.modules resolves ShortConvolution lazily: its
+      files import einops, which the gated-deltanet path does not need. Later
+      upstream conv fixes are not backported, as none reaches Ling 3.0's
+      training or decode path: #1097 (more than 65535 sequences per decode
+      launch) and #1139 / #1141 (gradients into a conv cache state, which
+      training never builds). The
+      conv kernels already load varlen sequence starts as int64; offsets
+      inside one sequence stay int32 as in 0.5.1 (upstream #1082), as for KDA
+      above.
     - Backported fla PR #1109 in ops/kda/chunk_bwd.py (+ IS_NVIDIA_SM100 in
       utils/_device.py and utils/__init__.py, each marked with an inline
       "Unsloth: backported from fla PR #1109" comment): on SM100 the
@@ -187,6 +229,61 @@ modifications =
       on triton 3.4.0, 3.5.1, 3.6.0 and 3.7.1 (torch 2.8.0 to 2.13.0), and on
       3.7.1 the autotuner picks one of those configs, so excluding them there
       cost up to 2.7% of a KDA layer fwd+bwd (B 1, T 8192, H 64, D 128).
+    - Backported fla PR #1229 in ops/common/chunk_o.py (+ inline "Unsloth:
+      backported from fla PR #1229" comment): on Blackwell the chunk_fwd_kernel_o
+      autotune drops its 8-warp BK=BV=128 config, which hits a Triton tl.dot
+      recurrence race. Reproduced on B200 with triton 3.7.1: with cu_seqlens and
+      48 or 64 value heads the autotuner picks that config, and o differs from
+      the dense path by up to 0.08 and between identical runs.
+    - Sequence start offsets past 2**31 elements (fixed upstream after 0.5.1 by
+      fla PR #1329, which forces int64 program ids everywhere). In
+      ops/gated_delta_rule/chunk_fwd.py, ops/kda/{chunk_bwd,chunk_intra,
+      chunk_intra_token_parallel,gate,wy_fast}.py, ops/utils/cumsum.py,
+      ops/common/chunk_delta_h.py and ops/common/chunk_h.py (the simple_gla /
+      GLA state kernels), kernels that add `bos * H * K`-style
+      sequence start offsets in int32 take a LONG_INDEXING constexpr that
+      widens `bos` to int64 only when the launcher's shapes can pass 2**31
+      elements (LONG_INDEXING_THRESHOLD in utils/_config.py, exported from
+      fla.utils), so normal sizes keep the int32 code (forced int64 is slower).
+      Without it a packed batch or a batch whose later sequences start past
+      2**31 / (heads * 128) tokens silently returned wrong outputs and
+      gradients (KDA: non-finite). Offsets inside one sequence are unchanged:
+      a single KDA sequence past 2**31 / (heads * 128) tokens still indexes
+      in-chunk raw pointers in int32, as in 0.5.1.
+    - Block pointers removed (fla PR #1062, after 0.5.1): triton main deleted
+      tl.make_block_ptr / tl.advance (triton-lang/triton#10833; both raise
+      NotImplementedError), so every kernel in the 19 files that used them
+      (modules/{fused_norm_gate,l2norm}.py, modules/conv/triton/kernels.py,
+      ops/common/{chunk_delta_h,chunk_h,chunk_o}.py, ops/cp/chunk_delta_h.py,
+      ops/gated_delta_rule/{chunk_fwd,gate,wy_fast}.py, ops/gla/chunk.py,
+      ops/kda/{chunk_bwd,chunk_intra,chunk_intra_token_parallel,gate,wy_fast}.py,
+      ops/utils/{cumsum,pooling,solve_tril}.py) loads and stores through plain
+      pointer arithmetic with explicit masks instead. #1062 was applied as a
+      three-way merge (base fla 7e46dffc, theirs fla 02e27033) so every
+      Unsloth change above stays in place. Plain pointers compile on every
+      triton, old and new. Block pointers computed offsets in int64, so the
+      loop-derived in-chunk offsets are kept int64 as upstream did afterwards:
+      fla PRs #1173 / #1188 in ops/common/{chunk_delta_h,chunk_h}.py (a fresh
+      i_t_int64 rather than retyping the loop variable, which torch 2.7 /
+      triton 3.3 rejects) and the #1082 o_t lines in
+      modules/conv/triton/kernels.py, plus the same widening of the loop-derived
+      o_t / last_idx in ops/cp/chunk_delta_h.py and of o_t in the
+      chunk_global_cumsum kernels of ops/utils/cumsum.py (neither fixed
+      upstream; bitwise neutral at normal sizes). Without them one sequence longer than
+      2**31 / (heads * head_dim) tokens hit an illegal memory access. Also
+      fla PR #1330 in ops/cp/chunk_delta_h.py: merge_fwd_bwd_kernel's autotune
+      key named BT, which is not a kernel argument; triton main rejects that at
+      import, which made the whole vendored tree fail to inject.
+    - Backported fla PR #1388 (with the #1154 key change it completes) in
+      modules/conv/triton/{kernels,ops}.py: NB = cdiv(B*T, 1024) is dropped from
+      the causal_conv1d forward / backward autotune keys, signatures and
+      launches (neither kernel reads it), so every new 1024-token bucket no
+      longer re-tunes and recompiles both kernels.
+    - Modified by Unsloth in ops/utils/cumsum.py (inline "Unsloth:" comment, not
+      upstream as of fla 9d478fa): B is dropped from the autotune keys and
+      constexpr arguments of the four chunk_{local,global}_cumsum_{scalar,vector}
+      kernels (none reads it; the grid carries B * H), so padded batches no
+      longer re-tune and recompile per batch size.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
@@ -195,13 +292,254 @@ modifications =
       its lazy imports of those files execute only when the optional `tilelang`
       package is installed and its backend is selected (not the default path).
 
-file_count = 62 python modules + this MANIFEST + LICENSE
+file_count = 73 python modules + this MANIFEST + LICENSE
 closure_measured = 43 python modules for gated_delta_rule (includes naive.py);
     vendored set drops naive.py, leaving 42, plus 5 for simple_gla (its __init__,
     chunk.py, fused_recurrent.py, common/chunk_h.py, common/fused_recurrent.py),
-    plus 15 for kda (11 under ops/kda, 4 under ops/gla).
+    plus 15 for kda (11 under ops/kda, 4 under ops/gla), plus 11 for
+    ShortConvolution (10 under modules/conv, modules/backends/__init__.py).
 
 vendored_by = Unsloth (unsloth_zoo/_vendored/fla)
 """
 
-__all__ = ["FLA_LICENSE", "NOTICE", "FLA_MANIFEST"]
+# vLLM (Apache-2.0), verbatim from unsloth_zoo/_vendored/vllm/LICENSE.
+VLLM_LICENSE = """                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+"""
+
+# Provenance, verbatim from unsloth_zoo/_vendored/vllm/MANIFEST.
+VLLM_MANIFEST = """name = vLLM
+pull_request = https://github.com/vllm-project/vllm/pull/48792
+commit = ccd8197ae9818607cb7e904ffbb83a7ce0fe31fa (refs/pull/48792/head)
+upstream = https://github.com/vllm-project/vllm
+license = Apache-2.0
+license_file = LICENSE
+copyright = Copyright contributors to the vLLM project
+
+description =
+    The Gated DeltaNet ReplaySSM standard-decode Triton kernel from vLLM PR
+    #48792 ("ReplaySSM: cache SSM inputs for faster Gated DeltaNet standard
+    decode"), which closed unmerged when its fork was deleted. Released vLLM ships
+    ReplaySSM for Mamba2 only; unsloth_zoo.vllm_gdn_replayssm backports the GDN
+    path onto released vLLM at runtime and launches this kernel.
+
+exported_api =
+    gdn_replayssm_decode.fused_recurrent_gated_delta_rule_replayssm
+
+modifications =
+    - gdn_replayssm_decode.py is vllm/third_party/flash_linear_attention/ops/
+      fused_recurrent_replayssm.py from the commit above with one change, marked
+      "Modified by Unsloth": the launch-config lookup imported from
+      vllm.model_executor.layers.mamba.ops.replayssm_config is inlined (released
+      vLLM has no "gdn_decode" entry), with the same values as the PR plus a
+      T4 (sm75) entry (32, 1, 1, 4) and a per-device cache, and the kernel
+      imports triton directly instead of vllm.triton_utils.
+    - The runtime integration (state page, metadata builder, layer dispatch) is
+      Unsloth's own code in unsloth_zoo/vllm_gdn_replayssm.py, ported from the
+      same PR.
+
+file_count = 1 python module + __init__.py + this MANIFEST + LICENSE
+
+vendored_by = Unsloth (unsloth_zoo/_vendored/vllm)
+"""
+
+__all__ = ["FLA_LICENSE", "NOTICE", "FLA_MANIFEST", "VLLM_LICENSE", "VLLM_MANIFEST"]

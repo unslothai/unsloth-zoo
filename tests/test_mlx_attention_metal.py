@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import functools
+import math
 import sys
 
 import pytest
@@ -50,14 +52,24 @@ if mlx_is_simulated():
         allow_module_level = True,
     )
 
+from unsloth_zoo.mlx import nax
 from unsloth_zoo.mlx.attention import (
     _PATCH_FLAG,
     _PATCH_TARGETS,
+    _assert_rounding_close,
+    _fp32_prefill,
+    _probe_cases,
     dequantized_sdpa,
     dequantizing_is_smaller,
+    fast_prefill_supported,
     fused_kernel_exists,
     install_quantized_attention,
+    probe_fast_prefill,
+    probe_simd_prefill,
     quantized_sdpa_over,
+    select_blocks,
+    simd_prefill_attention,
+    simd_prefill_supported,
 )
 
 GS = 64
@@ -132,14 +144,13 @@ def test_the_query_count_against_the_cache_geometry_decides_the_route(HQ, HKV, D
 
 
 @pytest.mark.parametrize("D,Dv,group_size", [
-    (256, 256, 64),   # Gemma-2 and Gemma-3: no full kernel at head_dim 256
+    (256, 256, 64),   # Gemma-2 and Gemma-3: fused only for long causal or array-masked prefill
     (192, 128, 64),   # MLA-shaped: a latent wider than the values
     (160, 160, 32),   # not a supported head dim at all
     (128, 64, 64),    # values narrower than the keys
 ])
 def test_a_geometry_with_no_fused_kernel_never_leaves_the_runtime(D, Dv, group_size):
-    """Past 8 queries mlx has a full kernel only at head_dim 64/72/80/96/128 with D == Dv; anywhere
-    else it materializes the same scores, so dequantizing on top of them is strictly worse."""
+    """mlx fuses none of these, so dequantizing on top of its scores is strictly worse."""
     cache = _cache(1, 8, 512, D, 4, group_size, Dv=Dv)
     taken = []
 
@@ -157,6 +168,139 @@ def test_a_geometry_with_no_fused_kernel_never_leaves_the_runtime(D, Dv, group_s
     assert dequantizing_is_smaller(_queries(1, 32, 65536, D), *cache, group_size) is True
 
 
+@pytest.mark.parametrize("case,expected", [
+    ({}, True),
+    ({"L": 1023}, False),
+    ({"S": 1023}, False),   # more queries than keys
+    ({"mask": None}, False),
+    ({"mask": "bool"}, True),
+    ({"mask": "additive"}, True),
+    ({"mask": "bool", "L": 1023}, False),
+    ({"Dv": 128}, False),
+    ({"nax": False}, False),
+    ({"nax": False, "L": 2048, "S": 2048}, True),
+    ({"nax": False, "L": 2048, "S": 4096}, False),
+    ({"nax": False, "L": 2048, "S": 2048, "dtype": mx.float32}, False),
+    ({"nax": False, "L": 2048, "S": 2048, "mask": "bool"}, False),
+    ({"dtype": mx.float16}, True),
+    ({"tf32": "0"}, True),
+    ({"dtype": mx.float32}, True),
+    ({"dtype": mx.float32, "tf32": "0"}, False),
+    ({"dtype": mx.float32, "qdtype": mx.bfloat16, "tf32": "0"}, False),   # the result dtype decides
+    ({"dtype": mx.float32, "tf32": None}, True),   # unset means on
+    ({"dtype": mx.float32, "tf32": " 0"}, False),
+    ({"dtype": mx.float32, "tf32": "abc"}, False),
+    ({"dtype": mx.float32, "tf32": "-1"}, True),
+    ({"D": 512, "L": 4096, "S": 4096}, True),
+    ({"D": 512, "L": 4096, "S": 4096, "nax": False}, False),
+    ({"D": 512, "L": 4096, "S": 4096, "dtype": mx.float32, "tf32": "0"}, False),
+])
+def test_wide_head_prefill_is_fused_where_mlx_fuses_it(monkeypatch, case, expected):
+    from unsloth_zoo.mlx import attention, nax
+
+    c = {"L": 1024, "S": 1024, "D": 256, "mask": "causal", "nax": True, "dtype": mx.bfloat16,
+         "tf32": "1", **case}
+    c.setdefault("Dv", c["D"])
+    monkeypatch.setattr(nax, "nax_available", lambda: c["nax"])
+    if c["tf32"] is None:
+        monkeypatch.delenv("MLX_ENABLE_TF32", raising=False)
+    else:
+        monkeypatch.setenv("MLX_ENABLE_TF32", c["tf32"])
+    cache = _cache(1, 2, c["S"], c["D"], 8, dtype=c["dtype"], Dv=c["Dv"])
+    queries = _queries(1, 8, c["L"], c["D"], dtype=c.get("qdtype", c["dtype"]))
+    mask = {"bool": mx.ones((c["L"], c["S"]), mx.bool_),
+            "additive": mx.zeros((c["L"], c["S"]), c["dtype"])}.get(c["mask"], c["mask"])
+    attention._tf32_enabled.cache_clear()
+    try:
+        assert fused_kernel_exists(queries, *cache, GS, mask) is expected
+    finally:
+        attention._tf32_enabled.cache_clear()
+
+
+def test_head_dim_256_prefill_on_nax_is_the_dequantized_kernel(monkeypatch):
+    from unsloth_zoo.mlx import nax
+
+    unfused = _runtime("mlx_lm")
+    real_nax = nax.nax_available()
+    B, HQ, HKV, S, D, bits = 1, 16, 4, 1280, 256, 8
+    cache = _cache(B, HKV, S, D, bits)
+    wrapped = quantized_sdpa_over(unfused)
+    for L, on_nax, fused in ((1023, True, False), (1024, True, True), (1024, False, False)):
+        monkeypatch.setattr(nax, "nax_available", lambda: on_nax)
+        queries = _queries(B, HQ, L, D)
+        call = dict(scale=D ** -0.5, mask="causal", group_size=GS, bits=bits)
+        expected = unfused(mx.array(queries), *cache, **call)
+        actual = wrapped(mx.array(queries), *cache, **call)
+        dequantized = dequantized_sdpa(mx.array(queries), *cache, **call)
+        mx.eval(expected, actual, dequantized)
+        assert mx.array_equal(actual, dequantized if fused else expected).item(), (L, on_nax)
+        assert _divergence(expected, actual) < MAX_DIVERGENCE, (L, on_nax)
+        if fused and real_nax:   # mlx really fuses it: no scores are materialized
+            peak = _peak(lambda: wrapped(queries, *cache, **call))
+            assert peak < B * HQ * L * S * 2, peak
+
+
+@pytest.mark.parametrize("D,Dv,HQ,L,S,mask,min_keys,expected", [
+    (512, 512, 32, 1024, 1024, "causal", None, True),
+    (512, 512, 16, 1024, 1024, "causal", None, False),
+    (512, 512, 32, 1024, 1024, "bool", None, False),
+    (512, 512, 32, 1024, 1023, "causal", None, False),
+    (512, 512, 64, 1000, 1024, "causal", None, False),
+    (512, 512, 30, 1089, 1089, "causal", None, True),   # query blocks round up
+    (512, 512, 16, 1, 1024, None, None, True),
+    (512, 512, 16, 1, 1023, None, None, False),
+    (512, 512, 8, 1, 1024, None, None, False),
+    (512, 512, 16, 2, 1024, None, None, False),
+    (512, 512, 16, 1, 1024, "bool", None, False),
+    (512, 512, 16, 1, 512, None, "512", True),
+    (512, 512, 8, 2, 16, "bool", "0", True),
+    (96, 64, 8, 16, 512, None, None, True),
+    (96, 64, 8, 1, 512, None, None, True),
+    (96, 64, 8, 32, 16, "causal", None, False),
+    (96, 64, 8, 8, 4, None, None, False),
+])
+def test_head_dim_512_and_96_64_are_fused_where_mlx_has_a_kernel(monkeypatch, D, Dv, HQ, L, S, mask,
+                                                                min_keys, expected):
+    from unsloth_zoo.mlx import nax
+
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    if min_keys is None:
+        monkeypatch.delenv("MLX_SDPA_D512_MIN_KL", raising=False)
+    else:
+        monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", min_keys)
+    mask = mx.ones((L, S), mx.bool_) if mask == "bool" else mask
+    cache = _cache(1, 2, S, D, 8, group_size=32, Dv=Dv)
+    assert fused_kernel_exists(_queries(1, HQ, L, D), *cache, 32, mask) is expected
+
+
+@pytest.mark.parametrize("D,Dv,HQ,HKV,L,S,mask", [
+    (128, 128, 8, 8, 16, 512, None), (192, 192, 8, 8, 16, 512, None), (64, 64, 8, 8, 1, 512, None),
+    (256, 256, 8, 2, 16, 512, "causal"), (256, 256, 8, 2, 1024, 1024, "causal"),
+    (256, 256, 8, 2, 1024, 1024, "bool"), (256, 256, 8, 2, 2048, 2048, "causal"),
+    (512, 512, 32, 4, 1024, 1024, "causal"), (512, 512, 16, 4, 1024, 1024, "causal"),
+    (512, 512, 16, 2, 1, 1024, None), (512, 512, 16, 2, 1, 1023, None),
+    (96, 64, 8, 8, 16, 512, None), (96, 64, 8, 8, 1, 512, None),
+    (96, 64, 8, 8, 32, 16, "causal"), (128, 128, 8, 8, 32, 16, "causal"),
+    (128, 128, 8, 8, 8, 4, None),
+])
+def test_fused_kernel_exists_matches_what_the_installed_mlx_fuses(monkeypatch, D, Dv, HQ, HKV, L, S,
+                                                                  mask):
+    """The default call is bit-identical to `force_fused=True` exactly when mlx fuses."""
+    monkeypatch.delenv("UNSLOTH_MLX_NAX", raising=False)
+    q_keys, q_values = _cache(1, HKV, S, D, 8, group_size=32, Dv=Dv)
+    queries = _queries(1, HQ, L, D)
+    keys, values = (mx.dequantize(*q, group_size=32, bits=8).astype(queries.dtype)
+                    for q in (q_keys, q_values))
+    mask = mx.random.uniform(shape=(L, S)) > 0.1 if mask == "bool" else mask
+    sdpa = functools.partial(mx.fast.scaled_dot_product_attention, queries, keys, values,
+                             scale=D ** -0.5, mask=mask)
+    try:
+        fused = mx.array_equal(sdpa(force_fused=True), sdpa()).item()
+    except ValueError:
+        fused = False
+    assert fused_kernel_exists(queries, q_keys, q_values, 32, mask) is fused
+
+
 @pytest.mark.parametrize("bits,group_size,last", [(4, 64, 82), (8, 64, 98), (2, 32, 76)])
 @pytest.mark.parametrize("mask", ["causal", "bool", "additive"])
 @pytest.mark.parametrize("runtime", ["mlx_lm", "mlx_vlm"])
@@ -164,8 +308,8 @@ def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, 
                                                                  last):
     """mlx-vlm runs batched, as its array masks are; those masks also drop every seventh key.
 
-    Both array masks carry a leading 1: `mlx_vlm<0.6.5` -- which is what `mlx-vlm<=0.7.1` against
-    this repo's `transformers` cap resolves to -- broadcasts a `[B, 1, L, S]` mask against its own
+    Both array masks carry a leading 1: `mlx_vlm<0.6.5` -- which is what `mlx-vlm<=0.7.9` against
+    unsloth's `transformers<=5.5.0` resolves to -- broadcasts a `[B, 1, L, S]` mask against its own
     5-D grouped scores only when B is 1. A per-row batched mask above the tie is covered by
     `test_a_batched_mask_the_pinned_runtime_cannot_broadcast` below.
     """
@@ -196,7 +340,7 @@ def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, 
 @pytest.mark.parametrize("runtime", ["mlx_lm", "mlx_vlm"])
 def test_a_batched_mask_the_pinned_runtime_cannot_broadcast(runtime):
     """A per-row `[B, 1, L, S]` mask over grouped heads, which above the tie no longer reaches the
-    runtime. `mlx_lm` 0.31.3 and `mlx_vlm` 0.6.4 both raise on it; the fused kernel takes it as
+    runtime. `mlx_lm` 0.31.3 and `mlx_vlm` 0.6.4 raise on it (mlx_lm 0.32 broadcasts it); the fused kernel takes it as
     given, so gate on a float32 reference rather than on their answer."""
     unfused = _runtime(runtime)
     B, HQ, HKV, S, L, D, bits = 2, 32, 8, 640, 256, 128, 4
@@ -518,3 +662,90 @@ def test_qsa_wrapper_forwards_unknown_kwargs_outside_training():
     wrapped = attention._qsa_attention_training_over(dispatch)
     assert wrapped(*[None] * 5, cache=None, scale=1., block_size=4, causal=True,
                    mask=None, mask_factory=None, future_flag="kept") == "kept"
+
+
+def _stock_selection(scores, complete, topk):
+    # mlx-vlm 0.7.4 Qwen4ExpQSAIndexer.select_from_projected after the per-head scores, sorted.
+    blocks = mx.sum(mx.maximum(scores, 0), axis = 1) / math.sqrt(128)
+    blocks = mx.where(mx.arange(scores.shape[-1])[None, None] < complete[..., None], blocks, -mx.inf)
+    picks = mx.argpartition(blocks, kth = -topk, axis = -1)[..., -topk:].astype(mx.int32)
+    return mx.sort(mx.where(picks < complete[..., None], picks, -1), axis = -1)
+
+
+@pytest.mark.parametrize("kind", ["normal", "ties", "zeros", "nan", "negzero"])
+def test_qsa_block_selection_picks_argpartitions_set(kind):
+    mx.random.seed(len(kind))
+    for B, L, nb in [(1, 1, 1025), (1, 2, 70000), (2, 3, 4096), (1, 300, 1500), (1, 64, 40000)]:
+        scores = mx.random.normal((B, 4, L, nb))
+        draw = mx.random.uniform(shape = scores.shape)
+        scores = {"ties": mx.round(scores * 2) / 2, "zeros": mx.where(draw < 0.9, -1.0, scores),
+                  "nan": mx.where(draw < 0.001, mx.nan, scores), "negzero": mx.where(draw < 0.5, -0.0, scores),
+                  }.get(kind, scores)
+        # Rows straddle the top-k: some see fewer complete blocks than it, the rest more.
+        complete = mx.broadcast_to(nb - L + mx.arange(L, dtype = mx.int32), (B, L)) - (B * L > 3) * (nb - 600)
+        assert mx.array_equal(select_blocks(scores, complete, 512, 128), _stock_selection(scores, complete, 512)).item()
+
+
+def test_qsa_block_selection_refuses_a_zero_budget():
+    scores, complete = mx.random.normal((1, 4, 2, 64)), mx.full((1, 2), 64, dtype = mx.int32)
+    with pytest.raises(ValueError, match = "topk >= 1"):
+        select_blocks(scores, complete, 0, 128)
+
+
+def test_qsa_fast_prefill_matches_fp32_attention():
+    if not nax.nax_available():
+        pytest.skip("needs the neural accelerators")
+    probe_fast_prefill()
+
+
+@pytest.mark.parametrize("change", [None, "batch", "heads", "kv_heads", "width", "dtype", "topk", "block", "rows"])
+def test_qsa_fast_prefill_covers_only_the_measured_layout(change):
+    B, H, KV, D, L, topk, block, dtype = 1, 24, 2, 256, 64, 512, 4, mx.bfloat16
+    B, H, KV, D, L, topk, block, dtype = {
+        "batch": (2, H, KV, D, L, topk, block, dtype), "heads": (B, 12, KV, D, L, topk, block, dtype),
+        "kv_heads": (B, H, 4, D, L, topk, block, dtype), "width": (B, H, KV, 128, L, topk, block, dtype),
+        "dtype": (B, H, KV, D, L, topk, block, mx.float16), "topk": (B, H, KV, D, L, 256, block, dtype),
+        "block": (B, H, KV, D, L, topk, 8, dtype), "rows": (B, H, KV, D, 63, topk, block, dtype),
+    }.get(change, (B, H, KV, D, L, topk, block, dtype))
+    queries, keys = mx.zeros((B, H, L, D), dtype), mx.zeros((B, KV, 4096, D), dtype)
+    assert fast_prefill_supported(queries, keys, mx.zeros((B, L, topk), mx.int32), block) == (change is None)
+
+
+def test_qsa_prefill_reference_matches_mlx_vlm():
+    from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
+    for q, k, v, picks, ends in _probe_cases():
+        _assert_rounding_close(_fp32_prefill(q, k, v, picks, ends, 256 ** -0.5),
+                               qsa_sparse_attention(q, k, v, picks, ends, scale = 256 ** -0.5, block_size = 4),
+                               q.shape[2:3] + k.shape[2:3])
+
+
+def test_qsa_simd_prefill_matches_fp32_attention():
+    probe_simd_prefill()
+
+
+@pytest.mark.parametrize("heads, topk", [(4, 512), (32, 512), (24, 256)])
+def test_qsa_simd_prefill_matches_other_query_groups(heads, topk):
+    from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
+    L, N = 64, 2400
+    q = mx.random.normal((1, heads, L, 256), key = mx.random.key(1)).astype(mx.bfloat16)
+    k, v = (mx.random.normal((1, 2, N, 256), key = mx.random.key(i)).astype(mx.bfloat16) for i in (2, 3))
+    ends = mx.arange(N - L + 1, N + 1, dtype = mx.int32)[None]
+    picks = mx.argsort(mx.random.uniform(shape = (1, L, 584), key = mx.random.key(4)), axis = -1)[..., :topk]  # complete blocks
+    native = qsa_sparse_attention(q, k, v, picks, ends, scale = 0.0625, block_size = 4).astype(mx.float32)
+    got = simd_prefill_attention(q, k, v, picks, ends, 0.0625).astype(mx.float32)
+    assert mx.abs(got - native).max().item() <= 0.02 * mx.abs(native).max().item()
+
+
+@pytest.mark.parametrize("change", [None, "group", "topk", "batch", "uneven", "wide_group", "width", "dtype", "block",
+                                    "rows"])
+def test_qsa_simd_prefill_covers_query_groups_up_to_16(change):
+    B, H, KV, D, L, topk, block, dtype = {
+        "group": (1, 8, 1, 256, 64, 512, 4, mx.bfloat16), "topk": (1, 24, 2, 256, 64, 256, 4, mx.bfloat16),
+        "batch": (2, 24, 2, 256, 64, 512, 4, mx.bfloat16), "uneven": (1, 24, 5, 256, 64, 512, 4, mx.bfloat16),
+        "wide_group": (1, 34, 2, 256, 64, 512, 4, mx.bfloat16), "width": (1, 24, 2, 128, 64, 512, 4, mx.bfloat16),
+        "dtype": (1, 24, 2, 256, 64, 512, 4, mx.float16), "block": (1, 24, 2, 256, 64, 512, 8, mx.bfloat16),
+        "rows": (1, 24, 2, 256, 63, 512, 4, mx.bfloat16),
+    }.get(change, (1, 24, 2, 256, 64, 512, 4, mx.bfloat16))
+    queries, keys = mx.zeros((B, H, L, D), dtype), mx.zeros((B, KV, 4096, D), dtype)
+    covered = change in (None, "group", "topk")
+    assert simd_prefill_supported(queries, keys, mx.zeros((B, L, topk), mx.int32), block) == covered
