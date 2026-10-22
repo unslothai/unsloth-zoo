@@ -10874,6 +10874,9 @@ def train_on_responses_only(
         print("Unsloth: train_on_responses_only enabled (VLM mode).")
     else:
         args = trainer.args
+        if args.streaming:
+            # A sized dataset skips the lazy branch below and would cache an eager grouped plan.
+            _reject_group_by_length(_resolve_text_dataset_order(args), "streaming")
         train_dataset = trainer._train_dataset_for_batches()
         if args.streaming:
             trainer._mlx_response_mask_fn = mask_fn

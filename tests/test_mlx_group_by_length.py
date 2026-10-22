@@ -419,6 +419,39 @@ def test_streaming_rejects_length_grouping():
         _reject_group_by_length("length_grouped", "streaming")
 
 
+def test_responses_only_rejects_streaming_grouping_on_a_sized_dataset(monkeypatch):
+    # A sized dataset under streaming=True skips the lazy branch and used to build and cache an eager
+    # length-grouped plan, which train() then returned before its own streaming rejection.
+    import types
+
+    import unsloth_zoo.dataset_utils as dataset_utils
+    from unsloth_zoo.mlx import trainer as mlx_trainer
+
+    monkeypatch.setattr(
+        dataset_utils, "train_on_responses_only", lambda *a, **k: _keep_all_labels,
+    )
+    built = []
+    monkeypatch.setattr(
+        mlx_trainer, "_create_labeled_batches", lambda **k: built.append(k) or ([], []),
+    )
+    args = types.SimpleNamespace(
+        streaming=True, group_by_length=True, preserve_dataset_order=False,
+        dataset_order="default", max_steps=2, gradient_accumulation_steps=1,
+        num_train_epochs=1, per_device_train_batch_size=1, max_seq_length=16,
+        dataset_text_field="text", seed=0,
+    )
+    trainer = types.SimpleNamespace(
+        args=args, tokenizer=_SpaceTokenizer(), _is_vlm=False, eval_dataset=None,
+        formatting_func=None, model=types.SimpleNamespace(),
+        _train_dataset_for_batches=lambda: [{"text": "10 11 12"}],
+    )
+    with pytest.raises(ValueError, match="requires a sized dataset"):
+        mlx_trainer.train_on_responses_only(
+            trainer, instruction_part="1", response_part="2",
+        )
+    assert built == []
+
+
 def test_preference_rejects_length_grouping():
     from unsloth_zoo.mlx.trainer import _reject_group_by_length
 
