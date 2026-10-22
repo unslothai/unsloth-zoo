@@ -76,10 +76,14 @@ def _bf16_capable(gate_up) -> bool:
     # sm75 has no bf16 conversion instructions.
     if torch.compiler.is_compiling():
         return True
-    ok = _CACHE.get("bf16_ok")
+    # Per operand device: in a mixed system an older visible card must not disable fusion on a capable one.
+    index = gate_up.device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    key = ("bf16_ok", index)
+    ok = _CACHE.get(key)
     if ok is None:
-        n = torch.cuda.device_count()
-        ok = _CACHE["bf16_ok"] = n > 0 and all(torch.cuda.get_device_capability(i)[0] >= 8 for i in range(n))
+        ok = _CACHE[key] = torch.cuda.get_device_capability(index)[0] >= 8
     return ok
 
 

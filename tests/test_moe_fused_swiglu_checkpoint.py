@@ -79,6 +79,21 @@ def test_self_check_hooks_disabled_is_not_cached(monkeypatch):
     assert not any(isinstance(k, tuple) and k and k[0] == "self_check" for k in sw._CACHE)
 
 
+def test_bf16_gate_is_per_operand_device(monkeypatch):
+    # A visible sm75 card must not disable bf16 fusion on an sm90 operand device, and vice versa.
+    import types
+
+    caps = {0: (7, 5), 1: (9, 0)}
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i = None: caps[i])
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    monkeypatch.setattr(sw, "_CACHE", {})
+    on = lambda d: types.SimpleNamespace(device = torch.device(d))
+    assert sw._bf16_capable(on("cuda:1")) is True
+    assert sw._bf16_capable(on("cuda:0")) is False
+    assert sw._bf16_capable(on("cuda")) is True  # bare "cuda" = the current device
+
+
 def _gpu_dtypes():
     if not torch.cuda.is_available():
         return []
@@ -98,7 +113,7 @@ class GptOssExperts(torch.nn.Module):
     alpha, limit = 1.702, 7.0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "NVIDIA CUDA required")
 @pytest.mark.parametrize("dtype", _gpu_dtypes())
 @pytest.mark.parametrize("expert_cls", [Qwen3MoeExperts, GptOssExperts])
 @pytest.mark.parametrize("interleaved", [False, True])
