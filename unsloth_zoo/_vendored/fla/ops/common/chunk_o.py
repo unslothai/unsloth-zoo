@@ -21,12 +21,17 @@ from fla.utils import (
     IS_NVIDIA_HOPPER,
     TRITON_ABOVE_3_4_0,
     TRITON_ABOVE_3_7_1,
+    TRITON_ABOVE_3_8_0,
     autotune_cache_kwargs,
     check_shared_mem,
 )
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+# Unsloth: backported from fla-org/flash-linear-attention#1399 (issue #1327, triton-lang/triton#10590):
+# Triton < 3.8 races at 8 warps in chunk_bwd_kernel_dv_local on Blackwell (nondeterministic dv).
+BLACKWELL_8_WARP_RACE = IS_NVIDIA_BLACKWELL and not TRITON_ABOVE_3_8_0
+CHUNK_BWD_DV_LOCAL_NUM_WARPS = [2, 4] if BLACKWELL_8_WARP_RACE else NUM_WARPS
 
 
 # Unsloth: per-device Hopper probe for the fla #640 tile workaround below.
@@ -498,7 +503,7 @@ def chunk_bwd_kernel_dv(
 @fla_cache_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in NUM_WARPS
+        for num_warps in CHUNK_BWD_DV_LOCAL_NUM_WARPS
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G'],
