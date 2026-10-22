@@ -732,3 +732,29 @@ def test_wrong_cached_launch_still_caught_after_a_capture(monkeypatch):
     monkeypatch.setattr(gcc, "_conv_fast_launch", lambda plan, ptrs, ints, consts: ptrs[3].add_(1))
     assert torch.equal(gcc._launch_fwd(x.transpose(1, 2), w, b, "silu"), ref)
     assert gcc._conv_fast_ok == {"fwd": False}
+
+
+@requires_cuda
+@pytest.mark.parametrize("xdtype", [torch.float16, torch.bfloat16])
+def test_mamba_mixed_dtype_preactivation_stays_in_the_parameter_dtype(xdtype):
+    # fp16 x with the fp32 parameter: the torch path (and causal_conv1d) applies SiLU to the fp32
+    # conv output. Narrowing that pre-activation to x's fp16 first turns a finite -360000 into
+    # -inf, and SiLU / its derivative into NaN. bf16 does not overflow here but must agree too.
+    B, T, D, W = 1, 8, 64, 4
+    x = torch.full((B, T, D), -30000.0, device = "cuda", dtype = xdtype).transpose(1, 2)
+    w = torch.full((D, W), 3.0, device = "cuda")
+    g = torch.Generator(device = "cuda").manual_seed(0)
+    dout = torch.randn(B, T, D, device = "cuda", generator = g).to(xdtype).transpose(1, 2)
+    before = dict(gcc.GDN_CAUSAL_CONV1D_STATS)
+    y = gcc.mamba_causal_conv1d_fwd_function(x, w, None, None, None, None, True)
+    dx, dw, db, _ = gcc.mamba_causal_conv1d_bwd_function(x, w, None, dout, None, None, None, None, False, True)
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["mamba_fused_fwd"] == before["mamba_fused_fwd"] + 1
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["mamba_fused_bwd"] == before["mamba_fused_bwd"] + 1
+    assert db is None
+    xr, wr = (t.detach().clone().requires_grad_(True) for t in (x, w))
+    ref = gcc.causal_conv1d_reference(xr, wr, None, "silu")
+    ref.backward(dout)
+    for ours, theirs in ((y, ref.detach()), (dx, xr.grad), (dw, wr.grad)):
+        assert torch.isfinite(theirs).all()
+        assert torch.isfinite(ours).all()
+        assert torch.equal(ours, theirs)

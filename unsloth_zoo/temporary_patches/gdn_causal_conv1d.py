@@ -146,8 +146,9 @@ def _build_kernels():
         if HAS_BIAS:
             acc += tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)[None, :]
         if ACTIVATION:
-            # The torch path stores the conv output in the input dtype, then SiLU.
-            acc = acc.to(y.dtype.element_ty).to(tl.float32)
+            # The torch path stores the conv output in the weight's dtype, then SiLU (an fp32
+            # parameter under autocast keeps it fp32: narrowing to x's fp16 overflows to -inf).
+            acc = acc.to(weight.dtype.element_ty).to(tl.float32)
             acc = acc * tl.sigmoid(acc)
         if PAD_NEG:
             # causal_conv1d's rule: padding (seq_idx < 0) outputs 0; it never feeds a real position.
@@ -196,9 +197,9 @@ def _build_kernels():
             dy + tl.cast(i_b, tl.int64) * stride_dy_b + o_t.to(tl.int64)[:, None] * stride_dy_t + o_d64[None, :] * stride_dy_d,
             mask = m, other = 0,
         ).to(tl.float32)
-        pre = acc.to(g.dtype.element_ty).to(tl.float32)
+        pre = acc.to(weight.dtype.element_ty).to(tl.float32)
         sig = tl.sigmoid(pre)
-        # torch's silu_backward stores the gradient in the input dtype.
+        # torch's silu_backward stores the gradient in the conv's (the weight's) dtype.
         b_g = b_dy * sig * (1 + pre * (1 - sig))
         p_g = g + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
         tl.store(p_g, b_g.to(g.dtype.element_ty), mask = m)
@@ -305,7 +306,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
     grid = ((D + _BD - 1) // _BD, NT, B)
     seq_ptr = seq_idx if seq_idx is not None else weight
     if activation is not None:
-        g = torch.empty((B, T, D), dtype = x_btd.dtype, device = x_btd.device)
+        g = torch.empty((B, T, D), dtype = weight.dtype, device = x_btd.device)
         _conv_launch(
             "bwd_g", bwd_g, grid,
             (x_btd, weight, bias if bias is not None else weight, dy_btd, g, seq_ptr),
