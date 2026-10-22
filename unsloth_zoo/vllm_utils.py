@@ -5369,6 +5369,22 @@ def _is_moe_expert_lora_key(key):
     )
 
 
+def _is_moe_per_expert_lora_key(key):
+    """True for a per-expert 2D adapter key (`experts.<i>.gate_proj`, Mixtral's `experts.<i>.w1`).
+
+    Transformers 4.x keeps Qwen3-MoE / Mixtral experts as one nn.Linear per expert, so the
+    adapter is a plain 2D LoRA per expert. That is the layout vLLM's 2D FusedMoEWithLoRA
+    reads: `get_packed_modules_mapping` maps `experts` to `experts.<i>.<proj>` exactly when
+    the model is not `is_3d_moe_weight` (vllm/lora/utils.py), so it is not a stacked tensor.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    parts = key.split(".")
+    return any(
+        part in _MOE_EXPERT_LORA_SEGMENTS and child.isdigit()
+        for part, child in zip(parts, parts[1:])
+    )
+
+
 def _saved_adapter_lora_keys(save_directory):
     """Adapter key names in a saved PEFT adapter, read from the file on disk.
 
@@ -5629,29 +5645,35 @@ def _is_bitsandbytes_quantized(model):
 pass
 
 
-def _moe_expert_lora_refusal_reason(model, peft_config):
-    """Why vLLM cannot serve a stacked MoE expert adapter here, or None when it can.
+def _moe_expert_lora_refusal_reason(model, peft_config, per_expert = False):
+    """Why vLLM cannot serve a stacked (or, with per_expert, a per-expert 2D) MoE expert adapter here, or None when it can.
 
     vLLM picks `FusedMoE3DWithLoRA` (which consumes PEFT's target_parameters layout
     directly, so Unsloth's saved tensors need no conversion) exactly when the model class
     sets `is_3d_moe_weight` and the engine has not forced the 2D wrapper. Read that flag
     off the live class rather than comparing vLLM versions: it is the bit vLLM itself
     branches on, it tracks new architectures automatically, and it catches a caller who
-    patches it off.
+    patches it off. A per-expert adapter needs the opposite: the 2D `FusedMoEWithLoRA`.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     runner = _get_vllm_model_runner(model)
     vllm_model = _get_vllm_lora_model(model, runner)
     if vllm_model is None:
-        return "the vLLM model could not be inspected, so 3D MoE LoRA support cannot be confirmed"
+        return "the vLLM model could not be inspected, so MoE LoRA support cannot be confirmed"
 
-    if getattr(type(vllm_model), "is_3d_moe_weight", False) is not True:
+    is_3d = getattr(type(vllm_model), "is_3d_moe_weight", False) is True
+    if per_expert:
+        if is_3d and _vllm_mixed_moe_lora_enabled(model, runner, vllm_model) is not True:
+            return (
+                "this architecture sets is_3d_moe_weight, so vLLM wraps its experts with "
+                "FusedMoE3DWithLoRA, which reads only the stacked layout, not per-expert adapters"
+            )
+    elif not is_3d:
         return (
             "this architecture does not set is_3d_moe_weight, so vLLM wraps its experts with "
             "the 2D FusedMoEWithLoRA and drops Unsloth's stacked adapter (vllm-project/vllm#41754)"
         )
-
-    if _vllm_mixed_moe_lora_enabled(model, runner, vllm_model) is True:
+    elif _vllm_mixed_moe_lora_enabled(model, runner, vllm_model) is True:
         return "enable_mixed_moe_lora_format forces vLLM's 2D expert wrapper, which cannot read a stacked adapter"
 
     if _is_bitsandbytes_quantized(model):
@@ -5772,8 +5794,13 @@ def _check_lora_is_servable(model, keys, source, peft_config):
     """
     # All Unsloth Zoo code licensed under LGPLv3
     expert_keys = [k for k in keys if _is_moe_expert_lora_key(k)]
-    if len(expert_keys) != 0:
-        reason = _moe_expert_lora_refusal_reason(model, peft_config)
+    # Per-expert 2D keys (transformers 4.x Qwen3-MoE / Mixtral experts.<i>.<proj>) and stacked
+    # keys need opposite vLLM wrappers, so each group is checked against its own.
+    per_expert_keys = [k for k in expert_keys if _is_moe_per_expert_lora_key(k)]
+    stacked_keys = [k for k in expert_keys if not _is_moe_per_expert_lora_key(k)]
+    for per_expert, expert_keys in ((False, stacked_keys), (True, per_expert_keys)):
+        if len(expert_keys) == 0: continue
+        reason = _moe_expert_lora_refusal_reason(model, peft_config, per_expert = per_expert)
         if reason is not None:
             raise NotImplementedError(
                 "Unsloth: fast_inference=True cannot serve this LoRA on MoE expert weights "
