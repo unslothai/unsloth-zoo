@@ -64,9 +64,9 @@ def test_every_dv_local_config_is_deterministic(varlen):
     # fla issue #1327 repro: B200 + Triton 3.7.1 gives 2 of 19 differing calls at 8 warps, dense.
     import torch
     import triton
-    import fla.ops.utils as fla_utils
 
     chunk_o = _load_chunk_o()
+    import fla.ops.utils as fla_utils
     tuner = _autotuner(chunk_o.chunk_bwd_kernel_dv_local)
     T, H, D = 65536, 48, 128
     torch.manual_seed(0)
