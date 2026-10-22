@@ -662,6 +662,44 @@ def test_routed_experts_prompt_start_keeps_routes_on_their_tokens(replay, as_lis
         assert torch.equal(rr._lookup((3, 4, 5, 6, 7, 8))[:5].long(), torch.as_tensor(routed).long())
 
 
+def test_prompt_start_accepts_any_sampling_params_sequence(replay):
+    # vLLM pairs any collections.abc.Sequence of SamplingParams with the prompts, not only lists.
+    from collections import UserList
+    routed = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
+    request = SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = routed[2:])])
+    rr.record_routed_experts([request], sampling_params = UserList([SimpleNamespace(routed_experts_prompt_start = 2)]))
+    rows = rr._lookup((3, 4, 5, 6, 7, 8))
+    assert torch.equal(rows[:2].long(), torch.full((2, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[2:5].long(), torch.as_tensor(routed[2:5]).long())
+
+
+def test_prompt_start_reuses_routes_of_an_earlier_turn(replay):
+    # Multi-turn: turn 2 sets routed_experts_prompt_start to the length of turn 1's sequence, so vLLM
+    # returns only the new tokens. The skipped prefix replays what turn 1 recorded for those tokens.
+    turn1 = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
+    turn2 = (np.arange(3 * NUM_LAYERS * TOP_K).reshape(3, NUM_LAYERS, TOP_K) + 3) % NUM_EXPERTS
+    rr.record_routed_experts([SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = turn1)])])
+    prompt2 = [3, 4, 5, 6, 7, 8, 9, 10]
+    rr.record_routed_experts(
+        [SimpleNamespace(prompt_token_ids = prompt2, outputs = [SimpleNamespace(token_ids = [11, 12], routed_experts = turn2)])],
+        sampling_params = SimpleNamespace(routed_experts_prompt_start = 6),
+    )
+    rows = rr._lookup(tuple(prompt2 + [11, 12]))
+    assert torch.equal(rows[:5].long(), torch.as_tensor(turn1).long())
+    # Turn 1 never forwarded its last sampled token and turn 2 skipped it, so it keeps natural routing.
+    assert torch.equal(rows[5].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[6:9].long(), torch.as_tensor(turn2).long())
+    assert torch.equal(rows[9].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    # A prefix no earlier turn recorded stays unrouted.
+    rr.record_routed_experts(
+        [SimpleNamespace(prompt_token_ids = [1, 2, 3, 4, 5, 6, 7, 8], outputs = [SimpleNamespace(token_ids = [11, 12], routed_experts = turn2)])],
+        sampling_params = SimpleNamespace(routed_experts_prompt_start = 6),
+    )
+    rows = rr._lookup((1, 2, 3, 4, 5, 6, 7, 8, 11, 12))
+    assert torch.equal(rows[:6].long(), torch.full((6, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[6:9].long(), torch.as_tensor(turn2).long())
+
+
 def test_rollout_split_into_many_generate_calls_is_kept_whole(replay):
     # generate_batches splits one rollout into several llm.generate calls before any training forward.
     model = _model()

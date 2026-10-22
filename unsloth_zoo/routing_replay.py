@@ -47,6 +47,7 @@ import os
 import re
 import warnings
 from collections import OrderedDict
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -186,10 +187,21 @@ def _make_key(token_ids, pad_token_id):
 
 def _prompt_start(sampling_params, index):
     # vLLM's routed_experts_prompt_start drops that many leading prompt tokens from the capture.
-    if isinstance(sampling_params, (list, tuple)):
+    # Same per-prompt test as vLLM's offline _params_to_seq: any Sequence, never a SamplingParams.
+    if isinstance(sampling_params, Sequence):
         sampling_params = sampling_params[index] if index < len(sampling_params) else None
     start = getattr(sampling_params, "routed_experts_prompt_start", 0)
     return start if isinstance(start, int) and start > 0 else 0
+
+
+def _earlier_prefix_rows(prefix, store):
+    """Rows recorded for exactly `prefix` by an earlier turn (multi-turn prompt start), else None."""
+    earlier = (call[0] for rollout in reversed(_STATE.generations.values()) for call in reversed(rollout))
+    for candidate in (store, *earlier):
+        rows = candidate.get(prefix, None)
+        if rows is not None:
+            return rows
+    return None
 
 
 def record_routed_experts(request_outputs, pad_token_id = None, sampling_params = None):
@@ -211,6 +223,11 @@ def record_routed_experts(request_outputs, pad_token_id = None, sampling_params 
             rows = torch.full((len(full),) + tuple(routed.shape[1:]), -1, dtype = torch.int16)
             n = max(min(len(full) - start, routed.shape[0]), 0)
             rows[start : start + n] = routed[:n]
+            if start > 0:
+                # vLLM skipped tokens an earlier turn already returned: replay that turn's routes.
+                earlier = _earlier_prefix_rows(tuple(full[:start]), store)
+                if earlier is not None and earlier.shape[1:] == rows.shape[1:]:
+                    rows[:start] = earlier
             if rows.shape[-1] > 1:
                 # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.
                 ordered = rows.sort(dim = -1).values
