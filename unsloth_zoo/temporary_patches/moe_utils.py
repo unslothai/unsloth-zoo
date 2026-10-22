@@ -1988,10 +1988,8 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
     __setattr__, so no (de)registration or hooks); any other attribute goes through
     object.__setattr__. Used by the FP8 and bnb4bit MoE dispatchers.
     """
-    # Never write the Parameter into __dict__: it would shadow later `_parameters` swaps (FSDP2
-    # all-gather) and read a freed buffer. Swapping the `_parameters` entry and writing the same
-    # Parameter object back is a plain dict setitem, which Dynamo traces on every supported torch;
-    # `__dict__.pop` / `del` graph-break before torch 2.13 and an `object()` sentinel breaks too.
+    # Swap `_parameters` entries only: a __dict__ write shadows later FSDP2 swaps (freed buffer), and
+    # `__dict__.pop` / `del` / an `object()` sentinel graph-break; dict setitem traces on every torch.
     names = ("gate_up_proj", "down_proj")
     params = experts_module._parameters
     instance_dict = experts_module.__dict__

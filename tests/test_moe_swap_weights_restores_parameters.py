@@ -124,9 +124,7 @@ def test_swap_traces_fullgraph_and_restores_under_compile(backend, dynamic):
 @pytest.mark.parametrize("backend", ["eager", "aot_eager"])
 @pytest.mark.parametrize("fullgraph", [False, True])
 def test_compiled_swap_keeps_parameters_registered(backend, fullgraph):
-    # Dynamo on torch 2.12 replays a traced `__dict__.pop(name)` as DELETE_ATTR, and
-    # nn.Module.__delattr__ then unregisters the Parameter: the first compiled call returned the
-    # right value but left `_parameters` empty, and the module lost both expert weights.
+    # torch 2.12 replayed a traced `__dict__.pop` as DELETE_ATTR, unregistering both expert Parameters.
     experts = _Experts()
     originals = dict(experts._parameters)
 
