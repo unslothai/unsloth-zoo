@@ -560,6 +560,13 @@ def requires_grad_for_gradient_checkpointing(model):
         target.requires_grad_(True)
     pass
 
+    def requires_grad_post_hook_eager(module, input, output):
+        # Gemma 3N's multimodal embedder also has an Embedding child but runs compiled, where the flip
+        # is a graph break and needless (its LoRA projection sits right after); Dia's encoder runs eager.
+        if torch.compiler.is_compiling(): return
+        requires_grad_post_hook(module, input, output)
+    pass
+
     def requires_grad_pre_hook(module, args, kwargs):
         # Dynamo cannot trace requires_grad_(), and Gemma 3N compiles a LoRA target
         # (embed_audio.embedding_projection) with fullgraph = True, so it is a hard error.
@@ -738,7 +745,7 @@ def requires_grad_for_gradient_checkpointing(model):
                     embedding,
                     "_forward_hooks",
                 )
-                embedding.register_forward_hook(requires_grad_post_hook)
+                embedding.register_forward_hook(requires_grad_post_hook_eager)
         pass
     pass
 pass
