@@ -128,7 +128,7 @@ def test_visible_cuda_capabilities_partial_scan_keeps_readable_cards(monkeypatch
     assert device_type._visible_cuda_capabilities() == expected
 
 
-# C2: pre-Turing compile switch --------------------------------------------------------
+# C2: pre-Turing LM-head fusion switch --------------------------------------------------------
 
 def _old_cuda_arch_version(caps, current, cuda_caps):
     """Run compiler.py's module-level capability block against spoofed devices."""
@@ -147,9 +147,11 @@ def _old_cuda_arch_version(caps, current, cuda_caps):
 
 
 @pytest.mark.parametrize("current", [0, 1])
-@pytest.mark.parametrize("caps", [[(8, 0), (6, 1)], [(6, 1), (8, 0)]])
-def test_compile_switch_sees_any_old_device(cuda_caps, caps, current):
-    assert _old_cuda_arch_version(caps, current, cuda_caps) is True
+@pytest.mark.parametrize("caps", [[(8, 0), (6, 1)], [(6, 1), (8, 0)], [(8, 9), (7, 0)]])
+def test_lm_head_fusion_switch_follows_the_current_device(cuda_caps, caps, current):
+    # An idle older card beside the current one must not turn the LM-head fusion off.
+    major, minor = caps[current]
+    assert _old_cuda_arch_version(caps, current, cuda_caps) is ((major <= 7) and (minor < 5))
 
 
 def test_compile_switch_homogeneous_unchanged(cuda_caps):
