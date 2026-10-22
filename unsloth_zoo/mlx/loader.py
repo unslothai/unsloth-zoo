@@ -9901,7 +9901,6 @@ class FastMLXModel:
         )
 
         mlx_lm_vision = _mlx_lm_serves_images(config_data, model_type)
-        # Images go to mlx-vlm first; mlx_lm serves only the types mlx-vlm lacks.
         mlx_lm_images = (
             text_only is not True and mlx_lm_vision
             and _resolve_mlx_vlm_model_class(model_type) is None
@@ -10291,7 +10290,6 @@ class FastMLXModel:
             model._is_vlm_model = False
             if mlx_lm_images:
                 from mlx_lm.processors import load_processor
-                # The tokenizer's HF-style call takes images through it; see _patch_mlx_tokenizer_call.
                 tokenizer._unsloth_image_processor = load_processor(model, config)
                 model._unsloth_supports_images = True
                 model._unsloth_modality_model_type = model_type
