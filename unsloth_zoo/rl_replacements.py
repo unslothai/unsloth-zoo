@@ -46,6 +46,56 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 pass
 
+def _truncated_support_mask_impl(logits: torch.Tensor, top_k: int, top_p: float, min_p: float) -> torch.Tensor:
+    if min_p > 0.0:
+        probs = torch.softmax(logits, dim = -1)
+        logits = logits.masked_fill(probs < min_p * probs.amax(dim = -1, keepdim = True), float("-inf"))
+    if top_k > 0 and top_k < logits.shape[-1]:
+        kth = torch.topk(logits, top_k, dim = -1).values[:, -1:]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p < 1.0:
+        # Per sorted position, as vLLM does: a cutoff inside a run of equal logits keeps only part of it.
+        sorted_logits, sorted_idx = torch.sort(logits, dim = -1)
+        dropped = torch.cumsum(torch.softmax(sorted_logits, dim = -1), dim = -1) <= (1.0 - top_p)
+        dropped[:, -1] = False
+        logits = logits.scatter(-1, sorted_idx, sorted_logits.masked_fill(dropped, float("-inf")))
+    return torch.isfinite(logits)
+pass
+
+# Opaque to Inductor: with dynamic chunk rows its lowering of these reductions raises CantSplit
+# (torch 2.13), and the set is a constant of the backward anyway.
+try:
+    _truncated_support_mask = torch.library.custom_op(
+        "unsloth_zoo::truncated_support_mask", mutates_args = (),
+    )(_truncated_support_mask_impl)
+    _truncated_support_mask.register_fake(
+        lambda logits, top_k, top_p, min_p: torch.empty_like(logits, dtype = torch.bool)
+    )
+except Exception:
+    _truncated_support_mask = _truncated_support_mask_impl
+pass
+
+# Mirrors vLLM v1 processed_logprobs: renormalised over what survives min_p, then top_k, then top_p
+# (sampler.py `sample`, topk_topp_sampler.py `apply_top_k_top_p`). The scored token is always kept
+# so a boundary disagreement between the trainer's recomputed set and the sampler's stays finite.
+# A scored token tied with the smallest kept logit but dropped by the sort counts as one of the kept
+# tokens (vLLM keeps an arbitrary subset of a tied run): it takes the place of one kept tied token,
+# so both the value and its gradient are those of a kept token.
+def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p):
+    index = chunk_index.unsqueeze(-1)
+    selected_logits = torch.gather(chunk_logits, dim = -1, index = index)
+    detached = chunk_logits.detach()
+    keep = _truncated_support_mask(detached, top_k, top_p, min_p)
+    selected_kept = torch.gather(keep, dim = -1, index = index)
+    smallest_kept = detached.masked_fill(~keep, float("inf")).amin(dim = -1, keepdim = True)
+    tied = (~selected_kept) & (selected_logits.detach() == smallest_kept)
+    boundary = (keep & (detached == smallest_kept)).to(torch.int32).argmax(dim = -1, keepdim = True)
+    keep = keep.scatter(-1, boundary, torch.gather(keep, dim = -1, index = boundary) & ~tied)
+    keep = keep.scatter(-1, index, torch.ones_like(selected_kept))
+    kept = chunk_logits.masked_fill(~keep, float("-inf"))
+    return (selected_logits - torch.logsumexp(kept, dim = -1, keepdim = True)).squeeze(-1)
+pass
+
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
 @_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(
@@ -53,15 +103,29 @@ def chunked_selective_log_softmax(
     index,
     temperature: float = 1.0,
     chunks: int = 4,
+    support_top_k: int = 0,
+    support_top_p: float = 1.0,
+    support_min_p: float = 0.0,
 ):
-    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = chunks, dim = 0)
-    chunked_index  = torch.chunk(index.reshape(-1), chunks = chunks, dim = 0)
+    # Fixed `chunks` row ranges; see chunked_hidden_states_selective_log_softmax.
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_index = index.reshape(-1)
+    # Fewer rows than chunks: one row per range, as torch.chunk did, never empty ranges.
+    chunks = max(1, min(chunks, flat_logits.shape[0]))
+    bounds = [(i * flat_logits.shape[0]) // chunks for i in range(chunks + 1)]
+    chunked_logits = [flat_logits[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+    chunked_index  = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
     all_per_token_logps = []
     # Per-chunk selective_log_softmax.
     for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
         chunk_logits = chunk_logits.to(torch.float32)
         if temperature != 1.0:
             chunk_logits = chunk_logits / temperature
+        if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0:
+            all_per_token_logps.append(_truncated_support_logps(
+                chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
+            ))
+            continue
         selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
         logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
         per_token_logps = selected_logits - logsumexp_values
@@ -101,6 +165,15 @@ def chunked_hidden_states_selective_log_softmax(
         if os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip().isdigit()
         else 0
     ),
+    lm_head_bias: Optional[torch.Tensor] = None,
+    support_top_k: int = 0,
+    support_top_p: float = 1.0,
+    support_min_p: float = 0.0,
+    # Read in the default for the same Dynamo reason as max_rows_per_chunk. Pairs with vLLM's
+    # head_dtype=float32 that load_vllm requests under the same flag.
+    fp32_lm_head: bool = (
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+    ),
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
     # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
@@ -125,8 +198,26 @@ def chunked_hidden_states_selective_log_softmax(
         chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
         chunks = min(chunks, max(n_rows, 1))
 
-    chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
-    chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
+    # A one-row chunk's head gradient is a K=1 matmul Inductor mis-lowers under dynamic shapes (illegal
+    # memory access or NaN head gradients, torch 2.13), so keep chunks at 2+ rows when the head trains.
+    # Exactly `chunks` row ranges, so the unrolled loop length never depends on T: torch.chunk
+    # returns ceil(T / ceil(T / chunks)) pieces and recompiled per new count; tensor_split guards
+    # on T % chunks. At most rows // 2 chunks when the head trains keeps every piece at 2+ rows.
+    lm_head_grad = torch.is_grad_enabled() and lm_head.requires_grad
+    if lm_head_grad and flat_hidden_states.shape[0] < 2 * chunks:
+        chunks = max(flat_hidden_states.shape[0] // 2, 1)
+
+    n_rows = flat_hidden_states.shape[0]
+    chunks = max(1, min(chunks, n_rows))
+    bounds = [(i * n_rows) // chunks for i in range(chunks + 1)]
+    chunked_hidden_states = [flat_hidden_states[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+    chunked_index = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+
+    # Cast once, outside the loop, so every chunk shares one fp32 head copy (also for autograd).
+    if fp32_lm_head:
+        lm_head = lm_head.to(torch.float32)
+        if lm_head_bias is not None:
+            lm_head_bias = lm_head_bias.to(torch.float32)
 
     all_per_token_logps = []
 
@@ -141,7 +232,14 @@ def chunked_hidden_states_selective_log_softmax(
         # bit-identical to before.
         chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
         chunk_index = chunk_index.to(lm_head.device)
-        chunk_logits = chunk_hidden_states @ lm_head.t()
+        if fp32_lm_head:
+            # The GRPO loss runs this under bf16 / fp16 autocast, which would downcast the matmul.
+            with torch.autocast(device_type = chunk_hidden_states.device.type, enabled = False):
+                chunk_logits = torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
+        elif lm_head_bias is None:
+            chunk_logits = chunk_hidden_states @ lm_head.t()
+        else:
+            chunk_logits = torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
@@ -155,9 +253,14 @@ def chunked_hidden_states_selective_log_softmax(
         if temperature != 1.0:
             chunk_logits = chunk_logits / temperature
 
-        selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
-        per_token_logps = selected_logits - logsumexp_values
+        if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0:
+            per_token_logps = _truncated_support_logps(
+                chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
+            )
+        else:
+            selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
+            logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
+            per_token_logps = selected_logits - logsumexp_values
         # Return to the caller's device so the concatenation below and every
         # downstream consumer see the device they started on.
         all_per_token_logps.append(per_token_logps.to(hidden_states.device))
@@ -168,6 +271,232 @@ def chunked_hidden_states_selective_log_softmax(
     return all_per_token_logps
 
 RL_REPLACEMENTS["grpo_selective_log_softmax"] = chunked_hidden_states_selective_log_softmax
+
+# Keeps only per-row logsumexp and recomputes each chunk's logits in backward (as verl's
+# FusedLinearForPPOFunction). Self-contained (torch, os): its source is copied into trainers.
+def chunked_hidden_states_selective_log_softmax_recompute(
+    hidden_states: torch.Tensor,
+    lm_head: torch.Tensor,
+    index: torch.Tensor,
+    chunks: int = 4,
+    logit_scale_multiply: float = 0.0,
+    logit_scale_divide: float = 0.0,
+    logit_softcapping: float = 0.0,
+    temperature: float = 1.0,
+    max_rows_per_chunk: int = (
+        int(os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip())
+        if os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip().isdigit()
+        else 0
+    ),
+    lm_head_bias: Optional[torch.Tensor] = None,
+    return_entropy: bool = False,
+    # Same flag and default as chunked_hidden_states_selective_log_softmax, which scores old / ref
+    # logps: entropy and recompute scoring must project the head in the same precision.
+    fp32_lm_head: bool = (
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+    ),
+):
+    # All Unsloth Zoo code licensed under AGPL3
+    self_fn = chunked_hidden_states_selective_log_softmax_recompute
+    function = getattr(self_fn, "_autograd_function", None)
+    if function is None:
+        def post_forward(logits, index, scale_multiply, scale_divide, softcapping, temperature, with_entropy):
+            # The scale / softcap run in the matmul dtype, then float32, exactly as the plain path.
+            if scale_multiply != 0.0:
+                logits = logits * scale_multiply
+            if scale_divide != 0.0:
+                logits = logits / scale_divide
+            if softcapping != 0.0:
+                logits = softcapping * torch.tanh(logits / softcapping)
+            logits = logits.to(torch.float32)
+            if temperature != 1.0:
+                logits = logits / temperature
+            logsumexp = torch.logsumexp(logits, dim = -1)
+            selected = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
+            if with_entropy:
+                # -sum(p * log p) on log p = z - logsumexp: logsumexp - sum(p * z) cancels badly.
+                log_p = logits - logsumexp.unsqueeze(-1)
+                entropy = -(torch.exp(log_p) * log_p).sum(-1)
+            else:
+                entropy = torch.zeros_like(logsumexp)
+            return selected - logsumexp, logsumexp, entropy
+
+        def post_backward(
+            logits, index, logsumexp, entropy, grad_logps, grad_entropy,
+            scale_multiply, scale_divide, softcapping, temperature, with_entropy,
+        ):
+            # z exactly as the forward made it, so p matches the saved logsumexp; the softcap
+            # derivative in at least float32 (autograd would take it in the matmul dtype).
+            z = logits
+            if scale_multiply != 0.0:
+                z = z * scale_multiply
+            if scale_divide != 0.0:
+                z = z / scale_divide
+            if softcapping != 0.0:
+                z = softcapping * torch.tanh(z / softcapping)
+                x = logits.to(torch.promote_types(logits.dtype, torch.float32))
+                if scale_multiply != 0.0:
+                    x = x * scale_multiply
+                if scale_divide != 0.0:
+                    x = x / scale_divide
+                tanh = torch.tanh(x / softcapping)
+            z = z.to(torch.float32)
+            if temperature != 1.0:
+                z = z / temperature
+            log_p = z - logsumexp.unsqueeze(-1)
+            p = torch.exp(log_p)
+            # d logp / dz = onehot - p, d H / dz = -p * (log p + H)
+            if with_entropy:
+                grad_z = -p * (grad_logps.unsqueeze(-1) + grad_entropy.unsqueeze(-1) * (log_p + entropy.unsqueeze(-1)))
+            else:
+                grad_z = -p * grad_logps.unsqueeze(-1)
+            # A fused one-hot rather than scatter_add, which would materialise grad_z in float32.
+            onehot = torch.arange(z.shape[-1], device = z.device) == index.unsqueeze(-1)
+            grad_z = grad_z + onehot * grad_logps.unsqueeze(-1)
+            if temperature != 1.0:
+                grad_z = grad_z / temperature
+            if softcapping != 0.0:
+                grad_z = grad_z * (1.0 - tanh * tanh)
+            if scale_divide != 0.0:
+                grad_z = grad_z / scale_divide
+            if scale_multiply != 0.0:
+                grad_z = grad_z * scale_multiply
+            return grad_z.to(logits.dtype)
+
+        try:
+            from unsloth_zoo.temporary_patches.common import _maybe_compile as compile_function
+        except ImportError:
+            compile_function = torch.compile
+        compiled_forward  = compile_function(dynamic = True, fullgraph = True)(post_forward)
+        compiled_backward = compile_function(dynamic = True, fullgraph = True)(post_backward)
+
+        def run(kernel, eager, *args):
+            # getattr: the cached autograd function can outlive the flag (a test's monkeypatch undo).
+            if getattr(self_fn, "_use_compiled", True):
+                try:
+                    return kernel(*args)
+                except Exception:
+                    self_fn._use_compiled = False
+            return eager(*args)
+
+        def chunk_logits(chunk_hidden_states, lm_head, lm_head_bias):
+            chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
+            if lm_head_bias is None:
+                return chunk_hidden_states @ lm_head.t()
+            return torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
+
+        class ChunkedSelectiveLogSoftmax(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, hidden_states, lm_head, lm_head_bias, index, bounds, transforms):
+                device_type = lm_head.device.type
+                ctx.autocast_kwargs = dict(
+                    device_type = device_type,
+                    enabled = torch.is_autocast_enabled(device_type),
+                    dtype = torch.get_autocast_dtype(device_type),
+                    cache_enabled = torch.is_autocast_cache_enabled(),
+                )
+                logps, logsumexps, entropies = [], [], []
+                for a, b in zip(bounds[:-1], bounds[1:]):
+                    logits = chunk_logits(hidden_states[a:b], lm_head, lm_head_bias)
+                    chunk_index = index[a:b].to(lm_head.device)
+                    logp, logsumexp, entropy = run(
+                        compiled_forward, post_forward, logits, chunk_index, *transforms,
+                    )
+                    logps.append(logp)
+                    logsumexps.append(logsumexp)
+                    entropies.append(entropy)
+                logps = torch.cat(logps).to(hidden_states.device)
+                entropies = torch.cat(entropies).to(hidden_states.device)
+                ctx.save_for_backward(hidden_states, lm_head, lm_head_bias, index, torch.cat(logsumexps), entropies)
+                ctx.bounds = bounds
+                ctx.transforms = transforms
+                return logps, entropies
+
+            @staticmethod
+            def backward(ctx, grad_logps, grad_entropies):
+                hidden_states, lm_head, lm_head_bias, index, logsumexps, entropies = ctx.saved_tensors
+                need_hidden, need_head, need_bias = ctx.needs_input_grad[:3]
+                device = lm_head.device
+                if grad_logps is None:
+                    grad_logps = torch.zeros_like(entropies)
+                if grad_entropies is None:
+                    grad_entropies = torch.zeros_like(entropies)
+                grad_logps = grad_logps.to(device = device, dtype = torch.float32)
+                grad_entropies = grad_entropies.to(device = device, dtype = torch.float32)
+                entropies = entropies.to(device)
+                grad_hidden = torch.empty_like(hidden_states) if need_hidden else None
+                grad_head = None
+                grad_bias = torch.zeros(lm_head_bias.shape, dtype = torch.float32, device = device) if need_bias else None
+                head = None
+                for a, b in zip(ctx.bounds[:-1], ctx.bounds[1:]):
+                    chunk_hidden_states = hidden_states[a:b]
+                    with torch.no_grad(), torch.autocast(**ctx.autocast_kwargs):
+                        logits = chunk_logits(chunk_hidden_states, lm_head, lm_head_bias)
+                    grad_logits = run(
+                        compiled_backward, post_backward,
+                        logits, index[a:b].to(device), logsumexps[a:b], entropies[a:b],
+                        grad_logps[a:b], grad_entropies[a:b], *ctx.transforms,
+                    )
+                    del logits
+                    if head is None:
+                        head = lm_head if lm_head.dtype == grad_logits.dtype else lm_head.to(grad_logits.dtype)
+                    if need_hidden:
+                        grad_hidden[a:b] = (grad_logits @ head).to(device = hidden_states.device, dtype = hidden_states.dtype)
+                    if need_head:
+                        x = chunk_hidden_states.to(device = device, dtype = grad_logits.dtype)
+                        if grad_head is None:
+                            # Accumulate in place in the head's own dtype when the matmul ran in it,
+                            # as autograd does; a float32 head under autocast accumulates in float32.
+                            grad_head = torch.zeros(
+                                lm_head.shape, device = device,
+                                dtype = grad_logits.dtype if lm_head.dtype == grad_logits.dtype else torch.float32,
+                            )
+                        if grad_head.dtype == grad_logits.dtype:
+                            grad_head.addmm_(grad_logits.t(), x)
+                        else:
+                            grad_head.add_(grad_logits.t() @ x)
+                    if need_bias:
+                        grad_bias.add_(grad_logits.to(torch.float32).sum(0))
+                    del grad_logits
+                if need_head:
+                    grad_head = grad_head.to(lm_head.dtype)
+                if need_bias:
+                    grad_bias = grad_bias.to(lm_head_bias.dtype)
+                return grad_hidden, grad_head, grad_bias, None, None, None
+
+        self_fn._use_compiled = getattr(self_fn, "_use_compiled", True)
+        self_fn._autograd_function = function = ChunkedSelectiveLogSoftmax
+
+    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    flat_index = index.reshape(-1)
+    n_rows = flat_hidden_states.shape[0]
+    if max_rows_per_chunk > 0:
+        chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
+        chunks = min(chunks, max(n_rows, 1))
+    if torch.is_grad_enabled() and lm_head.requires_grad and n_rows < 2 * chunks:
+        chunks = max(n_rows // 2, 1)
+    chunks = max(1, min(chunks, n_rows))
+    bounds = tuple((i * n_rows) // chunks for i in range(chunks + 1))
+    transforms = (
+        float(logit_scale_multiply), float(logit_scale_divide),
+        float(logit_softcapping), float(temperature), bool(return_entropy),
+    )
+    if fp32_lm_head:
+        # One fp32 head copy (autograd casts its gradient back), and no autocast, which would
+        # downcast the matmul; forward saves the disabled state, so backward recomputes in fp32 too.
+        lm_head = lm_head.to(torch.float32)
+        if lm_head_bias is not None:
+            lm_head_bias = lm_head_bias.to(torch.float32)
+        with torch.autocast(device_type = lm_head.device.type, enabled = False):
+            logps, entropies = function.apply(flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms)
+    else:
+        logps, entropies = function.apply(flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms)
+    logps = logps.reshape(hidden_states.shape[0], hidden_states.shape[1])
+    if return_entropy:
+        return logps, entropies.reshape(hidden_states.shape[0], hidden_states.shape[1])
+    return logps
+pass
+RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_selective_log_softmax_recompute
 
 def calculate_pad_tokens_in_prompt(
     input_ids: torch.Tensor,
@@ -466,6 +795,13 @@ def grpo_compute_loss(
     vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
+    # TRL top_entropy_quantile: the policy term (not the KL) on high-entropy tokens only.
+    entropy_mask = kwargs.get("entropy_mask", None)
+    # Parsed (option, lower_log, upper) tuples from grpo_parse_rollout_rs, or None.
+    rollout_rs = kwargs.get("rollout_rs", None)
+    # Per-completion weights from unsloth's generation step (ScaleRL zero-variance exclusion /
+    # prompt-level aggregation), normalised over the whole generation batch; replaces the loss_type normaliser.
+    sample_weight = kwargs.get("sample_weight", None)
     # Only direct callers see this fallback; the trainer always forwards an explicit value.
     use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
@@ -512,16 +848,19 @@ def grpo_compute_loss(
 
             if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
                 importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True)
+            elif vllm_importance_sampling_mode in ["geometric_mask", "geometric_truncate"]:
+                # Geometric mean of the token ratios (verl seq_mean_k1): the product blows up on long rows.
+                importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
 
             importance_sampling_ratio = torch.exp(importance_sampling_ratio)
 
-            if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate"]:
+            if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate", "geometric_truncate"]:
                 importance_sampling_ratio = torch.clamp(
                     importance_sampling_ratio, 
                     min=vllm_importance_sampling_clip_min,
                     max=vllm_importance_sampling_clip_max
                 )
-            elif vllm_importance_sampling_mode in ["token_mask", "sequence_mask"]:
+            elif vllm_importance_sampling_mode in ["token_mask", "sequence_mask", "geometric_mask"]:
                 min_val = (
                     vllm_importance_sampling_clip_min
                     if vllm_importance_sampling_clip_min is not None
@@ -543,8 +882,37 @@ def grpo_compute_loss(
                 )
             else:
                 raise ValueError(
-                        f"Unknown vLLM importance sampling mode: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+                        f"Unknown vLLM importance sampling mode: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', 'sequence_mask', 'geometric_truncate' and 'geometric_mask'."
                 )
+
+            if rollout_rs is not None:
+                # verl compute_rollout_rejection_mask: every option must pass. A rejected token gets
+                # IS weight 0 like TRL's *_mask modes, so it stays in the loss normaliser.
+                rs_log_ratio = torch.clamp(torch.nan_to_num((old - sampling_per_token_logps) * mask, nan = 0.0), min = -20.0, max = 20.0)
+                rs_mask = mask.to(rs_log_ratio.dtype)
+                rs_count = rs_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                rs_keep = torch.ones_like(rs_log_ratio)
+                for rs_option, rs_lower, rs_upper in rollout_rs:
+                    if rs_option.endswith("k1"):
+                        rs_stat = -rs_log_ratio
+                    elif rs_option.endswith("k2"):
+                        rs_stat = 0.5 * rs_log_ratio * rs_log_ratio
+                    else:
+                        rs_stat = torch.expm1(rs_log_ratio) - rs_log_ratio
+                    rs_stat = rs_stat * rs_mask
+                    if rs_option.startswith("seq_sum"):
+                        rs_stat = rs_stat.sum(dim=-1, keepdim=True)
+                    elif rs_option.startswith("seq_mean"):
+                        rs_stat = rs_stat.sum(dim=-1, keepdim=True) / rs_count
+                    elif rs_option.startswith("seq_max"):
+                        # k2, k3 >= 0 and masked entries are 0, so this is the masked max (0 on an empty row).
+                        rs_stat = rs_stat.amax(dim=-1, keepdim=True)
+                    if rs_lower is not None:
+                        rs_pass = (rs_stat >= rs_lower) & (rs_stat <= rs_upper)
+                    else:
+                        rs_pass = rs_stat <= rs_upper
+                    rs_keep = rs_keep * rs_pass.to(rs_keep.dtype)
+                importance_sampling_ratio = importance_sampling_ratio * rs_keep
     pass
 
     # Must detach when old is None: exp(new - new.detach()) == 1 but keeps grads correct.
@@ -552,6 +920,10 @@ def grpo_compute_loss(
         log_ratio = new - old
     else:
         log_ratio = new - new.detach()
+    if kwargs.get("rollout_logps_as_old", False):
+        # Rollout gap can pass 88 nats (float32 exp overflow, 0 * inf backward); verl
+        # compute_policy_loss_vanilla clamps the log ratio to [-20, 20] too.
+        log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
 
     if importance_sampling_level == "token":
         log_importance_weights = log_ratio
@@ -619,6 +991,9 @@ def grpo_compute_loss(
     if off_policy_mask_threshold is not None:
         loss_i = loss_i * off_policy_mask
 
+    if entropy_mask is not None:
+        loss_i = loss_i * entropy_mask
+
     if use_vllm and sampling_per_token_logps is not None and vllm_importance_sampling_correction:
         # vespo applies the IS ratio inside get_gamma_weights, so skip it here.
         if loss_type != "vespo":
@@ -640,7 +1015,13 @@ def grpo_compute_loss(
     n_mask_per_reward = mask.sum(1)
 
     # https://github.com/huggingface/trl/blob/e8b8499f1f8d76838155b515e414ee98f757d6d5/trl/trainer/grpo_trainer.py#L1624
-    if loss_type in ["grpo", "sapo"]:
+    if sample_weight is not None:
+        # Same process / accumulation rescale as the dapo branch, whose weights are 1 / num_items_in_batch.
+        normalizer = 1.0 / num_processes
+        if steps_per_generation:
+            normalizer = normalizer * current_gradient_accumulation_steps / steps_per_generation
+        loss = (loss_i * mask * sample_weight.to(loss_i.dtype).unsqueeze(-1)).sum() / normalizer
+    elif loss_type in ["grpo", "sapo"]:
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "bnpo" and num_items_in_batch is None:
@@ -673,7 +1054,8 @@ def grpo_compute_loss(
     def masked_batch_mean(x):
         with torch.inference_mode():
             completion_length = n_mask_per_reward.mean()
-            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
+            # Sequence level only if x is narrower than mask: one-token completions are (B, 1) too.
+            if x.shape[1] == 1 and mask.shape[1] != 1:
                 return completion_length, x.mean()
             else:
                 # Rows with no tokens (mask_truncated_completions) are left out, as in TRL.
@@ -848,11 +1230,126 @@ pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
 
+class UnslothGRPOEntropyBonus(torch.autograd.Function):
+    """sum(entropies * weights), with the gradient scaled exactly as UnslothEfficientGRPO scales
+    the policy term's: by the mixed precision scale, ignoring grad_output unless DeepSpeed's
+    upstream_scale is set. Plain autograd would see grad_output instead, which the policy term
+    never does, and the entropy coefficient would then mean something else than in TRL."""
+    @staticmethod
+    def forward(ctx, entropies, weights, scaling, upstream_scale = None):
+        ctx.save_for_backward(weights)
+        ctx.scaling = scaling
+        ctx.upstream_scale = upstream_scale
+        return (entropies.to(torch.float32) * weights).sum()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (weights,) = ctx.saved_tensors
+        grad = weights * ctx.scaling
+        if ctx.upstream_scale is not None:
+            grad = grad * (grad_output * ctx.upstream_scale)
+        return grad, None, None, None
+pass
+RL_REPLACEMENTS["UnslothGRPOEntropyBonus"] = UnslothGRPOEntropyBonus
+
+
+def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss_kwargs, trl_version = None, training = True):
+    """Per-token weights w with sum(w * entropies) == -entropy_coef * TRL's entropy_loss.
+
+    TRL >= 1.10: the mean entropy over the tokens the policy term acts on, divided by the
+    accumulation steps (1 in eval) for every loss_type. TRL 1.8 and 1.9 instead divided cispo /
+    dapo / vespo by the policy term's own global token normalizer, without the mean.
+    """
+    weights = completion_mask.to(torch.float32)
+    if entropy_mask is not None:
+        weights = weights * entropy_mask
+    sample_weight = loss_kwargs.get("sample_weight", None)
+    if sample_weight is not None:
+        # Zero-variance exclusion drops a completion from the whole loss, the entropy bonus included.
+        weights = weights * (sample_weight.to(weights.device) > 0).to(weights.dtype).unsqueeze(-1)
+    if trl_version is None:
+        try:
+            import trl
+            trl_version = trl.__version__
+        except Exception:
+            trl_version = "0"
+    from packaging.version import Version
+    loss_type = loss_kwargs.get("loss_type", "grpo")
+    if Version(trl_version) < Version("1.10.0") and loss_type in ("cispo", "dapo", "vespo"):
+        if sample_weight is not None:
+            # The policy term is normalised by sample_weight (kept tokens only, grpo_compute_loss),
+            # and TRL 1.8 / 1.9 divide the bonus by the policy's own normaliser: the same here, so
+            # excluded rows do not dilute it. Without exclusion this equals the branch below.
+            normalizer = 1.0 / loss_kwargs.get("num_processes", 1)
+            steps_per_generation = loss_kwargs.get("steps_per_generation", None)
+            if steps_per_generation:
+                normalizer = normalizer * loss_kwargs.get("current_gradient_accumulation_steps", 1) / steps_per_generation
+            row_weight = sample_weight.to(device = weights.device, dtype = weights.dtype).unsqueeze(-1)
+            return weights * row_weight * (-entropy_coef / normalizer)
+        # TRL 1.8 / 1.9 used num_items_in_batch / num_processes as is, before 1.10 rescaled it to
+        # one accumulation window (grpo_compute_loss always rescales the policy term).
+        num_items_in_batch = loss_kwargs.get("num_items_in_batch", None)
+        if torch.is_tensor(num_items_in_batch):
+            normalizer = num_items_in_batch.clamp(min = 1.0) / loss_kwargs.get("num_processes", 1)
+        else:
+            normalizer = max(float(num_items_in_batch), 1.0) / loss_kwargs.get("num_processes", 1)
+        return weights * (-entropy_coef / normalizer)
+    # Unsloth before #11337 passes the training window's accumulation steps into eval too.
+    accumulation_steps = loss_kwargs.get("current_gradient_accumulation_steps", 1) if training else 1
+    return weights * (-entropy_coef / weights.sum().clamp(min = 1.0) / accumulation_steps)
+pass
+RL_REPLACEMENTS["grpo_entropy_bonus_weights"] = grpo_entropy_bonus_weights
+
+
+_HIGH_ENTROPY_MASK_PADS = {}
+def _high_entropy_mask_pads(method):
+    # TRL >= 0.24 pads every rank to one length before the gather; TRL 0.22 / 0.23 gather the
+    # raw valid tokens and return early on a rank that has none
+    func = getattr(method, "__func__", method)
+    pads = _HIGH_ENTROPY_MASK_PADS.get(func, None)
+    if pads is None:
+        try:
+            source = inspect.getsource(func)
+            pads = ("pad_across_processes" in source) or ("accelerator.gather" not in source)
+        except Exception:
+            pads = True
+        _HIGH_ENTROPY_MASK_PADS[func] = pads
+    return pads
+pass
+
+
+def grpo_high_entropy_mask(trainer, entropies, mask, threshold, sample_weight = None):
+    """trainer.get_high_entropy_mask, except on a multi-process run whose method gathers without
+    padding (TRL < 0.24): a rank with no valid tokens returns before the gather the other ranks
+    enter, so training hangs, and uneven token counts break the gather. Those runs take TRL >= 0.24's
+    padded gather, which sees the same quantile population; a single process is unchanged.
+    sample_weight: rows with weight 0 (zero-variance exclusion) leave the loss, so they are left
+    out of the quantile population too."""
+    if sample_weight is not None:
+        mask = mask * (sample_weight.to(mask.device) > 0).to(mask.dtype).unsqueeze(-1)
+    accelerator = getattr(trainer, "accelerator", None)
+    if getattr(accelerator, "num_processes", 1) > 1 and not _high_entropy_mask_pads(trainer.get_high_entropy_mask):
+        local = entropies[mask.bool()].float()
+        # entropies are >= 0, so a negative sentinel cannot collide with a real value
+        pad_value = -1e9
+        padded = accelerator.pad_across_processes(local, dim = 0, pad_index = pad_value)
+        gathered = accelerator.gather(padded)
+        gathered = gathered[gathered != pad_value]
+        if gathered.numel() == 0:
+            return torch.zeros_like(entropies, dtype = torch.bool)
+        entropy_threshold = torch.quantile(gathered, threshold)
+        entropy_mask = (entropies * mask.float()) >= entropy_threshold
+        return entropy_mask & mask.bool()
+    return trainer.get_high_entropy_mask(entropies, mask, threshold)
+pass
+
+
 def _warn_unsupported_grpo_options(trainer):
     """Warn once per trainer about TRL GRPOConfig options this path ignores, so setting
-    them is not silently dropped. top_entropy_quantile < 1.0 (entropy masking) and the
-    entropy bonus (entropy_coef, use_adaptive_entropy) are unimplemented; their TRL defaults
-    are off, so only non-defaults warn. use_bias_correction_kl is supported and must never be listed here.
+    them is not silently dropped. Adaptive entropy control (use_adaptive_entropy) is
+    unimplemented, and with it its entropy bonus; top_entropy_quantile is unsupported only on a
+    TRL without get_high_entropy_mask. Their TRL defaults are off, so only non-defaults warn.
+    top_entropy_quantile, a fixed entropy_coef and use_bias_correction_kl are supported.
     """
     if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):
         return
@@ -860,14 +1357,22 @@ def _warn_unsupported_grpo_options(trainer):
 
     unsupported = []
     top_entropy_quantile = getattr(args, "top_entropy_quantile", 1.0)
-    if top_entropy_quantile is not None and top_entropy_quantile < 1.0:
+    if top_entropy_quantile is not None and top_entropy_quantile < 1.0 and not hasattr(trainer, "get_high_entropy_mask"):
         unsupported.append(f"top_entropy_quantile={top_entropy_quantile}")
-    # TRL >= 1.8 entropy bonus (trl#6140); the loss here never subtracts it.
-    entropy_coef = getattr(args, "entropy_coef", 0.0)
-    if entropy_coef:
-        unsupported.append(f"entropy_coef={entropy_coef}")
     if getattr(args, "use_adaptive_entropy", False):
+        # The adaptive controller's bonus is dropped whole, including its starting entropy_coef.
+        entropy_coef = getattr(args, "entropy_coef", 0.0)
+        if entropy_coef:
+            unsupported.append(f"entropy_coef={entropy_coef}")
         unsupported.append("use_adaptive_entropy=True")
+    # These only act on vLLM sampling logprobs, which exist with vllm_importance_sampling_correction.
+    if not (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False)):
+        _names = ("UNSLOTH_GRPO_VLLM_IS_MODE", "UNSLOTH_GRPO_VLLM_IS_CLIP", "UNSLOTH_GRPO_ROLLOUT_RS", "UNSLOTH_GRPO_ROLLOUT_METRICS")
+        if os.environ.get("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", "0") == "1":
+            _names = _names[:-1]
+        for name in _names:
+            if os.environ.get(name, "") not in ("", "0"):
+                unsupported.append(f"{name}={os.environ[name]} (needs use_vllm and vllm_importance_sampling_correction=True)")
 
     if unsupported:
         message = (
@@ -888,6 +1393,130 @@ def _warn_unsupported_grpo_options(trainer):
     return
 pass
 RL_REPLACEMENTS["_warn_unsupported_grpo_options"] = _warn_unsupported_grpo_options
+
+
+def _grpo_rollout_sampling_params(trainer, keys):
+    """Later sources override earlier ones as they do for the SamplingParams: GRPOConfig fields,
+    then generation_kwargs, then Unsloth's vllm_sampling_params."""
+    args = getattr(trainer, "args", None)
+    params = {key: getattr(args, key, None) for key in keys}
+    vllm_sampling_params = getattr(args, "vllm_sampling_params", None)
+    vllm_overrides = getattr(vllm_sampling_params, "_set_kwargs", None)
+    if vllm_overrides is None and vllm_sampling_params is not None:
+        # A raw vllm.SamplingParams: take exactly the fields generation applies from it, through the
+        # grpo_update_SamplingParams the trainer's generated module calls (unsloth >= #11595 copies
+        # the fields that differ from SamplingParams(), older ones use this module's, lists only)
+        update = grpo_update_SamplingParams
+        for klass in type(trainer).__mro__:
+            candidate = getattr(sys.modules.get(klass.__module__, None), "grpo_update_SamplingParams", None)
+            if callable(candidate):
+                update = candidate
+                break
+        try:
+            vllm_overrides = update(type(vllm_sampling_params), {}, vllm_sampling_params)
+        except Exception:
+            vllm_overrides = grpo_update_SamplingParams(type(vllm_sampling_params), {}, vllm_sampling_params)
+    for overrides in (
+        getattr(args, "generation_kwargs", None),
+        vllm_overrides,
+    ):
+        if isinstance(overrides, dict):
+            for key in params:
+                if overrides.get(key, None) is not None:
+                    params[key] = overrides[key]
+    return params
+pass
+
+
+# vLLM v1 applies these to the logits before temperature, min_p and top_k / top_p
+# (Sampler.apply_logits_processors), so its kept set and logprobs come from logits the trainer never sees.
+_PRE_TRUNCATION_NEUTRAL = {
+    "repetition_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "min_tokens": 0,
+}
+_PRE_TRUNCATION_OPTIONAL = (
+    "logit_bias", "bad_words", "allowed_token_ids", "logits_processors",
+    "structured_outputs", "guided_decoding", "vllm_structured_outputs_regex", "vllm_guided_decoding_regex",
+)
+
+
+def grpo_truncated_support_blockers(trainer):
+    """Rollout settings under which the recomputed kept set cannot match vLLM's."""
+    params = _grpo_rollout_sampling_params(
+        trainer, ("temperature",) + tuple(_PRE_TRUNCATION_NEUTRAL) + _PRE_TRUNCATION_OPTIONAL,
+    )
+    blockers = []
+    for key, neutral in _PRE_TRUNCATION_NEUTRAL.items():
+        if params[key] is not None and float(params[key]) != neutral:
+            blockers.append(f"{key}={params[key]}")
+    for key in _PRE_TRUNCATION_OPTIONAL:
+        value = params[key]
+        if value is not None and not (isinstance(value, (dict, list, tuple, set, str)) and len(value) == 0):
+            blockers.append(key)
+    # The loss scales by the trainer's temperature; vLLM truncates at the rollout's.
+    trainer_temperature = getattr(trainer, "temperature", None)
+    if trainer_temperature is None:
+        trainer_temperature = getattr(getattr(trainer, "args", None), "temperature", None)
+    rollout_temperature = params["temperature"]
+    if rollout_temperature is not None and trainer_temperature is not None \
+            and float(rollout_temperature) != float(trainer_temperature):
+        blockers.append(f"rollout temperature={rollout_temperature} != trainer temperature={trainer_temperature}")
+    return blockers
+pass
+
+
+def grpo_sampling_support(trainer):
+    """(top_k, top_p, min_p) the rollouts were truncated with, or None for full-vocabulary sampling."""
+    params = _grpo_rollout_sampling_params(trainer, ("top_k", "top_p", "min_p"))
+    # top_k None / 0 / -1 all mean no top-k in TRL and vLLM.
+    top_k = max(int(params["top_k"] or 0), 0)
+    top_p = 1.0 if params["top_p"] is None else float(params["top_p"])
+    min_p = 0.0 if params["min_p"] is None else float(params["min_p"])
+    if top_k == 0 and top_p >= 1.0 and min_p <= 0.0:
+        return None
+    return top_k, top_p, min_p
+pass
+
+
+def grpo_truncated_support_kwargs(trainer):
+    """support_* kwargs for the chunked logprob helpers when UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 and
+    the vLLM rollouts were truncated, else {}. With the opt-in off, warns once if the truncated
+    vLLM logprobs feed the IS correction or the off-policy mask."""
+    if not getattr(trainer, "use_vllm", False):
+        return {}
+    support = grpo_sampling_support(trainer)
+    if support is None:
+        return {}
+    top_k, top_p, min_p = support
+    enabled = os.environ.get("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "0").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        args = getattr(trainer, "args", None)
+        consumed = (
+            getattr(trainer, "vllm_importance_sampling_correction", False)
+            or getattr(args, "off_policy_mask_threshold", None) is not None
+        )
+        if consumed and not getattr(trainer, "_unsloth_truncated_support_warned", False):
+            logger.warning(
+                f"Unsloth: rollouts sample with top_k={top_k}, top_p={top_p}, min_p={min_p}, so "
+                "vLLM's logprobs are renormalised over the kept tokens while the trainer scores the "
+                "full vocabulary. The importance sampling ratio / off-policy mask then sees a "
+                "systematic gap of log(kept probability mass) per token. Set "
+                "UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 to score the trainer over the same kept set."
+            )
+            trainer._unsloth_truncated_support_warned = True
+        return {}
+    blockers = grpo_truncated_support_blockers(trainer)
+    if blockers:
+        if not getattr(trainer, "_unsloth_truncated_support_blocked_warned", False):
+            logger.warning(
+                "Unsloth: ignoring UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 because the rollouts use "
+                f"{', '.join(blockers)}, which vLLM applies before truncating, so the trainer cannot "
+                "rebuild the same kept set. Scoring over the full vocabulary instead."
+            )
+            trainer._unsloth_truncated_support_blocked_warned = True
+        return {}
+    return {"support_top_k": top_k, "support_top_p": top_p, "support_min_p": min_p}
+pass
+RL_REPLACEMENTS["grpo_truncated_support_kwargs"] = grpo_truncated_support_kwargs
 
 
 _n_chunks_deprecation_warned = False
@@ -935,6 +1564,11 @@ GRPO_VISION_KEYS = (
     "num_images",
     "token_type_ids",
     "mm_token_type_ids",
+    # Qwen2-VL style video: patch rows by video, one grid row (and Qwen2.5-VL time step) per video.
+    "pixel_values_videos",
+    "video_grid_thw",
+    "second_per_grid_ts",
+    "num_videos",
 )
 
 
@@ -1191,6 +1825,25 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
 
     total_images = None if num_images is None else sum(num_images)
 
+    pixel_values_videos = vision.get("pixel_values_videos", None)
+    video_grid_thw = vision.get("video_grid_thw", None)
+    second_per_grid_ts = vision.get("second_per_grid_ts", None)
+    num_videos = _as_int_list(vision.get("num_videos", None))
+    if num_videos is not None and len(num_videos) != total_samples:
+        num_videos = None
+    cum_videos = cum_video_rows = None
+    if pixel_values_videos is not None and video_grid_thw is not None:
+        if num_videos is None or sum(num_videos) != video_grid_thw.shape[0]:
+            raise ValueError(
+                "Unsloth: GRPO cannot tell which sample each video belongs to: "
+                f"{video_grid_thw.shape[0]} videos over {total_samples} samples and no matching num_videos."
+            )
+        cum_videos = torch.tensor([0] + num_videos).cumsum(0)
+        cum_video_rows = torch.cat([
+            torch.zeros(1, dtype = torch.long),
+            video_grid_thw.prod(dim = -1).cumsum(0).cpu(),
+        ])
+
     def _row_axis_is_images(value, flat_ndim):
         """Whether this tensor's first dimension counts IMAGES rather than samples.
 
@@ -1256,6 +1909,16 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
         img_start = img_end = None
         if cum_imgs is not None:
             img_start, img_end = int(cum_imgs[start]), int(cum_imgs[end])
+        vid_start = vid_end = 0
+        if cum_videos is not None:
+            vid_start, vid_end = int(cum_videos[start]), int(cum_videos[end])
+        if vid_end > vid_start:
+            chunk["pixel_values_videos"] = pixel_values_videos[
+                int(cum_video_rows[vid_start]) : int(cum_video_rows[vid_end])
+            ]
+            chunk["video_grid_thw"] = video_grid_thw[vid_start:vid_end]
+            if second_per_grid_ts is not None:
+                chunk["second_per_grid_ts"] = second_per_grid_ts[vid_start:vid_end]
 
         if pixel_values is None:
             if image_sizes is not None:
@@ -1343,6 +2006,179 @@ pass
 RL_REPLACEMENTS["grpo_vision_chunks"] = grpo_vision_chunks
 
 
+GRPO_ROLLOUT_RS_OPTIONS = (
+    "token_k1", "token_k2", "token_k3",
+    "seq_sum_k1", "seq_sum_k2", "seq_sum_k3",
+    "seq_mean_k1", "seq_mean_k2", "seq_mean_k3",
+    "seq_max_k2", "seq_max_k3",
+)
+
+def grpo_parse_is_clip(spec, mode):
+    """Parse UNSLOTH_GRPO_VLLM_IS_CLIP "lower_upper" (either side may be empty) into (lower, upper).
+    Applied after GRPOConfig validation, so it checks the bounds itself: reversed bounds collapse
+    every truncated ratio to one value and make the mask modes reject every token."""
+    if "_" not in str(spec):
+        # A bare "2.0" would otherwise become a lower bound and floor / reject every on-policy ratio.
+        raise ValueError(
+            f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP must be 'lower_upper' (either side may be empty, "
+            f"e.g. '_{spec}' for an upper cap), got {spec!r}."
+        )
+    lower, _, upper = str(spec).partition("_")
+    lower = float(lower) if lower.strip() else None
+    upper = float(upper) if upper.strip() else None
+    if (lower is not None and not (0 <= lower < math.inf)) or (upper is not None and not (0 < upper < math.inf)):
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP needs a finite lower >= 0 and upper > 0, got {spec!r}.")
+    if lower is not None and upper is not None and lower >= upper:
+        # TRL GRPOConfig rejects clip_min >= clip_max: equal bounds make truncate a constant weight
+        # and the mask modes keep only ratios exactly equal to it.
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP lower bound must be below the upper bound in {spec!r}.")
+    if lower is None and upper is None and str(mode).endswith("_truncate"):
+        raise ValueError(f"Unsloth: UNSLOTH_GRPO_VLLM_IS_CLIP={spec!r} gives no bound for {mode}.")
+    return lower, upper
+
+def grpo_parse_rollout_rs(options, thresholds):
+    """Parse verl rollout_rs / rollout_rs_threshold strings (comma separated, one threshold shared
+    or one per option; k1 takes "lower_upper" ratio bounds, default lower = 1 / upper; k2 / k3 a
+    single upper bound) into (option, lower_log, upper) tuples, k1 bounds in log space.
+    Returns None when options is empty."""
+    if options is None or not str(options).strip():
+        return None
+    names = []
+    for name in str(options).split(","):
+        name = name.strip()
+        if not name: continue
+        if name not in GRPO_ROLLOUT_RS_OPTIONS:
+            raise ValueError(f"Unsloth: unknown rollout rejection option {name}; choose from {GRPO_ROLLOUT_RS_OPTIONS}.")
+        if name not in names: names.append(name)
+    if not names:
+        return None
+    if thresholds is None or not str(thresholds).strip():
+        raise ValueError("Unsloth: UNSLOTH_GRPO_ROLLOUT_RS needs UNSLOTH_GRPO_ROLLOUT_RS_THRESHOLD.")
+    specs = [x.strip() for x in str(thresholds).split(",") if x.strip()]
+    if len(specs) not in (1, len(names)):
+        raise ValueError(f"Unsloth: give one rollout rejection threshold or {len(names)}, got {len(specs)}.")
+    if len(specs) == 1: specs = specs * len(names)
+    parsed = []
+    for name, spec in zip(names, specs):
+        if name.endswith("k1"):
+            if "_" in spec:
+                lower, upper = (float(x) for x in spec.split("_", 1))
+            else:
+                upper = float(spec)
+                lower = 1.0 / upper
+            if not (0 < lower <= upper < math.inf):
+                raise ValueError(f"Unsloth: rollout rejection bounds for {name} must be finite with 0 < lower <= upper, got {spec}.")
+            parsed.append((name, math.log(lower), math.log(upper)))
+        else:
+            if "_" in spec:
+                raise ValueError(f"Unsloth: {name} takes a single upper bound, got {spec}.")
+            upper = float(spec)
+            if not (0 < upper < math.inf):
+                raise ValueError(f"Unsloth: rollout rejection threshold for {name} must be positive and finite, got {spec}.")
+            parsed.append((name, None, upper))
+    return tuple(parsed)
+pass
+RL_REPLACEMENTS["grpo_parse_rollout_rs"] = grpo_parse_rollout_rs
+
+
+def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
+    """Sums for the rollout / trainer mismatch metrics over valid tokens, so processes and
+    micro-batches can be pooled before dividing. Returns a float64 vector:
+    [tokens, sum k1, sum k3, max k3, sum w, sum w^2, rejected tokens, rows, rejected rows],
+    k1 = log pi_rollout - log pi_train and k3 = r - 1 - log r (r = pi_train / pi_rollout) estimate
+    KL(rollout || train) as verl compute_offpolicy_metrics; w = the applied IS weights."""
+    with torch.no_grad():
+        log_ratio = old_logps.to(torch.float64) - sampling_logps.to(torch.float64)
+        # Tokens vLLM could not score (NaN) carry no divergence information: leave them out.
+        keep = mask.to(torch.bool) & ~torch.isnan(log_ratio)
+        maskd = keep.to(torch.float64)
+        log_ratio = torch.nan_to_num(log_ratio, nan = 0.0) * maskd
+        # verl compute_offpolicy_metrics does not clamp: a +-20 clamp capped K1 at 20 and K3 near
+        # exp(20). Only keep the float64 sums finite (and -inf logps out of inf - inf): exp(670)
+        # leaves room for 1e15 saturated tokens below the float64 max (exp(709.8)).
+        log_ratio = torch.clamp(log_ratio, min = -670.0, max = 670.0)
+        k3 = (torch.expm1(log_ratio) - log_ratio) * maskd
+        w = torch.broadcast_to(is_weights.to(torch.float64), maskd.shape) * maskd
+        rejected = ((w == 0) & keep).to(torch.float64)
+        rows = (maskd.sum(-1) > 0).to(torch.float64)
+        return torch.stack([
+            maskd.sum(),
+            (-log_ratio).sum(),
+            k3.sum(),
+            k3.amax() if k3.numel() > 0 else k3.new_zeros(()),
+            w.sum(),
+            (w * w).sum(),
+            rejected.sum(),
+            rows.sum(),
+            ((rejected.sum(-1) > 0).to(torch.float64) * rows).sum(),
+        ])
+pass
+RL_REPLACEMENTS["grpo_rollout_mismatch_stats"] = grpo_rollout_mismatch_stats
+
+
+def grpo_rollout_mismatch_metrics(stats):
+    """Metric dict from (summed, k3 max maxed) grpo_rollout_mismatch_stats. ESS is the normalised
+    effective sample size (sum w)^2 / (N sum w^2) of the applied IS weights, verl's
+    rollout_is_eff_sample_size."""
+    stats = [float(x) for x in stats.tolist()]
+    n, k1, k3, k3_max, w1, w2, rej, rows, rej_rows = stats
+    return {
+        "sampling/rollout_kl_k1/mean": k1 / max(n, 1.0),
+        "sampling/rollout_kl_k3/mean": k3 / max(n, 1.0),
+        "sampling/rollout_kl_k3/max": k3_max,
+        "sampling/importance_sampling_ess": (w1 * w1) / (n * w2) if n > 0 and w2 > 0 else 0.0,
+        "sampling/importance_sampling_rejected_frac": rej / max(n, 1.0),
+        "sampling/importance_sampling_rejected_seq_frac": rej_rows / max(rows, 1.0),
+    }
+pass
+RL_REPLACEMENTS["grpo_rollout_mismatch_metrics"] = grpo_rollout_mismatch_metrics
+
+
+def grpo_rollout_logps_as_old(sampling_logps, old_logps = None):
+    """UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD (verl rollout_correction bypass_mode with loss_type
+    ppo_clip, vime --use-rollout-logprobs): the rollout engine's logprobs are pi_old, so the PPO
+    ratio is pi_theta / pi_rollout and its clip is the off-policy correction. Returns the
+    (old, sampling) pair for grpo_compute_loss: sampling is dropped so no importance weight
+    multiplies that ratio a second time (verl compute_policy_loss_bypass_mode: "would be
+    double-counting"; vime refuses use_tis with use_rollout_logprobs)."""
+    if sampling_logps is None:
+        raise ValueError("Unsloth: rollout_logps_as_old needs the rollout engine's sampling logprobs.")
+    if old_logps is not None:
+        raise ValueError("Unsloth: rollout_logps_as_old batches must not carry trainer-scored old logprobs.")
+    return sampling_logps.to(torch.float32), None
+pass
+RL_REPLACEMENTS["grpo_rollout_logps_as_old"] = grpo_rollout_logps_as_old
+
+
+def grpo_rollout_old_fill_unscored(old_logps, new_logps):
+    """Tokens the rollout engine could not score (vLLM returns NaN) take the current policy's own
+    logprob as pi_old, so their ratio is exactly 1: no correction, as the vLLM importance-sampling
+    path treats them (TRL zeroes their log ratio). Returns (old, unscored mask)."""
+    unscored = ~torch.isfinite(old_logps)
+    filled = torch.where(unscored, new_logps.detach().to(old_logps.dtype), old_logps)
+    return filled, unscored
+pass
+RL_REPLACEMENTS["grpo_rollout_old_fill_unscored"] = grpo_rollout_old_fill_unscored
+
+
+def grpo_rollout_as_old_ratio_metrics(coef_1, mask):
+    """(|log r|, r) zero-filled outside the mask, r = pi_theta / pi_rollout per token, for the
+    sampling_logp_difference / importance_sampling_ratio metrics when pi_old is the rollout policy.
+    verl measures the bypass mismatch the same way (compute_rollout_correction_and_rejection_mask
+    with old_log_prob = the current log_prob). None for a sequence-level ratio."""
+    if coef_1 is None or coef_1.shape != mask.shape:
+        return None, None
+    with torch.no_grad():
+        keep = mask.to(torch.bool)
+        ratio = coef_1.detach().to(torch.float32)
+        log_ratio = torch.nan_to_num(torch.log(ratio), nan = 0.0, posinf = 670.0, neginf = -670.0)
+        # where, not * mask: an overflowed ratio (inf) on a padded column would leave inf * 0 = nan.
+        zero = torch.zeros_like(ratio)
+        return torch.where(keep, log_ratio.abs(), zero), torch.where(keep, ratio, zero)
+pass
+RL_REPLACEMENTS["grpo_rollout_as_old_ratio_metrics"] = grpo_rollout_as_old_ratio_metrics
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -1368,10 +2204,40 @@ def grpo_accumulated_loss(
     from unsloth_zoo.rl_replacements import (
         grpo_shared_vision_inputs as _grpo_get_vision_inputs,
         grpo_vision_chunks as _grpo_vision_chunks,
+        chunked_hidden_states_selective_log_softmax,
+        chunked_selective_log_softmax,
+        grpo_rollout_logps_as_old,
+        grpo_rollout_as_old_ratio_metrics,
+        grpo_rollout_old_fill_unscored,
     )
+    if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
+        from unsloth_zoo.rl_replacements import (
+            chunked_hidden_states_selective_log_softmax_recompute as chunked_hidden_states_selective_log_softmax,
+        )
+    # Adaptive entropy control is not implemented, so it disables the bonus (and warns).
+    _entropy_quantile = getattr(trainer.args, "top_entropy_quantile", 1.0)
+    _entropy_mask_on = (
+        _entropy_quantile is not None and _entropy_quantile < 1.0
+        and hasattr(trainer, "get_high_entropy_mask")
+    )
+    _entropy_coef = float(getattr(trainer, "entropy_coef", getattr(trainer.args, "entropy_coef", 0.0)) or 0.0)
+    _entropy_bonus_on = _entropy_coef != 0.0 and not getattr(trainer.args, "use_adaptive_entropy", False)
+    _need_entropy = _entropy_mask_on or _entropy_bonus_on
+    if _need_entropy:
+        from unsloth_zoo.rl_replacements import (
+            chunked_hidden_states_selective_log_softmax_recompute as _entropy_log_softmax,
+            UnslothGRPOEntropyBonus as _UnslothGRPOEntropyBonus,
+            grpo_entropy_bonus_weights as _grpo_entropy_bonus_weights,
+            grpo_high_entropy_mask as _grpo_high_entropy_mask,
+        )
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
     image_grid_thw = vision_inputs.get('image_grid_thw', None)
+    video_grid_thw = vision_inputs.get('video_grid_thw', None)
+    if pixel_values is None:
+        # Only a sentinel below (the chunks carry the tensors): video rows must take the vision
+        # path too, since left and sequence packing move M-RoPE video positions.
+        pixel_values = vision_inputs.get('pixel_values_videos', None)
     # Released unsloth 2026.9.4 decides whether multi-image GRPO is supported by grepping
     # inspect.getsource(grpo_accumulated_loss) for "num_images", so moving the handling into
     # grpo_vision_chunks makes that probe answer no and raise "Please upgrade unsloth_zoo" at
@@ -1381,7 +2247,7 @@ def grpo_accumulated_loss(
     # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
     token_type_ids = vision_inputs.get('token_type_ids', None)
     mm_token_type_ids = vision_inputs.get('mm_token_type_ids', None)
-    if mm_token_type_ids is not None or image_grid_thw is not None:
+    if mm_token_type_ids is not None or image_grid_thw is not None or video_grid_thw is not None:
         mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
             trainer.processing_class, input_ids, mm_token_type_ids
         )
@@ -1392,9 +2258,12 @@ def grpo_accumulated_loss(
     # either way); the IS ratio stays gated on the correction flag inside grpo_compute_loss. On the
     # plain vLLM path (neither active) they are dropped so nothing pays for an unused aligned/compiled
     # input and grpo_compute_loss returns None (not empty) delta/flat_is_ratio.
+    # Set by unsloth when UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 skipped the old-policy forward.
+    _rollout_logps_as_old = bool(kwargs.pop("rollout_logps_as_old", False))
     _sampling_logps_used = (
         getattr(trainer, "vllm_importance_sampling_correction", False)
         or getattr(trainer.args, "off_policy_mask_threshold", None) is not None
+        or _rollout_logps_as_old
     )
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if _sampling_logps_used else None
     temperature = kwargs.get("temperature", 1.0)
@@ -1408,6 +2277,25 @@ def grpo_accumulated_loss(
     kwargs["vllm_importance_sampling_cap"] = getattr(trainer.args, "vllm_importance_sampling_cap", None)
     # Older TRL lacks this arg; fall back to token_truncate (legacy clamp(max=cap) behavior).
     kwargs["vllm_importance_sampling_mode"] = getattr(trainer.args, "vllm_importance_sampling_mode", None) or "token_truncate"
+    # Opt-in for TRL versions without the field or the geometric modes, e.g. geometric_mask.
+    if os.environ.get("UNSLOTH_GRPO_VLLM_IS_MODE", ""):
+        kwargs["vllm_importance_sampling_mode"] = os.environ["UNSLOTH_GRPO_VLLM_IS_MODE"]
+    # Like TRL, only check the mode where it is used: with the correction off it stays a no-op.
+    if getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False) and kwargs["vllm_importance_sampling_mode"] not in (
+        "token_truncate", "token_mask", "sequence_truncate", "sequence_mask", "geometric_truncate", "geometric_mask",
+    ):
+        raise ValueError(f"Unsloth: unknown vLLM importance sampling mode {kwargs['vllm_importance_sampling_mode']}.")
+    # TRL validates this in __init__, before the env override: get_gamma_weights sums a per-token log ratio.
+    if (
+        kwargs.get("loss_type", getattr(trainer, "loss_type", None)) == "vespo"
+        and getattr(trainer, "use_vllm", False)
+        and getattr(trainer, "vllm_importance_sampling_correction", False)
+        and kwargs["vllm_importance_sampling_mode"] not in ("token_truncate", "token_mask")
+    ):
+        raise ValueError(
+            "Unsloth: VESPO loss requires vllm_importance_sampling_mode to be 'token_truncate' or 'token_mask'. "
+            f"Got: {kwargs['vllm_importance_sampling_mode']}."
+        )
     kwargs["vllm_importance_sampling_clip_min"] = getattr(trainer.args, "vllm_importance_sampling_clip_min", None)
     kwargs["vllm_importance_sampling_clip_max"] = getattr(trainer.args, "vllm_importance_sampling_clip_max", None)
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
@@ -1481,6 +2369,21 @@ def grpo_accumulated_loss(
     if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
         kwargs["vllm_importance_sampling_clip_min"] = 0
         kwargs["vllm_importance_sampling_clip_max"] = kwargs["vllm_importance_sampling_cap"]
+    # "lower_upper" (either side may be empty), e.g. "0.999_1.001" for the geometric modes.
+    _is_clip_env = os.environ.get("UNSLOTH_GRPO_VLLM_IS_CLIP", "")
+    if _is_clip_env:
+        from unsloth_zoo.rl_replacements import grpo_parse_is_clip as _grpo_parse_is_clip
+        kwargs["vllm_importance_sampling_clip_min"], kwargs["vllm_importance_sampling_clip_max"] = _grpo_parse_is_clip(
+            _is_clip_env, kwargs["vllm_importance_sampling_mode"],
+        )
+    # verl rollout_rs rejection (token_k3, seq_mean_k3, seq_mean_k1, ...), applied with the vLLM IS ratio.
+    from unsloth_zoo.rl_replacements import grpo_parse_rollout_rs as _grpo_parse_rollout_rs
+    _rollout_rs = _grpo_parse_rollout_rs(
+        os.environ.get("UNSLOTH_GRPO_ROLLOUT_RS", ""), os.environ.get("UNSLOTH_GRPO_ROLLOUT_RS_THRESHOLD", ""),
+    )
+    if _rollout_rs is not None:
+        kwargs["rollout_rs"] = _rollout_rs
+    _rollout_metrics_on = os.environ.get("UNSLOTH_GRPO_ROLLOUT_METRICS", "0") == "1"
 
     if not hasattr(trainer, '_autocast_dtype'):
         # "no" is float32 training (a T4 / V100 without bfloat16): autocasting it to bfloat16 raises there.
@@ -1492,7 +2395,61 @@ def grpo_accumulated_loss(
     _unsloth_prior_hidden_states = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES")
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
     try:
-        lm_head = trainer.model.get_output_embeddings().weight
+        output_embeddings = trainer.model.get_output_embeddings()
+        lm_head = output_embeddings.weight
+        lm_head_bias = getattr(output_embeddings, "bias", None)
+        # ZeRO-3 released the head after the forward: score with one gathered copy per call.
+        _zero3_head = None
+        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_zero3_partitioned, unsloth_zero3_gathered
+        if unsloth_zero3_partitioned(lm_head) or unsloth_zero3_partitioned(lm_head_bias):
+            _zero3_head = (unsloth_zero3_gathered(lm_head), unsloth_zero3_gathered(lm_head_bias))
+            lm_head, lm_head_bias = _zero3_head
+
+        def _refresh_lm_head():
+            # FSDP2's forward unshard swaps the Parameters: the bindings above are metadata-only until then.
+            nonlocal lm_head, lm_head_bias
+            if _zero3_head is not None:
+                lm_head, lm_head_bias = _zero3_head
+                return
+            from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fsdp_unshard
+            unsloth_fsdp_unshard(output_embeddings)
+            lm_head = output_embeddings.weight
+            lm_head_bias = getattr(output_embeddings, "bias", None)
+
+        from unsloth_zoo.rl_replacements import grpo_truncated_support_kwargs
+        _support_kwargs = grpo_truncated_support_kwargs(trainer)
+        # old / ref logps come from Unsloth's _get_per_token_logps, which marks the trainer when
+        # it scored them over the same set; mixing the two normalisations would bias every ratio.
+        if _support_kwargs and (old_logps is not None or ref_logps is not None) \
+                and not getattr(trainer, "_unsloth_truncated_support_scored", False):
+            if not getattr(trainer, "_unsloth_truncated_support_refused", False):
+                from unsloth_zoo.log import logger as _zoo_logger
+                _zoo_logger.warning(
+                    "Unsloth: UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 needs an unsloth build that scores the "
+                    "old / reference logprobs over the same kept set. Ignoring it: pip install -U unsloth"
+                )
+                trainer._unsloth_truncated_support_refused = True
+            _support_kwargs = {}
+        if _support_kwargs and getattr(trainer, "_unsloth_truncated_support_refused", False):
+            # Unsloth found the scored policy is not the sampler (an unsynced vLLM sampler, a reference
+            # model, reused rollouts): the current policy's own kept set would not be vLLM's either.
+            _support_kwargs = {}
+        if _support_kwargs:
+            from functools import partial
+            if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
+                # The recompute helper scores the full vocabulary only, so the kept set uses the plain helper
+                from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax
+                if not getattr(trainer, "_unsloth_truncated_support_recompute_warned", False):
+                    from unsloth_zoo.log import logger as _zoo_logger
+                    _zoo_logger.warning(
+                        "Unsloth: UNSLOTH_GRPO_LOGPROB_RECOMPUTE=1 is not used with UNSLOTH_GRPO_TRUNCATED_SUPPORT=1; "
+                        "the logprobs are scored with the standard helper over the kept set."
+                    )
+                    trainer._unsloth_truncated_support_recompute_warned = True
+            chunked_hidden_states_selective_log_softmax = partial(
+                chunked_hidden_states_selective_log_softmax, **_support_kwargs,
+            )
+            chunked_selective_log_softmax = partial(chunked_selective_log_softmax, **_support_kwargs)
         # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
         _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
         dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
@@ -1547,7 +2504,7 @@ def grpo_accumulated_loss(
             completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
             completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
 
-            if trainer.use_vllm and sampling_per_token_logps is not None:
+            if (trainer.use_vllm or _rollout_logps_as_old) and sampling_per_token_logps is not None:
                 sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
             else:
                 sampling_per_token_logps = None
@@ -1558,6 +2515,9 @@ def grpo_accumulated_loss(
             completion_input_ids = input_ids[:, -logits_to_keep:]
             completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
 
+        if _rollout_logps_as_old:
+            old_logps, sampling_per_token_logps = grpo_rollout_logps_as_old(sampling_per_token_logps, old_logps)
+
         unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
         for module in unwrapped_model.modules():
@@ -1566,6 +2526,41 @@ def grpo_accumulated_loss(
         pass
 
         all_logprobs_list = []
+        all_entropies_list = []
+
+        # No width dispatch in these helpers: unsloth rewrites every
+        # `if <x>.shape[-1] == lm_head.shape[1]:` in this function and refuses any other spelling.
+        def _hidden_logps_and_entropies(hidden_states, ids, chunks):
+            logps, entropies = _entropy_log_softmax(
+                hidden_states, lm_head, ids, chunks,
+                logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                lm_head_bias = lm_head_bias, return_entropy = True,
+            )
+            if _support_kwargs:
+                # Entropies stay full-vocabulary as TRL's; the logprobs take the kept set
+                logps = chunked_hidden_states_selective_log_softmax(
+                    hidden_states, lm_head, ids, chunks,
+                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                    lm_head_bias = lm_head_bias,
+                )
+            return logps, entropies
+
+        def _raw_logits_entropies(logits):
+            # The forward already scaled / softcapped these; same temperature as the logprobs.
+            if _entropy_bonus_on:
+                log_p = torch.log_softmax(logits.to(torch.float32) / temperature, dim = -1)
+                return -(log_p.exp() * log_p).sum(-1)
+            # Mask only (top_entropy_quantile): TRL scores entropies under no_grad, so no graph is kept,
+            # and rows go in slices so the fp32 copies stay near 64M elements, not the whole [B, T, V].
+            with torch.no_grad():
+                flat = logits.reshape(-1, logits.shape[-1])
+                out = torch.empty(flat.shape[0], dtype = torch.float32, device = logits.device)
+                step = max(1, (1 << 26) // max(int(flat.shape[-1]), 1))
+                for lo in range(0, flat.shape[0], step):
+                    log_p = torch.log_softmax(flat[lo : lo + step].to(torch.float32) / temperature, dim = -1)
+                    out[lo : lo + step] = -(log_p.exp() * log_p).sum(-1)
+                    del log_p
+                return out.reshape(logits.shape[:-1])
 
         import math
         total_samples = input_ids.shape[0]
@@ -1630,7 +2625,7 @@ def grpo_accumulated_loss(
             grpo_accumulated_loss._pg_funcs = _pg_funcs
         # Skip PG under vLLM (fast_inference=True): rollout dominates the step, so the
         # saving is small and the first-use self-verify is net overhead.
-        _pg_engage = bool(_pg_funcs) and not getattr(trainer, "use_vllm", False)
+        _pg_engage = bool(_pg_funcs) and not getattr(trainer, "use_vllm", False) and not _need_entropy
 
         # ---- PrefixGrouper (GRPO shared-prompt dedup; UNSLOTH_GRPO_PREFIX_GROUPER=0 disables) ----
         # Each prompt's G completions share the prefix; PG forwards it once + the G suffixes
@@ -1729,6 +2724,10 @@ def grpo_accumulated_loss(
         new_logprobs = None
         _pack_result = None
         _pack_use = False
+        _pack_T = None
+        # True only while the packed forward and its scatter run, so an OOM elsewhere (setup, per-row verifier)
+        # is not read as a length limit
+        _pack_in_packed = False
         _pack_enabled = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING", "1").lower() not in ("0", "false", "no", "off")
         _pack_ok = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
         if (_pack_enabled and not _pg_skip_pack and pixel_values is None
@@ -1739,19 +2738,22 @@ def grpo_accumulated_loss(
                 _pack_lengths = _pack_keep.sum(dim = 1)
                 _pack_lengths_cpu = _pack_lengths.tolist()                 # single GPU->CPU sync, reused below
                 _pack_nz_cpu = [_n for _n in _pack_lengths_cpu if _n > 0]
-                _pack_flat_ids = input_ids[_pack_keep].unsqueeze(0)
-                _pack_T = _pack_flat_ids.shape[1]
+                _pack_T = sum(_pack_nz_cpu)
                 _pack_L = input_ids.shape[1]
                 _pack_W = logits_to_keep + max_left_pad
                 _pack_maxseg = max(_pack_nz_cpu) if _pack_nz_cpu else 0
                 # sliding-window models lose the per-sequence local window in a packed stream
                 _pack_sw = getattr(getattr(unwrapped_model, "config", None), "sliding_window", None)
                 _pack_sw_ok = not (isinstance(_pack_sw, int) and _pack_sw > 0 and _pack_maxseg > _pack_sw)
-                _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
                 _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
-                # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch)
-                if _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok and (_pack_ok is True or _pack_active >= 2) \
-                        and not (_pack_unsafe is not None and _pack_T >= _pack_unsafe):
+                # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch or a
+                # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
+                _pack_capped = _pack_unsafe is not None and _pack_T >= _pack_unsafe
+                if not _pack_capped:
+                    _pack_flat_ids = input_ids[_pack_keep].unsqueeze(0)
+                    _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
+                if (not _pack_capped) and _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok \
+                        and (_pack_ok is True or _pack_active >= 2):
                     _pack_psl = torch.tensor(_pack_nz_cpu, dtype = torch.int32, device = input_ids.device)
                     # reset 0-based position_ids per segment
                     _pack_pos = (_pack_keep.cumsum(dim = 1) - 1)[_pack_keep].unsqueeze(0)
@@ -1762,6 +2764,7 @@ def grpo_accumulated_loss(
                     # row's left-pad (matches create_completion_attention_mask exactly)
                     _pack_cstart = (_pack_L - logits_to_keep) - left_pad_tokens_per_prompt  # [rows]
                     _pack_ctgt = (_pack_nz_idx[1:, 1] >= _pack_cstart[_pack_nz_idx[1:, 0]]) & _pack_within
+                    _pack_in_packed = True
                     with autocaster:
                         # use_cache=False: a KV cache silently disables varlen packing
                         _pack_hidden = unwrapped_model(
@@ -1770,6 +2773,7 @@ def grpo_accumulated_loss(
                             packed_seq_lengths = _pack_psl,
                             use_cache = False,
                         ).logits
+                        _refresh_lm_head()
                         # `.logits` carries hidden states only when the forward is the
                         # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
                         # otherwise it is real [T, vocab] logits and the lm_head matmul
@@ -1777,16 +2781,23 @@ def grpo_accumulated_loss(
                         _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0)
                         _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0)
                         if _pack_h.shape[-1] == lm_head.shape[1]:
-                            _pack_sel = chunked_hidden_states_selective_log_softmax(
-                                _pack_h, lm_head, _pack_tid, _pack_chunks,
-                                logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                            )[0]
+                            if _need_entropy:
+                                _pack_sel, _pack_ent = _hidden_logps_and_entropies(_pack_h, _pack_tid, _pack_chunks)
+                                _pack_sel, _pack_ent = _pack_sel[0], _pack_ent[0]
+                            else:
+                                _pack_sel = chunked_hidden_states_selective_log_softmax(
+                                    _pack_h, lm_head, _pack_tid, _pack_chunks,
+                                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                    lm_head_bias = lm_head_bias,
+                                )[0]
                         else:
                             # Raw logits: the forward already applied scale/softcap.
                             _pack_sel = chunked_selective_log_softmax(
                                 _pack_h, _pack_tid,
                                 temperature = temperature, chunks = _pack_chunks,
                             )[0]
+                            if _need_entropy:
+                                _pack_ent = _raw_logits_entropies(_pack_h)[0]
                     # GPT-OSS offload race guard (matches the padded loop)
                     device_synchronize()
                     # scatter each completion logprob back to its (row, col) so [:, -_pack_W:] matches padded
@@ -1794,6 +2805,11 @@ def grpo_accumulated_loss(
                     _pack_result = torch.zeros(
                         total_rows * _pack_L, dtype = torch.float32, device = input_ids.device,
                     ).index_put((_pack_tgt,), _pack_sel.to(torch.float32)).view(total_rows, _pack_L)[:, -_pack_W:]
+                    if _need_entropy:
+                        _pack_entropies = torch.zeros(
+                            total_rows * _pack_L, dtype = torch.float32, device = input_ids.device,
+                        ).index_put((_pack_tgt,), _pack_ent.to(torch.float32)).view(total_rows, _pack_L)[:, -_pack_W:]
+                    _pack_in_packed = False
                     # trust decision: re-verify when T or the longest segment grows past what was verified
                     # (a LongRoPE cache switch can change the result)
                     _pack_vT = int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_T", 0))
@@ -1812,6 +2828,7 @@ def grpo_accumulated_loss(
                                 _pack_real = input_ids[_pack_i][_pack_rmask].unsqueeze(0)
                                 _pack_rpos = torch.arange(_pack_ni, device = input_ids.device).unsqueeze(0)
                                 _pack_rh = unwrapped_model(input_ids = _pack_real, position_ids = _pack_rpos, use_cache = False).logits
+                                _refresh_lm_head()
                                 # same width dispatch as the packed call above: this forward
                                 # returns raw logits whenever that one did, and the first
                                 # packed batch always lands here
@@ -1819,6 +2836,7 @@ def grpo_accumulated_loss(
                                     _pack_rsel = chunked_hidden_states_selective_log_softmax(
                                         _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
                                         logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                        lm_head_bias = lm_head_bias,
                                     )[0]
                                 else:
                                     _pack_rsel = chunked_selective_log_softmax(
@@ -1870,9 +2888,17 @@ def grpo_accumulated_loss(
                 _pack_use = False
                 if isinstance(_pack_err, torch.cuda.OutOfMemoryError):
                     torch.cuda.empty_cache()
-                unwrapped_model._unsloth_seq_packing_grad_ok = False
-                if UNSLOTH_ENABLE_LOGGING:
-                    print(f"[Unsloth] GRPO sequence-packing disabled (fell back to padded): {_pack_err!r}", flush = True)
+                if isinstance(_pack_err, torch.cuda.OutOfMemoryError) and _pack_in_packed and _pack_T is not None:
+                    # an OOM in the packed forward means this length does not fit, not that packing is wrong
+                    _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
+                    _pack_unsafe = _pack_T if _pack_unsafe is None else min(_pack_unsafe, _pack_T)
+                    unwrapped_model._unsloth_seq_packing_grad_unsafe_T = _pack_unsafe
+                    if UNSLOTH_ENABLE_LOGGING:
+                        print(f"[Unsloth] GRPO sequence-packing OOM at T={_pack_T}: packing capped below T={_pack_unsafe}, this batch uses the padded loop: {_pack_err!r}", flush = True)
+                else:
+                    unwrapped_model._unsloth_seq_packing_grad_ok = False
+                    if UNSLOTH_ENABLE_LOGGING:
+                        print(f"[Unsloth] GRPO sequence-packing disabled (fell back to padded): {_pack_err!r}", flush = True)
         # ---- PrefixGrouper resolution + first-use self-verify (grad) ----
         # Verify runs under no_grad, then a separate grad forward builds new_logprobs,
         # so no inference tensors are saved for backward.
@@ -1885,6 +2911,7 @@ def grpo_accumulated_loss(
                     prefix_seg_info = _pg_layout.prefix_seg_info,
                     use_cache = False,
                 ).logits
+                _refresh_lm_head()
                 # Same width dispatch as the packed path and compute_logprobs_chunk.
                 # `.logits` carries hidden states only when the forward is the Unsloth
                 # generated one honouring UNSLOTH_RETURN_HIDDEN_STATES; otherwise it is
@@ -1893,6 +2920,9 @@ def grpo_accumulated_loss(
                 # that same signature, which skips the lm_head matmul and the scale /
                 # softcap the forward already applied.
                 _pg_fn = chunked_hidden_states_selective_log_softmax
+                if lm_head_bias is not None:
+                    from functools import partial
+                    _pg_fn = partial(_pg_fn, lm_head_bias = lm_head_bias)
                 if _h.shape[-1] != lm_head.shape[1]:
                     def _pg_fn(_pg_h, _pg_lm, _pg_ids, _pg_n, _pg_lsm, _pg_lsd, _pg_lsc, _pg_t):
                         return chunked_selective_log_softmax(
@@ -1985,10 +3015,18 @@ def grpo_accumulated_loss(
             zipped_inputs = []
         elif _pack_use and _pack_result is not None:
             new_logprobs = _pack_result          # verified -> skip the loop
+            if _need_entropy:
+                all_entropies_list = [_pack_entropies]
             zipped_inputs = []
         else:
-            # packing rejected/unused: drop the packed graph before the padded loop so both don't co-reside
+            # packing rejected/unused: drop the packed graph and its index buffers before the padded loop so
+            # neither co-resides with it
             _pack_hidden = _pack_sel = _pack_result = None
+            _pack_ent = _pack_entropies = None
+            if _pack_T is not None:
+                _pack_keep = _pack_lengths = _pack_flat_ids = _pack_pos = _pack_psl = None
+                _pack_nz_idx = _pack_within = _pack_cstart = _pack_ctgt = _pack_tgt = None
+                _pack_h = _pack_tid = _pack_ref = _pack_cm = None
 
         def to_device(tensor, device, non_blocking=True):
             if tensor is None: return None
@@ -2009,11 +3047,18 @@ def grpo_accumulated_loss(
             @staticmethod
             def forward(ctx, hidden_states, lm_head, index, chunks,
                         logit_scale_multiply, logit_scale_divide,
-                        logit_softcapping, temperature):
+                        logit_softcapping, temperature, lm_head_bias = None):
                 # Detach so we don't keep the graph (and extra memory) on CPU.
                 detached_hidden_states = hidden_states.detach().contiguous()
                 ctx.device = hidden_states.device
                 ctx.copy_event = None
+                # Backward runs outside autocast; recompute must match forward (torch.utils.checkpoint does the same).
+                ctx.autocast_kwargs = dict(
+                    device_type = lm_head.device.type,
+                    enabled = torch.is_autocast_enabled(lm_head.device.type),
+                    dtype = torch.get_autocast_dtype(lm_head.device.type),
+                    cache_enabled = torch.is_autocast_cache_enabled(),
+                )
 
                 # Always offload: this path only runs when the caller is already memory bound
                 # (long completions / large batches), so the win is overlapping the copy.
@@ -2054,12 +3099,15 @@ def grpo_accumulated_loss(
 
                 ctx.lm_head = lm_head
                 ctx.lm_head_requires_grad = lm_head.requires_grad
+                ctx.lm_head_bias = lm_head_bias
+                ctx.bias_requires_grad = lm_head_bias is not None and lm_head_bias.requires_grad
                 ctx.index = index
                 ctx.args = (chunks, logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature)
 
+                bias_kwargs = {} if lm_head_bias is None else {"lm_head_bias": lm_head_bias}
                 with torch.no_grad():
                     output = chunked_hidden_states_selective_log_softmax(
-                        hidden_states, lm_head, index, *ctx.args
+                        hidden_states, lm_head, index, *ctx.args, **bias_kwargs,
                     )
 
                 return output
@@ -2080,20 +3128,25 @@ def grpo_accumulated_loss(
                     # it here would run a user's grad mask / scaler once on this local
                     # gradient and again when the returned gradient reaches lm_head.
                     lm_head = lm_head.detach().requires_grad_(True)
+                lm_head_bias = ctx.lm_head_bias
+                if ctx.bias_requires_grad:
+                    lm_head_bias = lm_head_bias.detach().requires_grad_(True)
                 index = ctx.index
 
-                with torch.enable_grad():
+                bias_kwargs = {} if lm_head_bias is None else {"lm_head_bias": lm_head_bias}
+                with torch.enable_grad(), torch.autocast(**ctx.autocast_kwargs):
                     output = chunked_hidden_states_selective_log_softmax(
-                        hidden_states, lm_head, index, *ctx.args
+                        hidden_states, lm_head, index, *ctx.args, **bias_kwargs,
                     )
 
                 # autograd.grad, not backward: backward writes into leaf .grad, which the
                 # outer AccumulateGrad would then double-count.
-                grad_inputs = torch.autograd.grad(
-                    output,
-                    (hidden_states, lm_head) if ctx.lm_head_requires_grad else (hidden_states,),
-                    grad_output,
-                )
+                inputs = [hidden_states]
+                if ctx.lm_head_requires_grad:
+                    inputs.append(lm_head)
+                if ctx.bias_requires_grad:
+                    inputs.append(lm_head_bias)
+                grad_inputs = torch.autograd.grad(output, inputs, grad_output)
 
                 return (
                     grad_inputs[0],
@@ -2104,11 +3157,13 @@ def grpo_accumulated_loss(
                     None,
                     None,
                     None,
+                    grad_inputs[-1] if ctx.bias_requires_grad else None,
                 )
 
         def efficient_log_softmax(hidden_states, lm_head, index, chunks=32,
                                 logit_scale_multiply=0.0, logit_scale_divide=0.0,
-                                logit_softcapping=0.0, temperature=1, batch_size=8):
+                                logit_softcapping=0.0, temperature=1, batch_size=8,
+                                lm_head_bias=None):
             if (index.shape[1] <= 1024 and batch_size <= 8) or batch_size==1:
                 # Normal path is faster / saves a GB under these conditions.
                 return chunked_hidden_states_selective_log_softmax(
@@ -2119,20 +3174,26 @@ def grpo_accumulated_loss(
                     logit_scale_multiply,
                     logit_scale_divide,
                     logit_softcapping,
-                    temperature
+                    temperature,
+                    lm_head_bias = lm_head_bias,
                 )
             else:
                 return Unsloth_Offloaded_Log_Softmax.apply(
                     hidden_states, lm_head, index, chunks,
                     logit_scale_multiply, logit_scale_divide,
-                    logit_softcapping, temperature
+                    logit_softcapping, temperature, lm_head_bias,
                 )
 
         def compute_logprobs_chunk(new_hidden_states_chunk, completion_ids, input_ids_chunk):
+            _refresh_lm_head()
             # Hidden states -> lm_head matmul path; raw logits -> skip matmul and
             # skip scale/softcap (model forward already applied them).
             chunks = input_ids_chunk.shape[0] * multiplier
             if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
+                if _need_entropy:
+                    logps, entropies = _hidden_logps_and_entropies(new_hidden_states_chunk, completion_ids, chunks)
+                    all_entropies_list.append(entropies)
+                    return logps
                 return efficient_log_softmax(
                     new_hidden_states_chunk,
                     lm_head,
@@ -2143,7 +3204,10 @@ def grpo_accumulated_loss(
                     logit_softcapping = logit_softcapping,
                     temperature = temperature,
                     batch_size = B,
+                    lm_head_bias = lm_head_bias,
                 )
+            if _need_entropy:
+                all_entropies_list.append(_raw_logits_entropies(new_hidden_states_chunk))
             return chunked_selective_log_softmax(
                 new_hidden_states_chunk,
                 completion_ids,
@@ -2192,13 +3256,37 @@ def grpo_accumulated_loss(
                 device = completion_mask.device, dtype = completion_mask.dtype,
             )
 
-        # Only DeepSpeed (no Accelerate scaler) needs grad_output; undo TRL <= 0.21's extra 1/GAS on the normalized loss.
+        entropy_mask = None
+        if _need_entropy:
+            new_entropies = torch.cat(all_entropies_list, dim = 0)
+            if _entropy_mask_on:
+                # TRL's own method, so its quantile population, ties and empty-batch rule match per version
+                # (multi-process TRL < 0.24 takes the padded gather so an empty rank cannot hang the rest).
+                entropy_mask = _grpo_high_entropy_mask(
+                    trainer, new_entropies.detach(), completion_mask, 1 - _entropy_quantile,
+                    sample_weight = kwargs.get("sample_weight", None),
+                )
+                kwargs["entropy_mask"] = entropy_mask
+
+        # DeepSpeed (no scaler) only: undo training_step's 1/GAS, which transformers >= 5.19 skips when
+        # loss_is_scaled_for_ga (TRL >= 1.15 GRPO) and older ones when compute_loss_func is set.
         upstream_scale = None
         if trainer.accelerator.scaler is None and getattr(trainer, "is_deepspeed_enabled", False):
+            import transformers as _unsloth_transformers
+            loss_is_scaled_for_ga = None
+            if hasattr(_unsloth_transformers.Trainer, "loss_is_scaled_for_ga"):
+                loss_is_scaled_for_ga = getattr(trainer, "loss_is_scaled_for_ga", None)
+            if loss_is_scaled_for_ga is None:
+                loss_is_scaled_for_ga = getattr(trainer, "compute_loss_func", None) is not None
             upstream_scale = 1.0
-            if getattr(trainer, "compute_loss_func", None) is None:
+            if not loss_is_scaled_for_ga:
                 upstream_scale = float(kwargs.get("current_gradient_accumulation_steps", 1))
 
+        _rollout_unscored = None
+        if _rollout_logps_as_old:
+            old_logps, _rollout_unscored = grpo_rollout_old_fill_unscored(old_logps, new_logprobs)
+            # Only on this path: grpo_compute_loss clamps pi_theta / pi_rollout's log to [-20, 20] like verl.
+            kwargs["rollout_logps_as_old"] = True
         with autocaster:
             loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
                 new_logprobs,
@@ -2214,6 +3302,63 @@ def grpo_accumulated_loss(
                 1,
                 kwargs,
                 upstream_scale,
+            )
+        _rollout_stats_args = None
+        if _rollout_logps_as_old:
+            delta, flat_is_ratio = grpo_rollout_as_old_ratio_metrics(coef_1, completion_mask)
+            if _rollout_metrics_on and flat_is_ratio is not None:
+                _log_ratio = torch.nan_to_num(
+                    torch.log(coef_1.detach().to(torch.float64)), nan = 0.0, posinf = 670.0, neginf = -670.0,
+                )
+                _log_ratio = torch.where(completion_mask.to(torch.bool), _log_ratio, torch.zeros_like(_log_ratio))
+                if _rollout_unscored is not None:
+                    # Unscored tokens carry no mismatch information: NaN leaves them out of the sums.
+                    _log_ratio = torch.where(_rollout_unscored, torch.full_like(_log_ratio, float("nan")), _log_ratio)
+                # An overflowed ratio is capped (finite squares) so ESS tends to its 1 / N limit, not nan.
+                _ess_weights = torch.clamp(flat_is_ratio.to(torch.float64), max = 1e100)
+                _rollout_stats_args = (_log_ratio, torch.zeros_like(_log_ratio), completion_mask, _ess_weights)
+        elif (
+            _rollout_metrics_on and old_logps is not None and sampling_per_token_logps is not None
+            and flat_is_ratio is not None and flat_is_ratio.numel() > 0
+        ):
+            _rollout_stats_args = (old_logps, sampling_per_token_logps, completion_mask, flat_is_ratio)
+        if _rollout_stats_args is not None:
+            from unsloth_zoo.rl_replacements import (
+                grpo_rollout_mismatch_stats as _grpo_rollout_mismatch_stats,
+                grpo_rollout_mismatch_metrics as _grpo_rollout_mismatch_metrics,
+            )
+            _rollout_stats = _grpo_rollout_mismatch_stats(*_rollout_stats_args)
+            _rollout_stats = trainer.accelerator.gather(_rollout_stats.reshape(1, -1)).reshape(-1, _rollout_stats.numel())
+            _rollout_stats = torch.cat([_rollout_stats[:, :3].sum(0), _rollout_stats[:, 3:4].amax(0), _rollout_stats[:, 4:].sum(0)])
+            _metrics = trainer._metrics
+            _bucket = "train" if _training else "eval"
+            if "train" in _metrics:
+                _metrics = _metrics[_bucket]
+            # Pool the sums over every micro-batch since the last log instead of averaging
+            # per-micro-batch ratios: TRL's log() clears _metrics, which restarts the window.
+            _rollout_acc = getattr(trainer, "_unsloth_rollout_mismatch_stats", None)
+            if not isinstance(_rollout_acc, dict):
+                _rollout_acc = {}
+                trainer._unsloth_rollout_mismatch_stats = _rollout_acc
+            _prev = _rollout_acc.get(_bucket)
+            if _prev is not None and "sampling/rollout_kl_k1/mean" in _metrics:
+                _prev = _prev.to(_rollout_stats.device)
+                _rollout_stats = torch.cat([
+                    _prev[:3] + _rollout_stats[:3],
+                    torch.maximum(_prev[3:4], _rollout_stats[3:4]),
+                    _prev[4:] + _rollout_stats[4:],
+                ])
+            _rollout_acc[_bucket] = _rollout_stats.detach()
+            for _name, _value in _grpo_rollout_mismatch_metrics(_rollout_stats).items():
+                _metrics[_name] = [_value]
+        if _entropy_bonus_on:
+            _entropy_weights = _grpo_entropy_bonus_weights(
+                completion_mask, entropy_mask, _entropy_coef, kwargs, training = _training,
+            )
+            _scaler = trainer.accelerator.scaler
+            loss = loss + _UnslothGRPOEntropyBonus.apply(
+                new_entropies, _entropy_weights.to(new_entropies.device),
+                _scaler.get_scale() if _scaler is not None else 1.0, upstream_scale,
             )
     finally:
         if _unsloth_prior_hidden_states is None:
@@ -2296,9 +3441,9 @@ def _distillation_jsd_chunk(
     valid, divisor,
     student_logit_scale, student_final_logit_softcapping,
     teacher_logit_scale, teacher_final_logit_softcapping,
-    beta, temperature,
+    beta, temperature, grad_scale,
 ):
-    """One chunk, already divided by the reduction denominator. Differentiated with ``torch.func.grad_and_value`` in the forward, so the positional order IS the argnums order: student hidden states, then head, then bias. Entropy is aux: a logged metric, not part of the objective."""
+    """One normalized chunk, scaled before ``torch.func.grad_and_value``. The positional order IS the argnums order: student hidden states, then head, then bias. The unscaled loss and entropy are auxiliary outputs."""
     student_logits = _distillation_project_logits(
         student_hidden_states, student_lm_head, student_lm_head_bias,
         student_logit_scale, student_final_logit_softcapping,
@@ -2334,7 +3479,8 @@ def _distillation_jsd_chunk(
     # The final chunk's tail holds positions packed out of the valid prefix.
     per_token_jsd = jsd.sum(dim = -1) * valid
     per_token_entropy = -(student_log_probs.exp() * student_log_probs).sum(dim = -1) * valid
-    return per_token_jsd.sum() / divisor, (per_token_entropy.sum(),)
+    loss = per_token_jsd.sum() / divisor
+    return loss * grad_scale, (loss, per_token_entropy.sum())
 pass
 
 
@@ -2415,7 +3561,7 @@ class _UnslothDistillationJSD(torch.autograd.Function):
         student_lm_head_bias, teacher_lm_head_bias,
         student_logit_scale, teacher_logit_scale,
         student_final_logit_softcapping, teacher_final_logit_softcapping,
-        temperature,
+        temperature, scaling,
     ):
         flat_student = student_hidden_states.reshape(-1, student_hidden_states.shape[-1])
         flat_teacher = teacher_hidden_states.reshape(-1, teacher_hidden_states.shape[-1])
@@ -2454,7 +3600,6 @@ class _UnslothDistillationJSD(torch.autograd.Function):
             flat_teacher = torch.cat([flat_teacher, flat_teacher.new_zeros(pad, flat_teacher.shape[-1])])
             sorted_valid = torch.cat([sorted_valid, sorted_valid.new_zeros(pad)])
 
-        # Divide inside the chunk so the accumulated gradient needs no rescale.
         if num_items_in_batch is None:
             # Clamped for the same reason a chunk always runs below: a fully
             # masked batch has to reduce to a finite zero rather than 0 / 0.
@@ -2491,16 +3636,19 @@ class _UnslothDistillationJSD(torch.autograd.Function):
 
         loss = flat_student.new_zeros((), dtype = torch.float32)
         entropy_sum = flat_student.new_zeros((), dtype = torch.float32)
+        # Scale before differentiation: an unscaled saved FP16 gradient underflows before GradScaler's backward.
+        grad_scale = loss.new_tensor(scaling)
+        ctx.scaling = scaling
 
         for start in range(0, n_padded, chunk_size):
             stop = start + chunk_size
-            grads, (chunk_loss, (chunk_entropy,)) = grad_fn(
+            grads, (_, (chunk_loss, chunk_entropy)) = grad_fn(
                 flat_student[start : stop], student_lm_head, student_lm_head_bias,
                 flat_teacher[start : stop], teacher_lm_head, teacher_lm_head_bias,
                 sorted_valid[start : stop].to(flat_student.dtype), divisor,
                 student_logit_scale, student_final_logit_softcapping,
                 teacher_logit_scale, teacher_final_logit_softcapping,
-                beta, temperature,
+                beta, temperature, grad_scale,
             )
             grad_hidden[start : stop] = grads[0]
             if head_position is not None:
@@ -2528,6 +3676,7 @@ class _UnslothDistillationJSD(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, _grad_entropy, _grad_n_valid):
         grad_hidden, grad_head, grad_bias = ctx.saved_tensors
+        grad_output = grad_output / ctx.scaling
         # Saved as empty rather than None: save_for_backward rejects None, and an
         # empty tensor is the cheap way to say "this input was not trainable".
         return (
@@ -2536,7 +3685,7 @@ class _UnslothDistillationJSD(torch.autograd.Function):
             grad_output * grad_head if grad_head.numel() != 0 else None,
             None, None, None, None, None,
             grad_output * grad_bias if grad_bias.numel() != 0 else None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         )
 pass
 
@@ -2557,6 +3706,7 @@ def distillation_chunked_jsd(
     student_final_logit_softcapping: float = 0.0,
     teacher_final_logit_softcapping: float = 0.0,
     temperature: float = 1.0,
+    scaler = None,
 ):
     """Memory efficient generalized JSD between a student and a frozen teacher.
 
@@ -2584,6 +3734,8 @@ def distillation_chunked_jsd(
         num_items_in_batch: total valid tokens across the global batch. When given
             the reduction is ``sum / num_items_in_batch``, which is what makes
             gradient accumulation exact; when ``None`` it is the local mean.
+        scaler: current GradScaler, applied before the chunk gradients are
+            computed. The returned loss remains unscaled.
     Returns:
         ``(loss, entropy_sum, n_valid_tokens)``. The last two are raw local sums so
         a distributed caller can reduce them itself.
@@ -2595,7 +3747,7 @@ def distillation_chunked_jsd(
         student_lm_head_bias, teacher_lm_head_bias,
         student_logit_scale, teacher_logit_scale,
         student_final_logit_softcapping, teacher_final_logit_softcapping,
-        temperature,
+        temperature, scaler.get_scale() if scaler is not None else 1.0,
     )
 pass
 RL_REPLACEMENTS["distillation_chunked_jsd"] = distillation_chunked_jsd

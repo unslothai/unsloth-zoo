@@ -354,10 +354,37 @@ def _patch_decode_switch():
     GenerationMixin._optimize_model_for_decode = _optimize_model_for_decode
 
 
+def _patch_transformers_grouped_mm():
+    """Route transformers' moe._grouped_mm through moe_utils' Triton grouped GEMM where its gate picks it."""
+    try:
+        import transformers.integrations.moe as transformers_moe
+        moe_utils = _moe_utils_module()
+    except Exception:
+        return
+    original = getattr(transformers_moe, "_grouped_mm", None)
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+    op = getattr(moe_utils, "_triton_grouped_mm", None)
+    wanted = getattr(moe_utils, "_triton_grouped_mm_wanted", None)
+    if op is None or wanted is None or getattr(moe_utils, "_GROUPED_MM_TRITON_OP", None) is None:
+        return
+
+    @functools.wraps(original)
+    def _grouped_mm(input, weight, offs, *args, **kwargs):
+        if not args and not kwargs and input.dtype == weight.dtype and wanted(input, weight):
+            return op(input, weight, offs)
+        return original(input, weight, offs, *args, **kwargs)
+
+    _grouped_mm._unsloth_patched = True
+    _grouped_mm._unsloth_original = original
+    transformers_moe._grouped_mm = _grouped_mm
+
+
 def patch_experts_interface():
     interface = _experts_interface()
     if interface is None:
         return
+    _patch_transformers_grouped_mm()
     try:
         from transformers.modeling_utils import PreTrainedModel
     except Exception as e:

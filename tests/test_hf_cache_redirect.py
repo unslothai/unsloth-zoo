@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-_HF_CACHE_PATH = Path(__file__).resolve().parents[1] / "unsloth_zoo" / "hf_cache.py"
+_HF_CACHE_PATH = Path(__file__).resolve().parents[1] / "unsloth_zoo_downloads" / "hf_cache.py"
 
 
 def _load_module():

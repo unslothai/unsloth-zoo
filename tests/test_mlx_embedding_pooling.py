@@ -25,6 +25,13 @@ mx = pytest.importorskip("mlx.core", reason="MLX is only available on Apple Sili
 nn = pytest.importorskip("mlx.nn", reason="MLX is only available on Apple Silicon")
 optim = pytest.importorskip("mlx.optimizers", reason="MLX is only available on Apple Silicon")
 
+# The torch shim installs process-wide while another module is being collected, so the
+# imports above can succeed against it; these numerics need real MLX (the mlx-cpu lane).
+from mlx_simulation import mlx_is_simulated  # noqa: E402
+
+if mlx_is_simulated():
+    pytest.skip("needs real MLX, the torch shim is installed", allow_module_level = True)
+
 # Module-level on purpose: tests/mlx_simulation stubs mlx.* session-wide.
 from mlx.utils import tree_flatten
 _mlx_lm = pytest.importorskip("mlx_lm", reason="MLX is only available on Apple Silicon")

@@ -44,6 +44,12 @@ def ogs(monkeypatch):
     torch._dynamo.reset()
 
 
+def _native_here():
+    """False on sm_12x + release/3.6.x, where the decode must fail closed to the exact packed path."""
+    from unsloth_zoo.triton_kernels_compat import native_mxfp4_matmul_ok
+    return native_mxfp4_matmul_ok(torch.device("cuda", torch.cuda.current_device()), gpt_oss._ogs_modules())
+
+
 def _inputs():
     g = torch.Generator(device = "cuda").manual_seed(13)
     return [torch.randn(b, 1, 128, device = "cuda", dtype = torch.bfloat16, generator = g) for b in (1, 1, 4)]
@@ -68,7 +74,7 @@ def test_no_grad_decode_runs_matmul_ogs_and_matches_the_dequantized_experts(ogs)
     want = _dense_reference(mlp, experts, inputs)
     with torch.no_grad():
         got = [gpt_oss.moe_forward_inference_bf16(mlp, h).float() for h in inputs]
-    assert ogs["op"] > 0
+    assert (ogs["op"] > 0) is _native_here()
     for a, b in zip(got, want):
         assert torch.isfinite(a).all() and (a - b).norm() / b.norm() < 2e-2
 
@@ -112,6 +118,11 @@ def test_the_cached_ogs_views_follow_their_experts(ogs):
     model, experts = _tiny_gpt_oss("cuda")
     mlp = model.model.layers[0].mlp
     h = _inputs()[0]
+    if not _native_here():
+        with torch.no_grad():
+            assert gpt_oss._mxfp4_ogs_decode(mlp, h) is None  # fails closed: no view cached, nothing launched
+        assert len(gpt_oss._OGS_WEIGHTS) == 0 and ogs["op"] == 0
+        return
     with torch.no_grad():
         before = gpt_oss._mxfp4_ogs_decode(mlp, h).float()
         experts.gate_up_proj.copy_(_packed(4, 128, 128, device = "cuda", seed = 21))
@@ -123,3 +134,18 @@ def test_the_cached_ogs_views_follow_their_experts(ogs):
     del model, experts, mlp
     gc.collect()
     assert len(gpt_oss._OGS_WEIGHTS) == 0
+
+
+def test_auto_prefers_the_fused_packed_decode(ogs, monkeypatch):
+    model, experts = _tiny_gpt_oss("cuda")
+    mlp = model.model.layers[0].mlp
+    monkeypatch.delenv("UNSLOTH_MXFP4_OGS")
+    fused = gpt_oss._mxfp4_fused_decode_enabled(experts.gate_up_proj, torch.bfloat16)
+    with torch.no_grad():
+        auto = gpt_oss._mxfp4_ogs_decode(mlp, _inputs()[0])
+        out = gpt_oss.moe_forward_inference_bf16(mlp, _inputs()[0])
+    assert torch.isfinite(out).all()
+    if fused:
+        assert auto is None and ogs["op"] == 0
+    else:
+        assert (ogs["op"] > 0) is _native_here()

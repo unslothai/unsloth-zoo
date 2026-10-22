@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
+import contextlib
 import functools
 import gc
+import inspect
 import sys
 import threading
 from types import FunctionType, SimpleNamespace
@@ -20,7 +22,10 @@ from mlx.utils import tree_flatten
 from mlx_lm.models import gemma4_text as lm_gemma
 from mlx_lm.models import qwen3_next as lm_qwen
 from mlx_lm.models import switch_layers as lm
-from mlx_lm.models.gpt_oss import SwiGLU
+try:
+    from mlx_lm.models.activations import SwigluOAI as SwiGLU
+except ImportError:  # mlx-lm < 0.32
+    from mlx_lm.models.gpt_oss import SwiGLU
 from mlx_vlm.models import switch_layers as vlm
 from mlx_vlm.models.gemma4 import language as vlm_gemma
 from mlx_vlm.models.gemma4.language import GeGLU
@@ -128,7 +133,7 @@ def test_each_contract_resolution_gets_its_own_bindings():
     # one list shared between resolutions would vouch for helpers a cached fused class never captured
     first, second = fusion._moe_switch_specs(), fusion._moe_switch_specs()
     assert first[lm.SwitchGLU][-1] is not second[lm.SwitchGLU][-1]
-    fused = [fusion._fused_moe_gate_up_class(lm.SwitchGLU, kind, None, None, 0, []) for kind in
+    fused = [fusion._fused_moe_gate_up_class(lm.SwitchGLU, kind, None, 0, []) for kind in
              (lm.QuantizedSwitchLinear, type("Other", (lm.QuantizedSwitchLinear,), {}))]
     assert fused[0] is not fused[1]  # one class cached across projection types would guard the wrong one
 
@@ -395,6 +400,33 @@ def test_accepted_switch_glu_bodies_cover_the_installed_packages():
         assert fusion._ast_fingerprint(native.SwitchGLU.__call__) in accepted
 
 
+@pytest.mark.skipif("global_scale" not in inspect.signature(lm.SwitchLinear.to_quantized).parameters,
+                    reason = "Requires an mlx-lm with nvfp4 global scales")
+def test_global_scale_projections_keep_the_native_path():
+    # gate and up each carry their own per-expert scale, which one packed matmul cannot apply
+    mx.random.seed(19)
+    model = lm.SwitchGLU(2048, 512, 8, bias = False)
+    model.set_dtype(mx.bfloat16)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(model, name, getattr(model, name).to_quantized(16, 4, mode = "nvfp4", global_scale = True))
+    model.eval()
+    model.freeze()
+    samples = _samples(model, mx.bfloat16, 2048, [(1, 1), (1, 32)])
+    with fused_moe_gate_up(model):
+        assert type(model) is lm.SwitchGLU
+        for x, indices, expected in samples:
+            _equal(model(x, indices), expected)
+
+
+def test_routing_bodies_cover_the_installed_packages():
+    # an unlisted routing body keeps its native call without a word, so it has to fail here
+    from mlx_vlm.models.gemma4_text import language as vlm_gemma_text
+    from mlx_vlm.models.qwen3_next import language as vlm_next
+    for router in (vlm_qwen.Qwen3_5MoeSparseMoeBlock, vlm_next.Qwen3NextSparseMoeBlock,
+                   lm_qwen.Qwen3NextSparseMoeBlock, vlm_gemma.Router, vlm_gemma_text.Router, lm_gemma.Router):
+        assert fusion._moe_router_class(router) is not None, router.__module__
+
+
 @pytest.mark.skipif("weights" not in vlm.SwitchGLU.__call__.__code__.co_varnames,
                     reason = "Requires an mlx-vlm that combines routing weights")
 @pytest.mark.parametrize("with_shared", [False, True])
@@ -432,14 +464,14 @@ def _inputs(dtype, experts, rows, mode):
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
-@pytest.mark.parametrize("experts, top_k", [(32, 1), (64, 5), (128, 8), (160, 3), (256, 8), (1024, 8)])
+@pytest.mark.parametrize("experts, top_k", [(32, 1), (64, 5), (128, 8), (160, 3), (256, 8), (288, 8), (512, 10), (1024, 8), (1024, 16)])
 @pytest.mark.parametrize("mode, normalize", [(QWEN, True), (QWEN, False), (GEMMA, False)])
 def test_kernel_reproduces_native_routing(dtype, experts, top_k, mode, normalize):
     for rows in (0, 1, 8, 4096):
         mx.random.seed(rows + experts + top_k)
         logits, scale = _inputs(dtype, experts, rows, mode)
         fused = fusion._fused_moe_router(logits, scale, top_k, mode, normalize)
-        if rows == 0 or (mode == QWEN and experts > 256):
+        if rows == 0 or (mode == GEMMA and top_k > 8):
             assert fused is None
             continue
         assert fused is not None
@@ -521,13 +553,16 @@ def test_scope_fuses_routing_composes_with_gate_up_in_either_order_and_restores(
     assert partitions
 
 
-def test_unnormalized_top_k_and_subclass_bodies_are_fused(monkeypatch):
+def test_unnormalized_wide_and_subclass_bodies_are_fused(monkeypatch):
     class Scaled(vlm_qwen.Qwen3_5MoeSparseMoeBlock):  # qwen4_exp inherits the body and overrides the shared gate
         def _shared_expert_scale(self, x):
             return 2 * super()._shared_expert_scale(x)
 
     partitions = _counting_argpartition(monkeypatch)
-    for block in (_block(lm_qwen, norm_topk_prob = False), _block(vlm_qwen, cls = Scaled)):
+    # qwen3_next and qwen4_exp route 512 experts to 10
+    for block in (_block(lm_qwen, norm_topk_prob = False), _block(vlm_qwen, norm_topk_prob = False),
+                  _block(vlm_qwen, cls = Scaled), _block(lm_qwen, experts = 512, top_k = 10),
+                  _block(vlm_qwen, experts = 512, top_k = 10, cls = Scaled)):
         samples = _routing_samples(block)
         base = type(block)
         with fusion.fused_moe_router(block):
@@ -536,6 +571,257 @@ def test_unnormalized_top_k_and_subclass_bodies_are_fused(monkeypatch):
             partitions.clear()
             _check(block, samples)
             assert not partitions
+
+
+def _native_combine(y, inv_order, scores):
+    return (y[inv_order].reshape(*scores.shape, y.shape[-1]) * scores[..., None]).sum(axis = -2)
+
+
+@pytest.mark.parametrize("dtype", fusion._MOE_COMBINE_DTYPES)
+@pytest.mark.parametrize("top_k, width", [(8, 2048), (3, 96)])
+def test_combine_kernel_reproduces_the_native_weighted_sum(dtype, top_k, width):
+    for tokens in (1, 300):
+        mx.random.seed(tokens + top_k)
+        y = (mx.random.normal((tokens * top_k, 1, width)) * 3).astype(dtype)
+        scores = mx.softmax(mx.random.normal((1, tokens, top_k)) * 2, axis = -1).astype(dtype)
+        y[..., 0] = -0.0
+        inv_order = mx.random.permutation(tokens * top_k)
+        _identical(fusion._run_moe_combine(y, inv_order, scores), _native_combine(y, inv_order, scores))
+    assert not fusion._moe_combine_verified(dtype, 1, width)  # one route is not summed, so its zero keeps its sign
+    fusion._moe_combine_verified.cache_clear()
+
+
+@pytest.mark.parametrize("native", [vlm_qwen, lm_qwen])
+@pytest.mark.parametrize("verified", [True, False])
+def test_prefill_combines_sorted_expert_rows_under_the_gate_up_pack(native, verified, monkeypatch):
+    _skip_unless_gate_up_resolves(native)
+    block = _block(native)
+    prefill, decode = (mx.random.normal(shape).astype(mx.bfloat16) for shape in ((2, 70, 64), (9, 1, 64)))
+    expected = block(prefill), block(decode)
+    combines, run = [], fusion._run_moe_combine
+    monkeypatch.setattr(fusion, "_run_moe_combine",
+                        lambda *a: combines.append(None) or run(*a) + (0 if verified else 1))
+    fusion._moe_combine_verified.cache_clear()
+    with fusion.fused_moe_router(block):
+        _identical(block(prefill), expected[0])
+        assert not combines  # without the pack the experts are not reachable in sorted order
+        with fusion.fused_moe_gate_up(block):
+            mx.eval(block(prefill))  # the first call verifies the kernel against the native chain
+            combines.clear()
+            _identical(block(prefill), expected[0])
+            assert bool(combines) is verified
+            combines.clear()
+            _identical(block(decode), expected[1])
+            with monkeypatch.context() as capped:  # past 32-bit indexing the native chain runs
+                capped.setattr(fusion, "_MOE_COMBINE_MAX_ELEMENTS", 2 * 70 * 8 * 64 - 1)
+                _identical(block(prefill), expected[0])
+                assert not combines
+            switch = vlm if native is vlm_qwen else lm
+            sort = switch._gather_sort
+            with monkeypatch.context() as rebound:  # a pinned helper replaced after the scope resolved it
+                rebound.setattr(switch, "_gather_sort", lambda *a: sort(*a))
+                _identical(block(prefill), expected[0])
+            block.switch_mlp.gate_proj.scales = block.switch_mlp.gate_proj.scales * 1.25  # the pack is now stale
+            stale = block(prefill)
+            assert not combines
+    _identical(stale, block(prefill))
+    fusion._moe_combine_verified.cache_clear()
+
+
+@contextlib.contextmanager
+def _routed(block):
+    with fusion.fused_moe_router(block), fusion.fused_moe_routed_experts(block):
+        yield
+
+
+def _expert_block(native, quantization, dtype, widths = (512, 512)):
+    mx.random.seed(23)
+    args = SimpleNamespace(hidden_size = widths[0], moe_intermediate_size = widths[1], num_experts = 32, num_experts_per_tok = 8,
+                           shared_expert_intermediate_size = 512, norm_topk_prob = True)
+    block = (vlm_qwen.Qwen3_5MoeSparseMoeBlock if native is vlm_qwen else lm_qwen.Qwen3NextSparseMoeBlock)(args)
+    block.set_dtype(dtype)
+    bits, mode, group_size = quantization
+    nn.quantize(block.switch_mlp, bits = bits, group_size = group_size, mode = mode)
+    nn.quantize(block, bits = 8, group_size = 32)
+    block.eval()
+    mx.eval(block.parameters())
+    return block
+
+
+@pytest.mark.parametrize("native", [vlm_qwen, lm_qwen])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+# (hidden, expert) widths: MLX runs qmv for a K its bit width's qmv_fast step does not divide (512 at 4 bits, 256 at 8),
+# here the down projection, gate/up, both, and neither at 8 bits.
+@pytest.mark.parametrize("quantization, widths", [((8, "affine", 64), (512, 512)), ((4, "affine", 32), (512, 512)), ((4, "mxfp4", 32), (512, 512)),
+                                                  ((4, "nvfp4", 16), (512, 512)), ((4, "affine", 32), (512, 640)), ((4, "affine", 32), (640, 512)),
+                                                  ((8, "affine", 32), (640, 640)), ((6, "affine", 32), (640, 640)), ((2, "affine", 32), (640, 640)),
+                                                  ((8, "affine", 64), (768, 768))])
+def test_routed_experts_run_on_the_decode_kernels_bitwise(native, dtype, quantization, widths, monkeypatch):
+    block = _expert_block(native, quantization, dtype, widths)
+    # decode rows, the last row alone, and the first sorted width, whose 64 routes stay native
+    xs = [mx.random.normal((rows, 1, widths[0])).astype(dtype) for rows in (1, 7, 8)]
+    xs.insert(2, xs[1][6:])
+    expected = [block(x) for x in xs]
+    gathers = _counting_gather_qmm(monkeypatch)
+    router, routed = fusion.fused_moe_router, fusion.fused_moe_routed_experts
+    pack = fusion.fused_moe_gate_up  # the pack leaves strided expert views
+    for scopes in ((router,), (router, routed), (routed, router), (pack, router, routed), (router, routed, routed, pack)):
+        with contextlib.ExitStack() as stack:
+            for scope in scopes:
+                stack.enter_context(scope(block))
+            mx.eval(block(xs[0]))  # the first call verifies the kernels against the native experts
+            for x, out in zip(xs, expected):
+                gathers.clear()
+                _identical(block(x), out)
+                assert bool(gathers) is (routed not in scopes or x.shape[0] == 8)
+        assert "_unsloth_moe_routed" not in block.__dict__
+
+
+def test_verify_blocks_run_their_routed_experts_on_the_decode_kernels_bitwise(monkeypatch):
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward as native
+    block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
+    xs = [mx.random.normal(shape).astype(mx.bfloat16) for shape in ((2, 5, 512), (1, 9, 512))]
+    expected = [native()._feed_forward(block, x) for x in xs]
+    verifier = fusion._exact_verify_class(native, "verify", True, *(vars(native).get(name) for name in fusion._VERIFY_METHODS))()
+    monkeypatch.setattr(fusion, "_VERIFY_VERDICTS", {})
+    gathers, partitions = _counting_gather_qmm(monkeypatch), _counting_argpartition(monkeypatch)
+    with fusion.fused_moe_routed_experts(block):
+        for serving in (False, True):
+            monkeypatch.setattr(fusion._VERIFY_STATE, "serving", serving, raising = False)
+            for x, out in zip(xs, expected):
+                mx.eval(verifier._feed_forward(block, x))  # a served shape's first block is compared and returned native
+                gathers.clear()
+                partitions.clear()
+                _identical(verifier._feed_forward(block, x), out)
+                assert len(gathers) == (1 if serving else 4)  # mlx-vlm gathers for the shared gate, then per expert projection
+                assert bool(partitions) is not serving  # served blocks route in the fused router's launch
+        assert len(fusion._VERIFY_VERDICTS) >= 2 and all(fusion._VERIFY_VERDICTS.values())
+        block.switch_mlp.down_proj.unfreeze()
+        gathers.clear()
+        _identical(verifier._feed_forward(block, xs[0]), expected[0])
+        assert len(gathers) == 4
+        # A projection swapped for one the kernels were not built for takes the native call as well.
+        block.switch_mlp.down_proj = vlm.SwitchLinear(512, 512, 32, bias = False)
+        block.switch_mlp.down_proj.set_dtype(mx.bfloat16)
+        block.eval().freeze()
+        _identical(verifier._feed_forward(block, xs[0]), native()._feed_forward(block, xs[0]))
+
+
+def test_routed_experts_kill_switch_keeps_native(monkeypatch):
+    block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
+    x = mx.random.normal((2, 1, 512)).astype(mx.bfloat16)
+    expected = block(x)
+    gathers = _counting_gather_qmm(monkeypatch)
+    monkeypatch.setenv("UNSLOTH_MLX_ROUTED_EXPERTS", "0")
+    with _routed(block):
+        assert "_unsloth_moe_routed" not in block.__dict__
+        gathers.clear()
+        _identical(block(x), expected)
+        assert gathers
+
+
+@pytest.mark.parametrize("int8_prefill_first", [False, True])
+def test_routed_experts_run_under_the_int8_prefill_scope(int8_prefill_first, monkeypatch):
+    from unsloth_zoo.mlx import nax
+    block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
+    x = mx.random.normal((2, 1, 512)).astype(mx.bfloat16)
+    expected = block(x)
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
+    monkeypatch.setattr(nax, "_INT8_PREFILL_EXPERT_ROWS", {8: (8, 8)})
+    gathers = _counting_gather_qmm(monkeypatch)
+    scopes = [functools.partial(fusion.nax_quantized_linear, int8_prefill = True), _routed]
+    with contextlib.ExitStack() as stack:
+        for scope in scopes if int8_prefill_first else scopes[::-1]:
+            stack.enter_context(scope(block))
+        assert type(block.switch_mlp.down_proj).__name__.startswith("_NaxGather")
+        mx.eval(block(x))
+        gathers.clear()
+        _identical(block(x), expected)
+        assert not gathers
+
+
+class _Doubled(vlm.SwitchGLU):
+    def __call__(self, x, indices):
+        return super().__call__(x, indices) * 2
+
+
+@pytest.mark.parametrize("change", ["unverified", "rebound", "rebound_between_scopes", "override", "strided", "activation",
+                                    "combine_before", "combine", "combine_instance"])
+def test_routed_experts_keep_native_when_unverified_or_changed(change, monkeypatch):
+    block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
+    x = mx.random.normal((2, 1, 512)).astype(mx.bfloat16)
+    gathers = _counting_gather_qmm(monkeypatch)
+    monkeypatch.setattr(fusion, "_MOE_ROUTED_VERDICTS", {})
+    # compiled like the pinned one and equal on every probe input, so only its pinned body refuses it
+    clamped = functools.partial(mx.compile, shapeless = True)(lambda gate, x: nn.silu(mx.minimum(gate, 30)) * x)
+    rebind = lambda: monkeypatch.setattr(vlm, "swiglu", clamped)
+    combine = vlm.SwitchGLU.__dict__["_combine"].__func__
+    clamped_combine = staticmethod(lambda *a: mx.minimum(combine(*a), 1e4))  # equal on every probe input too
+    if change == "combine_before":  # a wrapper, whose source inspect reads as the original's
+        monkeypatch.setattr(vlm.SwitchGLU, "_combine", staticmethod(functools.wraps(combine)(clamped_combine.__func__)))
+    elif change == "unverified":
+        down = fusion._routed_down
+        monkeypatch.setattr(fusion, "_routed_down", lambda *a: down(*a) + 1)
+    elif change == "override":
+        block.switch_mlp.__class__ = _Doubled
+    elif change == "rebound_between_scopes":
+        with _routed(block):
+            mx.eval(block(x))  # verified with the pinned activation
+        rebind()
+    with _routed(block):
+        mx.eval(block(x))
+        if change == "rebound":
+            rebind()
+        elif change == "combine":
+            monkeypatch.setattr(vlm.SwitchGLU, "_combine", clamped_combine)
+        elif change == "combine_instance":
+            block.switch_mlp._combine = clamped_combine.__func__
+        elif change == "activation":
+            block.switch_mlp.activation = GeGLU()
+        elif change == "strided":  # after verification: only the layout check sees it
+            w = block.switch_mlp.down_proj.weight
+            block.switch_mlp.down_proj.weight = mx.broadcast_to(w[:, :1], w.shape)
+        gathers.clear()
+        fused = block(x)
+        assert gathers
+    _identical(fused, block(x))
+
+
+class _ScaledShared(vlm_qwen.Qwen3_5MoeSparseMoeBlock):
+    def _shared_expert_scale(self, x):
+        return 2 * super()._shared_expert_scale(x)
+
+
+@pytest.mark.parametrize("case", ["lm", "vlm", "vlm_override", "sigmoid_disagrees"])
+def test_shared_expert_gate_sigmoid_rides_on_the_routing_launch(case, monkeypatch):
+    block = _expert_block(lm_qwen if case == "lm" else vlm_qwen, (8, "affine", 64), mx.bfloat16)
+    if case == "vlm_override":
+        block.__class__ = _ScaledShared
+    # decode rows, and the first sorted width, which the routed-experts kernel leaves native
+    xs = [mx.random.normal((rows, 1, 512)).astype(mx.bfloat16) for rows in (1, 7, 8)]
+    expected = [block(x) for x in xs]
+    launches, run, skewed = [], fusion._run_moe_router, [case == "sigmoid_disagrees"]
+
+    def recording(*args):
+        out = run(*args)
+        launches.append(len(args) > 6)
+        return out[:2] + (out[2] + 1,) if skewed[0] and len(args) > 6 else out
+
+    monkeypatch.setattr(fusion, "_run_moe_router", recording)
+    fusion._moe_router_shared_verified.cache_clear()
+    try:
+        with _routed(block):
+            mx.eval(block(xs[0]))
+            for x, out in zip(xs, expected):
+                launches.clear()
+                _identical(block(x), out)
+                assert launches == [case in ("lm", "vlm") and x.shape[0] < 8]
+            skewed[0] = True  # past the probe, the folded scale is what scales the shared expert
+            assert mx.array_equal(block(xs[0]), expected[0]).item() is (case not in ("lm", "vlm"))
+    finally:
+        fusion._moe_router_shared_verified.cache_clear()
 
 
 @pytest.mark.parametrize("native", [vlm_gemma, lm_gemma])
@@ -619,7 +905,7 @@ def _unpinned_call(self, x):
 @pytest.mark.parametrize("reason", ["training", "top_k", "experts", "few_experts", "unpinned", "sharded", "no_kernel", "distributed"])
 def test_ineligible_modules_keep_native(reason, monkeypatch):
     module = (_router(vlm_gemma, experts = 4, top_k = 2) if reason == "few_experts"
-              else _block(lm_qwen, experts = 288 if reason == "experts" else 256, top_k = 10 if reason == "top_k" else 8))
+              else _block(lm_qwen, experts = 1056 if reason == "experts" else 256, top_k = 17 if reason == "top_k" else 8))
     base = type(module)
     if reason == "training":
         module.train()

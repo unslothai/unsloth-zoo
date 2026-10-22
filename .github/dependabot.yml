@@ -43,6 +43,15 @@ updates:
     open-pull-requests-limit: 5
     cooldown:
       default-days: 7
+    # transformers and datasets windows in pyproject.toml are hand-kept:
+    # the ceiling is the newest release the CEILING matrix ran, and every
+    # `!=` is a tested, rejected release. Dependabot rewrites the whole
+    # specifier (#1755 turned datasets into ">=4.0,<5.2", dropping the 3.x
+    # floor and readmitting 4.0.*, 4.1.0, 4.4.*, 4.5.0), and
+    # tests/test_published_version_window.py goes red. Move them by hand.
+    ignore:
+      - dependency-name: "transformers"
+      - dependency-name: "datasets"
     groups:
       python:
         patterns: ["*"]

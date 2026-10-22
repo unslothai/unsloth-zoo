@@ -720,6 +720,42 @@ def smart_nframes(
     return nframes
 
 
+def _read_video_pyav(video_path: str, start: float = 0.0, end: Union[float, None] = None):
+    """Frames in [start, end] seconds as a (T, C, H, W) uint8 tensor, plus {"video_fps": fps}.
+
+    What torchvision.io.read_video(pts_unit="sec", output_format="TCHW") returns, for PyAV
+    builds that torchvision can no longer open.
+    """
+    import av
+    import numpy as np
+
+    frames = []
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        rate = stream.average_rate or stream.guessed_rate
+        video_fps = float(rate) if rate else 0.0
+        if start and stream.time_base:
+            # Jump to the keyframe at or before `start`, as torchvision does, rather than
+            # decoding and discarding everything ahead of a late segment. The filter below
+            # still drops the frames between that keyframe and `start`.
+            try:
+                container.seek(int(start / stream.time_base), stream=stream, backward=True)
+            except av.error.FFmpegError:
+                container.seek(0, stream=stream)
+        for frame in container.decode(stream):
+            when = frame.time
+            if when is not None:
+                if when < (start or 0.0):
+                    continue
+                if end is not None and when > end:
+                    break
+            frames.append(frame.to_ndarray(format="rgb24"))
+    if not frames:
+        return torch.empty((0, 3, 0, 0), dtype=torch.uint8), {"video_fps": video_fps}
+    video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous()
+    return video, {"video_fps": video_fps}
+
+
 def _read_video_torchvision(
     ele: dict,
 ) -> tuple[torch.Tensor, float]:
@@ -733,13 +769,22 @@ def _read_video_torchvision(
         if "http://" in video_path or "https://" in video_path:
             warnings.warn("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
     st = time.time()
-    video, audio, info = io.read_video(
-        video_path,
-        start_pts=ele.get("video_start", 0.0),
-        end_pts=ele.get("video_end", None),
-        pts_unit="sec",
-        output_format="TCHW",
-    )
+    try:
+        video, audio, info = io.read_video(
+            video_path,
+            start_pts=ele.get("video_start", 0.0),
+            end_pts=ele.get("video_end", None),
+            pts_unit="sec",
+            output_format="TCHW",
+        )
+    except TypeError as exc:
+        # torchvision's read_video passes av.open(..., metadata_errors="ignore"), which PyAV 19
+        # removed, so every read fails before decoding. Decode the same range with PyAV directly.
+        if "metadata_errors" not in str(exc):
+            raise
+        video, info = _read_video_pyav(
+            video_path, ele.get("video_start", 0.0), ele.get("video_end", None)
+        )
     try:
         video_fps = info["video_fps"]
     except Exception as e:
@@ -997,6 +1042,84 @@ def collapse_fps(fps, tol=1e-4):
         return None
     f0 = vals[0]
     return float(f0) if all(math.isclose(v, f0, rel_tol=tol, abs_tol=tol) for v in vals[1:]) else vals
+
+
+def _video_metadata_support():
+    """(processor accepts video_metadata, rate is read from it rather than from fps=)."""
+    try:
+        from transformers.processing_utils import VideosKwargs
+        from transformers.video_utils import VideoMetadata
+    except Exception:
+        return False, False
+    takes = "video_metadata" in getattr(VideosKwargs, "__annotations__", {})
+    return takes, takes and hasattr(VideoMetadata, "sampled_fps")
+
+_PROCESSOR_TAKES_VIDEO_METADATA, _VIDEO_RATE_FROM_METADATA = _video_metadata_support()
+
+
+def _fixed_frame_count(video_processor):
+    """num_frames of a processor that samples exactly that many frames per clip (Gemma 4), else None.
+
+    Only the stock sampler honours num_frames; GLM4V and others override sample_frames and size
+    the clip by duration and fps, keeping num_frames as an unused default.
+    """
+    if not getattr(video_processor, "do_sample_frames", False):
+        return None
+    num_frames = getattr(video_processor, "num_frames", None)
+    if not num_frames:
+        return None
+    try:
+        from transformers.video_processing_utils import BaseVideoProcessor
+    except Exception:
+        return None
+    if getattr(type(video_processor), "sample_frames", None) is not BaseVideoProcessor.sample_frames:
+        return None
+    return int(num_frames)
+
+
+def video_processor_kwargs(processor, videos, fps):
+    """(videos, processor kwargs) carrying each video's sampling rate.
+
+    `videos` is one list of decoded videos per example (frames tensor or list of frames), `fps`
+    the matching flat list of sample rates. transformers 5 ignores `fps=` here and reads the rate
+    from `video_metadata` (else assumes 24 fps), which collapses Qwen2.5-VL temporal positions and
+    makes Qwen3-VL drop most frames; a list `fps=` is rejected outright.
+    Fixed-count samplers (Gemma 4, `num_frames=32`) cannot sample a shorter clip, so every clip
+    is resampled to that count here instead and the processor told not to resample.
+    """
+    flat = [v for per_example in videos for v in per_example]
+    fps = list(fps) if isinstance(fps, (list, tuple)) else ([fps] * len(flat) if fps is not None else [])
+    if not _PROCESSOR_TAKES_VIDEO_METADATA or len(fps) != len(flat):
+        return videos, {"fps": collapse_fps(fps)}
+    cap = _fixed_frame_count(getattr(processor, "video_processor", None))
+    metadata, new_videos, i = [], [], 0
+    for per_example in videos:
+        kept = []
+        for video in per_example:
+            n = int(video.shape[0]) if hasattr(video, "shape") else len(video)
+            indices = list(range(n))
+            if cap and n != cap:
+                # Every clip gets exactly cap frames (short ones repeat frames), as the
+                # processor stacks them into one tensor.
+                indices = torch.linspace(0, n - 1, cap).round().long().tolist()
+                video = video[indices] if hasattr(video, "shape") else [video[j] for j in indices]
+            rate = float(fps[i])
+            i += 1
+            metadata.append({
+                "total_num_frames": n,
+                "fps": rate,
+                "duration": n / rate if rate > 0 else None,
+                "frames_indices": indices,
+            })
+            kept.append(video)
+        new_videos.append(kept)
+    kwargs = {"video_metadata": metadata}
+    if not _VIDEO_RATE_FROM_METADATA:
+        # transformers 4.x Qwen2.5-VL still takes the rate from fps= and ignores the metadata
+        kwargs["fps"] = collapse_fps(fps)
+    if cap:
+        kwargs["do_sample_frames"] = False
+    return new_videos, kwargs
 
 
 def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List[Dict]:
@@ -1541,6 +1664,7 @@ class UnslothVisionDataCollator:
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
         "_seen_supervised", "_warned_unsupervised", "audio_call_kwarg",
+        "chat_template_kwargs",
     )
 
     def __init__(
@@ -1563,6 +1687,8 @@ class UnslothVisionDataCollator:
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
+        chat_template_kwargs = None,
+        mask_out_tokens = None, # e.g. ["</think>"]: see train_on_responses_only
     ):
         has_images = getattr(processor, "image_processor", None) is not None or _processor_takes_images(processor)
         audio_call_kwarg = _audio_call_kwarg(processor)
@@ -1589,6 +1715,7 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
         self.completion_only_loss = completion_only_loss
@@ -1681,6 +1808,7 @@ class UnslothVisionDataCollator:
                 return_function    = True,
                 num_proc           = num_proc,
                 last_response_only = last_response_only,
+                mask_out_tokens    = mask_out_tokens,
             )
         else:
             self.train_on_responses_only = None
@@ -1699,6 +1827,13 @@ class UnslothVisionDataCollator:
         if self.padding_token_ids.device != device:
             self.padding_token_ids = self.padding_token_ids.to(device)
         return self.padding_token_ids
+
+    def _apply_chat_template(self, messages, example = None, **kwargs):
+        # Per-row chat_template_kwargs override the collator's, as in the text path (dataset_utils).
+        row_kwargs = example.get("chat_template_kwargs") if isinstance(example, dict) else None
+        return self.processor.apply_chat_template(
+            messages, **{**(getattr(self, "chat_template_kwargs", None) or {}), **(row_kwargs or {}), **kwargs},
+        )
 
     def __call__(self, examples):
         batch = self._collate(examples)
@@ -1738,8 +1873,9 @@ class UnslothVisionDataCollator:
                     messages = self._collapse_assistant_content(messages)
                 messages = self._clean_none_keys(messages)
 
-            message = self.processor.apply_chat_template(
+            message = self._apply_chat_template(
                 messages,
+                example = example,
                 tokenize = False,
                 add_generation_prompt = False,
             )
@@ -1779,10 +1915,9 @@ class UnslothVisionDataCollator:
         if has_images:
             proc_kwargs["images"] = images
         if videos:
+            videos, extra = video_processor_kwargs(self.processor, videos, video_kwargs["fps"])
             proc_kwargs["videos"] = videos
-            video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
-            for k, v in video_kwargs.items():
-                proc_kwargs[k] = v
+            proc_kwargs.update(extra)
         if audios:
             proc_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
         if self.pad_to_multiple_of is not None:
@@ -1952,9 +2087,9 @@ class UnslothVisionDataCollator:
                         message["content"] = content[0]["text"]
         return messages
 
-    def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False):
-        return self.processor.apply_chat_template(
-            prompt_messages + (completion_messages or []), tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
+    def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False, example=None):
+        return self._apply_chat_template(
+            prompt_messages + (completion_messages or []), example=example, tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
         )
 
     def _load_column_images(self, images):
@@ -2267,18 +2402,28 @@ class UnslothVisionDataCollator:
 
         return new_attn, new_ids, tuple(new_extras)
 
+    @staticmethod
+    def _left_truncation_index(lengths, L, max_len):
+        # Keep each row's start like TRL; [-max_len:] cut the prompt and its image tokens.
+        starts = L - lengths.clamp(min=max_len)
+        return starts.unsqueeze(1) + torch.arange(max_len, device=lengths.device)
+
     def _truncate_by_side(self, input_ids, attention_mask, completion_mask, side, max_len, token_type_ids=None):
         _, L = input_ids.shape
         if L <= max_len:
             return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
-        sl = slice(-max_len, None) if side == "left" else slice(0, max_len)
+        if side == "left":
+            idx = self._left_truncation_index(attention_mask.sum(-1), L, max_len)
+            take = lambda t: torch.gather(t, 1, idx)
+        else:
+            take = lambda t: t[:, :max_len]
 
-        input_ids       = input_ids[:, sl]
-        attention_mask  = attention_mask[:, sl]
-        completion_mask = completion_mask[:, sl]
+        input_ids       = take(input_ids)
+        attention_mask  = take(attention_mask)
+        completion_mask = take(completion_mask)
 
         if token_type_ids is not None:
-            token_type_ids = token_type_ids[:, sl]
+            token_type_ids = take(token_type_ids)
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
     def _raise_if_truncation_cut_media(self, before, after, pad_id):
@@ -2348,7 +2493,7 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     self._collapse_assistant_content(p)
                 p = self._clean_none_keys(p)
-                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False)
+                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False, example=ex)
             else:
                 p_txt = str(p)
 
@@ -2357,7 +2502,7 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     self._collapse_assistant_content(c)
                 c = self._clean_none_keys(c)
-                pc_txt = self._render_chat(prompt_messages=p, completion_messages=c)
+                pc_txt = self._render_chat(prompt_messages=p, completion_messages=c, example=ex)
                 # some models append common template items so this removes them.
                 # see trl/data_utils.py
                 p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
@@ -2402,10 +2547,9 @@ class UnslothVisionDataCollator:
         if pc_has_images:
             prompt_kwargs["images"] = images
         if len(videos) > 0:
+            videos, extra = video_processor_kwargs(self.processor, videos, video_kwargs["fps"])
             prompt_kwargs["videos"] = videos
-            video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
-            for k, v in video_kwargs.items():
-                prompt_kwargs[k] = v
+            prompt_kwargs.update(extra)
         if audios:
             prompt_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
 
@@ -2473,9 +2617,15 @@ class UnslothVisionDataCollator:
         if cross_mask is not None:
             cross_mask = torch.cat((cross_mask, cross_mask[:, -1:].expand(-1, c_ids.shape[1], *cross_mask.shape[2:])), dim=1)
             _, _, (cross_mask,) = self._flush_to_side(*pre_flush, flush_side, pad_id, (cross_mask,))
-            if cross_mask.shape[1] > input_ids.shape[1]:
-                cross_mask = cross_mask[:, -input_ids.shape[1]:] if flush_side == "left" else cross_mask[:, :input_ids.shape[1]]
-            elif cross_mask.shape[1] < input_ids.shape[1]:
+            max_len = self.max_seq_length
+            if max_len is not None and cross_mask.shape[1] > max_len:
+                # Same rows as _truncate_by_side, or the mask shifts against input_ids.
+                if flush_side == "left":
+                    idx = self._left_truncation_index(pre_flush[0].sum(-1), cross_mask.shape[1], max_len)
+                    cross_mask = cross_mask[torch.arange(cross_mask.shape[0], device = idx.device).unsqueeze(1), idx]
+                else:
+                    cross_mask = cross_mask[:, :max_len]
+            if cross_mask.shape[1] < input_ids.shape[1]:
                 fill = cross_mask.new_zeros((cross_mask.shape[0], input_ids.shape[1] - cross_mask.shape[1], *cross_mask.shape[2:]))
                 cross_mask = torch.cat((fill, cross_mask) if flush_side == "left" else (cross_mask, fill), dim=1)
 

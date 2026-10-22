@@ -34,11 +34,8 @@ def _is_float8_tensor(tensor: Optional[torch.Tensor]) -> bool:
 
 
 def _get_fp8_dequant_target_dtype(hidden_states: torch.Tensor) -> torch.dtype:
-    if hidden_states.dtype in (torch.float32, torch.float16, torch.bfloat16):
-        return hidden_states.dtype
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
+    from .moe_utils import moe_compute_dtype
+    return moe_compute_dtype(hidden_states)
 
 
 def _log_moe_fp8_backend_once(experts_module, message: str):
@@ -52,55 +49,69 @@ def _log_moe_fp8_backend_once(experts_module, message: str):
     _log_info(message)
 
 
-def _check_torch_scaled_grouped_mm_supported():
-    global _TORCH_SCALED_GROUPED_MM_SUPPORTED
+def _probe_torch_scaled_grouped_mm(device_index: int) -> bool:
+    try:
+        with torch.cuda.device(device_index):
+            device = torch.device("cuda", device_index)
+            x = torch.randn((16, 16), device=device, dtype=torch.bfloat16)
+            w_hp = torch.randn((1, 16, 16), device=device, dtype=torch.bfloat16)
+            x_fp8, x_scale = _manual_fp8_rowwise_quantize(x)
+            w_fp8, w_scale = _manual_fp8_rowwise_quantize(w_hp.view(-1, w_hp.shape[-1]))
+            w_fp8 = w_fp8.view_as(w_hp)
+            w_fp8 = _make_grouped_mm_rhs_column_major(w_fp8)
+            w_scale = w_scale.view(w_hp.shape[0], w_hp.shape[1])
+            offs = torch.tensor([16], device=device, dtype=torch.int32)
+            torch._scaled_grouped_mm(
+                x_fp8.contiguous(),
+                w_fp8,
+                x_scale.contiguous(),
+                w_scale.contiguous(),
+                offs=offs,
+                out_dtype=torch.bfloat16,
+                use_fast_accum=True,
+            )
+            torch.cuda.synchronize(device)
+        return True
+    except Exception:
+        return False
+
+
+# Per device index: a multi-GPU device_map keeps current_device() at cuda:0 while operands live elsewhere.
+_TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE = {}
+
+
+def _check_torch_scaled_grouped_mm_supported(device=None):
+    # Non-None module value = forced answer.
     if _TORCH_SCALED_GROUPED_MM_SUPPORTED is not None:
         return _TORCH_SCALED_GROUPED_MM_SUPPORTED
 
     if not _TORCH_SCALED_GROUPED_MM_AVAILABLE:
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
     if not torch.cuda.is_available():
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
+    if device is not None:
+        device = torch.device(device)
+        if device.type != "cuda":
+            return False
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+    else:
+        device_index = torch.cuda.current_device()
 
-    # The symbol can exist on unsupported GPUs, and the light probe can still
-    # pass on SM100 while real MoE kernels later emit incompatible MMA
-    # instructions and poison the CUDA context asynchronously. Restrict the
-    # FP8 scaled_grouped_mm path to Hopper (SM 9.x) only for now.
-    major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    supported = _TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE.get(device_index)
+    if supported is not None:
+        return supported
+
+    # Hopper only: on SM100 the probe passes but real MoE kernels emit bad MMA and poison the CUDA context.
+    major, _minor = torch.cuda.get_device_capability(device_index)
     if major != 9:
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
-        return False
+        supported = False
     # Opt-in until validated end to end on Hopper (the probe never passed before the rhs layout fix).
-    if os.environ.get("UNSLOTH_FP8_SCALED_GROUPED_MM", "0") != "1":
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
-        return False
-
-    try:
-        device = torch.cuda.current_device()
-        x = torch.randn((16, 16), device=device, dtype=torch.bfloat16)
-        w_hp = torch.randn((1, 16, 16), device=device, dtype=torch.bfloat16)
-        x_fp8, x_scale = _manual_fp8_rowwise_quantize(x)
-        w_fp8, w_scale = _manual_fp8_rowwise_quantize(w_hp.view(-1, w_hp.shape[-1]))
-        w_fp8 = w_fp8.view_as(w_hp)
-        w_fp8 = _make_grouped_mm_rhs_column_major(w_fp8)
-        w_scale = w_scale.view(w_hp.shape[0], w_hp.shape[1])
-        offs = torch.tensor([16], device=device, dtype=torch.int32)
-        torch._scaled_grouped_mm(
-            x_fp8.contiguous(),
-            w_fp8,
-            x_scale.contiguous(),
-            w_scale.contiguous(),
-            offs=offs,
-            out_dtype=torch.bfloat16,
-            use_fast_accum=True,
-        )
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = True
-        torch.cuda.synchronize(device)
-    except Exception:
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
-    return _TORCH_SCALED_GROUPED_MM_SUPPORTED
+    elif os.environ.get("UNSLOTH_FP8_SCALED_GROUPED_MM", "0") != "1":
+        supported = False
+    else:
+        supported = _probe_torch_scaled_grouped_mm(device_index)
+    _TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE[device_index] = supported
+    return supported
 
 
 def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
@@ -185,10 +196,12 @@ def _dequantize_expert_slice(
         return expert_weight.to(target_dtype)
 
     w = expert_weight.to(target_dtype)
+    # FP16 flushes small scales: multiply in FP32, mul_ rounds once into w.
+    scale_dtype = torch.float32 if target_dtype == torch.float16 else target_dtype
 
     # Per-tensor scale
     if s.numel() == 1:
-        return w * s.view(1, 1).to(target_dtype)
+        return w.mul_(s.view(1, 1).to(scale_dtype))
 
     if s.ndim == 1:
         s = s.view(-1, 1)
@@ -205,10 +218,10 @@ def _dequantize_expert_slice(
             s = s.repeat_interleave(repeat_factor, dim=0)
 
         if w.shape[0] == s.shape[0]:
-            return w * s.to(target_dtype)
+            return w.mul_(s.to(scale_dtype))
         elif w.shape[1] == s.shape[0]:
-            return (w.t() * s.to(target_dtype)).t()
-        return w * s.to(target_dtype)
+            return w.t().mul_(s.to(scale_dtype)).t()
+        return w.mul_(s.to(scale_dtype))
 
     # Block scale: (ceil(m/bm), ceil(n/bn)) — expand to weight shape
     if s.ndim == 2:
@@ -229,11 +242,14 @@ def _dequantize_expert_slice(
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
 
-        s_expanded = s.to(target_dtype).repeat_interleave(bm, dim=0)[:M].repeat_interleave(bn, dim=1)[:, :N]
-        return w * s_expanded
+        s_expanded = s.to(scale_dtype).repeat_interleave(bm, dim=0)[:M].repeat_interleave(bn, dim=1)[:, :N]
+        return w.mul_(s_expanded)
 
     return expert_weight.to(target_dtype)
 
+
+# Budget for one chunk's temporaries in the block-scaled vectorized dequant (converted weight + expanded scale).
+_VECTORIZED_DEQUANT_CHUNK_BYTES = 256 * 1024 * 1024
 
 def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state, target_dtype: torch.dtype,) -> Optional[torch.Tensor]:
     """Dequantize all experts in one batched op."""
@@ -245,50 +261,58 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
     E, M, N = weight.shape
     s = quant_state
 
-    w = weight.to(target_dtype)
+    # FP16 flushes small scales: multiply in FP32 and round once into the target dtype.
+    scale_dtype = torch.float32 if target_dtype == torch.float16 else target_dtype
 
     # Per-tensor scalar
     if s.numel() == 1:
-        return w * s.to(target_dtype).view(1, 1, 1)
+        return weight.to(target_dtype).mul_(s.to(scale_dtype).view(1, 1, 1))
 
     # 3D block scales: (E, ceil(M/bm), ceil(N/bn))
     if s.ndim == 3 and s.shape[0] == E:
         block_size = getattr(weight, "block_size", None) or getattr(s, "block_size", None)
         p, q = s.shape[1], s.shape[2]
         if p == 1 and q == 1:
-            # One scale per expert already broadcasts over (E, M, N). Expanding
-            # it first allocates a second full-size tensor: +4.00 GiB measured
-            # on the (128, 4096, 4096) Mistral-Small-4-119B layout, on top of
-            # the 8 GiB the converted weight and the result already need.
-            return w * s.to(target_dtype)
+            # One scale per expert already broadcasts over (E, M, N).
+            return weight.to(target_dtype).mul_(s.to(scale_dtype))
         if block_size is not None and len(block_size) == 2:
             bm, bn = block_size
         else:
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
-        # Expand block scales (E, p, q) -> (E, p*bm, q*bn), trim to (E, M, N)
-        s_expanded = (
-            s.to(target_dtype)
-            .repeat_interleave(bm, dim=1)[:, :M, :]
-            .repeat_interleave(bn, dim=2)[:, :, :N]
-        )
-        return w * s_expanded
+        # Chunk over experts: whole-stack expansion peaked at 3x the dequantized size.
+        out = torch.empty((E, M, N), dtype=target_dtype, device=weight.device)
+        # A chunk holds the converted weight and the expanded scale (FP32 when the target is FP16).
+        per_expert = M * N * (out.element_size() + torch.finfo(scale_dtype).bits // 8)
+        step = max(1, _VECTORIZED_DEQUANT_CHUNK_BYTES // max(per_expert, 1))
+        for e0 in range(0, E, step):
+            e1 = min(E, e0 + step)
+            s_expanded = (
+                s[e0:e1].to(scale_dtype)
+                .repeat_interleave(bm, dim=1)[:, :M, :]
+                .repeat_interleave(bn, dim=2)[:, :, :N]
+            )
+            # In place, not mul(out=): autograd rejects out= when the scale requires grad (FP8Experts parameters).
+            out[e0:e1].copy_(weight[e0:e1]).mul_(s_expanded)
+        return out
+
+    w = weight.to(target_dtype)
 
     # 2D per-row scales: (E, M) or (E, 1)
     if s.ndim == 2 and s.shape[0] == E:
         if s.shape[1] == 1:
-            return w * s.to(target_dtype).unsqueeze(-1)
+            return w.mul_(s.to(scale_dtype).unsqueeze(-1))
         if s.shape[1] == M:
-            return w * s.to(target_dtype).unsqueeze(-1)
+            return w.mul_(s.to(scale_dtype).unsqueeze(-1))
         if s.shape[1] == N:
-            return w * s.to(target_dtype).unsqueeze(1)
+            return w.mul_(s.to(scale_dtype).unsqueeze(1))
 
     # 1D: single per-row scale shared across experts
     if s.ndim == 1:
         if s.shape[0] == M:
-            return w * s.to(target_dtype).view(1, -1, 1)
+            return w.mul_(s.to(scale_dtype).view(1, -1, 1))
         if s.shape[0] == N:
-            return w * s.to(target_dtype).view(1, 1, -1)
+            return w.mul_(s.to(scale_dtype).view(1, 1, -1))
 
     return None
 
@@ -309,6 +333,13 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
     try:
         from unsloth.kernels.fp8 import weight_dequant_block
     except ImportError:
+        return None
+    try:
+        from unsloth.kernels.fp8 import _fp8_kernel_unsupported
+    except ImportError:
+        _fp8_kernel_unsupported = None
+    # fp8e4nv does not compile on pre-sm89 CUDA, nor on most AMD archs with triton < 3.5 (unsloth's guard).
+    if _fp8_kernel_unsupported is not None and _fp8_kernel_unsupported(weight):
         return None
 
     E, M, N = weight.shape
@@ -642,7 +673,7 @@ def _expand_grouped_bias(bias, num_tokens_per_expert):
 
 
 def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights):
-    if not _check_torch_scaled_grouped_mm_supported():
+    if not _check_torch_scaled_grouped_mm_supported(hidden_states.device):
         return None
     # No backward for _scaled_grouped_mm; training (incl. reentrant GC's no_grad forward) must match the dequant recompute.
     if torch.is_grad_enabled() or self.training:
@@ -659,13 +690,9 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
 
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.view(-1, hidden_dim)
-    flat_top_k = top_k_index.view(-1)
-    from .moe_utils import count_tokens_per_expert
-    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
-    sorted_indices = torch.argsort(flat_top_k, stable=True)
-    token_indices = sorted_indices // top_k_index.shape[-1]
-    permuted_input = hidden_states[token_indices]
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    from .moe_utils import gather_routed_rows, moe_routing_sort
+    num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
+    permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
     from .moe_utils import (
         _should_use_separated_lora,
         combine_permuted_moe_outputs,
@@ -866,7 +893,10 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         elif _is_float8_tensor(expert_gate_up):
             target_dtype = _get_fp8_dequant_target_dtype(current_state)
             expert_dequant = _dequantize_expert_slice(expert_gate_up, gate_up_qstate, target_dtype)
-            gate_up_out = F.linear(current_state, expert_dequant, gate_up_bias_expert)
+            gate_up_out = F.linear(
+                current_state.to(target_dtype), expert_dequant,
+                None if gate_up_bias_expert is None else gate_up_bias_expert.to(target_dtype),
+            )
         else:
             gate_up_out = F.linear(current_state, expert_gate_up, gate_up_bias_expert)
 
@@ -900,7 +930,10 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         elif _is_float8_tensor(expert_down):
             target_dtype = _get_fp8_dequant_target_dtype(current_hidden_states)
             expert_dequant = _dequantize_expert_slice(expert_down, down_qstate, target_dtype)
-            current_hidden_states = F.linear(current_hidden_states, expert_dequant, down_bias_expert)
+            current_hidden_states = F.linear(
+                current_hidden_states.to(target_dtype), expert_dequant,
+                None if down_bias_expert is None else down_bias_expert.to(target_dtype),
+            )
         else:
             current_hidden_states = F.linear(current_hidden_states, expert_down, down_bias_expert)
 
@@ -908,6 +941,91 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(input_dtype))
 
     return final_hidden_states.view(original_shape)
+
+
+def _release_dequantized_banks_until_backward(output, inputs, banks):
+    """Free the BF16 dequantization of frozen FP8 experts between forward and backward.
+
+    The experts get no gradient, but the input gradient needs the dequantized weights, which the
+    backends keep (saved tensors, recompute closures, views), so every MoE layer would hold a BF16 copy
+    of its experts until backward: the memory FP8 was loaded to save. The storage is emptied after
+    forward and refilled from the FP8 weights + scales just before this call's backward (a prehook on
+    the node producing `output`), then emptied again once the input gradient exists. Every holder keeps
+    the same storage, and the values are bit-identical because the same dequantization runs again.
+    """
+    if not torch.is_grad_enabled() or not isinstance(output, torch.Tensor) or output.grad_fn is None:
+        return
+    # A forward inside backward is a checkpoint recompute: releasing would only re-dequantize.
+    _graph_task_id = getattr(torch._C, "_current_graph_task_id", None)
+    if _graph_task_id is not None and _graph_task_id() != -1:
+        return
+    # Non-reentrant checkpointing recomputes banks (refill would hold two); torch < 2.8 cannot detect it, so keep.
+    _top_hooks = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+    if _top_hooks is None:
+        return
+    hooks = _top_hooks(False)
+    if hooks is not None and getattr(hooks[0], "__qualname__", "").startswith("_checkpoint_hook"):
+        return
+    tracked = []
+    for dequantized, base, quant, quant_kind in banks:
+        if (
+            dequantized is None or base is None or getattr(base, "requires_grad", False)
+            or dequantized.requires_grad or not dequantized.is_contiguous()
+            or dequantized.storage_offset() != 0 or dequantized.data_ptr() == base.data_ptr()
+        ):
+            continue
+        storage = dequantized.untyped_storage()
+        tracked.append((dequantized, storage, storage.nbytes(), base, quant, quant_kind))
+    if not tracked:
+        return
+
+    keep = []  # set once a backward builds a higher-order graph that saves the refilled banks
+
+    def free():
+        if keep:
+            return
+        for _, storage, _, _, _, _ in tracked:
+            storage.resize_(0)
+
+    def refill(*args):
+        # Grad mode in backward means create_graph=True: the new graph keeps these banks anyway.
+        if torch.is_grad_enabled():
+            keep.append(True)
+        with torch.no_grad():
+            for dequantized, storage, nbytes, base, quant, quant_kind in tracked:
+                if storage.nbytes() == nbytes:
+                    continue
+                storage.resize_(nbytes)
+                # .data: a fresh version counter, so the refill does not count as an in-place edit
+                target = dequantized.data
+                # Slices drop the block_size attribute; without it a non-128-aligned dim infers another block.
+                block_size = getattr(base, "block_size", None) or getattr(quant, "block_size", None)
+                step = max(1, base.shape[0] // 8)  # bounded transient: an eighth of the bank at a time
+                for start in range(0, base.shape[0], step):
+                    end = min(start + step, base.shape[0])
+                    piece_base = base[start:end]
+                    # Per-expert scales follow the chunk; scalar / 1-D shared scales do not.
+                    expert_indexed = isinstance(quant, torch.Tensor) and quant.ndim >= 2 and quant.shape[0] == base.shape[0]
+                    piece_quant = quant[start:end] if expert_indexed else quant
+                    if block_size is not None:
+                        _try_attach_block_size(piece_base, block_size)
+                        if isinstance(piece_quant, torch.Tensor): _try_attach_block_size(piece_quant, block_size)
+                    piece = _dequantize_full_expert_weights(piece_base, piece_quant, target.dtype, quant_kind = quant_kind)
+                    target[start:end].copy_(piece)
+                    del piece
+        # Fallback free at backward end: the input hook never runs for frozen / pruned inputs.
+        torch.autograd.Variable._execution_engine.queue_callback(free)
+        return None
+
+    def release(grad):
+        free()
+        return None
+
+    input_hooked = isinstance(inputs, torch.Tensor) and inputs.requires_grad
+    output.grad_fn.register_prehook(refill)
+    if input_hooked:
+        inputs.register_hook(release)
+    free()
 
 
 def _fp8_experts_own_gate(module) -> bool:
@@ -952,7 +1070,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     backend = select_moe_backend()
 
     # 1. _scaled_grouped_mm (fast FP8 path on Hopper/Blackwell)
-    if backend == "grouped_mm" and _check_torch_scaled_grouped_mm_supported():
+    if backend == "grouped_mm" and _check_torch_scaled_grouped_mm_supported(hidden_states.device):
         scaled_grouped_mm_output = _forward_scaled_grouped_mm_fp8(
             self,
             hidden_states,
@@ -985,15 +1103,25 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-native_torch loop.")
             forward_fn = forward_native_moe_loop
 
-        return swap_moe_weights_for_call(
+        expert_inputs = hidden_states.to(target_dtype)
+        output = swap_moe_weights_for_call(
             self,
             gate_up_weight,
             down_weight,
             forward_fn,
-            hidden_states.to(target_dtype),
+            expert_inputs,
             top_k_index,
             top_k_weights,
         )
+        # Caller's dtype back, as the eager experts' index_add_ into zeros_like(hidden_states).
+        if isinstance(output, torch.Tensor) and output.dtype != hidden_states.dtype:
+            output = output.to(hidden_states.dtype)
+        _release_dequantized_banks_until_backward(
+            output, expert_inputs,
+            ((gate_up_weight, gate_up_base, gate_up_quant, gate_up_qkind),
+             (down_weight, down_base, down_quant, down_qkind)),
+        )
+        return output
 
     # 3. Last resort: per-expert fp8_linear loop
     _log_moe_fp8_backend_once(

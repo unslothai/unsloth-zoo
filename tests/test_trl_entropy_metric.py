@@ -46,6 +46,7 @@ draft of this patch keyed on the two messages and would have fixed one trl
 version while missing the other.
 """
 
+import inspect
 import sys
 from pathlib import Path
 
@@ -222,6 +223,10 @@ def test_it_patches_the_module_the_caller_actually_reads(patched):
     be a no-op for the one caller that matters."""
     trl_utils, sft, _ = patched
     assert getattr(trl_utils.entropy_from_logits, "_unsloth_patched", False)
+    if not hasattr(sft, "entropy_from_logits"):
+        # trl 1.15 takes the entropy from its fused LM head and no longer imports the helper.
+        assert "entropy_from_logits" not in inspect.getsource(sft.SFTTrainer.compute_loss)
+        pytest.skip("this trl's SFTTrainer does not call entropy_from_logits")
     assert getattr(sft.entropy_from_logits, "_unsloth_patched", False)
 
 

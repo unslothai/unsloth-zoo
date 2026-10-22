@@ -199,6 +199,42 @@ def test_mask_is_plain_band_survives_id_reuse():
         del packed
 
 
+@pytest.mark.parametrize("dtype", [torch.bool, torch.float32])
+def test_mask_is_plain_band_rechecks_after_inplace_edit(dtype):
+    # A cached True verdict must not survive an in-place edit (directly or via a view).
+    S, w = 128, 32
+    band = _band_mask_full(S, w)
+    mask = (band if dtype == torch.bool else torch.where(band, 0.0, float("-inf")))[None, None].clone()
+    blocked = False if dtype == torch.bool else float("-inf")
+    assert _mask_is_plain_band(mask, S, w)
+    mask[..., 64:, 40:64] = blocked
+    assert not _mask_is_plain_band(mask, S, w)
+    mask.copy_(band[None, None].to(dtype) if dtype == torch.bool
+               else torch.where(band, 0.0, float("-inf"))[None, None])
+    assert _mask_is_plain_band(mask, S, w)
+    mask[0, 0][100, 90] = blocked                            # edit through a view
+    assert not _mask_is_plain_band(mask, S, w)
+
+
+def test_mask_is_plain_band_rechecks_other_window():
+    S = 128
+    mask = _band_mask_full(S, 32)[None, None].clone()
+    assert _mask_is_plain_band(mask, S, 32)
+    assert not _mask_is_plain_band(mask, S, 16)
+
+
+def test_mask_is_plain_band_inference_tensor_cached_per_window(monkeypatch):
+    # No version counter: one scan per (S, w), not one per sliding layer.
+    S, w = 128, 32
+    with torch.inference_mode():
+        mask = _band_mask_full(S, w)[None, None].clone()
+        assert _mask_is_plain_band(mask, S, w)
+        monkeypatch.setattr(torch, "arange", lambda *a, **k: pytest.fail("rescanned"))
+        assert _mask_is_plain_band(mask, S, w)
+        monkeypatch.undo()
+        assert not _mask_is_plain_band(mask, S, 16)
+
+
 class Gemma4SlidingFake:
     """Minimal stand-in for a Gemma-4 sliding-window attention module.
 

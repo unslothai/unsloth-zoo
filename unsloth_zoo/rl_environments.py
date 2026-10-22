@@ -34,10 +34,15 @@ import importlib
 import types
 import __future__
 import builtins as _py_builtins
+import unicodedata
 import os, gc, time, statistics
 import collections
+import io
+import pickle
+import itertools
 import numpy as np
 import signal
+import contextlib
 from contextlib import contextmanager
 from functools import wraps
 import threading
@@ -512,17 +517,29 @@ _SAFE_IMPORT_MODULES = frozenset({
 #     3.14. Denied on every version; 3.13 reaches it only via private
 #     _evaluate, which the private-attribute rule already covers.
 #   mutators -- time.clock_settime(_ns) sets the host clock given the
-#     privilege a root container has. Read-only clocks stay.
+#     privilege a root container has. Read-only clocks stay. enum.global_enum
+#     copies members into sys.modules[cls.__module__], which the functional
+#     API lets the caller name (module="builtins").
 _DENIED_MODULE_ATTRS = frozenset({
     "functools.update_wrapper",
     "functools.wraps",
     "time.clock_settime",
     "time.clock_settime_ns",
+    "enum.global_enum",
     "operator.attrgetter",
     "operator.methodcaller",
     "typing.ForwardRef",
     "typing.evaluate_forward_ref",
     "typing.get_type_hints",
+    # register() runs get_type_hints on string annotations.
+    "functools.singledispatch",
+    "functools.singledispatchmethod",
+})
+
+# `case int(x)` binds the subject; other positional patterns getattr __match_args__ names.
+_SELF_MATCHING_TYPES = frozenset({
+    "bool", "bytearray", "bytes", "dict", "float", "frozenset", "int", "list",
+    "set", "str", "tuple",
 })
 
 # Attributes that walk the interpreter's own object graph. None of these start
@@ -540,6 +557,9 @@ _DENIED_ATTR_NAMES = frozenset({
     "gi_code", "gi_frame", "gi_running", "gi_yieldfrom",
     "tb_frame", "tb_lasti", "tb_lineno", "tb_next",
 })
+# 3.14 ForwardRef.evaluate runs its string with the real builtins; denied only where it exists.
+if sys.version_info >= (3, 14):
+    _DENIED_ATTR_NAMES = _DENIED_ATTR_NAMES | {"evaluate"}
 
 # Dunder methods a generated helper class may define. A method name is
 # FunctionDef.name, not a Name or Attribute node, so the walk below cannot see
@@ -664,6 +684,105 @@ _MATCH_CLASS_NODES = tuple(
 )
 
 
+def _annotation_nodes(node):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        arguments = node.args
+        params = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                  arguments.vararg, arguments.kwarg]
+        yield from (p.annotation for p in params if p is not None and p.annotation is not None)
+        if node.returns is not None:
+            yield node.returns
+    elif isinstance(node, ast.AnnAssign):
+        yield node.annotation
+
+
+_TYPING_MODULES = frozenset({"typing", "typing_extensions"})
+
+
+# Missing on older Pythons (match 3.10+, PEP 695 3.12+): an empty tuple matches nothing.
+def _ast_nodes(*names):
+    return tuple(node for node in (getattr(ast, name, None) for name in names) if node is not None)
+
+
+_NAMED_BINDING_NODES = _ast_nodes("MatchAs", "MatchStar", "TypeVar", "ParamSpec", "TypeVarTuple")
+_MATCH_MAPPING_NODES = _ast_nodes("MatchMapping")
+
+
+def _bound_names(tree):
+    # Bound names, plus the Literal / typing names only real typing imports bind.
+    bound, literal_names, typing_names = set(), {"Literal"}, set(_TYPING_MODULES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) or (
+            _NAMED_BINDING_NODES and isinstance(node, _NAMED_BINDING_NODES)
+        ):
+            if node.name:
+                bound.add(node.name)
+        elif _MATCH_MAPPING_NODES and isinstance(node, _MATCH_MAPPING_NODES):
+            if node.rest:
+                bound.add(node.rest)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _TYPING_MODULES:
+                    typing_names.add(alias.asname or alias.name)
+                else:
+                    bound.add(alias.asname or alias.name.partition(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if node.module in _TYPING_MODULES and alias.name == "Literal":
+                    literal_names.add(alias.asname or alias.name)
+                else:
+                    bound.add(alias.asname or alias.name)
+    return bound, literal_names - bound, typing_names - bound
+
+
+# Quoted names that resolve to a real builtin or module the code could not name itself.
+_UNSAFE_FORWARD_REFS = frozenset(dir(_py_builtins)) | frozenset(
+    getattr(sys, "stdlib_module_names", ())
+) | frozenset(sys.builtin_module_names) | frozenset(
+    name.partition(".")[0] for name in list(sys.modules)
+)
+
+
+def _is_plain_forward_ref(value):
+    # One name lookup, never code; NFKC first, as the compiler folds "ｅｖａｌ" to "eval".
+    value = unicodedata.normalize("NFKC", value)
+    return (
+        value.isidentifier() and not value.startswith("_")
+        and value not in _UNSAFE_FORWARD_REFS
+    )
+
+
+def _annotation_strings(annotation, literal_names, typing_names):
+    # Literal["W"] values and plain forward refs ("Matrix") are never run as code.
+    stack = [annotation]
+    while stack:
+        sub = stack.pop()
+        if isinstance(sub, ast.Subscript) and (
+            (isinstance(sub.value, ast.Name) and sub.value.id in literal_names)
+            or (isinstance(sub.value, ast.Attribute) and sub.value.attr == "Literal"
+                and isinstance(sub.value.value, ast.Name)
+                and sub.value.value.id in typing_names)
+        ):
+            # Only the Literal's own string values are exempt; anything nested is still scanned.
+            values = sub.slice.elts if isinstance(sub.slice, ast.Tuple) else [sub.slice]
+            stack.extend(
+                v for v in values if not (isinstance(v, ast.Constant) and isinstance(v.value, str))
+            )
+            continue
+        if (
+            isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+            and not _is_plain_forward_ref(sub.value)
+        ):
+            yield sub
+        stack.extend(ast.iter_child_nodes(sub))
+
+
 def _reject_dunder_access(tree):
     """
     Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
@@ -671,6 +790,7 @@ def _reject_dunder_access(tree):
     included) using only attribute access. Generated code has no reason to touch
     dunders, so refuse them outright.
     """
+    bindings = None
     for node in ast.walk(tree):
         # Definition names are strings on the node, invisible to the Name and
         # Attribute checks below, so they get their own fail-closed rule.
@@ -689,6 +809,14 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )
+        # Annotations are strings here; anything evaluating them runs text the walk saw as a literal.
+        for annotation in _annotation_nodes(node):
+            if bindings is None:
+                bindings = _bound_names(tree)
+            for _ in _annotation_strings(annotation, *bindings[1:]):
+                raise RuntimeError(
+                    "String annotations are not allowed in generated code."
+                )
         # Two for names: a bare `_` or `_total` local is ordinary and reaches
         # nothing on its own.
         if isinstance(node, ast.Name) and node.id.startswith("__"):
@@ -699,6 +827,16 @@ def _reject_dunder_access(tree):
         # kwd_attrs is the only identifier-as-string field that READS an attribute;
         # every other one merely binds, and the Name rule above refuses the read.
         if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
+            if node.patterns and bindings is None:
+                bindings = _bound_names(tree)
+            # A rebound `int = K` is no longer the builtin, so it gets no exemption.
+            if node.patterns and not (
+                isinstance(node.cls, ast.Name) and node.cls.id in _SELF_MATCHING_TYPES
+                and node.cls.id not in bindings[0]
+            ):
+                raise RuntimeError(
+                    "Positional class patterns are only allowed on builtin types in generated code."
+                )
             for attr in (node.kwd_attrs or []):
                 if attr.startswith("_") or attr in _DENIED_ATTR_NAMES:
                     raise RuntimeError(
@@ -789,6 +927,10 @@ def create_locked_down_function(function, *, builtins_policy: str = "allowlist")
     # parameter recently, but the attribute is writable on every version we
     # support. Without it `def f(x, *, k = 1)` loses k and raises TypeError.
     locked.__kwdefaults__ = f.__kwdefaults__
+    # Full builtins can reach signal itself, so only a separate process bounds them.
+    if builtins_policy == "full" or _catches_everything(ast.parse(function)):
+        # The id keeps each instance's globals separate in the helper, as they are in-process.
+        locked._unsloth_catch_all = (function, builtins_policy, next(_catch_all_ids))
     return locked
 pass
 
@@ -802,6 +944,31 @@ def _retry_eintr(func, *args):
                 continue
             raise
 pass
+
+# Raising in these frames would skip time_limit's teardown.
+_CONTEXTMANAGER_FRAMES = frozenset((
+    contextlib._GeneratorContextManager.__enter__.__code__,
+    contextlib._GeneratorContextManager.__exit__.__code__,
+))
+# After the deadline SIGALRM re-fires at this period until the body unwinds.
+_TIME_LIMIT_REFIRE_S = 0.01
+# Cleanup still unwinding the first timeout gets this long before re-fires raise.
+_TIME_LIMIT_CLEANUP_GRACE_S = 1.0
+
+class _TimeLimitExceeded(BaseException):
+    # Re-fires raise this so `except Exception` cannot catch it; time_limit converts it.
+    pass
+
+def _timeout_unwinding():
+    # A timeout still unwinding through finally / except / __exit__: let that cleanup run.
+    exc = sys.exc_info()[1]
+    for _ in range(32):
+        if exc is None:
+            return False
+        if isinstance(exc, (TimeoutError, _TimeLimitExceeded)):
+            return True
+        exc = exc.__context__
+    return False
 
 @contextmanager
 def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
@@ -831,10 +998,23 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
     deadline = seconds if prev_remaining <= 0.0 else min(seconds, prev_remaining)
 
     fired = False  # set by our handler
+    fired_at = 0.0
+    stopping = False
 
     def _handler(signum, frame):
-        nonlocal fired
+        nonlocal fired, fired_at
+        if stopping:
+            return
+        # Re-fire until the body unwinds: a one-shot alarm is lost once generated code swallows it.
+        signal.setitimer(signal.ITIMER_REAL, _TIME_LIMIT_REFIRE_S)
+        if frame is not None and frame.f_code in _CONTEXTMANAGER_FRAMES:
+            return
+        if fired:
+            if _timeout_unwinding() and time.monotonic() - fired_at < _TIME_LIMIT_CLEANUP_GRACE_S:
+                return
+            raise _TimeLimitExceeded()
         fired = True
+        fired_at = time.monotonic()
         # include the intended arming deadline for debugging
         raise TimeoutError(f"Timed out after {deadline:g}s")
 
@@ -850,7 +1030,10 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
 
         _retry_eintr(signal.setitimer, signal.ITIMER_REAL, deadline)
         yield
+    except _TimeLimitExceeded:
+        raise TimeoutError(f"Timed out after {deadline:g}s") from None
     finally:
+        stopping = True
         # Make teardown atomic wrt SIGINT and robust to EINTR
         old_sigint = signal.getsignal(signal.SIGINT)
         try:
@@ -947,6 +1130,183 @@ pass
 
 _VALID_START_METHODS = frozenset({"fork", "spawn", "forkserver"})
 
+# Handler names that provably cannot catch the re-fires' BaseException subclass.
+_NARROW_EXCEPTIONS = frozenset(
+    name for name, value in vars(_py_builtins).items()
+    if isinstance(value, type) and issubclass(value, Exception)
+)
+
+def _catches_everything(tree):
+    bound = _bound_names(tree)[0]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler):
+            names = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
+            if not all(isinstance(n, ast.Name) and n.id in _NARROW_EXCEPTIONS and n.id not in bound for n in names):
+                return True
+        elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
+            if node.finalbody:  # can return / continue, or raise something an outer handler eats
+                return True
+        elif isinstance(node, (ast.With, ast.AsyncWith)):  # __exit__ can return True, even one built by type()
+            return True
+    return False
+pass
+
+# A fresh interpreter, not a fork: forking a process holding a model costs ~100 ms each way and pins its pages.
+_CATCH_ALL_HELPER = """
+import importlib.util, sys
+from multiprocessing.connection import Connection
+spec = importlib.util.spec_from_file_location("_unsloth_rl_sandbox", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._catch_all_helper_main(Connection(int(sys.argv[2]), writable = False), Connection(int(sys.argv[3]), readable = False))
+"""
+
+_catch_all_ids = itertools.count()
+_DEFERRED_BODY = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
+
+def _runs_in_helper(value):
+    # Async and generator functions return an object without running their body, so they stay in-process.
+    return (
+        getattr(value, "_unsloth_catch_all", None) is not None
+        and not (value.__code__.co_flags & _DEFERRED_BODY)
+    )
+pass
+
+# (process, request conn, reply conn, owner pid); replaced only after a timeout kills it.
+_catch_all_helper = None
+
+# The helper can write any bytes to the reply pipe: rebuild only plain data (pickle's "Restricting Globals").
+_INERT_GLOBALS = _NARROW_EXCEPTIONS | {"complex", "set", "frozenset", "bytearray", "range", "slice"}
+
+class _InertUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "builtins" and name in _INERT_GLOBALS:
+            return getattr(_py_builtins, name)
+        raise pickle.UnpicklingError(f"Unsloth: strategy helper replied with {module}.{name}")
+pass
+
+def _inert_loads(data):
+    return _InertUnpickler(io.BytesIO(data)).load()
+pass
+
+def _send_inert(conn, reply):
+    try:
+        data = pickle.dumps(reply)
+        _inert_loads(data)
+    except Exception as e:
+        data = pickle.dumps((False, RuntimeError(
+            f"Unsloth: a strategy may only return or raise plain data and builtin exceptions: {e!r}"
+        )))
+    conn.send_bytes(data)
+pass
+
+def _catch_all_helper_main(requests_conn, replies_conn):
+    _send_inert(replies_conn, None)  # ready: imports done, so the first call is not charged for them
+    compiled = collections.OrderedDict()
+    while True:
+        try:
+            (source, policy, key), args, kwargs = requests_conn.recv()
+        except (EOFError, OSError):
+            return
+        try:
+            fn = compiled.get(key)
+            if fn is None:
+                if len(compiled) >= 256:
+                    compiled.popitem(last = False)
+                fn = compiled[key] = create_locked_down_function(source, builtins_policy = policy)
+            else:
+                compiled.move_to_end(key)
+            reply = (True, fn(*args, **kwargs))
+        except BaseException as e:
+            reply = (False, e)
+        _send_inert(replies_conn, reply)
+pass
+
+def _stop_catch_all_helper():
+    global _catch_all_helper
+    helper, _catch_all_helper = _catch_all_helper, None
+    if helper is None or helper[3] != os.getpid():
+        return
+    process, requests_conn, replies_conn, _ = helper
+    process.kill()
+    process.wait()
+    requests_conn.close()
+    replies_conn.close()
+pass
+
+def _ensure_catch_all_helper():
+    global _catch_all_helper
+    helper = _catch_all_helper
+    if helper is not None and helper[3] == os.getpid() and helper[0].poll() is None:
+        return True
+    _stop_catch_all_helper()
+    from multiprocessing.connection import Connection
+    request_r, request_w = os.pipe()
+    reply_r, reply_w = os.pipe()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _CATCH_ALL_HELPER, os.path.abspath(__file__), str(request_r), str(reply_w)],
+            pass_fds = (request_r, reply_w), stdin = subprocess.DEVNULL,
+        )
+    except (OSError, ValueError):  # ValueError: pass_fds on Windows
+        for fd in (request_r, request_w, reply_r, reply_w):
+            os.close(fd)
+        return False
+    os.close(request_r)
+    os.close(reply_w)
+    _catch_all_helper = (process, Connection(request_w, readable = False), Connection(reply_r, writable = False), os.getpid())
+    try:
+        if _catch_all_helper[2].poll(60):
+            _inert_loads(_catch_all_helper[2].recv_bytes())
+            return True
+    except (EOFError, OSError, pickle.UnpicklingError):
+        pass
+    _stop_catch_all_helper()
+    return False
+pass
+
+def _call_in_catch_all_helper(fn, deadline, seconds, args, kwargs):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"Timed out after {seconds:g}s")
+    try:
+        if not _ensure_catch_all_helper():
+            raise RuntimeError("Unsloth: could not restart the strategy helper process")
+        _, requests_conn, replies_conn, _ = _catch_all_helper
+        requests_conn.send((fn._unsloth_catch_all, args, kwargs))
+        if not replies_conn.poll(max(deadline - time.monotonic(), 0.0)):
+            raise TimeoutError(f"Timed out after {seconds:g}s")
+        ok, value = _inert_loads(replies_conn.recv_bytes())
+    except BaseException:
+        # Interrupted mid-call, its next reply would answer the wrong request.
+        _stop_catch_all_helper()
+        raise
+    if not ok:
+        raise value
+    return value
+pass
+
+def _stop_generated_code_at_deadline(value, deadline, seconds):
+    # Generated code can swallow the TimeoutError raised inside it; re-raise it in the caller.
+    if not (isinstance(value, types.FunctionType) and value.__code__.co_filename == "<user_code>"):
+        return value
+    # Code that may absorb any exception runs in the killable helper (in-process if none started).
+    if _runs_in_helper(value) and _catch_all_helper is not None:
+        @wraps(value)
+        def in_helper(*args, **kwargs):
+            return _call_in_catch_all_helper(value, deadline, seconds, args, kwargs)
+        return in_helper
+
+    @wraps(value)
+    def guarded(*args, **kwargs):
+        if time.monotonic() < deadline:
+            result = value(*args, **kwargs)
+            if time.monotonic() < deadline:
+                return result
+        raise TimeoutError(f"Timed out after {seconds:g}s")
+    return guarded
+pass
+
 def execute_with_time_limit(
     seconds: float,
     *,
@@ -997,6 +1357,11 @@ def execute_with_time_limit(
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
             if effective_backend == "signal":
+                if any(_runs_in_helper(v) for v in (*args, *kwargs.values())):
+                    _ensure_catch_all_helper()  # started before the clock, not on the strategy's time
+                deadline = time.monotonic() + seconds
+                args = tuple(_stop_generated_code_at_deadline(a, deadline, seconds) for a in args)
+                kwargs = {k: _stop_generated_code_at_deadline(v, deadline, seconds) for k, v in kwargs.items()}
                 with time_limit(seconds):
                     return func(*args, **kwargs)
             elif effective_backend == "process":

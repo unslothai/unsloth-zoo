@@ -2,6 +2,7 @@
   "_comment": "Call sites that predate the gate. New ones fail; see scripts/lint_exec_literals.py.",
   "targets": [
     "unsloth_zoo",
+    "unsloth_zoo_downloads",
     "scripts"
   ],
   "entries": [
@@ -330,13 +331,6 @@
     {
       "file": "unsloth_zoo/peft_utils.py",
       "sink": "exec",
-      "digest": "9c8c2a17a2a67b45",
-      "count": 1,
-      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
-    },
-    {
-      "file": "unsloth_zoo/peft_utils.py",
-      "sink": "exec",
       "digest": "d467bcd0b437db95",
       "count": 1,
       "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
@@ -452,6 +446,20 @@
       "digest": "32809b4ed10761d5",
       "count": 1,
       "reason": "Executes that compiled torch_forward in the remote module's own namespace; the source is the already-trusted remote method with the two literal substitutions above."
+    },
+    {
+      "file": "unsloth_zoo/vllm_gdn_replayssm.py",
+      "sink": "compile",
+      "digest": "9934852d2076b955",
+      "count": 1,
+      "reason": "vLLM's own installed method source (inspect.getsource), changed only by the fixed literal fragments in _LAYER_SOURCE_EDITS, each required to match exactly once; any mismatch returns None before compile, so no other text reaches exec."
+    },
+    {
+      "file": "unsloth_zoo/vllm_gdn_replayssm.py",
+      "sink": "exec",
+      "digest": "311123857fe38e74",
+      "count": 1,
+      "reason": "vLLM's own installed method source (inspect.getsource), changed only by the fixed literal fragments in _LAYER_SOURCE_EDITS, each required to match exactly once; any mismatch returns None before compile, so no other text reaches exec."
     },
     {
       "file": "unsloth_zoo/vllm_utils.py",

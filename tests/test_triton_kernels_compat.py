@@ -40,6 +40,8 @@ def _fake_package(name, complete = True, lazy_absolute = False):
     subs["tensor"] = tensor
     subs["swiglu"] = types.ModuleType(name + ".swiglu")
     subs["routing"] = types.ModuleType(name + ".routing")
+    for attr in ("routing", "RoutingData", "GatherIndx", "ScatterIndx"):
+        setattr(subs["routing"], attr, object())
     details = types.ModuleType(name + ".tensor_details")
     details.__path__ = []
     subs["tensor_details"] = details
@@ -54,6 +56,8 @@ def _fake_package(name, complete = True, lazy_absolute = False):
 @pytest.fixture
 def fresh(monkeypatch):
     monkeypatch.setattr(tkc, "_MODULE", tkc._UNRESOLVED)
+    monkeypatch.setattr(tkc, "_BACKENDS", {})
+    monkeypatch.delenv("UNSLOTH_TRITON_KERNELS_SOURCE", raising = False)
     monkeypatch.setattr(tkc, "_DEVICE_OK", {})
     for key in [k for k in sys.modules if k == "triton_kernels" or k.startswith("triton_kernels.")]:
         monkeypatch.delitem(sys.modules, key)
@@ -119,6 +123,8 @@ def test_self_check_failure_is_cached_false(fresh):
         calls.append(device)
         raise RuntimeError("launch failed")
     fresh.setattr(tkc, "_self_check", boom)
+    # A cell that is allowed to probe (sm_12x + release/3.6.x is rejected before probing, see the native gate tests).
+    fresh.setattr(tkc, "native_mxfp4_matmul_ok", lambda device, backend: True)
     dev = "cuda:0" if torch.cuda.is_available() else "cpu"
     assert tkc.matmul_ogs_available(dev) is False
     assert tkc.matmul_ogs_available(dev) is False
@@ -129,7 +135,9 @@ def test_self_check_failure_is_cached_false(fresh):
 def test_real_self_check_matches_exact_dequant_and_leaves_patch_gpt_oss_alone(fresh):
     if tkc.get_triton_kernels() is None:
         pytest.skip("no triton_kernels build (top-level or vLLM's) in this environment")
-    assert tkc.matmul_ogs_available("cuda") is True
+    device = torch.device("cuda", torch.cuda.current_device())
+    # sm_12x + release/3.6.x is rejected up front (its matmul trips opt_flags there), everything else self-checks True.
+    assert tkc.matmul_ogs_available("cuda") is tkc.native_mxfp4_matmul_ok(device, tkc.get_triton_kernels_backend())
     assert "triton_kernels" not in sys.modules or importlib.util.find_spec("triton_kernels") is not None
     from unsloth_zoo.temporary_patches.gpt_oss import _check_triton_kernels_available
     assert _check_triton_kernels_available() == (importlib.util.find_spec("triton_kernels") is not None)

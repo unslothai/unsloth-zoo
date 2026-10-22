@@ -30,73 +30,6 @@ from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, m
 
 transformers_version = Version(importlib_version("transformers"))
 
-# UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels);
-# otherwise weights dequantize to bf16 for LoRA training.
-UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
-
-
-def _check_triton_kernels_available():
-    """Check if OpenAI's triton_kernels package is available for MXFP4."""
-    try:
-        from triton_kernels import matmul_ogs, swiglu
-        return True
-    except ImportError:
-        return False
-
-
-_TRITON_KERNELS_AVAILABLE = None
-def is_triton_kernels_available():
-    """Cached check for triton_kernels availability."""
-    global _TRITON_KERNELS_AVAILABLE
-    if _TRITON_KERNELS_AVAILABLE is None:
-        _TRITON_KERNELS_AVAILABLE = _check_triton_kernels_available()
-    return _TRITON_KERNELS_AVAILABLE
-
-
-def should_dequantize_mxfp4():
-    """Whether MXFP4 should be dequantized to bf16 for training.
-
-    True unless UNSLOTH_MXFP4_NO_DEQUANTIZE="1" and triton_kernels is available.
-    """
-    if not UNSLOTH_MXFP4_NO_DEQUANTIZE:
-        return True  # Default: dequantize for compatibility
-
-    if not is_triton_kernels_available():
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.warning(
-                "Unsloth: UNSLOTH_MXFP4_NO_DEQUANTIZE=1 but triton_kernels not available. "
-                "Will dequantize MXFP4 to bf16."
-            )
-        return True  # triton_kernels required for native MXFP4
-
-    return False  # Keep MXFP4 quantized
-
-
-def get_mxfp4_config_for_training():
-    """Return the Mxfp4Config for training (dequantize=True unless
-    UNSLOTH_MXFP4_NO_DEQUANTIZE=1 and triton_kernels is available).
-
-    Usage:
-        model = AutoModelForCausalLM.from_pretrained(
-            "unsloth/gpt-oss-20b",
-            quantization_config=get_mxfp4_config_for_training(),
-        )
-    """
-    try:
-        from transformers import Mxfp4Config
-    except ImportError:
-        raise ImportError("transformers.Mxfp4Config not available. Please upgrade transformers.")
-
-    dequantize = should_dequantize_mxfp4()
-
-    if UNSLOTH_ENABLE_LOGGING:
-        if dequantize:
-            logger.info("Unsloth: MXFP4 will be dequantized to bf16 for training")
-        else:
-            logger.info("Unsloth: MXFP4 weights will remain quantized (triton_kernels available)")
-
-    return Mxfp4Config(dequantize=dequantize)
-
 _LOAD_OFFLOADS = [False]
 
 
@@ -153,11 +86,11 @@ def keep_mxfp4_experts_packed() -> bool:
         return False
     try:
         # Only grouped_mm reads experts through _get_base_weight; loop and Triton index the stack.
-        from .moe_utils import select_moe_backend
+        from .moe_utils import select_moe_backend_for_interleaved_gate_up
         import transformers.models.gpt_oss.modeling_gpt_oss as modeling_gpt_oss
         if not getattr(modeling_gpt_oss.GptOssExperts, "_unsloth_lora_patched", False):
             return False
-        if select_moe_backend() != "grouped_mm":
+        if select_moe_backend_for_interleaved_gate_up() != "grouped_mm":
             return False
     except Exception:
         return False
@@ -503,7 +436,8 @@ def patch_convert_moe_packed_tensors():
         if not blocks.is_cuda and torch.cuda.is_available():
             blocks = blocks.cuda()
             scales = scales.cuda()
-        if blocks.is_cuda and blocks.dtype == torch.uint8 and dtype in (torch.bfloat16, torch.float16):
+        # mxfp4_dequantize needs 16-byte (32-value) blocks; any other block size takes the loop below.
+        if blocks.is_cuda and blocks.dtype == torch.uint8 and blocks.shape[-1] == 16 and dtype in (torch.bfloat16, torch.float16):
             return mxfp4_dequantize(blocks, scales, dtype = dtype)
 
         scales = scales.to(torch.int32) - 127
