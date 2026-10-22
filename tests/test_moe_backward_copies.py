@@ -383,3 +383,30 @@ def test_expert_bias_gather_chunks_bound_one_hot(monkeypatch):
     want = torch.zeros(E, D, dtype = torch.float64, device = "cuda").index_add_(0, ids, g.double())
     assert bias.grad.dtype == DT
     assert _rel(bias.grad, want) < 4e-3, _rel(bias.grad, want)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks = pytest.mark.skipif(not CUDA, reason = "needs CUDA"))])
+def test_expert_bias_gather_grad_stays_fp32_under_fp16_autocast(device):
+    """fp32 biases under fp16 autocast: the per-expert sum (131072 here) must not round to fp16 and overflow."""
+    E, D, M = 4, 8, 128
+    ids = torch.zeros(M, dtype = torch.long, device = device)
+    bias = torch.zeros(E, D, device = device, requires_grad = True)
+    g = torch.full((M, D), 1024.0, device = device)
+    with torch.autocast(device_type = device, dtype = torch.float16):
+        out = mu._gather_expert_bias(bias, ids)
+        out.backward(g)
+    assert bias.grad.dtype == torch.float32
+    assert torch.isfinite(bias.grad).all(), bias.grad
+    assert torch.equal(bias.grad[0], torch.full((D,), float(M * 1024), device = device))
+    assert torch.equal(bias.grad[1:], torch.zeros(E - 1, D, device = device))
+
+    if device == "cuda":
+        # Compiled backward replays the forward's autocast state ("same_as_forward" on torch 2.11+).
+        torch._dynamo.reset()
+        bias.grad = None
+        f = torch.compile(lambda b, i: mu._gather_expert_bias(b, i).float(), fullgraph = True)
+        with torch.autocast(device_type = device, dtype = torch.float16):
+            out = f(bias, ids)
+        out.backward(g)
+        assert torch.isfinite(bias.grad).all(), bias.grad
+        assert torch.equal(bias.grad[0], torch.full((D,), float(M * 1024), device = device))
