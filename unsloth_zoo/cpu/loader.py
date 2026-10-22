@@ -132,18 +132,26 @@ class FastCPUModel:
         if quantization_config is not None:
             # Only when set: an explicit None also discards a pre-quantized checkpoint's own config.
             kwargs["quantization_config"] = quantization_config
+        load_kwargs = dict(
+            dtype = dtype,
+            device_map = "cpu",
+            attn_implementation = attn_implementation or "sdpa",
+            token = token,
+            revision = revision,
+            trust_remote_code = trust_remote_code,
+        )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                dtype = dtype,
-                device_map = "cpu",
-                attn_implementation = attn_implementation or "sdpa",
-                token = token,
-                revision = revision,
-                trust_remote_code = trust_remote_code,
-                **kwargs,
-            )
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
+            except RuntimeError as error:
+                # bitsandbytes' CPU packing rejects very narrow layers (hidden size < 64).
+                if quantization_config is None:
+                    raise
+                _print(f"bitsandbytes 4-bit failed on CPU ({error}), loading 16-bit weights instead.")
+                kwargs.pop("quantization_config", None)
+                use_4bit = False
+                model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
         tokenizer = AutoTokenizer.from_pretrained(
             model_name, token = token, revision = revision, trust_remote_code = trust_remote_code,
             model_max_length = max_seq_length, padding_side = "right",
