@@ -10474,8 +10474,12 @@ class FastMLXModel:
                 linear_to_lora_layers(
                     lm, num_layers,
                     {**lora_config, "keys": language_lora_keys,
-                     "layer_keys": language_layer_keys}, dry_run=True,
+                     "layer_keys": language_layer_keys,
+                     "qat_scheme": qat_scheme}, dry_run=True,
                 )
+            if qat_scheme not in (None, False) and not language_lora_keys:
+                from .qat import validate_mlx_qat_targets
+                validate_mlx_qat_targets((), qat_scheme)
 
             # Scopes embedding_learning_rate to exactly these tensors.
             model._unsloth_cpt_full_module_weight_keys = (
@@ -10625,7 +10629,8 @@ class FastMLXModel:
 
         if qat_scheme not in (None, False):
             from .qat import apply_mlx_qat
-            apply_mlx_qat(model)
+            # Text-only VLMs: only the validated language tower is simulated.
+            apply_mlx_qat(model.language_model if is_vlm else model)
 
         # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):

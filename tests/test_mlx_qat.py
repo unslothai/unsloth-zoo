@@ -199,6 +199,34 @@ def test_refused_requests_leave_the_model_untouched(kwargs, error, make):
     assert [k for k, _ in tree_flatten(model.trainable_parameters())] == [k for k, _ in before]
 
 
+def _text_only_vlm(quantized=True):
+    # A text model loaded through mlx-vlm: get_peft_model takes the VLM branch.
+    model = nn.Module()
+    model.language_model = _tiny_llama(quantized)
+    model.config = type("C", (), {"hidden_size": 128})()
+    model._is_vlm_model = True
+    model._unsloth_text_only_vlm = True
+    return model
+
+
+@pytest.mark.parametrize("kwargs,make", [
+    ({"qat_scheme": "int8"}, _text_only_vlm),
+    ({}, lambda: _text_only_vlm(quantized=False)),
+], ids=["bit mismatch", "unquantized base"])
+def test_text_only_vlm_is_validated_before_mutation(kwargs, make):
+    model = make()
+    with pytest.raises(ValueError):
+        _peft(model, **kwargs)
+    assert not any(isinstance(m, LoRALinear) for _, m in model.named_modules())
+    assert tree_flatten(model.trainable_parameters())
+
+
+def test_text_only_vlm_trains_the_language_tower_with_qat():
+    model = _peft(_text_only_vlm())
+    patched = [n for n, m in model.named_modules() if getattr(m, "_unsloth_mlx_qat_active", False)]
+    assert len(patched) == 14 and all(n.startswith("language_model.") for n in patched)
+
+
 def test_vlm_is_refused(monkeypatch):
     from unsloth_zoo.mlx import utils
     monkeypatch.setattr(utils, "_is_vlm_model", lambda model: True)
