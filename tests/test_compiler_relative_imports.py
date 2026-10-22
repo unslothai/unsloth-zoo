@@ -56,3 +56,18 @@ def test_the_real_musicgen_init_resolves():
             module = line[len("from ") :].split(" import ")[0]
             assert not module.startswith(".")
             importlib.import_module(module)
+
+
+def test_rnn_modules_are_not_compiled():
+    """Dynamo refuses nn.LSTM (EnCodec's EncodecLSTM inside MusicGen), so such modules stay eager."""
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "unsloth_zoo" / "compiler.py").read_text(encoding = "utf-8")
+    pattern = "(?:LSTM|GRU|RNN)" in source
+    assert pattern and "+ rnn_modules" in source
+    transformers = pytest.importorskip("transformers")
+    lstm = getattr(transformers.models.encodec.modeling_encodec, "EncodecLSTM", None)
+    if lstm is None:
+        pytest.skip("transformers has no EnCodec")
+    assert re.search(r"\bnn\.(?:LSTM|GRU|RNN)\(", inspect.getsource(lstm))

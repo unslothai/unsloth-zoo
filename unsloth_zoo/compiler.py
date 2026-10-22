@@ -6278,6 +6278,7 @@ def unsloth_compile_transformers(
     scaled_dot_product_attention_modules = []
     full_attention_modules = []
     router_logit_cast_modules = []
+    rnn_modules = []
 
     for module in torch_modules:
         source = eval(f"modeling_file.{module}")
@@ -6287,6 +6288,9 @@ def unsloth_compile_transformers(
             continue
         if "_gradient_checkpointing_func" in source:
             gradient_checkpointed_modules.append(module)
+        elif re.search(r"\bnn\.(?:LSTM|GRU|RNN)\(", source):
+            # Dynamo refuses to trace RNN modules (EnCodec's EncodecLSTM in MusicGen).
+            rnn_modules.append(module)
         elif (
             "scaled_dot_product_attention" in source
             or "ALL_ATTENTION_FUNCTIONS" in source
@@ -6310,6 +6314,7 @@ def unsloth_compile_transformers(
         scaled_dot_product_attention_modules
         + full_attention_modules
         + gradient_checkpointed_modules
+        + rnn_modules
     )
     torch_modules = [x for x in torch_modules if x not in removal]
 
