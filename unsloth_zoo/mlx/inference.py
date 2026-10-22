@@ -1460,6 +1460,7 @@ _QWEN4_DECODE_CONTRACT = {
     "mlx_vlm.models.qwen4_exp.language": {
         "Qwen4ExpBatchInvariantForward": None,
         "Qwen3_5BatchInvariantForward": None,
+        "Qwen4ExpGatedResidual": None,
         "Qwen4ExpRMSNorm": None,
         "Qwen4ExpBatchInvariantForward._hyper_connection": "0b22ede797c90e60",
         "Qwen4ExpRMSNorm.__call__": "b47a270c1b0eade5",
@@ -1740,13 +1741,15 @@ def fused_qwen4_decode(model, *, _modules = None):
                     _QWEN4_DECODE_BINDINGS[0] = _qwen4_bindings(_QWEN4_DECODE_CONTRACT)
                 # exact_batch_invariant_decode's class over the forward leaves a one-row `_linear` the native one.
                 # Matched by code object: a `functools.wraps` decorator would copy its names.
+                # A drifted forward without these methods keeps the native read rather than raising.
                 native_class = getattr(type(target), "_unsloth_verify_native", type(target))
-                linear = getattr(target._linear, "__func__", None)
+                linear = getattr(getattr(target, "_linear", None), "__func__", None)
                 sliced = next(c for c in _exact_verify_class.__wrapped__.__code__.co_consts
                               if getattr(c, "co_name", None) == "sliced_linear")
-                stock = (_QWEN4_DECODE_BINDINGS[0] is not None
-                         and type(target)._hyper_connection is language.Qwen4ExpBatchInvariantForward._hyper_connection
-                         and native_class._linear is language.Qwen3_5BatchInvariantForward._linear
+                stock = (_QWEN4_DECODE_BINDINGS[0] is not None and linear is not None
+                         and getattr(type(target), "_hyper_connection", None)
+                         is language.Qwen4ExpBatchInvariantForward._hyper_connection
+                         and getattr(native_class, "_linear", None) is language.Qwen3_5BatchInvariantForward._linear
                          and (linear is native_class._linear or getattr(linear, "__code__", None) is sliced))
                 seen = set()
                 for _, module in _fusion_modules(model, _modules) if stock else ():

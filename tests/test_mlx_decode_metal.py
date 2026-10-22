@@ -1464,3 +1464,19 @@ def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
     assert len(log) == {"differs": 2, "verified": 4}.get(reason, 0)
     assert ("differs from the version" in caplog.text) == (reason in ("body", "patched", "rebound"))
     assert caplog.text.count("differs from mlx-vlm's") == (reason == "differs")
+
+
+@_needs_qwen4
+@pytest.mark.parametrize("removed", ["residual", "linear"])
+def test_qwen4_decode_scope_stays_native_when_a_pinned_name_is_gone(removed, monkeypatch):
+    # A drifted mlx-vlm without one of these names fails the contract; opening the scope must not raise.
+    module, forward = _qwen4_read(), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
+    for name, value in (("_QWEN4_PREFILL_VERDICTS", {}), ("_QWEN4_DECODE_BINDINGS", [None]), ("_CONTRACT_MISSES", set())):
+        monkeypatch.setattr(decode, name, value)
+    if removed == "residual":
+        monkeypatch.delattr(qwen4, "Qwen4ExpGatedResidual")
+    else:
+        monkeypatch.delattr(next(c for c in type(forward).__mro__ if "_linear" in vars(c)), "_linear")
+    with decode.fused_qwen4_decode(module):
+        assert "_hyper_connection" not in vars(forward)
+        assert "_unsloth_qwen4_decode_plan" not in vars(module)
