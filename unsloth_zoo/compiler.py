@@ -2034,6 +2034,27 @@ def is_hub_kernel_wrapper(source):
 pass
 
 
+_RELATIVE_IMPORT = re.compile(r"^(\s*)from (\.+)([A-Za-z_][\w.]*)? import ", flags = re.MULTILINE)
+
+
+def _absolute_relative_imports(source, model_location):
+    """The generated module lives outside the transformers package, so a function-local
+    `from ..auto.modeling_auto import AutoModel` (MusicgenForConditionalGeneration.__init__)
+    must name its package: "attempted relative import with no known parent package" otherwise."""
+    if not isinstance(model_location, str) or "." not in model_location or "from ." not in source:
+        return source
+    package = model_location.rsplit(".", 1)[0]
+
+    def absolute(match):
+        try:
+            name = importlib.util.resolve_name(match.group(2) + (match.group(3) or ""), package)
+        except (ImportError, ValueError):
+            return match.group(0)
+        return f"{match.group(1)}from {name} import "
+    return _RELATIVE_IMPORT.sub(absolute, source)
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -2186,7 +2207,7 @@ def create_new_function(
             _valid_items = items  # Fall back to all items if module load fails
         if _valid_items:
             imports += f"from {model_location} import (" + ", ".join(_valid_items) + ")"
-    new_source = imports + "\n\n" + new_source
+    new_source = imports + "\n\n" + _absolute_relative_imports(new_source, model_location)
     # Check logger and remove use_cache
     if "logger" in items:
         new_source = new_source + "\n" + disble_use_cache_logging + "\n"
