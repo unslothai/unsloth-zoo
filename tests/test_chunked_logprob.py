@@ -247,10 +247,31 @@ def test_default_chunk_budget_shrinks_with_free_memory(monkeypatch):
 
     for free, want in ((0.25, 0.25), (64.0, cl._CHUNK_GB)):
         monkeypatch.setattr(tm, "_default_target_gb", lambda device = None, free = free: free)
-        cl._default_chunk_gb.cache_clear()
         assert cl._default_chunk_gb() == want
         assert cl.chunked_logprob_rows(1000) == cl.chunked_logprob_rows(1000, target_gb = want)
-    cl._default_chunk_gb.cache_clear()
+
+
+def test_default_chunk_budget_is_read_per_call(monkeypatch):
+    # A first call before the optimizer states exist must not size later chunks for memory that is gone.
+    import unsloth_zoo.tiled_mlp as tm
+
+    free = [64.0]
+    monkeypatch.setattr(tm, "_default_target_gb", lambda device = None: free[0])
+    assert cl._default_chunk_gb() == cl._CHUNK_GB
+    free[0] = 0.25
+    assert cl._default_chunk_gb() == 0.25
+
+
+def test_fp32_projection_reraises_oom(monkeypatch):
+    # An OOM in the fp32-output GEMM must surface, not fall back to half logits mixed with an fp32 lse.
+    def oom(*args, **kwargs):
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(cl, "_FP32_OUT_GEMM", True)
+    monkeypatch.setattr(torch, "mm", oom)
+    a = type("CudaLike", (), {"dtype": torch.bfloat16, "is_cuda": True})()
+    with pytest.raises(torch.OutOfMemoryError):
+        cl._mm_fp32(a, None)
 
 
 def test_chunk_budget_reads_the_head_device(monkeypatch):
@@ -258,10 +279,8 @@ def test_chunk_budget_reads_the_head_device(monkeypatch):
 
     seen = []
     monkeypatch.setattr(tm, "_default_target_gb", lambda device = None: seen.append(device) or 0.25)
-    cl._default_chunk_gb.cache_clear()
     dev = torch.device("cuda", 1)
     assert cl._default_chunk_gb(dev) == 0.25 and seen == [dev]
-    cl._default_chunk_gb.cache_clear()
 
 
 def test_forward_casts_the_head_once(monkeypatch):

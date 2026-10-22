@@ -48,7 +48,6 @@ _CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 2.0)
 _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 
 
-@functools.cache
 def _default_chunk_gb(device = None):
     try:
         from unsloth_zoo.tiled_mlp import _default_target_gb
@@ -151,6 +150,8 @@ def _mm_fp32(a, b):
     if _FP32_OUT_GEMM and a.dtype in (torch.float16, torch.bfloat16) and a.is_cuda:
         try:
             return torch.mm(a, b, out_dtype = torch.float32)
+        except torch.OutOfMemoryError:
+            raise
         except (TypeError, RuntimeError):
             pass
     return a @ b
@@ -167,6 +168,8 @@ def _project(hidden, weight, bias, compute_dtype, fp32_out = False):
         try:
             out = torch.mm(h, w.t(), out_dtype = torch.float32)
             return out if bias is None else out + bias.float()
+        except torch.OutOfMemoryError:
+            raise
         except (TypeError, RuntimeError):
             pass
     if bias is None:
