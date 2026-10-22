@@ -164,6 +164,29 @@ def test_capture_on_a_non_current_operand_device_does_not_probe(monkeypatch):
     assert mg._asm_ok(1) == 2
 
 
+def test_capture_on_either_device_defers_the_probe(monkeypatch):
+    # Capturing on the current GPU or on the operand's GPU: both must defer (the probe syncs).
+    import contextlib
+    import unsloth_zoo.mxfp4_gemm as mg
+    monkeypatch.setenv("UNSLOTH_MXFP4_CVT", "1")
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = None: (10, 0))
+    current = {"index": 0}
+
+    @contextlib.contextmanager
+    def device(index):
+        previous, current["index"] = current["index"], index
+        try:
+            yield
+        finally:
+            current["index"] = previous
+
+    monkeypatch.setattr(torch.cuda, "device", device)
+    for capturing in (0, 1):
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda c = capturing: current["index"] == c)
+        assert mg._cvt_ok(1) is None, capturing
+
+
 def test_cold_compiled_region_bakes_in_the_probed_decode_mode(monkeypatch):
     # The op body is traced on FakeTensors and its ASM constexpr is frozen into the graph: probe before it.
     import unsloth_zoo.mxfp4_gemm as mg

@@ -508,7 +508,9 @@ def _cvt_ok(index, eager = False):
         except Exception:
             pass
     try:
-        # Probe syncs (invalidates a capture); ask the operand's device, the only one whose stream is capturing.
+        # Probe syncs: a capture on the current stream or on the operand's device would be invalidated.
+        if torch.cuda.is_current_stream_capturing():
+            return None
         with torch.cuda.device(index):
             if torch.cuda.is_current_stream_capturing():
                 return None
