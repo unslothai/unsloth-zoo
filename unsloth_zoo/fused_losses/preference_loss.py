@@ -263,7 +263,14 @@ def _chunked_backward(ctx, hidden, weight, bias, labels, grad_logps):
                 grad_bias += grad_logits.sum(0)
             grad_logits = grad_logits.to(weight.dtype)
             if need_hidden:
-                grad_hidden[start:end] = (grad_logits @ weight).to(device = hidden.device, dtype = hidden.dtype)
+                # An fp16 product overflows a row sum a bf16 / fp32 hidden state can hold.
+                grad_chunk = (
+                    _mm_float32(grad_logits, weight)
+                    if weight.dtype == torch.float16 and hidden.dtype != torch.float16
+                    else grad_logits @ weight
+                )
+                grad_hidden[start:end] = grad_chunk.to(device = hidden.device, dtype = hidden.dtype)
+                del grad_chunk
             if need_weight:
                 # Opposite signed row chunks overflow an fp16 product before they cancel here.
                 grad_weight.add_(_mm_float32(grad_logits.t(), chunk_hidden) if weight.dtype in _HALF_DTYPES

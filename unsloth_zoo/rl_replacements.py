@@ -379,6 +379,20 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                     self_fn._use_compiled = False
             return eager(*args)
 
+        # aten::mm.dtype (torch >= 2.8) has CUDA / ROCm kernels only.
+        mm_out_dtype = {"cuda": hasattr(torch.ops.aten.mm, "dtype")}
+
+        def mm_float32(a, b):
+            # fp16 GEMM with float32 output where it exists, else a float32 matmul of the chunk.
+            if mm_out_dtype.get(a.device.type, False):
+                try:
+                    return torch.mm(a, b, out_dtype = torch.float32)
+                except torch.cuda.OutOfMemoryError:
+                    raise
+                except (TypeError, RuntimeError, NotImplementedError):
+                    mm_out_dtype[a.device.type] = False
+            return torch.mm(a.float(), b.float())
+
         def chunk_logits(chunk_hidden_states, lm_head, lm_head_bias):
             chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
             if lm_head_bias is None:
@@ -440,19 +454,31 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                     del logits
                     if head is None:
                         head = lm_head if lm_head.dtype == grad_logits.dtype else lm_head.to(grad_logits.dtype)
+                        half_to_float32 = grad_logits.dtype == torch.float16
                     if need_hidden:
-                        grad_hidden[a:b] = (grad_logits @ head).to(device = hidden_states.device, dtype = hidden_states.dtype)
+                        if half_to_float32 and hidden_states.dtype != torch.float16:
+                            # A bf16 / fp32 hidden state can hold a row sum an fp16 product cannot.
+                            grad_chunk = mm_float32(grad_logits, head)
+                        else:
+                            grad_chunk = grad_logits @ head
+                        grad_hidden[a:b] = grad_chunk.to(device = hidden_states.device, dtype = hidden_states.dtype)
+                        del grad_chunk
                     if need_head:
                         x = chunk_hidden_states.to(device = device, dtype = grad_logits.dtype)
                         if grad_head is None:
                             # Accumulate in place in the head's own dtype when the matmul ran in it,
-                            # as autograd does; a float32 head under autocast accumulates in float32.
+                            # as autograd does, except fp16: its chunk products and running sum can
+                            # leave the fp16 range before opposite signed chunks cancel. fp16 and a
+                            # float32 head under autocast accumulate in float32, cast once at the end.
+                            same_dtype = lm_head.dtype == grad_logits.dtype and not half_to_float32
                             grad_head = torch.zeros(
                                 lm_head.shape, device = device,
-                                dtype = grad_logits.dtype if lm_head.dtype == grad_logits.dtype else torch.float32,
+                                dtype = grad_logits.dtype if same_dtype else torch.float32,
                             )
                         if grad_head.dtype == grad_logits.dtype:
                             grad_head.addmm_(grad_logits.t(), x)
+                        elif half_to_float32:
+                            grad_head.add_(mm_float32(grad_logits.t(), x))
                         else:
                             grad_head.add_(grad_logits.t() @ x)
                     if need_bias:
@@ -467,6 +493,10 @@ def chunked_hidden_states_selective_log_softmax_recompute(
         self_fn._use_compiled = getattr(self_fn, "_use_compiled", True)
         self_fn._autograd_function = function = ChunkedSelectiveLogSoftmax
 
+    if hidden_states is None:
+        # Build-only call, made once at import: a cold outer torch.compile(fullgraph = True) cannot
+        # trace the setup above (class creation, compile wrappers), only the cached function.
+        return function
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
     n_rows = flat_hidden_states.shape[0]
@@ -496,6 +526,7 @@ def chunked_hidden_states_selective_log_softmax_recompute(
         return logps, entropies.reshape(hidden_states.shape[0], hidden_states.shape[1])
     return logps
 pass
+chunked_hidden_states_selective_log_softmax_recompute(None, None, None)
 RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_selective_log_softmax_recompute
 
 def calculate_pad_tokens_in_prompt(
@@ -807,6 +838,8 @@ def grpo_compute_loss(
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
+    # Bool (B, T) keep mask from rollout_rs; None when rejection is off.
+    rs_keep = None
 
     # exp(new - old) and exp(ref - new) below are taken before `mask` is applied. A sequence-packed
     # logp path leaves the masked (prompt/pad) columns at 0 while a padded one fills them with a real
@@ -885,34 +918,47 @@ def grpo_compute_loss(
                         f"Unknown vLLM importance sampling mode: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', 'sequence_mask', 'geometric_truncate' and 'geometric_mask'."
                 )
 
-            if rollout_rs is not None:
-                # verl compute_rollout_rejection_mask: every option must pass. A rejected token gets
-                # IS weight 0 like TRL's *_mask modes, so it stays in the loss normaliser.
-                rs_log_ratio = torch.clamp(torch.nan_to_num((old - sampling_per_token_logps) * mask, nan = 0.0), min = -20.0, max = 20.0)
-                rs_mask = mask.to(rs_log_ratio.dtype)
-                rs_count = rs_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
-                rs_keep = torch.ones_like(rs_log_ratio)
-                for rs_option, rs_lower, rs_upper in rollout_rs:
-                    if rs_option.endswith("k1"):
-                        rs_stat = -rs_log_ratio
-                    elif rs_option.endswith("k2"):
-                        rs_stat = 0.5 * rs_log_ratio * rs_log_ratio
-                    else:
-                        rs_stat = torch.expm1(rs_log_ratio) - rs_log_ratio
-                    rs_stat = rs_stat * rs_mask
-                    if rs_option.startswith("seq_sum"):
-                        rs_stat = rs_stat.sum(dim=-1, keepdim=True)
-                    elif rs_option.startswith("seq_mean"):
-                        rs_stat = rs_stat.sum(dim=-1, keepdim=True) / rs_count
-                    elif rs_option.startswith("seq_max"):
-                        # k2, k3 >= 0 and masked entries are 0, so this is the masked max (0 on an empty row).
-                        rs_stat = rs_stat.amax(dim=-1, keepdim=True)
-                    if rs_lower is not None:
-                        rs_pass = (rs_stat >= rs_lower) & (rs_stat <= rs_upper)
-                    else:
-                        rs_pass = rs_stat <= rs_upper
-                    rs_keep = rs_keep * rs_pass.to(rs_keep.dtype)
-                importance_sampling_ratio = importance_sampling_ratio * rs_keep
+        # verl compute_rollout_rejection_mask: every option must pass. verl then replaces
+        # response_mask with response_mask * keep, so a rejected token leaves the policy term
+        # and the KL loss (both selected out below). It stays in the loss normaliser like
+        # TRL's *_mask modes, since num_items_in_batch is counted before the loss.
+        # Log ratio is pi_old / pi_rollout; with rollout logps as pi_old (verl bypass mode) it is
+        # pi_theta / pi_rollout, verl compute_policy_loss_bypass_mode passing old_log_prob=log_prob.
+        rs_log_ratio = None
+        if rollout_rs is not None:
+            if use_vllm and sampling_per_token_logps is not None and vllm_importance_sampling_correction:
+                rs_log_ratio = old - sampling_per_token_logps
+            elif kwargs.get("rollout_logps_as_old", False) and old is not None:
+                rs_log_ratio = new.detach() - old
+        if rs_log_ratio is not None:
+            rs_log_ratio = torch.clamp(torch.nan_to_num(rs_log_ratio * mask, nan = 0.0), min = -20.0, max = 20.0)
+            rs_mask = mask.to(rs_log_ratio.dtype)
+            rs_count = rs_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            rs_keep = torch.ones_like(rs_log_ratio)
+            for rs_option, rs_lower, rs_upper in rollout_rs:
+                if rs_option.endswith("k1"):
+                    rs_stat = -rs_log_ratio
+                elif rs_option.endswith("k2"):
+                    rs_stat = 0.5 * rs_log_ratio * rs_log_ratio
+                else:
+                    rs_stat = torch.expm1(rs_log_ratio) - rs_log_ratio
+                rs_stat = rs_stat * rs_mask
+                if rs_option.startswith("seq_sum"):
+                    rs_stat = rs_stat.sum(dim=-1, keepdim=True)
+                elif rs_option.startswith("seq_mean"):
+                    rs_stat = rs_stat.sum(dim=-1, keepdim=True) / rs_count
+                elif rs_option.startswith("seq_max"):
+                    # k2, k3 >= 0 and masked entries are 0, so this is the masked max (0 on an empty row).
+                    rs_stat = rs_stat.amax(dim=-1, keepdim=True)
+                if rs_lower is not None:
+                    rs_pass = (rs_stat >= rs_lower) & (rs_stat <= rs_upper)
+                else:
+                    rs_pass = rs_stat <= rs_upper
+                rs_keep = rs_keep * rs_pass.to(rs_keep.dtype)
+            rs_keep = rs_keep > 0
+            if importance_sampling_ratio is not None:
+                # Select, not multiply: an unclipped ratio can overflow to inf and inf * 0 is nan.
+                importance_sampling_ratio = torch.where(rs_keep, importance_sampling_ratio, 0.0)
     pass
 
     # Must detach when old is None: exp(new - new.detach()) == 1 but keeps grads correct.
@@ -1010,6 +1056,10 @@ def grpo_compute_loss(
         flat_is_ratio = torch.tensor([]).detach()
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
+    if rs_keep is not None:
+        # Rejected tokens drop out of every loss term, KL included (verl rollout_rs). A select, so
+        # an inf or nan there neither reaches the loss nor turns into a nan gradient.
+        loss_i = torch.where(rs_keep, loss_i, 0.0)
 
     mask = mask.to(torch.float32)
     n_mask_per_reward = mask.sum(1)
@@ -1067,7 +1117,10 @@ def grpo_compute_loss(
                     mean_kl_per_reward.sum() / kept_rows.clamp(min = 1),
                 )
                 return completion_length, mean_kl
-    completion_length, mean_kl = masked_batch_mean(kl_i)
+    # Rejected tokens add nothing to the reported KL either; the denominator keeps every completion
+    # token, like the loss normaliser.
+    kl_metric = kl_i if rs_keep is None or beta == 0.0 else torch.where(rs_keep, kl_i, 0.0)
+    completion_length, mean_kl = masked_batch_mean(kl_metric)
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
@@ -1277,13 +1330,10 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
     loss_type = loss_kwargs.get("loss_type", "grpo")
     if Version(trl_version) < Version("1.10.0") and loss_type in ("cispo", "dapo", "vespo"):
         if sample_weight is not None:
-            # The policy term is normalised by sample_weight (kept tokens only, grpo_compute_loss),
-            # and TRL 1.8 / 1.9 divide the bonus by the policy's own normaliser: the same here, so
-            # excluded rows do not dilute it. Without exclusion this equals the branch below.
+            # sample_weight is 1 / kept tokens of the generation batch, the kept-only num_items_in_batch,
+            # so excluded rows do not dilute the bonus. Like the branch below (TRL 1.8 / 1.9), no
+            # accumulation / steps_per_generation rescale: with every row kept the two are equal.
             normalizer = 1.0 / loss_kwargs.get("num_processes", 1)
-            steps_per_generation = loss_kwargs.get("steps_per_generation", None)
-            if steps_per_generation:
-                normalizer = normalizer * loss_kwargs.get("current_gradient_accumulation_steps", 1) / steps_per_generation
             row_weight = sample_weight.to(device = weights.device, dtype = weights.dtype).unsqueeze(-1)
             return weights * row_weight * (-entropy_coef / normalizer)
         # TRL 1.8 / 1.9 used num_items_in_batch / num_processes as is, before 1.10 rescaled it to
@@ -1369,7 +1419,8 @@ def _warn_unsupported_grpo_options(trainer):
     if not (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False)):
         _names = ("UNSLOTH_GRPO_VLLM_IS_MODE", "UNSLOTH_GRPO_VLLM_IS_CLIP", "UNSLOTH_GRPO_ROLLOUT_RS", "UNSLOTH_GRPO_ROLLOUT_METRICS")
         if os.environ.get("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", "0") == "1":
-            _names = _names[:-1]
+            # Rejection and the mismatch metrics run on pi_theta / pi_rollout there (verl bypass mode).
+            _names = _names[:2]
         for name in _names:
             if os.environ.get(name, "") not in ("", "0"):
                 unsupported.append(f"{name}={os.environ[name]} (needs use_vllm and vllm_importance_sampling_correction=True)")
@@ -2081,6 +2132,40 @@ pass
 RL_REPLACEMENTS["grpo_parse_rollout_rs"] = grpo_parse_rollout_rs
 
 
+def grpo_rollout_rs_keep(log_ratio, mask, rollout_rs):
+    """Bool (B, T) keep mask of grpo_compute_loss's rollout_rs rejection, for the caller's metric
+    and entropy weights. grpo_compute_loss inlines the same steps (its source is copied into the
+    compiled trainer, so it cannot call this); log_ratio is old - sampling, or new - rollout with
+    rollout logprobs as pi_old."""
+    with torch.no_grad():
+        rs_log_ratio = torch.clamp(torch.nan_to_num(log_ratio * mask, nan = 0.0), min = -20.0, max = 20.0)
+        rs_mask = mask.to(rs_log_ratio.dtype)
+        rs_count = rs_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        rs_keep = torch.ones_like(rs_log_ratio)
+        for rs_option, rs_lower, rs_upper in rollout_rs:
+            if rs_option.endswith("k1"):
+                rs_stat = -rs_log_ratio
+            elif rs_option.endswith("k2"):
+                rs_stat = 0.5 * rs_log_ratio * rs_log_ratio
+            else:
+                rs_stat = torch.expm1(rs_log_ratio) - rs_log_ratio
+            rs_stat = rs_stat * rs_mask
+            if rs_option.startswith("seq_sum"):
+                rs_stat = rs_stat.sum(dim=-1, keepdim=True)
+            elif rs_option.startswith("seq_mean"):
+                rs_stat = rs_stat.sum(dim=-1, keepdim=True) / rs_count
+            elif rs_option.startswith("seq_max"):
+                rs_stat = rs_stat.amax(dim=-1, keepdim=True)
+            if rs_lower is not None:
+                rs_pass = (rs_stat >= rs_lower) & (rs_stat <= rs_upper)
+            else:
+                rs_pass = rs_stat <= rs_upper
+            rs_keep = rs_keep * rs_pass.to(rs_keep.dtype)
+        return rs_keep > 0
+pass
+RL_REPLACEMENTS["grpo_rollout_rs_keep"] = grpo_rollout_rs_keep
+
+
 def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
     """Sums for the rollout / trainer mismatch metrics over valid tokens, so processes and
     micro-batches can be pooled before dividing. Returns a float64 vector:
@@ -2161,17 +2246,23 @@ pass
 RL_REPLACEMENTS["grpo_rollout_old_fill_unscored"] = grpo_rollout_old_fill_unscored
 
 
-def grpo_rollout_as_old_ratio_metrics(coef_1, mask):
+def grpo_rollout_as_old_ratio_metrics(coef_1, mask, log_ratio = None):
     """(|log r|, r) zero-filled outside the mask, r = pi_theta / pi_rollout per token, for the
     sampling_logp_difference / importance_sampling_ratio metrics when pi_old is the rollout policy.
     verl measures the bypass mismatch the same way (compute_rollout_correction_and_rejection_mask
-    with old_log_prob = the current log_prob). None for a sequence-level ratio."""
+    with old_log_prob = the current log_prob). None for a sequence-level ratio. log_ratio, when
+    given, is the unclamped new - rollout for |log r|: coef_1 is the loss ratio, clamped to
+    [-20, 20] in log space, and verl compute_offpolicy_metrics reads the raw difference for its
+    KL metrics. r stays coef_1, which matches verl's SAFETY_BOUND clamped IS weights."""
     if coef_1 is None or coef_1.shape != mask.shape:
         return None, None
     with torch.no_grad():
         keep = mask.to(torch.bool)
         ratio = coef_1.detach().to(torch.float32)
-        log_ratio = torch.nan_to_num(torch.log(ratio), nan = 0.0, posinf = 670.0, neginf = -670.0)
+        if log_ratio is not None and log_ratio.shape == mask.shape:
+            log_ratio = torch.nan_to_num(log_ratio.detach().to(torch.float32), nan = 0.0, posinf = 670.0, neginf = -670.0)
+        else:
+            log_ratio = torch.nan_to_num(torch.log(ratio), nan = 0.0, posinf = 670.0, neginf = -670.0)
         # where, not * mask: an overflowed ratio (inf) on a padded column would leave inf * 0 = nan.
         zero = torch.zeros_like(ratio)
         return torch.where(keep, log_ratio.abs(), zero), torch.where(keep, ratio, zero)
@@ -3287,6 +3378,17 @@ def grpo_accumulated_loss(
             old_logps, _rollout_unscored = grpo_rollout_old_fill_unscored(old_logps, new_logprobs)
             # Only on this path: grpo_compute_loss clamps pi_theta / pi_rollout's log to [-20, 20] like verl.
             kwargs["rollout_logps_as_old"] = True
+        # The rollout_rs keep mask grpo_compute_loss applies, for the IS metric weights and the entropy bonus.
+        _rs_keep = None
+        if kwargs.get("rollout_rs", None) is not None and old_logps is not None and old_logps.shape == completion_mask.shape:
+            _rs_log_ratio = None
+            if _rollout_logps_as_old:
+                _rs_log_ratio = new_logprobs.detach() - old_logps
+            elif trainer.use_vllm and sampling_per_token_logps is not None and kwargs.get("vllm_importance_sampling_correction", False):
+                _rs_log_ratio = old_logps - sampling_per_token_logps
+            if _rs_log_ratio is not None:
+                from unsloth_zoo.rl_replacements import grpo_rollout_rs_keep as _grpo_rollout_rs_keep
+                _rs_keep = _grpo_rollout_rs_keep(_rs_log_ratio, completion_mask, kwargs["rollout_rs"])
         with autocaster:
             loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
                 new_logprobs,
@@ -3305,11 +3407,16 @@ def grpo_accumulated_loss(
             )
         _rollout_stats_args = None
         if _rollout_logps_as_old:
-            delta, flat_is_ratio = grpo_rollout_as_old_ratio_metrics(coef_1, completion_mask)
+            # Unclamped log(pi_theta / pi_rollout) for the KL diagnostics; the loss ratio is clamped to [-20, 20].
+            _raw_log_ratio = new_logprobs.detach().to(torch.float64) - old_logps.detach().to(torch.float64)
+            if _raw_log_ratio.shape != completion_mask.shape:
+                _raw_log_ratio = torch.log(coef_1.detach().to(torch.float64))
+            delta, flat_is_ratio = grpo_rollout_as_old_ratio_metrics(coef_1, completion_mask, _raw_log_ratio)
+            if _rs_keep is not None and flat_is_ratio is not None:
+                # Rejected tokens get IS weight 0, as on the vLLM IS path: rejected_frac counts them, ESS drops them.
+                flat_is_ratio = torch.where(_rs_keep, flat_is_ratio, torch.zeros_like(flat_is_ratio))
             if _rollout_metrics_on and flat_is_ratio is not None:
-                _log_ratio = torch.nan_to_num(
-                    torch.log(coef_1.detach().to(torch.float64)), nan = 0.0, posinf = 670.0, neginf = -670.0,
-                )
+                _log_ratio = torch.nan_to_num(_raw_log_ratio, nan = 0.0, posinf = 670.0, neginf = -670.0)
                 _log_ratio = torch.where(completion_mask.to(torch.bool), _log_ratio, torch.zeros_like(_log_ratio))
                 if _rollout_unscored is not None:
                     # Unscored tokens carry no mismatch information: NaN leaves them out of the sums.
@@ -3355,6 +3462,10 @@ def grpo_accumulated_loss(
             _entropy_weights = _grpo_entropy_bonus_weights(
                 completion_mask, entropy_mask, _entropy_coef, kwargs, training = _training,
             )
+            if _rs_keep is not None:
+                # Rejected tokens leave the entropy bonus too (verl drops them from response_mask);
+                # its normaliser keeps them, like the policy term's.
+                _entropy_weights = torch.where(_rs_keep.to(_entropy_weights.device), _entropy_weights, 0.0)
             _scaler = trainer.accelerator.scaler
             loss = loss + _UnslothGRPOEntropyBonus.apply(
                 new_entropies, _entropy_weights.to(new_entropies.device),

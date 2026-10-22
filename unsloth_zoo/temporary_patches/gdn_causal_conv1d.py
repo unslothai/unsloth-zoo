@@ -904,6 +904,25 @@ def _hub_gdn_function(decorator, torch_function):
     # The hub wrapper passes only the implementation's named parameters on.
     names = frozenset(inspect.signature(dispatch).parameters)
 
+    if isinstance(hub_fn, torch.nn.Module):
+        # With `kernels` installed the hub decorator turns the function into a layer instance whose
+        # class carries `kernel_layer_name`, which `use_kernelized_func` checks and `kernelize` reads
+        # from `type(fn)`. A plain function wrapper loses both, so route on the instance instead:
+        # the layer stays what transformers registered, and `kernelize` can still swap its forward.
+        hub_forward = hub_fn.forward
+
+        @functools.wraps(hub_forward)
+        def forward(*args, **kwargs):
+            if kwargs.get("seq_idx") is not None:
+                return dispatch(*args, **{k: v for k, v in kwargs.items() if k in names})
+            return hub_forward(*args, **kwargs)
+
+        hub_fn.forward = forward
+        # Signature checks (Unsloth's packing gate looks for `seq_idx`) see the dispatch, not (*args, **kwargs).
+        hub_fn.__signature__ = inspect.signature(dispatch)
+        setattr(hub_fn, _MARK, True)
+        return hub_fn
+
     @functools.wraps(hub_fn)
     def causal_conv1d_fn(*args, **kwargs):
         if kwargs.get("seq_idx") is not None:
@@ -912,6 +931,15 @@ def _hub_gdn_function(decorator, torch_function):
 
     setattr(causal_conv1d_fn, _MARK, True)
     return causal_conv1d_fn
+
+
+def _hub_gdn_update(decorator, torch_function):
+    """Hub-decorate the GDN update dispatch. With `kernels` installed the result is a layer
+    instance (its class keeps `kernel_layer_name`), which does not inherit the dispatch's mark."""
+    hub_fn = decorator(_make_update_dispatch(torch_function))
+    if isinstance(hub_fn, torch.nn.Module):
+        setattr(hub_fn, _MARK, True)
+    return hub_fn
 
 
 def _patch_hub_decorator():
@@ -935,7 +963,7 @@ def _patch_hub_decorator():
         if func_name == "causal_conv1d_fn":
             return lambda fn: _hub_gdn_function(decorator, fn) if _is_gdn_function(fn) else decorator(fn)
         if func_name == "causal_conv1d_update":
-            return lambda fn: decorator(_make_update_dispatch(fn)) if _is_gdn_function(fn) else decorator(fn)
+            return lambda fn: _hub_gdn_update(decorator, fn) if _is_gdn_function(fn) else decorator(fn)
         return decorator
 
     setattr(use_kernel_func_from_hub_with_fallback, _HUB_MARK, True)

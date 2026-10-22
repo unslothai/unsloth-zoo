@@ -100,3 +100,29 @@ def test_per_chunk_head_grad_does_not_overflow_fp16(monkeypatch, device):
     assert not calls
     assert grad_weight.isfinite().all()
     assert grad_hidden.isfinite().all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_per_chunk_bf16_hidden_grad_with_fp16_head_does_not_overflow(monkeypatch, device):
+    # Enough rows for the per chunk backward. Row 0's hidden gradient, about -72000, fits bf16 but
+    # not an fp16 GEMM output, which gave -inf before the cast to the hidden dtype.
+    monkeypatch.setattr(module, "_target_chunk_bytes", lambda: 1024 * 1024)
+    vocab, hidden_size, n_rows = 129, 2048, 259
+    weight = torch.full((vocab, hidden_size), 600.0, device = device)
+    weight[0] = 0.0
+    weight = weight.half()
+    gen = torch.Generator().manual_seed(0)
+    hidden = (torch.randn(1, n_rows, hidden_size, generator = gen) * 1e-3).to(device = device, dtype = torch.bfloat16)
+    sliced = []
+    original = module._sliced_backward
+    monkeypatch.setattr(module, "_sliced_backward", lambda *args: sliced.append(1) or original(*args))
+    _, grad_hidden, grad_weight = _run(hidden, weight, torch.full((1, n_rows), 120.0, device = device))
+    assert not sliced
+    h = hidden.detach().double().requires_grad_(True)
+    w = weight.detach().double()
+    logps = torch.log_softmax(h @ w.t(), -1)[..., 0]
+    (want,) = torch.autograd.grad((logps * 120.0).sum(), [h])
+    assert grad_hidden.isfinite().all()
+    assert grad_weight.isfinite().all()
+    # Within bf16 / fp16 rounding of the float64 oracle.
+    assert float((grad_hidden.double() - want).abs().max()) <= 2 ** -7 * float(want.abs().max())
