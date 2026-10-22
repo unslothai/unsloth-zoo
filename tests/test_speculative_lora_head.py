@@ -43,11 +43,20 @@ def _target():
     return Qwen3ForCausalLM(config).eval()
 
 
-def _lora_target(**lora_kwargs):
+def _lora_target(head_bias = False, dtype = None, **lora_kwargs):
     torch.manual_seed(1)
     config = LoraConfig(r = 4, lora_alpha = 16, lora_dropout = 0.0, target_modules = ["lm_head"],
                         init_lora_weights = False, **lora_kwargs)
-    model = get_peft_model(_target(), config).eval()
+    target = _target()
+    if head_bias:
+        old = target.lm_head
+        target.lm_head = torch.nn.Linear(old.in_features, old.out_features, bias = True)
+        with torch.no_grad():
+            target.lm_head.weight.copy_(old.weight)
+            target.lm_head.bias.zero_()
+    if dtype is not None:
+        target = target.to(dtype)
+    model = get_peft_model(target, config).eval()
     with torch.no_grad():
         # A large delta so the adapter visibly changes the argmax.
         for name, p in model.named_parameters():
@@ -192,3 +201,65 @@ def test_eagle3_trainer_uses_the_effective_head(tmp_path):
     args = Eagle3TrainingArguments(output_dir = str(tmp_path), report_to = "none", save_strategy = "no", use_cpu = True)
     trainer = UnslothEagle3Trainer(model = drafter, target_model = model, args = args)
     assert torch.allclose(trainer._lm_head_weight, effective)
+
+
+def test_effective_weight_accumulates_in_place_in_the_base_dtype(monkeypatch):
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from unsloth_zoo.speculative import capture
+
+    model = _lora_target(dtype = torch.bfloat16)
+    head = _head(model)
+    shape = tuple(head.get_base_layer().weight.shape)
+    fp32_full = []
+    merged = copy.deepcopy(model)
+    _head(merged).merge()
+    # Same representation as PEFT's merge: the delta added into the base dtype.
+    torch.testing.assert_close(effective_lm_head_weight(head), _head(merged).get_base_layer().weight,
+                               atol = 0, rtol = 0)
+    with torch.no_grad():
+        head.lora_B["default"].weight.mul_(1.5)  # invalidate the cache
+
+    def delta(name):
+        return (head.lora_B[name].weight.float() @ head.lora_A[name].weight.float()) * head.scaling[name]
+
+    class Watch(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+            out = func(*args, **(kwargs or {}))
+            if isinstance(out, torch.Tensor) and tuple(out.shape) == shape and out.dtype == torch.float32 \
+                    and not func.__name__.split(".")[0].endswith("_"):
+                fp32_full.append(func.__name__)
+            return out
+
+    monkeypatch.setattr(capture, "_DELTA_BLOCK_BYTES", 16 * 64 * 4)  # 16-row delta blocks
+    with Watch():
+        w = effective_lm_head_weight(head)
+    # No full-size fp32 temporaries (the old path held a base copy, the delta, its cast and the sum).
+    assert fp32_full == []
+    assert w.dtype == torch.bfloat16
+    with torch.no_grad():
+        expected = (head.get_base_layer().weight.float() + delta("default")).to(torch.bfloat16)
+    torch.testing.assert_close(w, expected, atol = 0, rtol = 0)
+
+
+def test_lora_bias_is_refused_as_unsupported():
+    model = _lora_target(head_bias = True, lora_bias = True)
+    with torch.no_grad():
+        _head(model).lora_B["default"].bias.fill_(0.25)
+    with pytest.raises(NotImplementedError, match = "lora_bias = True.*does not support"):
+        effective_lm_head_weight(_head(model))
+    # Merging folds the adapter bias into the head bias, which a weight-only projection drops.
+    _head(model).merge()
+    with pytest.raises(NotImplementedError, match = "nonzero bias"):
+        effective_lm_head_weight(_head(model))
+
+
+def test_merged_head_with_a_bias_is_checked():
+    model = _lora_target(head_bias = True)
+    head = _head(model)
+    head.merge()
+    # A zero bias changes nothing: the merged weight is the whole head.
+    assert effective_lm_head_weight(head) is head.get_base_layer().weight
+    with torch.no_grad():
+        head.get_base_layer().bias.fill_(0.5)
+    with pytest.raises(NotImplementedError, match = "nonzero bias"):
+        effective_lm_head_weight(head)
