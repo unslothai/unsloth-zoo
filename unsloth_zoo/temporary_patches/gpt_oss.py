@@ -2296,6 +2296,9 @@ def _mxfp4_ogs_decode(self, hidden_states):
     """None unless both stacks are packed, nothing needs gradients, and triton_kernels runs them."""
     if torch.is_grad_enabled() or _ogs_kernels() is None:
         return None
+    if _has_active_expert_lora(self.experts):
+        # matmul_ogs reads the unwrapped base experts; the module forward applies expert LoRA.
+        return None
     moe = _unwrap_peft_experts(self.experts)
     gate_up, down = moe.gate_up_proj, moe.down_proj
     if not (is_mxfp4_expert_param(gate_up) and is_mxfp4_expert_param(down)):
