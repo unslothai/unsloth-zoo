@@ -327,6 +327,51 @@ def _warm_moe_backend(model) -> None:
                 pass
 
 
+def _expert_devices(model):
+    devices = set()
+    for module in model.modules():
+        if getattr(module, "num_experts", None) is None and not type(module).__name__.endswith("Experts"):
+            continue
+        for param in module.parameters():
+            device = param.device
+            if device.type in ("cuda", "xpu") and device.index is not None:
+                devices.add(device)
+    return sorted(devices, key = lambda d: (d.type, d.index))
+
+
+def warm_moe_probes_on_expert_devices(model) -> None:
+    """Run the per-GPU-model grouped_mm probes eagerly for every card the experts sit on.
+
+    device_map over two GPU models (H100 + A100): the no-arg warmup resolves only the home card, and the
+    other card's first support query inside a compiled forward reaches the compiler-disabled probe
+    (a graph break, or Unsupported under fullgraph=True). Cards without experts are never probed, and a
+    card of the home model is answered by the home flag (no extra probe)."""
+    if torch.compiler.is_compiling():
+        return
+    try:
+        devices = _expert_devices(model)
+        if not devices or all(getattr(torch, d.type).device_count() <= 1 for d in devices):
+            return
+        moe_utils = _moe_utils_module()
+        backend = moe_utils.get_forward_moe_backend()
+        backend_module = sys.modules.get(getattr(backend, "__module__", None) or "", moe_utils)
+    except Exception:
+        return
+    # The package module and the compiled-cache copy each cache their own probe results.
+    for module in (moe_utils,) if backend_module is moe_utils else (moe_utils, backend_module):
+        foreign_kind = getattr(module, "_grouped_mm_foreign_kind", None)
+        if foreign_kind is None:
+            continue
+        for device in devices:
+            try:
+                if foreign_kind(device) is None:
+                    continue
+                module._grouped_mm_supported_on(device)
+                module._transposed_view_safe_on(device)
+            except Exception:
+                pass
+
+
 def _patch_decode_switch():
     try:
         from transformers.generation.utils import GenerationMixin

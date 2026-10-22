@@ -5601,18 +5601,23 @@ def _triton_moe_compute_dtype(module, hidden_states):
 
 
 @torch.compiler.disable
-def _moe_weight_dtype_kwargs(tuner, module, name, dtype):
-    """weight_dtype kwarg when expert weights differ from activations (bf16 W, float32 X)."""
-    weight = getattr(module, name, None)
-    weight_dtype = getattr(weight, "dtype", None)
-    if weight_dtype not in (torch.float32, torch.bfloat16, torch.float16) or weight_dtype == dtype:
-        return {}
+def _moe_weight_dtype_kwargs(tuner, module, name, dtype, device = None):
+    """weight_dtype kwarg when expert weights differ from activations (bf16 W, float32 X), and the
+    operands' CUDA device: on a mixed-GPU host the configs must fit the card the GEMM launches on."""
     try:
-        if "weight_dtype" not in inspect.signature(tuner).parameters:
-            return {}
+        parameters = inspect.signature(tuner).parameters
     except (TypeError, ValueError):
         return {}
-    return {"weight_dtype": weight_dtype}
+    kwargs = {}
+    weight = getattr(module, name, None)
+    weight_dtype = getattr(weight, "dtype", None)
+    if weight_dtype in (torch.float32, torch.bfloat16, torch.float16) and weight_dtype != dtype \
+            and "weight_dtype" in parameters:
+        kwargs["weight_dtype"] = weight_dtype
+    # Older unsloth has no device argument and reads the current device.
+    if device is not None and device.type == "cuda" and "device" in parameters:
+        kwargs["device"] = device
+    return kwargs
 
 
 def forward_triton_grouped_gemm(
@@ -5680,7 +5685,9 @@ def forward_triton_grouped_gemm(
             intermediate_dim=intermediate_dim,
             top_k=top_k,
             dtype=gemm_hidden_states.dtype,
-            **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "gate_up_proj", gemm_hidden_states.dtype),
+            **_moe_weight_dtype_kwargs(
+                get_or_autotune_moe_kernels, self, "gate_up_proj", gemm_hidden_states.dtype, gemm_hidden_states.device,
+            ),
         )
 
         # Second GEMM: K = intermediate_dim, N = hidden_dim.
@@ -5690,7 +5697,9 @@ def forward_triton_grouped_gemm(
             intermediate_dim=hidden_dim // 2 if hidden_dim % 2 == 0 else hidden_dim,
             top_k=top_k,
             dtype=compute_dtype,
-            **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "down_proj", compute_dtype),
+            **_moe_weight_dtype_kwargs(
+                get_or_autotune_moe_kernels, self, "down_proj", compute_dtype, gemm_hidden_states.device,
+            ),
         )
 
         self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)

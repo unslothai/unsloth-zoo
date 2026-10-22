@@ -383,3 +383,40 @@ def test_rocm_mask_rewritten_only_when_token_order_is_logical_order(spoof, monke
         assert children == [("0", (tokens[0],) * 2), ("0", (tokens[1],) * 2)]
     else:
         assert children == [("0", None), ("1", None)]
+
+
+class _FakeExperts(torch.nn.Module):
+    """Stacked experts whose weights sit on `device` (device_map split over GPU models), CPU only."""
+    def __init__(self, device):
+        super().__init__()
+        self.num_experts = 4
+        self._device = device
+
+    def parameters(self, recurse = True):
+        yield types.SimpleNamespace(device = self._device)
+
+
+def _split_model(*devices):
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(_FakeExperts(d) for d in devices)
+    return model
+
+
+def test_loader_warms_a_foreign_expert_card_before_compile(spoof, monkeypatch):
+    # H100 home + A100 holding later layers: the loader resolves the A100 eagerly, so the compiled
+    # forward's first A100 query traces under fullgraph=True instead of hitting the disabled probe.
+    from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
+    seen = spoof(3, models = ["H100", "A100", "L4"])
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    auto_enable_grouped_moe(_split_model(cuda(0), cuda(1)))
+    assert _fullgraph_gate(monkeypatch, cuda(1)).tolist() == [1.0, 1.0]
+    assert 1 in seen and 2 not in seen  # the L4 holds no experts: never probed
+
+
+@pytest.mark.parametrize("models", [["H100"], ["H100", "H100"]])
+def test_loader_warm_adds_no_probe_on_one_gpu_or_one_model(spoof, models):
+    from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
+    seen = spoof(len(models), models = models)
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    auto_enable_grouped_moe(_split_model(*(cuda(i) for i in range(len(models)))))
+    assert seen == [0]
