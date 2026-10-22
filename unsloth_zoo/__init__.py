@@ -203,6 +203,8 @@ else:
         DEVICE_COUNT = 0
         ALLOW_PREQUANTIZED_MODELS = False
 
+_IS_CPU_BACKEND = False
+
 # Stub the CUDA-only imports whenever GPU init is skipped (MLX host or the opt-in
 # download child), so they resolve to a loud no-op instead of a hard ImportError. On a
 # normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
@@ -431,6 +433,8 @@ if not _SKIP_GPU_INIT:
         ALLOW_PREQUANTIZED_MODELS,
     )
     IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
+    # No accelerator: unsloth_zoo.cpu trains with stock torch, so none of the GPU patches below load.
+    _IS_CPU_BACKEND = DEVICE_TYPE == "cpu"
 
     # Torch >= 2.10 reads PYTORCH_ALLOC_CONF and treats legacy per-backend vars as deprecated.
     if IS_TORCH_2_10_OR_NEWER:
@@ -555,14 +559,16 @@ if not _SKIP_GPU_INIT:
     if not ("UNSLOTH_IS_PRESENT" in os.environ):
         raise ImportError("Please install Unsloth via `pip install unsloth`!")
 
-    try:
-        print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-    except:
-        print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
+    if not _IS_CPU_BACKEND:
+        try:
+            print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
+        except:
+            print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
 
     # Log Unsloth-Zoo Utilities
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 
+if not _SKIP_GPU_INIT and not _IS_CPU_BACKEND:
     from unsloth_zoo.temporary_patches import (
         encode_conversations_with_harmony,
     )
@@ -596,6 +602,7 @@ if not _SKIP_GPU_INIT:
     except:
         pass
 
+if not _SKIP_GPU_INIT:
     del os, warnings, re
 
 
