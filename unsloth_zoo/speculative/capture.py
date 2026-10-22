@@ -15,10 +15,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import contextlib
+import weakref
 import torch
 
 __all__ = [
     "resolve_text_parts",
+    "effective_lm_head_weight",
     "capture_hidden_states",
     "run_frozen_target",
 ]
@@ -45,6 +47,79 @@ def _unwrap(model):
 
 def _has_layers(module):
     return isinstance(getattr(module, "layers", None), torch.nn.ModuleList)
+
+
+_EFFECTIVE_HEAD_CACHE = weakref.WeakKeyDictionary()
+
+
+def _tensor_key(t):
+    return (t.data_ptr(), t._version, t.dtype, t.device, tuple(t.shape))
+
+
+def effective_lm_head_weight(lm_head):
+    """The [V, H] matrix `lm_head(x)` actually multiplies by, for code that projects with a raw weight.
+
+    A plain Linear (or a merged / disabled PEFT LoRA layer) returns `lm_head.weight` itself. An
+    unmerged PEFT LoRA head returns base + sum of its active adapters' scaled deltas, built once
+    without grad and cached until a weight, the active adapters or the merge state changes (the
+    target is frozen, so that is once per run). Variants a weight-only projection cannot express
+    (DoRA and other LoRA variants, lora_bias, a quantized base) raise instead of silently dropping
+    the adapter.
+    """
+    lora_A = getattr(lm_head, "lora_A", None)
+    get_base_layer = getattr(lm_head, "get_base_layer", None)
+    if not isinstance(lora_A, torch.nn.ModuleDict) or not callable(get_base_layer):
+        return lm_head.weight
+    base_weight = get_base_layer().weight
+    merged = bool(getattr(lm_head, "merged", False))
+    if getattr(lm_head, "disable_adapters", False):
+        if merged:
+            raise NotImplementedError(
+                "Unsloth: the target's lm_head has merged LoRA adapters but adapters are disabled; "
+                "unmerge them (model.unmerge_adapter()) before speculative training."
+            )
+        return base_weight
+    if merged:
+        return base_weight
+    active = getattr(lm_head, "active_adapters", None)
+    if active is None:
+        active = getattr(lm_head, "active_adapter", ())
+    if isinstance(active, str):
+        active = [active]
+    active = tuple(a for a in active if a in lora_A)
+    if not active:
+        return base_weight
+    for name in active:
+        if name in (getattr(lm_head, "lora_variant", None) or {}) or \
+                (getattr(lm_head, "use_dora", None) or {}).get(name, False):
+            raise NotImplementedError(
+                f"Unsloth: the target's lm_head adapter {name!r} uses a LoRA variant (e.g. DoRA); speculative "
+                "training cannot project through it unmerged. Merge it (model.merge_adapter()) first."
+            )
+        if (getattr(lm_head, "lora_bias", None) or {}).get(name, False):
+            raise NotImplementedError(
+                f"Unsloth: the target's lm_head adapter {name!r} has lora_bias; merge it (model.merge_adapter()) "
+                "before speculative training."
+            )
+    if not base_weight.is_floating_point() or base_weight.element_size() < 2:
+        raise NotImplementedError(
+            "Unsloth: the target's lm_head is quantized and carries an unmerged LoRA adapter; speculative "
+            "training cannot project through it. Use an unquantized lm_head or merge the adapter."
+        )
+    key = (_tensor_key(base_weight),) + tuple(
+        (name, float(lm_head.scaling[name]), _tensor_key(lora_A[name].weight), _tensor_key(lm_head.lora_B[name].weight))
+        for name in active
+    )
+    cached = _EFFECTIVE_HEAD_CACHE.get(lm_head)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    with torch.no_grad():
+        weight = base_weight.detach().float()
+        for name in active:
+            weight = weight + lm_head.get_delta_weight(name).to(device = weight.device, dtype = torch.float32)
+        weight = weight.to(base_weight.dtype)
+    _EFFECTIVE_HEAD_CACHE[lm_head] = (key, weight)
+    return weight
 
 
 def resolve_text_parts(model):
