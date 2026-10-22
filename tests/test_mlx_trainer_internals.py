@@ -2995,10 +2995,8 @@ def test_mlx_train_result_reports_base_quantization():
     assert '"base_quantized_source"' in source
 
 
-def test_native_awq_adapter_base_reloads_as_native_prequant(monkeypatch):
+def test_native_awq_adapter_base_reloads_as_native_prequant():
     from unsloth_zoo.mlx import loader as _loader
-
-    monkeypatch.setattr(_loader, "_mlx_lm_supports_native_prequant", lambda: True)
 
     native_awq_cfg = {
         "base_quantization_config": {
@@ -3049,14 +3047,6 @@ def test_native_awq_adapter_base_reloads_as_native_prequant(monkeypatch):
     ) is False
     assert _loader._adapter_base_prefers_native_prequant(
         {},
-        adapter_requires_runtime_quant=False,
-        adapter_mlx_quant_config=None,
-        adapter_base_is_bnb=False,
-    ) is False
-
-    monkeypatch.setattr(_loader, "_mlx_lm_supports_native_prequant", lambda: False)
-    assert _loader._adapter_base_prefers_native_prequant(
-        native_awq_cfg,
         adapter_requires_runtime_quant=False,
         adapter_mlx_quant_config=None,
         adapter_base_is_bnb=False,

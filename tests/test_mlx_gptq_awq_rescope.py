@@ -107,32 +107,29 @@ def _make_gptq_tensors(inn=16, out=8, gs=8, seed=0, desc_act=False):
 
 def test_reject_prequant_gptq_always_true_on_supported_mlx_lm(monkeypatch):
     import unsloth_zoo.mlx.loader as ml
-    monkeypatch.setattr(ml, "_mlx_lm_supports_native_prequant", lambda: True)
     assert ml._mlx_lm_would_reject_prequant(
-        "/nonexistent", "gptq", {"bits": 4, "group_size": 128, "desc_act": False}
+        "gptq", {"bits": 4, "group_size": 128, "desc_act": False}
     ) is True
     assert ml._mlx_lm_would_reject_prequant(
-        "/nonexistent", "gptq", {"bits": 4, "group_size": 128, "desc_act": True}
+        "gptq", {"bits": 4, "group_size": 128, "desc_act": True}
     ) is True
 
 
 def test_reject_prequant_awq_defers_on_supported_mlx_lm(monkeypatch):
     import unsloth_zoo.mlx.loader as ml
-    monkeypatch.setattr(ml, "_mlx_lm_supports_native_prequant", lambda: True)
     assert ml._mlx_lm_would_reject_prequant(
-        "/nonexistent", "awq", {"bits": 4, "group_size": 128}
+        "awq", {"bits": 4, "group_size": 128}
     ) is False
 
 
 @pytest.mark.parametrize("group_size", [-1, 0])
 def test_reject_prequant_full_group_awq_dequants_locally(monkeypatch, group_size):
     import unsloth_zoo.mlx.loader as ml
-    monkeypatch.setattr(ml, "_mlx_lm_supports_native_prequant", lambda: True)
     assert ml._mlx_lm_would_reject_prequant(
-        "/nonexistent", "awq", {"bits": 4, "group_size": group_size}
+        "awq", {"bits": 4, "group_size": group_size}
     ) is True
     assert ml._mlx_lm_would_reject_prequant(
-        "/nonexistent", "awq", {"bits": 4, "q_group_size": group_size}
+        "awq", {"bits": 4, "q_group_size": group_size}
     ) is True
 
 
@@ -147,13 +144,6 @@ def test_awq_group_size_is_full_predicate():
     assert ml._awq_group_size_is_full({"group_size": None}) is False
     assert ml._awq_group_size_is_full({"group_size": "bad"}) is False
     assert ml._awq_group_size_is_full(None) is False
-
-
-def test_reject_prequant_old_mlx_lm_dequants_everything(monkeypatch):
-    import unsloth_zoo.mlx.loader as ml
-    monkeypatch.setattr(ml, "_mlx_lm_supports_native_prequant", lambda: False)
-    assert ml._mlx_lm_would_reject_prequant("/x", "awq", {"bits": 4}) is True
-    assert ml._mlx_lm_would_reject_prequant("/x", "gptq", {"bits": 4}) is True
 
 
 def test_dead_gptq_g_idx_helper_removed():
@@ -513,7 +503,6 @@ def test_full_group_gemm_awq_routes_to_local_dequant(monkeypatch, tmp_path):
             },
         }, f)
     monkeypatch.setattr(mlx_lm_utils, "_download", lambda *a, **k: repo)
-    monkeypatch.setattr(loader, "_mlx_lm_supports_native_prequant", lambda: True)
 
     class _ReachedLocalDequant(Exception):
         pass

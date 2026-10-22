@@ -6181,7 +6181,7 @@ def _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=False):
     return dequantized.reshape(original_shape).astype(original_dtype)
 
 
-# GPTQ/AWQ: mlx-lm >= 0.30.4 (PR #730) loads standard AWQ, contiguous-group GPTQ is repacked as MLX affine, the rest is dequantized to fp16.
+# GPTQ/AWQ: mlx-lm (>= 0.30.4, PR #730) loads standard AWQ, contiguous-group GPTQ is repacked as MLX affine, the rest is dequantized to fp16.
 _HF_RUNTIME_DEQUANT_METHODS = frozenset({"gptq", "awq"})
 # Fail loud; else the generic MLX check misreports them as a bits/group_size mismatch.
 _HF_UNSUPPORTED_PACKED_METHODS = frozenset({
@@ -6283,40 +6283,9 @@ def _awq_group_size_is_full(quant_config):
         return False
 
 
-_MLX_LM_NATIVE_PREQUANT_MIN = (0, 30, 4)
-
-
-def _mlx_lm_supports_native_prequant():
-    """mlx-lm >= 0.30.4 (PR #730); unknown version = unsupported."""
-    try:
-        from importlib.metadata import version as _dist_version
-
-        raw = _dist_version("mlx-lm")
-    except Exception:
-        return False
-    parts = []
-    for chunk in str(raw).split(".")[:3]:
-        digits = ""
-        for ch in chunk:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        parts.append(int(digits) if digits else 0)
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts) >= _MLX_LM_NATIVE_PREQUANT_MIN
-
-
-def _mlx_lm_would_reject_prequant(local_path, method, quant_config):
-    """GPTQ always (mlx-lm decodes it with the AWQ layout and raises on g_idx), full-group AWQ, or mlx-lm < 0.30.4."""
-    if not _mlx_lm_supports_native_prequant():
-        return True
-    if method == "gptq":
-        return True
-    if method == "awq" and _awq_group_size_is_full(quant_config):
-        return True
-    return False
+def _mlx_lm_would_reject_prequant(method, quant_config):
+    """GPTQ always (mlx-lm decodes it with the AWQ layout and raises on g_idx), and full-group AWQ."""
+    return method == "gptq" or (method == "awq" and _awq_group_size_is_full(quant_config))
 
 
 def _adapter_base_prefers_native_prequant(
@@ -6336,12 +6305,7 @@ def _adapter_base_prefers_native_prequant(
     base_quant_cfg = adapter_cfg.get("base_quantization_config")
     if not isinstance(base_quant_cfg, dict):
         return False
-    method = str(base_quant_cfg.get("quant_method", "")).lower()
-    if method == "gptq":
-        return True
-    if method != "awq":
-        return False
-    return _mlx_lm_supports_native_prequant()
+    return str(base_quant_cfg.get("quant_method", "")).lower() in _HF_RUNTIME_DEQUANT_METHODS
 
 
 _DEQUANT_DROP_SIDECARS = ("quantize_config.json", "quant_config.json")
@@ -9746,7 +9710,7 @@ class FastMLXModel:
             # Dense / full-finetuning needs trainable fp16 weights, not mlx-lm's quantized base.
             _force_dense_dequant = not quantization_spec.enabled
             if _force_dense_dequant or _mlx_lm_would_reject_prequant(
-                local_path, hf_prequant_method, hf_prequant_config
+                hf_prequant_method, hf_prequant_config
             ):
                 if distributed_requested:
                     raise NotImplementedError(
@@ -9781,8 +9745,8 @@ class FastMLXModel:
                     _reason = (
                         "a dense / 16-bit / full-finetuning load was requested"
                         if _force_dense_dequant
-                        else "mlx-lm cannot load it natively (act-order g_idx, "
-                             "full-group AWQ, or mlx-lm < 0.30.4)"
+                        else "mlx-lm cannot load it natively (act-order g_idx "
+                             "or full-group AWQ)"
                     )
                     warnings.warn(
                         f"Unsloth: '{model_name}' is a {hf_prequant_method.upper()} "
