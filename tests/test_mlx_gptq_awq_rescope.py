@@ -625,7 +625,9 @@ def test_bnb_prequant_load_still_cleans_its_scratch_dir(monkeypatch, tmp_path):
     assert not scratch.exists()
 
 
-def test_failed_gptq_load_removes_scratch_dir(monkeypatch, tmp_path):
+@pytest.mark.parametrize("warnings_as_errors", [False, True])
+def test_failed_gptq_load_removes_scratch_dir(monkeypatch, tmp_path, warnings_as_errors):
+    import warnings
     import mlx_lm
     import mlx_lm.utils as mlx_lm_utils
     import unsloth_zoo.mlx.loader as loader
@@ -644,7 +646,9 @@ def test_failed_gptq_load_removes_scratch_dir(monkeypatch, tmp_path):
         raise RuntimeError("load failed")
 
     monkeypatch.setattr(mlx_lm, "load", _boom)
-    with pytest.raises(Exception):
+    with warnings.catch_warnings(), pytest.raises(Exception):
+        if warnings_as_errors:
+            warnings.simplefilter("error")
         FastMLXModel.from_pretrained(repo, text_only=True)
     assert not scratch.exists()
 

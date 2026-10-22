@@ -9736,6 +9736,10 @@ class FastMLXModel:
                     _prequant_src_path, config_data, hf_prequant_method, hf_prequant_config,
                     mlx_affine=_gptq_affine,
                 )
+                # Registered before any warning: warnings-as-errors must still clean it up.
+                _scratch = _LOAD_SCRATCH_DIRS.get()
+                if _scratch is not None:
+                    _scratch.append(dequant_dir)
                 if "quantization" in config_data:
                     print(
                         f"Unsloth: '{model_name}' is a GPTQ checkpoint; repacked its "
@@ -9757,9 +9761,6 @@ class FastMLXModel:
                 local_path = dequant_dir
                 model_name = dequant_dir
                 dequant_temp_dir = dequant_dir
-                _scratch = _LOAD_SCRATCH_DIRS.get()
-                if _scratch is not None:
-                    _scratch.append(dequant_dir)
             else:
                 print(
                     f"Unsloth: '{model_name}' is a standard "
