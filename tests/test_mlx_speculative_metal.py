@@ -999,8 +999,10 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
     assert list(ar.run_speculative_rounds(model, object(), max_tokens = 1)) == [("upstream", None)]
     draft, rounds, started = SpeculativeDraft(_script(("draft", 3)) if native else _script(("copy", 4), ("plain", 3)), _drafter(model, max_lag = 32) if native else None), [], []
     monkeypatch.setattr(draft.controller, "record_round", lambda plan, *args, **kwargs: rounds.append(plan))
+    kept, append = [], ar.SpeculativePrefill.append
+    monkeypatch.setattr(ar.SpeculativePrefill, "append", lambda self, output: append(self, output) or kept.append(sum(int(chunk.shape[1]) for chunk in self.chunks)))
     if native:
-        start = draft.drafter.start
+        draft.drafter.prompt_tail, start = 48, draft.drafter.start
         monkeypatch.setattr(draft.drafter, "start", lambda prompt, hidden, pending: started.append(hidden) or start(prompt, hidden, pending))
     generate = lambda **kwargs: [int(token) for token, _ in ar.generate_step(mx.array([ids[0]]), model, None, None, max_tokens = 96, temperature = 0.0, **kwargs)]
     for prefill_step_size in (16, None):  # unchunked, the final forward returns every prompt position's hidden
@@ -1011,7 +1013,9 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size) == plain
         draft.prepare(ids[0], SamplingParams(), [penalty := _presence()])
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size, logits_processors = [penalty]) == penalized != plain
-    assert rounds and [hidden.shape[1] for hidden in started] == ([32] * 4 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+    # A row primes on the prompt's last prompt_tail positions, in max_lag pieces that drop none of them.
+    assert rounds and [hidden.shape[1] for hidden in started] == ([48] * 4 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+    assert not native or (len(ids[0]) > max(kept) == 48 and not any(draft.drafter.dropped.values()))
     # The same positions from six chunks as from one forward: chunking moves them ~0.07 on average, a one-position shift ~3.3.
     assert not native or (started[0] - started[2]).abs().mean().item() < 0.5
     with pytest.raises(RuntimeError, match = "prepare"):

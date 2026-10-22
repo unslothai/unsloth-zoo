@@ -1237,7 +1237,7 @@ class SpeculativeDraft:
     @property
     def prompt_tail(self) -> int:
         """How many of the prompt's last hidden states an MTP drafter starts from; other kinds take the whole prompt."""
-        return getattr(self.drafter, "max_lag", 1) if self.drafter is not None and self.draft_kind == "mtp" else 0
+        return getattr(self.drafter, "prompt_tail", 1) if self.drafter is not None and self.draft_kind == "mtp" else 0
 
     def prepare(self, prompt: Sequence[int], sampling: SamplingParams, processors: Sequence[Callable] = ()) -> None:
         self._request = (list(prompt), sampling, list(processors))
@@ -1441,6 +1441,10 @@ class MTPDrafter:
     target hidden ``j``). Plain windows and copy rounds only record pairs; a row replays them just before
     it drafts, so an unused head costs nothing. The engine joins and splits head caches with the target's."""
 
+    # Prompt positions a row starts from: more lifts acceptance on long prompts, but priming time and the
+    # hidden states the prefill keeps grow with it.
+    prompt_tail = 4096
+
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
         from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 
@@ -1465,8 +1469,10 @@ class MTPDrafter:
             self._shortlist.prepare()
         count = 0 if hidden is None else min(int(hidden.shape[1]), len(prompt))
         row = DraftRow(len(prompt) - count)
-        if count:
-            self.push(row, [*prompt[len(prompt) - count + 1 :], pending], hidden[0, -count:])
+        tokens, hidden = [*prompt[len(prompt) - count + 1 :], pending], None if hidden is None else hidden[0, int(hidden.shape[1]) - count :]
+        # max_lag pairs per replay, so a long prompt never runs the head over all of its positions at once.
+        for begin in range(0, count, self.max_lag):
+            self.push(row, tokens[begin : begin + self.max_lag], hidden[begin : begin + self.max_lag])
             self.catch_up(cache, [row])
         return row, cache
 
@@ -1656,7 +1662,7 @@ class HeadDrafter:
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
         self.model = model
         self.target = target
-        self.max_lag = max_lag
+        self.max_lag = self.prompt_tail = max_lag
 
     def new_cache(self) -> list:
         return []
