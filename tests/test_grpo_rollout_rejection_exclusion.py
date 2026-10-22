@@ -204,3 +204,102 @@ def test_default_path_without_rejection_keeps_kl_on_is_masked_tokens():
     loss.backward()
     masked = (flat == 0) & (mask > 0)
     assert (new.grad[masked] != 0).all()
+
+
+# Rollout logprobs as pi_old (UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD, verl bypass mode): sampling is
+# dropped, old = rollout. verl compute_policy_loss_bypass_mode still runs
+# compute_rollout_correction_and_rejection_mask with old_log_prob = the current log_prob, so the
+# rejection statistic is on log(pi_theta / pi_rollout) and the rejected tokens leave the loss.
+
+
+def _run_bypass(ref, new, rollout, mask, adv, beta, rollout_rs, loss_type = "dapo"):
+    old, sampling = rr.grpo_rollout_logps_as_old(rollout)
+    kwargs = dict(
+        loss_type = loss_type, epsilon_low = EPS_LOW, epsilon_high = EPS_HIGH, max_completion_length = new.shape[1],
+        num_items_in_batch = mask.sum(), current_gradient_accumulation_steps = 1, steps_per_generation = 1,
+        num_processes = 1, importance_sampling_level = "token", use_vllm = True,
+        vllm_importance_sampling_correction = True, rollout_logps_as_old = True, use_bias_correction_kl = False,
+    )
+    if rollout_rs is not None:
+        kwargs["rollout_rs"] = rollout_rs
+    return rr.grpo_compute_loss(ref, new, old, sampling, torch.zeros_like(mask), mask, beta, adv, **kwargs)[0]
+
+
+def _oracle_bypass(ref, new, rollout, mask, adv, beta, parsed, loss_type):
+    m = mask.double()
+    new, rollout = new.double(), rollout.double()
+    keep = _oracle_keep(new.detach(), rollout, mask, parsed) * m
+    lr = torch.where(m > 0, new - rollout, torch.zeros_like(new)).clamp(-20, 20)
+    coef = lr.exp()
+    a = adv.double().unsqueeze(1)
+    per_token = -torch.min(coef * a, coef.clamp(1 - EPS_LOW, 1 + EPS_HIGH) * a)
+    if beta != 0.0:
+        d = torch.where(m > 0, ref.double() - new, torch.zeros_like(new)).clamp(-20, 20)
+        per_token = per_token + beta * (d.exp() - d - 1).clamp(-10, 10)
+    per_token = torch.where(keep > 0, per_token, torch.zeros_like(per_token))
+    if loss_type == "dapo":
+        return per_token.sum() / m.sum().clamp(min = 1)
+    return (per_token.sum(-1) / m.sum(-1).clamp(min = 1)).mean()
+
+
+def test_bypass_mode_applies_rejection():
+    # Review repro (zoo#1927): new = -2, rollout = -1, advantage 1, token_k1 bounds [0.5, 2]. The
+    # statistic -log(pi_theta / pi_rollout) = 1 > log 2 rejects the token; main ignored the filter
+    # and returned -exp(-1).
+    new = torch.full((1, 1), -2.0, dtype = torch.float64, requires_grad = True)
+    rollout = torch.full((1, 1), -1.0, dtype = torch.float64)
+    mask = torch.ones(1, 1, dtype = torch.long)
+    loss = _run_bypass(None, new, rollout, mask, torch.ones(1, dtype = torch.float64), 0.0,
+                       rr.grpo_parse_rollout_rs("token_k1", "0.5_2"))
+    loss.backward()
+    assert loss.item() == 0.0 and new.grad.item() == 0.0
+
+
+@pytest.mark.parametrize("options,thresholds", RS)
+@pytest.mark.parametrize("loss_type", ["dapo", "grpo"])
+@pytest.mark.parametrize("beta", [0.0, 0.04])
+def test_bypass_rejection_matches_fp64_oracle(options, thresholds, loss_type, beta):
+    ref, new, old, sampling, mask, adv = _data(7)
+    rollout = sampling.float().double()  # grpo_rollout_logps_as_old hands the loss float32 rollout logps
+    parsed = rr.grpo_parse_rollout_rs(options, thresholds)
+    keep = _oracle_keep(new.detach(), rollout, mask, parsed) * mask
+    assert 0 < int(((keep == 0) & (mask > 0)).sum()), "the threshold should reject something"
+    loss = _run_bypass(ref, new, rollout, mask, adv, beta, parsed, loss_type)
+    torch.testing.assert_close(loss, _oracle_bypass(ref, new, rollout, mask, adv, beta, parsed, loss_type),
+                               rtol = 1e-12, atol = 1e-15)
+    loss.backward()
+    oracle_new = new.detach().clone().requires_grad_(True)
+    _oracle_bypass(ref, oracle_new, rollout, mask, adv, beta, parsed, loss_type).backward()
+    torch.testing.assert_close(new.grad, oracle_new.grad, rtol = 1e-10, atol = 1e-14)
+
+
+def test_bypass_without_rejection_is_unchanged():
+    ref, new, old, sampling, mask, adv = _data(8)
+    plain = _run_bypass(ref, new, sampling, mask, adv, 0.04, None)
+    wide = _run_bypass(ref, new, sampling, mask, adv, 0.04, rr.grpo_parse_rollout_rs("seq_mean_k3", "1e9"))
+    assert torch.equal(plain, wide)
+
+
+def test_bypass_metrics_report_gaps_past_the_loss_clamp():
+    # Review repro: gaps 30 and 20 nats. coef_1 is clamped to e^20 in the loss; |log r| must stay raw.
+    mask = torch.ones(1, 2, dtype = torch.long)
+    raw = torch.tensor([[30.0, 20.0]], dtype = torch.float64)
+    coef_1 = raw.clamp(-20, 20).exp().float()
+    delta, ratio = rr.grpo_rollout_as_old_ratio_metrics(coef_1, mask, raw)
+    torch.testing.assert_close(delta, raw.float())
+    torch.testing.assert_close(ratio, coef_1)
+
+
+@pytest.mark.parametrize("as_old", ["0", "1"])
+def test_rollout_rs_warning_follows_bypass_support(monkeypatch, as_old):
+    # Without vLLM IS correction rejection only runs with rollout logps as pi_old, so only the
+    # other case is reported as ignored.
+    import types
+    monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_RS", "token_k3")
+    monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", as_old)
+    seen = []
+    monkeypatch.setattr(rr.logger, "warning", lambda msg, *a, **k: seen.append(msg))
+    trainer = types.SimpleNamespace(args = types.SimpleNamespace(top_entropy_quantile = 1.0), use_vllm = True,
+                                    vllm_importance_sampling_correction = False)
+    rr._warn_unsupported_grpo_options(trainer)
+    assert any("UNSLOTH_GRPO_ROLLOUT_RS" in m for m in seen) == (as_old == "0")

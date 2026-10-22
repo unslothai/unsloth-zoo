@@ -324,21 +324,25 @@ def test_accumulated_loss_without_the_marker_is_unchanged(monkeypatch):
 
 
 def test_accumulated_loss_reports_the_clipped_ratio(monkeypatch):
+    # r (and the ESS built on it) is the loss ratio coef_1, like verl's SAFETY_BOUND clamped IS
+    # weights; |log r| and the k1 / k3 metrics use the raw new - rollout, like verl
+    # compute_offpolicy_metrics, so a gap past the [-20, 20] loss clamp is not under-reported.
     values = torch.tensor([1.5, 0.5, 1.0, 2.0, 1.0, 0.25, 1.1, 7.0, 9.0, 3.0, 0.1, 4.0, 2.5, 1.25, 0.75])
 
     def coef_of(mask):
         return values[: mask.numel()].view(mask.shape)
 
-    _, _, out, metrics = _drive(monkeypatch, True, coef_1 = coef_of)
+    seen, _, out, metrics = _drive(monkeypatch, True, coef_1 = coef_of)
     delta, ratio, mask = out[3], out[4], out[6]
     coef_1 = coef_of(mask)
     keep = mask.bool()
+    raw = seen["new"].double() - seen["old"].double()
     torch.testing.assert_close(ratio[keep], coef_1[keep])
-    torch.testing.assert_close(delta[keep], coef_1.log().abs()[keep])
-    lr = coef_1.double().log()[keep]
-    r = lr.exp()
+    torch.testing.assert_close(delta[keep], raw.abs().float()[keep])
+    lr = raw[keep]
+    r = coef_1.double()[keep]
     m = metrics["train"]
-    assert m["sampling/rollout_kl_k3/mean"] == [pytest.approx((r - 1 - lr).mean().item(), rel = 1e-6)]
+    assert m["sampling/rollout_kl_k3/mean"] == [pytest.approx((lr.exp() - 1 - lr).mean().item(), rel = 1e-6)]
     assert m["sampling/importance_sampling_ess"] == [
         pytest.approx((r.sum() ** 2 / (r.numel() * (r * r).sum())).item(), rel = 1e-6)
     ]
@@ -374,8 +378,10 @@ def test_unscored_rollout_tokens_get_ratio_one(monkeypatch):
     keep = mask.bool() & ~hole
     torch.testing.assert_close(old[keep], rr.align_logprobs_with_mask(sampling, mask)[keep])
     assert seen["kwargs"]["rollout_logps_as_old"] is True
-    assert metrics["train"]["sampling/rollout_kl_k3/mean"] == [0.0]
-    assert metrics["train"]["sampling/rollout_kl_k1/mean"] == [0.0]
+    # The hole is left out of the sums; the scored tokens report their raw new - rollout gap.
+    lr = (new.double() - old.double())[keep]
+    assert metrics["train"]["sampling/rollout_kl_k3/mean"] == [pytest.approx((lr.exp() - 1 - lr).mean().item(), rel = 1e-6)]
+    assert metrics["train"]["sampling/rollout_kl_k1/mean"] == [pytest.approx((-lr).mean().item(), rel = 1e-6)]
 
 
 def test_default_batch_does_not_ask_for_the_clamp(monkeypatch):
