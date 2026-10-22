@@ -441,3 +441,18 @@ def test_a_fullgraph_compile_on_an_unprobed_card_traces(spoof, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     out = torch.compile(gate, fullgraph = True, backend = "eager")(torch.zeros(2))
     assert out.tolist() == [1.0, 1.0]
+
+
+def test_the_modulelist_forward_declines_a_card_without_grouped_mm(monkeypatch):
+    # A block moved after enable onto a GPU model without torch._grouped_mm runs its original loop.
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ml
+    from unsloth_zoo.temporary_patches import moe_utils as mu
+
+    monkeypatch.setattr(mu, "_grouped_mm_supported_on", lambda device: False)
+    sentinel = object()
+    block = SimpleNamespace(
+        _unsloth_moe_spec = None, experts = [], _orig_moe_forward = lambda hs: sentinel
+    )
+    hidden = SimpleNamespace(device = torch.device("cuda", 1), dtype = torch.bfloat16)
+    assert ml.grouped_moe_forward(block, hidden) is sentinel
