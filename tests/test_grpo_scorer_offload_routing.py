@@ -135,5 +135,8 @@ def test_old_scorer_keeps_logits_control():
         saved.append(tensor.numel() * tensor.element_size())
         return tensor
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-        rr.chunked_hidden_states_selective_log_softmax(states, head, index, 4)
+        kwargs = {}
+        if "fused_linear" in inspect.signature(rr.chunked_hidden_states_selective_log_softmax).parameters:
+            kwargs["fused_linear"] = False  # the old chunked path, not the fused kernel
+        rr.chunked_hidden_states_selective_log_softmax(states, head, index, 4, **kwargs)
     assert sum(saved) >= batch * length * vocab * 4
