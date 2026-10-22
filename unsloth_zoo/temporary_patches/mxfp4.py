@@ -441,8 +441,7 @@ def patch_convert_moe_packed_tensors():
         if blocks.is_cuda and blocks.dtype == torch.uint8 and blocks.shape[-1] == 16 and dtype in (torch.bfloat16, torch.float16):
             return mxfp4_dequantize(blocks, scales, dtype = dtype)
         if not _mxfp4_dequant._LDEXP_EXACT and blocks.dtype == torch.uint8:
-            # torch < 2.12's ldexp forms 2^e in the output dtype (fp16 inf from 2^16, 0 * 2^128 = NaN): the
-            # reference decodes through fp32 with one rounding, for any block size.
+            # torch < 2.12 ldexp forms 2^e in the output dtype (fp16 inf, 0 * inf = NaN); decode via fp32.
             with _device_guard(blocks):
                 return _mxfp4_dequant.mxfp4_dequantize_torch(blocks, scales, dtype = dtype)
 

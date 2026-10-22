@@ -48,7 +48,7 @@ _LDEXP_EXACT = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[
 
 def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False, out = None):
     """Reference: transformers' convert_moe_packed_tensors arithmetic, in row chunks."""
-    # float64 holds 2^128 itself, so only narrower outputs need the fp32 detour (fp64 through fp32 overflowed).
+    # float64 holds 2^128; routing it through fp32 would overflow.
     work = dtype if _LDEXP_EXACT or dtype == torch.float64 else torch.float32
     lut = torch.tensor(_FP4_VALUES, dtype = work, device = blocks.device)
     *prefix, G, B = blocks.shape
@@ -62,8 +62,7 @@ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = F
     scales_in = scales.reshape(R, G)
     # Transposed: row r lands in column r % N of expert r // N; a chunk never crosses an expert.
     dst = buf.view(R // N, G * B * 2, N) if transpose else buf.view(R, G * B * 2)
-    # Bytes per decoded value held at once: 8 in the work dtype; the fp32 detour also keeps the ldexp and where
-    # outputs and the cast (~18), which overran the budget with the old step.
+    # Live bytes per value: 8 native; the fp32 detour also holds ldexp/where outputs and the cast (~18).
     per_value = 8 if work == dtype else 20
     step = max(1, min(N if transpose else R, _TORCH_CHUNK_BYTES // (G * B * 2 * per_value)))
     r0 = 0
