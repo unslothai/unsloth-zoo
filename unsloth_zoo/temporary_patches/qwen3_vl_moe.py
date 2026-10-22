@@ -258,7 +258,27 @@ def patch_qwen3_vl_moe():
 
         backend = select_moe_backend()
 
-        if backend == "grouped_mm":
+        forward_sonic_moe = None
+        if backend == "sonic_moe":
+            try:
+                from .moe_utils_sonic import forward_sonic_moe
+            except ImportError:
+                backend = "grouped_mm"
+
+        if backend == "sonic_moe":
+
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor,
+            ) -> torch.Tensor:
+                """sonic-moe forward; falls back to grouped_mm where sonic does not support the weights."""
+                return forward_sonic_moe(
+                    self, hidden_states, top_k_index, top_k_weights
+                )
+
+        elif backend == "grouped_mm":
 
             def forward(
                 self,
