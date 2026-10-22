@@ -1896,7 +1896,8 @@ def select_moe_backend():
         return _SELECTED_MOE_BACKEND
     backend = _select_moe_backend()
     # Chosen while unsloth imports (its Triton kernels cannot load yet): choose again on the next call.
-    if not _unsloth_importing():
+    # Not inside a trace either: the write fails the `is None` guard and recompiles the caller once.
+    if not _unsloth_importing() and not torch.compiler.is_compiling():
         _SELECTED_MOE_BACKEND = backend
     return backend
 
