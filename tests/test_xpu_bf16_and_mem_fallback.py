@@ -101,21 +101,53 @@ def test_xpu_bf16_uses_native_conversions(on_xpu, flags, expected):
 
 
 @not_on_macos
-@pytest.mark.parametrize("current", [0, 1])
 @pytest.mark.parametrize(
-    "flags, expected",
+    "flags, current, expected",
     [
-        ((True, _PROVEN_NO_BF16), False),  # any visible proven non-native XPU, whichever is current
-        ((_PROVEN_NO_BF16, True), False),
-        ((True, False), True),             # aspects unreadable on that device: unproven there
-        ((False, True), True),
-        ((_PROVEN_NO_BF16, False), False),
+        ((True, _PROVEN_NO_BF16), 0, True),   # native current XPU: the unused sibling never narrows it
+        ((True, _PROVEN_NO_BF16), 1, False),  # the current XPU itself emulates bf16
+        ((_PROVEN_NO_BF16, True), 0, False),
+        ((_PROVEN_NO_BF16, True), 1, True),
+        ((True, False), 0, True),             # aspects unreadable on that device: unproven there
+        ((True, False), 1, True),
+        ((False, True), 0, True),
+        ((_PROVEN_NO_BF16, False), 0, False),
+        ((_PROVEN_NO_BF16, False), 1, True),
     ],
 )
-def test_xpu_bf16_judges_each_device_by_its_own_aspects(on_xpu, flags, current, expected):
+def test_xpu_bf16_judges_the_current_device_by_its_own_aspects(on_xpu, flags, current, expected):
     on_xpu(_fake_xpu(flags, current = current))
     assert dt.device_is_bf16_supported() is expected
     assert dt._xpu_bf16_supported() is expected
+
+
+@not_on_macos
+@pytest.mark.parametrize(
+    "device, expected",
+    [
+        (0, True),
+        (1, False),
+        ("xpu:0", True),
+        (torch.device("xpu", 1), False),
+        ("xpu", True),          # no index: the current device (0 here)
+        ([0, 1], False),        # a model split over both reaches the emulating one
+        ([0, "xpu:0"], True),
+        ("cpu", True),          # nothing on an XPU: nothing to narrow
+    ],
+)
+def test_xpu_bf16_judges_the_devices_a_model_uses(on_xpu, device, expected):
+    on_xpu(_fake_xpu((True, _PROVEN_NO_BF16), current = 0))
+    assert dt._xpu_bf16_supported(device) is expected
+
+
+@not_on_macos
+def test_xpu_bf16_unreadable_current_device_keeps_bf16(on_xpu):
+    xpu = _fake_xpu((_PROVEN_NO_BF16,))
+    def current_device():
+        raise RuntimeError("no context")
+    xpu.current_device = current_device
+    on_xpu(xpu)
+    assert dt._xpu_bf16_supported() is True
 
 
 @not_on_macos
@@ -130,14 +162,15 @@ def test_xpu_bf16_keeps_old_answer_beside_an_older_unsloth(on_xpu, monkeypatch):
 
 @not_on_macos
 @pytest.mark.parametrize("core_answer", [True, False])
-def test_xpu_bf16_gives_the_loaded_unsloths_answer(on_xpu, monkeypatch, core_answer):
-    # Mixed aspect reads where unsloth main (one probe across devices) and this zoo (per device)
-    # differ: the loaded unsloth decides, so the two never pick different dtypes.
-    on_xpu(_fake_xpu((True, False)))
+@pytest.mark.parametrize("current, expected", [(0, True), (1, False)])
+def test_xpu_bf16_released_unsloth_never_narrows_the_current_device(on_xpu, monkeypatch, core_answer, current, expected):
+    # Released unsloth judges every visible XPU: its False for an unused emulating sibling must not
+    # turn bf16 off on a native current XPU. The current device's own answer decides.
+    on_xpu(_fake_xpu((True, _PROVEN_NO_BF16), current = current))
     core = types.ModuleType("unsloth.device_type")
     core.xpu_supports_native_bf16 = lambda: core_answer
     monkeypatch.setitem(sys.modules, "unsloth.device_type", core)
-    assert dt._xpu_bf16_supported() is core_answer
+    assert dt._xpu_bf16_supported() is expected
 
 
 @not_on_macos
@@ -176,17 +209,24 @@ def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
 
     monkeypatch.delitem(sys.modules, "unsloth.device_type", raising = False)
     monkeypatch.setenv("UNSLOTH_DISABLE_DOUBLE_BUFFER", "1")
+    # The answer is cached on the first init: an earlier test may have cached False.
+    monkeypatch.setattr(gc, "_double_buffer_disabled", lambda: True)
     monkeypatch.setattr(torch, "empty", empty)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
     monkeypatch.setattr(gc, "DEVICE_TYPE", "xpu")
     monkeypatch.setattr(gc, "DEVICE_TYPE_TORCH", "cuda")
     try:
         got = {}
-        for flags in ((True,), (False,), (_PROVEN_NO_BF16,), (_MISSING,), (True, _PROVEN_NO_BF16), (_PROVEN_NO_BF16, True), (True, False)):
-            monkeypatch.setattr(torch, "xpu", _fake_xpu(flags), raising = False)
+        cases = (
+            ((True,), None), ((False,), None), ((_PROVEN_NO_BF16,), None), ((_MISSING,), None),
+            ((True, _PROVEN_NO_BF16), 0), ((True, _PROVEN_NO_BF16), 1),
+            ((_PROVEN_NO_BF16, True), 0), ((_PROVEN_NO_BF16, True), 1), ((True, False), None),
+        )
+        for flags, current in cases:
+            monkeypatch.setattr(torch, "xpu", _fake_xpu(flags, current = current), raising = False)
             gc.CPU_BUFFERS = []
             gc.initialize_unsloth_gradient_checkpointing()
-            got[flags] = gc.CPU_BUFFERS[0].dtype
+            got[flags, current] = gc.CPU_BUFFERS[0].dtype
     finally:
         for name, value in saved.items():
             if value is _MISSING:
@@ -194,13 +234,16 @@ def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
                     delattr(gc, name)
             else:
                 setattr(gc, name, value)
-    assert got[(True,)] is torch.bfloat16
-    assert got[(_MISSING,)] is torch.bfloat16
-    assert got[(False,)] is torch.bfloat16
-    assert got[(_PROVEN_NO_BF16,)] is torch.float16
-    assert got[(True, _PROVEN_NO_BF16)] is torch.float16
-    assert got[(_PROVEN_NO_BF16, True)] is torch.float16
-    assert got[(True, False)] is torch.bfloat16
+    assert got[(True,), None] is torch.bfloat16
+    assert got[(_MISSING,), None] is torch.bfloat16
+    assert got[(False,), None] is torch.bfloat16
+    assert got[(_PROVEN_NO_BF16,), None] is torch.float16
+    # The current XPU decides: an unused emulating sibling keeps a native current device bf16.
+    assert got[(True, _PROVEN_NO_BF16), 0] is torch.bfloat16
+    assert got[(True, _PROVEN_NO_BF16), 1] is torch.float16
+    assert got[(_PROVEN_NO_BF16, True), 0] is torch.float16
+    assert got[(_PROVEN_NO_BF16, True), 1] is torch.bfloat16
+    assert got[(True, False), None] is torch.bfloat16
 
 
 @pytest.fixture
@@ -261,18 +304,20 @@ def _vllm_dtype_block(vu):
 
 @not_on_macos
 @pytest.mark.parametrize(
-    "flags, dtype, expected",
+    "flags, current, dtype, expected",
     [
-        ((_PROVEN_NO_BF16,), None, "float16"),
-        ((_PROVEN_NO_BF16,), "bfloat16", "bfloat16"),  # explicit bf16 still runs (emulated)
-        ((_PROVEN_NO_BF16,), "float16", "float16"),
-        ((True,), None, "bfloat16"),
-        ((True, _PROVEN_NO_BF16), None, "float16"),    # any visible non-native XPU
-        ((_PROVEN_NO_BF16, True), None, "float16"),
+        ((_PROVEN_NO_BF16,), None, None, "float16"),
+        ((_PROVEN_NO_BF16,), None, "bfloat16", "bfloat16"),  # explicit bf16 still runs (emulated)
+        ((_PROVEN_NO_BF16,), None, "float16", "float16"),
+        ((True,), None, None, "bfloat16"),
+        ((True, _PROVEN_NO_BF16), 0, None, "bfloat16"),  # native current XPU, unused emulating sibling
+        ((True, _PROVEN_NO_BF16), 1, None, "float16"),   # the current XPU emulates bf16
+        ((_PROVEN_NO_BF16, True), 0, None, "float16"),
+        ((_PROVEN_NO_BF16, True), 1, None, "bfloat16"),
     ],
 )
-def test_vllm_xpu_dtype_keeps_explicit_bf16(on_xpu, vu, flags, dtype, expected):
-    on_xpu(_fake_xpu(flags))
+def test_vllm_xpu_dtype_keeps_explicit_bf16(on_xpu, vu, flags, current, dtype, expected):
+    on_xpu(_fake_xpu(flags, current = current))
     scope = {
         "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
         "__package__": "unsloth_zoo", "dtype": None if dtype is None else getattr(torch, dtype),
@@ -356,9 +401,11 @@ def test_vllm_xpu_dtype_follows_vllms_bf16_check(on_xpu, vu, monkeypatch, flags,
 
 
 @not_on_macos
-@pytest.mark.parametrize("core_has_rule, expected", [(True, "float16"), (False, "bfloat16")])
-def test_vllm_xpu_bf16_refusal_follows_the_loaded_unsloth(on_xpu, vu, monkeypatch, core_has_rule, expected):
-    # An older unsloth keeps the Hugging Face side bf16: vLLM must not switch alone and split the weights.
+@pytest.mark.parametrize("core_has_rule", [True, False])
+def test_vllm_xpu_bf16_refusal_switches_beside_any_unsloth(on_xpu, vu, monkeypatch, core_has_rule):
+    # Released unsloth has no xpu_vllm_refuses_bf16 and still asks for bf16. vLLM must switch anyway,
+    # or its engine raises on an A770; convert_vllm_to_huggingface then follows the fp16 weights.
+    expected = "float16"
     on_xpu(_fake_xpu((_PROVEN_NO_BF16,)))
     _fake_vllm_platforms(monkeypatch, refuses = True)
     core = types.ModuleType("unsloth.device_type")

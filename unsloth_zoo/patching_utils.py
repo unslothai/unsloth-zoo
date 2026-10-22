@@ -564,6 +564,9 @@ def patch_model_and_tokenizer(
     pass
 
     # Determine the model's correct data type
+    # A vLLM-backed model shares vLLM's weights: their fp16 wins over a bf16 the loader still asked for.
+    if correct_dtype == torch.bfloat16 and getattr(model, "_unsloth_vllm_dtype", None) == torch.float16:
+        correct_dtype = torch.float16
     if correct_dtype is None:
         try:
             correct_dtype = _get_dtype(dtype_from_config(model.config))
