@@ -302,6 +302,21 @@ def test_bound_gguf_push_filters_kwargs(monkeypatch):
     }
 
 
+def test_text_generate_with_no_new_tokens_returns_the_prompt(monkeypatch):
+    import mlx_lm
+    import unsloth_zoo.mlx.loader as loader
+
+    def refusing_stream_generate(*args, max_tokens=None, **kwargs):
+        raise ValueError("Maximum number of tokens must be non-zero (use -1 for no limit).")
+        yield
+
+    monkeypatch.setattr(mlx_lm, "stream_generate", refusing_stream_generate)
+    tokenizer = types.SimpleNamespace(bos_token=None, eos_token_ids={2})
+    model = types.SimpleNamespace(_tokenizer=tokenizer, _is_vlm_model=False)
+    for limit in ({"max_length": 2}, {"max_new_tokens": 0}):
+        assert loader._mlx_generate(model, input_ids=[[1, 2]], **limit).tolist() == [[1, 2]]
+
+
 def test_text_generate_honors_do_sample_false(monkeypatch):
     import mlx_lm
     import mlx_lm.sample_utils as sample_utils
@@ -2105,6 +2120,51 @@ def test_minicpmo_vision_dtype_adapter_is_scoped_and_fail_closed(monkeypatch):
     assert loader._minicpmo_vision_dtype_adapter(_test_minicpmo_legacy_vision) is _test_minicpmo_legacy_vision
 
 
+def test_qwen3_omni_audio_clips_are_encoded_one_at_a_time(monkeypatch):
+    """mlx-vlm 0.7.4 fills a second clip's positions from the first clip's chunks."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as loader
+
+    calls = []
+
+    def get_audio_features(self, input_features, feature_attention_mask=None,
+                           audio_feature_lengths=None):
+        calls.append((input_features.shape[0], feature_attention_mask.tolist()))
+        if input_features.shape[0] > 1:
+            return mx.zeros((5, 1))
+        return input_features[0].T[:int(audio_feature_lengths[0])]
+
+    per_clip = loader._encode_audio_clips_one_at_a_time(get_audio_features)
+    features = mx.array([[[1.0, 2.0, 3.0]], [[4.0, 5.0, 0.0]]])
+    mask, lengths = mx.array([[1, 1, 1], [1, 1, 0]]), mx.array([3, 2])
+    assert per_clip(None, features, mask, lengths).tolist() == [[1.0], [2.0], [3.0], [4.0], [5.0]]
+    assert calls == [(1, [[1, 1, 1]]), (1, [[1, 1, 0]])]
+    assert per_clip(None, features[1:], mask[1:], lengths[1:]).tolist() == [[4.0], [5.0]]
+
+    Thinker = type("Thinker", (), {"get_audio_features": get_audio_features})
+
+    class Model:
+        __module__ = "mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe"
+
+    package = "mlx_vlm.models.qwen3_omni_moe"
+    audio = types.SimpleNamespace(AudioModel=type("AudioModel", (), {"__call__": lambda self: None}))
+    monkeypatch.setitem(sys.modules, f"{package}.thinker", types.SimpleNamespace(Thinker=Thinker))
+    monkeypatch.setitem(sys.modules, f"{package}.audio", audio)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda name: Model if name == "qwen" else object)
+    source = {"text": "for i, length in enumerate(chunk_lens_after_cnn):"}
+    monkeypatch.setattr(loader, "_safe_getsource", lambda _: source["text"])
+    loader._ensure_qwen3_omni_audio_per_clip("qwen")  # a fixed tower is left alone
+    assert Thinker.get_audio_features is get_audio_features
+    source["text"] = "for i, length in enumerate(feature_lens_after_cnn):"
+    loader._ensure_qwen3_omni_audio_per_clip("other")
+    assert Thinker.get_audio_features is get_audio_features
+    loader._ensure_qwen3_omni_audio_per_clip("qwen")
+    repaired = Thinker.get_audio_features
+    assert repaired.__wrapped__ is get_audio_features
+    loader._ensure_qwen3_omni_audio_per_clip("qwen")
+    assert Thinker.get_audio_features is repaired
+
+
 def test_read_json_file_returns_empty_for_missing_or_malformed_files(tmp_path):
     import unsloth_zoo.mlx.loader as loader
 
@@ -2349,6 +2409,105 @@ def test_copy_source_sidecars_preserves_image_processor_metadata(tmp_path):
         "pytorch_model.bin",
     ):
         assert not (dst / skipped).exists()
+
+
+def test_copy_source_sidecars_refuses_symlinks_leaving_the_model(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("private", encoding="utf-8")
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "vocab.txt").write_text("vocab", encoding="utf-8")
+    (src / "leak.txt").symlink_to(secret)
+    (src / "inside.txt").symlink_to(src / "vocab.txt")
+
+    assert mutils._copy_source_sidecars(src, dst) == 2
+    assert not (dst / "leak.txt").exists()
+    assert (dst / "inside.txt").read_text(encoding="utf-8") == "vocab"
+
+
+def test_copy_source_sidecars_follows_hf_snapshot_blob_links(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    repo = tmp_path / "models--org--name"
+    blob = repo / "blobs" / "abc123"
+    blob.parent.mkdir(parents=True)
+    blob.write_text("template", encoding="utf-8")
+    snapshot = repo / "snapshots" / "sha"
+    snapshot.mkdir(parents=True)
+    (snapshot / "chat_template.jinja").symlink_to(blob)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    assert mutils._copy_source_sidecars(snapshot, dst) == 1
+    assert (dst / "chat_template.jinja").read_text(encoding="utf-8") == "template"
+
+
+def test_copy_source_sidecars_follows_shared_hf_blob_store(tmp_path):
+    # huggingface_hub >= 1.32: snapshot -> models--*/blobs/<etag> -> <cache>/blobs/<xx>/<hash>.
+    import unsloth_zoo.mlx.utils as mutils
+
+    shared = tmp_path / "blobs" / "91" / "91bf"
+    shared.parent.mkdir(parents=True)
+    shared.write_bytes(b"sentencepiece")
+    repo = tmp_path / "models--org--name"
+    (repo / "blobs").mkdir(parents=True)
+    (repo / "blobs" / "etag").symlink_to(shared)
+    snapshot = repo / "snapshots" / "sha"
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer.model").symlink_to(repo / "blobs" / "etag")
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    assert mutils._copy_source_sidecars(snapshot, dst) == 1
+    assert (dst / "tokenizer.model").read_bytes() == b"sentencepiece"
+
+
+def test_a_config_symlink_out_of_the_model_is_not_recovered(tmp_path):
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    secret = tmp_path / "docker_config.json"
+    secret.write_text('{"auths": {"x": "SECRET"}}')
+    src = tmp_path / "model"
+    src.mkdir()
+    (src / "config.json").symlink_to(secret)
+    out = tmp_path / "out"
+    out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(src),))
+    assert not (out / "config.json").exists()
+
+
+def test_a_config_override_dir_falls_back_to_the_snapshot_config(tmp_path):
+    # The VLM config override dir links unpatched files back to the snapshot.
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    repo = tmp_path / "models--org--name"
+    blobs = repo / "blobs"
+    blobs.mkdir(parents=True)
+    snapshot = repo / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (blobs / "deadbeef").write_text('{"model_type": "real"}')
+    (snapshot / "config.json").symlink_to(blobs / "deadbeef")
+    override = tmp_path / "unsloth_mlx_vlm_config_x"
+    override.mkdir()
+    (override / "config.json").symlink_to(snapshot / "config.json")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(override), str(snapshot)))
+    assert (out / "config.json").read_text() == '{"model_type": "real"}'
 
 
 def test_copy_source_sidecars_ignores_non_directory_source(tmp_path):
@@ -3432,7 +3591,10 @@ def test_trusted_dir_handles_a_root_trusted_path(monkeypatch, tmp_path):
     # os.path.join(parent, "") keeps a root parent as "/" rather than "//", which
     # a bare parent + os.sep would produce and never match.
     home = tmp_path / ".unsloth"
-    assert _trusted(monkeypatch, tmp_path / "anywhere", home, env_value=os.sep) is True
+    folder = tmp_path / "anywhere"
+    # Drive-qualified on Windows: a bare "\\" never contains C:\...
+    root = os.path.splitdrive(str(folder))[0] + os.sep
+    assert _trusted(monkeypatch, folder, home, env_value=root) is True
 
 
 def test_trusted_dir_is_case_insensitive_on_windows_style_paths(monkeypatch):

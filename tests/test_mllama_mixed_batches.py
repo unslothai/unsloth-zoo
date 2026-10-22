@@ -193,3 +193,25 @@ def test_image_axis_equal_to_token_width_is_not_padded():
     assert out["aspect_ratio_ids"].shape == (2, 1)
     assert out["aspect_ratio_mask"].shape == (2, 1, TILES)
     assert (out["pixel_values"][0] == 5).all() and (out["pixel_values"][1] == 0).all()
+
+
+@pytest.mark.parametrize("padding_side", ["right", "left"])
+@pytest.mark.parametrize("pad_to_multiple_of", [None, 3])
+def test_prompt_completion_cross_attention_mask_follows_truncation(padding_side, pad_to_multiple_of):
+    collator = make_collator()
+    collator.processor.tokenizer.padding_side = padding_side
+    collator.max_seq_length = 4
+    collator.pad_to_multiple_of = pad_to_multiple_of
+    examples = [
+        {"images": [IMG], "prompt": "a <img> b", "completion": "x y z w"},
+        {"images": [IMG], "prompt": "<img> a", "completion": "x"},
+    ]
+    out = collator(examples)
+    cross, attn = out["cross_attention_mask"], out["attention_mask"].bool()
+    assert cross.shape[:2] == out["input_ids"].shape
+    assert out["input_ids"][0][attn[0]].tolist() == [1, IMG_ID, 2, 3]
+    for j in range(2):
+        ids = out["input_ids"][j][attn[j]]
+        after_image = torch.cumsum(ids == IMG_ID, 0) > 0
+        assert torch.equal(cross[j][attn[j]][:, 0, 0].bool(), after_image)
+        assert (cross[j][~attn[j]] == 0).all()

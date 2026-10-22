@@ -1,0 +1,33 @@
+name = vLLM
+pull_request = https://github.com/vllm-project/vllm/pull/48792
+commit = ccd8197ae9818607cb7e904ffbb83a7ce0fe31fa (refs/pull/48792/head)
+upstream = https://github.com/vllm-project/vllm
+license = Apache-2.0
+license_file = LICENSE
+copyright = Copyright contributors to the vLLM project
+
+description =
+    The Gated DeltaNet ReplaySSM standard-decode Triton kernel from vLLM PR
+    #48792 ("ReplaySSM: cache SSM inputs for faster Gated DeltaNet standard
+    decode"), which closed unmerged when its fork was deleted. Released vLLM ships
+    ReplaySSM for Mamba2 only; unsloth_zoo.vllm_gdn_replayssm backports the GDN
+    path onto released vLLM at runtime and launches this kernel.
+
+exported_api =
+    gdn_replayssm_decode.fused_recurrent_gated_delta_rule_replayssm
+
+modifications =
+    - gdn_replayssm_decode.py is vllm/third_party/flash_linear_attention/ops/
+      fused_recurrent_replayssm.py from the commit above with one change, marked
+      "Modified by Unsloth": the launch-config lookup imported from
+      vllm.model_executor.layers.mamba.ops.replayssm_config is inlined (released
+      vLLM has no "gdn_decode" entry), with the same values as the PR plus a
+      T4 (sm75) entry (32, 1, 1, 4) and a per-device cache, and the kernel
+      imports triton directly instead of vllm.triton_utils.
+    - The runtime integration (state page, metadata builder, layer dispatch) is
+      Unsloth's own code in unsloth_zoo/vllm_gdn_replayssm.py, ported from the
+      same PR.
+
+file_count = 1 python module + __init__.py + this MANIFEST + LICENSE
+
+vendored_by = Unsloth (unsloth_zoo/_vendored/vllm)

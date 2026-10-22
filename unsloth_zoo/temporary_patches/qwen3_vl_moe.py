@@ -38,6 +38,11 @@ from .utils import (
     Cache,
     process_return,
 )
+try:
+    from .moe_router_triton import fused_route_or_none as _fused_route_or_none
+except Exception:
+    def _fused_route_or_none(*args, **kwargs):
+        return None
 from .moe_utils import (
     _check_grouped_gemm_available,
     _TORCH_GROUPED_MM_AVAILABLE,
@@ -48,6 +53,21 @@ from .moe_utils import (
     patch_param_wrapper_for_moe,
 )
 from .qwen3_moe import _make_qwen_moe_lora_extractor
+
+
+try:
+    from .moe_utils_bnb4bit import _moe_uses_bnb4bit_expert_weights, forward_moe_backend_bnb4bit
+except ImportError:
+    _moe_uses_bnb4bit_expert_weights = None
+
+
+def _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights):
+    """Packed bnb 4-bit experts: dequantize then dispatch. The Triton kernels and the per-expert loop
+    index the stack and cannot read a packed Params4bit; None otherwise."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if _moe_uses_bnb4bit_expert_weights is None or not _moe_uses_bnb4bit_expert_weights(self):
+        return None
+    return forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 
 
 def patch_qwen3_vl_moe():
@@ -131,14 +151,18 @@ def patch_qwen3_vl_moe():
         def router_forward(self, hidden_states):
             router_logits = self.gate(hidden_states)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
-            if self.norm_topk_prob:
-                routing_weights = routing_weights / routing_weights.sum(
-                    dim=-1, keepdim=True
+            fused = _fused_route_or_none(router_logits, self.top_k, "softmax_topk", bool(self.norm_topk_prob))
+            if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+                routing_weights, selected_experts = fused
+            else:
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
+                routing_weights, selected_experts = torch.topk(
+                    routing_weights, self.top_k, dim=-1
                 )
+                if self.norm_topk_prob:
+                    routing_weights = routing_weights / routing_weights.sum(
+                        dim=-1, keepdim=True
+                    )
             routing_weights = routing_weights.to(hidden_states.dtype)
             router_scores = torch.zeros_like(
                 router_logits, dtype=hidden_states.dtype
@@ -256,6 +280,9 @@ def patch_qwen3_vl_moe():
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
                 """Grouped-GEMM MoE forward via Triton kernels (fused permutation, cached configs)."""
+                output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
+                if output is not None:
+                    return output
                 return forward_triton_grouped_gemm(
                     self, hidden_states, top_k_index, top_k_weights
                 )
@@ -270,6 +297,9 @@ def patch_qwen3_vl_moe():
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
                 # Same loop fallback logic as Qwen3MoeExperts
+                output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
+                if output is not None:
+                    return output
                 return forward_native_moe_loop(
                     self, hidden_states, top_k_index, top_k_weights
                 )
@@ -303,14 +333,18 @@ def patch_qwen3_vl_moe():
                     self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True)
                 )
 
-                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-                routing_weights, selected_experts = torch.topk(
-                    routing_weights, top_k, dim=-1
-                )
-                if norm_topk_prob:
-                    routing_weights = routing_weights / routing_weights.sum(
-                        dim=-1, keepdim=True
+                fused = _fused_route_or_none(router_logits, top_k, "softmax_topk", bool(norm_topk_prob))
+                if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+                    routing_weights, selected_experts = fused
+                else:
+                    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+                    routing_weights, selected_experts = torch.topk(
+                        routing_weights, top_k, dim=-1
                     )
+                    if norm_topk_prob:
+                        routing_weights = routing_weights / routing_weights.sum(
+                            dim=-1, keepdim=True
+                        )
                 routing_weights = routing_weights.to(hidden_states.dtype)
             final_hidden_states = self.experts(
                 hidden_states_reshaped, selected_experts, routing_weights
@@ -354,6 +388,9 @@ def patch_qwen3_vl_moe():
         )
 
         _original_causal_lm_forward = Qwen3VLMoeForConditionalGeneration.forward
+        # Temporary patches run at init, pre_compile and post_compile: wrap each class once.
+        if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
+            return
 
         def _patched_causal_lm_forward(
             self,
@@ -433,7 +470,12 @@ def patch_qwen3_vl_moe():
         # Preserve __qualname__ so _unsloth_get_batch_samples can detect this is
         # a ForConditionalGeneration forward and compute num_items_in_batch.
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
+        # Lets the compiler read (and fuse the loss of) the real forward, as with functools.wraps.
+        _patched_causal_lm_forward.__wrapped__ = _original_causal_lm_forward
+        _patched_causal_lm_forward._unsloth_hidden_states_wrapper = True
         Qwen3VLMoeForConditionalGeneration.forward = _patched_causal_lm_forward
+        # unsloth's GRPO reads this marker and skips its output_hidden_states fallback, which keeps every layer's hidden states.
+        Qwen3VLMoeForConditionalGeneration.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(
                 "Unsloth: Patched Qwen3VLMoeForConditionalGeneration.forward for GRPO hidden states."

@@ -118,6 +118,31 @@ def test_grpo_kl_clamp_precedes_bias_correction_and_beta(use_bias_correction_kl)
     torch.testing.assert_close(mean_kl, kl.mean())
     torch.testing.assert_close(loss, beta * kl.mean())
 
+@pytest.mark.parametrize("width", [1, 2])
+def test_grpo_mean_kl_skips_masked_rows_for_one_token_completions(width):
+    new = torch.zeros(2, width, dtype=torch.float64, requires_grad=True)
+    ref = torch.full((2, width), 0.5, dtype=torch.float64)
+    mask = torch.zeros(2, width, dtype=torch.long)
+    mask[0] = 1
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, new.detach(), None, torch.zeros(2, width, dtype=torch.long),
+        mask, 0.1, torch.ones(2, dtype=torch.float64),
+    )
+    expected = math.exp(0.5) - 1.0 - 0.5
+    torch.testing.assert_close(mean_kl, torch.tensor(expected, dtype=torch.float64))
+    torch.testing.assert_close(loss, torch.tensor((-1.0 + 0.1 * expected) / 2, dtype=torch.float64))
+
+
+def test_grpo_sequence_level_beta_zero_mean_kl_still_zero():
+    new = torch.zeros(2, 3, requires_grad=True)
+    mask = torch.ones(2, 3, dtype=torch.long)
+    _, _, mean_kl, *_ = rr.grpo_compute_loss(
+        new.detach(), new, new.detach(), None, torch.zeros(2, 3, dtype=torch.long),
+        mask, 0.0, torch.ones(2), importance_sampling_level="sequence",
+    )
+    assert float(mean_kl) == 0.0
+
+
 def test_calculate_pad_tokens_in_prompt_counts_left_pads():
     PAD = 0
     # batch=2, seq_len=6, logits_to_keep=3 -> prompt_section is the
@@ -1191,6 +1216,47 @@ def test_offloaded_log_softmax_preserves_preexisting_head_grad():
     ref, pre_ref = run(_eager_selective_log_softmax)
     assert torch.equal(pre_got, pre_ref)
     assert torch.allclose(got, ref, atol=1e-6), (got - ref).abs().max()
+
+
+@pytest.mark.parametrize("lm_requires_grad", [False, True])
+def test_offloaded_log_softmax_recompute_restores_forward_autocast(lm_requires_grad):
+    # Forward under autocast, backward outside it: an fp32 head must not recompute in fp32.
+    Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
+    args = (4, 0.0, 0.0, 0.0, 1.0)
+
+    def run(op):
+        torch.manual_seed(0)
+        hs = torch.randn(3, 32, 16, dtype=torch.bfloat16).requires_grad_(True)
+        lm = torch.randn(64, 16).requires_grad_(lm_requires_grad)
+        idx = torch.randint(0, 64, (3, 32))
+        go = torch.randn(3, 32)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = op(hs, lm, idx, *args)
+        out.backward(go)
+        return out.detach(), hs.grad, (lm.grad if lm_requires_grad else None)
+
+    out_ref, hs_ref, lm_ref = run(_eager_selective_log_softmax)
+    out_fn, hs_fn, lm_fn = run(Fn.apply)
+    assert torch.equal(out_fn, out_ref)
+    assert torch.equal(hs_fn, hs_ref), (hs_fn.float() - hs_ref.float()).abs().max()
+    if lm_requires_grad:
+        assert torch.equal(lm_fn, lm_ref), (lm_fn - lm_ref).abs().max()
+
+
+def test_offloaded_log_softmax_recompute_keeps_autocast_off_when_forward_had_none():
+    seen = []
+
+    def probe(*a):
+        seen.append(torch.is_autocast_enabled("cpu"))
+        return _eager_selective_log_softmax(*a)
+
+    Fn = _extract_offloaded_log_softmax(probe)
+    hs = torch.randn(2, 8, 16).requires_grad_(True)
+    lm = torch.randn(32, 16)
+    out = Fn.apply(hs, lm, torch.randint(0, 32, (2, 8)), 2, 0.0, 0.0, 0.0, 1.0)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out.sum().backward()
+    assert seen == [False, False]
 
 
 

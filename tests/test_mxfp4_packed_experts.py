@@ -71,6 +71,22 @@ def test_torch_reference_matches_transformers():
     assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, transpose = True)), _bits(_reference(blocks, scales)))
 
 
+@pytest.mark.parametrize("old_torch_path", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_torch_reference_is_exact_on_every_torch(monkeypatch, dtype, old_torch_path):
+    # Every byte under every e8m0 scale against fp64 rounded once (the fused kernel's self-check needs this).
+    if old_torch_path:
+        monkeypatch.setattr(mxd, "_LDEXP_EXACT", False)
+    blocks = torch.arange(256, dtype = torch.uint8).reshape(16, 1, 16).repeat(256, 1, 1)
+    scales = torch.arange(256, dtype = torch.uint8).repeat_interleave(16).reshape(4096, 1)
+    lut = torch.tensor(_FP4, dtype = torch.float64)
+    want = torch.empty(4096, 1, 32, dtype = torch.float64)
+    want[..., 0::2] = lut[(blocks & 0x0F).long()]
+    want[..., 1::2] = lut[(blocks >> 4).long()]
+    want = (want * torch.exp2(scales.double() - 127).unsqueeze(-1)).reshape(4096, 32).to(dtype)
+    assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, dtype = dtype)), _bits(want))
+
+
 
 @pytest.mark.parametrize("transpose", [False, True])
 @pytest.mark.parametrize("chunk_bytes", [1, 5 * 64 * 16 * 8, 1 << 30])

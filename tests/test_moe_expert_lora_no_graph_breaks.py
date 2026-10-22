@@ -120,6 +120,8 @@ def test_expert_lora_trains_without_graph_breaks(tmp_path, model_type):
     env = dict(os.environ)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    # Compiling is what is under test; an inherited UNSLOTH_COMPILE_DISABLE=1 makes "no graph breaks" vacuous.
+    env.pop("UNSLOTH_COMPILE_DISABLE", None)
     proc = subprocess.run([sys.executable, str(script), model_type, str(tmp_path), json.dumps(_CONFIGS[model_type])],
                           capture_output = True, text = True, timeout = 1200, env = env)
     line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)

@@ -164,7 +164,8 @@ def patch_Qwen3MoeAttention_float32():
     except Exception as e:
         return raise_error("Qwen3MoeAttention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
+    from .sdpa_gqa import make_gqa_sdpa
+    float32_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
 
     def forward(
         self,
@@ -247,15 +248,15 @@ def patch_Qwen3MoeAttention_float32():
             if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
                 attn_mask = attn_mask.to(torch.float32)
             is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
-            attn_output = scaled_dot_product_attention(
+            attn_output = float32_sdpa(
                 query_states,
                 key_states,
                 value_states,
-                attn_mask = attn_mask,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = is_causal,
-                scale = self.scaling,
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                attn_mask,
+                self.attention_dropout if self.training else 0.0,
+                is_causal,
+                self.scaling,
+                getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_output = attn_output.transpose(1, 2)  # (b, h, q, d) -> (b, q, h, d)
 
