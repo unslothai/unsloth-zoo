@@ -420,7 +420,7 @@ def test_tracing_an_unprobed_card_never_runs_a_probe(spoof, monkeypatch):
     monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_probe)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     assert moe_utils._transposed_view_safe_on(cuda(1)) is True    # the home verdict, as before #1928
-    assert moe_utils._grouped_mm_supported_on(cuda(1)) is False   # unprobed model: the per-group fallback
+    assert moe_utils._grouped_mm_supported_on(cuda(1)) is True    # unprobed model: the home answer, as before #1928
     monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
     assert moe_utils._transposed_view_safe_on(cuda(1)) is False   # nothing probed at all: the contiguous copy
 
@@ -440,7 +440,7 @@ def test_a_fullgraph_compile_on_an_unprobed_card_traces(spoof, monkeypatch):
     # The cards are spoofed: keep Dynamo from saving a CUDA RNG state no runner without a GPU has.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     out = torch.compile(gate, fullgraph = True, backend = "eager")(torch.zeros(2))
-    assert out.tolist() == [1.0, 1.0]
+    assert out.tolist() == [11.0, 11.0]   # traced without a probe: the home card's verdicts
 
 
 def test_the_modulelist_forward_declines_a_card_without_grouped_mm(monkeypatch):

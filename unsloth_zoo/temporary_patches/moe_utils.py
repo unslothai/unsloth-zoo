@@ -1620,9 +1620,10 @@ def _grouped_mm_supported_on(device):
     if kind is None:
         return _check_torch_grouped_mm_supported()
     # Never probe while tracing (graph break; an error under fullgraph): an unprobed model takes the
-    # per-group fallback in this graph, and the next eager call probes and caches it.
+    # home card's answer, which every card used before per-model probes. Answering False would bake
+    # the slow loop into the graph, or route to the compiler-disabled per-group fallback.
     if torch.compiler.is_compiling() and kind not in _TORCH_GROUPED_MM_SUPPORTED_BY_KIND:
-        return False
+        return _check_torch_grouped_mm_supported()
     return _check_torch_grouped_mm_supported(device)
 
 
