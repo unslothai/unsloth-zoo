@@ -254,3 +254,62 @@ def _generation_trainer(generation_class = _VLLMGeneration, shared = False, llm 
 def test_vllm_sampling_params_count_only_where_generation_applies_them(sampler, make, rollout_top_p):
     sampler("0.11.2")
     assert rr.grpo_truncated_support_kwargs(make())["support_top_p"] == rollout_top_p
+
+
+def _padded_engine_trainer(ids, bias = float("-inf"), **args):
+    trainer = _trainer(**args)
+    trainer.llm = types.SimpleNamespace(_unsloth_padded_vocab_bias = (tuple(ids), bias))
+    return trainer
+
+
+def test_engine_suppressed_padded_rows_leave_the_scored_support(sampler):
+    # zoo#1831: 61 real tokens, 64 alignment rows the engine biases to -inf on every request, equal
+    # logits. vLLM adds logit_bias before computing processed logprobs (sampler.py
+    # apply_logits_processors, builtin.py LogitBiasLogitsProcessor: logits += bias), so a rollout
+    # token scores -log(61); the trainer scored -log(125), a ratio of 0.488 with identical weights.
+    sampler("0.11.2")
+    pad = list(range(61, 125))
+    logits = torch.zeros(1, 2, 125)
+    ids = torch.tensor([[0, 60]])
+    biased = logits.clone()
+    biased[..., pad] += float("-inf")
+    vllm = torch.log_softmax(biased, -1).gather(-1, ids[..., None]).squeeze(-1)
+    full = rr.chunked_selective_log_softmax(logits, ids, 1.0, 1)
+    torch.testing.assert_close(full, torch.full((1, 2), -float(torch.log(torch.tensor(125.0)))))
+
+    # No top_k / top_p / min_p: the padded rows alone turn support scoring on.
+    kwargs = rr.grpo_truncated_support_kwargs(_padded_engine_trainer(pad, top_p = 1.0))
+    assert kwargs["support_top_k"] == 0 and kwargs["support_top_p"] == 1.0
+    assert kwargs["support_excluded_ids"].tolist() == pad
+    x = logits.clone().requires_grad_(True)
+    got = rr.chunked_selective_log_softmax(x, ids, 1.0, 1, **kwargs)
+    torch.testing.assert_close(got, vllm)
+    (grad,) = torch.autograd.grad(got.sum(), [x])
+    assert bool((grad[..., pad] == 0).all())
+    # Together with truncation, on the hidden-states helper as well.
+    kwargs = rr.grpo_truncated_support_kwargs(_padded_engine_trainer(pad, top_k = 30, top_p = 1.0))
+    assert kwargs["support_top_k"] == 30 and "support_excluded_ids" in kwargs
+    hidden = torch.eye(125)[None, :2]
+    head = torch.zeros(125, 125)
+    got = rr.chunked_hidden_states_selective_log_softmax(hidden, head, ids, 1, 1.0, 1.0, 0.0, 1.0, **kwargs)
+    torch.testing.assert_close(got, torch.full((1, 2), -float(torch.log(torch.tensor(61.0)))))
+
+
+def test_padded_rows_only_count_where_the_engine_suppresses_them(sampler, monkeypatch, caplog):
+    sampler("0.11.2")
+    pad = list(range(61, 125))
+    # No record (TRL-created engine, server mode) or a finite bias: nothing is excluded.
+    assert rr.grpo_truncated_support_kwargs(_trainer(top_p = 1.0)) == {}
+    assert rr.grpo_truncated_support_kwargs(_padded_engine_trainer(pad, bias = -100.0, top_p = 1.0)) == {}
+    # TRL >= 0.28: the record sits on vllm_generation.llm.
+    trainer = _trainer(top_p = 1.0)
+    trainer.vllm_generation = types.SimpleNamespace(llm = types.SimpleNamespace(_unsloth_padded_vocab_bias = (tuple(pad), float("-inf"))))
+    assert rr.grpo_truncated_support_kwargs(trainer)["support_excluded_ids"].tolist() == pad
+    # Opt-in off with the vLLM logprobs consumed: warned once, naming the padded rows.
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT")
+    caplog.set_level(logging.WARNING)
+    rr.logger.propagate = True
+    t = _padded_engine_trainer(pad, top_p = 1.0)
+    assert rr.grpo_truncated_support_kwargs(t) == {}
+    assert rr.grpo_truncated_support_kwargs(t) == {}
+    assert caplog.text.count("64 padded vocabulary rows suppressed") == 1

@@ -106,10 +106,13 @@ pass
 # A scored token tied with the smallest kept logit but dropped by the sort counts as one of the kept
 # tokens (vLLM keeps an arbitrary subset of a tied run): it takes the place of one kept tied token,
 # so both the value and its gradient are those of a kept token.
-def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False):
+def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False, excluded_ids = None):
     index = chunk_index.unsqueeze(-1)
     selected_logits = torch.gather(chunk_logits, dim = -1, index = index)
     detached = chunk_logits.detach()
+    if excluded_ids is not None:
+        # Rows the engine biases to -inf before sampling (suppress_vllm_padded_vocab).
+        detached = detached.index_fill(-1, excluded_ids.to(detached.device), float("-inf"))
     keep = _truncated_support_mask(detached, top_k, top_p, min_p, triton_sampler)
     selected_kept = torch.gather(keep, dim = -1, index = index)
     smallest_kept = detached.masked_fill(~keep, float("inf")).amin(dim = -1, keepdim = True)
@@ -132,6 +135,7 @@ def chunked_selective_log_softmax(
     support_top_p: float = 1.0,
     support_min_p: float = 0.0,
     support_triton_sampler: bool = False,
+    support_excluded_ids: Optional[torch.Tensor] = None,
 ):
     # Fixed `chunks` row ranges; see chunked_hidden_states_selective_log_softmax.
     flat_logits = logits.reshape(-1, logits.shape[-1])
@@ -147,10 +151,10 @@ def chunked_selective_log_softmax(
         chunk_logits = chunk_logits.to(torch.float32)
         if temperature != 1.0:
             chunk_logits = chunk_logits / temperature
-        if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0:
+        if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0 or support_excluded_ids is not None:
             all_per_token_logps.append(_truncated_support_logps(
                 chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
-                support_triton_sampler,
+                support_triton_sampler, support_excluded_ids,
             ))
             continue
         selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
@@ -197,6 +201,7 @@ def chunked_hidden_states_selective_log_softmax(
     support_top_p: float = 1.0,
     support_min_p: float = 0.0,
     support_triton_sampler: bool = False,
+    support_excluded_ids: Optional[torch.Tensor] = None,
     # Read in the default for the same Dynamo reason as max_rows_per_chunk. Pairs with vLLM's
     # head_dtype=float32 that load_vllm requests under the same flag.
     fp32_lm_head: bool = (
@@ -281,10 +286,10 @@ def chunked_hidden_states_selective_log_softmax(
         if temperature != 1.0:
             chunk_logits = chunk_logits / temperature
 
-        if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0:
+        if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0 or support_excluded_ids is not None:
             per_token_logps = _truncated_support_logps(
                 chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
-                support_triton_sampler,
+                support_triton_sampler, support_excluded_ids,
             )
         else:
             selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
@@ -1537,9 +1542,10 @@ def grpo_truncated_support_kwargs(trainer):
     if not getattr(trainer, "use_vllm", False):
         return {}
     support = grpo_sampling_support(trainer)
-    if support is None:
+    excluded = _grpo_engine_excluded_ids(trainer)
+    if support is None and excluded is None:
         return {}
-    top_k, top_p, min_p = support
+    top_k, top_p, min_p = support if support is not None else (0, 1.0, 0.0)
     enabled = os.environ.get("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "0").strip().lower() in ("1", "true", "yes", "on")
     if not enabled:
         args = getattr(trainer, "args", None)
@@ -1548,8 +1554,15 @@ def grpo_truncated_support_kwargs(trainer):
             or getattr(args, "off_policy_mask_threshold", None) is not None
         )
         if consumed and not getattr(trainer, "_unsloth_truncated_support_warned", False):
+            truncation = (
+                f"top_k={top_k}, top_p={top_p}, min_p={min_p}" if support is not None else ""
+            )
+            if excluded is not None:
+                truncation += (" and " if truncation else "") + (
+                    f"{excluded.numel()} padded vocabulary rows suppressed"
+                )
             logger.warning(
-                f"Unsloth: rollouts sample with top_k={top_k}, top_p={top_p}, min_p={min_p}, so "
+                f"Unsloth: rollouts sample with {truncation}, so "
                 "vLLM's logprobs are renormalised over the kept tokens while the trainer scores the "
                 "full vocabulary. The importance sampling ratio / off-policy mask then sees a "
                 "systematic gap of log(kept probability mass) per token. Set "
@@ -1570,9 +1583,42 @@ def grpo_truncated_support_kwargs(trainer):
     kwargs = {"support_top_k": top_k, "support_top_p": top_p, "support_min_p": min_p}
     if grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
         kwargs["support_triton_sampler"] = True
+    if excluded is not None:
+        kwargs["support_excluded_ids"] = excluded
     return kwargs
 pass
 RL_REPLACEMENTS["grpo_truncated_support_kwargs"] = grpo_truncated_support_kwargs
+
+
+def _grpo_engine_excluded_ids(trainer):
+    """Token ids the rollout engine never samples because Unsloth biases them to -inf on every
+    request (vllm_utils.suppress_vllm_padded_vocab, add_new_tokens(pad_to_multiple_of = ...)
+    alignment rows), as a long tensor; None if the engine generating the rollouts has none.
+    vLLM applies logit_bias before truncation, so its processed logprobs leave these rows out."""
+    llm = getattr(trainer, "llm", None)
+    if llm is None:
+        llm = getattr(getattr(trainer, "vllm_generation", None), "llm", None)
+    record = getattr(llm, "_unsloth_padded_vocab_bias", None) if llm is not None else None
+    if not record:
+        return None
+    ids, bias = record
+    if not ids or bias != float("-inf"):
+        return None
+    cached = getattr(trainer, "_unsloth_support_excluded_ids", None)
+    if cached is not None and cached[0] == tuple(ids):
+        return cached[1]
+    device = None
+    try:
+        device = next(trainer.model.parameters()).device
+    except Exception:
+        pass
+    excluded = torch.tensor(list(ids), dtype = torch.long, device = device)
+    try:
+        trainer._unsloth_support_excluded_ids = (tuple(ids), excluded)
+    except Exception:
+        pass
+    return excluded
+pass
 
 
 def _vllm_sampler_version():
