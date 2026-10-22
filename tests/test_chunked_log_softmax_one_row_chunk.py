@@ -1,0 +1,75 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""A trainable head must get correct gradients when a chunk would hold one row (49 packed tokens in 16
+chunks: 12 of 4, then 1). Inductor mis-lowered it: illegal memory access, or silently wrong gradients
+with a small vocabulary. One process per case, since the illegal access poisons the CUDA context."""
+import json
+import subprocess
+import sys
+import textwrap
+
+import pytest
+import torch
+
+CHILD = textwrap.dedent(
+    """
+    import json, sys
+    import torch
+    from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as f
+
+    rows, head_grad, cap = int(sys.argv[1]), sys.argv[2] == "1", int(sys.argv[3])
+    vocab, hidden = 1024, 64
+    amp = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation = False) else torch.float16
+    gen = torch.Generator().manual_seed(0)
+    lm_head = (torch.randn(vocab, hidden, generator = gen) * 0.05).cuda().requires_grad_(head_grad)
+    states = torch.randn(1, rows, hidden, generator = gen).cuda().to(amp).requires_grad_(True)
+    index = torch.randint(0, vocab, (1, rows), generator = gen).cuda()
+    weights = torch.randn(1, rows, generator = gen).cuda()
+
+    # float32 head under half-precision autocast: full fine-tuning with bf16=True / fp16=True.
+    with torch.autocast("cuda", dtype = amp):
+        out = f(states, lm_head, index, 16, max_rows_per_chunk = cap)
+    (out * weights).sum().backward()
+    got = [out.detach(), states.grad.clone()] + ([lm_head.grad.clone()] if head_grad else [])
+    states.grad = None
+    lm_head.grad = None
+
+    with torch.autocast("cuda", dtype = amp):
+        logits = (states.reshape(-1, hidden) @ lm_head.t()).float()
+    ref = (logits.gather(-1, index.reshape(-1, 1)).squeeze(-1) - logits.logsumexp(-1)).reshape(1, rows)
+    (ref * weights).sum().backward()
+    want = [ref.detach(), states.grad] + ([lm_head.grad] if head_grad else [])
+    print(json.dumps([float((a.float() - b.float()).abs().max() / b.float().abs().max()) for a, b in zip(got, want)]))
+    """
+)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "the fault is in Inductor's CUDA codegen")
+@pytest.mark.parametrize(
+    "rows, head_grad, cap",
+    [(rows, head_grad, 0) for rows in (8, 13, 17, 24, 25, 49) for head_grad in (True, False)]
+    # A row cap: the one-row tail is re-split with the chunk before it (49 / 2, 100 / 3).
+    + [(49, True, 2), (100, True, 3)],
+)
+def test_one_row_chunk_matches_eager(rows, head_grad, cap):
+    run = subprocess.run(
+        [sys.executable, "-c", CHILD, str(rows), "1" if head_grad else "0", str(cap)],
+        capture_output = True, text = True, timeout = 600,
+    )
+    assert run.returncode == 0, run.stderr[-3000:]
+    errors = json.loads(run.stdout.strip().splitlines()[-1])
+    assert max(errors) < 1e-2, errors

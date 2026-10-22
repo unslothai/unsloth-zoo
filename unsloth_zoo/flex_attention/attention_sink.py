@@ -31,6 +31,7 @@ from .utils import (
     create_block_mask_cached,
     create_block_mask,
     compiled_create_block_mask,
+    reused_compiled_create_block_mask,
     _flex_attention as uncompiled_flex_attention,
     flex_attention,
     FlexAttentionCache,
@@ -119,7 +120,7 @@ def old_flex_attention_with_sink(
         if type(sliding_window) is int and sliding_window != 0 else \
         causal_mask_with_sink
     score_mod = generate_sink_score_mod(sink_weights)
-    block_mask = compiled_create_block_mask(mask_mod, qlen_Q, qlen_KV+1, device = key.device) # +1 for padding
+    block_mask = compiled_create_block_mask(mask_mod, None, None, qlen_Q, qlen_KV+1, device = key.device) # +1 for padding
     attn_output = (flex_attention if compile else uncompiled_flex_attention)(
         query,
         key_padded,
@@ -216,6 +217,9 @@ def flex_attention_with_sink(
             generate_sliding_window_mask(sliding_window) \
             if type(sliding_window) is int and sliding_window != 0 else \
             causal_mask
+        # Stateless mask_mod, so reuse one block mask across layers and checkpoint replays
+        if block_mask is None:
+            block_mask = reused_compiled_create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
     if block_mask is None:
         block_mask = compiled_create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
 

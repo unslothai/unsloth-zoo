@@ -1,0 +1,256 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""A standalone function that builds attention masks must never be compiled fullgraph.
+
+`flex_attention_mask` does `if not fast_all(attention_mask)` on a 0-dim tensor, so a
+caller captured whole dies with `Unsupported: Data-dependent branching`. The literal
+`create_causal_mask(**mask_kwargs)` used to catch this until transformers added a kwarg
+inside the parens, which is why these pin a call-shaped detector instead.
+"""
+
+import inspect
+
+import pytest
+import torch
+
+from unsloth_zoo import compiler as compiler_module
+from unsloth_zoo.compiler import (
+    DISABLED_KEYWORDS,
+    calls_mask_creation_function,
+    get_mask_functions,
+)
+
+# Probed, not required: gemma4* are absent on older transformers.
+_VISION_MASK_MODELS = ("gemma3", "gemma4", "gemma4_unified")
+
+
+def _vision_mask_builder(model):
+    try:
+        module = __import__(
+            f"transformers.models.{model}.modeling_{model}", fromlist=["_"]
+        )
+    except Exception:
+        return None
+    return getattr(module, "create_masks_for_vision_model", None)
+
+
+def _installed_vision_mask_builders():
+    found = {}
+    for model in _VISION_MASK_MODELS:
+        function = _vision_mask_builder(model)
+        if function is not None:
+            found[model] = function
+    return found
+
+
+def test_mask_factories_are_discoverable():
+    """Everything below is vacuous if the installed transformers exports no factory."""
+    factories = get_mask_functions()
+
+    assert "create_causal_mask" in factories, (
+        "transformers.masking_utils no longer exports create_causal_mask, so "
+        "calls_mask_creation_function cannot recognise a mask builder and every "
+        f"builder goes back to fullgraph = True. Found: {sorted(factories)}"
+    )
+
+
+@pytest.mark.parametrize("model", _VISION_MASK_MODELS)
+def test_vision_mask_builders_are_not_compiled(model):
+    """The regression guard. Fails on the commit that shipped the drifted literal."""
+    function = _vision_mask_builder(model)
+    if function is None:
+        pytest.skip(f"transformers has no {model}.create_masks_for_vision_model")
+
+    source = inspect.getsource(function)
+    matched = calls_mask_creation_function(source)
+
+    assert len(matched) != 0, (
+        f"transformers.models.{model}.modeling_{model}.create_masks_for_vision_model "
+        "calls a transformers.masking_utils factory, but the compiler does not see "
+        "it, so the rewriter stamps @torch_compile_with_fallback(fullgraph = True, "
+        "...) on it and the first vision generate dies with `Unsupported: "
+        "Data-dependent branching` inside flex_attention_mask. The detector has "
+        "drifted away from how upstream now spells the call."
+    )
+
+
+def test_a_defined_vision_mask_builder_is_always_resolved():
+    """Skipping everything is legitimate only when no modeling file defines one.
+
+    A release that defines the builder under another name would also skip and guard
+    nothing, so the modeling source is asked directly rather than trusting the skips."""
+    defines = []
+    for model in _VISION_MASK_MODELS:
+        try:
+            module = __import__(
+                f"transformers.models.{model}.modeling_{model}", fromlist=["_"]
+            )
+            source = inspect.getsource(module)
+        except Exception:
+            continue
+        if "def create_masks_for_vision_model" in source:
+            defines.append(model)
+
+    if len(defines) == 0:
+        pytest.skip("this transformers defines no create_masks_for_vision_model")
+
+    found = _installed_vision_mask_builders()
+
+    assert sorted(found) == sorted(defines), (
+        f"{sorted(defines)} define create_masks_for_vision_model but only "
+        f"{sorted(found)} could be resolved by name, so the cases above skipped a "
+        "builder that really is compiled. The lookup has drifted from upstream."
+    )
+
+
+def test_a_mask_builder_really_is_uncapturable_fullgraph():
+    """Why the rule exists, not just that it fires.
+
+    Eager first, so a drifted harness fails loudly instead of passing through the
+    `except`. A raise then demands the compiler exclude it; success is allowed and
+    means upstream became traceable."""
+    torch = pytest.importorskip("torch")
+    gemma3 = pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
+    builder = getattr(gemma3, "create_masks_for_vision_model", None)
+    if builder is None:
+        pytest.skip("transformers has no gemma3.create_masks_for_vision_model")
+
+    from transformers.models.gemma3.configuration_gemma3 import Gemma3TextConfig
+
+    config = Gemma3TextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        sliding_window=8,
+    )
+    config._attn_implementation = "flex_attention"
+
+    length = 16
+    inputs_embeds = torch.zeros(1, length, config.hidden_size)
+    # A padded row is the point: it makes `fast_all` False, taking the uncapturable branch.
+    attention_mask = torch.ones(1, length, dtype=torch.long)
+    attention_mask[:, -4:] = 0
+    position_ids = torch.arange(length).unsqueeze(0)
+    token_type_ids = torch.zeros(1, length, dtype=torch.long)
+    token_type_ids[:, 4:8] = 1
+    block_sequence_ids = gemma3.get_block_sequence_ids_for_mask(token_type_ids)
+
+    kwargs = dict(
+        config=config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        position_ids=position_ids,
+        block_sequence_ids=block_sequence_ids,
+    )
+
+    # Flex compiles `create_block_mask` internally, so a runner without triton dies
+    # here. That is the runner, not the rule: skip.
+    try:
+        eager = builder(**kwargs)
+    except Exception as exception:
+        pytest.skip(f"platform cannot build a flex block mask: {type(exception).__name__}")
+    assert set(eager) == {"full_attention", "sliding_attention"}
+
+    # backend="eager": the break is a Dynamo tracing failure, so no inductor needed.
+    torch._dynamo.reset()
+    try:
+        torch.compile(builder, fullgraph=True, dynamic=True, backend="eager")(**kwargs)
+    except Exception as exception:
+        assert len(calls_mask_creation_function(inspect.getsource(builder))) != 0, (
+            "create_masks_for_vision_model cannot be traced with fullgraph = True "
+            f"({type(exception).__name__}: "
+            f"{str(exception).strip().splitlines()[0][:200]}), and the compiler does "
+            "not exclude it, so it is compiled and Gemma3 vision generate crashes."
+        )
+    finally:
+        torch._dynamo.reset()
+
+
+def test_the_call_is_matched_whatever_its_arguments():
+    """The exact drift that caused the bug: a kwarg added inside the parentheses."""
+    drifted = "    full_mask = create_causal_mask(**mask_kwargs, block_sequence_ids=ids)\n"
+    original = "    full_mask = create_causal_mask(**mask_kwargs)\n"
+    split = "    mask = create_causal_mask(\n        **mask_kwargs,\n    )\n"
+    spaced = "    mask = create_causal_mask (**mask_kwargs)\n"
+
+    for source in (drifted, original, split, spaced):
+        assert calls_mask_creation_function(source) == ["create_causal_mask"], source
+
+    assert original not in "".join(DISABLED_KEYWORDS), (
+        "the spelling-sensitive literal is back in DISABLED_KEYWORDS; it silently "
+        "stops matching the moment upstream adds a keyword argument"
+    )
+
+
+def test_unrelated_sources_are_not_matched():
+    """Over-matching would stop compiling functions that are fine today."""
+    assert calls_mask_creation_function("    m = self.create_causal_mask(x)\n") == []
+    assert calls_mask_creation_function("    m = utils.create_causal_mask(x)\n") == []
+    assert calls_mask_creation_function("    m = my_create_causal_mask(x)\n") == []
+    assert calls_mask_creation_function('    """See create_causal_mask."""\n') == []
+    assert calls_mask_creation_function("    x = create_causal_mask\n") == []
+
+
+@pytest.mark.parametrize(
+    "name", ["rotate_half", "apply_rotary_pos_emb", "eager_attention_forward"]
+)
+def test_ordinary_lifted_functions_still_compile(name):
+    """Negative control: the rule must not sweep up the hot helpers."""
+    gemma3 = pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
+    function = getattr(gemma3, name, None)
+    if function is None:
+        pytest.skip(f"transformers has no gemma3.{name}")
+
+    assert calls_mask_creation_function(inspect.getsource(function)) == []
+
+
+def test_disable_compile_functions_outranks_the_mask_rule():
+    """`@torch.compiler.disable` also blocks inlining into a compiled caller, so a
+    mask call inside a DISABLE_COMPILE_FUNCTIONS name must not downgrade it to 'emit
+    bare'. Nothing on the list builds masks today, which is why this needs pinning."""
+    source = inspect.getsource(compiler_module)
+
+    # Loop B: skipped for a listed name, so the disable branch below is still reached.
+    assert "if not bad and module not in disable_compile_functions:" in source, (
+        "the copy loop applies the mask rule to names in DISABLE_COMPILE_FUNCTIONS, "
+        "so such a function is emitted bare instead of with "
+        "@torch.compiler.disable(recursive = False) and can be inlined into a "
+        "compiled caller"
+    )
+
+    fixup = source.index("_mask_builders = calls_mask_creation_function(")
+    window = source[fixup:fixup + 400]
+    assert window.index("if module in disable_compile_functions:") < window.index(
+        "elif len(_mask_builders) != 0:"
+    ), "the signature-fixup loop tests the mask rule before DISABLE_COMPILE_FUNCTIONS"
+
+
+def test_both_standalone_emit_sites_consult_the_detector():
+    """Miss one and a mask builder is stamped fullgraph again from the other path."""
+    source = inspect.getsource(compiler_module)
+
+    assert source.count("calls_mask_creation_function(") == 3, (
+        "expected one definition plus the two standalone-function emit sites in "
+        "unsloth_compile_transformers (the signature-fixup loop and the copy loop); "
+        "a site that stopped consulting the detector will stamp "
+        "@torch_compile_with_fallback(fullgraph = True, ...) on a mask builder again"
+    )

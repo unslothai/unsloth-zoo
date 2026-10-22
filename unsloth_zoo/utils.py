@@ -17,9 +17,12 @@
 __all__ = [
     "Version",
     "_get_dtype",
+    "device_guard",
     "is_main_process",
     "is_distributed",
+    "current_rank",
     "distributed_function",
+    "distributed_any",
     "torch_distributed_get_rank",
 ]
 
@@ -30,6 +33,7 @@ import torch.distributed as dist
 import os
 import time
 import contextlib
+import traceback
 import re
 import pathlib
 from typing import Optional
@@ -120,6 +124,17 @@ def _get_dtype(dtype):
 pass
 
 
+def device_guard(tensor):
+    """Make tensor's device current: torch.ldexp (>= 2.12) launches on the current device."""
+    device = tensor.device
+    backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+    guard = getattr(backend, "device", None)
+    if guard is None or device.index is None:
+        return contextlib.nullcontext()
+    return guard(device)
+pass
+
+
 import functools
 # ROCm on Windows ships a stubbed torch.distributed missing these attributes
 # entirely (https://github.com/ROCm/TheRock/issues/3284). Bind the real
@@ -148,6 +163,13 @@ def is_distributed():
     return torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
 pass
 
+def current_rank():
+    """Best effort rank, for diagnostics only. RANK is unset outside a launcher."""
+    if torch_distributed_is_initialized():
+        return torch_distributed_get_rank()
+    return os.environ.get("RANK", "0")
+pass
+
 def distributed_function(n = 1, function = None, *args, **kwargs):
     assert function is not None
 
@@ -159,18 +181,79 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
         out = function(*args, **kwargs)
         return out if n == 1 else out
 
-    # Multi-process: only main executes the function
+    # (ok, value) envelope: a raise on main must reach peers, else they hang until PG timeout.
+    error = None
     if is_main_process():
-        out = function(*args, **kwargs)
-        obj_list = [out] if n == 1 else list(out)
+        try:
+            out = function(*args, **kwargs)
+            envelope = (True, out if n == 1 else list(out))
+        except BaseException as exception:
+            error = exception
+            message = "".join(traceback.format_exception_only(type(exception), exception)).strip()
+            envelope = (False, message)
     else:
-        obj_list = [None for _ in range(n)]
+        envelope = None
+    obj_list = [envelope]
 
-    if torch_distributed_is_initialized():
-        dist.broadcast_object_list(obj_list, src = 0)
-        dist.barrier()  # wait until main is done
+    device = _collective_device()
+    dist.broadcast_object_list(obj_list, src = 0, device = device)
+    ok, value = obj_list[0]
+    if not ok:
+        if error is not None: raise error
+        raise RuntimeError(
+            f"Unsloth: distributed_function `{getattr(function, '__name__', function)}` "
+            f"failed on rank 0: {value}"
+        )
+    if device.type == "cuda" and device.index is not None:
+        dist.barrier(device_ids = [device.index])
+    else:
+        dist.barrier()
 
-    return obj_list[0] if n == 1 else obj_list
+    return value
+pass
+
+def _collective_device():
+    """This rank's device: NCCL object collectives default to cuda:0 until set_device.
+    Prefer the bound device, then the caller's current device, then LOCAL_RANK."""
+    try:
+        device_type = dist.distributed_c10d._get_object_coll_device()
+    except Exception:
+        device_type = "cuda" if "nccl" in str(dist.get_backend()).lower() else "cpu"
+    if device_type != "cuda":
+        if device_type == "cpu" or not hasattr(torch, device_type):
+            return torch.device("cpu")
+        return torch.device(device_type, getattr(torch, device_type).current_device())
+
+    try:
+        bound = dist.distributed_c10d._get_default_group().bound_device_id
+    except Exception:
+        bound = None
+    if bound is not None:
+        return bound
+    if torch.cuda.is_initialized() and torch.cuda.current_device() != 0:
+        return torch.device("cuda", torch.cuda.current_device())
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", ""))
+    except ValueError:
+        local_rank = -1
+    if 0 <= local_rank < torch.cuda.device_count():
+        return torch.device("cuda", local_rank)
+    return torch.device("cuda", torch.cuda.current_device())
+pass
+
+def distributed_any(value):
+    """True when `value` is truthy on any rank. Every rank has to call this.
+
+    distributed_function() only mirrors rank 0, which is wrong when the condition
+    is rank-local and guards a collective.
+    """
+    if not torch_distributed_is_initialized():
+        return bool(value)
+
+    # Not all_gather_object: its NCCL buffers land on cuda:0 before set_device.
+    flag = torch.tensor([1 if value else 0], dtype = torch.int32, device = _collective_device())
+    dist.all_reduce(flag, op = dist.ReduceOp.MAX)
+    return bool(flag.item())
 pass
 
 def _lock_path_for(target: str) -> str:

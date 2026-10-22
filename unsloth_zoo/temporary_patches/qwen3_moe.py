@@ -29,8 +29,15 @@ from .utils import (
     patch_function,
     raise_error,
     logger,
+    torch_compiler_disable_unless_decode,
 )
 
+
+try:
+    from .moe_router_triton import fused_route_or_none as _fused_route_or_none
+except Exception:
+    def _fused_route_or_none(*args, **kwargs):
+        return None
 
 # Grouped GEMM kernel integration for MoE training acceleration
 from .moe_utils import (
@@ -79,7 +86,16 @@ def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
 
 
 def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name: Optional[str] = None):
-    @torch.compiler.disable
+    # Kept because compiling this block is still blocked (B200, torch 2.13.0,
+    # Qwen3.5-35B-A3B): fullgraph=True dies building guards on a stale global
+    # (Qwen3_5MoeMLP_forward), and fullgraph=False leaves 8 graph breaks, all
+    # torch._C.Generator, 6 of them present with no LoRA at all. The routing counter
+    # is not the blocker: breaks are identical with bincount and with the sync-free
+    # counter. Dropping the decorator did run 1.22-1.40x faster, but PR #608 measured
+    # only 1.03-1.04x end to end and found capture incompatible with gradient
+    # checkpointing, so do not remove it without an end-to-end measurement. A compiled
+    # decode step (inference only) still traces it; training keeps the recursive disable.
+    @torch_compiler_disable_unless_decode(recursive = True)
     def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         use_shared_expert = hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate")
         if hidden_states.dim() == 3:
@@ -103,10 +119,14 @@ def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name
             top_k = getattr(self.gate, "top_k", getattr(self, "top_k", 2))
             norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", False))
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-            if norm_topk_prob:
-                routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+            fused = _fused_route_or_none(router_logits, top_k, "softmax_topk", bool(norm_topk_prob))
+            if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+                routing_weights, selected_experts = fused
+            else:
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+                routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+                if norm_topk_prob:
+                    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
             routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
@@ -131,6 +151,9 @@ def _patch_causal_lm_forward_for_hidden_states(
     extra_output_kwargs_fn=None,
 ):
     _original_causal_lm_forward = causal_lm_cls.forward
+    # Temporary patches run at init, pre_compile and post_compile: wrap each class once.
+    if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
+        return
 
     def _patched_causal_lm_forward(
         self,
@@ -195,7 +218,12 @@ def _patch_causal_lm_forward_for_hidden_states(
         )
 
     _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
+    # Lets the compiler read (and fuse the loss of) the real forward, as with functools.wraps.
+    _patched_causal_lm_forward.__wrapped__ = _original_causal_lm_forward
+    _patched_causal_lm_forward._unsloth_hidden_states_wrapper = True
     causal_lm_cls.forward = _patched_causal_lm_forward
+    # unsloth's GRPO reads this marker and skips its output_hidden_states fallback, which keeps every layer's hidden states.
+    causal_lm_cls.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: Patched {model_label}.forward for GRPO hidden states.")
 
@@ -205,7 +233,11 @@ def patch_qwen3_moe():
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
     # whilst old transformers uses self.experts = nn.ModuleList(...)
 
-    # Patch ParamWrapper.forward for MoE separated LoRA
+    # Patch ParamWrapper.forward for MoE separated LoRA.
+    # Ordering is load-bearing: this unconditional call installs the
+    # peft.get_peft_model wrapper during the import-time patch pass, before
+    # unsloth.models.llama/vision capture their get_peft_model alias. Do not
+    # gate it by model name or move it below the qwen3 import check.
     patch_param_wrapper_for_moe()
 
     try:
@@ -266,10 +298,14 @@ def patch_qwen3_moe():
         def router_forward(self, hidden_states):
             router_logits = self.gate(hidden_states)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-            if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
-                routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+            fused = _fused_route_or_none(router_logits, self.top_k, "softmax_topk", bool(self.norm_topk_prob))
+            if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+                routing_weights, selected_experts = fused
+            else:
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
+                routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+                if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
+                    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
             # we cast back to the input dtype
             routing_weights = routing_weights.to(hidden_states.dtype)
             router_scores = torch.zeros_like(router_logits, dtype = hidden_states.dtype).scatter_(1, selected_experts, routing_weights)

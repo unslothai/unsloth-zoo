@@ -66,7 +66,6 @@ def test_loss_mapping_other_losses_left_alone():
     lu = pytest.importorskip("transformers.loss.loss_utils")
     from unsloth_zoo import loss_utils as zoo_loss
 
-    # Keys not currently aliased to ForCausalLMLoss must survive the sweep.
     non_causal = {
         k: v for k, v in lu.LOSS_MAPPING.items()
         if getattr(v, "__name__", "") != "ForCausalLMLoss"
@@ -110,3 +109,71 @@ def test_loss_mapping_sweep_idempotent():
             )
     finally:
         _restore(lu.LOSS_MAPPING, saved)
+
+
+@pytest.mark.parametrize("torch_compile", [False, True])
+def test_patched_loss_fuses_but_custom_wraps_does_not(torch_compile):
+    import functools
+
+    lu = pytest.importorskip("transformers.loss.loss_utils")
+    from unsloth_zoo import loss_utils as zoo_loss
+    from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+
+    saved = dict(lu.LOSS_MAPPING)
+    try:
+        def fast_ce(*args, **kwargs):
+            raise AssertionError("checking fusion eligibility must not execute the loss")
+
+        zoo_loss.patch_loss_functions(fast_ce, torch_compile = torch_compile)
+        patched = lu.LOSS_MAPPING["ForCausalLM"]
+        assert _can_fuse_loss(lu.ForCausalLMLoss)
+        assert _can_fuse_loss(patched)
+
+        @functools.wraps(patched)
+        def custom(*args, **kwargs):
+            return 3 * patched(*args, **kwargs)
+
+        assert not _can_fuse_loss(custom)
+        zoo_loss.patch_loss_functions(fast_ce, torch_compile = torch_compile)
+        assert lu.LOSS_MAPPING["ForCausalLM"] is patched
+        assert _can_fuse_loss(patched)
+    finally:
+        _restore(lu.LOSS_MAPPING, saved)
+
+
+def test_compiled_patched_loss_fuses_inside_dynamo():
+    torch = pytest.importorskip("torch")
+    lu = pytest.importorskip("transformers.loss.loss_utils")
+    from unsloth_zoo import loss_utils as zoo_loss
+    from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+
+    saved = dict(lu.LOSS_MAPPING)
+    try:
+        zoo_loss.patch_loss_functions(lambda *a, **k: None, torch_compile = True)
+        patched = lu.LOSS_MAPPING["ForCausalLM"]
+
+        def custom(*args, **kwargs):
+            return 3 * patched(*args, **kwargs)
+
+        # Dynamo traces the compile wrapper as the raw function (torch 2.6 graph-breaks instead).
+        for loss_function, expected in ((patched, True), (lu.ForCausalLMLoss, True), (custom, False)):
+            torch._dynamo.reset()
+            traced = torch.compile(lambda x: x * 2 if _can_fuse_loss(loss_function) else x * 3, backend = "eager")
+            assert traced(torch.ones(1)).item() == (2 if expected else 3)
+    finally:
+        _restore(lu.LOSS_MAPPING, saved)
+        torch._dynamo.reset()
+
+
+def test_rebound_stock_symbol_is_not_fusable(monkeypatch):
+    lu = pytest.importorskip("transformers.loss.loss_utils")
+    from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+
+    stock = lu.ForCausalLMLoss
+
+    def custom(*args, **kwargs):
+        return 3 * stock(*args, **kwargs)
+
+    monkeypatch.setattr(lu, "ForCausalLMLoss", custom)
+    assert not _can_fuse_loss(custom)
+    assert _can_fuse_loss(stock)

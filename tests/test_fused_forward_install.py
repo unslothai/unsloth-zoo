@@ -15,6 +15,7 @@ and numerical equivalence of the rewritten forward vs the original.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import types
@@ -22,31 +23,45 @@ import types
 import pytest
 
 
-# Reset module state between tests so install registries don't bleed.
+def get_device_type():
+    # Broad except: a torch broken by missing driver libs must skip, not fail collection.
+    try:
+        import torch as _torch
+    except Exception:
+        return "cpu"
+    if hasattr(_torch, "cuda") and _torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(_torch, "xpu") and _torch.xpu.is_available():
+        return "xpu"
+    else:
+        return "cpu"
+
+
+device = get_device_type()
+gpu_available = device in ("cuda", "xpu")
+
+
+# Empty registries for each test, then the previous contents back. Clearing on the way out
+# dropped the entries for classes patched before this file ran while their rewritten forward
+# stayed, so a later test in the same worker could not install on them again.
 @pytest.fixture
 def fresh_install():
     from unsloth_zoo.fused_losses import forward_install as fi
+    registries = (fi._PATCHED, fi._UNMATCHED, fi._FAILED, fi._CANONICAL_FORWARDS)
     with fi._REGISTRY_LOCK:
-        fi._PATCHED.clear()
-        fi._UNMATCHED.clear()
-        fi._FAILED.clear()
-        fi._CANONICAL_FORWARDS.clear()
+        saved = [dict(registry) for registry in registries]
+        for registry in registries:
+            registry.clear()
     yield fi
     with fi._REGISTRY_LOCK:
-        fi._PATCHED.clear()
-        fi._UNMATCHED.clear()
-        fi._FAILED.clear()
-        fi._CANONICAL_FORWARDS.clear()
+        for registry, contents in zip(registries, saved):
+            registry.clear()
+            registry.update(contents)
 
 
 @pytest.fixture
 def enable_env(monkeypatch):
     monkeypatch.setenv("UNSLOTH_FUSED_FORWARD", "1")
-
-
-# ---------------------------------------------------------------------------
-# AST rewriter unit tests
-# ---------------------------------------------------------------------------
 
 
 CANONICAL_KW_SRC = """
@@ -95,9 +110,11 @@ def test_ast_rewriter_matches_keyword_form():
     assert cap.logits_name == "logits"
     assert "unsloth_fused_lm_head_loss" in new_src
     assert "EMPTY_LOGITS" in new_src
-    # self.loss_function only on the UNSLOTH_RETURN_LOGITS opt-in path, routing
-    # the loss through materialised logits to avoid a second lm_head matmul.
-    assert new_src.count("self.loss_function") == 1
+    assert sum(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "loss_function"
+        for node in ast.walk(ast.parse(new_src))
+    ) == 1
     # Labels branch carries the RETURN_LOGITS opt-in; RETURN_HIDDEN_STATES is
     # absent (handled by the compiled forward in unsloth_zoo/compiler.py).
     assert "UNSLOTH_RETURN_LOGITS" in new_src
@@ -242,11 +259,6 @@ def test_ast_rewriter_forwards_explicit_extra_kwargs():
     assert "num_items_in_batch=" in new_src
 
 
-# ---------------------------------------------------------------------------
-# install_for_class
-# ---------------------------------------------------------------------------
-
-
 _SYNTH_COUNTER = 0
 
 
@@ -283,7 +295,6 @@ def test_install_noop_when_disabled(fresh_install, monkeypatch):
 
 
 def test_install_default_is_on(fresh_install, monkeypatch):
-    # With no env var set, the installer must be active.
     monkeypatch.delenv("UNSLOTH_FUSED_FORWARD", raising=False)
     cls = _make_synthetic_class(CANONICAL_KW_SRC)
     assert fresh_install.is_enabled() is True
@@ -388,11 +399,6 @@ def test_audit_dump(fresh_install, enable_env):
     assert cls.__qualname__ in out["patched"]
 
 
-# ---------------------------------------------------------------------------
-# Numerical equivalence on a small toy model
-# ---------------------------------------------------------------------------
-
-
 def _toy_forward_src():
     # Mirrors the canonical HF template enough to be rewriter-eligible.
     return """
@@ -405,14 +411,88 @@ def forward(self, hidden_states, labels=None, **kwargs):
 """
 
 
+@pytest.mark.parametrize("shape", ["plain", "scaled", "cast_wrapped"])
+@pytest.mark.parametrize("wrapped", [False, True, "kwargs_only", "positional_only", "no_vocab"])
+def test_rewritten_forward_tracks_runtime_custom_loss(
+    fresh_install, enable_env, monkeypatch, shape, wrapped,
+):
+    import functools
+
+    torch = pytest.importorskip("torch")
+    from transformers.loss.loss_utils import ForCausalLMLoss
+
+    monkeypatch.delenv("UNSLOTH_RETURN_LOGITS", raising = False)
+    source = _toy_forward_src()
+    if shape == "scaled":
+        source = source.replace("self.lm_head(hidden_states)", "self.lm_head(hidden_states) * 0.25")
+    elif shape == "cast_wrapped":
+        source = source.replace(
+            "        loss = self.loss_function",
+            "        labels = labels.to(logits.device)\n"
+            "        logits = logits.float()\n"
+            "        loss = self.loss_function",
+        ).replace("    return (loss, logits)", "        loss = loss.to(hidden_states.dtype)\n    return (loss, logits)")
+    if wrapped == "no_vocab":
+        source = source.replace(", vocab_size=self.config.vocab_size, **kwargs)", ", **kwargs)")
+    if wrapped == "positional_only":
+        source = source.replace(
+            "self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)",
+            "self.loss_function(logits, labels, self.config.vocab_size, **kwargs)",
+        )
+    cls = _make_synthetic_class(source)
+    original = cls.forward
+    assert fresh_install.install_for_class(cls)
+    model = cls()
+    model.config = types.SimpleNamespace(vocab_size = 16)
+    torch.manual_seed(0)
+    model.lm_head = torch.nn.Linear(8, 16, bias = False)
+    hidden = torch.randn(2, 5, 8, requires_grad = True)
+    labels = torch.randint(0, 16, (2, 5))
+    labels[0, :2] = -100
+    calls = []
+
+    def custom_loss(*args, **kwargs):
+        calls.append(kwargs["num_items_in_batch"])
+        return 3 * ForCausalLMLoss(*args, **kwargs)
+
+    if wrapped == "no_vocab":
+        def custom_loss(logits, labels, **kwargs):
+            calls.append(kwargs["num_items_in_batch"])
+            return 3 * ForCausalLMLoss(logits, labels, 16, **kwargs)
+    elif wrapped == "positional_only":
+        def custom_loss(logits, labels, size, /, **kwargs):
+            calls.append(kwargs["num_items_in_batch"])
+            return 3 * ForCausalLMLoss(logits, labels, size, **kwargs)
+    elif wrapped == "kwargs_only":
+        def custom_loss(**kwargs):
+            calls.append(kwargs["num_items_in_batch"])
+            return 3 * ForCausalLMLoss(**kwargs)
+    elif wrapped:
+        custom_loss = functools.wraps(ForCausalLMLoss)(custom_loss)
+    # Stock requires vocab_size, so a forward omitting it only ever runs a custom loss.
+    for loss_function in (custom_loss,) if wrapped == "no_vocab" else (ForCausalLMLoss, custom_loss, ForCausalLMLoss):
+        model.loss_function = loss_function
+        actual, logits = model.forward(hidden, labels = labels, num_items_in_batch = 13)
+        expected, expected_logits = original(model, hidden, labels = labels, num_items_in_batch = 13)
+        torch.testing.assert_close(actual, expected)
+        actual_grads = torch.autograd.grad(actual, (hidden, model.lm_head.weight))
+        expected_grads = torch.autograd.grad(expected, (hidden, model.lm_head.weight))
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad)
+        if loss_function is custom_loss:
+            assert calls == [13, 13]
+            torch.testing.assert_close(logits, expected_logits)
+        else:
+            assert logits.numel() == 0
+
+
 def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("fused CE kernel requires a CUDA device")
+    if not gpu_available:
+        pytest.skip("fused CE kernel requires a CUDA or XPU device")
 
     cls = _make_synthetic_class(_toy_forward_src(), name="ToyForCausalLM")
 
-    # Wire a config + lm_head + reference loss_function.
     B, T, H, V = 2, 8, 32, 64
 
     class _Config:
@@ -420,27 +500,17 @@ def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
 
     instance = cls()
     instance.config = _Config()
-    instance.lm_head = torch.nn.Linear(H, V, bias=False).cuda().to(torch.bfloat16)
+    instance.lm_head = torch.nn.Linear(H, V, bias=False).to(device).to(torch.bfloat16)
 
-    def _reference_loss(logits, labels, vocab_size, **kw):
-        # Mirror unsloth_fused_ce_loss's causal one-token label shift.
-        shifted = labels.clone()
-        shifted[..., :-1] = labels[..., 1:]
-        shifted[..., -1] = -100
-        return torch.nn.functional.cross_entropy(
-            logits.float().view(-1, vocab_size),
-            shifted.view(-1),
-            ignore_index=-100,
-        )
-    instance.loss_function = _reference_loss
+    from transformers.loss.loss_utils import ForCausalLMLoss
+    instance.loss_function = ForCausalLMLoss
 
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(0, V, (B, T), device=device)
 
     ref_loss, _ = instance.forward(hidden, labels=labels)
     ref_loss_value = float(ref_loss.detach().cpu().item())
 
-    # Install fused forward.
     ok = fresh_install.install_for_class(cls)
     assert ok is True
 
@@ -459,14 +529,14 @@ def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
 
 def test_fused_kernel_respects_ignore_index():
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("fused CE kernel requires a CUDA device")
+    if not gpu_available:
+        pytest.skip("fused CE kernel requires a CUDA or XPU device")
     from unsloth_zoo.fused_losses import unsloth_fused_ce_loss
 
     B, T, H, V = 1, 16, 8, 32
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    weight = torch.randn(V, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(V, H, device=device, dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, V, (B, T), device=device)
     labels[0, 0] = 99  # would be a CUDA-side assert if not masked out
 
     loss = unsloth_fused_ce_loss(
@@ -486,14 +556,14 @@ def test_fused_kernel_accepts_int_n_items():
     # num_items_in_batch. The kernel must promote it to a tensor before
     # the DataParallel .numel()/.ravel() guard.
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("fused CE kernel requires a CUDA device")
+    if not gpu_available:
+        pytest.skip("fused CE kernel requires a CUDA or XPU device")
     from unsloth_zoo.fused_losses import unsloth_fused_ce_loss
 
     B, T, H, V = 1, 8, 8, 16
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    weight = torch.randn(V, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(V, H, device=device, dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, V, (B, T), device=device)
 
     loss = unsloth_fused_ce_loss(
         trainer=None, hidden_states=hidden, lm_head_weight=weight, lm_head_bias=None,
@@ -531,15 +601,15 @@ def _ce_reference(hidden, lm_head, labels, shift_labels=None, n_items=None,
 
 def test_adapter_auto_shift_matches_F_cross_entropy():
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
     from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
 
     torch.manual_seed(0)
     B, T, H, V = 2, 32, 64, 128
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).to(device).float()
+    labels = torch.randint(0, V, (B, T), device=device)
     labels[0, 5:8] = -100  # sprinkle ignore_index
 
     fused = unsloth_fused_lm_head_loss(hidden, lm_head, labels, vocab_size=V)
@@ -551,15 +621,15 @@ def test_adapter_auto_shift_matches_F_cross_entropy():
 
 def test_adapter_pre_shifted_tensor_matches_F_cross_entropy():
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
     from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
 
     torch.manual_seed(1)
     B, T, H, V = 2, 32, 64, 128
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).to(device).float()
+    labels = torch.randint(0, V, (B, T), device=device)
     # Simulate trl padding_free pre-shifted target: shift labels left by 1,
     # last position becomes ignore_index. Same shape as logits.
     shift = torch.full_like(labels, -100)
@@ -576,17 +646,17 @@ def test_adapter_pre_shifted_tensor_matches_F_cross_entropy():
 
 def test_adapter_shift_labels_false_matches_F_cross_entropy():
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
     from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
 
     torch.manual_seed(2)
     B, T, H, V = 2, 32, 64, 128
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).to(device).float()
     # Caller hands us labels that are already pre-shifted (the bool=False
     # contract: do not shift again, treat labels as the target tensor).
-    target = torch.randint(0, V, (B, T), device="cuda")
+    target = torch.randint(0, V, (B, T), device=device)
     target[..., -1] = -100  # canonical pre-shift fills last position
     fused = unsloth_fused_lm_head_loss(
         hidden, lm_head, labels=target, vocab_size=V, shift_labels=False,
@@ -599,15 +669,15 @@ def test_adapter_shift_labels_false_matches_F_cross_entropy():
 
 def test_adapter_num_items_in_batch_divides_correctly():
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
     from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
 
     torch.manual_seed(3)
     B, T, H, V = 2, 16, 32, 64
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).to(device).float()
+    labels = torch.randint(0, V, (B, T), device=device)
     labels[:, :2] = -100  # pad-like prefix
 
     # Effective token count after causal shift: only positions where the
@@ -627,17 +697,17 @@ def test_adapter_num_items_in_batch_divides_correctly():
 
 def test_adapter_num_items_in_batch_as_int_and_tensor_equal():
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
     from unsloth_zoo.fused_losses import unsloth_fused_lm_head_loss
 
     torch.manual_seed(4)
     B, T, H, V = 2, 16, 32, 64
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(H, V, bias=False).cuda().float()
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
+    lm_head = torch.nn.Linear(H, V, bias=False).to(device).float()
+    labels = torch.randint(0, V, (B, T), device=device)
     n_items_int = 17
-    n_items_tensor = torch.tensor(17, device="cuda")
+    n_items_tensor = torch.tensor(17, device=device)
 
     fused_int = unsloth_fused_lm_head_loss(
         hidden, lm_head, labels, vocab_size=V, num_items_in_batch=n_items_int,
@@ -648,11 +718,6 @@ def test_adapter_num_items_in_batch_as_int_and_tensor_equal():
     assert torch.allclose(fused_int, fused_tensor, atol=1e-6), (
         f"int vs tensor n_items disagree: {fused_int.item()} vs {fused_tensor.item()}"
     )
-
-
-# ---------------------------------------------------------------------------
-# Env-var branch: UNSLOTH_RETURN_LOGITS
-# ---------------------------------------------------------------------------
 
 
 def _install_toy_cls(fresh_install):
@@ -667,17 +732,9 @@ def _toy_instance(cls, dtype, V=64, H=32):
         vocab_size = V
     inst = cls()
     inst.config = _Config()
-    inst.lm_head = torch.nn.Linear(H, V, bias=False).cuda().to(dtype)
-    def _reference_loss(logits, labels, vocab_size, **kw):
-        shifted = labels.clone()
-        shifted[..., :-1] = labels[..., 1:]
-        shifted[..., -1] = -100
-        return torch.nn.functional.cross_entropy(
-            logits.float().view(-1, vocab_size),
-            shifted.view(-1),
-            ignore_index=-100,
-        )
-    inst.loss_function = _reference_loss
+    inst.lm_head = torch.nn.Linear(H, V, bias=False).to(device).to(dtype)
+    from transformers.loss.loss_utils import ForCausalLMLoss
+    inst.loss_function = ForCausalLMLoss
     return inst
 
 
@@ -689,16 +746,15 @@ def test_rewritten_forward_returns_real_logits_when_env_set(
     # those materialised logits. Critically, only ONE lm_head matmul
     # happens (no fused-kernel re-matmul).
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
 
     cls = _install_toy_cls(fresh_install)
     B, T, H, V = 2, 8, 32, 64
     inst = _toy_instance(cls, dtype=torch.bfloat16, V=V, H=H)
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.bfloat16)
+    labels = torch.randint(0, V, (B, T), device=device)
 
-    # Count lm_head invocations to prove single-matmul on the opt-in path.
     lm_head_calls = {"n": 0}
     orig_call = inst.lm_head.__class__.__call__
     def _counting_call(self, *a, **kw):
@@ -706,8 +762,6 @@ def test_rewritten_forward_returns_real_logits_when_env_set(
         return orig_call(self, *a, **kw)
     monkeypatch.setattr(inst.lm_head.__class__, "__call__", _counting_call)
 
-    # Also count self.loss_function invocations to confirm the opt-in path
-    # routes through the model's own loss function.
     loss_fn_calls = {"n": 0}
     real_loss_fn = inst.loss_function
     def _counting_loss_fn(*a, **kw):
@@ -737,14 +791,14 @@ def test_rewritten_forward_default_labels_branch_yields_empty_logits(
     # don't pay the lm_head matmul on the hot path. Byte-identical to
     # the pre-PR behaviour.
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
 
     cls = _install_toy_cls(fresh_install)
     B, T, H, V = 2, 8, 32, 64
     inst = _toy_instance(cls, dtype=torch.bfloat16, V=V, H=H)
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.bfloat16)
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.bfloat16)
+    labels = torch.randint(0, V, (B, T), device=device)
 
     monkeypatch.delenv("UNSLOTH_RETURN_LOGITS", raising=False)
     loss, logits = cls.forward(inst, hidden, labels=labels)
@@ -755,14 +809,14 @@ def test_rewritten_forward_default_labels_branch_yields_empty_logits(
 
 def test_fused_kernel_label_smoothing_changes_loss():
     torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("fused CE kernel requires a CUDA device")
+    if not gpu_available:
+        pytest.skip("fused CE kernel requires a CUDA or XPU device")
     from unsloth_zoo.fused_losses import unsloth_fused_ce_loss
 
     B, T, H, V = 1, 8, 8, 16
-    hidden = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    weight = torch.randn(V, H, device="cuda", dtype=torch.float32, requires_grad=True)
-    labels = torch.randint(0, V, (B, T), device="cuda")
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(V, H, device=device, dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, V, (B, T), device=device)
 
     loss_plain = unsloth_fused_ce_loss(
         trainer=None, hidden_states=hidden, lm_head_weight=weight, lm_head_bias=None,

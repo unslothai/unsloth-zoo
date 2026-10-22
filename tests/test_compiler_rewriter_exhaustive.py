@@ -361,7 +361,7 @@ def test_compiler_dtype_mismatch_finfo_attention_mask_pinned():
     )
     if not _probe_modules(candidates, lambda s: pattern.search(s) is not None):
         # Exact idiom removed in masking_utils 4.50+; only fail when both
-        # `torch.finfo(...).min` AND `(1.0 - <mask>)` primitives are gone.
+        # `torch.finfo(...).min` and `(1.0 - <mask>)` are gone.
         finfo_present = _probe_modules(
             candidates,
             lambda s: "torch.finfo" in s,
@@ -799,15 +799,13 @@ def test_patching_utils_compiled_autograd_end_capture_return_compiled_fn_pinned(
         return
     needle = "return compiled_fn(inputs, sizes, scalars, hooks)"
     pattern = re.compile(r"\n([ ]{1,})return compiled_fn")
-    # Pass if exact str+regex present (rewriter works), or `with disable()`
-    # / `with _disable()` already in src (torch 2.7+ native fix).
+    # `with disable()` / `with _disable()` in src is the torch 2.7+ native fix.
     if needle in src and pattern.search(src) is not None:
         return
     if "with disable()" in src or "with _disable()" in src:
         return
     if "compiled_fn(" in src:
-        # BENIGN on torch 2.7+: upstream fixed PR #135795 natively; zoo
-        # recognises both forms and no-ops cleanly.
+        # BENIGN on torch 2.7+: upstream fixed PR #135795 natively.
         pytest.skip(
             "BENIGN: torch 2.7+ fixed PR #135795-style double-compile "
             "upstream natively (now wraps compiled_fn in `with _disable()`); "
@@ -903,8 +901,7 @@ def test_patching_utils_replace_with_bnb_linear_skip_modules_pinned():
         )
         return
 
-    # Read upstream source from the module file: zoo rebinds the live
-    # function, so inspect.getsource off it returns the patched body.
+    # Zoo rebinds the live function, so inspect.getsource returns the patched body.
     live = bnb._replace_with_bnb_linear
     is_zoo_patched = (
         getattr(live, "__name__", "") == "_unsloth_replace_with_bnb_linear"
@@ -1032,7 +1029,6 @@ def test_patching_utils_replace_with_bnb_linear_ast_wrap_target():
         src = inspect.getsource(bnb._replace_with_bnb_linear)
     except (OSError, TypeError):
         pytest.skip("Source unavailable")
-    # The recursive call is the AST anchor.
     pattern = re.compile(r"=\s*_replace_with_bnb_linear\s*\(")
     if pattern.search(src) is None:
         _drift(
@@ -1088,7 +1084,6 @@ def test_saving_utils_save_pretrained_state_dict_contiguous_pinned_string():
             "on 5.x but is present; refresh the zoo prod-fix anchor "
             "list at saving_utils.py:_required_anchors"
         )
-        # Assert zoo's preflight check includes the now-missing anchor.
         import unsloth_zoo.saving_utils as zsu
         zsu_src = inspect.getsource(zsu.merge_and_dequantize_lora)
         assert needle in zsu_src, (

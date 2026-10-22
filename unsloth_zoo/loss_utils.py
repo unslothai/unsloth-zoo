@@ -19,12 +19,14 @@ from .utils import Version
 import os
 import math
 import functools
+from collections.abc import Mapping
 from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
-from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
+import re
 
 global HAS_CUT_CROSS_ENTROPY
 global UNSLOTH_STUDIO_ENABLED
@@ -35,11 +37,79 @@ else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
 
-if DEVICE_TYPE == "cuda":
+# unsloth #2491: triton 3.3.0 and 3.3.1 cannot lower cut_cross_entropy's
+# `_cce_lse_forward_kernel` for compute capability 7.5 (T4, RTX 2080 Ti). The TritonGPU to
+# LLVM pass gives up on a `tt.fp_to_fp` and aborts the process:
+#     error: Unsupported conversion from f16 to f16
+#     LLVM ERROR: Unsupported rounding mode for conversion.
+# (triton-lang/triton#6698, closed 2025-07-22.) The range is measured: the kernel was
+# compiled ahead of time for cuda:75 on every release from 3.1.0 to 3.8.0 and only these
+# two abort, for every block size, dot precision and accumulator dtype tried, while the
+# sm_80 control compiles on all of them.
+#
+# Not expressible as a floor: torch pins triton exactly and the oldest supported torch,
+# 2.6.0, requires `triton==3.2.0`.
+_TRITON_CCE_BROKEN_ON_SM75 = ("3.3.0", "3.4.0")
+
+
+def _triton_miscompiles_cce_on_sm75(major, minor, version = triton_version):
+    if (major, minor) != (7, 5):
+        return False
+    low, high = _TRITON_CCE_BROKEN_ON_SM75
+    try:
+        installed = Version(version)
+    except Exception:
+        # An unparseable version is not evidence of a defect.
+        return False
+    return Version(low) <= installed < Version(high)
+pass
+
+
+def _triton_miscompiles_cce_on_any_visible_device():
+    """Every visible CUDA device this triton would miscompile the CCE kernel for, as
+    [(index, major, minor), ...].
+
+    Asked of all of them because `torch.cuda.get_device_capability()` with no argument
+    describes the CURRENT device, while a `device_map` can place `lm_head` anywhere. On a
+    heterogeneous host that turns the import-time reading into a guess about the wrong GPU,
+    and the consequence of guessing wrong is not a slow path: the kernel aborts the process
+    with `LLVM ERROR: Unsupported rounding mode for conversion`, which nothing can catch.
+    A host with no affected device is unchanged, since the list is then empty.
+    """
+    affected = []
+    try:
+        count = torch.cuda.device_count()
+    except Exception:
+        return affected
+    for index in range(count):
+        try:
+            device_major, device_minor = torch.cuda.get_device_capability(index)
+        except Exception:
+            continue
+        # `triton_version` passed rather than left to the default, which binds at
+        # definition time and so cannot be substituted by a caller or a test.
+        if _triton_miscompiles_cce_on_sm75(device_major, device_minor, triton_version):
+            affected.append((index, device_major, device_minor))
+    return affected
+pass
+
+
+if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
+    # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so ask
+    # whether a device is present before asking what it can do. Cut cross
+    # entropy is a Triton GPU kernel and cannot run here regardless, so False is
+    # both the conservative answer and the only correct one.
+    HAS_CUT_CROSS_ENTROPY = False
+elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
+    # Every VISIBLE device, not just the current one: a device_map can place lm_head on
+    # another GPU, so the kernel can run on an sm_75 while device 0 is an sm_80. The
+    # failure aborts the process rather than raising, so be conservative.
+    _miscompiling_devices = _triton_miscompiles_cce_on_any_visible_device()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
-        (not (Version(triton_version) < Version("3.0.0"))):
+        (not (Version(triton_version) < Version("3.0.0"))) and \
+        (not _miscompiling_devices):
         try:
             from cut_cross_entropy import linear_cross_entropy
             HAS_CUT_CROSS_ENTROPY = True
@@ -47,6 +117,23 @@ if DEVICE_TYPE == "cuda":
             HAS_CUT_CROSS_ENTROPY = False
     else:
         HAS_CUT_CROSS_ENTROPY = False
+    pass
+    if _miscompiling_devices:
+        _affected = ", ".join(
+            f"cuda:{index} (sm_{device_major}{device_minor})"
+            for index, device_major, device_minor in _miscompiling_devices
+        )
+        logger.warning(
+            f"Unsloth: triton=={triton_version} miscompiles the cut cross entropy "
+            f"kernel for {_affected}, so it is disabled and "
+            f"the standard loss is used instead, at a higher memory cost. torch 2.6.0, "
+            f"which carries triton 3.2.0, restores it. torch 2.8.0 and later carry a "
+            f"triton that compiles the kernel, but do NOT restore it here: unsloth_zoo "
+            f"sets UNSLOTH_ENABLE_CCE=0 for torch 2.8 and above over a separate shared "
+            f"memory failure, and both compiled branches require that flag as well as "
+            f"HAS_CUT_CROSS_ENTROPY. Leaving it enabled aborts the process with "
+            f"'LLVM ERROR: Unsupported rounding mode for conversion'."
+        )
     pass
 elif DEVICE_TYPE == "hip":
     try:
@@ -74,7 +161,7 @@ __all__ = [
     "unsloth_fused_ce_loss",
 ]
 
-from .fused_losses import unsloth_fused_ce_loss
+from unsloth_zoo.fused_losses import unsloth_fused_ce_loss
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -95,9 +182,10 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
             )
         else:
             reduction = "sum" if num_items_in_batch is not None else "mean"
+            # F.cross_entropy reads dim 1 of 3-D logits as the classes.
             loss = torch_nn_functional_cross_entropy(
-                source,
-                target,
+                source.reshape(-1, source.shape[-1]),
+                target.reshape(-1),
                 ignore_index = ignore_index,
                 reduction    = reduction,
             )
@@ -111,16 +199,28 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     
     # Causal LM loss
     def UnslothForCausalLMLoss(
-        logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
+        logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100,
+        shift_labels: Optional[torch.Tensor] = None, **kwargs
     ):
-        if labels is None: return None
-        shift_logits = logits
-        shift_labels = torch.empty_like(labels)
-        shift_labels[..., :-1] = labels[..., 1:]
-        shift_labels[..., -1] = ignore_index
-        loss = unsloth_fixed_cross_entropy(shift_logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
+        if shift_labels is None:
+            if labels is None: return None
+            # Flat (tokens, vocab) logits (Ling-2.6-flash MTP head): take the labels' rows, as stock shifts per label row.
+            if logits.dim() == 2:
+                labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
+                logits = logits.view(*labels.shape, logits.shape[-1])
+            shift_labels = torch.empty_like(labels, device = logits.device)
+            shift_labels[..., :-1] = labels[..., 1:]
+            shift_labels[..., -1] = ignore_index
+        else:
+            # Explicit targets are already aligned to logits.
+            if logits.dim() == 2:
+                logits = logits.unsqueeze(0)
+            shift_labels = shift_labels.reshape(logits.shape[:-1]).to(logits.device).contiguous()
+        loss = unsloth_fixed_cross_entropy(logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
         return loss
     pass
+    # Dynamo traces a torch.compile wrapper as the raw function, so both carry the marker.
+    UnslothForCausalLMLoss._unsloth_fused_loss = UnslothForCausalLMLoss
 
     if (Version(torch.__version__) < Version("2.4.0")):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
@@ -135,6 +235,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     pass
 
     # Now patch the losses!
+    UnslothForCausalLMLoss._unsloth_fused_loss = UnslothForCausalLMLoss
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
     # Patch every key still aliased to the stock ForCausalLMLoss. PreTrainedModel
@@ -176,7 +277,12 @@ def post_patch_loss_function(model):
 pass
 
 
-current_device = torch.xpu.device if DEVICE_TYPE == "xpu" else torch.cuda.device
+if DEVICE_TYPE == "xpu":
+    current_device = torch.xpu.device
+elif DEVICE_TYPE == "npu":
+    current_device = torch.npu.device
+else:
+    current_device = torch.cuda.device
 def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
@@ -189,16 +295,16 @@ def fused_linear_cross_entropy(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
-        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+        num_items_in_batch = num_items_in_batch.to(lm_weight.device, non_blocking = True)
 
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
 
     with current_device(lm_weight.device):
         loss = linear_cross_entropy(
-            hidden_states.to(lm_weight.dtype),
+            hidden_states.to(device = lm_weight.device, dtype = lm_weight.dtype, non_blocking = True),
             lm_weight,
-            targets      = labels,
+            targets      = labels.to(lm_weight.device, non_blocking = True),
             ignore_index = ignore_index,
             softcap      = logit_softcapping,
             reduction    = reduction,
@@ -222,6 +328,55 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
+# Heads whose labels are not shifted next-token targets, so the counter below cannot
+# describe them. Matched on the top level class name, since the walk below descends
+# into the backbone and would judge the head by the decoder it sits on.
+NON_CAUSAL_HEADS = (
+    "ForSequenceClassification",
+    "ForTokenClassification",
+    "ForQuestionAnswering",
+    "ForMultipleChoice",
+)
+
+# The loss_types that shift labels, snapshotted AT IMPORT: patch_loss_functions() above
+# swaps every causal entry for UnslothForCausalLMLoss, so testing against the live
+# mapping would read False for every causal model once unsloth has loaded.
+try:
+    from transformers.loss.loss_utils import LOSS_MAPPING as _LOSS_MAPPING, ForCausalLMLoss
+    CAUSAL_LOSS_TYPES = frozenset(
+        key for key, fn in _LOSS_MAPPING.items() if fn is ForCausalLMLoss
+    )
+except Exception:
+    CAUSAL_LOSS_TYPES = frozenset()
+
+
+def _loss_shifts_labels(trainer, model, is_encoder_decoder):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Does this model's loss shift labels, so labels[..., 1:] is the right count?
+
+    A positive signal, not a list of excluded suffixes: a name cannot tell
+    BertForMaskedLM (2D token aligned labels, column 0 supervised) from a causal LM.
+    5.x already computed this on the Trainer; older ones get the same answer from the
+    loss_type every PreTrainedModel derives from its class name. A hand written
+    nn.Module has neither, and stays out: without a signal we decline rather than
+    guess, which is today's behaviour for it anyway.
+    """
+    shifts = getattr(trainer, "_loss_shifts_labels", None)
+    if isinstance(shifts, bool): return shifts
+    return getattr(model, "loss_type", None) in CAUSAL_LOSS_TYPES \
+        and not is_encoder_decoder
+pass
+
+UNSHIFTED_LABELS_MARKER = "_unsloth_counts_unshifted_labels"
+
+
+def counts_unshifted_labels(model):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if model is None: return False
+    if getattr(model, "__dict__", {}).get(UNSHIFTED_LABELS_MARKER, None) is True: return True
+    return getattr(type(model), UNSHIFTED_LABELS_MARKER, False) is True
+pass
+
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
@@ -236,19 +391,182 @@ from transformers.training_args import ParallelMode
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
 
+
+def _normalize_packed_seq_lengths(seq_lengths):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Coerce collator supplied packed sequence lengths to a 1D int64 CPU tensor.
+
+    Returns None when the metadata is missing, unusable, describes a single
+    document (one document has no internal boundary to drop), or when the running
+    execution mode cannot evaluate the filter below. Kept on CPU:
+    these are tens of elements, it avoids MPS / XPU integer op gaps, and it keeps
+    the counting path free of a device sync.
+
+    Deliberately duplicated from unsloth/utils/packing.py rather than imported.
+    The dependency arrow runs unsloth -> unsloth_zoo and must never run back.
+
+    Anything unconvertible is treated as absent rather than raised: the caller
+    counts inside a try that re-raises as RuntimeError, so a plain list of ints
+    used to end the run outright.
+    """
+    if seq_lengths is None: return None
+    try:
+        if isinstance(seq_lengths, torch.Tensor):
+            lengths = seq_lengths.detach().to(device = "cpu", dtype = torch.long)
+        else:
+            lengths = torch.as_tensor(seq_lengths, dtype = torch.long)
+        if lengths.ndim != 1:
+            lengths = lengths.reshape(-1)
+        # Filtering is mandatory (a 0 length duplicates a start, a negative one
+        # corrupts every later cumsum) and must stay inside the try: the mask
+        # lowers to aten.nonzero, which raises DynamicOutputShapeException under
+        # FakeTensorMode and raises under vmap. Escaping into the caller's
+        # `except Exception: raise RuntimeError(...)` kills the run.
+        lengths = lengths[lengths > 0]
+        if lengths.numel() <= 1: return None
+    except Exception:
+        return None
+    return lengths
+pass
+
+
+_TRAINING_WRAPPER_ATTRS = ("module", "_orig_mod", "_fsdp_wrapped_module")
+_TRAINING_WRAPPER_TYPES = frozenset((
+    "DistributedDataParallel", "DataParallel", "OptimizedModule", "FullyShardedDataParallel",
+))
+
+
+def _unwrap_training_wrappers(m):
+    # All Unsloth Zoo code licensed under LGPLv3
+    for _ in range(4):
+        modules = getattr(m, "__dict__", {}).get("_modules") or {}
+        inner = next((modules[a] for a in _TRAINING_WRAPPER_ATTRS if a in modules), None)
+        if inner is None or type(m).__name__ not in _TRAINING_WRAPPER_TYPES:
+            return m
+        m = inner
+    return m
+pass
+
+
+# Written by unsloth once it decides the head consumes the count; outranks the guesses below.
+NUM_ITEMS_LABELS_ATTR = "_unsloth_num_items_labels"
+_NUM_ITEMS_LABELS = ("shifted", "unshifted")
+
+
+def num_items_labels_convention(model):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """unsloth's recorded count convention off the model, its training wrappers or PEFT base, else None."""
+    candidates = []
+    m = model
+    try:
+        for _ in range(4):
+            candidates.append(m)
+            modules = getattr(m, "__dict__", {}).get("_modules") or {}
+            inner = next((modules[a] for a in _TRAINING_WRAPPER_ATTRS if a in modules), None)
+            if inner is None or type(m).__name__ not in _TRAINING_WRAPPER_TYPES: break
+            m = inner
+        get_base_model = getattr(m, "get_base_model", None)
+        if callable(get_base_model):
+            candidates.append(get_base_model())
+    except Exception:
+        pass
+    for m in candidates:
+        value = getattr(m, "__dict__", {}).get(NUM_ITEMS_LABELS_ATTR, None)
+        if isinstance(value, str) and value in _NUM_ITEMS_LABELS:
+            return value
+    return None
+pass
+
+
+def _packed_boundary_targets(packed_seq_lengths, token_count):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Mask over `token_count` (the shifted targets) of the slots that start a later packed document, else None.
+
+    No data-dependent shapes, so a compiled forward drops the same slots as the eager batch count.
+    """
+    if torch.compiler.is_compiling() and isinstance(packed_seq_lengths, torch.Tensor):
+        # Clamping stands in for the eager filter, which lowers to nonzero and cannot trace.
+        lengths = packed_seq_lengths.reshape(-1).long().clamp_min(0)
+    else:
+        lengths = _normalize_packed_seq_lengths(packed_seq_lengths)
+    if lengths is None or lengths.numel() <= 1: return None
+    n_shift = token_count.shape[-1]
+    n_rows  = token_count.numel() // n_shift
+    ends    = torch.cumsum(lengths, dim = 0)
+    starts  = ends[:-1]
+    rows    = torch.div(starts, n_shift + 1, rounding_mode = "floor")
+    cols    = starts - rows * (n_shift + 1)
+    # labels[..., 1:] already dropped column 0, and a start at the last end has no document after it.
+    keep    = (cols > 0) & (rows < n_rows) & (starts < ends[-1])
+    flat    = torch.where(keep, rows * n_shift + cols - 1, n_rows * n_shift).to(token_count.device)
+    drop    = torch.zeros(n_rows * n_shift + 1, dtype = torch.bool, device = token_count.device)
+    drop.index_fill_(0, flat, True)
+    return drop[:-1].reshape(token_count.shape)
+pass
+
+
+def count_batch_items(labels, attention_mask = None, input_ids = None, packed_seq_lengths = None,
+                      unshifted = False, shift_labels = None):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Counted targets of one micro-batch, as `(count, short, degenerate)`, without a device sync.
+
+    Shared by the batch counter and the MoE aux weighting. A caller's `shift_labels` are the losses'
+    targets as given (stock counts them too): never re-shifted or re-masked.
+    """
+    degenerate = input_ids is not None and labels.ndim != input_ids.ndim
+    if isinstance(shift_labels, torch.Tensor):
+        return (shift_labels != -100).sum(), shift_labels.shape[-1] < 1, degenerate
+    if unshifted:
+        return (labels != -100).sum(), labels.shape[-1] < 1, degenerate
+    short = labels.shape[-1] < 2
+    token_count = (labels[..., 1:] != -100)
+    if attention_mask is not None:
+        # Only AND a mask of the same shape: a seq2seq mask is the encoder's.
+        if attention_mask.shape != labels.shape:
+            degenerate = True
+        else:
+            token_count &= (attention_mask[..., 1:] != 0)
+    if token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
+        # Zero the N-1 packed boundaries, never subtract: collators often mask them already.
+        boundaries = _packed_boundary_targets(packed_seq_lengths, token_count)
+        if boundaries is not None:
+            token_count = token_count & ~boundaries
+    pass
+    return token_count.sum(), short, degenerate
+pass
+
+
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
     num_items_in_batch = None
 
     # Check if model allows **kwargs
-    m = self.model
+    m = _unwrap_training_wrappers(self.model)
     if hasattr(m, "get_base_model"):
         # Removes PeftModelForCausalLM and gets internal model
         m = m.get_base_model()
     model_name = m.__class__.__name__
+
+    # Read off the top level model, before the walk below reassigns m: unsloth patches
+    # LlamaModel.forward class-wide, so LlamaForSequenceClassification descends into
+    # .model, matches "_fast_forward" and never consults the head it trains. Not
+    # cached, since is_encoder_decoder belongs to the instance, not the class name.
+    top_model = m
+    is_encoder_decoder = bool(getattr(getattr(m, "config", None), "is_encoder_decoder", False))
+    is_non_causal_head = any(head in model_name for head in NON_CAUSAL_HEADS)
+    # Read every call, never cached: the rewriter may install it after a first count.
+    unshifted = counts_unshifted_labels(top_model)
+    convention = num_items_labels_convention(self.model)
+    if convention is not None:
+        unshifted = convention == "unshifted"
+
+    forward_key = getattr(type(top_model), "forward", None)
     global ALLOWED_NUM_ITEMS_IN_BATCH
-    if model_name not in ALLOWED_NUM_ITEMS_IN_BATCH:
+    cached = ALLOWED_NUM_ITEMS_IN_BATCH.get(model_name)
+    if cached is not None and len(cached) > 2 and cached[2] is not forward_key:
+        cached = None
+    if cached is None:
 
         has_kwargs = False
         is_vlm = False
@@ -280,10 +598,12 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             if not hasattr(m, "model"): break
             m = m.model
         pass
-        ALLOWED_NUM_ITEMS_IN_BATCH[model_name] = (has_kwargs, is_vlm)
+        ALLOWED_NUM_ITEMS_IN_BATCH[model_name] = (has_kwargs, is_vlm, forward_key)
     else:
-        has_kwargs, is_vlm = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
+        has_kwargs, is_vlm = cached[0], cached[1]
     pass
+    if convention is not None:
+        has_kwargs = True
 
     # Iterate to find all batches
     for _ in range(num_batches):
@@ -293,38 +613,87 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
-    # Get num_items_in_batch
-    if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
+    # Get num_items_in_batch. Two questions, as in stock transformers:
+    #   has a consumer: `model_accepts_loss_kwargs or compute_loss_func is not None`,
+    #     same on 4.57.6 and 5.17.0. has_kwargs is our first half, #1217 the second.
+    #   is countable: everything below counts SHIFTED CAUSAL targets (stock 5.17.0's
+    #     self._loss_shifts_labels). This lives on the base Trainer class, so
+    #     classification and seq2seq subclasses inherit it and their labels mean
+    #     something else: they raise here, or come back quietly short.
+    # The guards differ in width on purpose. is_non_causal_head gates both routes; the
+    # new route also demands a POSITIVE shifted-label signal, so Whisper and Florence2
+    # keep today's count rather than being rescaled here. A sample has to be a Mapping
+    # before "labels" can be read off it, and then have a .ndim before any tensor op
+    # touches it: TRL's GRPO collator is the identity, so a sample is a LIST of dicts
+    # and `.get` on it raises. Both used to kill a run stock trains through, which is
+    # why the pre-#1217 spelling asked `"labels" in batch_samples[0]`.
+    labels_are_countable = getattr(
+        batch_samples[0].get("labels") if len(batch_samples) > 0
+        and isinstance(batch_samples[0], Mapping) else None, "ndim", None,
+    ) is not None
+    if unshifted:
+        has_consumer = has_kwargs or (getattr(self, "compute_loss_func", None) is not None
+                                      and is_encoder_decoder)
+    else:
+        has_consumer = has_kwargs or (getattr(self, "compute_loss_func", None) is not None
+                                      and _loss_shifts_labels(self, top_model, is_encoder_decoder))
+    if (not is_non_causal_head) and labels_are_countable and has_consumer:
         try:
             token_counts = []
+            # Shape only, so no device sync and still traceable. Acted on after the
+            # collectives below, never by breaking out: skipping accelerator.gather on
+            # one rank alone would hang the others.
+            degenerate = False
+            # One column leaves labels[..., 1:] empty. Only fatal when EVERY microbatch
+            # is short, since then the total is 0 and a sum/count loss divides by it. A
+            # short member of a mixed group just contributes 0, and voiding the group
+            # for it would lose GA invariance.
+            all_short = True
             for x in batch_samples:
                 labels = x["labels"]
-                token_count = (labels[..., 1:] != -100)
+                input_ids = attention_mask = None
                 if "input_ids" in x:
                     input_ids = x["input_ids"]
-                    mark_static (input_ids, 0)
-                    mark_dynamic(input_ids, 1)
-                if "attention_mask" in x:
+                    if not unshifted:
+                        mark_static (input_ids, 0)
+                        mark_dynamic(input_ids, 1)
+                if "attention_mask" in x and not unshifted:
                     attention_mask = x["attention_mask"]
                     mark_static (attention_mask, 0)
                     mark_dynamic(attention_mask, 1)
-                    token_count &= (attention_mask[..., 1:] != 0)
-                if "token_type_ids" in x:
+                if "token_type_ids" in x and not unshifted:
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
-                count = token_count.sum()
-                seq_lengths = x.get("packed_seq_lengths")
-                if seq_lengths is not None:
-                    # Packing N sequences has N-1 internal boundaries that
-                    # aren't valid training positions.
-                    count -= torch.count_nonzero(seq_lengths > 0).item() - 1
+                count, short, bad = count_batch_items(
+                    labels, attention_mask, input_ids,
+                    None if unshifted else x.get("packed_seq_lengths"), unshifted = unshifted,
+                    shift_labels = x.get("shift_labels"),
+                )
+                if not short: all_short = False
+                if bad: degenerate = True
                 token_counts.append(count)
             pass
             num_items_in_batch = sum(token_counts)
 
             if self.args.average_tokens_across_devices:
-                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
+                if getattr(self.args, "world_size", 1) > 1:
+                    # One collective, not two: the two rank-local fallback flags ride
+                    # along with the count, so this path keeps exactly the single
+                    # gather it has always had. ANY degenerate rank means the layout
+                    # is uncountable everywhere; only an ALL-short world has a truly
+                    # zero total, since a short rank beside healthy ones has simply
+                    # contributed 0 to a total that is still its right divisor.
+                    count = torch.as_tensor(num_items_in_batch).reshape(()).to(torch.int64)
+                    flags = torch.tensor([int(degenerate), int(all_short)],
+                                         dtype = torch.int64, device = count.device)
+                    packed = torch.cat([count.reshape(1), flags])
+                    packed = self.accelerator.gather(packed).reshape(-1, 3)
+                    num_items_in_batch = packed[:, 0].sum()
+                    degenerate = bool(packed[:, 1].any())
+                    all_short  = bool(packed[:, 2].all())
+                else:
+                    num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
             if torch.is_tensor(num_items_in_batch):
                 if device is not None:
                     num_items_in_batch = num_items_in_batch.to(device)
@@ -332,9 +701,25 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # Uses DataParallel scatter gather
                     # So we have to scatter num_items_in_batch to each GPU
                     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
+            # Discard a count these labels could not support. Last, so every collective
+            # above ran on every rank, and reduced above so no rank drops a divisor its
+            # peers keep.
+            if degenerate or all_short: num_items_in_batch = None
         except Exception as exception:
             raise RuntimeError(exception)
     pass
+
+    # num_items_in_batch is set from the forward signature, but training_step
+    # divides by grad-accum off self.model_accepts_loss_kwargs. Counting while
+    # that flag is False normalises twice (TRL chunked_nll and our fused CE each
+    # divide by it), scaling loss and grads by 1/GA. Like stock
+    # Trainer._get_num_items_in_batch, only count when a consumer exists; these
+    # losses fall back to a mean when it is None.
+    if (num_items_in_batch is not None
+            and not getattr(self, "model_accepts_loss_kwargs", True)
+            and getattr(self, "compute_loss_func", None) is None):
+        num_items_in_batch = None
+
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
     

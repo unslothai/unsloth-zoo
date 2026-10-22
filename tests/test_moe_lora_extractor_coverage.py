@@ -31,8 +31,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-# Importing the package side-effect-populates TEMPORARY_PATCHES.
 import unsloth_zoo.temporary_patches  # noqa: F401  side effect: register patches
+from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_expert_columns
 from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
 
 
@@ -123,11 +123,6 @@ def _discover_patched_moe_classes() -> list[type]:
                 continue
             out.append(obj)
     return out
-
-
-# --------------------------------------------------------------------------
-# Opportunistic parity helpers
-# --------------------------------------------------------------------------
 
 
 class _StubWrapper:
@@ -246,17 +241,12 @@ def _parity_one(extractor, experts, name: str, in_dim: int, out_dim: int,
     x = torch.randn(5, in_dim)
     for e in range(E):
         Ae = wA[e * R : (e + 1) * R]
-        Be = wB[:, e * R : (e + 1) * R]
+        Be = wB[:, moe_lora_b_expert_columns(e, E, R)]
         naive = (x @ Be @ Ae) if peft_swap else (x @ Ae.T @ Be.T)
         via = (x @ first[e]) @ second[e]
         if not torch.allclose(via, naive, atol=1e-4, rtol=1e-4):
             return False, f"per-expert delta mismatch on expert {e}"
     return True, "ok"
-
-
-# --------------------------------------------------------------------------
-# The single test
-# --------------------------------------------------------------------------
 
 
 def test_every_patched_moe_experts_class_has_lora_extractor():
@@ -276,9 +266,6 @@ def test_every_patched_moe_experts_class_has_lora_extractor():
         # drift; (c) the `_original_..._forward` convention
         # `_has_unsloth_patched_forward` reads drifted from `patch_function`
         # -- a real test-helper regression.
-        # Disambiguate via `_unsloth_already_patched=True`: if any class
-        # carries it, a patch fn ran fully so missing discovery is (c), a real
-        # regression. If none carries it, we're in (a)/(b) and skip.
         already = []
         for modeling in _iter_modeling_modules():
             for _name, cls in inspect.getmembers(modeling, inspect.isclass):
@@ -311,7 +298,6 @@ def test_every_patched_moe_experts_class_has_lora_extractor():
             "fully supported runtime still exercise the real assertion."
         )
 
-    # Hard contract: extractor must be registered on every patched class.
     missing = [
         f"{c.__module__}.{c.__name__}"
         for c in patched
@@ -326,8 +312,6 @@ def test_every_patched_moe_experts_class_has_lora_extractor():
         f"in the patch function. Offenders: {missing}"
     )
 
-    # Soft contract: opportunistic per-expert parity catches the
-    # extractor-orientation bug class (cheap to assert alongside).
     parity_failures = []
     for cls in patched:
         experts = _try_instantiate_experts(cls)

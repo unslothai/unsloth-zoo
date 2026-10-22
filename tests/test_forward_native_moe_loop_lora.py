@@ -45,7 +45,6 @@ def _build_lora_for(experts, rank, scaling):
     """
     E = experts.num_experts
     if experts.gate_up_proj.shape[1] == 2 * (experts.down_proj.shape[1] if experts.down_proj.shape[1] != experts.gate_up_proj.shape[2] else experts.down_proj.shape[2]):
-        # Heuristic that holds for both layouts in this test
         pass
     # Derive in/out from the actual base shape to stay layout-agnostic
     if experts.gate_up_proj.shape[1] > experts.gate_up_proj.shape[2]:
@@ -130,7 +129,6 @@ def test_forward_native_moe_loop_with_lora_matches_naive(transposed_storage):
     experts = _build_experts(num_experts, hidden, intermediate, transposed_storage)
     gate_up_lora, down_lora = _build_lora_for(experts, rank, scaling=2.0)
 
-    # Stash the LoRA tensors where forward_native_moe_loop expects them.
     experts._unsloth_lora_gate_up_proj = gate_up_lora
     experts._unsloth_lora_down_proj = down_lora
 
@@ -187,7 +185,6 @@ def test_forward_native_moe_loop_square_dim_uses_grouped_mm_flag():
 
     experts = nn.Module()
     experts.num_experts = num_experts
-    # Transposed (grouped_mm) storage:
     experts.gate_up_proj = nn.Parameter(
         torch.randn(num_experts, hidden, 2 * intermediate, dtype=torch.float32)
     )
@@ -236,7 +233,6 @@ def test_forward_native_moe_loop_lora_dtype_precast_no_loop_alloc(dtype):
 
     experts = _build_experts(num_experts, hidden, intermediate, False)
     gate_up_lora, down_lora = _build_lora_for(experts, rank, scaling=1.5)
-    # Cast everything (params + lora) to the target dtype.
     experts.gate_up_proj.data = experts.gate_up_proj.data.to(dtype)
     experts.down_proj.data = experts.down_proj.data.to(dtype)
     experts._unsloth_lora_gate_up_proj = (
@@ -255,8 +251,84 @@ def test_forward_native_moe_loop_lora_dtype_precast_no_loop_alloc(dtype):
                          experts._unsloth_lora_gate_up_proj,
                          experts._unsloth_lora_down_proj)
 
-    # Looser tolerance for low-precision dtypes
     atol = 1e-4 if dtype == torch.float32 else 1e-1
     rtol = 1e-4 if dtype == torch.float32 else 1e-1
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
     assert out.dtype == dtype
+
+
+class GptOssExperts(nn.Module):
+    """Stock gpt-oss layout: (E, in, out) weights, biases, clamped swiglu."""
+
+    def __init__(self, num_experts=4, hidden=16, intermediate=12):
+        super().__init__()
+        self.num_experts = num_experts
+        self.alpha = 1.702
+        self.limit = 7.0
+        self.gate_up_proj = nn.Parameter(
+            torch.randn(num_experts, hidden, 2 * intermediate) * 0.1)
+        self.gate_up_proj_bias = nn.Parameter(
+            torch.randn(num_experts, 2 * intermediate) * 0.1)
+        self.down_proj = nn.Parameter(
+            torch.randn(num_experts, intermediate, hidden) * 0.1)
+        self.down_proj_bias = nn.Parameter(torch.randn(num_experts, hidden) * 0.1)
+        self._unsloth_grouped_mm_format = True
+
+
+def test_forward_native_moe_loop_gpt_oss_matches_naive():
+    torch.manual_seed(0)
+    num_experts, hidden, num_tokens, top_k = 4, 16, 8, 2
+    experts = GptOssExperts(num_experts, hidden)
+    hidden_states = torch.randn(num_tokens, hidden)
+    top_k_index = torch.stack(
+        [torch.randperm(num_experts)[:top_k] for _ in range(num_tokens)])
+    top_k_weights = torch.softmax(torch.randn(num_tokens, top_k), dim=-1)
+
+    out = forward_native_moe_loop(experts, hidden_states, top_k_index, top_k_weights)
+
+    ref = torch.zeros_like(hidden_states)
+    for t in range(num_tokens):
+        for k in range(top_k):
+            e = top_k_index[t, k].item()
+            h = hidden_states[t] @ experts.gate_up_proj[e] + experts.gate_up_proj_bias[e]
+            gate, up = h[::2], h[1::2]
+            gate = gate.clamp(max=experts.limit)
+            up = up.clamp(min=-experts.limit, max=experts.limit)
+            inter = (up + 1.0) * (gate * torch.sigmoid(gate * experts.alpha))
+            ref[t] += top_k_weights[t, k] * (
+                inter @ experts.down_proj[e] + experts.down_proj_bias[e])
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
+
+
+class _InterleavedExperts(nn.Module):
+
+    is_concatenated = False
+
+    def __init__(self, num_experts, hidden, intermediate):
+        super().__init__()
+        self.num_experts = num_experts
+        self.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * intermediate, hidden))
+        self.gate_up_proj_bias = nn.Parameter(torch.randn(num_experts, 2 * intermediate))
+        self.down_proj = nn.Parameter(torch.randn(num_experts, hidden, intermediate))
+        self.down_proj_bias = nn.Parameter(torch.randn(num_experts, hidden))
+        self.act_fn = F.silu
+
+
+def test_interleaved_non_gpt_oss_keeps_its_own_activation():
+    torch.manual_seed(0)
+    E, H, I, T, K = 4, 16, 8, 6, 2
+    experts = _InterleavedExperts(E, H, I)
+    x = torch.randn(T, H) * 4
+    top_k_index = torch.stack([torch.randperm(E)[:K] for _ in range(T)])
+    top_k_weights = torch.rand(T, K)
+    with torch.no_grad():
+        out = forward_native_moe_loop(experts, x, top_k_index, top_k_weights)
+        ref = torch.zeros_like(x)
+        for t in range(T):
+            for k in range(K):
+                e = int(top_k_index[t, k])
+                gate_up = F.linear(x[t], experts.gate_up_proj[e], experts.gate_up_proj_bias[e])
+                gate, up = gate_up[::2], gate_up[1::2]
+                y = F.linear(F.silu(gate) * up, experts.down_proj[e], experts.down_proj_bias[e])
+                ref[t] += y * top_k_weights[t, k]
+    assert torch.allclose(out, ref, atol = 1e-4, rtol = 1e-4), (out - ref).abs().max()
