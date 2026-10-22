@@ -92,3 +92,11 @@ def test_other_models_keep_top_level_padding():
         type(processor).__call__ = original
     assert calls and all(c.get("padding") is True and "text_kwargs" not in c for c in calls)
     assert batch["input_features"].shape[-1] < 3000
+
+
+def test_pad_to_multiple_of_stays_off_fixed_length_audio():
+    from unsloth_zoo.vision_utils import _text_only_padding
+
+    kwargs = _text_only_padding({"padding": True, "pad_to_multiple_of": 512, "audio": [0]})
+    assert kwargs == {"audio": [0], "text_kwargs": {"padding": True, "pad_to_multiple_of": 512}}
+    assert _text_only_padding({"padding": True}) == {"text_kwargs": {"padding": True}}

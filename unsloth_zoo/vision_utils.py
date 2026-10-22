@@ -1683,8 +1683,11 @@ _FULL_LENGTH_AUDIO_MODEL_TYPES = frozenset({"audioflamingo3", "musicflamingo"})
 
 
 def _text_only_padding(kwargs):
-    """Move a top-level padding into text_kwargs, so the audio feature extractor keeps its own."""
-    kwargs["text_kwargs"] = {"padding": kwargs.pop("padding")}
+    """Move top-level padding (and pad_to_multiple_of) into text_kwargs, so the audio feature extractor keeps its own."""
+    text_kwargs = {"padding": kwargs.pop("padding")}
+    if kwargs.get("pad_to_multiple_of") is not None:
+        text_kwargs["pad_to_multiple_of"] = kwargs.pop("pad_to_multiple_of")
+    kwargs["text_kwargs"] = text_kwargs
     return kwargs
 
 
@@ -1955,12 +1958,12 @@ class UnslothVisionDataCollator:
             videos, extra = video_processor_kwargs(self.processor, videos, video_kwargs["fps"])
             proc_kwargs["videos"] = videos
             proc_kwargs.update(extra)
+        if self.pad_to_multiple_of is not None:
+            proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         if audios:
             proc_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
             if self._full_length_audio:
                 _text_only_padding(proc_kwargs)
-        if self.pad_to_multiple_of is not None:
-            proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         batch = self._call_processor(proc_kwargs, has_images)
 
         # Truncate manually when audio is present (couldn't pass max_length to processor)
