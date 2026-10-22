@@ -107,10 +107,17 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
     return _ChunkedLinearCrossEntropy.apply(hidden, weight, shift_labels, float(divisor), chunk_rows, ignore_index)
 
 
+# Architectures whose causal-LM loss is plain CE over lm_head(hidden). Others (soft caps, logit scales,
+# z-loss, router losses, ...) keep their own forward.
+_CHUNKED_CE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "olmo2", "smollm3"))
+
+
 def _plain_lm_head(model):
     """Only models whose logits are exactly lm_head(hidden): no softcap, scale or bias."""
     config = getattr(model, "config", None)
     text_config = getattr(config, "get_text_config", lambda: config)()
+    if getattr(text_config, "model_type", None) not in _CHUNKED_CE_MODEL_TYPES:
+        return False
     for name in ("final_logit_softcapping", "logits_soft_cap", "logit_scale", "logits_scaling", "output_multiplier_scale"):
         value = getattr(text_config, name, None)
         if value not in (None, 1, 1.0):

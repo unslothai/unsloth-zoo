@@ -43,7 +43,7 @@ def normalize_cpu_training_arguments(args):
         # bf16 autocast without AMX / AVX512-BF16 / Arm BF16 is emulated and several times slower.
         args.bf16 = False
     optim = str(_name(getattr(args, "optim", "")) or "").lower()
-    if optim in _GPU_ONLY_OPTIMIZERS or "8bit" in optim or "paged" in optim or "bnb" in optim:
+    if optim in _GPU_ONLY_OPTIMIZERS or any(tag in optim for tag in ("8bit", "paged", "bnb", "npu", "xla")):
         print(f"Unsloth (CPU): optim = {optim!r} needs a GPU, using 'adamw_torch'.")
         args.optim = "adamw_torch"
     if getattr(args, "tf32", None):

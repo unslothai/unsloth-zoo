@@ -165,8 +165,9 @@ def test_moe_models_keep_their_own_loss():
         def get_output_embeddings(self):
             return self.lm_head
 
-    assert _plain_lm_head(Model(SimpleNamespace()))
-    assert not _plain_lm_head(Model(SimpleNamespace(num_experts = 8, output_router_logits = False)))
+    assert _plain_lm_head(Model(SimpleNamespace(model_type = "llama")))
+    assert not _plain_lm_head(Model(SimpleNamespace(model_type = "llama", num_experts = 8)))
+    assert not _plain_lm_head(Model(SimpleNamespace(model_type = "xlstm")))
 
 
 def test_cpu_backend_installs_the_datasets_path_guard():

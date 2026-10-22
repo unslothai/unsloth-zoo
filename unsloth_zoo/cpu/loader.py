@@ -167,6 +167,7 @@ class FastCPUModel:
         tokenizer = AutoTokenizer.from_pretrained(
             model_name, token = token, revision = revision, trust_remote_code = trust_remote_code,
             model_max_length = max_seq_length, padding_side = "right",
+            **{k: kwargs[k] for k in ("cache_dir", "local_files_only", "subfolder") if k in kwargs},
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
