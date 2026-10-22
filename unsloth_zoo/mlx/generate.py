@@ -248,7 +248,8 @@ class GenerationRequest:
 
     Exactly one of ``prompt`` and ``prompt_token_ids`` must be provided, and a
     vision request with media must use ``prompt``. Rendered prompt strings are
-    encoded as-is; chat templating belongs to the caller. ``image`` (vision models only) accepts a PIL image, an array, or a
+    encoded as-is; chat templating belongs to the caller. ``image`` (vision models, and image models
+    loaded through mlx-lm) accepts a PIL image, an array, or a
     str/os.PathLike filesystem path or URL, decoded once before grouping; raw
     bytes and file-like objects are rejected. ``audio`` (vision models only) is
     accepted but decodes one request at a time, since no supported mlx-vlm
@@ -356,9 +357,15 @@ def _validated_prompt_ids(request: GenerationRequest, index: int) -> tuple[int, 
     return tuple(int(token) for token in prompt_ids)
 
 
+def _serves_text_images(model) -> bool:
+    """An image model loaded through mlx-lm (see ``FastMLXModel``), whose text batches take images."""
+    return getattr(model, "_unsloth_supports_images", None) is True and not getattr(model, "_is_vlm_model", False)
+
+
 def _validate_text_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
+    takes_images: bool = False,
 ) -> list[GenerationRequest]:
     validated = list(requests)
     for index, request in enumerate(validated):
@@ -386,11 +393,18 @@ def _validate_text_requests(
             request.sampling, SamplingParams
         ):
             raise TypeError(f"requests[{index}].sampling must be SamplingParams.")
-        if request.image is not None or request.audio is not None:
+        if request.audio is not None or request.image is not None and not takes_images:
             raise ValueError(
                 f"requests[{index}] includes media, but text models accept "
                 "text prompts only."
             )
+        if request.image is not None and has_ids:
+            raise ValueError(
+                f"requests[{index}] gives token ids with an image; only the "
+                "processor can place image tokens, so send a rendered prompt."
+            )
+        if isinstance(request.image, os.PathLike):
+            validated[index] = replace(validated[index], image=os.fspath(request.image))
         if request.prompt_cache_state is not None:
             raise ValueError(
                 f"requests[{index}] carries a prompt_cache_state, which only a vision "
@@ -1610,6 +1624,45 @@ def _warn_preserving(
         pass
 
 
+def image_prompt_embeddings(model, tokenizer, prompt: str, images, *, add_special_tokens = None):
+    """``(token_ids, input_embeddings)`` of a rendered prompt for an image model loaded through
+    mlx-lm, with the tokenizer returned with it, for ``mlx_lm.stream_generate(..., input_embeddings=)``.
+    ``add_special_tokens=None`` adds them unless the prompt starts with the BOS."""
+    import mlx.core as mx
+    from .loader import _mlx_lm_image_inputs
+
+    processor = getattr(tokenizer, "_unsloth_image_processor", None)
+    if processor is None:
+        raise ValueError("Image prompts need the tokenizer FastMLXModel returned with this model.")
+    inputs = _mlx_lm_image_inputs(
+        tokenizer, processor, list(images), prompt, add_special_tokens=add_special_tokens)
+    ids = [int(token) for token in inputs["input_ids"][0]]
+    embeddings = model.embed_inputs(
+        mx.array(ids), pixel_values=[mx.array(pixels) for pixels in inputs["pixel_values"]])
+    return ids, embeddings
+
+
+def prefill_image_prompt(
+    model, tokenizer, prompt: str, images, cache, *, prefill_step_size: int = 2048, add_special_tokens = None,
+) -> list[int]:
+    """Prefill ``cache`` with all but the last token of an image prompt and return its token ids: mlx-lm's
+    ``BatchGenerator`` takes ids only, so the row joins as ``insert([ids[-1:]], caches=[cache], all_tokens=[ids[:-1]])``."""
+    import mlx.core as mx
+
+    with mx.stream(importlib.import_module("mlx_lm.generate").generation_stream):
+        ids, embeddings = image_prompt_embeddings(
+            model, tokenizer, prompt, images, add_special_tokens=add_special_tokens)
+        processor = tokenizer._unsloth_image_processor
+        # The last position joins as a token, so it must not be an image row.
+        if ids[-1] == tokenizer.convert_tokens_to_ids(processor.image_token):
+            raise ValueError("An image prompt cannot end inside an image.")
+        for start in range(0, len(ids) - 1, prefill_step_size):
+            end = min(start + prefill_step_size, len(ids) - 1)
+            model(mx.array(ids[start:end])[None], cache=cache, input_embeddings=embeddings[None, start:end])
+            mx.eval([entry.state for entry in cache])
+    return ids
+
+
 class _TextBatchSession:
     """One mlx-lm ``BatchGenerator`` with its row set left open."""
 
@@ -1643,7 +1696,10 @@ class _TextBatchSession:
     def add(self, request: GenerationRequest) -> int:
         adapter = self.adapter
         defaults = adapter.defaults
-        prompt = _encode_prompt(adapter.tokenizer, request)
+        if request.image is None:
+            prompt, prefilled, cache = _encode_prompt(adapter.tokenizer, request), [], None
+        else:
+            prompt, prefilled, cache = self._prefill_image_row(request)
         params = request.sampling or defaults.sampling
         sampler = (
             _seeded_sampler(adapter.sample_utils, params)
@@ -1661,6 +1717,7 @@ class _TextBatchSession:
                 max_tokens=[int(request.max_tokens or defaults.max_tokens)],
                 samplers=[sampler],
                 logits_processors=[_text_row_processors(request)],
+                **({} if cache is None else {"caches": [cache], "all_tokens": [prefilled]}),
             )
         except BaseException:
             self.usable = False
@@ -1674,7 +1731,7 @@ class _TextBatchSession:
             state = _PendingResult(
                 detokenizer=_new_detokenizer(adapter.tokenizer),
                 scanner=_StopStringScanner(defaults.stop_strings),
-                prompt_token_count=len(prompt),
+                prompt_token_count=len(prefilled) + len(prompt),
             )
         except BaseException as active_error:
             try:
@@ -1693,6 +1750,30 @@ class _TextBatchSession:
         self._row_of[uid] = row
         self._uid_of[row] = uid
         return row
+
+    def _prefill_image_row(self, request: GenerationRequest) -> tuple[list[int], list[int], list]:
+        """``(last token, prompt before it, cache holding that prompt)`` for an image row."""
+        from mlx_lm.models.cache import make_prompt_cache
+
+        image = request.image
+        if isinstance(image, bytes):
+            raise ValueError(
+                "Batched image generation accepts a PIL image, an array, or a str/os.PathLike "
+                "path or URL; raw bytes are not supported."
+            )
+        if isinstance(image, str):
+            from transformers.image_utils import load_image
+            try:
+                image = load_image(image)
+            except Exception as exc:
+                raise ValueError(f"Could not load the image {image!r} for batched generation.") from exc
+        cache = make_prompt_cache(self.adapter.model, self.adapter.defaults.max_kv_size)
+        ids = prefill_image_prompt(
+            self.adapter.model, self.adapter.tokenizer, request.prompt, [image], cache,
+            prefill_step_size=getattr(self.generator, "prefill_step_size", None) or 2048,
+            add_special_tokens=False,
+        )
+        return ids[-1:], ids[:-1], cache
 
     def cancel(self, row: int) -> bool:
         return self._take_back(row) is not None
@@ -4056,8 +4137,11 @@ class BatchStream:
 
     def add(self, request: GenerationRequest) -> int:
         session = self._require_open()
-        validate = _validate_vlm_requests if self._is_vlm else _validate_text_requests
-        (validated,) = validate([request], session.adapter.defaults)
+        if self._is_vlm:
+            (validated,) = _validate_vlm_requests([request], session.adapter.defaults)
+        else:
+            (validated,) = _validate_text_requests(
+                [request], session.adapter.defaults, _serves_text_images(session.adapter.model))
         from .utils import _validate_mlx_image_input
         _validate_mlx_image_input(session.adapter.model, validated.image is not None)
         return session.add(validated)
@@ -4264,7 +4348,7 @@ def _stream_batch(
     validated = (
         _validate_vlm_requests(requests, defaults)
         if is_vlm
-        else _validate_text_requests(requests, defaults)
+        else _validate_text_requests(requests, defaults, _serves_text_images(model))
     )
     from .utils import _validate_mlx_image_input
     _validate_mlx_image_input(model, any(request.image is not None for request in validated))
@@ -4380,6 +4464,8 @@ __all__ = [
     "fast_generate",
     "generate_batch",
     "generation_mode",
+    "image_prompt_embeddings",
+    "prefill_image_prompt",
     "row_logits_processors_unavailable_reason",
     "row_prompt_cache_unavailable_reason",
     "row_quantized_prompt_cache_unavailable_reason",

@@ -1640,6 +1640,17 @@ def test_a_text_row_carries_its_own_logits_processors_into_the_batch(monkeypatch
     assert seen[1 - carrying] == [[]]
     assert [_shows(processor, [4, 5, 6]) for processor in seen[carrying][0]] == [7]
 
+def test_only_an_mlx_lm_image_model_s_text_batch_takes_an_image_row(monkeypatch):
+    image_row = GenerationRequest(prompt = "p", image = "a.png")
+    assert _validate_text_requests([image_row], GenerationDefaults(), True) == [image_row]
+    for images, kwargs in ((False, {"prompt": "p", "image": 1}), (True, {"prompt_token_ids": [1], "image": 1}),
+                           (True, {"prompt": "p", "audio": 1})):
+        with pytest.raises(ValueError, match = "media|token ids"):
+            _validate_text_requests([GenerationRequest(**kwargs)], GenerationDefaults(), images)
+    with contextlib.closing(_open_stream(monkeypatch)) as stream, pytest.raises(ValueError, match = "media"):
+        stream.add(image_row)
+
+
 def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
     with pytest.raises(TypeError, match="must be GenerationDefaults"):
         stream_batch(object(), object(), [], defaults = {"stop_strings": ()})
