@@ -1389,8 +1389,7 @@ def _grouped_mm_slice(inputs, weight, offsets, plan):
 
 
 def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
-    # The transposed view, not a copy (as _GroupedMMRecompute.backward): the Triton grouped GEMM reads
-    # strided weights and _grouped_mm_eager copies only where the view path is unproven on the device.
+    # View, not copy: Triton reads strided weights; _grouped_mm_eager copies only where views are unproven.
     if len(plan.chunks) == 1:
         experts, _, _, offsets = plan.chunks[0]
         weight = weight_provider(experts)

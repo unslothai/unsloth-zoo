@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The selective-dequant backward hands the planned experts to the grouped GEMM as a transposed view,
-as _GroupedMMRecompute.backward does for the full stack: a stack already in grouped_mm layout
-(gpt-oss gate_up [E, H, 2I]) is not copied, and dX matches the old contiguous copy bit for bit."""
+"""Selective-dequant backward passes experts as a transposed view (no copy); dX matches the copy bitwise."""
 import pytest
 import torch
 
@@ -30,7 +28,7 @@ def _case(chunks_split):
     gen = torch.Generator().manual_seed(0)
     E, K, N = 8, 64, 96
     counts = torch.tensor([5, 0, 7, 3, 0, 6, 2, 0])
-    W = (torch.randn(E, K, N, generator = gen) * 0.1).to(DEVICE, DT)   # grouped_mm layout [E, K, N]
+    W = (torch.randn(E, K, N, generator = gen) * 0.1).to(DEVICE, DT)
     x = torch.randn(int(counts.sum()), K, generator = gen).to(DEVICE, DT)
     dy = torch.randn(x.shape[0], N, generator = gen).to(DEVICE, DT)
     routed = [e for e in range(E) if counts[e] > 0]
@@ -46,7 +44,7 @@ def _case(chunks_split):
     provided = []
 
     def provider(experts):
-        weight = W.index_select(0, experts)   # a fresh contiguous planned stack, like the dequant
+        weight = W.index_select(0, experts)
         provided.append(weight.untyped_storage().data_ptr())
         return weight
 
@@ -68,7 +66,7 @@ def test_backward_passes_the_planned_experts_as_a_view(chunks_split, monkeypatch
     mu._GroupedMMSelectiveRecompute.apply(xg, provider, plan).backward(dy)
     n = len(plan.chunks)
     backward_ptrs, backward_provided = [p for p, _ in seen[n:]], provided[n:]
-    assert backward_ptrs == backward_provided   # same storage as the dequantized stack: no copy
+    assert backward_ptrs == backward_provided   # same storage: no copy
     assert not any(contiguous for _, contiguous in seen[n:])
 
 
