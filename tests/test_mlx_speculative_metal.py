@@ -892,6 +892,26 @@ def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag, monkey
     assert sum(count for count, _ in accepted) >= (0.6 if max_lag >= 8 else 0.5) * sum(length for _, length in accepted)
 
 
+def test_an_mtp_heads_cache_holds_only_target_hidden_pairs_however_its_drafts_fared(qwen_mtp):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids = qwen_mtp
+    drafter, chunks, compared = _drafter(model, max_lag = 4096), [[]], []
+    push, catch_up, draft = drafter.push, drafter.catch_up, drafter.draft
+    drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
+    drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
+    def against_replay(cache, rows, depth, target):
+        fresh, position = drafter.new_cache(), 0
+        for chunk in filter(None, chunks):
+            tokens, hidden = sum((t for t, _ in chunk), []), mx.concatenate([h for _, h in chunk])
+            last = drafter._forward(fresh, mx.array([tokens]), hidden[None], mx.arange(position, position + len(tokens))[None])[:, -1:]
+            position += len(tokens)
+        compared.append(mx.array_equal(rows[0].last, last).item() and all(mx.array_equal(a, b).item() for x, y in zip(cache, fresh) for a, b in zip(x.state, y.state)))
+        return draft(cache, rows, depth, target)
+    drafter.draft = against_replay
+    _, drafted, _ = _run(model, ids[:1], 96, _script(("draft", 3), ("draft", 3), ("plain", 6), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
+    assert len(compared) > 6 and all(compared) and drafted[0][1] > 0
+
+
 def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monkeypatch):
     from mlx_vlm.speculative.drafters.mtp_split import MTPSplitter
     model, _ = qwen_mtp

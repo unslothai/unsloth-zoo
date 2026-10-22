@@ -1539,22 +1539,15 @@ class MTPDrafter:
         return mx.concatenate(drafts, axis = 1)
 
     def settle(self, cache: list, rows: Sequence[DraftRow | None], appended: int, keep: Sequence[int]) -> list[int]:
-        """Keep each row's first ``keep[i]`` appended entries (its accepted drafts), drop the rest, and
-        return how many pairs each row's head now holds from this round."""
-        trims = [appended - count for count in keep]
-        if len(set(trims)) == 1:
-            if trims[0]:
-                for entry in cache:
-                    entry.trim(trims[0])
-        else:
+        """Drop every entry the round's drafting appended, accepted or not: each paired a draft with the head's own
+        output instead of the target hidden, so accepted drafts are recorded again from the verify forward."""
+        if appended:
             for entry in cache:
-                entry.prepare(right_padding = trims)
-                entry.finalize()
-        for row, count in zip(rows, keep):
+                entry.trim(appended)
+        for row in rows:
             if row is not None:
-                row.position += count
                 row.last = None
-        return list(keep)
+        return [0] * len(rows)
 
 
 class AssistantRow:
