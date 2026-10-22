@@ -55,9 +55,7 @@ ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 _MAX_ROLLOUTS = 2
 _MAX_CALLS_PER_ROLLOUT = 64
-# Checkpointed forwards since the last backward recompute (a chunked GRPO loss runs one per chunk).
-# Only a leak guard: evicting a forward still waiting for its backward recompute makes that
-# recompute route naturally, so its gradients differ from the forward (warned once).
+# Leak guard only: evicting a forward awaiting its recompute makes that recompute route naturally.
 _MAX_PENDING = 1024
 
 

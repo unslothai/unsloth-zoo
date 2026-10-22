@@ -302,8 +302,7 @@ def _many_forwards_grad(n, checkpointing):
 
 
 def test_more_than_64_checkpointed_forwards_before_backward_keep_their_replays(replay):
-    # A chunked GRPO loss runs one checkpointed forward per chunk before its single backward; every
-    # recompute must find its own forward's replay, or its gradients follow natural routing instead.
+    # Each chunk's recompute must find its own forward's replay.
     plain = _many_forwards_grad(65, checkpointing = False)
     checkpointed = _many_forwards_grad(65, checkpointing = True)
     torch.testing.assert_close(checkpointed, plain, rtol = 0, atol = 0)
