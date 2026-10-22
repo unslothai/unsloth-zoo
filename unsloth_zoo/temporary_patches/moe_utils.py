@@ -1145,10 +1145,11 @@ def _expert_bias_grad_chunked(expert_ids, grad, num_experts):
     chunk together stay at most _EXPERT_BIAS_ONE_HOT_ELEMENTS elements."""
     chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // (num_experts + grad.shape[1]))
     experts = torch.arange(num_experts, device = expert_ids.device, dtype = expert_ids.dtype).unsqueeze(1)
-    out = torch.zeros(num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
+    acc = torch.promote_types(grad.dtype, torch.float32)  # fp32, or fp64 for fp64 grads
+    out = torch.zeros(num_experts, grad.shape[1], dtype = acc, device = grad.device)
     for start in range(0, grad.shape[0], chunk):
-        one_hot = (expert_ids[start : start + chunk].unsqueeze(0) == experts).float()
-        out.addmm_(one_hot, grad[start : start + chunk].float())
+        one_hot = (expert_ids[start : start + chunk].unsqueeze(0) == experts).to(acc)
+        out.addmm_(one_hot, grad[start : start + chunk].to(acc))
     return out.to(grad.dtype)
 
 
@@ -1170,6 +1171,16 @@ def _register_expert_bias_grad_op():
         def _(expert_ids, grad, num_experts):
             return grad.new_empty((num_experts, grad.shape[1]))
 
+        # Linear in grad: d/d grad of one-hot @ grad is a row gather, so create_graph=True still differentiates.
+        def _setup_context(ctx, inputs, output):
+            ctx.save_for_backward(inputs[0])
+            ctx.grad_dtype = inputs[1].dtype
+
+        def _backward(ctx, grad_out):
+            (expert_ids,) = ctx.saved_tensors
+            return None, grad_out.index_select(0, expert_ids).to(ctx.grad_dtype), None
+
+        expert_bias_grad_chunked.register_autograd(_backward, setup_context = _setup_context)
         return torch.ops.unsloth_zoo.expert_bias_grad_chunked.default
     except Exception:
         return None

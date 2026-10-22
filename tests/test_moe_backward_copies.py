@@ -420,3 +420,24 @@ def test_expert_bias_gather_chunks_dynamic_rows(monkeypatch):
     assert counters["stats"]["unique_graphs"] == 1, dict(counters["stats"])
     assert not counters["graph_break"], dict(counters["graph_break"])
     torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids = ["one_gemm", "chunked"])
+def test_expert_bias_gather_double_backward(chunked, monkeypatch):
+    """create_graph=True through the bias gradient (gradient penalties): the chunked op needs its own backward."""
+    if chunked:
+        monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", 1 << 8)
+    E, D, M = 4, 3, 200  # chunked: 200 rows > 256 // 4
+    gen = torch.Generator().manual_seed(0)
+    ids = torch.randint(0, E, (M,), generator = gen)
+    w = torch.randn(M, D, generator = gen, dtype = torch.float64)
+    coef = torch.randn(E, D, generator = gen, dtype = torch.float64)
+    bias = torch.randn(E, D, generator = gen, dtype = torch.float64, requires_grad = True)
+    # loss = sum(w * tanh(bias[ids])): the bias gradient depends on bias, so its gradient has a second order term.
+    (gb,) = torch.autograd.grad((w * torch.tanh(mu._gather_expert_bias(bias, ids))).sum(), bias, create_graph = True)
+    (ggb,) = torch.autograd.grad((gb * coef).sum(), bias)
+    ref = bias.detach().clone().requires_grad_(True)
+    (rb,) = torch.autograd.grad((w * torch.tanh(ref.index_select(0, ids))).sum(), ref, create_graph = True)
+    (rgb,) = torch.autograd.grad((rb * coef).sum(), ref)
+    torch.testing.assert_close(gb, rb)
+    torch.testing.assert_close(ggb, rgb)
