@@ -46,18 +46,43 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 pass
 
-def _truncated_support_mask_impl(logits: torch.Tensor, top_k: int, top_p: float, min_p: float) -> torch.Tensor:
+def _truncated_support_mask_impl(
+    logits: torch.Tensor, top_k: int, top_p: float, min_p: float, triton_sampler: bool = False,
+) -> torch.Tensor:
     if min_p > 0.0:
         probs = torch.softmax(logits, dim = -1)
         logits = logits.masked_fill(probs < min_p * probs.amax(dim = -1, keepdim = True), float("-inf"))
+    if triton_sampler:
+        # vLLM's Triton top-k / top-p kernels search for a pivot logit; a row whose logits are all
+        # equal has none, so they keep the whole row (apply_top_k_top_p_triton, vLLM >= 0.17).
+        finite = torch.isfinite(logits)
+        uniform = logits.amax(dim = -1, keepdim = True) == logits.masked_fill(~finite, float("inf")).amin(dim = -1, keepdim = True)
+        uniform = uniform & finite.any(dim = -1, keepdim = True)
     if top_k > 0 and top_k < logits.shape[-1]:
-        kth = torch.topk(logits, top_k, dim = -1).values[:, -1:]
-        logits = logits.masked_fill(logits < kth, float("-inf"))
+        if triton_sampler:
+            # The Triton kernel keeps exactly top_k tokens: logits tied with the k-th are kept in
+            # vocabulary order until the budget is used (vLLM >= 0.24). The PyTorch sampler keeps them all.
+            # Its pivot cannot go below the row's smallest finite logit, so when the k-th logit is that
+            # minimum it keeps only the logits above it, fewer than top_k.
+            sorted_logits, order = torch.sort(logits, dim = -1, descending = True, stable = True)
+            dropped = torch.zeros_like(logits, dtype = torch.bool).scatter(-1, order[:, top_k:], True)
+            kth = sorted_logits[:, top_k - 1 : top_k]
+            row_min = logits.masked_fill(~finite, float("inf")).amin(dim = -1, keepdim = True)
+            dropped = dropped | ((kth == row_min) & (logits <= kth))
+            logits = logits.masked_fill(dropped & ~uniform, float("-inf"))
+        else:
+            kth = torch.topk(logits, top_k, dim = -1).values[:, -1:]
+            logits = logits.masked_fill(logits < kth, float("-inf"))
     if top_p < 1.0:
         # Per sorted position, as vLLM does: a cutoff inside a run of equal logits keeps only part of it.
         sorted_logits, sorted_idx = torch.sort(logits, dim = -1)
-        dropped = torch.cumsum(torch.softmax(sorted_logits, dim = -1), dim = -1) <= (1.0 - top_p)
+        # vLLM holds top_p in a float32 tensor and compares against `1 - p` computed in float32;
+        # the Python double 1.0 - top_p can round to the neighbouring float32 and move the cutoff.
+        threshold = 1.0 - torch.full((), top_p, dtype = torch.float32, device = logits.device)
+        dropped = torch.cumsum(torch.softmax(sorted_logits.float(), dim = -1), dim = -1) <= threshold
         dropped[:, -1] = False
+        if triton_sampler:
+            dropped = dropped & ~uniform
         logits = logits.scatter(-1, sorted_idx, sorted_logits.masked_fill(dropped, float("-inf")))
     return torch.isfinite(logits)
 pass
@@ -69,7 +94,7 @@ try:
         "unsloth_zoo::truncated_support_mask", mutates_args = (),
     )(_truncated_support_mask_impl)
     _truncated_support_mask.register_fake(
-        lambda logits, top_k, top_p, min_p: torch.empty_like(logits, dtype = torch.bool)
+        lambda logits, top_k, top_p, min_p, triton_sampler = False: torch.empty_like(logits, dtype = torch.bool)
     )
 except Exception:
     _truncated_support_mask = _truncated_support_mask_impl
@@ -81,11 +106,11 @@ pass
 # A scored token tied with the smallest kept logit but dropped by the sort counts as one of the kept
 # tokens (vLLM keeps an arbitrary subset of a tied run): it takes the place of one kept tied token,
 # so both the value and its gradient are those of a kept token.
-def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p):
+def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False):
     index = chunk_index.unsqueeze(-1)
     selected_logits = torch.gather(chunk_logits, dim = -1, index = index)
     detached = chunk_logits.detach()
-    keep = _truncated_support_mask(detached, top_k, top_p, min_p)
+    keep = _truncated_support_mask(detached, top_k, top_p, min_p, triton_sampler)
     selected_kept = torch.gather(keep, dim = -1, index = index)
     smallest_kept = detached.masked_fill(~keep, float("inf")).amin(dim = -1, keepdim = True)
     tied = (~selected_kept) & (selected_logits.detach() == smallest_kept)
@@ -106,6 +131,7 @@ def chunked_selective_log_softmax(
     support_top_k: int = 0,
     support_top_p: float = 1.0,
     support_min_p: float = 0.0,
+    support_triton_sampler: bool = False,
 ):
     # Fixed `chunks` row ranges; see chunked_hidden_states_selective_log_softmax.
     flat_logits = logits.reshape(-1, logits.shape[-1])
@@ -124,6 +150,7 @@ def chunked_selective_log_softmax(
         if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0:
             all_per_token_logps.append(_truncated_support_logps(
                 chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
+                support_triton_sampler,
             ))
             continue
         selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
@@ -169,6 +196,7 @@ def chunked_hidden_states_selective_log_softmax(
     support_top_k: int = 0,
     support_top_p: float = 1.0,
     support_min_p: float = 0.0,
+    support_triton_sampler: bool = False,
     # Read in the default for the same Dynamo reason as max_rows_per_chunk. Pairs with vLLM's
     # head_dtype=float32 that load_vllm requests under the same flag.
     fp32_lm_head: bool = (
@@ -256,6 +284,7 @@ def chunked_hidden_states_selective_log_softmax(
         if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0:
             per_token_logps = _truncated_support_logps(
                 chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
+                support_triton_sampler,
             )
         else:
             selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
@@ -1395,12 +1424,36 @@ pass
 RL_REPLACEMENTS["_warn_unsupported_grpo_options"] = _warn_unsupported_grpo_options
 
 
+def _grpo_vllm_sampling_params_reach_generation(trainer):
+    """Whether Unsloth routes args.vllm_sampling_params into the rollouts' SamplingParams.
+    TRL < 0.28 builds SamplingParams in the trainer, whose colocate call rl.py rewrites. TRL >= 0.28
+    builds it in VLLMGeneration.generate, which Unsloth's wrapper (unsloth/models/rl_replacements.py
+    vllm_generation_init_patch) only reroutes for a weight-sharing engine: an engine TRL created
+    itself, or server mode, samples with TRL's own parameters."""
+    args = getattr(trainer, "args", None)
+    if getattr(args, "vllm_mode", None) == "server" or getattr(trainer, "vllm_mode", None) == "server":
+        return False
+    vllm_generation = getattr(trainer, "vllm_generation", None)
+    if vllm_generation is None:
+        return True
+    generate = getattr(type(vllm_generation), "generate", None)
+    if not getattr(generate, "_unsloth_vllm_generation_lora_wrapped", False):
+        return False
+    llm = getattr(vllm_generation, "llm", None)
+    if llm is None:
+        return False
+    return bool(getattr(llm, "shared_weights", False) or getattr(vllm_generation, "unsloth_fast_inference_lora", False))
+pass
+
+
 def _grpo_rollout_sampling_params(trainer, keys):
     """Later sources override earlier ones as they do for the SamplingParams: GRPOConfig fields,
-    then generation_kwargs, then Unsloth's vllm_sampling_params."""
+    then generation_kwargs, then Unsloth's vllm_sampling_params where generation applies them."""
     args = getattr(trainer, "args", None)
     params = {key: getattr(args, key, None) for key in keys}
     vllm_sampling_params = getattr(args, "vllm_sampling_params", None)
+    if vllm_sampling_params is not None and not _grpo_vllm_sampling_params_reach_generation(trainer):
+        vllm_sampling_params = None
     vllm_overrides = getattr(vllm_sampling_params, "_set_kwargs", None)
     if vllm_overrides is None and vllm_sampling_params is not None:
         # A raw vllm.SamplingParams: take exactly the fields generation applies from it, through the
@@ -1514,9 +1567,93 @@ def grpo_truncated_support_kwargs(trainer):
             )
             trainer._unsloth_truncated_support_blocked_warned = True
         return {}
-    return {"support_top_k": top_k, "support_top_p": top_p, "support_min_p": min_p}
+    kwargs = {"support_top_k": top_k, "support_top_p": top_p, "support_min_p": min_p}
+    if grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
+        kwargs["support_triton_sampler"] = True
+    return kwargs
 pass
 RL_REPLACEMENTS["grpo_truncated_support_kwargs"] = grpo_truncated_support_kwargs
+
+
+def _vllm_sampler_version():
+    try:
+        from importlib.metadata import version as importlib_version
+        from packaging.version import Version
+        return Version(importlib_version("vllm"))
+    except Exception:
+        return None
+pass
+
+
+def _vllm_has_triton():
+    try:
+        from vllm.triton_utils import HAS_TRITON
+        return bool(HAS_TRITON)
+    except Exception:
+        import importlib.util
+        return importlib.util.find_spec("triton") is not None
+pass
+
+
+def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
+    """Whether vLLM's apply_top_k_top_p masks the rollouts with its Triton kernel (True) or its
+    PyTorch sort (False); the two keep different tokens when logits tie at the cutoff.
+    vllm/v1/sample/ops/topk_topp_sampler.py: < 0.17 PyTorch only; 0.17 - 0.29 Triton when the
+    decode batch has >= 8 rows (PyTorch below); >= 0.30 Triton whenever vllm.triton_utils.HAS_TRITON.
+    UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER=triton|pytorch overrides the guess (e.g. server mode, where
+    the serving vLLM is not the one installed here). Warns once where the trainer cannot reproduce
+    every tie the sampler breaks."""
+    if top_k == 0 and top_p >= 1.0:
+        return False
+    forced = os.environ.get("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "auto").strip().lower()
+    version = _vllm_sampler_version()
+    if forced in ("triton", "pytorch"):
+        uses_triton, caveats = forced == "triton", []
+    else:
+        from packaging.version import Version
+        caveats = []
+        if version is None:
+            uses_triton = False
+            caveats.append("vLLM is not installed here, so its sampler is assumed to be the PyTorch one")
+        elif version < Version("0.17.0") or not _vllm_has_triton():
+            uses_triton = False
+        else:
+            uses_triton = True
+            if version < Version("0.30.0"):
+                caveats.append(
+                    f"vLLM {version} masks decode batches of fewer than 8 sequences with its PyTorch "
+                    "sampler, which keeps every token tied with the top_k-th logit"
+                )
+            if version < Version("0.24.0") and top_k > 0:
+                caveats.append(
+                    f"vLLM {version}'s Triton top-k can keep one token more or fewer than top_k "
+                    "when logits tie at the cutoff"
+                )
+        args = getattr(trainer, "args", None)
+        if getattr(args, "vllm_mode", None) == "server":
+            caveats.append(
+                "in server mode the serving vLLM may differ from the installed one; set "
+                "UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER=triton or pytorch to match it"
+            )
+    if uses_triton and top_k > 0 and top_p < 1.0:
+        caveats.append(
+            "with both top_k and top_p, the Triton kernel's budget for logits tied at the top_p "
+            "cutoff is not reproducible"
+        )
+    if caveats and not getattr(trainer, "_unsloth_truncated_support_sampler_warned", False):
+        logger.warning(
+            "Unsloth: UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 scores the kept set of vLLM's "
+            f"{'Triton' if uses_triton else 'PyTorch'} top-k / top-p sampler, but "
+            + "; ".join(caveats)
+            + ". Rows whose cutoff falls inside a run of equal logits can then be renormalised "
+            "over a slightly different set than the rollout's; all other rows match exactly."
+        )
+        try:
+            trainer._unsloth_truncated_support_sampler_warned = True
+        except Exception:
+            pass
+    return uses_triton
+pass
 
 
 _n_chunks_deprecation_warned = False
