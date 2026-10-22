@@ -67,6 +67,8 @@ def test_compiled_grouped_mm_backward_has_no_atomics_and_is_bitwise_reproducible
 
     m, x, topi, w, dy, lora = _case(k = top_k)
     monkeypatch.setattr(mu, "take_moe_lora_stash", lambda module, name: lora.get(name))
+    # top_k 4 takes the fixed-order gather only under UNSLOTH_MOE_DETERMINISTIC_GATHER=1.
+    monkeypatch.setattr(mu, "_DETERMINISTIC_GATHER_MIN_TOP_K", 3)
     # Eager reference: the sorted index_put backward, reproducible but not the compiled path.
     xe = x.detach().clone().requires_grad_(True)
     mu.forward_native_grouped_mm(m, xe, topi, w).backward(dy)
@@ -123,3 +125,14 @@ def test_gather_routed_rows_matches_indexing(top_k):
     mu.gather_routed_rows(xe, sorted_indices, top_k).backward(g)
     assert torch.equal(xe.grad, xr.grad)
     torch._dynamo.reset()
+
+
+def test_default_threshold_keeps_plain_gather_below_top_k_8(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mu._RoutedRowGather, "apply", staticmethod(lambda *a: calls.append(a[2]) or a[0]))
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(mu, "_DETERMINISTIC_GATHER_MIN_TOP_K", 8)
+    for top_k in (4, 8):
+        x = torch.randn(6, 4, requires_grad = True)
+        mu.gather_routed_rows(x, torch.randperm(6 * top_k), top_k)
+    assert calls == [8]

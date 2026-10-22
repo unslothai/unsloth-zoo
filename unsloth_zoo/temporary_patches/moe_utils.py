@@ -2257,13 +2257,19 @@ class _RoutedRowGather(torch.autograd.Function):
         return grad, None, None
 
 
+# Fixed-order gather from top_k 8 (measured faster on L4: -55% at k 8; k 4 was +22% on the gather
+# alone). UNSLOTH_MOE_DETERMINISTIC_GATHER=1 uses it for every top_k > 2, =0 never.
+_DETERMINISTIC_GATHER = os.environ.get("UNSLOTH_MOE_DETERMINISTIC_GATHER", "")
+_DETERMINISTIC_GATHER_MIN_TOP_K = {"1": 3, "0": 1 << 30}.get(_DETERMINISTIC_GATHER, 8)
+
+
 def gather_routed_rows(hidden_states, sorted_indices, top_k):
     """Rows of a 2D hidden_states in routed (expert-sorted) order; sorted_indices must be the
     full argsort permutation from moe_routing_sort. Eager keeps plain indexing: its sorted
     index_put backward is already reproducible and needs no [T * top_k, H] buffer."""
     # This Unsloth Zoo code section is licensed under AGPL3
     if (
-        top_k > 2
+        top_k >= _DETERMINISTIC_GATHER_MIN_TOP_K
         and torch.compiler.is_compiling()
         and hidden_states.requires_grad
         and torch.is_grad_enabled()
