@@ -344,3 +344,21 @@ def test_cold_outer_fullgraph_compile():
         env.setdefault("UNSLOTH_ALLOW_CPU", "1")
     result = subprocess.run([sys.executable, "-c", script], capture_output = True, text = True, timeout = 900, env = env)
     assert "COLD_COMPILE_OK" in result.stdout, (result.stdout[-2000:], result.stderr[-4000:])
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_fp32_head_under_fp16_autocast_does_not_nan(compiled):
+    # fp32 trainable head, fp16 autocast, loss scale 65536, hidden 4, two 512 row chunks with opposite
+    # upstream signs: each fp16 chunk product overflowed to +-inf before the float32 sum, leaving NaN.
+    function = _standalone(compiled = compiled)
+    rows, hidden_size, vocab = 1024, 8, 64
+    sign = torch.ones(rows)
+    sign[rows // 2:] = -1
+    states = torch.full((1, rows, hidden_size), 4.0, dtype = torch.float16)
+    head = torch.zeros((vocab, hidden_size), requires_grad = True)
+    index = torch.zeros((1, rows), dtype = torch.long)
+    with torch.autocast("cpu", dtype = torch.float16):
+        out = function(states, head, index, 2)
+    (grad,) = torch.autograd.grad((out.float() * 65536.0 * sign).sum(), [head])
+    assert grad.dtype == torch.float32
+    assert torch.equal(grad, torch.zeros_like(grad)), grad
