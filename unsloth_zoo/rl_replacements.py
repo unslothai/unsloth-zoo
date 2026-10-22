@@ -1330,13 +1330,10 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
     loss_type = loss_kwargs.get("loss_type", "grpo")
     if Version(trl_version) < Version("1.10.0") and loss_type in ("cispo", "dapo", "vespo"):
         if sample_weight is not None:
-            # The policy term is normalised by sample_weight (kept tokens only, grpo_compute_loss),
-            # and TRL 1.8 / 1.9 divide the bonus by the policy's own normaliser: the same here, so
-            # excluded rows do not dilute it. Without exclusion this equals the branch below.
+            # sample_weight is 1 / kept tokens of the generation batch, the kept-only num_items_in_batch,
+            # so excluded rows do not dilute the bonus. Like the branch below (TRL 1.8 / 1.9), no
+            # accumulation / steps_per_generation rescale: with every row kept the two are equal.
             normalizer = 1.0 / loss_kwargs.get("num_processes", 1)
-            steps_per_generation = loss_kwargs.get("steps_per_generation", None)
-            if steps_per_generation:
-                normalizer = normalizer * loss_kwargs.get("current_gradient_accumulation_steps", 1) / steps_per_generation
             row_weight = sample_weight.to(device = weights.device, dtype = weights.dtype).unsqueeze(-1)
             return weights * row_weight * (-entropy_coef / normalizer)
         # TRL 1.8 / 1.9 used num_items_in_batch / num_processes as is, before 1.10 rescaled it to

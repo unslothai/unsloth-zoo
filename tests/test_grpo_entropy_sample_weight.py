@@ -97,3 +97,72 @@ def test_legacy_bonus_of_kept_rows_matches_running_them_alone(loss_type):
     # No exclusion: identical to the num_items_in_batch normaliser.
     full = rr.grpo_entropy_bonus_weights(mask, None, 0.2, _kwargs(torch.full((2,), 1.0 / 12), loss_type), trl_version = "1.8.0")
     torch.testing.assert_close(full, rr.grpo_entropy_bonus_weights(mask, None, 0.2, _kwargs(None, loss_type), trl_version = "1.8.0"))
+
+
+def _legacy_oracle(entropies, mask, row_weight, coef, num_processes):
+    # fp64 TRL 1.8 / 1.9 cispo / dapo / vespo bonus (grpo_trainer.py `(entropies * effective_mask).sum() /
+    # normalizer`, normalizer = num_items_in_batch / num_processes), with 1 / num_items_in_batch replaced
+    # by the per-row sample_weight. No accumulation or steps_per_generation factor.
+    return -coef * (entropies.double() * mask.double() * row_weight.double().unsqueeze(-1)).sum() * num_processes
+
+
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
+@pytest.mark.parametrize("num_processes", [1, 2])
+@pytest.mark.parametrize("spg,ga", [(8, 2), (2, 2), (4, 1), (1, 4), (6, 3)])
+def test_legacy_all_kept_equals_no_exclusion_for_any_spg_ga(loss_type, num_processes, spg, ga):
+    # Exclusion on with every group kept must not change the bonus (unequal SPG / GA used to scale it by SPG / GA).
+    gen = torch.Generator().manual_seed(spg * 10 + ga)
+    rows, length = 16, 6
+    mask = (torch.rand(rows, length, generator = gen) > 0.25).long()
+    mask[:, 0] = 1
+    entropies = torch.rand(rows, length, generator = gen, dtype = torch.float64) * 3
+    total = mask.sum()
+    sample_weight = torch.full((rows,), 1.0 / float(total), dtype = torch.float64)
+    per_step = rows // spg if rows % spg == 0 else 2
+    got_on, got_off, want = 0.0, 0.0, 0.0
+    for start in range(0, rows, per_step):
+        sl = slice(start, start + per_step)
+        common = dict(loss_type = loss_type, num_items_in_batch = total, num_processes = num_processes,
+                      current_gradient_accumulation_steps = ga, steps_per_generation = spg)
+        on = rr.grpo_entropy_bonus_weights(mask[sl], None, 0.2, dict(common, sample_weight = sample_weight[sl]), trl_version = "1.8.0")
+        off = rr.grpo_entropy_bonus_weights(mask[sl], None, 0.2, dict(common, sample_weight = None), trl_version = "1.8.0")
+        got_on += (on.double() * entropies[sl]).sum().item()
+        got_off += (off.double() * entropies[sl]).sum().item()
+        want += _legacy_oracle(entropies[sl], mask[sl], sample_weight[sl], 0.2, num_processes).item()
+        torch.testing.assert_close(on, off, rtol = 1e-6, atol = 0)
+    assert abs(got_on - want) <= 1e-6 * abs(want)
+    assert abs(got_off - want) <= 1e-6 * abs(want)
+
+
+@pytest.mark.parametrize("prompt_level", [False, True])
+@pytest.mark.parametrize("spg,ga", [(8, 2), (1, 1)])
+def test_legacy_partial_exclusion_matches_fp64_oracle(prompt_level, spg, ga):
+    # sample_weight built like unsloth's _unsloth_grpo_sample_weight: keep / kept tokens, or prompt level
+    # keep / (group tokens * kept groups). The bonus is the kept-token reweighting, independent of SPG / GA.
+    gen = torch.Generator().manual_seed(11)
+    num_generations, groups, length = 2, 4, 5
+    rows = num_generations * groups
+    mask = (torch.rand(rows, length, generator = gen) > 0.3).long()
+    mask[:, 0] = 1
+    entropies = torch.rand(rows, length, generator = gen, dtype = torch.float64)
+    group_keep = torch.tensor([True, False, True, False])
+    keep = group_keep.repeat_interleave(num_generations).double()
+    lengths = mask.sum(1).double()
+    if prompt_level:
+        group_tokens = (lengths * keep).view(-1, num_generations).sum(1).repeat_interleave(num_generations)
+        sample_weight = keep / (group_tokens.clamp(min = 1.0) * group_keep.sum())
+    else:
+        sample_weight = keep / (lengths * keep).sum()
+    kwargs = dict(loss_type = "dapo", num_items_in_batch = mask.sum(), num_processes = 1,
+                  current_gradient_accumulation_steps = ga, steps_per_generation = spg, sample_weight = sample_weight)
+    weights = rr.grpo_entropy_bonus_weights(mask, None, 0.2, kwargs, trl_version = "1.8.0")
+    got = (weights.double() * entropies).sum()
+    want = _legacy_oracle(entropies, mask, sample_weight, 0.2, 1)
+    torch.testing.assert_close(got, want, rtol = 1e-6, atol = 0)
+    assert (weights[keep == 0] == 0).all()
+    if not prompt_level:
+        # Equal to running TRL 1.8 on the kept rows alone with their own token count.
+        kept_rows = keep.bool()
+        alone = dict(kwargs, sample_weight = None, num_items_in_batch = mask[kept_rows].sum())
+        ref = rr.grpo_entropy_bonus_weights(mask[kept_rows], None, 0.2, alone, trl_version = "1.8.0")
+        torch.testing.assert_close(got, (ref.double() * entropies[kept_rows]).sum(), rtol = 1e-6, atol = 0)
