@@ -4951,9 +4951,11 @@ def _gpu_generation():
     return int(match.group(1)) if match else 0
 
 
-def _launch_simds():
-    # Before M3 (no dynamic caching), this kernel's pipeline allows 832 threads per threadgroup, not 1024.
-    return 32 if _gpu_generation() >= 15 else 24
+def _launch_simds(dtype = mx.bfloat16):
+    # Before M3 (no dynamic caching), this kernel's pipeline allows 768 threads per threadgroup in BF16 and 576 in F16.
+    if _gpu_generation() >= 15:
+        return 32
+    return 24 if dtype == mx.bfloat16 else 18
 
 
 def _vector_blocks(simds, keys):
@@ -5168,7 +5170,7 @@ def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
             and _vector_attention_kernels() is not None):
         return None
     rows, gqa = queries.shape[2], queries.shape[1] // keys.shape[1]
-    step = _launch_simds() // gqa   # a launch holds gqa * rows simdgroups
+    step = _launch_simds(queries.dtype) // gqa   # a launch holds gqa * rows simdgroups
     outs = []
     for start in range(0, rows, step):
         stop = min(start + step, rows)

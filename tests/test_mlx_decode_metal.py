@@ -702,7 +702,7 @@ def test_verify_attention_matches_mlx_vector_kernel_and_decode_rows_bitwise(gqa,
             queries[:, :, i : i + 1], keys[..., : horizon(i), :], values[..., : horizon(i), :], scale = 1.0)
             for i in range(rows)], axis = 2))
     monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # MLX's own vector kernel over each launch's rows
-    step = decode._launch_simds() // gqa
+    step = decode._launch_simds(dtype) // gqa
     if _mlx_vector_launch_fits(gqa * min(step, rows)):
         _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
             queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
@@ -718,7 +718,12 @@ def test_launches_before_m3_fit_their_threadgroup_limit(monkeypatch):
     queries, keys, values = _attention_block(8, 8, 4500)
     out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None)
     _equal(out, decode._decode_attention(queries, keys, values, 1.0))
-    assert launched == [3, 3, 2]   # 32 lanes x 8 query heads x 3 rows = 768 of the 832 threads allowed
+    assert launched == [3, 3, 2]   # 32 lanes x 8 query heads x 3 rows = the 768 BF16 threads allowed
+    launched.clear()
+    queries, keys, values = _attention_block(8, 8, 4500, mx.float16)
+    out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None)
+    _equal(out, decode._decode_attention(queries, keys, values, 1.0))
+    assert launched == [2, 2, 2, 2]   # F16 allows 576
 
 
 def _gemma4_attention(gqa):
