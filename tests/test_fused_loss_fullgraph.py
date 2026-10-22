@@ -24,15 +24,23 @@ skips, so fullgraph evaluation failed.
 
 import os
 
-os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
-
 import pytest
 import torch
 from torch._dynamo.utils import counters
 
-import unsloth_zoo.fused_losses.preference_loss as preference
-from unsloth_zoo.fused_losses import forward_adapter
-from unsloth_zoo.fused_losses.preference_loss import fused_linear_token_logps
+# UNSLOTH_ALLOW_CPU is read once at import, so set it only around the zoo imports and put the
+# previous value back: a module scope write would apply to every test collected after this one.
+_PREVIOUS_ALLOW_CPU = os.environ.get("UNSLOTH_ALLOW_CPU")
+try:
+    os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
+    import unsloth_zoo.fused_losses.preference_loss as preference
+    from unsloth_zoo.fused_losses import forward_adapter
+    from unsloth_zoo.fused_losses.preference_loss import fused_linear_token_logps
+finally:
+    if _PREVIOUS_ALLOW_CPU is None:
+        os.environ.pop("UNSLOTH_ALLOW_CPU", None)
+    else:
+        os.environ["UNSLOTH_ALLOW_CPU"] = _PREVIOUS_ALLOW_CPU
 
 
 def _inputs(seq_len, valid, dtype = torch.float32, vocab = 40, hidden = 16, head_grad = True):
@@ -110,9 +118,10 @@ def test_preference_logps_matches_autograd_function_path(dtype, head_grad):
     def old(states, weight, labels, mask):
         out = legacy(states, weight, None, labels, mask, 0.0, 0.0, 0.0, 3, True, True)
         return out["per_token_logps"], out["mean_logits"], out["log_sum_sq_probs"]
-    for valid in (6, 0):
-        a = _run(old, _inputs(8, valid, dtype, head_grad = head_grad))
-        b = _run(_score, _inputs(8, valid, dtype, head_grad = head_grad))
+    # (64, 60) selects more than 2 * vocab rows, so a trainable half head takes the per chunk backward.
+    for seq_len, valid in ((8, 6), (64, 60), (8, 0)):
+        a = _run(old, _inputs(seq_len, valid, dtype, head_grad = head_grad))
+        b = _run(_score, _inputs(seq_len, valid, dtype, head_grad = head_grad))
         for x, y in zip(a[:3], b[:3]):
             assert x.dtype == y.dtype and torch.equal(x, y)
         for x, y in zip(a[3], b[3]):
@@ -131,6 +140,29 @@ def test_preference_logps_custom_op_opcheck():
         preference._token_logps_op,
         (states.reshape(-1, 16), weight, None, labels.reshape(-1), mask.reshape(-1), 3,
          0.0, 0.0, 0.0, True, True, False, True),
+        test_utils = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
+    )
+
+
+@pytest.mark.parametrize("seq_len, valid", [(8, 5), (64, 60)])
+def test_preference_logps_custom_op_opcheck_half_head_hidden_grad(seq_len, valid):
+    # A trainable fp16 head with hidden gradients: (8, 5) keeps the vocab sliced backward, while
+    # (64, 60) selects more than 2 * vocab rows, so the forward switches to the per chunk backward.
+    # The real op must still return the lse metadata at the shape the fake kernel declares.
+    if not hasattr(torch.library, "opcheck"):
+        pytest.skip("torch.library.opcheck unavailable")
+    states, weight, labels, mask = _inputs(seq_len, valid, dtype = torch.float16)
+    args = (states.reshape(-1, 16), weight, None, labels.reshape(-1), mask.reshape(-1), 3,
+            0.0, 0.0, 0.0, True, True, True, True)
+    real = preference._token_logps_op(*args)
+    with torch._subclasses.fake_tensor.FakeTensorMode() as mode:
+        fake = preference._token_logps_op(*(
+            mode.from_tensor(a) if isinstance(a, torch.Tensor) else a for a in args
+        ))
+    assert [tuple(t.shape) for t in real] == [tuple(t.shape) for t in fake]
+    assert bool(real[4][1]) == (seq_len == 8)
+    torch.library.opcheck(
+        preference._token_logps_op, args,
         test_utils = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
     )
 

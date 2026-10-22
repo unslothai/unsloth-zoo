@@ -338,11 +338,17 @@ def _compact_forward(hidden, weight, bias, labels, mask, chunk_size, transforms,
         # Unselected rows are 0, as the masked_scatter of the compacted outputs gave before.
         return torch.zeros(n_all, dtype = dtype, device = device).masked_scatter_(mask, values)
 
+    if sliced:
+        saved_lse = expand(saved_lse)
+    elif sliced_ok:
+        # The selected count switched to the per chunk backward, which never reads the lse, but
+        # the fake kernel can only see sliced_ok, so the metadata keeps its n_all length.
+        saved_lse = torch.zeros(n_all, dtype = dtype, device = device)
     return (
         expand(logps),
         expand(mean_logits) if want_mean else mean_logits,
         expand(log_sum_sq_probs) if want_lssp else log_sum_sq_probs,
-        expand(saved_lse) if sliced else saved_lse,
+        saved_lse,
         torch.tensor([rows, int(sliced)], dtype = torch.int64),
     )
 
