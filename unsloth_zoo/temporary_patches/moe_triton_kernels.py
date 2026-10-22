@@ -31,24 +31,29 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_TRITON = None          # None: not probed yet; True/False: importable on a CUDA/ROCm device
 _DISABLED_REASON = None # set on the first failed launch; everything falls back afterwards
 _K = None               # compiled kernels, built on first use
 
 
+def _probe_triton() -> bool:
+    try:
+        import triton  # noqa: F401
+        import triton.language  # noqa: F401
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+# Probed at import, not on first use: this is called inside compiled MoE forwards, and
+# a global that changes after the first trace makes Dynamo recompile the enclosing graph.
+_TRITON = _probe_triton() # importable on a CUDA/ROCm device
+
+
 def moe_triton_kernels_available(device = None) -> bool:
-    global _TRITON
     if _DISABLED_REASON is not None or os.environ.get("UNSLOTH_MOE_TRITON_KERNELS", "1") == "0":
         return False
     if device is not None and getattr(device, "type", None) != "cuda":
         return False
-    if _TRITON is None:
-        try:
-            import triton  # noqa: F401
-            import triton.language  # noqa: F401
-            _TRITON = torch.cuda.is_available()
-        except Exception:
-            _TRITON = False
     return _TRITON
 
 

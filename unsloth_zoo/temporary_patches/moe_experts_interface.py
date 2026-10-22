@@ -384,6 +384,14 @@ def patch_experts_interface():
     interface = _experts_interface()
     if interface is None:
         return
+    # Fill the lazy lookups here, outside any compile: filled on first use inside a traced
+    # MoE forward, Dynamo guards on the missing key and every MoE graph compiles twice.
+    _default_apply_gate_or_none()
+    _experts_layout_is_standard_or_none()
+    try:
+        _moe_utils_module()
+    except Exception:
+        pass
     _patch_transformers_grouped_mm()
     try:
         from transformers.modeling_utils import PreTrainedModel
