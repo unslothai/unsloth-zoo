@@ -41,10 +41,21 @@ def _chunk_bytes():
         return _DEFAULT_CHUNK_BYTES
 
 
-def _experts_per_chunk(param, dtype):
+def _expert_bytes(param, dtype):
     E, K, N = param._original_shape
-    per_expert = K * N * torch.empty((), dtype = dtype).element_size()
-    return max(1, min(E, _chunk_bytes() // per_expert))
+    return K * N * torch.empty((), dtype = dtype).element_size()
+
+
+def _experts_per_chunk(param, dtype, budget = None):
+    per_expert = _expert_bytes(param, dtype)
+    return max(1, min(param._original_shape[0], (_chunk_bytes() if budget is None else budget) // per_expert))
+
+
+# Dequantize fallback: per GPU, [the chunk bytes to try, the calls left before the full chunk budget is tried
+# again, the smallest chunk bytes that failed to allocate]. Bytes, not experts: params with smaller experts
+# (a down_proj expert is half a gate_up one) still probe the dequantize path below the failed size.
+_CHUNK_BUDGET = {}
+_CHUNK_RETRY_CALLS = 1024
 
 
 def _grouped_mm(inputs, weight, offsets):
@@ -63,25 +74,75 @@ def _dequantize_chunk(param, start, end, dtype, transpose, counts):
     )
 
 
+def _chunk_budget(device):
+    state = _CHUNK_BUDGET.get(device.index)
+    if state is None:
+        return None
+    state[1] -= 1
+    if state[1] <= 0:
+        _CHUNK_BUDGET.pop(device.index, None)
+        return None
+    return state
+
+
 def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
     E = len(ends)
     out_dim = param._original_shape[-1] if transpose else param._original_shape[-2]
     out = inputs.new_empty((inputs.shape[0], out_dim))
-    step = _experts_per_chunk(param, dtype)
+    device = inputs.device
+    adaptive = device.type == "cuda"
+    state = _chunk_budget(device) if adaptive else None
+    budget = None if state is None else state[0]
+    if state is not None and _expert_bytes(param, dtype) >= state[2] and _fused_fallback_ok(inputs, param):
+        # One expert of this size (or less) already failed to allocate: skip straight to the fused kernel.
+        del out
+        return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
+    step = _experts_per_chunk(param, dtype, budget)
     ends_device = None
-    for first in range(0, E, step):
+    first = 0
+    while first < E:
         last = min(E, first + step)
         row_start = ends[first - 1] if first > 0 else 0
         row_end = ends[last - 1]
         if row_end == row_start:
+            first = last
             continue
         if ends_device is None:
             ends_device = torch.cumsum(counts, 0, dtype = torch.int32)
         offsets = ends_device[first:last] - row_start
-        weight = _dequantize_chunk(param, first, last, dtype, transpose, counts)
-        out[row_start:row_end] = _grouped_mm(inputs[row_start:row_end], weight, offsets)
+        try:
+            weight = _dequantize_chunk(param, first, last, dtype, transpose, counts)
+            out[row_start:row_end] = _grouped_mm(inputs[row_start:row_end], weight, offsets)
+        except torch.cuda.OutOfMemoryError:
+            if not adaptive:
+                raise
+            weight = None
+        if weight is None:
+            # The dequantized chunk did not fit (2 GiB default on a small GPU): halve it, keep that size for the
+            # next calls, and below one expert use the fused kernel, which never builds a 16-bit expert.
+            failed = step * _expert_bytes(param, dtype)
+            if step > 1:
+                step //= 2
+                _CHUNK_BUDGET[device.index] = [step * _expert_bytes(param, dtype), _CHUNK_RETRY_CALLS, failed]
+                continue
+            if not _fused_fallback_ok(inputs, param):
+                raise torch.cuda.OutOfMemoryError(
+                    f"Unsloth: one dequantized MXFP4 expert ({_expert_bytes(param, dtype)} bytes) does not fit"
+                )
+            _CHUNK_BUDGET[device.index] = [0, _CHUNK_RETRY_CALLS, failed]
+            del out
+            return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
         del weight
+        first = last
     return out
+
+
+def _fused_fallback_ok(inputs, param):
+    # Below sm_80 the verified tile kernel is slow but needs only its output: still better than an OOM.
+    return (
+        is_mxfp4_expert_param(param) and param.mxfp4_transposed
+        and mxfp4_grouped_gemv_available(inputs.device, inputs.dtype)
+    )
 
 
 def _fused(inputs, param, transpose = True):

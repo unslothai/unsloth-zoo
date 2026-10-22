@@ -198,6 +198,8 @@ def _kernel_verified(device, dtype, transpose):
         want = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
         got = _kernel_dequantize(blocks, scales, dtype, transpose, None, None, None)
         verified = bool(torch.equal(got.view(torch.uint8), want.view(torch.uint8)))
+    except torch.cuda.OutOfMemoryError:
+        raise  # a full GPU says nothing about the kernel: decide on a later call
     except Exception as exception:
         _kernel_fail(exception)
         verified = False
@@ -217,7 +219,10 @@ def mxfp4_kernel_available(device = None, dtype = torch.bfloat16) -> bool:
     device = torch.device(device)
     if device.type != "cuda":
         return False
-    return _kernel_verified(device, dtype, True)
+    try:
+        return _kernel_verified(device, dtype, True)
+    except torch.cuda.OutOfMemoryError:
+        return False  # a predicate: no room for the probe now, nothing cached, a later call decides
 
 
 def mxfp4_dequantize(
@@ -241,6 +246,8 @@ def _mxfp4_dequantize(blocks, scales, dtype, transpose, experts, token_counts, o
         return mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose, out = out)
     try:
         return _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, out)
+    except torch.cuda.OutOfMemoryError:
+        raise  # not a kernel failure: keep the kernel, let the caller shrink its chunk
     except Exception as exception:
         _kernel_fail(exception)
         return mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose, out = out)
