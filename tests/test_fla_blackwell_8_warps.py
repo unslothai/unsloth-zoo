@@ -112,7 +112,8 @@ def test_fwd_o_configs_per_arch_and_triton(host, triton_3_8):
     configs = _kernel_configs("chunk_fwd_kernel_o", hopper=hopper, blackwell=blackwell, triton_3_8=triton_3_8)
     big = (8, 3, (("BK", 128), ("BV", 128)))
     small = [(4, 3, (("BK", 64), ("BV", 64))), (2, 3, (("BK", 32), ("BV", 32)))]
-    if blackwell and not triton_3_8:
+    # Unsloth keeps the 8-warp config off on every Blackwell Triton (not yet stress-tested on 3.8).
+    if blackwell:
         assert configs == small
     else:
         assert configs == [big] + small

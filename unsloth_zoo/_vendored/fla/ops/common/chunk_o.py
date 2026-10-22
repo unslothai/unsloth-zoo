@@ -96,8 +96,8 @@ def _is_hopper_tensor(x):
 @fla_cache_autotune(
     configs=[
         # Unsloth: backported from fla PR #1229. The 8-warp config hits a Blackwell tl.dot race (wrong, nondeterministic o).
-        # fla PR #1399 limits the drop to Triton<3.8 (BLACKWELL_8_WARP_RACE).
-        *([] if BLACKWELL_8_WARP_RACE else [triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3)]),
+        # Kept off on every Blackwell Triton: fla PR #1399 re-enables it on Triton>=3.8, not yet stress-tested here.
+        *([] if IS_NVIDIA_BLACKWELL else [triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3)]),
         triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
         triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
     ],
