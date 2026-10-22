@@ -237,8 +237,7 @@ def test_no_grad_forward_without_lora_fails_closed_on_the_rejected_cell(monkeypa
 
 @pytest.mark.parametrize("grad", [False, True])
 def test_lora_patched_forward_returns_the_fp16_input_dtype(monkeypatch, grad):
-    # T4 runs fp16: the bf16 from mxfp4_ogs_experts_forward promoted the fp16 residual to fp32, and the next
-    # fp16 Linear then failed outside autocast. Same contract as the patched Mxfp4GptOssExperts.forward.
+    # T4 fp16: a bf16 expert output promoted the residual to fp32 and broke the next fp16 Linear.
     import contextlib
     monkeypatch.setattr(compat, "_device_capability", lambda device: (12, 0))
     monkeypatch.setattr(go, "_OGS_NATIVE_REJECT_WARNED", False)
