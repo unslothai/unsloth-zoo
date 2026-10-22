@@ -5615,6 +5615,17 @@ def _moe_weight_dtype_kwargs(tuner, module, name, dtype):
     return {"weight_dtype": weight_dtype}
 
 
+def _moe_tuner_device_kwargs(tuner, device):
+    """device kwarg so the autotune key, tuning run and SMEM fit follow the experts' card (a device_map
+    layer on another GPU model). Older unsloth has no such parameter and keeps the current device."""
+    try:
+        if "device" not in inspect.signature(tuner).parameters:
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    return {"device": device}
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -5681,6 +5692,7 @@ def forward_triton_grouped_gemm(
             top_k=top_k,
             dtype=gemm_hidden_states.dtype,
             **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "gate_up_proj", gemm_hidden_states.dtype),
+            **_moe_tuner_device_kwargs(get_or_autotune_moe_kernels, gemm_hidden_states.device),
         )
 
         # Second GEMM: K = intermediate_dim, N = hidden_dim.
@@ -5691,6 +5703,7 @@ def forward_triton_grouped_gemm(
             top_k=top_k,
             dtype=compute_dtype,
             **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "down_proj", compute_dtype),
+            **_moe_tuner_device_kwargs(get_or_autotune_moe_kernels, gemm_hidden_states.device),
         )
 
         self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)
