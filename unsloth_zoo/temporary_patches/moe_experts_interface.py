@@ -350,6 +350,18 @@ def _expert_devices(model):
     return sorted(devices, key = lambda d: (d.type, d.index))
 
 
+def _accelerator_count() -> int:
+    count = 0
+    for name in ("cuda", "xpu"):
+        backend = getattr(torch, name, None)
+        try:
+            if backend is not None and backend.is_available():
+                count += backend.device_count()
+        except Exception:
+            pass
+    return count
+
+
 def warm_moe_probes_on_expert_devices(model) -> None:
     """Run the per-GPU-model grouped_mm probes eagerly for every card the experts sit on.
 
@@ -361,7 +373,9 @@ def warm_moe_probes_on_expert_devices(model) -> None:
         return
     try:
         devices = _expert_devices(model)
-        if not devices or all(getattr(torch, d.type).device_count() <= 1 for d in devices):
+        # One accelerator on the whole host: it is the home card. Count every backend, since one CUDA card
+        # plus one XPU card are each a single device of their type yet the XPU is foreign to a CUDA home.
+        if not devices or _accelerator_count() <= 1:
             return
         moe_utils = _moe_utils_module()
         backend = moe_utils.get_forward_moe_backend()

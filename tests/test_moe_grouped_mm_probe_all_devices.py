@@ -456,3 +456,27 @@ def test_loader_warm_skips_cards_holding_only_non_expert_weights(spoof, monkeypa
     assert _expert_devices(model) == [cuda(0)]
     auto_enable_grouped_moe(model)
     assert seen == [0]
+
+
+def test_loader_warms_an_xpu_card_beside_a_single_cuda_home(spoof, monkeypatch):
+    # One CUDA card plus one XPU card: each backend counts 1 device, yet the XPU is foreign to the CUDA
+    # home and its first traced query would reach the compiler-disabled resolver.
+    from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
+    seen = spoof(1, models = ["H100"])
+    real_xpu = getattr(torch, "xpu", None)
+    monkeypatch.setattr(torch, "xpu", types.SimpleNamespace(
+        is_available = lambda: True,
+        device_count = lambda: 1,
+        current_device = lambda: 0,
+        get_device_properties = lambda i: types.SimpleNamespace(name = "Arc B580", major = None, minor = None),
+    ), raising = False)
+    # Warm only this module: a compiled-cache copy (if one exists here) would probe once more for itself.
+    monkeypatch.setattr(moe_utils, "get_forward_moe_backend", lambda: moe_utils.forward_native_grouped_mm)
+    xpu = torch.device("xpu", 0)
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    auto_enable_grouped_moe(_split_model(cuda(0), xpu))
+    assert seen == [0, 0]   # the CUDA home, then the XPU card
+    kind = moe_utils._grouped_mm_foreign_kind(xpu)
+    assert kind is not None and moe_utils._TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind) is True
+    monkeypatch.setattr(torch, "xpu", real_xpu, raising = False)   # Dynamo itself reads the real backend
+    assert _fullgraph_gate(monkeypatch, xpu).tolist() == [1.0, 1.0]
