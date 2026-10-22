@@ -43,29 +43,11 @@ def _helper():
     return _length_grouped_order
 
 
-def _hf_reference(lengths, batch_size, generator, mega_batch_mult=None):
-    """transformers.trainer_pt_utils.get_length_grouped_indices, transcribed."""
-    if mega_batch_mult is None:
-        mega_batch_mult = min(len(lengths) // (batch_size * 4), 50)
-        if mega_batch_mult == 0:
-            mega_batch_mult = 1
-    indices = torch.randperm(len(lengths), generator=generator)
-    megabatch_size = mega_batch_mult * batch_size
-    megabatches = [
-        indices[i : i + megabatch_size].tolist()
-        for i in range(0, len(lengths), megabatch_size)
-    ]
-    megabatches = [
-        sorted(mb, key=lambda i: lengths[i], reverse=True) for mb in megabatches
-    ]
-    megabatch_maximums = [lengths[mb[0]] for mb in megabatches]
-    max_idx = torch.argmax(torch.tensor(megabatch_maximums)).item()
-    megabatches[0][0], megabatches[max_idx][0] = (
-        megabatches[max_idx][0], megabatches[0][0],
-    )
-    return [i for mb in megabatches for i in mb]
-
-
+def _hf_reference(lengths, batch_size, generator):
+    pt_utils = pytest.importorskip("transformers.trainer_pt_utils")
+    if not hasattr(pt_utils, "get_length_grouped_indices"):
+        pytest.skip("transformers no longer ships get_length_grouped_indices")
+    return pt_utils.get_length_grouped_indices(lengths, batch_size, generator=generator)
 
 
 def test_matches_hf_reference_bit_for_bit():
@@ -440,7 +422,7 @@ def test_streaming_rejects_length_grouping():
 def test_preference_rejects_length_grouping():
     from unsloth_zoo.mlx.trainer import _reject_group_by_length
 
-    with pytest.raises(ValueError, match="DPO/ORPO"):
+    with pytest.raises(ValueError, match="preference or RL"):
         _reject_group_by_length("length_grouped", "preference")
 
 

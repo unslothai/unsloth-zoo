@@ -13054,7 +13054,7 @@ def _torch_randperm_order(length, seed):
 
 
 def _length_grouped_permutation(length, seed):
-    """Seeded torch.randperm when importable, else stdlib (unsloth_zoo[mlx] omits torch on Apple Silicon). Seed-only, so DDP ranks agree."""
+    # unsloth_zoo[mlx] may omit torch; the stdlib fallback is still seed-only, so DDP ranks agree.
     try:
         import torch  # noqa: F401
     except Exception:
@@ -13146,14 +13146,13 @@ def _finite_batch_schedule(
 
 
 def _text_row_length(row):
-    """Token count of a row, either ``ids`` or ``(ids, labels)``."""
     if isinstance(row, (tuple, list)) and row and isinstance(row[0], (tuple, list)):
         return len(row[0])
     return len(row)
 
 
 def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
-    """Mirrors transformers ``get_length_grouped_indices``; ``batch_size`` comes from ``_length_grouped_window``."""
+    # transformers.trainer_pt_utils.get_length_grouped_indices.
     n = len(lengths)
     if n == 0:
         return []
@@ -13182,8 +13181,7 @@ def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
 
 
 def _length_grouped_window(local_batch_size, comm_group=None, grad_accum=None):
-    """Global micro-batch x grad_accum: HF's Trainer._get_train_sampler uses train_batch_size * gradient_accumulation_steps,
-    and a per-rank window would let a consumed global chunk straddle two mega-batches."""
+    # HF Trainer._get_train_sampler: train_batch_size * gradient_accumulation_steps, over the global batch.
     global_batch_size = _distributed_global_batch_size(local_batch_size, comm_group)
     return global_batch_size * max(1, int(grad_accum or 1))
 
