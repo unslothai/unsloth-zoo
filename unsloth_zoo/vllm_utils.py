@@ -5527,6 +5527,14 @@ def _vllm_lora_target_names(vllm_model, manager = None):
 
     packed = getattr(manager, "packed_modules_mapping", None)
     if not isinstance(packed, dict):
+        # Same builder the manager uses: on a 2D MoE it adds `experts -> experts.<i>.<proj>`,
+        # which get_packed_modules_mapping lacks, so per-expert keys would look unmatched.
+        try:
+            from vllm.lora.utils import process_packed_modules_mapping
+            packed = process_packed_modules_mapping(vllm_model)
+        except Exception:
+            packed = None
+    if not isinstance(packed, dict):
         try:
             from vllm.model_executor.utils import get_packed_modules_mapping
             packed = get_packed_modules_mapping(vllm_model)
@@ -5561,6 +5569,8 @@ def _vllm_lora_target_names(vllm_model, manager = None):
         # never appears in named_modules. Expand the packed mapping back out.
         parent, _, leaf = name.rpartition(".")
         for sub in packed.get(leaf, ()):
+            # Once wrapped, vLLM's RoutedExperts names experts `experts.<i>.<proj>.base_layer`.
+            if sub.endswith(".base_layer"): sub = sub[:-len(".base_layer")]
             names.add(f"{parent}.{sub}" if parent else sub)
     if len(names) == 0: return None
     return names, embedding_names
