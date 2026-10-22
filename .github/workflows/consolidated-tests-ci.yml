@@ -1205,6 +1205,7 @@ jobs:
                   tests/test_deepseek_v3_grpo_hidden_states.py \
                   tests/test_moe_hidden_states_wrapper.py \
                   tests/test_aya_vision_logit_scale.py \
+                  tests/test_umt5_transformers5.py \
                   tests/test_vision_utils_grid_helpers_eager.py \
                   tests/test_modeling_local_vision_helpers_eager.py \
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
