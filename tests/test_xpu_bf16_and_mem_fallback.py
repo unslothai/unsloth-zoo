@@ -76,6 +76,8 @@ def on_xpu(monkeypatch):
         monkeypatch.setattr(dt, "DEVICE_TYPE", "xpu")
         monkeypatch.setattr(torch, "cuda", fake_cuda)
         monkeypatch.setattr(torch, "xpu", xpu, raising = False)
+        # load_vllm asks vLLM's own platform check on XPU: a stub that accepts bf16 keeps this hermetic.
+        _fake_vllm_platforms(monkeypatch)
     return install
 
 
@@ -296,6 +298,71 @@ def test_vllm_xpu_explicit_bf16_follows_the_loading_unsloth(on_xpu, vu, monkeypa
     }
     exec(_vllm_dtype_block(vu), scope)
     assert scope["dtype"] is getattr(torch, expected)
+
+
+def _fake_vllm_platforms(monkeypatch, refuses = False, has_check = True, missing = False):
+    if missing:
+        monkeypatch.setitem(sys.modules, "vllm.platforms", None)  # import raises ImportError
+        return
+
+    class _Platform:
+        pass
+
+    if has_check:
+        def check_if_supports_dtype(dtype):
+            if refuses and dtype is torch.bfloat16:
+                raise ValueError("Intel Arc A770 have bfloat16 accuracy known issue.")
+        _Platform.check_if_supports_dtype = staticmethod(check_if_supports_dtype)
+    mod = types.ModuleType("vllm.platforms")
+    mod.current_platform = _Platform()
+    monkeypatch.setitem(sys.modules, "vllm.platforms", mod)
+
+
+@pytest.mark.parametrize(
+    "fake, expected",
+    [
+        ({"refuses": True}, True),
+        ({"refuses": False}, False),
+        ({"has_check": False}, False),   # older vLLM without the hook
+        ({"missing": True}, False),      # vLLM not importable
+    ],
+)
+def test_xpu_vllm_refuses_bf16_asks_vllms_own_check(monkeypatch, fake, expected):
+    _fake_vllm_platforms(monkeypatch, **fake)
+    assert dt._xpu_vllm_refuses_bf16() is expected
+
+
+@not_on_macos
+@pytest.mark.parametrize(
+    "flags, dtype, refuses, expected",
+    [
+        ((_PROVEN_NO_BF16,), "bfloat16", True, "float16"),   # explicit bf16 on an A770: vLLM refuses
+        ((True,), None, True, "float16"),                    # automatic bf16 on an A770 too
+        ((_PROVEN_NO_BF16,), "bfloat16", False, "bfloat16"), # vLLM accepts it: kept
+        ((True,), None, False, "bfloat16"),
+        ((True,), "float16", True, "float16"),
+    ],
+)
+def test_vllm_xpu_dtype_follows_vllms_bf16_check(on_xpu, vu, monkeypatch, flags, dtype, refuses, expected):
+    on_xpu(_fake_xpu(flags))
+    _fake_vllm_platforms(monkeypatch, refuses = refuses)
+    scope = {
+        "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
+        "__package__": "unsloth_zoo", "dtype": None if dtype is None else getattr(torch, dtype),
+    }
+    exec(_vllm_dtype_block(vu), scope)
+    assert scope["dtype"] is getattr(torch, expected)
+
+
+@not_on_macos
+def test_vllm_cuda_dtype_never_asks_the_xpu_check(vu, monkeypatch):
+    _fake_vllm_platforms(monkeypatch, refuses = True)
+    scope = {
+        "DEVICE_TYPE": "cuda", "torch": torch, "major_version": 9, "__name__": vu.__name__,
+        "__package__": "unsloth_zoo", "dtype": torch.bfloat16,
+    }
+    exec(_vllm_dtype_block(vu), scope)
+    assert scope["dtype"] is torch.bfloat16
 
 
 @pytest.mark.parametrize(
