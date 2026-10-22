@@ -51,8 +51,9 @@ def _experts_per_chunk(param, dtype, budget = None):
     return max(1, min(param._original_shape[0], (_chunk_bytes() if budget is None else budget) // per_expert))
 
 
-# Dequantize fallback: per GPU, the chunk bytes that last fitted after a chunk failed to allocate, and the
-# calls left before the full chunk budget is tried again.
+# Dequantize fallback: per GPU, [the chunk bytes to try, the calls left before the full chunk budget is tried
+# again, the smallest chunk bytes that failed to allocate]. Bytes, not experts: params with smaller experts
+# (a down_proj expert is half a gate_up one) still probe the dequantize path below the failed size.
 _CHUNK_BUDGET = {}
 _CHUNK_RETRY_CALLS = 1024
 
@@ -81,7 +82,7 @@ def _chunk_budget(device):
     if state[1] <= 0:
         _CHUNK_BUDGET.pop(device.index, None)
         return None
-    return state[0]
+    return state
 
 
 def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
@@ -90,8 +91,10 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
     out = inputs.new_empty((inputs.shape[0], out_dim))
     device = inputs.device
     adaptive = device.type == "cuda"
-    budget = _chunk_budget(device) if adaptive else None
-    if budget is not None and budget < _expert_bytes(param, dtype) and _fused_fallback_ok(inputs, param):
+    state = _chunk_budget(device) if adaptive else None
+    budget = None if state is None else state[0]
+    if state is not None and _expert_bytes(param, dtype) >= state[2] and _fused_fallback_ok(inputs, param):
+        # One expert of this size (or less) already failed to allocate: skip straight to the fused kernel.
         del out
         return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
     step = _experts_per_chunk(param, dtype, budget)
@@ -117,15 +120,16 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
         if weight is None:
             # The dequantized chunk did not fit (2 GiB default on a small GPU): halve it, keep that size for the
             # next calls, and below one expert use the fused kernel, which never builds a 16-bit expert.
+            failed = step * _expert_bytes(param, dtype)
             if step > 1:
                 step //= 2
-                _CHUNK_BUDGET[device.index] = [step * _expert_bytes(param, dtype), _CHUNK_RETRY_CALLS]
+                _CHUNK_BUDGET[device.index] = [step * _expert_bytes(param, dtype), _CHUNK_RETRY_CALLS, failed]
                 continue
             if not _fused_fallback_ok(inputs, param):
                 raise torch.cuda.OutOfMemoryError(
                     f"Unsloth: one dequantized MXFP4 expert ({_expert_bytes(param, dtype)} bytes) does not fit"
                 )
-            _CHUNK_BUDGET[device.index] = [0, _CHUNK_RETRY_CALLS]
+            _CHUNK_BUDGET[device.index] = [0, _CHUNK_RETRY_CALLS, failed]
             del out
             return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
         del weight

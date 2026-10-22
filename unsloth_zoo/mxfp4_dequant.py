@@ -219,7 +219,10 @@ def mxfp4_kernel_available(device = None, dtype = torch.bfloat16) -> bool:
     device = torch.device(device)
     if device.type != "cuda":
         return False
-    return _kernel_verified(device, dtype, True)
+    try:
+        return _kernel_verified(device, dtype, True)
+    except torch.cuda.OutOfMemoryError:
+        return False  # a predicate: no room for the probe now, nothing cached, a later call decides
 
 
 def mxfp4_dequantize(

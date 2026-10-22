@@ -140,3 +140,46 @@ def test_oom_in_the_dequant_kernel_keeps_the_kernel(monkeypatch):
     with _headroom(16, device), pytest.raises(torch.cuda.OutOfMemoryError):
         mxfp4_dequantize(blocks, scales, dtype = torch.bfloat16)
     assert not md._KERNEL_FAILED
+
+
+def test_one_failed_expert_size_does_not_force_smaller_experts_fused(sm75, monkeypatch):
+    # gate_up experts (8 MiB) do not fit even alone; down_proj experts (half that) do and keep the dequantize path.
+    device = sm75
+    gate_up = _stack(E, K, N, device, seed = 4)
+    down = _stack(E, K, N // 2, device, seed = 5)
+    x, counts, ends = _routed(E, 64, K, device, torch.float16)
+    real_chunk, fused = mse._dequantize_chunk, []
+    limit = mse._expert_bytes(gate_up, torch.float16)
+
+    def chunk(param, start, end, dtype, transpose, counts):
+        if (end - start) * mse._expert_bytes(param, dtype) >= limit:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory (fake)")
+        return real_chunk(param, start, end, dtype, transpose, counts)
+
+    real_fused = mse.mxfp4_grouped_matmul
+    monkeypatch.setattr(mse, "_dequantize_chunk", chunk)
+    monkeypatch.setattr(mse, "mxfp4_grouped_matmul", lambda *a, **k: fused.append(1) or real_fused(*a, **k))
+    for param in (gate_up, down, gate_up):
+        ref = _reference(x, param, counts)
+        got = mse.mxfp4_grouped_linear(x, param, counts, ends)
+        torch.testing.assert_close(got.float(), ref, rtol = 2e-2, atol = 2e-2 * ref.abs().max().item())
+    assert len(fused) == 2  # both gate_up calls; down_proj probed and fitted
+
+
+def test_kernel_available_is_false_not_oom_under_memory_pressure(monkeypatch):
+    device = torch.device("cuda", torch.cuda.current_device())
+    monkeypatch.setattr(md, "_KERNEL_FAILED", False)
+    monkeypatch.setattr(md, "_KERNEL_VERIFIED", {})
+    real = md._kernel_dequantize
+
+    def oom(*args, **kwargs):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory (fake)")
+
+    monkeypatch.setattr(md, "_kernel_dequantize", oom)
+    assert md.mxfp4_kernel_available(device, torch.bfloat16) is False
+    assert not md._KERNEL_VERIFIED and not md._KERNEL_FAILED  # nothing decided for later calls
+    with pytest.raises(torch.cuda.OutOfMemoryError):  # dequant callers still see the OOM and shrink
+        md._kernel_verified(device, torch.bfloat16, True)
+    monkeypatch.setattr(md, "_kernel_dequantize", real)
+    if md._HAS_TRITON:
+        assert md.mxfp4_kernel_available(device, torch.bfloat16) == md._KERNEL_VERIFIED[(str(device), torch.bfloat16, True)]
