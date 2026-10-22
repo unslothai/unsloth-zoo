@@ -79,6 +79,10 @@ def spoof(monkeypatch):
         monkeypatch.setattr(torch, "ones", ones)
         monkeypatch.setattr(torch, "tensor", tensor)
         monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
+        # The view probe builds real tensors (torch.Generator / randn on the card): on a GPU host that ran
+        # on the real device and logged extra _grouped_mm calls; on a CPU host it raised and gave False.
+        # Pin that False everywhere; tests of the view probe override it.
+        monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda device: False)
         return probed
     return make
 
