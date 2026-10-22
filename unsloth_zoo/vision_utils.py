@@ -1655,12 +1655,7 @@ pass
 
 
 def _generation_prompt_fuses_answer(processor, chat_template_kwargs = None) -> bool:
-    """True when the generation prompt ends in whitespace the tokenizer fuses into the answer.
-
-    PaddleOCR-VL renders "Assistant: " and tokenizes "Assistant: Z" as [..., ':', ' Z'], but
-    generation feeds [..., ':', ' '] and continues with 'Z'. Training on the whole rendered string
-    teaches a boundary generation never shows (unslothai/notebooks#149).
-    """
+    """PaddleOCR-VL: "Assistant: Z" tokenizes as [':', ' Z'], generation as [':', ' '] then 'Z' (unslothai/notebooks#149)."""
     tokenizer = getattr(processor, "tokenizer", processor)
     user = [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}]
     kwargs = dict(chat_template_kwargs or {}, tokenize = False)
@@ -1883,8 +1878,7 @@ class UnslothVisionDataCollator:
         if "prompt" in examples[0] and "completion" in examples[0]:
             return self._collate_prompt_completion(examples)
 
-        # Response-only masking (set here or later by train_on_responses_only(trainer)): the
-        # prompt/completion path masks the prompt and tokenizes it apart, as generation does.
+        # Masker may be attached later by train_on_responses_only(trainer).
         if getattr(self, "split_generation_prompt", False) and getattr(self, "train_on_responses_only", None):
             split = self._split_at_generation_prompt(examples)
             if split is not None:

@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Generation prompts ending in a space the tokenizer fuses into the answer (unslothai/notebooks#149).
-
-PaddleOCR-VL renders "Assistant: " before the answer: the whole string tokenizes as
-[':', ' Z'], generation as [':', ' '] then 'Z'. Hermetic CPU tests with a stub
-SentencePiece-like tokenizer (a space fuses into the following word).
-"""
+"""Generation prompt ending in a space the tokenizer fuses into the answer (unslothai/notebooks#149)."""
 
 from __future__ import annotations
 
@@ -99,7 +94,6 @@ def make_collator(processor, split):
     collator.assistant_single_content = False
     collator.chat_template_kwargs = {}
     collator.split_generation_prompt = split
-    # As train_on_responses_only installs it; the stub masks nothing beyond the collator's labels.
     collator.train_on_responses_only = lambda batch: {"labels": batch["labels"].clone()}
     return collator
 
@@ -128,7 +122,6 @@ def test_probe_flags_only_a_fused_trailing_space():
 def test_answer_boundary_matches_generation():
     processor = _FakeProcessor()
     out = make_collator(processor, _generation_prompt_fuses_answer(processor))([chat("Zuh tee"), chat("Hi")])
-    # Generation feeds the rendered generation prompt, then continues with the bare answer
     prompt = processor.apply_chat_template(chat()["messages"], add_generation_prompt = True)
     for row, answer in enumerate(["Zuh tee", "Hi"]):
         expected = processor.tokenizer.encode(prompt) + processor.tokenizer.encode(answer + "</s>")
