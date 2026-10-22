@@ -195,9 +195,18 @@ def _agreed(a, b):
     if a.shape != b.shape:
         return a
     same = (a.sort(dim = -1).values == b.sort(dim = -1).values).all(dim = -1, keepdim = True)
-    if not bool(same.all()):
-        _STATE.stats["conflicting_routes"] = _STATE.stats.get("conflicting_routes", 0) + int((~same).sum())
     return torch.where(same, a, torch.full_like(a, -1))
+
+
+def _count_conflicts(a, b):
+    # (token, layer) rows two real captures route differently: counted once, when recorded.
+    if a.shape != b.shape:
+        return
+    merged = _agreed(a, b)
+    natural = lambda x: (x < 0).all(dim = -1)
+    conflicts = int((natural(merged) & ~natural(a) & ~natural(b)).sum())
+    if conflicts:
+        _STATE.stats["conflicting_routes"] = _STATE.stats.get("conflicting_routes", 0) + conflicts
 
 
 def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = None):
@@ -249,7 +258,10 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
             # Keyed by every token: a pad id inside the sequence (pad == eos) can be real.
             key = tuple(full)
             # Duplicate completions can be routed differently; only their common routes replay.
-            store[key] = _agreed(store[key], rows) if key in store else rows
+            if key in store:
+                _count_conflicts(store[key], rows)
+                rows = _agreed(store[key], rows)
+            store[key] = rows
             if pad_token_id is not None:
                 unpadded[_make_key(full, pad_token_id)] = key
             _STATE.stats["recorded"] += 1
@@ -260,6 +272,14 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
             _STATE.generations[_STATE.generation_id] = []
             _STATE.forwarded_since_record = False
         calls = next(reversed(_STATE.generations.values()))
+        for key, rows in store.items():
+            # The same tokens in an earlier call of this rollout: _lookup merges them, count here.
+            earlier = None
+            for previous, _, _ in calls:
+                if key in previous:
+                    earlier = previous[key] if earlier is None else _agreed(earlier, previous[key])
+            if earlier is not None:
+                _count_conflicts(earlier, rows)
         calls.append((store, unpadded, pad_token_id))
         # generate without training forwards in between (evaluation) would otherwise grow forever.
         del calls[:-_MAX_CALLS_PER_ROLLOUT]

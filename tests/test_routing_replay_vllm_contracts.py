@@ -124,6 +124,44 @@ def test_duplicate_completions_replay_only_their_common_routes(replay):
         keep = torch.ones(3, LAYERS, dtype = torch.bool)
         keep[1, 0] = False
         assert torch.equal(rows[keep].long(), torch.as_tensor(a)[keep].long())
+        # One conflicting (token, layer) row, counted once at record time however often it replays.
+        for _ in range(3):
+            rr._lookup(tuple(tokens), exact = True)
+        assert rr.routing_replay_stats()["conflicting_routes"] == 1, split_calls
+
+
+def test_invalid_capture_next_to_a_valid_one_is_not_a_conflict(replay):
+    tokens = [1, 2, 3]
+    a = _routes(3, 3)
+    b = a.copy()
+    b[1, 0] = -1  # vLLM gave no routing there (rows with repeated ids are marked -1 too)
+
+    def req(routed):
+        return SimpleNamespace(prompt_token_ids = tokens[:1], outputs = [SimpleNamespace(token_ids = tokens[1:], routed_experts = routed)])
+
+    rr.record_routed_experts([req(a), req(b)])
+    assert rr.routing_replay_stats().get("conflicting_routes", 0) == 0
+
+
+def test_return_args_path_also_checks_the_model_runner():
+    # load_vllm(return_args = True) returns the `vllm serve` engine args before the ReplaySSM block:
+    # the Model Runner V2 conflict check must run there as well.
+    import unsloth_zoo.vllm_utils as vu
+    path = pathlib.Path(vu.__file__)
+    tree = ast.parse(path.read_text(encoding = "utf-8-sig"))
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+    branch = next(
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If) and ast.unparse(n.test) == "return_args"
+        and any(isinstance(s, ast.Return) for s in n.body)
+    )
+    calls = [
+        i for i, s in enumerate(branch.body)
+        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+        and getattr(s.value.func, "id", None) == "_routing_replay_model_runner"
+    ]
+    returns = [i for i, s in enumerate(branch.body) if isinstance(s, ast.Return)]
+    assert calls and calls[0] < returns[0]
 
 
 transformers = pytest.importorskip("transformers")

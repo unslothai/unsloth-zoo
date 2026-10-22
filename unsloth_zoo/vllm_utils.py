@@ -4951,6 +4951,8 @@ def load_vllm(
         # Quick exit. The finally below restores the patch on the way out.
         if return_args:
             _warn_padded_vocab_for_serve(config)
+            # `vllm serve` inherits this environment: routing replay needs Model Runner V2 there too.
+            _routing_replay_model_runner(engine_args)
             # No engine is built here, so nothing will ever reach delete_vllm to lift the
             # block, and the failure arm below is not reached either. Hand flashinfer back
             # rather than poisoning the session for good.
