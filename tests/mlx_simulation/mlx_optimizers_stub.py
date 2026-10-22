@@ -14,8 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Unsloth Zoo - Utilities for Unsloth
-# MLX optimizers stub — wraps torch.optim.* via the functional update API.
 """
 mlx.optimizers — Adam/AdamW/SGD/Adafactor/Muon/Lion + schedulers.
 
@@ -64,13 +62,11 @@ class _OptimizerBase:
         torch.optim.X.step() once.  Phase 4 extends to MLX's exact tree
         semantics.
         """
-        # Gather parameters as a flat list with stable ordering.
         from .mlx_utils_stub import tree_flatten
         params = [p for _, p in tree_flatten(model.parameters() if callable(getattr(model, "parameters", None)) else model)]
         flat_grads = [g for _, g in tree_flatten(grads)]
         if self._torch_opt is None:
             self._torch_opt = self._build_torch_opt(params)
-        # Assign grads
         for p, g in zip(params, flat_grads):
             if isinstance(p, torch.Tensor) and isinstance(g, torch.Tensor):
                 if p.grad is None:
@@ -167,7 +163,6 @@ class Lion(_OptimizerBase):
 
 class Muon(_OptimizerBase):
     def _build_torch_opt(self, params):
-        # Muon is a recent optimizer; if not installed, fall back to SGD.
         try:
             from muon import Muon as _Muon  # placeholder package name
             return _Muon(params, lr=self.learning_rate)
@@ -190,9 +185,7 @@ class MultiOptimizer:
             self.optimizers[0].update(model, grads)
 
 
-# ---------------------------------------------------------------------------
 # Schedulers — MLX returns lr-schedule callables (step -> lr) directly.
-# ---------------------------------------------------------------------------
 def linear_schedule(init, end, steps):
     def _sched(step):
         if step >= steps:
@@ -253,7 +246,6 @@ def decay_weight(weights, decay):
     return tree_map(lambda w: w * (1.0 - decay) if isinstance(w, torch.Tensor) else w, weights)
 
 
-# ---------------------------------------------------------------------------
 schedulers_module = types.ModuleType("mlx.optimizers.schedulers")
 schedulers_module.__path__ = []
 schedulers_module.linear_schedule = linear_schedule

@@ -22,6 +22,8 @@ __all__ = [
     "create_block_mask_cached",
     "create_block_mask",
     "compiled_create_block_mask",
+    "reused_compiled_create_block_mask",
+    "clear_block_mask_cache",
     "FlexAttentionCache",
 
     "causal_mask",
@@ -33,9 +35,10 @@ __all__ = [
     "generate_decoding_sliding_window_mask_with_padding",
 ]
 
+import os
 import torch
 import functools
-from ..temporary_patches.common import torch_compile, _torch_compile
+from unsloth_zoo.temporary_patches.common import torch_compile, _torch_compile
 FLEX_ATTENTION_KV_INCREMENT = 512
 
 try:
@@ -51,7 +54,16 @@ try:
     # InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton_tem_fused_0 Required: 65536 Hardware limit:65536 Reducing block sizes or `num_stages` may help.
     # See https://github.com/pytorch/pytorch/issues/133254#issuecomment-2408710459
     # https://github.com/pytorch/pytorch/issues/133254#issuecomment-2539969593
-    vram_of_gpu = min(torch.cuda.memory.mem_get_info(i)[-1]/1024/1024/1024 for i in range(torch.cuda.device_count()))
+    # Total capacity, like the gpt_oss probe: mem_get_info() would pin a device context at import
+    # time. Integrated parts are the exception, where properties may report only the carve-out.
+    # Properties are read HERE, not inside cuda_total_memory, which answers 0 for a device it
+    # cannot read: a 0 would read as "16GB or less" and leave flex attention on with 32x32 kernel
+    # options, where an unreadable device must keep raising into the except below.
+    from unsloth_zoo.integrated_device import cuda_total_memory
+    vram_of_gpu = min(
+        cuda_total_memory(i, props = torch.cuda.get_device_properties(i))/1024/1024/1024
+        for i in range(torch.cuda.device_count())
+    )
     kernel_options = None
     if vram_of_gpu <= 16:
         kernel_options = {
@@ -86,16 +98,62 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device)
 
+    # Largest dense mask (bool elements) built eagerly; above it the compiled builder keeps memory O(blocks).
+    _EAGER_BLOCK_MASK_MAX_ELEMENTS = 1 << 27
+
+    def _compile_block_mask(bsz, head, M, N):
+        # torch 2.10's dynamic create_block_mask graph miscompiles one-block lengths: its block
+        # counts come out 2 instead of 1 and read past the buffer (illegal memory access).
+        blk = FLEX_ATTENTION_BLOCK_SIZE
+        if M > blk and N > blk:
+            return True
+        # The eager builder pads both lengths to whole blocks before reducing the dense mask.
+        padded = -(-M // blk) * blk * (-(-N // blk) * blk)
+        return (bsz or 1) * (head or 1) * padded > _EAGER_BLOCK_MASK_MAX_ELEMENTS
+
     def compiled_create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         # See https://github.com/meta-pytorch/attention-gym/issues/15#issuecomment-2284148665
         # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
-        return _create_block_mask(mask_mod, None, None, M, N, device = device, _compile = True)
+        return _create_block_mask(mask_mod, None, None, M, N, device = device,
+                                  _compile = _compile_block_mask(None, None, M, N))
 
     def compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
-        return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = True)
+        return _create_block_mask(mask_mod, bsz, head, M, N, device = device,
+                                  _compile = _compile_block_mask(bsz, head, M, N))
+
+    # Block masks for stateless mask_mods (causal / sliding window) only depend on the
+    # mask_mod and shapes, so every layer, pass and checkpoint replay can share one.
+    # Never pass mask_mods closing over per batch tensors (padding, document ids).
+    _BLOCK_MASK_CACHE = {}
+    _BLOCK_MASK_CACHE_SIZE = 32
+
+    def clear_block_mask_cache():
+        _BLOCK_MASK_CACHE.clear()
+
+    def reused_compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
+        """compiled_create_block_mask cached for stateless mask_mods. UNSLOTH_FLEX_MASK_REUSE=0 disables"""
+        if os.environ.get("UNSLOTH_FLEX_MASK_REUSE", "1") == "0":
+            _BLOCK_MASK_CACHE.clear()   # turning reuse off also frees the retained masks
+            return compiled_create_block_mask(mask_mod, bsz, head, M, N, device = device)
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:   # "cuda" means the current device
+            dev = torch.device("cuda", torch.cuda.current_device())
+        # Inference tensors cannot be saved for backward, so keep inference mode masks apart
+        key = (mask_mod, bsz, head, M, N, dev, torch.is_inference_mode_enabled())
+        block_mask = _BLOCK_MASK_CACHE.get(key)
+        if block_mask is None:
+            # Masks grow ~quadratically with length: keep only the current shape's masks (one per
+            # mask_mod in the current inference mode, shared by all layers of one forward), freed first.
+            for k in [k for k in _BLOCK_MASK_CACHE if k[1:] != key[1:]]:
+                del _BLOCK_MASK_CACHE[k]
+            if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_SIZE:
+                _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
+            block_mask = compiled_create_block_mask(mask_mod, bsz, head, M, N, device = dev)
+            _BLOCK_MASK_CACHE[key] = block_mask
+        return block_mask
 
     def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
         """Causal mask for Flex Attention"""
@@ -353,4 +411,6 @@ except:
     causal_mask = None
     generate_sliding_window_mask = None
     FlexAttentionCache = None
+    reused_compiled_create_block_mask = None
+    clear_block_mask_cache = None
 pass

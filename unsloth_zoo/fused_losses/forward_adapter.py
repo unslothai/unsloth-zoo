@@ -31,7 +31,7 @@ __all__ = [
 
 import torch
 
-from .cross_entropy_loss import unsloth_fused_ce_loss
+from .cross_entropy_loss import unsloth_fsdp_unshard, unsloth_fused_ce_loss
 
 
 EMPTY_LOGITS = torch.empty(0)
@@ -55,7 +55,8 @@ def unsloth_fused_lm_head_loss(
         vocab_size: ignored; kernel reads it from `lm_head.weight.shape[0]`.
         **kwargs: forwarded to the kernel. `num_items_in_batch` is renamed to
             `n_items`; also accepts `logit_scale_multiply`, `logit_scale_divide`,
-            `logit_softcapping`, plus extras the original loss_function ignored.
+            `logit_softcapping`, `logits_bias` (an extra vocab bias added after the
+            head), plus extras the original loss_function ignored.
     """
     n_items = kwargs.pop("num_items_in_batch", None)
     if n_items is None:
@@ -80,6 +81,12 @@ def unsloth_fused_lm_head_loss(
         target = labels
         do_shift = True
 
+    # fp16: grads are computed in the forward and underflow without the loss scale (#3529).
+    accelerator_scaler = kwargs.pop("accelerator_scaler", None)
+    if kwargs.get("scaling", None) is None and accelerator_scaler is not None:
+        kwargs["scaling"] = accelerator_scaler
+
+    unsloth_fsdp_unshard(lm_head)
     loss = unsloth_fused_ce_loss(
         trainer        = None,
         hidden_states  = hidden_states,

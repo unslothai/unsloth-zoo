@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from typing import Optional, List, Any, Tuple
 import os
 import warnings
-from ..log import logger
+from unsloth_zoo.log import logger
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 
@@ -36,8 +36,15 @@ try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
     from bitsandbytes.functional import dequantize_4bit
-    HAS_BNB = True
-except ImportError:
+    # The zoo injects a permissive bitsandbytes stub wherever the real package is absent,
+    # macOS arm64 among others, and every attribute of that stub is a placeholder object
+    # rather than a class. `isinstance(x, Params4bit)` against one raises TypeError, so a
+    # non-class Params4bit has to count as no bitsandbytes at all.
+    HAS_BNB = isinstance(Params4bit, type)
+    if not HAS_BNB:
+        Params4bit = None
+except Exception:
+    # Not just ImportError: a bitsandbytes mismatched with torch fails its own import with AttributeError.
     HAS_BNB = False
     Params4bit = None
 

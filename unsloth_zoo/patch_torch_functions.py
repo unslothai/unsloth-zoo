@@ -20,7 +20,7 @@ __all__ = [
 ]
 
 import os
-from .temporary_patches.common import torch_compile, UNSLOTH_ENABLE_LOGGING
+from unsloth_zoo.temporary_patches.common import torch_compile, UNSLOTH_ENABLE_LOGGING
 from .log import logger
 from torch import Tensor
 import torch
@@ -34,10 +34,14 @@ from torch.nn.functional import (
     np,
 )
 from typing import Callable, List, Optional, Tuple, Union
+from torch.fx import _symbolic_trace
+
+_is_fx_symbolic_tracing = getattr(
+    _symbolic_trace, "is_fx_symbolic_tracing", _symbolic_trace.is_fx_tracing
+)
 
 
-@torch_compile
-def layer_norm(
+def _layer_norm_eager(
     input: Tensor,
     normalized_shape: List[int],
     weight: Optional[Tensor] = None,
@@ -58,9 +62,64 @@ def layer_norm(
             bias=bias,
             eps=eps,
         ).to(input.dtype)
+    # SigLIP norms keep float32 weights under bfloat16 activations and this body runs eagerly when
+    # Dynamo does not compile; CUDA rejects mixed dtypes, so normalise in the wider dtype.
+    if (
+        weight is not None and input.is_floating_point() and weight.is_floating_point()
+        and (bias is None or bias.is_floating_point())
+        and (weight.dtype != input.dtype or (bias is not None and bias.dtype != input.dtype))
+    ):
+        dtype = torch.promote_types(input.dtype, weight.dtype)
+        if bias is not None: dtype = torch.promote_types(dtype, bias.dtype)
+        return torch.layer_norm(
+            input.to(dtype),
+            normalized_shape,
+            weight.to(dtype),
+            bias.to(dtype) if bias is not None else None,
+            eps,
+            torch.backends.cudnn.enabled,
+        ).to(input.dtype)
     return torch.layer_norm(
         input, normalized_shape, weight, bias, eps, torch.backends.cudnn.enabled
     ).to(input.dtype)
+pass
+_layer_norm_compiled = torch_compile(_layer_norm_eager)
+
+try:
+    from torch._subclasses.fake_tensor import FakeTensor as _FakeTensor
+    _TRACING_MODE_KEYS = (torch._C._TorchDispatchModeKey.FAKE, torch._C._TorchDispatchModeKey.PROXY)
+except Exception:
+    _FakeTensor, _TRACING_MODE_KEYS = (), ()
+try:
+    from torch.compiler import is_dynamo_compiling as _is_dynamo_compiling
+except Exception:
+    def _is_dynamo_compiling(): return False
+
+
+def _in_fake_or_proxy_mode(input) -> bool:
+    # vLLM's init_process_group resets Dynamo rules; compiled callee aborts on fake tensors (symbolic numel).
+    if isinstance(input, _FakeTensor):
+        return True
+    # Dynamo inlining this cannot trace _get_dispatch_mode and would break the graph.
+    if _is_dynamo_compiling():
+        return False
+    for key in _TRACING_MODE_KEYS:
+        if torch._C._get_dispatch_mode(key) is not None:
+            return True
+    return False
+
+
+def layer_norm(
+    input: Tensor,
+    normalized_shape: List[int],
+    weight: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    eps: float = 1e-5,
+) -> Tensor:
+    # Dynamo raises when FX symbolic tracing (e.g. vLLM on Gemma 4 audio) enters a compiled fn.
+    if _is_fx_symbolic_tracing() or _in_fake_or_proxy_mode(input):
+        return _layer_norm_eager(input, normalized_shape, weight, bias, eps)
+    return _layer_norm_compiled(input, normalized_shape, weight, bias, eps)
 pass
 
 

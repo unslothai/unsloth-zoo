@@ -38,6 +38,8 @@ class _FakeModel:
     def update(self, new_params):
         self._params = new_params
 
+    named_modules = lambda self: []
+
 
 def _make_model(dtype_map):
     return _FakeModel({name: _FakeArray(dt) for name, dt in dtype_map.items()})
@@ -131,7 +133,6 @@ def test_gemma3_comma_does_not_match_gemma3n():
     assert _is_force_float32_arch("gemma3") is True
     assert _is_force_float32_arch("gemma3n") is True
     assert _is_force_float32_arch("gemma3text") is True
-    # An invented gemma3 variant not in the list returns False
     assert _is_force_float32_arch("gemma3_audio_only_pretend") is False
 
 

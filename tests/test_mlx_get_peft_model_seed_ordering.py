@@ -9,14 +9,19 @@ from __future__ import annotations
 
 import inspect
 import re
+import ast
+import textwrap
 
 import pytest
 
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_shim():
-    from mlx_simulation import simulate_mlx_on_torch
-    simulate_mlx_on_torch()
+    try:
+        import mlx  # noqa: F401
+    except ImportError:
+        from mlx_simulation import simulate_mlx_on_torch
+        simulate_mlx_on_torch()
 
 
 def _get_peft_model_source():
@@ -25,7 +30,7 @@ def _get_peft_model_source():
 
 
 def test_seed_immediately_precedes_each_linear_to_lora_layers_call():
-    """Every `linear_to_lora_layers(...)` in get_peft_model must be
+    """Every adapter-constructing call in get_peft_model must be
     preceded within ~20 lines by `_seed_mlx_random_state`.
 
     Empirically (probe 39 on Apple Silicon), a far-away seed lets lazy
@@ -36,8 +41,11 @@ def test_seed_immediately_precedes_each_linear_to_lora_layers_call():
     lines = src.splitlines()
 
     call_lines = [
-        i for i, line in enumerate(lines)
-        if "linear_to_lora_layers(" in line and not line.strip().startswith("#")
+        node.lineno - 1 for node in ast.walk(ast.parse(textwrap.dedent(src)))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "linear_to_lora_layers"
+        and not any(kw.arg == "dry_run" and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is True for kw in node.keywords)
     ]
     assert call_lines, "expected at least one linear_to_lora_layers call in get_peft_model"
 
@@ -69,7 +77,8 @@ def test_no_other_mlx_op_between_seed_and_linear_to_lora_layers():
     pattern = re.compile(
         r"_seed_mlx_random_state\(random_state\)\s*"
         r"(?:\n\s*#[^\n]*)*"
-        r"\s*\n\s*linear_to_lora_layers\(",
+        r"\s*\n\s*(?:[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*\s*=\s*)?"
+        r"linear_to_lora_layers\(",
     )
     matches = pattern.findall(src)
     assert len(matches) >= 2, (

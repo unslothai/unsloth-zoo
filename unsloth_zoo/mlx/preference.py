@@ -1,0 +1,3452 @@
+"""MLX preference tokenization, finite batching, and objectives."""
+
+import json
+import os
+import math
+import warnings
+from collections.abc import Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.utils
+import numpy as np
+
+# Absolute, like the other cce imports in this package: transformers' remote-code walk
+# turns `from .cce.runtime_cce import x` into unsloth_zoo/mlx/cce.runtime_cce.py and dies
+# on the missing file. See tests/test_relative_imports_resolve.py.
+from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap, _chunk_matmul, _resolve_chunk_size
+from .utils import (
+    _RAW_INPUT_IDS_FOR_LABELS,
+    _VLM_POSITION_GENERATING_MODEL_TYPES,
+    _VLM_RELOCATABLE_SIDECAR_KEYS,
+    _VLM_WIDTH_GENERATED_KEYS,
+    _FiniteVisitMixin,
+    _as_numpy_vlm_field,
+    _config_get,
+    _encode_mlx_prompt_completion,
+    _extract_vlm_images,
+    _finite_batch_schedule,
+    _finite_row_schedule,
+    _finite_text_pad_width,
+    _forward_text_hidden_states,
+    _get_mlx_dropout_probability,
+    _mlx_prompt_completion_boundary,
+    _get_processor_tokenizer,
+    _get_vlm_ignore_token_ids,
+    _image_truncation_token_ids,
+    _model_logits,
+    _normalize_mlx_messages,
+    _normalize_seed,
+    _prepare_vlm_batch_for_compile,
+    _preserved_preprocessing_rng,
+    _processor_vlm_inputs,
+    _render_vlm_messages,
+    _row_has_images,
+    _to_mx_vlm_batch,
+    _torch_randperm_order,
+    _vlm_audio_part_state,
+    _vlm_batch_family,
+    _vlm_family_divergence,
+    _vlm_forward_logits,
+    _vlm_hidden_states,
+    _vlm_pipeline_disposable_keys,
+    _vlm_token_aligned_sidecars,
+    _vlm_vision_part_state,
+    _vlm_width_survey,
+    collect_mlx_lora_adapter_tensors,
+    encode_mlx_text,
+    is_mlx_dora_module,
+    iter_mlx_lora_modules,
+)
+
+
+@dataclass(frozen=True)
+class TokenizedPreferenceRow:
+    """Branch-specific prompt boundaries and response continuations."""
+
+    chosen_prompt_ids: tuple
+    chosen_ids: tuple
+    rejected_prompt_ids: tuple
+    rejected_ids: tuple
+
+    @property
+    def chosen(self):
+        return self.chosen_prompt_ids + self.chosen_ids
+
+    @property
+    def rejected(self):
+        return self.rejected_prompt_ids + self.rejected_ids
+
+
+@dataclass(frozen=True)
+class VisionPreferenceRow(TokenizedPreferenceRow):
+    """A row encoded through a processor; its images belong to the prompt.
+
+    Each branch's arrays pair a processor field name with the values aligned to
+    that branch's kept prompt ids.
+    """
+
+    prompt_text: str = ""
+    images: tuple = ()
+    chosen_prompt_arrays: tuple = ()
+    rejected_prompt_arrays: tuple = ()
+
+
+TRUNCATION_MODES = ("keep_end", "keep_start")
+
+
+@dataclass(frozen=True)
+class PreferenceLengthPolicy:
+    """Resolved length budget for one preference objective.
+
+    ``kind`` picks the truncation algorithm; DPO's and ORPO's differ, and CPO
+    uses ORPO's.
+    """
+
+    kind: str
+    max_length: int
+    max_prompt_length: int | None
+    max_completion_length: int | None
+    truncation_mode: str
+    # The width every row must fit; max_length is the budget spent inside it.
+    max_seq_length: int
+
+
+def _token_budget(value, name):
+    if value is None:
+        return None
+    value = int(value)
+    if value <= 0:
+        raise ValueError(
+            f"Unsloth MLX preference: {name} must be a positive token count."
+        )
+    return value
+
+
+def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=None):
+    """Resolve the four length bounds the way the matching TRL trainer does.
+
+    max_seq_length has no TRL counterpart: it is the width a batch can hold, so
+    it caps max_length, and for ORPO and CPO it can pull max_prompt_length down
+    with it. KTO needs ``tokenizer``: its special tokens decide how far a row can
+    run past max_length.
+    """
+    truncation_mode = getattr(args, "truncation_mode", "keep_end")
+    if truncation_mode not in TRUNCATION_MODES:
+        raise ValueError(
+            f"Unsloth MLX preference: unknown truncation_mode "
+            f"{truncation_mode!r}; expected one of {list(TRUNCATION_MODES)}."
+        )
+    max_seq_length = int(max_seq_length)
+    max_length = _token_budget(getattr(args, "max_length", None), "max_length")
+    max_prompt_length = _token_budget(
+        getattr(args, "max_prompt_length", None), "max_prompt_length",
+    )
+    max_completion_length = _token_budget(
+        getattr(args, "max_completion_length", None), "max_completion_length",
+    )
+    name = kind.upper()
+    if kind != "dpo":
+        # They split the budget between prompt and answer, so neither may be open.
+        if max_length is None:
+            max_length = 512
+            warnings.warn(
+                f"Unsloth MLX {name}: max_length is not set; defaulting to 512.",
+                RuntimeWarning, stacklevel=2,
+            )
+        if max_prompt_length is None:
+            max_prompt_length = 128
+            warnings.warn(
+                f"Unsloth MLX {name}: max_prompt_length is not set; defaulting "
+                "to 128.",
+                RuntimeWarning, stacklevel=2,
+            )
+        if kind == "cpo" and not max_prompt_length < max_length:
+            raise ValueError(
+                f"Unsloth MLX CPO: max_prompt_length ({max_prompt_length}) must "
+                f"be strictly less than max_length ({max_length})."
+            )
+        if max_completion_length is not None:
+            overrun = "branch whose capped prompt plus the longer answer" \
+                if kind != "kto" else "row whose capped prompt plus answer"
+            warnings.warn(
+                f"Unsloth MLX {name}: max_completion_length only applies to "
+                f"encoder-decoder models and is ignored here. A {overrun} still "
+                "overruns max_length has its answer sliced to max_length minus "
+                "max_prompt_length instead, which trims the answer's tail when "
+                "max_prompt_length stands above max_length.",
+                RuntimeWarning, stacklevel=2,
+            )
+            max_completion_length = None
+    carry = 0
+    if kind == "kto":
+        if tokenizer is None:
+            raise ValueError(
+                "Unsloth MLX KTO: resolving the length budget needs the tokenizer."
+            )
+        carry = _kto_carry(tokenizer, getattr(args, "append_eos", True))
+    limit = max_seq_length - carry
+    if max_length is None:
+        max_length = limit
+    elif max_length > limit:
+        warnings.warn(
+            f"Unsloth MLX preference: max_length={max_length} exceeds "
+            f"max_seq_length={max_seq_length}, which bounds the batched "
+            "sequences; using max_seq_length."
+            if not carry else
+            f"Unsloth MLX KTO: max_length={max_length} leaves no room inside "
+            f"max_seq_length={max_seq_length}, which bounds the batched "
+            f"sequences, for the {carry} special token(s) this tokenizer can "
+            f"add to a row past max_length; using {limit}.",
+            RuntimeWarning, stacklevel=2,
+        )
+        before_clamp = max_length
+        max_length = limit
+        if kind != "dpo" and before_clamp > max_prompt_length >= max_length:
+            # The answer gets max_length minus max_prompt_length, so clamping to the
+            # prompt bound leaves none. A bound the caller set themselves stands.
+            max_prompt_length = max(1, max_length // 2)
+            warnings.warn(
+                f"Unsloth MLX {name}: max_prompt_length no longer leaves room for "
+                f"an answer inside max_length={max_length}; using "
+                f"{max_prompt_length}.",
+                RuntimeWarning, stacklevel=2,
+            )
+    # A config predating max_length carries the default, not a choice, so the same
+    # call now trains on less. No marker means duck-typed, so take the value as meant.
+    max_length_explicit = getattr(args, "_unsloth_mlx_max_length_explicit", True)
+    # CPO and KTO are newer than max_length, so no earlier run had a wider budget.
+    if max_seq_length > max_length and not max_length_explicit \
+            and kind not in ("cpo", "kto"):
+        # DPO reads an open prompt bound as no cap; ORPO already made it 128 above.
+        restore = (
+            "Pass max_length=max_seq_length, max_prompt_length=None"
+            if kind == "dpo" else
+            "Pass max_length=max_seq_length together with the max_prompt_length "
+            "you want reserved, since leaving it open resolves to 128"
+        )
+        warnings.warn(
+            f"Unsloth MLX preference: max_length defaults to {max_length}, below "
+            f"max_seq_length={max_seq_length}, so rows are budgeted more tightly "
+            f"than they were before this option existed. {restore} to widen the "
+            "budget back.",
+            RuntimeWarning, stacklevel=2,
+        )
+    # DPO's prompt bound is a cap, not reserved room, so it may exceed max_length.
+    return PreferenceLengthPolicy(
+        kind, max_length, max_prompt_length, max_completion_length,
+        truncation_mode, max_seq_length,
+    )
+
+
+def _kto_carry(tokenizer, append_eos):
+    """How far TRL's KTO rows can run past max_length."""
+    # TRL reserves no slot for a leading BOS / trailing EOS but re-adds them after
+    # the cut; without bos_token_id the prompt's BOS slot absorbs the EOS.
+    if getattr(tokenizer, "bos_token_id", None) is None:
+        return 0
+    return 1 + (append_eos and getattr(tokenizer, "eos_token_id", None) is not None)
+
+
+def _truncate_dpo_branch(prompt_ids, response_ids, policy):
+    """Cap the prompt's end and the response's start, then the concatenation.
+
+    DPOTrainer truncates in the forward pass over a prompt-left-, completion-
+    right-padded batch, so each row is contiguous and its batched slice is this one.
+    """
+    if policy.max_prompt_length is not None:
+        prompt_ids = prompt_ids[-policy.max_prompt_length:]
+    if policy.max_completion_length is not None:
+        response_ids = response_ids[:policy.max_completion_length]
+    overflow = len(prompt_ids) + len(response_ids) - policy.max_length
+    if overflow > 0:
+        if policy.truncation_mode == "keep_start":
+            prompt_ids = prompt_ids[:policy.max_length]
+            response_ids = response_ids[:policy.max_length - len(prompt_ids)]
+        else:
+            dropped = min(overflow, len(prompt_ids))
+            prompt_ids = prompt_ids[dropped:]
+            response_ids = response_ids[overflow - dropped:]
+    return prompt_ids, response_ids
+
+
+def _truncate_orpo(
+    chosen_prompt, chosen_ids, rejected_prompt, rejected_ids, policy,
+):
+    """Cap both prompts against the longer response, then cut each answer's tail.
+
+    Mirrors ORPOTrainer, whose answer cut spends the whole prompt budget rather
+    than the prompt's real length.
+    """
+    longer = max(len(chosen_ids), len(rejected_ids))
+    keep = policy.max_prompt_length
+
+    def fits(prompt_ids):
+        return len(prompt_ids) + longer <= policy.max_length
+
+    if keep is None and not (fits(chosen_prompt) and fits(rejected_prompt)):
+        # Only an overflowing row reads the bound; name it rather than negate a None.
+        raise ValueError(
+            f"Unsloth MLX {policy.kind.upper()}: this row overruns max_length="
+            f"{policy.max_length}, and max_prompt_length is the room reserved "
+            "for the prompt inside it, so it cannot be left open here."
+        )
+
+    def cap_prompt(prompt_ids):
+        if fits(prompt_ids):
+            return prompt_ids
+        if policy.truncation_mode == "keep_start":
+            return prompt_ids[:keep]
+        return prompt_ids[-keep:]
+
+    def cap_response(prompt_ids, response_ids):
+        if fits(prompt_ids):
+            return response_ids
+        return response_ids[:policy.max_length - keep]
+
+    chosen_prompt = cap_prompt(chosen_prompt)
+    rejected_prompt = cap_prompt(rejected_prompt)
+    return (
+        chosen_prompt, cap_response(chosen_prompt, chosen_ids),
+        rejected_prompt, cap_response(rejected_prompt, rejected_ids),
+    )
+
+
+def _is_messages(value):
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(
+            isinstance(message, Mapping)
+            and "role" in message
+            and "content" in message
+            for message in value
+        )
+    )
+
+
+def _extract_prompt(chosen, rejected):
+    """Recover the prompt as the common prefix of the two completions.
+
+    Mirrors TRL's extract_prompt, including its stop one element short when the
+    completions never diverge, so a row splits alike on either backend.
+    """
+    limit = min(len(chosen), len(rejected))
+    if not limit:
+        raise ValueError(
+            "Unsloth MLX preference: chosen and rejected must be non-empty to "
+            "recover a prompt from them."
+        )
+    for index in range(limit):
+        if chosen[index] != rejected[index]:
+            # TRL strips a space via chosen[index - 1], which at index 0 wraps to
+            # chosen's LAST character and invents a prompt. Deliberate divergence.
+            if index > 0 and chosen[index - 1] == " ":
+                index -= 1
+            break
+    return chosen[:index], chosen[index:], rejected[index:]
+
+
+def _maybe_extract_prompt(row):
+    """Fill in a prompt the row leaves implicit in its two completions.
+
+    Also reports whether it was recovered: only an explicit assistant-ended
+    prompt may be a partial turn its completions continue.
+    """
+    missing = {"chosen", "rejected"} - set(row)
+    if missing:
+        raise ValueError(
+            "Unsloth MLX preference: every row requires chosen and rejected "
+            f"fields; missing {sorted(missing)!r}."
+        )
+    if "prompt" in row and _is_messages(row["prompt"]) == _is_messages(row["chosen"]):
+        return row, False
+    prompt, chosen, rejected = _extract_prompt(row["chosen"], row["rejected"])
+    return {**row, "prompt": prompt, "chosen": chosen, "rejected": rejected}, True
+
+
+def _chat_template(tokenizer, messages, *, tools, kwargs, is_vlm=False, **mode):
+    options = dict(kwargs or {})
+    if tools is not None:
+        options["tools"] = tools
+    if is_vlm:
+        return _render_vlm_messages(tokenizer, messages, **mode, **options)
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, **mode, **options,
+    )
+
+
+def _continues_assistant(*completions):
+    return all(
+        completion and completion[0].get("role") == "assistant"
+        for completion in completions
+    )
+
+
+def _content_parts(content):
+    if isinstance(content, list):
+        return list(content)
+    return [{"type": "text", "text": str(content)}] if content else []
+
+
+def _append_to_assistant(prompt, completion):
+    merged = [dict(message) for message in prompt]
+    head = merged[-1].get("content", "")
+    tail = completion[0].get("content", "")
+    if isinstance(head, list) or isinstance(tail, list):
+        merged[-1]["content"] = _content_parts(head) + _content_parts(tail)
+    else:
+        merged[-1]["content"] = str(head) + str(tail)
+    merged.extend(dict(message) for message in completion[1:])
+    return merged
+
+
+def _render_completions(tokenizer, row, names, *, extracted=False, is_vlm=False):
+    """Render the prompt and, per completion field in ``names``, the prompt
+    followed by that completion."""
+    prompt = row["prompt"]
+    completions = [row[name] for name in names]
+    fields = ("prompt", *names)
+    fields = (
+        " and ".join(fields) if len(fields) == 2
+        else f"{', '.join(fields[:-1])}, and {fields[-1]}"
+    )
+    # An empty prompt carries no kind of its own, so it follows the completions.
+    kinds = [_is_messages(completion) for completion in completions]
+    if prompt:
+        kinds.append(_is_messages(prompt))
+    if any(kinds) and not all(kinds):
+        raise ValueError(
+            f"Unsloth MLX preference: {fields} must all be strings or all be "
+            "message lists."
+        )
+    if not any(kinds):
+        if not all(isinstance(value, str) for value in (prompt, *completions)):
+            raise ValueError(
+                f"Unsloth MLX preference: {fields} must be strings."
+            )
+        return prompt, [prompt + completion for completion in completions]
+
+    completions = [
+        _normalize_mlx_messages(completion, is_vlm=is_vlm)
+        for completion in completions
+    ]
+
+    def render(messages, **mode):
+        return _chat_template(
+            tokenizer, messages, tools=row.get("tools"),
+            kwargs=row.get("chat_template_kwargs"), is_vlm=is_vlm, **mode,
+        )
+
+    if not prompt:
+        return "", [
+            render(completion, add_generation_prompt=False)
+            for completion in completions
+        ]
+    prompt = _normalize_mlx_messages(prompt, is_vlm=is_vlm)
+    role = prompt[-1].get("role")
+    if role == "assistant":
+        prompt_text = render(prompt, continue_final_message=True)
+        if not extracted and _continues_assistant(*completions):
+            # The completions finish this partial turn, so they join its message.
+            conversations = [
+                _append_to_assistant(prompt, completion)
+                for completion in completions
+            ]
+        else:
+            # A whole turn instead, so its closing marker falls to the response.
+            conversations = [prompt + completion for completion in completions]
+    elif role == "user":
+        prompt_text = render(prompt, add_generation_prompt=True)
+        conversations = [prompt + completion for completion in completions]
+    else:
+        raise ValueError(
+            "Unsloth MLX preference: a conversational prompt must end with a "
+            "user or assistant message."
+        )
+    return prompt_text, [
+        render(messages, add_generation_prompt=False) for messages in conversations
+    ]
+
+
+def _render_preference_row(tokenizer, row, *, extracted=False, is_vlm=False):
+    prompt_text, (chosen_text, rejected_text) = _render_completions(
+        tokenizer, row, ("chosen", "rejected"), extracted=extracted, is_vlm=is_vlm,
+    )
+    return prompt_text, chosen_text, rejected_text
+
+
+def _shared_prefix(prompt_text, *full_texts):
+    """Clip the rendered prompt to what every full rendering still agrees with."""
+    shared = len(prompt_text)
+    for text in full_texts:
+        matched = 0
+        for left, right in zip(prompt_text[:shared], text):
+            if left != right:
+                break
+            matched += 1
+        shared = matched
+    return prompt_text[:shared]
+
+
+def _emitted_bos_id(tokenizer):
+    """The BOS this tokenizer's add_special_tokens policy actually emits.
+
+    Not ``bos_token_id``: Phi-4-mini declares one it never emits, and forcing that
+    in gives DPO a leading token MLX's SFT and ORPO, and TRL's DPOTrainer, omit.
+    """
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is None:
+        return None
+    try:
+        probe = [int(x) for x in encode_mlx_text(tokenizer, "x")]
+    except Exception:
+        return None
+    return int(bos_id) if probe[:1] == [int(bos_id)] else None
+
+
+def _encode_dpo_branches(
+    tokenizer, prompt_text, chosen_text, rejected_text, *, append_eos,
+    encode_prompt=None,
+):
+    """Tokenize the prompt and each completion apart, as TRL's DPOTrainer does.
+
+    ORPO tokenizes the pair together and folds a merged boundary token back into
+    the completion; DPO never sees the pair, so a mid-token prompt splits there.
+    ``encode_prompt`` encodes the prompt in place of ``tokenizer``, returning its
+    ids and a dict of arrays aligned with them; the returned arrays follow any BOS
+    added here.
+    """
+    prompt_text = _shared_prefix(prompt_text, chosen_text, rejected_text)
+    if encode_prompt is None:
+        # No special tokens: a closing EOS would land between prompt and completion.
+        prompt_ids = [int(x) for x in encode_mlx_text(
+            tokenizer, prompt_text, add_special_tokens=False,
+        )]
+        arrays = {}
+    else:
+        prompt_ids, arrays = encode_prompt(prompt_text)
+    bos_id = _emitted_bos_id(tokenizer)
+    if bos_id is not None and (not prompt_ids or prompt_ids[0] != bos_id):
+        prompt_ids.insert(0, bos_id)
+        arrays = {name: [0, *values] for name, values in arrays.items()}
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+
+    def response(text):
+        ids = [int(x) for x in encode_mlx_text(
+            tokenizer, text[len(prompt_text):], add_special_tokens=False,
+        )]
+        if append_eos and eos_id is not None and (
+            not ids or ids[-1] != int(eos_id)
+        ):
+            ids.append(int(eos_id))
+        return ids
+
+    return prompt_ids, response(chosen_text), response(rejected_text), arrays
+
+
+def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids, kind):
+    """Refuse an ORPO or CPO row whose two prompt encodings disagree beyond a merge.
+
+    ORPOTrainer.tokenize_row lets only the last prompt token move, since a
+    tokenizer may merge it with the answer's first. Comparing over the overlap and
+    bounding the gap accepts the same rows without relying on zip's strict=.
+    """
+    overlap = min(len(chosen_prompt_ids), len(rejected_prompt_ids))
+    different = sum(
+        int(a != b) for a, b in zip(
+            chosen_prompt_ids[:overlap], rejected_prompt_ids[:overlap],
+        )
+    )
+    length_gap = abs(len(chosen_prompt_ids) - len(rejected_prompt_ids))
+    if different > 1 or length_gap > 1:
+        raise ValueError(
+            f"Unsloth MLX {kind.upper()}: the chosen and rejected branches "
+            "tokenized the same prompt differently in "
+            f"{different} position(s) with a length gap of {length_gap}, and "
+            "only the last prompt token may move that way through a tokenizer "
+            "merge. Training the row would compare two responses written "
+            "against different contexts."
+        )
+
+
+def _require_preference_fields(row):
+    if not isinstance(row, Mapping):
+        raise ValueError("Unsloth MLX preference: each dataset row must be a mapping.")
+    # prompt is optional: TRL's DPO, ORPO and CPO all maybe_extract_prompt first, so a
+    # row naming only its completions recovers a prompt instead of being refused.
+    missing = {"chosen", "rejected"} - set(row)
+    if missing:
+        raise ValueError(
+            "Unsloth MLX preference: every row requires chosen and rejected "
+            f"fields; missing {sorted(missing)!r}."
+        )
+
+
+def prepare_preference_row(tokenizer, row, *, is_vlm=False):
+    """Validate, recover an implicit prompt, and render, in that order.
+
+    ``is_vlm`` renders through a processor, keeping image parts in the messages.
+    """
+    _require_preference_fields(row)
+    row, extracted = _maybe_extract_prompt(row)
+    return _render_preference_row(
+        tokenizer, row, extracted=extracted, is_vlm=is_vlm,
+    )
+
+
+def tokenize_preference_row(
+    tokenizer, row, *, length_policy, append_eos=True, rendered=None,
+):
+    """Tokenize one row and preserve a shared prompt boundary.
+
+    ``rendered`` reuses a ``prepare_preference_row`` result the caller already has:
+    a chat template may carry state, so two renderings need not agree.
+    """
+    prompt_text, chosen_text, rejected_text = (
+        prepare_preference_row(tokenizer, row) if rendered is None else rendered
+    )
+    if length_policy.kind == "dpo":
+        chosen_prompt, chosen_response, rejected_response, _ = _encode_dpo_branches(
+            tokenizer, prompt_text, chosen_text, rejected_text,
+            append_eos=append_eos,
+        )
+        rejected_prompt = list(chosen_prompt)
+    else:
+        # A recovered prompt lands mid-token often, so step back one token and ask
+        # no more, as build_tokenized_answer does.
+        chosen = _encode_mlx_prompt_completion(
+            tokenizer, prompt_text, chosen_text, append_eos=append_eos,
+            step_back=True,
+        )
+        rejected = _encode_mlx_prompt_completion(
+            tokenizer, prompt_text, rejected_text, append_eos=append_eos,
+            step_back=True,
+        )
+        boundaries = [chosen.prompt_length, rejected.prompt_length]
+        if not all(
+            text.startswith(prompt_text) for text in (chosen_text, rejected_text)
+        ):
+            # Both mask one prompt, so neither keeps more than both prove shared.
+            boundaries = [min(boundaries)] * 2
+        chosen_prompt = list(chosen.input_ids[:boundaries[0]])
+        rejected_prompt = list(rejected.input_ids[:boundaries[1]])
+        chosen_response = list(chosen.input_ids[boundaries[0]:])
+        rejected_response = list(rejected.input_ids[boundaries[1]:])
+        # Without this two different prefixes reach the loss as one context. On the
+        # resolved boundaries: judging before the clip refuses rows that agree.
+        _reject_diverging_orpo_prompts(
+            chosen_prompt, rejected_prompt, length_policy.kind,
+        )
+    return TokenizedPreferenceRow(*(tuple(ids) for ids in _truncate_preference_row(
+        chosen_prompt, chosen_response, rejected_prompt, rejected_response,
+        length_policy,
+    )))
+
+
+def _truncate_preference_row(
+    chosen_prompt, chosen_response, rejected_prompt, rejected_response,
+    length_policy,
+):
+    """Apply the objective's length budget to encoded branches, refusing a row
+    it leaves untrainable."""
+    if not chosen_response or not rejected_response:
+        raise ValueError(
+            "Unsloth MLX preference: chosen and rejected must each contain at "
+            "least one response token."
+        )
+    if length_policy.kind != "dpo":
+        (
+            chosen_prompt, chosen_response, rejected_prompt, rejected_response,
+        ) = _truncate_orpo(
+            chosen_prompt, chosen_response, rejected_prompt, rejected_response,
+            length_policy,
+        )
+    else:
+        chosen_prompt, chosen_response = _truncate_dpo_branch(
+            chosen_prompt, chosen_response, length_policy,
+        )
+        rejected_prompt, rejected_response = _truncate_dpo_branch(
+            rejected_prompt, rejected_response, length_policy,
+        )
+    # A response token needs something before it. ORPO and CPO score each branch, so one
+    # bad branch voids the row; DPO sums and it cancels against the reference.
+    unscoreable = [
+        len(prompt) + len(response) < 2 or not response
+        for prompt, response in (
+            (chosen_prompt, chosen_response),
+            (rejected_prompt, rejected_response),
+        )
+    ]
+    if all(unscoreable) if length_policy.kind == "dpo" else any(unscoreable):
+        raise ValueError(
+            "Unsloth MLX preference: this row leaves a branch without one "
+            "response token that has anything before it to predict from, and "
+            f"{length_policy.kind} scores that branch on its own. Raise "
+            "max_length or lower max_prompt_length if the length budget cut it "
+            "down; otherwise the row itself is too short to train on."
+        )
+    # A prompt bound above max_length turns ORPO's answer cut into a tail cut that
+    # can outrun the width, silently masking the response out of the loss.
+    kept = max(
+        len(chosen_prompt) + len(chosen_response),
+        len(rejected_prompt) + len(rejected_response),
+    )
+    if kept > length_policy.max_seq_length:
+        raise ValueError(
+            f"Unsloth MLX preference: this row keeps {kept} tokens, more than "
+            f"the {length_policy.max_seq_length} a batch can hold, because "
+            f"max_prompt_length={length_policy.max_prompt_length} is not below "
+            f"max_length={length_policy.max_length}. Lower max_prompt_length."
+        )
+    return chosen_prompt, chosen_response, rejected_prompt, rejected_response
+
+
+def encode_generation_prompt(tokenizer, row, *, max_seq_length, max_new_tokens):
+    """Encode one row's prompt for generation, reserving room for the sample.
+
+    ``max_new_tokens`` comes out of ``max_seq_length`` and the prompt keeps its
+    end. Not ``tokenize_preference_row``'s prompt: that boundary hands a merged
+    prompt/completion token to the response span, and generation has no
+    completion to merge with. Not the generation engine's own encoder either,
+    which omits the special tokens training adds.
+    """
+    # Recover here too, so a row with no prompt column samples what it trains on.
+    prompt_text, _, _ = prepare_preference_row(tokenizer, row)
+    return encode_generation_prompt_text(
+        tokenizer, prompt_text,
+        max_seq_length=max_seq_length, max_new_tokens=max_new_tokens,
+    )
+
+
+def encode_generation_prompt_text(
+    tokenizer, prompt_text, *, max_seq_length, max_new_tokens,
+):
+    """Encode an already-rendered prompt, reserving room for the sample."""
+    budget = int(max_seq_length) - int(max_new_tokens)
+    if budget < 1:
+        raise ValueError(
+            "Unsloth MLX preference: max_new_tokens must leave at least one "
+            "prompt token within max_seq_length."
+        )
+    prompt_ids = [int(token) for token in encode_mlx_text(tokenizer, prompt_text)]
+    if not prompt_ids:
+        raise ValueError(
+            "Unsloth MLX preference: a row rendered an empty prompt."
+        )
+    return prompt_text, tuple(prompt_ids[-budget:])
+
+
+def _media_in(messages, what):
+    messages = _normalize_mlx_messages(messages, is_vlm=True) if _is_messages(messages) else []
+    bare, payload = (
+        _vlm_audio_part_state(messages) if what == "audio"
+        else _vlm_vision_part_state(messages)
+    )
+    return bool(bare or payload)
+
+
+_VIDEO_KEYS = ("video", "videos", "video_url", "input_video", "pixel_values_videos")
+_IMAGE_KEYS = ("image", "images", "image_url", "input_image", "pixel_values")
+
+
+def _vision_prompt_images(row, image_size):
+    """The prompt's images, refusing media the CUDA path would not condition on."""
+    filled = lambda item, *keys: any(
+        item.get(key) is not None and (not isinstance(item[key], list) or item[key])
+        for key in keys
+    )
+    if (
+        filled(row, "audio", "audios")
+        or any(_media_in(row[key], "audio") for key in ("prompt", "chosen", "rejected"))
+    ):
+        raise ValueError(
+            "Unsloth MLX preference: audio rows are not supported for preference "
+            "training."
+        )
+    if filled(row, *_VIDEO_KEYS) or any(
+        isinstance(part, dict)
+        and (part.get("type") in _VIDEO_KEYS or filled(part, *_VIDEO_KEYS))
+        for key in ("prompt", "chosen", "rejected") if _is_messages(row[key])
+        for message in _normalize_mlx_messages(row[key], is_vlm=True)
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+    ):
+        raise ValueError(
+            "Unsloth MLX preference: video rows are not supported for preference "
+            "training."
+        )
+    if any(_media_in(row[key], "image") for key in ("chosen", "rejected")):
+        raise ValueError(
+            "Unsloth MLX preference: images belong to the prompt. TRL tokenizes "
+            "chosen and rejected as plain text, so an image in a completion "
+            "would never reach the model."
+        )
+    prompt = row["prompt"]
+    messages = (
+        _normalize_mlx_messages(prompt, is_vlm=True) if _is_messages(prompt) else []
+    )
+    images = tuple(_extract_vlm_images(row, messages, image_size))
+    if not images and (
+        filled(row, *_IMAGE_KEYS)
+        or _row_has_images([row[key] for key in ("prompt", "chosen", "rejected")])
+    ):
+        raise ValueError(
+            "Unsloth MLX preference: this row carries an image its prompt does not "
+            "place, so it would train as text. Pass images under `images` with an "
+            "image part in the prompt."
+        )
+    return images
+
+
+def tokenize_vision_preference_row(
+    processor, row, *, length_policy, append_eos=True, image_size=None,
+    media_token_ids=(), rendered=None,
+):
+    """Tokenize one row for a vision-language model, as unsloth's CUDA DPO does.
+
+    The processor renders every row and encodes an image row's prompt with its
+    images; completions, and every text-only row, tokenize through its inner
+    tokenizer exactly as on a text model. ``media_token_ids`` are the tokens a
+    truncation may not cut from an image row's prompt.
+    """
+    tokenizer = _get_processor_tokenizer(processor)
+    _require_preference_fields(row)
+    row, extracted = _maybe_extract_prompt(row)
+    images = _vision_prompt_images(row, image_size)
+    if rendered is None:
+        rendered = _render_preference_row(
+            processor, row, extracted=extracted, is_vlm=True,
+        )
+    prompt_text = _shared_prefix(*rendered)
+    if not images:
+        encoded = tokenize_preference_row(
+            tokenizer, row, length_policy=length_policy, append_eos=append_eos,
+            rendered=rendered,
+        )
+        return VisionPreferenceRow(
+            encoded.chosen_prompt_ids, encoded.chosen_ids,
+            encoded.rejected_prompt_ids, encoded.rejected_ids,
+            prompt_text=prompt_text,
+        )
+    if length_policy.kind != "dpo":
+        raise ValueError(
+            "Unsloth MLX ORPO: rows with images are not supported. TRL's "
+            "ORPOTrainer has no vision path; train text-only rows, or use DPO."
+        )
+
+    def encode_prompt(text):
+        inputs = _processor_vlm_inputs(
+            processor, [text], [list(images)], None,
+            truncation=False, padding_side="right",
+        )
+        ids = _as_numpy_vlm_field(inputs, "input_ids")
+        arrays = _vlm_token_aligned_sidecars(inputs, ids.shape)
+        return (
+            [int(token) for token in ids[0]],
+            {name: [int(value) for value in values[0]] for name, values in arrays.items()},
+        )
+
+    prompt_ids, chosen, rejected, arrays = _encode_dpo_branches(
+        tokenizer, *rendered, append_eos=append_eos, encode_prompt=encode_prompt,
+    )
+    truncated = _truncate_preference_row(
+        list(prompt_ids), chosen, list(prompt_ids), rejected, length_policy,
+    )
+    kept_arrays = []
+    for response in (chosen, rejected):
+        kept, _ = _truncate_dpo_branch(range(len(prompt_ids)), response, length_policy)
+        if any(
+            # Negative ids are image placeholders (Phi-3 Vision).
+            token in media_token_ids or token < 0
+            for position, token in enumerate(prompt_ids) if position not in kept
+        ):
+            # A cut image run leaves features without positions; CUDA fails in the forward.
+            raise ValueError(
+                "Unsloth MLX DPO: the length budget cuts into this row's image "
+                "tokens. Raise max_length, max_prompt_length and max_seq_length, "
+                "or pass a smaller image_size."
+            )
+        kept_arrays.append(tuple(
+            (name, tuple(values[position] for position in kept))
+            for name, values in arrays.items()
+        ))
+    return VisionPreferenceRow(
+        *(tuple(ids) for ids in truncated),
+        prompt_text=prompt_text, images=images,
+        chosen_prompt_arrays=kept_arrays[0], rejected_prompt_arrays=kept_arrays[1],
+    )
+
+
+def _repeated_for_both_branches(value):
+    """Chosen rows then rejected rows share the images, as TRL concatenates them."""
+    if isinstance(value, mx.array):
+        return mx.concatenate([value, value]) if value.ndim else value
+    if hasattr(value, "shape"):
+        value = np.asarray(value)
+        return np.concatenate([value, value]) if value.ndim else value
+    if isinstance(value, (list, tuple)):
+        return [*value, *value]
+    return value
+
+
+# Spans into the prompt as the processor laid it out, which BOS insertion,
+# truncation and padding all move.
+_VLM_TOKEN_SPAN_KEYS = ("image_bound", "audio_bounds")
+
+# Their pixels are a [crops, whole images] pair, each batched along its own axis.
+_PIXEL_COMPONENT_MODEL_TYPES = ("deepseekocr", "deepseekocr_2")
+
+
+def _vision_batch(processor, model_config, rows, ids, lengths):
+    """A vision batch dict for packed rows: chosen rows first, then rejected."""
+    pairs = len(rows)
+    width = ids.shape[1]
+    inputs = {
+        "input_ids": ids,
+        "attention_mask": (np.arange(width)[None, :] < lengths[:, 1:]).astype(np.int32),
+    }
+    for offset, row in enumerate(rows):
+        for output_row, arrays in (
+            (offset, row.chosen_prompt_arrays),
+            (offset + pairs, row.rejected_prompt_arrays),
+        ):
+            for name, values in arrays:
+                if name not in inputs:
+                    inputs[name] = np.zeros(ids.shape, dtype=np.int32)
+                values = values[:width]
+                inputs[name][output_row, :len(values)] = values
+    if any(row.images for row in rows):
+        outputs = _processor_vlm_inputs(
+            processor, [row.prompt_text for row in rows],
+            [list(row.images) for row in rows], None,
+            truncation=False, padding_side="right",
+        )
+        text_shape = _as_numpy_vlm_field(outputs, "input_ids").shape
+        model_type = _config_get(model_config, "model_type")
+        rebuilt = (
+            _VLM_WIDTH_GENERATED_KEYS
+            if model_type in _VLM_POSITION_GENERATING_MODEL_TYPES
+            else ()
+        )
+        for key, value in outputs.items():
+            if (
+                key in ("input_ids", "attention_mask", "labels")
+                or key in _VLM_RELOCATABLE_SIDECAR_KEYS or key in rebuilt
+                or key.startswith("_unsloth_")
+            ):
+                continue
+            shape = getattr(value, "shape", None)
+            if key in _VLM_TOKEN_SPAN_KEYS or (
+                shape is not None and len(shape) >= 2
+                and tuple(shape[:2]) == tuple(text_shape)
+            ):
+                raise NotImplementedError(
+                    f"Unsloth MLX preference: {type(processor).__name__} returns "
+                    f"{key!r} aligned with the prompt as it laid it out, which "
+                    "preference batching re-lays. This model is not supported "
+                    "for preference training on image rows."
+                )
+            if (
+                key in ("images", "pixel_values") and isinstance(value, (list, tuple))
+                and model_type in _PIXEL_COMPONENT_MODEL_TYPES
+            ):
+                inputs[key] = [_repeated_for_both_branches(part) for part in value]
+            else:
+                inputs[key] = _repeated_for_both_branches(value)
+    batch = _to_mx_vlm_batch(inputs)
+    batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+    batch = _prepare_vlm_batch_for_compile(batch, model_config)
+    if tuple(batch["input_ids"].shape) != tuple(ids.shape):
+        raise NotImplementedError(
+            "Unsloth MLX preference: this model expands its image tokens after "
+            "the processor, which moves the response spans. It is not supported "
+            "for preference training on image rows."
+        )
+    return batch
+
+
+class FinitePreferenceBatchPlan(_FiniteVisitMixin):
+    """CPU-backed preference schedule with lazy MLX materialization."""
+
+    __slots__ = (
+        "_rows", "_schedule", "_normalizers", "_widths", "_cycle_length",
+        "max_seq_length", "pad_id", "_shape_plan", "_visit_policy",
+        "_visit_seed", "_visit_epoch_cache", "_cce_capacities", "_cce_kind",
+        "_reference",
+    )
+
+    def __init__(
+        self, rows, schedule, *, normalizers, cycle_length, max_seq_length, pad_id,
+    ):
+        self._rows = tuple(rows)
+        self._schedule = tuple(tuple(batch) for batch in schedule)
+        self._normalizers = tuple(tuple(values) for values in normalizers)
+        self._cycle_length = int(cycle_length)
+        self.max_seq_length = int(max_seq_length)
+        self.pad_id = int(pad_id)
+        self._shape_plan = None
+        self._cce_capacities = {}
+        self._cce_kind = "dpo"
+        self._visit_policy = "identity"
+        self._visit_seed = None
+        self._visit_epoch_cache = None
+        self._reference = None
+        self._widths = tuple(self._raw_width(batch) for batch in self._schedule)
+
+    @property
+    def rows(self):
+        return self._rows
+
+    @property
+    def schedule(self):
+        return self._schedule
+
+    @property
+    def widths(self):
+        return self._widths
+
+    @property
+    def cycle_length(self):
+        return self._cycle_length
+
+    @property
+    def reference_logps(self):
+        return self._reference
+
+    def set_reference_logps(self, table):
+        """Install ``(rows, 2)`` reference log probabilities, one column per
+        branch: chosen then rejected, or a KTO completion then its KL pair."""
+        table = np.asarray(table, dtype=np.float32)
+        if table.shape != (len(self._rows), 2):
+            raise ValueError(
+                "Unsloth MLX preference: the reference table must hold one pair "
+                "per row."
+            )
+        self._reference = table
+
+    def __len__(self):
+        return len(self._schedule)
+
+    def _branches(self, row):
+        return (
+            (row.chosen, len(row.chosen_prompt_ids)),
+            (row.rejected, len(row.rejected_prompt_ids)),
+        )
+
+    def _pack_width(self, rows):
+        raw = max(
+            len(values) for row in rows for values, _ in self._branches(row)
+        )
+        return _finite_text_pad_width(
+            raw, pad_to_multiple=32, minimum_width=2,
+            max_seq_length=self.max_seq_length,
+        )
+
+    def pack(self, rows, width=None):
+        """``rows`` as one padded batch, every row's first branch before any
+        second, with each sequence's ``(prompt length, end)``."""
+        if width is None:
+            width = self._pack_width(rows)
+        branches = [self._branches(row) for row in rows]
+        count = len(branches[0]) * len(rows)
+        batch = np.full((count, width), self.pad_id, dtype=np.int32)
+        lengths = np.zeros((count, 2), dtype=np.int32)
+        for offset, row_branches in enumerate(branches):
+            for branch, (values, prompt_length) in enumerate(row_branches):
+                output_row = offset + branch * len(rows)
+                size = min(len(values), width)
+                batch[output_row, :size] = values[:size]
+                lengths[output_row] = (prompt_length, size)
+        return batch, lengths
+
+    def _raw_width(self, batch):
+        return self._pack_width([self._rows[index] for index in batch])
+
+    def batch_width(self, index):
+        return self._widths[index]
+
+    def batch_family(self, index):
+        pairs = len(self._schedule[index])
+        return (
+            "preference_tuple_3",
+            ((2 * pairs, "sequence"), "int32"),
+            ((2 * pairs, 2), "int32"),
+            ((3,), "int32"),
+        )
+
+    def set_shape_plan(self, shape_plan):
+        if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
+            raise ValueError("only exact or bucket shape plans can be installed")
+        self._shape_plan = shape_plan
+
+    def configure_cce_compaction(self, enabled=True, *, kind="dpo"):
+        self._cce_capacities = {}
+        self._cce_kind = kind
+        if not enabled:
+            return
+        counts = {}
+        for index, row_indices in enumerate(self._schedule):
+            family = self.batch_family(index)
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                count = 0
+                for row_index in row_indices:
+                    row = self._rows[row_index]
+                    for branch, (values, prompt) in enumerate((
+                        (row.chosen, len(row.chosen_prompt_ids)),
+                        (row.rejected, len(row.rejected_prompt_ids)),
+                    )):
+                        start = 1 if kind == "orpo" and branch == 0 else max(1, prompt)
+                        count += max(0, min(len(values), width, self.max_seq_length) - start)
+                key = (family, width)
+                counts[key] = max(counts.get(key, 0), count)
+        for (family, width), count in counts.items():
+            capacity = max(256, ((count + 255) // 256) * 256)
+            if capacity < family[1][0][0] * (width - 1):
+                self._cce_capacities[family, width] = capacity
+
+    def prepare_cce_batch(self, index, batch):
+        width = _preference_ids(batch[0]).shape[1]
+        capacity = self._cce_capacities.get((self.batch_family(index), width))
+        if capacity is None:
+            return batch
+        selected = []
+        rows = [self._rows[i] for i in self._schedule[index]]
+        for branch in (0, 1):
+            for offset, row in enumerate(rows):
+                values, prompt = ((row.chosen, len(row.chosen_prompt_ids)) if branch == 0 else
+                                  (row.rejected, len(row.rejected_prompt_ids)))
+                end = min(len(values), width, self.max_seq_length)
+                start = 1 if self._cce_kind == "orpo" and branch == 0 else max(1, prompt)
+                selected.extend((offset + branch * len(rows)) * (width - 1) + step - 1
+                                for step in range(start, end))
+        indices = np.full(capacity, -1, dtype=np.int32)
+        indices[:len(selected)] = selected
+        return (*batch[:3], mx.array(indices), *batch[4:])
+
+    def _materialized_width(self, index, phase):
+        width = self._widths[index]
+        if self._shape_plan is not None and phase is not None:
+            width = self._shape_plan.endpoint_for(
+                self.batch_family(index), self.batch_width(index),
+            )
+        return width
+
+    def materialize(self, index, *, phase=None):
+        indices = self._schedule[index]
+        rows = [self._rows[item] for item in indices]
+        batch, lengths = self.pack(rows, self._materialized_width(index, phase))
+        materialized = (
+            self._inputs(rows, batch, lengths), mx.array(lengths),
+            mx.array(self._normalizers[index], dtype=mx.int32),
+        )
+        if self._reference is None:
+            return materialized
+        return materialized + (None, self._held_reference(indices))
+
+    def _held_reference(self, indices):
+        branches = len(self._branches(self._rows[indices[0]]))
+        return mx.array(self._reference[list(indices), :branches].T.reshape(-1))
+
+    def __getitem__(self, index):
+        return self.materialize(index)
+
+    def materialize_all(self):
+        return [self[index] for index in range(len(self))]
+
+    def _inputs(self, rows, batch, lengths):
+        """The model input for packed rows; a vision plan returns a batch dict."""
+        return mx.array(batch)
+
+
+class FiniteVisionPreferenceBatchPlan(FinitePreferenceBatchPlan):
+    """Preference plan whose batches carry the processor's vision inputs."""
+
+    __slots__ = ("_processor", "_model_config", "_families", "_event_widths")
+
+    def __init__(self, rows, schedule, *, processor, model_config, **kwargs):
+        super().__init__(rows, schedule, **kwargs)
+        self._processor = processor
+        self._model_config = model_config
+        self._families = self._event_widths = None
+
+    def _inputs(self, rows, batch, lengths):
+        return _vision_batch(self._processor, self._model_config, rows, batch, lengths)
+
+    def _survey(self, inputs):
+        _width, axes, padable, forbidden = _vlm_width_survey(
+            inputs, disposable_keys=_vlm_pipeline_disposable_keys(self._model_config),
+        )
+        family = _vlm_batch_family(inputs, symbolic_axes=axes if padable else None)
+        return family, padable, forbidden
+
+    def ensure_descriptors(self):
+        """Survey every batch's compile-key family once, as the vision SFT plan does."""
+        if self._families is not None:
+            return
+        surveyed = []
+        with _preserved_preprocessing_rng():
+            for index, indices in enumerate(self._schedule):
+                rows = [self._rows[item] for item in indices]
+                packed = self.pack(rows, self._widths[index])
+                surveyed.append(self._survey(self._inputs(rows, *packed)))
+        forbidden = set().union(*(extents for _family, _padable, extents in surveyed))
+        widths = []
+        for width, (_family, padable, _extents) in zip(self._widths, surveyed):
+            # A width equal to an unpadded array extent would reclassify the batch.
+            while padable and width in forbidden:
+                width += 1
+            widths.append(width)
+        self._families = tuple(family for family, _padable, _extents in surveyed)
+        self._event_widths = tuple(widths)
+
+    def batch_width(self, index):
+        return (self._event_widths or self._widths)[index]
+
+    def batch_family(self, index):
+        family = super().batch_family(index)
+        return family if self._families is None else (*family, self._families[index])
+
+    def materialize(self, index, *, phase=None):
+        planned = self._shape_plan is not None and phase is not None
+        if planned and not self._shape_plan.allows(
+            self.batch_family(index), self.batch_width(index), phase,
+        ):
+            raise RuntimeError(
+                "Unsloth MLX preference: compiled batch signature was not "
+                "admitted by the finite shape plan."
+            )
+        materialized = super().materialize(index, phase=phase)
+        if planned:
+            divergence = _vlm_family_divergence(
+                self._families[index], self._survey(materialized[0])[0],
+            )
+            if divergence is not None:
+                raise RuntimeError(
+                    f"Unsloth MLX preference: batch {index} drifted from its "
+                    f"surveyed compile family ({divergence}). The processor must "
+                    "produce structurally identical batches on every visit; "
+                    "train this pipeline with compile disabled."
+                )
+        return materialized
+
+
+def precompute_reference_logps(plan, model, reference_policy, *, batch_size, scorer=None):
+    """Precompute reference logps per row of ``plan``; kernels round per chunk shape, so batch like the live forward."""
+    rows = plan.rows
+    batch_size = max(1, int(batch_size))
+    table = np.zeros((len(rows), 2), dtype=np.float32)
+    for start in range(0, len(rows), batch_size):
+        chunk = rows[start:start + batch_size]
+        batch, lengths = plan.pack(chunk)
+        batch, lengths = plan._inputs(chunk, batch, lengths), mx.array(lengths)
+        options = {}
+        # The live forward scores through CCE too; full logits would defeat it.
+        if scorer is not None and reference_policy.model is None:
+            mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
+            options["response_scorer"] = lambda model, batch, _lengths: -(
+                scorer(model, batch, mask > 0)[0] * mask
+            ).sum(axis=1)
+        logps = reference_policy.forward(model, batch, lengths, **options)
+        mx.eval(logps)
+        values = np.asarray(logps.tolist(), dtype=np.float32)
+        # A plan whose rows carry one sequence each leaves the second column zero.
+        table[start:start + len(chunk), :len(values) // len(chunk)] = (
+            values.reshape(-1, len(chunk)).T
+        )
+    plan.set_reference_logps(table)
+    return table
+
+
+def _window_normalizers(rows, schedule, cycle_length, grad_accum, kind):
+    """Per batch: its window's chosen NLL tokens (0 for an objective without
+    one), rows, and micro-batches."""
+    values = []
+    accum = max(1, int(grad_accum or 1))
+
+    def nll_tokens(row):
+        # CPO's NLL masks the prompt; ORPO's spans the whole chosen sequence.
+        start = max(1, len(row.chosen_prompt_ids)) if kind == "cpo" else 1
+        return max(0, len(row.chosen) - start)
+
+    for position in range(len(schedule)):
+        epoch_start = (position // cycle_length) * cycle_length
+        epoch_end = min(epoch_start + cycle_length, len(schedule))
+        window_start = epoch_start + ((position - epoch_start) // accum) * accum
+        window_end = min(window_start + accum, epoch_end)
+        batches = schedule[window_start:window_end]
+        pair_count = sum(len(batch) for batch in batches)
+        chosen_tokens = sum(
+            nll_tokens(rows[index]) for batch in batches for index in batch
+        ) if kind != "kto" else 0
+        values.append((chosen_tokens, pair_count, window_end - window_start))
+    return values
+
+
+def create_preference_batch_plan(
+    dataset,
+    tokenizer,
+    *,
+    batch_size,
+    length_policy,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+    dataset_order="default",
+    preserve_dataset_order=False,
+    seed=None,
+    append_eos=True,
+    formatting_func=None,
+    prompt_sink=None,
+    processor=None,
+    model_config=None,
+    image_size=None,
+):
+    """Build the finite preference plan consumed by every objective.
+
+    ``prompt_sink`` receives each row's rendered prompt text as the plan is
+    built, so a caller wanting it does not render the row a second time. A
+    ``processor`` builds a vision plan for a vision-language model, encoding image
+    prompts through it and all other text through its inner tokenizer.
+    """
+    if processor is not None:
+        tokenizer = _get_processor_tokenizer(processor)
+        media_token_ids = frozenset(_image_truncation_token_ids(
+            processor, _get_vlm_ignore_token_ids(processor, model_config),
+        ))
+    rows = []
+    for index, raw in enumerate(dataset):
+        row = formatting_func(raw) if formatting_func is not None else raw
+        if not isinstance(row, Mapping):
+            raise ValueError(
+                "Unsloth MLX preference: formatting_func must return a mapping."
+            )
+        rendered = None
+        if prompt_sink is not None:
+            # One rendering for sampler and tokenizer: a stateful template may differ.
+            rendered = prepare_preference_row(
+                processor or tokenizer, row, is_vlm=processor is not None,
+            )
+            prompt_sink(rendered[0])
+        try:
+            rows.append(
+                tokenize_preference_row(
+                    tokenizer, row, length_policy=length_policy,
+                    append_eos=append_eos, rendered=rendered,
+                ) if processor is None else tokenize_vision_preference_row(
+                    processor, row, length_policy=length_policy,
+                    append_eos=append_eos, image_size=image_size,
+                    media_token_ids=media_token_ids, rendered=rendered,
+                )
+            )
+        except ValueError as exc:
+            # Tokenized up front, so without the index one bad row aborts blindly.
+            raise ValueError(
+                f"Unsloth MLX preference: dataset row {index} could not be "
+                f"tokenized. {exc}"
+            ) from exc
+    if not rows:
+        raise ValueError("Unsloth MLX preference: the training dataset is empty.")
+    order_mode = "sequential" if preserve_dataset_order else dataset_order
+    if order_mode not in ("default", "sequential", "torch_randperm"):
+        raise ValueError(
+            f"Unsloth MLX preference: unsupported dataset_order {order_mode!r}."
+        )
+
+    def order_for_epoch(epoch):
+        if order_mode == "torch_randperm":
+            return _torch_randperm_order(
+                len(rows), _normalize_seed(seed) + int(epoch),
+            )
+        order = list(range(len(rows)))
+        if order_mode == "default":
+            order.sort(key=lambda index: max(
+                len(rows[index].chosen), len(rows[index].rejected),
+            ))
+        return order
+
+    if order_mode == "default":
+        def batches_for_epoch(epoch):
+            order = order_for_epoch(0)
+            blocks = [
+                tuple(order[start : start + batch_size])
+                for start in range(0, len(order), batch_size)
+            ]
+            rng = np.random.RandomState(_normalize_seed(seed) + int(epoch))
+            rng.shuffle(blocks)
+            return blocks
+
+        schedule, cycle_length = _finite_batch_schedule(
+            batches_for_epoch,
+            num_batches=num_batches,
+            num_epochs=num_epochs,
+            grad_accum=grad_accum,
+        )
+    else:
+        schedule, cycle_length = _finite_row_schedule(
+            len(rows), batch_size, order_for_epoch=order_for_epoch,
+            num_batches=num_batches, num_epochs=num_epochs, grad_accum=grad_accum,
+        )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", 0)
+    vision = {} if processor is None else dict(
+        processor=processor, model_config=model_config,
+    )
+    return (FiniteVisionPreferenceBatchPlan if vision else FinitePreferenceBatchPlan)(
+        rows, schedule,
+        normalizers=_window_normalizers(
+            rows, schedule, cycle_length, grad_accum, length_policy.kind,
+        ),
+        cycle_length=cycle_length,
+        max_seq_length=length_policy.max_seq_length,
+        pad_id=0 if pad_id is None else pad_id,
+        **vision,
+    )
+
+
+@dataclass(frozen=True)
+class TokenizedKTORow:
+    """One labeled completion, and the mismatched pair its KL term scores."""
+
+    prompt_ids: tuple
+    completion_ids: tuple
+    label: bool
+    kl_prompt_ids: tuple = ()
+    kl_completion_ids: tuple = ()
+
+    @property
+    def sequence(self):
+        return self.prompt_ids + self.completion_ids
+
+    @property
+    def kl(self):
+        return self.kl_prompt_ids + self.kl_completion_ids
+
+
+# TRL unpairs through datasets.map(batched=True) at its default batch size, so
+# each block of pairs yields its chosen rows, then its rejected rows.
+_UNPAIR_BLOCK = 1000
+
+
+_KTO_LABELS = {"true": True, "1": True, "1.0": True, "yes": True,
+               "false": False, "0": False, "0.0": False, "no": False}
+
+
+def _kto_label(row):
+    # bool("false") is True, so string labels from a CSV are parsed, never truth-tested.
+    label = row["label"]
+    if isinstance(label, (bool, int, float, np.bool_, np.integer, np.floating)):
+        return bool(label)
+    if isinstance(label, str) and label.strip().lower() in _KTO_LABELS:
+        return _KTO_LABELS[label.strip().lower()]
+    raise ValueError(
+        f"label {label!r} is not a boolean (use True/False, 1/0 or 'true'/'false')."
+    )
+
+
+def _unpaired_kto_rows(dataset, formatting_func):
+    """Yield ``(dataset index, row, extracted)`` per completion, in TRL's order."""
+    block = []
+    paired = None
+
+    def unpair():
+        for side, label in (("chosen", True), ("rejected", False)):
+            for index, row, extracted in block:
+                yield index, {**row, "completion": row[side], "label": label}, extracted
+        block.clear()
+
+    for index, raw in enumerate(dataset):
+        row = formatting_func(raw) if formatting_func is not None else raw
+        if not isinstance(row, Mapping):
+            raise ValueError(
+                f"Unsloth MLX KTO: dataset row {index} is not a mapping."
+            )
+        is_paired = "chosen" in row or "rejected" in row
+        if paired is None:
+            paired = is_paired
+        elif is_paired != paired:
+            raise ValueError(
+                f"Unsloth MLX KTO: dataset row {index} is "
+                f"{'paired' if is_paired else 'unpaired'} and the rows before "
+                "it are not; a dataset is either chosen/rejected pairs or "
+                "prompt/completion/label rows."
+            )
+        if not paired:
+            missing = {"prompt", "completion", "label"} - set(row)
+            if missing:
+                raise ValueError(
+                    f"Unsloth MLX KTO: dataset row {index} lacks "
+                    f"{sorted(missing)!r}; an unpaired row needs prompt, "
+                    "completion, and label."
+                )
+            yield index, row, False
+            continue
+        try:
+            block.append((index, *_maybe_extract_prompt(row)))
+        except ValueError as exc:
+            raise ValueError(f"Unsloth MLX KTO: dataset row {index}: {exc}") from exc
+        if len(block) == _UNPAIR_BLOCK:
+            yield from unpair()
+    yield from unpair()
+
+
+def _encode_kto_row(tokenizer, row, *, extracted):
+    """TRL KTO's _tokenize: returns the rendered prompt, prompt ids, answer ids."""
+    prompt_text, (full_text,) = _render_completions(
+        tokenizer, row, ("completion",), extracted=extracted,
+    )
+    prompt_ids, full_ids = (
+        [int(x) for x in encode_mlx_text(tokenizer, text, add_special_tokens=False)]
+        for text in (_shared_prefix(prompt_text, full_text), full_text)
+    )
+    boundary = _mlx_prompt_completion_boundary(
+        prompt_ids, full_ids, step_back=True,
+    )
+    return prompt_text, full_ids[:boundary], full_ids[boundary:]
+
+
+def _truncate_kto(prompt_ids, answer_ids, policy, *, bos_id, eos_id):
+    """TRL KTOTrainer's _process_tokens for a decoder-only model, including its
+    BOS slot reserved against a None bos_token_id and its answer cut spending the
+    whole prompt bound."""
+    budget = policy.max_length
+    if prompt_ids and prompt_ids[0] != bos_id:
+        budget -= 1
+    if eos_id is not None and answer_ids and answer_ids[-1] != eos_id:
+        budget -= 1
+    keep = policy.max_prompt_length
+    if len(prompt_ids) + len(answer_ids) > budget:
+        prompt_ids = (
+            prompt_ids[:keep] if policy.truncation_mode == "keep_start"
+            else prompt_ids[-keep:]
+        )
+    if len(prompt_ids) + len(answer_ids) > budget:
+        answer_ids = answer_ids[:budget - keep]
+    if bos_id is not None and (not prompt_ids or prompt_ids[0] != bos_id):
+        prompt_ids = [bos_id, *prompt_ids]
+    if eos_id is not None and (not answer_ids or answer_ids[-1] != eos_id):
+        answer_ids = [*answer_ids, eos_id]
+    return tuple(prompt_ids), tuple(answer_ids)
+
+
+def _require_kto_fit(prompt_ids, answer_ids, policy):
+    kept = len(prompt_ids) + len(answer_ids)
+    if kept > policy.max_seq_length:
+        raise ValueError(
+            f"this row keeps {kept} tokens, more than the "
+            f"{policy.max_seq_length} a batch can hold: "
+            f"max_prompt_length={policy.max_prompt_length} leaves an overrun "
+            f"answer no room inside max_length={policy.max_length} once its BOS "
+            "and EOS slots are reserved, so the cut only drops its last tokens. "
+            "Lower max_prompt_length."
+        )
+
+
+def create_kto_batch_plan(
+    dataset,
+    tokenizer,
+    *,
+    batch_size,
+    kl_batch_size,
+    length_policy,
+    with_kl=True,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+    append_eos=True,
+    formatting_func=None,
+    prompt_sink=None,
+    dataset_order="default",
+    preserve_dataset_order=False,
+    seed=None,
+):
+    """Build a finite KTO plan over TRL's unpaired rows, visited in dataset order.
+    ``dataset_order="torch_randperm"`` reorders whole batches each epoch, keeping
+    KL partners together.
+
+    Each row's KL pair joins its prompt to the previous row's completion within
+    ``kl_batch_size`` chunks (TRL's per_device_train_batch_size, for evaluation
+    too). ``prompt_sink`` receives each undesirable row's rendered prompt.
+    """
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    bos_id = None if bos_id is None else int(bos_id)
+    eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
+    eos_id = None if eos_id is None else int(eos_id)
+    carry = _kto_carry(tokenizer, append_eos)
+    if length_policy.max_length + carry > length_policy.max_seq_length:
+        raise ValueError(
+            f"Unsloth MLX KTO: max_length={length_policy.max_length} leaves no "
+            f"room inside max_seq_length={length_policy.max_seq_length} for the "
+            f"{carry} special token(s) a row can carry past it; resolve the "
+            "length policy with this tokenizer and append_eos."
+        )
+    tokenized = []
+    for index, row, extracted in _unpaired_kto_rows(dataset, formatting_func):
+        try:
+            label = _kto_label(row)
+            prompt_text, prompt_ids, answer_ids = _encode_kto_row(
+                tokenizer, row, extracted=extracted,
+            )
+            prompt, answer = _truncate_kto(
+                prompt_ids, answer_ids, length_policy, bos_id=bos_id, eos_id=eos_id,
+            )
+            if not answer or len(prompt) + len(answer) < 2:
+                raise ValueError(
+                    "this row leaves no completion token with anything before "
+                    "it to predict from. Raise max_length or lower "
+                    "max_prompt_length if the length budget cut it down."
+                )
+            _require_kto_fit(prompt, answer, length_policy)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsloth MLX KTO: dataset row {index} could not be tokenized. "
+                f"{exc}"
+            ) from exc
+        if prompt_sink is not None and not label:
+            prompt_sink(prompt_text)
+        tokenized.append((prompt, answer, answer_ids, label))
+    if not tokenized:
+        raise ValueError("Unsloth MLX KTO: the dataset is empty.")
+    order_mode = "sequential" if preserve_dataset_order else dataset_order
+    if order_mode not in ("default", "sequential", "torch_randperm"):
+        raise ValueError(f"Unsloth MLX KTO: unsupported dataset_order {order_mode!r}.")
+    rows = []
+    for start in range(0, len(tokenized), kl_batch_size):
+        chunk = tokenized[start:start + kl_batch_size]
+        for offset, (prompt, answer, _, label) in enumerate(chunk):
+            kl_prompt = kl_answer = ()
+            if with_kl:
+                # The prompt as processed, so one already cut by its own answer stays cut.
+                kl_prompt, kl_answer = _truncate_kto(
+                    prompt, chunk[offset - 1][2], length_policy,
+                    bos_id=bos_id, eos_id=eos_id,
+                )
+                try:
+                    _require_kto_fit(kl_prompt, kl_answer, length_policy)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Unsloth MLX KTO: the KL pair of unpaired row "
+                        f"{start + offset} could not be formed. {exc}"
+                    ) from exc
+            rows.append(TokenizedKTORow(prompt, answer, label, kl_prompt, kl_answer))
+    batches = [
+        tuple(range(start, min(start + batch_size, len(rows))))
+        for start in range(0, len(rows), batch_size)
+    ]
+
+    def batches_for_epoch(epoch):
+        if order_mode != "torch_randperm":
+            return batches
+        order = _torch_randperm_order(len(batches), _normalize_seed(seed) + int(epoch))
+        return [batches[index] for index in order]
+
+    schedule, cycle_length = _finite_batch_schedule(
+        batches_for_epoch, num_batches=num_batches, num_epochs=num_epochs,
+        grad_accum=grad_accum,
+    )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", 0)
+    return FiniteKTOBatchPlan(
+        rows, schedule,
+        with_kl=with_kl,
+        normalizers=_window_normalizers(
+            rows, schedule, cycle_length, grad_accum, "kto",
+        ),
+        cycle_length=cycle_length,
+        max_seq_length=length_policy.max_seq_length,
+        pad_id=0 if pad_id is None else pad_id,
+    )
+
+
+class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
+    """Batches ``(ids, lengths, normalizers, labels[, reference])``: completions,
+    then their KL rows when the loss has a KL term."""
+
+    __slots__ = ("_with_kl",)
+
+    def __init__(self, rows, schedule, *, with_kl, **kwargs):
+        # Before the parent measures batch widths through _branches.
+        self._with_kl = bool(with_kl)
+        super().__init__(rows, schedule, **kwargs)
+
+    @property
+    def with_kl(self):
+        return self._with_kl
+
+    def _branches(self, row):
+        completion = ((row.sequence, len(row.prompt_ids)),)
+        if not self._with_kl:
+            return completion
+        return completion + ((row.kl, len(row.kl_prompt_ids)),)
+
+    def batch_family(self, index):
+        rows = len(self._schedule[index])
+        sequences = rows * (2 if self._with_kl else 1)
+        return (
+            "kto_tuple_4",
+            ((sequences, "sequence"), "int32"),
+            ((sequences, 2), "int32"),
+            ((3,), "int32"),
+            ((rows,), "bool"),
+        )
+
+    def configure_cce_compaction(self, enabled=True, *, kind="kto"):
+        self._cce_capacities = {}
+
+    def prepare_cce_batch(self, index, batch):
+        return batch
+
+    def materialize(self, index, *, phase=None):
+        indices = self._schedule[index]
+        rows = [self._rows[item] for item in indices]
+        batch, lengths = self.pack(rows, self._materialized_width(index, phase))
+        materialized = (
+            mx.array(batch), mx.array(lengths),
+            mx.array(self._normalizers[index], dtype=mx.int32),
+            mx.array([row.label for row in rows]),
+        )
+        if self._reference is None:
+            return materialized
+        return materialized + (self._held_reference(indices),)
+
+
+def warn_kto_weight_balance(labels, desirable_weight, undesirable_weight):
+    """TRL KTOTrainer's warning, from Eq. (8) of the KTO paper, when neither
+    weight lies in the range the label counts recommend."""
+    num_desirable = max(sum(bool(label) for label in labels), 1)
+    num_undesirable = max(len(labels) - num_desirable, 1)
+    if num_desirable == num_undesirable:
+        return
+    ratio = num_undesirable * undesirable_weight / num_desirable
+    inverse = num_desirable * desirable_weight / num_undesirable
+    desirable = (round(ratio, 2), round(ratio * 1.33, 2))
+    undesirable = (round(inverse / 1.33, 2), round(inverse, 2))
+    if desirable[0] <= desirable_weight <= desirable[1]:
+        return
+    if undesirable[0] <= undesirable_weight <= undesirable[1]:
+        return
+    warnings.warn(
+        "Unsloth MLX KTO: the dataset has different numbers of desirable and "
+        "undesirable rows, and the loss weights do not balance them. Set EITHER "
+        f"desirable_weight in [{desirable[0]}, {desirable[1]}] or "
+        f"undesirable_weight in [{undesirable[0]}, {undesirable[1]}], not both.",
+        RuntimeWarning, stacklevel=2,
+    )
+
+
+def _response_mask(targets, lengths):
+    steps = mx.arange(1, targets.shape[1] + 1)
+    return mx.logical_and(
+        steps >= lengths[:, 0:1], steps < lengths[:, 1:]
+    ).astype(mx.float32)
+
+
+def _supervised_tokens(batch_data):
+    lengths = batch_data[1]
+    return mx.maximum(
+        lengths[:, 1] - mx.maximum(lengths[:, 0], mx.array(1)),
+        mx.array(0),
+    ).sum()
+
+
+def _log_sigmoid(value):
+    return -mx.logaddexp(mx.array(0.0, dtype=value.dtype), -value)
+
+
+def _orpo_log_odds(chosen, rejected):
+    chosen = chosen.astype(mx.float32)
+    rejected = rejected.astype(mx.float32)
+    floor = mx.array(1e-12, dtype=mx.float32)
+    chosen_odds = chosen - mx.log(mx.maximum(-mx.expm1(chosen), floor))
+    rejected_odds = rejected - mx.log(mx.maximum(-mx.expm1(rejected), floor))
+    return chosen_odds - rejected_odds
+
+
+def _require_kind(objective, kind):
+    if objective.kind != kind:
+        raise ValueError(
+            f"Unsloth MLX preference: the {kind.upper()} loss needs an "
+            f"objective of kind '{kind}', not '{objective.kind}'."
+        )
+
+
+def _require_reference(objective, reference_policy):
+    if objective.kind == "kto" and reference_policy is None:
+        raise ValueError(
+            "Unsloth MLX KTO: this objective scores against a reference "
+            "policy, but none was given. Pass one as reference_policy."
+        )
+    if objective.kind == "dpo" and not objective.reference_free \
+            and reference_policy is None:
+        raise ValueError(
+            "Unsloth MLX DPO: this objective scores against a reference "
+            "policy, but none was given. Pass one as reference_policy, or "
+            "build the objective with reference_free=True."
+        )
+
+
+def make_orpo_loss_fn(objective, *, _scorer=None):
+    """Create an ORPO loss with exact logical-window normalization."""
+    _require_kind(objective, "orpo")
+    beta = objective.beta
+
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
+        nll_sum, _batch_nll_tokens, ratio, stats = _orpo_scores(
+            model, batch, lengths, beta, scorer=_scorer, cce_indices=cce_indices,
+        )
+        nll_tokens, window_pairs, window_microbatches = normalizers
+        loss = window_microbatches.astype(mx.float32) * (
+            nll_sum / mx.maximum(nll_tokens, mx.array(1)).astype(mx.float32)
+            - beta * ratio.sum() / mx.maximum(
+                window_pairs, mx.array(1),
+            ).astype(mx.float32)
+        )
+        return loss, mx.array(1, dtype=mx.int32), stats
+
+    loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["orpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["orpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["orpo"]
+    return loss_fn
+
+
+def make_orpo_cce_loss_fn(model, objective):
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_orpo_loss_fn(objective, _scorer=scorer), scorer)
+
+
+def _mark_cce_loss(loss_fn, scorer):
+    if scorer is not None:
+        loss_fn._unsloth_cce_backend = "runtime-cce"
+        loss_fn._unsloth_cce_compaction = scorer.compaction
+        loss_fn._unsloth_cce_scorer = scorer
+    return loss_fn
+
+
+class PreferenceRunContext:
+    """Run-scoped dropout state with exact restoration."""
+
+    def __init__(self, model, enabled=True):
+        self._saved = []
+        if not enabled:
+            return
+        dropout_types = tuple(
+            value for value in (
+                getattr(nn, "Dropout", None),
+                getattr(nn, "Dropout2d", None),
+                getattr(nn, "Dropout3d", None),
+            )
+            if isinstance(value, type)
+        )
+        named_modules = getattr(model, "named_modules", None)
+        try:
+            for _, module in named_modules() if callable(named_modules) else ():
+                if not (
+                    (dropout_types and isinstance(module, dropout_types))
+                    or getattr(module, "_p_1", None) is not None
+                    or type(module).__name__.endswith("Dropout")
+                ):
+                    continue
+                if _get_mlx_dropout_probability(module) <= 0:
+                    continue
+                state = {
+                    "_unsloth_preference_original_probability": getattr(
+                        module, "_unsloth_preference_original_probability", None,
+                    )
+                }
+                self._saved.append((module, state))
+                module._unsloth_preference_original_probability = (
+                    _get_mlx_dropout_probability(module)
+                )
+                if hasattr(module, "_p_1"):
+                    state["_p_1"] = module._p_1
+                    module._p_1 = 1.0
+                if hasattr(module, "p"):
+                    state["p"] = module.p
+                    module.p = 0.0
+        except BaseException:
+            self.restore()
+            raise
+
+    def restore(self):
+        while self._saved:
+            module, state = self._saved.pop()
+            for name, value in state.items():
+                if (
+                    name == "_unsloth_preference_original_probability"
+                    and value is None
+                ):
+                    delattr(module, name)
+                else:
+                    setattr(module, name, value)
+
+
+class ReferencePolicy:
+    """The policy a referenced DPO run scores against: its own model, or the policy under overrides."""
+
+    def __init__(
+        self, *, model=None, scales=(), overrides=(), paths=(), mirrored=(),
+        neftune_modules=(), objective_name="DPO",
+    ):
+        self.model = model
+        self.objective_name = objective_name
+        self.scales = tuple(scales)
+        self.targets = tuple((module, name) for module, name, _ in overrides)
+        self.values = [value for _, _, value in overrides]
+        # A snapshot syncs its first ``len(paths)`` values; a model syncs ``mirrored``.
+        self.paths = tuple(paths)
+        self.mirrored = tuple(mirrored)
+        self.neftune_modules = tuple(neftune_modules)
+        self.released = False
+
+    @property
+    def state(self):
+        """What a compiled step captures to read the reference afresh each call."""
+        return self.values if self.model is None else self.model.state
+
+    @contextmanager
+    def activate(self, model):
+        """Yield the module to score with; overrides sit on the owning module so they hold under a trace."""
+        if self.released:
+            raise RuntimeError(
+                f"Unsloth MLX {self.objective_name}: the reference was released once "
+                "its log probabilities were precomputed."
+            )
+        if self.model is not None:
+            yield self.model
+            return
+        saved_scales = [module.scale for module, _ in self.scales]
+        saved_values = [getattr(module, name) for module, name in self.targets]
+        noise = [
+            getattr(module, "_neftune_noise_enabled", True)
+            for module in self.neftune_modules
+        ]
+        try:
+            for module, scale in self.scales:
+                module.scale = scale
+            for (module, name), value in zip(self.targets, self.values):
+                setattr(module, name, value)
+            for module in self.neftune_modules:
+                module._neftune_noise_enabled = False
+            yield model
+        finally:
+            for (module, _), scale in zip(self.scales, saved_scales):
+                module.scale = scale
+            for (module, name), value in zip(self.targets, saved_values):
+                setattr(module, name, value)
+            for module, enabled in zip(self.neftune_modules, noise):
+                module._neftune_noise_enabled = enabled
+
+    def forward(self, model, batch, lengths, *, response_scorer=None):
+        scorer = _response_logps if response_scorer is None else response_scorer
+        with self.activate(model) as reference:
+            return mx.stop_gradient(scorer(reference, batch, lengths))
+
+    def release(self):
+        """Drop a snapshot's arrays; a reference model is the caller's and stays."""
+        if self.model is None:
+            self.values.clear()
+            self.targets = ()
+        self.released = True
+
+    def _synced_tensor(self, index):
+        if self.model is None:
+            return self.values[index]
+        module, name = self.mirrored[index]
+        return getattr(module, name)
+
+    def _store_synced(self, index, value):
+        if self.model is None:
+            self.values[index] = value
+        else:
+            module, name = self.mirrored[index]
+            setattr(module, name, value)
+
+    def _require_synced(self):
+        if not self.paths:
+            raise RuntimeError("Unsloth MLX DPO: this reference does not sync.")
+
+    def sync(self, policy, alpha):
+        """In place ``(1 - alpha) * reference + alpha * policy``, mixed in float32."""
+        self._require_synced()
+        trainable = dict(mlx.utils.tree_flatten(policy.trainable_parameters()))
+        for index, path in enumerate(self.paths):
+            reference = self._synced_tensor(index)
+            value = (1.0 - alpha) * reference.astype(mx.float32) \
+                + alpha * trainable[path].astype(mx.float32)
+            value = value.astype(reference.dtype)
+            mx.eval(value)
+            self._store_synced(index, value)
+
+    def save(self, directory):
+        self._require_synced()
+        os.makedirs(directory, exist_ok=True)
+        mx.save_safetensors(
+            os.path.join(directory, "reference.safetensors"),
+            {path: self._synced_tensor(index) for index, path in enumerate(self.paths)},
+        )
+
+    def load(self, directory):
+        file = os.path.join(directory, "reference.safetensors")
+        if not os.path.isfile(file):
+            raise FileNotFoundError(
+                f"Unsloth MLX DPO: {directory!r} has no reference.safetensors; "
+                "a sync_ref_model run resumes its synced reference from it."
+            )
+        self._require_synced()
+        loaded = mx.load(file)
+        if set(loaded) != set(self.paths) or any(
+            tuple(loaded[path].shape) != tuple(self._synced_tensor(index).shape)
+            for index, path in enumerate(self.paths)
+        ):
+            raise ValueError(
+                "Unsloth MLX DPO: reference.safetensors does not match this "
+                "run's reference tensors."
+            )
+        for index, path in enumerate(self.paths):
+            restored = loaded[path].astype(self._synced_tensor(index).dtype)
+            mx.eval(restored)  # read now: mx.load is lazy and file-backed
+            self._store_synced(index, restored)
+
+
+def _preference_ids(batch):
+    """A vision batch is a dict carrying its token ids beside the pixels."""
+    return batch["input_ids"] if isinstance(batch, Mapping) else batch
+
+
+def _next_token_positions(values, ids, what):
+    """Drop the last position, once the output is known to cover every token.
+
+    A family expanding tokens inside its forward would shift every response
+    position the lengths name, so the scores would silently read other tokens.
+    """
+    if values.shape[1] != ids.shape[1]:
+        raise ValueError(
+            f"Unsloth MLX preference: this model returned {what} for "
+            f"{values.shape[1]} positions from {ids.shape[1]} tokens, so the "
+            "response spans cannot be located in them."
+        )
+    return values[:, :-1]
+
+
+def _preference_logits(model, batch):
+    """Logits predicting each next token, for every position but the last."""
+    if isinstance(batch, Mapping):
+        return _next_token_positions(
+            _vlm_forward_logits(model, batch), batch["input_ids"], "logits",
+        )
+    return _model_logits(model(batch[:, :-1]))
+
+
+def _preference_hidden(model, batch):
+    if isinstance(batch, Mapping):
+        return _next_token_positions(
+            _vlm_hidden_states(model, batch), batch["input_ids"], "hidden states",
+        )
+    return _forward_text_hidden_states(model, batch[:, :-1])
+
+
+def _token_cross_entropy(logits, targets, mask):
+    # An image token may lie past the output head (Mllama's does), so unscored
+    # labels are gathered as token 0, as TRL does.
+    targets = mx.where(mask > 0, targets, 0)
+    return nn.losses.cross_entropy(
+        logits, targets, reduction="none",
+    ).reshape(targets.shape)
+
+
+def _response_logps(model, batch, lengths):
+    targets = _preference_ids(batch)[:, 1:]
+    mask = _response_mask(targets, lengths)
+    ce = _token_cross_entropy(_preference_logits(model, batch), targets, mask)
+    return -(ce * mask).sum(axis=1)
+
+
+# TRL's own warning list, narrower than the set that drops the value.
+_DPO_SMOOTHING_WARNINGS = frozenset({
+    "hinge", "ipo", "bco_pair", "sppo_hard", "nca_pair", "apo_zero", "apo_down",
+})
+
+# These rebuild from the raw reference logps, bypassing TRL's reference_free mask.
+_DPO_NEEDS_REFERENCE = frozenset({
+    "sppo_hard", "nca_pair", "aot_pair", "aot", "discopop",
+})
+
+_DPO_REFUSED = {
+    "bco_pair": (
+        "it subtracts a running mean of rewards carried across optimizer steps, "
+        "so its value would depend on micro-batch order and on what a "
+        "checkpoint happened to hold"
+    ),
+    "kto_pair": "TRL removed it from DPO training in favour of a KTO trainer",
+}
+
+
+@dataclass(frozen=True)
+class _DPOTerms:
+    """``delta`` uses TRL's subtraction grouping; regrouping shifts it in float32."""
+
+    chosen: object
+    rejected: object
+    ref_chosen: object
+    ref_rejected: object
+    chosen_ratio: object
+    rejected_ratio: object
+    delta: object
+
+
+def _dpo_smoothed_sigmoid(objective, delta):
+    scaled = objective.beta * delta
+    epsilon = objective.label_smoothing
+    return -(
+        (1.0 - epsilon) * _log_sigmoid(scaled) + epsilon * _log_sigmoid(-scaled)
+    )
+
+
+def _dpo_robust(objective, terms):
+    scaled = objective.beta * terms.delta
+    epsilon = objective.label_smoothing
+    return (
+        -_log_sigmoid(scaled) * (1.0 - epsilon) + _log_sigmoid(-scaled) * epsilon
+    ) / (1.0 - 2.0 * epsilon)
+
+
+def _dpo_exo_pair(objective, terms):
+    scaled = objective.beta * terms.delta
+    epsilon = objective.label_smoothing
+    return (
+        mx.sigmoid(scaled) * (_log_sigmoid(scaled) - math.log(1.0 - epsilon))
+        + mx.sigmoid(-scaled) * (_log_sigmoid(-scaled) - math.log(epsilon))
+    )
+
+
+def _dpo_hinge(objective, terms):
+    value = 1.0 - objective.beta * terms.delta
+    return mx.maximum(value, mx.array(0.0, dtype=value.dtype))
+
+
+def _dpo_ipo(objective, terms):
+    return (terms.delta - 1.0 / (2.0 * objective.beta)) ** 2
+
+
+def _dpo_sppo_hard(objective, terms):
+    half = 0.5 / objective.beta
+    return (terms.chosen_ratio - half) ** 2 + (terms.rejected_ratio + half) ** 2
+
+
+def _dpo_nca_pair(objective, terms):
+    chosen_rewards = terms.chosen_ratio * objective.beta
+    rejected_rewards = terms.rejected_ratio * objective.beta
+    return (
+        -_log_sigmoid(chosen_rewards)
+        - 0.5 * _log_sigmoid(-chosen_rewards)
+        - 0.5 * _log_sigmoid(-rejected_rewards)
+    )
+
+
+def _dpo_aot_pair(objective, terms):
+    return _dpo_smoothed_sigmoid(objective, (
+        mx.sort(terms.chosen_ratio, axis=0)
+        - mx.sort(terms.rejected_ratio, axis=0)
+    ))
+
+
+def _dpo_aot(objective, terms):
+    return _dpo_smoothed_sigmoid(objective, (
+        mx.sort(terms.chosen - terms.rejected, axis=0)
+        - mx.sort(terms.ref_chosen - terms.ref_rejected, axis=0)
+    ))
+
+
+def _dpo_apo_zero(objective, terms):
+    return (
+        1.0 - mx.sigmoid(objective.beta * terms.chosen_ratio)
+        + mx.sigmoid(objective.beta * terms.rejected_ratio)
+    )
+
+
+def _dpo_apo_down(objective, terms):
+    return (
+        mx.sigmoid(objective.beta * terms.chosen_ratio)
+        + 1.0 - mx.sigmoid(
+            objective.beta * (terms.chosen_ratio - terms.rejected_ratio)
+        )
+    )
+
+
+def _dpo_discopop(objective, terms):
+    scaled = objective.beta * terms.delta
+    modulation = mx.sigmoid(scaled / objective.discopop_tau)
+    # TRL's exp(-scaled) * modulation is inf * 0 = NaN once scaled < -88.
+    return (
+        -_log_sigmoid(scaled) * (1.0 - modulation)
+        + mx.exp(_log_sigmoid(scaled / objective.discopop_tau) - scaled)
+    )
+
+
+_DPO_VARIANTS = {
+    "sigmoid": lambda objective, terms: _dpo_smoothed_sigmoid(
+        objective, terms.delta,
+    ),
+    "robust": _dpo_robust,
+    "exo_pair": _dpo_exo_pair,
+    "hinge": _dpo_hinge,
+    "ipo": _dpo_ipo,
+    "sppo_hard": _dpo_sppo_hard,
+    "nca_pair": _dpo_nca_pair,
+    "aot_pair": _dpo_aot_pair,
+    "aot": _dpo_aot,
+    "apo_zero": _dpo_apo_zero,
+    "apo_down": _dpo_apo_down,
+    "discopop": _dpo_discopop,
+}
+
+
+def _cpo_hinge(objective, delta):
+    value = 1.0 - objective.beta * delta
+    return mx.maximum(value, mx.array(0.0, dtype=value.dtype))
+
+
+# CPOTrainer.cpo_loss, on the chosen-minus-rejected difference.
+_CPO_VARIANTS = {
+    "sigmoid": _dpo_smoothed_sigmoid,
+    "simpo": lambda objective, delta: _dpo_smoothed_sigmoid(
+        objective, delta - objective.simpo_gamma / objective.beta,
+    ),
+    "hinge": _cpo_hinge,
+    "ipo": lambda objective, delta: (delta - 1.0 / (2.0 * objective.beta)) ** 2,
+}
+
+
+def _cpo_rewards(objective, logps):
+    """AlphaPO's (1 - p ** -alpha) / alpha, without underflowing p = exp(logps)."""
+    if objective.alpha == 0:
+        return logps
+    return -mx.expm1(-objective.alpha * logps) / objective.alpha
+
+
+@dataclass(frozen=True)
+class PreferenceObjective:
+    kind: str
+    beta: float
+    label_smoothing: float = 0.0
+    loss_types: tuple = ("sigmoid",)
+    weights: tuple = (1.0,)
+    discopop_tau: float = 0.05
+    reference_free: bool = False
+    desirable_weight: float = 1.0
+    undesirable_weight: float = 1.0
+    cpo_alpha: float = 1.0
+    simpo_gamma: float = 0.5
+    alpha: float = 0.0
+
+    def __post_init__(self):
+        object.__setattr__(self, "loss_types", tuple(self.loss_types))
+        object.__setattr__(self, "weights", tuple(self.weights))
+        if self.kind not in ("dpo", "orpo", "cpo", "kto"):
+            raise ValueError(
+                f"Unsloth MLX preference: unknown objective kind '{self.kind}'."
+            )
+        if not math.isfinite(self.beta) or self.beta < 0:
+            raise ValueError(
+                "Unsloth MLX preference: beta must be finite and non-negative, "
+                f"not {self.beta}."
+            )
+        if self.kind == "kto":
+            if len(self.loss_types) != 1 or self.loss_types[0] not in KTO_LOSS_TYPES:
+                raise ValueError(
+                    f"Unsloth MLX KTO: loss_type must be one of "
+                    f"{', '.join(KTO_LOSS_TYPES)}, not {list(self.loss_types)}."
+                )
+            weights = (self.desirable_weight, self.undesirable_weight)
+            if not all(math.isfinite(weight) for weight in weights):
+                raise ValueError(
+                    "Unsloth MLX KTO: desirable_weight and undesirable_weight "
+                    f"must be finite, not {list(weights)}."
+                )
+        if self.kind == "cpo":
+            _validate_cpo_objective(self)
+        if self.kind != "dpo":
+            return
+        if len(self.weights) != len(self.loss_types):
+            raise ValueError(
+                f"Unsloth MLX DPO: loss_weights has {len(self.weights)} entries "
+                f"for {len(self.loss_types)} loss types; they must be the same "
+                "length."
+            )
+        if not self.loss_types:
+            raise ValueError(
+                "Unsloth MLX DPO: loss_type must name at least one loss."
+            )
+        if not all(math.isfinite(weight) for weight in self.weights):
+            raise ValueError(
+                f"Unsloth MLX DPO: loss_weights must all be finite, not "
+                f"{list(self.weights)}."
+            )
+        for name in self.loss_types:
+            if name in _DPO_REFUSED:
+                raise ValueError(
+                    f"Unsloth MLX DPO: loss_type '{name}' is not supported "
+                    f"because {_DPO_REFUSED[name]}."
+                )
+            if name not in _DPO_VARIANTS:
+                raise ValueError(
+                    f"Unsloth MLX DPO: unknown loss_type '{name}'. Supported: "
+                    f"{', '.join(sorted(_DPO_VARIANTS))}."
+                )
+        if not 0 <= self.label_smoothing < 0.5:
+            # robust divides by 1 - 2 * it, so 0.5 is a division by zero.
+            raise ValueError(
+                "Unsloth MLX DPO: label_smoothing must be in [0, 0.5), not "
+                f"{self.label_smoothing}."
+            )
+        if self.label_smoothing == 0 and "exo_pair" in self.loss_types:
+            # exo_pair logs label_smoothing, undefined at zero. Floored here at
+            # config time; TRL mutates self.label_smoothing inside exo_pair's own
+            # branch, a state change that leaks into the other losses in the list.
+            object.__setattr__(self, "label_smoothing", 1e-3)
+        if "discopop" in self.loss_types and not 0 < self.discopop_tau < math.inf:
+            # discopop divides by it, and delta is zero at init, so 0 is NaN.
+            raise ValueError(
+                "Unsloth MLX DPO: discopop_tau must be finite and above zero, "
+                f"not {self.discopop_tau}."
+            )
+        unscorable = [
+            name for name in self.loss_types if name in _DPO_NEEDS_REFERENCE
+        ]
+        if self.reference_free and unscorable:
+            raise ValueError(
+                f"Unsloth MLX DPO: {', '.join(unscorable)} score against the "
+                "reference log probabilities themselves, which reference_free "
+                "never computes. Set reference_free=False, or pick a loss_type "
+                "that only reads the policy-minus-reference difference."
+            )
+
+    @property
+    def length_normalized(self):
+        """TRL divides before any variant runs, so DPO's ipo normalizes the whole
+        list; CPO averages under ipo and simpo."""
+        return any(name in ("ipo", "simpo") for name in self.loss_types)
+
+    @property
+    def with_kl(self):
+        return self.kind == "kto" and self.loss_types == ("kto",)
+
+
+def _validate_cpo_objective(objective):
+    names = objective.loss_types
+    if len(names) != 1:
+        raise ValueError(
+            f"Unsloth MLX CPO: loss_type must name exactly one loss, not {list(names)}."
+        )
+    if names[0] == "kto_pair":
+        raise ValueError(
+            "Unsloth MLX CPO: loss_type 'kto_pair' is not supported because TRL "
+            "removed it from CPO training in favour of a KTO trainer."
+        )
+    if names[0] not in _CPO_VARIANTS:
+        raise ValueError(
+            f"Unsloth MLX CPO: unknown loss_type '{names[0]}'. Supported: "
+            f"{', '.join(sorted(_CPO_VARIANTS))}."
+        )
+    if names[0] in ("ipo", "simpo") and objective.beta == 0:
+        raise ValueError(
+            f"Unsloth MLX CPO: {names[0]} divides by beta, so beta must be above zero."
+        )
+    if not 0 <= objective.label_smoothing <= 1:
+        # Outside [0, 1] one smoothed term has a negative weight, unbounded below.
+        raise ValueError(
+            "Unsloth MLX CPO: label_smoothing must be in [0, 1], not "
+            f"{objective.label_smoothing}."
+        )
+    for name in ("cpo_alpha", "simpo_gamma", "alpha"):
+        if not math.isfinite(getattr(objective, name)):
+            raise ValueError(
+                f"Unsloth MLX CPO: {name} must be finite, not "
+                f"{getattr(objective, name)}."
+            )
+    if objective.cpo_alpha < 0:
+        # A negative NLL weight pays for lowering the chosen likelihood, unbounded below.
+        raise ValueError(
+            "Unsloth MLX CPO: cpo_alpha must be non-negative, not "
+            f"{objective.cpo_alpha}."
+        )
+
+
+def resolve_preference_objective(
+    kind, *, beta, label_smoothing=0.0, loss_type="sigmoid",
+    loss_weights=None, discopop_tau=0.05, reference_free=False,
+    desirable_weight=1.0, undesirable_weight=1.0,
+    cpo_alpha=1.0, simpo_gamma=0.5, alpha=0.0,
+):
+    beta = float(beta)
+    if kind == "orpo":
+        return PreferenceObjective(kind="orpo", beta=beta)
+    names = (loss_type,) if isinstance(loss_type, str) else tuple(loss_type)
+    if kind == "kto":
+        return PreferenceObjective(
+            kind="kto", beta=beta, loss_types=names,
+            desirable_weight=float(desirable_weight),
+            undesirable_weight=float(undesirable_weight),
+        )
+    if kind == "cpo":
+        objective = PreferenceObjective(
+            kind=kind, beta=beta, label_smoothing=float(label_smoothing),
+            loss_types=names, cpo_alpha=float(cpo_alpha),
+            simpo_gamma=float(simpo_gamma), alpha=float(alpha),
+        )
+        ignoring = ("hinge", "ipo")
+    else:
+        if loss_weights is None:
+            weights = (1.0,) * len(names)
+        else:
+            weights = tuple(float(weight) for weight in loss_weights)
+        objective = PreferenceObjective(
+            kind=kind, beta=beta, label_smoothing=float(label_smoothing),
+            loss_types=names, weights=weights,
+            discopop_tau=float(discopop_tau), reference_free=bool(reference_free),
+        )
+        ignoring = _DPO_SMOOTHING_WARNINGS
+    ignored = [name for name in names if name in ignoring]
+    if float(label_smoothing) > 0 and ignored:
+        warnings.warn(
+            f"Unsloth MLX {kind.upper()}: {', '.join(ignored)} ignore "
+            "label_smoothing; pass label_smoothing=0.0 to silence this.",
+            RuntimeWarning,
+        )
+    return objective
+
+
+def _weighted_rewards(rewards, weights):
+    total = rewards * weights[0]
+    for weight in weights[1:]:
+        total = total + rewards * weight
+    return total
+
+
+def _dpo_pair_loss(objective, terms):
+    total = None
+    for name, weight in zip(objective.loss_types, objective.weights):
+        term = _DPO_VARIANTS[name](objective, terms) * weight
+        total = term if total is None else total + term
+    return total
+
+
+def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
+    _require_kind(objective, "dpo")
+    _require_reference(objective, reference_policy)
+
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None, reference=None):
+        terms, stats = _dpo_scores(
+            model, batch, lengths, objective, reference_policy=reference_policy,
+            scorer=_scorer, cce_indices=cce_indices, reference=reference,
+        )
+        pair_loss = _dpo_pair_loss(objective, terms)
+        _, window_pairs, window_microbatches = normalizers
+        loss = window_microbatches.astype(mx.float32) * pair_loss.sum() / mx.maximum(
+            window_pairs, mx.array(1),
+        ).astype(mx.float32)
+        return loss, mx.array(1, dtype=mx.int32), stats
+
+    loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["dpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["dpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["dpo"]
+    return loss_fn
+
+
+def _cpo_loss(objective, nll_sum, nll_tokens, pair_loss, pairs):
+    loss = pair_loss.sum() / mx.maximum(pairs, mx.array(1)).astype(mx.float32)
+    if objective.cpo_alpha == 0:
+        # TRL skips the NLL rather than weighting it by zero.
+        return loss
+    return loss + objective.cpo_alpha * nll_sum / mx.maximum(
+        nll_tokens, mx.array(1),
+    ).astype(mx.float32)
+
+
+def make_cpo_loss_fn(objective, *, _scorer=None):
+    """Create a CPO loss with exact logical-window normalization."""
+    _require_kind(objective, "cpo")
+
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
+        nll_sum, _batch_nll_tokens, pair_loss, stats = _cpo_scores(
+            model, batch, lengths, objective, scorer=_scorer,
+            cce_indices=cce_indices,
+        )
+        nll_tokens, window_pairs, window_microbatches = normalizers
+        loss = window_microbatches.astype(mx.float32) * _cpo_loss(
+            objective, nll_sum, nll_tokens, pair_loss, window_pairs,
+        )
+        return loss, mx.array(1, dtype=mx.int32), stats
+
+    loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["cpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["cpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["cpo"]
+    return loss_fn
+
+
+def make_cpo_cce_loss_fn(model, objective):
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_cpo_loss_fn(objective, _scorer=scorer), scorer)
+
+
+def _scatter_rows(values, indices, size):
+    values = mx.where(indices >= 0, values, mx.array(0, values.dtype))
+    return mx.zeros((size,), values.dtype).at[mx.maximum(indices, 0)].add(values)
+
+
+def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
+    """Each row's logits summed over the vocabulary, one vocabulary chunk at a time.
+
+    Uncapped logits are linear in the head, so their sum projects onto the summed
+    weight rows; a softcap needs the logits themselves.
+    """
+    vocab = weight.shape[0]
+    # Without a softcap a chunk holds weight rows, not a row of logits per token.
+    step = _resolve_chunk_size(
+        0, hidden.shape[0] if softcap else hidden.shape[-1], vocab,
+    )
+    total = 0.0
+    for start in range(0, vocab, step):
+        chunk = [None if value is None else value[start:start + step]
+                 for value in (weight, scales, biases)]
+        if softcap:
+            logits = _chunk_matmul(hidden, chunk[0], scales=chunk[1], biases=chunk[2],
+                                   **quantization)
+            total = total + _apply_softcap(logits.astype(mx.float32), softcap).sum(axis=-1)
+        elif scales is not None:
+            total = total + mx.dequantize(*chunk, **quantization).astype(mx.float32).sum(axis=0)
+        else:
+            total = total + chunk[0].astype(mx.float32).sum(axis=0)
+    return total if softcap else hidden.astype(mx.float32) @ total
+
+
+def _make_preference_cce_scorer(model, *, temperature=1.0):
+    """Score preference positions from hidden states through runtime CCE.
+
+    Returns None unless the hidden states are reachable and the head is an
+    unwrapped, bias-free dense or frozen quantized projection. ``temperature``
+    divides the logits; a softcapped head cannot take it through the hidden states.
+    """
+    from . import utils
+
+    if utils._get_text_backbone(model) is None and not utils._has_direct_hidden_stack(model):
+        return None
+    if utils._is_vlm_model(model) and not hasattr(model, "get_input_embeddings"):
+        return None
+    desc = utils.describe_output_head(model)
+    if utils._cce_head_ineligibility(desc) is not None:
+        return None
+    scale, problem = utils._detect_head_transform(model, desc.status)
+    softcap, softcap_problem = utils._detect_logit_softcap(model)
+    if problem is not None or softcap_problem is not None or (softcap and temperature != 1.0):
+        return None
+    quantization = {}
+    if desc.quantized:
+        # The quantized kernel returns no weight gradient.
+        if desc.module.trainable_parameters():
+            return None
+        quantization = dict(group_size=getattr(desc.module, "group_size", 64),
+                            bits=getattr(desc.module, "bits", 4),
+                            mode=getattr(desc.module, "mode", "affine"))
+    frozen = not utils._is_lm_head_trainable(model)
+    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
+                                    quantized=desc.quantized, weight_is_frozen=frozen,
+                                    **quantization)
+
+    def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True):
+        """Token cross entropy and logit sums per position, as float32 grids.
+
+        Cross entropy is zero outside ``supervised``. ``indices`` limits the
+        kernel to those rows, which then also limits the logit sums unless
+        ``every_position``. Without ``logit_sums`` the sums are None.
+        """
+        targets = _preference_ids(batch)[:, 1:]
+        hidden = _preference_hidden(model, batch)
+        head = utils._resolve_module_path(model, desc.path)
+        # Before compaction: the logit sums below may read every row.
+        hidden = utils._rotate_head_input(head, hidden.reshape((-1, hidden.shape[-1])))
+        if scale is not None:
+            hidden = hidden * scale
+        if temperature != 1.0:
+            hidden = hidden / temperature
+        labels = utils._normalize_cce_label_dtype(targets)
+        labels = mx.where(supervised, labels, mx.array(-100, labels.dtype))
+        rows, labels = utils._compact_cce_inputs(hidden, labels.reshape((-1,)), indices)
+        weight = mx.stop_gradient(head.weight) if frozen else head.weight
+        scales = biases = None
+        if desc.quantized:
+            scales, biases = head.scales, head.get("biases")
+            if biases is None and quantization["mode"] == "affine":
+                biases = mx.zeros_like(scales)
+            ce = kernel(rows, weight, scales, biases, labels)
+        else:
+            ce = kernel(rows, weight, labels)
+        if indices is not None:
+            ce = _scatter_rows(ce, indices, targets.size)
+        if not logit_sums:
+            return ce.reshape(targets.shape), None
+        summed = hidden if every_position or indices is None else rows
+        sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
+        if indices is not None and summed is rows:
+            sums = _scatter_rows(sums, indices, targets.size)
+        return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape))
+
+    score.vocab = desc.module.weight.shape[0]
+    score.compaction = score.vocab >= 8192
+    return score
+
+
+def _logit_totals(sums, mask, vocab):
+    pairs = sums.shape[0] // 2
+    sums = sums * mask
+    return (sums[:pairs].sum(), sums[pairs:].sum(),
+            mask[:pairs].sum() * vocab, mask[pairs:].sum() * vocab)
+
+
+def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_dpo_loss_fn(
+        objective, reference_policy=reference_policy, _scorer=scorer,
+    ), scorer)
+
+
+_SHARED_EVAL_METRICS = (
+    "rewards/chosen",
+    "rewards/rejected",
+    "rewards/accuracies",
+    "rewards/margins",
+    "logps/chosen",
+    "logps/rejected",
+    "logits/chosen",
+    "logits/rejected",
+)
+
+# The names TRL logs for these objectives, so a run reads the same on
+# either backend. ORPO adds the three terms its loss decomposes into.
+PREFERENCE_EVAL_METRICS = {
+    "dpo": _SHARED_EVAL_METRICS,
+    "orpo": _SHARED_EVAL_METRICS + (
+        "nll_loss", "log_odds_ratio", "log_odds_chosen",
+    ),
+    "cpo": _SHARED_EVAL_METRICS + ("nll_loss",),
+}
+
+
+# An unscaled float16 vocabulary row sum overflows to inf, which the mask then
+# turns into NaN. This is the smallest normal float16, so undoing it is exact.
+_LOGIT_SUM_SCALE = 2.0 ** -14
+
+
+def _row_logit_sum(logits):
+    """Logit sum per position, accumulated in float32 by the matmul, not mx.sum."""
+    weights = mx.full(
+        (logits.shape[-1], 1), _LOGIT_SUM_SCALE, dtype = logits.dtype,
+    )
+    return (logits @ weights).astype(mx.float32).squeeze(-1) / _LOGIT_SUM_SCALE
+
+
+def _masked_logit_sum(logits, mask):
+    """Logit sum over the response positions, and the count it divides by.
+
+    Separate so the eval set's mean is taken over all of its positions at once.
+    """
+    kept = mask.sum() * logits.shape[-1]
+    return (_row_logit_sum(logits) * mask).sum(), kept
+
+
+def _orpo_logit_sum(logits):
+    return _row_logit_sum(logits).sum(), mx.array(float(math.prod(logits.shape)))
+
+
+_PREFERENCE_DENOMINATOR_NAMES = {
+    "dpo": ("chosen_logits", "rejected_logits", "pairs"),
+    "orpo": ("chosen_logits", "rejected_logits", "nll_tokens", "pairs"),
+    "cpo": ("chosen_logits", "rejected_logits", "nll_tokens", "pairs"),
+}
+
+# Token means, unlike TRL, which weights per-micro-batch means equally and so
+# reports a number that moves with per_device_train_batch_size.
+_PREFERENCE_TOKEN_DENOMINATORS = {
+    "dpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+    },
+    "orpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+        "nll_loss": "nll_tokens",
+    },
+    "cpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+        "nll_loss": "nll_tokens",
+    },
+}
+
+
+def _preference_denominators(kind):
+    names = PREFERENCE_EVAL_METRICS[kind]
+    offsets = {
+        name: len(names) + offset
+        for offset, name in enumerate(_PREFERENCE_DENOMINATOR_NAMES[kind])
+    }
+    token_means = _PREFERENCE_TOKEN_DENOMINATORS[kind]
+    return {
+        index: offsets[token_means.get(name, "pairs")]
+        for index, name in enumerate(names)
+    }
+
+
+PREFERENCE_EVAL_DENOMINATORS = {
+    kind: _preference_denominators(kind) for kind in PREFERENCE_EVAL_METRICS
+}
+
+# Reported metrics, then the denominators the trainer sums alongside them.
+PREFERENCE_EVAL_STATS_WIDTH = {
+    kind: len(names) + len(_PREFERENCE_DENOMINATOR_NAMES[kind])
+    for kind, names in PREFERENCE_EVAL_METRICS.items()
+}
+
+
+def _preference_stats(
+    kind, logits, mask, *, chosen, rejected, chosen_rewards, rejected_rewards,
+    extra=(), extra_denominators=(), logit_totals=None,
+):
+    """Numerators then denominators, all sums, so a window average is exact."""
+    pairs = chosen.shape[0]
+    # TRL is inconsistent between its trainers: DPOTrainer averages its logit
+    # metric over completion positions, ORPOTrainer and CPOTrainer over every
+    # padded position, so those two follow each backend's padding width.
+    if logit_totals is not None:
+        chosen_logits, rejected_logits, chosen_count, rejected_count = logit_totals
+    elif kind != "dpo":
+        chosen_logits, chosen_count = _orpo_logit_sum(logits[:pairs])
+        rejected_logits, rejected_count = _orpo_logit_sum(logits[pairs:])
+    else:
+        chosen_logits, chosen_count = _masked_logit_sum(
+            logits[:pairs], mask[:pairs])
+        rejected_logits, rejected_count = _masked_logit_sum(
+            logits[pairs:], mask[pairs:])
+    values = [
+        chosen_rewards.sum(),
+        rejected_rewards.sum(),
+        (chosen_rewards > rejected_rewards).astype(mx.float32).sum(),
+        (chosen_rewards - rejected_rewards).sum(),
+        chosen.sum(),
+        rejected.sum(),
+        chosen_logits,
+        rejected_logits,
+        *extra,
+        chosen_count,
+        rejected_count,
+        *extra_denominators,
+        mx.array(float(pairs)),
+    ]
+    return mx.stop_gradient(
+        mx.stack([value.astype(mx.float32) for value in values])
+    )
+
+
+def _preference_forward(model, batch, supervised):
+    """Logits and per-token cross entropy, scoring the ``supervised`` positions."""
+    logits = _preference_logits(model, batch)
+    return logits, _token_cross_entropy(logits, _preference_ids(batch)[:, 1:], supervised)
+
+
+def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
+    """Unreduced: training normalizes over its window, evaluation over the batch."""
+    ids = _preference_ids(batch)
+    pairs = ids.shape[0] // 2
+    nll_mask = (
+        mx.arange(1, ids.shape[1]) < lengths[:pairs, 1:]
+    ).astype(mx.float32)
+    logits = logit_totals = None
+    mask = _response_mask(ids[:, 1:], lengths)
+    # The chosen NLL spans the whole sequence, not only the response.
+    supervised = mx.concatenate([nll_mask, mask[pairs:]]) > 0
+    if scorer is None:
+        logits, ce = _preference_forward(model, batch, supervised)
+    else:
+        ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True)
+        logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
+    response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
+        mask.sum(axis=1), mx.array(1.0),
+    )
+    chosen, rejected = response_logp[:pairs], response_logp[pairs:]
+    nll_tokens = nll_mask.sum()
+    nll_sum = (ce[:pairs] * nll_mask).sum()
+    log_odds = _orpo_log_odds(chosen, rejected)
+    ratio = _log_sigmoid(log_odds)
+    stats = _preference_stats(
+        "orpo", logits, mask, logit_totals=logit_totals,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=beta * chosen, rejected_rewards=beta * rejected,
+        extra=(nll_sum, ratio.sum(), log_odds.sum()),
+        extra_denominators=(nll_tokens,),
+    )
+    return nll_sum, nll_tokens, ratio, stats
+
+
+def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=None):
+    """Unreduced: training normalizes over its window, evaluation over the batch."""
+    pairs = lengths.shape[0] // 2
+    logits = logit_totals = None
+    mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
+    if scorer is None:
+        logits, ce = _preference_forward(model, batch, mask)
+    else:
+        ce, sums = scorer(model, batch, mask > 0, cce_indices, every_position=True)
+        logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
+    logps = -(ce * mask).sum(axis=1)
+    if objective.length_normalized:
+        logps = logps / mx.maximum(mask.sum(axis=1), mx.array(1.0))
+    chosen, rejected = logps[:pairs], logps[pairs:]
+    # Unlike ORPO's, the chosen NLL covers the response only.
+    nll_tokens = mask[:pairs].sum()
+    nll_sum = (ce[:pairs] * mask[:pairs]).sum()
+    chosen_rewards = _cpo_rewards(objective, chosen)
+    rejected_rewards = _cpo_rewards(objective, rejected)
+    pair_loss = _CPO_VARIANTS[objective.loss_types[0]](
+        objective, chosen_rewards - rejected_rewards,
+    )
+    stats = _preference_stats(
+        "cpo", logits, mask, logit_totals=logit_totals,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=objective.beta * chosen_rewards,
+        rejected_rewards=objective.beta * rejected_rewards,
+        extra=(mx.zeros_like(nll_sum) if objective.cpo_alpha == 0 else nll_sum,),
+        extra_denominators=(nll_tokens,),
+    )
+    return nll_sum, nll_tokens, pair_loss, stats
+
+
+def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
+                scorer=None, cce_indices=None, reference=None):
+    """Score one DPO batch; ``reference`` holds precomputed reference log probabilities."""
+    pairs = lengths.shape[0] // 2
+    logits = logit_totals = None
+    mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
+    if scorer is None:
+        logits, ce = _preference_forward(model, batch, mask)
+    else:
+        ce, sums = scorer(model, batch, mask > 0, cce_indices)
+        logit_totals = _logit_totals(sums, mask, scorer.vocab)
+    logps = -(ce * mask).sum(axis=1)
+    if reference is not None:
+        reference = reference.astype(logps.dtype)
+    elif objective.reference_free:
+        reference = mx.zeros(logps.shape, dtype=logps.dtype)
+    elif scorer is not None and reference_policy.model is None:
+        def response_scorer(model, batch, _lengths):
+            return -(scorer(model, batch, mask > 0, cce_indices)[0] * mask).sum(axis=1)
+        reference = reference_policy.forward(model, batch, lengths, response_scorer=response_scorer)
+    else:
+        reference = reference_policy.forward(model, batch, lengths)
+    if objective.length_normalized:
+        counts = mx.maximum(mask.sum(axis=1), mx.array(1.0))
+        logps = logps / counts
+        reference = reference / counts
+    beta = objective.beta
+    chosen, rejected = logps[:pairs], logps[pairs:]
+    ref_chosen, ref_rejected = reference[:pairs], reference[pairs:]
+    # TRL adds the rewards once per loss entry, so a two-entry list reports twice
+    # a one-entry list; summed in its order, not scaled by the summed weights.
+    stats = _preference_stats(
+        "dpo", logits, mask, logit_totals=logit_totals,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=_weighted_rewards(
+            beta * (chosen - ref_chosen), objective.weights),
+        rejected_rewards=_weighted_rewards(
+            beta * (rejected - ref_rejected), objective.weights),
+    )
+    terms = _DPOTerms(
+        chosen=chosen, rejected=rejected,
+        ref_chosen=ref_chosen, ref_rejected=ref_rejected,
+        chosen_ratio=chosen - ref_chosen,
+        rejected_ratio=rejected - ref_rejected,
+        delta=(chosen - rejected) - (ref_chosen - ref_rejected),
+    )
+    return terms, stats
+
+
+def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
+    """Score one preference batch as ``(loss, pairs, stats)``.
+
+    ``stats`` holds a numerator per metric in ``PREFERENCE_EVAL_METRICS[kind]``
+    order, then the denominators ``PREFERENCE_EVAL_DENOMINATORS[kind]`` names.
+    Nothing is a per-batch mean, so the eval set averages exactly.
+    """
+    _require_reference(objective, reference_policy)
+    kind = objective.kind
+    beta = objective.beta
+    scorer = None if model is None else _make_preference_cce_scorer(model)
+    if kind == "kto":
+        return _make_kto_eval_fn(objective, reference_policy, scorer)
+
+    def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None, reference=None):
+        pairs = lengths.shape[0] // 2
+        if kind == "orpo":
+            nll_sum, nll_tokens, ratio, stats = _orpo_scores(
+                model, batch, lengths, beta, scorer=scorer, cce_indices=cce_indices,
+            )
+            loss = (
+                nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
+                - beta * ratio.mean()
+            )
+        elif kind == "cpo":
+            nll_sum, nll_tokens, pair_loss, stats = _cpo_scores(
+                model, batch, lengths, objective, scorer=scorer,
+                cce_indices=cce_indices,
+            )
+            loss = _cpo_loss(
+                objective, nll_sum, nll_tokens, pair_loss, mx.array(pairs),
+            )
+        else:
+            terms, stats = _dpo_scores(
+                model, batch, lengths, objective,
+                reference_policy=reference_policy,
+                scorer=scorer, cce_indices=cce_indices, reference=reference,
+            )
+            loss = _dpo_pair_loss(objective, terms).mean()
+        return loss, mx.array(pairs, dtype=mx.int32), stats
+
+    eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
+    eval_fn._unsloth_cce_scorer = scorer
+    eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
+    eval_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH[kind]
+    eval_fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
+    eval_fn._unsloth_cce_kind = kind
+    return eval_fn
+
+
+KTO_LOSS_TYPES = ("kto", "apo_zero_unpaired")
+
+# Summed per side, divided by each side's rows (TRL KTOTrainer.log); KL per batch.
+KTO_METRICS = (
+    "rewards/chosen", "rewards/rejected", "logps/chosen", "logps/rejected",
+    "logits/chosen", "logits/rejected", "kl",
+)
+# The metric sums, then chosen rows, rejected rows and batches.
+KTO_STATS_WIDTH = len(KTO_METRICS) + 3
+
+
+def kto_metric_values(summed):
+    """TRL's logged KTO metrics from summed stats; a side with no rows is left out."""
+    sums = dict(zip(KTO_METRICS, summed))
+    chosen, rejected, batches = summed[len(KTO_METRICS):]
+    values = {}
+    for side, count in (("chosen", chosen), ("rejected", rejected)):
+        if count > 0:
+            for metric in ("rewards", "logps", "logits"):
+                values[f"{metric}/{side}"] = sums[f"{metric}/{side}"] / count
+    if chosen > 0 and rejected > 0:
+        values["rewards/margins"] = values["rewards/chosen"] - values["rewards/rejected"]
+    values["kl"] = sums["kl"] / batches if batches > 0 else 0.0
+    return values
+
+
+def _kto_supervised_tokens(batch_data):
+    rows = batch_data[3].shape[0]
+    return _supervised_tokens((batch_data[0][:rows], batch_data[1][:rows]))
+
+
+def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
+                scorer=None, reference=None, kl_mean=None):
+    """Per-row weighted losses and the batch's metric sums."""
+    rows = labels.shape[0]
+    completions, completion_lengths = batch[:rows], lengths[:rows]
+    mask = _response_mask(completions[:, 1:], completion_lengths)
+    # Real-token positions only; TRL's sum also counts its collator's padding.
+    positions = (
+        mx.arange(1, completions.shape[1]) < completion_lengths[:, 1:]
+    ).astype(mx.float32)
+    if scorer is None:
+        logits, ce = _preference_forward(model, completions, mask)
+        logit_sums = (_row_logit_sum(logits) * positions).sum(axis=1)
+    else:
+        ce, sums = scorer(model, completions, mask > 0, every_position=True)
+        logit_sums = (sums * positions).sum(axis=1)
+    logps = -(ce * mask).sum(axis=1)
+
+    def score(model, batch, lengths):
+        if scorer is None:
+            return _response_logps(model, batch, lengths)
+        batch_mask = _response_mask(batch[:, 1:], lengths)
+        return -(scorer(model, batch, batch_mask > 0)[0] * batch_mask).sum(axis=1)
+
+    if reference is None:
+        reference = reference_policy.forward(
+            model, batch, lengths,
+            response_scorer=(
+                score if scorer is not None and reference_policy.model is None
+                else None
+            ),
+        )
+    reference = reference.astype(mx.float32)
+    zero = mx.array(0.0, mx.float32)
+    kl = zero
+    if objective.with_kl:
+        # TRL scores KL rows under no_grad: a separate, undifferentiated forward.
+        policy_kl = mx.stop_gradient(score(model, batch[rows:], lengths[rows:]))
+        kl = (policy_kl.astype(mx.float32) - reference[rows:]).mean()
+        if kl_mean is not None:
+            kl = kl_mean(kl)
+        kl = mx.stop_gradient(mx.maximum(kl, zero))
+    logratio = logps.astype(mx.float32) - reference[:rows]
+    desirable = labels.astype(mx.bool_)
+    beta = objective.beta
+    if objective.with_kl:
+        chosen_loss = 1.0 - mx.sigmoid(beta * (logratio - kl))
+        rejected_loss = 1.0 - mx.sigmoid(beta * (kl - logratio))
+    else:
+        chosen_loss = 1.0 - mx.sigmoid(beta * logratio)
+        rejected_loss = mx.sigmoid(beta * logratio)
+    losses = mx.where(
+        desirable,
+        objective.desirable_weight * chosen_loss,
+        objective.undesirable_weight * rejected_loss,
+    )
+    chosen = desirable.astype(mx.float32)
+    rejected = 1.0 - chosen
+    sums = []
+    for values in (beta * logratio, logps.astype(mx.float32), logit_sums):
+        sums += [(values * chosen).sum(), (values * rejected).sum()]
+    stats = mx.stop_gradient(mx.stack(
+        sums + [kl, chosen.sum(), rejected.sum(), mx.array(1.0, mx.float32)]
+    ))
+    return losses, stats
+
+
+def _mark_kto_fn(fn, scorer):
+    fn._unsloth_preference_metrics = KTO_METRICS
+    fn._unsloth_preference_stats_width = KTO_STATS_WIDTH
+    fn._unsloth_preference_report = kto_metric_values
+    # A KTO batch has no chosen/rejected halves to compact.
+    fn._unsloth_cce_compaction = False
+    fn._unsloth_cce_scorer = scorer
+    if scorer is not None:
+        fn._unsloth_cce_backend = "runtime-cce"
+    return fn
+
+
+def make_kto_loss_fn(objective, *, reference_policy, kl_mean=None, _scorer=None):
+    """Create a KTO loss normalized over the rows of its logical window.
+
+    ``kl_mean`` maps this process's KL estimate to the mean across processes
+    before it is clamped, as TRL gathers it.
+    """
+    _require_kind(objective, "kto")
+    _require_reference(objective, reference_policy)
+
+    def loss_fn(model, batch, lengths, normalizers, labels, reference=None):
+        losses, stats = _kto_scores(
+            model, batch, lengths, labels, objective,
+            reference_policy=reference_policy, scorer=_scorer,
+            reference=reference, kl_mean=kl_mean,
+        )
+        _, window_rows, window_microbatches = normalizers
+        loss = window_microbatches.astype(mx.float32) * losses.sum() / mx.maximum(
+            window_rows, mx.array(1),
+        ).astype(mx.float32)
+        return loss, mx.array(1, dtype=mx.int32), stats
+
+    loss_fn._unsloth_supervised_tokens = _kto_supervised_tokens
+    return _mark_kto_fn(loss_fn, _scorer)
+
+
+def make_kto_cce_loss_fn(model, objective, *, reference_policy, kl_mean=None):
+    return make_kto_loss_fn(
+        objective, reference_policy=reference_policy, kl_mean=kl_mean,
+        _scorer=_make_preference_cce_scorer(model),
+    )
+
+
+def _make_kto_eval_fn(objective, reference_policy, scorer):
+    def eval_fn(model, batch, lengths, _normalizers, labels, reference=None):
+        losses, stats = _kto_scores(
+            model, batch, lengths, labels, objective,
+            reference_policy=reference_policy, scorer=scorer, reference=reference,
+        )
+        return losses.mean(), mx.array(labels.shape[0], dtype=mx.int32), stats
+
+    return _mark_kto_fn(eval_fn, scorer)
+
+
+def lora_modules_have_nonzero_delta(modules):
+    def has_values(value):
+        if value is not None and not hasattr(value, "shape"):
+            value = getattr(value, "weight", None)
+        if value is None or not hasattr(value, "shape"):
+            return True
+        try:
+            result = mx.any(value != 0)
+            mx.eval(result)
+            return bool(result.item())
+        except Exception:
+            return True
+
+    return any(
+        has_values(module.lora_a) and has_values(module.lora_b)
+        for module in modules
+    )
+
+
+def _dora_base_magnitude(module, objective_name):
+    """Base weight row norms, as set_linear / set_embedding set DoRA's magnitude."""
+    if hasattr(module, "_dequantized_weight"):
+        weight = module._dequantized_weight().astype(mx.float32)
+    elif hasattr(getattr(module, "embedding", None), "weight"):
+        weight = module.embedding.weight
+    else:
+        raise ValueError(
+            f"Unsloth MLX {objective_name}: cannot recover the base magnitude of a "
+            f"{type(module).__name__}; its base weight is not where DoRALinear "
+            "or DoRAEmbedding keeps it."
+        )
+    return mx.linalg.norm(weight, axis=1).astype(module.m.dtype)
+
+
+def _adapter_carries_delta(modules, magnitudes):
+    return lora_modules_have_nonzero_delta(modules) or any(
+        not bool(mx.allclose(module.m, magnitude, rtol=1e-3))
+        for module, magnitude in magnitudes
+    )
+
+
+def _owner_of(by_name, parameter_path, *, objective_name, of="the model"):
+    module_path, _, attribute = parameter_path.rpartition(".")
+    module = by_name.get(module_path)
+    if module is None:
+        raise ValueError(
+            f"Unsloth MLX {objective_name}: the reference cannot stand in for "
+            f"{parameter_path!r}, which no module of {of} owns: a "
+            "parameter held in a list or dict is not supported for a "
+            "referenced run."
+            + (" Use reference_free=True." if objective_name == "DPO" else "")
+        )
+    return module, attribute
+
+
+def _reference_adapter_overrides(
+    by_name, parameters, adapters, path, *, dora, objective_name,
+):
+    """Return a saved adapter's scale, its tensors as overrides, and their names."""
+    path = Path(path)
+    weights_file = path / "adapters.safetensors"
+    if not weights_file.is_file():
+        raise ValueError(
+            f"Unsloth MLX {objective_name}: ref_adapter_name={str(path)!r} is not a saved "
+            "adapter directory: it has no adapters.safetensors."
+        )
+    tensors = mx.load(str(weights_file))
+    config_file = path / "adapter_config.json"
+    config = {}
+    if config_file.is_file():
+        with open(config_file, encoding="utf-8") as handle:
+            config = json.load(handle)
+    kind = config.get("fine_tune_type")
+    if kind in ("lora", "dora") and (kind == "dora") != dora:
+        raise ValueError(
+            f"Unsloth MLX {objective_name}: the reference adapter is {kind} and this "
+            f"model's adapters are {'dora' if dora else 'lora'}; the reference "
+            "must adapt the same way."
+        )
+    lora_parameters = config.get("lora_parameters") or {}
+    # The adapter loader reads missing scale metadata as 1.0.
+    scale = float(lora_parameters.get("scale", config.get("scale", 1.0)))
+    missing = sorted(name for name in adapters if name not in tensors)
+    if missing:
+        raise ValueError(
+            f"Unsloth MLX {objective_name}: the reference adapter lacks {len(missing)} of "
+            f"this model's {len(adapters)} adapter tensors, starting with "
+            f"{missing[0]!r}. The reference must adapt the same modules."
+        )
+    overrides = []
+    for name, value in parameters.items():
+        if name not in tensors:
+            continue
+        reference = tensors[name]
+        if tuple(reference.shape) != tuple(value.shape):
+            raise ValueError(
+                f"Unsloth MLX {objective_name}: the reference adapter's {name!r} "
+                "has shape "
+                f"{tuple(reference.shape)}, but this model's has "
+                f"{tuple(value.shape)}; its rank or layout differs."
+            )
+        module, attribute = _owner_of(by_name, name, objective_name=objective_name)
+        overrides.append((module, attribute, reference.astype(value.dtype)))
+    # mx.load is lazy and file-backed: read before the directory can change.
+    mx.eval(*(value for _, _, value in overrides))
+    unused = sorted(set(tensors) - set(parameters))
+    if unused:
+        warnings.warn(
+            f"Unsloth MLX {objective_name}: the reference adapter names {len(unused)} "
+            "parameters this model does not have, and they are ignored "
+            f"(first: {unused[:3]}).",
+            RuntimeWarning, stacklevel=3,
+        )
+    return scale, overrides, set(tensors)
+
+
+def _snapshot_policy(by_name, trainable, *, neftune, synced, objective_name, fixed=()):
+    """Hold every trainable tensor at the value given; ``fixed`` overrides never sync."""
+    return ReferencePolicy(
+        overrides=[
+            (*_owner_of(by_name, name, objective_name=objective_name), value)
+            for name, value in trainable.items()
+        ] + list(fixed),
+        paths=list(trainable) if synced else (),
+        neftune_modules=neftune, objective_name=objective_name,
+    )
+
+
+def _check_provenance(resume_provenance, provenance, objective_name):
+    if resume_provenance is not None and resume_provenance != provenance:
+        raise ValueError(
+            f"Unsloth MLX {objective_name}: the checkpoint reference provenance "
+            "does not match "
+            "this model, adapter layout, or reference."
+        )
+
+
+def build_reference_policy(
+    model, *, reference_free, resume_provenance, neftune=(),
+    ref_adapter_name=None, model_adapter_name=None,
+    ref_model=None, force_use_ref_model=False, sync_ref_model=False,
+    objective_name="DPO",
+):
+    """Validate the reference and build its policy in TRL's order: ref_model, adapters off, start weights."""
+    if reference_free:
+        return None, {"kind": "reference_free"}
+    if model_adapter_name not in (None, "default"):
+        raise ValueError(
+            f"Unsloth MLX {objective_name}: model_adapter_name names one of several PEFT "
+            "adapters, and an MLX model carries a single unnamed adapter set, "
+            "which is the one trained. Leave it None; ref_adapter_name takes "
+            "the directory of the saved adapter to score against."
+        )
+    named_modules = list(iter_mlx_lora_modules(model))
+    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    if not trainable:
+        raise ValueError(
+            f"Unsloth MLX {objective_name}: this model has no trainable parameters to "
+            "reference."
+        )
+    provenance = {
+        "kind": "plain_lora_base",
+        "base_repo": getattr(model, "_hf_repo", None),
+        "base_revision": getattr(model, "_unsloth_base_revision", None),
+        "base_commit": getattr(model, "_unsloth_base_commit_hash", None),
+        "adapter_modules": [name for name, _ in named_modules],
+    }
+    if sync_ref_model:
+        # Absent from unsynced provenance, so earlier checkpoints still match.
+        provenance["synced"] = True
+        packed = [
+            name for name, value in trainable.items()
+            if not mx.issubdtype(value.dtype, mx.floating)
+        ]
+        if packed:
+            raise ValueError(
+                "Unsloth MLX DPO: sync_ref_model mixes each trainable tensor "
+                f"in float, and {packed[0]!r} is {trainable[packed[0]].dtype}: "
+                "a quantized weight cannot be mixed."
+            )
+    if ref_model is not None:
+        if not hasattr(ref_model, "parameters"):
+            raise ValueError(
+                f"Unsloth MLX {objective_name}: ref_model must be a loaded MLX model, "
+                f"not {type(ref_model).__name__}; MLX {objective_name} does not load a "
+                "reference from a model id."
+            )
+        if ref_model is model:
+            raise ValueError(
+                f"Unsloth MLX {objective_name}: model and ref_model cannot be the same "
+                "object. Load the reference separately, or pass ref_model=None."
+            )
+        if ref_adapter_name is not None:
+            raise ValueError(
+                f"Unsloth MLX {objective_name}: ref_model and ref_adapter_name each "
+                "name a "
+                "reference; pass one of them."
+            )
+        if named_modules and not (force_use_ref_model or sync_ref_model):
+            warnings.warn(
+                f"Unsloth MLX {objective_name}: this model carries adapters, so its "
+                "base is "
+                "already the reference and a ref_model doubles the memory. "
+                "Pass ref_model=None" + (
+                    ", or force_use_ref_model=True to score against a different "
+                    "model without this warning." if objective_name == "DPO" else "."
+                ),
+                RuntimeWarning, stacklevel=2,
+            )
+        ref_model.eval()
+        mirrored = []
+        if sync_ref_model:
+            reference_tensors = dict(mlx.utils.tree_flatten(ref_model.parameters()))
+            ref_by_name = dict(ref_model.named_modules())
+            for name, value in trainable.items():
+                held = reference_tensors.get(name)
+                if (
+                    held is None or tuple(held.shape) != tuple(value.shape)
+                    or not mx.issubdtype(held.dtype, mx.floating)
+                ):
+                    raise ValueError(
+                        "Unsloth MLX DPO: sync_ref_model mixes each trainable "
+                        "tensor of the model into the same-named tensor of "
+                        f"ref_model, which has no floating {name!r} of shape "
+                        f"{tuple(value.shape)}. Load the reference the way the "
+                        "model is loaded, adapters included."
+                    )
+                mirrored.append(_owner_of(
+                    ref_by_name, name, objective_name=objective_name, of="ref_model",
+                ))
+        provenance.update(
+            kind="reference_model",
+            reference_repo=getattr(ref_model, "_hf_repo", None),
+            reference_commit=getattr(ref_model, "_unsloth_base_commit_hash", None),
+        )
+        _check_provenance(resume_provenance, provenance, objective_name)
+        return ReferencePolicy(
+            model=ref_model, mirrored=mirrored,
+            paths=list(trainable) if sync_ref_model else (), objective_name=objective_name,
+        ), provenance
+    by_name = dict(model.named_modules())
+    if not named_modules:
+        if ref_adapter_name is not None:
+            raise ValueError(
+                f"Unsloth MLX {objective_name}: ref_adapter_name replaces this model's "
+                "adapter tensors, and a full fine-tune has none."
+            )
+        provenance["kind"] = "parameter_snapshot"
+        _check_provenance(resume_provenance, provenance, objective_name)
+        return _snapshot_policy(
+            by_name, trainable, neftune=neftune, synced=sync_ref_model,
+            objective_name=objective_name,
+        ), provenance
+    if sync_ref_model and ref_adapter_name is not None:
+        raise ValueError(
+            "Unsloth MLX DPO: sync_ref_model moves the reference toward the "
+            "policy, and a saved reference adapter is fixed. Pass ref_model "
+            "instead, as TRL's DPOTrainer requires for TR-DPO."
+        )
+    adapters = collect_mlx_lora_adapter_tensors(model)
+    if not any(name in adapters for name in trainable):
+        raise ValueError(
+            f"Unsloth MLX {objective_name}: referenced training requires at least one "
+            "trainable LoRA adapter tensor."
+        )
+    modules = [module for _, module in named_modules]
+    if ref_adapter_name is not None:
+        provenance["kind"] = "reference_adapter"
+        provenance["reference_adapter"] = os.path.normpath(str(ref_adapter_name))
+    _check_provenance(resume_provenance, provenance, objective_name)
+    # Held at its start value, as PEFT restores modules_to_save.
+    extra = [name for name in trainable if name not in adapters]
+    reloaded = sorted(
+        name for name in getattr(model, "_unsloth_reloaded_parameter_keys", ())
+        if name not in adapters
+    )
+    magnitudes = [
+        (module, _dora_base_magnitude(module, objective_name))
+        for module in modules if is_mlx_dora_module(module)
+    ]
+    delta = resume_provenance is None and _adapter_carries_delta(
+        modules, magnitudes,
+    )
+    trained = reloaded + (
+        [name for name in extra if name not in reloaded] if delta else []
+    )
+    if ref_adapter_name is None:
+        if sync_ref_model:
+            if delta or trained:
+                carried = (
+                    f"the loader restored trained tensors beside the adapter "
+                    f"(starting with {reloaded[0]!r})" if reloaded
+                    else "this model's adapter already carries a delta"
+                )
+                raise ValueError(
+                    "Unsloth MLX DPO: sync_ref_model starts the reference at "
+                    f"the base model, and {carried}. Pass ref_model=<a second "
+                    "load of the model, adapters included> to start the "
+                    "reference where the policy starts, as TRL's DPOTrainer "
+                    "requires for TR-DPO."
+                )
+            magnitude_paths = {
+                id(module): f"{name}.m" if name else "m"
+                for name, module in named_modules
+            }
+            base_magnitudes = {
+                magnitude_paths[id(module)]: magnitude
+                for module, magnitude in magnitudes
+                if magnitude_paths[id(module)] in trainable
+            }
+            return _snapshot_policy(
+                by_name, {**trainable, **base_magnitudes},
+                neftune=neftune, synced=True, objective_name=objective_name,
+                fixed=[
+                    (module, "m", magnitude)
+                    for module, magnitude in magnitudes
+                    if magnitude_paths[id(module)] not in trainable
+                ],
+            ), provenance
+        if trained:
+            raise ValueError(
+                f"Unsloth MLX {objective_name}: the model carries trained tensors no "
+                f"adapter owns (starting with {trained[0]!r}), so disabling the "
+                "adapter does not recover the base model. Pass ref_adapter_name="
+                "<a saved copy of this adapter, such as the directory it was "
+                "loaded from> to score against the loaded policy"
+                + (", or reference_free=True" if objective_name == "DPO" else "")
+                + ". A resumed run constructs the model from its base and lets "
+                "the checkpoint hydrate it."
+            )
+        scales = [(module, 0.0) for module in modules]
+        overrides = [(module, "m", magnitude) for module, magnitude in magnitudes]
+        if delta:
+            warnings.warn(
+                f"Unsloth MLX {objective_name}: the adapter already carries a delta, "
+                "so the reference is the base model with the adapter disabled, "
+                f"as TRL's {objective_name}Trainer scores it, not the policy this "
+                "run starts "
+                "from. Pass ref_adapter_name=<saved adapter directory> to "
+                "score against the loaded adapter instead.",
+                RuntimeWarning, stacklevel=2,
+            )
+    else:
+        scale, overrides, named = _reference_adapter_overrides(
+            by_name, dict(mlx.utils.tree_flatten(model.parameters())),
+            adapters, ref_adapter_name,
+            dora=any(is_mlx_dora_module(module) for module in modules),
+            objective_name=objective_name,
+        )
+        uncovered = [name for name in trained if name not in named]
+        if uncovered:
+            raise ValueError(
+                f"Unsloth MLX {objective_name}: the reference adapter lacks the trained "
+                f"tensors this model carries (starting with {uncovered[0]!r}), "
+                "so the reference would mix its adapter with this model's "
+                "trained weights."
+            )
+        scales = [(module, scale) for module in modules]
+    overridden = {(id(module), name) for module, name, _ in overrides}
+    for name in extra:
+        module, attribute = _owner_of(by_name, name, objective_name=objective_name)
+        if (id(module), attribute) not in overridden:
+            overrides.append((module, attribute, trainable[name]))
+    return ReferencePolicy(
+        scales=scales, overrides=overrides, neftune_modules=neftune,
+        objective_name=objective_name,
+    ), provenance
