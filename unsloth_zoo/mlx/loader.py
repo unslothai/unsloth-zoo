@@ -10597,8 +10597,10 @@ class FastMLXModel:
             return _finish_load(model, public_target)
         else:
             # Text path via mlx-lm (original behavior)
+            # Messages name the repo the user passed, not the dequant scratch dir.
+            display_name = _prequant_model_name or model_name
             quant_state = _ensure_quantization_compatible(
-                config_data, quantization_spec, model_name,
+                config_data, quantization_spec, display_name,
             )
             want_runtime_quant = quantization_spec.enabled and quant_state != "compatible"
             quantization_spec, want_runtime_quant = _resolve_distributed_runtime_quantization(
@@ -10615,10 +10617,10 @@ class FastMLXModel:
                     f"(runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)..."
                 )
             else:
-                print(f"Unsloth: Loading {model_name} via mlx-lm...")
+                print(f"Unsloth: Loading {display_name} via mlx-lm...")
                 if quantization_spec.enabled and quant_state == "compatible":
                     warnings.warn(
-                        f"Unsloth: '{model_name}' is already quantized — "
+                        f"Unsloth: '{display_name}' is already quantized — "
                         "using existing compatible MLX quantization.",
                         stacklevel=2,
                     )
