@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""moe_triton_kernels_available() must not graph-break when first probed while Dynamo traces an
-autograd.Function (the MoE NF4 dequant runs inside _GroupedMMRecompute's weight provider). torch
-2.10 broke there on the module-global write: "HigherOrderOperator: Mutating a variable not in the
-current scope (SideEffects)", once per decoder block trace (Qwen3-MoE QLoRA, block compile)."""
+"""moe_triton_kernels_available() must not write its global (graph break) inside a traced autograd.Function."""
 
 import pytest
 import torch

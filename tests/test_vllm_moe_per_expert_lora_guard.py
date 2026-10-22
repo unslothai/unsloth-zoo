@@ -109,10 +109,7 @@ def test_per_expert_adapter_still_goes_through_the_name_check(engine):
 
 
 # --- the real name check, unstubbed: only what vLLM itself provides is faked below --------
-# vLLM's manager builds `packed_modules_mapping` with process_packed_modules_mapping, which
-# on a 2D MoE maps `experts` to every `experts.<i>.<proj>` from get_expert_mapping. With no
-# reachable manager the check must rebuild the same expansion, or every per-expert key is
-# reported missing.
+# With no reachable manager the check must rebuild vLLM's `experts -> experts.<i>.<proj>` expansion.
 import sys
 
 import torch.nn as nn
@@ -161,8 +158,7 @@ def _process_packed_modules_mapping_v0112(model):
 
 
 def _process_packed_modules_mapping_main(model, force_2d_moe = False, enable_moe_shared_loras = False):
-    # vllm/lora/utils.py main: get_moe_expert_mapping takes the first named module that has
-    # get_expert_mapping, which is the RoutedExperts layer.
+    # vllm/lora/utils.py main: first named module with get_expert_mapping (RoutedExperts).
     packed = _get_packed_modules_mapping(model)
     if not any(isinstance(m, _MoERunner) for m in model.modules()): return packed
     if (not model.is_3d_moe_weight) or force_2d_moe:
@@ -323,9 +319,7 @@ def test_per_expert_keys_resolve_through_the_real_name_check(monkeypatch, fake_v
 
 
 # --- no reachable manager on a 3D model in mixed mode ------------------------------------
-# LoRAModelManager passes force_2d_moe = enable_mixed_moe_lora_format, so a 3D model in mixed
-# mode also gets the per-expert expansion. The fallback must pass the same flag, or the
-# refusal check allows the adapter and the name check then rejects every expert key.
+# The fallback must pass force_2d_moe = enable_mixed_moe_lora_format like LoRAModelManager.
 @pytest.mark.parametrize("arch", sorted(ARCHS))
 def test_mixed_mode_3d_model_without_manager_expands_per_expert_names(monkeypatch, fake_vllm, arch):
     vllm_model, _, _ = _build_engine(arch, "main")

@@ -5370,10 +5370,7 @@ def _is_moe_expert_lora_key(key):
 
 
 def _is_moe_per_expert_lora_key(key):
-    """True for a per-expert 2D adapter key (`experts.<i>.gate_proj`, Mixtral `experts.<i>.w1`).
-
-    vLLM's 2D FusedMoEWithLoRA reads this layout when the model is not `is_3d_moe_weight` (vllm/lora/utils.py).
-    """
+    """True for a per-expert 2D adapter key (`experts.<i>.gate_proj`, Mixtral `experts.<i>.w1`)."""
     # All Unsloth Zoo code licensed under LGPLv3
     parts = key.split(".")
     return any(
@@ -5535,10 +5532,8 @@ def _vllm_lora_target_names(vllm_model, manager = None, lora_config = None):
 
     packed = getattr(manager, "packed_modules_mapping", None)
     if not isinstance(packed, dict):
-        # Same builder the manager uses: on a 2D MoE it adds `experts -> experts.<i>.<proj>`,
-        # which get_packed_modules_mapping lacks, so per-expert keys would look unmatched.
-        # LoRAModelManager.__init__ passes the mixed / shared MoE flags from lora_config
-        # (a 3D model in mixed mode expands too); v0.11.2's builder takes only the model.
+        # The manager's builder adds `experts -> experts.<i>.<proj>` (also for 3D in mixed mode);
+        # v0.11.2's takes only the model.
         try:
             from vllm.lora.utils import process_packed_modules_mapping
             kwargs = {}

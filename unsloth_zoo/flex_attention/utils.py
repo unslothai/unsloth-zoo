@@ -88,8 +88,7 @@ try:
     pass
     flex_attention = _torch_compile(_flex_attention)
 
-    # torch >= 2.9 deprecates return_lse = True for return_aux = AuxRequest(lse = True); the
-    # deprecation's warnings.warn is untraceable on torch 2.10, a graph break in every caller.
+    # torch >= 2.9: return_lse's deprecation warning is a graph break on 2.10; use AuxRequest.
     try:
         from torch.nn.attention.flex_attention import AuxRequest as _AuxRequest
         FLEX_LSE_KWARGS = {"return_aux": _AuxRequest(lse = True)}

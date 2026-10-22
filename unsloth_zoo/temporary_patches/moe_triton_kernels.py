@@ -53,8 +53,7 @@ def moe_triton_kernels_available(device = None) -> bool:
         return False
     if _TRITON is None:
         available = _probe_triton()
-        # Writing the module global while Dynamo traces an autograd.Function forward (the MoE
-        # dequant runs inside one) is an unsupported side effect: a graph break per traced call.
+        # Writing the global inside a traced autograd.Function is a graph break.
         if torch.compiler.is_compiling():
             return available
         _TRITON = available

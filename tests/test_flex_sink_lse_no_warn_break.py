@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""flex_attention_with_sink must request the logsumexp without return_lse = True where torch has
-AuxRequest (torch >= 2.9): the deprecation's warnings.warn is untraceable on torch 2.10, a graph
-break in the gpt-oss attention under torch.compile. The output stays bit-equal."""
+"""flex_attention_with_sink requests the lse via AuxRequest (no return_lse graph break), bit-equal."""
 
 import pytest
 import torch
