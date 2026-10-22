@@ -96,7 +96,8 @@ def _patch_sft_compute_loss(sft_trainer_cls):
         chunked = None
         unwrapped = self.accelerator.unwrap_model(model) if getattr(self, "accelerator", None) is not None else model
         for candidate in (unwrapped, getattr(unwrapped, "base_model", None), getattr(getattr(unwrapped, "base_model", None), "model", None)):
-            if getattr(candidate, "_unsloth_cpu_chunked_ce", False):
+            # vars(), not getattr: PEFT forwards attribute reads to the inner model, but writes stay on the wrapper.
+            if candidate is not None and vars(candidate).get("_unsloth_cpu_chunked_ce", False):
                 chunked = candidate
                 break
         if chunked is None:
