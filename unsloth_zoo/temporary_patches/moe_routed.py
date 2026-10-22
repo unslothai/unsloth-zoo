@@ -1525,13 +1525,18 @@ def _bf16_supported(device):
 
 # Below sm80 (T4) the 16-bit routed kernels only pay off for one-token decode: on T4 fp16 they are 1.9-8.6x
 # slower than grouped_mm from 2 tokens up, while at one token grouped_mm's host syncs cost more end to end
-# (Qwen3-MoE shapes 55 vs 43 tok/s). Visible CUDA devices below sm80, built once.
+# (Qwen3-MoE shapes 55 vs 43 tok/s). Visible CUDA devices below sm80, built once on an eager call.
 _SUB_SM80_DEVICES = None
 
 
 def sub_sm80_devices():
+    """Visible CUDA devices below sm80; None when a trace asks before any eager call built the set:
+    torch.cuda host queries break the graph there (fullgraph raises), so callers then take the
+    below-sm80 answer, which routes only one-token decode and is never slower than grouped_mm."""
     global _SUB_SM80_DEVICES
     if _SUB_SM80_DEVICES is None:
+        if torch.compiler.is_compiling():
+            return None
         _SUB_SM80_DEVICES = frozenset(
             i for i in range(torch.cuda.device_count()) if torch.cuda.get_device_capability(i)[0] < 8
         )
@@ -1540,6 +1545,8 @@ def sub_sm80_devices():
 
 def routed_16bit_supported(device):
     sub = sub_sm80_devices()
+    if sub is None:
+        return False
     if not sub:
         return True
     return (device.index if device.index is not None else torch.cuda.current_device()) not in sub
