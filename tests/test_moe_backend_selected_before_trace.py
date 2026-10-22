@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The MoE backend is chosen when the forward is resolved, not on the first traced call:
-a first select_moe_backend() inside a trace stores its global there and the guard on it
-recompiles the enclosing graph once."""
+"""Select the MoE backend at forward resolution, else the first traced call recompiles."""
 import sys
 
 import torch

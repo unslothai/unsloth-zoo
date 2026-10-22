@@ -346,8 +346,7 @@ def _load_cached_moe_utils_module():
 
 
 def _select_moe_backend_eagerly(module):
-    # A first select_moe_backend() reached inside a trace stores its global there, and the
-    # guard on it recompiles the enclosing graph once: choose it now, outside any trace.
+    # Selecting inside a trace sets a guarded global and recompiles the graph once.
     if torch.compiler.is_compiling():
         return
     try:
