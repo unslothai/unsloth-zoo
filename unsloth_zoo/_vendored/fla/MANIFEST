@@ -133,6 +133,17 @@ modifications =
       recurrence race. Reproduced on B200 with triton 3.7.1: with cu_seqlens and
       48 or 64 value heads the autotuner picks that config, and o differs from
       the dense path by up to 0.08 and between identical runs.
+    - Backported fla PR #1399 (fla issue #1327, triton-lang/triton#10590) in
+      ops/common/chunk_o.py (+ TRITON_ABOVE_3_8_0 in utils/_compat.py and
+      utils/__init__.py): on Blackwell with Triton < 3.8 the
+      chunk_bwd_kernel_dv_local autotune is limited to 2 / 4 warps
+      (BLACKWELL_8_WARP_RACE), since its 8-warp configs race (TMEM read vs
+      zero-fill with no barrier) and give nondeterministic dv. Reproduced on B200
+      with triton 3.7.1 (T=65536, 48 heads, dense: 2 of 19 repeat calls differ at
+      8 warps / 2 or 3 stages; 2 / 4 warps and triton 3.6.0 / 3.8.0 clean). Triton
+      3.8+ and other GPUs keep the full NUM_WARPS list. The chunk_fwd_kernel_o
+      8-warp drop above stays unconditional (not narrowed to Triton < 3.8 as
+      upstream does) until the #1229 repro is re-run on Triton 3.8.
     - Sequence start offsets past 2**31 elements (fixed upstream after 0.5.1 by
       fla PR #1329, which forces int64 program ids everywhere). In
       ops/gated_delta_rule/chunk_fwd.py, ops/kda/{chunk_bwd,chunk_intra,
@@ -177,6 +188,13 @@ modifications =
       the causal_conv1d forward / backward autotune keys, signatures and
       launches (neither kernel reads it), so every new 1024-token bucket no
       longer re-tunes and recompiles both kernels.
+    - Modified by Unsloth in modules/l2norm.py and modules/fused_norm_gate.py (not
+      upstream as of fla 9d478fa), the same change as the #1388 conv backport above:
+      NB = cdiv(T, 65536) is dropped from the l2norm_{fwd,bwd}_kernel and
+      layer_norm_gated_{fwd,bwd}_kernel autotune keys, signatures and launches
+      (no kernel reads it; zoo's _ReuseBestCache already reuses one config across
+      buckets), so a new 65536-row bucket no longer recompiles them. The three
+      layer_norm_gated kernels also get do_not_specialize=['T'], as upstream has.
     - Modified by Unsloth in ops/utils/cumsum.py (inline "Unsloth:" comment, not
       upstream as of fla 9d478fa): B is dropped from the autotune keys and
       constexpr arguments of the four chunk_{local,global}_cumsum_{scalar,vector}

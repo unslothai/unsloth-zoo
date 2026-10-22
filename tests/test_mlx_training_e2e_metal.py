@@ -978,15 +978,23 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
     assert plan.prepare_cce_batch(1, batch) is batch
 
 
+# Ternary Bonsai 2 packs, from mlx-vlm and (0.32+) mlx-lm.
+_HADAMARD_PACKS = pytest.mark.parametrize("pack_module", [
+    "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35", "mlx_lm.models.prism_hadamard_qwen35",
+], ids=["mlx_vlm", "mlx_lm"])
+
+
 @metal_only
-def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch):
-    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+@_HADAMARD_PACKS
+def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch, pack_module):
+    pack = pytest.importorskip(pack_module)
+    rotate = getattr(pack, "hadamard_transform", None) or pack.hadamard_rotate
     from unsloth_zoo.mlx import preference
     mx.random.seed(611)
     model = _cce_text_model(2053, 1024, quantized=True)
     head = pack.HadamardQuantizedLinear(1024, 8192, 512)
     head.signs = mx.where(mx.random.uniform(shape=(1024,)) < 0.5, -1.0, 1.0)
-    rotated = pack.hadamard_transform(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
+    rotated = rotate(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
     head.weight, scales, biases = mx.quantize(rotated, group_size=128, bits=2)
     head.scales, head.biases = scales.astype(mx.float16), biases.astype(mx.float16)
     model.lm_head = head

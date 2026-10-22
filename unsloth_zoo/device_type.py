@@ -622,6 +622,29 @@ def _xpu_keeps_explicit_bf16():
     return unsloth_device_type is None or hasattr(unsloth_device_type, "xpu_keeps_explicit_bf16")
 pass
 
+def _unsloth_follows_vllm_bf16_refusal():
+    """The loaded unsloth (if any) also loads fp16 when vLLM refuses bf16, so the shared weights agree.
+    An older unsloth keeps bf16 on the Hugging Face side: then vLLM keeps it too and refuses as before."""
+    unsloth_device_type = sys.modules.get("unsloth.device_type")
+    return unsloth_device_type is None or hasattr(unsloth_device_type, "xpu_vllm_refuses_bf16")
+pass
+
+def _xpu_vllm_refuses_bf16():
+    """True when the installed vLLM's own platform check refuses bf16 on this XPU (Arc A770, for a
+    known accuracy issue). Older vLLM without the hook, or any other failure, refuses nothing."""
+    try:
+        from vllm.platforms import current_platform
+        check = getattr(current_platform, "check_if_supports_dtype", None)
+        if check is None:
+            return False
+        check(torch.bfloat16)
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+pass
+
 def _xpu_bf16_supported():
     """is_bf16_supported() counts emulation. Process-wide like CUDA: any visible XPU proven to lack
     native bf16 turns it off, since neither the load target nor vLLM's device is known here. Each

@@ -1939,7 +1939,7 @@ def _cce_head_ineligibility(desc):
 
 def _rotate_head_input(head, hidden):
     if getattr(head, "block", 0) and _is_hadamard_packed_linear(head):
-        return _hadamard_pack_module().hadamard_transform(hidden, head.block, head.signs)
+        return _hadamard_rotate(head, hidden)
     return hidden
 
 
@@ -9056,7 +9056,8 @@ def _validate_mlx_image_input(target, has_images):
     if has_images and getattr(target, "_unsloth_supports_images", None) is False:
         name = getattr(target, "_unsloth_modality_model_type", type(target).__name__)
         raise ValueError(
-            f"Unsloth MLX: `{name}` has no vision path; image and video inputs are not supported."
+            getattr(target, "_unsloth_image_input_error", None)
+            or f"Unsloth MLX: `{name}` has no vision path; image and video inputs are not supported."
         )
 
 
@@ -15079,44 +15080,55 @@ class LoRAPointwiseConv2d(nn.Module):
         return conv
 
 
-def _hadamard_pack_module():
-    """mlx-vlm's Hadamard-packed layer module (Ternary Bonsai 2), once loaded."""
-    module = sys.modules.get("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
-    if isinstance(getattr(module, "HadamardQuantizedLinear", None), type):
-        return module
-    return None
+# mlx-vlm's, and mlx-lm's from 0.32: the same layers and rotation, under different names.
+_HADAMARD_PACK_MODULES = (
+    "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35",
+    "mlx_lm.models.prism_hadamard_qwen35",
+)
+
+
+def _hadamard_pack_modules():
+    """The loaded Hadamard-packed layer modules (Ternary Bonsai 2)."""
+    modules = (sys.modules.get(name) for name in _HADAMARD_PACK_MODULES)
+    return tuple(module for module in modules
+                 if isinstance(getattr(module, "HadamardQuantizedLinear", None), type))
 
 
 def _is_hadamard_packed_linear(module):
-    pack = _hadamard_pack_module()
     # Exact type: the packed embedding subclasses the linear.
-    return pack is not None and type(module) is pack.HadamardQuantizedLinear
+    return any(type(module) is pack.HadamardQuantizedLinear for pack in _hadamard_pack_modules())
+
+
+def _hadamard_rotate(layer, x, inverse=False):
+    pack = sys.modules[type(layer).__module__]
+    rotate = getattr(pack, "hadamard_transform", None) or pack.hadamard_rotate
+    return rotate(x, layer.block, layer.signs, inverse=inverse)
 
 
 def _hadamard_dense_weight(layer):
     """The float32 dense weight a Hadamard-packed layer encodes, in the unrotated basis."""
     weight = mx.dequantize(
         layer.weight, layer.scales, layer.biases,
-        group_size=layer.group_size, bits=layer.bits, mode=layer.mode,
+        group_size=layer.group_size, bits=layer.bits, mode=getattr(layer, "mode", "affine"),
     ).astype(mx.float32)
     if layer.block:
-        weight = _hadamard_pack_module().hadamard_transform(
-            weight, layer.block, layer.signs, inverse=True,
-        )
+        weight = _hadamard_rotate(layer, weight, inverse=True)
     return weight
 
 
 def _unpack_hadamard_modules(model):
-    pack = _hadamard_pack_module()
-    if pack is None:
+    packs = _hadamard_pack_modules()
+    linears = tuple(pack.HadamardQuantizedLinear for pack in packs)
+    embeddings = tuple(pack.HadamardQuantizedEmbedding for pack in packs)
+    if not packs:
         return False
     dense = []
     for name, module in model.named_modules():
-        if not isinstance(module, pack.HadamardQuantizedLinear):
+        if not isinstance(module, linears):
             continue
         weight = _hadamard_dense_weight(module).astype(module.scales.dtype)
         rows, width = weight.shape
-        if isinstance(module, pack.HadamardQuantizedEmbedding):
+        if isinstance(module, embeddings):
             layer = nn.Embedding(rows, width)
         else:
             layer = nn.Linear(width, rows, bias=False)
@@ -15152,7 +15164,7 @@ class LoRAHadamardLinear(nn.Module):
     @staticmethod
     def from_base(linear, r=8, dropout=0.0, scale=20.0):
         if not LoRAHadamardLinear.supports(linear):
-            raise ValueError("LoRA requires mlx-vlm's HadamardQuantizedLinear.")
+            raise ValueError("LoRA requires a HadamardQuantizedLinear.")
         output_dims, packed_dims = linear.weight.shape
         input_dims = packed_dims * 32 // linear.bits
         module = LoRAHadamardLinear()
@@ -15478,9 +15490,12 @@ def _lora_module_types(model):
         if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
             continue
         base_linear = getattr(module, "linear", None)
+        module_type = type(module)
+        if getattr(module_type, "_unsloth_mlx_qat_active", False):
+            module_type = module_type.__base__  # QAT forward subclass, see mlx/qat.py
         if (
-            type(module) is LoRALinear
-            or (DoRALinear is not None and type(module) is DoRALinear)
+            module_type is LoRALinear
+            or (DoRALinear is not None and module_type is DoRALinear)
         ) and type(base_linear) in (nn.Linear, nn.QuantizedLinear):
             wrapped[name] = "linear"
         else:
@@ -18556,6 +18571,8 @@ _MODEL_WEIGHT_SUFFIXES = (
     ".pth",
 )
 _MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
+# Merged saves emit MLX weights, so a copied GPTQ/AWQ descriptor would mis-detect the export as packed.
+_PACKED_QUANT_SIDECARS = frozenset({"quantize_config.json", "quant_config.json"})
 
 
 def _asset_link_stays_in_the_model(file, source):
@@ -18582,6 +18599,23 @@ def _asset_link_stays_in_the_model(file, source):
         return any(target.is_relative_to(root) for root in roots)
     except OSError:
         return False
+
+
+@contextlib.contextmanager
+def _detached_detokenizer(processor):
+    """Without mlx-vlm's attached streaming detokenizer: transformers deep-copies a processor's
+    attributes to serialize it, and the naive one (tiktoken tokenizers, e.g. Kimi) cannot be copied."""
+    detokenizer = vars(processor).pop("detokenizer", None) if hasattr(processor, "__dict__") else None
+    try:
+        yield
+    finally:
+        if detokenizer is not None:
+            processor.detokenizer = detokenizer
+
+
+def _save_tokenizer(tokenizer, path):
+    with _detached_detokenizer(tokenizer):
+        tokenizer.save_pretrained(str(path))
 
 
 def _save_vlm_processor_assets(processor, path, sources=()):
@@ -18648,7 +18682,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
         try:
             with tempfile.TemporaryDirectory() as staging:
                 try:
-                    save(staging)
+                    with _detached_detokenizer(component):
+                        save(staging)
                 except Exception as error:
                     failures.append(f"{type(component).__name__}: {error}")
                     success = False
@@ -18722,6 +18757,8 @@ def _copy_source_sidecars(src_path, path):
             continue
         name = source.name
         if name in _CORE_SAVE_FILENAMES:
+            continue
+        if name in _PACKED_QUANT_SIDECARS:
             continue
         if name.startswith("model-") or name.startswith("pytorch_model"):
             continue
@@ -19037,7 +19074,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
             is_vlm=is_vlm,
         )
 
-    tokenizer.save_pretrained(str(path))
+    _save_tokenizer(tokenizer, path)
 
     src_path = _get_src_path(model)
     if src_path is not None:
@@ -19326,7 +19363,7 @@ def save_pretrained_merged(
         else:
             save_lora_adapters(model, save_directory)
         try:
-            tokenizer.save_pretrained(str(save_directory))
+            _save_tokenizer(tokenizer, save_directory)
         except Exception:
             pass
     else:
