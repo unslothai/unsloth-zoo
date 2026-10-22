@@ -549,8 +549,7 @@ def _stdin_is_usable() -> bool:
 
 
 def _sudo_prefix():
-    # With no terminal to type a password into, -n makes sudo fail at once instead of waiting on
-    # a prompt nobody can answer (a notebook kernel, or Studio's backend started from a shell).
+    # No terminal: -n fails at once instead of hanging on a password prompt nobody can answer.
     try:
         interactive = sys.stdin is not None and sys.stdin.isatty()
     except Exception:
@@ -757,9 +756,7 @@ def do_we_need_sudo(system_type="debian"):
         pass
     pass
 
-    # The unprivileged refresh worked (root, or a manager that needs none), so there is
-    # nothing to elevate. Root never needs sudo either. Re-running the refresh under sudo
-    # anyway ran a privileged package-manager command nobody asked for.
+    # Never re-run a refresh that already worked, or as root, under sudo.
     if not sudo or os.geteuid() == 0:
         return False
 
@@ -2401,8 +2398,7 @@ def install_llama_cpp(
 
     print_outputs = []
     missing_packages, system_type = check_build_requirements()
-    # Only probe (which refreshes the package lists, possibly under sudo) when something is
-    # actually missing.
+    # The probe refreshes package lists (maybe elevated): only run it when something is missing.
     sudo = do_we_need_sudo(system_type) if missing_packages else False
     kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
 
