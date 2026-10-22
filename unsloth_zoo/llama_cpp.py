@@ -113,6 +113,8 @@ NEEDS_ROOT = (
     "fatal",
     "Root privileges are required",                       # zypper
     "you cannot perform this operation unless you are root",  # pacman
+    "a password is required",                             # sudo -n with no cached credentials
+    "a terminal is required",                             # sudo with no terminal to prompt on
 )
 
 PACKAGE_MANAGER_NAMES = {

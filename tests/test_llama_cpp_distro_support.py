@@ -264,6 +264,23 @@ def test_sudo_install_does_not_wait_on_a_password_without_a_terminal(llama_cpp, 
     assert calls == [expected]
 
 
+def test_a_refused_noninteractive_sudo_install_raises_instead_of_continuing(llama_cpp, monkeypatch):
+    import builtins
+    import types
+
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp, "IS_KAGGLE_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp, "_auto_install_enabled", lambda: True)
+    monkeypatch.setattr(llama_cpp.sys, "stdin", types.SimpleNamespace(isatty = lambda: False))
+    monkeypatch.setattr(builtins, "input", lambda *a: "")
+    monkeypatch.setattr(
+        llama_cpp.subprocess, "Popen", _FakePopen(["sudo: a password is required\n"])
+    )
+    with pytest.raises(RuntimeError, match = "Permission denied when installing"):
+        llama_cpp.install_package("cmake", True, system_type = "debian")
+
+
 def test_install_llama_cpp_does_not_refresh_packages_when_nothing_is_missing(llama_cpp, monkeypatch, tmp_path):
     """The probe refreshes package lists (under sudo when needed), so it must only run when a
     package is actually missing. A build that only needed the clone and compile still ran a
