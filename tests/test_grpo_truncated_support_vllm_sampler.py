@@ -122,6 +122,26 @@ def test_triton_sampler_top_k_at_the_row_minimum_keeps_only_larger_logits():
     assert int(rr._truncated_support_mask(logits, 8, 1.0, 0.0, True).sum()) == 8
 
 
+def test_triton_sampler_skips_top_k_with_at_most_k_finite_logits():
+    # vLLM v0.24 - v0.32 Triton masks top-k only when the row has more than top_k finite logits
+    # (`num_finite_total > k`). 4 at 0 and 4 at -1 with the rest -inf and top_k = 8: all 8 stay,
+    # though the 8th logit is the row minimum. With 5 at -1 the row-minimum rule applies again.
+    logits = torch.full((1, 64), float("-inf"))
+    logits[0, :4] = 0.0
+    logits[0, 4:8] = -1.0
+    assert int(rr._truncated_support_mask(logits, 8, 1.0, 0.0, True).sum()) == 8
+    logits[0, 8] = -1.0
+    assert int(rr._truncated_support_mask(logits, 8, 1.0, 0.0, True).sum()) == 4
+    # The same row reached through engine-excluded ids, on the scoring helper.
+    raw = torch.full((1, 64), -30.0)
+    raw[0, :4] = 0.0
+    raw[0, 4:8] = -1.0
+    excluded = torch.arange(8, 64)
+    got = rr._truncated_support_logps(raw, torch.tensor([5]), 8, 1.0, 0.0, True, excluded)
+    want = -1.0 - torch.logsumexp(torch.tensor([0.0] * 4 + [-1.0] * 4), 0)
+    torch.testing.assert_close(got, want.reshape(1))
+
+
 def test_triton_sampler_keeps_uniform_rows_whole():
     # vLLM v0.32.0 Triton, monolithic kernel and the CUDA split pipeline alike: 100 equal logits at
     # top_p = 0.9 keep all 100 (-log 100); the PyTorch sampler keeps 90 (-log 90).

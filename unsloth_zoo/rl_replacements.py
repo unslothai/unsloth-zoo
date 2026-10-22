@@ -63,12 +63,14 @@ def _truncated_support_mask_impl(
             # The Triton kernel keeps exactly top_k tokens: logits tied with the k-th are kept in
             # vocabulary order until the budget is used (vLLM >= 0.24). The PyTorch sampler keeps them all.
             # Its pivot cannot go below the row's smallest finite logit, so when the k-th logit is that
-            # minimum it keeps only the logits above it, fewer than top_k.
+            # minimum it keeps only the logits above it, fewer than top_k. Rows with at most top_k
+            # finite logits (after min_p or excluded ids) skip top-k entirely (num_finite_total > k).
             sorted_logits, order = torch.sort(logits, dim = -1, descending = True, stable = True)
             dropped = torch.zeros_like(logits, dtype = torch.bool).scatter(-1, order[:, top_k:], True)
             kth = sorted_logits[:, top_k - 1 : top_k]
             row_min = logits.masked_fill(~finite, float("inf")).amin(dim = -1, keepdim = True)
-            dropped = dropped | ((kth == row_min) & (logits <= kth))
+            more_than_k = finite.sum(dim = -1, keepdim = True) > top_k
+            dropped = dropped | (more_than_k & (kth == row_min) & (logits <= kth))
             logits = logits.masked_fill(dropped & ~uniform, float("-inf"))
         else:
             kth = torch.topk(logits, top_k, dim = -1).values[:, -1:]
