@@ -37,7 +37,7 @@ def _processor():
         pytest.skip("transformers has no Audio Flamingo 3")
     try:
         return transformers.AutoProcessor.from_pretrained(REPO)
-    except (OSError, ValueError) as error:
+    except Exception as error:  # offline / proxy / DNS failures raise OSError, httpx or hub errors
         pytest.skip(f"{REPO} processor not reachable: {error}")
 
 
