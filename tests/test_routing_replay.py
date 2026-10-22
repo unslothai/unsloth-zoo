@@ -639,6 +639,29 @@ def test_wrap_vllm_generate_records_and_is_idempotent(replay):
     assert rr.routing_replay_stats()["recorded"] == 1
 
 
+@pytest.mark.parametrize("as_list", [False, True])
+def test_routed_experts_prompt_start_keeps_routes_on_their_tokens(replay, as_list):
+    # vLLM's SamplingParams.routed_experts_prompt_start = 2 drops the first two prompt tokens from
+    # the capture, so its first row belongs to token 2. Tokens 0 and 1 have no routing to replay.
+    routed = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
+    params = [SimpleNamespace(routed_experts_prompt_start = 0), SimpleNamespace(routed_experts_prompt_start = 2)]
+    request = lambda start: SimpleNamespace(
+        prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6 + start, 7, 8], routed_experts = routed[start:])],
+    )
+    llm = SimpleNamespace(generate = lambda prompts, sampling_params = None: [request(0), request(2)] if as_list else [request(2)])
+    rr.wrap_vllm_generate(llm)
+    if as_list:
+        llm.generate([], params)
+    else:
+        llm.generate([], sampling_params = params[1])
+    rows = rr._lookup((3, 4, 5, 8, 7, 8))
+    assert torch.equal(rows[:2].long(), torch.full((2, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[2:5].long(), torch.as_tensor(routed[2:5]).long())
+    assert torch.equal(rows[5].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    if as_list:
+        assert torch.equal(rr._lookup((3, 4, 5, 6, 7, 8))[:5].long(), torch.as_tensor(routed).long())
+
+
 def test_rollout_split_into_many_generate_calls_is_kept_whole(replay):
     # generate_batches splits one rollout into several llm.generate calls before any training forward.
     model = _model()
