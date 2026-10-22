@@ -79,7 +79,8 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         grad_hidden, grad_weight = ctx.saved_tensors
-        scale = grad_output / ctx.divisor
+        # Every label ignored: the loss is NaN like F.cross_entropy(mean), but its gradient is zero.
+        scale = grad_output / ctx.divisor if not math.isnan(ctx.divisor) else torch.zeros_like(grad_output)
         dh = (grad_hidden * scale.to(grad_hidden.dtype)) if ctx.has_hidden else None
         dw = (grad_weight * scale).to(ctx.weight_dtype) if ctx.has_weight else None
         return dh, dw, None, None, None, None
@@ -114,6 +115,10 @@ def _plain_lm_head(model):
         value = getattr(text_config, name, None)
         if value not in (None, 1, 1.0):
             return False
+    # MoE heads add a router load-balancing loss inside their own forward.
+    if getattr(text_config, "output_router_logits", False) or getattr(text_config, "num_experts", None) \
+            or getattr(text_config, "num_local_experts", None) or getattr(text_config, "n_routed_experts", None):
+        return False
     lm_head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
     if not isinstance(lm_head, torch.nn.Linear) or lm_head.bias is not None:
         return False
@@ -141,7 +146,8 @@ def patch_chunked_causal_lm_loss(model):
                 past_key_values = None, inputs_embeds = None, labels = None, use_cache = None,
                 logits_to_keep = 0, **kwargs):
         shift_labels = kwargs.pop("shift_labels", None)
-        if (labels is None and shift_labels is None) or not torch.is_grad_enabled():
+        if (labels is None and shift_labels is None) or not torch.is_grad_enabled() \
+                or not getattr(self, "_unsloth_cpu_chunked_ce_active", True):
             if shift_labels is not None:
                 kwargs["shift_labels"] = shift_labels
             return original_forward(

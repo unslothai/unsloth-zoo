@@ -94,7 +94,10 @@ def test_chunked_ce_all_ignored_matches_mean_nan():
     hidden = torch.randn(1, 4, 8, requires_grad = True)
     weight = torch.randn(10, 8)
     labels = torch.full((1, 4), -100)
-    assert torch.isnan(chunked_linear_cross_entropy(hidden, weight, labels))
+    loss = chunked_linear_cross_entropy(hidden, weight, labels)
+    assert torch.isnan(loss)
+    loss.backward()
+    assert torch.equal(hidden.grad, torch.zeros_like(hidden.grad))
     assert chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = 1).item() == 0.0
 
 
@@ -112,7 +115,10 @@ def test_bf16_policy_override(monkeypatch):
 def test_bnb_cpu_4bit_grads_survive_eval_forward():
     """bitsandbytes repacks Linear4bit weights for its AVX512-BF16 kernel on an eval no-grad forward,
     after which backward is wrong. The CPU loader turns that repacking off; check grads after an eval."""
-    bnb = pytest.importorskip("bitsandbytes")
+    from unsloth_zoo.cpu.runtime import cpu_bnb_4bit_supported
+    if not cpu_bnb_4bit_supported():
+        pytest.skip("no working bitsandbytes CPU 4-bit backend on this host")
+    import bitsandbytes as bnb
     from unsloth_zoo.cpu.loader import _disable_bnb_cpu_weight_packing
     torch.manual_seed(0)
     layer = bnb.nn.Linear4bit(256, 128, bias = False, compute_dtype = torch.bfloat16, quant_type = "nf4")
@@ -131,3 +137,41 @@ def test_bnb_cpu_4bit_grads_survive_eval_forward():
     ((x_ref @ dense.t()) * grad).sum().backward()
     assert x.grad is not None
     torch.testing.assert_close(x.grad, x_ref.grad)
+
+
+def test_cpu_training_arguments_turn_off_packing_and_gpu_optimizers():
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.trainer import normalize_cpu_training_arguments
+    args = SimpleNamespace(use_cpu = False, fp16 = True, bf16 = False, optim = "paged_adamw_8bit",
+                           packing = True, eval_packing = True, padding_free = True, dataloader_pin_memory = True)
+    normalize_cpu_training_arguments(args)
+    assert args.use_cpu and not args.fp16 and args.optim == "adamw_torch"
+    assert not args.packing and not args.eval_packing and not args.padding_free and not args.dataloader_pin_memory
+
+
+def test_moe_models_keep_their_own_loss():
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.ops import _plain_lm_head
+
+    class Model(torch.nn.Module):
+        base_model_prefix = "model"
+
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.model = torch.nn.Linear(4, 4)
+            self.lm_head = torch.nn.Linear(4, 10, bias = False)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    assert _plain_lm_head(Model(SimpleNamespace()))
+    assert not _plain_lm_head(Model(SimpleNamespace(num_experts = 8, output_router_logits = False)))
+
+
+def test_cpu_backend_installs_the_datasets_path_guard():
+    folder = pytest.importorskip("datasets.packaged_modules.folder_based_builder.folder_based_builder")
+    from unsloth_zoo.cpu.runtime import apply_cpu_security_patches
+    assert apply_cpu_security_patches() == ["patch_datasets_folder_metadata_file_name"]
+    assert getattr(folder.FolderBasedBuilder._read_metadata, "_unsloth_file_name_guard", False)
+    apply_cpu_security_patches()  # idempotent

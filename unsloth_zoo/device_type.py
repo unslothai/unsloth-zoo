@@ -482,8 +482,12 @@ def _cpu_fallback():
 
 
 def _gpus_deliberately_hidden():
-    mask = os.environ.get("CUDA_VISIBLE_DEVICES")
-    return mask is not None and "".join(mask.split()) in ("", "-1")
+    # CUDA_VISIBLE_DEVICES, or the ROCm masks (ROCR_VISIBLE_DEVICES on Linux, HIP_VISIBLE_DEVICES on Windows).
+    for key in ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        mask = os.environ.get(key)
+        if mask is not None and "".join(mask.split()) in ("", "-1"):
+            return True
+    return False
 
 
 def cpu_backend_allowed():

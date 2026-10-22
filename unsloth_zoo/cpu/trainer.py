@@ -54,6 +54,10 @@ def normalize_cpu_training_arguments(args):
     # attends across examples. Keep TRL's padded batches.
     if getattr(args, "padding_free", False):
         args.padding_free = False
+    for key in ("packing", "eval_packing"):
+        if getattr(args, key, False):
+            print(f"Unsloth (CPU): {key} needs FlashAttention to keep packed examples apart, turning it off.")
+            setattr(args, key, False)
     if getattr(args, "gradient_checkpointing", False):
         kwargs = dict(getattr(args, "gradient_checkpointing_kwargs", None) or {})
         kwargs.setdefault("use_reentrant", False)
@@ -89,10 +93,20 @@ def _patch_sft_compute_loss(sft_trainer_cls):
 
     @functools.wraps(original)
     def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None, **kwargs):
-        unwrapped = getattr(model, "base_model", model)
-        inner = getattr(unwrapped, "model", unwrapped)
-        if not getattr(inner, "_unsloth_cpu_chunked_ce", False) and not getattr(model, "_unsloth_cpu_chunked_ce", False):
+        chunked = None
+        for candidate in (model, getattr(model, "base_model", None), getattr(getattr(model, "base_model", None), "model", None)):
+            if getattr(candidate, "_unsloth_cpu_chunked_ce", False):
+                chunked = candidate
+                break
+        if chunked is None:
             return original(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch, **kwargs)
+        if str(_name(getattr(self.args, "loss_type", None) or "nll")) != "nll":
+            # TRL's other SFT objectives (dft, ...) weight per-token logits, so run the stock forward.
+            chunked._unsloth_cpu_chunked_ce_active = False
+            try:
+                return original(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch, **kwargs)
+            finally:
+                chunked._unsloth_cpu_chunked_ce_active = True
         inputs["use_cache"] = False
         return Trainer.compute_loss(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch)
 
@@ -123,12 +137,24 @@ def _make_cpu_sft_trainer(base):
                 kwargs["processing_class"] = tokenizer
             legacy = {k: kwargs.pop(k) for k in list(kwargs) if k in _LEGACY_SFT_KWARGS}
             if legacy:
+                from trl import SFTConfig
+                args = list(args)
                 training_args = kwargs.get("args", args[1] if len(args) > 1 else None)
                 if training_args is None:
-                    from trl import SFTConfig
-                    training_args = kwargs["args"] = SFTConfig(output_dir = "outputs")
+                    training_args = SFTConfig(output_dir = "outputs")
+                elif not isinstance(training_args, SFTConfig):
+                    # TRL rebuilds a plain TrainingArguments from to_dict(), which drops attributes set here.
+                    values = training_args.to_dict()
+                    values["hub_token"] = getattr(training_args, "hub_token", None)
+                    values.pop("push_to_hub_token", None)
+                    training_args = SFTConfig(**values)
+                if "args" in kwargs or len(args) <= 1:
+                    kwargs["args"] = training_args
+                else:
+                    args[1] = training_args
                 for key, value in legacy.items():
                     setattr(training_args, _LEGACY_SFT_KWARGS[key], value)
+                normalize_cpu_training_arguments(training_args)
             super().__init__(*args, **kwargs)
 
     SFTTrainer.__module__ = base.__module__

@@ -19,6 +19,7 @@ __all__ = [
     "cpu_bf16_supported",
     "cpu_bnb_4bit_supported",
     "cpu_capabilities",
+    "apply_cpu_security_patches",
 ]
 
 import functools
@@ -107,3 +108,49 @@ def cpu_capabilities():
         "amx": "amx_bf16" in cpu_flags(),
         "bnb_4bit": cpu_bnb_4bit_supported(),
     }
+
+
+def apply_cpu_security_patches():
+    """Install the device-independent security guards from temporary_patches.
+
+    That package also pulls the GPU kernels, so each guard file is loaded on its own with a private
+    TEMPORARY_PATCHES list standing in for `.common`. Idempotent: the guards check their own flags.
+    """
+    import importlib.util
+    import sys
+    import types
+
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temporary_patches")
+    applied = []
+    for name in ("datasets_folder_metadata",):
+        module_name = f"{__package__}._guard_{name}"
+        module = sys.modules.get(module_name)
+        if module is None:
+            spec = importlib.util.spec_from_file_location(module_name, os.path.join(root, f"{name}.py"))
+            if spec is None:
+                continue
+            common_name = f"{__package__}.common"
+            common = types.ModuleType(common_name)
+            common.TEMPORARY_PATCHES = []
+            previous = sys.modules.get(common_name)
+            sys.modules[common_name] = common
+            try:
+                module = importlib.util.module_from_spec(spec)
+                module.__package__ = __package__
+                spec.loader.exec_module(module)
+            except Exception:
+                continue
+            finally:
+                if previous is None:
+                    sys.modules.pop(common_name, None)
+                else:
+                    sys.modules[common_name] = previous
+            sys.modules[module_name] = module
+            module._unsloth_cpu_patches = list(common.TEMPORARY_PATCHES)
+        for patch in getattr(module, "_unsloth_cpu_patches", []):
+            try:
+                patch()
+                applied.append(patch.__name__)
+            except Exception:
+                pass
+    return applied

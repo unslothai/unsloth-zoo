@@ -22,9 +22,12 @@ torch.compile). Nothing here is imported on a GPU host.
 """
 
 from .runtime import (
+    apply_cpu_security_patches,
     cpu_capabilities,
     cpu_bf16_supported,
     cpu_bnb_4bit_supported,
 )
 from .loader import FastCPUModel
 from .trainer import install_cpu_training_defaults
+
+apply_cpu_security_patches()

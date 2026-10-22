@@ -31,6 +31,16 @@ _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", 
 _PREQUANTIZED_SUFFIX = re.compile(r"(-unsloth)?-bnb-4bit$", re.IGNORECASE)
 
 
+def _dtype_kwarg():
+    # from_pretrained took `torch_dtype` before transformers 4.56; older ones drop `dtype` silently.
+    from transformers import __version__
+    from unsloth_zoo.utils import Version
+    return "dtype" if Version(__version__) >= Version("4.56.0") else "torch_dtype"
+
+
+_DTYPE_KWARG = _dtype_kwarg()
+
+
 def _print(message):
     print(f"Unsloth (CPU): {message}")
 
@@ -107,7 +117,7 @@ class FastCPUModel:
         dtype = _resolve_dtype(dtype)
 
         # 4-bit only where bitsandbytes' CPU backend really runs; full finetuning never quantizes.
-        use_4bit = bool(load_in_4bit) and not load_in_16bit and not full_finetuning
+        use_4bit = bool(load_in_4bit) and not load_in_8bit and not load_in_16bit and not full_finetuning
         if use_4bit and not cpu_bnb_4bit_supported():
             _print("bitsandbytes 4-bit does not work on this CPU, loading 16-bit weights instead.")
             use_4bit = False
@@ -133,7 +143,7 @@ class FastCPUModel:
             # Only when set: an explicit None also discards a pre-quantized checkpoint's own config.
             kwargs["quantization_config"] = quantization_config
         load_kwargs = dict(
-            dtype = dtype,
+            **{_DTYPE_KWARG: dtype},
             device_map = "cpu",
             attn_implementation = attn_implementation or "sdpa",
             token = token,
@@ -213,6 +223,12 @@ class FastCPUModel:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
         if target_modules is None or target_modules == "all-linear":
             target_modules = _DEFAULT_TARGET_MODULES if target_modules is None else "all-linear"
+        elif not isinstance(target_modules, str):
+            # As on GPU: embed_tokens / lm_head in target_modules are trained in full (continued pretraining).
+            embeddings = [m for m in target_modules if m in ("embed_tokens", "lm_head")]
+            if embeddings:
+                target_modules = [m for m in target_modules if m not in embeddings]
+                modules_to_save = list(dict.fromkeys([*(modules_to_save or []), *embeddings]))
         for key in ("finetune_vision_layers", "finetune_language_layers", "finetune_attention_modules",
                     "finetune_mlp_modules", "temporary_location", "ensure_weight_tying", "qat_scheme"):
             kwargs.pop(key, None)
@@ -267,8 +283,14 @@ class FastCPUModel:
 
 
 def _merged_copy(model, save_method):
-    if save_method == "lora" or not hasattr(model, "merge_and_unload"):
-        return model, save_method == "lora"
+    if save_method == "lora":
+        return model, True
+    if not hasattr(model, "merge_and_unload"):
+        # Full finetuning: nothing to merge, but merged_16bit still means 16-bit weights on disk.
+        if save_method == "merged_16bit" and getattr(model, "dtype", None) == torch.float32:
+            import copy
+            model = copy.deepcopy(model).to(torch.bfloat16 if cpu_bf16_supported() else torch.float16)
+        return model, False
     if getattr(getattr(model, "config", None), "quantization_config", None) is not None or any(
         type(m).__name__ == "Linear4bit" for m in model.modules()
     ):
@@ -316,7 +338,7 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
     base_name = os.path.basename(os.path.normpath(save_directory)) or "model"
     direct = {"bf16", "f16", "q8_0", "f32"}
     # llama-quantize refuses to requantize from q8_0, so k-quants are made from a bf16 GGUF.
-    first = "bf16" if any(m not in direct for m in methods) else methods[0]
+    first = "bf16" if len(methods) > 1 or any(m not in direct for m in methods) else methods[0]
     outputs, _ = convert_to_gguf(
         os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
         quantization_type = first, converter_location = converter,
