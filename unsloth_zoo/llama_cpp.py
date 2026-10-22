@@ -6501,13 +6501,13 @@ def convert_to_gguf(
             # llama.cpp uses SHARD_NAME_FORMAT = "{:s}-{:05d}-of-{:05d}.gguf"
             basename_without_gguf = os.path.splitext(output_file)[0]
             shard_pattern = re.compile(
-                re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf$'
+                re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf'
             )
             parent_dir = os.path.dirname(output_file) or '.'
             shard_files = sorted(
                 os.path.join(parent_dir, f)
                 for f in os.listdir(parent_dir)
-                if shard_pattern.search(f)
+                if shard_pattern.fullmatch(f)
             )
 
             if not shard_files:
@@ -6519,7 +6519,7 @@ def convert_to_gguf(
             # Validate shard completeness
             shard_numbers = []
             for f in shard_files:
-                m = shard_pattern.search(os.path.basename(f))
+                m = shard_pattern.fullmatch(os.path.basename(f))
                 shard_numbers.append((int(m.group(1)), int(m.group(2))))
 
             expected_total = shard_numbers[0][1]
