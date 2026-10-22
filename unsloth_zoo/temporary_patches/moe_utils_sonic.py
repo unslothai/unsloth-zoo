@@ -805,10 +805,9 @@ def forward_sonic_moe(
         batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states = hidden_states.view(-1, hidden_dim)
 
-    from .moe_utils import moe_routing_sort
+    from .moe_utils import gather_routed_rows, moe_routing_sort
     _, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
-    token_indices = sorted_indices // top_k_index.shape[-1]
-    permuted_input = hidden_states[token_indices]
+    permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
     cu_seqlens = _cu_seqlens_from_offsets(offsets)
 
     use_separated_lora = _should_use_separated_lora()

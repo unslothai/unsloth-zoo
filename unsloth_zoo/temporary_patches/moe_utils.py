@@ -2229,6 +2229,50 @@ def combine_permuted_moe_outputs(
     return combined
 
 
+class _RoutedRowGather(torch.autograd.Function):
+    """hidden_states[sorted_indices // top_k] with a fixed-order backward.
+
+    Autograd's backward of that gather is an accumulating index_put over top_k duplicate
+    rows per token. Eager CUDA sorts first and is reproducible, but Inductor (block compile)
+    lowers it to tl.atomic_add, so every LoRA grad upstream of the first MoE backward changed
+    between two identical steps. The backward here is the same top_k sum in a fixed order,
+    spelled as combine_permuted_moe_outputs (inverse-permutation gather + sum). An unrolled
+    fp32 sum over the top_k slots is faster but Inductor miscompiled it under dynamic shapes
+    (torch 2.13: wrong, run-to-run varying dX), so it is not used.
+    With top_k <= 2 every token row gets at most two addends onto zero, which is order
+    independent, so the plain gather is kept there."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, hidden_states, sorted_indices, top_k):
+        ctx.save_for_backward(sorted_indices)
+        ctx.num_tokens = hidden_states.shape[0]
+        ctx.top_k = top_k
+        return hidden_states.index_select(0, sorted_indices // top_k)
+
+    @staticmethod
+    def backward(ctx, grad_rows):
+        (sorted_indices,) = ctx.saved_tensors
+        grad = combine_permuted_moe_outputs(grad_rows, sorted_indices, ctx.num_tokens, ctx.top_k)
+        return grad, None, None
+
+
+def gather_routed_rows(hidden_states, sorted_indices, top_k):
+    """Rows of a 2D hidden_states in routed (expert-sorted) order; sorted_indices must be the
+    full argsort permutation from moe_routing_sort. Eager keeps plain indexing: its sorted
+    index_put backward is already reproducible and needs no [T * top_k, H] buffer."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if (
+        top_k > 2
+        and torch.compiler.is_compiling()
+        and hidden_states.requires_grad
+        and torch.is_grad_enabled()
+        and sorted_indices.numel() == hidden_states.shape[0] * top_k
+    ):
+        return _RoutedRowGather.apply(hidden_states, sorted_indices, top_k)
+    return hidden_states[sorted_indices // top_k]
+
+
 def _silu_and_mul(x):
     """Fused SiLU + element-wise multiply for gate/up projections."""
     gate, up = x.chunk(2, dim=-1)
@@ -5200,8 +5244,7 @@ def forward_native_grouped_mm(
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
     num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
-    token_indices = sorted_indices // top_k_index.shape[-1]
-    permuted_input = hidden_states[token_indices]
+    permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
 
     # Gate + Up projection with optional separated LoRA (default).
     use_separated_lora = _should_use_separated_lora()
@@ -5672,7 +5715,7 @@ def forward_triton_grouped_gemm(
         first_weight, second_weight, scaling = gate_up_lora
         first_weight = first_weight.to(hidden_states.dtype)
         second_weight = second_weight.to(hidden_states.dtype)
-        permuted_hidden = hidden_states[gather_indices // top_k]
+        permuted_hidden = gather_routed_rows(hidden_states, gather_indices, top_k)
         gate_up_lora_delta = _apply_lora_grouped_mm(
             permuted_hidden,
             first_weight,
