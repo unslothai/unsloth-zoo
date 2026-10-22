@@ -142,10 +142,12 @@ class FastCPUModel:
         if quantization_config is not None:
             # Only when set: an explicit None also discards a pre-quantized checkpoint's own config.
             kwargs["quantization_config"] = quantization_config
+        # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
+        if attn_implementation is not None:
+            kwargs["attn_implementation"] = attn_implementation
         load_kwargs = dict(
             **{_DTYPE_KWARG: dtype},
             device_map = "cpu",
-            attn_implementation = attn_implementation or "sdpa",
             token = token,
             revision = revision,
             trust_remote_code = trust_remote_code,
@@ -305,10 +307,14 @@ def _merged_copy(model, save_method):
     return merged, False
 
 
-def save_pretrained_merged(self, save_directory, tokenizer = None, save_method = "merged_16bit", **kwargs):
-    """CPU save_pretrained_merged: "lora" (adapters), "merged_16bit" or "merged_4bit_forced" unsupported."""
+def _check_save_method(save_method):
     if save_method not in ("lora", "merged_16bit"):
         raise NotImplementedError(f"Unsloth (CPU): save_method = {save_method!r} is not supported on CPU.")
+
+
+def save_pretrained_merged(self, save_directory, tokenizer = None, save_method = "merged_16bit", **kwargs):
+    """CPU save_pretrained_merged: "lora" (adapters) or "merged_16bit"."""
+    _check_save_method(save_method)
     model, _ = _merged_copy(self, save_method)
     for key in ("maximum_memory_usage", "temporary_location", "max_shard_size_gb"):
         kwargs.pop(key, None)
@@ -319,6 +325,7 @@ def save_pretrained_merged(self, save_directory, tokenizer = None, save_method =
 
 
 def push_to_hub_merged(self, repo_id, tokenizer = None, save_method = "merged_16bit", token = None, private = None, **kwargs):
+    _check_save_method(save_method)
     model, _ = _merged_copy(self, save_method)
     model.push_to_hub(repo_id, token = token, private = private)
     if tokenizer is not None:
