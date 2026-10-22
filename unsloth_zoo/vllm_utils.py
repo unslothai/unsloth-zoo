@@ -4927,6 +4927,12 @@ def load_vllm(
             replayssm_mode = "off"
         if replayssm_mode != "off":
             replayssm_skip = _vllm_replayssm_skip_reason(config, good_keys, DEVICE_TYPE)
+            if replayssm_skip is None and engine_args.get("enable_return_routed_experts"):
+                # ReplaySSM pins Model Runner V1 below, but vLLM 0.31 captures routed experts only
+                # on V2 and refuses the engine: routing replay was asked for, so it wins.
+                from .routing_replay import _vllm_at_least
+                if _vllm_at_least(0, 31):
+                    replayssm_skip = "routing replay needs Model Runner V2 on this vLLM, ReplaySSM needs V1"
             if replayssm_skip is None and not (
                 _patch_vllm_replayssm_mamba2(replayssm_type) if replayssm_type in _REPLAYSSM_MAMBA2_MODELS
                 else _patch_vllm_replayssm_gdn() if replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES
