@@ -472,6 +472,21 @@ def get_lora_layer_modules():
 pass
 
 
+def _outside_compiled_region(root, embeddings):
+    """The input embedding's outermost ancestor below `root` whose class Unsloth's compiler swapped in
+    (AST's ASTEmbeddings): a hook there runs outside torch.compile, where requires_grad_() is allowed."""
+    path = next((name for name, sub in root.named_modules() if sub is embeddings), None)
+    if not path:
+        return embeddings
+    current = root
+    for part in path.split(".")[:-1]:
+        current = getattr(current, part)
+        if type(current).__module__.startswith("unsloth_compiled_module"):
+            return current
+    return embeddings
+pass
+
+
 def requires_grad_for_gradient_checkpointing(model):
     # All Unsloth Zoo code licensed under LGPLv3
     # Enables requires_grad to make gradient checkpointing work on
@@ -684,6 +699,8 @@ def requires_grad_for_gradient_checkpointing(model):
                 )
             else:
                 # Keep `module` on the tower: the fallback below hooks it.
+                if embeddings is not None:
+                    embeddings = _outside_compiled_region(module, embeddings)
                 try:
                     register_other_hooks(
                         "requires_grad_post_hook",
