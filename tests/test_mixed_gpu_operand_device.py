@@ -118,3 +118,30 @@ def test_efficient_check_on_the_current_card_does_not_switch(two_cards):
     two_cards["current"] = 0
     assert sdpa_gqa._efficient_takes(_query(0), None, None, None, 0.0, True, False) is False
     assert two_cards["switches"] == 0
+
+
+def test_rejected_repeated_kv_is_freed_before_the_fallback(monkeypatch):
+    # The repeat is rejected too (fp32 on ROCm CK): its k/v copies must not stay alive during the fallback call.
+    import weakref
+    repeated = []
+
+    def efficient(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa):
+        if not enable_gqa:
+            repeated.extend((weakref.ref(key), weakref.ref(value)))
+        return False
+
+    monkeypatch.setattr(sdpa_gqa, "_efficient_takes", efficient)
+    monkeypatch.setattr(sdpa_gqa, "_flash_takes_gqa", lambda *a: False)
+    monkeypatch.setattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: True)
+    alive = []
+
+    def sdpa(query, key, value, **kwargs):
+        alive.append([r() is not None for r in repeated])
+        assert kwargs["enable_gqa"] is True and key.shape[1] == 2
+        return "fallback"
+
+    gqa_sdpa = sdpa_gqa.make_gqa_sdpa(sdpa)
+    query = types.SimpleNamespace(is_cuda = True, device = torch.device("cuda", 0))
+    key, value = torch.zeros(1, 2, 16, 8), torch.zeros(1, 2, 16, 8)
+    assert gqa_sdpa(query, key, value, None, 0.0, True, None, 4) == "fallback"
+    assert len(repeated) == 2 and alive == [[False, False]]

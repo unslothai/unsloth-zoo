@@ -76,6 +76,8 @@ def make_gqa_sdpa(scaled_dot_product_attention):
                 return scaled_dot_product_attention(
                     query, key_r, value_r, attn_mask = attn_mask, dropout_p = dropout_p, is_causal = is_causal, scale = scale,
                 )
+            # Rejected: free the repeated copies before the fallback runs (math GQA repeats k/v itself).
+            del key_r, value_r
         return scaled_dot_product_attention(
             query, key, value, attn_mask = attn_mask, dropout_p = dropout_p, is_causal = is_causal, scale = scale,
             enable_gqa = groups != 1,
