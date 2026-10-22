@@ -164,56 +164,8 @@ def patch_Qwen3MoeAttention_float32():
     except Exception as e:
         return raise_error("Qwen3MoeAttention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    try:
-        from .misc import _flash_sdpa_accepts
-    except Exception:
-        _flash_sdpa_accepts = None
-
-    def flash_takes_gqa(query, key, attn_mask, dropout_p):
-        if attn_mask is not None or _flash_sdpa_accepts is None or not torch.backends.cuda.flash_sdp_enabled():
-            return False
-        if not torch.is_autocast_enabled("cuda"):
-            return False
-        dtype = torch.get_autocast_dtype("cuda")
-        if dtype not in (torch.float16, torch.bfloat16):
-            return False
-        return _flash_sdpa_accepts(
-            query.device, dtype, query.shape[1], key.shape[1], query.shape[-1], dropout_p, query.requires_grad,
-        )
-    pass
-
-    def efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa):
-        try:
-            try:
-                params = torch.backends.cuda.SDPAParams(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
-            except TypeError:
-                # torch 2.4: six-argument SDPAParams, no GQA support to probe.
-                if enable_gqa:
-                    return False
-                params = torch.backends.cuda.SDPAParams(query, key, value, attn_mask, dropout_p, is_causal)
-            return torch.backends.cuda.can_use_efficient_attention(params, False) is True
-        except Exception:
-            return False
-    pass
-
-    @torch.compiler.disable(recursive = True)
-    def float32_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale, groups):
-        # Pre torch 2.14 mem-efficient rejects enable_gqa (math fallback keeps fp32 scores); repeat k/v instead.
-        if groups != 1 and query.is_cuda and torch.backends.cuda.mem_efficient_sdp_enabled() and \
-            not flash_takes_gqa(query, key, attn_mask, dropout_p) and \
-            not efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, True):
-            b, h_kv, s_kv, d = key.shape
-            key_r = key[:, :, None].expand(b, h_kv, groups, s_kv, d).reshape(b, h_kv * groups, s_kv, d)
-            value_r = value[:, :, None].expand(b, h_kv, groups, s_kv, value.shape[-1]).reshape(b, h_kv * groups, s_kv, value.shape[-1])
-            if efficient_takes(query, key_r, value_r, attn_mask, dropout_p, is_causal, False):
-                return scaled_dot_product_attention(
-                    query, key_r, value_r, attn_mask = attn_mask, dropout_p = dropout_p, is_causal = is_causal, scale = scale,
-                )
-        return scaled_dot_product_attention(
-            query, key, value, attn_mask = attn_mask, dropout_p = dropout_p, is_causal = is_causal, scale = scale,
-            enable_gqa = groups != 1,
-        )
-    pass
+    from .sdpa_gqa import make_gqa_sdpa
+    float32_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
 
     def forward(
         self,
