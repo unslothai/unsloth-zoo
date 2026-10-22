@@ -71,3 +71,15 @@ def test_untagged_decoders_get_peft_targets():
     targets = {n for n in linears if re.fullmatch(regex, n)}
     want = {n for n in linears if n != "lm_head"}
     assert targets == want
+
+
+def test_frozen_codec_is_not_a_target():
+    model = _CsmLike()
+    model.codec_model = nn.Module()
+    model.codec_model.encoder = _Stack(8)
+    model.codec_model.encoder.layers[0].mlp.fc1 = nn.Linear(8, 8)
+    regex = get_peft_regex(model)
+    targets = {n for n, m in model.named_modules() if isinstance(m, nn.Linear) and re.fullmatch(regex, n)}
+    assert targets and not any(n.startswith("codec_model.") for n in targets)
+    assert any(n.startswith("backbone_model.") for n in targets)
+    assert any(n.startswith("depth_decoder.") for n in targets)
