@@ -189,6 +189,26 @@ def test_cached_launch_matches_reference_over_many_steps(monkeypatch, dtype):
 
 
 @requires_cuda
+def test_update_plan_cache_stays_bounded_over_batch_sizes(monkeypatch):
+    # Batch size and length are in the plan key: a long-running server must not grow it forever.
+    monkeypatch.setattr(gcc, "_update_plans", {})
+    monkeypatch.setattr(gcc, "_fast_launch_mode", None)
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    monkeypatch.setattr(gcc, "_UPDATE_PLANS_MAX", 8, raising = False)
+    sizes = []
+    for B in range(1, 25):
+        x, state, w, b = _inputs(B, 64, 1, 4, 4, torch.bfloat16, True)
+        ref_state = state.clone()
+        ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, "silu")
+        ours = gcc._try_fast_update(x, state, w, b, "silu")
+        assert ours is not None and torch.equal(state, ref_state)
+        assert _rel(ours, ref) < 5e-3
+        sizes.append(len(gcc._update_plans))
+    assert max(sizes) <= 8
+
+
+@requires_cuda
 def test_unaligned_and_uncached_paths(monkeypatch):
     monkeypatch.setattr(gcc, "_update_plans", {})
     monkeypatch.setattr(gcc, "_fast_launch_mode", False)  # a Triton whose launcher did not check out

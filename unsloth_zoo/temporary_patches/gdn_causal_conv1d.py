@@ -535,8 +535,15 @@ def _launch_update(x, conv_state, weight, bias, activation, y = None):
 
 
 # key -> (grid, compiled kernel, runtime ints, runtime ints + constexprs) for repeated decode
-# steps; None = ineligible.
+# steps; None = ineligible. Batch size and length are in the key: capped (FIFO) like _conv_plans.
 _update_plans = {}
+_UPDATE_PLANS_MAX = 256
+
+
+def _remember_update_plan(key, plan):
+    if key not in _update_plans and len(_update_plans) >= _UPDATE_PLANS_MAX:
+        _update_plans.pop(next(iter(_update_plans)), None)
+    _update_plans[key] = plan
 # Which argument list the cached launcher takes on this Triton: None = not checked yet,
 # "all" (every parameter, Triton 3.6+), False = full launches only.
 _fast_launch_mode = None
@@ -635,12 +642,12 @@ def _run_update(x, conv_state, weight, bias, activation):
         return None
     if plan == 0:
         if not _update_eligible(x, conv_state, weight, bias, activation):
-            _update_plans[key] = None
+            _remember_update_plan(key, None)
             return None
         y, plan = _launch_update(x, conv_state, weight, bias, activation)
         # Triton specializes pointers on 16-byte alignment: cache only the all-aligned plan.
         if not _unaligned(x, conv_state, weight, bias):
-            _update_plans[key] = plan
+            _remember_update_plan(key, plan)
         return y
     if (
         _fast_launch_mode is False or _unaligned(x, conv_state, weight, bias) or _launch_hooks_set()
