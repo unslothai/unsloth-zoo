@@ -807,6 +807,8 @@ def grpo_compute_loss(
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
+    # Bool (B, T) keep mask from rollout_rs; None when rejection is off.
+    rs_keep = None
 
     # exp(new - old) and exp(ref - new) below are taken before `mask` is applied. A sequence-packed
     # logp path leaves the masked (prompt/pad) columns at 0 while a padded one fills them with a real
@@ -886,8 +888,10 @@ def grpo_compute_loss(
                 )
 
             if rollout_rs is not None:
-                # verl compute_rollout_rejection_mask: every option must pass. A rejected token gets
-                # IS weight 0 like TRL's *_mask modes, so it stays in the loss normaliser.
+                # verl compute_rollout_rejection_mask: every option must pass. verl then replaces
+                # response_mask with response_mask * keep, so a rejected token leaves the policy term
+                # and the KL loss (both selected out below). It stays in the loss normaliser like
+                # TRL's *_mask modes, since num_items_in_batch is counted before the loss.
                 rs_log_ratio = torch.clamp(torch.nan_to_num((old - sampling_per_token_logps) * mask, nan = 0.0), min = -20.0, max = 20.0)
                 rs_mask = mask.to(rs_log_ratio.dtype)
                 rs_count = rs_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
@@ -912,7 +916,9 @@ def grpo_compute_loss(
                     else:
                         rs_pass = rs_stat <= rs_upper
                     rs_keep = rs_keep * rs_pass.to(rs_keep.dtype)
-                importance_sampling_ratio = importance_sampling_ratio * rs_keep
+                rs_keep = rs_keep > 0
+                # Select, not multiply: an unclipped ratio can overflow to inf and inf * 0 is nan.
+                importance_sampling_ratio = torch.where(rs_keep, importance_sampling_ratio, 0.0)
     pass
 
     # Must detach when old is None: exp(new - new.detach()) == 1 but keeps grads correct.
@@ -1010,6 +1016,10 @@ def grpo_compute_loss(
         flat_is_ratio = torch.tensor([]).detach()
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
+    if rs_keep is not None:
+        # Rejected tokens drop out of every loss term, KL included (verl rollout_rs). A select, so
+        # an inf or nan there neither reaches the loss nor turns into a nan gradient.
+        loss_i = torch.where(rs_keep, loss_i, 0.0)
 
     mask = mask.to(torch.float32)
     n_mask_per_reward = mask.sum(1)
