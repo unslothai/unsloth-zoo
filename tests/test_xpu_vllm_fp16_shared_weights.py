@@ -51,6 +51,20 @@ def test_shared_weight_dtype_reads_vision_embedding_and_parameters(vu, monkeypat
     assert vu._shared_weight_dtype(state, torch.bfloat16) is torch.float16
 
 
+def test_shared_weight_dtype_reads_nemotron_h_embeddings(vu, monkeypatch):
+    # get_vllm_state_dict stores Nemotron-H's embedding as `embeddings`, not `embed_tokens`.
+    monkeypatch.setattr(vu, "DEVICE_TYPE", "xpu")
+    state = {"model.embeddings.weight": torch.zeros(4, 2, dtype = torch.float16)}
+    assert vu._shared_weight_dtype(state, torch.bfloat16) is torch.float16
+
+
+def test_vllm_automatic_dtype_judges_the_engine_target():
+    from unsloth_zoo import vllm_utils as vu
+    source = inspect.getsource(vu.load_vllm)
+    assert "_xpu_bf16_supported(get_target_device())" in source
+    assert "device = get_target_device()" in source
+
+
 def test_convert_builds_in_the_shared_dtype_and_marks_the_model(vu):
     source = inspect.getsource(vu.convert_vllm_to_huggingface)
     tree = ast.parse(source)
@@ -59,6 +73,9 @@ def test_convert_builds_in_the_shared_dtype_and_marks_the_model(vu):
     # The dtype is settled before the config or the empty model see it.
     assert ast.unparse(first) == "dtype = _shared_weight_dtype(quant_state_dict, dtype)"
     assert "new_model._unsloth_vllm_dtype = dtype" in source
+    # The rebuild still runs under inference mode, and the dtype probe stays a plain function.
+    assert source.lstrip().startswith("@torch.inference_mode\n")
+    assert not inspect.getsource(vu._shared_weight_dtype).lstrip().startswith("@")
 
 
 def _model():

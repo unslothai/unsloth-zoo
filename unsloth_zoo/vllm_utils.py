@@ -1931,13 +1931,16 @@ def _native_config_for_vllm_rebuild(config):
 pass
 
 
-@torch.inference_mode
+# Embeddings stored under another name: Nemotron-H keeps `embeddings` (see get_vllm_state_dict).
+_EXTRA_EMBED_KEYS = ("model.embeddings.weight",)
+
+
 def _shared_weight_dtype(quant_state_dict, dtype):
     """The dtype to build the Hugging Face side in. On XPU, load_vllm runs fp16 when vLLM refuses bf16
     (Arc A770) even if the loader asked for bf16, so follow the embedding vLLM shares, never a guess."""
     if DEVICE_TYPE != "xpu" or dtype != torch.bfloat16:
         return dtype
-    for key in TIED_EMBED_KEYS:
+    for key in TIED_EMBED_KEYS + _EXTRA_EMBED_KEYS:
         weight = getattr(quant_state_dict.get(key, None), "data", quant_state_dict.get(key, None))
         if isinstance(weight, torch.Tensor):
             return torch.float16 if weight.dtype == torch.float16 else dtype
@@ -1945,6 +1948,7 @@ def _shared_weight_dtype(quant_state_dict, dtype):
 pass
 
 
+@torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules into an HF-compatible model
@@ -4312,9 +4316,9 @@ def load_vllm(
     elif DEVICE_TYPE == "hip":
         _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
-        # The current XPU is the one vLLM runs on in-process (unsloth sets it per rank).
+        # Judge the XPU the engine is handed below (get_target_device()), not the current one.
         from .device_type import _xpu_bf16_supported
-        _dtype = torch.bfloat16 if _xpu_bf16_supported() else torch.float16
+        _dtype = torch.bfloat16 if _xpu_bf16_supported(get_target_device()) else torch.float16
     elif DEVICE_TYPE == "npu" and torch.npu.is_bf16_supported():
         _dtype = torch.bfloat16
     else:

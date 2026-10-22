@@ -238,11 +238,11 @@ def test_gradient_checkpointing_xpu_buffers_follow_native_bf16(monkeypatch):
     assert got[(_MISSING,), None] is torch.bfloat16
     assert got[(False,), None] is torch.bfloat16
     assert got[(_PROVEN_NO_BF16,), None] is torch.float16
-    # The current XPU decides: an unused emulating sibling keeps a native current device bf16.
-    assert got[(True, _PROVEN_NO_BF16), 0] is torch.bfloat16
+    # One buffer pool spans every visible XPU: any emulating one decides, whichever is current.
+    assert got[(True, _PROVEN_NO_BF16), 0] is torch.float16
     assert got[(True, _PROVEN_NO_BF16), 1] is torch.float16
     assert got[(_PROVEN_NO_BF16, True), 0] is torch.float16
-    assert got[(_PROVEN_NO_BF16, True), 1] is torch.bfloat16
+    assert got[(_PROVEN_NO_BF16, True), 1] is torch.float16
     assert got[(True, False), None] is torch.bfloat16
 
 
@@ -288,10 +288,15 @@ def test_get_mem_info_cuda_unchanged(monkeypatch, vu):
 @not_on_macos
 def test_vllm_xpu_dtype_asks_native_bf16_and_old_gpu_message_is_actionable(vu):
     source = inspect.getsource(vu.load_vllm)
-    assert "_xpu_bf16_supported()" in source
+    assert "_xpu_bf16_supported(get_target_device())" in source
     assert "fast_inference = False" in source
     assert "compute capability 7.0" in source
     assert "{major_version}.{minor_version}" in source
+
+
+def _xpu_target(index = 0):
+    # vllm_utils.get_target_device on XPU: the engine is always handed xpu:0.
+    return torch.device("xpu", index)
 
 
 def _vllm_dtype_block(vu):
@@ -310,16 +315,16 @@ def _vllm_dtype_block(vu):
         ((_PROVEN_NO_BF16,), None, "bfloat16", "bfloat16"),  # explicit bf16 still runs (emulated)
         ((_PROVEN_NO_BF16,), None, "float16", "float16"),
         ((True,), None, None, "bfloat16"),
-        ((True, _PROVEN_NO_BF16), 0, None, "bfloat16"),  # native current XPU, unused emulating sibling
-        ((True, _PROVEN_NO_BF16), 1, None, "float16"),   # the current XPU emulates bf16
-        ((_PROVEN_NO_BF16, True), 0, None, "float16"),
-        ((_PROVEN_NO_BF16, True), 1, None, "bfloat16"),
+        ((True, _PROVEN_NO_BF16), 0, None, "bfloat16"),  # native engine XPU (xpu:0), unused emulating sibling
+        ((True, _PROVEN_NO_BF16), 1, None, "bfloat16"),  # the engine still targets xpu:0, whatever is current
+        ((_PROVEN_NO_BF16, True), 0, None, "float16"),   # the engine XPU emulates bf16
+        ((_PROVEN_NO_BF16, True), 1, None, "float16"),
     ],
 )
 def test_vllm_xpu_dtype_keeps_explicit_bf16(on_xpu, vu, flags, current, dtype, expected):
     on_xpu(_fake_xpu(flags, current = current))
     scope = {
-        "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
+        "DEVICE_TYPE": "xpu", "torch": torch, "get_target_device": _xpu_target, "major_version": 0, "__name__": vu.__name__,
         "__package__": "unsloth_zoo", "dtype": None if dtype is None else getattr(torch, dtype),
     }
     exec(_vllm_dtype_block(vu), scope)
@@ -338,7 +343,7 @@ def test_vllm_xpu_explicit_bf16_follows_the_loading_unsloth(on_xpu, vu, monkeypa
     monkeypatch.setitem(sys.modules, "unsloth.device_type", core)
     assert dt.XPU_KEEPS_EXPLICIT_BF16 is True
     scope = {
-        "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
+        "DEVICE_TYPE": "xpu", "torch": torch, "get_target_device": _xpu_target, "major_version": 0, "__name__": vu.__name__,
         "__package__": "unsloth_zoo", "dtype": torch.bfloat16,
     }
     exec(_vllm_dtype_block(vu), scope)
@@ -393,7 +398,7 @@ def test_vllm_xpu_dtype_follows_vllms_bf16_check(on_xpu, vu, monkeypatch, flags,
     on_xpu(_fake_xpu(flags))
     _fake_vllm_platforms(monkeypatch, refuses = refuses)
     scope = {
-        "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
+        "DEVICE_TYPE": "xpu", "torch": torch, "get_target_device": _xpu_target, "major_version": 0, "__name__": vu.__name__,
         "__package__": "unsloth_zoo", "dtype": None if dtype is None else getattr(torch, dtype),
     }
     exec(_vllm_dtype_block(vu), scope)
@@ -414,7 +419,7 @@ def test_vllm_xpu_bf16_refusal_switches_beside_any_unsloth(on_xpu, vu, monkeypat
         core.xpu_vllm_refuses_bf16 = lambda: True
     monkeypatch.setitem(sys.modules, "unsloth.device_type", core)
     scope = {
-        "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
+        "DEVICE_TYPE": "xpu", "torch": torch, "get_target_device": _xpu_target, "major_version": 0, "__name__": vu.__name__,
         "__package__": "unsloth_zoo", "dtype": torch.bfloat16,
     }
     exec(_vllm_dtype_block(vu), scope)
@@ -436,7 +441,7 @@ def test_vllm_xpu_a770_refusal_beside_released_unsloth_main(on_xpu, vu, monkeypa
     core.zoo_shares_xpu_bf16 = lambda: True
     monkeypatch.setitem(sys.modules, "unsloth.device_type", core)
     scope = {
-        "DEVICE_TYPE": "xpu", "torch": torch, "major_version": 0, "__name__": vu.__name__,
+        "DEVICE_TYPE": "xpu", "torch": torch, "get_target_device": _xpu_target, "major_version": 0, "__name__": vu.__name__,
         "__package__": "unsloth_zoo", "dtype": None if dtype is None else getattr(torch, dtype),
     }
     exec(_vllm_dtype_block(vu), scope)
