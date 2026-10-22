@@ -15490,9 +15490,12 @@ def _lora_module_types(model):
         if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
             continue
         base_linear = getattr(module, "linear", None)
+        module_type = type(module)
+        if getattr(module_type, "_unsloth_mlx_qat_active", False):
+            module_type = module_type.__base__  # QAT forward subclass, see mlx/qat.py
         if (
-            type(module) is LoRALinear
-            or (DoRALinear is not None and type(module) is DoRALinear)
+            module_type is LoRALinear
+            or (DoRALinear is not None and module_type is DoRALinear)
         ) and type(base_linear) in (nn.Linear, nn.QuantizedLinear):
             wrapped[name] = "linear"
         else:

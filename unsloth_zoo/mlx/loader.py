@@ -595,6 +595,12 @@ def linear_to_lora_layers(model, num_layers, config, *, dry_run=False):
     for _, modules in [*selected, (root, root_modules)]:
         for _, module in modules:
             _check_mlx_lora_base(module)
+    if config.get("qat_scheme") not in (None, False):
+        from .qat import validate_mlx_qat_targets
+        validate_mlx_qat_targets(
+            [pair for _, modules in [*selected, (root, root_modules)] for pair in modules],
+            config["qat_scheme"],
+        )
     if dry_run:
         return sum(len(modules) for _, modules in selected) + len(root_modules)
     attached = 0
@@ -10355,9 +10361,11 @@ class FastMLXModel:
                 "Unsloth: loftq_config is not supported for MLX LoRA yet."
             )
         qat_scheme = kwargs.pop("qat_scheme", None)
-        if qat_scheme is not None:
-            raise NotImplementedError(
-                "Unsloth: qat_scheme is not supported for MLX LoRA yet."
+        if qat_scheme not in (None, False):
+            # Before the full_finetuning early return, else QAT is silently dropped.
+            from .qat import validate_mlx_qat_request
+            validate_mlx_qat_request(
+                model, qat_scheme, lora_dropout=lora_dropout, use_dora=use_dora,
             )
         if bias not in (None, False, "none"):
             print(
@@ -10570,8 +10578,12 @@ class FastMLXModel:
                 linear_to_lora_layers(
                     lm, num_layers,
                     {**lora_config, "keys": language_lora_keys,
-                     "layer_keys": language_layer_keys}, dry_run=True,
+                     "layer_keys": language_layer_keys,
+                     "qat_scheme": qat_scheme}, dry_run=True,
                 )
+            if qat_scheme not in (None, False) and not language_lora_keys:
+                from .qat import validate_mlx_qat_targets
+                validate_mlx_qat_targets((), qat_scheme)
 
             # Scopes embedding_learning_rate to exactly these tensors.
             model._unsloth_cpt_full_module_weight_keys = (
@@ -10679,6 +10691,9 @@ class FastMLXModel:
                 _apply_layer_lora = finetune_language_layers and (
                     language_lora_keys is None or len(language_lora_keys) > 0
                 )
+            if qat_scheme not in (None, False) and not _apply_layer_lora:
+                from .qat import validate_mlx_qat_targets
+                validate_mlx_qat_targets((), qat_scheme)
             if _apply_layer_lora:
                 # Compat patch (older mlx-lm rejects scale=/dropout= on
                 # from_base); before the seed since monkey-patching doesn't
@@ -10692,7 +10707,8 @@ class FastMLXModel:
                     model,
                     num_layers=num_layers,
                     config={**lora_config, "keys": language_lora_keys,
-                            "layer_keys": language_layer_keys},
+                            "layer_keys": language_layer_keys,
+                            "qat_scheme": qat_scheme},
                 )
                 if language_lora_count == 0:
                     _raise_no_lora_targets(target_modules, model, _requested_target_modules)
@@ -10714,6 +10730,11 @@ class FastMLXModel:
         _apply_mlx_lora_initialization(model, init_lora_weights)
         # Adapters are invisible to a cached weight fusion.
         _disable_fused_input_projections(model)
+
+        if qat_scheme not in (None, False):
+            from .qat import apply_mlx_qat
+            # Text-only VLMs: only the validated language tower is simulated.
+            apply_mlx_qat(model.language_model if is_vlm else model)
 
         # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):
