@@ -383,8 +383,10 @@ def get_peft_regex(
     # modules are not tagged with vision keywords): drop the model-part requirement.
     # Never broaden for audio-only (regex_model_parts == ""), which would otherwise
     # pull in the whole language stack.
+    # fullmatch like PEFT: re.search finds `model.layers.` inside CSM's `depth_decoder.model.layers.`,
+    # which PEFT then rejects ("Target modules ... not found").
     if regex_model_parts != "":
-        check = any(re.search(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
+        check = any(re.fullmatch(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
         if not check:
             regex_matcher = \
                 r".*?(?:" + regex_components + \
