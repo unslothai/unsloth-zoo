@@ -452,6 +452,8 @@ def routed_bf16_eligible(experts, hidden_states):
             return False
     # Below sm80 (T4) only one-token decode routes (moe_routed.sub_sm80_devices).
     sub = sub_sm80_devices()
+    if sub is None:
+        return hidden_states.numel() == hidden_states.shape[-1]
     return not sub or w.device.index not in sub or hidden_states.numel() == hidden_states.shape[-1]
 
 
@@ -492,6 +494,9 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
         # Built eagerly (data_ptr is not traceable), even on calls too large to route.
         state = _compiled_state(experts) if torch.compiler.is_compiling() else prepare_routed_experts(experts)
         nf4 = isinstance(state, dict)
+    elif not torch.compiler.is_compiling():
+        # The device set too (torch.cuda host queries), on the eager prefill a compiled decode follows.
+        sub_sm80_devices()
     if hidden_states.numel() // hidden_states.shape[-1] * getattr(mlp.router, "top_k", 4) > max_slots:
         return None
     if not nf4 and not routed_bf16_eligible(experts, hidden_states):
