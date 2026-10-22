@@ -723,7 +723,7 @@ def test_launches_before_m3_fit_their_threadgroup_limit(monkeypatch):
     queries, keys, values = _attention_block(8, 8, 4500, mx.float16)
     out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None)
     _equal(out, decode._decode_attention(queries, keys, values, 1.0))
-    assert launched == [2, 2, 2, 2]   # F16 allows 576
+    assert launched == [2, 2, 2, 2]
 
 
 def _gemma4_attention(gqa):
@@ -846,7 +846,6 @@ def test_vector_attention_preserves_bits_when_feature_layouts_change(dtype, rows
 def test_wide_decode_attention_is_native_bitwise_over_strided_caches(heads, keys, monkeypatch):
     monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
     mx.random.seed(keys)
-    # Separate row/head padding and every-other feature, including different K and V strides.
     q = mx.random.normal((1, heads, 1, 1024)).astype(mx.bfloat16)[..., ::2]
     k = mx.random.normal((1, heads // 8, keys + 256, 1024)).astype(mx.bfloat16)[:, :, :keys, ::2]
     v = mx.random.normal((1, heads // 8, keys + 128, 1536)).astype(mx.bfloat16)[:, :, :keys, ::3]

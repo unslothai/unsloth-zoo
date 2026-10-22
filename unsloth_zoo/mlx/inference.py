@@ -5110,11 +5110,8 @@ def _wide_attention_class(base, helper, cache_type):
 
 @contextmanager
 def fused_decode_attention(model, *, _modules = None):
-    """Route MLX 0.32.4's wide BF16 decode heads through the small-unroll vector kernel after bitwise agreement.
-
-    Only this model's attention instances are routed. Multi-query calls, array masks, sinks, nonstandard caches,
-    training and distributed models keep their native paths; scope exit restores the instance classes.
-    """
+    """Route MLX 0.32.4's wide BF16 single-token decode attention through the vector kernel after bitwise agreement;
+    everything else, training and distributed models stay native."""
     changed = []
     try:
         with _WIDE_ATTENTION_LOCK:
