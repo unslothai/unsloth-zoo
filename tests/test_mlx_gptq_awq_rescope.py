@@ -778,3 +778,36 @@ def test_materialize_links_nested_asset_dirs(tmp_path):
         import shutil
         shutil.rmtree(out_dir, ignore_errors=True)
     assert (tmp_path / "chat_templates" / "tool_use.jinja").exists()
+
+
+@pytest.mark.parametrize("override, rejected", [
+    ({"+:.*down_proj": {"bits": 8}}, True),
+    ({"+:.*down_proj": {"group_size": 32}}, True),
+    ({"-:.*lm_head": {}}, False),
+    ({"+:.*down_proj": {"bits": 4, "group_size": 128}}, False),
+])
+def test_gptq_dynamic_mixed_bits_rejected(override, rejected):
+    import unsloth_zoo.mlx.loader as ml
+    qc = {"bits": 4, "group_size": 128, "dynamic": override}
+    if rejected:
+        with pytest.raises(NotImplementedError, match="dynamic"):
+            ml._materialize_dequantized_hf_checkpoint("/nonexistent", {}, "gptq", qc)
+    else:
+        with pytest.raises(FileNotFoundError):
+            ml._materialize_dequantized_hf_checkpoint("/nonexistent", {}, "gptq", qc)
+
+
+def test_gptq_on_mlx_vlm_routed_text_model_rejected_before_conversion(monkeypatch, tmp_path):
+    import mlx_lm.utils as mlx_lm_utils
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    repo = _write_repo(str(tmp_path / "gptq"))
+    monkeypatch.setattr(mlx_lm_utils, "_download", lambda *a, **k: repo)
+    monkeypatch.setattr(loader, "_mlx_vlm_only_text_model", lambda config, model_type: True)
+    monkeypatch.setattr(
+        loader, "_materialize_dequantized_hf_checkpoint",
+        lambda *a, **k: pytest.fail("an mlx-vlm-routed GPTQ model must not be converted"),
+    )
+    with pytest.raises(NotImplementedError, match="mlx-vlm"):
+        FastMLXModel.from_pretrained(repo)

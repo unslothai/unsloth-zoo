@@ -6378,6 +6378,20 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
                 "not supported on MLX; only the standard AutoGPTQ (v1) packing can be "
                 "loaded. Use a checkpoint saved with format='gptq'."
             )
+        # GPTQModel `dynamic` overrides re-pack matched modules at their own bits / group size.
+        _dynamic = quant_config.get("dynamic")
+        if isinstance(_dynamic, dict) and any(
+            isinstance(_override, dict)
+            and (
+                int(_override.get("bits", bits)) != bits
+                or _override.get("group_size", raw_group_size) != raw_group_size
+            )
+            for _override in _dynamic.values()
+        ):
+            raise NotImplementedError(
+                "Unsloth: GPTQ checkpoints whose `dynamic` config gives some modules "
+                "different bits or group sizes are not supported on MLX."
+            )
 
     shard_paths = sorted(glob.glob(os.path.join(local_path, "*.safetensors")))
     if not shard_paths:
@@ -9687,11 +9701,15 @@ class FastMLXModel:
                     f"Unsloth: could not resolve local files for "
                     f"{hf_prequant_method.upper()} model '{model_name}'."
                 )
-            if _is_vlm(config_data):
+            # mlx-vlm-routed text models too: that branch never restores the repo or removes the scratch dir.
+            if _is_vlm(config_data) or (
+                text_only is not False
+                and _mlx_vlm_only_text_model(config_data, config_data.get("model_type", ""))
+            ):
                 raise NotImplementedError(
                     f"Unsloth: {hf_prequant_method.upper()} runtime dequant is not "
-                    "yet supported for vision models on MLX. Load an unquantized "
-                    "VLM base for LoRA instead."
+                    "yet supported for models MLX loads through mlx-vlm (vision "
+                    "models and mlx-vlm-only architectures). Load an unquantized base instead."
                 )
             if hf_prequant_method == "awq" and not _awq_quant_config_is_gemm(
                 hf_prequant_config
