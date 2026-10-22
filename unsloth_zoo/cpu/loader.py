@@ -129,13 +129,15 @@ class FastCPUModel:
                     "fix_tokenizer", "resize_model_vocab", "unsloth_tiled_mlp", "offload_embedding"):
             kwargs.pop(key, None)
 
+        if quantization_config is not None:
+            # Only when set: an explicit None also discards a pre-quantized checkpoint's own config.
+            kwargs["quantization_config"] = quantization_config
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 dtype = dtype,
                 device_map = "cpu",
-                quantization_config = quantization_config,
                 attn_implementation = attn_implementation or "sdpa",
                 token = token,
                 revision = revision,
