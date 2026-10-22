@@ -116,12 +116,13 @@ def _run(experts, dtype):
     return out, X.grad, experts.gate_up_proj.grad, experts.down_proj.grad
 
 
-def test_float32_activations_run_down_in_bf16(setup):
+def test_float32_activations_run_both_gemms_in_bf16(setup):
     out, dX, dgu, ddn = _run(_experts(torch.bfloat16), torch.float32)
-    assert CALLS == [("gate_up", torch.float32), ("down", torch.bfloat16)]
+    assert CALLS == [("gate_up", torch.bfloat16), ("down", torch.bfloat16)]
+    # The cast is autograd-tracked: dX and the routed output stay float32.
     assert out.dtype == torch.float32 and dX.dtype == torch.float32
     assert dgu.dtype == torch.bfloat16 and ddn.dtype == torch.bfloat16
-    assert TUNED == [torch.float32, torch.bfloat16]
+    assert TUNED == [torch.bfloat16, torch.bfloat16]
     assert moe_utils.TRITON_MOE_COMPUTE_DTYPE_STATS == {"cast": 1, "kept_fp32": 0}
 
 
