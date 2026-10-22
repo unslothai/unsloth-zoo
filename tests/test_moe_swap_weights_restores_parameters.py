@@ -119,3 +119,33 @@ def test_swap_traces_fullgraph_and_restores_under_compile(backend, dynamic):
     finally:
         torch._dynamo.reset()
     assert sum(breaks.values()) == 0, breaks
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+@pytest.mark.parametrize("fullgraph", [False, True])
+def test_compiled_swap_keeps_parameters_registered(backend, fullgraph):
+    # Dynamo on torch 2.12 replays a traced `__dict__.pop(name)` as DELETE_ATTR, and
+    # nn.Module.__delattr__ then unregisters the Parameter: the first compiled call returned the
+    # right value but left `_parameters` empty, and the module lost both expert weights.
+    experts = _Experts()
+    originals = dict(experts._parameters)
+
+    def forward_fn(module, x):
+        return x * module.gate_up_proj.sum() + module.down_proj.sum()
+
+    call = torch.compile(
+        lambda x: swap_moe_weights_for_call(experts, torch.ones(2, 8, 4), torch.ones(2, 4, 4), forward_fn, x),
+        backend = backend,
+        fullgraph = fullgraph,
+    )
+    torch._dynamo.reset()
+    try:
+        for _ in range(3):
+            out = call(torch.ones(1))
+            assert out.item() == 64 + 32
+            assert list(experts._parameters) == ["gate_up_proj", "down_proj"]
+            assert all(experts._parameters[n] is p for n, p in originals.items())
+            assert set(dict(experts.named_parameters())) == set(originals)
+            assert "gate_up_proj" not in experts.__dict__ and "down_proj" not in experts.__dict__
+    finally:
+        torch._dynamo.reset()
