@@ -1212,10 +1212,7 @@ def fused_packed_gated_delta(model, *, _modules = None):
                         namespace["gated_delta_kernel"] = native
 
 
-# Qwen4-Exp prefill hyper-connection read. Each kernel repeats mlx-vlm's arithmetic bit for bit: reductions keep the
-# native kernels' lane assignment and order, and the sigmoid of a 16-bit gate is read from a 65,536-entry table MLX
-# computes with the native op.
-# The exported classes the eligibility checks compare against are pinned by name too.
+# Qwen4-Exp prefill hyper-connection read, bit for bit with mlx-vlm: native reduction order, sigmoid table.
 _QWEN4_PREFILL_CONTRACT = {
     "mlx_vlm.models.qwen4_exp.language": {
         "Qwen4ExpGatedResidual": None,
@@ -1225,7 +1222,6 @@ _QWEN4_PREFILL_CONTRACT = {
         "_row_invariant_quantized_projection": "75dc4975ef847716",
     },
 }
-# Builders behind an lru_cache, pinned through the cached function.
 _QWEN4_PREFILL_CACHED = {"_qwen4_rms_norm": "4474fbab75e313c3", "_qwen4_hyper_pointwise": "5a6f9a76f981f7c0"}
 _QWEN4_PREFILL_LOCK = RLock()
 _QWEN4_PREFILL_VERDICTS = {}
@@ -1244,7 +1240,6 @@ def _qwen4_bindings(contract):
         cached = getattr(language, name, None)
         builder = getattr(cached, "__wrapped__", None)
         try:
-            # The lru_cache wrapper itself, not another wrapper around it.
             held = (hasattr(cached, "cache_info") and not hasattr(builder, "__wrapped__")
                     and _ast_fingerprint(builder) == expected)
         except (OSError, TypeError, SyntaxError, AttributeError):
@@ -1275,8 +1270,7 @@ def _qwen4_kernels():
         return None
     pragma = "#pragma clang fp contract(off) reassociate(off)\n"
     try:
-        # _qwen4_rms_norm on one group: MLX's simple row reduction gives thread i elements 4i..4i+3, summed
-        # from +0, then simd_sums the threads and the per-simdgroup partials.
+        # MLX's simple row reduction: thread i sums 4i..4i+3 from +0, then simd_sum of threads and partials.
         norm = mx.fast.metal_kernel(
             name = "unsloth_qwen4_hc_norm", input_names = ["x", "w", "inv_n", "eps"], output_names = ["out"],
             compile_options = _QWEN4_SAFE_MATH, source = pragma + """
@@ -1304,8 +1298,7 @@ def _qwen4_kernels():
                 out[size_t(row) * G + t * 4 + i] = T((y[i] * r) * gain);
             }
             """)
-        # mix_streams: the sigmoid gate times each stream, then the native small column reduction (each
-        # stream from +0, added in stream order) and the mean's reciprocal rounded to the input dtype.
+        # Native small column reduction: each stream from +0 in stream order, times 1/n rounded to T.
         mix = mx.fast.metal_kernel(
             name = "unsloth_qwen4_hc_mix", input_names = ["up", "normed", "sigmoid", "inv_n"],
             output_names = ["out"], compile_options = _QWEN4_SAFE_MATH, source = pragma + """
@@ -1371,8 +1364,7 @@ def _qwen4_verified(key, fused, native, what):
 
 def _qwen4_hc_eligible(language, module):
     norm, group, streams = module.hc_norm, module.hidden_size, module.hc_count
-    # MLX reduces a group of 1025 to 4096 with one pass of ceil(group / 4) threads, which the norm kernel repeats;
-    # its small column reduction gives each of up to 8 streams its own lane, which the mix kernel repeats.
+    # Kernels repeat MLX's one-pass row reduction (1024 < group <= 4096) and per-lane column sum (<= 8 streams).
     return (not module.training and type(norm).__call__ is language.Qwen4ExpRMSNorm.__call__ and 1 < streams <= 8
             and norm.group_size == group and 1024 < group <= 4096 and not group % 128
             and norm.weight.shape == (group * streams,))
@@ -1390,8 +1382,7 @@ def _qwen4_hc_read(module, x, native):
         normed = _qwen4_hc_norm(x, norm.weight, group, norm.eps)
         activate, mix_streams, injection_gate = language._qwen4_hyper_pointwise(streams, group)
         up = module.input_mix_weight_up(activate(module.input_mix_weight_down(normed)))
-        # The sigmoid table is indexed by the 16-bit gate and the kernel does not broadcast; any other projection
-        # result keeps mlx-vlm's mix.
+        # The table is indexed by the 16-bit gate and the kernel does not broadcast.
         mixed = (_qwen4_hc_mix(up, normed, streams, group) if up.dtype == normed.dtype and up.shape == normed.shape
                  else mix_streams(up, normed))
         if not combine:
@@ -1465,7 +1456,6 @@ _QWEN4_DECODE_CONTRACT = {
         "Qwen4ExpBatchInvariantForward._hyper_connection": "0b22ede797c90e60",
         "Qwen4ExpRMSNorm.__call__": "b47a270c1b0eade5",
     },
-    # A one-row projection is the layer's own call.
     "mlx_vlm.models.qwen3_5.speculative_verifier": {
         "Qwen3_5BatchInvariantForward._linear": "6e38296bd3f89d5a",
         "_target_verify_linear": "190517e318ba4d7b",
@@ -1477,7 +1467,6 @@ _QWEN4_DECODE_CONTRACT = {
 }
 _QWEN4_DECODE_LOCK = RLock()
 _QWEN4_DECODE_BINDINGS = [None]
-# Simdgroups per down-projection threadgroup: the first that divides its 4-row tiles.
 _QWEN4_DECODE_SIMDGROUPS = (16, 10, 8, 5, 4, 2, 1)
 # The `QuantizedLinear` calls zoo's own scopes install that leave a one-row call on the stock quantized matmul.
 _ONE_ROW_STOCK_CALLS = set()
@@ -1497,8 +1486,7 @@ def _qwen4_decode_kernels():
         load_tg = load.replace("load_vector(const device T* x", "load_vector_tg(const threadgroup T* x")
         if load_tg == load:
             return None
-        # The streams' norm in MLX's simple row reduction order (one simdgroup per 128 values, partials from +0),
-        # kept in threadgroup memory for qmv_fast's down projection; `activate` is read from a table.
+        # Norm in MLX's row reduction order (a simdgroup per 128 values), kept in threadgroup memory for qmv_fast.
         norm_down = mx.fast.metal_kernel(
             name = "unsloth_qwen4_decode_norm_down",
             input_names = ["x", "w", "inv_n", "eps", "wd", "sd", "bd", "activate"], output_names = ["normed", "act"],
@@ -1573,8 +1561,6 @@ def _qwen4_decode_kernels():
                 if (lane == 0) act[out_row + r] = activate[as_type<ushort>(static_cast<T>(result[r]))];
             }
             """)
-        # qmv's full-tile path for each stream's 4 consecutive up-projection rows, then mix_streams as in
-        # the prefill mix kernel.
         up_mix = mx.fast.metal_kernel(
             name = "unsloth_qwen4_decode_up_mix", input_names = ["act", "normed", "wu", "su", "bu", "sigmoid", "inv_n"],
             output_names = ["out"], header = quantized, compile_options = _QWEN4_SAFE_MATH, source = pragma + """
@@ -1666,8 +1652,7 @@ def _qwen4_decode_plan(language, module):
     """The fused one-row read of `module`, settled when the scope opens; None keeps the native read."""
     norm, down, up = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
     group, streams = module.hidden_size, module.hc_count
-    # The norm reduction repeats MLX's one-pass row reduction (1024 < group <= 4096) and the mix its small column
-    # reduction (up to 8 streams); the normalized streams stay in 32 KB of threadgroup memory.
+    # Same reduction bounds as prefill; the normalized streams must fit 32 KB of threadgroup memory.
     if (module.training or type(norm).__call__ is not language.Qwen4ExpRMSNorm.__call__
             or not _qwen4_qmv(down, True) or not _qwen4_qmv(up, False) or up.scales.dtype != down.scales.dtype
             or not 1 < streams <= 8 or not 1024 < group <= 4096 or group % 128 or streams * group > 12288
@@ -1699,7 +1684,6 @@ def _qwen4_decode_plan(language, module):
             output_shapes = [(*x.shape[:-1], group)], output_dtypes = [dtype])[0]
         if not combine:
             return mixed
-        # The stock `_linear` of one row is the layer's own call.
         return mixed, x, injection_gate(module.block_inject_weight(normed))
 
     key = ("decode hyper-connection read", streams, group, lowrank, dtype, norm.weight.dtype, down.bits,
@@ -1731,7 +1715,6 @@ def fused_qwen4_decode(model, *, _modules = None):
         with _QWEN4_DECODE_LOCK:
             language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
             target = getattr(language, "_QWEN4_BATCH_INVARIANT_FORWARD", None)
-            # Another hook already on the shared forward object is left alone.
             hook = vars(target).get("_hyper_connection") if target is not None else None
             if (target is not None and os.environ.get("UNSLOTH_MLX_QWEN4_DECODE", "1") != "0"
                     and (hook is None or getattr(hook, "func", None) is _qwen4_decode_read)
@@ -1739,9 +1722,7 @@ def fused_qwen4_decode(model, *, _modules = None):
                     and mx.default_device() == mx.gpu and _qwen4_decode_kernels() is not None):
                 if _QWEN4_DECODE_BINDINGS[0] is None or not _bindings_intact(_QWEN4_DECODE_BINDINGS[0]):
                     _QWEN4_DECODE_BINDINGS[0] = _qwen4_bindings(_QWEN4_DECODE_CONTRACT)
-                # exact_batch_invariant_decode's class over the forward leaves a one-row `_linear` the native one.
-                # Matched by code object: a `functools.wraps` decorator would copy its names.
-                # A drifted forward without these methods keeps the native read rather than raising.
+                # exact_batch_invariant_decode's sliced `_linear` matched by code object (functools.wraps copies names).
                 native_class = getattr(type(target), "_unsloth_verify_native", type(target))
                 linear = getattr(getattr(target, "_linear", None), "__func__", None)
                 sliced = next(c for c in _exact_verify_class.__wrapped__.__code__.co_consts
@@ -1765,7 +1746,6 @@ def fused_qwen4_decode(model, *, _modules = None):
                     module._unsloth_qwen4_decode_scopes = scopes + 1
                     changed.append(module)
                 if changed:
-                    # The forward is one object per process; an instance attribute shadows its method.
                     if not target.__dict__.get("_unsloth_qwen4_decode_scopes"):
                         target._hyper_connection = functools.partial(_qwen4_decode_read, target)
                     target._unsloth_qwen4_decode_scopes = target.__dict__.get("_unsloth_qwen4_decode_scopes", 0) + 1

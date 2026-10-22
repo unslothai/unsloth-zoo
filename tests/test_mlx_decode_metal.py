@@ -1290,7 +1290,6 @@ def _assert_same(actual, expected):
 @pytest.mark.parametrize("dtype, combine", [(mx.bfloat16, True), (mx.float16, False)])
 def test_qwen4_prefill_kernels_match_mlx_vlm_bitwise(dtype, combine, monkeypatch):
     hc = _qwen4_hc(combine, dtype = dtype)
-    # Prefill chunks around a decode step, the last at the row bound.
     chunks = [(mx.random.normal((2, n, 4 * 1280)) * mx.exp(2 * mx.random.normal((2, n, 1)))).astype(dtype) for n in (37, 300, 1, 16)]
     expected = [hc(x) for x in chunks]
     calls = {name: [] for name in ("_qwen4_hc_norm", "_qwen4_hc_mix")}
@@ -1384,8 +1383,7 @@ def test_qwen4_decode_read_matches_mlx_vlm_bitwise(dtype, bits, group_size, lowr
     log = []
     _logged_decode_kernels(monkeypatch, log)
     monkeypatch.setattr(decode, "_QWEN4_PREFILL_VERDICTS", {})
-    # Generation also holds the dense prefill scope, which swaps every quantized linear's class; it opens before
-    # this scope or after it, closing first.
+    # Generation also holds dense_prefill_linear, opened before or after this scope.
     outer, inner = ((decode.dense_prefill_linear, decode.fused_qwen4_decode) if combine
                     else (decode.fused_qwen4_decode, decode.dense_prefill_linear))
     with outer(module), decode.fused_qwen4_decode(module):
