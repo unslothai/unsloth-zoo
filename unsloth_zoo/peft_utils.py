@@ -711,6 +711,17 @@ def requires_grad_for_gradient_checkpointing(model):
             )
             module.register_forward_pre_hook(requires_grad_pre_hook, with_kwargs=True)
             logger.info(f"Unsloth: Registered pre-forward gradient hook on `{module_name}`.")
+            # A tower fed only token ids with no get_input_embeddings (Dia's encoder) gives the pre-hook
+            # no float input, so its checkpointed layers would get no gradients: hook its own Embedding.
+            embedding = next((c for c in module.children() if isinstance(c, torch.nn.Embedding)), None)
+            if embedding is not None:
+                register_other_hooks(
+                    "requires_grad_post_hook",
+                    "requires_grad_post_hook",
+                    embedding,
+                    "_forward_hooks",
+                )
+                embedding.register_forward_hook(requires_grad_post_hook)
         pass
     pass
 pass
