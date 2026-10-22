@@ -817,13 +817,13 @@ wide_decode_only = pytest.mark.skipif(mx.__version__ != "0.32.4", reason = "MLX 
 
 @wide_decode_only
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("rows", [1, 2])   # 16 simdgroups fit every GPU's F16 limit (576 threads before M3)
 @pytest.mark.parametrize("reverse", [False, True])
 def test_vector_attention_preserves_bits_when_feature_layouts_change(dtype, rows, reverse, monkeypatch):
     monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")
     monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
     arrays = _attention_block(8, rows, 4500, dtype)
-    # Before M3, MLX's own launch for 3 rows exceeds the threadgroup limit, so the contiguous layout is the reference.
+    # Before M3, MLX's own launch for 2 rows exceeds its threadgroup limit, so the contiguous layout is the reference.
     reference = (mx.fast.scaled_dot_product_attention(*arrays, scale = 1.0, mask = "causal")
                  if _mlx_vector_launch_fits(8 * rows) else
                  decode._vector_attention(*arrays, 1.0, decode._vector_blocks(8 * rows, 4500)))
