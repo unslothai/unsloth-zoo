@@ -211,6 +211,7 @@ def test_is_dropped_dequant_sidecar_predicate():
         "model.safetensors", "model-00001-of-00002.safetensors",
         "model.safetensors.index.json",
         "quantize_config.json", "quant_config.json",
+        "pytorch_model.bin", "model.gguf", "consolidated.pth",
     ):
         assert ml._is_dropped_dequant_sidecar(dropped) is True, dropped
     for kept in (
@@ -811,3 +812,35 @@ def test_gptq_on_mlx_vlm_routed_text_model_rejected_before_conversion(monkeypatc
     )
     with pytest.raises(NotImplementedError, match="mlx-vlm"):
         FastMLXModel.from_pretrained(repo)
+
+
+def test_gptq_with_text_only_false_rejected_before_conversion(monkeypatch, tmp_path):
+    import mlx_lm.utils as mlx_lm_utils
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    repo = _write_repo(str(tmp_path / "gptq"))
+    monkeypatch.setattr(mlx_lm_utils, "_download", lambda *a, **k: repo)
+    monkeypatch.setattr(
+        loader, "_materialize_dequantized_hf_checkpoint",
+        lambda *a, **k: pytest.fail("text_only=False routes to mlx-vlm; must not be converted"),
+    )
+    with pytest.raises(NotImplementedError, match="mlx-vlm"):
+        FastMLXModel.from_pretrained(repo, text_only=False)
+
+
+@pytest.mark.parametrize("text_only, vlm_config, prefer, vlm_only, expected", [
+    (None, False, False, False, False),
+    (None, True, False, False, True),
+    (True, True, False, False, False),
+    (True, True, True, False, True),
+    (False, False, False, False, True),
+    (None, False, False, True, True),
+    (False, False, False, True, True),
+])
+def test_routes_to_mlx_vlm_matches_legacy_routing(monkeypatch, text_only, vlm_config, prefer, vlm_only, expected):
+    import unsloth_zoo.mlx.loader as loader
+    monkeypatch.setattr(loader, "_is_vlm", lambda config: vlm_config)
+    monkeypatch.setattr(loader, "_prefer_vlm_loader_for_text", lambda config, mt: prefer)
+    monkeypatch.setattr(loader, "_mlx_vlm_only_text_model", lambda config, mt: vlm_only)
+    assert loader._routes_to_mlx_vlm({}, "llama", text_only) is expected

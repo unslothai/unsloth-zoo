@@ -3469,6 +3469,17 @@ def _mlx_vlm_only_text_model(config: dict, model_type: str) -> bool:
     return _resolve_mlx_vlm_model_class(model_type) is not None
 
 
+def _routes_to_mlx_vlm(config, model_type, text_only):
+    """Whether from_pretrained's routing below (force_vlm_text_path / text_only) picks mlx-vlm."""
+    if text_only is True and _prefer_vlm_loader_for_text(config, model_type):
+        return True
+    if text_only is not False and _mlx_vlm_only_text_model(config, model_type):
+        return True
+    if text_only is None:
+        return _is_vlm(config)
+    return text_only is False
+
+
 def _mlx_lm_refuses_config(module_name, config):
     """Whether mlx_lm's model arguments refuse ``config``, as its DeepSeek V4.1 refuses Engram layers."""
     try:
@@ -6312,8 +6323,10 @@ _DEQUANT_DROP_SIDECARS = ("quantize_config.json", "quant_config.json")
 
 
 def _is_dropped_dequant_sidecar(filename):
-    """Packed weights and GPTQ/AWQ sidecars, which would make the dense copy look packed."""
-    if filename.endswith(".safetensors") or filename.endswith(".safetensors.index.json"):
+    """Weights (packed or alternate exports) and GPTQ/AWQ sidecars, which would make the dense copy look packed."""
+    from .utils import _MODEL_WEIGHT_SUFFIXES
+
+    if filename.endswith(_MODEL_WEIGHT_SUFFIXES) or filename.endswith(".safetensors.index.json"):
         return True
     return filename in _DEQUANT_DROP_SIDECARS
 
@@ -9701,11 +9714,8 @@ class FastMLXModel:
                     f"Unsloth: could not resolve local files for "
                     f"{hf_prequant_method.upper()} model '{model_name}'."
                 )
-            # mlx-vlm-routed text models too: that branch never restores the repo or removes the scratch dir.
-            if _is_vlm(config_data) or (
-                text_only is not False
-                and _mlx_vlm_only_text_model(config_data, config_data.get("model_type", ""))
-            ):
+            # The mlx-vlm branch never restores the repo or removes the scratch dir.
+            if _routes_to_mlx_vlm(config_data, config_data.get("model_type", ""), text_only):
                 raise NotImplementedError(
                     f"Unsloth: {hf_prequant_method.upper()} runtime dequant is not "
                     "yet supported for models MLX loads through mlx-vlm (vision "
