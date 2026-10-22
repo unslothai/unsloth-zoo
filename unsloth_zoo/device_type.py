@@ -501,7 +501,8 @@ def cpu_backend_allowed():
     if _detect_amd_rocm_runtime():
         return False
     # Linux: the loaded kernel driver, not a stray nvidia-smi in a CPU container image.
-    if os.path.exists("/proc/driver/nvidia/version") or (
+    # WSL2 exposes the Windows NVIDIA driver through /usr/lib/wsl/lib instead of /proc/driver/nvidia.
+    if os.path.exists("/proc/driver/nvidia/version") or os.path.exists("/usr/lib/wsl/lib/nvidia-smi") or (
         not sys.platform.startswith("linux") and shutil.which("nvidia-smi") is not None
     ):
         return False
@@ -509,7 +510,8 @@ def cpu_backend_allowed():
 
 
 def cpu_backend_forced():
-    return os.environ.get("UNSLOTH_FORCE_CPU", "0") == "1"
+    # UNSLOTH_ALLOW_CPU (the CUDA-shaped test spoof) keeps its meaning when both are set.
+    return os.environ.get("UNSLOTH_FORCE_CPU", "0") == "1" and os.environ.get("UNSLOTH_ALLOW_CPU", "0") != "1"
 
 
 _GPU_INIT_SKIPPED = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"

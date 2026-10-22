@@ -347,6 +347,9 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
     from unsloth_zoo.llama_cpp import install_llama_cpp, convert_to_gguf, quantize_gguf
 
     methods = [quantization_method] if isinstance(quantization_method, str) else list(quantization_method)
+    # Unsloth's GGUF aliases, as on the GPU save path.
+    aliases = {"not_quantized": "bf16", "fast_quantized": "q8_0", "quantized": "q4_k_m", "none": "q8_0"}
+    methods = list(dict.fromkeys(aliases.get(str(m).lower(), str(m).lower()) for m in methods))
     os.makedirs(save_directory, exist_ok = True)
     merged_directory = os.path.join(save_directory, "merged_16bit")
     save_pretrained_merged(self, merged_directory, tokenizer, save_method = "merged_16bit")
