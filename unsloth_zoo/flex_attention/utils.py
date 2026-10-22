@@ -88,6 +88,19 @@ try:
     pass
     flex_attention = _torch_compile(_flex_attention)
 
+    # torch >= 2.9 deprecates return_lse = True for return_aux = AuxRequest(lse = True); the
+    # deprecation's warnings.warn is untraceable on torch 2.10, a graph break in every caller.
+    try:
+        from torch.nn.attention.flex_attention import AuxRequest as _AuxRequest
+        FLEX_LSE_KWARGS = {"return_aux": _AuxRequest(lse = True)}
+    except Exception:
+        FLEX_LSE_KWARGS = {"return_lse": True}
+
+    def flex_output_and_lse(output):
+        """(attention output, logsumexp) from a flex_attention call made with FLEX_LSE_KWARGS."""
+        out, aux = output
+        return out, (aux.lse if "return_aux" in FLEX_LSE_KWARGS else aux)
+
     @functools.lru_cache
     def create_block_mask_cached(mask_mod, M, N, device = "cuda"):
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
@@ -413,4 +426,6 @@ except:
     FlexAttentionCache = None
     reused_compiled_create_block_mask = None
     clear_block_mask_cache = None
+    FLEX_LSE_KWARGS = {"return_lse": True}
+    flex_output_and_lse = None
 pass
