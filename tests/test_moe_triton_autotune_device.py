@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""forward_triton_grouped_gemm hands the experts' device to the autotuner when it takes one, so a
-device_map layer on another GPU model is tuned, keyed and SMEM-fitted for its own card. An older
-autotuner without the parameter is called exactly as before."""
+"""Experts' device reaches the autotuner when it accepts one; older autotuners are called as before."""
 
 import sys
 import types

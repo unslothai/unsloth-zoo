@@ -5616,8 +5616,7 @@ def _moe_weight_dtype_kwargs(tuner, module, name, dtype):
 
 
 def _moe_tuner_device_kwargs(tuner, device):
-    """device kwarg so the autotune key, tuning run and SMEM fit follow the experts' card (a device_map
-    layer on another GPU model). Older unsloth has no such parameter and keeps the current device."""
+    """device kwarg so autotuning follows the experts' card; older unsloth lacks it."""
     try:
         if "device" not in inspect.signature(tuner).parameters:
             return {}
