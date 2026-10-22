@@ -236,3 +236,80 @@ def test_softmax_renorm_survives_underflowed_forced_experts():
     torch.testing.assert_close(got[1].double(), ref / ref.sum(), rtol = 1e-6, atol = 1e-7)
     got.sum().backward()
     assert torch.isfinite(logits.grad).all()
+
+
+class _TinyTopKRouter(torch.nn.Module):
+    norm_topk_prob = True
+
+    def forward(self, x):
+        logits = x.reshape(-1, 4)
+        w, idx = logits.softmax(-1).topk(2, -1)
+        return logits, w / w.sum(-1, keepdim = True), idx
+
+
+class _TinyBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.router = _TinyTopKRouter()
+
+    def forward(self, x):
+        _, w, idx = self.router(x)
+        return x * (w * (idx.to(w.dtype) + 1)).sum(-1).reshape(x.shape[:-1] + (1,))
+
+
+class _TinyDecoder(torch.nn.Module):
+    def __init__(self, checkpointing):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(300, 4)
+        self.layers = torch.nn.ModuleList([_TinyBlock()])
+        self.gradient_checkpointing = checkpointing
+
+    def forward(self, input_ids = None):
+        x = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant = True) if self.gradient_checkpointing else layer(x)
+        return x
+
+
+class _TinyModel(torch.nn.Module):
+    def __init__(self, checkpointing):
+        super().__init__()
+        self.model = _TinyDecoder(checkpointing)
+
+    def forward(self, input_ids = None):
+        return self.model(input_ids = input_ids)
+
+
+def _many_forwards_grad(n, checkpointing):
+    torch.manual_seed(17)
+    m = _TinyModel(checkpointing)
+    m.train()
+    rr.reset_routing_replay()
+    rr.install_routing_replay(m)
+    requests = []
+    for i in range(n):
+        ids = [2 * i + 1, 2 * i + 2]
+        natural = m.model.embed_tokens(torch.tensor(ids)).topk(2, -1).indices
+        forced = (natural + (i % 3) + 1) % 4
+        out = SimpleNamespace(token_ids = ids[1:], routed_experts = forced[:1, None, :])
+        requests.append(SimpleNamespace(prompt_token_ids = ids[:1], outputs = [out]))
+    rr.record_routed_experts(requests)
+    losses = [m(input_ids = torch.tensor([[2 * i + 1, 2 * i + 2]])).square().mean() for i in range(n)]
+    sum(losses).backward()
+    stats = rr.routing_replay_stats()
+    assert stats["router_calls_replayed"] >= n and stats["router_calls_recomputed"] == (n if checkpointing else 0)
+    return m.model.embed_tokens.weight.grad
+
+
+def test_more_than_64_checkpointed_forwards_before_backward_keep_their_replays(replay):
+    # A chunked GRPO loss runs one checkpointed forward per chunk before its single backward; every
+    # recompute must find its own forward's replay, or its gradients follow natural routing instead.
+    plain = _many_forwards_grad(65, checkpointing = False)
+    checkpointed = _many_forwards_grad(65, checkpointing = True)
+    torch.testing.assert_close(checkpointed, plain, rtol = 0, atol = 0)
+
+
+def test_evicting_a_pending_forward_warns(replay, monkeypatch):
+    monkeypatch.setattr(rr, "_MAX_PENDING", 4)
+    with pytest.warns(UserWarning, match = "checkpointed forwards without a backward"):
+        _many_forwards_grad(5, checkpointing = True)
