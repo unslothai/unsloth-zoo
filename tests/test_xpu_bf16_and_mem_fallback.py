@@ -310,7 +310,8 @@ def _fake_vllm_platforms(monkeypatch, refuses = False, has_check = True, missing
 
     if has_check:
         def check_if_supports_dtype(dtype):
-            if refuses and dtype is torch.bfloat16:
+            # By name: on macOS the module under test may hold a different torch object.
+            if refuses and str(dtype).endswith("bfloat16"):
                 raise ValueError("Intel Arc A770 have bfloat16 accuracy known issue.")
         _Platform.check_if_supports_dtype = staticmethod(check_if_supports_dtype)
     mod = types.ModuleType("vllm.platforms")
