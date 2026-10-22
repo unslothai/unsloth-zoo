@@ -143,7 +143,9 @@ modifications =
       8 warps / 2 or 3 stages; 2 / 4 warps and triton 3.6.0 / 3.8.0 clean). Triton
       3.8+ and other GPUs keep the full NUM_WARPS list. The chunk_fwd_kernel_o
       8-warp drop above stays unconditional (not narrowed to Triton < 3.8 as
-      upstream does) until the #1229 repro is re-run on Triton 3.8.
+      upstream does) until the #1229 repro is re-run on Triton 3.8. ops/utils/cache.py
+      ignores an FLA_CACHE_MODE disk config whose num_warps the kernel's config
+      list no longer offers, so a cached 8-warp entry cannot bring the race back.
     - Sequence start offsets past 2**31 elements (fixed upstream after 0.5.1 by
       fla PR #1329, which forces int64 program ids everywhere). In
       ops/gated_delta_rule/chunk_fwd.py, ops/kda/{chunk_bwd,chunk_intra,
