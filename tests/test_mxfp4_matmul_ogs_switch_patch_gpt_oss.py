@@ -48,7 +48,7 @@ _HUB_PROBE = (
 
 
 def _dequantizes_with_hub_kernels(switch):
-    env = dict(os.environ, UNSLOTH_IS_PRESENT = "1", UNSLOTH_MXFP4_MATMUL_OGS = switch)
+    env = dict(os.environ, UNSLOTH_IS_PRESENT = "1", UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", UNSLOTH_MXFP4_MATMUL_OGS = switch)
     out = subprocess.run([sys.executable, "-c", _HUB_PROBE], env = env, capture_output = True, text = True, timeout = 600)
     assert out.returncode == 0, out.stderr[-2000:]
     return out.stdout.strip().splitlines()[-1]
