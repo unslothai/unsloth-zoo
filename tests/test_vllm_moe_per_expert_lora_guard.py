@@ -286,10 +286,12 @@ def fake_vllm(monkeypatch):
     return install
 
 
-def _trainer(monkeypatch, vllm_model, manager):
+def _trainer(monkeypatch, vllm_model, manager, lora_config = None):
     runner = types.SimpleNamespace(model = vllm_model)
     if manager is not None:
         runner.lora_manager = types.SimpleNamespace(_adapter_manager = manager)
+    elif lora_config is not None:  # WorkerLoRAManager without a built LoRAModelManager
+        runner.lora_manager = types.SimpleNamespace(lora_config = lora_config)
     monkeypatch.setattr(vu, "_get_vllm_model_runner", lambda model: runner)
     return _model()
 
@@ -318,3 +320,70 @@ def test_per_expert_keys_resolve_through_the_real_name_check(monkeypatch, fake_v
     ]
     with pytest.raises(RuntimeError, match = "does not have"):
         vu._check_lora_is_servable(model, keys + bad, "the training model", {"r": 16})
+
+
+# --- no reachable manager on a 3D model in mixed mode ------------------------------------
+# LoRAModelManager passes force_2d_moe = enable_mixed_moe_lora_format, so a 3D model in mixed
+# mode also gets the per-expert expansion. The fallback must pass the same flag, or the
+# refusal check allows the adapter and the name check then rejects every expert key.
+@pytest.mark.parametrize("arch", sorted(ARCHS))
+def test_mixed_mode_3d_model_without_manager_expands_per_expert_names(monkeypatch, fake_vllm, arch):
+    vllm_model, _, _ = _build_engine(arch, "main")
+    type(vllm_model).is_3d_moe_weight = True
+    fake_vllm(_process_packed_modules_mapping_main)
+    lora_config = types.SimpleNamespace(enable_mixed_moe_lora_format = True, enable_moe_shared_loras = False)
+    model = _trainer(monkeypatch, vllm_model, None, lora_config)
+    keys = _per_expert_keys(arch)
+
+    assert vu._moe_expert_lora_refusal_reason(model, {"r": 16}, per_expert = True) is None
+    assert vu._unmatched_lora_keys(model, keys) == []
+    vu._check_lora_is_servable(model, keys, "the training model", {"r": 16})
+
+    # without mixed mode the same 3D model still refuses per-expert keys
+    lora_config.enable_mixed_moe_lora_format = False
+    with pytest.raises(NotImplementedError, match = "per-expert"):
+        vu._check_lora_is_servable(model, keys, "the training model", {"r": 16})
+
+
+def test_v0112_builder_without_flag_parameters_is_called_with_the_model_only(monkeypatch, fake_vllm):
+    vllm_model, _, process = _build_engine("qwen3_moe", "v0.11.2")
+    fake_vllm(process)
+    lora_config = types.SimpleNamespace(enable_mixed_moe_lora_format = True, enable_moe_shared_loras = True)
+    model = _trainer(monkeypatch, vllm_model, None, lora_config)
+    assert vu._unmatched_lora_keys(model, _per_expert_keys("qwen3_moe")) == []
+
+
+# --- path loading: per-expert keys are not lone stacked halves ---------------------------
+def test_per_expert_keys_are_not_lone_stacked_expert_halves():
+    keys = [k for k in _per_expert_keys("qwen3_moe") if "experts" in k]
+    assert vu._moe_lone_expert_lora_prefixes(keys) == []
+    # a real lone stacked half is still found
+    lone = ["base_model.model.model.layers.0.mlp.experts.lora_A.weight",
+            "base_model.model.model.layers.0.mlp.experts.lora_B.weight"]
+    assert vu._moe_lone_expert_lora_prefixes(keys + lone) == ["base_model.model.model.layers.0.mlp.experts"]
+
+
+def test_saved_per_expert_adapter_is_loaded_by_path(monkeypatch, tmp_path):
+    keys = _per_expert_keys("mixtral")
+    monkeypatch.setattr(vu, "_check_lora_rank_fits", lambda model, save_directory: None)
+    monkeypatch.setattr(vu, "_saved_adapter_lora_keys", lambda save_directory: list(keys))
+    monkeypatch.setattr(vu, "get_peft_config", lambda save_directory: {"r": 16})
+    monkeypatch.setattr(vu, "_remap_moe_expert_lora_keys", lambda model, state_dict: state_dict)
+    monkeypatch.setattr(vu, "_check_lora_is_servable", lambda *a, **k: None)
+    monkeypatch.setattr(vu, "LORA_REQUEST_ID", 1, raising = False)
+
+    def materialised(save_directory):
+        raise AssertionError("the whole checkpoint was loaded in the trainer process")
+    monkeypatch.setattr(vu, "_saved_adapter_lora_tensors", materialised)
+
+    class _LoRARequest:
+        def __init__(self, name, int_id, path = None, lora_tensors = None, lora_config = None):
+            self.path, self.lora_tensors = path, lora_tensors
+    for name in ("vllm", "vllm.lora", "vllm.lora.request"):
+        module = types.ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    sys.modules["vllm.lora.request"].LoRARequest = _LoRARequest
+
+    request = vu._build_lora_request(_model(), str(tmp_path), False, 1)
+    assert request.path == str(tmp_path) and request.lora_tensors is None

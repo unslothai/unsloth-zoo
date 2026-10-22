@@ -5489,17 +5489,25 @@ def _vllm_mixed_moe_lora_enabled(model, runner = None, vllm_model = None):
     resolved = getattr(_get_vllm_lora_manager(model, runner), "_enable_mixed_moe_lora_format", None)
     if isinstance(resolved, bool): return resolved
     if vllm_model is None: vllm_model = _get_vllm_lora_model(model, runner)
+    lora_config = _vllm_worker_lora_config(runner, vllm_model)
+    if lora_config is None: return None
+    return getattr(lora_config, "enable_mixed_moe_lora_format", False) is True
+pass
+
+
+def _vllm_worker_lora_config(runner, vllm_model):
+    """The engine's LoRAConfig: WorkerLoRAManager's copy first, the model's vllm_config second."""
+    # All Unsloth Zoo code licensed under LGPLv3
     for lora_config in (
         getattr(getattr(runner, "lora_manager", None), "lora_config", None),
         getattr(getattr(vllm_model, "vllm_config", None), "lora_config", None),
     ):
-        if lora_config is None: continue
-        return getattr(lora_config, "enable_mixed_moe_lora_format", False) is True
+        if lora_config is not None: return lora_config
     return None
 pass
 
 
-def _vllm_lora_target_names(vllm_model, manager = None):
+def _vllm_lora_target_names(vllm_model, manager = None, lora_config = None):
     """(full module names, bare embedding names) vLLM can bind a LoRA to, or None.
 
     vLLM's own `check_unexpected_modules` compares the LAST path component only
@@ -5529,9 +5537,20 @@ def _vllm_lora_target_names(vllm_model, manager = None):
     if not isinstance(packed, dict):
         # Same builder the manager uses: on a 2D MoE it adds `experts -> experts.<i>.<proj>`,
         # which get_packed_modules_mapping lacks, so per-expert keys would look unmatched.
+        # LoRAModelManager.__init__ passes the mixed / shared MoE flags from lora_config
+        # (a 3D model in mixed mode expands too); v0.11.2's builder takes only the model.
         try:
             from vllm.lora.utils import process_packed_modules_mapping
-            packed = process_packed_modules_mapping(vllm_model)
+            kwargs = {}
+            if lora_config is not None:
+                accepted = inspect.signature(process_packed_modules_mapping).parameters
+                for kwarg, field in (
+                    ("force_2d_moe", "enable_mixed_moe_lora_format"),
+                    ("enable_moe_shared_loras", "enable_moe_shared_loras"),
+                ):
+                    if kwarg in accepted:
+                        kwargs[kwarg] = getattr(lora_config, field, False) is True
+            packed = process_packed_modules_mapping(vllm_model, **kwargs)
         except Exception:
             packed = None
     if not isinstance(packed, dict):
@@ -5602,7 +5621,9 @@ def _unmatched_lora_keys(model, keys):
     # All Unsloth Zoo code licensed under LGPLv3
     runner = _get_vllm_model_runner(model)
     vllm_model = _get_vllm_lora_model(model, runner)
-    targets = _vllm_lora_target_names(vllm_model, _get_vllm_lora_manager(model, runner))
+    targets = _vllm_lora_target_names(
+        vllm_model, _get_vllm_lora_manager(model, runner), _vllm_worker_lora_config(runner, vllm_model),
+    )
     if targets is None: return None
     module_names, embedding_names = targets
 
@@ -5703,7 +5724,9 @@ def _remap_moe_expert_lora_keys(model, state_dict):
     if not any(_is_moe_expert_lora_key(k) for k in state_dict): return state_dict
     runner = _get_vllm_model_runner(model)
     vllm_model = _get_vllm_lora_model(model, runner)
-    targets = _vllm_lora_target_names(vllm_model, _get_vllm_lora_manager(model, runner))
+    targets = _vllm_lora_target_names(
+        vllm_model, _get_vllm_lora_manager(model, runner), _vllm_worker_lora_config(runner, vllm_model),
+    )
     if targets is None: return state_dict
     module_names = targets[0]
     weights_mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
@@ -5735,7 +5758,8 @@ def _moe_lone_expert_lora_prefixes(keys):
     outer, base = set(), set()
     for key in keys:
         if "experts" not in key and "moe" not in key: continue
-        if not _is_moe_expert_lora_key(key): continue
+        # Per-expert 2D keys (`experts.<i>.<proj>`) are separate modules, not a stacked half.
+        if not _is_moe_expert_lora_key(key) or _is_moe_per_expert_lora_key(key): continue
         match = _MOE_STACKED_LORA_KEY.match(key)
         if match is None: continue
         prefix = match.group(1)
