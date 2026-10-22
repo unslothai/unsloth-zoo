@@ -2914,6 +2914,8 @@ def forward_mxfp4_gpt_oss_with_lora(
             f"LoRA={gate_up_lora is not None or down_lora is not None}, experts={self.num_experts}."
         )
 
+    # The native kernels and mxfp4_ogs_experts_forward return bf16; an fp16 residual (T4) would be promoted.
+    input_dtype = hidden_states.dtype
     hidden_states, routing_data, gather_idx, scatter_idx, leading_shape = _mxfp4_experts_routing(
         self, hidden_states, routing_data, gather_idx, scatter_idx, router_indices, routing_weights,
     )
@@ -2931,7 +2933,7 @@ def forward_mxfp4_gpt_oss_with_lora(
             )
     if leading_shape is not None:
         out = out.reshape(*leading_shape, out.shape[-1])
-    return out
+    return out.to(input_dtype)
 
 
 def patch_mxfp4_gpt_oss_for_lora():
