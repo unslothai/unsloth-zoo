@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""grouped_mm and ROCm crash probes answer per GPU model, probing only the cards experts actually run on."""
+"""grouped_mm and ROCm crash probes answer per GPU model: one probe on a homogeneous host, one per visible model on a mixed one."""
 import subprocess
 import sys
 import types
@@ -81,6 +81,8 @@ def spoof(monkeypatch):
         monkeypatch.setattr(torch, "ones", ones)
         monkeypatch.setattr(torch, "tensor", tensor)
         monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
+        # The real view probe allocates on the (spoofed) card: answer from `failing` instead.
+        monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: d is not None and d.index not in failing)
         return probed
     return make
 
@@ -91,19 +93,20 @@ def cuda(i): return torch.device("cuda", i)
 @pytest.mark.parametrize("count, failing, expected", [
     (1, (), True), (1, (0,), False), (2, (), True), (2, (1,), True), (3, (2,), True), (3, (0,), False),
 ])
-def test_default_probe_touches_only_the_current_card(spoof, count, failing, expected):
+def test_default_probe_answers_for_the_current_card(spoof, count, failing, expected):
+    # Distinct models: the home probe also warms each other visible model once, never changing the home answer.
     seen = spoof(count, failing)
     assert moe_utils._probe_torch_grouped_mm_supported() is expected
     assert moe_utils._check_torch_grouped_mm_supported() is expected
     assert moe_utils._check_torch_grouped_mm_supported(cuda(0)) is expected
-    assert seen == [0]
+    assert seen == list(range(count))
     assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is expected
 
 
 def test_mixed_host_each_card_answers_for_itself(spoof):
     seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
     assert moe_utils._check_torch_grouped_mm_supported(cuda(0)) is True   # unused 4090 never disables the H100
-    assert seen == [0]
+    assert seen == [0, 1]   # the 4090 warmed with the home probe
     assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is False  # experts spilled onto the 4090
     assert moe_utils._check_torch_grouped_mm_supported(cuda(0)) is True
     assert moe_utils._check_torch_grouped_mm_supported() is True
@@ -173,7 +176,7 @@ def test_unreadable_properties_probe_the_card_when_used(spoof, monkeypatch):
         return types.SimpleNamespace(name = "MI300X", major = 9, minor = 4)
     monkeypatch.setattr(torch.cuda, "get_device_properties", props)
     assert moe_utils._check_torch_grouped_mm_supported() is True
-    assert seen == [0]
+    assert seen == [0, 1]   # unclassifiable, so warmed as a model of its own
     assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is False
     assert seen == [0, 1]
 
@@ -191,7 +194,7 @@ def test_cpu_or_indexless_device_uses_the_default_answer(spoof):
     seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
     assert moe_utils._check_torch_grouped_mm_supported(torch.device("cpu")) is True
     assert moe_utils._check_torch_grouped_mm_supported(torch.device("cuda")) is True
-    assert seen == [0]
+    assert seen == [0, 1]   # the home probe warms the RTX4090; its failure never leaks into the default answer
 
 
 def test_grouped_mm_eager_asks_for_the_input_device(spoof, monkeypatch):
@@ -230,15 +233,14 @@ def test_rocm_homogeneous_host_one_child(spoof, monkeypatch):
     assert len(children) == 1
 
 
-def test_rocm_crash_probe_one_child_per_used_model(spoof, monkeypatch):
+def test_rocm_crash_probe_one_child_per_model(spoof, monkeypatch):
     spoof(3, hip = "7.1.0")
     children = _record_children(monkeypatch)
     assert moe_utils._probe_torch_grouped_mm_supported() is True
-    assert children == [("0", ("0", "0"))]
+    assert children == [("0", ("0", "0")), ("0", ("1", "1")), ("0", ("2", "2"))]
     assert moe_utils._check_torch_grouped_mm_supported(cuda(2)) is True
-    assert children == [("0", ("0", "0")), ("0", ("2", "2"))]
     assert moe_utils._grouped_mm_survives_out_of_process(cuda(2)) is True
-    assert len(children) == 2
+    assert len(children) == 3
 
 
 def test_rocm_crash_on_unused_card_keeps_grouped_mm(spoof, monkeypatch):
@@ -412,65 +414,103 @@ def test_a_mixed_host_keeps_per_card_answers(spoof):
     assert seen == [0, 1]
 
 
-def test_tracing_an_unprobed_card_never_runs_a_probe(spoof, monkeypatch):
-    # A block moved to an unwarmed card after enable: the trace must not reach the compiler-disabled probe.
-    spoof(2, models = ["H100", "RTX4090"])
-    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
-    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+def _no_probe_while_tracing(monkeypatch):
     def no_probe(_probe): raise AssertionError("probe ran while tracing")
     monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_probe)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    assert moe_utils._transposed_view_safe_on(cuda(1)) is True    # the home verdict, as before #1928
-    assert moe_utils._grouped_mm_supported_on(cuda(1)) is True    # unprobed model: the home answer, as before #1928
-    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
-    assert moe_utils._transposed_view_safe_on(cuda(1)) is False   # nothing probed at all: the contiguous copy
 
 
-@pytest.mark.parametrize("sm90_only,expected", [(True, [False, True, False]), (False, [True, True, True])])
-def test_tracing_an_unprobed_card_follows_torchs_own_grouped_mm_rule(spoof, monkeypatch, sm90_only, expected):
-    # torch 2.8 refuses grouped_mm off sm90, so a trace on an unprobed A100 or B200 beside an H100 home
-    # takes the manual loop there; 2.9+ falls back internally, so every card keeps the home answer.
-    spoof(4, models = ["H100", "A100", "H200", "B200"], caps = [(9, 0), (8, 0), (9, 0), (10, 0)])
+@pytest.mark.parametrize("hip, crash_masks, failing", [("7.1.0", ("1",), ()), (None, (), (1,))])
+def test_eager_warmup_lets_a_trace_on_the_other_model_read_its_own_answer(spoof, monkeypatch, hip, crash_masks, failing):
+    # Mixed host: the second model cannot run grouped_mm (ROCm: the kernel crashes the process, unsloth#12391).
+    seen = spoof(2, failing = failing, hip = hip, models = ["gfx942", "gfx1100"])
+    children = _record_children(monkeypatch, crash_masks = crash_masks)
+    views = []
+    monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: views.append(d.index) or True)
+    # Even where torch would fall back internally, a warmed card answers for itself.
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", True, raising = False)
+    # What the eager warm-up (`_warm_moe_backend`, or the first eager MoE call) runs.
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    assert moe_utils._transposed_view_grouped_mm_is_safe() is True
+    if hip:
+        assert [c[1] for c in children] == [("0", "0"), ("1", "1")]   # each model's crash probe, once
+        assert seen == [0]                                             # the crashing kernel never ran in-process
+    else:
+        assert seen == [0, 1]
+    assert views == [0]   # unsupported card: its view verdict is the copy, no probe
+    _no_probe_while_tracing(monkeypatch)
+    assert moe_utils._grouped_mm_supported_on(cuda(1)) is False
+    assert moe_utils._transposed_view_safe_on(cuda(1)) is False
+    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+    assert moe_utils._transposed_view_safe_on(cuda(0)) is True
+
+
+def _never_warmed(spoof, monkeypatch, **kwargs):
+    # Home probed and every card classified, no other model probed: experts moved after the warm-up.
+    seen = spoof(**kwargs)
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", True)
+    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
+    moe_utils._grouped_mm_home()
+    return seen
+
+
+@pytest.mark.parametrize("falls_back, sm90_only, hip, expected", [
+    (True, False, None, [True, True, True]),           # CUDA torch 2.9+: torch's fallback serves any arch
+    (False, True, None, [False, True, False]),         # CUDA torch 2.8: sm90 only
+    (False, False, "7.1.0", [False, False, False]),    # ROCm: no such promise, the manual loop
+])
+def test_tracing_a_never_warmed_card_takes_the_conservative_answers(spoof, monkeypatch, falls_back, sm90_only, hip, expected):
+    seen = _never_warmed(spoof, monkeypatch, count = 4, hip = hip, models = ["H100", "A100", "H200", "B200"],
+                         caps = [(9, 0), (8, 0), (9, 0), (10, 0)])
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", falls_back, raising = False)
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SM90_ONLY", sm90_only)
-    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
-    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
-    def no_probe(_probe): raise AssertionError("probe ran while tracing")
-    monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_probe)
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    _no_probe_while_tracing(monkeypatch)
     assert [moe_utils._grouped_mm_supported_on(cuda(i)) for i in (1, 2, 3)] == expected
+    assert [moe_utils._transposed_view_safe_on(cuda(i)) for i in (1, 2, 3)] == [False] * 3   # the copy
+    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+    assert moe_utils._transposed_view_safe_on(cuda(0)) is True
+    assert seen == []
 
 
 def test_tracing_a_card_of_another_accelerator_type_never_resolves_it(spoof, monkeypatch):
-    # Mixed CUDA/XPU: the eager anchor classifies only the home type, so an XPU card first seen in a
-    # trace must not reach the compiler-disabled resolver; it takes the home answers.
-    spoof(2, models = ["H100", "RTX4090"])
-    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
-    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
-    def no_probe(_probe): raise AssertionError("resolver ran while tracing")
-    monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_probe)
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    # Mixed CUDA/XPU host whose XPU card no eager probe reached: the trace must not reach the
+    # compiler-disabled resolver, and an XPU has no torch-side fallback, so the manual loop and the copy.
+    _never_warmed(spoof, monkeypatch, count = 2, models = ["H100", "RTX4090"])
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", True, raising = False)
+    _no_probe_while_tracing(monkeypatch)
     xpu = types.SimpleNamespace(type = "xpu", index = 0)
-    assert moe_utils._grouped_mm_supported_on(xpu) is True
-    assert moe_utils._transposed_view_safe_on(xpu) is True
+    assert moe_utils._grouped_mm_supported_on(xpu) is False
+    assert moe_utils._transposed_view_safe_on(xpu) is False
     assert ("xpu", 0) not in moe_utils._GROUPED_MM_FOREIGN
 
 
-def test_a_fullgraph_compile_on_an_unprobed_card_traces(spoof, monkeypatch):
-    spoof(2, models = ["H100", "RTX4090"])
-    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
-    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+@pytest.mark.parametrize("warmed, index, expected", [
+    (True, 0, 11.0),    # home card on a mixed host: its own verdicts
+    (True, 1, 0.0),     # warmed RTX4090: its own "no" (support and view)
+    (False, 1, 10.0),   # never warmed, CUDA 2.9+: torch's fallback, the contiguous copy
+])
+def test_a_fullgraph_compile_on_a_mixed_host_traces(spoof, monkeypatch, warmed, index, expected):
+    if warmed:
+        spoof(2, failing = (1,), models = ["H100", "RTX4090"])
+        assert moe_utils._check_torch_grouped_mm_supported() is True
+        assert moe_utils._transposed_view_grouped_mm_is_safe() is True
+    else:
+        _never_warmed(spoof, monkeypatch, count = 2, failing = (1,), models = ["H100", "RTX4090"])
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", True, raising = False)
     # Not a real torch.device: tracing one would initialise CUDA on a runner without a GPU.
-    other = types.SimpleNamespace(type = "cuda", index = 1)
+    card = types.SimpleNamespace(type = "cuda", index = index)
 
     def gate(x):
-        view = moe_utils._transposed_view_safe_on(other)
-        supported = moe_utils._grouped_mm_supported_on(other)
+        view = moe_utils._transposed_view_safe_on(card)
+        supported = moe_utils._grouped_mm_supported_on(card)
         return x + (1 if view else 0) + (10 if supported else 0)
 
+    def no_probe(_probe): raise AssertionError("probe ran while tracing")
+    monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_probe)
     # The cards are spoofed: keep Dynamo from saving a CUDA RNG state no runner without a GPU has.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     out = torch.compile(gate, fullgraph = True, backend = "eager")(torch.zeros(2))
-    assert out.tolist() == [11.0, 11.0]   # traced without a probe: the home card's verdicts
+    assert out.tolist() == [expected] * 2
 
 
 def test_the_modulelist_forward_declines_a_card_without_grouped_mm(monkeypatch):
