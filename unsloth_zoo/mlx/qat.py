@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MLX LoRA QAT: train through the exact weights ``save_method="merged_4bit"`` ships.
-
-``LoRALinear.fuse(dequantize=False)`` saves ``quantize(dequantize(W) + BA)``, so the QAT
-forward runs that requantized merge through ``quantized_matmul`` (bit-exact to the saved
-``QuantizedLinear``) with a straight-through gradient. Unlike the CUDA/torchao path, the
-target is W + BA, not W. Only LoRA over affine ``QuantizedLinear`` text layers is supported.
-"""
+"""MLX LoRA QAT: the forward is ``quantize(dequantize(W) + BA)``, what ``merged_4bit`` saves
+(unlike torchao, which fake-quantizes W only), with a straight-through gradient."""
 
 _SCHEME_BITS = {"auto": None, "int4": 4, "int8": 8}
 _QAT_FLAG = "_unsloth_mlx_qat_active"
@@ -48,7 +43,6 @@ def _requested_bits(qat_scheme):
 
 
 def validate_mlx_qat_request(model, qat_scheme, *, lora_dropout=0, use_dora=False):
-    """Checks that need no LoRA targets; run before get_peft_model mutates anything."""
     _requested_bits(qat_scheme)
     from .utils import _is_vlm_model
     refusal = (
@@ -63,7 +57,6 @@ def validate_mlx_qat_request(model, qat_scheme, *, lora_dropout=0, use_dora=Fals
 
 
 def validate_mlx_qat_targets(named_modules, qat_scheme):
-    """The exact modules LoRA will wrap: all affine QuantizedLinear on one grid."""
     import mlx.nn as nn
 
     named_modules = list(named_modules)
@@ -112,7 +105,6 @@ def _ste_quantized_matmul(group_size, bits, mode):
 
 
 def _qat_call(self, x):
-    """LoRALinear.fuse(dequantize=False) applied on the fly, straight-through gradient."""
     import mlx.core as mx
 
     base = self.linear
@@ -125,7 +117,6 @@ def _qat_call(self, x):
 
 
 def apply_mlx_qat(model):
-    """Switch every LoRALinear over a QuantizedLinear to the QAT forward; returns the count."""
     import mlx.nn as nn
     from mlx_lm.tuner.lora import LoRALinear
 
