@@ -92,3 +92,43 @@ def test_converter_generic_loop_is_exact_at_extreme_scales(dtype, block_bytes):
         want = (want * 2.0 ** (scale - 127)).reshape(2, 3, 4 * block_bytes * 2).to(dtype)
         assert got.shape == want.shape and got.dtype == dtype
         assert torch.equal(got, want), (byte, scale, got.flatten()[:4], want.flatten()[:4])
+
+
+def _patched_converter(monkeypatch):
+    M = pytest.importorskip("transformers.integrations.mxfp4")
+    from unsloth_zoo.temporary_patches.mxfp4 import patch_convert_moe_packed_tensors
+    monkeypatch.setattr(mxd, "_LDEXP_EXACT", False)
+    patch_convert_moe_packed_tensors()
+    convert = getattr(M, "convert_moe_packed_tensors", None)
+    if convert is None:
+        pytest.skip("no convert_moe_packed_tensors on this transformers")
+    return convert
+
+
+def test_converter_old_torch_path_honors_rows_per_chunk(monkeypatch):
+    # The caller sizes rows_per_chunk from free memory; the fp32 detour must not use a bigger chunk.
+    convert = _patched_converter(monkeypatch)
+    sizes = []
+    real_empty = torch.empty
+
+    def spy(*shape, **kw):
+        out = real_empty(*shape, **kw)
+        if kw.get("dtype") == torch.float32 and out.dim() == 3:
+            sizes.append(out.shape[0])
+        return out
+
+    blocks = torch.randint(0, 256, (2, 16, 4, 8), dtype = torch.uint8)
+    scales = torch.randint(120, 135, (2, 16, 4), dtype = torch.uint8)
+    want = convert(blocks, scales, dtype = torch.float32).cpu()
+    monkeypatch.setattr(torch, "empty", spy)
+    got = convert(blocks, scales, dtype = torch.float32, rows_per_chunk = 8).cpu()
+    monkeypatch.setattr(torch, "empty", real_empty)
+    assert sizes and max(sizes) <= 8 // 4, sizes
+    assert torch.equal(got, want)
+
+
+def test_converter_old_torch_path_rejects_mismatched_scales(monkeypatch):
+    convert = _patched_converter(monkeypatch)
+    blocks = torch.zeros(2, 3, 4, 16, dtype = torch.uint8)
+    with pytest.raises(AssertionError):
+        convert(blocks, torch.zeros(2, 4, 3, dtype = torch.uint8), dtype = torch.float32)
