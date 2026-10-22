@@ -667,3 +667,68 @@ def test_mamba_drop_ins_launch_with_the_fp32_parameter(monkeypatch):
     gcc.mamba_causal_conv1d_fwd_function(x, w, b, None, None, None, True)
     gcc.mamba_causal_conv1d_bwd_function(x, w, b, torch.randn_like(x), None, None, None, None, False, True)
     assert seen == [(torch.float32, torch.float32)] * 2
+
+
+@requires_cuda
+def test_cuda_graph_capture_after_one_warmup(monkeypatch):
+    # The cached launcher's one-time self-check reads a verdict back on the host; inside a CUDA
+    # graph capture that sync invalidates the capture. One eager warm-up builds the plans, so the
+    # captured step is the first cached launch: it must take the full launch and stay capturable.
+    if not gcc._triton_launcher_verified():
+        pytest.skip("cached launcher needs Triton 3.6+")
+    monkeypatch.setattr(gcc, "_conv_plans", {})
+    monkeypatch.setattr(gcc, "_conv_fast_ok", {})
+    x0, w0, b0, dy = _inputs(1, 64, 64, 4, torch.float32, True, False)
+    x, w, b = (t.detach().clone().requires_grad_(True) for t in (x0, w0, b0))
+
+    def step():
+        y = gcc.triton_causal_conv1d(x, w, b, "silu")
+        y.backward(dy)
+        return y
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        eager = step().detach().clone()
+        eager_grads = [t.grad.clone() for t in (x, w, b)]
+        for t in (x, w, b):
+            t.grad = None
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    assert len(gcc._conv_plans) == 3 and gcc._conv_fast_ok == {}
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = step()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(y, eager)
+    for t, ref in zip((x, w, b), eager_grads):
+        assert torch.equal(t.grad, ref)
+    # No verdict was recorded while capturing: the next eager call still runs the self-check.
+    assert gcc._conv_fast_ok == {}
+    for t in (x, w, b):
+        t.grad = None
+    assert torch.equal(step(), eager)
+    assert gcc._conv_fast_ok == {"fwd": True, "bwd_g": True, "bwd_dxdw": True}
+
+
+@requires_cuda
+def test_wrong_cached_launch_still_caught_after_a_capture(monkeypatch):
+    # Skipping the self-check during capture must not skip it for good: a cached launcher that
+    # writes wrong values is still caught on the first eager cached launch, and the output kept.
+    if not gcc._triton_launcher_verified():
+        pytest.skip("cached launcher needs Triton 3.6+")
+    monkeypatch.setattr(gcc, "_conv_plans", {})
+    monkeypatch.setattr(gcc, "_conv_fast_ok", {})
+    x, w, b, _ = _inputs(1, 64, 64, 4, torch.float32, True, False)
+    ref = gcc._launch_fwd(x.transpose(1, 2), w, b, "silu")  # builds the plan
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = gcc._launch_fwd(x.transpose(1, 2), w, b, "silu")
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, ref) and gcc._conv_fast_ok == {}
+    monkeypatch.setattr(gcc, "_conv_fast_launch", lambda plan, ptrs, ints, consts: ptrs[3].add_(1))
+    assert torch.equal(gcc._launch_fwd(x.transpose(1, 2), w, b, "silu"), ref)
+    assert gcc._conv_fast_ok == {"fwd": False}

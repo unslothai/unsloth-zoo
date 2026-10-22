@@ -379,6 +379,10 @@ def _conv_launch(name, kernel, grid, ptrs, ints, consts, num_warps, outs):
         return
     if name not in _conv_fast_ok:
         _conv_full_launch(kernel, grid, ptrs, ints, consts, num_warps)
+        if torch.cuda.is_current_stream_capturing():
+            # The self-check reads its verdict back on the host, which invalidates a CUDA graph
+            # capture: keep the full launch and leave the check to the next eager call.
+            return
         refs = [t.clone() for t in outs]
         try:
             _conv_fast_launch(plan, ptrs, ints, consts)
@@ -604,6 +608,9 @@ def _check_fast_launch(plan, x, conv_state, weight, bias, activation):
         # A wrong argument list can fault on the device instead of raising, which no fallback
         # survives, so only the launcher convention checked on real hardware is tried.
         _fast_launch_mode = False
+        return _launch_update(x, conv_state, weight, bias, activation)[0]
+    if torch.cuda.is_current_stream_capturing():
+        # Same as _conv_launch: no host readback while capturing. Full launch, mode stays None.
         return _launch_update(x, conv_state, weight, bias, activation)[0]
     state_before = conv_state.clone()
     for mode in ("all",):
