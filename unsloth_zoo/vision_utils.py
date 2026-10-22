@@ -1848,9 +1848,7 @@ class UnslothVisionDataCollator:
         self.assistant_single_content = _probe_assistant_single_content(
             processor, model, "image" if has_images else "audio",
         )
-        # Only response-only training: the prompt/completion path masks the prompt.
-        self.split_generation_prompt = self.train_on_responses_only is not None and \
-            _generation_prompt_fuses_answer(processor, self.chat_template_kwargs)
+        self.split_generation_prompt = _generation_prompt_fuses_answer(processor, self.chat_template_kwargs)
         return
 
     def _get_padding_token_ids_on_device(self, device):
@@ -1885,8 +1883,9 @@ class UnslothVisionDataCollator:
         if "prompt" in examples[0] and "completion" in examples[0]:
             return self._collate_prompt_completion(examples)
 
-        if getattr(self, "split_generation_prompt", False):
-            # Tokenize the generation prompt apart from the answer, as generation does.
+        # Response-only masking (set here or later by train_on_responses_only(trainer)): the
+        # prompt/completion path masks the prompt and tokenizes it apart, as generation does.
+        if getattr(self, "split_generation_prompt", False) and getattr(self, "train_on_responses_only", None):
             split = self._split_at_generation_prompt(examples)
             if split is not None:
                 return self._collate_prompt_completion(split)

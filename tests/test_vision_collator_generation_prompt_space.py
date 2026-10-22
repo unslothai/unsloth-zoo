@@ -2,8 +2,8 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -99,6 +99,8 @@ def make_collator(processor, split):
     collator.assistant_single_content = False
     collator.chat_template_kwargs = {}
     collator.split_generation_prompt = split
+    # As train_on_responses_only installs it; the stub masks nothing beyond the collator's labels.
+    collator.train_on_responses_only = lambda batch: {"labels": batch["labels"].clone()}
     return collator
 
 
@@ -148,4 +150,13 @@ def test_multi_turn_keeps_full_text_path():
     processor = _FakeProcessor()
     out = make_collator(processor, True)([chat("Zuh", "Hi")])
     text = processor.apply_chat_template(chat("Zuh", "Hi")["messages"])
+    assert out["input_ids"][0].tolist() == processor.tokenizer.encode(text)
+
+
+def test_full_sequence_training_keeps_full_text_path():
+    processor = _FakeProcessor()
+    collator = make_collator(processor, True)
+    collator.train_on_responses_only = None
+    out = collator([chat("Zuh")])
+    text = processor.apply_chat_template(chat("Zuh")["messages"])
     assert out["input_ids"][0].tolist() == processor.tokenizer.encode(text)
