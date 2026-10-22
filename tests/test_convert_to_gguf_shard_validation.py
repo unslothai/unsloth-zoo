@@ -110,6 +110,19 @@ def test_only_this_exports_shards_are_collected(llama_cpp, tmp_path, neighbour_t
     ]
 
 
+def test_a_shard_name_with_a_trailing_suffix_is_not_collected(llama_cpp, tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "model.BF16-00001-of-00002.gguf.backup").write_bytes(b"OLD")
+
+    outputs, _ = _convert(llama_cpp, tmp_path, own_shards = 2)
+
+    assert sorted(Path(p).name for p in outputs) == [
+        "model.BF16-00001-of-00002.gguf",
+        "model.BF16-00002-of-00002.gguf",
+    ]
+
+
 def test_a_neighbours_shards_are_not_adopted_when_the_export_wrote_none(llama_cpp, tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
