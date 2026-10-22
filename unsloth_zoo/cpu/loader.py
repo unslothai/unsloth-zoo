@@ -236,9 +236,13 @@ class FastCPUModel:
                 target_modules = [m for m in target_modules if m not in embeddings]
                 modules_to_save = list(dict.fromkeys([*(modules_to_save or []), *embeddings]))
         for key in ("finetune_vision_layers", "finetune_language_layers", "finetune_attention_modules",
-                    "finetune_mlp_modules", "temporary_location", "ensure_weight_tying", "qat_scheme"):
+                    "finetune_mlp_modules", "temporary_location", "qat_scheme"):
             kwargs.pop(key, None)
         torch.manual_seed(random_state)
+        import inspect
+        ensure_weight_tying = kwargs.pop("ensure_weight_tying", None)
+        if ensure_weight_tying is not None and "ensure_weight_tying" in inspect.signature(LoraConfig).parameters:
+            kwargs["ensure_weight_tying"] = ensure_weight_tying
         config = LoraConfig(
             r = r,
             lora_alpha = lora_alpha,

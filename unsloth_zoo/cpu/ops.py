@@ -133,6 +133,19 @@ def _plain_lm_head(model):
     return isinstance(inner, torch.nn.Module)
 
 
+def _plain_head_weight(head):
+    """The weight that alone produces this head's logits, or None (e.g. a LoRA-wrapped lm_head)."""
+    if type(head) is torch.nn.Linear and head.bias is None:
+        return head.weight
+    if type(head).__name__ == "ModulesToSaveWrapper":
+        adapter = getattr(head, "active_adapter", None)
+        adapter = adapter[0] if isinstance(adapter, (list, tuple)) else adapter
+        copies = getattr(head, "modules_to_save", None)
+        active = copies[adapter] if copies is not None and adapter in copies else None
+        return _plain_head_weight(active if active is not None else getattr(head, "original_module", None))
+    return None
+
+
 def patch_chunked_causal_lm_loss(model):
     """Route training forwards with labels through chunked_linear_cross_entropy.
 
@@ -153,8 +166,9 @@ def patch_chunked_causal_lm_loss(model):
                 past_key_values = None, inputs_embeds = None, labels = None, use_cache = None,
                 logits_to_keep = 0, **kwargs):
         shift_labels = kwargs.pop("shift_labels", None)
+        head_weight = _plain_head_weight(self.get_output_embeddings())
         if (labels is None and shift_labels is None) or not torch.is_grad_enabled() \
-                or not getattr(self, "_unsloth_cpu_chunked_ce_active", True):
+                or not getattr(self, "_unsloth_cpu_chunked_ce_active", True) or head_weight is None:
             if shift_labels is not None:
                 kwargs["shift_labels"] = shift_labels
             return original_forward(
@@ -171,7 +185,7 @@ def patch_chunked_causal_lm_loss(model):
         )
         hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
         loss = chunked_linear_cross_entropy(
-            hidden, self.get_output_embeddings().weight, labels,
+            hidden, head_weight, labels,
             num_items_in_batch = num_items_in_batch, shift_labels = shift_labels,
         )
         return CausalLMOutputWithPast(
