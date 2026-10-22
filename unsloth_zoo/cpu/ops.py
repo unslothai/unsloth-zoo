@@ -111,7 +111,7 @@ def _plain_lm_head(model):
     """Only models whose logits are exactly lm_head(hidden): no softcap, scale or bias."""
     config = getattr(model, "config", None)
     text_config = getattr(config, "get_text_config", lambda: config)()
-    for name in ("final_logit_softcapping", "logit_scale", "logits_scaling", "output_multiplier_scale"):
+    for name in ("final_logit_softcapping", "logits_soft_cap", "logit_scale", "logits_scaling", "output_multiplier_scale"):
         value = getattr(text_config, name, None)
         if value not in (None, 1, 1.0):
             return False

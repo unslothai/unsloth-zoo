@@ -94,7 +94,8 @@ def _patch_sft_compute_loss(sft_trainer_cls):
     @functools.wraps(original)
     def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None, **kwargs):
         chunked = None
-        for candidate in (model, getattr(model, "base_model", None), getattr(getattr(model, "base_model", None), "model", None)):
+        unwrapped = self.accelerator.unwrap_model(model) if getattr(self, "accelerator", None) is not None else model
+        for candidate in (unwrapped, getattr(unwrapped, "base_model", None), getattr(getattr(unwrapped, "base_model", None), "model", None)):
             if getattr(candidate, "_unsloth_cpu_chunked_ce", False):
                 chunked = candidate
                 break

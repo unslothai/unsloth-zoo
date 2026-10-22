@@ -223,8 +223,11 @@ class FastCPUModel:
 
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
-        if target_modules is None or target_modules == "all-linear":
-            target_modules = _DEFAULT_TARGET_MODULES if target_modules is None else "all-linear"
+        if target_modules is None:
+            # Unsloth's usual projections where the model has them, else PEFT's per-architecture default.
+            leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
+            present = [m for m in _DEFAULT_TARGET_MODULES if m in leaf_names]
+            target_modules = present or None
         elif not isinstance(target_modules, str):
             # As on GPU: embed_tokens / lm_head in target_modules are trained in full (continued pretraining).
             embeddings = [m for m in target_modules if m in ("embed_tokens", "lm_head")]
