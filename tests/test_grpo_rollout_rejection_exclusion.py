@@ -303,3 +303,63 @@ def test_rollout_rs_warning_follows_bypass_support(monkeypatch, as_old):
                                     vllm_importance_sampling_correction = False)
     rr._warn_unsupported_grpo_options(trainer)
     assert any("UNSLOTH_GRPO_ROLLOUT_RS" in m for m in seen) == (as_old == "0")
+
+
+@pytest.mark.parametrize("options,thresholds", RS)
+@pytest.mark.parametrize("bypass", [False, True])
+def test_reported_kl_leaves_out_rejected_tokens(options, thresholds, bypass):
+    # mean_kl: per-row sum of KL over kept tokens / all completion tokens of that row (the loss
+    # normaliser's count), averaged over the rows that have tokens.
+    ref, new, old, sampling, mask, adv = _data(5)
+    parsed = rr.grpo_parse_rollout_rs(options, thresholds)
+    if bypass:
+        rollout = sampling.float().double()
+        o, s = rr.grpo_rollout_logps_as_old(rollout)
+        keep = _oracle_keep(new.detach(), rollout, mask, parsed) * mask
+        extra = dict(rollout_logps_as_old = True)
+    else:
+        o, s = old, sampling
+        keep = _oracle_keep(old, sampling, mask, parsed) * mask
+        extra = dict(vllm_importance_sampling_mode = "token_mask")
+    assert 0 < int(((keep == 0) & (mask > 0)).sum())
+    out = rr.grpo_compute_loss(
+        ref, new, o, s, torch.zeros_like(mask), mask, 0.04, adv, loss_type = "dapo", num_items_in_batch = mask.sum(),
+        steps_per_generation = 1, use_vllm = True, vllm_importance_sampling_correction = True, rollout_rs = parsed,
+        max_completion_length = new.shape[1], **extra,
+    )
+    m = mask.double()
+    d = torch.where(m > 0, ref - new.detach(), torch.zeros_like(ref)).clamp(-20, 20)
+    k3 = (d.exp() - d - 1).clamp(-10, 10) * keep
+    n = m.sum(-1)
+    rows = n > 0
+    want = (k3.sum(-1)[rows] / n[rows]).mean()
+    torch.testing.assert_close(out[2].double(), want, rtol = 1e-6, atol = 1e-9)
+
+
+def test_reported_kl_without_rejection_is_unchanged():
+    ref, new, old, sampling, mask, adv = _data(6)
+    kw = dict(loss_type = "dapo", num_items_in_batch = mask.sum(), steps_per_generation = 1, use_vllm = True,
+              vllm_importance_sampling_correction = True, max_completion_length = new.shape[1])
+    a = rr.grpo_compute_loss(ref, new, old, sampling, torch.zeros_like(mask), mask, 0.04, adv, **kw)[2]
+    b = rr.grpo_compute_loss(ref, new, old, sampling, torch.zeros_like(mask), mask, 0.04, adv,
+                             rollout_rs = rr.grpo_parse_rollout_rs("seq_mean_k3", "1e9"), **kw)[2]
+    assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("options,thresholds", RS)
+@pytest.mark.parametrize("bypass", [False, True])
+def test_keep_helper_matches_the_loss(options, thresholds, bypass):
+    # grpo_rollout_rs_keep (caller side) must reject exactly the tokens grpo_compute_loss rejects.
+    ref, new, old, sampling, mask, adv = _data(9)
+    parsed = rr.grpo_parse_rollout_rs(options, thresholds)
+    if bypass:
+        o, s = rr.grpo_rollout_logps_as_old(sampling)
+        keep = rr.grpo_rollout_rs_keep(new.detach() - o, mask, parsed)
+        loss = _run_bypass(ref, new, sampling, mask, adv, 0.04, parsed)
+    else:
+        keep = rr.grpo_rollout_rs_keep(old - sampling, mask, parsed)
+        loss, _ = _run(ref, new, old, sampling, mask, adv, 0.04, parsed)
+    loss.backward()
+    rejected = mask.bool() & ~keep
+    assert int(rejected.sum()) > 0
+    assert torch.all(new.grad[rejected] == 0) and torch.all(new.grad[keep & mask.bool()] != 0)

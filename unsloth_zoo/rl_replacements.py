@@ -1086,7 +1086,10 @@ def grpo_compute_loss(
                     mean_kl_per_reward.sum() / kept_rows.clamp(min = 1),
                 )
                 return completion_length, mean_kl
-    completion_length, mean_kl = masked_batch_mean(kl_i)
+    # Rejected tokens add nothing to the reported KL either; the denominator keeps every completion
+    # token, like the loss normaliser.
+    kl_metric = kl_i if rs_keep is None or beta == 0.0 else torch.where(rs_keep, kl_i, 0.0)
+    completion_length, mean_kl = masked_batch_mean(kl_metric)
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
@@ -2099,6 +2102,40 @@ def grpo_parse_rollout_rs(options, thresholds):
     return tuple(parsed)
 pass
 RL_REPLACEMENTS["grpo_parse_rollout_rs"] = grpo_parse_rollout_rs
+
+
+def grpo_rollout_rs_keep(log_ratio, mask, rollout_rs):
+    """Bool (B, T) keep mask of grpo_compute_loss's rollout_rs rejection, for the caller's metric
+    and entropy weights. grpo_compute_loss inlines the same steps (its source is copied into the
+    compiled trainer, so it cannot call this); log_ratio is old - sampling, or new - rollout with
+    rollout logprobs as pi_old."""
+    with torch.no_grad():
+        rs_log_ratio = torch.clamp(torch.nan_to_num(log_ratio * mask, nan = 0.0), min = -20.0, max = 20.0)
+        rs_mask = mask.to(rs_log_ratio.dtype)
+        rs_count = rs_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        rs_keep = torch.ones_like(rs_log_ratio)
+        for rs_option, rs_lower, rs_upper in rollout_rs:
+            if rs_option.endswith("k1"):
+                rs_stat = -rs_log_ratio
+            elif rs_option.endswith("k2"):
+                rs_stat = 0.5 * rs_log_ratio * rs_log_ratio
+            else:
+                rs_stat = torch.expm1(rs_log_ratio) - rs_log_ratio
+            rs_stat = rs_stat * rs_mask
+            if rs_option.startswith("seq_sum"):
+                rs_stat = rs_stat.sum(dim=-1, keepdim=True)
+            elif rs_option.startswith("seq_mean"):
+                rs_stat = rs_stat.sum(dim=-1, keepdim=True) / rs_count
+            elif rs_option.startswith("seq_max"):
+                rs_stat = rs_stat.amax(dim=-1, keepdim=True)
+            if rs_lower is not None:
+                rs_pass = (rs_stat >= rs_lower) & (rs_stat <= rs_upper)
+            else:
+                rs_pass = rs_stat <= rs_upper
+            rs_keep = rs_keep * rs_pass.to(rs_keep.dtype)
+        return rs_keep > 0
+pass
+RL_REPLACEMENTS["grpo_rollout_rs_keep"] = grpo_rollout_rs_keep
 
 
 def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
@@ -3313,6 +3350,17 @@ def grpo_accumulated_loss(
             old_logps, _rollout_unscored = grpo_rollout_old_fill_unscored(old_logps, new_logprobs)
             # Only on this path: grpo_compute_loss clamps pi_theta / pi_rollout's log to [-20, 20] like verl.
             kwargs["rollout_logps_as_old"] = True
+        # The rollout_rs keep mask grpo_compute_loss applies, for the IS metric weights and the entropy bonus.
+        _rs_keep = None
+        if kwargs.get("rollout_rs", None) is not None and old_logps is not None and old_logps.shape == completion_mask.shape:
+            _rs_log_ratio = None
+            if _rollout_logps_as_old:
+                _rs_log_ratio = new_logprobs.detach() - old_logps
+            elif trainer.use_vllm and sampling_per_token_logps is not None and kwargs.get("vllm_importance_sampling_correction", False):
+                _rs_log_ratio = old_logps - sampling_per_token_logps
+            if _rs_log_ratio is not None:
+                from unsloth_zoo.rl_replacements import grpo_rollout_rs_keep as _grpo_rollout_rs_keep
+                _rs_keep = _grpo_rollout_rs_keep(_rs_log_ratio, completion_mask, kwargs["rollout_rs"])
         with autocaster:
             loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
                 new_logprobs,
@@ -3336,6 +3384,9 @@ def grpo_accumulated_loss(
             if _raw_log_ratio.shape != completion_mask.shape:
                 _raw_log_ratio = torch.log(coef_1.detach().to(torch.float64))
             delta, flat_is_ratio = grpo_rollout_as_old_ratio_metrics(coef_1, completion_mask, _raw_log_ratio)
+            if _rs_keep is not None and flat_is_ratio is not None:
+                # Rejected tokens get IS weight 0, as on the vLLM IS path: rejected_frac counts them, ESS drops them.
+                flat_is_ratio = torch.where(_rs_keep, flat_is_ratio, torch.zeros_like(flat_is_ratio))
             if _rollout_metrics_on and flat_is_ratio is not None:
                 _log_ratio = torch.nan_to_num(_raw_log_ratio, nan = 0.0, posinf = 670.0, neginf = -670.0)
                 _log_ratio = torch.where(completion_mask.to(torch.bool), _log_ratio, torch.zeros_like(_log_ratio))
@@ -3383,6 +3434,10 @@ def grpo_accumulated_loss(
             _entropy_weights = _grpo_entropy_bonus_weights(
                 completion_mask, entropy_mask, _entropy_coef, kwargs, training = _training,
             )
+            if _rs_keep is not None:
+                # Rejected tokens leave the entropy bonus too (verl drops them from response_mask);
+                # its normaliser keeps them, like the policy term's.
+                _entropy_weights = torch.where(_rs_keep.to(_entropy_weights.device), _entropy_weights, 0.0)
             _scaler = trainer.accelerator.scaler
             loss = loss + _UnslothGRPOEntropyBonus.apply(
                 new_entropies, _entropy_weights.to(new_entropies.device),
