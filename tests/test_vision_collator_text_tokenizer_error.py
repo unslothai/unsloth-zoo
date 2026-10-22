@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A text-only tokenizer handed to UnslothVisionDataCollator (AutoTokenizer, or a local
-VLM folder without preprocessor_config.json) must say what was passed and how to fix it
-(unslothai/notebooks#124). CPU-pure and offline."""
+"""A text-only tokenizer must get an actionable collator error (unslothai/notebooks#124)."""
 
 import pytest
 
