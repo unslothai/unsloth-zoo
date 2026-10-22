@@ -198,6 +198,32 @@ def test_qwen3_vl_moe_experts_forward(monkeypatch, selected, backend, expected):
     assert calls == [expected]
 
 
+
+def test_qwen3_vl_moe_sonic_forward_routes_bnb4bit_experts_first(monkeypatch, selected):
+    # Packed 4-bit experts take the bnb4bit dispatcher, never sonic or its native-loop fallback.
+    modeling = pytest.importorskip("transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe")
+    experts_cls = getattr(modeling, "Qwen3VLMoeTextExperts", None)
+    if experts_cls is None:
+        pytest.skip("transformers has no Qwen3VLMoeTextExperts")
+    import unsloth_zoo.temporary_patches.qwen3_vl_moe as Q
+    import unsloth_zoo.temporary_patches.moe_utils_sonic as S
+
+    for cls in (experts_cls, modeling.Qwen3VLMoeTextSparseMoeBlock):
+        for name, value in list(vars(cls).items()):
+            if not name.startswith("__") or name == "__init__":
+                monkeypatch.setattr(cls, name, value)
+
+    selected("sonic_moe")
+    calls = _spies(monkeypatch, [Q, M])
+    monkeypatch.setattr(
+        Q, "_bnb4bit_experts_forward_or_none",
+        lambda self, hidden_states, *a, **k: calls.append("bnb4bit") or torch.zeros_like(hidden_states),
+    )
+    monkeypatch.setattr(S, "forward_sonic_moe", lambda *a, **k: calls.append("forward_sonic_moe"))
+    Q.patch_qwen3_vl_moe()
+    experts_cls.forward(_Experts(), *_inputs())
+    assert calls == ["bnb4bit"]
+
 def test_without_sonic_takes_the_loop_on_a_card_without_grouped_mm(monkeypatch):
     # Mixed host: sonic_moe was selected on a grouped_mm card, the expert runs on one without it.
     monkeypatch.setattr(M, "select_moe_backend", lambda: "sonic_moe")

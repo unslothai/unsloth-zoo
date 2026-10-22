@@ -274,6 +274,9 @@ def patch_qwen3_vl_moe():
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
                 """sonic-moe forward; falls back to grouped_mm where sonic does not support the weights."""
+                output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
+                if output is not None:
+                    return output
                 return forward_sonic_moe(
                     self, hidden_states, top_k_index, top_k_weights
                 )
