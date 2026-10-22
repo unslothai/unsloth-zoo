@@ -6369,6 +6369,12 @@ def unsloth_compile_transformers(
 
     # Check if fullgraph can be used
     torch_modules = {x: True for x in torch_modules}
+    disabled_attention_modules = (
+        full_attention_modules
+        + (scaled_dot_product_attention_modules if (disable or sdpa_dynamic_compile) else [])
+        if compile_attention
+        else []
+    )
     for module in torch_modules.keys():
         source = eval(f"modeling_file.{module}")
         try:
@@ -6376,6 +6382,10 @@ def unsloth_compile_transformers(
         except:
             continue
         fullgraph = not ("nn.Linear" in source or "nn.ModuleList" in source)
+
+        # Dynamo cannot inline a compile-disabled attention forward into a fullgraph region (UMT5LayerSelfAttention).
+        if any(re.search(rf"\b{re.escape(x)}\(", source) for x in disabled_attention_modules):
+            fullgraph = False
 
         # Eg SiglipVisionEmbeddings and CLIPVisionEmbeddings
         if str(module).endswith("VisionEmbeddings"):

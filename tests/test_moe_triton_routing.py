@@ -279,3 +279,38 @@ def test_kill_switch(value):
         assert triton_calls == 0
     else:
         assert triton_calls == 1 and torch_calls == 0
+
+
+def _compiled_variants(kernel):
+    caches = getattr(kernel, "device_caches", None)
+    if caches is not None:
+        return sum(len(v[0]) for v in caches.values())
+    return sum(len(v) for v in kernel.cache.values())
+
+
+def _clear_compiled(kernel):
+    # Earlier tests in this file may already have compiled every tile size: start empty.
+    caches = getattr(kernel, "device_caches", None)
+    if caches is not None:
+        for v in caches.values():
+            v[0].clear()
+    else:
+        for v in kernel.cache.values():
+            v.clear()
+
+
+def test_scan_kernel_compiles_once_across_token_counts():
+    # The scan tile must not follow the block count: training steps with different token counts
+    # (here 9 NB values from 16 to 512 blocks) reuse one compiled scan kernel.
+    E, k = 64, 8
+    _clear_compiled(mrt._route_scan_kernel)
+    before = _compiled_variants(mrt._route_scan_kernel)
+    seen = set()
+    for T in (520, 1100, 2100, 3300, 4300, 6000, 8200, 12000, 16384):
+        ids = torch.randint(0, E, (T, k), device = "cuda")
+        got = mrt._launch(ids, E)
+        ref = mrt.torch_moe_routing_sort(ids, E)
+        assert all(torch.equal(a, b) for a, b in zip(got, ref))
+        seen.add(_compiled_variants(mrt._route_scan_kernel) - before)
+    # <= 2: Triton's own 16-byte pointer-alignment specialization of the scratch slices.
+    assert _compiled_variants(mrt._route_scan_kernel) - before <= 2, seen

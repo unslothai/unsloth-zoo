@@ -702,7 +702,7 @@ def test_verify_attention_matches_mlx_vector_kernel_and_decode_rows_bitwise(gqa,
             queries[:, :, i : i + 1], keys[..., : horizon(i), :], values[..., : horizon(i), :], scale = 1.0)
             for i in range(rows)], axis = 2))
     monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # MLX's own vector kernel over each launch's rows
-    step = decode._launch_simds() // gqa
+    step = decode._launch_simds(dtype) // gqa
     if _mlx_vector_launch_fits(gqa * min(step, rows)):
         _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
             queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
@@ -718,7 +718,12 @@ def test_launches_before_m3_fit_their_threadgroup_limit(monkeypatch):
     queries, keys, values = _attention_block(8, 8, 4500)
     out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None)
     _equal(out, decode._decode_attention(queries, keys, values, 1.0))
-    assert launched == [3, 3, 2]   # 32 lanes x 8 query heads x 3 rows = 768 of the 832 threads allowed
+    assert launched == [3, 3, 2]   # 32 lanes x 8 query heads x 3 rows = the 768 BF16 threads allowed
+    launched.clear()
+    queries, keys, values = _attention_block(8, 8, 4500, mx.float16)
+    out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None)
+    _equal(out, decode._decode_attention(queries, keys, values, 1.0))
+    assert launched == [2, 2, 2, 2]
 
 
 def _gemma4_attention(gqa):
@@ -805,6 +810,185 @@ def test_a_launch_straddling_a_block_count_boundary_is_not_judged(monkeypatch):
         monkeypatch.setattr(decode, "_vector_attention", lambda *args: pytest.fail("a straddling launch ran"))
         assert decode._verify_attention(*_attention_block(8, 4, keys), None, 1.0, "causal", None) is None
         assert decode._VERIFY_ATTENTION_VERDICTS == admitted
+
+
+wide_decode_only = pytest.mark.skipif(mx.__version__ != "0.32.4", reason = "MLX 0.32.4 decode dispatch")
+
+
+@wide_decode_only
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("rows", [1, 2])   # 16 simdgroups fit every GPU's F16 limit (576 threads before M3)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_vector_attention_preserves_bits_when_feature_layouts_change(dtype, rows, reverse, monkeypatch):
+    monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")
+    monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
+    arrays = _attention_block(8, rows, 4500, dtype)
+    # Before M3, MLX's own launch for 2 rows exceeds its threadgroup limit, so the contiguous layout is the reference.
+    reference = (mx.fast.scaled_dot_product_attention(*arrays, scale = 1.0, mask = "causal")
+                 if _mlx_vector_launch_fits(8 * rows) else
+                 decode._vector_attention(*arrays, 1.0, decode._vector_blocks(8 * rows, 4500)))
+    strided = [mx.stack([x, mx.full(x.shape, -7, dtype)], axis = -1).reshape(
+        *x.shape[:-1], 2 * x.shape[-1])[..., ::2] for x in arrays]
+    layouts = [(False, False, False), (True, False, False), (False, True, False),
+               (False, False, True), (True, True, True), (False, False, False)]
+    for layout in reversed(layouts) if reverse else layouts:
+        inputs = [strided[i] if use_stride else arrays[i] for i, use_stride in enumerate(layout)]
+        if rows == 1 and dtype == mx.bfloat16:
+            out = decode._wide_head_decode_attention(*inputs, 1.0, "causal")
+            assert out is not None and all(decode._WIDE_ATTENTION_VERDICTS.values())
+        else:
+            out = decode._vector_attention(*inputs, 1.0, decode._vector_blocks(8 * rows, 4500))
+        _equal(out, reference)
+
+
+@wide_decode_only
+@pytest.mark.parametrize("heads,keys", [(8, 1024), (8, 1025), (16, 4224), (8, 8192), (16, 8193)])
+def test_wide_decode_attention_is_native_bitwise_over_strided_caches(heads, keys, monkeypatch):
+    monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
+    mx.random.seed(keys)
+    q = mx.random.normal((1, heads, 1, 1024)).astype(mx.bfloat16)[..., ::2]
+    k = mx.random.normal((1, heads // 8, keys + 256, 1024)).astype(mx.bfloat16)[:, :, :keys, ::2]
+    v = mx.random.normal((1, heads // 8, keys + 128, 1536)).astype(mx.bfloat16)[:, :, :keys, ::3]
+    for mask, scale in [(None, 512 ** -.5), ("causal", .125)]:
+        out = decode._wide_head_decode_attention(q, k, v, scale, mask)
+        if not decode._two_pass_keys(keys):   # below this GPU's two-pass threshold, MLX's single-pass kernel stays
+            assert out is None
+            continue
+        assert out is not None
+        _equal(out, mx.fast.scaled_dot_product_attention(q, k, v, scale = scale, mask = mask))
+        _equal(out, decode._vector_attention(mx.contiguous(q), mx.contiguous(k), mx.contiguous(v),
+                                            scale, decode._vector_blocks(8, keys)))
+
+
+def test_wide_decode_attention_keeps_unsupported_calls_native(monkeypatch):
+    q, k, v = _attention_block(8, 1, 4500)
+    calls = [(q, k, v, mx.ones((1, 4500), mx.bool_)), (q, k, v, "invalid"),
+             (mx.concatenate([q, q], axis = 2), k, v, None),
+             (q.astype(mx.float16), k, v, None), (q[:, :4], k, v, None),
+             (q, k[..., None], v[..., None], None),
+             (q, k[:, :, :600], v[:, :, :600], None), (q, k, v[..., :256], None),
+             (mx.concatenate([q, q]), mx.concatenate([k, k]), mx.concatenate([v, v]), None)]
+    monkeypatch.setattr(decode, "_vector_attention", lambda *args: pytest.fail("unsupported attention launched"))
+    for a, b, c, mask in calls:
+        assert decode._wide_head_decode_attention(a, b, c, 1.0, mask) is None
+    monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "8192")
+    assert decode._wide_head_decode_attention(q, k, v, 1.0, None) is None
+    monkeypatch.delenv("MLX_SDPA_D512_MIN_KL")
+    monkeypatch.setattr(mx, "__version__", "0.32.5")
+    assert decode._wide_head_decode_attention(q, k, v, 1.0, None) is None
+
+
+@wide_decode_only
+def test_wide_decode_attention_remembers_mismatch_and_defers_transformed_checks(monkeypatch):
+    monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
+    q, k, v = _attention_block(8, 1, 4500)
+    kernel = decode._vector_attention
+    monkeypatch.setattr(decode, "_vector_attention", lambda *args: mx.ones_like(q))
+    assert decode._wide_head_decode_attention(q, k, v, 1.0, None) is None
+    monkeypatch.setattr(decode, "_vector_attention", lambda *args: pytest.fail("repeated a rejected kernel"))
+    assert decode._wide_head_decode_attention(q, k, v, 1.0, None) is None
+    assert list(decode._WIDE_ATTENTION_VERDICTS.values()) == [False]
+    monkeypatch.setattr(decode, "_vector_attention", kernel)
+    wide = _attention_block(8, 1, 4500, heads = 16)
+    assert decode._wide_head_decode_attention(*wide, 1.0, None) is not None
+    assert sorted(decode._WIDE_ATTENTION_VERDICTS.values()) == [False, True]
+    monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
+    monkeypatch.setattr(decode, "_vector_attention", kernel)
+    native = mx.fast.scaled_dot_product_attention
+    with monkeypatch.context() as patch:
+        patch.setattr(mx.fast, "scaled_dot_product_attention", lambda *a, **kw: (_ for _ in ()).throw(
+            ValueError("cannot evaluate while tracing")))
+        assert decode._wide_head_decode_attention(q, k, v, 1.0, None) is None
+    assert decode._WIDE_ATTENTION_VERDICTS == {}
+    _equal(decode._wide_head_decode_attention(q, k, v, 1.0, None), native(q, k, v, scale = 1.0))
+    monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
+    def attend(q, k, v):
+        out = decode._wide_head_decode_attention(q, k, v, 1.0, None)
+        return native(q, k, v, scale = 1.0) if out is None else out
+    _equal(mx.compile(attend)(q, k, v), native(q, k, v, scale = 1.0))
+    _equal(attend(q, k, v), native(q, k, v, scale = 1.0))
+
+
+@wide_decode_only
+def test_wide_decode_scope_is_generic_live_and_reversible(monkeypatch):
+    from mlx_lm.models import base as lm_base
+    from mlx_vlm.models import base as vlm_base
+    q, k, v = _attention_block(8, 1, 4500)
+    layers, namespaces = [], []
+    for helper in (lm_base.scaled_dot_product_attention, vlm_base.scaled_dot_product_attention):
+        namespace = {"scaled_dot_product_attention": helper, "factor": 1}
+        exec("def attend(self, q, k, v, cache=None, **kwargs):\n"
+             "    return factor * scaled_dot_product_attention(q, k, v, cache, scale=1.0, mask=None, **kwargs)", namespace)
+        layer = type("AttentionClient", (nn.Module,), {"__call__": namespace["attend"]})()
+        layer.head_dim = 512
+        layer.eval()
+        layers.append(layer)
+        namespaces.append(namespace)
+    root = nn.Sequential(*layers)
+    original = [type(layer) for layer in layers]
+    with decode.fused_decode_attention(SimpleNamespace(named_modules = lambda: [("plain", object()), ("other", SimpleNamespace())])):
+        pass
+    for index in (0, 1):
+        with monkeypatch.context() as patch:
+            package = (lm_base, vlm_base)[index]
+            patch.setattr(package, "scaled_dot_product_attention", lambda *a, **kw: q)
+            with decode.fused_decode_attention(root):
+                assert type(layers[index]) is original[index]
+                assert type(layers[1 - index]) is not original[1 - index]
+        with monkeypatch.context() as patch:
+            patch.setitem(namespaces[index], "scaled_dot_product_attention", lambda *a, **kw: q)
+            with decode.fused_decode_attention(root):
+                assert type(layers[index]) is original[index]
+                _equal(layers[index](q, k, v), q)
+    launched, kernel = [], decode._vector_attention
+    monkeypatch.setattr(decode, "_vector_attention", lambda *a: launched.append(None) or kernel(*a))
+    with pytest.raises(RuntimeError, match = "cancel"):
+        with decode.fused_decode_attention(root):
+            patched = [type(layer) for layer in layers]
+            assert all(a is not b for a, b in zip(original, patched))
+            with decode.fused_decode_attention(root):
+                assert [type(layer) for layer in layers] == patched
+            for index in (1, 0):
+                layer, namespace = layers[index], namespaces[index]
+                for factor in (.25, 2):
+                    namespace["factor"] = factor
+                    _equal(layer(q, k, v), original[index].__call__(layer, q, k, v))
+                assert len(launched) == (2 if index == 1 else 4)
+                layer.train()
+                _equal(layer(q, k, v), original[index].__call__(layer, q, k, v))
+                layer.eval()
+                _equal(layer(q, k, v, cache = object()), original[index].__call__(layer, q, k, v, cache = object()))
+                _equal(layer(q, k, v, sinks = mx.zeros((8,), mx.bfloat16)),
+                       original[index].__call__(layer, q, k, v, sinks = mx.zeros((8,), mx.bfloat16)))
+                assert len(launched) == (2 if index == 1 else 4)
+            for index in (0, 1):
+                with monkeypatch.context() as patch:
+                    patch.setitem(namespaces[index], "scaled_dot_product_attention", lambda *a, **kw: q * 3)
+                    _equal(layers[index](q, k, v), q * 3 * namespaces[index]["factor"])
+            assert len(launched) == 4
+            raise RuntimeError("cancel")
+    assert [type(layer) for layer in layers] == original
+    root._unsloth_mlx_distributed_parallel_mode = "tensor"
+    with decode.fused_decode_attention(root):
+        assert [type(layer) for layer in layers] == original
+
+
+@wide_decode_only
+def test_wide_decode_scope_composes_with_speculative_attention(monkeypatch):
+    gemma4, layers = _gemma4_attention(8)
+    full = layers.layers[1]
+    x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    with decode.fused_verify_attention(layers), decode.fused_decode_attention(layers):
+        with decode.verify_block_attention():
+            launched, kernel = [], decode._vector_attention
+            monkeypatch.setattr(decode, "_vector_attention", lambda *a: launched.append(a[0].shape[2]) or kernel(*a))
+            _attend(gemma4, full, x)
+            assert launched == [3]
+        launched.clear()
+        _equal(_attend(gemma4, full, x[:, :1], mask = None),
+               _attend(gemma4, full, x[:, :1], mask = None, call = gemma4.Attention.__call__))
+        assert launched == [1]
+    assert type(full) is gemma4.Attention
 
 
 try:
@@ -1265,3 +1449,216 @@ def test_ple_reads_skip_resident_tables_drifted_bodies_and_restore(tmp_path, mon
     monkeypatch.setattr(decode, "_PLE_READ_CONTRACT", contract)
     with decode.exact_ple_row_reads(model):
         assert type(table) is stock
+
+
+_needs_qwen4 = pytest.mark.skipif(qwen4 is None, reason = "mlx-vlm without qwen4_exp")
+
+
+def _qwen4_hc(combine = True, streams = 4, lowrank = 32, dtype = mx.bfloat16):
+    config = SimpleNamespace(hidden_size = 1280, hc_count = streams, hc_lowrank = lowrank, rms_norm_eps = 1e-6)
+    module = qwen4.Qwen4ExpGatedResidual(config, use_combine = combine)
+    module.update(nn.utils.tree_map(lambda p: mx.random.normal(p.shape) * mx.exp(mx.random.normal(p.shape)) * 0.2,
+                                    module.parameters()))
+    module.set_dtype(dtype)
+    return module.eval()
+
+
+def _assert_same(actual, expected):
+    actual, expected = nn.utils.tree_flatten(actual), nn.utils.tree_flatten(expected)
+    assert [key for key, _ in actual] == [key for key, _ in expected]
+    for a, b in zip(actual, expected):
+        _equal(a[1], b[1])
+
+
+@_needs_qwen4
+@pytest.mark.parametrize("dtype, combine", [(mx.bfloat16, True), (mx.float16, False)])
+def test_qwen4_prefill_kernels_match_mlx_vlm_bitwise(dtype, combine, monkeypatch):
+    hc = _qwen4_hc(combine, dtype = dtype)
+    chunks = [(mx.random.normal((2, n, 4 * 1280)) * mx.exp(2 * mx.random.normal((2, n, 1)))).astype(dtype) for n in (37, 300, 1, 16)]
+    expected = [hc(x) for x in chunks]
+    calls = {name: [] for name in ("_qwen4_hc_norm", "_qwen4_hc_mix")}
+    for name, log in calls.items():
+        monkeypatch.setattr(decode, name, lambda *a, f = getattr(decode, name), log = log: log.append(1) or f(*a))
+    monkeypatch.setattr(decode, "_QWEN4_PREFILL_VERDICTS", {})
+    with pytest.raises(RuntimeError, match = "cancel"), decode.fused_qwen4_prefill(hc):
+        with decode.fused_qwen4_prefill(hc):
+            pass
+        for x, reference in zip(chunks, expected):
+            _assert_same(hc(x), reference)
+        raise RuntimeError("cancel")
+    assert [len(log) for log in calls.values()] == [3, 3]   # a first-use comparison and two served calls
+    assert list(decode._QWEN4_PREFILL_VERDICTS.values()) == [True]
+    assert type(hc) is qwen4.Qwen4ExpGatedResidual
+
+
+@_needs_qwen4
+@pytest.mark.parametrize("reason", [
+    "switch", "body", "wrapped", "short", "differs", "wide", "streams", "child", "subclass", "rebound", "sliced"])
+def test_qwen4_prefill_scope_steps_aside(reason, monkeypatch, caplog):
+    hc = _qwen4_hc(streams = 9 if reason == "streams" else 4)
+    x = mx.random.normal((1, 31 if reason == "short" else 40, hc.hc_count * 1280)).astype(mx.bfloat16)
+    norm, builder, residual, rms = decode._qwen4_hc_norm, qwen4._qwen4_rms_norm, qwen4.Qwen4ExpGatedResidual, qwen4.Qwen4ExpRMSNorm
+    stock, shifted = residual.__call__, lambda base, call: type("Shifted", (base,), {"__call__": call})
+    fail = lambda *a: pytest.fail("an ineligible call was fused")
+    for name, value in (("_QWEN4_PREFILL_VERDICTS", {}), ("_QWEN4_PREFILL_BINDINGS", [None]), ("_CONTRACT_MISSES", set())):
+        monkeypatch.setattr(decode, name, value)
+    if reason == "body":
+        monkeypatch.setattr(rms, "__call__", lambda self, h: h)
+    elif reason == "wrapped":   # a wrapper around the cached norm builder, which unwraps to the stock body
+        monkeypatch.setattr(qwen4, "_qwen4_rms_norm", functools.wraps(builder)(lambda *a: lambda *h: builder(*a)(*h) + 1))
+    elif reason == "sliced":   # a projection result that the native mix broadcasts
+        hc.input_mix_weight_up.__class__ = shifted(nn.Linear, lambda self, h: nn.Linear.__call__(self, h)[:, :1])
+    elif reason == "child":   # an overridden norm the fused read would bypass
+        hc.hc_norm.__class__ = shifted(rms, lambda self, h: rms.__call__(self, h) + 1)
+    elif reason == "subclass":   # a residual whose own call the class swap would replace
+        hc.__class__ = shifted(residual, lambda self, h: stock(self, h + 1))
+    elif reason == "rebound":   # the exported norm class replaced after an earlier scope resolved the contract
+        with decode.fused_qwen4_prefill(_qwen4_hc()):
+            pass
+        monkeypatch.setattr(qwen4, "Qwen4ExpRMSNorm", shifted(rms, lambda self, h: rms.__call__(self, h) + 1))
+        hc.hc_norm.__class__ = qwen4.Qwen4ExpRMSNorm
+    cls, expected = type(hc), hc(x)
+    monkeypatch.setenv("UNSLOTH_MLX_QWEN4_PREFILL", "0" if reason == "switch" else "1")
+    monkeypatch.setattr(decode, "_qwen4_hc_norm", fail if reason in ("short", "streams", "child", "rebound") else
+                        (lambda *a: norm(*a) + 1) if reason == "differs" else norm)
+    with caplog.at_level("WARNING"), decode.fused_qwen4_prefill(hc):
+        patched = type(hc) is not cls
+        if reason == "wide":   # widened while the scope is open, after a 16-bit call verified the key
+            mx.eval(hc(x))
+            hc.input_mix_weight_up.set_dtype(mx.float32)
+            expected = cls.__call__(hc, x)
+            monkeypatch.setattr(decode, "_qwen4_hc_mix", fail)
+        for _ in range(2):
+            _assert_same(hc(x), expected)
+    assert patched == (reason in ("short", "differs", "wide", "sliced"))
+    assert ("differs from the version" in caplog.text) == (reason in ("body", "wrapped", "rebound"))
+    assert caplog.text.count("differs from mlx-vlm's") == (reason == "differs")
+    assert type(hc) is cls
+
+
+def _qwen4_read(combine = True, lowrank = 160, bits = 4, group_size = 32, dtype = mx.bfloat16):
+    module = _qwen4_hc(combine, lowrank = lowrank, dtype = dtype)
+    nn.quantize(module, group_size = group_size, bits = bits)
+    module.eval()
+    return module
+
+
+def _qwen4_rows(rows, dtype = mx.bfloat16):
+    return (mx.random.normal((1, rows, 4 * 1280)) * mx.exp(2 * mx.random.normal((1, rows, 1)))).astype(dtype)
+
+
+def _logged_decode_kernels(monkeypatch, log, shift = 0):
+    kernels = decode._qwen4_decode_kernels()
+
+    def logged(kernel):
+        return lambda **kw: log.append(kernel) or [out + shift if shift else out for out in kernel(**kw)]
+    monkeypatch.setattr(decode, "_qwen4_decode_kernels", lambda: tuple(logged(k) for k in kernels))
+
+
+@_needs_qwen4
+@pytest.mark.parametrize("dtype, bits, group_size, lowrank, combine", [
+    (mx.bfloat16, 4, 32, 160, True), (mx.float16, 8, 64, 192, False)])
+def test_qwen4_decode_read_matches_mlx_vlm_bitwise(dtype, bits, group_size, lowrank, combine, monkeypatch):
+    mx.random.seed(0)
+    module, forward = _qwen4_read(combine, lowrank, bits, group_size, dtype), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
+    # Enough one-row reads that a norm rounding off by one float32 ulp shows in some 16-bit result.
+    inputs = [_qwen4_rows(1, dtype) for _ in range(128)] + [_qwen4_rows(2, dtype)]
+    expected = [forward._hyper_connection(module, x) for x in inputs]
+    log = []
+    _logged_decode_kernels(monkeypatch, log)
+    monkeypatch.setattr(decode, "_QWEN4_PREFILL_VERDICTS", {})
+    # Generation also holds dense_prefill_linear, opened before or after this scope.
+    outer, inner = ((decode.dense_prefill_linear, decode.fused_qwen4_decode) if combine
+                    else (decode.fused_qwen4_decode, decode.dense_prefill_linear))
+    with outer(module), decode.fused_qwen4_decode(module):
+        with inner(module), decode.fused_qwen4_decode(module):
+            assert type(module.input_mix_weight_down) is not nn.QuantizedLinear
+            for x, reference in zip(inputs[:64], expected):
+                _assert_same(forward._hyper_connection(module, x), reference)
+        for x, reference in zip(inputs[64:], expected[64:]):   # the outer scope still routes
+            _assert_same(forward._hyper_connection(module, x), reference)
+    # A first-use comparison and 127 served one-row reads, two launches each; the two-row read stays native.
+    assert len(log) == 256 and list(decode._QWEN4_PREFILL_VERDICTS.values()) == [True]
+    assert "_hyper_connection" not in vars(forward)
+    assert not {"_unsloth_qwen4_decode_scopes", "_unsloth_qwen4_decode_plan"} & set(vars(module))
+
+
+@_needs_qwen4
+@pytest.mark.parametrize("reason", [
+    "switch", "body", "patched", "outside", "differs", "aligned", "quad", "child", "override", "linear",
+    "foreign", "late", "rebound", "lora", "dtype", "verified", "relinear"])
+def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
+    module = _qwen4_read(lowrank = {"aligned": 512, "quad": 128}.get(reason, 160))
+    other, forward = _qwen4_read(), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
+    x = _qwen4_rows(1, mx.float16 if reason == "dtype" else mx.bfloat16)   # "dtype": not the plan's
+    if reason == "body":
+        monkeypatch.setattr(qwen4.Qwen4ExpRMSNorm, "__call__", lambda self, x: x)
+    elif reason == "child":
+        module.hc_norm.__class__ = type("Shifted", (qwen4.Qwen4ExpRMSNorm,), {
+            "__call__": lambda self, x: qwen4.Qwen4ExpRMSNorm.__call__(self, x) + 1})
+    elif reason == "patched":
+        stock_linear = nn.QuantizedLinear.__call__
+        monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: stock_linear(self, x) * 2)
+    elif reason == "lora":   # an unfused adapter wraps the projection, which has no weight of its own
+        from mlx_lm.tuner.lora import LoRALinear
+        module.input_mix_weight_down = LoRALinear.from_base(module.input_mix_weight_down)
+        module.input_mix_weight_down.lora_b = mx.random.normal(module.input_mix_weight_down.lora_b.shape) * 0.01
+    elif reason == "override":
+        module.input_mix_weight_down.__class__ = type("Scaled", (nn.QuantizedLinear,), {
+            "__call__": lambda self, x: nn.QuantizedLinear.__call__(self, x) * 2})
+    elif reason == "linear":
+        monkeypatch.setitem(vars(forward), "_linear", lambda linear, h: linear(h) * 2)
+    elif reason in ("verified", "relinear"):   # exact_batch_invariant_decode's class already over the forward
+        native = type(forward)
+        methods = (getattr(native, name, None) for name in decode._VERIFY_METHODS)
+        verified = decode._exact_verify_class(native, "__call__", False, *methods)
+        if reason == "relinear":   # a class under that one decorating its `_linear`
+            sliced = verified._linear
+            verified = type("Scaled", (verified,), {
+                "_linear": functools.wraps(sliced)(lambda self, linear, h: sliced(self, linear, h) * 2)})
+        monkeypatch.setattr(forward, "__class__", verified)
+    foreign = lambda m, h: type(forward)._hyper_connection(forward, m, h)
+    if reason == "foreign":   # another library's hook on the shared forward object
+        monkeypatch.setitem(vars(forward), "_hyper_connection", foreign)
+    for name, value in (("_QWEN4_PREFILL_VERDICTS", {}), ("_QWEN4_DECODE_BINDINGS", [None]), ("_CONTRACT_MISSES", set())):
+        monkeypatch.setattr(decode, name, value)
+    if reason == "rebound":   # the exported norm class replaced after an earlier scope resolved the contract
+        with decode.fused_qwen4_decode(other):
+            pass
+        stock_norm = qwen4.Qwen4ExpRMSNorm
+        monkeypatch.setattr(qwen4, "Qwen4ExpRMSNorm", type("Shifted", (stock_norm,), {
+            "__call__": lambda self, h: stock_norm.__call__(self, h) + 1}))
+        module.hc_norm.__class__ = qwen4.Qwen4ExpRMSNorm
+    target = other if reason == "outside" else module
+    expected = forward._hyper_connection(target, x)
+    log = []
+    _logged_decode_kernels(monkeypatch, log, shift = 1 if reason == "differs" else 0)
+    monkeypatch.setenv("UNSLOTH_MLX_QWEN4_DECODE", "0" if reason == "switch" else "1")
+    with caplog.at_level("WARNING"), decode.fused_qwen4_decode(module):
+        hooked = getattr(vars(forward).get("_hyper_connection"), "func", None) is decode._qwen4_decode_read
+        if reason == "late":   # replaced while the scope is open
+            vars(forward)["_hyper_connection"] = foreign
+        for _ in range(2):
+            _assert_same(forward._hyper_connection(target, x), expected)
+    left = vars(forward).pop("_hyper_connection", None) if reason == "late" else vars(forward).get("_hyper_connection")
+    assert left is (foreign if reason in ("foreign", "late") else None)
+    assert hooked == (reason in ("outside", "differs", "late", "dtype", "verified"))
+    assert len(log) == {"differs": 2, "verified": 4}.get(reason, 0)
+    assert ("differs from the version" in caplog.text) == (reason in ("body", "patched", "rebound"))
+    assert caplog.text.count("differs from mlx-vlm's") == (reason == "differs")
+
+
+@_needs_qwen4
+@pytest.mark.parametrize("removed", ["residual", "linear"])
+def test_qwen4_decode_scope_stays_native_when_a_pinned_name_is_gone(removed, monkeypatch):
+    # A drifted mlx-vlm without one of these names fails the contract; opening the scope must not raise.
+    module, forward = _qwen4_read(), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
+    for name, value in (("_QWEN4_PREFILL_VERDICTS", {}), ("_QWEN4_DECODE_BINDINGS", [None]), ("_CONTRACT_MISSES", set())):
+        monkeypatch.setattr(decode, name, value)
+    if removed == "residual":
+        monkeypatch.delattr(qwen4, "Qwen4ExpGatedResidual")
+    else:
+        monkeypatch.delattr(next(c for c in type(forward).__mro__ if "_linear" in vars(c)), "_linear")
+    with decode.fused_qwen4_decode(module):
+        assert "_hyper_connection" not in vars(forward)
+        assert "_unsloth_qwen4_decode_plan" not in vars(module)

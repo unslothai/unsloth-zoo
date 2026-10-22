@@ -837,6 +837,34 @@ def test_a_penalised_row_answers_the_same_batched_and_alone():
         assert result.token_ids == alone, prompt
 
 
+@metal_only
+def test_an_image_row_batched_through_mlx_lm_decodes_as_its_input_embeddings_do_alone(monkeypatch):
+    from mlx_lm import load, stream_generate
+    from mlx_lm.sample_utils import make_sampler
+    from unsloth_zoo.mlx.generate import GenerationDefaults, GenerationRequest, generate_batch
+
+    model, tokenizer = load(MODEL)
+    patch, marker = tokenizer.eos_token_id, tokenizer.eos_token * 4
+
+    def embed_inputs(self, inputs, *, pixel_values):
+        text = self.model.embed_tokens(inputs)
+        image = pixel_values[0][mx.maximum(mx.cumsum(inputs == patch) - 1, 0)].astype(text.dtype)
+        return mx.where((inputs == patch)[:, None], image, text)
+
+    processor = lambda text, images: (text.replace("<image>", marker), [mx.array(image) for image in images])
+    processor.image_token = tokenizer.eos_token
+    monkeypatch.setattr(type(model), "embed_inputs", embed_inputs, raising = False)
+    model._unsloth_supports_images, tokenizer._unsloth_image_processor = True, processor
+    prompt, pixels = "Look: <image> What is shown?", mx.random.normal((4, 576), key = mx.random.key(0)) * 0.05
+    ids = tokenizer.encode(prompt.replace("<image>", marker), add_special_tokens = False)
+    alone = [int(event.token) for event in stream_generate(
+        model, tokenizer, ids, max_tokens = 8, sampler = make_sampler(temp = 0.0),
+        input_embeddings = embed_inputs(model, mx.array(ids), pixel_values = [pixels])) if event.finish_reason != "stop"]
+    batched = generate_batch(model, tokenizer, [GenerationRequest(prompt = "Name a colour:", max_tokens = 8),
+        GenerationRequest(prompt = prompt, image = pixels, max_tokens = 8)], defaults = GenerationDefaults(prefill_step_size = 3))
+    assert batched[1].token_ids == alone and batched[1].prompt_token_count == len(ids)
+
+
 def _residual_equal(actual, expected):
     assert bool(mx.array_equal(actual.view(mx.uint8), expected.view(mx.uint8)))
 
@@ -1888,6 +1916,7 @@ def _first_use_checks():
         "combine": (lambda: I._moe_combine_verified(mx.bfloat16, 2, 64), None),
         "gated_delta": (lambda: I._packed_gated_delta_route(gated_delta_kernel, [])(*delta), "_GATED_DELTA_VERDICTS"),
         "verify": (lambda: I._verify_admitted("key", lambda: rows(2, 4), lambda: rows(2, 4)), "_VERIFY_VERDICTS"),
+        "qwen4": (lambda: I._qwen4_verified("key", lambda: rows(2, 4), lambda: rows(2, 4), "read"), "_QWEN4_PREFILL_VERDICTS"),
         "dense": (dense, "_DENSE_QMM_VERIFIED"),
         "tape": (tape, "_TAPE_VERDICTS"),
     }
@@ -1895,7 +1924,7 @@ def _first_use_checks():
 
 @real_mlx_only
 @metal_only
-@pytest.mark.parametrize("site", ["add_norm", "router", "router_shared", "combine", "gated_delta", "verify", "dense", "tape"])
+@pytest.mark.parametrize("site", ["add_norm", "router", "router_shared", "combine", "gated_delta", "verify", "qwen4", "dense", "tape"])
 def test_a_first_use_mismatch_from_a_failed_command_buffer_raises_instead_of_recording(monkeypatch, site):
     from unsloth_zoo.mlx import inference
 

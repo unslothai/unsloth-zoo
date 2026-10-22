@@ -1640,6 +1640,17 @@ def test_a_text_row_carries_its_own_logits_processors_into_the_batch(monkeypatch
     assert seen[1 - carrying] == [[]]
     assert [_shows(processor, [4, 5, 6]) for processor in seen[carrying][0]] == [7]
 
+def test_only_an_mlx_lm_image_model_s_text_batch_takes_an_image_row(monkeypatch):
+    image_row = GenerationRequest(prompt = "p", image = "a.png")
+    assert _validate_text_requests([image_row], GenerationDefaults(), True) == [image_row]
+    for images, kwargs in ((False, {"prompt": "p", "image": 1}), (True, {"prompt_token_ids": [1], "image": 1}),
+                           (True, {"prompt": "p", "audio": 1})):
+        with pytest.raises(ValueError, match = "media|token ids"):
+            _validate_text_requests([GenerationRequest(**kwargs)], GenerationDefaults(), images)
+    with contextlib.closing(_open_stream(monkeypatch)) as stream, pytest.raises(ValueError, match = "media"):
+        stream.add(image_row)
+
+
 def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
     with pytest.raises(TypeError, match="must be GenerationDefaults"):
         stream_batch(object(), object(), [], defaults = {"stop_strings": ()})
@@ -1695,8 +1706,9 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     from unsloth_zoo.mlx.inference import (exact_batch_invariant_decode, exact_dilated_depthwise_conv,
                                            exact_ple_row_reads, exact_qsa_trim, exact_speculative_verify,
                                            fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                                           fused_moe_router, fused_packed_gated_delta, fused_residual_norm,
-                                           fused_residual_norm_handoff, fused_verify_attention)
+                                           fused_moe_router, fused_packed_gated_delta, fused_qwen4_decode,
+                                           fused_qwen4_prefill, fused_residual_norm, fused_residual_norm_handoff,
+                                           fused_verify_attention)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1708,7 +1720,7 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
                 fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model), \
                 exact_speculative_verify(model), exact_batch_invariant_decode(model), fused_packed_gated_delta(model), \
                 fused_verify_attention(model), exact_ple_row_reads(model), exact_qsa_trim(model), \
-                exact_dilated_depthwise_conv(model):
+                exact_dilated_depthwise_conv(model), fused_qwen4_prefill(model), fused_qwen4_decode(model):
             pass
 
 

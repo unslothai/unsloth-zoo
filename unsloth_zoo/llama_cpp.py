@@ -2569,6 +2569,8 @@ def install_llama_cpp(
                     f"-j{cpu_count} --clean-first --target "\
                     f"{' '.join(llama_cpp_targets)}",
                     cwd = llama_cpp_folder,
+                    # Compiler `... is deprecated` warnings are not failures (unsloth#5832).
+                    ignore_deprecation = True,
                     **kwargs
                 )
                 # Move compiled objects to main folder.

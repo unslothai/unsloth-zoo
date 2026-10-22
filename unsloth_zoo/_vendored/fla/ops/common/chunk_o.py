@@ -28,11 +28,7 @@ from fla.utils import (
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
-# Unsloth: backport of fla PR #1399. Triton<3.8 races at 8 warps on Blackwell: a
-# tl.dot accumulator is read from TMEM by one warp while another warp zero-fills it
-# for the next tl.dot (triton-lang/triton#10590, fla-org/flash-linear-attention#1327).
-# IS_NVIDIA_BLACKWELL is frozen at import from a Blackwell device when any visible
-# device is one (fla_vendor._blackwell_import_device), so mixed hosts drop 8 warps too.
+# Unsloth: fla PR #1399 (issue #1327, triton #10590): Blackwell + Triton < 3.8 dv_local races at 8 warps.
 BLACKWELL_8_WARP_RACE = IS_NVIDIA_BLACKWELL and not TRITON_ABOVE_3_8_0
 CHUNK_BWD_DV_LOCAL_NUM_WARPS = [2, 4] if BLACKWELL_8_WARP_RACE else NUM_WARPS
 
@@ -96,7 +92,6 @@ def _is_hopper_tensor(x):
 @fla_cache_autotune(
     configs=[
         # Unsloth: backported from fla PR #1229. The 8-warp config hits a Blackwell tl.dot race (wrong, nondeterministic o).
-        # Kept off on every Blackwell Triton: fla PR #1399 re-enables it on Triton>=3.8, not yet stress-tested here.
         *([] if IS_NVIDIA_BLACKWELL else [triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3)]),
         triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
         triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),

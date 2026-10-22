@@ -235,6 +235,40 @@ def test_no_grad_forward_without_lora_fails_closed_on_the_rejected_cell(monkeypa
         assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-2
 
 
+@pytest.mark.parametrize("grad", [False, True])
+def test_lora_patched_forward_returns_the_fp16_input_dtype(monkeypatch, grad):
+    # T4 fp16: a bf16 expert output promoted the residual to fp32 and broke the next fp16 Linear.
+    import contextlib
+    monkeypatch.setattr(compat, "_device_capability", lambda device: (12, 0))
+    monkeypatch.setattr(go, "_OGS_NATIVE_REJECT_WARNED", False)
+    monkeypatch.setattr(go.logger, "warning", lambda *args, **kwargs: None)
+    backend = _Recorder(compat.API_OGS_RAGGED)
+    monkeypatch.setattr(go, "_ogs_backend_for", lambda *args, **kwargs: backend)
+    monkeypatch.setattr(go, "_ogs_module_backend", lambda module: backend)
+    monkeypatch.setattr(go, "is_triton_kernels_available", lambda: True)
+    monkeypatch.setattr(go, "_get_lora_wrapper_for_param", lambda module, name: None)
+    monkeypatch.setattr(go, "torch_cuda_device", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(
+        go, "_mxfp4_experts_routing",
+        lambda module, hs, rd, gather, scatter, ri, rw: (hs, rd, gather, scatter, None),
+    )
+    module, x, logits = _problem(seed = 7)
+    experts = _NoGradExperts(module)
+    routing, gather, scatter, top, weights = _routing(logits)
+    x = x.to(torch.float16).requires_grad_(grad)
+    with torch.set_grad_enabled(grad):
+        out = go.forward_mxfp4_gpt_oss_with_lora(experts, x, routing, gather, scatter)
+        residual = x + out
+        assert out.dtype == torch.float16 and residual.dtype == torch.float16
+        torch.nn.Linear(H, H, dtype = torch.float16)(residual)  # the next layer, no autocast
+        if grad:
+            out.float().sum().backward()
+            assert x.grad is not None and x.grad.dtype == torch.float16
+    assert experts.original_calls == 0
+    ref = _reference(module, x.detach().float(), top, weights)
+    assert ((out.detach().float() - ref).norm() / ref.norm()).item() < 2e-2
+
+
 def test_matmul_ogs_available_rejects_the_cell_without_probing(monkeypatch):
     probes = []
     monkeypatch.setattr(compat, "_DEVICE_OK", {})
