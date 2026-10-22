@@ -1654,6 +1654,16 @@ def _probe_assistant_single_content(processor, model = None, modality = "image")
 pass
 
 
+# Audio towers that add a fixed 1500 positions, so features must stay padded to the processor's 30 s.
+_FULL_LENGTH_AUDIO_MODEL_TYPES = frozenset({"audioflamingo3", "musicflamingo"})
+
+
+def _text_only_padding(kwargs):
+    """Move a top-level padding into text_kwargs, so the audio feature extractor keeps its own."""
+    kwargs["text_kwargs"] = {"padding": kwargs.pop("padding")}
+    return kwargs
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -1664,7 +1674,7 @@ class UnslothVisionDataCollator:
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
         "_seen_supervised", "_warned_unsupervised", "audio_call_kwarg",
-        "chat_template_kwargs",
+        "chat_template_kwargs", "_full_length_audio",
     )
 
     def __init__(
@@ -1715,6 +1725,9 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        self._full_length_audio = (
+            getattr(getattr(model, "config", None), "model_type", None) in _FULL_LENGTH_AUDIO_MODEL_TYPES
+        )
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
@@ -1920,6 +1933,8 @@ class UnslothVisionDataCollator:
             proc_kwargs.update(extra)
         if audios:
             proc_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
+            if self._full_length_audio:
+                _text_only_padding(proc_kwargs)
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         batch = self._call_processor(proc_kwargs, has_images)
@@ -2552,6 +2567,8 @@ class UnslothVisionDataCollator:
             prompt_kwargs.update(extra)
         if audios:
             prompt_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
+            if self._full_length_audio:
+                _text_only_padding(prompt_kwargs)
 
         proc_prompts = self._call_processor(dict(prompt_kwargs, text = prompt_texts), pc_has_images)
         # Encode completions (RIGHT pad) text-only
