@@ -19,7 +19,7 @@ TRITON_ABOVE_3_5_1 = package_version.parse(triton.__version__) >= package_versio
 TRITON_ABOVE_3_6_0 = package_version.parse(triton.__version__) >= package_version.parse("3.6.0")
 # Unsloth: added for fla PR #983 (issue #640) backport in ops/common/chunk_o.py.
 TRITON_ABOVE_3_7_1 = package_version.parse(triton.__version__) >= package_version.parse("3.7.1")
-# Unsloth: added for the Blackwell 8-warp chunk_bwd_kernel_dv_local race guard in ops/common/chunk_o.py.
+# Unsloth: for the fla PR #1399 backport in ops/common/chunk_o.py.
 TRITON_ABOVE_3_8_0 = package_version.parse(triton.__version__) >= package_version.parse("3.8.0")
 
 SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters

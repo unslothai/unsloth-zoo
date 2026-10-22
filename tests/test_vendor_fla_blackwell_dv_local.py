@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Blackwell 8-warp race in vendored fla chunk_bwd_kernel_dv_local (fla-org/flash-linear-attention#1327).
-
-Triton < 3.8 miscompiles chunk_bwd_kernel_dv_local at num_warps=8 on Blackwell
-(triton-lang/triton#10590): dv comes back nondeterministic. The vendored autotune
-space must drop 8 warps there and keep it everywhere else.
-"""
+"""Blackwell + Triton < 3.8: chunk_bwd_kernel_dv_local races at 8 warps (fla issue #1327, triton #10590)."""
 
 import os
 
@@ -60,7 +55,6 @@ def test_dv_local_warps_follow_the_race_guard():
     if race:
         assert 8 not in warps
     else:
-        # Off Blackwell (or on Triton >= 3.8) the space is unchanged.
         assert warps == set(chunk_o.NUM_WARPS)
 
 
