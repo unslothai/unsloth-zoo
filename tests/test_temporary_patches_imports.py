@@ -119,6 +119,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.remote_mamba2",
     "unsloth_zoo.temporary_patches.sdpa_gqa",
     "unsloth_zoo.temporary_patches.step3p7_moe",
+    "unsloth_zoo.temporary_patches.t5",
     "unsloth_zoo.temporary_patches.utils",
 ]
 
