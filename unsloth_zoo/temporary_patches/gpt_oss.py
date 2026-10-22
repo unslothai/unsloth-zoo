@@ -2176,7 +2176,8 @@ def _moe_forward_inference_mxfp4_kernel(
     rows = torch.empty(weighted.shape, dtype = torch.float32, device = x.device)
     rows = rows.index_copy_(0, order, weighted.to(torch.float32))
     out = rows.view(x.shape[0], top_k, hidden_size).sum(1)
-    return out.to(weighted.dtype).view(batch_size, -1, hidden_size)
+    # In the activation dtype, as matmul_ogs returns: float32 biases must not promote the residual stream.
+    return out.to(hidden_states.dtype).view(batch_size, -1, hidden_size)
 
 
 def _mxfp4_static_operands(param, experts_module, proj_type):
