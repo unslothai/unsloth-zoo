@@ -27,6 +27,7 @@ from unsloth_zoo.utils import Version, device_guard as _device_guard
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
 from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequantize, mxfp4_kernel_available
+from unsloth_zoo import mxfp4_dequant as _mxfp4_dequant
 
 transformers_version = Version(importlib_version("transformers"))
 
@@ -436,12 +437,18 @@ def patch_convert_moe_packed_tensors():
         if not blocks.is_cuda and torch.cuda.is_available():
             blocks = blocks.cuda()
             scales = scales.cuda()
-        if blocks.is_cuda and blocks.dtype == torch.uint8 and dtype in (torch.bfloat16, torch.float16):
+        # mxfp4_dequantize needs 16-byte (32-value) blocks; any other block size takes the loop below.
+        if blocks.is_cuda and blocks.dtype == torch.uint8 and blocks.shape[-1] == 16 and dtype in (torch.bfloat16, torch.float16):
             return mxfp4_dequantize(blocks, scales, dtype = dtype)
+        assert blocks.shape[:-1] == scales.shape, f"{blocks.shape=} does not match {scales.shape=}"
+        if not _mxfp4_dequant._LDEXP_EXACT and blocks.dtype == torch.uint8:
+            # torch < 2.12 ldexp forms 2^e in the output dtype (fp16 inf, 0 * inf = NaN); decode via fp32.
+            with _device_guard(blocks):
+                return _mxfp4_dequant.mxfp4_dequantize_torch(
+                    blocks, scales, dtype = dtype, max_rows = max(1, rows_per_chunk // blocks.shape[-2]),
+                )
 
         scales = scales.to(torch.int32) - 127
-
-        assert blocks.shape[:-1] == scales.shape, f"{blocks.shape=} does not match {scales.shape=}"
 
         lut = torch.tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
 

@@ -235,6 +235,19 @@ modifications =
       recurrence race. Reproduced on B200 with triton 3.7.1: with cu_seqlens and
       48 or 64 value heads the autotuner picks that config, and o differs from
       the dense path by up to 0.08 and between identical runs.
+    - Backported fla PR #1399 (fla issue #1327, triton-lang/triton#10590) in
+      ops/common/chunk_o.py (+ TRITON_ABOVE_3_8_0 in utils/_compat.py and
+      utils/__init__.py): on Blackwell with Triton < 3.8 the
+      chunk_bwd_kernel_dv_local autotune is limited to 2 / 4 warps
+      (BLACKWELL_8_WARP_RACE), since its 8-warp configs race (TMEM read vs
+      zero-fill with no barrier) and give nondeterministic dv. Reproduced on B200
+      with triton 3.7.1 (T=65536, 48 heads, dense: 2 of 19 repeat calls differ at
+      8 warps / 2 or 3 stages; 2 / 4 warps and triton 3.6.0 / 3.8.0 clean). Triton
+      3.8+ and other GPUs keep the full NUM_WARPS list. The chunk_fwd_kernel_o
+      8-warp drop above stays unconditional (not narrowed to Triton < 3.8 as
+      upstream does) until the #1229 repro is re-run on Triton 3.8. ops/utils/cache.py
+      ignores an FLA_CACHE_MODE disk config whose num_warps the kernel's config
+      list no longer offers, so a cached 8-warp entry cannot bring the race back.
     - Sequence start offsets past 2**31 elements (fixed upstream after 0.5.1 by
       fla PR #1329, which forces int64 program ids everywhere). In
       ops/gated_delta_rule/chunk_fwd.py, ops/kda/{chunk_bwd,chunk_intra,
@@ -274,6 +287,23 @@ modifications =
       fla PR #1330 in ops/cp/chunk_delta_h.py: merge_fwd_bwd_kernel's autotune
       key named BT, which is not a kernel argument; triton main rejects that at
       import, which made the whole vendored tree fail to inject.
+    - Backported fla PR #1388 (with the #1154 key change it completes) in
+      modules/conv/triton/{kernels,ops}.py: NB = cdiv(B*T, 1024) is dropped from
+      the causal_conv1d forward / backward autotune keys, signatures and
+      launches (neither kernel reads it), so every new 1024-token bucket no
+      longer re-tunes and recompiles both kernels.
+    - Modified by Unsloth in modules/l2norm.py and modules/fused_norm_gate.py (not
+      upstream as of fla 9d478fa), the same change as the #1388 conv backport above:
+      NB = cdiv(T, 65536) is dropped from the l2norm_{fwd,bwd}_kernel and
+      layer_norm_gated_{fwd,bwd}_kernel autotune keys, signatures and launches
+      (no kernel reads it; zoo's _ReuseBestCache already reuses one config across
+      buckets), so a new 65536-row bucket no longer recompiles them. The three
+      layer_norm_gated kernels also get do_not_specialize=['T'], as upstream has.
+    - Modified by Unsloth in ops/utils/cumsum.py (inline "Unsloth:" comment, not
+      upstream as of fla 9d478fa): B is dropped from the autotune keys and
+      constexpr arguments of the four chunk_{local,global}_cumsum_{scalar,vector}
+      kernels (none reads it; the grid carries B * H), so padded batches no
+      longer re-tune and recompile per batch size.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
@@ -520,8 +550,10 @@ modifications =
       fused_recurrent_replayssm.py from the commit above with one change, marked
       "Modified by Unsloth": the launch-config lookup imported from
       vllm.model_executor.layers.mamba.ops.replayssm_config is inlined (released
-      vLLM has no "gdn_decode" entry), with the same values as the PR, and the
-      kernel imports triton directly instead of vllm.triton_utils.
+      vLLM has no "gdn_decode" entry), with the same values as the PR plus a
+      T4 (sm75) entry (32, 1, 1, 4) and a per-device cache, a table nk is
+      clamped so BK // nk stays >= 16 for small key dims, and the kernel
+      imports triton directly instead of vllm.triton_utils.
     - The runtime integration (state page, metadata builder, layer dispatch) is
       Unsloth's own code in unsloth_zoo/vllm_gdn_replayssm.py, ported from the
       same PR.

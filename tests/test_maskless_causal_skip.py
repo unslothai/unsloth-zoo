@@ -491,6 +491,24 @@ def test_right_padding_skips_the_mask_when_opted_in(patched, monkeypatch):
         assert not reference[row, 0, :n, n:].any()
 
 
+def test_right_padding_skip_is_on_by_default(patched, monkeypatch):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert patched.create_causal_mask(**kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 1
+
+
+@pytest.mark.parametrize("env", [("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "0"), ("UNSLOTH_SKIP_CAUSAL_MASK", "0")])
+def test_right_padding_kill_switch_keeps_the_mask(patched, monkeypatch, env):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    monkeypatch.setenv(*env)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert isinstance(patched.create_causal_mask(**kwargs), torch.Tensor)
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before
+
+
 @pytest.mark.parametrize("attention_mask", [
     torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]]),
     torch.tensor([[1, 1, 1, 1], [1, 0, 1, 1]]),
@@ -627,11 +645,52 @@ def test_flash_sdpa_check_keeps_the_mask_when_the_probe_fails(monkeypatch):
     monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (9, 0))
     monkeypatch.setattr(misc, "_FLASH_SDPA_ACCEPTS_CACHE", {})
+    monkeypatch.setattr(misc, "_EFFICIENT_SDPA_ACCEPTS_CACHE", {}, raising = False)
     def broken(*args, **kwargs):
         raise RuntimeError("no SDPAParams")
     monkeypatch.setattr(torch.backends.cuda, "SDPAParams", broken)
     embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
     assert misc._flash_sdpa_takes_causal(_config(), embeds) is False
+
+
+@pytest.mark.parametrize("kv_heads", [8, 1], ids = ["mha", "gqa"])
+@pytest.mark.parametrize("efficient", [True, False])
+@pytest.mark.parametrize("efficient_enabled", [True, False])
+def test_mha_rejected_by_flash_runs_maskless_on_the_efficient_kernel(monkeypatch, kv_heads, efficient, efficient_enabled):
+    # sm86 / sm89 / sm120 flash refuses some training shapes. Equal head counts need no enable_gqa,
+    # so mem-efficient SDPA still runs the maskless causal call; GQA would fall to the math kernel.
+    import types
+    from transformers import LlamaConfig
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: efficient_enabled)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (8, 9))
+    monkeypatch.setattr(misc, "_flash_sdpa_accepts", lambda *args: False)
+    asked = []
+    def efficient_accepts(*args):
+        asked.append(args)
+        return efficient
+    monkeypatch.setattr(misc, "_efficient_sdpa_accepts_mha", efficient_accepts, raising = False)
+    config = LlamaConfig(hidden_size = 2048, num_attention_heads = 8, num_key_value_heads = kv_heads, head_dim = 256)
+    config._attn_implementation = "sdpa"
+    embeds = types.SimpleNamespace(dtype = torch.bfloat16, is_cuda = True, device = "cuda:0")
+    got = misc._flash_sdpa_takes_causal(config, embeds)
+    assert got is (kv_heads == 8 and efficient and efficient_enabled)
+    if kv_heads == 1 or not efficient_enabled:
+        assert asked == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "needs an NVIDIA GPU")
+def test_efficient_mha_probe_matches_a_real_maskless_call(monkeypatch):
+    monkeypatch.setattr(misc, "_EFFICIENT_SDPA_ACCEPTS_CACHE", {}, raising = False)
+    device = torch.device("cuda", torch.cuda.current_device())
+    assert misc._efficient_sdpa_accepts_mha(device, torch.bfloat16, 8, 128, 0.0, True) is True
+    q = torch.randn(1, 8, 64, 128, device = device, dtype = torch.bfloat16, requires_grad = True)
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+        out = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal = True)
+        out.float().sum().backward()
+    assert torch.isfinite(q.grad).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason = "needs an NVIDIA GPU")
@@ -696,3 +755,53 @@ def test_flash_probe_without_enable_gqa_argument(monkeypatch):
     assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 8, 128, 0.0, True) is True
     assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 1, 128, 0.0, True) is False
     assert probe.param_counts == [6]
+
+
+class _SplitModel(torch.nn.Module):
+    """Stands in for a decoder whose forward builds the mask; `devices` fakes where its layers live."""
+
+    def __init__(self, devices = None, hf_device_map = None):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(torch.nn.Linear(2, 2) for _ in range(2))
+        self._devices = devices
+        if hf_device_map is not None:
+            self.hf_device_map = hf_device_map
+
+    def parameters(self, recurse = True):
+        if self._devices is None:
+            yield from super().parameters(recurse)
+            return
+        for device in self._devices:
+            yield torch.empty(0, device = device)
+
+    def forward(self, create_causal_mask, kwargs):
+        return create_causal_mask(**kwargs)
+
+
+@pytest.mark.parametrize("model", [
+    lambda: _SplitModel(devices = ["cpu", "meta"]),
+    lambda: _SplitModel(hf_device_map = {"model.embed_tokens": 0, "model.layers.1": 1}),
+], ids = ["layer_devices", "hf_device_map"])
+def test_right_padding_keeps_the_mask_on_a_split_model_by_default(patched, monkeypatch, model):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    model = model()
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert isinstance(model(patched.create_causal_mask, kwargs), torch.Tensor)
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before
+    # The explicit opt-in keeps skipping on split models.
+    monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
+    assert model(patched.create_causal_mask, kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 1
+
+
+@pytest.mark.parametrize("hf_device_map", [None, {"": 0}, {"model.embed_tokens": 0, "lm_head": "cuda:0"}])
+def test_right_padding_skips_on_a_single_device_model(patched, monkeypatch, hf_device_map):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    model = _SplitModel(hf_device_map = hf_device_map)
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert model(patched.create_causal_mask, kwargs) is None
+    assert model(patched.create_causal_mask, kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 2
+    assert misc._MODEL_SPANS_DEVICES[model] is False

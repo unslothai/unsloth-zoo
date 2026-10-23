@@ -21,10 +21,12 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import sys
 import time
 from dataclasses import dataclass, field, replace
 from itertools import combinations
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Literal, Sequence
 
 import mlx.core as mx
@@ -151,10 +153,15 @@ class _Ema:
 class ReplyStats:
     """One reply's acceptance, seeded from what the load has seen so far."""
 
+    # A bare prior weighs as a few samples, so it yields to a reply's first rounds but not to one of them.
+    PRIOR_SAMPLES = 3
+
     def __init__(self, draft: list[_Ema], copy: _Ema, backoff: int, weight: int = 1):
-        self.draft = [_Ema(ema.value, weight) for ema in draft]
+        seed = lambda ema: _Ema(ema.value, min(weight, max(self.PRIOR_SAMPLES, ema.count)))
+        self.draft = [seed(ema) for ema in draft]
         self.draft_seen = [ema.count > 1 for ema in draft]
-        self.copy = _Ema(copy.value, weight)
+        self.copy = seed(copy)
+        self.load_draft, self.load_copy = draft, copy
         self.tokens = 0
         # Per source: the doubling back-off, and the token count to retry an unused source at.
         self.backoff = {"copy": backoff, "draft": backoff}
@@ -166,12 +173,25 @@ class ReplyStats:
             return self.draft[position].value
         return min(self.draft[position].value, self.draft_rate(position - 1))
 
-    def expected(self, row: RowPlan) -> float:
+    def expected(self, row: RowPlan, optimism: float = 0.0) -> float:
+        """Expected emitted tokens; ``optimism`` > 0 takes each rate at that many standard errors above, on the load's samples."""
         expected, reach = 1.0, 1.0
         for position in range(row.length):
-            reach *= self.draft_rate(position) if row.source == "draft" else self.copy.value
+            if row.source == "draft":
+                rate, samples = self.draft_rate(position), self.load_draft[position].count
+            else:
+                rate, samples = self.copy.value, self.load_copy.count
+            reach *= _upper(rate, samples, optimism) if optimism else rate
             expected += reach
         return expected
+
+
+def _upper(rate: float, samples: int, z: float) -> float:
+    # Wilson score bound, which stays below 1 and needs few samples to rule out a rate near 0.
+    samples, z2 = max(samples, 1), z * z
+    centre = rate + z2 / (2 * samples)
+    spread = z * (rate * (1.0 - rate) / samples + z2 / (4 * samples * samples)) ** 0.5
+    return min(1.0, (centre + spread) / (1.0 + z2 / samples))
 
 
 @dataclass
@@ -220,6 +240,7 @@ class DraftController:
         cost_alpha: float = 0.2,
         hysteresis: float = 1.03,
         plain_margin: float = 1.05,
+        optimism: float = 2.0,
         probe_margin: float = 1.15,
         probe_every: int = 64,
         probe_rounds: int = 3,
@@ -244,6 +265,7 @@ class DraftController:
         self.cost_alpha = cost_alpha
         self.hysteresis = hysteresis
         self.plain_margin = plain_margin
+        self.optimism = optimism
         self.probe_margin = probe_margin
         self.probe_every = probe_every
         self.probe_rounds = probe_rounds
@@ -351,10 +373,10 @@ class DraftController:
         drafting = sum(self._row_seconds(row, state) for row, state in zip(plan.rows, rows))
         return self._verify_seconds(bucket, width or plan.width) + self._drafting_paid(bucket, drafting)
 
-    def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
+    def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None, optimism: float = 0.0) -> float:
         if plan.kind == "plain":
             return len(rows) / self._plain_step(_bucket(len(rows)))
-        expected = sum(state.stats.expected(row) for row, state in zip(plan.rows, rows))
+        expected = sum(state.stats.expected(row, optimism) for row, state in zip(plan.rows, rows))
         return expected / self.round_seconds(plan, rows, width)
 
     @staticmethod
@@ -438,7 +460,7 @@ class DraftController:
             # The deepest affordable draft probe: a full-depth one may not fit the credit a reply earns.
             for depth in range(self.max_depth, 1, -1) or [self.max_depth]:
                 probe, sources = self._source_probe(chosen, rows, depth)
-                if sources and self._affordable(probe, chosen, rows):
+                if sources and (self._affordable(probe, chosen, rows) or self._unmeasured(sources)):
                     chosen, self._probing_sources, self._reference = probe, sources, self.score(chosen, rows)
                     break
                 if "draft" not in sources.values():
@@ -481,9 +503,15 @@ class DraftController:
                 self._reference = max(self.score(plan, rows) for plan in candidates)
                 return self._shorten(probe), True
             self._probe_left = 0
-        best = max(candidates, key = lambda plan: self._worth(plan, rows))
+        # Plain decoding samples no acceptance, so it must beat drafting at the rates the load's samples still allow.
+        rounds = [plan for plan in candidates if plan.kind == "round"]
+        doubt = 1.0 if not rounds else (
+            max(self.score(plan, rows) for plan in rounds) / max(self.score(plan, rows, optimism = self.optimism) for plan in rounds)
+        )
+        worth = lambda plan: self._worth(plan, rows) * (doubt if plan.kind == "plain" else 1.0)
+        best = max(candidates, key = worth)
         current = next((p for p in candidates if self._identity(p, bucket) == self._current), None)
-        if current is not None and self._worth(best, rows) < self._worth(current, rows) * self.hysteresis:
+        if current is not None and worth(best) < worth(current) * self.hysteresis:
             best = current
         if self.steps >= self._next_probe:
             self._next_probe = self.steps + self.probe_every
@@ -539,6 +567,10 @@ class DraftController:
     def _affordable(self, probe: RoundPlan, best: RoundPlan, rows: Sequence[RowState], rounds: int = 1) -> bool:
         return self._regret(probe, best, rows) * rounds <= self._credit
 
+    def _unmeasured(self, sources: dict[int, str]) -> bool:
+        # A source the load never measured loses only by its prior, so its first probe waits for no credit.
+        return any((self.copy_acceptance if source == "copy" else self.draft_acceptance[0]).count <= 1 for source in sources.values())
+
     def _account(self, emitted: int, seconds: float, charged: float | None = None) -> None:
         self._credit += self.explore_fraction * seconds
         if self._reference is not None:
@@ -565,7 +597,7 @@ class DraftController:
         """Whether copies now on offer are worth ending a plain window early for."""
         plain_plan = RoundPlan("plain", 1)
         probe, sources = self._source_probe(plain_plan, rows)
-        if "copy" in sources.values() and self._affordable(probe, plain_plan, rows):
+        if "copy" in sources.values() and (self._affordable(probe, plain_plan, rows) or self._unmeasured(sources)):
             return True
         if not any(state.copy_available for state in rows):
             return False
@@ -601,11 +633,13 @@ class DraftController:
         seconds: float,
         draft_seconds: float = 0.0,
         catch_up_seconds: float = 0.0,
+        first_use: bool = False,
     ) -> None:
         """Account a finished round; ``accepted[i]`` counts row ``i``'s accepted drafts.
 
         ``seconds`` is the whole round. A split round times its parts apart; a fused round,
         whose drafting overlaps building its verify, measures how much of the drafting it hid.
+        A ``first_use`` round, which also ran one-off first-use work, updates no cost and leaves its width unmeasured.
         """
         bucket = _bucket(len(rows))
         alpha = self.acceptance_alpha
@@ -634,6 +668,9 @@ class DraftController:
             if row.source in stats.probe_at:
                 stats.probe_at[row.source] = stats.tokens + stats.backoff[row.source]
         self._probing_sources, self._reference = {}, None
+        self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
+        if first_use:
+            return
 
         depths = [row.length for row in plan.rows if row.source == "draft" and row.length]
         catch_up = sum(state.catch_up for row, state in zip(plan.rows, rows) if row.source == "draft")
@@ -650,13 +687,12 @@ class DraftController:
             self._since_split += 1
             drafting = sum(self._draft_seconds(depth) for depth in depths) + catch_up * self._catch_up_seconds()
             if drafting:
-                hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds, 0.0), drafting)
+                hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds + catch_up_seconds, 0.0), drafting)
                 self.hidden_drafting.setdefault(bucket, _Ema()).update(hidden, self.cost_alpha)
             else:
                 verify.update(seconds, self.cost_alpha)
         if depths and self._warmup and self._warmup[0] >= max(depths):
             self._warmup.pop(0)
-        self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
         self._measured_at[self._identity(plan, bucket)] = self.steps
 
 
@@ -838,6 +874,30 @@ def _language_call(family: str):
     return module.LanguageModel.__call__
 
 
+def _rows_trimmed(transaction):
+    """``transaction`` committing a ragged block row by row in qwen4_exp's QSA caches too.
+
+    Their ``prepare``/``finalize`` roll each row's rejected tail out, but mlx-vlm's commit takes that path only for a
+    cache exposing ``keys``, which ``BatchQSAKVCache`` does not, so it trimmed every row to the longest acceptance."""
+    qsa = getattr(sys.modules.get("mlx_vlm.models.qwen4_exp.language"), "BatchQSAKVCache", None)
+    if qsa is None or hasattr(qsa, "keys"):
+        return transaction
+    commit = transaction.commit
+
+    def commit_rows(lengths):
+        shown = [cache for cache in transaction.caches if isinstance(cache, qsa) and "keys" not in vars(cache)]
+        for cache in shown:
+            cache.keys = cache.kv_cache.keys
+        try:
+            return commit(lengths)
+        finally:
+            for cache in shown:
+                del cache.keys
+
+    transaction.commit = commit_rows
+    return transaction
+
+
 def _join(batch: list | None, new: list, size: int) -> list:
     if not size:
         return list(new)
@@ -882,8 +942,14 @@ class SpeculativeEngine:
         # a capture list keeps the forward off the per-row paths that replace cache objects.
         call = type(self.lm).__call__
         self._exact = call is _language_call("qwen3_5")
+        # qwen4_exp decodes on its batch-invariant forward wherever its head allows, and its verify method
+        # runs blocks on that same forward; it returns the last hidden state alone, all an MTP head reads.
+        supports = getattr(self.lm, "_supports_batch_invariant_decode", None)
+        self._invariant = (call is _language_call("qwen4_exp") and callable(supports) and supports()
+                           and callable(getattr(self.lm, "speculative_verify_logits", None))
+                           and getattr(drafter, "features", None) is None)
         # Families whose verify forward was measured to commit ragged acceptance correctly.
-        self._batch_rounds = self._exact or call is _language_call("gemma4")
+        self._batch_rounds = self._exact or self._invariant or call is _language_call("gemma4")
         self._mrope = hasattr(self.lm, "_rope_deltas")
         self._rows: list[_Row] = []
         self.cache: list | None = None
@@ -977,6 +1043,12 @@ class SpeculativeEngine:
         if self._exact:
             out = self.lm(inputs, cache = self.cache, speculative_verify = True, **{"capture_layer_ids": [], **self._kwargs()})
             return out.logits, self._hidden(out), out.gdn_states
+        if self._invariant:
+            if self._mrope:
+                # As a decode step's call would, so the verifier positions each row by its own delta.
+                self.lm._rope_deltas = self._position_kwargs()["rope_deltas"]
+            hidden, _, transaction, logits = self.lm.speculative_verify_logits(inputs, self.cache, lambda logits: logits)
+            return logits, self._hidden(SimpleNamespace(hidden_states = [hidden])), _rows_trimmed(transaction)
         from .inference import verify_block_attention
         with verify_block_attention():
             out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._kwargs())
@@ -1024,6 +1096,8 @@ class SpeculativeEngine:
         self.controller.record_plain(states, steps, end - start, (end - started) / ran if ran > 0 else None)
 
     def _round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]] | None:
+        from .inference import first_use_work
+
         rows, width = self._rows, plan.width
         proposals = [
             row.proposer.propose(row.tokens, spec.length) if spec.source == "copy" else []
@@ -1033,18 +1107,22 @@ class SpeculativeEngine:
         inputs = mx.array(
             [[row.pending, *proposal] + [row.pending] * (width - 1 - len(proposal)) for row, proposal in zip(rows, proposals)]
         )
-        start = time.perf_counter()
+        start, work = time.perf_counter(), first_use_work()
         depth = max((spec.length for spec in plan.rows if spec.source == "draft"), default = 0)
         draft_rows = [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)]
-        drafts, draft_seconds = None, 0.0
+        drafts, draft_seconds, catch_up_seconds = None, 0.0, 0.0
         if depth:
             with mx.stream(self._stream):
-                # Replay is one head forward, as costly for one pair as for many, so it counts as drafting.
+                # A round's few pairs replay as drafting; a plain window's backlog is replayed and timed apart.
+                if max(len(getattr(row, "tokens", ())) for row in draft_rows) > self.controller.max_depth + 1:
+                    self.drafter.catch_up(self.draft_cache, draft_rows)
+                    mx.synchronize(self._stream)
+                    catch_up_seconds = time.perf_counter() - start
                 self.drafter.catch_up(self.draft_cache, draft_rows)
                 drafts = self.drafter.draft(self.draft_cache, draft_rows, depth, self.cache).astype(inputs.dtype)
                 if plan.split:
                     mx.eval(drafts)
-                    draft_seconds = time.perf_counter() - start
+                    draft_seconds = time.perf_counter() - start - catch_up_seconds
                 else:
                     # The head drafts on the GPU while the host builds the verify graph.
                     mx.async_eval(drafts)
@@ -1117,7 +1195,8 @@ class SpeculativeEngine:
                 self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
             emitted.append(taken)
         self.controller.record_round(
-            plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds
+            plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds,
+            catch_up_seconds = catch_up_seconds, first_use = first_use_work() != work,
         )
         return emitted
 
@@ -1434,6 +1513,7 @@ class MTPDrafter:
                 row.last = last[i : i + 1]
                 row.position += length
                 row.tokens, row.hidden = [], []
+        mx.async_eval(last, *(entry.state for entry in cache))
         return sum(lengths)
 
     def probe(self, hidden: mx.array) -> list:

@@ -232,53 +232,246 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
         need_hidden, need_weight, need_bias = ctx.needs_input_grad[:3]
         if ctx.sliced and need_weight:
             return _sliced_backward(ctx, hidden, weight, bias, labels, saved_lse, grad_logps)
-        scale_multiply, scale_divide, softcapping = ctx.transforms
-        scale = 1.0
-        if scale_multiply != 0.0:
-            scale *= scale_multiply
-        if scale_divide != 0.0:
-            scale /= scale_divide
-        n_rows = hidden.shape[0]
-        grad_hidden = torch.zeros_like(hidden) if need_hidden else None
-        # float32 accumulators: summing per-chunk head gradients in bf16 loses bits every chunk.
-        acc_dtype = torch.promote_types(weight.dtype, torch.float32)
-        grad_weight = torch.zeros(weight.shape, dtype = acc_dtype, device = weight.device) if need_weight else None
-        grad_bias = (
-            torch.zeros(bias.shape, dtype = acc_dtype, device = bias.device)
-            if (need_bias and bias is not None) else None
+        return _chunked_backward(ctx, hidden, weight, bias, labels, grad_logps)
+
+
+def _chunked_backward(ctx, hidden, weight, bias, labels, grad_logps):
+    need_hidden, need_weight, need_bias = ctx.needs_input_grad[:3]
+    scale_multiply, scale_divide, softcapping = ctx.transforms
+    scale = 1.0
+    if scale_multiply != 0.0:
+        scale *= scale_multiply
+    if scale_divide != 0.0:
+        scale /= scale_divide
+    n_rows = hidden.shape[0]
+    grad_hidden = torch.zeros_like(hidden) if need_hidden else None
+    # float32 accumulators: summing per-chunk head gradients in bf16 loses bits every chunk.
+    acc_dtype = torch.promote_types(weight.dtype, torch.float32)
+    grad_weight = torch.zeros(weight.shape, dtype = acc_dtype, device = weight.device) if need_weight else None
+    grad_bias = (
+        torch.zeros(bias.shape, dtype = acc_dtype, device = bias.device)
+        if (need_bias and bias is not None) else None
+    )
+    if grad_logps is None:
+        grad_logps = torch.zeros(n_rows, dtype = acc_dtype, device = hidden.device)
+    with torch.autocast(device_type = hidden.device.type, enabled = False):
+        for start in range(0, n_rows, ctx.rows):
+            end = min(start + ctx.rows, n_rows)
+            chunk_hidden = hidden[start:end].to(device = weight.device, dtype = weight.dtype)
+            logits = _chunk_logits(chunk_hidden, weight, bias, ctx.transforms)
+            grad_logits = torch.softmax(logits, dim = -1)
+            grad_logits.neg_()
+            target = labels[start:end].to(logits.device).unsqueeze(-1)
+            grad_logits.scatter_add_(-1, target, torch.ones_like(target, dtype = grad_logits.dtype))
+            grad_logits.mul_(grad_logps[start:end].to(grad_logits).unsqueeze(-1))
+            if softcapping != 0.0:
+                grad_logits.mul_(1.0 - (logits / softcapping).square())
+            del logits
+            if scale != 1.0:
+                grad_logits.mul_(scale)
+            if need_bias and bias is not None:
+                grad_bias += grad_logits.sum(0)
+            grad_logits = grad_logits.to(weight.dtype)
+            if need_hidden:
+                # An fp16 product overflows a row sum a bf16 / fp32 hidden state can hold.
+                grad_chunk = (
+                    _mm_float32(grad_logits, weight)
+                    if weight.dtype == torch.float16 and hidden.dtype != torch.float16
+                    else grad_logits @ weight
+                )
+                grad_hidden[start:end] = grad_chunk.to(device = hidden.device, dtype = hidden.dtype)
+                del grad_chunk
+            if need_weight:
+                # Opposite signed row chunks overflow an fp16 product before they cancel here.
+                grad_weight.add_(_mm_float32(grad_logits.t(), chunk_hidden) if weight.dtype in _HALF_DTYPES
+                                 else (grad_logits.t() @ chunk_hidden).to(acc_dtype))
+            del grad_logits
+    if grad_weight is not None:
+        grad_weight = grad_weight.to(weight.dtype)
+    if grad_bias is not None:
+        grad_bias = grad_bias.to(bias.dtype)
+    return grad_hidden, grad_weight, grad_bias, None, None, None, None, None
+
+
+class _BackwardContext:
+    # The fields of an autograd ctx that _sliced_backward and the chunk loops read.
+    __slots__ = ("needs_input_grad", "rows", "transforms", "sliced")
+
+    def __init__(self, needs_input_grad, rows, transforms, sliced):
+        self.needs_input_grad = needs_input_grad
+        self.rows = rows
+        self.transforms = transforms
+        self.sliced = sliced
+
+
+def _compact_forward(hidden, weight, bias, labels, mask, chunk_size, transforms,
+                     want_mean, want_lssp, sliced_ok, need_hidden):
+    # Eager body of the custom op: the boolean compaction has a data dependent row count, so it
+    # and the Python chunk loop stay behind the op boundary, and every output is sized by
+    # hidden's row count, which torch.compile can treat as an ordinary (dynamic) shape.
+    n_all = hidden.shape[0]
+    dtype = torch.promote_types(weight.dtype, torch.float32)
+    selected_hidden = hidden[mask]
+    selected_labels = labels[mask]
+    n_rows = selected_hidden.shape[0]
+    rows = _rows_per_chunk(n_rows, weight.shape[0], None if chunk_size <= 0 else chunk_size)
+    sliced = sliced_ok
+    if sliced and need_hidden:
+        # Sliced backward holds a float32 rows x hidden gradient plus its cast (6 N H bytes for a
+        # half hidden) and a head dtype head gradient (2 V H); the per chunk loop holds float32
+        # head sized copies (10 V H) and a hidden dtype gradient. Long contexts favour the latter.
+        vocab_size = weight.shape[0]
+        hidden_bytes = hidden.element_size()
+        cast_bytes = hidden_bytes if hidden.dtype != torch.float32 else 0
+        sliced = 2 * vocab_size + n_rows * (4 + cast_bytes) <= 10 * vocab_size + n_rows * hidden_bytes
+    device = hidden.device
+    logps = torch.empty(n_rows, dtype = dtype, device = device)
+    mean_logits = torch.empty(n_rows if want_mean else 0, dtype = dtype, device = device)
+    log_sum_sq_probs = torch.empty(n_rows if want_lssp else 0, dtype = dtype, device = device)
+    saved_lse = torch.empty(n_rows if sliced else 0, dtype = dtype, device = device)
+    with torch.autocast(device_type = device.type, enabled = False):
+        for start in range(0, n_rows, rows):
+            end = min(start + rows, n_rows)
+            logits = _chunk_logits(selected_hidden[start:end], weight, bias, transforms)
+            lse = logits.logsumexp(-1)
+            if sliced:
+                saved_lse[start:end] = lse.to(device)
+            target = selected_labels[start:end].to(logits.device).unsqueeze(-1)
+            logps[start:end] = (logits.gather(-1, target).squeeze(-1) - lse).to(device)
+            if want_mean:
+                mean_logits[start:end] = logits.mean(-1).to(device)
+            if want_lssp:
+                log_sum_sq_probs[start:end] = ((2.0 * logits).logsumexp(-1) - 2.0 * lse).to(device)
+            del logits
+
+    def expand(values):
+        # Unselected rows are 0, as the masked_scatter of the compacted outputs gave before.
+        return torch.zeros(n_all, dtype = dtype, device = device).masked_scatter_(mask, values)
+
+    if sliced:
+        saved_lse = expand(saved_lse)
+    elif sliced_ok:
+        # The selected count switched to the per chunk backward, which never reads the lse, but
+        # the fake kernel can only see sliced_ok, so the metadata keeps its n_all length.
+        saved_lse = torch.zeros(n_all, dtype = dtype, device = device)
+    return (
+        expand(logps),
+        expand(mean_logits) if want_mean else mean_logits,
+        expand(log_sum_sq_probs) if want_lssp else log_sum_sq_probs,
+        saved_lse,
+        torch.tensor([rows, int(sliced)], dtype = torch.int64),
+    )
+
+
+def _compact_backward(grad_logps, hidden, weight, bias, labels, mask, saved_lse, meta,
+                      transforms, need_hidden, need_weight, need_bias):
+    rows, sliced = (int(x) for x in meta.tolist())
+    ctx = _BackwardContext(
+        (need_hidden, need_weight, need_bias, False, False, False, False, False),
+        rows, transforms, bool(sliced),
+    )
+    selected_hidden = hidden[mask]
+    selected_labels = labels[mask]
+    selected_grad = grad_logps[mask]
+    if ctx.sliced and need_weight:
+        grads = _sliced_backward(
+            ctx, selected_hidden, weight, bias, selected_labels, saved_lse[mask], selected_grad,
         )
+    else:
+        grads = _chunked_backward(ctx, selected_hidden, weight, bias, selected_labels, selected_grad)
+    grad_hidden, grad_weight, grad_bias = grads[:3]
+    if grad_hidden is not None:
+        grad_hidden = torch.zeros_like(hidden).index_put_((mask,), grad_hidden)
+    return grad_hidden, grad_weight, grad_bias
+
+
+_OP_NAMESPACE = "unsloth_zoo_fused_preference"
+_HAS_CUSTOM_OP = hasattr(torch, "library") and hasattr(torch.library, "custom_op") \
+    and hasattr(torch.library, "register_fake")
+
+if _HAS_CUSTOM_OP:
+    @torch.library.custom_op(f"{_OP_NAMESPACE}::token_logps", mutates_args = ())
+    def _token_logps_op(
+        hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
+        labels: torch.Tensor, mask: torch.Tensor, chunk_size: int,
+        scale_multiply: float, scale_divide: float, softcapping: float,
+        want_mean: bool, want_lssp: bool, sliced_ok: bool, need_hidden: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _compact_forward(
+            hidden, weight, bias, labels, mask, chunk_size,
+            (scale_multiply, scale_divide, softcapping), want_mean, want_lssp, sliced_ok, need_hidden,
+        )
+
+    @torch.library.register_fake(f"{_OP_NAMESPACE}::token_logps")
+    def _token_logps_fake(hidden, weight, bias, labels, mask, chunk_size, scale_multiply,
+                          scale_divide, softcapping, want_mean, want_lssp, sliced_ok, need_hidden):
+        n_all = hidden.shape[0]
+        dtype = torch.promote_types(weight.dtype, torch.float32)
+        # Whether the sliced backward runs is decided from the selected count, so its lse is
+        # sized for every row whenever it might be needed.
+        return (
+            hidden.new_empty(n_all, dtype = dtype),
+            hidden.new_empty(n_all if want_mean else 0, dtype = dtype),
+            hidden.new_empty(n_all if want_lssp else 0, dtype = dtype),
+            hidden.new_empty(n_all if sliced_ok else 0, dtype = dtype),
+            torch.empty(2, dtype = torch.int64, device = "cpu"),
+        )
+
+    @torch.library.custom_op(f"{_OP_NAMESPACE}::token_logps_backward", mutates_args = ())
+    def _token_logps_backward_op(
+        grad_logps: torch.Tensor, hidden: torch.Tensor, weight: torch.Tensor,
+        bias: Optional[torch.Tensor], labels: torch.Tensor, mask: torch.Tensor,
+        saved_lse: torch.Tensor, meta: torch.Tensor,
+        scale_multiply: float, scale_divide: float, softcapping: float,
+        need_hidden: bool, need_weight: bool, need_bias: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        grad_hidden, grad_weight, grad_bias = _compact_backward(
+            grad_logps, hidden, weight, bias, labels, mask, saved_lse, meta,
+            (scale_multiply, scale_divide, softcapping), need_hidden, need_weight, need_bias,
+        )
+        # A custom op returns tensors, never None: unrequested gradients come back empty.
+        return (
+            hidden.new_empty(0) if grad_hidden is None else grad_hidden,
+            weight.new_empty(0) if grad_weight is None else grad_weight,
+            weight.new_empty(0) if grad_bias is None else grad_bias,
+        )
+
+    @torch.library.register_fake(f"{_OP_NAMESPACE}::token_logps_backward")
+    def _token_logps_backward_fake(grad_logps, hidden, weight, bias, labels, mask, saved_lse, meta,
+                                   scale_multiply, scale_divide, softcapping,
+                                   need_hidden, need_weight, need_bias):
+        return (
+            torch.empty_like(hidden) if need_hidden else hidden.new_empty(0),
+            torch.empty_like(weight) if need_weight else weight.new_empty(0),
+            torch.empty_like(bias) if (need_bias and bias is not None) else weight.new_empty(0),
+        )
+
+    def _token_logps_setup_context(ctx, inputs, output):
+        hidden, weight, bias, labels, mask, _, scale_multiply, scale_divide, softcapping = inputs[:9]
+        ctx.save_for_backward(hidden, weight, bias, labels, mask, output[3], output[4])
+        ctx.transforms = (scale_multiply, scale_divide, softcapping)
+        ctx.mark_non_differentiable(output[1], output[2], output[3], output[4])
+
+    def _token_logps_autograd(ctx, grad_logps, grad_mean, grad_lssp, grad_lse, grad_meta):
+        hidden, weight, bias, labels, mask, saved_lse, meta = ctx.saved_tensors
+        need_hidden, need_weight, need_bias = ctx.needs_input_grad[:3]
+        need_bias = need_bias and bias is not None
         if grad_logps is None:
-            grad_logps = torch.zeros(n_rows, dtype = acc_dtype, device = hidden.device)
-        with torch.autocast(device_type = hidden.device.type, enabled = False):
-            for start in range(0, n_rows, ctx.rows):
-                end = min(start + ctx.rows, n_rows)
-                chunk_hidden = hidden[start:end].to(device = weight.device, dtype = weight.dtype)
-                logits = _chunk_logits(chunk_hidden, weight, bias, ctx.transforms)
-                grad_logits = torch.softmax(logits, dim = -1)
-                grad_logits.neg_()
-                target = labels[start:end].to(logits.device).unsqueeze(-1)
-                grad_logits.scatter_add_(-1, target, torch.ones_like(target, dtype = grad_logits.dtype))
-                grad_logits.mul_(grad_logps[start:end].to(grad_logits).unsqueeze(-1))
-                if softcapping != 0.0:
-                    grad_logits.mul_(1.0 - (logits / softcapping).square())
-                del logits
-                if scale != 1.0:
-                    grad_logits.mul_(scale)
-                if need_bias and bias is not None:
-                    grad_bias += grad_logits.sum(0)
-                grad_logits = grad_logits.to(weight.dtype)
-                if need_hidden:
-                    grad_hidden[start:end] = (grad_logits @ weight).to(device = hidden.device, dtype = hidden.dtype)
-                if need_weight:
-                    # Opposite signed row chunks overflow an fp16 product before they cancel here.
-                    grad_weight.add_(_mm_float32(grad_logits.t(), chunk_hidden) if weight.dtype in _HALF_DTYPES
-                                     else (grad_logits.t() @ chunk_hidden).to(acc_dtype))
-                del grad_logits
-        if grad_weight is not None:
-            grad_weight = grad_weight.to(weight.dtype)
-        if grad_bias is not None:
-            grad_bias = grad_bias.to(bias.dtype)
-        return grad_hidden, grad_weight, grad_bias, None, None, None, None, None
+            grad_logps = torch.zeros(hidden.shape[0], dtype = saved_lse.dtype, device = hidden.device)
+        grad_hidden, grad_weight, grad_bias = _token_logps_backward_op(
+            grad_logps, hidden, weight, bias, labels, mask, saved_lse, meta,
+            *ctx.transforms, need_hidden, need_weight, need_bias,
+        )
+        return (
+            grad_hidden if need_hidden else None,
+            grad_weight if need_weight else None,
+            grad_bias if need_bias else None,
+        ) + (None,) * 10
+
+    torch.library.register_autograd(
+        f"{_OP_NAMESPACE}::token_logps", _token_logps_autograd,
+        setup_context = _token_logps_setup_context,
+    )
 
 
 def fused_linear_token_logps(
@@ -300,7 +493,42 @@ def fused_linear_token_logps(
     positions are projected; the rest are 0 in every output (float32, float64 for a float64 head).
     Optional no-grad outputs: ``mean_logits`` (vocab mean of the transformed logits) and
     ``log_sum_sq_probs`` (``log sum_v p_v^2``).
+
+    The selection and chunk loop run inside one custom op, so ``torch.compile`` (``fullgraph``,
+    ``dynamic``) sees a single node whose outputs are sized by ``mask``'s shape, not its count.
     """
+    if not _HAS_CUSTOM_OP:
+        return _fused_linear_token_logps_function(
+            hidden_states, lm_head_weight, lm_head_bias, labels, mask, logit_scale_multiply,
+            logit_scale_divide, logit_softcapping, chunk_size, return_mean_logits, return_log_sum_sq_probs,
+        )
+    shape = mask.shape
+    hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    flat_mask = mask.to(device = hidden_states.device, dtype = torch.bool).reshape(-1)
+    flat_labels = labels.to(hidden_states.device).reshape(-1)
+    grad_on = torch.is_grad_enabled()
+    # A trainable half precision head may run the vocab sliced backward, which needs each row's lse.
+    sliced_ok = grad_on and lm_head_weight.requires_grad and lm_head_weight.dtype in _HALF_DTYPES
+    need_hidden = grad_on and hidden.requires_grad
+    logps, mean_logits, log_sum_sq_probs, _, _ = _token_logps_op(
+        hidden, lm_head_weight, lm_head_bias, flat_labels, flat_mask,
+        int(chunk_size) if (chunk_size is not None and chunk_size > 0) else 0,
+        float(logit_scale_multiply), float(logit_scale_divide), float(logit_softcapping),
+        bool(return_mean_logits), bool(return_log_sum_sq_probs), bool(sliced_ok), bool(need_hidden),
+    )
+    output = {"per_token_logps": logps.reshape(shape)}
+    if return_mean_logits:
+        output["mean_logits"] = mean_logits.reshape(shape)
+    if return_log_sum_sq_probs:
+        output["log_sum_sq_probs"] = log_sum_sq_probs.reshape(shape)
+    return output
+
+
+def _fused_linear_token_logps_function(
+    hidden_states, lm_head_weight, lm_head_bias, labels, mask, logit_scale_multiply,
+    logit_scale_divide, logit_softcapping, chunk_size, return_mean_logits, return_log_sum_sq_probs,
+):
+    # torch without torch.library.custom_op: the autograd.Function path (eager only).
     mask = mask.to(device = hidden_states.device, dtype = torch.bool)
     labels = labels.to(hidden_states.device)
     if _use_fused_linear(lm_head_weight):
@@ -337,6 +565,7 @@ def fused_linear_token_logps(
     if return_log_sum_sq_probs:
         output["log_sum_sq_probs"] = zeros.masked_scatter(mask, log_sum_sq_probs)
     return output
+
 
 
 @torch.no_grad()

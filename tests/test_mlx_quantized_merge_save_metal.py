@@ -191,16 +191,24 @@ def test_push_to_hub_merged_does_not_quantize():
     )
 
 
+# Ternary Bonsai 2 packs, from mlx-vlm and (0.32+) mlx-lm.
+_HADAMARD_PACKS = pytest.mark.parametrize("pack_module", [
+    "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35", "mlx_lm.models.prism_hadamard_qwen35",
+], ids=["mlx_vlm", "mlx_lm"])
+
+
 @pytest.mark.parametrize("config_on", ["_config", "config"])
-def test_merged_16bit_unpacks_hadamard_layers_to_the_dense_layers_they_compute(tmp_path, config_on):
-    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+@_HADAMARD_PACKS
+def test_merged_16bit_unpacks_hadamard_layers_to_the_dense_layers_they_compute(tmp_path, config_on, pack_module):
+    pack = pytest.importorskip(pack_module)
+    rotate = getattr(pack, "hadamard_transform", None) or pack.hadamard_rotate
     from unsloth_zoo.mlx.utils import LoRAHadamardLinear, save_merged_model
     mx.random.seed(5)
 
     def packed(cls, rows):
         layer = cls(1024, rows, 512)
         layer.signs = mx.where(mx.random.uniform(shape=(1024,)) < 0.5, -1.0, 1.0)
-        rotated = pack.hadamard_transform(mx.random.normal((rows, 1024)) * 0.05, 512, layer.signs)
+        rotated = rotate(mx.random.normal((rows, 1024)) * 0.05, 512, layer.signs)
         layer.weight, scales, biases = mx.quantize(rotated, group_size=128, bits=2)
         layer.scales, layer.biases = scales.astype(mx.float16), biases.astype(mx.float16)
         return layer

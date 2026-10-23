@@ -49,55 +49,69 @@ def _log_moe_fp8_backend_once(experts_module, message: str):
     _log_info(message)
 
 
-def _check_torch_scaled_grouped_mm_supported():
-    global _TORCH_SCALED_GROUPED_MM_SUPPORTED
+def _probe_torch_scaled_grouped_mm(device_index: int) -> bool:
+    try:
+        with torch.cuda.device(device_index):
+            device = torch.device("cuda", device_index)
+            x = torch.randn((16, 16), device=device, dtype=torch.bfloat16)
+            w_hp = torch.randn((1, 16, 16), device=device, dtype=torch.bfloat16)
+            x_fp8, x_scale = _manual_fp8_rowwise_quantize(x)
+            w_fp8, w_scale = _manual_fp8_rowwise_quantize(w_hp.view(-1, w_hp.shape[-1]))
+            w_fp8 = w_fp8.view_as(w_hp)
+            w_fp8 = _make_grouped_mm_rhs_column_major(w_fp8)
+            w_scale = w_scale.view(w_hp.shape[0], w_hp.shape[1])
+            offs = torch.tensor([16], device=device, dtype=torch.int32)
+            torch._scaled_grouped_mm(
+                x_fp8.contiguous(),
+                w_fp8,
+                x_scale.contiguous(),
+                w_scale.contiguous(),
+                offs=offs,
+                out_dtype=torch.bfloat16,
+                use_fast_accum=True,
+            )
+            torch.cuda.synchronize(device)
+        return True
+    except Exception:
+        return False
+
+
+# Per device index: a multi-GPU device_map keeps current_device() at cuda:0 while operands live elsewhere.
+_TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE = {}
+
+
+def _check_torch_scaled_grouped_mm_supported(device=None):
+    # Non-None module value = forced answer.
     if _TORCH_SCALED_GROUPED_MM_SUPPORTED is not None:
         return _TORCH_SCALED_GROUPED_MM_SUPPORTED
 
     if not _TORCH_SCALED_GROUPED_MM_AVAILABLE:
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
     if not torch.cuda.is_available():
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
+    if device is not None:
+        device = torch.device(device)
+        if device.type != "cuda":
+            return False
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+    else:
+        device_index = torch.cuda.current_device()
 
-    # The symbol can exist on unsupported GPUs, and the light probe can still
-    # pass on SM100 while real MoE kernels later emit incompatible MMA
-    # instructions and poison the CUDA context asynchronously. Restrict the
-    # FP8 scaled_grouped_mm path to Hopper (SM 9.x) only for now.
-    major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    supported = _TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE.get(device_index)
+    if supported is not None:
+        return supported
+
+    # Hopper only: on SM100 the probe passes but real MoE kernels emit bad MMA and poison the CUDA context.
+    major, _minor = torch.cuda.get_device_capability(device_index)
     if major != 9:
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
-        return False
+        supported = False
     # Opt-in until validated end to end on Hopper (the probe never passed before the rhs layout fix).
-    if os.environ.get("UNSLOTH_FP8_SCALED_GROUPED_MM", "0") != "1":
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
-        return False
-
-    try:
-        device = torch.cuda.current_device()
-        x = torch.randn((16, 16), device=device, dtype=torch.bfloat16)
-        w_hp = torch.randn((1, 16, 16), device=device, dtype=torch.bfloat16)
-        x_fp8, x_scale = _manual_fp8_rowwise_quantize(x)
-        w_fp8, w_scale = _manual_fp8_rowwise_quantize(w_hp.view(-1, w_hp.shape[-1]))
-        w_fp8 = w_fp8.view_as(w_hp)
-        w_fp8 = _make_grouped_mm_rhs_column_major(w_fp8)
-        w_scale = w_scale.view(w_hp.shape[0], w_hp.shape[1])
-        offs = torch.tensor([16], device=device, dtype=torch.int32)
-        torch._scaled_grouped_mm(
-            x_fp8.contiguous(),
-            w_fp8,
-            x_scale.contiguous(),
-            w_scale.contiguous(),
-            offs=offs,
-            out_dtype=torch.bfloat16,
-            use_fast_accum=True,
-        )
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = True
-        torch.cuda.synchronize(device)
-    except Exception:
-        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
-    return _TORCH_SCALED_GROUPED_MM_SUPPORTED
+    elif os.environ.get("UNSLOTH_FP8_SCALED_GROUPED_MM", "0") != "1":
+        supported = False
+    else:
+        supported = _probe_torch_scaled_grouped_mm(device_index)
+    _TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE[device_index] = supported
+    return supported
 
 
 def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
@@ -659,7 +673,7 @@ def _expand_grouped_bias(bias, num_tokens_per_expert):
 
 
 def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights):
-    if not _check_torch_scaled_grouped_mm_supported():
+    if not _check_torch_scaled_grouped_mm_supported(hidden_states.device):
         return None
     # No backward for _scaled_grouped_mm; training (incl. reentrant GC's no_grad forward) must match the dequant recompute.
     if torch.is_grad_enabled() or self.training:
@@ -676,13 +690,9 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
 
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.view(-1, hidden_dim)
-    flat_top_k = top_k_index.view(-1)
-    from .moe_utils import count_tokens_per_expert
-    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
-    sorted_indices = torch.argsort(flat_top_k, stable=True)
-    token_indices = sorted_indices // top_k_index.shape[-1]
-    permuted_input = hidden_states[token_indices]
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    from .moe_utils import gather_routed_rows, moe_routing_sort
+    num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
+    permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
     from .moe_utils import (
         _should_use_separated_lora,
         combine_permuted_moe_outputs,
@@ -1045,7 +1055,7 @@ def _refuse_fp4_with_an_unapplied_gate(module, gate_up_weight):
 @torch.compiler.disable
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
-        select_moe_backend,
+        select_moe_backend_without_sonic,
         forward_native_grouped_mm,
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
@@ -1057,10 +1067,10 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     if not getattr(self, "_unsloth_own_apply_gate", False) and _fp8_experts_own_gate(self):
         self._unsloth_own_apply_gate = True
 
-    backend = select_moe_backend()
+    backend = select_moe_backend_without_sonic(hidden_states.device)
 
     # 1. _scaled_grouped_mm (fast FP8 path on Hopper/Blackwell)
-    if backend == "grouped_mm" and _check_torch_scaled_grouped_mm_supported():
+    if backend == "grouped_mm" and _check_torch_scaled_grouped_mm_supported(hidden_states.device):
         scaled_grouped_mm_output = _forward_scaled_grouped_mm_fp8(
             self,
             hidden_states,

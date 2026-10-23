@@ -21,6 +21,8 @@ __all__ = [
     "unsloth_count_aware_cross_entropy",
     "unsloth_loss_count_kwargs",
     "unsloth_fsdp_unshard",
+    "unsloth_zero3_partitioned",
+    "unsloth_zero3_gathered",
 ]
 
 import torch
@@ -37,6 +39,8 @@ from unsloth_zoo.device_type import DEVICE_TYPE
 from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
         
 
+# Not F.linear: ZeRO-3 patches it process wide, giving a zero lm_head grad under compile + grad_and_value.
+_aten_linear = torch._C._nn.linear
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
 N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
 # Opt-in: accumulate a trainable lm_head weight gradient across chunks in float32 (one
@@ -101,6 +105,34 @@ def unsloth_fsdp_unshard(module):
             _fsdp_unshard(submodule)
 pass
 
+def unsloth_zero3_partitioned(tensor):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """True for a DeepSpeed ZeRO-3 parameter that may be a released placeholder outside its module's forward."""
+    if tensor is None or not hasattr(tensor, "ds_id") or not hasattr(tensor, "ds_status"):
+        return False
+    if not getattr(tensor, "ds_persist", False):
+        return True
+    # Persistent params can still be released (cache partitioning).
+    status = getattr(tensor.ds_status, "name", tensor.ds_status)
+    return status != "AVAILABLE"
+pass
+
+def unsloth_zero3_gathered(tensor):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Detached gathered copy of a ZeRO-3 param (collective: all ranks call it); no grad, so trainable heads are refused."""
+    if not unsloth_zero3_partitioned(tensor):
+        return tensor
+    if tensor.requires_grad and torch.is_grad_enabled():
+        raise NotImplementedError(
+            "Unsloth: the output head (lm_head) is trainable under DeepSpeed ZeRO-3, and the GRPO "
+            "scoring head reads it outside the model forward, so its gradient cannot reach ZeRO-3. "
+            "Freeze lm_head (do not list it in modules_to_save), or use ZeRO-2 / FSDP2."
+        )
+    import deepspeed
+    with deepspeed.zero.GatheredParameters([tensor], modifier_rank = None):
+        return tensor.data.detach().clone()
+pass
+
 def apply_autograd_function(autograd, mapping):
     parameters, defaults = _get_mapping(autograd)
     return getattr(autograd, "apply")(*(
@@ -143,7 +175,7 @@ def compute_fused_ce_loss(
         labels = _labels
     pass
 
-    logits = torch.nn.functional.linear(
+    logits = _aten_linear(
         hidden_states.to(dtype = lm_head_weight.dtype, device = device),
         lm_head_weight,
         lm_head_bias,
@@ -796,7 +828,12 @@ def unsloth_fused_ce_loss(
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     """
     scaler = trainer.accelerator.scaler if trainer is not None else None
-    # Get mixed precision scaling if seen (read lazily: get_scale() syncs the host)
+    # Get mixed precision scaling if seen (read lazily: get_scale() syncs the host). The scale only
+    # multiplies the gradients saved in the forward (the returned loss is unscaled), so no-grad scoring
+    # skips GradScaler: torch.compile cannot trace get_scale() (fullgraph eval would fail).
+    if not torch.is_grad_enabled():
+        scaler = None
+        if hasattr(scaling, "get_scale"): scaling = None
     scaling = scaler if scaler is not None else scaling
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)

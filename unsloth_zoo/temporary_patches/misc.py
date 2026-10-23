@@ -49,6 +49,8 @@ from .utils import (
 from textwrap import dedent
 import re
 import os
+import sys
+import weakref
 
 def patch_ministral3_config_mapping():
     # Ministral-3 VL models set text_config.model_type="ministral3", which is
@@ -605,8 +607,7 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 # Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
 CAUSAL_MASK_SKIP_STATS = {"skipped": 0, "right_padded": 0}
 _SKIP_CAUSAL_MASK_ENV = "UNSLOTH_SKIP_CAUSAL_MASK"
-# Opt-in: right-padded rows also run `is_causal` instead of a [bsz, 1, q, q] mask. Real tokens never
-# see the pad tail under causal attention, so only the outputs at pad positions change.
+# Right-padded rows also skip the mask: causal attention hides the pad tail, only pad outputs change.
 _SKIP_RIGHT_PADDING_MASK_ENV = "UNSLOTH_SKIP_RIGHT_PADDING_MASK"
 # Any other non-None argument (or/and_mask_function, encoder_hidden_states, ...) keeps the mask.
 _PLAIN_CAUSAL_MASK_ARGUMENTS = frozenset((
@@ -719,6 +720,30 @@ def _flash_sdpa_accepts(device, dtype, num_heads, num_kv_heads, head_dim, dropou
     return accepts
 
 
+_EFFICIENT_SDPA_ACCEPTS_CACHE = {}
+
+
+def _efficient_sdpa_accepts_mha(device, dtype, num_heads, head_dim, dropout, requires_grad):
+    # Equal head counts need no enable_gqa, so the mem-efficient kernel also runs a maskless causal
+    # call. transformers < 5 still passes enable_gqa = True there, so both forms must be accepted.
+    key = (str(device), dtype, num_heads, head_dim, dropout, requires_grad)
+    accepts = _EFFICIENT_SDPA_ACCEPTS_CACHE.get(key, None)
+    if accepts is not None:
+        return accepts
+    try:
+        with torch.cuda.device(device):
+            query = torch.empty((1, num_heads, 1, head_dim), device = device, dtype = dtype, requires_grad = requires_grad)
+            accepts = torch.backends.cuda.can_use_efficient_attention(
+                torch.backends.cuda.SDPAParams(query, query, query, None, dropout, True, False), False
+            ) is True and torch.backends.cuda.can_use_efficient_attention(
+                torch.backends.cuda.SDPAParams(query, query, query, None, dropout, True, True), False
+            ) is True
+    except Exception:
+        accepts = False  # torch < 2.5: no enable_gqa argument, keep the mask
+    _EFFICIENT_SDPA_ACCEPTS_CACHE[key] = accepts
+    return accepts
+
+
 def _flash_sdpa_takes_causal(config, embeds):
     """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; anything
     else falls to the math kernel and its [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
@@ -758,8 +783,61 @@ def _flash_sdpa_takes_causal(config, embeds):
         if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
             return False
         if not _flash_sdpa_accepts(embeds.device, embeds.dtype, num_heads, num_kv_heads, head_dim, dropout, requires_grad):
-            return False
+            if num_heads != num_kv_heads or not torch.backends.cuda.mem_efficient_sdp_enabled() or \
+                not _efficient_sdpa_accepts_mha(embeds.device, embeds.dtype, num_heads, head_dim, dropout, requires_grad):
+                return False
     return True
+
+
+_MODEL_SPANS_DEVICES = weakref.WeakKeyDictionary()
+
+
+def _module_spans_devices(module):
+    device_map = getattr(module, "hf_device_map", None)
+    if isinstance(device_map, Mapping):
+        mapped = set()
+        for value in device_map.values():
+            try:
+                mapped.add(str(torch.device(value)))  # 0 and "cuda:0" are one device
+            except (RuntimeError, TypeError, ValueError):
+                if isinstance(value, int) and not isinstance(value, bool):
+                    # No accelerator to resolve a bare index (CPU-only torch): accelerate's ints are CUDA.
+                    mapped.add(f"cuda:{value}")
+                else:
+                    mapped.add(str(value))  # "disk"
+        if len(mapped) > 1:
+            return True
+    devices = {parameter.device for parameter in module.parameters()}
+    devices.update(buffer.device for buffer in module.buffers())
+    return len(devices) > 1
+
+
+def _calling_model_spans_devices(max_depth = 8):
+    """True when the module whose forward builds this mask has weights on more than one device.
+
+    A device_map split can put later layers on a GPU (or a shape) flash cannot take, where SDPA
+    without a mask falls back to the math kernel. Cached per module; no calling module found = False.
+    """
+    frame = sys._getframe(1)
+    for _ in range(max_depth):
+        frame = frame.f_back
+        if frame is None:
+            return False
+        module = frame.f_locals.get("self", None)
+        if isinstance(module, nn.Module):
+            break
+    else:
+        return False
+    try:
+        return _MODEL_SPANS_DEVICES[module]
+    except (KeyError, TypeError):
+        pass
+    spans = _module_spans_devices(module)
+    try:
+        _MODEL_SPANS_DEVICES[module] = spans
+    except TypeError:
+        pass
+    return spans
 
 
 def _maskless_causal_arguments(signature, args, kwargs):
@@ -830,9 +908,13 @@ def _maskless_causal_arguments(signature, args, kwargs):
             return None
     right_padded = False
     if attention_mask is not None and not bool(attention_mask.all()):
-        if os.environ.get(_SKIP_RIGHT_PADDING_MASK_ENV, "0") != "1":
+        right_padding = os.environ.get(_SKIP_RIGHT_PADDING_MASK_ENV, "")
+        if right_padding == "0":
             return None
         if not _flash_sdpa_takes_causal(config, embeds):
+            return None
+        # Only the embeddings device is checked above; an explicit =1 opts split models in too.
+        if right_padding != "1" and _calling_model_spans_devices():
             return None
         # Every row starts real and stays padded after its first pad; left padding keeps the mask.
         mask = attention_mask.bool()
@@ -847,6 +929,54 @@ def _maskless_causal_arguments(signature, args, kwargs):
     if right_padded:
         CAUSAL_MASK_SKIP_STATS["right_padded"] += 1
     return arguments
+
+
+def _warm_mask_device_cache(cache, mask, device):
+    if device not in cache:
+        cache[device] = mask.to(device, non_blocking = True)
+
+
+def _warm_mask_mod_devices(mask_mod, device):
+    # Walk and_masks / offset closures to Unsloth's per-device mask caches.
+    stack, seen = [mask_mod], set()
+    while stack and len(seen) < 64:
+        fn = stack.pop()
+        if id(fn) in seen:
+            continue
+        seen.add(id(fn))
+        if isinstance(fn, (tuple, list)):
+            stack.extend(fn)
+            continue
+        warm = getattr(fn, "_unsloth_mask_to_device", None)
+        if warm is not None:
+            warm(device)
+        for cell in getattr(fn, "__closure__", None) or ():
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            if callable(value) or isinstance(value, (tuple, list)):
+                stack.append(value)
+
+
+def _patch_block_mask_to():
+    # Inductor cannot lower a device copy inside Flex's mask subgraph, so copy
+    # captured masks when accelerate moves the BlockMask to the next device.
+    try:
+        from torch.nn.attention.flex_attention import BlockMask
+    except Exception:
+        return
+    if hasattr(BlockMask.to, "_unsloth_original_to"):
+        return
+    _original_to = BlockMask.to
+    @functools.wraps(_original_to)
+    def block_mask_to(self, device):
+        moved = _original_to(self, device)
+        if not torch.compiler.is_compiling() and moved.kv_num_blocks.device != self.kv_num_blocks.device:
+            _warm_mask_mod_devices(self.mask_mod, moved.kv_num_blocks.device)
+        return moved
+    block_mask_to._unsloth_original_to = _original_to
+    BlockMask.to = block_mask_to
 
 
 def patch_transformers_masks():
@@ -1028,8 +1158,11 @@ def patch_transformers_masks():
                 pm = _cache.get(device)
                 if pm is None:
                     pm = padding_mask.to(device, non_blocking=True)
-                    _cache[device] = pm
+                    # Flex traces mask_mod as a pure higher-order subgraph.
+                    if not torch.compiler.is_compiling():
+                        _cache[device] = pm
                 return pm[batch_idx, kv_idx]
+            inner_mask._unsloth_mask_to_device = functools.partial(_warm_mask_device_cache, _cache, padding_mask)
             return inner_mask
         masking_utils.padding_mask_function = padding_mask_wrapper
 
@@ -1046,10 +1179,14 @@ def patch_transformers_masks():
                 pm = _cache.get(device)
                 if pm is None:
                     pm = packed_sequence_mask.to(device, non_blocking=True)
-                    _cache[device] = pm
+                    if not torch.compiler.is_compiling():
+                        _cache[device] = pm
                 return pm[batch_idx, q_idx] == pm[batch_idx, kv_idx]
+            inner_mask._unsloth_mask_to_device = functools.partial(_warm_mask_device_cache, _cache, packed_sequence_mask)
             return inner_mask
         masking_utils.packed_sequence_mask_function = packed_sequence_mask_wrapper
+
+    _patch_block_mask_to()
 
     masking_utils.__unsloth_mask_patch__ = True
 pass
@@ -1783,6 +1920,13 @@ def patch_mamba_fused_split_without_causal_conv1d():
     reference (None) so modeling code takes the split path (torch conv1d + mamba_ssm chunk scan)."""
     if not _mamba_fused_split_needs_causal_conv1d_unusable():
         return
+    # Keep the fused path when its conv can run on Triton instead of causal_conv1d's C++ kernels.
+    try:
+        from .gdn_causal_conv1d import install_mamba_ssm_triton_conv
+        if install_mamba_ssm_triton_conv():
+            return
+    except Exception:
+        pass
     try:
         import transformers.integrations as _integrations
         from transformers.integrations import hub_kernels as _hk

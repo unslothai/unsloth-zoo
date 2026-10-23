@@ -20,6 +20,7 @@ from .fla_vendor import *
 from .gdn_causal_conv1d import *
 from .gemma import *
 from .misc import *
+from .t5 import *
 from .granitemoehybrid import *
 from .gemma3n import *
 from .gemma4 import *
@@ -56,6 +57,7 @@ from .bitsandbytes import *
 from .bitsandbytes_optimizer_sync import *
 from .moe_utils_bnb4bit import *
 from .moe_experts_interface import *
+from .moe_router_triton import *
 from .moe_grouped_modulelist import *
 from .moe_utils_fp8 import *
 from .fp8_uncontained_weights import *

@@ -158,7 +158,150 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) else v,
         model.parameters(),
     ))
-    mx.eval(model.parameters())
+    mx.eval(_resident_parameters(model))
+
+
+_OFFLOAD_CACHE_LIMIT = 1 << 30
+_offload_cache_cap = {"models": 0, "previous": None, "applied": None}
+# Reentrant: a collected model's finalizer can run on a thread inside this lock.
+_OFFLOAD_CACHE_LOCK = threading.RLock()
+
+
+def _cap_cache_while_alive(model) -> None:
+    """Cap MLX's buffer cache while ``model`` lives: offloaded reads free buffers of ever-changing
+    sizes, which the cache would keep until the memory limit."""
+    import mlx.core as mx
+
+    cap = _offload_cache_cap
+    with _OFFLOAD_CACHE_LOCK:
+        if not cap["models"]:
+            cap["previous"] = mx.set_cache_limit(_OFFLOAD_CACHE_LIMIT)
+            cap["applied"] = min(cap["previous"], _OFFLOAD_CACHE_LIMIT)
+            mx.set_cache_limit(cap["applied"])
+        cap["models"] += 1
+
+    def release():
+        with _OFFLOAD_CACHE_LOCK:
+            cap["models"] -= 1
+            if not cap["models"]:
+                current = mx.set_cache_limit(cap["previous"])
+                if current != cap["applied"]:  # set by someone else since: theirs stays
+                    mx.set_cache_limit(current)
+
+    weakref.finalize(model, release)
+
+
+def _settle_offload(offload, conflict, message):
+    """Refuse an offload set to a fraction that ``conflict`` rules out; ``auto`` or a caller's
+    planner turns off."""
+    if not conflict:
+        return offload
+    if not callable(offload) and any(value not in (None, "auto") for value in offload.values()):
+        raise ValueError(message)
+    return {"ple": None, "experts": None}
+
+
+def _auto_offload(model, model_dir, offload, max_seq_length, target_dtype):
+    """Resolve ``auto`` parts to the least offload that fits the weights and ``max_seq_length``
+    tokens of context in 0.85 of the GPU's recommended working set, warning for each it turns on."""
+    import mlx.core as mx
+    from .offload import context_bytes, offload_inventory, offloadable, plan_offload
+
+    dtype_bytes = target_dtype.size if target_dtype is not None else 2
+    try:
+        context_bytes(model_dir, 0)
+    except ValueError as error:
+        warnings.warn(f"{error} offload 'auto' stays off.", stacklevel=4)
+        return {key: None if value == "auto" else value for key, value in offload.items()}
+    # The checkpoint's size, and what this model's offload can actually take from it.
+    inventory = {**offload_inventory(model_dir, dtype_bytes), **offloadable(model, model_dir, cast_dtype=target_dtype)}
+    budget = int(0.85 * mx.device_info()["max_recommended_working_set_size"])
+    plan = plan_offload(
+        budget=budget,
+        resident=inventory["total_bytes"] - inventory["ple_bytes"] - inventory["expert_bytes"],
+        inventory=inventory,
+        context_cost=lambda tokens, step: context_bytes(model_dir, tokens, step, dtype_bytes),
+        ceiling=max_seq_length,
+        context=max_seq_length,
+        offload=offload,
+    )
+    fits = plan["context"] is not None
+    if not fits:
+        warnings.warn(
+            f"Unsloth: the weights and max_seq_length={max_seq_length} do not fit in "
+            f"{budget / 2**30:.1f} GiB even with every offload; offloading all that can be.",
+            stacklevel=4,
+        )
+    resolved = dict(offload)
+    step = plan["prefill_step"] or 2048
+    for key, what in (("ple", "per-layer embedding rows"), ("experts", "routed experts")):
+        if offload[key] != "auto":
+            continue
+        chosen = resolved[key] = plan[key] if fits else (None if inventory[key] else 1.0)
+        if chosen is not None:
+            warnings.warn(
+                f"Unsloth: offload 'auto' leaves {chosen:.0%} of the {what} on disk, read on demand"
+                + (f", so the weights and max_seq_length={max_seq_length} fit in {budget / 2**30:.1f} GiB. "
+                   if fits else ". ")
+                + (f"Prefill with prefill_step_size={step}: each step re-reads the offloaded experts. "
+                   if key == "experts" and step != 2048 else "")
+                + f"Set offload's {key!r} to 'off' to keep them in memory.",
+                stacklevel=4,
+            )
+    return resolved
+
+
+def _apply_offload(model, model_dir, offload, target_dtype, max_seq_length) -> None:
+    """Swap the still-lazy PLE tables and routed experts for ones read from ``model_dir``'s shards."""
+    from .offload import offload_experts, offload_ple, offload_setting
+
+    if not callable(offload) and not any(offload.values()):
+        return
+    if not model_dir:
+        raise ValueError("Unsloth: offloading weights needs a local copy of the checkpoint.")
+    if callable(offload):
+        offload = offload_setting(offload(model_dir))
+    if "auto" in offload.values():
+        offload = _auto_offload(model, model_dir, offload, max_seq_length, target_dtype)
+    reports, missing = {}, []
+    for key, apply, count, what, label in (
+        ("ple", offload_ple, "tables", "PLE table", "PLE"),
+        ("experts", offload_experts, "layers", "quantized MoE experts", "Expert"),
+    ):
+        if offload[key] is None:
+            continue
+        report = apply(model, model_dir, offload[key], cast_dtype=target_dtype)
+        for path, reason in report["skipped"]:
+            warnings.warn(f"Unsloth: kept the {what} at {path} in memory: {reason}.", stacklevel=3)
+        if not report[count]:
+            missing += [] if report["skipped"] else [what]
+            continue
+        print(
+            f"Unsloth: {label} offload reads {report['on_disk_bytes'] / 2**30:.2f} GiB from the "
+            f"checkpoint on demand and holds {report['resident_bytes'] / 2**30:.2f} GiB in memory."
+        )
+        reports[key] = report
+    # One knob sets both parts, so a part the model lacks is news only when nothing was offloaded.
+    if missing and not reports:
+        warnings.warn(f"Unsloth: offload is set, but this model has no {' or '.join(missing)}.", stacklevel=3)
+    if reports:
+        model._unsloth_offload = reports
+        _cap_cache_while_alive(model)
+
+
+_OFFLOAD_RUNTIME_QUANT = (
+    "Unsloth: offload reads the checkpoint's tensors as stored, so "
+    "they cannot be combined with runtime quantization. Load the checkpoint in its own "
+    "quantization."
+)
+
+
+def _refuse_offloaded(model, action) -> None:
+    if getattr(model, "_unsloth_offload", None):
+        raise ValueError(
+            f"Unsloth: this model was loaded with offload, which is for inference only; "
+            f"{action} needs the model loaded without offload."
+        )
 
 
 def _keep_norm_parameters_float32(model) -> None:
@@ -243,11 +386,11 @@ def _mlx_lora_type_specs(*, include_convolutions=False):
                 vlm_lora_module.LoRASwitchLinear,
             )
         )
-    from .utils import LoRAHadamardLinear, _hadamard_pack_module
-    pack = _hadamard_pack_module()
-    if pack is not None:
+    from .utils import LoRAHadamardLinear, _hadamard_pack_modules
+    packs = _hadamard_pack_modules()
+    if packs:
         specs.append(_MLXLoRATypeSpec(
-            (pack.HadamardQuantizedLinear,), LoRAHadamardLinear,
+            tuple(pack.HadamardQuantizedLinear for pack in packs), LoRAHadamardLinear,
         ))
     if include_convolutions:
         from .utils import LoRAPointwiseConv2d
@@ -452,6 +595,12 @@ def linear_to_lora_layers(model, num_layers, config, *, dry_run=False):
     for _, modules in [*selected, (root, root_modules)]:
         for _, module in modules:
             _check_mlx_lora_base(module)
+    if config.get("qat_scheme") not in (None, False):
+        from .qat import validate_mlx_qat_targets
+        validate_mlx_qat_targets(
+            [pair for _, modules in [*selected, (root, root_modules)] for pair in modules],
+            config["qat_scheme"],
+        )
     if dry_run:
         return sum(len(modules) for _, modules in selected) + len(root_modules)
     attached = 0
@@ -655,6 +804,19 @@ _MLX_LM_CONFIG_BACKFILLS = {
 }
 
 
+def _mlx_lm_backfills(config, args_class):
+    parameters = inspect.signature(args_class).parameters
+    filled = {}
+    for key, derive in _MLX_LM_CONFIG_BACKFILLS.items():
+        parameter = parameters.get(key)
+        if parameter is None or parameter.default is not inspect.Parameter.empty or key in config:
+            continue
+        value = derive(config)
+        if value is not None:
+            filled[key] = value
+    return filled
+
+
 def _mlx_lm_config_backfill(model_name, model_path, model_config):
     """model_config plus the required mlx-lm ModelArgs fields config.json lacks but implies."""
     try:
@@ -664,17 +826,9 @@ def _mlx_lm_config_backfill(model_name, model_path, model_config):
         if config.get("model_file") is not None:
             return model_config
         _, args_class = _get_classes(config=config)
-        parameters = inspect.signature(args_class).parameters
+        filled = _mlx_lm_backfills(config, args_class)
     except Exception:
         return model_config
-    filled = {}
-    for key, derive in _MLX_LM_CONFIG_BACKFILLS.items():
-        parameter = parameters.get(key)
-        if parameter is None or parameter.default is not inspect.Parameter.empty or key in config:
-            continue
-        value = derive(config)
-        if value is not None:
-            filled[key] = value
     if not filled:
         return model_config
     listed = ", ".join(f"{key}={value!r}" for key, value in filled.items())
@@ -717,6 +871,31 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
         f"or dependency policy for your environment; Studio users should rerun "
         f"installer/repair. Do not bypass this error with strict=False.{installed}"
     ) from error
+
+
+# The layers mlx-vlm's glm5_next sanitize fuses, each by its first source projection.
+_GLM5_NEXT_FUSED = {"gate_up_proj": "gate_proj", "qkv_proj": "q_proj", "fbg_a_proj": "f_a_proj", "qkv_a_proj": "q_a_proj"}
+
+
+def _patch_glm5_next_quantization_aliases(model_type):
+    """mlx-vlm fuses glm5_next projections (``_GLM5_NEXT_FUSED``) but gives a fused layer no alias
+    to its sources' per-module quantization, so a mixed-bit checkpoint's (as GLM-5.3-Flash-4bit's
+    6-bit shared experts) is built at the default bits and fails to load."""
+    if model_type != "glm5_next":
+        return
+    try:
+        from mlx_vlm.models.glm5_next.glm5_next import Model as model
+    except Exception:
+        return
+    if hasattr(model, "quantization_path_aliases"):
+        return
+
+    def quantization_path_aliases(self, path):
+        path = path[len("language_model."):] if path.startswith("language_model.") else path
+        parent, _, name = path.rpartition(".")
+        return [f"{parent}.{_GLM5_NEXT_FUSED[name]}"] if name in _GLM5_NEXT_FUSED else []
+
+    model.quantization_path_aliases = quantization_path_aliases
 
 
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
@@ -1636,6 +1815,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
     registered mismatch signatures and exact allow-listed keys only.
     """
     _patch_deepseek_ocr_transformers_import_compat(model_type)
+    _patch_glm5_next_quantization_aliases(model_type)
     try:
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
@@ -1715,6 +1895,7 @@ def _load_mlx_vlm_distributed(
     model_label = f"'{model_name}'"
     if model_type:
         model_label = f"{model_label} (model_type={model_type!r})"
+    _patch_glm5_next_quantization_aliases(model_type)
 
     try:
         from mlx_vlm.utils import get_model_path, sharded_load
@@ -3280,10 +3461,38 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
         return False
 
     cls = _get_mlx_lm_model_class(model_type)
-    if cls is None:
-        return _resolve_mlx_vlm_model_class(model_type) is not None
+    if cls is not None and _mlx_lm_accepts_config(cls, config) and not _has_multimodal_strip_sanitize(cls):
+        return False
+    return _resolve_mlx_vlm_model_class(model_type) is not None
 
-    return _has_multimodal_strip_sanitize(cls)
+
+def _mlx_lm_accepts_config(cls, config: dict) -> bool:
+    """Whether mlx_lm's ModelArgs take the config its load hands over (deepseek_v41's refuse engram layers)."""
+    args_class = getattr(sys.modules.get(cls.__module__), "ModelArgs", None)
+    if args_class is None or config.get("model_file") is not None:
+        return True
+    try:
+        # Deep: __post_init__ may rewrite nested configs (gemma3's text_config vocab_size).
+        args_class.from_dict(copy.deepcopy({**config, **_mlx_lm_backfills(config, args_class)}))
+    except Exception:
+        return False
+    return True
+
+
+def _mlx_lm_serves_images(config: dict, model_type: str) -> bool:
+    """Whether mlx_lm builds this checkpoint's vision tower and feeds it: mlx_lm.processors'
+    own rule (a populated vision_config, a registered processor) plus `embed_inputs`."""
+    if not config.get("vision_config"):
+        return False
+    cls = _get_mlx_lm_model_class(model_type)
+    if cls is None or not callable(getattr(cls, "embed_inputs", None)):
+        return False
+    try:
+        from mlx_lm.processors import PROCESSORS
+    except ImportError:
+        return False
+    module = cls.__module__.rsplit(".", 1)[-1]
+    return config.get("processor_type", module) in PROCESSORS and _mlx_lm_accepts_config(cls, config)
 
 
 def _mlx_vlm_only_text_model(config: dict, model_type: str) -> bool:
@@ -3294,9 +3503,31 @@ def _mlx_vlm_only_text_model(config: dict, model_type: str) -> bool:
         spec = importlib.util.find_spec(f"mlx_lm.models.{module_name}")
     except (ImportError, ValueError):
         return False
-    if spec is not None:
+    if spec is not None and not _mlx_lm_refuses_config(module_name, config):
         return False
     return _resolve_mlx_vlm_model_class(model_type) is not None
+
+
+def _routes_to_mlx_vlm(config, model_type, text_only):
+    """Whether from_pretrained's routing below (force_vlm_text_path / text_only) picks mlx-vlm."""
+    if text_only is True and _prefer_vlm_loader_for_text(config, model_type):
+        return True
+    if text_only is not False and _mlx_vlm_only_text_model(config, model_type):
+        return True
+    if text_only is None:
+        return _is_vlm(config)
+    return text_only is False
+
+
+def _mlx_lm_refuses_config(module_name, config):
+    """Whether mlx_lm's model arguments refuse ``config``, as its DeepSeek V4.1 refuses Engram layers."""
+    try:
+        importlib.import_module(f"mlx_lm.models.{module_name}").ModelArgs.from_dict(config)
+    except ValueError:
+        return True
+    except (Exception, SystemExit):
+        return False
+    return False
 
 
 class _NativeVLMWeightSanitizer:
@@ -3670,7 +3901,8 @@ _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
     "4405529c372e5bc69cf782c1038b674b55b46434e9a515d9db46a2a92e0414fa"
 )
 _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256 = (
-    "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576"
+    "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576",
+    "ae6c02d68719bee0ce97ab68458eed1f092aa2ab0398f0b903d5a9bf68cfc7ab",
 )
 _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256 = (
     "f995c993dd959cc55a43f70f8f87c115d18833179e464426d63153022f4770ec"
@@ -3680,6 +3912,12 @@ _GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 = (
 )
 _XING4_0_HYPER_CONNECTION_CALL_TOKEN_SHA256 = (
     "d33c41e769c36a1d01595314a684092576323fb12077090b3caf83325cf7bf64"
+)
+_QWEN3_5_VERIFY_QK_TOKEN_SHA256 = (
+    "e6f9df6af39d81908f992befef96ce200dd55c55c6fe14cd15c8267a9904dc87"
+)
+_QWEN3_5_DIVIDED_QK_TOKEN_SHA256 = (
+    "bb94a73450a3430389fab37f6c066725705ce042d059289587a9e6f4795e631e"
 )
 
 
@@ -4124,7 +4362,7 @@ def _minicpmv4_7_text_positions_adapter(cls):
     if (
         getattr(original, "_unsloth_minicpmv4_7_text_positions", False)
         or _source_token_sha256(_safe_getsource(original))
-        != _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
+        not in _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
         or _source_token_sha256(_safe_getsource(getattr(rope, "get_rope_index", None)))
         != _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256
     ):
@@ -5993,6 +6231,345 @@ def _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=False):
     return dequantized.reshape(original_shape).astype(original_dtype)
 
 
+# GPTQ/AWQ: mlx-lm (>= 0.30.4, PR #730) loads standard AWQ, contiguous-group GPTQ is repacked as MLX affine, the rest is dequantized to fp16.
+_HF_RUNTIME_DEQUANT_METHODS = frozenset({"gptq", "awq"})
+# Fail loud; else the generic MLX check misreports them as a bits/group_size mismatch.
+_HF_UNSUPPORTED_PACKED_METHODS = frozenset({
+    "compressed-tensors", "compressed_tensors", "aqlm",
+    "quip", "quip_sharp", "eetq", "hqq", "vptq", "fp_quant",
+})
+_AWQ_REVERSE_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
+
+
+def _mlx_reinterpret_uint32(arr):
+    # Widen to int64 so top-nibble shifts don't sign-extend.
+    import mlx.core as mx
+
+    a = arr.astype(mx.int64)
+    return mx.where(a < 0, a + (1 << 32), a)
+
+
+def _gptq_dequantize_weight(qweight, qzeros, scales, g_idx, bits=4):
+    """AutoGPTQ v1 4-bit -> dense [out, in]; g_idx may be an act-order permutation."""
+    import mlx.core as mx
+
+    qw = _mlx_reinterpret_uint32(qweight)               # [in//8, out]
+    qz = _mlx_reinterpret_uint32(qzeros)                # [groups, out//8]
+    scales = scales.astype(mx.float32)                  # [groups, out]
+    shifts = mx.arange(0, 32, bits).astype(mx.int64)    # [8]
+    w = (mx.right_shift(qw[:, None, :], shifts[None, :, None]) & 0xF)
+    w = w.reshape(-1, qw.shape[1]).astype(mx.float32)   # [in, out]
+    z = (mx.right_shift(qz[:, :, None], shifts[None, None, :]) & 0xF)
+    # Mask AFTER the +1: stored 15 encodes zero-point 0 (AutoGPTQ: (zeros + 1) & 0xF).
+    z = ((z.reshape(qz.shape[0], -1) + 1) & 0xF).astype(mx.float32)   # [groups, out]
+    g = g_idx.astype(mx.int32)                          # [in]
+    eff = (w - z[g]) * scales[g]                        # [in, out]
+    return mx.transpose(eff)                            # [out, in]
+
+
+def _awq_dequantize_weight(qweight, qzeros, scales, group_size, bits=4):
+    """AutoAWQ GEMM 4-bit -> dense [out, in] (the AWQ smoothed weight)."""
+    import mlx.core as mx
+
+    qw = _mlx_reinterpret_uint32(qweight)               # [in, out//8]
+    qz = _mlx_reinterpret_uint32(qzeros)                # [groups, out//8]
+    scales = scales.astype(mx.float32)                  # [groups, out]
+    shifts = mx.arange(0, 32, bits).astype(mx.int64)
+    pack = 32 // bits                                   # 8
+    reorder = mx.array(
+        [b * pack + o for b in range(scales.shape[1] // pack) for o in _AWQ_REVERSE_ORDER]
+    )
+
+    def _unpack(x):
+        y = (mx.right_shift(x[:, :, None], shifts[None, None, :]) & 0xF).reshape(x.shape[0], -1)
+        return y[:, reorder]
+
+    w = _unpack(qw).astype(mx.float32)                  # [in, out]
+    z = _unpack(qz).astype(mx.float32)                  # [groups, out]
+    if group_size and group_size > 0:
+        g = (mx.arange(w.shape[0]) // group_size).astype(mx.int32)   # [in]
+    else:
+        # Full-group (group_size <= 0): arange // -1 would give negative indices.
+        g = mx.zeros((w.shape[0],), dtype=mx.int32)     # [in]
+    eff = (w - z[g]) * scales[g]                        # [in, out]
+    return mx.transpose(eff)                            # [out, in]
+
+
+def _detect_hf_prequant_method(config_data):
+    """Return (method, quant_config_dict) for a GPTQ/AWQ repo, else (None, None)."""
+    if not isinstance(config_data, dict):
+        return None, None
+    quant_config = config_data.get("quantization_config", None)
+    if not isinstance(quant_config, dict):
+        return None, None
+    method = str(quant_config.get("quant_method", "")).lower()
+    if method in _HF_RUNTIME_DEQUANT_METHODS:
+        return method, quant_config
+    return None, None
+
+
+# Only the GEMM layout (blank version = default) matches mlx-lm's and our AWQ unpacking.
+_AWQ_NATIVE_GEMM_VERSIONS = frozenset({"", "gemm"})
+
+
+def _awq_quant_config_is_gemm(quant_config):
+    """Non-GEMM AWQ variants would silently decode to wrong weights."""
+    if not isinstance(quant_config, dict):
+        return True
+    version = str(quant_config.get("version", "") or "").strip().lower()
+    return version in _AWQ_NATIVE_GEMM_VERSIONS
+
+
+def _awq_group_size_is_full(quant_config):
+    """q_group_size <= 0 (per-column); mlx-lm passes it to nn.quantize, which rejects it."""
+    if not isinstance(quant_config, dict):
+        return False
+    raw = quant_config.get("group_size", quant_config.get("q_group_size"))
+    if raw is None:
+        return False
+    try:
+        return int(raw) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _mlx_lm_would_reject_prequant(method, quant_config):
+    """GPTQ always (mlx-lm decodes it with the AWQ layout and raises on g_idx), and full-group AWQ."""
+    return method == "gptq" or (method == "awq" and _awq_group_size_is_full(quant_config))
+
+
+def _adapter_base_prefers_native_prequant(
+    adapter_cfg,
+    *,
+    adapter_requires_runtime_quant,
+    adapter_mlx_quant_config,
+    adapter_base_is_bnb,
+):
+    """Native AWQ and repacked GPTQ bases must reload 4-bit; load_in_4bit=False would dequantize and fail base validation."""
+    if adapter_requires_runtime_quant:
+        return False
+    if adapter_mlx_quant_config is not None:
+        return False
+    if adapter_base_is_bnb:
+        return False
+    base_quant_cfg = adapter_cfg.get("base_quantization_config")
+    if not isinstance(base_quant_cfg, dict):
+        return False
+    return str(base_quant_cfg.get("quant_method", "")).lower() in _HF_RUNTIME_DEQUANT_METHODS
+
+
+_DEQUANT_DROP_SIDECARS = ("quantize_config.json", "quant_config.json")
+
+
+def _is_dropped_dequant_sidecar(filename):
+    """Weights (packed or alternate exports) and GPTQ/AWQ sidecars, which would make the dense copy look packed."""
+    from .utils import _MODEL_WEIGHT_SUFFIXES
+
+    if filename.endswith(_MODEL_WEIGHT_SUFFIXES) or filename.endswith(".safetensors.index.json"):
+        return True
+    return filename in _DEQUANT_DROP_SIDECARS
+
+
+_MLX_AFFINE_GROUP_SIZES = (32, 64, 128)
+_DEQUANT_SHARD_BYTES = 2 << 30
+
+
+def _gptq_to_mlx_affine(qweight, qzeros, scales):
+    """AutoGPTQ v1 4-bit -> MLX affine (weight, scales, biases), lossless: w = s*(q - z) = s*q - s*z.
+    qweight [in//8, out] packs input rows low nibble first, which is MLX's [out, in//8] layout transposed."""
+    import mlx.core as mx
+
+    shifts = mx.arange(0, 32, 4).astype(mx.int64)
+    qz = _mlx_reinterpret_uint32(qzeros)
+    z = ((mx.right_shift(qz[:, :, None], shifts[None, None, :]) & 0xF).reshape(qz.shape[0], -1) + 1) & 0xF
+    weight = mx.contiguous(_mlx_reinterpret_uint32(qweight).astype(mx.uint32).T)
+    biases = -(z.astype(mx.float32) * scales.astype(mx.float32))
+    return weight, mx.contiguous(scales.T), mx.contiguous(biases.T.astype(scales.dtype))
+
+
+def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quant_config, mlx_affine=False):
+    """Returns (temp_dir, config_data without HF quantization metadata).
+
+    mlx_affine=True converts a contiguous-group 4-bit GPTQ checkpoint straight to MLX affine
+    (config gains "quantization"); dequantizing and re-quantizing it would round every weight twice.
+    Falls back to dense fp16 when g_idx is permuted (act-order) or the group size has no MLX kernel."""
+    import glob
+    import shutil
+    import mlx.core as mx
+
+    bits = int(quant_config.get("bits", 4) or 4)
+    # Keep group_size <= 0 (full-group); defaulting it to 128 gathers wrong scale rows.
+    if method == "awq":
+        raw_group_size = quant_config.get("q_group_size", quant_config.get("group_size"))
+    else:
+        raw_group_size = quant_config.get("group_size")
+    group_size = int(raw_group_size) if raw_group_size is not None else 128
+    if bits != 4:
+        raise NotImplementedError(
+            f"Unsloth: {method.upper()} runtime dequant on MLX currently supports "
+            f"4-bit checkpoints only (got bits={bits})."
+        )
+    if method == "gptq":
+        # gptq_v2 stores raw zero-points (no -1 offset); v1 decoding would be off by one.
+        _ckpt_fmts = {
+            str(quant_config.get(_key, "") or "").lower()
+            for _key in ("checkpoint_format", "format")
+        }
+        if _ckpt_fmts & {"gptq_v2", "gptqv2"}:
+            raise NotImplementedError(
+                "Unsloth: GPTQ v2 checkpoints (checkpoint_format='gptq_v2') use a "
+                "different zero-point convention than AutoGPTQ v1 and are not yet "
+                "supported for MLX runtime dequant. Convert to the v1 GPTQ format, "
+                "or use a v1 GPTQ / AWQ checkpoint."
+            )
+        # Marlin / BitBLAS / IPEX / QQQ repack qweight differently; only the AutoGPTQ v1 layout decodes here.
+        _other_fmts = _ckpt_fmts - {"", "gptq"}
+        if _other_fmts or quant_config.get("is_marlin_format"):
+            raise NotImplementedError(
+                f"Unsloth: GPTQ checkpoint format {sorted(_other_fmts) or ['marlin']} is "
+                "not supported on MLX; only the standard AutoGPTQ (v1) packing can be "
+                "loaded. Use a checkpoint saved with format='gptq'."
+            )
+        # GPTQModel `dynamic` overrides re-pack matched modules at their own bits / group size.
+        _dynamic = quant_config.get("dynamic")
+        if isinstance(_dynamic, dict) and any(
+            isinstance(_override, dict)
+            and (
+                int(_override.get("bits", bits)) != bits
+                or _override.get("group_size", raw_group_size) != raw_group_size
+            )
+            for _override in _dynamic.values()
+        ):
+            raise NotImplementedError(
+                "Unsloth: GPTQ checkpoints whose `dynamic` config gives some modules "
+                "different bits or group sizes are not supported on MLX."
+            )
+
+    shard_paths = sorted(glob.glob(os.path.join(local_path, "*.safetensors")))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"Unsloth: no .safetensors weights found in '{local_path}' for "
+            f"{method.upper()} dequantization."
+        )
+    weights = {}
+    for shard in shard_paths:
+        weights.update(mx.load(shard))
+
+    quant_modules = sorted(
+        {k[: -len(".qweight")] for k in weights if k.endswith(".qweight")}
+    )
+    if not quant_modules:
+        raise ValueError(
+            f"Unsloth: '{local_path}' is declared {method.upper()} but no packed "
+            "'.qweight' tensors were found."
+        )
+
+    in_rows = 32 // bits
+    affine = (
+        mlx_affine
+        and method == "gptq"
+        and group_size in _MLX_AFFINE_GROUP_SIZES
+        and all(
+            name + ".g_idx" not in weights
+            or bool(mx.array_equal(
+                weights[name + ".g_idx"].astype(mx.int32),
+                mx.arange(weights[name + ".qweight"].shape[0] * in_rows) // group_size,
+            ))
+            for name in quant_modules
+        )
+    )
+
+    def _convert(name):
+        qweight = weights[name + ".qweight"]
+        qzeros = weights[name + ".qzeros"]
+        scales = weights[name + ".scales"]
+        if affine:
+            weight, scales, biases = _gptq_to_mlx_affine(qweight, qzeros, scales)
+            return {name + ".weight": weight, name + ".scales": scales, name + ".biases": biases}
+        if method == "gptq":
+            g_idx = weights.get(name + ".g_idx")
+            if g_idx is None:
+                in_features = int(qweight.shape[0]) * in_rows
+                if group_size and group_size > 0:
+                    g_idx = mx.arange(in_features) // group_size
+                else:
+                    g_idx = mx.zeros((in_features,), dtype=mx.int32)
+            dense = _gptq_dequantize_weight(qweight, qzeros, scales, g_idx, bits=bits)
+        else:
+            dense = _awq_dequantize_weight(qweight, qzeros, scales, group_size, bits=bits)
+        return {name + ".weight": dense.astype(mx.float16)}
+
+    packed = {name + suffix for name in quant_modules
+              for suffix in (".qweight", ".qzeros", ".scales", ".g_idx")}
+    quant_set = set(quant_modules)
+    temp_dir = tempfile.mkdtemp(prefix="unsloth_mlx_dequant_")
+    # BaseException: also clean up a multi-GB save interrupted by Ctrl-C.
+    try:
+        # Bounded shards: peak memory is one shard of dense weights, not the model.
+        shard, shard_bytes, weight_map, n_shards = {}, 0, {}, 0
+
+        def _flush():
+            nonlocal shard, shard_bytes, n_shards
+            if not shard:
+                return
+            n_shards += 1
+            filename = f"model-{n_shards:05d}.safetensors"
+            mx.eval(list(shard.values()))
+            mx.save_safetensors(os.path.join(temp_dir, filename), shard)
+            weight_map.update({key: filename for key in shard})
+            shard, shard_bytes = {}, 0
+
+        items = [(name, None) for name in quant_modules] + [
+            (None, key) for key in weights if key not in packed
+        ]
+        for name, key in items:
+            if name is not None:
+                tensors = _convert(name)
+            else:
+                tensor = weights[key]
+                # Drop GPTQ QuantLinear's all-zero placeholder bias on packed modules only.
+                if (
+                    key.endswith(".bias")
+                    and key[: -len(".bias")] in quant_set
+                    and bool(mx.all(tensor == 0).item())
+                ):
+                    continue
+                tensors = {key: tensor}
+            for k, v in tensors.items():
+                shard[k] = v
+                shard_bytes += v.nbytes
+            if shard_bytes >= _DEQUANT_SHARD_BYTES:
+                _flush()
+        _flush()
+        with open(os.path.join(temp_dir, "model.safetensors.index.json"), "w") as f:
+            json.dump({"metadata": {}, "weight_map": weight_map}, f, indent=2)
+
+        for filename in os.listdir(local_path):
+            src = os.path.join(local_path, filename)
+            if os.path.isdir(src):
+                # Nested assets (chat_templates/, remote-code packages) by link, never copied weights.
+                if not filename.startswith("."):
+                    os.symlink(os.path.realpath(src), os.path.join(temp_dir, filename))
+                continue
+            if not os.path.isfile(src):
+                continue
+            if _is_dropped_dequant_sidecar(filename):
+                continue
+            shutil.copy(src, os.path.join(temp_dir, filename))
+
+        new_config_data = dict(config_data)
+        new_config_data.pop("quantization_config", None)
+        new_config_data.pop("quantization", None)
+        if affine:
+            new_config_data["quantization"] = {"group_size": group_size, "bits": bits, "mode": "affine"}
+        with open(os.path.join(temp_dir, "config.json"), "w") as f:
+            json.dump(new_config_data, f, indent=2)
+    except BaseException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    return temp_dir, new_config_data
+
+
 def _apply_dense_nf4_quantization(model, config, spec: _MLXQuantizationSpec, predicate):
     import mlx.core as mx
 
@@ -7011,6 +7588,39 @@ def _ensure_exact_verify_sums_promoted():
     _exact_verify_sums_promoted = True
 
 
+def _ensure_verify_qk_norm_matches_decode():
+    """mlx-vlm 0.7.9's Qwen3.5 layer divides its q/k RMSNorm epsilon by the head width while the
+    exact verifier keeps 1e-6, so verify no longer matches decode. Verify with the layer's own norm."""
+    try:
+        language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+        verifier = importlib.import_module("mlx_vlm.models.qwen3_5.speculative_verifier")
+    except Exception:
+        return
+    forward = getattr(verifier, "Qwen3_5BatchInvariantForward", None)
+    layer = getattr(language, "Qwen3_5GatedDeltaNet", None)
+    if not isinstance(forward, type) or not isinstance(layer, type):
+        return
+    decode = vars(layer).get("_normalize_qk")
+    native = vars(forward).get("_normalize_gated_delta_qk")
+    if (
+        not isinstance(native, staticmethod)
+        or _source_token_sha256(_safe_getsource(native.__func__))
+        != _QWEN3_5_VERIFY_QK_TOKEN_SHA256
+        or _source_token_sha256(_safe_getsource(decode))
+        != _QWEN3_5_DIVIDED_QK_TOKEN_SHA256
+    ):
+        return
+    original = native.__func__
+
+    def normalize(layer, q, k):
+        if getattr(type(layer), "_normalize_qk", None) is decode:
+            return decode(layer, q, k)
+        return original(layer, q, k)
+
+    # Not wrapped: getsource would follow __wrapped__ back to the guarded body and patch twice.
+    forward._normalize_gated_delta_qk = staticmethod(normalize)
+
+
 def _ensure_vlm_processor_inputs_patched():
     """Patch mlx-vlm's processor call without replacing its input preparation."""
 
@@ -7024,6 +7634,7 @@ def _ensure_vlm_processor_inputs_patched():
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import collect_mlx_lora_adapter_tensors, save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
     if "save_method" not in kwargs and not collect_mlx_lora_adapter_tensors(self):
@@ -7090,6 +7701,7 @@ def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
 
 def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
     kwargs = _mlx_supported_kwargs(
@@ -7102,6 +7714,7 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
 
 
 def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import push_to_hub_merged
     tokenizer = tokenizer or self._tokenizer
     # Default save_directory to repo_id; callers that already saved locally
@@ -7112,6 +7725,7 @@ def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, 
 
 def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
+    _refuse_offloaded(self, "saving")
     from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
     kwargs = _mlx_supported_kwargs(
@@ -7479,6 +8093,17 @@ def _mlx_generate(self, *args, **kwargs):
         except TypeError:
             prompt_ids = tokenizer.encode(prompt_ids)
 
+    pixel_values = kwargs.pop("pixel_values", None)
+    if pixel_values is None and isinstance(prompt, dict):
+        pixel_values = prompt.get("pixel_values")
+    if pixel_values is not None and getattr(self, "_unsloth_supports_images", False):
+        import mlx.core as mx
+        if isinstance(pixel_values, (list, tuple)):
+            pixel_values = [mx.array(image) for image in pixel_values]
+        kwargs["input_embeddings"] = self.embed_inputs(mx.array(prompt_ids), pixel_values=pixel_values)
+        # As mlx_lm's generate: the prefill runs on another stream, so compute the vision rows first.
+        mx.eval(kwargs["input_embeddings"])
+
     int8_prefill = kwargs.pop("int8_prefill", None)
     streamer = kwargs.pop("streamer", None)
     max_tokens = kwargs.pop("max_tokens", None)
@@ -7575,6 +8200,42 @@ def _mlx_chat_template_batch_encoding(output):
     return BatchEncoding({"input_ids": output})
 
 
+def _is_mlx_image_input(value):
+    import numpy as np
+    from PIL import Image
+
+    if isinstance(value, (list, tuple)):
+        return bool(value) and all(_is_mlx_image_input(item) for item in value)
+    return isinstance(value, Image.Image) or isinstance(value, np.ndarray) and value.ndim == 3
+
+
+def _mlx_lm_image_inputs(tokenizer, processor, images, text=None, *, return_tensors=None,
+                         add_special_tokens=None, **kwargs):
+    """HF processor-style `input_ids`, `attention_mask` and `pixel_values` (a list of
+    per-image arrays) for one prompt of an mlx_lm image model."""
+    import numpy as np
+    from PIL import Image
+    from transformers import BatchEncoding
+
+    if isinstance(text, (list, tuple)) and len(text) == 1:
+        text = text[0]
+    if not isinstance(text, str):
+        raise ValueError("Unsloth MLX: image inputs of an mlx_lm model take one prompt string.")
+    # Arrays pass as given: the processor refuses non-uint8 ones, where a cast would corrupt [0, 1] floats.
+    images = [
+        np.asarray(image.convert("RGB")) if isinstance(image, Image.Image) else np.asarray(image)
+        for image in (images if isinstance(images, (list, tuple)) else [images])
+    ]
+    text, pixel_values = processor(text, images=images)
+    if add_special_tokens is None:
+        bos = getattr(tokenizer, "bos_token", None)
+        add_special_tokens = bos is None or not text.startswith(bos)
+    ids = tokenizer.encode(text, add_special_tokens=add_special_tokens)
+    encoding = BatchEncoding({"input_ids": [ids], "attention_mask": [[1] * len(ids)]}, tensor_type=return_tensors)
+    encoding["pixel_values"] = pixel_values
+    return encoding
+
+
 def _patch_mlx_tokenizer_call(tokenizer):
     """Patch mlx-lm TokenizerWrapper to match HF notebook tokenizer APIs."""
     if tokenizer is None:
@@ -7585,6 +8246,13 @@ def _patch_mlx_tokenizer_call(tokenizer):
     if "__call__" not in cls.__dict__:
         if hasattr(tokenizer, "_tokenizer") and callable(tokenizer._tokenizer):
             def tokenizer_wrapper_call(self, *args, **kwargs):
+                image_processor = self.__dict__.get("_unsloth_image_processor")
+                if image_processor is not None:
+                    images = kwargs.pop("images", None)
+                    if images is None and args and _is_mlx_image_input(args[0]):
+                        images, args = args[0], args[1:]
+                    if images is not None:
+                        return _mlx_lm_image_inputs(self, image_processor, images, *args, **kwargs)
                 return self._tokenizer(*args, **kwargs)
 
             tokenizer_wrapper_call._unsloth_mlx_call = True
@@ -7970,7 +8638,11 @@ def _decides(segment):
     tokens = _role_tokens(segment)
     if not tokens & {"gate", "router"}:
         return False
-    return not (tokens - {"gate", "router"}) & (_MLP_LEAVES | {"proj"})
+    rest = tokens - {"gate", "router"}
+    # talkie's `mlp_gate` is its block's gate projection, as llama.cpp's `ffn_gate` is.
+    if "router" not in tokens and rest and rest <= _MLP_PATH_TOKENS:
+        return False
+    return not rest & (_MLP_LEAVES | {"proj"})
 
 
 def _linear_role(path):
@@ -8646,6 +9318,16 @@ def _coerce_list_extra_special_tokens():
 _LAZY_WEIGHTS_ENV = "UNSLOTH_MLX_LAZY_WEIGHTS"
 
 
+def _resident_parameters(model):
+    """``model``'s parameters but the tables mlx-vlm reads row by row from disk (DeepSeek V4.1's Engram)."""
+    from mlx.utils import tree_flatten
+
+    mapped = tuple(path + "." for path, module in model.named_modules() if type(module).__name__ == "OffloadedEngramEmbedding")
+    if not mapped:
+        return model.parameters()
+    return [value for name, value in tree_flatten(model.parameters()) if not name.startswith(mapped)]
+
+
 def _materialize_weights(model):
     """Left mapped, the first GPU kernel to touch a weight can stall long enough for
     Apple's watchdog to kill the process's queue."""
@@ -8654,7 +9336,7 @@ def _materialize_weights(model):
     import mlx.core as mx
 
     try:
-        mx.eval(model.parameters())
+        mx.eval(_resident_parameters(model))
     except Exception as error:
         # Not fatal: the weights stay lazy, as before.
         print(f"Unsloth: Could not read {type(model).__name__} weights at load time: {error}")
@@ -8672,6 +9354,26 @@ def _evaluate_quantized_modules(model, sources):
         target = quantized.get(path)
         if target is not None:
             mx.eval(target.parameters())
+
+
+_LOAD_SCRATCH_DIRS = contextvars.ContextVar("unsloth_mlx_load_scratch_dirs", default=None)
+
+
+def _remove_scratch_dirs_on_error(load):
+    """A failed (and caught) load must not leave its dequantized checkpoint behind until exit."""
+    @wraps(load)
+    def wrapper(*args, **kwargs):
+        dirs = []
+        token = _LOAD_SCRATCH_DIRS.set(dirs)
+        try:
+            return load(*args, **kwargs)
+        except BaseException:
+            for path in dirs:
+                shutil.rmtree(path, ignore_errors=True)
+            raise
+        finally:
+            _LOAD_SCRATCH_DIRS.reset(token)
+    return wrapper
 
 
 def _finish_load(model, tokenizer):
@@ -8711,6 +9413,7 @@ class FastMLXModel:
 
     @staticmethod
     @_scoped_mlx_model_file_trust
+    @_remove_scratch_dirs_on_error
     def from_pretrained(
         model_name="mlx-community/Llama-3.2-1B-Instruct-4bit",
         max_seq_length=2048,
@@ -8731,6 +9434,7 @@ class FastMLXModel:
         float32_mixed_precision=None,
         pipeline_group=None,
         tensor_group=None,
+        offload=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -8759,6 +9463,23 @@ class FastMLXModel:
                 parallel text or VLM inference.
             tensor_group: Optional MLX distributed group for tensor parallel
                 text or VLM inference.
+            offload: Inference only: leave weights in the checkpoint's
+                safetensors and read them on demand. ``"off"`` / ``None``
+                (default), ``"auto"``, or a fraction in (0, 1] for both parts,
+                or ``{"ple": ..., "experts": ...}`` per part (a missing part is
+                off). ``"ple"`` is each per-layer embedding table's share read
+                by row on lookup; ``"experts"`` is each quantized MoE layer's
+                share of experts, the rest held in slots experts are read into
+                as tokens route to them (at least ``max(8, top_k)``).
+                ``"auto"`` offloads only what the weights and
+                ``max_seq_length`` need to fit in 0.85 of the GPU's recommended
+                working set, PLE tables first, and warns for each offload it
+                turns on; it turns off where offloading cannot apply
+                (adapters, runtime quantization, training, distributed loads)
+                instead of refusing. A callable decides in place of that rule,
+                for a caller that prices loads its own way: called with the
+                downloaded checkpoint's directory before any weight is read, it
+                returns either of the forms above.
 
         Reloading a saved LoRA/DoRA adapter directory returns a model whose
         base is frozen and whose adapter parameters are trainable, so it can be
@@ -8774,6 +9495,13 @@ class FastMLXModel:
         _warn_block_swap(kwargs)
         _coerce_list_extra_special_tokens()
         _mlx_active_distributed_groups(pipeline_group, tensor_group)
+        from .offload import offload_setting
+        offload = _settle_offload(
+            offload_setting(offload),
+            full_finetuning or _mlx_distributed_requested(pipeline_group, tensor_group),
+            "Unsloth: offload is for single-process inference and cannot be combined with "
+            "full_finetuning or distributed loading.",
+        )
 
         model_name, revision, _bnb_remapped_from = _remap_unsloth_bnb_hub_id_for_mlx(
             model_name, revision
@@ -8955,11 +9683,17 @@ class FastMLXModel:
         _is_adapter_dir = bool(local_path) and os.path.exists(
             os.path.join(local_path, "adapter_config.json")
         )
-        if (
+        _is_bnb_checkpoint = (
             not _is_adapter_dir
             and isinstance(_existing_quant, dict)
             and _existing_quant.get("quant_method") == "bitsandbytes"
-        ):
+        )
+        offload = _settle_offload(
+            offload, _is_adapter_dir or _is_bnb_checkpoint,
+            "Unsloth: offload reads an MLX checkpoint's own safetensors, so it cannot be used "
+            "with a LoRA adapter directory or a bitsandbytes checkpoint.",
+        )
+        if _is_bnb_checkpoint:
             _suggested = re.sub(
                 r"-(?:unsloth-)?bnb-\d+bit$", "", model_name,
             ) or model_name
@@ -9064,6 +9798,115 @@ class FastMLXModel:
             model._unsloth_base_revision = revision
             model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
             return _finish_load(model, tokenizer)
+
+        dequant_temp_dir = None
+        # Original identity when the load is rerouted through a dequant temp dir.
+        _prequant_src_path = None
+        _prequant_model_name = None
+        hf_prequant_method, hf_prequant_config = _detect_hf_prequant_method(config_data)
+        # Adapter dirs carry the base config.json but no packed weights.
+        if hf_prequant_method is not None and not _is_adapter_dir:
+            if local_path is None:
+                raise FileNotFoundError(
+                    f"Unsloth: could not resolve local files for "
+                    f"{hf_prequant_method.upper()} model '{model_name}'."
+                )
+            # The mlx-vlm branch never restores the repo or removes the scratch dir.
+            if _routes_to_mlx_vlm(config_data, config_data.get("model_type", ""), text_only):
+                raise NotImplementedError(
+                    f"Unsloth: {hf_prequant_method.upper()} runtime dequant is not "
+                    "yet supported for models MLX loads through mlx-vlm (vision "
+                    "models and mlx-vlm-only architectures). Load an unquantized base instead."
+                )
+            if hf_prequant_method == "awq" and not _awq_quant_config_is_gemm(
+                hf_prequant_config
+            ):
+                _awq_version = str(
+                    (hf_prequant_config or {}).get("version", "")
+                ).strip()
+                raise NotImplementedError(
+                    f"Unsloth: '{model_name}' is an AWQ checkpoint packed with the "
+                    f"'{_awq_version or 'unknown'}' layout, which is not supported "
+                    "on the MLX path. Only the standard AutoAWQ GEMM layout can be "
+                    "loaded (mlx-lm's native loader and the local dequant both "
+                    "assume the GEMM packing). Re-quantize with version=\"GEMM\" or "
+                    "load an unquantized base for LoRA."
+                )
+            # Dense / full-finetuning needs trainable fp16 weights, not mlx-lm's quantized base.
+            _force_dense_dequant = not quantization_spec.enabled
+            if _force_dense_dequant or _mlx_lm_would_reject_prequant(
+                hf_prequant_method, hf_prequant_config
+            ):
+                if distributed_requested:
+                    raise NotImplementedError(
+                        f"Unsloth: distributed MLX loading of the "
+                        f"{hf_prequant_method.upper()} checkpoint '{model_name}' "
+                        "is not supported: it must be dequantized to fp16 first "
+                        "and the metadata-only distributed snapshot ships no "
+                        "packed weights. Convert it with mlx_lm.convert to an MLX "
+                        "checkpoint before distributed loading."
+                    )
+                # A plain 4-bit request keeps GPTQ's own 4-bit codes (lossless MLX affine repack).
+                _gptq_affine = (
+                    hf_prequant_method == "gptq"
+                    and quantization_spec.source == "load_in_4bit"
+                    and quantization_spec.mode == "affine"
+                    and quantization_spec.quantize_modules is None
+                    and not quantization_spec.has_callable_predicate
+                    and not quantization_spec.force_requantize
+                )
+                _prequant_src_path = local_path
+                _prequant_model_name = model_name
+                dequant_dir, config_data = _materialize_dequantized_hf_checkpoint(
+                    _prequant_src_path, config_data, hf_prequant_method, hf_prequant_config,
+                    mlx_affine=_gptq_affine,
+                )
+                # Registered before any warning: warnings-as-errors must still clean it up.
+                _scratch = _LOAD_SCRATCH_DIRS.get()
+                if _scratch is not None:
+                    _scratch.append(dequant_dir)
+                if "quantization" in config_data:
+                    print(
+                        f"Unsloth: '{model_name}' is a GPTQ checkpoint; repacked its "
+                        "4-bit weights losslessly as MLX affine."
+                    )
+                else:
+                    _reason = (
+                        "a dense / 16-bit / full-finetuning load was requested"
+                        if _force_dense_dequant
+                        else "mlx-lm cannot load it natively (act-order g_idx "
+                             "or full-group AWQ)"
+                    )
+                    warnings.warn(
+                        f"Unsloth: '{model_name}' is a {hf_prequant_method.upper()} "
+                        f"pre-quantized checkpoint and {_reason}; dequantized it to "
+                        "fp16 for MLX (a LoRA base is re-quantized to MLX affine).",
+                        stacklevel=2,
+                    )
+                local_path = dequant_dir
+                model_name = dequant_dir
+                dequant_temp_dir = dequant_dir
+            else:
+                print(
+                    f"Unsloth: '{model_name}' is a standard "
+                    f"{hf_prequant_method.upper()} checkpoint; loading natively "
+                    "via mlx-lm."
+                )
+        else:
+            _other_quant = (
+                config_data.get("quantization_config")
+                if isinstance(config_data, dict) else None
+            )
+            if isinstance(_other_quant, dict):
+                _other_method = str(_other_quant.get("quant_method", "")).lower()
+                if _other_method in _HF_UNSUPPORTED_PACKED_METHODS:
+                    raise NotImplementedError(
+                        f"Unsloth: '{model_name}' uses '{_other_method}' "
+                        "quantization, which is not supported on the MLX path. "
+                        "Supported pre-quantized formats are GPTQ and AWQ "
+                        "(dequantized to MLX affine for LoRA); otherwise load an "
+                        "unquantized or MLX-quantized checkpoint."
+                    )
 
         # Reject full_finetuning on a pre-quantized repo: int4/int8 weights
         # aren't trainable (our CCE backward zeros the quantized weight grad),
@@ -9234,6 +10077,12 @@ class FastMLXModel:
                             "group_size": _MLX_QUANT_MODE_DEFAULTS["affine"][0],
                             "mode": "affine",
                         }
+                    _reload_base_load_in_4bit = _adapter_base_prefers_native_prequant(
+                        adapter_cfg,
+                        adapter_requires_runtime_quant=adapter_requires_runtime_quant,
+                        adapter_mlx_quant_config=adapter_mlx_quant_config,
+                        adapter_base_is_bnb=_adapter_base_bnb is not None,
+                    )
                     # Reload the base via FastMLXModel.from_pretrained (text +
                     # VLM); the old mlx_lm.load fallback broke VLM adapters
                     # (mlx-lm load is text-only).
@@ -9262,7 +10111,7 @@ class FastMLXModel:
                         }
                         if adapter_cfg.get("_unsloth_peft_import")
                         else {
-                            "load_in_4bit": False,
+                            "load_in_4bit": _reload_base_load_in_4bit,
                             "load_in_8bit": False,
                             "load_in_16bit": False,
                             "load_in_fp8": False,
@@ -9543,9 +10392,15 @@ class FastMLXModel:
             or text_only is not False and _mlx_vlm_only_text_model(config_data, model_type)
         )
 
+        mlx_lm_vision = _mlx_lm_serves_images(config_data, model_type)
+        mlx_lm_images = (
+            text_only is not True and mlx_lm_vision
+            and _resolve_mlx_vlm_model_class(model_type) is None
+        )
+
         if force_vlm_text_path:
             is_vlm = True
-        elif text_only is True:
+        elif text_only is True or mlx_lm_images:
             is_vlm = False
         elif text_only is False:
             is_vlm = True
@@ -9587,6 +10442,7 @@ class FastMLXModel:
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
             _ensure_exact_verify_sums_promoted()
+            _ensure_verify_qk_norm_matches_decode()
             _ensure_xing4_0_sliced_hyper_connection_base(model_type)
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
@@ -9612,6 +10468,7 @@ class FastMLXModel:
                     "using existing compatible MLX quantization.",
                     stacklevel=2,
                 )
+            offload = _settle_offload(offload, want_runtime_quant, _OFFLOAD_RUNTIME_QUANT)
 
             if want_runtime_quant:
                 import mlx.core as mx
@@ -9715,6 +10572,9 @@ class FastMLXModel:
                     vlm_load,
                     vlm_kwargs,
                     hf_token=token,
+                )
+                _apply_offload(
+                    model, original_local_path or local_path, offload, target_dtype, max_seq_length,
                 )
 
             processor = _run_with_vlm_config_view(
@@ -9833,8 +10693,10 @@ class FastMLXModel:
             return _finish_load(model, public_target)
         else:
             # Text path via mlx-lm (original behavior)
+            # Messages name the repo the user passed, not the dequant scratch dir.
+            display_name = _prequant_model_name or model_name
             quant_state = _ensure_quantization_compatible(
-                config_data, quantization_spec, model_name,
+                config_data, quantization_spec, display_name,
             )
             want_runtime_quant = quantization_spec.enabled and quant_state != "compatible"
             quantization_spec, want_runtime_quant = _resolve_distributed_runtime_quantization(
@@ -9844,16 +10706,17 @@ class FastMLXModel:
                 want_runtime_quant=want_runtime_quant,
             )
 
+            offload = _settle_offload(offload, want_runtime_quant, _OFFLOAD_RUNTIME_QUANT)
             if want_runtime_quant:
                 print(
                     f"Unsloth: Loading {model_name} via mlx-lm "
                     f"(runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)..."
                 )
             else:
-                print(f"Unsloth: Loading {model_name} via mlx-lm...")
+                print(f"Unsloth: Loading {display_name} via mlx-lm...")
                 if quantization_spec.enabled and quant_state == "compatible":
                     warnings.warn(
-                        f"Unsloth: '{model_name}' is already quantized — "
+                        f"Unsloth: '{display_name}' is already quantized — "
                         "using existing compatible MLX quantization.",
                         stacklevel=2,
                     )
@@ -9864,6 +10727,8 @@ class FastMLXModel:
                 return_config=True,
                 revision=revision,
             )
+            if mlx_lm_vision and not mlx_lm_images:
+                mlx_load_kwargs["model_config"] = {"vision_config": None}
             if target_dtype is not None or want_runtime_quant:
                 mlx_load_kwargs["lazy"] = True
             if _mlx_distributed_requested(pipeline_group, tensor_group):
@@ -9883,6 +10748,9 @@ class FastMLXModel:
                     mlx_load,
                     mlx_load_kwargs,
                     hf_token=token,
+                )
+                _apply_offload(
+                    model, original_local_path or local_path, offload, target_dtype, max_seq_length,
                 )
 
             if want_runtime_quant:
@@ -9914,27 +10782,51 @@ class FastMLXModel:
                 strict=False,
             )
             model._is_vlm_model = False
+            if mlx_lm_images:
+                from mlx_lm.processors import load_processor
+                tokenizer._unsloth_image_processor = load_processor(model, config)
+                model._unsloth_supports_images = True
+                model._unsloth_modality_model_type = model_type
 
             model._config = config
-            model._hf_repo = model_name
-            model._src_path = original_local_path or local_path
-            # Mirror the VLM branch: sidecar-saving uses the patched dir when one
-            # was materialized (no-op for text, where local_path == original).
-            model._config_src_path = local_path or original_local_path
-            model._unsloth_base_revision = revision
-            model._unsloth_base_commit_hash = _infer_snapshot_commit(
-                original_local_path or local_path
-            )
+            if dequant_temp_dir is not None:
+                # Point save/reload at the real repo, not the deleted temp dir.
+                model._hf_repo = _prequant_model_name
+                model._src_path = _prequant_src_path
+                model._config_src_path = _prequant_src_path
+                model._unsloth_base_revision = revision
+                model._unsloth_base_commit_hash = _infer_snapshot_commit(
+                    _prequant_src_path
+                )
+            else:
+                model._hf_repo = model_name
+                model._src_path = original_local_path or local_path
+                model._config_src_path = local_path or original_local_path
+                model._unsloth_base_revision = revision
+                model._unsloth_base_commit_hash = _infer_snapshot_commit(
+                    original_local_path or local_path
+                )
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
             if quant_state == "compatible":
-                model._unsloth_quantization_config = _get_existing_mlx_quantization(config_data)
+                # Repacked GPTQ keeps quant_method, as native AWQ does, so an adapter reload replays it.
+                model._unsloth_quantization_config = (
+                    {**config_data["quantization"], "quant_method": hf_prequant_method}
+                    if dequant_temp_dir is not None
+                    else _get_existing_mlx_quantization(config_data)
+                )
                 model._unsloth_quantization_policy = quantization_spec.to_metadata()
                 model._unsloth_quantized_source = "mlx_config"
             _patch_mixed_precision_set_dtype(model)
 
             _patch_mlx_saving(model, tokenizer)
+
+            if dequant_temp_dir is not None:
+                import mlx.core as mx
+
+                mx.eval(model.parameters())
+                shutil.rmtree(dequant_temp_dir, ignore_errors=True)
             return _finish_load(model, tokenizer)
 
     @staticmethod
@@ -9969,15 +10861,18 @@ class FastMLXModel:
         when the model was loaded with ``full_finetuning=True``.
         """
         _warn_block_swap(kwargs)
+        _refuse_offloaded(model, "LoRA training")
         loftq_config = kwargs.pop("loftq_config", None)
         if loftq_config is not None:
             raise NotImplementedError(
                 "Unsloth: loftq_config is not supported for MLX LoRA yet."
             )
         qat_scheme = kwargs.pop("qat_scheme", None)
-        if qat_scheme is not None:
-            raise NotImplementedError(
-                "Unsloth: qat_scheme is not supported for MLX LoRA yet."
+        if qat_scheme not in (None, False):
+            # Before the full_finetuning early return, else QAT is silently dropped.
+            from .qat import validate_mlx_qat_request
+            validate_mlx_qat_request(
+                model, qat_scheme, lora_dropout=lora_dropout, use_dora=use_dora,
             )
         if bias not in (None, False, "none"):
             print(
@@ -10190,8 +11085,12 @@ class FastMLXModel:
                 linear_to_lora_layers(
                     lm, num_layers,
                     {**lora_config, "keys": language_lora_keys,
-                     "layer_keys": language_layer_keys}, dry_run=True,
+                     "layer_keys": language_layer_keys,
+                     "qat_scheme": qat_scheme}, dry_run=True,
                 )
+            if qat_scheme not in (None, False) and not language_lora_keys:
+                from .qat import validate_mlx_qat_targets
+                validate_mlx_qat_targets((), qat_scheme)
 
             # Scopes embedding_learning_rate to exactly these tensors.
             model._unsloth_cpt_full_module_weight_keys = (
@@ -10299,6 +11198,9 @@ class FastMLXModel:
                 _apply_layer_lora = finetune_language_layers and (
                     language_lora_keys is None or len(language_lora_keys) > 0
                 )
+            if qat_scheme not in (None, False) and not _apply_layer_lora:
+                from .qat import validate_mlx_qat_targets
+                validate_mlx_qat_targets((), qat_scheme)
             if _apply_layer_lora:
                 # Compat patch (older mlx-lm rejects scale=/dropout= on
                 # from_base); before the seed since monkey-patching doesn't
@@ -10312,7 +11214,8 @@ class FastMLXModel:
                     model,
                     num_layers=num_layers,
                     config={**lora_config, "keys": language_lora_keys,
-                            "layer_keys": language_layer_keys},
+                            "layer_keys": language_layer_keys,
+                            "qat_scheme": qat_scheme},
                 )
                 if language_lora_count == 0:
                     _raise_no_lora_targets(target_modules, model, _requested_target_modules)
@@ -10334,6 +11237,11 @@ class FastMLXModel:
         _apply_mlx_lora_initialization(model, init_lora_weights)
         # Adapters are invisible to a cached weight fusion.
         _disable_fused_input_projections(model)
+
+        if qat_scheme not in (None, False):
+            from .qat import apply_mlx_qat
+            # Text-only VLMs: only the validated language tower is simulated.
+            apply_mlx_qat(model.language_model if is_vlm else model)
 
         # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):

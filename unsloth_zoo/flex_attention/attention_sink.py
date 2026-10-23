@@ -35,6 +35,8 @@ from .utils import (
     _flex_attention as uncompiled_flex_attention,
     flex_attention,
     FlexAttentionCache,
+    FLEX_LSE_KWARGS,
+    flex_output_and_lse,
 
     causal_mask,
     generate_causal_mask_with_padding,
@@ -120,7 +122,7 @@ def old_flex_attention_with_sink(
         if type(sliding_window) is int and sliding_window != 0 else \
         causal_mask_with_sink
     score_mod = generate_sink_score_mod(sink_weights)
-    block_mask = compiled_create_block_mask(mask_mod, qlen_Q, qlen_KV+1, device = key.device) # +1 for padding
+    block_mask = compiled_create_block_mask(mask_mod, None, None, qlen_Q, qlen_KV+1, device = key.device) # +1 for padding
     attn_output = (flex_attention if compile else uncompiled_flex_attention)(
         query,
         key_padded,
@@ -223,7 +225,7 @@ def flex_attention_with_sink(
     if block_mask is None:
         block_mask = compiled_create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
 
-    attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
+    attn_output, logsumexp = flex_output_and_lse((flex_attention if compile else uncompiled_flex_attention)(
         query,
         key,
         value,
@@ -231,8 +233,8 @@ def flex_attention_with_sink(
         score_mod = None, # None needed
         enable_gqa = enable_gqa,
         scale = scale,
-        return_lse = True, # log(sum(exp(xi)))
-    )
+        **FLEX_LSE_KWARGS, # log(sum(exp(xi)))
+    ))
 
     #### 3 versions to add sink tokens ####
     #### Version 1: Basic reciprocal denominator removal
@@ -268,7 +270,7 @@ def flex_attention_with_sink_decoding(
     enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
     scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None) or scale
     block_mask = self_attn._flex_attention_cache(key)
-    attn_output, logsumexp = flex_attention(
+    attn_output, logsumexp = flex_output_and_lse(flex_attention(
         query,
         key,
         value,
@@ -276,8 +278,8 @@ def flex_attention_with_sink_decoding(
         score_mod = None, # None needed
         enable_gqa = enable_gqa,
         scale = scale,
-        return_lse = True, # log(sum(exp(xi)))
-    )
+        **FLEX_LSE_KWARGS, # log(sum(exp(xi)))
+    ))
     return attn_output, logsumexp
 pass
 

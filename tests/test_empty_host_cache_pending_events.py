@@ -63,9 +63,9 @@ def test_pageable_fallback_frees_block_last_used_by_async_copy(gc_module, monkey
     grown = gc_module._grow_host_buffer(x, 2 * n)  # host RAM "full": pageable
     assert not grown.is_pinned()
     del x
-    assert torch.cuda.host_memory_stats()["allocated_bytes.current"] > base
-    assert gc_module._empty_host_cache() is True
+    # The fallback itself frees the old block (its last use was the async copy above).
     assert torch.cuda.host_memory_stats()["allocated_bytes.current"] == base
+    assert gc_module.GC_PINNED_BYTES == 0 and not any(gc_module._PINNED_CACHED.values())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA pinned memory")

@@ -57,8 +57,9 @@ def _moe_router_gate_names(model):
     return names
 
 
-# Mirrors PEFT's _check_lora_target_modules_mamba in peft/tuners/tuners_utils.py.
-MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h"))
+# PEFT's _check_lora_target_modules_mamba set, plus nemotron_h_puzzle (Nemotron 3.5 Bolt): its
+# fused Mamba kernel reads out_proj.weight directly, bypassing a LoRA adapter there.
+MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h", "nemotron_h_puzzle"))
 MAMBA_ONLY_LEAVES = frozenset(("out_proj", "conv1d"))
 # Mamba, Mamba2, Nemotron-H name the mixer `mixer`; Falcon-H1, Bamba, Zamba2 `mamba`.
 MAMBA_MIXER_NAMES = ("mixer", "mamba")
@@ -382,10 +383,14 @@ def get_peft_regex(
     # modules are not tagged with vision keywords): drop the model-part requirement.
     # Never broaden for audio-only (regex_model_parts == ""), which would otherwise
     # pull in the whole language stack.
+    # fullmatch like PEFT: re.search finds `model.layers.` inside CSM's `depth_decoder.model.layers.`,
+    # which PEFT then rejects ("Target modules ... not found").
     if regex_model_parts != "":
-        check = any(re.search(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
+        check = any(re.fullmatch(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
         if not check:
+            # Frozen audio codecs (CSM / Kyutai Mimi) run under no_grad, so LoRA there never trains.
             regex_matcher = \
+                r"(?!(?:.*\.)?(?:codec_model|audio_tokenizer|acoustic_tokenizer|semantic_tokenizer)\.)" + \
                 r".*?(?:" + regex_components + \
                 r").*?\." + match_linear_modules
     pass
@@ -467,27 +472,48 @@ def get_lora_layer_modules():
 pass
 
 
+def _outside_compiled_region(root, embeddings):
+    """The input embedding's outermost ancestor below `root` whose class Unsloth's compiler swapped in
+    (AST's ASTEmbeddings): a hook there runs outside torch.compile, where requires_grad_() is allowed."""
+    path = next((name for name, sub in root.named_modules() if sub is embeddings), None)
+    if not path:
+        return embeddings
+    current = root
+    for part in path.split(".")[:-1]:
+        current = getattr(current, part)
+        if type(current).__module__.startswith("unsloth_compiled_module"):
+            return current
+    return embeddings
+pass
+
+
 def requires_grad_for_gradient_checkpointing(model):
     # All Unsloth Zoo code licensed under LGPLv3
     # Enables requires_grad to make gradient checkpointing work on
     # non language models that don't just use .embed_tokens
     def register_other_hooks(name1, name2, module, _hooks):
         old_hooks = eval(f"module.{_hooks}")
+        # Hooks registered with_kwargs = True (Unsloth's inputs_embeds pre-hook) take (module, args,
+        # kwargs): re-register them the same way, or the next forward calls them with two arguments.
+        with_kwargs = set(getattr(module, f"{_hooks}_with_kwargs", None) or ())
         other_hooks = []
-        for value in old_hooks.values():
+        for key, value in old_hooks.items():
             qualname = getattr(value, "__qualname__", "")
             name     = getattr(value, "__name__", "")
             if name1 in qualname or name2 in qualname: pass
             elif name2 in name or name2 in name: pass
-            else: other_hooks.append(value)
+            else: other_hooks.append((value, key in with_kwargs))
         pass
         # Keep none input requires grad hooks
         exec(f"module.{_hooks} = OrderedDict()")
-        if _hooks == "_forward_pre_hooks":
-            if hasattr(module, "_forward_pre_hooks_with_kwargs"):
-                module._forward_pre_hooks_with_kwargs.clear()
-        for hook in other_hooks:
-            exec(f"module.register{_hooks[:-1]}(hook)")
+        if hasattr(module, f"{_hooks}_with_kwargs"):
+            getattr(module, f"{_hooks}_with_kwargs").clear()
+        register = getattr(module, f"register{_hooks[:-1]}")
+        for hook, kwargs_hook in other_hooks:
+            if kwargs_hook:
+                register(hook, with_kwargs = True)
+            else:
+                register(hook)
         pass
     pass
 
@@ -532,6 +558,13 @@ def requires_grad_for_gradient_checkpointing(model):
         # grad (a compiled decode step) nothing is recorded, so the flip is moot there.
         if torch.compiler.is_compiling() and (target.requires_grad or not torch.is_grad_enabled()): return
         target.requires_grad_(True)
+    pass
+
+    def requires_grad_post_hook_eager(module, input, output):
+        # Gemma 3N's multimodal embedder also has an Embedding child but runs compiled, where the flip
+        # is a graph break and needless (its LoRA projection sits right after); Dia's encoder runs eager.
+        if torch.compiler.is_compiling(): return
+        requires_grad_post_hook(module, input, output)
     pass
 
     def requires_grad_pre_hook(module, args, kwargs):
@@ -673,6 +706,8 @@ def requires_grad_for_gradient_checkpointing(model):
                 )
             else:
                 # Keep `module` on the tower: the fallback below hooks it.
+                if embeddings is not None:
+                    embeddings = _outside_compiled_region(module, embeddings)
                 try:
                     register_other_hooks(
                         "requires_grad_post_hook",
@@ -700,6 +735,17 @@ def requires_grad_for_gradient_checkpointing(model):
             )
             module.register_forward_pre_hook(requires_grad_pre_hook, with_kwargs=True)
             logger.info(f"Unsloth: Registered pre-forward gradient hook on `{module_name}`.")
+            # A tower fed only token ids with no get_input_embeddings (Dia's encoder) gives the pre-hook
+            # no float input, so its checkpointed layers would get no gradients: hook its own Embedding.
+            embedding = next((c for c in module.children() if isinstance(c, torch.nn.Embedding)), None)
+            if embedding is not None:
+                register_other_hooks(
+                    "requires_grad_post_hook",
+                    "requires_grad_post_hook",
+                    embedding,
+                    "_forward_hooks",
+                )
+                embedding.register_forward_hook(requires_grad_post_hook_eager)
         pass
     pass
 pass

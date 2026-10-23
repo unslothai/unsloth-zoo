@@ -263,6 +263,69 @@ def test_hub_wrapper_forwards_seq_idx(monkeypatch):
     torch.testing.assert_close(hub_fn(x, w, None, activation = "silu"), causal_conv1d_fn(x, w, None, "silu"))
 
 
+
+def _fake_kernels_decorator(layer_name):
+    """What `kernels.use_kernel_forward_from_hub` does to a function: a layer instance whose
+    class carries `kernel_layer_name`."""
+    def decorator(fn):
+        class Func(torch.nn.Module):
+            def forward(self, *args, **kwargs):
+                return fn(*args, **kwargs)
+
+        Func.kernel_layer_name = layer_name
+        return Func()
+    return decorator
+
+
+def _hub_conv(hidden_states, weight, bias = None, activation = None, **kwargs):
+    return gcc.causal_conv1d_reference(hidden_states, weight, bias, activation)
+
+
+_hub_conv.__module__ = "transformers.models.qwen3_5.modeling_qwen3_5"
+
+
+def _check_hub_layer_routing(hub_fn):
+    x, w = torch.randn(1, 8, 6, dtype = torch.float64), torch.randn(8, 4, dtype = torch.float64)
+    seq_idx = _seq_idx_from_lengths([[2, 4]])
+    torch.testing.assert_close(hub_fn(x, w, None, activation = "silu", seq_idx = seq_idx),
+                               _per_document(x, w, None, "silu", seq_idx))
+    torch.testing.assert_close(hub_fn(x, w, None, activation = "silu"), _hub_conv(x, w, None, "silu"))
+
+
+def test_hub_layer_instance_keeps_its_kernel_metadata():
+    # kernels' decorator returns a layer instance; use_kernelized_func checks `kernel_layer_name`
+    # and kernelize reads it from type(fn), so the GDN routing must not replace it with a function.
+    hub_fn = gcc._hub_gdn_function(_fake_kernels_decorator("causal_conv1d_fn"), _hub_conv)
+    assert isinstance(hub_fn, torch.nn.Module)
+    assert type(hub_fn).kernel_layer_name == "causal_conv1d_fn"
+    assert gcc._is_marked(hub_fn)
+    assert "seq_idx" in inspect.signature(hub_fn).parameters
+    _check_hub_layer_routing(hub_fn)
+
+    # kernelize swaps the instance forward for the hub kernel's; that must take effect.
+    class Kernel(torch.nn.Module):
+        def forward(self, x, *args, **kwargs):
+            return x * 0 + 7
+
+    from types import MethodType
+    hub_fn.forward = MethodType(Kernel.forward, hub_fn)
+    x, w = torch.randn(1, 8, 6), torch.randn(8, 4)
+    assert torch.equal(hub_fn(x, w), torch.full_like(x, 7))
+
+
+def test_hub_layer_passes_real_kernels_validation():
+    kernels = pytest.importorskip("kernels")
+    hub_fn = gcc._hub_gdn_function(kernels.use_kernel_forward_from_hub("causal_conv1d_fn"), _hub_conv)
+    assert hasattr(hub_fn, "kernel_layer_name")
+
+    @kernels.use_kernelized_func(hub_fn)
+    class Layer(torch.nn.Module):
+        pass
+
+    assert Layer()._kernel_funcs
+    _check_hub_layer_routing(hub_fn)
+
+
 def _wide_ids(lengths, labels, dtype, device):
     return torch.repeat_interleave(
         torch.tensor(labels, dtype = torch.int64), torch.tensor(lengths),
