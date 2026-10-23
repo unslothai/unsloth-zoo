@@ -62,6 +62,7 @@ def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):
     assert rr.grpo_scorer_keeps_logits({"support_top_k": 20})
     assert rr.grpo_scorer_keeps_logits({"support_top_p": 0.9})
     assert rr.grpo_scorer_keeps_logits({"support_min_p": 0.05})
+    assert rr.grpo_scorer_keeps_logits({"support_excluded_ids": torch.arange(4)})
     assert rr.grpo_scorer_keeps_logits(fp32_lm_head = True)
     monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
     assert rr.grpo_scorer_keeps_logits()

@@ -218,7 +218,8 @@ def chunked_hidden_states_selective_log_softmax(
     # All Unsloth Zoo code licensed under AGPL3
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
     if (fused_linear and _chunked_logprob._FUSED_LINEAR and not fp32_lm_head
-            and support_top_k == 0 and support_top_p == 1.0 and support_min_p == 0.0):
+            and support_top_k == 0 and support_top_p == 1.0 and support_min_p == 0.0
+            and support_excluded_ids is None):
         return _chunked_logprob.unsloth_chunked_logprobs(
             hidden_states, lm_head, index,
             temperature = temperature,
@@ -616,6 +617,7 @@ def grpo_scorer_keeps_logits(support_kwargs = None, **extra_kwargs):
         or support.get("support_top_k", 0)
         or support.get("support_top_p", 1.0) != 1.0
         or support.get("support_min_p", 0.0)
+        or support.get("support_excluded_ids") is not None
         or os.environ.get("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "1") == "0"
     )
 

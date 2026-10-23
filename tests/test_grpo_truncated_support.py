@@ -98,6 +98,20 @@ def test_support_scoring_matches_vllm_processed_logprobs(top_p, top_k, min_p):
     torch.testing.assert_close(got_hidden, expected, atol = 1e-4, rtol = 1e-4)
 
 
+def test_excluded_ids_alone_drop_padded_vocab_rows():
+    # Padded vocab rows the engine never samples: the scorer must drop them even without top_k / top_p / min_p.
+    g = torch.Generator().manual_seed(4)
+    hidden = torch.randn(1, 8, 32, generator = g)
+    lm_head = torch.randn(128, 32, generator = g) * 0.3
+    ids = torch.randint(0, 64, (1, 8), generator = g)
+    logits = (hidden @ lm_head.t()).double()
+    expected = torch.log_softmax(logits[..., :64], dim = -1).gather(-1, ids[..., None]).squeeze(-1)
+    got = rr.chunked_hidden_states_selective_log_softmax(
+        hidden, lm_head, ids, 4, support_excluded_ids = torch.arange(64, 128),
+    )
+    torch.testing.assert_close(got.double(), expected, atol = 1e-5, rtol = 0)
+
+
 def test_token_outside_recomputed_set_stays_finite_and_grads_flow():
     g = torch.Generator().manual_seed(2)
     hidden = torch.randn(1, 8, 16, generator = g, requires_grad = True)
