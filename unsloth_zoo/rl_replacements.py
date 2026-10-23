@@ -2682,7 +2682,8 @@ def grpo_accumulated_loss(
             lm_head, lm_head_bias = _zero3_head
 
         # UNSLOTH_VLLM_FP32_LM_HEAD: every projector casts the head to fp32. Cast once per call instead, so the
-        # mini-batches kept until the loss save one shared fp32 copy rather than one each.
+        # mini-batches kept until the loss save one shared fp32 copy rather than one each. Cast lazily in
+        # _refresh_lm_head, which every scoring path calls after its forward, so the copy never overlaps one.
         import inspect as _inspect
         from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as _projector
         _fp32_lm_head = _inspect.signature(_projector).parameters["fp32_lm_head"].default
@@ -2710,8 +2711,6 @@ def grpo_accumulated_loss(
             lm_head = output_embeddings.weight
             lm_head_bias = getattr(output_embeddings, "bias", None)
             _fp32_bind()
-
-        _fp32_bind()
 
         from unsloth_zoo.rl_replacements import grpo_truncated_support_kwargs
         _support_kwargs = grpo_truncated_support_kwargs(trainer)
