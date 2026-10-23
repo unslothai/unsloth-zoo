@@ -56,7 +56,8 @@ def test_float64_output_is_exact_on_every_torch(monkeypatch, old_torch_path, dev
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "no CUDA")
 @pytest.mark.parametrize("old_torch_path", [False, True])
-def test_float64_temporaries_stay_within_the_chunk_budget(monkeypatch, old_torch_path):
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_temporaries_stay_within_the_chunk_budget(monkeypatch, old_torch_path, dtype):
     if old_torch_path:
         monkeypatch.setattr(mxd, "_LDEXP_EXACT", False)
     blocks = torch.full((8192, 128, 16), 0x77, dtype = torch.uint8, device = "cuda")
@@ -65,10 +66,12 @@ def test_float64_temporaries_stay_within_the_chunk_budget(monkeypatch, old_torch
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    out = mxfp4_dequantize_torch(blocks, scales, dtype = torch.float64)
+    out = mxfp4_dequantize_torch(blocks, scales, dtype = dtype)
     temp = torch.cuda.max_memory_allocated() - base - out.numel() * out.element_size()
-    # Merge base peaks at 516 MiB here on every torch; the old float64 ldexp + where path reached 773 MiB.
-    assert temp <= 2 * mxd._TORCH_CHUNK_BYTES + (8 << 20), temp / 2**20
+    # float64: merge base peaks at 516 MiB on every torch, the old ldexp + where path reached 773 MiB.
+    # float32 on old torch: merge base 324 MiB, sizing its chunks for 8 bytes per value reached 389 MiB.
+    limit = (2 if dtype == torch.float64 else 1.25) * mxd._TORCH_CHUNK_BYTES + (8 << 20)
+    assert temp <= limit, temp / 2**20
 
 
 @pytest.mark.parametrize("block_bytes", [8, 16])

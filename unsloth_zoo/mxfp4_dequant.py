@@ -62,8 +62,8 @@ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = F
     scales_in = scales.reshape(R, G)
     # Transposed: row r lands in column r % N of expert r // N; a chunk never crosses an expert.
     dst = buf.view(R // N, G * B * 2, N) if transpose else buf.view(R, G * B * 2)
-    # Live bytes per value: 8 native; the fp32 detour also holds ldexp/where outputs and the cast (~18).
-    per_value = 8 if work == dtype else 20
+    # Live bytes per value: 8 native; the fp32 detour (float32 output too) also holds ldexp/where outputs and the cast (~18).
+    per_value = 8 if _LDEXP_EXACT or dtype == torch.float64 else 20
     step = max(1, min(N if transpose else R, _TORCH_CHUNK_BYTES // (G * B * 2 * per_value)))
     if max_rows is not None:
         # A caller's memory-derived limit (rows of G blocks) wins over the fixed budget.
