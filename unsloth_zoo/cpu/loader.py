@@ -117,6 +117,10 @@ class FastCPUModel:
             _print("8-bit loading is not supported on CPU, loading 16-bit weights instead.")
         if token is None:
             token = os.environ.get("HF_TOKEN")
+        # The transformers spelling: honoured, and never passed twice next to the resolved dtype.
+        torch_dtype = kwargs.pop("torch_dtype", None)
+        if dtype is None and torch_dtype is not None:
+            dtype = torch_dtype
         dtype = _resolve_dtype(dtype)
 
         # 4-bit only where bitsandbytes' CPU backend really runs; full finetuning never quantizes.
@@ -128,11 +132,14 @@ class FastCPUModel:
         # trainable, so training resumes and merged exports see a PeftModel.
         adapter_name = adapter_revision = None
         hub_kwargs = {k: kwargs[k] for k in ("cache_dir", "local_files_only") if k in kwargs}
-        base = _adapter_base_model(model_name, token, revision, **hub_kwargs)
+        adapter_kwargs = dict(hub_kwargs, **({"subfolder": kwargs["subfolder"]} if kwargs.get("subfolder") else {}))
+        base = _adapter_base_model(model_name, token, revision, **adapter_kwargs)
         if base is not None:
             # The caller's revision names the adapter repo's branch; the base keeps the one the adapter recorded.
             adapter_name, adapter_revision = model_name, revision
             model_name, revision = base
+            # A subfolder locates the adapter inside its repo, not the base model.
+            kwargs.pop("subfolder", None)
             _print(f"{adapter_name} is a LoRA adapter; loading its base {model_name} first.")
         if not use_4bit and _PREQUANTIZED_SUFFIX.search(model_name):
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
@@ -184,7 +191,7 @@ class FastCPUModel:
         )
         try:
             if adapter_name is not None and tokenizer_name == adapter_name:
-                tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **{**tokenizer_kwargs, "revision": adapter_revision})
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **{**tokenizer_kwargs, **adapter_kwargs, "revision": adapter_revision})
             else:
                 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **tokenizer_kwargs)
         except (OSError, ValueError):
@@ -223,7 +230,7 @@ class FastCPUModel:
                 # Tokens added during finetuning: the saved embed_tokens / lm_head are that size.
                 model.resize_token_embeddings(len(tokenizer))
             model = PeftModel.from_pretrained(
-                model, adapter_name, is_trainable = True, token = token, revision = adapter_revision, **hub_kwargs,
+                model, adapter_name, is_trainable = True, token = token, revision = adapter_revision, **adapter_kwargs,
             )
             model.max_seq_length = max_seq_length
             FastCPUModel._attach(model)
@@ -367,7 +374,8 @@ def _with_fused_projections(target_modules, leaf_names):
 def _adapter_base_model(model_name, token, revision, **hub_kwargs):
     """(base model, base revision) when model_name is a PEFT adapter checkpoint (local dir or Hub repo), else None."""
     try:
-        if os.path.isdir(model_name) and not os.path.isfile(os.path.join(model_name, "adapter_config.json")):
+        local = os.path.join(model_name, hub_kwargs.get("subfolder") or "")
+        if os.path.isdir(model_name) and not os.path.isfile(os.path.join(local, "adapter_config.json")):
             return None
         from peft import PeftConfig
         # Cache-aware (works offline for a cached adapter); a plain model repo raises here.

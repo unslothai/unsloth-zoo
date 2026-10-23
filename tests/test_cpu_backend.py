@@ -621,3 +621,39 @@ def test_adapter_and_base_revisions_stay_separate(monkeypatch):
     assert seen["base"] == ("org/base", "base-rev")
     assert seen["adapter"] == ("org/lora", "adapter-rev")
     assert seen["tok"] == ("org/lora", "adapter-rev")
+
+
+def test_adapter_in_a_subfolder_is_found_and_loaded_from_it(monkeypatch, tmp_path):
+    import peft
+    import transformers
+    from unsloth_zoo.cpu import loader
+    base_dir, repo = tmp_path / "base", tmp_path / "repo"
+    _tiny_llama().save_pretrained(base_dir)
+    trained = peft.get_peft_model(transformers.AutoModelForCausalLM.from_pretrained(base_dir),
+                                  peft.LoraConfig(r = 4, target_modules = ["q_proj"], task_type = "CAUSAL_LM"))
+    trained.save_pretrained(repo / "checkpoint")
+    seen = {}
+    real_load = transformers.AutoModelForCausalLM.from_pretrained
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained",
+                        lambda name, **k: seen.update(base = (name, k.get("subfolder"))) or real_load(name, **k))
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    model, _ = loader.FastCPUModel.from_pretrained(str(repo), subfolder = "checkpoint", load_in_4bit = False,
+                                                   dtype = torch.float32)
+    assert isinstance(model, peft.PeftModel)
+    assert seen["base"] == (str(base_dir), None)
+
+
+def test_torch_dtype_alias_is_used_and_not_passed_twice(monkeypatch):
+    import transformers
+    from unsloth_zoo.cpu import loader
+    seen = {}
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
+
+    def fake_load(name, **k):
+        seen.update(k)
+        return _tiny_llama()
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_load)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    loader.FastCPUModel.from_pretrained("org/model", torch_dtype = torch.float32, load_in_4bit = False)
+    assert "torch_dtype" not in seen or "dtype" not in seen
+    assert torch.float32 in (seen.get("dtype"), seen.get("torch_dtype"))
