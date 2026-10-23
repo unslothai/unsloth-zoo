@@ -143,7 +143,10 @@ def test_router_logits_capture_compiles_once_for_all_layers():
 def test_router_logits_list_length_recompiles_without_scratch():
     # Control: the guard this fix removes is real on this torch.
     frames, got, want = _run_layers(None)
-    assert frames >= len(LENGTHS) - 1
+    # Dynamo stops recompiling at its limit (8 by default; importing unsloth_zoo raises it).
+    config = torch._dynamo.config
+    limit = getattr(config, "recompile_limit", getattr(config, "cache_size_limit", 8))
+    assert frames >= min(len(LENGTHS) - 1, limit)
     assert len(got) == len(want)
 
 
