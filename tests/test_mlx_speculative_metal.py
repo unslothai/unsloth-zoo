@@ -761,6 +761,15 @@ def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit
     # The first decode step and the verify block each matched on their first layer, then served every other one.
     admitted = [key for key, verdict in inference._VERIFY_VERDICTS.items() if verdict]
     assert {key[0] for key in admitted} == {(1, 1), (1, 5)} and all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted)
+    # A drafted target settles its projections' multi-row kernels at load, through the batch-invariant forward too.
+    projections = [p for _, p in lm.named_modules() if type(p).__name__ == "QuantizedLinear"]
+    for p in projections:
+        p.__dict__.pop("_unsloth_qmv_rows", None)
+    monkeypatch.setattr(model, "generate", lambda *args, **kwargs: None, raising = False)
+    monkeypatch.setattr(model, "_unsloth_speculates", True, raising = False)
+    inference.warm_inference(model)
+    tags = [vars(p).get("_unsloth_qmv_rows") for p in projections]
+    assert projections and all(tags) and any(tag[2] for tag in tags)
 
 
 def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qwen4):

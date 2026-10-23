@@ -6535,11 +6535,11 @@ def warm_inference(model, int8_prefill = None):
 
 
 def _warm_qmv_rows(model):
-    """Settle `_qmv_rows_kernel` for the projections of every language model the verify scope serves, for a model a
+    """Settle `_qmv_rows_kernel` for the projections of every language model the multi-row scopes serve, for a model a
     drafter was built for."""
     if not getattr(model, "_unsloth_speculates", False) or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS") == "0":
         return
-    with exact_speculative_verify(model):
+    with exact_speculative_verify(model), exact_batch_invariant_decode(model):
         served = [language for _, language in model.named_modules() if vars(language).get("_unsloth_verify_scopes")]
         for p in {id(p): p for language in served for _, p in language.named_modules()
                   if isinstance(p, nn.QuantizedLinear)}.values():
