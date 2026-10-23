@@ -473,7 +473,8 @@ def test_gguf_export_drops_the_unrequested_bf16_intermediate(monkeypatch, tmp_pa
     def quantize(src, dst, method, quantizer_location, print_output):
         open(dst, "w").close()
 
-    monkeypatch.setattr(loader, "save_pretrained_merged", lambda *a, **k: None)
+    from types import SimpleNamespace
+    monkeypatch.setattr(loader, "_merged_copy", lambda model, method: (SimpleNamespace(save_pretrained = lambda d: None), False))
     monkeypatch.setattr(llama_cpp, "install_llama_cpp", lambda print_output = False: ("q", "c"))
     monkeypatch.setattr(llama_cpp, "convert_to_gguf", convert)
     monkeypatch.setattr(llama_cpp, "quantize_gguf", quantize)
@@ -832,3 +833,25 @@ def test_f16_gguf_is_staged_unrounded_and_converted_directly(monkeypatch, tmp_pa
     loader.save_pretrained_gguf(_tiny_llama().float(), str(tmp_path / "m"), quantization_method = methods)
     assert staged["dtype"] == "float32"
     assert "f16" in converted and "f16" not in quantized
+
+
+@pytest.mark.parametrize("methods", ["bf16", "q4_k_m"])
+def test_gguf_on_a_cpu_without_native_bf16_is_not_rounded_through_fp16(monkeypatch, tmp_path, dtype_policy, methods):
+    import json
+    import unsloth_zoo.llama_cpp as llama_cpp
+    from unsloth_zoo.cpu import loader
+    dtype_policy("0", "0")
+    staged = {}
+
+    def convert(prefix, merged, model_dtype, quantization_type, converter_location):
+        config = json.load(open(os.path.join(merged, "config.json")))
+        staged["dtype"] = config.get("torch_dtype") or config.get("dtype")
+        path = f"{prefix}.{quantization_type.upper()}.gguf"
+        open(path, "w").close()
+        return [path], None
+
+    monkeypatch.setattr(llama_cpp, "install_llama_cpp", lambda print_output = False: ("q", "c"))
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", convert)
+    monkeypatch.setattr(llama_cpp, "quantize_gguf", lambda src, dst, *a, **k: open(dst, "w").close())
+    loader.save_pretrained_gguf(_tiny_llama().float(), str(tmp_path / "m"), quantization_method = methods)
+    assert staged["dtype"] == "float32"

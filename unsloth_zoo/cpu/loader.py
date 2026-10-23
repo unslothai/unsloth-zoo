@@ -520,15 +520,13 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
         )
     os.makedirs(save_directory, exist_ok = True)
     merged_directory = os.path.join(save_directory, "merged_16bit")
+    # Stage the merged weights unrounded: the converter casts once to each requested type, instead of
+    # rounding through fp16 / bf16 first (fp16 on a CPU without native bf16 would also clip bf16's range).
     unrounded = [m for m in methods if m in ("f32", "f16")]
-    if unrounded:
-        # F32 / F16 GGUFs come from unrounded weights, not bf16-rounded ones the converter re-casts.
-        staged, _ = _merged_copy(self, "merged_32bit")
-        staged.save_pretrained(merged_directory)
-        if tokenizer is not None:
-            tokenizer.save_pretrained(merged_directory)
-    else:
-        save_pretrained_merged(self, merged_directory, tokenizer, save_method = "merged_16bit")
+    staged, _ = _merged_copy(self, "merged_32bit")
+    staged.save_pretrained(merged_directory)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(merged_directory)
     quantizer, converter = install_llama_cpp(print_output = False)
     base_name = os.path.basename(os.path.normpath(save_directory)) or "model"
     direct = {"bf16", "f16", "q8_0", "f32"}
