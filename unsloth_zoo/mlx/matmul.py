@@ -266,7 +266,8 @@ def probe_simd_qmm():
 
 # Rows of affine `x @ W^T` with stock qmv_fast's one-row arithmetic, so each row equals its one-row call bit for bit
 # while each weight is read once per launch, where mlx-vlm's exact verifier re-reads or re-decodes it per row.
-QMV_ROWS_MAX = 8
+QMV_ROWS_MAX = 8  # rows a simdgroup holds; a staged launch runs up to twice as many in two row groups
+QMV_ROWS_STAGED_MAX = 16
 _QMV_ROWS_BITS = (4, 5, 6, 8)
 _QMV_ROWS_GROUP_SIZES = (32, 64, 128)
 
@@ -297,7 +298,8 @@ _QMV_ROWS_INPUTS = """
 """
 
 # Multiply-add bound on smaller GPUs: a lane decodes its codes once for all rows (half codes are exact) and forms
-# each row's inputs per four outputs or reads them from `qmv_rows_inputs`. A row count compiles once for all N and K.
+# each row's inputs per four outputs, reads them from `qmv_rows_inputs` or stages them per threadgroup. A row count
+# compiles once for all N and K.
 _QMV_ROWS_SOURCE = """
     constexpr int VPT = (BITS == 4 || BITS == 5) ? 16 : 8;
     constexpr int NP = BITS == 5 ? 24 : (BITS == 6 ? 12 : VPT);
@@ -307,14 +309,18 @@ _QMV_ROWS_SOURCE = """
     const int ROW_BYTES = K * BITS / 8;
     const int KG = K / GS;
     const uint lane = thread_index_in_simdgroup;
-    const int n0 = int(thread_position_in_grid.y) * 4;
+    const int SG = int(threads_per_threadgroup.y), group = int(thread_position_in_grid.y) / SG % GROUPS;
+    const int n0 = (int(thread_position_in_grid.y) / SG / GROUPS * SG + int(thread_position_in_grid.y) % SG) * 4;
+    const int row0 = group * ROWS;
     const device uint8_t* ws = (const device uint8_t*)w + n0 * ROW_BYTES + int(lane) * LANE_BYTES;
     const device T* sc = scales + n0 * KG + int(lane) / (GS / VPT);
     const device T* bs = biases + n0 * KG + int(lane) / (GS / VPT);
     float result[ROWS][4];
     _Pragma("clang loop unroll(full)")
     for (int t = 0; t < ROWS; ++t) _Pragma("clang loop unroll(full)") for (int r = 0; r < 4; ++r) result[t][r] = 0;
+    ROW_SHARED
     for (int k = 0; k < K; k += 32 * VPT) {
+        ROW_STAGE
         half code[4][NP];
         float s[4], b[4];
         _Pragma("clang loop unroll(full)")
@@ -352,7 +358,7 @@ _QMV_ROWS_SOURCE = """
         }
         _Pragma("clang loop unroll(full)")
         for (int t = 0; t < ROWS; ++t) {
-            const int row = t;
+            const int row = min(row0 + t, M - 1);
             ROW_INPUTS
             _Pragma("clang loop unroll(full)")
             for (int r = 0; r < 4; ++r) {
@@ -379,7 +385,7 @@ _QMV_ROWS_SOURCE = """
         _Pragma("clang loop unroll(full)")
         for (int t = 0; t < ROWS; ++t) {
             const float v = simd_sum(result[t][r]);
-            if (lane == 0) y[t * N + n0 + r] = T(v);
+            if (lane == 0 && row0 + t < M) y[(row0 + t) * N + n0 + r] = T(v);
         }
     }
 """
@@ -407,22 +413,49 @@ _QMV_ROWS_PREPARE = """
 """
 
 
-def _qmv_rows_source(prepared):
-    inputs = _QMV_ROWS_READ if prepared else "const device T* xr = x + row * K + k + int(lane) * VPT;" + _QMV_ROWS_INPUTS
-    return _QMV_ROWS_SOURCE.replace("ROW_INPUTS", inputs)
+_QMV_ROWS_SHARED = """threadgroup float4 staged[ROWS * NP / 4 * 32];
+    threadgroup float staged_sums[ROWS * 32];"""
+_QMV_ROWS_STAGE = """threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int threads = 32 * int(threads_per_threadgroup.y);
+        for (int chunk = int(thread_index_in_threadgroup); chunk < ROWS * 32; chunk += threads) {
+            const int t = chunk / 32;
+            const device T* xr = x + min(row0 + t, M - 1) * K + k + (chunk % 32) * VPT;""" + _QMV_ROWS_INPUTS + """
+            _Pragma("clang loop unroll(full)")
+            for (int j = 0; j < NP; j += 4)
+                staged[(t * NP + j) * 8 + chunk % 32] = float4(xt[j], xt[j + 1], xt[j + 2], xt[j + 3]);
+            staged_sums[chunk] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);"""
+_QMV_ROWS_STAGED_READ = """const float sum = staged_sums[t * 32 + int(lane)];
+            float xt[NP];
+            _Pragma("clang loop unroll(full)")
+            for (int j = 0; j < NP; j += 4) {
+                const float4 v = staged[(t * NP + j) * 8 + int(lane)];
+                xt[j] = v.x; xt[j + 1] = v.y; xt[j + 2] = v.z; xt[j + 3] = v.w;
+            }"""
+QMV_ROWS_KINDS = ("inline", "prepared", "staged")
+
+
+def _qmv_rows_source(kind):
+    inputs = {"inline": "const device T* xr = x + row * K + k + int(lane) * VPT;" + _QMV_ROWS_INPUTS,
+              "prepared": _QMV_ROWS_READ, "staged": _QMV_ROWS_STAGED_READ}[kind]
+    staged = kind == "staged"
+    return (_QMV_ROWS_SOURCE.replace("ROW_INPUTS", inputs).replace("ROW_SHARED", _QMV_ROWS_SHARED if staged else "")
+            .replace("ROW_STAGE", _QMV_ROWS_STAGE if staged else ""))
 
 
 QMV_ROWS_PROBE_KEY = "qmv_rows:" + hashlib.sha256((_QMV_ROWS_SOURCE + _QMV_ROWS_INPUTS + _QMV_ROWS_READ
-                                                   + _QMV_ROWS_PREPARE).encode()).hexdigest()[:12]
+                                                   + _QMV_ROWS_PREPARE + _QMV_ROWS_SHARED + _QMV_ROWS_STAGE
+                                                   + _QMV_ROWS_STAGED_READ).encode()).hexdigest()[:12]
 
 
 @functools.cache
-def _qmv_rows_kernel(prepared):
+def _qmv_rows_kernel(kind):
     header = nax._mlx_kernel_header("quantized.h", "qdot")
     return header and mx.fast.metal_kernel(
-        name = f"unsloth_qmv_rows{'_prepared' if prepared else ''}",
-        input_names = [*(("xs", "sums") if prepared else ("x",)), "w", "scales", "biases"],
-        output_names = ["y"], header = header, source = _qmv_rows_source(prepared))
+        name = f"unsloth_qmv_rows{'' if kind == 'inline' else '_' + kind}",
+        input_names = [*(("xs", "sums") if kind == "prepared" else ("x",)), "w", "scales", "biases"],
+        output_names = ["y"], header = header, source = _qmv_rows_source(kind))
 
 
 @functools.cache
@@ -452,48 +485,64 @@ def qmv_rows_inputs(x, bits):
         output_shapes = [(M, K // values * products), (M, K // values)], output_dtypes = [mx.float32, mx.float32]))
 
 
-def qmv_rows(x, w, scales, biases, group_size, bits, inputs = None):
-    """Each row of a 2-D x of at most `QMV_ROWS_MAX` rows as `quantized_matmul(row, w, ..., transpose=True)`;
-    `inputs`, its `qmv_rows_inputs`, are read rather than formed per output."""
+def qmv_rows(x, w, scales, biases, group_size, bits, inputs = None, staged = False):
+    """Each row of a 2-D x as `quantized_matmul(row, w, ..., transpose=True)`, x having at most `qmv_rows_most(kind)`
+    rows; `inputs`, its `qmv_rows_inputs`, are read rather than formed per output, and `staged` forms them once per
+    threadgroup instead."""
     M, N = x.shape[0], w.shape[0]
-    return _qmv_rows_kernel(inputs is not None)(
+    groups = -(-M // QMV_ROWS_MAX)
+    kind = "prepared" if inputs is not None else "staged" if staged else "inline"
+    simdgroups = next(g for g in ((4, 2) if staged else (8, 4, 2)) if N % (4 * g) == 0)
+    return _qmv_rows_kernel(kind)(
         inputs = [*([x] if inputs is None else inputs), w, scales, biases],
-        template = [("T", x.dtype), ("ROWS", M), ("GS", group_size), ("BITS", bits)],
-        grid = (32, N // 4, 1), threadgroup = (32, next(g for g in (8, 4, 2) if N % (4 * g) == 0), 1),
+        template = [("T", x.dtype), ("M", M), ("ROWS", -(-M // groups)), ("GROUPS", groups), ("GS", group_size),
+                    ("BITS", bits)],
+        grid = (32, N // 4 * groups, 1), threadgroup = (32, simdgroups, 1),
         output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
+
+
+def qmv_rows_most(kind):
+    return QMV_ROWS_STAGED_MAX if kind == "staged" else QMV_ROWS_MAX
+
+
+def qmv_rows_args(x, bits, kind):
+    return qmv_rows_inputs(x, bits) if kind == "prepared" else None, kind == "staged"
 
 
 @functools.cache
 def compile_qmv_rows(dtype, group_size, bits):
-    """Build `qmv_rows` both ways for every row count of `dtype` inputs and these weights, on a tiny weight."""
+    """Build every kind of `qmv_rows` for every row count of `dtype` inputs and these weights, on a tiny weight."""
     K = 32 * _qmv_rows_values(bits)[0]
     w, scales, biases = mx.quantize(mx.zeros((8, K), dtype = dtype), group_size = group_size, bits = bits)
-    x = mx.zeros((QMV_ROWS_MAX, K), dtype = dtype)
-    mx.eval([qmv_rows(x[:M], w, scales, biases, group_size, bits, inputs) for M in range(1, QMV_ROWS_MAX + 1)
-             for inputs in (None, qmv_rows_inputs(x[:M], bits))])
+    x = mx.zeros((QMV_ROWS_STAGED_MAX, K), dtype = dtype)
+    mx.eval([qmv_rows(x[:M], w, scales, biases, group_size, bits, *qmv_rows_args(x[:M], bits, kind))
+             for kind in QMV_ROWS_KINDS for M in range(1, qmv_rows_most(kind) + 1)])
 
 
 def probe_qmv_rows():
     """Subprocess probe: every variant the kernel compiles, each row bitwise its one-row stock call."""
-    for dtype, group_size, bits in itertools.product((mx.bfloat16, mx.float16), _QMV_ROWS_GROUP_SIZES, _QMV_ROWS_BITS):
-        w = mx.random.normal((72, 1024), key = mx.random.key(group_size)) * 0.05
+    # 72 and 80 outputs launch two and four simdgroups per staged threadgroup.
+    for dtype, group_size, bits, N in itertools.product((mx.bfloat16, mx.float16), _QMV_ROWS_GROUP_SIZES,
+                                                        _QMV_ROWS_BITS, (72, 80)):
+        w = mx.random.normal((N, 1024), key = mx.random.key(group_size)) * 0.05
         w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
-        for M in range(1, QMV_ROWS_MAX + 1):
+        for M in range(1, QMV_ROWS_STAGED_MAX + 1):
             x = mx.random.normal((M, 1024), key = mx.random.key(M)).astype(dtype)
             native = mx.concatenate([mx.quantized_matmul(x[i:i + 1], w, scales, biases, transpose = True,
                                                          group_size = group_size, bits = bits) for i in range(M)])
-            for inputs in (None, qmv_rows_inputs(x, bits)):
-                got = qmv_rows(x, w, scales, biases, group_size, bits, inputs)
-                assert mx.array_equal(got.view(mx.uint16), native.view(mx.uint16)).item(), (dtype, group_size, bits, M)
+            for kind in (kind for kind in QMV_ROWS_KINDS if M <= qmv_rows_most(kind)):
+                got = qmv_rows(x, w, scales, biases, group_size, bits, *qmv_rows_args(x, bits, kind))
+                assert mx.array_equal(got.view(mx.uint16), native.view(mx.uint16)).item(), \
+                    (dtype, group_size, bits, N, M, kind)
 
 
 def qmv_rows_launch_costs(dtype, group_size, bits, clock = time.perf_counter):
     # A weight of 64-128 MB and four launches per timed run, so each run is well above timer and launch noise.
     w = mx.quantize(mx.zeros((16384, 8192), dtype = dtype), group_size = group_size, bits = bits)
-    x = mx.zeros((QMV_ROWS_MAX, 8192), dtype = dtype)
-    launch = lambda m, prepared: [qmv_rows(x[:m], *w, group_size, bits,
-                                               qmv_rows_inputs(x[:m], bits) if prepared else None) for _ in range(4)]
-    launches = [(m, prepared) for m in range(1, QMV_ROWS_MAX + 1) for prepared in (False, True)]
+    x = mx.zeros((QMV_ROWS_STAGED_MAX, 8192), dtype = dtype)
+    launch = lambda m, kind: [qmv_rows(x[:m], *w, group_size, bits, *qmv_rows_args(x[:m], bits, kind))
+                              for _ in range(4)]
+    launches = [(m, kind) for kind in QMV_ROWS_KINDS for m in range(1, qmv_rows_most(kind) + 1)]
     mx.eval(w, [launch(*plan) for plan in launches])
     seconds = {plan: [] for plan in launches}
     for _ in range(3):
@@ -513,7 +562,6 @@ def qmv_rows_sizes(rows, most):
 
 @functools.cache
 def qmv_rows_plan(costs, rows):
-    """The (rows per launch at most, inputs prepared) whose balanced launches of `rows` rows cost least by `costs`."""
+    """The (rows per launch at most, launch kind) whose balanced launches of `rows` rows cost least by `costs`."""
     costs = dict(costs)
-    return min(((most, prepared) for most in range(1, QMV_ROWS_MAX + 1) for prepared in (False, True)),
-               key = lambda plan: sum(costs[(m, plan[1])] for m in qmv_rows_sizes(rows, plan[0])))
+    return min(sorted(costs), key = lambda plan: sum(costs[(m, plan[1])] for m in qmv_rows_sizes(rows, plan[0])))

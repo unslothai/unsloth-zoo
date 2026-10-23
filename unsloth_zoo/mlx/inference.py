@@ -5063,12 +5063,12 @@ def _verify_qmv_rows(project, native, linears, x):
             kernel = (x.dtype, p.group_size, p.bits)
             if kernel not in launches:
                 costs = _QMV_ROWS_COSTS.get(kernel)
-                most, prepared = (matmul.QMV_ROWS_MAX, False) if costs is None else matmul.qmv_rows_plan(costs, rows.shape[0])
+                most, kind = (matmul.QMV_ROWS_MAX, "inline") if costs is None else matmul.qmv_rows_plan(costs, rows.shape[0])
                 stops = list(itertools.accumulate(matmul.qmv_rows_sizes(rows.shape[0], most)))
-                launches[kernel] = [(part, matmul.qmv_rows_inputs(part, p.bits) if prepared else None)
+                launches[kernel] = [(part, matmul.qmv_rows_args(part, p.bits, kind))
                                     for part in (rows[a:b] for a, b in zip([0, *stops], stops))]
-            ys = [matmul.qmv_rows(part, p.weight, p.scales, p.biases, p.group_size, p.bits, inputs)
-                  for part, inputs in launches[kernel]]
+            ys = [matmul.qmv_rows(part, p.weight, p.scales, p.biases, p.group_size, p.bits, *args)
+                  for part, args in launches[kernel]]
             y = (ys[0] if len(ys) == 1 else mx.concatenate(ys)).reshape(*x.shape[:-1], -1)
             outs.append(y + p["bias"] if "bias" in p else y)
         return tuple(outs) if len(outs) > 1 else outs[0]

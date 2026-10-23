@@ -431,12 +431,14 @@ def test_a_verify_block_runs_its_rows_together_and_matches_one_token_decode_step
     mx.eval(lm(mx.array([ids[0][:24]]), cache = cache).logits)
     served, block, calls = _serving(monkeypatch), mx.array([ids[0][24:35]]), []
     kernel = matmul.qmv_rows
-    monkeypatch.setattr(matmul, "qmv_rows", lambda x, *args: calls.append(x.shape) or kernel(x, *args))
+    kind = lambda inputs, staged: "prepared" if inputs is not None else "staged" if staged else "inline"
+    monkeypatch.setattr(matmul, "qmv_rows", lambda x, *args: calls.append((*x.shape, kind(*args[5:]))) or kernel(x, *args))
     matmul.compile_qmv_rows.cache_clear()
-    # Launches are timed once per kernel; here more than four rows per launch spill and prepared inputs are cheaper.
-    timed = []
+    # Launches are timed once per kernel; here staged launches are cheapest up to 16 rows, or prepared ones up to 4.
+    timed, cheaper = [], "staged" if bits in (4, 6) else "prepared"
+    costs = _spilling_costs(16, staged = 0.8) if cheaper == "staged" else _spilling_costs(4)
     monkeypatch.setattr(inference, "_QMV_ROWS_COSTS", {})
-    monkeypatch.setattr(matmul, "qmv_rows_launch_costs", lambda *kernel: timed.append(kernel) or _spilling_costs(4))
+    monkeypatch.setattr(matmul, "qmv_rows_launch_costs", lambda *kernel: timed.append(kernel) or costs)
     steps, snapshots, decoded = _clone(cache), {0: cache}, []
     for t in range(block.shape[1]):
         decoded.append(lm(block[:, t : t + 1], cache = steps, **_captured(lm)))
@@ -446,14 +448,16 @@ def test_a_verify_block_runs_its_rows_together_and_matches_one_token_decode_step
     with inference.exact_speculative_verify(model):
         _verified(lm, cache, block, 0)
         assert not served.clear() and all(_same(_state(stepped, entries), _verified(lm, cache, block, keep)) for keep, entries in snapshots.items())
-        # Every row count is built on a one-step weight before the first block; the 11-row block runs as 4 + 4 + 3.
+        # Every row count is built on a one-step weight before the first block; the 11-row block runs as 11 or 4 + 4 + 3.
         step = 512 if bits in (4, 5) else 256
-        assert {M for M, K in calls if K == step} == set(range(1, 9)) and {M for M, K in calls if K != step} == {4, 3}
+        wide = {11} if cheaper == "staged" else {4, 3}
+        assert {M for M, K, _ in calls if K == step} == set(range(1, 17)) and {M for M, K, _ in calls if K != step} == wide
+        assert {launched for M, K, launched in calls if K != step} == {cheaper}
         admitted = {key: verdict for key, verdict in inference._VERIFY_VERDICTS.items() if key[0] == "qmv_rows"}
         assert any(key[0] == "qmv_rows" for key in served) and admitted and all(admitted.values())
         # A block of another width is served under the same admissions.
         _verified(lm, cache, block[:, :5], 0)
-        assert (2, lm.args.hidden_size) in calls
+        assert (5 if cheaper == "staged" else 2, lm.args.hidden_size, cheaper) in calls
         assert admitted == {key: verdict for key, verdict in inference._VERIFY_VERDICTS.items() if key[0] == "qmv_rows"}
         assert timed == [(mx.bfloat16, 64, bits)]
         probe = nax.kernel_probe_passed
@@ -468,16 +472,21 @@ def test_a_verify_block_runs_its_rows_together_and_matches_one_token_decode_step
         assert not any(key[0] == "qmv_rows" for key in served)
 
 
-def _spilling_costs(most, prepared = 0.9):  # one unit per launch and per row; launches over `most` rows spill
-    return {(m, p): 1 + m * (prepared if p else 1) if m <= most else 100 for m in range(1, 9) for p in (False, True)}
+def _spilling_costs(most, prepared = 0.9, staged = 1):  # one unit per launch and per row; launches over `most` rows spill
+    per_row = {"inline": 1, "prepared": prepared, "staged": staged}
+    return {(m, kind): 1 + m * per_row[kind] if m <= most else 100 for kind in per_row
+            for m in range(1, 17 if kind == "staged" else 9)}
 
 
 def test_verify_rows_launch_the_plan_their_launch_costs_make_cheapest():
     from unsloth_zoo.mlx import matmul
     plan = lambda costs, rows: matmul.qmv_rows_plan(tuple(costs.items()), rows)
     # As few launches as fit under the spill, balanced, with the cheaper inputs.
-    assert plan(_spilling_costs(6), 16) == (6, True) and matmul.qmv_rows_sizes(16, 6) == [6, 5, 5]
-    assert plan(_spilling_costs(8, prepared = 1.1), 16) == (8, False) and plan(_spilling_costs(4), 3) in {(3, True), (4, True)}
+    assert plan(_spilling_costs(6), 16) == (6, "prepared") and matmul.qmv_rows_sizes(16, 6) == [6, 5, 5]
+    assert plan(_spilling_costs(8, prepared = 1.1), 16) == (8, "inline")
+    assert plan(_spilling_costs(8, staged = 0.8), 16) == (8, "staged")
+    assert plan(_spilling_costs(16, staged = 0.8), 16) == (16, "staged")
+    assert plan(_spilling_costs(4), 3) in {(3, "prepared"), (4, "prepared")}
 
 
 def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkeypatch):
@@ -488,16 +497,17 @@ def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkey
         now[0], spent[0] = now[0] + spent[0], 0.0
         return now[0]
 
-    def launch(x, w, scales, biases, group_size, bits, inputs):
+    def launch(x, w, scales, biases, group_size, bits, inputs, staged):
         rows, prepared = x.shape[0], inputs is not None
-        durations = (0, rows, 50, rows + 0.5 * prepared)
-        spent[0] += next(runs.setdefault((rows, prepared), iter([d for d in durations for _ in range(4)])))
+        durations = (0, rows, 50, rows + 0.5 * prepared + 0.25 * staged)
+        spent[0] += next(runs.setdefault((rows, prepared, staged), iter([d for d in durations for _ in range(4)])))
         return x
     monkeypatch.setattr(matmul, "qmv_rows", launch)
     monkeypatch.setattr(matmul, "qmv_rows_inputs", lambda x, bits: x)
     # A warm run, then three timed runs of four launches each, every launch advancing the clock by its own time.
     costs = matmul.qmv_rows_launch_costs(mx.bfloat16, 64, 4, clock)
-    assert costs == {(m, prepared): m + 0.5 * prepared for m in range(1, 9) for prepared in (False, True)}
+    extra = {"inline": 0, "prepared": 0.5, "staged": 0.25}
+    assert costs == {(m, kind): m + extra[kind] for kind in extra for m in range(1, 17 if kind == "staged" else 9)}
 
 
 def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(qwen_4bit, monkeypatch):

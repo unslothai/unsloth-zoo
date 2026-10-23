@@ -2738,17 +2738,17 @@ def test_qmv_rows_gives_each_row_its_one_row_stock_bits(bits, group_size, dtype)
     from unsloth_zoo.mlx import matmul
 
     K = 3 * (512 if bits in (4, 5) else 256)  # three of qmv_fast's K steps
-    # 520 and 544 outputs launch two and eight simdgroups per threadgroup.
+    # 520 and 544 outputs launch two and eight simdgroups per threadgroup (staged: two and four).
     for N in (520, 544):
         w, scales, biases = _quantized(N, K, group_size, dtype, bits, seed = group_size)
-        for M in range(1, matmul.QMV_ROWS_MAX + 1):
+        for M in range(1, matmul.QMV_ROWS_STAGED_MAX + 1):
             # Rows differ in scale, so a row mix-up shows.
             x = (mx.random.normal((M, K), key = mx.random.key(M)) * (1 + mx.arange(M)[:, None])).astype(dtype)
             alone = mx.concatenate([mx.quantized_matmul(x[i:i + 1], w, scales, biases, transpose = True,
                                                         group_size = group_size, bits = bits) for i in range(M)])
-            for inputs in (None, matmul.qmv_rows_inputs(x, bits)):
-                y = matmul.qmv_rows(x, w, scales, biases, group_size, bits, inputs)
-                assert mx.array_equal(mx.view(y, mx.uint16), mx.view(alone, mx.uint16)).item(), (N, M, inputs is None)
+            for kind in (kind for kind in matmul.QMV_ROWS_KINDS if M <= matmul.qmv_rows_most(kind)):
+                y = matmul.qmv_rows(x, w, scales, biases, group_size, bits, *matmul.qmv_rows_args(x, bits, kind))
+                assert mx.array_equal(mx.view(y, mx.uint16), mx.view(alone, mx.uint16)).item(), (N, M, kind)
     for args in ((520, 768, 64, 6, "affine"), (8, 256, 32, 8, "affine"), (520, 1024, 32, 4, "affine"),
                  (520, 512, 128, 5, "affine")):
         assert matmul.qmv_rows_supported(*args)
