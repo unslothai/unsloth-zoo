@@ -440,6 +440,23 @@ def has_data_dependent_call(source):
     )
 
 
+def loops_over_checkpointed_layers(modeling_file, init, forward):
+    """A forward looping over `GradientCheckpointingLayer`s (Wav2Vec2FeatureEncoder's conv
+    layers) graph breaks once per layer under gradient checkpointing: Dynamo skips the
+    checkpoint function `GradientCheckpointingLayer.__call__` hands each layer to."""
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        return False
+    if not re.search(r"^\s*for\s[^\n]+?\sin\s[^\n]*\bself\.\w+", forward, flags = re.MULTILINE):
+        return False
+    for name in set(re.findall(r"\b([A-Za-z_]\w*)\(", init)):
+        cls = getattr(modeling_file, name, None)
+        if isinstance(cls, type) and issubclass(cls, GradientCheckpointingLayer):
+            return True
+    return False
+
+
 def data_dependent_helpers(modeling_file, called_functions):
     """Helpers the module forward screen misses (e.g. Qwen3-Omni chunk_and_pad_features)."""
     found = []
@@ -6665,6 +6682,15 @@ def unsloth_compile_transformers(
         if "for layer in self." in source:
             print(
                 f"Unsloth: Failed compiling function {module} since it looks like a decoder!"
+            )
+            bad_torch_modules.add(module)
+        pass
+
+        if module not in bad_torch_modules and loops_over_checkpointed_layers(
+            modeling_file, init, source
+        ):
+            print(
+                f"Unsloth: Will not compile {module} since it loops over gradient checkpointed layers."
             )
             bad_torch_modules.add(module)
         pass
