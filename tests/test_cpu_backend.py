@@ -508,6 +508,8 @@ def test_unsupported_active_accelerator_keeps_its_error(monkeypatch, accelerator
     for key in ("UNSLOTH_DISABLE_CPU_FALLBACK", "UNSLOTH_ALLOW_CPU", "UNSLOTH_FORCE_CPU", "CUDA_VISIBLE_DEVICES"):
         monkeypatch.delenv(key, raising = False)
     monkeypatch.setattr(dt, "_IS_MLX", False)
+    # On Apple Silicon with MLX the module never imported torch; give the non-MLX path its global.
+    monkeypatch.setattr(dt, "torch", torch, raising = False)
     monkeypatch.setattr(dt, "_GPU_INIT_SKIPPED", False)
     monkeypatch.setattr(dt.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(dt.torch.xpu, "is_available", lambda: False)
