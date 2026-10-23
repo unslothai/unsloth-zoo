@@ -43,7 +43,12 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         rows = hidden.shape[0]
         need_hidden_grad = hidden.requires_grad
         need_weight_grad = weight.requires_grad
-        grad_hidden = torch.empty_like(hidden) if need_hidden_grad else None
+        # fp16 cannot hold these gradients before GradScaler multiplies them: keep them fp32 until backward.
+        exact = hidden.dtype == torch.float16 or (
+            torch.is_autocast_enabled("cpu") and torch.get_autocast_dtype("cpu") == torch.float16
+        )
+        grad_dtype = torch.float32 if exact else hidden.dtype
+        grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else None
         grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else None
         total = torch.zeros((), dtype = torch.float32)
         for start in range(0, rows, chunk_rows):
@@ -61,9 +66,12 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
                 logits.sub_(lse.unsqueeze(-1)).exp_()
                 logits.scatter_add_(-1, safe_y.unsqueeze(-1), -torch.ones_like(target).unsqueeze(-1))
                 logits.mul_(valid.unsqueeze(-1))
-                dlogits = logits.to(h.dtype)
                 if need_hidden_grad:
-                    grad_hidden[start:end] = dlogits @ weight
+                    if exact:
+                        with torch.autocast("cpu", enabled = False):
+                            grad_hidden[start:end] = logits @ weight.float()
+                    else:
+                        grad_hidden[start:end] = logits.to(h.dtype) @ weight
                 if need_weight_grad:
                     grad_weight.addmm_(logits.t(), h.float())
         loss = total / divisor
@@ -75,6 +83,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         ctx.has_hidden = need_hidden_grad
         ctx.has_weight = need_weight_grad
         ctx.weight_dtype = weight.dtype
+        ctx.hidden_dtype = hidden.dtype
         return loss
 
     @staticmethod
@@ -84,7 +93,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         # Also num_items_in_batch == 0 (a fully masked accumulation group): stock CE's gradient is zero there.
         empty = math.isnan(ctx.divisor) or ctx.divisor == 0
         scale = torch.zeros_like(grad_output) if empty else grad_output / ctx.divisor
-        dh = (grad_hidden * scale.to(grad_hidden.dtype)) if ctx.has_hidden else None
+        dh = (grad_hidden * scale.to(grad_hidden.dtype)).to(ctx.hidden_dtype) if ctx.has_hidden else None
         dw = (grad_weight * scale).to(ctx.weight_dtype) if ctx.has_weight else None
         return dh, dw, None, None, None, None
 

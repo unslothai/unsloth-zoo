@@ -657,3 +657,19 @@ def test_torch_dtype_alias_is_used_and_not_passed_twice(monkeypatch):
     loader.FastCPUModel.from_pretrained("org/model", torch_dtype = torch.float32, load_in_4bit = False)
     assert "torch_dtype" not in seen or "dtype" not in seen
     assert torch.float32 in (seen.get("dtype"), seen.get("torch_dtype"))
+
+
+def test_fp16_autocast_chunked_loss_keeps_small_gradients_for_the_scaler():
+    """Under fp16 autocast the cached hidden gradient must survive until GradScaler's multiplier is applied."""
+    from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 8, 16, requires_grad = True)
+    weight = torch.randn(512, 16) * 1e-9
+    labels = torch.randint(0, 512, (2, 8))
+    reference = hidden.detach().clone().requires_grad_(True)
+    (F.cross_entropy((reference[:, :-1] @ weight.t()).reshape(-1, 512), labels[:, 1:].reshape(-1)) * 65536).backward()
+    with torch.autocast("cpu", dtype = torch.float16):
+        loss = chunked_linear_cross_entropy(hidden, weight, labels)
+    (loss * 65536).backward()
+    assert reference.grad.abs().max() > 0
+    torch.testing.assert_close(hidden.grad, reference.grad, rtol = 1e-3, atol = 1e-9)
