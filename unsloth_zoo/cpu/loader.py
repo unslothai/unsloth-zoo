@@ -520,8 +520,9 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
         )
     os.makedirs(save_directory, exist_ok = True)
     merged_directory = os.path.join(save_directory, "merged_16bit")
-    if "f32" in methods:
-        # An F32 GGUF must come from unrounded weights, not 16-bit ones upcast by the converter.
+    unrounded = [m for m in methods if m in ("f32", "f16")]
+    if unrounded:
+        # F32 / F16 GGUFs come from unrounded weights, not bf16-rounded ones the converter re-casts.
         staged, _ = _merged_copy(self, "merged_32bit")
         staged.save_pretrained(merged_directory)
         if tokenizer is not None:
@@ -542,13 +543,13 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
     for method in methods:
         if method in direct and method == first:
             continue
-        if method == "f32":
-            # Straight from the FP32 staging checkpoint; llama-quantize would upcast the bf16 GGUF.
-            f32_outputs, _ = convert_to_gguf(
+        if method in unrounded:
+            # Straight from the unrounded staging checkpoint; llama-quantize would re-cast the bf16 GGUF.
+            direct_outputs, _ = convert_to_gguf(
                 os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
-                quantization_type = "f32", converter_location = converter,
+                quantization_type = method, converter_location = converter,
             )
-            results.extend(f32_outputs)
+            results.extend(direct_outputs)
             continue
         target = first_file.replace(f".{first.upper()}.gguf", f".{method.upper()}.gguf")
         if target == first_file:

@@ -804,3 +804,31 @@ def test_a_separate_tokenizer_keeps_the_callers_revision(monkeypatch):
     monkeypatch.setattr(peft.PeftModel, "from_pretrained", lambda model, name, **k: model)
     loader.FastCPUModel.from_pretrained("org/lora", tokenizer_name = "org/tok", revision = "v2", load_in_4bit = False)
     assert seen["tok"] == ("org/tok", "v2")
+
+
+@pytest.mark.parametrize("methods", ["f16", ["f16", "q4_k_m"]])
+def test_f16_gguf_is_staged_unrounded_and_converted_directly(monkeypatch, tmp_path, dtype_policy, methods):
+    import json
+    import unsloth_zoo.llama_cpp as llama_cpp
+    from unsloth_zoo.cpu import loader
+    dtype_policy("1", "0")
+    staged, converted, quantized = {}, [], []
+
+    def convert(prefix, merged, model_dtype, quantization_type, converter_location):
+        config = json.load(open(os.path.join(merged, "config.json")))
+        staged["dtype"] = config.get("torch_dtype") or config.get("dtype")
+        converted.append(quantization_type)
+        path = f"{prefix}.{quantization_type.upper()}.gguf"
+        open(path, "w").close()
+        return [path], None
+
+    def quantize(src, dst, method, quantizer_location, print_output):
+        quantized.append(method)
+        open(dst, "w").close()
+
+    monkeypatch.setattr(llama_cpp, "install_llama_cpp", lambda print_output = False: ("q", "c"))
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", convert)
+    monkeypatch.setattr(llama_cpp, "quantize_gguf", quantize)
+    loader.save_pretrained_gguf(_tiny_llama().float(), str(tmp_path / "m"), quantization_method = methods)
+    assert staged["dtype"] == "float32"
+    assert "f16" in converted and "f16" not in quantized
