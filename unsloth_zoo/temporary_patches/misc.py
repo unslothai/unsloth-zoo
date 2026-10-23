@@ -3857,6 +3857,7 @@ def output_capture_scratch():
         yield
         return
     scratch = dict(value)
+    starts = {k: len(value[k]) for k in keys}
     for k in keys:
         scratch[k] = []
     var._unsloth_eager_value = scratch
@@ -3866,8 +3867,10 @@ def output_capture_scratch():
         # A nested set / reset inside the call replaced the mirror: leave theirs.
         if var.__dict__.get("_unsloth_eager_value") is scratch:
             var._unsloth_eager_value = value
+        # Inserted where the context began: after a nested reset, later hooks append straight to
+        # value, and the scratch items were captured before them.
         for k in keys:
-            value[k].extend(scratch[k])
+            value[k][starts[k]:starts[k]] = scratch[k]
 pass
 
 

@@ -164,3 +164,26 @@ def test_experts_interface_lookups_are_filled_before_any_trace():
     mei.patch_experts_interface()
     # A key first filled inside a compiled MoE layer guards on its absence: one more compile per layer kind.
     assert "default_apply_gate" in mei._LAZY and "layout_is_standard" in mei._LAZY
+
+
+def test_scratch_keeps_capture_order_after_a_nested_reset():
+    import threading
+    from unsloth_zoo.temporary_patches.misc import output_capture_scratch
+    var = _collector()
+    saved = {k: var.__dict__.get(k) for k in ("_unsloth_eager_value", "_unsloth_eager_single", "_unsloth_eager_tls")}
+    value = {"router_logits": ["earlier"]}
+    tls = threading.local()
+    tls.depth = 1
+    var._unsloth_eager_value, var._unsloth_eager_single, var._unsloth_eager_tls = value, True, tls
+    try:
+        with output_capture_scratch():
+            var._unsloth_eager_value["router_logits"].append("before")  # a hook inside the call
+            var._unsloth_eager_value = value  # a nested set / reset restores the original collector
+            var._unsloth_eager_value["router_logits"].append("after")  # later hooks append to it
+        assert value["router_logits"] == ["earlier", "before", "after"]
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                var.__dict__.pop(k, None)
+            else:
+                setattr(var, k, v)
