@@ -17,6 +17,8 @@
 __all__ = [
     "cpu_flags",
     "cpu_bf16_supported",
+    "cpu_fp16_supported",
+    "cpu_autocast_dtype",
     "cpu_bnb_4bit_supported",
     "cpu_capabilities",
     "apply_cpu_security_patches",
@@ -67,12 +69,63 @@ def cpu_bf16_supported():
     if override in ("1", "true", "yes", "on"):
         return True
     flags = cpu_flags()
+    if not flags:
+        # No /proc/cpuinfo (Windows, macOS on Arm): time it instead.
+        return _bf16_autocast_is_fast()
     machine = platform.machine().lower()
     if machine in ("x86_64", "amd64", "i686", "x86"):
         return bool(flags & {"amx_bf16", "avx512_bf16"})
     if machine in ("aarch64", "arm64"):
         return "bf16" in flags
     return False
+
+
+def _bf16_autocast_is_fast():
+    """bf16 autocast matmul vs fp32 on this CPU. Native bf16 runs 2-3x faster than fp32 (AVX512-BF16 /
+    AMX / Arm BF16 through oneDNN or ACL); without a native kernel torch falls back to a reference
+    loop 30-200x slower, so a 1.5x threshold separates the two with a wide margin."""
+    try:
+        import time
+        import torch
+        a = torch.randn(512, 512)
+        b = torch.randn(512, 512)
+
+        def best(dtype):
+            times = []
+            for _ in range(3):
+                start = time.perf_counter()
+                with torch.autocast("cpu", dtype = dtype, enabled = dtype is not None):
+                    a @ b
+                times.append(time.perf_counter() - start)
+            return min(times[1:])
+        return best(torch.bfloat16) < 1.5 * best(None)
+    except Exception:
+        return False
+
+
+@functools.cache
+def cpu_fp16_supported():
+    """float16 matmuls in hardware fast enough to train with fp16 autocast: AMX-FP16 (Granite Rapids).
+    Measured fp16 autocast vs fp32 for a LoRA MLP fwd+bwd: AVX512-FP16 without AMX-FP16 1.1-1.2x
+    (those CPUs have AMX-BF16 at 1.9-2.7x), Arm Neoverse N2 FP16 0.91x, AVX2 / Zen 4 / Windows on Arm
+    50-200x slower. Only consulted when bf16 is not native. UNSLOTH_CPU_FP16=0/1 overrides.
+    """
+    override = os.environ.get("UNSLOTH_CPU_FP16", "").strip().lower()
+    if override in ("0", "false", "no", "off"):
+        return False
+    if override in ("1", "true", "yes", "on"):
+        return True
+    return "amx_fp16" in cpu_flags()
+
+
+def cpu_autocast_dtype():
+    """Mixed-precision dtype for CPU training: bf16 when native, else fp16 when native, else None (fp32)."""
+    import torch
+    if cpu_bf16_supported():
+        return torch.bfloat16
+    if cpu_fp16_supported():
+        return torch.float16
+    return None
 
 
 @functools.cache
@@ -105,6 +158,7 @@ def cpu_capabilities():
         "machine": platform.machine(),
         "threads": torch.get_num_threads(),
         "bf16": cpu_bf16_supported(),
+        "fp16": cpu_fp16_supported(),
         "amx": "amx_bf16" in cpu_flags(),
         "bnb_4bit": cpu_bnb_4bit_supported(),
     }

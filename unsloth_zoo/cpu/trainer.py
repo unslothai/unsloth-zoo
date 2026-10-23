@@ -20,7 +20,7 @@ __all__ = ["install_cpu_training_defaults", "normalize_cpu_training_arguments"]
 
 import functools
 
-from .runtime import cpu_bf16_supported
+from .runtime import cpu_bf16_supported, cpu_fp16_supported
 
 # bitsandbytes 8-bit / paged optimizers have no CPU kernels; AdamW states for LoRA are tiny anyway.
 _GPU_ONLY_OPTIMIZERS = (
@@ -37,8 +37,12 @@ def _name(value):
 def normalize_cpu_training_arguments(args):
     args.use_cpu = True
     if getattr(args, "fp16", False):
-        args.fp16 = False
-        args.bf16 = cpu_bf16_supported()
+        # bf16 needs no loss scaling, so it wins whenever it is native; fp16 autocast (with a CPU
+        # GradScaler, see _patch_cpu_fp16_accelerator) only where fp16 is native and bf16 is not.
+        if cpu_bf16_supported():
+            args.fp16, args.bf16 = False, True
+        elif not cpu_fp16_supported():
+            args.fp16, args.bf16 = False, False
     elif getattr(args, "bf16", None) and not cpu_bf16_supported():
         # bf16 autocast without AMX / AVX512-BF16 / Arm BF16 is emulated and several times slower.
         args.bf16 = False
@@ -82,6 +86,34 @@ def _patch_post_init(cls):
 
     __post_init__._unsloth_cpu = True
     cls.__post_init__ = __post_init__
+
+
+def _patch_cpu_fp16_accelerator(trainer_cls):
+    """accelerate turns fp16 into a silent fp32 run on CPU (no autocast, no scaler). When
+    normalize_cpu_training_arguments kept fp16 (native fp16, no native bf16), enable CPU autocast
+    and a CPU GradScaler before the model and optimizer are prepared."""
+    original = trainer_cls.create_accelerator_and_postprocess
+    if getattr(original, "_unsloth_cpu", False):
+        return
+
+    @functools.wraps(original)
+    def create_accelerator_and_postprocess(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        accelerator = getattr(self, "accelerator", None)
+        if (
+            accelerator is not None
+            and getattr(self.args, "fp16", False)
+            and accelerator.device.type == "cpu"
+            and accelerator.state.mixed_precision == "fp16"
+            and not accelerator.native_amp
+        ):
+            import torch
+            accelerator.native_amp = True
+            accelerator.scaler = torch.amp.GradScaler("cpu")
+        return result
+
+    create_accelerator_and_postprocess._unsloth_cpu = True
+    trainer_cls.create_accelerator_and_postprocess = create_accelerator_and_postprocess
 
 
 def _patch_sft_compute_loss(sft_trainer_cls):
@@ -167,8 +199,10 @@ def _make_cpu_sft_trainer(base):
 def install_cpu_training_defaults():
     """Idempotent. Only ever called from a CPU-backend process."""
     import sys
-    from transformers import TrainingArguments
+    from transformers import Trainer, TrainingArguments
     _patch_post_init(TrainingArguments)
+    if hasattr(Trainer, "create_accelerator_and_postprocess"):
+        _patch_cpu_fp16_accelerator(Trainer)
     try:
         import trl
         from trl.trainer import sft_trainer

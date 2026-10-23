@@ -112,6 +112,18 @@ def test_bf16_policy_override(monkeypatch):
     runtime.cpu_bf16_supported.cache_clear()
 
 
+def test_bf16_policy_times_bf16_when_cpu_flags_are_unreadable(monkeypatch):
+    """Windows has no /proc/cpuinfo: the answer comes from timing bf16 autocast against fp32."""
+    from unsloth_zoo.cpu import runtime
+    monkeypatch.delenv("UNSLOTH_CPU_BF16", raising = False)
+    monkeypatch.setattr(runtime, "cpu_flags", lambda: frozenset())
+    for fast in (True, False):
+        monkeypatch.setattr(runtime, "_bf16_autocast_is_fast", lambda fast = fast: fast)
+        runtime.cpu_bf16_supported.cache_clear()
+        assert runtime.cpu_bf16_supported() is fast
+    runtime.cpu_bf16_supported.cache_clear()
+
+
 def test_bnb_cpu_4bit_grads_survive_eval_forward():
     """bitsandbytes repacks Linear4bit weights for its AVX512-BF16 kernel on an eval no-grad forward,
     after which backward is wrong. The CPU loader turns that repacking off; check grads after an eval."""
@@ -139,9 +151,61 @@ def test_bnb_cpu_4bit_grads_survive_eval_forward():
     torch.testing.assert_close(x.grad, x_ref.grad)
 
 
-def test_cpu_training_arguments_turn_off_packing_and_gpu_optimizers():
+@pytest.fixture
+def dtype_policy(monkeypatch):
+    """Pin the CPU bf16 / fp16 answers via their env overrides; the cached answers are dropped after."""
+    from unsloth_zoo.cpu import runtime
+
+    def pin(bf16, fp16):
+        monkeypatch.setenv("UNSLOTH_CPU_BF16", bf16)
+        monkeypatch.setenv("UNSLOTH_CPU_FP16", fp16)
+        runtime.cpu_bf16_supported.cache_clear()
+        runtime.cpu_fp16_supported.cache_clear()
+    yield pin
+    runtime.cpu_bf16_supported.cache_clear()
+    runtime.cpu_fp16_supported.cache_clear()
+
+
+@pytest.mark.parametrize("bf16, fp16, expected", [
+    ("1", "1", (False, True)),   # native bf16 wins: no loss scaling needed
+    ("0", "1", (True, False)),   # native fp16 only: fp16 autocast + CPU GradScaler
+    ("0", "0", (False, False)),  # neither: fp32
+])
+def test_fp16_request_picks_the_native_half_precision(dtype_policy, bf16, fp16, expected):
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu import runtime
+    from unsloth_zoo.cpu.trainer import normalize_cpu_training_arguments
+    dtype_policy(bf16, fp16)
+    args = normalize_cpu_training_arguments(SimpleNamespace(use_cpu = False, fp16 = True, bf16 = False, optim = "adamw_torch"))
+    assert (args.fp16, args.bf16) == expected
+    assert runtime.cpu_autocast_dtype() == {"1": torch.bfloat16}.get(bf16, torch.float16 if fp16 == "1" else None)
+
+
+def test_fp16_trainer_gets_cpu_autocast_and_grad_scaler(monkeypatch, tmp_path, dtype_policy):
+    """accelerate leaves fp16 on CPU as a silent fp32 run; the CPU backend enables autocast + GradScaler."""
+    from unsloth_zoo.cpu.trainer import _patch_cpu_fp16_accelerator, _patch_post_init
+    from transformers import Trainer, TrainingArguments
+    dtype_policy("0", "1")
+    monkeypatch.setattr(Trainer, "create_accelerator_and_postprocess", Trainer.create_accelerator_and_postprocess)
+    monkeypatch.setattr(TrainingArguments, "__post_init__", TrainingArguments.__post_init__)
+    _patch_cpu_fp16_accelerator(Trainer)
+    _patch_post_init(TrainingArguments)
+    model = torch.nn.Sequential(torch.nn.Linear(8, 8))
+    seen = []
+    model[0].register_forward_hook(lambda m, i, o: seen.append(o.dtype))
+    args = TrainingArguments(output_dir = str(tmp_path), fp16 = True, report_to = [], max_steps = 1)
+    trainer = Trainer(model = model, args = args)
+    assert args.fp16 and trainer.accelerator.native_amp
+    assert isinstance(trainer.accelerator.scaler, torch.amp.GradScaler)
+    prepared = trainer.accelerator.prepare(model)
+    prepared(torch.randn(2, 8))
+    assert seen == [torch.float16]
+
+
+def test_cpu_training_arguments_turn_off_packing_and_gpu_optimizers(dtype_policy):
     from types import SimpleNamespace
     from unsloth_zoo.cpu.trainer import normalize_cpu_training_arguments
+    dtype_policy("0", "0")
     args = SimpleNamespace(use_cpu = False, fp16 = True, bf16 = False, optim = "paged_adamw_8bit",
                            packing = True, eval_packing = True, padding_free = True, dataloader_pin_memory = True)
     normalize_cpu_training_arguments(args)
