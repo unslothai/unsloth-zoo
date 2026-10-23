@@ -53,6 +53,7 @@ from .common import (
     publish_to_modeling_module,
 )
 from .utils import compile_with_eager_fallback, patch_function, raise_error
+from .gemma import _linear_boundary_dtype, _to_boundary_dtype, _to_forced_output_dtype
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
@@ -360,6 +361,35 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4RMSNorm)
 
 
+def patch_Gemma4ClippableLinear():
+    """Gemma4RMSNorm above always emits fp16, which matches the fp16 vision / audio Linears of LoRA.
+    Full finetuning upcasts them to fp32 and trains without autocast, so the fp16 activation must
+    meet the weight's dtype (identity on LoRA, where they already agree)."""
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    for module, prefix in _gemma4_text_variants("ClippableLinear"):
+        publish_to_modeling_module(
+            module,
+            _linear_boundary_dtype = _linear_boundary_dtype,
+            _to_boundary_dtype = _to_boundary_dtype,
+        )
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "linear"))
+            if self.use_clipped_linears:
+                hidden_states = torch.clamp(hidden_states, self.input_min, self.input_max)
+
+            hidden_states = self.linear(hidden_states)
+
+            if self.use_clipped_linears:
+                hidden_states = torch.clamp(hidden_states, self.output_min, self.output_max)
+
+            return hidden_states
+        pass
+        patch_function(getattr(module, prefix + "ClippableLinear"), "forward", forward, match_level = "relaxed")
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear)
+
+
 def _patch_gemma4_text_attention(module, prefix):
     apply_rotary_pos_emb = module.apply_rotary_pos_emb
     ALL_ATTENTION_FUNCTIONS = module.ALL_ATTENTION_FUNCTIONS
@@ -393,6 +423,10 @@ def _patch_gemma4_text_attention(module, prefix):
         cos, sin = position_embeddings
         cos = cos.to(torch.float32)
         sin = sin.to(torch.float32)
+
+        # hidden_states is fp16 out of the forced RMSNorm, matching LoRA's fp16 projections; full
+        # finetuning upcasts them to fp32 without autocast, so meet them there (identity on LoRA).
+        hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "q_proj"))
 
         # q: fp16 proj -> fp16 q_norm -> float32 -> RoPE (float32) -> (b, h, q, d)
         query_states = self.q_proj(hidden_states).view(hidden_shape)
@@ -520,7 +554,9 @@ def _patch_gemma4_text_attention(module, prefix):
 
         # (b, q, h, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
         attn_output = attn_output.contiguous().reshape(*input_shape, -1)
-        attn_output = attn_output.to(torch.float16)
+        # fp16 for the fp16 o_proj of LoRA; full finetuning upcasts o_proj to fp32 and runs without
+        # autocast, so meet it there (a weight that does not answer, 4bit, still means fp16).
+        attn_output = _to_forced_output_dtype(attn_output, _linear_boundary_dtype(self, "o_proj"))
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
     pass

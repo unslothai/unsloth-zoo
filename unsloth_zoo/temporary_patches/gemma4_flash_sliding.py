@@ -89,6 +89,13 @@ def _force_banded():
 
 def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
                               dropout=0.0, scaling=None, is_causal=None, **kwargs):
+    # SDPA needs one dtype for q / k / v. Forced float32 full finetuning (fp32 weights, no
+    # autocast) gives Gemma4VisionAttention float32 q / k out of RoPE, whose cos / sin follow
+    # the fp32 residual, while v_norm (the forced RMSNorm) emits fp16. Promote only in that
+    # case, which raised before, so every call that worked is unchanged.
+    if not (query.dtype == key.dtype == value.dtype):
+        qkv_dtype = torch.promote_types(torch.promote_types(query.dtype, key.dtype), value.dtype)
+        query, key, value = query.to(qkv_dtype), key.to(qkv_dtype), value.to(qkv_dtype)
     # Shared layer + band gate for both fast kernels (no _HAS_FA2 / dtype clause
     # here, so the banded fallback is reachable without flash-attn).
     if (_enabled()
