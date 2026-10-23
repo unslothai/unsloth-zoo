@@ -1440,13 +1440,37 @@ def _flatten_message_content(messages, placeholders):
 pass
 
 
+def _template_drops_audio(processor) -> bool:
+    """Granite Speech templates drop an audio part or print the content list's repr; the model expects
+    the audio token inside a string turn instead."""
+    token = getattr(processor, "audio_token", None)
+    if not isinstance(token, str) or not token or not _audio_sub_processors(processor):
+        return False
+    try:
+        with_audio = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": "Hello!"}]}], tokenize = False,
+        )
+        text_only = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], tokenize = False,
+        )
+        as_string = processor.apply_chat_template(
+            [{"role": "user", "content": f"{token}\nHello!"}], tokenize = False,
+        )
+    except Exception:
+        return False
+    if not isinstance(with_audio, str) or token not in str(as_string):
+        return False
+    return with_audio == text_only or _renders_content_list_as_repr(with_audio, "Hello!")
+pass
+
+
 def _template_needs_string_content(processor) -> bool:
     """List content raises TypeError but the same turn as a string renders."""
     try:
         processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], tokenize = False,
         )
-        return False
+        return _template_drops_audio(processor)
     except TypeError:
         pass
     except Exception:
@@ -1654,6 +1678,19 @@ def _probe_assistant_single_content(processor, model = None, modality = "image")
 pass
 
 
+# Audio towers that add a fixed 1500 positions, so features must stay padded to the processor's 30 s.
+_FULL_LENGTH_AUDIO_MODEL_TYPES = frozenset({"audioflamingo3", "musicflamingo"})
+
+
+def _text_only_padding(kwargs):
+    """Move top-level padding (and pad_to_multiple_of) into text_kwargs, so the audio feature extractor keeps its own."""
+    text_kwargs = {"padding": kwargs.pop("padding")}
+    if kwargs.get("pad_to_multiple_of") is not None:
+        text_kwargs["pad_to_multiple_of"] = kwargs.pop("pad_to_multiple_of")
+    kwargs["text_kwargs"] = text_kwargs
+    return kwargs
+
+
 def _generation_prompt_fuses_answer(processor, chat_template_kwargs = None) -> bool:
     """PaddleOCR-VL: "Assistant: Z" tokenizes as [':', ' Z'], generation as [':', ' '] then 'Z' (unslothai/notebooks#149)."""
     tokenizer = getattr(processor, "tokenizer", processor)
@@ -1686,7 +1723,7 @@ class UnslothVisionDataCollator:
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
         "_seen_supervised", "_warned_unsupervised", "audio_call_kwarg",
-        "chat_template_kwargs", "split_generation_prompt",
+        "chat_template_kwargs", "split_generation_prompt", "_full_length_audio",
     )
 
     def __init__(
@@ -1742,6 +1779,9 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        self._full_length_audio = (
+            getattr(getattr(model, "config", None), "model_type", None) in _FULL_LENGTH_AUDIO_MODEL_TYPES
+        )
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
@@ -1952,10 +1992,12 @@ class UnslothVisionDataCollator:
             videos, extra = video_processor_kwargs(self.processor, videos, video_kwargs["fps"])
             proc_kwargs["videos"] = videos
             proc_kwargs.update(extra)
-        if audios:
-            proc_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
+        if audios:
+            proc_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
+            if self._full_length_audio:
+                _text_only_padding(proc_kwargs)
         batch = self._call_processor(proc_kwargs, has_images)
 
         # Truncate manually when audio is present (couldn't pass max_length to processor)
@@ -2601,6 +2643,8 @@ class UnslothVisionDataCollator:
             prompt_kwargs.update(extra)
         if audios:
             prompt_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
+            if self._full_length_audio:
+                _text_only_padding(prompt_kwargs)
 
         proc_prompts = self._call_processor(dict(prompt_kwargs, text = prompt_texts), pc_has_images)
         # Encode completions (RIGHT pad) text-only
