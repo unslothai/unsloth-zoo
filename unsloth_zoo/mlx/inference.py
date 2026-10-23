@@ -5051,11 +5051,15 @@ def _qmv_rows_kernel(p):
     """The (dtype, group size, bits) `matmul.qmv_rows` runs an affine projection's verify rows with, or None. Settled once
     per quantized weight, at load or on its first block: built, timed, and checked on random rows."""
     arrays, settled = (p.get("weight"), p.get("scales"), p.get("biases")), p.__dict__.get("_unsloth_qmv_rows")
-    quantized = (type(p), *(getattr(p, name, None) for name in ("group_size", "bits", "mode")))
+    # The kernel bypasses the layer's call, so it must be one whose one-row result is the stock one; zoo's own
+    # wrappers count as stock, so a projection settled at load keeps its verdict when generation installs them.
+    call = type(p).__call__
+    stock = isinstance(p, nn.QuantizedLinear) and (call is nn.QuantizedLinear.__call__ or call in _ONE_ROW_STOCK_CALLS)
+    quantized = (stock, *(getattr(p, name, None) for name in ("group_size", "bits", "mode")))
     if settled is not None and all(a is b for a, b in zip(settled[0], arrays)) and settled[1] == quantized:
         return settled[2]
     kernel = None
-    if (isinstance(p, nn.QuantizedLinear)
+    if (stock
             and p.scales.dtype in (mx.bfloat16, mx.float16) and p.scales.dtype == getattr(p.get("biases"), "dtype", None)
             and matmul.qmv_rows_supported(p.weight.shape[0], p.scales.shape[-1] * p.group_size, p.group_size, p.bits, p.mode)
             and matmul.qmv_rows_probe_passed(p.scales.dtype, p.group_size, p.bits)):

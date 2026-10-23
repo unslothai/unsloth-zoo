@@ -508,6 +508,30 @@ def test_each_verify_rows_kernel_has_its_own_probe_building_only_that_kernel(mon
             getattr(matmul, name)
 
 
+def test_verify_rows_serve_only_projections_whose_one_row_call_is_stock(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    monkeypatch.setattr(inference, "_QMV_ROWS_COSTS", {})
+    monkeypatch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+    monkeypatch.setattr(matmul, "qmv_rows_launch_costs", lambda *kernel: _spilling_costs(8))
+    supported, support = [], matmul.qmv_rows_supported
+    monkeypatch.setattr(matmul, "qmv_rows_supported", lambda *args: supported.append(args) or support(*args))
+    linear = nn.Linear(512, 64, bias = False)
+    linear.set_dtype(mx.bfloat16)
+    p = nn.QuantizedLinear.from_linear(linear, group_size = 64, bits = 4)
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4) and len(supported) == 1
+    # A wrapper zoo installs during generation, stock on one row, keeps the verdict settled at load.
+    stock_call = lambda self, x: nn.QuantizedLinear.__call__(self, x)
+    monkeypatch.setattr(inference, "_ONE_ROW_STOCK_CALLS", {stock_call})
+    p.__class__ = type("Wrapped", (nn.QuantizedLinear,), {"__call__": stock_call})
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4) and len(supported) == 1
+    # A subclass whose call changes the projection is never bypassed.
+    p.__class__ = type("Scaled", (nn.QuantizedLinear,), {"__call__": lambda self, x: nn.QuantizedLinear.__call__(self, x) * 2})
+    assert inference._qmv_rows_kernel(p) is None
+    p.__class__ = nn.QuantizedLinear
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4)
+
+
 def test_verify_rows_launch_the_plan_their_launch_costs_make_cheapest():
     from unsloth_zoo.mlx import matmul
     plan = lambda costs, rows: matmul.qmv_rows_plan(tuple(costs.items()), rows)
