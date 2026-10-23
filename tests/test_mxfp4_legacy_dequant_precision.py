@@ -68,8 +68,7 @@ def test_temporaries_stay_within_the_chunk_budget(monkeypatch, old_torch_path, d
     base = torch.cuda.memory_allocated()
     out = mxfp4_dequantize_torch(blocks, scales, dtype = dtype)
     temp = torch.cuda.max_memory_allocated() - base - out.numel() * out.element_size()
-    # float64: merge base peaks at 516 MiB on every torch, the old ldexp + where path reached 773 MiB.
-    # float32 on old torch: merge base 324 MiB, sizing its chunks for 8 bytes per value reached 389 MiB.
+    # Merge base peaks: float64 516 MiB (old ldexp + where path 773), float32 on old torch 324 MiB.
     limit = (2 if dtype == torch.float64 else 1.25) * mxd._TORCH_CHUNK_BYTES + (8 << 20)
     assert temp <= limit, temp / 2**20
 
@@ -109,7 +108,6 @@ def _patched_converter(monkeypatch):
 
 
 def test_converter_old_torch_path_honors_rows_per_chunk(monkeypatch):
-    # The caller sizes rows_per_chunk from free memory; the fp32 detour must not use a bigger chunk.
     convert = _patched_converter(monkeypatch)
     sizes = []
     real_empty = torch.empty
