@@ -5154,7 +5154,7 @@ def _resolve_weighted_unpermute():
     if _WEIGHTED_UNPERMUTE is None:
         try:
             from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
-        except ImportError:
+        except Exception:  # now runs at import too: a broken triton must not fail importing zoo
             _wu = False
         _WEIGHTED_UNPERMUTE = _wu
     return _WEIGHTED_UNPERMUTE
