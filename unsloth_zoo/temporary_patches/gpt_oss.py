@@ -2831,9 +2831,9 @@ class _OgsDown(torch.autograd.Function):
                 if need_h:
                     grad_h[lo:hi] = scaled[lo:hi] @ weight.t()
                 if need_gamma:
-                    y = (h[lo:hi] @ weight).float()
-                    if bias is not None:
-                        y = y + bias[e].float()
+                    # Same fp32 epilogue as the forward, so the routing-weight gradient matches it.
+                    with torch.autocast(device_type = h.device.type, enabled = False):
+                        y = _ogs_mm_fp32(h[lo:hi].to(torch.bfloat16), weight, None if bias is None else bias[e])
                     grad_gamma[lo:hi] = (grad_rows[lo:hi].float() * y).sum(-1)
                 if need_bias:
                     grad_bias[e] = scaled[lo:hi].float().sum(0)

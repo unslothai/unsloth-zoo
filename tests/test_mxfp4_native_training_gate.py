@@ -217,6 +217,19 @@ def test_the_fallback_adds_the_bias_before_rounding():
     torch.testing.assert_close(down.float(), torch.ones_like(down, dtype = torch.float32), rtol = 0, atol = 1e-2)
 
 
+def test_the_fallback_routing_weight_grad_uses_the_same_epilogue(monkeypatch):
+    # d out / d gamma is h @ W + b: 1 here, not 0 from a product rounded to bf16 before the bias.
+    module, x, h, logits = _cancelling_problem()
+    routing, gather, scatter, _, _ = _routing(logits)
+    module.down_proj_precision_config = None
+    monkeypatch.setattr(go, "_ogs_backend_for", lambda *args, **kwargs: None)
+    monkeypatch.setattr(go, "_ogs_native_training_ok", lambda *args, **kwargs: False)
+    gammas = routing.gate_scal.detach().clone().requires_grad_(True)
+    out = go._OgsDown.apply(h, gammas, module.down_proj_bias, module, routing, scatter)
+    out.float().sum().backward()
+    torch.testing.assert_close(gammas.grad.float(), torch.full_like(gammas.grad, H, dtype = torch.float32))
+
+
 class _NoGradExperts:
     """The LoRA-patched experts forward's view of a module: dense stacks, no adapters, a recording native forward."""
 
