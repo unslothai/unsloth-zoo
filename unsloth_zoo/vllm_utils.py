@@ -3600,15 +3600,66 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
     Records the bias on llm._unsloth_padded_vocab_bias so GRPO support scoring can apply it too.
     Idempotent."""
     pad_bias = float("-inf")
+    bias = {int(i): pad_bias for i in padded_ids}
+    engine = getattr(llm, "llm_engine", None) or llm
+    masked = []
+
+    def _record():
+        try:
+            llm._unsloth_padded_vocab_bias = (tuple(bias), pad_bias)
+        except Exception:
+            pass
+        return llm
+
+    def _mask_in_model():
+        # Where logit_bias cannot reach, mask the rows in the target model's compute_logits: the
+        # runner samples, and verifies every speculative draft, from it. The engine runs in this
+        # process (VLLM_ENABLE_V1_MULTIPROCESSING=0); an unreachable model returns False.
+        if masked:
+            return True
+        try:
+            core = getattr(engine, "engine_core", None)
+            core = getattr(core, "engine_core", core)
+            executor = getattr(core, "model_executor", None) or engine.model_executor
+            model = executor.driver_worker.model_runner.model
+            method = model.compute_logits
+        except Exception:
+            return False
+        if not getattr(method, "_unsloth_padded_vocab", False):
+            indices = {}
+            pad_ids = list(bias)
+
+            @functools.wraps(method)
+            def compute_logits_without_padded_vocab(*args, **kwargs):
+                logits = method(*args, **kwargs)
+                # None on pipeline ranks that do not sample.
+                if isinstance(logits, torch.Tensor) and logits.ndim > 0:
+                    key = (logits.device, logits.shape[-1])
+                    index = indices.get(key)
+                    if index is None:
+                        ids = [i for i in pad_ids if i < logits.shape[-1]]
+                        index = indices[key] = torch.tensor(ids, dtype = torch.long, device = logits.device)
+                    logits.index_fill_(-1, index, pad_bias)
+                return logits
+
+            compute_logits_without_padded_vocab._unsloth_padded_vocab = True
+            try:
+                model.compute_logits = compute_logits_without_padded_vocab
+            except Exception:
+                return False
+        masked.append(True)
+        return True
+
     if speculative:
         # SamplingParams._validate_spec_decode rejects any logit_bias under speculative decoding
         # (vLLM 0.29; older V1 drops it with a warning), so biasing would fail every request.
+        if _mask_in_model():
+            return _record()
         print(
             "Unsloth: vLLM does not support logit_bias with speculative decoding, so this padded "
             "vocabulary's alignment rows stay sampleable."
         )
         return llm
-    bias = {int(i): pad_bias for i in padded_ids}
     try:
         # Model Runner V2 refuses a request with more logit_bias entries than this.
         from vllm.v1.worker.gpu.sample.logit_bias import MAX_NUM_LOGIT_BIAS_TOKENS as max_bias
@@ -3626,6 +3677,8 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
             return
         merged = {**current, **bias}
         if len(merged) > max_bias:
+            if _mask_in_model():
+                return
             if not warned:
                 warned.append(True)
                 print(
@@ -3641,8 +3694,13 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
     # add_request / add_request_async: LLM.generate / chat / enqueue, LLMEngine and AsyncLLM
     # add_request (also with a prebuilt EngineCoreRequest), n > 1 children and AsyncLLM streaming
     # input chunks. Biasing there covers them all, once per request.
-    engine = getattr(llm, "llm_engine", None) or llm
     client = getattr(engine, "engine_core", None)
+    v1 = client is not None and any(
+        getattr(client, name, None) is not None for name in ("add_request", "add_request_async")
+    )
+    if v1 and len(bias) > max_bias and _mask_in_model():
+        # Every request would be refused the bias: the model mask covers them all instead.
+        return _record()
     hooked = False
     for name in ("add_request", "add_request_async"):
         method = getattr(client, name, None) if client is not None else None
@@ -3705,11 +3763,7 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
     elif len(bias) > max_bias:
         # Every request is refused the bias in _bias_request: nothing is suppressed.
         return llm
-    try:
-        llm._unsloth_padded_vocab_bias = (tuple(bias), pad_bias)
-    except Exception:
-        pass
-    return llm
+    return _record()
 pass
 
 

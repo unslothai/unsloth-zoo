@@ -579,3 +579,69 @@ def test_merged_export_tolerates_an_ambiguous_text_config():
     plain_base, plain = Ambiguous(text_config = SimpleNamespace()), Ambiguous(text_config = SimpleNamespace())
     _carry_over_vocab_pad_records(plain_base, plain)
     assert not hasattr(plain_base.text_config, "unsloth_vocab_pad_ids")
+
+
+class _VllmModel(torch.nn.Module):
+    # A vLLM *ForCausalLM: the runner samples (and verifies drafts) from model.compute_logits.
+    def __init__(self, vocab = 2100):
+        super().__init__()
+        self.vocab = vocab
+
+    def compute_logits(self, hidden_states):
+        logits = torch.zeros(hidden_states.shape[0], self.vocab)
+        logits[:, 1] = 1.0
+        logits[:, IDS[0]] = 200.0
+        return logits
+
+
+def _inproc_llm():
+    # VLLM_ENABLE_V1_MULTIPROCESSING=0: LLM.llm_engine.engine_core is an InprocClient whose
+    # engine_core is the EngineCore holding the executor, worker and model runner in this process.
+    from types import SimpleNamespace
+    llm = _LLM()
+    runner = SimpleNamespace(model = _VllmModel())
+    llm.llm_engine.engine_core.engine_core = SimpleNamespace(
+        model_executor = SimpleNamespace(driver_worker = SimpleNamespace(model_runner = runner)),
+    )
+    return llm, runner.model
+
+
+def _assert_padded_rows_masked(model, ids = IDS):
+    logits = model.compute_logits(torch.zeros(3, 4))
+    assert torch.isneginf(logits[:, ids]).all()
+    assert int((~torch.isneginf(logits)).sum()) == 3 * (logits.shape[-1] - len(ids))
+    assert logits.argmax(-1).tolist() == [1, 1, 1]
+
+
+def test_vllm_padded_vocab_masked_in_model_under_speculative_decoding(capsys):
+    # logit_bias is refused with speculation, so the rows are masked where the target logits
+    # (which also verify every draft) are computed; requests stay untouched.
+    llm, model = _inproc_llm()
+    wrap = _vllm_wrapper_ns()["suppress_vllm_padded_vocab"]
+    wrap(llm, IDS, speculative = True)
+    wrap(llm, IDS, speculative = True)
+    _assert_padded_rows_masked(model)
+    llm.generate(["a"], _Params())
+    assert llm.llm_engine.engine_core.seen[0].sampling_params.logit_bias is None
+    assert "stay sampleable" not in capsys.readouterr().out
+    assert llm._unsloth_padded_vocab_bias == (tuple(IDS), float("-inf"))
+
+
+def test_vllm_padded_vocab_masked_in_model_past_the_logit_bias_limit(capsys):
+    big = list(range(900, 2063))
+    llm, model = _inproc_llm()
+    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, big)
+    _assert_padded_rows_masked(model, big)
+    llm.generate(["a"], _Params())
+    assert llm.llm_engine.engine_core.seen[0].sampling_params.logit_bias is None
+    assert "stay sampleable" not in capsys.readouterr().out
+    assert llm._unsloth_padded_vocab_bias == (tuple(big), float("-inf"))
+
+
+def test_vllm_padded_vocab_masked_in_model_when_a_request_overflows_the_limit(capsys):
+    llm, model = _inproc_llm()
+    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, IDS)
+    llm.generate(["a"], _Params({i: 1.0 for i in range(1000)}))
+    assert len(llm.llm_engine.engine_core.seen[0].sampling_params.logit_bias) == 1000
+    _assert_padded_rows_masked(model)
+    assert "stay sampleable" not in capsys.readouterr().out
