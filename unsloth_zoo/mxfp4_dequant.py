@@ -213,18 +213,23 @@ if _HAS_TRITON:
         tl.store(out_ptr + out_offs, vals, mask = mask)
 
 
-_KERNEL_FAILED = False
+# Rounding paths (see _exact_round) whose kernel failed to compile or launch.
+_KERNEL_FAILED = set()
 _KERNEL_VERIFIED = {}
 
 
+def _kernel_failed():
+    return _exact_round() in _KERNEL_FAILED
+
+
 def _triton_usable(blocks):
-    return _HAS_TRITON and not _KERNEL_FAILED and blocks.is_cuda and blocks.dtype == torch.uint8
+    return _HAS_TRITON and not _kernel_failed() and blocks.is_cuda and blocks.dtype == torch.uint8
 
 
 def _kernel_fail(exception):
-    # A Triton build that cannot compile the kernel (an old ROCm stack) falls back for good.
-    global _KERNEL_FAILED
-    _KERNEL_FAILED = True
+    # A Triton build that cannot compile this variant (an old ROCm stack) falls back for good; the other
+    # rounding path can still be tried.
+    _KERNEL_FAILED.add(_exact_round())
     import warnings
     warnings.warn(f"Unsloth: fused MXFP4 dequant unavailable ({exception}); using the torch path.")
 
@@ -254,7 +259,7 @@ def _kernel_verified(device, dtype, transpose):
     except Exception as exception:
         _kernel_fail(exception)
         verified = False
-    if not verified and not _KERNEL_FAILED:
+    if not verified and not _kernel_failed():
         import warnings
         warnings.warn("Unsloth: fused MXFP4 dequant does not match the reference on this device; using the torch path.")
     _KERNEL_VERIFIED[key] = verified
@@ -263,7 +268,7 @@ def _kernel_verified(device, dtype, transpose):
 
 def mxfp4_kernel_available(device = None, dtype = torch.bfloat16) -> bool:
     """Whether the fused kernel runs, and is exact, for the GPT-OSS transposed layout on ``device``."""
-    if not _HAS_TRITON or _KERNEL_FAILED or not torch.cuda.is_available():
+    if not _HAS_TRITON or _kernel_failed() or not torch.cuda.is_available():
         return False
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())

@@ -144,7 +144,7 @@ def test_verification_is_keyed_on_the_rounding_path(monkeypatch):
 
     monkeypatch.setattr(mxd, "_kernel_dequantize", fake_dequantize)
     monkeypatch.setattr(mxd, "_KERNEL_VERIFIED", {})
-    monkeypatch.setattr(mxd, "_KERNEL_FAILED", False)
+    monkeypatch.setattr(mxd, "_KERNEL_FAILED", set())
     device = torch.device("cpu")
     monkeypatch.setenv("UNSLOTH_MXFP4_EXACT_ROUND", "1")
     assert mxd._kernel_verified(device, torch.bfloat16, False) is True
@@ -154,6 +154,18 @@ def test_verification_is_keyed_on_the_rounding_path(monkeypatch):
     monkeypatch.setenv("UNSLOTH_MXFP4_EXACT_ROUND", "1")
     assert mxd._kernel_verified(device, torch.bfloat16, False) is True
     assert checked == [True, False]
+
+
+def test_a_failed_variant_leaves_the_other_rounding_path_usable(monkeypatch):
+    monkeypatch.setattr(mxd, "_KERNEL_FAILED", set())
+    blocks = torch.zeros(1, 4, 2, 16, dtype = torch.uint8, device = "cuda" if torch.cuda.is_available() else "cpu")
+    monkeypatch.setenv("UNSLOTH_MXFP4_EXACT_ROUND", "1")
+    with pytest.warns(UserWarning, match = "unavailable"):
+        mxd._kernel_fail(RuntimeError("cannot compile"))
+    assert mxd._kernel_failed()
+    monkeypatch.setenv("UNSLOTH_MXFP4_EXACT_ROUND", "0")
+    assert not mxd._kernel_failed()
+    assert mxd._triton_usable(blocks) == (mxd._HAS_TRITON and blocks.is_cuda)
 
 
 @needs_gpu
