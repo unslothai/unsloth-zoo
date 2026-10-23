@@ -1931,6 +1931,24 @@ def _native_config_for_vllm_rebuild(config):
 pass
 
 
+# Embeddings stored under another name: Nemotron-H keeps `embeddings` (see get_vllm_state_dict).
+_EXTRA_EMBED_KEYS = ("model.embeddings.weight",)
+
+
+def _shared_weight_dtype(quant_state_dict, dtype):
+    """The dtype to build the Hugging Face side in. On XPU the loader and vLLM can judge bf16 on different
+    devices (vLLM refuses bf16 on an Arc A770; a released unsloth judges an unused emulating XPU), so
+    follow the fp16 / bf16 embedding vLLM shares in either direction, never a guess."""
+    if DEVICE_TYPE != "xpu" or dtype not in (torch.float16, torch.bfloat16):
+        return dtype
+    for key in TIED_EMBED_KEYS + _EXTRA_EMBED_KEYS:
+        weight = getattr(quant_state_dict.get(key, None), "data", quant_state_dict.get(key, None))
+        if isinstance(weight, torch.Tensor):
+            return weight.dtype if weight.dtype in (torch.float16, torch.bfloat16) else dtype
+    return dtype
+pass
+
+
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1938,6 +1956,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     def _unwrap_tensor(value):
         return getattr(value, "data", value)
 
+    dtype = _shared_weight_dtype(quant_state_dict, dtype)
     config = _native_config_for_vllm_rebuild(config)
     set_dtype_in_config(config, dtype)
     for subconfig_name in ("text_config", "vision_config", "audio_config"):
@@ -2209,6 +2228,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
+    # patch_model_and_tokenizer reads this: the loader's dtype may differ (see _shared_weight_dtype).
+    new_model._unsloth_vllm_dtype = dtype
     return new_model
 pass
 
@@ -4306,8 +4327,9 @@ def load_vllm(
     elif DEVICE_TYPE == "hip":
         _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
+        # Judge the XPU the engine is handed below (get_target_device()), not the current one.
         from .device_type import _xpu_bf16_supported
-        _dtype = torch.bfloat16 if _xpu_bf16_supported() else torch.float16
+        _dtype = torch.bfloat16 if _xpu_bf16_supported(get_target_device()) else torch.float16
     elif DEVICE_TYPE == "npu" and torch.npu.is_bf16_supported():
         _dtype = torch.bfloat16
     else:
@@ -4327,9 +4349,10 @@ def load_vllm(
     else:
         raise NotImplementedError(f"Unsloth: We do not support dtype = {dtype} yet!")
     if DEVICE_TYPE == "xpu" and dtype == torch.bfloat16:
-        # Fail early and agree with unsloth's loader rather than raise inside vLLM's engine.
-        from .device_type import _unsloth_follows_vllm_bf16_refusal, _xpu_vllm_refuses_bf16
-        if _xpu_vllm_refuses_bf16() and _unsloth_follows_vllm_bf16_refusal():
+        # Switch here rather than raise inside vLLM's engine. A loader that still holds bf16 (any
+        # released unsloth) is fine: convert_vllm_to_huggingface builds on the fp16 weights vLLM shares.
+        from .device_type import _xpu_vllm_refuses_bf16
+        if _xpu_vllm_refuses_bf16():
             print("Unsloth: vLLM does not accept torch.bfloat16 on this Intel GPU, so we switched to dtype = torch.float16.")
             dtype = torch.float16
 
