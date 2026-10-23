@@ -55,6 +55,14 @@
       "reason": "Loads the module this process just generated into its own compile cache folder."
     },
     {
+      "file": "unsloth_zoo/cpu/runtime.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "7e28e71786fdeb78",
+      "count": 1,
+      "reason": "Loads a fixed, package-shipped guard file (unsloth_zoo/temporary_patches/datasets_folder_metadata.py) by a hard-coded name; no caller-controlled path."
+    },
+    {
       "file": "unsloth_zoo/dataset_num_proc.py",
       "rule": "dynamic-import",
       "sink": "__import__",
