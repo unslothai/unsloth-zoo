@@ -47,6 +47,7 @@ import os
 import re
 import warnings
 from collections import OrderedDict
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -184,13 +185,33 @@ def _make_key(token_ids, pad_token_id):
     return tuple(t for t in token_ids if t != pad_token_id)
 
 
-def record_routed_experts(request_outputs, pad_token_id = None):
+def _prompt_start(sampling_params, index):
+    # vLLM's routed_experts_prompt_start drops that many leading prompt tokens from the capture.
+    # Same per-prompt test as vLLM's offline _params_to_seq: any Sequence, never a SamplingParams.
+    if isinstance(sampling_params, Sequence):
+        sampling_params = sampling_params[index] if index < len(sampling_params) else None
+    start = getattr(sampling_params, "routed_experts_prompt_start", 0)
+    return start if isinstance(start, int) and start > 0 else 0
+
+
+def _earlier_prefix_rows(prefix, store):
+    """Rows recorded for exactly `prefix` by an earlier turn (multi-turn prompt start), else None."""
+    earlier = (call[0] for rollout in reversed(_STATE.generations.values()) for call in reversed(rollout))
+    for candidate in (store, *earlier):
+        rows = candidate.get(prefix, None)
+        if rows is not None:
+            return rows
+    return None
+
+
+def record_routed_experts(request_outputs, pad_token_id = None, sampling_params = None):
     """Store vLLM's per-token expert ids for each finished completion."""
     if pad_token_id is None:
         pad_token_id = _STATE.pad_token_id
     store = {}
     unpadded = {}
-    for request_output in request_outputs:
+    for index, request_output in enumerate(request_outputs):
+        start = _prompt_start(sampling_params, index)
         prompt_ids = list(getattr(request_output, "prompt_token_ids", None) or [])
         for completion in getattr(request_output, "outputs", None) or []:
             routed = getattr(completion, "routed_experts", None)
@@ -200,8 +221,13 @@ def record_routed_experts(request_outputs, pad_token_id = None):
             routed = torch.as_tensor(routed).to(torch.int16)
             # vLLM never forwards the last sampled token, so it has no routing.
             rows = torch.full((len(full),) + tuple(routed.shape[1:]), -1, dtype = torch.int16)
-            n = min(len(full), routed.shape[0])
-            rows[:n] = routed[:n]
+            n = max(min(len(full) - start, routed.shape[0]), 0)
+            rows[start : start + n] = routed[:n]
+            if start > 0:
+                # vLLM skipped tokens an earlier turn already returned: replay that turn's routes.
+                earlier = _earlier_prefix_rows(tuple(full[:start]), store)
+                if earlier is not None and earlier.shape[1:] == rows.shape[1:]:
+                    rows[:start] = earlier
             if rows.shape[-1] > 1:
                 # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.
                 ordered = rows.sort(dim = -1).values
@@ -262,7 +288,11 @@ def wrap_vllm_generate(llm):
     def generate_with_routing_record(*args, **kwargs):
         outputs = generate(*args, **kwargs)
         try:
-            record_routed_experts(outputs if isinstance(outputs, (list, tuple)) else [outputs])
+            sampling_params = kwargs.get("sampling_params", args[1] if len(args) > 1 else None)
+            record_routed_experts(
+                outputs if isinstance(outputs, (list, tuple)) else [outputs],
+                sampling_params = sampling_params,
+            )
         except Exception as error:
             warnings.warn(f"Unsloth: routing replay could not record routed experts: {error}")
         return outputs
