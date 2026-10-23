@@ -746,3 +746,38 @@ def test_fp16_autocast_probe_works_with_the_device_less_api(monkeypatch):
             # torch.autocast itself calls the real API on entry and exit, so stub only inside.
             m.setattr(torch, "is_autocast_enabled", device_less)
             assert ops._cpu_fp16_autocast() is True
+
+
+def test_f32_in_a_multi_format_gguf_export_is_converted_not_quantized(monkeypatch, tmp_path):
+    import unsloth_zoo.llama_cpp as llama_cpp
+    from unsloth_zoo.cpu import loader
+    converted, quantized = [], []
+
+    def convert(prefix, merged, model_dtype, quantization_type, converter_location):
+        converted.append(quantization_type)
+        path = f"{prefix}.{quantization_type.upper()}.gguf"
+        open(path, "w").close()
+        return [path], None
+
+    def quantize(src, dst, method, quantizer_location, print_output):
+        quantized.append(method)
+        open(dst, "w").close()
+
+    monkeypatch.setattr(llama_cpp, "install_llama_cpp", lambda print_output = False: ("q", "c"))
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", convert)
+    monkeypatch.setattr(llama_cpp, "quantize_gguf", quantize)
+    out = loader.save_pretrained_gguf(_tiny_llama().float(), str(tmp_path / "m"), quantization_method = ["f32", "q4_k_m"])
+    assert sorted(os.path.basename(p) for p in out) == ["m.F32.gguf", "m.Q4_K_M.gguf"]
+    assert "f32" in converted and quantized == ["q4_k_m"]
+
+
+@pytest.mark.parametrize("saved, expected", [(torch.float32, torch.float32), (torch.float16, torch.bfloat16)])
+def test_auto_dtype_keeps_the_checkpoint_dtype(monkeypatch, tmp_path, dtype_policy, saved, expected):
+    import transformers
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    dtype_policy("1", "0")
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    _tiny_llama().to(saved).save_pretrained(tmp_path / "m")
+    for key in ("dtype", "torch_dtype"):
+        model, _ = FastCPUModel.from_pretrained(str(tmp_path / "m"), load_in_4bit = False, **{key: "auto"})
+        assert model.dtype == expected

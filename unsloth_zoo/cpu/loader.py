@@ -121,7 +121,9 @@ class FastCPUModel:
         torch_dtype = kwargs.pop("torch_dtype", None)
         if dtype is None and torch_dtype is not None:
             dtype = torch_dtype
-        dtype = _resolve_dtype(dtype)
+        # "auto" keeps the checkpoint's own dtype (fp16 checkpoints still move off fp16 after loading).
+        auto_dtype = isinstance(dtype, str) and dtype == "auto"
+        dtype = _resolve_dtype(None if auto_dtype else dtype)
 
         # 4-bit only where bitsandbytes' CPU backend really runs; full finetuning never quantizes.
         use_4bit = bool(load_in_4bit) and not load_in_8bit and not load_in_16bit and not full_finetuning
@@ -167,7 +169,7 @@ class FastCPUModel:
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
         load_kwargs = dict(
-            **{_DTYPE_KWARG: dtype},
+            **{_DTYPE_KWARG: "auto" if auto_dtype else dtype},
             device_map = "cpu",
             token = token,
             revision = revision,
@@ -185,6 +187,11 @@ class FastCPUModel:
                 kwargs.pop("quantization_config", None)
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
+        if auto_dtype:
+            dtype = model.dtype
+            if dtype == torch.float16 and not use_4bit:
+                dtype = _resolve_dtype(torch.float16)
+                model = model.to(dtype)
         max_seq_length = _clamp_to_learned_positions(model, max_seq_length)
         tokenizer_kwargs = dict(
             token = token, revision = revision, trust_remote_code = trust_remote_code,
@@ -531,6 +538,14 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
     results = list(outputs)
     for method in methods:
         if method in direct and method == first:
+            continue
+        if method == "f32":
+            # Straight from the FP32 staging checkpoint; llama-quantize would upcast the bf16 GGUF.
+            f32_outputs, _ = convert_to_gguf(
+                os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
+                quantization_type = "f32", converter_location = converter,
+            )
+            results.extend(f32_outputs)
             continue
         target = first_file.replace(f".{first.upper()}.gguf", f".{method.upper()}.gguf")
         if target == first_file:
