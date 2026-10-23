@@ -80,7 +80,8 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
                         grad_hidden[start:end] = logits.to(h.dtype) @ weight
                 if need_weight_grad:
                     grad_weight.addmm_(logits.t(), h.float())
-        loss = total / divisor
+        # num_items_in_batch == 0 (a fully masked accumulation group): a finite 0, as TRL's clamped divisor gives.
+        loss = total / (1.0 if divisor == 0 else divisor)
         ctx.divisor = divisor
         ctx.save_for_backward(
             grad_hidden if grad_hidden is not None else torch.empty(0),

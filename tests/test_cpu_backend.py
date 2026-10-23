@@ -503,6 +503,7 @@ def test_zero_item_batch_gives_zero_gradients_not_nan():
     weight = torch.randn(16, 8)
     labels = torch.full((2, 4), -100)
     loss = chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = torch.tensor(0))
+    assert loss.item() == 0.0
     loss.backward()
     assert torch.equal(hidden.grad, torch.zeros_like(hidden.grad))
 
