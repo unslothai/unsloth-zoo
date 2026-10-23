@@ -154,9 +154,10 @@ class FastCPUModel:
                 bnb_4bit_use_double_quant = True,
                 bnb_4bit_compute_dtype = dtype,
             )
+        resize_model_vocab = kwargs.pop("resize_model_vocab", None)
         for key in ("load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",
                     "max_lora_rank", "gpu_memory_utilization", "float8_kv_cache", "random_state",
-                    "fix_tokenizer", "resize_model_vocab", "unsloth_tiled_mlp", "offload_embedding"):
+                    "fix_tokenizer", "unsloth_tiled_mlp", "offload_embedding"):
             kwargs.pop(key, None)
 
         if quantization_config is not None:
@@ -219,6 +220,8 @@ class FastCPUModel:
             f"{type(model).__name__} on {torch.get_num_threads()} CPU threads. "
             f"dtype = {dtype}, 4-bit = {use_4bit}, chunked CE = {chunked}."
         )
+        if resize_model_vocab is not None:
+            model.resize_token_embeddings(resize_model_vocab)
         FastCPUModel._attach(model)
         if adapter_name is not None:
             from peft import PeftModel

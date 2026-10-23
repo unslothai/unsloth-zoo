@@ -673,3 +673,24 @@ def test_fp16_autocast_chunked_loss_keeps_small_gradients_for_the_scaler():
     (loss * 65536).backward()
     assert reference.grad.abs().max() > 0
     torch.testing.assert_close(hidden.grad, reference.grad, rtol = 1e-3, atol = 1e-9)
+
+
+def test_json_gradient_checkpointing_kwargs_are_decoded(dtype_policy):
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.trainer import normalize_cpu_training_arguments
+    dtype_policy("0", "0")
+    args = SimpleNamespace(use_cpu = True, fp16 = False, bf16 = False, optim = "adamw_torch", gradient_checkpointing = True,
+                           gradient_checkpointing_kwargs = '{"use_reentrant": true}')
+    normalize_cpu_training_arguments(args)
+    assert args.gradient_checkpointing_kwargs == {"use_reentrant": True}
+
+
+def test_resize_model_vocab_is_applied(monkeypatch, tmp_path):
+    import transformers
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    _tiny_llama().save_pretrained(tmp_path / "base")
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(70))
+    model, _ = FastCPUModel.from_pretrained(str(tmp_path / "base"), load_in_4bit = False, dtype = torch.float32,
+                                            resize_model_vocab = 70)
+    assert model.get_input_embeddings().num_embeddings == 70
+    assert model.get_output_embeddings().weight.shape[0] == 70

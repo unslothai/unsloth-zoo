@@ -19,6 +19,7 @@
 __all__ = ["install_cpu_training_defaults", "normalize_cpu_training_arguments"]
 
 import functools
+import json
 
 import torch
 
@@ -65,7 +66,11 @@ def normalize_cpu_training_arguments(args):
             print(f"Unsloth (CPU): {key} needs FlashAttention to keep packed examples apart, turning it off.")
             setattr(args, key, False)
     if getattr(args, "gradient_checkpointing", False):
-        kwargs = dict(getattr(args, "gradient_checkpointing_kwargs", None) or {})
+        kwargs = getattr(args, "gradient_checkpointing_kwargs", None) or {}
+        if isinstance(kwargs, str):
+            # The CLI / JSON form, which TrainingArguments decodes only after this runs.
+            kwargs = json.loads(kwargs)
+        kwargs = dict(kwargs)
         kwargs.setdefault("use_reentrant", False)
         args.gradient_checkpointing_kwargs = kwargs
     return args
