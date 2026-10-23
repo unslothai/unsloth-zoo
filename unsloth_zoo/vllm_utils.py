@@ -1936,14 +1936,15 @@ _EXTRA_EMBED_KEYS = ("model.embeddings.weight",)
 
 
 def _shared_weight_dtype(quant_state_dict, dtype):
-    """The dtype to build the Hugging Face side in. On XPU, load_vllm runs fp16 when vLLM refuses bf16
-    (Arc A770) even if the loader asked for bf16, so follow the embedding vLLM shares, never a guess."""
-    if DEVICE_TYPE != "xpu" or dtype != torch.bfloat16:
+    """The dtype to build the Hugging Face side in. On XPU the loader and vLLM can judge bf16 on different
+    devices (vLLM refuses bf16 on an Arc A770; a released unsloth judges an unused emulating XPU), so
+    follow the fp16 / bf16 embedding vLLM shares in either direction, never a guess."""
+    if DEVICE_TYPE != "xpu" or dtype not in (torch.float16, torch.bfloat16):
         return dtype
     for key in TIED_EMBED_KEYS + _EXTRA_EMBED_KEYS:
         weight = getattr(quant_state_dict.get(key, None), "data", quant_state_dict.get(key, None))
         if isinstance(weight, torch.Tensor):
-            return torch.float16 if weight.dtype == torch.float16 else dtype
+            return weight.dtype if weight.dtype in (torch.float16, torch.bfloat16) else dtype
     return dtype
 pass
 
