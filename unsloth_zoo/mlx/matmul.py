@@ -519,6 +519,15 @@ def compile_qmv_rows(dtype, group_size, bits):
              for kind in QMV_ROWS_KINDS for M in range(1, qmv_rows_most(kind) + 1)])
 
 
+def qmv_rows_matches(x, w, scales, biases, group_size, bits):
+    """Whether every kind of `qmv_rows` that takes x's rows gives each row bit for bit its one-row stock call."""
+    native = mx.concatenate([mx.quantized_matmul(x[i:i + 1], w, scales, biases, transpose = True,
+                                                 group_size = group_size, bits = bits) for i in range(x.shape[0])])
+    return all(mx.array_equal(qmv_rows(x, w, scales, biases, group_size, bits, *qmv_rows_args(x, bits, kind))
+                              .view(mx.uint16), native.view(mx.uint16)).item()
+               for kind in QMV_ROWS_KINDS if x.shape[0] <= qmv_rows_most(kind))
+
+
 def probe_qmv_rows():
     """Subprocess probe: every variant the kernel compiles, each row bitwise its one-row stock call."""
     # 72 and 80 outputs launch two and four simdgroups per staged threadgroup.
@@ -528,12 +537,7 @@ def probe_qmv_rows():
         w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
         for M in range(1, QMV_ROWS_STAGED_MAX + 1):
             x = mx.random.normal((M, 1024), key = mx.random.key(M)).astype(dtype)
-            native = mx.concatenate([mx.quantized_matmul(x[i:i + 1], w, scales, biases, transpose = True,
-                                                         group_size = group_size, bits = bits) for i in range(M)])
-            for kind in (kind for kind in QMV_ROWS_KINDS if M <= qmv_rows_most(kind)):
-                got = qmv_rows(x, w, scales, biases, group_size, bits, *qmv_rows_args(x, bits, kind))
-                assert mx.array_equal(got.view(mx.uint16), native.view(mx.uint16)).item(), \
-                    (dtype, group_size, bits, N, M, kind)
+            assert qmv_rows_matches(x, w, scales, biases, group_size, bits), (dtype, group_size, bits, N, M)
 
 
 def qmv_rows_launch_costs(dtype, group_size, bits, clock = time.perf_counter):

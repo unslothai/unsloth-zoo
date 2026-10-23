@@ -5043,49 +5043,67 @@ _EXACT_ATTENTION_THREADS = {}
 # Seconds per `matmul.qmv_rows` launch by (rows, inputs prepared), per (dtype, group size, bits), measured on the device:
 # the fastest launch width depends on the GPU and not monotonically on the rows (a wider launch can spill registers).
 _QMV_ROWS_COSTS = {}
+# Per (dtype, group size, bits, weight shape): whether every kind of `matmul.qmv_rows` gave each row its one-row stock bits.
+_QMV_ROWS_LAYOUTS = {}
 
 
-def _verify_qmv_rows(project, native, linears, x):
-    """`native()`, with affine projections run by `matmul.qmv_rows` once their first block matched `project(x)` bit for bit."""
-    if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.dtype not in (mx.bfloat16, mx.float16)
-            or x.shape[0] * x.shape[1] < 2 or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS", "1") == "0"
-            or not all(isinstance(p, nn.QuantizedLinear) and not p.trainable_parameters()
-                       and x.dtype == p.scales.dtype == getattr(p.get("biases"), "dtype", None)
-                       and matmul.qmv_rows_supported(p.weight.shape[0], x.shape[-1], p.group_size, p.bits, p.mode)
-                       for p in linears)
-            or not nax.kernel_probe_passed(matmul.QMV_ROWS_PROBE_KEY, matmul.__name__, "probe_qmv_rows", mx.metal.is_available)):
-        return native()
-    rows = x.reshape(-1, x.shape[-1])
-
-    def fused():
-        launches, outs = {}, []
-        for p in linears:
-            kernel = (x.dtype, p.group_size, p.bits)
-            if kernel not in launches:
-                costs = _QMV_ROWS_COSTS.get(kernel)
-                most, kind = (matmul.QMV_ROWS_MAX, "inline") if costs is None else matmul.qmv_rows_plan(costs, rows.shape[0])
-                stops = list(itertools.accumulate(matmul.qmv_rows_sizes(rows.shape[0], most)))
-                launches[kernel] = [(part, matmul.qmv_rows_args(part, p.bits, kind))
-                                    for part in (rows[a:b] for a, b in zip([0, *stops], stops))]
-            ys = [matmul.qmv_rows(part, p.weight, p.scales, p.biases, p.group_size, p.bits, *args)
-                  for part, args in launches[kernel]]
-            y = (ys[0] if len(ys) == 1 else mx.concatenate(ys)).reshape(*x.shape[:-1], -1)
-            outs.append(y + p["bias"] if "bias" in p else y)
-        return tuple(outs) if len(outs) > 1 else outs[0]
-
-    # Keyed by projection, not block width (a row's arithmetic does not depend on its block), with every row count
-    # built and every launch timed before the first block: the draft controller times a width from its first rounds.
-    key = ("qmv_rows", x.dtype, *((p.weight.shape, p.bits, p.group_size, "bias" in p) for p in linears))
-    if key not in _VERIFY_VERDICTS:
+def _qmv_rows_kernel(p):
+    """The (dtype, group size, bits) `matmul.qmv_rows` runs an affine projection's verify rows with, or None. Settled once
+    per quantized weight, at load or on its first block: built, timed, and checked on random rows."""
+    arrays, settled = (p.get("weight"), p.get("scales"), p.get("biases")), p.__dict__.get("_unsloth_qmv_rows")
+    quantized = (type(p), *(getattr(p, name, None) for name in ("group_size", "bits", "mode")))
+    if settled is not None and all(a is b for a, b in zip(settled[0], arrays)) and settled[1] == quantized:
+        return settled[2]
+    kernel = None
+    if (isinstance(p, nn.QuantizedLinear)
+            and p.scales.dtype in (mx.bfloat16, mx.float16) and p.scales.dtype == getattr(p.get("biases"), "dtype", None)
+            and matmul.qmv_rows_supported(p.weight.shape[0], p.scales.shape[-1] * p.group_size, p.group_size, p.bits, p.mode)
+            and nax.kernel_probe_passed(matmul.QMV_ROWS_PROBE_KEY, matmul.__name__, "probe_qmv_rows", mx.metal.is_available)):
+        kernel = (p.scales.dtype, p.group_size, p.bits)
+        layout = (*kernel, p.weight.shape)
         try:
-            for kernel in {(x.dtype, p.group_size, p.bits) for p in linears}:
-                matmul.compile_qmv_rows(*kernel)
-                if kernel not in _QMV_ROWS_COSTS:
-                    _FIRST_USE_WORK[0] += 1
-                    _QMV_ROWS_COSTS[kernel] = tuple(matmul.qmv_rows_launch_costs(*kernel).items())
+            matmul.compile_qmv_rows(*kernel)
+            if kernel not in _QMV_ROWS_COSTS:
+                _FIRST_USE_WORK[0] += 1
+                _QMV_ROWS_COSTS[kernel] = tuple(matmul.qmv_rows_launch_costs(*kernel).items())
+            if layout not in _QMV_ROWS_LAYOUTS:
+                K = p.scales.shape[-1] * p.group_size
+                x = mx.random.normal((matmul.QMV_ROWS_STAGED_MAX, K), key = mx.random.key(K)).astype(kernel[0])
+                _QMV_ROWS_LAYOUTS[layout] = _settled(all(
+                    matmul.qmv_rows_matches(x[:rows], p.weight, p.scales, p.biases, p.group_size, p.bits)
+                    for rows in {matmul.QMV_ROWS_MAX, matmul.QMV_ROWS_STAGED_MAX}))
+                if not _QMV_ROWS_LAYOUTS[layout]:
+                    logger.warning("verify rows differ from one-row calls for a %s weight of %d-bit groups of %d; "
+                                   "the native verifier stays in use there", p.weight.shape, p.bits, p.group_size)
         except (RuntimeError, ValueError) as error:
-            _unless_failed_buffer(error)  # inside a function transformation, which cannot evaluate
-    return _verify_admitted(key, lambda: project(x), fused)
+            _unless_failed_buffer(error)
+            return None  # inside a function transformation, which cannot evaluate; settled later
+        kernel = kernel if _QMV_ROWS_LAYOUTS[layout] else None
+    p.__dict__["_unsloth_qmv_rows"] = (arrays, quantized, kernel)
+    return kernel
+
+
+def _verify_qmv_rows(native, linears, x):
+    """`native()`, with affine projections that `_qmv_rows_kernel` settled run by `matmul.qmv_rows`."""
+    if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[0] * x.shape[1] < 2
+            or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS") == "0"):
+        return native()
+    kernels = [_qmv_rows_kernel(p) for p in linears]
+    if not all(kernel is not None and kernel[0] == x.dtype and not p.trainable_parameters()
+               for p, kernel in zip(linears, kernels)):
+        return native()
+    rows, launches, outs = x.reshape(-1, x.shape[-1]), {}, []
+    for p, kernel in zip(linears, kernels):
+        if kernel not in launches:
+            most, kind = matmul.qmv_rows_plan(_QMV_ROWS_COSTS[kernel], rows.shape[0])
+            stops = list(itertools.accumulate(matmul.qmv_rows_sizes(rows.shape[0], most)))
+            launches[kernel] = [(part, matmul.qmv_rows_args(part, p.bits, kind))
+                                for part in (rows[a:b] for a, b in zip([0, *stops], stops))]
+        ys = [matmul.qmv_rows(part, p.weight, p.scales, p.biases, p.group_size, p.bits, *args)
+              for part, args in launches[kernel]]
+        y = (ys[0] if len(ys) == 1 else mx.concatenate(ys)).reshape(*x.shape[:-1], -1)
+        outs.append(y + p["bias"] if "bias" in p else y)
+    return tuple(outs) if len(outs) > 1 else outs[0]
 
 
 @functools.cache
@@ -5246,11 +5264,11 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
 
     def sliced_linear(self, linear, x):
         project = lambda rows: base._linear(self, linear, rows)
-        return _verify_qmv_rows(project, lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
+        return _verify_qmv_rows(lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
 
     def sliced_linears(self, linears, x):
         project = lambda rows: base._linears(self, linears, rows)
-        return _verify_qmv_rows(project, lambda: _verify_sliced(project, linears, x, eligible), linears, x)
+        return _verify_qmv_rows(lambda: _verify_sliced(project, linears, x, eligible), linears, x)
 
     def submitted_layer(self, *args, **kwargs):
         hidden = base._layer(self, *args, **kwargs)
@@ -6513,3 +6531,16 @@ def warm_inference(model, int8_prefill = None):
     first-use checks; checks keyed by a request's row count still run then."""
     model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
                    int8_prefill = int8_prefill)
+    _warm_qmv_rows(model)
+
+
+def _warm_qmv_rows(model):
+    """Settle `_qmv_rows_kernel` for the projections of every language model the verify scope serves, for a model a
+    drafter was built for."""
+    if not getattr(model, "_unsloth_speculates", False) or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS") == "0":
+        return
+    with exact_speculative_verify(model):
+        served = [language for _, language in model.named_modules() if vars(language).get("_unsloth_verify_scopes")]
+        for p in {id(p): p for language in served for _, p in language.named_modules()
+                  if isinstance(p, nn.QuantizedLinear)}.values():
+            _qmv_rows_kernel(p)
