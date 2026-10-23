@@ -23,13 +23,7 @@ import torch
 modeling_parakeet = pytest.importorskip("transformers.models.parakeet.modeling_parakeet")
 
 from unsloth_zoo.compiler import _dtype_safe_forward
-from unsloth_zoo.temporary_patches.misc import patch_ParakeetEncoderSubsamplingConv2D_input_dtype
-from unsloth_zoo.temporary_patches.utils import _get_unique_storage_name
-
-
-def _original_forward(cls):
-    # importing unsloth_zoo may already have applied the patch; the pristine forward is kept beside it
-    return getattr(cls, _get_unique_storage_name(cls, "forward"), cls.forward)
+from unsloth_zoo.peft_utils import requires_grad_for_gradient_checkpointing
 
 
 def _subsampling():
@@ -39,6 +33,18 @@ def _subsampling():
     )
     torch.manual_seed(0)
     return modeling_parakeet.ParakeetEncoderSubsamplingConv2D(config).to(torch.bfloat16)
+
+
+class _Holder(torch.nn.Module):
+    def __init__(self, subsampling):
+        super().__init__()
+        self.subsampling = subsampling
+
+
+def _hook(module):
+    for param in module.parameters():  # frozen, as under LoRA
+        param.requires_grad_(False)
+    requires_grad_for_gradient_checkpointing(_Holder(module))
 
 
 def _run(module, features, mask):
@@ -65,44 +71,42 @@ def unsloth_conv_wrapper(monkeypatch):
     )
 
 
-def test_subsampling_runs_16_bit_and_matches_bitwise(unsloth_conv_wrapper, monkeypatch):
+def test_subsampling_runs_16_bit_and_matches_bitwise(unsloth_conv_wrapper):
     module = _subsampling()
     features = torch.randn(2, 64, 80)
     mask = torch.ones(2, 64, dtype = torch.bool)
     mask[1, 40:] = False
-    cls = modeling_parakeet.ParakeetEncoderSubsamplingConv2D
-    monkeypatch.setattr(cls, "forward", _original_forward(cls))  # restored after the test
     expected, before = _run(module, features, mask)
-    patch_ParakeetEncoderSubsamplingConv2D_input_dtype()
-    patch_ParakeetEncoderSubsamplingConv2D_input_dtype()  # idempotent: no stacked wrappers
+    _hook(module)
+    _hook(module)  # idempotent: one hook, not two
+    assert len(module._forward_pre_hooks) == 1
     got, after = _run(module, features, mask)
     assert set(before) == {torch.float32}
     assert set(after) == {torch.bfloat16}
     assert got.dtype == expected.dtype
     assert torch.equal(got, expected)
+    # keyword call path
+    with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
+        assert torch.equal(module(input_features = features, attention_mask = mask), expected)
 
 
-def test_float32_weights_are_left_alone(monkeypatch):
-    module = _subsampling().float()
-    cls = modeling_parakeet.ParakeetEncoderSubsamplingConv2D
-    monkeypatch.setattr(cls, "forward", _original_forward(cls))
-    patch_ParakeetEncoderSubsamplingConv2D_input_dtype()
-    seen = []
-    module.layers[0].register_forward_pre_hook(lambda m, args: seen.append(args[0].dtype))
-    with torch.no_grad():
-        module(torch.randn(1, 32, 80), None)
-    assert seen == [torch.float32]
-
-
-def test_quantized_closing_linear_keeps_float32(monkeypatch):
-    # bitsandbytes' Linear4bit computes in its input's dtype: a float32 input there must stay float32
-    module = _subsampling()
-    module.linear.weight.quant_state = object()
-    cls = modeling_parakeet.ParakeetEncoderSubsamplingConv2D
-    monkeypatch.setattr(cls, "forward", _original_forward(cls))
-    patch_ParakeetEncoderSubsamplingConv2D_input_dtype()
+def _first_conv_input_dtype(module):
     seen = []
     module.layers[0].register_forward_pre_hook(lambda m, args: seen.append(args[0].dtype))
     with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
         module(torch.randn(1, 32, 80), None)
-    assert seen == [torch.float32]
+    return seen
+
+
+def test_float32_weights_are_left_alone():
+    module = _subsampling().float()
+    _hook(module)
+    assert _first_conv_input_dtype(module) == [torch.float32]
+
+
+def test_quantized_closing_linear_keeps_float32():
+    # bitsandbytes' Linear4bit computes in its input's dtype: a float32 input there must stay float32
+    module = _subsampling()
+    module.linear.weight.quant_state = object()
+    _hook(module)
+    assert _first_conv_input_dtype(module) == [torch.float32]

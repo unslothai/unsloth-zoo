@@ -587,6 +587,45 @@ def _freeze_unused_feature_encoders(model):
 pass
 
 
+def _subsampling_input_to_16bit(module, args, kwargs):
+    """Pre-hook for the FastConformer subsampling (Parakeet, Canary): float32 features to 16 bit.
+
+    Unsloth's conv dtype wrapper casts a conv's input to its weight dtype and the result back to the
+    input's dtype, so float32 input_features kept the frozen conv stack in float32: twice autocast's
+    activation memory. Casting up front is bit identical: every conv already ran in the 16-bit weight
+    dtype, the ReLUs and 0/1 masks between them are exact, and autocast feeds the closing 16-bit Linear
+    the same values. A quantized closing Linear (QLoRA) computes in its input's dtype, so it is skipped.
+    A hook, not a forward patch, so the compiler's view of the forward is unchanged."""
+    layers = getattr(module, "layers", None)
+    weight = getattr(layers[0], "weight", None) if layers is not None and len(layers) else None
+    linear_weight = getattr(getattr(module, "linear", None), "weight", None)
+    if not (
+        isinstance(weight, torch.Tensor) and weight.dtype in (torch.float16, torch.bfloat16)
+        and isinstance(linear_weight, torch.Tensor) and linear_weight.dtype in (torch.float16, torch.bfloat16)
+        and not hasattr(linear_weight, "quant_state")
+    ):
+        return None
+    if args and type(args[0]) is torch.Tensor and args[0].dtype == torch.float32:
+        return (args[0].to(weight.dtype),) + tuple(args[1:]), kwargs
+    features = kwargs.get("input_features")
+    if type(features) is torch.Tensor and features.dtype == torch.float32:
+        return args, {**kwargs, "input_features": features.to(weight.dtype)}
+    return None
+pass
+
+
+def _cast_subsampling_inputs(model):
+    for module in model.modules():
+        if type(module).__name__ != "ParakeetEncoderSubsamplingConv2D":
+            continue
+        for key, hook in list(module._forward_pre_hooks.items()):
+            if getattr(hook, "__name__", "") == "_subsampling_input_to_16bit":
+                del module._forward_pre_hooks[key]
+                getattr(module, "_forward_pre_hooks_with_kwargs", {}).pop(key, None)
+        module.register_forward_pre_hook(_subsampling_input_to_16bit, with_kwargs = True)
+pass
+
+
 def requires_grad_for_gradient_checkpointing(model):
     # All Unsloth Zoo code licensed under LGPLv3
     # Enables requires_grad to make gradient checkpointing work on
@@ -775,6 +814,7 @@ def requires_grad_for_gradient_checkpointing(model):
     pass
 
     _freeze_unused_feature_encoders(model)
+    _cast_subsampling_inputs(model)
     hook_targets, fallback_targets = collect_hook_targets()
     if len(hook_targets) == 0 and len(fallback_targets) == 0: return
 
