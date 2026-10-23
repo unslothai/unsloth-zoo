@@ -582,9 +582,7 @@ def test_merged_export_tolerates_an_ambiguous_text_config():
 
 
 def test_merged_export_drops_pad_records_training_released(monkeypatch, tmp_path):
-    # A padded base is saved, then training turns every alignment row into a token, which drops
-    # the records. The merge reads the saved base config: its records are stale and would make
-    # vLLM bias real tokens to -inf.
+    # Training fills every pad row, so the saved base config's records are stale.
     from transformers import AutoConfig
     from unsloth_zoo.saving_utils import _carry_over_vocab_size
     from unsloth_zoo.vllm_utils import _padded_vocab_ids
@@ -614,8 +612,7 @@ def test_merged_export_drops_pad_records_training_released(monkeypatch, tmp_path
 
 
 def test_merged_export_keeps_an_empty_ownership_list():
-    # Rows remain but Unsloth owns none of their suppression: the empty list is a record, not
-    # an absent one, and must replace the base's stale ownership instead of being dropped.
+    # An explicit [] is a record and must replace the base's stale list.
     from transformers import LlamaConfig
     from unsloth_zoo.saving_utils import _carry_over_vocab_pad_records
     base = LlamaConfig(vocab_size = 128)
@@ -627,7 +624,6 @@ def test_merged_export_keeps_an_empty_ownership_list():
     _carry_over_vocab_pad_records(base, trained)
     assert base.unsloth_vocab_pad_ids == [127]
     assert base.unsloth_vocab_pad_suppressed_ids == []
-    # Rows remain with no ownership record (every row is ours): the base's stale list goes.
     base.unsloth_vocab_pad_suppressed_ids = [101]
     del trained.unsloth_vocab_pad_suppressed_ids
     _carry_over_vocab_pad_records(base, trained)
