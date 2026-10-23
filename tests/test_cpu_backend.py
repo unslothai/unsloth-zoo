@@ -308,3 +308,28 @@ def test_push_to_hub_merged_forwards_branch_and_pr_options():
         assert repo == "user/repo"
         assert kw == {"token": "t", "private": None, "revision": "dev", "create_pr": True, "commit_message": "m"}
     assert [c[0] for c in calls] == ["model", "tokenizer"]
+
+
+def test_lora_targets_include_fused_projections():
+    """Phi-3 fuses Q/K/V and gate/up; a Llama-style target list must not leave them frozen."""
+    from transformers import Phi3Config, Phi3ForCausalLM
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    config = Phi3Config(vocab_size = 64, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 1,
+                        num_attention_heads = 4, num_key_value_heads = 4, max_position_embeddings = 32,
+                        pad_token_id = 0)
+    for targets in (None, ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]):
+        peft_model = FastCPUModel.get_peft_model(Phi3ForCausalLM(config), r = 4, target_modules = targets,
+                                                 use_gradient_checkpointing = False)
+        lora = {name.split(".lora_A")[0].rsplit(".", 1)[-1] for name, _ in peft_model.named_parameters() if ".lora_A" in name}
+        assert lora == {"qkv_proj", "o_proj", "gate_up_proj", "down_proj"}
+
+
+def test_inference_mode_left_pads_and_training_right_pads():
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    model = _tiny_llama()
+    model._saved_temp_tokenizer = SimpleNamespace(padding_side = "right")
+    FastCPUModel.for_inference(model)
+    assert model._saved_temp_tokenizer.padding_side == "left"
+    FastCPUModel.for_training(model)
+    assert model._saved_temp_tokenizer.padding_side == "right"

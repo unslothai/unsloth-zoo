@@ -172,6 +172,8 @@ class FastCPUModel:
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        # for_inference / for_training flip its padding side, as the GPU path does.
+        model._saved_temp_tokenizer = tokenizer
         if getattr(model.config, "pad_token_id", None) is None:
             model.config.pad_token_id = tokenizer.pad_token_id
 
@@ -225,17 +227,18 @@ class FastCPUModel:
 
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
+        leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
         if target_modules is None:
             # Unsloth's usual projections where the model has them, else PEFT's per-architecture default.
-            leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
-            present = [m for m in _DEFAULT_TARGET_MODULES if m in leaf_names]
-            target_modules = present or None
+            candidates = _with_fused_projections(_DEFAULT_TARGET_MODULES, leaf_names)
+            target_modules = [m for m in candidates if m in leaf_names] or None
         elif not isinstance(target_modules, str):
             # As on GPU: embed_tokens / lm_head in target_modules are trained in full (continued pretraining).
             embeddings = [m for m in target_modules if m in ("embed_tokens", "lm_head")]
             if embeddings:
                 target_modules = [m for m in target_modules if m not in embeddings]
                 modules_to_save = list(dict.fromkeys([*(modules_to_save or []), *embeddings]))
+            target_modules = _with_fused_projections(list(target_modules), leaf_names)
         for key in ("finetune_vision_layers", "finetune_language_layers", "finetune_attention_modules",
                     "finetune_mlp_modules", "temporary_location", "qat_scheme"):
             kwargs.pop(key, None)
@@ -271,13 +274,13 @@ class FastCPUModel:
     @staticmethod
     def for_training(model, use_gradient_checkpointing = True):
         model.train()
-        _set_use_cache(model, False)
+        _set_inference_mode(model, False)
         return model
 
     @staticmethod
     def for_inference(model):
         model.eval()
-        _set_use_cache(model, True)
+        _set_inference_mode(model, True)
         return model
 
     @staticmethod
@@ -294,11 +297,31 @@ class FastCPUModel:
         model.save_pretrained_gguf = types.MethodType(save_pretrained_gguf, model)
 
 
-def _set_use_cache(model, value):
+# Unsloth's projection names -> the fused module some architectures use instead (Phi-3: qkv_proj, gate_up_proj).
+_FUSED_PROJECTIONS = {"q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv_proj",
+                      "gate_proj": "gate_up_proj", "up_proj": "gate_up_proj"}
+
+
+def _with_fused_projections(target_modules, leaf_names):
+    """Add the fused projection a requested split name maps to, when the model has it and not the split one,
+    so a Llama-style target list does not silently leave Phi-3's Q/K/V and MLP input projections frozen."""
+    out = list(target_modules)
+    for name in target_modules:
+        fused = _FUSED_PROJECTIONS.get(name)
+        if fused and fused in leaf_names and name not in leaf_names and fused not in out:
+            out.append(fused)
+    return out
+
+
+def _set_inference_mode(model, inference):
+    """KV cache on and left padding for generate(), off and right padding for training, as on GPU."""
     inner = model
     for _ in range(3):
         if hasattr(inner, "config"):
-            inner.config.use_cache = value
+            inner.config.use_cache = inference
+        tokenizer = getattr(inner, "_saved_temp_tokenizer", None)
+        if tokenizer is not None:
+            tokenizer.padding_side = "left" if inference else "right"
         inner = getattr(inner, "base_model", None) or getattr(inner, "model", None)
         if inner is None:
             break
