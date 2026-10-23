@@ -288,6 +288,8 @@ def install_for_class(cls) -> bool:
     if _base_forward is not forward:
         for _name, _value in (getattr(forward, "__globals__", {}) or {}).items():
             ns.setdefault(_name, _value)
+    # Dynamo < 2.14 resolves globals with __name__ on sys.modules[__name__], which lacks the names added here.
+    ns.pop("__name__", None)
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
     ns["_can_fuse_loss"] = _can_fuse_loss
     ns["unsloth_count_aware_cross_entropy"] = unsloth_count_aware_cross_entropy
@@ -336,6 +338,10 @@ def install_for_class(cls) -> bool:
         new_forward.__qualname__ = forward.__qualname__
         new_forward.__module__ = forward.__module__
         new_forward.__doc__ = forward.__doc__
+        # The exec namespace has no __name__, so decorated bodies start with __module__ None.
+        inner = inspect.unwrap(new_forward)
+        if inner is not new_forward:
+            inner.__module__ = forward.__module__
     except Exception:
         pass
 
