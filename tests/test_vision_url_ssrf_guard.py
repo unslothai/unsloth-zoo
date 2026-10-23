@@ -427,6 +427,7 @@ def test_fetch_video_refuses_other_url_schemes_before_a_decoder(monkeypatch, no_
         "clips/a.mp4",
         "subfile,clip.mp4",
         "file://C:/data/clip.mp4",
+        "\\\\?\\C:\\data\\clip.mp4",
         "file:///tmp/clip.mp4",
         "data:video/mp4;base64,AAAAIGZ0eXBpc29t",
     ],
@@ -683,6 +684,9 @@ def test_backslash_anywhere_in_the_authority_is_refused(url, no_network):
         "//attacker/share/clip.mp4",
         "file://attacker/share/clip.mp4",
         "file:///%5cattacker/share/clip.mp4",
+        "\\\\?\\UNC\\attacker\\share\\clip.mp4",
+        "\\\\?\\GLOBALROOT\\Device\\Mup\\attacker\\share\\clip.mp4",
+        "\\\\.\\GLOBALROOT\\Device\\LanmanRedirector\\attacker\\share\\clip.mp4",
     ],
 )
 def test_fetch_video_refuses_network_share_paths(monkeypatch, no_network, path):
@@ -690,3 +694,23 @@ def test_fetch_video_refuses_network_share_paths(monkeypatch, no_network, path):
     _decoder_must_not_run(monkeypatch)
     with pytest.raises(ValueError, match = "network share"):
         vision_utils.fetch_video({"video": path})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n",
+        b'<?xml version="1.0"?>\n<!-- ' + b"x" * 4096 + b' -->\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+        b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n",
+    ],
+)
+def test_a_downloaded_playlist_never_reaches_the_decoder(monkeypatch, public_dns, tmp_path, body):
+    # ffmpeg opens a playlist's entries itself; a file:// segment would reach a share on Windows.
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(vision_utils.requests, "get", lambda url, **kwargs: _FakeResponse(body))
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "playlist"):
+        vision_utils.fetch_video({"video": "https://example.com/live.m3u8"})
+    assert not list(tmp_path.glob("unsloth_media_*"))
