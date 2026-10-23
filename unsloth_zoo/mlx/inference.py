@@ -5434,6 +5434,112 @@ def exact_batch_invariant_decode(model, *, _modules = None):
         yield model
 
 
+_DFLASH2 = "mlx_vlm.speculative.drafters.dflash2.dflash2"
+_DFLASH2_CONTRACT = {_DFLASH2: {
+    "_grouped_dynamic_convolve": "5ab4bc6fa008dbf5",
+    "GroupedDynamicCausalConv.prepare": "ac69137fe6f70673",
+    "GroupedDynamicCausalConv.finish": "9c486c6f81e51dcb",
+    "CandidateSelector.select": "3b72a48573b5e422",
+}}
+
+
+@functools.cache
+def _dynamic_convolve(group_size):
+    # `_grouped_dynamic_convolve`'s arithmetic in one compiled kernel instead of a handful per tap.
+    def convolve(hidden, dynamic, base):
+        batch, length, size = hidden.shape
+        groups = size // group_size
+        blocks = hidden.reshape(batch, length, groups, group_size)
+        dynamic = dynamic.reshape(batch, length, base.shape[0], groups, 1)
+        output = mx.zeros_like(blocks)
+        for offset in range(base.shape[0]):
+            values = blocks if offset == 0 else mx.pad(blocks, [(0, 0), (offset, 0), (0, 0), (0, 0)])[:, :length]
+            kernel = base[offset].reshape(1, 1, groups, group_size).astype(hidden.dtype)
+            output = output + (kernel + dynamic[:, :, offset]) * values
+        return output.reshape(hidden.shape)
+    return mx.compile(convolve)
+
+
+def _top_candidates(logits, k):
+    # Metal's argpartition sorts the whole vocabulary; each chunk's top k, then theirs, select the same entries in the
+    # same order, as its sort is stable. A vocabulary no chunk divides keeps the one call, which padding could change.
+    chunk = next((c for c in (512, 256) if logits.shape[-1] % c == 0 and logits.shape[-1] > 2 * c and k <= c), None)
+    if chunk is None:
+        return mx.argpartition(logits, -k, axis = -1)[..., -k:]
+    blocks = logits.reshape(*logits.shape[:-1], -1, chunk)
+    local = mx.argpartition(blocks, -k, axis = -1)[..., -k:]
+    offsets = (mx.arange(blocks.shape[-2]) * chunk).astype(local.dtype)
+    index = (local + offsets[:, None]).reshape(*logits.shape[:-1], -1)
+    pick = mx.argpartition(mx.take_along_axis(blocks, local, axis = -1).reshape(index.shape), -k, axis = -1)[..., -k:]
+    return mx.take_along_axis(index, pick, axis = -1)
+
+
+@mx.compile
+def _candidate_walk(predecessors, hidden, successors, unary, candidates):
+    # Every edge from each candidate at a position to each at the next, then the greedy walk over those tables:
+    # each edge is `CandidateSelector.select`'s own bf16 product and sum.
+    edges = mx.sum((predecessors * hidden[:, :, None])[:, :, :, None] * successors[:, :, None], axis = -1)
+    scores = unary[:, :, None] + edges
+    choice, path = mx.zeros((candidates.shape[0],), mx.int32), []
+    for position in range(candidates.shape[1]):
+        selected = mx.argmax(mx.take_along_axis(scores[:, position], choice[:, None, None], axis = 1)[:, 0], axis = -1)
+        path.append(mx.take_along_axis(candidates[:, position], selected[:, None], axis = -1)[:, 0])
+        choice = selected.astype(mx.int32)
+    return mx.stack(path, axis = 1)
+
+
+def _fused_dflash2_serves(module):
+    # Checked against the native methods on Metal; the CPU's argpartition does not sort.
+    return mx.default_device() == mx.gpu and _bindings_intact(module._unsloth_fused_bindings)
+
+
+@functools.cache
+def _fused_dflash2_class(base):
+    if hasattr(base, "select"):
+        def select(self, hidden, logits, anchor_ids, sampler):
+            if callable(getattr(sampler, "sample_proposal", None)) or not _fused_dflash2_serves(self):
+                return base.select(self, hidden, logits, anchor_ids, sampler)
+            candidates = _top_candidates(logits, self.top_k)
+            # Position 0 follows the anchor, each later one every candidate before it.
+            previous = mx.concatenate([mx.broadcast_to(anchor_ids.reshape(-1, 1, 1), (candidates.shape[0], 1, self.top_k)),
+                                       candidates[:, :-1]], axis = 1)
+            return _candidate_walk(self.predecessor_codebook(previous), self.hidden_projection(hidden),
+                                   self.successor_codebook(candidates), mx.take_along_axis(logits, candidates, axis = -1),
+                                   candidates)
+        return type(f"_Fused{base.__name__}", (base,), {"select": select, "_unsloth_fused_native": base})
+
+    def prepare(self, hidden):
+        if not _fused_dflash2_serves(self):
+            return base.prepare(self, hidden)
+        groups = hidden.shape[-1] // self.group_size
+        dynamic = self.kernel_projection(hidden).reshape(*hidden.shape[:-1], 2, self.kernel_size, groups)
+        return _dynamic_convolve(self.group_size)(hidden, dynamic[..., 0, :, :], self.base_kernel[0]), dynamic[..., 1, :, :]
+
+    def finish(self, hidden, dynamic):
+        if not _fused_dflash2_serves(self):
+            return base.finish(self, hidden, dynamic)
+        return _dynamic_convolve(self.group_size)(hidden, dynamic, self.base_kernel[1])
+
+    return type(f"_Fused{base.__name__}", (base,), {"prepare": prepare, "finish": finish, "_unsloth_fused_native": base})
+
+
+def fused_drafter_ops(model) -> int:
+    """Run a DFlash2 drafter's grouped dynamic convolutions and greedy candidate selection in a few kernels instead of
+    hundreds; returns how many modules now do. Each produces the drafts mlx-vlm's methods do, bit for bit."""
+    module = sys.modules.get(_DFLASH2)
+    bindings = _resolved_bindings(_DFLASH2_CONTRACT) if module is not None else None
+    if bindings is None:
+        return 0
+    fused = [child for _, child in model.named_modules()
+             if type(child) in (module.GroupedDynamicCausalConv, module.CandidateSelector)]
+    for child in fused:
+        child.__dict__["_unsloth_fused_bindings"] = bindings
+        child.__class__ = _fused_dflash2_class(type(child))
+    return len(fused)
+
+
+
+
 # MLX's sdpa_vector_2pass_1/2 (mlx/backend/metal/kernels/sdpa_vector.h, Copyright © 2024 Apple Inc., MIT),
 # reading strided keys and values in place. Rows attend end-aligned causally, as MLX's kernel does for a block.
 _VECTOR_ATTENTION_PASS1 = """

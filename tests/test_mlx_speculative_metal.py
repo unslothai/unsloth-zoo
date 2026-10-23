@@ -1055,6 +1055,26 @@ def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag, monkey
     assert sum(count for count, _ in accepted) >= (0.6 if max_lag >= 8 else 0.5) * sum(length for _, length in accepted)
 
 
+def test_an_mtp_heads_cache_holds_only_target_hidden_pairs_however_its_drafts_fared(qwen_mtp):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids = qwen_mtp
+    drafter, chunks, compared = _drafter(model, max_lag = 4096), [[]], []
+    push, catch_up, draft = drafter.push, drafter.catch_up, drafter.draft
+    drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
+    drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
+    def against_replay(cache, rows, depth, target):
+        fresh, position = drafter.new_cache(), 0
+        for chunk in filter(None, chunks):
+            tokens, hidden = sum((t for t, _ in chunk), []), mx.concatenate([h for _, h in chunk])
+            last = drafter._forward(fresh, mx.array([tokens]), hidden[None], mx.arange(position, position + len(tokens))[None])[:, -1:]
+            position += len(tokens)
+        compared.append(mx.array_equal(rows[0].last, last).item() and all(mx.array_equal(a, b).item() for x, y in zip(cache, fresh) for a, b in zip(x.state, y.state)))
+        return draft(cache, rows, depth, target)
+    drafter.draft = against_replay
+    _, drafted, _ = _run(model, ids[:1], 96, _script(("draft", 3), ("draft", 3), ("plain", 6), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
+    assert len(compared) > 6 and all(compared) and drafted[0][1] > 0
+
+
 def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monkeypatch):
     from mlx_vlm.speculative.drafters.mtp_split import MTPSplitter
     model, _ = qwen_mtp
@@ -1142,8 +1162,10 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
     assert list(ar.run_speculative_rounds(model, object(), max_tokens = 1)) == [("upstream", None)]
     draft, rounds, started = SpeculativeDraft(_script(("draft", 3)) if native else _script(("copy", 4), ("plain", 3)), _drafter(model, max_lag = 32) if native else None), [], []
     monkeypatch.setattr(draft.controller, "record_round", lambda plan, *args, **kwargs: rounds.append(plan))
+    kept, append = [], ar.SpeculativePrefill.append
+    monkeypatch.setattr(ar.SpeculativePrefill, "append", lambda self, output: append(self, output) or kept.append(sum(int(chunk.shape[1]) for chunk in self.chunks)))
     if native:
-        start = draft.drafter.start
+        draft.drafter.prompt_tail, start = 48, draft.drafter.start
         monkeypatch.setattr(draft.drafter, "start", lambda prompt, hidden, pending: started.append(hidden) or start(prompt, hidden, pending))
     generate = lambda **kwargs: [int(token) for token, _ in ar.generate_step(mx.array([ids[0]]), model, None, None, max_tokens = 96, temperature = 0.0, **kwargs)]
     for prefill_step_size in (16, None):  # unchunked, the final forward returns every prompt position's hidden
@@ -1154,7 +1176,9 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size) == plain
         draft.prepare(ids[0], SamplingParams(), [penalty := _presence()])
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size, logits_processors = [penalty]) == penalized != plain
-    assert rounds and [hidden.shape[1] for hidden in started] == ([32] * 4 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+    # A row primes on the prompt's last prompt_tail positions, in max_lag pieces that drop none of them.
+    assert rounds and [hidden.shape[1] for hidden in started] == ([48] * 4 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+    assert not native or (len(ids[0]) > max(kept) == 48 and not any(draft.drafter.dropped.values()))
     # The same positions from six chunks as from one forward: chunking moves them ~0.07 on average, a one-position shift ~3.3.
     assert not native or (started[0] - started[2]).abs().mean().item() < 0.5
     with pytest.raises(RuntimeError, match = "prepare"):
@@ -1162,12 +1186,15 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
 
 @pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
 def test_a_lazy_drafter_weighs_its_checkpoint_and_holds_a_started_row_without_allocating(request, companion):
-    from mlx_vlm.utils import get_model_path, load
+    from mlx_vlm.utils import load
     from unsloth_zoo.mlx import speculative
     model = request.getfixturevalue("qwen_mtp")[0] if companion is None else load("mlx-community/Qwen3.5-4B-4bit", lazy = True)[0]
     before, lazy = mx.get_active_memory(), _drafter(model, lazy = True) if companion is None else speculative.companion_drafter(companion, model, lazy = True)
     grown = speculative.probe_drafter(model, lazy, 40) and mx.get_active_memory() - before  # before any eager build below
-    stored = _drafter(model).weight_bytes if companion is None else sum(a.nbytes for a in mx.load(str(get_model_path(companion) / "model.safetensors")).values())
+    mx.reset_peak_memory()
+    held, stored = mx.get_active_memory(), (_drafter(model) if companion is None else speculative.companion_drafter(companion, model)).weight_bytes
+    # An eager build quantizes a bf16 DFlash drafter before evaluating it, so never holds the bf16 weights whole.
+    assert companion is None or mx.get_peak_memory() - held < 2 * stored
     assert grown < lazy.weight_bytes / 100 and lazy.weight_bytes == stored > 0 and (companion or _probe_matches_a_started_row(model, _drafter(model), list(range(1, 41)), lambda started: started[1]))
 
 
@@ -1325,6 +1352,81 @@ def _tiny_companion(model, repo):
     config["dflash_config"].update(target_layer_ids = [1, n // 2, n - 2], num_target_layers = n, selector_rank = 16, markov_rank = 16)
     module = {"DFlash2DraftModel": dflash2, "DSparkDraftModel": dspark}.get(config["architectures"][0], qwen3_dflash)
     return module.Model(module.ModelConfig.from_dict(config))
+
+
+def test_unquantized_companion_mtp_heads_and_dflash_drafters_load_at_4_bits_unless_turned_off(qwen, qwen_mtp, monkeypatch, tmp_path):
+    import shutil
+    import mlx.nn as nn
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
+    from unsloth_zoo.mlx import speculative
+    detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(split := tmp_path / "bf16"))
+    shutil.copytree(split, packed := tmp_path / "packed")  # the same head with only its MLP stored at 4 bits
+    for file in split.glob("*.safetensors"):
+        tensors = mx.load(str(file))
+        for key in [key for key in tensors if ".mlp." in key and key.endswith("_proj.weight")]:
+            tensors[key], tensors[key[: -len("weight")] + "scales"], tensors[key[: -len("weight")] + "biases"] = mx.quantize(tensors[key], 64, 4)
+        mx.save_safetensors(str(packed / file.name), tensors, metadata = {"format": "mlx"})
+    (packed / "config.json").write_text(json.dumps({**json.loads((split / "config.json").read_text()), "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}))
+    def built(bits):
+        monkeypatch.delenv("UNSLOTH_MLX_DRAFTER_BITS", raising = False) if bits is None else monkeypatch.setenv("UNSLOTH_MLX_DRAFTER_BITS", bits)
+        dflash = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
+        return speculative.companion_drafter(split, qwen_mtp[0]), speculative._built(speculative.ContextDrafter, dflash, qwen[0].language_model, quantize = True)
+    head, dflash = built(None)
+    # A head stored partly quantized keeps its full-precision layers; one read whole out of a model's checkpoint, as
+    # its own head or a companion, stays as stored.
+    kept, native, whole = (build(path, qwen_mtp[0]) for build, path in ((speculative.companion_drafter, packed), (speculative.native_mtp_drafter, source), (speculative.companion_drafter, source)))
+    plain_head, plain_dflash = built("0")
+    assert head.model.fc.bits == head.model.layers[0].mlp.up_proj.bits == dflash.model.fc.bits == dflash.model.layers[0].mlp.up_proj.bits == 4
+    assert type(plain_head.model.fc) is type(plain_dflash.model.fc) is nn.Linear and head.weight_bytes < plain_head.weight_bytes
+    assert type(kept.model.fc) is type(native.model.fc) is type(whole.model.fc) is nn.Linear and kept.model.layers[0].mlp.up_proj.bits == 4
+
+
+def test_a_dflash2_drafter_convolves_and_selects_its_drafts_bit_for_bit_in_fewer_kernels(qwen, monkeypatch):
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector, GroupedDynamicCausalConv
+    from unsloth_zoo.mlx import inference, speculative
+    model, _ = qwen
+    ran, convolve, walk = [], inference._dynamic_convolve, inference._candidate_walk
+    monkeypatch.setattr(inference, "_dynamic_convolve", lambda group_size: ran.append("conv") or convolve(group_size))
+    monkeypatch.setattr(inference, "_candidate_walk", lambda *args: ran.append("walk") or walk(*args))
+    companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    drafter = speculative._built(speculative.ContextDrafter, companion, model.language_model, quantize = True)
+    convs = [m for _, m in drafter.model.named_modules() if isinstance(m, GroupedDynamicCausalConv)]
+    selector, size = drafter.model.candidate_selector, companion.config.hidden_size
+    assert convs and {type(m)._unsloth_fused_native for m in convs} == {GroupedDynamicCausalConv}
+    assert type(selector)._unsloth_fused_native is CandidateSelector
+    mx.random.seed(0)
+    conv = convs[-1]
+    conv.base_kernel = (mx.random.normal(conv.base_kernel.shape) * 0.1).astype(mx.bfloat16)   # loaded kernels are not zero
+    # Two rows of five positions, so a result that read the first row or position for all would differ.
+    hidden = mx.random.normal((2, 5, size)).astype(mx.bfloat16)
+    (prepared, dynamic), (native, native_dynamic) = conv.prepare(hidden), GroupedDynamicCausalConv.prepare(conv, hidden)
+    finished, native_finished = conv.finish(hidden, dynamic), GroupedDynamicCausalConv.finish(conv, hidden, native_dynamic)
+    assert mx.array_equal(prepared, native) and mx.array_equal(finished, native_finished)
+    assert prepared.dtype == native.dtype and finished.dtype == native_finished.dtype and ran == ["conv", "conv"]
+    # Logits on a coarse grid tie often: candidates must come in argpartition's order for the walk to break ties alike.
+    logits = (mx.round(mx.random.normal((2, 5, selector.predecessor_codebook.weight.shape[0])) * 2) / 2).astype(mx.bfloat16)
+    top, expected = inference._top_candidates(logits, selector.top_k), mx.argpartition(logits, -selector.top_k, axis = -1)[..., -selector.top_k:]
+    assert mx.array_equal(top, expected) and top.dtype == expected.dtype
+    greedy, anchors = lambda scores: mx.argmax(scores, axis = -1), mx.array([3, 7])
+    drafts, expected = selector.select(hidden, logits, anchors, greedy), CandidateSelector.select(selector, hidden, logits, anchors, greedy)
+    assert mx.array_equal(drafts, expected) and drafts.dtype == expected.dtype and ran[-1] == "walk"
+    # A k past every chunk keeps the one argpartition.
+    assert mx.array_equal(inference._top_candidates(logits, 600), mx.argpartition(logits, -600, axis = -1)[..., -600:])
+    # On the CPU, whose argpartition does not sort, the native methods run.
+    served = len(ran)
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.eval(selector.select(hidden, logits, anchors, greedy), conv.prepare(hidden)[0])
+    finally:
+        mx.set_default_device(mx.gpu)
+    assert len(ran) == served
+    # Methods rebound upstream are what a fused module then runs.
+    monkeypatch.setattr(GroupedDynamicCausalConv, "prepare", lambda self, hidden: ("native", None))
+    monkeypatch.setattr(CandidateSelector, "select", lambda self, *args: "native")
+    assert conv.prepare(hidden)[0] == "native" and selector.select(hidden, logits, anchors, greedy) == "native"
+
+
 
 
 @pytest.mark.parametrize("repo", ["z-lab/Qwen3.5-4B-DFlash", "incoai/Qwen3.8-27B-DFlash2", "RadixArk/Qwen3.8-27B-DSpark"])

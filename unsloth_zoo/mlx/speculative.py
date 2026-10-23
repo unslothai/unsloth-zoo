@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import copy
+import gc
 import importlib
 import json
+import os
 import re
 import sys
 import time
@@ -1253,7 +1255,7 @@ class SpeculativeDraft:
     @property
     def prompt_tail(self) -> int:
         """How many of the prompt's last hidden states an MTP drafter starts from; other kinds take the whole prompt."""
-        return getattr(self.drafter, "max_lag", 1) if self.drafter is not None and self.draft_kind == "mtp" else 0
+        return getattr(self.drafter, "prompt_tail", 1) if self.drafter is not None and self.draft_kind == "mtp" else 0
 
     def prepare(self, prompt: Sequence[int], sampling: SamplingParams, processors: Sequence[Callable] = ()) -> None:
         self._request = (list(prompt), sampling, list(processors))
@@ -1457,6 +1459,10 @@ class MTPDrafter:
     target hidden ``j``). Plain windows and copy rounds only record pairs; a row replays them just before
     it drafts, so an unused head costs nothing. The engine joins and splits head caches with the target's."""
 
+    # Prompt positions a row starts from: more lifts acceptance on long prompts, but priming time and the
+    # hidden states the prefill keeps grow with it.
+    prompt_tail = 4096
+
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
         from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 
@@ -1481,8 +1487,10 @@ class MTPDrafter:
             self._shortlist.prepare()
         count = 0 if hidden is None else min(int(hidden.shape[1]), len(prompt))
         row = DraftRow(len(prompt) - count)
-        if count:
-            self.push(row, [*prompt[len(prompt) - count + 1 :], pending], hidden[0, -count:])
+        tokens, hidden = [*prompt[len(prompt) - count + 1 :], pending], None if hidden is None else hidden[0, int(hidden.shape[1]) - count :]
+        # max_lag pairs per replay, so a long prompt never runs the head over all of its positions at once.
+        for begin in range(0, count, self.max_lag):
+            self.push(row, tokens[begin : begin + self.max_lag], hidden[begin : begin + self.max_lag])
             self.catch_up(cache, [row])
         return row, cache
 
@@ -1555,22 +1563,15 @@ class MTPDrafter:
         return mx.concatenate(drafts, axis = 1)
 
     def settle(self, cache: list, rows: Sequence[DraftRow | None], appended: int, keep: Sequence[int]) -> list[int]:
-        """Keep each row's first ``keep[i]`` appended entries (its accepted drafts), drop the rest, and
-        return how many pairs each row's head now holds from this round."""
-        trims = [appended - count for count in keep]
-        if len(set(trims)) == 1:
-            if trims[0]:
-                for entry in cache:
-                    entry.trim(trims[0])
-        else:
+        """Drop every entry the round's drafting appended, accepted or not: each paired a draft with the head's own
+        output instead of the target hidden, so accepted drafts are recorded again from the verify forward."""
+        if appended:
             for entry in cache:
-                entry.prepare(right_padding = trims)
-                entry.finalize()
-        for row, count in zip(rows, keep):
+                entry.trim(appended)
+        for row in rows:
             if row is not None:
-                row.position += count
                 row.last = None
-        return list(keep)
+        return [0] * len(rows)
 
 
 class AssistantRow:
@@ -1679,7 +1680,7 @@ class HeadDrafter:
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
         self.model = model
         self.target = target
-        self.max_lag = max_lag
+        self.max_lag = self.prompt_tail = max_lag
 
     def new_cache(self) -> list:
         return []
@@ -1851,10 +1852,27 @@ class ContextDrafter:
         return [0] * len(rows)
 
 
-def _built(wrapper, model: nn.Module, target: nn.Module, **kwargs):
+def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, quantize: bool = False, **kwargs):
+    quantized = any(key.endswith(".scales") for key, _ in tree_flatten(model.parameters()))
+    if quantize and wrapper in (MTPDrafter, ContextDrafter) and not quantized and (bits := int(os.environ.get("UNSLOTH_MLX_DRAFTER_BITS", "4"))):
+        # At 4 bits these drafters accept within ~2% of bf16 at under a third of the memory, and verification keeps
+        # the output exact either way. A checkpoint that quantized its drafter chose what to leave in full precision.
+        nn.quantize(model, group_size = 64, bits = bits, class_predicate = lambda name, layer: (
+            hasattr(layer, "to_quantized") and not isinstance(layer, nn.Embedding)
+            and not name.endswith(("mlp.gate", "shared_expert_gate")) and layer.weight.shape[-1] % 64 == 0
+        ))
+        # The replaced layers sit in reference cycles: until collected, their weights would be loaded and kept.
+        gc.collect()
+    if not lazy:
+        # An array at a time, so a lazily loaded drafter quantized above never holds its full-precision weights whole.
+        for _, value in tree_flatten(model.parameters()):
+            mx.eval(value)
     # Counted before the wrapper binds the target (a bound DFlash drafter holds its embedding and head); ``lazy``
     # factories evaluate nothing mlx-vlm's loader leaves lazy (it converts ModelOpt/compressed-tensors exports eagerly).
     weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
+    from .inference import fused_drafter_ops
+
+    fused_drafter_ops(model)
     drafter = wrapper(model, target, **kwargs)
     drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
     target._unsloth_speculates = True  # so `warm_inference` runs the verify path's first-use checks at load
@@ -1879,15 +1897,20 @@ def _dense_table(model: nn.Module) -> nn.Module:
 def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter | MTPDrafter | HeadDrafter:
     """A drafter from a separate DFlash, DFlash2, DSpark, EAGLE-3, Gemma 4 assistant or MTP head checkpoint, checked against ``target``."""
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+    from mlx_vlm.utils import get_model_path
 
-    model, kind = load_drafter(str(model_path), lazy = lazy)
+    # Loaded lazily whatever ``lazy`` is, so quantizing reads the full-precision weights only as it goes; mlx-vlm
+    # reads a head out of a whole model's checkpoint eagerly, so only a drafter's own checkpoint is quantized.
+    model, kind = load_drafter(str(model_path), lazy = True)
+    quantize = get_mtp_splitter(source_config = json.loads((get_model_path(str(model_path)) / "config.json").read_text())) is None
     if kind not in ("dflash", "eagle3", "mtp"):
         raise ValueError(f"{kind} companion drafters are not supported")
     validate_drafter_compatibility(target, model, kind)
     if kind == "mtp":
         assistant = str(getattr(model.config, "model_type", "")).endswith("_assistant")
-        return _built(AssistantDrafter, _dense_table(model), target) if assistant else _head_drafter(model, target, **kwargs)
-    return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, **kwargs)
+        return _built(AssistantDrafter, _dense_table(model), target, lazy = lazy) if assistant else _head_drafter(model, target, lazy = lazy, quantize = quantize, **kwargs)
+    return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, lazy = lazy, quantize = quantize, **kwargs)
 
 
 def _checkpoint_keys(path: Path) -> dict[str, Path]:
@@ -1985,10 +2008,8 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool 
             ),
         )
     model.load_weights(list(weights.items()), strict = True)
-    if not lazy:
-        mx.eval(model.parameters())
     from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
 
     if DRAFTER_KIND_BY_MODEL_TYPE.get(splitter.output_model_type) == "dflash":
-        return _built(ContextDrafter, model, target, **kwargs)
-    return _head_drafter(model, target, **kwargs)
+        return _built(ContextDrafter, model, target, lazy = lazy, **kwargs)
+    return _head_drafter(model, target, lazy = lazy, **kwargs)
