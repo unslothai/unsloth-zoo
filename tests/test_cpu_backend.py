@@ -541,3 +541,33 @@ def test_gguf_imatrix_quants_fail_before_the_merge(monkeypatch, tmp_path):
     with pytest.raises(NotImplementedError, match = "importance matrix"):
         loader.save_pretrained_gguf(None, str(tmp_path / "m"), quantization_method = "iq2_xxs")
     assert merged == []
+
+
+def test_reloaded_lora_checkpoint_is_trainable_and_keeps_its_weights(monkeypatch, tmp_path):
+    """FastLanguageModel.from_pretrained("lora_model") must give back a trainable PeftModel with the
+    saved adapter weights; get_peft_model on it keeps them; merged_16bit then writes a full model."""
+    import transformers
+    from types import SimpleNamespace
+    from peft import LoraConfig, PeftModel, get_peft_model
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    base_dir, adapter_dir, merged_dir = tmp_path / "base", tmp_path / "lora", tmp_path / "merged"
+    _tiny_llama().save_pretrained(base_dir)
+    trained = get_peft_model(transformers.AutoModelForCausalLM.from_pretrained(base_dir),
+                             LoraConfig(r = 4, target_modules = ["q_proj", "v_proj"], task_type = "CAUSAL_LM"))
+    with torch.no_grad():
+        for name, p in trained.named_parameters():
+            if "lora_B" in name:
+                p.fill_(0.123)
+    trained.save_pretrained(adapter_dir)
+
+    tok = SimpleNamespace(pad_token = "<pad>", pad_token_id = 0, eos_token = "</s>", padding_side = "right",
+                          save_pretrained = lambda *a, **k: None)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: tok)
+    model, _ = FastCPUModel.from_pretrained(str(adapter_dir), load_in_4bit = False, dtype = torch.float32)
+    assert isinstance(model, PeftModel)
+    lora_b = [p for n, p in model.named_parameters() if "lora_B" in n]
+    assert lora_b and all(p.requires_grad for p in lora_b)
+    assert all(torch.allclose(p, torch.full_like(p, 0.123)) for p in lora_b)
+    assert FastCPUModel.get_peft_model(model, r = 4) is model
+    model.save_pretrained_merged(str(merged_dir), tok, save_method = "merged_16bit")
+    assert (merged_dir / "config.json").is_file()

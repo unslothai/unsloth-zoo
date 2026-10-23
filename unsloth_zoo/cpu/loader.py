@@ -124,6 +124,13 @@ class FastCPUModel:
         if use_4bit and not cpu_bnb_4bit_supported():
             _print("bitsandbytes 4-bit does not work on this CPU, loading 16-bit weights instead.")
             use_4bit = False
+        # A saved LoRA checkpoint (notebooks reload "lora_model"): load its base, then the adapter on top,
+        # trainable, so training resumes and merged exports see a PeftModel.
+        adapter_name = None
+        base_name = _adapter_base_model(model_name, token, revision)
+        if base_name is not None:
+            adapter_name, model_name = model_name, base_name
+            _print(f"{adapter_name} is a LoRA adapter; loading its base {base_name} first.")
         if not use_4bit and _PREQUANTIZED_SUFFIX.search(model_name):
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
             _print(f"{model_name} is pre-quantized; loading {base} for 16-bit training.")
@@ -167,11 +174,18 @@ class FastCPUModel:
                 kwargs.pop("quantization_config", None)
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name, token = token, revision = revision, trust_remote_code = trust_remote_code,
+        tokenizer_kwargs = dict(
+            token = token, revision = revision, trust_remote_code = trust_remote_code,
             model_max_length = max_seq_length, padding_side = "right",
             **{k: kwargs[k] for k in ("cache_dir", "local_files_only", "subfolder") if k in kwargs},
         )
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **tokenizer_kwargs)
+        except (OSError, ValueError):
+            if adapter_name is None or tokenizer_name != adapter_name:
+                raise
+            # An adapter saved without its tokenizer: the base model's.
+            tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         # for_inference / for_training flip its padding side, as the GPU path does.
@@ -193,6 +207,14 @@ class FastCPUModel:
             f"dtype = {dtype}, 4-bit = {use_4bit}, chunked CE = {chunked}."
         )
         FastCPUModel._attach(model)
+        if adapter_name is not None:
+            from peft import PeftModel
+            FastCPUModel._prepare(model, use_gradient_checkpointing)
+            if use_gradient_checkpointing in (True, "unsloth") and hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+            model = PeftModel.from_pretrained(model, adapter_name, is_trainable = True, token = token)
+            model.max_seq_length = max_seq_length
+            FastCPUModel._attach(model)
         return model, tokenizer
 
     @staticmethod
@@ -226,8 +248,12 @@ class FastCPUModel:
         loftq_config = None,
         **kwargs,
     ):
-        from peft import LoraConfig, get_peft_model
+        from peft import LoraConfig, PeftModel, get_peft_model
 
+        if isinstance(model, PeftModel):
+            # Reloaded LoRA checkpoint: a second get_peft_model would reset the saved adapter weights.
+            _print("this model already has LoRA adapters, keeping them.")
+            return model
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
         leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
@@ -324,6 +350,22 @@ def _with_fused_projections(target_modules, leaf_names):
         if fused and fused in leaf_names and name not in leaf_names and fused not in out:
             out.append(fused)
     return out
+
+
+def _adapter_base_model(model_name, token, revision):
+    """base_model_name_or_path when model_name is a PEFT adapter checkpoint (local dir or Hub repo), else None."""
+    try:
+        if os.path.isdir(model_name):
+            if not os.path.isfile(os.path.join(model_name, "adapter_config.json")):
+                return None
+        else:
+            from huggingface_hub import file_exists
+            if not file_exists(model_name, "adapter_config.json", revision = revision, token = token):
+                return None
+        from peft import PeftConfig
+        return PeftConfig.from_pretrained(model_name, revision = revision, token = token).base_model_name_or_path
+    except Exception:
+        return None
 
 
 def _set_inference_mode(model, inference):
