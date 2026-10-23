@@ -958,6 +958,45 @@ def get_video_reader_backend() -> str:
     return video_reader_backend
 
 
+def _ffmpeg_protocol(source: str) -> str:
+    """The protocol ffmpeg's url_find_protocol would pick, lower-cased, or "" for a plain path: a
+    leading `name:` even with no `//` (`tcp:host:port`), `subfile,` only when a colon follows, and
+    a one-letter prefix is a Windows drive."""
+    match = re.match(r"([A-Za-z0-9+.-]+)(:|,)", source)
+    if not match or len(match.group(1)) < 2:
+        return ""
+    name = match.group(1).lower()
+    if match.group(2) == ",":
+        return name if name == "subfile" and ":" in source[match.end():] else ""
+    return name
+
+
+def _is_network_share(path: str) -> bool:
+    """UNC paths and file: URLs naming a remote host: Windows would open an SMB connection."""
+    p = path.replace("\\", "/")
+    if p[:5].lower() == "file:":
+        p = p[5:]
+        if p.startswith("//"):
+            host = p[2:].split("/", 1)[0]
+            if host.lower() not in ("", "localhost"):
+                return True
+            p = p[2 + len(host):]
+    if p.startswith(("//?/", "//./")):
+        return p[4:].upper().startswith("UNC/")
+    return p.startswith("//")
+
+
+# A playlist or concat list makes ffmpeg fetch every entry itself, outside the guard.
+_PLAYLIST_MARKERS = (b"#EXTM3U", b"<MPD", b"ffconcat")
+
+
+def _refuse_playlist(path: str, source: str) -> None:
+    with open(path, "rb") as handle:
+        head = handle.read(4096).lstrip(b"\xef\xbb\xbf \t\r\n")
+    if head.startswith(_PLAYLIST_MARKERS) or b"<MPD" in head[:1024]:
+        raise ValueError(f"Unsloth: Refusing a streaming playlist video URL: `{source}`")
+
+
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
         # Pick the decoder first: if none is installed, a temp file would strand.
@@ -966,19 +1005,22 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
         # way to refuse, so download through the guard and decode a local file.
         downloaded = None
         source = ele["video"]
-        # ffmpeg's own rule: a leading `name:` (or `subfile,`) is a protocol, even with no `//`
-        # (`tcp:host:port`); a one-letter one is a Windows drive.
-        match = re.match(r"([A-Za-z0-9+.-]+)(?::|,)", source)
-        scheme = match.group(1).lower() if match and len(match.group(1)) > 1 else ""
-        if match and source[match.end() - 1] == "," and scheme != "subfile":
-            scheme = ""
+        scheme = _ffmpeg_protocol(source)
         if scheme in ("http", "https"):
             downloaded = fetch_remote_media_to_file(source)
             ele = dict(ele)
             ele["video"] = downloaded
-        elif scheme not in ("", "file"):
+            try:
+                _refuse_playlist(downloaded, source)
+            except BaseException:
+                try: os.unlink(downloaded)
+                except OSError: pass
+                raise
+        elif scheme not in ("", "file", "data"):
             # rtsp://, tcp://, ftp:// ... would be dialled by ffmpeg with no address checks.
             raise ValueError(f"Unsloth: Refusing a video URL with an unsupported scheme: `{source}`")
+        elif _is_network_share(source):
+            raise ValueError(f"Unsloth: Refusing a video path on a network share: `{source}`")
         try:
             try:
                 video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)

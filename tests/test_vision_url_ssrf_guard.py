@@ -418,7 +418,17 @@ def test_fetch_video_refuses_other_url_schemes_before_a_decoder(monkeypatch, no_
     assert no_network == []
 
 
-@pytest.mark.parametrize("path", ["C:\\data\\clip.mp4", "C:/data/clip.mp4", "/data/clip.mp4", "clips/a.mp4"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "C:\\data\\clip.mp4",
+        "C:/data/clip.mp4",
+        "/data/clip.mp4",
+        "clips/a.mp4",
+        "subfile,clip.mp4",
+        "data:video/mp4;base64,AAAAIGZ0eXBpc29t",
+    ],
+)
 def test_fetch_video_local_paths_still_reach_the_decoder(monkeypatch, no_network, path):
     seen = []
 
@@ -662,3 +672,34 @@ def test_backslash_anywhere_in_the_authority_is_refused(url, no_network):
     with pytest.raises(ValueError, match="backslash"):
         vision_utils.fetch_image({"image": url})
     assert no_network == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["\\\\attacker\\share\\clip.mp4", "//attacker/share/clip.mp4", "file://attacker/share/clip.mp4"],
+)
+def test_fetch_video_refuses_network_share_paths(monkeypatch, no_network, path):
+    # Windows would open an SMB connection (and may send credentials) for these.
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "network share"):
+        vision_utils.fetch_video({"video": path})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"#EXTM3U\n#EXT-X-VERSION:3\nhttp://127.0.0.1:9/seg0.ts\n",
+        b'<?xml version="1.0"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+        b"ffconcat version 1.0\nfile http://169.254.169.254/a.mp4\n",
+    ],
+)
+def test_a_downloaded_playlist_never_reaches_the_decoder(monkeypatch, public_dns, tmp_path, body):
+    # ffmpeg would fetch every entry of a local playlist itself, outside the guard.
+    monkeypatch.setattr(vision_utils.requests, "get", lambda url, **kwargs: _FakeResponse(body))
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "playlist"):
+        vision_utils.fetch_video({"video": "https://example.com/live.m3u8"})
+    assert not list(tmp_path.glob("unsloth_media_*"))
