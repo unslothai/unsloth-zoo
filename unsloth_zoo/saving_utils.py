@@ -3955,7 +3955,15 @@ def _carry_over_vocab_pad_records(base_config, trained_config):
     targets = _text_configs(base_config) or [base_config]
     for key in ("unsloth_vocab_pad_ids", "unsloth_vocab_pad_suppressed_ids"):
         ids = next((getattr(h, key) for h in sources if getattr(h, key, None) is not None), None)
-        if ids is None: continue
+        if ids is None:
+            # Record dropped by training: the base's copy is stale and would make vLLM mask real tokens.
+            for holder in targets + [base_config]:
+                try:
+                    if key in getattr(holder, "__dict__", {}): delattr(holder, key)
+                except Exception: pass
+            pass
+            continue
+        pass
         # The first holder is get_text_config(), which vllm_utils._padded_vocab_ids reads.
         try: setattr(targets[0], key, list(ids))
         except Exception: pass
