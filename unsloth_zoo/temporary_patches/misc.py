@@ -603,7 +603,6 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
-
 # Compiled, `_ignore_causal_mask_sdpa` always refuses, so SDPA loses its `is_causal` kernels.
 # Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
 CAUSAL_MASK_SKIP_STATS = {"skipped": 0, "right_padded": 0}
