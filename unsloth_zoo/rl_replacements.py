@@ -2681,16 +2681,37 @@ def grpo_accumulated_loss(
             _zero3_head = (unsloth_zero3_gathered(lm_head), unsloth_zero3_gathered(lm_head_bias))
             lm_head, lm_head_bias = _zero3_head
 
+        # UNSLOTH_VLLM_FP32_LM_HEAD: every projector casts the head to fp32. Cast once per call instead, so the
+        # mini-batches kept until the loss save one shared fp32 copy rather than one each.
+        import inspect as _inspect
+        from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as _projector
+        _fp32_lm_head = _inspect.signature(_projector).parameters["fp32_lm_head"].default
+        _fp32_cache = {}
+
+        def _fp32_bind():
+            nonlocal lm_head, lm_head_bias
+            if not _fp32_lm_head or lm_head.dtype == torch.float32:
+                return
+            # A new object (FSDP2 unshard, ZeRO-3 gather) or a grad mode change needs a fresh cast.
+            key = (lm_head, lm_head_bias, torch.is_grad_enabled())
+            if _fp32_cache.get("key") is None or any(a is not b for a, b in zip(_fp32_cache["key"], key)):
+                bias = None if lm_head_bias is None else lm_head_bias.to(torch.float32)
+                _fp32_cache.update(key = key, value = (lm_head.to(torch.float32), bias))
+            lm_head, lm_head_bias = _fp32_cache["value"]
+
         def _refresh_lm_head():
             # FSDP2's forward unshard swaps the Parameters: the bindings above are metadata-only until then.
             nonlocal lm_head, lm_head_bias
             if _zero3_head is not None:
                 lm_head, lm_head_bias = _zero3_head
-                return
+                return _fp32_bind()
             from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fsdp_unshard
             unsloth_fsdp_unshard(output_embeddings)
             lm_head = output_embeddings.weight
             lm_head_bias = getattr(output_embeddings, "bias", None)
+            _fp32_bind()
+
+        _fp32_bind()
 
         from unsloth_zoo.rl_replacements import grpo_truncated_support_kwargs
         _support_kwargs = grpo_truncated_support_kwargs(trainer)
