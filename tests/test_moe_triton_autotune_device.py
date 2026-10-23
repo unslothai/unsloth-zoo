@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Experts' device reaches the autotuner when it accepts one; older autotuners are called as before."""
+"""Experts' CUDA device reaches the autotuner when it accepts one; older autotuners and non-CUDA
+operands are called as before (no device kwarg)."""
 
 import sys
 import types
@@ -34,17 +35,29 @@ def _run(monkeypatch, tuner):
         )
 
 
-def test_a_tuner_with_a_device_parameter_gets_the_experts_device(monkeypatch):
-    seen = []
-
+def _tuner_recording_device(seen):
     def tuner(num_experts, hidden_dim, intermediate_dim, top_k, dtype, weight_dtype = None, device = None):
         seen.append(device)
         if len(seen) == 2:
             raise _Stop
         return ("fwd", "dX", "dW")
+    return tuner
 
-    _run(monkeypatch, tuner)
-    assert seen == [torch.device("cpu"), torch.device("cpu")]
+
+def test_a_tuner_with_a_device_parameter_gets_the_experts_cuda_device(monkeypatch):
+    # The operands report cuda:1 to the kwarg builder (no GPU needed): the forward must hand it to the tuner.
+    card = torch.device("cuda", 1)
+    real = M._moe_weight_dtype_kwargs
+    monkeypatch.setattr(M, "_moe_weight_dtype_kwargs", lambda t, m, n, d, device = None: real(t, m, n, d, card))
+    seen = []
+    _run(monkeypatch, _tuner_recording_device(seen))
+    assert seen == [card, card]
+
+
+def test_cpu_operands_pass_no_device(monkeypatch):
+    seen = []
+    _run(monkeypatch, _tuner_recording_device(seen))
+    assert seen == [None, None]
 
 
 def test_an_older_tuner_is_called_without_it(monkeypatch):

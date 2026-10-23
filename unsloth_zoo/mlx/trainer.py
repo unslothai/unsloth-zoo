@@ -1419,6 +1419,54 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
     return int(math.prod(arr.shape))
 
 
+def _reject_group_by_length(order, context):
+    if order != "length_grouped":
+        return
+    if context == "vlm":
+        raise ValueError(
+            "Unsloth MLX: group_by_length=True is not supported for "
+            "vision-language training yet; the sequence length does not "
+            "account for image or audio tokens. Leave it unset."
+        )
+    if context == "streaming":
+        raise ValueError(
+            "Unsloth MLX: group_by_length=True requires a sized dataset and "
+            "is not supported with streaming=True. Use "
+            "streaming_text_length_window_batches to group lazily, or drop "
+            "streaming."
+        )
+    if context == "preference":
+        # CUDA fails too: TRL's LengthGroupedSampler cannot infer lengths without input_ids.
+        raise ValueError(
+            "Unsloth MLX preference: group_by_length=True is not supported for "
+            "preference or RL training. Leave it unset."
+        )
+    raise ValueError(f"Unsloth MLX: unknown group_by_length context {context!r}.")
+
+
+def _resolve_text_dataset_order(args, *, for_training=True):
+    # Every plan must use this, or train_on_responses_only masks a different stream than it trains on.
+    group_by_length = bool(getattr(args, "group_by_length", False))
+    preserve = bool(getattr(args, "preserve_dataset_order", False))
+    dataset_order = getattr(args, "dataset_order", "default")
+
+    if group_by_length:
+        if preserve:
+            raise ValueError(
+                "Unsloth MLX: group_by_length=True conflicts with "
+                "preserve_dataset_order=True (which forces the original "
+                "dataset order). Set only one."
+            )
+        if dataset_order not in (None, "default"):
+            raise ValueError(
+                "Unsloth MLX: group_by_length=True conflicts with "
+                f"dataset_order={dataset_order!r}. Set only one."
+            )
+        return "length_grouped" if for_training else dataset_order
+
+    return "sequential" if preserve else dataset_order
+
+
 # Fields added after the original public MLXTrainingConfig surface. Keep them a
 # suffix of the declaration order (append new ones at the end and list them
 # here) so positional copies from older configs keep mapping correctly.
@@ -1440,6 +1488,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "gkd_lmbda",
     "gkd_chunk_size",
     "gkd_skip_memory_preflight",
+    "group_by_length",
 )
 
 
@@ -1591,6 +1640,8 @@ class MLXTrainingConfig:
     gkd_lmbda: float = 0.0
     gkd_chunk_size: int = 128
     gkd_skip_memory_preflight: bool = False
+    # HF TrainingArguments.group_by_length; appended LAST (positional binding).
+    group_by_length: bool = False
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -9456,6 +9507,7 @@ class MLXTrainer:
                 raise ValueError(
                     "Unsloth MLX preference: streaming datasets are not supported."
                 )
+            _reject_group_by_length(_resolve_text_dataset_order(args), "preference")
             # A cadence is optional -- a callback can raise should_evaluate --
             # but selecting a best model reads a metric only an evaluation makes.
             _sampling_eval = bool(getattr(args, "generate_during_eval", False))
@@ -9699,11 +9751,8 @@ class MLXTrainer:
                     "train_on_responses_only for response masking."
                 )
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
-            vlm_dataset_order = (
-                "sequential"
-                if getattr(args, "preserve_dataset_order", False)
-                else getattr(args, "dataset_order", "default")
-            )
+            vlm_dataset_order = _resolve_text_dataset_order(args)
+            _reject_group_by_length(vlm_dataset_order, "vlm")
             vlm_num_epochs = (
                 args.num_train_epochs
                 if (
@@ -9844,11 +9893,8 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
-                text_dataset_order = (
-                    "sequential"
-                    if getattr(args, "preserve_dataset_order", False)
-                    else getattr(args, "dataset_order", "default")
-                )
+                text_dataset_order = _resolve_text_dataset_order(args)
+                _reject_group_by_length(text_dataset_order, "streaming")
                 expected_rows_per_pass = None
                 require_replayable = bool(
                     getattr(self, "_resume_from_checkpoint", None)
@@ -9978,27 +10024,18 @@ class MLXTrainer:
                     assistant_only_loss=text_assistant_only_loss,
                     comm_group=comm_group,
                 )
-                if (
-                    getattr(args, "preserve_dataset_order", False)
-                    or getattr(args, "dataset_order", "default") != "default"
-                ):
-                    text_dataset_order = (
-                        "sequential"
-                        if getattr(args, "preserve_dataset_order", False)
-                        else getattr(args, "dataset_order", "default")
-                    )
+                text_dataset_order = _resolve_text_dataset_order(args)
+                if text_dataset_order != "default":
                     batch_kwargs["dataset_order"] = text_dataset_order
+                    batch_kwargs["grad_accum"] = args.gradient_accumulation_steps
                     if (
                         args.max_steps <= 0
                         and args.num_train_epochs > 0
-                        and text_dataset_order == "torch_randperm"
+                        and text_dataset_order in (
+                            "torch_randperm", "length_grouped",
+                        )
                     ):
                         batch_kwargs["num_epochs"] = args.num_train_epochs
-                        # The builder quantizes a fractional epoch count to whole
-                        # accumulation windows, as HF does, so it needs the factor.
-                        batch_kwargs["grad_accum"] = (
-                            args.gradient_accumulation_steps
-                        )
                         self._prepared_batches_include_epochs = True
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = _create_ordered_text_plan(**batch_kwargs)
@@ -10397,14 +10434,17 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # 2. Sample order; must agree with unlabeled `create_ordered_batches`
     # (utils.py:2845-2849) so `train_on_responses_only` sees the same stream.
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     _order_requested = preserve_dataset_order or (
         dataset_order not in (None, "default")
     )
-    if dataset_order not in (None, "default", "sequential", "torch_randperm"):
+    if dataset_order not in (
+        None, "default", "sequential", "torch_randperm", "length_grouped",
+    ):
         raise ValueError(
             f"Unsloth MLX: unsupported dataset_order={dataset_order!r}. "
             "Expected one of: None, 'default', 'sequential', "
-            "'torch_randperm'."
+            "'torch_randperm', 'length_grouped'."
         )
 
     def _order_indices_for_epoch(epoch_idx):
@@ -10418,6 +10458,15 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                 len(all_items), _normalize_seed(seed) + epoch_idx
             )
             return order
+        if dataset_order == "length_grouped":
+            from .utils import (
+                _length_grouped_order, _length_grouped_window, _normalize_seed,
+            )
+            return _length_grouped_order(
+                [len(item[0]) for item in all_items],
+                _length_grouped_window(batch_size, comm_group, grad_accum),
+                _normalize_seed(seed) + epoch_idx,
+            )
         # legacy default: length-sort once
         return sorted(range(len(all_items)), key=lambda i: len(all_items[i][0]))
 
@@ -10428,6 +10477,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     from .utils import (
         _finite_epoch_batch_budget, _finite_text_pad_width, _normalize_seed,
     )
+    # max_steps runs reseed each pass up to num_batches, as the unlabeled plan does.
+    _expand_to_num_batches = (
+        num_epochs is None
+        and num_batches is not None
+        and not preserve_dataset_order
+        and dataset_order in ("torch_randperm", "length_grouped")
+    )
     # Normalized so seed=None is deterministic (canonicalized) instead of
     # entropy-derived; explicit seeds are unchanged. Visits stay identity —
     # these plans carry explicitly materialized epoch blocks.
@@ -10435,8 +10491,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     schedule = []
     widths = []
     cycle_length = None
-    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    for epoch_idx in range(_n_epochs_materialize):
+    epoch_idx = 0
+    while True:
         epoch_order = _order_indices_for_epoch(epoch_idx)
         epoch_schedule = []
         for start in range(0, len(epoch_order), global_batch_size):
@@ -10472,6 +10528,15 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         # One dataset pass == this epoch's micro-batch count (pre-truncation).
         if cycle_length is None and len(epoch_schedule) > 0:
             cycle_length = len(epoch_schedule)
+
+        epoch_idx += 1
+        if not epoch_schedule:
+            break
+        if epoch_idx < _n_epochs_materialize:
+            continue
+        if _expand_to_num_batches and len(schedule) < num_batches:
+            continue
+        break
 
     # Fractional epochs end mid-pass on whole accumulation windows, as HF does.
     if num_batches is None and num_epochs is not None and cycle_length:
@@ -10675,7 +10740,7 @@ def _prepare_response_labeled_eval_batches(
                 else None
             ),
             append_eos=bool(getattr(args, "append_eos", True)),
-            dataset_order=getattr(args, "dataset_order", "default"),
+            dataset_order=_resolve_text_dataset_order(args, for_training=False),
             preserve_dataset_order=bool(
                 getattr(args, "preserve_dataset_order", False)
             ),
@@ -10816,6 +10881,9 @@ def train_on_responses_only(
         print("Unsloth: train_on_responses_only enabled (VLM mode).")
     else:
         args = trainer.args
+        if args.streaming:
+            # A sized dataset skips the lazy branch below and would cache an eager grouped plan.
+            _reject_group_by_length(_resolve_text_dataset_order(args), "streaming")
         train_dataset = trainer._train_dataset_for_batches()
         if args.streaming:
             trainer._mlx_response_mask_fn = mask_fn
@@ -10876,7 +10944,7 @@ def train_on_responses_only(
                 else None
             ),
             append_eos=bool(getattr(args, "append_eos", True)),
-            dataset_order=getattr(args, "dataset_order", "default"),
+            dataset_order=_resolve_text_dataset_order(args),
             preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
             num_epochs=labeled_num_epochs,
             return_dataset=True,

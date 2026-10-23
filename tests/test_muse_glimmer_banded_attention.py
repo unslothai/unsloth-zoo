@@ -245,6 +245,28 @@ def test_compiled_deferral_does_not_recompile(_clean_router):
     assert counter.frame_count == 1
 
 
+
+def test_compiled_banded_path_does_not_recompile(_clean_router):
+    """The engaged counters are not traced either: a maskless banded call recompiled on every count."""
+    from torch._dynamo.testing import CompileCounter
+
+    module = MuseGlimmerTextAttention()
+    q, k, v = _qkv(S_ON)
+    _route(module, S_ON, q=q, k=k, v=v)  # eager call first, so the counter is already past 1
+    assert not _clean_router, "router deferred instead of engaging"
+    counter = CompileCounter()
+
+    @torch.compile(backend=counter, dynamic=False)
+    def layer(q, k, v):
+        return mg._sdpa_maybe_muse_glimmer_banded(
+            module, q, k, v, None, dropout=0.0, scaling=D ** -0.5)[0] + 1
+
+    torch._dynamo.reset()
+    for _ in range(4):
+        layer(q, k, v)
+    torch._dynamo.reset()
+    assert counter.frame_count == 1
+
 def test_patch_is_idempotent():
     """unsloth applies TEMPORARY_PATCHES three times per process (init,
     pre_compile, post_compile), so a second install must not stack a wrapper."""

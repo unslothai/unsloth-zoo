@@ -36,6 +36,15 @@ _DISABLED_REASON = None # set on the first failed launch; everything falls back 
 _K = None               # compiled kernels, built on first use
 
 
+def _probe_triton() -> bool:
+    try:
+        import triton  # noqa: F401
+        import triton.language  # noqa: F401
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
 def moe_triton_kernels_available(device = None) -> bool:
     global _TRITON
     if _DISABLED_REASON is not None or os.environ.get("UNSLOTH_MOE_TRITON_KERNELS", "1") == "0":
@@ -43,12 +52,11 @@ def moe_triton_kernels_available(device = None) -> bool:
     if device is not None and getattr(device, "type", None) != "cuda":
         return False
     if _TRITON is None:
-        try:
-            import triton  # noqa: F401
-            import triton.language  # noqa: F401
-            _TRITON = torch.cuda.is_available()
-        except Exception:
-            _TRITON = False
+        available = _probe_triton()
+        # Writing the global inside a traced autograd.Function is a graph break.
+        if torch.compiler.is_compiling():
+            return available
+        _TRITON = available
     return _TRITON
 
 

@@ -207,7 +207,7 @@ def _launch(top_k_index, num_experts, single_block_max = None, block = None):
         EC = min(_SCAN_EXPERTS, _pow2((E + 32) // 32))
         _route_scan_kernel[((E + EC) // EC,)](
             hist, rank_base, counts, NB, E,
-            EC = EC, BB = min(_SCAN_BLOCKS, max(_pow2(NB), 16)), num_warps = _WARPS[1],
+            EC = EC, BB = _SCAN_BLOCKS, num_warps = _WARPS[1],   # fixed tile: one variant for every NB
             enable_fp_fusion = True,
         )
         _route_starts_kernel[(1,)](
