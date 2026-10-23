@@ -126,11 +126,14 @@ class FastCPUModel:
             use_4bit = False
         # A saved LoRA checkpoint (notebooks reload "lora_model"): load its base, then the adapter on top,
         # trainable, so training resumes and merged exports see a PeftModel.
-        adapter_name = None
-        base_name = _adapter_base_model(model_name, token, revision)
-        if base_name is not None:
-            adapter_name, model_name = model_name, base_name
-            _print(f"{adapter_name} is a LoRA adapter; loading its base {base_name} first.")
+        adapter_name = adapter_revision = None
+        hub_kwargs = {k: kwargs[k] for k in ("cache_dir", "local_files_only") if k in kwargs}
+        base = _adapter_base_model(model_name, token, revision, **hub_kwargs)
+        if base is not None:
+            # The caller's revision names the adapter repo's branch; the base keeps the one the adapter recorded.
+            adapter_name, adapter_revision = model_name, revision
+            model_name, revision = base
+            _print(f"{adapter_name} is a LoRA adapter; loading its base {model_name} first.")
         if not use_4bit and _PREQUANTIZED_SUFFIX.search(model_name):
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
             _print(f"{model_name} is pre-quantized; loading {base} for 16-bit training.")
@@ -180,7 +183,10 @@ class FastCPUModel:
             **{k: kwargs[k] for k in ("cache_dir", "local_files_only", "subfolder") if k in kwargs},
         )
         try:
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **tokenizer_kwargs)
+            if adapter_name is not None and tokenizer_name == adapter_name:
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **{**tokenizer_kwargs, "revision": adapter_revision})
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **tokenizer_kwargs)
         except (OSError, ValueError):
             if adapter_name is None or tokenizer_name != adapter_name:
                 raise
@@ -212,7 +218,13 @@ class FastCPUModel:
             FastCPUModel._prepare(model, use_gradient_checkpointing)
             if use_gradient_checkpointing in (True, "unsloth") and hasattr(model, "enable_input_require_grads"):
                 model.enable_input_require_grads()
-            model = PeftModel.from_pretrained(model, adapter_name, is_trainable = True, token = token)
+            embeddings = model.get_input_embeddings()
+            if embeddings is not None and len(tokenizer) > embeddings.num_embeddings:
+                # Tokens added during finetuning: the saved embed_tokens / lm_head are that size.
+                model.resize_token_embeddings(len(tokenizer))
+            model = PeftModel.from_pretrained(
+                model, adapter_name, is_trainable = True, token = token, revision = adapter_revision, **hub_kwargs,
+            )
             model.max_seq_length = max_seq_length
             FastCPUModel._attach(model)
         return model, tokenizer
@@ -352,18 +364,17 @@ def _with_fused_projections(target_modules, leaf_names):
     return out
 
 
-def _adapter_base_model(model_name, token, revision):
-    """base_model_name_or_path when model_name is a PEFT adapter checkpoint (local dir or Hub repo), else None."""
+def _adapter_base_model(model_name, token, revision, **hub_kwargs):
+    """(base model, base revision) when model_name is a PEFT adapter checkpoint (local dir or Hub repo), else None."""
     try:
-        if os.path.isdir(model_name):
-            if not os.path.isfile(os.path.join(model_name, "adapter_config.json")):
-                return None
-        else:
-            from huggingface_hub import file_exists
-            if not file_exists(model_name, "adapter_config.json", revision = revision, token = token):
-                return None
+        if os.path.isdir(model_name) and not os.path.isfile(os.path.join(model_name, "adapter_config.json")):
+            return None
         from peft import PeftConfig
-        return PeftConfig.from_pretrained(model_name, revision = revision, token = token).base_model_name_or_path
+        # Cache-aware (works offline for a cached adapter); a plain model repo raises here.
+        config = PeftConfig.from_pretrained(model_name, revision = revision, token = token, **hub_kwargs)
+        if not config.base_model_name_or_path:
+            return None
+        return config.base_model_name_or_path, getattr(config, "revision", None)
     except Exception:
         return None
 
