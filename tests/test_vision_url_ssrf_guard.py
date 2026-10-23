@@ -707,6 +707,8 @@ def test_fetch_video_refuses_network_share_paths(monkeypatch, no_network, path):
         b" " * 70000 + b'<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
         b"\xef\xbb\xbf#EXTM3U\nfile://attacker/share/seg0.ts\n",
     ],
+    # Short ids: Windows caps PYTEST_CURRENT_TEST at 32767 characters.
+    ids = ["hls", "dash", "ffconcat", "padded_dash", "bom_hls"],
 )
 def test_a_downloaded_playlist_never_reaches_the_decoder(monkeypatch, public_dns, tmp_path, body):
     # ffmpeg opens a playlist's entries itself; a file:// segment would reach a share on Windows.
@@ -763,6 +765,7 @@ def test_double_slash_paths_are_ordinary_paths_off_windows(monkeypatch, no_netwo
 
 def test_the_opt_in_allows_a_share_the_owner_trusts(monkeypatch, no_network):
     monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    _decoder_must_not_run(monkeypatch)
     with pytest.raises(ValueError, match = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1"):
         vision_utils.fetch_video({"video": "\\\\nas\\videos\\clip.mp4"})
     monkeypatch.setenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", "1")
