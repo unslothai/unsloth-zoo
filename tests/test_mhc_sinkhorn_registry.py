@@ -167,7 +167,8 @@ def _run_child(tmp_path, mode):
     env = dict(os.environ)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
-    env.pop("UNSLOTH_COMPILE_DISABLE", None)
+    for var in ("UNSLOTH_COMPILE_DISABLE", "TORCH_COMPILE_DISABLE", "TORCHDYNAMO_DISABLE"):
+        env.pop(var, None)
     env["UNSLOTH_ALLOW_CPU"] = "1"
     env["UNSLOTH_DSV4_MHC_FAST"] = mode
     if importlib.util.find_spec("unsloth") is None:
@@ -186,9 +187,10 @@ def _run_child(tmp_path, mode):
 def test_glm5_next_mixer_compiles_through_the_rewrite(tmp_path):
     child = _run_child(tmp_path, "unrolled")
     assert child["Glm5NextTextHyperConnection"].startswith("torch_compile_with_fallback("), child
+    assert child["Glm5NextTextHyperHead"].startswith("torch_compile_with_fallback("), child
     assert child["calls_fast"] and child["imports_fast"], child
     assert child["finite"], child
-    assert child["graph_breaks"] == 0, child
+    assert child["graph_breaks"] == 0 and child["frames"] >= 1, child
     assert max(child["rel_errs"]) < 2e-2, child
 
 
@@ -203,7 +205,8 @@ def test_glm5_next_kill_switch_keeps_the_stock_eager_mixer(tmp_path):
 def test_glm5_next_stock_mode_compiles_the_unchanged_mixer(tmp_path):
     child = _run_child(tmp_path, "stock")
     assert child["Glm5NextTextHyperConnection"].startswith("torch_compile_with_fallback("), child
+    assert child["Glm5NextTextHyperHead"].startswith("torch_compile_with_fallback("), child
     assert not child["calls_fast"] and not child["imports_fast"], child
     assert child["finite"], child
-    assert child["graph_breaks"] == 0, child
+    assert child["graph_breaks"] == 0 and child["frames"] >= 1, child
     assert max(child["rel_errs"]) < 2e-2, child
