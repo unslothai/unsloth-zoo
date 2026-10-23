@@ -788,3 +788,17 @@ def test_auto_dtype_keeps_the_checkpoint_dtype(monkeypatch, tmp_path, dtype_poli
     for key in ("dtype", "torch_dtype"):
         model, _ = FastCPUModel.from_pretrained(str(tmp_path / "m"), load_in_4bit = False, **{key: "auto"})
         assert model.dtype == expected
+
+
+def test_a_separate_tokenizer_keeps_the_callers_revision(monkeypatch):
+    import peft
+    import transformers
+    from unsloth_zoo.cpu import loader
+    seen = {}
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda name, token, revision, **k: ("org/base", "base-rev"))
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", lambda name, **k: _tiny_llama())
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained",
+                        lambda name, **k: seen.update(tok = (name, k.get("revision"))) or _StubTokenizer(64))
+    monkeypatch.setattr(peft.PeftModel, "from_pretrained", lambda model, name, **k: model)
+    loader.FastCPUModel.from_pretrained("org/lora", tokenizer_name = "org/tok", revision = "v2", load_in_4bit = False)
+    assert seen["tok"] == ("org/tok", "v2")

@@ -201,6 +201,9 @@ class FastCPUModel:
         try:
             if adapter_name is not None and tokenizer_name == adapter_name:
                 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **{**tokenizer_kwargs, **adapter_kwargs, "revision": adapter_revision})
+            elif adapter_name is not None and tokenizer_name != model_name:
+                # A separate tokenizer repo: the caller's revision, not the one the adapter recorded for its base.
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **{**tokenizer_kwargs, "revision": adapter_revision})
             else:
                 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **tokenizer_kwargs)
         except (OSError, ValueError):
