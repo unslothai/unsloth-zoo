@@ -769,6 +769,10 @@ def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ra
         return out, scores, drafted, (first_use, verified)
     closed, scores, drafted, _ = run()
     inference._VERIFY_VERDICTS.clear()
+    # Projections earlier tests settled settle again, so the first blocks run their first-use checks.
+    monkeypatch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+    for _, module in model.named_modules():
+        vars(module).pop("_unsloth_qmv_rows", None)
     with inference.exact_speculative_verify(model):
         opened = run()
     assert opened[:2] == (closed, scores) and any(scores) and drafted[0][1] > 8 and len({accepted for _, accepted in drafted.values()}) > 1
