@@ -288,10 +288,7 @@ def install_for_class(cls) -> bool:
     if _base_forward is not forward:
         for _name, _value in (getattr(forward, "__globals__", {}) or {}).items():
             ns.setdefault(_name, _value)
-    # ns is a copy of the module globals plus names the module lacks. Dynamo before
-    # torch 2.14 reads an inlined function's globals as sys.modules[__name__] whenever
-    # __name__ is set, so EMPTY_LOGITS / os resolved on the real module and failed.
-    # Without __name__ it guards on this dict instead (what 2.14 already does).
+    # Dynamo < 2.14 resolves globals with __name__ on sys.modules[__name__], which lacks the names added here.
     ns.pop("__name__", None)
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
     ns["_can_fuse_loss"] = _can_fuse_loss
