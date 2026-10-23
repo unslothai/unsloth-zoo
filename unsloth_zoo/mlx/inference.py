@@ -45,7 +45,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import attention, nax, qmm
+from . import attention, matmul, nax
 
 
 logger = logging.getLogger(__name__)
@@ -3860,7 +3860,7 @@ class _SmallRowRoute(NamedTuple):
 _NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_NAX_QMM", "small_m_qmm",
                                 ("QMM_PROBE_KEY", "probe_small_m_qmm"), True)
 # Leaves single-sequence blocks native: Auto depth drafts those shallow, where a few-row verify gains nothing.
-_SIMD_QMM_ROUTE = _SmallRowRoute(qmm, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
+_SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
                                  "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
 
 
@@ -3868,7 +3868,7 @@ def _small_row_route():
     """The small-row kernel this GPU runs, or None: stock's NAX kernels decide, not `UNSLOTH_MLX_NAX`."""
     if nax.nax_available():
         return _NAX_QMM_ROUTE
-    return _SIMD_QMM_ROUTE if qmm.simd_qmm_available() else None
+    return _SIMD_QMM_ROUTE if matmul.simd_qmm_available() else None
 
 
 def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
@@ -4327,7 +4327,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     training and other quantizations keep the native call. `UNSLOTH_MLX_NAX_QMM=0` turns the route off.
 
     Where stock MLX has no NAX kernels (the GPUs before M5), 4- and 8-bit projections take the
-    small-row kernels of `qmm` under their own row table and the same first-use check;
+    small-row kernels of `matmul` under their own row table and the same first-use check;
     `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
 
     `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 3- to
@@ -4574,8 +4574,8 @@ def _tiled_prefill_enabled():
             or mx.__version__ not in _TILED_QMM_DISPATCH_MLX):
         return False
     # Where stock runs its NAX kernels (another tile and K order) it keeps them, whatever `UNSLOTH_MLX_NAX` says.
-    return (qmm.simd_qmm_available() and _tiled_qmm_kernel() is not None and nax.kernel_probe_passed(
-        TILED_QMM_PROBE_KEY, __name__, "probe_tiled_qmm", qmm.simd_qmm_available))
+    return (matmul.simd_qmm_available() and _tiled_qmm_kernel() is not None and nax.kernel_probe_passed(
+        TILED_QMM_PROBE_KEY, __name__, "probe_tiled_qmm", matmul.simd_qmm_available))
 
 
 def _dense_prefill_qmm(module, x, bindings):
@@ -5040,6 +5040,83 @@ _EXACT_ATTENTION_TIMINGS, _EXACT_ATTENTION_RETRY = 3, 128
 _EXACT_ATTENTION_THREADS = {}
 
 
+# Seconds per `matmul.qmv_rows` launch by (rows, inputs prepared), per (dtype, group size, bits), measured on the device:
+# the fastest launch width depends on the GPU and not monotonically on the rows (a wider launch can spill registers).
+_QMV_ROWS_COSTS = {}
+# Per (dtype, group size, bits, weight shape): whether every kind of `matmul.qmv_rows` gave each row its one-row stock bits.
+_QMV_ROWS_LAYOUTS = {}
+
+
+@functools.cache
+def _stock_linear_pinned(linear):
+    """Whether `linear`, the current `QuantizedLinear.__call__`, is the MLX body the multi-row kernel reproduces: a
+    rebinding (a patch scaling every projection, say) keeps the native verifier."""
+    return linear is nn.QuantizedLinear.__call__ and _resolved_bindings(_DENSE_QMM_CONTRACT) is not None
+
+
+def _qmv_rows_kernel(p):
+    """The (dtype, group size, bits) `matmul.qmv_rows` runs an affine projection's verify rows with, or None. Settled once
+    per quantized weight, at load or on its first block: built, timed, and checked on random rows."""
+    arrays, settled = (p.get("weight"), p.get("scales"), p.get("biases")), p.__dict__.get("_unsloth_qmv_rows")
+    # The kernel bypasses the layer's call, so it must be one whose one-row result is the stock one; zoo's own
+    # wrappers count as stock, so a projection settled at load keeps its verdict when generation installs them.
+    call, linear = type(p).__call__, nn.QuantizedLinear.__call__
+    stock = isinstance(p, nn.QuantizedLinear) and (call is linear or call in _ONE_ROW_STOCK_CALLS)
+    quantized = (stock, linear, *(getattr(p, name, None) for name in ("group_size", "bits", "mode")))
+    if settled is not None and all(a is b for a, b in zip(settled[0], arrays)) and settled[1] == quantized:
+        return settled[2]
+    kernel = None
+    if (stock and _stock_linear_pinned(linear)
+            and p.scales.dtype in (mx.bfloat16, mx.float16) and p.scales.dtype == getattr(p.get("biases"), "dtype", None)
+            and matmul.qmv_rows_supported(p.weight.shape[0], p.scales.shape[-1] * p.group_size, p.group_size, p.bits, p.mode)
+            and matmul.qmv_rows_probe_passed(p.scales.dtype, p.group_size, p.bits)):
+        kernel = (p.scales.dtype, p.group_size, p.bits)
+        layout = (*kernel, p.weight.shape)
+        try:
+            matmul.compile_qmv_rows(*kernel)
+            if kernel not in _QMV_ROWS_COSTS:
+                _FIRST_USE_WORK[0] += 1
+                _QMV_ROWS_COSTS[kernel] = tuple(matmul.qmv_rows_launch_costs(*kernel).items())
+            if layout not in _QMV_ROWS_LAYOUTS:
+                K = p.scales.shape[-1] * p.group_size
+                x = mx.random.normal((matmul.QMV_ROWS_STAGED_MAX, K), key = mx.random.key(K)).astype(kernel[0])
+                _QMV_ROWS_LAYOUTS[layout] = _settled(all(
+                    matmul.qmv_rows_matches(x[:rows], p.weight, p.scales, p.biases, p.group_size, p.bits)
+                    for rows in {matmul.QMV_ROWS_MAX, matmul.QMV_ROWS_STAGED_MAX}))
+                if not _QMV_ROWS_LAYOUTS[layout]:
+                    logger.warning("verify rows differ from one-row calls for a %s weight of %d-bit groups of %d; "
+                                   "the native verifier stays in use there", p.weight.shape, p.bits, p.group_size)
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return None  # inside a function transformation, which cannot evaluate; settled later
+        kernel = kernel if _QMV_ROWS_LAYOUTS[layout] else None
+    p.__dict__["_unsloth_qmv_rows"] = (arrays, quantized, kernel)
+    return kernel
+
+
+def _verify_qmv_rows(native, linears, x):
+    """`native()`, with affine projections that `_qmv_rows_kernel` settled run by `matmul.qmv_rows`."""
+    if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[0] * x.shape[1] < 2
+            or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS") == "0"):
+        return native()
+    kernels = [_qmv_rows_kernel(p) for p in linears]
+    if not all(kernel is not None and kernel[0] == x.dtype and not p.trainable_parameters()
+               for p, kernel in zip(linears, kernels)):
+        return native()
+    rows, launches, outs = x.reshape(-1, x.shape[-1]), {}, []
+    for p, kernel in zip(linears, kernels):
+        if kernel not in launches:
+            most, kind = matmul.qmv_rows_plan(_QMV_ROWS_COSTS[kernel], rows.shape[0])
+            stops = list(itertools.accumulate(matmul.qmv_rows_sizes(rows.shape[0], most)))
+            launches[kernel] = [(part, matmul.qmv_rows_args(part, p.bits, kind))
+                                for part in (rows[a:b] for a, b in zip([0, *stops], stops))]
+        ys = [matmul.qmv_rows(part, p.weight, p.scales, p.biases, p.group_size, p.bits, *args)
+              for part, args in launches[kernel]]
+        y = (ys[0] if len(ys) == 1 else mx.concatenate(ys)).reshape(*x.shape[:-1], -1)
+        outs.append(y + p["bias"] if "bias" in p else y)
+    return tuple(outs) if len(outs) > 1 else outs[0]
+
+
 @functools.cache
 def _exact_attention_kernels():
     try:
@@ -5197,10 +5274,12 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         return taped(self, layer, inputs, mask, cache)
 
     def sliced_linear(self, linear, x):
-        return _verify_sliced(lambda rows: base._linear(self, linear, rows), (linear,), x, eligible)
+        project = lambda rows: base._linear(self, linear, rows)
+        return _verify_qmv_rows(lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
 
     def sliced_linears(self, linears, x):
-        return _verify_sliced(lambda rows: base._linears(self, linears, rows), linears, x, eligible)
+        project = lambda rows: base._linears(self, linears, rows)
+        return _verify_qmv_rows(lambda: _verify_sliced(project, linears, x, eligible), linears, x)
 
     def submitted_layer(self, *args, **kwargs):
         hidden = base._layer(self, *args, **kwargs)
@@ -5329,8 +5408,11 @@ def exact_speculative_verify(model, *, _modules = None):
     pair of rows instead of once per row, where that measured faster on this device. A block's gated-delta layers
     write only their final state, and the commit replays each layer over the retained prefix with the same kernel
     instead of keeping every step's state, once replays of a key's first block matched every per-step state bit
-    for bit. Only verify calls of the language models found here are served; other, training and distributed
-    models, and an mlx-vlm whose verifier drifted, keep the native methods.
+    for bit. 4-, 5-, 6- and 8-bit affine projections run every row of a block in one call per eight rows, each row
+    with its one-row decode arithmetic, on the same condition; `UNSLOTH_MLX_VERIFY_QMV_ROWS=0` keeps them native.
+    Only verify calls of the
+    language models found here are served; other, training and distributed models, and an mlx-vlm whose verifier
+    drifted, keep the native methods.
     """
     with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
         yield model
@@ -5343,7 +5425,8 @@ def exact_batch_invariant_decode(model, *, _modules = None):
 
     As `exact_speculative_verify` does for the Qwen3.5 verifier, frozen quantized projections in blocks wider than
     eight rows run over balanced row slices and sparse blocks' routed experts run on the decode kernels, each once its
-    first call of that shape matched the native call bit for bit. The forward already submits each layer. Only calls
+    first call of that shape matched the native call bit for bit; affine projections of multi-row blocks run their
+    rows together as there. The forward already submits each layer. Only calls
     of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
     forward drifted, keep the native methods.
     """
@@ -6565,3 +6648,16 @@ def warm_inference(model, int8_prefill = None):
     first-use checks; checks keyed by a request's row count still run then."""
     model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
                    int8_prefill = int8_prefill)
+    _warm_qmv_rows(model)
+
+
+def _warm_qmv_rows(model):
+    """Settle `_qmv_rows_kernel` for the projections of every language model the multi-row scopes serve, for a model a
+    drafter was built for."""
+    if not getattr(model, "_unsloth_speculates", False) or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS") == "0":
+        return
+    with exact_speculative_verify(model), exact_batch_invariant_decode(model):
+        served = [language for _, language in model.named_modules() if vars(language).get("_unsloth_verify_scopes")]
+        for p in {id(p): p for language in served for _, p in language.named_modules()
+                  if isinstance(p, nn.QuantizedLinear)}.values():
+            _qmv_rows_kernel(p)
