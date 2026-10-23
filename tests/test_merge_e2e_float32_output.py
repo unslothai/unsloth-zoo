@@ -171,3 +171,17 @@ def test_float32_peak_counts_every_16bit_tensor_and_the_rewrite():
     assert _float32_merge_peak_bytes(10, 4) == 28
     # Streamed to the Hub: the 16-bit copies plus the largest shard's float32 copy and temp.
     assert _float32_merge_peak_bytes(10, 4, uploads_as_it_goes = True) == 22
+
+
+def test_index_total_size_keeps_a_cp1252_index_byte_for_byte(tmp_path):
+    """An index the loader reads in the locale encoding is fixed in place, not skipped or re-encoded."""
+    from unsloth_zoo.saving_utils import _set_index_total_size
+    raw = (
+        b'{\n  "metadata": {"total_size": 100},\n'
+        b'  "weight_map": {"caf\xe9.weight": "model-00001-of-00002.safetensors"}\n}\n'
+    )
+    path = tmp_path / "model.safetensors.index.json"
+    path.write_bytes(raw)
+    assert _set_index_total_size(str(tmp_path), 200)
+    assert path.read_bytes() == raw.replace(b'"total_size": 100', b'"total_size": 200')
+    assert not _set_index_total_size(str(tmp_path), 200)

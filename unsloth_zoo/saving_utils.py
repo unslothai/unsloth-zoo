@@ -4917,16 +4917,27 @@ def _set_index_total_size(save_directory, total_size):
     if not os.path.isfile(index_path): return False
     try:
         with open(index_path, "rb") as f:
-            data = json.loads(f.read())
+            raw = f.read()
+        # Decoded as _reject_unsafe_shard_index does: transformers reads the index in the locale
+        # encoding, so bytes strict UTF-8 refuses (cp1252 names) are still a valid index.
+        data = json.loads(raw.decode("utf-8", errors = "surrogateescape"))
     except Exception:
         return False
     metadata = data.get("metadata") if isinstance(data, dict) else None
     if not isinstance(metadata, dict) or metadata.get("total_size") == total_size:
         return False
-    metadata["total_size"] = total_size
-    _export_index_atomically(
-        index_path, index_path, json.dumps(data, indent = 4).encode("utf-8"),
-    )
+    # Rewrite only the number, so every other byte (shard names in any encoding) stays as copied.
+    pattern = re.compile(rb'("total_size"\s*:\s*)-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?')
+    if len(pattern.findall(raw)) == 1:
+        updated = pattern.sub(lambda m: m.group(1) + str(int(total_size)).encode("ascii"), raw)
+    else:
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        metadata["total_size"] = total_size
+        updated = json.dumps(data, indent = 4).encode("utf-8")
+    _export_index_atomically(index_path, index_path, updated)
     return True
 pass
 
