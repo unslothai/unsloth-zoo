@@ -1249,13 +1249,13 @@ def test_nax_quantized_linear_first_use_check_rejects_a_wrong_kernel(monkeypatch
 @real_mlx_only
 @pytest.mark.parametrize("blocker", [None, "kill switch", "no NAX", "gap closed", "distributed", "probe failed"])
 def test_nax_quantized_linear_scope_stays_native(monkeypatch, blocker):
-    from unsloth_zoo.mlx import inference, nax, qmm
+    from unsloth_zoo.mlx import inference, matmul, nax
 
     model = _QuantizedHead()
     monkeypatch.delenv("UNSLOTH_MLX_NAX_QMM", raising = False)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
     monkeypatch.setattr(nax, "nax_available", lambda: blocker != "no NAX")
-    monkeypatch.setattr(qmm, "simd_qmm_available", lambda: False)
+    monkeypatch.setattr(matmul, "simd_qmm_available", lambda: False)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: blocker != "probe failed")
     monkeypatch.setattr(nax, "gap_open", lambda name: blocker != "gap closed")
     if blocker == "kill switch":
@@ -1297,7 +1297,7 @@ apple_gpu_only = pytest.mark.skipif(not _apple_gpu(), reason="requires a non-par
 @pytest.mark.parametrize("bits", [4, 8])
 @apple_gpu_only
 def test_simd_qmm_matches_native(bits, group_size, dtype):
-    from unsloth_zoo.mlx import qmm
+    from unsloth_zoo.mlx import matmul
 
     for N, groups in ((328, 68), (72, 17), (64, 1)):   # uneven K splits, and the last one unsplit
         K = group_size * groups
@@ -1306,7 +1306,7 @@ def test_simd_qmm_matches_native(bits, group_size, dtype):
             # Rows differ in scale and the rows after M are NaN, so a row mix-up or a read past M shows.
             padded = mx.random.normal((M + 16, K), key = mx.random.key(M)) * (1 + mx.arange(M + 16)[:, None])
             x = mx.where(mx.arange(M + 16)[:, None] < M, padded, mx.nan).astype(dtype)[:M]
-            got = qmm.simd_qmm(x, w, scales, biases, group_size, bits).astype(mx.float32)
+            got = matmul.simd_qmm(x, w, scales, biases, group_size, bits).astype(mx.float32)
             with mx.stream(mx.cpu):
                 weight = mx.dequantize(w, scales.astype(mx.float32), biases.astype(mx.float32),
                                        group_size = group_size, bits = bits)
@@ -1319,35 +1319,35 @@ def test_simd_qmm_matches_native(bits, group_size, dtype):
 
 @apple_gpu_only
 def test_simd_qmm_takes_the_few_row_kernel_up_to_5_rows(monkeypatch):
-    from unsloth_zoo.mlx import qmm
+    from unsloth_zoo.mlx import matmul
 
     built, metal_kernel = [], mx.fast.metal_kernel
     monkeypatch.setattr(mx.fast, "metal_kernel", lambda **kwargs: built.append(kwargs) or metal_kernel(**kwargs))
-    qmm._simd_qmm_launch.cache_clear()
+    matmul._simd_qmm_launch.cache_clear()
     took = []
     for bits, M in ((4, 5), (4, 6), (8, 5), (8, 6)):
         w, scales, biases = _quantized(64, 128, 64, mx.bfloat16, bits, seed = M)
-        mx.eval(qmm.simd_qmm(mx.ones((M, 128), mx.bfloat16), w, scales, biases, 64, bits))
-        took.append(built[-1]["source"].endswith(qmm._SIMD_QMM_FEW_ROW_SOURCE))
+        mx.eval(matmul.simd_qmm(mx.ones((M, 128), mx.bfloat16), w, scales, biases, 64, bits))
+        took.append(built[-1]["source"].endswith(matmul._SIMD_QMM_FEW_ROW_SOURCE))
     assert took == [True, False, True, False]
     # MLX recompiles a kernel whose name comes back with another source.
     assert len({kwargs["name"] for kwargs in built}) == len(built)
-    qmm._simd_qmm_launch.cache_clear()
+    matmul._simd_qmm_launch.cache_clear()
     # The first-use check is keyed by this, so each row count of the few-row kernel is checked on its own.
-    assert len({qmm.simd_qmm_geometry(M, 328, 512, 64) for M in range(1, 9)}) == 6
+    assert len({matmul.simd_qmm_geometry(M, 328, 512, 64) for M in range(1, 9)}) == 6
 
 
 def test_simd_qmm_covers_4_and_8_bit_weights_where_stock_has_no_nax(monkeypatch):
-    from unsloth_zoo.mlx import nax, qmm
+    from unsloth_zoo.mlx import matmul, nax
 
     for args in ((328, 512, 64, 4, "affine"), (328, 512, 64, 8, "affine"), (1 << 18, 1 << 14, 64, 8, "affine")):
-        assert qmm.simd_qmm_supported(*args)
+        assert matmul.simd_qmm_supported(*args)
     for args in ((324, 512, 64, 4, "affine"), (328, 480, 64, 4, "affine"), (328, 512, 16, 4, "affine"),
                  (328, 512, 64, 5, "affine"), (328, 512, 32, 4, "mxfp4"),
                  (1 << 18, 1 << 15, 128, 8, "affine"),   # 2^31 packed words
                  ((1 << 29) - 8, 32, 32, 4, "affine")):   # 5 rows of output past 2^31
-        assert not qmm.simd_qmm_supported(*args)
-    assert qmm.simd_qmm_geometry(9, 328, 512, 64)[:2] == (16, 8) and qmm.simd_qmm_geometry(8, 328, 128, 64)[:2] == (8, 2)
+        assert not matmul.simd_qmm_supported(*args)
+    assert matmul.simd_qmm_geometry(9, 328, 512, 64)[:2] == (16, 8) and matmul.simd_qmm_geometry(8, 328, 128, 64)[:2] == (8, 2)
     monkeypatch.setattr(nax.mx.metal, "is_available", lambda: True)
     # An M5 dispatches no NAX kernels below macOS 26.2 (no NAX GPU) or from a wheel built without them.
     for architecture, nax_gpu, stock_kernels, expected in (
@@ -1356,28 +1356,28 @@ def test_simd_qmm_covers_4_and_8_bit_weights_where_stock_has_no_nax(monkeypatch)
         monkeypatch.setattr(nax, "_gpu_architecture", lambda: architecture)
         monkeypatch.setattr(nax, "_nax_gpu", lambda: nax_gpu)
         monkeypatch.setattr(nax, "_stock_nax_kernels", lambda: stock_kernels)
-        assert qmm.simd_qmm_available() is expected, architecture
-    monkeypatch.setattr(qmm, "_SIMD_QMM_ROWS", ((4, None, 1 << 20, 4096, 5, 30), (4, None, 1 << 21, None, 7, 12),
+        assert matmul.simd_qmm_available() is expected, architecture
+    monkeypatch.setattr(matmul, "_SIMD_QMM_ROWS", ((4, None, 1 << 20, 4096, 5, 30), (4, None, 1 << 21, None, 7, 12),
                                                 (8, None, 1 << 20, None, 6, 16)))
-    assert [qmm.simd_qmm_row_range(N, K, 64, 4) for N, K in ((4096, 256), (8192, 256), (4096, 128))] == [
+    assert [matmul.simd_qmm_row_range(N, K, 64, 4) for N, K in ((4096, 256), (8192, 256), (4096, 128))] == [
         (5, 24), (7, 12), (0, -1)]
-    assert qmm.simd_qmm_row_range(4096, 256, 64, 8) == (6, 16)
+    assert matmul.simd_qmm_row_range(4096, 256, 64, 8) == (6, 16)
 
 
 @apple_gpu_only
 def test_nax_quantized_linear_scope_routes_without_nax(monkeypatch, caplog):
-    from unsloth_zoo.mlx import inference, nax, qmm
+    from unsloth_zoo.mlx import inference, matmul, nax
 
     model = _QuantizedHead()
     calls = []
-    kernel = qmm.simd_qmm
-    monkeypatch.setattr(qmm, "simd_qmm", lambda *args: calls.append(args[0].shape[0]) or kernel(*args))
+    kernel = matmul.simd_qmm
+    monkeypatch.setattr(matmul, "simd_qmm", lambda *args: calls.append(args[0].shape[0]) or kernel(*args))
     checked, check = [], inference._nax_small_m_qmm
     monkeypatch.setattr(inference, "_nax_small_m_qmm", lambda *args: checked.append(1) or check(*args))
     monkeypatch.setattr(nax, "nax_available", lambda: False)
-    monkeypatch.setattr(qmm, "simd_qmm_available", lambda: True)
+    monkeypatch.setattr(matmul, "simd_qmm_available", lambda: True)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
-    monkeypatch.setattr(qmm, "_SIMD_QMM_ROWS", ((4, None, 0, None, 1, 20), (8, None, 0, None, 1, 20)))
+    monkeypatch.setattr(matmul, "_SIMD_QMM_ROWS", ((4, None, 0, None, 1, 20), (8, None, 0, None, 1, 20)))
     monkeypatch.setattr(nax, "int8_prefill_min_rows", lambda N, K: 17)
     monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
     monkeypatch.delenv("UNSLOTH_MLX_SIMD_QMM", raising = False)
@@ -1412,8 +1412,8 @@ def test_nax_quantized_linear_scope_routes_without_nax(monkeypatch, caplog):
         model(mx.zeros((1, 1024, 512), mx.bfloat16))
         assert len(checked) == 3
         # The memo holds while the weight layout does: new values are read; scales promoted in place go native.
-        supported, support = [], qmm.simd_qmm_supported
-        monkeypatch.setattr(qmm, "simd_qmm_supported", lambda *args: supported.append(1) or support(*args))
+        supported, support = [], matmul.simd_qmm_supported
+        monkeypatch.setattr(matmul, "simd_qmm_supported", lambda *args: supported.append(1) or support(*args))
         routed = run(2)
         assert calls == [2] * 3 and not supported
         model.odd.scales, model.odd.biases = model.odd.scales * 2, model.odd.biases * 2
@@ -1434,7 +1434,7 @@ def test_nax_quantized_linear_scope_routes_without_nax(monkeypatch, caplog):
             if blocker == "kill switch":
                 patch.setenv("UNSLOTH_MLX_SIMD_QMM", "0")
             patch.setattr(nax, "gap_open", lambda name: (blocker, name) != ("gap closed", "small_m_qmm_simd"))
-            patch.setattr(nax, "kernel_probe_passed", lambda key, *args: (blocker, key) != ("probe failed", qmm.SIMD_QMM_PROBE_KEY))
+            patch.setattr(nax, "kernel_probe_passed", lambda key, *args: (blocker, key) != ("probe failed", matmul.SIMD_QMM_PROBE_KEY))
             patch.setattr(nax, "nax_available", lambda: blocker == "NAX")   # where stock has NAX, its route runs
             patch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
             with inference.nax_quantized_linear(model):
@@ -1576,7 +1576,7 @@ def _skip_with_stock_nax():
 @real_mlx_only
 @metal_only
 def test_tiled_prefill_takes_what_stock_runs_as_plain_qmm_bit_for_bit(monkeypatch):
-    from unsloth_zoo.mlx import inference, qmm
+    from unsloth_zoo.mlx import inference, matmul
     from unsloth_zoo.mlx.generate import generation_mode
 
     _skip_with_stock_nax()
@@ -1588,13 +1588,13 @@ def test_tiled_prefill_takes_what_stock_runs_as_plain_qmm_bit_for_bit(monkeypatc
     tiled, tile = [], inference.tiled_qmm
     monkeypatch.setattr(inference, "tiled_qmm", lambda x, *args: tiled.append(x.shape[0]) or tile(x, *args))
     monkeypatch.setattr(inference, "_tiled_prefill_enabled", lambda: True)
-    monkeypatch.setattr(qmm, "_SIMD_QMM_ROWS", _EVERY_ROW)
+    monkeypatch.setattr(matmul, "_SIMD_QMM_ROWS", _EVERY_ROW)
     monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", {})
     seen, quantized_matmul = [], mx.quantized_matmul
     monkeypatch.setattr(mx, "quantized_matmul", lambda a, w, *args, **kwargs: (
         seen.append(a.shape[-2]) if w.shape[0] == 2048 else None, quantized_matmul(a, w, *args, **kwargs))[1])
     with generation_mode(model):
-        if qmm.simd_qmm_available():   # the small-row class must leave the tile's rows to the dense scope
+        if matmul.simd_qmm_available():   # the small-row class must leave the tile's rows to the dense scope
             assert type(model.wide).__name__ == "_SimdSmallMQuantizedLinear"
             assert model.wide._unsloth_nax_qmm_next == 33 * 512   # a 64-row tile pads no more from 33 rows
         for x, native in zip(xs, natives):
@@ -1772,11 +1772,11 @@ def test_tiled_prefill_probes_only_for_a_quantized_linear(monkeypatch):
 
 
 def test_tiled_prefill_serves_wherever_stock_runs_no_nax(monkeypatch):
-    from unsloth_zoo.mlx import inference, nax, qmm
+    from unsloth_zoo.mlx import inference, matmul, nax
 
     monkeypatch.setattr(inference, "_TILED_QMM_DISPATCH_MLX", (mx.__version__,))
     monkeypatch.setattr(inference, "_tiled_qmm_kernel", lambda: object())
-    monkeypatch.setattr(qmm, "simd_qmm_available", lambda: True)
+    monkeypatch.setattr(matmul, "simd_qmm_available", lambda: True)
     probe = [True]
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda key, module, function, available: (
         key == inference.TILED_QMM_PROBE_KEY and function == "probe_tiled_qmm" and probe[0]))
@@ -1798,7 +1798,7 @@ def test_tiled_prefill_serves_wherever_stock_runs_no_nax(monkeypatch):
     monkeypatch.setattr(inference, "_TILED_QMM_DISPATCH_MLX", ("0.0.0",))
     assert not inference._tiled_prefill_enabled()
     monkeypatch.setattr(inference, "_TILED_QMM_DISPATCH_MLX", (mx.__version__,))
-    monkeypatch.setattr(qmm, "simd_qmm_available", lambda: False)   # stock runs its NAX kernels
+    monkeypatch.setattr(matmul, "simd_qmm_available", lambda: False)   # stock runs its NAX kernels
     assert not inference._tiled_prefill_enabled()
 
 

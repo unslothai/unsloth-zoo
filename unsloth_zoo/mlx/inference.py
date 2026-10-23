@@ -45,7 +45,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import attention, nax, qmm
+from . import attention, matmul, nax
 
 
 logger = logging.getLogger(__name__)
@@ -3860,7 +3860,7 @@ class _SmallRowRoute(NamedTuple):
 _NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_NAX_QMM", "small_m_qmm",
                                 ("QMM_PROBE_KEY", "probe_small_m_qmm"), True)
 # Leaves single-sequence blocks native: Auto depth drafts those shallow, where a few-row verify gains nothing.
-_SIMD_QMM_ROUTE = _SmallRowRoute(qmm, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
+_SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
                                  "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
 
 
@@ -3868,7 +3868,7 @@ def _small_row_route():
     """The small-row kernel this GPU runs, or None: stock's NAX kernels decide, not `UNSLOTH_MLX_NAX`."""
     if nax.nax_available():
         return _NAX_QMM_ROUTE
-    return _SIMD_QMM_ROUTE if qmm.simd_qmm_available() else None
+    return _SIMD_QMM_ROUTE if matmul.simd_qmm_available() else None
 
 
 def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
@@ -4327,7 +4327,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     training and other quantizations keep the native call. `UNSLOTH_MLX_NAX_QMM=0` turns the route off.
 
     Where stock MLX has no NAX kernels (the GPUs before M5), 4- and 8-bit projections take the
-    small-row kernels of `qmm` under their own row table and the same first-use check;
+    small-row kernels of `matmul` under their own row table and the same first-use check;
     `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
 
     `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 3- to
@@ -4574,8 +4574,8 @@ def _tiled_prefill_enabled():
             or mx.__version__ not in _TILED_QMM_DISPATCH_MLX):
         return False
     # Where stock runs its NAX kernels (another tile and K order) it keeps them, whatever `UNSLOTH_MLX_NAX` says.
-    return (qmm.simd_qmm_available() and _tiled_qmm_kernel() is not None and nax.kernel_probe_passed(
-        TILED_QMM_PROBE_KEY, __name__, "probe_tiled_qmm", qmm.simd_qmm_available))
+    return (matmul.simd_qmm_available() and _tiled_qmm_kernel() is not None and nax.kernel_probe_passed(
+        TILED_QMM_PROBE_KEY, __name__, "probe_tiled_qmm", matmul.simd_qmm_available))
 
 
 def _dense_prefill_qmm(module, x, bindings):
