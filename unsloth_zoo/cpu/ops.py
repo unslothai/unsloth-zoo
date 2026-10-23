@@ -21,6 +21,7 @@ __all__ = [
     "patch_chunked_causal_lm_loss",
 ]
 
+import functools
 import math
 import os
 import types
@@ -160,6 +161,10 @@ def patch_chunked_causal_lm_loss(model):
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
     original_forward = model.forward
+    # Call the class forward on `self`, not the bound method: deepcopy (TRL reference models,
+    # merged copies) rebinds the outer method to the copy, and a bound original would still run
+    # the source model's weights.
+    original_func = original_forward.__func__ if getattr(original_forward, "__self__", None) is model else None
     inner_name = getattr(model, "base_model_prefix", "model")
 
     def forward(self, input_ids = None, attention_mask = None, position_ids = None,
@@ -171,7 +176,8 @@ def patch_chunked_causal_lm_loss(model):
                 or not getattr(self, "_unsloth_cpu_chunked_ce_active", False) or head_weight is None:
             if shift_labels is not None:
                 kwargs["shift_labels"] = shift_labels
-            return original_forward(
+            call = functools.partial(original_func, self) if original_func is not None else original_forward
+            return call(
                 input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
                 past_key_values = past_key_values, inputs_embeds = inputs_embeds, labels = labels,
                 use_cache = use_cache, logits_to_keep = logits_to_keep, **kwargs,

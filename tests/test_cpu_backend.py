@@ -17,6 +17,7 @@
 """CPU backend (unsloth_zoo.cpu): selection rules and the chunked cross entropy."""
 
 import importlib
+import math
 
 import pytest
 import torch
@@ -247,10 +248,49 @@ def test_generate_accepts_a_batch_encoding_as_input_ids():
     from transformers import BatchEncoding
     from unsloth_zoo.cpu.loader import _unpack_encoding_generate
     seen = {}
-    wrapped = _unpack_encoding_generate(lambda **kwargs: seen.update(kwargs) or "out")
+    wrapped = _unpack_encoding_generate(lambda self, **kwargs: seen.update(kwargs, owner = self) or "out")
     ids = torch.tensor([[1, 2, 3]])
     mask = torch.ones_like(ids)
-    assert wrapped(input_ids = BatchEncoding({"input_ids": ids, "attention_mask": mask}), max_new_tokens = 4) == "out"
+    assert wrapped("model", input_ids = BatchEncoding({"input_ids": ids, "attention_mask": mask}), max_new_tokens = 4) == "out"
     assert seen["input_ids"] is ids and seen["attention_mask"] is mask and seen["max_new_tokens"] == 4
-    wrapped(input_ids = ids)
+    assert seen["owner"] == "model"
+    wrapped("model", input_ids = ids)
     assert seen["input_ids"] is ids
+
+
+def _tiny_llama():
+    from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
+    config = LlamaConfig(vocab_size = 64, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 1,
+                         num_attention_heads = 4, num_key_value_heads = 4, max_position_embeddings = 32,
+                         tie_word_embeddings = False)
+    return LlamaForCausalLM(config)
+
+
+def test_deepcopied_models_run_their_own_weights():
+    """TRL reference models and merged copies are deepcopies; the patched forward and generate must
+    run the copy, not the model they were copied from."""
+    import copy
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    from unsloth_zoo.cpu.ops import patch_chunked_causal_lm_loss
+    model = _tiny_llama()
+    assert patch_chunked_causal_lm_loss(model)
+    FastCPUModel._attach(model)
+    clone = copy.deepcopy(model)
+    with torch.no_grad():
+        clone.lm_head.weight.zero_()
+    ids = torch.tensor([[1, 2, 3, 4]])
+    uniform = math.log(64)  # zero head -> uniform logits over the vocab
+    with torch.no_grad():
+        assert abs(clone(input_ids = ids, labels = ids).loss.item() - uniform) < 1e-5
+        assert abs(model(input_ids = ids, labels = ids).loss.item() - uniform) > 1e-3
+    assert clone.generate.__self__ is clone and model.generate.__self__ is model
+
+
+def test_for_training_turns_the_kv_cache_back_off():
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    model = _tiny_llama()
+    FastCPUModel.for_inference(model)
+    assert model.config.use_cache is True and not model.training
+    FastCPUModel.for_training(model)
+    assert model.config.use_cache is False and model.training

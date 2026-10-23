@@ -271,25 +271,22 @@ class FastCPUModel:
     @staticmethod
     def for_training(model, use_gradient_checkpointing = True):
         model.train()
+        _set_use_cache(model, False)
         return model
 
     @staticmethod
     def for_inference(model):
         model.eval()
-        inner = model
-        for _ in range(3):
-            if hasattr(inner, "config"):
-                inner.config.use_cache = True
-            inner = getattr(inner, "base_model", None) or getattr(inner, "model", None)
-            if inner is None:
-                break
+        _set_use_cache(model, True)
         return model
 
     @staticmethod
     def _attach(model):
         generate = getattr(model, "generate", None)
-        if generate is not None and not getattr(generate, "_unsloth_cpu", False):
-            model.generate = _unpack_encoding_generate(generate)
+        func = getattr(generate, "__func__", None)
+        if func is not None and generate.__self__ is model and not getattr(func, "_unsloth_cpu", False):
+            # Bound per instance (MethodType), so deepcopy rebinds it to the copy.
+            model.generate = types.MethodType(_unpack_encoding_generate(func), model)
         model.for_training = types.MethodType(lambda self, *a, **k: FastCPUModel.for_training(self, *a, **k), model)
         model.for_inference = types.MethodType(lambda self: FastCPUModel.for_inference(self), model)
         model.save_pretrained_merged = types.MethodType(save_pretrained_merged, model)
@@ -297,16 +294,26 @@ class FastCPUModel:
         model.save_pretrained_gguf = types.MethodType(save_pretrained_gguf, model)
 
 
+def _set_use_cache(model, value):
+    inner = model
+    for _ in range(3):
+        if hasattr(inner, "config"):
+            inner.config.use_cache = value
+        inner = getattr(inner, "base_model", None) or getattr(inner, "model", None)
+        if inner is None:
+            break
+
+
 def _unpack_encoding_generate(generate):
     """Notebooks pass `input_ids = tokenizer.apply_chat_template(..., return_tensors = "pt")`, which is a
     BatchEncoding on transformers 5; generate() then fails on `.shape`. The GPU path unpacks it, so do the same."""
     @functools.wraps(generate)
-    def wrapper(*args, **kwargs):
+    def wrapper(self, *args, **kwargs):
         encoding = kwargs.get("input_ids", None)
         if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
-        return generate(*args, **kwargs)
+        return generate(self, *args, **kwargs)
     wrapper._unsloth_cpu = True
     return wrapper
 

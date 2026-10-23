@@ -601,6 +601,16 @@ if not _SKIP_GPU_INIT and not _IS_CPU_BACKEND:
         del UnsupportedFieldAttributeWarning
     except:
         pass
+elif not _SKIP_GPU_INIT and _IS_CPU_BACKEND:
+    # Device-independent (stdlib + numpy): keep the root exports on the CPU backend too.
+    from .rl_environments import (
+        check_python_modules,
+        create_locked_down_function,
+        execute_with_time_limit,
+        Benchmarker,
+        is_port_open,
+        launch_openenv,
+    )
 
 if not _SKIP_GPU_INIT:
     del os, warnings, re
