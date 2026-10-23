@@ -358,7 +358,8 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     # All Unsloth Zoo code licensed under AGPL3
     # Body-local: this source is copied into the generated trainer without its imports.
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
-    if fused_linear and _chunked_logprob._FUSED_LINEAR and not fp32_lm_head:
+    # hidden_states None is the import-time build call below: it only sets up the recompute function.
+    if hidden_states is not None and fused_linear and _chunked_logprob._FUSED_LINEAR and not fp32_lm_head:
         from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
         return fused_linear_logprobs(
             hidden_states, lm_head, index, bias = lm_head_bias, temperature = temperature,
