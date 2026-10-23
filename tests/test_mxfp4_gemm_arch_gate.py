@@ -120,3 +120,38 @@ def test_unindexed_device_resolves_the_current_gpu_for_the_gemv_probe(monkeypatc
     assert mg.mxfp4_grouped_gemv_available(device, torch.float16)
     current[0] = 1
     assert not mg.mxfp4_grouped_gemv_available(device, torch.float16)
+
+
+@pytest.mark.parametrize("mode", ["compiling", "capturing"])
+@pytest.mark.parametrize("rows", [17, 2048])
+def test_stacked_experts_on_sm75_keep_the_device_schedule_when_traced(gpu, monkeypatch, mode, rows):
+    # The dequantize fallback reads routing offsets on the host (.tolist()): a graph break, a fullgraph
+    # error and a CUDA graph capture error, so compiled and captured calls keep the device-scheduled kernel.
+    device = gpu((7, 5))
+    param = _expert_param(E = 32)
+    assert not mse._fused(_rows(rows, device), param, True)
+    assert not mse._fused(_rows(rows, device), param, False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: mode == "compiling")
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: mode == "capturing")
+    assert mse._fused(_rows(rows, device), param, True)
+    assert mse._fused(_rows(rows, device), param, False)
+
+
+def test_stacked_experts_traced_on_sm75_still_honour_the_off_switch(gpu, monkeypatch):
+    device = gpu((7, 5))
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "0")
+    assert not mse._fused(_rows(2048, device), _expert_param(E = 32), False)
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (12, 0)])
+@pytest.mark.parametrize("traced", [False, True])
+@pytest.mark.parametrize("rows", [1, 17, 2048])
+def test_sm80_and_newer_route_the_same_traced_or_not(gpu, monkeypatch, capability, traced, rows):
+    device = gpu(capability)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: traced)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: traced)
+    for transpose in (True, False):
+        assert mse._fused(_rows(rows, device), _expert_param(E = 32), transpose)

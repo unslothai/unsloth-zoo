@@ -76,10 +76,14 @@ def _bf16_capable(gate_up) -> bool:
     # sm75 has no bf16 conversion instructions.
     if torch.compiler.is_compiling():
         return True
-    ok = _CACHE.get("bf16_ok")
+    # Per operand device: in a mixed system an older visible card must not disable fusion on a capable one.
+    index = gate_up.device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    key = ("bf16_ok", index)
+    ok = _CACHE.get(key)
     if ok is None:
-        n = torch.cuda.device_count()
-        ok = _CACHE["bf16_ok"] = n > 0 and all(torch.cuda.get_device_capability(i)[0] >= 8 for i in range(n))
+        ok = _CACHE[key] = torch.cuda.get_device_capability(index)[0] >= 8
     return ok
 
 
@@ -477,6 +481,10 @@ def _bits_equal(a, b):
     return torch.equal(a.contiguous().view(iv), b.contiguous().view(iv))
 
 
+def _identity(t):
+    return t
+
+
 def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limit = 7.0) -> bool:
     """Cached bitwise probe of fused fwd + bwd vs eager autograd; eager ATen bits change across torch releases."""
     key = ("self_check", str(device), dtype, int(act), bool(interleaved), float(alpha), float(limit))
@@ -486,6 +494,15 @@ def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limi
     if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         return False
     ok = False
+    # The first call is often inside a model forward, e.g. a non-reentrant checkpoint region. The probe's
+    # own graph must not reach the saved-tensor hooks there: they would count its tensors against the
+    # checkpoint (CheckpointError at backward) and its grad would trigger a nested recompute. The
+    # innermost hook pair wins, so identity hooks keep the probe self-contained.
+    try:
+        hooks = torch.autograd.graph.saved_tensors_hooks(_identity, _identity)
+        hooks.__enter__()
+    except Exception:
+        return False  # hooks disabled here (e.g. a functorch transform): eager now, probe again later
     try:
         with torch.inference_mode(False), torch.enable_grad(), torch.cuda.device(device):
             gen = torch.Generator(device = device).manual_seed(1234)
@@ -512,6 +529,8 @@ def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limi
         if isinstance(err, torch.cuda.OutOfMemoryError):
             raise
         ok = False
+    finally:
+        hooks.__exit__(None, None, None)
     _CACHE[key] = ok
     return ok
 

@@ -381,6 +381,44 @@ def test_text_generate_honors_do_sample_false(monkeypatch):
     assert tokenizer.eos_token_ids == {2}
 
 
+def test_text_generate_feeds_an_mlx_lm_image_model_its_pixel_values(monkeypatch):
+    import mlx.core as mx
+    import mlx_lm
+    import numpy as np
+    import unsloth_zoo.mlx.loader as loader
+
+    calls = {}
+
+    def fake_stream_generate(_model, _tokenizer, prompt, max_tokens=None, **kwargs):
+        calls["stream"] = (prompt, kwargs.get("input_embeddings"))
+        yield types.SimpleNamespace(token=9)
+
+    class Model:
+        _is_vlm_model = False
+
+        def embed_inputs(self, inputs, *, pixel_values):
+            calls["embed"] = (inputs.tolist(), [p.tolist() for p in pixel_values])
+            return mx.ones((len(inputs.tolist()), 2))
+
+    monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream_generate)
+    model = Model()
+    model._tokenizer = types.SimpleNamespace(bos_token=None, eos_token_ids={2})
+    pixels = [np.zeros((3, 1, 1), np.float32), np.ones((3, 1, 2), np.float32)]
+    loader._mlx_generate(model, input_ids=[[5, 6, 7]], pixel_values=pixels, max_new_tokens=1)
+    assert "embed" not in calls and calls["stream"][1] is None
+
+    model._unsloth_supports_images = True
+    out = loader._mlx_generate(model, input_ids=[[0, 5, 6, 7]], attention_mask=[[0, 1, 1, 1]],
+                               pixel_values=pixels, max_new_tokens=1)
+    assert out.tolist() == [[5, 6, 7, 9]]
+    assert calls["embed"] == ([5, 6, 7], [p.tolist() for p in pixels])
+    assert calls["stream"][0] == [5, 6, 7] and calls["stream"][1].shape == (3, 2)
+
+    calls.clear()
+    loader._mlx_generate(model, {"input_ids": [[5, 6]], "pixel_values": pixels[:1]}, max_new_tokens=1)
+    assert calls["embed"] == ([5, 6], [pixels[0].tolist()])
+
+
 def test_mlx_generate_output_numpy_fallback_without_torch(monkeypatch):
     import builtins
     import numpy as np
@@ -451,6 +489,42 @@ def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
     assert encoded.to("cpu")["input_ids"] == [1, 2, 3]
     assert tokenizer.apply_chat_template([], tokenize=False, return_dict=True) == "rendered"
     assert tokenizer("hi") == {"called": True}
+
+
+def test_tokenizer_wrapper_takes_images_through_an_mlx_lm_image_processor():
+    import numpy as np
+    from PIL import Image
+    import unsloth_zoo.mlx.loader as loader
+
+    class TokenizerWrapper:
+        bos_token = "<s>"
+
+        def __init__(self):
+            self._tokenizer = lambda *args, **kwargs: ("text", args, kwargs)
+
+        def encode(self, text, add_special_tokens=True):
+            return [1] * add_special_tokens + [ord(c) for c in text]
+
+    def image_processor(text, *, images):
+        assert all(image.dtype == np.uint8 and image.shape[-1] == 3 for image in images)
+        return text.replace("P", "PP"), [image[None, :, :, 0] for image in images]
+
+    tokenizer = TokenizerWrapper()
+    loader._patch_mlx_tokenizer_call(tokenizer)
+    image = Image.new("RGB", (3, 2), (5, 0, 0))
+    assert tokenizer("hi", images=[image]) == ("text", ("hi",), {"images": [image]})
+    tokenizer._unsloth_image_processor = image_processor
+
+    by_keyword = tokenizer(images=[image], text="aP", return_tensors="np")
+    assert by_keyword["input_ids"].tolist() == [[1, 97, 80, 80]]
+    assert by_keyword["attention_mask"].tolist() == [[1, 1, 1, 1]]
+    assert [p.tolist() for p in by_keyword["pixel_values"]] == [[[[5, 5, 5], [5, 5, 5]]]]
+    positional = tokenizer(image, "<s>aP")
+    assert positional["input_ids"] == [[60, 115, 62, 97, 80, 80]]
+    assert tokenizer("a", "b") == ("text", ("a", "b"), {})
+    # A [0, 1] float array reaches the processor's uint8 check instead of being cast to near-black.
+    with pytest.raises(AssertionError):
+        tokenizer(images=[np.full((2, 3, 3), 0.5, np.float32)], text="aP")
 
 
 def test_vlm_prompt_patch_preserves_model_specific_media_markers(monkeypatch):
@@ -4909,3 +4983,29 @@ def test_clean_processor_save_does_not_invent_processor_config(tmp_path):
     _save_vlm_processor_assets(Processor(), tmp_path)
     assert (tmp_path / "preprocessor_config.json").is_file()
     assert not (tmp_path / "processor_config.json").exists()
+
+
+def test_processor_saves_skip_mlx_vlms_uncopyable_detokenizer(tmp_path):
+    import copy
+    from unsloth_zoo.mlx.utils import _save_tokenizer, _save_vlm_processor_assets
+
+    class Detokenizer:   # mlx-vlm's naive streaming detokenizer refuses a deep copy
+        def __deepcopy__(self, memo):
+            raise AttributeError("property 'text' of 'NaiveStreamingDetokenizer' object has no setter")
+
+    class Processor:   # transformers deep-copies a processor's attributes to serialize it
+        def __init__(self):
+            self.size, self.detokenizer = 32, Detokenizer()
+        def to_dict(self):
+            return {"processor_class": "Processor", **copy.deepcopy(vars(self))}
+        def save_pretrained(self, path):
+            (Path(path) / "processor_config.json").write_text(json.dumps(self.to_dict()))
+
+    processor = Processor()
+    detokenizer = processor.detokenizer
+    for save in (_save_tokenizer, _save_vlm_processor_assets):
+        out = tmp_path / save.__name__
+        out.mkdir()
+        save(processor, out)
+        assert json.loads((out / "processor_config.json").read_text()) == {"processor_class": "Processor", "size": 32}
+        assert processor.detokenizer is detokenizer
