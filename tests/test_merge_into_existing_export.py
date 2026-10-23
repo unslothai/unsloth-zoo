@@ -679,3 +679,99 @@ def test_rollback_keeps_previous_export_metadata_links(tmp_path, refresh):
     assert (out / "config.json").read_bytes() == b"previous config"
     assert (out / "model.safetensors").read_bytes() == b"previous shard"
     assert (shared / "tokenizer.model").read_bytes() == b"shared tokenizer"
+
+
+def test_rollback_never_writes_through_a_link_named_like_a_restore_file(tmp_path):
+    # The previous export may hold any name as a link, including the one a rollback would stage
+    # a restored file under: the restore must replace entries, never follow a link.
+    from unsloth_zoo import saving_utils as S
+
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"outside file")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "model.safetensors").write_bytes(b"previous shard")
+    (out / "config.json").write_bytes(b"previous config")
+    os.chmod(out / "config.json", 0o640)
+    os.symlink(victim, out / "config.json.unsloth-restore")
+
+    metadata = S._snapshot_previous_export_metadata(str(out))
+    kept = S._keep_previous_export_shards(
+        ["model.safetensors"], str(out), {"model.safetensors" : 1}, metadata)
+    assert kept
+    (out / "config.json").write_bytes(b"new config")
+    S._restore_previous_export_shards(kept)
+
+    assert victim.read_bytes() == b"outside file"
+    assert not os.path.islink(out / "config.json")
+    assert (out / "config.json").read_bytes() == b"previous config"
+    assert os.stat(out / "config.json").st_mode & 0o777 == 0o640
+    assert os.readlink(out / "config.json.unsloth-restore") == str(victim)
+    assert sorted(os.listdir(out)) == ["config.json", "config.json.unsloth-restore", "model.safetensors"]
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_rollback_removes_shards_the_refresh_added(tmp_path, monkeypatch, relative):
+    # A shard name the previous export did not hold, fetched or split before a later step
+    # failed, would otherwise survive the rollback beside the restored shards. A relative
+    # output path must not make every previous shard look new.
+    from unsloth_zoo import saving_utils as S
+
+    out = tmp_path / "out"
+    out.mkdir()
+    if relative:
+        monkeypatch.chdir(tmp_path)
+        out = type(out)("out")
+    (out / "model.safetensors").write_bytes(b"previous shard")
+    (out / "kept-unrelated.safetensors").write_bytes(b"not refreshed")
+    (out / "config.json").write_bytes(b"previous config")
+    before = {f : (out / f).read_bytes() for f in os.listdir(out)}
+
+    metadata = S._snapshot_previous_export_metadata(str(out))
+    kept = S._keep_previous_export_shards(
+        ["model.safetensors"], str(out), {"model.safetensors" : 1}, metadata)
+    assert kept
+    (out / "model-00002-of-00002.safetensors").write_bytes(b"new shard")
+    (out / "temp_split_abcd_000.safetensors").write_bytes(b"split piece")
+    (out / "sub").mkdir()
+    (out / "sub" / "nested.safetensors").write_bytes(b"new nested shard")
+    S._restore_previous_export_shards(kept)
+
+    assert not (out / "sub" / "nested.safetensors").exists()
+    os.rmdir(out / "sub")
+    assert {f : (out / f).read_bytes() for f in os.listdir(out)} == before
+
+
+def test_failed_local_refresh_restores_the_previous_tokenizer_model(tmp_path, monkeypatch):
+    # For a local base, tokenizer.model was copied over the previous one before the snapshot, so a
+    # rollback paired the previous shards with the new tokenizer.
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path)
+    out = str(tmp_path / "out")
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    with open(os.path.join(out, "tokenizer.model"), "wb") as f:
+        f.write(b"previous tokenizer")
+    with open(os.path.join(base, "tokenizer.model"), "wb") as f:
+        f.write(b"new tokenizer")
+    before = {
+        f : open(os.path.join(out, f), "rb").read() for f in os.listdir(out)
+        if os.path.isfile(os.path.join(out, f))
+    }
+
+    real_copy = S._copy_file_from_source
+    def _copy(src, target_dir, filename):
+        if str(filename).endswith(".safetensors"):
+            raise IOError("simulated copy failure")
+        return real_copy(src, target_dir, filename)
+    monkeypatch.setattr(S, "_copy_file_from_source", _copy)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+
+    after = {
+        f : open(os.path.join(out, f), "rb").read() for f in os.listdir(out)
+        if os.path.isfile(os.path.join(out, f))
+    }
+    assert after["tokenizer.model"] == b"previous tokenizer"
+    assert sorted(after) == sorted(before)
+    assert [f for f in before if after[f] != before[f]] == []
