@@ -964,10 +964,15 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
         # The decoders fetch remote URLs themselves and follow redirects with no
         # way to refuse, so download through the guard and decode a local file.
         downloaded = None
-        if ele["video"].startswith("http://") or ele["video"].startswith("https://"):
-            downloaded = fetch_remote_media_to_file(ele["video"])
+        source = ele["video"]
+        scheme = source.split("://", 1)[0].lower() if "://" in source else ""
+        if scheme in ("http", "https"):
+            downloaded = fetch_remote_media_to_file(source)
             ele = dict(ele)
             ele["video"] = downloaded
+        elif scheme not in ("", "file"):
+            # rtsp://, tcp://, ftp:// ... would be dialled by ffmpeg with no address checks.
+            raise ValueError(f"Unsloth: Refusing a video URL with an unsupported scheme: `{source}`")
         try:
             try:
                 video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)

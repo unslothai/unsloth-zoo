@@ -389,6 +389,29 @@ def test_fetch_video_rejects_internal_url_before_touching_a_decoder(monkeypatch,
 
 @pytest.mark.parametrize(
     "url",
+    ["HTTP://127.0.0.1:9/clip.mp4", "Https://169.254.169.254/clip.mp4"],
+)
+def test_fetch_video_guards_upper_case_http_schemes(monkeypatch, no_network, url):
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError):
+        vision_utils.fetch_video({"video": url})
+    assert no_network == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["rtsp://10.0.0.5/stream", "tcp://127.0.0.1:9", "ftp://10.0.0.5/clip.mp4", "smb://host/share/a.mp4"],
+)
+def test_fetch_video_refuses_other_url_schemes_before_a_decoder(monkeypatch, no_network, url):
+    # ffmpeg dials these protocols itself, so they would bypass the guard.
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "unsupported scheme"):
+        vision_utils.fetch_video({"video": url})
+    assert no_network == []
+
+
+@pytest.mark.parametrize(
+    "url",
     [
         "http://%31%32%37.0.0.1:8080/x.png",
         "http://127%2e0%2e0%2e1:8080/x.png",
