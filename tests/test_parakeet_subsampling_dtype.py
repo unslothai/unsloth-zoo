@@ -92,3 +92,17 @@ def test_float32_weights_are_left_alone(monkeypatch):
     with torch.no_grad():
         module(torch.randn(1, 32, 80), None)
     assert seen == [torch.float32]
+
+
+def test_quantized_closing_linear_keeps_float32(monkeypatch):
+    # bitsandbytes' Linear4bit computes in its input's dtype: a float32 input there must stay float32
+    module = _subsampling()
+    module.linear.weight.quant_state = object()
+    cls = modeling_parakeet.ParakeetEncoderSubsamplingConv2D
+    monkeypatch.setattr(cls, "forward", _original_forward(cls))
+    patch_ParakeetEncoderSubsamplingConv2D_input_dtype()
+    seen = []
+    module.layers[0].register_forward_pre_hook(lambda m, args: seen.append(args[0].dtype))
+    with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
+        module(torch.randn(1, 32, 80), None)
+    assert seen == [torch.float32]

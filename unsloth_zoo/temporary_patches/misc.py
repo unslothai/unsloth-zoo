@@ -609,8 +609,9 @@ def patch_ParakeetEncoderSubsamplingConv2D_input_dtype():
     Unsloth's conv dtype wrapper casts a conv's input to its weight dtype and the result back to the
     input's dtype, so float32 input_features kept the frozen conv stack in float32: twice autocast's
     activation memory. Casting the features to the first conv's 16-bit weight dtype up front is bit
-    identical, since every conv already ran in that dtype and the ReLUs and 0/1 masks between them
-    are exact."""
+    identical, since every conv already ran in that dtype, the ReLUs and 0/1 masks between them are
+    exact, and autocast feeds the closing 16-bit Linear the same values. A quantized closing Linear
+    (QLoRA) computes in its input's dtype, so it keeps the float32 path."""
     try:
         import transformers.models.parakeet.modeling_parakeet as modeling_parakeet
     except Exception as e:
@@ -629,11 +630,15 @@ def patch_ParakeetEncoderSubsamplingConv2D_input_dtype():
     def forward(self, input_features, *args, **kwargs):
         layers = getattr(self, "layers", None)
         weight = getattr(layers[0], "weight", None) if layers is not None and len(layers) else None
+        linear_weight = getattr(getattr(self, "linear", None), "weight", None)
         if (
             type(input_features) is torch.Tensor
             and input_features.dtype == torch.float32
             and isinstance(weight, torch.Tensor)
             and weight.dtype in (torch.float16, torch.bfloat16)
+            and isinstance(linear_weight, torch.Tensor)
+            and linear_weight.dtype in (torch.float16, torch.bfloat16)
+            and not hasattr(linear_weight, "quant_state")
         ):
             input_features = input_features.to(weight.dtype)
         return original_forward(self, input_features, *args, **kwargs)
