@@ -546,7 +546,7 @@ def _recurrence(rows, steps, heads = 4, width = 128):
     return q, k, v, a, b, mx.zeros((heads,)), mx.ones((heads,))
 
 
-def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, monkeypatch):
+def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, qwen4, monkeypatch):
     from unsloth_zoo.mlx import inference
     model, ids, cache = qwen_4bit
     launched, outputs, evaluated, block_fn, evaluate = [], [], [], inference._verify_gdn_block, mx.eval
@@ -601,6 +601,10 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, m
         inference.warm_inference(model)
     finally:
         mx.set_default_device(device)
+    assert not launched
+    # Nor does a qwen4_exp load: its gated-delta layers verify through its own forward.
+    monkeypatch.setattr(qwen4[0], "generate", lambda *args, **kwargs: None, raising = False)
+    inference.warm_inference(qwen4[0])
     assert not launched
 
 

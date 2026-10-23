@@ -6746,7 +6746,8 @@ def _warm_verify_gdn(model):
         return
     shapes = {}
     for _, layer in model.named_modules():
-        if (isinstance(layer, language.Qwen3_5GatedDeltaNet) and layer.head_k_dim == layer.head_v_dim == 128
+        # Not qwen4_exp's subclass: its blocks verify through its own forward, which never launches the fused block.
+        if (type(layer) is language.Qwen3_5GatedDeltaNet and layer.head_k_dim == layer.head_v_dim == 128
                 and not layer.num_v_heads % layer.num_k_heads and layer.conv1d.weight.dtype in (mx.bfloat16, mx.float16)):
             shapes.setdefault((layer.conv1d.weight.dtype, layer.A_log.dtype, layer.dt_bias.dtype, layer.conv_kernel_size,
                                layer.num_k_heads, layer.num_v_heads), layer)
