@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""grpo_accumulated_loss's efficient_log_softmax: the fused scorer recomputes logits in backward, but when GRPO falls
-back to the old chunked scorer (fp32 head, truncated support, UNSLOTH_GRPO_CHUNKED_LOGPROBS=0) every chunk's logits
-are kept for backward, so long completions must keep using Unsloth_Offloaded_Log_Softmax."""
+"""Long completions must offload only when GRPO falls back to the old chunked scorer, which keeps logits."""
 import inspect
 import os
 import textwrap
@@ -29,7 +27,6 @@ from unsloth_zoo import rl_replacements as rr
 
 _ENVS = ("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "UNSLOTH_VLLM_FP32_LM_HEAD", "UNSLOTH_GRPO_LOGPROB_RECOMPUTE")
 
-# name -> (env, truncated support kwargs)
 _CASES = {
     "default": ({}, {}),
     "fp32_head": ({"UNSLOTH_VLLM_FP32_LM_HEAD": "1"}, {}),
@@ -46,7 +43,7 @@ def _set_env(monkeypatch, env):
 
 
 def _efficient_log_softmax(support, scorer):
-    # The offload helpers and efficient_log_softmax are closures inside grpo_accumulated_loss: rebuild them alone.
+    # Closures inside grpo_accumulated_loss: rebuild them alone.
     src = inspect.getsource(rr.grpo_accumulated_loss)
     start = src.rindex("\n", 0, src.index("def to_device")) + 1
     end = src.rindex("\n", 0, src.index("def compute_logprobs_chunk")) + 1
@@ -70,15 +67,15 @@ def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):
 
 
 @pytest.mark.parametrize("case, length, batch, recompute, offloaded", [
-    ("default", 2000, 2, False, False),         # fused scorer: recomputes in backward, never offloads
+    ("default", 2000, 2, False, False),
     ("default", 100, 16, False, False),
-    ("fp32_head", 2000, 2, False, True),        # old scorer keeps logits: long completions offload
+    ("fp32_head", 2000, 2, False, True),
     ("truncated_support", 2000, 2, False, True),
     ("kill_switch", 2000, 2, False, True),
-    ("kill_switch", 100, 16, False, True),      # batch > 8 offloads too, as on main
-    ("kill_switch", 100, 4, False, False),      # short completions, small batch: the plain path, as before
+    ("kill_switch", 100, 16, False, True),
+    ("kill_switch", 100, 4, False, False),
     ("kill_switch", 100, 1, False, False),
-    ("kill_switch", 2000, 2, True, False),      # UNSLOTH_GRPO_LOGPROB_RECOMPUTE=1 never keeps logits
+    ("kill_switch", 2000, 2, True, False),
     ("truncated_support", 2000, 2, True, True),
 ])
 def test_efficient_log_softmax_offloads_only_for_the_old_scorer(monkeypatch, case, length, batch, recompute, offloaded):
@@ -96,7 +93,6 @@ def test_efficient_log_softmax_offloads_only_for_the_old_scorer(monkeypatch, cas
 
 @pytest.mark.parametrize("case", list(_CASES))
 def test_long_completion_saves_no_logits_for_backward(monkeypatch, case):
-    # Real scorers, long completion: no route may keep rows x vocab logits for backward, and gradients are unchanged.
     env, support = _CASES[case]
     _set_env(monkeypatch, env)
     batch, length, hidden, vocab = 2, 1100, 8, 128
@@ -125,7 +121,6 @@ def test_long_completion_saves_no_logits_for_backward(monkeypatch, case):
 
 
 def test_old_scorer_keeps_logits_control():
-    # Control for the test above: the old chunked scorer itself saves at least rows x vocab bytes.
     batch, length, hidden, vocab = 2, 1100, 8, 128
     states = torch.randn(batch, length, hidden, requires_grad = True)
     head = torch.randn(vocab, hidden)

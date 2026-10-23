@@ -475,8 +475,7 @@ RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_
 
 
 def grpo_scorer_keeps_logits(support_kwargs = None, **extra_kwargs):
-    """True when GRPO scoring takes chunked_hidden_states_selective_log_softmax's own chunked path, which keeps each
-    chunk's logits for backward (truncated support, the fp32 head, or the fused kernel switched off)."""
+    """True when GRPO falls back to the old chunked scorer, which keeps every chunk's logits for backward."""
     support = dict(support_kwargs or {}, **extra_kwargs)
     fp32_head = support.get(
         "fp32_lm_head",

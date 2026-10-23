@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Per-token log-probabilities of `hidden @ lm_head.T` without keeping `[tokens, vocab]` logits for backward.
-
-Forward projects a fixed number of rows at a time and keeps only the per-token logsumexp; backward recomputes each
-chunk's logits and turns them into the logits gradient. Peak memory is one chunk, whatever the sequence length.
-Autograd over a chunked loop instead keeps every chunk's logits until backward (bf16 tokens x vocab).
-"""
+"""Per-token log-probs of `hidden @ lm_head.T`; forward keeps only the logsumexp, backward recomputes each chunk."""
 
 __all__ = [
     "UnslothChunkedLogProbs",
@@ -45,15 +40,13 @@ def _env_float(name, default):
         return default
 
 
-# Per chunk: fp32 logits (log-probs) or half logits (CE) plus a half logits gradient; the compiled bodies fuse the rest.
 _BYTES_PER_LOGIT = 8.0
 _CHUNK_GB = _env_float("UNSLOTH_LOGPROB_CHUNK_GB", 2.0)
 _MIN_ROWS = int(_env_float("UNSLOTH_LOGPROB_MIN_ROWS", 512))
 
 
 def _default_chunk_gb(device = None):
-    # Half the head device's free memory, read per call: a first call before the optimizer states exist would
-    # otherwise size every later chunk for memory that is gone.
+    # Read per call: free memory shrinks once optimizer states exist.
     try:
         from unsloth_zoo.tiled_mlp import _default_target_gb
 
@@ -64,10 +57,8 @@ def _default_chunk_gb(device = None):
 
 
 def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None, device = None):
-    """Rows per chunk so that one chunk's logits stay near `target_gb`, and with `n_rows` at most an eighth of them
-    (min `UNSLOTH_LOGPROB_MIN_ROWS`, 512), so a short batch is not projected in one or two
-    near-full chunks. At least 2: a one-row head gradient
-    is a K=1 matmul Inductor mis-lowers under dynamic shapes (see chunked_hidden_states_selective_log_softmax)."""
+    """Rows per chunk for ~`target_gb` of logits, at most n_rows / 8 (min UNSLOTH_LOGPROB_MIN_ROWS).
+    At least 2: Inductor mis-lowers a K=1 head-gradient matmul under dynamic shapes."""
     target_gb = _default_chunk_gb(device) if target_gb is None else target_gb
     rows = int(target_gb * (1024**3) / (max(int(vocab_size), 1) * _BYTES_PER_LOGIT))
     if n_rows is not None:
@@ -282,11 +273,7 @@ def unsloth_chunked_logprobs(
     rows_per_chunk: Optional[int] = None,
     return_mean_logits: bool = False,
 ):
-    """Per-token log-probs for hidden_states [..., H] and index [...] (valid token ids), shape [...] float32.
-
-    Same contract as chunked_hidden_states_selective_log_softmax, but backward recomputes logits per chunk instead of
-    keeping them. On a split model the math runs on the head's device and the result comes back to the caller's.
-    """
+    """chunked_hidden_states_selective_log_softmax contract, recomputing logits in backward. Returns float32 [...]."""
     lead_shape = index.shape
     hidden = hidden_states.reshape(-1, hidden_states.shape[-1]).to(lm_head.device)
     targets = index.reshape(-1).to(lm_head.device)
@@ -304,8 +291,7 @@ def unsloth_chunked_logprobs(
 
 
 def unsloth_masked_logprobs(hidden_states, lm_head, labels, mask = None, ignore_index = -100, **kwargs):
-    """Like unsloth_chunked_logprobs, but only rows where `mask` (default labels != ignore_index) is set reach the head;
-    the rest are 0. `masked_scatter` keeps an all-masked batch connected to the graph as a differentiable zero."""
+    """unsloth_chunked_logprobs on masked rows only, 0 elsewhere; masked_scatter keeps an all-masked batch in the graph."""
     if mask is None:
         mask = labels != ignore_index
     mask = mask.to(hidden_states.device)
@@ -316,13 +302,7 @@ def unsloth_masked_logprobs(hidden_states, lm_head, labels, mask = None, ignore_
 
 
 class UnslothChunkedCE(torch.autograd.Function):
-    """sum(-logp[i] for labelled rows) / divisor, with the gradient taken chunk by chunk in forward.
-
-    Cross entropy is a sum over tokens, so unlike preference losses its gradient is known in forward: each chunk's
-    logits gradient is (softmax - onehot) / divisor, turned into the hidden (and head) gradient right away and the
-    logits freed. No recompute, one chunk resident. `scaling` (fp16 GradScaler) multiplies the stored gradients so
-    they do not underflow in half precision; backward divides it back out.
-    """
+    """sum(-logp[i] for labelled rows) / divisor; gradients computed per chunk in forward (scaled by `scaling`)."""
 
     @staticmethod
     def forward(

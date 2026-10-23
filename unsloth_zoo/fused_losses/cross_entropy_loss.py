@@ -668,10 +668,8 @@ _CHUNKED_CE_KWARGS = frozenset(("ignore_index", "logit_scale_multiply", "logit_s
 
 
 def _use_chunked_ce(kwargs, target_gb):
-    # Plain token CE only: label smoothing, logits_bias, n_chunks and explicit memory targets keep the old path.
     if not _CHUNKED_CE or target_gb is not None or TARGET_GB or N_CHUNKS:
         return False
-    # Opt-ins only the old path implements: fp32 head-gradient accumulation, no fused-CE compile.
     if FP32_HEAD_GRAD or _FUSED_CE_COMPILE_DISABLED:
         return False
     if float(kwargs.get("label_smoothing", 0.0) or 0.0) != 0.0:
@@ -684,7 +682,6 @@ def _chunked_ce_opaque(hidden_states, lm_head_weight, lm_head_bias, labels, mask
                        ignore_index, logit_scale_multiply, logit_scale_divide, logit_softcapping):
     from unsloth_zoo.fused_losses.chunked_logprob import _CHUNK_GB, unsloth_chunked_ce_loss
 
-    # Same device-aware budget as the path below, capped at the chunked kernel's own chunk size.
     target_gb = min(_CHUNK_GB, _free_target_gb(lm_head_weight.device))
     return unsloth_chunked_ce_loss(
         hidden_states, lm_head_weight, lm_head_bias, labels, mask = mask, n_items = n_items, scaling = scaling,
