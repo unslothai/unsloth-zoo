@@ -482,9 +482,9 @@ def _cpu_fallback():
     return None
 
 
-def _gpus_deliberately_hidden():
-    # CUDA_VISIBLE_DEVICES, or the ROCm masks (ROCR_VISIBLE_DEVICES on Linux, HIP_VISIBLE_DEVICES on Windows).
-    for key in ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+def _hidden_by(*keys):
+    """An empty / -1 visibility mask among keys: those devices were hidden on purpose."""
+    for key in keys:
         mask = os.environ.get(key)
         if mask is not None and "".join(mask.split()) in ("", "-1"):
             return True
@@ -497,18 +497,21 @@ def cpu_backend_allowed():
     those keep their install errors instead of silently training on CPU."""
     if os.environ.get("UNSLOTH_DISABLE_CPU_FALLBACK", "0") == "1":
         return False
-    if _gpus_deliberately_hidden():
-        return True
-    if _detect_amd_rocm_runtime():
+    # Each mask only hides the runtime that honours it (HIP also reads CUDA_VISIBLE_DEVICES).
+    if not _hidden_by("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES") and _detect_amd_rocm_runtime():
         return False
     # Linux: the loaded kernel driver, not a stray nvidia-smi in a CPU container image.
     # WSL2 exposes the Windows NVIDIA driver through /usr/lib/wsl/lib instead of /proc/driver/nvidia.
-    if os.path.exists("/proc/driver/nvidia/version") or os.path.exists("/usr/lib/wsl/lib/nvidia-smi") or (
-        not sys.platform.startswith("linux") and shutil.which("nvidia-smi") is not None
+    if not _hidden_by("CUDA_VISIBLE_DEVICES") and (
+        os.path.exists("/proc/driver/nvidia/version") or os.path.exists("/usr/lib/wsl/lib/nvidia-smi") or (
+            not sys.platform.startswith("linux") and shutil.which("nvidia-smi") is not None
+        )
     ):
         return False
     # Ascend NPU driver without torch_npu: keep the install error too.
-    if os.path.exists("/dev/davinci0") or shutil.which("npu-smi") is not None:
+    if not _hidden_by("ASCEND_RT_VISIBLE_DEVICES") and (
+        os.path.exists("/dev/davinci0") or shutil.which("npu-smi") is not None
+    ):
         return False
     if _intel_gpu_present():
         # Not refused: every Intel laptop has one, and most (Iris Xe / UHD) cannot train through XPU.
