@@ -3932,11 +3932,9 @@ pass
 
 
 def _restore_checkpoint_config_keys(config_path, source, config_class):
-    """A built-in class read a checkpoint written for its own code (auto_map) and saved some of its keys
-    under the class's names: transformers 5.20 bailing_hybrid writes Ling 3.x's `norm_topk_prob` as
-    `moe_renormalize` (attribute_map) and rewrites `head_dim` 128 -> 64. The merged weights keep the
-    checkpoint's layout, and its code, vLLM and llama.cpp read the checkpoint's keys (#14916), so write the
-    checkpoint's config.json back, keeping only what the export itself set. Returns True if rewritten."""
+    """A built-in class saved a repo-code (auto_map) checkpoint's keys under its own names (bailing_hybrid:
+    `norm_topk_prob` -> `moe_renormalize`, `head_dim` 128 -> 64), but the weights keep the checkpoint's layout
+    and llama.cpp / its code read its keys (#14916): write its config.json back. True if rewritten."""
     config_path = Path(config_path)
     if not isinstance(source, dict) or "auto_map" not in source or not config_path.exists(): return False
     try:

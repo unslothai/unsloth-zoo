@@ -3632,9 +3632,8 @@ pass
 
 _CHECKPOINT_HPARAMS_MARKER = b"# UNSLOTH_CHECKPOINT_HPARAMS_APPLIED"
 _MAIN_GUARD_PATTERN = re.compile(rb"^if __name__ == (['\"])__main__\1:", re.MULTILINE)
-# transformers 5.20 reads Ling 3.x through its built-in bailing_hybrid class, whose to_dict() renames
-# the checkpoint's keys (norm_topk_prob -> moe_renormalize) and rewrites head_dim (KDA 128 -> 64), and
-# conversion/bailingmoe3.py reads the checkpoint's keys: hand it config.json, as before 5.20 (#14916).
+# conversion/bailingmoe3.py reads Ling 3.x's own keys, which transformers 5.20's bailing_hybrid to_dict()
+# renames (norm_topk_prob) and rewrites (head_dim 128 -> 64): read config.json, as before 5.20 (#14916).
 _CHECKPOINT_HPARAMS_BLOCK = b"""\
 # UNSLOTH_CHECKPOINT_HPARAMS_APPLIED
 _UNSLOTH_CHECKPOINT_HPARAMS_ARCHS = ("BailingMoeV3ForCausalLM", "BailingMoeV3VLForConditionalGeneration")
