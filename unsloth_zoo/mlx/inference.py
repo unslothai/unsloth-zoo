@@ -5047,19 +5047,26 @@ _QMV_ROWS_COSTS = {}
 _QMV_ROWS_LAYOUTS = {}
 
 
+@functools.cache
+def _stock_linear_pinned(linear):
+    """Whether `linear`, the current `QuantizedLinear.__call__`, is the MLX body the multi-row kernel reproduces: a
+    rebinding (a patch scaling every projection, say) keeps the native verifier."""
+    return linear is nn.QuantizedLinear.__call__ and _resolved_bindings(_DENSE_QMM_CONTRACT) is not None
+
+
 def _qmv_rows_kernel(p):
     """The (dtype, group size, bits) `matmul.qmv_rows` runs an affine projection's verify rows with, or None. Settled once
     per quantized weight, at load or on its first block: built, timed, and checked on random rows."""
     arrays, settled = (p.get("weight"), p.get("scales"), p.get("biases")), p.__dict__.get("_unsloth_qmv_rows")
     # The kernel bypasses the layer's call, so it must be one whose one-row result is the stock one; zoo's own
     # wrappers count as stock, so a projection settled at load keeps its verdict when generation installs them.
-    call = type(p).__call__
-    stock = isinstance(p, nn.QuantizedLinear) and (call is nn.QuantizedLinear.__call__ or call in _ONE_ROW_STOCK_CALLS)
-    quantized = (stock, *(getattr(p, name, None) for name in ("group_size", "bits", "mode")))
+    call, linear = type(p).__call__, nn.QuantizedLinear.__call__
+    stock = isinstance(p, nn.QuantizedLinear) and (call is linear or call in _ONE_ROW_STOCK_CALLS)
+    quantized = (stock, linear, *(getattr(p, name, None) for name in ("group_size", "bits", "mode")))
     if settled is not None and all(a is b for a, b in zip(settled[0], arrays)) and settled[1] == quantized:
         return settled[2]
     kernel = None
-    if (stock
+    if (stock and _stock_linear_pinned(linear)
             and p.scales.dtype in (mx.bfloat16, mx.float16) and p.scales.dtype == getattr(p.get("biases"), "dtype", None)
             and matmul.qmv_rows_supported(p.weight.shape[0], p.scales.shape[-1] * p.group_size, p.group_size, p.bits, p.mode)
             and matmul.qmv_rows_probe_passed(p.scales.dtype, p.group_size, p.bits)):

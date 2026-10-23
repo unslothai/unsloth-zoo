@@ -530,6 +530,12 @@ def test_verify_rows_serve_only_projections_whose_one_row_call_is_stock(monkeypa
     assert inference._qmv_rows_kernel(p) is None
     p.__class__ = nn.QuantizedLinear
     assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4)
+    # Nor is the stock call once something rebinds it, until the MLX body is back.
+    linear_call = nn.QuantizedLinear.__call__
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: linear_call(self, x) * 2)
+    assert inference._qmv_rows_kernel(p) is None
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", linear_call)
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4)
 
 
 def test_verify_rows_launch_the_plan_their_launch_costs_make_cheapest():
