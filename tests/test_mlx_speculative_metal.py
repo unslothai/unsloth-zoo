@@ -2044,12 +2044,13 @@ def test_other_mtp_heads_match_a_head_that_never_drafted_even_in_a_wrapping_wind
     from mlx_vlm.speculative.drafters import deepseek_v4_mtp
     from mlx_vlm.utils import get_model_and_args
     from unsloth_zoo.mlx.generate import SamplingParams
-    from unsloth_zoo.mlx.speculative import HeadDrafter
+    from unsloth_zoo.mlx.speculative import HeadDrafter, _head_drafter
     config = dict(model_type = "deepseek_v4", vocab_size = 256, hidden_size = 64, moe_intermediate_size = 32, num_hidden_layers = 2, compress_ratios = [0, 4],
                   num_attention_heads = 2, head_dim = 16, qk_rope_head_dim = 8, q_lora_rank = 16, o_groups = 1, o_lora_rank = 16, n_routed_experts = 4,
                   num_experts_per_tok = 2, index_n_heads = 1, index_head_dim = 16, num_hash_layers = 0, hc_mult = 2, sliding_window = 16)
     model = (arch := get_model_and_args(dict(config))[0]).Model(arch.ModelConfig.from_dict(config))
     head = deepseek_v4_mtp.Model(deepseek_v4_mtp.ModelConfig.from_dict({"model_type": "deepseek_v4_mtp", "text_config": config}))
+    assert _head_drafter(head, model, max_lag = 4).prompt_tail == 4  # only qwen4_exp's head primes on a longer tail
     drafter, chunks, compared, prompt = HeadDrafter(head, model, max_lag = 4), [[]], [], [(7 * i + 3) % 200 + 1 for i in range(37)]
     start, push, catch_up, draft = drafter.start, drafter.push, drafter.catch_up, drafter.draft
     drafter.start = lambda prompt, hidden, token: start(prompt, hidden[:, -20:], token)  # as after a reused prompt prefix
@@ -2066,8 +2067,44 @@ def test_other_mtp_heads_match_a_head_that_never_drafted_even_in_a_wrapping_wind
     drafter.draft = against_replay
     _run(model, [prompt], 96, _script(("draft", 3), ("draft", 3), ("plain", 12), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
     assert len(compared) > 6 and all(compared)
+    assert [len(t) for t, _ in chunks[0]] == [20]  # a head with no tail past max_lag primes in one replay
     assert max(sum(len(t) for t, _ in chunk) for chunk in chunks[1:]) <= 8  # max_lag - 1 pending plus one 5-token round
     assert _probe_matches_a_started_row(model, HeadDrafter(head, model), prompt, lambda started: started[0].head._cache)
+
+
+def test_a_qwen4_head_primes_a_long_tail_in_max_lag_pieces_and_holds_only_verified_pairs(qwen4, monkeypatch):
+    import copy
+    from mlx.utils import tree_map
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.config import Qwen4ExpMTPConfig
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp import Qwen4ExpMTPDraftModel
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import HeadDrafter, MTPDrafter, SpeculativeDraft, _head_drafter
+    model, ids = qwen4
+    head = Qwen4ExpMTPDraftModel(Qwen4ExpMTPConfig(text_config = model.language_model.args))
+    head.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05 if mx.issubdtype(a.dtype, mx.floating) else a, head.parameters()))
+    head.set_dtype(mx.bfloat16)
+    monkeypatch.setattr(model, "_unsloth_speculates", False, raising = False)
+    drafter = _head_drafter(head, model, max_lag = 4)
+    # The prefill keeps the hidden states of SpeculativeDraft.prompt_tail positions.
+    assert SpeculativeDraft(None, drafter).prompt_tail == MTPDrafter.prompt_tail and HeadDrafter(head, model, max_lag = 4).prompt_tail == 4
+    chunks, compared, started, start, push, catch_up, draft = [[]], [], [], drafter.start, drafter.push, drafter.catch_up, drafter.draft
+    drafter.start = lambda *args: (start(*args), started.append(len(chunks)))[0]
+    drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
+    drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
+    state = lambda h: [h._seed_hidden, *(a for entry in h._cache for a in entry.state if isinstance(a, mx.array))]
+    def against_replay(cache, rows, depth, target):
+        (fresh := copy.copy(head)).reset(model)
+        for chunk in filter(None, chunks):
+            tokens, hidden = sum((t for t, _ in chunk), []), mx.concatenate([h for _, h in chunk])[None]
+            fresh.accept_verified_tokens(hidden, mx.array([tokens[:-1]]), len(tokens) - 1, tokens[-1:], None, greedy = True)
+        compared.append(all(a.shape == b.shape and mx.array_equal(a, b).item() for a, b in zip(state(rows[0].head), state(fresh))))
+        return draft(cache, rows, depth, target)
+    drafter.draft = against_replay
+    _run(model, [ids[0]], 64, _script(("draft", 3), ("draft", 3), ("plain", 6), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
+    # The prompt went in max_lag pieces, all of it, and every draft started from a cache of verified pairs alone.
+    priming = [len(tokens) for chunk in chunks[: started[0]] for tokens, _ in chunk]
+    assert sum(priming) == len(ids[0]) and max(priming) == 4
+    assert len(compared) > 4 and all(compared)
 
 
 def test_eagle3_narrower_than_its_target_drafts_from_the_concatenated_layers_row_by_row(qwen):
