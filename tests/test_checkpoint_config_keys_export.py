@@ -224,6 +224,13 @@ def test_converter_patch_is_idempotent_and_keeps_crlf(llama_cpp):
     assert b"\n" not in crlf.replace(b"\r\n", b"")
 
 
+def test_monolith_converter_is_left_alone(llama_cpp):
+    # llama.cpp b4000: `class Model`, `load_hparams(dir_model)`, no ModelBase to wrap.
+    legacy = b"class Model:\n    @staticmethod\n    def load_hparams(dir_model):\n        return {}\n\n\nif __name__ == '__main__':\n    pass\n"
+    assert llama_cpp._patch_checkpoint_hparams(legacy, "monolith") == (legacy, "not-package")
+    exec(compile(legacy, "convert_hf_to_gguf.py", "exec"), {"__name__": "__main__"})
+
+
 def test_converter_without_main_guard_is_reported(llama_cpp):
     content = b"class ModelBase: pass\n"
     assert llama_cpp._patch_checkpoint_hparams(content) == (content, "pattern-missing")

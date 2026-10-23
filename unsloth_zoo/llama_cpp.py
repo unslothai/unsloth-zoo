@@ -3656,9 +3656,12 @@ ModelBase.load_hparams = staticmethod(_unsloth_checkpoint_hparams(ModelBase.load
 """
 
 
-def _patch_checkpoint_hparams(content):
+def _patch_checkpoint_hparams(content, layout = "package"):
     """Insert _CHECKPOINT_HPARAMS_BLOCK before the entrypoint's `if __name__ == "__main__":`.
-    Returns (new_content, status): 'applied' / 'already-applied' / 'pattern-missing'."""
+    Returns (new_content, status): 'applied' / 'already-applied' / 'pattern-missing' / 'not-package'."""
+    # A monolith converter has no BailingMoeV3, and older ones name the class `Model` with
+    # `load_hparams(dir_model)`: wrapping `ModelBase` there is a NameError on every conversion.
+    if layout != "package": return content, "not-package"
     if _CHECKPOINT_HPARAMS_MARKER in content: return content, "already-applied"
     match = _MAIN_GUARD_PATTERN.search(content)
     if match is None: return content, "pattern-missing"
@@ -4671,7 +4674,7 @@ def _download_convert_hf_to_gguf_cached(
 
         # Patch 4: architectures whose converter reads the checkpoint's own config.json keys.
         try:
-            patched_content, _hparams_status = _patch_checkpoint_hparams(patched_content)
+            patched_content, _hparams_status = _patch_checkpoint_hparams(patched_content, _layout)
             if _hparams_status == "pattern-missing":
                 logger.warning("Unsloth: checkpoint hparams patch target `if __name__ == '__main__':` not found.")
         except Exception as e:
