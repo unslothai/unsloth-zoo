@@ -4908,25 +4908,20 @@ pass
 
 
 def _set_index_total_size(save_directory, total_size):
-    """Record `total_size` in a copied shard index, returning whether it changed.
-
-    The copied index still describes the 16-bit base, so a float32 export would otherwise
-    report half its real size.
-    """
+    """Record `total_size` in a copied shard index; returns whether it changed."""
     index_path = os.path.join(save_directory, "model.safetensors.index.json")
     if not os.path.isfile(index_path): return False
     try:
         with open(index_path, "rb") as f:
             raw = f.read()
-        # Decoded as _reject_unsafe_shard_index does: transformers reads the index in the locale
-        # encoding, so bytes strict UTF-8 refuses (cp1252 names) are still a valid index.
+        # transformers reads the index in the locale encoding, so non-UTF-8 bytes are still valid.
         data = json.loads(raw.decode("utf-8", errors = "surrogateescape"))
     except Exception:
         return False
     metadata = data.get("metadata") if isinstance(data, dict) else None
     if not isinstance(metadata, dict) or metadata.get("total_size") == total_size:
         return False
-    # Rewrite only the number, so every other byte (shard names in any encoding) stays as copied.
+    # Rewrite only the number so every other byte stays as copied.
     pattern = re.compile(rb'("total_size"\s*:\s*)-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?')
     if len(pattern.findall(raw)) == 1:
         updated = pattern.sub(lambda m: m.group(1) + str(int(total_size)).encode("ascii"), raw)
@@ -5922,10 +5917,10 @@ def merge_and_overwrite_lora(
                     pass
     pass
 
-    # A copied index still carries the 16-bit base's total_size; the widened shards are larger.
+    # A copied index still carries the 16-bit base's total_size.
     if upcast_to_float32 and not regenerate_index:
         if _set_index_total_size(save_directory, _widened_total_size) and push_to_hub and low_disk_space_usage:
-            # Low disk mode uploaded the index before the merge, and Step 7 does not run.
+            # Low disk mode uploaded the index before the merge; Step 7 does not run.
             upload_items("model.safetensors.index.json")
 
     # Step 6: Regenerate index for MXFP4 dequantization or shard splitting
