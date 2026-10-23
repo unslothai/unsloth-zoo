@@ -1020,8 +1020,9 @@ SORTED_GATHER_PROBE_KEY = "sorted_gather_qmm:" + hashlib.sha256(_SORTED_GATHER_S
 
 
 @functools.cache
-def _mlx_kernel_header(name):
-    """An installed MLX kernel header with the MLX headers it includes inlined, or None without them."""
+def _mlx_kernel_header(name, stop = None):
+    """An installed MLX kernel header with the MLX headers it includes inlined, or None without them; with `stop`,
+    only what precedes its top-level declaration of `stop`."""
     root, kernels = os.path.join(os.path.dirname(mx.__file__), "include"), "mlx/backend/metal/kernels/"
     seen = {kernels + preamble for preamble in _MLX_KERNEL_PREAMBLE}
 
@@ -1039,9 +1040,14 @@ def _mlx_kernel_header(name):
         return lines
 
     try:
-        return "\n".join(inline(kernels + name)) + "\n"
+        text = "\n".join(inline(kernels + name)) + "\n"
     except OSError:
         return None
+    if stop is None:
+        return text
+    found = re.search(rf"^\w.*\b{stop}\s*\(", text, re.M)
+    # From the line after the previous top-level closing brace, so a template line goes with its declaration.
+    return found and text[: text.index("\n", text.rfind("\n}", 0, found.start()) + 1) + 1]
 
 
 @functools.cache

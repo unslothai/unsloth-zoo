@@ -5040,6 +5040,54 @@ _EXACT_ATTENTION_TIMINGS, _EXACT_ATTENTION_RETRY = 3, 128
 _EXACT_ATTENTION_THREADS = {}
 
 
+# Seconds per `matmul.qmv_rows` launch by (rows, inputs prepared), per (dtype, group size, bits), measured on the device:
+# the fastest launch width depends on the GPU and not monotonically on the rows (a wider launch can spill registers).
+_QMV_ROWS_COSTS = {}
+
+
+def _verify_qmv_rows(project, native, linears, x):
+    """`native()`, with affine projections run by `matmul.qmv_rows` once their first block matched `project(x)` bit for bit."""
+    if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.dtype not in (mx.bfloat16, mx.float16)
+            or x.shape[0] * x.shape[1] < 2 or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS", "1") == "0"
+            or not all(isinstance(p, nn.QuantizedLinear) and not p.trainable_parameters()
+                       and x.dtype == p.scales.dtype == getattr(p.get("biases"), "dtype", None)
+                       and matmul.qmv_rows_supported(p.weight.shape[0], x.shape[-1], p.group_size, p.bits, p.mode)
+                       for p in linears)
+            or not nax.kernel_probe_passed(matmul.QMV_ROWS_PROBE_KEY, matmul.__name__, "probe_qmv_rows", mx.metal.is_available)):
+        return native()
+    rows = x.reshape(-1, x.shape[-1])
+
+    def fused():
+        launches, outs = {}, []
+        for p in linears:
+            kernel = (x.dtype, p.group_size, p.bits)
+            if kernel not in launches:
+                costs = _QMV_ROWS_COSTS.get(kernel)
+                most, prepared = (matmul.QMV_ROWS_MAX, False) if costs is None else matmul.qmv_rows_plan(costs, rows.shape[0])
+                stops = list(itertools.accumulate(matmul.qmv_rows_sizes(rows.shape[0], most)))
+                launches[kernel] = [(part, matmul.qmv_rows_inputs(part, p.bits) if prepared else None)
+                                    for part in (rows[a:b] for a, b in zip([0, *stops], stops))]
+            ys = [matmul.qmv_rows(part, p.weight, p.scales, p.biases, p.group_size, p.bits, inputs)
+                  for part, inputs in launches[kernel]]
+            y = (ys[0] if len(ys) == 1 else mx.concatenate(ys)).reshape(*x.shape[:-1], -1)
+            outs.append(y + p["bias"] if "bias" in p else y)
+        return tuple(outs) if len(outs) > 1 else outs[0]
+
+    # Keyed by projection, not block width (a row's arithmetic does not depend on its block), with every row count
+    # built and every launch timed before the first block: the draft controller times a width from its first rounds.
+    key = ("qmv_rows", x.dtype, *((p.weight.shape, p.bits, p.group_size, "bias" in p) for p in linears))
+    if key not in _VERIFY_VERDICTS:
+        try:
+            for kernel in {(x.dtype, p.group_size, p.bits) for p in linears}:
+                matmul.compile_qmv_rows(*kernel)
+                if kernel not in _QMV_ROWS_COSTS:
+                    _FIRST_USE_WORK[0] += 1
+                    _QMV_ROWS_COSTS[kernel] = tuple(matmul.qmv_rows_launch_costs(*kernel).items())
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)  # inside a function transformation, which cannot evaluate
+    return _verify_admitted(key, lambda: project(x), fused)
+
+
 @functools.cache
 def _exact_attention_kernels():
     try:
@@ -5197,10 +5245,12 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         return taped(self, layer, inputs, mask, cache)
 
     def sliced_linear(self, linear, x):
-        return _verify_sliced(lambda rows: base._linear(self, linear, rows), (linear,), x, eligible)
+        project = lambda rows: base._linear(self, linear, rows)
+        return _verify_qmv_rows(project, lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
 
     def sliced_linears(self, linears, x):
-        return _verify_sliced(lambda rows: base._linears(self, linears, rows), linears, x, eligible)
+        project = lambda rows: base._linears(self, linears, rows)
+        return _verify_qmv_rows(project, lambda: _verify_sliced(project, linears, x, eligible), linears, x)
 
     def submitted_layer(self, *args, **kwargs):
         hidden = base._layer(self, *args, **kwargs)
@@ -5329,8 +5379,11 @@ def exact_speculative_verify(model, *, _modules = None):
     pair of rows instead of once per row, where that measured faster on this device. A block's gated-delta layers
     write only their final state, and the commit replays each layer over the retained prefix with the same kernel
     instead of keeping every step's state, once replays of a key's first block matched every per-step state bit
-    for bit. Only verify calls of the language models found here are served; other, training and distributed
-    models, and an mlx-vlm whose verifier drifted, keep the native methods.
+    for bit. 4-, 5-, 6- and 8-bit affine projections run every row of a block in one call per eight rows, each row
+    with its one-row decode arithmetic, on the same condition; `UNSLOTH_MLX_VERIFY_QMV_ROWS=0` keeps them native.
+    Only verify calls of the
+    language models found here are served; other, training and distributed models, and an mlx-vlm whose verifier
+    drifted, keep the native methods.
     """
     with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
         yield model
@@ -5343,7 +5396,8 @@ def exact_batch_invariant_decode(model, *, _modules = None):
 
     As `exact_speculative_verify` does for the Qwen3.5 verifier, frozen quantized projections in blocks wider than
     eight rows run over balanced row slices and sparse blocks' routed experts run on the decode kernels, each once its
-    first call of that shape matched the native call bit for bit. The forward already submits each layer. Only calls
+    first call of that shape matched the native call bit for bit; affine projections of multi-row blocks run their
+    rows together as there. The forward already submits each layer. Only calls
     of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
     forward drifted, keep the native methods.
     """

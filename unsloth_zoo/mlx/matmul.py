@@ -14,11 +14,13 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Small-row 4- and 8-bit affine `x @ W^T` on the stock packed weights, for Apple GPUs without stock NAX kernels."""
+"""Affine `x @ W^T` on the stock packed weights: small-row 4- and 8-bit qmm for Apple GPUs without stock NAX
+kernels, and multi-row qmv that gives each row its one-row stock bits."""
 
 import functools
 import hashlib
 import itertools
+import time
 
 import mlx.core as mx
 
@@ -260,3 +262,258 @@ def probe_simd_qmm():
                 got = simd_qmm(x, w, scales, biases, group_size, bits).astype(mx.float32)
                 error = mx.abs(got - native).max().item()
                 assert error <= 0.02 * mx.abs(native).max().item(), (bits, group_size, M, error)
+
+
+# Rows of affine `x @ W^T` with stock qmv_fast's one-row arithmetic, so each row equals its one-row call bit for bit
+# while each weight is read once per launch, where mlx-vlm's exact verifier re-reads or re-decodes it per row.
+QMV_ROWS_MAX = 8
+_QMV_ROWS_BITS = (4, 5, 6, 8)
+_QMV_ROWS_GROUP_SIZES = (32, 64, 128)
+
+# A row's inputs as the installed MLX's `load_vector` forms them, and `xt`, each code product's factor.
+_QMV_ROWS_INPUTS = """
+    float x_thread[VPT];
+    const float sum = load_vector<T, float, VPT, BITS>(xr, x_thread);
+    float xt[NP];
+    if (BITS == 5) {
+        _Pragma("clang loop unroll(full)")
+        for (int p = 0; p < 2; ++p) {
+            const thread float* v = x_thread + 8 * p;
+            thread float* f = xt + 12 * p;
+            f[0] = v[0]; f[1] = v[1]; f[2] = v[1] * 256.0f; f[3] = v[2]; f[4] = v[3]; f[5] = v[3] * 256.0f;
+            f[6] = v[4]; f[7] = v[4] * 256.0f; f[8] = v[5]; f[9] = v[6]; f[10] = v[6] * 256.0f; f[11] = v[7];
+        }
+    } else if (BITS == 6) {
+        _Pragma("clang loop unroll(full)")
+        for (int p = 0; p < 2; ++p) {
+            const thread float* v = x_thread + 4 * p;
+            thread float* f = xt + 6 * p;
+            f[0] = v[0]; f[1] = v[1]; f[2] = v[1] * 256.0f; f[3] = v[2]; f[4] = v[2] * 256.0f; f[5] = v[3];
+        }
+    } else {
+        _Pragma("clang loop unroll(full)")
+        for (int j = 0; j < VPT; ++j) xt[j] = x_thread[j];
+    }
+"""
+
+# Multiply-add bound on smaller GPUs: a lane decodes its codes once for all rows (half codes are exact) and forms
+# each row's inputs per four outputs or reads them from `qmv_rows_inputs`. A row count compiles once for all N and K.
+_QMV_ROWS_SOURCE = """
+    constexpr int VPT = (BITS == 4 || BITS == 5) ? 16 : 8;
+    constexpr int NP = BITS == 5 ? 24 : (BITS == 6 ? 12 : VPT);
+    constexpr int LANE_BYTES = VPT * BITS / 8;
+    const int K = w_shape[w_ndim - 1] * 32 / BITS;
+    const int N = w_shape[w_ndim - 2];
+    const int ROW_BYTES = K * BITS / 8;
+    const int KG = K / GS;
+    const uint lane = thread_index_in_simdgroup;
+    const int n0 = int(thread_position_in_grid.y) * 4;
+    const device uint8_t* ws = (const device uint8_t*)w + n0 * ROW_BYTES + int(lane) * LANE_BYTES;
+    const device T* sc = scales + n0 * KG + int(lane) / (GS / VPT);
+    const device T* bs = biases + n0 * KG + int(lane) / (GS / VPT);
+    float result[ROWS][4];
+    _Pragma("clang loop unroll(full)")
+    for (int t = 0; t < ROWS; ++t) _Pragma("clang loop unroll(full)") for (int r = 0; r < 4; ++r) result[t][r] = 0;
+    for (int k = 0; k < K; k += 32 * VPT) {
+        half code[4][NP];
+        float s[4], b[4];
+        _Pragma("clang loop unroll(full)")
+        for (int r = 0; r < 4; ++r) {
+            const device uint8_t* wl = ws + r * ROW_BYTES;
+            if (BITS == 4) {
+                _Pragma("clang loop unroll(full)")
+                for (int p = 0; p < 4; ++p) {
+                    const uint16_t v = ((const device uint16_t*)wl)[p];
+                    code[r][4 * p] = v & 0x000f; code[r][4 * p + 1] = v & 0x00f0;
+                    code[r][4 * p + 2] = v & 0x0f00; code[r][4 * p + 3] = v & 0xf000;
+                }
+            } else if (BITS == 5) {
+                _Pragma("clang loop unroll(full)")
+                for (int p = 0; p < 2; ++p) {
+                    const device uint8_t* wp = wl + 5 * p;
+                    const uint8_t w0 = wp[0], w1 = wp[1], w2 = wp[2], w3 = wp[3], w4 = wp[4];
+                    code[r][12 * p] = w0 & 0x1f; code[r][12 * p + 1] = w0 & 0xe0; code[r][12 * p + 2] = w1 & 0x03;
+                    code[r][12 * p + 3] = w1 & 0x7c; code[r][12 * p + 4] = w1 & 0x80; code[r][12 * p + 5] = w2 & 0x0f;
+                    code[r][12 * p + 6] = w2 & 0xf0; code[r][12 * p + 7] = w3 & 0x01; code[r][12 * p + 8] = w3 & 0x3e;
+                    code[r][12 * p + 9] = w3 & 0xc0; code[r][12 * p + 10] = w4 & 0x07; code[r][12 * p + 11] = w4 & 0xf8;
+                }
+            } else if (BITS == 6) {
+                const uint8_t w0 = wl[0], w1 = wl[1], w2 = wl[2], w3 = wl[3], w4 = wl[4], w5 = wl[5];
+                code[r][0] = w0 & 0x3f; code[r][1] = w0 & 0xc0; code[r][2] = w1 & 0x0f;
+                code[r][3] = w1 & 0xf0; code[r][4] = w2 & 0x03; code[r][5] = w2 & 0xfc;
+                code[r][6] = w3 & 0x3f; code[r][7] = w3 & 0xc0; code[r][8] = w4 & 0x0f;
+                code[r][9] = w4 & 0xf0; code[r][10] = w5 & 0x03; code[r][11] = w5 & 0xfc;
+            } else {
+                _Pragma("clang loop unroll(full)")
+                for (int j = 0; j < 8; ++j) code[r][j] = wl[j];
+            }
+            s[r] = sc[r * KG];
+            b[r] = bs[r * KG];
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int t = 0; t < ROWS; ++t) {
+            const int row = t;
+            ROW_INPUTS
+            _Pragma("clang loop unroll(full)")
+            for (int r = 0; r < 4; ++r) {
+                float accum = 0;
+                if (BITS == 4) {
+                    _Pragma("clang loop unroll(full)")
+                    for (int i = 0; i < 16; i += 4) {
+                        accum += (xt[i] * float(code[r][i]) + xt[i + 1] * float(code[r][i + 1])
+                                  + xt[i + 2] * float(code[r][i + 2]) + xt[i + 3] * float(code[r][i + 3]));
+                    }
+                } else {
+                    _Pragma("clang loop unroll(full)")
+                    for (int j = 0; j < NP; ++j) accum += float(code[r][j]) * xt[j];
+                }
+                result[t][r] += s[r] * accum + sum * b[r];
+            }
+        }
+        ws += 32 * LANE_BYTES;
+        sc += 32 * VPT / GS;
+        bs += 32 * VPT / GS;
+    }
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < 4; ++r) {
+        _Pragma("clang loop unroll(full)")
+        for (int t = 0; t < ROWS; ++t) {
+            const float v = simd_sum(result[t][r]);
+            if (lane == 0) y[t * N + n0 + r] = T(v);
+        }
+    }
+"""
+_QMV_ROWS_READ = """const int chunk = row * (K / VPT) + (k / VPT) + int(lane);
+            const float sum = sums[chunk];
+            float xt[NP];
+            _Pragma("clang loop unroll(full)")
+            for (int j = 0; j < NP; j += 4) {
+                const float4 v = *(const device float4*)(xs + chunk * NP + j);
+                xt[j] = v.x; xt[j + 1] = v.y; xt[j + 2] = v.z; xt[j + 3] = v.w;
+            }"""
+
+_QMV_ROWS_PREPARE = """
+    constexpr int VPT = (BITS == 4 || BITS == 5) ? 16 : 8;
+    constexpr int NP = BITS == 5 ? 24 : (BITS == 6 ? 12 : VPT);
+    const int K = x_shape[1];
+    const int t = int(thread_position_in_grid.y);
+    const int chunk = int(thread_position_in_grid.x);
+    const device T* xr = x + t * K + chunk * VPT;
+""" + _QMV_ROWS_INPUTS + """
+    device float* out = xs + (t * (K / VPT) + chunk) * NP;
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < NP; ++j) out[j] = xt[j];
+    sums[t * (K / VPT) + chunk] = sum;
+"""
+
+
+def _qmv_rows_source(prepared):
+    inputs = _QMV_ROWS_READ if prepared else "const device T* xr = x + row * K + k + int(lane) * VPT;" + _QMV_ROWS_INPUTS
+    return _QMV_ROWS_SOURCE.replace("ROW_INPUTS", inputs)
+
+
+QMV_ROWS_PROBE_KEY = "qmv_rows:" + hashlib.sha256((_QMV_ROWS_SOURCE + _QMV_ROWS_INPUTS + _QMV_ROWS_READ
+                                                   + _QMV_ROWS_PREPARE).encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _qmv_rows_kernel(prepared):
+    header = nax._mlx_kernel_header("quantized.h", "qdot")
+    return header and mx.fast.metal_kernel(
+        name = f"unsloth_qmv_rows{'_prepared' if prepared else ''}",
+        input_names = [*(("xs", "sums") if prepared else ("x",)), "w", "scales", "biases"],
+        output_names = ["y"], header = header, source = _qmv_rows_source(prepared))
+
+
+@functools.cache
+def _qmv_rows_inputs_kernel():
+    header = nax._mlx_kernel_header("quantized.h", "qdot")
+    return header and mx.fast.metal_kernel(name = "unsloth_qmv_rows_inputs", input_names = ["x"],
+                                           output_names = ["xs", "sums"], header = header, source = _QMV_ROWS_PREPARE)
+
+
+def _qmv_rows_values(bits):  # qmv_fast's values per lane per K step, and the code products they make
+    values = 16 if bits in (4, 5) else 8
+    return values, values * 3 // 2 if bits in (5, 6) else values
+
+
+def qmv_rows_supported(N, K, group_size, bits, mode):
+    """Whether `qmv_rows` covers an `[N, K]` weight quantized this way: where stock runs qmv_fast for one row."""
+    return (mode == "affine" and bits in _QMV_ROWS_BITS and group_size in _QMV_ROWS_GROUP_SIZES and N > 0
+            and N % 8 == 0 and K > 0 and K % (32 * _qmv_rows_values(bits)[0]) == 0 and N * K * bits // 8 < 1 << 31)
+
+
+def qmv_rows_inputs(x, bits):
+    """Each row's prescaled inputs and input sums as qmv_fast forms them, for `qmv_rows` over several weights of x."""
+    (M, K), (values, products) = x.shape, _qmv_rows_values(bits)
+    return tuple(_qmv_rows_inputs_kernel()(
+        inputs = [x], template = [("T", x.dtype), ("BITS", bits)],
+        grid = (K // values, M, 1), threadgroup = (min(256, K // values), 1, 1),
+        output_shapes = [(M, K // values * products), (M, K // values)], output_dtypes = [mx.float32, mx.float32]))
+
+
+def qmv_rows(x, w, scales, biases, group_size, bits, inputs = None):
+    """Each row of a 2-D x of at most `QMV_ROWS_MAX` rows as `quantized_matmul(row, w, ..., transpose=True)`;
+    `inputs`, its `qmv_rows_inputs`, are read rather than formed per output."""
+    M, N = x.shape[0], w.shape[0]
+    return _qmv_rows_kernel(inputs is not None)(
+        inputs = [*([x] if inputs is None else inputs), w, scales, biases],
+        template = [("T", x.dtype), ("ROWS", M), ("GS", group_size), ("BITS", bits)],
+        grid = (32, N // 4, 1), threadgroup = (32, next(g for g in (8, 4, 2) if N % (4 * g) == 0), 1),
+        output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
+
+
+@functools.cache
+def compile_qmv_rows(dtype, group_size, bits):
+    """Build `qmv_rows` both ways for every row count of `dtype` inputs and these weights, on a tiny weight."""
+    K = 32 * _qmv_rows_values(bits)[0]
+    w, scales, biases = mx.quantize(mx.zeros((8, K), dtype = dtype), group_size = group_size, bits = bits)
+    x = mx.zeros((QMV_ROWS_MAX, K), dtype = dtype)
+    mx.eval([qmv_rows(x[:M], w, scales, biases, group_size, bits, inputs) for M in range(1, QMV_ROWS_MAX + 1)
+             for inputs in (None, qmv_rows_inputs(x[:M], bits))])
+
+
+def probe_qmv_rows():
+    """Subprocess probe: every variant the kernel compiles, each row bitwise its one-row stock call."""
+    for dtype, group_size, bits in itertools.product((mx.bfloat16, mx.float16), _QMV_ROWS_GROUP_SIZES, _QMV_ROWS_BITS):
+        w = mx.random.normal((72, 1024), key = mx.random.key(group_size)) * 0.05
+        w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
+        for M in range(1, QMV_ROWS_MAX + 1):
+            x = mx.random.normal((M, 1024), key = mx.random.key(M)).astype(dtype)
+            native = mx.concatenate([mx.quantized_matmul(x[i:i + 1], w, scales, biases, transpose = True,
+                                                         group_size = group_size, bits = bits) for i in range(M)])
+            for inputs in (None, qmv_rows_inputs(x, bits)):
+                got = qmv_rows(x, w, scales, biases, group_size, bits, inputs)
+                assert mx.array_equal(got.view(mx.uint16), native.view(mx.uint16)).item(), (dtype, group_size, bits, M)
+
+
+def qmv_rows_launch_costs(dtype, group_size, bits, clock = time.perf_counter):
+    # A weight of 64-128 MB and four launches per timed run, so each run is well above timer and launch noise.
+    w = mx.quantize(mx.zeros((16384, 8192), dtype = dtype), group_size = group_size, bits = bits)
+    x = mx.zeros((QMV_ROWS_MAX, 8192), dtype = dtype)
+    launch = lambda m, prepared: [qmv_rows(x[:m], *w, group_size, bits,
+                                               qmv_rows_inputs(x[:m], bits) if prepared else None) for _ in range(4)]
+    launches = [(m, prepared) for m in range(1, QMV_ROWS_MAX + 1) for prepared in (False, True)]
+    mx.eval(w, [launch(*plan) for plan in launches])
+    seconds = {plan: [] for plan in launches}
+    for _ in range(3):
+        for plan in launches:
+            mx.synchronize()
+            start = clock()
+            mx.eval(launch(*plan))
+            seconds[plan].append((clock() - start) / 4)
+    return {plan: sorted(spent)[1] for plan, spent in seconds.items()}
+
+
+def qmv_rows_sizes(rows, most):
+    count = -(-rows // most)
+    size, extra = divmod(rows, count)
+    return [size + (i < extra) for i in range(count)]
+
+
+@functools.cache
+def qmv_rows_plan(costs, rows):
+    """The (rows per launch at most, inputs prepared) whose balanced launches of `rows` rows cost least by `costs`."""
+    costs = dict(costs)
+    return min(((most, prepared) for most in range(1, QMV_ROWS_MAX + 1) for prepared in (False, True)),
+               key = lambda plan: sum(costs[(m, plan[1])] for m in qmv_rows_sizes(rows, plan[0])))

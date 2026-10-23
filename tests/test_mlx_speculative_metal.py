@@ -389,6 +389,7 @@ def test_wide_verify_blocks_are_cut_into_balanced_slices_within_the_fused_bound(
 @pytest.mark.parametrize("width", [9, 17])
 def test_wide_verify_blocks_in_slices_match_the_native_verifier(qwen_4bit, monkeypatch, width):
     from unsloth_zoo.mlx import inference
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")  # slices serve the layouts `matmul.qmv_rows` does not cover
     (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)
     lm, block = model.language_model, mx.array([ids[0][24 : 24 + width]])
     first = -(-width // -(-width // 8))
@@ -403,6 +404,7 @@ def test_wide_verify_blocks_in_slices_match_the_native_verifier(qwen_4bit, monke
 
 def test_a_sliced_verify_block_matches_one_token_decode_steps(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
     (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)
     lm, block = model.language_model, mx.array([ids[0][24:39]])
     steps, snapshots, decoded = _clone(cache), {0: cache}, []
@@ -417,6 +419,87 @@ def test_a_sliced_verify_block_matches_one_token_decode_steps(qwen_4bit, monkeyp
     assert served
 
 
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_a_verify_block_runs_its_rows_together_and_matches_one_token_decode_steps(monkeypatch, bits):
+    import mlx.nn as nn
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference, matmul, nax
+    model, ids = _load(MODEL)
+    lm = model.language_model
+    nn.quantize(lm, group_size = 64, bits = bits)
+    cache = make_prompt_cache(lm)
+    mx.eval(lm(mx.array([ids[0][:24]]), cache = cache).logits)
+    served, block, calls = _serving(monkeypatch), mx.array([ids[0][24:35]]), []
+    kernel = matmul.qmv_rows
+    monkeypatch.setattr(matmul, "qmv_rows", lambda x, *args: calls.append(x.shape) or kernel(x, *args))
+    matmul.compile_qmv_rows.cache_clear()
+    # Launches are timed once per kernel; here more than four rows per launch spill and prepared inputs are cheaper.
+    timed = []
+    monkeypatch.setattr(inference, "_QMV_ROWS_COSTS", {})
+    monkeypatch.setattr(matmul, "qmv_rows_launch_costs", lambda *kernel: timed.append(kernel) or _spilling_costs(4))
+    steps, snapshots, decoded = _clone(cache), {0: cache}, []
+    for t in range(block.shape[1]):
+        decoded.append(lm(block[:, t : t + 1], cache = steps, **_captured(lm)))
+        if t + 1 in (1, 6, 11):
+            snapshots[t + 1] = _clone(steps)
+    stepped = SimpleNamespace(logits = mx.concatenate([out.logits for out in decoded], axis = 1), hidden_states = [mx.concatenate(parts, axis = 1) for parts in zip(*(out.hidden_states for out in decoded))])
+    with inference.exact_speculative_verify(model):
+        _verified(lm, cache, block, 0)
+        assert not served.clear() and all(_same(_state(stepped, entries), _verified(lm, cache, block, keep)) for keep, entries in snapshots.items())
+        # Every row count is built on a one-step weight before the first block; the 11-row block runs as 4 + 4 + 3.
+        step = 512 if bits in (4, 5) else 256
+        assert {M for M, K in calls if K == step} == set(range(1, 9)) and {M for M, K in calls if K != step} == {4, 3}
+        admitted = {key: verdict for key, verdict in inference._VERIFY_VERDICTS.items() if key[0] == "qmv_rows"}
+        assert any(key[0] == "qmv_rows" for key in served) and admitted and all(admitted.values())
+        # A block of another width is served under the same admissions.
+        _verified(lm, cache, block[:, :5], 0)
+        assert (2, lm.args.hidden_size) in calls
+        assert admitted == {key: verdict for key, verdict in inference._VERIFY_VERDICTS.items() if key[0] == "qmv_rows"}
+        assert timed == [(mx.bfloat16, 64, bits)]
+        probe = nax.kernel_probe_passed
+        monkeypatch.setattr(nax, "kernel_probe_passed", lambda key, *args: key != matmul.QMV_ROWS_PROBE_KEY and probe(key, *args))
+        count = len(calls)
+        _verified(lm, cache, block, 0)
+        assert len(calls) == count
+        monkeypatch.setattr(nax, "kernel_probe_passed", probe)
+        monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
+        served.clear()
+        _verified(lm, cache, block, 0)
+        assert not any(key[0] == "qmv_rows" for key in served)
+
+
+def _spilling_costs(most, prepared = 0.9):  # one unit per launch and per row; launches over `most` rows spill
+    return {(m, p): 1 + m * (prepared if p else 1) if m <= most else 100 for m in range(1, 9) for p in (False, True)}
+
+
+def test_verify_rows_launch_the_plan_their_launch_costs_make_cheapest():
+    from unsloth_zoo.mlx import matmul
+    plan = lambda costs, rows: matmul.qmv_rows_plan(tuple(costs.items()), rows)
+    # As few launches as fit under the spill, balanced, with the cheaper inputs.
+    assert plan(_spilling_costs(6), 16) == (6, True) and matmul.qmv_rows_sizes(16, 6) == [6, 5, 5]
+    assert plan(_spilling_costs(8, prepared = 1.1), 16) == (8, False) and plan(_spilling_costs(4), 3) in {(3, True), (4, True)}
+
+
+def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkeypatch):
+    from unsloth_zoo.mlx import matmul
+    now, spent, runs = [0.0], [0.0], {}
+
+    def clock():
+        now[0], spent[0] = now[0] + spent[0], 0.0
+        return now[0]
+
+    def launch(x, w, scales, biases, group_size, bits, inputs):
+        rows, prepared = x.shape[0], inputs is not None
+        durations = (0, rows, 50, rows + 0.5 * prepared)
+        spent[0] += next(runs.setdefault((rows, prepared), iter([d for d in durations for _ in range(4)])))
+        return x
+    monkeypatch.setattr(matmul, "qmv_rows", launch)
+    monkeypatch.setattr(matmul, "qmv_rows_inputs", lambda x, bits: x)
+    # A warm run, then three timed runs of four launches each, every launch advancing the clock by its own time.
+    costs = matmul.qmv_rows_launch_costs(mx.bfloat16, 64, 4, clock)
+    assert costs == {(m, prepared): m + 0.5 * prepared for m in range(1, 9) for prepared in (False, True)}
+
+
 def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(qwen_4bit, monkeypatch):
     import copy
     import mlx.nn as nn
@@ -424,6 +507,7 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
     from mlx_vlm.speculative.ops import linear as linear_ops
     from unsloth_zoo.mlx import inference
     (model, ids, cache), verdicts = qwen_4bit, inference._VERIFY_VERDICTS
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
     lm, verifier, native = model.language_model, language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
     unscoped, block = copy.copy(lm), mx.array([ids[0][24:36]])
     quantized = [module for _, module in lm.named_modules() if isinstance(module, nn.QuantizedLinear)]
@@ -626,7 +710,7 @@ def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ra
     assert opened[:2] == (closed, scores) and any(scores) and drafted[0][1] > 8 and len({accepted for _, accepted in drafted.values()}) > 1
     # Exactly the rounds whose verify ran a first-use check are flagged, so the controller leaves just those out of its costs.
     assert opened[3][0] == opened[3][1] and any(opened[3][0]) and not all(opened[3][0])
-    wide = [key for key, verdict in inference._VERIFY_VERDICTS.items() if key[0][0] == 3 and key[0][1] > 8 and verdict]
+    wide = [key for key, verdict in inference._VERIFY_VERDICTS.items() if key[0] == "qmv_rows" and verdict]
     # Each admitted key's replacement ran once for the comparison, then again for every later round it served.
     assert any(served.count(key) > 1 for key in wide)
 
@@ -657,8 +741,9 @@ def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit
     assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is native and "_unsloth_verify_scopes" not in vars(lm)
     # The first decode step and the verify block each matched on their first layer, then served every other one.
     admitted = [key for key, verdict in inference._VERIFY_VERDICTS.items() if verdict]
-    assert {key[0] for key in admitted} == {(1, 1), (1, 5)}
-    assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted)
+    assert {key[0] for key in admitted} == {(1, 1), (1, 5), "qmv_rows"}
+    assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers)
+               for key in admitted if key[0] != "qmv_rows")
 
 
 def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qwen4):

@@ -2728,3 +2728,30 @@ def test_generation_mode_discovers_fusion_modules_once_per_entry(monkeypatch):
         assert all(type(layer) is ResidualNormBlock for layer in root.layers)
         assert [module.training for module in root.modules()] == flags
         root.layers[1] = ResidualNormBlock(128)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@metal_only
+def test_qmv_rows_gives_each_row_its_one_row_stock_bits(bits, group_size, dtype):
+    from unsloth_zoo.mlx import matmul
+
+    K = 3 * (512 if bits in (4, 5) else 256)  # three of qmv_fast's K steps
+    # 520 and 544 outputs launch two and eight simdgroups per threadgroup.
+    for N in (520, 544):
+        w, scales, biases = _quantized(N, K, group_size, dtype, bits, seed = group_size)
+        for M in range(1, matmul.QMV_ROWS_MAX + 1):
+            # Rows differ in scale, so a row mix-up shows.
+            x = (mx.random.normal((M, K), key = mx.random.key(M)) * (1 + mx.arange(M)[:, None])).astype(dtype)
+            alone = mx.concatenate([mx.quantized_matmul(x[i:i + 1], w, scales, biases, transpose = True,
+                                                        group_size = group_size, bits = bits) for i in range(M)])
+            for inputs in (None, matmul.qmv_rows_inputs(x, bits)):
+                y = matmul.qmv_rows(x, w, scales, biases, group_size, bits, inputs)
+                assert mx.array_equal(mx.view(y, mx.uint16), mx.view(alone, mx.uint16)).item(), (N, M, inputs is None)
+    for args in ((520, 768, 64, 6, "affine"), (8, 256, 32, 8, "affine"), (520, 1024, 32, 4, "affine"),
+                 (520, 512, 128, 5, "affine")):
+        assert matmul.qmv_rows_supported(*args)
+    for args in ((516, 768, 64, 6, "affine"), (520, 640, 64, 6, "affine"), (520, 768, 64, 4, "affine"),
+                 (520, 768, 16, 6, "affine"), (520, 1024, 64, 3, "affine"), (520, 768, 64, 8, "mxfp8")):
+        assert not matmul.qmv_rows_supported(*args)
