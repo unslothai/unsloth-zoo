@@ -313,7 +313,7 @@ def test_bnb_matmul_4bit_top_level_and_signature():
 
 
 def test_bnb_functional_dequantize_4bit_present():
-    """temporary_patches/moe_grouped_modulelist.py, moe_nf4_grouped.py -- dequantize
+    """temporary_patches/moe_grouped_modulelist.py:201 -- dequantizes
     expert weights via dequantize_4bit. Rename takes out MoE-on-bnb training."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.functional.dequantize_4bit")
