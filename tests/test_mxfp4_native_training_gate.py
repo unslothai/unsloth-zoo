@@ -218,7 +218,6 @@ def test_the_fallback_adds_the_bias_before_rounding():
 
 
 def test_the_fallback_routing_weight_grad_uses_the_same_epilogue(monkeypatch):
-    # d out / d gamma is h @ W + b: 1 here, not 0 from a product rounded to bf16 before the bias.
     module, x, h, logits = _cancelling_problem()
     routing, gather, scatter, _, _ = _routing(logits)
     module.down_proj_precision_config = None

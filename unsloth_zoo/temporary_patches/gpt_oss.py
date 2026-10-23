@@ -2665,8 +2665,7 @@ _OGS_MM_OUT_DTYPE = {}
 
 
 def _ogs_mm_fp32(a, b, bias = None):
-    """``a @ b (+ bias)`` for bf16 ``a`` / ``b`` in float32: accumulated in fp32 and the bias added before any
-    rounding, as the native kernels' epilogue does (rounding the product to bf16 first can cancel it away)."""
+    """fp32 ``a @ b (+ bias)`` for bf16 inputs, bias added before any rounding like the native epilogue."""
     key = a.device.type
     if _OGS_MM_OUT_DTYPE.get(key, True):
         try:
