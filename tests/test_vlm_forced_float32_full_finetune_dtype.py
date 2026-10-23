@@ -194,3 +194,34 @@ def test_gemma4_sdpa_promotes_mixed_qkv_and_leaves_matching_dtypes_alone(monkeyp
     gemma4_flash_sliding._sdpa_maybe_flash_sliding(module, q, q, v16, None)
     gemma4_flash_sliding._sdpa_maybe_flash_sliding(module, v16, v16, v16, None)
     assert calls == [(torch.float32,) * 3, (torch.float16,) * 3]
+
+
+@requires_gemma4
+@pytest.mark.parametrize("autocast", [False, True], ids = ["no_autocast", "autocast"])
+def test_gemma4_text_attention_meets_full_finetune_weights_only_without_autocast(forced, monkeypatch, autocast):
+    # fp32 weights (full finetuning). Without autocast the fp16 norm output meets them; under autocast
+    # (fp16 forced on a bf16 GPU) the Linears cast for themselves, so the inputs stay fp16 as before.
+    monkeypatch.setattr(gemma4.Gemma4TextAttention, "forward", gemma4.Gemma4TextAttention.forward)
+    config = Gemma4TextConfig(
+        vocab_size = 32, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 2,
+        num_attention_heads = 2, num_key_value_heads = 1, head_dim = 8, global_head_dim = 8,
+        num_global_key_value_heads = 1, layer_types = ["sliding_attention", "full_attention"],
+        sliding_window = 2, vocab_size_per_layer_input = 32, hidden_size_per_layer_input = 8,
+    )
+    config._attn_implementation = "sdpa"
+    gemma4_float32_patches.patch_Gemma4TextAttention()
+    torch.manual_seed(0)
+    attention = gemma4.Gemma4TextAttention(config, 0).to(torch.float32)
+    q_seen, o_seen = _seen_dtypes(attention.q_proj), _seen_dtypes(attention.o_proj)
+    angles = torch.randn(1, 3, 8)
+    positions = torch.arange(3)
+    mask = ((positions[:, None] >= positions[None, :]) & (positions[:, None] - positions[None, :] < 2))[None, None]
+    inputs = torch.randn(1, 3, 16, dtype = torch.float16)
+    if autocast:
+        with torch.autocast("cpu", dtype = torch.float16):
+            out, _ = attention(inputs, (angles.cos(), angles.sin()), mask, shared_kv_states = {})
+        assert q_seen == [torch.float16] and o_seen == [torch.float16]
+    else:
+        out, _ = attention(inputs, (angles.cos(), angles.sin()), mask, shared_kv_states = {})
+        assert q_seen == [torch.float32] and o_seen == [torch.float32]
+    assert torch.isfinite(out).all()

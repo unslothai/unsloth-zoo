@@ -426,7 +426,8 @@ def _patch_gemma4_text_attention(module, prefix):
 
         # hidden_states is fp16 out of the forced RMSNorm, matching LoRA's fp16 projections; full
         # finetuning upcasts them to fp32 without autocast, so meet them there (identity on LoRA).
-        hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "q_proj"))
+        if not torch.is_autocast_enabled(hidden_states.device.type):
+            hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "q_proj"))
 
         # q: fp16 proj -> fp16 q_norm -> float32 -> RoPE (float32) -> (b, h, q, d)
         query_states = self.q_proj(hidden_states).view(hidden_shape)
@@ -556,7 +557,10 @@ def _patch_gemma4_text_attention(module, prefix):
         attn_output = attn_output.contiguous().reshape(*input_shape, -1)
         # fp16 for the fp16 o_proj of LoRA; full finetuning upcasts o_proj to fp32 and runs without
         # autocast, so meet it there (a weight that does not answer, 4bit, still means fp16).
-        attn_output = _to_forced_output_dtype(attn_output, _linear_boundary_dtype(self, "o_proj"))
+        if torch.is_autocast_enabled(attn_output.device.type):
+            attn_output = attn_output.to(torch.float16)
+        else:
+            attn_output = _to_forced_output_dtype(attn_output, _linear_boundary_dtype(self, "o_proj"))
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
     pass
