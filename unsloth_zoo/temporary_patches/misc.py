@@ -3852,9 +3852,7 @@ TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
 
 
 def patch_HiggsAudioV2Embeddings_autocast_dtype():
-    # Autocast runs sum() in float32, so the summed codebook embeddings reach masked_scatter as float32
-    # beside bfloat16 text embeddings and every autocast training step fails
-    # ("masked_scatter_: expected self and source to have same dtypes"), with or without Unsloth.
+    # CUDA autocast runs sum() in float32, so masked_scatter gets float32 audio beside bf16 text embeddings and raises.
     try:
         from transformers.models.higgs_audio_v2.modeling_higgs_audio_v2 import HiggsAudioV2Embeddings
     except Exception as e:
