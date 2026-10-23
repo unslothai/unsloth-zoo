@@ -10,6 +10,7 @@
 # see danielhanchen/unsloth-staging-2).
 
 import contextlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -899,6 +900,32 @@ def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monk
     monkeypatch.setattr(mx, "save_safetensors", lambda *args, **kwargs: pytest.fail("the build wrote a checkpoint"))
     assert _drafter(model) is not None
     assert loaded and all(key.startswith("mtp.") for key in loaded)
+
+
+def test_a_head_kept_under_the_language_model_of_an_mlx_conversion_is_built_with_its_per_module_quantization(qwen_mtp, tmp_path):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.speculative.drafters.mtp_split import get_model_path
+    from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import Qwen3_5MTPSplitter
+    from unsloth_zoo.mlx.speculative import MTPDrafter, has_native_mtp_head, native_mtp_drafter
+    source = get_model_path(MTP_MODEL)
+    _, head = Qwen3_5MTPSplitter().prepare(source)
+    quantization, tensors = {"group_size": 64, "bits": 4, "mode": "affine"}, {"language_model.model.norm.weight": mx.ones(8)}
+    for key, value in head.items():
+        module, bits = key.removesuffix(".weight"), 8 if ".self_attn." in key else 4
+        if value.ndim == 2 and key != "fc.weight":
+            tensors.update(zip([f"language_model.mtp.{module}.{part}" for part in ("weight", "scales", "biases")], mx.quantize(value, 64, bits)))
+            if bits == 8:
+                quantization[f"language_model.mtp.{module}"] = {"group_size": 64, "bits": 8, "mode": "affine"}
+        else:
+            tensors[f"language_model.mtp.{key}"] = value
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors, metadata = {"format": "mlx"})
+    (tmp_path / "config.json").write_text(json.dumps({**json.loads((source / "config.json").read_text()), "quantization": quantization}))
+    assert has_native_mtp_head(tmp_path) and not has_native_mtp_head(get_model_path(MODEL))
+    drafter = native_mtp_drafter(tmp_path, qwen_mtp[0])
+    built = dict(tree_flatten(drafter.model.parameters()))
+    assert type(drafter) is MTPDrafter and drafter.model.layers[0].self_attn.q_proj.bits == 8 and drafter.model.layers[0].mlp.up_proj.bits == 4
+    assert built.keys() == {key.removeprefix("language_model.mtp.") for key in tensors if ".mtp." in key}
+    assert all(mx.array_equal(built[key.removeprefix("language_model.mtp.")], value) for key, value in tensors.items() if ".mtp." in key)
 
 
 def test_a_separate_mtp_head_checkpoint_is_wrapped_as_the_built_in_head(qwen_mtp, tmp_path):
