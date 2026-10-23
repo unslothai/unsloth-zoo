@@ -51,6 +51,7 @@ import math
 import time
 import warnings
 import os
+import re
 from functools import lru_cache
 from collections.abc import Mapping
 
@@ -965,7 +966,12 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
         # way to refuse, so download through the guard and decode a local file.
         downloaded = None
         source = ele["video"]
-        scheme = source.split("://", 1)[0].lower() if "://" in source else ""
+        # ffmpeg's own rule: a leading `name:` (or `subfile,`) is a protocol, even with no `//`
+        # (`tcp:host:port`); a one-letter one is a Windows drive.
+        match = re.match(r"([A-Za-z0-9+.-]+)(?::|,)", source)
+        scheme = match.group(1).lower() if match and len(match.group(1)) > 1 else ""
+        if match and source[match.end() - 1] == "," and scheme != "subfile":
+            scheme = ""
         if scheme in ("http", "https"):
             downloaded = fetch_remote_media_to_file(source)
             ele = dict(ele)

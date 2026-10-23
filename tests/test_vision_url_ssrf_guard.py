@@ -400,7 +400,15 @@ def test_fetch_video_guards_upper_case_http_schemes(monkeypatch, no_network, url
 
 @pytest.mark.parametrize(
     "url",
-    ["rtsp://10.0.0.5/stream", "tcp://127.0.0.1:9", "ftp://10.0.0.5/clip.mp4", "smb://host/share/a.mp4"],
+    [
+        "rtsp://10.0.0.5/stream",
+        "tcp://127.0.0.1:9",
+        "ftp://10.0.0.5/clip.mp4",
+        "smb://host/share/a.mp4",
+        "tcp:127.0.0.1:9",
+        "concat:/tmp/a.mp4|/tmp/b.mp4",
+        "subfile,,start,0,end,0,,:/tmp/a.mp4",
+    ],
 )
 def test_fetch_video_refuses_other_url_schemes_before_a_decoder(monkeypatch, no_network, url):
     # ffmpeg dials these protocols itself, so they would bypass the guard.
@@ -408,6 +416,21 @@ def test_fetch_video_refuses_other_url_schemes_before_a_decoder(monkeypatch, no_
     with pytest.raises(ValueError, match = "unsupported scheme"):
         vision_utils.fetch_video({"video": url})
     assert no_network == []
+
+
+@pytest.mark.parametrize("path", ["C:\\data\\clip.mp4", "C:/data/clip.mp4", "/data/clip.mp4", "clips/a.mp4"])
+def test_fetch_video_local_paths_still_reach_the_decoder(monkeypatch, no_network, path):
+    seen = []
+
+    def decoder(ele):
+        seen.append(ele["video"])
+        raise RuntimeError("stop after the decoder is reached")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", lambda: "torchvision")
+    monkeypatch.setitem(vision_utils.VIDEO_READER_BACKENDS, "torchvision", decoder)
+    with pytest.raises(RuntimeError, match = "stop after"):
+        vision_utils.fetch_video({"video": path})
+    assert seen and seen[0] == path
 
 
 @pytest.mark.parametrize(
