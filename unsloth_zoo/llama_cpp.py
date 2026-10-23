@@ -3630,6 +3630,43 @@ def _patch_num_experts(content, eol_fallback = None):
 pass
 
 
+_CHECKPOINT_HPARAMS_MARKER = b"# UNSLOTH_CHECKPOINT_HPARAMS_APPLIED"
+_MAIN_GUARD_PATTERN = re.compile(rb"^if __name__ == (['\"])__main__\1:", re.MULTILINE)
+# transformers 5.20 reads Ling 3.x through its built-in bailing_hybrid class, whose to_dict() renames
+# the checkpoint's keys (norm_topk_prob -> moe_renormalize) and rewrites head_dim (KDA 128 -> 64), and
+# conversion/bailingmoe3.py reads the checkpoint's keys: hand it config.json, as before 5.20 (#14916).
+_CHECKPOINT_HPARAMS_BLOCK = b"""\
+# UNSLOTH_CHECKPOINT_HPARAMS_APPLIED
+_UNSLOTH_CHECKPOINT_HPARAMS_ARCHS = ("BailingMoeV3ForCausalLM", "BailingMoeV3VLForConditionalGeneration")
+def _unsloth_checkpoint_hparams(load_hparams):
+    def wrapped(dir_model, is_mistral_format = False, *args, **kwargs):
+        if not is_mistral_format:
+            try:
+                import json as _json
+                with open(os.path.join(str(dir_model), "config.json"), "r", encoding = "utf-8") as f:
+                    config = _json.load(f)
+                if set(config.get("architectures") or ()) & set(_UNSLOTH_CHECKPOINT_HPARAMS_ARCHS):
+                    return config
+            except Exception:
+                pass
+        return load_hparams(dir_model, is_mistral_format, *args, **kwargs)
+    return wrapped
+ModelBase.load_hparams = staticmethod(_unsloth_checkpoint_hparams(ModelBase.load_hparams))
+
+"""
+
+
+def _patch_checkpoint_hparams(content):
+    """Insert _CHECKPOINT_HPARAMS_BLOCK before the entrypoint's `if __name__ == "__main__":`.
+    Returns (new_content, status): 'applied' / 'already-applied' / 'pattern-missing'."""
+    if _CHECKPOINT_HPARAMS_MARKER in content: return content, "already-applied"
+    match = _MAIN_GUARD_PATTERN.search(content)
+    if match is None: return content, "pattern-missing"
+    block = _CHECKPOINT_HPARAMS_BLOCK.replace(b"\n", _dominant_newline(content))
+    return content[:match.start()] + block + content[match.start():], "applied"
+pass
+
+
 def _patched_content_parses(content):
     """True iff the patched converter is still syntactically valid Python.
 
@@ -4631,6 +4668,16 @@ def _download_convert_hf_to_gguf_cached(
             logger.error(f"Unsloth: Error applying Qwen2MoE num_experts patch: {e}", exc_info=True)
             raise
         _patch_stages.append(("Qwen2MoE num_experts alias", patched_content))
+
+        # Patch 4: architectures whose converter reads the checkpoint's own config.json keys.
+        try:
+            patched_content, _hparams_status = _patch_checkpoint_hparams(patched_content)
+            if _hparams_status == "pattern-missing":
+                logger.warning("Unsloth: checkpoint hparams patch target `if __name__ == '__main__':` not found.")
+        except Exception as e:
+            logger.error(f"Unsloth: Error applying checkpoint hparams patch: {e}", exc_info=True)
+            raise
+        _patch_stages.append(("checkpoint hparams", patched_content))
 
 
         # 4. Write Patched File
