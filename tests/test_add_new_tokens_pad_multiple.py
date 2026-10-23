@@ -579,3 +579,53 @@ def test_merged_export_tolerates_an_ambiguous_text_config():
     plain_base, plain = Ambiguous(text_config = SimpleNamespace()), Ambiguous(text_config = SimpleNamespace())
     _carry_over_vocab_pad_records(plain_base, plain)
     assert not hasattr(plain_base.text_config, "unsloth_vocab_pad_ids")
+
+
+def test_merged_export_drops_pad_records_training_released(monkeypatch, tmp_path):
+    # Training fills every pad row, so the saved base config's records are stale.
+    from transformers import AutoConfig
+    from unsloth_zoo.saving_utils import _carry_over_vocab_size
+    from unsloth_zoo.vllm_utils import _padded_vocab_ids
+    monkeypatch.delenv("UNSLOTH_VOCAB_PAD_MULTIPLE", raising = False)
+    model, tokenizer = _load()
+    add_new_tokens(model, tokenizer, new_tokens = ["<unsloth_a>"], pad_to_multiple_of = 64)
+    n1, padded = len(tokenizer), model.get_input_embeddings().weight.shape[0]
+    assert model.config.unsloth_vocab_pad_ids == list(range(n1, padded))
+    model.save_pretrained(tmp_path / "base")
+    tokenizer.save_pretrained(tmp_path / "base")
+
+    model = AutoModelForCausalLM.from_pretrained(tmp_path / "base", torch_dtype = torch.float32)
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path / "base")
+    add_new_tokens(model, tokenizer, new_tokens = [f"<unsloth_b{i}>" for i in range(padded - n1)])
+    assert len(tokenizer) == padded
+    assert not hasattr(model.config, "unsloth_vocab_pad_ids")
+    assert not hasattr(model.config, "unsloth_vocab_pad_suppressed_ids")
+
+    base_config = AutoConfig.from_pretrained(tmp_path / "base")
+    assert base_config.unsloth_vocab_pad_ids == list(range(n1, padded))
+    _carry_over_vocab_size(base_config, model.config)
+    assert base_config.vocab_size == padded
+    assert _padded_vocab_ids(base_config) == []
+    assert not hasattr(base_config, "unsloth_vocab_pad_ids")
+    assert not hasattr(base_config, "unsloth_vocab_pad_suppressed_ids")
+    assert "unsloth_vocab_pad_ids" not in base_config.to_dict()
+
+
+def test_merged_export_keeps_an_empty_ownership_list():
+    # An explicit [] is a record and must replace the base's stale list.
+    from transformers import LlamaConfig
+    from unsloth_zoo.saving_utils import _carry_over_vocab_pad_records
+    base = LlamaConfig(vocab_size = 128)
+    base.unsloth_vocab_pad_ids = list(range(101, 128))
+    base.unsloth_vocab_pad_suppressed_ids = list(range(101, 127))
+    trained = LlamaConfig(vocab_size = 128)
+    trained.unsloth_vocab_pad_ids = [127]
+    trained.unsloth_vocab_pad_suppressed_ids = []
+    _carry_over_vocab_pad_records(base, trained)
+    assert base.unsloth_vocab_pad_ids == [127]
+    assert base.unsloth_vocab_pad_suppressed_ids == []
+    base.unsloth_vocab_pad_suppressed_ids = [101]
+    del trained.unsloth_vocab_pad_suppressed_ids
+    _carry_over_vocab_pad_records(base, trained)
+    assert base.unsloth_vocab_pad_ids == [127]
+    assert not hasattr(base, "unsloth_vocab_pad_suppressed_ids")
