@@ -109,12 +109,14 @@ def test_preference_logps_explain_zero_breaks():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("head_grad", [True, False])
-def test_preference_logps_matches_autograd_function_path(dtype, head_grad):
+def test_preference_logps_matches_autograd_function_path(dtype, head_grad, monkeypatch):
     # The custom op wraps the same compaction and chunk loops: bitwise equal to the
     # autograd.Function path, including the vocab sliced backward of a trainable half head.
     legacy = getattr(preference, "_fused_linear_token_logps_function", None)
     if legacy is None:
         pytest.skip("no custom op path")
+    # Both are the fallback behind the fused linear kernel.
+    monkeypatch.setattr(preference, "_FUSED_LINEAR", False)
     def old(states, weight, labels, mask):
         out = legacy(states, weight, None, labels, mask, 0.0, 0.0, 0.0, 3, True, True)
         return out["per_token_logps"], out["mean_logits"], out["log_sum_sq_probs"]

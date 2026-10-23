@@ -497,6 +497,11 @@ def fused_linear_token_logps(
     The selection and chunk loop run inside one custom op, so ``torch.compile`` (``fullgraph``,
     ``dynamic``) sees a single node whose outputs are sized by ``mask``'s shape, not its count.
     """
+    if _use_fused_linear(lm_head_weight):
+        return _fused_linear_engine_logps(
+            hidden_states, lm_head_weight, lm_head_bias, labels, mask, logit_scale_multiply,
+            logit_scale_divide, logit_softcapping, chunk_size, return_mean_logits, return_log_sum_sq_probs,
+        )
     if not _HAS_CUSTOM_OP:
         return _fused_linear_token_logps_function(
             hidden_states, lm_head_weight, lm_head_bias, labels, mask, logit_scale_multiply,
@@ -524,6 +529,30 @@ def fused_linear_token_logps(
     return output
 
 
+def _fused_linear_engine_logps(
+    hidden_states, lm_head_weight, lm_head_bias, labels, mask, logit_scale_multiply,
+    logit_scale_divide, logit_softcapping, chunk_size, return_mean_logits, return_log_sum_sq_probs,
+):
+    from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
+
+    outs = fused_linear_logprobs(
+        hidden_states, lm_head_weight, labels.to(hidden_states.device), bias = lm_head_bias,
+        mask = mask.to(device = hidden_states.device, dtype = torch.bool),
+        logit_scale_multiply = float(logit_scale_multiply), logit_scale_divide = float(logit_scale_divide),
+        logit_softcapping = float(logit_softcapping), return_mean_logits = bool(return_mean_logits),
+        return_log_sum_sq_probs = bool(return_log_sum_sq_probs),
+        rows_per_chunk = chunk_size if chunk_size is not None and chunk_size > 0 else None,
+    )
+    outs = outs if isinstance(outs, tuple) else (outs,)
+    output = {"per_token_logps": outs[0]}
+    extra = iter(outs[1:])
+    if return_mean_logits:
+        output["mean_logits"] = next(extra)
+    if return_log_sum_sq_probs:
+        output["log_sum_sq_probs"] = next(extra)
+    return output
+
+
 def _fused_linear_token_logps_function(
     hidden_states, lm_head_weight, lm_head_bias, labels, mask, logit_scale_multiply,
     logit_scale_divide, logit_softcapping, chunk_size, return_mean_logits, return_log_sum_sq_probs,
@@ -531,24 +560,6 @@ def _fused_linear_token_logps_function(
     # torch without torch.library.custom_op: the autograd.Function path (eager only).
     mask = mask.to(device = hidden_states.device, dtype = torch.bool)
     labels = labels.to(hidden_states.device)
-    if _use_fused_linear(lm_head_weight):
-        from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
-
-        outs = fused_linear_logprobs(
-            hidden_states, lm_head_weight, labels, bias = lm_head_bias, mask = mask,
-            logit_scale_multiply = float(logit_scale_multiply), logit_scale_divide = float(logit_scale_divide),
-            logit_softcapping = float(logit_softcapping), return_mean_logits = bool(return_mean_logits),
-            return_log_sum_sq_probs = bool(return_log_sum_sq_probs),
-            rows_per_chunk = chunk_size if chunk_size is not None and chunk_size > 0 else None,
-        )
-        outs = outs if isinstance(outs, tuple) else (outs,)
-        output = {"per_token_logps": outs[0]}
-        extra = iter(outs[1:])
-        if return_mean_logits:
-            output["mean_logits"] = next(extra)
-        if return_log_sum_sq_probs:
-            output["log_sum_sq_probs"] = next(extra)
-        return output
     selected_hidden = hidden_states[mask]
     selected_labels = labels[mask]
     rows = _rows_per_chunk(selected_hidden.shape[0], lm_head_weight.shape[0], chunk_size)
