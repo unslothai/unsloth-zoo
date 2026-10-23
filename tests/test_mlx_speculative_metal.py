@@ -583,16 +583,31 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, q
             assert inference.first_use_work() == work and set(launched) == warmed
     assert len(warmed) == 1
     # A build the runtime rejects leaves warm-up to the native ops: one attempt per shape, no verdicts.
-    builds = []
+    builds, errors = [], [RuntimeError("[metal::Device] Unable to build metal library from source")]
 
     def rejected(*args):
         builds.append(args)
-        raise RuntimeError("[metal::Device] Unable to build metal library from source")
+        raise errors[-1]
     with monkeypatch.context() as patch:
         patch.setattr(inference, "_verify_gdn_block", rejected)
         patch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
         inference.warm_inference(model)
         assert len(builds) == 1 and not inference._VERIFY_GDN_VERDICTS
+        # A block evaluated inside a function transformation or under memory pressure is checked on a later one; a
+        # rejected build is not retried.
+        block = lambda: _verified(model.language_model, cache, mx.array([ids[0][24 : 27]]), 0)
+        with inference.exact_speculative_verify(model):
+            for later in (ValueError("[eval] Attempting to eval an array during function transformations"),
+                          RuntimeError("[malloc] Unable to allocate 1048576 bytes.")):
+                errors.append(later)
+                tried = len(builds)
+                block()
+                assert len(builds) > tried + 1 and not inference._VERIFY_GDN_VERDICTS  # each layer tried
+                errors.pop()
+            tried = len(builds)
+            block()
+            block()
+        assert len(builds) == tried + 1 and list(inference._VERIFY_GDN_VERDICTS.values()) == [False]
     # A CPU load verifies on the native ops, so it builds nothing.
     launched.clear()
     device = mx.default_device()

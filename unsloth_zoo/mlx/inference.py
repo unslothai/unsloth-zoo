@@ -5165,7 +5165,10 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
                     x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
                     for x, y in zip(fused(initial), (output, state, q, k, v))))
             except (RuntimeError, ValueError) as error:
-                _unless_failed_buffer(error)  # inside a function transformation, which cannot evaluate; checked later
+                _unless_failed_buffer(error)
+                # A build Metal rejects stays rejected; a function transformation or memory pressure is checked later.
+                if str(error).startswith("[metal::Device] Unable to "):
+                    _VERIFY_GDN_VERDICTS[key] = False
             else:
                 _VERIFY_GDN_VERDICTS[key] = verdict and tape_key
                 if taped and not verdict:
