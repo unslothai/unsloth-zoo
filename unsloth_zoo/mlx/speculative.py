@@ -350,12 +350,13 @@ class DraftController:
         return max(anchor[1] + slope * (key - anchor[0]), 1e-9)
 
     def _measured(self, table: dict[int, _Ema]) -> list[tuple[int, float]]:
-        points = [(key, ema.value, ema.count > 1) for key, ema in sorted(table.items()) if ema.value is not None]
-        confirmed = [(key, value) for key, value, sure in points if sure]
-        if not confirmed:
-            return [(key, value) for key, value, _ in points]
+        points = [(key, ema.value) for key, ema in sorted(table.items()) if ema.value is not None]
+        once = {key for key, ema in table.items() if ema.value is not None and ema.count < 2}
+        if not once or len(once) == len(points):
+            return points
         # A key timed once may have paid one-off work: it counts no more than its confirmed neighbours predict.
-        return [(key, value if sure else min(value, self._extrapolate(confirmed, key, 0.0))) for key, value, sure in points]
+        confirmed = [point for point in points if point[0] not in once]
+        return [(key, min(value, self._extrapolate(confirmed, key, 0.0)) if key in once else value) for key, value in points]
 
     def _verify_seconds(self, bucket: int, width: int) -> float:
         step = self._plain_step(bucket)
