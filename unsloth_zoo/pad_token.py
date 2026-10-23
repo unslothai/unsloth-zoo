@@ -27,6 +27,8 @@ pad_token=<|vision_pad|>, which is fine. The old NaN reports (unsloth#3155, #410
 were a masking artifact (collators set labels=-100 on pad), not a pad-identity bug.
 """
 
+import contextlib
+
 __all__ = [
     "POSSIBLE_RESERVED_TOKENS",
     "VISION_RESERVED_TOKENS",
@@ -418,7 +420,17 @@ def fix_pad_token(
                 if model.get_input_embeddings().weight.shape[0] < len(inner):
                     from .tokenizer_utils import _vocab_pad_multiple, _round_up_vocab, _suppress_padded_rows
                     target = _round_up_vocab(len(inner), _vocab_pad_multiple())
-                    model.resize_token_embeddings(target)
+                    # patch_tokenizer runs under inference_mode: rows built there are inference
+                    # tensors, which autograd refuses to save and Dynamo cannot fake (Moonshine).
+                    try:
+                        import torch
+                        no_inference = (torch.inference_mode(False), torch.no_grad())
+                    except ImportError:
+                        no_inference = ()
+                    with contextlib.ExitStack() as stack:
+                        for ctx in no_inference:
+                            stack.enter_context(ctx)
+                        model.resize_token_embeddings(target)
                     _suppress_padded_rows(model, len(inner), target)
             except Exception:
                 pass
