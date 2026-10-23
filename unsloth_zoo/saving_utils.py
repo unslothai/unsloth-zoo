@@ -4234,6 +4234,64 @@ def _check_disk_for_previous_export_refresh(save_directory, new_sizes):
 pass
 
 
+_PREVIOUS_EXPORT_PREFIX = ".unsloth-previous-"
+
+
+def _keep_previous_export_shards(filenames, save_directory, new_sizes):
+    """Hard-link each previous export shard aside so a failed refresh can put it back.
+
+    Every writer stages the new shard and renames it over the old entry, so the link keeps
+    the old shard's data and costs nothing until then. Kept only when the disk can hold
+    every new shard beside the old ones, and only for all shards or none: a partial rollback
+    would still leave a mixed export. Returns {shard path: backup path}.
+    """
+    try:
+        if shutil.disk_usage(save_directory).free < sum(new_sizes.values()) + _REFRESH_DISK_MARGIN:
+            return {}
+    except OSError:
+        return {}
+    kept = {}
+    try:
+        for filename in filenames:
+            file_path = os.path.join(save_directory, filename)
+            if os.path.islink(file_path) or not os.path.isfile(file_path):
+                raise OSError(f"{file_path} is not a regular file")
+            backup_path = os.path.join(
+                os.path.dirname(file_path), _PREVIOUS_EXPORT_PREFIX + os.path.basename(file_path),
+            )
+            if os.path.lexists(backup_path):
+                os.remove(backup_path)
+            os.link(file_path, backup_path)
+            kept[file_path] = backup_path
+    except OSError:
+        _drop_previous_export_shards(kept)
+    return kept
+pass
+
+
+def _restore_previous_export_shards(kept):
+    for file_path, backup_path in kept.items():
+        if not os.path.lexists(backup_path):
+            continue
+        if os.path.lexists(file_path) and os.path.samefile(file_path, backup_path):
+            # Not replaced yet; renaming a hard link over itself would leave the backup behind.
+            os.remove(backup_path)
+        else:
+            os.replace(backup_path, file_path)
+    kept.clear()
+pass
+
+
+def _drop_previous_export_shards(kept):
+    for backup_path in kept.values():
+        try:
+            os.remove(backup_path)
+        except OSError:
+            pass
+    kept.clear()
+pass
+
+
 def _resolve_hub_commit(repo_id, token):
     # One commit for every file an export fetches, so a push to the repo mid-export cannot mix
     # shards from two commits. Offline or unreachable gives None: unpinned, as before.
@@ -5252,6 +5310,7 @@ def merge_and_overwrite_lora(
     pass
 
     _stale_shards = set()
+    _new_sizes = {}
     if save_method not in ("merged_4bit", "forced_merged_4bit"):
         # Before the tokenizer, config and index writes below, so a refused refresh changes nothing.
         # Only shard entries decide it, and none of those writes touches a shard.
@@ -5495,6 +5554,11 @@ def merge_and_overwrite_lora(
     pass
 
     _replaced_shards = []
+    # Outside low disk mode a failed refresh puts the previous export back instead of leaving
+    # some shards on the base weights and the rest still merged, when the disk can hold both.
+    _previous_export = _keep_previous_export_shards(
+        sorted(_stale_shards), save_directory, _new_sizes,
+    ) if _stale_shards and not low_disk_space_usage else {}
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
         if not is_local_path and _hf_cache_dir is not None:
@@ -5614,12 +5678,20 @@ def merge_and_overwrite_lora(
             final_safetensors_list.extend(resulting_files)
         pass
     except BaseException:
+        if _previous_export:
+            try:
+                _restore_previous_export_shards(_previous_export)
+                _replaced_shards = []
+                print(f"Unsloth: Warning: the export in {save_directory} failed; the previous shards were restored.")
+            except OSError as restore_error:
+                print(f"Unsloth: Warning: could not restore the previous export in {save_directory}: {restore_error}")
         if _replaced_shards:
             print(
                 f"Unsloth: Warning: the export in {save_directory} is incomplete. These shards "
                 f"already hold the base weights: {', '.join(dict.fromkeys(_replaced_shards))}. Re-run the export."
             )
         raise
+    _drop_previous_export_shards(_previous_export)
 
     if low_disk_space_usage and not is_local_path and not copied_all_from_cache:
         tokenizer_model_path = os.path.join(save_directory, "tokenizer.model")

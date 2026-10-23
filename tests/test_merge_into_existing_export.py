@@ -179,16 +179,33 @@ def test_failed_first_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low
     assert [k for k in expected if not torch.equal(again[k], expected[k])] == []
 
 
-@pytest.mark.parametrize("low_disk", [False, True])
-def test_failed_later_hub_fetch_keeps_unfetched_shards(tmp_path, monkeypatch, low_disk):
-    # Shards are replaced one at a time (no second copy of the checkpoint), so a network
+def _short_disk_for_backups(monkeypatch, base):
+    # Room for the per-shard refresh (the largest shard plus the margin) but not for keeping
+    # every previous shard beside the new ones.
+    from unsloth_zoo import saving_utils as S
+
+    sizes = [os.path.getsize(os.path.join(base, f)) for f in _shards(base)]
+    assert len(sizes) > 2
+    free = S._REFRESH_DISK_MARGIN + 2 * max(sizes)
+    assert free < S._REFRESH_DISK_MARGIN + sum(sizes)
+    disk = S.shutil.disk_usage(base)
+    monkeypatch.setattr(S.shutil, "disk_usage", lambda _: type(disk)(disk.total, disk.total - free, free))
+
+
+@pytest.mark.parametrize("mode", ["low_disk", "short_disk"])
+def test_failed_later_hub_fetch_keeps_unfetched_shards(tmp_path, monkeypatch, mode):
+    # In low disk mode, or when the disk cannot hold the previous shards beside the new ones,
+    # shards are replaced one at a time (no second copy of the checkpoint), so a network
     # failure part way only loses the shards already refreshed, and says so.
+    low_disk = mode == "low_disk"
     base, peft_model = _build(tmp_path, "20KB")
     out = str(tmp_path / "out")
     _fake_hub(monkeypatch, base, fail = False)
     H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
     before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
 
+    if mode == "short_disk":
+        _short_disk_for_backups(monkeypatch, base)
     _fake_hub(monkeypatch, base, fail = 1)
     with pytest.raises(OSError, match = "simulated"):
         H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
@@ -202,6 +219,32 @@ def test_failed_later_hub_fetch_keeps_unfetched_shards(tmp_path, monkeypatch, lo
     _fake_hub(monkeypatch, base, fail = False)
     H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
     assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+
+
+def test_failed_later_hub_fetch_restores_previous_export(tmp_path, monkeypatch):
+    # Outside low disk mode, with room for both, a failure part way puts every previous
+    # shard back instead of leaving some on the base weights and the rest still merged.
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
+    assert len(before) > 2
+
+    _fake_hub(monkeypatch, base, fail = 1)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    assert len(_fake_hub.fetched) == 1
+    # The refetched shard held merged weights, so keeping it is a real rollback.
+    replaced = _fake_hub.fetched[0]
+    assert open(os.path.join(base, replaced), "rb").read() != before[replaced]
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+    assert _no_staging_left(out)
+
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+    assert _no_staging_left(out)
 
 
 def _dir_bytes(directory):
@@ -225,6 +268,9 @@ def test_reexport_keeps_no_second_copy_of_the_checkpoint(tmp_path, monkeypatch, 
     expected = H.read_safetensors_dir(out)
     size_before = _dir_bytes(out)
     largest = max(os.path.getsize(os.path.join(base, f)) for f in _shards(base))
+    if not low_disk:
+        # With room to spare the previous shards are kept for a rollback; without it, never.
+        _short_disk_for_backups(monkeypatch, base)
 
     peak = [0]
     if source == "local":
@@ -297,7 +343,8 @@ def test_reexport_with_longest_valid_shard_name(tmp_path):
     assert long_name in _shards(out) and _no_staging_left(out)
 
 
-def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch):
+@pytest.mark.parametrize("short_disk", [True, False])
+def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch, short_disk):
     from unsloth_zoo import saving_utils as S
 
     base, peft_model = _build(tmp_path, "20KB")
@@ -305,6 +352,8 @@ def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch):
     H.run_merge(peft_model, base, out, save_dtype = torch.float32)
     before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
     assert len(before) > 2
+    if short_disk:
+        _short_disk_for_backups(monkeypatch, base)
 
     real_copy, copied = S._copy_file_from_source, []
     def _copy_then_fail(src, target_dir, filename):
@@ -319,7 +368,8 @@ def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch):
     assert len(copied) == 1 and _shards(out) == sorted(before)
     for f in before:
         now = open(os.path.join(out, f), "rb").read()
-        assert now == (open(os.path.join(base, f), "rb").read() if f in copied else before[f]), f
+        # Restored when the disk could hold the previous shards, else only the copied one is lost.
+        assert now == (open(os.path.join(base, f), "rb").read() if short_disk and f in copied else before[f]), f
     assert _no_staging_left(out)
 
 
