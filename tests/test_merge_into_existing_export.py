@@ -583,3 +583,59 @@ def test_shard_link_to_the_local_base_shard_is_copied_once(tmp_path, monkeypatch
     assert open(os.path.join(base, "model.safetensors"), "rb").read() == base_before
     got = H.read_safetensors_dir(str(out))
     assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
+
+
+def test_failed_hub_fetch_restores_previous_export_metadata(tmp_path, monkeypatch):
+    # The refresh rewrites config.json and the index before the shard fetch; a rollback of the
+    # shards alone would pair the previous shards with the new metadata.
+    import json
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    for name in ("config.json", "model.safetensors.index.json"):
+        path = os.path.join(out, name)
+        with open(path) as f:
+            data = json.load(f)
+        data["previous_export_marker"] = name
+        with open(path, "w") as f:
+            json.dump(data, f)
+    before = {
+        f : open(os.path.join(out, f), "rb").read() for f in os.listdir(out)
+        if os.path.isfile(os.path.join(out, f))
+    }
+
+    _fake_hub(monkeypatch, base, fail = 1)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    after = {
+        f : open(os.path.join(out, f), "rb").read() for f in os.listdir(out)
+        if os.path.isfile(os.path.join(out, f))
+    }
+    assert sorted(after) == sorted(before)
+    assert [f for f in before if after[f] != before[f]] == []
+    assert _no_staging_left(out)
+
+
+def test_previous_export_backup_names_cannot_collide_with_shards(tmp_path):
+    from unsloth_zoo import saving_utils as S
+
+    out = tmp_path / "out"
+    out.mkdir()
+    names = ["foo.safetensors", S._PREVIOUS_EXPORT_PREFIX + "foo.safetensors"]
+    for name in names:
+        (out / name).write_bytes(name.encode())
+    kept = S._keep_previous_export_shards(sorted(names), str(out), {n : 1 for n in names})
+    assert kept
+    for name in names:
+        assert (out / name).read_bytes() == name.encode()
+    S._restore_previous_export_shards(kept)
+    assert sorted(os.listdir(out)) == sorted(names)
+    for name in names:
+        assert (out / name).read_bytes() == name.encode()
+    kept = S._keep_previous_export_shards(sorted(names), str(out), {n : 1 for n in names})
+    S._drop_previous_export_shards(kept)
+    assert sorted(os.listdir(out)) == sorted(names)
+    for name in names:
+        assert (out / name).read_bytes() == name.encode()

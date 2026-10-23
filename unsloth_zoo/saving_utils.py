@@ -4235,34 +4235,61 @@ pass
 
 
 _PREVIOUS_EXPORT_PREFIX = ".unsloth-previous-"
+_PREVIOUS_EXPORT_METADATA_MAX = 64 * 1024 * 1024
 
 
-def _keep_previous_export_shards(filenames, save_directory, new_sizes):
+def _snapshot_previous_export_metadata(save_directory):
+    """Read the previous export's top level metadata before the refresh rewrites it.
+
+    config.json, the index, the tokenizer and generation config are rewritten before any shard
+    is fetched, so a rollback of the shards alone would pair them with the new metadata.
+    Returns {path: bytes}; None when a file cannot be read, so no rollback is attempted.
+    """
+    metadata = {}
+    try:
+        for name in os.listdir(save_directory):
+            path = os.path.join(save_directory, name)
+            if name.endswith(".safetensors") or name.startswith(_PREVIOUS_EXPORT_PREFIX):
+                continue
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            if os.path.getsize(path) > _PREVIOUS_EXPORT_METADATA_MAX:
+                return None
+            with open(path, "rb") as f:
+                metadata[path] = f.read()
+    except OSError:
+        return None
+    return metadata
+pass
+
+
+def _keep_previous_export_shards(filenames, save_directory, new_sizes, metadata = {}):
     """Hard-link each previous export shard aside so a failed refresh can put it back.
 
     Every writer stages the new shard and renames it over the old entry, so the link keeps
     the old shard's data and costs nothing until then. Kept only when the disk can hold
     every new shard beside the old ones, and only for all shards or none: a partial rollback
-    would still leave a mixed export. Returns {shard path: backup path}.
+    would still leave a mixed export. The links go in a private directory under numbered
+    names, so no shard name can collide with a backup. `metadata` is the snapshot taken
+    before the refresh rewrote it, restored with the shards; None (unreadable) keeps nothing.
     """
+    if metadata is None:
+        return {}
     try:
         if shutil.disk_usage(save_directory).free < sum(new_sizes.values()) + _REFRESH_DISK_MARGIN:
             return {}
+        backup_dir = tempfile.mkdtemp(prefix = _PREVIOUS_EXPORT_PREFIX, dir = save_directory)
     except OSError:
         return {}
-    kept = {}
+    kept = {"dir" : backup_dir, "shards" : {}, "metadata" : metadata}
     try:
-        for filename in filenames:
+        for i, filename in enumerate(filenames):
             file_path = os.path.join(save_directory, filename)
             if os.path.islink(file_path) or not os.path.isfile(file_path):
                 raise OSError(f"{file_path} is not a regular file")
-            backup_path = os.path.join(
-                os.path.dirname(file_path), _PREVIOUS_EXPORT_PREFIX + os.path.basename(file_path),
-            )
-            if os.path.lexists(backup_path):
-                os.remove(backup_path)
+            backup_path = os.path.join(backup_dir, str(i))
             os.link(file_path, backup_path)
-            kept[file_path] = backup_path
+            kept["shards"][file_path] = backup_path
     except OSError:
         _drop_previous_export_shards(kept)
     return kept
@@ -4270,24 +4297,33 @@ pass
 
 
 def _restore_previous_export_shards(kept):
-    for file_path, backup_path in kept.items():
+    for file_path, backup_path in kept["shards"].items():
         if not os.path.lexists(backup_path):
             continue
         if os.path.lexists(file_path) and os.path.samefile(file_path, backup_path):
-            # Not replaced yet; renaming a hard link over itself would leave the backup behind.
-            os.remove(backup_path)
-        else:
-            os.replace(backup_path, file_path)
-    kept.clear()
+            continue
+        os.replace(backup_path, file_path)
+    save_directory = os.path.dirname(kept["dir"])
+    metadata = kept["metadata"]
+    for name in os.listdir(save_directory):
+        path = os.path.join(save_directory, name)
+        # Metadata the refresh added beside the previous export goes with it.
+        if path not in metadata and not name.endswith(".safetensors") and \
+                not name.startswith(_PREVIOUS_EXPORT_PREFIX) and \
+                (os.path.islink(path) or os.path.isfile(path)):
+            os.remove(path)
+    for path, payload in metadata.items():
+        staged = path + ".unsloth-restore"
+        with open(staged, "wb") as f:
+            f.write(payload)
+        os.replace(staged, path)
+    _drop_previous_export_shards(kept)
 pass
 
 
 def _drop_previous_export_shards(kept):
-    for backup_path in kept.values():
-        try:
-            os.remove(backup_path)
-        except OSError:
-            pass
+    if kept:
+        shutil.rmtree(kept["dir"], ignore_errors = True)
     kept.clear()
 pass
 
@@ -5311,6 +5347,7 @@ def merge_and_overwrite_lora(
 
     _stale_shards = set()
     _new_sizes = {}
+    _previous_metadata = None
     if save_method not in ("merged_4bit", "forced_merged_4bit"):
         # Before the tokenizer, config and index writes below, so a refused refresh changes nothing.
         # Only shard entries decide it, and none of those writes touches a shard.
@@ -5334,6 +5371,9 @@ def merge_and_overwrite_lora(
                     f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
                 }
             _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
+            if not low_disk_space_usage:
+                # Before the tokenizer, config and index writes below, which a rollback undoes too.
+                _previous_metadata = _snapshot_previous_export_metadata(save_directory)
         pass
 
     # Save config / generation_config via no state_dict and tokenizer
@@ -5557,7 +5597,7 @@ def merge_and_overwrite_lora(
     # Outside low disk mode a failed refresh puts the previous export back instead of leaving
     # some shards on the base weights and the rest still merged, when the disk can hold both.
     _previous_export = _keep_previous_export_shards(
-        sorted(_stale_shards), save_directory, _new_sizes,
+        sorted(_stale_shards), save_directory, _new_sizes, _previous_metadata,
     ) if _stale_shards and not low_disk_space_usage else {}
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
@@ -5682,7 +5722,7 @@ def merge_and_overwrite_lora(
             try:
                 _restore_previous_export_shards(_previous_export)
                 _replaced_shards = []
-                print(f"Unsloth: Warning: the export in {save_directory} failed; the previous shards were restored.")
+                print(f"Unsloth: Warning: the export in {save_directory} failed; the previous export was restored.")
             except OSError as restore_error:
                 print(f"Unsloth: Warning: could not restore the previous export in {save_directory}: {restore_error}")
         if _replaced_shards:
