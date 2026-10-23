@@ -487,6 +487,145 @@ def _outside_compiled_region(root, embeddings):
 pass
 
 
+def _frozen_frontend(module):
+    """The frozen child whose output starts a tower's checkpointed layer loop, else None.
+
+    Matches `h = self.<child>(<first input>, ...)` ahead of `for layer in self.<ModuleList>:` with
+    `layer(h, ...)`, every later assignment to `h` reading `h`. Flipping that output, not the raw
+    audio input, keeps autograd out of the frozen front end (Parakeet / Canary conv subsampling): the
+    same adapter gradients without its activations and input gradients."""
+    import ast, textwrap
+    forward = getattr(type(module), "forward", None)
+    if forward is None or hasattr(forward, "_torchdynamo_orig_callable"):
+        return None
+    if type(module).__module__.startswith("unsloth_compiled_module"):
+        return None
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(forward)))
+    except Exception:
+        return None
+    fn = next((n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if fn is None or len(fn.args.args) < 2:
+        return None
+    first_input = fn.args.args[1].arg
+    # Audio front ends only: a vision patch embedding is one cheap conv, not worth widening the change.
+    if first_input not in ("input_features", "input_values", "audio_mel", "audio_values"):
+        return None
+
+    def self_attr(node):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+            return node.attr
+        return None
+
+    loop_index = None
+    for i, stmt in enumerate(fn.body):
+        if isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
+            it = stmt.iter
+            name = self_attr(it)
+            if isinstance(getattr(module, name or "", None), torch.nn.ModuleList):
+                loop_index = i
+                break
+    if loop_index is None:
+        return None
+    loop = fn.body[loop_index]
+    hidden = child = None
+    for stmt in fn.body[:loop_index]:
+        if (child is None and isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name) and isinstance(stmt.value, ast.Call)
+                and self_attr(stmt.value.func) and stmt.value.args
+                and isinstance(stmt.value.args[0], ast.Name) and stmt.value.args[0].id == first_input):
+            hidden, child = stmt.targets[0].id, self_attr(stmt.value.func)
+            continue
+        for node in ast.walk(stmt):
+            targets = node.targets if isinstance(node, ast.Assign) else \
+                [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else []
+            for target in targets:
+                stores = {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+                if hidden is None or hidden not in stores:
+                    continue
+                value = getattr(node, "value", None)
+                metadata = {
+                    id(n.value) for n in ast.walk(value) if isinstance(n, ast.Attribute)
+                    and n.attr in ("shape", "size", "dtype", "device", "ndim")
+                } if value is not None else set()
+                reads = value is not None and any(
+                    isinstance(n, ast.Name) and n.id == hidden and id(n) not in metadata for n in ast.walk(value)
+                )
+                detaches = value is not None and any(
+                    isinstance(n, ast.Attribute) and n.attr in ("detach", "data", "detach_") for n in ast.walk(value)
+                )
+                if not isinstance(target, ast.Name) or not (reads or isinstance(node, ast.AugAssign)) or detaches:
+                    return None
+    if child is None:
+        return None
+    layer = loop.target.id
+    feeds = any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == layer
+        and n.args and isinstance(n.args[0], ast.Name) and n.args[0].id == hidden
+        for n in ast.walk(loop)
+    )
+    frontend = getattr(module, child, None)
+    if not feeds or not isinstance(frontend, torch.nn.Module):
+        return None
+    params = list(frontend.parameters())
+    if not params or any(p.requires_grad for p in params):
+        return None
+    return frontend
+pass
+
+
+def _freeze_unused_feature_encoders(model):
+    """wav2vec2-style feature encoders (`_requires_grad`, `_freeze_parameters`) flag their input as
+    requiring grad unless frozen, so a frozen conv stack still runs its whole backward. Mark the ones
+    LoRA left frozen as frozen, as `freeze_feature_encoder()` does."""
+    for module in model.modules():
+        if getattr(module, "_requires_grad", None) is not True or not callable(getattr(module, "_freeze_parameters", None)):
+            continue
+        params = list(module.parameters())
+        if params and not any(p.requires_grad for p in params):
+            module._requires_grad = False
+pass
+
+
+def _subsampling_input_to_16bit(module, args, kwargs):
+    """Pre-hook for the FastConformer subsampling (Parakeet, Canary): float32 features to 16 bit.
+
+    Unsloth's conv dtype wrapper casts a conv's input to its weight dtype and the result back to the
+    input's dtype, so float32 input_features kept the frozen conv stack in float32: twice autocast's
+    activation memory. Casting up front is bit identical: every conv already ran in the 16-bit weight
+    dtype, the ReLUs and 0/1 masks between them are exact, and autocast feeds the closing 16-bit Linear
+    the same values. A quantized closing Linear (QLoRA) computes in its input's dtype, so it is skipped.
+    A hook, not a forward patch, so the compiler's view of the forward is unchanged."""
+    layers = getattr(module, "layers", None)
+    weight = getattr(layers[0], "weight", None) if layers is not None and len(layers) else None
+    linear_weight = getattr(getattr(module, "linear", None), "weight", None)
+    if not (
+        isinstance(weight, torch.Tensor) and weight.dtype in (torch.float16, torch.bfloat16)
+        and isinstance(linear_weight, torch.Tensor) and linear_weight.dtype in (torch.float16, torch.bfloat16)
+        and not hasattr(linear_weight, "quant_state")
+    ):
+        return None
+    if args and type(args[0]) is torch.Tensor and args[0].dtype == torch.float32:
+        return (args[0].to(weight.dtype),) + tuple(args[1:]), kwargs
+    features = kwargs.get("input_features")
+    if type(features) is torch.Tensor and features.dtype == torch.float32:
+        return args, {**kwargs, "input_features": features.to(weight.dtype)}
+    return None
+pass
+
+
+def _cast_subsampling_inputs(model):
+    for module in model.modules():
+        if type(module).__name__ != "ParakeetEncoderSubsamplingConv2D":
+            continue
+        for key, hook in list(module._forward_pre_hooks.items()):
+            if getattr(hook, "__name__", "") == "_subsampling_input_to_16bit":
+                del module._forward_pre_hooks[key]
+                getattr(module, "_forward_pre_hooks_with_kwargs", {}).pop(key, None)
+        module.register_forward_pre_hook(_subsampling_input_to_16bit, with_kwargs = True)
+pass
+
+
 def requires_grad_for_gradient_checkpointing(model):
     # All Unsloth Zoo code licensed under LGPLv3
     # Enables requires_grad to make gradient checkpointing work on
@@ -601,6 +740,15 @@ def requires_grad_for_gradient_checkpointing(model):
         pass
     pass
 
+    def requires_grad_frontend_hook(module, input, output):
+        if torch.compiler.is_compiling(): return
+        target = output
+        if type(target) in (tuple, list):
+            target = next((x for x in target if type(x) is torch.Tensor), None)
+        if type(target) is torch.Tensor and torch.is_floating_point(target) and torch.is_grad_enabled():
+            target.requires_grad_(True)
+    pass
+
     def collect_hook_targets():
         hook_targets = OrderedDict()
         fallback_targets = OrderedDict()
@@ -665,6 +813,8 @@ def requires_grad_for_gradient_checkpointing(model):
         return hook_targets, fallback_targets
     pass
 
+    _freeze_unused_feature_encoders(model)
+    _cast_subsampling_inputs(model)
     hook_targets, fallback_targets = collect_hook_targets()
     if len(hook_targets) == 0 and len(fallback_targets) == 0: return
 
@@ -723,6 +873,19 @@ def requires_grad_for_gradient_checkpointing(model):
                         f"Unsloth: Failed to register input-embedding hook for `{module_name}`: {exception}. "
                         "Falling back to pre-forward hook."
                     )
+        pass
+
+        frontend = _frozen_frontend(module) if still_need_patching else None
+        if frontend is not None:
+            register_other_hooks(
+                "requires_grad_frontend_hook",
+                "requires_grad_frontend_hook",
+                frontend,
+                "_forward_hooks",
+            )
+            frontend.register_forward_hook(requires_grad_frontend_hook)
+            logger.info(f"Unsloth: Registered output gradient hook on `{module_name}`'s frozen front end.")
+            still_need_patching = False
         pass
 
         if still_need_patching:
