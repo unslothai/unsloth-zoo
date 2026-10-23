@@ -3886,7 +3886,7 @@ def _copy_export_remote_code(model_name, save_directory, token, model):
 pass
 
 
-def _source_config_model_type(model_name, token = None, commit = None):
+def _source_config_dict(model_name, token = None, commit = None):
     # `commit` pins a moved branch to the loaded revision.
     try:
         if os.path.isdir(str(model_name)):
@@ -3897,10 +3897,56 @@ def _source_config_model_type(model_name, token = None, commit = None):
             path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token,
                                    revision = revision or commit)
         with open(path, "r", encoding = "utf-8") as f:
-            model_type = json.load(f).get("model_type")
+            config = json.load(f)
     except Exception:
         return None
+    return config if isinstance(config, dict) else None
+pass
+
+
+def _source_config_model_type(model_name, token = None, commit = None):
+    model_type = (_source_config_dict(model_name, token, commit) or {}).get("model_type")
     return model_type if isinstance(model_type, str) and model_type else None
+pass
+
+
+# Set by the export itself (vocab carry-over, dtype, quantization), so never taken from the checkpoint.
+_EXPORT_MANAGED_CONFIG_KEYS = frozenset((
+    "vocab_size", "unsloth_vocab_pad_ids", "unsloth_vocab_pad_suppressed_ids",
+    "quantization_config", "transformers_version", "torch_dtype", "dtype",
+))
+
+
+def _overlay_export_managed_keys(target, written):
+    for key, value in written.items():
+        if key in _EXPORT_MANAGED_CONFIG_KEYS:
+            target[key] = value
+        elif isinstance(value, dict) and isinstance(target.get(key), dict):
+            _overlay_export_managed_keys(target[key], value)
+        elif key in target and target[key] == value:
+            # The saved type: transformers 5.20 rejects Ling-3.0-tiny's own `"kda_lower_bound": -5` (int).
+            target[key] = value
+    for key in [k for k in target if k in _EXPORT_MANAGED_CONFIG_KEYS and k not in written]:
+        del target[key]
+pass
+
+
+def _restore_checkpoint_config_keys(config_path, source, config_class):
+    """A built-in class saved a repo-code (auto_map) checkpoint's keys under its own names (bailing_hybrid:
+    `norm_topk_prob` -> `moe_renormalize`, `head_dim` 128 -> 64), but the weights keep the checkpoint's layout
+    and llama.cpp / its code read its keys (#14916): write its config.json back. True if rewritten."""
+    config_path = Path(config_path)
+    if not isinstance(source, dict) or "auto_map" not in source or not config_path.exists(): return False
+    try:
+        written = json.loads(config_path.read_text(encoding = "utf-8"))
+    except Exception:
+        return False
+    aliases = getattr(config_class, "attribute_map", None) or {}
+    # Only when the save lost a checkpoint key to an alias: every other built-in export stays as it was.
+    if not any(alias in source and alias not in written for alias in aliases): return False
+    _overlay_export_managed_keys(source, written)
+    config_path.write_text(json.dumps(source, indent = 2), encoding = "utf-8")
+    return True
 pass
 
 
@@ -3955,7 +4001,15 @@ def _carry_over_vocab_pad_records(base_config, trained_config):
     targets = _text_configs(base_config) or [base_config]
     for key in ("unsloth_vocab_pad_ids", "unsloth_vocab_pad_suppressed_ids"):
         ids = next((getattr(h, key) for h in sources if getattr(h, key, None) is not None), None)
-        if ids is None: continue
+        if ids is None:
+            # Record dropped by training: the base's copy is stale and would make vLLM mask real tokens.
+            for holder in targets + [base_config]:
+                try:
+                    if key in getattr(holder, "__dict__", {}): delattr(holder, key)
+                except Exception: pass
+            pass
+            continue
+        pass
         # The first holder is get_text_config(), which vllm_utils._padded_vocab_ids reads.
         try: setattr(targets[0], key, list(ids))
         except Exception: pass
@@ -4894,6 +4948,49 @@ def _upcast_shard_to_float32(save_directory, filename):
 pass
 
 
+def _shard_tensor_bytes(file_path):
+    """Bytes of tensor data in one safetensors shard, read from its header."""
+    with open(file_path, "rb") as f:
+        length_of_header = int.from_bytes(f.read(8), "little")
+        header_metadata = json.loads(f.read(length_of_header))
+    return sum(
+        v["data_offsets"][1] - v["data_offsets"][0]
+        for k, v in header_metadata.items()
+        if k != "__metadata__" and isinstance(v, dict) and "data_offsets" in v
+    )
+pass
+
+
+def _set_index_total_size(save_directory, total_size):
+    """Record `total_size` in a copied shard index; returns whether it changed."""
+    index_path = os.path.join(save_directory, "model.safetensors.index.json")
+    if not os.path.isfile(index_path): return False
+    try:
+        with open(index_path, "rb") as f:
+            raw = f.read()
+        # transformers reads the index in the locale encoding, so non-UTF-8 bytes are still valid.
+        data = json.loads(raw.decode("utf-8", errors = "surrogateescape"))
+    except Exception:
+        return False
+    metadata = data.get("metadata") if isinstance(data, dict) else None
+    if not isinstance(metadata, dict) or metadata.get("total_size") == total_size:
+        return False
+    # Rewrite only the number so every other byte stays as copied.
+    pattern = re.compile(rb'("total_size"\s*:\s*)-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?')
+    if len(pattern.findall(raw)) == 1:
+        updated = pattern.sub(lambda m: m.group(1) + str(int(total_size)).encode("ascii"), raw)
+    else:
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        metadata["total_size"] = total_size
+        updated = json.dumps(data, indent = 4).encode("utf-8")
+    _export_index_atomically(index_path, index_path, updated)
+    return True
+pass
+
+
 def _mark_config_float32(config_path):
     # Without this, from_pretrained(dtype = "auto") reads bfloat16 and downcasts on load.
     if not os.path.exists(config_path): return
@@ -5376,14 +5473,18 @@ def merge_and_overwrite_lora(
         else:
             _carry_over_vocab_size(base_config, config)
         # Read before saving: an in-place export overwrites the source config.json.
-        source_model_type = None
+        source_model_type = source_config = None
         if _is_remote_code_config(base_config):
             loaded_commit = _trusted_code_commit(model) if _is_export_source_loaded_repo(model_name, model) else None
             source_model_type = _source_config_model_type(model_name, token, loaded_commit)
+        elif getattr(type(base_config), "attribute_map", None):
+            source_config = _source_config_dict(model_name, token)
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
             _restore_source_model_type(Path(save_directory) / "config.json", source_model_type)
             _copy_export_remote_code(model_name, save_directory, token, model)
+        else:
+            _restore_checkpoint_config_keys(Path(save_directory) / "config.json", source_config, type(base_config))
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         if upcast_to_float32:
@@ -5807,6 +5908,7 @@ def merge_and_overwrite_lora(
     _vocab_modules = _untargeted_vocab_modules(
         _merge_base_model, lora_weights, _merge_tie_word_embeddings,
     ) if save_method == "merged_16bit" else {}
+    _widened_total_size = 0
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         if _mxfp4_rewrite is not None:
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
@@ -5836,6 +5938,8 @@ def merge_and_overwrite_lora(
         device_empty_cache()
 
         file_path = os.path.join(save_directory, filename)
+        if upcast_to_float32 and not regenerate_index:
+            _widened_total_size += _shard_tensor_bytes(file_path)
 
         # --- NEW LOGIC: Build the weight_map BEFORE deleting the file ---
         if regenerate_index and not _fp8_post_cleanup:
@@ -5870,6 +5974,12 @@ def merge_and_overwrite_lora(
                 except FileNotFoundError:
                     pass
     pass
+
+    # A copied index still carries the 16-bit base's total_size.
+    if upcast_to_float32 and not regenerate_index:
+        if _set_index_total_size(save_directory, _widened_total_size) and push_to_hub and low_disk_space_usage:
+            # Low disk mode uploaded the index before the merge; Step 7 does not run.
+            upload_items("model.safetensors.index.json")
 
     # Step 6: Regenerate index for MXFP4 dequantization or shard splitting
     if regenerate_index:

@@ -287,3 +287,20 @@ def test_frozen_only_contract_for_experts():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+def test_enable_warms_the_probes_on_each_card_holding_experts(monkeypatch):
+    """A compiled first forward on a second GPU model must not open an eager probe region (a graph
+    break, or Unsupported under fullgraph): enabling warms that card's support and view probes."""
+    from unsloth_zoo.temporary_patches import moe_utils
+
+    seen = []
+    monkeypatch.setattr(moe_utils, "_grouped_mm_supported_on", lambda d: seen.append(("support", d)) or True)
+    monkeypatch.setattr(moe_utils, "_transposed_view_safe_on", lambda d: seen.append(("view", d)) or True)
+    spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
+    model = nn.Module()
+    model.layers = nn.ModuleList([_eligible_block("Qwen3MoeSparseMoeBlock", spec) for _ in range(2)])
+    assert enable_grouped_moe(model, verbose=False) == 2
+    device = next(model.layers[0].parameters()).device
+    # Once per card, not per block.
+    assert seen == [("support", device), ("view", device)]

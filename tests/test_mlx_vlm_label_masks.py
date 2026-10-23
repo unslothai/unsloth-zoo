@@ -1350,6 +1350,90 @@ def test_text_capable_mlx_lm_architecture_still_decides_by_its_sanitize(monkeypa
     ) is False
 
 
+def test_a_tower_stripping_mlx_lm_class_stays_when_mlx_vlm_lacks_the_type(monkeypatch):
+    """Muse Spark: mlx_lm drops its audio tower in sanitize, and mlx-vlm has no muse_spark."""
+    assert _route_text_only(
+        monkeypatch, mlx_lm_class=_StripSanitizeModel, vlm_class=None
+    ) is False
+
+
+def _mlx_lm_architecture(monkeypatch):
+    """A Model whose mlx_lm module's ModelArgs need rope_theta and refuse engram layers."""
+    import dataclasses
+    import sys
+    import types
+
+    module = types.ModuleType("_unsloth_fake_mlx_lm_architecture")
+
+    @dataclasses.dataclass
+    class ModelArgs:
+        rope_theta: float
+        engram_layer_ids: list = None
+        vision_config: dict = None
+
+        @classmethod
+        def from_dict(cls, params):
+            names = inspect.signature(cls).parameters
+            return cls(**{key: value for key, value in params.items() if key in names})
+
+        def __post_init__(self):
+            self.vision_config["hidden_size"] = 0
+            if self.engram_layer_ids:
+                raise NotImplementedError("Engram layers are not supported.")
+
+    class Model(_PlainModel):
+        def embed_inputs(self, inputs, *, pixel_values=None):
+            raise AssertionError("routing never builds the model")
+
+    Model.__module__ = ModelArgs.__module__ = module.__name__
+    module.Model, module.ModelArgs = Model, ModelArgs
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return Model
+
+
+def test_mlx_lm_keeps_a_wrapper_only_while_its_model_args_take_the_config(monkeypatch):
+    """DeepSeek-V4.1: mlx_lm's ModelArgs refuse the published engram layers, which mlx-vlm builds."""
+    model = _mlx_lm_architecture(monkeypatch)
+    # rope_theta is backfilled from rope_parameters, as mlx_lm's load is handed it.
+    takes = {**_VLM_CONFIG, "rope_parameters": {"rope_theta": 1e4}}
+    refused = {**takes, "engram_layer_ids": [1, 14]}
+
+    def route(config, vlm_class):
+        return _route_text_only(monkeypatch, mlx_lm_class=model, vlm_class=vlm_class, config=config)
+
+    assert route(takes, _VLMOnlyClass) is False
+    assert route(refused, _VLMOnlyClass) is True
+    assert route(_VLM_CONFIG, _VLMOnlyClass) is True
+    assert route(refused, None) is False
+    assert _VLM_CONFIG["vision_config"] == takes["vision_config"] == {"hidden_size": 8}
+
+
+def test_mlx_lm_serves_images_by_its_own_processor_rule(monkeypatch):
+    """Muse Spark: mlx_lm.processors registers a processor per model module, keyed by
+    `processor_type` when the config names one, and only for a populated vision_config."""
+    import sys
+    import types
+    from unsloth_zoo.mlx import loader
+
+    model = _mlx_lm_architecture(monkeypatch)
+    monkeypatch.setattr(loader, "_get_mlx_lm_model_class", lambda _t: model)
+    processors = types.ModuleType("mlx_lm.processors")
+    processors.PROCESSORS = {model.__module__: object, "named": object}
+    monkeypatch.setitem(sys.modules, "mlx_lm.processors", processors)
+    config = {**_VLM_CONFIG, "rope_theta": 1e4}
+
+    def serves(**changes):
+        return loader._mlx_lm_serves_images({**config, **changes}, "fake_vlm")
+
+    assert serves() is True
+    assert serves(vision_config={}) is False
+    assert serves(processor_type="unregistered") is False
+    assert serves(processor_type="named") is True
+    assert serves(engram_layer_ids=[1]) is False
+    monkeypatch.setattr(model, "embed_inputs", None)
+    assert serves() is False
+
+
 def test_text_only_config_is_never_routed_to_the_vlm_loader(monkeypatch):
     assert _route_text_only(
         monkeypatch,
@@ -7009,13 +7093,18 @@ def test_image_capability_includes_nested_encoders_and_pixel_projections(path):
     assert _model_supports_images(root) is True
 
 
-def test_text_training_checks_model_capability_with_a_replacement_tokenizer(tmp_path):
+@pytest.mark.parametrize("supports_images, message", [
+    (False, "`text_wrapper` has no vision path"),
+    # An mlx_lm image model (not built by mlx-vlm) takes images in generation only.
+    (True, "`text_wrapper` takes images in generation only"),
+])
+def test_text_training_checks_model_capability_with_a_replacement_tokenizer(tmp_path, supports_images, message):
     from tokenizers import Tokenizer, models
     from transformers import PreTrainedTokenizerFast
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     model = nn.Linear(2, 2)
-    model._unsloth_supports_images = False
+    model._unsloth_supports_images = supports_images
     model._config = {"model_type": "text_wrapper"}
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(models.WordLevel({"a": 0})))
     trainer = MLXTrainer(
@@ -7023,7 +7112,7 @@ def test_text_training_checks_model_capability_with_a_replacement_tokenizer(tmp_
         train_dataset=[{"input_ids": [0, 0], "image": Image.new("RGB", (2, 2))}],
         args=MLXTrainingConfig(max_steps=1, output_dir=str(tmp_path), report_to="none"),
     )
-    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+    with pytest.raises(ValueError, match=message):
         trainer._prepare_data(False)
 
 

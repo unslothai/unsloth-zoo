@@ -103,14 +103,6 @@
       "reason": "Iterates the fixed _VLLM_BNB_LOADER_PATHS pair of vLLM bitsandbytes loader modules."
     },
     {
-      "file": "unsloth_zoo_downloads/hf_xet_fallback.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "59e72c01edb14c86",
-      "count": 1,
-      "reason": "Iterates two fixed huggingface_hub module names."
-    },
-    {
       "file": "unsloth_zoo/llama_cpp.py",
       "rule": "dynamic-import",
       "sink": "spec_from_file_location",
@@ -211,7 +203,7 @@
       "rule": "dynamic-import",
       "sink": "import_module",
       "digest": "a0573ba00a682ea0",
-      "count": 2,
+      "count": 3,
       "reason": "Prefix-bounded to the installed mlx_lm / mlx_vlm package: a model's model_type can only select one of that package's own modules (#1083 removed the unbounded form)."
     },
     {
@@ -423,6 +415,14 @@
       "reason": "Prefix-bounded to transformers.models.<name>.modeling_<name> over a fixed list of model names."
     },
     {
+      "file": "unsloth_zoo/temporary_patches/moe_router_triton.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "e0884049feeeed7d",
+      "count": 1,
+      "reason": "Prefix-bounded to transformers.models.<name>.modeling_<name> over the fixed _ROUTER_CLASSES tuple of model names."
+    },
+    {
       "file": "unsloth_zoo/temporary_patches/moe_utils.py",
       "rule": "dynamic-import",
       "sink": "import_module",
@@ -517,6 +517,14 @@
       "digest": "54cfcec6d18cb37d",
       "count": 1,
       "reason": "Fixed vLLM bitsandbytes module path held in a local."
+    },
+    {
+      "file": "unsloth_zoo_downloads/hf_xet_fallback.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "59e72c01edb14c86",
+      "count": 1,
+      "reason": "Iterates two fixed huggingface_hub module names."
     }
   ]
 }

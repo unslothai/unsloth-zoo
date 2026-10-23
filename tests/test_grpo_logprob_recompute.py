@@ -266,3 +266,99 @@ def test_cached_function_survives_a_missing_compiled_flag():
     out = function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0)
     (out * weights).sum().backward()
     assert out.isfinite().all()
+
+
+def _fp16_head_case(function, head_dtype = torch.float16):
+    # Three chunks of two rows; each chunk's head gradient (2 x 1.5 x 32768 = 98304) and the running
+    # sum leave the fp16 range before the last chunk's opposite sign cancels half of it.
+    hidden = torch.full((1, 6, 1), 1.5, dtype = torch.float16)
+    head = torch.zeros((2, 1), dtype = head_dtype, requires_grad = True)
+    index = torch.zeros((1, 6), dtype = torch.long)
+    upstream = torch.tensor([[32768.0, 32768.0, 32768.0, 32768.0, -32768.0, -32768.0]])
+    out = function(hidden, head, index, 3)
+    (grad,) = torch.autograd.grad((out.float() * upstream).sum(), [head])
+    head64 = head.detach().double().requires_grad_(True)
+    logps = torch.log_softmax(hidden.double() @ head64.t(), -1)[..., 0]
+    (want,) = torch.autograd.grad((logps * upstream.double()).sum(), [head64])
+    return grad, want
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_fp16_head_grad_accumulates_in_float32(compiled):
+    for function in (_standalone(compiled = compiled), rr.chunked_hidden_states_selective_log_softmax_recompute):
+        grad, want = _fp16_head_case(function)
+        assert grad.dtype == torch.float16
+        assert grad.isfinite().all(), grad
+        assert grad.double().flatten().tolist() == want.flatten().tolist() == [49152.0, -49152.0]
+
+
+def test_bf16_hidden_grad_with_fp16_head_does_not_overflow():
+    # Row hidden gradient sum_v grad_z[v] * W[v] is about -72000: fine in bf16, inf as an fp16 product.
+    function = _standalone()
+    vocab, hidden_size, rows = 9, 64, 4
+    head = torch.full((vocab, hidden_size), 8000.0)
+    head[0] = 0.0
+    head = head.half().requires_grad_(True)
+    gen = torch.Generator().manual_seed(0)
+    states = (torch.randn(1, rows, hidden_size, generator = gen) * 1e-6).to(torch.bfloat16).requires_grad_(True)
+    index = torch.zeros((1, rows), dtype = torch.long)
+    out = function(states, head, index, 2)
+    grad_states, grad_head = torch.autograd.grad((out * 10.0).sum(), [states, head])
+    states64 = states.detach().double().requires_grad_(True)
+    logps = torch.log_softmax(states64 @ head.detach().double().t(), -1)[..., 0]
+    (want,) = torch.autograd.grad((logps * 10.0).sum(), [states64])
+    assert grad_head.isfinite().all()
+    assert grad_states.isfinite().all(), grad_states
+    # Within bf16 / fp16 rounding of the float64 oracle.
+    assert float((grad_states.double() - want).abs().max()) <= 2 ** -7 * float(want.abs().max())
+
+
+def test_cold_outer_fullgraph_compile():
+    # A fresh process, so nothing has called the function yet: it must build its autograd function
+    # at import, leaving a cold outer torch.compile(fullgraph = True) only the cached function to trace.
+    import subprocess, sys, textwrap
+    script = textwrap.dedent("""
+        import torch
+        import unsloth_zoo.rl_replacements as rr
+        function = rr.chunked_hidden_states_selective_log_softmax_recompute
+        gen = torch.Generator().manual_seed(9)
+        states = torch.randn(2, 8, 6, generator = gen, requires_grad = True)
+        head = torch.randn(37, 6, generator = gen, requires_grad = True)
+        index = torch.randint(0, 37, (2, 8), generator = gen)
+        def outer(states, head, index):
+            return function(states, head, index, 2, return_entropy = True)
+        logps, entropy = torch.compile(outer, fullgraph = True, dynamic = True)(states, head, index)
+        (logps.sum() + entropy.sum()).backward()
+        assert function._use_compiled
+        want = outer(states, head, index)
+        torch.testing.assert_close(logps, want[0])
+        torch.testing.assert_close(entropy, want[1])
+        torch._dynamo.reset()
+        explanation = torch._dynamo.explain(outer)(states, head, index)
+        assert explanation.graph_break_count == 0, explanation.break_reasons
+        print("COLD_COMPILE_OK", explanation.graph_count)
+    """)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH = root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    if not torch.cuda.is_available():
+        env.setdefault("UNSLOTH_ALLOW_CPU", "1")
+    result = subprocess.run([sys.executable, "-c", script], capture_output = True, text = True, timeout = 900, env = env)
+    assert "COLD_COMPILE_OK" in result.stdout, (result.stdout[-2000:], result.stderr[-4000:])
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_fp32_head_under_fp16_autocast_does_not_nan(compiled):
+    # fp32 trainable head, fp16 autocast, loss scale 65536, hidden 4, two 512 row chunks with opposite
+    # upstream signs: each fp16 chunk product overflowed to +-inf before the float32 sum, leaving NaN.
+    function = _standalone(compiled = compiled)
+    rows, hidden_size, vocab = 1024, 8, 64
+    sign = torch.ones(rows)
+    sign[rows // 2:] = -1
+    states = torch.full((1, rows, hidden_size), 4.0, dtype = torch.float16)
+    head = torch.zeros((vocab, hidden_size), requires_grad = True)
+    index = torch.zeros((1, rows), dtype = torch.long)
+    with torch.autocast("cpu", dtype = torch.float16):
+        out = function(states, head, index, 2)
+    (grad,) = torch.autograd.grad((out.float() * 65536.0 * sign).sum(), [head])
+    assert grad.dtype == torch.float32
+    assert torch.equal(grad, torch.zeros_like(grad)), grad

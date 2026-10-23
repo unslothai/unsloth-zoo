@@ -308,7 +308,7 @@ def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, 
                                                                  last):
     """mlx-vlm runs batched, as its array masks are; those masks also drop every seventh key.
 
-    Both array masks carry a leading 1: `mlx_vlm<0.6.5` -- which is what `mlx-vlm<=0.7.8` against
+    Both array masks carry a leading 1: `mlx_vlm<0.6.5` -- which is what `mlx-vlm<=0.7.9` against
     unsloth's `transformers<=5.5.0` resolves to -- broadcasts a `[B, 1, L, S]` mask against its own
     5-D grouped scores only when B is 1. A per-row batched mask above the tie is covered by
     `test_a_batched_mask_the_pinned_runtime_cannot_broadcast` below.
@@ -684,6 +684,12 @@ def test_qsa_block_selection_picks_argpartitions_set(kind):
         # Rows straddle the top-k: some see fewer complete blocks than it, the rest more.
         complete = mx.broadcast_to(nb - L + mx.arange(L, dtype = mx.int32), (B, L)) - (B * L > 3) * (nb - 600)
         assert mx.array_equal(select_blocks(scores, complete, 512, 128), _stock_selection(scores, complete, 512)).item()
+
+
+def test_qsa_block_selection_refuses_a_zero_budget():
+    scores, complete = mx.random.normal((1, 4, 2, 64)), mx.full((1, 2), 64, dtype = mx.int32)
+    with pytest.raises(ValueError, match = "topk >= 1"):
+        select_blocks(scores, complete, 0, 128)
 
 
 def test_qsa_fast_prefill_matches_fp32_attention():

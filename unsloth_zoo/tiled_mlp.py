@@ -361,7 +361,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
         preserve_rng_state = _mlp_needs_rng_state(self)
-        return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, max_flat_qlen)
+        return TiledMLP.apply(inner_forward, self, x, preserve_rng_state, n_shards, max_flat_qlen)
 
     def tiled_forward_arctic_size(self, x):
         B, S, H = x.shape
@@ -374,7 +374,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
         # this call binds
         inner_forward = self._unsloth_forward.__get__(self, self.__class__)
         preserve_rng_state = _mlp_needs_rng_state(self)
-        return TiledMLP.apply(inner_forward, mlp_module, x, preserve_rng_state, n_shards, chunk_size)
+        return TiledMLP.apply(inner_forward, self, x, preserve_rng_state, n_shards, chunk_size)
 
     if target_arctic:
         mlp_module.forward = MethodType(tiled_forward_arctic_size, mlp_module)

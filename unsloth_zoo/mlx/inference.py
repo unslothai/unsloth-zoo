@@ -17,13 +17,15 @@
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
 small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
-Qwen exact speculative verify blocks, Gemma 4 verify-block attention, and Qwen sparse attention block selection."""
+Qwen exact speculative verify blocks, wide-head decode and Gemma 4 verify-block attention, Qwen sparse attention block selection,
+QSA indexer blocks kept across cache trims, dilated depthwise convolutions, and SSD-backed PLE row reads."""
 
 import ast
 import functools
 import copy
 import hashlib
 import inspect
+import itertools
 import json
 import logging
 import math
@@ -32,6 +34,7 @@ import re
 import struct
 import sys
 import textwrap
+import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import RLock, local
@@ -40,6 +43,7 @@ from typing import Callable, NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from . import attention, nax, qmm
 
@@ -101,6 +105,7 @@ def _resolved_bindings(contract):
             owner, _, name = path.rpartition(".")
             holder = _resolve_dotted(module, owner) if owner else module
             target = getattr(holder, name, None)
+            target = _exact_route_native(target) or target
             # The sparse-attention training wrapper outlives training and calls what it wraps outside it. A wrapper
             # around it inherits the marker through functools.wraps, but its own __wrapped__ is not the marked one.
             marked = getattr(target, "_unsloth_sparse_attention_original", None)
@@ -129,19 +134,35 @@ def _resolved_bindings(contract):
     return list(found.values()) if holds else None
 
 
+def _exact_route_native(function):
+    """The native a route marked `_unsloth_exact_route_of` runs unchanged, so a contract on that native holds.
+    functools.wraps copies the mark onto a wrapper around the route, whose own __wrapped__ gives it away."""
+    native = getattr(function, "_unsloth_exact_route_of", None)
+    return None if native is None or hasattr(function, "__wrapped__") else native
+
+
 def _bindings_intact(bindings):
     for namespace, name, target in bindings:
-        if namespace.get(name) is not target:
+        current = namespace.get(name)
+        if current is not target and _exact_route_native(current) is not target:
             return False
     return True
 
 
 _FAILED_BUFFER = "[METAL] Command buffer execution failed"
+# One-off work run so far: each first-use check settles through `_settled`, and each timing counts one.
+_FIRST_USE_WORK = [0]
+
+
+def first_use_work():
+    """How much one-off first-use work (bitwise checks, timings) this process has run; a call that changed it paid for some."""
+    return _FIRST_USE_WORK[0]
 
 
 def _settled(verdict):
     """`verdict`, after synchronizing on a mismatch: a failed command buffer's garbage reads as one, and MLX
     raises that error only at the next synchronize."""
+    _FIRST_USE_WORK[0] += 1
     if not verdict:
         mx.synchronize()
     return verdict
@@ -629,7 +650,7 @@ _DECODE_STEP_SOURCE = """
         }
         acc = simd_sum(acc);
         acc = simd_sum(lane == 0 ? acc : 0.0f);
-        float inv = metal::precise::rsqrt(acc / Dk + 1e-6f);
+        float inv = metal::precise::rsqrt(acc / Dk + qk_eps[0]);
         for (int i = 0; i < 4; i++) {
             T normed = static_cast<T>(1) * static_cast<T>(thread_x[i] * inv);
             x[lane * 4 + i] = Multiply()(scale, normed);
@@ -707,7 +728,7 @@ def _decode_step_kernel():
         return binary and mx.fast.metal_kernel(
             name = "unsloth_gated_delta_decode_step",
             input_names = ["conv_state", "qkv", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight",
-                           "q_scale", "k_scale", "norm_eps", "state_in"],
+                           "q_scale", "k_scale", "qk_eps", "norm_eps", "state_in"],
             output_names = ["window", "y", "state_out"], header = header + binary,
             compile_options = {"math_mode": "safe"}, source = _DECODE_STEP_SOURCE,
         ) or None
@@ -716,20 +737,21 @@ def _decode_step_kernel():
 
 
 @functools.lru_cache(maxsize = 64)
-def _decode_step_scalars(head_dim, dtype, eps):
+def _decode_step_scalars(head_dim, dtype, qk_eps, eps):
     # `inv_scale * x` converts the Python scale to x's dtype; going through the same multiply keeps its rounding.
     inv_scale, one = head_dim ** -0.5, mx.ones((1,), dtype)
-    scalars = ((inv_scale ** 2) * one, inv_scale * one, mx.array([eps], mx.float32))
+    scalars = ((inv_scale ** 2) * one, inv_scale * one, mx.array([qk_eps], mx.float32), mx.array([eps], mx.float32))
     mx.eval(*scalars)
     return scalars
 
 
-def _decode_step(conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, eps, state, key_heads):
+def _decode_step(conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads):
     B, value_heads, Dv, Dk = state.shape
     dtype = qkv.dtype
-    q_scale, k_scale, norm_eps = _decode_step_scalars(Dk, dtype, eps)
+    q_scale, k_scale, qk_norm_eps, norm_eps = _decode_step_scalars(Dk, dtype, qk_eps, eps)
     return _decode_step_kernel()(
-        inputs = [conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, norm_eps, state],
+        inputs = [conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, qk_norm_eps,
+                  norm_eps, state],
         template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[0]),
                     ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv), ("TY", _DECODE_STEP_ROWS)],
         grid = (32, _DECODE_STEP_ROWS, B * value_heads), threadgroup = (32, _DECODE_STEP_ROWS, 1),
@@ -738,12 +760,14 @@ def _decode_step(conv_state, qkv, weight, a, b, A_log, dt_bias, z, norm_weight, 
     )
 
 
+# The `_normalize_qk` bodies the decode step mirrors, by the RMSNorm epsilon each uses for a head width.
+_NORMALIZE_QK_EPS = {"8f16e229aec08b7a": lambda width: 1e-6, "f23945a25dd3df5f": lambda width: 1e-6 / width}
 # Bodies the decode step mirrors. `gated_delta_kernel` is left out: the packed scope rebinds it, and its
 # single-token route is the generic kernel whose arithmetic `_make_gated_delta_kernel` pins.
 _DECODE_STEP_CONTRACT = {
     "mlx_vlm.models.qwen3_5.language": {
         "Qwen3_5GatedDeltaNet.__call__": "f8deff65c803d4da",
-        "Qwen3_5GatedDeltaNet._normalize_qk": "8f16e229aec08b7a",
+        "Qwen3_5GatedDeltaNet._normalize_qk": tuple(_NORMALIZE_QK_EPS),
         "Qwen3_5GatedDeltaNet._project_gates": "817d9767396ec3f8",
         "Qwen3_5RMSNormGated.__call__": "7c0c74be3b59d596",
         "_precise_swiglu": "d5cc9afa38657b66",
@@ -786,10 +810,12 @@ def _decode_step_contract(base):
     except (OSError, TypeError, SyntaxError, AttributeError):
         return None
     return (language, bound, update, cache.ArraysCache.update_window, cache.ArraysCache.update_recurrent,
-            language._qwen3_5_advance_lengths_info, language.Qwen3_5RMSNormGated.__call__)
+            language._qwen3_5_advance_lengths_info, language.Qwen3_5RMSNormGated.__call__,
+            _NORMALIZE_QK_EPS[_ast_fingerprint(layer._normalize_qk)])
 
 
-def _decode_step_route(language, bound, update, update_window, update_recurrent, advance_lengths, norm_call):
+def _decode_step_route(language, bound, update, update_window, update_recurrent, advance_lengths, norm_call,
+                       qk_eps):
     bindings = _resolved_bindings(_DECODE_STEP_CONTRACT)  # this resolution's, not a later one's
     if bindings is None:
         return None
@@ -834,7 +860,7 @@ def _decode_step_route(language, bound, update, update_window, update_recurrent,
                 mx.eval(cached[1])
                 self.__dict__["_unsloth_decode_step_weight"] = cached
             fused = lambda: _decode_step(conv_state, mixed_qkv, cached[1], a, b, self.A_log, self.dt_bias, z,
-                                         self.norm.weight, self.norm.eps, state, self.num_k_heads)
+                                         self.norm.weight, qk_eps(Dk), self.norm.eps, state, self.num_k_heads)
         if fits and verdict:
             window, out, new_state = fused()
         else:
@@ -1184,6 +1210,558 @@ def fused_packed_gated_delta(model, *, _modules = None):
                     del _GATED_DELTA_SCOPES[name]
                     if namespace.get("gated_delta_kernel") is route:
                         namespace["gated_delta_kernel"] = native
+
+
+# Qwen4-Exp prefill hyper-connection read, bit for bit with mlx-vlm: native reduction order, sigmoid table.
+_QWEN4_PREFILL_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.language": {
+        "Qwen4ExpGatedResidual": None,
+        "Qwen4ExpRMSNorm": None,
+        "Qwen4ExpGatedResidual.__call__": "04cef0824dc1add0",
+        "Qwen4ExpRMSNorm.__call__": "b47a270c1b0eade5",
+        "_row_invariant_quantized_projection": "75dc4975ef847716",
+    },
+}
+_QWEN4_PREFILL_CACHED = {"_qwen4_rms_norm": "4474fbab75e313c3", "_qwen4_hyper_pointwise": "5a6f9a76f981f7c0"}
+_QWEN4_PREFILL_LOCK = RLock()
+_QWEN4_PREFILL_VERDICTS = {}
+_QWEN4_PREFILL_BINDINGS = [None]
+# Below this many token rows MLX picks other reduction kernels; decode and verify widths stay native.
+_QWEN4_PREFILL_MIN_ROWS = 32
+_QWEN4_SAFE_MATH = {"math_mode": "safe"}
+
+
+def _qwen4_bindings(contract):
+    language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+    bindings = None if language is None else _resolved_bindings(contract)
+    if bindings is None:
+        return None
+    for name, expected in _QWEN4_PREFILL_CACHED.items():
+        cached = getattr(language, name, None)
+        builder = getattr(cached, "__wrapped__", None)
+        try:
+            held = (hasattr(cached, "cache_info") and not hasattr(builder, "__wrapped__")
+                    and _ast_fingerprint(builder) == expected)
+        except (OSError, TypeError, SyntaxError, AttributeError):
+            held = False
+        if not held:
+            if (language.__name__, name) not in _CONTRACT_MISSES:
+                _CONTRACT_MISSES.add((language.__name__, name))
+                logger.warning("%s.%s differs from the version the MLX fusions were written against; "
+                               "the native method stays in use", language.__name__, name)
+            return None
+        bindings.append((vars(language), name, cached))
+    return bindings
+
+
+@functools.cache
+def _qwen4_table(fn, dtype):
+    return fn(mx.arange(1 << 16, dtype = mx.uint32).astype(mx.uint16).view(dtype))
+
+
+@functools.cache
+def _qwen4_scalar(value, dtype):
+    return mx.array(value, dtype)
+
+
+@functools.cache
+def _qwen4_kernels():
+    if not mx.metal.is_available():
+        return None
+    pragma = "#pragma clang fp contract(off) reassociate(off)\n"
+    try:
+        # MLX's simple row reduction: thread i sums 4i..4i+3 from +0, then simd_sum of threads and partials.
+        norm = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_hc_norm", input_names = ["x", "w", "inv_n", "eps"], output_names = ["out"],
+            compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint t = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint weights = (row % STREAMS) * G + t * 4;
+            threadgroup float partial[32];
+            float y[4];
+            float total = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                y[i] = float(x[size_t(row) * G + t * 4 + i]);
+                total = y[i] * y[i] + total;
+            }
+            total = simd_sum(total);
+            if (sg == 0) partial[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) partial[sg] = total;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            total = simd_sum(partial[lane]);
+            const float r = metal::precise::rsqrt(total * inv_n + eps);
+            for (uint i = 0; i < 4; ++i) {
+                const float gain = 1.0f + float(w[weights + i]);
+                out[size_t(row) * G + t * 4 + i] = T((y[i] * r) * gain);
+            }
+            """)
+        # Native small column reduction: each stream from +0 in stream order, times 1/n rounded to T.
+        mix = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_hc_mix", input_names = ["up", "normed", "sigmoid", "inv_n"],
+            output_names = ["out"], compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            const uint i = thread_position_in_grid.x;
+            const size_t base = size_t(i / G) * STREAMS * G + i % G;
+            T total = T(0);
+            for (uint h = 0; h < STREAMS; ++h) {
+                const T gate = sigmoid[as_type<ushort>(up[base + h * G])];
+                const T product = gate * normed[base + h * G];
+                const T partial = product + T(0);
+                total = h == 0 ? partial : T(partial + total);
+            }
+            out[i] = total * inv_n;
+            """)
+        return norm, mix
+    except (AttributeError, TypeError, RuntimeError):
+        return None
+
+
+def _qwen4_rows(x):
+    return x.size // x.shape[-1] if x.ndim and x.shape[-1] else 0
+
+
+def _qwen4_hc_norm(x, weight, group, eps):
+    streams = weight.size // group
+    return _qwen4_kernels()[0](
+        inputs = [x, weight, _qwen4_scalar(1.0 / group, mx.float32), _qwen4_scalar(eps, mx.float32)],
+        template = [("T", x.dtype), ("G", group), ("STREAMS", streams)],
+        grid = (x.size // 4, 1, 1), threadgroup = (group // 4, 1, 1),
+        output_shapes = [x.shape], output_dtypes = [x.dtype])[0]
+
+
+def _qwen4_hc_mix(up, normed, streams, group):
+    return _qwen4_kernels()[1](
+        inputs = [up, normed, _qwen4_table(mx.sigmoid, up.dtype), _qwen4_scalar(1.0 / streams, up.dtype)],
+        template = [("T", up.dtype), ("STREAMS", streams), ("G", group)],
+        grid = (up.size // streams, 1, 1), threadgroup = (256, 1, 1),
+        output_shapes = [(*up.shape[:-1], group)], output_dtypes = [up.dtype])[0]
+
+
+def _qwen4_verified(key, fused, native, what):
+    """`fused()` once `key`'s first call matched `native()` bit for bit; that call and a failed key take `native()`."""
+    verdict = _QWEN4_PREFILL_VERDICTS.get(key)
+    if verdict:
+        return fused()
+    reference = native()
+    if verdict is None:
+        candidate = fused()
+        outputs = [out if isinstance(out, tuple) else (out,) for out in (reference, candidate)]
+        try:
+            verdict = _settled(len(outputs[0]) == len(outputs[1]) and all(
+                a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item()
+                for a, b in zip(*outputs)))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return reference  # inside a function transformation, which cannot evaluate; checked later
+        _QWEN4_PREFILL_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("the fused Qwen4-Exp %s differs from mlx-vlm's for %s; the native path stays in use",
+                           what, key)
+    return reference
+
+
+def _qwen4_hc_eligible(language, module):
+    norm, group, streams = module.hc_norm, module.hidden_size, module.hc_count
+    # Kernels repeat MLX's one-pass row reduction (1024 < group <= 4096) and per-lane column sum (<= 8 streams).
+    return (not module.training and type(norm).__call__ is language.Qwen4ExpRMSNorm.__call__ and 1 < streams <= 8
+            and norm.group_size == group and 1024 < group <= 4096 and not group % 128
+            and norm.weight.shape == (group * streams,))
+
+
+def _qwen4_hc_read(module, x, native):
+    group, streams = module.hidden_size, module.hc_count
+    if (x.ndim != 3 or _qwen4_rows(x) < _QWEN4_PREFILL_MIN_ROWS or x.dtype not in _HALF
+            or x.shape[-1] != group * streams):
+        return native(module, x)
+    language, norm = sys.modules["mlx_vlm.models.qwen4_exp.language"], module.hc_norm
+    combine = "block_inject_weight" in module
+
+    def fused():
+        normed = _qwen4_hc_norm(x, norm.weight, group, norm.eps)
+        activate, mix_streams, injection_gate = language._qwen4_hyper_pointwise(streams, group)
+        up = module.input_mix_weight_up(activate(module.input_mix_weight_down(normed)))
+        # The table is indexed by the 16-bit gate and the kernel does not broadcast.
+        mixed = (_qwen4_hc_mix(up, normed, streams, group) if up.dtype == normed.dtype and up.shape == normed.shape
+                 else mix_streams(up, normed))
+        if not combine:
+            return mixed
+        injection = language._row_invariant_quantized_projection(module.block_inject_weight, normed)
+        return mixed, x, injection_gate(injection)
+
+    key = ("hyper-connection read", streams, group, x.dtype, norm.weight.dtype, combine)
+    return _qwen4_verified(key, fused, lambda: native(module, x), "hyper-connection read")
+
+
+@functools.cache
+def _qwen4_prefill_class(base):
+    def call(self, hyper_input):
+        return _qwen4_hc_read(self, hyper_input, base.__call__)
+    return type(f"_Qwen4Prefill{base.__name__}", (base,), {"__call__": call, "_unsloth_qwen4_prefill_native": base})
+
+
+@contextmanager
+def fused_qwen4_prefill(model, *, _modules = None):
+    """Run Qwen4-Exp prefill's hyper-connection reads (norm and stream mix) as fused kernels.
+
+    Calls of 32 or more token rows take kernels bit-identical to mlx-vlm, each layout and dtype compared on
+    its first use; decode, verify, training and any drifted mlx-vlm body keep the native calls. Eligibility is
+    settled when the scope opens. `UNSLOTH_MLX_QWEN4_PREFILL=0` turns the route off.
+    """
+    changed = []
+    try:
+        with _QWEN4_PREFILL_LOCK:
+            language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+            if (language is not None and os.environ.get("UNSLOTH_MLX_QWEN4_PREFILL", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and mx.default_device() == mx.gpu and _qwen4_kernels() is not None):
+                if _QWEN4_PREFILL_BINDINGS[0] is None or not _bindings_intact(_QWEN4_PREFILL_BINDINGS[0]):
+                    _QWEN4_PREFILL_BINDINGS[0] = _qwen4_bindings(_QWEN4_PREFILL_CONTRACT)
+                seen = set()
+                for _, module in _fusion_modules(model, _modules) if _QWEN4_PREFILL_BINDINGS[0] is not None else ():
+                    if id(module) in seen or not isinstance(module, language.Qwen4ExpGatedResidual):
+                        continue
+                    seen.add(id(module))
+                    if module.__dict__.get("_unsloth_qwen4_prefill_scopes"):
+                        module._unsloth_qwen4_prefill_scopes += 1
+                        changed.append(module)
+                        continue
+                    if (type(module).__call__ is not language.Qwen4ExpGatedResidual.__call__
+                            or not _qwen4_hc_eligible(language, module)):
+                        continue
+                    module.__class__ = _qwen4_prefill_class(type(module))
+                    module._unsloth_qwen4_prefill_scopes = 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _QWEN4_PREFILL_LOCK:
+            for module in reversed(changed):
+                module._unsloth_qwen4_prefill_scopes -= 1
+                if not module._unsloth_qwen4_prefill_scopes:
+                    native = getattr(type(module), "_unsloth_qwen4_prefill_native", None)
+                    if native is not None:
+                        module.__class__ = native
+                    module.__dict__.pop("_unsloth_qwen4_prefill_scopes", None)
+
+
+# Qwen4-Exp single-token decode: the batch-invariant forward's hyper-connection read in two launches, built from
+# MLX's qmv_fast and qmv bodies (mlx/backend/metal/kernels/quantized.h, Copyright © 2023-2024 Apple Inc., MIT).
+_QWEN4_DECODE_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.language": {
+        "Qwen4ExpBatchInvariantForward": None,
+        "Qwen3_5BatchInvariantForward": None,
+        "Qwen4ExpGatedResidual": None,
+        "Qwen4ExpRMSNorm": None,
+        "Qwen4ExpBatchInvariantForward._hyper_connection": "0b22ede797c90e60",
+        "Qwen4ExpRMSNorm.__call__": "b47a270c1b0eade5",
+    },
+    "mlx_vlm.models.qwen3_5.speculative_verifier": {
+        "Qwen3_5BatchInvariantForward._linear": "6e38296bd3f89d5a",
+        "_target_verify_linear": "190517e318ba4d7b",
+    },
+    # 0.7.9 also admits ScaledQuantizedLinear blocks; a one-row call still takes the layer.
+    "mlx_vlm.speculative.ops.linear": {"_use_target_verify_dense": ("29df386e9a7b137a", "7e630b199d5cdb4c")},
+    "mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"},
+    "mlx.nn": {"QuantizedLinear": None},
+}
+_QWEN4_DECODE_LOCK = RLock()
+_QWEN4_DECODE_BINDINGS = [None]
+_QWEN4_DECODE_SIMDGROUPS = (16, 10, 8, 5, 4, 2, 1)
+# The `QuantizedLinear` calls zoo's own scopes install that leave a one-row call on the stock quantized matmul.
+_ONE_ROW_STOCK_CALLS = set()
+
+
+@functools.cache
+def _qwen4_decode_kernels():
+    if not mx.metal.is_available():
+        return None
+    pragma = "#pragma clang fp contract(off) reassociate(off)\n"
+    try:
+        seen = set()
+        _inline("mlx/backend/metal/kernels/utils.h", seen)   # already in metal_kernel's preamble
+        quantized = _inline("mlx/backend/metal/kernels/quantized.h", seen, "get_pack_factor", "dequantize")
+        signature = "template <typename T, typename U, int values_per_thread, int bits>\ninline U "
+        load = quantized[quantized.index(signature + "load_vector("):quantized.index(signature + "load_vector_safe(")]
+        load_tg = load.replace("load_vector(const device T* x", "load_vector_tg(const threadgroup T* x")
+        if load_tg == load:
+            return None
+        # Norm in MLX's row reduction order (a simdgroup per 128 values), kept in threadgroup memory for qmv_fast.
+        norm_down = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_decode_norm_down",
+            input_names = ["x", "w", "inv_n", "eps", "wd", "sd", "bd", "activate"], output_names = ["normed", "act"],
+            header = quantized + load_tg, compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint tile = threadgroup_position_in_grid.x;
+            const uint t = sg * 32 + lane;
+            constexpr uint THREADS = NSG * 32;
+            constexpr uint CHUNKS = G / 128;
+            threadgroup T normed_tg[STREAMS * G];
+            threadgroup float partial[STREAMS][32];
+            threadgroup float inverse[STREAMS];
+            for (uint i = t; i < STREAMS * 32; i += THREADS) partial[i / 32][i % 32] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint c = sg; c < STREAMS * CHUNKS; c += NSG) {
+                const uint g = c / CHUNKS, v = c % CHUNKS;
+                float total = 0.0f;
+                for (uint i = 0; i < 4; ++i) {
+                    const float y = float(x[g * G + (v * 32 + lane) * 4 + i]);
+                    total = y * y + total;
+                }
+                total = simd_sum(total);
+                if (lane == 0) partial[g][v] = total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                for (uint g = 0; g < STREAMS; ++g) {
+                    const float total = simd_sum(partial[g][lane]);
+                    if (lane == 0) inverse[g] = metal::precise::rsqrt(total * inv_n + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint span = (STREAMS * G + threadgroups_per_grid.x - 1) / threadgroups_per_grid.x;
+            for (uint e = t; e < STREAMS * G; e += THREADS) {
+                const T value = T((float(x[e]) * inverse[e / G]) * (1.0f + float(w[e])));
+                normed_tg[e] = value;
+                if (e / span == tile) normed[e] = value;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            constexpr int results = 4;
+            constexpr int pack_factor = get_pack_factor<BITS, 32>();
+            constexpr int bytes_per_pack = get_bytes_per_pack<BITS, 32>();
+            constexpr int values_per_thread = pack_factor * 2;
+            constexpr int block_size = values_per_thread * 32;
+            constexpr int scale_step_per_thread = GS / values_per_thread;
+            constexpr int in_vec_size = STREAMS * G;
+            constexpr int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+            constexpr int in_vec_size_g = in_vec_size / GS;
+            thread float x_thread[values_per_thread];
+            thread float result[results] = {0};
+            const int out_row = tile * (NSG * results) + sg * results;
+            const device uint8_t* ws = (const device uint8_t*)wd + out_row * in_vec_size_w + lane * 2 * bytes_per_pack;
+            const device T* sc = sd + out_row * in_vec_size_g + lane / scale_step_per_thread;
+            const device T* bi = bd + out_row * in_vec_size_g + lane / scale_step_per_thread;
+            const threadgroup T* xp = normed_tg + lane * values_per_thread;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                float sum = load_vector_tg<T, float, values_per_thread, BITS>(xp, x_thread);
+                for (int r = 0; r < results; r++) {
+                    auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+                    result[r] += qdot<float, values_per_thread, BITS>(
+                        wl, x_thread, float(sc[r * in_vec_size_g]), float(bi[r * in_vec_size_g]), sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                sc += block_size / GS;
+                bi += block_size / GS;
+                xp += block_size;
+            }
+            for (int r = 0; r < results; r++) {
+                result[r] = simd_sum(result[r]);
+                if (lane == 0) act[out_row + r] = activate[as_type<ushort>(static_cast<T>(result[r]))];
+            }
+            """)
+        up_mix = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_decode_up_mix", input_names = ["act", "normed", "wu", "su", "bu", "sigmoid", "inv_n"],
+            output_names = ["out"], header = quantized, compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            const uint lane = thread_index_in_simdgroup;
+            const uint h = simdgroup_index_in_threadgroup;
+            const uint i0 = threadgroup_position_in_grid.x * 4;
+            threadgroup T up[STREAMS][4];
+            constexpr int results = 4;
+            constexpr int pack_factor = get_pack_factor<BITS, 32>();
+            constexpr int bytes_per_pack = get_bytes_per_pack<BITS, 32>();
+            constexpr int values_per_thread = pack_factor;
+            constexpr int block_size = values_per_thread * 32;
+            constexpr int scale_step_per_thread = GS / values_per_thread;
+            constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
+            constexpr int in_vec_size_g = K / GS;
+            thread float x_thread[values_per_thread];
+            thread float result[results] = {0};
+            const int out_row = h * G + i0;
+            const device uint8_t* ws = (const device uint8_t*)wu + out_row * in_vec_size_w + lane * bytes_per_pack;
+            const device T* sc = su + out_row * in_vec_size_g + lane / scale_step_per_thread;
+            const device T* bi = bu + out_row * in_vec_size_g + lane / scale_step_per_thread;
+            const device T* xp = act + lane * values_per_thread;
+            int k = 0;
+            for (; k < K - block_size; k += block_size) {
+                float sum = load_vector<T, float, values_per_thread, BITS>(xp, x_thread);
+                for (int r = 0; r < results; r++) {
+                    auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+                    result[r] += qdot<float, values_per_thread, BITS>(
+                        wl, x_thread, float(sc[r * in_vec_size_g]), float(bi[r * in_vec_size_g]), sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                sc += block_size / GS;
+                bi += block_size / GS;
+                xp += block_size;
+            }
+            const int remaining = clamp(static_cast<int>(K - k - lane * values_per_thread), 0, values_per_thread);
+            if (remaining > 0) {
+                float sum = load_vector_safe<T, float, values_per_thread, BITS>(xp, x_thread, remaining);
+                for (int r = 0; r < results; r++) {
+                    auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+                    result[r] += qdot_safe<float, values_per_thread, BITS>(
+                        wl, x_thread, float(sc[r * in_vec_size_g]), float(bi[r * in_vec_size_g]), sum, remaining);
+                }
+            }
+            for (int r = 0; r < results; r++) {
+                result[r] = simd_sum(result[r]);
+                if (lane == 0) up[h][r] = static_cast<T>(result[r]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (h == 0 && lane < 4) {
+                T total = T(0);
+                for (uint s = 0; s < STREAMS; ++s) {
+                    const T gate = sigmoid[as_type<ushort>(up[s][lane])];
+                    const T product = gate * normed[s * G + i0 + lane];
+                    const T partial = product + T(0);
+                    total = s == 0 ? partial : T(partial + total);
+                }
+                out[i0 + lane] = total * inv_n;
+            }
+            """)
+        return norm_down, up_mix
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _qwen4_qmv(linear, fast):
+    """Whether MLX runs `linear` on one row as the qmv body the decode kernels repeat (qmv_fast if `fast`)."""
+    # The kernels bypass the layer's call, so it must be one whose one-row result is the stock one.
+    call = type(linear).__call__
+    if call is not nn.QuantizedLinear.__call__ and call not in _ONE_ROW_STOCK_CALLS:
+        return False
+    if (linear.mode != "affine" or linear.bits not in (4, 8) or "bias" in linear
+            or linear.scales.dtype not in _HALF or linear.biases.dtype != linear.scales.dtype):
+        return False
+    N, K = linear.weight.shape[0], linear.weight.shape[1] * 32 // linear.bits
+    aligned = K % ((32 // linear.bits) * 64) == 0
+    # Both 0.32.3 and 0.32.4 take qmv_fast for aligned K and whole 8-row tiles; qmv_quad serves K of 64 or 128.
+    return N % 8 == 0 and (aligned if fast else not aligned and K not in (64, 128))
+
+
+class _Qwen4DecodePlan(NamedTuple):
+    dtype: object
+    width: int
+    key: tuple
+    launch: Callable
+
+
+def _qwen4_decode_plan(language, module):
+    """The fused one-row read of `module`, settled when the scope opens; None keeps the native read."""
+    norm, down, up = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
+    group, streams = module.hidden_size, module.hc_count
+    # Same reduction bounds as prefill; the normalized streams must fit 32 KB of threadgroup memory.
+    if (module.training or type(norm).__call__ is not language.Qwen4ExpRMSNorm.__call__
+            or not _qwen4_qmv(down, True) or not _qwen4_qmv(up, False) or up.scales.dtype != down.scales.dtype
+            or not 1 < streams <= 8 or not 1024 < group <= 4096 or group % 128 or streams * group > 12288
+            or norm.group_size != group or norm.weight.shape != (streams * group,)
+            or down.weight.shape[1] * 32 // down.bits != streams * group
+            or up.weight.shape != (streams * group, down.weight.shape[0] * up.bits // 32)):
+        return None
+    dtype, lowrank, combine = down.scales.dtype, down.weight.shape[0], "block_inject_weight" in module
+    norm_down, up_mix = _qwen4_decode_kernels()
+    activate, _, injection_gate = language._qwen4_hyper_pointwise(streams, group)
+    simdgroups = next(n for n in _QWEN4_DECODE_SIMDGROUPS if lowrank // 4 % n == 0)
+    norm_constants = [_qwen4_scalar(1.0 / group, mx.float32), _qwen4_scalar(norm.eps, mx.float32)]
+    activate_table, sigmoid_table = _qwen4_table(activate, dtype), _qwen4_table(mx.sigmoid, dtype)
+    inv_streams = _qwen4_scalar(1.0 / streams, dtype)
+    norm_template = [("T", dtype), ("G", group), ("STREAMS", streams), ("GS", down.group_size),
+                     ("BITS", down.bits), ("NSG", simdgroups)]
+    mix_template = [("T", dtype), ("G", group), ("STREAMS", streams), ("K", lowrank), ("GS", up.group_size),
+                    ("BITS", up.bits)]
+
+    def launch(module, x):
+        norm, down, up = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
+        normed, act = norm_down(
+            inputs = [x, norm.weight, *norm_constants, down.weight, down.scales, down.biases, activate_table],
+            template = norm_template, grid = (32 * lowrank // 4, 1, 1), threadgroup = (32 * simdgroups, 1, 1),
+            output_shapes = [x.shape, (*x.shape[:-1], lowrank)], output_dtypes = [dtype, dtype])
+        mixed = up_mix(
+            inputs = [act, normed, up.weight, up.scales, up.biases, sigmoid_table, inv_streams],
+            template = mix_template, grid = (32 * streams * group // 4, 1, 1), threadgroup = (32 * streams, 1, 1),
+            output_shapes = [(*x.shape[:-1], group)], output_dtypes = [dtype])[0]
+        if not combine:
+            return mixed
+        return mixed, x, injection_gate(module.block_inject_weight(normed))
+
+    key = ("decode hyper-connection read", streams, group, lowrank, dtype, norm.weight.dtype, down.bits,
+           down.group_size, up.bits, up.group_size, combine)
+    return _Qwen4DecodePlan(dtype, streams * group, key, launch)
+
+
+def _qwen4_decode_read(forward, module, x):
+    native = type(forward)._hyper_connection
+    plan = module.__dict__.get("_unsloth_qwen4_decode_plan")
+    if plan is None or x.ndim != 3 or x.size != x.shape[-1] or x.dtype != plan.dtype or x.shape[-1] != plan.width:
+        return native(forward, module, x)
+    return _qwen4_verified(plan.key, lambda: plan.launch(module, x), lambda: native(forward, module, x),
+                           "decode hyper-connection read")
+
+
+@contextmanager
+def fused_qwen4_decode(model, *, _modules = None):
+    """Run Qwen4-Exp's single-token decode hyper-connection reads as two fused launches.
+
+    mlx-vlm's batch-invariant decode forward reads each hyper-connection through a norm, two quantized projections
+    and a stream mix; a one-row read of this model's modules takes kernels bit-identical to it, each layout,
+    quantization and dtype compared on its first use. Eligibility is settled when the scope opens: modules,
+    projections and mlx-vlm methods replaced while it is open are not rechecked. Verify blocks, training and a
+    drifted mlx-vlm keep the native read. `UNSLOTH_MLX_QWEN4_DECODE=0` turns the route off.
+    """
+    changed, forward = [], None
+    try:
+        with _QWEN4_DECODE_LOCK:
+            language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+            target = getattr(language, "_QWEN4_BATCH_INVARIANT_FORWARD", None)
+            hook = vars(target).get("_hyper_connection") if target is not None else None
+            if (target is not None and os.environ.get("UNSLOTH_MLX_QWEN4_DECODE", "1") != "0"
+                    and (hook is None or getattr(hook, "func", None) is _qwen4_decode_read)
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and mx.default_device() == mx.gpu and _qwen4_decode_kernels() is not None):
+                if _QWEN4_DECODE_BINDINGS[0] is None or not _bindings_intact(_QWEN4_DECODE_BINDINGS[0]):
+                    _QWEN4_DECODE_BINDINGS[0] = _qwen4_bindings(_QWEN4_DECODE_CONTRACT)
+                # exact_batch_invariant_decode's sliced `_linear` matched by code object (functools.wraps copies names).
+                native_class = getattr(type(target), "_unsloth_verify_native", type(target))
+                linear = getattr(getattr(target, "_linear", None), "__func__", None)
+                sliced = next(c for c in _exact_verify_class.__wrapped__.__code__.co_consts
+                              if getattr(c, "co_name", None) == "sliced_linear")
+                stock = (_QWEN4_DECODE_BINDINGS[0] is not None and linear is not None
+                         and getattr(type(target), "_hyper_connection", None)
+                         is language.Qwen4ExpBatchInvariantForward._hyper_connection
+                         and getattr(native_class, "_linear", None) is language.Qwen3_5BatchInvariantForward._linear
+                         and (linear is native_class._linear or getattr(linear, "__code__", None) is sliced))
+                seen = set()
+                for _, module in _fusion_modules(model, _modules) if stock else ():
+                    if id(module) in seen or not isinstance(module, language.Qwen4ExpGatedResidual):
+                        continue
+                    seen.add(id(module))
+                    scopes = module.__dict__.get("_unsloth_qwen4_decode_scopes", 0)
+                    if not scopes:
+                        plan = _qwen4_decode_plan(language, module)
+                        if plan is None:
+                            continue
+                        vars(module)["_unsloth_qwen4_decode_plan"] = plan   # a tuple attribute would become a child
+                    module._unsloth_qwen4_decode_scopes = scopes + 1
+                    changed.append(module)
+                if changed:
+                    if not target.__dict__.get("_unsloth_qwen4_decode_scopes"):
+                        target._hyper_connection = functools.partial(_qwen4_decode_read, target)
+                    target._unsloth_qwen4_decode_scopes = target.__dict__.get("_unsloth_qwen4_decode_scopes", 0) + 1
+                    forward = target
+        yield model
+    finally:
+        with _QWEN4_DECODE_LOCK:
+            for owner in changed + ([forward] if forward is not None else []):
+                owner._unsloth_qwen4_decode_scopes -= 1
+                if not owner._unsloth_qwen4_decode_scopes:
+                    owner.__dict__.pop("_unsloth_qwen4_decode_scopes", None)
+                    owner.__dict__.pop("_unsloth_qwen4_decode_plan", None)
+                    hook = owner.__dict__.get("_hyper_connection")
+                    if owner is forward and getattr(hook, "func", None) is _qwen4_decode_read:
+                        del owner.__dict__["_hyper_connection"]
+
 
 def _single_row(x):
     # The fused kernel reduces one row per launch, so anything wider keeps the native path.
@@ -3569,6 +4147,7 @@ def _nax_qmm_classes(route, *cache_key):
         routed = _nax_small_m_qmm(self, x, bindings)
         return nn.QuantizedEmbedding.as_linear(self, x) if routed is None else routed
 
+    _ONE_ROW_STOCK_CALLS.add(linear)   # the small-row routes start at two rows
     return {
         base: type(f"_{route.tag}SmallM{base.__name__}", (base,),
                    {name: method, "_unsloth_nax_qmm_native": base, "_unsloth_nax_qmm_route": route,
@@ -3812,6 +4391,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         nax.SORTED_GATHER_PROBE_KEY, nax.__name__, "probe_sorted_gather_qmm"):
                     fresh = [(module, rows, int8, False) for module, rows, int8, _ in fresh]
                 fresh = [entry for entry in fresh if entry[1] is not None or entry[2] or entry[3]]
+                tiled = any(rows is not None for _, rows, _, _ in fresh) and _tiled_prefill_enabled()
                 for module, rows, int8_prefill_rows, gather in fresh:
                     if type(module) in switches:
                         if int8_prefill_rows:
@@ -3822,7 +4402,8 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         continue
                     module._unsloth_nax_qmm_rows = (0, -1) if rows is None else rows
                     K = module["weight"].shape[-1] * 32 // module.bits
-                    after = min(row for row in (_DENSE_QMM_MIN_ROWS, int8_prefill_rows) if row)
+                    prefill = _TILED_QMM_MIN_ROWS if tiled else _DENSE_QMM_MIN_ROWS
+                    after = min(row for row in (prefill, int8_prefill_rows) if row)
                     module._unsloth_nax_qmm_floor = min(after, rows[0] if rows else after) * K
                     module._unsloth_nax_qmm_ceiling = (rows[1] if rows else -1) * K
                     module._unsloth_nax_qmm_next = after * K
@@ -3874,12 +4455,136 @@ def _dense_qmm_rows(M, N, K):
             2 * widest > K, next((rows for rows in (128, 64, 32) if M % rows == 0), 0))
 
 
+# Stock's transposed affine qmm (`qmm_t_impl`) at a 64x32x64 tile instead of 32x32x32: every output element
+# still sums its 32-wide K steps in the same order, so it reproduces stock's plain qmm bit for bit.
+_TILED_QMM_BITS = (2, 3, 4, 5, 6, 8)
+_TILED_QMM_GROUP_SIZES = (32, 64, 128)
+_TILED_QMM_TILE = {"BM": 64, "BK": 32, "BN": 64}
+_TILED_QMM_ARGUMENTS = ("w", "scales", "biases", "x", "y", "Xs", "Ws", "K", "N", "M", "K_eff",
+                        "tid", "lid", "simd_gid", "simd_lid")
+_TILED_QMM_SOURCE = """
+    constexpr int BM = {BM}, BK = {BK}, BN = {BN};
+    constexpr int BK_padded = (BK + 16 / sizeof(T));
+    threadgroup T Xs[BM * BK_padded];
+    threadgroup T Ws[BN * BK_padded];
+    qmm_t_impl<{template}>(w, scales, biases, x, y, Xs, Ws, K, N, M, K, threadgroup_position_in_grid,
+        thread_index_in_threadgroup, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+"""
+TILED_QMM_PROBE_KEY = "tiled_qmm:" + hashlib.sha256(
+    _TILED_QMM_SOURCE.format(template = "", **_TILED_QMM_TILE).encode()).hexdigest()[:12]
+# Releases whose quantized matmul dispatch `_tile_shape_loses` keeps clear of split-K and qmv.
+_TILED_QMM_DISPATCH_MLX = ("0.32.3", "0.32.4")
+# Stock may run qmv up to 32 rows, and fewer rows pad one 64-row tile past stock's 32-row one.
+_TILED_QMM_MIN_ROWS = _TILED_QMM_TILE["BM"] // 2 + 1
+
+
+def _tiled_qmm_source(header):
+    """The kernel body calling `header`'s `qmm_t_impl` at the wider tile; None for a signature it does not know."""
+    found = re.search(r"template\s*<([^<>]*)>\s*METAL_FUNC void qmm_t_impl\s*\(([^)]*)\)", header)
+    if found is None:
+        return None
+    named = {"T": "T", "group_size": "GS", "bits": "BITS", "aligned_N": "true", "U": "T",
+             **{name: name for name in _TILED_QMM_TILE}}
+    parameters = [parameter.partition("=")[0].split()[-1] for parameter in found.group(1).split(",")]
+    arguments = tuple(re.sub(r"\[\[.*?\]\]", "", argument).split()[-1].lstrip("*&")
+                      for argument in found.group(2).split(","))
+    if (not set(parameters) <= named.keys() or not {"aligned_N", *_TILED_QMM_TILE} <= set(parameters)
+            or arguments != _TILED_QMM_ARGUMENTS):
+        return None
+    return _TILED_QMM_SOURCE.format(template = ", ".join(named[name] for name in parameters), **_TILED_QMM_TILE)
+
+
+@functools.cache
+def _tiled_qmm_kernel():
+    try:
+        if not mx.metal.is_available():
+            return None
+        seen = set()
+        _inline("mlx/backend/metal/kernels/utils.h", seen)   # already in metal_kernel's preamble
+        header = "".join(_inline(f"mlx/backend/metal/kernels/{name}", seen, None, stop) for name, stop in (
+            ("steel/gemm/loader.h", None), ("steel/gemm/mma.h", None), ("quantized.h", "qmm_n_impl")))
+        source = _tiled_qmm_source(header)
+        return source and mx.fast.metal_kernel(
+            name = "unsloth_tiled_qmm", input_names = ["w", "scales", "biases", "x", "K", "N", "M"],
+            output_names = ["y"], header = header, source = source)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+# Stock's qmm_splitk splits K to bring its grid up to about this many threadgroups, enough to fill the GPU.
+_QMM_SPLITK_THREADGROUPS = 512
+
+
+def _tile_shape_loses(M, N):
+    """Whether the tile pads more rows than stock's 32-row tiles, or its grid has fewer threadgroups than stock's
+    split-K aims for: a quarter of stock's grid leaves the GPU idle between a layer's dependent calls.
+
+    Otherwise stock runs plain qmm: its grid is four times the tile's, and 33+ rows are past its qmv limit."""
+    BM, BN = _TILED_QMM_TILE["BM"], _TILED_QMM_TILE["BN"]
+    return -(-M // BM) * BM > -(-M // 32) * 32 or (N // BN) * -(-M // BM) < _QMM_SPLITK_THREADGROUPS
+
+
+def tiled_qmm(x, w, scales, biases, group_size, bits):
+    """`quantized_matmul(x, w, scales, biases, transpose=True)` for a 2-D x, as stock's plain qmm computes it."""
+    (M, K), N = x.shape, w.shape[0]
+    return _tiled_qmm_kernel()(
+        inputs = [w, scales, biases, x, _scalar(K), _scalar(N), _scalar(M)],
+        template = [("T", x.dtype), ("GS", group_size), ("BITS", bits)],
+        grid = (128 * (N // _TILED_QMM_TILE["BN"]), -(-M // _TILED_QMM_TILE["BM"]), 1), threadgroup = (128, 1, 1),
+        output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
+
+
+@functools.cache
+def _differentiable_tiled_qmm(group_size, bits):
+    """`tiled_qmm` with stock's vjp (Metal kernels have none); the packed weight gets zeros."""
+    def stock(x, w, scales, biases):
+        return mx.quantized_matmul(x, w, scales, biases, transpose = True, group_size = group_size, bits = bits)
+
+    @mx.custom_function
+    def routed(x, w, scales, biases):
+        return tiled_qmm(x, w, scales, biases, group_size, bits)
+
+    @routed.vjp
+    def routed_vjp(primals, cotangent, output):
+        x, w, scales, biases = primals
+        with mx.stream(mx.gpu):   # where the forward ran, as stock's vjp keeps its op's stream
+            _, (dx, ds, db) = mx.vjp(lambda x, s, b: stock(x, w, s, b), (x, scales, biases), (cotangent,))
+        return dx, mx.zeros_like(w), ds, db
+
+    return routed
+
+
+def probe_tiled_qmm():
+    """Subprocess probe: bit-identical to stock at each bit width and group size, ragged and full row tiles."""
+    for dtype, bits, group_size in itertools.product((mx.bfloat16, mx.float16), _TILED_QMM_BITS,
+                                                     _TILED_QMM_GROUP_SIZES):
+        w = mx.random.normal((4096, 512), key = mx.random.key(group_size)) * 0.05
+        w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
+        for M in (100, 256):
+            x = mx.random.normal((M, 512), key = mx.random.key(M)).astype(dtype)
+            native = mx.quantized_matmul(x, w, scales, biases, transpose = True, group_size = group_size, bits = bits)
+            got = tiled_qmm(x, w, scales, biases, group_size, bits)
+            assert mx.array_equal(got.view(mx.uint16), native.view(mx.uint16)).item(), (dtype, bits, group_size, M)
+
+
+def _tiled_prefill_enabled():
+    """Whether the tile serves here: on, stock runs no NAX kernels, and its kernel built and passed its probe."""
+    # It runs inside the dense prefill scope, so that scope's opt-out turns it off too.
+    if (any(os.environ.get(name, "1") == "0" for name in ("UNSLOTH_MLX_TILED_PREFILL", "UNSLOTH_MLX_DENSE_PREFILL"))
+            or mx.__version__ not in _TILED_QMM_DISPATCH_MLX):
+        return False
+    # Where stock runs its NAX kernels (another tile and K order) it keeps them, whatever `UNSLOTH_MLX_NAX` says.
+    return (qmm.simd_qmm_available() and _tiled_qmm_kernel() is not None and nax.kernel_probe_passed(
+        TILED_QMM_PROBE_KEY, __name__, "probe_tiled_qmm", qmm.simd_qmm_available))
+
+
 def _dense_prefill_qmm(module, x, bindings):
     """`x` times the dequantized weight for a prefill-sized call, or None when it takes the native call.
 
     MLX's quantized matmul dequantizes inside every tile; dequantizing once is the same arithmetic.
     Compared bit for bit on first use per (`_dense_qmm_rows`, shape, quantization, dtypes). Another MLX or a
     one-column output (matvec, kernel picked per row count) would need a check per prompt length: native.
+    Calls it declines go to the tiled route when that is on, exact by construction and not compared.
     """
     if mx.__version__ not in _DENSE_QMM_DISPATCH_MLX:
         return None
@@ -3893,6 +4598,8 @@ def _dense_prefill_qmm(module, x, bindings):
         return None
     if (M < _DENSE_QMM_MIN_ROWS or N == 1 or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
             or N * K > _DENSE_QMM_MAX_WEIGHTS or module.training or not _bindings_intact(bindings)):
+        if module.__dict__.get("_unsloth_tiled_qmm"):
+            return _tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings)
         return None
     group_size, bits, mode = module.group_size, module.bits, module.mode
     family = (N, K, bits, group_size, mode, x.dtype, w.dtype, scales.dtype, getattr(biases, "dtype", None))
@@ -3920,6 +4627,19 @@ def _dense_prefill_qmm(module, x, bindings):
     return dense if verified else None
 
 
+def _tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings):
+    group_size, bits, mode = module.group_size, module.bits, module.mode
+    if (mx.default_device() != mx.gpu or mode != "affine" or bits not in _TILED_QMM_BITS
+            or group_size not in _TILED_QMM_GROUP_SIZES
+            or not isinstance(biases, mx.array) or not x.dtype == scales.dtype == biases.dtype
+            or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32) or K % group_size
+            or scales.shape != (N, K // group_size) or biases.shape != scales.shape
+            or N % _TILED_QMM_TILE["BN"] or _tile_shape_loses(M, N)
+            or module.training or not _bindings_intact(bindings)):
+        return None
+    return _differentiable_tiled_qmm(group_size, bits)(x.reshape(M, K), w, scales, biases).reshape(*x.shape[:-1], N)
+
+
 @functools.cache
 def _dense_qmm_bindings(*cache_key):
     return _resolved_bindings(_DENSE_QMM_CONTRACT)
@@ -3945,6 +4665,7 @@ def _dense_qmm_class(*cache_key):
             return nn.QuantizedLinear.__call__(self, x)
         return routed + self["bias"] if "bias" in self else routed
 
+    _ONE_ROW_STOCK_CALLS.add(linear)
     return type("_DensePrefillQuantizedLinear", (nn.QuantizedLinear,), {"__call__": linear})
 
 
@@ -3957,6 +4678,11 @@ def dense_prefill_linear(model, *, _modules = None):
     training, and any shape that fails its first-use comparison keep the native call. A linear the
     NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
     `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
+
+    Where stock MLX runs no NAX kernels, affine calls this route leaves to stock's plain quantized matmul
+    run that kernel at a 64x32x64 tile instead. It sums K in stock's order, so it is bit-identical by
+    construction (checked once per MLX version by a probe, not per shape); `UNSLOTH_MLX_TILED_PREFILL=0`
+    turns that off.
     """
     changed = []
     try:
@@ -3965,6 +4691,7 @@ def dense_prefill_linear(model, *, _modules = None):
             if (os.environ.get("UNSLOTH_MLX_DENSE_PREFILL", "1") != "0"
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 fused = _dense_qmm_class(nn.QuantizedLinear.__call__)
+                tiled = None   # its probe waits for a linear it could serve
             if fused is not None:
                 seen = set()
                 for _, module in _fusion_modules(model, _modules):
@@ -3979,9 +4706,13 @@ def dense_prefill_linear(model, *, _modules = None):
                     elif module.training or type(module) is fused:
                         continue
                     else:
+                        if tiled is None:   # before this module changes, so an interrupted probe leaves none behind
+                            tiled = _tiled_prefill_enabled()
                         if type(module) is nn.QuantizedLinear:
                             module.__class__ = fused
                         module._unsloth_dense_qmm_scopes = 1
+                        if tiled:
+                            module.__dict__["_unsloth_tiled_qmm"] = True
                     changed.append((module, fused))
         yield model
     finally:
@@ -3992,6 +4723,7 @@ def dense_prefill_linear(model, *, _modules = None):
                     if type(module) is fused:   # a NAX-routed linear keeps the NAX scope's class
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
+                    module.__dict__.pop("_unsloth_tiled_qmm", None)
 
 
 # The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
@@ -4007,7 +4739,8 @@ _EXACT_VERIFY_CONTRACT = {
         "Qwen3_5BatchInvariantForward._feed_forward": ("d1c424074fbf0c21", "b04b66c926777a23"),
         "Qwen3_5BatchInvariantForward._switch_glu": "6aa1f4defb45f54a",
         "_target_verify_linear": "190517e318ba4d7b",
-        "_target_verify_linears": "2d4c9adbc50be66e",
+        # 0.7.9 also batches NVFP4 scaled linears, which are not affine, so the slices never take them.
+        "_target_verify_linears": ("2d4c9adbc50be66e", "ae9a374ec7aad3e4"),
     },
     "mlx_vlm.speculative.ops.linear": {
         "_target_verify_quantized_linear": "539dce1a6026f87e",
@@ -4034,7 +4767,10 @@ _QWEN4_FORWARD = ("mlx_vlm.models.qwen4_exp.language", "_QWEN4_BATCH_INVARIANT_F
                   "mlx_vlm.models.qwen4_exp.language", "Qwen4ExpBatchInvariantForward", "__call__", False)
 # mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
 _VERIFY_FUSED_ROWS = 8
-_VERIFY_METHODS = ("verify", "__call__", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta")
+# Pinned apart, so a drifted attention body leaves only the attention route native.
+_EXACT_ATTENTION_CONTRACT = {"mlx_vlm.models.qwen3_5.speculative_verifier": {
+    "Qwen3_5BatchInvariantForward._attention": "0c8e3b361ee34362"}}
+_VERIFY_METHODS = ("verify", "__call__", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta", "_attention")
 _VERIFY_LOCK = RLock()
 _VERIFY_VERDICTS = {}
 # The verifier is one object per process: whether a call is served is kept per thread, not on it.
@@ -4140,8 +4876,9 @@ def _taped_update(native, with_states):
                                     state_steps = steps)
                 if verdict is None:
                     try:
-                        verdict = _replay_matches(stock, replay, mask, initial)
-                    except (RuntimeError, ValueError):
+                        verdict = _settled(_replay_matches(stock, replay, mask, initial))
+                    except (RuntimeError, ValueError) as error:
+                        _unless_failed_buffer(error)
                         return stock  # inside a function transformation, which cannot evaluate; checked later
                     _TAPE_VERDICTS[key] = verdict
                     if not verdict:
@@ -4178,6 +4915,239 @@ def _taped_transaction_class(base):
         base.abort(self)
 
     return type(f"_Taped{base.__name__}", (base,), {"commit": commit, "abort": abort})
+# MLX 0.32.3's sdpa_vector_2pass_1 and _2 over a causal block of rows, each row's arithmetic and
+# order the one-row call's: key i goes to block i % BLOCKS, and a row skips the keys past its own.
+# Each simdgroup carries two rows, so a K/V load serves both; the row pairs of a threadgroup share it through L1.
+_EXACT_ATTENTION_ROWS = """
+    constexpr int qk = D / 32;
+    const int h = threadgroup_position_in_grid.x;
+    const int b = threadgroup_position_in_grid.y;
+    const int block = threadgroup_position_in_grid.z % BLOCKS;
+    const int r0 = 2 * (threadgroup_position_in_grid.z / BLOCKS * threads_per_threadgroup.z + thread_position_in_threadgroup.z);
+    const int g = thread_position_in_threadgroup.y;
+    const int lane = thread_index_in_simdgroup;
+    const int prefix = N - L;
+
+    float qr[2][qk], o[2][qk], m[2], s[2];
+    for (int r = 0; r < 2; r++) {
+        const device T* qp = q + b * q_strides[0] + (h * G + g) * q_strides[1] + min(r0 + r, L - 1) * q_strides[2] + lane * qk;
+        for (int j = 0; j < qk; j++) {
+            qr[r][j] = static_cast<float>(scale) * qp[j];
+            o[r][j] = 0;
+        }
+        m[r] = Limits<float>::finite_min;
+        s[r] = 0;
+    }
+
+    const device T* kp = k + b * k_strides[0] + h * k_strides[1] + block * k_strides[2] + lane * qk;
+    const device T* vp = v + b * v_strides[0] + h * v_strides[1] + block * v_strides[2] + lane * qk;
+    // The last threadgroup's spare row-pair slots load nothing.
+    const int end = r0 < L ? prefix + min(r0 + 2, L) : 0;
+    for (int i = block; i < end; i += BLOCKS) {
+        float kr[qk], vr[qk];
+        for (int j = 0; j < qk; j++) {
+            kr[j] = kp[j];
+            vr[j] = vp[j];
+        }
+        for (int r = 0; r < 2; r++) {
+            if (r0 + r < L && i <= prefix + r0 + r) {
+                float score = 0;
+                for (int j = 0; j < qk; j++) {
+                    score += qr[r][j] * kr[j];
+                }
+                score = simd_sum(score);
+                float new_max = max(m[r], score);
+                float factor = fast::exp(m[r] - new_max);
+                float exp_score = fast::exp(score - new_max);
+                m[r] = new_max;
+                s[r] = s[r] * factor + exp_score;
+                for (int j = 0; j < qk; j++) {
+                    o[r][j] = o[r][j] * factor + exp_score * vr[j];
+                }
+            }
+        }
+        kp += BLOCKS * k_strides[2];
+        vp += BLOCKS * v_strides[2];
+    }
+
+    for (int r = 0; r < 2 && r0 + r < L; r++) {
+        const int row = ((b * threadgroups_per_grid.x + h) * G + g) * L + r0 + r;
+        for (int j = 0; j < qk; j++) {
+            partials[(row * BLOCKS + block) * D + lane * qk + j] = static_cast<T>(o[r][j]);
+        }
+        if (lane == 0) {
+            sums[row * BLOCKS + block] = s[r];
+            maxs[row * BLOCKS + block] = m[r];
+        }
+    }
+"""
+_EXACT_ATTENTION_REDUCE = """
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int elem_per_thread = D / BD;
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+
+    float o[elem_per_thread] = {0};
+    threadgroup float outputs[BN * BD];
+
+    const int q_offset = threadgroup_position_in_grid.x * threadgroups_per_grid.y + threadgroup_position_in_grid.y;
+    partials += q_offset * BLOCKS * D + simd_gid * D + simd_lid * elem_per_thread;
+    sums += q_offset * BLOCKS;
+    maxs += q_offset * BLOCKS;
+    out += q_offset * D + simd_gid * elem_per_thread;
+
+    float sum_exp_score = 0.0;
+    float max_score = Limits<float>::finite_min;
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        max_score = max(max_score, maxs[simd_lid + BN * b]);
+    }
+    max_score = simd_max(max_score);
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        float factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
+        sum_exp_score += factor * sums[simd_lid + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        float factor = fast::exp(maxs[simd_gid] - max_score);
+        for (int i = 0; i < elem_per_thread; i++) {
+            o[i] += factor * static_cast<float>(partials[i]);
+        }
+        maxs += BN;
+        sums += BN;
+        partials += BN * D;
+    }
+    for (int i = 0; i < elem_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (simd_lid == 0) {
+        for (int i = 0; i < elem_per_thread; i++) {
+            out[i] = static_cast<T>(o[i]);
+        }
+    }
+"""
+# Below this many keys attention is too small a share of a verify round to time; above it, the kernel is timed.
+_EXACT_ATTENTION_MIN_KEYS = 8192
+# Per timing key: True once the kernel timed faster, else [timings, calls left before retiming], as short of memory the kernel can run slow for a while.
+_EXACT_ATTENTION_TIMED = {}
+_EXACT_ATTENTION_TIMINGS, _EXACT_ATTENTION_RETRY = 3, 128
+# Per (dtype, query heads per KV head): the rows kernel's threadgroup limit on this device, once a launch was refused
+# (640 on M1-class GPUs). Row pairs per threadgroup only share loads through L1, so fewer leave every row's bits as they are.
+_EXACT_ATTENTION_THREADS = {}
+
+
+@functools.cache
+def _exact_attention_kernels():
+    try:
+        if not mx.metal.is_available():
+            return None
+        return (mx.fast.metal_kernel(name = "unsloth_exact_attention_rows", input_names = ["q", "k", "v", "N", "L", "scale"],
+                                     output_names = ["partials", "sums", "maxs"], source = _EXACT_ATTENTION_ROWS,
+                                     ensure_row_contiguous = False),
+                mx.fast.metal_kernel(name = "unsloth_exact_attention_reduce", input_names = ["partials", "sums", "maxs"],
+                                     output_names = ["out"], source = _EXACT_ATTENTION_REDUCE))
+    except (AttributeError, TypeError):
+        return None
+
+
+def _sdpa_vector_blocks(gqa, keys):
+    """The block count of MLX 0.32.3's 2-pass vector SDPA for one head-dim-256 query row over `keys` keys, or None off that kernel."""
+    device = nax._gpu_architecture()[-1:]
+    if not ((device in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)) or os.environ.get("MLX_SDPA_BLOCKS"):
+        return None
+    return _vector_blocks(gqa, keys)
+
+
+def _exact_attention_rows(queries, keys, values, scale, blocks):
+    batch, heads, length, dim = queries.shape
+    kv_heads, gqa = keys.shape[1], heads // keys.shape[1]
+    pairs = -(-length // 2)
+    per_group = min(pairs, 32 // gqa, max(1, _EXACT_ATTENTION_THREADS.get((queries.dtype, gqa), 1024) // (32 * gqa)))
+    groups = -(-pairs // per_group)
+    rows = batch * heads * length
+    first, second = _exact_attention_kernels()
+    partials, sums, maxs = first(
+        inputs = [queries, keys, values, keys.shape[2], length, scale],
+        template = [("T", queries.dtype), ("D", dim), ("G", gqa), ("BLOCKS", blocks)],
+        grid = (32 * kv_heads, gqa * batch, per_group * blocks * groups), threadgroup = (32, gqa, per_group),
+        output_shapes = [(rows * blocks * dim,), (rows * blocks,), (rows * blocks,)],
+        output_dtypes = [queries.dtype, mx.float32, mx.float32])
+    return second(inputs = [partials, sums, maxs], template = [("T", queries.dtype), ("D", dim), ("BLOCKS", blocks)],
+                  grid = (1024 * batch * heads, length, 1), threadgroup = (1024, 1, 1),
+                  output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
+
+
+def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
+    """`per_row()`, mlx-vlm's one-row SDPA calls over a causal verify block, read in one pass over the KV prefix where that is faster."""
+    if (not isinstance(keys, mx.array) or not isinstance(values, mx.array) or isinstance(mask, mx.array)
+            or hasattr(cache, "bits") or hasattr(cache, "decode_attention") or queries.ndim != 4
+            or queries.dtype not in (mx.bfloat16, mx.float16) or keys.dtype != queries.dtype or values.dtype != queries.dtype
+            or queries.shape[-1] != 256 or keys.shape[-1] != 256 or values.shape[-1] != 256
+            or keys.shape[0] != queries.shape[0] or queries.shape[1] % keys.shape[1] or queries.shape[1] > 32 * keys.shape[1]
+            or _exact_attention_kernels() is None):
+        return per_row()
+    length, gqa = queries.shape[2], queries.shape[1] // keys.shape[1]
+    first = keys.shape[2] - length + 1
+    blocks = _sdpa_vector_blocks(gqa, first)
+    if first < _EXACT_ATTENTION_MIN_KEYS or blocks is None or blocks != _sdpa_vector_blocks(gqa, keys.shape[2]):
+        return per_row()
+    fused = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
+    # Each bucket is timed on its own: the kernel's advantage is not monotone in the key count (odd widths leave a pair half empty).
+    timing = (queries.shape[0], length, queries.shape[1], keys.shape[1], queries.dtype, first.bit_length())
+    if (lost := _EXACT_ATTENTION_TIMED.get(timing)) is not True:
+        if lost is not None:
+            lost[1] -= 1
+            if lost[1] > 0 or lost[0] >= _EXACT_ATTENTION_TIMINGS:
+                return per_row()
+        try:
+            mx.eval(queries, keys, values)
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return per_row()  # inside a function transformation, which cannot evaluate; timed later
+        _FIRST_USE_WORK[0] += 1
+        while True:
+            try:
+                faster = _exact_attention_faster(per_row, fused)
+                break
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                faster = False  # the kernel cannot build or launch here: a loss
+                if not _fit_threadgroup(error, queries.dtype, gqa):
+                    break
+        if not faster:
+            timings = 1 if lost is None else lost[0] + 1
+            _EXACT_ATTENTION_TIMED[timing] = [timings, _EXACT_ATTENTION_RETRY << timings]
+            return per_row()
+        _EXACT_ATTENTION_TIMED[timing] = True
+    key = ((queries.shape[0], length), "attention", queries.shape[1], keys.shape[1], queries.dtype, blocks)
+    return _verify_admitted(key, per_row, fused)
+
+
+def _fit_threadgroup(error, dtype, gqa):
+    """Whether a rows-kernel launch refused for its threadgroup size now launches within the limit MLX quoted."""
+    found = re.search(r"maximum allowed threads per threadgroup \((\d+)\)", str(error))
+    limit = int(found.group(1)) if found else 0
+    if limit < 32 * gqa or _EXACT_ATTENTION_THREADS.get((dtype, gqa), 1024) <= limit:
+        return False
+    _EXACT_ATTENTION_THREADS[(dtype, gqa)] = limit
+    return True
+
+
+def _exact_attention_faster(per_row, fused, clock = time.perf_counter):
+    """Whether `fused()` beats `per_row()` by 5% on the median of three alternating runs, after one warm run of each."""
+    mx.eval(per_row(), fused())
+    seconds = ([], [])
+    for _ in range(3):
+        for run, spent in zip((per_row, fused), seconds):
+            mx.synchronize()
+            start = clock()
+            mx.eval(run())
+            spent.append(clock() - start)
+    return sorted(seconds[1])[1] < 0.95 * sorted(seconds[0])[1]
 
 
 @functools.cache
@@ -4274,7 +5244,39 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         methods["_layer"] = submitted_layer
     if taped is not None:
         methods["_gated_delta"] = taped_gated_delta
-    return type(f"_ScopedVerify{base.__name__}", (base,), methods)
+    attention_bindings = _resolved_bindings(_EXACT_ATTENTION_CONTRACT)
+    module = sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier")
+    # Qwen3.5's verify blocks only: qwen4_exp's forward also routes its sparse attention through `_attention`.
+    if entry != "verify" or attention_bindings is None or module is None:
+        return type(f"_ScopedVerify{base.__name__}", (base,), methods)
+
+    def block_attention(self, attention, x, mask, cache, position_ids, position_embeddings):
+        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] <= 2
+                or not _bindings_intact(attention_bindings)):
+            return base._attention(self, attention, x, mask, cache, position_ids, position_embeddings)
+        # The native body for a block wider than two rows, with its one-row SDPA calls handed to `_exact_attention`.
+        batch, length, _ = x.shape
+        q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
+        queries, keys, values, gate, mask = attention._prepare_projected_qkv(
+            q_proj_output, keys, values, cache, position_ids, position_embeddings, mask)
+        if isinstance(mask, str) and mask == "left_padded_decode":
+            mask = None
+        output = self._helpers()._qwen3_5_left_padded_attention(
+            queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
+        if output is None:
+            prefix = module.kv_sequence_length(keys) - length
+
+            def per_row():
+                return mx.concatenate([module.scaled_dot_product_attention(
+                    queries[:, :, i : i + 1, :], module.slice_kv_sequence(keys, prefix + i + 1),
+                    module.slice_kv_sequence(values, prefix + i + 1), cache = cache, scale = attention.scale,
+                    mask = mask[..., i : i + 1, : prefix + i + 1] if isinstance(mask, mx.array) and mask.ndim >= 4 else None,
+                ) for i in range(length)], axis = 2)
+            output = _exact_attention(queries, keys, values, attention.scale, cache, mask, per_row)
+        output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        return self._linear(attention.o_proj, output * mx.sigmoid(gate))
+
+    return type(f"_ScopedVerify{base.__name__}", (base,), {**methods, "_attention": block_attention})
 
 
 @contextmanager
@@ -4322,11 +5324,13 @@ def exact_speculative_verify(model, *, _modules = None):
     Each layer of a verify block is submitted for evaluation as it is built, so the GPU runs while the host builds on.
     A verify block wider than the eight rows mlx-vlm's fused verify kernels serve runs each frozen
     quantized projection over balanced row slices, once its first block of that shape matched the
-    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition.
-    A block's gated-delta layers write only their final state, and the commit replays each layer over the retained
-    prefix with the same kernel instead of keeping every step's state, once replays of a key's first block matched
-    every per-step state bit for bit. Only verify calls of the language models found here are served; other,
-    training and distributed models, and an mlx-vlm whose verifier drifted, keep the native methods.
+    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition, and
+    over a long KV cache a block wider than two rows reads each full-attention layer's keys and values once per
+    pair of rows instead of once per row, where that measured faster on this device. A block's gated-delta layers
+    write only their final state, and the commit replays each layer over the retained prefix with the same kernel
+    instead of keeping every step's state, once replays of a key's first block matched every per-step state bit
+    for bit. Only verify calls of the language models found here are served; other, training and distributed
+    models, and an mlx-vlm whose verifier drifted, keep the native methods.
     """
     with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
         yield model
@@ -4368,13 +5372,13 @@ _VECTOR_ATTENTION_PASS1 = """
     const int N = keys_shape[2];
 
     const device T* qp = queries + batch * queries_strides[0] + head * queries_strides[1]
-        + row * queries_strides[2] + lane * per_thread;
+        + row * queries_strides[2] + lane * per_thread * queries_strides[3];
     const device T* kp = keys + batch * keys_strides[0] + kv_head * keys_strides[1]
-        + block * keys_strides[2] + lane * per_thread;
+        + block * keys_strides[2] + lane * per_thread * keys_strides[3];
     const device T* vp = values + batch * values_strides[0] + kv_head * values_strides[1]
-        + block * values_strides[2] + lane * per_thread;
+        + block * values_strides[2] + lane * per_thread * values_strides[3];
     for (int i = 0; i < per_thread; i++) {
-        q[i] = static_cast<U>(scale) * qp[i];
+        q[i] = static_cast<U>(scale) * qp[i * queries_strides[3]];
     }
 
     U max_score = -metal::numeric_limits<U>::max();
@@ -4384,7 +5388,7 @@ _VECTOR_ATTENTION_PASS1 = """
         if (i <= horizon) {
             U score = 0;
             for (int j = 0; j < per_thread; j++) {
-                score += q[j] * kp[j];
+                score += q[j] * kp[j * keys_strides[3]];
             }
             score = simd_sum(score);
             U new_max = max(max_score, score);
@@ -4393,7 +5397,7 @@ _VECTOR_ATTENTION_PASS1 = """
             max_score = new_max;
             sum_exp_score = sum_exp_score * factor + exp_score;
             for (int j = 0; j < per_thread; j++) {
-                o[j] = o[j] * factor + exp_score * vp[j];
+                o[j] = o[j] * factor + exp_score * vp[j * values_strides[3]];
             }
         }
         kp += BLOCKS * keys_strides[2];
@@ -4470,13 +5474,22 @@ def _vector_attention_kernels():
             mx.fast.metal_kernel(name = "unsloth_vector_attention_pass1",
                                  input_names = ["queries", "keys", "values", "scale"],
                                  output_names = ["partials", "sums", "maxs"],
-                                 source = _VECTOR_ATTENTION_PASS1, ensure_row_contiguous = False),
+                                 source = _vector_attention_source(), ensure_row_contiguous = False),
             mx.fast.metal_kernel(name = "unsloth_vector_attention_pass2",
                                  input_names = ["partials", "sums", "maxs"], output_names = ["out"],
                                  source = _VECTOR_ATTENTION_PASS2),
         )
     except (AttributeError, TypeError):
         return None
+
+
+def _vector_attention_source():
+    # Specialize unit feature strides while keeping row/head pitches dynamic.
+    contiguous = _VECTOR_ATTENTION_PASS1
+    for name in ("queries", "keys", "values"):
+        contiguous = contiguous.replace(f" * {name}_strides[3]", "")
+    return ("if (queries_strides[3] == 1 && keys_strides[3] == 1 && values_strides[3] == 1) {\n"
+            + contiguous + "\n} else {\n" + _VECTOR_ATTENTION_PASS1 + "\n}")
 
 
 @functools.cache
@@ -4492,9 +5505,11 @@ def _gpu_generation():
     return int(match.group(1)) if match else 0
 
 
-def _launch_simds():
-    # Before M3 (no dynamic caching), this kernel's pipeline allows 832 threads per threadgroup, not 1024.
-    return 32 if _gpu_generation() >= 15 else 24
+def _launch_simds(dtype = mx.bfloat16):
+    # Before M3 (no dynamic caching), this kernel's pipeline allows 768 threads per threadgroup in BF16 and 576 in F16.
+    if _gpu_generation() >= 15:
+        return 32
+    return 24 if dtype == mx.bfloat16 else 18
 
 
 def _vector_blocks(simds, keys):
@@ -4570,6 +5585,129 @@ def _two_pass_keys(keys):
     return keys >= (1024 if _gpu_class() in ("s", "d") else 4096)
 
 
+_WIDE_ATTENTION_LOCK = RLock()
+_WIDE_ATTENTION_VERDICTS = {}
+_WIDE_ATTENTION_CONTRACT = {
+    "mlx_lm.models.base": {"scaled_dot_product_attention": "9b23a7140848b172"},
+    "mlx_vlm.models.base": {"scaled_dot_product_attention": ("9b23a7140848b172", "2bc5644af48b66c9")},
+}
+
+
+def _wide_head_decode_attention(queries, keys, values, scale, mask):
+    # MLX 0.32.4 prefetches four D512 BF16 keys per thread; do not shadow a later tuned dispatch.
+    if mx.__version__ != "0.32.4":
+        return None
+    if not (mask is None or isinstance(mask, str) and mask == "causal"):
+        return None
+    if not (all(isinstance(x, mx.array) and x.ndim == 4 for x in (queries, keys, values))
+            and queries.shape[0] == keys.shape[0] == 1 and keys.shape == values.shape
+            and queries.shape[2:] == (1, 512) and keys.shape[3] == 512
+            and queries.dtype == keys.dtype == values.dtype == mx.bfloat16
+            and keys.shape[1] > 0 and queries.shape[1] == 8 * keys.shape[1]
+            and keys.shape[2] >= attention._atoi(os.environ.get("MLX_SDPA_D512_MIN_KL", "1024"))
+            and _two_pass_keys(keys.shape[2]) and _vector_attention_kernels() is not None):
+        return None
+    blocks = _vector_blocks(8, keys.shape[2])
+    key = (queries.shape[1], blocks, mx.fast.scaled_dot_product_attention)
+    verdict = _WIDE_ATTENTION_VERDICTS.get(key)
+    if verdict is False:
+        return None
+    out = _vector_attention(queries, keys, values, scale, blocks)
+    if verdict is None:
+        with _WIDE_ATTENTION_LOCK:
+            try:
+                native = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = scale, mask = mask)
+                verdict = _settled(mx.array_equal(out.view(mx.uint16), native.view(mx.uint16)).item())
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                return None
+            _WIDE_ATTENTION_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("wide-head decode attention differs from MLX for %s; keeping native attention", key)
+            return None
+    return out
+
+
+@functools.cache
+def _wide_attention_class(base, helper, cache_type):
+    # A speculative scope may already own this instance's class.
+    original = getattr(base, "_unsloth_verify_attention_native", base)
+    call = vars(original).get("__call__")
+    if not isinstance(call, FunctionType) or call.__globals__.get("scaled_dot_product_attention") is not helper:
+        return None
+    namespace = call.__globals__
+    path = helper.__module__
+    bindings = _resolved_bindings({path: _WIDE_ATTENTION_CONTRACT[path]})
+    sdpa = mx.fast.scaled_dot_product_attention
+
+    def attend(queries, keys, values, cache, scale, mask, sinks = None, **kwargs):
+        out = None
+        if not kwargs and sinks is None and (cache is None or type(cache) is cache_type):
+            out = _wide_head_decode_attention(queries, keys, values, scale, mask)
+        return helper(queries, keys, values, cache, scale, mask, sinks = sinks, **kwargs) if out is None else out
+
+    native = base.__call__
+
+    def decode_call(self, *args, **kwargs):
+        if (not self.training and not getattr(_VERIFY_STATE, "attention", False)
+                and namespace.get("scaled_dot_product_attention") is helper and _bindings_intact(bindings)
+                and mx.fast.scaled_dot_product_attention is sdpa):
+            routed = FunctionType(call.__code__, {**namespace, "scaled_dot_product_attention": attend},
+                                  call.__name__, call.__defaults__, call.__closure__)
+            routed.__kwdefaults__ = call.__kwdefaults__
+            return routed(self, *args, **kwargs)
+        return native(self, *args, **kwargs)
+
+    return type(f"_WideAttention{base.__name__}", (base,),
+                {"__call__": decode_call, "_unsloth_wide_attention_native": base})
+
+
+@contextmanager
+def fused_decode_attention(model, *, _modules = None):
+    """Route MLX 0.32.4's wide BF16 single-token decode attention through the vector kernel after bitwise agreement;
+    everything else, training and distributed models stay native."""
+    changed = []
+    try:
+        with _WIDE_ATTENTION_LOCK:
+            if mx.__version__ == "0.32.4" and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                specs = {}
+                for path, contract in _WIDE_ATTENTION_CONTRACT.items():
+                    bindings = _resolved_bindings({path: contract})
+                    cache_type = getattr(sys.modules.get(path.rsplit(".", 1)[0] + ".cache"), "KVCache", None)
+                    if bindings and cache_type is not None:
+                        specs[bindings[0][2]] = cache_type
+                for _, module in _fusion_modules(model, _modules):
+                    if not isinstance(module, nn.Module) or module.training:
+                        continue
+                    base = type(module)
+                    if getattr(base, "_unsloth_wide_attention_native", None) is not None:
+                        module._unsloth_wide_attention_scopes += 1
+                        changed.append(module)
+                        continue
+                    if getattr(module, "head_dim", None) != 512:
+                        continue
+                    original = getattr(base, "_unsloth_verify_attention_native", base)
+                    call = vars(original).get("__call__")
+                    helper = call.__globals__.get("scaled_dot_product_attention") if isinstance(call, FunctionType) else None
+                    if not isinstance(helper, FunctionType) or helper not in specs or "scaled_dot_product_attention" not in call.__code__.co_names:
+                        continue
+                    patched = _wide_attention_class(base, helper, specs[helper])
+                    if patched is not None:
+                        module.__class__ = patched
+                        module._unsloth_wide_attention_scopes = 1
+                        changed.append(module)
+        yield model
+    finally:
+        with _WIDE_ATTENTION_LOCK:
+            for module in reversed(changed):
+                scopes = module.__dict__.get("_unsloth_wide_attention_scopes", 0)
+                if scopes > 1:
+                    module._unsloth_wide_attention_scopes = scopes - 1
+                    continue
+                module.__dict__.pop("_unsloth_wide_attention_scopes", None)
+                module.__class__ = type(module)._unsloth_wide_attention_native
+
+
 def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
     """A verify block's head-dim-512 causal attention on MLX's vector kernel, or None for the native call."""
     if not (isinstance(mask, str) and mask == "causal" and (cache is None or type(cache) is kv_cache)
@@ -4583,7 +5721,7 @@ def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
             and _vector_attention_kernels() is not None):
         return None
     rows, gqa = queries.shape[2], queries.shape[1] // keys.shape[1]
-    step = _launch_simds() // gqa   # a launch holds gqa * rows simdgroups
+    step = _launch_simds(queries.dtype) // gqa   # a launch holds gqa * rows simdgroups
     outs = []
     for start in range(0, rows, step):
         stop = min(start + step, rows)
@@ -4720,7 +5858,8 @@ def _qsa_select_route(native, bindings):
         selection = native(self, qk, cache, position_ids)
         pooled = getattr(cache, "index_block_keys", None)
         # The native top-k is still lazy; once the picks replace it, it is never evaluated.
-        if (selection is None or not selection.zero_padding or not isinstance(pooled, mx.array)
+        # The kernel needs a positive budget: a config whose indexer budget is under one block leaves it at 0.
+        if (selection is None or not selection.zero_padding or not isinstance(pooled, mx.array) or self.block_topk < 1
                 or pooled.shape[2] <= self.block_topk or self.training or not _bindings_intact(bindings)):
             return selection
         batch, rows, _ = qk.shape
@@ -4746,6 +5885,7 @@ def _qsa_select_route(native, bindings):
             selection.selected_blocks = picks
         return selection
 
+    select_from_projected._unsloth_exact_route_of = native
     return select_from_projected
 
 
@@ -4845,6 +5985,402 @@ def fast_qsa_prefill(model, *, _modules = None):
 
     return _qsa_routes(model, _modules, enter)
 
+# mlx-vlm gathers SSD-backed Qwen4-Exp PLE rows by fancy-indexing memory maps: a row on a page that is not in
+# core is a serial page fault taken with the GIL held, and even a cached page costs a fault to map. Cold rows are
+# read with concurrent preads instead, which release the GIL, and handed to the unchanged gather in place of the
+# memory map reads it would make.
+_PLE_STORAGE = "mlx_vlm.models.qwen4_exp.ple_storage"
+_PLE_READ_CONTRACT = {_PLE_STORAGE: {"QuantizedMMapNGramEmbedding._read_rows": "4a31310895b56550"}}
+_PLE_READ_LOCK = RLock()
+_PLE_READ_CLASSES = {}
+_PLE_PENDING = local()  # this thread's reads for the gather it is running
+_PLE_READ_WORKERS = 32
+# A pread costs a few microseconds of Python per row, more than a gather from mapped resident pages, so a gather
+# whose sampled new rows are all in core keeps the memory map read; one cold page in a hundred already costs more.
+_PLE_RESIDENT_SAMPLE = 256
+_PLE_RESIDENT = 0.99
+
+
+@functools.cache
+def _ple_read_pool():
+    from concurrent.futures import ThreadPoolExecutor
+    return ThreadPoolExecutor(_PLE_READ_WORKERS, thread_name_prefix = "unsloth-ple-read")
+
+
+@functools.cache
+def _mincore():
+    import ctypes
+    import ctypes.util
+    try:
+        function = ctypes.CDLL(ctypes.util.find_library("c"), use_errno = True).mincore
+    except (OSError, AttributeError, TypeError):
+        return None
+    function.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+    function.restype = ctypes.c_int
+    return function
+
+
+def _ple_resident(reads):
+    """Fraction of a fixed-stride sample of these (memmap, rows) reads' pages in core; 0 when it cannot tell."""
+    import ctypes
+    mincore, page = _mincore(), os.sysconf("SC_PAGESIZE")
+    step = max(1, sum(len(rows) for _, rows in reads) // _PLE_RESIDENT_SAMPLE)
+    taken, probed, resident = 0, 0, 0
+    vector = ctypes.create_string_buffer(2)
+    for memmap, rows in reads:
+        stride = memmap.strides[0]
+        for row in rows[(-taken) % step::step].tolist():
+            address = memmap.ctypes.data + row * stride
+            start = address - address % page
+            pages = -(-(address + stride - start) // page)
+            if pages > len(vector) or mincore(start, pages * page, vector) != 0:
+                return 0.0
+            probed += pages
+            resident += sum(byte & 1 for byte in vector.raw[:pages])
+        taken += len(rows)
+    return resident / probed if probed else 1.0
+
+
+class _PreadMap:
+    """A row-major memory map; a gather of the rows this thread already read returns those reads."""
+
+    def __init__(self, memmap):
+        self.memmap = memmap
+
+    def __getitem__(self, index):
+        read = (getattr(_PLE_PENDING, "reads", None) or {}).get(id(self))
+        if read is not None and np.array_equal(index, read[0]):
+            return read[1]
+        return self.memmap[index]
+
+    def __getattr__(self, name):
+        return getattr(self.memmap, name)
+
+
+def _ple_read(chunk):
+    for descriptor, offset, view in chunk:
+        while view:  # a regular file reads short only at its end, which the manifest's ranges never pass
+            count = os.preadv(descriptor, [view], offset)
+            if count <= 0:
+                raise OSError("short PLE read")
+            view, offset = view[count:], offset + count
+
+
+def _ple_pread_rows(table, row_ids):
+    """{id(map): (rows, values)} for each map of a gather whose new rows are cold, those rows read concurrently."""
+    ids = np.asarray(row_ids, dtype = np.int64)
+    cache = table._cache
+    missing = ids if not cache else ids[np.fromiter((row not in cache for row in ids.tolist()), bool, len(ids))]
+    # Rows this table already read are taken as resident, so a gather of only those skips the residency probe.
+    seen = table.__dict__.get("_unsloth_ple_seen")
+    if seen is None:
+        seen = table._unsloth_ple_seen = np.zeros(-(-table.row_count // 8), np.uint8)
+    byte, bit = missing >> 3, np.left_shift(1, missing & 7).astype(np.uint8)
+    new = (seen[byte] & bit) == 0
+    if not new.any():
+        return None
+    np.bitwise_or.at(seen, byte[new], bit[new])
+    if table._interleaved is not None:
+        parts = [([table._interleaved], missing, new)]
+    else:
+        # The gather slices each shard's rows in the order it meets them, and a read must match that slice.
+        shard = np.searchsorted(np.array([end for _, end, _ in table._shards]), missing, side = "right")
+        parts = []
+        for index in np.unique(shard[new]).tolist():
+            start, _, arrays = table._shards[index]
+            part = np.flatnonzero(shard == index)
+            parts.append((list(arrays.values()), missing[part] - start, new[part]))
+    # A row's scales and biases are read with its weights, so the first map's pages stand for all of them.
+    if _ple_resident([(maps[0].memmap, rows[fresh]) for maps, rows, fresh in parts]) >= _PLE_RESIDENT:
+        return None
+    files, work, pending = {}, [], {}
+    try:
+        for maps, rows, fresh in parts:
+            for wrapped in maps:
+                memmap = wrapped.memmap
+                if memmap.filename not in files:
+                    files[memmap.filename] = os.open(memmap.filename, os.O_RDONLY)
+                values = np.empty((len(rows), *memmap.shape[1:]), memmap.dtype)
+                if not fresh.all():
+                    values[~fresh] = memmap[rows[~fresh]]
+                pending[id(wrapped)] = rows, values
+                views, stride = memoryview(values.reshape(-1).view(np.uint8)), memmap.strides[0]
+                work += [(files[memmap.filename], memmap.offset + row * stride, views[i * stride:(i + 1) * stride])
+                         for i, row in zip(np.flatnonzero(fresh).tolist(), rows[fresh].tolist())]
+        step = -(-len(work) // _PLE_READ_WORKERS)
+        list(_ple_read_pool().map(_ple_read, [work[i:i + step] for i in range(0, len(work), step)]))
+    finally:
+        for descriptor in files.values():
+            os.close(descriptor)
+    return pending
+
+
+def _ple_read_class(base, bindings):
+    if base not in _PLE_READ_CLASSES:  # built on the first resolution, whose bindings it rechecks
+
+        def _read_rows(self, row_ids):
+            pending = None
+            if _bindings_intact(bindings):
+                try:
+                    pending = _ple_pread_rows(self, row_ids)
+                except OSError:
+                    pass  # the gather reads the memory maps itself
+            _PLE_PENDING.reads = pending
+            try:
+                return base._read_rows(self, row_ids)
+            finally:
+                _PLE_PENDING.reads = None
+
+        _PLE_READ_CLASSES[base] = type(f"_Pread{base.__name__}", (base,), {"_read_rows": _read_rows})
+    return _PLE_READ_CLASSES[base]
+
+
+def _ple_wrap_maps(table):
+    table._shards = [(start, end, {name: _PreadMap(memmap) for name, memmap in arrays.items()})
+                     for start, end, arrays in table._shards]
+    if table._interleaved is not None:
+        table._interleaved = _PreadMap(table._interleaved)
+
+
+def _ple_unwrap_maps(table):
+    table._shards = [(start, end, {name: getattr(wrapped, "memmap", wrapped) for name, wrapped in arrays.items()})
+                     for start, end, arrays in table._shards]
+    table._interleaved = getattr(table._interleaved, "memmap", table._interleaved)
+
+
+@contextmanager
+def exact_ple_row_reads(model, *, _modules = None):
+    """Read cold SSD-backed Qwen4-Exp PLE rows with concurrent preads, byte for byte the memory map's rows.
+
+    mlx-vlm's own gather still assembles every row. Tables return to their own class and memory maps when the
+    last scope holding them exits.
+    """
+    changed = []
+    try:
+        with _PLE_READ_LOCK:
+            base = getattr(sys.modules.get(_PLE_STORAGE), "QuantizedMMapNGramEmbedding", None)
+            if base is not None and hasattr(os, "preadv") and _mincore() is not None:
+                bindings = None
+                for _, module in _fusion_modules(model, _modules):
+                    table = getattr(module, "ngram_embedding", None)
+                    if not isinstance(table, base):
+                        continue
+                    if table.__dict__.get("_unsloth_ple_scopes"):
+                        table._unsloth_ple_scopes += 1
+                        changed.append(table)
+                        continue
+                    if type(table) is not base:
+                        continue
+                    if bindings is None:
+                        bindings = _resolved_bindings(_PLE_READ_CONTRACT) or ()
+                    if not bindings:
+                        break
+                    _ple_wrap_maps(table)
+                    table.__class__ = _ple_read_class(base, bindings)
+                    table._unsloth_ple_scopes = 1
+                    changed.append(table)
+        yield model
+    finally:
+        with _PLE_READ_LOCK:
+            for table in reversed(changed):
+                table._unsloth_ple_scopes -= 1
+                if not table._unsloth_ple_scopes:
+                    del table._unsloth_ple_scopes
+                    _ple_unwrap_maps(table)
+                    if type(table) in _PLE_READ_CLASSES.values():
+                        table.__class__ = type(table).__base__
+
+
+# mlx-vlm's QSA caches drop every pooled indexer block on trim, so the indexer call after a speculative
+# rollback re-pools the whole context on each QSA layer.
+_QSA_LANGUAGE = "mlx_vlm.models.qwen4_exp.language"
+_QSA_TRIM_CACHES = ("QSAKVCache", "QSAQuantizedKVCache", "BatchQSAKVCache")
+_QSA_TRIM_CONTRACT = {_QSA_LANGUAGE: {
+    "QSAKVCache.trim": "408373696f053090",
+    "QSAQuantizedKVCache.trim": "408373696f053090",
+    "BatchQSAKVCache.trim": "c26b5cd8d0d2cc19",
+    # Extends a cached prefix of pooled blocks, pooling only the blocks after it.
+    "Qwen4ExpQSAIndexer.select_from_projected": "379bb821075d65a8",
+}}
+_QSA_TRIM_LOCK = RLock()
+_QSA_TRIM_HELD = []  # [open scopes, [(cache class, native trim, route)]]
+
+
+def _qsa_trim_route(native, bindings):
+    def trim(self, n):
+        blocks, ratio = self.index_block_keys, self.index_block_ratio
+        trimmed = native(self, n)
+        if blocks is not None and ratio and self.index_keys is not None and _bindings_intact(bindings):
+            # A block below the kept complete-block count pools only keys the trim left in place.
+            length = getattr(self, "index_offset", self.index_keys.shape[1])
+            self.index_block_keys, self.index_block_ratio = blocks[:, :, : length // ratio], ratio
+        return trimmed
+
+    return trim
+
+
+@contextmanager
+def exact_qsa_trim(model, *, _modules = None):
+    """Keep the pooled QSA indexer blocks a cache trim leaves complete; the indexer re-pools only the tail.
+
+    The kept blocks are the ones a re-pool would rebuild bit for bit. The QSA caches' `trim` is rebound
+    process-wide while any scope is open. `UNSLOTH_MLX_QSA_TRIM_KEEPS_BLOCKS=0` turns this off.
+    """
+    entered = False
+    try:
+        with _QSA_TRIM_LOCK:
+            language = sys.modules.get(_QSA_LANGUAGE)
+            indexer = getattr(language, "Qwen4ExpQSAIndexer", None)
+            if (os.environ.get("UNSLOTH_MLX_QSA_TRIM_KEEPS_BLOCKS", "1") != "0" and indexer is not None
+                    and any(isinstance(module, indexer) for _, module in _fusion_modules(model, _modules))):
+                if not _QSA_TRIM_HELD:
+                    bindings = _resolved_bindings(_QSA_TRIM_CONTRACT)
+                    if bindings is not None:
+                        classes = [getattr(language, name) for name in _QSA_TRIM_CACHES]
+                        natives = [vars(cls)["trim"] for cls in classes]
+                        kept = [binding for binding in bindings if binding[2] not in natives]
+                        routes = [(cls, native, _qsa_trim_route(native, kept)) for cls, native in zip(classes, natives)]
+                        for cls, _, route in routes:
+                            cls.trim = route
+                        _QSA_TRIM_HELD[:] = [0, routes]
+                if _QSA_TRIM_HELD:
+                    _QSA_TRIM_HELD[0] += 1
+                    entered = True
+        yield model
+    finally:
+        with _QSA_TRIM_LOCK:
+            if entered:
+                _QSA_TRIM_HELD[0] -= 1
+                if not _QSA_TRIM_HELD[0]:
+                    for cls, native, route in _QSA_TRIM_HELD[1]:
+                        if vars(cls).get("trim") is route:
+                            cls.trim = native
+                    _QSA_TRIM_HELD.clear()
+
+
+# MLX takes its depthwise kernel only without dilation, so a dilated depthwise convolution (the Qwen4-Exp
+# PLE short conv) runs as a grouped implicit GEMM with one group per channel.
+_DEPTHWISE_CONV_CONTRACT = {"mlx.nn.layers.convolution": {"Conv1d.__call__": "e6c4e02415104dd1"}}
+_DEPTHWISE_CONV_DTYPES = (mx.bfloat16, mx.float16, mx.float32)
+_DEPTHWISE_CONV_LOCK = RLock()
+_DEPTHWISE_CONV_CLASS = []
+_DEPTHWISE_CONV_SOURCE = """
+    uint c = thread_position_in_grid.x;
+    uint t = thread_position_in_grid.y;
+    uint b = thread_position_in_grid.z;
+    size_t rows = threads_per_grid.y;
+    const device T* src = x + ((size_t)b * (rows + (K - 1) * DIL) + t) * C + c;
+    float acc = 0.0f;
+    for (int i = 0; i < K; ++i) {
+        acc += static_cast<float>(src[(size_t)i * DIL * C]) * static_cast<float>(w[c * K + i]);
+    }
+    y[((size_t)b * rows + t) * C + c] = static_cast<T>(acc);
+"""
+
+
+@functools.cache
+def _depthwise_conv_kernel():
+    return mx.fast.metal_kernel(name = "unsloth_depthwise_conv1d", input_names = ["x", "w"],
+                                output_names = ["y"], source = _DEPTHWISE_CONV_SOURCE)
+
+
+def _depthwise_conv(x, weight, dilation):
+    batch, rows, channels = x.shape
+    taps = weight.shape[1]
+    rows -= (taps - 1) * dilation
+    return _depthwise_conv_kernel()(
+        inputs = [x, weight], template = [("T", x.dtype), ("C", channels), ("K", taps), ("DIL", dilation)],
+        grid = (channels, rows, batch), threadgroup = (min(channels, 256), 1, 1),
+        output_shapes = [(batch, rows, channels)], output_dtypes = [x.dtype],
+    )[0]
+
+
+@functools.cache
+def _depthwise_conv_verified(dtype, channels, taps, dilation):
+    keys = mx.random.split(mx.random.key(channels), 3)
+    weight = mx.random.normal((channels, taps, 1), key = keys[0]).astype(dtype)
+    for rows, scale, key in ((1, 1, keys[1]), (67, 64, keys[2])):
+        x = (mx.random.normal((2, rows + (taps - 1) * dilation, channels), key = key) * scale).astype(dtype)
+        native, fused = mx.conv1d(x, weight, dilation = dilation, groups = channels), _depthwise_conv(x, weight, dilation)
+        if not _settled(mx.array_equal(fused.view(mx.uint8), native.view(mx.uint8)).item()):
+            logger.warning("the depthwise convolution kernel differs from mx.conv1d for %s, %d channels, %d taps "
+                           "and dilation %d; the native convolution stays in use", dtype, channels, taps, dilation)
+            return False
+    return True
+
+
+def _depthwise_conv_class(bindings):
+    if not _DEPTHWISE_CONV_CLASS:  # built on the first resolution, whose bindings it rechecks
+        native = nn.Conv1d.__call__
+
+        def __call__(self, x):
+            weight = self.weight
+            # The scope verified this weight's dtype and geometry before switching the layer.
+            if (self.training or not _bindings_intact(bindings) or x.ndim != 3 or x.dtype != weight.dtype
+                    or x.shape[2] != weight.shape[0] or x.shape[1] <= (weight.shape[1] - 1) * self.dilation
+                    or mx.default_device() != mx.gpu):
+                return native(self, x)
+            y = _depthwise_conv(x, weight, self.dilation)
+            if "bias" in self:
+                y = y + self.bias
+            return y
+
+        _DEPTHWISE_CONV_CLASS.append(type("_DepthwiseConv1d", (nn.Conv1d,), {"__call__": __call__}))
+    return _DEPTHWISE_CONV_CLASS[0]
+
+
+def _depthwise_conv_eligible(module):
+    weight = module.get("weight")
+    return (type(module) is nn.Conv1d and not module.training and isinstance(weight, mx.array)
+            and weight.ndim == 3 and weight.shape[2] == 1 and weight.dtype in _DEPTHWISE_CONV_DTYPES
+            and module.groups == weight.shape[0] and module.stride == 1 and module.padding == 0
+            and module.dilation > 1)
+
+
+@contextmanager
+def exact_dilated_depthwise_conv(model, *, _modules = None):
+    """Run dilated depthwise `nn.Conv1d` layers on a depthwise kernel, bit-identical to `mx.conv1d`.
+
+    Each dtype and geometry is compared bit for bit against `mx.conv1d` before a layer is switched,
+    and layers return to `nn.Conv1d` when the last scope holding them exits.
+    """
+    changed = []
+    try:
+        with _DEPTHWISE_CONV_LOCK:
+            if mx.metal.is_available() and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                bindings = None
+                for _, module in _fusion_modules(model, _modules):
+                    if not isinstance(module, nn.Module):
+                        continue
+                    if module.__dict__.get("_unsloth_depthwise_scopes"):
+                        module._unsloth_depthwise_scopes += 1
+                        changed.append(module)
+                        continue
+                    if not _depthwise_conv_eligible(module):
+                        continue
+                    if bindings is None:
+                        bindings = _resolved_bindings(_DEPTHWISE_CONV_CONTRACT) or ()
+                    try:
+                        if not bindings or not _depthwise_conv_verified(module.weight.dtype, *module.weight.shape[:2],
+                                                                        module.dilation):
+                            continue
+                    except RuntimeError as error:  # nothing was cached, so a later scope retries
+                        _unless_failed_buffer(error)
+                        continue
+                    module.__class__ = _depthwise_conv_class(bindings)
+                    module._unsloth_depthwise_scopes = 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _DEPTHWISE_CONV_LOCK:
+            for module in reversed(changed):
+                module._unsloth_depthwise_scopes -= 1
+                if not module._unsloth_depthwise_scopes:
+                    del module._unsloth_depthwise_scopes
+                    if _DEPTHWISE_CONV_CLASS and type(module) is _DEPTHWISE_CONV_CLASS[0]:
+                        module.__class__ = nn.Conv1d
+
+
 class InferenceScope(NamedTuple):
     """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
     `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
@@ -4877,11 +6413,17 @@ INFERENCE_SCOPES = [
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_qsa_attention),
     InferenceScope(fast_qsa_prefill),
+    InferenceScope(fused_qwen4_prefill),
+    InferenceScope(fused_qwen4_decode),
     InferenceScope(fused_residual_norm_handoff),
     # qwen4_exp decodes on the forward its verify blocks run on, so every generation holds this one.
     InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
+    InferenceScope(fused_decode_attention),
+    InferenceScope(exact_ple_row_reads),
+    InferenceScope(exact_qsa_trim),
+    InferenceScope(exact_dilated_depthwise_conv),
 ]
 
 

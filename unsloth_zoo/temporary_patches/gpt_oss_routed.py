@@ -35,6 +35,7 @@ from .moe_routed import (
     ACT_GPTOSS,
     ROUTED_MAX_SLOTS,
     _bf16_supported,
+    _bf16_supported_index,
     _lora_delta,
     routed_bf16_gemm,
     routed_bf16_moe,
@@ -449,7 +450,11 @@ def routed_bf16_eligible(experts, hidden_states):
             return False
         if w.dtype == torch.bfloat16 and not _bf16_supported(w.device):
             return False
-    return True
+    # Below sm80 (T4) only one-token decode routes (moe_routed.sub_sm80_devices). Per device, not
+    # sub_sm80_devices(): its first call runs torch.cuda.device_count(), which a cold fullgraph trace rejects.
+    if hidden_states.numel() == hidden_states.shape[-1] or w.device.index is None:
+        return True
+    return _bf16_supported_index(w.device.index)
 
 
 def routed_bf16_forward(experts, hidden_states, router_indices, routing_weights):

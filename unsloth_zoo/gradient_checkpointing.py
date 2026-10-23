@@ -1222,7 +1222,13 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             # still answers True here, so this is inert until unsloth patches the probe.
             SUPPORTS_BFLOAT16 = torch.cuda.is_bf16_supported()
         elif DEVICE_TYPE == "xpu":
-            SUPPORTS_BFLOAT16 = True
+            # One buffer dtype for the pool below, which covers every visible XPU.
+            from .device_type import _xpu_bf16_supported
+            try:
+                _xpu_indices = list(range(torch.xpu.device_count()))
+            except Exception:
+                _xpu_indices = None
+            SUPPORTS_BFLOAT16 = _xpu_bf16_supported(_xpu_indices or None)
         elif DEVICE_TYPE == "npu":
             SUPPORTS_BFLOAT16 = torch.npu.is_bf16_supported()
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16

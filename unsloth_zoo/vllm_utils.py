@@ -120,7 +120,13 @@ pass
 
 def get_mem_info():
     if DEVICE_TYPE == "xpu":
-        free_memory, total_memory = torch.xpu.mem_get_info()
+        try:
+            free_memory, total_memory = torch.xpu.mem_get_info()
+        except Exception:
+            # Raises on some Intel GPUs (Arc B580, Lunar Lake)
+            index = torch.xpu.current_device()
+            total_memory = torch.xpu.get_device_properties(index).total_memory
+            free_memory = total_memory - torch.xpu.memory_reserved(index)
     elif DEVICE_TYPE == "npu":
         free_memory, total_memory = torch.npu.mem_get_info()
     else:
@@ -1925,6 +1931,24 @@ def _native_config_for_vllm_rebuild(config):
 pass
 
 
+# Embeddings stored under another name: Nemotron-H keeps `embeddings` (see get_vllm_state_dict).
+_EXTRA_EMBED_KEYS = ("model.embeddings.weight",)
+
+
+def _shared_weight_dtype(quant_state_dict, dtype):
+    """The dtype to build the Hugging Face side in. On XPU the loader and vLLM can judge bf16 on different
+    devices (vLLM refuses bf16 on an Arc A770; a released unsloth judges an unused emulating XPU), so
+    follow the fp16 / bf16 embedding vLLM shares in either direction, never a guess."""
+    if DEVICE_TYPE != "xpu" or dtype not in (torch.float16, torch.bfloat16):
+        return dtype
+    for key in TIED_EMBED_KEYS + _EXTRA_EMBED_KEYS:
+        weight = getattr(quant_state_dict.get(key, None), "data", quant_state_dict.get(key, None))
+        if isinstance(weight, torch.Tensor):
+            return weight.dtype if weight.dtype in (torch.float16, torch.bfloat16) else dtype
+    return dtype
+pass
+
+
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1932,6 +1956,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     def _unwrap_tensor(value):
         return getattr(value, "data", value)
 
+    dtype = _shared_weight_dtype(quant_state_dict, dtype)
     config = _native_config_for_vllm_rebuild(config)
     set_dtype_in_config(config, dtype)
     for subconfig_name in ("text_config", "vision_config", "audio_config"):
@@ -2203,6 +2228,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
+    # patch_model_and_tokenizer reads this: the loader's dtype may differ (see _shared_weight_dtype).
+    new_model._unsloth_vllm_dtype = dtype
     return new_model
 pass
 
@@ -3589,17 +3616,76 @@ pass
 def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
     """vLLM samples every row of config.vocab_size and ignores generation_config.suppress_tokens,
     so alignment rows from add_new_tokens(pad_to_multiple_of = ...) could be emitted as ids no
-    tokenizer token has. Bias them to -100 on every request the engine core receives.
+    tokenizer token has. Bias them to -inf on every request the engine core receives: a finite bias
+    such as the OpenAI API's -100 only shifts the row, so a large enough logit could still win.
+    Records the bias on llm._unsloth_padded_vocab_bias so GRPO support scoring can apply it too.
     Idempotent."""
+    pad_bias = float("-inf")
+    bias = {int(i): pad_bias for i in padded_ids}
+    engine = getattr(llm, "llm_engine", None) or llm
+    masked = []
+
+    def _record():
+        try:
+            llm._unsloth_padded_vocab_bias = (tuple(bias), pad_bias)
+        except Exception:
+            pass
+        return llm
+
+    def _mask_in_model():
+        # The runner samples and verifies drafts from compute_logits; needs an in-process engine.
+        if masked:
+            return True
+        try:
+            core = getattr(engine, "engine_core", None)
+            core = getattr(core, "engine_core", core)
+            executor = getattr(core, "model_executor", None) or engine.model_executor
+            runner = executor.driver_worker.model_runner
+            model = runner.model
+            method = model.compute_logits
+        except Exception:
+            return False
+        if getattr(runner, "batch_sharder", None) is not None:
+            # Batch-sharded sampling (MRV2, TP > 1) bypasses compute_logits.
+            try:
+                runner.batch_sharder = None
+            except Exception:
+                return False
+            print("Unsloth: batch-sharded sampling is turned off so padded vocabulary rows stay masked.")
+        if not getattr(method, "_unsloth_padded_vocab", False):
+            indices = {}
+            pad_ids = list(bias)
+
+            @functools.wraps(method)
+            def compute_logits_without_padded_vocab(*args, **kwargs):
+                logits = method(*args, **kwargs)
+                if isinstance(logits, torch.Tensor) and logits.ndim > 0:
+                    key = (logits.device, logits.shape[-1])
+                    index = indices.get(key)
+                    if index is None:
+                        ids = [i for i in pad_ids if i < logits.shape[-1]]
+                        index = indices[key] = torch.tensor(ids, dtype = torch.long, device = logits.device)
+                    logits.index_fill_(-1, index, pad_bias)
+                return logits
+
+            compute_logits_without_padded_vocab._unsloth_padded_vocab = True
+            try:
+                model.compute_logits = compute_logits_without_padded_vocab
+            except Exception:
+                return False
+        masked.append(True)
+        return True
+
     if speculative:
         # SamplingParams._validate_spec_decode rejects any logit_bias under speculative decoding
         # (vLLM 0.29; older V1 drops it with a warning), so biasing would fail every request.
+        if _mask_in_model():
+            return _record()
         print(
             "Unsloth: vLLM does not support logit_bias with speculative decoding, so this padded "
             "vocabulary's alignment rows stay sampleable."
         )
         return llm
-    bias = {int(i): -100.0 for i in padded_ids}
     try:
         # Model Runner V2 refuses a request with more logit_bias entries than this.
         from vllm.v1.worker.gpu.sample.logit_bias import MAX_NUM_LOGIT_BIAS_TOKENS as max_bias
@@ -3613,10 +3699,12 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
             # Pooling request: nothing is sampled.
             return
         current = params.logit_bias or {}
-        if all(current.get(i) == -100.0 for i in bias):
+        if all(current.get(i) == pad_bias for i in bias):
             return
         merged = {**current, **bias}
         if len(merged) > max_bias:
+            if _mask_in_model():
+                return
             if not warned:
                 warned.append(True)
                 print(
@@ -3632,8 +3720,12 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
     # add_request / add_request_async: LLM.generate / chat / enqueue, LLMEngine and AsyncLLM
     # add_request (also with a prebuilt EngineCoreRequest), n > 1 children and AsyncLLM streaming
     # input chunks. Biasing there covers them all, once per request.
-    engine = getattr(llm, "llm_engine", None) or llm
     client = getattr(engine, "engine_core", None)
+    v1 = client is not None and any(
+        getattr(client, name, None) is not None for name in ("add_request", "add_request_async")
+    )
+    if v1 and len(bias) > max_bias and _mask_in_model():
+        return _record()
     hooked = False
     for name in ("add_request", "add_request_async"):
         method = getattr(client, name, None) if client is not None else None
@@ -3676,7 +3768,7 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
                 index = indices.get(logits.device)
                 if index is None:
                     index = indices[logits.device] = torch.tensor(pad_ids, dtype = torch.long, device = logits.device)
-                logits[index] += -100.0
+                logits[index] = pad_bias
                 return logits
 
             @functools.wraps(method)
@@ -3693,7 +3785,10 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
 
             _add_processed_request_without_padded_vocab._unsloth_padded_vocab = True
             v0._add_processed_request = _add_processed_request_without_padded_vocab
-    return llm
+    elif len(bias) > max_bias:
+        # Every request is refused the bias in _bias_request: nothing is suppressed.
+        return llm
+    return _record()
 pass
 
 
@@ -3801,6 +3896,73 @@ def _warn_fp32_lm_head_set_late():
             "`import unsloth` for matching logprobs."
         )
     return bool(stale)
+
+
+# vLLM's "auto" keeps the Gated DeltaNet state in the model dtype unless the config names one
+# (Qwen3-Next does not); training uses float32, so a bf16 rollout state drifts logprobs.
+_VLLM_MAMBA_SSM_DTYPE_ALIASES = {"fp32": "float32", "bf16": "bfloat16", "fp16": "float16"}
+
+
+def _vllm_mamba_dtype_choices():
+    # vLLM 0.11.2 accepts "auto" / "float32"; later ones add "float16" / "bfloat16".
+    try:
+        import typing
+        from vllm.config.cache import MambaDType
+        choices = tuple(typing.get_args(MambaDType))
+        if choices:
+            return choices
+    except Exception:
+        pass
+    return ("auto", "float32")
+
+
+def _vllm_gdn_reads_ssm_dtype():
+    # Before vLLM 0.17 the Gated DeltaNet state ignores mamba_ssm_cache_dtype.
+    try:
+        import inspect
+        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
+        fn = MambaStateDtypeCalculator.gated_delta_net_state_dtype
+        return "mamba_ssm_cache_dtype" in inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+
+def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices = None, gdn_reads_ssm = None):
+    # (engine args to add, message or None). Unset env: nothing is passed.
+    value = os.environ.get("UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE", "").strip().lower()
+    value = _VLLM_MAMBA_SSM_DTYPE_ALIASES.get(value, value)
+    has_arg = "mamba_ssm_cache_dtype" in engine_arg_keys
+    # Gated DeltaNet only: MiniMax ignores the field and KDA rejects float16.
+    text_config = getattr(config, "text_config", None) or config
+    is_gdn = getattr(text_config, "linear_key_head_dim", None) is not None
+    if is_gdn and has_arg and gdn_reads_ssm is None:
+        gdn_reads_ssm = _vllm_gdn_reads_ssm_dtype()
+    if not value:
+        if (training and has_arg and is_gdn and gdn_reads_ssm
+                and getattr(text_config, "mamba_ssm_dtype", None) is None):
+            return {}, (
+                "Unsloth: vLLM keeps this model's Gated DeltaNet state in the model dtype during "
+                "rollouts. Set UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE=float32 to match training more closely."
+            )
+        return {}, None
+    if not has_arg:
+        return {}, "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: this vLLM has no mamba_ssm_cache_dtype."
+    choices = _vllm_mamba_dtype_choices() if choices is None else choices
+    if value not in choices:
+        return {}, (
+            f"Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE={value!r} ignored: this vLLM accepts {', '.join(choices)}."
+        )
+    if not is_gdn:
+        return {}, (
+            "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: it is only supported for Gated DeltaNet "
+            "models (Qwen3-Next, Qwen3.5)."
+        )
+    if not gdn_reads_ssm:
+        return {}, (
+            "Unsloth: UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE ignored: this vLLM sizes the Gated DeltaNet "
+            "state from mamba_cache_dtype only (vLLM < 0.17)."
+        )
+    return {"mamba_ssm_cache_dtype": value}, None
 
 
 def _vllm_replayssm_mode():
@@ -4109,7 +4271,11 @@ def load_vllm(
 
     if DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
-        if major_version < 7: raise NotImplementedError("Unsloth: Your GPU is too old!")
+        if major_version < 7: raise NotImplementedError(
+            f"Unsloth: Your GPU is too old for vLLM! vLLM needs compute capability 7.0 or higher, "\
+            f"but your GPU has {major_version}.{minor_version}. "\
+            f"Use `fast_inference = False` to train and run inference without vLLM."
+        )
 
         # Float8 KV cache only works for 8.0 or higher
         if float8_kv_cache and major_version < 8:
@@ -4219,12 +4385,19 @@ def load_vllm(
     elif DEVICE_TYPE == "hip":
         _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
-        _dtype = torch.bfloat16
+        # Judge the XPU the engine is handed below (get_target_device()), not the current one.
+        from .device_type import _xpu_bf16_supported
+        _dtype = torch.bfloat16 if _xpu_bf16_supported(get_target_device()) else torch.float16
     elif DEVICE_TYPE == "npu" and torch.npu.is_bf16_supported():
         _dtype = torch.bfloat16
     else:
         _dtype = torch.float16
-    if dtype == torch.bfloat16 and _dtype == torch.float16:
+    # XPU runs an explicit bf16 request (emulated if need be), as before the native-bf16 probe.
+    _keep_bf16 = False
+    if DEVICE_TYPE == "xpu":
+        from .device_type import _xpu_keeps_explicit_bf16
+        _keep_bf16 = _xpu_keeps_explicit_bf16()
+    if dtype == torch.bfloat16 and _dtype == torch.float16 and not _keep_bf16:
         print("Unsloth: We switched to dtype = torch.float16 since your GPU does not support torch.bfloat16")
         dtype = torch.float16
     elif dtype is None:
@@ -4233,6 +4406,13 @@ def load_vllm(
     elif dtype == torch.float16 or dtype == torch.bfloat16: pass
     else:
         raise NotImplementedError(f"Unsloth: We do not support dtype = {dtype} yet!")
+    if DEVICE_TYPE == "xpu" and dtype == torch.bfloat16:
+        # Switch here rather than raise inside vLLM's engine. A loader that still holds bf16 (any
+        # released unsloth) is fine: convert_vllm_to_huggingface builds on the fp16 weights vLLM shares.
+        from .device_type import _xpu_vllm_refuses_bf16
+        if _xpu_vllm_refuses_bf16():
+            print("Unsloth: vLLM does not accept torch.bfloat16 on this Intel GPU, so we switched to dtype = torch.float16.")
+            dtype = torch.float16
 
     free_memory, total_memory = get_mem_info()
 
@@ -4790,6 +4970,10 @@ def load_vllm(
                 print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
             pass
         pass
+        ssm_dtype_args, ssm_dtype_message = _vllm_mamba_ssm_cache_dtype_args(config, good_keys, training)
+        engine_args.update(ssm_dtype_args)
+        if ssm_dtype_message is not None:
+            print(ssm_dtype_message)
 
         # Read back from engine_args, after the filter above, so the banner can only
         # report what vLLM was given: swap_space left EngineArgs in vLLM 0.18.0.
@@ -5276,6 +5460,19 @@ def _is_moe_expert_lora_key(key):
     )
 
 
+def _is_moe_per_expert_lora_key(key):
+    """True for a per-expert 2D adapter key (`experts.<i>.gate_proj`, Mixtral `experts.<i>.w1`).
+
+    vLLM's 2D FusedMoEWithLoRA reads this layout when the model is not `is_3d_moe_weight` (vllm/lora/utils.py).
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    parts = key.split(".")
+    return any(
+        part in _MOE_EXPERT_LORA_SEGMENTS and child.isdigit()
+        for part, child in zip(parts, parts[1:])
+    )
+
+
 def _saved_adapter_lora_keys(save_directory):
     """Adapter key names in a saved PEFT adapter, read from the file on disk.
 
@@ -5383,17 +5580,25 @@ def _vllm_mixed_moe_lora_enabled(model, runner = None, vllm_model = None):
     resolved = getattr(_get_vllm_lora_manager(model, runner), "_enable_mixed_moe_lora_format", None)
     if isinstance(resolved, bool): return resolved
     if vllm_model is None: vllm_model = _get_vllm_lora_model(model, runner)
+    lora_config = _vllm_worker_lora_config(runner, vllm_model)
+    if lora_config is None: return None
+    return getattr(lora_config, "enable_mixed_moe_lora_format", False) is True
+pass
+
+
+def _vllm_worker_lora_config(runner, vllm_model):
+    """The engine's LoRAConfig: WorkerLoRAManager's copy first, the model's vllm_config second."""
+    # All Unsloth Zoo code licensed under LGPLv3
     for lora_config in (
         getattr(getattr(runner, "lora_manager", None), "lora_config", None),
         getattr(getattr(vllm_model, "vllm_config", None), "lora_config", None),
     ):
-        if lora_config is None: continue
-        return getattr(lora_config, "enable_mixed_moe_lora_format", False) is True
+        if lora_config is not None: return lora_config
     return None
 pass
 
 
-def _vllm_lora_target_names(vllm_model, manager = None):
+def _vllm_lora_target_names(vllm_model, manager = None, lora_config = None):
     """(full module names, bare embedding names) vLLM can bind a LoRA to, or None.
 
     vLLM's own `check_unexpected_modules` compares the LAST path component only
@@ -5420,6 +5625,25 @@ def _vllm_lora_target_names(vllm_model, manager = None):
     lora_types = tuple(lora_types)
 
     packed = getattr(manager, "packed_modules_mapping", None)
+    if not isinstance(packed, dict):
+        # Same builder the manager uses: on a 2D MoE it adds `experts -> experts.<i>.<proj>`,
+        # which get_packed_modules_mapping lacks, so per-expert keys would look unmatched.
+        # LoRAModelManager.__init__ passes the mixed / shared MoE flags from lora_config
+        # (a 3D model in mixed mode expands too); v0.11.2's builder takes only the model.
+        try:
+            from vllm.lora.utils import process_packed_modules_mapping
+            kwargs = {}
+            if lora_config is not None:
+                accepted = inspect.signature(process_packed_modules_mapping).parameters
+                for kwarg, field in (
+                    ("force_2d_moe", "enable_mixed_moe_lora_format"),
+                    ("enable_moe_shared_loras", "enable_moe_shared_loras"),
+                ):
+                    if kwarg in accepted:
+                        kwargs[kwarg] = getattr(lora_config, field, False) is True
+            packed = process_packed_modules_mapping(vllm_model, **kwargs)
+        except Exception:
+            packed = None
     if not isinstance(packed, dict):
         try:
             from vllm.model_executor.utils import get_packed_modules_mapping
@@ -5455,6 +5679,8 @@ def _vllm_lora_target_names(vllm_model, manager = None):
         # never appears in named_modules. Expand the packed mapping back out.
         parent, _, leaf = name.rpartition(".")
         for sub in packed.get(leaf, ()):
+            # Once wrapped, vLLM's RoutedExperts names experts `experts.<i>.<proj>.base_layer`.
+            if sub.endswith(".base_layer"): sub = sub[:-len(".base_layer")]
             names.add(f"{parent}.{sub}" if parent else sub)
     if len(names) == 0: return None
     return names, embedding_names
@@ -5486,7 +5712,9 @@ def _unmatched_lora_keys(model, keys):
     # All Unsloth Zoo code licensed under LGPLv3
     runner = _get_vllm_model_runner(model)
     vllm_model = _get_vllm_lora_model(model, runner)
-    targets = _vllm_lora_target_names(vllm_model, _get_vllm_lora_manager(model, runner))
+    targets = _vllm_lora_target_names(
+        vllm_model, _get_vllm_lora_manager(model, runner), _vllm_worker_lora_config(runner, vllm_model),
+    )
     if targets is None: return None
     module_names, embedding_names = targets
 
@@ -5536,29 +5764,35 @@ def _is_bitsandbytes_quantized(model):
 pass
 
 
-def _moe_expert_lora_refusal_reason(model, peft_config):
-    """Why vLLM cannot serve a stacked MoE expert adapter here, or None when it can.
+def _moe_expert_lora_refusal_reason(model, peft_config, per_expert = False):
+    """Why vLLM cannot serve a stacked (or, with per_expert, a per-expert 2D) MoE expert adapter here, or None when it can.
 
     vLLM picks `FusedMoE3DWithLoRA` (which consumes PEFT's target_parameters layout
     directly, so Unsloth's saved tensors need no conversion) exactly when the model class
     sets `is_3d_moe_weight` and the engine has not forced the 2D wrapper. Read that flag
     off the live class rather than comparing vLLM versions: it is the bit vLLM itself
     branches on, it tracks new architectures automatically, and it catches a caller who
-    patches it off.
+    patches it off. A per-expert adapter needs the opposite: the 2D `FusedMoEWithLoRA`.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     runner = _get_vllm_model_runner(model)
     vllm_model = _get_vllm_lora_model(model, runner)
     if vllm_model is None:
-        return "the vLLM model could not be inspected, so 3D MoE LoRA support cannot be confirmed"
+        return "the vLLM model could not be inspected, so MoE LoRA support cannot be confirmed"
 
-    if getattr(type(vllm_model), "is_3d_moe_weight", False) is not True:
+    is_3d = getattr(type(vllm_model), "is_3d_moe_weight", False) is True
+    if per_expert:
+        if is_3d and _vllm_mixed_moe_lora_enabled(model, runner, vllm_model) is not True:
+            return (
+                "this architecture sets is_3d_moe_weight, so vLLM wraps its experts with "
+                "FusedMoE3DWithLoRA, which reads only the stacked layout, not per-expert adapters"
+            )
+    elif not is_3d:
         return (
             "this architecture does not set is_3d_moe_weight, so vLLM wraps its experts with "
             "the 2D FusedMoEWithLoRA and drops Unsloth's stacked adapter (vllm-project/vllm#41754)"
         )
-
-    if _vllm_mixed_moe_lora_enabled(model, runner, vllm_model) is True:
+    elif _vllm_mixed_moe_lora_enabled(model, runner, vllm_model) is True:
         return "enable_mixed_moe_lora_format forces vLLM's 2D expert wrapper, which cannot read a stacked adapter"
 
     if _is_bitsandbytes_quantized(model):
@@ -5581,7 +5815,9 @@ def _remap_moe_expert_lora_keys(model, state_dict):
     if not any(_is_moe_expert_lora_key(k) for k in state_dict): return state_dict
     runner = _get_vllm_model_runner(model)
     vllm_model = _get_vllm_lora_model(model, runner)
-    targets = _vllm_lora_target_names(vllm_model, _get_vllm_lora_manager(model, runner))
+    targets = _vllm_lora_target_names(
+        vllm_model, _get_vllm_lora_manager(model, runner), _vllm_worker_lora_config(runner, vllm_model),
+    )
     if targets is None: return state_dict
     module_names = targets[0]
     weights_mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
@@ -5613,7 +5849,8 @@ def _moe_lone_expert_lora_prefixes(keys):
     outer, base = set(), set()
     for key in keys:
         if "experts" not in key and "moe" not in key: continue
-        if not _is_moe_expert_lora_key(key): continue
+        # Per-expert 2D keys (`experts.<i>.<proj>`) are separate modules, not a stacked half.
+        if not _is_moe_expert_lora_key(key) or _is_moe_per_expert_lora_key(key): continue
         match = _MOE_STACKED_LORA_KEY.match(key)
         if match is None: continue
         prefix = match.group(1)
@@ -5679,8 +5916,12 @@ def _check_lora_is_servable(model, keys, source, peft_config):
     """
     # All Unsloth Zoo code licensed under LGPLv3
     expert_keys = [k for k in keys if _is_moe_expert_lora_key(k)]
-    if len(expert_keys) != 0:
-        reason = _moe_expert_lora_refusal_reason(model, peft_config)
+    # Per-expert 2D and stacked keys need opposite vLLM wrappers.
+    per_expert_keys = [k for k in expert_keys if _is_moe_per_expert_lora_key(k)]
+    stacked_keys = [k for k in expert_keys if not _is_moe_per_expert_lora_key(k)]
+    for per_expert, expert_keys in ((False, stacked_keys), (True, per_expert_keys)):
+        if len(expert_keys) == 0: continue
+        reason = _moe_expert_lora_refusal_reason(model, peft_config, per_expert = per_expert)
         if reason is not None:
             raise NotImplementedError(
                 "Unsloth: fast_inference=True cannot serve this LoRA on MoE expert weights "

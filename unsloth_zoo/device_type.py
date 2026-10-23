@@ -37,6 +37,7 @@ import inspect
 import os
 import re
 import shutil
+import sys
 import subprocess
 import urllib.request
 
@@ -610,18 +611,144 @@ def device_empty_cache():
             torch.npu.empty_cache()
 pass
 
+# unsloth reads this: an explicit bf16 load on XPU stays bf16 only where vLLM keeps it too.
+XPU_KEEPS_EXPLICIT_BF16 = True
+
+
+def _xpu_keeps_explicit_bf16():
+    """An explicit bf16 request on XPU stays bf16 (emulated if need be), unless an older unsloth
+    loading the same model downgrades it to fp16: then vLLM must too, or the shared weights split."""
+    unsloth_device_type = sys.modules.get("unsloth.device_type")
+    return unsloth_device_type is None or hasattr(unsloth_device_type, "xpu_keeps_explicit_bf16")
+pass
+
+def _xpu_vllm_refuses_bf16():
+    """True when the installed vLLM's own platform check refuses bf16 on this XPU (Arc A770, for a
+    known accuracy issue). Older vLLM without the hook, or any other failure, refuses nothing."""
+    try:
+        from vllm.platforms import current_platform
+        check = getattr(current_platform, "check_if_supports_dtype", None)
+        if check is None:
+            return False
+        check(torch.bfloat16)
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+pass
+
+def _xpu_launch_indices():
+    """Under torchrun / accelerate, the XPUs this node's ranks use (LOCAL_WORLD_SIZE of them, clipped
+    to the visible count), else None. Unsloth is imported before a rank selects its XPU, so the
+    current device then reads XPU 0 on every rank; judging the ranks' devices together keeps every
+    rank on one dtype and is never narrower than the all-visible rule."""
+    def _env_int(name):
+        try:
+            return int(os.environ.get(name, ""))
+        except ValueError:
+            return None
+    local_world = _env_int("LOCAL_WORLD_SIZE")
+    world = _env_int("WORLD_SIZE")
+    if (local_world or 1) <= 1 and (world or 1) <= 1:
+        return None
+    try:
+        count = int(torch.xpu.device_count())
+    except Exception:
+        return None
+    if count <= 0:
+        return None
+    return list(range(min(local_world, count) if local_world and local_world > 0 else count))
+
+pass
+
+def _xpu_selected_indices(device = None):
+    """XPU indices to judge: `device` (an index, "xpu:N", a torch.device or several of them), else
+    the XPUs of a distributed launch (_xpu_launch_indices), else the current device, which
+    torch.xpu.is_bf16_supported() also asks. None when unreadable."""
+    items = device if isinstance(device, (list, tuple, set, frozenset)) else [device]
+    indices = []
+    for item in items:
+        try:
+            if item is None:
+                launch = _xpu_launch_indices()
+                if launch is not None:
+                    indices.extend(i for i in launch if i not in indices)
+                    continue
+                index = torch.xpu.current_device()
+            elif isinstance(item, int) and not isinstance(item, bool):
+                index = item
+            else:
+                item = torch.device(item)
+                if item.type != "xpu":
+                    continue
+                index = torch.xpu.current_device() if item.index is None else item.index
+        except Exception:
+            return None
+        if index not in indices:
+            indices.append(int(index))
+    return indices
+pass
+
+def _xpu_device_lacks_native_bf16(index):
+    """True only when this device is proven to emulate bf16. Its own aspects decide whether the probe
+    can be trusted: without libocloc (absent in torch-xpu wheels) every SYCL aspect reads False."""
+    aspects = (
+        "has_bfloat16_conversions",
+        "has_subgroup_matrix_multiply_accumulate",
+        "has_subgroup_matrix_multiply_accumulate_tensor_float32",
+        "has_subgroup_2d_block_io",
+    )
+    try:
+        props = torch.xpu.get_device_properties(index)
+    except Exception:
+        return False
+    lacks_bf16 = getattr(props, "has_bfloat16_conversions", True) is False
+    return lacks_bf16 and any(getattr(props, name, False) is True for name in aspects)
+pass
+
+def _xpu_bf16_supported(device = None):
+    """is_bf16_supported() counts emulation. Native bf16 on the device(s) in use: `device`, else the
+    current XPU (torch.xpu.is_bf16_supported() asks the same one). An unused sibling never narrows
+    it, and emulated bf16 still runs on any XPU a split model reaches. Unknown means True."""
+    # Beside an older unsloth without the native probe, keep its answer: it still says bf16 on XPU.
+    unsloth_device_type = sys.modules.get("unsloth.device_type")
+    if unsloth_device_type is not None and getattr(unsloth_device_type, "xpu_supports_native_bf16", None) is None:
+        return True
+    indices = _xpu_selected_indices(device)
+    if indices is None:
+        return True
+    return not any(_xpu_device_lacks_native_bf16(index) for index in indices)
+pass
+
+def _apple_bf16_supported():
+    """M1 (g13) and M2 (g14) lack native bf16. Matches unsloth's MLX answer."""
+    try:
+        import mlx.core as mx
+        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        match = re.fullmatch(r"applegpu_g(\d+)[a-z]", str(info.get("architecture", "")))
+        if match:
+            return int(match.group(1)) >= 15
+        name = info.get("device_name", "") or ""
+        return not name.startswith(("Apple M1", "Apple M2"))
+    except Exception:
+        return True
+pass
+
 def device_is_bf16_supported():
-    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, HIP or NPU)."""
+    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, HIP, NPU or Apple MLX)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             return torch.cuda.is_bf16_supported()
     elif DEVICE_TYPE == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "is_bf16_supported"):
-                return torch.xpu.is_bf16_supported()
+                return torch.xpu.is_bf16_supported() and _xpu_bf16_supported()
     elif DEVICE_TYPE == "npu":
         if npu_is_available() and hasattr(torch.npu, "is_bf16_supported"):
             return torch.npu.is_bf16_supported()
+    elif DEVICE_TYPE == "mlx":
+        return _apple_bf16_supported()
     return False
 pass
 

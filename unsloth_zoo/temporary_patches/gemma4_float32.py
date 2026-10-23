@@ -366,6 +366,8 @@ def _patch_gemma4_text_attention(module, prefix):
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     from .gemma4_banded_attention import _packed_document_sdpa
+    from .sdpa_gqa import make_gqa_sdpa
+    gqa_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
     # Eager: the mask check syncs to host.
     packed_document_sdpa = torch.compiler.disable(_packed_document_sdpa, recursive = True)
     packed_documents = os.environ.get("UNSLOTH_GEMMA4_PACKED_DOCUMENTS", "1") != "0"
@@ -504,15 +506,15 @@ def _patch_gemma4_text_attention(module, prefix):
                     getattr(self, "num_key_value_groups", 1) or 1,
                 )
             if attn_output is None:
-                attn_output = scaled_dot_product_attention(
+                attn_output = gqa_sdpa(
                     query_states,
                     key_states,
                     value_states,
-                    attn_mask = attn_mask,
-                    dropout_p = self.attention_dropout if self.training else 0.0,
-                    is_causal = is_causal,
-                    scale = self.scaling,
-                    enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                    attn_mask,
+                    self.attention_dropout if self.training else 0.0,
+                    is_causal,
+                    self.scaling,
+                    getattr(self, "num_key_value_groups", 1) or 1,
                 )
             attn_output = attn_output.transpose(1, 2)  # (b, h, q, d) -> (b, q, h, d)
 

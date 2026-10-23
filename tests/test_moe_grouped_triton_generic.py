@@ -108,12 +108,12 @@ def _calls():
 
 
 
-_KINDS = ("lora", "many", "few", "dw")
+_KINDS = ("lora", "many", "few", "dw", "dw_few")
 _AUTO = {
-    (8, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 128},
-    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
-    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
-    (8, 9): {"lora": -1, "many": 32, "few": 32, "dw": 0},
+    (8, 0): {"lora": -1, "many": 2048, "few": 512, "dw": 128, "dw_few": 128},
+    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
+    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64, "dw_few": 64},
+    (8, 9): {"lora": -1, "many": 32, "few": 32, "dw": 0, "dw_few": 0},
 }
 
 
@@ -158,13 +158,37 @@ def test_base_dw_above_limit_uses_torch(rows_per_expert, triton_dw):
     if MU._GROUPED_MM_TRITON_OP is None or MG.triton is None or not MU._check_torch_grouped_mm_supported():
         pytest.skip("no custom_op / Triton / torch._grouped_mm")
     index = torch.cuda.current_device()
-    _mock_cap((8, 0), index)                                     # few: 256 rows, dw: 128 rows
+    _mock_cap((8, 0), index)                                     # few: 512 rows, dw: 128 rows
     E, K, N = 4, 64, 96
     x, param, dy, offs, counts = _problem([rows_per_expert] * E, K, N, torch.bfloat16)
     before = _calls()
     y, dx, dw = _run(MU._grouped_mm_with_backward_fix, x, param, dy, offs, True)
     after = _calls()
     assert after["gemm"] - before["gemm"] == 2                   # forward + dX on Triton
+    assert after["wgrad"] - before["wgrad"] == (1 if triton_dw else 0)
+    ref_y, ref_dx, ref_dw = _fp64(x, param, dy, counts, True)
+    assert _rel(y, ref_y) < 1e-2 and _rel(dx, ref_dx) < 1e-2 and _rel(dw, ref_dw) < 1e-2
+
+
+@needs_kernel
+@pytest.mark.parametrize("cap, E, rows_per_expert, triton_dw", [
+    ((12, 0), 64, 256, True), ((12, 0), 64, 257, False),       # RTX PRO 6000, >= 64 experts: "dw" 256
+    ((12, 0), 4, 64, True), ((12, 0), 4, 65, False),           # < 64 experts: "dw_few" stays 64
+    ((12, 1), 64, 64, True), ((12, 1), 64, 65, False),         # GB10 keeps 64 (not remeasured)
+    ((8, 0), 64, 128, True), ((8, 0), 4, 129, False),          # A100 unchanged: 128 for both
+])
+def test_base_dw_limit_per_arch(cap, E, rows_per_expert, triton_dw):
+    """Base dW takes Triton up to the "dw" (>= 64 experts) / "dw_few" limit; forward + dX stay on Triton."""
+    if MU._GROUPED_MM_TRITON_OP is None or MG.triton is None or not MU._check_torch_grouped_mm_supported():
+        pytest.skip("no custom_op / Triton / torch._grouped_mm")
+    index = torch.cuda.current_device()
+    _mock_cap(cap, index)
+    K, N = 64, 96
+    x, param, dy, offs, counts = _problem([rows_per_expert] * E, K, N, torch.bfloat16)
+    before = _calls()
+    y, dx, dw = _run(MU._grouped_mm_with_backward_fix, x, param, dy, offs, True)
+    after = _calls()
+    assert after["gemm"] - before["gemm"] == 2
     assert after["wgrad"] - before["wgrad"] == (1 if triton_dw else 0)
     ref_y, ref_dx, ref_dw = _fp64(x, param, dy, counts, True)
     assert _rel(y, ref_y) < 1e-2 and _rel(dx, ref_dx) < 1e-2 and _rel(dw, ref_dw) < 1e-2
@@ -188,7 +212,7 @@ def test_gate_rows_threshold_and_operands(monkeypatch):
     w = torch.empty(E, N, K, device = "cuda", dtype = torch.bfloat16).transpose(-2, -1)
     at = lambda m, dtype = torch.bfloat16, weight = w: MU._triton_grouped_mm_wanted(
         torch.empty(m, weight.shape[1], device = "cuda", dtype = dtype), weight)
-    assert at(256 * E) and not at(256 * E + 1)
+    assert at(512 * E) and not at(512 * E + 1)
     many = torch.empty(64, 40, 48, device = "cuda", dtype = torch.bfloat16)
     assert at(2048 * 64, weight = many) and not at(2048 * 64 + 1, weight = many)
     lora = torch.empty(E, 40, 16, device = "cuda", dtype = torch.bfloat16)
