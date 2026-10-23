@@ -1228,6 +1228,11 @@ def patch_sdpa_bool_causal_mask():
         is_causal = None,
         **kwargs,
     ):
+        # `self.is_causal and attention_mask is None and q_len > 1` (Moonshine) is a SymBool
+        # under dynamic shapes, which SDPA rejects: a graph break per call. Branching on it
+        # makes Dynamo guard on the value instead.
+        if is_causal is not None:
+            is_causal = True if is_causal else False
         m = attention_mask
 
         # Below 2**16 the Cutlass bool-mask overflow (pytorch/pytorch#162588)
