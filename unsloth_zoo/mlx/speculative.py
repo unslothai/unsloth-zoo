@@ -1839,6 +1839,7 @@ def _built(wrapper, model: nn.Module, target: nn.Module, **kwargs):
     weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
     drafter = wrapper(model, target, **kwargs)
     drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
+    target._unsloth_speculates = True  # so `warm_inference` runs the verify path's first-use checks at load
     return drafter
 
 

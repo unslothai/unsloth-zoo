@@ -6737,8 +6737,9 @@ def warm_inference(model, int8_prefill = None):
 
 
 def _warm_verify_gdn(model):
-    """Build the fused verify block's pipeline for each linear-attention layer shape: a build takes about a quarter
-    second, which would otherwise land in the first speculative reply."""
+    """Build the fused verify block's pipeline for each linear-attention layer shape, and settle each block width's
+    bitwise checks through the verifier for a model a drafter was built for: either would otherwise land in the first
+    speculative replies."""
     language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
     if (language is None or os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") == "0" or not hasattr(model, "named_modules")
             or mx.default_device() != mx.gpu or not _verify_gdn_kernel()):
@@ -6756,3 +6757,30 @@ def _warm_verify_gdn(model):
             mx.zeros((1, K - 1 + length, layer.conv_dim), dtype), layer.conv1d.weight.reshape(layer.conv_dim, K), gates,
             gates, layer.A_log, layer.dt_bias, mx.zeros((1, length, Hv, D), dtype), layer.norm.weight, 1e-6,
             layer.norm.eps, mx.zeros((1, Hv, D, D), mx.float32), layer.num_k_heads))
+    if getattr(model, "_unsloth_speculates", False):  # set by building a drafter for it
+        with exact_speculative_verify(model):
+            _settle_verify_gdn(model, language, shapes)
+
+
+def _settle_verify_gdn(model, language, shapes):
+    verifier, caches = getattr(language, "_EXACT_SPECULATIVE_VERIFIER", None), sys.modules.get("mlx_vlm.models.cache")
+    served = {id(layer) for _, owner in model.named_modules() if vars(owner).get("_unsloth_verify_scopes")
+              for _, layer in owner.named_modules()}
+    if caches is None or not hasattr(type(verifier), "_unsloth_verify_native"):
+        return
+    outer = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
+    try:
+        _VERIFY_STATE.serving = True
+        for (dtype, *_), layer in shapes.items():
+            if id(layer) not in served:
+                continue
+            for length in range(3, _VERIFY_GDN_MAX_ROWS + 1):
+                cache, key = caches.ArraysCache(2), mx.random.key(length)
+                cache[0] = mx.random.normal((1, layer.conv_kernel_size - 1, layer.conv_dim), key = key).astype(dtype)
+                cache[1] = mx.random.normal((1, layer.num_v_heads, layer.head_v_dim, layer.head_k_dim), key = key) * 0.1
+                cache.start_speculation(length)
+                _VERIFY_STATE.tapes = []
+                mx.eval(verifier._gated_delta(layer, mx.random.normal((1, length, layer.hidden_size), key = key)
+                                              .astype(dtype), None, cache))
+    finally:
+        _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer

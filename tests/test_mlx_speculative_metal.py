@@ -559,17 +559,29 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, m
         return outputs[-1]
     monkeypatch.setattr(inference, "_verify_gdn_block", recorded)
     monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+    monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
     monkeypatch.setattr(model, "generate", lambda *args, **kwargs: None, raising = False)
+    monkeypatch.setattr(model, "_unsloth_speculates", False, raising = False)
     with monkeypatch.context() as patch:
         # A launch builds its pipeline only once evaluated.
         patch.setattr(mx, "eval", lambda *arrays: evaluated.extend(arrays) or evaluate(*arrays))
         inference.warm_inference(model)
     assert outputs and all(any(out is x for x in evaluated) for out in outputs)
     warmed = set(launched)
-    launched.clear()
+    assert not inference._VERIFY_GDN_VERDICTS
+    # For a model a drafter was built for, each block width's checks run there too, so no block pays them.
+    monkeypatch.setattr(model, "_unsloth_speculates", True, raising = False)
+    inference.warm_inference(model)
     with inference.exact_speculative_verify(model):
-        _verified(model.language_model, cache, mx.array([ids[0][24:27]]), 0)
-    assert len(warmed) == 1 and launched and set(launched) == warmed
+        widths = range(3, inference._VERIFY_GDN_MAX_ROWS + 1)
+        assert sorted(key[0] for key in inference._VERIFY_GDN_VERDICTS) == list(widths)
+        assert all(inference._VERIFY_GDN_VERDICTS.values()) and set(launched) == warmed
+        for width in (3, 8):
+            launched.clear()
+            work = inference.first_use_work()
+            _verified(model.language_model, cache, mx.array([ids[0][24 : 24 + width]]), 0)
+            assert inference.first_use_work() == work and set(launched) == warmed
+    assert len(warmed) == 1
     # A CPU load verifies on the native ops, so it builds nothing.
     launched.clear()
     device = mx.default_device()
@@ -991,7 +1003,7 @@ def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monk
 def test_a_separate_mtp_head_checkpoint_is_wrapped_as_the_built_in_head(qwen_mtp, tmp_path):
     from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
     from unsloth_zoo.mlx.speculative import MTPDrafter, companion_drafter
-    assert detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(tmp_path)) and type(companion_drafter(tmp_path, qwen_mtp[0])) is MTPDrafter
+    assert detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(tmp_path)) and type(companion_drafter(tmp_path, qwen_mtp[0])) is MTPDrafter and qwen_mtp[0]._unsloth_speculates
 
 
 
