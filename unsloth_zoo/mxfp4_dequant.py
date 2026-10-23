@@ -230,8 +230,9 @@ def _kernel_fail(exception):
 
 
 def _kernel_verified(device, dtype, transpose):
-    """Once per (device, dtype, layout): kernel must match the torch reference bit for bit, else torch is used."""
-    key = (str(device), dtype, bool(transpose))
+    """Once per (device, dtype, layout, rounding path): kernel must match the torch reference bit for bit, else torch is used."""
+    # The rounding path picks a different kernel variant, so it is part of the key.
+    key = (str(device), dtype, bool(transpose), _exact_round())
     verified = _KERNEL_VERIFIED.get(key)
     if verified is not None:
         return verified

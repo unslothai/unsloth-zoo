@@ -133,6 +133,29 @@ def test_faked_rocm_launches_the_exact_path(monkeypatch):
     assert seen == {"bf16_bits": False, "exact": True}
 
 
+def test_verification_is_keyed_on_the_rounding_path(monkeypatch):
+    # A result checked on one rounding path must not be reused when the switch selects the other kernel.
+    checked = []
+
+    def fake_dequantize(blocks, scales, dtype, transpose, *rest):
+        checked.append(mxd._exact_round())
+        want = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
+        return want if mxd._exact_round() else torch.zeros_like(want)
+
+    monkeypatch.setattr(mxd, "_kernel_dequantize", fake_dequantize)
+    monkeypatch.setattr(mxd, "_KERNEL_VERIFIED", {})
+    monkeypatch.setattr(mxd, "_KERNEL_FAILED", False)
+    device = torch.device("cpu")
+    monkeypatch.setenv("UNSLOTH_MXFP4_EXACT_ROUND", "1")
+    assert mxd._kernel_verified(device, torch.bfloat16, False) is True
+    monkeypatch.setenv("UNSLOTH_MXFP4_EXACT_ROUND", "0")
+    with pytest.warns(UserWarning, match = "does not match"):
+        assert mxd._kernel_verified(device, torch.bfloat16, False) is False
+    monkeypatch.setenv("UNSLOTH_MXFP4_EXACT_ROUND", "1")
+    assert mxd._kernel_verified(device, torch.bfloat16, False) is True
+    assert checked == [True, False]
+
+
 @needs_gpu
 @pytest.mark.skipif(not on_hip, reason = "real ROCm only")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
