@@ -3612,9 +3612,7 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         return llm
 
     def _mask_in_model():
-        # Where logit_bias cannot reach, mask the rows in the target model's compute_logits: the
-        # runner samples, and verifies every speculative draft, from it. The engine runs in this
-        # process (VLLM_ENABLE_V1_MULTIPROCESSING=0); an unreachable model returns False.
+        # The runner samples and verifies drafts from compute_logits; needs an in-process engine.
         if masked:
             return True
         try:
@@ -3627,8 +3625,7 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         except Exception:
             return False
         if getattr(runner, "batch_sharder", None) is not None:
-            # --enable-batch-sharded-sampling (Model Runner V2, TP > 1) samples from the
-            # vocab-sharded compute_logits_local instead, so sample from compute_logits again.
+            # Batch-sharded sampling (MRV2, TP > 1) bypasses compute_logits.
             try:
                 runner.batch_sharder = None
             except Exception:
@@ -3641,7 +3638,6 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
             @functools.wraps(method)
             def compute_logits_without_padded_vocab(*args, **kwargs):
                 logits = method(*args, **kwargs)
-                # None on pipeline ranks that do not sample.
                 if isinstance(logits, torch.Tensor) and logits.ndim > 0:
                     key = (logits.device, logits.shape[-1])
                     index = indices.get(key)
@@ -3708,7 +3704,6 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         getattr(client, name, None) is not None for name in ("add_request", "add_request_async")
     )
     if v1 and len(bias) > max_bias and _mask_in_model():
-        # Every request would be refused the bias: the model mask covers them all instead.
         return _record()
     hooked = False
     for name in ("add_request", "add_request_async"):

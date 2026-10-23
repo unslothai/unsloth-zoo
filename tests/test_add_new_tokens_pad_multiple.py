@@ -595,8 +595,7 @@ class _VllmModel(torch.nn.Module):
 
 
 def _inproc_llm():
-    # VLLM_ENABLE_V1_MULTIPROCESSING=0: LLM.llm_engine.engine_core is an InprocClient whose
-    # engine_core is the EngineCore holding the executor, worker and model runner in this process.
+    # In-process engine: llm_engine.engine_core.engine_core holds the model runner.
     from types import SimpleNamespace
     llm = _LLM()
     runner = SimpleNamespace(model = _VllmModel())
@@ -614,8 +613,7 @@ def _assert_padded_rows_masked(model, ids = IDS):
 
 
 def test_vllm_padded_vocab_masked_in_model_under_speculative_decoding(capsys):
-    # logit_bias is refused with speculation, so the rows are masked where the target logits
-    # (which also verify every draft) are computed; requests stay untouched.
+    # logit_bias is refused with speculation, so the target logits are masked instead.
     llm, model = _inproc_llm()
     wrap = _vllm_wrapper_ns()["suppress_vllm_padded_vocab"]
     wrap(llm, IDS, speculative = True)
@@ -654,8 +652,7 @@ class _ShardedVllmModel(_VllmModel):
 
 
 def _sampled_logits(runner):
-    # GPUModelRunner.sample (vLLM 0.29 Model Runner V2): compute_logits_local plus an all-to-all
-    # when a BatchSharder is set, compute_logits otherwise.
+    # vLLM 0.29 MRV2: compute_logits_local with a BatchSharder, compute_logits otherwise.
     hidden = torch.zeros(3, 4)
     if runner.batch_sharder is not None:
         return runner.model.compute_logits_local(hidden)
@@ -663,8 +660,7 @@ def _sampled_logits(runner):
 
 
 def test_vllm_padded_vocab_masked_in_model_turns_off_batch_sharded_sampling(capsys):
-    # --enable-batch-sharded-sampling samples from compute_logits_local, which the mask does not
-    # wrap, so it is switched off on this runner and sampling goes through compute_logits again.
+    # The mask does not wrap compute_logits_local, so batch-sharded sampling is switched off.
     llm, _ = _inproc_llm()
     runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner
     runner.model, runner.batch_sharder = _ShardedVllmModel(), object()
