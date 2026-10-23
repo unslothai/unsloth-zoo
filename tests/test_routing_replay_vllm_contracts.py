@@ -42,7 +42,6 @@ def replay(monkeypatch):
 
 
 def _routes(n, seed):
-    # n tokens of distinct top-2 expert pairs per layer.
     g = torch.Generator().manual_seed(seed)
     return np.stack([
         np.stack([torch.randperm(8, generator = g)[:TOP_K].numpy() for _ in range(LAYERS)]) for _ in range(n)
@@ -53,7 +52,6 @@ def _routes(n, seed):
     ("0.20.2", None), ("0.21.0", False), ("0.21.1rc0", False), ("0.22.0", None), ("0.32.0", None),
 ])
 def test_vllm_021_turns_async_scheduling_off(replay, monkeypatch, version, expected):
-    # vLLM 0.21 _validate_return_routed_experts refuses async scheduling, which it enables by default.
     import importlib.metadata
     monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts", "async_scheduling"})
     monkeypatch.setattr(importlib.metadata, "version", lambda name: version)
@@ -63,8 +61,7 @@ def test_vllm_021_turns_async_scheduling_off(replay, monkeypatch, version, expec
 
 
 def test_vllm_021_prompt_routes_on_the_request_are_placed_first(replay):
-    # vLLM 0.21: RequestOutput.prompt_routed_experts [prompt_len], CompletionOutput.routed_experts
-    # only the generated tokens (split_routed_experts in routed_experts_capturer.py).
+    # vLLM 0.21: prompt routes on RequestOutput, only generated tokens on the completion.
     prompt, completion = [11, 12, 13], [21, 22, 23]
     full = _routes(6, 0)
     request = SimpleNamespace(
@@ -77,7 +74,6 @@ def test_vllm_021_prompt_routes_on_the_request_are_placed_first(replay):
     assert torch.equal(rows[:5].long(), torch.as_tensor(full[:5]).long())
     assert bool((rows[5] == -1).all())
 
-    # No prompt routes returned: the prompt keeps its natural routing, the completion still lines up.
     rr.reset_routing_replay()
     request.prompt_routed_experts = None
     rr.record_routed_experts([request])
@@ -87,8 +83,7 @@ def test_vllm_021_prompt_routes_on_the_request_are_placed_first(replay):
 
 
 def test_vllm_021_one_token_completion_keeps_the_prompt_routes(replay):
-    # vLLM 0.21 split_routed_experts: an empty generation part becomes None on the completion,
-    # while the prompt part stays on RequestOutput.prompt_routed_experts (immediate EOS).
+    # vLLM 0.21: empty generation part is None, prompt part stays (immediate EOS).
     prompt = [11, 12, 13]
     full = _routes(3, 2)
     request = SimpleNamespace(
@@ -101,7 +96,6 @@ def test_vllm_021_one_token_completion_keeps_the_prompt_routes(replay):
     assert torch.equal(rows[:3].long(), torch.as_tensor(full).long())
     assert bool((rows[3] == -1).all())
 
-    # Neither part returned: nothing is recorded.
     rr.reset_routing_replay()
     request.prompt_routed_experts = None
     assert rr.record_routed_experts([request]) == 0
@@ -109,7 +103,7 @@ def test_vllm_021_one_token_completion_keeps_the_prompt_routes(replay):
 
 @pytest.mark.parametrize("per_prompt", [False, True])
 def test_routed_experts_prompt_start_offsets_the_rows(replay, per_prompt):
-    # vLLM >= 0.22 SamplingParams.routed_experts_prompt_start = N: returned row 0 is position N.
+    # vLLM >= 0.22 routed_experts_prompt_start = N: returned row 0 is position N.
     prompt, completion = [1, 2, 3], [4, 5]
     full = _routes(5, 1)
     params = SimpleNamespace(routed_experts_prompt_start = 2)
@@ -145,7 +139,6 @@ def test_duplicate_completions_replay_only_their_common_routes(replay):
         keep = torch.ones(3, LAYERS, dtype = torch.bool)
         keep[1, 0] = False
         assert torch.equal(rows[keep].long(), torch.as_tensor(a)[keep].long())
-        # One conflicting (token, layer) row, counted once at record time however often it replays.
         for _ in range(3):
             rr._lookup(tuple(tokens), exact = True)
         assert rr.routing_replay_stats()["conflicting_routes"] == 1, split_calls
@@ -165,9 +158,7 @@ def test_invalid_capture_next_to_a_valid_one_is_not_a_conflict(replay):
 
 
 def test_return_args_path_does_not_ask_vllm_serve_for_routed_experts():
-    # load_vllm(return_args = True) hands its engine args to `vllm serve` (SyntheticDataKit), which
-    # drops every False value, so vLLM 0.21 would get no --no-async-scheduling and refuse routed
-    # experts capture. Nothing records routes from that server either: the replay args stay out.
+    # `vllm serve` drops False values (no --no-async-scheduling), so replay args stay out.
     import unsloth_zoo.vllm_utils as vu
     path = pathlib.Path(vu.__file__)
     tree = ast.parse(path.read_text(encoding = "utf-8-sig"))
@@ -204,9 +195,7 @@ def _moe(seed = 0):
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("use_reentrant", [True, False])
 def test_recompute_of_identical_inputs_with_different_replays_keeps_gradients(replay, use_reentrant, compiled):
-    # Record / forward one rollout, record / forward another for the same tokens, then one backward.
-    # Both forwards feed every router the same bits with the same natural routes, so only the
-    # checkpointed layer's input tensor can tell their recomputes apart.
+    # Two rollouts with identical tokens and routes: only the layer input tensor tells recomputes apart.
     ids = [5, 6, 7, 30, 31, 32]
     natural = None
     with torch.no_grad():
@@ -225,8 +214,6 @@ def test_recompute_of_identical_inputs_with_different_replays_keeps_gradients(re
             m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
         m.model.embed_tokens.weight.requires_grad_(True)
         if compiled:
-            # Decoder layers under torch.compile, their hooks inside the compiled call: the layer
-            # input addresses must still name each forward for its recompute.
             torch._dynamo.reset()
             for layer in m.model.layers:
                 layer.compile(backend = "eager")
@@ -251,8 +238,7 @@ def test_recompute_of_identical_inputs_with_different_replays_keeps_gradients(re
 
 
 def test_replayssm_yields_to_routing_replay_on_vllm_031():
-    # vLLM 0.31 _verify_aux_output_compatibility: routed experts capture needs Model Runner V2,
-    # while load_vllm pins V1 for ReplaySSM. The skip must come before use_replayssm is set.
+    # Routed experts capture needs MRV2; the skip must come before use_replayssm is set.
     path = pathlib.Path(rr.__file__).with_name("vllm_utils.py")
     src = path.read_text(encoding = "utf-8-sig")
     fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
@@ -297,9 +283,7 @@ def offloaded_gc(monkeypatch):
 
 @pytest.mark.parametrize("prior", ["plain", "offloaded"])
 def test_recompute_identity_survives_offloaded_checkpointing(replay, offloaded_gc, prior):
-    # Same scenario as above (identical tokens, two replays, one backward) on Unsloth's
-    # use_gradient_checkpointing = "unsloth" path: the recompute's hidden states live in the
-    # staging buffer, not at the forward's address.
+    # Same scenario on use_gradient_checkpointing = "unsloth": hidden states live in the staging buffer.
     gc, staging = offloaded_gc
     ids = [5, 6, 7, 30, 31, 32]
     with torch.no_grad():
@@ -332,12 +316,10 @@ def test_recompute_identity_survives_offloaded_checkpointing(replay, offloaded_g
             )])
             losses.append(m(input_ids = torch.tensor([ids])).logits.float().square().mean())
         if checkpointing:
-            # Every layer input of both forwards went to the host buffers; after the first step the
-            # very last checkpoint stays on the device (LAST_GC_INDEX), as in training.
+            # After the first step the last checkpoint stays on device (LAST_GC_INDEX).
             assert gc.CPU_INDEX >= 2 * LAYERS - 1
         sum(losses).backward()
         if checkpointing:
-            # Both recomputes of layer 0 read the one staging buffer.
             assert len(recompute_inputs) == 2 and set(recompute_inputs) == {staging.data_ptr()}
         return torch.stack([l.detach() for l in losses]), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
 
@@ -368,8 +350,7 @@ def _replay_args():
 
 
 def test_v1_runner_left_by_an_earlier_replayssm_load_is_taken_back(runner_env, monkeypatch):
-    # An earlier load_vllm turned ReplaySSM on and left VLLM_USE_V2_MODEL_RUNNER=0 set; vLLM 0.31
-    # _verify_aux_output_compatibility refuses routed experts capture on V1.
+    # Earlier ReplaySSM load left VLLM_USE_V2_MODEL_RUNNER=0; vLLM 0.31 refuses capture on V1.
     vu, _ = runner_env
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", True)
@@ -408,8 +389,7 @@ def test_runner_is_left_alone_when_there_is_no_conflict(runner_env, monkeypatch,
 
 
 def test_load_vllm_checks_the_runner_even_when_replayssm_is_off():
-    # The check sits before the ReplaySSM block at its own level (so its conflict test sees routing
-    # replay after a user V1 runner turned it off), and load_vllm records when it set the V1 runner.
+    # Check sits before the ReplaySSM block, at its own level.
     import unsloth_zoo.vllm_utils as vu
     path = pathlib.Path(vu.__file__)
     tree = ast.parse(path.read_text(encoding = "utf-8-sig"))
@@ -434,8 +414,7 @@ def test_load_vllm_checks_the_runner_even_when_replayssm_is_off():
 
 
 def _runner_and_replayssm_block(vu):
-    # The load_vllm statements from the runner check through the ReplaySSM block, wherever the
-    # check sits, compiled on their own: load_vllm itself needs a GPU.
+    # Compile the load_vllm statements on their own: load_vllm itself needs a GPU.
     path = pathlib.Path(vu.__file__)
     src = path.read_text(encoding = "utf-8-sig")
     fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
@@ -478,8 +457,6 @@ def _run_block(vu, monkeypatch, engine_args, **names):
 
 @pytest.mark.parametrize("replay_pinned", [True, False])
 def test_replay_off_releases_the_moe_backend_only_routing_replay_pinned(runner_env, monkeypatch, replay_pinned):
-    # routing_replay_engine_args pins moe_backend = "triton" only for the capture hook; with routing
-    # replay off the engine keeps vLLM's own MoE backend choice. An FP8 MoE checkpoint pins it too.
     vu, _ = runner_env
     monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "0")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -500,9 +477,7 @@ def test_moe_backend_pin_stays_while_routing_replay_is_on(runner_env, monkeypatc
 
 @pytest.mark.parametrize("owned_v1", [False, True])
 def test_dropped_suffix_decoding_gives_back_its_batch_limits(runner_env, monkeypatch, owned_v1):
-    # load_vllm lowered max_num_seqs (and raised max_num_batched_tokens) to fit the suffix lookahead
-    # with LoRA; once routing replay drops suffix decoding, the engine and generate_batches
-    # (llm.approx_max_num_seqs) get the limits from before speculation back.
+    # Once routing replay drops suffix decoding, the pre-speculation limits come back.
     vu, _ = runner_env
     monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "0")
     if owned_v1:
@@ -529,8 +504,7 @@ def test_kept_speculation_keeps_its_batch_limits(runner_env, monkeypatch):
 
 
 def test_user_v1_runner_keeps_replayssm_when_it_turns_routing_replay_off(runner_env, monkeypatch, capsys):
-    # UNSLOTH_VLLM_REPLAYSSM=1 plus a user VLLM_USE_V2_MODEL_RUNNER=0 on vLLM 0.31+: the user's V1
-    # runner drops routing replay (vLLM refuses it on V1), and ReplaySSM, which runs on V1, stays on.
+    # User V1 runner + ReplaySSM: routing replay drops, ReplaySSM stays on.
     vu, _ = runner_env
     monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -544,7 +518,6 @@ def test_user_v1_runner_keeps_replayssm_when_it_turns_routing_replay_off(runner_
 
 
 def test_inherited_v1_runner_keeps_routing_replay_and_says_replayssm_was_dropped(runner_env, monkeypatch, capsys):
-    # VLLM_USE_V2_MODEL_RUNNER=0 left by an earlier ReplaySSM load: routing replay wins, V2 comes back.
     vu, _ = runner_env
     monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -567,8 +540,7 @@ def test_unset_runner_keeps_routing_replay_on_v2(runner_env, monkeypatch, capsys
 
 
 def test_routing_replay_is_off_without_prefix_caching(runner_env, monkeypatch):
-    # vLLM 0.31 _verify_aux_output_compatibility: "AuxOutput Connector requires prefix caching".
-    # load_vllm turns prefix caching off on compute capability < 7.5 (V100) and on request.
+    # load_vllm turns prefix caching off on compute capability < 7.5 and on request.
     vu, _ = runner_env
     args = dict(_replay_args(), enable_prefix_caching = False, async_scheduling = False)
     with pytest.warns(UserWarning, match = "prefix caching"):
@@ -585,7 +557,6 @@ def test_routing_replay_stays_on_with_prefix_caching(runner_env, version):
     assert vu._routing_replay_model_runner(args) is None
     assert args["enable_return_routed_experts"] is True
     if version == "0.30.0":
-        # Before 0.31 vLLM captures routed experts without prefix caching too.
         args = dict(_replay_args(), enable_prefix_caching = False)
         assert vu._routing_replay_model_runner(args) is None
         assert args["enable_return_routed_experts"] is True
@@ -593,8 +564,6 @@ def test_routing_replay_stays_on_with_prefix_caching(runner_env, version):
 
 @pytest.mark.parametrize("owned_v1", [False, True])
 def test_suffix_decoding_yields_to_routing_replay_on_model_runner_v2(runner_env, monkeypatch, capsys, owned_v1):
-    # vLLM 0.31 _get_v2_model_runner_unsupported_features lists speculative method 'suffix', so an
-    # unset runner falls back to V1, where routed experts capture is refused. Routing replay wins.
     vu, _ = runner_env
     if owned_v1:
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -617,15 +586,13 @@ def test_v2_supported_speculation_is_kept(runner_env):
 
 
 def _rocm_v1_config(arch = "DeepseekV32ForCausalLM"):
-    # Shaped like the HF config load_vllm passes; vLLM ModelConfig.architectures comes from it.
     return SimpleNamespace(architectures = [arch], model_type = "deepseek_v32")
 
 
 @pytest.mark.parametrize("arch", ["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"])
 @pytest.mark.parametrize("owned_v1", [False, True])
 def test_rocm_v1_default_architectures_turn_routing_replay_off(runner_env, monkeypatch, arch, owned_v1):
-    # vLLM 0.31 VllmConfig.use_v2_model_runner: on ROCm an unset runner defaults to V1 for
-    # ROCM_DEFAULT_MRV1_ARCHITECTURES, and _verify_aux_output_compatibility then refuses the engine.
+    # On ROCm an unset runner is V1 for ROCM_DEFAULT_MRV1_ARCHITECTURES on vLLM 0.31.
     vu, versions = runner_env
     versions["vllm"] = "0.31.0"
     monkeypatch.setattr(vu, "is_hip", lambda: True)
@@ -655,7 +622,6 @@ def test_rocm_v1_default_leaves_routing_replay_on_otherwise(runner_env, monkeypa
 
 @pytest.mark.parametrize("version", ["0.32.0", "0.33.1"])
 def test_rocm_v1_default_is_gone_from_vllm_032(runner_env, monkeypatch, version):
-    # vLLM 0.32 dropped ROCM_DEFAULT_MRV1_ARCHITECTURES (#56360): ROCm then picks V2 like CUDA.
     vu, versions = runner_env
     versions["vllm"] = version
     monkeypatch.setattr(vu, "is_hip", lambda: True)
@@ -669,7 +635,6 @@ def test_rocm_v1_default_is_gone_from_vllm_032(runner_env, monkeypatch, version)
     (None, None),
 ])
 def test_rocm_v1_default_follows_the_installed_vllm(runner_env, monkeypatch, defined, expected):
-    # With vLLM importable its own ROCM_DEFAULT_MRV1_ARCHITECTURES decides, whatever the version says.
     import sys
     vu, versions = runner_env
     versions["vllm"] = "0.31.0"
