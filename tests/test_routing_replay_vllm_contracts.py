@@ -86,6 +86,27 @@ def test_vllm_021_prompt_routes_on_the_request_are_placed_first(replay):
     assert torch.equal(rows[3:5].long(), torch.as_tensor(full[3:5]).long())
 
 
+def test_vllm_021_one_token_completion_keeps_the_prompt_routes(replay):
+    # vLLM 0.21 split_routed_experts: an empty generation part becomes None on the completion,
+    # while the prompt part stays on RequestOutput.prompt_routed_experts (immediate EOS).
+    prompt = [11, 12, 13]
+    full = _routes(3, 2)
+    request = SimpleNamespace(
+        prompt_token_ids = prompt,
+        prompt_routed_experts = full,
+        outputs = [SimpleNamespace(token_ids = [2], routed_experts = None)],
+    )
+    assert rr.record_routed_experts([request]) == 1
+    rows = rr._lookup(tuple(prompt + [2]), exact = True)
+    assert torch.equal(rows[:3].long(), torch.as_tensor(full).long())
+    assert bool((rows[3] == -1).all())
+
+    # Neither part returned: nothing is recorded.
+    rr.reset_routing_replay()
+    request.prompt_routed_experts = None
+    assert rr.record_routed_experts([request]) == 0
+
+
 @pytest.mark.parametrize("per_prompt", [False, True])
 def test_routed_experts_prompt_start_offsets_the_rows(replay, per_prompt):
     # vLLM >= 0.22 SamplingParams.routed_experts_prompt_start = N: returned row 0 is position N.
@@ -400,7 +421,7 @@ def test_load_vllm_checks_the_runner_even_when_replayssm_is_off():
         ifs = [i for i, s in enumerate(body) if isinstance(s, ast.If) and ast.unparse(s.test) == "replayssm_mode != 'off'"]
         calls = [
             i for i, s in enumerate(body)
-            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+            if isinstance(s, (ast.Expr, ast.Assign)) and isinstance(s.value, ast.Call)
             and getattr(s.value.func, "id", None) == "_routing_replay_model_runner"
         ]
         if ifs and calls:
@@ -427,28 +448,84 @@ def _runner_and_replayssm_block(vu):
             continue
         calls = [
             i for i, s in enumerate(body)
-            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+            if isinstance(s, (ast.Expr, ast.Assign)) and isinstance(s.value, ast.Call)
             and getattr(s.value.func, "id", None) == "_routing_replay_model_runner"
         ]
         start = next(i for i, s in enumerate(body) if ast.unparse(s) == "replayssm_set_runner = False")
         span = body[min([start, *calls]) : max([ifs[0], *calls]) + 1]
         module = ast.Module(body = [ast.Global(names = ["_UNSLOTH_SET_V1_RUNNER"]), *span], type_ignores = [])
         fn_src = "def _block():\n" + "\n".join("    " + line for line in ast.unparse(module).splitlines())
+        fn_src += "\n    return locals()"
         return compile(fn_src, str(path), "exec")
     raise AssertionError("ReplaySSM block not found in load_vllm")
 
 
-def _run_block(vu, monkeypatch, engine_args):
+def _run_block(vu, monkeypatch, engine_args, **names):
     ns = dict(vars(vu))
     ns.update(
         config = SimpleNamespace(model_type = "nemotron_h"),
         good_keys = {"model", "use_replayssm", "enable_return_routed_experts"},
         DEVICE_TYPE = "cuda",
         engine_args = engine_args,
+        replay_moe_pin = False,
+        pre_speculation_sizes = None,
     )
+    ns.update(names)
     exec(_runner_and_replayssm_block(vu), ns)
-    ns["_block"]()
+    ns["block_locals"] = ns["_block"]()
     return ns
+
+
+@pytest.mark.parametrize("replay_pinned", [True, False])
+def test_replay_off_releases_the_moe_backend_only_routing_replay_pinned(runner_env, monkeypatch, replay_pinned):
+    # routing_replay_engine_args pins moe_backend = "triton" only for the capture hook; with routing
+    # replay off the engine keeps vLLM's own MoE backend choice. An FP8 MoE checkpoint pins it too.
+    vu, _ = runner_env
+    monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "0")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    args = _replay_args()
+    with pytest.warns(UserWarning, match = "Model Runner V1"):
+        _run_block(vu, monkeypatch, args, replay_moe_pin = replay_pinned)
+    assert "enable_return_routed_experts" not in args
+    assert ("moe_backend" in args) is (not replay_pinned)
+
+
+def test_moe_backend_pin_stays_while_routing_replay_is_on(runner_env, monkeypatch):
+    vu, _ = runner_env
+    monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "0")
+    args = _replay_args()
+    _run_block(vu, monkeypatch, args, replay_moe_pin = True)
+    assert args["moe_backend"] == "triton" and args["enable_return_routed_experts"] is True
+
+
+@pytest.mark.parametrize("owned_v1", [False, True])
+def test_dropped_suffix_decoding_gives_back_its_batch_limits(runner_env, monkeypatch, owned_v1):
+    # load_vllm lowered max_num_seqs (and raised max_num_batched_tokens) to fit the suffix lookahead
+    # with LoRA; once routing replay drops suffix decoding, the engine and generate_batches
+    # (llm.approx_max_num_seqs) get the limits from before speculation back.
+    vu, _ = runner_env
+    monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "0")
+    if owned_v1:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+        monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", True)
+    args = dict(_replay_args(), speculative_config = {"method": "suffix"}, max_num_seqs = 12, max_num_batched_tokens = 512)
+    ns = _run_block(
+        vu, monkeypatch, args, approx_max_num_seqs = 12, max_num_batched_tokens = 512,
+        pre_speculation_sizes = (64, 256, 64, 256),
+    )
+    assert "speculative_config" not in args
+    assert args["max_num_seqs"] == 64 and args["max_num_batched_tokens"] == 256
+    assert ns["block_locals"]["approx_max_num_seqs"] == 64
+    assert ns["block_locals"]["max_num_batched_tokens"] == 256
+
+
+def test_kept_speculation_keeps_its_batch_limits(runner_env, monkeypatch):
+    vu, _ = runner_env
+    monkeypatch.setenv("UNSLOTH_VLLM_REPLAYSSM", "0")
+    args = dict(_replay_args(), speculative_config = {"method": "mtp"}, max_num_seqs = 12, max_num_batched_tokens = 512)
+    _run_block(vu, monkeypatch, args, approx_max_num_seqs = 12, max_num_batched_tokens = 512,
+               pre_speculation_sizes = (64, 256, 64, 256))
+    assert args["max_num_seqs"] == 12 and args["max_num_batched_tokens"] == 512
 
 
 def test_user_v1_runner_keeps_replayssm_when_it_turns_routing_replay_off(runner_env, monkeypatch, capsys):

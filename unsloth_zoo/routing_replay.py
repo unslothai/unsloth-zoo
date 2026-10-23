@@ -227,6 +227,10 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
             prompt_routed = torch.as_tensor(prompt_routed).to(torch.int16)
         for completion in getattr(request_output, "outputs", None) or []:
             routed = getattr(completion, "routed_experts", None)
+            if routed is None and split and prompt_routed is not None:
+                # vLLM 0.21 split_routed_experts turns an empty generation part (one sampled
+                # token, never forwarded) into None; the prompt part is still on the request.
+                routed = prompt_routed[:0]
             if routed is None:
                 continue
             full = prompt_ids + list(completion.token_ids)

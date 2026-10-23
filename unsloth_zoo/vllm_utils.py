@@ -4850,12 +4850,17 @@ def load_vllm(
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
         # Not for return_args (`vllm serve`, e.g. SyntheticDataKit): nothing records routes from
         # that server, and its CLI translation drops False values such as async_scheduling.
+        # True while moe_backend = "triton" is there only for routing replay's capture hook.
+        replay_moe_pin = False
         if not use_async and not use_engine and not return_args:
             from .routing_replay import routing_replay_engine_args
-            engine_args.update(routing_replay_engine_args(config))
+            replay_engine_args = routing_replay_engine_args(config)
+            engine_args.update(replay_engine_args)
+            replay_moe_pin = "moe_backend" in replay_engine_args
         if fp8_moe is not None:
             # Only the Triton FP8 MoE kernel keeps the expert layout training aliases.
             engine_args["moe_backend"] = "triton"
+            replay_moe_pin = False
         if (enable_lora and not use_async and not use_engine and not use_bitsandbytes and not is_fp8
                 and _merged_rollout_mode() == "attention"):
             # Attention is folded, so vLLM wraps only the rest: no punica kernels on attention.
@@ -4933,7 +4938,13 @@ def load_vllm(
         # return_args callers (SyntheticDataKit's `vllm serve`) turn every value into a CLI flag with
         # str(), and vLLM parses --speculative-config as JSON, so a dict here kills the server.
         suffix_config = None if return_args else _vllm_suffix_decoding_config()
+        # Limits before suffix decoding sizing, for when routing replay drops suffix decoding.
+        pre_speculation_sizes = None
         if suffix_config is not None:
+            pre_speculation_sizes = (
+                approx_max_num_seqs, max_num_batched_tokens,
+                engine_args.get("max_num_seqs"), engine_args.get("max_num_batched_tokens"),
+            )
             engine_args["speculative_config"] = suffix_config
             if enable_lora:
                 fitted_max_num_seqs = _fit_max_num_seqs_to_speculation(
@@ -5043,7 +5054,18 @@ def load_vllm(
         # Routing replay on vLLM 0.31+ needs Model Runner V2, also when ReplaySSM is off here. Runs
         # before the ReplaySSM conflict test below: a V1 runner the user chose turns routing replay
         # off here, which leaves ReplaySSM free to stay on (it runs on V1).
-        _routing_replay_model_runner(engine_args, config)
+        replay_runner_action = _routing_replay_model_runner(engine_args, config)
+        if replay_runner_action == "replay_off" and replay_moe_pin:
+            # The Triton pin was only for the capture hook: vLLM picks its own MoE backend again.
+            engine_args.pop("moe_backend", None)
+        if pre_speculation_sizes is not None and "speculative_config" not in engine_args:
+            # Suffix decoding was dropped for routing replay: undo its LoRA lookahead sizing.
+            approx_max_num_seqs, max_num_batched_tokens, seqs, tokens = pre_speculation_sizes
+            for key, value in (("max_num_seqs", seqs), ("max_num_batched_tokens", tokens)):
+                if value is None:
+                    engine_args.pop(key, None)
+                else:
+                    engine_args[key] = value
         replayssm_set_runner = False
         replayssm_mode = _vllm_replayssm_mode()
         # A runner the user forced to V2 would only get the engine refused and rebuilt.
