@@ -4852,6 +4852,11 @@ def _replay_matches(stock, replay, mask, initial):
                and mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item() for a, b in pairs)
 
 
+def _tape_key(q, k, v, a, b, initial, mask):
+    return (*k.shape[2:], *v.shape[2:], q.shape[1], a.ndim, q.dtype, k.dtype, v.dtype, a.dtype, b.dtype,
+            getattr(initial, "dtype", None), getattr(mask, "dtype", None))
+
+
 def _taped_update(native, with_states):
     """`gated_delta_update` keeping no per-step states for a block that fills its cache's speculative window."""
     def gated_delta_update(q, k, v, a, b, A_log, dt_bias, state = None, mask = None, use_kernel = True,
@@ -4868,8 +4873,7 @@ def _taped_update(native, with_states):
         def update(initial, steps):
             replay = functools.partial(with_states, q, k, v, a, b, A_log, dt_bias, initial,
                                        use_kernel = use_kernel, state_steps = 0)
-            key = (*k.shape[2:], *v.shape[2:], length, a.ndim, q.dtype, k.dtype, v.dtype, a.dtype, b.dtype,
-                   getattr(initial, "dtype", None), getattr(mask, "dtype", None))
+            key = _tape_key(q, k, v, a, b, initial, mask)
             verdict = _TAPE_VERDICTS.get(key)
             if not verdict:
                 stock = with_states(q, k, v, a, b, A_log, dt_bias, initial, mask, use_kernel = use_kernel,
@@ -4915,6 +4919,266 @@ def _taped_transaction_class(base):
         base.abort(self)
 
     return type(f"_Taped{base.__name__}", (base,), {"commit": commit, "abort": abort})
+
+
+# A verify block's convolution through gated norm in one launch per head, the decode step's arithmetic per row:
+# every row's taps, SiLU, q/k norms and gates, then the recurrence over the rows, then every row's gated norm.
+_VERIFY_GDN_SOURCE = """
+    constexpr uint NT = 32 * TY;
+    constexpr uint KEY = Hk * Dk;
+    constexpr uint C = 2 * KEY + Hv * Dv;
+    constexpr uint W = 2 * Dk + Dv;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint tid = sg * 32 + lane;
+    uint n = threadgroup_position_in_grid.z;
+    uint row = n / Hv;
+    uint hv = n % Hv;
+    uint hk = hv / (Hv / Hk);
+    const uint L = length;
+    threadgroup T qs[LMAX * Dk];
+    threadgroup T ks[LMAX * Dk];
+    threadgroup T vs[LMAX * Dv];
+    threadgroup T ys[LMAX * Dv];
+    threadgroup float decay[LMAX];
+    threadgroup T beta[LMAX];
+
+    {
+        // MLX's depthwise_conv_1d over each row's window, then SiLU.
+        #pragma clang fp contract(off) reassociate(off)
+        for (uint i = tid; i < L * W; i += NT) {
+            uint t = i / W, j = i % W;
+            uint c = j < Dk ? hk * Dk + j : j < 2 * Dk ? KEY + hk * Dk + j - Dk : 2 * KEY + hv * Dv + j - 2 * Dk;
+            float acc = 0.0f;
+            for (uint tap = 0; tap < K; ++tap) {
+                float product = static_cast<float>(conv_input[(row * (K - 1 + L) + t + tap) * C + c]) * conv_weight[c * K + tap];
+                acc = acc + product;
+            }
+            T conv = static_cast<T>(acc);
+            T act = Multiply()(conv, static_cast<T>(Sigmoid()(conv)));
+            if (j < Dk) qs[t * Dk + j] = act;
+            else if (j < 2 * Dk) ks[t * Dk + j - Dk] = act;
+            else vs[t * Dv + j - 2 * Dk] = act;
+        }
+    }
+    if (tid < L) {
+        uint gi = (row * L + tid) * Hv + hv;
+        PT gate = Add()(static_cast<PT>(a[gi]), static_cast<PT>(dt_bias[hv]));
+        float softplus = static_cast<float>(static_cast<PT>(LogAddExp()(gate, static_cast<PT>(0))));
+        decay[tid] = Exp()(Multiply()(Negative()(Exp()(static_cast<float>(A_log[hv]))), softplus));
+        beta[tid] = Sigmoid()(b[gi]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint r = sg; r < 2 * L; r += TY) {
+        threadgroup T* x = r < L ? qs + r * Dk : ks + (r - L) * Dk;
+        T scale = r < L ? q_scale[0] : k_scale[0];
+        float thread_x[4];
+        float acc = 0;
+        for (int i = 0; i < 4; i++) {
+            thread_x[i] = x[lane * 4 + i];
+            acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        acc = simd_sum(lane == 0 ? acc : 0.0f);
+        float inv = metal::precise::rsqrt(acc / Dk + qk_eps[0]);
+        for (int i = 0; i < 4; i++) {
+            T normed = static_cast<T>(1) * static_cast<T>(thread_x[i] * inv);
+            x[lane * 4 + i] = Multiply()(scale, normed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The block's q, k and v, for the commit to replay a retained prefix from.
+    for (uint i = tid; i < L * Dv; i += NT) {
+        uint t = i / Dv, d = i % Dv;
+        v_out[((row * L + t) * Hv + hv) * Dv + d] = vs[i];
+        if (hv % (Hv / Hk) == 0 && d < Dk) {
+            q_out[((row * L + t) * Hk + hk) * Dk + d] = qs[t * Dk + d];
+            k_out[((row * L + t) * Hk + hk) * Dk + d] = ks[t * Dk + d];
+        }
+    }
+
+    for (uint dv = sg; dv < Dv; dv += TY) {
+        float state[4];
+        auto i_state = state_in + (n * Dv + dv) * Dk + lane * 4;
+        for (int i = 0; i < 4; ++i) {
+            state[i] = static_cast<float>(i_state[i]);
+        }
+        for (uint t = 0; t < L; ++t) {
+            float kv_mem = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] * decay[t];
+                kv_mem += state[i] * ks[t * Dk + lane * 4 + i];
+            }
+            kv_mem = simd_sum(kv_mem);
+            auto delta = (vs[t * Dv + dv] - kv_mem) * beta[t];
+            float out = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] + ks[t * Dk + lane * 4 + i] * delta;
+                out += state[i] * qs[t * Dk + lane * 4 + i];
+            }
+            out = simd_sum(out);
+            if (lane == 0) {
+                ys[t * Dv + dv] = static_cast<T>(out);
+            }
+        }
+        auto o_state = state_out + (n * Dv + dv) * Dk + lane * 4;
+        for (int i = 0; i < 4; ++i) {
+            o_state[i] = state[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = sg; t < L; t += TY) {
+        float acc = 0;
+        for (int i = 0; i < 4; i++) {
+            float xi = ys[t * Dv + lane * 4 + i];
+            acc += xi * xi;
+        }
+        acc = simd_sum(acc);
+        acc = simd_sum(lane == 0 ? acc : 0.0f);
+        float inv = metal::precise::rsqrt(acc / Dv + norm_eps[0]);
+        for (int i = 0; i < 4; i++) {
+            uint d = lane * 4 + i, o = ((row * L + t) * Hv + hv) * Dv + d;
+            T normed = norm_weight[d] * static_cast<T>(static_cast<float>(ys[t * Dv + d]) * inv);
+            float zf = static_cast<float>(z[o]);
+            float silu = Multiply()(zf, Sigmoid()(zf));
+            y[o] = static_cast<T>(Multiply()(silu, static_cast<float>(normed)));
+        }
+    }
+"""
+_VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
+# Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
+_VERIFY_GDN_MAX_ROWS = 16
+# The verifier's own q/k normalization keeps 1e-6; the loader's replacement uses the layer's.
+_VERIFY_QK_EPS = {"abddec205f64acc5": lambda layer: 1e-6,
+                  "4fa05fbe449bee52": lambda layer: _NORMALIZE_QK_EPS.get(
+                      _ast_fingerprint(type(layer)._normalize_qk), lambda width: None)(layer.head_k_dim)}
+_VERIFY_GDN_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.speculative_verifier": {
+        "Qwen3_5BatchInvariantForward._normalize_gated_delta_qk": tuple(_VERIFY_QK_EPS)},
+    "mlx_vlm.models.qwen3_5.language": {"Qwen3_5RMSNormGated.__call__": "7c0c74be3b59d596",
+                                       "_precise_swiglu": "d5cc9afa38657b66"},
+    "mlx_vlm.models.qwen3_5.gated_delta": {"_compute_g_beta": "1185629ef7a77fba", "compute_g": "837fdb794c06f7f5",
+                                           "_make_gated_delta_with_states_kernel": "95debad27edcc930"},
+    "mlx.nn": {"silu": "78867fdb7e42731c", "softplus": "4d48a9bee57aeadd", "Conv1d.__call__": "e6c4e02415104dd1"},
+}
+_VERIFY_GDN_VERDICTS = {}
+
+
+@functools.cache
+def _verify_gdn_kernel():
+    try:
+        header = mx.metal.is_available() and nax._mlx_kernel_header("unary_ops.h")
+        binary = header and nax._mlx_kernel_header("binary_ops.h")
+        return binary and mx.fast.metal_kernel(
+            name = "unsloth_gated_delta_verify_block",
+            input_names = ["conv_input", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight", "q_scale",
+                           "k_scale", "qk_eps", "norm_eps", "state_in", "length"],
+            output_names = ["y", "state_out", "q_out", "k_out", "v_out"], header = header + binary,
+            compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_SOURCE,
+        ) or None
+    except (AttributeError, TypeError):
+        return None
+
+
+def _verify_gdn_block(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads):
+    B, L, value_heads, Dv = z.shape
+    Dk, dtype = state.shape[-1], conv_input.dtype
+    q_scale, k_scale, qk_norm_eps, norm_eps = _decode_step_scalars(Dk, dtype, qk_eps, eps)
+    return _verify_gdn_kernel()(
+        inputs = [conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, qk_norm_eps, norm_eps,
+                  state, L],
+        template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[1]),
+                    ("LMAX", _VERIFY_GDN_MAX_ROWS), ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv),
+                    ("TY", _VERIFY_GDN_ROWS)],
+        grid = (32, _VERIFY_GDN_ROWS, B * value_heads), threadgroup = (32, _VERIFY_GDN_ROWS, 1),
+        output_shapes = [z.shape, state.shape, (B, L, key_heads, Dk), (B, L, key_heads, Dk), z.shape],
+        output_dtypes = [dtype, state.dtype, dtype, dtype, dtype],
+    )
+
+
+def _verify_gdn_fits(layer, inputs, mask, cache):
+    """Whether the fused block can take this unmasked block, before its projections run."""
+    batch, length = inputs.shape[:2]
+    K, Dk, Dv, Hv = layer.conv_kernel_size, layer.head_k_dim, layer.head_v_dim, layer.num_v_heads
+    conv, norm, language = layer.conv1d, layer.norm, sys.modules.get("mlx_vlm.models.qwen3_5.language")
+    if (mask is not None or cache is None or layer.training or language is None or mx.default_device() != mx.gpu
+            or not 3 <= length <= _VERIFY_GDN_MAX_ROWS
+            or getattr(cache, "history_capacity", 0) != length or Dk != 128 or Dv != 128 or not 2 <= K <= 8
+            or Hv % layer.num_k_heads or inputs.dtype not in (mx.bfloat16, mx.float16)):
+        return False
+    state = cache[1]
+    if state is not None and (state.shape != (batch, Hv, Dv, Dk) or state.dtype != mx.float32):
+        return False
+    return (type(conv) is nn.Conv1d and "bias" not in conv and conv.weight.shape == (layer.conv_dim, K, 1)
+            and conv.weight.dtype == inputs.dtype and conv.groups == layer.conv_dim
+            and (conv.stride, conv.padding, conv.dilation) == (1, 0, 1)
+            and type(norm) is language.Qwen3_5RMSNormGated and norm.weight.shape == (Dv,)
+            and norm.weight.dtype == inputs.dtype and layer.A_log.shape == (Hv,) and layer.dt_bias.shape == (Hv,)
+            and all(t.dtype in (mx.float32, mx.bfloat16, mx.float16) for t in (layer.A_log, layer.dt_bias)))
+
+
+def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
+    """The verifier's `_gated_delta` for a block `_verify_gdn_fits` took, its convolution through gated norm fused
+    once a first block matched the stock ops bit for bit; the commit replays the kernel's q/k/v like a taped block's."""
+    batch, length, _ = inputs.shape
+    K, Dv, Hk = layer.conv_kernel_size, layer.head_v_dim, layer.num_k_heads
+    mixed_qkv, z, b, a = self._linears((layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a), inputs)
+    z = z.reshape(batch, length, -1, Dv)
+    conv_state = cache[0]
+    if conv_state is None or conv_state.shape[0] != batch:
+        conv_state = mx.zeros((batch, K - 1, layer.conv_dim), dtype = inputs.dtype)
+    conv_input = mx.concatenate([conv_state, mixed_qkv], axis = 1)
+    cache.update_window(0, conv_input, K - 1, lengths = cache.lengths)
+    initial, dtype = cache[1], conv_input.dtype
+    key = (length, Hk, layer.num_v_heads, K, dtype, a.dtype, b.dtype, layer.A_log.dtype, layer.dt_bias.dtype,
+           getattr(initial, "dtype", None), qk_eps, layer.norm.eps)
+    verdict = _VERIFY_GDN_VERDICTS.get(key)
+    fits = all(t.dtype == dtype for t in (z, a, b)) and a.shape == b.shape == (batch, length, layer.num_v_heads)
+    fused = lambda state: _verify_gdn_block(
+        conv_input, layer.conv1d.weight.reshape(layer.conv_dim, K), a, b, layer.A_log, layer.dt_bias, z,
+        layer.norm.weight, qk_eps, layer.norm.eps,
+        mx.zeros((batch, layer.num_v_heads, Dv, layer.head_k_dim), mx.float32) if state is None else state, Hk)
+    # A passed check holds the key of the replay its commit relies on.
+    if fits and verdict and _TAPE_VERDICTS.get(verdict):
+        def update(entry, steps):
+            y, final, q, k, v = fused(entry)
+            replay = functools.partial(with_states, q, k, v, a, b, layer.A_log, layer.dt_bias, entry,
+                                       use_kernel = True, state_steps = 0)
+            _VERIFY_STATE.tapes.append((cache, 1, replay, None))
+            return y, final, mx.broadcast_to(final[:, None], (batch, steps, *final.shape[1:]))
+        output, _ = cache.update_recurrent(1, length, update)
+    else:
+        conv_output = nn.silu(layer.conv1d(conv_input))
+        q, k, v = [value.reshape(batch, length, heads, width) for value, heads, width in zip(
+            mx.split(conv_output, [layer.key_dim, 2 * layer.key_dim], -1), [Hk, Hk, layer.num_v_heads],
+            [layer.head_k_dim, layer.head_k_dim, Dv])]
+        q, k = self._normalize_gated_delta_qk(layer, q, k)
+        output, state = route(q, k, v, a, b, layer.A_log, layer.dt_bias, use_kernel = True, cache = cache)
+        output = layer.norm(output, z)
+        tape_key = _tape_key(q, k, v, a, b, initial, None)
+        taped = _TAPE_VERDICTS.get(tape_key)
+        if fits and verdict is None and taped is not None:
+            try:
+                verdict = _settled(taped and all(
+                    x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+                    for x, y in zip(fused(initial), (output, state, q, k, v))))
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                # A build Metal rejects stays rejected; a function transformation or memory pressure is checked later.
+                if str(error).startswith("[metal::Device] Unable to "):
+                    _VERIFY_GDN_VERDICTS[key] = False
+            else:
+                _VERIFY_GDN_VERDICTS[key] = verdict and tape_key
+                if taped and not verdict:
+                    logger.warning("the fused gated-delta verify block differs from the verifier's ops for %d rows, "
+                                   "%d key heads, %d value heads, a %d-tap convolution and %s inputs; the verifier's "
+                                   "ops stay in use", *key[:5])
+    if hasattr(cache, "advance"):
+        cache.advance(length)
+        self._helpers()._qwen3_5_advance_lengths_info(cache, length)
+    return self._linear(layer.out_proj, output.reshape(batch, length, -1))
 # MLX 0.32.3's sdpa_vector_2pass_1 and _2 over a causal block of rows, each row's arithmetic and
 # order the one-row call's: key i goes to block i % BLOCKS, and a row skips the keys past its own.
 # Each simdgroup carries two rows, so a K/V load serves both; the row pairs of a threadgroup share it through L1.
@@ -5243,6 +5507,15 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         route = _taped_update(kernels.gated_delta_update, kernels.gated_delta_update_with_states)
         taped = FunctionType(gated_delta.__code__, {**gated_delta.__globals__, "gated_delta_update": route},
                              gated_delta.__name__, gated_delta.__defaults__, gated_delta.__closure__)
+    fused_bindings = None
+    if taped is not None and os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") != "0" and _verify_gdn_kernel():
+        fused_bindings = _resolved_bindings(_VERIFY_GDN_CONTRACT)
+        normalize = getattr(base, "_normalize_gated_delta_qk", None)
+        forward = getattr(sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier"), "Qwen3_5BatchInvariantForward", None)
+        qk_eps_of = (fused_bindings is not None and normalize is not None
+                     and normalize is getattr(forward, "_normalize_gated_delta_qk", None)
+                     and _VERIFY_QK_EPS[_ast_fingerprint(normalize)])
+        fused_bindings = fused_bindings if qk_eps_of else None
 
     def verify(self, language_model, inputs, *, cache = None, **kwargs):
         outer, outer_tapes = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
@@ -5271,6 +5544,10 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
     def taped_gated_delta(self, layer, inputs, mask, cache):
         if getattr(_VERIFY_STATE, "tapes", None) is None:
             return base._gated_delta(self, layer, inputs, mask, cache)
+        if fused_bindings is not None and _verify_gdn_fits(layer, inputs, mask, cache) and _bindings_intact(fused_bindings):
+            qk_eps = qk_eps_of(layer)
+            if qk_eps is not None:
+                return _verify_gdn(self, layer, inputs, cache, route, kernels.gated_delta_update_with_states, qk_eps)
         return taped(self, layer, inputs, mask, cache)
 
     def sliced_linear(self, linear, x):
@@ -6649,6 +6926,62 @@ def warm_inference(model, int8_prefill = None):
     model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
                    int8_prefill = int8_prefill)
     _warm_qmv_rows(model)
+    _warm_verify_gdn(model)
+
+
+def _warm_verify_gdn(model):
+    """Build the fused verify block's pipeline for each linear-attention layer shape, and settle each block width's
+    bitwise checks through the verifier for a model a drafter was built for: either would otherwise land in the first
+    speculative replies."""
+    language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
+    if (language is None or os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") == "0" or not hasattr(model, "named_modules")
+            or mx.default_device() != mx.gpu or not _verify_gdn_kernel()):
+        return
+    shapes = {}
+    for _, layer in model.named_modules():
+        # Not qwen4_exp's subclass: its blocks verify through its own forward, which never launches the fused block.
+        if (type(layer) is language.Qwen3_5GatedDeltaNet and layer.head_k_dim == layer.head_v_dim == 128
+                and not layer.num_v_heads % layer.num_k_heads and layer.conv1d.weight.dtype in (mx.bfloat16, mx.float16)):
+            shapes.setdefault((layer.conv1d.weight.dtype, layer.A_log.dtype, layer.dt_bias.dtype, layer.conv_kernel_size,
+                               layer.num_k_heads, layer.num_v_heads), layer)
+    for shape, layer in list(shapes.items()):
+        dtype, K, Hv, D, length = shape[0], layer.conv_kernel_size, layer.num_v_heads, layer.head_v_dim, 3
+        gates = mx.zeros((1, length, Hv), dtype)
+        try:
+            mx.eval(_verify_gdn_block(
+                mx.zeros((1, K - 1 + length, layer.conv_dim), dtype), layer.conv1d.weight.reshape(layer.conv_dim, K),
+                gates, gates, layer.A_log, layer.dt_bias, mx.zeros((1, length, Hv, D), dtype), layer.norm.weight, 1e-6,
+                layer.norm.eps, mx.zeros((1, Hv, D, D), mx.float32), layer.num_k_heads))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            del shapes[shape]  # its blocks keep the verifier's ops
+    if getattr(model, "_unsloth_speculates", False):  # set by building a drafter for it
+        with exact_speculative_verify(model):
+            _settle_verify_gdn(model, language, shapes)
+
+
+def _settle_verify_gdn(model, language, shapes):
+    verifier, caches = getattr(language, "_EXACT_SPECULATIVE_VERIFIER", None), sys.modules.get("mlx_vlm.models.cache")
+    served = {id(layer) for _, owner in model.named_modules() if vars(owner).get("_unsloth_verify_scopes")
+              for _, layer in owner.named_modules()}
+    if caches is None or not hasattr(type(verifier), "_unsloth_verify_native"):
+        return
+    outer = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
+    try:
+        _VERIFY_STATE.serving = True
+        for (dtype, *_), layer in shapes.items():
+            if id(layer) not in served:
+                continue
+            for length in range(3, _VERIFY_GDN_MAX_ROWS + 1):
+                cache, key = caches.ArraysCache(2), mx.random.key(length)
+                cache[0] = mx.random.normal((1, layer.conv_kernel_size - 1, layer.conv_dim), key = key).astype(dtype)
+                cache[1] = mx.random.normal((1, layer.num_v_heads, layer.head_v_dim, layer.head_k_dim), key = key) * 0.1
+                cache.start_speculation(length)
+                _VERIFY_STATE.tapes = []
+                mx.eval(verifier._gated_delta(layer, mx.random.normal((1, length, layer.hidden_size), key = key)
+                                              .astype(dtype), None, cache))
+    finally:
+        _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer
 
 
 def _warm_qmv_rows(model):
