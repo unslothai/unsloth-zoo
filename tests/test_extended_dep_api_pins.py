@@ -295,7 +295,7 @@ def test_bnb_fix_4bit_weight_quant_state_from_module_present():
 
 
 def test_bnb_matmul_4bit_top_level_and_signature():
-    """temporary_patches/bitsandbytes.py:106, moe_bnb.py:245,
+    """temporary_patches/bitsandbytes.py:106,
     vllm_utils.py:190 -- ``bnb.matmul_4bit`` is the 4-bit GEMM kernel
     zoo replaces Linear4bit.forward with. Pin ``(A, B, quant_state, bias)``."""
     _require_module("bitsandbytes")
@@ -313,8 +313,8 @@ def test_bnb_matmul_4bit_top_level_and_signature():
 
 
 def test_bnb_functional_dequantize_4bit_present():
-    """temporary_patches/moe_bnb.py:44 -- pre-dequantizes expert weights
-    via dequantize_4bit. Rename takes out MoE-on-bnb training."""
+    """temporary_patches/moe_grouped_modulelist.py, moe_nf4_grouped.py -- dequantize
+    expert weights via dequantize_4bit. Rename takes out MoE-on-bnb training."""
     _require_module("bitsandbytes")
     _resolve("bitsandbytes.functional.dequantize_4bit")
 

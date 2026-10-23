@@ -3175,30 +3175,6 @@ def _sft_logits_are_unusable(logits):
 pass
 
 
-def _sft_raised_on_empty_logits(exception):
-    """Decided on the object trl was holding, not on the exception message.
-
-    Which exception comes out depends on which sentinel the model returned and
-    which attribute the installed trl reaches for first:
-
-        EmptyLogits().shape[:-1]      TypeError    ('function' not subscriptable)
-        EmptyLogits()[..., :-1, :]    NotImplementedError
-        torch.empty(0)[..., :-1, :]   IndexError   (too many indices)
-        torch.empty(0).argmax(-1)     RuntimeError
-
-    so a message match fixes one build and misses the next. The failing frame
-    still holds trl's `outputs`, so the question can be asked of the logits
-    themselves: if they are real, this is somebody's genuine bug and it must
-    keep propagating.
-
-    Matched on the local rather than on the frame's name, because the raise can
-    land in a helper trl called and because the enclosing method has been
-    renamed before. The stack starts inside SFTTrainer.compute_loss either way.
-    """
-    return _sft_empty_logits_outputs(exception) is not None
-pass
-
-
 _SFT_NO_LOGITS = object()
 
 

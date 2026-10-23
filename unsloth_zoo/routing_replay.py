@@ -638,7 +638,6 @@ def _router_hook(layer_index, compact = None):
 
 def _is_router(module):
     name = type(module).__name__
-    # Also Unsloth's GptOssTopKRouterBnb4bit.
     return "TopKRouter" in name or "TopkRouter" in name
 
 

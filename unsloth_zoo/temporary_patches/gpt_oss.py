@@ -289,30 +289,6 @@ def swiglu_torch_forward(a, alpha, limit, dtype = None):
 pass
 
 
-@torch_compile(dynamic = True, fullgraph = True)
-def swiglu_torch_backward(pre_act, alpha, limit, g1):
-    g, l = pre_act[..., ::2].to(torch.float32), pre_act[..., 1::2].to(torch.float32)
-
-    if limit is not None:
-        mask_g = g <= limit
-        mask_l = l.abs() <= limit
-        ḡ = torch.where(mask_g, g, limit)
-        l̄ = torch.where(mask_l, l, l.sign() * limit)
-    else:                                            # no clipping
-        mask_g = mask_l = torch.ones_like(g, dtype=bool)
-        ḡ, l̄ = g, l
-
-    σ   = torch.sigmoid(alpha * ḡ)
-    dg  = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
-    dl  = ḡ * σ
-    dg  = torch.where(mask_g, dg, 0.)                # clamp-grad
-    dl  = torch.where(mask_l, dl, 0.)
-
-    grad = torch.empty_like(pre_act)
-    grad[..., ::2], grad[..., 1::2] = dg, dl
-    return g1 * grad.to(g1.dtype)
-pass
-
 _MXFP4_E2M1_VALUES = (
     +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -1450,89 +1426,6 @@ class GptOssExpertsBnb4bit(nn.Module):
 pass
 
 
-class GptOssTopKRouterBnb4bit(nn.Module):
-    """
-    GPT OSS Router with weight/bias as direct nn.Parameter (not nested Linear) for BnB 4bit.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
-        self.hidden_dim = config.hidden_size
-        self.dtype = dtype_from_config(config)
-        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, dtype=self.dtype))
-        self.bias = nn.Parameter(torch.zeros(self.num_experts, dtype=self.dtype))
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        # Accept checkpoints that used a Linear router (linear.weight/bias)
-        linear_weight_key = prefix + "linear.weight"
-        linear_bias_key = prefix + "linear.bias"
-        weight_key = prefix + "weight"
-        bias_key = prefix + "bias"
-        moved_weight = False
-        moved_bias = False
-        if linear_weight_key in state_dict and weight_key not in state_dict:
-            state_dict[weight_key] = state_dict.pop(linear_weight_key)
-            moved_weight = True
-        if linear_bias_key in state_dict and bias_key not in state_dict:
-            state_dict[bias_key] = state_dict.pop(linear_bias_key)
-            moved_bias = True
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
-        if moved_weight:
-            if linear_weight_key in unexpected_keys:
-                unexpected_keys.remove(linear_weight_key)
-            if weight_key in missing_keys:
-                missing_keys.remove(weight_key)
-        if moved_bias:
-            if linear_bias_key in unexpected_keys:
-                unexpected_keys.remove(linear_bias_key)
-            if bias_key in missing_keys:
-                missing_keys.remove(bias_key)
-        if self.weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            self.weight.data = self.weight.data.to(self.dtype)
-        if self.bias is not None and self.bias.dtype not in (
-            torch.float16, torch.bfloat16, torch.float32
-        ):
-            self.bias.data = self.bias.data.to(self.dtype)
-
-    def forward(self, hidden_states):
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = torch.nn.functional.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)
-        dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
-        fused = _fused_route_or_none(router_logits, self.top_k, "topk_softmax")
-        if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
-            router_top_value, router_indices = fused[0].to(dtype), fused[1]
-        else:
-            router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
-            router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
-        router_scores = torch.zeros_like(router_logits, dtype=dtype).scatter_(1, router_indices, router_top_value)
-        if transformers_version >= Version("5.0.0"):
-            return router_logits, router_scores, router_indices
-        else:
-            return router_scores, router_indices
-
-
-pass
-
-
 def patch_gpt_oss_bnb4bit():
     """
     Patch transformers to use BnB 4bit compatible classes for pre-quantized models.
@@ -1561,7 +1454,7 @@ def patch_gpt_oss_bnb4bit():
 
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExpertsBnb4bit
     # Use unsloth GptOssTopKRouter (self.linear = nn.Linear): BnB 4-bit checkpoints store
-    # router.linear.weight/bias. GptOssTopKRouterBnb4bit remapped keys via _load_from_state_dict,
+    # router.linear.weight/bias. A separate 4-bit router class remapped keys via _load_from_state_dict,
     # but transformers v5 bypasses it (accelerate's set_module_tensor_to_device), so weights
     # stayed randomly initialized -> high loss (~4-5).
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
@@ -2619,10 +2512,6 @@ def _ogs_root_for(weight, routing_data = None, module = None):
 def _ogs_backend_for(weight, routing_data = None, module = None):
     from unsloth_zoo.triton_kernels_compat import triton_kernels_backend_for
     return triton_kernels_backend_for(_ogs_root_for(weight, routing_data, module))
-
-
-def _matmul_ogs_for(weight, routing_data = None):
-    return _ogs_backend_for(weight, routing_data).matmul_ogs
 
 
 _OGS_NATIVE_REJECT_WARNED = False
@@ -3826,62 +3715,6 @@ def patch_GptOssModel():
         hidden_states *= torch.rsqrt_(variance)
         hidden_states *= self.weight.to(hidden_states.device).to(torch.float32)
         return hidden_states.to(input_dtype)  # main diff with Llama
-    pass
-
-    # Re-compiling for each new sequence length which is NOT ideal
-    @_torch_compile(dynamic = True, fullgraph = False, mode = "reduce-overhead")
-    def pre_forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-    ):
-        hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
-        # Self Attention
-        query_states, key_states, value_states, input_shape = pre_attention_decoding(
-            self=self.self_attn,
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-        )
-        return query_states, key_states, value_states, input_shape
-    pass
-    fused_torch_compile_options = get_torch_compile_options(
-        epilogue_fusion = True,
-        max_autotune = False, # Too slow
-        shape_padding = True,
-        cudagraphs = True,
-        coordinate_descent_tuning = False,
-        combo_kernels = False,
-        memory_planning = True,
-        multi_kernel = False, # Fails on torch 2.10 nightly
-        use_block_ptr = True,
-        logging = UNSLOTH_ENABLE_LOGGING,
-    )
-
-    @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
-    def post_forward(
-        self,
-        residual: torch.Tensor,
-        attn_output: torch.Tensor,
-        logsumexp: torch.Tensor,
-        input_shape,
-    ):
-        hidden_states = post_attention_decoding(self.self_attn, attn_output, logsumexp, input_shape)
-        hidden_states += residual
-
-        # Fully Connected
-        residual = hidden_states.clone()
-        hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
-        return hidden_states, residual
     pass
 
     def inference_forward(
