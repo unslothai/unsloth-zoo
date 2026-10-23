@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MXFP4 dequant: the fp32-multiply + integer-rounding kernel path (default on ROCm).
-
-On gfx11 ROCm Triton lowers bf16 x bf16 to v_dot2_bf16_bf16(a, b, +0) and an fp32 multiply followed by
-an fp16 cast to v_fma_mixlo_f16(a, b, +0); both turn -0.0 into +0.0, and the dot flushes subnormals, so
-the fused kernel failed its bit-exact self-check there. The exact path must match the torch reference
-bit for bit on any GPU (NVIDIA runs it with UNSLOTH_MXFP4_EXACT_ROUND=1), and is the default on ROCm.
-"""
+"""MXFP4 dequant: the fp32-multiply + integer-rounding kernel path (default on ROCm)."""
 
 import pytest
 import torch
@@ -33,7 +27,6 @@ on_hip = torch.version.hip is not None
 
 
 def _every_nibble_under_every_scale(device):
-    # Each byte 0..255 (both nibbles, so every e2m1 code in both positions) under every e8m0 scale 0..255.
     byte = torch.arange(256, device = device, dtype = torch.int32)
     blocks = byte.view(1, 1, 256).expand(256, 1, 256).reshape(256, 16, 16).to(torch.uint8)
     blocks = blocks.reshape(2, 128, 16, 16)
@@ -46,8 +39,6 @@ def _bits(t):
 
 
 def _f32_patterns(device):
-    # Every exponent with edge and random mantissas, the fp16 / bf16 halfway points, subnormal and
-    # overflow boundaries, +-0, +-inf, NaN.
     g = torch.Generator(device = "cpu").manual_seed(0)
     exp = torch.arange(256, dtype = torch.int64).repeat_interleave(64)
     man = torch.randint(0, 1 << 23, (exp.numel(),), generator = g, dtype = torch.int64)
@@ -89,7 +80,7 @@ def test_rounding_helpers_match_torch(dtype):
     nan = torch.isnan(x)
     assert torch.equal(torch.isnan(y), nan)
     assert torch.equal(_bits(y)[~nan], _bits(want)[~nan])
-    # NaN keeps its sign bit (torch's own NaN bits are backend-specific: CUDA emits 0x7FFF).
+    # torch's NaN bits are backend-specific (CUDA emits 0x7FFF).
     assert torch.equal(_bits(y)[nan] < 0, x.view(torch.int32)[nan] < 0)
 
 
@@ -122,7 +113,6 @@ def test_exact_round_is_the_rocm_default(monkeypatch):
 
 @pytest.mark.skipif(not mxd._HAS_TRITON, reason = "needs Triton")
 def test_faked_rocm_launches_the_exact_path(monkeypatch):
-    # Routing only: on ROCm the launch asks for EXACT_ROUND and not the bf16 bit-built multiply.
     monkeypatch.delenv("UNSLOTH_MXFP4_EXACT_ROUND", raising = False)
     monkeypatch.setattr(mxd, "_IS_HIP", True)
     seen = {}
@@ -134,7 +124,6 @@ def test_faked_rocm_launches_the_exact_path(monkeypatch):
 
 
 def test_verification_is_keyed_on_the_rounding_path(monkeypatch):
-    # A result checked on one rounding path must not be reused when the switch selects the other kernel.
     checked = []
 
     def fake_dequantize(blocks, scales, dtype, transpose, *rest):
@@ -178,7 +167,6 @@ def test_rocm_self_check_passes(dtype):
 
 
 def test_hip_codegen_has_no_fused_mixed_precision_ops():
-    # Offline: compile the exact path for gfx1151 and check the two combines that broke it are gone.
     pytest.importorskip("triton")
     if not mxd._HAS_TRITON:
         pytest.skip("needs Triton")

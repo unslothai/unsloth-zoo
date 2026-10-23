@@ -46,7 +46,7 @@ _TORCH_CHUNK_BYTES = 256 << 20
 
 # ROCm Triton (gfx11, Triton 3.6) lowers bf16 x bf16 to v_dot2_bf16_bf16(a, b, +0) (flushes subnormals,
 # -0 -> +0) and fp32 multiply then fp16 cast to v_fma_mixlo_f16(a, b, +0) (-0 -> +0). There the kernel
-# multiplies in fp32 and rounds to 16 bits with integer ops, which no backend combine can fuse.
+# multiplies in fp32 and rounds to 16 bits with integer ops instead.
 _IS_HIP = torch.version.hip is not None
 
 # torch < 2.12's ldexp forms 2^e in the input dtype: inf from 2^16 in fp16, and from 2^128 (e8m0 255) in fp32 (0 -> NaN).
@@ -118,14 +118,12 @@ if _HAS_TRITON:
 
     @triton.jit
     def _f32_to_f16_rne(x):
-        # IEEE fp32 -> fp16, round to nearest even, subnormals kept, sign of zero kept, NaN quietened.
         u = x.to(tl.int32, bitcast = True)
         sign = (u >> 16) & 0x8000
         a = u & 0x7FFFFFFF
         c = tl.minimum(a, 0x477FF000)
         normal = (c + 0xFFF + ((c >> 13) & 1) - 0x38000000) >> 13
-        # Below 2^-14: value = m * 2^(e - 150), result in units of 2^-24.
-        # Clamped to [1, 31]: lanes at or above 2^-14 take `normal`, but must not shift by a negative count.
+        # Clamped to [1, 31]: lanes >= 2^-14 take `normal` but must not shift by a negative count.
         shift = tl.minimum(tl.maximum(126 - (a >> 23), 1), 31)
         m = (a & 0x7FFFFF) | 0x800000
         q = m >> shift
@@ -139,7 +137,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _f32_to_bf16_rne(x):
-        # IEEE fp32 -> bf16, round to nearest even (torch's c10::BFloat16 rounding; NaN -> 0x7FC0 | sign).
+        # Matches c10::BFloat16 rounding; NaN -> 0x7FC0 | sign.
         u = x.to(tl.uint32, bitcast = True)
         r = (u + 0x7FFF + ((u >> 16) & 1)) >> 16
         r = tl.where((u & 0x7FFFFFFF) > 0x7F800000, ((u >> 16) & 0x8000) | 0x7FC0, r)
@@ -213,7 +211,6 @@ if _HAS_TRITON:
         tl.store(out_ptr + out_offs, vals, mask = mask)
 
 
-# Rounding paths (see _exact_round) whose kernel failed to compile or launch.
 _KERNEL_FAILED = set()
 _KERNEL_VERIFIED = {}
 
@@ -227,8 +224,7 @@ def _triton_usable(blocks):
 
 
 def _kernel_fail(exception):
-    # A Triton build that cannot compile this variant (an old ROCm stack) falls back for good; the other
-    # rounding path can still be tried.
+    # Per rounding path: the other variant can still be tried.
     _KERNEL_FAILED.add(_exact_round())
     import warnings
     warnings.warn(f"Unsloth: fused MXFP4 dequant unavailable ({exception}); using the torch path.")
@@ -236,7 +232,6 @@ def _kernel_fail(exception):
 
 def _kernel_verified(device, dtype, transpose):
     """Once per (device, dtype, layout, rounding path): kernel must match the torch reference bit for bit, else torch is used."""
-    # The rounding path picks a different kernel variant, so it is part of the key.
     key = (str(device), dtype, bool(transpose), _exact_round())
     verified = _KERNEL_VERIFIED.get(key)
     if verified is not None:
