@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`triton.enable_persistent_tma_matmul` is only requested on torch < 2.12.
-
-From torch 2.12 Inductor guards every GEMM size when it considers its TMA templates, so a compiled
-torch._scaled_mm (rowwise FP8 linears) recompiled for each new token count on sm90+.
-"""
+"""`triton.enable_persistent_tma_matmul` is only requested on torch < 2.12 (see common._persistent_tma_matmul_ok)."""
 
 import subprocess
 import sys
