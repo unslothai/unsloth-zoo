@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -52,6 +53,7 @@ __all__ = [
     "SpeculativeEngine",
     "StepOutput",
     "companion_drafter",
+    "has_native_mtp_head",
     "install_speculative_seam",
     "native_mtp_drafter",
     "probe_drafter",
@@ -1871,25 +1873,75 @@ def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool =
     return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, **kwargs)
 
 
-def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
-    """A drafter for the target's own MTP head, built in memory from only the ``mtp.*`` tensors of its
-    checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
-    from mlx_vlm.fp8 import transform_fp8_weights
-    from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors, detect_mtp_splitter
+def _checkpoint_keys(path: Path) -> dict[str, Path]:
+    from mlx_vlm.speculative.drafters.mtp_split import _safetensor_files, _weight_map
+    from safetensors import safe_open
 
-    path = Path(model_path)
-    splitter = detect_mtp_splitter(path)
+    if weight_map := _weight_map(path):
+        return {key: path / file for key, file in weight_map.items()}
+    keys = {}
+    for file in _safetensor_files(path):
+        with safe_open(file, framework = "mlx") as handle:
+            keys.update(dict.fromkeys(handle.keys(), file))
+    return keys
+
+
+def _native_mtp_head(path: Path) -> tuple | None:
+    """``(splitter, source_config, text_config, prefix, [(file, keys)])`` for a checkpoint's own MTP head, or None. The head
+    is the splitter's own layout, at the top level or under one ``model.``/``language_model.`` wrapper, where MLX
+    conversions of vision-language checkpoints keep it (``language_model.mtp.*``); ``prefix`` is that wrapper."""
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+
+    try:
+        source_config = json.loads((path / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    splitter = get_mtp_splitter(source_config = source_config)
     if splitter is None:
         return None
+    text_config = splitter.read_text_config(source_config)
+    if selected := list(splitter.iter_selected(path, text_config)):
+        return splitter, source_config, text_config, "", selected
+    nested = {}
+    for key, file in _checkpoint_keys(path).items():
+        wrapper = re.match(r"(?:(?:model|language_model)\.)+", key)
+        parts = wrapper.group().split(".")[:-1] if wrapper else []
+        for prefix in (".".join(parts[:end]) + "." for end in range(1, len(parts) + 1)):
+            if splitter.select_keys(key[len(prefix) :], text_config):
+                nested.setdefault(prefix, {}).setdefault(file, []).append(key)
+                break
+    if len(nested) != 1:
+        return None
+    [(prefix, files)] = nested.items()
+    for name in ("quantization", "quantization_config"):
+        if isinstance(source_config.get(name), dict):
+            # Per-module overrides name the head's modules under the wrapper too.
+            source_config[name] = {key.removeprefix(prefix): value for key, value in source_config[name].items()}
+    return splitter, source_config, text_config, prefix, list(files.items())
+
+
+def has_native_mtp_head(model_path: str | Path) -> bool:
+    """Whether ``native_mtp_drafter`` finds an MTP head in the checkpoint at ``model_path``."""
+    return _native_mtp_head(Path(model_path)) is not None
+
+
+def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
+    """A drafter for the target's own MTP head, built in memory from only the MTP tensors of its
+    checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
+    from mlx_vlm.fp8 import transform_fp8_weights
+    from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors
+
+    head = _native_mtp_head(Path(model_path))
+    if head is None:
+        return None
+    splitter, source_config, text_config, prefix, selected = head
     module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
     if not hasattr(module, "Model"):
         raise ValueError(f"mlx-vlm has no drafter for {splitter.output_model_type} MTP heads")
-    source_config = json.loads((path / "config.json").read_text())
-    text_config = splitter.read_text_config(source_config)
     tensors, source_is_mlx = {}, False
-    for file, keys in splitter.iter_selected(path, text_config):
+    for file, keys in selected:
         source_is_mlx = source_is_mlx or (splitter.supports_mlx_source and _is_mlx_safetensors(file))
-        tensors.update(splitter.load_shard(file, keys))
+        tensors.update((key.removeprefix(prefix), value) for key, value in splitter.load_shard(file, keys).items())
     tensors, fp8_quantization = transform_fp8_weights(tensors, source_config)
     if fp8_quantization is not None:
         source_config = {**source_config, "quantization": fp8_quantization}
