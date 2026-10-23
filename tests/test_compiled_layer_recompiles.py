@@ -153,3 +153,11 @@ def test_scratch_is_a_no_op_without_an_active_collector():
     before = var.__dict__.get("_unsloth_eager_value")
     with output_capture_scratch():
         assert var.__dict__.get("_unsloth_eager_value") is before
+
+
+def test_experts_interface_lookups_are_filled_before_any_trace():
+    pytest.importorskip("transformers.integrations.moe")
+    from unsloth_zoo.temporary_patches import moe_experts_interface as mei
+    mei.patch_experts_interface()
+    # A key first filled inside a compiled MoE layer guards on its absence: one more compile per layer kind.
+    assert "default_apply_gate" in mei._LAZY and "layout_is_standard" in mei._LAZY
