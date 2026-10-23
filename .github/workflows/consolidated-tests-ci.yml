@@ -470,6 +470,7 @@ jobs:
               tests/test_download_helpers_import_without_zoo_init.py \
               tests/test_llama_cpp_install_consent.py \
               tests/test_llama_cpp_consent_platforms.py \
+              tests/test_llama_cpp_subprocess_utf8_encoding.py \
               tests/test_converter_source_staging.py \
               tests/test_get_transformers_model_type_empty.py \
               tests/test_train_on_responses_list_labels.py \
