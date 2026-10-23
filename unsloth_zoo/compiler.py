@@ -293,6 +293,26 @@ def calls_disable_compile_function(source, disable_compile_functions):
     )
 
 
+def modules_wrapping_disabled_attention(inits, disabled_attention_modules):
+    """Modules whose `__init__` builds a compile-disabled attention module, directly or through
+    another such module. Compiled, each graph-breaks at every call (GraniteSpeechConformerBlock,
+    Gemma3nAudioConformerAttention, Blip2QFormerAttention), so they stay eager like layers that
+    call `self.self_attn`; their own compiled children still compile."""
+    found = set()
+    targets = set(disabled_attention_modules)
+    while targets:
+        new = {
+            module
+            for module, init in inits.items()
+            if module not in found
+            and module not in disabled_attention_modules
+            and any(re.search(rf"\b{re.escape(x)}\(", init) for x in targets)
+        }
+        found |= new
+        targets = new
+    return found
+
+
 def function_defined_elsewhere(modeling_file, name):
     """True if `modeling_file.<name>` is imported from another file (a same-named method can match `def <name>`)."""
     try:
@@ -6408,6 +6428,7 @@ def unsloth_compile_transformers(
         if compile_attention
         else []
     )
+    torch_module_inits = {}
     for module in torch_modules.keys():
         source = eval(f"modeling_file.{module}")
         try:
@@ -6419,6 +6440,7 @@ def unsloth_compile_transformers(
         # Dynamo cannot inline a compile-disabled attention forward into a fullgraph region (UMT5LayerSelfAttention).
         if any(re.search(rf"\b{re.escape(x)}\(", source) for x in disabled_attention_modules):
             fullgraph = False
+        torch_module_inits[module] = source
 
         # Eg SiglipVisionEmbeddings and CLIPVisionEmbeddings
         if str(module).endswith("VisionEmbeddings"):
@@ -6435,6 +6457,9 @@ def unsloth_compile_transformers(
         pass
         torch_modules[module] = fullgraph if UNSLOTH_FULLGRAPH else False
     pass
+    disabled_attention_wrappers = modules_wrapping_disabled_attention(
+        torch_module_inits, disabled_attention_modules
+    )
 
     # Get other classes
     other_classes = re.findall(r"class ([^\s]{1,})\(.+?\)", full_source)
@@ -6594,6 +6619,7 @@ def unsloth_compile_transformers(
             "attn_weights" in source
             or "self.self_attn" in source
             or "_ATTENTION_CLASSES" in init
+            or module in disabled_attention_wrappers
         ):
             print(
                 f"Unsloth: Will not compile {module} since it looks like it calls attention modules!"
