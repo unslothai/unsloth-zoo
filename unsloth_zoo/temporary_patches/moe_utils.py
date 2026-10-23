@@ -1942,6 +1942,18 @@ def select_moe_backend_for_interleaved_gate_up():
     return backend
 
 
+def select_moe_backend_without_sonic(device = None):
+    """select_moe_backend() for dispatchers with no sonic route (bnb4bit / FP8 experts): sonic_moe runs as grouped_mm."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    backend = select_moe_backend()
+    if backend == "sonic_moe":
+        # sonic_moe was selected on a card with torch._grouped_mm; on a mixed host the expert's card may lack it.
+        if getattr(device, "type", None) == "cuda" and not _check_torch_grouped_mm_supported(device):
+            return "native_torch"
+        return "grouped_mm"
+    return backend
+
+
 def _check_sonic_moe_available():
     """Opt-in kernels-community/sonic-moe backend; guarded import."""
     if os.environ.get("UNSLOTH_DISABLE_MOE_SONIC", "0") == "1":

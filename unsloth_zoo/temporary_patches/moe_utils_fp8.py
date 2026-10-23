@@ -1055,7 +1055,7 @@ def _refuse_fp4_with_an_unapplied_gate(module, gate_up_weight):
 @torch.compiler.disable
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
-        select_moe_backend,
+        select_moe_backend_without_sonic,
         forward_native_grouped_mm,
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
@@ -1067,7 +1067,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     if not getattr(self, "_unsloth_own_apply_gate", False) and _fp8_experts_own_gate(self):
         self._unsloth_own_apply_gate = True
 
-    backend = select_moe_backend()
+    backend = select_moe_backend_without_sonic(hidden_states.device)
 
     # 1. _scaled_grouped_mm (fast FP8 path on Hopper/Blackwell)
     if backend == "grouped_mm" and _check_torch_scaled_grouped_mm_supported(hidden_states.device):
