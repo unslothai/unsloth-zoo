@@ -27,9 +27,7 @@ def _bf16_order(t):
 
 
 def _assert_bf16_within_one_ulp(got, want, msg = None):
-    """The rewrite takes each expert's LoRA delta from its own factor slice, the reference from
-    PEFT's batched get_delta_weight. The fp32 sums run in a different order, and on some GPUs (L4)
-    cuBLAS picks kernels whose results differ in the last bit, which can flip one bf16 rounding."""
+    """Per-expert and PEFT's batched LoRA deltas sum in a different fp32 order: on L4 that can flip one bf16 rounding."""
     assert got.shape == want.shape, msg
     assert (_bf16_order(got) - _bf16_order(want)).abs().max().item() <= 1, msg
 
