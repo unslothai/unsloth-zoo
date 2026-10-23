@@ -201,7 +201,8 @@ class FastCPUModel:
             # "unsloth" offloads activations to host RAM on GPUs; on CPU they already live there,
             # so it is plain recomputation.
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
-            model.config.use_cache = False
+        # Training forwards never reuse a KV cache; generate() turns it back on via for_inference.
+        model.config.use_cache = False
         if os.environ.get("UNSLOTH_CPU_COMPILE", "0") == "1":
             count = _compile_layers(model)
             _print(f"torch.compile (Inductor C++) on {count} decoder layers.")

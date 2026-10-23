@@ -395,3 +395,11 @@ def test_tokenizer_name_loads_the_tokenizer_not_the_model(monkeypatch):
     FastCPUModel.from_pretrained("some/model", tokenizer_name = "some/tokenizer", load_in_4bit = False)
     assert seen["tokenizer"] == "some/tokenizer"
     assert seen["model"][0] == "some/model" and "tokenizer_name" not in seen["model"][1]
+
+
+def test_kv_cache_is_off_for_training_without_checkpointing():
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    model = _tiny_llama()
+    model.config.use_cache = True
+    FastCPUModel._prepare(model, use_gradient_checkpointing = False)
+    assert model.config.use_cache is False
