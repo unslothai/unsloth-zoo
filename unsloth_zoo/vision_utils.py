@@ -986,17 +986,6 @@ def _is_network_share(path: str) -> bool:
     return p.startswith("//")
 
 
-# A playlist or concat list makes ffmpeg fetch every entry itself, outside the guard.
-_PLAYLIST_MARKERS = (b"#EXTM3U", b"<MPD", b"ffconcat")
-
-
-def _refuse_playlist(path: str, source: str) -> None:
-    with open(path, "rb") as handle:
-        head = handle.read(4096).lstrip(b"\xef\xbb\xbf \t\r\n")
-    if head.startswith(_PLAYLIST_MARKERS) or b"<MPD" in head[:1024]:
-        raise ValueError(f"Unsloth: Refusing a streaming playlist video URL: `{source}`")
-
-
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
         # Pick the decoder first: if none is installed, a temp file would strand.
@@ -1010,16 +999,11 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
             downloaded = fetch_remote_media_to_file(source)
             ele = dict(ele)
             ele["video"] = downloaded
-            try:
-                _refuse_playlist(downloaded, source)
-            except BaseException:
-                try: os.unlink(downloaded)
-                except OSError: pass
-                raise
         elif scheme not in ("", "file", "data"):
             # rtsp://, tcp://, ftp:// ... would be dialled by ffmpeg with no address checks.
             raise ValueError(f"Unsloth: Refusing a video URL with an unsupported scheme: `{source}`")
-        elif _is_network_share(source):
+        elif _is_network_share(resolve_file_uri_to_path(source)):
+            # Resolved first: file://C:/x is a drive, file:///%5chost/... decodes to a UNC path.
             raise ValueError(f"Unsloth: Refusing a video path on a network share: `{source}`")
         try:
             try:
