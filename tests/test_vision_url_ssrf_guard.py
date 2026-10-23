@@ -691,6 +691,7 @@ def test_backslash_anywhere_in_the_authority_is_refused(url, no_network):
     ],
 )
 def test_fetch_video_refuses_network_share_paths(monkeypatch, no_network, path):
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
     # Windows would open an SMB connection (and may send credentials) for these.
     _decoder_must_not_run(monkeypatch)
     with pytest.raises(ValueError, match = "network share"):
@@ -739,3 +740,44 @@ def test_an_inline_data_playlist_never_reaches_the_decoder(monkeypatch, no_netwo
     _decoder_must_not_run(monkeypatch)
     with pytest.raises(ValueError, match = "playlist"):
         vision_utils.fetch_video({"video": uri})
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "\\\\wsl$\\Ubuntu\\home\\u\\clip.mp4",
+        "\\\\wsl.localhost\\Ubuntu\\home\\u\\clip.mp4",
+        "file://wsl.localhost/Ubuntu/home/u/clip.mp4",
+        "\\\\?\\UNC\\wsl.localhost\\Ubuntu\\clip.mp4",
+    ],
+)
+def test_wsl_paths_are_local_on_windows(monkeypatch, no_network, path):
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    _reaches_the_decoder(monkeypatch, path)
+
+
+def test_double_slash_paths_are_ordinary_paths_off_windows(monkeypatch, no_network):
+    monkeypatch.setattr(vision_utils, "_WINDOWS", False)
+    _reaches_the_decoder(monkeypatch, "//data/videos/clip.mp4")
+
+
+def test_the_opt_in_allows_a_share_the_owner_trusts(monkeypatch, no_network):
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    with pytest.raises(ValueError, match = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1"):
+        vision_utils.fetch_video({"video": "\\\\nas\\videos\\clip.mp4"})
+    monkeypatch.setenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", "1")
+    _reaches_the_decoder(monkeypatch, "\\\\nas\\videos\\clip.mp4")
+
+
+def _reaches_the_decoder(monkeypatch, path):
+    seen = []
+
+    def decoder(ele):
+        seen.append(ele["video"])
+        raise RuntimeError("stop after the decoder is reached")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", lambda: "torchvision")
+    monkeypatch.setitem(vision_utils.VIDEO_READER_BACKENDS, "torchvision", decoder)
+    with pytest.raises(RuntimeError, match = "stop after"):
+        vision_utils.fetch_video({"video": path})
+    assert seen and seen[0] == path
