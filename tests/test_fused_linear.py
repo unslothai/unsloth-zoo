@@ -714,7 +714,7 @@ def test_ce_rejects_out_of_range_targets(bad):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA only")
 @pytest.mark.parametrize("bad", [-1, 64])
 def test_ce_out_of_range_target_is_a_device_assert_on_cuda(bad):
-    # A device-side assert, like F.cross_entropy's: no host sync per call. It poisons the context, so run it apart.
+    # The device-side assert poisons the CUDA context, so run it in a subprocess.
     import subprocess, sys, textwrap
     script = textwrap.dedent(f"""
         import torch

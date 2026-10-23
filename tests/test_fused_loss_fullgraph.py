@@ -115,7 +115,6 @@ def test_preference_logps_matches_autograd_function_path(dtype, head_grad, monke
     legacy = getattr(preference, "_fused_linear_token_logps_function", None)
     if legacy is None:
         pytest.skip("no custom op path")
-    # Both are the fallback behind the fused linear kernel.
     monkeypatch.setattr(preference, "_FUSED_LINEAR", False)
     def old(states, weight, labels, mask):
         out = legacy(states, weight, None, labels, mask, 0.0, 0.0, 0.0, 3, True, True)

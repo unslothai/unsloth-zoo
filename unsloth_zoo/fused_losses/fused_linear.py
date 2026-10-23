@@ -1628,8 +1628,7 @@ _ASSERT_ASYNC_MSG = "msg" in torch.ops.aten._assert_async.overloads()
 
 
 def _ce_checked(hidden, weight, bias, targets, divisor, scaling, ignore_index, *args):
-    # Raise like F.cross_entropy (else it leaves the sum but stays in the divisor). On CUDA / ROCm a device-side
-    # assert, as F.cross_entropy's own: reading the check on the host would sync every training step.
+    # Raise like F.cross_entropy; on GPU a device-side assert, since a host read would sync every step.
     V = weight.shape[0]
     bad = (targets != ignore_index) & ((targets < 0) | (targets >= V))
     if targets.is_cuda:
