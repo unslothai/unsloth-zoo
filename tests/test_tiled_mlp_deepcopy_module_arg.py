@@ -13,12 +13,9 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A deepcopy of a tiled MLP hands TiledMLP.apply the module it runs, not the original (CPU only).
+"""A deepcopied tiled MLP passes itself, not the closure-captured original, to TiledMLP.apply.
 
-The patched forward is a bound method over a closure that names the patched module. deepcopy
-rebinds `self` to the copy but keeps the closure, so passing the closed over module made any
-apply wrapper that differentiates against `mlp_module.parameters()` (Unsloth's DDP shim) ask for
-the original's gradients: the copy's weights never received a .grad while input grads flowed.
+Unsloth's DDP shim takes gradients for `mlp_module.parameters()`, so passing the original left the copy without grads.
 """
 import copy
 
