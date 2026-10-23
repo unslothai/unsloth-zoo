@@ -428,6 +428,7 @@ def test_fetch_video_refuses_other_url_schemes_before_a_decoder(monkeypatch, no_
         "subfile,clip.mp4",
         "file://C:/data/clip.mp4",
         "\\\\?\\C:\\data\\clip.mp4",
+        "\\\\?\\Volume{b75e2c83-0000-0000-0000-602f00000000}\\videos\\clip.mp4",
         "file:///tmp/clip.mp4",
         "data:video/mp4;base64,AAAAIGZ0eXBpc29t",
     ],
@@ -714,3 +715,21 @@ def test_a_downloaded_playlist_never_reaches_the_decoder(monkeypatch, public_dns
     with pytest.raises(ValueError, match = "playlist"):
         vision_utils.fetch_video({"video": "https://example.com/live.m3u8"})
     assert not list(tmp_path.glob("unsloth_media_*"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n", b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n"],
+)
+@pytest.mark.parametrize("encoding", ["base64", "percent"])
+def test_an_inline_data_playlist_never_reaches_the_decoder(monkeypatch, no_network, body, encoding):
+    import base64
+    from urllib.parse import quote_from_bytes
+
+    if encoding == "base64":
+        uri = "data:video/mp4;base64," + base64.b64encode(body).decode()
+    else:
+        uri = "data:video/mp4," + quote_from_bytes(body)
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "playlist"):
+        vision_utils.fetch_video({"video": uri})
