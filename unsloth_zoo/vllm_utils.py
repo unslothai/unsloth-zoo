@@ -43,6 +43,7 @@ import os
 import ast
 import sys
 import traceback
+import warnings
 import shutil
 import torch
 from torch import __version__ as torch_version
@@ -3987,6 +3988,115 @@ def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
     return None
 
 
+# True while VLLM_USE_V2_MODEL_RUNNER=0 was set by load_vllm for ReplaySSM, so it may be undone.
+_UNSLOTH_SET_V1_RUNNER = False
+
+
+def _vllm_disable_envs_cache():
+    # vLLM caches env reads (envs.enable_envs_cache); the next engine must see the change.
+    try:
+        import vllm.envs as vllm_envs
+        disable = getattr(vllm_envs, "disable_envs_cache", None)
+        if disable is not None:
+            disable()
+    except Exception:
+        pass
+
+
+# Speculative methods vLLM 0.31 MRV2 cannot run (_get_v2_model_runner_unsupported_features).
+_MRV2_UNSUPPORTED_SPECULATIVE_METHODS = frozenset((
+    "ngram", "ngram_gpu", "suffix", "medusa", "mlp_speculator", "custom_class",
+))
+
+# vLLM 0.31 ROCM_DEFAULT_MRV1_ARCHITECTURES: V1 on ROCm when the runner is unset; gone in 0.32 (#56360).
+_ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset((
+    "DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM",
+))
+
+
+def _vllm_rocm_default_v1_architectures():
+    try:
+        import importlib
+        module = importlib.import_module("vllm.config.vllm")
+    except Exception:
+        module = None
+    if module is not None:
+        return frozenset(getattr(module, "ROCM_DEFAULT_MRV1_ARCHITECTURES", None) or ())
+    from .routing_replay import _vllm_at_least
+    return frozenset() if _vllm_at_least(0, 32) else _ROCM_DEFAULT_MRV1_ARCHITECTURES
+
+
+def _routing_replay_model_runner(engine_args, config = None):
+    """vLLM 0.31+ captures routed experts only on MRV2 with prefix caching
+    (_verify_aux_output_compatibility). Takes back a V1 runner left by ReplaySSM, drops suffix
+    decoding, else turns routing replay off. Returns None, "restored_v2", "replay_off" or
+    "speculation_off"."""
+    global _UNSLOTH_SET_V1_RUNNER
+    if not engine_args.get("enable_return_routed_experts"):
+        return None
+    from .routing_replay import _vllm_at_least, ROUTING_REPLAY_ENV
+    if not _vllm_at_least(0, 31):
+        return None
+    if engine_args.get("enable_prefix_caching", True) is False:
+        engine_args.pop("enable_return_routed_experts", None)
+        engine_args.pop("async_scheduling", None)
+        warnings.warn(
+            f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: prefix caching is off (on "
+            "request, or on a GPU below compute capability 7.5), and this vLLM captures routed "
+            "experts only with prefix caching on.",
+            stacklevel = 2,
+        )
+        return "replay_off"
+    action = None
+    value = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", None)
+    try:
+        forced = None if value is None else bool(int(value.strip()))
+    except ValueError:
+        forced = None
+    v1 = forced is False
+    if forced is not True and not (v1 and not _UNSLOTH_SET_V1_RUNNER) and is_hip():
+        default_v1 = _vllm_rocm_default_v1_architectures()
+        architectures = [a for a in (getattr(config, "architectures", None) or ()) if a in default_v1]
+        if architectures:
+            engine_args.pop("enable_return_routed_experts", None)
+            engine_args.pop("async_scheduling", None)
+            warnings.warn(
+                f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: on ROCm vLLM runs "
+                f"{', '.join(architectures)} on Model Runner V1, and this vLLM captures routed "
+                "experts only on V2. Set VLLM_USE_V2_MODEL_RUNNER=1 to use routing replay.",
+                stacklevel = 2,
+            )
+            return "replay_off"
+    if v1:
+        if not _UNSLOTH_SET_V1_RUNNER:
+            engine_args.pop("enable_return_routed_experts", None)
+            engine_args.pop("async_scheduling", None)
+            warnings.warn(
+                f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: VLLM_USE_V2_MODEL_RUNNER=0 selects "
+                "Model Runner V1, and this vLLM captures routed experts only on V2. Unset "
+                "VLLM_USE_V2_MODEL_RUNNER to use routing replay.",
+                stacklevel = 2,
+            )
+            return "replay_off"
+        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+        _UNSLOTH_SET_V1_RUNNER = False
+        _vllm_disable_envs_cache()
+        print("Unsloth: routing replay needs vLLM Model Runner V2; dropping the V1 runner an earlier ReplaySSM load set.")
+        action = "restored_v2"
+    speculative_config = engine_args.get("speculative_config", None)
+    method = speculative_config.get("method", None) if isinstance(speculative_config, dict) \
+        else getattr(speculative_config, "method", None)
+    if method in _MRV2_UNSUPPORTED_SPECULATIVE_METHODS:
+        engine_args.pop("speculative_config", None)
+        what = "suffix decoding" if method == "suffix" else f"speculative method {method!r}"
+        print(
+            f"Unsloth: {what} is off for this engine: vLLM Model Runner V2 does not run it, and "
+            f"routing replay ({ROUTING_REPLAY_ENV}=1) needs V2 on this vLLM."
+        )
+        action = action or "speculation_off"
+    return action
+
+
 def _is_vllm_replayssm_refusal(error_text):
     # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2). With
     # speculative decoding vLLM 0.29 turns ReplaySSM into RecoverSSM, which only Kimi KDA supports.
@@ -4194,7 +4304,7 @@ def load_vllm(
             "vLLM state at import, so installing into a live session is not enough."
         )
 
-    global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS
+    global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS, _UNSLOTH_SET_V1_RUNNER
     _UNSLOTH_FLASHINFER_UNUSABLE = False
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
@@ -4817,12 +4927,18 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
-        if not use_async and not use_engine:
+        # Not for return_args (`vllm serve`): its CLI drops False values such as async_scheduling.
+        # True while moe_backend = "triton" is only for routing replay's capture hook.
+        replay_moe_pin = False
+        if not use_async and not use_engine and not return_args:
             from .routing_replay import routing_replay_engine_args
-            engine_args.update(routing_replay_engine_args(config))
+            replay_engine_args = routing_replay_engine_args(config)
+            engine_args.update(replay_engine_args)
+            replay_moe_pin = "moe_backend" in replay_engine_args
         if fp8_moe is not None:
             # Only the Triton FP8 MoE kernel keeps the expert layout training aliases.
             engine_args["moe_backend"] = "triton"
+            replay_moe_pin = False
         if (enable_lora and not use_async and not use_engine and not use_bitsandbytes and not is_fp8
                 and _merged_rollout_mode() == "attention"):
             # Attention is folded, so vLLM wraps only the rest: no punica kernels on attention.
@@ -4900,7 +5016,12 @@ def load_vllm(
         # return_args callers (SyntheticDataKit's `vllm serve`) turn every value into a CLI flag with
         # str(), and vLLM parses --speculative-config as JSON, so a dict here kills the server.
         suffix_config = None if return_args else _vllm_suffix_decoding_config()
+        pre_speculation_sizes = None
         if suffix_config is not None:
+            pre_speculation_sizes = (
+                approx_max_num_seqs, max_num_batched_tokens,
+                engine_args.get("max_num_seqs"), engine_args.get("max_num_batched_tokens"),
+            )
             engine_args["speculative_config"] = suffix_config
             if enable_lora:
                 fitted_max_num_seqs = _fit_max_num_seqs_to_speculation(
@@ -5007,6 +5128,17 @@ def load_vllm(
 
         # Only for engines built here: return_args callers (e.g. `vllm serve`) start
         # their own process without the runner setting below.
+        # Before the ReplaySSM conflict test: a user V1 runner turns routing replay off, ReplaySSM stays.
+        replay_runner_action = _routing_replay_model_runner(engine_args, config)
+        if replay_runner_action == "replay_off" and replay_moe_pin:
+            engine_args.pop("moe_backend", None)
+        if pre_speculation_sizes is not None and "speculative_config" not in engine_args:
+            approx_max_num_seqs, max_num_batched_tokens, seqs, tokens = pre_speculation_sizes
+            for key, value in (("max_num_seqs", seqs), ("max_num_batched_tokens", tokens)):
+                if value is None:
+                    engine_args.pop(key, None)
+                else:
+                    engine_args[key] = value
         replayssm_set_runner = False
         replayssm_mode = _vllm_replayssm_mode()
         # A runner the user forced to V2 would only get the engine refused and rebuilt.
@@ -5018,6 +5150,11 @@ def load_vllm(
             replayssm_mode = "off"
         if replayssm_mode != "off":
             replayssm_skip = _vllm_replayssm_skip_reason(config, good_keys, DEVICE_TYPE)
+            if replayssm_skip is None and engine_args.get("enable_return_routed_experts"):
+                # vLLM 0.31 refuses capture on V1, which ReplaySSM pins: routing replay wins.
+                from .routing_replay import _vllm_at_least
+                if _vllm_at_least(0, 31):
+                    replayssm_skip = "routing replay needs Model Runner V2 on this vLLM, ReplaySSM needs V1"
             if replayssm_skip is None and not (
                 _patch_vllm_replayssm_mamba2(replayssm_type) if replayssm_type in _REPLAYSSM_MAMBA2_MODELS
                 else _patch_vllm_replayssm_gdn() if replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES
@@ -5035,6 +5172,7 @@ def load_vllm(
                 if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
                     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
                     replayssm_set_runner = True
+                    _UNSLOTH_SET_V1_RUNNER = True
             elif replayssm_mode == "on":
                 print(f"Unsloth: UNSLOTH_VLLM_REPLAYSSM=1 ignored: {replayssm_skip}.")
         pass
@@ -5072,6 +5210,7 @@ def load_vllm(
                     engine_args.pop("use_replayssm")
                     if replayssm_set_runner:
                         os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                        _UNSLOTH_SET_V1_RUNNER = False
                     print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
                     continue
                 # A transient race: retry the *identical* load rather than fall
