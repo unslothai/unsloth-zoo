@@ -474,8 +474,6 @@ def _forward_generic_experts_eagerly(resolve_backend, self, hidden_states, top_k
     return resolve_backend()(self, hidden_states, top_k_index, top_k_weights)
 
 
-if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
-    _forward_generic_experts_eagerly = torch.compiler.disable(_forward_generic_experts_eagerly)
 
 
 def _drop_expert_parallel_sentinel(module, top_k_index, top_k_weights):
