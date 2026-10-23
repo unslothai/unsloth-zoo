@@ -3849,3 +3849,25 @@ def patch_output_collector_for_compiled_submodules():
     cls._unsloth_eager_mirror = True
 pass
 TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
+
+
+def patch_HiggsAudioV2Embeddings_autocast_dtype():
+    # Autocast runs sum() in float32, so the summed codebook embeddings reach masked_scatter as float32
+    # beside bfloat16 text embeddings and every autocast training step fails
+    # ("masked_scatter_: expected self and source to have same dtypes"), with or without Unsloth.
+    try:
+        from transformers.models.higgs_audio_v2.modeling_higgs_audio_v2 import HiggsAudioV2Embeddings
+    except Exception as e:
+        return raise_error("HiggsAudioV2Embeddings", e)
+    original_forward = HiggsAudioV2Embeddings.forward
+    if getattr(original_forward, "_unsloth_patched", False):
+        return
+
+    @functools.wraps(original_forward)
+    def forward(self, input_ids):
+        return original_forward(self, input_ids).to(self.embed_audio_tokens.weight.dtype)
+
+    forward._unsloth_patched = True
+    HiggsAudioV2Embeddings.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_HiggsAudioV2Embeddings_autocast_dtype)
