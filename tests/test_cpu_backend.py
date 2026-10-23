@@ -403,3 +403,31 @@ def test_kv_cache_is_off_for_training_without_checkpointing():
     model.config.use_cache = True
     FastCPUModel._prepare(model, use_gradient_checkpointing = False)
     assert model.config.use_cache is False
+
+
+def test_partial_llama_style_match_falls_back_to_the_peft_default():
+    """MPT-like: Wqkv + out_proj + up_proj/down_proj. up/down alone must not become the target set."""
+    import torch.nn as nn
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    import peft
+    captured = {}
+    real = peft.LoraConfig.__init__
+
+    def spy(self, *args, **kwargs):
+        captured["target_modules"] = kwargs.get("target_modules")
+        raise RuntimeError("stop")
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.Wqkv, self.out_proj = nn.Linear(8, 24), nn.Linear(8, 8)
+            self.up_proj, self.down_proj = nn.Linear(8, 16), nn.Linear(16, 8)
+
+    model = nn.Sequential(Block())
+    peft.LoraConfig.__init__ = spy
+    try:
+        with pytest.raises(RuntimeError, match = "stop"):
+            FastCPUModel.get_peft_model(model, r = 4, use_gradient_checkpointing = False)
+    finally:
+        peft.LoraConfig.__init__ = real
+    assert captured["target_modules"] is None

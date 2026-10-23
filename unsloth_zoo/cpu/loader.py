@@ -234,7 +234,11 @@ class FastCPUModel:
         if target_modules is None:
             # Unsloth's usual projections where the model has them, else PEFT's per-architecture default.
             candidates = _with_fused_projections(_DEFAULT_TARGET_MODULES, leaf_names)
-            target_modules = [m for m in candidates if m in leaf_names] or None
+            target_modules = [m for m in candidates if m in leaf_names]
+            # Only a set that reaches attention counts; a partial match (MPT: Wqkv + up/down_proj) would
+            # leave attention frozen, so hand those architectures to PEFT's own per-model default.
+            if not set(target_modules) & {"q_proj", "k_proj", "v_proj", "qkv_proj"}:
+                target_modules = None
         elif not isinstance(target_modules, str):
             # As on GPU: embed_tokens / lm_head in target_modules are trained in full (continued pretraining).
             embeddings = [m for m in target_modules if m in ("embed_tokens", "lm_head")]
