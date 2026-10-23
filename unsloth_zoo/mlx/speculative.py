@@ -151,6 +151,16 @@ class _Ema:
         rate = max(alpha, 1.0 / self.count)
         self.value = sample if self.value is None else self.value + rate * (sample - self.value)
 
+    def update_time(self, sample: float, alpha: float) -> None:
+        """``update`` for a duration: one-off work (a first-use compile, a stall) inflates a sample, never shrinks it,
+        so the first two samples keep the faster, and later ones count at most twice the estimate."""
+        if self.count == 1:
+            self.count, self.value = 2, min(self.value, sample)
+            return
+        if self.count > 1:
+            sample = min(sample, 2.0 * self.value)
+        self.update(sample, alpha)
+
 
 class ReplyStats:
     """One reply's acceptance, seeded from what the load has seen so far."""
@@ -342,7 +352,13 @@ class DraftController:
         return max(anchor[1] + slope * (key - anchor[0]), 1e-9)
 
     def _measured(self, table: dict[int, _Ema]) -> list[tuple[int, float]]:
-        return [(key, ema.value) for key, ema in sorted(table.items()) if ema.value is not None]
+        points = [(key, ema.value) for key, ema in sorted(table.items()) if ema.value is not None]
+        once = {key for key, ema in table.items() if ema.value is not None and ema.count < 2}
+        if not once or len(once) == len(points):
+            return points
+        # A key timed once may have paid one-off work: it counts no more than its confirmed neighbours predict.
+        confirmed = [point for point in points if point[0] not in once]
+        return [(key, min(value, self._extrapolate(confirmed, key, 0.0)) if key in once else value) for key, value in points]
 
     def _verify_seconds(self, bucket: int, width: int) -> float:
         step = self._plain_step(bucket)
@@ -486,11 +502,11 @@ class DraftController:
 
     def _measured_parts(self, plan: RoundPlan, rows: Sequence[RowState]) -> bool:
         verify = self.verify_cost.get(_bucket(len(rows)), {}).get(plan.width)
-        if verify is None or verify.value is None:
+        if verify is None or verify.count < 2:
             return False
         for row, state in zip(plan.rows, rows):
             if row.source == "draft":
-                if self.draft_cost[row.length].value is None:
+                if self.draft_cost[row.length].count < 2:
                     return False
                 if state.catch_up and self.catch_up_cost.value is None:
                     return False
@@ -617,7 +633,7 @@ class DraftController:
             return
         bucket = _bucket(len(rows))
         if step_seconds is not None:
-            self.plain_cost.setdefault(bucket, _Ema()).update(step_seconds, self.cost_alpha)
+            self.plain_cost.setdefault(bucket, _Ema()).update_time(step_seconds, self.cost_alpha)
         for state in rows:
             state.stats.tokens += steps
         self.tokens += steps * len(rows)
@@ -679,12 +695,12 @@ class DraftController:
         verify = self.verify_cost.setdefault(bucket, {}).setdefault(plan.width, _Ema())
         if plan.split:
             self._since_split = 0
-            verify.update(max(seconds - draft_seconds - catch_up_seconds, 1e-9), self.cost_alpha)
+            verify.update_time(max(seconds - draft_seconds - catch_up_seconds, 1e-9), self.cost_alpha)
             # Only a round drafting one depth for every row can attribute its drafting time.
             if depths and len(set(depths)) == 1:
-                self.draft_cost[depths[0]].update(draft_seconds / len(depths), self.cost_alpha)
+                self.draft_cost[depths[0]].update_time(draft_seconds / len(depths), self.cost_alpha)
             if catch_up:
-                self.catch_up_cost.update(catch_up_seconds / catch_up, self.cost_alpha)
+                self.catch_up_cost.update_time(catch_up_seconds / catch_up, self.cost_alpha)
         else:
             self._since_split += 1
             drafting = sum(self._draft_seconds(depth) for depth in depths) + catch_up * self._catch_up_seconds()
@@ -692,7 +708,7 @@ class DraftController:
                 hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds + catch_up_seconds, 0.0), drafting)
                 self.hidden_drafting.setdefault(bucket, _Ema()).update(hidden, self.cost_alpha)
             else:
-                verify.update(seconds, self.cost_alpha)
+                verify.update_time(seconds, self.cost_alpha)
         if depths and self._warmup and self._warmup[0] >= max(depths):
             self._warmup.pop(0)
         self._measured_at[self._identity(plan, bucket)] = self.steps
