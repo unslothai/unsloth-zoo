@@ -1218,6 +1218,54 @@ def test_unquantized_companion_mtp_heads_and_dflash_drafters_load_at_4_bits_unle
     assert type(kept.model.fc) is type(native.model.fc) is type(whole.model.fc) is nn.Linear and kept.model.layers[0].mlp.up_proj.bits == 4
 
 
+def test_a_dflash2_drafter_convolves_and_selects_its_drafts_bit_for_bit_in_fewer_kernels(qwen, monkeypatch):
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector, GroupedDynamicCausalConv
+    from unsloth_zoo.mlx import inference, speculative
+    model, _ = qwen
+    ran, convolve, walk = [], inference._dynamic_convolve, inference._candidate_walk
+    monkeypatch.setattr(inference, "_dynamic_convolve", lambda group_size: ran.append("conv") or convolve(group_size))
+    monkeypatch.setattr(inference, "_candidate_walk", lambda *args: ran.append("walk") or walk(*args))
+    companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    drafter = speculative._built(speculative.ContextDrafter, companion, model.language_model, quantize = True)
+    convs = [m for _, m in drafter.model.named_modules() if isinstance(m, GroupedDynamicCausalConv)]
+    selector, size = drafter.model.candidate_selector, companion.config.hidden_size
+    assert convs and {type(m)._unsloth_fused_native for m in convs} == {GroupedDynamicCausalConv}
+    assert type(selector)._unsloth_fused_native is CandidateSelector
+    mx.random.seed(0)
+    conv = convs[-1]
+    conv.base_kernel = (mx.random.normal(conv.base_kernel.shape) * 0.1).astype(mx.bfloat16)   # loaded kernels are not zero
+    # Two rows of five positions, so a result that read the first row or position for all would differ.
+    hidden = mx.random.normal((2, 5, size)).astype(mx.bfloat16)
+    (prepared, dynamic), (native, native_dynamic) = conv.prepare(hidden), GroupedDynamicCausalConv.prepare(conv, hidden)
+    finished, native_finished = conv.finish(hidden, dynamic), GroupedDynamicCausalConv.finish(conv, hidden, native_dynamic)
+    assert mx.array_equal(prepared, native) and mx.array_equal(finished, native_finished)
+    assert prepared.dtype == native.dtype and finished.dtype == native_finished.dtype and ran == ["conv", "conv"]
+    # Logits on a coarse grid tie often: candidates must come in argpartition's order for the walk to break ties alike.
+    logits = (mx.round(mx.random.normal((2, 5, selector.predecessor_codebook.weight.shape[0])) * 2) / 2).astype(mx.bfloat16)
+    top, expected = inference._top_candidates(logits, selector.top_k), mx.argpartition(logits, -selector.top_k, axis = -1)[..., -selector.top_k:]
+    assert mx.array_equal(top, expected) and top.dtype == expected.dtype
+    greedy, anchors = lambda scores: mx.argmax(scores, axis = -1), mx.array([3, 7])
+    drafts, expected = selector.select(hidden, logits, anchors, greedy), CandidateSelector.select(selector, hidden, logits, anchors, greedy)
+    assert mx.array_equal(drafts, expected) and drafts.dtype == expected.dtype and ran[-1] == "walk"
+    # A k past every chunk keeps the one argpartition.
+    assert mx.array_equal(inference._top_candidates(logits, 600), mx.argpartition(logits, -600, axis = -1)[..., -600:])
+    # On the CPU, whose argpartition does not sort, the native methods run.
+    served = len(ran)
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.eval(selector.select(hidden, logits, anchors, greedy), conv.prepare(hidden)[0])
+    finally:
+        mx.set_default_device(mx.gpu)
+    assert len(ran) == served
+    # Methods rebound upstream are what a fused module then runs.
+    monkeypatch.setattr(GroupedDynamicCausalConv, "prepare", lambda self, hidden: ("native", None))
+    monkeypatch.setattr(CandidateSelector, "select", lambda self, *args: "native")
+    assert conv.prepare(hidden)[0] == "native" and selector.select(hidden, logits, anchors, greedy) == "native"
+
+
+
+
 @pytest.mark.parametrize("repo", ["z-lab/Qwen3.5-4B-DFlash", "incoai/Qwen3.8-27B-DFlash2", "RadixArk/Qwen3.8-27B-DSpark"])
 def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_through_the_seam(qwen, repo, monkeypatch):
     from unsloth_zoo.mlx import generate, speculative

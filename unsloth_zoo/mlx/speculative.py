@@ -1854,6 +1854,9 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
     # Counted before the wrapper binds the target (a bound DFlash drafter holds its embedding and head); ``lazy``
     # factories evaluate nothing mlx-vlm's loader leaves lazy (it converts ModelOpt/compressed-tensors exports eagerly).
     weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
+    from .inference import fused_drafter_ops
+
+    fused_drafter_ops(model)
     drafter = wrapper(model, target, **kwargs)
     drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
     return drafter
