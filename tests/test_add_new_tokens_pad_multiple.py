@@ -645,3 +645,31 @@ def test_vllm_padded_vocab_masked_in_model_when_a_request_overflows_the_limit(ca
     assert len(llm.llm_engine.engine_core.seen[0].sampling_params.logit_bias) == 1000
     _assert_padded_rows_masked(model)
     assert "stay sampleable" not in capsys.readouterr().out
+
+
+class _ShardedVllmModel(_VllmModel):
+    # TP models that opt in to batch-sharded sampling: the vocab-sharded logits skip compute_logits.
+    def compute_logits_local(self, hidden_states):
+        return _VllmModel.compute_logits(self, hidden_states)
+
+
+def _sampled_logits(runner):
+    # GPUModelRunner.sample (vLLM 0.29 Model Runner V2): compute_logits_local plus an all-to-all
+    # when a BatchSharder is set, compute_logits otherwise.
+    hidden = torch.zeros(3, 4)
+    if runner.batch_sharder is not None:
+        return runner.model.compute_logits_local(hidden)
+    return runner.model.compute_logits(hidden)
+
+
+def test_vllm_padded_vocab_masked_in_model_turns_off_batch_sharded_sampling(capsys):
+    # --enable-batch-sharded-sampling samples from compute_logits_local, which the mask does not
+    # wrap, so it is switched off on this runner and sampling goes through compute_logits again.
+    llm, _ = _inproc_llm()
+    runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner
+    runner.model, runner.batch_sharder = _ShardedVllmModel(), object()
+    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, IDS, speculative = True)
+    logits = _sampled_logits(runner)
+    assert torch.isneginf(logits[:, IDS]).all()
+    assert logits.argmax(-1).tolist() == [1, 1, 1]
+    assert "stay sampleable" not in capsys.readouterr().out

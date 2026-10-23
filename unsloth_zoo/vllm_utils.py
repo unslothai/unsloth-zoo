@@ -3621,10 +3621,19 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
             core = getattr(engine, "engine_core", None)
             core = getattr(core, "engine_core", core)
             executor = getattr(core, "model_executor", None) or engine.model_executor
-            model = executor.driver_worker.model_runner.model
+            runner = executor.driver_worker.model_runner
+            model = runner.model
             method = model.compute_logits
         except Exception:
             return False
+        if getattr(runner, "batch_sharder", None) is not None:
+            # --enable-batch-sharded-sampling (Model Runner V2, TP > 1) samples from the
+            # vocab-sharded compute_logits_local instead, so sample from compute_logits again.
+            try:
+                runner.batch_sharder = None
+            except Exception:
+                return False
+            print("Unsloth: batch-sharded sampling is turned off so padded vocabulary rows stay masked.")
         if not getattr(method, "_unsloth_padded_vocab", False):
             indices = {}
             pad_ids = list(bias)
