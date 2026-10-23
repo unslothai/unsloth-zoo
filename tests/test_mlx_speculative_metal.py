@@ -492,11 +492,15 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
     # A row with no recurrent state yet.
     native_fresh = [_verified(lm, fresh, block[:1], keep) for keep in ([0], [1])]
     monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+    fused, block_fn = [], inference._verify_gdn_block
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args: fused.append(args) or block_fn(*args))
     with inference.exact_speculative_verify(model):
         _verified(lm, cache, block, 0)
         _verified(lm, fresh, block[:1], 0)
+        checked = len(fused)
         run, out = _verify_call(lm, cache, block)
-        assert len(out.gdn_states._unsloth_tapes) == sum(layer.is_linear for layer in lm.model.layers)
+        assert len(out.gdn_states._unsloth_tapes) == sum(layer.is_linear for layer in lm.model.layers) == len(fused) - checked
         # A refused commit keeps the tapes, and the retained lengths may come from any iterable.
         with pytest.raises(ValueError):
             out.gdn_states.commit(width + 1)
@@ -515,8 +519,10 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         out.gdn_states.commit(mx.array(keeps[0]))
         assert _same(native[0], _state(out, run))
         assert set(inference._TAPE_VERDICTS.values()) == {True}
-        # A replay that does not reproduce stock keeps that key on stock.
+        assert len(inference._VERIFY_GDN_VERDICTS) == 2 and all(inference._VERIFY_GDN_VERDICTS.values())
+        # A replay that does not reproduce stock keeps that key on stock, fused or not.
         inference._TAPE_VERDICTS.clear()
+        replay_matches = inference._replay_matches
         monkeypatch.setattr(inference, "_replay_matches", lambda *args: False)
         work = inference.first_use_work()
         _verified(lm, cache, block, 0)
@@ -525,12 +531,93 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         assert inference.first_use_work() > work
         out.gdn_states.commit(keeps[0])
         assert _same(native[0], _state(out, run))
+        # A fused block that differs from the verifier's ops keeps that key on them.
+        inference._TAPE_VERDICTS.clear()
+        inference._VERIFY_GDN_VERDICTS.clear()
+        monkeypatch.setattr(inference, "_replay_matches", replay_matches)
+        monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args: (lambda y, *rest: (y + 1, *rest))(*block_fn(*args)))
+        assert all(_same(native[0], _verified(lm, cache, block, keeps[0])) for _ in range(2))
+        assert set(inference._VERIFY_GDN_VERDICTS.values()) == {False}
 
 
 def _recurrence(rows, steps, heads = 4, width = 128):
     q, k, v = (mx.random.normal((rows, steps, heads, width), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in range(3))
     a, b = (mx.random.normal((rows, steps, heads), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in (3, 4))
     return q, k, v, a, b, mx.zeros((heads,)), mx.ones((heads,))
+
+
+def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    model, ids, cache = qwen_4bit
+    launched, outputs, evaluated, block_fn, evaluate = [], [], [], inference._verify_gdn_block, mx.eval
+
+    def recorded(*args):
+        # The template arguments a call picks (LMAX and TY are constants): input dtypes, taps, heads and head widths.
+        launched.append((*(x.dtype for x in args if isinstance(x, mx.array)), args[1].shape[1], args[6].shape[2],
+                         args[-1], args[6].shape[3], args[-2].shape[3]))
+        outputs.append(block_fn(*args))
+        return outputs[-1]
+    monkeypatch.setattr(inference, "_verify_gdn_block", recorded)
+    monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+    monkeypatch.setattr(model, "generate", lambda *args, **kwargs: None, raising = False)
+    with monkeypatch.context() as patch:
+        # A launch builds its pipeline only once evaluated.
+        patch.setattr(mx, "eval", lambda *arrays: evaluated.extend(arrays) or evaluate(*arrays))
+        inference.warm_inference(model)
+    assert outputs and all(any(out is x for x in evaluated) for out in outputs)
+    warmed = set(launched)
+    launched.clear()
+    with inference.exact_speculative_verify(model):
+        _verified(model.language_model, cache, mx.array([ids[0][24:27]]), 0)
+    assert len(warmed) == 1 and launched and set(launched) == warmed
+    # A CPU load verifies on the native ops, so it builds nothing.
+    launched.clear()
+    device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        inference.warm_inference(model)
+    finally:
+        mx.set_default_device(device)
+    assert not launched
+
+
+def test_the_fused_verify_block_takes_gpu_blocks_only(qwen_4bit):
+    from unsloth_zoo.mlx.inference import _verify_gdn_fits
+    model, _, _ = qwen_4bit
+    lm = model.language_model
+    layer = next(layer.linear_attn for layer in lm.model.layers if layer.is_linear)
+    cache = type("Window", (), {"history_capacity": 3, "__getitem__": lambda self, index: None})()
+    inputs = mx.zeros((1, 3, lm.args.hidden_size), mx.bfloat16)
+    assert _verify_gdn_fits(layer, inputs, None, cache)
+    device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        assert not _verify_gdn_fits(layer, inputs, None, cache)
+    finally:
+        mx.set_default_device(device)
+
+
+@pytest.mark.parametrize("length", [3, 9])
+def test_the_fused_verify_block_matches_the_verifiers_ops_with_grouped_value_heads(length):
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_update_with_states
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5RMSNormGated
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from unsloth_zoo.mlx.inference import _verify_gdn_block
+    rows, Hk, Hv, D, K = 2, 2, 6, 128, 4
+    C = (2 * Hk + Hv) * D
+    rand = lambda seed, *shape: mx.random.normal(shape, key = mx.random.key(seed)).astype(mx.bfloat16)
+    conv, norm = nn.Conv1d(C, C, K, groups = C, bias = False), Qwen3_5RMSNormGated(D, eps = 1e-6)
+    conv.weight, norm.weight = rand(0, C, K, 1), 1 + 0.1 * rand(1, D)
+    conv_input, a, b, z = rand(2, rows, K - 1 + length, C), rand(3, rows, length, Hv), rand(4, rows, length, Hv), rand(5, rows, length, Hv, D)
+    A_log, dt_bias = mx.log(mx.arange(1, Hv + 1, dtype = mx.float32)), 1 + 0.1 * rand(6, Hv)
+    state = 0.05 * mx.random.normal((rows, Hv, D, D), key = mx.random.key(7))
+    q, k, v = [x.reshape(rows, length, h, D) for x, h in zip(mx.split(nn.silu(conv(conv_input)), [Hk * D, 2 * Hk * D], -1), (Hk, Hk, Hv))]
+    q, k = Qwen3_5BatchInvariantForward._normalize_gated_delta_qk(None, q, k)
+    out, final, _ = gated_delta_update_with_states(q, k, v, a, b, A_log, dt_bias, state, state_steps = 0)
+    got = _verify_gdn_block(conv_input, conv.weight.reshape(C, K), a, b, A_log, dt_bias, z, norm.weight, 1e-6, 1e-6, state, Hk)
+    assert all(x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+               for x, y in zip(got, (norm(out, z), final, q, k, v)))
 
 
 def test_replay_admission_refuses_a_replay_one_bit_off_or_misreading_retained_lengths():
