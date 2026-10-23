@@ -1691,6 +1691,28 @@ def _text_only_padding(kwargs):
     return kwargs
 
 
+def _generation_prompt_fuses_answer(processor, chat_template_kwargs = None) -> bool:
+    """PaddleOCR-VL: "Assistant: Z" tokenizes as [':', ' Z'], generation as [':', ' '] then 'Z' (unslothai/notebooks#149)."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    user = [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}]
+    kwargs = dict(chat_template_kwargs or {}, tokenize = False)
+    try:
+        with_prompt = processor.apply_chat_template(user, add_generation_prompt = True, **kwargs)
+        without = processor.apply_chat_template(user, add_generation_prompt = False, **kwargs)
+        if not isinstance(with_prompt, str) or not isinstance(without, str) \
+            or not with_prompt.startswith(without):
+            return False
+        prompt = with_prompt[len(without):]
+        if not prompt[-1:].isspace():
+            return False
+        prompt_ids = tokenizer(prompt, add_special_tokens = False)["input_ids"]
+        fused_ids = tokenizer(prompt + "Answer", add_special_tokens = False)["input_ids"]
+        return fused_ids[:len(prompt_ids)] != prompt_ids
+    except Exception:
+        return False
+pass
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -1701,7 +1723,7 @@ class UnslothVisionDataCollator:
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
         "_seen_supervised", "_warned_unsupervised", "audio_call_kwarg",
-        "chat_template_kwargs", "_full_length_audio",
+        "chat_template_kwargs", "split_generation_prompt", "_full_length_audio",
     )
 
     def __init__(
@@ -1731,7 +1753,12 @@ class UnslothVisionDataCollator:
         audio_call_kwarg = _audio_call_kwarg(processor)
         if not has_images:
             if not _audio_sub_processors(processor):
-                raise TypeError("Unsloth: UnslothVisionDataCollator requires an image or audio processor!")
+                raise TypeError(
+                    f"Unsloth: UnslothVisionDataCollator requires an image or audio processor, but got "
+                    f"{type(processor).__name__}, which is text only. Pass the processor returned by "
+                    "FastVisionModel.from_pretrained, not AutoTokenizer. If you loaded a local folder, it is "
+                    "missing preprocessor_config.json: copy it from the original model repo."
+                )
             if audio_call_kwarg is None:
                 raise TypeError(
                     f"Unsloth: UnslothVisionDataCollator does not support {type(processor).__name__}: "
@@ -1861,6 +1888,7 @@ class UnslothVisionDataCollator:
         self.assistant_single_content = _probe_assistant_single_content(
             processor, model, "image" if has_images else "audio",
         )
+        self.split_generation_prompt = _generation_prompt_fuses_answer(processor, self.chat_template_kwargs)
         return
 
     def _get_padding_token_ids_on_device(self, device):
@@ -1894,6 +1922,12 @@ class UnslothVisionDataCollator:
         
         if "prompt" in examples[0] and "completion" in examples[0]:
             return self._collate_prompt_completion(examples)
+
+        # Masker may be attached later by train_on_responses_only(trainer).
+        if getattr(self, "split_generation_prompt", False) and getattr(self, "train_on_responses_only", None):
+            split = self._split_at_generation_prompt(examples)
+            if split is not None:
+                return self._collate_prompt_completion(split)
 
         texts  = []
         images = []
@@ -2015,6 +2049,21 @@ class UnslothVisionDataCollator:
         if not getattr(self, "_warned_unsupervised", False):
             self._warned_unsupervised = True
             logger.warning(msg)
+
+    def _split_at_generation_prompt(self, examples):
+        """Single-answer chats as prompt / completion rows; None if any row has another shape."""
+        split = []
+        for example in examples:
+            messages = self._select_messages_or_raw(example)
+            if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+                return None
+            roles = [m.get("role") for m in messages]
+            if not roles or roles[-1] != "assistant" or roles.count("assistant") != 1:
+                return None
+            row = dict(example) if isinstance(example, dict) else {}
+            row["prompt"], row["completion"] = messages[:-1], messages[-1:]
+            split.append(row)
+        return split
 
     def _select_messages_or_raw(self, example):
         if "messages" in example:

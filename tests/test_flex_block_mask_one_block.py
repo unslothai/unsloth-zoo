@@ -31,8 +31,9 @@ def _utils():
     return utils
 
 
-def test_one_block_lengths_build_eagerly():
+def test_one_block_lengths_build_eagerly(monkeypatch):
     utils = _utils()
+    monkeypatch.setattr(utils, "_ONE_BLOCK_MISCOMPILE", True, raising = False)
     BS = utils.FLEX_ATTENTION_BLOCK_SIZE
     assert not utils._compile_block_mask(4, 64, BS, BS)
     assert not utils._compile_block_mask(None, None, 1, 4096)
@@ -60,3 +61,40 @@ def test_compiled_block_mask_matches_eager_after_going_dynamic():
             if a is None and b is None:
                 continue
             assert torch.equal(a, b), f"L={L} {name}: {a.flatten()[:4].tolist()} vs {b.flatten()[:4].tolist()}"
+
+
+def test_fixed_torch_keeps_the_compiled_builder(monkeypatch):
+    """torch 2.13+ does not miscompile one-block lengths: no dense O(M x N) mask there."""
+    utils = _utils()
+    monkeypatch.setattr(utils, "_ONE_BLOCK_MISCOMPILE", False, raising = False)
+    BS = utils.FLEX_ATTENTION_BLOCK_SIZE
+    assert utils._compile_block_mask(4, 64, BS, BS)
+    assert utils._compile_block_mask(None, None, 1, 4096)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "flex attention block masks need CUDA")
+def test_block_mask_inside_an_outer_compile_matches_eager():
+    """A compiled caller must not trace the one-block build into its own (miscompiled) graph."""
+    utils = _utils()
+    from torch.nn.attention.flex_attention import create_block_mask as eager_create_block_mask
+    torch._dynamo.reset()
+
+    def causal(b, h, q, kv):
+        return q >= kv
+
+    def outer(x):
+        m = utils.compiled_create_block_mask(causal, 4, 64, x.shape[0], x.shape[0], device = "cuda")
+        return tuple(getattr(m, name) for name in NAMES)
+
+    compiled = torch.compile(outer)  # automatic dynamic: the second length recompiles dynamic
+    try:
+        for L in (512, 700, 100, 64, 128, 129, 300):
+            got = compiled(torch.empty(L, device = "cuda"))
+            ref = eager_create_block_mask(causal, 4, 64, L, L, device = "cuda")
+            for name, a in zip(NAMES, got):
+                b = getattr(ref, name)
+                if a is None and b is None:
+                    continue
+                assert torch.equal(a, b), f"L={L} {name}: {a.flatten()[:4].tolist()} vs {b.flatten()[:4].tolist()}"
+    finally:
+        torch._dynamo.reset()

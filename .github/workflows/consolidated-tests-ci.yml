@@ -463,6 +463,7 @@ jobs:
               tests/test_mlx_incomplete_config.py \
               tests/test_mlx_incomplete_config_vlm.py \
               tests/test_mlx_adam_epsilon.py \
+              tests/test_mlx_group_by_length.py \
               tests/test_mlx_optimizer_torch_parity.py \
               tests/test_hf_xet_fallback.py \
               tests/test_hf_xet_fallback_blob_scoped_redownload.py \

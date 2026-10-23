@@ -508,9 +508,12 @@ def _cvt_ok(index, eager = False):
         except Exception:
             pass
     try:
-        # The probe syncs (torch.equal); inside a CUDA graph capture that would invalidate it.
+        # Probe syncs: a capture on the current stream or on the operand's device would be invalidated.
         if torch.cuda.is_current_stream_capturing():
             return None
+        with torch.cuda.device(index):
+            if torch.cuda.is_current_stream_capturing():
+                return None
     except Exception:
         return None
     try:

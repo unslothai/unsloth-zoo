@@ -17,7 +17,7 @@
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
 small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
-Qwen exact speculative verify blocks, Gemma 4 verify-block attention, Qwen sparse attention block selection,
+Qwen exact speculative verify blocks, wide-head decode and Gemma 4 verify-block attention, Qwen sparse attention block selection,
 QSA indexer blocks kept across cache trims, dilated depthwise convolutions, and SSD-backed PLE row reads."""
 
 import ast
@@ -5372,13 +5372,13 @@ _VECTOR_ATTENTION_PASS1 = """
     const int N = keys_shape[2];
 
     const device T* qp = queries + batch * queries_strides[0] + head * queries_strides[1]
-        + row * queries_strides[2] + lane * per_thread;
+        + row * queries_strides[2] + lane * per_thread * queries_strides[3];
     const device T* kp = keys + batch * keys_strides[0] + kv_head * keys_strides[1]
-        + block * keys_strides[2] + lane * per_thread;
+        + block * keys_strides[2] + lane * per_thread * keys_strides[3];
     const device T* vp = values + batch * values_strides[0] + kv_head * values_strides[1]
-        + block * values_strides[2] + lane * per_thread;
+        + block * values_strides[2] + lane * per_thread * values_strides[3];
     for (int i = 0; i < per_thread; i++) {
-        q[i] = static_cast<U>(scale) * qp[i];
+        q[i] = static_cast<U>(scale) * qp[i * queries_strides[3]];
     }
 
     U max_score = -metal::numeric_limits<U>::max();
@@ -5388,7 +5388,7 @@ _VECTOR_ATTENTION_PASS1 = """
         if (i <= horizon) {
             U score = 0;
             for (int j = 0; j < per_thread; j++) {
-                score += q[j] * kp[j];
+                score += q[j] * kp[j * keys_strides[3]];
             }
             score = simd_sum(score);
             U new_max = max(max_score, score);
@@ -5397,7 +5397,7 @@ _VECTOR_ATTENTION_PASS1 = """
             max_score = new_max;
             sum_exp_score = sum_exp_score * factor + exp_score;
             for (int j = 0; j < per_thread; j++) {
-                o[j] = o[j] * factor + exp_score * vp[j];
+                o[j] = o[j] * factor + exp_score * vp[j * values_strides[3]];
             }
         }
         kp += BLOCKS * keys_strides[2];
@@ -5474,13 +5474,22 @@ def _vector_attention_kernels():
             mx.fast.metal_kernel(name = "unsloth_vector_attention_pass1",
                                  input_names = ["queries", "keys", "values", "scale"],
                                  output_names = ["partials", "sums", "maxs"],
-                                 source = _VECTOR_ATTENTION_PASS1, ensure_row_contiguous = False),
+                                 source = _vector_attention_source(), ensure_row_contiguous = False),
             mx.fast.metal_kernel(name = "unsloth_vector_attention_pass2",
                                  input_names = ["partials", "sums", "maxs"], output_names = ["out"],
                                  source = _VECTOR_ATTENTION_PASS2),
         )
     except (AttributeError, TypeError):
         return None
+
+
+def _vector_attention_source():
+    # Specialize unit feature strides while keeping row/head pitches dynamic.
+    contiguous = _VECTOR_ATTENTION_PASS1
+    for name in ("queries", "keys", "values"):
+        contiguous = contiguous.replace(f" * {name}_strides[3]", "")
+    return ("if (queries_strides[3] == 1 && keys_strides[3] == 1 && values_strides[3] == 1) {\n"
+            + contiguous + "\n} else {\n" + _VECTOR_ATTENTION_PASS1 + "\n}")
 
 
 @functools.cache
@@ -5496,9 +5505,11 @@ def _gpu_generation():
     return int(match.group(1)) if match else 0
 
 
-def _launch_simds():
-    # Before M3 (no dynamic caching), this kernel's pipeline allows 832 threads per threadgroup, not 1024.
-    return 32 if _gpu_generation() >= 15 else 24
+def _launch_simds(dtype = mx.bfloat16):
+    # Before M3 (no dynamic caching), this kernel's pipeline allows 768 threads per threadgroup in BF16 and 576 in F16.
+    if _gpu_generation() >= 15:
+        return 32
+    return 24 if dtype == mx.bfloat16 else 18
 
 
 def _vector_blocks(simds, keys):
@@ -5574,6 +5585,129 @@ def _two_pass_keys(keys):
     return keys >= (1024 if _gpu_class() in ("s", "d") else 4096)
 
 
+_WIDE_ATTENTION_LOCK = RLock()
+_WIDE_ATTENTION_VERDICTS = {}
+_WIDE_ATTENTION_CONTRACT = {
+    "mlx_lm.models.base": {"scaled_dot_product_attention": "9b23a7140848b172"},
+    "mlx_vlm.models.base": {"scaled_dot_product_attention": ("9b23a7140848b172", "2bc5644af48b66c9")},
+}
+
+
+def _wide_head_decode_attention(queries, keys, values, scale, mask):
+    # MLX 0.32.4 prefetches four D512 BF16 keys per thread; do not shadow a later tuned dispatch.
+    if mx.__version__ != "0.32.4":
+        return None
+    if not (mask is None or isinstance(mask, str) and mask == "causal"):
+        return None
+    if not (all(isinstance(x, mx.array) and x.ndim == 4 for x in (queries, keys, values))
+            and queries.shape[0] == keys.shape[0] == 1 and keys.shape == values.shape
+            and queries.shape[2:] == (1, 512) and keys.shape[3] == 512
+            and queries.dtype == keys.dtype == values.dtype == mx.bfloat16
+            and keys.shape[1] > 0 and queries.shape[1] == 8 * keys.shape[1]
+            and keys.shape[2] >= attention._atoi(os.environ.get("MLX_SDPA_D512_MIN_KL", "1024"))
+            and _two_pass_keys(keys.shape[2]) and _vector_attention_kernels() is not None):
+        return None
+    blocks = _vector_blocks(8, keys.shape[2])
+    key = (queries.shape[1], blocks, mx.fast.scaled_dot_product_attention)
+    verdict = _WIDE_ATTENTION_VERDICTS.get(key)
+    if verdict is False:
+        return None
+    out = _vector_attention(queries, keys, values, scale, blocks)
+    if verdict is None:
+        with _WIDE_ATTENTION_LOCK:
+            try:
+                native = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = scale, mask = mask)
+                verdict = _settled(mx.array_equal(out.view(mx.uint16), native.view(mx.uint16)).item())
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                return None
+            _WIDE_ATTENTION_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("wide-head decode attention differs from MLX for %s; keeping native attention", key)
+            return None
+    return out
+
+
+@functools.cache
+def _wide_attention_class(base, helper, cache_type):
+    # A speculative scope may already own this instance's class.
+    original = getattr(base, "_unsloth_verify_attention_native", base)
+    call = vars(original).get("__call__")
+    if not isinstance(call, FunctionType) or call.__globals__.get("scaled_dot_product_attention") is not helper:
+        return None
+    namespace = call.__globals__
+    path = helper.__module__
+    bindings = _resolved_bindings({path: _WIDE_ATTENTION_CONTRACT[path]})
+    sdpa = mx.fast.scaled_dot_product_attention
+
+    def attend(queries, keys, values, cache, scale, mask, sinks = None, **kwargs):
+        out = None
+        if not kwargs and sinks is None and (cache is None or type(cache) is cache_type):
+            out = _wide_head_decode_attention(queries, keys, values, scale, mask)
+        return helper(queries, keys, values, cache, scale, mask, sinks = sinks, **kwargs) if out is None else out
+
+    native = base.__call__
+
+    def decode_call(self, *args, **kwargs):
+        if (not self.training and not getattr(_VERIFY_STATE, "attention", False)
+                and namespace.get("scaled_dot_product_attention") is helper and _bindings_intact(bindings)
+                and mx.fast.scaled_dot_product_attention is sdpa):
+            routed = FunctionType(call.__code__, {**namespace, "scaled_dot_product_attention": attend},
+                                  call.__name__, call.__defaults__, call.__closure__)
+            routed.__kwdefaults__ = call.__kwdefaults__
+            return routed(self, *args, **kwargs)
+        return native(self, *args, **kwargs)
+
+    return type(f"_WideAttention{base.__name__}", (base,),
+                {"__call__": decode_call, "_unsloth_wide_attention_native": base})
+
+
+@contextmanager
+def fused_decode_attention(model, *, _modules = None):
+    """Route MLX 0.32.4's wide BF16 single-token decode attention through the vector kernel after bitwise agreement;
+    everything else, training and distributed models stay native."""
+    changed = []
+    try:
+        with _WIDE_ATTENTION_LOCK:
+            if mx.__version__ == "0.32.4" and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                specs = {}
+                for path, contract in _WIDE_ATTENTION_CONTRACT.items():
+                    bindings = _resolved_bindings({path: contract})
+                    cache_type = getattr(sys.modules.get(path.rsplit(".", 1)[0] + ".cache"), "KVCache", None)
+                    if bindings and cache_type is not None:
+                        specs[bindings[0][2]] = cache_type
+                for _, module in _fusion_modules(model, _modules):
+                    if not isinstance(module, nn.Module) or module.training:
+                        continue
+                    base = type(module)
+                    if getattr(base, "_unsloth_wide_attention_native", None) is not None:
+                        module._unsloth_wide_attention_scopes += 1
+                        changed.append(module)
+                        continue
+                    if getattr(module, "head_dim", None) != 512:
+                        continue
+                    original = getattr(base, "_unsloth_verify_attention_native", base)
+                    call = vars(original).get("__call__")
+                    helper = call.__globals__.get("scaled_dot_product_attention") if isinstance(call, FunctionType) else None
+                    if not isinstance(helper, FunctionType) or helper not in specs or "scaled_dot_product_attention" not in call.__code__.co_names:
+                        continue
+                    patched = _wide_attention_class(base, helper, specs[helper])
+                    if patched is not None:
+                        module.__class__ = patched
+                        module._unsloth_wide_attention_scopes = 1
+                        changed.append(module)
+        yield model
+    finally:
+        with _WIDE_ATTENTION_LOCK:
+            for module in reversed(changed):
+                scopes = module.__dict__.get("_unsloth_wide_attention_scopes", 0)
+                if scopes > 1:
+                    module._unsloth_wide_attention_scopes = scopes - 1
+                    continue
+                module.__dict__.pop("_unsloth_wide_attention_scopes", None)
+                module.__class__ = type(module)._unsloth_wide_attention_native
+
+
 def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
     """A verify block's head-dim-512 causal attention on MLX's vector kernel, or None for the native call."""
     if not (isinstance(mask, str) and mask == "causal" and (cache is None or type(cache) is kv_cache)
@@ -5587,7 +5721,7 @@ def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
             and _vector_attention_kernels() is not None):
         return None
     rows, gqa = queries.shape[2], queries.shape[1] // keys.shape[1]
-    step = _launch_simds() // gqa   # a launch holds gqa * rows simdgroups
+    step = _launch_simds(queries.dtype) // gqa   # a launch holds gqa * rows simdgroups
     outs = []
     for start in range(0, rows, step):
         stop = min(start + step, rows)
@@ -6286,6 +6420,7 @@ INFERENCE_SCOPES = [
     InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
+    InferenceScope(fused_decode_attention),
     InferenceScope(exact_ple_row_reads),
     InferenceScope(exact_qsa_trim),
     InferenceScope(exact_dilated_depthwise_conv),
