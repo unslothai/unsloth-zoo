@@ -17,6 +17,12 @@ if multiprocessing.parent_process() is not None or getattr(
     multiprocessing.current_process(), "_inheriting", False
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # A spawned worker runs the real unsloth_zoo/__init__ (not conftest's setup), which refuses to
+    # import without unsloth unless GPU init is skipped; tokenizer_utils needs none of it.
+    import importlib.util
+
+    if importlib.util.find_spec("unsloth") is None:
+        os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
 
 import pytest  # noqa: E402
 import torch  # noqa: E402

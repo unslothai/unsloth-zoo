@@ -491,7 +491,10 @@ def _gathered_dtensor_weights(model, weights):
         with torch.inference_mode(False), torch.no_grad():
             for module, name, param in owners:
                 module._parameters[name] = param
-            from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+            try:
+                from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+            except ImportError:  # torch 2.4: only the private namespace has it
+                from torch.distributed._tensor._utils import compute_local_shape_and_global_offset
             for weight, copy in full.values():
                 shape, offset = compute_local_shape_and_global_offset(
                     copy.shape, weight.device_mesh, weight.placements
