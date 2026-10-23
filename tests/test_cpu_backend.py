@@ -37,20 +37,37 @@ def _device_type_module():
         ({}, False, True, False),                                     # NVIDIA driver, CPU wheel: keep hint
         ({"CUDA_VISIBLE_DEVICES": ""}, False, True, True),            # GPUs hidden on purpose
         ({"CUDA_VISIBLE_DEVICES": "-1"}, True, False, True),
+        ({}, False, "ascend", False),                                 # Ascend driver, no torch_npu: keep error
     ],
 )
 def test_cpu_backend_allowed(monkeypatch, env, rocm, nvidia, expected):
     dt = _device_type_module()
-    for key in ("UNSLOTH_DISABLE_CPU_FALLBACK", "CUDA_VISIBLE_DEVICES"):
+    for key in ("UNSLOTH_DISABLE_CPU_FALLBACK", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
         monkeypatch.delenv(key, raising = False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
+    ascend = nvidia == "ascend"
+    nvidia = nvidia is True
     monkeypatch.setattr(dt, "_detect_amd_rocm_runtime", lambda: rocm)
+    monkeypatch.setattr(dt, "_intel_gpu_present", lambda: False)
     real_exists = dt.os.path.exists
-    monkeypatch.setattr(dt.os.path, "exists",
-                        lambda p: nvidia if p == "/proc/driver/nvidia/version" else real_exists(p))
+    monkeypatch.setattr(dt.os.path, "exists", lambda p: nvidia if p == "/proc/driver/nvidia/version"
+                        else ascend if p == "/dev/davinci0" else real_exists(p))
     monkeypatch.setattr(dt.shutil, "which", lambda name: "/usr/bin/nvidia-smi" if nvidia and name == "nvidia-smi" else None)
     assert dt.cpu_backend_allowed() is expected
+
+
+def test_intel_gpu_without_xpu_torch_trains_on_cpu_with_a_hint(monkeypatch):
+    dt = _device_type_module()
+    for key in ("UNSLOTH_DISABLE_CPU_FALLBACK", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        monkeypatch.delenv(key, raising = False)
+    monkeypatch.setattr(dt, "_detect_amd_rocm_runtime", lambda: False)
+    monkeypatch.setattr(dt, "_intel_gpu_present", lambda: True)
+    real_exists = dt.os.path.exists
+    monkeypatch.setattr(dt.os.path, "exists", lambda p: False if p.startswith(("/proc/driver/nvidia", "/usr/lib/wsl", "/dev/davinci")) else real_exists(p))
+    monkeypatch.setattr(dt.shutil, "which", lambda name: None)
+    with pytest.warns(UserWarning, match = "whl/xpu"):
+        assert dt.cpu_backend_allowed() is True
 
 
 def test_allow_cpu_spoof_still_wins(monkeypatch):
@@ -333,3 +350,13 @@ def test_inference_mode_left_pads_and_training_right_pads():
     assert model._saved_temp_tokenizer.padding_side == "left"
     FastCPUModel.for_training(model)
     assert model._saved_temp_tokenizer.padding_side == "right"
+
+
+def test_chunked_sft_step_keeps_token_count():
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.trainer import _count_sft_tokens
+    trainer = SimpleNamespace(_metrics = {"train": {}, "eval": {}}, _total_train_tokens = 5,
+                              accelerator = SimpleNamespace(gather_for_metrics = lambda t: t))
+    model = torch.nn.Linear(2, 2).train()
+    _count_sft_tokens(trainer, model, {"attention_mask": torch.tensor([[1, 1, 0], [1, 1, 1]])})
+    assert trainer._total_train_tokens == 10 and trainer._metrics["train"]["num_tokens"] == [10]

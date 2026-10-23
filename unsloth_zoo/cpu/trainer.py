@@ -116,6 +116,21 @@ def _patch_cpu_fp16_accelerator(trainer_cls):
     trainer_cls.create_accelerator_and_postprocess = create_accelerator_and_postprocess
 
 
+def _count_sft_tokens(trainer, model, inputs):
+    """TRL's `num_tokens` bookkeeping from SFTTrainer.compute_loss, which the chunked path bypasses."""
+    metrics = getattr(trainer, "_metrics", None)
+    if metrics is None or not hasattr(trainer, "_total_train_tokens"):
+        return
+    mode = "train" if model.training else "eval"
+    if mode == "train":
+        mask = inputs.get("attention_mask", None)
+        if mask is not None:
+            trainer._total_train_tokens += trainer.accelerator.gather_for_metrics(mask.sum()).sum().item()
+        elif inputs.get("position_ids", None) is not None:
+            trainer._total_train_tokens += inputs["position_ids"].size(1)
+    metrics[mode]["num_tokens"] = [trainer._total_train_tokens]
+
+
 def _patch_sft_compute_loss(sft_trainer_cls):
     """Chunked CE returns no logits; TRL's entropy / token-accuracy metrics need them. Skip just those."""
     original = sft_trainer_cls.compute_loss
@@ -141,9 +156,11 @@ def _patch_sft_compute_loss(sft_trainer_cls):
         inputs["use_cache"] = False
         chunked._unsloth_cpu_chunked_ce_active = True
         try:
-            return Trainer.compute_loss(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch)
+            result = Trainer.compute_loss(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch)
         finally:
             chunked._unsloth_cpu_chunked_ce_active = False
+        _count_sft_tokens(self, model, inputs)
+        return result
 
     compute_loss._unsloth_cpu = True
     sft_trainer_cls.compute_loss = compute_loss

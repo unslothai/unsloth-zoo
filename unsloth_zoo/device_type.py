@@ -39,6 +39,7 @@ import re
 import shutil
 import sys
 import subprocess
+import warnings
 import urllib.request
 
 _IS_MLX = is_mlx_available()
@@ -506,7 +507,31 @@ def cpu_backend_allowed():
         not sys.platform.startswith("linux") and shutil.which("nvidia-smi") is not None
     ):
         return False
+    # Ascend NPU driver without torch_npu: keep the install error too.
+    if os.path.exists("/dev/davinci0") or shutil.which("npu-smi") is not None:
+        return False
+    if _intel_gpu_present():
+        # Not refused: every Intel laptop has one, and most (Iris Xe / UHD) cannot train through XPU.
+        warnings.warn(
+            "Unsloth: found an Intel GPU, but this torch build has no XPU support, so training runs on the CPU. "
+            "Intel Arc and Core Ultra GPUs can train with the XPU build of torch: "
+            "pip install torch --index-url https://download.pytorch.org/whl/xpu",
+            stacklevel = 2,
+        )
     return True
+
+
+def _intel_gpu_present():
+    """An Intel display / compute device under /sys/class/drm (Linux only)."""
+    try:
+        import glob
+        for path in glob.glob("/sys/class/drm/card*/device/vendor"):
+            with open(path, "r", encoding = "utf-8") as f:
+                if f.read().strip().lower() == "0x8086":
+                    return True
+    except Exception:
+        pass
+    return False
 
 
 def cpu_backend_forced():
