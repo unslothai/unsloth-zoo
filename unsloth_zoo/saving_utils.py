@@ -3886,7 +3886,7 @@ def _copy_export_remote_code(model_name, save_directory, token, model):
 pass
 
 
-def _source_config_model_type(model_name, token = None, commit = None):
+def _source_config_dict(model_name, token = None, commit = None):
     # `commit` pins a moved branch to the loaded revision.
     try:
         if os.path.isdir(str(model_name)):
@@ -3897,10 +3897,56 @@ def _source_config_model_type(model_name, token = None, commit = None):
             path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token,
                                    revision = revision or commit)
         with open(path, "r", encoding = "utf-8") as f:
-            model_type = json.load(f).get("model_type")
+            config = json.load(f)
     except Exception:
         return None
+    return config if isinstance(config, dict) else None
+pass
+
+
+def _source_config_model_type(model_name, token = None, commit = None):
+    model_type = (_source_config_dict(model_name, token, commit) or {}).get("model_type")
     return model_type if isinstance(model_type, str) and model_type else None
+pass
+
+
+# Set by the export itself (vocab carry-over, dtype, quantization), so never taken from the checkpoint.
+_EXPORT_MANAGED_CONFIG_KEYS = frozenset((
+    "vocab_size", "unsloth_vocab_pad_ids", "unsloth_vocab_pad_suppressed_ids",
+    "quantization_config", "transformers_version", "torch_dtype", "dtype",
+))
+
+
+def _overlay_export_managed_keys(target, written):
+    for key, value in written.items():
+        if key in _EXPORT_MANAGED_CONFIG_KEYS:
+            target[key] = value
+        elif isinstance(value, dict) and isinstance(target.get(key), dict):
+            _overlay_export_managed_keys(target[key], value)
+        elif key in target and target[key] == value:
+            # The saved type: transformers 5.20 rejects Ling-3.0-tiny's own `"kda_lower_bound": -5` (int).
+            target[key] = value
+    for key in [k for k in target if k in _EXPORT_MANAGED_CONFIG_KEYS and k not in written]:
+        del target[key]
+pass
+
+
+def _restore_checkpoint_config_keys(config_path, source, config_class):
+    """A built-in class saved a repo-code (auto_map) checkpoint's keys under its own names (bailing_hybrid:
+    `norm_topk_prob` -> `moe_renormalize`, `head_dim` 128 -> 64), but the weights keep the checkpoint's layout
+    and llama.cpp / its code read its keys (#14916): write its config.json back. True if rewritten."""
+    config_path = Path(config_path)
+    if not isinstance(source, dict) or "auto_map" not in source or not config_path.exists(): return False
+    try:
+        written = json.loads(config_path.read_text(encoding = "utf-8"))
+    except Exception:
+        return False
+    aliases = getattr(config_class, "attribute_map", None) or {}
+    # Only when the save lost a checkpoint key to an alias: every other built-in export stays as it was.
+    if not any(alias in source and alias not in written for alias in aliases): return False
+    _overlay_export_managed_keys(source, written)
+    config_path.write_text(json.dumps(source, indent = 2), encoding = "utf-8")
+    return True
 pass
 
 
@@ -5427,14 +5473,18 @@ def merge_and_overwrite_lora(
         else:
             _carry_over_vocab_size(base_config, config)
         # Read before saving: an in-place export overwrites the source config.json.
-        source_model_type = None
+        source_model_type = source_config = None
         if _is_remote_code_config(base_config):
             loaded_commit = _trusted_code_commit(model) if _is_export_source_loaded_repo(model_name, model) else None
             source_model_type = _source_config_model_type(model_name, token, loaded_commit)
+        elif getattr(type(base_config), "attribute_map", None):
+            source_config = _source_config_dict(model_name, token)
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
             _restore_source_model_type(Path(save_directory) / "config.json", source_model_type)
             _copy_export_remote_code(model_name, save_directory, token, model)
+        else:
+            _restore_checkpoint_config_keys(Path(save_directory) / "config.json", source_config, type(base_config))
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         if upcast_to_float32:

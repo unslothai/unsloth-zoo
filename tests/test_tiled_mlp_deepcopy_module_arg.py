@@ -22,7 +22,8 @@ import copy
 import pytest
 import torch
 
-from unsloth_zoo.tiled_mlp import TiledMLP, patch_mlp
+from unsloth_zoo import tiled_mlp
+from unsloth_zoo.tiled_mlp import patch_mlp
 
 HIDDEN = 16
 
@@ -66,7 +67,8 @@ def params_as_inputs_apply(monkeypatch):
         params = [p for p in mlp_module.parameters() if p.requires_grad]
         return _ParamsAsInputs.apply(mlp_forward, x, *params)
 
-    monkeypatch.setattr(TiledMLP, "apply", staticmethod(apply))
+    # The class patch_mlp resolves now, not the one imported at collection (a reload swaps it).
+    monkeypatch.setattr(tiled_mlp.TiledMLP, "apply", staticmethod(apply))
     return seen
 pass
 

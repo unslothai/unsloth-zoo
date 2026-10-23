@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -52,6 +53,7 @@ __all__ = [
     "SpeculativeEngine",
     "StepOutput",
     "companion_drafter",
+    "has_native_mtp_head",
     "install_speculative_seam",
     "native_mtp_drafter",
     "probe_drafter",
@@ -148,6 +150,16 @@ class _Ema:
         self.count += 1
         rate = max(alpha, 1.0 / self.count)
         self.value = sample if self.value is None else self.value + rate * (sample - self.value)
+
+    def update_time(self, sample: float, alpha: float) -> None:
+        """``update`` for a duration: one-off work (a first-use compile, a stall) inflates a sample, never shrinks it,
+        so the first two samples keep the faster, and later ones count at most twice the estimate."""
+        if self.count == 1:
+            self.count, self.value = 2, min(self.value, sample)
+            return
+        if self.count > 1:
+            sample = min(sample, 2.0 * self.value)
+        self.update(sample, alpha)
 
 
 class ReplyStats:
@@ -340,7 +352,13 @@ class DraftController:
         return max(anchor[1] + slope * (key - anchor[0]), 1e-9)
 
     def _measured(self, table: dict[int, _Ema]) -> list[tuple[int, float]]:
-        return [(key, ema.value) for key, ema in sorted(table.items()) if ema.value is not None]
+        points = [(key, ema.value) for key, ema in sorted(table.items()) if ema.value is not None]
+        once = {key for key, ema in table.items() if ema.value is not None and ema.count < 2}
+        if not once or len(once) == len(points):
+            return points
+        # A key timed once may have paid one-off work: it counts no more than its confirmed neighbours predict.
+        confirmed = [point for point in points if point[0] not in once]
+        return [(key, min(value, self._extrapolate(confirmed, key, 0.0)) if key in once else value) for key, value in points]
 
     def _verify_seconds(self, bucket: int, width: int) -> float:
         step = self._plain_step(bucket)
@@ -484,11 +502,11 @@ class DraftController:
 
     def _measured_parts(self, plan: RoundPlan, rows: Sequence[RowState]) -> bool:
         verify = self.verify_cost.get(_bucket(len(rows)), {}).get(plan.width)
-        if verify is None or verify.value is None:
+        if verify is None or verify.count < 2:
             return False
         for row, state in zip(plan.rows, rows):
             if row.source == "draft":
-                if self.draft_cost[row.length].value is None:
+                if self.draft_cost[row.length].count < 2:
                     return False
                 if state.catch_up and self.catch_up_cost.value is None:
                     return False
@@ -615,7 +633,7 @@ class DraftController:
             return
         bucket = _bucket(len(rows))
         if step_seconds is not None:
-            self.plain_cost.setdefault(bucket, _Ema()).update(step_seconds, self.cost_alpha)
+            self.plain_cost.setdefault(bucket, _Ema()).update_time(step_seconds, self.cost_alpha)
         for state in rows:
             state.stats.tokens += steps
         self.tokens += steps * len(rows)
@@ -677,12 +695,12 @@ class DraftController:
         verify = self.verify_cost.setdefault(bucket, {}).setdefault(plan.width, _Ema())
         if plan.split:
             self._since_split = 0
-            verify.update(max(seconds - draft_seconds - catch_up_seconds, 1e-9), self.cost_alpha)
+            verify.update_time(max(seconds - draft_seconds - catch_up_seconds, 1e-9), self.cost_alpha)
             # Only a round drafting one depth for every row can attribute its drafting time.
             if depths and len(set(depths)) == 1:
-                self.draft_cost[depths[0]].update(draft_seconds / len(depths), self.cost_alpha)
+                self.draft_cost[depths[0]].update_time(draft_seconds / len(depths), self.cost_alpha)
             if catch_up:
-                self.catch_up_cost.update(catch_up_seconds / catch_up, self.cost_alpha)
+                self.catch_up_cost.update_time(catch_up_seconds / catch_up, self.cost_alpha)
         else:
             self._since_split += 1
             drafting = sum(self._draft_seconds(depth) for depth in depths) + catch_up * self._catch_up_seconds()
@@ -690,7 +708,7 @@ class DraftController:
                 hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds + catch_up_seconds, 0.0), drafting)
                 self.hidden_drafting.setdefault(bucket, _Ema()).update(hidden, self.cost_alpha)
             else:
-                verify.update(seconds, self.cost_alpha)
+                verify.update_time(seconds, self.cost_alpha)
         if depths and self._warmup and self._warmup[0] >= max(depths):
             self._warmup.pop(0)
         self._measured_at[self._identity(plan, bucket)] = self.steps
@@ -1872,25 +1890,75 @@ def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool =
     return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, **kwargs)
 
 
-def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
-    """A drafter for the target's own MTP head, built in memory from only the ``mtp.*`` tensors of its
-    checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
-    from mlx_vlm.fp8 import transform_fp8_weights
-    from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors, detect_mtp_splitter
+def _checkpoint_keys(path: Path) -> dict[str, Path]:
+    from mlx_vlm.speculative.drafters.mtp_split import _safetensor_files, _weight_map
+    from safetensors import safe_open
 
-    path = Path(model_path)
-    splitter = detect_mtp_splitter(path)
+    if weight_map := _weight_map(path):
+        return {key: path / file for key, file in weight_map.items()}
+    keys = {}
+    for file in _safetensor_files(path):
+        with safe_open(file, framework = "mlx") as handle:
+            keys.update(dict.fromkeys(handle.keys(), file))
+    return keys
+
+
+def _native_mtp_head(path: Path) -> tuple | None:
+    """``(splitter, source_config, text_config, prefix, [(file, keys)])`` for a checkpoint's own MTP head, or None. The head
+    is the splitter's own layout, at the top level or under one ``model.``/``language_model.`` wrapper, where MLX
+    conversions of vision-language checkpoints keep it (``language_model.mtp.*``); ``prefix`` is that wrapper."""
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+
+    try:
+        source_config = json.loads((path / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    splitter = get_mtp_splitter(source_config = source_config)
     if splitter is None:
         return None
+    text_config = splitter.read_text_config(source_config)
+    if selected := list(splitter.iter_selected(path, text_config)):
+        return splitter, source_config, text_config, "", selected
+    nested = {}
+    for key, file in _checkpoint_keys(path).items():
+        wrapper = re.match(r"(?:(?:model|language_model)\.)+", key)
+        parts = wrapper.group().split(".")[:-1] if wrapper else []
+        for prefix in (".".join(parts[:end]) + "." for end in range(1, len(parts) + 1)):
+            if splitter.select_keys(key[len(prefix) :], text_config):
+                nested.setdefault(prefix, {}).setdefault(file, []).append(key)
+                break
+    if len(nested) != 1:
+        return None
+    [(prefix, files)] = nested.items()
+    for name in ("quantization", "quantization_config"):
+        if isinstance(source_config.get(name), dict):
+            # Per-module overrides name the head's modules under the wrapper too.
+            source_config[name] = {key.removeprefix(prefix): value for key, value in source_config[name].items()}
+    return splitter, source_config, text_config, prefix, list(files.items())
+
+
+def has_native_mtp_head(model_path: str | Path) -> bool:
+    """Whether ``native_mtp_drafter`` finds an MTP head in the checkpoint at ``model_path``."""
+    return _native_mtp_head(Path(model_path)) is not None
+
+
+def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
+    """A drafter for the target's own MTP head, built in memory from only the MTP tensors of its
+    checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
+    from mlx_vlm.fp8 import transform_fp8_weights
+    from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors
+
+    head = _native_mtp_head(Path(model_path))
+    if head is None:
+        return None
+    splitter, source_config, text_config, prefix, selected = head
     module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
     if not hasattr(module, "Model"):
         raise ValueError(f"mlx-vlm has no drafter for {splitter.output_model_type} MTP heads")
-    source_config = json.loads((path / "config.json").read_text())
-    text_config = splitter.read_text_config(source_config)
     tensors, source_is_mlx = {}, False
-    for file, keys in splitter.iter_selected(path, text_config):
+    for file, keys in selected:
         source_is_mlx = source_is_mlx or (splitter.supports_mlx_source and _is_mlx_safetensors(file))
-        tensors.update(splitter.load_shard(file, keys))
+        tensors.update((key.removeprefix(prefix), value) for key, value in splitter.load_shard(file, keys).items())
     tensors, fp8_quantization = transform_fp8_weights(tensors, source_config)
     if fp8_quantization is not None:
         source_config = {**source_config, "quantization": fp8_quantization}
