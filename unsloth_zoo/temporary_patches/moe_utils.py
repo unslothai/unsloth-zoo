@@ -3083,6 +3083,9 @@ def get_weight_preprocessor(model_type: str):
     return _weight_preprocessor_registry().get(model_type)
 
 
+_LOGICAL_SHAPE_MAX_DEPTH = 16  # PEFT / quant wrapper chains are a few levels deep
+
+
 def _logical_expert_shape(param):
     """Return the logical expert shape without dequantizing or materializing.
 
@@ -3092,9 +3095,11 @@ def _logical_expert_shape(param):
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    seen = set()
-    while param is not None and id(param) not in seen:
-        seen.add(id(param))
+    # Bounded walk, no id(): id() of a traced parameter guards on that object's identity, so a
+    # compiled decoder layer recompiled once per layer (each layer owns its expert parameters).
+    for _ in range(_LOGICAL_SHAPE_MAX_DEPTH):
+        if param is None:
+            break
 
         # Recorded logical shape avoids materializing a get_param provider.
         recorded = getattr(param, "_original_shape", None)
@@ -5144,18 +5149,27 @@ def patch_param_wrapper_for_moe():
 _WEIGHTED_UNPERMUTE = None
 
 
-def weighted_unpermute(*args, **kwargs):
-    """Fused Triton combine, or None so the caller falls back to the eager reduction."""
+def _resolve_weighted_unpermute():
     global _WEIGHTED_UNPERMUTE
     if _WEIGHTED_UNPERMUTE is None:
         try:
             from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
-        except ImportError:
+        except Exception:  # now runs at import too: a broken triton must not fail importing zoo
             _wu = False
         _WEIGHTED_UNPERMUTE = _wu
-    if _WEIGHTED_UNPERMUTE is False:
+    return _WEIGHTED_UNPERMUTE
+
+
+def weighted_unpermute(*args, **kwargs):
+    """Fused Triton combine, or None so the caller falls back to the eager reduction."""
+    if _resolve_weighted_unpermute() is False:
         return None
     return _WEIGHTED_UNPERMUTE(*args, **kwargs)
+
+
+# Resolved at import: a first-call assignment inside a compiled MoE block guards on the global being
+# None, so the next call recompiles every compiled decoder layer once.
+_resolve_weighted_unpermute()
 
 
 @lru_cache(maxsize=1)
