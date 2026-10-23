@@ -537,3 +537,45 @@ def test_v2_supported_speculation_is_kept(runner_env):
     versions["vllm"] = "0.30.0"
     args = dict(_replay_args(), speculative_config = {"method": "suffix"})
     assert vu._routing_replay_model_runner(args) is None and "speculative_config" in args
+
+
+def _rocm_v1_config(arch = "DeepseekV32ForCausalLM"):
+    # Shaped like the HF config load_vllm passes; vLLM ModelConfig.architectures comes from it.
+    return SimpleNamespace(architectures = [arch], model_type = "deepseek_v32")
+
+
+@pytest.mark.parametrize("arch", ["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"])
+@pytest.mark.parametrize("owned_v1", [False, True])
+def test_rocm_v1_default_architectures_turn_routing_replay_off(runner_env, monkeypatch, arch, owned_v1):
+    # vLLM 0.31 VllmConfig.use_v2_model_runner: on ROCm an unset runner defaults to V1 for
+    # ROCM_DEFAULT_MRV1_ARCHITECTURES, and _verify_aux_output_compatibility then refuses the engine.
+    vu, _ = runner_env
+    monkeypatch.setattr(vu, "is_hip", lambda: True)
+    if owned_v1:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+        monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", True)
+    args = dict(_replay_args(), async_scheduling = False)
+    with pytest.warns(UserWarning, match = "on ROCm vLLM runs"):
+        assert vu._routing_replay_model_runner(args, _rocm_v1_config(arch)) == "replay_off"
+    assert "enable_return_routed_experts" not in args and "async_scheduling" not in args
+
+
+@pytest.mark.parametrize("hip, env, arch", [
+    (True, "1", "DeepseekV32ForCausalLM"),   # the user forces V2: vLLM honours it
+    (False, None, "DeepseekV32ForCausalLM"),  # CUDA: V2 by default
+    (True, None, "Qwen3MoeForCausalLM"),     # not a ROCm V1 default architecture
+])
+def test_rocm_v1_default_leaves_routing_replay_on_otherwise(runner_env, monkeypatch, hip, env, arch):
+    vu, _ = runner_env
+    monkeypatch.setattr(vu, "is_hip", lambda: hip)
+    if env is not None:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", env)
+    args = _replay_args()
+    assert vu._routing_replay_model_runner(args, _rocm_v1_config(arch)) is None
+    assert args == _replay_args()
+
+
+def test_load_vllm_passes_the_config_to_the_runner_check():
+    import unsloth_zoo.vllm_utils as vu
+    src = pathlib.Path(vu.__file__).read_text(encoding = "utf-8-sig")
+    assert "_routing_replay_model_runner(engine_args, config)" in src
