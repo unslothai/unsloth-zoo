@@ -3922,11 +3922,25 @@ _MRV2_UNSUPPORTED_SPECULATIVE_METHODS = frozenset((
     "ngram", "ngram_gpu", "suffix", "medusa", "mlp_speculator", "custom_class",
 ))
 
-# Architectures vLLM 0.31+ runs on Model Runner V1 on ROCm when VLLM_USE_V2_MODEL_RUNNER is unset
+# Architectures vLLM 0.31 runs on Model Runner V1 on ROCm when VLLM_USE_V2_MODEL_RUNNER is unset
 # (vllm/config/vllm.py ROCM_DEFAULT_MRV1_ARCHITECTURES, used by VllmConfig.use_v2_model_runner).
+# vLLM 0.32 removed that default (#56360).
 _ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset((
     "DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM",
 ))
+
+
+def _vllm_rocm_default_v1_architectures():
+    # The installed vLLM's own set when importable, else the 0.31 set on 0.31.x only.
+    try:
+        import importlib
+        module = importlib.import_module("vllm.config.vllm")
+    except Exception:
+        module = None
+    if module is not None:
+        return frozenset(getattr(module, "ROCM_DEFAULT_MRV1_ARCHITECTURES", None) or ())
+    from .routing_replay import _vllm_at_least
+    return frozenset() if _vllm_at_least(0, 32) else _ROCM_DEFAULT_MRV1_ARCHITECTURES
 
 
 def _routing_replay_model_runner(engine_args, config = None):
@@ -3935,8 +3949,8 @@ def _routing_replay_model_runner(engine_args, config = None):
     V1 runner left by an earlier ReplaySSM load is taken back; a V1 runner the user chose turns
     routing replay off for this engine instead. A speculative method V2 cannot run (suffix
     decoding) would fall back to V1, so it is dropped: routing replay wins. On ROCm vLLM picks V1
-    for DeepSeek V3.2 / V4 and GLM-MoE-DSA unless VLLM_USE_V2_MODEL_RUNNER=1, so routing replay is
-    off there too. Returns the action taken: None, "restored_v2", "replay_off" or
+    for DeepSeek V3.2 / V4 and GLM-MoE-DSA on vLLM 0.31 unless VLLM_USE_V2_MODEL_RUNNER=1, so routing
+    replay is off there too. Returns the action taken: None, "restored_v2", "replay_off" or
     "speculation_off"."""
     global _UNSLOTH_SET_V1_RUNNER
     if not engine_args.get("enable_return_routed_experts"):
@@ -3963,8 +3977,9 @@ def _routing_replay_model_runner(engine_args, config = None):
     v1 = forced is False
     if forced is not True and not (v1 and not _UNSLOTH_SET_V1_RUNNER) and is_hip():
         # vLLM 0.31 VllmConfig.use_v2_model_runner: an unset runner on ROCm defaults to V1 for these
-        # architectures, and _verify_aux_output_compatibility then refuses routed experts capture.
-        architectures = [a for a in (getattr(config, "architectures", None) or ()) if a in _ROCM_DEFAULT_MRV1_ARCHITECTURES]
+        # architectures (gone in 0.32), and _verify_aux_output_compatibility then refuses routed experts capture.
+        default_v1 = _vllm_rocm_default_v1_architectures()
+        architectures = [a for a in (getattr(config, "architectures", None) or ()) if a in default_v1]
         if architectures:
             engine_args.pop("enable_return_routed_experts", None)
             engine_args.pop("async_scheduling", None)

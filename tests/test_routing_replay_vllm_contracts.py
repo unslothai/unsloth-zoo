@@ -549,7 +549,8 @@ def _rocm_v1_config(arch = "DeepseekV32ForCausalLM"):
 def test_rocm_v1_default_architectures_turn_routing_replay_off(runner_env, monkeypatch, arch, owned_v1):
     # vLLM 0.31 VllmConfig.use_v2_model_runner: on ROCm an unset runner defaults to V1 for
     # ROCM_DEFAULT_MRV1_ARCHITECTURES, and _verify_aux_output_compatibility then refuses the engine.
-    vu, _ = runner_env
+    vu, versions = runner_env
+    versions["vllm"] = "0.31.0"
     monkeypatch.setattr(vu, "is_hip", lambda: True)
     if owned_v1:
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -573,6 +574,37 @@ def test_rocm_v1_default_leaves_routing_replay_on_otherwise(runner_env, monkeypa
     args = _replay_args()
     assert vu._routing_replay_model_runner(args, _rocm_v1_config(arch)) is None
     assert args == _replay_args()
+
+
+@pytest.mark.parametrize("version", ["0.32.0", "0.33.1"])
+def test_rocm_v1_default_is_gone_from_vllm_032(runner_env, monkeypatch, version):
+    # vLLM 0.32 dropped ROCM_DEFAULT_MRV1_ARCHITECTURES (#56360): ROCm then picks V2 like CUDA.
+    vu, versions = runner_env
+    versions["vllm"] = version
+    monkeypatch.setattr(vu, "is_hip", lambda: True)
+    args = _replay_args()
+    assert vu._routing_replay_model_runner(args, _rocm_v1_config()) is None
+    assert args == _replay_args()
+
+
+@pytest.mark.parametrize("defined, expected", [
+    (frozenset({"Qwen3MoeForCausalLM"}), "replay_off"),
+    (None, None),
+])
+def test_rocm_v1_default_follows_the_installed_vllm(runner_env, monkeypatch, defined, expected):
+    # With vLLM importable its own ROCM_DEFAULT_MRV1_ARCHITECTURES decides, whatever the version says.
+    import sys
+    vu, versions = runner_env
+    versions["vllm"] = "0.31.0"
+    monkeypatch.setattr(vu, "is_hip", lambda: True)
+    module = SimpleNamespace() if defined is None else SimpleNamespace(ROCM_DEFAULT_MRV1_ARCHITECTURES = defined)
+    monkeypatch.setitem(sys.modules, "vllm.config.vllm", module)
+    args = _replay_args()
+    if expected is None:
+        assert vu._routing_replay_model_runner(args, _rocm_v1_config("DeepseekV32ForCausalLM")) is None
+    else:
+        with pytest.warns(UserWarning, match = "on ROCm vLLM runs"):
+            assert vu._routing_replay_model_runner(args, _rocm_v1_config("Qwen3MoeForCausalLM")) == expected
 
 
 def test_load_vllm_passes_the_config_to_the_runner_check():
