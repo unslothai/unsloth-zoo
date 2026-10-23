@@ -279,9 +279,15 @@ class FastCPUModel:
         return peft_model
 
     @staticmethod
-    def for_training(model, use_gradient_checkpointing = True):
+    def for_training(model, use_gradient_checkpointing = None):
         model.train()
         _set_inference_mode(model, False)
+        # None keeps whatever from_pretrained / get_peft_model set up; an explicit value switches it.
+        if use_gradient_checkpointing is not None and hasattr(model, "gradient_checkpointing_enable"):
+            if use_gradient_checkpointing:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+            elif getattr(model, "is_gradient_checkpointing", False):
+                model.gradient_checkpointing_disable()
         return model
 
     @staticmethod
@@ -429,4 +435,11 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
             target = os.path.join(save_directory, f"{base_name}.{method.upper()}.gguf")
         quantize_gguf(first_file, target, method, quantizer_location = quantizer, print_output = False)
         results.append(target)
+    if first not in methods:
+        # The bf16 GGUF only fed llama-quantize; drop it (all shards) like the GPU export does.
+        for path in outputs:
+            if os.path.exists(path):
+                os.remove(path)
+            if path in results:
+                results.remove(path)
     return results

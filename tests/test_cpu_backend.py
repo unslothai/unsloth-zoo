@@ -17,6 +17,7 @@
 """CPU backend (unsloth_zoo.cpu): selection rules and the chunked cross entropy."""
 
 import importlib
+import os
 import math
 
 import pytest
@@ -431,3 +432,61 @@ def test_partial_llama_style_match_falls_back_to_the_peft_default():
     finally:
         peft.LoraConfig.__init__ = real
     assert captured["target_modules"] is None
+
+
+def test_sft_evaluation_keeps_the_stock_loss_and_metrics():
+    """Under no_grad the chunked path is off, so TRL's own compute_loss (entropy / accuracy) must run."""
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.trainer import _patch_sft_compute_loss
+
+    class FakeSFT:
+        def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None, **kwargs):
+            return "trl"
+
+    _patch_sft_compute_loss(FakeSFT)
+    model = _tiny_llama()
+    model._unsloth_cpu_chunked_ce = True
+    trainer = FakeSFT()
+    trainer.accelerator = SimpleNamespace(unwrap_model = lambda m: m)
+    trainer.args = SimpleNamespace(loss_type = "nll")
+    with torch.no_grad():
+        assert trainer.compute_loss(model, {"input_ids": torch.tensor([[1, 2]])}) == "trl"
+
+
+def test_gguf_export_drops_the_unrequested_bf16_intermediate(monkeypatch, tmp_path):
+    import unsloth_zoo.llama_cpp as llama_cpp
+    from unsloth_zoo.cpu import loader
+    made = []
+
+    def convert(prefix, merged, model_dtype, quantization_type, converter_location):
+        path = f"{prefix}.{quantization_type.upper()}.gguf"
+        open(path, "w").close()
+        made.append(path)
+        return [path], None
+
+    def quantize(src, dst, method, quantizer_location, print_output):
+        open(dst, "w").close()
+
+    monkeypatch.setattr(loader, "save_pretrained_merged", lambda *a, **k: None)
+    monkeypatch.setattr(llama_cpp, "install_llama_cpp", lambda print_output = False: ("q", "c"))
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", convert)
+    monkeypatch.setattr(llama_cpp, "quantize_gguf", quantize)
+    out = loader.save_pretrained_gguf(None, str(tmp_path / "m"), quantization_method = "q4_k_m")
+    assert [os.path.basename(p) for p in out] == ["m.Q4_K_M.gguf"]
+    assert not os.path.exists(made[0]) and os.path.exists(out[0])
+    out = loader.save_pretrained_gguf(None, str(tmp_path / "k"), quantization_method = ["bf16", "q4_k_m"])
+    assert sorted(os.path.basename(p) for p in out) == ["k.BF16.gguf", "k.Q4_K_M.gguf"]
+    assert all(os.path.exists(p) for p in out)
+
+
+def test_for_training_switches_gradient_checkpointing_only_when_asked():
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    model = _tiny_llama()
+    FastCPUModel.for_training(model)
+    assert not model.is_gradient_checkpointing
+    FastCPUModel.for_training(model, use_gradient_checkpointing = True)
+    assert model.is_gradient_checkpointing
+    FastCPUModel.for_training(model)
+    assert model.is_gradient_checkpointing
+    FastCPUModel.for_training(model, use_gradient_checkpointing = False)
+    assert not model.is_gradient_checkpointing

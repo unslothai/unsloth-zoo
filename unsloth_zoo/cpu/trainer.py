@@ -20,6 +20,8 @@ __all__ = ["install_cpu_training_defaults", "normalize_cpu_training_arguments"]
 
 import functools
 
+import torch
+
 from .runtime import cpu_bf16_supported, cpu_fp16_supported
 
 # bitsandbytes 8-bit / paged optimizers have no CPU kernels; AdamW states for LoRA are tiny anyway.
@@ -148,6 +150,9 @@ def _patch_sft_compute_loss(sft_trainer_cls):
                 chunked = candidate
                 break
         if chunked is None:
+            return original(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch, **kwargs)
+        if not torch.is_grad_enabled():
+            # Evaluation / prediction: the stock forward returns logits, so keep TRL's entropy and accuracy metrics.
             return original(self, model, inputs, return_outputs = return_outputs, num_items_in_batch = num_items_in_batch, **kwargs)
         if str(_name(getattr(self.args, "loss_type", None) or "nll")) != "nll":
             # TRL's other SFT objectives (dft, ...) weight per-token logits: stock forward.
