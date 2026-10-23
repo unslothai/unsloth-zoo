@@ -25,6 +25,7 @@ Submodules import transformers lazily so `import unsloth_zoo` stays unchanged.
 
 __all__ = [
     "resolve_text_parts",
+    "effective_lm_head_weight",
     "capture_hidden_states",
     "run_frozen_target",
     "chunked_lm_loss",
@@ -58,6 +59,7 @@ __all__ = [
 
 _LOCATIONS = {
     "resolve_text_parts": "capture",
+    "effective_lm_head_weight": "capture",
     "capture_hidden_states": "capture",
     "run_frozen_target": "capture",
     "chunked_lm_loss": "losses",

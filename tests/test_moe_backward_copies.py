@@ -383,3 +383,102 @@ def test_expert_bias_gather_chunks_bound_one_hot(monkeypatch):
     want = torch.zeros(E, D, dtype = torch.float64, device = "cuda").index_add_(0, ids, g.double())
     assert bias.grad.dtype == DT
     assert _rel(bias.grad, want) < 4e-3, _rel(bias.grad, want)
+
+
+_BIAS_DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
+
+
+@pytest.mark.parametrize("fp32_out", [True, False], ids = ["mm_out_dtype", "upcast"])
+@pytest.mark.parametrize("device", _BIAS_DEVICES)
+def test_expert_bias_gather_chunks_sum_in_fp32_before_rounding(device, fp32_out, monkeypatch):
+    """fp16, two chunks whose 16-bit sums overflow (+131072, -131072) but whose total is 0: no inf - inf = NaN."""
+    if not fp32_out:
+        monkeypatch.setattr(mu, "_MM_OUT_DTYPE", False, raising = False)
+    E, D = 128, 2
+    chunk = mu._EXPERT_BIAS_ONE_HOT_ELEMENTS // E
+    ids = torch.zeros(2 * chunk, dtype = torch.long, device = device)
+    ids[-1] = 1
+    g = torch.ones(2 * chunk, D, dtype = torch.float16, device = device)
+    g[chunk:] = -1
+    g[-1] = 3
+    bias = torch.zeros(E, D, dtype = torch.float16, device = device, requires_grad = True)
+    mu._gather_expert_bias(bias, ids).backward(g)
+    want = torch.zeros(E, D, dtype = torch.float64, device = device).index_add_(0, ids, g.double())
+    assert torch.isfinite(bias.grad).all(), bias.grad[:2]
+    assert torch.equal(bias.grad.double(), want), (bias.grad[:2], want[:2])
+
+
+@pytest.mark.parametrize("fp32_out", [True, False], ids = ["mm_out_dtype", "upcast"])
+@pytest.mark.parametrize("device", _BIAS_DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_expert_bias_gather_chunked_matches_fp64(device, dtype, fp32_out, monkeypatch):
+    """Ragged chunks, random data: fp32 sums, one output rounding off the fp64 per-expert sum."""
+    if not fp32_out:
+        monkeypatch.setattr(mu, "_MM_OUT_DTYPE", False, raising = False)
+    gen = torch.Generator().manual_seed(0)
+    E, D, M = 16, 48, 4096 + 77
+    monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", 1 << 14)
+    ids = torch.randint(0, E, (M,), generator = gen).sort().values.to(device)
+    g = torch.randn(M, D, generator = gen).to(device, dtype)
+    bias = torch.zeros(E, D, dtype = dtype, device = device, requires_grad = True)
+    mu._gather_expert_bias(bias, ids).backward(g)
+    want = torch.zeros(E, D, dtype = torch.float64, device = device).index_add_(0, ids, g.double())
+    assert bias.grad.dtype == dtype
+    assert _rel(bias.grad, want) < (1e-3 if dtype == torch.float16 else 5e-3), _rel(bias.grad, want)
+
+
+def test_expert_bias_gather_compiles_with_a_dynamic_row_count(monkeypatch):
+    """mark_dynamic on the routed rows: the chunked backward must not specialize them (fullgraph, dynamic)."""
+    E, D = 8, 4
+    monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", 1 << 10)
+    chunk = (1 << 10) // E
+    gen = torch.Generator().manual_seed(0)
+
+    def f(bias, ids, base):
+        return base + mu._gather_expert_bias(bias, ids)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(f, backend = "aot_eager", fullgraph = True, dynamic = True)
+    for M in (chunk + 1, 3 * chunk + 5):
+        ids = torch.randint(0, E, (M,), generator = gen).sort().values
+        torch._dynamo.mark_dynamic(ids, 0)
+        base = torch.zeros(M, D)
+        torch._dynamo.mark_dynamic(base, 0)
+        bias = torch.zeros(E, D, requires_grad = True)
+        g = torch.randn(M, D, generator = gen)
+        compiled(bias, ids, base).backward(g)
+        want = torch.zeros(E, D, dtype = torch.float64).index_add_(0, ids, g.double())
+        torch.testing.assert_close(bias.grad.double(), want, rtol = 1e-5, atol = 1e-5)
+
+
+@pytest.mark.skipif(not CUDA, reason = "CUDA determinism")
+@pytest.mark.parametrize("path", ["eager", "eager_upcast", "compiled"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_expert_bias_gather_long_backward_is_reproducible(path, dtype, monkeypatch):
+    """Rows past one chunk, 10 backwards: bitwise-identical bias grads (GEMMs only, no index_add_ atomics)."""
+    gen = torch.Generator().manual_seed(0)
+    E, D, M = 16, 96, 3 * 1024 + 77
+    monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", E * 1024)
+    if path == "eager_upcast":
+        monkeypatch.setattr(mu, "_MM_OUT_DTYPE", False, raising = False)
+    # Long sorted runs per expert: where atomic adds would reorder.
+    ids = torch.randint(0, E, (M,), generator = gen).sort().values.cuda()
+    g = torch.randn(M, D, generator = gen).to("cuda", dtype)
+    base = torch.zeros(M, D, dtype = dtype, device = "cuda")
+
+    def f(bias, ids, base):
+        return base + mu._gather_expert_bias(bias, ids)
+
+    torch._dynamo.reset()
+    fn = torch.compile(f, fullgraph = True) if path == "compiled" else f
+    want = torch.zeros(E, D, dtype = torch.float64, device = "cuda").index_add_(0, ids, g.double())
+    grads = []
+    try:
+        for _ in range(10):
+            bias = torch.zeros(E, D, dtype = dtype, device = "cuda", requires_grad = True)
+            fn(bias, ids, base).backward(g)
+            grads.append(bias.grad)
+    finally:
+        torch._dynamo.reset()
+    assert all(torch.equal(grads[0], x) for x in grads[1:])
+    assert _rel(grads[0], want) < (1e-3 if dtype == torch.float16 else 5e-3), _rel(grads[0], want)

@@ -191,6 +191,44 @@ def test_the_fallback_returns_the_native_shapes_and_dtypes(monkeypatch):
     assert down.dtype == torch.bfloat16 and down.shape == (T, H)
 
 
+def _cancelling_problem(device = "cpu", terms = 2, value = 1.0):
+    """Every expert's product is 256 + 1 = 257 (not a bf16 value) and its bias -256: the exact answer is 1."""
+    module, x, logits = _problem(seed = 8)
+    x = torch.zeros(T, H, dtype = torch.bfloat16)
+    x[:, 0], x[:, 1] = 256, 1
+    module.gate_up_proj = torch.zeros(E, H, 2 * I, dtype = torch.bfloat16)
+    module.gate_up_proj[:, :2] = 1
+    module.down_proj = torch.zeros(E, I, H, dtype = torch.bfloat16)
+    module.down_proj[:, :2] = 1
+    module.gate_up_proj_bias = torch.full((E, 2 * I), -256.0)
+    module.down_proj_bias = torch.full((E, H), -256.0)
+    h = torch.zeros(T * K, I, dtype = torch.bfloat16)
+    h[:, 0], h[:, 1] = 256, 1
+    return module, x.to(device), h.to(device), logits
+
+
+def test_the_fallback_adds_the_bias_before_rounding():
+    # The native epilogue adds the fp32 bias to the fp32 accumulator; rounding 257 to bf16 (256) first gave 0.
+    module, x, h, logits = _cancelling_problem()
+    routing, gather, scatter, _, _ = _routing(logits)
+    gate_up = go._ogs_dequant_gate_up(x, module.gate_up_proj, module.gate_up_proj_bias, routing, gather, None)
+    assert torch.equal(gate_up.float(), torch.ones_like(gate_up, dtype = torch.float32))
+    down = go._ogs_dequant_down(h, routing.gate_scal, module.down_proj, module.down_proj_bias, routing, scatter, None)
+    torch.testing.assert_close(down.float(), torch.ones_like(down, dtype = torch.float32), rtol = 0, atol = 1e-2)
+
+
+def test_the_fallback_routing_weight_grad_uses_the_same_epilogue(monkeypatch):
+    module, x, h, logits = _cancelling_problem()
+    routing, gather, scatter, _, _ = _routing(logits)
+    module.down_proj_precision_config = None
+    monkeypatch.setattr(go, "_ogs_backend_for", lambda *args, **kwargs: None)
+    monkeypatch.setattr(go, "_ogs_native_training_ok", lambda *args, **kwargs: False)
+    gammas = routing.gate_scal.detach().clone().requires_grad_(True)
+    out = go._OgsDown.apply(h, gammas, module.down_proj_bias, module, routing, scatter)
+    out.float().sum().backward()
+    torch.testing.assert_close(gammas.grad.float(), torch.full_like(gammas.grad, H, dtype = torch.float32))
+
+
 class _NoGradExperts:
     """The LoRA-patched experts forward's view of a module: dense stacks, no adapters, a recording native forward."""
 
@@ -235,6 +273,40 @@ def test_no_grad_forward_without_lora_fails_closed_on_the_rejected_cell(monkeypa
         assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-2
 
 
+@pytest.mark.parametrize("grad", [False, True])
+def test_lora_patched_forward_returns_the_fp16_input_dtype(monkeypatch, grad):
+    # T4 fp16: a bf16 expert output promoted the residual to fp32 and broke the next fp16 Linear.
+    import contextlib
+    monkeypatch.setattr(compat, "_device_capability", lambda device: (12, 0))
+    monkeypatch.setattr(go, "_OGS_NATIVE_REJECT_WARNED", False)
+    monkeypatch.setattr(go.logger, "warning", lambda *args, **kwargs: None)
+    backend = _Recorder(compat.API_OGS_RAGGED)
+    monkeypatch.setattr(go, "_ogs_backend_for", lambda *args, **kwargs: backend)
+    monkeypatch.setattr(go, "_ogs_module_backend", lambda module: backend)
+    monkeypatch.setattr(go, "is_triton_kernels_available", lambda: True)
+    monkeypatch.setattr(go, "_get_lora_wrapper_for_param", lambda module, name: None)
+    monkeypatch.setattr(go, "torch_cuda_device", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(
+        go, "_mxfp4_experts_routing",
+        lambda module, hs, rd, gather, scatter, ri, rw: (hs, rd, gather, scatter, None),
+    )
+    module, x, logits = _problem(seed = 7)
+    experts = _NoGradExperts(module)
+    routing, gather, scatter, top, weights = _routing(logits)
+    x = x.to(torch.float16).requires_grad_(grad)
+    with torch.set_grad_enabled(grad):
+        out = go.forward_mxfp4_gpt_oss_with_lora(experts, x, routing, gather, scatter)
+        residual = x + out
+        assert out.dtype == torch.float16 and residual.dtype == torch.float16
+        torch.nn.Linear(H, H, dtype = torch.float16)(residual)  # the next layer, no autocast
+        if grad:
+            out.float().sum().backward()
+            assert x.grad is not None and x.grad.dtype == torch.float16
+    assert experts.original_calls == 0
+    ref = _reference(module, x.detach().float(), top, weights)
+    assert ((out.detach().float() - ref).norm() / ref.norm()).item() < 2e-2
+
+
 def test_matmul_ogs_available_rejects_the_cell_without_probing(monkeypatch):
     probes = []
     monkeypatch.setattr(compat, "_DEVICE_OK", {})
@@ -247,3 +319,62 @@ def test_matmul_ogs_available_rejects_the_cell_without_probing(monkeypatch):
     monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
     monkeypatch.setattr(compat, "_device_capability", lambda device: (10, 0))
     assert compat.matmul_ogs_available("cuda:0") is True and len(probes) == 1
+
+
+def _overflowing_problem():
+    # x @ W_gate_up = 64 * 2048 = 131072 exactly (bf16 and MXFP4 exact), past fp16's 65504; the bias
+    # cancels it back to small pre-activations, so the right answer is finite and fp16-representable.
+    module, _, logits = _problem(seed = 7)
+    gen = torch.Generator().manual_seed(8)
+    module.gate_up_proj = torch.ones(E, H, 2 * I, dtype = torch.bfloat16)
+    module.gate_up_proj_bias = torch.nn.Parameter(torch.randn(E, 2 * I, generator = gen) * 2 - 64 * 2048)
+    x = torch.full((T, H), 2048.0, dtype = torch.bfloat16)
+    return module, x, logits
+
+
+def test_fallback_ignores_fp16_autocast_and_matches_the_fp32_reference(monkeypatch):
+    # The fallback's explicit bf16 matmuls must not be recast to fp16 by the caller's autocast (T4 / fp16 runs).
+    monkeypatch.setattr(compat, "_device_capability", lambda device: (12, 0))
+    monkeypatch.setattr(go, "_OGS_NATIVE_REJECT_WARNED", False)
+    monkeypatch.setattr(go.logger, "warning", lambda *args, **kwargs: None)
+    backend = _Recorder(compat.API_OGS_RAGGED)
+    monkeypatch.setattr(go, "_ogs_backend_for", lambda *args, **kwargs: backend)
+    module, x0, logits0 = _overflowing_problem()
+    grad = torch.randn(T, H, generator = torch.Generator().manual_seed(9))
+
+    x, logits = x0.clone().requires_grad_(), logits0.clone().requires_grad_()
+    routing, gather, scatter, _, _ = _routing(logits)
+    with torch.autocast(device_type = "cpu", dtype = torch.float16):
+        out = go.mxfp4_ogs_experts_forward(module, x, routing, gather, scatter)
+    (out.float() * grad).sum().backward()
+    assert backend.calls == 0
+    ours = {"out": out.detach().float(), "x": x.grad.float(), "logits": logits.grad,
+            "gate_up_bias": module.gate_up_proj_bias.grad, "down_bias": module.down_proj_bias.grad}
+    module.gate_up_proj_bias.grad = module.down_proj_bias.grad = None
+
+    x_ref, logits_ref = x0.float().requires_grad_(), logits0.clone().requires_grad_()
+    _, experts, weights = _routing(logits_ref)[2:]
+    ref = _reference(module, x_ref, experts, weights)
+    (ref * grad).sum().backward()
+    theirs = {"out": ref.detach(), "x": x_ref.grad, "logits": logits_ref.grad,
+              "gate_up_bias": module.gate_up_proj_bias.grad, "down_bias": module.down_proj_bias.grad}
+    assert ref.abs().max() < 65504
+    for key in theirs:
+        assert torch.isfinite(ours[key]).all(), key
+        error = ((ours[key] - theirs[key]).norm() / theirs[key].norm()).item()
+        assert error < 2e-2, (key, error)
+
+
+def test_fallback_down_does_not_overflow_before_the_routing_weight():
+    # h @ W_down = 32 * 32 * 64 = 65536 overflows fp16; the 0.25 routing weight brings it back to 16384.
+    module, _, _ = _problem()
+    routing = compat.RoutingData(torch.full((1,), 0.25), torch.tensor([1, 0, 0, 0]), E, 1)
+    scatter = compat.ScatterIndx(src_indx = torch.tensor([0]), dst_indx = torch.tensor([0]))
+    h = torch.full((1, I), 32.0, dtype = torch.bfloat16)
+    weight = torch.full((E, I, H), 64.0, dtype = torch.bfloat16)
+    eager = go._ogs_dequant_down(h, routing.gate_scal, weight, None, routing, scatter, None)
+    with torch.autocast(device_type = "cpu", dtype = torch.float16):
+        amp = go._ogs_dequant_down(h, routing.gate_scal, weight, None, routing, scatter, None)
+    assert eager.dtype == amp.dtype == torch.bfloat16
+    assert torch.equal(eager, torch.full((1, H), 16384.0, dtype = torch.bfloat16))
+    assert torch.equal(amp, eager)

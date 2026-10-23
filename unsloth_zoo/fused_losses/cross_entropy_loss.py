@@ -753,7 +753,12 @@ def unsloth_fused_ce_loss(
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     """
     scaler = trainer.accelerator.scaler if trainer is not None else None
-    # Get mixed precision scaling if seen
+    # Get mixed precision scaling if seen. The scale only multiplies the gradients saved in the
+    # forward (the returned loss is unscaled), so no-grad scoring skips GradScaler.get_scale():
+    # it is a host sync and torch.compile cannot trace it (fullgraph eval would fail).
+    if not torch.is_grad_enabled():
+        scaler = None
+        if hasattr(scaling, "get_scale"): scaling = None
     scaling = scaler.get_scale() if scaler is not None else scaling
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
     if TARGET_GB: target_gb = float(TARGET_GB)

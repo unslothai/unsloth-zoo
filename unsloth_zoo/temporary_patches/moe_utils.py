@@ -1133,11 +1133,34 @@ class _ExpertBiasGather(torch.autograd.Function):
         rows = grad.shape[0]
         if rows <= chunk:
             return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
+        # GEMMs only (no index_add_ atomics) for reproducibility; fp32 partials, since 16-bit chunk sums can overflow to inf.
+        if torch.compiler.is_compiling():
+            # A loop over symbolic rows would specialize them: one uncapped GEMM instead.
+            return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
+        if not _mm_fp32_out_ok(grad):
+            # The fallback upcasts each grad chunk to fp32: cap that copy too.
+            chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(ctx.num_experts, grad.shape[1]))
         out = torch.zeros(ctx.num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
         for start in range(0, rows, chunk):
-            one_hot = (expert_ids[start : start + chunk].unsqueeze(0) == experts).to(grad.dtype)
-            out += (one_hot @ grad[start : start + chunk]).float()
+            out += _one_hot_mm_fp32(expert_ids[start : start + chunk].unsqueeze(0) == experts, grad[start : start + chunk])
         return out.to(grad.dtype), None
+
+
+# torch.mm(..., out_dtype = torch.float32): 16-bit inputs, fp32 output (aten::mm.dtype, CUDA only, torch 2.9+).
+_MM_OUT_DTYPE = "dtype" in torch.ops.aten.mm.overloads()
+
+
+def _mm_fp32_out_ok(grad):
+    return _MM_OUT_DTYPE and grad.is_cuda and torch.version.hip is None and grad.dtype in (torch.float16, torch.bfloat16)
+
+
+def _one_hot_mm_fp32(one_hot, grad):
+    """one_hot (bool [E, rows]) @ grad as fp32 [E, D], with no 16-bit rounding of the sum."""
+    if grad.dtype == torch.float32:
+        return one_hot.to(grad.dtype) @ grad
+    if _mm_fp32_out_ok(grad):
+        return torch.mm(one_hot.to(grad.dtype), grad, out_dtype = torch.float32)
+    return one_hot.to(torch.float32) @ grad.float()
 
 
 def _gather_expert_bias(bias, expert_ids):
@@ -1896,7 +1919,8 @@ def select_moe_backend():
         return _SELECTED_MOE_BACKEND
     backend = _select_moe_backend()
     # Chosen while unsloth imports (its Triton kernels cannot load yet): choose again on the next call.
-    if not _unsloth_importing():
+    # Not inside a trace either: the write fails the `is None` guard and recompiles the caller once.
+    if not _unsloth_importing() and not torch.compiler.is_compiling():
         _SELECTED_MOE_BACKEND = backend
     return backend
 
@@ -1914,6 +1938,18 @@ def select_moe_backend_for_interleaved_gate_up():
     # This Unsloth Zoo code section is licensed under AGPL3
     backend = select_moe_backend()
     if backend in ("unsloth_triton", "sonic_moe") and _check_torch_grouped_mm_supported():
+        return "grouped_mm"
+    return backend
+
+
+def select_moe_backend_without_sonic(device = None):
+    """select_moe_backend() for dispatchers with no sonic route (bnb4bit / FP8 experts): sonic_moe runs as grouped_mm."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    backend = select_moe_backend()
+    if backend == "sonic_moe":
+        # sonic_moe was selected on a card with torch._grouped_mm; on a mixed host the expert's card may lack it.
+        if getattr(device, "type", None) == "cuda" and not _check_torch_grouped_mm_supported(device):
+            return "native_torch"
         return "grouped_mm"
     return backend
 
@@ -1984,23 +2020,29 @@ def moe_compute_dtype(hidden_states):
 def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_fn, *args):
     """Temporarily install dequantized weights for one forward call, then restore.
 
-    Uses object.__setattr__ to bypass nn.Module Parameter (de)registration
-    (re-registers hooks, unnecessary for read-only temp tensors). Used by the
-    FP8 and bnb4bit MoE dispatchers.
+    Registered parameters are swapped in place in `_parameters` (no nn.Module
+    __setattr__, so no (de)registration or hooks); any other attribute goes through
+    object.__setattr__. Used by the FP8 and bnb4bit MoE dispatchers.
     """
-    # Restore by popping the __dict__ entries, never writing the Parameter there: it would shadow
-    # later `_parameters` swaps (FSDP2 all-gather) and read a freed buffer. No `object()` sentinel:
-    # its graph break left the temporary tensors installed after a compiled call.
-    instance_dict = experts_module.__dict__
+    # Swap `_parameters` entries only: a __dict__ write shadows later FSDP2 swaps (freed buffer), and
+    # `__dict__.pop` / `del` / an `object()` sentinel graph-break; dict setitem traces on every torch.
     names = ("gate_up_proj", "down_proj")
-    saved = {name: instance_dict[name] for name in names if name in instance_dict}
-    object.__setattr__(experts_module, "gate_up_proj", gate_up_proj)
-    object.__setattr__(experts_module, "down_proj", down_proj)
+    params = experts_module._parameters
+    instance_dict = experts_module.__dict__
+    registered = {name: params[name] for name in names if name in params}
+    saved = {name: instance_dict[name] for name in names if name not in registered and name in instance_dict}
+    for name, tensor in zip(names, (gate_up_proj, down_proj)):
+        if name in registered:
+            params[name] = tensor
+        else:
+            object.__setattr__(experts_module, name, tensor)
     try:
         return forward_fn(experts_module, *args)
     finally:
         for name in names:
-            if name in saved:
+            if name in registered:
+                params[name] = registered[name]
+            elif name in saved:
                 instance_dict[name] = saved[name]
             else:
                 instance_dict.pop(name, None)
@@ -5601,18 +5643,23 @@ def _triton_moe_compute_dtype(module, hidden_states):
 
 
 @torch.compiler.disable
-def _moe_weight_dtype_kwargs(tuner, module, name, dtype):
-    """weight_dtype kwarg when expert weights differ from activations (bf16 W, float32 X)."""
-    weight = getattr(module, name, None)
-    weight_dtype = getattr(weight, "dtype", None)
-    if weight_dtype not in (torch.float32, torch.bfloat16, torch.float16) or weight_dtype == dtype:
-        return {}
+def _moe_weight_dtype_kwargs(tuner, module, name, dtype, device = None):
+    """weight_dtype kwarg when expert weights differ from activations (bf16 W, float32 X), and the
+    operands' CUDA device: on a mixed-GPU host the configs must fit the card the GEMM launches on."""
     try:
-        if "weight_dtype" not in inspect.signature(tuner).parameters:
-            return {}
+        parameters = inspect.signature(tuner).parameters
     except (TypeError, ValueError):
         return {}
-    return {"weight_dtype": weight_dtype}
+    kwargs = {}
+    weight = getattr(module, name, None)
+    weight_dtype = getattr(weight, "dtype", None)
+    if weight_dtype in (torch.float32, torch.bfloat16, torch.float16) and weight_dtype != dtype \
+            and "weight_dtype" in parameters:
+        kwargs["weight_dtype"] = weight_dtype
+    # Older unsloth has no device argument and reads the current device.
+    if device is not None and device.type == "cuda" and "device" in parameters:
+        kwargs["device"] = device
+    return kwargs
 
 
 def forward_triton_grouped_gemm(
@@ -5680,7 +5727,9 @@ def forward_triton_grouped_gemm(
             intermediate_dim=intermediate_dim,
             top_k=top_k,
             dtype=gemm_hidden_states.dtype,
-            **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "gate_up_proj", gemm_hidden_states.dtype),
+            **_moe_weight_dtype_kwargs(
+                get_or_autotune_moe_kernels, self, "gate_up_proj", gemm_hidden_states.dtype, gemm_hidden_states.device,
+            ),
         )
 
         # Second GEMM: K = intermediate_dim, N = hidden_dim.
@@ -5690,7 +5739,9 @@ def forward_triton_grouped_gemm(
             intermediate_dim=hidden_dim // 2 if hidden_dim % 2 == 0 else hidden_dim,
             top_k=top_k,
             dtype=compute_dtype,
-            **_moe_weight_dtype_kwargs(get_or_autotune_moe_kernels, self, "down_proj", compute_dtype),
+            **_moe_weight_dtype_kwargs(
+                get_or_autotune_moe_kernels, self, "down_proj", compute_dtype, gemm_hidden_states.device,
+            ),
         )
 
         self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)

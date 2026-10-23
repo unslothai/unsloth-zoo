@@ -54,7 +54,7 @@ from torch import nn
 from transformers import Trainer, TrainingArguments
 
 from .trainer import token_average_scale
-from .capture import resolve_text_parts, run_frozen_target
+from .capture import effective_lm_head_weight, resolve_text_parts, run_frozen_target
 
 # Target text model_types where llama.cpp exposes layer inputs (`t_layer_inp`) AND vLLM 0.31
 # implements SupportsEagle3. Mistral checkpoints convert to llama.cpp's llama arch.
@@ -415,7 +415,7 @@ def build_eagle3_drafter(target_model, d2t, t2d, aux_layer_ids = None, dtype = N
     t2d = t2d.bool()
     drafter = Eagle3Drafter(layer_config, int(t2d.sum()), aux, target_hidden_size = text.hidden_size,
                             norm_before_residual = norm_before_residual)
-    lm_weight = parts["lm_head"].weight
+    lm_weight = effective_lm_head_weight(parts["lm_head"])
     with torch.no_grad():
         drafter.d2t.copy_(d2t.long())
         drafter.t2d.copy_(t2d)
@@ -645,7 +645,7 @@ class UnslothEagle3Trainer(Trainer):
             p.requires_grad_(False)
         target_model.eval()
         parts = resolve_text_parts(target_model)
-        self._lm_head_weight = parts["lm_head"].weight
+        self._lm_head_weight = effective_lm_head_weight(parts["lm_head"])
         self._teacher_logit_softcap = getattr(parts["config"], "final_logit_softcapping", None)
         self._num_layers = int(parts["config"].num_hidden_layers)
         model.lm_head.weight.requires_grad_(False)

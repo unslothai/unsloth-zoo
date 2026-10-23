@@ -85,6 +85,9 @@ dependencies = [
     # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
     # through datasets, which dropped it in 5.x.
     "requests",
+    # requests and huggingface_hub verify TLS against certifi; 2026.10.19 drops the compromised
+    # eMudhra/emSign root, and an older bundle already installed would otherwise be kept.
+    "certifi>=2026.10.19",
 ]
 
 [tool.setuptools.dynamic]
@@ -137,6 +140,9 @@ core = [
     # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
     # through datasets, which dropped it in 5.x.
     "requests",
+    # requests and huggingface_hub verify TLS against certifi; 2026.10.19 drops the compromised
+    # eMudhra/emSign root, and an older bundle already installed would otherwise be kept.
+    "certifi>=2026.10.19",
 ]
 huggingface = [
     "unsloth_zoo[core]",
