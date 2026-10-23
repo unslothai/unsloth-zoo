@@ -94,6 +94,13 @@ COMMANDS_NOT_FOUND = (
     "not found",
     "No such file or directory",
 )
+# What a shell prints for a missing command. cmake's "OpenMP not found" or "pthreads - not found"
+# on a successful configure must not fail the build.
+SHELL_COMMAND_NOT_FOUND = (
+    "command not found",
+    ": not found",
+    "No such file or directory",
+)
 
 # Each manager's own "no such package" phrase: a bare "not found" also matches normal install output.
 PACKAGE_NOT_FOUND = (
@@ -861,7 +868,7 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
         # Process output
         for line in all_output.splitlines(keepends=True):
             # Check for command not found
-            if line.rstrip().endswith(COMMANDS_NOT_FOUND):
+            if line.rstrip().endswith(SHELL_COMMAND_NOT_FOUND):
                 raise RuntimeError(f"Command not found: {command}")
 
             # Check for other bad outcomes

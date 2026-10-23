@@ -327,3 +327,21 @@ def test_install_llama_cpp_still_probes_when_a_package_is_missing(llama_cpp, mon
         llama_cpp.install_llama_cpp(llama_cpp_folder = str(tmp_path / "llama.cpp"))
     assert probed == [("debian",)]
     assert installed == [("cmake", True)]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "CMake Warning at ggml/src/CMakeLists.txt:347 (message):\\n  OpenMP not found\\n-- Configuring done\\n",
+        "-- Looking for pthread_create in pthreads - not found\\n-- Found Threads: TRUE\\n",
+    ],
+)
+def test_benign_not_found_output_does_not_fail_a_successful_command(llama_cpp, output):
+    # cmake prints these on macOS (Apple Clang has no OpenMP) and on older glibc.
+    llama_cpp.try_execute(f"printf -- '{output}'")
+
+
+@pytest.mark.parametrize("command", ["missing_tool_xyz", "missing_tool_xyz | cat"])
+def test_a_missing_command_still_fails(llama_cpp, command):
+    with pytest.raises(RuntimeError):
+        llama_cpp.try_execute(command)
