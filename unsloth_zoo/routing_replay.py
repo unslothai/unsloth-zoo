@@ -733,10 +733,10 @@ def _tensor_addresses(values):
 def _layer_pre_hook(layer_index):
     def hook(module, args, kwargs):
         # Addresses of every tensor this decoder layer call gets (one level into tuples, e.g. the
-        # rotary (cos, sin)): the checkpoint recompute is called with the same tensors.
-        _STATE.layer_inputs[layer_index] = None if torch.compiler.is_compiling() else (
-            frozenset(_tensor_addresses(list(args) + list(kwargs.values()))) or None
-        )
+        # rotary (cos, sin)): the checkpoint recompute is called with the same tensors. Also read
+        # inside a compiled layer: torch.compile hands the hook the real per-call addresses there
+        # (no graph break or recompile), and dropping them leaves identical forwards ambiguous.
+        _STATE.layer_inputs[layer_index] = frozenset(_tensor_addresses(list(args) + list(kwargs.values()))) or None
         return None
 
     return hook

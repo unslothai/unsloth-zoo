@@ -143,25 +143,20 @@ def test_invalid_capture_next_to_a_valid_one_is_not_a_conflict(replay):
     assert rr.routing_replay_stats().get("conflicting_routes", 0) == 0
 
 
-def test_return_args_path_also_checks_the_model_runner():
-    # load_vllm(return_args = True) returns the `vllm serve` engine args before the ReplaySSM block:
-    # the Model Runner V2 conflict check must run there as well.
+def test_return_args_path_does_not_ask_vllm_serve_for_routed_experts():
+    # load_vllm(return_args = True) hands its engine args to `vllm serve` (SyntheticDataKit), which
+    # drops every False value, so vLLM 0.21 would get no --no-async-scheduling and refuse routed
+    # experts capture. Nothing records routes from that server either: the replay args stay out.
     import unsloth_zoo.vllm_utils as vu
     path = pathlib.Path(vu.__file__)
     tree = ast.parse(path.read_text(encoding = "utf-8-sig"))
     fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
-    branch = next(
+    guard = next(
         n for n in ast.walk(fn)
-        if isinstance(n, ast.If) and ast.unparse(n.test) == "return_args"
-        and any(isinstance(s, ast.Return) for s in n.body)
+        if isinstance(n, ast.If) and "routing_replay_engine_args" in ast.unparse(n)
+        and not isinstance(n.test, ast.Constant)
     )
-    calls = [
-        i for i, s in enumerate(branch.body)
-        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
-        and getattr(s.value.func, "id", None) == "_routing_replay_model_runner"
-    ]
-    returns = [i for i, s in enumerate(branch.body) if isinstance(s, ast.Return)]
-    assert calls and calls[0] < returns[0]
+    assert "not return_args" in ast.unparse(guard.test)
 
 
 transformers = pytest.importorskip("transformers")
@@ -185,8 +180,9 @@ def _moe(seed = 0):
     return model
 
 
+@pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("use_reentrant", [True, False])
-def test_recompute_of_identical_inputs_with_different_replays_keeps_gradients(replay, use_reentrant):
+def test_recompute_of_identical_inputs_with_different_replays_keeps_gradients(replay, use_reentrant, compiled):
     # Record / forward one rollout, record / forward another for the same tokens, then one backward.
     # Both forwards feed every router the same bits with the same natural routes, so only the
     # checkpointed layer's input tensor can tell their recomputes apart.
@@ -207,6 +203,12 @@ def test_recompute_of_identical_inputs_with_different_replays_keeps_gradients(re
         if checkpointing:
             m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
         m.model.embed_tokens.weight.requires_grad_(True)
+        if compiled:
+            # Decoder layers under torch.compile, their hooks inside the compiled call: the layer
+            # input addresses must still name each forward for its recompute.
+            torch._dynamo.reset()
+            for layer in m.model.layers:
+                layer.compile(backend = "eager")
         rr.reset_routing_replay()
         assert rr.install_routing_replay(m, None, SimpleNamespace(pad_token_id = PAD)) == LAYERS
         losses = []
@@ -485,3 +487,53 @@ def test_unset_runner_keeps_routing_replay_on_v2(runner_env, monkeypatch, capsys
     assert args.get("enable_return_routed_experts") is True and "use_replayssm" not in args
     assert "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
     assert "UNSLOTH_VLLM_REPLAYSSM=1 ignored: routing replay" in capsys.readouterr().out
+
+
+def test_routing_replay_is_off_without_prefix_caching(runner_env, monkeypatch):
+    # vLLM 0.31 _verify_aux_output_compatibility: "AuxOutput Connector requires prefix caching".
+    # load_vllm turns prefix caching off on compute capability < 7.5 (V100) and on request.
+    vu, _ = runner_env
+    args = dict(_replay_args(), enable_prefix_caching = False, async_scheduling = False)
+    with pytest.warns(UserWarning, match = "prefix caching"):
+        assert vu._routing_replay_model_runner(args) == "replay_off"
+    assert "enable_return_routed_experts" not in args and "async_scheduling" not in args
+    assert args["enable_prefix_caching"] is False
+
+
+@pytest.mark.parametrize("version", ["0.30.0", "0.32.0"])
+def test_routing_replay_stays_on_with_prefix_caching(runner_env, version):
+    vu, versions = runner_env
+    versions["vllm"] = version
+    args = dict(_replay_args(), enable_prefix_caching = True)
+    assert vu._routing_replay_model_runner(args) is None
+    assert args["enable_return_routed_experts"] is True
+    if version == "0.30.0":
+        # Before 0.31 vLLM captures routed experts without prefix caching too.
+        args = dict(_replay_args(), enable_prefix_caching = False)
+        assert vu._routing_replay_model_runner(args) is None
+        assert args["enable_return_routed_experts"] is True
+
+
+@pytest.mark.parametrize("owned_v1", [False, True])
+def test_suffix_decoding_yields_to_routing_replay_on_model_runner_v2(runner_env, monkeypatch, capsys, owned_v1):
+    # vLLM 0.31 _get_v2_model_runner_unsupported_features lists speculative method 'suffix', so an
+    # unset runner falls back to V1, where routed experts capture is refused. Routing replay wins.
+    vu, _ = runner_env
+    if owned_v1:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+        monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", True)
+    args = dict(_replay_args(), enable_prefix_caching = True, speculative_config = {"method": "suffix"})
+    action = vu._routing_replay_model_runner(args)
+    assert action == ("restored_v2" if owned_v1 else "speculation_off")
+    assert "speculative_config" not in args and args["enable_return_routed_experts"] is True
+    assert "suffix decoding is off" in capsys.readouterr().out
+
+
+def test_v2_supported_speculation_is_kept(runner_env):
+    vu, versions = runner_env
+    args = dict(_replay_args(), speculative_config = {"method": "mtp"})
+    assert vu._routing_replay_model_runner(args) is None
+    assert args["speculative_config"] == {"method": "mtp"}
+    versions["vllm"] = "0.30.0"
+    args = dict(_replay_args(), speculative_config = {"method": "suffix"})
+    assert vu._routing_replay_model_runner(args) is None and "speculative_config" in args

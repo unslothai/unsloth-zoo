@@ -3916,39 +3916,70 @@ def _vllm_disable_envs_cache():
         pass
 
 
+# Speculative methods vLLM 0.31 Model Runner V2 does not run (VllmConfig
+# _get_v2_model_runner_unsupported_features): with one set, an unset runner falls back to V1.
+_MRV2_UNSUPPORTED_SPECULATIVE_METHODS = frozenset((
+    "ngram", "ngram_gpu", "suffix", "medusa", "mlp_speculator", "custom_class",
+))
+
+
 def _routing_replay_model_runner(engine_args):
-    """vLLM 0.31+ captures routed experts only on Model Runner V2 (VllmConfig
-    _verify_aux_output_compatibility). A V1 runner left by an earlier ReplaySSM load is taken back;
-    a V1 runner the user chose turns routing replay off for this engine instead. Returns the
-    action taken: None, "restored_v2" or "replay_off"."""
+    """vLLM 0.31+ captures routed experts only on Model Runner V2 and with prefix caching on
+    (VllmConfig _verify_aux_output_compatibility). Without prefix caching routing replay is off. A
+    V1 runner left by an earlier ReplaySSM load is taken back; a V1 runner the user chose turns
+    routing replay off for this engine instead. A speculative method V2 cannot run (suffix
+    decoding) would fall back to V1, so it is dropped: routing replay wins. Returns the action
+    taken: None, "restored_v2", "replay_off" or "speculation_off"."""
     global _UNSLOTH_SET_V1_RUNNER
     if not engine_args.get("enable_return_routed_experts"):
         return None
     from .routing_replay import _vllm_at_least, ROUTING_REPLAY_ENV
     if not _vllm_at_least(0, 31):
         return None
+    if engine_args.get("enable_prefix_caching", True) is False:
+        engine_args.pop("enable_return_routed_experts", None)
+        engine_args.pop("async_scheduling", None)
+        warnings.warn(
+            f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: prefix caching is off (on "
+            "request, or on a GPU below compute capability 7.5), and this vLLM captures routed "
+            "experts only with prefix caching on.",
+            stacklevel = 2,
+        )
+        return "replay_off"
+    action = None
     value = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", None)
     try:
         v1 = value is not None and not bool(int(value.strip()))
     except ValueError:
         v1 = False
-    if not v1:
-        return None
-    if _UNSLOTH_SET_V1_RUNNER:
+    if v1:
+        if not _UNSLOTH_SET_V1_RUNNER:
+            engine_args.pop("enable_return_routed_experts", None)
+            engine_args.pop("async_scheduling", None)
+            warnings.warn(
+                f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: VLLM_USE_V2_MODEL_RUNNER=0 selects "
+                "Model Runner V1, and this vLLM captures routed experts only on V2. Unset "
+                "VLLM_USE_V2_MODEL_RUNNER to use routing replay.",
+                stacklevel = 2,
+            )
+            return "replay_off"
         os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
         _UNSLOTH_SET_V1_RUNNER = False
         _vllm_disable_envs_cache()
         print("Unsloth: routing replay needs vLLM Model Runner V2; dropping the V1 runner an earlier ReplaySSM load set.")
-        return "restored_v2"
-    engine_args.pop("enable_return_routed_experts", None)
-    engine_args.pop("async_scheduling", None)
-    warnings.warn(
-        f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: VLLM_USE_V2_MODEL_RUNNER=0 selects "
-        "Model Runner V1, and this vLLM captures routed experts only on V2. Unset "
-        "VLLM_USE_V2_MODEL_RUNNER to use routing replay.",
-        stacklevel = 2,
-    )
-    return "replay_off"
+        action = "restored_v2"
+    speculative_config = engine_args.get("speculative_config", None)
+    method = speculative_config.get("method", None) if isinstance(speculative_config, dict) \
+        else getattr(speculative_config, "method", None)
+    if method in _MRV2_UNSUPPORTED_SPECULATIVE_METHODS:
+        engine_args.pop("speculative_config", None)
+        what = "suffix decoding" if method == "suffix" else f"speculative method {method!r}"
+        print(
+            f"Unsloth: {what} is off for this engine: vLLM Model Runner V2 does not run it, and "
+            f"routing replay ({ROUTING_REPLAY_ENV}=1) needs V2 on this vLLM."
+        )
+        action = action or "speculation_off"
+    return action
 
 
 def _is_vllm_replayssm_refusal(error_text):
@@ -4779,7 +4810,9 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
-        if not use_async and not use_engine:
+        # Not for return_args (`vllm serve`, e.g. SyntheticDataKit): nothing records routes from
+        # that server, and its CLI translation drops False values such as async_scheduling.
+        if not use_async and not use_engine and not return_args:
             from .routing_replay import routing_replay_engine_args
             engine_args.update(routing_replay_engine_args(config))
         if fp8_moe is not None:
@@ -4951,8 +4984,6 @@ def load_vllm(
         # Quick exit. The finally below restores the patch on the way out.
         if return_args:
             _warn_padded_vocab_for_serve(config)
-            # `vllm serve` inherits this environment: routing replay needs Model Runner V2 there too.
-            _routing_replay_model_runner(engine_args)
             # No engine is built here, so nothing will ever reach delete_vllm to lift the
             # block, and the failure arm below is not reached either. Hand flashinfer back
             # rather than poisoning the session for good.
