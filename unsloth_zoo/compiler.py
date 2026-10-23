@@ -250,6 +250,10 @@ MODULE_FORWARD_SOURCE_REWRITES = {
     "deepseek_v41": {
         "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
+    # GLM-5.3-Flash carries the V4 Sinkhorn chain verbatim (transformers 5.17 - 5.20).
+    "glm5_next": {
+        "Glm5NextTextHyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
 }
 
 
@@ -5694,6 +5698,8 @@ DISABLE_COMPILE_MODULES = [
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",
+    # GLM-5.3-Flash: same Sinkhorn mixer. Its HyperHead is an unweighted mean and stays compiled.
+    "Glm5NextTextHyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
