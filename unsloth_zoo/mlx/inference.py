@@ -5058,7 +5058,7 @@ def _qmv_rows_kernel(p):
     if (isinstance(p, nn.QuantizedLinear)
             and p.scales.dtype in (mx.bfloat16, mx.float16) and p.scales.dtype == getattr(p.get("biases"), "dtype", None)
             and matmul.qmv_rows_supported(p.weight.shape[0], p.scales.shape[-1] * p.group_size, p.group_size, p.bits, p.mode)
-            and nax.kernel_probe_passed(matmul.QMV_ROWS_PROBE_KEY, matmul.__name__, "probe_qmv_rows", mx.metal.is_available)):
+            and matmul.qmv_rows_probe_passed(p.scales.dtype, p.group_size, p.bits)):
         kernel = (p.scales.dtype, p.group_size, p.bits)
         layout = (*kernel, p.weight.shape)
         try:

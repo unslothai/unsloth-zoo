@@ -528,16 +528,43 @@ def qmv_rows_matches(x, w, scales, biases, group_size, bits):
                for kind in QMV_ROWS_KINDS if x.shape[0] <= qmv_rows_most(kind))
 
 
-def probe_qmv_rows():
-    """Subprocess probe: every variant the kernel compiles, each row bitwise its one-row stock call."""
+_QMV_ROWS_DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16}
+
+
+def qmv_rows_probe(dtype, group_size, bits):
+    """The (probe key, `probe_qmv_rows_*` name) of one kernel: probing all 24 at once outlasts the probe timeout on M1."""
+    name = f"probe_qmv_rows_{next(k for k, v in _QMV_ROWS_DTYPES.items() if v == dtype)}_{group_size}_{bits}"
+    return f"{QMV_ROWS_PROBE_KEY}:{name[len('probe_qmv_rows_'):]}", name
+
+
+def qmv_rows_probe_passed(dtype, group_size, bits):
+    key, function = qmv_rows_probe(dtype, group_size, bits)
+    return nax.kernel_probe_passed(key, __name__, function, mx.metal.is_available)
+
+
+def _probe_qmv_rows(dtype, group_size, bits):
+    """Subprocess probe: every variant of one kernel, each row bitwise its one-row stock call."""
     # 72 and 80 outputs launch two and four simdgroups per staged threadgroup.
-    for dtype, group_size, bits, N in itertools.product((mx.bfloat16, mx.float16), _QMV_ROWS_GROUP_SIZES,
-                                                        _QMV_ROWS_BITS, (72, 80)):
+    for N in (72, 80):
         w = mx.random.normal((N, 1024), key = mx.random.key(group_size)) * 0.05
         w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
         for M in range(1, QMV_ROWS_STAGED_MAX + 1):
             x = mx.random.normal((M, 1024), key = mx.random.key(M)).astype(dtype)
             assert qmv_rows_matches(x, w, scales, biases, group_size, bits), (dtype, group_size, bits, N, M)
+
+
+def probe_qmv_rows():
+    for dtype, group_size, bits in itertools.product(_QMV_ROWS_DTYPES.values(), _QMV_ROWS_GROUP_SIZES, _QMV_ROWS_BITS):
+        _probe_qmv_rows(dtype, group_size, bits)
+
+
+def __getattr__(name):  # `probe_qmv_rows_<dtype>_<group size>_<bits>`, the names `qmv_rows_probe` gives the probe runner
+    dtype, _, rest = name.removeprefix("probe_qmv_rows_").partition("_")
+    group_size, _, bits = rest.partition("_")
+    if (name.startswith("probe_qmv_rows_") and dtype in _QMV_ROWS_DTYPES and group_size.isdigit() and bits.isdigit()
+            and int(group_size) in _QMV_ROWS_GROUP_SIZES and int(bits) in _QMV_ROWS_BITS):
+        return functools.partial(_probe_qmv_rows, _QMV_ROWS_DTYPES[dtype], int(group_size), int(bits))
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def qmv_rows_launch_costs(dtype, group_size, bits, clock = time.perf_counter):

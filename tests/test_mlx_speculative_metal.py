@@ -463,7 +463,7 @@ def test_a_verify_block_runs_its_rows_together_and_matches_one_token_decode_step
         assert timed == [(mx.bfloat16, 64, bits)]
         probe, recorded = nax.kernel_probe_passed, matmul.qmv_rows  # replaced scales settle again, natively if these fail
         fresh = lambda: [setattr(p, "scales", mx.array(p.scales)) for p in projections]
-        for failed in ((nax, "kernel_probe_passed", lambda key, *args: key != matmul.QMV_ROWS_PROBE_KEY and probe(key, *args)),
+        for failed in ((nax, "kernel_probe_passed", lambda key, *args: not key.startswith(matmul.QMV_ROWS_PROBE_KEY) and probe(key, *args)),
                        (matmul, "qmv_rows", lambda x, *args: recorded(x, *args) + (kind(*args[5:]) == "staged"))):
             with monkeypatch.context() as patch:
                 patch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
@@ -488,6 +488,24 @@ def _spilling_costs(most, prepared = 0.9, staged = 1):  # one unit per launch an
     per_row = {"inline": 1, "prepared": prepared, "staged": staged}
     return {(m, kind): 1 + m * per_row[kind] if m <= most else 100 for kind in per_row
             for m in range(1, 17 if kind == "staged" else 9)}
+
+
+def test_each_verify_rows_kernel_has_its_own_probe_building_only_that_kernel(monkeypatch):
+    import itertools
+    from unsloth_zoo.mlx import matmul
+    probed = []
+    monkeypatch.setattr(matmul, "_probe_qmv_rows", lambda *kernel: probed.append(kernel))
+    kernels = list(itertools.product((mx.bfloat16, mx.float16), (32, 64, 128), (4, 5, 6, 8)))
+    keys = set()
+    for kernel in kernels:
+        key, function = matmul.qmv_rows_probe(*kernel)
+        keys.add(key)
+        getattr(matmul, function)()
+        assert key.startswith(matmul.QMV_ROWS_PROBE_KEY + ":") and probed[-1] == kernel
+    assert len(keys) == len(kernels) == len(probed)
+    for name in ("probe_qmv_rows_bfloat16_64_3", "probe_qmv_rows_float32_64_4", "probe_qmv_rows_float16_48_4"):
+        with pytest.raises(AttributeError):
+            getattr(matmul, name)
 
 
 def test_verify_rows_launch_the_plan_their_launch_costs_make_cheapest():
