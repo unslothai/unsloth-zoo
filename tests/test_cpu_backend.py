@@ -360,3 +360,38 @@ def test_chunked_sft_step_keeps_token_count():
     model = torch.nn.Linear(2, 2).train()
     _count_sft_tokens(trainer, model, {"attention_mask": torch.tensor([[1, 1, 0], [1, 1, 1]])})
     assert trainer._total_train_tokens == 10 and trainer._metrics["train"]["num_tokens"] == [10]
+
+
+def test_chunked_loss_honours_a_custom_ignore_index():
+    from unsloth_zoo.cpu.ops import patch_chunked_causal_lm_loss
+    model = _tiny_llama()
+    assert patch_chunked_causal_lm_loss(model)
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    labels = torch.tensor([[1, 2, -1, -1, 5]])
+    with torch.no_grad():
+        logits = model.lm_head(model.model(input_ids = ids).last_hidden_state)
+    expected = F.cross_entropy(logits[0, :-1], labels[0, 1:], ignore_index = -1)
+    model._unsloth_cpu_chunked_ce_active = True
+    loss = model(input_ids = ids, labels = labels, ignore_index = -1).loss
+    torch.testing.assert_close(loss, expected, rtol = 1e-5, atol = 1e-5)
+
+
+def test_tokenizer_name_loads_the_tokenizer_not_the_model(monkeypatch):
+    import transformers
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    seen = {}
+
+    def fake_model(name, **kwargs):
+        seen["model"] = (name, kwargs)
+        return _tiny_llama()
+
+    def fake_tokenizer(name, **kwargs):
+        seen["tokenizer"] = name
+        return SimpleNamespace(pad_token = "<pad>", pad_token_id = 0, eos_token = "</s>", padding_side = "right")
+
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_model)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", fake_tokenizer)
+    FastCPUModel.from_pretrained("some/model", tokenizer_name = "some/tokenizer", load_in_4bit = False)
+    assert seen["tokenizer"] == "some/tokenizer"
+    assert seen["model"][0] == "some/model" and "tokenizer_name" not in seen["model"][1]

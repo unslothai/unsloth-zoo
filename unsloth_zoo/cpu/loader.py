@@ -111,6 +111,8 @@ class FastCPUModel:
 
         if fast_inference:
             raise NotImplementedError("Unsloth (CPU): fast_inference (vLLM) needs a GPU.")
+        # A separate tokenizer repo, as FastLanguageModel accepts on GPU; never a model kwarg.
+        tokenizer_name = kwargs.pop("tokenizer_name", None) or model_name
         if load_in_8bit:
             _print("8-bit loading is not supported on CPU, loading 16-bit weights instead.")
         if token is None:
@@ -166,7 +168,7 @@ class FastCPUModel:
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
         tokenizer = AutoTokenizer.from_pretrained(
-            model_name, token = token, revision = revision, trust_remote_code = trust_remote_code,
+            tokenizer_name, token = token, revision = revision, trust_remote_code = trust_remote_code,
             model_max_length = max_seq_length, padding_side = "right",
             **{k: kwargs[k] for k in ("cache_dir", "local_files_only", "subfolder") if k in kwargs},
         )

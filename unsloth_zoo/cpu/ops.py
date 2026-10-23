@@ -183,6 +183,7 @@ def patch_chunked_causal_lm_loss(model):
                 use_cache = use_cache, logits_to_keep = logits_to_keep, **kwargs,
             )
         num_items_in_batch = kwargs.pop("num_items_in_batch", None)
+        ignore_index = kwargs.pop("ignore_index", -100)
         kwargs.pop("return_dict", None)
         outputs = getattr(self, inner_name)(
             input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
@@ -192,7 +193,7 @@ def patch_chunked_causal_lm_loss(model):
         hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
         loss = chunked_linear_cross_entropy(
             hidden, head_weight, labels,
-            num_items_in_batch = num_items_in_batch, shift_labels = shift_labels,
+            num_items_in_batch = num_items_in_batch, shift_labels = shift_labels, ignore_index = ignore_index,
         )
         return CausalLMOutputWithPast(
             loss = loss, logits = None,
