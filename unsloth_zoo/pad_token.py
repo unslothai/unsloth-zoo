@@ -420,8 +420,7 @@ def fix_pad_token(
                 if model.get_input_embeddings().weight.shape[0] < len(inner):
                     from .tokenizer_utils import _vocab_pad_multiple, _round_up_vocab, _suppress_padded_rows
                     target = _round_up_vocab(len(inner), _vocab_pad_multiple())
-                    # patch_tokenizer runs under inference_mode: rows built there are inference
-                    # tensors, which autograd refuses to save and Dynamo cannot fake (Moonshine).
+                    # patch_tokenizer runs under inference_mode; rows built there cannot be saved for backward (Moonshine).
                     try:
                         import torch
                         no_inference = (torch.inference_mode(False), torch.no_grad())
