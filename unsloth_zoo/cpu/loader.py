@@ -361,9 +361,11 @@ def save_pretrained_merged(self, save_directory, tokenizer = None, save_method =
 def push_to_hub_merged(self, repo_id, tokenizer = None, save_method = "merged_16bit", token = None, private = None, **kwargs):
     _check_save_method(save_method)
     model, _ = _merged_copy(self, save_method)
-    model.push_to_hub(repo_id, token = token, private = private)
+    # Branch / PR / message options shared by model and tokenizer push_to_hub on transformers 4.57 and 5.x.
+    hub = {k: kwargs[k] for k in ("revision", "create_pr", "commit_message", "commit_description", "tags") if k in kwargs}
+    model.push_to_hub(repo_id, token = token, private = private, **hub)
     if tokenizer is not None:
-        tokenizer.push_to_hub(repo_id, token = token, private = private)
+        tokenizer.push_to_hub(repo_id, token = token, private = private, **hub)
     return repo_id
 
 

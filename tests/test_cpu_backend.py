@@ -294,3 +294,17 @@ def test_for_training_turns_the_kv_cache_back_off():
     assert model.config.use_cache is True and not model.training
     FastCPUModel.for_training(model)
     assert model.config.use_cache is False and model.training
+
+
+def test_push_to_hub_merged_forwards_branch_and_pr_options():
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.loader import push_to_hub_merged
+    calls = []
+    model = SimpleNamespace(push_to_hub = lambda repo, **kw: calls.append(("model", repo, kw)))
+    tokenizer = SimpleNamespace(push_to_hub = lambda repo, **kw: calls.append(("tokenizer", repo, kw)))
+    push_to_hub_merged(model, "user/repo", tokenizer, save_method = "lora", token = "t",
+                       revision = "dev", create_pr = True, commit_message = "m", max_shard_size = "1GB")
+    for _, repo, kw in calls:
+        assert repo == "user/repo"
+        assert kw == {"token": "t", "private": None, "revision": "dev", "create_pr": True, "commit_message": "m"}
+    assert [c[0] for c in calls] == ["model", "tokenizer"]
