@@ -4243,7 +4243,9 @@ def _snapshot_previous_export_metadata(save_directory):
 
     config.json, the index, the tokenizer and generation config are rewritten before any shard
     is fetched, so a rollback of the shards alone would pair them with the new metadata.
-    Returns {path: bytes}; None when a file cannot be read, so no rollback is attempted.
+    Returns {path: bytes}, with a top level link recorded as {path: link target (str)} so the
+    rollback puts the link back instead of removing it; None when a file cannot be read, so no
+    rollback is attempted.
     """
     metadata = {}
     try:
@@ -4251,7 +4253,10 @@ def _snapshot_previous_export_metadata(save_directory):
             path = os.path.join(save_directory, name)
             if name.endswith(".safetensors") or name.startswith(_PREVIOUS_EXPORT_PREFIX):
                 continue
-            if os.path.islink(path) or not os.path.isfile(path):
+            if os.path.islink(path):
+                metadata[path] = os.readlink(path)
+                continue
+            if not os.path.isfile(path):
                 continue
             if os.path.getsize(path) > _PREVIOUS_EXPORT_METADATA_MAX:
                 return None
@@ -4314,8 +4319,16 @@ def _restore_previous_export_shards(kept):
             os.remove(path)
     for path, payload in metadata.items():
         staged = path + ".unsloth-restore"
-        with open(staged, "wb") as f:
-            f.write(payload)
+        if isinstance(payload, str):
+            # A link the previous export held: leave it if the refresh kept it, else relink it.
+            if os.path.islink(path) and os.readlink(path) == payload:
+                continue
+            if os.path.lexists(staged):
+                os.remove(staged)
+            os.symlink(payload, staged)
+        else:
+            with open(staged, "wb") as f:
+                f.write(payload)
         os.replace(staged, path)
     _drop_previous_export_shards(kept)
 pass

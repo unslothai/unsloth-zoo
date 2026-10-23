@@ -639,3 +639,43 @@ def test_previous_export_backup_names_cannot_collide_with_shards(tmp_path):
     assert sorted(os.listdir(out)) == sorted(names)
     for name in names:
         assert (out / name).read_bytes() == name.encode()
+
+
+@pytest.mark.parametrize("refresh", ["keeps_link", "replaces_link", "removes_link"])
+def test_rollback_keeps_previous_export_metadata_links(tmp_path, refresh):
+    # A top level metadata link the previous export held (tokenizer.model shared with another
+    # folder) is not a file the failed refresh added: the rollback must leave it as it was.
+    from unsloth_zoo import saving_utils as S
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "tokenizer.model").write_bytes(b"shared tokenizer")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "model.safetensors").write_bytes(b"previous shard")
+    (out / "config.json").write_bytes(b"previous config")
+    target = os.path.join("..", "shared", "tokenizer.model")
+    os.symlink(target, out / "tokenizer.model")
+
+    metadata = S._snapshot_previous_export_metadata(str(out))
+    kept = S._keep_previous_export_shards(
+        ["model.safetensors"], str(out), {"model.safetensors" : 1}, metadata)
+    assert kept
+    # The refresh rewrites the metadata, adds a file and starts on the shard.
+    (out / "config.json").write_bytes(b"new config")
+    (out / "added.json").write_bytes(b"new file")
+    if refresh != "keeps_link":
+        os.remove(out / "tokenizer.model")
+    if refresh == "replaces_link":
+        (out / "tokenizer.model").write_bytes(b"new tokenizer")
+    os.replace(out / "added.json", out / "model.safetensors.tmp")
+    os.replace(out / "model.safetensors.tmp", out / "model.safetensors")
+
+    S._restore_previous_export_shards(kept)
+    assert sorted(os.listdir(out)) == ["config.json", "model.safetensors", "tokenizer.model"]
+    assert os.path.islink(out / "tokenizer.model")
+    assert os.readlink(out / "tokenizer.model") == target
+    assert (out / "tokenizer.model").read_bytes() == b"shared tokenizer"
+    assert (out / "config.json").read_bytes() == b"previous config"
+    assert (out / "model.safetensors").read_bytes() == b"previous shard"
+    assert (shared / "tokenizer.model").read_bytes() == b"shared tokenizer"
