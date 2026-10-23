@@ -5279,9 +5279,11 @@ _QWEN4_FORWARD_CONTRACT = {
 
 class SpeculativeFamily(NamedTuple):
     """`language`'s forward object `target`, a `module.forward` entered at `entry` ("verify", or "__call__" when it also
-    decodes), served once `contract` holds. `capabilities` maps the further optimizations its arithmetic admits,
-    "attention", "lanes" and "invariant_attention" (its one-token decode attention body), to the bodies each pins
-    apart (the lanes' own contract is the kernel's)."""
+    decodes), served once `contract` holds. The fused gated-delta block takes `gdn_layer`s with a `gdn_norm` once
+    `gdn_contract` holds and `gdn_qk_eps(normalize)` gives each layer's q/k epsilon from the forward's normalization.
+    `capabilities` maps the further optimizations its arithmetic admits, "attention", "lanes" and
+    "invariant_attention" (its one-token decode attention body), to the bodies each pins apart (the lanes' own
+    contract is the kernel's)."""
     language: str
     target: str
     module: str
@@ -5289,6 +5291,11 @@ class SpeculativeFamily(NamedTuple):
     entry: str
     submit_layers: bool
     contract: dict
+    gdn_layer: str
+    gdn_norm: str
+    gdn_contract: dict
+    gdn_qk_eps: Callable
+    gdn_l2: bool = False
     capabilities: dict = {}
 
 
@@ -5458,32 +5465,66 @@ def _taped_update(native, with_states):
     return gated_delta_update
 
 
+def _committed_lengths(lengths):
+    if isinstance(lengths, int):
+        return lengths
+    return [int(value) for value in (lengths.reshape(-1).tolist() if isinstance(lengths, mx.array) else lengths)]
+
+
+def _replay_tapes(tapes, lengths, length):
+    counts = {lengths} if isinstance(lengths, int) else set(lengths)
+    # Retaining all or none, stock committed the final or the entry state itself.
+    if counts == {length} or counts == {0}:
+        return
+    # Otherwise stock selected from a stand-in history; the retained state is the replayed prefix.
+    retained = None
+    for cache, index, replay, mask, folds in tapes:
+        rows = [lengths] * replay.args[0].shape[0] if isinstance(lengths, int) else lengths
+        cache[index] = replay(mask = _retained_mask(rows, length, mask))[1]
+        if folds:  # the next fused block can advance from the replay's own entry instead
+            if retained is None:
+                retained = mx.array(rows, mx.uint32)
+            cache._unsloth_pending = (cache[index], replay, retained)
+
+
 @functools.cache
 def _taped_transaction_class(base):
     def commit(self, lengths):
-        if not isinstance(lengths, int):
-            lengths = [int(value) for value in (lengths.reshape(-1).tolist() if isinstance(lengths, mx.array) else lengths)]
+        lengths = _committed_lengths(lengths)
         base.commit(self, lengths)
-        tapes = self.__dict__.pop("_unsloth_tapes", ())
-        counts = {lengths} if isinstance(lengths, int) else set(lengths)
-        # Retaining all or none, stock committed the final or the entry state itself.
-        if counts == {self.length} or counts == {0}:
-            return
-        # Otherwise stock selected from a stand-in history; the retained state is the replayed prefix.
-        retained = None
-        for cache, index, replay, mask, folds in tapes:
-            rows = [lengths] * replay.args[0].shape[0] if isinstance(lengths, int) else lengths
-            cache[index] = replay(mask = _retained_mask(rows, self.length, mask))[1]
-            if folds:  # the next fused block can advance from the replay's own entry instead
-                if retained is None:
-                    retained = mx.array(rows, mx.uint32)
-                cache._unsloth_pending = (cache[index], replay, retained)
+        _replay_tapes(self.__dict__.pop("_unsloth_tapes", ()), lengths, self.length)
 
     def abort(self):
         self.__dict__.pop("_unsloth_tapes", None)
         base.abort(self)
 
     return type(f"_Taped{base.__name__}", (base,), {"commit": commit, "abort": abort})
+
+
+# A forward entered at `__call__` never sees the transaction, so its taped caches replay on their own commit.
+_CACHE_TAPE_CONTRACT = {**_VERIFY_TAPE_CONTRACT, "mlx_vlm.models.cache": {
+    **_VERIFY_TAPE_CONTRACT["mlx_vlm.models.cache"], "ArraysCache.start_speculation": "ef020ee767e8a8fc",
+    "ArraysCache.abort_speculation": "b029b95363a7f3ff"}}
+
+
+@functools.cache
+def _taped_cache_class(base):
+    def commit_speculation(self, lengths, generation = None):
+        lengths, speculation, length = _committed_lengths(lengths), self._speculation, self.history_capacity
+        base.commit_speculation(self, lengths, generation)
+        self.__class__ = base
+        taped, tapes = self.__dict__.pop("_unsloth_tapes")
+        if taped is speculation:  # not a later block this cache started without committing the taped one
+            _replay_tapes(tapes, lengths, length)
+
+    def abort_speculation(self, generation = None):
+        base.abort_speculation(self, generation)
+        self.__class__ = base
+        self.__dict__.pop("_unsloth_tapes", None)
+
+    return type(f"_Taped{base.__name__}", (base,), {"commit_speculation": commit_speculation,
+                                                   "abort_speculation": abort_speculation,
+                                                   "_unsloth_tape_native": base})
 
 
 # A verify block's convolution through gated norm in one launch per head, the decode step's arithmetic per row:
@@ -5537,6 +5578,22 @@ _VERIFY_GDN_SOURCE = """
 
     for (uint r = sg; r < 2 * L; r += TY) {
         threadgroup T* x = r < L ? qs + r * Dk : ks + (r - L) * Dk;
+        if (QK_L2) {
+            // qwen4_exp's L2 norm in T, its row sum as MLX's: each lane's four squares, then the simdgroup.
+            T vals[4];
+            T total = static_cast<T>(0);
+            for (int i = 0; i < 4; i++) {
+                vals[i] = x[lane * 4 + i];
+                total = Add()(Square()(vals[i]), total);
+            }
+            total = simd_sum(total);
+            T inv = Rsqrt()(Add()(total, static_cast<T>(qk_eps[0])));
+            for (int i = 0; i < 4; i++) {
+                T normed = Multiply()(vals[i], inv);
+                x[lane * 4 + i] = r < L ? Multiply()(normed, q_scale[0]) : normed;
+            }
+            continue;
+        }
         T scale = r < L ? q_scale[0] : k_scale[0];
         float thread_x[4];
         float acc = 0;
@@ -5607,8 +5664,8 @@ _VERIFY_GDN_SOURCE = """
             uint d = lane * 4 + i, o = ((row * L + t) * Hv + hv) * Dv + d;
             T normed = norm_weight[d] * static_cast<T>(static_cast<float>(ys[t * Dv + d]) * inv);
             float zf = static_cast<float>(z[o]);
-            float silu = Multiply()(zf, Sigmoid()(zf));
-            y[o] = static_cast<T>(Multiply()(silu, static_cast<float>(normed)));
+            float gate = SIGMOID_GATE ? Sigmoid()(zf) : Multiply()(zf, Sigmoid()(zf));
+            y[o] = static_cast<T>(Multiply()(gate, static_cast<float>(normed)));
         }
     }
 """
@@ -5692,6 +5749,23 @@ _VERIFY_GDN_CONTRACT = {
                                            "_make_gated_delta_with_states_kernel": "95debad27edcc930"},
     "mlx.nn": {"silu": "78867fdb7e42731c", "softplus": "4d48a9bee57aeadd", "Conv1d.__call__": "e6c4e02415104dd1"},
 }
+# qwen4_exp's L2 q/k norm, epsilon after the sum, and its sigmoid or SiLU gated norm. The normalization is
+# compiled, which leaves no globals to pin: the contract pins its name and `_QWEN4_QK_NORM` its body.
+_QWEN4_VERIFY_GDN_CONTRACT = {**_VERIFY_GDN_CONTRACT, "mlx_vlm.models.qwen4_exp.language": {
+    "Qwen4ExpBatchInvariantForward._normalize_gated_delta_qk": "e6ee65b778220bf3",
+    "_qwen4_normalize_gated_delta_qk": None, "Qwen4ExpRMSNormGated.__call__": "46820c5ac7651e4c"}}
+_QWEN4_QK_NORM = "405c5c572ed60e76"
+
+
+def _qwen3_5_qk_eps(normalize):
+    return _VERIFY_QK_EPS.get(_ast_fingerprint(normalize))
+
+
+def _qwen4_qk_eps(normalize):
+    compiled = normalize.__globals__.get("_qwen4_normalize_gated_delta_qk")
+    return (lambda layer: 1e-6) if _ast_fingerprint(compiled) == _QWEN4_QK_NORM else None
+
+
 _VERIFY_GDN_VERDICTS = {}
 _VERIFY_GDN_FOLDS = {}
 
@@ -5726,10 +5800,13 @@ def _verify_gdn_tree_kernel(fold = False):
         compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_TREE_FOLD_SOURCE if fold else _VERIFY_GDN_TREE_SOURCE)
 
 
-def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads, pending, tree = None):
+def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads,
+                       pending, l2 = False, sigmoid = False, tree = None):
     B, L, value_heads, Dv = z.shape
     Dk, dtype = state.shape[-1], conv_input.dtype
     q_scale, k_scale, qk_norm_eps, norm_eps = _decode_step_scalars(Dk, dtype, qk_eps, eps)
+    if l2:  # q's one scale is k's RMSNorm one, the head width's -1/2 power in T
+        q_scale = k_scale
     extra = [state.shape] if pending else []
     kernel = _verify_gdn_kernel(bool(pending)) if tree is None else _verify_gdn_tree_kernel(bool(pending))
     rows = [] if tree is None else [tree.depth, tree.path, tree.fork, tree.back]
@@ -5738,23 +5815,23 @@ def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight,
                   state, L, *rows, *pending],
         template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[1]),
                     ("LMAX", _VERIFY_GDN_MAX_ROWS), ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv),
-                    ("TY", _VERIFY_GDN_ROWS)],
+                    ("TY", _VERIFY_GDN_ROWS), ("QK_L2", l2), ("SIGMOID_GATE", sigmoid)],
         grid = (32, _VERIFY_GDN_ROWS, B * value_heads), threadgroup = (32, _VERIFY_GDN_ROWS, 1),
         output_shapes = [z.shape, state.shape, (B, L, key_heads, Dk), (B, L, key_heads, Dk), z.shape, *extra],
         output_dtypes = [dtype, state.dtype, dtype, dtype, dtype, *(state.dtype for _ in extra)],
     )
 
 
-def _verify_gdn_block(*args, tree = None):
-    return _verify_gdn_launch(*args, (), tree)
+def _verify_gdn_block(*args, l2 = False, sigmoid = False, tree = None):
+    return _verify_gdn_launch(*args, (), l2, sigmoid, tree)
 
 
-def _verify_gdn_folded_block(*args, pending, tree = None):
+def _verify_gdn_folded_block(*args, pending, l2 = False, sigmoid = False, tree = None):
     """`_verify_gdn_block` from the entry state of a block whose retained prefix was not replayed yet, given that
     block's k, v, a, b and each row's retained count; it also returns the state after that prefix. Below a draft tree,
     `pending` also names the block rows the retained path took."""
     k, v, a, b, rows, *path = pending
-    return _verify_gdn_launch(*args, (k, v, a, b, rows, *(path or [k.shape[1]])), tree)
+    return _verify_gdn_launch(*args, (k, v, a, b, rows, *(path or [k.shape[1]])), l2, sigmoid, tree)
 
 
 def _tree_attention(queries, keys, values, scale, tree):
@@ -5765,8 +5842,8 @@ def _verify_gdn_fits(layer, inputs, mask, cache):
     """Whether the fused block can take this unmasked block, before its projections run."""
     batch, length = inputs.shape[:2]
     K, Dk, Dv, Hv = layer.conv_kernel_size, layer.head_k_dim, layer.head_v_dim, layer.num_v_heads
-    conv, norm, language = layer.conv1d, layer.norm, sys.modules.get("mlx_vlm.models.qwen3_5.language")
-    if (mask is not None or cache is None or layer.training or language is None or mx.default_device() != mx.gpu
+    conv, norm = layer.conv1d, layer.norm
+    if (mask is not None or cache is None or layer.training or mx.default_device() != mx.gpu
             or not 3 <= length <= _VERIFY_GDN_MAX_ROWS
             or getattr(cache, "history_capacity", 0) != length or Dk != 128 or Dv != 128 or not 2 <= K <= 8
             or Hv % layer.num_k_heads or inputs.dtype not in (mx.bfloat16, mx.float16)):
@@ -5774,11 +5851,12 @@ def _verify_gdn_fits(layer, inputs, mask, cache):
     state = cache[1]
     if state is not None and (state.shape != (batch, Hv, Dv, Dk) or state.dtype != mx.float32):
         return False
+    norms = [getattr(sys.modules.get(family.language), family.gdn_norm, None) for family in SPECULATIVE_FAMILIES.values()]
     return (type(conv) is nn.Conv1d and "bias" not in conv and conv.weight.shape == (layer.conv_dim, K, 1)
             and conv.weight.dtype == inputs.dtype and conv.groups == layer.conv_dim
             and (conv.stride, conv.padding, conv.dilation) == (1, 0, 1)
-            and type(norm) is language.Qwen3_5RMSNormGated and norm.weight.shape == (Dv,)
-            and norm.weight.dtype == inputs.dtype and layer.A_log.shape == (Hv,) and layer.dt_bias.shape == (Hv,)
+            and type(norm) in norms and norm.weight.shape == (Dv,) and norm.weight.dtype == inputs.dtype
+            and layer.A_log.shape == (Hv,) and layer.dt_bias.shape == (Hv,)
             and all(t.dtype in (mx.float32, mx.bfloat16, mx.float16) for t in (layer.A_log, layer.dt_bias)))
 
 
@@ -5806,7 +5884,7 @@ def _verify_gdn_folded(key, folded, fused, entry):
     return reference
 
 
-def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
+def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = False):
     """The verifier's `_gated_delta` for a block `_verify_gdn_fits` took, its convolution through gated norm fused
     once a first block matched the stock ops bit for bit; the commit replays the kernel's q/k/v like a taped block's.
     A block on a partly retained one's unevaluated replay starts from that block's entry state instead, once a first
@@ -5824,15 +5902,16 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
     pending = cache.__dict__.pop("_unsloth_pending", None)
     retained_path = cache.__dict__.pop("_unsloth_pending_path", None)
     tree = getattr(_VERIFY_STATE, "tree", None)
+    sigmoid = getattr(layer.norm, "activation", None) == "sigmoid"
     key = (length, Hk, layer.num_v_heads, K, dtype, a.dtype, b.dtype, layer.A_log.dtype, layer.dt_bias.dtype,
-           getattr(initial, "dtype", None), qk_eps, layer.norm.eps)
+           getattr(initial, "dtype", None), qk_eps, layer.norm.eps, l2, sigmoid)
     verdict = _VERIFY_GDN_VERDICTS.get(key)
     fits = all(t.dtype == dtype for t in (z, a, b)) and a.shape == b.shape == (batch, length, layer.num_v_heads)
     block = lambda state: (
         conv_input, layer.conv1d.weight.reshape(layer.conv_dim, K), a, b, layer.A_log, layer.dt_bias, z,
         layer.norm.weight, qk_eps, layer.norm.eps,
         mx.zeros((batch, layer.num_v_heads, Dv, layer.head_k_dim), mx.float32) if state is None else state, Hk)
-    fused = lambda state: _verify_gdn_block(*block(state), tree = tree)
+    fused = lambda state: _verify_gdn_block(*block(state), l2 = l2, sigmoid = sigmoid, tree = tree)
     # A passed check holds the key of the replay its commit relies on.
     if fits and verdict and _TAPE_VERDICTS.get(verdict):
         fold = None
@@ -5846,7 +5925,7 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps):
                     # A tree reads the retained rows in place; a chain block reads the replay's own gathered ones.
                     retained = (*retained[:4], rows, attention._invariant_depths(pending_k.shape[1])) if retained_path is None else (*retained_path[:4], rows, retained_path[4])
                 fold = (*key, retained[0].shape[1], tree is not None), lambda: _verify_gdn_folded_block(
-                    *block(pending_entry), pending = retained, tree = tree)
+                    *block(pending_entry), pending = retained, l2 = l2, sigmoid = sigmoid, tree = tree)
 
         def update(entry, steps):
             if fold is not None:
@@ -6312,22 +6391,25 @@ def _exact_verify_class(base, name, *cache_key):
     if bindings is None or eligible is None:
         return None
     native_entry = getattr(base, entry)
-    tape_bindings = _resolved_bindings(_VERIFY_TAPE_CONTRACT)
-    gated_delta, kernels = vars(base).get("_gated_delta"), sys.modules.get("mlx_vlm.models.qwen3_5.gated_delta")
+    tape_bindings = _resolved_bindings(_VERIFY_TAPE_CONTRACT if entry == "verify" else _CACHE_TAPE_CONTRACT)
+    # A family's forward may inherit the pinned Qwen3.5 body.
+    forward = getattr(sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier"), "Qwen3_5BatchInvariantForward", None)
+    gated_delta, kernels = getattr(base, "_gated_delta", None), sys.modules.get("mlx_vlm.models.qwen3_5.gated_delta")
     taped = None
-    if (entry == "verify" and tape_bindings is not None and gated_delta is not None and kernels is not None
+    if (tape_bindings is not None and gated_delta is not None and kernels is not None
+            and gated_delta is getattr(forward, "_gated_delta", None)
             and gated_delta.__globals__.get("gated_delta_update") is kernels.gated_delta_update):
         route = _taped_update(kernels.gated_delta_update, kernels.gated_delta_update_with_states)
         taped = FunctionType(gated_delta.__code__, {**gated_delta.__globals__, "gated_delta_update": route},
                              gated_delta.__name__, gated_delta.__defaults__, gated_delta.__closure__)
-    fused_bindings = None
+    fused_bindings, l2 = None, family.gdn_l2
     if taped is not None and os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") != "0" and _verify_gdn_kernel():
-        fused_bindings = _resolved_bindings(_VERIFY_GDN_CONTRACT)
+        fused_bindings = _resolved_bindings(family.gdn_contract)
         normalize = getattr(base, "_normalize_gated_delta_qk", None)
-        forward = getattr(sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier"), "Qwen3_5BatchInvariantForward", None)
-        qk_eps_of = (fused_bindings is not None and normalize is not None
-                     and normalize is getattr(forward, "_normalize_gated_delta_qk", None)
-                     and _VERIFY_QK_EPS[_ast_fingerprint(normalize)])
+        try:
+            qk_eps_of = fused_bindings is not None and normalize is not None and family.gdn_qk_eps(normalize)
+        except (OSError, TypeError, SyntaxError, AttributeError):
+            qk_eps_of = None
         fused_bindings = fused_bindings if qk_eps_of else None
 
     def verify(self, language_model, inputs, *, cache = None, **kwargs):
@@ -6346,14 +6428,26 @@ def _exact_verify_class(base, name, *cache_key):
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer, outer_tapes
 
     def entered(self, language_model, *args, **kwargs):
-        outer, outer_plain = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "plain_decode", False)
+        outer, outer_tapes = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
+        outer_plain = getattr(_VERIFY_STATE, "plain_decode", False)
         _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
                                      and not language_model.training and _bindings_intact(bindings))
         _VERIFY_STATE.plain_decode = "_unsloth_speculative_call" not in language_model.__dict__
+        # The entry also runs decode steps: only a block some cache holds a speculative window for is taped.
+        _VERIFY_STATE.tapes = ([] if _VERIFY_STATE.serving and taped is not None
+                               and any(getattr(entry, "history_capacity", 0) for entry in kwargs.get("cache") or ())
+                               and _bindings_intact(tape_bindings) else None)
         try:
-            return native_entry(self, language_model, *args, **kwargs)
+            output = native_entry(self, language_model, *args, **kwargs)
+            caches = {}
+            for tape in _VERIFY_STATE.tapes or ():
+                caches.setdefault(id(tape[0]), (tape[0], []))[1].append(tape)
+            for cache, tapes in caches.values():
+                cache.__class__ = _taped_cache_class(getattr(type(cache), "_unsloth_tape_native", type(cache)))
+                cache._unsloth_tapes = (cache._speculation, tapes)
+            return output
         finally:
-            _VERIFY_STATE.serving, _VERIFY_STATE.plain_decode = outer, outer_plain
+            _VERIFY_STATE.serving, _VERIFY_STATE.tapes, _VERIFY_STATE.plain_decode = outer, outer_tapes, outer_plain
 
     def taped_gated_delta(self, layer, inputs, mask, cache):
         if getattr(_VERIFY_STATE, "tapes", None) is None:
@@ -6361,7 +6455,7 @@ def _exact_verify_class(base, name, *cache_key):
         if fused_bindings is not None and _verify_gdn_fits(layer, inputs, mask, cache) and _bindings_intact(fused_bindings):
             qk_eps = qk_eps_of(layer)
             if qk_eps is not None:
-                return _verify_gdn(self, layer, inputs, cache, route, kernels.gated_delta_update_with_states, qk_eps)
+                return _verify_gdn(self, layer, inputs, cache, route, kernels.gated_delta_update_with_states, qk_eps, l2)
         if getattr(_VERIFY_STATE, "tree", None) is not None:
             raise RuntimeError("a draft tree's gated delta layers need the fused verify block")
         return taped(self, layer, inputs, mask, cache)
@@ -6568,7 +6662,8 @@ def exact_batch_invariant_decode(model, *, _modules = None):
     As `exact_speculative_verify` does for the Qwen3.5 verifier, frozen quantized projections in blocks wider than
     eight rows run over balanced row slices and sparse blocks' routed experts run on the decode kernels, each once its
     first call of that shape matched the native call bit for bit; affine projections of multi-row blocks run their
-    rows together as there. The forward already submits each layer. Only calls
+    rows together as there. A speculative block's gated-delta layers are taped and fused as the Qwen3.5 verifier's
+    are, each cache replaying its retained prefix on its own commit. The forward already submits each layer. Only calls
     of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
     forward drifted, keep the native methods.
     """
@@ -9052,13 +9147,16 @@ SPECULATIVE_FAMILIES = {
         language = "mlx_vlm.models.qwen3_5.language", target = "_EXACT_SPECULATIVE_VERIFIER",
         module = "mlx_vlm.models.qwen3_5.speculative_verifier", forward = "Qwen3_5BatchInvariantForward",
         entry = "verify", submit_layers = True, contract = _EXACT_VERIFY_CONTRACT,
-        capabilities = {"attention": _EXACT_ATTENTION_CONTRACT, "lanes": {},
-                        "invariant_attention": _INVARIANT_ATTENTION_CONTRACT,
-                        "tree_verify": _TREE_VERIFY_CONTRACT}),
+        gdn_layer = "Qwen3_5GatedDeltaNet", gdn_norm = "Qwen3_5RMSNormGated", gdn_contract = _VERIFY_GDN_CONTRACT,
+        gdn_qk_eps = _qwen3_5_qk_eps, capabilities = {"attention": _EXACT_ATTENTION_CONTRACT, "lanes": {},
+                                                       "invariant_attention": _INVARIANT_ATTENTION_CONTRACT,
+                                                       "tree_verify": _TREE_VERIFY_CONTRACT}),
     "qwen4_exp": SpeculativeFamily(
         language = "mlx_vlm.models.qwen4_exp.language", target = "_QWEN4_BATCH_INVARIANT_FORWARD",
         module = "mlx_vlm.models.qwen4_exp.language", forward = "Qwen4ExpBatchInvariantForward",
-        entry = "__call__", submit_layers = False, contract = _QWEN4_FORWARD_CONTRACT),
+        entry = "__call__", submit_layers = False, contract = _QWEN4_FORWARD_CONTRACT,
+        gdn_layer = "Qwen4ExpGatedDeltaNet", gdn_norm = "Qwen4ExpRMSNormGated", gdn_contract = _QWEN4_VERIFY_GDN_CONTRACT,
+        gdn_qk_eps = _qwen4_qk_eps, gdn_l2 = True),
 }
 
 
@@ -9157,17 +9255,23 @@ def _warm_verify_gdn(model):
     """Build the fused verify block's pipeline for each linear-attention layer shape, and settle each block width's
     and each pair of widths' bitwise checks through the verifier for a model a drafter was built for: either would
     otherwise land in the first speculative replies."""
-    language = sys.modules.get("mlx_vlm.models.qwen3_5.language")
-    if (language is None or os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") == "0" or not hasattr(model, "named_modules")
+    # Whether a layer class takes the L2 q/k norm.
+    speculates = getattr(model, "_unsloth_speculates", False)
+    # A family decoding on its verify forward launches the block only in speculative calls.
+    l2_of = {getattr(sys.modules.get(family.language), family.gdn_layer, None): family.gdn_l2
+             for family in SPECULATIVE_FAMILIES.values() if speculates or family.entry == "verify"}
+    l2_of.pop(None, None)
+    if (not l2_of or os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") == "0" or not hasattr(model, "named_modules")
             or mx.default_device() != mx.gpu or not _verify_gdn_kernel()):
         return
     shapes = {}
     for _, layer in model.named_modules():
-        # Not qwen4_exp's subclass: its blocks verify through its own forward, which never launches the fused block.
-        if (type(layer) is language.Qwen3_5GatedDeltaNet and layer.head_k_dim == layer.head_v_dim == 128
+        l2 = l2_of.get(type(layer))
+        if (l2 is not None and layer.head_k_dim == layer.head_v_dim == 128
                 and not layer.num_v_heads % layer.num_k_heads and layer.conv1d.weight.dtype in (mx.bfloat16, mx.float16)):
             shapes.setdefault((layer.conv1d.weight.dtype, layer.A_log.dtype, layer.dt_bias.dtype, layer.conv_kernel_size,
-                               layer.num_k_heads, layer.num_v_heads), layer)
+                               layer.num_k_heads, layer.num_v_heads, l2,
+                               getattr(layer.norm, "activation", None) == "sigmoid"), layer)
     for shape, layer in list(shapes.items()):
         dtype, K, Hv, D, length = shape[0], layer.conv_kernel_size, layer.num_v_heads, layer.head_v_dim, 3
         gates = mx.zeros((1, length, Hv), dtype)
@@ -9175,17 +9279,19 @@ def _warm_verify_gdn(model):
             mx.eval(_verify_gdn_block(
                 mx.zeros((1, K - 1 + length, layer.conv_dim), dtype), layer.conv1d.weight.reshape(layer.conv_dim, K),
                 gates, gates, layer.A_log, layer.dt_bias, mx.zeros((1, length, Hv, D), dtype), layer.norm.weight, 1e-6,
-                layer.norm.eps, mx.zeros((1, Hv, D, D), mx.float32), layer.num_k_heads))
+                layer.norm.eps, mx.zeros((1, Hv, D, D), mx.float32), layer.num_k_heads, l2 = shape[-2],
+                sigmoid = shape[-1]))
         except (RuntimeError, ValueError) as error:
             _unless_failed_buffer(error)
             del shapes[shape]  # its blocks keep the verifier's ops
-    if getattr(model, "_unsloth_speculates", False):  # set by building a drafter for it
-        with exact_speculative_verify(model):
-            _settle_verify_gdn(model, language, shapes)
+    if speculates:
+        for name, family in SPECULATIVE_FAMILIES.items():
+            with _exact_forwards(model, (name,), None):
+                _settle_verify_gdn(model, getattr(sys.modules.get(family.language), family.target, None), shapes)
 
 
-def _settle_verify_gdn(model, language, shapes):
-    verifier, caches = getattr(language, "_EXACT_SPECULATIVE_VERIFIER", None), sys.modules.get("mlx_vlm.models.cache")
+def _settle_verify_gdn(model, verifier, shapes):
+    caches = sys.modules.get("mlx_vlm.models.cache")
     served = {id(layer) for _, owner in model.named_modules() if vars(owner).get("_unsloth_verify_scopes")
               for _, layer in owner.named_modules()}
     transactions, widths = sys.modules.get("mlx_vlm.speculative.cache_state"), range(3, _VERIFY_GDN_MAX_ROWS + 1)

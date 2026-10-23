@@ -1195,9 +1195,10 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, q
     launched, outputs, evaluated, block_fn, evaluate = [], [], [], inference._verify_gdn_block, mx.eval
 
     def recorded(*args, **variant):
-        # The template arguments a call picks (LMAX and TY are constants): input dtypes, taps, heads and head widths.
+        # The template arguments a call picks (LMAX and TY are constants): input dtypes, taps, heads, head widths and
+        # the q/k norm and gate variant.
         launched.append((*(x.dtype for x in args if isinstance(x, mx.array)), args[1].shape[1], args[6].shape[2],
-                         args[-1], args[6].shape[3], args[-2].shape[3]))
+                         args[-1], args[6].shape[3], args[-2].shape[3], variant.get("l2"), variant.get("sigmoid")))
         outputs.append(block_fn(*args, **variant))
         return outputs[-1]
     monkeypatch.setattr(inference, "_verify_gdn_block", recorded)
@@ -1269,10 +1270,17 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, q
     finally:
         mx.set_default_device(device)
     assert not launched
-    # Nor does a qwen4_exp load: its gated-delta layers verify through its own forward.
+    # A qwen4_exp load builds its L2 q/k norm and sigmoid gate variant only for a drafter, and settles each width through
+    # its own forward.
     monkeypatch.setattr(qwen4[0], "generate", lambda *args, **kwargs: None, raising = False)
+    monkeypatch.setattr(qwen4[0], "_unsloth_speculates", False, raising = False)
     inference.warm_inference(qwen4[0])
     assert not launched
+    monkeypatch.setattr(qwen4[0], "_unsloth_speculates", True, raising = False)
+    inference.warm_inference(qwen4[0])
+    assert {entry[-2:] for entry in launched} == {(True, True)}
+    settled = {key[0]: verdict for key, verdict in inference._VERIFY_GDN_VERDICTS.items() if key[-2]}
+    assert sorted(settled) == list(range(3, inference._VERIFY_GDN_MAX_ROWS + 1)) and all(settled.values())
 
 
 def test_the_fused_verify_block_takes_gpu_blocks_only(qwen_4bit):
@@ -1292,24 +1300,29 @@ def test_the_fused_verify_block_takes_gpu_blocks_only(qwen_4bit):
 
 
 @pytest.mark.parametrize("length", [3, 9])
-def test_the_fused_verify_block_matches_the_verifiers_ops_with_grouped_value_heads(length):
+@pytest.mark.parametrize("gate", [None, "sigmoid", "silu"])  # Qwen3.5's, or qwen4_exp's L2 q/k norm with either gate
+def test_the_fused_verify_block_matches_the_verifiers_ops_with_grouped_value_heads(length, gate):
     import mlx.nn as nn
     from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_update_with_states
     from mlx_vlm.models.qwen3_5.language import Qwen3_5RMSNormGated
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpBatchInvariantForward, Qwen4ExpRMSNormGated
     from unsloth_zoo.mlx.inference import _verify_gdn_block
     rows, Hk, Hv, D, K = 2, 2, 6, 128, 4
     C = (2 * Hk + Hv) * D
     rand = lambda seed, *shape: mx.random.normal(shape, key = mx.random.key(seed)).astype(mx.bfloat16)
-    conv, norm = nn.Conv1d(C, C, K, groups = C, bias = False), Qwen3_5RMSNormGated(D, eps = 1e-6)
+    forward = Qwen3_5BatchInvariantForward if gate is None else Qwen4ExpBatchInvariantForward
+    norm = Qwen3_5RMSNormGated(D, eps = 1e-6) if gate is None else Qwen4ExpRMSNormGated(D, eps = 1e-6, activation = gate)
+    conv = nn.Conv1d(C, C, K, groups = C, bias = False)
     conv.weight, norm.weight = rand(0, C, K, 1), 1 + 0.1 * rand(1, D)
     conv_input, a, b, z = rand(2, rows, K - 1 + length, C), rand(3, rows, length, Hv), rand(4, rows, length, Hv), rand(5, rows, length, Hv, D)
     A_log, dt_bias = mx.log(mx.arange(1, Hv + 1, dtype = mx.float32)), 1 + 0.1 * rand(6, Hv)
     state = 0.05 * mx.random.normal((rows, Hv, D, D), key = mx.random.key(7))
     q, k, v = [x.reshape(rows, length, h, D) for x, h in zip(mx.split(nn.silu(conv(conv_input)), [Hk * D, 2 * Hk * D], -1), (Hk, Hk, Hv))]
-    q, k = Qwen3_5BatchInvariantForward._normalize_gated_delta_qk(None, q, k)
+    q, k = forward._normalize_gated_delta_qk(None, q, k)
     out, final, _ = gated_delta_update_with_states(q, k, v, a, b, A_log, dt_bias, state, state_steps = 0)
-    got = _verify_gdn_block(conv_input, conv.weight.reshape(C, K), a, b, A_log, dt_bias, z, norm.weight, 1e-6, 1e-6, state, Hk)
+    got = _verify_gdn_block(conv_input, conv.weight.reshape(C, K), a, b, A_log, dt_bias, z, norm.weight, 1e-6, 1e-6, state, Hk,
+                            l2 = gate is not None, sigmoid = gate == "sigmoid")
     assert all(x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
                for x, y in zip(got, (norm(out, z), final, q, k, v)))
 
@@ -1473,8 +1486,66 @@ def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit
     assert projections and all(tags) and any(tag[2] for tag in tags)
 
 
-def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qwen4):
+def test_a_qwen4_verify_block_taped_and_fused_commits_what_stock_commits(qwen4, monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache, make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    (model, ids), width = qwen4, 5
+    lm, cache = model.language_model, make_prompt_cache(model.language_model)
+    lm(mx.array([ids[0][:24]]), cache = cache)
+    block, linear = mx.array([ids[0][24 : 24 + width]]), sum(layer.is_linear for layer in lm.layers)
+
+    def verify():
+        run = _clone(cache)
+        hidden, _, transaction, logits = lm.speculative_verify_logits(block, run, lambda logits: logits)
+        return run, transaction, SimpleNamespace(logits = logits, hidden_states = [hidden])
+
+    def verified(keep):
+        run, transaction, out = verify()
+        transaction.commit([keep]) if keep else transaction.abort()
+        return _state(out, run)
+    keeps = [2, 1, width - 1, width, 0]
+    native = [verified(keep) for keep in keeps]
+    monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+    fused, block_fn = [], inference._verify_gdn_block
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args, **variant: fused.append(variant) or block_fn(*args, **variant))
+    with inference.exact_batch_invariant_decode(model):
+        assert all(_same(expected, verified(keep)) for keep, expected in zip(keeps, native))
+        assert set(inference._TAPE_VERDICTS.values()) == {True} and len(inference._VERIFY_GDN_VERDICTS) == 1 and all(inference._VERIFY_GDN_VERDICTS.values())
+        checked = len(fused)
+        # Each gated-delta layer's cache holds its tapes until the commit replays them, then is a plain cache again.
+        run, transaction, out = verify()
+        taped = [entry for entry in run if "_unsloth_tapes" in vars(entry)]
+        assert len(taped) == linear == len(fused) - checked and {tuple(sorted(v.items())) for v in fused} == {(("l2", True), ("sigmoid", True), ("tree", None))}
+        transaction.commit([keeps[0]])
+        assert _same(native[0], _state(out, run)) and all(type(entry) is ArraysCache and "_unsloth_tapes" not in vars(entry) for entry in taped)
+        # A cache that started another block before committing the taped one commits that block alone.
+        run, transaction, _ = verify()
+        taped = [entry for entry in run if "_unsloth_tapes" in vars(entry)]
+        entry, held = taped[0], taped[0][1]
+        entry.start_speculation(width)
+        entry.commit_speculation([2])
+        assert entry[1] is held and type(entry) is ArraysCache
+        transaction.abort()
+        assert not any("_unsloth_tapes" in vars(entry) or type(entry) is not ArraysCache for entry in taped)
+        # A rebound cache method the replay relies on leaves blocks untaped.
+        for name in ("update_recurrent", "commit_speculation", "abort_speculation"):
+            with monkeypatch.context() as patch:
+                patch.setattr(ArraysCache, name, (lambda method: lambda self, *args, **kwargs: method(self, *args, **kwargs))(getattr(ArraysCache, name)))
+                run, transaction, _ = verify()
+                assert not any("_unsloth_tapes" in vars(entry) for entry in run), name
+                transaction.abort()
+        # The forward's decode steps are never taped, so they skip the block checks.
+        fits, fit = [], inference._verify_gdn_fits
+        monkeypatch.setattr(inference, "_verify_gdn_fits", lambda *args: fits.append(args) or fit(*args))
+        lm(mx.array([[ids[0][24]]]), cache = _clone(cache))
+        assert not fits and verify() and len(fits) == linear
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qwen4, scoped):
     from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
     from unsloth_zoo.mlx.generate import SamplingParams
     from unsloth_zoo.mlx.speculative import EngineRow, SpeculativeEngine
     (model, ids), greedy = qwen4, SamplingParams()
@@ -1492,12 +1563,14 @@ def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qw
         row.draft = object()  # a drafting row, so verify returns the hidden states an MTP head reads
     assert engine._invariant and engine._batch_rounds
     # Blocks of each row's own stream, kept raggedly, so a rejected tail left in any cache shows in the next block.
-    starts = [0, 0, 0]
+    starts, taped = [0, 0, 0], []
     for keeps in ((5, 2, 3), (1, 5, 2), (4, 3, 1)):
-        logits, hidden, transaction = engine._verify(mx.array([stream[start : start + 5] for stream, start in zip(streams, starts)]))
+        with inference.exact_batch_invariant_decode(model) if scoped else contextlib.nullcontext():
+            logits, hidden, transaction = engine._verify(mx.array([stream[start : start + 5] for stream, start in zip(streams, starts)]))
         assert all(_same([("logits", want_logits[:, start : start + 5]), ("hidden", want_hidden[:, start : start + 5])],
                          [("logits", logits[i : i + 1]), ("hidden", hidden[i : i + 1])])
                    for i, ((want_logits, want_hidden), start) in enumerate(zip(stepped, starts)))
+        taped.append(sum("_unsloth_tapes" in vars(entry) for entry in engine.cache))
         transaction.commit(list(keeps))
         for entry in engine.cache:  # as a round does after a ragged commit
             padding = getattr(entry, "left_padding", None)
@@ -1505,6 +1578,8 @@ def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qw
                 entry.left_padding = padding + 0
         starts = [start + keep for start, keep in zip(starts, keeps)]
     assert not any("keys" in vars(entry) for entry in engine.cache)  # the commit's view of the QSA keys is gone
+    # Served, each round's gated-delta layers committed through their tapes.
+    assert taped == [sum(layer.is_linear for layer in lm.layers) if scoped else 0] * 3
 
 
 @pytest.mark.parametrize("heads", [(24, 4), (16, 2), (8, 2)])
