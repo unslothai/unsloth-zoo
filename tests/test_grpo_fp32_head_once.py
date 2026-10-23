@@ -21,6 +21,7 @@ import types
 
 import pytest
 import torch
+from torch.overrides import TorchFunctionMode
 
 import unsloth_zoo.rl_replacements as _rl
 
@@ -28,8 +29,9 @@ HIDDEN, VOCAB, ROWS = 16, 64, 4
 
 
 class _Model(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, raw_logits = False):
         super().__init__()
+        self.raw_logits = raw_logits
         torch.manual_seed(0)
         self.emb = torch.nn.Embedding(VOCAB + 1, HIDDEN)
         self.head = torch.nn.Linear(HIDDEN, VOCAB, bias = False).to(torch.bfloat16).requires_grad_(False)
@@ -42,11 +44,14 @@ class _Model(torch.nn.Module):
         hidden = self.emb(input_ids)
         if logits_to_keep:
             hidden = hidden[:, -logits_to_keep:]
+        if self.raw_logits:
+            # A forward that ignores UNSLOTH_RETURN_HIDDEN_STATES: no projection through the head follows.
+            return types.SimpleNamespace(logits = hidden.to(torch.bfloat16) @ self.head.weight.t())
         return types.SimpleNamespace(logits = hidden)
 
 
-@pytest.mark.parametrize("fp32_head", [True, False])
-def test_mini_batches_share_one_fp32_head(monkeypatch, fp32_head):
+@pytest.mark.parametrize("fp32_head, raw_logits, expected", [(True, False, 1), (False, False, 0), (True, True, 0)])
+def test_mini_batches_share_one_fp32_head(monkeypatch, fp32_head, raw_logits, expected):
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "1")
@@ -65,25 +70,35 @@ def test_mini_batches_share_one_fp32_head(monkeypatch, fp32_head):
     trainer = types.SimpleNamespace(
         args = types.SimpleNamespace(unsloth_grpo_mini_batch = ROWS, unsloth_logit_chunk_multiplier = 1),
         processing_class = types.SimpleNamespace(pad_token_id = 0),
-        model = _Model(),
+        model = _Model(raw_logits),
         accelerator = types.SimpleNamespace(unwrap_model = lambda m, keep_fp32_wrapper = False: m, scaler = None),
         use_vllm = False,
         beta = 0.0,
         _autocast_dtype = torch.bfloat16,
     )
     input_ids = torch.randint(1, VOCAB, (ROWS, 6), generator = torch.Generator().manual_seed(0))
-    heads = {}
+    heads, casts = {}, []
 
     def pack(t):
         if t.numel() == VOCAB * HIDDEN:
             heads[t.untyped_storage().data_ptr()] = t.dtype
         return t
 
-    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+    class _CountHeadCasts(TorchFunctionMode):
+        def __torch_function__(self, func, types, args = (), kwargs = None):
+            out = func(*args, **(kwargs or {}))
+            if func is torch.Tensor.to and args[0].shape == (VOCAB, HIDDEN) and args[0].dtype != torch.float32 \
+                    and isinstance(out, torch.Tensor) and out.dtype == torch.float32:
+                casts.append(out)
+            return out
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t), _CountHeadCasts():
         _rl.grpo_accumulated_loss(
             trainer, input_ids, torch.ones_like(input_ids), 3, torch.ones(ROWS, 3, dtype = torch.long),
             torch.zeros(ROWS), None, None, loss_type = "dapo", num_items_in_batch = 3 * ROWS,
         )
     assert seen == [ROWS]
     fp32_copies = [d for d in heads.values() if d == torch.float32]
-    assert len(fp32_copies) == (1 if fp32_head else 0), heads
+    assert len(fp32_copies) == expected, heads
+    # Raw logits never project through the head, so nothing may cast it.
+    assert len(casts) == expected, len(casts)

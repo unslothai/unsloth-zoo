@@ -2682,8 +2682,8 @@ def grpo_accumulated_loss(
             lm_head, lm_head_bias = _zero3_head
 
         # UNSLOTH_VLLM_FP32_LM_HEAD: every projector casts the head to fp32. Cast once per call instead, so the
-        # mini-batches kept until the loss save one shared fp32 copy rather than one each. Cast lazily in
-        # _refresh_lm_head, which every scoring path calls after its forward, so the copy never overlaps one.
+        # mini-batches kept until the loss save one shared fp32 copy rather than one each. Cast only on the
+        # hidden-state branches, after the forward: raw-logit outputs never project through the head.
         import inspect as _inspect
         from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as _projector
         _fp32_lm_head = _inspect.signature(_projector).parameters["fp32_lm_head"].default
@@ -2705,12 +2705,11 @@ def grpo_accumulated_loss(
             nonlocal lm_head, lm_head_bias
             if _zero3_head is not None:
                 lm_head, lm_head_bias = _zero3_head
-                return _fp32_bind()
+                return
             from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fsdp_unshard
             unsloth_fsdp_unshard(output_embeddings)
             lm_head = output_embeddings.weight
             lm_head_bias = getattr(output_embeddings, "bias", None)
-            _fp32_bind()
 
         from unsloth_zoo.rl_replacements import grpo_truncated_support_kwargs
         _support_kwargs = grpo_truncated_support_kwargs(trainer)
@@ -3077,6 +3076,7 @@ def grpo_accumulated_loss(
                         _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0)
                         _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0)
                         if _pack_h.shape[-1] == lm_head.shape[1]:
+                            _fp32_bind()
                             if _need_entropy:
                                 _pack_sel, _pack_ent = _hidden_logps_and_entropies(_pack_h, _pack_tid, _pack_chunks)
                                 _pack_sel, _pack_ent = _pack_sel[0], _pack_ent[0]
@@ -3129,6 +3129,7 @@ def grpo_accumulated_loss(
                                 # returns raw logits whenever that one did, and the first
                                 # packed batch always lands here
                                 if _pack_rh.shape[-1] == lm_head.shape[1]:
+                                    _fp32_bind()
                                     _pack_rsel = chunked_hidden_states_selective_log_softmax(
                                         _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
                                         logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
@@ -3215,15 +3216,17 @@ def grpo_accumulated_loss(
                 # (hidden, lm_head, ids, chunks, ...), so pass a raw-logits helper with
                 # that same signature, which skips the lm_head matmul and the scale /
                 # softcap the forward already applied.
-                _pg_fn = chunked_hidden_states_selective_log_softmax
-                if lm_head_bias is not None:
-                    from functools import partial
-                    _pg_fn = partial(_pg_fn, lm_head_bias = lm_head_bias)
                 if _h.shape[-1] != lm_head.shape[1]:
                     def _pg_fn(_pg_h, _pg_lm, _pg_ids, _pg_n, _pg_lsm, _pg_lsd, _pg_lsc, _pg_t):
                         return chunked_selective_log_softmax(
                             _pg_h, _pg_ids, temperature = _pg_t, chunks = _pg_n,
                         )
+                else:
+                    _fp32_bind()
+                    _pg_fn = chunked_hidden_states_selective_log_softmax
+                    if lm_head_bias is not None:
+                        from functools import partial
+                        _pg_fn = partial(_pg_fn, lm_head_bias = lm_head_bias)
                 _pg_lp = _pg_layout.extract_logps(
                     _h, lm_head, _pg_fn,
                     _pg_chunks, logit_scale_multiply, logit_scale_divide,
@@ -3486,6 +3489,7 @@ def grpo_accumulated_loss(
             # skip scale/softcap (model forward already applied them).
             chunks = input_ids_chunk.shape[0] * multiplier
             if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
+                _fp32_bind()
                 if _need_entropy:
                     logps, entropies = _hidden_logps_and_entropies(new_hidden_states_chunk, completion_ids, chunks)
                     all_entropies_list.append(entropies)
