@@ -987,9 +987,10 @@ def _is_network_share(path: str) -> bool:
     return p.startswith("//")
 
 
-# A real video container never starts like this; a playlist would make ffmpeg open its entries
-# itself (file:// segments included), outside every check here.
-_PLAYLIST_HEADS = (b"#EXTM3U", b"<", b"ffconcat")
+# A real video container never starts like this (nor with whitespace or a BOM, which a padded
+# text document would); a playlist would make ffmpeg open its entries itself (file:// segments
+# included), outside every check here.
+_PLAYLIST_HEADS = (b"#EXTM3U", b"<", b"ffconcat", b"\xef\xbb\xbf", b" ", b"\t", b"\r", b"\n")
 
 
 def _refuse_playlist(path: str, source: str) -> None:
@@ -998,7 +999,7 @@ def _refuse_playlist(path: str, source: str) -> None:
 
 
 def _refuse_playlist_head(head: bytes, source: str) -> None:
-    if head.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(_PLAYLIST_HEADS):
+    if head.startswith(_PLAYLIST_HEADS):
         raise ValueError(f"Unsloth: Refusing a playlist or document as a video URL: `{source}`")
 
 

