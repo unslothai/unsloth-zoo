@@ -412,6 +412,13 @@ def _capture_entropy_weights(monkeypatch):
             return (entropies.to(torch.float32) * weights).sum()
 
     monkeypatch.setattr(rr, "UnslothGRPOEntropyBonus", _Bonus)
+    # The expected weights are TRL >= 1.10's; without a pin, a TRL < 1.10 install takes the legacy
+    # dapo branch, which needs num_items_in_batch that this fake trainer does not pass.
+    weights_fn = rr.grpo_entropy_bonus_weights
+    monkeypatch.setattr(
+        rr, "grpo_entropy_bonus_weights",
+        lambda *a, **k: weights_fn(*a, **{**k, "trl_version": "1.10.0"}),
+    )
     return captured
 
 
