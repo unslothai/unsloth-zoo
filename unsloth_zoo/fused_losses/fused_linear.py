@@ -1624,11 +1624,21 @@ if _OPS is None:
     _OPS = {}
     torch._unsloth_fused_linear_ops = _OPS
 
+_ASSERT_ASYNC_MSG = "msg" in torch.ops.aten._assert_async.overloads()
+
+
 def _ce_checked(hidden, weight, bias, targets, divisor, scaling, ignore_index, *args):
-    # Raise like F.cross_entropy (else it leaves the sum but stays in the divisor).
+    # Raise like F.cross_entropy (else it leaves the sum but stays in the divisor). On CUDA / ROCm a device-side
+    # assert, as F.cross_entropy's own: reading the check on the host would sync every training step.
     V = weight.shape[0]
     bad = (targets != ignore_index) & ((targets < 0) | (targets >= V))
-    if bool(bad.any()):
+    if targets.is_cuda:
+        ok = torch.logical_not(bad.any())
+        if _ASSERT_ASYNC_MSG:
+            torch._assert_async(ok, f"Unsloth: cross entropy target out of bounds for a vocabulary of {V}")
+        else:
+            torch._assert_async(ok)
+    elif bool(bad.any()):
         raise IndexError(f"Unsloth: cross entropy target {int(targets[bad][0])} is out of bounds for a vocabulary "
                          f"of {V} (ignore_index = {ignore_index}).")
     return _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, *args)

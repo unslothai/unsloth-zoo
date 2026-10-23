@@ -700,16 +700,42 @@ def test_fp16_tile_partials_do_not_overflow_without_fp32_out_gemm(monkeypatch, b
     assert h.grad.isfinite().all() and w.grad.isfinite().all()
 
 
-@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("bad", [-1, 64, 1000])
-def test_ce_rejects_out_of_range_targets(device, bad):
-    h, w, _, t = _make(device, torch.float32, 8, 16, 64)
+def test_ce_rejects_out_of_range_targets(bad):
+    h, w, _, t = _make("cpu", torch.float32, 8, 16, 64)
     t[0] = -100
     fused_linear_cross_entropy(h, w, None, t, divisor = 7.0)
     t[3] = bad
     with pytest.raises(IndexError, match = "out of bounds"):
         fused_linear_cross_entropy(h, w, None, t, divisor = 7.0)
     assert not fl._TRITON_BROKEN
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA only")
+@pytest.mark.parametrize("bad", [-1, 64])
+def test_ce_out_of_range_target_is_a_device_assert_on_cuda(bad):
+    # A device-side assert, like F.cross_entropy's: no host sync per call. It poisons the context, so run it apart.
+    import subprocess, sys, textwrap
+    script = textwrap.dedent(f"""
+        import torch
+        from unsloth_zoo.fused_losses.fused_linear import fused_linear_cross_entropy
+        h = torch.randn(8, 16, device = "cuda", requires_grad = True)
+        w = torch.randn(64, 16, device = "cuda")
+        t = torch.randint(0, 64, (8,), device = "cuda")
+        t[0] = -100
+        fused_linear_cross_entropy(h, w, None, t, divisor = 7.0)
+        torch.cuda.synchronize()
+        print("VALID_OK", flush = True)
+        t[3] = {bad}
+        fused_linear_cross_entropy(h, w, None, t, divisor = 7.0)
+        torch.cuda.synchronize()
+        print("NOT_RAISED", flush = True)
+    """)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH = root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    result = subprocess.run([sys.executable, "-c", script], capture_output = True, text = True, timeout = 600, env = env)
+    assert "VALID_OK" in result.stdout and "NOT_RAISED" not in result.stdout, (result.stdout, result.stderr[-3000:])
+    assert result.returncode != 0 and "out of bounds" in result.stderr, result.stderr[-3000:]
 
 
 def test_ce_rejects_invalid_label_smoothing():
