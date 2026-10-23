@@ -191,6 +191,44 @@ def test_the_fallback_returns_the_native_shapes_and_dtypes(monkeypatch):
     assert down.dtype == torch.bfloat16 and down.shape == (T, H)
 
 
+def _cancelling_problem(device = "cpu", terms = 2, value = 1.0):
+    """Every expert's product is 256 + 1 = 257 (not a bf16 value) and its bias -256: the exact answer is 1."""
+    module, x, logits = _problem(seed = 8)
+    x = torch.zeros(T, H, dtype = torch.bfloat16)
+    x[:, 0], x[:, 1] = 256, 1
+    module.gate_up_proj = torch.zeros(E, H, 2 * I, dtype = torch.bfloat16)
+    module.gate_up_proj[:, :2] = 1
+    module.down_proj = torch.zeros(E, I, H, dtype = torch.bfloat16)
+    module.down_proj[:, :2] = 1
+    module.gate_up_proj_bias = torch.full((E, 2 * I), -256.0)
+    module.down_proj_bias = torch.full((E, H), -256.0)
+    h = torch.zeros(T * K, I, dtype = torch.bfloat16)
+    h[:, 0], h[:, 1] = 256, 1
+    return module, x.to(device), h.to(device), logits
+
+
+def test_the_fallback_adds_the_bias_before_rounding():
+    # The native epilogue adds the fp32 bias to the fp32 accumulator; rounding 257 to bf16 (256) first gave 0.
+    module, x, h, logits = _cancelling_problem()
+    routing, gather, scatter, _, _ = _routing(logits)
+    gate_up = go._ogs_dequant_gate_up(x, module.gate_up_proj, module.gate_up_proj_bias, routing, gather, None)
+    assert torch.equal(gate_up.float(), torch.ones_like(gate_up, dtype = torch.float32))
+    down = go._ogs_dequant_down(h, routing.gate_scal, module.down_proj, module.down_proj_bias, routing, scatter, None)
+    torch.testing.assert_close(down.float(), torch.ones_like(down, dtype = torch.float32), rtol = 0, atol = 1e-2)
+
+
+def test_the_fallback_routing_weight_grad_uses_the_same_epilogue(monkeypatch):
+    module, x, h, logits = _cancelling_problem()
+    routing, gather, scatter, _, _ = _routing(logits)
+    module.down_proj_precision_config = None
+    monkeypatch.setattr(go, "_ogs_backend_for", lambda *args, **kwargs: None)
+    monkeypatch.setattr(go, "_ogs_native_training_ok", lambda *args, **kwargs: False)
+    gammas = routing.gate_scal.detach().clone().requires_grad_(True)
+    out = go._OgsDown.apply(h, gammas, module.down_proj_bias, module, routing, scatter)
+    out.float().sum().backward()
+    torch.testing.assert_close(gammas.grad.float(), torch.full_like(gammas.grad, H, dtype = torch.float32))
+
+
 class _NoGradExperts:
     """The LoRA-patched experts forward's view of a module: dense stacks, no adapters, a recording native forward."""
 

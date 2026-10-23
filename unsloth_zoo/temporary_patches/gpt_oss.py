@@ -2661,6 +2661,26 @@ def _ogs_module_backend(module):
         return None
 
 
+_OGS_MM_OUT_DTYPE = {}
+
+
+def _ogs_mm_fp32(a, b, bias = None):
+    """fp32 ``a @ b (+ bias)`` for bf16 inputs, bias added before any rounding like the native epilogue."""
+    key = a.device.type
+    if _OGS_MM_OUT_DTYPE.get(key, True):
+        try:
+            y = torch.mm(a, b, out_dtype = torch.float32)  # torch >= 2.8: bf16 inputs, fp32 output
+            _OGS_MM_OUT_DTYPE[key] = True
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except (TypeError, RuntimeError, NotImplementedError):
+            _OGS_MM_OUT_DTYPE[key] = False
+            y = a.float() @ b.float()
+    else:
+        y = a.float() @ b.float()
+    return y if bias is None else y + bias.float()
+
+
 def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_config):
     """matmul_ogs gate_up on bf16 decodes: ``x[src // k] @ W[e] + b[e]``."""
     k = routing_data.n_expts_act
@@ -2677,9 +2697,7 @@ def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_co
                 continue
             # Explicit bf16: an fp16 autocast would recast the matmul and overflow before the bias cancels it.
             with torch.autocast(device_type = x.device.type, enabled = False):
-                y = (x[rows[lo:hi] // k] @ dense[e - first]).float()
-            if bias is not None:
-                y = y + bias[e].float()
+                y = _ogs_mm_fp32(x[rows[lo:hi] // k], dense[e - first], None if bias is None else bias[e])
             out[lo:hi] = y.to(out.dtype)
         del dense
     return out
@@ -2701,9 +2719,7 @@ def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precis
                 continue
             # As above: fp16 autocast would overflow here before the routing weight scales it down.
             with torch.autocast(device_type = h.device.type, enabled = False):
-                y = (h[lo:hi] @ dense[e - first]).float()
-            if bias is not None:
-                y = y + bias[e].float()
+                y = _ogs_mm_fp32(h[lo:hi], dense[e - first], None if bias is None else bias[e])
             if gammas is not None:
                 y = y * gammas[lo:hi].float().unsqueeze(-1)
             where = dst[lo:hi]
@@ -2814,9 +2830,9 @@ class _OgsDown(torch.autograd.Function):
                 if need_h:
                     grad_h[lo:hi] = scaled[lo:hi] @ weight.t()
                 if need_gamma:
-                    y = (h[lo:hi] @ weight).float()
-                    if bias is not None:
-                        y = y + bias[e].float()
+                    # Same fp32 epilogue as the forward, so the routing-weight gradient matches it.
+                    with torch.autocast(device_type = h.device.type, enabled = False):
+                        y = _ogs_mm_fp32(h[lo:hi].to(torch.bfloat16), weight, None if bias is None else bias[e])
                     grad_gamma[lo:hi] = (grad_rows[lo:hi].float() * y).sum(-1)
                 if need_bias:
                     grad_bias[e] = scaled[lo:hi].float().sum(0)
