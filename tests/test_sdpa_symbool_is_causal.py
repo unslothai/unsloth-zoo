@@ -31,13 +31,22 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
 
-def test_symbool_is_causal_compiles_fullgraph():
+def test_symbool_is_causal_compiles_fullgraph(monkeypatch):
+    import transformers.integrations.sdpa_attention as sdpa_module
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
     import unsloth_zoo.temporary_patches.misc as misc
 
+    # The patch is a no-op under UNSLOTH_COMPILE_DISABLE=1, which the unsloth repo's Core zoo
+    # job sets for the whole suite; this test is about the patch, so it must not inherit that.
+    monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
+    # Installed globally; restore both slots so the rest of the worker sees stock SDPA.
+    monkeypatch.setattr(sdpa_module, "sdpa_attention_forward", sdpa_module.sdpa_attention_forward)
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS, "sdpa", ALL_ATTENTION_FUNCTIONS["sdpa"])
     misc.patch_sdpa_bool_causal_mask()
-    import transformers.integrations.sdpa_attention as sdpa_module
 
     forward = sdpa_module.sdpa_attention_forward
+    assert getattr(forward, "__unsloth_bool_causal_mask_fix__", False), "the patch did not install"
 
     class Layer(torch.nn.Module):
         is_causal = True
