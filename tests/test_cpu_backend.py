@@ -240,3 +240,17 @@ def test_cpu_backend_installs_the_datasets_path_guard():
     assert apply_cpu_security_patches() == ["patch_datasets_folder_metadata_file_name"]
     assert getattr(folder.FolderBasedBuilder._read_metadata, "_unsloth_file_name_guard", False)
     apply_cpu_security_patches()  # idempotent
+
+
+def test_generate_accepts_a_batch_encoding_as_input_ids():
+    """Notebook inference cells pass apply_chat_template(..., return_tensors = "pt") as input_ids."""
+    from transformers import BatchEncoding
+    from unsloth_zoo.cpu.loader import _unpack_encoding_generate
+    seen = {}
+    wrapped = _unpack_encoding_generate(lambda **kwargs: seen.update(kwargs) or "out")
+    ids = torch.tensor([[1, 2, 3]])
+    mask = torch.ones_like(ids)
+    assert wrapped(input_ids = BatchEncoding({"input_ids": ids, "attention_mask": mask}), max_new_tokens = 4) == "out"
+    assert seen["input_ids"] is ids and seen["attention_mask"] is mask and seen["max_new_tokens"] == 4
+    wrapped(input_ids = ids)
+    assert seen["input_ids"] is ids

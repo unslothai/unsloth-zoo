@@ -16,6 +16,7 @@
 
 __all__ = ["FastCPUModel"]
 
+import functools
 import os
 import re
 import types
@@ -286,11 +287,28 @@ class FastCPUModel:
 
     @staticmethod
     def _attach(model):
+        generate = getattr(model, "generate", None)
+        if generate is not None and not getattr(generate, "_unsloth_cpu", False):
+            model.generate = _unpack_encoding_generate(generate)
         model.for_training = types.MethodType(lambda self, *a, **k: FastCPUModel.for_training(self, *a, **k), model)
         model.for_inference = types.MethodType(lambda self: FastCPUModel.for_inference(self), model)
         model.save_pretrained_merged = types.MethodType(save_pretrained_merged, model)
         model.push_to_hub_merged = types.MethodType(push_to_hub_merged, model)
         model.save_pretrained_gguf = types.MethodType(save_pretrained_gguf, model)
+
+
+def _unpack_encoding_generate(generate):
+    """Notebooks pass `input_ids = tokenizer.apply_chat_template(..., return_tensors = "pt")`, which is a
+    BatchEncoding on transformers 5; generate() then fails on `.shape`. The GPU path unpacks it, so do the same."""
+    @functools.wraps(generate)
+    def wrapper(*args, **kwargs):
+        encoding = kwargs.get("input_ids", None)
+        if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
+            for key, value in kwargs.pop("input_ids").items():
+                kwargs.setdefault(key, value)
+        return generate(*args, **kwargs)
+    wrapper._unsloth_cpu = True
+    return wrapper
 
 
 def _merged_copy(model, save_method):
