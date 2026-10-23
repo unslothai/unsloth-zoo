@@ -389,6 +389,66 @@ def test_fetch_video_rejects_internal_url_before_touching_a_decoder(monkeypatch,
 
 @pytest.mark.parametrize(
     "url",
+    ["HTTP://127.0.0.1:9/clip.mp4", "Https://169.254.169.254/clip.mp4"],
+)
+def test_fetch_video_guards_upper_case_http_schemes(monkeypatch, no_network, url):
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError):
+        vision_utils.fetch_video({"video": url})
+    assert no_network == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "rtsp://10.0.0.5/stream",
+        "tcp://127.0.0.1:9",
+        "ftp://10.0.0.5/clip.mp4",
+        "smb://host/share/a.mp4",
+        "tcp:127.0.0.1:9",
+        "concat:/tmp/a.mp4|/tmp/b.mp4",
+        "subfile,,start,0,end,0,,:/tmp/a.mp4",
+    ],
+)
+def test_fetch_video_refuses_other_url_schemes_before_a_decoder(monkeypatch, no_network, url):
+    # ffmpeg dials these protocols itself, so they would bypass the guard.
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "unsupported scheme"):
+        vision_utils.fetch_video({"video": url})
+    assert no_network == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "C:\\data\\clip.mp4",
+        "C:/data/clip.mp4",
+        "/data/clip.mp4",
+        "clips/a.mp4",
+        "subfile,clip.mp4",
+        "file://C:/data/clip.mp4",
+        "\\\\?\\C:\\data\\clip.mp4",
+        "\\\\?\\Volume{b75e2c83-0000-0000-0000-602f00000000}\\videos\\clip.mp4",
+        "file:///tmp/clip.mp4",
+        "data:video/mp4;base64,AAAAIGZ0eXBpc29t",
+    ],
+)
+def test_fetch_video_local_paths_still_reach_the_decoder(monkeypatch, no_network, path):
+    seen = []
+
+    def decoder(ele):
+        seen.append(ele["video"])
+        raise RuntimeError("stop after the decoder is reached")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", lambda: "torchvision")
+    monkeypatch.setitem(vision_utils.VIDEO_READER_BACKENDS, "torchvision", decoder)
+    with pytest.raises(RuntimeError, match = "stop after"):
+        vision_utils.fetch_video({"video": path})
+    assert seen and seen[0] == path
+
+
+@pytest.mark.parametrize(
+    "url",
     [
         "http://%31%32%37.0.0.1:8080/x.png",
         "http://127%2e0%2e0%2e1:8080/x.png",
@@ -616,3 +676,66 @@ def test_backslash_anywhere_in_the_authority_is_refused(url, no_network):
     with pytest.raises(ValueError, match="backslash"):
         vision_utils.fetch_image({"image": url})
     assert no_network == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "\\\\attacker\\share\\clip.mp4",
+        "//attacker/share/clip.mp4",
+        "file://attacker/share/clip.mp4",
+        "file:///%5cattacker/share/clip.mp4",
+        "\\\\?\\UNC\\attacker\\share\\clip.mp4",
+        "\\\\?\\GLOBALROOT\\Device\\Mup\\attacker\\share\\clip.mp4",
+        "\\\\.\\GLOBALROOT\\Device\\LanmanRedirector\\attacker\\share\\clip.mp4",
+    ],
+)
+def test_fetch_video_refuses_network_share_paths(monkeypatch, no_network, path):
+    # Windows would open an SMB connection (and may send credentials) for these.
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "network share"):
+        vision_utils.fetch_video({"video": path})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n",
+        b'<?xml version="1.0"?>\n<!-- ' + b"x" * 4096 + b' -->\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+        b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n",
+        b" " * 70000 + b'<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+        b"\xef\xbb\xbf#EXTM3U\nfile://attacker/share/seg0.ts\n",
+    ],
+)
+def test_a_downloaded_playlist_never_reaches_the_decoder(monkeypatch, public_dns, tmp_path, body):
+    # ffmpeg opens a playlist's entries itself; a file:// segment would reach a share on Windows.
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(vision_utils.requests, "get", lambda url, **kwargs: _FakeResponse(body))
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "playlist"):
+        vision_utils.fetch_video({"video": "https://example.com/live.m3u8"})
+    assert not list(tmp_path.glob("unsloth_media_*"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n",
+        b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n",
+        b" " * 4096 + b'<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+    ],
+)
+@pytest.mark.parametrize("encoding", ["base64", "percent"])
+def test_an_inline_data_playlist_never_reaches_the_decoder(monkeypatch, no_network, body, encoding):
+    import base64
+    from urllib.parse import quote_from_bytes
+
+    if encoding == "base64":
+        uri = "data:video/mp4;base64," + base64.b64encode(body).decode()
+    else:
+        uri = "data:video/mp4," + quote_from_bytes(body)
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "playlist"):
+        vision_utils.fetch_video({"video": uri})
