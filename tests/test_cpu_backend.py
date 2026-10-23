@@ -694,3 +694,55 @@ def test_resize_model_vocab_is_applied(monkeypatch, tmp_path):
                                             resize_model_vocab = 70)
     assert model.get_input_embeddings().num_embeddings == 70
     assert model.get_output_embeddings().weight.shape[0] == 70
+
+
+def test_f32_gguf_is_staged_from_fp32_weights(monkeypatch, tmp_path):
+    import json
+    import unsloth_zoo.llama_cpp as llama_cpp
+    from unsloth_zoo.cpu import loader
+    staged = {}
+
+    def convert(prefix, merged, model_dtype, quantization_type, converter_location):
+        staged["dtype"] = json.load(open(os.path.join(merged, "config.json"))).get("torch_dtype") or \
+            json.load(open(os.path.join(merged, "config.json"))).get("dtype")
+        path = f"{prefix}.{quantization_type.upper()}.gguf"
+        open(path, "w").close()
+        return [path], None
+
+    monkeypatch.setattr(llama_cpp, "install_llama_cpp", lambda print_output = False: ("q", "c"))
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", convert)
+    out = loader.save_pretrained_gguf(_tiny_llama().float(), str(tmp_path / "m"), quantization_method = "f32")
+    assert [os.path.basename(p) for p in out] == ["m.F32.gguf"]
+    assert staged["dtype"] == "float32"
+
+
+def test_learned_position_tables_cap_max_seq_length(monkeypatch, tmp_path):
+    import transformers
+    from transformers import GPT2Config, GPT2LMHeadModel
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    GPT2LMHeadModel(GPT2Config(vocab_size = 64, n_positions = 32, n_embd = 32, n_layer = 1, n_head = 4)).save_pretrained(
+        tmp_path / "gpt2")
+    model, _ = FastCPUModel.from_pretrained(str(tmp_path / "gpt2"), max_seq_length = 128, load_in_4bit = False)
+    assert model.max_seq_length == 32
+    # RoPE models keep the requested length.
+    _tiny_llama().save_pretrained(tmp_path / "llama")
+    model, _ = FastCPUModel.from_pretrained(str(tmp_path / "llama"), max_seq_length = 128, load_in_4bit = False)
+    assert model.max_seq_length == 128
+
+
+def test_fp16_autocast_probe_works_with_the_device_less_api(monkeypatch):
+    from unsloth_zoo.cpu import ops
+
+    def device_less(*args):
+        if args:
+            raise TypeError("is_autocast_enabled() takes 0 positional arguments")
+        return False
+    with monkeypatch.context() as m:
+        m.setattr(torch, "is_autocast_enabled", device_less)
+        assert ops._cpu_fp16_autocast() is False
+    with torch.autocast("cpu", dtype = torch.float16):
+        with monkeypatch.context() as m:
+            # torch.autocast itself calls the real API on entry and exit, so stub only inside.
+            m.setattr(torch, "is_autocast_enabled", device_less)
+            assert ops._cpu_fp16_autocast() is True

@@ -185,6 +185,7 @@ class FastCPUModel:
                 kwargs.pop("quantization_config", None)
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
+        max_seq_length = _clamp_to_learned_positions(model, max_seq_length)
         tokenizer_kwargs = dict(
             token = token, revision = revision, trust_remote_code = trust_remote_code,
             model_max_length = max_seq_length, padding_side = "right",
@@ -390,6 +391,24 @@ def _adapter_base_model(model_name, token, revision, **hub_kwargs):
         return None
 
 
+def _clamp_to_learned_positions(model, max_seq_length):
+    """GPT-2 / OPT style learned position tables cannot be extended here (RoPE models can run past their
+    trained length), so a longer max_seq_length would index past the table during training."""
+    config = getattr(model, "config", None)
+    limit = getattr(config, "max_position_embeddings", None) or getattr(config, "n_positions", None)
+    if not isinstance(limit, int) or max_seq_length is None or max_seq_length <= limit:
+        return max_seq_length
+    inputs = model.get_input_embeddings()
+    learned = any(
+        isinstance(m, torch.nn.Embedding) and m is not inputs and limit <= m.num_embeddings <= limit + 2
+        for m in model.modules()
+    )
+    if learned:
+        _print(f"max_seq_length = {max_seq_length} is longer than this model's {limit} learned positions, using {limit}.")
+        return limit
+    return max_seq_length
+
+
 def _set_inference_mode(model, inference):
     """KV cache on and left padding for generate(), off and right padding for training, as on GPU."""
     inner = model
@@ -491,7 +510,14 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
         )
     os.makedirs(save_directory, exist_ok = True)
     merged_directory = os.path.join(save_directory, "merged_16bit")
-    save_pretrained_merged(self, merged_directory, tokenizer, save_method = "merged_16bit")
+    if "f32" in methods:
+        # An F32 GGUF must come from unrounded weights, not 16-bit ones upcast by the converter.
+        staged, _ = _merged_copy(self, "merged_32bit")
+        staged.save_pretrained(merged_directory)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(merged_directory)
+    else:
+        save_pretrained_merged(self, merged_directory, tokenizer, save_method = "merged_16bit")
     quantizer, converter = install_llama_cpp(print_output = False)
     base_name = os.path.basename(os.path.normpath(save_directory)) or "model"
     direct = {"bf16", "f16", "q8_0", "f32"}

@@ -30,6 +30,14 @@ import torch
 import torch.nn.functional as F
 
 
+def _cpu_fp16_autocast():
+    try:
+        return torch.is_autocast_enabled("cpu") and torch.get_autocast_dtype("cpu") == torch.float16
+    except TypeError:
+        # Older torch: the device-less CPU autocast API.
+        return torch.is_autocast_cpu_enabled() and torch.get_autocast_cpu_dtype() == torch.float16
+
+
 class _ChunkedLinearCrossEntropy(torch.autograd.Function):
     """sum CE(hidden @ weight.T, labels) / divisor without materialising the (rows, vocab) logits.
 
@@ -44,9 +52,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         need_hidden_grad = hidden.requires_grad
         need_weight_grad = weight.requires_grad
         # fp16 cannot hold these gradients before GradScaler multiplies them: keep them fp32 until backward.
-        exact = hidden.dtype == torch.float16 or (
-            torch.is_autocast_enabled("cpu") and torch.get_autocast_dtype("cpu") == torch.float16
-        )
+        exact = hidden.dtype == torch.float16 or _cpu_fp16_autocast()
         grad_dtype = torch.float32 if exact else hidden.dtype
         grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else None
         grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else None
