@@ -20,6 +20,7 @@ from .fla_vendor import *
 from .gdn_causal_conv1d import *
 from .gemma import *
 from .misc import *
+from .t5 import *
 from .granitemoehybrid import *
 from .gemma3n import *
 from .gemma4 import *
