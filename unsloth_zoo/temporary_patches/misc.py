@@ -603,6 +603,50 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
+def patch_ParakeetEncoderSubsamplingConv2D_input_dtype():
+    """Run the FastConformer subsampling (Parakeet, Canary) on 16-bit activations.
+
+    Unsloth's conv dtype wrapper casts a conv's input to its weight dtype and the result back to the
+    input's dtype, so float32 input_features kept the frozen conv stack in float32: twice autocast's
+    activation memory. Casting the features to the first conv's 16-bit weight dtype up front is bit
+    identical, since every conv already ran in that dtype and the ReLUs and 0/1 masks between them
+    are exact."""
+    try:
+        import transformers.models.parakeet.modeling_parakeet as modeling_parakeet
+    except Exception as e:
+        return raise_error("ParakeetEncoderSubsamplingConv2D.forward", e)
+    target_cls = getattr(modeling_parakeet, "ParakeetEncoderSubsamplingConv2D", None)
+    if target_cls is None:
+        return
+    storage_name = _get_unique_storage_name(target_cls, "forward")
+    if hasattr(target_cls, storage_name):
+        original_forward = getattr(target_cls, storage_name)
+    else:
+        original_forward = target_cls.forward
+        setattr(target_cls, storage_name, original_forward)
+    pass
+
+    def forward(self, input_features, *args, **kwargs):
+        layers = getattr(self, "layers", None)
+        weight = getattr(layers[0], "weight", None) if layers is not None and len(layers) else None
+        if (
+            type(input_features) is torch.Tensor
+            and input_features.dtype == torch.float32
+            and isinstance(weight, torch.Tensor)
+            and weight.dtype in (torch.float16, torch.bfloat16)
+        ):
+            input_features = input_features.to(weight.dtype)
+        return original_forward(self, input_features, *args, **kwargs)
+    pass
+    try:
+        forward.__signature__ = inspect.signature(original_forward)
+    except Exception:
+        pass
+    target_cls.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_ParakeetEncoderSubsamplingConv2D_input_dtype)
+
+
 # Compiled, `_ignore_causal_mask_sdpa` always refuses, so SDPA loses its `is_causal` kernels.
 # Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
 CAUSAL_MASK_SKIP_STATS = {"skipped": 0, "right_padded": 0}
