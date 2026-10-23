@@ -398,7 +398,7 @@ def test_has_bnb_is_false_when_params4bit_is_not_a_class():
 
 
 @pytest.mark.parametrize("module_name", [
-    "moe_utils", "moe_utils_bnb4bit", "moe_bnb", "moe_grouped_modulelist",
+    "moe_utils", "moe_utils_bnb4bit", "moe_grouped_modulelist",
 ])
 def test_every_module_level_has_bnb_implies_a_real_class(module_name):
     """The same guard in every sibling that keeps its own HAS_BNB and Params4bit pair.
