@@ -81,7 +81,9 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_output):
         grad_hidden, grad_weight = ctx.saved_tensors
         # Every label ignored: the loss is NaN like F.cross_entropy(mean), but its gradient is zero.
-        scale = grad_output / ctx.divisor if not math.isnan(ctx.divisor) else torch.zeros_like(grad_output)
+        # Also num_items_in_batch == 0 (a fully masked accumulation group): stock CE's gradient is zero there.
+        empty = math.isnan(ctx.divisor) or ctx.divisor == 0
+        scale = torch.zeros_like(grad_output) if empty else grad_output / ctx.divisor
         dh = (grad_hidden * scale.to(grad_hidden.dtype)) if ctx.has_hidden else None
         dw = (grad_weight * scale).to(ctx.weight_dtype) if ctx.has_weight else None
         return dh, dw, None, None, None, None

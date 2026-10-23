@@ -399,8 +399,12 @@ def push_to_hub_merged(self, repo_id, tokenizer = None, save_method = "merged_16
     model, _ = _merged_copy(self, save_method)
     # Branch / PR / message options shared by model and tokenizer push_to_hub on transformers 4.57 and 5.x.
     hub = {k: kwargs[k] for k in ("revision", "create_pr", "commit_message", "commit_description", "tags") if k in kwargs}
-    model.push_to_hub(repo_id, token = token, private = private, **hub)
+    info = model.push_to_hub(repo_id, token = token, private = private, **hub)
     if tokenizer is not None:
+        pr_revision = getattr(info, "pr_revision", None)
+        if hub.get("create_pr") and pr_revision:
+            # Add the tokenizer to the model's PR instead of opening a second, model-less one.
+            hub = {**hub, "create_pr": False, "revision": pr_revision}
         tokenizer.push_to_hub(repo_id, token = token, private = private, **hub)
     return repo_id
 
@@ -413,6 +417,14 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
     # Unsloth's GGUF aliases, as on the GPU save path.
     aliases = {"not_quantized": "bf16", "fast_quantized": "q8_0", "quantized": "q4_k_m", "none": "q8_0"}
     methods = list(dict.fromkeys(aliases.get(str(m).lower(), str(m).lower()) for m in methods))
+    from unsloth_zoo.llama_cpp import quant_requires_imatrix
+    needs_imatrix = [m for m in methods if quant_requires_imatrix(m)]
+    if needs_imatrix:
+        # Fail before the merge and conversion, not after them.
+        raise NotImplementedError(
+            f"Unsloth (CPU): {needs_imatrix} need an importance matrix, which the CPU GGUF export does not build. "
+            "Use q4_k_m / q5_k_m / q8_0 / bf16, or quantize the bf16 GGUF with llama-quantize --imatrix."
+        )
     os.makedirs(save_directory, exist_ok = True)
     merged_directory = os.path.join(save_directory, "merged_16bit")
     save_pretrained_merged(self, merged_directory, tokenizer, save_method = "merged_16bit")

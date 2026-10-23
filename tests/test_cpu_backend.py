@@ -490,3 +490,54 @@ def test_for_training_switches_gradient_checkpointing_only_when_asked():
     assert model.is_gradient_checkpointing
     FastCPUModel.for_training(model, use_gradient_checkpointing = False)
     assert not model.is_gradient_checkpointing
+
+
+def test_zero_item_batch_gives_zero_gradients_not_nan():
+    from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
+    hidden = torch.randn(2, 4, 8, requires_grad = True)
+    weight = torch.randn(16, 8)
+    labels = torch.full((2, 4), -100)
+    loss = chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = torch.tensor(0))
+    loss.backward()
+    assert torch.equal(hidden.grad, torch.zeros_like(hidden.grad))
+
+
+@pytest.mark.parametrize("accelerator, expected", [("mps", "cpu"), ("hpu", None)])
+def test_unsupported_active_accelerator_keeps_its_error(monkeypatch, accelerator, expected):
+    dt = _device_type_module()
+    for key in ("UNSLOTH_DISABLE_CPU_FALLBACK", "UNSLOTH_ALLOW_CPU", "UNSLOTH_FORCE_CPU", "CUDA_VISIBLE_DEVICES"):
+        monkeypatch.delenv(key, raising = False)
+    monkeypatch.setattr(dt, "_IS_MLX", False)
+    monkeypatch.setattr(dt, "_GPU_INIT_SKIPPED", False)
+    monkeypatch.setattr(dt.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(dt.torch.xpu, "is_available", lambda: False)
+    monkeypatch.setattr(dt, "npu_is_available", lambda: False)
+    monkeypatch.setattr(dt.torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(dt.torch.accelerator, "current_accelerator", lambda: accelerator)
+    monkeypatch.setattr(dt, "cpu_backend_allowed", lambda: True)
+    monkeypatch.setattr(dt, "_amd_installation_hint", lambda: None)
+    if expected is None:
+        with pytest.raises(NotImplementedError):
+            dt.get_device_type.__wrapped__()
+    else:
+        assert dt.get_device_type.__wrapped__() == expected
+
+
+def test_create_pr_puts_the_tokenizer_in_the_model_pr():
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu.loader import push_to_hub_merged
+    calls = []
+    model = SimpleNamespace(push_to_hub = lambda repo, **kw: calls.append(("model", kw)) or SimpleNamespace(pr_revision = "refs/pr/7"))
+    tokenizer = SimpleNamespace(push_to_hub = lambda repo, **kw: calls.append(("tokenizer", kw)))
+    push_to_hub_merged(model, "user/repo", tokenizer, save_method = "lora", create_pr = True)
+    assert calls[0][1]["create_pr"] is True
+    assert calls[1][1]["create_pr"] is False and calls[1][1]["revision"] == "refs/pr/7"
+
+
+def test_gguf_imatrix_quants_fail_before_the_merge(monkeypatch, tmp_path):
+    from unsloth_zoo.cpu import loader
+    merged = []
+    monkeypatch.setattr(loader, "save_pretrained_merged", lambda *a, **k: merged.append(1))
+    with pytest.raises(NotImplementedError, match = "importance matrix"):
+        loader.save_pretrained_gguf(None, str(tmp_path / "m"), quantization_method = "iq2_xxs")
+    assert merged == []

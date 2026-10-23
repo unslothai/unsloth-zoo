@@ -579,6 +579,13 @@ def get_device_type():
                 f"Please reinstall torch - it's most likely broken :("
             )
     fallback = _cpu_fallback()
+    other = None
+    if hasattr(torch, "accelerator") and torch.accelerator.is_available():
+        other = str(torch.accelerator.current_accelerator())
+    # An active accelerator Unsloth does not drive (hpu, mtia, ...) keeps this error instead of silently
+    # training on CPU. A Mac without MLX ("mps") is the exception: its CPU is the supported path there.
+    if fallback == "cpu" and other not in (None, "mps"):
+        fallback = None
     if fallback is not None:
         return fallback
     amd_hint = _amd_installation_hint()
