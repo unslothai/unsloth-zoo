@@ -431,6 +431,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 _GENERIC_EXPERTS_FORWARD_FILE = ("transformers", "integrations", "moe.py")
 
 # Module global, passed as an argument below: _forward_statically_reads_stash only follows global names the forward calls.
+from . import moe_utils as _moe_utils
 from .moe_utils import get_forward_moe_backend
 
 
@@ -470,12 +471,23 @@ def _experts_layout_is_standard(module: nn.Module) -> bool:
 
 
 def _forward_generic_experts_eagerly(resolve_backend, self, hidden_states, top_k_index, top_k_weights):
-    """Traced by Dynamo, the backend recomputes a different graph under checkpointing (CheckpointError)."""
-    return resolve_backend()(self, hidden_states, top_k_index, top_k_weights)
+    """Kept out of compiled regions: traced there, the backend recomputed a different graph under
+    gradient checkpointing (CheckpointError). Unsloth's per-layer block compile keeps one graph per
+    layer across the recompute, so inside it (UNSLOTH_DECODE_COMPILE set) the backend is traced,
+    resolved ahead of time: the resolver's cache-file checks are not traceable."""
+    backend = None
+    if torch.compiler.is_compiling():
+        backend = _moe_utils._CACHED_FORWARD_MOE_BACKEND
+    if backend is None:
+        backend = resolve_backend()
+    return backend(self, hidden_states, top_k_index, top_k_weights)
 
 
 if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
-    _forward_generic_experts_eagerly = torch.compiler.disable(_forward_generic_experts_eagerly)
+    from .utils import torch_compiler_disable_unless_decode
+    _forward_generic_experts_eagerly = torch_compiler_disable_unless_decode(
+        _forward_generic_experts_eagerly, recursive = True
+    )
 
 
 def _drop_expert_parallel_sentinel(module, top_k_index, top_k_weights):
@@ -508,6 +520,7 @@ def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
 
     forward.__wrapped__ = original_forward
     forward.__doc__ = original_forward.__doc__
+    get_forward_moe_backend()  # resolve eagerly so a traced first call needs no file checks
     # Set only on classes routed here, so every patched family computes as before.
     klass._unsloth_own_apply_gate = _experts_have_own_apply_gate(module)
     klass.forward = forward
