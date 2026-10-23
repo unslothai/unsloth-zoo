@@ -18,17 +18,21 @@
 
 The reference below follows vLLM v1 (0.11.2 .. 0.31): temperature, then the min_p logits
 processor, then apply_top_k_top_p (sort ascending, top-k mask, cumsum <= 1 - p mask, the
-largest token always kept), then log_softmax of the masked logits.
+largest token always kept; vLLM's own function, copied verbatim), then log_softmax of the masked logits.
 """
 
 import inspect
 import logging
+import os
+import sys
 import types
 
 import pytest
 import torch
 
 import unsloth_zoo.rl_replacements as rr
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _vllm_topk_topp_reference import apply_top_k_top_p_pytorch  # noqa: E402
 
 
 def _vllm_processed_logprobs(logits, temperature, top_k, top_p, min_p):
@@ -36,16 +40,12 @@ def _vllm_processed_logprobs(logits, temperature, top_k, top_p, min_p):
     if min_p > 0.0:
         probs = torch.softmax(logits, dim = -1)
         logits = logits.masked_fill(probs < min_p * probs.amax(dim = -1, keepdim = True), float("-inf"))
-    logits_sort, logits_idx = logits.sort(dim = -1, descending = False)
-    if top_k > 0:
-        kth = logits_sort.gather(1, torch.full((logits.shape[0], 1), logits.shape[-1] - top_k))
-        logits_sort = logits_sort.masked_fill(logits_sort < kth, float("-inf"))
-    if top_p < 1.0:
-        probs_sum = torch.cumsum(logits_sort.softmax(dim = -1), dim = -1)
-        mask = probs_sum <= 1 - top_p
-        mask[:, -1] = False
-        logits_sort = logits_sort.masked_fill(mask, float("-inf"))
-    logits = logits_sort.scatter(dim = -1, index = logits_idx, src = logits_sort)
+    rows = logits.shape[0]
+    # vLLM's own apply_top_k_top_p_pytorch (verbatim copy), with k / p as the int32 / float32 tensors
+    # vLLM's input batch holds: the top-p cutoff `1 - p` is a float32 subtraction.
+    k = torch.full((rows,), top_k, dtype = torch.int32) if top_k > 0 else None
+    p = torch.full((rows,), top_p, dtype = torch.float32) if top_p < 1.0 else None
+    logits = apply_top_k_top_p_pytorch(logits, k, p)
     return torch.log_softmax(logits, dim = -1)
 
 

@@ -109,6 +109,8 @@ _ROLE_CASES = {
     "linear_attn.in_proj_qkv": "attention", "per_layer_input_gate": "gate",
     "block_sparse_moe.switch_mlp.gate_up_proj": "mlp",
     "mlp.zaya_block.router.down_proj": "gate",
+    "blocks.0.mlp.mlp_gate": "mlp", "ffn_gate": "mlp", "ffn_gate_inp": "gate", "moe_gate": "gate",
+    "mlp.router_mlp.0": "gate",
 }
 
 
@@ -626,15 +628,22 @@ _PACKED_PROJECTIONS = ["model.layers.0.mlp.down_proj", "model.layers.0.mlp.gate_
                        "model.layers.0.self_attn.o_proj", "model.layers.0.self_attn.q_proj"]
 
 
+# Ternary Bonsai 2 packs, from mlx-vlm and (0.32+) mlx-lm.
+_HADAMARD_PACKS = pytest.mark.parametrize("pack_module", [
+    "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35", "mlx_lm.models.prism_hadamard_qwen35",
+], ids=["mlx_vlm", "mlx_lm"])
+
+
 @pytest.mark.parametrize("kwargs, expected", [
     ({}, _PACKED_PROJECTIONS),
     ({"target_modules": "all-linear"}, _PACKED_PROJECTIONS),
     ({"target_modules": ["q_proj", "down_proj", "lm_head"]},
      ["lm_head", "model.layers.0.mlp.down_proj", "model.layers.0.self_attn.q_proj"]),
 ], ids=["default", "all-linear", "named-with-head"])
-def test_hadamard_packed_projections_are_adapted_but_not_the_embedding(kwargs, expected):
+@_HADAMARD_PACKS
+def test_hadamard_packed_projections_are_adapted_but_not_the_embedding(kwargs, expected, pack_module):
     # Ternary Bonsai 2 packs every decoder projection, the head and the embedding.
-    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    pack = pytest.importorskip(pack_module)
     from unsloth_zoo.mlx.utils import LoRAHadamardLinear
     packed = lambda i, o: lambda: pack.HadamardQuantizedLinear(i, o, 512)
     block = {"self_attn": {"q_proj": packed(512, 512), "o_proj": packed(512, 512)},

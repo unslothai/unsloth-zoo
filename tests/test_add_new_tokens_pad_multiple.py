@@ -326,7 +326,8 @@ class _LLM:
 
 
 IDS = list(range(2000, 2063))
-WANT = {i: -100.0 for i in IDS}
+# A hard mask: a finite bias (the OpenAI API's -100) only shifts the row.
+WANT = {i: float("-inf") for i in IDS}
 
 
 def test_vllm_generate_biases_padded_rows():
@@ -462,8 +463,14 @@ def test_vllm_padded_vocab_biases_v0_engine():
     assert seen[3].logits_processors[0] is user_proc
     logits = torch.zeros(2100)
     seen[0].logits_processors[0]([], logits)
-    assert torch.equal(logits[IDS], torch.full((len(IDS),), -100.0))
+    assert torch.equal(logits[IDS], torch.full((len(IDS),), float("-inf")))
     assert int((logits != 0).sum()) == len(IDS)
+    # A padded row with a far larger logit than every real token still cannot be sampled.
+    logits = torch.zeros(2100)
+    logits[1] = 1.0
+    logits[IDS[0]] = 200.0
+    assert int(seen[0].logits_processors[0]([], logits).argmax()) == 1
+    assert llm._unsloth_padded_vocab_bias == (tuple(IDS), float("-inf"))
     # V0 extends each request's list in place: requests must not share one.
     assert seen[0].logits_processors is not seen[1].logits_processors
 

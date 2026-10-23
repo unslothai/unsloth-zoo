@@ -860,5 +860,6 @@ def test_fused_decode_moe_sums_each_tokens_experts_in_a_fixed_order():
     down = mxfp4_grouped_mm_op(inter, dn_blocks, dn_scales, counts, True) + dn_bias[expert]
     rows = torch.empty(down.shape, dtype = torch.float32, device = "cuda")
     rows[order] = (down * weights[token, expert][:, None]).float()
-    want = rows.view(T, k, H).sum(1).to(down.dtype)
+    # In the activation dtype: the float32 biases promote `down`, not the returned MoE output.
+    want = rows.view(T, k, H).sum(1).to(x.dtype)
     assert torch.equal(got.view(T, H), want)

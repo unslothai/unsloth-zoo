@@ -46,7 +46,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import Trainer, TrainingArguments
 
 from . import losses
-from .capture import resolve_text_parts, run_frozen_target
+from .capture import effective_lm_head_weight, resolve_text_parts, run_frozen_target
 
 _CONFIG_EXTRAS = (
     "block_size", "target_layer_ids", "mask_token_id", "num_anchors", "enable_confidence_head",
@@ -255,7 +255,7 @@ class Qwen3DSparkDrafter(nn.Module):
         drafter.apply(drafter._init_weights)
         with torch.no_grad():
             drafter.embed_tokens.weight.copy_(parts["embed_tokens"].weight.detach().float())
-            drafter.lm_head.weight.copy_(parts["lm_head"].weight.detach().float())
+            drafter.lm_head.weight.copy_(effective_lm_head_weight(parts["lm_head"]).detach().float())
         return drafter.to(device = device or parts["embed_tokens"].weight.device, dtype = dtype)
 
     def _init_weights(self, module):
@@ -489,6 +489,7 @@ class UnslothDSparkTrainer(Trainer):
         for p in target_model.parameters():
             p.requires_grad_(False)
         target_model.eval()
+        effective_lm_head_weight(resolve_text_parts(target_model)["lm_head"])  # unsupported adapted heads fail here
         model.freeze_shared()
         if kwargs.get("data_collator") is None:
             from .trainer import MTPDataCollator
@@ -523,7 +524,7 @@ class UnslothDSparkTrainer(Trainer):
             teacher_hidden = captured["final"].to(device = param.device, dtype = param.dtype), ce_alpha = self.args.dspark_ce_alpha,
             l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
             decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
-            teacher_lm_head_weight = resolve_text_parts(self.target_model)["lm_head"].weight,
+            teacher_lm_head_weight = effective_lm_head_weight(resolve_text_parts(self.target_model)["lm_head"]),
         )
         if isinstance(model, nn.DataParallel):
             # DataParallel scatters forward kwargs along dim 0 and cannot gather Python stats: score after the gather.
