@@ -4787,7 +4787,6 @@ def _convert_to_gguf(command, output_filename, print_output = False, print_outpu
         universal_newlines = True,
         encoding = "utf-8",
         errors = "replace",
-        env = _utf8_child_env(),
         shell = True,
     )
     ProgressBar._instances.clear()
@@ -5736,6 +5735,7 @@ def _converter_child_env(gguf_py_dir = None, base_env = None):
     sibling tree ahead of our choice. Idempotent.
     """
     env = dict(os.environ if base_env is None else base_env)
+    env["PYTHONIOENCODING"] = "utf-8"
     if not gguf_py_dir:
         return env
     gguf_py_dir = os.path.abspath(gguf_py_dir)

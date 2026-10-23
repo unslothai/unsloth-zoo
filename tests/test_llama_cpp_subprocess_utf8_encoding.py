@@ -68,7 +68,8 @@ def test_try_execute_reads_non_locale_utf8_output():
     llama_cpp.try_execute(f'"{sys.executable}" -c "{raw}"', print_outputs = lines)
     assert "".join(lines) == "tensor ” ok\n"
 
-    # A Python child printing to the pipe (the GGUF converter) must emit UTF-8 too.
+    # A Python child printing to the pipe must emit UTF-8 too, as must the GGUF converter.
+    assert llama_cpp._converter_child_env()["PYTHONIOENCODING"] == "utf-8"
     lines = []
     llama_cpp.try_execute(f'"{sys.executable}" -c "print(chr(0x201D) + chr(0xE9) + chr(0x4E2D))"', print_outputs = lines)
     assert "".join(lines) == "”é中\n"
