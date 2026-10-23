@@ -498,7 +498,8 @@ def cpu_backend_allowed():
     if os.environ.get("UNSLOTH_DISABLE_CPU_FALLBACK", "0") == "1":
         return False
     # Each mask only hides the runtime that honours it (HIP also reads CUDA_VISIBLE_DEVICES).
-    if not _hidden_by("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES") and _detect_amd_rocm_runtime():
+    amd_masks = ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
+    if not _hidden_by(*amd_masks) and _detect_amd_rocm_runtime():
         return False
     # Linux: the loaded kernel driver, not a stray nvidia-smi in a CPU container image.
     # WSL2 exposes the Windows NVIDIA driver through /usr/lib/wsl/lib instead of /proc/driver/nvidia.

@@ -41,6 +41,7 @@ def _device_type_module():
         ({}, False, "ascend", False),                                 # Ascend driver, no torch_npu: keep error
         ({"ROCR_VISIBLE_DEVICES": "-1"}, False, True, False),         # another vendor's mask: NVIDIA still seen
         ({"HIP_VISIBLE_DEVICES": ""}, True, False, True),             # the ROCm mask hides AMD
+        ({"GPU_DEVICE_ORDINAL": ""}, True, False, True),
         ({"CUDA_VISIBLE_DEVICES": "-1"}, False, "ascend", False),     # the CUDA mask does not hide Ascend
         ({"ASCEND_RT_VISIBLE_DEVICES": ""}, False, "ascend", True),
     ],
@@ -48,7 +49,7 @@ def _device_type_module():
 def test_cpu_backend_allowed(monkeypatch, env, rocm, nvidia, expected):
     dt = _device_type_module()
     for key in ("UNSLOTH_DISABLE_CPU_FALLBACK", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
-                "ASCEND_RT_VISIBLE_DEVICES"):
+                "ASCEND_RT_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"):
         monkeypatch.delenv(key, raising = False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
