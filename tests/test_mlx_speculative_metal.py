@@ -582,6 +582,17 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, m
             _verified(model.language_model, cache, mx.array([ids[0][24 : 24 + width]]), 0)
             assert inference.first_use_work() == work and set(launched) == warmed
     assert len(warmed) == 1
+    # A build the runtime rejects leaves warm-up to the native ops: one attempt per shape, no verdicts.
+    builds = []
+
+    def rejected(*args):
+        builds.append(args)
+        raise RuntimeError("[metal::Device] Unable to build metal library from source")
+    with monkeypatch.context() as patch:
+        patch.setattr(inference, "_verify_gdn_block", rejected)
+        patch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+        inference.warm_inference(model)
+        assert len(builds) == 1 and not inference._VERIFY_GDN_VERDICTS
     # A CPU load verifies on the native ops, so it builds nothing.
     launched.clear()
     device = mx.default_device()

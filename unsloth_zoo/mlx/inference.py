@@ -6750,13 +6750,17 @@ def _warm_verify_gdn(model):
                 and not layer.num_v_heads % layer.num_k_heads and layer.conv1d.weight.dtype in (mx.bfloat16, mx.float16)):
             shapes.setdefault((layer.conv1d.weight.dtype, layer.A_log.dtype, layer.dt_bias.dtype, layer.conv_kernel_size,
                                layer.num_k_heads, layer.num_v_heads), layer)
-    for (dtype, *_), layer in shapes.items():
-        K, Hv, D, length = layer.conv_kernel_size, layer.num_v_heads, layer.head_v_dim, 3
+    for shape, layer in list(shapes.items()):
+        dtype, K, Hv, D, length = shape[0], layer.conv_kernel_size, layer.num_v_heads, layer.head_v_dim, 3
         gates = mx.zeros((1, length, Hv), dtype)
-        mx.eval(_verify_gdn_block(
-            mx.zeros((1, K - 1 + length, layer.conv_dim), dtype), layer.conv1d.weight.reshape(layer.conv_dim, K), gates,
-            gates, layer.A_log, layer.dt_bias, mx.zeros((1, length, Hv, D), dtype), layer.norm.weight, 1e-6,
-            layer.norm.eps, mx.zeros((1, Hv, D, D), mx.float32), layer.num_k_heads))
+        try:
+            mx.eval(_verify_gdn_block(
+                mx.zeros((1, K - 1 + length, layer.conv_dim), dtype), layer.conv1d.weight.reshape(layer.conv_dim, K),
+                gates, gates, layer.A_log, layer.dt_bias, mx.zeros((1, length, Hv, D), dtype), layer.norm.weight, 1e-6,
+                layer.norm.eps, mx.zeros((1, Hv, D, D), mx.float32), layer.num_k_heads))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            del shapes[shape]  # its blocks keep the verifier's ops
     if getattr(model, "_unsloth_speculates", False):  # set by building a drafter for it
         with exact_speculative_verify(model):
             _settle_verify_gdn(model, language, shapes)
