@@ -4894,6 +4894,43 @@ def _upcast_shard_to_float32(save_directory, filename):
 pass
 
 
+def _shard_tensor_bytes(file_path):
+    """Bytes of tensor data in one safetensors shard, read from its header."""
+    with open(file_path, "rb") as f:
+        length_of_header = int.from_bytes(f.read(8), "little")
+        header_metadata = json.loads(f.read(length_of_header))
+    return sum(
+        v["data_offsets"][1] - v["data_offsets"][0]
+        for k, v in header_metadata.items()
+        if k != "__metadata__" and isinstance(v, dict) and "data_offsets" in v
+    )
+pass
+
+
+def _set_index_total_size(save_directory, total_size):
+    """Record `total_size` in a copied shard index, returning whether it changed.
+
+    The copied index still describes the 16-bit base, so a float32 export would otherwise
+    report half its real size.
+    """
+    index_path = os.path.join(save_directory, "model.safetensors.index.json")
+    if not os.path.isfile(index_path): return False
+    try:
+        with open(index_path, "rb") as f:
+            data = json.loads(f.read())
+    except Exception:
+        return False
+    metadata = data.get("metadata") if isinstance(data, dict) else None
+    if not isinstance(metadata, dict) or metadata.get("total_size") == total_size:
+        return False
+    metadata["total_size"] = total_size
+    _export_index_atomically(
+        index_path, index_path, json.dumps(data, indent = 4).encode("utf-8"),
+    )
+    return True
+pass
+
+
 def _mark_config_float32(config_path):
     # Without this, from_pretrained(dtype = "auto") reads bfloat16 and downcasts on load.
     if not os.path.exists(config_path): return
@@ -5807,6 +5844,7 @@ def merge_and_overwrite_lora(
     _vocab_modules = _untargeted_vocab_modules(
         _merge_base_model, lora_weights, _merge_tie_word_embeddings,
     ) if save_method == "merged_16bit" else {}
+    _widened_total_size = 0
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         if _mxfp4_rewrite is not None:
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
@@ -5836,6 +5874,8 @@ def merge_and_overwrite_lora(
         device_empty_cache()
 
         file_path = os.path.join(save_directory, filename)
+        if upcast_to_float32 and not regenerate_index:
+            _widened_total_size += _shard_tensor_bytes(file_path)
 
         # --- NEW LOGIC: Build the weight_map BEFORE deleting the file ---
         if regenerate_index and not _fp8_post_cleanup:
@@ -5870,6 +5910,12 @@ def merge_and_overwrite_lora(
                 except FileNotFoundError:
                     pass
     pass
+
+    # A copied index still carries the 16-bit base's total_size; the widened shards are larger.
+    if upcast_to_float32 and not regenerate_index:
+        if _set_index_total_size(save_directory, _widened_total_size) and push_to_hub and low_disk_space_usage:
+            # Low disk mode uploaded the index before the merge, and Step 7 does not run.
+            upload_items("model.safetensors.index.json")
 
     # Step 6: Regenerate index for MXFP4 dequantization or shard splitting
     if regenerate_index:
