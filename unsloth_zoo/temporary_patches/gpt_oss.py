@@ -289,30 +289,6 @@ def swiglu_torch_forward(a, alpha, limit, dtype = None):
 pass
 
 
-@torch_compile(dynamic = True, fullgraph = True)
-def swiglu_torch_backward(pre_act, alpha, limit, g1):
-    g, l = pre_act[..., ::2].to(torch.float32), pre_act[..., 1::2].to(torch.float32)
-
-    if limit is not None:
-        mask_g = g <= limit
-        mask_l = l.abs() <= limit
-        ḡ = torch.where(mask_g, g, limit)
-        l̄ = torch.where(mask_l, l, l.sign() * limit)
-    else:                                            # no clipping
-        mask_g = mask_l = torch.ones_like(g, dtype=bool)
-        ḡ, l̄ = g, l
-
-    σ   = torch.sigmoid(alpha * ḡ)
-    dg  = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
-    dl  = ḡ * σ
-    dg  = torch.where(mask_g, dg, 0.)                # clamp-grad
-    dl  = torch.where(mask_l, dl, 0.)
-
-    grad = torch.empty_like(pre_act)
-    grad[..., ::2], grad[..., 1::2] = dg, dl
-    return g1 * grad.to(g1.dtype)
-pass
-
 _MXFP4_E2M1_VALUES = (
     +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -570,6 +546,12 @@ def patch_gpt_oss():
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
+
+    if os.environ.get("UNSLOTH_MXFP4_MATMUL_OGS", "1") == "0":
+        # With the `kernels` package installed, transformers would otherwise fetch the hub triton_kernels
+        # (matmul_ogs) instead of dequantizing to bf16, so the switch must also hide those.
+        transformers.quantizers.quantizer_mxfp4.is_kernels_available = lambda *args, **kwargs: False
+        return
 
     if HAS_TRITON_KERNELS and _mxfp4_hub_kernel_unreachable():
         # Claiming kernels skips the bf16 fallback, then the hub load raises ImportError (vLLM triton_kernels).
@@ -1444,89 +1426,6 @@ class GptOssExpertsBnb4bit(nn.Module):
 pass
 
 
-class GptOssTopKRouterBnb4bit(nn.Module):
-    """
-    GPT OSS Router with weight/bias as direct nn.Parameter (not nested Linear) for BnB 4bit.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
-        self.hidden_dim = config.hidden_size
-        self.dtype = dtype_from_config(config)
-        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, dtype=self.dtype))
-        self.bias = nn.Parameter(torch.zeros(self.num_experts, dtype=self.dtype))
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        # Accept checkpoints that used a Linear router (linear.weight/bias)
-        linear_weight_key = prefix + "linear.weight"
-        linear_bias_key = prefix + "linear.bias"
-        weight_key = prefix + "weight"
-        bias_key = prefix + "bias"
-        moved_weight = False
-        moved_bias = False
-        if linear_weight_key in state_dict and weight_key not in state_dict:
-            state_dict[weight_key] = state_dict.pop(linear_weight_key)
-            moved_weight = True
-        if linear_bias_key in state_dict and bias_key not in state_dict:
-            state_dict[bias_key] = state_dict.pop(linear_bias_key)
-            moved_bias = True
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
-        if moved_weight:
-            if linear_weight_key in unexpected_keys:
-                unexpected_keys.remove(linear_weight_key)
-            if weight_key in missing_keys:
-                missing_keys.remove(weight_key)
-        if moved_bias:
-            if linear_bias_key in unexpected_keys:
-                unexpected_keys.remove(linear_bias_key)
-            if bias_key in missing_keys:
-                missing_keys.remove(bias_key)
-        if self.weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            self.weight.data = self.weight.data.to(self.dtype)
-        if self.bias is not None and self.bias.dtype not in (
-            torch.float16, torch.bfloat16, torch.float32
-        ):
-            self.bias.data = self.bias.data.to(self.dtype)
-
-    def forward(self, hidden_states):
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = torch.nn.functional.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)
-        dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
-        fused = _fused_route_or_none(router_logits, self.top_k, "topk_softmax")
-        if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
-            router_top_value, router_indices = fused[0].to(dtype), fused[1]
-        else:
-            router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
-            router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
-        router_scores = torch.zeros_like(router_logits, dtype=dtype).scatter_(1, router_indices, router_top_value)
-        if transformers_version >= Version("5.0.0"):
-            return router_logits, router_scores, router_indices
-        else:
-            return router_scores, router_indices
-
-
-pass
-
-
 def patch_gpt_oss_bnb4bit():
     """
     Patch transformers to use BnB 4bit compatible classes for pre-quantized models.
@@ -1555,7 +1454,7 @@ def patch_gpt_oss_bnb4bit():
 
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExpertsBnb4bit
     # Use unsloth GptOssTopKRouter (self.linear = nn.Linear): BnB 4-bit checkpoints store
-    # router.linear.weight/bias. GptOssTopKRouterBnb4bit remapped keys via _load_from_state_dict,
+    # router.linear.weight/bias. A separate 4-bit router class remapped keys via _load_from_state_dict,
     # but transformers v5 bypasses it (accelerate's set_module_tensor_to_device), so weights
     # stayed randomly initialized -> high loss (~4-5).
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
@@ -2170,7 +2069,8 @@ def _moe_forward_inference_mxfp4_kernel(
     rows = torch.empty(weighted.shape, dtype = torch.float32, device = x.device)
     rows = rows.index_copy_(0, order, weighted.to(torch.float32))
     out = rows.view(x.shape[0], top_k, hidden_size).sum(1)
-    return out.to(weighted.dtype).view(batch_size, -1, hidden_size)
+    # In the activation dtype, as matmul_ogs returns: float32 biases must not promote the residual stream.
+    return out.to(hidden_states.dtype).view(batch_size, -1, hidden_size)
 
 
 def _mxfp4_static_operands(param, experts_module, proj_type):
@@ -2614,10 +2514,6 @@ def _ogs_backend_for(weight, routing_data = None, module = None):
     return triton_kernels_backend_for(_ogs_root_for(weight, routing_data, module))
 
 
-def _matmul_ogs_for(weight, routing_data = None):
-    return _ogs_backend_for(weight, routing_data).matmul_ogs
-
-
 _OGS_NATIVE_REJECT_WARNED = False
 
 
@@ -2654,6 +2550,26 @@ def _ogs_module_backend(module):
         return None
 
 
+_OGS_MM_OUT_DTYPE = {}
+
+
+def _ogs_mm_fp32(a, b, bias = None):
+    """fp32 ``a @ b (+ bias)`` for bf16 inputs, bias added before any rounding like the native epilogue."""
+    key = a.device.type
+    if _OGS_MM_OUT_DTYPE.get(key, True):
+        try:
+            y = torch.mm(a, b, out_dtype = torch.float32)  # torch >= 2.8: bf16 inputs, fp32 output
+            _OGS_MM_OUT_DTYPE[key] = True
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except (TypeError, RuntimeError, NotImplementedError):
+            _OGS_MM_OUT_DTYPE[key] = False
+            y = a.float() @ b.float()
+    else:
+        y = a.float() @ b.float()
+    return y if bias is None else y + bias.float()
+
+
 def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_config):
     """matmul_ogs gate_up on bf16 decodes: ``x[src // k] @ W[e] + b[e]``."""
     k = routing_data.n_expts_act
@@ -2668,9 +2584,9 @@ def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_co
             lo, hi = offsets[e], offsets[e + 1]
             if hi == lo:
                 continue
-            y = (x[rows[lo:hi] // k] @ dense[e - first]).float()
-            if bias is not None:
-                y = y + bias[e].float()
+            # Explicit bf16: an fp16 autocast would recast the matmul and overflow before the bias cancels it.
+            with torch.autocast(device_type = x.device.type, enabled = False):
+                y = _ogs_mm_fp32(x[rows[lo:hi] // k], dense[e - first], None if bias is None else bias[e])
             out[lo:hi] = y.to(out.dtype)
         del dense
     return out
@@ -2690,9 +2606,9 @@ def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precis
             lo, hi = offsets[e], offsets[e + 1]
             if hi == lo:
                 continue
-            y = (h[lo:hi] @ dense[e - first]).float()
-            if bias is not None:
-                y = y + bias[e].float()
+            # As above: fp16 autocast would overflow here before the routing weight scales it down.
+            with torch.autocast(device_type = h.device.type, enabled = False):
+                y = _ogs_mm_fp32(h[lo:hi], dense[e - first], None if bias is None else bias[e])
             if gammas is not None:
                 y = y * gammas[lo:hi].float().unsqueeze(-1)
             where = dst[lo:hi]
@@ -2803,9 +2719,9 @@ class _OgsDown(torch.autograd.Function):
                 if need_h:
                     grad_h[lo:hi] = scaled[lo:hi] @ weight.t()
                 if need_gamma:
-                    y = (h[lo:hi] @ weight).float()
-                    if bias is not None:
-                        y = y + bias[e].float()
+                    # Same fp32 epilogue as the forward, so the routing-weight gradient matches it.
+                    with torch.autocast(device_type = h.device.type, enabled = False):
+                        y = _ogs_mm_fp32(h[lo:hi].to(torch.bfloat16), weight, None if bias is None else bias[e])
                     grad_gamma[lo:hi] = (grad_rows[lo:hi].float() * y).sum(-1)
                 if need_bias:
                     grad_bias[e] = scaled[lo:hi].float().sum(0)
@@ -2914,6 +2830,8 @@ def forward_mxfp4_gpt_oss_with_lora(
             f"LoRA={gate_up_lora is not None or down_lora is not None}, experts={self.num_experts}."
         )
 
+    # The native kernels and mxfp4_ogs_experts_forward return bf16; an fp16 residual (T4) would be promoted.
+    input_dtype = hidden_states.dtype
     hidden_states, routing_data, gather_idx, scatter_idx, leading_shape = _mxfp4_experts_routing(
         self, hidden_states, routing_data, gather_idx, scatter_idx, router_indices, routing_weights,
     )
@@ -2931,7 +2849,7 @@ def forward_mxfp4_gpt_oss_with_lora(
             )
     if leading_shape is not None:
         out = out.reshape(*leading_shape, out.shape[-1])
-    return out
+    return out.to(input_dtype)
 
 
 def patch_mxfp4_gpt_oss_for_lora():
@@ -3797,62 +3715,6 @@ def patch_GptOssModel():
         hidden_states *= torch.rsqrt_(variance)
         hidden_states *= self.weight.to(hidden_states.device).to(torch.float32)
         return hidden_states.to(input_dtype)  # main diff with Llama
-    pass
-
-    # Re-compiling for each new sequence length which is NOT ideal
-    @_torch_compile(dynamic = True, fullgraph = False, mode = "reduce-overhead")
-    def pre_forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-    ):
-        hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
-        # Self Attention
-        query_states, key_states, value_states, input_shape = pre_attention_decoding(
-            self=self.self_attn,
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-        )
-        return query_states, key_states, value_states, input_shape
-    pass
-    fused_torch_compile_options = get_torch_compile_options(
-        epilogue_fusion = True,
-        max_autotune = False, # Too slow
-        shape_padding = True,
-        cudagraphs = True,
-        coordinate_descent_tuning = False,
-        combo_kernels = False,
-        memory_planning = True,
-        multi_kernel = False, # Fails on torch 2.10 nightly
-        use_block_ptr = True,
-        logging = UNSLOTH_ENABLE_LOGGING,
-    )
-
-    @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
-    def post_forward(
-        self,
-        residual: torch.Tensor,
-        attn_output: torch.Tensor,
-        logsumexp: torch.Tensor,
-        input_shape,
-    ):
-        hidden_states = post_attention_decoding(self.self_attn, attn_output, logsumexp, input_shape)
-        hidden_states += residual
-
-        # Fully Connected
-        residual = hidden_states.clone()
-        hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
-        return hidden_states, residual
     pass
 
     def inference_forward(

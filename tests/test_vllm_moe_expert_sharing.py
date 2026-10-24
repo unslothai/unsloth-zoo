@@ -178,7 +178,7 @@ def test_gemma4_lora_keys_are_renamed_onto_moe_experts(monkeypatch):
     monkeypatch.setattr(vu, "_get_vllm_model_runner", lambda model: None)
     monkeypatch.setattr(vu, "_get_vllm_lora_model", lambda model, runner = None: types.SimpleNamespace())
     monkeypatch.setattr(vu, "_get_vllm_lora_manager", lambda model, runner = None: None)
-    monkeypatch.setattr(vu, "_vllm_lora_target_names", lambda vllm_model, manager = None: (names, set()))
+    monkeypatch.setattr(vu, "_vllm_lora_target_names", lambda vllm_model, manager = None, lora_config = None: (names, set()))
 
     def resolve(key, mapper):
         key = key.replace("base_model.model.model.language_model.", "language_model.model.")
@@ -206,7 +206,7 @@ def _fake_vllm_targets(monkeypatch, vu, names):
     monkeypatch.setattr(vu, "_get_vllm_model_runner", lambda model: None)
     monkeypatch.setattr(vu, "_get_vllm_lora_model", lambda model, runner = None: types.SimpleNamespace())
     monkeypatch.setattr(vu, "_get_vllm_lora_manager", lambda model, runner = None: None)
-    monkeypatch.setattr(vu, "_vllm_lora_target_names", lambda vllm_model, manager = None: (names, set()))
+    monkeypatch.setattr(vu, "_vllm_lora_target_names", lambda vllm_model, manager = None, lora_config = None: (names, set()))
 
     def resolve(key, mapper):
         key = key.replace("base_model.model.model.language_model.", "language_model.model.")

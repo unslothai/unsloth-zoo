@@ -79,6 +79,10 @@ def spoof(monkeypatch):
         monkeypatch.setattr(torch, "ones", ones)
         monkeypatch.setattr(torch, "tensor", tensor)
         monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
+        # The view probe builds real tensors (torch.Generator / randn on the card): on a GPU host that ran
+        # on the real device and logged extra _grouped_mm calls; on a CPU host it raised and gave False.
+        # Pin that False everywhere; tests of the view probe override it.
+        monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda device: False)
         return probed
     return make
 
@@ -383,3 +387,96 @@ def test_rocm_mask_rewritten_only_when_token_order_is_logical_order(spoof, monke
         assert children == [("0", (tokens[0],) * 2), ("0", (tokens[1],) * 2)]
     else:
         assert children == [("0", None), ("1", None)]
+
+
+class _OnCard(torch.Tensor):
+    """CPU tensor reporting a CUDA device, so a device_map split is modelled without a GPU."""
+    @property
+    def device(self):
+        return self._card
+
+
+def _on(device, *shape):
+    t = torch.Tensor._make_subclass(_OnCard, torch.zeros(*shape))
+    t._card = device
+    return t
+
+
+class _FakeExperts(torch.nn.Module):
+    """Stacked 3D expert weights on `device`."""
+    def __init__(self, device):
+        super().__init__()
+        self.num_experts = 4
+        self.gate_up_proj = _on(device, 4, 8, 4)
+        self.down_proj = _on(device, 4, 4, 4)
+
+
+class _FakeLinear(torch.nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.weight = _on(device, 4, 4)
+
+
+def _split_model(*devices, others = ()):
+    model = torch.nn.Module()
+    model.num_experts = 4   # transformers wrappers (GptOssForCausalLM, OlmoeForCausalLM) expose it too
+    model.layers = torch.nn.ModuleList(_FakeExperts(d) for d in devices)
+    model.lm_head = torch.nn.ModuleList(_FakeLinear(d) for d in others)
+    return model
+
+
+def test_loader_warms_a_foreign_expert_card_before_compile(spoof, monkeypatch):
+    # H100 home + A100 holding later layers: the loader resolves the A100 eagerly, so the compiled
+    # forward's first A100 query traces under fullgraph=True instead of hitting the disabled probe.
+    from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
+    seen = spoof(3, models = ["H100", "A100", "L4"])
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    auto_enable_grouped_moe(_split_model(cuda(0), cuda(1)))
+    assert _fullgraph_gate(monkeypatch, cuda(1)).tolist() == [1.0, 1.0]
+    assert 1 in seen and 2 not in seen  # the L4 holds no experts: never probed
+
+
+@pytest.mark.parametrize("models", [["H100"], ["H100", "H100"]])
+def test_loader_warm_adds_no_probe_on_one_gpu_or_one_model(spoof, models):
+    from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
+    seen = spoof(len(models), models = models)
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    auto_enable_grouped_moe(_split_model(*(cuda(i) for i in range(len(models)))))
+    assert seen == [0]
+
+
+def test_loader_warm_skips_cards_holding_only_non_expert_weights(spoof, monkeypatch):
+    # A wrapper exposing num_experts with its LM head on an A100: the experts all sit on the H100 home,
+    # so the A100 must not be probed (nor the L4 that holds nothing).
+    from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
+    from unsloth_zoo.temporary_patches.moe_experts_interface import _expert_devices
+    seen = spoof(3, models = ["H100", "A100", "L4"])
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    model = _split_model(cuda(0), cuda(0), others = (cuda(1),))
+    assert _expert_devices(model) == [cuda(0)]
+    auto_enable_grouped_moe(model)
+    assert seen == [0]
+
+
+def test_loader_warms_an_xpu_card_beside_a_single_cuda_home(spoof, monkeypatch):
+    # One CUDA card plus one XPU card: each backend counts 1 device, yet the XPU is foreign to the CUDA
+    # home and its first traced query would reach the compiler-disabled resolver.
+    from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
+    seen = spoof(1, models = ["H100"])
+    real_xpu = getattr(torch, "xpu", None)
+    monkeypatch.setattr(torch, "xpu", types.SimpleNamespace(
+        is_available = lambda: True,
+        device_count = lambda: 1,
+        current_device = lambda: 0,
+        get_device_properties = lambda i: types.SimpleNamespace(name = "Arc B580", major = None, minor = None),
+    ), raising = False)
+    # Warm only this module: a compiled-cache copy (if one exists here) would probe once more for itself.
+    monkeypatch.setattr(moe_utils, "get_forward_moe_backend", lambda: moe_utils.forward_native_grouped_mm)
+    xpu = torch.device("xpu", 0)
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    auto_enable_grouped_moe(_split_model(cuda(0), xpu))
+    assert seen == [0, 0]   # the CUDA home, then the XPU card
+    kind = moe_utils._grouped_mm_foreign_kind(xpu)
+    assert kind is not None and moe_utils._TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind) is True
+    monkeypatch.setattr(torch, "xpu", real_xpu, raising = False)   # Dynamo itself reads the real backend
+    assert _fullgraph_gate(monkeypatch, xpu).tolist() == [1.0, 1.0]

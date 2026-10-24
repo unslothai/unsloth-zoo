@@ -293,6 +293,26 @@ def calls_disable_compile_function(source, disable_compile_functions):
     )
 
 
+def modules_wrapping_disabled_attention(inits, disabled_attention_modules):
+    """Modules whose `__init__` builds a compile-disabled attention module, directly or through
+    another such module. Compiled, each graph-breaks at every call (GraniteSpeechConformerBlock,
+    Gemma3nAudioConformerAttention, Blip2QFormerAttention), so they stay eager like layers that
+    call `self.self_attn`; their own compiled children still compile."""
+    found = set()
+    targets = set(disabled_attention_modules)
+    while targets:
+        new = {
+            module
+            for module, init in inits.items()
+            if module not in found
+            and module not in disabled_attention_modules
+            and any(re.search(rf"\b{re.escape(x)}\(", init) for x in targets)
+        }
+        found |= new
+        targets = new
+    return found
+
+
 def function_defined_elsewhere(modeling_file, name):
     """True if `modeling_file.<name>` is imported from another file (a same-named method can match `def <name>`)."""
     try:
@@ -438,6 +458,23 @@ def has_data_dependent_call(source):
         or ".tolist()" in source
         or ".item()" in source
     )
+
+
+def loops_over_checkpointed_layers(modeling_file, init, forward):
+    """A forward looping over `GradientCheckpointingLayer`s (Wav2Vec2FeatureEncoder's conv
+    layers) graph breaks once per layer under gradient checkpointing: Dynamo skips the
+    checkpoint function `GradientCheckpointingLayer.__call__` hands each layer to."""
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        return False
+    if not re.search(r"^\s*for\s[^\n]+?\sin\s[^\n]*\bself\.\w+", forward, flags = re.MULTILINE):
+        return False
+    for name in set(re.findall(r"\b([A-Za-z_]\w*)\(", init)):
+        cls = getattr(modeling_file, name, None)
+        if isinstance(cls, type) and issubclass(cls, GradientCheckpointingLayer):
+            return True
+    return False
 
 
 def data_dependent_helpers(modeling_file, called_functions):
@@ -2034,6 +2071,27 @@ def is_hub_kernel_wrapper(source):
 pass
 
 
+_RELATIVE_IMPORT = re.compile(r"^(\s*)from (\.+)([A-Za-z_][\w.]*)? import ", flags = re.MULTILINE)
+
+
+def _absolute_relative_imports(source, model_location):
+    """The generated module lives outside the transformers package, so a function-local
+    `from ..auto.modeling_auto import AutoModel` (MusicgenForConditionalGeneration.__init__)
+    must name its package: "attempted relative import with no known parent package" otherwise."""
+    if not isinstance(model_location, str) or "." not in model_location or "from ." not in source:
+        return source
+    package = model_location.rsplit(".", 1)[0]
+
+    def absolute(match):
+        try:
+            name = importlib.util.resolve_name(match.group(2) + (match.group(3) or ""), package)
+        except (ImportError, ValueError):
+            return match.group(0)
+        return f"{match.group(1)}from {name} import "
+    return _RELATIVE_IMPORT.sub(absolute, source)
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -2168,9 +2226,28 @@ def create_new_function(
             "except Exception:\n"
             "    pass\n"
         )
+    if "forward_sonic_moe" in new_source:
+        # The patched Qwen3-VL-MoE expert forward on the sonic_moe backend.
+        imports += (
+            "try:\n"
+            "    from unsloth_zoo.temporary_patches.moe_utils_sonic import forward_sonic_moe\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
     if "_bnb4bit_experts_forward_or_none" in new_source:
         # The patched Qwen3-VL-MoE expert forwards call it first, before any weight check.
         imports += "from unsloth_zoo.temporary_patches.qwen3_vl_moe import _bnb4bit_experts_forward_or_none\n"
+    if "_fused_route_or_none" in new_source:
+        # The zoo gpt-oss / Qwen3-MoE / Qwen3-VL-MoE / grouped ModuleList routers call it on
+        # every forward (it returns None unless UNSLOTH_MOE_FUSED_ROUTER=1), and their source
+        # is copied here without the patch module's globals. Same fallback as those modules.
+        imports += (
+            "try:\n"
+            "    from unsloth_zoo.temporary_patches.moe_router_triton import fused_route_or_none as _fused_route_or_none\n"
+            "except Exception:\n"
+            "    def _fused_route_or_none(*args, **kwargs):\n"
+            "        return None\n"
+        )
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
@@ -2186,7 +2263,7 @@ def create_new_function(
             _valid_items = items  # Fall back to all items if module load fails
         if _valid_items:
             imports += f"from {model_location} import (" + ", ".join(_valid_items) + ")"
-    new_source = imports + "\n\n" + new_source
+    new_source = imports + "\n\n" + _absolute_relative_imports(new_source, model_location)
     # Check logger and remove use_cache
     if "logger" in items:
         new_source = new_source + "\n" + disble_use_cache_logging + "\n"
@@ -3205,7 +3282,12 @@ pass
 
 
 def mask_attention_mask_out(labels = None, attention_mask = None):
-    if labels is not None and attention_mask is not None:
+    # Only a mask over the labels' own positions: MusicGen's attention_mask is the text encoder's,
+    # while its labels are decoder codebook frames.
+    if (
+        labels is not None and attention_mask is not None
+        and tuple(attention_mask.shape) == tuple(labels.shape)
+    ):
         attention_mask = attention_mask.to(device = labels.device)
         labels[attention_mask == 0] = -100
     return labels
@@ -5868,7 +5950,9 @@ def _patch_torch_dtype_modules(
                 import re as _re
                 m = _re.search(r"def forward\(self,\s*(\w+)", source)
                 param_name = m.group(1) if m else "input"
-                if disable:
+                # F.batch_norm has no autocast rule, so a float32 input against a bfloat16 weight
+                # (Canary's conformer under QLoRA) raises compiled too; matching dtypes make the cast a no-op.
+                if disable or module.startswith("BatchNorm"):
                     # Eager F.layer_norm needs input dtype == weight dtype: cast in
                     # and out. Compiled path left untouched (adding the cast there
                     # changes batched numerics). weight is None when affine=False.
@@ -6255,6 +6339,7 @@ def unsloth_compile_transformers(
     scaled_dot_product_attention_modules = []
     full_attention_modules = []
     router_logit_cast_modules = []
+    rnn_modules = []
 
     for module in torch_modules:
         source = eval(f"modeling_file.{module}")
@@ -6264,6 +6349,9 @@ def unsloth_compile_transformers(
             continue
         if "_gradient_checkpointing_func" in source:
             gradient_checkpointed_modules.append(module)
+        elif re.search(r"\bnn\.(?:LSTM|GRU|RNN)\(", source):
+            # Dynamo refuses to trace RNN modules (EnCodec's EncodecLSTM in MusicGen).
+            rnn_modules.append(module)
         elif (
             "scaled_dot_product_attention" in source
             or "ALL_ATTENTION_FUNCTIONS" in source
@@ -6287,6 +6375,7 @@ def unsloth_compile_transformers(
         scaled_dot_product_attention_modules
         + full_attention_modules
         + gradient_checkpointed_modules
+        + rnn_modules
     )
     torch_modules = [x for x in torch_modules if x not in removal]
 
@@ -6369,6 +6458,13 @@ def unsloth_compile_transformers(
 
     # Check if fullgraph can be used
     torch_modules = {x: True for x in torch_modules}
+    disabled_attention_modules = (
+        full_attention_modules
+        + (scaled_dot_product_attention_modules if (disable or sdpa_dynamic_compile) else [])
+        if compile_attention
+        else []
+    )
+    torch_module_inits = {}
     for module in torch_modules.keys():
         source = eval(f"modeling_file.{module}")
         try:
@@ -6376,6 +6472,11 @@ def unsloth_compile_transformers(
         except:
             continue
         fullgraph = not ("nn.Linear" in source or "nn.ModuleList" in source)
+
+        # Dynamo cannot inline a compile-disabled attention forward into a fullgraph region (UMT5LayerSelfAttention).
+        if any(re.search(rf"\b{re.escape(x)}\(", source) for x in disabled_attention_modules):
+            fullgraph = False
+        torch_module_inits[module] = source
 
         # Eg SiglipVisionEmbeddings and CLIPVisionEmbeddings
         if str(module).endswith("VisionEmbeddings"):
@@ -6392,6 +6493,9 @@ def unsloth_compile_transformers(
         pass
         torch_modules[module] = fullgraph if UNSLOTH_FULLGRAPH else False
     pass
+    disabled_attention_wrappers = modules_wrapping_disabled_attention(
+        torch_module_inits, disabled_attention_modules
+    )
 
     # Get other classes
     other_classes = re.findall(r"class ([^\s]{1,})\(.+?\)", full_source)
@@ -6551,6 +6655,7 @@ def unsloth_compile_transformers(
             "attn_weights" in source
             or "self.self_attn" in source
             or "_ATTENTION_CLASSES" in init
+            or module in disabled_attention_wrappers
         ):
             print(
                 f"Unsloth: Will not compile {module} since it looks like it calls attention modules!"
@@ -6614,6 +6719,15 @@ def unsloth_compile_transformers(
         if "for layer in self." in source:
             print(
                 f"Unsloth: Failed compiling function {module} since it looks like a decoder!"
+            )
+            bad_torch_modules.add(module)
+        pass
+
+        if module not in bad_torch_modules and loops_over_checkpointed_layers(
+            modeling_file, init, source
+        ):
+            print(
+                f"Unsloth: Will not compile {module} since it loops over gradient checkpointed layers."
             )
             bad_torch_modules.add(module)
         pass
