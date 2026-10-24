@@ -334,11 +334,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         """
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
-        # GradScaler.get_scale() is a Python float. Handed to the compiled accumulate_chunk as
-        # is, grad_and_value makes dynamo guard on its value (scaling == 65536.0), so every
-        # scale change (an fp16 overflow, a growth step) recompiles until the recompile limit,
-        # then the chunk loop runs eager. A 0-dim float32 tensor holds the same value: the
-        # float32 loss is multiplied in float32 either way. ctx.scaling keeps the float.
+        # A float GradScaler scale makes dynamo guard on its value, so every scale change recompiled
+        # the chunk loop; a 0-dim float32 tensor gives the same float32 product. ctx.scaling keeps the float.
         chunk_scaling = scaling
         if scaling is not None and not torch.is_tensor(scaling):
             chunk_scaling = torch.full((), float(scaling), dtype = torch.float32, device = device)
