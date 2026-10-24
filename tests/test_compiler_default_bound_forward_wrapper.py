@@ -17,21 +17,11 @@
 """`create_standalone_class` against a forward wrapped by a function that binds
 the original through a default argument.
 
-`_force_slow_path_on_raising_mamba_mixers` in `temporary_patches/misc.py`
-replaces `JambaMambaMixer.forward` / `ZambaMambaMixer.forward` with
-
-    def _slow_only(self, *a, __orig = _mixer.forward, **kw): ...
-
-whenever the mamba fast kernels are missing. The compiler read that wrapper as
-a renamed temporary-patch forward and emitted it verbatim at module scope, so
-the default expression `_mixer.forward` (a local of the patch) made
-`unsloth_compiled_module_jamba` fail to import with
-`NameError: name '_mixer' is not defined`, before the first training step.
-
-The fakes run the REAL patch function (extracted by AST) against fake modules
-registered under the transformers names, so neither transformers nor a GPU is
-needed. A second group repeats the check on the installed transformers' Jamba
-and Zamba mixers when they import.
+`_force_slow_path_on_raising_mamba_mixers` (`temporary_patches/misc.py`) installs
+`def _slow_only(self, *a, __orig = _mixer.forward, **kw)` on Jamba / Zamba mamba
+mixers. Emitted verbatim, `_mixer` is undefined and the compiled module fails to
+import with `NameError`. Fakes run the real patch (extracted by AST), so no
+transformers or GPU is needed; a second group uses the installed transformers.
 """
 
 import ast
@@ -124,8 +114,7 @@ def _install_fakes(tmp_path, monkeypatch, decorated):
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, file_name, module)
         spec.loader.exec_module(module)
-        # The patch looks the module up by its transformers name, the compiler
-        # by `eval(f"{model_location}.{module}")` in its own namespace.
+        # The patch finds the module by its transformers name, the compiler via eval.
         monkeypatch.setitem(sys.modules, module_name, module)
         monkeypatch.setattr(compiler, file_name, module, raising = False)
         modules[key] = (file_name, class_name, module)
@@ -149,8 +138,6 @@ def test_default_bound_wrapper_emits_the_real_forward(tmp_path, monkeypatch, key
     file_name, class_name, module = modules[key]
     cls = getattr(module, class_name)
 
-    # The premise: the class attribute is the patch's wrapper, whose source
-    # names a local of the patch in a default argument.
     assert cls.forward.__name__ == "_slow_only"
     assert "_mixer.forward" in inspect.getsource(cls.forward)
 
@@ -165,8 +152,7 @@ def test_default_bound_wrapper_emits_the_real_forward(tmp_path, monkeypatch, key
     }
     exec(generated, namespace)
     generated_cls = namespace[class_name]
-    # The compiled class replaces the modeling class, and the patch re-runs on
-    # it: the slow-path guard must still wrap the generated forward.
+    # The patch re-runs on the compiled class; the guard must still wrap it.
     monkeypatch.setattr(module, class_name, generated_cls)
     force_slow_path()
     assert generated_cls.forward.__name__ == "_slow_only"
@@ -243,7 +229,6 @@ def test_installed_transformers_mixer_generates(monkeypatch, key):
     monkeypatch.setattr(compiler, "transformers", transformers, raising = False)
     cls = getattr(module, class_name)
     config_cls = getattr(config_module, CONFIGS[config_module.__name__])
-    # Restore everything the patch touches once the test ends.
     monkeypatch.setattr(cls, "forward", cls.__dict__["forward"])
     monkeypatch.setattr(config_cls, "__init__", config_cls.__dict__["__init__"])
     if not cls.__dict__.get("_unsloth_slow_only", False):

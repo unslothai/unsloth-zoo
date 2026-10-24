@@ -2853,12 +2853,9 @@ def _unwrap_undecorated_method(func, owner_qualname):
     standalone function from that emits `return wrapped(self, *args, **kwargs)`
     under the real named signature, which is a `NameError` at the first forward.
 
-    A wrapper can also bind the original through a default argument instead of
-    a closure, e.g. `def _slow_only(self, *a, __orig = _mixer.forward, **kw)` in
-    `temporary_patches/misc.py` for Jamba / Zamba mamba mixers. Its source
-    cannot be re-emitted: the default expression names a local of the patch
-    (`_mixer`), so the generated module raises `NameError: name '_mixer' is not
-    defined` at import. Function-valued defaults are walked like closure cells.
+    A wrapper can also bind the original through a default argument (Jamba /
+    Zamba `_slow_only` in `temporary_patches/misc.py`); its default names a patch
+    local, so re-emitting it raises `NameError`. Such defaults are walked too.
 
     Walk `__wrapped__` and then single function closure cells or defaults until
     we land on a function that really belongs to `owner_qualname`. If no such
