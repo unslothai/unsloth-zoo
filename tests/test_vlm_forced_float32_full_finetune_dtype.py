@@ -16,17 +16,13 @@
 
 """fp16 full finetuning of Gemma3-VL / Gemma4-VL on a GPU without bfloat16 (T4, V100).
 
-Those models force float32: the forced RMSNorm patches compute in float32 and emit fp16,
-which matches the fp16 Linears of LoRA. Full finetuning upcasts the weights to float32 and,
-without bfloat16, trains with no autocast, so every consumer of a norm the text-path fix
-(test_gemma3_forced_float32_boundary_dtype.py) did not cover died with
-"expected mat1 and mat2 to have the same dtype ... Half != float":
+The forced RMSNorms emit fp16; full finetuning has fp32 weights and no autocast, so these
+consumers died with "expected mat1 and mat2 to have the same dtype ... Half != float":
   * Gemma3MultiModalProjector: torch.matmul(mm_soft_emb_norm(x), mm_input_projection_weight)
   * Gemma4ClippableLinear (vision tower q / k / v / o / MLP projections)
   * Gemma4TextMLP (gate_proj) and the forced Gemma4 text attention (q_proj in, o_proj out)
   * SDPA in Gemma4VisionAttention: RoPE leaves q / k float32 while v_norm emits fp16
-The real patched forwards run on CPU (dtype errors raise there too). fp16 weights (LoRA)
-must stay bit-for-bit what they were.
+Runs on CPU; fp16 weights (LoRA) must stay bit-for-bit unchanged.
 """
 
 from __future__ import annotations

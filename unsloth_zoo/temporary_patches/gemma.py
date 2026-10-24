@@ -691,9 +691,8 @@ def patch_Gemma3MultiModalProjector():
         pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
 
         normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
-        # mm_soft_emb_norm is a Gemma3RMSNorm, which emits fp16 here. That matches the fp16
-        # projection weight of LoRA / QLoRA, but full finetuning upcasts it to fp32 and runs
-        # without autocast, so torch.matmul would see Half against float.
+        # mm_soft_emb_norm emits fp16; full finetuning has an fp32 weight and no autocast,
+        # so torch.matmul would see Half against float.
         normed_vision_outputs = _to_boundary_dtype(
             normed_vision_outputs, _linear_boundary_dtype(self, "mm_input_projection_weight")
         )

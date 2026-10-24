@@ -362,9 +362,7 @@ TEMPORARY_PATCHES.append(patch_Gemma4RMSNorm)
 
 
 def patch_Gemma4ClippableLinear():
-    """Gemma4RMSNorm above always emits fp16, which matches the fp16 vision / audio Linears of LoRA.
-    Full finetuning upcasts them to fp32 and trains without autocast, so the fp16 activation must
-    meet the weight's dtype (identity on LoRA, where they already agree)."""
+    """Cast the fp16 norm output to the Linear's dtype (fp32 on full finetuning; identity on LoRA)."""
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     for module, prefix in _gemma4_text_variants("ClippableLinear"):
         publish_to_modeling_module(
@@ -424,8 +422,7 @@ def _patch_gemma4_text_attention(module, prefix):
         cos = cos.to(torch.float32)
         sin = sin.to(torch.float32)
 
-        # hidden_states is fp16 out of the forced RMSNorm, matching LoRA's fp16 projections; full
-        # finetuning upcasts them to fp32 without autocast, so meet them there (identity on LoRA).
+        # fp16 norm output meets fp32 projections on full finetuning (identity on LoRA).
         if not torch.is_autocast_enabled(hidden_states.device.type):
             hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "q_proj"))
 
@@ -555,8 +552,7 @@ def _patch_gemma4_text_attention(module, prefix):
 
         # (b, q, h, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
         attn_output = attn_output.contiguous().reshape(*input_shape, -1)
-        # fp16 for the fp16 o_proj of LoRA; full finetuning upcasts o_proj to fp32 and runs without
-        # autocast, so meet it there (a weight that does not answer, 4bit, still means fp16).
+        # Match o_proj's dtype (fp32 on full finetuning); 4bit / unknown weights stay fp16.
         if torch.is_autocast_enabled(attn_output.device.type):
             attn_output = attn_output.to(torch.float16)
         else:
