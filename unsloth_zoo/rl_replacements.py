@@ -1259,8 +1259,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
 
         # Mixed precision scaling if present.
         scaling = scaler.get_scale() if scaler is not None else 1.0
-        # A float scale makes dynamo guard on its value (a recompile per scale change); the loss is
-        # float32, so a 0-dim float32 tensor gives the same product.
+        # A float scale is a dynamo guard (recompile per change); a float32 0-dim tensor is not.
         if scaler is not None and not torch.is_tensor(scaling):
             scaling = torch.full((), float(scaling), dtype = torch.float32, device = device)
 

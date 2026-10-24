@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A changing fp16 GradScaler scale must not recompile the GRPO chunk loop.
-
-UnslothEfficientGRPO read GradScaler.get_scale(), a Python float, and passed it
-straight into the compiled accumulate_chunk, where grad_and_value made dynamo
-guard on its value (``scaling == 65536.0``). Each overflow halving and each
-growth step built a new graph, and after the recompile limit the chunk loop
-ran eager.
-"""
+"""A changing GradScaler scale must not recompile the GRPO chunk loop (dynamo guarded the float)."""
 
 import pytest
 import torch
@@ -80,8 +73,7 @@ def test_scale_changes_reuse_one_graph():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_scaled_gradient_is_unchanged(dtype):
-    # GradScaler scales are powers of two, so the gradient is exactly scale times the
-    # scaling = 1 gradient, and the returned loss is the unscaled float32 one.
+    # Power-of-two scales: grad is exactly scale * unscaled grad; loss stays unscaled float32.
     loss_1, grad_1 = _run(1.0, dtype, seed = 1)
     assert loss_1.dtype == torch.float32 and grad_1.dtype == dtype
     for scale in (1024.0, 0.5):
