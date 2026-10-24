@@ -5707,6 +5707,24 @@ def _moe_weight_dtype_kwargs(tuner, module, name, dtype, device = None):
     return kwargs
 
 
+# tl.dot needs tile dims >= 16 and the kernels static_assert K % BLOCK_SIZE_K == 0 (N likewise); the tile
+# fitter stops at 16, so a hidden or MoE intermediate size that is not a multiple of 16 cannot compile.
+_TRITON_GROUPED_GEMM_DIM_MULTIPLE = 16
+
+
+def _triton_grouped_gemm_dims_supported(module, hidden_dim) -> bool:
+    try:
+        gate_up = module.gate_up_proj
+        if _experts_are_input_major(module, "gate_up_proj", hidden_dim):
+            intermediate_dim = gate_up.shape[-1] // 2
+        else:
+            intermediate_dim = gate_up.shape[1] // 2
+    except Exception:
+        return True
+    m = _TRITON_GROUPED_GEMM_DIM_MULTIPLE
+    return hidden_dim % m == 0 and intermediate_dim % m == 0
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -5715,6 +5733,12 @@ def forward_triton_grouped_gemm(
 ) -> torch.Tensor:
     """Grouped-GEMM MoE forward via Triton kernels (torch.compile-compatible, mode="max-autotune")."""
     # This Unsloth Zoo code section is licensed under AGPL3
+
+    if not _triton_grouped_gemm_dims_supported(self, hidden_states.shape[-1]):
+        # Toy shapes (hidden_size 8): the same routing on grouped_mm, else the eager loop; neither has the tile limit.
+        if _check_torch_grouped_mm_supported(hidden_states.device):
+            return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+        return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
     from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
     from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
