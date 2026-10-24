@@ -2455,6 +2455,67 @@ pass
 RL_REPLACEMENTS["grpo_rollout_as_old_ratio_metrics"] = grpo_rollout_as_old_ratio_metrics
 
 
+def grpo_active_model_rows(trainer, model, advantages, loss_type, vision_inputs, need_entropy, rollout_as_old):
+    """UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE=1 opts into compacting model scoring.
+
+    The opt-in requires a deterministic dense text model with independent rows;
+    the guards below reject common violations and distributed execution.
+    Keep one row in an all-zero batch: its ordinary backward produces zero gradients
+    for the parameters the model actually uses, preserving optimizer updates.
+    """
+    if os.environ.get("UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE", "0") != "1":
+        return None
+    args = trainer.args
+    if (
+        not model.training or not torch.is_grad_enabled()
+        or trainer.beta != 0.0 or loss_type not in ("grpo", "dapo")
+        or need_entropy or rollout_as_old
+        or getattr(args, "use_adaptive_entropy", False)
+        or getattr(args, "top_entropy_quantile", 1.0) not in (None, 1.0)
+        or getattr(trainer, "aux_loss_enabled", False)
+        or getattr(trainer, "is_deepspeed_enabled", False)
+        or getattr(trainer, "is_fsdp_enabled", False)
+        or getattr(trainer.accelerator, "num_processes", 1) != 1
+        or any(value is not None for value in vision_inputs.values())
+        or advantages.ndim not in (1, 2)
+        or (advantages.ndim == 2 and advantages.shape[1] != 1)
+        or advantages.shape[0] <= 1
+    ):
+        return None
+    rows = (advantages.reshape(-1) != 0).nonzero(as_tuple = True)[0]
+    if rows.numel() == advantages.shape[0]:
+        return None
+    # A dense deterministic forward must not couple examples or consume dropout RNG.
+    dropout_fields = (
+        "dropout", "attention_dropout", "hidden_dropout", "hidden_dropout_prob",
+        "attention_probs_dropout_prob", "attn_pdrop", "resid_pdrop", "embd_pdrop",
+    )
+    expert_fields = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
+    aux_fields = ("router_aux_loss_coef", "aux_loss_coef", "auxiliary_loss_coef")
+    configs = [args]
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            return None
+        if isinstance(module, torch.nn.modules.dropout._DropoutNd) and module.training and module.p:
+            return None
+        config = getattr(module, "config", None)
+        if config is not None:
+            configs.append(config)
+            if hasattr(config, "get_text_config"):
+                configs.append(config.get_text_config())
+        if any(isinstance(getattr(module, name, None), (int, float)) and getattr(module, name) > 0
+               for name in dropout_fields):
+            return None
+    for config in configs:
+        if any(isinstance(getattr(config, name, None), (int, float)) and getattr(config, name) > 0
+               for name in (*dropout_fields, *aux_fields)):
+            return None
+        if any(isinstance(getattr(config, name, None), (int, float)) and getattr(config, name) > 1
+               for name in expert_fields):
+            return None
+    return rows if rows.numel() else torch.zeros(1, dtype = torch.long, device = advantages.device)
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -2485,6 +2546,7 @@ def grpo_accumulated_loss(
         grpo_rollout_logps_as_old,
         grpo_rollout_as_old_ratio_metrics,
         grpo_rollout_old_fill_unscored,
+        grpo_active_model_rows,
     )
     if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
         from unsloth_zoo.rl_replacements import (
@@ -2796,6 +2858,23 @@ def grpo_accumulated_loss(
 
         unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
+        model_rows = grpo_active_model_rows(
+            trainer, unwrapped_model, advantages, kwargs.get("loss_type", "grpo"),
+            vision_inputs, _need_entropy, _rollout_logps_as_old,
+        )
+        full_model_inputs = None
+        if model_rows is not None:
+            # Keep the full loss inputs and normalizers; only model scoring is compacted.
+            full_model_inputs = (
+                input_ids, attention_mask, completion_input_ids, completion_mask, left_pad_tokens_per_prompt,
+            )
+            model_rows = model_rows.to(input_ids.device)
+            input_ids, attention_mask, completion_input_ids, completion_mask, left_pad_tokens_per_prompt = (
+                tensor.index_select(0, model_rows.to(tensor.device)) for tensor in full_model_inputs
+            )
+            total_rows = input_ids.shape[0]
+            B = min(B, total_rows)
+
         for module in unwrapped_model.modules():
             if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_decice"):
                 module._hf_hook.io_same_decice = False
@@ -2901,7 +2980,8 @@ def grpo_accumulated_loss(
             grpo_accumulated_loss._pg_funcs = _pg_funcs
         # Skip PG under vLLM (fast_inference=True): rollout dominates the step, so the
         # saving is small and the first-use self-verify is net overhead.
-        _pg_engage = bool(_pg_funcs) and not getattr(trainer, "use_vllm", False) and not _need_entropy
+        # Compaction can remove individual members of a prompt group, breaking its fixed group size.
+        _pg_engage = bool(_pg_funcs) and not getattr(trainer, "use_vllm", False) and not _need_entropy and model_rows is None
 
         # ---- PrefixGrouper (GRPO shared-prompt dedup; UNSLOTH_GRPO_PREFIX_GROUPER=0 disables) ----
         # Each prompt's G completions share the prefix; PG forwards it once + the G suffixes
@@ -3526,6 +3606,16 @@ def grpo_accumulated_loss(
         if new_logprobs is None:
             # padded fallback (packing disabled / unsupported / not verified for this length)
             new_logprobs = torch.cat(all_logprobs_list, dim=0)
+
+        if full_model_inputs is not None:
+            input_ids, attention_mask, completion_input_ids, completion_mask, left_pad_tokens_per_prompt = full_model_inputs
+            # Zero-advantage rows contribute neither policy loss nor clipping metrics.
+            # Use old logps (ratio 1), or zero when old is implicit, to keep the full loss layout.
+            full_logprobs = (
+                old_logps.detach().to(new_logprobs).clone() if old_logps is not None
+                else new_logprobs.new_zeros(completion_mask.shape)
+            )
+            new_logprobs = full_logprobs.index_copy(0, model_rows.to(new_logprobs.device), new_logprobs)
 
         if kept_completion_rows is not None:
             completion_mask = completion_mask * kept_completion_rows.to(
