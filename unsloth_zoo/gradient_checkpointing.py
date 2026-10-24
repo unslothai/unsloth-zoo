@@ -1192,6 +1192,11 @@ GPU_BUFFER_DTYPE = None
 _FREE_CPU_SLOTS = []    # min-heap of returned slot indices
 _CPU_SLOT_TOP = 0       # slots [0, _CPU_SLOT_TOP) have been handed out at least once
 _CPU_SLOT_EPOCH = 0     # bumped by every pool reset; a lease from an older epoch is ignored
+# Each device copies through its own side stream, so a slot returned on one device and leased on
+# another needs an explicit order: with more than one offloading device, a release records an event
+# on the releasing device's side stream and the next lease from another device waits on it.
+_OFFLOAD_DEVICES = set()
+_SLOT_FENCES = {}       # slot index -> (device index, event recorded at release)
 
 
 def _reset_cpu_slots():
@@ -1199,14 +1204,15 @@ def _reset_cpu_slots():
     del _FREE_CPU_SLOTS[:]
     _CPU_SLOT_TOP = 0
     _CPU_SLOT_EPOCH += 1
+    _SLOT_FENCES.clear()
 pass
 
 
 class _CpuSlotLease:
     """One CPU_BUFFERS slot held by an offloaded checkpoint until its backward has read it."""
-    __slots__ = ("index", "epoch")
+    __slots__ = ("index", "epoch", "device", "stream")
 
-    def __init__(self):
+    def __init__(self, device = None, stream = None):
         global _CPU_SLOT_TOP
         if _FREE_CPU_SLOTS:
             self.index = heapq.heappop(_FREE_CPU_SLOTS)
@@ -1214,10 +1220,17 @@ class _CpuSlotLease:
             self.index = _CPU_SLOT_TOP
             _CPU_SLOT_TOP += 1
         self.epoch = _CPU_SLOT_EPOCH
+        self.device, self.stream = device, stream
+        _OFFLOAD_DEVICES.add(device)
+        fence = _SLOT_FENCES.pop(self.index, None)
+        if fence is not None and fence[0] != device and stream is not None:
+            stream.wait_event(fence[1])
 
     def release(self):
         index, self.index = self.index, None
         if index is not None and self.epoch == _CPU_SLOT_EPOCH:
+            if len(_OFFLOAD_DEVICES) > 1 and self.stream is not None:
+                _SLOT_FENCES[index] = (self.device, self.stream.record_event())
             heapq.heappush(_FREE_CPU_SLOTS, index)
 
     def __del__(self):
@@ -1443,7 +1456,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     _free_gpu_buffers_b()
                         pass
 
-                        lease = _CpuSlotLease()
+                        lease = _CpuSlotLease(device_index, EXTRA_STREAM)
                         CPU_INDEX = lease.index
                         # Extend buffer size
                         while CPU_INDEX >= len(CPU_BUFFERS):
