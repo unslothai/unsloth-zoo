@@ -215,3 +215,28 @@ def test_glm5_next_stock_mode_compiles_the_unchanged_mixer(tmp_path):
     assert child["graph_breaks"] == 0, child
     assert child["frames"] >= 1 or child["triton_stub"], child
     assert max(child["rel_errs"]) < 2e-2, child
+
+
+@pytest.mark.parametrize("model_type", sorted(MODULE_FORWARD_SOURCE_REWRITES))
+def test_unrolled_rewrite_publishes_its_helper_on_the_modeling_module(model_type, monkeypatch):
+    # Block compile rebinds a decoder layer's forward to its modeling module's globals, so the helper
+    # the unrolled mixer calls must resolve there, not only in the generated module.
+    import importlib
+
+    from unsloth_zoo.compiler import module_forward_source_rewrites
+
+    try:
+        modeling = importlib.import_module(f"transformers.models.{model_type}.modeling_{model_type}")
+    except Exception:
+        pytest.skip(f"transformers has no {model_type}")
+    monkeypatch.delattr(modeling, "unsloth_sinkhorn_knopp", raising = False)
+    monkeypatch.setenv("UNSLOTH_DSV4_MHC_FAST", "stock")
+    if not module_forward_source_rewrites(modeling, model_type):
+        pytest.skip(f"{model_type}: this transformers' mixer does not carry the Sinkhorn chain")
+    assert not hasattr(modeling, "unsloth_sinkhorn_knopp")  # stock compiles the source unchanged
+    monkeypatch.setenv("UNSLOTH_DSV4_MHC_FAST", "unrolled")
+    rewritten = module_forward_source_rewrites(modeling, model_type)
+    assert all("unsloth_sinkhorn_knopp" in source for source in rewritten.values())
+    from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
+
+    assert modeling.unsloth_sinkhorn_knopp is unsloth_sinkhorn_knopp

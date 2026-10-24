@@ -270,6 +270,13 @@ def module_forward_source_rewrites(modeling_file, model_type):
             continue
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
+            if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
+                # Block compile rebinds a layer's forward to its modeling module's globals, so the
+                # helper the rewritten forward calls must resolve there too, not only in the
+                # generated module that imports it.
+                from .temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
+
+                modeling_file.unsloth_sinkhorn_knopp = unsloth_sinkhorn_knopp
     return applicable
 
 
