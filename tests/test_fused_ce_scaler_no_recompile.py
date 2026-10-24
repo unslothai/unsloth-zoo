@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A changing fp16 GradScaler scale must not recompile the fused CE chunk loop.
-
-GradScaler.get_scale() is a Python float. Passed straight into the compiled
-accumulate_chunk, dynamo guarded on its value (``scaling == 65536.0``), so each
-overflow halving and each growth step built a new graph, and after the
-recompile limit the chunk loop ran eager.
-"""
+"""A float GradScaler scale guarded by value (``scaling == 65536.0``) recompiled the fused CE chunk loop per scale."""
 
 import pytest
 import torch
@@ -38,7 +32,6 @@ def _run(scaling, bsz = 2, qlen = 40, n_chunks = 4, seed = 0):
     weight = torch.randn(V, H, generator = g) * 0.05
     labels = torch.randint(0, V, (bsz, qlen), generator = g)
     loss = ce.unsloth_fused_ce_loss(None, hidden, weight, None, labels, scaling = scaling, n_chunks = n_chunks)
-    # The trainer backpropagates the GradScaler-scaled loss.
     (loss * (1.0 if scaling is None else scaling)).backward()
     return loss.detach(), hidden.grad
 
@@ -67,8 +60,7 @@ def test_scale_changes_reuse_one_graph():
 
 
 def test_scaled_gradient_is_unchanged():
-    # GradScaler scales are powers of two, so the scaled gradient is exactly scale times the
-    # scaling=1 gradient, and the returned loss is the unscaled one.
+    # Power-of-two scales: the scaled gradient is exactly scale times the scaling=1 gradient.
     loss_1, grad_1 = _run(1.0, seed = 1)
     for scale in (65536.0, 1024.0, 0.5):
         loss_s, grad_s = _run(scale, seed = 1)
