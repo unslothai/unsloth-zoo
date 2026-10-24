@@ -250,6 +250,10 @@ MODULE_FORWARD_SOURCE_REWRITES = {
     "deepseek_v41": {
         "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
+    # GLM-5.3-Flash carries the V4 Sinkhorn chain verbatim (transformers 5.17 - 5.20).
+    "glm5_next": {
+        "Glm5NextTextHyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
 }
 
 
@@ -266,6 +270,13 @@ def module_forward_source_rewrites(modeling_file, model_type):
             continue
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
+            if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
+                # Block compile rebinds a layer's forward to its modeling module's globals, so the
+                # helper the rewritten forward calls must resolve there too, not only in the
+                # generated module that imports it.
+                from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
+
+                modeling_file.unsloth_sinkhorn_knopp = unsloth_sinkhorn_knopp
     return applicable
 
 
@@ -2237,6 +2248,17 @@ def create_new_function(
     if "_bnb4bit_experts_forward_or_none" in new_source:
         # The patched Qwen3-VL-MoE expert forwards call it first, before any weight check.
         imports += "from unsloth_zoo.temporary_patches.qwen3_vl_moe import _bnb4bit_experts_forward_or_none\n"
+    if "_fused_route_or_none" in new_source:
+        # The zoo gpt-oss / Qwen3-MoE / Qwen3-VL-MoE / grouped ModuleList routers call it on
+        # every forward (it returns None unless UNSLOTH_MOE_FUSED_ROUTER=1), and their source
+        # is copied here without the patch module's globals. Same fallback as those modules.
+        imports += (
+            "try:\n"
+            "    from unsloth_zoo.temporary_patches.moe_router_triton import fused_route_or_none as _fused_route_or_none\n"
+            "except Exception:\n"
+            "    def _fused_route_or_none(*args, **kwargs):\n"
+            "        return None\n"
+        )
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
@@ -2842,9 +2864,13 @@ def _unwrap_undecorated_method(func, owner_qualname):
     standalone function from that emits `return wrapped(self, *args, **kwargs)`
     under the real named signature, which is a `NameError` at the first forward.
 
-    Walk `__wrapped__` and then single function closure cells until we land on a
-    function that really belongs to `owner_qualname`. If no such function is
-    found, return `func` unchanged so nothing else changes behaviour.
+    A wrapper can also bind the original through a default argument (Jamba /
+    Zamba `_slow_only` in `temporary_patches/misc.py`); its default names a patch
+    local, so re-emitting it raises `NameError`. Such defaults are walked too.
+
+    Walk `__wrapped__` and then single function closure cells or defaults until
+    we land on a function that really belongs to `owner_qualname`. If no such
+    function is found, return `func` unchanged so nothing else changes behaviour.
     """
     prefix = owner_qualname + "."
     if getattr(func, "__qualname__", "").startswith(prefix):
@@ -2854,17 +2880,22 @@ def _unwrap_undecorated_method(func, owner_qualname):
     for _ in range(10):
         candidate = getattr(current, "__wrapped__", None)
         if candidate is None:
-            cells = getattr(current, "__closure__", None)
-            if getattr(current, "__code__", None) is None or not cells:
+            if getattr(current, "__code__", None) is None:
                 break
             inner = []
-            for cell in cells:
+            for cell in getattr(current, "__closure__", None) or ():
                 try:
                     value = cell.cell_contents
                 except ValueError:
                     continue
                 if inspect.isfunction(value):
                     inner.append(value)
+            # Defaults only when no closure cell holds a function, so every
+            # wrapper the closure walk already resolved keeps its answer.
+            if not inner:
+                defaults = list(getattr(current, "__defaults__", None) or ())
+                defaults += list((getattr(current, "__kwdefaults__", None) or {}).values())
+                inner = [value for value in defaults if inspect.isfunction(value)]
             # More than one candidate is ambiguous, so leave `func` alone.
             if len(inner) != 1:
                 break
@@ -5694,6 +5725,8 @@ DISABLE_COMPILE_MODULES = [
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",
+    # GLM-5.3-Flash: same Sinkhorn mixer. Its HyperHead is an unweighted mean and stays compiled.
+    "Glm5NextTextHyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [

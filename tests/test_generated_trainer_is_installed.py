@@ -67,6 +67,10 @@ def _run(body: str, timeout: int = 900):
     # early-return: inherited here it would guarantee a plain SFTTrainer and so
     # fail this file on a healthy tree.
     env.pop("UNSLOTH_ALLOW_CPU", None)
+    # On a host with no accelerator unsloth now loads its CPU backend, which trains with
+    # trl's own SFTTrainer by design, so the generated class this file guards is never
+    # built there. Keep the GPU path or abort, as before the CPU backend existed.
+    env["UNSLOTH_DISABLE_CPU_FALLBACK"] = "1"
     return subprocess.run([sys.executable, "-c", script], capture_output=True,
                           text=True, timeout=timeout, env=env)
 

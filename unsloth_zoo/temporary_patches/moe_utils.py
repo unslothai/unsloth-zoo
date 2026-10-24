@@ -363,6 +363,30 @@ _assume_constant_result = getattr(torch.compiler, "assume_constant_result", None
     getattr(torch._dynamo, "assume_constant_result", lambda fn: fn)
 
 
+def _match_grouped_mm_dtypes(inputs, weight):
+    """torch._grouped_mm is not on autocast's cast list and needs equal operand dtypes.
+
+    fp16 full finetuning keeps float32 master expert weights; under fp16 autocast the
+    activations reaching the experts are fp16 and the grouped GEMM raised "expected mat1 and
+    mat2 to have the same dtype ... Half != float". Do what autocast does for F.linear: run in
+    the autocast dtype (the weight cast is autograd tracked, so the fp32 master still gets its
+    grad). Without autocast, promote to the wider dtype. Identity when the dtypes agree.
+    """
+    if inputs.dtype == weight.dtype or not (inputs.is_floating_point() and weight.is_floating_point()):
+        return inputs, weight
+    device_type = inputs.device.type
+    try:
+        autocast_dtype = (
+            torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type) else None
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        autocast_dtype = None
+    if autocast_dtype in (torch.float16, torch.bfloat16):
+        return inputs.to(autocast_dtype), weight.to(autocast_dtype)
+    dtype = torch.promote_types(inputs.dtype, weight.dtype)
+    return inputs.to(dtype), weight.to(dtype)
+
+
 def _grouped_mm_with_backward_fix(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
@@ -388,6 +412,9 @@ def _grouped_mm_with_backward_fix(
 
 
 def _grouped_mm_eager(inputs, weight, offsets):
+    # Mixed dtypes always land here: the Triton and compiled fp16 routes need equal dtypes.
+    if inputs.dtype != weight.dtype:
+        inputs, weight = _match_grouped_mm_dtypes(inputs, weight)
     inputs = inputs.contiguous()
     # The Triton backend is picked precisely when the probe says no, yet its separated
     # LoRA delta still routed here. torch 2.8 hard-raises unless `dprops->major == 9`
@@ -413,6 +440,10 @@ def _grouped_mm_eager(inputs, weight, offsets):
 
 def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
     """dW[g] = inputs[g]^T @ grad_output[g] per group, as [G, K, N]; empty groups are zero."""
+    # torch._grouped_mm rejects stride-0 (the grad of y.sum()) or unaligned operands, which sent eager dW to the
+    # per-expert loop below: a host sync, and a different reduction than the compiled path. No-op when contiguous.
+    inputs = inputs.contiguous()
+    grad_output = grad_output.contiguous()
     try:
         if _grouped_mm_supported_on(inputs.device):
             return torch._grouped_mm(inputs.transpose(-2, -1), grad_output, offs = offsets).contiguous()
@@ -3083,6 +3114,9 @@ def get_weight_preprocessor(model_type: str):
     return _weight_preprocessor_registry().get(model_type)
 
 
+_LOGICAL_SHAPE_MAX_DEPTH = 16  # PEFT / quant wrapper chains are a few levels deep
+
+
 def _logical_expert_shape(param):
     """Return the logical expert shape without dequantizing or materializing.
 
@@ -3092,9 +3126,11 @@ def _logical_expert_shape(param):
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    seen = set()
-    while param is not None and id(param) not in seen:
-        seen.add(id(param))
+    # Bounded walk, no id(): id() of a traced parameter guards on that object's identity, so a
+    # compiled decoder layer recompiled once per layer (each layer owns its expert parameters).
+    for _ in range(_LOGICAL_SHAPE_MAX_DEPTH):
+        if param is None:
+            break
 
         # Recorded logical shape avoids materializing a get_param provider.
         recorded = getattr(param, "_original_shape", None)
@@ -5144,18 +5180,27 @@ def patch_param_wrapper_for_moe():
 _WEIGHTED_UNPERMUTE = None
 
 
-def weighted_unpermute(*args, **kwargs):
-    """Fused Triton combine, or None so the caller falls back to the eager reduction."""
+def _resolve_weighted_unpermute():
     global _WEIGHTED_UNPERMUTE
     if _WEIGHTED_UNPERMUTE is None:
         try:
             from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
-        except ImportError:
+        except Exception:  # now runs at import too: a broken triton must not fail importing zoo
             _wu = False
         _WEIGHTED_UNPERMUTE = _wu
-    if _WEIGHTED_UNPERMUTE is False:
+    return _WEIGHTED_UNPERMUTE
+
+
+def weighted_unpermute(*args, **kwargs):
+    """Fused Triton combine, or None so the caller falls back to the eager reduction."""
+    if _resolve_weighted_unpermute() is False:
         return None
     return _WEIGHTED_UNPERMUTE(*args, **kwargs)
+
+
+# Resolved at import: a first-call assignment inside a compiled MoE block guards on the global being
+# None, so the next call recompiles every compiled decoder layer once.
+_resolve_weighted_unpermute()
 
 
 @lru_cache(maxsize=1)
@@ -5662,6 +5707,24 @@ def _moe_weight_dtype_kwargs(tuner, module, name, dtype, device = None):
     return kwargs
 
 
+# tl.dot needs tile dims >= 16 and the kernels static_assert K % BLOCK_SIZE_K == 0 (N likewise); the tile
+# fitter stops at 16, so a hidden or MoE intermediate size that is not a multiple of 16 cannot compile.
+_TRITON_GROUPED_GEMM_DIM_MULTIPLE = 16
+
+
+def _triton_grouped_gemm_dims_supported(module, hidden_dim) -> bool:
+    try:
+        gate_up = module.gate_up_proj
+        if _experts_are_input_major(module, "gate_up_proj", hidden_dim):
+            intermediate_dim = gate_up.shape[-1] // 2
+        else:
+            intermediate_dim = gate_up.shape[1] // 2
+    except Exception:
+        return True
+    m = _TRITON_GROUPED_GEMM_DIM_MULTIPLE
+    return hidden_dim % m == 0 and intermediate_dim % m == 0
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -5670,6 +5733,12 @@ def forward_triton_grouped_gemm(
 ) -> torch.Tensor:
     """Grouped-GEMM MoE forward via Triton kernels (torch.compile-compatible, mode="max-autotune")."""
     # This Unsloth Zoo code section is licensed under AGPL3
+
+    if not _triton_grouped_gemm_dims_supported(self, hidden_states.shape[-1]):
+        # Toy shapes (hidden_size 8): the same routing on grouped_mm, else the eager loop; neither has the tile limit.
+        if _check_torch_grouped_mm_supported(hidden_states.device):
+            return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+        return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
     from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
     from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels

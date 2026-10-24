@@ -10,6 +10,7 @@
 # see danielhanchen/unsloth-staging-2).
 
 import contextlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -389,6 +390,7 @@ def test_wide_verify_blocks_are_cut_into_balanced_slices_within_the_fused_bound(
 @pytest.mark.parametrize("width", [9, 17])
 def test_wide_verify_blocks_in_slices_match_the_native_verifier(qwen_4bit, monkeypatch, width):
     from unsloth_zoo.mlx import inference
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")  # slices serve the layouts `matmul.qmv_rows` does not cover
     (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)
     lm, block = model.language_model, mx.array([ids[0][24 : 24 + width]])
     first = -(-width // -(-width // 8))
@@ -403,6 +405,7 @@ def test_wide_verify_blocks_in_slices_match_the_native_verifier(qwen_4bit, monke
 
 def test_a_sliced_verify_block_matches_one_token_decode_steps(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
     (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)
     lm, block = model.language_model, mx.array([ids[0][24:39]])
     steps, snapshots, decoded = _clone(cache), {0: cache}, []
@@ -417,6 +420,157 @@ def test_a_sliced_verify_block_matches_one_token_decode_steps(qwen_4bit, monkeyp
     assert served
 
 
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_a_verify_block_runs_its_rows_together_and_matches_one_token_decode_steps(monkeypatch, bits):
+    import mlx.nn as nn
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference, matmul, nax
+    model, ids = _load(MODEL)
+    lm = model.language_model
+    nn.quantize(lm, group_size = 64, bits = bits)
+    cache = make_prompt_cache(lm)
+    mx.eval(lm(mx.array([ids[0][:24]]), cache = cache).logits)
+    block, calls = mx.array([ids[0][24:35]]), []
+    kernel = matmul.qmv_rows
+    kind = lambda inputs, staged: "prepared" if inputs is not None else "staged" if staged else "inline"
+    monkeypatch.setattr(matmul, "qmv_rows", lambda x, *args: calls.append((*x.shape, kind(*args[5:]))) or kernel(x, *args))
+    matmul.compile_qmv_rows.cache_clear()
+    # Launches are timed once per kernel; here staged launches are cheapest up to 16 rows, or prepared ones up to 4.
+    timed, cheaper = [], "staged" if bits in (4, 6) else "prepared"
+    costs = _spilling_costs(16, staged = 0.8) if cheaper == "staged" else _spilling_costs(4)
+    monkeypatch.setattr(inference, "_QMV_ROWS_COSTS", {})
+    monkeypatch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+    monkeypatch.setattr(matmul, "qmv_rows_launch_costs", lambda *kernel: timed.append(kernel) or costs)
+    steps, snapshots, decoded = _clone(cache), {0: cache}, []
+    for t in range(block.shape[1]):
+        decoded.append(lm(block[:, t : t + 1], cache = steps, **_captured(lm)))
+        if t + 1 in (1, 6, 11):
+            snapshots[t + 1] = _clone(steps)
+    stepped = SimpleNamespace(logits = mx.concatenate([out.logits for out in decoded], axis = 1), hidden_states = [mx.concatenate(parts, axis = 1) for parts in zip(*(out.hidden_states for out in decoded))])
+    projections = [p for _, p in lm.named_modules() if isinstance(p, nn.QuantizedLinear)]
+    model.generate, model._unsloth_speculates = lambda *args, **kwargs: None, True  # marked as building a drafter does
+    # Settled at load, outside any verify scope: every row count built, launches timed once, each layout checked.
+    inference.warm_inference(model)
+    with inference.exact_speculative_verify(model):
+        step = 512 if bits in (4, 5) else 256
+        assert {M for M, K, _ in calls if K == step} == set(range(1, 17)) and timed == [(mx.bfloat16, 64, bits)]
+        supported, support = [], matmul.qmv_rows_supported
+        monkeypatch.setattr(matmul, "qmv_rows_supported", lambda *args: supported.append(args) or support(*args))
+        calls.clear()
+        assert all(_same(_state(stepped, entries), _verified(lm, cache, block, keep)) for keep, entries in snapshots.items())
+        assert {(M, launched) for M, K, launched in calls} == {(M, cheaper) for M in ({11} if cheaper == "staged" else {4, 3})}  # 11 or 4 + 4 + 3
+        _verified(lm, cache, block[:, :5], 0)
+        assert (5 if cheaper == "staged" else 2, lm.args.hidden_size, cheaper) in calls and not supported
+        assert timed == [(mx.bfloat16, 64, bits)]
+        probe, recorded = nax.kernel_probe_passed, matmul.qmv_rows  # replaced scales settle again, natively if these fail
+        fresh = lambda: [setattr(p, "scales", mx.array(p.scales)) for p in projections]
+        for failed in ((nax, "kernel_probe_passed", lambda key, *args: not key.startswith(matmul.QMV_ROWS_PROBE_KEY) and probe(key, *args)),
+                       (matmul, "qmv_rows", lambda x, *args: recorded(x, *args) + (kind(*args[5:]) == "staged"))):
+            with monkeypatch.context() as patch:
+                patch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+                patch.setattr(*failed)
+                fresh()
+                inference._warm_qmv_rows(model)
+                calls.clear()
+                _verified(lm, cache, block, 0)
+                assert not calls and all(vars(p)["_unsloth_qmv_rows"][2] is None for p in projections)
+        fresh()  # without a warm-up the first block settles them, unless the kill switch is set
+        count, checked = len(calls), len(supported)
+        monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
+        inference.warm_inference(model)
+        _verified(lm, cache, block, 0)
+        assert len(calls) == count and len(supported) == checked
+        monkeypatch.delenv("UNSLOTH_MLX_VERIFY_QMV_ROWS")
+        _verified(lm, cache, block, 0)
+        assert len(calls) > count
+
+
+def _spilling_costs(most, prepared = 0.9, staged = 1):  # one unit per launch and per row; launches over `most` rows spill
+    per_row = {"inline": 1, "prepared": prepared, "staged": staged}
+    return {(m, kind): 1 + m * per_row[kind] if m <= most else 100 for kind in per_row
+            for m in range(1, 17 if kind == "staged" else 9)}
+
+
+def test_each_verify_rows_kernel_has_its_own_probe_building_only_that_kernel(monkeypatch):
+    import itertools
+    from unsloth_zoo.mlx import matmul
+    probed = []
+    monkeypatch.setattr(matmul, "_probe_qmv_rows", lambda *kernel: probed.append(kernel))
+    kernels = list(itertools.product((mx.bfloat16, mx.float16), (32, 64, 128), (4, 5, 6, 8)))
+    keys = set()
+    for kernel in kernels:
+        key, function = matmul.qmv_rows_probe(*kernel)
+        keys.add(key)
+        getattr(matmul, function)()
+        assert key.startswith(matmul.QMV_ROWS_PROBE_KEY + ":") and probed[-1] == kernel
+    assert len(keys) == len(kernels) == len(probed)
+    for name in ("probe_qmv_rows_bfloat16_64_3", "probe_qmv_rows_float32_64_4", "probe_qmv_rows_float16_48_4"):
+        with pytest.raises(AttributeError):
+            getattr(matmul, name)
+
+
+def test_verify_rows_serve_only_projections_whose_one_row_call_is_stock(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    monkeypatch.setattr(inference, "_QMV_ROWS_COSTS", {})
+    monkeypatch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+    monkeypatch.setattr(matmul, "qmv_rows_launch_costs", lambda *kernel: _spilling_costs(8))
+    supported, support = [], matmul.qmv_rows_supported
+    monkeypatch.setattr(matmul, "qmv_rows_supported", lambda *args: supported.append(args) or support(*args))
+    linear = nn.Linear(512, 64, bias = False)
+    linear.set_dtype(mx.bfloat16)
+    p = nn.QuantizedLinear.from_linear(linear, group_size = 64, bits = 4)
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4) and len(supported) == 1
+    # A wrapper zoo installs during generation, stock on one row, keeps the verdict settled at load.
+    stock_call = lambda self, x: nn.QuantizedLinear.__call__(self, x)
+    monkeypatch.setattr(inference, "_ONE_ROW_STOCK_CALLS", {stock_call})
+    p.__class__ = type("Wrapped", (nn.QuantizedLinear,), {"__call__": stock_call})
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4) and len(supported) == 1
+    # A subclass whose call changes the projection is never bypassed.
+    p.__class__ = type("Scaled", (nn.QuantizedLinear,), {"__call__": lambda self, x: nn.QuantizedLinear.__call__(self, x) * 2})
+    assert inference._qmv_rows_kernel(p) is None
+    p.__class__ = nn.QuantizedLinear
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4)
+    # Nor is the stock call once something rebinds it, until the MLX body is back.
+    linear_call = nn.QuantizedLinear.__call__
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: linear_call(self, x) * 2)
+    assert inference._qmv_rows_kernel(p) is None
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", linear_call)
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4)
+
+
+def test_verify_rows_launch_the_plan_their_launch_costs_make_cheapest():
+    from unsloth_zoo.mlx import matmul
+    plan = lambda costs, rows: matmul.qmv_rows_plan(tuple(costs.items()), rows)
+    # As few launches as fit under the spill, balanced, with the cheaper inputs.
+    assert plan(_spilling_costs(6), 16) == (6, "prepared") and matmul.qmv_rows_sizes(16, 6) == [6, 5, 5]
+    assert plan(_spilling_costs(8, prepared = 1.1), 16) == (8, "inline")
+    assert plan(_spilling_costs(8, staged = 0.8), 16) == (8, "staged")
+    assert plan(_spilling_costs(16, staged = 0.8), 16) == (16, "staged")
+    assert plan(_spilling_costs(4), 3) in {(3, "prepared"), (4, "prepared")}
+
+
+def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkeypatch):
+    from unsloth_zoo.mlx import matmul
+    now, spent, runs = [0.0], [0.0], {}
+
+    def clock():
+        now[0], spent[0] = now[0] + spent[0], 0.0
+        return now[0]
+
+    def launch(x, w, scales, biases, group_size, bits, inputs, staged):
+        rows, prepared = x.shape[0], inputs is not None
+        durations = (0, rows, 50, rows + 0.5 * prepared + 0.25 * staged)
+        spent[0] += next(runs.setdefault((rows, prepared, staged), iter([d for d in durations for _ in range(4)])))
+        return x
+    monkeypatch.setattr(matmul, "qmv_rows", launch)
+    monkeypatch.setattr(matmul, "qmv_rows_inputs", lambda x, bits: x)
+    # A warm run, then three timed runs of four launches each, every launch advancing the clock by its own time.
+    costs = matmul.qmv_rows_launch_costs(mx.bfloat16, 64, 4, clock)
+    extra = {"inline": 0, "prepared": 0.5, "staged": 0.25}
+    assert costs == {(m, kind): m + extra[kind] for kind in extra for m in range(1, 17 if kind == "staged" else 9)}
+
+
 def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(qwen_4bit, monkeypatch):
     import copy
     import mlx.nn as nn
@@ -424,6 +578,7 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
     from mlx_vlm.speculative.ops import linear as linear_ops
     from unsloth_zoo.mlx import inference
     (model, ids, cache), verdicts = qwen_4bit, inference._VERIFY_VERDICTS
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
     lm, verifier, native = model.language_model, language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
     unscoped, block = copy.copy(lm), mx.array([ids[0][24:36]])
     quantized = [module for _, module in lm.named_modules() if isinstance(module, nn.QuantizedLinear)]
@@ -492,11 +647,15 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
     # A row with no recurrent state yet.
     native_fresh = [_verified(lm, fresh, block[:1], keep) for keep in ([0], [1])]
     monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+    fused, block_fn = [], inference._verify_gdn_block
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args: fused.append(args) or block_fn(*args))
     with inference.exact_speculative_verify(model):
         _verified(lm, cache, block, 0)
         _verified(lm, fresh, block[:1], 0)
+        checked = len(fused)
         run, out = _verify_call(lm, cache, block)
-        assert len(out.gdn_states._unsloth_tapes) == sum(layer.is_linear for layer in lm.model.layers)
+        assert len(out.gdn_states._unsloth_tapes) == sum(layer.is_linear for layer in lm.model.layers) == len(fused) - checked
         # A refused commit keeps the tapes, and the retained lengths may come from any iterable.
         with pytest.raises(ValueError):
             out.gdn_states.commit(width + 1)
@@ -515,8 +674,10 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         out.gdn_states.commit(mx.array(keeps[0]))
         assert _same(native[0], _state(out, run))
         assert set(inference._TAPE_VERDICTS.values()) == {True}
-        # A replay that does not reproduce stock keeps that key on stock.
+        assert len(inference._VERIFY_GDN_VERDICTS) == 2 and all(inference._VERIFY_GDN_VERDICTS.values())
+        # A replay that does not reproduce stock keeps that key on stock, fused or not.
         inference._TAPE_VERDICTS.clear()
+        replay_matches = inference._replay_matches
         monkeypatch.setattr(inference, "_replay_matches", lambda *args: False)
         work = inference.first_use_work()
         _verified(lm, cache, block, 0)
@@ -525,12 +686,135 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         assert inference.first_use_work() > work
         out.gdn_states.commit(keeps[0])
         assert _same(native[0], _state(out, run))
+        # A fused block that differs from the verifier's ops keeps that key on them.
+        inference._TAPE_VERDICTS.clear()
+        inference._VERIFY_GDN_VERDICTS.clear()
+        monkeypatch.setattr(inference, "_replay_matches", replay_matches)
+        monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args: (lambda y, *rest: (y + 1, *rest))(*block_fn(*args)))
+        assert all(_same(native[0], _verified(lm, cache, block, keeps[0])) for _ in range(2))
+        assert set(inference._VERIFY_GDN_VERDICTS.values()) == {False}
 
 
 def _recurrence(rows, steps, heads = 4, width = 128):
     q, k, v = (mx.random.normal((rows, steps, heads, width), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in range(3))
     a, b = (mx.random.normal((rows, steps, heads), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in (3, 4))
     return q, k, v, a, b, mx.zeros((heads,)), mx.ones((heads,))
+
+
+def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, qwen4, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    model, ids, cache = qwen_4bit
+    launched, outputs, evaluated, block_fn, evaluate = [], [], [], inference._verify_gdn_block, mx.eval
+
+    def recorded(*args):
+        # The template arguments a call picks (LMAX and TY are constants): input dtypes, taps, heads and head widths.
+        launched.append((*(x.dtype for x in args if isinstance(x, mx.array)), args[1].shape[1], args[6].shape[2],
+                         args[-1], args[6].shape[3], args[-2].shape[3]))
+        outputs.append(block_fn(*args))
+        return outputs[-1]
+    monkeypatch.setattr(inference, "_verify_gdn_block", recorded)
+    monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+    monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    monkeypatch.setattr(model, "generate", lambda *args, **kwargs: None, raising = False)
+    monkeypatch.setattr(model, "_unsloth_speculates", False, raising = False)
+    with monkeypatch.context() as patch:
+        # A launch builds its pipeline only once evaluated.
+        patch.setattr(mx, "eval", lambda *arrays: evaluated.extend(arrays) or evaluate(*arrays))
+        inference.warm_inference(model)
+    assert outputs and all(any(out is x for x in evaluated) for out in outputs)
+    warmed = set(launched)
+    assert not inference._VERIFY_GDN_VERDICTS
+    # For a model a drafter was built for, each block width's checks run there too, so no block pays them.
+    monkeypatch.setattr(model, "_unsloth_speculates", True, raising = False)
+    inference.warm_inference(model)
+    with inference.exact_speculative_verify(model):
+        widths = range(3, inference._VERIFY_GDN_MAX_ROWS + 1)
+        assert sorted(key[0] for key in inference._VERIFY_GDN_VERDICTS) == list(widths)
+        assert all(inference._VERIFY_GDN_VERDICTS.values()) and set(launched) == warmed
+        for width in (3, 8):
+            launched.clear()
+            work = inference.first_use_work()
+            _verified(model.language_model, cache, mx.array([ids[0][24 : 24 + width]]), 0)
+            assert inference.first_use_work() == work and set(launched) == warmed
+    assert len(warmed) == 1
+    # A build the runtime rejects leaves warm-up to the native ops: one attempt per shape, no verdicts.
+    builds, errors = [], [RuntimeError("[metal::Device] Unable to build metal library from source")]
+
+    def rejected(*args):
+        builds.append(args)
+        raise errors[-1]
+    with monkeypatch.context() as patch:
+        patch.setattr(inference, "_verify_gdn_block", rejected)
+        patch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+        inference.warm_inference(model)
+        assert len(builds) == 1 and not inference._VERIFY_GDN_VERDICTS
+        # A block evaluated inside a function transformation or under memory pressure is checked on a later one; a
+        # rejected build is not retried.
+        block = lambda: _verified(model.language_model, cache, mx.array([ids[0][24 : 27]]), 0)
+        with inference.exact_speculative_verify(model):
+            for later in (ValueError("[eval] Attempting to eval an array during function transformations"),
+                          RuntimeError("[malloc] Unable to allocate 1048576 bytes.")):
+                errors.append(later)
+                tried = len(builds)
+                block()
+                assert len(builds) > tried + 1 and not inference._VERIFY_GDN_VERDICTS  # each layer tried
+                errors.pop()
+            tried = len(builds)
+            block()
+            block()
+        assert len(builds) == tried + 1 and list(inference._VERIFY_GDN_VERDICTS.values()) == [False]
+    # A CPU load verifies on the native ops, so it builds nothing.
+    launched.clear()
+    device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        inference.warm_inference(model)
+    finally:
+        mx.set_default_device(device)
+    assert not launched
+    # Nor does a qwen4_exp load: its gated-delta layers verify through its own forward.
+    monkeypatch.setattr(qwen4[0], "generate", lambda *args, **kwargs: None, raising = False)
+    inference.warm_inference(qwen4[0])
+    assert not launched
+
+
+def test_the_fused_verify_block_takes_gpu_blocks_only(qwen_4bit):
+    from unsloth_zoo.mlx.inference import _verify_gdn_fits
+    model, _, _ = qwen_4bit
+    lm = model.language_model
+    layer = next(layer.linear_attn for layer in lm.model.layers if layer.is_linear)
+    cache = type("Window", (), {"history_capacity": 3, "__getitem__": lambda self, index: None})()
+    inputs = mx.zeros((1, 3, lm.args.hidden_size), mx.bfloat16)
+    assert _verify_gdn_fits(layer, inputs, None, cache)
+    device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        assert not _verify_gdn_fits(layer, inputs, None, cache)
+    finally:
+        mx.set_default_device(device)
+
+
+@pytest.mark.parametrize("length", [3, 9])
+def test_the_fused_verify_block_matches_the_verifiers_ops_with_grouped_value_heads(length):
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_update_with_states
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5RMSNormGated
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from unsloth_zoo.mlx.inference import _verify_gdn_block
+    rows, Hk, Hv, D, K = 2, 2, 6, 128, 4
+    C = (2 * Hk + Hv) * D
+    rand = lambda seed, *shape: mx.random.normal(shape, key = mx.random.key(seed)).astype(mx.bfloat16)
+    conv, norm = nn.Conv1d(C, C, K, groups = C, bias = False), Qwen3_5RMSNormGated(D, eps = 1e-6)
+    conv.weight, norm.weight = rand(0, C, K, 1), 1 + 0.1 * rand(1, D)
+    conv_input, a, b, z = rand(2, rows, K - 1 + length, C), rand(3, rows, length, Hv), rand(4, rows, length, Hv), rand(5, rows, length, Hv, D)
+    A_log, dt_bias = mx.log(mx.arange(1, Hv + 1, dtype = mx.float32)), 1 + 0.1 * rand(6, Hv)
+    state = 0.05 * mx.random.normal((rows, Hv, D, D), key = mx.random.key(7))
+    q, k, v = [x.reshape(rows, length, h, D) for x, h in zip(mx.split(nn.silu(conv(conv_input)), [Hk * D, 2 * Hk * D], -1), (Hk, Hk, Hv))]
+    q, k = Qwen3_5BatchInvariantForward._normalize_gated_delta_qk(None, q, k)
+    out, final, _ = gated_delta_update_with_states(q, k, v, a, b, A_log, dt_bias, state, state_steps = 0)
+    got = _verify_gdn_block(conv_input, conv.weight.reshape(C, K), a, b, A_log, dt_bias, z, norm.weight, 1e-6, 1e-6, state, Hk)
+    assert all(x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+               for x, y in zip(got, (norm(out, z), final, q, k, v)))
 
 
 def test_replay_admission_refuses_a_replay_one_bit_off_or_misreading_retained_lengths():
@@ -607,7 +891,7 @@ def test_a_served_verify_call_submits_each_layer_as_it_is_built(qwen_4bit, monke
 def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ragged_rounds(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference
     from unsloth_zoo.mlx.generate import SamplingParams
-    (model, ids, _), served = qwen_4bit, _serving(monkeypatch)
+    (model, ids, _), _ = qwen_4bit, _serving(monkeypatch)
     ban = lambda history, logits: logits + mx.where(mx.arange(logits.shape[-1]) == 13, -1e9, 0)
 
     def run():
@@ -621,14 +905,15 @@ def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ra
         return out, scores, drafted, (first_use, verified)
     closed, scores, drafted, _ = run()
     inference._VERIFY_VERDICTS.clear()
+    # Projections earlier tests settled settle again, so the first blocks run their first-use checks.
+    monkeypatch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+    for _, module in model.named_modules():
+        vars(module).pop("_unsloth_qmv_rows", None)
     with inference.exact_speculative_verify(model):
         opened = run()
     assert opened[:2] == (closed, scores) and any(scores) and drafted[0][1] > 8 and len({accepted for _, accepted in drafted.values()}) > 1
     # Exactly the rounds whose verify ran a first-use check are flagged, so the controller leaves just those out of its costs.
     assert opened[3][0] == opened[3][1] and any(opened[3][0]) and not all(opened[3][0])
-    wide = [key for key, verdict in inference._VERIFY_VERDICTS.items() if key[0][0] == 3 and key[0][1] > 8 and verdict]
-    # Each admitted key's replacement ran once for the comparison, then again for every later round it served.
-    assert any(served.count(key) > 1 for key in wide)
 
 
 def _decoded(lm, prompt, steps, block):
@@ -657,8 +942,16 @@ def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit
     assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is native and "_unsloth_verify_scopes" not in vars(lm)
     # The first decode step and the verify block each matched on their first layer, then served every other one.
     admitted = [key for key, verdict in inference._VERIFY_VERDICTS.items() if verdict]
-    assert {key[0] for key in admitted} == {(1, 1), (1, 5)}
-    assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted)
+    assert {key[0] for key in admitted} == {(1, 1), (1, 5)} and all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted)
+    # A drafted target settles its projections' multi-row kernels at load, through the batch-invariant forward too.
+    projections = [p for _, p in lm.named_modules() if type(p).__name__ == "QuantizedLinear"]
+    for p in projections:
+        p.__dict__.pop("_unsloth_qmv_rows", None)
+    monkeypatch.setattr(model, "generate", lambda *args, **kwargs: None, raising = False)
+    monkeypatch.setattr(model, "_unsloth_speculates", True, raising = False)
+    inference.warm_inference(model)
+    tags = [vars(p).get("_unsloth_qmv_rows") for p in projections]
+    assert projections and all(tags) and any(tag[2] for tag in tags)
 
 
 def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qwen4):
@@ -891,6 +1184,26 @@ def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag, monkey
     assert sum(count for count, _ in accepted) >= (0.6 if max_lag >= 8 else 0.5) * sum(length for _, length in accepted)
 
 
+def test_an_mtp_heads_cache_holds_only_target_hidden_pairs_however_its_drafts_fared(qwen_mtp):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids = qwen_mtp
+    drafter, chunks, compared = _drafter(model, max_lag = 4096), [[]], []
+    push, catch_up, draft = drafter.push, drafter.catch_up, drafter.draft
+    drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
+    drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
+    def against_replay(cache, rows, depth, target):
+        fresh, position = drafter.new_cache(), 0
+        for chunk in filter(None, chunks):
+            tokens, hidden = sum((t for t, _ in chunk), []), mx.concatenate([h for _, h in chunk])
+            last = drafter._forward(fresh, mx.array([tokens]), hidden[None], mx.arange(position, position + len(tokens))[None])[:, -1:]
+            position += len(tokens)
+        compared.append(mx.array_equal(rows[0].last, last).item() and all(mx.array_equal(a, b).item() for x, y in zip(cache, fresh) for a, b in zip(x.state, y.state)))
+        return draft(cache, rows, depth, target)
+    drafter.draft = against_replay
+    _, drafted, _ = _run(model, ids[:1], 96, _script(("draft", 3), ("draft", 3), ("plain", 6), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
+    assert len(compared) > 6 and all(compared) and drafted[0][1] > 0
+
+
 def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monkeypatch):
     from mlx_vlm.speculative.drafters.mtp_split import MTPSplitter
     model, _ = qwen_mtp
@@ -901,10 +1214,36 @@ def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monk
     assert loaded and all(key.startswith("mtp.") for key in loaded)
 
 
+def test_a_head_kept_under_the_language_model_of_an_mlx_conversion_is_built_with_its_per_module_quantization(qwen_mtp, tmp_path):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.speculative.drafters.mtp_split import get_model_path
+    from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import Qwen3_5MTPSplitter
+    from unsloth_zoo.mlx.speculative import MTPDrafter, has_native_mtp_head, native_mtp_drafter
+    source = get_model_path(MTP_MODEL)
+    _, head = Qwen3_5MTPSplitter().prepare(source)
+    quantization, tensors = {"group_size": 64, "bits": 4, "mode": "affine"}, {"language_model.model.norm.weight": mx.ones(8)}
+    for key, value in head.items():
+        module, bits = key.removesuffix(".weight"), 8 if ".self_attn." in key else 4
+        if value.ndim == 2 and key != "fc.weight":
+            tensors.update(zip([f"language_model.mtp.{module}.{part}" for part in ("weight", "scales", "biases")], mx.quantize(value, 64, bits)))
+            if bits == 8:
+                quantization[f"language_model.mtp.{module}"] = {"group_size": 64, "bits": 8, "mode": "affine"}
+        else:
+            tensors[f"language_model.mtp.{key}"] = value
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors, metadata = {"format": "mlx"})
+    (tmp_path / "config.json").write_text(json.dumps({**json.loads((source / "config.json").read_text()), "quantization": quantization}))
+    assert has_native_mtp_head(tmp_path) and not has_native_mtp_head(get_model_path(MODEL))
+    drafter = native_mtp_drafter(tmp_path, qwen_mtp[0])
+    built = dict(tree_flatten(drafter.model.parameters()))
+    assert type(drafter) is MTPDrafter and drafter.model.layers[0].self_attn.q_proj.bits == 8 and drafter.model.layers[0].mlp.up_proj.bits == 4
+    assert built.keys() == {key.removeprefix("language_model.mtp.") for key in tensors if ".mtp." in key}
+    assert all(mx.array_equal(built[key.removeprefix("language_model.mtp.")], value) for key, value in tensors.items() if ".mtp." in key)
+
+
 def test_a_separate_mtp_head_checkpoint_is_wrapped_as_the_built_in_head(qwen_mtp, tmp_path):
     from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
     from unsloth_zoo.mlx.speculative import MTPDrafter, companion_drafter
-    assert detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(tmp_path)) and type(companion_drafter(tmp_path, qwen_mtp[0])) is MTPDrafter
+    assert detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(tmp_path)) and type(companion_drafter(tmp_path, qwen_mtp[0])) is MTPDrafter and qwen_mtp[0]._unsloth_speculates
 
 
 
@@ -952,8 +1291,10 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
     assert list(ar.run_speculative_rounds(model, object(), max_tokens = 1)) == [("upstream", None)]
     draft, rounds, started = SpeculativeDraft(_script(("draft", 3)) if native else _script(("copy", 4), ("plain", 3)), _drafter(model, max_lag = 32) if native else None), [], []
     monkeypatch.setattr(draft.controller, "record_round", lambda plan, *args, **kwargs: rounds.append(plan))
+    kept, append = [], ar.SpeculativePrefill.append
+    monkeypatch.setattr(ar.SpeculativePrefill, "append", lambda self, output: append(self, output) or kept.append(sum(int(chunk.shape[1]) for chunk in self.chunks)))
     if native:
-        start = draft.drafter.start
+        draft.drafter.prompt_tail, start = 48, draft.drafter.start
         monkeypatch.setattr(draft.drafter, "start", lambda prompt, hidden, pending: started.append(hidden) or start(prompt, hidden, pending))
     generate = lambda **kwargs: [int(token) for token, _ in ar.generate_step(mx.array([ids[0]]), model, None, None, max_tokens = 96, temperature = 0.0, **kwargs)]
     for prefill_step_size in (16, None):  # unchunked, the final forward returns every prompt position's hidden
@@ -964,7 +1305,9 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size) == plain
         draft.prepare(ids[0], SamplingParams(), [penalty := _presence()])
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size, logits_processors = [penalty]) == penalized != plain
-    assert rounds and [hidden.shape[1] for hidden in started] == ([32] * 4 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+    # A row primes on the prompt's last prompt_tail positions, in max_lag pieces that drop none of them.
+    assert rounds and [hidden.shape[1] for hidden in started] == ([48] * 4 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+    assert not native or (len(ids[0]) > max(kept) == 48 and not any(draft.drafter.dropped.values()))
     # The same positions from six chunks as from one forward: chunking moves them ~0.07 on average, a one-position shift ~3.3.
     assert not native or (started[0] - started[2]).abs().mean().item() < 0.5
     with pytest.raises(RuntimeError, match = "prepare"):
@@ -972,12 +1315,15 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
 
 @pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
 def test_a_lazy_drafter_weighs_its_checkpoint_and_holds_a_started_row_without_allocating(request, companion):
-    from mlx_vlm.utils import get_model_path, load
+    from mlx_vlm.utils import load
     from unsloth_zoo.mlx import speculative
     model = request.getfixturevalue("qwen_mtp")[0] if companion is None else load("mlx-community/Qwen3.5-4B-4bit", lazy = True)[0]
     before, lazy = mx.get_active_memory(), _drafter(model, lazy = True) if companion is None else speculative.companion_drafter(companion, model, lazy = True)
     grown = speculative.probe_drafter(model, lazy, 40) and mx.get_active_memory() - before  # before any eager build below
-    stored = _drafter(model).weight_bytes if companion is None else sum(a.nbytes for a in mx.load(str(get_model_path(companion) / "model.safetensors")).values())
+    mx.reset_peak_memory()
+    held, stored = mx.get_active_memory(), (_drafter(model) if companion is None else speculative.companion_drafter(companion, model)).weight_bytes
+    # An eager build quantizes a bf16 DFlash drafter before evaluating it, so never holds the bf16 weights whole.
+    assert companion is None or mx.get_peak_memory() - held < 2 * stored
     assert grown < lazy.weight_bytes / 100 and lazy.weight_bytes == stored > 0 and (companion or _probe_matches_a_started_row(model, _drafter(model), list(range(1, 41)), lambda started: started[1]))
 
 
@@ -1135,6 +1481,81 @@ def _tiny_companion(model, repo):
     config["dflash_config"].update(target_layer_ids = [1, n // 2, n - 2], num_target_layers = n, selector_rank = 16, markov_rank = 16)
     module = {"DFlash2DraftModel": dflash2, "DSparkDraftModel": dspark}.get(config["architectures"][0], qwen3_dflash)
     return module.Model(module.ModelConfig.from_dict(config))
+
+
+def test_unquantized_companion_mtp_heads_and_dflash_drafters_load_at_4_bits_unless_turned_off(qwen, qwen_mtp, monkeypatch, tmp_path):
+    import shutil
+    import mlx.nn as nn
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
+    from unsloth_zoo.mlx import speculative
+    detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(split := tmp_path / "bf16"))
+    shutil.copytree(split, packed := tmp_path / "packed")  # the same head with only its MLP stored at 4 bits
+    for file in split.glob("*.safetensors"):
+        tensors = mx.load(str(file))
+        for key in [key for key in tensors if ".mlp." in key and key.endswith("_proj.weight")]:
+            tensors[key], tensors[key[: -len("weight")] + "scales"], tensors[key[: -len("weight")] + "biases"] = mx.quantize(tensors[key], 64, 4)
+        mx.save_safetensors(str(packed / file.name), tensors, metadata = {"format": "mlx"})
+    (packed / "config.json").write_text(json.dumps({**json.loads((split / "config.json").read_text()), "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}))
+    def built(bits):
+        monkeypatch.delenv("UNSLOTH_MLX_DRAFTER_BITS", raising = False) if bits is None else monkeypatch.setenv("UNSLOTH_MLX_DRAFTER_BITS", bits)
+        dflash = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
+        return speculative.companion_drafter(split, qwen_mtp[0]), speculative._built(speculative.ContextDrafter, dflash, qwen[0].language_model, quantize = True)
+    head, dflash = built(None)
+    # A head stored partly quantized keeps its full-precision layers; one read whole out of a model's checkpoint, as
+    # its own head or a companion, stays as stored.
+    kept, native, whole = (build(path, qwen_mtp[0]) for build, path in ((speculative.companion_drafter, packed), (speculative.native_mtp_drafter, source), (speculative.companion_drafter, source)))
+    plain_head, plain_dflash = built("0")
+    assert head.model.fc.bits == head.model.layers[0].mlp.up_proj.bits == dflash.model.fc.bits == dflash.model.layers[0].mlp.up_proj.bits == 4
+    assert type(plain_head.model.fc) is type(plain_dflash.model.fc) is nn.Linear and head.weight_bytes < plain_head.weight_bytes
+    assert type(kept.model.fc) is type(native.model.fc) is type(whole.model.fc) is nn.Linear and kept.model.layers[0].mlp.up_proj.bits == 4
+
+
+def test_a_dflash2_drafter_convolves_and_selects_its_drafts_bit_for_bit_in_fewer_kernels(qwen, monkeypatch):
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector, GroupedDynamicCausalConv
+    from unsloth_zoo.mlx import inference, speculative
+    model, _ = qwen
+    ran, convolve, walk = [], inference._dynamic_convolve, inference._candidate_walk
+    monkeypatch.setattr(inference, "_dynamic_convolve", lambda group_size: ran.append("conv") or convolve(group_size))
+    monkeypatch.setattr(inference, "_candidate_walk", lambda *args: ran.append("walk") or walk(*args))
+    companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    drafter = speculative._built(speculative.ContextDrafter, companion, model.language_model, quantize = True)
+    convs = [m for _, m in drafter.model.named_modules() if isinstance(m, GroupedDynamicCausalConv)]
+    selector, size = drafter.model.candidate_selector, companion.config.hidden_size
+    assert convs and {type(m)._unsloth_fused_native for m in convs} == {GroupedDynamicCausalConv}
+    assert type(selector)._unsloth_fused_native is CandidateSelector
+    mx.random.seed(0)
+    conv = convs[-1]
+    conv.base_kernel = (mx.random.normal(conv.base_kernel.shape) * 0.1).astype(mx.bfloat16)   # loaded kernels are not zero
+    # Two rows of five positions, so a result that read the first row or position for all would differ.
+    hidden = mx.random.normal((2, 5, size)).astype(mx.bfloat16)
+    (prepared, dynamic), (native, native_dynamic) = conv.prepare(hidden), GroupedDynamicCausalConv.prepare(conv, hidden)
+    finished, native_finished = conv.finish(hidden, dynamic), GroupedDynamicCausalConv.finish(conv, hidden, native_dynamic)
+    assert mx.array_equal(prepared, native) and mx.array_equal(finished, native_finished)
+    assert prepared.dtype == native.dtype and finished.dtype == native_finished.dtype and ran == ["conv", "conv"]
+    # Logits on a coarse grid tie often: candidates must come in argpartition's order for the walk to break ties alike.
+    logits = (mx.round(mx.random.normal((2, 5, selector.predecessor_codebook.weight.shape[0])) * 2) / 2).astype(mx.bfloat16)
+    top, expected = inference._top_candidates(logits, selector.top_k), mx.argpartition(logits, -selector.top_k, axis = -1)[..., -selector.top_k:]
+    assert mx.array_equal(top, expected) and top.dtype == expected.dtype
+    greedy, anchors = lambda scores: mx.argmax(scores, axis = -1), mx.array([3, 7])
+    drafts, expected = selector.select(hidden, logits, anchors, greedy), CandidateSelector.select(selector, hidden, logits, anchors, greedy)
+    assert mx.array_equal(drafts, expected) and drafts.dtype == expected.dtype and ran[-1] == "walk"
+    # A k past every chunk keeps the one argpartition.
+    assert mx.array_equal(inference._top_candidates(logits, 600), mx.argpartition(logits, -600, axis = -1)[..., -600:])
+    # On the CPU, whose argpartition does not sort, the native methods run.
+    served = len(ran)
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.eval(selector.select(hidden, logits, anchors, greedy), conv.prepare(hidden)[0])
+    finally:
+        mx.set_default_device(mx.gpu)
+    assert len(ran) == served
+    # Methods rebound upstream are what a fused module then runs.
+    monkeypatch.setattr(GroupedDynamicCausalConv, "prepare", lambda self, hidden: ("native", None))
+    monkeypatch.setattr(CandidateSelector, "select", lambda self, *args: "native")
+    assert conv.prepare(hidden)[0] == "native" and selector.select(hidden, logits, anchors, greedy) == "native"
+
+
 
 
 @pytest.mark.parametrize("repo", ["z-lab/Qwen3.5-4B-DFlash", "incoai/Qwen3.8-27B-DFlash2", "RadixArk/Qwen3.8-27B-DSpark"])

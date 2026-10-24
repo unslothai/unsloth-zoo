@@ -971,20 +971,31 @@ def _ffmpeg_protocol(source: str) -> str:
     return name
 
 
+_LOCAL_SHARE_HOSTS = ("", "localhost", "wsl$", "wsl.localhost")
+_WINDOWS = os.name == "nt"
+
+
 def _is_network_share(path: str) -> bool:
-    """UNC paths and file: URLs naming a remote host: Windows would open an SMB connection."""
+    """UNC paths and file: URLs naming a remote host: Windows would open an SMB connection.
+    Elsewhere `//x` is an ordinary path, and `\\\\wsl$` is the user's own WSL distro."""
+    if not _WINDOWS:
+        return False
     p = path.replace("\\", "/")
     if p[:5].lower() == "file:":
         p = p[5:]
         if p.startswith("//"):
             host = p[2:].split("/", 1)[0]
-            if host.lower() not in ("", "localhost"):
+            if host.lower() not in _LOCAL_SHARE_HOSTS:
                 return True
             p = p[2 + len(host):]
     if p.startswith(("//?/", "//./")):
-        # A drive or a volume GUID is local; UNC/ and GLOBALROOT/Device/Mup reach the redirector.
-        return re.match(r"([A-Za-z]:|Volume\{[0-9A-Fa-f-]+\})(/|$)", p[4:]) is None
-    return p.startswith("//")
+        rest = p[4:]
+        if rest.upper().startswith("UNC/"):
+            p = "//" + rest[4:]
+        else:
+            # A drive or a volume GUID is local; GLOBALROOT/Device/Mup reaches the redirector.
+            return re.match(r"([A-Za-z]:|Volume\{[0-9A-Fa-f-]+\})(/|$)", rest) is None
+    return p.startswith("//") and p[2:].split("/", 1)[0].lower() not in _LOCAL_SHARE_HOSTS
 
 
 # A real video container never starts like this (nor with whitespace or a BOM, which a padded
@@ -1042,9 +1053,12 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
         elif scheme not in ("", "file"):
             # rtsp://, tcp://, ftp:// ... would be dialled by ffmpeg with no address checks.
             raise ValueError(f"Unsloth: Refusing a video URL with an unsupported scheme: `{source}`")
-        elif _is_network_share(resolve_file_uri_to_path(source)):
+        elif _is_network_share(resolve_file_uri_to_path(source)) and not _allow_private_url_fetch():
             # Resolved first: file://C:/x is a drive, file:///%5chost/... decodes to a UNC path.
-            raise ValueError(f"Unsloth: Refusing a video path on a network share: `{source}`")
+            raise ValueError(
+                f"Unsloth: Refusing a video path on a network share: `{source}`. "
+                f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load videos from shares you trust."
+            )
         try:
             try:
                 video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
@@ -2096,8 +2110,16 @@ class UnslothVisionDataCollator:
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
         # LLaVA IMAGE_TOKEN_INDEX (-200) sentinel is never a target.
         labels[labels < 0] = self.ignore_index
+        self._mask_targets_after_padding(labels, batch.get("attention_mask"))
         batch["labels"] = labels
         return batch
+
+    def _mask_targets_after_padding(self, labels, attention_mask):
+        """Mask targets predicted from a pad position: unpadded rows lose them at the loss shift,
+        so left padding would make batch size 2 differ from 2 accumulation steps."""
+        if not torch.is_tensor(attention_mask) or attention_mask.dim() != 2 or attention_mask.shape != labels.shape:
+            return
+        labels[:, 1:].masked_fill_(attention_mask[:, :-1].to(labels.device) == 0, self.ignore_index)
 
     def _check_supervised(self, labels, attention_mask = None):
         """All labels masked means zero loss: raise on an untruncated first batch, else warn once."""
@@ -2810,6 +2832,7 @@ class UnslothVisionDataCollator:
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
         labels[labels < 0] = self.ignore_index
+        self._mask_targets_after_padding(labels, attention_mask)
         if self.completion_only_loss:
             labels[completion_mask == 0] = self.ignore_index
 
