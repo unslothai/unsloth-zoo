@@ -274,7 +274,7 @@ def module_forward_source_rewrites(modeling_file, model_type):
                 # Block compile rebinds a layer's forward to its modeling module's globals, so the
                 # helper the rewritten forward calls must resolve there too, not only in the
                 # generated module that imports it.
-                from .temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
+                from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
 
                 modeling_file.unsloth_sinkhorn_knopp = unsloth_sinkhorn_knopp
     return applicable
