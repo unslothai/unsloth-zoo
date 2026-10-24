@@ -165,10 +165,12 @@ class _ChunkedLogProbs(torch.autograd.Function):
                 # First-argmax, like the kernel's `target >= max and target > max before it`.
                 top1[start:end] = z.argmax(-1) == targets[start:end]
             z.sub_(z.amax(-1, keepdim = True))  # in place: shifted logits, the raw ones are not needed below
-            p = torch.exp(z) if entropy is not None else z.exp()
+            target = z.gather(-1, y)
+            # The entropy still needs the shifted logits; otherwise exponentiate in place.
+            p = torch.exp(z) if entropy is not None else z.exp_()
             total = p.sum(-1, keepdim = True)
             log_total = torch.log(total)
-            log_probs[start:end] = (z.gather(-1, y) - log_total).squeeze(-1)
+            log_probs[start:end] = (target - log_total).squeeze(-1)
             p.div_(total)
             if entropy is not None:
                 # H = -sum p log p = log(total) - sum p * shifted.
