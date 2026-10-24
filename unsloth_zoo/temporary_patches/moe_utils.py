@@ -363,6 +363,30 @@ _assume_constant_result = getattr(torch.compiler, "assume_constant_result", None
     getattr(torch._dynamo, "assume_constant_result", lambda fn: fn)
 
 
+def _match_grouped_mm_dtypes(inputs, weight):
+    """torch._grouped_mm is not on autocast's cast list and needs equal operand dtypes.
+
+    fp16 full finetuning keeps float32 master expert weights; under fp16 autocast the
+    activations reaching the experts are fp16 and the grouped GEMM raised "expected mat1 and
+    mat2 to have the same dtype ... Half != float". Do what autocast does for F.linear: run in
+    the autocast dtype (the weight cast is autograd tracked, so the fp32 master still gets its
+    grad). Without autocast, promote to the wider dtype. Identity when the dtypes agree.
+    """
+    if inputs.dtype == weight.dtype or not (inputs.is_floating_point() and weight.is_floating_point()):
+        return inputs, weight
+    device_type = inputs.device.type
+    try:
+        autocast_dtype = (
+            torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type) else None
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        autocast_dtype = None
+    if autocast_dtype in (torch.float16, torch.bfloat16):
+        return inputs.to(autocast_dtype), weight.to(autocast_dtype)
+    dtype = torch.promote_types(inputs.dtype, weight.dtype)
+    return inputs.to(dtype), weight.to(dtype)
+
+
 def _grouped_mm_with_backward_fix(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
@@ -388,6 +412,9 @@ def _grouped_mm_with_backward_fix(
 
 
 def _grouped_mm_eager(inputs, weight, offsets):
+    # Mixed dtypes always land here: the Triton and compiled fp16 routes need equal dtypes.
+    if inputs.dtype != weight.dtype:
+        inputs, weight = _match_grouped_mm_dtypes(inputs, weight)
     inputs = inputs.contiguous()
     # The Triton backend is picked precisely when the probe says no, yet its separated
     # LoRA delta still routed here. torch 2.8 hard-raises unless `dprops->major == 9`
