@@ -334,6 +334,10 @@ class UnslothFusedLoss(torch.autograd.Function):
         """
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
+        # A float scale is value-guarded (recompile per GradScaler step); a 0-dim float32 tensor gives the same product.
+        chunk_scaling = scaling
+        if scaling is not None and not torch.is_tensor(scaling):
+            chunk_scaling = torch.full((), float(scaling), dtype = torch.float32, device = device)
         # Thread ignore_index through label-shift and the inner CE call.
         ignore_index = int(extra_kwargs.get("ignore_index", -100))
 
@@ -555,7 +559,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -580,7 +584,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -596,7 +600,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -614,7 +618,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
