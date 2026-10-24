@@ -1661,6 +1661,74 @@ def test_push_to_hub_gguf_forwards_a_quant_list(monkeypatch, tmp_path):
     assert seen["quantization_method"] == ["q4_k_m", "q8_0"]
 
 
+def _capture_gguf_uploads(monkeypatch, mutils):
+    uploaded = []
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def upload_file(self, path_or_fileobj, path_in_repo, repo_id, **k):
+            uploaded.append(path_in_repo)
+
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=_FakeApi),
+    )
+    monkeypatch.setattr(mutils, "_ensure_hub_repo_visibility", lambda *a, **k: None)
+    return uploaded
+
+
+def test_gguf_save_reports_only_the_files_this_export_wrote(monkeypatch, tmp_path):
+    mutils, _ = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "OtherPrivateModel.Q4_K_M.gguf").write_bytes(b"GGUF-earlier-export")
+    result = mutils.save_pretrained_gguf(
+        types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method="fast_quantized",
+    )
+    assert [Path(f).name for f in result["gguf_files"]] == ["EdgeModel.Q8_0.gguf"]
+    # Left on disk: the export only stops claiming it.
+    assert (out / "OtherPrivateModel.Q4_K_M.gguf").exists()
+
+
+def test_push_to_hub_gguf_does_not_publish_an_earlier_exports_gguf(monkeypatch, tmp_path):
+    mutils, _ = _gguf_export_scaffold(monkeypatch, tmp_path, shards=3)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "OtherPrivateModel.Q4_K_M.gguf").write_bytes(b"GGUF-earlier-export")
+    uploaded = _capture_gguf_uploads(monkeypatch, mutils)
+    mutils.push_to_hub_gguf(
+        types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+        tokenizer=object(),
+        save_directory=out,
+        repo_id="org/EdgeModel",
+        quantization_method="not_quantized",
+    )
+    # Every shard of this export, and nothing from the earlier one.
+    assert uploaded == [f"EdgeModel.BF16-{i:05d}-of-00003.gguf" for i in (1, 2, 3)]
+
+
+def test_push_to_hub_gguf_keeps_the_folder_upload_for_a_save_reporting_nothing(
+    monkeypatch, tmp_path
+):
+    mutils, _ = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "EdgeModel.Q8_0.gguf").write_bytes(b"GGUF-final")
+    monkeypatch.setattr(mutils, "save_pretrained_gguf", lambda *a, **k: None)
+    uploaded = _capture_gguf_uploads(monkeypatch, mutils)
+    mutils.push_to_hub_gguf(
+        types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+        tokenizer=object(),
+        save_directory=out,
+        repo_id="org/EdgeModel",
+    )
+    assert uploaded == ["EdgeModel.Q8_0.gguf"]
+
+
 # --- Group 12: concurrency over the patcher env mutation ---
 
 
