@@ -150,11 +150,14 @@ class FastCPUModel:
 
         quantization_config = None
         if use_4bit and not _PREQUANTIZED_SUFFIX.search(model_name):
+            from ..peft_utils import SKIP_QUANTIZATION_MODULES
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit = True,
                 bnb_4bit_quant_type = "nf4",
                 bnb_4bit_use_double_quant = True,
                 bnb_4bit_compute_dtype = dtype,
+                # As the GPU loaders: lm_head, MoE routers, Mamba and vision / audio towers stay 16-bit.
+                llm_int8_skip_modules = list(SKIP_QUANTIZATION_MODULES),
             )
         resize_model_vocab = kwargs.pop("resize_model_vocab", None)
         for key in ("load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",

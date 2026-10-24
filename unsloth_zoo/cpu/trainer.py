@@ -28,9 +28,17 @@ from .runtime import cpu_bf16_supported, cpu_fp16_supported
 # bitsandbytes 8-bit / paged optimizers have no CPU kernels; AdamW states for LoRA are tiny anyway.
 _GPU_ONLY_OPTIMIZERS = (
     "adamw_8bit", "adamw_bnb_8bit", "paged_adamw_8bit", "paged_adamw_32bit", "paged_adamw",
-    "adamw_torch_fused", "adamw_apex_fused", "adafactor_8bit", "lion_8bit", "paged_lion_8bit",
+    "adamw_apex_fused", "adafactor_8bit", "lion_8bit", "paged_lion_8bit",
     "paged_lion_32bit", "ademamix_8bit", "paged_ademamix_8bit", "paged_ademamix_32bit",
 )
+
+
+@functools.cache
+def _cpu_adamw():
+    """torch's fused AdamW has CPU kernels from 2.4. A LoRA step updates hundreds of small tensors,
+    where the foreach AdamW behind "adamw_torch" is 4-6x slower than the fused one on CPU."""
+    from packaging.version import Version
+    return "adamw_torch_fused" if Version(torch.__version__.split("+")[0]) >= Version("2.4.0") else "adamw_torch"
 
 
 def _name(value):
@@ -51,8 +59,11 @@ def normalize_cpu_training_arguments(args):
         args.bf16 = False
     optim = str(_name(getattr(args, "optim", "")) or "").lower()
     if optim in _GPU_ONLY_OPTIMIZERS or any(tag in optim for tag in ("8bit", "paged", "bnb", "npu", "xla")):
-        print(f"Unsloth (CPU): optim = {optim!r} needs a GPU, using 'adamw_torch'.")
-        args.optim = "adamw_torch"
+        print(f"Unsloth (CPU): optim = {optim!r} needs a GPU, using {_cpu_adamw()!r}.")
+        args.optim = _cpu_adamw()
+    elif optim in ("adamw_torch", "adamw_torch_fused"):
+        # Same update rule; the fused kernel where this torch has it on CPU.
+        args.optim = _cpu_adamw()
     if getattr(args, "tf32", None):
         args.tf32 = None
     if hasattr(args, "dataloader_pin_memory"):

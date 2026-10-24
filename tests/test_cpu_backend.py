@@ -234,8 +234,26 @@ def test_cpu_training_arguments_turn_off_packing_and_gpu_optimizers(dtype_policy
     args = SimpleNamespace(use_cpu = False, fp16 = True, bf16 = False, optim = "paged_adamw_8bit",
                            packing = True, eval_packing = True, padding_free = True, dataloader_pin_memory = True)
     normalize_cpu_training_arguments(args)
-    assert args.use_cpu and not args.fp16 and args.optim == "adamw_torch"
+    assert args.use_cpu and not args.fp16 and args.optim == "adamw_torch_fused"
     assert not args.packing and not args.eval_packing and not args.padding_free and not args.dataloader_pin_memory
+
+
+@pytest.mark.parametrize("torch_version, expected", [("2.13.0+cpu", "adamw_torch_fused"), ("2.3.1", "adamw_torch")])
+@pytest.mark.parametrize("optim", ["adamw_torch", "adamw_torch_fused", "adamw_8bit", "paged_adamw_32bit"])
+def test_cpu_training_uses_the_fused_adamw_where_torch_has_it(monkeypatch, optim, torch_version, expected):
+    """transformers defaults to adamw_torch_fused from torch 2.8; torch has fused AdamW on CPU from 2.4."""
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu import trainer
+    monkeypatch.setattr(trainer.torch, "__version__", torch_version)
+    trainer._cpu_adamw.cache_clear()
+    try:
+        args = trainer.normalize_cpu_training_arguments(SimpleNamespace(use_cpu = True, fp16 = False, bf16 = False, optim = optim))
+        assert args.optim == expected
+        # Other optimizers are the caller's choice.
+        args = trainer.normalize_cpu_training_arguments(SimpleNamespace(use_cpu = True, fp16 = False, bf16 = False, optim = "sgd"))
+        assert args.optim == "sgd"
+    finally:
+        trainer._cpu_adamw.cache_clear()
 
 
 def test_moe_models_keep_their_own_loss():
@@ -669,6 +687,29 @@ def test_torch_dtype_alias_is_used_and_not_passed_twice(monkeypatch):
     assert torch.float32 in (seen.get("dtype"), seen.get("torch_dtype"))
 
 
+def test_cpu_4bit_keeps_the_gpu_skip_modules_in_16bit(monkeypatch):
+    """lm_head, MoE routers, Mamba and vision towers stay out of NF4, as SKIP_QUANTIZATION_MODULES does on GPU."""
+    import transformers
+    from unsloth_zoo.cpu import loader
+    from unsloth_zoo.peft_utils import SKIP_QUANTIZATION_MODULES
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_load(name, **k):
+        seen.update(k)
+        raise Stop
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
+    monkeypatch.setattr(loader, "cpu_bnb_4bit_supported", lambda: True)
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_load)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    with pytest.raises(Stop):
+        loader.FastCPUModel.from_pretrained("org/model", load_in_4bit = True)
+    qc = seen["quantization_config"]
+    assert qc.load_in_4bit and list(qc.llm_int8_skip_modules) == list(SKIP_QUANTIZATION_MODULES)
+
+
 def test_fp16_autocast_chunked_loss_keeps_small_gradients_for_the_scaler():
     """Under fp16 autocast the cached hidden gradient must survive until GradScaler's multiplier is applied."""
     from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
@@ -887,6 +928,56 @@ def test_cpu_fused_lm_head_matches_an_fp64_reference(softcap, temperature, scale
     assert torch.equal(ours[4], ref[4])
     torch.testing.assert_close(h1.grad.double(), h2.grad, rtol = 1e-5, atol = 1e-6)
     torch.testing.assert_close(w1.grad.double(), w2.grad, rtol = 1e-5, atol = 1e-6)
+
+
+@pytest.mark.parametrize("softcap, temperature, scale, bias", [(None, 1.0, 1.0, False), (30.0, 0.7, 0.5, True)])
+@pytest.mark.parametrize("entropy_weight", [0.0, 0.1])
+def test_cpu_fused_lm_head_frozen_head_single_pass_matches_fp64(softcap, temperature, scale, bias, entropy_weight):
+    """Frozen LM head (LoRA): the single-pass function's outputs and d/dhidden, with and without a
+    gradient through the entropy, against an fp64 reference; the extras match too."""
+    from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
+    torch.manual_seed(0)
+    hidden, weight = torch.randn(37, 16) * 2, torch.randn(101, 16) * 0.3
+    b = torch.randn(101) if bias else None
+    targets = torch.randint(0, 101, (37,))
+    h1 = hidden.clone().requires_grad_(True)
+    ours = cpu_chunked_log_probs(h1, weight, b, targets, temperature, 64, softcap, scale)
+    upstream = torch.randn(37)
+    (-(ours[0] * upstream).sum() + entropy_weight * ours[1].sum()).backward()
+    h2 = hidden.double().requires_grad_(True)
+    z = h2 @ weight.double().t() + (b.double() if b is not None else 0)
+    z = z * scale
+    if softcap is not None:
+        z = softcap * torch.tanh(z / softcap)
+    z = z / temperature
+    logp = torch.log_softmax(z, -1)
+    ref = (logp.gather(-1, targets[:, None]).squeeze(-1), -(logp.exp() * logp).sum(-1),
+           torch.logsumexp(2 * logp, -1), z.mean(-1), z.argmax(-1) == targets)
+    (-(ref[0] * upstream.double()).sum() + entropy_weight * ref[1].sum()).backward()
+    for got, want in zip(ours[:4], ref[:4]):
+        torch.testing.assert_close(got.double(), want, rtol = 1e-5, atol = 1e-5)
+    assert torch.equal(ours[4], ref[4])
+    torch.testing.assert_close(h1.grad.double(), h2.grad, rtol = 1e-5, atol = 1e-6)
+
+
+def test_cpu_fused_lm_head_single_pass_under_bf16_autocast_and_no_grad():
+    """bf16 autocast (the CPU default on AMX / Arm BF16): gradients close to fp32; under no_grad
+    (evaluate) nothing is kept for backward and only the requested outputs come back."""
+    from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
+    torch.manual_seed(0)
+    hidden, weight = torch.randn(64, 32), torch.randn(500, 32) * 0.2
+    targets = torch.randint(0, 500, (64,))
+    h32 = hidden.clone().requires_grad_(True)
+    cpu_chunked_log_probs(h32, weight, None, targets, 1.0, 64)[0].sum().backward()
+    h16 = hidden.clone().requires_grad_(True)
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        lp = cpu_chunked_log_probs(h16, weight, None, targets, 1.0, 64, outputs = ("log_probs",))
+    assert lp[1:] == (None, None, None, None)
+    lp[0].sum().backward()
+    assert (h16.grad - h32.grad).norm() / h32.grad.norm() < 2e-2
+    with torch.no_grad():
+        out = cpu_chunked_log_probs(hidden, weight, None, targets, 1.0, 64, outputs = ("log_probs", "is_top1"))
+    assert out[0].grad_fn is None and out[4].dtype == torch.bool and out[1] is None
 
 
 def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
