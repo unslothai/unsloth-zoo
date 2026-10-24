@@ -241,13 +241,9 @@ modifications =
       them it is 3e-3 to 5e-3, as safe_gate=False. The safe_gate=False
       code is unchanged (identical outputs and gradients under the same
       autotuned configs).
-    - Modified by Unsloth in ops/kda/__init__.py (inline comment): chunk_kda
-      is exported through unsloth_zoo's safe_gate router
-      (temporary_patches/fla_vendor.py), which passes safe_gate=True with
-      lower_bound only for GLM-5.3-Flash (glm5_next) layers whose forget gate
-      is linear_lower_bound * sigmoid(.) with linear_lower_bound in [-5, 0),
-      on Triton >= 3.6 and SM80+. Every other caller, Kimi-Linear included,
-      reaches the unmodified chunk_kda.
+      unsloth_zoo (temporary_patches/fla_vendor.py) passes safe_gate=True
+      only from GLM-5.3-Flash (glm5_next), whose forget gate is
+      linear_lower_bound * sigmoid(.) with linear_lower_bound in [-5, 0).
     - Backported fla PR #1229 in ops/common/chunk_o.py (+ inline "Unsloth:
       backported from fla PR #1229" comment): on Blackwell the chunk_fwd_kernel_o
       autotune drops its 8-warp BK=BV=128 config, which hits a Triton tl.dot

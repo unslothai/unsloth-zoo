@@ -48,26 +48,70 @@ def test_fla_1242_and_1554_are_backported():
     assert code.count("input_precision=SAFE_GATE_DOT_PRECISION") == 4
 
 
-def test_kda_export_is_routed():
-    init = (VENDORED / "ops" / "kda" / "__init__.py").read_text()
-    assert "_wrap_kda_safe_gate(chunk_kda)" in init
+def _fake_glm5(monkeypatch, hardware = True):
+    """A glm5_next module whose chunk_kimi_delta_attention closes over ``implementation`` like
+    transformers' kernel-hub fallback wrapper."""
+    import types
+    seen = []
+
+    def chunk_kda(q, g = None, safe_gate = False, lower_bound = None):
+        seen.append((safe_gate, lower_bound))
+
+    def torch_ref(q, g = None, **kwargs):
+        seen.append("torch")
+
+    implementation = chunk_kda
+
+    def chunk_kimi_delta_attention(*args, **kwargs):
+        return implementation(*args, **kwargs)
+
+    chunk_kimi_delta_attention.__wrapped__ = torch_ref
+    module = types.ModuleType(fla_vendor._GLM5_NEXT_MODULE)
+    module.chunk_kimi_delta_attention = chunk_kimi_delta_attention
+    monkeypatch.setitem(sys.modules, fla_vendor._GLM5_NEXT_MODULE, module)
+    monkeypatch.setattr(fla_vendor, "_kda_safe_gate_state", {"bound": None, "bounds": set(), "layers": 0})
+    monkeypatch.setattr(fla_vendor, "_kda_safe_gate_hardware_ok", lambda: hardware)
+    monkeypatch.delenv("UNSLOTH_KDA_SAFE_GATE", raising = False)
+    return module, chunk_kda, seen
 
 
-def test_only_bounded_glm5_forget_gates_qualify():
-    pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
-    from transformers.models.glm5_next import modeling_glm5_next as m
-    assert fla_vendor._glm5_forget_gate_is_bounded(m.Glm5NextTextForgetGate)
-    if importlib.util.find_spec("transformers.models.kimi_linear") is not None:
-        from transformers.models.kimi_linear import modeling_kimi_linear as k
-        for cls in vars(k).values():
-            if isinstance(cls, type) and "forward" in vars(cls):
-                assert not fla_vendor._glm5_forget_gate_is_bounded(cls), cls
+@pytest.mark.parametrize("bound, expected", [(-5.0, -5.0), (-5, -5.0), (-1.5, -1.5), (None, None), (-8.0, None),
+                                             (0.0, None), (True, None), ("-5", None)])
+def test_bound_is_read_from_config(monkeypatch, bound, expected):
+    module, chunk_kda, seen = _fake_glm5(monkeypatch)
+    fla_vendor._glm5_record_kda_bound(bound)
+    module.chunk_kimi_delta_attention(1, g = 2)
+    assert seen == [(expected is not None, expected)]
+    # The repair / binding checks still see the fla kernel itself.
+    assert fla_vendor._resolved_implementation(module.chunk_kimi_delta_attention) is chunk_kda
 
-    class Gate:
-        def forward(self, x):
-            return -x.exp()
 
-    assert not fla_vendor._glm5_forget_gate_is_bounded(Gate)
+def test_mixed_bounds_kill_switch_and_hardware_disable(monkeypatch):
+    module, _, seen = _fake_glm5(monkeypatch)
+    fla_vendor._glm5_record_kda_bound(-5.0)
+    fla_vendor._glm5_record_kda_bound(-3.0)  # two glm5_next models with different bounds: off
+    module.chunk_kimi_delta_attention(1)
+    module, _, seen2 = _fake_glm5(monkeypatch)
+    monkeypatch.setenv("UNSLOTH_KDA_SAFE_GATE", "0")
+    fla_vendor._glm5_record_kda_bound(-5.0)
+    module.chunk_kimi_delta_attention(1)
+    module, _, seen3 = _fake_glm5(monkeypatch, hardware = False)
+    fla_vendor._glm5_record_kda_bound(-5.0)
+    module.chunk_kimi_delta_attention(1)
+    assert seen == seen2 == seen3 == [(False, None)]
+
+
+def test_explicit_safe_gate_and_torch_fallback_untouched(monkeypatch):
+    module, _, seen = _fake_glm5(monkeypatch)
+    fla_vendor._glm5_record_kda_bound(-5.0)
+    module.chunk_kimi_delta_attention(1, safe_gate = False)  # an explicit caller choice wins
+    assert seen == [(False, -5.0)]
+    module, _, seen = _fake_glm5(monkeypatch)
+    cell = fla_vendor._hub_implementation_cell(module.chunk_kimi_delta_attention)
+    cell.cell_contents = module.chunk_kimi_delta_attention.__wrapped__  # pure torch fallback bound
+    fla_vendor._glm5_record_kda_bound(-5.0)
+    module.chunk_kimi_delta_attention(1)
+    assert seen == ["torch"]
 
 
 _ROUTE_CHILD = textwrap.dedent(
@@ -78,26 +122,40 @@ _ROUTE_CHILD = textwrap.dedent(
     from transformers.models.glm5_next import modeling_glm5_next as m
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
     impl = fla_vendor._resolved_implementation(m.chunk_kimi_delta_attention)
-    assert getattr(impl, fla_vendor._KDA_SAFE_GATE_MARK, False), impl
+    assert f"{impl.__module__}.{impl.__name__}" == "fla.ops.kda.chunk.chunk_kda", impl
+    import importlib.util
+    if importlib.util.find_spec("transformers.models.kimi_linear") is not None:
+        from transformers.models.kimi_linear import modeling_kimi_linear as km
+        kcell = fla_vendor._hub_implementation_cell(km.chunk_kimi_delta_attention)
+        assert kcell is None or not hasattr(kcell.cell_contents, fla_vendor._KDA_SAFE_GATE_MARK)
+    import fla.ops.kda.chunk as chunk_mod
+    real_apply = chunk_mod.ChunkKDAFunction.apply
+    safe_calls = [0]
+    def spy(*args):
+        safe_calls[0] += bool(args[-6])  # ..., safe_gate, lower_bound, chunk_size, disable_recompute, return_intermediate_states, cp_context
+        return real_apply(*args)
+    chunk_mod.ChunkKDAFunction.apply = spy
     out = {}
     for name, bound in (("bounded", -5.0), ("unbounded", None), ("out_of_range", -8.0)):
         torch.manual_seed(0)
         cfg = Glm5NextTextConfig(hidden_size = 256, linear_num_heads = 2, linear_head_dim = 128,
                                  linear_lower_bound = bound, num_hidden_layers = 1, layer_types = ["linear_attention"])
-        layer = m.Glm5NextTextLinearAttention(cfg, 0).cuda().to(torch.bfloat16)
-        for p in layer.parameters():
-            torch.nn.init.normal_(p, std = 0.02)
         x = torch.randn(1, 200, 256, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
         res = {}
         for env in ("1", "0"):
             os.environ["UNSLOTH_KDA_SAFE_GATE"] = env
-            before = fla_vendor._kda_safe_gate_state["calls"]
+            fla_vendor._kda_safe_gate_state["bounds"].clear()  # one model per process in practice
+            torch.manual_seed(0)
+            layer = m.Glm5NextTextLinearAttention(cfg, 0).cuda().to(torch.bfloat16)
+            for p in layer.parameters():
+                torch.nn.init.normal_(p, std = 0.02)
+            before = safe_calls[0]
             x.grad = None
             layer.zero_grad()
             y = layer(x)
             y = y[0] if isinstance(y, tuple) else y
             y.float().square().sum().backward()
-            res[env] = (y.detach().float(), x.grad.float(), fla_vendor._kda_safe_gate_state["calls"] - before)
+            res[env] = (y.detach().float(), x.grad.float(), safe_calls[0] - before)
         rel = lambda a, b: float((a - b).norm() / b.norm())
         out[name] = {"routed": res["1"][2], "routed_off": res["0"][2],
                      "rel_o": rel(res["1"][0], res["0"][0]), "rel_dx": rel(res["1"][1], res["0"][1])}
