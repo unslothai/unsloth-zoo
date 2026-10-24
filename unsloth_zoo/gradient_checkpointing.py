@@ -23,6 +23,8 @@ import functools
 import inspect
 import warnings
 import gc
+import collections
+import heapq
 import threading
 import weakref
 from .utils import _get_dtype, Version, is_distributed
@@ -1181,6 +1183,50 @@ CPU_BUFFERS = []
 CPU_INDEX = None
 GPU_BUFFER_DTYPE = None
 
+# Host slots of CPU_BUFFERS are leased per offloaded checkpoint and returned by its backward
+# (or when its graph is dropped), so a forward that starts while another graph still waits
+# for its backward (1F1B pipeline schedules, two forwards then two backwards) never reuses a
+# slot that holds a pending activation. The lowest free slot goes first: in the usual one
+# forward, one backward loop every layer gets the same slot as before, so the buffer count
+# and sizes do not change.
+_FREE_CPU_SLOTS = []    # min-heap of returned slot indices
+_CPU_SLOT_TOP = 0       # slots [0, _CPU_SLOT_TOP) have been handed out at least once
+_CPU_SLOT_EPOCH = 0     # bumped by every pool reset; a lease from an older epoch is ignored
+
+
+def _reset_cpu_slots():
+    global _CPU_SLOT_TOP, _CPU_SLOT_EPOCH
+    del _FREE_CPU_SLOTS[:]
+    _CPU_SLOT_TOP = 0
+    _CPU_SLOT_EPOCH += 1
+pass
+
+
+class _CpuSlotLease:
+    """One CPU_BUFFERS slot held by an offloaded checkpoint until its backward has read it."""
+    __slots__ = ("index", "epoch")
+
+    def __init__(self):
+        global _CPU_SLOT_TOP
+        if _FREE_CPU_SLOTS:
+            self.index = heapq.heappop(_FREE_CPU_SLOTS)
+        else:
+            self.index = _CPU_SLOT_TOP
+            _CPU_SLOT_TOP += 1
+        self.epoch = _CPU_SLOT_EPOCH
+
+    def release(self):
+        index, self.index = self.index, None
+        if index is not None and self.epoch == _CPU_SLOT_EPOCH:
+            heapq.heappush(_FREE_CPU_SLOTS, index)
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass  # interpreter shutdown
+pass
+
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
     global FP32_OFFLOAD_EXACT
@@ -1208,6 +1254,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     _reset_pinned_cap()
     CPU_BUFFERS = []
     CPU_INDEX = 0
+    _reset_cpu_slots()
 
     if dtype is None:
         if DEVICE_TYPE == "cuda":
@@ -1369,10 +1416,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         MAIN_STREAM  = _compute_stream(device_index)
                         EXTRA_STREAM = EXTRA_STREAMS[device_index]
 
-                        # Handle interrupted training runs
+                        # First offload of a new graph. Host slots are not rewound here: a graph
+                        # still waiting for its backward keeps its slots (see _CpuSlotLease).
                         if BACKWARD_PASS:
                             BACKWARD_PASS = False
-                            CPU_INDEX = 0
                             # A new graph: earlier prefetch descriptors and slot records are stale.
                             global OFFLOAD_GENERATION
                             OFFLOAD_GENERATION += 1
@@ -1396,8 +1443,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     _free_gpu_buffers_b()
                         pass
 
+                        lease = _CpuSlotLease()
+                        CPU_INDEX = lease.index
                         # Extend buffer size
-                        if CPU_INDEX >= len(CPU_BUFFERS):
+                        while CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
                                 x = _new_host_buffer(-(-new_size // GPU_BUFFER.element_size()), GPU_BUFFER.dtype)
                             CPU_BUFFERS.append(x)
@@ -1463,6 +1512,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         while len(OFFLOAD_SLOT_META) <= CPU_INDEX: OFFLOAD_SLOT_META.append(None)
                         OFFLOAD_SLOT_META[CPU_INDEX] = None if ctx._offload_generation is None else \
                             (OFFLOAD_GENERATION, device_index, buffer_slot, new_size, shape, store_dtype)
+                        # Held until backward has read the slot, or freed with the graph.
+                        ctx._cpu_slot = lease
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -1556,6 +1607,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 if in_chain:
                     _prefetch_offloaded_input(CPU_INDEX - 1, device_index, generation, buffer_slot)
             pass
+            # The reload is queued on EXTRA_STREAM, where the next offload into this slot also
+            # runs, so the slot can be handed out again now.
+            lease = getattr(ctx, "_cpu_slot", None)
+            if lease is not None: lease.release()
         else:
             # No GPU buffer seen
             if len(tensor_indices) != 0:
@@ -1669,7 +1724,8 @@ pass
 
 class _OffloadedActivation:
     """One saved activation: a host copy (`copied` marks the D2H), or still a device tensor."""
-    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "index", "pinned_bytes", "unpacked", "group", "__weakref__")
+    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "ready_stream", "index", "pinned_bytes",
+                 "unpacked", "group", "__weakref__")
 
     def __init__(self, device, index):
         self.device        = device
@@ -1677,6 +1733,7 @@ class _OffloadedActivation:
         self.copied        = None
         self.device_tensor = None
         self.ready         = None  # set only on a prefetched device_tensor
+        self.ready_stream  = None  # the stream that allocated it
         self.index         = index
         self.pinned_bytes  = 0
         self.unpacked      = False
@@ -1685,6 +1742,9 @@ class _OffloadedActivation:
     def __del__(self):
         try:
             if self.pinned_bytes: _release_pinned(self.pinned_bytes)
+            # A prefetch dropped unread (graph freed mid backward): its block goes back to the
+            # allocating stream's pool, so order that stream after the reload still writing it.
+            if self.ready is not None: self.ready_stream.wait_event(self.ready)
         except Exception:
             pass  # interpreter shutdown
 pass
@@ -1710,10 +1770,12 @@ class NonReentrantActivationOffloader:
             self.keep_last = max(0, int(os.environ.get("UNSLOTH_GC_STREAM_KEEP_LAST", "1")))
         except ValueError:
             self.keep_last = 1
-        # A side stream D2H keeps its device block until the copy ends (record_stream), and
-        # unthrottled copies piled up 2-4 activations of extra VRAM. 0 copies on the compute
-        # stream (no extra VRAM, no overlap, the single GPU default); N > 0 overlaps the next
-        # layers with at most N copies in flight per device (distributed default 1).
+        # 0 copies on the compute stream (no extra VRAM, no overlap, the single GPU default);
+        # N > 0 copies on a side stream that overlaps the next layers. The source of each side
+        # stream copy is kept alive with its copy event (at most N per device, so N activations
+        # of extra VRAM, fixed); the oldest is released only after the compute stream, which
+        # allocated it, waits on that event. No host sync and no record_stream, whose block
+        # reuse depends on how far the CPU runs ahead (distributed default 1).
         default_inflight = 1 if is_distributed() else 0
         try:
             self.max_inflight = max(0, int(os.environ.get("UNSLOTH_GC_MAX_INFLIGHT_COPIES", default_inflight)))
@@ -1754,12 +1816,16 @@ class NonReentrantActivationOffloader:
                 record.host = x.to("cpu")
                 self.stats["pageable"] += 1
                 return
-            inflight = self.inflight.setdefault(device_index, [])
-            # Wait on the host for the oldest copies past the limit so their blocks can be reused.
-            while inflight and (len(inflight) >= self.max_inflight or inflight[0].query()):
-                inflight.pop(0).synchronize()
+            inflight = self.inflight.get(device_index)
+            if inflight is None:
+                inflight = self.inflight[device_index] = collections.deque()
+            compute = torch.cuda.current_stream(device_index)
+            # Retire the oldest copies past the limit, plus any that already finished. The
+            # compute stream waits on the copy before the source is dropped, so no later
+            # allocation on it can reuse the block while the D2H still reads it.
+            self._retire(inflight, compute, self.max_inflight - 1)
             side = self._stream(self.d2h_streams, device_index)
-            side.wait_stream(torch.cuda.current_stream(device_index))
+            side.wait_stream(compute)
             try:
                 with torch.cuda.stream(side):
                     # A non_blocking D2H allocates its destination pinned.
@@ -1771,14 +1837,26 @@ class NonReentrantActivationOffloader:
                 if not _is_host_alloc_oom(e): raise
                 _warn_pinned_unavailable(e)
             else:
-                # The caller drops x next; its block must outlive the copy.
-                x.record_stream(side)
-                inflight.append(copied)
+                # Keepalive: the caller drops x next, but its block must outlive the copy.
+                inflight.append((x, copied))
                 record.host, record.copied, record.pinned_bytes = host, copied, nbytes
                 self.stats["pinned"] += 1
                 return
         record.host = x.to("cpu")
         self.stats["pageable"] += 1
+    pass
+
+    @staticmethod
+    def _retire(inflight, compute, keep):
+        while inflight and (len(inflight) > keep or inflight[0][1].query()):
+            _, copied = inflight.popleft()
+            compute.wait_event(copied)
+    pass
+
+    def _drain(self):
+        """Release every keepalive (backward reads the host copies after waiting on them)."""
+        for device_index, inflight in self.inflight.items():
+            if inflight: self._retire(inflight, torch.cuda.current_stream(device_index), 0)
     pass
 
     def pack(self, x):
@@ -1828,8 +1906,9 @@ class NonReentrantActivationOffloader:
             x.copy_(record.host, non_blocking = True)
             ready = torch.cuda.Event()
             ready.record(side)
-        x.record_stream(side)
-        record.device_tensor, record.ready = x, ready
+        # No record_stream: the record keeps x alive, and the compute stream that allocated it
+        # waits on `ready` before using it (unpack) or before it is freed unread (__del__).
+        record.device_tensor, record.ready, record.ready_stream = x, ready, compute
         self.stats["prefetched"] += 1
     pass
 
@@ -1858,6 +1937,7 @@ class NonReentrantActivationOffloader:
             device, x = packed
             return x if device is None else x.to(device, non_blocking = True)
         record = packed
+        if not self.backward_started: self._drain()
         self.backward_started = True
         record.unpacked = True
         device_index = record.device.index
@@ -1867,7 +1947,7 @@ class NonReentrantActivationOffloader:
             if record.ready is not None:
                 compute.wait_event(record.ready)
                 # One shot: a retain_graph rerun reloads from the host copy.
-                record.device_tensor, record.ready = None, None
+                record.device_tensor, record.ready, record.ready_stream = None, None, None
                 self.stats["prefetch_hits"] += 1
         else:
             if record.copied is not None: compute.wait_event(record.copied)
@@ -2022,6 +2102,7 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         if GPU_BUFFERS_B is not None:
             _free_gpu_buffers_b()
         CPU_BUFFERS = None
+        _reset_cpu_slots()
         GPU_BUFFERS = None
         BUFFER_EVENTS_A = None
         BUFFER_EVENTS_B = None
@@ -2107,6 +2188,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
 
     # Reset state for a fresh training run
     CPU_INDEX = 0
+    _reset_cpu_slots()
     BACKWARD_PASS = True
     _reset_gc_prefetch_state()
     LAST_GC_INDEX = 0
