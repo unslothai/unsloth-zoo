@@ -1412,17 +1412,18 @@ def _grouped_mm_slice(inputs, weight, offsets, plan):
 
 
 def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
+    # View, not copy: Triton reads strided weights; _grouped_mm_eager copies only where views are unproven.
     if len(plan.chunks) == 1:
         experts, _, _, offsets = plan.chunks[0]
         weight = weight_provider(experts)
         if transpose:
-            weight = weight.transpose(-2, -1).contiguous()
+            weight = weight.transpose(-2, -1)
         return _grouped_mm_slice(inputs, weight, offsets, plan)
     out = None
     for experts, row_lo, row_hi, offsets in plan.chunks:
         weight = weight_provider(experts)
         if transpose:
-            weight = weight.transpose(-2, -1).contiguous()
+            weight = weight.transpose(-2, -1)
         rows = inputs[row_lo : row_hi]
         if rows.data_ptr() % 16:
             rows = rows.clone()   # grouped GEMMs want 16-byte aligned operands
