@@ -12,7 +12,7 @@ import ast
 import importlib
 
 
-_LOSS_MODULES = ("unsloth_zoo.loss_utils", "unsloth_zoo.fused_losses")
+_LOSS_MODULES = ("unsloth_zoo.loss_utils", "unsloth_zoo.fused_losses", "unsloth_zoo.compiler")
 
 
 def fused_loss_header_names() -> dict:
