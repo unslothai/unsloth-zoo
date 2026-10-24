@@ -201,7 +201,8 @@ def test_saves_no_logits_for_backward():
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         out = function(states, head, index, 4, return_entropy = True)
     assert max(saved) <= vocab * hidden, saved
-    assert sum(saved) <= vocab * hidden + rows * hidden + 4 * rows, saved
+    # Per-row statistics plus the kept-row index and its one-element count.
+    assert sum(saved) <= vocab * hidden + rows * hidden + 5 * rows + 1, saved
     sum(x.sum() for x in out).backward()
 
     saved.clear()

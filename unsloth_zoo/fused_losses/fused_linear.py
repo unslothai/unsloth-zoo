@@ -106,8 +106,8 @@ _FWD_TILE_COLS = (max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 0)), 
                   if os.environ.get("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS") is not None else None)
 _IS_HIP = torch.version.hip is not None
 # Bump the suffix on any schema / backward change: Inductor / AOTAutograd caches key on neither.
-_LP_OP = "fused_linear_logprobs_v4"
-_LP_BWD_OP = "fused_linear_logprobs_bwd_v2"
+_LP_OP = "fused_linear_logprobs_v5"
+_LP_BWD_OP = "fused_linear_logprobs_bwd_v3"
 
 CALLS = {"ce": 0, "logprobs": 0, "logprobs_bwd": 0, "triton": 0, "torch": 0, "tiled": 0, "exact_top": 0,
          "bwd_single": 0, "flash": 0}
@@ -1055,6 +1055,12 @@ def _keep_index(targets, mask, vocab_size, ignore_index):
     return idx, int(idx.numel())
 
 
+def _saved_index(idx, n_keep, n_all):
+    # Fixed length (no data dependent op output) + the count on the host, so the backward needs no nonzero / sync.
+    full = idx if n_keep == n_all else torch.cat([idx, idx.new_zeros(n_all - n_keep)])
+    return full, torch.tensor([n_keep], dtype = torch.long)
+
+
 def _rows_of(x, idx, a, b, n_keep, n_all):
     if n_keep == n_all:
         return x[a:b]
@@ -1256,7 +1262,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                         out.index_copy_(0, idx, dst[key])
                 if top is not None:
                     block_top.index_copy_(0, idx, top)
-            return logps, ent, mean, lssp, top1, u, lse, block_top
+            return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N)
         R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
@@ -1289,7 +1295,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                         put(dst, st[key] / V if key == "sum" else st[key])
                 if want_u:
                     put(u, _dz_w(dz, w) if u_scale == 1.0 else _dz_w(dz, w).div_(u_scale))
-    return logps, ent, mean, lssp, top1, u, lse, block_top
+    return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N)
 
 
 def _mm_into(out, a, b):
@@ -1334,12 +1340,14 @@ def _bwd_layout(n_keep, V, H, rows, bpl, budget, need_w, single, align):
 
 
 @_guarded
-def _logprobs_bwd_impl(hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul, div, cap,
-                       compute_dtype, need_h, need_w, need_b, rows):
+def _logprobs_bwd_impl(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, temperature, mul, div,
+                       cap, compute_dtype, need_h, need_w, need_b, rows):
     device = weight.device
     N, H = hidden.shape
     V = weight.shape[0]
-    idx, n_keep = _keep_index(targets, mask, V, None)
+    # Kept rows come from the forward (count on the host), so the backward does not sync on a second nonzero.
+    n_keep = int(n_keep[0])
+    idx = idx[:n_keep]
     f32 = dict(device = device, dtype = torch.float32)
     inv_t, scale, cap = _scalars(temperature, mul, div, cap)
     has_ge = ge.numel() > 0
@@ -1514,7 +1522,7 @@ if _OPS is None:
         compute_dtype: torch.dtype, want_ent: bool, want_mean: bool, want_lssp: bool, want_top1: bool,
         want_u: bool, need_h: bool, need_w: bool, need_b: bool, rows: int, ent_lazy: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor]:
+               torch.Tensor, torch.Tensor, torch.Tensor]:
         CALLS["logprobs"] += 1
         return _OPS["lp_impl"](hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
                                want_ent, want_mean, want_lssp, want_top1, want_u, rows,
@@ -1538,11 +1546,13 @@ if _OPS is None:
             torch.empty(N, **f32),
             torch.empty(_block_top_shape(N, weight.shape[0], weight.device, compute_dtype,
                                          (need_h or need_w or need_b) and not want_u and need_w and not cap), **f32),
+            torch.empty(N, device = targets.device, dtype = torch.long),
+            torch.empty(1, device = "cpu", dtype = torch.long),
         )
 
     def _lp_setup(ctx, inputs, output):
-        logps, ent, mean, lssp, top1, u, lse, block_top = output
-        ctx.mark_non_differentiable(mean, lssp, top1, u, lse, block_top)
+        logps, ent, mean, lssp, top1, u, lse, block_top, idx, n_keep = output
+        ctx.mark_non_differentiable(mean, lssp, top1, u, lse, block_top, idx, n_keep)
         ctx.set_materialize_grads(False)
         (hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
          want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows, ent_lazy) = inputs
@@ -1555,11 +1565,11 @@ if _OPS is None:
         ctx.has_mask = mask is not None
         ctx.hidden_dtype = hidden.dtype
         if ctx.ent_lazy:
-            ctx.save_for_backward(u, hidden, weight, bias, targets, mask, lse, ent)
+            ctx.save_for_backward(u, hidden, weight, bias, targets, idx, n_keep, lse, ent)
         elif want_u:
             ctx.save_for_backward(u)
         else:
-            ctx.save_for_backward(hidden, weight, bias, targets, mask, lse, ent, block_top)
+            ctx.save_for_backward(hidden, weight, bias, targets, idx, n_keep, lse, ent, block_top)
 
     def _lp_backward(ctx, g_logps, g_ent, *_):
         need_h, need_w, need_b = ctx.need
@@ -1568,26 +1578,26 @@ if _OPS is None:
             if not need_h:
                 return (None,) + none
             if ctx.ent_lazy and g_ent is not None:
-                _, hidden, weight, bias, targets, mask, lse, ent = ctx.saved_tensors
+                _, hidden, weight, bias, targets, idx, n_keep, lse, ent = ctx.saved_tensors
                 temperature, mul, div, cap, compute_dtype, rows = ctx.args
                 g = g_logps.float() if g_logps is not None else torch.zeros_like(lse)
                 gh, _, _ = getattr(torch.ops.unsloth_zoo, _LP_BWD_OP)(
-                    hidden, weight, bias, targets, mask, lse, ent, g, g_ent.float(), lse.new_empty(0),
+                    hidden, weight, bias, targets, idx, n_keep, lse, ent, g, g_ent.float(), lse.new_empty(0),
                     temperature, mul, div, cap, compute_dtype, True, False, False, rows,
                 )
                 return (gh,) + none
             if g_logps is None:
                 return (None,) + none
             return (torch.ops.unsloth_zoo.fused_linear_scale_rows(ctx.saved_tensors[0], g_logps, ctx.hidden_dtype),) + none
-        hidden, weight, bias, targets, mask, lse, ent, block_top = ctx.saved_tensors
+        hidden, weight, bias, targets, idx, n_keep, lse, ent, block_top = ctx.saved_tensors
         if g_logps is None and g_ent is None:
             return (None,) + none
         g = g_logps.float() if g_logps is not None else torch.zeros_like(lse)
         ge = g_ent.float() if (g_ent is not None and ent.numel() > 0) else lse.new_empty(0)
         temperature, mul, div, cap, compute_dtype, rows = ctx.args
         gh, gw, gb = getattr(torch.ops.unsloth_zoo, _LP_BWD_OP)(
-            hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul, div, cap, compute_dtype,
-            need_h, need_w, need_b, rows,
+            hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, temperature, mul, div, cap,
+            compute_dtype, need_h, need_w, need_b, rows,
         )
         return (gh if need_h else None, gw if need_w else None, gb if need_b else None) + (None,) * 17
 
@@ -1596,16 +1606,16 @@ if _OPS is None:
     @custom_op(f"unsloth_zoo::{_LP_BWD_OP}", mutates_args = ())
     def _lp_bwd_op(
         hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], targets: torch.Tensor,
-        mask: Optional[torch.Tensor], lse: torch.Tensor, ent: torch.Tensor, g: torch.Tensor, ge: torch.Tensor,
-        block_top: torch.Tensor, temperature: float, mul: float, div: float, cap: float, compute_dtype: torch.dtype,
-        need_h: bool, need_w: bool, need_b: bool, rows: int,
+        idx: torch.Tensor, n_keep: torch.Tensor, lse: torch.Tensor, ent: torch.Tensor, g: torch.Tensor,
+        ge: torch.Tensor, block_top: torch.Tensor, temperature: float, mul: float, div: float, cap: float,
+        compute_dtype: torch.dtype, need_h: bool, need_w: bool, need_b: bool, rows: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         CALLS["logprobs_bwd"] += 1
-        return _OPS["lp_bwd_impl"](hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul,
-                                   div, cap, compute_dtype, need_h, need_w, need_b, rows)
+        return _OPS["lp_bwd_impl"](hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, temperature,
+                                   mul, div, cap, compute_dtype, need_h, need_w, need_b, rows)
 
     @_lp_bwd_op.register_fake
-    def _lp_bwd_fake(hidden, weight, bias, targets, mask, lse, ent, g, ge, block_top, temperature, mul, div, cap,
+    def _lp_bwd_fake(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, temperature, mul, div, cap,
                      compute_dtype, need_h, need_w, need_b, rows):
         return (
             hidden.new_empty(hidden.shape) if need_h else hidden.new_empty(0),
@@ -1794,7 +1804,7 @@ def fused_linear_logprobs(
     ent_grad = bool(return_entropy) and (lazy or bool(entropy_requires_grad))
     head_grad = need_w or need_b
     want_u = _FORWARD_GRAD and need_h and not head_grad and (not ent_grad or lazy)
-    logps, ent, mean, lssp, top1, u, lse, _ = getattr(torch.ops.unsloth_zoo, _LP_OP)(
+    logps, ent, mean, lssp, top1, u, lse, _, _, _ = getattr(torch.ops.unsloth_zoo, _LP_OP)(
         hidden2, weight, bias, targets2, mask2, float(temperature),
         float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
         _compute_dtype(hidden, weight), bool(return_entropy), bool(return_mean_logits),

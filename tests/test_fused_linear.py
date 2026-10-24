@@ -624,8 +624,8 @@ def test_opcheck_with_disabled_outputs():
     n = h.shape[0]
     torch.library.opcheck(
         getattr(torch.ops.unsloth_zoo, fl._LP_BWD_OP).default,
-        (h, w, b, t, None, torch.zeros(n), torch.empty(0), torch.ones(n), torch.empty(0), torch.empty(0), 1.0, 0.0,
-         0.0, 0.0, torch.float32, True, False, False, 4),
+        (h, w, b, t, torch.arange(n), torch.tensor([n]), torch.zeros(n), torch.empty(0), torch.ones(n), torch.empty(0),
+         torch.empty(0), 1.0, 0.0, 0.0, 0.0, torch.float32, True, False, False, 4),
         test_utils = ("test_faketensor",),
     )
 
@@ -642,7 +642,7 @@ def test_two_dim_logits_bias(device):
 def test_detached_entropy_skips_the_entropy_backward(monkeypatch):
     seen = []
     real = fl._OPS["lp_bwd_impl"]
-    monkeypatch.setitem(fl._OPS, "lp_bwd_impl", lambda *a: seen.append(a[8].numel()) or real(*a))
+    monkeypatch.setitem(fl._OPS, "lp_bwd_impl", lambda *a: seen.append(a[9].numel()) or real(*a))
     h, w, _, t = _make("cpu", torch.float32, 10, 8, 33, train_head = True)
     lp, ent = fused_linear_logprobs(h, w, t, return_entropy = True, entropy_requires_grad = False)
     grads = torch.autograd.grad(lp.sum(), [h, w])
@@ -1383,3 +1383,36 @@ def test_triton_skipped_where_core_turns_compile_off(monkeypatch, hip, arch, cap
         assert fl._use_triton(torch.device("cuda", 0)) is ok
     finally:
         fl._triton_arch_ok.cache_clear()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("case", ["head", "entropy", "lazy_entropy"])
+def test_recompute_backward_reuses_forward_index(monkeypatch, device, case):
+    """The kept-row index is built once in the forward; the recompute backward must not nonzero (a host sync) again."""
+    calls = []
+    real = torch.Tensor.nonzero
+    monkeypatch.setattr(torch.Tensor, "nonzero", lambda self, *a, **k: calls.append(1) or real(self, *a, **k))
+    h, w, _, t = _make(device, torch.float32, 24, 8, 33, train_head = case == "head")
+    mask = torch.arange(24, device = device) % 3 != 0
+    ent_grad = None if case == "lazy_entropy" else True
+    lp, ent = fused_linear_logprobs(h, w, t, mask = mask, return_entropy = True, entropy_requires_grad = ent_grad)
+    assert len(calls) == 1, calls
+    params = [h, w] if case == "head" else [h]
+    grads = torch.autograd.grad(lp.sum() + ent.sum(), params)
+    assert len(calls) == 1, f"backward ran nonzero {len(calls) - 1} more time(s)"
+    assert all(torch.isfinite(g).all() for g in grads)
+    assert torch.count_nonzero(grads[0][~mask]) == 0
+    if device == "cuda":
+        import warnings
+        h.grad = None
+        with warnings.catch_warnings(record = True) as rec:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                lp, ent = fused_linear_logprobs(h, w, t, mask = mask, return_entropy = True,
+                                                entropy_requires_grad = ent_grad)
+                torch.autograd.grad(lp.sum() + ent.sum(), params)
+            finally:
+                torch.cuda.set_sync_debug_mode(0)
+        syncs = [r for r in rec if "called a synchronizing" in str(r.message)]
+        assert len(syncs) == 1, [str(r.message) for r in syncs]
