@@ -292,6 +292,15 @@ modifications =
       the causal_conv1d forward / backward autotune keys, signatures and
       launches (neither kernel reads it), so every new 1024-token bucket no
       longer re-tunes and recompiles both kernels.
+    - Backported fla PR #1514 in ops/common/chunk_o.py (inline "Unsloth: backported
+      from fla PR #1514" comments): chunk_bwd_dv, chunk_bwd_dv_local and
+      chunk_bwd_dqkwg take 128-wide K/V tiles on A100-class GPUs (shared memory
+      >= the 'ampere' tier, below 'hopper') when every tensor the wrapper loads is
+      16-bit, and keep 64 otherwise. Measured on a Colab A100-SXM4-40GB (torch
+      2.14.1, triton 3.8.0), Qwen3.5 GDN fwd+bwd, B=1 T=8192 HV=32/64 and packed:
+      chunk_bwd_kernel_dqkwg 952 -> 773 us, layer fwd+bwd 1.04-1.05x; parity vs an
+      fp32 recurrence unchanged. Every other GPU keeps its tile (the branch is not
+      reached on Hopper / Blackwell / Ada / Turing / AMD).
     - Modified by Unsloth in modules/l2norm.py and modules/fused_norm_gate.py (not
       upstream as of fla 9d478fa), the same change as the #1388 conv backport above:
       NB = cdiv(T, 65536) is dropped from the l2norm_{fwd,bwd}_kernel and
