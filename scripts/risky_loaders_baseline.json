@@ -337,6 +337,14 @@
     {
       "file": "unsloth_zoo/temporary_patches/fla_vendor.py",
       "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "f79d15f13ee764d4",
+      "count": 1,
+      "reason": "Imports _GLM5_NEXT_MODULE, a fixed transformers module path defined in this file, to patch Glm5NextTextLinearAttention."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/fla_vendor.py",
+      "rule": "dynamic-import",
       "sink": "spec_from_file_location",
       "digest": "992d2ddf3e2ecc8d",
       "count": 1,
