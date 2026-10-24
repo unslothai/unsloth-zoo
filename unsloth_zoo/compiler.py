@@ -2864,9 +2864,13 @@ def _unwrap_undecorated_method(func, owner_qualname):
     standalone function from that emits `return wrapped(self, *args, **kwargs)`
     under the real named signature, which is a `NameError` at the first forward.
 
-    Walk `__wrapped__` and then single function closure cells until we land on a
-    function that really belongs to `owner_qualname`. If no such function is
-    found, return `func` unchanged so nothing else changes behaviour.
+    A wrapper can also bind the original through a default argument (Jamba /
+    Zamba `_slow_only` in `temporary_patches/misc.py`); its default names a patch
+    local, so re-emitting it raises `NameError`. Such defaults are walked too.
+
+    Walk `__wrapped__` and then single function closure cells or defaults until
+    we land on a function that really belongs to `owner_qualname`. If no such
+    function is found, return `func` unchanged so nothing else changes behaviour.
     """
     prefix = owner_qualname + "."
     if getattr(func, "__qualname__", "").startswith(prefix):
@@ -2876,17 +2880,22 @@ def _unwrap_undecorated_method(func, owner_qualname):
     for _ in range(10):
         candidate = getattr(current, "__wrapped__", None)
         if candidate is None:
-            cells = getattr(current, "__closure__", None)
-            if getattr(current, "__code__", None) is None or not cells:
+            if getattr(current, "__code__", None) is None:
                 break
             inner = []
-            for cell in cells:
+            for cell in getattr(current, "__closure__", None) or ():
                 try:
                     value = cell.cell_contents
                 except ValueError:
                     continue
                 if inspect.isfunction(value):
                     inner.append(value)
+            # Defaults only when no closure cell holds a function, so every
+            # wrapper the closure walk already resolved keeps its answer.
+            if not inner:
+                defaults = list(getattr(current, "__defaults__", None) or ())
+                defaults += list((getattr(current, "__kwdefaults__", None) or {}).values())
+                inner = [value for value in defaults if inspect.isfunction(value)]
             # More than one candidate is ambiguous, so leave `func` alone.
             if len(inner) != 1:
                 break
