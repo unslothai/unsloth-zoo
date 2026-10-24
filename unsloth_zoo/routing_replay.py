@@ -55,7 +55,8 @@ ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 _MAX_ROLLOUTS = 2
 _MAX_CALLS_PER_ROLLOUT = 64
-_MAX_PENDING = 64
+# Leak guard only: evicting a forward awaiting its recompute makes that recompute route naturally.
+_MAX_PENDING = 1024
 
 
 def routing_replay_requested():
@@ -166,6 +167,7 @@ class _ReplayState:
         )
         self.changed = None
         self.warned_invalid = False
+        self.warned_evicted = False
 
 
 _STATE = _ReplayState()
@@ -415,7 +417,15 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
             _STATE.recomputed = False
         _STATE.record = {}
         _STATE.pending.append(_STATE.record)
-        del _STATE.pending[:-_MAX_PENDING]
+        if len(_STATE.pending) > _MAX_PENDING:
+            del _STATE.pending[:-_MAX_PENDING]
+            if not _STATE.warned_evicted:
+                _STATE.warned_evicted = True
+                warnings.warn(
+                    f"Unsloth: routing replay kept {_MAX_PENDING} checkpointed forwards without a backward; "
+                    "the oldest ones recompute with the trainer's own routing, so their gradients no longer "
+                    "match their forward. Run backward more often (fewer chunks per backward)."
+                )
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
         return None
