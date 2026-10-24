@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Compilable Sinkhorn-Knopp for the DeepSeek-V4 / V4.1 mHC mixers (see `mhc_fast_mode`).
+"""Compilable Sinkhorn-Knopp for the DeepSeek-V4 / V4.1 and GLM-5.3-Flash mHC mixers (see `mhc_fast_mode`).
 
 `unsloth_sinkhorn_knopp` unrolls each token's n x n matrix into n * n pointwise tensors so Inductor
 fuses the chain instead of emitting one reduction kernel per normalisation. Its backward

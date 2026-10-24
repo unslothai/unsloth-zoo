@@ -250,6 +250,10 @@ MODULE_FORWARD_SOURCE_REWRITES = {
     "deepseek_v41": {
         "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
+    # GLM-5.3-Flash carries the V4 Sinkhorn chain verbatim (transformers 5.17 - 5.20).
+    "glm5_next": {
+        "Glm5NextTextHyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
 }
 
 
@@ -266,6 +270,13 @@ def module_forward_source_rewrites(modeling_file, model_type):
             continue
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
+            if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
+                # Block compile rebinds a layer's forward to its modeling module's globals, so the
+                # helper the rewritten forward calls must resolve there too, not only in the
+                # generated module that imports it.
+                from .temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
+
+                modeling_file.unsloth_sinkhorn_knopp = unsloth_sinkhorn_knopp
     return applicable
 
 
@@ -5705,6 +5716,8 @@ DISABLE_COMPILE_MODULES = [
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",
+    # GLM-5.3-Flash: same Sinkhorn mixer. Its HyperHead is an unweighted mean and stays compiled.
+    "Glm5NextTextHyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
