@@ -345,14 +345,26 @@ def _load_cached_moe_utils_module():
         return None
 
 
+def _select_moe_backend_eagerly(module):
+    # Selecting inside a trace sets a guarded global and recompiles the graph once.
+    if torch.compiler.is_compiling():
+        return
+    try:
+        module.select_moe_backend()
+    except Exception:
+        pass
+
+
 def get_forward_moe_backend():
     """Resolve forward_moe_backend from the compiled cache copy, else the local def."""
     global _CACHED_FORWARD_MOE_BACKEND
     module = _load_cached_moe_utils_module()
     if module is not None and hasattr(module, "forward_moe_backend"):
+        _select_moe_backend_eagerly(module)
         _CACHED_FORWARD_MOE_BACKEND = module.forward_moe_backend
         return _CACHED_FORWARD_MOE_BACKEND
 
+    _select_moe_backend_eagerly(sys.modules[__name__])
     _CACHED_FORWARD_MOE_BACKEND = forward_moe_backend
     return _CACHED_FORWARD_MOE_BACKEND
 
