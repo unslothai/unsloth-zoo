@@ -1183,18 +1183,12 @@ CPU_BUFFERS = []
 CPU_INDEX = None
 GPU_BUFFER_DTYPE = None
 
-# Host slots of CPU_BUFFERS are leased per offloaded checkpoint and returned by its backward
-# (or when its graph is dropped), so a forward that starts while another graph still waits
-# for its backward (1F1B pipeline schedules, two forwards then two backwards) never reuses a
-# slot that holds a pending activation. The lowest free slot goes first: in the usual one
-# forward, one backward loop every layer gets the same slot as before, so the buffer count
-# and sizes do not change.
+# CPU_BUFFERS slots are leased per checkpoint until its backward, so 1F1B schedules (two forwards
+# then two backwards) never reuse a pending slot. Lowest free slot first keeps 1F1B-free runs unchanged.
 _FREE_CPU_SLOTS = []    # min-heap of returned slot indices
 _CPU_SLOT_TOP = 0       # slots [0, _CPU_SLOT_TOP) have been handed out at least once
 _CPU_SLOT_EPOCH = 0     # bumped by every pool reset; a lease from an older epoch is ignored
-# Each device copies through its own side stream, so a slot returned on one device and leased on
-# another needs an explicit order: every release records an event on the releasing device's side
-# stream (a second device may appear only later), and a lease from another device waits on it.
+# A slot released on one device's side stream and leased on another waits on the release event.
 _SLOT_FENCES = {}       # slot index -> (device index, event recorded at release)
 
 
@@ -1427,8 +1421,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         MAIN_STREAM  = _compute_stream(device_index)
                         EXTRA_STREAM = EXTRA_STREAMS[device_index]
 
-                        # First offload of a new graph. Host slots are not rewound here: a graph
-                        # still waiting for its backward keeps its slots (see _CpuSlotLease).
+                        # New graph. Host slots are not rewound: pending graphs keep theirs.
                         if BACKWARD_PASS:
                             BACKWARD_PASS = False
                             # A new graph: earlier prefetch descriptors and slot records are stale.
@@ -1523,7 +1516,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         while len(OFFLOAD_SLOT_META) <= CPU_INDEX: OFFLOAD_SLOT_META.append(None)
                         OFFLOAD_SLOT_META[CPU_INDEX] = None if ctx._offload_generation is None else \
                             (OFFLOAD_GENERATION, device_index, buffer_slot, new_size, shape, store_dtype)
-                        # Held until backward has read the slot, or freed with the graph.
                         ctx._cpu_slot = lease
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
@@ -1618,8 +1610,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 if in_chain:
                     _prefetch_offloaded_input(CPU_INDEX - 1, device_index, generation, buffer_slot)
             pass
-            # The reload is queued on EXTRA_STREAM, where the next offload into this slot also
-            # runs, so the slot can be handed out again now.
+            # Reload is queued on EXTRA_STREAM, as is the next offload into it: safe to reuse now.
             lease = getattr(ctx, "_cpu_slot", None)
             if lease is not None: lease.release()
         else:
@@ -1753,8 +1744,7 @@ class _OffloadedActivation:
     def __del__(self):
         try:
             if self.pinned_bytes: _release_pinned(self.pinned_bytes)
-            # A prefetch dropped unread (graph freed mid backward): its block goes back to the
-            # allocating stream's pool, so order that stream after the reload still writing it.
+            # Prefetch dropped unread: order the allocating stream after the reload still writing it.
             if self.ready is not None: self.ready_stream.wait_event(self.ready)
         except Exception:
             pass  # interpreter shutdown
@@ -1781,12 +1771,9 @@ class NonReentrantActivationOffloader:
             self.keep_last = max(0, int(os.environ.get("UNSLOTH_GC_STREAM_KEEP_LAST", "1")))
         except ValueError:
             self.keep_last = 1
-        # 0 copies on the compute stream (no extra VRAM, no overlap, the single GPU default);
-        # N > 0 copies on a side stream that overlaps the next layers. The source of each side
-        # stream copy is kept alive with its copy event (at most N per device, so N activations
-        # of extra VRAM, fixed); the oldest is released only after the compute stream, which
-        # allocated it, waits on that event. No host sync and no record_stream, whose block
-        # reuse depends on how far the CPU runs ahead (distributed default 1).
+        # 0: copy on the compute stream (single GPU default). N > 0: side stream, at most N sources
+        # kept alive per device, released after the compute stream waits on the copy. No
+        # record_stream: its block reuse depends on how far the CPU runs ahead (distributed default 1).
         default_inflight = 1 if is_distributed() else 0
         try:
             self.max_inflight = max(0, int(os.environ.get("UNSLOTH_GC_MAX_INFLIGHT_COPIES", default_inflight)))
@@ -1831,9 +1818,6 @@ class NonReentrantActivationOffloader:
             if inflight is None:
                 inflight = self.inflight[device_index] = collections.deque()
             compute = torch.cuda.current_stream(device_index)
-            # Retire the oldest copies past the limit, plus any that already finished. The
-            # compute stream waits on the copy before the source is dropped, so no later
-            # allocation on it can reuse the block while the D2H still reads it.
             self._retire(inflight, compute, self.max_inflight - 1)
             side = self._stream(self.d2h_streams, device_index)
             side.wait_stream(compute)
@@ -1848,7 +1832,7 @@ class NonReentrantActivationOffloader:
                 if not _is_host_alloc_oom(e): raise
                 _warn_pinned_unavailable(e)
             else:
-                # Keepalive: the caller drops x next, but its block must outlive the copy.
+                # Keepalive: x's block must outlive the copy.
                 inflight.append((x, copied, compute))
                 record.host, record.copied, record.pinned_bytes = host, copied, nbytes
                 self.stats["pinned"] += 1
@@ -1859,7 +1843,6 @@ class NonReentrantActivationOffloader:
 
     @staticmethod
     def _retire(inflight, compute, keep):
-        # Each keepalive waits on the stream that allocated its source (compute is only the default).
         while inflight and (len(inflight) > keep or inflight[0][1].query()):
             _, copied, owner = inflight.popleft()
             (owner or compute).wait_event(copied)
@@ -1918,8 +1901,7 @@ class NonReentrantActivationOffloader:
             x.copy_(record.host, non_blocking = True)
             ready = torch.cuda.Event()
             ready.record(side)
-        # No record_stream: the record keeps x alive, and the compute stream that allocated it
-        # waits on `ready` before using it (unpack) or before it is freed unread (__del__).
+        # No record_stream: compute waits on `ready` in unpack, or in __del__ if never read.
         record.device_tensor, record.ready, record.ready_stream = x, ready, compute
         self.stats["prefetched"] += 1
     pass
