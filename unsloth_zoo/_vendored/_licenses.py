@@ -229,6 +229,21 @@ modifications =
       on triton 3.4.0, 3.5.1, 3.6.0 and 3.7.1 (torch 2.8.0 to 2.13.0), and on
       3.7.1 the autotuner picks one of those configs, so excluding them there
       cost up to 2.7% of a KDA layer fwd+bwd (B 1, T 8192, H 64, D 128).
+    - Backported fla PR #1242 and the KDA hunk of fla PR #1554 in
+      ops/kda/chunk_intra.py (+ inline "Unsloth: backported from fla PR
+      #1242" / "#1554" comments), safe_gate path only: the 16x16 diagonal
+      blocks anchor on the block's first cumulative gate shifted by a fixed
+      amount (GATE_SHIFT) instead of the middle token's gate, so earlier
+      causal scores never read future gates, and the four safe-gate backward
+      dots use bf16x3 (ieee before Triton 3.6). Without them the safe_gate dg
+      error against an fp32 recurrence is 5e-2 to 2.6e-1 with GLM-5.3-Flash
+      style gates (T 256 to 2048, gates down to the -5 lower bound); with
+      them it is 3e-3 to 5e-3, as safe_gate=False. The safe_gate=False
+      code is unchanged (identical outputs and gradients under the same
+      autotuned configs).
+      unsloth_zoo (temporary_patches/fla_vendor.py) passes safe_gate=True
+      only from GLM-5.3-Flash (glm5_next), whose forget gate is
+      linear_lower_bound * sigmoid(.) with linear_lower_bound in [-5, 0).
     - Backported fla PR #1229 in ops/common/chunk_o.py (+ inline "Unsloth:
       backported from fla PR #1229" comment): on Blackwell the chunk_fwd_kernel_o
       autotune drops its 8-warp BK=BV=128 config, which hits a Triton tl.dot
