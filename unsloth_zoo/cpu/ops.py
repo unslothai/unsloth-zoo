@@ -105,6 +105,98 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         return dh, dw, None, None, None, None
 
 
+_LOGPROB_OUTPUTS = ("entropy", "log_sum_sq_probs", "mean_logits", "is_top1")
+
+
+def _logprob_piece(hidden, weight, bias, targets, inv_t, softcap, logit_scale, want_entropy):
+    logits = (hidden @ weight.t()).float()
+    if bias is not None:
+        logits = logits + bias.float()
+    logits = logits * logit_scale
+    if softcap is not None:
+        logits = softcap * torch.tanh(logits / softcap)
+    logits = logits * inv_t
+    log_z = torch.logsumexp(logits, dim = -1)
+    log_probs = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1) - log_z
+    if not want_entropy:
+        return log_probs, log_z
+    entropy = log_z - (torch.softmax(logits, dim = -1) * logits).sum(-1)
+    return log_probs, entropy
+
+
+def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size,
+                          final_logit_softcapping = None, logit_scale = 1.0, outputs = _LOGPROB_OUTPUTS):
+    """Torch twin of TRL's Triton `ChunkedLogProbFunction` (the fused LM head SFTTrainer uses from
+    TRL 1.x): per-token log-probabilities of hidden @ weight.T and the requested extras, for devices
+    the kernel cannot run on. Rows are checkpointed in chunks, so no [N, V] logits stay alive."""
+    from torch.utils.checkpoint import checkpoint
+    if torch.is_autocast_enabled(hidden.device.type):
+        dtype = torch.get_autocast_dtype(hidden.device.type)
+        hidden, weight = hidden.to(dtype), weight.to(dtype)
+        bias = bias.to(dtype) if bias is not None else None
+    rows = max(1, int(os.environ.get("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", 16 * 1024 * 1024)) // max(1, weight.shape[0]))
+    inv_t = 1.0 / temperature
+    want_entropy = "entropy" in outputs
+    grad = torch.is_grad_enabled() and (hidden.requires_grad or weight.requires_grad)
+    log_probs, entropy = [], []
+    for start in range(0, hidden.shape[0], rows):
+        args = (hidden[start:start + rows], weight, bias, targets[start:start + rows], inv_t,
+                final_logit_softcapping, logit_scale, want_entropy)
+        lp, ent = checkpoint(_logprob_piece, *args, use_reentrant = False) if grad else _logprob_piece(*args)
+        log_probs.append(lp)
+        entropy.append(ent)
+    log_probs = torch.cat(log_probs) if log_probs else hidden.new_zeros(0, dtype = torch.float32)
+    entropy = torch.cat(entropy) if want_entropy and entropy else None
+    extras = {}
+    if any(name in outputs for name in ("log_sum_sq_probs", "mean_logits", "is_top1")):
+        # Metrics only (TRL marks them non-differentiable): one more pass without autograd.
+        with torch.no_grad():
+            sq, mean, top1 = [], [], []
+            for start in range(0, hidden.shape[0], rows):
+                logits = (hidden[start:start + rows] @ weight.t()).float()
+                if bias is not None:
+                    logits = logits + bias.float()
+                logits = logits * logit_scale
+                if final_logit_softcapping is not None:
+                    logits = final_logit_softcapping * torch.tanh(logits / final_logit_softcapping)
+                logits = logits * inv_t
+                sq.append(torch.logsumexp(2 * torch.log_softmax(logits, dim = -1), dim = -1))
+                mean.append(logits.mean(-1))
+                # First-argmax, like the kernel's `target >= max and target > max before it`.
+                top1.append(logits.argmax(-1) == targets[start:start + rows])
+            extras = {"log_sum_sq_probs": torch.cat(sq), "mean_logits": torch.cat(mean), "is_top1": torch.cat(top1)}
+    pick = lambda name: extras.get(name) if name in outputs else None  # noqa: E731
+    return log_probs, entropy, pick("log_sum_sq_probs"), pick("mean_logits"), pick("is_top1")
+
+
+def patch_trl_fused_lm_head():
+    """TRL 1.x SFTTrainer always computes its loss through a fused LM head whose kernel is Triton
+    (CUDA / XPU only) and is None where Triton is missing, so CPU training and evaluate() fail. Keep
+    the kernel on those devices and route every other device to cpu_chunked_log_probs. Idempotent."""
+    try:
+        from trl.trainer import utils as trl_utils
+    except Exception:
+        return False
+    if not hasattr(trl_utils, "_ChunkedLogProbFunction"):
+        return False  # TRL without the fused head: nothing to route.
+    kernel = trl_utils._ChunkedLogProbFunction
+    if getattr(kernel, "_unsloth_cpu_dispatch", False):
+        return True
+
+    class _DeviceDispatch:
+        _unsloth_cpu_dispatch = True
+        _kernel = kernel
+
+        @staticmethod
+        def apply(hidden, *args, **kwargs):
+            if kernel is not None and hidden.device.type in ("cuda", "xpu"):
+                return kernel.apply(hidden, *args, **kwargs)
+            return cpu_chunked_log_probs(hidden, *args, **kwargs)
+
+    trl_utils._ChunkedLogProbFunction = _DeviceDispatch
+    return True
+
+
 def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = None,
                                  ignore_index = -100, shift_labels = None, chunk_rows = None):
     """Causal-LM loss with the same shift and normalisation as transformers' ForCausalLMLoss."""

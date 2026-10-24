@@ -855,3 +855,66 @@ def test_gguf_on_a_cpu_without_native_bf16_is_not_rounded_through_fp16(monkeypat
     monkeypatch.setattr(llama_cpp, "quantize_gguf", lambda src, dst, *a, **k: open(dst, "w").close())
     loader.save_pretrained_gguf(_tiny_llama().float(), str(tmp_path / "m"), quantization_method = methods)
     assert staged["dtype"] == "float32"
+
+
+@pytest.mark.parametrize("softcap, temperature, scale, bias", [(None, 1.0, 1.0, False), (30.0, 0.7, 0.5, True)])
+def test_cpu_fused_lm_head_matches_an_fp64_reference(softcap, temperature, scale, bias):
+    """The torch twin of TRL's fused LM head kernel: log-probs, extras and gradients."""
+    from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
+    torch.manual_seed(0)
+    hidden, weight = torch.randn(37, 16) * 2, torch.randn(101, 16) * 0.3
+    b = torch.randn(101) if bias else None
+    targets = torch.randint(0, 101, (37,))
+
+    def reference(h, w):
+        z = h.double() @ w.double().t() + (b.double() if b is not None else 0)
+        z = z * scale
+        if softcap is not None:
+            z = softcap * torch.tanh(z / softcap)
+        z = z / temperature
+        logp = torch.log_softmax(z, -1)
+        return (logp.gather(-1, targets[:, None]).squeeze(-1), -(logp.exp() * logp).sum(-1),
+                torch.logsumexp(2 * logp, -1), z.mean(-1), z.argmax(-1) == targets)
+
+    h1, w1 = hidden.clone().requires_grad_(True), weight.clone().requires_grad_(True)
+    ours = cpu_chunked_log_probs(h1, w1, b, targets, temperature, 64, softcap, scale)
+    (ours[0].sum() + 0.1 * ours[1].sum()).backward()
+    h2, w2 = hidden.double().requires_grad_(True), weight.double().requires_grad_(True)
+    ref = reference(h2, w2)
+    (ref[0].sum() + 0.1 * ref[1].sum()).backward()
+    for got, want in zip(ours[:4], ref[:4]):
+        torch.testing.assert_close(got.double(), want, rtol = 1e-5, atol = 1e-5)
+    assert torch.equal(ours[4], ref[4])
+    torch.testing.assert_close(h1.grad.double(), h2.grad, rtol = 1e-5, atol = 1e-6)
+    torch.testing.assert_close(w1.grad.double(), w2.grad, rtol = 1e-5, atol = 1e-6)
+
+
+def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
+    """TRL 1.x calls `_ChunkedLogProbFunction.apply` from SFTTrainer.compute_loss; CPU tensors (and a
+    missing kernel) take the torch path, accelerator tensors keep the kernel."""
+    from types import SimpleNamespace
+    from trl.trainer import utils as trl_utils
+    from unsloth_zoo.cpu import ops
+    calls = []
+
+    class Kernel:
+        @staticmethod
+        def apply(hidden, *a, **k):
+            calls.append(hidden.device.type)
+            return "kernel"
+
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", Kernel, raising = False)
+    monkeypatch.setattr(ops, "cpu_chunked_log_probs", lambda *a, **k: "torch")
+    assert ops.patch_trl_fused_lm_head() is True
+    assert ops.patch_trl_fused_lm_head() is True  # idempotent: not wrapped twice
+    dispatch = trl_utils._ChunkedLogProbFunction
+    assert dispatch._kernel is Kernel
+    assert dispatch.apply(torch.zeros(1, 2), None) == "torch" and calls == []
+    assert dispatch.apply(SimpleNamespace(device = SimpleNamespace(type = "cuda")), None) == "kernel" and calls == ["cuda"]
+    # Triton missing (macOS, Windows without triton-windows): TRL leaves None, the torch path still answers.
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", None)
+    assert ops.patch_trl_fused_lm_head() is True
+    assert trl_utils._ChunkedLogProbFunction.apply(torch.zeros(1, 2), None) == "torch"
+    # TRL before the fused head: nothing to route.
+    monkeypatch.delattr(trl_utils, "_ChunkedLogProbFunction")
+    assert ops.patch_trl_fused_lm_head() is False

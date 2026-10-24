@@ -240,6 +240,8 @@ def install_cpu_training_defaults():
         if cls is not None and "__post_init__" in vars(cls):
             _patch_post_init(cls)
     _patch_sft_compute_loss(sft_trainer.SFTTrainer)
+    from .ops import patch_trl_fused_lm_head
+    patch_trl_fused_lm_head()
     trainer = _make_cpu_sft_trainer(sft_trainer.SFTTrainer)
     for module in (sft_trainer, trl, sys.modules.get("trl.trainer")):
         if module is not None:
