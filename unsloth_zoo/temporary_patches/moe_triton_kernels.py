@@ -45,6 +45,10 @@ def _probe_triton() -> bool:
         return False
 
 
+# Probed at import: a compiled frame that read _TRITON as None would recompile once a later eager call cached it.
+_TRITON = _probe_triton()
+
+
 def moe_triton_kernels_available(device = None) -> bool:
     global _TRITON
     if _DISABLED_REASON is not None or os.environ.get("UNSLOTH_MOE_TRITON_KERNELS", "1") == "0":
