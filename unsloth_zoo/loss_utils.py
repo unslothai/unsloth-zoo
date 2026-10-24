@@ -487,10 +487,8 @@ def _packed_boundary_targets(packed_seq_lengths, token_count):
     if isinstance(packed_seq_lengths, torch.Tensor) and (
         torch.compiler.is_compiling() or packed_seq_lengths.device.type == "cuda"
     ):
-        # Clamping stands in for the eager filter, which lowers to nonzero and cannot trace. It drops
-        # the same slots: a 0 (or clamped negative) length repeats the previous start, index_fill_ is
-        # idempotent, and a start equal to ends[-1] is never kept. On a CUDA batch it also avoids a
-        # D2H read of the lengths plus a pageable H2D copy of the slots back, two syncs per micro-batch.
+        # Clamp, not the eager filter (nonzero cannot trace; on CUDA it costs a D2H + H2D sync). Same slots:
+        # a 0 length repeats the previous start, index_fill_ is idempotent, a start at ends[-1] is never kept.
         lengths = packed_seq_lengths.reshape(-1).long().clamp_min(0)
     else:
         lengths = _normalize_packed_seq_lengths(packed_seq_lengths)
