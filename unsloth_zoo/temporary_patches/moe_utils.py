@@ -413,6 +413,11 @@ def _grouped_mm_eager(inputs, weight, offsets):
 
 def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
     """dW[g] = inputs[g]^T @ grad_output[g] per group, as [G, K, N]; empty groups are zero."""
+    # torch._grouped_mm rejects a stride-0 operand (autograd's expand for the grad of y.sum()) and a non-16-byte
+    # aligned one, which sent dW to the per-expert loop below: a host sync and a different reduction than the
+    # compiled path, whose tangent is materialized (eager vs AOT dW differed on L4). No-op when contiguous.
+    inputs = inputs.contiguous()
+    grad_output = grad_output.contiguous()
     try:
         if _grouped_mm_supported_on(inputs.device):
             return torch._grouped_mm(inputs.transpose(-2, -1), grad_output, offs = offsets).contiguous()

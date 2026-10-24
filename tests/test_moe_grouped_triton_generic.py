@@ -494,6 +494,31 @@ def test_opcheck(dtype):
     torch.library.opcheck(torch.ops.unsloth_zoo.grouped_mm_triton_wgrad.default, (x, dy, offs))
 
 
+@needs_kernel
+@pytest.mark.parametrize("transposed", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_eager_dw_fallback_with_broadcast_grad(dtype, transposed):
+    # sm89's auto table hands every base dW (K, N > 32) to the torch._grouped_mm fallback. The grad of
+    # y.sum() reaches it as a stride-0 expand; dW must still match fp64 (test_opcheck saw it differ under AOT).
+    if not MU._grouped_mm_supported_on(torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("torch._grouped_mm unsupported here")
+    _mock_cap((8, 9), torch.cuda.current_device())
+    x, param, _, offs, counts = _problem([5, 0, 19, 7], 64, 96, dtype, transposed = transposed)
+    ref_dy = torch.ones(x.shape[0], _weight(param, transposed).shape[-1], device = "cuda", dtype = dtype)
+    _, ref_dx, ref_dw = _fp64(x, param, ref_dy, counts, transposed)
+    for fn in (MU._triton_grouped_mm, torch.ops.unsloth_zoo.grouped_mm_triton.default):
+        xx = x.detach().clone().requires_grad_(True)
+        p = param.detach().clone().requires_grad_(True)
+        before = _calls()
+        fn(xx, _weight(p, transposed), offs).sum().backward()
+        assert _calls()["wgrad"] == before["wgrad"]            # dW took the torch fallback, not the Triton kernel
+        # fp32 accumulation and one final rounding: within half an ulp of fp64 per element (2x margin here).
+        rtol = 2 ** -8 if dtype == torch.bfloat16 else 2 ** -11
+        for got, ref in ((p.grad, ref_dw), (xx.grad, ref_dx)):
+            bad = (got.double() - ref).abs() > rtol * ref.abs() + 1e-4 * ref.abs().max()
+            assert not bad.any(), (fn, bad.nonzero()[:4].tolist(), (got.double() - ref).abs().max().item())
+
+
 def _lora_block(x, base, lora_a, lora_b, offs):
     # frozen base through a transposed view + a LoRA pair, as forward_native_grouped_mm runs them
     y = MU._grouped_mm_with_backward_fix(x, base.transpose(-2, -1), offs)
