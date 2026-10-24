@@ -4288,6 +4288,139 @@ def _check_disk_for_previous_export_refresh(save_directory, new_sizes):
 pass
 
 
+_PREVIOUS_EXPORT_PREFIX = ".unsloth-previous-"
+_PREVIOUS_EXPORT_METADATA_MAX = 64 * 1024 * 1024
+
+
+def _snapshot_previous_export_metadata(save_directory):
+    """Read the previous export's top level metadata before the refresh rewrites it.
+
+    config.json, the index, the tokenizer and generation config are rewritten before any shard
+    is fetched, so a rollback of the shards alone would pair them with the new metadata.
+    Returns {"files": {path: (bytes, mode)}, "shards": set of shard paths}, with a top level
+    link recorded as {path: link target (str)} so the rollback puts the link back instead of
+    removing it. "shards" is every shard entry the previous export held, so the rollback can
+    remove the ones the refresh added. None when a file cannot be read, so no rollback is attempted.
+    """
+    # Absolute, as the rollback lists the folder holding the backup, which mkdtemp returns absolute.
+    save_directory = os.path.abspath(save_directory)
+    files = {}
+    try:
+        for name in os.listdir(save_directory):
+            path = os.path.join(save_directory, name)
+            if name.endswith(".safetensors") or name.startswith(_PREVIOUS_EXPORT_PREFIX):
+                continue
+            if os.path.islink(path):
+                files[path] = os.readlink(path)
+                continue
+            if not os.path.isfile(path):
+                continue
+            if os.path.getsize(path) > _PREVIOUS_EXPORT_METADATA_MAX:
+                return None
+            with open(path, "rb") as f:
+                files[path] = (f.read(), stat.S_IMODE(os.stat(path).st_mode))
+        shards = set(_export_shard_entries(save_directory))
+    except OSError:
+        return None
+    return {"files" : files, "shards" : shards}
+pass
+
+
+def _export_shard_entries(save_directory):
+    # Every shard entry (file or link) under the export, nested ones too; never inside a linked
+    # directory or the private backup and staging directories.
+    for root, dirs, names in os.walk(save_directory):
+        dirs[:] = [d for d in dirs if not d.startswith(".unsloth-")]
+        for name in names:
+            path = os.path.join(root, name)
+            if name.endswith(".safetensors") and (os.path.islink(path) or os.path.isfile(path)):
+                yield path
+pass
+
+
+def _keep_previous_export_shards(filenames, save_directory, new_sizes, metadata = {"files" : {}, "shards" : None}):
+    """Hard-link each previous export shard aside so a failed refresh can put it back.
+
+    Every writer stages the new shard and renames it over the old entry, so the link keeps
+    the old shard's data and costs nothing until then. Kept only when the disk can hold
+    every new shard beside the old ones, and only for all shards or none: a partial rollback
+    would still leave a mixed export. The links go in a private directory under numbered
+    names, so no shard name can collide with a backup. `metadata` is the snapshot taken
+    before the refresh rewrote it, restored with the shards; None (unreadable) keeps nothing.
+    """
+    if metadata is None:
+        return {}
+    try:
+        if shutil.disk_usage(save_directory).free < sum(new_sizes.values()) + _REFRESH_DISK_MARGIN:
+            return {}
+        backup_dir = tempfile.mkdtemp(prefix = _PREVIOUS_EXPORT_PREFIX, dir = save_directory)
+    except OSError:
+        return {}
+    kept = {"dir" : backup_dir, "shards" : {}, "metadata" : metadata}
+    try:
+        for i, filename in enumerate(filenames):
+            file_path = os.path.join(save_directory, filename)
+            if os.path.islink(file_path) or not os.path.isfile(file_path):
+                raise OSError(f"{file_path} is not a regular file")
+            backup_path = os.path.join(backup_dir, str(i))
+            os.link(file_path, backup_path)
+            kept["shards"][file_path] = backup_path
+    except OSError:
+        _drop_previous_export_shards(kept)
+    return kept
+pass
+
+
+def _restore_previous_export_shards(kept):
+    for file_path, backup_path in kept["shards"].items():
+        if not os.path.lexists(backup_path):
+            continue
+        if os.path.lexists(file_path) and os.path.samefile(file_path, backup_path):
+            continue
+        os.replace(backup_path, file_path)
+    backup_dir = kept["dir"]
+    save_directory = os.path.dirname(os.path.abspath(backup_dir))
+    metadata = kept["metadata"]["files"]
+    previous_shards = kept["metadata"].get("shards")
+    if previous_shards is not None:
+        # Shards the refresh added beside the previous export go with it.
+        for path in list(_export_shard_entries(save_directory)):
+            if path not in previous_shards:
+                os.remove(path)
+    for name in os.listdir(save_directory):
+        path = os.path.join(save_directory, name)
+        # Metadata the refresh added beside the previous export goes with it.
+        if path not in metadata and not name.endswith(".safetensors") and \
+                not name.startswith(_PREVIOUS_EXPORT_PREFIX) and \
+                (os.path.islink(path) or os.path.isfile(path)):
+            os.remove(path)
+    for i, (path, payload) in enumerate(metadata.items()):
+        # Staged in the private backup directory and renamed over the entry, so a link the
+        # export holds under any name is replaced, never followed.
+        if isinstance(payload, str):
+            # A link the previous export held: leave it if the refresh kept it, else relink it.
+            if os.path.islink(path) and os.readlink(path) == payload:
+                continue
+            staged = os.path.join(backup_dir, f"link-{i}")
+            os.symlink(payload, staged)
+        else:
+            data, mode = payload
+            fd, staged = tempfile.mkstemp(dir = backup_dir, prefix = "restore-")
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chmod(staged, mode)
+        os.replace(staged, path)
+    _drop_previous_export_shards(kept)
+pass
+
+
+def _drop_previous_export_shards(kept):
+    if kept:
+        shutil.rmtree(kept["dir"], ignore_errors = True)
+    kept.clear()
+pass
+
+
 def _resolve_hub_commit(repo_id, token):
     # One commit for every file an export fetches, so a push to the repo mid-export cannot mix
     # shards from two commits. Offline or unreachable gives None: unpinned, as before.
@@ -5120,6 +5253,7 @@ def merge_and_overwrite_lora(
         # Handle case for local model where config._name_or_path is a local os path
         # https://github.com/unslothai/unsloth/issues/2140
         is_local_path = False
+        _local_tokenizer_model = None
         if os.path.exists(model_name) and os.path.isdir(model_name):
             is_local_path = True
             print(f"Detected local model directory: {model_name}")
@@ -5189,10 +5323,8 @@ def merge_and_overwrite_lora(
                     print(f"Warning: Could not process index file: {e}")
             tokenizer_model_path = os.path.join(model_name, "tokenizer.model")
             if os.path.exists(tokenizer_model_path):
-                os.makedirs(save_directory, exist_ok=True)
-                # Copy from local
-                _copy_file_from_source(tokenizer_model_path, save_directory, "tokenizer.model")
-                print(f"Copied tokenizer.model from local model directory")
+                # Copied after the previous export snapshot below, so a rollback restores it too.
+                _local_tokenizer_model = tokenizer_model_path
         else:
             # Original HF repo logic
             # Third Hub round trip on this path, and it had the same bare `except:` as
@@ -5349,6 +5481,8 @@ def merge_and_overwrite_lora(
     pass
 
     _stale_shards = set()
+    _new_sizes = {}
+    _previous_metadata = None
     if save_method not in ("merged_4bit", "forced_merged_4bit"):
         # Before the tokenizer, config and index writes below, so a refused refresh changes nothing.
         # Only shard entries decide it, and none of those writes touches a shard.
@@ -5372,7 +5506,15 @@ def merge_and_overwrite_lora(
                     f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
                 }
             _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
+            if not low_disk_space_usage:
+                # Before the tokenizer, config and index writes below, which a rollback undoes too.
+                _previous_metadata = _snapshot_previous_export_metadata(save_directory)
         pass
+
+    if _local_tokenizer_model is not None:
+        os.makedirs(save_directory, exist_ok=True)
+        _copy_file_from_source(_local_tokenizer_model, save_directory, "tokenizer.model")
+        print(f"Copied tokenizer.model from local model directory")
 
     # Save config / generation_config via no state_dict and tokenizer
     if tokenizer is not None:
@@ -5596,6 +5738,11 @@ def merge_and_overwrite_lora(
     pass
 
     _replaced_shards = []
+    # Outside low disk mode a failed refresh puts the previous export back instead of leaving
+    # some shards on the base weights and the rest still merged, when the disk can hold both.
+    _previous_export = _keep_previous_export_shards(
+        sorted(_stale_shards), save_directory, _new_sizes, _previous_metadata,
+    ) if _stale_shards and not low_disk_space_usage else {}
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
         if not is_local_path and _hf_cache_dir is not None:
@@ -5715,12 +5862,20 @@ def merge_and_overwrite_lora(
             final_safetensors_list.extend(resulting_files)
         pass
     except BaseException:
+        if _previous_export:
+            try:
+                _restore_previous_export_shards(_previous_export)
+                _replaced_shards = []
+                print(f"Unsloth: Warning: the export in {save_directory} failed; the previous export was restored.")
+            except OSError as restore_error:
+                print(f"Unsloth: Warning: could not restore the previous export in {save_directory}: {restore_error}")
         if _replaced_shards:
             print(
                 f"Unsloth: Warning: the export in {save_directory} is incomplete. These shards "
                 f"already hold the base weights: {', '.join(dict.fromkeys(_replaced_shards))}. Re-run the export."
             )
         raise
+    _drop_previous_export_shards(_previous_export)
 
     if low_disk_space_usage and not is_local_path and not copied_all_from_cache:
         tokenizer_model_path = os.path.join(save_directory, "tokenizer.model")

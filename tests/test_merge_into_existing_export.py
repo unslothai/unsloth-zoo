@@ -179,16 +179,33 @@ def test_failed_first_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low
     assert [k for k in expected if not torch.equal(again[k], expected[k])] == []
 
 
-@pytest.mark.parametrize("low_disk", [False, True])
-def test_failed_later_hub_fetch_keeps_unfetched_shards(tmp_path, monkeypatch, low_disk):
-    # Shards are replaced one at a time (no second copy of the checkpoint), so a network
+def _short_disk_for_backups(monkeypatch, base):
+    # Room for the per-shard refresh (the largest shard plus the margin) but not for keeping
+    # every previous shard beside the new ones.
+    from unsloth_zoo import saving_utils as S
+
+    sizes = [os.path.getsize(os.path.join(base, f)) for f in _shards(base)]
+    assert len(sizes) > 2
+    free = S._REFRESH_DISK_MARGIN + 2 * max(sizes)
+    assert free < S._REFRESH_DISK_MARGIN + sum(sizes)
+    disk = S.shutil.disk_usage(base)
+    monkeypatch.setattr(S.shutil, "disk_usage", lambda _: type(disk)(disk.total, disk.total - free, free))
+
+
+@pytest.mark.parametrize("mode", ["low_disk", "short_disk"])
+def test_failed_later_hub_fetch_keeps_unfetched_shards(tmp_path, monkeypatch, mode):
+    # In low disk mode, or when the disk cannot hold the previous shards beside the new ones,
+    # shards are replaced one at a time (no second copy of the checkpoint), so a network
     # failure part way only loses the shards already refreshed, and says so.
+    low_disk = mode == "low_disk"
     base, peft_model = _build(tmp_path, "20KB")
     out = str(tmp_path / "out")
     _fake_hub(monkeypatch, base, fail = False)
     H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
     before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
 
+    if mode == "short_disk":
+        _short_disk_for_backups(monkeypatch, base)
     _fake_hub(monkeypatch, base, fail = 1)
     with pytest.raises(OSError, match = "simulated"):
         H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
@@ -202,6 +219,32 @@ def test_failed_later_hub_fetch_keeps_unfetched_shards(tmp_path, monkeypatch, lo
     _fake_hub(monkeypatch, base, fail = False)
     H.run_merge(peft_model, base, out, save_dtype = torch.float32, low_disk_space_usage = low_disk)
     assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+
+
+def test_failed_later_hub_fetch_restores_previous_export(tmp_path, monkeypatch):
+    # Outside low disk mode, with room for both, a failure part way puts every previous
+    # shard back instead of leaving some on the base weights and the rest still merged.
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
+    assert len(before) > 2
+
+    _fake_hub(monkeypatch, base, fail = 1)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    assert len(_fake_hub.fetched) == 1
+    # The refetched shard held merged weights, so keeping it is a real rollback.
+    replaced = _fake_hub.fetched[0]
+    assert open(os.path.join(base, replaced), "rb").read() != before[replaced]
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+    assert _no_staging_left(out)
+
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    assert {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)} == before
+    assert _no_staging_left(out)
 
 
 def _dir_bytes(directory):
@@ -225,6 +268,9 @@ def test_reexport_keeps_no_second_copy_of_the_checkpoint(tmp_path, monkeypatch, 
     expected = H.read_safetensors_dir(out)
     size_before = _dir_bytes(out)
     largest = max(os.path.getsize(os.path.join(base, f)) for f in _shards(base))
+    if not low_disk:
+        # With room to spare the previous shards are kept for a rollback; without it, never.
+        _short_disk_for_backups(monkeypatch, base)
 
     peak = [0]
     if source == "local":
@@ -297,7 +343,8 @@ def test_reexport_with_longest_valid_shard_name(tmp_path):
     assert long_name in _shards(out) and _no_staging_left(out)
 
 
-def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch):
+@pytest.mark.parametrize("short_disk", [True, False])
+def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch, short_disk):
     from unsloth_zoo import saving_utils as S
 
     base, peft_model = _build(tmp_path, "20KB")
@@ -305,6 +352,8 @@ def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch):
     H.run_merge(peft_model, base, out, save_dtype = torch.float32)
     before = {f : open(os.path.join(out, f), "rb").read() for f in _shards(out)}
     assert len(before) > 2
+    if short_disk:
+        _short_disk_for_backups(monkeypatch, base)
 
     real_copy, copied = S._copy_file_from_source, []
     def _copy_then_fail(src, target_dir, filename):
@@ -319,7 +368,8 @@ def test_failed_local_copy_keeps_uncopied_shards(tmp_path, monkeypatch):
     assert len(copied) == 1 and _shards(out) == sorted(before)
     for f in before:
         now = open(os.path.join(out, f), "rb").read()
-        assert now == (open(os.path.join(base, f), "rb").read() if f in copied else before[f]), f
+        # Restored when the disk could hold the previous shards, else only the copied one is lost.
+        assert now == (open(os.path.join(base, f), "rb").read() if short_disk and f in copied else before[f]), f
     assert _no_staging_left(out)
 
 
@@ -533,3 +583,195 @@ def test_shard_link_to_the_local_base_shard_is_copied_once(tmp_path, monkeypatch
     assert open(os.path.join(base, "model.safetensors"), "rb").read() == base_before
     got = H.read_safetensors_dir(str(out))
     assert [k for k in expected if not torch.equal(got[k], expected[k])] == []
+
+
+def test_failed_hub_fetch_restores_previous_export_metadata(tmp_path, monkeypatch):
+    # The refresh rewrites config.json and the index before the shard fetch; a rollback of the
+    # shards alone would pair the previous shards with the new metadata.
+    import json
+
+    base, peft_model = _build(tmp_path, "20KB")
+    out = str(tmp_path / "out")
+    _fake_hub(monkeypatch, base, fail = False)
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    for name in ("config.json", "model.safetensors.index.json"):
+        path = os.path.join(out, name)
+        with open(path) as f:
+            data = json.load(f)
+        data["previous_export_marker"] = name
+        with open(path, "w") as f:
+            json.dump(data, f)
+    before = {
+        f : open(os.path.join(out, f), "rb").read() for f in os.listdir(out)
+        if os.path.isfile(os.path.join(out, f))
+    }
+
+    _fake_hub(monkeypatch, base, fail = 1)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    after = {
+        f : open(os.path.join(out, f), "rb").read() for f in os.listdir(out)
+        if os.path.isfile(os.path.join(out, f))
+    }
+    assert sorted(after) == sorted(before)
+    assert [f for f in before if after[f] != before[f]] == []
+    assert _no_staging_left(out)
+
+
+def test_previous_export_backup_names_cannot_collide_with_shards(tmp_path):
+    from unsloth_zoo import saving_utils as S
+
+    out = tmp_path / "out"
+    out.mkdir()
+    names = ["foo.safetensors", S._PREVIOUS_EXPORT_PREFIX + "foo.safetensors"]
+    for name in names:
+        (out / name).write_bytes(name.encode())
+    kept = S._keep_previous_export_shards(sorted(names), str(out), {n : 1 for n in names})
+    assert kept
+    for name in names:
+        assert (out / name).read_bytes() == name.encode()
+    S._restore_previous_export_shards(kept)
+    assert sorted(os.listdir(out)) == sorted(names)
+    for name in names:
+        assert (out / name).read_bytes() == name.encode()
+    kept = S._keep_previous_export_shards(sorted(names), str(out), {n : 1 for n in names})
+    S._drop_previous_export_shards(kept)
+    assert sorted(os.listdir(out)) == sorted(names)
+    for name in names:
+        assert (out / name).read_bytes() == name.encode()
+
+
+@pytest.mark.parametrize("refresh", ["keeps_link", "replaces_link", "removes_link"])
+def test_rollback_keeps_previous_export_metadata_links(tmp_path, refresh):
+    # A top level metadata link the previous export held (tokenizer.model shared with another
+    # folder) is not a file the failed refresh added: the rollback must leave it as it was.
+    from unsloth_zoo import saving_utils as S
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "tokenizer.model").write_bytes(b"shared tokenizer")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "model.safetensors").write_bytes(b"previous shard")
+    (out / "config.json").write_bytes(b"previous config")
+    target = os.path.join("..", "shared", "tokenizer.model")
+    os.symlink(target, out / "tokenizer.model")
+
+    metadata = S._snapshot_previous_export_metadata(str(out))
+    kept = S._keep_previous_export_shards(
+        ["model.safetensors"], str(out), {"model.safetensors" : 1}, metadata)
+    assert kept
+    # The refresh rewrites the metadata, adds a file and starts on the shard.
+    (out / "config.json").write_bytes(b"new config")
+    (out / "added.json").write_bytes(b"new file")
+    if refresh != "keeps_link":
+        os.remove(out / "tokenizer.model")
+    if refresh == "replaces_link":
+        (out / "tokenizer.model").write_bytes(b"new tokenizer")
+    os.replace(out / "added.json", out / "model.safetensors.tmp")
+    os.replace(out / "model.safetensors.tmp", out / "model.safetensors")
+
+    S._restore_previous_export_shards(kept)
+    assert sorted(os.listdir(out)) == ["config.json", "model.safetensors", "tokenizer.model"]
+    assert os.path.islink(out / "tokenizer.model")
+    assert os.readlink(out / "tokenizer.model") == target
+    assert (out / "tokenizer.model").read_bytes() == b"shared tokenizer"
+    assert (out / "config.json").read_bytes() == b"previous config"
+    assert (out / "model.safetensors").read_bytes() == b"previous shard"
+    assert (shared / "tokenizer.model").read_bytes() == b"shared tokenizer"
+
+
+def test_rollback_never_writes_through_a_link_named_like_a_restore_file(tmp_path):
+    # The previous export may hold any name as a link, including the one a rollback would stage
+    # a restored file under: the restore must replace entries, never follow a link.
+    from unsloth_zoo import saving_utils as S
+
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"outside file")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "model.safetensors").write_bytes(b"previous shard")
+    (out / "config.json").write_bytes(b"previous config")
+    os.chmod(out / "config.json", 0o640)
+    os.symlink(victim, out / "config.json.unsloth-restore")
+
+    metadata = S._snapshot_previous_export_metadata(str(out))
+    kept = S._keep_previous_export_shards(
+        ["model.safetensors"], str(out), {"model.safetensors" : 1}, metadata)
+    assert kept
+    (out / "config.json").write_bytes(b"new config")
+    S._restore_previous_export_shards(kept)
+
+    assert victim.read_bytes() == b"outside file"
+    assert not os.path.islink(out / "config.json")
+    assert (out / "config.json").read_bytes() == b"previous config"
+    assert os.stat(out / "config.json").st_mode & 0o777 == 0o640
+    assert os.readlink(out / "config.json.unsloth-restore") == str(victim)
+    assert sorted(os.listdir(out)) == ["config.json", "config.json.unsloth-restore", "model.safetensors"]
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_rollback_removes_shards_the_refresh_added(tmp_path, monkeypatch, relative):
+    # A shard name the previous export did not hold, fetched or split before a later step
+    # failed, would otherwise survive the rollback beside the restored shards. A relative
+    # output path must not make every previous shard look new.
+    from unsloth_zoo import saving_utils as S
+
+    out = tmp_path / "out"
+    out.mkdir()
+    if relative:
+        monkeypatch.chdir(tmp_path)
+        out = type(out)("out")
+    (out / "model.safetensors").write_bytes(b"previous shard")
+    (out / "kept-unrelated.safetensors").write_bytes(b"not refreshed")
+    (out / "config.json").write_bytes(b"previous config")
+    before = {f : (out / f).read_bytes() for f in os.listdir(out)}
+
+    metadata = S._snapshot_previous_export_metadata(str(out))
+    kept = S._keep_previous_export_shards(
+        ["model.safetensors"], str(out), {"model.safetensors" : 1}, metadata)
+    assert kept
+    (out / "model-00002-of-00002.safetensors").write_bytes(b"new shard")
+    (out / "temp_split_abcd_000.safetensors").write_bytes(b"split piece")
+    (out / "sub").mkdir()
+    (out / "sub" / "nested.safetensors").write_bytes(b"new nested shard")
+    S._restore_previous_export_shards(kept)
+
+    assert not (out / "sub" / "nested.safetensors").exists()
+    os.rmdir(out / "sub")
+    assert {f : (out / f).read_bytes() for f in os.listdir(out)} == before
+
+
+def test_failed_local_refresh_restores_the_previous_tokenizer_model(tmp_path, monkeypatch):
+    # For a local base, tokenizer.model was copied over the previous one before the snapshot, so a
+    # rollback paired the previous shards with the new tokenizer.
+    from unsloth_zoo import saving_utils as S
+
+    base, peft_model = _build(tmp_path)
+    out = str(tmp_path / "out")
+    H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+    with open(os.path.join(out, "tokenizer.model"), "wb") as f:
+        f.write(b"previous tokenizer")
+    with open(os.path.join(base, "tokenizer.model"), "wb") as f:
+        f.write(b"new tokenizer")
+    before = {
+        f : open(os.path.join(out, f), "rb").read() for f in os.listdir(out)
+        if os.path.isfile(os.path.join(out, f))
+    }
+
+    real_copy = S._copy_file_from_source
+    def _copy(src, target_dir, filename):
+        if str(filename).endswith(".safetensors"):
+            raise IOError("simulated copy failure")
+        return real_copy(src, target_dir, filename)
+    monkeypatch.setattr(S, "_copy_file_from_source", _copy)
+    with pytest.raises(OSError, match = "simulated"):
+        H.run_merge(peft_model, base, out, save_dtype = torch.float32)
+
+    after = {
+        f : open(os.path.join(out, f), "rb").read() for f in os.listdir(out)
+        if os.path.isfile(os.path.join(out, f))
+    }
+    assert after["tokenizer.model"] == b"previous tokenizer"
+    assert sorted(after) == sorted(before)
+    assert [f for f in before if after[f] != before[f]] == []
