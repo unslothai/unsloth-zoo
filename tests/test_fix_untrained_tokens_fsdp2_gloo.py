@@ -1,14 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""fix_untrained_tokens on FSDP2 (DTensor) embeddings.
-
-A second Trainer built on a model that native FSDP2 already sharded (the continued-pretraining
-notebook: UnslothTrainer on Wikipedia, then UnslothTrainer on Alpaca, with trainable embed_tokens /
-lm_head) reaches fix_untrained_tokens with DTensor weights. Slicing a DTensor under inference mode
-raised "Cannot set version_counter for inference tensor". On a gloo CPU world of 2 the untrained rows
-must be reset on every rank, the trained rows left alone, and the parameters must stay the same
-DTensor objects FSDP2 manages."""
+"""fix_untrained_tokens on FSDP2 (DTensor) embeddings, e.g. a second Trainer on an already sharded
+model, which raised "Cannot set version_counter for inference tensor". Gloo CPU world of 2."""
 
 import multiprocessing
 import os

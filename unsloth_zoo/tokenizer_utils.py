@@ -467,10 +467,8 @@ pass
 
 @contextlib.contextmanager
 def _gathered_dtensor_weights(model, weights):
-    """FSDP2 shards embed_tokens / lm_head into DTensors, which cannot be sliced under inference mode
-    (a second Trainer on an already sharded model). Swap in full plain copies (an all-gather: every
-    rank calls this), let the fix edit them, then copy each rank's shard back into the same DTensor
-    FSDP2 manages. All ranks hold identical full copies, so they make identical edits."""
+    """FSDP2 DTensor weights cannot be sliced under inference mode. Swap in full copies (all-gather:
+    every rank must call this), then copy each rank's shard back into the same DTensor."""
     # All Unsloth Zoo code licensed under LGPLv3
     owners = []
     for module in model.modules():
