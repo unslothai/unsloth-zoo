@@ -1582,11 +1582,14 @@ _GROUPED_MM_FOREIGN = {}   # (type, index) -> None if same GPU model as the prob
 # (type, index) the process-wide flags were probed on; a later current-device switch must not move it.
 _GROUPED_MM_HOME = None
 _GROUPED_MM_HOME_LOCK = threading.Lock()
+# True once every visible accelerator is the home card's model: the per-call gates then read the
+# process-wide flags directly (no device classification per GEMM). Set eagerly with the home anchor.
+_GROUPED_MM_HOMOGENEOUS = False
 
 
 def _grouped_mm_home():
     """Card the process-wide flags describe; locked so concurrent first callers on different cards agree."""
-    global _GROUPED_MM_HOME
+    global _GROUPED_MM_HOME, _GROUPED_MM_HOMOGENEOUS
     if _GROUPED_MM_HOME is None:
         device = _grouped_mm_probe_device()
         anchored = False
@@ -1605,7 +1608,26 @@ def _grouped_mm_home():
             for i in range(count):
                 if (device.type, i) not in _GROUPED_MM_FOREIGN:
                     _resolve_grouped_mm_foreign_kind(torch.device(device.type, i), (device.type, i))
+            _GROUPED_MM_HOMOGENEOUS = _grouped_mm_all_cards_alike(device.type, count)
     return torch.device(*_GROUPED_MM_HOME) if _GROUPED_MM_HOME is not None else _grouped_mm_probe_device()
+
+
+def _grouped_mm_all_cards_alike(home_type, count):
+    """Every visible card of the home's type is its model, and no other accelerator type has cards."""
+    if count < 1 or any(_GROUPED_MM_FOREIGN.get((home_type, i), 0) is not None for i in range(count)):
+        return False
+    other = "xpu" if home_type == "cuda" else "cuda"
+    try:
+        backend = getattr(torch, other, None)
+        return not (backend is not None and backend.is_available() and backend.device_count() > 0)
+    except Exception:
+        return False
+
+
+def _grouped_mm_traced_kind(device):
+    # Trace-time lookup, never resolves: None = the home model (or not a GPU), False = never seen eagerly.
+    if device is None or device.type not in ("cuda", "xpu") or device.index is None: return None
+    return _GROUPED_MM_FOREIGN.get((device.type, device.index), False)
 
 
 def _grouped_mm_foreign_kind(device):
@@ -1627,7 +1649,7 @@ def _resolve_grouped_mm_foreign_kind(device, key):
     return kind
 
 
-# Per GPU model other than the current device's: a card the model never uses is never probed.
+# Per GPU model other than the home card's; probed once, eagerly, when the experts or a call first use it.
 _TORCH_GROUPED_MM_SUPPORTED_BY_KIND = {}
 
 
@@ -1649,11 +1671,53 @@ def _check_torch_grouped_mm_supported(device = None):
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
 
+def _torch_version_tuple():
+    try:
+        return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    except Exception:
+        return (0, 0)
+
+
+# CUDA (not ROCm) torch 2.8 hard-raises unless `dprops->major == 9` (Blas.cpp, sm90_only). 2.9+ sends
+# any other arch to _grouped_mm_fallback instead of raising (GroupedBlas.cpp, `_grouped_mm_cuda`).
+_TORCH_IS_CUDA_BUILD = getattr(torch.version, "hip", None) is None
+_TORCH_GROUPED_MM_SM90_ONLY = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() == (2, 8)
+_TORCH_GROUPED_MM_FALLS_BACK = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() >= (2, 9)
+
+
+def _grouped_mm_falls_back_internally(device_type, kind):
+    """torch itself serves grouped_mm on a card no probe reached: CUDA 2.9+ (natively or through its
+    fallback), 2.8 only on sm90. ROCm (some cards crash, unsloth#12391) and XPU make no such promise."""
+    if device_type != "cuda": return False
+    if _TORCH_GROUPED_MM_FALLS_BACK: return True
+    info = kind[1] if isinstance(kind, tuple) and len(kind) == 2 else None
+    return _TORCH_GROUPED_MM_SM90_ONLY and isinstance(info, tuple) and info[1] == 9
+
+
 def _grouped_mm_supported_on(device):
     # Absent symbol (torch 2.6/2.7): the traceable definitive negative, no classification.
-    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_foreign_kind(device) is None:
+    # One GPU model on the host: the process-wide flag answers for every card.
+    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE:
+        return _check_torch_grouped_mm_supported()
+    if torch.compiler.is_compiling():
+        return _grouped_mm_supported_while_tracing(device)
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is None:
         return _check_torch_grouped_mm_supported()
     return _check_torch_grouped_mm_supported(device)
+
+
+def _grouped_mm_supported_while_tracing(device):
+    # Never probes a card here (graph break; an error under fullgraph). The eager warm-up probes the
+    # home card and each other GPU model the experts sit on, so a card is unprobed only if the experts
+    # reached it later (or it ran no eager call first). Trade-off for that card: the home answer only where
+    # torch falls back internally; elsewhere the manual loop, which is safe but breaks a fullgraph trace.
+    home = _check_torch_grouped_mm_supported()
+    kind = _grouped_mm_traced_kind(device)
+    if kind is None or _GROUPED_MM_HOMOGENEOUS: return home
+    known = None if kind is False else _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
+    if known is not None: return known
+    return home and _grouped_mm_falls_back_internally(device.type, kind)
 
 
 # Some ROCm GPUs segfault in grouped_mm instead of raising (unsloth#12391): run the kernels in a throwaway interpreter first.
@@ -1761,8 +1825,8 @@ def _probe_torch_grouped_mm_supported(device = None):
             supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
             _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
             # Same eager region: a traced first use of this model must not break again on the view check.
-            if supported and kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
-                _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = _transposed_view_probe(device)
+            if kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
+                _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = supported and _transposed_view_probe(device)
         return supported
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
@@ -1770,10 +1834,27 @@ def _probe_torch_grouped_mm_supported(device = None):
     device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else None
     if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
-        return False
-
-    _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
+    else:
+        _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
     return _TORCH_GROUPED_MM_SUPPORTED
+
+
+def _warm_grouped_mm_devices(devices):
+    """Mixed host only, eagerly: probe one card of each other GPU model among `devices` (the cards
+    holding this process's expert weights), so a later trace there reads its own answers. Never a
+    card the process does not use: torchrun ranks see every GPU, and probing foreign ones would put
+    a CUDA context and a grouped_mm call from every rank on one representative card."""
+    if _GROUPED_MM_HOMOGENEOUS or torch.compiler.is_compiling(): return
+    seen = set()
+    for device in devices:
+        try:
+            if device is None or device.type not in ("cuda", "xpu") or device.index is None: continue
+            kind = _grouped_mm_foreign_kind(device)
+            if kind is None or kind in seen: continue
+            seen.add(kind)
+            _check_torch_grouped_mm_supported(device)
+        except Exception:
+            pass
 
 
 # One-time check that torch._grouped_mm on a transposed bf16 view matches the contiguous copy. Insurance
@@ -1796,7 +1877,13 @@ _TRANSPOSED_VIEW_SAFE_BY_KIND = {}
 
 def _transposed_view_safe_on(device):
     """View probe on `device`'s GPU model; the home model keeps the process-wide flag."""
-    if not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
+    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
+    if torch.compiler.is_compiling():
+        kind = _grouped_mm_traced_kind(device)
+        if kind is None: return _transposed_view_grouped_mm_is_safe()
+        # A card no eager probe reached: probing would break the graph, so the contiguous copy
+        # (always correct, traceable), never the home card's verdict.
+        return False if kind is False else bool(_TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind, False))
     kind = _grouped_mm_foreign_kind(device)
     if kind is None: return _transposed_view_grouped_mm_is_safe()
     safe = _TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind)
