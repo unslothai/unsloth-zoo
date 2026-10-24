@@ -359,7 +359,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         # N items divisor
         divisor = n_items if n_items is not None else (labels != ignore_index).sum()
         if not torch.is_tensor(divisor):
-            divisor = torch.tensor(divisor, dtype = torch.float32, device = device)
+            # torch.full is a fill kernel; torch.tensor(..., device = cuda) is a blocking H2D copy.
+            divisor = torch.full((), divisor, dtype = torch.float32, device = device)
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
         divisor = _nonzero_count(divisor.to(dtype = torch.float32, device = device))
