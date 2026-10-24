@@ -206,7 +206,7 @@ def test_saves_no_logits_for_backward():
 
     saved.clear()
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-        rr.chunked_hidden_states_selective_log_softmax(states, head, index, 4)
+        rr.chunked_hidden_states_selective_log_softmax(states, head, index, 4, fused_linear = False)
     assert sum(saved) >= rows * vocab
 
 
@@ -223,7 +223,10 @@ def test_compiled_kernels_match_eager():
     leaves = [states, head, head_bias]
     results = []
     for function in (eager, compiled):
-        out = function(states, head, index, 3, 0.5, 0.0, 4.0, 0.9, lm_head_bias = head_bias, return_entropy = True)
+        out = function(
+            states, head, index, 3, 0.5, 0.0, 4.0, 0.9, lm_head_bias = head_bias, return_entropy = True,
+            fused_linear = False,
+        )
         results.append(list(out) + list(_grads(out, weights, entropy_weights, leaves)))
     # Engaged, not silently fallen back to eager.
     assert compiled._use_compiled
@@ -233,7 +236,8 @@ def test_compiled_kernels_match_eager():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "half-precision autocast on CUDA")
 @pytest.mark.parametrize("rows, head_dtype", [(49, torch.float32), (300, torch.bfloat16), (17, torch.float16)])
-def test_cuda_autocast_matches_plain_function(rows, head_dtype):
+@pytest.mark.parametrize("fused_linear", [True, False])
+def test_cuda_autocast_matches_plain_function(rows, head_dtype, fused_linear):
     amp = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation = False) else torch.float16
     if head_dtype == torch.bfloat16 and amp != torch.bfloat16:
         pytest.skip("no bfloat16")
@@ -246,10 +250,14 @@ def test_cuda_autocast_matches_plain_function(rows, head_dtype):
     results = []
     for function in (rr.chunked_hidden_states_selective_log_softmax, rr.chunked_hidden_states_selective_log_softmax_recompute):
         with torch.autocast("cuda", dtype = amp):
-            out = function(states, head, index, 16, 0.0, 0.0, 30.0, 0.8)
+            if function is rr.chunked_hidden_states_selective_log_softmax_recompute:
+                out = function(states, head, index, 16, 0.0, 0.0, 30.0, 0.8, fused_linear = fused_linear)
+            else:
+                out = function(states, head, index, 16, 0.0, 0.0, 30.0, 0.8)
         grads = torch.autograd.grad((out * weights).sum(), [states, head])
         results.append([out.float()] + [g.float() for g in grads])
-    assert rr.chunked_hidden_states_selective_log_softmax_recompute._use_compiled
+    if not fused_linear:
+        assert rr.chunked_hidden_states_selective_log_softmax_recompute._use_compiled
     for a, b in zip(*results):
         assert a.shape == b.shape
         assert float((a - b).abs().max() / b.abs().max()) < 1e-2
@@ -260,10 +268,10 @@ def test_cached_function_survives_a_missing_compiled_flag():
     # was cached, deletes the flag; later calls must fall back to the default instead of raising.
     function = _standalone()
     head, states, _, index, weights, _ = _inputs(rows = 6, bias = False, seed = 3)
-    function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0)
+    function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0, fused_linear = False)
     assert getattr(function, "_autograd_function", None) is not None
     del function._use_compiled
-    out = function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0)
+    out = function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0, fused_linear = False)
     (out * weights).sum().backward()
     assert out.isfinite().all()
 

@@ -70,6 +70,7 @@ def test_sliced_hidden_grad_does_not_overflow_fp16(monkeypatch, device):
 def test_long_context_keeps_per_chunk_backward(monkeypatch, n_rows, hidden_grad, want_sliced):
     # Sliced backward's float32 rows x hidden gradient outgrows the per chunk loop's head sized
     # copies once rows exceed about twice the vocab, so long contexts keep the per chunk loop.
+    monkeypatch.setattr(module, "_FUSED_LINEAR", False)
     calls = []
     real = module._sliced_backward
     monkeypatch.setattr(module, "_sliced_backward", lambda *a: calls.append(1) or real(*a))
@@ -89,6 +90,7 @@ def test_per_chunk_head_grad_does_not_overflow_fp16(monkeypatch, device):
     # Rows past about twice the vocab take the per chunk loop; its head GEMM must not round each
     # chunk to fp16 either, or +inf and -inf chunks sum to NaN.
     monkeypatch.setattr(module, "_target_chunk_bytes", lambda: 1024)  # 4 rows per chunk
+    monkeypatch.setattr(module, "_FUSED_LINEAR", False)
     calls = []
     real = module._sliced_backward
     monkeypatch.setattr(module, "_sliced_backward", lambda *a: calls.append(1) or real(*a))
