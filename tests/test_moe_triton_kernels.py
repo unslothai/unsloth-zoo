@@ -44,22 +44,51 @@ def _need_triton():
         pytest.skip("Triton unavailable")
 
 
+def _ptxas_fuses_rn_mul_add():
+    # The ptxas-blackwell 12.9 bundled with Triton 3.6 (torch 2.10 / 2.11) contracts mul.rn + add.rn into FFMA2 on
+    # sm_100+ even under --fmad=false; Triton 3.7+ (ptxas 13.x) keeps them apart. One rounding instead of two.
+    import triton
+    version = tuple(int(v) for v in triton.__version__.split(".")[:2])
+    return torch.cuda.get_device_capability()[0] >= 10 and version < (3, 7)
+
+
 @cuda
 @pytest.mark.parametrize("shape", [(8, 64, 128), (3, 5, 64), (128, 1408, 2816), (2, 100 * 64)])
 @pytest.mark.parametrize("nested", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_nf4_dequant_matches_bitsandbytes_bitwise(shape, nested, dtype):
     _need_triton()
+    numel = 1
+    for s in shape:
+        numel *= s
+    # Peak: the weight, or the 4-bit bytes and both decodes, plus bitsandbytes' workspace. The largest shape needs
+    # ~5.5 GB in fp32, so it skips only on a card that is already short (e.g. a shared 15 GB T4), never shrinks.
+    need = numel * dtype.itemsize * 2 + numel // 2 + (512 << 20)
+    free = torch.cuda.mem_get_info()[0]
+    if free < need:
+        pytest.skip(f"needs {need / 2**30:.1f} GiB free on the GPU, {free / 2**30:.1f} GiB free")
     torch.manual_seed(0)
     w = torch.randn(*shape, device = "cuda", dtype = dtype)
     q, qs = quantize_4bit(w, blocksize = 64, compress_statistics = nested, quant_type = "nf4")
+    del w
     ref = dequantize_4bit(q, qs)
     out = nf4_dequant_triton(q, qs)
     assert out is not None
     assert out.shape == ref.shape and out.dtype == ref.dtype
     if dtype == torch.float16:
-        # bitsandbytes' fp16 kernel rounds a few elements one ulp differently.
-        assert (out.float() - ref.float()).abs().max().item() <= 2 ** -10 * ref.float().abs().max().item()
+        # bitsandbytes' fp16 kernel rounds a few elements one ulp differently. Compared in fp32 slices, never a full
+        # fp32 copy of both (4x the fp16 bytes).
+        bound = 2 ** -10 * ref.abs().max().float().item()
+        flat_out, flat_ref = out.reshape(-1), ref.reshape(-1)
+        step = 1 << 26
+        worst = max(
+            (flat_out[i : i + step].float() - flat_ref[i : i + step].float()).abs().max().item()
+            for i in range(0, numel, step)
+        )
+        assert worst <= bound
+    elif dtype == torch.float32 and nested and _ptxas_fuses_rn_mul_add():
+        # code2 * absmax2 + offset fused: at most 2 fp32 ulp (same sign, so the int32 views subtract as ulps)
+        assert (out.view(torch.int32) - ref.view(torch.int32)).abs().max().item() <= 2
     else:
         assert torch.equal(out, ref)
 
@@ -150,6 +179,19 @@ def _reference_combine(y, sorted_indices, w_perm, num_tokens, top_k, out_dtype):
     )
 
 
+def _assert_combine_matches(out, ref, y, sorted_indices, w, num_tokens, top_k):
+    """Bitwise, except where ptxas fuses acc += w * y (fp32 router, top_k > 4 leaves a non-zero accumulator)."""
+    if not (w.dtype == torch.float32 and top_k > 4 and _ptxas_fuses_rn_mul_add()):
+        assert torch.equal(out, ref)
+        return
+    # One rounding instead of two per add: fp32-level error on the sum of |w * y|, then the bf16 rounding of the output.
+    scale = _reference_combine(y.detach().abs(), sorted_indices, w.detach().abs(), num_tokens, top_k, torch.float32)
+    diff = (out.float() - ref.float()).abs()
+    bound = 2 ** -7 * ref.float().abs() + 2 ** -20 * scale   # 2 ** -7: one bf16 ulp at worst
+    assert (diff <= bound).all(), diff.max().item()
+    assert (diff != 0).float().mean().item() < 1e-2
+
+
 @cuda
 @pytest.mark.parametrize("num_tokens,top_k,hidden,E", [(2048, 8, 2816, 128), (7, 2, 100, 4), (1, 1, 1024, 2), (33, 4, 1500, 16),
                                                       (300, 6, 512, 64), (128, 10, 768, 32), (64, 16, 256, 32), (50, 3, 100, 8)])
@@ -165,7 +207,7 @@ def test_weighted_unpermute_matches_eager(num_tokens, top_k, hidden, E, w_dtype)
     assert out is not None and out.shape == (num_tokens, hidden) and out.dtype == torch.bfloat16
     y2 = y.detach().clone().requires_grad_(True); w2 = w.detach().clone().requires_grad_(True)
     ref = _reference_combine(y2, sorted_indices, w2, num_tokens, top_k, torch.bfloat16)
-    assert torch.equal(out, ref)
+    _assert_combine_matches(out, ref, y, sorted_indices, w, num_tokens, top_k)
     g = torch.randn_like(ref)
     out.backward(g); ref.backward(g)
     assert torch.equal(y.grad, y2.grad)
@@ -196,8 +238,9 @@ def test_weighted_unpermute_empty_experts():
     sorted_indices = torch.argsort(torch.randint(0, 3, (num_tokens * top_k,), device = "cuda"), stable = True)
     y = torch.randn(num_tokens * top_k, hidden, device = "cuda", dtype = torch.bfloat16)
     w = torch.rand(num_tokens * top_k, device = "cuda")
-    assert torch.equal(weighted_unpermute(y, sorted_indices, w, num_tokens, top_k, out_dtype = torch.bfloat16),
-                       _reference_combine(y, sorted_indices, w, num_tokens, top_k, torch.bfloat16))
+    out = weighted_unpermute(y, sorted_indices, w, num_tokens, top_k, out_dtype = torch.bfloat16)
+    _assert_combine_matches(out, _reference_combine(y, sorted_indices, w, num_tokens, top_k, torch.bfloat16),
+                            y, sorted_indices, w, num_tokens, top_k)
 
 
 @cuda
