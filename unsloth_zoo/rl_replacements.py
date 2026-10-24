@@ -565,6 +565,81 @@ pass
 chunked_hidden_states_selective_log_softmax_recompute(None, None, None)
 RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_selective_log_softmax_recompute
 
+
+def grpo_scorer_keeps_logits(support_kwargs = None, **extra_kwargs):
+    """True when GRPO falls back to the old chunked scorer, which keeps every chunk's logits for backward."""
+    support = dict(support_kwargs or {}, **extra_kwargs)
+    fp32_head = support.get(
+        "fp32_lm_head",
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes"),
+    )
+    return bool(
+        fp32_head
+        or support.get("support_top_k", 0)
+        or support.get("support_top_p", 1.0) != 1.0
+        or support.get("support_min_p", 0.0)
+        or os.environ.get("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "1") == "0"
+    )
+
+
+def grpo_chunked_hidden_states_logprobs(
+    hidden_states: torch.Tensor,
+    lm_head: torch.Tensor,
+    index: torch.Tensor,
+    chunks: int = 4,
+    logit_scale_multiply: float = 0.0,
+    logit_scale_divide: float = 0.0,
+    logit_softcapping: float = 0.0,
+    temperature: float = 1.0,
+    max_rows_per_chunk: Optional[int] = None,
+    lm_head_bias: Optional[torch.Tensor] = None,
+    **extra_kwargs,
+) -> torch.Tensor:
+    # All Unsloth Zoo code licensed under AGPL3
+    # Same contract as chunked_hidden_states_selective_log_softmax, but under grad recomputes logits per chunk.
+    needs_grad = torch.is_grad_enabled() and (
+        hidden_states.requires_grad
+        or lm_head.requires_grad
+        or (lm_head_bias is not None and lm_head_bias.requires_grad)
+    )
+    # Truncated-support scoring and the fp32 head are the old function's: hand those calls to it.
+    fp32_head = extra_kwargs.get(
+        "fp32_lm_head",
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes"),
+    )
+    custom = (
+        fp32_head
+        or extra_kwargs.get("support_top_k", 0)
+        or extra_kwargs.get("support_top_p", 1.0) != 1.0
+        or extra_kwargs.get("support_min_p", 0.0)
+    )
+    if not needs_grad or custom or os.environ.get("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "1") == "0":
+        kwargs = dict(extra_kwargs)
+        if max_rows_per_chunk is not None:
+            kwargs["max_rows_per_chunk"] = max_rows_per_chunk
+        return chunked_hidden_states_selective_log_softmax(
+            hidden_states, lm_head, index, chunks,
+            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+            lm_head_bias = lm_head_bias, **kwargs,
+        )
+    from unsloth_zoo.fused_losses.chunked_logprob import unsloth_chunked_logprobs, chunked_logprob_rows
+    if max_rows_per_chunk is None:
+        env_rows = os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip()
+        max_rows_per_chunk = int(env_rows) if env_rows.isdigit() else 0
+    rows_per_chunk = chunked_logprob_rows(lm_head.shape[0], n_rows = index.numel(), device = lm_head.device)
+    if max_rows_per_chunk > 0:
+        rows_per_chunk = min(rows_per_chunk, max_rows_per_chunk)
+    return unsloth_chunked_logprobs(
+        hidden_states, lm_head, index,
+        temperature = temperature,
+        logit_scale_multiply = logit_scale_multiply,
+        logit_scale_divide = logit_scale_divide,
+        logit_softcapping = logit_softcapping,
+        lm_head_bias = lm_head_bias,
+        rows_per_chunk = rows_per_chunk,
+    )
+pass
+
 def calculate_pad_tokens_in_prompt(
     input_ids: torch.Tensor,
     logits_to_keep: int,
@@ -2480,7 +2555,8 @@ def grpo_accumulated_loss(
     from unsloth_zoo.rl_replacements import (
         grpo_shared_vision_inputs as _grpo_get_vision_inputs,
         grpo_vision_chunks as _grpo_vision_chunks,
-        chunked_hidden_states_selective_log_softmax,
+        # Under grad this recomputes logits in backward instead of keeping them; no grad, the old function.
+        grpo_chunked_hidden_states_logprobs as chunked_hidden_states_selective_log_softmax,
         chunked_selective_log_softmax,
         grpo_rollout_logps_as_old,
         grpo_rollout_as_old_ratio_metrics,
@@ -3440,25 +3516,27 @@ def grpo_accumulated_loss(
                                 logit_scale_multiply=0.0, logit_scale_divide=0.0,
                                 logit_softcapping=0.0, temperature=1, batch_size=8,
                                 lm_head_bias=None):
-            if (index.shape[1] <= 1024 and batch_size <= 8) or batch_size==1:
-                # Normal path is faster / saves a GB under these conditions.
-                return chunked_hidden_states_selective_log_softmax(
-                    hidden_states,
-                    lm_head,
-                    index,
-                    chunks,
-                    logit_scale_multiply,
-                    logit_scale_divide,
-                    logit_softcapping,
-                    temperature,
-                    lm_head_bias = lm_head_bias,
-                )
-            else:
+            # The old chunked scorer keeps every chunk's logits, so long completions keep the offloaded scorer.
+            from unsloth_zoo.rl_replacements import grpo_scorer_keeps_logits as _keeps_logits
+            _plain = os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") != "1"
+            if not ((index.shape[1] <= 1024 and batch_size <= 8) or batch_size == 1) \
+                    and (bool(_support_kwargs) or (_plain and _keeps_logits())):
                 return Unsloth_Offloaded_Log_Softmax.apply(
                     hidden_states, lm_head, index, chunks,
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature, lm_head_bias,
                 )
+            return chunked_hidden_states_selective_log_softmax(
+                hidden_states,
+                lm_head,
+                index,
+                chunks,
+                logit_scale_multiply,
+                logit_scale_divide,
+                logit_softcapping,
+                temperature,
+                lm_head_bias = lm_head_bias,
+            )
 
         def compute_logprobs_chunk(new_hidden_states_chunk, completion_ids, input_ids_chunk):
             _refresh_lm_head()
