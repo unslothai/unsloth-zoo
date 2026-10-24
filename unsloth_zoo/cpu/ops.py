@@ -134,6 +134,12 @@ def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size
         dtype = torch.get_autocast_dtype(hidden.device.type)
         hidden, weight = hidden.to(dtype), weight.to(dtype)
         bias = bias.to(dtype) if bias is not None else None
+    if hidden.shape[0] == 0:
+        # Every label masked: empty outputs, log-probs still attached to the graph (a differentiable zero).
+        empty = (hidden @ weight.t()).float().sum(-1) * 0
+        pick = lambda name, value: value if name in outputs else None  # noqa: E731
+        return (empty, pick("entropy", empty), pick("log_sum_sq_probs", empty.detach()),
+                pick("mean_logits", empty.detach()), pick("is_top1", empty.detach().bool()))
     rows = max(1, int(os.environ.get("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", 16 * 1024 * 1024)) // max(1, weight.shape[0]))
     inv_t = 1.0 / temperature
     want_entropy = "entropy" in outputs

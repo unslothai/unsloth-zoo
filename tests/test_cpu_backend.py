@@ -918,3 +918,15 @@ def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
     # TRL before the fused head: nothing to route.
     monkeypatch.delattr(trl_utils, "_ChunkedLogProbFunction")
     assert ops.patch_trl_fused_lm_head() is False
+
+
+def test_cpu_fused_lm_head_with_every_label_masked():
+    """TRL passes hidden_states[mask] / labels[mask], which are empty for a fully masked batch."""
+    from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
+    hidden = torch.randn(0, 16, requires_grad = True)
+    weight = torch.randn(101, 16, requires_grad = True)
+    lp, ent, sq, mean, top1 = cpu_chunked_log_probs(hidden, weight, None, torch.zeros(0, dtype = torch.long), 1.0, 64)
+    assert lp.shape == ent.shape == sq.shape == mean.shape == top1.shape == (0,)
+    assert top1.dtype == torch.bool
+    (lp.sum() + ent.sum()).backward()
+    assert torch.count_nonzero(weight.grad) == 0
