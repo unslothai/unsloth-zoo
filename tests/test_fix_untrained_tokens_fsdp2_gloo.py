@@ -11,12 +11,6 @@ if multiprocessing.parent_process() is not None or getattr(
     multiprocessing.current_process(), "_inheriting", False
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    # A spawned worker runs the real unsloth_zoo/__init__ (not conftest's setup), which refuses to
-    # import without unsloth unless GPU init is skipped; tokenizer_utils needs none of it.
-    import importlib.util
-
-    if importlib.util.find_spec("unsloth") is None:
-        os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
@@ -61,6 +55,15 @@ def _worker(rank, init_file, out):
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
+
+    # A spawned rank runs the real unsloth_zoo/__init__ (not conftest's setup), which refuses to
+    # import without unsloth unless GPU init is skipped; tokenizer_utils needs none of it. Set here,
+    # in the rank process that exits after this, not at module scope, where pytest's collection
+    # would apply it to every test on the xdist worker.
+    import importlib.util
+
+    if importlib.util.find_spec("unsloth") is None:
+        os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
     from unsloth_zoo import tokenizer_utils
 
     dist.init_process_group("gloo", init_method = "file://" + init_file, rank = rank, world_size = 2)
