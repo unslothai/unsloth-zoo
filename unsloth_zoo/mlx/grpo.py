@@ -262,6 +262,8 @@ def _reduce(objective, per_token, mask, normalizers):
         return (masked.sum(-1) / mx.maximum(mask.sum(-1), mx.array(1.0))).mean()
     if objective.loss_type == "dr_grpo":
         return masked.sum() / (per_token.shape[0] * objective.max_completion_length)
+    if objective.loss_type == "bnpo":
+        return masked.sum() / mx.maximum(mask.sum(), mx.array(1.0))
     return steps_per_generation * masked.sum() / mx.maximum(generation_tokens, mx.array(1.0))
 
 
