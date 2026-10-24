@@ -2115,9 +2115,8 @@ class UnslothVisionDataCollator:
         return batch
 
     def _mask_targets_after_padding(self, labels, attention_mask):
-        """A target whose previous position is padding is predicted from a pad token. Without padding
-        (batch size 1, or gradient accumulation) the loss shift drops it, so with left padding a batched
-        row would train on one extra token, and batch size 2 would not equal 2 accumulation steps."""
+        """Mask targets predicted from a pad position: unpadded rows lose them at the loss shift,
+        so left padding would make batch size 2 differ from 2 accumulation steps."""
         if not torch.is_tensor(attention_mask) or attention_mask.dim() != 2 or attention_mask.shape != labels.shape:
             return
         labels[:, 1:].masked_fill_(attention_mask[:, :-1].to(labels.device) == 0, self.ignore_index)

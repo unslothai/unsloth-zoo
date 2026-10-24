@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A left-padded batch must train on the same targets as its rows collated alone.
-
-Vision processors are loaded with padding_side = "left". The loss shifts labels by one, so
-the first real token of a left-padded row became a target predicted from a pad position,
-while the same row alone (batch size 1, or each gradient accumulation micro-batch) drops it
-at the shift. Batch size 2 then trained on one extra token per padded row, so it was not
-equal to 2 accumulation steps of batch size 1. CPU only, fake processor.
+"""A left-padded batch must train on the same targets as its rows collated alone
+(batch size 2 == 2 accumulation steps of batch size 1). CPU only, fake processor.
 """
 
 import pytest
