@@ -20,6 +20,7 @@ import torch
 class _NoStream:
     def wait_stream(self, other): pass
     def wait_event(self, event): pass
+    def record_event(self): return None
 
 
 @pytest.fixture
@@ -137,3 +138,42 @@ def test_dropped_graph_returns_its_slots(G):
     loss = _fwd(G, ws, xs[1].requires_grad_(), True)
     assert G._CPU_SLOT_TOP == held  # reused, not grown
     loss.backward()
+
+
+class _FenceStream:
+    def __init__(self, name):
+        self.name, self.waited = name, []
+    def record_event(self):
+        return (self.name, "event")
+    def wait_event(self, event):
+        self.waited.append(event)
+
+
+def test_slot_fence_is_kept_before_a_second_device_appears(G):
+    G._reset_cpu_slots()
+    s0, s1 = _FenceStream("cuda:0"), _FenceStream("cuda:1")
+    lease = G._CpuSlotLease(0, s0)
+    lease.release()  # only one device has offloaded so far
+    assert G._SLOT_FENCES[0] == (0, ("cuda:0", "event"))
+    again = G._CpuSlotLease(0, s0)  # same device: stream order already holds
+    assert again.index == 0 and s0.waited == [] and 0 not in G._SLOT_FENCES
+    again.release()
+    other = G._CpuSlotLease(1, s1)  # first lease ever on device 1 still waits on device 0's release
+    assert other.index == 0 and s1.waited == [("cuda:0", "event")]
+    other.release()
+    G._reset_cpu_slots()
+    assert not G._SLOT_FENCES
+
+
+class _Copied:
+    def __init__(self, done): self.done = done
+    def query(self): return self.done
+
+
+def test_retire_waits_on_the_stream_that_allocated_the_source(G):
+    import collections
+    owner, current = _FenceStream("owner"), _FenceStream("current")
+    first, second = _Copied(True), _Copied(False)
+    inflight = collections.deque([(None, first, owner), (None, second, None)])
+    G.NonReentrantActivationOffloader._retire(inflight, current, 0)
+    assert owner.waited == [first] and current.waited == [second] and not inflight

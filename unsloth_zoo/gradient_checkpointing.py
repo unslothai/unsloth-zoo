@@ -1193,9 +1193,8 @@ _FREE_CPU_SLOTS = []    # min-heap of returned slot indices
 _CPU_SLOT_TOP = 0       # slots [0, _CPU_SLOT_TOP) have been handed out at least once
 _CPU_SLOT_EPOCH = 0     # bumped by every pool reset; a lease from an older epoch is ignored
 # Each device copies through its own side stream, so a slot returned on one device and leased on
-# another needs an explicit order: with more than one offloading device, a release records an event
-# on the releasing device's side stream and the next lease from another device waits on it.
-_OFFLOAD_DEVICES = set()
+# another needs an explicit order: every release records an event on the releasing device's side
+# stream (a second device may appear only later), and a lease from another device waits on it.
 _SLOT_FENCES = {}       # slot index -> (device index, event recorded at release)
 
 
@@ -1221,7 +1220,6 @@ class _CpuSlotLease:
             _CPU_SLOT_TOP += 1
         self.epoch = _CPU_SLOT_EPOCH
         self.device, self.stream = device, stream
-        _OFFLOAD_DEVICES.add(device)
         fence = _SLOT_FENCES.pop(self.index, None)
         if fence is not None and fence[0] != device and stream is not None:
             stream.wait_event(fence[1])
@@ -1229,7 +1227,7 @@ class _CpuSlotLease:
     def release(self):
         index, self.index = self.index, None
         if index is not None and self.epoch == _CPU_SLOT_EPOCH:
-            if len(_OFFLOAD_DEVICES) > 1 and self.stream is not None:
+            if self.stream is not None:
                 _SLOT_FENCES[index] = (self.device, self.stream.record_event())
             heapq.heappush(_FREE_CPU_SLOTS, index)
 
@@ -1851,7 +1849,7 @@ class NonReentrantActivationOffloader:
                 _warn_pinned_unavailable(e)
             else:
                 # Keepalive: the caller drops x next, but its block must outlive the copy.
-                inflight.append((x, copied))
+                inflight.append((x, copied, compute))
                 record.host, record.copied, record.pinned_bytes = host, copied, nbytes
                 self.stats["pinned"] += 1
                 return
@@ -1861,9 +1859,10 @@ class NonReentrantActivationOffloader:
 
     @staticmethod
     def _retire(inflight, compute, keep):
+        # Each keepalive waits on the stream that allocated its source (compute is only the default).
         while inflight and (len(inflight) > keep or inflight[0][1].query()):
-            _, copied = inflight.popleft()
-            compute.wait_event(copied)
+            _, copied, owner = inflight.popleft()
+            (owner or compute).wait_event(copied)
     pass
 
     def _drain(self):
