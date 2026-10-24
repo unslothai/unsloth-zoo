@@ -1162,19 +1162,22 @@ class _ExpertBiasGather(torch.autograd.Function):
         # The one-hot is at most _EXPERT_BIAS_ONE_HOT_ELEMENTS: long contexts go in row chunks, summed in fp32.
         chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // ctx.num_experts)
         rows = grad.shape[0]
-        if rows <= chunk:
-            return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
-        # GEMMs only (no index_add_ atomics) for reproducibility; fp32 partials, since 16-bit chunk sums can overflow to inf.
-        if torch.compiler.is_compiling():
-            # A loop over symbolic rows would specialize them: one uncapped GEMM instead.
-            return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
-        if not _mm_fp32_out_ok(grad):
-            # The fallback upcasts each grad chunk to fp32: cap that copy too.
-            chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(ctx.num_experts, grad.shape[1]))
-        out = torch.zeros(ctx.num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
-        for start in range(0, rows, chunk):
-            out += _one_hot_mm_fp32(expert_ids[start : start + chunk].unsqueeze(0) == experts, grad[start : start + chunk])
-        return out.to(grad.dtype), None
+        # Autocast off: under fp16 autocast (incl. compiled backward's "same_as_forward") `mm` rounds the
+        # per-expert sum of fp32 grads to fp16 and overflows past 65504.
+        with torch.autocast(device_type = grad.device.type, enabled = False):
+            if rows <= chunk:
+                return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
+            # GEMMs only (no index_add_ atomics) for reproducibility; fp32 partials, since 16-bit chunk sums can overflow to inf.
+            if torch.compiler.is_compiling():
+                # A loop over symbolic rows would specialize them: one uncapped GEMM instead.
+                return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
+            if not _mm_fp32_out_ok(grad):
+                # The fallback upcasts each grad chunk to fp32: cap that copy too.
+                chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(ctx.num_experts, grad.shape[1]))
+            out = torch.zeros(ctx.num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
+            for start in range(0, rows, chunk):
+                out += _one_hot_mm_fp32(expert_ids[start : start + chunk].unsqueeze(0) == experts, grad[start : start + chunk])
+            return out.to(grad.dtype), None
 
 
 # torch.mm(..., out_dtype = torch.float32): 16-bit inputs, fp32 output (aten::mm.dtype, CUDA only, torch 2.9+).
