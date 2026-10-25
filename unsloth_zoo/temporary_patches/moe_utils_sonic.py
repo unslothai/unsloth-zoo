@@ -689,9 +689,10 @@ class _SonicGatedGroupedMM(torch.autograd.Function):
 def _is_quantized_source(source):
     """bnb 4-bit / fp8 / any non-plain-float expert weight must not reach sonic."""
     param = source
-    seen = set()
-    while param is not None and id(param) not in seen:
-        seen.add(id(param))
+    # Bounded walk, no id(): id() of a traced parameter guards on its identity (one recompile per layer).
+    for _ in range(16):
+        if param is None:
+            break
         if type(param).__name__ in ("Params4bit", "Params8bit", "Int8Params"):
             return True
         nxt = getattr(param, "base_layer", None)

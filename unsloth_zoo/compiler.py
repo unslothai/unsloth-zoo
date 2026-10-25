@@ -62,6 +62,8 @@ from .peft_utils import get_lora_layer_modules
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_SOURCE,
     MHC_SINKHORN_REPLACEMENT,
+    MHC_PROJECTION_SOURCE,
+    MHC_PROJECTION_REPLACEMENT,
     mhc_fast_mode,
 )
 from importlib.metadata import version as importlib_version
@@ -250,11 +252,46 @@ MODULE_FORWARD_SOURCE_REWRITES = {
     "deepseek_v41": {
         "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
+    # GLM-5.3-Flash carries the V4 Sinkhorn chain verbatim (transformers 5.17 - 5.20).
+    "glm5_next": {
+        "Glm5NextTextHyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
 }
+
+
+# {model_type: {class: (old, new)}}: forward rewrites that apply whether or not the class compiles
+# (the eager mixer saves its FP32 upcast for backward; compiled blocks do not, and the helper
+# keeps the stock math under torch.compile).
+MODULE_FORWARD_EAGER_REWRITES = {
+    "deepseek_v4": {"DeepseekV4HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
+    "deepseek_v41": {"DeepseekV41HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
+    "glm5_next": {"Glm5NextTextHyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
+}
+
+
+def module_forward_eager_rewrites(modeling_file, model_type):
+    """{class: rewritten forward source} for MODULE_FORWARD_EAGER_REWRITES that match exactly once."""
+    applicable = {}
+    for name, (old, new) in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}).items():
+        try:
+            cls = getattr(modeling_file, name)
+            source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = source.replace(old, new)
+            if "unsloth_mhc_projection" in new:
+                # Same reason as unsloth_sinkhorn_knopp below: block compile rebinds the forward
+                # to the modeling module's globals.
+                from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection
+
+                modeling_file.unsloth_mhc_projection = unsloth_mhc_projection
+    return applicable
 
 
 def module_forward_source_rewrites(modeling_file, model_type):
     applicable = {}
+    eager_rewrites = module_forward_eager_rewrites(modeling_file, model_type)
     for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
         try:
             mode = mode()
@@ -264,8 +301,16 @@ def module_forward_source_rewrites(modeling_file, model_type):
             source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
         except Exception:
             continue
+        source = eager_rewrites.get(name, source)
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
+            if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
+                # Block compile rebinds a layer's forward to its modeling module's globals, so the
+                # helper the rewritten forward calls must resolve there too, not only in the
+                # generated module that imports it.
+                from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
+
+                modeling_file.unsloth_sinkhorn_knopp = unsloth_sinkhorn_knopp
     return applicable
 
 
@@ -291,6 +336,26 @@ def calls_disable_compile_function(source, disable_compile_functions):
         for name in disable_compile_functions
         if re.search(r"[^\w.]" + re.escape(name) + r"[\s]{0,}\(", source)
     )
+
+
+def modules_wrapping_disabled_attention(inits, disabled_attention_modules):
+    """Modules whose `__init__` builds a compile-disabled attention module, directly or through
+    another such module. Compiled, each graph-breaks at every call (GraniteSpeechConformerBlock,
+    Gemma3nAudioConformerAttention, Blip2QFormerAttention), so they stay eager like layers that
+    call `self.self_attn`; their own compiled children still compile."""
+    found = set()
+    targets = set(disabled_attention_modules)
+    while targets:
+        new = {
+            module
+            for module, init in inits.items()
+            if module not in found
+            and module not in disabled_attention_modules
+            and any(re.search(rf"\b{re.escape(x)}\(", init) for x in targets)
+        }
+        found |= new
+        targets = new
+    return found
 
 
 def function_defined_elsewhere(modeling_file, name):
@@ -438,6 +503,23 @@ def has_data_dependent_call(source):
         or ".tolist()" in source
         or ".item()" in source
     )
+
+
+def loops_over_checkpointed_layers(modeling_file, init, forward):
+    """A forward looping over `GradientCheckpointingLayer`s (Wav2Vec2FeatureEncoder's conv
+    layers) graph breaks once per layer under gradient checkpointing: Dynamo skips the
+    checkpoint function `GradientCheckpointingLayer.__call__` hands each layer to."""
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        return False
+    if not re.search(r"^\s*for\s[^\n]+?\sin\s[^\n]*\bself\.\w+", forward, flags = re.MULTILINE):
+        return False
+    for name in set(re.findall(r"\b([A-Za-z_]\w*)\(", init)):
+        cls = getattr(modeling_file, name, None)
+        if isinstance(cls, type) and issubclass(cls, GradientCheckpointingLayer):
+            return True
+    return False
 
 
 def data_dependent_helpers(modeling_file, called_functions):
@@ -2153,6 +2235,8 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
     if "unsloth_sinkhorn_knopp" in new_source:
         imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp\n"
+    if "unsloth_mhc_projection" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -2200,6 +2284,17 @@ def create_new_function(
     if "_bnb4bit_experts_forward_or_none" in new_source:
         # The patched Qwen3-VL-MoE expert forwards call it first, before any weight check.
         imports += "from unsloth_zoo.temporary_patches.qwen3_vl_moe import _bnb4bit_experts_forward_or_none\n"
+    if "_fused_route_or_none" in new_source:
+        # The zoo gpt-oss / Qwen3-MoE / Qwen3-VL-MoE / grouped ModuleList routers call it on
+        # every forward (it returns None unless UNSLOTH_MOE_FUSED_ROUTER=1), and their source
+        # is copied here without the patch module's globals. Same fallback as those modules.
+        imports += (
+            "try:\n"
+            "    from unsloth_zoo.temporary_patches.moe_router_triton import fused_route_or_none as _fused_route_or_none\n"
+            "except Exception:\n"
+            "    def _fused_route_or_none(*args, **kwargs):\n"
+            "        return None\n"
+        )
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
@@ -2805,9 +2900,13 @@ def _unwrap_undecorated_method(func, owner_qualname):
     standalone function from that emits `return wrapped(self, *args, **kwargs)`
     under the real named signature, which is a `NameError` at the first forward.
 
-    Walk `__wrapped__` and then single function closure cells until we land on a
-    function that really belongs to `owner_qualname`. If no such function is
-    found, return `func` unchanged so nothing else changes behaviour.
+    A wrapper can also bind the original through a default argument (Jamba /
+    Zamba `_slow_only` in `temporary_patches/misc.py`); its default names a patch
+    local, so re-emitting it raises `NameError`. Such defaults are walked too.
+
+    Walk `__wrapped__` and then single function closure cells or defaults until
+    we land on a function that really belongs to `owner_qualname`. If no such
+    function is found, return `func` unchanged so nothing else changes behaviour.
     """
     prefix = owner_qualname + "."
     if getattr(func, "__qualname__", "").startswith(prefix):
@@ -2817,17 +2916,22 @@ def _unwrap_undecorated_method(func, owner_qualname):
     for _ in range(10):
         candidate = getattr(current, "__wrapped__", None)
         if candidate is None:
-            cells = getattr(current, "__closure__", None)
-            if getattr(current, "__code__", None) is None or not cells:
+            if getattr(current, "__code__", None) is None:
                 break
             inner = []
-            for cell in cells:
+            for cell in getattr(current, "__closure__", None) or ():
                 try:
                     value = cell.cell_contents
                 except ValueError:
                     continue
                 if inspect.isfunction(value):
                     inner.append(value)
+            # Defaults only when no closure cell holds a function, so every
+            # wrapper the closure walk already resolved keeps its answer.
+            if not inner:
+                defaults = list(getattr(current, "__defaults__", None) or ())
+                defaults += list((getattr(current, "__kwdefaults__", None) or {}).values())
+                inner = [value for value in defaults if inspect.isfunction(value)]
             # More than one candidate is ambiguous, so leave `func` alone.
             if len(inner) != 1:
                 break
@@ -5657,6 +5761,8 @@ DISABLE_COMPILE_MODULES = [
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",
+    # GLM-5.3-Flash: same Sinkhorn mixer. Its HyperHead is an unweighted mean and stays compiled.
+    "Glm5NextTextHyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -6025,6 +6131,7 @@ def unsloth_compile_transformers(
     function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
     disable_compile_functions.difference_update(function_source_rewrites)
     module_forward_rewrites = module_forward_source_rewrites(modeling_file, model_type)
+    module_eager_rewrites = module_forward_eager_rewrites(modeling_file, model_type)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -6415,6 +6522,7 @@ def unsloth_compile_transformers(
         if compile_attention
         else []
     )
+    torch_module_inits = {}
     for module in torch_modules.keys():
         source = eval(f"modeling_file.{module}")
         try:
@@ -6426,6 +6534,7 @@ def unsloth_compile_transformers(
         # Dynamo cannot inline a compile-disabled attention forward into a fullgraph region (UMT5LayerSelfAttention).
         if any(re.search(rf"\b{re.escape(x)}\(", source) for x in disabled_attention_modules):
             fullgraph = False
+        torch_module_inits[module] = source
 
         # Eg SiglipVisionEmbeddings and CLIPVisionEmbeddings
         if str(module).endswith("VisionEmbeddings"):
@@ -6442,6 +6551,9 @@ def unsloth_compile_transformers(
         pass
         torch_modules[module] = fullgraph if UNSLOTH_FULLGRAPH else False
     pass
+    disabled_attention_wrappers = modules_wrapping_disabled_attention(
+        torch_module_inits, disabled_attention_modules
+    )
 
     # Get other classes
     other_classes = re.findall(r"class ([^\s]{1,})\(.+?\)", full_source)
@@ -6601,6 +6713,7 @@ def unsloth_compile_transformers(
             "attn_weights" in source
             or "self.self_attn" in source
             or "_ATTENTION_CLASSES" in init
+            or module in disabled_attention_wrappers
         ):
             print(
                 f"Unsloth: Will not compile {module} since it looks like it calls attention modules!"
@@ -6664,6 +6777,15 @@ def unsloth_compile_transformers(
         if "for layer in self." in source:
             print(
                 f"Unsloth: Failed compiling function {module} since it looks like a decoder!"
+            )
+            bad_torch_modules.add(module)
+        pass
+
+        if module not in bad_torch_modules and loops_over_checkpointed_layers(
+            modeling_file, init, source
+        ):
+            print(
+                f"Unsloth: Will not compile {module} since it loops over gradient checkpointed layers."
             )
             bad_torch_modules.add(module)
         pass
@@ -6734,6 +6856,7 @@ def unsloth_compile_transformers(
                     functions,
                     fullgraph=False,
                     disable=True,
+                    forward_source=module_eager_rewrites.get(module),
                 )
                 all_standalone_classes[module] = new_module
             except Exception as e:

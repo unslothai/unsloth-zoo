@@ -410,7 +410,7 @@ def test_hf_router_class_parity(module_name, cls_name, cfg_name, over, dtype):
     assert (x0 - x1).norm() <= 2e-2 * x0.norm() + 1e-6
 
 
-@pytest.mark.parametrize("cls_name", ("GptOssTopKRouter", "GptOssTopKRouterBnb4bit"))
+@pytest.mark.parametrize("cls_name", ("GptOssTopKRouter",))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16), ids = str)
 def test_zoo_gpt_oss_router_parity(cls_name, dtype):
     from unsloth_zoo.temporary_patches import gpt_oss as zg

@@ -80,16 +80,6 @@ _DEFERRED = [0]          # count of sliding calls that fell through (debug)
 _MIN_SEQ_MULTIPLE_OF_WINDOW = 3
 
 
-def muse_glimmer_banded_stats():
-    """Engagement counters, for tests and benchmarks."""
-    return {
-        "fa2"      : _ENGAGED[0],
-        "banded"   : _BANDED_ENGAGED[0],
-        "deferred" : _DEFERRED[0],
-        "has_fa2"  : _HAS_FA2,
-    }
-
-
 @functools.lru_cache(maxsize=1)
 def _enabled():
     """Whether the Muse Glimmer sliding-window fast router is active.

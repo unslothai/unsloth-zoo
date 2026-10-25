@@ -9,6 +9,7 @@ stream pinned copies, unsloth_stream (keep last N on device, reload i-1 ahead), 
 pageable fallback once the pinned cap is hit. The engagement counters prove each path ran.
 """
 import functools
+import weakref
 
 import pytest
 import torch
@@ -389,3 +390,117 @@ def test_a_probe_failure_other_than_oom_is_raised(gc_module, monkeypatch):
 
     monkeypatch.setattr(torch, "empty", oom)
     assert gc_module._host_cache_reuses_block(1 << 20) is False
+
+
+# Caching allocator model on CPU: a block freed on its allocation stream is reusable there at
+# once, so a use on another stream is safe only if, at free time, the allocation stream waited on
+# it or record_stream() named a stream that did (record_stream ignores the allocation stream).
+class _Stream:
+    def __init__(self, name): self.name, self.waited, self.ops = name, [], []
+    def wait_event(self, event): self.waited.append(event)
+    def wait_stream(self, other): pass
+    def record_event(self): return _Event()
+    def __repr__(self): return self.name
+
+
+class _Event:
+    def record(self, stream = None): pass
+    def query(self): return False
+
+
+class _Source:
+    """A device tensor: `uses` is what record_stream() registered, `safe` is decided at free."""
+    def __init__(self, stream, guards):
+        self.alloc_stream, self.uses, self.guards, self.freed = stream, [], guards, []
+        self.device = type("D", (), {"index": 0, "type": "cuda"})()
+        weakref.finalize(self, _Source._free, self.alloc_stream, self.uses, self.guards, self.freed)
+
+    @staticmethod
+    def _free(alloc_stream, uses, guards, freed):
+        # Every guard (a copy's event, or work queued on a consumer stream) must be ordered before
+        # reuse on the allocation stream.
+        for guard in guards:
+            if isinstance(guard, _Stream):
+                freed.append(guard is alloc_stream or guard in uses)
+            else:
+                freed.append(guard in alloc_stream.waited or any(guard in s.waited for s in uses))
+
+    def record_stream(self, stream):
+        if stream is not self.alloc_stream and stream not in self.uses: self.uses.append(stream)
+    def numel(self): return 4
+    def element_size(self): return 4
+    def to(self, device, non_blocking = False): return "host copy"
+
+
+@pytest.fixture
+def fake_cuda(gc_module, monkeypatch):
+    import contextlib
+    state = {"current": _Stream("compute"), "side": _Stream("side")}
+    monkeypatch.setattr(gc_module, "PINNED_MEMORY_AVAILABLE", True)
+    monkeypatch.setattr(gc_module, "_pinned_memory_disabled", lambda: False)
+    monkeypatch.setattr(gc_module, "_reserve_pinned", lambda n: True)
+    monkeypatch.setattr(gc_module, "_release_pinned", lambda n: None)
+    monkeypatch.setattr(gc_module, "_new_extra_stream", lambda i: state["side"])
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device = None: state["current"])
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", "1")
+    return state
+
+
+def _pack_on_side_stream(gc_module, alloc_stream):
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    record = gc_module._OffloadedActivation(None, 0)
+    guards = []
+    x = _Source(alloc_stream, guards)
+    offloader._to_host(record, x)
+    guards.append(record.copied)
+    return offloader, record, x.freed, x.uses, weakref.ref(x)
+
+
+@pytest.mark.parametrize("same_stream", [True, False])
+def test_d2h_source_is_reused_only_after_its_copy(gc_module, fake_cuda, same_stream):
+    alloc = fake_cuda["current"] if same_stream else _Stream("producer")
+    offloader, record, freed, uses, alive = _pack_on_side_stream(gc_module, alloc)
+    offloader._drain()  # backward starts: the keepalive is retired
+    assert alive() is None and freed == [True]
+    # The usual case costs no delayed reuse: nothing is recorded on the side stream.
+    assert fake_cuda["side"] not in uses
+    assert uses == ([] if same_stream else [fake_cuda["current"]])
+
+
+@pytest.mark.parametrize("same_stream", [True, False])
+def test_a_dropped_graph_releases_its_d2h_source_after_the_copy(gc_module, fake_cuda, same_stream):
+    alloc = fake_cuda["current"] if same_stream else _Stream("producer")
+    offloader, record, freed, uses, alive = _pack_on_side_stream(gc_module, alloc)
+    del record  # graph discarded without backward, offloader idle
+    assert alive() is None and freed == [True]
+    assert not offloader.inflight[0] or offloader.inflight[0][0][0] is None
+
+
+def test_a_record_outliving_its_offloader_keeps_the_source_until_the_copy(gc_module, fake_cuda):
+    offloader, record, freed, uses, alive = _pack_on_side_stream(gc_module, fake_cuda["current"])
+    del offloader
+    assert alive() is not None or freed == [True]
+    del record
+    assert alive() is None and freed == [True]
+
+
+@pytest.mark.parametrize("same_stream", [True, False])
+def test_a_consumed_prefetch_outlives_its_reload_and_its_consumer(gc_module, fake_cuda, same_stream):
+    alloc = fake_cuda["current"] if same_stream else _Stream("prefetching")
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    record = gc_module._OffloadedActivation(type("D", (), {"index": 0})(), 0)
+    guards = []
+    x = _Source(alloc, guards)
+    freed = x.freed
+    ready = _Event()
+    record.device_tensor, record.ready, record.ready_stream, record.host = x, ready, alloc, "host copy"
+    guards.append(ready)
+    del x
+    out = offloader.unpack(record)
+    guards.append(fake_cuda["current"])  # the consumer then reads it on the unpacking stream
+    del record
+    alive = weakref.ref(out)
+    del out
+    assert alive() is None and freed == [True, True]
