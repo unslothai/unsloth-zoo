@@ -89,11 +89,59 @@ def _compile_layers(model):
     return len(layers)
 
 
+def _load_msvc_environment():
+    """Windows: Inductor runs `cl` from PATH, which only a Visual Studio Developer Prompt sets up. When
+    Build Tools are installed but not activated, run vcvars64.bat once and take its PATH / INCLUDE /
+    LIB / LIBPATH (as Studio does for XPU Triton). Returns True when cl is reachable afterwards."""
+    import shutil
+    import subprocess
+    if shutil.which("cl"):
+        return True
+    root = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    vswhere = os.path.join(root, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if not os.path.isfile(vswhere):
+        return False
+    hidden = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    try:
+        done = subprocess.run(
+            [vswhere, "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+             "-property", "installationPath", "-utf8"],
+            capture_output = True, text = True, encoding = "utf-8", errors = "replace", timeout = 60, **hidden,
+        )
+        install = (done.stdout or "").strip().splitlines()
+        if done.returncode != 0 or not install:
+            return False
+        vcvars = os.path.join(install[0].strip(), "VC", "Auxiliary", "Build", "vcvars64.bat")
+        if not os.path.isfile(vcvars):
+            return False
+        # /u: UTF-16 `set` output, so non-ASCII PATH entries survive.
+        done = subprocess.run(f'cmd /d /u /s /c ""{vcvars}" >nul 2>&1 && set"', capture_output = True,
+                              timeout = 120, **hidden)
+    except Exception:
+        return False
+    if done.returncode != 0:
+        return False
+    env = {}
+    for line in (done.stdout or b"").decode("utf-16-le", errors = "replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.upper() in ("PATH", "INCLUDE", "LIB", "LIBPATH"):
+            env[key.upper()] = value
+    if "PATH" not in env or "INCLUDE" not in env:
+        return False
+    os.environ.update(env)
+    return bool(shutil.which("cl"))
+
+
 @functools.cache
 def _cpu_compile_unavailable():
     """None when Inductor can build and run a CPU kernel here, else why not. Inductor needs a C++
     compiler at run time (MSVC `cl` on an initialised Windows shell, Xcode clang on macOS, gcc / clang on
     Linux); without one the first training step would raise instead of falling back."""
+    import sys
+    if sys.platform == "win32" and not _load_msvc_environment():
+        return ("no MSVC: install Visual Studio Build Tools with the C++ workload "
+                "(winget install Microsoft.VisualStudio.2022.BuildTools --override \"--add "
+                "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\")")
     try:
         import torch._dynamo
         x = torch.linspace(-4, 4, 64)  # not randn: the probe must not move the RNG that seeds LoRA init

@@ -1227,3 +1227,48 @@ def test_cpu_compile_probe_leaves_the_rng_alone(monkeypatch):
         torch.testing.assert_close(torch.rand(3), expected)
     finally:
         loader._cpu_compile_unavailable.cache_clear()
+
+
+def test_windows_compile_loads_the_msvc_environment(monkeypatch, tmp_path):
+    """Build Tools installed but no Developer Prompt: vswhere -> vcvars64.bat -> PATH / INCLUDE / LIB."""
+    import shutil
+    import subprocess
+    from types import SimpleNamespace
+    from unsloth_zoo.cpu import loader
+    root = tmp_path / "x86"
+    (root / "Microsoft Visual Studio" / "Installer").mkdir(parents = True)
+    (root / "Microsoft Visual Studio" / "Installer" / "vswhere.exe").write_text("")
+    install = tmp_path / "BuildTools"
+    (install / "VC" / "Auxiliary" / "Build").mkdir(parents = True)
+    (install / "VC" / "Auxiliary" / "Build" / "vcvars64.bat").write_text("")
+    monkeypatch.setenv("ProgramFiles(x86)", str(root))
+    monkeypatch.delenv("INCLUDE", raising = False)
+    for key in ("PATH", "LIB", "LIBPATH"):  # restored after the test; the loader updates os.environ
+        monkeypatch.setenv(key, os.environ.get(key, ""))
+    cl_dir = str(tmp_path / "msvc_bin")
+    state = {"cl": None}
+
+    def fake_run(cmd, **kwargs):
+        if isinstance(cmd, list):
+            return SimpleNamespace(returncode = 0, stdout = str(install) + "\n")
+        state["cl"] = cl_dir
+        listing = f"Path={cl_dir};C:\\Windows\r\nINCLUDE=C:\\VC\\include\r\nLIB=C:\\VC\\lib\r\nOTHER=x\r\n"
+        return SimpleNamespace(returncode = 0, stdout = listing.encode("utf-16-le"))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(shutil, "which", lambda name: state["cl"] and name == "cl" and state["cl"] + "\\cl.exe")
+    assert loader._load_msvc_environment() is True
+    assert os.environ["INCLUDE"] == "C:\\VC\\include" and os.environ["PATH"].startswith(cl_dir)
+    assert os.environ.get("OTHER") != "x"
+
+
+def test_windows_compile_without_build_tools_says_how_to_install(monkeypatch):
+    import sys
+    from unsloth_zoo.cpu import loader
+    loader._cpu_compile_unavailable.cache_clear()
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(loader, "_load_msvc_environment", lambda: False)
+    try:
+        assert "Build Tools" in loader._cpu_compile_unavailable()
+    finally:
+        loader._cpu_compile_unavailable.cache_clear()
