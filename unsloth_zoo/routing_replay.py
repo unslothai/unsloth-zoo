@@ -436,7 +436,6 @@ def _recomputed_routes(layer_index, ids2, signature = None):
         # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
         return _NATURAL
     fp = _fingerprint(ids2)
-    # One stacked compare, not one per candidate: up to _MAX_PENDING candidates per router call.
     match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
     if signature is not None:
         # Narrow the natural matches to the forwards whose router input was the same too. Only a
