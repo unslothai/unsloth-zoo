@@ -712,6 +712,10 @@ def _sonic_eligible(self, hidden_states):
         return False, f"device {hidden_states.device} is not the compute capability sonic was probed on"
     if hidden_states.dtype not in _SUPPORTED_DTYPES:
         return False, f"dtype {hidden_states.dtype} is not bf16/fp16"
+    # Row strides of A, B and D must be 16-byte aligned, else sonic raises "divisible by 8".
+    align = 16 // hidden_states.element_size()
+    if hidden_states.shape[-1] % align != 0:
+        return False, f"hidden size {hidden_states.shape[-1]} is not a multiple of {align}"
     if not (hasattr(self, "gate_up_proj") and hasattr(self, "down_proj")):
         return False, "experts do not use the gate_up_proj/down_proj layout"
     cls = self.__class__.__name__
@@ -744,6 +748,8 @@ def _sonic_eligible(self, hidden_states):
                 return False, f"{name} base dtype {base.dtype} is not bf16/fp16"
             if base.dim() != 3:
                 return False, f"{name} base is not a 3D expert stack"
+            if base.shape[1] % align != 0 or base.shape[2] % align != 0:
+                return False, f"{name} expert dims {tuple(base.shape[1:])} are not multiples of {align}"
     return True, None
 
 
