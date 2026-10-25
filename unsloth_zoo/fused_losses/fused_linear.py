@@ -945,8 +945,12 @@ def _logits_into(h, w, out, fp32_logits):
     for a, b in parts:
         if fp32_logits:
             _mm_fp32(h, w[a:b].t(), out = out[:, a:b])
-        else:
+        elif h.is_cuda:
             torch.mm(h, w[a:b].t(), out = out[:, a:b])
+        else:
+            # CPU fp16 mm with out= into this strided column slice reads the slice's stale contents on
+            # avx512_fp16 hosts (torch 2.10, oneDNN): NaN logits from an uninitialised buffer, wrong ones otherwise.
+            out[:, a:b].copy_(torch.mm(h, w[a:b].t()))
     return out
 
 
