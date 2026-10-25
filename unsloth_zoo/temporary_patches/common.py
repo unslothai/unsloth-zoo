@@ -63,6 +63,14 @@ import inspect
 import torch
 inductor_config_source = inspect.getsource(torch._inductor.config)
 
+def _persistent_tma_matmul_ok():
+    # torch 2.12+ guards every GEMM size when Inductor considers its TMA templates
+    # (pytorch/pytorch#172925), so a compiled torch._scaled_mm recompiles for each new token count.
+    import re
+    found = re.match(r"(\d+)\.(\d+)", torch.__version__)
+    return found is not None and (int(found.group(1)), int(found.group(2))) < (2, 12)
+pass
+
 @functools.lru_cache(1)
 def determine_compile_threads():
     # See https://github.com/pytorch/pytorch/blob/ab2294d8289a7757a2fc321cdefac88e2b378edf/torch/_inductor/config.py#L771
@@ -152,7 +160,7 @@ def get_torch_compile_options(
 
         "triton.multi_kernel"       : multi_kernel, # RuntimeError: name 'multi_kernel_0' is not defined
         "triton.use_block_ptr"      : use_block_ptr,
-        "triton.enable_persistent_tma_matmul" : True,
+        "triton.enable_persistent_tma_matmul" : _persistent_tma_matmul_ok(),
         "triton.autotune_at_compile_time"     : False,
         "triton.cooperative_reductions"       : False,
         # "reorder_for_compute_comm_overlap"  : True, # Fails for single GPU

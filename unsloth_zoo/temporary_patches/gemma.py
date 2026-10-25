@@ -667,6 +667,43 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
+def patch_Gemma3MultiModalProjector():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector
+    except Exception as e:
+        return raise_error("Gemma3MultiModalProjector.forward", e)
+
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
+
+    def forward(self, vision_outputs: torch.Tensor):
+        batch_size, _, hidden_size = vision_outputs.shape
+
+        reshaped_vision_outputs = vision_outputs.transpose(1, 2)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            batch_size, hidden_size, self.patches_per_image, self.patches_per_image
+        )
+        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
+
+        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
+        pooled_vision_outputs = pooled_vision_outputs.flatten(2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
+
+        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+        # mm_soft_emb_norm emits fp16; full finetuning has an fp32 weight and no autocast,
+        # so torch.matmul would see Half against float.
+        normed_vision_outputs = _to_boundary_dtype(
+            normed_vision_outputs, _linear_boundary_dtype(self, "mm_input_projection_weight")
+        )
+        projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
+        return projected_vision_outputs.type_as(vision_outputs)
+    pass
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector, "forward", forward)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3MultiModalProjector)
+
+
 def patch_Gemma3Attention():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
@@ -680,6 +717,8 @@ def patch_Gemma3Attention():
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
+    from .sdpa_gqa import make_gqa_sdpa
+    gqa_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
 
     def prepare(
         hidden_states,
@@ -851,15 +890,15 @@ def patch_Gemma3Attention():
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # During jit tracing shapes are tensors, so is_causal may be a tensor; SDPA needs a bool.
             if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-            attn_output_fp32 = scaled_dot_product_attention(
+            attn_output_fp32 = gqa_sdpa(
                 query_states_fp32.contiguous(),
                 key_states_fp32.contiguous(),
                 value_states_fp32.contiguous(),
-                attn_mask = attn_mask_for_sdpa,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = is_causal,
-                scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                attn_mask_for_sdpa,
+                self.attention_dropout if self.training else 0.0,
+                is_causal,
+                getattr(self, "scaling", None),
+                getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_weights = None # Defaulting to None
 
@@ -931,6 +970,8 @@ def patch_Gemma3Attention_generic():
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
+    from .sdpa_gqa import make_gqa_sdpa
+    gqa_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
 
     def prepare(
         hidden_states,
@@ -1101,15 +1142,15 @@ def patch_Gemma3Attention_generic():
             is_causal = query_states_fp32.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
             # During jit tracing shapes are tensors, so is_causal may be a tensor; SDPA needs a bool.
             if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-            attn_output_fp32 = scaled_dot_product_attention(
+            attn_output_fp32 = gqa_sdpa(
                 query_states_fp32.contiguous(),
                 key_states_fp32.contiguous(),
                 value_states_fp32.contiguous(),
-                attn_mask = attn_mask_for_sdpa,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = is_causal,
-                scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                attn_mask_for_sdpa,
+                self.attention_dropout if self.training else 0.0,
+                is_causal,
+                getattr(self, "scaling", None),
+                getattr(self, "num_key_value_groups", 1) or 1,
             )
             attn_weights = None # Defaulting to None
 

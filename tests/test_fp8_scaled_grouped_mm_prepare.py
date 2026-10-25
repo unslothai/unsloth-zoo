@@ -105,3 +105,37 @@ def test_scaled_grouped_mm_path_skipped_in_training_mode_under_no_grad(monkeypat
     with torch.no_grad():
         out = m._forward_scaled_grouped_mm_fp8(ex, torch.randn(4, H), torch.tensor([[0], [1], [0], [1]]), torch.ones(4, 1))
     assert out is None
+
+
+def _mixed_host(monkeypatch, probes):
+    # cuda:0 is Hopper (the current device), cuda:1 is Ampere.
+    monkeypatch.setattr(m, "_TORCH_SCALED_GROUPED_MM_SUPPORTED", None)
+    monkeypatch.setattr(m, "_TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE", {}, raising = False)
+    monkeypatch.setattr(m, "_TORCH_SCALED_GROUPED_MM_AVAILABLE", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    capability = {0: (9, 0), 1: (8, 0)}
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d = None: capability[0 if d is None else int(d)])
+    monkeypatch.setattr(m, "_probe_torch_scaled_grouped_mm", lambda index: probes.append(index) or True, raising = False)
+    monkeypatch.setenv("UNSLOTH_FP8_SCALED_GROUPED_MM", "1")
+
+
+def test_scaled_grouped_mm_capability_is_per_device(monkeypatch):
+    probes = []
+    _mixed_host(monkeypatch, probes)
+    assert m._check_torch_scaled_grouped_mm_supported() is True
+    assert m._check_torch_scaled_grouped_mm_supported(torch.device("cuda", 1)) is False
+    assert m._check_torch_scaled_grouped_mm_supported(torch.device("cuda", 0)) is True
+    assert m._check_torch_scaled_grouped_mm_supported(torch.device("cpu")) is False
+    assert probes == [0]
+
+
+def test_scaled_grouped_mm_checks_the_operand_device(monkeypatch):
+    seen = []
+    monkeypatch.setattr(m, "_check_torch_scaled_grouped_mm_supported", lambda device = None: seen.append(device) or False)
+    ex = _experts("scale_inv")
+    ex.eval()
+    hidden = torch.randn(4, H)
+    with torch.no_grad():
+        assert m._forward_scaled_grouped_mm_fp8(ex, hidden, torch.tensor([[0], [1], [0], [1]]), torch.ones(4, 1)) is None
+    assert seen == [hidden.device]

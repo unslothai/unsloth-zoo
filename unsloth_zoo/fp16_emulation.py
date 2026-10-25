@@ -94,8 +94,6 @@ so nothing is materialised that could overflow.
 So: numerically sound, not currently worth enabling. Kept for the case where a large
 float32 GEMM appears on hardware without bfloat16 tensor cores.
 """
-from __future__ import annotations
-
 import itertools
 import math
 import os
