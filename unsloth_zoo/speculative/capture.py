@@ -15,10 +15,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import contextlib
+import weakref
 import torch
 
 __all__ = [
     "resolve_text_parts",
+    "effective_lm_head_weight",
     "capture_hidden_states",
     "run_frozen_target",
 ]
@@ -45,6 +47,115 @@ def _unwrap(model):
 
 def _has_layers(module):
     return isinstance(getattr(module, "layers", None), torch.nn.ModuleList)
+
+
+_EFFECTIVE_HEAD_CACHE = weakref.WeakKeyDictionary()
+
+
+def _tensor_key(t):
+    return (t.data_ptr(), t._version, t.dtype, t.device, tuple(t.shape))
+
+
+_CHECKED_HEAD_BIAS = weakref.WeakKeyDictionary()
+_DELTA_BLOCK_BYTES = 64 << 20
+
+
+def _check_no_head_bias(lm_head, base_layer):
+    """Speculative losses project with the head weight only. A PEFT head whose base carries a nonzero
+    bias (a folded lora_bias after merging, or a biased head) would lose it: refuse. Checked once per
+    bias version and merge state, so the per-step call does not sync."""
+    bias = getattr(base_layer, "bias", None)
+    if bias is None:
+        return
+    # PEFT merges through `.data`, which does not bump `_version`: key on the merge state too.
+    key = (_tensor_key(bias), bool(getattr(lm_head, "merged", False)), tuple(getattr(lm_head, "merged_adapters", ())))
+    if _CHECKED_HEAD_BIAS.get(lm_head) == key:
+        return
+    if bool(bias.detach().ne(0).any()):
+        raise NotImplementedError(
+            "Unsloth: the target's lm_head has a nonzero bias (for example a merged lora_bias adapter); "
+            "speculative training projects with the head weight only and does not support it."
+        )
+    _CHECKED_HEAD_BIAS[lm_head] = key
+
+
+def effective_lm_head_weight(lm_head):
+    """The [V, H] matrix `lm_head(x)` actually multiplies by, for code that projects with a raw weight.
+
+    A plain Linear (or a merged / disabled PEFT LoRA layer) returns `lm_head.weight` itself. An
+    unmerged PEFT LoRA head returns base + sum of its active adapters' scaled deltas (B @ A * scaling), built once
+    without grad and cached until a weight, the active adapters or the merge state changes (the
+    target is frozen, so that is once per run). The sum is accumulated in place in the base dtype,
+    as PEFT's merge does, so the only full-size buffer kept is the result. Heads a weight-only
+    projection cannot express (DoRA and other LoRA variants, lora_bias, a nonzero lm_head bias,
+    a quantized base) raise instead of silently dropping part of the head.
+    """
+    lora_A = getattr(lm_head, "lora_A", None)
+    get_base_layer = getattr(lm_head, "get_base_layer", None)
+    if not isinstance(lora_A, torch.nn.ModuleDict) or not callable(get_base_layer):
+        return lm_head.weight
+    base_layer = get_base_layer()
+    base_weight = base_layer.weight
+    merged = bool(getattr(lm_head, "merged", False))
+    _check_no_head_bias(lm_head, base_layer)
+    if getattr(lm_head, "disable_adapters", False):
+        if merged:
+            raise NotImplementedError(
+                "Unsloth: the target's lm_head has merged LoRA adapters but adapters are disabled; "
+                "unmerge them (model.unmerge_adapter()) before speculative training."
+            )
+        return base_weight
+    if merged:
+        return base_weight
+    active = getattr(lm_head, "active_adapters", None)
+    if active is None:
+        active = getattr(lm_head, "active_adapter", ())
+    if isinstance(active, str):
+        active = [active]
+    active = tuple(a for a in active if a in lora_A)
+    if not active:
+        return base_weight
+    for name in active:
+        if name in (getattr(lm_head, "lora_variant", None) or {}) or \
+                (getattr(lm_head, "use_dora", None) or {}).get(name, False):
+            raise NotImplementedError(
+                f"Unsloth: the target's lm_head adapter {name!r} uses a LoRA variant (e.g. DoRA); speculative "
+                "training cannot project through it unmerged. Merge it (model.merge_adapter()) first."
+            )
+        if (getattr(lm_head, "lora_bias", None) or {}).get(name, False):
+            raise NotImplementedError(
+                f"Unsloth: the target's lm_head adapter {name!r} uses lora_bias = True, which speculative "
+                "training does not support: drafts and teachers project with the head weight only, so the "
+                "adapter's bias would be dropped. Train the lm_head adapter with lora_bias = False."
+            )
+    if not base_weight.is_floating_point() or base_weight.element_size() < 2:
+        raise NotImplementedError(
+            "Unsloth: the target's lm_head is quantized and carries an unmerged LoRA adapter; speculative "
+            "training cannot project through it. Use an unquantized lm_head or merge the adapter."
+        )
+    key = (_tensor_key(base_weight),) + tuple(
+        (name, float(lm_head.scaling[name]), _tensor_key(lora_A[name].weight), _tensor_key(lm_head.lora_B[name].weight))
+        for name in active
+    )
+    cached = _EFFECTIVE_HEAD_CACHE.get(lm_head)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    with torch.no_grad():
+        # In place in the base dtype (PEFT's merged representation): one result buffer plus one
+        # delta at a time, not several full-size fp32 temporaries.
+        weight = base_weight.detach().clone()
+        # Rows of the [out, in] view; fan_in_fan_out heads store the transpose.
+        rows_view = weight.T if getattr(lm_head, "fan_in_fan_out", False) else weight
+        for name in active:
+            A = lora_A[name].weight.detach().to(weight.device)
+            B = lm_head.lora_B[name].weight.detach().to(weight.device)
+            scaling = lm_head.scaling[name]
+            # Row blocks keep the delta's temporaries small; add_ rounds once into the base dtype.
+            step = max(1, _DELTA_BLOCK_BYTES // max(1, A.shape[1] * 4))
+            for s in range(0, B.shape[0], step):
+                rows_view[s:s + step].add_((B[s:s + step] @ A) * scaling)
+    _EFFECTIVE_HEAD_CACHE[lm_head] = (key, weight)
+    return weight
 
 
 def resolve_text_parts(model):

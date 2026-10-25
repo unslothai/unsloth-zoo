@@ -3,7 +3,7 @@ requires = [
     # setuptools 83+ needs Python 3.10, and we still support 3.9 source installs.
     "setuptools==84.0.0; python_version >= '3.10'",
     "setuptools==80.9.0; python_version < '3.10'",
-    "setuptools-scm==9.2.0",
+    "setuptools-scm==10.3.4",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -53,7 +53,7 @@ dependencies = [
     "mlx-lm>=0.31.3,<=0.32.2 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # Ceiling, not a pin: an older transformers (unsloth's <=5.5.0) still resolves 0.6.4,
     # since 0.6.5+ needs transformers>=5.14. unsloth #9466 is fixed in 0.6.9.
-    "mlx-vlm>=0.4.4,<=0.7.8 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx-vlm>=0.4.4,<=0.7.9 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
     # Floor is 4.52.4, not 4.51.3: peft declares no transformers floor of its own (a
@@ -85,6 +85,9 @@ dependencies = [
     # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
     # through datasets, which dropped it in 5.x.
     "requests",
+    # requests and huggingface_hub verify TLS against certifi; 2026.10.19 drops the compromised
+    # eMudhra/emSign root, and an older bundle already installed would otherwise be kept.
+    "certifi>=2026.10.19",
 ]
 
 [tool.setuptools.dynamic]
@@ -110,7 +113,7 @@ mlx = [
     # they are pins.
     "mlx==0.32.4",
     "mlx-lm>=0.31.3,<=0.32.2",
-    "mlx-vlm>=0.4.4,<=0.7.8",
+    "mlx-vlm>=0.4.4,<=0.7.9",
 ]
 core = [
     "packaging>=24.1",
@@ -137,6 +140,9 @@ core = [
     # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
     # through datasets, which dropped it in 5.x.
     "requests",
+    # requests and huggingface_hub verify TLS against certifi; 2026.10.19 drops the compromised
+    # eMudhra/emSign root, and an older bundle already installed would otherwise be kept.
+    "certifi>=2026.10.19",
 ]
 huggingface = [
     "unsloth_zoo[core]",

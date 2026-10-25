@@ -20,7 +20,8 @@ Env: ``UNSLOTH_DISABLE_VENDORED_FLA=1`` never injects (an installed fla is untou
 an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VENDORED_FLA=1``;
 ``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640);
 ``UNSLOTH_GDN_BACKEND=flashqla`` sends supported chunk_gated_delta_rule calls to FlashQLA (``pip install flash-qla``);
-on SM120 only with ``UNSLOTH_FLASHQLA_ALLOW_SM120=1`` (QwenLM/FlashQLA#35).
+on SM120 only with ``UNSLOTH_FLASHQLA_ALLOW_SM120=1`` (QwenLM/FlashQLA#35);
+``UNSLOTH_KDA_SAFE_GATE=0`` keeps GLM-5.3-Flash's bounded KDA gates off fla's safe_gate path.
 Injects only with torch >= 2.7, triton >= 3.3 and CUDA.
 """
 
@@ -806,6 +807,139 @@ def _alias_missing_gated_delta_names():
     return tuple(added)
 
 
+# GLM-5.3-Flash (glm5_next) bounds its KDA forget gate: Glm5NextTextForgetGate returns
+# config.linear_lower_bound * sigmoid(.), in [linear_lower_bound, 0] (-5 in the released config).
+# For such gates fla's chunk_kda(safe_gate=True) computes the 16x16 intra-chunk diagonal blocks on
+# tensor cores instead of token by token (1.2x KDA fwd + bwd on A100 at 64 heads, T = 8192).
+# Kimi-Linear's gate is unbounded (-exp(A_log) * softplus(.)), so only glm5_next is patched: each
+# Glm5NextTextLinearAttention records config.linear_lower_bound at __init__, and while every
+# glm5_next layer built so far shares one bound in fla's accepted [-5, 0), the fla kernel behind
+# glm5_next's kernel-hub chunk_kimi_delta_attention becomes functools.partial(chunk_kda,
+# safe_gate = True, lower_bound = bound). The call path keeps its frames (no new graph breaks).
+# Only on the vendored tree (it carries fla #1242 and #1554, without which the safe_gate dg error
+# is 5e-2 to 2.6e-1), Triton >= 3.6 (bf16x3 backward dots) and SM80+ (T4 is slower with it).
+# UNSLOTH_KDA_SAFE_GATE=0 disables (read when a layer is built).
+_GLM5_NEXT_MODULE = "transformers.models.glm5_next.modeling_glm5_next"
+_KDA_SAFE_GATE_MARK = "_unsloth_kda_safe_gate"
+_KDA_SAFE_GATE_INNER = "_unsloth_kda_inner"
+_KDA_SAFE_GATE_RANGE = (-5.0, 0.0)  # fla chunk_kda only accepts lower_bound in [-5, 0)
+# bound: the engaged lower bound or None; bounds: every glm5_next layer's; layers: engaged builds.
+_kda_safe_gate_state = {"bound": None, "bounds": set(), "layers": 0}
+
+
+def _kda_safe_gate_hardware_ok():
+    """Vendored fla live, Triton >= 3.6, CUDA (not ROCm) and every visible GPU SM80+."""
+    if not _vendored_already_injected():
+        return False
+    try:
+        import torch
+        from fla.utils import TRITON_ABOVE_3_6_0
+        if not TRITON_ABOVE_3_6_0 or getattr(torch.version, "hip", None) is not None:
+            return False
+        n = torch.cuda.device_count()
+        return n > 0 and all(torch.cuda.get_device_capability(i) >= (8, 0) for i in range(n))
+    except Exception:
+        return False
+
+
+def _hub_implementation_cell(wrapper):
+    """The ``implementation`` closure cell of a kernel-hub fallback wrapper, or None."""
+    code = getattr(wrapper, "__code__", None)
+    for name, cell in zip(getattr(code, "co_freevars", ()), getattr(wrapper, "__closure__", None) or ()):
+        if name == "implementation":
+            return cell
+    return None
+
+
+def _glm5_modules():
+    names = [_GLM5_NEXT_MODULE] + sorted(
+        name for name in list(sys.modules)
+        if name.startswith(_UNSLOTH_COMPILED_MODULE_PREFIX) and "glm5_next" in name
+    )
+    return [sys.modules[n] for n in names if sys.modules.get(n) is not None]
+
+
+def _apply_glm5_kda_safe_gate(bound):
+    """Point glm5_next's chunk_kimi_delta_attention at chunk_kda with (bound) or without (None) safe_gate."""
+    applied = 0
+    for module in _glm5_modules():
+        wrapper = getattr(module, "chunk_kimi_delta_attention", None)
+        cell = _hub_implementation_cell(wrapper)
+        if cell is None:
+            continue
+        try:
+            current = cell.cell_contents
+        except ValueError:
+            continue
+        base = getattr(current, _KDA_SAFE_GATE_INNER, current)
+        # Only the fla kernel: the torch fallback (wrapper.__wrapped__) has no safe_gate.
+        if base is getattr(wrapper, "__wrapped__", None) or "safe_gate" not in inspect.signature(base).parameters:
+            continue
+        if bound is None:
+            new = base
+        elif getattr(current, _KDA_SAFE_GATE_MARK, None) == bound:
+            new = current
+        else:
+            new = functools.partial(base, safe_gate = True, lower_bound = bound)
+            setattr(new, _KDA_SAFE_GATE_MARK, bound)
+            setattr(new, _KDA_SAFE_GATE_INNER, base)
+        if new is not current:
+            cell.cell_contents = new
+        applied += 1
+    return applied
+
+
+def _glm5_record_kda_bound(bound):
+    """Called from Glm5NextTextLinearAttention.__init__ with config.linear_lower_bound."""
+    state = _kda_safe_gate_state
+    valid = not isinstance(bound, bool) and isinstance(bound, (int, float))
+    low, high = _KDA_SAFE_GATE_RANGE
+    state["bounds"].add(float(bound) if valid else None)
+    (only,) = state["bounds"] if len(state["bounds"]) == 1 else (None,)
+    enabled = (
+        only is not None and low <= only < high
+        and os.environ.get("UNSLOTH_KDA_SAFE_GATE", "1") != "0"
+        and _kda_safe_gate_hardware_ok()
+    )
+    state["bound"] = only if enabled else None
+    if _apply_glm5_kda_safe_gate(state["bound"]) and enabled:
+        state["layers"] += 1
+        if UNSLOTH_ENABLE_LOGGING and state["layers"] == 1:
+            logger.info(f"Unsloth: GLM-5.3-Flash KDA gates are bounded below by {only}; using fla safe_gate.")
+
+
+def _install_glm5_kda_safe_gate():
+    """Make Glm5NextTextLinearAttention.__init__ record its bound. The modeling module is imported
+    here (~0.1 s) once transformers' modeling_utils is loaded, so the patch never depends on
+    whether the model class was imported before or after this runs."""
+    module = sys.modules.get(_GLM5_NEXT_MODULE)
+    if module is None:
+        if "transformers.modeling_utils" not in sys.modules:
+            return False
+        try:
+            if importlib.util.find_spec("transformers.models.glm5_next") is None:
+                return False
+            module = importlib.import_module(_GLM5_NEXT_MODULE)
+        except Exception:
+            return False
+    cls = getattr(module, "Glm5NextTextLinearAttention", None)
+    if cls is None:
+        return False
+    if not getattr(cls.__init__, _KDA_SAFE_GATE_MARK, False):
+        original_init = cls.__init__
+
+        @functools.wraps(original_init)
+        def __init__(self, config, *args, **kwargs):
+            original_init(self, config, *args, **kwargs)
+            _glm5_record_kda_bound(getattr(config, "linear_lower_bound", None))
+
+        setattr(__init__, _KDA_SAFE_GATE_MARK, True)
+        cls.__init__ = __init__
+    # A repair may have rebuilt the wrapper: re-apply the current choice to it.
+    _apply_glm5_kda_safe_gate(_kda_safe_gate_state["bound"])
+    return True
+
+
 # Kernel-hub decorated wrapper -> (fla module, kernel). causal_conv1d is not vendored.
 _KERNEL_HUB_DECORATED = {
     "torch_chunk_gated_delta_rule": ("fla.ops.gated_delta_rule", "chunk_gated_delta_rule"),
@@ -823,7 +957,8 @@ def _resolved_implementation(wrapper):
         except ValueError:
             continue
         if callable(value):
-            return value
+            # glm5_next's safe_gate partial: report the fla kernel it wraps.
+            return getattr(value, _KDA_SAFE_GATE_INNER, value)
     return None
 
 
@@ -1218,6 +1353,12 @@ def patch_vendor_fla(phase=None):
             except Exception as e:
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
+            # After the repair, which may rebuild glm5_next's chunk_kimi_delta_attention.
+            try:
+                _install_glm5_kda_safe_gate()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: could not route GLM-5.3-Flash KDA to fla safe_gate: {e}")
 
 
 def _patch_vendor_fla(phase=None):

@@ -54,7 +54,7 @@ from torch import nn
 from transformers import Trainer, TrainingArguments
 
 from .trainer import token_average_scale
-from .capture import resolve_text_parts, run_frozen_target
+from .capture import effective_lm_head_weight, resolve_text_parts, run_frozen_target
 
 # Target text model_types where llama.cpp exposes layer inputs (`t_layer_inp`) AND vLLM 0.31
 # implements SupportsEagle3. Mistral checkpoints convert to llama.cpp's llama arch.
@@ -415,7 +415,7 @@ def build_eagle3_drafter(target_model, d2t, t2d, aux_layer_ids = None, dtype = N
     t2d = t2d.bool()
     drafter = Eagle3Drafter(layer_config, int(t2d.sum()), aux, target_hidden_size = text.hidden_size,
                             norm_before_residual = norm_before_residual)
-    lm_weight = parts["lm_head"].weight
+    lm_weight = effective_lm_head_weight(parts["lm_head"])
     with torch.no_grad():
         drafter.d2t.copy_(d2t.long())
         drafter.t2d.copy_(t2d)
@@ -554,7 +554,7 @@ def eagle3_loss(step_logits, teacher_logits, loss_mask, decay = 1.0):
 
 
 def eagle3_chunked_loss(drafter, step_hidden, final_hidden, lm_head_weight, loss_mask, decay = 1.0,
-                        chunk_rows = 1024, normalizer = None):
+                        chunk_rows = 1024, normalizer = None, teacher_logit_softcap = None):
     """`eagle3_loss` from the drafter's hidden states, on supervised rows only, in checkpointed chunks:
     draft and teacher logits never exist for the whole batch ([B, T, Vd] fp32 per step OOMs 24 GB cards).
     `normalizer` (supervised tokens in the whole accumulated batch) replaces the per-microbatch count,
@@ -569,6 +569,8 @@ def eagle3_chunked_loss(drafter, step_hidden, final_hidden, lm_head_weight, loss
         logp = F.log_softmax(drafter.logits(h).float(), dim = -1)
         with torch.no_grad():
             teacher = F.linear(th.to(weight.dtype), weight).to(logp.dtype)
+            if teacher_logit_softcap is not None:
+                teacher = teacher_logit_softcap * torch.tanh(teacher / teacher_logit_softcap)
             p = F.softmax(teacher.float(), dim = -1)
             hits = (logp.argmax(-1) == teacher.argmax(-1)).sum()
         return F.kl_div(logp, p, reduction = "sum"), hits
@@ -643,7 +645,8 @@ class UnslothEagle3Trainer(Trainer):
             p.requires_grad_(False)
         target_model.eval()
         parts = resolve_text_parts(target_model)
-        self._lm_head_weight = parts["lm_head"].weight
+        self._lm_head_weight = effective_lm_head_weight(parts["lm_head"])
+        self._teacher_logit_softcap = getattr(parts["config"], "final_logit_softcapping", None)
         self._num_layers = int(parts["config"].num_hidden_layers)
         model.lm_head.weight.requires_grad_(False)
         if model._embed_weight is None:
@@ -682,7 +685,8 @@ class UnslothEagle3Trainer(Trainer):
         if num_items_in_batch is not None:
             normalizer = torch.as_tensor(num_items_in_batch, device = loss_mask.device, dtype = torch.float32).clamp(min = 1)
         loss_kwargs = dict(final_hidden = captured["final"][:, 1:], lm_head_weight = self._lm_head_weight,
-                           loss_mask = loss_mask, decay = self.args.eagle3_step_decay, normalizer = normalizer)
+                           loss_mask = loss_mask, decay = self.args.eagle3_step_decay, normalizer = normalizer,
+                           teacher_logit_softcap = self._teacher_logit_softcap)
         if isinstance(model, nn.DataParallel):
             # DataParallel scatters forward kwargs along dim 0 and cannot gather Python stats: score after the gather.
             step_hidden = model(aux, input_ids, attention_mask, self.args.eagle3_ttt_steps, return_hidden = True)

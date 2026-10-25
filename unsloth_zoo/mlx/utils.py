@@ -1939,7 +1939,7 @@ def _cce_head_ineligibility(desc):
 
 def _rotate_head_input(head, hidden):
     if getattr(head, "block", 0) and _is_hadamard_packed_linear(head):
-        return _hadamard_pack_module().hadamard_transform(hidden, head.block, head.signs)
+        return _hadamard_rotate(head, hidden)
     return hidden
 
 
@@ -9056,7 +9056,8 @@ def _validate_mlx_image_input(target, has_images):
     if has_images and getattr(target, "_unsloth_supports_images", None) is False:
         name = getattr(target, "_unsloth_modality_model_type", type(target).__name__)
         raise ValueError(
-            f"Unsloth MLX: `{name}` has no vision path; image and video inputs are not supported."
+            getattr(target, "_unsloth_image_input_error", None)
+            or f"Unsloth MLX: `{name}` has no vision path; image and video inputs are not supported."
         )
 
 
@@ -13053,6 +13054,17 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
+def _length_grouped_permutation(length, seed):
+    # unsloth_zoo[mlx] may omit torch; the stdlib fallback is still seed-only, so DDP ranks agree.
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        indices = list(range(length))
+        random.Random(3407 if seed is None else int(seed)).shuffle(indices)
+        return indices
+    return _torch_randperm_order(length, seed)
+
+
 def _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum):
     """Translate fractional epochs into HF-style accumulation windows."""
     accum = max(1, int(grad_accum or 1))
@@ -13132,6 +13144,47 @@ def _finite_batch_schedule(
                 break
         epoch += 1
     return tuple(schedule), cycle_length
+
+
+def _text_row_length(row):
+    if isinstance(row, (tuple, list)) and row and isinstance(row[0], (tuple, list)):
+        return len(row[0])
+    return len(row)
+
+
+def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
+    # transformers.trainer_pt_utils.get_length_grouped_indices.
+    n = len(lengths)
+    if n == 0:
+        return []
+    if mega_batch_mult is None:
+        mega_batch_mult = min(n // (batch_size * 4), 50) if batch_size > 0 else 1
+        if mega_batch_mult == 0:
+            mega_batch_mult = 1
+
+    indices = _length_grouped_permutation(n, seed)
+    megabatch_size = max(1, mega_batch_mult * batch_size)
+    megabatches = [
+        indices[i : i + megabatch_size] for i in range(0, n, megabatch_size)
+    ]
+    megabatches = [
+        sorted(megabatch, key=lambda i: lengths[i], reverse=True)
+        for megabatch in megabatches
+    ]
+
+    megabatch_maximums = [lengths[megabatch[0]] for megabatch in megabatches]
+    max_idx = megabatch_maximums.index(max(megabatch_maximums))
+    megabatches[0][0], megabatches[max_idx][0] = (
+        megabatches[max_idx][0], megabatches[0][0],
+    )
+
+    return [i for megabatch in megabatches for i in megabatch]
+
+
+def _length_grouped_window(local_batch_size, comm_group=None, grad_accum=None):
+    # HF Trainer._get_train_sampler: train_batch_size * gradient_accumulation_steps, over the global batch.
+    global_batch_size = _distributed_global_batch_size(local_batch_size, comm_group)
+    return global_batch_size * max(1, int(grad_accum or 1))
 
 
 def _create_ordered_text_plan(
@@ -13252,6 +13305,12 @@ def _create_ordered_text_plan(
         base_seed = _normalize_seed(seed)
         if dataset_order == "torch_randperm":
             return _torch_randperm_order(len(tokenized), base_seed + epoch)
+        if dataset_order == "length_grouped":
+            return _length_grouped_order(
+                [_text_row_length(row) for row in tokenized],
+                _length_grouped_window(batch_size, comm_group, grad_accum),
+                base_seed + epoch,
+            )
         if dataset_order not in (None, "sequential"):
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
@@ -15079,44 +15138,55 @@ class LoRAPointwiseConv2d(nn.Module):
         return conv
 
 
-def _hadamard_pack_module():
-    """mlx-vlm's Hadamard-packed layer module (Ternary Bonsai 2), once loaded."""
-    module = sys.modules.get("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
-    if isinstance(getattr(module, "HadamardQuantizedLinear", None), type):
-        return module
-    return None
+# mlx-vlm's, and mlx-lm's from 0.32: the same layers and rotation, under different names.
+_HADAMARD_PACK_MODULES = (
+    "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35",
+    "mlx_lm.models.prism_hadamard_qwen35",
+)
+
+
+def _hadamard_pack_modules():
+    """The loaded Hadamard-packed layer modules (Ternary Bonsai 2)."""
+    modules = (sys.modules.get(name) for name in _HADAMARD_PACK_MODULES)
+    return tuple(module for module in modules
+                 if isinstance(getattr(module, "HadamardQuantizedLinear", None), type))
 
 
 def _is_hadamard_packed_linear(module):
-    pack = _hadamard_pack_module()
     # Exact type: the packed embedding subclasses the linear.
-    return pack is not None and type(module) is pack.HadamardQuantizedLinear
+    return any(type(module) is pack.HadamardQuantizedLinear for pack in _hadamard_pack_modules())
+
+
+def _hadamard_rotate(layer, x, inverse=False):
+    pack = sys.modules[type(layer).__module__]
+    rotate = getattr(pack, "hadamard_transform", None) or pack.hadamard_rotate
+    return rotate(x, layer.block, layer.signs, inverse=inverse)
 
 
 def _hadamard_dense_weight(layer):
     """The float32 dense weight a Hadamard-packed layer encodes, in the unrotated basis."""
     weight = mx.dequantize(
         layer.weight, layer.scales, layer.biases,
-        group_size=layer.group_size, bits=layer.bits, mode=layer.mode,
+        group_size=layer.group_size, bits=layer.bits, mode=getattr(layer, "mode", "affine"),
     ).astype(mx.float32)
     if layer.block:
-        weight = _hadamard_pack_module().hadamard_transform(
-            weight, layer.block, layer.signs, inverse=True,
-        )
+        weight = _hadamard_rotate(layer, weight, inverse=True)
     return weight
 
 
 def _unpack_hadamard_modules(model):
-    pack = _hadamard_pack_module()
-    if pack is None:
+    packs = _hadamard_pack_modules()
+    linears = tuple(pack.HadamardQuantizedLinear for pack in packs)
+    embeddings = tuple(pack.HadamardQuantizedEmbedding for pack in packs)
+    if not packs:
         return False
     dense = []
     for name, module in model.named_modules():
-        if not isinstance(module, pack.HadamardQuantizedLinear):
+        if not isinstance(module, linears):
             continue
         weight = _hadamard_dense_weight(module).astype(module.scales.dtype)
         rows, width = weight.shape
-        if isinstance(module, pack.HadamardQuantizedEmbedding):
+        if isinstance(module, embeddings):
             layer = nn.Embedding(rows, width)
         else:
             layer = nn.Linear(width, rows, bias=False)
@@ -15152,7 +15222,7 @@ class LoRAHadamardLinear(nn.Module):
     @staticmethod
     def from_base(linear, r=8, dropout=0.0, scale=20.0):
         if not LoRAHadamardLinear.supports(linear):
-            raise ValueError("LoRA requires mlx-vlm's HadamardQuantizedLinear.")
+            raise ValueError("LoRA requires a HadamardQuantizedLinear.")
         output_dims, packed_dims = linear.weight.shape
         input_dims = packed_dims * 32 // linear.bits
         module = LoRAHadamardLinear()
@@ -15478,9 +15548,12 @@ def _lora_module_types(model):
         if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
             continue
         base_linear = getattr(module, "linear", None)
+        module_type = type(module)
+        if getattr(module_type, "_unsloth_mlx_qat_active", False):
+            module_type = module_type.__base__  # QAT forward subclass, see mlx/qat.py
         if (
-            type(module) is LoRALinear
-            or (DoRALinear is not None and type(module) is DoRALinear)
+            module_type is LoRALinear
+            or (DoRALinear is not None and module_type is DoRALinear)
         ) and type(base_linear) in (nn.Linear, nn.QuantizedLinear):
             wrapped[name] = "linear"
         else:
@@ -18556,6 +18629,8 @@ _MODEL_WEIGHT_SUFFIXES = (
     ".pth",
 )
 _MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
+# Merged saves emit MLX weights, so a copied GPTQ/AWQ descriptor would mis-detect the export as packed.
+_PACKED_QUANT_SIDECARS = frozenset({"quantize_config.json", "quant_config.json"})
 
 
 def _asset_link_stays_in_the_model(file, source):
@@ -18582,6 +18657,23 @@ def _asset_link_stays_in_the_model(file, source):
         return any(target.is_relative_to(root) for root in roots)
     except OSError:
         return False
+
+
+@contextlib.contextmanager
+def _detached_detokenizer(processor):
+    """Without mlx-vlm's attached streaming detokenizer: transformers deep-copies a processor's
+    attributes to serialize it, and the naive one (tiktoken tokenizers, e.g. Kimi) cannot be copied."""
+    detokenizer = vars(processor).pop("detokenizer", None) if hasattr(processor, "__dict__") else None
+    try:
+        yield
+    finally:
+        if detokenizer is not None:
+            processor.detokenizer = detokenizer
+
+
+def _save_tokenizer(tokenizer, path):
+    with _detached_detokenizer(tokenizer):
+        tokenizer.save_pretrained(str(path))
 
 
 def _save_vlm_processor_assets(processor, path, sources=()):
@@ -18648,7 +18740,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
         try:
             with tempfile.TemporaryDirectory() as staging:
                 try:
-                    save(staging)
+                    with _detached_detokenizer(component):
+                        save(staging)
                 except Exception as error:
                     failures.append(f"{type(component).__name__}: {error}")
                     success = False
@@ -18722,6 +18815,8 @@ def _copy_source_sidecars(src_path, path):
             continue
         name = source.name
         if name in _CORE_SAVE_FILENAMES:
+            continue
+        if name in _PACKED_QUANT_SIDECARS:
             continue
         if name.startswith("model-") or name.startswith("pytorch_model"):
             continue
@@ -19037,7 +19132,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
             is_vlm=is_vlm,
         )
 
-    tokenizer.save_pretrained(str(path))
+    _save_tokenizer(tokenizer, path)
 
     src_path = _get_src_path(model)
     if src_path is not None:
@@ -19326,7 +19421,7 @@ def save_pretrained_merged(
         else:
             save_lora_adapters(model, save_directory)
         try:
-            tokenizer.save_pretrained(str(save_directory))
+            _save_tokenizer(tokenizer, save_directory)
         except Exception:
             pass
     else:
@@ -19926,6 +20021,7 @@ def save_pretrained_gguf(
                 else:
                     os.environ["PYTHONPATH"] = original_pythonpath
 
+        final_ggufs = []
         if to_quantize:
             if not produced_files:
                 raise RuntimeError(
@@ -19957,11 +20053,18 @@ def save_pretrained_gguf(
                     os.remove(stale)
                     print(f"Unsloth: Removed intermediate {Path(stale).name}")
 
-    gguf_files = _exported_gguf_files(save_directory, imatrix_source)
+    # Only what THIS export wrote: a *.gguf already in save_directory (an earlier export, another
+    # model) is not part of it, and push_to_hub_gguf publishes exactly this list.
+    written = {os.path.abspath(f) for f in (*produced_files, *final_ggufs) if os.path.isfile(f)}
+    gguf_files = [
+        f for f in _exported_gguf_files(save_directory, imatrix_source)
+        if os.path.abspath(f) in written
+    ]
     for f in gguf_files:
         size_gb = f.stat().st_size / (1024**3)
         print(f"Unsloth: Saved {f.name} ({size_gb:.2f} GB)")
     print(f"Unsloth: GGUF export complete -> {save_directory}")
+    return {"gguf_files": [str(f) for f in gguf_files]}
 
 
 _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE = "Trained with Unsloth"
@@ -20138,7 +20241,7 @@ def push_to_hub_gguf(
 
     save_directory = Path(save_directory)
 
-    save_pretrained_gguf(
+    result = save_pretrained_gguf(
         model,
         tokenizer,
         save_directory,
@@ -20147,6 +20250,7 @@ def push_to_hub_gguf(
         token=token,
         imatrix_file=imatrix_file,
     )
+    reported = result.get("gguf_files") if isinstance(result, dict) else None
 
     api = HfApi(token=token)
     # Same fail-loud private=True rule as the LoRA / merged paths so a
@@ -20158,6 +20262,9 @@ def push_to_hub_gguf(
         os.path.expanduser(os.fspath(imatrix_file))
         if isinstance(imatrix_file, (str, os.PathLike)) else None,
     )
+    if reported:
+        reported = {os.path.abspath(f) for f in reported}
+        gguf_files = [f for f in gguf_files if os.path.abspath(f) in reported]
     for gguf_file in gguf_files:
         api.upload_file(
             path_or_fileobj=str(gguf_file),

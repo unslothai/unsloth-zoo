@@ -112,6 +112,12 @@ try:
 except Exception:
     _triton_grouped_mm = _triton_grouped_mm_wanted = None
 
+try:
+    from .moe_router_triton import fused_route_or_none as _fused_route_or_none
+except Exception:
+    def _fused_route_or_none(*args, **kwargs):
+        return None
+
 # Hot-path helpers are read as module attributes (one lookup per call, no import machinery);
 # monkeypatching moe_utils / gpt_oss_grouped_qlora still reaches them.
 try:
@@ -140,8 +146,8 @@ def _view_weight_ok(w):
     if w.stride() != (K * N, 1, K) or (K * n) % 16 or (K * N * n) % 16:
         return False
     try:
-        from .moe_utils import _transposed_view_grouped_mm_is_safe
-        return bool(_transposed_view_grouped_mm_is_safe())
+        from .moe_utils import _transposed_view_safe_on
+        return bool(_transposed_view_safe_on(w.device))
     except Exception:
         return False
 
@@ -198,6 +204,9 @@ def _expert_weight(lin, dtype):
 
 def _route_softmax_topk(self, router_logits, top_k):
     """softmax(fp32) -> top_k -> optional renorm (Mixtral has no norm_topk_prob attr -> True)."""
+    fused = _fused_route_or_none(router_logits, top_k, "softmax_topk", bool(getattr(self, "norm_topk_prob", True)))
+    if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1: one Triton launch, same ids / weights / grads
+        return fused
     rw = F.softmax(router_logits, dim=1, dtype=torch.float32)
     rw, sel = torch.topk(rw, top_k, dim=-1)
     if getattr(self, "norm_topk_prob", True):
@@ -919,15 +928,12 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     rw, sel = spec[3](self, router_logits, top_k)
     rw = rw.to(dtype)
 
-    flat_e = sel.reshape(-1)
     flat_w = rw.reshape(-1)
     tok_of_pair = torch.arange(T, device=dev).repeat_interleave(top_k)
-    # int64 matches what bincount returned, so cumsum is unchanged.
-    counts = _moe_utils.count_tokens_per_expert(flat_e, num_experts, torch.int64)
-    order = torch.argsort(flat_e, stable=True)
+    # Same offsets as the int64 count + cumsum this replaced (counts < 2**31).
+    _, order, offsets = _moe_utils.moe_routing_sort(sel, num_experts)
     sorted_tok = tok_of_pair[order]
     sorted_w = flat_w[order]
-    offsets = torch.cumsum(counts, dim=0).to(torch.int32)
     permuted = hidden_states[sorted_tok]
 
     recompute = getattr(self, "_moe_recompute", False)
@@ -1048,6 +1054,7 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lo
         cache = os.environ.get("UNSLOTH_MOE_GROUPED_CACHE") == "1"
     n = 0
     warmed = False
+    warmed_devices = set()
     for module in model.modules():
         spec = _block_is_eligible(module)
         if spec is None:
@@ -1076,6 +1083,20 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lo
                 _transposed_view_grouped_mm_is_safe()
             except Exception:
                 pass
+        # Same for each other card these experts sit on (device_map="auto" over two GPU models):
+        # only cards holding experts are probed.
+        try:
+            device = next(module.parameters()).device
+        except Exception:
+            device = None
+        if device is not None and device.type in ("cuda", "xpu") and device not in warmed_devices:
+            warmed_devices.add(device)
+            try:
+                from .moe_utils import _grouped_mm_supported_on, _transposed_view_safe_on
+                _grouped_mm_supported_on(device)
+                _transposed_view_safe_on(device)
+            except Exception:
+                pass
     if verbose and n:
         print(f"Unsloth: Grouped MoE enabled on {n} block(s) (recompute={recompute}, cache={cache}).", flush=True)
     return n
@@ -1092,6 +1113,17 @@ def auto_enable_grouped_moe(model):
             enable_grouped_moe(model, verbose=True, stack_lora=True)
     except Exception:
         pass  # optional speedup; never block model loading
+    try:   # stacked experts on another GPU model: probe that card now, not first inside a compiled forward
+        if model is not None and hasattr(model, "modules"):
+            from .moe_experts_interface import warm_moe_probes_on_expert_devices
+            warm_moe_probes_on_expert_devices(model)
+    except Exception:
+        pass
+    try:   # UNSLOTH_MOE_FUSED_ROUTER=1: routers re-created by the compiler
+        from .moe_router_triton import enable_fused_router
+        enable_fused_router(model)
+    except Exception:
+        pass
     try:
         # gpt-oss experts have their own grouped path (no torch._grouped_mm needed on fp16).
         if model is not None and hasattr(model, "modules"):

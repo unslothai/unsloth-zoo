@@ -19,8 +19,11 @@
 from __future__ import annotations
 
 import copy
+import gc
 import importlib
 import json
+import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -52,6 +55,7 @@ __all__ = [
     "SpeculativeEngine",
     "StepOutput",
     "companion_drafter",
+    "has_native_mtp_head",
     "install_speculative_seam",
     "native_mtp_drafter",
     "probe_drafter",
@@ -149,14 +153,29 @@ class _Ema:
         rate = max(alpha, 1.0 / self.count)
         self.value = sample if self.value is None else self.value + rate * (sample - self.value)
 
+    def update_time(self, sample: float, alpha: float) -> None:
+        """``update`` for a duration: one-off work (a first-use compile, a stall) inflates a sample, never shrinks it,
+        so the first two samples keep the faster, and later ones count at most twice the estimate."""
+        if self.count == 1:
+            self.count, self.value = 2, min(self.value, sample)
+            return
+        if self.count > 1:
+            sample = min(sample, 2.0 * self.value)
+        self.update(sample, alpha)
+
 
 class ReplyStats:
     """One reply's acceptance, seeded from what the load has seen so far."""
 
+    # A bare prior weighs as a few samples, so it yields to a reply's first rounds but not to one of them.
+    PRIOR_SAMPLES = 3
+
     def __init__(self, draft: list[_Ema], copy: _Ema, backoff: int, weight: int = 1):
-        self.draft = [_Ema(ema.value, weight) for ema in draft]
+        seed = lambda ema: _Ema(ema.value, min(weight, max(self.PRIOR_SAMPLES, ema.count)))
+        self.draft = [seed(ema) for ema in draft]
         self.draft_seen = [ema.count > 1 for ema in draft]
-        self.copy = _Ema(copy.value, weight)
+        self.copy = seed(copy)
+        self.load_draft, self.load_copy = draft, copy
         self.tokens = 0
         # Per source: the doubling back-off, and the token count to retry an unused source at.
         self.backoff = {"copy": backoff, "draft": backoff}
@@ -168,12 +187,25 @@ class ReplyStats:
             return self.draft[position].value
         return min(self.draft[position].value, self.draft_rate(position - 1))
 
-    def expected(self, row: RowPlan) -> float:
+    def expected(self, row: RowPlan, optimism: float = 0.0) -> float:
+        """Expected emitted tokens; ``optimism`` > 0 takes each rate at that many standard errors above, on the load's samples."""
         expected, reach = 1.0, 1.0
         for position in range(row.length):
-            reach *= self.draft_rate(position) if row.source == "draft" else self.copy.value
+            if row.source == "draft":
+                rate, samples = self.draft_rate(position), self.load_draft[position].count
+            else:
+                rate, samples = self.copy.value, self.load_copy.count
+            reach *= _upper(rate, samples, optimism) if optimism else rate
             expected += reach
         return expected
+
+
+def _upper(rate: float, samples: int, z: float) -> float:
+    # Wilson score bound, which stays below 1 and needs few samples to rule out a rate near 0.
+    samples, z2 = max(samples, 1), z * z
+    centre = rate + z2 / (2 * samples)
+    spread = z * (rate * (1.0 - rate) / samples + z2 / (4 * samples * samples)) ** 0.5
+    return min(1.0, (centre + spread) / (1.0 + z2 / samples))
 
 
 @dataclass
@@ -222,6 +254,7 @@ class DraftController:
         cost_alpha: float = 0.2,
         hysteresis: float = 1.03,
         plain_margin: float = 1.05,
+        optimism: float = 2.0,
         probe_margin: float = 1.15,
         probe_every: int = 64,
         probe_rounds: int = 3,
@@ -246,6 +279,7 @@ class DraftController:
         self.cost_alpha = cost_alpha
         self.hysteresis = hysteresis
         self.plain_margin = plain_margin
+        self.optimism = optimism
         self.probe_margin = probe_margin
         self.probe_every = probe_every
         self.probe_rounds = probe_rounds
@@ -320,7 +354,13 @@ class DraftController:
         return max(anchor[1] + slope * (key - anchor[0]), 1e-9)
 
     def _measured(self, table: dict[int, _Ema]) -> list[tuple[int, float]]:
-        return [(key, ema.value) for key, ema in sorted(table.items()) if ema.value is not None]
+        points = [(key, ema.value) for key, ema in sorted(table.items()) if ema.value is not None]
+        once = {key for key, ema in table.items() if ema.value is not None and ema.count < 2}
+        if not once or len(once) == len(points):
+            return points
+        # A key timed once may have paid one-off work: it counts no more than its confirmed neighbours predict.
+        confirmed = [point for point in points if point[0] not in once]
+        return [(key, min(value, self._extrapolate(confirmed, key, 0.0)) if key in once else value) for key, value in points]
 
     def _verify_seconds(self, bucket: int, width: int) -> float:
         step = self._plain_step(bucket)
@@ -353,10 +393,10 @@ class DraftController:
         drafting = sum(self._row_seconds(row, state) for row, state in zip(plan.rows, rows))
         return self._verify_seconds(bucket, width or plan.width) + self._drafting_paid(bucket, drafting)
 
-    def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
+    def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None, optimism: float = 0.0) -> float:
         if plan.kind == "plain":
             return len(rows) / self._plain_step(_bucket(len(rows)))
-        expected = sum(state.stats.expected(row) for row, state in zip(plan.rows, rows))
+        expected = sum(state.stats.expected(row, optimism) for row, state in zip(plan.rows, rows))
         return expected / self.round_seconds(plan, rows, width)
 
     @staticmethod
@@ -440,7 +480,7 @@ class DraftController:
             # The deepest affordable draft probe: a full-depth one may not fit the credit a reply earns.
             for depth in range(self.max_depth, 1, -1) or [self.max_depth]:
                 probe, sources = self._source_probe(chosen, rows, depth)
-                if sources and self._affordable(probe, chosen, rows):
+                if sources and (self._affordable(probe, chosen, rows) or self._unmeasured(sources)):
                     chosen, self._probing_sources, self._reference = probe, sources, self.score(chosen, rows)
                     break
                 if "draft" not in sources.values():
@@ -464,11 +504,11 @@ class DraftController:
 
     def _measured_parts(self, plan: RoundPlan, rows: Sequence[RowState]) -> bool:
         verify = self.verify_cost.get(_bucket(len(rows)), {}).get(plan.width)
-        if verify is None or verify.value is None:
+        if verify is None or verify.count < 2:
             return False
         for row, state in zip(plan.rows, rows):
             if row.source == "draft":
-                if self.draft_cost[row.length].value is None:
+                if self.draft_cost[row.length].count < 2:
                     return False
                 if state.catch_up and self.catch_up_cost.value is None:
                     return False
@@ -483,9 +523,15 @@ class DraftController:
                 self._reference = max(self.score(plan, rows) for plan in candidates)
                 return self._shorten(probe), True
             self._probe_left = 0
-        best = max(candidates, key = lambda plan: self._worth(plan, rows))
+        # Plain decoding samples no acceptance, so it must beat drafting at the rates the load's samples still allow.
+        rounds = [plan for plan in candidates if plan.kind == "round"]
+        doubt = 1.0 if not rounds else (
+            max(self.score(plan, rows) for plan in rounds) / max(self.score(plan, rows, optimism = self.optimism) for plan in rounds)
+        )
+        worth = lambda plan: self._worth(plan, rows) * (doubt if plan.kind == "plain" else 1.0)
+        best = max(candidates, key = worth)
         current = next((p for p in candidates if self._identity(p, bucket) == self._current), None)
-        if current is not None and self._worth(best, rows) < self._worth(current, rows) * self.hysteresis:
+        if current is not None and worth(best) < worth(current) * self.hysteresis:
             best = current
         if self.steps >= self._next_probe:
             self._next_probe = self.steps + self.probe_every
@@ -541,6 +587,10 @@ class DraftController:
     def _affordable(self, probe: RoundPlan, best: RoundPlan, rows: Sequence[RowState], rounds: int = 1) -> bool:
         return self._regret(probe, best, rows) * rounds <= self._credit
 
+    def _unmeasured(self, sources: dict[int, str]) -> bool:
+        # A source the load never measured loses only by its prior, so its first probe waits for no credit.
+        return any((self.copy_acceptance if source == "copy" else self.draft_acceptance[0]).count <= 1 for source in sources.values())
+
     def _account(self, emitted: int, seconds: float, charged: float | None = None) -> None:
         self._credit += self.explore_fraction * seconds
         if self._reference is not None:
@@ -567,7 +617,7 @@ class DraftController:
         """Whether copies now on offer are worth ending a plain window early for."""
         plain_plan = RoundPlan("plain", 1)
         probe, sources = self._source_probe(plain_plan, rows)
-        if "copy" in sources.values() and self._affordable(probe, plain_plan, rows):
+        if "copy" in sources.values() and (self._affordable(probe, plain_plan, rows) or self._unmeasured(sources)):
             return True
         if not any(state.copy_available for state in rows):
             return False
@@ -585,7 +635,7 @@ class DraftController:
             return
         bucket = _bucket(len(rows))
         if step_seconds is not None:
-            self.plain_cost.setdefault(bucket, _Ema()).update(step_seconds, self.cost_alpha)
+            self.plain_cost.setdefault(bucket, _Ema()).update_time(step_seconds, self.cost_alpha)
         for state in rows:
             state.stats.tokens += steps
         self.tokens += steps * len(rows)
@@ -603,11 +653,13 @@ class DraftController:
         seconds: float,
         draft_seconds: float = 0.0,
         catch_up_seconds: float = 0.0,
+        first_use: bool = False,
     ) -> None:
         """Account a finished round; ``accepted[i]`` counts row ``i``'s accepted drafts.
 
         ``seconds`` is the whole round. A split round times its parts apart; a fused round,
         whose drafting overlaps building its verify, measures how much of the drafting it hid.
+        A ``first_use`` round, which also ran one-off first-use work, updates no cost and leaves its width unmeasured.
         """
         bucket = _bucket(len(rows))
         alpha = self.acceptance_alpha
@@ -636,29 +688,31 @@ class DraftController:
             if row.source in stats.probe_at:
                 stats.probe_at[row.source] = stats.tokens + stats.backoff[row.source]
         self._probing_sources, self._reference = {}, None
+        self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
+        if first_use:
+            return
 
         depths = [row.length for row in plan.rows if row.source == "draft" and row.length]
         catch_up = sum(state.catch_up for row, state in zip(plan.rows, rows) if row.source == "draft")
         verify = self.verify_cost.setdefault(bucket, {}).setdefault(plan.width, _Ema())
         if plan.split:
             self._since_split = 0
-            verify.update(max(seconds - draft_seconds - catch_up_seconds, 1e-9), self.cost_alpha)
+            verify.update_time(max(seconds - draft_seconds - catch_up_seconds, 1e-9), self.cost_alpha)
             # Only a round drafting one depth for every row can attribute its drafting time.
             if depths and len(set(depths)) == 1:
-                self.draft_cost[depths[0]].update(draft_seconds / len(depths), self.cost_alpha)
+                self.draft_cost[depths[0]].update_time(draft_seconds / len(depths), self.cost_alpha)
             if catch_up:
-                self.catch_up_cost.update(catch_up_seconds / catch_up, self.cost_alpha)
+                self.catch_up_cost.update_time(catch_up_seconds / catch_up, self.cost_alpha)
         else:
             self._since_split += 1
             drafting = sum(self._draft_seconds(depth) for depth in depths) + catch_up * self._catch_up_seconds()
             if drafting:
-                hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds, 0.0), drafting)
+                hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds + catch_up_seconds, 0.0), drafting)
                 self.hidden_drafting.setdefault(bucket, _Ema()).update(hidden, self.cost_alpha)
             else:
-                verify.update(seconds, self.cost_alpha)
+                verify.update_time(seconds, self.cost_alpha)
         if depths and self._warmup and self._warmup[0] >= max(depths):
             self._warmup.pop(0)
-        self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
         self._measured_at[self._identity(plan, bucket)] = self.steps
 
 
@@ -1062,6 +1116,8 @@ class SpeculativeEngine:
         self.controller.record_plain(states, steps, end - start, (end - started) / ran if ran > 0 else None)
 
     def _round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]] | None:
+        from .inference import first_use_work
+
         rows, width = self._rows, plan.width
         proposals = [
             row.proposer.propose(row.tokens, spec.length) if spec.source == "copy" else []
@@ -1071,18 +1127,22 @@ class SpeculativeEngine:
         inputs = mx.array(
             [[row.pending, *proposal] + [row.pending] * (width - 1 - len(proposal)) for row, proposal in zip(rows, proposals)]
         )
-        start = time.perf_counter()
+        start, work = time.perf_counter(), first_use_work()
         depth = max((spec.length for spec in plan.rows if spec.source == "draft"), default = 0)
         draft_rows = [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)]
-        drafts, draft_seconds = None, 0.0
+        drafts, draft_seconds, catch_up_seconds = None, 0.0, 0.0
         if depth:
             with mx.stream(self._stream):
-                # Replay is one head forward, as costly for one pair as for many, so it counts as drafting.
+                # A round's few pairs replay as drafting; a plain window's backlog is replayed and timed apart.
+                if max(len(getattr(row, "tokens", ())) for row in draft_rows) > self.controller.max_depth + 1:
+                    self.drafter.catch_up(self.draft_cache, draft_rows)
+                    mx.synchronize(self._stream)
+                    catch_up_seconds = time.perf_counter() - start
                 self.drafter.catch_up(self.draft_cache, draft_rows)
                 drafts = self.drafter.draft(self.draft_cache, draft_rows, depth, self.cache).astype(inputs.dtype)
                 if plan.split:
                     mx.eval(drafts)
-                    draft_seconds = time.perf_counter() - start
+                    draft_seconds = time.perf_counter() - start - catch_up_seconds
                 else:
                     # The head drafts on the GPU while the host builds the verify graph.
                     mx.async_eval(drafts)
@@ -1155,7 +1215,8 @@ class SpeculativeEngine:
                 self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
             emitted.append(taken)
         self.controller.record_round(
-            plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds
+            plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds,
+            catch_up_seconds = catch_up_seconds, first_use = first_use_work() != work,
         )
         return emitted
 
@@ -1194,7 +1255,7 @@ class SpeculativeDraft:
     @property
     def prompt_tail(self) -> int:
         """How many of the prompt's last hidden states an MTP drafter starts from; other kinds take the whole prompt."""
-        return getattr(self.drafter, "max_lag", 1) if self.drafter is not None and self.draft_kind == "mtp" else 0
+        return getattr(self.drafter, "prompt_tail", 1) if self.drafter is not None and self.draft_kind == "mtp" else 0
 
     def prepare(self, prompt: Sequence[int], sampling: SamplingParams, processors: Sequence[Callable] = ()) -> None:
         self._request = (list(prompt), sampling, list(processors))
@@ -1398,6 +1459,10 @@ class MTPDrafter:
     target hidden ``j``). Plain windows and copy rounds only record pairs; a row replays them just before
     it drafts, so an unused head costs nothing. The engine joins and splits head caches with the target's."""
 
+    # Prompt positions a row starts from: more lifts acceptance on long prompts, but priming time and the
+    # hidden states the prefill keeps grow with it.
+    prompt_tail = 4096
+
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
         from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 
@@ -1422,8 +1487,10 @@ class MTPDrafter:
             self._shortlist.prepare()
         count = 0 if hidden is None else min(int(hidden.shape[1]), len(prompt))
         row = DraftRow(len(prompt) - count)
-        if count:
-            self.push(row, [*prompt[len(prompt) - count + 1 :], pending], hidden[0, -count:])
+        tokens, hidden = [*prompt[len(prompt) - count + 1 :], pending], None if hidden is None else hidden[0, int(hidden.shape[1]) - count :]
+        # max_lag pairs per replay, so a long prompt never runs the head over all of its positions at once.
+        for begin in range(0, count, self.max_lag):
+            self.push(row, tokens[begin : begin + self.max_lag], hidden[begin : begin + self.max_lag])
             self.catch_up(cache, [row])
         return row, cache
 
@@ -1472,6 +1539,7 @@ class MTPDrafter:
                 row.last = last[i : i + 1]
                 row.position += length
                 row.tokens, row.hidden = [], []
+        mx.async_eval(last, *(entry.state for entry in cache))
         return sum(lengths)
 
     def probe(self, hidden: mx.array) -> list:
@@ -1495,22 +1563,15 @@ class MTPDrafter:
         return mx.concatenate(drafts, axis = 1)
 
     def settle(self, cache: list, rows: Sequence[DraftRow | None], appended: int, keep: Sequence[int]) -> list[int]:
-        """Keep each row's first ``keep[i]`` appended entries (its accepted drafts), drop the rest, and
-        return how many pairs each row's head now holds from this round."""
-        trims = [appended - count for count in keep]
-        if len(set(trims)) == 1:
-            if trims[0]:
-                for entry in cache:
-                    entry.trim(trims[0])
-        else:
+        """Drop every entry the round's drafting appended, accepted or not: each paired a draft with the head's own
+        output instead of the target hidden, so accepted drafts are recorded again from the verify forward."""
+        if appended:
             for entry in cache:
-                entry.prepare(right_padding = trims)
-                entry.finalize()
-        for row, count in zip(rows, keep):
+                entry.trim(appended)
+        for row in rows:
             if row is not None:
-                row.position += count
                 row.last = None
-        return list(keep)
+        return [0] * len(rows)
 
 
 class AssistantRow:
@@ -1619,7 +1680,7 @@ class HeadDrafter:
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
         self.model = model
         self.target = target
-        self.max_lag = max_lag
+        self.max_lag = self.prompt_tail = max_lag
 
     def new_cache(self) -> list:
         return []
@@ -1791,12 +1852,30 @@ class ContextDrafter:
         return [0] * len(rows)
 
 
-def _built(wrapper, model: nn.Module, target: nn.Module, **kwargs):
+def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, quantize: bool = False, **kwargs):
+    quantized = any(key.endswith(".scales") for key, _ in tree_flatten(model.parameters()))
+    if quantize and wrapper in (MTPDrafter, ContextDrafter) and not quantized and (bits := int(os.environ.get("UNSLOTH_MLX_DRAFTER_BITS", "4"))):
+        # At 4 bits these drafters accept within ~2% of bf16 at under a third of the memory, and verification keeps
+        # the output exact either way. A checkpoint that quantized its drafter chose what to leave in full precision.
+        nn.quantize(model, group_size = 64, bits = bits, class_predicate = lambda name, layer: (
+            hasattr(layer, "to_quantized") and not isinstance(layer, nn.Embedding)
+            and not name.endswith(("mlp.gate", "shared_expert_gate")) and layer.weight.shape[-1] % 64 == 0
+        ))
+        # The replaced layers sit in reference cycles: until collected, their weights would be loaded and kept.
+        gc.collect()
+    if not lazy:
+        # An array at a time, so a lazily loaded drafter quantized above never holds its full-precision weights whole.
+        for _, value in tree_flatten(model.parameters()):
+            mx.eval(value)
     # Counted before the wrapper binds the target (a bound DFlash drafter holds its embedding and head); ``lazy``
     # factories evaluate nothing mlx-vlm's loader leaves lazy (it converts ModelOpt/compressed-tensors exports eagerly).
     weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
+    from .inference import fused_drafter_ops
+
+    fused_drafter_ops(model)
     drafter = wrapper(model, target, **kwargs)
     drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
+    target._unsloth_speculates = True  # so `warm_inference` runs the verify path's first-use checks at load
     return drafter
 
 
@@ -1818,36 +1897,91 @@ def _dense_table(model: nn.Module) -> nn.Module:
 def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter | MTPDrafter | HeadDrafter:
     """A drafter from a separate DFlash, DFlash2, DSpark, EAGLE-3, Gemma 4 assistant or MTP head checkpoint, checked against ``target``."""
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+    from mlx_vlm.utils import get_model_path
 
-    model, kind = load_drafter(str(model_path), lazy = lazy)
+    # Loaded lazily whatever ``lazy`` is, so quantizing reads the full-precision weights only as it goes; mlx-vlm
+    # reads a head out of a whole model's checkpoint eagerly, so only a drafter's own checkpoint is quantized.
+    model, kind = load_drafter(str(model_path), lazy = True)
+    quantize = get_mtp_splitter(source_config = json.loads((get_model_path(str(model_path)) / "config.json").read_text())) is None
     if kind not in ("dflash", "eagle3", "mtp"):
         raise ValueError(f"{kind} companion drafters are not supported")
     validate_drafter_compatibility(target, model, kind)
     if kind == "mtp":
         assistant = str(getattr(model.config, "model_type", "")).endswith("_assistant")
-        return _built(AssistantDrafter, _dense_table(model), target) if assistant else _head_drafter(model, target, **kwargs)
-    return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, **kwargs)
+        return _built(AssistantDrafter, _dense_table(model), target, lazy = lazy) if assistant else _head_drafter(model, target, lazy = lazy, quantize = quantize, **kwargs)
+    return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, lazy = lazy, quantize = quantize, **kwargs)
+
+
+def _checkpoint_keys(path: Path) -> dict[str, Path]:
+    from mlx_vlm.speculative.drafters.mtp_split import _safetensor_files, _weight_map
+    from safetensors import safe_open
+
+    if weight_map := _weight_map(path):
+        return {key: path / file for key, file in weight_map.items()}
+    keys = {}
+    for file in _safetensor_files(path):
+        with safe_open(file, framework = "mlx") as handle:
+            keys.update(dict.fromkeys(handle.keys(), file))
+    return keys
+
+
+def _native_mtp_head(path: Path) -> tuple | None:
+    """``(splitter, source_config, text_config, prefix, [(file, keys)])`` for a checkpoint's own MTP head, or None. The head
+    is the splitter's own layout, at the top level or under one ``model.``/``language_model.`` wrapper, where MLX
+    conversions of vision-language checkpoints keep it (``language_model.mtp.*``); ``prefix`` is that wrapper."""
+    from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+
+    try:
+        source_config = json.loads((path / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    splitter = get_mtp_splitter(source_config = source_config)
+    if splitter is None:
+        return None
+    text_config = splitter.read_text_config(source_config)
+    if selected := list(splitter.iter_selected(path, text_config)):
+        return splitter, source_config, text_config, "", selected
+    nested = {}
+    for key, file in _checkpoint_keys(path).items():
+        wrapper = re.match(r"(?:(?:model|language_model)\.)+", key)
+        parts = wrapper.group().split(".")[:-1] if wrapper else []
+        for prefix in (".".join(parts[:end]) + "." for end in range(1, len(parts) + 1)):
+            if splitter.select_keys(key[len(prefix) :], text_config):
+                nested.setdefault(prefix, {}).setdefault(file, []).append(key)
+                break
+    if len(nested) != 1:
+        return None
+    [(prefix, files)] = nested.items()
+    for name in ("quantization", "quantization_config"):
+        if isinstance(source_config.get(name), dict):
+            # Per-module overrides name the head's modules under the wrapper too.
+            source_config[name] = {key.removeprefix(prefix): value for key, value in source_config[name].items()}
+    return splitter, source_config, text_config, prefix, list(files.items())
+
+
+def has_native_mtp_head(model_path: str | Path) -> bool:
+    """Whether ``native_mtp_drafter`` finds an MTP head in the checkpoint at ``model_path``."""
+    return _native_mtp_head(Path(model_path)) is not None
 
 
 def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
-    """A drafter for the target's own MTP head, built in memory from only the ``mtp.*`` tensors of its
+    """A drafter for the target's own MTP head, built in memory from only the MTP tensors of its
     checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
     from mlx_vlm.fp8 import transform_fp8_weights
-    from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors, detect_mtp_splitter
+    from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors
 
-    path = Path(model_path)
-    splitter = detect_mtp_splitter(path)
-    if splitter is None:
+    head = _native_mtp_head(Path(model_path))
+    if head is None:
         return None
+    splitter, source_config, text_config, prefix, selected = head
     module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
     if not hasattr(module, "Model"):
         raise ValueError(f"mlx-vlm has no drafter for {splitter.output_model_type} MTP heads")
-    source_config = json.loads((path / "config.json").read_text())
-    text_config = splitter.read_text_config(source_config)
     tensors, source_is_mlx = {}, False
-    for file, keys in splitter.iter_selected(path, text_config):
+    for file, keys in selected:
         source_is_mlx = source_is_mlx or (splitter.supports_mlx_source and _is_mlx_safetensors(file))
-        tensors.update(splitter.load_shard(file, keys))
+        tensors.update((key.removeprefix(prefix), value) for key, value in splitter.load_shard(file, keys).items())
     tensors, fp8_quantization = transform_fp8_weights(tensors, source_config)
     if fp8_quantization is not None:
         source_config = {**source_config, "quantization": fp8_quantization}
@@ -1874,10 +2008,8 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool 
             ),
         )
     model.load_weights(list(weights.items()), strict = True)
-    if not lazy:
-        mx.eval(model.parameters())
     from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
 
     if DRAFTER_KIND_BY_MODEL_TYPE.get(splitter.output_model_type) == "dflash":
-        return _built(ContextDrafter, model, target, **kwargs)
-    return _head_drafter(model, target, **kwargs)
+        return _built(ContextDrafter, model, target, lazy = lazy, **kwargs)
+    return _head_drafter(model, target, lazy = lazy, **kwargs)
