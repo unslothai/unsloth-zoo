@@ -39,13 +39,8 @@ def _cpu_fp16_autocast():
 
 
 def _softmax_without_collapse(z, y, keep_logits = False):
-    """softmax(z) with the target column zeroed, log softmax(z)[y] and the shifted target logit, (rows, 1).
-
-    The sum over the other classes is formed apart from the target's exp(0) = 1: when the target
-    leads by more than ~16.6 (fp32), p_t rounds to 1 and log p_t, 1 - p_t read 0 (softmax collapse,
-    arXiv 2610.31642, as fixed in fused_losses/fused_linear.py). z is shifted in place; with
-    keep_logits the exponentials go to a new tensor so the shifted logits survive.
-    """
+    """(softmax(z) with the target column zeroed, log p_t, shifted z_t); shifts z in place.
+    Sums the other classes apart from exp(0) = 1, else p_t rounds to 1 past a ~16.6 lead (softmax collapse, arXiv 2610.31642)."""
     z.sub_(z.amax(-1, keepdim = True))
     target = z.gather(-1, y)
     p = torch.exp(z) if keep_logits else z.exp_()
@@ -84,7 +79,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
             total -= (log_p_target.squeeze(-1) * valid).sum()
             if need_hidden_grad or need_weight_grad:
-                # d/dlogits of sum CE = softmax - onehot on valid rows, zero elsewhere; p_t - 1 = expm1(log p_t).
+                # softmax - onehot on valid rows; p_t - 1 = expm1(log p_t).
                 logits.scatter_(-1, safe_y, torch.expm1(log_p_target))
                 logits.mul_(valid.unsqueeze(-1))
                 if need_hidden_grad:
@@ -133,7 +128,7 @@ def _logprob_piece(hidden, weight, bias, targets, inv_t, softcap, logit_scale, w
     logits = logits * inv_t
     y = targets.unsqueeze(-1)
     target = logits.gather(-1, y).squeeze(-1)
-    # log p_t = -softplus(lse(others) - z_t): its gradient keeps 1 - p_t when the target dominates (softmax collapse).
+    # Softplus form: keeps 1 - p_t past a ~16.6 lead (softmax collapse).
     log_others = torch.logsumexp(logits.scatter(-1, y, float("-inf")), dim = -1)
     log_probs = -F.softplus(log_others - target)
     log_z = target - log_probs
@@ -144,8 +139,7 @@ def _logprob_piece(hidden, weight, bias, targets, inv_t, softcap, logit_scale, w
 
 
 def _transformed_logits(hidden, weight, bias, inv_t, softcap, logit_scale):
-    """The kernel's logits: (hidden @ weight.T + bias) * scale, soft-capped, / temperature (fp32), plus
-    d(final)/d(raw logits) per element, or a scalar when there is no soft cap."""
+    """fp32 (hidden @ W.T + bias) * scale, soft-capped, / temperature, and d(final)/d(raw) (a scalar without a cap)."""
     logits = (hidden @ weight.t()).float()
     if bias is not None:
         logits = logits + bias.float()
@@ -159,21 +153,18 @@ def _transformed_logits(hidden, weight, bias, inv_t, softcap, logit_scale):
 
 
 class _ChunkedLogProbs(torch.autograd.Function):
-    """One pass over the vocabulary per row chunk: log-probs, entropy and the metric extras, plus
-    d(log_prob)/d(hidden), which depends only on its own row, so backward is a per-row rescale.
-    The checkpointed path recomputes the logits in backward and spends another pass on the extras."""
+    """One vocabulary pass per row chunk; d(log_prob)/d(hidden) is per row, so backward only rescales."""
 
     @staticmethod
     def forward(ctx, hidden, weight, bias, targets, inv_t, softcap, logit_scale, rows, outputs, need_grad):
         ctx.set_materialize_grads(False)
         n = hidden.shape[0]
-        # fp16 cannot hold these gradients before GradScaler multiplies them: keep them fp32 until backward.
-        exact = hidden.dtype == torch.float16
+        exact = hidden.dtype == torch.float16  # fp16 gradients overflow before GradScaler: keep them fp32
         grad_lp = torch.empty(hidden.shape, dtype = torch.float32 if exact else hidden.dtype) if need_grad else None
         new = lambda name, dtype = torch.float32: torch.empty(n, dtype = dtype) if name in outputs else None  # noqa: E731
         log_probs, entropy, sq, mean = new("log_probs"), new("entropy"), new("log_sum_sq_probs"), new("mean_logits")
         top1 = new("is_top1", torch.bool)
-        rowdot = lambda x, y: torch.einsum("ij,ij->i", x, y)  # noqa: E731  (a batched dot, no [rows, V] temporary)
+        rowdot = lambda x, y: torch.einsum("ij,ij->i", x, y)  # noqa: E731
         for start in range(0, n, rows):
             end = min(start + rows, n)
             y = targets[start:end].unsqueeze(-1)
@@ -181,19 +172,16 @@ class _ChunkedLogProbs(torch.autograd.Function):
             if mean is not None:
                 mean[start:end] = z.mean(-1)
             if top1 is not None:
-                # First-argmax, like the kernel's `target >= max and target > max before it`.
                 top1[start:end] = z.argmax(-1) == targets[start:end]
-            # The entropy still needs the shifted logits; otherwise exponentiate in place.
             p, log_p, target = _softmax_without_collapse(z, y, keep_logits = entropy is not None)
             log_probs[start:end] = log_p.squeeze(-1)
             p_target = torch.exp(log_p).squeeze(-1)  # p's target column is zero
             if entropy is not None:
-                # H = -sum p log p = log(total) - sum p * shifted, log(total) = shifted target - log p_t.
+                # H = log(total) - sum p * z, the target term apart.
                 entropy[start:end] = (target - log_p).squeeze(-1) - rowdot(p, z) - p_target * target.squeeze(-1)
             if sq is not None:
                 sq[start:end] = torch.log(rowdot(p, p) + p_target * p_target)
             if need_grad:
-                # d log_softmax(z)[y] / dz = onehot(y) - p, then through the scale / soft cap / temperature.
                 p.neg_().scatter_(-1, y, -torch.expm1(log_p))
                 if not (isinstance(slope, float) and slope == 1.0):
                     p.mul_(slope)
@@ -217,8 +205,7 @@ class _ChunkedLogProbs(torch.autograd.Function):
         if d_log_probs is not None:
             dh += grad_lp * d_log_probs.to(grad_lp.dtype).unsqueeze(-1)
         if d_entropy is not None and bool(torch.any(d_entropy != 0)):
-            # Entropy is a metric in TRL's SFT loss; when something does backpropagate through it,
-            # recompute: dH/dz = -p (z - E_p[z]).
+            # Entropy is only a metric in TRL SFT: recompute dH/dz = -p (z - E_p[z]) when it gets a gradient.
             inv_t, softcap, logit_scale, rows = ctx.args
             for start in range(0, hidden.shape[0], rows):
                 end = min(start + rows, hidden.shape[0])
@@ -260,15 +247,12 @@ def _checkpointed_log_probs(hidden, weight, bias, targets, inv_t, softcap, logit
 
 def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size,
                           final_logit_softcapping = None, logit_scale = 1.0, outputs = _LOGPROB_OUTPUTS):
-    """Torch twin of TRL's Triton `ChunkedLogProbFunction` (the fused LM head SFTTrainer uses from
-    TRL 1.x): per-token log-probabilities of hidden @ weight.T and the requested extras, for devices
-    the kernel cannot run on. Works in row chunks, so no [N, V] logits stay alive."""
+    """Torch twin of TRL 1.x's Triton fused-LM-head `ChunkedLogProbFunction`, in row chunks (no [N, V] logits)."""
     if torch.is_autocast_enabled(hidden.device.type):
         dtype = torch.get_autocast_dtype(hidden.device.type)
         hidden, weight = hidden.to(dtype), weight.to(dtype)
         bias = bias.to(dtype) if bias is not None else None
     if hidden.shape[0] == 0:
-        # Every label masked: empty outputs, log-probs still attached to the graph (a differentiable zero).
         empty = (hidden @ weight.t()).float().sum(-1) * 0
         pick = lambda name, value: value if name in outputs else None  # noqa: E731
         return (empty, pick("entropy", empty), pick("log_sum_sq_probs", empty.detach()),
@@ -319,8 +303,7 @@ def patch_trl_fused_lm_head():
 
 
 class _Bf16StoredLinearFunction(torch.autograd.Function):
-    """F.linear with a bf16-stored frozen weight upcast to the activation dtype. Saves the bf16 weight, not
-    the upcast copy, and backward needs only dX = dY @ W."""
+    """F.linear with a frozen bf16 weight upcast per call; saves the bf16 weight, backward is dX = dY @ W."""
 
     @staticmethod
     def forward(ctx, x, weight, bias):
@@ -339,15 +322,12 @@ class Bf16StoredLinear(torch.nn.Linear):
     def forward(self, x):
         trainable = self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad)
         if self.weight.dtype == x.dtype or (trainable and torch.is_grad_enabled()):
-            # A trainable weight or bias (LoRA bias = "all" / "lora_only"), or an already upcast copy such
-            # as a merged fp32 model: plain autograd.
+            # Trainable weight / bias (LoRA bias="all") or an upcast copy (merged fp32): plain autograd.
             return F.linear(x, self.weight.to(x.dtype), self.bias)
         return _Bf16StoredLinearFunction.apply(x, self.weight, self.bias)
 
 
-# Projections that transformers always calls as modules. Some architectures read a Linear's .weight
-# directly (Mamba dt_proj, Nemotron-H out_proj, MLA absorbed weights), which a bf16 weight next to fp32
-# activations would break, so only these names are converted.
+# Only projections always called as modules: Mamba dt_proj, Nemotron-H out_proj, MLA read .weight directly.
 _BF16_STORED_PROJECTIONS = frozenset((
     "q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj", "gate_proj", "up_proj", "down_proj", "gate_up_proj",
     "in_proj_qkv", "in_proj_z",
@@ -355,9 +335,7 @@ _BF16_STORED_PROJECTIONS = frozenset((
 
 
 def store_frozen_linears_in_bf16(model):
-    """For fp32 training of a bf16 checkpoint loaded in bf16: keep the attention / MLP projection weights
-    in bf16 (lossless: the checkpoint's own values) and move everything else to fp32. Those frozen
-    weights are most of the model, so resident memory drops by 15-28%."""
+    """fp32 training of a bf16 checkpoint: frozen attention / MLP projections stay bf16 (lossless), the rest fp32."""
     head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
     stored = set()
     for name, module in model.named_modules():
@@ -375,9 +353,7 @@ def store_frozen_linears_in_bf16(model):
 
 
 def cpu_causal_conv1d(hidden_states, weight, bias = None, activation = None, **kwargs):
-    """Causal depthwise conv1d as K shifted multiply-adds. transformers' reference fallback (used without
-    the causal_conv1d package) calls a grouped F.conv1d, whose forward + backward on macOS, where torch has
-    no oneDNN, took 211 ms per Qwen3.5 linear-attention layer against 2-4 ms on Linux: most of the step."""
+    """Causal depthwise conv1d as K shifted multiply-adds: transformers' grouped F.conv1d fallback is slow without oneDNN."""
     x = hidden_states.to(weight.dtype)
     kernel, length = weight.shape[-1], x.shape[-1]
     padded = F.pad(x, (kernel - 1, 0))
@@ -393,9 +369,8 @@ def cpu_causal_conv1d(hidden_states, weight, bias = None, activation = None, **k
 
 
 def patch_causal_conv1d_fallback(model):
-    """Where torch has no oneDNN (the macOS wheels), point every loaded modeling module's `causal_conv1d_fn`
-    (Qwen3.5 / Qwen3-Next style: hidden_states, weight, bias, activation) at cpu_causal_conv1d, after
-    checking both agree on a probe. With oneDNN the grouped conv is faster (19 vs 44 ms at 6144 x 512)."""
+    """Without oneDNN (macOS wheels), route modeling modules' `causal_conv1d_fn(hidden_states, weight, bias,
+    activation)` to cpu_causal_conv1d when a probe agrees; with oneDNN the grouped conv is faster."""
     import inspect
     import sys
     if torch.backends.mkldnn.is_available():
@@ -439,8 +414,7 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
         divisor = num_items_in_batch.item() if torch.is_tensor(num_items_in_batch) else num_items_in_batch
     valid = shift_labels != ignore_index
     if bool(valid.any()) and not bool(valid.all()):
-        # Padding, prompt tokens (train_on_responses_only) and the last position add nothing to the
-        # loss: skip their share of the LM head, the largest matmul of a CPU step for 150k+ vocabularies.
+        # Ignored rows add no loss: skip their share of the LM head.
         rows = valid.nonzero().squeeze(-1)
         hidden, shift_labels = hidden.index_select(0, rows), shift_labels.index_select(0, rows)
     if chunk_rows is None:

@@ -90,9 +90,7 @@ def _compile_layers(model):
 
 
 def _load_msvc_environment():
-    """Windows: Inductor runs `cl` from PATH, which only a Visual Studio Developer Prompt sets up. When
-    Build Tools are installed but not activated, run vcvars64.bat once and take its PATH / INCLUDE /
-    LIB / LIBPATH (as Studio does for XPU Triton). Returns True when cl is reachable afterwards."""
+    """Windows: Inductor needs `cl` on PATH (a Developer Prompt); load vcvars64.bat's environment. True if cl is reachable."""
     import shutil
     import subprocess
     if shutil.which("cl"):
@@ -134,9 +132,7 @@ def _load_msvc_environment():
 
 @functools.cache
 def _cpu_compile_unavailable():
-    """None when Inductor can build and run a CPU kernel here, else why not. Inductor needs a C++
-    compiler at run time (MSVC `cl` on an initialised Windows shell, Xcode clang on macOS, gcc / clang on
-    Linux); without one the first training step would raise instead of falling back."""
+    """None when Inductor can build and run a CPU kernel here (it needs a C++ compiler at run time), else why not."""
     import sys
     if sys.platform == "win32" and not _load_msvc_environment():
         return ("no MSVC: install Visual Studio Build Tools with the C++ workload "
@@ -257,8 +253,6 @@ class FastCPUModel:
         # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
-        # Opt-in for fp32 training: a bf16 checkpoint keeps its frozen Linear weights in bf16 (lossless,
-        # about a quarter less resident memory) while everything trainable and every matmul stays fp32.
         frozen_bf16 = (
             os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "0") == "1" and dtype == torch.float32 and not auto_dtype
             and not use_4bit and not full_finetuning
@@ -550,8 +544,7 @@ def _unpack_encoding_generate(generate):
         set_stance = getattr(torch.compiler, "set_stance", None)
         modules = self.modules() if isinstance(self, torch.nn.Module) else ()
         if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
-            # UNSLOTH_CPU_COMPILE layers are compiled for training; with a KV cache every layer would recompile
-            # (the cache guards on each layer's state) until the recompile limit, costing seconds per layer.
+            # Layers compiled for training would recompile per layer against the KV cache, up to the limit.
             with set_stance("force_eager"):
                 return generate(self, *args, **kwargs)
         return generate(self, *args, **kwargs)

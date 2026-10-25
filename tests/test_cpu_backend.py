@@ -249,7 +249,6 @@ def test_cpu_training_uses_the_fused_adamw_where_torch_has_it(monkeypatch, optim
     try:
         args = trainer.normalize_cpu_training_arguments(SimpleNamespace(use_cpu = True, fp16 = False, bf16 = False, optim = optim))
         assert args.optim == expected
-        # Other optimizers are the caller's choice.
         args = trainer.normalize_cpu_training_arguments(SimpleNamespace(use_cpu = True, fp16 = False, bf16 = False, optim = "sgd"))
         assert args.optim == "sgd"
     finally:
@@ -933,8 +932,7 @@ def test_cpu_fused_lm_head_matches_an_fp64_reference(softcap, temperature, scale
 @pytest.mark.parametrize("softcap, temperature, scale, bias", [(None, 1.0, 1.0, False), (30.0, 0.7, 0.5, True)])
 @pytest.mark.parametrize("entropy_weight", [0.0, 0.1])
 def test_cpu_fused_lm_head_frozen_head_single_pass_matches_fp64(softcap, temperature, scale, bias, entropy_weight):
-    """Frozen LM head (LoRA): the single-pass function's outputs and d/dhidden, with and without a
-    gradient through the entropy, against an fp64 reference; the extras match too."""
+    """Frozen-head single pass: outputs, extras and d/dhidden (with / without an entropy gradient) vs fp64."""
     from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
     torch.manual_seed(0)
     hidden, weight = torch.randn(37, 16) * 2, torch.randn(101, 16) * 0.3
@@ -961,8 +959,7 @@ def test_cpu_fused_lm_head_frozen_head_single_pass_matches_fp64(softcap, tempera
 
 
 def test_cpu_fused_lm_head_single_pass_under_bf16_autocast_and_no_grad():
-    """bf16 autocast (the CPU default on AMX / Arm BF16): gradients close to fp32; under no_grad
-    (evaluate) nothing is kept for backward and only the requested outputs come back."""
+    """bf16 autocast: gradients close to fp32; under no_grad only the requested outputs come back."""
     from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
     torch.manual_seed(0)
     hidden, weight = torch.randn(64, 32), torch.randn(500, 32) * 0.2
@@ -1024,12 +1021,11 @@ def test_cpu_fused_lm_head_with_every_label_masked():
 
 
 def test_bf16_stored_frozen_linear_matches_fp32():
-    """A bf16-stored frozen weight computes exactly what the fp32 copy of the same values computes,
-    returns dX only, and a trainable weight still gets its gradient."""
+    """Bf16StoredLinear equals fp32 on the same values, returns dX only; a trainable weight keeps its gradient."""
     from unsloth_zoo.cpu.ops import Bf16StoredLinear
     torch.manual_seed(0)
     ref = torch.nn.Linear(16, 8)
-    ref.weight.data = ref.weight.data.bfloat16().float()  # values a bf16 checkpoint can hold
+    ref.weight.data = ref.weight.data.bfloat16().float()
     ref.weight.requires_grad_(False)
     ref.bias.requires_grad_(False)
     stored = torch.nn.Linear(16, 8)
@@ -1051,7 +1047,6 @@ def test_bf16_stored_frozen_linear_matches_fp32():
     stored.weight.requires_grad_(True)
     stored(torch.randn(2, 16)).sum().backward()
     assert stored.weight.grad is not None
-    # LoRA bias = "all" / "lora_only": frozen weight, trainable bias.
     stored.weight.requires_grad_(False)
     stored.weight.grad = None
     stored.bias.requires_grad_(True)
@@ -1081,7 +1076,7 @@ def test_store_frozen_linears_in_bf16_keeps_head_and_norms_fp32_and_merges_unrou
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.cpu import loader
     from unsloth_zoo.cpu.ops import Bf16StoredLinear, store_frozen_linears_in_bf16
-    ref = _tiny_llama().bfloat16().float()  # the "checkpoint" values, in fp32
+    ref = _tiny_llama().bfloat16().float()
     model = copy.deepcopy(ref).bfloat16()
     count = store_frozen_linears_in_bf16(model)
     assert count == 7  # q, k, v, o, gate, up, down; lm_head stays a plain fp32 Linear
@@ -1097,7 +1092,6 @@ def test_store_frozen_linears_in_bf16_keeps_head_and_norms_fp32_and_merges_unrou
     merged, _ = loader._merged_copy(lora, "merged_32bit")
     assert all(p.dtype == torch.float32 for p in merged.parameters())
     assert not any(type(m) is Bf16StoredLinear and m.weight.dtype == torch.bfloat16 for m in merged.modules())
-    # The training model is untouched by the merge.
     assert lora.base_model.model.model.layers[0].mlp.up_proj.weight.dtype == torch.bfloat16
 
 
@@ -1161,7 +1155,7 @@ def test_generate_runs_compiled_layers_eagerly(monkeypatch):
     ids = torch.randint(0, 64, (1, 4))
     model.generate(input_ids = ids, max_new_tokens = 2, do_sample = False)
     assert stances == []
-    model.model.layers[0]._compiled_call_impl = model.model.layers[0]._call_impl  # what Module.compile() sets
+    model.model.layers[0]._compiled_call_impl = model.model.layers[0]._call_impl
     model.generate(input_ids = ids, max_new_tokens = 2, do_sample = False)
     assert stances == ["force_eager"]
 
@@ -1188,7 +1182,7 @@ def test_causal_conv1d_fallback_is_patched_only_where_it_agrees(monkeypatch):
     import sys
     import types
     from unsloth_zoo.cpu import ops
-    monkeypatch.setattr(torch.backends.mkldnn, "is_available", lambda: False)  # the macOS wheels
+    monkeypatch.setattr(torch.backends.mkldnn, "is_available", lambda: False)
 
     def reference(hidden_states, weight, bias = None, activation = None, **kwargs):
         out = F.conv1d(hidden_states, weight.unsqueeze(1), bias, padding = weight.shape[-1] - 1,
@@ -1207,7 +1201,6 @@ def test_causal_conv1d_fallback_is_patched_only_where_it_agrees(monkeypatch):
         model = torch.nn.Sequential(good_cls(), bad_cls())
         assert ops.patch_causal_conv1d_fallback(model) == 1
         assert good.causal_conv1d_fn is ops.cpu_causal_conv1d and bad.causal_conv1d_fn is other_signature
-        # With oneDNN (Linux / Windows wheels) the grouped conv is faster: left alone.
         good.causal_conv1d_fn = reference
         monkeypatch.setattr(torch.backends.mkldnn, "is_available", lambda: True)
         assert ops.patch_causal_conv1d_fallback(model) == 0 and good.causal_conv1d_fn is reference
@@ -1243,7 +1236,7 @@ def test_windows_compile_loads_the_msvc_environment(monkeypatch, tmp_path):
     (install / "VC" / "Auxiliary" / "Build" / "vcvars64.bat").write_text("")
     monkeypatch.setenv("ProgramFiles(x86)", str(root))
     monkeypatch.delenv("INCLUDE", raising = False)
-    for key in ("PATH", "LIB", "LIBPATH"):  # restored after the test; the loader updates os.environ
+    for key in ("PATH", "LIB", "LIBPATH"):
         monkeypatch.setenv(key, os.environ.get(key, ""))
     cl_dir = str(tmp_path / "msvc_bin")
     state = {"cl": None}
@@ -1291,8 +1284,7 @@ def _confident_rows(margins, vocab = 1003, hidden_size = 64):
 
 @pytest.mark.parametrize("path", ["frozen_head", "trainable_head", "chunked_ce"])
 def test_confident_rows_keep_their_gradient(path):
-    """Softmax collapse: past a ~16.6 margin p_t rounds to 1 in fp32, so log p_t and 1 - p_t read 0 and the
-    row's gradient was 100% wrong. Oracle: fp64 -softplus(lse(others) - z_t) (plain fp64 log_softmax collapses too)."""
+    """Softmax collapse (p_t rounds to 1 past a ~16.6 lead). Oracle: fp64 -softplus(lse(others) - z_t); fp64 log_softmax collapses too."""
     from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy, cpu_chunked_log_probs
     margins = [0, 5, 17, 20, 30, 50]
     hidden, weight, targets = _confident_rows(margins)

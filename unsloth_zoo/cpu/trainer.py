@@ -35,8 +35,7 @@ _GPU_ONLY_OPTIMIZERS = (
 
 @functools.cache
 def _cpu_adamw():
-    """torch's fused AdamW has CPU kernels from 2.4. A LoRA step updates hundreds of small tensors,
-    where the foreach AdamW behind "adamw_torch" is 4-6x slower than the fused one on CPU."""
+    """Fused AdamW has CPU kernels from torch 2.4; foreach is far slower over LoRA's many small tensors."""
     from packaging.version import Version
     return "adamw_torch_fused" if Version(torch.__version__.split("+")[0]) >= Version("2.4.0") else "adamw_torch"
 
@@ -62,7 +61,6 @@ def normalize_cpu_training_arguments(args):
         print(f"Unsloth (CPU): optim = {optim!r} needs a GPU, using {_cpu_adamw()!r}.")
         args.optim = _cpu_adamw()
     elif optim in ("adamw_torch", "adamw_torch_fused"):
-        # Same update rule; the fused kernel where this torch has it on CPU.
         args.optim = _cpu_adamw()
     if getattr(args, "tf32", None):
         args.tf32 = None
