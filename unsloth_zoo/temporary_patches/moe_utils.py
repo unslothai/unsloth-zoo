@@ -1449,9 +1449,15 @@ def _grouped_mm_slice(inputs, weight, offsets, plan):
 
 
 def _slice_reads_views(inputs, weight, plan):
-    # Triton and torch._grouped_mm (behind its view probe) give the copy's bits. The per-group
-    # matmul fallback does not: cuBLAS picks another kernel for a transposed operand (T4 fp16, K 5760: 3x max error).
-    return _slice_takes_triton(inputs, weight, plan) or _grouped_mm_supported_on(inputs.device)
+    # Triton and the sm90 / sm100 grouped GEMMs (behind the view probe) give the copy's bits. A per-expert cuBLAS
+    # loop (torch._grouped_mm elsewhere, our fallback) does not: a transposed operand takes another kernel (T4 fp16, K 5760: 3x max error).
+    if _slice_takes_triton(inputs, weight, plan):
+        return True
+    device = inputs.device
+    if device.type != "cuda" or torch.version.hip is not None:
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _triton_grouped_mm_capability(index)[0] in (9, 10) and _grouped_mm_supported_on(device)
 
 
 def _transposed_for_slice(weight, inputs, plan):
