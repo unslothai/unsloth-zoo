@@ -38,8 +38,7 @@ EMPTY_LOGITS = torch.empty(0)
 
 
 def lm_head_on_old_cuda_arch(weight):
-    """Replaced by unsloth_zoo.compiler.lm_head_on_old_cuda_arch when the compiler imports (it owns
-    the visible pre-Turing card set). Until then, and on hosts without such a card, always False."""
+    """Replaced by unsloth_zoo.compiler.lm_head_on_old_cuda_arch, which owns the pre-Turing card set."""
     return False
 
 
@@ -93,9 +92,8 @@ def unsloth_fused_lm_head_loss(
         kwargs["scaling"] = accelerator_scaler
 
     unsloth_fsdp_unshard(lm_head)
-    # A head a device_map put on a pre-Turing card keeps the chunked loss without Inductor, as the
-    # regex templates do. Asked after unshard: FSDP2 CPUOffloadPolicy keeps the shard on CPU until
-    # then. An empty-set read on hosts without one; an explicit False stays False.
+    # A head on a pre-Turing card skips Inductor. Asked after unshard: FSDP2 CPUOffloadPolicy keeps
+    # the shard on CPU until then.
     if kwargs.get("torch_compile", True) and lm_head_on_old_cuda_arch(lm_head.weight):
         kwargs["torch_compile"] = False
     loss = unsloth_fused_ce_loss(

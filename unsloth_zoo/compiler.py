@@ -100,16 +100,13 @@ minor = None
 # Bound before the branches: DEVICE_TYPE == "cpu" takes none of them, and
 # `fuse_lm_head` then read this global and raised NameError.
 OLD_CUDA_ARCH_VERSION = False
-# Visible pre-Turing card indices (an unreadable card counts as one). The LM-head rewrite is
-# installed per class before any model is placed, so the current device decides whether it is
-# installed at all; a forward whose LM head a device_map put on one of these cards then keeps
-# the chunked loss but skips Inductor and the CCE kernels (lm_head_on_old_cuda_arch).
+# Visible pre-Turing (or unreadable) card indices. The rewrite is installed before placement,
+# so a head a device_map puts on one skips Inductor and CCE per forward (lm_head_on_old_cuda_arch).
 OLD_CUDA_ARCH_INDICES = frozenset()
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
-        # The current device, as torch decides: an idle older card beside it must not turn the
-        # LM-head fusion off for a model that runs here.
+        # Current device only, as torch decides: an idle older card must not disable the fusion.
         OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
         _old_indices = set()
         try:
@@ -138,17 +135,15 @@ pass
 
 
 def lm_head_on_old_cuda_arch(weight):
-    """True when the LM head weight sits on a visible pre-Turing CUDA card. A frozenset read,
-    no device query, so the generated forward stays traceable; always False on hosts without
-    one (every single-GPU and homogeneous host that installs the rewrite)."""
+    """True when the LM head weight sits on a visible pre-Turing card. A frozenset read, so the
+    generated forward stays traceable."""
     if not OLD_CUDA_ARCH_INDICES:
         return False
     device = getattr(weight, "device", None)
     return device is not None and device.type == "cuda" and device.index in OLD_CUDA_ARCH_INDICES
 pass
 
-# AST-rewritten forwards and the import hook reach the CE kernel through the shared adapter, not
-# the regex templates; it asks the same question. fused_losses never imports this module.
+# AST-rewritten forwards and the import hook use the shared adapter; fused_losses never imports this module.
 from unsloth_zoo.fused_losses import forward_adapter as _forward_adapter
 _forward_adapter.lm_head_on_old_cuda_arch = lm_head_on_old_cuda_arch
 del _forward_adapter
