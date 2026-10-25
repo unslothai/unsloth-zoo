@@ -2066,7 +2066,7 @@ def select_moe_backend_without_sonic(device = None):
     backend = select_moe_backend()
     if backend == "sonic_moe":
         # sonic_moe was selected on a card with torch._grouped_mm; on a mixed host the expert's card may lack it.
-        if getattr(device, "type", None) == "cuda" and not _check_torch_grouped_mm_supported(device):
+        if getattr(device, "type", None) == "cuda" and not _grouped_mm_supported_on(device):
             return "native_torch"
         return "grouped_mm"
     return backend
@@ -5823,7 +5823,7 @@ def forward_triton_grouped_gemm(
 
     if not _triton_grouped_gemm_dims_supported(self, hidden_states.shape[-1]):
         # Toy shapes (hidden_size 8): the same routing on grouped_mm, else the eager loop; neither has the tile limit.
-        if _check_torch_grouped_mm_supported(hidden_states.device):
+        if _grouped_mm_supported_on(hidden_states.device):
             return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
         return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 

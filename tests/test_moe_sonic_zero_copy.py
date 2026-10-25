@@ -380,7 +380,7 @@ def test_rejected_operand_falls_back_by_its_own_device(monkeypatch):
     monkeypatch.setattr(MU, "forward_native_grouped_mm", lambda *a: calls.append("grouped_mm"))
     monkeypatch.setattr(MU, "forward_native_moe_loop", lambda *a: calls.append("loop"))
     seen = []
-    monkeypatch.setattr(MU, "_check_torch_grouped_mm_supported", lambda device = None: seen.append(device) or False)
+    monkeypatch.setattr(MU, "_grouped_mm_supported_on", lambda device: seen.append(device) or False)
 
     class FakeCuda:
         is_cuda = True
@@ -388,6 +388,6 @@ def test_rejected_operand_falls_back_by_its_own_device(monkeypatch):
 
     S.forward_sonic_moe(object(), FakeCuda(), None, None)
     assert calls == ["loop"] and seen == ["cuda:1"]
-    monkeypatch.setattr(MU, "_check_torch_grouped_mm_supported", lambda device = None: True)
+    monkeypatch.setattr(MU, "_grouped_mm_supported_on", lambda device: True)
     S.forward_sonic_moe(object(), FakeCuda(), None, None)
     assert calls == ["loop", "grouped_mm"]
