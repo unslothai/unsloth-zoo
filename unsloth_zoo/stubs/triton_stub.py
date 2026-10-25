@@ -243,9 +243,7 @@ language = _make_module("triton.language", _language_attrs)
 language.math = language
 language.core = _make_module("triton.language.core", _language_attrs)
 
-# Inductor folds triton_key() into the cache key of every compile, CPU and MPS included, and imports
-# it from triton.runtime.cache (older torch: triton.compiler.compiler). A raising _Noop there fails
-# every torch.compile in the process once the stub is installed.
+# Inductor keys every compile (CPU and MPS too) on triton_key(); a raising _Noop there breaks torch.compile.
 def triton_key():
     return f"unsloth-triton-stub-{__version__}"
 
