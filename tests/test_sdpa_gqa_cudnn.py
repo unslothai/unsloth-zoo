@@ -167,17 +167,9 @@ def test_cudnn_gqa_retains_no_repeated_kv(cudnn_gqa):
     assert mine == native, (mine, native, 2 * B * H * SEQ * HEAD_DIM * 2)
 
 
-def test_cudnn_probe_runs_on_the_operands_device(monkeypatch, cudnn_sdp_on):
-    # The cuDNN choice reads the current device, so it must run under the operands' device.
-    seen = []
-    real_device = torch.cuda.device
-
-    class recording_device(real_device):
-        def __init__(self, device):
-            seen.append(torch.device(device))
-            super().__init__(device)
-
-    monkeypatch.setattr(torch.cuda, "device", recording_device)
+def test_cudnn_probe_on_the_current_card_matches_sdpa(cudnn_sdp_on):
+    # Single card: the probe needs no device switch and agrees with SDPA's own choice.
     q, k, v, mask = _inputs()
-    sdpa_gqa._cudnn_takes_gqa(q, k, v, mask, 0.0, False, None)
-    assert seen.count(q.device) >= 1, seen
+    choice = torch._fused_sdp_choice(q, k, v, mask, 0.0, False, scale = None, enable_gqa = True)
+    expected = choice == int(SDPBackend.CUDNN_ATTENTION) and sdpa_gqa._CUDNN_GATE_CHECKS_GQA
+    assert sdpa_gqa._cudnn_takes_gqa(q, k, v, mask, 0.0, False, None) is expected

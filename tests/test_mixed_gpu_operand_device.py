@@ -145,3 +145,58 @@ def test_rejected_repeated_kv_is_freed_before_the_fallback(monkeypatch):
     key, value = torch.zeros(1, 2, 16, 8), torch.zeros(1, 2, 16, 8)
     assert gqa_sdpa(query, key, value, None, 0.0, True, None, 4) == "fallback"
     assert len(repeated) == 2 and alive == [[False, False]]
+
+
+@pytest.fixture
+def cudnn_two_cards(two_cards, monkeypatch):
+    # SDPA picks cuDNN for the enable_gqa call only when cuda:1 is the current device.
+    from torch.nn.attention import SDPBackend
+    monkeypatch.setattr(sdpa_gqa, "_CUDNN_GATE_CHECKS_GQA", True)
+    monkeypatch.setattr(torch.backends.cuda, "cudnn_sdp_enabled", lambda: True)
+
+    def choice(*args, **kwargs):
+        return int(SDPBackend.CUDNN_ATTENTION if two_cards["current"] == 1 else SDPBackend.MATH)
+
+    monkeypatch.setattr(torch, "_fused_sdp_choice", choice, raising = False)
+    return two_cards
+
+
+def test_cudnn_check_asks_the_query_card(cudnn_two_cards):
+    assert sdpa_gqa._cudnn_takes_gqa(_query(1), None, None, None, 0.0, False, None) is True
+    assert cudnn_two_cards["current"] == 0 and cudnn_two_cards["switches"] == 1
+
+
+def test_cudnn_check_on_the_current_card_does_not_switch(cudnn_two_cards):
+    assert sdpa_gqa._cudnn_takes_gqa(_query(0), None, None, None, 0.0, False, None) is False
+    cudnn_two_cards["current"] = 1
+    assert sdpa_gqa._cudnn_takes_gqa(_query(1), None, None, None, 0.0, False, None) is True
+    assert cudnn_two_cards["switches"] == 0
+
+
+@pytest.mark.parametrize("cudnn_picked, gate_checks_gqa, cudnn_on, kv_heads", [
+    (True, True, True, 2),
+    (False, True, True, 8),
+    (True, False, True, 8),
+    (True, True, False, 8),
+])
+def test_cudnn_choice_decides_the_repeat(monkeypatch, cudnn_picked, gate_checks_gqa, cudnn_on, kv_heads):
+    # The enable_gqa call is kept only when SDPA itself would run it on cuDNN (torch >= 2.8, cuDNN SDPA on).
+    from torch.nn.attention import SDPBackend
+    monkeypatch.setattr(sdpa_gqa, "_flash_takes_gqa", lambda *a: False)
+    monkeypatch.setattr(sdpa_gqa, "_efficient_takes", lambda *a: not a[-1])
+    monkeypatch.setattr(sdpa_gqa, "_CUDNN_GATE_CHECKS_GQA", gate_checks_gqa)
+    monkeypatch.setattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: True)
+    monkeypatch.setattr(torch.backends.cuda, "cudnn_sdp_enabled", lambda: cudnn_on)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    picked = SDPBackend.CUDNN_ATTENTION if cudnn_picked else SDPBackend.EFFICIENT_ATTENTION
+    monkeypatch.setattr(torch, "_fused_sdp_choice", lambda *a, **k: int(picked), raising = False)
+    calls = []
+
+    def sdpa(query, key, value, **kwargs):
+        calls.append((key.shape[1], kwargs.get("enable_gqa", False)))
+        return "out"
+
+    query = types.SimpleNamespace(is_cuda = True, device = torch.device("cuda", 0), shape = (1, 8, 16, 8))
+    key, value = torch.zeros(1, 2, 16, 8), torch.zeros(1, 2, 16, 8)
+    assert sdpa_gqa.make_gqa_sdpa(sdpa)(query, key, value, None, 0.0, False, None, 4) == "out"
+    assert calls == [(kv_heads, kv_heads == 2)]

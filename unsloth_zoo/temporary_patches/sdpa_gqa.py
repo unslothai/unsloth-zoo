@@ -83,10 +83,13 @@ def _cudnn_takes_gqa(query, key, value, attn_mask, dropout_p, is_causal, scale):
         if not torch.backends.cuda.cudnn_sdp_enabled():
             return False
         from torch.nn.attention import SDPBackend
-        with torch.cuda.device(query.device):
-            choice = torch._fused_sdp_choice(
-                query, key, value, attn_mask, dropout_p, is_causal, scale = scale, enable_gqa = True,
-            )
+        args = (query, key, value, attn_mask, dropout_p, is_causal)
+        # The arch checks read the current device's properties, so ask on the query's card.
+        if query.device.index is not None and query.device.index != torch.cuda.current_device():
+            with torch.cuda.device(query.device):
+                choice = torch._fused_sdp_choice(*args, scale = scale, enable_gqa = True)
+        else:
+            choice = torch._fused_sdp_choice(*args, scale = scale, enable_gqa = True)
         return choice == int(SDPBackend.CUDNN_ATTENTION)
     except Exception:
         return False
