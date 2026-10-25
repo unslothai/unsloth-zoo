@@ -307,12 +307,18 @@ _COMPILE_SWITCH_MODULES = (
 
 @_pytest.fixture
 def compile_enabled(monkeypatch):
+    _enable_compile(monkeypatch)
+
+
+def _enable_compile(monkeypatch):
     import importlib
     import sys
 
-    monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
+    # Import first, under the caller's environment: a module first imported after the switch is
+    # cleared would freeze its flags compile-on, and monkeypatch would restore those values.
     for name in _COMPILE_SWITCH_MODULES:
         importlib.import_module(name)
+    monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
     for name, module in list(sys.modules.items()):
         if module is None or not (name == "unsloth_zoo" or name.startswith("unsloth_zoo.")):
             continue
