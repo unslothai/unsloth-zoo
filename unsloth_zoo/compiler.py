@@ -1171,6 +1171,16 @@ def _all_attention_functions_has_sdpa():
 pass
 
 
+def _is_single_operand(expression):
+    # `.to(<expression>.dtype)` only reads right for one operand: `a + b` becomes `a + (b.dtype)`.
+    try:
+        node = ast.parse(expression.strip(), mode = "eval").body
+    except SyntaxError:
+        return False
+    return isinstance(node, (ast.Name, ast.Attribute, ast.Call, ast.Subscript))
+pass
+
+
 # Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
 def higher_precision_softmax(source):
     """
@@ -1198,6 +1208,10 @@ def higher_precision_softmax(source):
     for item in softmax_objects:
         full_match, matches = item.group(0), item.groups()
         softmax, variable, dim, dtype = matches
+        # Falcon's `softmax(scores + mask, dim=-1, dtype=hidden_states.dtype)` and a call cut at
+        # its first comma (`torch.stack(xs, dim=1)`) have no `.dtype` to read: leave them as written.
+        if not _is_single_operand(variable):
+            continue
         new = (
             f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
         )
