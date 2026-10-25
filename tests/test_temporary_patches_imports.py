@@ -83,6 +83,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.gpt_oss_routed",
     "unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora",
     "unsloth_zoo.temporary_patches.granitemoehybrid",
+    "unsloth_zoo.temporary_patches.hub_kernel_export_check",
     "unsloth_zoo.temporary_patches.inkling",
     "unsloth_zoo.temporary_patches.lfm2_moe",
     "unsloth_zoo.temporary_patches.llama4_moe",

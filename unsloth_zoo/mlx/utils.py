@@ -20021,6 +20021,7 @@ def save_pretrained_gguf(
                 else:
                     os.environ["PYTHONPATH"] = original_pythonpath
 
+        final_ggufs = []
         if to_quantize:
             if not produced_files:
                 raise RuntimeError(
@@ -20052,11 +20053,18 @@ def save_pretrained_gguf(
                     os.remove(stale)
                     print(f"Unsloth: Removed intermediate {Path(stale).name}")
 
-    gguf_files = _exported_gguf_files(save_directory, imatrix_source)
+    # Only what THIS export wrote: a *.gguf already in save_directory (an earlier export, another
+    # model) is not part of it, and push_to_hub_gguf publishes exactly this list.
+    written = {os.path.abspath(f) for f in (*produced_files, *final_ggufs) if os.path.isfile(f)}
+    gguf_files = [
+        f for f in _exported_gguf_files(save_directory, imatrix_source)
+        if os.path.abspath(f) in written
+    ]
     for f in gguf_files:
         size_gb = f.stat().st_size / (1024**3)
         print(f"Unsloth: Saved {f.name} ({size_gb:.2f} GB)")
     print(f"Unsloth: GGUF export complete -> {save_directory}")
+    return {"gguf_files": [str(f) for f in gguf_files]}
 
 
 _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE = "Trained with Unsloth"
@@ -20233,7 +20241,7 @@ def push_to_hub_gguf(
 
     save_directory = Path(save_directory)
 
-    save_pretrained_gguf(
+    result = save_pretrained_gguf(
         model,
         tokenizer,
         save_directory,
@@ -20242,6 +20250,7 @@ def push_to_hub_gguf(
         token=token,
         imatrix_file=imatrix_file,
     )
+    reported = result.get("gguf_files") if isinstance(result, dict) else None
 
     api = HfApi(token=token)
     # Same fail-loud private=True rule as the LoRA / merged paths so a
@@ -20253,6 +20262,9 @@ def push_to_hub_gguf(
         os.path.expanduser(os.fspath(imatrix_file))
         if isinstance(imatrix_file, (str, os.PathLike)) else None,
     )
+    if reported:
+        reported = {os.path.abspath(f) for f in reported}
+        gguf_files = [f for f in gguf_files if os.path.abspath(f) in reported]
     for gguf_file in gguf_files:
         api.upload_file(
             path_or_fileobj=str(gguf_file),
