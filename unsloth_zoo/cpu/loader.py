@@ -96,7 +96,7 @@ def _cpu_compile_unavailable():
     Linux); without one the first training step would raise instead of falling back."""
     try:
         import torch._dynamo
-        x = torch.randn(64)
+        x = torch.linspace(-4, 4, 64)  # not randn: the probe must not move the RNG that seeds LoRA init
         out = torch.compile(lambda t: torch.nn.functional.silu(t) * 2, dynamic = False)(x)
         if not torch.allclose(out, torch.nn.functional.silu(x) * 2):
             return "probe kernel gave wrong results"

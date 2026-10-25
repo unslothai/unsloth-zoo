@@ -1213,3 +1213,17 @@ def test_causal_conv1d_fallback_is_patched_only_where_it_agrees(monkeypatch):
         assert ops.patch_causal_conv1d_fallback(model) == 0 and good.causal_conv1d_fn is reference
     finally:
         del sys.modules["fake_good_modeling"], sys.modules["fake_bad_modeling"]
+
+
+def test_cpu_compile_probe_leaves_the_rng_alone(monkeypatch):
+    from unsloth_zoo.cpu import loader
+    loader._cpu_compile_unavailable.cache_clear()
+    monkeypatch.setattr(torch, "compile", lambda fn, **k: fn)
+    try:
+        torch.manual_seed(123)
+        expected = torch.rand(3)
+        torch.manual_seed(123)
+        assert loader._cpu_compile_unavailable() is None
+        torch.testing.assert_close(torch.rand(3), expected)
+    finally:
+        loader._cpu_compile_unavailable.cache_clear()
