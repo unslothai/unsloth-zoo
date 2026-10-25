@@ -2899,6 +2899,11 @@ def grpo_accumulated_loss(
         # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
         _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
         dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
+        if _support_kwargs:
+            # Kept-set scoring saves one more float32 [rows, vocab] tensor per chunk for the backward
+            # (the masked logits), so the mini-batch autotune counts the logits twice. No effect
+            # unless free memory already limits the mini-batch.
+            dtype_bytes = dtype_bytes * 2
 
         total_rows = input_ids.shape[0]
         seq_len = input_ids.shape[1]
