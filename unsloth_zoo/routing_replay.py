@@ -270,7 +270,6 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
                 n = max(0, min(len(full) - offset, part.shape[0]))
                 rows[offset : offset + n] = part[:n]
             if start > 0 and not split:
-                # vLLM skipped rows an earlier turn already returned: reuse a capture sharing that prefix.
                 _fill_prefix(rows, full, start, store)
             if rows.shape[-1] > 1:
                 # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.

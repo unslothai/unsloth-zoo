@@ -640,7 +640,6 @@ def test_wrap_vllm_generate_records_and_is_idempotent(replay):
 
 
 def test_prompt_start_accepts_any_sampling_params_sequence(replay):
-    # vLLM pairs any collections.abc.Sequence of SamplingParams with the prompts, not only lists.
     from collections import UserList
     routed = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
     request = SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = routed[2:])])
@@ -670,7 +669,6 @@ def test_prompt_start_reuses_routes_of_an_earlier_turn(replay, start):
         assert torch.equal(rows[5].long(), torch.full((NUM_LAYERS, TOP_K), -1))
     assert torch.equal(rows[start:9].long(), torch.as_tensor(turn2).long())
     assert torch.equal(rows[9].long(), torch.full((NUM_LAYERS, TOP_K), -1))
-    # A prefix no earlier capture shares stays unrouted.
     rr.record_routed_experts([second([1, 2, 3, 4, 5, 6, 7, 8])], prompt_starts = [start])
     rows = rr._lookup((1, 2, 3, 4, 5, 6, 7, 8, 11, 12))
     assert torch.equal(rows[:start].long(), torch.full((start, NUM_LAYERS, TOP_K), -1))
@@ -685,7 +683,7 @@ def test_prompt_start_prefix_keeps_conflicts_natural_and_ignores_older_rollouts(
         return np.stack([np.stack([np.arange(TOP_K) + value] * NUM_LAYERS)] * n) % NUM_EXPERTS
 
     tail = rows_of(5, 2)
-    # Two captures of [1, 2, 3, 4] disagree on token 1: replay leaves it natural, like _lookup.
+    # Captures disagreeing on token 1 leave it natural, like _lookup.
     rr.record_routed_experts([capture([1, 2], [3, 4], np.concatenate([rows_of(0, 1), rows_of(1, 1), rows_of(2, 1)]))])
     rr.record_routed_experts([capture([1, 2], [3, 4], np.concatenate([rows_of(0, 1), rows_of(3, 1), rows_of(2, 1)]))])
     rr.record_routed_experts([capture([1, 2, 3, 4, 9], [10], tail)], prompt_starts = [3])
