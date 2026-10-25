@@ -25,7 +25,7 @@ import warnings
 import torch
 
 from .runtime import cpu_bf16_supported, cpu_bnb_4bit_supported
-from .ops import patch_chunked_causal_lm_loss
+from .ops import Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, store_frozen_linears_in_bf16
 
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
@@ -44,6 +44,22 @@ _DTYPE_KWARG = _dtype_kwarg()
 
 def _print(message):
     print(f"Unsloth (CPU): {message}")
+
+
+def _checkpoint_dtype(model_name, **kwargs):
+    """The dtype the checkpoint's weights are stored in, from its config (None when unknown)."""
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name, **kwargs)
+    except Exception:
+        return None
+    for cfg in (config, getattr(config, "get_text_config", lambda: config)()):
+        value = getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None)
+        if isinstance(value, str):
+            value = getattr(torch, value.replace("torch.", ""), None)
+        if isinstance(value, torch.dtype):
+            return value
+    return None
 
 
 def _resolve_dtype(dtype):
@@ -71,6 +87,72 @@ def _compile_layers(model):
     for layer in layers:
         layer.compile(dynamic = dynamic)
     return len(layers)
+
+
+def _load_msvc_environment():
+    """Windows: Inductor needs `cl` on PATH (a Developer Prompt); load vcvars64.bat's environment. True if cl is reachable."""
+    import shutil
+    import subprocess
+    if shutil.which("cl"):
+        return True
+    root = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    vswhere = os.path.join(root, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if not os.path.isfile(vswhere):
+        return False
+    hidden = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    try:
+        done = subprocess.run(
+            [vswhere, "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+             "-property", "installationPath", "-utf8"],
+            capture_output = True, text = True, encoding = "utf-8", errors = "replace", timeout = 60, **hidden,
+        )
+        install = (done.stdout or "").strip().splitlines()
+        if done.returncode != 0 or not install:
+            return False
+        vcvars = os.path.join(install[0].strip(), "VC", "Auxiliary", "Build", "vcvars64.bat")
+        if not os.path.isfile(vcvars):
+            return False
+        # /u: UTF-16 `set` output, so non-ASCII PATH entries survive.
+        done = subprocess.run(f'cmd /d /u /s /c ""{vcvars}" >nul 2>&1 && set"', capture_output = True,
+                              timeout = 120, **hidden)
+    except Exception:
+        return False
+    if done.returncode != 0:
+        return False
+    env = {}
+    for line in (done.stdout or b"").decode("utf-16-le", errors = "replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.upper() in ("PATH", "INCLUDE", "LIB", "LIBPATH"):
+            env[key.upper()] = value
+    if "PATH" not in env or "INCLUDE" not in env:
+        return False
+    os.environ.update(env)
+    return bool(shutil.which("cl"))
+
+
+@functools.cache
+def _cpu_compile_unavailable():
+    """None when Inductor can build and run a CPU kernel here (it needs a C++ compiler at run time), else why not."""
+    import sys
+    if sys.platform == "win32" and not _load_msvc_environment():
+        return ("no MSVC: install Visual Studio Build Tools with the C++ workload "
+                "(winget install Microsoft.VisualStudio.2022.BuildTools --override \"--add "
+                "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\")")
+    try:
+        import torch._dynamo
+        x = torch.linspace(-4, 4, 64)  # not randn: the probe must not move the RNG that seeds LoRA init
+        out = torch.compile(lambda t: torch.nn.functional.silu(t) * 2, dynamic = False)(x)
+        if not torch.allclose(out, torch.nn.functional.silu(x) * 2):
+            return "probe kernel gave wrong results"
+        return None
+    except Exception as error:
+        message = str(error).strip().splitlines()
+        return f"{type(error).__name__}: {message[0][:200] if message else ''}"
+    finally:
+        try:
+            torch._dynamo.reset()
+        except Exception:
+            pass
 
 
 def _disable_bnb_cpu_weight_packing(model):
@@ -150,11 +232,14 @@ class FastCPUModel:
 
         quantization_config = None
         if use_4bit and not _PREQUANTIZED_SUFFIX.search(model_name):
+            from unsloth_zoo.peft_utils import SKIP_QUANTIZATION_MODULES
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit = True,
                 bnb_4bit_quant_type = "nf4",
                 bnb_4bit_use_double_quant = True,
                 bnb_4bit_compute_dtype = dtype,
+                # As the GPU loaders: lm_head, MoE routers, Mamba and vision / audio towers stay 16-bit.
+                llm_int8_skip_modules = list(SKIP_QUANTIZATION_MODULES),
             )
         resize_model_vocab = kwargs.pop("resize_model_vocab", None)
         for key in ("load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",
@@ -168,8 +253,14 @@ class FastCPUModel:
         # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
+        frozen_bf16 = (
+            os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "0") == "1" and dtype == torch.float32 and not auto_dtype
+            and not use_4bit and not full_finetuning
+            and _checkpoint_dtype(model_name, token = token, revision = revision,
+                                  trust_remote_code = trust_remote_code, **hub_kwargs) == torch.bfloat16
+        )
         load_kwargs = dict(
-            **{_DTYPE_KWARG: "auto" if auto_dtype else dtype},
+            **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 else dtype)},
             device_map = "cpu",
             token = token,
             revision = revision,
@@ -218,6 +309,9 @@ class FastCPUModel:
         if getattr(model.config, "pad_token_id", None) is None:
             model.config.pad_token_id = tokenizer.pad_token_id
 
+        if frozen_bf16:
+            _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
+        patch_causal_conv1d_fallback(model)
         # Also for a checkpoint that ships its own 4-bit quantization_config.
         _disable_bnb_cpu_weight_packing(model)
         model.max_seq_length = max_seq_length
@@ -258,8 +352,13 @@ class FastCPUModel:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
         # Training forwards never reuse a KV cache; generate() turns it back on via for_inference.
         model.config.use_cache = False
-        if os.environ.get("UNSLOTH_CPU_COMPILE", "0") == "1":
+        if os.environ.get("UNSLOTH_CPU_COMPILE", "0") == "1" and not getattr(model, "_unsloth_cpu_compiled", False):
+            reason = _cpu_compile_unavailable()
+            if reason is not None:
+                _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
+                return
             count = _compile_layers(model)
+            model._unsloth_cpu_compiled = True
             _print(f"torch.compile (Inductor C++) on {count} decoder layers.")
 
     @staticmethod
@@ -442,6 +541,12 @@ def _unpack_encoding_generate(generate):
         if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
+        set_stance = getattr(torch.compiler, "set_stance", None)
+        modules = self.modules() if isinstance(self, torch.nn.Module) else ()
+        if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
+            # Layers compiled for training would recompile per layer against the KV cache, up to the limit.
+            with set_stance("force_eager"):
+                return generate(self, *args, **kwargs)
         return generate(self, *args, **kwargs)
     wrapper._unsloth_cpu = True
     return wrapper
@@ -464,7 +569,12 @@ def _merged_copy(model, save_method):
             "Load with load_in_4bit = False to save merged 16-bit weights, or save_method = 'lora'."
         )
     import copy
-    merged = copy.deepcopy(model).merge_and_unload()
+    merged = copy.deepcopy(model)
+    for module in merged.modules():
+        # bf16-stored frozen weights: merge in fp32 so the merged / GGUF weights are unrounded.
+        if isinstance(module, Bf16StoredLinear) and module.weight.dtype == torch.bfloat16:
+            module.weight.data = module.weight.data.float()
+    merged = merged.merge_and_unload()
     if save_method == "merged_16bit" and merged.dtype == torch.float32:
         merged = merged.to(torch.bfloat16 if cpu_bf16_supported() else torch.float16)
     return merged, False
