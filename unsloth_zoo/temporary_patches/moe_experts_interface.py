@@ -326,7 +326,7 @@ def _warm_moe_backend(model) -> None:
                 getattr(module, probe)()
             except Exception:
                 pass
-        # Mixed host: also each other GPU model the experts sit on (only those: never a card this process does not use).
+        # Mixed host: only the GPU models the experts sit on, never a card this process does not use.
         warm = getattr(module, "_warm_grouped_mm_devices", None)
         if devices and callable(warm):
             try:
@@ -351,10 +351,9 @@ def _expert_devices(model) -> list:
         return []
     for module in modules:
         candidates = []
-        # Registered stacked parameters (gate_up_proj / down_proj / gate_proj / up_proj).
         params = getattr(module, "_parameters", None) or {}
         candidates += [params.get(name) for name in _EXPERT_STACK_NAMES]
-        # Experts layers whose weights are plain tensors (PEFT parametrize) or w1/w2/w3.
+        # PEFT parametrize leaves plain tensors; w1/w2/w3 are attributes.
         try:
             if is_experts is not None and is_experts(module):
                 candidates += [getattr(module, name, None) for name in _EXPERT_WEIGHT_NAMES]

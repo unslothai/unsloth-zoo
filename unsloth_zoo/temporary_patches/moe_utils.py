@@ -1582,8 +1582,7 @@ _GROUPED_MM_FOREIGN = {}   # (type, index) -> None if same GPU model as the prob
 # (type, index) the process-wide flags were probed on; a later current-device switch must not move it.
 _GROUPED_MM_HOME = None
 _GROUPED_MM_HOME_LOCK = threading.Lock()
-# True once every visible accelerator is the home card's model: the per-call gates then read the
-# process-wide flags directly (no device classification per GEMM). Set eagerly with the home anchor.
+# Every visible accelerator is the home card's model: per-call gates read the process-wide flags.
 _GROUPED_MM_HOMOGENEOUS = False
 
 
@@ -1649,7 +1648,7 @@ def _resolve_grouped_mm_foreign_kind(device, key):
     return kind
 
 
-# Per GPU model other than the home card's; probed once, eagerly, when the experts or a call first use it.
+# Per GPU model other than the home card's.
 _TORCH_GROUPED_MM_SUPPORTED_BY_KIND = {}
 
 
@@ -1696,7 +1695,6 @@ def _grouped_mm_falls_back_internally(device_type, kind):
 
 def _grouped_mm_supported_on(device):
     # Absent symbol (torch 2.6/2.7): the traceable definitive negative, no classification.
-    # One GPU model on the host: the process-wide flag answers for every card.
     if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE:
         return _check_torch_grouped_mm_supported()
     if torch.compiler.is_compiling():
@@ -1708,10 +1706,8 @@ def _grouped_mm_supported_on(device):
 
 
 def _grouped_mm_supported_while_tracing(device):
-    # Never probes a card here (graph break; an error under fullgraph). The eager warm-up probes the
-    # home card and each other GPU model the experts sit on, so a card is unprobed only if the experts
-    # reached it later (or it ran no eager call first). Trade-off for that card: the home answer only where
-    # torch falls back internally; elsewhere the manual loop, which is safe but breaks a fullgraph trace.
+    # Never probes (graph break; fullgraph error). An unwarmed card takes the home answer only where torch
+    # falls back internally, else the manual loop (safe, but breaks a fullgraph trace).
     home = _check_torch_grouped_mm_supported()
     kind = _grouped_mm_traced_kind(device)
     if kind is None or _GROUPED_MM_HOMOGENEOUS: return home
@@ -1881,8 +1877,7 @@ def _transposed_view_safe_on(device):
     if torch.compiler.is_compiling():
         kind = _grouped_mm_traced_kind(device)
         if kind is None: return _transposed_view_grouped_mm_is_safe()
-        # A card no eager probe reached: probing would break the graph, so the contiguous copy
-        # (always correct, traceable), never the home card's verdict.
+        # Unprobed card: the contiguous copy (correct, traceable), never the home card's verdict.
         return False if kind is False else bool(_TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind, False))
     kind = _grouped_mm_foreign_kind(device)
     if kind is None: return _transposed_view_grouped_mm_is_safe()

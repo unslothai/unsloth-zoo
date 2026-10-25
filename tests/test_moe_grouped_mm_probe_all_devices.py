@@ -472,8 +472,7 @@ def _distributed(monkeypatch):
 
 
 def test_a_rank_never_probes_a_card_its_experts_do_not_use(spoof, monkeypatch):
-    # Codex P2: probing one card of every other visible model put a CUDA context and a grouped_mm
-    # call from every rank on that card. Only the home card and the experts' cards are probed.
+    # Only the home card and the experts' cards are probed, never another rank's card.
     seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
     _distributed(monkeypatch)
     views = []

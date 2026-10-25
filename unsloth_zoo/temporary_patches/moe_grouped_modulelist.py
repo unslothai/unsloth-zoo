@@ -900,8 +900,7 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
         if not torch.compiler.is_compiling():
             _decline(f"{hidden_states.device.type} {hidden_states.dtype} input")
         return self._orig_moe_forward(hidden_states)
-    # The experts' card must run torch._grouped_mm too: a block moved after enable_grouped_moe may sit
-    # on another GPU model (one model per host reads the global flag; a trace never probes).
+    # A block moved after enable_grouped_moe may sit on a GPU model without torch._grouped_mm.
     from .moe_utils import _grouped_mm_supported_on
     if not _grouped_mm_supported_on(hidden_states.device):
         if not torch.compiler.is_compiling():
