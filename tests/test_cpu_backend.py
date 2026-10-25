@@ -1021,3 +1021,97 @@ def test_cpu_fused_lm_head_with_every_label_masked():
     assert top1.dtype == torch.bool
     (lp.sum() + ent.sum()).backward()
     assert torch.count_nonzero(weight.grad) == 0
+
+
+def test_bf16_stored_frozen_linear_matches_fp32():
+    """A bf16-stored frozen weight computes exactly what the fp32 copy of the same values computes,
+    returns dX only, and a trainable weight still gets its gradient."""
+    from unsloth_zoo.cpu.ops import Bf16StoredLinear
+    torch.manual_seed(0)
+    ref = torch.nn.Linear(16, 8)
+    ref.weight.data = ref.weight.data.bfloat16().float()  # values a bf16 checkpoint can hold
+    ref.weight.requires_grad_(False)
+    ref.bias.requires_grad_(False)
+    stored = torch.nn.Linear(16, 8)
+    stored.weight.data = ref.weight.data.bfloat16()
+    stored.bias.data = ref.bias.data.clone()
+    stored.__class__ = Bf16StoredLinear
+    stored.weight.requires_grad_(False)
+    stored.bias.requires_grad_(False)
+    x1, x2 = torch.randn(3, 5, 16, requires_grad = True), None
+    x2 = x1.detach().clone().requires_grad_(True)
+    up = torch.randn(3, 5, 8)
+    (ref(x1) * up).sum().backward()
+    out = stored(x2)
+    (out * up).sum().backward()
+    assert out.dtype == torch.float32 and stored.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(out, ref(x1.detach()))
+    torch.testing.assert_close(x2.grad, x1.grad)
+    assert stored.weight.grad is None
+    stored.weight.requires_grad_(True)
+    stored(torch.randn(2, 16)).sum().backward()
+    assert stored.weight.grad is not None
+
+
+def test_store_frozen_linears_in_bf16_keeps_head_and_norms_fp32_and_merges_unrounded():
+    import copy
+    from peft import LoraConfig, get_peft_model
+    from unsloth_zoo.cpu import loader
+    from unsloth_zoo.cpu.ops import Bf16StoredLinear, store_frozen_linears_in_bf16
+    ref = _tiny_llama().bfloat16().float()  # the "checkpoint" values, in fp32
+    model = copy.deepcopy(ref).bfloat16()
+    count = store_frozen_linears_in_bf16(model)
+    assert count == 7  # q, k, v, o, gate, up, down; lm_head stays a plain fp32 Linear
+    assert type(model.lm_head) is torch.nn.Linear and model.lm_head.weight.dtype == torch.float32
+    assert model.model.norm.weight.dtype == torch.float32 and model.model.embed_tokens.weight.dtype == torch.float32
+    ids = torch.randint(0, 64, (2, 9))
+    with torch.no_grad():
+        torch.testing.assert_close(model(ids).logits, ref(ids).logits)
+    lora = get_peft_model(model, LoraConfig(r = 4, target_modules = ["q_proj", "v_proj"], init_lora_weights = False))
+    loss = lora(input_ids = ids, labels = ids).loss
+    loss.backward()
+    assert all(p.grad is not None for n, p in lora.named_parameters() if p.requires_grad)
+    merged, _ = loader._merged_copy(lora, "merged_32bit")
+    assert all(p.dtype == torch.float32 for p in merged.parameters())
+    assert not any(type(m) is Bf16StoredLinear and m.weight.dtype == torch.bfloat16 for m in merged.modules())
+    # The training model is untouched by the merge.
+    assert lora.base_model.model.model.layers[0].mlp.up_proj.weight.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("env, ckpt_dtype, expected", [("1", torch.bfloat16, torch.bfloat16), ("1", torch.float32, torch.float32),
+                                                       ("0", torch.bfloat16, torch.float32)])
+def test_frozen_bf16_storage_is_opt_in_and_only_for_bf16_checkpoints(monkeypatch, env, ckpt_dtype, expected):
+    import transformers
+    from unsloth_zoo.cpu import loader
+    seen = {}
+
+    def fake_load(name, **k):
+        seen.update(k)
+        return _tiny_llama().to(k.get("dtype", k.get("torch_dtype")))
+    monkeypatch.setenv("UNSLOTH_CPU_FROZEN_BF16", env)
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
+    monkeypatch.setattr(loader, "_checkpoint_dtype", lambda *a, **k: ckpt_dtype)
+    monkeypatch.setattr(loader, "cpu_bf16_supported", lambda: False)
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_load)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    model, _ = loader.FastCPUModel.from_pretrained("org/model", load_in_4bit = False)
+    assert seen.get("dtype", seen.get("torch_dtype")) == expected
+    assert model.lm_head.weight.dtype == torch.float32 and model.model.norm.weight.dtype == torch.float32
+
+
+def test_cpu_compile_without_a_toolchain_trains_eagerly(monkeypatch, capsys):
+    from unsloth_zoo.cpu import loader
+    loader._cpu_compile_unavailable.cache_clear()
+    monkeypatch.setenv("UNSLOTH_CPU_COMPILE", "1")
+
+    def no_compiler(*a, **k):
+        raise RuntimeError("InvalidCxxCompiler: Compiler: cl is not found.")
+    monkeypatch.setattr(torch, "compile", no_compiler)
+    model = _tiny_llama()
+    try:
+        loader.FastCPUModel._prepare(model, False)
+    finally:
+        loader._cpu_compile_unavailable.cache_clear()
+    assert "training eagerly" in capsys.readouterr().out
+    assert not getattr(model, "_unsloth_cpu_compiled", False)
+    assert not hasattr(model.model.layers[0], "_compiled_call_impl") or model.model.layers[0]._compiled_call_impl is None

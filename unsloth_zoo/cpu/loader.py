@@ -25,7 +25,7 @@ import warnings
 import torch
 
 from .runtime import cpu_bf16_supported, cpu_bnb_4bit_supported
-from .ops import patch_chunked_causal_lm_loss
+from .ops import Bf16StoredLinear, patch_chunked_causal_lm_loss, store_frozen_linears_in_bf16
 
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
@@ -44,6 +44,22 @@ _DTYPE_KWARG = _dtype_kwarg()
 
 def _print(message):
     print(f"Unsloth (CPU): {message}")
+
+
+def _checkpoint_dtype(model_name, **kwargs):
+    """The dtype the checkpoint's weights are stored in, from its config (None when unknown)."""
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name, **kwargs)
+    except Exception:
+        return None
+    for cfg in (config, getattr(config, "get_text_config", lambda: config)()):
+        value = getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None)
+        if isinstance(value, str):
+            value = getattr(torch, value.replace("torch.", ""), None)
+        if isinstance(value, torch.dtype):
+            return value
+    return None
 
 
 def _resolve_dtype(dtype):
@@ -71,6 +87,28 @@ def _compile_layers(model):
     for layer in layers:
         layer.compile(dynamic = dynamic)
     return len(layers)
+
+
+@functools.cache
+def _cpu_compile_unavailable():
+    """None when Inductor can build and run a CPU kernel here, else why not. Inductor needs a C++
+    compiler at run time (MSVC `cl` on an initialised Windows shell, Xcode clang on macOS, gcc / clang on
+    Linux); without one the first training step would raise instead of falling back."""
+    try:
+        import torch._dynamo
+        x = torch.randn(64)
+        out = torch.compile(lambda t: torch.nn.functional.silu(t) * 2, dynamic = False)(x)
+        if not torch.allclose(out, torch.nn.functional.silu(x) * 2):
+            return "probe kernel gave wrong results"
+        return None
+    except Exception as error:
+        message = str(error).strip().splitlines()
+        return f"{type(error).__name__}: {message[0][:200] if message else ''}"
+    finally:
+        try:
+            torch._dynamo.reset()
+        except Exception:
+            pass
 
 
 def _disable_bnb_cpu_weight_packing(model):
@@ -171,8 +209,16 @@ class FastCPUModel:
         # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
+        # Opt-in for fp32 training: a bf16 checkpoint keeps its frozen Linear weights in bf16 (lossless,
+        # about a quarter less resident memory) while everything trainable and every matmul stays fp32.
+        frozen_bf16 = (
+            os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "0") == "1" and dtype == torch.float32 and not auto_dtype
+            and not use_4bit and not full_finetuning
+            and _checkpoint_dtype(model_name, token = token, revision = revision,
+                                  trust_remote_code = trust_remote_code, **hub_kwargs) == torch.bfloat16
+        )
         load_kwargs = dict(
-            **{_DTYPE_KWARG: "auto" if auto_dtype else dtype},
+            **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 else dtype)},
             device_map = "cpu",
             token = token,
             revision = revision,
@@ -221,6 +267,8 @@ class FastCPUModel:
         if getattr(model.config, "pad_token_id", None) is None:
             model.config.pad_token_id = tokenizer.pad_token_id
 
+        if frozen_bf16:
+            _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
         # Also for a checkpoint that ships its own 4-bit quantization_config.
         _disable_bnb_cpu_weight_packing(model)
         model.max_seq_length = max_seq_length
@@ -261,8 +309,13 @@ class FastCPUModel:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
         # Training forwards never reuse a KV cache; generate() turns it back on via for_inference.
         model.config.use_cache = False
-        if os.environ.get("UNSLOTH_CPU_COMPILE", "0") == "1":
+        if os.environ.get("UNSLOTH_CPU_COMPILE", "0") == "1" and not getattr(model, "_unsloth_cpu_compiled", False):
+            reason = _cpu_compile_unavailable()
+            if reason is not None:
+                _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
+                return
             count = _compile_layers(model)
+            model._unsloth_cpu_compiled = True
             _print(f"torch.compile (Inductor C++) on {count} decoder layers.")
 
     @staticmethod
@@ -467,7 +520,12 @@ def _merged_copy(model, save_method):
             "Load with load_in_4bit = False to save merged 16-bit weights, or save_method = 'lora'."
         )
     import copy
-    merged = copy.deepcopy(model).merge_and_unload()
+    merged = copy.deepcopy(model)
+    for module in merged.modules():
+        # bf16-stored frozen weights: merge in fp32 so the merged / GGUF weights are unrounded.
+        if isinstance(module, Bf16StoredLinear) and module.weight.dtype == torch.bfloat16:
+            module.weight.data = module.weight.data.float()
+    merged = merged.merge_and_unload()
     if save_method == "merged_16bit" and merged.dtype == torch.float32:
         merged = merged.to(torch.bfloat16 if cpu_bf16_supported() else torch.float16)
     return merged, False
