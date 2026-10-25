@@ -1724,7 +1724,12 @@ def grpo_truncated_support_kwargs(trainer):
     )
     # Only where the engine is known to return processed (kept-set renormalised) logprobs: against
     # raw_logprobs a kept-set trainer score would bias the ratio the other way. Server mode: unknown.
-    automatic = setting == "auto" and support is not None and consumed and _grpo_rollout_logprobs_processed(trainer) is True
+    # Measured on NVIDIA CUDA only: ROCm / XPU keep the full vocabulary unless =1.
+    automatic = (
+        setting == "auto" and support is not None and consumed
+        and _grpo_truncated_support_auto_platform()
+        and _grpo_rollout_logprobs_processed(trainer) is True
+    )
     enabled = setting == "on" or automatic
     if not enabled:
         if setting != "off" and consumed and not getattr(trainer, "_unsloth_truncated_support_warned", False):
@@ -1767,6 +1772,12 @@ pass
 RL_REPLACEMENTS["grpo_truncated_support_kwargs"] = grpo_truncated_support_kwargs
 # GRPO loss calls that scored the policy over the kept set, by setting: engagement counter.
 _GRPO_TRUNCATED_SUPPORT_STATS = {"auto": 0, "on": 0}
+
+
+def _grpo_truncated_support_auto_platform():
+    """The automatic default is measured on NVIDIA CUDA only (not ROCm, XPU or CPU)."""
+    return getattr(torch.version, "hip", None) is None and torch.cuda.is_available()
+pass
 
 
 def _grpo_rollout_logprobs_processed(trainer):

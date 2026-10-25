@@ -161,6 +161,25 @@ def test_sampling_support_resolution():
     assert rr.grpo_sampling_support(t) == (0, 1.0, 0.1)
 
 
+@pytest.fixture(autouse = True)
+def _nvidia_platform(monkeypatch):
+    # The automatic default needs NVIDIA CUDA; the CPU decision tables assume it (ROCm / CPU below).
+    monkeypatch.setattr(rr, "_grpo_truncated_support_auto_platform", lambda: True)
+
+
+@pytest.mark.parametrize("hip, cuda, expected", [(None, True, True), ("7.2.0", True, False), (None, False, False)])
+def test_automatic_platform_gate(monkeypatch, hip, cuda, expected):
+    monkeypatch.undo()
+    monkeypatch.setattr(rr.torch.version, "hip", hip)
+    monkeypatch.setattr(rr.torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    assert rr._grpo_truncated_support_auto_platform() is expected
+    assert bool(rr.grpo_truncated_support_kwargs(_trainer(top_p = 0.9))) is expected
+    # =1 still forces it everywhere.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    assert rr.grpo_truncated_support_kwargs(_trainer(top_p = 0.9))
+
+
 def _support_only(kwargs):
     # support_triton_sampler depends on the installed vLLM; the decision is the kept-set triple.
     return {k: v for k, v in kwargs.items() if k in ("support_top_k", "support_top_p", "support_min_p")}
