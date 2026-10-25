@@ -1383,8 +1383,10 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
     fp32_logits, exact_mode = _logits_mode(device, compute_dtype)
     if compute_dtype not in _HALF:
         fp32_logits, exact_mode = False, False
-    # log p_t of the logits the gradient reads; only the exact target logit makes it differ from logps.
-    lpt = torch.zeros(N, **f32) if _exact_lpt(device, compute_dtype) else logps.new_empty(0)
+    # log p_t of the logits the gradient reads; only the exact target logit makes it differ from logps (else a
+    # copy at the end: an op output may not alias another).
+    exact_lpt = _exact_lpt(device, compute_dtype)
+    lpt = torch.zeros(N, **f32) if exact_lpt else None
     if n_keep > 0:
         if tiled and not _RECOMPUTE_FP32:
             fp32_logits = False
@@ -1421,7 +1423,8 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                         out.index_copy_(0, idx, dst[key])
                 if top is not None:
                     block_top.index_copy_(0, idx, top)
-            return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + (lpt,)
+            return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + \
+                (lpt if exact_lpt else logps.clone(),)
         R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
@@ -1458,7 +1461,8 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                         put(dst, st[key] / V if key == "sum" else st[key])
                 if want_u:
                     put(u, _dz_w(dz, w) if u_scale == 1.0 else _dz_w(dz, w).div_(u_scale))
-    return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + (lpt,)
+    return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + \
+        (lpt if exact_lpt else logps.clone(),)
 
 
 def _mm_into(out, a, b):
@@ -1712,7 +1716,7 @@ if _OPS is None:
                                          (need_h or need_w or need_b) and not want_u and need_w and not cap), **f32),
             torch.empty(N, device = targets.device, dtype = torch.long),
             torch.empty(1, device = "cpu", dtype = torch.long),
-            torch.empty(N if _exact_lpt(weight.device, compute_dtype) else 0, **f32),
+            torch.empty(N, **f32),
         )
 
     def _lp_setup(ctx, inputs, output):
@@ -1729,8 +1733,7 @@ if _OPS is None:
         ctx.has_bias = bias is not None
         ctx.has_mask = mask is not None
         ctx.hidden_dtype = hidden.dtype
-        # lpt: log p_t for the backward's target column, logps unless the exact target logit is on.
-        lpt = lpt if lpt.numel() > 0 else logps
+        # lpt: log p_t for the backward's target column (logps unless the exact target logit is on).
         if ctx.ent_lazy:
             ctx.save_for_backward(u, hidden, weight, bias, targets, idx, n_keep, lse, ent, lpt)
         elif want_u:

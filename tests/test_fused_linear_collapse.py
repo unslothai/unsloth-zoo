@@ -137,7 +137,6 @@ def _run(route, h, w, t, T, cap):
 
 
 def measure(V, dtype, T, cap, routes = None):
-    fl._FLASH_MIN_ROWS = 0
     h, w, t = _inputs(V, dtype, T, cap)
     ref = _oracle(h, w, t, T, cap)
     peaked = torch.arange(h.shape[0], device = "cuda") < 2 * len(GAPS)
@@ -259,6 +258,7 @@ if __name__ == "__main__":
     ap.add_argument("--V", default = "1003,40001,151936")
     args = ap.parse_args()
     report = []
+    fl._FLASH_MIN_ROWS = 0
     for torch_path, acc in ((False, "1"), (True, "1"), (False, "2"), (False, "0")):
         fl._TRITON = not torch_path
         fl._ACCURACY = acc
