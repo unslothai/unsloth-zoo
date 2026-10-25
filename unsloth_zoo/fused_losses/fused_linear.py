@@ -1345,7 +1345,6 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, 
     device = weight.device
     N, H = hidden.shape
     V = weight.shape[0]
-    # Kept rows come from the forward (count on the host), so the backward does not sync on a second nonzero.
     n_keep = int(n_keep[0])
     idx = idx[:n_keep]
     f32 = dict(device = device, dtype = torch.float32)
