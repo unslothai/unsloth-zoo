@@ -24,7 +24,7 @@ from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
-from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
 import inspect
 import re
 
@@ -225,7 +225,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     if (Version(torch.__version__) < Version("2.4.0")):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
     
-    elif torch_compile:
+    elif torch_compile and not UNSLOTH_COMPILE_DISABLE:
         UnslothForCausalLMLoss = torch.compile(
             UnslothForCausalLMLoss,
             dynamic = True,

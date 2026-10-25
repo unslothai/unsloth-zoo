@@ -1214,11 +1214,7 @@ class GptOssExpertsBnb4bit(nn.Module):
         import os
         if os.environ.get("UNSLOTH_GPTOSS_GROUPED", "1") == "0":
             return False
-        # The grouped path materializes torch._grouped_mm stacks meant to run under the
-        # compiled cache; when the user disables compilation they have opted into the plain
-        # eager per-expert loop, so honor that and fall back.
-        if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
-            return False
+        # Not gated on UNSLOTH_COMPILE_DISABLE: grouped_qlora_forward is torch.compiler.disable'd, eager either way.
         # The full check costs ~0.6 ms per layer; reuse it while ready_signature is unchanged,
         # and skip even that while no expert state changed (moe_ready_epoch).
         from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import (

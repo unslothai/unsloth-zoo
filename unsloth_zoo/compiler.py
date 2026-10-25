@@ -6092,10 +6092,9 @@ def unsloth_compile_transformers(
     except:
         return
     # All Unsloth Zoo code licensed under LGPLv3
-    full_disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
-    disable = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
-    if full_disable:
-        disable = True
+    # UNSLOTH_COMPILE_DISABLE only drops torch.compile; rewritten forwards still run eagerly.
+    full_disable = disable
+    disable = full_disable or os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial")
     if fast_residual_stream:
         raise NotImplementedError(
             "Unsloth: Fast residual stream optimization makes things slower!"
@@ -6264,7 +6263,7 @@ def unsloth_compile_transformers(
     pass
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
-    # Gated on full disable only: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
+    # Not gated on UNSLOTH_COMPILE_DISABLE: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
     if (not full_disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)
