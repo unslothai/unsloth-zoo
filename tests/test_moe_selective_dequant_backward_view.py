@@ -42,9 +42,13 @@ def _case(chunks_split):
         chunks.append((torch.tensor(ids, device = DEVICE), lo, hi, offs))
     plan = mu._SelectiveDequantPlan(E, x.shape[0], chunks)
     provided = []
+    # Each weight is kept alive with its address: a freed one's address can be handed straight
+    # back to a later contiguous copy, which would then look like the same storage.
+    kept = []
 
     def provider(experts):
         weight = W.index_select(0, experts)
+        kept.append(weight)
         provided.append(weight.untyped_storage().data_ptr())
         return weight
 
@@ -55,9 +59,11 @@ def _backward_weights(chunks_split, monkeypatch, reads_views):
     x, dy, W, plan, provider, provided = _case(chunks_split)
     monkeypatch.setattr(mu, "_slice_reads_views", lambda *args: reads_views)
     seen = []
+    kept = []
     real = mu._grouped_mm_slice
 
     def spy(inputs, weight, offsets, plan):
+        kept.append(weight)
         seen.append((weight.untyped_storage().data_ptr(), weight.is_contiguous()))
         return real(inputs, weight, offsets, plan)
 
