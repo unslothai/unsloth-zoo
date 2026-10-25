@@ -255,6 +255,28 @@ class _NoStream:
     def wait_event(self, event):
         pass
 
+    def record_event(self, event = None):
+        # A released CPU slot keeps the event as its fence; nothing here ever waits on it.
+        return object() if event is None else event
+
+
+def test_the_cpu_stream_stand_in_covers_every_stream_call():
+    """The offload path calls these on whatever stream it holds; a method the stand-in lacks stops
+    the recompute test below with an AttributeError instead of checking the recompute."""
+    import unsloth_zoo.gradient_checkpointing as gc
+
+    tree = ast.parse(pathlib.Path(gc.__file__).read_text(encoding = "utf-8"))
+    called = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            owner = node.func.value
+            name = owner.id if isinstance(owner, ast.Name) else getattr(owner, "attr", "")
+            if "stream" in name.lower():
+                called.add(node.func.attr)
+    assert called, "found no stream calls in gradient_checkpointing.py; the scan is stale"
+    missing = sorted(m for m in called if not callable(getattr(_NoStream, m, None)))
+    assert not missing, f"_NoStream needs {missing}: gradient_checkpointing.py calls them on a stream"
+
 
 @pytest.fixture
 def offloaded_gc(monkeypatch):
