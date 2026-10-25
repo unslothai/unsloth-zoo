@@ -223,7 +223,7 @@ def test_torch_compile_on_cpu_under_the_stub():
     pytest.importorskip("torch")
     import shutil
     if not any(shutil.which(cc) for cc in ("g++", "clang++", "c++")):
-        pytest.skip("no C++ compiler for Inductor")
+        pytest.skip(reason="Inductor builds CPU kernels with a C++ compiler (g++ / clang++); none on PATH")
     code = _COMPILE_SUBPROCESS.format(stub=str(STUB_PATH))
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
                           text=True, cwd=str(REPO_ROOT), timeout=900)
