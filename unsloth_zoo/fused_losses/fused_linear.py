@@ -24,6 +24,7 @@ torch bodies with the same math when Triton is unavailable.
 __all__ = [
     "fused_linear_cross_entropy",
     "fused_linear_logprobs",
+    "fused_linear_jsd",
     "fused_linear_rows",
     "CALLS",
 ]
@@ -1702,6 +1703,314 @@ if "calls" in _OPS:
     CALLS = _OPS["calls"]
 else:
     _OPS["calls"] = CALLS
+CALLS.setdefault("jsd", 0)
+
+
+# Generalized JSD between a trained student head and a frozen teacher head (TRL GKDTrainer.generalized_jsd_loss).
+_JSD_OP = "fused_linear_jsd_v1"
+# Live [rows, vocab] buffers per eager chunk in the statistic dtype; the chunk is sized to this budget.
+_JSD_BUFFERS = 4
+_JSD_CHUNK_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB", 1024) * 1024**2), 1)
+
+
+def _jsd_rows(rows, n_rows, V, bytes_per_row):
+    # rows > 0 sets the chunk; otherwise a power of two within the budget, in [16, _MAX_ROWS].
+    if rows > 0:
+        return rows
+    fit = max(_JSD_CHUNK_BYTES // max(bytes_per_row * V, 1), 1)
+    auto = min(max(1 << (fit.bit_length() - 1), 16), _MAX_ROWS)
+    return min(auto, -rows) if rows < 0 else auto
+
+
+def _jsd_logprobs(h, w, bias, scale, cap, inv_t, sd, device):
+    """log_softmax(transform(h @ w.T + bias) * inv_t) in sd on `device`, and its row lse; projected on w's device."""
+    x = _jsd_logits(h, w, bias, sd)
+    if scale != 1.0:
+        x.mul_(scale)
+    if cap != 0.0:
+        x.div_(cap).tanh_().mul_(cap)
+    if inv_t != 1.0:
+        x.mul_(inv_t)
+    x = x.to(device)
+    lse = torch.logsumexp(x, dim = -1, keepdim = True)
+    x.sub_(lse)
+    return x, lse
+
+
+def _jsd_logits(h, w, bias, sd):
+    x = _mm_fp32(h, w.t()) if sd == torch.float32 else (h.to(sd) @ w.to(sd).t())
+    if bias is not None:
+        x.add_(bias.to(sd))
+    return x
+
+
+def _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, need_w, sd):
+    if need_h:
+        gh = _dz_w(dzc, w) if sd == torch.float32 else dzc @ w
+        if ratio is not None:
+            gh.mul_(ratio)
+        if n_keep == N:
+            grad_h[a:b].copy_(gh)
+        else:
+            grad_h.index_copy_(0, idx[a:b], gh.to(grad_h.dtype))
+    if need_w:
+        _dz_t_h(acc_w, dzc, h)
+
+
+def _jsd_chunk(ls, lt, beta, want_grad):
+    """Per-row generalized JSD of log-probs ls (student) / lt (teacher), and d loss / d student logits.
+
+    Buffers ls / lt are consumed. Interior beta: m = log((1 - b) p + b q),
+    loss = b KL(q || M) + (1 - b) KL(p || M), dz = (1 - b) (g - p sum g) with g = p (ls - m)."""
+    if beta == 0.0:
+        q = lt.exp()
+        lt.sub_(ls).mul_(q)
+        row = lt.sum(-1)
+        if not want_grad:
+            return row, None
+        return row, ls.exp_().sub_(q)
+    if beta == 1.0:
+        p = ls.exp()
+        ls.sub_(lt)
+        g = torch.mul(p, ls, out = lt)
+        row = g.sum(-1)
+        if not want_grad:
+            return row, None
+        p.mul_(row.unsqueeze(-1))
+        return row, g.sub_(p)
+    m = torch.add(ls, math.log1p(-beta))
+    q = torch.add(lt, math.log(beta))
+    torch.logaddexp(m, q, out = m)
+    torch.exp(lt, out = q)
+    lt.sub_(m).mul_(q)
+    row_t = lt.sum(-1)
+    m.neg_().add_(ls)
+    p = torch.exp(ls, out = lt)
+    g = torch.mul(p, m, out = q)
+    row_s = g.sum(-1)
+    row = beta * row_t + (1.0 - beta) * row_s
+    if not want_grad:
+        return row, None
+    p.mul_(row_s.unsqueeze(-1))
+    return row, g.sub_(p).mul_(1.0 - beta)
+
+
+def _jsd_body(s, t, factor, beta: float, inv_t: float, s_scale: float, s_cap: float, t_scale: float, t_cap: float,
+              want_grad: bool, grad_dtype: torch.dtype):
+    """Raw fp32 logits (bias added) of both heads -> per-row JSD and dz in grad_dtype; the compiled (fused) form."""
+    s = s * s_scale
+    u = None
+    if s_cap != 0.0:
+        u = torch.tanh(s / s_cap)
+        s = s_cap * u
+    s = s * inv_t
+    t = t * t_scale
+    if t_cap != 0.0:
+        t = t_cap * torch.tanh(t / t_cap)
+    t = t * inv_t
+    ls = s - torch.logsumexp(s, dim = -1, keepdim = True)
+    lt = t - torch.logsumexp(t, dim = -1, keepdim = True)
+    p = torch.exp(ls)
+    if beta == 0.0:
+        q = torch.exp(lt)
+        row = (q * (lt - ls)).sum(-1)
+        dz = p - q
+    elif beta == 1.0:
+        g = p * (ls - lt)
+        row = g.sum(-1)
+        dz = g - p * row.unsqueeze(-1)
+    else:
+        m = torch.logaddexp(ls + math.log1p(-beta), lt + math.log(beta))
+        row_t = (torch.exp(lt) * (lt - m)).sum(-1)
+        g = p * (ls - m)
+        row_s = g.sum(-1)
+        row = beta * row_t + (1.0 - beta) * row_s
+        dz = (1.0 - beta) * (g - p * row_s.unsqueeze(-1))
+    if not want_grad:
+        return row, None
+    dz = dz * (factor * (inv_t * s_scale))
+    if u is not None:
+        dz = dz * (1.0 - u * u)
+    return row, dz.to(grad_dtype)
+
+
+_JSD_COMPILE = os.environ.get("UNSLOTH_FUSED_LINEAR_JSD_COMPILE", "1") != "0"
+_JSD_COMPILED = {}
+
+
+def _jsd_compiled(device):
+    """Inductor-fused _jsd_body on CUDA (reads each chunk's logits a few times, writes only dz); None = eager."""
+    if not _JSD_COMPILE or device.type != "cuda":
+        return None
+    fn = _JSD_COMPILED.get("fn", False)
+    if fn is False:
+        fn = None
+        try:
+            from unsloth_zoo.temporary_patches.common import _maybe_compile, torch_compile_options
+
+            # Static shapes (every chunk is padded to the same rows): 1.8x faster and fewer live buffers than dynamic.
+            compiled = _maybe_compile(dynamic = False, fullgraph = True, options = torch_compile_options)(_jsd_body)
+            fn = None if compiled is _jsd_body else compiled
+        except Exception:
+            fn = None
+        _JSD_COMPILED["fn"] = fn
+    return fn
+
+
+def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, scaling, beta, temperature,
+              s_scale, s_cap, t_scale, t_cap, compute_dtype, t_dtype, need_h, need_w, need_b, rows):
+    device = weight.device
+    N, H = hidden.shape
+    V = weight.shape[0]
+    sd = _stat_dtype(compute_dtype)
+    acc = torch.float64 if device.type in ("cuda", "cpu") else torch.float32
+    keep = mask.to(device = device, dtype = torch.bool).reshape(-1)
+    idx = keep.nonzero().squeeze(-1)
+    n_keep = int(idx.numel())
+    grad = need_h or need_w or need_b
+    grad_h = torch.zeros((N, H), device = device, dtype = hidden.dtype) if need_h else hidden.new_empty(0)
+    acc_w = None
+    if need_w:
+        acc_w = torch.zeros(weight.shape, device = device,
+                            dtype = torch.float32 if weight.dtype in _HALF else weight.dtype)
+    acc_b = torch.zeros(V, device = device, dtype = sd) if need_b else None
+    total = torch.zeros((), device = device, dtype = acc)
+    inv_t = 1.0 / temperature
+    divisor = divisor.to(device = device, dtype = torch.float32)
+    coef = (scaling.to(device = device, dtype = torch.float32) / divisor).reshape(())
+    ratio = None
+    if n_keep > 0:
+        fused = _jsd_compiled(device) if sd == torch.float32 else None
+        # Compiled: both logits + about 1.5 buffers inside the fused body (measured); eager four, five with softcap.
+        n_buf = 4 if fused is not None else _JSD_BUFFERS + (s_cap != 0.0)
+        R = max(_jsd_rows(rows, n_keep, V, n_buf * sd.itemsize), 1)
+        if fused is None:
+            R = min(R, n_keep)
+        w = weight.to(compute_dtype)
+        t_device = t_weight.device
+        wt = t_weight.to(t_dtype)
+        t_idx = idx.to(t_hidden.device)
+        coef_dz = coef.to(sd)
+        if grad and compute_dtype in _HALF:
+            # half(coef) rounds 0.4%: dz takes a power of two, fp32 the rest.
+            pow2 = torch.exp2(torch.round(torch.log2(coef)))
+            ratio, coef_dz = coef / pow2, pow2
+        with torch.autocast(device.type, enabled = False):
+            for a in range(0, n_keep, R):
+                b = min(a + R, n_keep)
+                h = (hidden[a:b] if n_keep == N else hidden.index_select(0, idx[a:b])).to(compute_dtype)
+                ht = t_hidden[a:b] if n_keep == N else t_hidden.index_select(0, t_idx[a:b])
+                if fused is not None:
+                    n = b - a
+                    # One static shape for the compiled body: pad the tail (rows of zeros, sliced off below).
+                    hp = h if n == R else torch.cat([h, h.new_zeros(R - n, h.shape[1])])
+                    htp = ht if n == R else torch.cat([ht, ht.new_zeros(R - n, ht.shape[1])])
+                    s_raw = _jsd_logits(hp, w, bias, sd)
+                    with torch.no_grad():
+                        t_raw = _jsd_logits(htp.to(device = t_device, dtype = t_dtype), wt, t_bias, sd).to(device)
+                    del hp, htp
+                    try:
+                        row, dzc = fused(s_raw, t_raw, coef_dz, beta, inv_t, s_scale, s_cap, t_scale, t_cap, grad,
+                                         compute_dtype)
+                    except Exception as e:
+                        if type(e).__name__ == "OutOfMemoryError":
+                            raise
+                        _JSD_COMPILED["fn"] = fused = None
+                        warnings.warn(f"Unsloth: compiled GKD JSD failed ({type(e).__name__}: {e}); using eager.",
+                                      stacklevel = 2)
+                        row, dzc = _jsd_body(s_raw, t_raw, coef_dz, beta, inv_t, s_scale, s_cap, t_scale, t_cap,
+                                             grad, compute_dtype)
+                    del s_raw, t_raw
+                    if n != R:
+                        row = row[:n]
+                        dzc = dzc[:n] if dzc is not None else None
+                    total += row.sum(dtype = acc)
+                    if not grad:
+                        continue
+                    if need_b:
+                        acc_b += dzc.sum(0, dtype = sd)
+                    _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, need_w, sd)
+                    continue
+                ls, lse_s = _jsd_logprobs(h, w, bias, s_scale, s_cap, inv_t, sd, device)
+                with torch.no_grad():
+                    lt, _ = _jsd_logprobs(ht.to(device = t_device, dtype = t_dtype), wt, t_bias, t_scale, t_cap,
+                                          inv_t, sd, device)
+                if grad and s_cap != 0.0:
+                    # 1 - tanh^2 of the capped logit, recovered from the log-probs before they are consumed.
+                    dcap = ls.add(lse_s).mul_(1.0 / (inv_t * s_cap)).square_().neg_().add_(1.0)
+                else:
+                    dcap = None
+                row, dz = _jsd_chunk(ls, lt, beta, grad)
+                total += row.sum(dtype = acc)
+                if not grad:
+                    continue
+                factor = coef_dz * (inv_t * s_scale)
+                dz.mul_(factor)
+                if dcap is not None:
+                    dz.mul_(dcap)
+                    del dcap
+                if need_b:
+                    acc_b += dz.sum(0)
+                dzc = dz.to(compute_dtype) if compute_dtype != sd else dz
+                _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, need_w, sd)
+    loss = (total / divisor.to(acc)).float()
+    if ratio is not None:
+        if need_w:
+            acc_w.mul_(ratio)
+        if need_b:
+            acc_b.mul_(ratio)
+    grad_w = acc_w.to(weight.dtype) if need_w else hidden.new_empty(0)
+    grad_b = acc_b.to(bias.dtype) if need_b else hidden.new_empty(0)
+    return loss, grad_h, grad_w, grad_b
+
+
+_OPS["jsd_impl"] = _jsd_impl
+if not _OPS.get("jsd_registered", False):
+    from torch.library import custom_op as _custom_op
+
+    @_custom_op(f"unsloth_zoo::{_JSD_OP}", mutates_args = ())
+    def _jsd_op(
+        hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
+        t_hidden: torch.Tensor, t_weight: torch.Tensor, t_bias: Optional[torch.Tensor],
+        mask: torch.Tensor, divisor: torch.Tensor, scaling: torch.Tensor, beta: float, temperature: float,
+        s_scale: float, s_cap: float, t_scale: float, t_cap: float, compute_dtype: torch.dtype,
+        t_dtype: torch.dtype, need_h: bool, need_w: bool, need_b: bool, rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        _OPS["calls"]["jsd"] += 1
+        return _OPS["jsd_impl"](hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, scaling, beta,
+                                temperature, s_scale, s_cap, t_scale, t_cap, compute_dtype, t_dtype, need_h, need_w,
+                                need_b, rows)
+
+    @_jsd_op.register_fake
+    def _jsd_fake(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, scaling, beta, temperature,
+                  s_scale, s_cap, t_scale, t_cap, compute_dtype, t_dtype, need_h, need_w, need_b, rows):
+        return (
+            torch.empty((), device = weight.device, dtype = torch.float32),
+            hidden.new_empty(hidden.shape) if need_h else hidden.new_empty(0),
+            weight.new_empty(weight.shape) if need_w else hidden.new_empty(0),
+            bias.new_empty(bias.shape) if need_b else hidden.new_empty(0),
+        )
+
+    def _jsd_setup(ctx, inputs, output):
+        loss, grad_h, grad_w, grad_b = output
+        ctx.mark_non_differentiable(grad_h, grad_w, grad_b)
+        ctx.need = inputs[17:20]
+        ctx.save_for_backward(grad_h, grad_w, grad_b, inputs[8])
+
+    def _jsd_backward(ctx, grad_loss, *_):
+        grad_h, grad_w, grad_b, scaling = ctx.saved_tensors
+        acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
+        s = grad_loss.to(acc) / scaling.to(acc)
+        need_h, need_w, need_b = ctx.need
+
+        def scale(x):
+            return torch.ops.unsloth_zoo.fused_linear_scale_rows(x, s, x.dtype)
+
+        return ((scale(grad_h) if need_h else None, scale(grad_w) if need_w else None,
+                 scale(grad_b) if need_b else None) + (None,) * 18)
+
+    _jsd_op.register_autograd(_jsd_backward, setup_context = _jsd_setup)
+    _OPS["jsd_registered"] = True
 
 
 def _compute_dtype(hidden, weight):
@@ -1822,3 +2131,75 @@ def fused_linear_logprobs(
     if return_is_top1:
         result.append(top1.reshape(lead).to(out_device))
     return result[0] if len(result) == 1 else tuple(result)
+
+
+def fused_linear_jsd(
+    student_hidden, student_weight, teacher_hidden, teacher_weight, *,
+    mask = None,
+    labels = None,
+    ignore_index = -100,
+    beta = 0.5,
+    temperature = 1.0,
+    student_bias = None,
+    teacher_bias = None,
+    student_logit_scale = 1.0, student_logit_softcapping = 0.0,
+    teacher_logit_scale = 1.0, teacher_logit_softcapping = 0.0,
+    num_items_in_batch = None,
+    scaling = None,
+    rows_per_chunk = None,
+):
+    """TRL ``GKDTrainer.generalized_jsd_loss`` over ``transform(hidden @ weight.T + bias) / temperature`` of a student
+    and a frozen teacher, one row chunk of both logits at a time; float32 scalar.
+
+    beta 0 is forward KL(teacher || student), 1 reverse KL, else the generalized JSD with mixture
+    ``(1 - beta) p_student + beta p_teacher``. Rows are kept where ``mask`` is non zero and ``labels != ignore_index``
+    (either may be omitted). The sum is divided by ``num_items_in_batch`` when given (TRL >= 1.x), else by the kept
+    row count (``reduction = "batchmean"``); a zero divisor counts as 1. The transform is ``* logit_scale`` then
+    softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
+    taken in forward; teacher inputs are never differentiated and may have their own hidden size and device.
+    ``scaling`` (fp16 GradScaler) multiplies stored gradients; backward divides it out."""
+    beta = float(beta)
+    temperature = float(temperature)
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError(f"Unsloth: GKD beta must be in [0, 1], got {beta}.")
+    if not (temperature > 0.0 and math.isfinite(temperature)):
+        raise ValueError(f"Unsloth: GKD temperature must be finite and > 0, got {temperature}.")
+    if teacher_weight.shape[0] != student_weight.shape[0]:
+        raise ValueError(f"Unsloth: GKD student vocabulary {student_weight.shape[0]} != teacher vocabulary "
+                         f"{teacher_weight.shape[0]}.")
+    device = student_weight.device
+    hidden2 = student_hidden.reshape(-1, student_hidden.shape[-1]).to(device)
+    t_hidden2 = teacher_hidden.detach().reshape(-1, teacher_hidden.shape[-1])
+    if t_hidden2.shape[0] != hidden2.shape[0]:
+        raise ValueError(f"Unsloth: GKD student has {hidden2.shape[0]} rows, teacher {t_hidden2.shape[0]}.")
+    keep = torch.ones(hidden2.shape[0], device = device, dtype = torch.bool)
+    if mask is not None:
+        keep = keep & (mask.reshape(-1).to(device) != 0)
+    if labels is not None:
+        keep = keep & (labels.reshape(-1).to(device) != ignore_index)
+    grad_on = torch.is_grad_enabled()
+    need_h = grad_on and student_hidden.requires_grad
+    need_w = grad_on and student_weight.requires_grad
+    need_b = grad_on and _requires_grad(student_bias)
+    student_bias = _head_bias(student_bias, student_weight)
+    teacher_weight = teacher_weight.detach()
+    teacher_bias = _head_bias(teacher_bias.detach(), teacher_weight) if teacher_bias is not None else None
+    f32 = dict(device = device, dtype = torch.float32)
+    if num_items_in_batch is None:
+        divisor = keep.sum().to(**f32)
+    else:
+        divisor = torch.as_tensor(num_items_in_batch).to(**f32).reshape(-1)[:1].reshape(())
+    divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
+    if scaling is None:
+        scaling = torch.ones((), **f32)
+    else:
+        scaling = torch.as_tensor(scaling).to(**f32).reshape(())
+        scaling = torch.where(scaling == 0, torch.ones_like(scaling), scaling)
+    loss = getattr(torch.ops.unsloth_zoo, _JSD_OP)(
+        hidden2, student_weight, student_bias, t_hidden2, teacher_weight, teacher_bias, keep, divisor, scaling,
+        beta, temperature, float(student_logit_scale or 1.0), float(student_logit_softcapping or 0.0),
+        float(teacher_logit_scale or 1.0), float(teacher_logit_softcapping or 0.0),
+        _compute_dtype(student_hidden, student_weight), _compute_dtype(teacher_hidden, teacher_weight),
+        need_h, need_w, need_b, int(rows_per_chunk or 0),
+    )[0]
+    return loss
