@@ -108,8 +108,9 @@ def test_a_host_with_no_device_claims_no_capability():
 
 
 def test_without_the_variable_the_import_still_refuses():
-    """The documented refusal is not what this fix relaxes."""
+    """The documented refusal is not what this fix relaxes. A driverless host now gets the CPU
+    training backend instead, so opt out of it to reach the refusal."""
     _needs_cuda_build()
-    out = _run("import unsloth_zoo.compiler")
+    out = _run("import unsloth_zoo.compiler", UNSLOTH_DISABLE_CPU_FALLBACK = "1")
     assert out.returncode != 0, out.stdout
     assert "You need a GPU" in out.stderr, out.stderr[-2000:]

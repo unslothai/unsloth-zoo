@@ -50,7 +50,7 @@ def _grad(rows, loss_type, epsilon_high, accumulation, processes):
 
 
 @pytest.mark.parametrize("loss_type, epsilon_high", [
-    ("grpo", 0.2), ("bnpo", 0.2), ("dr_grpo", 0.2), ("dapo", 0.28), ("sapo", 0.2), ("luspo", 0.2), ("cispo", 5.0),
+    ("grpo", 0.2), ("dr_grpo", 0.2), ("dapo", 0.28), ("sapo", 0.2), ("luspo", 0.2), ("cispo", 5.0),
 ])
 def test_split_batch_matches_one_gpu(loss_type, epsilon_high):
     whole = _grad(list(range(N)), loss_type, epsilon_high, accumulation = 1, processes = 1)
@@ -62,12 +62,15 @@ def test_split_batch_matches_one_gpu(loss_type, epsilon_high):
     torch.testing.assert_close(split, whole, rtol = 1e-12, atol = 1e-14)
 
 
-def test_bnpo_without_global_token_count_keeps_the_micro_batch_mean():
+# TRL's bnpo is the micro-batch token mean even when num_items_in_batch is set; dapo is the split-invariant one.
+@pytest.mark.parametrize("num_items_in_batch", [None, MASK.sum()])
+def test_bnpo_keeps_the_micro_batch_mean(num_items_in_batch):
     w = torch.nn.Parameter(W0.clone())
     new = torch.log_softmax(X[:2] @ w.T, -1).gather(-1, IDS[:2].unsqueeze(-1)).squeeze(-1)
     loss, *_ = grpo_compute_loss(
         new.detach() + REF[:2], new, new.detach(), None, IDS[:2], MASK[:2], 0.0, ADV[:2],
-        loss_type = "bnpo", num_items_in_batch = None, current_gradient_accumulation_steps = 2,
+        loss_type = "bnpo", num_items_in_batch = num_items_in_batch, current_gradient_accumulation_steps = 2,
+        num_processes = 2, steps_per_generation = 2,
     )
     per_token = -ADV[:2, None] * torch.ones_like(new)  # ratio 1 at old = new, beta 0
     expected = (per_token * MASK[:2]).sum() / MASK[:2].sum() / 2

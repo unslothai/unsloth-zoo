@@ -639,65 +639,42 @@ def test_wrap_vllm_generate_records_and_is_idempotent(replay):
     assert rr.routing_replay_stats()["recorded"] == 1
 
 
-@pytest.mark.parametrize("as_list", [False, True])
-def test_routed_experts_prompt_start_keeps_routes_on_their_tokens(replay, as_list):
-    # vLLM's SamplingParams.routed_experts_prompt_start = 2 drops the first two prompt tokens from
-    # the capture, so its first row belongs to token 2. Tokens 0 and 1 have no routing to replay.
-    routed = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
-    params = [SimpleNamespace(routed_experts_prompt_start = 0), SimpleNamespace(routed_experts_prompt_start = 2)]
-    request = lambda start: SimpleNamespace(
-        prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6 + start, 7, 8], routed_experts = routed[start:])],
-    )
-    llm = SimpleNamespace(generate = lambda prompts, sampling_params = None: [request(0), request(2)] if as_list else [request(2)])
-    rr.wrap_vllm_generate(llm)
-    if as_list:
-        llm.generate([], params)
-    else:
-        llm.generate([], sampling_params = params[1])
-    rows = rr._lookup((3, 4, 5, 8, 7, 8))
-    assert torch.equal(rows[:2].long(), torch.full((2, NUM_LAYERS, TOP_K), -1))
-    assert torch.equal(rows[2:5].long(), torch.as_tensor(routed[2:5]).long())
-    assert torch.equal(rows[5].long(), torch.full((NUM_LAYERS, TOP_K), -1))
-    if as_list:
-        assert torch.equal(rr._lookup((3, 4, 5, 6, 7, 8))[:5].long(), torch.as_tensor(routed).long())
-
-
 def test_prompt_start_accepts_any_sampling_params_sequence(replay):
     # vLLM pairs any collections.abc.Sequence of SamplingParams with the prompts, not only lists.
     from collections import UserList
     routed = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
     request = SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = routed[2:])])
-    rr.record_routed_experts([request], sampling_params = UserList([SimpleNamespace(routed_experts_prompt_start = 2)]))
+    llm = rr.wrap_vllm_generate(SimpleNamespace(generate = lambda prompts, sampling_params = None: [request]))
+    llm.generate([], UserList([SimpleNamespace(routed_experts_prompt_start = 2)]))
     rows = rr._lookup((3, 4, 5, 6, 7, 8))
     assert torch.equal(rows[:2].long(), torch.full((2, NUM_LAYERS, TOP_K), -1))
     assert torch.equal(rows[2:5].long(), torch.as_tensor(routed[2:5]).long())
 
 
-def test_prompt_start_reuses_routes_of_an_earlier_turn(replay):
-    # Multi-turn: turn 2 sets routed_experts_prompt_start to the length of turn 1's sequence, so vLLM
-    # returns only the new tokens. The skipped prefix replays what turn 1 recorded for those tokens.
+@pytest.mark.parametrize("start", [5, 6])
+def test_prompt_start_reuses_routes_of_an_earlier_turn(replay, start):
+    # Multi-turn: turn 2 skips the rows turn 1 already returned (5 rows of its 6 tokens, or all 6).
     turn1 = (np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS)[:-1]
-    turn2 = (np.arange(3 * NUM_LAYERS * TOP_K).reshape(3, NUM_LAYERS, TOP_K) + 3) % NUM_EXPERTS
-    rr.record_routed_experts([SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = turn1)])])
     prompt2 = [3, 4, 5, 6, 7, 8, 9, 10]
-    rr.record_routed_experts(
-        [SimpleNamespace(prompt_token_ids = prompt2, outputs = [SimpleNamespace(token_ids = [11, 12], routed_experts = turn2)])],
-        sampling_params = SimpleNamespace(routed_experts_prompt_start = 6),
-    )
+    turn2 = (np.arange((10 - 1 - start) * NUM_LAYERS * TOP_K).reshape(-1, NUM_LAYERS, TOP_K) + 3) % NUM_EXPERTS
+    rr.record_routed_experts([SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = turn1)])])
+    def second(ids):
+        return SimpleNamespace(prompt_token_ids = ids, outputs = [SimpleNamespace(token_ids = [11, 12], routed_experts = turn2)])
+
+    # A same-call sibling with an unrouted prefix must not mask turn 1's rows.
+    rr.record_routed_experts([second(prompt2), second(prompt2)], prompt_starts = [start, start])
     rows = rr._lookup(tuple(prompt2 + [11, 12]))
     assert torch.equal(rows[:5].long(), torch.as_tensor(turn1).long())
-    # Turn 1 never forwarded its last sampled token and turn 2 skipped it, so it keeps natural routing.
-    assert torch.equal(rows[5].long(), torch.full((NUM_LAYERS, TOP_K), -1))
-    assert torch.equal(rows[6:9].long(), torch.as_tensor(turn2).long())
+    if start == 6:
+        # Turn 1 never forwarded its last sampled token and turn 2 skipped it: natural routing.
+        assert torch.equal(rows[5].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[start:9].long(), torch.as_tensor(turn2).long())
     assert torch.equal(rows[9].long(), torch.full((NUM_LAYERS, TOP_K), -1))
-    # A prefix no earlier turn recorded stays unrouted.
-    rr.record_routed_experts(
-        [SimpleNamespace(prompt_token_ids = [1, 2, 3, 4, 5, 6, 7, 8], outputs = [SimpleNamespace(token_ids = [11, 12], routed_experts = turn2)])],
-        sampling_params = SimpleNamespace(routed_experts_prompt_start = 6),
-    )
+    # A prefix no earlier capture shares stays unrouted.
+    rr.record_routed_experts([second([1, 2, 3, 4, 5, 6, 7, 8])], prompt_starts = [start])
     rows = rr._lookup((1, 2, 3, 4, 5, 6, 7, 8, 11, 12))
-    assert torch.equal(rows[:6].long(), torch.full((6, NUM_LAYERS, TOP_K), -1))
-    assert torch.equal(rows[6:9].long(), torch.as_tensor(turn2).long())
+    assert torch.equal(rows[:start].long(), torch.full((start, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[start:9].long(), torch.as_tensor(turn2).long())
 
 
 def test_rollout_split_into_many_generate_calls_is_kept_whole(replay):

@@ -463,12 +463,14 @@ jobs:
               tests/test_mlx_incomplete_config.py \
               tests/test_mlx_incomplete_config_vlm.py \
               tests/test_mlx_adam_epsilon.py \
+              tests/test_mlx_group_by_length.py \
               tests/test_mlx_optimizer_torch_parity.py \
               tests/test_hf_xet_fallback.py \
               tests/test_hf_xet_fallback_blob_scoped_redownload.py \
               tests/test_download_helpers_import_without_zoo_init.py \
               tests/test_llama_cpp_install_consent.py \
               tests/test_llama_cpp_consent_platforms.py \
+              tests/test_llama_cpp_subprocess_utf8_encoding.py \
               tests/test_converter_source_staging.py \
               tests/test_get_transformers_model_type_empty.py \
               tests/test_train_on_responses_list_labels.py \
@@ -1217,6 +1219,7 @@ jobs:
                   tests/test_deepseek_v3_grpo_hidden_states.py \
                   tests/test_moe_hidden_states_wrapper.py \
                   tests/test_aya_vision_logit_scale.py \
+                  tests/test_umt5_transformers5.py \
                   tests/test_vision_utils_grid_helpers_eager.py \
                   tests/test_modeling_local_vision_helpers_eager.py \
                   tests/test_disable_compile_functions_reach_imported_helpers.py \

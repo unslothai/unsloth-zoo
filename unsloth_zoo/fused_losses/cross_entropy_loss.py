@@ -334,6 +334,10 @@ class UnslothFusedLoss(torch.autograd.Function):
         """
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
+        # A float scale is value-guarded (recompile per GradScaler step); a 0-dim float32 tensor gives the same product.
+        chunk_scaling = scaling
+        if scaling is not None and not torch.is_tensor(scaling):
+            chunk_scaling = torch.full((), float(scaling), dtype = torch.float32, device = device)
         # Thread ignore_index through label-shift and the inner CE call.
         ignore_index = int(extra_kwargs.get("ignore_index", -100))
 
@@ -359,7 +363,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         # N items divisor
         divisor = n_items if n_items is not None else (labels != ignore_index).sum()
         if not torch.is_tensor(divisor):
-            divisor = torch.tensor(divisor, dtype = torch.float32, device = device)
+            # torch.full is a fill kernel; torch.tensor(..., device = cuda) is a blocking H2D copy.
+            divisor = torch.full((), divisor, dtype = torch.float32, device = device)
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
         divisor = _nonzero_count(divisor.to(dtype = torch.float32, device = device))
@@ -554,7 +559,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -579,7 +584,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -595,7 +600,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -613,7 +618,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -753,7 +758,12 @@ def unsloth_fused_ce_loss(
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     """
     scaler = trainer.accelerator.scaler if trainer is not None else None
-    # Get mixed precision scaling if seen
+    # Get mixed precision scaling if seen. The scale only multiplies the gradients saved in the
+    # forward (the returned loss is unscaled), so no-grad scoring skips GradScaler.get_scale():
+    # it is a host sync and torch.compile cannot trace it (fullgraph eval would fail).
+    if not torch.is_grad_enabled():
+        scaler = None
+        if hasattr(scaling, "get_scale"): scaling = None
     scaling = scaler.get_scale() if scaler is not None else scaling
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
     if TARGET_GB: target_gb = float(TARGET_GB)

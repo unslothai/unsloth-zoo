@@ -22,6 +22,7 @@ import warnings
 from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import functools
+import contextlib
 # Guarded because tests load this file by path rather than as
 # `unsloth_zoo.temporary_patches.misc`, where a two-level relative import
 # raises "attempted relative import beyond top-level package".
@@ -1228,6 +1229,9 @@ def patch_sdpa_bool_causal_mask():
         is_causal = None,
         **kwargs,
     ):
+        # Moonshine's is_causal is a SymBool under dynamic shapes, which SDPA rejects; bool() still breaks, a branch guards.
+        if is_causal is not None:
+            is_causal = True if is_causal else False
         m = attention_mask
 
         # Below 2**16 the Cutlass bool-mask overflow (pytorch/pytorch#162588)
@@ -3175,30 +3179,6 @@ def _sft_logits_are_unusable(logits):
 pass
 
 
-def _sft_raised_on_empty_logits(exception):
-    """Decided on the object trl was holding, not on the exception message.
-
-    Which exception comes out depends on which sentinel the model returned and
-    which attribute the installed trl reaches for first:
-
-        EmptyLogits().shape[:-1]      TypeError    ('function' not subscriptable)
-        EmptyLogits()[..., :-1, :]    NotImplementedError
-        torch.empty(0)[..., :-1, :]   IndexError   (too many indices)
-        torch.empty(0).argmax(-1)     RuntimeError
-
-    so a message match fixes one build and misses the next. The failing frame
-    still holds trl's `outputs`, so the question can be asked of the logits
-    themselves: if they are real, this is somebody's genuine bug and it must
-    keep propagating.
-
-    Matched on the local rather than on the frame's name, because the raise can
-    land in a helper trl called and because the enclosing method has been
-    renamed before. The stack starts inside SFTTrainer.compute_loss either way.
-    """
-    return _sft_empty_logits_outputs(exception) is not None
-pass
-
-
 _SFT_NO_LOGITS = object()
 
 
@@ -3849,3 +3829,66 @@ def patch_output_collector_for_compiled_submodules():
     cls._unsloth_eager_mirror = True
 pass
 TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
+
+
+@contextlib.contextmanager
+def output_capture_scratch():
+    """Eager wrapper around one compiled decoder-layer call: capture hooks append into empty scratch lists.
+
+    A capture hook traced inside the compiled layer (router_logits for the MoE aux loss) appends to the
+    collector's list, and Dynamo guards on that list's length, which is the layer index: every layer
+    recompiled once and deep MoE models ran into the recompile limit. Inside this context the compiled
+    code reads a mirror whose lists start empty on every call; their items are moved to the real lists
+    afterwards, in call order. hidden_states keeps the real list (its hook reads the length)."""
+    try:
+        from transformers.utils import output_capturing
+        var = output_capturing._active_collector
+    except Exception:
+        yield
+        return
+    state = getattr(var, "__dict__", {})
+    value = state.get("_unsloth_eager_value")
+    if not isinstance(value, dict) or not state.get("_unsloth_eager_single", True) or \
+            getattr(state.get("_unsloth_eager_tls"), "depth", 0) <= 0:
+        yield
+        return
+    keys = [k for k, v in value.items() if type(v) is list and k != "hidden_states"]
+    if not keys:
+        yield
+        return
+    scratch = dict(value)
+    starts = {k: len(value[k]) for k in keys}
+    for k in keys:
+        scratch[k] = []
+    var._unsloth_eager_value = scratch
+    try:
+        yield
+    finally:
+        # A nested set / reset inside the call replaced the mirror: leave theirs.
+        if var.__dict__.get("_unsloth_eager_value") is scratch:
+            var._unsloth_eager_value = value
+        # Inserted where the context began: after a nested reset, later hooks append straight to
+        # value, and the scratch items were captured before them.
+        for k in keys:
+            value[k][starts[k]:starts[k]] = scratch[k]
+pass
+
+
+def patch_HiggsAudioV2Embeddings_autocast_dtype():
+    # CUDA autocast runs sum() in float32, so masked_scatter gets float32 audio beside bf16 text embeddings and raises.
+    try:
+        from transformers.models.higgs_audio_v2.modeling_higgs_audio_v2 import HiggsAudioV2Embeddings
+    except Exception as e:
+        return raise_error("HiggsAudioV2Embeddings", e)
+    original_forward = HiggsAudioV2Embeddings.forward
+    if getattr(original_forward, "_unsloth_patched", False):
+        return
+
+    @functools.wraps(original_forward)
+    def forward(self, input_ids):
+        return original_forward(self, input_ids).to(self.embed_audio_tokens.weight.dtype)
+
+    forward._unsloth_patched = True
+    HiggsAudioV2Embeddings.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_HiggsAudioV2Embeddings_autocast_dtype)
