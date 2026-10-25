@@ -150,6 +150,36 @@ def test_jsd_fp32_and_chunking(beta):
         outs.append(h.grad)
 
 
+@pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
+def test_peaked_rows_match_fp64(beta):
+    """Top logit leading the rest by 20..80 (Liger #1555: fp32 softmax rounds to 1 past ~16.6): still exact in fp32."""
+    g = torch.Generator().manual_seed(11)
+    n = 12
+    ws = torch.eye(V)  # logits == hidden
+    hs = torch.randn(n, V, generator = g)
+    ht = torch.randn(n, V, generator = g)
+    lead = torch.tensor([20.0, 40.0, 80.0]).repeat(n // 3)
+    peak = torch.randint(0, V, (n,), generator = g)
+    hs[torch.arange(n), peak] += lead
+    # Teacher: mildly peaked on the student's token on odd rows, sharply peaked on another token on even rows,
+    # so the true gradient is O(1) (both collapsed onto one token leaves only rounding noise to compare).
+    ht[torch.arange(1, n, 2), peak[1::2]] += 3.0
+    ht[torch.arange(0, n, 2), (peak[::2] + 1) % V] += lead[::2]
+    labels = torch.randint(0, V, (n,), generator = g)
+    ref, gh, _, _ = _oracle(hs, ws, None, ht, ws, None, labels, beta, 1.0)
+    h = hs.clone().requires_grad_(True)
+    loss = fl.fused_linear_jsd(h, ws, ht, ws, labels = labels, beta = beta)
+    loss.backward()
+    torch.testing.assert_close(loss.double(), ref, rtol = 1e-5, atol = 1e-6)
+    # Peaked rows have exponentially small true gradients for beta > 0, so compare at the fp32 noise floor of O(1)
+    # logits; the beta = 0 rows keep O(0.1) gradients and must match tightly.
+    err = (h.grad.double() - gh).norm(dim = -1)
+    assert torch.isfinite(h.grad).all()
+    assert (err <= 1e-6 + 1e-5 * gh.norm(dim = -1)).all(), err
+    # The collapse symptom: with W = I the hidden gradient is d loss / d logits, which must sum to zero per row.
+    assert h.grad.double().sum(-1).abs().max().item() < 1e-6
+
+
 def test_fully_masked_is_finite_zero():
     hs, ws, _, ht, wt, _, labels = _case(3)
     h = hs.clone().requires_grad_(True)
