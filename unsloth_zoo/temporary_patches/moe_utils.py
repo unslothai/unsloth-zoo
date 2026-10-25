@@ -1438,23 +1438,46 @@ def _capped_dequant_plan(sources, num_tokens_per_expert, num_rows):
     return _SelectiveDequantPlan(E, num_rows, [(experts, 0, num_rows, offsets)])
 
 
-def _grouped_mm_slice(inputs, weight, offsets, plan):
-    """_grouped_mm_with_backward_fix for a slice of a planned problem: the Triton choice and
-    its tiles follow the whole (rows, experts) problem, so each group's result matches it."""
+def _slice_takes_triton(inputs, weight, plan):
     E, K, N = weight.shape
-    if (
+    if not (
         _GROUPED_MM_TRITON_OP is not None
         and inputs.device.type == "cuda"
         and inputs.dtype in (torch.bfloat16, torch.float16)
         and weight.dtype == inputs.dtype
         and _triton_grouped_mm_rows_ok(inputs.device, plan.num_rows, plan.num_experts, K, N)
     ):
+        return False
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+    return mg.triton_grouped_available(inputs.device)
+
+
+def _grouped_mm_slice(inputs, weight, offsets, plan):
+    """_grouped_mm_with_backward_fix for a slice of a planned problem: the Triton choice and
+    its tiles follow the whole (rows, experts) problem, so each group's result matches it."""
+    if _slice_takes_triton(inputs, weight, plan):
         from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
-        if mg.triton_grouped_available(inputs.device):
-            return mg.generic_grouped_mm(
-                inputs.contiguous(), weight, offsets, config_rows = (plan.num_rows, plan.num_experts),
-            )
+        return mg.generic_grouped_mm(
+            inputs.contiguous(), weight, offsets, config_rows = (plan.num_rows, plan.num_experts),
+        )
     return _grouped_mm_eager(inputs, weight, offsets)
+
+
+def _slice_reads_views(inputs, weight, plan):
+    # Triton and the sm90 / sm100 grouped GEMMs (behind the view probe) give the copy's bits. A per-expert cuBLAS
+    # loop (torch._grouped_mm elsewhere, our fallback) does not: a transposed operand takes another kernel (T4 fp16, K 5760: 3x max error).
+    if _slice_takes_triton(inputs, weight, plan):
+        return True
+    device = inputs.device
+    if device.type != "cuda" or torch.version.hip is not None:
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _triton_grouped_mm_capability(index)[0] in (9, 10) and _grouped_mm_supported_on(device)
+
+
+def _transposed_for_slice(weight, inputs, plan):
+    weight = weight.transpose(-2, -1)
+    return weight if _slice_reads_views(inputs, weight, plan) else weight.contiguous()
 
 
 def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
@@ -1462,13 +1485,13 @@ def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
         experts, _, _, offsets = plan.chunks[0]
         weight = weight_provider(experts)
         if transpose:
-            weight = weight.transpose(-2, -1).contiguous()
+            weight = _transposed_for_slice(weight, inputs, plan)
         return _grouped_mm_slice(inputs, weight, offsets, plan)
     out = None
     for experts, row_lo, row_hi, offsets in plan.chunks:
         weight = weight_provider(experts)
         if transpose:
-            weight = weight.transpose(-2, -1).contiguous()
+            weight = _transposed_for_slice(weight, inputs, plan)
         rows = inputs[row_lo : row_hi]
         if rows.data_ptr() % 16:
             rows = rows.clone()   # grouped GEMMs want 16-byte aligned operands
