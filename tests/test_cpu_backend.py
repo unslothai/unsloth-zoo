@@ -1138,3 +1138,29 @@ def test_cpu_compile_without_a_toolchain_trains_eagerly(monkeypatch, capsys):
     assert "training eagerly" in capsys.readouterr().out
     assert not getattr(model, "_unsloth_cpu_compiled", False)
     assert not hasattr(model.model.layers[0], "_compiled_call_impl") or model.model.layers[0]._compiled_call_impl is None
+
+
+def test_generate_runs_compiled_layers_eagerly(monkeypatch):
+    """Compiled training layers would recompile per layer against a KV cache; generate() forces eager."""
+    from unsloth_zoo.cpu import loader
+    stances = []
+
+    class Stance:
+        def __init__(self, name):
+            stances.append(name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(torch.compiler, "set_stance", Stance, raising = False)
+    model = _tiny_llama()
+    loader.FastCPUModel._attach(model)
+    ids = torch.randint(0, 64, (1, 4))
+    model.generate(input_ids = ids, max_new_tokens = 2, do_sample = False)
+    assert stances == []
+    model.model.layers[0]._compiled_call_impl = model.model.layers[0]._call_impl  # what Module.compile() sets
+    model.generate(input_ids = ids, max_new_tokens = 2, do_sample = False)
+    assert stances == ["force_eager"]

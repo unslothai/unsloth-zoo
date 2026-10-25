@@ -498,6 +498,13 @@ def _unpack_encoding_generate(generate):
         if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
+        set_stance = getattr(torch.compiler, "set_stance", None)
+        modules = self.modules() if isinstance(self, torch.nn.Module) else ()
+        if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
+            # UNSLOTH_CPU_COMPILE layers are compiled for training; with a KV cache every layer would recompile
+            # (the cache guards on each layer's state) until the recompile limit, costing seconds per layer.
+            with set_stance("force_eager"):
+                return generate(self, *args, **kwargs)
         return generate(self, *args, **kwargs)
     wrapper._unsloth_cpu = True
     return wrapper
