@@ -1272,3 +1272,50 @@ def test_windows_compile_without_build_tools_says_how_to_install(monkeypatch):
         assert "Build Tools" in loader._cpu_compile_unavailable()
     finally:
         loader._cpu_compile_unavailable.cache_clear()
+
+
+def _confident_rows(margins, vocab = 1003, hidden_size = 64):
+    """fp64 hidden states whose target logit leads every other class by the given margins."""
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn(vocab, hidden_size, generator = generator, dtype = torch.float64) * 0.1
+    hidden = torch.randn(len(margins), hidden_size, generator = generator, dtype = torch.float64)
+    targets = torch.randint(0, vocab, (len(margins),), generator = generator)
+    for i, margin in enumerate(margins):
+        logits = hidden[i] @ weight.t()
+        others = logits.clone()
+        others[targets[i]] = -math.inf
+        direction = weight[targets[i]] / weight[targets[i]].norm() ** 2
+        hidden[i] += direction * (others.max() - logits[targets[i]] + margin)
+    return hidden, weight, targets
+
+
+@pytest.mark.parametrize("path", ["frozen_head", "trainable_head", "chunked_ce"])
+def test_confident_rows_keep_their_gradient(path):
+    """Softmax collapse: past a ~16.6 margin p_t rounds to 1 in fp32, so log p_t and 1 - p_t read 0 and the
+    row's gradient was 100% wrong. Oracle: fp64 -softplus(lse(others) - z_t) (plain fp64 log_softmax collapses too)."""
+    from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy, cpu_chunked_log_probs
+    margins = [0, 5, 17, 20, 30, 50]
+    hidden, weight, targets = _confident_rows(margins)
+    reference_hidden = hidden.clone().requires_grad_(True)
+    logits = reference_hidden @ weight.t()
+    target_logit = logits.gather(-1, targets[:, None]).squeeze(-1)
+    others = torch.logsumexp(logits.scatter(-1, targets[:, None], -math.inf), dim = -1)
+    reference = -F.softplus(others - target_logit)
+    reference.sum().backward()
+
+    h32 = hidden.float().requires_grad_(True)
+    if path == "chunked_ce":
+        labels = torch.cat([targets.new_full((1,), -100), targets])[None]  # position i predicts labels[i + 1]
+        h = h32[None]
+        chunked_linear_cross_entropy(h, weight.float(), labels, num_items_in_batch = 1).backward()
+        grad, log_probs = -h32.grad, None
+    else:
+        w32 = weight.float().requires_grad_(path == "trainable_head")
+        log_probs = cpu_chunked_log_probs(h32, w32, None, targets, 1.0, 64)[0]
+        log_probs.sum().backward()
+        grad = h32.grad
+    rel = (grad.double() - reference_hidden.grad).norm(dim = -1) / reference_hidden.grad.norm(dim = -1)
+    assert float(rel.max()) < 1e-4, rel
+    if log_probs is not None:
+        assert bool((log_probs < 0).all())
+        assert torch.allclose(log_probs.double(), reference.detach(), rtol = 1e-4, atol = 0)

@@ -38,6 +38,23 @@ def _cpu_fp16_autocast():
         return torch.is_autocast_cpu_enabled() and torch.get_autocast_cpu_dtype() == torch.float16
 
 
+def _softmax_without_collapse(z, y, keep_logits = False):
+    """softmax(z) with the target column zeroed, log softmax(z)[y] and the shifted target logit, (rows, 1).
+
+    The sum over the other classes is formed apart from the target's exp(0) = 1: when the target
+    leads by more than ~16.6 (fp32), p_t rounds to 1 and log p_t, 1 - p_t read 0 (softmax collapse,
+    arXiv 2610.31642, as fixed in fused_losses/fused_linear.py). z is shifted in place; with
+    keep_logits the exponentials go to a new tensor so the shifted logits survive.
+    """
+    z.sub_(z.amax(-1, keepdim = True))
+    target = z.gather(-1, y)
+    p = torch.exp(z) if keep_logits else z.exp_()
+    others = p.scatter_(-1, y, 0.0).sum(-1, keepdim = True)
+    log_p_target = -F.softplus(torch.log(others) - target)
+    p.div_(others + torch.exp(target))
+    return p, log_p_target, target
+
+
 class _ChunkedLinearCrossEntropy(torch.autograd.Function):
     """sum CE(hidden @ weight.T, labels) / divisor without materialising the (rows, vocab) logits.
 
@@ -62,15 +79,13 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             h = hidden[start:end]
             y = labels[start:end]
             logits = (h @ weight.t()).float()
-            lse = torch.logsumexp(logits, dim = -1)
             valid = y != ignore_index
-            safe_y = torch.where(valid, y, torch.zeros_like(y))
-            target = logits.gather(-1, safe_y.unsqueeze(-1)).squeeze(-1)
-            total += ((lse - target) * valid).sum()
+            safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
+            logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
+            total -= (log_p_target.squeeze(-1) * valid).sum()
             if need_hidden_grad or need_weight_grad:
-                # d/dlogits of sum CE = softmax - onehot on valid rows, zero elsewhere.
-                logits.sub_(lse.unsqueeze(-1)).exp_()
-                logits.scatter_add_(-1, safe_y.unsqueeze(-1), -torch.ones_like(target).unsqueeze(-1))
+                # d/dlogits of sum CE = softmax - onehot on valid rows, zero elsewhere; p_t - 1 = expm1(log p_t).
+                logits.scatter_(-1, safe_y, torch.expm1(log_p_target))
                 logits.mul_(valid.unsqueeze(-1))
                 if need_hidden_grad:
                     if exact:
@@ -116,8 +131,12 @@ def _logprob_piece(hidden, weight, bias, targets, inv_t, softcap, logit_scale, w
     if softcap is not None:
         logits = softcap * torch.tanh(logits / softcap)
     logits = logits * inv_t
-    log_z = torch.logsumexp(logits, dim = -1)
-    log_probs = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1) - log_z
+    y = targets.unsqueeze(-1)
+    target = logits.gather(-1, y).squeeze(-1)
+    # log p_t = -softplus(lse(others) - z_t): its gradient keeps 1 - p_t when the target dominates (softmax collapse).
+    log_others = torch.logsumexp(logits.scatter(-1, y, float("-inf")), dim = -1)
+    log_probs = -F.softplus(log_others - target)
+    log_z = target - log_probs
     if not want_entropy:
         return log_probs, log_z
     entropy = log_z - (torch.softmax(logits, dim = -1) * logits).sum(-1)
@@ -164,22 +183,18 @@ class _ChunkedLogProbs(torch.autograd.Function):
             if top1 is not None:
                 # First-argmax, like the kernel's `target >= max and target > max before it`.
                 top1[start:end] = z.argmax(-1) == targets[start:end]
-            z.sub_(z.amax(-1, keepdim = True))  # in place: shifted logits, the raw ones are not needed below
-            target = z.gather(-1, y)
             # The entropy still needs the shifted logits; otherwise exponentiate in place.
-            p = torch.exp(z) if entropy is not None else z.exp_()
-            total = p.sum(-1, keepdim = True)
-            log_total = torch.log(total)
-            log_probs[start:end] = (target - log_total).squeeze(-1)
-            p.div_(total)
+            p, log_p, target = _softmax_without_collapse(z, y, keep_logits = entropy is not None)
+            log_probs[start:end] = log_p.squeeze(-1)
+            p_target = torch.exp(log_p).squeeze(-1)  # p's target column is zero
             if entropy is not None:
-                # H = -sum p log p = log(total) - sum p * shifted.
-                entropy[start:end] = log_total.squeeze(-1) - rowdot(p, z)
+                # H = -sum p log p = log(total) - sum p * shifted, log(total) = shifted target - log p_t.
+                entropy[start:end] = (target - log_p).squeeze(-1) - rowdot(p, z) - p_target * target.squeeze(-1)
             if sq is not None:
-                sq[start:end] = torch.log(rowdot(p, p))
+                sq[start:end] = torch.log(rowdot(p, p) + p_target * p_target)
             if need_grad:
                 # d log_softmax(z)[y] / dz = onehot(y) - p, then through the scale / soft cap / temperature.
-                p.neg_().scatter_add_(-1, y, torch.ones_like(y, dtype = p.dtype))
+                p.neg_().scatter_(-1, y, -torch.expm1(log_p))
                 if not (isinstance(slope, float) and slope == 1.0):
                     p.mul_(slope)
                 if exact:
