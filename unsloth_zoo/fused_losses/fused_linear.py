@@ -614,8 +614,7 @@ if _HAS_TRITON:
         tl.store(out_ptr + offs, (x * g).to(out_ptr.dtype.element_ty), mask = ok)
 
 
-    # GKD generalized JSD over two heads' raw fp32 logits [R, V]: grid (rows, vocab blocks), so a few hundred rows
-    # still fill the card (a row-per-program reduction leaves most SMs idle at R = 128..256).
+    # GKD generalized JSD over two heads' fp32 logits [R, V]; grid (rows, vocab blocks) fills the card at small R.
     @triton.jit
     def _fl_jsd_load(s_ptr, t_ptr, row, cols, ok, stride, s_scale, s_cap, t_scale, t_cap, inv_t,
                      S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr):
@@ -1999,7 +1998,7 @@ def _jsd_compiled(device):
         try:
             from unsloth_zoo.temporary_patches.common import _maybe_compile, torch_compile_options
 
-            # Static shapes (every chunk is padded to the same rows): 1.8x faster and fewer live buffers than dynamic.
+            # Static shapes (every chunk padded to the same rows): faster and fewer live buffers than dynamic.
             compiled = _maybe_compile(dynamic = False, fullgraph = True, options = torch_compile_options)(_jsd_body)
             fn = None if compiled is _jsd_body else compiled
         except Exception:
@@ -2038,8 +2037,7 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
         n_buf = 4 if fused is not None else _JSD_BUFFERS + (s_cap != 0.0)
         R = max(_jsd_rows(rows, n_keep, V, n_buf * sd.itemsize), 1)
         if fused is _jsd_triton and rows <= 0 and _JSD_TRITON_ROWS:
-            # Triton keeps 2.5 [rows, vocab] fp32 buffers (both logits + dz). Same rows as Unsloth's torch.func
-            # chunked JSD (2**26 logits, [64, 1024]), whose compiled chunk holds slightly more.
+            # Triton keeps 2.5 [rows, vocab] fp32 buffers; rows as in the torch.func chunked JSD (2**26 logits, [64, 1024]).
             R = min(1024, max(64, 1 << max(((1 << 26) // max(V, 1)).bit_length() - 1, 0)))
         pad = fused is not None and fused is not _jsd_triton
         if not pad:
