@@ -76,7 +76,6 @@ _CUDNN_GATE_CHECKS_GQA = _torch_version_at_least(2, 8)
 
 
 def _cudnn_takes_gqa(query, key, value, attn_mask, dropout_p, is_causal, scale):
-    # cuDNN takes GQA natively: when SDPA itself would pick cuDNN for the enable_gqa call, repeating k/v only costs memory.
     if not _CUDNN_GATE_CHECKS_GQA:
         return False
     try:

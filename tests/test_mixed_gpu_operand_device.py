@@ -180,7 +180,6 @@ def test_cudnn_check_on_the_current_card_does_not_switch(cudnn_two_cards):
     (True, True, False, 8),
 ])
 def test_cudnn_choice_decides_the_repeat(monkeypatch, cudnn_picked, gate_checks_gqa, cudnn_on, kv_heads):
-    # The enable_gqa call is kept only when SDPA itself would run it on cuDNN (torch >= 2.8, cuDNN SDPA on).
     from torch.nn.attention import SDPBackend
     monkeypatch.setattr(sdpa_gqa, "_flash_takes_gqa", lambda *a: False)
     monkeypatch.setattr(sdpa_gqa, "_efficient_takes", lambda *a: not a[-1])

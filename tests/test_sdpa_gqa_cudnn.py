@@ -168,7 +168,6 @@ def test_cudnn_gqa_retains_no_repeated_kv(cudnn_gqa):
 
 
 def test_cudnn_probe_on_the_current_card_matches_sdpa(cudnn_sdp_on):
-    # Single card: the probe needs no device switch and agrees with SDPA's own choice.
     q, k, v, mask = _inputs()
     choice = torch._fused_sdp_choice(q, k, v, mask, 0.0, False, scale = None, enable_gqa = True)
     expected = choice == int(SDPBackend.CUDNN_ATTENTION) and sdpa_gqa._CUDNN_GATE_CHECKS_GQA
