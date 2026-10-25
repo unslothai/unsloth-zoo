@@ -31,13 +31,20 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
 
-def test_symbool_is_causal_compiles_fullgraph():
+def test_symbool_is_causal_compiles_fullgraph(monkeypatch):
     import unsloth_zoo.temporary_patches.misc as misc
-
-    misc.patch_sdpa_bool_causal_mask()
     import transformers.integrations.sdpa_attention as sdpa_module
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    # CI runs with UNSLOTH_COMPILE_DISABLE=1, where the patch is (rightly) skipped; install it
+    # here and restore transformers' forward afterwards so the rest of the session is unchanged.
+    monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
+    monkeypatch.setattr(sdpa_module, "sdpa_attention_forward", sdpa_module.sdpa_attention_forward)
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS, "sdpa", ALL_ATTENTION_FUNCTIONS["sdpa"])
+    misc.patch_sdpa_bool_causal_mask()
 
     forward = sdpa_module.sdpa_attention_forward
+    assert getattr(forward, "__unsloth_bool_causal_mask_fix__", False)
 
     class Layer(torch.nn.Module):
         is_causal = True

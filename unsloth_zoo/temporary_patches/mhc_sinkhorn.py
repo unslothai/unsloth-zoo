@@ -14,23 +14,33 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Compilable Sinkhorn-Knopp for the DeepSeek-V4 / V4.1 mHC mixers (see `mhc_fast_mode`).
+"""Compilable Sinkhorn-Knopp for the DeepSeek-V4 / V4.1 and GLM-5.3-Flash mHC mixers (see `mhc_fast_mode`).
 
 `unsloth_sinkhorn_knopp` unrolls each token's n x n matrix into n * n pointwise tensors so Inductor
 fuses the chain instead of emitting one reduction kernel per normalisation. Its backward
 recomputes the iterates and uses `gx = (gy - sum(gy * y)) / d` per step (no `x / d / d` term).
 Eager runs transformers' own loop, so it stays bitwise identical to the stock module.
+
+`unsloth_mhc_projection` replaces the mixer's FP32 norm + projection outside torch.compile: plain
+autograd keeps the FP32 upcast of the `[tokens, hc_mult * hidden]` input for backward (twice the
+bytes of the bf16 streams, per mixer site); this saves only the bf16 input and reruns the cast,
+norm and projection in backward, bitwise identical. Compiled blocks keep the stock math.
 """
 
 import os
 
 import torch
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 __all__ = [
     "unsloth_sinkhorn_knopp",
+    "unsloth_mhc_projection",
     "mhc_fast_mode",
     "MHC_SINKHORN_SOURCE",
     "MHC_SINKHORN_REPLACEMENT",
+    "MHC_PROJECTION_SOURCE",
+    "MHC_PROJECTION_REPLACEMENT",
 ]
 
 
@@ -64,6 +74,38 @@ MHC_SINKHORN_SOURCE = (
 MHC_SINKHORN_REPLACEMENT = (
     "        comb = unsloth_sinkhorn_knopp(comb, self.hc_sinkhorn_iters, self.hc_eps)\n"
 )
+
+# Must occur exactly once in the mixer forward (DeepSeek-V4 / V4.1, GLM-5.3-Flash; transformers 5.17).
+MHC_PROJECTION_SOURCE = (
+    "        flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())\n"
+    "        pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)\n"
+)
+MHC_PROJECTION_REPLACEMENT = (
+    "        pre_w, post_w, comb_w = unsloth_mhc_projection(hidden_streams, self.input_norm, self.fn).split(\n"
+    "            [hc, hc, hc * hc], dim=-1\n"
+    "        )\n"
+)
+
+
+def _mhc_projection(hidden_streams, input_norm, fn):
+    flat = input_norm(hidden_streams.flatten(start_dim=2).float())
+    return F.linear(flat, fn.float())
+
+
+def unsloth_mhc_projection(hidden_streams, input_norm, fn):
+    """`F.linear(input_norm(hidden_streams.flatten(2).float()), fn.float())`, saving `hidden_streams`
+    (alive anyway) for backward instead of its FP32 upcast; backward reruns the same math."""
+    if (
+        torch.compiler.is_compiling()
+        or not torch.is_grad_enabled()
+        or hidden_streams.dtype == torch.float32
+        or not (hidden_streams.requires_grad or fn.requires_grad)
+    ):
+        return _mhc_projection(hidden_streams, input_norm, fn)
+    return checkpoint(
+        _mhc_projection, hidden_streams, input_norm, fn,
+        use_reentrant = False, preserve_rng_state = False,
+    )
 
 
 _MAX_UNROLLED_N = 8

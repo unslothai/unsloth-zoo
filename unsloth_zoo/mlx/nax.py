@@ -175,6 +175,11 @@ def _run_probe(module, function):
     return lines[-1] if lines else f"exit code {result.returncode}"
 
 
+@functools.cache  # read per call, a verify block of a sparse model spends more time here than on the GPU
+def _probe_build():
+    return f"{platform.mac_ver()[0]}|{_os_build()}|{mx.__version__}"
+
+
 def kernel_probe_passed(key: str, module: str, function: str, available = None) -> bool:
     """Run `module.function()` once in a subprocess; cache pass/fail per (macOS build, MLX version, key).
 
@@ -185,7 +190,7 @@ def kernel_probe_passed(key: str, module: str, function: str, available = None) 
     try:
         if not (available or nax_available)():
             return False
-        entry = f"{platform.mac_ver()[0]}|{_os_build()}|{mx.__version__}|{key}"
+        entry = f"{_probe_build()}|{key}"
         with _PROBE_LOCK:
             if entry not in _PROBES:
                 passed = _stored_probes().get(entry)
@@ -1015,8 +1020,9 @@ SORTED_GATHER_PROBE_KEY = "sorted_gather_qmm:" + hashlib.sha256(_SORTED_GATHER_S
 
 
 @functools.cache
-def _mlx_kernel_header(name):
-    """An installed MLX kernel header with the MLX headers it includes inlined, or None without them."""
+def _mlx_kernel_header(name, stop = None):
+    """An installed MLX kernel header with the MLX headers it includes inlined, or None without them; with `stop`,
+    only what precedes its top-level declaration of `stop`."""
     root, kernels = os.path.join(os.path.dirname(mx.__file__), "include"), "mlx/backend/metal/kernels/"
     seen = {kernels + preamble for preamble in _MLX_KERNEL_PREAMBLE}
 
@@ -1034,9 +1040,14 @@ def _mlx_kernel_header(name):
         return lines
 
     try:
-        return "\n".join(inline(kernels + name)) + "\n"
+        text = "\n".join(inline(kernels + name)) + "\n"
     except OSError:
         return None
+    if stop is None:
+        return text
+    found = re.search(rf"^\w.*\b{stop}\s*\(", text, re.M)
+    # From the line after the previous top-level closing brace, so a template line goes with its declaration.
+    return found and text[: text.index("\n", text.rfind("\n}", 0, found.start()) + 1) + 1]
 
 
 @functools.cache

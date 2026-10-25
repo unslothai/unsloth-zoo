@@ -484,8 +484,11 @@ def _packed_boundary_targets(packed_seq_lengths, token_count):
 
     No data-dependent shapes, so a compiled forward drops the same slots as the eager batch count.
     """
-    if torch.compiler.is_compiling() and isinstance(packed_seq_lengths, torch.Tensor):
-        # Clamping stands in for the eager filter, which lowers to nonzero and cannot trace.
+    if isinstance(packed_seq_lengths, torch.Tensor) and (
+        torch.compiler.is_compiling() or packed_seq_lengths.device.type == "cuda"
+    ):
+        # Clamp, not the eager filter (nonzero cannot trace; on CUDA it costs a D2H + H2D sync). Same slots:
+        # a 0 length repeats the previous start, index_fill_ is idempotent, a start at ends[-1] is never kept.
         lengths = packed_seq_lengths.reshape(-1).long().clamp_min(0)
     else:
         lengths = _normalize_packed_seq_lengths(packed_seq_lengths)
@@ -685,13 +688,16 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # zero total, since a short rank beside healthy ones has simply
                     # contributed 0 to a total that is still its right divisor.
                     count = torch.as_tensor(num_items_in_batch).reshape(()).to(torch.int64)
-                    flags = torch.tensor([int(degenerate), int(all_short)],
-                                         dtype = torch.int64, device = count.device)
-                    packed = torch.cat([count.reshape(1), flags])
+                    # Fill kernels, not torch.tensor(..., device = cuda): that is a blocking H2D copy.
+                    flags = [torch.full((), int(flag), dtype = torch.int64, device = count.device)
+                             for flag in (degenerate, all_short)]
+                    packed = torch.stack([count, *flags])
                     packed = self.accelerator.gather(packed).reshape(-1, 3)
                     num_items_in_batch = packed[:, 0].sum()
-                    degenerate = bool(packed[:, 1].any())
-                    all_short  = bool(packed[:, 2].all())
+                    # One D2H read for both flags, not one per bool().
+                    degenerate, all_short = (
+                        bool(flag) for flag in torch.stack([packed[:, 1].any(), packed[:, 2].all()]).tolist()
+                    )
                 else:
                     num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
             if torch.is_tensor(num_items_in_batch):
