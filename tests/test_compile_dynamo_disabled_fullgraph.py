@@ -48,6 +48,8 @@ import torch
 
 from unsloth_zoo.temporary_patches import utils as u
 
+pytestmark = pytest.mark.usefixtures("compile_enabled")
+
 
 @pytest.fixture(autouse = True)
 def clear_checkpoint_markers():
