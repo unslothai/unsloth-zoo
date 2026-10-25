@@ -315,3 +315,47 @@ def test_loss_binds_the_raw_logits_helper_locally_so_the_support_partial_reaches
     assert "_unsloth_truncated_support_scored" in src
     imports = src.split("vision_inputs = _grpo_get_vision_inputs(kwargs)", 1)[0]
     assert "chunked_selective_log_softmax," in imports
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+@pytest.mark.parametrize("sampling, triple", [
+    (dict(min_p = 0.1), (0, 1.0, 0.1)),
+    (dict(top_p = 0.9), (0, 0.9, 0.0)),
+    (dict(top_k = 20), (20, 1.0, 0.0)),
+])
+def test_cuda_automatic_kwargs_score_the_kept_set(monkeypatch, sampling, triple):
+    # Unset + truncated + IS correction: the kwargs the GRPO loss receives score the renormalised
+    # kept set on CUDA, so identical trainer / sampler logits give an IS ratio of 1 (full
+    # vocabulary would give the kept mass).
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
+    kwargs = rr.grpo_truncated_support_kwargs(_trainer(**sampling))
+    assert _support_only(kwargs) == dict(zip(("support_top_k", "support_top_p", "support_min_p"), triple))
+    g = torch.Generator().manual_seed(7)
+    hidden = torch.randn(2, 16, 64, generator = g)
+    head = torch.randn(4096, 64, generator = g) * 0.3
+    logits = (hidden.double() @ head.double().t())
+    probs = torch.softmax(logits, -1)
+    ids = torch.multinomial(probs.reshape(-1, 4096).float(), 1, generator = g).reshape(2, 16)
+    # fp64 kept set, vLLM order (min_p, then top_k / top_p), always keeping the scored token.
+    keep = torch.ones_like(logits, dtype = torch.bool)
+    top_k, top_p, min_p = triple
+    if min_p > 0:
+        keep &= probs >= min_p * probs.amax(-1, keepdim = True)
+    if top_k > 0:
+        keep &= logits >= logits.topk(top_k, -1).values[..., -1:]
+    if top_p < 1:
+        s, order = logits.masked_fill(~keep, float("-inf")).sort(-1)
+        cum = torch.softmax(s, -1).cumsum(-1)
+        drop_sorted = cum <= 1 - top_p
+        drop_sorted[..., -1] = False
+        keep &= ~torch.zeros_like(keep).scatter(-1, order, drop_sorted)
+    keep.scatter_(-1, ids[..., None], True)
+    masked = logits.masked_fill(~keep, float("-inf"))
+    oracle = torch.log_softmax(masked, -1).gather(-1, ids[..., None]).squeeze(-1)
+    full = torch.log_softmax(logits, -1).gather(-1, ids[..., None]).squeeze(-1)
+    got = rr.chunked_hidden_states_selective_log_softmax(
+        hidden.cuda(), head.cuda(), ids.cuda(), 2, **{k: v for k, v in kwargs.items()}
+    ).cpu().double()
+    torch.testing.assert_close(got, oracle, atol = 2e-4, rtol = 0)
+    assert (oracle - full).abs().max() > 1e-3  # the kept set really differs from the full vocabulary
