@@ -1699,16 +1699,10 @@ pass
 
 
 def grpo_truncated_support_kwargs(trainer):
-    """support_* kwargs for the chunked logprob helpers when the vLLM rollouts were truncated and the
-    trainer scores over the same kept set, else {}.
-
-    UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 always scores over the kept set, =0 never does. Unset, it does
-    exactly when the rollouts were truncated (top_k > 0, top_p < 1 or min_p > 0) AND their vLLM
-    logprobs feed the IS correction (vllm_importance_sampling_correction) or the off-policy mask:
-    vLLM's logprobs are then renormalised over the kept tokens, and a full-vocabulary trainer score
-    would bias every IS ratio by log(kept probability mass). Padded vocabulary rows alone (no
-    truncation) stay opt-in. Where the full vocabulary is scored while the truncated logprobs are
-    consumed, warns once (not under =0)."""
+    """support_* kwargs for the chunked logprob helpers when the trainer must score over the vLLM
+    rollouts' kept set, else {}. =1 always, =0 never; unset when the rollouts were truncated and their
+    (kept-set renormalised) logprobs feed the IS correction or off-policy mask, since a full-vocabulary
+    score would bias every IS ratio by log(kept mass). Warns once when that bias is left in (not under =0)."""
     if not getattr(trainer, "use_vllm", False):
         return {}
     support = grpo_sampling_support(trainer)
