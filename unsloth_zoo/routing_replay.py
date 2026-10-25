@@ -47,6 +47,7 @@ import os
 import re
 import warnings
 from collections import OrderedDict
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -55,7 +56,8 @@ ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 _MAX_ROLLOUTS = 2
 _MAX_CALLS_PER_ROLLOUT = 64
-_MAX_PENDING = 64
+# Leak guard only: evicting a forward awaiting its recompute makes that recompute route naturally.
+_MAX_PENDING = 1024
 
 
 def routing_replay_requested():
@@ -166,6 +168,7 @@ class _ReplayState:
         )
         self.changed = None
         self.warned_invalid = False
+        self.warned_evicted = False
 
 
 _STATE = _ReplayState()
@@ -206,6 +209,33 @@ def _count_conflicts(a, b):
         _STATE.stats["conflicting_routes"] = _STATE.stats.get("conflicting_routes", 0) + conflicts
 
 
+def _fill_prefix(rows, full, start, store):
+    """Fill rows [0, start) from this rollout's captures sharing that prefix; disagreeing captures leave -1."""
+    prefix = tuple(full[:start])
+    stores = [store]
+    if not _STATE.forwarded_since_record and _STATE.generations:
+        # Earlier rollouts ran on older weights: their routes are not this policy's.
+        stores += [call[0] for call in reversed(next(reversed(_STATE.generations.values())))]
+    merged = rows[:start].clone()
+    seen = torch.zeros(rows.shape[:-1], dtype = torch.bool)[:start]
+    conflict = seen.clone()
+    for candidate in stores:
+        for key, earlier in candidate.items():
+            m = min(start, len(key))
+            if m == 0 or earlier.shape[1:] != rows.shape[1:] or key[:m] != prefix[:m]:
+                continue
+            part = earlier[:m]
+            routed = ~(part < 0).all(dim = -1)
+            same = (part.sort(dim = -1).values == merged[:m].sort(dim = -1).values).all(dim = -1)
+            conflict[:m] |= routed & seen[:m] & ~same
+            new = routed & ~seen[:m]
+            if bool(new.any()):
+                merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
+                seen[:m] |= new
+    keep = seen & ~conflict
+    rows[:start] = torch.where(keep.unsqueeze(-1), merged, rows[:start])
+
+
 def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = None):
     """Store vLLM's per-token expert ids per finished completion. prompt_starts: per-request
     `SamplingParams.routed_experts_prompt_start` (prompt position of the first returned row)."""
@@ -241,6 +271,8 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
             for offset, part in parts:
                 n = max(0, min(len(full) - offset, part.shape[0]))
                 rows[offset : offset + n] = part[:n]
+            if start > 0 and not split:
+                _fill_prefix(rows, full, start, store)
             if rows.shape[-1] > 1:
                 # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.
                 ordered = rows.sort(dim = -1).values
@@ -306,7 +338,8 @@ def _lookup(key, exact = False):
 
 def _prompt_starts(args, kwargs, count):
     params = kwargs.get("sampling_params", args[1] if len(args) > 1 else None)
-    if isinstance(params, (list, tuple)):
+    # Same per-prompt test as vLLM's offline _params_to_seq; a SamplingParams is no Sequence.
+    if isinstance(params, Sequence):
         starts = [getattr(p, "routed_experts_prompt_start", 0) or 0 for p in params]
         if len(starts) != count:
             if any(starts):
@@ -415,7 +448,15 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
             _STATE.recomputed = False
         _STATE.record = {}
         _STATE.pending.append(_STATE.record)
-        del _STATE.pending[:-_MAX_PENDING]
+        if len(_STATE.pending) > _MAX_PENDING:
+            del _STATE.pending[:-_MAX_PENDING]
+            if not _STATE.warned_evicted:
+                _STATE.warned_evicted = True
+                warnings.warn(
+                    f"Unsloth: routing replay kept {_MAX_PENDING} checkpointed forwards without a backward; "
+                    "the oldest ones recompute with the trainer's own routing, so their gradients no longer "
+                    "match their forward. Run backward more often (fewer chunks per backward)."
+                )
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
         return None
@@ -499,25 +540,29 @@ def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
         # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
         return _NATURAL
     fp = _fingerprint(ids2)
-    match = torch.stack([(c[0] == fp).all() for c in candidates])
+    match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
     if signature is not None:
         # Narrow the natural matches to the forwards whose router input was the same too. Only a
         # refinement: when no input matches exactly, the natural matches stand as before.
-        same = [
-            (c[3] == signature).all() if len(c) > 3 and c[3] is not None and c[3].shape == signature.shape
-            else torch.zeros((), dtype = torch.bool, device = match.device)
-            for c in candidates
-        ]
-        exact = match & torch.stack(same).to(match.device)
+        has = [len(c) > 3 and c[3] is not None and c[3].shape == signature.shape for c in candidates]
+        if all(has):
+            same = (torch.stack([c[3] for c in candidates]) == signature).flatten(1).all(-1)
+        else:
+            same = torch.stack([
+                (c[3] == signature).all() if h else torch.zeros((), dtype = torch.bool, device = match.device)
+                for c, h in zip(candidates, has)
+            ])
+        exact = match & same.to(match.device)
         match = torch.where(exact.any(), exact, match)
-    pick = match.to(torch.int32).argmax()
+    # index_select, not forced_all[pick]: a 0-dim CUDA index is read back to the host.
+    pick = match.to(torch.int32).argmax().reshape(1)
     forced_all = torch.stack([c[1] for c in candidates])
-    forced = forced_all[pick]
+    forced = forced_all.index_select(0, pick)[0]
     # Several forwards with the same natural routing but different replays cannot be told
     # apart, so keep the natural routing there rather than guess. Only the expert set counts:
     # the same experts in another order route and weight every token identically.
     agree = ((forced_all.sort(-1).values == forced.sort(-1).values).flatten(1).all(-1) | ~match).all()
-    valid = torch.stack([c[2] for c in candidates])[pick] & match.any() & agree
+    valid = torch.stack([c[2] for c in candidates]).index_select(0, pick)[0] & match.any() & agree
     return forced, valid
 
 

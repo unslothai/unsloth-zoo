@@ -33,9 +33,10 @@ import functools
 import math
 import os
 import sys
-from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
 from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bounds
 from unsloth_zoo.device_type import DEVICE_TYPE
+from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
         
 
 # Not F.linear: ZeRO-3 patches it process wide, giving a zero lm_head grad under compile + grad_and_value.
@@ -61,8 +62,8 @@ except Exception:
     pass
 
 # Module-level flag: None = untested, True = works, False = skip compile.
-_FUSED_CE_COMPILE_SUPPORTED = None if \
-    os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") != "1" else False
+_FUSED_CE_COMPILE_DISABLED = os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") == "1"
+_FUSED_CE_COMPILE_SUPPORTED = None if not _FUSED_CE_COMPILE_DISABLED else False
 
 @functools.cache
 def _get_mapping(autograd):
@@ -334,6 +335,10 @@ class UnslothFusedLoss(torch.autograd.Function):
         """
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
+        # A float scale is value-guarded (recompile per GradScaler step); a 0-dim float32 tensor gives the same product.
+        chunk_scaling = scaling
+        if scaling is not None and not torch.is_tensor(scaling):
+            chunk_scaling = torch.full((), float(scaling), dtype = torch.float32, device = device)
         # Thread ignore_index through label-shift and the inner CE call.
         ignore_index = int(extra_kwargs.get("ignore_index", -100))
 
@@ -359,7 +364,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         # N items divisor
         divisor = n_items if n_items is not None else (labels != ignore_index).sum()
         if not torch.is_tensor(divisor):
-            divisor = torch.tensor(divisor, dtype = torch.float32, device = device)
+            # torch.full is a fill kernel; torch.tensor(..., device = cuda) is a blocking H2D copy.
+            divisor = torch.full((), divisor, dtype = torch.float32, device = device)
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
         divisor = _nonzero_count(divisor.to(dtype = torch.float32, device = device))
@@ -525,7 +531,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         global _FUSED_CE_COMPILE_SUPPORTED
         uncompiled_accumulate_chunk = accumulate_chunk
 
-        if torch_compile and _FUSED_CE_COMPILE_SUPPORTED is not False:
+        # UNSLOTH_COMPILE_DISABLE runs the same chunks eagerly; callers that pass no torch_compile default to True.
+        if torch_compile and not UNSLOTH_COMPILE_DISABLE and _FUSED_CE_COMPILE_SUPPORTED is not False:
             try:
                 accumulate_chunk = torch.compile(
                     accumulate_chunk,
@@ -554,7 +561,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -579,7 +586,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -595,7 +602,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -613,7 +620,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     lm_head_bias = lm_head_bias,
                     labels_j = labels_j,
                     divisor = divisor,
-                    scaling = scaling,
+                    scaling = chunk_scaling,
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
@@ -725,6 +732,79 @@ _FUSED_LOSS_OPAQUE = torch.__version__.split("+")[0].split(".")[:2] == ["2", "11
 def _fused_loss_opaque(*args):
     return UnslothFusedLoss.apply(*args)
 
+# UNSLOTH_CHUNKED_CE=0 keeps the torch.func path below for every call.
+_CHUNKED_CE = os.environ.get("UNSLOTH_CHUNKED_CE", "1") != "0"
+_CHUNKED_CE_KWARGS = frozenset(("ignore_index", "logit_scale_multiply", "logit_scale_divide", "logit_softcapping"))
+# The fused linear kernel also implements these; UNSLOTH_FUSED_LINEAR=0 sends them back to the torch.func path.
+_FUSED_LINEAR_CE_KWARGS = _CHUNKED_CE_KWARGS | frozenset(("label_smoothing", "logits_bias"))
+
+
+def _use_chunked_ce(kwargs, target_gb):
+    if not _CHUNKED_CE or target_gb is not None or TARGET_GB or N_CHUNKS:
+        return False
+    if _FUSED_CE_COMPILE_DISABLED:
+        return False
+    if _chunked_logprob._FUSED_LINEAR:
+        return all(k in _FUSED_LINEAR_CE_KWARGS for k in kwargs)
+    # Fused kernel: plain token CE only; fp32 head-gradient accumulation stays on the old path.
+    if FP32_HEAD_GRAD:
+        return False
+    if float(kwargs.get("label_smoothing", 0.0) or 0.0) != 0.0:
+        return False
+    return all(k in _CHUNKED_CE_KWARGS or k == "label_smoothing" for k in kwargs)
+
+
+def _scaler_scale(scaling):
+    """GradScaler -> its scale as a device tensor (get_scale() is a host sync, and a graph break when compiled)."""
+    if not hasattr(scaling, "get_scale"):
+        return scaling
+    # Attributes, not is_enabled() / get_scale(): dynamo skips torch.amp methods (graph break every step).
+    enabled = getattr(scaling, "_enabled", None)
+    if enabled is None and hasattr(scaling, "is_enabled"):
+        enabled = scaling.is_enabled()
+    if enabled is False:
+        return None
+    scale = getattr(scaling, "_scale", None)
+    if torch.is_tensor(scale):
+        return scale.detach().reshape(())
+    # Step 0: scale not allocated yet.
+    init = getattr(scaling, "_init_scale", None)
+    return float(init) if init is not None else scaling.get_scale()
+
+
+def _chunked_ce(hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs):
+    if not _chunked_logprob._FUSED_LINEAR:
+        return _chunked_ce_opaque(
+            hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,
+        )
+    return _chunked_ce_traced(
+        hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,
+    )
+
+
+def _chunked_ce_traced(hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels,
+                       kwargs):
+    return _chunked_logprob.unsloth_chunked_ce_loss(
+        hidden_states, lm_head_weight, lm_head_bias, labels, mask = mask, n_items = n_items,
+        scaling = _scaler_scale(scaling), shift_labels = shift_labels,
+        ignore_index = int(kwargs.get("ignore_index", -100)),
+        logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0),
+        logit_scale_divide = kwargs.get("logit_scale_divide", 0.0),
+        logit_softcapping = kwargs.get("logit_softcapping", 0.0),
+        label_smoothing = float(kwargs.get("label_smoothing", 0.0) or 0.0),
+        logits_bias = kwargs.get("logits_bias", None),
+        fp32_head_grad = FP32_HEAD_GRAD,
+    )
+
+
+@torch.compiler.disable
+def _chunked_ce_opaque(hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels,
+                       kwargs):
+    return _chunked_ce_traced(
+        hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,
+    )
+
+
 def unsloth_fused_ce_loss(
     trainer,
     hidden_states  : torch.Tensor,
@@ -753,14 +833,13 @@ def unsloth_fused_ce_loss(
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     """
     scaler = trainer.accelerator.scaler if trainer is not None else None
-    # Get mixed precision scaling if seen. The scale only multiplies the gradients saved in the
-    # forward (the returned loss is unscaled), so no-grad scoring skips GradScaler.get_scale():
-    # it is a host sync and torch.compile cannot trace it (fullgraph eval would fail).
+    # Get mixed precision scaling if seen (read lazily: get_scale() syncs the host). The scale only
+    # multiplies the gradients saved in the forward (the returned loss is unscaled), so no-grad scoring
+    # skips GradScaler: torch.compile cannot trace get_scale() (fullgraph eval would fail).
     if not torch.is_grad_enabled():
         scaler = None
         if hasattr(scaling, "get_scale"): scaling = None
-    scaling = scaler.get_scale() if scaler is not None else scaling
-    if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
+    scaling = scaler if scaler is not None else scaling
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
 
@@ -771,6 +850,13 @@ def unsloth_fused_ce_loss(
     device = lm_head_weight.device
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
+
+    # overwrite=True (gradient written into hidden_states) is a memory opt-in the old path implements.
+    if not overwrite and _use_chunked_ce(kwargs, target_gb):
+        return _chunked_ce(
+            hidden_states, lm_head_weight, lm_head_bias, labels, mask, n_items, scaling, shift_labels, kwargs,
+        )
+    if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
 
     mapping = dict(
         loss_function = compute_fused_ce_loss,

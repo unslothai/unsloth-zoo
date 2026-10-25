@@ -219,11 +219,14 @@ def flex_attention_with_sink(
             generate_sliding_window_mask(sliding_window) \
             if type(sliding_window) is int and sliding_window != 0 else \
             causal_mask
-        # Stateless mask_mod, so reuse one block mask across layers and checkpoint replays
+        # Stateless mask_mod, so reuse one block mask across layers and checkpoint replays.
+        # causal_mask / sliding_window never read batch_idx or head_idx, so one broadcast
+        # (B = H = None) mask serves every row: built in O(blocks), not O(bsz * heads * blocks).
         if block_mask is None:
-            block_mask = reused_compiled_create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
+            block_mask = reused_compiled_create_block_mask(mask_mod, None, None, qlen_Q, qlen_KV, device = key.device)
     if block_mask is None:
-        block_mask = compiled_create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
+        # Left padding masks read padding_start_idx[batch_idx] but never head_idx: keep B, broadcast H.
+        block_mask = compiled_create_block_mask(mask_mod, bsz, None, qlen_Q, qlen_KV, device = key.device)
 
     attn_output, logsumexp = flex_output_and_lse((flex_attention if compile else uncompiled_flex_attention)(
         query,

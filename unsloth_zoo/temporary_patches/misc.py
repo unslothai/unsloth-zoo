@@ -1023,7 +1023,7 @@ def patch_transformers_masks():
         masking_utils.create_sliding_window_causal_mask,
     )
 
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial"):
         # `_torch_compile` is `noop` here, i.e. torch.compiler.disable: a fullgraph user compile would refuse it.
         compiled_create_causal_mask = original_create_causal_mask
         compiled_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
@@ -1202,8 +1202,7 @@ def patch_sdpa_bool_causal_mask():
     Drop pure causal bool masks (is_causal=True); convert non-pure bool masks to
     float additive bias. Skipped below 2**16 where the bug cannot fire.
     """
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
-        return
+    # No UNSLOTH_COMPILE_DISABLE early return: a correctness fix that compiles nothing.
     try:
         import transformers.integrations.sdpa_attention as sdpa_mod
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
