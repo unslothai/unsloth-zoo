@@ -232,7 +232,7 @@ class FastCPUModel:
 
         quantization_config = None
         if use_4bit and not _PREQUANTIZED_SUFFIX.search(model_name):
-            from ..peft_utils import SKIP_QUANTIZATION_MODULES
+            from unsloth_zoo.peft_utils import SKIP_QUANTIZATION_MODULES
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit = True,
                 bnb_4bit_quant_type = "nf4",
