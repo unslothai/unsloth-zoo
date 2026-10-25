@@ -208,25 +208,30 @@ def _count_conflicts(a, b):
 
 
 def _fill_prefix(rows, full, start, store):
-    """Fill unrouted rows [0, start) from recorded captures whose tokens share that prefix."""
+    """Fill rows [0, start) from this rollout's captures sharing that prefix; disagreeing captures leave -1."""
     prefix = tuple(full[:start])
-    missing = torch.ones(rows.shape[:-1], dtype = torch.bool)[:start]
-    stores = [store] + [call[0] for rollout in reversed(_STATE.generations.values()) for call in reversed(rollout)]
+    stores = [store]
+    if not _STATE.forwarded_since_record and _STATE.generations:
+        # Earlier rollouts ran on older weights: their routes are not this policy's.
+        stores += [call[0] for call in reversed(next(reversed(_STATE.generations.values())))]
+    merged = rows[:start].clone()
+    seen = torch.zeros(rows.shape[:-1], dtype = torch.bool)[:start]
+    conflict = seen.clone()
     for candidate in stores:
         for key, earlier in candidate.items():
             m = min(start, len(key))
             if m == 0 or earlier.shape[1:] != rows.shape[1:] or key[:m] != prefix[:m]:
                 continue
-            take = missing[:m] & ~(earlier[:m] < 0).all(dim = -1)
-            if not bool(take.any()):
-                continue
-            if bool(take.all()):
-                rows[:m] = earlier[:m]
-            else:
-                rows[:m] = torch.where(take.unsqueeze(-1), earlier[:m], rows[:m])
-            missing[:m] &= ~take
-            if not bool(missing.any()):
-                return
+            part = earlier[:m]
+            routed = ~(part < 0).all(dim = -1)
+            same = (part.sort(dim = -1).values == merged[:m].sort(dim = -1).values).all(dim = -1)
+            conflict[:m] |= routed & seen[:m] & ~same
+            new = routed & ~seen[:m]
+            if bool(new.any()):
+                merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
+                seen[:m] |= new
+    keep = seen & ~conflict
+    rows[:start] = torch.where(keep.unsqueeze(-1), merged, rows[:start])
 
 
 def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = None):

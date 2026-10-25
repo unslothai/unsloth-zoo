@@ -677,6 +677,30 @@ def test_prompt_start_reuses_routes_of_an_earlier_turn(replay, start):
     assert torch.equal(rows[start:9].long(), torch.as_tensor(turn2).long())
 
 
+def test_prompt_start_prefix_keeps_conflicts_natural_and_ignores_older_rollouts(replay):
+    def capture(prompt, completion, routed):
+        return SimpleNamespace(prompt_token_ids = prompt, outputs = [SimpleNamespace(token_ids = completion, routed_experts = routed)])
+
+    def rows_of(value, n):
+        return np.stack([np.stack([np.arange(TOP_K) + value] * NUM_LAYERS)] * n) % NUM_EXPERTS
+
+    tail = rows_of(5, 2)
+    # Two captures of [1, 2, 3, 4] disagree on token 1: replay leaves it natural, like _lookup.
+    rr.record_routed_experts([capture([1, 2], [3, 4], np.concatenate([rows_of(0, 1), rows_of(1, 1), rows_of(2, 1)]))])
+    rr.record_routed_experts([capture([1, 2], [3, 4], np.concatenate([rows_of(0, 1), rows_of(3, 1), rows_of(2, 1)]))])
+    rr.record_routed_experts([capture([1, 2, 3, 4, 9], [10], tail)], prompt_starts = [3])
+    rows = rr._lookup((1, 2, 3, 4, 9, 10))
+    assert torch.equal(rows[0].long(), torch.as_tensor(rows_of(0, 1)[0]).long())
+    assert torch.equal(rows[1].long(), torch.full((NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[2].long(), torch.as_tensor(rows_of(2, 1)[0]).long())
+    # After a training forward the policy changed: an older rollout's routes are not reused.
+    rr._STATE.forwarded_since_record = True
+    rr.record_routed_experts([capture([1, 2, 3, 4, 9], [11], tail)], prompt_starts = [3])
+    rows = rr._lookup((1, 2, 3, 4, 9, 11))
+    assert torch.equal(rows[:3].long(), torch.full((3, NUM_LAYERS, TOP_K), -1))
+    assert torch.equal(rows[3:5].long(), torch.as_tensor(tail).long())
+
+
 def test_rollout_split_into_many_generate_calls_is_kept_whole(replay):
     # generate_batches splits one rollout into several llm.generate calls before any training forward.
     model = _model()
