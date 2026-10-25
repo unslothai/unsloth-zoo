@@ -322,20 +322,32 @@ class Bf16StoredLinear(torch.nn.Linear):
     """nn.Linear whose frozen weight stays in bf16 while activations, LoRA and the matmul are fp32."""
 
     def forward(self, x):
-        if self.weight.dtype == x.dtype or (self.weight.requires_grad and torch.is_grad_enabled()):
-            # Trainable (or already upcast, e.g. a merged fp32 copy): plain autograd.
+        trainable = self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad)
+        if self.weight.dtype == x.dtype or (trainable and torch.is_grad_enabled()):
+            # A trainable weight or bias (LoRA bias = "all" / "lora_only"), or an already upcast copy such
+            # as a merged fp32 model: plain autograd.
             return F.linear(x, self.weight.to(x.dtype), self.bias)
         return _Bf16StoredLinearFunction.apply(x, self.weight, self.bias)
 
 
+# Projections that transformers always calls as modules. Some architectures read a Linear's .weight
+# directly (Mamba dt_proj, Nemotron-H out_proj, MLA absorbed weights), which a bf16 weight next to fp32
+# activations would break, so only these names are converted.
+_BF16_STORED_PROJECTIONS = frozenset((
+    "q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj", "gate_proj", "up_proj", "down_proj", "gate_up_proj",
+    "in_proj_qkv", "in_proj_z",
+))
+
+
 def store_frozen_linears_in_bf16(model):
-    """For fp32 training of a bf16 checkpoint loaded in bf16: keep every nn.Linear weight except the
-    output embeddings in bf16 (lossless: the checkpoint's own values) and move the rest to fp32. Frozen
-    decoder weights are most of the model, so resident memory drops by about a quarter."""
+    """For fp32 training of a bf16 checkpoint loaded in bf16: keep the attention / MLP projection weights
+    in bf16 (lossless: the checkpoint's own values) and move everything else to fp32. Those frozen
+    weights are most of the model, so resident memory drops by 15-28%."""
     head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
     stored = set()
-    for module in model.modules():
-        if type(module) is torch.nn.Linear and module is not head and module.weight.dtype == torch.bfloat16:
+    for name, module in model.named_modules():
+        if type(module) is torch.nn.Linear and module is not head and module.weight.dtype == torch.bfloat16 \
+                and name.rsplit(".", 1)[-1] in _BF16_STORED_PROJECTIONS:
             module.__class__ = Bf16StoredLinear
             stored.add(id(module.weight))
     for param in model.parameters():

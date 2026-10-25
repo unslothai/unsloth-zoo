@@ -1051,6 +1051,29 @@ def test_bf16_stored_frozen_linear_matches_fp32():
     stored.weight.requires_grad_(True)
     stored(torch.randn(2, 16)).sum().backward()
     assert stored.weight.grad is not None
+    # LoRA bias = "all" / "lora_only": frozen weight, trainable bias.
+    stored.weight.requires_grad_(False)
+    stored.weight.grad = None
+    stored.bias.requires_grad_(True)
+    stored(torch.randn(2, 16)).sum().backward()
+    assert stored.bias.grad is not None and stored.weight.grad is None
+
+
+def test_bf16_storage_leaves_directly_read_projections_alone():
+    """Mamba reads dt_proj.weight directly (no module call); only always-called projections convert."""
+    from unsloth_zoo.cpu.ops import Bf16StoredLinear, store_frozen_linears_in_bf16
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj, self.dt_proj, self.out_proj = (torch.nn.Linear(8, 8) for _ in range(3))
+
+    model = torch.nn.Sequential(Block()).bfloat16()
+    assert store_frozen_linears_in_bf16(model) == 1
+    block = model[0]
+    assert type(block.q_proj) is Bf16StoredLinear and block.q_proj.weight.dtype == torch.bfloat16
+    assert type(block.dt_proj) is torch.nn.Linear and block.dt_proj.weight.dtype == torch.float32
+    assert block.out_proj.weight.dtype == torch.float32
 
 
 def test_store_frozen_linears_in_bf16_keeps_head_and_norms_fp32_and_merges_unrounded():
