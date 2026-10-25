@@ -735,7 +735,9 @@ def test_ce_out_of_range_target_is_a_device_assert_on_cuda(bad):
     env = dict(os.environ, PYTHONPATH = root + os.pathsep + os.environ.get("PYTHONPATH", ""))
     result = subprocess.run([sys.executable, "-c", script], capture_output = True, text = True, timeout = 600, env = env)
     assert "VALID_OK" in result.stdout and "NOT_RAISED" not in result.stdout, (result.stdout, result.stderr[-3000:])
-    assert result.returncode != 0 and "out of bounds" in result.stderr, result.stderr[-3000:]
+    assert result.returncode != 0, result.stderr[-3000:]
+    if torch.version.hip is None:  # ROCm aborts (SIGABRT) without printing the assert message
+        assert "out of bounds" in result.stderr, result.stderr[-3000:]
 
 
 def test_ce_rejects_invalid_label_smoothing():
