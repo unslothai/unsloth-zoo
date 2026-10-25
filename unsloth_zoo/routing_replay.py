@@ -47,6 +47,7 @@ import os
 import re
 import warnings
 from collections import OrderedDict
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -208,6 +209,33 @@ def _count_conflicts(a, b):
         _STATE.stats["conflicting_routes"] = _STATE.stats.get("conflicting_routes", 0) + conflicts
 
 
+def _fill_prefix(rows, full, start, store):
+    """Fill rows [0, start) from this rollout's captures sharing that prefix; disagreeing captures leave -1."""
+    prefix = tuple(full[:start])
+    stores = [store]
+    if not _STATE.forwarded_since_record and _STATE.generations:
+        # Earlier rollouts ran on older weights: their routes are not this policy's.
+        stores += [call[0] for call in reversed(next(reversed(_STATE.generations.values())))]
+    merged = rows[:start].clone()
+    seen = torch.zeros(rows.shape[:-1], dtype = torch.bool)[:start]
+    conflict = seen.clone()
+    for candidate in stores:
+        for key, earlier in candidate.items():
+            m = min(start, len(key))
+            if m == 0 or earlier.shape[1:] != rows.shape[1:] or key[:m] != prefix[:m]:
+                continue
+            part = earlier[:m]
+            routed = ~(part < 0).all(dim = -1)
+            same = (part.sort(dim = -1).values == merged[:m].sort(dim = -1).values).all(dim = -1)
+            conflict[:m] |= routed & seen[:m] & ~same
+            new = routed & ~seen[:m]
+            if bool(new.any()):
+                merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
+                seen[:m] |= new
+    keep = seen & ~conflict
+    rows[:start] = torch.where(keep.unsqueeze(-1), merged, rows[:start])
+
+
 def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = None):
     """Store vLLM's per-token expert ids per finished completion. prompt_starts: per-request
     `SamplingParams.routed_experts_prompt_start` (prompt position of the first returned row)."""
@@ -243,6 +271,8 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
             for offset, part in parts:
                 n = max(0, min(len(full) - offset, part.shape[0]))
                 rows[offset : offset + n] = part[:n]
+            if start > 0 and not split:
+                _fill_prefix(rows, full, start, store)
             if rows.shape[-1] > 1:
                 # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.
                 ordered = rows.sort(dim = -1).values
@@ -308,7 +338,8 @@ def _lookup(key, exact = False):
 
 def _prompt_starts(args, kwargs, count):
     params = kwargs.get("sampling_params", args[1] if len(args) > 1 else None)
-    if isinstance(params, (list, tuple)):
+    # Same per-prompt test as vLLM's offline _params_to_seq; a SamplingParams is no Sequence.
+    if isinstance(params, Sequence):
         starts = [getattr(p, "routed_experts_prompt_start", 0) or 0 for p in params]
         if len(starts) != count:
             if any(starts):
