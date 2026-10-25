@@ -577,9 +577,6 @@ def _decline_model(case, monkeypatch):
     if case == "loop_path":
         monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "0")
         return build(), 0
-    if case == "compile_disabled":
-        monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
-        return build(), 0
     if case == "bf16_base":
         return build(base = "bf16"), 0
     if case == "no_bf16_backend":
@@ -592,7 +589,7 @@ def _decline_model(case, monkeypatch):
 
 @needs_bf16
 @pytest.mark.parametrize("case", ["dropout", "two_adapters", "dora", "lora_bias", "existing_grads", "frozen_expert",
-                                  "kill_switch", "loop_path", "compile_disabled", "bf16_base", "no_bf16_backend"])
+                                  "kill_switch", "loop_path", "bf16_base", "no_bf16_backend"])
 def test_declines_keep_per_expert_parameters(case, monkeypatch):
     model, expected = _decline_model(case, monkeypatch)
     ref = dict(model.named_parameters())
@@ -602,6 +599,20 @@ def test_declines_keep_per_expert_parameters(case, monkeypatch):
     if expected == 0:
         assert dict(model.named_parameters()).keys() == ref.keys()
         assert all(ref[n] is p for n, p in model.named_parameters())
+
+
+@needs_bf16
+@pytest.mark.parametrize("value", ["1", "partial"])
+def test_compile_disable_still_stacks(value, monkeypatch):
+    """UNSLOTH_COMPILE_DISABLE only skips torch.compile: the grouped path stacks as it does by default."""
+    with _env(UNSLOTH_MOE_STACKED_LORA = "1"):
+        default = build()
+        ML.auto_enable_grouped_moe(default)
+    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", value)
+    with _env(UNSLOTH_MOE_STACKED_LORA = "1"):
+        model = build()
+        ML.auto_enable_grouped_moe(model)
+    assert n_stacked(model) == n_stacked(default) > 0
 
 
 @needs_bf16

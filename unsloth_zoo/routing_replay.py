@@ -55,7 +55,8 @@ ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 _MAX_ROLLOUTS = 2
 _MAX_CALLS_PER_ROLLOUT = 64
-_MAX_PENDING = 64
+# Leak guard only: evicting a forward awaiting its recompute makes that recompute route naturally.
+_MAX_PENDING = 1024
 
 
 def routing_replay_requested():
@@ -166,6 +167,7 @@ class _ReplayState:
         )
         self.changed = None
         self.warned_invalid = False
+        self.warned_evicted = False
 
 
 _STATE = _ReplayState()
@@ -415,7 +417,15 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
             _STATE.recomputed = False
         _STATE.record = {}
         _STATE.pending.append(_STATE.record)
-        del _STATE.pending[:-_MAX_PENDING]
+        if len(_STATE.pending) > _MAX_PENDING:
+            del _STATE.pending[:-_MAX_PENDING]
+            if not _STATE.warned_evicted:
+                _STATE.warned_evicted = True
+                warnings.warn(
+                    f"Unsloth: routing replay kept {_MAX_PENDING} checkpointed forwards without a backward; "
+                    "the oldest ones recompute with the trainer's own routing, so their gradients no longer "
+                    "match their forward. Run backward more often (fewer chunks per backward)."
+                )
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
         return None
@@ -499,25 +509,29 @@ def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
         # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
         return _NATURAL
     fp = _fingerprint(ids2)
-    match = torch.stack([(c[0] == fp).all() for c in candidates])
+    match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
     if signature is not None:
         # Narrow the natural matches to the forwards whose router input was the same too. Only a
         # refinement: when no input matches exactly, the natural matches stand as before.
-        same = [
-            (c[3] == signature).all() if len(c) > 3 and c[3] is not None and c[3].shape == signature.shape
-            else torch.zeros((), dtype = torch.bool, device = match.device)
-            for c in candidates
-        ]
-        exact = match & torch.stack(same).to(match.device)
+        has = [len(c) > 3 and c[3] is not None and c[3].shape == signature.shape for c in candidates]
+        if all(has):
+            same = (torch.stack([c[3] for c in candidates]) == signature).flatten(1).all(-1)
+        else:
+            same = torch.stack([
+                (c[3] == signature).all() if h else torch.zeros((), dtype = torch.bool, device = match.device)
+                for c, h in zip(candidates, has)
+            ])
+        exact = match & same.to(match.device)
         match = torch.where(exact.any(), exact, match)
-    pick = match.to(torch.int32).argmax()
+    # index_select, not forced_all[pick]: a 0-dim CUDA index is read back to the host.
+    pick = match.to(torch.int32).argmax().reshape(1)
     forced_all = torch.stack([c[1] for c in candidates])
-    forced = forced_all[pick]
+    forced = forced_all.index_select(0, pick)[0]
     # Several forwards with the same natural routing but different replays cannot be told
     # apart, so keep the natural routing there rather than guess. Only the expert set counts:
     # the same experts in another order route and weight every token identically.
     agree = ((forced_all.sort(-1).values == forced.sort(-1).values).flatten(1).all(-1) | ~match).all()
-    valid = torch.stack([c[2] for c in candidates])[pick] & match.any() & agree
+    valid = torch.stack([c[2] for c in candidates]).index_select(0, pick)[0] & match.any() & agree
     return forced, valid
 
 
