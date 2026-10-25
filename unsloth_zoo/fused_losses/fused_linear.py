@@ -1944,9 +1944,9 @@ def _jsd_triton(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_
     grid = (R, NB)
     _fl_jsd_stats_kernel[grid](s, t, s.stride(0), V, stats, NB, *sc, **flags)
     m = stats[..., 0::2]
-    l = stats[..., 1::2]
+    sums = stats[..., 1::2]
     top = m.amax(1, keepdim = True)
-    lse = (top.squeeze(1) + torch.log((l * torch.exp(m - top)).sum(1))).contiguous()  # [R, 2] student, teacher
+    lse = (top.squeeze(1) + torch.log((sums * torch.exp(m - top)).sum(1))).contiguous()  # [R, 2] student, teacher
     mode = 0 if beta == 0.0 else (1 if beta == 1.0 else 2)
     log1mb = math.log1p(-beta) if mode == 2 else 0.0
     logb = math.log(beta) if mode == 2 else 0.0
