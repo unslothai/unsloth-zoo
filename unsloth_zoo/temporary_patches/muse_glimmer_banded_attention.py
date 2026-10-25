@@ -80,16 +80,6 @@ _DEFERRED = [0]          # count of sliding calls that fell through (debug)
 _MIN_SEQ_MULTIPLE_OF_WINDOW = 3
 
 
-def muse_glimmer_banded_stats():
-    """Engagement counters, for tests and benchmarks."""
-    return {
-        "fa2"      : _ENGAGED[0],
-        "banded"   : _BANDED_ENGAGED[0],
-        "deferred" : _DEFERRED[0],
-        "has_fa2"  : _HAS_FA2,
-    }
-
-
 @functools.lru_cache(maxsize=1)
 def _enabled():
     """Whether the Muse Glimmer sliding-window fast router is active.
@@ -178,12 +168,14 @@ def _sdpa_maybe_muse_glimmer_banded(module, query, key, value, attention_mask,
                         causal=True,
                         window_size=(w - 1, 0),
                     )
-                    _ENGAGED[0] += 1
-                    if _ENGAGED[0] == 1:
-                        logger.info_once(
-                            f"Unsloth: FlashAttention-2 sliding window engaged for "
-                            f"Muse Glimmer (window={w})."
-                        )
+                    # Not while compiling (as _DEFERRED below): dynamo guards on the counter.
+                    if not torch.compiler.is_compiling():
+                        _ENGAGED[0] += 1
+                        if _ENGAGED[0] == 1:
+                            logger.info_once(
+                                f"Unsloth: FlashAttention-2 sliding window engaged for "
+                                f"Muse Glimmer (window={w})."
+                            )
                     return out, None                      # (B, S, H, D), no weights
                 except Exception as e:
                     logger.warning_once(
@@ -195,12 +187,13 @@ def _sdpa_maybe_muse_glimmer_banded(module, query, key, value, attention_mask,
                 # expansion does (Muse Glimmer is 32 / 2, so ng = 16).
                 ng = getattr(module, "num_key_value_groups", query.shape[1] // key.shape[1])
                 out = _banded_sdpa_core(query, key, value, w, scaling, 0.0, ng)
-                _BANDED_ENGAGED[0] += 1
-                if _BANDED_ENGAGED[0] == 1:
-                    logger.info_once(
-                        f"Unsloth: banded sliding SDPA engaged for Muse Glimmer "
-                        f"(window={w})."
-                    )
+                if not torch.compiler.is_compiling():
+                    _BANDED_ENGAGED[0] += 1
+                    if _BANDED_ENGAGED[0] == 1:
+                        logger.info_once(
+                            f"Unsloth: banded sliding SDPA engaged for Muse Glimmer "
+                            f"(window={w})."
+                        )
                 return out, None                      # (B, S, H, D), no weights
             except Exception as e:
                 logger.warning_once(

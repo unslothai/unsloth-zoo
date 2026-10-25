@@ -43,6 +43,14 @@ def _flash_takes_gqa(query, key, attn_mask, dropout_p):
 
 
 def _efficient_takes(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa):
+    # The eligibility checks read the current device's properties, so ask on the query's card.
+    if query.is_cuda and query.device.index is not None and query.device.index != torch.cuda.current_device():
+        with torch.cuda.device(query.device):
+            return _efficient_takes_here(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
+    return _efficient_takes_here(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
+
+
+def _efficient_takes_here(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa):
     try:
         try:
             params = torch.backends.cuda.SDPAParams(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
@@ -98,6 +106,8 @@ def make_gqa_sdpa(scaled_dot_product_attention):
                 return scaled_dot_product_attention(
                     query, key_r, value_r, attn_mask = attn_mask, dropout_p = dropout_p, is_causal = is_causal, scale = scale,
                 )
+            # Rejected: free the repeated copies before the fallback runs (math GQA repeats k/v itself).
+            del key_r, value_r
         return scaled_dot_product_attention(
             query, key, value, attn_mask = attn_mask, dropout_p = dropout_p, is_causal = is_causal, scale = scale,
             enable_gqa = groups != 1,

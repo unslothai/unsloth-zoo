@@ -121,11 +121,14 @@ def _setup(monkeypatch):
     _install_fake_unsloth_kernels(monkeypatch)
     monkeypatch.setattr(moe_utils, "native_moe_grouped_mm", moe_utils._manual_grouped_mm)
 
-    num_experts, hidden, intermediate, rank = 4, 16, 12, 4
+    num_experts, hidden, intermediate, rank = 4, 16, 16, 4
     num_tokens, top_k = 8, 2
 
     torch.manual_seed(0)
     experts = _build_experts(num_experts, hidden, intermediate)
+    # Multiples of 16, or forward_triton_grouped_gemm routes to the native fallback (#2057) and
+    # the row-order tests below no longer reach the Triton path they are about.
+    assert moe_utils._triton_grouped_gemm_dims_supported(experts, hidden)
     first = torch.randn(num_experts, intermediate, rank)
     second = torch.randn(num_experts, rank, hidden)
     scaling = 0.5

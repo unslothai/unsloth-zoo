@@ -17,6 +17,7 @@
 
 from .common import *
 from .fla_vendor import *
+from .hub_kernel_export_check import *
 from .gdn_causal_conv1d import *
 from .gemma import *
 from .misc import *

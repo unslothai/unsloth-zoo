@@ -1113,6 +1113,12 @@ def auto_enable_grouped_moe(model):
             enable_grouped_moe(model, verbose=True, stack_lora=True)
     except Exception:
         pass  # optional speedup; never block model loading
+    try:   # stacked experts on another GPU model: probe that card now, not first inside a compiled forward
+        if model is not None and hasattr(model, "modules"):
+            from .moe_experts_interface import warm_moe_probes_on_expert_devices
+            warm_moe_probes_on_expert_devices(model)
+    except Exception:
+        pass
     try:   # UNSLOTH_MOE_FUSED_ROUTER=1: routers re-created by the compiler
         from .moe_router_triton import enable_fused_router
         enable_fused_router(model)

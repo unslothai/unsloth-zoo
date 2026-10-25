@@ -23,7 +23,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None, reason = "NVIDIA CUDA required (the kernel uses PTX inline asm)"
+)
 
 if torch.cuda.is_available():
     sw = importlib.import_module("unsloth_zoo.temporary_patches.moe_fused_swiglu")
