@@ -5302,7 +5302,9 @@ def load_vllm(
             suppress_vllm_padded_vocab(
                 llm, padded_ids, speculative = engine_args.get("speculative_config", None) is not None,
             )
-        if _merged_rollout_enabled():
+        if _merged_rollout_enabled() and _merged_rollout_auto_engine_ok(
+            enable_lora, use_async, use_engine, use_bitsandbytes, is_fp8, engine_args, is_vision_model,
+        ):
             llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)
         if _UNSLOTH_FLASHINFER_UNUSABLE:
@@ -6117,12 +6119,52 @@ _MERGED_ROLLOUT_PUNICA_MODULES = (
 _MERGED_ROLLOUT_LOCK = threading.RLock()
 
 
-def _merged_rollout_mode():
-    """"all" (=1): fold every LoRA layer. "attention": fold attention only, the rest stays on vLLM LoRA."""
+# Counts for tests and benchmarks: outermost folds, and calls that fell back to vLLM LoRA.
+_MERGED_ROLLOUT_STATS = {"folds": 0, "fallbacks": 0}
+
+
+def _merged_rollout_automatic():
+    """True when UNSLOTH_VLLM_MERGED_ROLLOUT is unset (or "auto"): the measured default decides.
+    "0" (or any other value) is off, "1" forces every eligible layer, "attention" folds attention only."""
     # All Unsloth Zoo code licensed under LGPLv3
-    value = os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "0").strip().lower()
+    return os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "").strip().lower() in ("", "auto")
+pass
+
+
+@functools.lru_cache(maxsize = 1)
+def _merged_rollout_auto_platform():
+    """None when the automatic default may fold on this machine, else why not. Measured only on
+    NVIDIA CUDA under Linux with the exact Triton fold (merged_rollout_exact) and vLLM >= 0.11.2;
+    ROCm, XPU, Windows / WSL and older vLLM keep vLLM LoRA unless UNSLOTH_VLLM_MERGED_ROLLOUT=1."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not sys.platform.startswith("linux"): return f"the platform is {sys.platform}"
+    try:
+        if "microsoft" in os.uname().release.lower(): return "this is WSL"
+    except Exception:
+        pass
+    if getattr(torch.version, "hip", None) is not None: return "this is ROCm"
+    if not torch.cuda.is_available(): return "CUDA is not available"
+    try:
+        from .merged_rollout_exact import triton as _triton
+    except Exception:
+        _triton = None
+    if _triton is None: return "Triton is not available for the exact fold"
+    try:
+        if Version(vllm_version) < Version("0.11.2"): return f"vLLM {vllm_version} is older than 0.11.2"
+    except Exception:
+        return "the vLLM version is unknown"
+    return None
+pass
+
+
+def _merged_rollout_mode():
+    """"all": fold every LoRA layer (=1, or the automatic default where it applies). "attention": fold
+    attention only, the rest stays on vLLM LoRA. None: off (=0, or the automatic default does not apply)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    value = os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "").strip().lower()
     if value == "1": return "all"
     if value in ("attention", "attn"): return "attention"
+    if value in ("", "auto"): return "all" if _merged_rollout_auto_platform() is None else None
     return None
 pass
 
@@ -6130,6 +6172,20 @@ pass
 def _merged_rollout_enabled():
     # All Unsloth Zoo code licensed under LGPLv3
     return _merged_rollout_mode() is not None
+pass
+
+
+def _merged_rollout_auto_engine_ok(enable_lora, use_async, use_engine, use_bitsandbytes, is_fp8, engine_args,
+                                   is_vision_model = False):
+    """The automatic default wraps only the engine shape it was measured on: one synchronous text LLM
+    serving 16-bit LoRA, no bitsandbytes / FP8 / other quantization, one GPU. "1" wraps every engine as before."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not _merged_rollout_automatic(): return True
+    if not enable_lora or use_async or use_engine or use_bitsandbytes or is_fp8 or is_vision_model: return False
+    if engine_args.get("quantization", None) is not None: return False
+    if int(engine_args.get("tensor_parallel_size", 1) or 1) != 1: return False
+    if int(engine_args.get("pipeline_parallel_size", 1) or 1) != 1: return False
+    return True
 pass
 
 
@@ -6410,23 +6466,38 @@ def _prepare_merged_rollout_locked(model):
     model._unsloth_merged_rollout_state = cached = None
 
     targets, reason, entries = None, None, None
+    automatic = _merged_rollout_automatic()
+    quiet = False
     if not getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
         reason = "the vLLM engine was not wrapped (set UNSLOTH_VLLM_MERGED_ROLLOUT before loading the model)"
+        # The automatic default declined this engine at load (quantized, async, ...): nothing to say.
+        quiet = automatic
     else:
         targets, reason = _merged_rollout_targets(model)
+    if reason is None and automatic and any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
+        reason = "the automatic default does not fold MoE expert LoRA (set UNSLOTH_VLLM_MERGED_ROLLOUT=1 to force it)"
     if reason is None:
         if _merged_rollout_use_exact(targets):
             entries = ([(module, W, None) for _, module, W in targets], None)
         elif any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
             reason = "MoE expert LoRA folds only with the exact fold, which needs every folded weight on one CUDA device"
+        elif automatic:
+            # The pinned copy costs a full host copy of the folded weights: opt-in only.
+            reason = (
+                "the exact in-place fold is unavailable and the automatic default does not pin a host copy "
+                "(set UNSLOTH_VLLM_MERGED_ROLLOUT=1 to use the pinned copy)"
+            )
         else:
             entries, reason = _merged_rollout_host_copies(targets)
     if reason is not None:
         modules = _merged_rollout_lora_layers(model)
         model._unsloth_merged_rollout_state = _MergedRolloutVerdict(model, modules, reason)
-        _merged_rollout_log_once(
-            f"Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT is on but falling back to vLLM LoRA (punica) because {reason}."
-        )
+        if not quiet:
+            _merged_rollout_log_once(
+                f"Unsloth: merged-weight rollouts (automatic) are not used because {reason}; generating with vLLM LoRA."
+                if automatic else
+                f"Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT is on but falling back to vLLM LoRA (punica) because {reason}."
+            )
         return None
     entries, host = entries
     state = _MergedRolloutState(model, entries)
@@ -6443,7 +6514,7 @@ def _prepare_merged_rollout_locked(model):
         pinned = "pinned" if getattr(entries[0][2], "is_pinned", lambda: False)() else "pageable"
         how = f"pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)"
     _merged_rollout_log_once(
-        f"Unsloth: Merged-weight rollouts on ({_merged_rollout_mode()}): folding the adapter into {len(entries)} "
+        f"Unsloth: Merged-weight rollouts on ({_merged_rollout_mode()}{', automatic' if _merged_rollout_automatic() else ''}): folding the adapter into {len(entries)} "
         f"shared weights{rest}; {how}."
     )
     return state
@@ -6732,6 +6803,7 @@ def merged_rollout(state):
                         for module, W, P in state.entries:
                             _merged_rollout_fold(W, module, adapter)
                 _merged_rollout_synchronize(state)
+                _MERGED_ROLLOUT_STATS["folds"] += 1
             yield
         finally:
             state.depth -= 1
@@ -6794,6 +6866,7 @@ def _merged_rollout_lora_fallback(request, reason):
     model = request.state.model_ref()
     if model is None:
         raise RuntimeError("Unsloth: the model behind this merged-rollout LoRA request was freed.")
+    _MERGED_ROLLOUT_STATS["fallbacks"] += 1
     _merged_rollout_log_once(
         f"Unsloth: merged-weight rollout used vLLM LoRA (punica) for a call because {reason}."
     )
