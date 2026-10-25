@@ -62,6 +62,7 @@ def _fresh_dynamo():
     torch._dynamo.reset()
 
 
+@pytest.mark.usefixtures("compile_enabled")
 def test_scale_changes_reuse_one_graph():
     _run(65536.0)
     first = _unique_graphs()
