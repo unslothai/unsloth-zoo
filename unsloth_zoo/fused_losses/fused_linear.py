@@ -367,7 +367,7 @@ if _HAS_TRITON:
                 q = q * r * r + tl.sum(e * e, axis = 0)
             # s skips the target's block (sb holds it); its other classes are added back after the sweep.
             es = tl.sum(e, axis = 0)
-            inb = (tgt >= start) & (tgt < start + BLOCK)
+            inb = valid & (tgt >= start) & (tgt < start + BLOCK)
             s = s * r + tl.where(inb, 0.0, es)
             sb = sb * r + tl.where(inb, es, 0.0)
             m = m_new
@@ -452,7 +452,8 @@ if _HAS_TRITON:
             if WANT_LSSP:
                 q = q * r * r + tl.sum(e * e, axis = 0)
             es = tl.sum(e, axis = 0)
-            inb = (tgt >= start) & (tgt < start + BLOCK)
+            # here: a split narrower than BLOCK must not drop a target that lies past its end.
+            inb = here & (tgt >= start) & (tgt < start + BLOCK)
             s = s * r + tl.where(inb, 0.0, es)
             sb = sb * r + tl.where(inb, es, 0.0)
             m = m_new
