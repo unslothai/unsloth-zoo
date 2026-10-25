@@ -31,10 +31,12 @@ def _gpu_ok():
     import torch
     import triton
     from packaging.version import Version
+    if getattr(torch.version, "hip", None) is not None:
+        return False  # fla_vendor withholds fla.ops.kda on ROCm and never routes safe_gate there
     return torch.cuda.get_device_capability() >= (8, 0) and Version(triton.__version__) >= Version("3.6.0")
 
 
-_GPU = pytest.mark.skipif(not _gpu_ok(), reason = "safe_gate needs the vendored fla on CUDA SM80+ with triton >= 3.6")
+_GPU = pytest.mark.skipif(not _gpu_ok(), reason = "safe_gate needs the vendored fla on CUDA (not ROCm) SM80+ with triton >= 3.6")
 
 
 def test_fla_1242_and_1554_are_backported():
