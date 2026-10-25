@@ -45,6 +45,13 @@ def _clean_env(monkeypatch):
     MU._TRITON_GROUPED_MM_POLICY.clear()
 
 
+def _skip_unless_forcing_engages():
+    # UNSLOTH_MOE_GROUPED_TRITON=1 is a no-op below sm80 by design (_triton_grouped_mm_policy, test_gate_table): T4 keeps
+    # torch._grouped_mm. Tests asserting the forced kernel engages have nothing to check there.
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("forcing the Triton grouped GEMM is off below sm80 by design")
+
+
 def _force_on(monkeypatch, max_rows = None):
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "1")
     if max_rows is not None:
@@ -286,6 +293,7 @@ def _torch_reference(monkeypatch, x, param, dy, offs, transposed):
 @pytest.mark.parametrize("transposed", [True, False])
 @pytest.mark.parametrize("case", list(_CASES))
 def test_matches_fp64_at_least_as_well_as_torch(monkeypatch, dtype, transposed, case):
+    _skip_unless_forcing_engages()
     counts, K, N = _CASES[case]
     x, param, dy, offs, counts_t = _problem(counts, K, N, dtype, transposed)
     ref = _fp64(x, param, dy, counts_t, transposed)
@@ -342,7 +350,11 @@ def test_engagement_counter_and_modulelist(monkeypatch):
     y_ml = ML._grouped_mm_fix(x, param.transpose(-2, -1), offs)
     y_mu = MU._grouped_mm_with_backward_fix(x, param.transpose(-2, -1), offs)
     after = _calls()
-    assert after["gemm"] - before["gemm"] == 2 and after["fallback"] == before["fallback"]
+    if torch.cuda.get_device_capability() < (8, 0):
+        # forcing declines below sm80: both entry points stay on torch, never touching the kernel
+        assert after == before
+    else:
+        assert after["gemm"] - before["gemm"] == 2 and after["fallback"] == before["fallback"]
     assert torch.equal(y_ml, y_mu)
 
 
@@ -432,6 +444,7 @@ def test_declined_branch_is_the_main_code():
 
 @needs_kernel
 def test_self_check_failure_falls_back_to_torch(monkeypatch, caplog):
+    _skip_unless_forcing_engages()
     if not MU._check_torch_grouped_mm_supported():
         pytest.skip("torch._grouped_mm unsupported here")
     _force_on(monkeypatch)
@@ -458,6 +471,7 @@ def test_self_check_failure_falls_back_to_torch(monkeypatch, caplog):
 
 @needs_kernel
 def test_self_check_oom_propagates(monkeypatch):
+    _skip_unless_forcing_engages()
     _force_on(monkeypatch)
     monkeypatch.setattr(MG, "_GENERIC_SELF_CHECKED", {})
     monkeypatch.setattr(MG, "_GENERIC_DISABLED_REASON", None)
@@ -494,6 +508,31 @@ def test_opcheck(dtype):
     torch.library.opcheck(torch.ops.unsloth_zoo.grouped_mm_triton_wgrad.default, (x, dy, offs))
 
 
+@needs_kernel
+@pytest.mark.parametrize("transposed", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_eager_dw_fallback_with_broadcast_grad(dtype, transposed):
+    # sm89's auto table hands every base dW (K, N > 32) to the torch._grouped_mm fallback. The grad of
+    # y.sum() reaches it as a stride-0 expand; dW must still match fp64 (test_opcheck saw it differ under AOT).
+    if not MU._grouped_mm_supported_on(torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("torch._grouped_mm unsupported here")
+    _mock_cap((8, 9), torch.cuda.current_device())
+    x, param, _, offs, counts = _problem([5, 0, 19, 7], 64, 96, dtype, transposed = transposed)
+    ref_dy = torch.ones(x.shape[0], _weight(param, transposed).shape[-1], device = "cuda", dtype = dtype)
+    _, ref_dx, ref_dw = _fp64(x, param, ref_dy, counts, transposed)
+    for fn in (MU._triton_grouped_mm, torch.ops.unsloth_zoo.grouped_mm_triton.default):
+        xx = x.detach().clone().requires_grad_(True)
+        p = param.detach().clone().requires_grad_(True)
+        before = _calls()
+        fn(xx, _weight(p, transposed), offs).sum().backward()
+        assert _calls()["wgrad"] == before["wgrad"]            # dW took the torch fallback, not the Triton kernel
+        # fp32 accumulation and one final rounding: within half an ulp of fp64 per element (2x margin here).
+        rtol = 2 ** -8 if dtype == torch.bfloat16 else 2 ** -11
+        for got, ref in ((p.grad, ref_dw), (xx.grad, ref_dx)):
+            bad = (got.double() - ref).abs() > rtol * ref.abs() + 1e-4 * ref.abs().max()
+            assert not bad.any(), (fn, bad.nonzero()[:4].tolist(), (got.double() - ref).abs().max().item())
+
+
 def _lora_block(x, base, lora_a, lora_b, offs):
     # frozen base through a transposed view + a LoRA pair, as forward_native_grouped_mm runs them
     y = MU._grouped_mm_with_backward_fix(x, base.transpose(-2, -1), offs)
@@ -526,6 +565,7 @@ def _lora_run(fn, case):
 @needs_kernel
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_compile_fullgraph_matches_eager(monkeypatch, dtype):
+    _skip_unless_forcing_engages()
     _force_on(monkeypatch)
     torch._dynamo.reset()
     case = _lora_case([30, 0, 50, 20], dtype)
@@ -559,6 +599,7 @@ def test_compile_ops_bitwise_eager(monkeypatch):
 @needs_kernel
 def test_compile_recompiles_at_most_once_across_threshold(monkeypatch):
     """Under dynamic shapes M <= limit * E is a guard: crossing it recompiles once, then nothing."""
+    _skip_unless_forcing_engages()
     if not MU._check_torch_grouped_mm_supported():
         pytest.skip("torch._grouped_mm unsupported here")
     from torch._dynamo.testing import CompileCounterWithBackend
@@ -603,6 +644,7 @@ def _transformers_moe():
 
 @needs_kernel
 def test_transformers_grouped_mm_wrapper(monkeypatch):
+    _skip_unless_forcing_engages()
     tm = _transformers_moe()
     if tm is None:
         pytest.skip("transformers without integrations.moe._grouped_mm")

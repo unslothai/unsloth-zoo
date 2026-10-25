@@ -615,7 +615,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                 '--accept-source-agreements',
             ] + extra_args
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"Unsloth: Failed to install {winget_id} via winget.\n"
@@ -834,6 +834,8 @@ def check_pip():
             stdout = subprocess.PIPE,
             stderr = subprocess.STDOUT,
             text = True,
+            encoding = "utf-8",
+            errors = "replace",
         )
         output = probe.stdout or ""
 
@@ -849,10 +851,15 @@ def check_pip():
 pass
 
 
+def _utf8_child_env():
+    # Python children write piped stdio in the ANSI code page on Windows; make them emit the UTF-8 we decode.
+    return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian", ignore_deprecation = False):
     # All Unsloth Zoo code licensed under LGPLv3
 
-    with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True) as sp:
+    with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, env = _utf8_child_env(), text=True, encoding="utf-8", errors="replace") as sp:
         stdout, stderr = sp.communicate()
         stdout = stdout or ""
         stderr = stderr or ""
@@ -942,9 +949,9 @@ def _find_lib_path(lib_name):
     try:
         result = subprocess.run(
             ['gcc', f'-print-file-name={lib_name}'],
-            capture_output=True, text=True
+            capture_output=True,
         )
-        path = os.path.realpath(result.stdout.strip())
+        path = os.path.realpath(os.fsdecode(result.stdout).strip())
         if os.path.isabs(path) and os.path.exists(path):
             return path
     except Exception as exc:
@@ -1002,6 +1009,8 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
                     [location, "--help"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=5
                 )
                 if result.returncode == 0 or "usage" in result.stdout.lower() or "usage" in result.stderr.lower():
@@ -2496,7 +2505,7 @@ def install_llama_cpp(
                 print(f"Unsloth: cmake configure with {cmake_generator}")
                 print(f"Unsloth: cmake args: {' '.join(cmake_args)}")
 
-            result = subprocess.run(cmake_args, capture_output=True, text=True)
+            result = subprocess.run(cmake_args, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"cmake configure failed (exit {result.returncode}):\n"
@@ -2511,7 +2520,7 @@ def install_llama_cpp(
 
             if print_output: print("Unsloth: Building llama.cpp (this may take several minutes)...")
 
-            result = subprocess.run(build_cmd, capture_output=True, text=True)
+            result = subprocess.run(build_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"cmake build failed (exit {result.returncode}):\n"
@@ -3630,6 +3639,45 @@ def _patch_num_experts(content, eol_fallback = None):
 pass
 
 
+_CHECKPOINT_HPARAMS_MARKER = b"# UNSLOTH_CHECKPOINT_HPARAMS_APPLIED"
+_MAIN_GUARD_PATTERN = re.compile(rb"^if __name__ == (['\"])__main__\1:", re.MULTILINE)
+# conversion/bailingmoe3.py reads Ling 3.x's own keys, which transformers 5.20's bailing_hybrid to_dict()
+# renames (norm_topk_prob) and rewrites (head_dim 128 -> 64): read config.json, as before 5.20 (#14916).
+_CHECKPOINT_HPARAMS_BLOCK = b"""\
+# UNSLOTH_CHECKPOINT_HPARAMS_APPLIED
+_UNSLOTH_CHECKPOINT_HPARAMS_ARCHS = ("BailingMoeV3ForCausalLM", "BailingMoeV3VLForConditionalGeneration")
+def _unsloth_checkpoint_hparams(load_hparams):
+    def wrapped(dir_model, is_mistral_format = False, *args, **kwargs):
+        if not is_mistral_format:
+            try:
+                import json as _json
+                with open(os.path.join(str(dir_model), "config.json"), "r", encoding = "utf-8") as f:
+                    config = _json.load(f)
+                if set(config.get("architectures") or ()) & set(_UNSLOTH_CHECKPOINT_HPARAMS_ARCHS):
+                    return config
+            except Exception:
+                pass
+        return load_hparams(dir_model, is_mistral_format, *args, **kwargs)
+    return wrapped
+ModelBase.load_hparams = staticmethod(_unsloth_checkpoint_hparams(ModelBase.load_hparams))
+
+"""
+
+
+def _patch_checkpoint_hparams(content, layout = "package"):
+    """Insert _CHECKPOINT_HPARAMS_BLOCK before the entrypoint's `if __name__ == "__main__":`.
+    Returns (new_content, status): 'applied' / 'already-applied' / 'pattern-missing' / 'not-package'."""
+    # A monolith converter has no BailingMoeV3, and older ones name the class `Model` with
+    # `load_hparams(dir_model)`: wrapping `ModelBase` there is a NameError on every conversion.
+    if layout != "package": return content, "not-package"
+    if _CHECKPOINT_HPARAMS_MARKER in content: return content, "already-applied"
+    match = _MAIN_GUARD_PATTERN.search(content)
+    if match is None: return content, "pattern-missing"
+    block = _CHECKPOINT_HPARAMS_BLOCK.replace(b"\n", _dominant_newline(content))
+    return content[:match.start()] + block + content[match.start():], "applied"
+pass
+
+
 def _patched_content_parses(content):
     """True iff the patched converter is still syntactically valid Python.
 
@@ -4632,6 +4680,16 @@ def _download_convert_hf_to_gguf_cached(
             raise
         _patch_stages.append(("Qwen2MoE num_experts alias", patched_content))
 
+        # Patch 4: architectures whose converter reads the checkpoint's own config.json keys.
+        try:
+            patched_content, _hparams_status = _patch_checkpoint_hparams(patched_content, _layout)
+            if _hparams_status == "pattern-missing":
+                logger.warning("Unsloth: checkpoint hparams patch target `if __name__ == '__main__':` not found.")
+        except Exception as e:
+            logger.error(f"Unsloth: Error applying checkpoint hparams patch: {e}", exc_info=True)
+            raise
+        _patch_stages.append(("checkpoint hparams", patched_content))
+
 
         # 4. Write Patched File
         # Package entrypoints stay beside conversion/ so the child resolves
@@ -4801,6 +4859,8 @@ def _convert_to_gguf(command, output_filename, print_output = False, print_outpu
         stdout = subprocess.PIPE,
         stderr = subprocess.STDOUT,
         universal_newlines = True,
+        encoding = "utf-8",
+        errors = "replace",
         shell = True,
     )
     ProgressBar._instances.clear()
@@ -5749,6 +5809,7 @@ def _converter_child_env(gguf_py_dir = None, base_env = None):
     sibling tree ahead of our choice. Idempotent.
     """
     env = dict(os.environ if base_env is None else base_env)
+    env["PYTHONIOENCODING"] = "utf-8"
     if not gguf_py_dir:
         return env
     gguf_py_dir = os.path.abspath(gguf_py_dir)
@@ -7758,7 +7819,7 @@ def check_libcurl_dev():
     if system_type == "debian":
         package_name = "libcurl4-openssl-dev"
         try:
-            result = subprocess.run(['dpkg','-l', package_name], capture_output = True, text = True)
+            result = subprocess.run(['dpkg','-l', package_name], capture_output = True, text = True, encoding = "utf-8", errors = "replace")
             is_installed = result.returncode == 0 and 'ii' in result.stdout
             return is_installed, package_name
         except Exception:
@@ -7767,7 +7828,7 @@ def check_libcurl_dev():
     elif system_type == "rpm":
         package_name = "libcurl-devel"
         try:
-            result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True)
+            result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True, encoding = "utf-8", errors = "replace")
             is_installed = result.returncode == 0
             return is_installed, package_name
         except Exception:
@@ -7776,7 +7837,7 @@ def check_libcurl_dev():
     elif system_type == "arch":
         package_name = "curl"
         try:
-            result = subprocess.run(['pacman', '-Q', package_name], capture_output=True, text=True)
+            result = subprocess.run(['pacman', '-Q', package_name], capture_output=True, text=True, encoding="utf-8", errors="replace")
             is_installed = result.returncode == 0
             return is_installed, package_name
         except Exception:
@@ -7785,7 +7846,7 @@ def check_libcurl_dev():
     elif system_type == "alpine":
         package_name = "curl-dev"
         try:
-            result = subprocess.run(['apk', 'info', '-e', package_name], capture_output=True, text=True)
+            result = subprocess.run(['apk', 'info', '-e', package_name], capture_output=True, text=True, encoding="utf-8", errors="replace")
             return result.returncode == 0, package_name
         except Exception:
             return False, package_name
@@ -7793,7 +7854,7 @@ def check_libcurl_dev():
     elif system_type == "suse":
         package_name = "libcurl-devel"
         try:
-            result = subprocess.run(['rpm', '-q', package_name], capture_output=True, text=True)
+            result = subprocess.run(['rpm', '-q', package_name], capture_output=True, text=True, encoding="utf-8", errors="replace")
             return result.returncode == 0, package_name
         except Exception:
             return False, package_name

@@ -667,6 +667,43 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3MLP)
 
 
+def patch_Gemma3MultiModalProjector():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.gemma3.modeling_gemma3
+        transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector
+    except Exception as e:
+        return raise_error("Gemma3MultiModalProjector.forward", e)
+
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
+
+    def forward(self, vision_outputs: torch.Tensor):
+        batch_size, _, hidden_size = vision_outputs.shape
+
+        reshaped_vision_outputs = vision_outputs.transpose(1, 2)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            batch_size, hidden_size, self.patches_per_image, self.patches_per_image
+        )
+        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
+
+        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
+        pooled_vision_outputs = pooled_vision_outputs.flatten(2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
+
+        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+        # mm_soft_emb_norm emits fp16; full finetuning has an fp32 weight and no autocast,
+        # so torch.matmul would see Half against float.
+        normed_vision_outputs = _to_boundary_dtype(
+            normed_vision_outputs, _linear_boundary_dtype(self, "mm_input_projection_weight")
+        )
+        projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
+        return projected_vision_outputs.type_as(vision_outputs)
+    pass
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MultiModalProjector, "forward", forward)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3MultiModalProjector)
+
+
 def patch_Gemma3Attention():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:

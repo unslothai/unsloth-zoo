@@ -60,6 +60,7 @@ def _rel(a, ref):
 @pytest.mark.parametrize("act", ["silu", None])
 def test_matches_reference(B, D, T, W, L, dtype, bias, act):
     x, state, w, b = _inputs(B, D, T, W, L, dtype, bias)
+    state_before = state.clone()  # both updates below advance their cache in place
     ref_state = state.clone()
     ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, act)
     ours = gcc.triton_causal_conv1d_update(x, state, w, b, act)
@@ -71,7 +72,8 @@ def test_matches_reference(B, D, T, W, L, dtype, bias, act):
     else:
         # Both accumulate in fp32 and round the conv output once; summation order and the SiLU
         # formula differ by an ulp here and there, so judge both against an fp64 oracle.
-        oracle = gcc.causal_conv1d_update_reference(_to64(x), _to64(state.clone()), _to64(w), _to64(b), act)
+        oracle = gcc.causal_conv1d_update_reference(_to64(x), _to64(state_before), _to64(w), _to64(b), act)
+        assert _rel(ref, oracle) < 5e-3
         assert _rel(ours, ref) < 5e-3
         assert _rel(ours, oracle) <= max(1.25 * _rel(ref, oracle), 1e-3)
         assert (ours == ref).float().mean().item() > 0.7
@@ -186,6 +188,26 @@ def test_cached_launch_matches_reference_over_many_steps(monkeypatch, dtype):
     # One plan for the repeated shape, and the cached launcher is used only where it was verified.
     assert len(gcc._update_plans) == 1
     assert gcc._fast_launch_mode == ("all" if gcc._triton_launcher_verified() else False)
+
+
+@requires_cuda
+def test_update_plan_cache_stays_bounded_over_batch_sizes(monkeypatch):
+    # Batch size and length are in the plan key: a long-running server must not grow it forever.
+    monkeypatch.setattr(gcc, "_update_plans", {})
+    monkeypatch.setattr(gcc, "_fast_launch_mode", None)
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    monkeypatch.setattr(gcc, "_UPDATE_PLANS_MAX", 8, raising = False)
+    sizes = []
+    for B in range(1, 25):
+        x, state, w, b = _inputs(B, 64, 1, 4, 4, torch.bfloat16, True)
+        ref_state = state.clone()
+        ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, "silu")
+        ours = gcc._try_fast_update(x, state, w, b, "silu")
+        assert ours is not None and torch.equal(state, ref_state)
+        assert _rel(ours, ref) < 5e-3
+        sizes.append(len(gcc._update_plans))
+    assert max(sizes) <= 8
 
 
 @requires_cuda

@@ -51,6 +51,7 @@ import math
 import time
 import warnings
 import os
+import re
 from functools import lru_cache
 from collections.abc import Mapping
 
@@ -957,6 +958,77 @@ def get_video_reader_backend() -> str:
     return video_reader_backend
 
 
+def _ffmpeg_protocol(source: str) -> str:
+    """The protocol ffmpeg's url_find_protocol would pick, lower-cased, or "" for a plain path: a
+    leading `name:` even with no `//` (`tcp:host:port`), `subfile,` only when a colon follows, and
+    a one-letter prefix is a Windows drive."""
+    match = re.match(r"([A-Za-z0-9+.-]+)(:|,)", source)
+    if not match or len(match.group(1)) < 2:
+        return ""
+    name = match.group(1).lower()
+    if match.group(2) == ",":
+        return name if name == "subfile" and ":" in source[match.end():] else ""
+    return name
+
+
+_LOCAL_SHARE_HOSTS = ("", "localhost", "wsl$", "wsl.localhost")
+_WINDOWS = os.name == "nt"
+
+
+def _is_network_share(path: str) -> bool:
+    """UNC paths and file: URLs naming a remote host: Windows would open an SMB connection.
+    Elsewhere `//x` is an ordinary path, and `\\\\wsl$` is the user's own WSL distro."""
+    if not _WINDOWS:
+        return False
+    p = path.replace("\\", "/")
+    if p[:5].lower() == "file:":
+        p = p[5:]
+        if p.startswith("//"):
+            host = p[2:].split("/", 1)[0]
+            if host.lower() not in _LOCAL_SHARE_HOSTS:
+                return True
+            p = p[2 + len(host):]
+    if p.startswith(("//?/", "//./")):
+        rest = p[4:]
+        if rest.upper().startswith("UNC/"):
+            p = "//" + rest[4:]
+        else:
+            # A drive or a volume GUID is local; GLOBALROOT/Device/Mup reaches the redirector.
+            return re.match(r"([A-Za-z]:|Volume\{[0-9A-Fa-f-]+\})(/|$)", rest) is None
+    return p.startswith("//") and p[2:].split("/", 1)[0].lower() not in _LOCAL_SHARE_HOSTS
+
+
+# A real video container never starts like this (nor with whitespace or a BOM, which a padded
+# text document would); a playlist would make ffmpeg open its entries itself (file:// segments
+# included), outside every check here.
+_PLAYLIST_HEADS = (b"#EXTM3U", b"<", b"ffconcat", b"\xef\xbb\xbf", b" ", b"\t", b"\r", b"\n")
+
+
+def _refuse_playlist(path: str, source: str) -> None:
+    with open(path, "rb") as handle:
+        _refuse_playlist_head(handle.read(64), source)
+
+
+def _refuse_playlist_head(head: bytes, source: str) -> None:
+    if head.startswith(_PLAYLIST_HEADS):
+        raise ValueError(f"Unsloth: Refusing a playlist or document as a video URL: `{source}`")
+
+
+def _data_uri_head(source: str) -> bytes:
+    """The first decoded bytes of a data: URI, enough to tell a playlist from a container."""
+    import base64
+    from urllib.parse import unquote_to_bytes
+
+    header, _, payload = source.partition(",")
+    if header.lower().endswith(";base64"):
+        chunk = re.sub(r"\s", "", payload[:256])
+        try:
+            return base64.b64decode(chunk[: len(chunk) // 4 * 4], validate = False)
+        except ValueError:
+            return b""  # malformed: the decoder rejects it on its own
+    return unquote_to_bytes(payload[:256])
+
+
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
         # Pick the decoder first: if none is installed, a temp file would strand.
@@ -964,10 +1036,29 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
         # The decoders fetch remote URLs themselves and follow redirects with no
         # way to refuse, so download through the guard and decode a local file.
         downloaded = None
-        if ele["video"].startswith("http://") or ele["video"].startswith("https://"):
-            downloaded = fetch_remote_media_to_file(ele["video"])
+        source = ele["video"]
+        scheme = _ffmpeg_protocol(source)
+        if scheme in ("http", "https"):
+            downloaded = fetch_remote_media_to_file(source)
             ele = dict(ele)
             ele["video"] = downloaded
+            try:
+                _refuse_playlist(downloaded, source)
+            except BaseException:
+                try: os.unlink(downloaded)
+                except OSError: pass
+                raise
+        elif scheme == "data":
+            _refuse_playlist_head(_data_uri_head(source), source)
+        elif scheme not in ("", "file"):
+            # rtsp://, tcp://, ftp:// ... would be dialled by ffmpeg with no address checks.
+            raise ValueError(f"Unsloth: Refusing a video URL with an unsupported scheme: `{source}`")
+        elif _is_network_share(resolve_file_uri_to_path(source)) and not _allow_private_url_fetch():
+            # Resolved first: file://C:/x is a drive, file:///%5chost/... decodes to a UNC path.
+            raise ValueError(
+                f"Unsloth: Refusing a video path on a network share: `{source}`. "
+                f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load videos from shares you trust."
+            )
         try:
             try:
                 video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
@@ -2019,8 +2110,16 @@ class UnslothVisionDataCollator:
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
         # LLaVA IMAGE_TOKEN_INDEX (-200) sentinel is never a target.
         labels[labels < 0] = self.ignore_index
+        self._mask_targets_after_padding(labels, batch.get("attention_mask"))
         batch["labels"] = labels
         return batch
+
+    def _mask_targets_after_padding(self, labels, attention_mask):
+        """Mask targets predicted from a pad position: unpadded rows lose them at the loss shift,
+        so left padding would make batch size 2 differ from 2 accumulation steps."""
+        if not torch.is_tensor(attention_mask) or attention_mask.dim() != 2 or attention_mask.shape != labels.shape:
+            return
+        labels[:, 1:].masked_fill_(attention_mask[:, :-1].to(labels.device) == 0, self.ignore_index)
 
     def _check_supervised(self, labels, attention_mask = None):
         """All labels masked means zero loss: raise on an untruncated first batch, else warn once."""
@@ -2733,6 +2832,7 @@ class UnslothVisionDataCollator:
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
         labels[labels < 0] = self.ignore_index
+        self._mask_targets_after_padding(labels, attention_mask)
         if self.completion_only_loss:
             labels[completion_mask == 0] = self.ignore_index
 

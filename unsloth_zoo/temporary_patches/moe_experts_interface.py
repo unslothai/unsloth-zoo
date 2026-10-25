@@ -467,10 +467,23 @@ def _patch_transformers_grouped_mm():
     transformers_moe._grouped_mm = _grouped_mm
 
 
+def _warm_lazy_lookups():
+    # Filled here, eagerly: a first fill inside a compiled MoE layer guards on the key being absent, so
+    # the next call recompiles every compiled layer once.
+    _default_apply_gate_or_none()
+    _experts_layout_is_standard_or_none()
+    if "moe_utils" not in _LAZY and __name__.rsplit(".", 1)[0] + ".moe_utils" in sys.modules:
+        _moe_utils_module()
+
+
 def patch_experts_interface():
     interface = _experts_interface()
     if interface is None:
         return
+    try:
+        _warm_lazy_lookups()
+    except Exception:
+        pass
     _patch_transformers_grouped_mm()
     try:
         from transformers.modeling_utils import PreTrainedModel

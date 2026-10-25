@@ -1022,13 +1022,14 @@ def grpo_compute_loss(
 
     # Reverse KL: low-variance low-bias estimator as used in the GRPO paper.
     if beta != 0.0:
-        # Clamped like verl "low_var_kl" / SkyRL "k3" (TRL does not): log-ratio to [-20, 20] so expm1
-        # cannot overflow into a nan gradient, then k3 to [-10, 10], before bias correction and beta.
+        # Keep expm1 finite, then cap the final KL term (TRL does not clamp).
         kl_log_ratio = torch.clamp(ref - new, min = -20.0, max = 20.0)
-        kl_i = torch.clamp(torch.expm1(kl_log_ratio) - kl_log_ratio, min = -10.0, max = 10.0)
+        kl_i = torch.expm1(kl_log_ratio) - kl_log_ratio
         # TRL order: pre-clamp non-detached coef_1, before the loss_type dispatch.
         if use_bias_correction_kl:
             kl_i = kl_i * coef_1
+        # Clamp after correction so a saturated KL also stops the ratio's gradient.
+        kl_i = torch.clamp(kl_i, min = -10.0, max = 10.0)
     else:
         # Zeros with the correct shape.
         if importance_sampling_level == "sequence":
@@ -1110,15 +1111,14 @@ def grpo_compute_loss(
     elif loss_type in ["grpo", "sapo"]:
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type == "bnpo" and num_items_in_batch is None:
-        # TRL < 0.22 passes no global token count: per micro-batch, so the loss depends on how the batch is split.
+    elif loss_type == "bnpo":
+        # BNPO uses the local micro-batch token count even when TRL supplies a global count.
         loss = (loss_i * mask).sum() / mask.sum().clamp(min=1.0)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "dr_grpo":
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type in ["bnpo", "cispo", "dapo", "vespo"]:
-        # bnpo too: a per micro-batch token mean changes with the GPU / accumulation split, the global count does not.
+    elif loss_type in ["cispo", "dapo", "vespo"]:
         # Floor at 1 like TRL: a fully masked batch (mask_truncated_completions) is 0/0 = nan otherwise.
         if torch.is_tensor(num_items_in_batch):
             normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
@@ -1259,6 +1259,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
 
         # Mixed precision scaling if present.
         scaling = scaler.get_scale() if scaler is not None else 1.0
+        # A float scale is a dynamo guard (recompile per change); a float32 0-dim tensor is not.
+        if scaler is not None and not torch.is_tensor(scaling):
+            scaling = torch.full((), float(scaling), dtype = torch.float32, device = device)
 
         for (grad_inputs_j, new_logps_j, old_logps_j, ref_logps_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, ) in \
             zip(grad_inputs_chunks, new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages):

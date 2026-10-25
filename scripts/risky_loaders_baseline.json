@@ -55,6 +55,14 @@
       "reason": "Loads the module this process just generated into its own compile cache folder."
     },
     {
+      "file": "unsloth_zoo/cpu/runtime.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "7e28e71786fdeb78",
+      "count": 1,
+      "reason": "Loads a fixed, package-shipped guard file (unsloth_zoo/temporary_patches/datasets_folder_metadata.py) by a hard-coded name; no caller-controlled path."
+    },
+    {
       "file": "unsloth_zoo/dataset_num_proc.py",
       "rule": "dynamic-import",
       "sink": "__import__",
@@ -325,6 +333,14 @@
       "digest": "37f520ba5b9ea0dc",
       "count": 1,
       "reason": "Iterates the fixed _EXPORT_SUBMODULES of the vendored fla package."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/fla_vendor.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "f79d15f13ee764d4",
+      "count": 1,
+      "reason": "Imports _GLM5_NEXT_MODULE, a fixed transformers module path defined in this file, to patch Glm5NextTextLinearAttention."
     },
     {
       "file": "unsloth_zoo/temporary_patches/fla_vendor.py",
