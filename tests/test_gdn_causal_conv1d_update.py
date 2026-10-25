@@ -60,6 +60,7 @@ def _rel(a, ref):
 @pytest.mark.parametrize("act", ["silu", None])
 def test_matches_reference(B, D, T, W, L, dtype, bias, act):
     x, state, w, b = _inputs(B, D, T, W, L, dtype, bias)
+    state_before = state.clone()  # both updates below advance their cache in place
     ref_state = state.clone()
     ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, act)
     ours = gcc.triton_causal_conv1d_update(x, state, w, b, act)
@@ -71,7 +72,8 @@ def test_matches_reference(B, D, T, W, L, dtype, bias, act):
     else:
         # Both accumulate in fp32 and round the conv output once; summation order and the SiLU
         # formula differ by an ulp here and there, so judge both against an fp64 oracle.
-        oracle = gcc.causal_conv1d_update_reference(_to64(x), _to64(state.clone()), _to64(w), _to64(b), act)
+        oracle = gcc.causal_conv1d_update_reference(_to64(x), _to64(state_before), _to64(w), _to64(b), act)
+        assert _rel(ref, oracle) < 5e-3
         assert _rel(ours, ref) < 5e-3
         assert _rel(ours, oracle) <= max(1.25 * _rel(ref, oracle), 1e-3)
         assert (ours == ref).float().mean().item() > 0.7
@@ -186,6 +188,26 @@ def test_cached_launch_matches_reference_over_many_steps(monkeypatch, dtype):
     # One plan for the repeated shape, and the cached launcher is used only where it was verified.
     assert len(gcc._update_plans) == 1
     assert gcc._fast_launch_mode == ("all" if gcc._triton_launcher_verified() else False)
+
+
+@requires_cuda
+def test_update_plan_cache_stays_bounded_over_batch_sizes(monkeypatch):
+    # Batch size and length are in the plan key: a long-running server must not grow it forever.
+    monkeypatch.setattr(gcc, "_update_plans", {})
+    monkeypatch.setattr(gcc, "_fast_launch_mode", None)
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    monkeypatch.setattr(gcc, "_UPDATE_PLANS_MAX", 8, raising = False)
+    sizes = []
+    for B in range(1, 25):
+        x, state, w, b = _inputs(B, 64, 1, 4, 4, torch.bfloat16, True)
+        ref_state = state.clone()
+        ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, "silu")
+        ours = gcc._try_fast_update(x, state, w, b, "silu")
+        assert ours is not None and torch.equal(state, ref_state)
+        assert _rel(ours, ref) < 5e-3
+        sizes.append(len(gcc._update_plans))
+    assert max(sizes) <= 8
 
 
 @requires_cuda
@@ -431,3 +453,42 @@ def test_tiny_qwen3_next_cached_decode_matches_full_forward(monkeypatch):
     n_decode = ids.shape[1] - prefill
     assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_update"] - before["triton_update"] == 3 * n_decode
     assert _rel(torch.cat(steps, dim = 1), full) < 1e-4
+
+
+@requires_cuda
+def test_cuda_graph_capture_after_one_warmup(monkeypatch):
+    # One eager decode step builds the plan, so the captured step is the first cached launch. Its
+    # self-check would read a verdict back on the host and invalidate the capture: it must take
+    # the full launch inside the graph and leave the check to the next eager step.
+    if not gcc._triton_launcher_verified():
+        pytest.skip("cached launcher needs Triton 3.6+")
+    monkeypatch.setattr(gcc, "_update_plans", {})
+    monkeypatch.setattr(gcc, "_fast_launch_mode", None)
+    monkeypatch.setattr(gcc, "_update_broken", False)
+    monkeypatch.setattr(gcc, "_update_disabled", False)
+    x, state, w, b = _inputs(2, 640, 1, 4, 4, torch.bfloat16, True)
+    with torch.no_grad():
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            assert gcc._try_fast_update(x, state.clone(), w, b, "silu") is not None
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        assert len(gcc._update_plans) == 1 and gcc._fast_launch_mode is None
+
+        state0 = state.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            y = gcc._try_fast_update(x, state, w, b, "silu")
+        assert y is not None and not gcc._update_broken
+        graph.replay()
+        torch.cuda.synchronize()
+        ref_state = state0.clone()
+        full = gcc.triton_causal_conv1d_update(x, ref_state, w, b, "silu")
+        assert torch.equal(y, full) and torch.equal(state, ref_state)
+        assert gcc._fast_launch_mode is None  # no verdict recorded while capturing
+
+        state.copy_(state0)
+        assert torch.equal(gcc._try_fast_update(x, state, w, b, "silu"), full)
+        assert torch.equal(state, ref_state)
+        assert gcc._fast_launch_mode == "all"

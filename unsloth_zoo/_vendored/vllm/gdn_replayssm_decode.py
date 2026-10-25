@@ -363,7 +363,8 @@ def fused_recurrent_gated_delta_rule_replayssm(
         num_warps = cfg_nw
     if num_stages is None:
         num_stages = cfg_ns
-    if nk is None:
+    nk_from_config = nk is None
+    if nk_from_config:
         nk = cfg_nk
 
     # Cache shape sanity (per state slot): d=(HV, L, V), k=(H, L, K), g=(HV, L).
@@ -390,6 +391,10 @@ def fused_recurrent_gated_delta_rule_replayssm(
         raise ValueError(
             f"Cached decode kernel only supports NK_global=1 (got K={K}, BK={BK})."
         )
+    if nk_from_config:
+        # Modified by Unsloth: fewer K splits for small K, where the table's nk (4 on sm75 and
+        # sm100+) would leave BKT < 16. An explicit nk is still validated as given.
+        nk = max(1, min(nk, BK // 16))
     if BK % nk != 0:
         raise ValueError(f"nk={nk} must divide BK={BK}.")
     BKT = BK // nk

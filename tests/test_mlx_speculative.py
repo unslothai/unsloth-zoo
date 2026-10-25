@@ -199,6 +199,34 @@ def test_a_round_running_first_use_work_updates_no_cost_and_is_measured_again():
     assert controller._measured_at == {(1, "round", 3): 6}
 
 
+def test_a_first_use_spike_at_each_width_does_not_pin_a_shallow_width():
+    # 27B 4-bit on flat verify kernels, in plain steps: each width's first block from 3 rows on pays a 7x compile.
+    table, seen, draft = [1.19, 1.29, 1.48, 1.51, 1.53, 1.62, 1.71], set(), [0.85] * 7
+    machine = _Machine()
+    machine.draft = lambda depth: 0.19
+    machine.verify = lambda batch, width: table[width - 2] * (1.0 if width < 3 or width in seen or seen.add(width) else 7.0)
+    choice = _run(DraftController(max_depth = 7, can_copy = False), machine, [(draft, None)], rounds = 800, report = (report := {}))
+    deepest = sum(prod(draft[:k]) for k in range(8)) / (table[-1] + 0.19)
+    assert choice[0][1] >= 6 and report["rate"] >= 0.93 * deepest
+
+
+def test_timings_resist_one_off_work():
+    # The first two keep the faster; later, 100 counts as 2 and 0.1 in full.
+    for samples, value in (((5.0, 1.0, 100.0), 4 / 3), ((1.0, 5.0), 1.0), ((1.0, 1.0, 0.1), 0.7)):
+        timing = _Ema()
+        for sample in samples:
+            timing.update_time(sample, 0.2)
+        assert (timing.value, timing.count) == pytest.approx((value, len(samples)))
+    controller = DraftController(max_depth = 7, can_copy = False)
+    controller.verify_cost[1] = {2: _Ema(1.0, 2), 4: _Ema(1.2, 2), 6: _Ema(9.0), 8: _Ema(1.5)}
+    # A width timed once counts no more than the confirmed widths predict.
+    assert [value for _, value in controller._measured(controller.verify_cost[1])] == pytest.approx([1.0, 1.2, 1.4, 1.5])
+    # And a round at it, or drafting a depth timed once, is timed apart again, so its second sample confirms or replaces it.
+    controller.draft_cost.update({1: _Ema(0.2, 2), 3: _Ema(0.2), 7: _Ema(0.2, 2)})
+    rows = [RowState(controller.new_reply())]
+    assert [controller._measured_parts(RoundPlan("round", rows = (RowPlan("draft", depth),)), rows) for depth in (1, 3, 7)] == [True, False, False]
+
+
 def test_short_budgets_never_plan_empty_drafts():
     controller = DraftController(max_depth = 3, can_copy = False)
     for budgets in ([1], [1, 10], [0, 1]):

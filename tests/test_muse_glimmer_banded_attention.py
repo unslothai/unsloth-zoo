@@ -245,6 +245,28 @@ def test_compiled_deferral_does_not_recompile(_clean_router):
     assert counter.frame_count == 1
 
 
+
+def test_compiled_banded_path_does_not_recompile(_clean_router):
+    """The engaged counters are not traced either: a maskless banded call recompiled on every count."""
+    from torch._dynamo.testing import CompileCounter
+
+    module = MuseGlimmerTextAttention()
+    q, k, v = _qkv(S_ON)
+    _route(module, S_ON, q=q, k=k, v=v)  # eager call first, so the counter is already past 1
+    assert not _clean_router, "router deferred instead of engaging"
+    counter = CompileCounter()
+
+    @torch.compile(backend=counter, dynamic=False)
+    def layer(q, k, v):
+        return mg._sdpa_maybe_muse_glimmer_banded(
+            module, q, k, v, None, dropout=0.0, scaling=D ** -0.5)[0] + 1
+
+    torch._dynamo.reset()
+    for _ in range(4):
+        layer(q, k, v)
+    torch._dynamo.reset()
+    assert counter.frame_count == 1
+
 def test_patch_is_idempotent():
     """unsloth applies TEMPORARY_PATCHES three times per process (init,
     pre_compile, post_compile), so a second install must not stack a wrapper."""
@@ -277,6 +299,7 @@ def test_patch_preserves_wrapped_router_sentinels():
     registry = _sdpa_registry()
     original = registry["sdpa"]
     prev_box = mg._ORIG_SDPA[0]
+    prev_attrs = dict(vars(mg._sdpa_maybe_muse_glimmer_banded))
 
     def gemma4_like(module, q, k, v, mask, **kw):
         return "GEMMA4", None
@@ -294,9 +317,49 @@ def test_patch_preserves_wrapped_router_sentinels():
     finally:
         registry["sdpa"] = original
         mg._ORIG_SDPA[0] = prev_box
-        # The sentinel was forwarded onto the module-level wrapper; drop it again
-        # so it cannot leak into any later test.
+        # Put the wrapper's attributes back exactly. Popping the forwarded sentinel stripped the
+        # real one when this process had already chained the wrapper over gemma-4's router, so
+        # the next TEMPORARY_PATCHES pass wrapped gemma-4 around this wrapper and every SDPA
+        # call recursed (muse -> gemma-4 -> muse).
+        attrs = vars(mg._sdpa_maybe_muse_glimmer_banded)
+        attrs.clear()
+        attrs.update(prev_attrs)
+
+
+def test_sentinel_test_leaves_a_live_chain_intact():
+    """Run against the chain unsloth installs: gemma-4's router under this one."""
+    gf = pytest.importorskip("unsloth_zoo.temporary_patches.gemma4_flash_sliding")
+    registry = _sdpa_registry()
+    saved = (registry["sdpa"], mg._ORIG_SDPA[0], gf._ORIG_SDPA[0])
+    saved_attrs = (
+        dict(vars(mg._sdpa_maybe_muse_glimmer_banded)),
+        dict(vars(gf._sdpa_maybe_flash_sliding)),
+    )
+
+    def stock(module, q, k, v, mask, **kw):
+        return "STOCK", None
+
+    try:
         vars(mg._sdpa_maybe_muse_glimmer_banded).pop("_unsloth_gemma4_flash", None)
+        registry["sdpa"] = stock
+        gf.patch_gemma4_flash_sliding()
+        mg.patch_muse_glimmer_banded_sliding_attention()
+        assert registry["sdpa"] is mg._sdpa_maybe_muse_glimmer_banded
+
+        test_patch_preserves_wrapped_router_sentinels()
+
+        # A later patch pass must find both routers already installed.
+        gf.patch_gemma4_flash_sliding()
+        mg.patch_muse_glimmer_banded_sliding_attention()
+        assert gf._ORIG_SDPA[0] is stock
+        assert mg._ORIG_SDPA[0] is gf._sdpa_maybe_flash_sliding
+    finally:
+        registry["sdpa"], mg._ORIG_SDPA[0], gf._ORIG_SDPA[0] = saved
+        for function, attrs in zip(
+            (mg._sdpa_maybe_muse_glimmer_banded, gf._sdpa_maybe_flash_sliding), saved_attrs
+        ):
+            vars(function).clear()
+            vars(function).update(attrs)
 
 
 if __name__ == "__main__":

@@ -340,6 +340,63 @@ def test_patched_update_routes_training_to_kernel_path(monkeypatch):
     assert called.get("kernel"), "use_kernel=False did not get the efficient VJP"
 
 
+@requires_metal
+@pytest.mark.parametrize("keywords", [{"lower_bound": -5.0}, {"allow_neg_eigval": True},
+                                      {"lower_bound": -5.0, "allow_neg_eigval": True}])
+def test_patched_update_applies_mlx_lm_gating_keywords(keywords):
+    import unsloth_zoo.gated_delta_vjp as gv
+
+    gv.patch_gated_delta()
+    import inspect
+    from functools import partial
+    from mlx_lm.models import gated_delta as gd
+    original = gd._unsloth_gated_delta_original
+    if not set(keywords) <= set(inspect.signature(original).parameters):
+        pytest.skip("this mlx-lm's gated delta takes no such keyword")
+
+    mx.random.seed(3)
+    B, T, Hk, Hv, Dk, Dv = 1, 8, 2, 2, 32, 16
+    q, k = (mx.random.normal((B, T, Hk, Dk)) * 0.1 for _ in range(2))
+    v = mx.random.normal((B, T, Hv, Dv)) * 0.1
+    a, b = mx.random.normal((B, T, Hv)), mx.random.normal((B, T, Hv))
+    A_log, dt_bias = mx.random.normal((Hv,)), mx.random.normal((Hv,))
+    state = mx.random.normal((B, Hv, Dv, Dk)) * 0.1
+    for cached in (None, state):   # training branch, then the cached kernel branch
+        expected = original(q, k, v, a, b, A_log, dt_bias, state=cached, use_kernel=False, **keywords)
+        acquire_mlx_training_patches()
+        try:
+            got = gd.gated_delta_update(q, k, v, a, b, A_log, dt_bias, state=cached, **keywords)
+        finally:
+            release_mlx_training_patches()
+        for e, g in zip(expected, got):
+            assert mx.allclose(e, g, atol=1e-4, rtol=1e-3).item()
+
+    def loss(update, a, b, A_log, dt_bias):
+        y, state = update(q, k, v, a, b, A_log, dt_bias, **keywords)
+        return y.sum() + state.sum()
+
+    argnums = (0, 1, 2, 3)
+    expected = mx.grad(lambda *g: loss(partial(original, use_kernel=False), *g), argnums)(a, b, A_log, dt_bias)
+    acquire_mlx_training_patches()
+    try:
+        got = mx.grad(lambda *g: loss(gd.gated_delta_update, *g), argnums)(a, b, A_log, dt_bias)
+    finally:
+        release_mlx_training_patches()
+    for e, g in zip(expected, got):   # the gate transforms stay on the differentiated path
+        assert mx.allclose(e, g, atol=1e-3, rtol=1e-2).item()
+
+
+def test_patched_update_delegates_an_unknown_keyword(fake_mlx_lm):
+    import unsloth_zoo.gated_delta_vjp as gv
+    from mlx_lm.models import gated_delta as gd
+
+    seen = {}
+    gd.gated_delta_update = lambda *args, **kwargs: seen.update(kwargs) or "original"
+    gv.patch_gated_delta()
+    assert gd.gated_delta_update(*range(7), new_gate_modifier=1) == "original"
+    assert seen["new_gate_modifier"] == 1
+
+
 def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
     fake_mlx_lm, monkeypatch,
 ):
