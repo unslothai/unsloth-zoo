@@ -100,5 +100,4 @@ def test_mini_batches_share_one_fp32_head(monkeypatch, fp32_head, raw_logits, ex
     assert seen == [ROWS]
     fp32_copies = [d for d in heads.values() if d == torch.float32]
     assert len(fp32_copies) == expected, heads
-    # Raw logits never project through the head, so nothing may cast it.
     assert len(casts) == expected, len(casts)

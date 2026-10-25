@@ -2684,9 +2684,7 @@ def grpo_accumulated_loss(
             _zero3_head = (unsloth_zero3_gathered(lm_head), unsloth_zero3_gathered(lm_head_bias))
             lm_head, lm_head_bias = _zero3_head
 
-        # UNSLOTH_VLLM_FP32_LM_HEAD: every projector casts the head to fp32. Cast once per call instead, so the
-        # mini-batches kept until the loss save one shared fp32 copy rather than one each. Cast only on the
-        # hidden-state branches, after the forward: raw-logit outputs never project through the head.
+        # UNSLOTH_VLLM_FP32_LM_HEAD: one fp32 head copy per call, shared by every mini-batch kept for the loss.
         import inspect as _inspect
         from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as _projector
         _fp32_lm_head = _inspect.signature(_projector).parameters["fp32_lm_head"].default
@@ -2696,7 +2694,7 @@ def grpo_accumulated_loss(
             nonlocal lm_head, lm_head_bias
             if not _fp32_lm_head or lm_head.dtype == torch.float32:
                 return
-            # A new object (FSDP2 unshard, ZeRO-3 gather) or a grad mode change needs a fresh cast.
+            # FSDP2 unshard / ZeRO-3 gather swap the objects; a grad-mode change needs a fresh cast too.
             key = (lm_head, lm_head_bias, torch.is_grad_enabled())
             if _fp32_cache.get("key") is None or any(a is not b for a, b in zip(_fp32_cache["key"], key)):
                 bias = None if lm_head_bias is None else lm_head_bias.to(torch.float32)
