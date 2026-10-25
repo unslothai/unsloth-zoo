@@ -281,6 +281,20 @@ if _HAS_TRITON:
         return x, d
 
     @triton.jit
+    def _fl_block_others(x_row, bias_ptr, bstart, n_end, tgt, m, inv_t, scale, cap, cols,
+                         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr):
+        # sum_{j != tgt} exp(z_j - m) over the block at bstart: the sweep leaves the target's block out entirely (a
+        # scalar choice per block, no per-element mask in the hot loop) and this re-read adds the rest of it back.
+        offs = bstart + cols
+        ok = offs < n_end
+        x = tl.load(x_row + offs, mask = ok, other = 0.0).to(tl.float32)
+        if HAS_BIAS:
+            x += tl.load(bias_ptr + offs, mask = ok, other = 0.0).to(tl.float32)
+        x, _d = _fl_transform(x, scale, cap, HAS_SCALE, HAS_CAP)
+        z = tl.where(ok & (offs != tgt), x * inv_t, -float("inf"))
+        return tl.sum(tl.exp(z - m), axis = 0)
+
+    @triton.jit
     def _fl_row_stats(row, valid, zt, m, so, a, exact_ptr, logp_ptr, lse_ptr, ent_ptr, lpt_ptr, inv_t, scale, cap,
                       HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr, WANT_ENT: tl.constexpr):
         # so excludes the target. lse must match the logits the gradient reads; mixing in the exact target logit biases
@@ -326,11 +340,7 @@ if _HAS_TRITON:
         tot = tl.zeros((), tl.float32)
         best = tl.full((), -float("inf"), tl.float32)
         best_i = tl.zeros((), tl.int64)
-        xt = tl.load(x_row + tgt_c).to(tl.float32)
-        if HAS_BIAS:
-            xt += tl.load(bias_ptr + tgt_c).to(tl.float32)
-        xt, _dt = _fl_transform(xt, scale, cap, HAS_SCALE, HAS_CAP)
-        zt = xt * inv_t
+        sb = tl.zeros((), tl.float32)
         for start in range(0, n_cols, BLOCK):
             offs = start + cols
             ok = offs < n_cols
@@ -351,16 +361,25 @@ if _HAS_TRITON:
             r = tl.exp(m - m_new)
             e = tl.exp(z - m_new)
             if WANT_ENT:
-                # The rescale needs the full running sum: s plus the target once its block has passed.
-                sf = s + tl.where(valid & (tgt < start), tl.exp(zt - m), 0.0)
-                shift = tl.where(m > -float("inf"), (m - m_new) * sf, 0.0)
+                shift = tl.where(s + sb > 0, (m - m_new) * (s + sb), 0.0)
                 a = r * (a + shift) + tl.sum(tl.where(ok, e * (z - m_new), 0.0), axis = 0)
             if WANT_LSSP:
                 q = q * r * r + tl.sum(e * e, axis = 0)
-            # s holds the classes other than the target; its term is added back after the loop.
-            s = s * r + tl.sum(tl.where(offs == tgt, 0.0, e), axis = 0)
+            # s skips the target's block (sb holds it); its other classes are added back after the sweep.
+            es = tl.sum(e, axis = 0)
+            inb = (tgt >= start) & (tgt < start + BLOCK)
+            s = s * r + tl.where(inb, 0.0, es)
+            sb = sb * r + tl.where(inb, es, 0.0)
             m = m_new
 
+        if valid:
+            s += _fl_block_others(x_row, bias_ptr, (tgt // BLOCK) * BLOCK, n_cols, tgt, m, inv_t, scale, cap, cols,
+                                  HAS_BIAS, HAS_SCALE, HAS_CAP)
+        xt = tl.load(x_row + tgt_c).to(tl.float32)
+        if HAS_BIAS:
+            xt += tl.load(bias_ptr + tgt_c).to(tl.float32)
+        xt, _dt = _fl_transform(xt, scale, cap, HAS_SCALE, HAS_CAP)
+        zt = xt * inv_t
         s = _fl_row_stats(row, valid, zt, m, s, a, exact_ptr, logp_ptr, lse_ptr, ent_ptr, lpt_ptr, inv_t, scale, cap,
                           HAS_SCALE, HAS_CAP, HAS_EXACT, WANT_ENT)
         if WANT_SUM:
@@ -396,13 +415,7 @@ if _HAS_TRITON:
         best_i = tl.zeros((), tl.int64)
         tgt = tl.load(tgt_ptr + row).to(tl.int64) - col0
         here = (tgt >= c0) & (tgt < c1)
-        zt = 0.0
-        if WANT_TGT or WANT_ENT:
-            xt = tl.load(x_row + tl.where(here, tgt, c0)).to(tl.float32)
-            if HAS_BIAS:
-                xt += tl.load(bias_ptr + tl.where(here, tgt, c0)).to(tl.float32)
-            xt, _dt = _fl_transform(xt, scale, cap, HAS_SCALE, HAS_CAP)
-            zt = xt * inv_t
+        sb = tl.zeros((), tl.float32)
         for start in range(c0, c1, BLOCK):
             offs = start + cols
             ok = offs < c1
@@ -434,17 +447,26 @@ if _HAS_TRITON:
             r = tl.exp(m - m_new)
             e = tl.exp(z - m_new)
             if WANT_ENT:
-                sf = s + tl.where(here & (tgt < start), tl.exp(zt - m), 0.0)
-                shift = tl.where(m > -float("inf"), (m - m_new) * sf, 0.0)
+                shift = tl.where(s + sb > 0, (m - m_new) * (s + sb), 0.0)
                 a = r * (a + shift) + tl.sum(tl.where(ok, e * (z - m_new), 0.0), axis = 0)
             if WANT_LSSP:
                 q = q * r * r + tl.sum(e * e, axis = 0)
-            s = s * r + tl.sum(tl.where(offs == tgt, 0.0, e), axis = 0)
+            es = tl.sum(e, axis = 0)
+            inb = (tgt >= start) & (tgt < start + BLOCK)
+            s = s * r + tl.where(inb, 0.0, es)
+            sb = sb * r + tl.where(inb, es, 0.0)
             m = m_new
+        if here:
+            s += _fl_block_others(x_row, bias_ptr, c0 + ((tgt - c0) // BLOCK) * BLOCK, c1, tgt, m, inv_t, scale, cap,
+                                  cols, HAS_BIAS, HAS_SCALE, HAS_CAP)
         # part[k, split, row]: m, s (without the target), a, q, tot, best, best_i (float: < 2^24 columns), target logit
         p = part_ptr + (split0 + split) * n_rows + row
         if WANT_TGT:
             if here:
+                xt = tl.load(x_row + tgt).to(tl.float32)
+                if HAS_BIAS:
+                    xt += tl.load(bias_ptr + tgt).to(tl.float32)
+                xt, _dt = _fl_transform(xt, scale, cap, HAS_SCALE, HAS_CAP)
                 tl.store(p + 7 * stride_k, xt)
         tl.store(p, m)
         tl.store(p + stride_k, s)
