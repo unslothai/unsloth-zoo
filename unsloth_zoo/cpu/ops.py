@@ -359,6 +359,54 @@ def store_frozen_linears_in_bf16(model):
     return len(stored)
 
 
+def cpu_causal_conv1d(hidden_states, weight, bias = None, activation = None, **kwargs):
+    """Causal depthwise conv1d as K shifted multiply-adds. transformers' reference fallback (used without
+    the causal_conv1d package) calls a grouped F.conv1d, whose forward + backward on macOS, where torch has
+    no oneDNN, took 211 ms per Qwen3.5 linear-attention layer against 2-4 ms on Linux: most of the step."""
+    x = hidden_states.to(weight.dtype)
+    kernel, length = weight.shape[-1], x.shape[-1]
+    padded = F.pad(x, (kernel - 1, 0))
+    out = padded[..., :length] * weight[:, :1]
+    for j in range(1, kernel):
+        out = out.addcmul(padded[..., j:j + length], weight[:, j:j + 1])
+    if bias is not None:
+        out = out + bias[:, None]
+    if activation is not None:
+        from transformers.activations import ACT2FN
+        out = ACT2FN[activation](out)
+    return out.to(hidden_states.dtype)
+
+
+def patch_causal_conv1d_fallback(model):
+    """Where torch has no oneDNN (the macOS wheels), point every loaded modeling module's `causal_conv1d_fn`
+    (Qwen3.5 / Qwen3-Next style: hidden_states, weight, bias, activation) at cpu_causal_conv1d, after
+    checking both agree on a probe. With oneDNN the grouped conv is faster (19 vs 44 ms at 6144 x 512)."""
+    import inspect
+    import sys
+    if torch.backends.mkldnn.is_available():
+        return 0
+    patched = 0
+    for name in {type(module).__module__ for module in model.modules()}:
+        module = sys.modules.get(name)
+        fn = getattr(module, "causal_conv1d_fn", None)
+        if fn is None or fn is cpu_causal_conv1d:
+            continue
+        try:
+            params = list(inspect.signature(fn).parameters)[:4]
+            if params != ["hidden_states", "weight", "bias", "activation"]:
+                continue
+            gen = torch.Generator().manual_seed(0)
+            x, w, b = (torch.randn(shape, generator = gen) for shape in ((2, 8, 11), (8, 4), (8,)))
+            if not torch.allclose(fn(x, w, b, activation = "silu"), cpu_causal_conv1d(x, w, b, activation = "silu"),
+                                  rtol = 1e-5, atol = 1e-6):
+                continue
+        except Exception:
+            continue
+        module.causal_conv1d_fn = cpu_causal_conv1d
+        patched += 1
+    return patched
+
+
 def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = None,
                                  ignore_index = -100, shift_labels = None, chunk_rows = None):
     """Causal-LM loss with the same shift and normalisation as transformers' ForCausalLMLoss."""

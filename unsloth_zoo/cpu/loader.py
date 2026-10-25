@@ -25,7 +25,7 @@ import warnings
 import torch
 
 from .runtime import cpu_bf16_supported, cpu_bnb_4bit_supported
-from .ops import Bf16StoredLinear, patch_chunked_causal_lm_loss, store_frozen_linears_in_bf16
+from .ops import Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, store_frozen_linears_in_bf16
 
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
@@ -269,6 +269,7 @@ class FastCPUModel:
 
         if frozen_bf16:
             _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
+        patch_causal_conv1d_fallback(model)
         # Also for a checkpoint that ships its own 4-bit quantization_config.
         _disable_bnb_cpu_weight_packing(model)
         model.max_seq_length = max_seq_length

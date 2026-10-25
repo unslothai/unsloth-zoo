@@ -1164,3 +1164,52 @@ def test_generate_runs_compiled_layers_eagerly(monkeypatch):
     model.model.layers[0]._compiled_call_impl = model.model.layers[0]._call_impl  # what Module.compile() sets
     model.generate(input_ids = ids, max_new_tokens = 2, do_sample = False)
     assert stances == ["force_eager"]
+
+
+def test_cpu_causal_conv1d_matches_the_grouped_conv_reference():
+    """Values and gradients equal F.conv1d(groups = channels, padding = K - 1)[..., :L], with and without bias."""
+    from unsloth_zoo.cpu.ops import cpu_causal_conv1d
+    torch.manual_seed(0)
+    for bias in (True, False):
+        x = torch.randn(2, 16, 37, dtype = torch.float64, requires_grad = True)
+        w = torch.randn(16, 4, dtype = torch.float64, requires_grad = True)
+        b = torch.randn(16, dtype = torch.float64, requires_grad = True) if bias else None
+        ref = F.silu(F.conv1d(x, w.unsqueeze(1), b, padding = 3, groups = 16)[..., :37])
+        up = torch.randn_like(ref)
+        grads_ref = torch.autograd.grad((ref * up).sum(), [t for t in (x, w, b) if t is not None])
+        out = cpu_causal_conv1d(x, w, b, activation = "silu")
+        grads = torch.autograd.grad((out * up).sum(), [t for t in (x, w, b) if t is not None])
+        torch.testing.assert_close(out, ref)
+        for g, r in zip(grads, grads_ref):
+            torch.testing.assert_close(g, r)
+
+
+def test_causal_conv1d_fallback_is_patched_only_where_it_agrees(monkeypatch):
+    import sys
+    import types
+    from unsloth_zoo.cpu import ops
+    monkeypatch.setattr(torch.backends.mkldnn, "is_available", lambda: False)  # the macOS wheels
+
+    def reference(hidden_states, weight, bias = None, activation = None, **kwargs):
+        out = F.conv1d(hidden_states, weight.unsqueeze(1), bias, padding = weight.shape[-1] - 1,
+                       groups = hidden_states.shape[1])[..., :hidden_states.shape[-1]]
+        return F.silu(out) if activation == "silu" else out
+
+    def other_signature(x, weight, bias = None, activation = None):
+        return x
+
+    good, bad = types.ModuleType("fake_good_modeling"), types.ModuleType("fake_bad_modeling")
+    good.causal_conv1d_fn, bad.causal_conv1d_fn = reference, other_signature
+    good_cls = type("GoodBlock", (torch.nn.Module,), {"__module__": "fake_good_modeling"})
+    bad_cls = type("BadBlock", (torch.nn.Module,), {"__module__": "fake_bad_modeling"})
+    sys.modules["fake_good_modeling"], sys.modules["fake_bad_modeling"] = good, bad
+    try:
+        model = torch.nn.Sequential(good_cls(), bad_cls())
+        assert ops.patch_causal_conv1d_fallback(model) == 1
+        assert good.causal_conv1d_fn is ops.cpu_causal_conv1d and bad.causal_conv1d_fn is other_signature
+        # With oneDNN (Linux / Windows wheels) the grouped conv is faster: left alone.
+        good.causal_conv1d_fn = reference
+        monkeypatch.setattr(torch.backends.mkldnn, "is_available", lambda: True)
+        assert ops.patch_causal_conv1d_fallback(model) == 0 and good.causal_conv1d_fn is reference
+    finally:
+        del sys.modules["fake_good_modeling"], sys.modules["fake_bad_modeling"]
