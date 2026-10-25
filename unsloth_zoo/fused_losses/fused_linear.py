@@ -614,6 +614,101 @@ if _HAS_TRITON:
         tl.store(out_ptr + offs, (x * g).to(out_ptr.dtype.element_ty), mask = ok)
 
 
+    # GKD generalized JSD over two heads' raw fp32 logits [R, V]: grid (rows, vocab blocks), so a few hundred rows
+    # still fill the card (a row-per-program reduction leaves most SMs idle at R = 128..256).
+    @triton.jit
+    def _fl_jsd_load(s_ptr, t_ptr, row, cols, ok, stride, s_scale, s_cap, t_scale, t_cap, inv_t,
+                     S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr):
+        base = row.to(tl.int64) * stride
+        s = tl.load(s_ptr + base + cols, mask = ok, other = 0.0).to(tl.float32)
+        t = tl.load(t_ptr + base + cols, mask = ok, other = 0.0).to(tl.float32)
+        s, ds = _fl_transform(s, s_scale, s_cap, S_SCALE, S_CAP)
+        t, _ = _fl_transform(t, t_scale, t_cap, T_SCALE, T_CAP)
+        return s * inv_t, t * inv_t, ds
+
+    @triton.jit
+    def _fl_jsd_stats_kernel(s_ptr, t_ptr, stride, V, stat_ptr, NB, s_scale, s_cap, t_scale, t_cap, inv_t,
+                             S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,
+                             T_CAP: tl.constexpr, BLOCK: tl.constexpr):
+        row = tl.program_id(0)
+        blk = tl.program_id(1)
+        cols = blk * BLOCK + tl.arange(0, BLOCK)
+        ok = cols < V
+        s, t, _ = _fl_jsd_load(s_ptr, t_ptr, row, cols, ok, stride, s_scale, s_cap, t_scale, t_cap, inv_t,
+                               S_SCALE, S_CAP, T_SCALE, T_CAP)
+        s = tl.where(ok, s, -float("inf"))
+        t = tl.where(ok, t, -float("inf"))
+        ms = tl.max(s, 0)
+        mt = tl.max(t, 0)
+        ls = tl.sum(tl.exp(s - ms), 0)
+        lt = tl.sum(tl.exp(t - mt), 0)
+        o = stat_ptr + (row.to(tl.int64) * NB + blk) * 4
+        tl.store(o, ms)
+        tl.store(o + 1, ls)
+        tl.store(o + 2, mt)
+        tl.store(o + 3, lt)
+
+    @triton.jit
+    def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, lse_ptr, c_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
+                           beta, log1mb, logb, s_scale, s_cap, t_scale, t_cap, inv_t,
+                           MODE: tl.constexpr, WRITE_DZ: tl.constexpr, S_SCALE: tl.constexpr,
+                           S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr):
+        # MODE 0: beta = 0, partial loss and (WRITE_DZ) dz = p - q in one pass. MODE 1: beta = 1, partial
+        # sum p (ls - lt). MODE 2: interior, partial sum q (lt - m) and sum p (ls - m).
+        row = tl.program_id(0)
+        blk = tl.program_id(1)
+        cols = blk * BLOCK + tl.arange(0, BLOCK)
+        ok = cols < V
+        s, t, ds = _fl_jsd_load(s_ptr, t_ptr, row, cols, ok, stride, s_scale, s_cap, t_scale, t_cap, inv_t,
+                                S_SCALE, S_CAP, T_SCALE, T_CAP)
+        ls = s - tl.load(lse_ptr + row * 2)
+        lt = t - tl.load(lse_ptr + row * 2 + 1)
+        p = tl.exp(ls)
+        q = tl.exp(lt)
+        o = part_ptr + (row.to(tl.int64) * NB + blk) * 2
+        if MODE == 0:
+            tl.store(o, tl.sum(tl.where(ok, q * (lt - ls), 0.0), 0))
+            if WRITE_DZ:
+                dz = (p - q) * (tl.load(coef_ptr) * inv_t) * ds
+                tl.store(dz_ptr + row.to(tl.int64) * dz_stride + cols, dz.to(dz_ptr.dtype.element_ty), mask = ok)
+        elif MODE == 1:
+            tl.store(o, tl.sum(tl.where(ok, p * (ls - lt - tl.load(c_ptr + row)), 0.0), 0))
+        else:
+            a = ls + log1mb
+            b = lt + logb
+            mx = tl.maximum(a, b)
+            m = mx + tl.log(tl.exp(a - mx) + tl.exp(b - mx))
+            tl.store(o, tl.sum(tl.where(ok, q * (lt - m), 0.0), 0))
+            tl.store(o + 1, tl.sum(tl.where(ok, p * (ls - m - tl.load(c_ptr + row)), 0.0), 0))
+
+    @triton.jit
+    def _fl_jsd_dz_kernel(s_ptr, t_ptr, stride, V, lse_ptr, c_ptr, rs_ptr, dz_ptr, dz_stride, coef_ptr, scale_g,
+                          log1mb, logb, s_scale, s_cap, t_scale, t_cap, inv_t,
+                          MODE: tl.constexpr, S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,
+                          T_CAP: tl.constexpr, BLOCK: tl.constexpr):
+        # dz = scale_g * p * (d - sum p d); MODE 1: d = ls - lt, MODE 2: d = ls - m, scale_g = 1 - beta.
+        row = tl.program_id(0)
+        blk = tl.program_id(1)
+        cols = blk * BLOCK + tl.arange(0, BLOCK)
+        ok = cols < V
+        s, t, ds = _fl_jsd_load(s_ptr, t_ptr, row, cols, ok, stride, s_scale, s_cap, t_scale, t_cap, inv_t,
+                                S_SCALE, S_CAP, T_SCALE, T_CAP)
+        ls = s - tl.load(lse_ptr + row * 2)
+        lt = t - tl.load(lse_ptr + row * 2 + 1)
+        p = tl.exp(ls)
+        if MODE == 1:
+            d = ls - lt
+        else:
+            a = ls + log1mb
+            b = lt + logb
+            mx = tl.maximum(a, b)
+            d = ls - (mx + tl.log(tl.exp(a - mx) + tl.exp(b - mx)))
+        # d is shifted by its value at the student's argmax (c): the softmax-collapse-safe form of d - sum p d.
+        g = p * ((d - tl.load(c_ptr + row)) - tl.load(rs_ptr + row))
+        dz = g * (tl.load(coef_ptr) * (scale_g * inv_t)) * ds
+        tl.store(dz_ptr + row.to(tl.int64) * dz_stride + cols, dz.to(dz_ptr.dtype.element_ty), mask = ok)
+
+
 _TRITON_BROKEN = set()
 
 
@@ -1834,6 +1929,62 @@ def _jsd_body(s, t, factor, beta: float, inv_t: float, s_scale: float, s_cap: fl
     return row, dz.to(grad_dtype)
 
 
+_JSD_BLOCK = 4096
+# An explicit UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB sizes the Triton chunk by budget instead.
+_JSD_TRITON_ROWS = os.environ.get("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB") is None
+
+
+def _jsd_triton(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
+    """_jsd_body on CUDA with Triton: two (beta = 0) or three passes over the raw fp32 logits, dz written once."""
+    R, V = s.shape
+    NB = triton.cdiv(V, _JSD_BLOCK)
+    flags = dict(S_SCALE = s_scale != 1.0, S_CAP = s_cap != 0.0, T_SCALE = t_scale != 1.0, T_CAP = t_cap != 0.0,
+                 BLOCK = _JSD_BLOCK, num_warps = 8)
+    sc = (float(s_scale), float(s_cap) or 1.0, float(t_scale), float(t_cap) or 1.0, float(inv_t))
+    stats = torch.empty((R, NB, 4), device = s.device, dtype = torch.float32)
+    grid = (R, NB)
+    _fl_jsd_stats_kernel[grid](s, t, s.stride(0), V, stats, NB, *sc, **flags)
+    m = stats[..., 0::2]
+    l = stats[..., 1::2]
+    top = m.amax(1, keepdim = True)
+    lse = (top.squeeze(1) + torch.log((l * torch.exp(m - top)).sum(1))).contiguous()  # [R, 2] student, teacher
+    mode = 0 if beta == 0.0 else (1 if beta == 1.0 else 2)
+    log1mb = math.log1p(-beta) if mode == 2 else 0.0
+    logb = math.log(beta) if mode == 2 else 0.0
+    part = torch.empty((R, NB, 2), device = s.device, dtype = torch.float32)
+    # c = d at the student's argmax. With p ~ 1 there, d - sum_k p_k d_k cancels to rounding noise in fp32 (the
+    # softmax-collapse failure); written as (d - c) - sum_k p_k (d_k - c) the peak's own term drops out exactly.
+    c = torch.zeros(R, device = s.device, dtype = torch.float32)
+    if mode != 0:
+        j = s.argmax(-1, keepdim = True)
+        sj = _torch_transform(s.gather(1, j).squeeze(1), s_scale, s_cap)[0] * inv_t - lse[:, 0]
+        tj = _torch_transform(t.gather(1, j).squeeze(1), t_scale, t_cap)[0] * inv_t - lse[:, 1]
+        if mode == 1:
+            c = sj - tj
+        else:
+            c = sj - torch.logaddexp(sj + log1mb, tj + logb)
+    dz = torch.empty((R, V), device = s.device, dtype = grad_dtype) if want_grad else s.new_empty((1, 1))
+    factor = factor.reshape(1).to(torch.float32)
+    _fl_jsd_row_kernel[grid](s, t, s.stride(0), V, lse, c, part, NB, dz, dz.stride(0), factor, float(beta), log1mb, logb,
+                             *sc, MODE = mode, WRITE_DZ = want_grad and mode == 0, **flags)
+    if mode == 0:
+        row = part[..., 0].sum(1)
+    elif mode == 1:
+        rs = part[..., 0].sum(1)
+        row = rs + c
+    else:
+        row_t = part[..., 0].sum(1)
+        rs = part[..., 1].sum(1)
+        row = beta * row_t + (1.0 - beta) * (rs + c)
+    if not want_grad:
+        return row, None
+    if mode != 0:
+        rs = rs.contiguous()
+        _fl_jsd_dz_kernel[grid](s, t, s.stride(0), V, lse, c, rs, dz, dz.stride(0), factor,
+                                1.0 if mode == 1 else 1.0 - beta, log1mb, logb, *sc, MODE = mode, **flags)
+    return row, dz
+
+
 _JSD_COMPILE = os.environ.get("UNSLOTH_FUSED_LINEAR_JSD_COMPILE", "1") != "0"
 _JSD_COMPILED = {}
 
@@ -1880,11 +2031,18 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
     coef = (scaling.to(device = device, dtype = torch.float32) / divisor).reshape(())
     ratio = None
     if n_keep > 0:
-        fused = _jsd_compiled(device) if sd == torch.float32 else None
-        # Compiled: both logits + about 1.5 buffers inside the fused body (measured); eager four, five with softcap.
+        fused = None
+        if sd == torch.float32:
+            fused = _jsd_triton if _use_triton(device) else _jsd_compiled(device)
+        # Compiled body: both logits + about 1.5 buffers (measured); eager four, five with softcapping.
         n_buf = 4 if fused is not None else _JSD_BUFFERS + (s_cap != 0.0)
         R = max(_jsd_rows(rows, n_keep, V, n_buf * sd.itemsize), 1)
-        if fused is None:
+        if fused is _jsd_triton and rows <= 0 and _JSD_TRITON_ROWS:
+            # Triton keeps 2.5 [rows, vocab] fp32 buffers (both logits + dz). Same rows as Unsloth's torch.func
+            # chunked JSD (2**26 logits, [64, 1024]), whose compiled chunk holds slightly more.
+            R = min(1024, max(64, 1 << max(((1 << 26) // max(V, 1)).bit_length() - 1, 0)))
+        pad = fused is not None and fused is not _jsd_triton
+        if not pad:
             R = min(R, n_keep)
         w = weight.to(compute_dtype)
         t_device = t_weight.device
@@ -1903,8 +2061,8 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
                 if fused is not None:
                     n = b - a
                     # One static shape for the compiled body: pad the tail (rows of zeros, sliced off below).
-                    hp = h if n == R else torch.cat([h, h.new_zeros(R - n, h.shape[1])])
-                    htp = ht if n == R else torch.cat([ht, ht.new_zeros(R - n, ht.shape[1])])
+                    hp = h if n == R or not pad else torch.cat([h, h.new_zeros(R - n, h.shape[1])])
+                    htp = ht if n == R or not pad else torch.cat([ht, ht.new_zeros(R - n, ht.shape[1])])
                     s_raw = _jsd_logits(hp, w, bias, sd)
                     with torch.no_grad():
                         t_raw = _jsd_logits(htp.to(device = t_device, dtype = t_dtype), wt, t_bias, sd).to(device)
@@ -1915,13 +2073,17 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
                     except Exception as e:
                         if type(e).__name__ == "OutOfMemoryError":
                             raise
-                        _JSD_COMPILED["fn"] = fused = None
-                        warnings.warn(f"Unsloth: compiled GKD JSD failed ({type(e).__name__}: {e}); using eager.",
+                        if fused is _jsd_triton:
+                            _TRITON_BROKEN.add(device)
+                        else:
+                            _JSD_COMPILED["fn"] = None
+                        fused = None
+                        warnings.warn(f"Unsloth: fused GKD JSD body failed ({type(e).__name__}: {e}); using eager.",
                                       stacklevel = 2)
                         row, dzc = _jsd_body(s_raw, t_raw, coef_dz, beta, inv_t, s_scale, s_cap, t_scale, t_cap,
                                              grad, compute_dtype)
                     del s_raw, t_raw
-                    if n != R:
+                    if row.shape[0] != n:
                         row = row[:n]
                         dzc = dzc[:n] if dzc is not None else None
                     total += row.sum(dtype = acc)
@@ -1930,6 +2092,8 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
                     if need_b:
                         acc_b += dzc.sum(0, dtype = sd)
                     _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, need_w, sd)
+                    # Free this chunk's dz before the next chunk's logits are allocated.
+                    del dzc, row
                     continue
                 ls, lse_s = _jsd_logprobs(h, w, bias, s_scale, s_cap, inv_t, sd, device)
                 with torch.no_grad():

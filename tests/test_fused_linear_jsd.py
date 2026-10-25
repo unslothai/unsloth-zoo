@@ -217,6 +217,26 @@ def test_compiles_without_graph_breaks():
     torch.testing.assert_close(h.grad.double(), 2 * gh, rtol = 2e-4, atol = 1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA")
+@pytest.mark.parametrize("tf", [(1.0, 0.0, 1.0, 0.0), (1.3, 4.0, 0.8, 3.0)])
+@pytest.mark.parametrize("beta", [0.0, 0.3, 1.0])
+def test_triton_body_matches_compiled_math(beta, tf):
+    """_jsd_triton against _jsd_body (fp64) on peaked and plain rows, odd vocab."""
+    if not fl._use_triton(torch.device("cuda")):
+        pytest.skip("Triton unavailable")
+    g = torch.Generator().manual_seed(4)
+    Vb = 10007
+    s = torch.randn(7, Vb, generator = g) * 3
+    t = torch.randn(7, Vb, generator = g) * 3
+    s[0, 5] += 60.0
+    t[1, 9] += 40.0
+    f = torch.tensor(0.37)
+    row, dz = fl._jsd_triton(s.cuda(), t.cuda(), f.cuda(), beta, 1 / 0.9, *tf, True, torch.float32)
+    row2, dz2 = fl._jsd_body(s.double(), t.double(), f.double(), beta, 1 / 0.9, *tf, True, torch.float64)
+    torch.testing.assert_close(row.cpu().double(), row2, rtol = 1e-5, atol = 1e-6)
+    torch.testing.assert_close(dz.cpu().double(), dz2, rtol = 1e-4, atol = 1e-8)
+
+
 def test_fused_body_matches_eager_chunk():
     """_jsd_body (the compiled CUDA form) and _jsd_chunk (eager, in place) are the same math."""
     g = torch.Generator().manual_seed(9)
@@ -233,13 +253,20 @@ def test_fused_body_matches_eager_chunk():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA")
-@pytest.mark.parametrize("compiled", [True, False])
+@pytest.mark.parametrize("compiled", ["triton", "inductor", "eager"])
 @pytest.mark.parametrize("temperature", [1.0, 0.9])
 @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
 def test_bf16_error_not_worse_than_trl_bf16(beta, temperature, compiled, monkeypatch):
-    if compiled:
-        assert fl._jsd_compiled(torch.device("cuda")) is not None, "compiled JSD body unavailable"
+    calls = []
+    if compiled == "triton":
+        assert fl._use_triton(torch.device("cuda")), "Triton JSD path unavailable"
+        real = fl._jsd_triton
+        monkeypatch.setattr(fl, "_jsd_triton", lambda *a: calls.append(1) or real(*a))
     else:
+        monkeypatch.setattr(fl, "_use_triton", lambda device: False)
+    if compiled == "inductor":
+        assert fl._jsd_compiled(torch.device("cuda")) is not None, "compiled JSD body unavailable"
+    elif compiled == "eager":
         monkeypatch.setattr(fl, "_jsd_compiled", lambda device: None)
     """TRL's dense path on bf16 logits (the model's own lm_head output) vs this op, both against the fp64 oracle."""
     g = torch.Generator().manual_seed(7)
@@ -266,3 +293,4 @@ def test_bf16_error_not_worse_than_trl_bf16(beta, temperature, compiled, monkeyp
           f"trl {trl_g:.3e}")
     assert ours_l <= max(trl_l, 1e-6 * abs(ref.item()))
     assert ours_g <= trl_g
+    assert compiled != "triton" or calls, "Triton JSD path did not run"
