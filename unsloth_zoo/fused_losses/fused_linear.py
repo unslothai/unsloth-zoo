@@ -107,8 +107,8 @@ _FWD_TILE_COLS = (max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 0)), 
                   if os.environ.get("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS") is not None else None)
 _IS_HIP = torch.version.hip is not None
 # Bump the suffix on any schema / backward change: Inductor / AOTAutograd caches key on neither.
-_LP_OP = "fused_linear_logprobs_v5"
-_LP_BWD_OP = "fused_linear_logprobs_bwd_v3"
+_LP_OP = "fused_linear_logprobs_v6"
+_LP_BWD_OP = "fused_linear_logprobs_bwd_v4"
 
 CALLS = {"ce": 0, "logprobs": 0, "logprobs_bwd": 0, "triton": 0, "torch": 0, "tiled": 0, "exact_top": 0,
          "bwd_single": 0, "flash": 0}
@@ -189,6 +189,12 @@ def _logits_mode(device, dtype = torch.float16):
     return True, False
 
 
+def _exact_lpt(device, dtype):
+    # Static (the fake uses it): True iff _logits_mode picks the exact target logit, so logps is not log p_t of
+    # the logits the gradient reads and the op returns that separately.
+    return device.type == "cuda" and _ACCURACY == "2" and dtype in _HALF
+
+
 def _mm_fp32(a, b, out = None):
     """a @ b with an fp32 result, rounded once (CUDA half inputs); elsewhere an fp32 matmul of the upcast inputs."""
     if a.is_cuda and a.dtype in _HALF:
@@ -234,14 +240,33 @@ if _HAS_TRITON:
         @triton.jit
         def _fl_expm1(x):
             return _libdevice.expm1(x)
+
+        @triton.jit
+        def _fl_log1p(x):
+            return _libdevice.log1p(x)
     except Exception:
         @triton.jit
         def _fl_tanh(x):
             return 2.0 * tl.sigmoid(2.0 * x) - 1.0
 
+        # Kahan's forms: exact to an ulp for tiny x with tl.exp / tl.log only.
         @triton.jit
         def _fl_expm1(x):
-            return tl.exp(x) - 1.0
+            u = tl.exp(x)
+            um1 = u - 1.0
+            return tl.where(u == 1.0, x, tl.where(um1 == -1.0, -1.0, um1 * (x / tl.log(tl.where(u == 1.0, 2.0, u)))))
+
+        @triton.jit
+        def _fl_log1p(x):
+            u = 1.0 + x
+            return tl.where(u == 1.0, x, tl.log(u) * (x / tl.where(u == 1.0, 1.0, u - 1.0)))
+
+    @triton.jit
+    def _fl_nll(zt, m, so):
+        # lse - zt from the max m and so = sum_{j != t} exp(z_j - m): softplus(log(so) + m - zt) never adds e^0 = 1
+        # to e^-margin, so it stays exact past the fp32 cliff (margin ~16.6, arXiv 2610.31642) and is never < 0.
+        r = tl.log(so) + m - zt
+        return tl.maximum(r, 0.0) + _fl_log1p(tl.exp(-tl.abs(r)))
 
     @triton.jit
     def _fl_transform(x, scale, cap, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr):
@@ -256,10 +281,32 @@ if _HAS_TRITON:
         return x, d
 
     @triton.jit
+    def _fl_row_stats(row, valid, zt, m, so, a, exact_ptr, logp_ptr, lse_ptr, ent_ptr, lpt_ptr, inv_t, scale, cap,
+                      HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr, WANT_ENT: tl.constexpr):
+        # so excludes the target. lse must match the logits the gradient reads; mixing in the exact target logit biases
+        # gradients. lpt = log p_t of those logits (logp unless HAS_EXACT): the backward's 1 - p_t = -expm1(lpt).
+        s = so + tl.where(valid, tl.exp(zt - m), 0.0)
+        tl.store(lse_ptr + row, m + tl.log(s))
+        nll = _fl_nll(zt, m, so)
+        lpt = tl.where(valid, -nll, 0.0)
+        if HAS_EXACT:
+            xe = tl.load(exact_ptr + row).to(tl.float32)
+            xe, _d = _fl_transform(xe, scale, cap, HAS_SCALE, HAS_CAP)
+            tl.store(logp_ptr + row, tl.where(valid, -_fl_nll(xe * inv_t, m, so), 0.0))
+            tl.store(lpt_ptr + row, lpt)
+        else:
+            tl.store(logp_ptr + row, lpt)
+        if WANT_ENT:
+            # log s = lse - m, which is nll when the target is the max (log(s) reads 0 past the cliff).
+            log_s = tl.where(valid & (zt >= m), nll, tl.log(s))
+            tl.store(ent_ptr + row, log_s - a / s)
+        return s
+
+    @triton.jit
     def _fl_forward_kernel(
         x_ptr, x_stride, n_cols,
         tgt_ptr, exact_ptr, bias_ptr,
-        logp_ptr, lse_ptr, ent_ptr, sum_ptr, lssp_ptr, top1_ptr,
+        logp_ptr, lse_ptr, ent_ptr, sum_ptr, lssp_ptr, top1_ptr, lpt_ptr,
         inv_t, scale, cap,
         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr,
         WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,
@@ -279,6 +326,11 @@ if _HAS_TRITON:
         tot = tl.zeros((), tl.float32)
         best = tl.full((), -float("inf"), tl.float32)
         best_i = tl.zeros((), tl.int64)
+        xt = tl.load(x_row + tgt_c).to(tl.float32)
+        if HAS_BIAS:
+            xt += tl.load(bias_ptr + tgt_c).to(tl.float32)
+        xt, _dt = _fl_transform(xt, scale, cap, HAS_SCALE, HAS_CAP)
+        zt = xt * inv_t
         for start in range(0, n_cols, BLOCK):
             offs = start + cols
             ok = offs < n_cols
@@ -299,31 +351,18 @@ if _HAS_TRITON:
             r = tl.exp(m - m_new)
             e = tl.exp(z - m_new)
             if WANT_ENT:
-                shift = tl.where(s > 0, (m - m_new) * s, 0.0)
+                # The rescale needs the full running sum: s plus the target once its block has passed.
+                sf = s + tl.where(valid & (tgt < start), tl.exp(zt - m), 0.0)
+                shift = tl.where(m > -float("inf"), (m - m_new) * sf, 0.0)
                 a = r * (a + shift) + tl.sum(tl.where(ok, e * (z - m_new), 0.0), axis = 0)
             if WANT_LSSP:
                 q = q * r * r + tl.sum(e * e, axis = 0)
-            s = s * r + tl.sum(e, axis = 0)
+            # s holds the classes other than the target; its term is added back after the loop.
+            s = s * r + tl.sum(tl.where(offs == tgt, 0.0, e), axis = 0)
             m = m_new
 
-        xt = tl.load(x_row + tgt_c).to(tl.float32)
-        if HAS_BIAS:
-            xt += tl.load(bias_ptr + tgt_c).to(tl.float32)
-        xt, _d = _fl_transform(xt, scale, cap, HAS_SCALE, HAS_CAP)
-        zt = xt * inv_t
-        # lse must match the logits the gradient reads; mixing in the exact target logit biases gradients.
-        lse = m + tl.log(s)
-        tl.store(lse_ptr + row, lse)
-        if HAS_EXACT:
-            xe = tl.load(exact_ptr + row).to(tl.float32)
-            xe, _d = _fl_transform(xe, scale, cap, HAS_SCALE, HAS_CAP)
-            ze = xe * inv_t
-            lse_value = m + tl.log(s + tl.exp(ze - m) - tl.exp(zt - m))
-            tl.store(logp_ptr + row, tl.where(valid, ze - lse_value, 0.0))
-        else:
-            tl.store(logp_ptr + row, tl.where(valid, zt - lse, 0.0))
-        if WANT_ENT:
-            tl.store(ent_ptr + row, tl.log(s) - a / s)
+        s = _fl_row_stats(row, valid, zt, m, s, a, exact_ptr, logp_ptr, lse_ptr, ent_ptr, lpt_ptr, inv_t, scale, cap,
+                          HAS_SCALE, HAS_CAP, HAS_EXACT, WANT_ENT)
         if WANT_SUM:
             tl.store(sum_ptr + row, tot)
         if WANT_LSSP:
@@ -355,6 +394,15 @@ if _HAS_TRITON:
         tot = tl.zeros((), tl.float32)
         best = tl.full((), -float("inf"), tl.float32)
         best_i = tl.zeros((), tl.int64)
+        tgt = tl.load(tgt_ptr + row).to(tl.int64) - col0
+        here = (tgt >= c0) & (tgt < c1)
+        zt = 0.0
+        if WANT_TGT or WANT_ENT:
+            xt = tl.load(x_row + tl.where(here, tgt, c0)).to(tl.float32)
+            if HAS_BIAS:
+                xt += tl.load(bias_ptr + tl.where(here, tgt, c0)).to(tl.float32)
+            xt, _dt = _fl_transform(xt, scale, cap, HAS_SCALE, HAS_CAP)
+            zt = xt * inv_t
         for start in range(c0, c1, BLOCK):
             offs = start + cols
             ok = offs < c1
@@ -386,21 +434,17 @@ if _HAS_TRITON:
             r = tl.exp(m - m_new)
             e = tl.exp(z - m_new)
             if WANT_ENT:
-                shift = tl.where(s > 0, (m - m_new) * s, 0.0)
+                sf = s + tl.where(here & (tgt < start), tl.exp(zt - m), 0.0)
+                shift = tl.where(m > -float("inf"), (m - m_new) * sf, 0.0)
                 a = r * (a + shift) + tl.sum(tl.where(ok, e * (z - m_new), 0.0), axis = 0)
             if WANT_LSSP:
                 q = q * r * r + tl.sum(e * e, axis = 0)
-            s = s * r + tl.sum(e, axis = 0)
+            s = s * r + tl.sum(tl.where(offs == tgt, 0.0, e), axis = 0)
             m = m_new
-        # part[k, split, row]: m, s, a, q, tot, best, best_i (float: < 2^24 columns), target logit
+        # part[k, split, row]: m, s (without the target), a, q, tot, best, best_i (float: < 2^24 columns), target logit
         p = part_ptr + (split0 + split) * n_rows + row
         if WANT_TGT:
-            tgt = tl.load(tgt_ptr + row).to(tl.int64) - col0
-            if (tgt >= c0) & (tgt < c1):
-                xt = tl.load(x_row + tgt).to(tl.float32)
-                if HAS_BIAS:
-                    xt += tl.load(bias_ptr + tgt).to(tl.float32)
-                xt, _d = _fl_transform(xt, scale, cap, HAS_SCALE, HAS_CAP)
+            if here:
                 tl.store(p + 7 * stride_k, xt)
         tl.store(p, m)
         tl.store(p + stride_k, s)
@@ -418,7 +462,7 @@ if _HAS_TRITON:
     def _fl_combine_kernel(
         x_ptr, x_stride, n_cols, n_rows, n_splits, stride_k, split_cols, part_ptr,
         tgt_ptr, exact_ptr, bias_ptr,
-        logp_ptr, lse_ptr, ent_ptr, sum_ptr, lssp_ptr, top1_ptr,
+        logp_ptr, lse_ptr, ent_ptr, sum_ptr, lssp_ptr, top1_ptr, lpt_ptr,
         inv_t, scale, cap,
         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr,
         WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,
@@ -444,20 +488,14 @@ if _HAS_TRITON:
                 xt += tl.load(bias_ptr + tgt_c).to(tl.float32)
             xt, _d = _fl_transform(xt, scale, cap, HAS_SCALE, HAS_CAP)
         zt = xt * inv_t
-        lse = m + tl.log(s)
-        tl.store(lse_ptr + row, lse)
-        if HAS_EXACT:
-            xe = tl.load(exact_ptr + row).to(tl.float32)
-            xe, _d = _fl_transform(xe, scale, cap, HAS_SCALE, HAS_CAP)
-            ze = xe * inv_t
-            lse_value = m + tl.log(s + tl.exp(ze - m) - tl.exp(zt - m))
-            tl.store(logp_ptr + row, tl.where(valid, ze - lse_value, 0.0))
-        else:
-            tl.store(logp_ptr + row, tl.where(valid, zt - lse, 0.0))
+        a = 0.0
         if WANT_ENT:
+            # The (ms - m) * ss shift uses each split's full sum: add the target back to its own split.
             aa = tl.load(p + 2 * stride_k, mask = okk, other = 0.0)
-            a = tl.sum(w * (aa + tl.where(okk, (ms - m) * ss, 0.0)), axis = 0)
-            tl.store(ent_ptr + row, tl.log(s) - a / s)
+            st = tl.where(valid & (k == tgt_c // split_cols), tl.exp(zt - ms), 0.0)
+            a = tl.sum(w * (aa + tl.where(okk, (ms - m) * (ss + st), 0.0)), axis = 0)
+        s = _fl_row_stats(row, valid, zt, m, s, a, exact_ptr, logp_ptr, lse_ptr, ent_ptr, lpt_ptr, inv_t, scale, cap,
+                          HAS_SCALE, HAS_CAP, HAS_EXACT, WANT_ENT)
         if WANT_SUM:
             tl.store(sum_ptr + row, tl.sum(tl.load(p + 4 * stride_k, mask = okk, other = 0.0), axis = 0))
         if WANT_LSSP:
@@ -475,13 +513,14 @@ if _HAS_TRITON:
     @triton.jit
     def _fl_backward_kernel(
         x_ptr, x_stride, dz_ptr, dz_stride, n_cols, col0, n_total,
-        tgt_ptr, bias_ptr, lse_ptr, ent_ptr, g_ptr, g_stride, ge_ptr,
+        tgt_ptr, bias_ptr, lse_ptr, ent_ptr, g_ptr, g_stride, ge_ptr, lpt_ptr,
         inv_t, scale, cap, smooth_keep, smooth_each, top_ptr, top_stride,
         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_ENT_GRAD: tl.constexpr,
         ALIASED: tl.constexpr, HAS_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,
     ):
         # dz = g * (keep * onehot + each - p) - ge * p * (z - lse + H). HAS_TOP: half x; each SUB group's two largest
-        # z take the forward's fp32 values (rounding keeps order; ties in half take their mean).
+        # z take the forward's fp32 values (rounding keeps order; ties in half take their mean). The target column
+        # takes the forward's log p_t: 1 - p_t = -expm1(lpt) is the others' mass (exp(z_t - lse) rounds to 1).
         row = tl.program_id(0).to(tl.int64)
         x_row = x_ptr + row * x_stride
         dz_row = dz_ptr + row * dz_stride
@@ -490,9 +529,13 @@ if _HAS_TRITON:
         valid = (tgt >= 0) & (tgt < n_total)
         lse = tl.load(lse_ptr + row)
         g = tl.where(valid, tl.load(g_ptr + row * g_stride).to(tl.float32), 0.0)
+        lpt = tl.load(lpt_ptr + row)
+        pt = tl.exp(lpt)
+        ct = g * ((smooth_keep + smooth_each - 1.0) - _fl_expm1(lpt))
         if HAS_ENT_GRAD:
             ge = tl.where(valid, tl.load(ge_ptr + row).to(tl.float32), 0.0)
             ent = tl.load(ent_ptr + row)
+            ct -= ge * pt * (lpt + ent)
         for start in range(0, n_cols, BLOCK):
             offs = start + cols
             ok = offs < n_cols
@@ -518,9 +561,10 @@ if _HAS_TRITON:
                 zg = tl.where(is1, tl.where(one, t1, 0.5 * (t1 + t2)), tl.where(one & (zg == h2), t2, zg))
                 z = tl.where(ok, tl.reshape(zg, (BLOCK,)), z)
             p = tl.exp(z - lse)
-            dz = g * (tl.where(offs + col0 == tgt, smooth_keep, 0.0) + smooth_each - p)
+            dz = g * (smooth_each - p)
             if HAS_ENT_GRAD:
                 dz -= ge * p * (z - lse + ent)
+            dz = tl.where(offs + col0 == tgt, ct, dz)
             dz = dz * inv_t * d
             tl.store(dz_row + offs, dz.to(dz_ptr.dtype.element_ty), mask = ok)
 
@@ -783,22 +827,26 @@ def _torch_forward(x, bias, tgt, inv_t, scale, cap, exact, want):
         x = x + bias.to(sd)
     xt, _ = _torch_transform(x, scale, cap)
     z = xt * inv_t
-    lse = torch.logsumexp(z, dim = -1)
     V = z.shape[-1]
     valid = (tgt >= 0) & (tgt < V)
-    tc = torch.where(valid, tgt, torch.zeros_like(tgt))
-    zt = z.gather(-1, tc.unsqueeze(-1)).squeeze(-1)
-    lse_value = lse
+    tc = torch.where(valid, tgt, torch.zeros_like(tgt)).unsqueeze(-1)
+    zt = z.gather(-1, tc).squeeze(-1)
+    # lse without the target, then log p_t = -softplus(lse_o - z_t): exact past the softmax collapse cliff.
+    # z is this call's own tensor: mask the target in place and put it back.
+    lse_o = torch.logsumexp(z.scatter_(-1, tc, -float("inf")), dim = -1)
+    z.scatter_(-1, tc, zt.unsqueeze(-1))
+    lse = torch.logaddexp(lse_o, zt)
+    zero = torch.zeros_like(lse)
+    lpt = torch.where(valid, -torch.nn.functional.softplus(lse_o - zt), zero)
+    logp = lpt
     if exact is not None:
         ze = _torch_transform(exact.to(sd), scale, cap)[0] * inv_t
-        m = z.max(-1).values
-        lse_value = m + torch.log(torch.exp(lse - m) + torch.exp(ze - m) - torch.exp(zt - m))
-        zt = ze
-    out = {"lse": lse.float(), "logp": torch.where(valid, zt - lse_value, torch.zeros_like(lse)).float()}
+        logp = torch.where(valid, -torch.nn.functional.softplus(lse_o - ze), zero)
+    out = {"lse": lse.float(), "logp": logp.float(), "lpt": lpt.float()}
     want_ent, want_sum, want_lssp, want_top1 = want
     logp_all = None
     if want_ent or want_lssp:
-        logp_all = z - lse.unsqueeze(-1)
+        logp_all = (z - lse.unsqueeze(-1)).scatter(-1, tc, (lpt + torch.where(valid, zero, zt - lse)).unsqueeze(-1))
     if want_ent:
         out["ent"] = (-(logp_all.exp() * logp_all).sum(-1)).float()
     if want_sum:
@@ -810,9 +858,10 @@ def _torch_forward(x, bias, tgt, inv_t, scale, cap, exact, want):
     return out, z, lse, valid
 
 
-def _torch_dz(x, bias, tgt, lse, inv_t, scale, cap, coef_row, smooth_keep, smooth_each, col0 = 0,
+def _torch_dz(x, bias, tgt, lse, lpt, inv_t, scale, cap, coef_row, smooth_keep, smooth_each, col0 = 0,
               ge = None, ent = None, n_total = None):
-    """dz = coef_row * (p - keep onehot - each) - ge * p * (z - lse + ent) for x [R, Vs] at columns col0.."""
+    """dz = coef_row * (p - keep onehot - each) - ge * p * (z - lse + ent) for x [R, Vs] at columns col0..; the
+    target column takes p_t - 1 = expm1(lpt) and log p_t = lpt."""
     sd = _stat_dtype(x.dtype)
     x = x.to(sd)
     if bias is not None:
@@ -826,9 +875,15 @@ def _torch_dz(x, bias, tgt, lse, inv_t, scale, cap, coef_row, smooth_keep, smoot
     onehot = (cols.unsqueeze(0) == tgt.unsqueeze(-1)).to(sd)
     coef = torch.where(valid, coef_row.to(sd), torch.zeros_like(coef_row, dtype = sd))
     dz = coef.unsqueeze(-1) * (p - smooth_keep * onehot - smooth_each)
+    lp = lpt.to(sd)
+    dzt = coef * (torch.expm1(lp) + (1.0 - smooth_keep - smooth_each))
     if ge is not None:
         gev = torch.where(valid, ge.to(sd), torch.zeros_like(ge, dtype = sd))
         dz = dz - gev.unsqueeze(-1) * p * (z - lse.to(sd).unsqueeze(-1) + ent.to(sd).unsqueeze(-1))
+        dzt = dzt - gev * torch.exp(lp) * (lp + ent.to(sd))
+    inside = valid & (tgt >= col0) & (tgt < col0 + z.shape[-1])
+    lc = (tgt - col0).clamp(0, z.shape[-1] - 1).unsqueeze(-1)
+    dz = dz.scatter_(-1, lc, torch.where(inside, dzt, dz.gather(-1, lc).squeeze(-1)).unsqueeze(-1))
     dz = dz * inv_t
     if d is not None:
         dz = dz * d
@@ -933,6 +988,9 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
         lssp = (outs.get("lssp") if outs.get("lssp") is not None else torch.empty(n, **f32)) if want_lssp else lse
         top1 = (outs.get("top1") if outs.get("top1") is not None else torch.empty(n, device = device, dtype = torch.bool)) \
             if want_top1 else logp
+        lpt = logp
+        if exact is not None:
+            lpt = outs.get("lpt") if outs.get("lpt") is not None else torch.empty(n, **f32)
         block = min(_BLOCK, triton.next_power_of_2(V))
         splits = -(-V // _SPLIT_COLS) if _SPLIT_COLS > 0 else 1
         if splits <= 2:
@@ -951,7 +1009,7 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
             _fl_combine_kernel[(n,)](
                 x, x.stride(0), V, n, splits, splits * n, _SPLIT_COLS, part,
                 tgt, exact if exact is not None else lse, bias if bias is not None else lse,
-                logp, lse, ent, tot, lssp, top1, *scal,
+                logp, lse, ent, tot, lssp, top1, lpt, *scal,
                 HAS_EXACT = exact is not None, HAS_TGT = False,
                 SPLITS = max(triton.next_power_of_2(splits), 2),
                 num_warps = 1, enable_fp_fusion = True, **flags,
@@ -963,7 +1021,7 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
             _fl_forward_kernel[(n,)](
                 x, x.stride(0), V,
                 tgt, exact if exact is not None else lse, bias if bias is not None else lse,
-                logp, lse, ent, tot, lssp, top1,
+                logp, lse, ent, tot, lssp, top1, lpt,
                 float(inv_t), float(scale), float(cap) if cap != 0.0 else 1.0,
                 HAS_BIAS = bias is not None, HAS_SCALE = scale != 1.0, HAS_CAP = cap != 0.0,
                 HAS_EXACT = exact is not None,
@@ -972,7 +1030,7 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
             )
         _launch(device, run)
         CALLS["triton"] += 1
-        out = {"logp": logp, "lse": lse}
+        out = {"logp": logp, "lse": lse, "lpt": lpt}
         if want_ent:
             out["ent"] = ent
         if want_sum:
@@ -983,7 +1041,7 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
             out["top1"] = top1
         dz = None
         if write_grad:
-            dz = _row_backward(device, x, dz_out, tgt, bias, lse, None, -coef.reshape(()), None,
+            dz = _row_backward(device, x, dz_out, tgt, bias, lse, lpt, None, -coef.reshape(()), None,
                                (inv_t, scale, cap), 0, V, (smooth_keep, smooth_each))
         return out, dz
     CALLS["torch"] += 1
@@ -994,7 +1052,7 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
             out[key] = dst
     dz = None
     if write_grad:
-        dz = _row_backward(device, x, dz_out, tgt, bias, out["lse"], None, -coef.reshape(()), None,
+        dz = _row_backward(device, x, dz_out, tgt, bias, out["lse"], out["lpt"], None, -coef.reshape(()), None,
                            (inv_t, scale, cap), 0, V, (smooth_keep, smooth_each))
     return out, dz
 
@@ -1071,14 +1129,16 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
             if u is not None:
                 _dz_w_acc(acc[:n], buf.buf.view(compute_dtype)[:n, : last - first], w[first:last])
         exact = _exact_target(h, w, bias, t) if exact_mode else None
-        o = {k: outs[k][a:b] for k in ("logp", "lse", "ent", "sum", "lssp", "top1") if outs.get(k) is not None}
+        o = {k: outs[k][a:b] for k in ("logp", "lse", "ent", "sum", "lssp", "top1", "lpt") if outs.get(k) is not None}
         lse = o["lse"]
+        assert exact is None or "lpt" in o, "the exact target logit needs its own lpt"
+        lpt = o.get("lpt", o["logp"]) if exact is not None else o["logp"]
 
         def run():
             _fl_combine_kernel[(n,)](
                 part, 0, V, n, splits, splits * n, _SPLIT_COLS, part,
                 t, exact if exact is not None else lse, lse,
-                o["logp"], lse, o.get("ent", lse), o.get("sum", lse), o.get("lssp", lse), o.get("top1", o["logp"]),
+                o["logp"], lse, o.get("ent", lse), o.get("sum", lse), o.get("lssp", lse), o.get("top1", o["logp"]), lpt,
                 *scal, HAS_EXACT = exact is not None, HAS_TGT = True,
                 SPLITS = max(triton.next_power_of_2(splits), 2), num_warps = 1, enable_fp_fusion = True, **flags,
             )
@@ -1087,7 +1147,7 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
             rowmap = idx[a:b] if n_keep != N else None
             _fl_flash_u_kernel[(n,)](
                 acc, acc.stride(0), w, w.stride(0), w.stride(1), u, u.stride(0), rowmap if rowmap is not None else t, a, H, n,
-                splits * n, _SPLIT_COLS, part, t, o["logp"], lse, m_run, g if g is not None else lse,
+                splits * n, _SPLIT_COLS, part, t, lpt, lse, m_run, g if g is not None else lse,
                 float(inv_t), float(scale), scal[2], 1.0 / float(gscale), HAS_SCALE = scale != 1.0,
                 HAS_CAP = cap != 0.0, HAS_MAP = rowmap is not None, HAS_G = g is not None, BLOCK_H = block_h, num_warps = 4, enable_fp_fusion = True,
             )
@@ -1098,9 +1158,10 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
         CALLS["flash"] += 1
 
 
-def _row_backward(device, x, dz_out, tgt, bias_slice, lse, ent, g, ge, scalars, col0, n_total, smooth = (1.0, 0.0),
+def _row_backward(device, x, dz_out, tgt, bias_slice, lse, lpt, ent, g, ge, scalars, col0, n_total, smooth = (1.0, 0.0),
                   block_top = None):
-    """Writes dz of x [n, Vs] into dz_out (x or a half view of it); block_top swaps group tops for fp32 values."""
+    """Writes dz of x [n, Vs] into dz_out (x or a half view of it); block_top swaps group tops for fp32 values.
+    lpt: the forward's log p_t of these logits (the target column's 1 - p_t)."""
     inv_t, scale, cap = scalars
     smooth_keep, smooth_each = smooth
     n, Vs = x.shape
@@ -1111,7 +1172,7 @@ def _row_backward(device, x, dz_out, tgt, bias_slice, lse, ent, g, ge, scalars, 
             _fl_backward_kernel[(n,)](
                 x, x.stride(0), dz_out, dz_out.stride(0), Vs, col0, n_total,
                 tgt, bias_slice if bias_slice is not None else lse, lse, ent if ent is not None else lse,
-                g, 0 if g.dim() == 0 else 1, ge if ge is not None else g,
+                g, 0 if g.dim() == 0 else 1, ge if ge is not None else g, lpt,
                 float(inv_t), float(scale), float(cap) if cap != 0.0 else 1.0, float(smooth_keep), float(smooth_each),
                 block_top if block_top is not None else lse, block_top.stride(0) if block_top is not None else 0,
                 HAS_BIAS = bias_slice is not None, HAS_SCALE = scale != 1.0, HAS_CAP = cap != 0.0,
@@ -1125,7 +1186,7 @@ def _row_backward(device, x, dz_out, tgt, bias_slice, lse, ent, g, ge, scalars, 
         return dz_out
     assert block_top is None, "exact-top backward needs the Triton kernel"
     CALLS["torch"] += 1
-    dz = _torch_dz(x, bias_slice, tgt, lse, inv_t, scale, cap, -g, smooth_keep, smooth_each, col0 = col0, ge = ge,
+    dz = _torch_dz(x, bias_slice, tgt, lse, lpt, inv_t, scale, cap, -g, smooth_keep, smooth_each, col0 = col0, ge = ge,
                    ent = ent, n_total = n_total)
     dz_out.copy_(dz.to(dz_out.dtype))
     return dz_out
@@ -1319,10 +1380,12 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
     block_top = torch.empty(_block_top_shape(N, V, device, compute_dtype, tiled and head_grad and not cap), device = device,
                             dtype = torch.float32)
     inv_t, scale, cap = _scalars(temperature, mul, div, cap)
+    fp32_logits, exact_mode = _logits_mode(device, compute_dtype)
+    if compute_dtype not in _HALF:
+        fp32_logits, exact_mode = False, False
+    # log p_t of the logits the gradient reads; only the exact target logit makes it differ from logps.
+    lpt = torch.zeros(N, **f32) if _exact_lpt(device, compute_dtype) else logps.new_empty(0)
     if n_keep > 0:
-        fp32_logits, exact_mode = _logits_mode(device, compute_dtype)
-        if compute_dtype not in _HALF:
-            fp32_logits, exact_mode = False, False
         if tiled and not _RECOMPUTE_FP32:
             fp32_logits = False
         w = weight.to(compute_dtype)
@@ -1336,7 +1399,8 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
         if (tiled or flash) and rows <= 0 and _tiled_vocab(V) and _use_triton(device):
             full = n_keep == N
             dst = {"logp": logps, "lse": lse, "ent": ent if want_ent else None, "sum": mean if want_mean else None,
-                   "lssp": lssp if want_lssp else None, "top1": top1 if want_top1 else None}
+                   "lssp": lssp if want_lssp else None, "top1": top1 if want_top1 else None,
+                   "lpt": lpt if exact_mode else None}
             if not full:
                 dst = {k: (torch.empty(n_keep, dtype = v.dtype, device = device) if v is not None else None)
                        for k, v in dst.items()}
@@ -1352,12 +1416,12 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                 dst["sum"].div_(V)
             if not full:
                 for key, out in (("logp", logps), ("lse", lse), ("ent", ent), ("sum", mean), ("lssp", lssp),
-                                 ("top1", top1)):
+                                 ("top1", top1), ("lpt", lpt)):
                     if dst[key] is not None:
                         out.index_copy_(0, idx, dst[key])
                 if top is not None:
                     block_top.index_copy_(0, idx, top)
-            return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N)
+            return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + (lpt,)
         R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
@@ -1372,6 +1436,8 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                 exact = _exact_target(h, w, bias, t) if exact_mode else None
                 dz_out = buf.grad_view(n, compute_dtype) if want_u else None
                 direct = {"logp": logps[a:b], "lse": lse[a:b]} if n_keep == N else None
+                if direct is not None and exact_mode:
+                    direct["lpt"] = lpt[a:b]
                 if direct is not None:
                     for key, dst, on in outs:
                         if on and key != "sum":
@@ -1385,12 +1451,14 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                 if direct is None:
                     put(logps, st["logp"])
                     put(lse, st["lse"])
+                    if exact_mode:
+                        put(lpt, st["lpt"])
                 for key, dst, on in outs:
                     if on and (direct is None or key == "sum"):
                         put(dst, st[key] / V if key == "sum" else st[key])
                 if want_u:
                     put(u, _dz_w(dz, w) if u_scale == 1.0 else _dz_w(dz, w).div_(u_scale))
-    return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N)
+    return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + (lpt,)
 
 
 def _mm_into(out, a, b):
@@ -1435,8 +1503,8 @@ def _bwd_layout(n_keep, V, H, rows, bpl, budget, need_w, single, align):
 
 
 @_guarded
-def _logprobs_bwd_impl(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, temperature, mul, div,
-                       cap, compute_dtype, need_h, need_w, need_b, rows):
+def _logprobs_bwd_impl(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, lpt, temperature, mul,
+                       div, cap, compute_dtype, need_h, need_w, need_b, rows):
     device = weight.device
     N, H = hidden.shape
     V = weight.shape[0]
@@ -1447,6 +1515,7 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, 
     has_ge = ge.numel() > 0
     # Autograd hands in stride-0 gradients (from .sum()).
     g, ge, lse, ent, targets = g.contiguous(), ge.contiguous(), lse.contiguous(), ent.contiguous(), targets.contiguous()
+    lpt = lpt.contiguous()
     bias = bias.contiguous() if bias is not None else None
     if n_keep == 0:
         return (torch.zeros((N, H), device = device, dtype = hidden.dtype) if need_h else hidden.new_empty(0),
@@ -1477,9 +1546,10 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, 
     w = weight.to(compute_dtype)
     buf = _Buffers(R, tile, device, fp32_logits, compute_dtype)
     if n_keep == N:
-        tk, lk, ek, gk, gek, topk = targets, lse, ent, g, ge, block_top
+        tk, lk, ek, gk, gek, topk, ptk = targets, lse, ent, g, ge, block_top, lpt
     else:
         tk, lk, gk = targets.index_select(0, idx), lse.index_select(0, idx), g.index_select(0, idx)
+        ptk = lpt.index_select(0, idx)
         ek = ent.index_select(0, idx) if has_ge else ent
         gek = ge.index_select(0, idx) if has_ge else ge
         topk = block_top.index_select(0, idx) if exact_top else block_top
@@ -1491,7 +1561,7 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, 
         dz_out = buf.buf.view(compute_dtype)[:n, : last - first] if fp32_logits else x
         dz = _row_backward(
             device, x, dz_out, tk[a:b], bias[first:last] if bias is not None else None,
-            lk[a:b], ek[a:b] if has_ge else None, gk[a:b], gek[a:b] if has_ge else None, (inv_t, scale, cap), first,
+            lk[a:b], ptk[a:b], ek[a:b] if has_ge else None, gk[a:b], gek[a:b] if has_ge else None, (inv_t, scale, cap), first,
             V, block_top = topk[a:b] if exact_top else None,
         )
         if acc_b is not None:
@@ -1616,7 +1686,7 @@ if _OPS is None:
         compute_dtype: torch.dtype, want_ent: bool, want_mean: bool, want_lssp: bool, want_top1: bool,
         want_u: bool, need_h: bool, need_w: bool, need_b: bool, rows: int, ent_lazy: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, torch.Tensor]:
+               torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         CALLS["logprobs"] += 1
         return _OPS["lp_impl"](hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
                                want_ent, want_mean, want_lssp, want_top1, want_u, rows,
@@ -1642,11 +1712,12 @@ if _OPS is None:
                                          (need_h or need_w or need_b) and not want_u and need_w and not cap), **f32),
             torch.empty(N, device = targets.device, dtype = torch.long),
             torch.empty(1, device = "cpu", dtype = torch.long),
+            torch.empty(N if _exact_lpt(weight.device, compute_dtype) else 0, **f32),
         )
 
     def _lp_setup(ctx, inputs, output):
-        logps, ent, mean, lssp, top1, u, lse, block_top, idx, n_keep = output
-        ctx.mark_non_differentiable(mean, lssp, top1, u, lse, block_top, idx, n_keep)
+        logps, ent, mean, lssp, top1, u, lse, block_top, idx, n_keep, lpt = output
+        ctx.mark_non_differentiable(mean, lssp, top1, u, lse, block_top, idx, n_keep, lpt)
         ctx.set_materialize_grads(False)
         (hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
          want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows, ent_lazy) = inputs
@@ -1658,12 +1729,14 @@ if _OPS is None:
         ctx.has_bias = bias is not None
         ctx.has_mask = mask is not None
         ctx.hidden_dtype = hidden.dtype
+        # lpt: log p_t for the backward's target column, logps unless the exact target logit is on.
+        lpt = lpt if lpt.numel() > 0 else logps
         if ctx.ent_lazy:
-            ctx.save_for_backward(u, hidden, weight, bias, targets, idx, n_keep, lse, ent)
+            ctx.save_for_backward(u, hidden, weight, bias, targets, idx, n_keep, lse, ent, lpt)
         elif want_u:
             ctx.save_for_backward(u)
         else:
-            ctx.save_for_backward(hidden, weight, bias, targets, idx, n_keep, lse, ent, block_top)
+            ctx.save_for_backward(hidden, weight, bias, targets, idx, n_keep, lse, ent, block_top, lpt)
 
     def _lp_backward(ctx, g_logps, g_ent, *_):
         need_h, need_w, need_b = ctx.need
@@ -1672,25 +1745,25 @@ if _OPS is None:
             if not need_h:
                 return (None,) + none
             if ctx.ent_lazy and g_ent is not None:
-                _, hidden, weight, bias, targets, idx, n_keep, lse, ent = ctx.saved_tensors
+                _, hidden, weight, bias, targets, idx, n_keep, lse, ent, lpt = ctx.saved_tensors
                 temperature, mul, div, cap, compute_dtype, rows = ctx.args
                 g = g_logps.float() if g_logps is not None else torch.zeros_like(lse)
                 gh, _, _ = getattr(torch.ops.unsloth_zoo, _LP_BWD_OP)(
-                    hidden, weight, bias, targets, idx, n_keep, lse, ent, g, g_ent.float(), lse.new_empty(0),
+                    hidden, weight, bias, targets, idx, n_keep, lse, ent, g, g_ent.float(), lse.new_empty(0), lpt,
                     temperature, mul, div, cap, compute_dtype, True, False, False, rows,
                 )
                 return (gh,) + none
             if g_logps is None:
                 return (None,) + none
             return (torch.ops.unsloth_zoo.fused_linear_scale_rows(ctx.saved_tensors[0], g_logps, ctx.hidden_dtype),) + none
-        hidden, weight, bias, targets, idx, n_keep, lse, ent, block_top = ctx.saved_tensors
+        hidden, weight, bias, targets, idx, n_keep, lse, ent, block_top, lpt = ctx.saved_tensors
         if g_logps is None and g_ent is None:
             return (None,) + none
         g = g_logps.float() if g_logps is not None else torch.zeros_like(lse)
         ge = g_ent.float() if (g_ent is not None and ent.numel() > 0) else lse.new_empty(0)
         temperature, mul, div, cap, compute_dtype, rows = ctx.args
         gh, gw, gb = getattr(torch.ops.unsloth_zoo, _LP_BWD_OP)(
-            hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, temperature, mul, div, cap,
+            hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, lpt, temperature, mul, div, cap,
             compute_dtype, need_h, need_w, need_b, rows,
         )
         return (gh if need_h else None, gw if need_w else None, gb if need_b else None) + (None,) * 17
@@ -1701,16 +1774,16 @@ if _OPS is None:
     def _lp_bwd_op(
         hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], targets: torch.Tensor,
         idx: torch.Tensor, n_keep: torch.Tensor, lse: torch.Tensor, ent: torch.Tensor, g: torch.Tensor,
-        ge: torch.Tensor, block_top: torch.Tensor, temperature: float, mul: float, div: float, cap: float,
+        ge: torch.Tensor, block_top: torch.Tensor, lpt: torch.Tensor, temperature: float, mul: float, div: float, cap: float,
         compute_dtype: torch.dtype, need_h: bool, need_w: bool, need_b: bool, rows: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         CALLS["logprobs_bwd"] += 1
-        return _OPS["lp_bwd_impl"](hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, temperature,
-                                   mul, div, cap, compute_dtype, need_h, need_w, need_b, rows)
+        return _OPS["lp_bwd_impl"](hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, lpt,
+                                   temperature, mul, div, cap, compute_dtype, need_h, need_w, need_b, rows)
 
     @_lp_bwd_op.register_fake
-    def _lp_bwd_fake(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, temperature, mul, div, cap,
-                     compute_dtype, need_h, need_w, need_b, rows):
+    def _lp_bwd_fake(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, lpt, temperature, mul, div,
+                     cap, compute_dtype, need_h, need_w, need_b, rows):
         return (
             hidden.new_empty(hidden.shape) if need_h else hidden.new_empty(0),
             weight.new_empty(weight.shape) if need_w else hidden.new_empty(0),
@@ -2276,7 +2349,7 @@ def fused_linear_logprobs(
     ent_grad = bool(return_entropy) and (lazy or bool(entropy_requires_grad))
     head_grad = need_w or need_b
     want_u = _FORWARD_GRAD and need_h and not head_grad and (not ent_grad or lazy)
-    logps, ent, mean, lssp, top1, u, lse, _, _, _ = getattr(torch.ops.unsloth_zoo, _LP_OP)(
+    logps, ent, mean, lssp, top1, u, lse, _, _, _, _ = getattr(torch.ops.unsloth_zoo, _LP_OP)(
         hidden2, weight, bias, targets2, mask2, float(temperature),
         float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
         _compute_dtype(hidden, weight), bool(return_entropy), bool(return_mean_logits),
