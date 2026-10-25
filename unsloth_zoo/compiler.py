@@ -102,15 +102,27 @@ minor = None
 # Bound before the branches: DEVICE_TYPE == "cpu" takes none of them, and
 # `fuse_lm_head` then read this global and raised NameError.
 OLD_CUDA_ARCH_VERSION = False
+# Visible pre-Turing (or unreadable) card indices. The rewrite is installed before placement,
+# so a head a device_map puts on one skips Inductor and CCE per forward (lm_head_on_old_cuda_arch).
+OLD_CUDA_ARCH_INDICES = frozenset()
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
-        # Any visible pre-Turing card, not just the current one: a device_map can place
-        # layers on it, and Inductor fails there.
-        from .device_type import _visible_cuda_capabilities
-        OLD_CUDA_ARCH_VERSION = any(
-            (_major <= 7) and (_minor < 5) for _major, _minor in _visible_cuda_capabilities()
-        )
+        # Current device only, as torch decides: an idle older card must not disable the fusion.
+        OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+        _old_indices = set()
+        try:
+            for _index in range(torch.cuda.device_count()):
+                try:
+                    _major, _minor = torch.cuda.get_device_capability(_index)
+                except Exception:
+                    _old_indices.add(_index)
+                    continue
+                if (_major <= 7) and (_minor < 5):
+                    _old_indices.add(_index)
+        except Exception:
+            pass
+        OLD_CUDA_ARCH_INDICES = frozenset(_old_indices)
     else:
         # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
         # ask whether a device is present before asking what it can do. There is
@@ -122,6 +134,21 @@ elif DEVICE_TYPE == "hip":
 elif DEVICE_TYPE == "xpu":
     OLD_CUDA_ARCH_VERSION = False
 pass
+
+
+def lm_head_on_old_cuda_arch(weight):
+    """True when the LM head weight sits on a visible pre-Turing card. A frozenset read, so the
+    generated forward stays traceable."""
+    if not OLD_CUDA_ARCH_INDICES:
+        return False
+    device = getattr(weight, "device", None)
+    return device is not None and device.type == "cuda" and device.index in OLD_CUDA_ARCH_INDICES
+pass
+
+# AST-rewritten forwards and the import hook use the shared adapter; fused_losses never imports this module.
+from unsloth_zoo.fused_losses import forward_adapter as _forward_adapter
+_forward_adapter.lm_head_on_old_cuda_arch = lm_head_on_old_cuda_arch
+del _forward_adapter
 
 OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
 
@@ -648,6 +675,7 @@ from unsloth_zoo.loss_utils import (
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
 from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
@@ -3495,7 +3523,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3521,7 +3549,7 @@ else:
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
-        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -3596,7 +3624,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3623,7 +3651,7 @@ elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LO
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
-        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -3747,7 +3775,7 @@ else:
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
-        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
