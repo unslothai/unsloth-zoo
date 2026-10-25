@@ -2039,6 +2039,8 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
         if fused is _jsd_triton and rows <= 0 and _JSD_TRITON_ROWS:
             # Triton keeps 2.5 [rows, vocab] fp32 buffers; rows as in the torch.func chunked JSD (2**26 logits, [64, 1024]).
             R = min(1024, max(64, 1 << max(((1 << 26) // max(V, 1)).bit_length() - 1, 0)))
+            if rows < 0:
+                R = min(R, -rows)
         pad = fused is not None and fused is not _jsd_triton
         if not pad:
             R = min(R, n_keep)

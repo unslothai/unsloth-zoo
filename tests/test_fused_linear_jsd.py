@@ -237,6 +237,28 @@ def test_triton_body_matches_compiled_math(beta, tf):
     torch.testing.assert_close(dz.cpu().double(), dz2, rtol = 1e-4, atol = 1e-8)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA")
+def test_triton_chunk_respects_row_cap(monkeypatch):
+    """A negative rows_per_chunk caps the Triton chunk too, not only the eager / compiled one."""
+    if not fl._use_triton(torch.device("cuda")):
+        pytest.skip("Triton unavailable")
+    seen = []
+    real = fl._jsd_triton
+
+    def spy(s, *args):
+        seen.append(s.shape[0])
+        return real(s, *args)
+
+    monkeypatch.setattr(fl, "_jsd_triton", spy)
+    g = torch.Generator().manual_seed(5)
+    h = torch.randn(300, 16, generator = g).cuda().requires_grad_()
+    ht = torch.randn(300, 24, generator = g).cuda()
+    w = (torch.randn(151936, 16, generator = g) * 0.1).cuda()
+    wt = (torch.randn(151936, 24, generator = g) * 0.1).cuda()
+    fl.fused_linear_jsd(h, w, ht, wt, beta = 0.5, rows_per_chunk = -32).backward()
+    assert seen and max(seen) <= 32, seen
+
+
 def test_fused_body_matches_eager_chunk():
     """_jsd_body (the compiled CUDA form) and _jsd_chunk (eager, in place) are the same math."""
     g = torch.Generator().manual_seed(9)
