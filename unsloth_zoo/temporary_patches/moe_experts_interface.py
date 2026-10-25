@@ -320,7 +320,7 @@ def _warm_moe_backend(model) -> None:
         return
     # The package module and the compiled-cache copy each cache their own probe results.
     for module in (moe_utils,) if backend_module is moe_utils else (moe_utils, backend_module):
-        for probe in ("_check_torch_grouped_mm_supported", "_transposed_view_grouped_mm_is_safe"):
+        for probe in ("_check_torch_grouped_mm_supported", "_transposed_view_grouped_mm_is_safe", "select_moe_backend"):
             try:
                 getattr(module, probe)()
             except Exception:
