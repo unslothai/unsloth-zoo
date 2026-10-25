@@ -174,6 +174,6 @@ def test_retire_waits_on_the_stream_that_allocated_the_source(G):
     import collections
     owner, current = _FenceStream("owner"), _FenceStream("current")
     first, second = _Copied(True), _Copied(False)
-    inflight = collections.deque([(None, first, owner), (None, second, None)])
+    inflight = collections.deque([[None, first, owner], [None, second, None]])
     G.NonReentrantActivationOffloader._retire(inflight, current, 0)
     assert owner.waited == [first] and current.waited == [second] and not inflight

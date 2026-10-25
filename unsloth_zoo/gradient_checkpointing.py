@@ -1724,10 +1724,18 @@ def _is_compiling():
 pass
 
 
+def _release_keepalive(entry, stream = None):
+    """Drop an inflight D2H source once its packing stream is ordered after the copy."""
+    copied, owner = entry[1], entry[2]
+    if copied is not None: (owner or stream).wait_event(copied)
+    entry[0] = entry[1] = entry[2] = None
+pass
+
+
 class _OffloadedActivation:
     """One saved activation: a host copy (`copied` marks the D2H), or still a device tensor."""
     __slots__ = ("device", "host", "copied", "device_tensor", "ready", "ready_stream", "index", "pinned_bytes",
-                 "unpacked", "group", "__weakref__")
+                 "unpacked", "group", "keepalive", "__weakref__")
 
     def __init__(self, device, index):
         self.device        = device
@@ -1740,9 +1748,12 @@ class _OffloadedActivation:
         self.pinned_bytes  = 0
         self.unpacked      = False
         self.group         = 0     # which hooks() entry (checkpoint call) packed it
+        self.keepalive     = None  # its inflight entry: [source, copied, packing stream]
 
     def __del__(self):
         try:
+            # Graph dropped before the keepalive was retired: release the source now, after its copy.
+            if self.keepalive is not None: _release_keepalive(self.keepalive)
             if self.pinned_bytes: _release_pinned(self.pinned_bytes)
             # Prefetch dropped unread: order the allocating stream after the reload still writing it.
             if self.ready is not None: self.ready_stream.wait_event(self.ready)
@@ -1773,7 +1784,8 @@ class NonReentrantActivationOffloader:
             self.keep_last = 1
         # 0: copy on the compute stream (single GPU default). N > 0: side stream, at most N sources
         # kept alive per device, released after the compute stream waits on the copy. No
-        # record_stream: its block reuse depends on how far the CPU runs ahead (distributed default 1).
+        # record_stream on the side stream: its block reuse depends on how far the CPU runs ahead
+        # (distributed default 1).
         default_inflight = 1 if is_distributed() else 0
         try:
             self.max_inflight = max(0, int(os.environ.get("UNSLOTH_GC_MAX_INFLIGHT_COPIES", default_inflight)))
@@ -1832,9 +1844,13 @@ class NonReentrantActivationOffloader:
                 if not _is_host_alloc_oom(e): raise
                 _warn_pinned_unavailable(e)
             else:
-                # Keepalive: x's block must outlive the copy.
-                inflight.append((x, copied, compute))
-                record.host, record.copied, record.pinned_bytes = host, copied, nbytes
+                # Keepalive: x's block must outlive the copy, and is released after `compute` waits on
+                # it. Allocated on another stream, that stream must also wait: record_stream is a
+                # no-op on the allocation stream, so the usual case pays nothing.
+                x.record_stream(compute)
+                entry = [x, copied, compute]
+                inflight.append(entry)
+                record.host, record.copied, record.pinned_bytes, record.keepalive = host, copied, nbytes, entry
                 self.stats["pinned"] += 1
                 return
         record.host = x.to("cpu")
@@ -1843,9 +1859,8 @@ class NonReentrantActivationOffloader:
 
     @staticmethod
     def _retire(inflight, compute, keep):
-        while inflight and (len(inflight) > keep or inflight[0][1].query()):
-            _, copied, owner = inflight.popleft()
-            (owner or compute).wait_event(copied)
+        while inflight and (len(inflight) > keep or inflight[0][1] is None or inflight[0][1].query()):
+            _release_keepalive(inflight.popleft(), compute)
     pass
 
     def _drain(self):
@@ -1940,6 +1955,8 @@ class NonReentrantActivationOffloader:
             x = record.device_tensor
             if record.ready is not None:
                 compute.wait_event(record.ready)
+                # Consumed on another stream than it was allocated on: its free must wait for this one.
+                if compute != record.ready_stream: x.record_stream(compute)
                 # One shot: a retain_graph rerun reloads from the host copy.
                 record.device_tensor, record.ready, record.ready_stream = None, None, None
                 self.stats["prefetch_hits"] += 1
