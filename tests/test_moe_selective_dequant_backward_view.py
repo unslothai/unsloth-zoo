@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Selective-dequant backward passes experts as a transposed view (no copy); dX matches the copy bitwise."""
+"""Selective-dequant backward: a transposed view (no copy) where the slice reads views exactly, else the copy; dX bitwise."""
 import pytest
 import torch
 
@@ -51,9 +51,9 @@ def _case(chunks_split):
     return x, dy, W, plan, provider, provided
 
 
-@pytest.mark.parametrize("chunks_split", [0, 2])
-def test_backward_passes_the_planned_experts_as_a_view(chunks_split, monkeypatch):
+def _backward_weights(chunks_split, monkeypatch, reads_views):
     x, dy, W, plan, provider, provided = _case(chunks_split)
+    monkeypatch.setattr(mu, "_slice_reads_views", lambda *args: reads_views)
     seen = []
     real = mu._grouped_mm_slice
 
@@ -65,9 +65,21 @@ def test_backward_passes_the_planned_experts_as_a_view(chunks_split, monkeypatch
     xg = x.clone().requires_grad_(True)
     mu._GroupedMMSelectiveRecompute.apply(xg, provider, plan).backward(dy)
     n = len(plan.chunks)
-    backward_ptrs, backward_provided = [p for p, _ in seen[n:]], provided[n:]
-    assert backward_ptrs == backward_provided   # same storage: no copy
-    assert not any(contiguous for _, contiguous in seen[n:])
+    return seen[n:], provided[n:]
+
+
+@pytest.mark.parametrize("chunks_split", [0, 2])
+def test_backward_passes_the_planned_experts_as_a_view(chunks_split, monkeypatch):
+    seen, provided = _backward_weights(chunks_split, monkeypatch, True)
+    assert [p for p, _ in seen] == provided   # same storage: no copy
+    assert not any(contiguous for _, contiguous in seen)
+
+
+@pytest.mark.parametrize("chunks_split", [0, 2])
+def test_per_group_fallback_keeps_the_contiguous_copy(chunks_split, monkeypatch):
+    seen, provided = _backward_weights(chunks_split, monkeypatch, False)
+    assert all(contiguous for _, contiguous in seen)
+    assert not set(p for p, _ in seen) & set(provided)
 
 
 @pytest.mark.parametrize("chunks_split", [0, 2])
