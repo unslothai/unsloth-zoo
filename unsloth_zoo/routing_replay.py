@@ -436,25 +436,30 @@ def _recomputed_routes(layer_index, ids2, signature = None):
         # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
         return _NATURAL
     fp = _fingerprint(ids2)
-    match = torch.stack([(c[0] == fp).all() for c in candidates])
+    # One stacked compare, not one per candidate: up to _MAX_PENDING candidates per router call.
+    match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
     if signature is not None:
         # Narrow the natural matches to the forwards whose router input was the same too. Only a
         # refinement: when no input matches exactly, the natural matches stand as before.
-        same = [
-            (c[3] == signature).all() if len(c) > 3 and c[3] is not None and c[3].shape == signature.shape
-            else torch.zeros((), dtype = torch.bool, device = match.device)
-            for c in candidates
-        ]
-        exact = match & torch.stack(same).to(match.device)
+        has = [len(c) > 3 and c[3] is not None and c[3].shape == signature.shape for c in candidates]
+        if all(has):
+            same = (torch.stack([c[3] for c in candidates]) == signature).flatten(1).all(-1)
+        else:
+            same = torch.stack([
+                (c[3] == signature).all() if h else torch.zeros((), dtype = torch.bool, device = match.device)
+                for c, h in zip(candidates, has)
+            ])
+        exact = match & same.to(match.device)
         match = torch.where(exact.any(), exact, match)
-    pick = match.to(torch.int32).argmax()
+    # index_select, not forced_all[pick]: a 0-dim CUDA index is read back to the host.
+    pick = match.to(torch.int32).argmax().reshape(1)
     forced_all = torch.stack([c[1] for c in candidates])
-    forced = forced_all[pick]
+    forced = forced_all.index_select(0, pick)[0]
     # Several forwards with the same natural routing but different replays cannot be told
     # apart, so keep the natural routing there rather than guess. Only the expert set counts:
     # the same experts in another order route and weight every token identically.
     agree = ((forced_all.sort(-1).values == forced.sort(-1).values).flatten(1).all(-1) | ~match).all()
-    valid = torch.stack([c[2] for c in candidates])[pick] & match.any() & agree
+    valid = torch.stack([c[2] for c in candidates]).index_select(0, pick)[0] & match.any() & agree
     return forced, valid
 
 
