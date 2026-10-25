@@ -625,7 +625,7 @@ def test_opcheck_with_disabled_outputs():
     torch.library.opcheck(
         getattr(torch.ops.unsloth_zoo, fl._LP_BWD_OP).default,
         (h, w, b, t, torch.arange(n), torch.tensor([n]), torch.zeros(n), torch.empty(0), torch.ones(n), torch.empty(0),
-         torch.empty(0), 1.0, 0.0, 0.0, 0.0, torch.float32, True, False, False, 4),
+         torch.empty(0), torch.zeros(n), 1.0, 0.0, 0.0, 0.0, torch.float32, True, False, False, 4),
         test_utils = ("test_faketensor",),
     )
 
