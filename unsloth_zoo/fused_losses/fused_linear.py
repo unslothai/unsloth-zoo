@@ -2037,7 +2037,7 @@ def _jsd_triton(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_
     R, V = s.shape
     NB = triton.cdiv(V, _JSD_BLOCK)
     flags = dict(S_SCALE = s_scale != 1.0, S_CAP = s_cap != 0.0, T_SCALE = t_scale != 1.0, T_CAP = t_cap != 0.0,
-                 BLOCK = _JSD_BLOCK, num_warps = 8)
+                 BLOCK = _JSD_BLOCK, num_warps = 8, enable_fp_fusion = True)
     sc = (float(s_scale), float(s_cap) or 1.0, float(t_scale), float(t_cap) or 1.0, float(inv_t))
     stats = torch.empty((R, NB, 4), device = s.device, dtype = torch.float32)
     grid = (R, NB)
