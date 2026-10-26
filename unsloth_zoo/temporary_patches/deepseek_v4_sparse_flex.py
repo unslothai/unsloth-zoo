@@ -135,7 +135,11 @@ def _min_keys(module, device, forced):
 def _flex_applies(module, query, key, value, attention_mask, dropout, kwargs):
     setting = _flex_setting()
     # Uncompiled flex attention materialises every score, which is worse than eager.
-    if setting == "0" or UNSLOTH_COMPILE_DISABLE or kwargs.get("output_attentions"):
+    # transformers records attention weights when config.output_attentions is set without passing the kwarg.
+    output_attentions = kwargs.get("output_attentions")
+    if output_attentions is None:
+        output_attentions = getattr(getattr(module, "config", None), "output_attentions", False)
+    if setting == "0" or UNSLOTH_COMPILE_DISABLE or output_attentions:
         return False
     if key is not value or dropout:
         return False

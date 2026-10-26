@@ -19,6 +19,8 @@ attention (fp32 exact-math check, bf16 layers against an fp32 oracle, prefill + 
 
 import copy
 
+import types
+
 import pytest
 import torch
 
@@ -102,13 +104,15 @@ def test_cpu_and_gates_fall_back_to_eager(monkeypatch):
 
 
 @needs_flex_gpu
-@pytest.mark.parametrize("case", ["env_off", "dropout", "output_attentions", "short_query", "k_not_v", "no_mask", "fp32"])
+@pytest.mark.parametrize("case", ["env_off", "dropout", "output_attentions", "config_output_attentions", "short_query", "k_not_v", "no_mask", "fp32"])
 def test_gpu_gates_fall_back_to_eager(monkeypatch, case):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0" if case == "env_off" else "1")
     attn, q, kv, mask = _gate_inputs("cuda", q_len = 8 if case == "short_query" else 32,
                                      dtype = torch.float32 if case == "fp32" else torch.bfloat16)
     value = kv.clone() if case == "k_not_v" else kv
     kwargs = {"output_attentions": True} if case == "output_attentions" else {}
+    if case == "config_output_attentions":
+        attn.config = types.SimpleNamespace(output_attentions = True)
     modeling.eager_attention_forward(attn, q, kv, value, None if case == "no_mask" else mask, 0.125,
                                      dropout = 0.1 if case == "dropout" else 0.0, **kwargs)
     assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
