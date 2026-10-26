@@ -524,6 +524,18 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             f"embedding."
         )
         return
+    # Ignore some model checks for now. Normalize both the model name and caller-
+    # provided entries so the comparison is case-insensitive in either direction.
+    # Checked before the ZeRO-3 / DTensor gathers below, which would otherwise materialise full
+    # embedding and lm_head copies on every rank only to return. The name is the same on every
+    # rank, so all ranks skip the collectives together.
+    model_name = model.config._name_or_path
+    ignored_tokenizer_names = {
+        name.lower() for name in IGNORED_TOKENIZER_NAMES
+    }
+    if model_name is not None and model_name.lower() in ignored_tokenizer_names:
+        return
+    pass
     # DeepSpeed ZeRO-3 partitioned the weights to empty placeholders: gather them outside inference mode
     # (all-gather writes param.data) and let rank 0's reset reach every partition (unsloth#225).
     partitioned = []
@@ -545,16 +557,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     lm_head_matrix   = lm_head.weight
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
-
-    # Ignore some model checks for now. Normalize both the model name and caller-
-    # provided entries so the comparison is case-insensitive in either direction.
-    model_name = model.config._name_or_path
-    ignored_tokenizer_names = {
-        name.lower() for name in IGNORED_TOKENIZER_NAMES
-    }
-    if model_name is not None and model_name.lower() in ignored_tokenizer_names:
-        return
-    pass
 
     # Sometimes the sizes can be different like in vision models
     # Ie <image> is in input, but not in output
