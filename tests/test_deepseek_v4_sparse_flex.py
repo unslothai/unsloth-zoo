@@ -424,8 +424,8 @@ def test_older_torch_keeps_eager(monkeypatch):
 @pytest.mark.parametrize("rate", [0, 4, 128])
 def test_flex_graphs_stay_bounded_over_lengths(rate):
     """Sliding (rate 0), CSA (4), HCA (128) masks over varying lengths (incl. non multiples of 128) and
-    batch 1 / 2, fwd + bwd: two graphs (batch 1 vs > 1), none added per new length. Compressed layers can take
-    a third: the first call here has as many query as key tiles, and duck sizing ties the two until they differ."""
+    batch 1 / 2, fwd + bwd: at most four graphs (the first length static, then dynamic, batch 1 vs > 1), none
+    added per new length after that."""
     import torch._dynamo
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()
@@ -444,7 +444,7 @@ def test_flex_graphs_stay_bounded_over_lengths(rate):
     for S in (260, 640, 1000, 1025):
         call(S, 2)
         call(S, 1)
-    assert graphs <= (2 if rate == 0 else 3), graphs
+    assert graphs <= 4, graphs
     assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
 
 

@@ -107,9 +107,9 @@ def _compiled_flex():
     global _FLEX
     if _FLEX is None:
         from torch.nn.attention.flex_attention import flex_attention
-        # dynamic=True: under dynamic=None each length-dependent input (key length, tile counts, the mask
-        # table) went dynamic on its own recompile, 4 graphs over varying lengths; now batch 1 vs > 1 only.
-        _FLEX = torch.compile(flex_attention, dynamic = True)
+        # dynamic=None: a fixed length (packed / padded runs) keeps a static kernel, 20-30% faster than the
+        # dynamic one (CSA 8192: 129 vs 188 ms on B200); varying lengths settle on dynamic after a few graphs.
+        _FLEX = torch.compile(flex_attention)
     return _FLEX
 
 
