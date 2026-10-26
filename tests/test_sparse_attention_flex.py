@@ -22,7 +22,6 @@ and Q / K / V gradients match upstream's dense masked attention, and whole tiny 
 with flex on vs off."""
 
 import importlib
-import os
 
 import pytest
 import torch
