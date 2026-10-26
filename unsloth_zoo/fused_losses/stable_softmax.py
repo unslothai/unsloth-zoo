@@ -39,9 +39,10 @@ def _softplus(x):
 
 def target_logprob(z, target):
     """(log softmax(z)[..., target], logsumexp(z)), traceable. ``target`` must be a valid column of every row."""
-    # Centred (a large shared offset rounds the normaliser away); target by masked sum, not gather (elementwise
-    # backward, no saved float32 copy); finfo.min, not -inf, keeps a target-only support NaN free.
-    m = z.detach().amax(-1, keepdim = True)
+    # Centred on the detached target logit, a gather rather than a row max pass (a large shared offset rounds
+    # the normaliser away); target by masked sum, not gather (elementwise backward, no saved float32 copy);
+    # finfo.min, not -inf, keeps a target-only support NaN free.
+    m = z.detach().gather(-1, target.unsqueeze(-1))
     m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
     z = z - m
     is_target = torch.arange(z.shape[-1], device = z.device) == target.unsqueeze(-1)
