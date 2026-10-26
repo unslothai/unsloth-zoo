@@ -181,6 +181,7 @@ def test_stacked_experts_on_sm75_see_a_capture_on_the_operand_gpu(gpu, monkeypat
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.cuda, "device", _device)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: state["current"])
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: state["current"] in state["capturing"])
     param = _expert_param(E = 32)
     inputs = _rows(2048, torch.device("cuda", operand))
