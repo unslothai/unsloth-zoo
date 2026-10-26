@@ -653,15 +653,23 @@ def test_dsa_flex_keeps_finite_mask_biases_in_float32():
 
 @needs_models
 @gpu
-def test_query_broadcast_masks_match_their_expansion(monkeypatch):
-    """A caller's [B, 1, 1, T] mask broadcasts over queries upstream. Padding its query dim hid every key
-    from later queries, and the chunked DSA indexer failed slicing it on the second chunk."""
+@pytest.mark.parametrize("shape", ["query", "key", "batch"])
+def test_broadcast_masks_match_their_expansion(monkeypatch, shape):
+    """Callers' masks broadcast upstream over queries ([B, 1, 1, T]), keys ([B, 1, S, 1]) or batch
+    ([1, 1, S, T]). Padding a singleton dim hid keys (only key 0, or only query 0, stayed visible), and the
+    chunked DSA indexer failed slicing a query-singleton mask on the second chunk."""
     torch.manual_seed(0)
     dev, dt = "cuda", torch.bfloat16
     B, H, S, D = 2, 4, 512, 64
-    pad = torch.ones(B, 1, 1, S, dtype = torch.bool, device = dev)
-    pad[1, ..., S - 100:] = False  # right padding on row 1
-    for base in (pad, torch.zeros(B, 1, 1, S, device = dev, dtype = dt).masked_fill(~pad, torch.finfo(dt).min)):
+    if shape == "query":
+        pad = torch.ones(B, 1, 1, S, dtype = torch.bool, device = dev)
+        pad[1, ..., S - 100:] = False  # right padding on row 1
+    elif shape == "key":
+        pad = torch.ones(B, 1, S, 1, dtype = torch.bool, device = dev)
+        pad[1, :, S - 100:] = False  # padded query rows on row 1
+    else:
+        pad = torch.ones(S, S, dtype = torch.bool, device = dev).tril()[None, None]
+    for base in (pad, torch.zeros(pad.shape, device = dev, dtype = dt).masked_fill(~pad, torch.finfo(dt).min)):
         full = base.expand(B, 1, S, S).contiguous()
         q, k, v = (torch.randn(B, H, S, D, device = dev, dtype = dt) for _ in range(3))
         topk_idx = torch.randn(B, S, S, device = dev).topk(128, dim = -1).indices.int()
@@ -674,6 +682,8 @@ def test_query_broadcast_masks_match_their_expansion(monkeypatch):
         ref = sb.minimax_m3_flex_attention(q, k, v, blocks, full, pos, D ** -0.5, 128)
         assert _rel(got, ref) < 1e-3, _rel(got, ref)
 
+    if shape != "query":
+        return
     _patched()
     config = _dsa_config("deepseek_v32")
     m, indexer = _indexer_module("deepseek_v32", config)

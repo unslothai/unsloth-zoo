@@ -165,11 +165,19 @@ def _pad_to(x, dim, size, value):
     return F.pad(x, pad, value = value)
 
 
-def _expand_queries(mask, q_len):
-    """A caller's [B, 1, 1, T] mask broadcasts over queries upstream; padding or chunking it would not."""
-    if mask is not None and mask.shape[-2] == 1 and q_len > 1:
-        return mask.expand(*mask.shape[:-2], q_len, mask.shape[-1])
-    return mask
+def _broadcast_mask(mask, batch, q_len, kv_len):
+    """Callers' masks may broadcast over batch, queries or keys ([1|B, 1, 1|S, 1|T]) as upstream allows;
+    padding or chunking a singleton dimension would not broadcast it."""
+    shape = (batch, *mask.shape[1:-2], q_len, kv_len)
+    return mask if tuple(mask.shape) == shape else mask.expand(shape)
+
+
+def _mask_fits(mask, batch, q_len, kv_len):
+    """4D, head-shared, every other dimension full or broadcastable."""
+    return (
+        mask.dim() == 4 and mask.shape[1] == 1 and mask.shape[0] in (1, batch)
+        and mask.shape[2] in (1, q_len) and mask.shape[3] in (1, kv_len)
+    )
 
 
 def _visible(attention_mask):
@@ -272,7 +280,7 @@ def minimax_m3_flex_attention(query, key, value, block_indices, attention_mask, 
         base_all = ((tile_end[None, None, :] <= q_min[..., None]) & (tile_end < kv_len)[None, None, :]).unsqueeze(1)
         base = None
     else:
-        base = _base_keep(_expand_queries(attention_mask, q_len), q_pad, kv_pad)
+        base = _base_keep(_broadcast_mask(attention_mask, batch, q_len, kv_len), q_pad, kv_pad)
         base_any, base_all = _tiles_any_all(base, n_q, n_kv)
         pos = None
 
@@ -305,7 +313,7 @@ def minimax_m3_flex_eligible(module, query, key, attention_mask, kwargs):
         return False
     if module.training and module.attention_dropout:
         return False
-    if attention_mask is not None and (attention_mask.dim() != 4 or attention_mask.shape[1] != 1):
+    if attention_mask is not None and not _mask_fits(attention_mask, query.shape[0], query.shape[2], key.shape[2]):
         return False
     if not sparse_flex_device_ok(query):
         return False
@@ -329,7 +337,7 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
     k_t = k.transpose(-1, -2).float().unsqueeze(1)  # [B, 1, D, T]
     weights = indexer.weights_proj(hidden_states.to(indexer.weights_proj.weight.dtype)).float() * (indexer.n_heads ** -0.5)
     topk = min(indexer.index_topk, k.shape[1])
-    attention_mask = _expand_queries(attention_mask, seq_len)
+    attention_mask = _broadcast_mask(attention_mask, batch_size, seq_len, k.shape[1])
     out = []
     for start, end in _q_ranges(seq_len, batch_size * indexer.n_heads * k.shape[1]):
         scores = torch.matmul(q[:, start:end].float(), k_t) * indexer.softmax_scale
@@ -365,7 +373,7 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling,
         q_pad, kv_pad = n_q * _TILE, n_kv * _TILE
         keep = torch.zeros(batch, q_pad, kv_pad, dtype = torch.bool, device = query.device)
         keep[:, :q_len].scatter_(-1, topk_indices.long(), True)
-        mask = _expand_queries(attention_mask, q_len)
+        mask = _broadcast_mask(attention_mask, batch, q_len, kv_len)
         base = _base_keep(mask, q_pad, kv_pad, additive = True)[:, 0]
         keep &= base
         any_tiles, all_tiles = _tiles_any_all(keep, n_q, n_kv)
@@ -408,7 +416,7 @@ def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_key
         return False
     if module.training and module.attention_dropout:
         return False
-    if attention_mask is None or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
+    if attention_mask is None or not _mask_fits(attention_mask, query.shape[0], query.shape[2], key.shape[2]):
         return False
     if not sparse_flex_device_ok(query):
         return False
