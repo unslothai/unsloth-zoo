@@ -54,6 +54,23 @@ def test_launch_info_needs_every_torchrun_variable():
         assert vu._torchrun_launch_info({**_TORCHRUN_ENV, **bad}) is None, bad
 
 
+def test_target_device_is_device_0_outside_torchrun(monkeypatch):
+    """A single process keeps vLLM's own executor, which takes local device 0 whatever is current:
+    a mixed-GPU host with set_device(1) must judge and place the engine on device 0. Under torchrun
+    each rank's external_launcher engine runs on its own current device."""
+    for key in vu._TORCHRUN_ENV_KEYS + ("TORCHELASTIC_RUN_ID",):
+        monkeypatch.delenv(key, raising = False)
+    monkeypatch.setattr(vu, "_current_device_index", lambda: 1)
+    assert vu.get_target_device().index == 0
+    assert vu.get_target_device(3).index == 3
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    assert vu.get_target_device().index == 1
+
+
 def test_process_group_timeout_env(monkeypatch):
     monkeypatch.delenv("UNSLOTH_DDP_TIMEOUT", raising = False)
     assert vu._process_group_timeout() == 1800
