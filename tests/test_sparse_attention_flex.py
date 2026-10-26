@@ -648,3 +648,25 @@ def test_dsa_flex_keeps_finite_mask_biases_in_float32():
     assert _rel(got, ref) < 1e-4, _rel(got, ref)
     for name, a, b in zip("qkv", got_g, ref_g):
         assert _rel(a, b) < 1e-3, (name, _rel(a, b))
+
+
+@needs_models
+@gpu
+@pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
+def test_config_output_attentions_keeps_the_model_path(family):
+    """transformers records attention weights when config.output_attentions is set, without the kwarg."""
+    import types
+    q = torch.randn(1, 4, 512, 64, device = "cuda", dtype = torch.bfloat16)
+    config = types.SimpleNamespace(_attn_implementation = "sdpa", index_topk = 64, output_attentions = True)
+    if family == "minimax_m3_vl":
+        module = types.SimpleNamespace(config = config, training = False, attention_dropout = 0.0,
+                                       indexer = types.SimpleNamespace(topk_blocks = 2, block_size = 128))
+        assert not sb.minimax_m3_flex_eligible(module, q, q, None, {})
+        config.output_attentions = False
+        assert sb.minimax_m3_flex_eligible(module, q, q, None, {})
+    else:
+        module = types.SimpleNamespace(config = config, training = False, attention_dropout = 0.0)
+        mask = torch.zeros(1, 1, 512, 512, device = "cuda", dtype = torch.bfloat16)
+        assert not sb.dsa_flex_eligible(module, q, q, q, mask, {}, None)
+        config.output_attentions = False
+        assert sb.dsa_flex_eligible(module, q, q, q, mask, {}, None)

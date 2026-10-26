@@ -56,6 +56,14 @@ def _q_ranges(q_len, per_row):
     return [(start, min(start + chunk, q_len)) for start in range(0, q_len, chunk)]
 
 
+def _wants_attentions(module, kwargs):
+    """output_attentions from the call, else the config (transformers records weights for either)."""
+    wanted = kwargs.get("output_attentions")
+    if wanted is None:
+        wanted = getattr(getattr(module, "config", None), "output_attentions", False)
+    return bool(wanted)
+
+
 def _eager_only(name):
     # Built inside an enclosing compiled graph, the BlockMask tables and the flex call miscompile
     # (MiniMax: output 95% off, silently). The patched forwards keep the model's own path there.
@@ -298,7 +306,7 @@ def minimax_m3_flex_eligible(module, query, key, attention_mask, kwargs):
         return False
     if key.shape[2] <= indexer.topk_blocks * indexer.block_size or query.shape[2] < 16:
         return False
-    if indexer.block_size % _TILE or kwargs.get("output_attentions") or torch.compiler.is_compiling():
+    if indexer.block_size % _TILE or _wants_attentions(module, kwargs) or torch.compiler.is_compiling():
         return False
     if module.training and module.attention_dropout:
         return False
@@ -395,7 +403,7 @@ def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_key
     if module.config._attn_implementation not in ("eager", "sdpa"):
         return False
     budget = int(module.config.index_topk)
-    if key.shape[2] <= budget or query.shape[2] < 16 or kwargs.get("output_attentions"):
+    if key.shape[2] <= budget or query.shape[2] < 16 or _wants_attentions(module, kwargs):
         return False
     if torch.compiler.is_compiling():
         return False
