@@ -102,10 +102,24 @@ def _virtual_kv_heads(query, key, value):
     return key.repeat_interleave(rep, dim = 1), value.repeat_interleave(rep, dim = 1)
 
 
+_DYNAMIC_FLEX = None
+
+
+def _dynamic_flex():
+    """flex_attention compiled with dynamic=True. Under the shared dynamic=None compile, automatic dynamic
+    relaxes one length-dependent input per recompile (key length, padded tiles, tile counts, the mask_mod
+    tables), so a run over varying lengths built 4-5 graphs; here batch 1 vs > 1 are the only two."""
+    global _DYNAMIC_FLEX
+    if _DYNAMIC_FLEX is None:
+        from ..flex_attention import utils
+        from ..temporary_patches.common import _torch_compile
+        _DYNAMIC_FLEX = _torch_compile(utils._flex_attention, dynamic = True)
+    return _DYNAMIC_FLEX
+
+
 def _flex(query, key, value, block_mask, scale):
-    from ..flex_attention.utils import flex_attention
     key, value = _virtual_kv_heads(query, key, value)
-    return flex_attention(
+    return _dynamic_flex()(
         query, key, value, block_mask = block_mask, scale = scale,
         enable_gqa = query.shape[1] != key.shape[1],
     )
@@ -214,12 +228,15 @@ def minimax_m3_flex_attention(query, key, value, block_indices, attention_mask, 
     safe = block_indices.masked_fill(block_indices < 0, num_key_blocks).long()
     sel = torch.zeros(batch, n_idx, q_pad, num_key_blocks + 1, dtype = torch.bool, device = query.device)
     sel[:, :, :q_len].scatter_(-1, safe, True)
-    sel_tiles = sel[..., :num_key_blocks].repeat_interleave(per_block, dim = -1)[..., :n_kv]
+    # Spare column dropped before the mask_mod captures it: its static width cost a recompile.
+    sel = sel[..., :num_key_blocks].contiguous()
+    sel_tiles = sel.repeat_interleave(per_block, dim = -1)[..., :n_kv]
     sel_tiles = sel_tiles.view(batch, n_idx, n_q, _TILE, n_kv)
     sel_any, sel_all = sel_tiles.any(dim = 3), sel_tiles.all(dim = 3)
 
     if attention_mask is None:
-        pos = _pad_to(position_ids.to(torch.int64), 1, q_pad, -1)  # padded rows keep nothing
+        # Contiguous: an expanded position_ids (stride 0) recompiled on its stride guard.
+        pos = _pad_to(position_ids.to(torch.int64), 1, q_pad, -1).contiguous()  # padded rows keep nothing
         pos_t = pos.view(batch, n_q, _TILE)
         q_max, q_min = pos_t.max(dim = -1).values, pos_t.min(dim = -1).values
         tile_start = torch.arange(n_kv, device = query.device) * _TILE

@@ -434,3 +434,81 @@ def test_skip_and_flex_compose(order, family):
     env = {k: v for k, v in os.environ.items() if not k.startswith("UNSLOTH_SPARSE_")}
     proc = subprocess.run([sys.executable, worker, order, family], capture_output = True, text = True, env = env, timeout = 600)
     assert "COMPOSE_OK" in proc.stdout, proc.stdout[-3000:] + proc.stderr[-3000:]
+
+
+@needs_models
+@gpu
+@pytest.mark.parametrize("family", ["minimax_m3_vl", "glm_moe_dsa"])
+def test_flex_graphs_stay_bounded_over_lengths(family):
+    """Varying lengths (incl. non multiples of 128) and batch 1 / 2, fwd + bwd: two graphs (batch 1 vs > 1),
+    none added per new length."""
+    import torch._dynamo
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    dt = torch.bfloat16
+
+    def call(S, B):
+        if family == "minimax_m3_vl":
+            nb = -(-S // 128)
+            causal = torch.arange(nb, device = "cuda") > (torch.arange(S, device = "cuda") // 128)[:, None]
+            v, blocks = torch.rand(B, 2, S, nb, device = "cuda").masked_fill(causal, float("-inf")).topk(2, -1)
+            blocks = blocks.masked_fill(v == float("-inf"), -1)
+            pos = torch.arange(S, device = "cuda")[None].expand(B, -1)
+            q = torch.randn(B, 8, S, 64, device = "cuda", dtype = dt, requires_grad = True)
+            k = torch.randn(B, 2, S, 64, device = "cuda", dtype = dt, requires_grad = True)
+            out = sb.minimax_m3_flex_attention(q, k, k, blocks, None, pos, 0.125, 128)
+        else:
+            q = torch.randn(B, 4, S, 64, device = "cuda", dtype = dt, requires_grad = True)
+            k = torch.randn(B, 4, S, 64, device = "cuda", dtype = dt, requires_grad = True)
+            keep = torch.ones(S, S, dtype = torch.bool, device = "cuda").tril()[None, None].expand(B, 1, S, S)
+            topk = torch.randn(B, S, S, device = "cuda").masked_fill(~keep[:, 0], float("-inf")).topk(64, -1).indices.int()
+            out = sb.dsa_flex_attention(q, k, k, topk, keep, 0.125, family)
+        out.float().sum().backward()
+
+    for B in (1, 2):
+        for S in (300, 384, 513, 777):
+            call(S, B)
+    graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    for S in (260, 640, 1000, 1025):
+        call(S, 2)
+        call(S, 1)
+    assert graphs <= 2, graphs
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
+
+
+def _packed_logits(model, ids, pos, docs, packed):
+    pieces = [(0, ids.shape[1])] if packed else [(sum(docs[:i]), sum(docs[: i + 1])) for i in range(len(docs))]
+    out = []
+    for a, b in pieces:
+        with torch.no_grad():
+            out.append(model(input_ids = ids[:, a:b], position_ids = pos[:, a:b] if packed else None, use_cache = False).logits.float())
+    return torch.cat(out, 1)
+
+
+@needs_models
+@gpu
+@pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32", "glm_moe_dsa"])
+def test_packed_sequences(monkeypatch, family):
+    """Padding-free packing (position_ids reset per document, no attention_mask): transformers builds a
+    block-diagonal mask. DSA keeps documents apart, so packed flex must match each document run alone.
+    MiniMax's indexer anchors blocks to absolute key slots and mixes documents upstream: flex must match
+    upstream's packed result instead."""
+    _patched()
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS", "65")
+    if family == "minimax_m3_vl":
+        config = _minimax_config(num_attention_heads = 8, num_key_value_heads = 2, head_dim = 64, hidden_size = 128)
+        docs = [400, 150, 333]
+    else:
+        config = _dsa_config(family, qk_nope_head_dim = 32, qk_rope_head_dim = 32, v_head_dim = 64)
+        docs = [150, 40, 120]
+    model = _model(family, config)
+    ids = torch.randint(0, config.vocab_size, (1, sum(docs)), device = "cuda")
+    pos = torch.cat([torch.arange(n, device = "cuda") for n in docs])[None]
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0")
+    upstream = _packed_logits(model, ids, pos, docs, packed = family == "minimax_m3_vl")
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1")
+    before = _stat("flex", family)
+    got = _packed_logits(model, ids, pos, docs, packed = True)
+    assert _stat("flex", family) >= before + 2, sparse_gates.SPARSE_ATTN_STATS
+    err = ((got - upstream).norm() / upstream.norm()).item()
+    assert err < 3e-2, err
