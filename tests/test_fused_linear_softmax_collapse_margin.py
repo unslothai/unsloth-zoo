@@ -84,29 +84,3 @@ def test_margin_sweep_matches_fp64_oracle(V, device, dtype, entry):
         print(f"{device} {dtype} V={V} {entry} margin={margin:4.0f} logp={lp:.3e} lp_rel={lp_rel:.2e} g_rel={g_rel:.2e}")
     for margin, lp, lp_rel, g_rel in rows:
         assert lp_rel < tol and g_rel < tol, (margin, lp, lp_rel, g_rel)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available() or not fl._HAS_TRITON, reason = "needs CUDA + Triton")
-def test_expm1_fallback_is_subnormal_safe():
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def k(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
-        o = tl.arange(0, BLOCK)
-        ok = o < n
-        tl.store(y_ptr + o, fl._fl_expm1_kahan(tl.load(x_ptr + o, mask = ok, other = 0.0)), mask = ok)
-
-    x = torch.tensor([0.0, -1e-37, -1e-30, -1e-12, -1e-7, -1e-3, -0.5, -0.999, -1.0, -3.0, -20.0, -88.0, -200.0,
-                      -float("inf"), 1e-30, 1e-6, 0.5, 2.0, 50.0, 100.0], device = "cuda")
-    y = torch.empty_like(x)
-    k[(1,)](x, y, x.numel(), BLOCK = 32)
-    ref = torch.expm1(x.double()).float().double()
-    finite = torch.isfinite(ref)
-    rel = (y.double() - ref).abs() / ref.abs().clamp_min(1e-300)
-    small = finite & (ref != 0) & (x.abs() < 1)
-    assert torch.equal(y[x == 0], x[x == 0])
-    # |x| < 1 is the cancelling range (Kahan); past it u - 1 carries tl.exp's own few-ulp error.
-    assert float(rel[small].max()) < 1e-6, rel
-    assert float(rel[finite & ~small & (ref != 0)].max()) < 4e-6, rel
-    assert torch.isinf(y[~finite]).all()

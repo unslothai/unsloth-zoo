@@ -229,16 +229,6 @@ def _addmm_fp32(acc, a, b):
 
 if _HAS_TRITON:
 
-    @triton.jit
-    def _fl_expm1_kahan(x):
-        # (u - 1) x / log u only where u - 1 cancels (|x| < 1; u == 1 gives x, so log p_t ~ -1e-30 keeps 1 - p_t);
-        # plain u - 1 elsewhere (u = inf or 0 would turn the ratio into NaN). Both branches run: log never sees 1, 0.
-        u = tl.exp(x)
-        um1 = u - 1.0
-        small = (tl.abs(x) < 1.0) & (u != 1.0)
-        kahan = um1 * (x / tl.log(tl.where(small, u, 2.0)))
-        return tl.where(u == 1.0, x, tl.where(small, kahan, um1))
-
     try:
         # 2 sigmoid(2u) - 1 cancels for small u.
         from triton.language.extra import libdevice as _libdevice
@@ -262,7 +252,9 @@ if _HAS_TRITON:
         # Kahan's forms: exact to an ulp for tiny x with tl.exp / tl.log only.
         @triton.jit
         def _fl_expm1(x):
-            return _fl_expm1_kahan(x)
+            u = tl.exp(x)
+            um1 = u - 1.0
+            return tl.where(u == 1.0, x, tl.where(um1 == -1.0, -1.0, um1 * (x / tl.log(tl.where(u == 1.0, 2.0, u)))))
 
         @triton.jit
         def _fl_log1p(x):
