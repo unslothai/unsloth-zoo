@@ -373,17 +373,14 @@ def test_dsa_cache_layout_matches_installed_source():
     assert s._DSA_LATENT_CACHE["deepseek_v32"] == (s._DSA_CACHE_LATENT in source)
 
 
-def test_cudnn_probe_routes_dsa_to_dense(monkeypatch):
+def test_dsa_flex_engages_above_the_budget(monkeypatch):
     from types import SimpleNamespace
     q = torch.randn(1, 4, 32, 16)
     mod = SimpleNamespace(config = SimpleNamespace(_attn_implementation = "sdpa", index_topk = 8), training = False, attention_dropout = 0.0)
     mask = torch.ones(1, 1, 32, 32, dtype = torch.bool)
     monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda query: True)
-    monkeypatch.setattr(sb, "masked_sdpa_picks_cudnn", lambda *a: True)
-    assert not sb.dsa_flex_eligible(mod, q, q, q, mask, {}, None)
-    assert sb.dsa_flex_eligible(mod, q, q, q, mask, {}, 16)  # the override forces flex
-    monkeypatch.setattr(sb, "masked_sdpa_picks_cudnn", lambda *a: False)
     assert sb.dsa_flex_eligible(mod, q, q, q, mask, {}, None)
+    assert not sb.dsa_flex_eligible(mod, q, q, q, mask, {}, 64)  # override above this key length
     k_short = torch.randn(1, 4, 8, 16)
     assert not sb.dsa_flex_eligible(mod, q, k_short, k_short, mask[..., :8], {}, None)  # within budget
 

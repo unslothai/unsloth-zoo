@@ -81,7 +81,7 @@ def _source_has(function, needles):
 
 
 def _dsa_min_keys():
-    """UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS override, else None (budget + cuDNN probe decide)."""
+    """UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS override, else None (flex from the budget)."""
     env = os.environ.get("UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS")
     if env:
         try:
