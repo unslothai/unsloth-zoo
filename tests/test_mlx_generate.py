@@ -1134,7 +1134,7 @@ def test_audio_requests_reach_the_fallback_through_the_public_entry_point(monkey
         _results(engine.stream_batch(model, object(), request))
     assert collected[0].filename == __file__
     # The at-most-one-media invariant has to survive audio becoming supported.
-    with pytest.raises(ValueError, match="both an image and audio"):
+    with pytest.raises(ValueError, match="audio with other media"):
         engine.generate_batch(model, object(),
                               [GenerationRequest(prompt="p", image=object(), audio="a.wav")])
 
@@ -1637,6 +1637,46 @@ def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
     assert adapter._group_key(rows[0]) != adapter._group_key(GenerationRequest(prompt = "ab"))
     inputs = _VLMBatchAdapter._prompt_inputs(adapter, rows)
     assert [inputs[k].tolist() for k in ("input_ids", "attention_mask")] == [[[1, 2], [3, 4]], [[1, 1]] * 2]
+
+
+def test_a_vision_row_s_clips_reach_the_processor_in_order_and_group_only_with_the_same_clips():
+    from dataclasses import replace
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _validate_vlm_requests
+    rows = _validate_vlm_requests([
+        GenerationRequest(prompt = "ab", videos = [pathlib.Path("a.mp4"), "b.mp4"], fps = 0.5),
+        GenerationRequest(prompt = "cd", videos = ["c.mp4"], fps = 0.5),
+    ], GenerationDefaults())
+    assert [row.videos for row in rows] == [("a.mp4", "b.mp4"), ("c.mp4",)]
+    with pytest.raises(ValueError, match = "text models accept text prompts only"):
+        _validate_text_requests([GenerationRequest(prompt = "p", videos = ["a.mp4"])], GenerationDefaults())
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.processor, adapter.batches_observable = types.SimpleNamespace(tokenizer = _CharTokenizer()), True
+    adapter.model, adapter._add_special_tokens = None, lambda: False
+    seen = []
+    adapter.prepare_inputs = lambda processor, **k: seen.append(k) or {}
+    _VLMBatchAdapter._prompt_inputs(adapter, rows)
+    _VLMBatchAdapter._prompt_inputs(adapter, [replace(rows[1], fps = None)])
+    _VLMBatchAdapter._prompt_inputs(adapter, [GenerationRequest(prompt = "ab")])
+    assert (seen[0]["videos"], seen[0]["fps"]) == (["a.mp4", "b.mp4", "c.mp4"], 0.5)
+    assert (seen[1]["videos"], "fps" in seen[1]) == (["c.mp4"], False)
+    assert not {"videos", "fps"} & set(seen[2])
+    key = adapter._group_key
+    assert key(rows[0]) == key(replace(rows[0], prompt = "xy"))
+    for other in (replace(rows[0], videos = ("a.mp4", "c.mp4")), replace(rows[0], fps = 1.0),
+                  GenerationRequest(prompt = "ab")):
+        assert key(rows[0]) != key(other)
+
+
+@pytest.mark.parametrize("request_, error, match", [
+    (GenerationRequest(prompt_token_ids = (1,), videos = ["a.mp4"]), ValueError, "token ids with media"),
+    (GenerationRequest(prompt = "p", videos = ["a.mp4"], audio = "a.wav"), ValueError, "audio with other media"),
+    (GenerationRequest(prompt = "p", videos = "a.mp4"), TypeError, "sequence of clip paths"),
+    (GenerationRequest(prompt = "p", videos = ["a.mp4"], fps = 0), ValueError, "fps must be positive"),
+])
+def test_a_vision_row_s_clips_are_refused_where_no_batch_can_read_them(request_, error, match):
+    from unsloth_zoo.mlx.generate import _validate_vlm_requests
+    with pytest.raises(error, match = match):
+        _validate_vlm_requests([request_], GenerationDefaults())
 
 
 def test_a_processor_is_shown_its_own_row_s_history_from_its_own_offset():
