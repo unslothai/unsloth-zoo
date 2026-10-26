@@ -219,7 +219,7 @@ def test_compiles_without_graph_breaks():
 
 @pytest.mark.parametrize("temperature", [None, 1.0, 0.9])
 def test_compiles_dynamic_fullgraph(temperature):
-    """dynamic = True turns temperature into a SymFloat; its validation must not break the graph (torch >= 2.10)."""
+    """dynamic = True makes temperature a SymFloat; validating it must not break the graph."""
     kw = {} if temperature is None else {"temperature": temperature}
 
     def f(h, w, t, wt, labels):
@@ -351,8 +351,7 @@ def test_bf16_error_not_worse_than_trl_bf16(beta, temperature, compiled, monkeyp
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason = "two CUDA devices")
 @pytest.mark.parametrize("teacher_device", ["cuda:1", "cuda:0"])
 def test_triton_runs_on_the_operand_device_not_the_current_one(teacher_device):
-    """Student head on cuda:1 while cuda:0 is current: the Triton body must launch there, not fall back to eager
-    and mark cuda:1 broken for every fused-linear kernel."""
+    """Student head on cuda:1 while cuda:0 is current: Triton must launch there, not fall back to eager."""
     import warnings
     dev = torch.device("cuda:1")
     if not fl._use_triton(dev):

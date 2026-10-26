@@ -2043,8 +2043,7 @@ _JSD_TRITON_ROWS = os.environ.get("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB") is None
 
 def _jsd_triton(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
     """_jsd_body on CUDA with Triton: two (beta = 0) or three passes over the raw fp32 logits, dz written once."""
-    # Triton launches on the current device and stream: a head on another card than the current one would
-    # be refused there and, through the fallback, mark that card broken for every fused-linear kernel.
+    # Triton launches on the current device: else a head on another card falls back and marks it broken.
     return _launch(s.device, lambda: _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap,
                                                          want_grad, grad_dtype))
 
@@ -2436,18 +2435,16 @@ def fused_linear_jsd(
     beta 0 is forward KL(teacher || student), 1 reverse KL, else the generalized JSD with mixture
     ``(1 - beta) p_student + beta p_teacher``. Rows are kept where ``mask`` is non zero and ``labels != ignore_index``
     (either may be omitted). The sum is divided by ``num_items_in_batch`` when given (TRL >= 1.x), else by the kept
-    row count (``reduction = "batchmean"``); a zero divisor counts as 1. Without labels, mask or count TRL differs by
-    release on 3D logits (0.x divides by batch * sequence like here, 1.x by batch size): pass ``num_items_in_batch``
-    to pin one. The transform is ``* logit_scale`` then
-    softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
+    row count (``reduction = "batchmean"``); a zero divisor counts as 1. With neither labels, mask nor count, TRL 0.x
+    divides 3D logits by batch * sequence (as here), 1.x by batch: pass ``num_items_in_batch`` to pin one. The
+    transform is ``* logit_scale`` then softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
     taken in forward; teacher inputs are never differentiated and may have their own hidden size and device.
     ``scaling`` (fp16 GradScaler) multiplies stored gradients; backward divides it out."""
     beta = float(beta)
     temperature = float(temperature)
     if not 0.0 <= beta <= 1.0:
         raise ValueError(f"Unsloth: GKD beta must be in [0, 1], got {beta}.")
-    # Comparisons, not math.isfinite: under torch.compile(dynamic = True) temperature is a SymFloat and
-    # math.isfinite on it breaks the graph. NaN fails both comparisons, inf fails the upper one.
+    # Not math.isfinite: it graph-breaks on a SymFloat (dynamic = True); NaN / inf fail these comparisons.
     if not (0.0 < temperature < math.inf):
         raise ValueError(f"Unsloth: GKD temperature must be finite and > 0, got {temperature}.")
     if teacher_weight.shape[0] != student_weight.shape[0]:
