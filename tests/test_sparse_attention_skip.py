@@ -22,7 +22,6 @@ skip; above it the reference indexer runs. A short prefill followed by decoding 
 must reproduce upstream's tokens, logits and indexer cache.
 """
 
-import copy
 import importlib.util
 
 import pytest
