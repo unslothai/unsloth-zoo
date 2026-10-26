@@ -26,7 +26,6 @@ class _Cfg:
 
 
 class _FP8Linear(nn.Module):
-    # transformers' FP8Linear layout: an fp8 weight next to its block scale.
     def __init__(self, scale_name):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(256, 256).to(torch.float8_e4m3fn), requires_grad = False)
@@ -76,7 +75,6 @@ def test_full_finetuning_refuses_scaled_fp8_expert_stack():
 
 
 def test_unscaled_fp8_weight_is_still_cast():
-    # No scale to lose: the old cast stays.
     model = _Model(_FP8Linear(None))
     _prepare(model)
     assert model.layers[0].proj.weight.dtype == torch.bfloat16
@@ -89,7 +87,7 @@ def test_lora_leaves_frozen_scaled_fp8_weight_alone():
 
 
 def test_full_finetuning_refuses_real_transformers_fp8_layers():
-    # Drift guard: the scale attribute names come from the installed transformers, not this file.
+    # Drift guard: scale attribute names come from installed transformers.
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     model = _Model(fp8.FP8Linear(256, 256, block_size = (128, 128)))
     with pytest.raises(RuntimeError, match = "drop its scale"):

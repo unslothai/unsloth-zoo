@@ -332,8 +332,7 @@ _FP8_PARAM_DTYPES = tuple(
 
 
 def _refuse_scaled_fp8_cast(model, name, param):
-    """Casting a block / per-tensor scaled FP8 weight to the training dtype drops its scale, so the
-    trained weight is wrong by the scale. Refuse instead: the loader must dequantize it first."""
+    """Casting a scaled FP8 weight drops its scale; the loader must dequantize it first."""
     if param.dtype not in _FP8_PARAM_DTYPES:
         return
     prefix, _, leaf = name.rpartition(".")
