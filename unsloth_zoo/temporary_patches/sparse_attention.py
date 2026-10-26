@@ -74,9 +74,7 @@ def _source(function):
         return ""
 
 
-# ---------------------------------------------------------------------------------------------
 # DeepSeek-V3.2 / GLM-MoE-DSA token indexer
-# ---------------------------------------------------------------------------------------------
 _DSA_TOPK_SOURCE = "topk = min(self.index_topk, index_scores.shape[-1])"
 _DSA_KEY_SOURCE = (
     "k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)",
@@ -130,7 +128,6 @@ def deepseek_v32_indexer_forward(self, hidden_states, q_resid, position_embeddin
 
 def glm_moe_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask,
                                 position_ids=None, past_key_values=None):
-    # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _dsa_indexer_forward
     with torch.no_grad():
         return _dsa_indexer_forward(
@@ -178,9 +175,7 @@ def patch_glm_moe_dsa_sparse_skip():
     )
 
 
-# ---------------------------------------------------------------------------------------------
 # MiniMax-M3 block indexer
-# ---------------------------------------------------------------------------------------------
 _MINIMAX_ROPE = {}
 _MINIMAX_SOURCE = (
     "idx_k = self.k_proj(hidden_states).view(batch, q_len, 1, self.head_dim)",
@@ -240,7 +235,6 @@ def _minimax_indexer_forward(self, hidden_states, position_embeddings, past_key_
 
 
 def minimax_m3_indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids):
-    # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _minimax_indexer_forward
     with torch.no_grad():
         return _minimax_indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids)
@@ -272,9 +266,7 @@ def patch_minimax_m3_sparse_skip():
         logger.info("Unsloth: MiniMaxM3VLIndexer skips scoring when top-k keeps every block.")
 
 
-# ---------------------------------------------------------------------------------------------
 # DeepSeek-V4 CSA indexer
-# ---------------------------------------------------------------------------------------------
 _V4_SOURCE = (
     "index_scores = self.scorer(q, compressed_kv, hidden_states)",
     "top_k = min(self.index_topk, compressed_len)",
@@ -290,7 +282,6 @@ def _deepseek_v4_indexer_forward(self, hidden_states, q_residual, position_ids, 
 
 
 def deepseek_v4_indexer_forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx):
-    # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _deepseek_v4_indexer_forward
     with torch.no_grad():
         return _deepseek_v4_indexer_forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx)
@@ -309,7 +300,6 @@ def _deepseek_v4_scorer_forward(self, q, compressed_kv, hidden_states):
 
 
 def deepseek_v4_indexer_scorer_forward(self, q, compressed_kv, hidden_states):
-    # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _deepseek_v4_scorer_forward
     return _deepseek_v4_scorer_forward(self, q, compressed_kv, hidden_states)
 
