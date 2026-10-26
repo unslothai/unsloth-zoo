@@ -42,11 +42,12 @@ def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     # log_softmax(x)[i] = -softplus(logsumexp_{j != i}(x_j - x_i)): x_i - logsumexp(x) rounds to 0 for a
     # confident token and drops its gradient (softmax collapse, arXiv 2610.31642).
-    selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1))
-    others = (logits - selected_logits).masked_fill(
-        torch.arange(logits.shape[-1], device = logits.device) == index.unsqueeze(-1), torch.finfo(logits.dtype).min,
+    selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
+    # Mask the raw logits, not logits - selected: the backward then recomputes from the saved logits.
+    others = torch.where(
+        torch.arange(logits.shape[-1], device = logits.device) == index.unsqueeze(-1), torch.finfo(logits.dtype).min, logits,
     )
-    per_token_logps = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1))
+    per_token_logps = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1) - selected_logits)
     return per_token_logps
 pass
 
@@ -166,12 +167,13 @@ def chunked_selective_log_softmax(
             ))
             continue
         # Target excluded from the normaliser: x_i - logsumexp(x) drops confident tokens (softmax collapse).
-        selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1))
-        others = (chunk_logits - selected_logits).masked_fill(
+        selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
+        others = torch.where(
             torch.arange(chunk_logits.shape[-1], device = chunk_logits.device) == chunk_index.unsqueeze(-1),
             torch.finfo(chunk_logits.dtype).min,
+            chunk_logits,
         )
-        per_token_logps = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1))
+        per_token_logps = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1) - selected_logits)
         all_per_token_logps.append(per_token_logps)
     pass
     all_per_token_logps = torch.concat(all_per_token_logps)
@@ -323,12 +325,13 @@ def chunked_hidden_states_selective_log_softmax(
             )
         else:
             # Target excluded from the normaliser: x_i - logsumexp(x) drops confident tokens (softmax collapse).
-            selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1))
-            others = (chunk_logits - selected_logits).masked_fill(
+            selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
+            others = torch.where(
                 torch.arange(chunk_logits.shape[-1], device = chunk_logits.device) == chunk_index.unsqueeze(-1),
                 torch.finfo(chunk_logits.dtype).min,
+                chunk_logits,
             )
-            per_token_logps = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1))
+            per_token_logps = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1) - selected_logits)
         # Return to the caller's device so the concatenation below and every
         # downstream consumer see the device they started on.
         all_per_token_logps.append(per_token_logps.to(hidden_states.device))
@@ -398,13 +401,13 @@ def chunked_hidden_states_selective_log_softmax_recompute(
             if temperature != 1.0:
                 logits = logits / temperature
             # Target excluded from the normaliser (softmax collapse); plain logsumexp = selected - logp.
-            selected = torch.gather(logits, dim = -1, index = index.unsqueeze(-1))
-            others = (logits - selected).masked_fill(
+            selected = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
+            others = torch.where(
                 torch.arange(logits.shape[-1], device = logits.device) == index.unsqueeze(-1),
                 torch.finfo(logits.dtype).min,
+                logits,
             )
-            logp = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1))
-            selected = selected.squeeze(-1)
+            logp = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1) - selected)
             logsumexp = selected - logp
             if with_entropy:
                 # -sum(p * log p) on log p = z - logsumexp: logsumexp - sum(p * z) cancels badly.

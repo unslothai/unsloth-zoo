@@ -429,3 +429,15 @@ def test_count_kwargs_read_a_module_loss_forward():
     assert unsloth_loss_count_kwargs(Strict(), count) == {}
     assert unsloth_loss_count_kwargs(positional_only, count) == {}
     assert unsloth_loss_count_kwargs(Counted(), count) == {"num_items_in_batch": count}
+
+
+def test_mean_under_autocast_matches_stock_dtype_and_scaled_backward():
+    # Stock cross_entropy runs in float32 under autocast; a half mean would overflow GradScaler's 65536.
+    logits = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype = torch.bfloat16, requires_grad = True)
+    labels = torch.tensor([0, 1])
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        got = unsloth_count_aware_cross_entropy(logits[None], labels[None], shift = False)
+        ref = torch.nn.functional.cross_entropy(logits, labels)
+    assert got.dtype == ref.dtype == torch.float32
+    (got * 65536.0).backward()
+    assert torch.isfinite(logits.grad).all()

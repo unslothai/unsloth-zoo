@@ -91,6 +91,70 @@ def _row_chunks(n_rows, vocab_size):
     return max(1, min(n_rows, _ROWS_CHUNK_BYTES // max(4 * vocab_size, 1)))
 
 
+def _rows_forward(chunk, target):
+    z = chunk.float()
+    index = target.unsqueeze(-1)
+    z_t = z.gather(-1, index).squeeze(-1)
+    others = torch.where(torch.arange(z.shape[-1], device = z.device) == index, torch.finfo(z.dtype).min, z)
+    logp = -_softplus(torch.logsumexp(others, -1) - z_t)
+    return logp, z_t - logp
+
+
+def _rows_backward(chunk, target, logp, lse, grad_nll):
+    # d nll / dz = p - onehot, with p_t - 1 = expm1(logp) for the target.
+    z = chunk.float()
+    p = torch.exp(z - lse.unsqueeze(-1))
+    is_target = torch.arange(z.shape[-1], device = z.device) == target.unsqueeze(-1)
+    return (torch.where(is_target, torch.expm1(logp).unsqueeze(-1), p) * grad_nll.float().unsqueeze(-1)).to(chunk.dtype)
+
+
+@torch.no_grad()
+def _rows_forward_eager(chunk, target):
+    return target_logprob_(chunk.to(torch.float32, copy = True), target)
+
+
+def _rows_backward_eager(chunk, target, logp, lse, grad_nll):
+    p = torch.exp(chunk.to(torch.float32) - lse.unsqueeze(-1))
+    p.scatter_(-1, target.unsqueeze(-1), torch.expm1(logp).unsqueeze(-1))
+    return p.mul_(grad_nll.to(torch.float32).unsqueeze(-1))
+
+
+_COMPILED_ROWS = {}
+
+
+def _rows_impl(logits):
+    """(forward, backward) per chunk: one fused Inductor kernel each on GPUs (eager here reads the chunk ~6
+    times, 1.9x stock's time on an A100), the in place eager pair elsewhere or when compiling fails."""
+    if torch.compiler.is_compiling():
+        return _rows_forward, _rows_backward
+    if logits.device.type not in ("cuda", "xpu") or _COMPILED_ROWS.get("failed") or _compile_disabled():
+        return _rows_forward_eager, _rows_backward_eager
+    if not _COMPILED_ROWS:
+        from unsloth_zoo.temporary_patches.common import torch_compile_options
+        _COMPILED_ROWS.update({
+            name: torch.compile(fn, dynamic = True, fullgraph = True, options = torch_compile_options)
+            for name, fn in (("forward", _rows_forward), ("backward", _rows_backward))
+        })
+    return _COMPILED_ROWS["forward"], _COMPILED_ROWS["backward"]
+
+
+def _compile_disabled():
+    from unsloth_zoo.temporary_patches.common import UNSLOTH_COMPILE_DISABLE
+    return bool(UNSLOTH_COMPILE_DISABLE)
+
+
+def _run_rows(step, eager_step, *args):
+    try:
+        return step(*args)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception:
+        if step is eager_step or torch.compiler.is_compiling():
+            raise
+        _COMPILED_ROWS["failed"] = True  # no Triton / compiler on this host: stay eager from now on
+        return eager_step(*args)
+
+
 class _CrossEntropyRows(torch.autograd.Function):
     """Saves the logits and two row vectors; stock F.cross_entropy saves a same sized log_softmax."""
 
@@ -98,12 +162,13 @@ class _CrossEntropyRows(torch.autograd.Function):
     def forward(ctx, logits, target):
         n_rows, vocab_size = logits.shape
         rows = _row_chunks(n_rows, vocab_size)
+        forward, _ = _rows_impl(logits)
         logp = torch.empty(n_rows, dtype = torch.float32, device = logits.device)
         lse = torch.empty(n_rows, dtype = torch.float32, device = logits.device)
         for start in range(0, n_rows, rows):
             end = min(start + rows, n_rows)
-            chunk = logits[start:end].to(torch.float32, copy = True)
-            logp[start:end], lse[start:end] = target_logprob_(chunk, target[start:end])
+            logp[start:end], lse[start:end] = _run_rows(
+                forward, _rows_forward_eager, logits[start:end], target[start:end])
         ctx.save_for_backward(logits, target, logp, lse)
         return -logp
 
@@ -112,12 +177,13 @@ class _CrossEntropyRows(torch.autograd.Function):
         logits, target, logp, lse = ctx.saved_tensors
         n_rows, vocab_size = logits.shape
         rows = _row_chunks(n_rows, vocab_size)
+        _, backward = _rows_impl(logits)
         grad = torch.empty_like(logits)
         for start in range(0, n_rows, rows):
             end = min(start + rows, n_rows)
-            p = torch.exp(logits[start:end].to(torch.float32) - lse[start:end].unsqueeze(-1))
-            p.scatter_(-1, target[start:end].unsqueeze(-1), torch.expm1(logp[start:end]).unsqueeze(-1))
-            grad[start:end] = p.mul_(grad_nll[start:end].to(torch.float32).unsqueeze(-1))
+            grad[start:end] = _run_rows(
+                backward, _rows_backward_eager,
+                logits[start:end], target[start:end], logp[start:end], lse[start:end], grad_nll[start:end])
         return grad, None
 
 

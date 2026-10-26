@@ -884,6 +884,13 @@ def unsloth_fused_ce_loss(
 pass
 
 
+def _autocast_enabled(device_type):
+    try:
+        return torch.is_autocast_enabled(device_type)
+    except TypeError:  # torch < 2.4 takes no device argument
+        return torch.is_autocast_cpu_enabled() if device_type == "cpu" else torch.is_autocast_enabled()
+
+
 def unsloth_count_aware_cross_entropy(
     logits,
     labels,
@@ -914,8 +921,10 @@ def unsloth_count_aware_cross_entropy(
     # float32 per token losses without a float32 copy of the logits (stock rounds each to the logits' dtype).
     nll = cross_entropy_rows(logits, labels, ignore_index = ignore_index)
     if n_items is None:
-        # The stock mean over labelled tokens, in the logits' dtype (NaN when every label is ignored).
-        return (nll.sum() / (labels != ignore_index).sum()).to(logits.dtype)
+        # The stock mean over labelled tokens (NaN when every label is ignored), in stock's dtype: autocast
+        # runs cross_entropy in float32, so a half mean there would overflow GradScaler's scaled gradient.
+        mean = nll.sum() / (labels != ignore_index).sum()
+        return mean if _autocast_enabled(logits.device.type) else mean.to(logits.dtype)
     loss = nll.sum()
     if torch.is_tensor(n_items):
         # A DataParallel replica gets a one-element slice of the repeated count: keep the loss 0-dim.
