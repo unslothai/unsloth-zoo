@@ -36,7 +36,7 @@ def _load(name):
 capture = _load("capture")
 
 QWEN3 = "trl-internal-testing/tiny-Qwen3ForCausalLM"
-QWEN35_VLM = "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration"
+QWEN35_VLM = "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-NoThink"
 QWEN35_TEXT = os.path.join(
     os.environ.get("WORKSPACE", ""), "temp", "tiny_cache", "Qwen3_5ForCausalLM-84305c791e79",
 )
