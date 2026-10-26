@@ -34,23 +34,22 @@ def _softplus(x):
     return torch.logaddexp(x, torch.zeros_like(x))
 
 
+def target_logprob(z, target):
+    """(log softmax(z)[..., target], logsumexp(z)), traceable. ``target`` must be a valid column of every row."""
+    # Raw logits masked and the target taken by a masked sum (not gather): the backward is elementwise and
+    # recomputes from z. finfo.min, not -inf, keeps a row whose only finite logit is the target NaN free.
+    is_target = torch.arange(z.shape[-1], device = z.device) == target.unsqueeze(-1)
+    z_t = torch.where(is_target, z, 0.0).sum(-1)
+    others = torch.where(is_target, torch.finfo(z.dtype).min, z)
+    logp = -_softplus(torch.logsumexp(others, -1) - z_t)
+    return logp, z_t - logp
+
+
 def _others_lse(s_others, m):
-    # Empty support (only the target kept) gives -inf without log(0) in the graph (NaN backward).
+    # An empty support (only the target kept) gives -inf.
     nonzero = s_others > 0
     safe = torch.where(nonzero, s_others, torch.ones_like(s_others))
     return torch.where(nonzero, m + torch.log(safe), torch.full_like(m, -float("inf")))
-
-
-def target_logprob(z, target):
-    """(log softmax(z)[..., target], logsumexp(z)), traceable. ``target`` must be a valid column of every row."""
-    m = z.detach().amax(-1, keepdim = True)
-    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
-    index = target.unsqueeze(-1)
-    z_t = z.gather(-1, index)
-    is_target = torch.arange(z.shape[-1], device = z.device) == index
-    s_others = torch.exp(z - m).masked_fill(is_target, 0.0).sum(-1, keepdim = True)
-    logp = -_softplus(_others_lse(s_others, m) - z_t)
-    return logp.squeeze(-1), (z_t - logp).squeeze(-1)
 
 
 @torch.no_grad()
@@ -92,12 +91,7 @@ def _row_chunks(n_rows, vocab_size):
 
 
 def _rows_forward(chunk, target):
-    z = chunk.float()
-    index = target.unsqueeze(-1)
-    z_t = z.gather(-1, index).squeeze(-1)
-    others = torch.where(torch.arange(z.shape[-1], device = z.device) == index, torch.finfo(z.dtype).min, z)
-    logp = -_softplus(torch.logsumexp(others, -1) - z_t)
-    return logp, z_t - logp
+    return target_logprob(chunk.float(), target)
 
 
 def _rows_backward(chunk, target, logp, lse, grad_nll):
