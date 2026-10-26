@@ -28,8 +28,7 @@ __all__ = [
     "reset_sparse_attn_stats",
 ]
 
-# {kind: {model_type: count}}; kind is e.g. "skip_full". Counts executed calls only:
-# updates are skipped while torch.compile traces, so a guard never sees a changing int.
+# {kind: {model_type: count}}; not updated while torch.compile traces (no guard on the int).
 SPARSE_ATTN_STATS = {}
 
 

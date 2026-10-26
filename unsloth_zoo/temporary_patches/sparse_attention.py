@@ -14,25 +14,12 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Skip sparse-attention indexers when their top-k keeps every key anyway.
+"""Skip sparse-attention indexers when top-k keeps every key anyway (exact).
 
-DeepSeek-V3.2 / GLM-MoE-DSA keep the top `index_topk` (2048) keys per query, MiniMax-M3 the top
-`index_topk_blocks` (16) key blocks, DeepSeek-V4's CSA the top `index_topk` (512) compressed
-entries. When the key count is within that budget top-k returns every key, so the selection is
-the causal / padding mask the model already has, and the indexer's multi-head fp32 scoring
-([B, S, 64, T] for DSA) is wasted. These patches return the same selection without scoring:
-
-* DSA: `arange(T)` indices; the attention builds the same (all-False) index mask.
-* MiniMax-M3: every block at or before the query's position block (exactly the blocks with a
-  non-future key, which top-k keeps in full), -1 for the rest, from `position_ids`, so left
-  padding and packed positions keep upstream's selection. `build_block_mask` is unchanged.
-* DeepSeek-V4: the scorer returns zeros, so top-k over all compressed entries is unchanged as a
-  set (future entries still become -1); the compressor and its cache run as before.
-
-With a cache the indexer's own key cache is still updated, so decoding past the budget later
-scores against the full history. Exact: same masks, same outputs and gradients.
-UNSLOTH_SPARSE_ATTN_SKIP_FULL=0 restores upstream. The MiniMax-M3 and DeepSeek-V4 indexers also
-run under `torch.no_grad()` like the DSA ones: they return integer indices only.
+Within the budget (DSA `index_topk`, MiniMax-M3 `index_topk_blocks`, DeepSeek-V4 CSA `index_topk`)
+top-k selects every visible key, so the indexer's fp32 multi-head scoring is wasted. The patched
+indexers return the same selection without scoring and still update their own key cache.
+UNSLOTH_SPARSE_ATTN_SKIP_FULL=0 restores upstream.
 """
 
 __all__ = [
@@ -50,8 +37,7 @@ import torch
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
 from .utils import logger
 
-# Original forwards, keyed by "<model_type>.<method>"; the patched forwards are copied into the
-# compiler's cache, so they reach these through a lazy import.
+# Original forwards; patched forwards reach them through a lazy import (compiler copies them).
 _REFERENCE = {}
 _DSA_KEY_ROPE = {}
 _DSA_CACHE_OK = {}
@@ -111,7 +97,7 @@ def _dsa_indexer_forward(self, model_type, hidden_states, q_resid, position_embe
         and (past_key_values is None or _DSA_CACHE_OK.get(model_type, False))
     ):
         if past_key_values is not None:
-            # The indexer key cache must hold every token for later steps past the budget.
+            # Later steps past the budget score against this cache.
             cos, sin = position_embeddings
             k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)
             k_rot, k_pass = torch.split(
@@ -133,7 +119,7 @@ def _dsa_indexer_forward(self, model_type, hidden_states, q_resid, position_embe
 
 def deepseek_v32_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask,
                                  position_ids=None, past_key_values=None):
-    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
+    # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _dsa_indexer_forward
     with torch.no_grad():
         return _dsa_indexer_forward(
@@ -144,7 +130,7 @@ def deepseek_v32_indexer_forward(self, hidden_states, q_resid, position_embeddin
 
 def glm_moe_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask,
                                 position_ids=None, past_key_values=None):
-    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
+    # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _dsa_indexer_forward
     with torch.no_grad():
         return _dsa_indexer_forward(
@@ -169,7 +155,6 @@ def _patch_dsa(model_type, indexer_name, rope_name, patched_forward):
             logger.info(f"Unsloth: {indexer_name}.forward changed upstream; sparse skip not applied.")
         return
     rope = getattr(modeling, rope_name, None)
-    # The cache-only key update mirrors upstream line for line; anything else keeps the reference.
     _DSA_CACHE_OK[model_type] = (
         rope is not None
         and all(line in source for line in _DSA_KEY_SOURCE)
@@ -217,7 +202,6 @@ def _minimax_index_key_len(self, q_len, past_key_values):
         return q_len
     layer = past_key_values.layers[self.layer_idx]
     if hasattr(layer, "idx_cumulative_length"):
-        # Static layer: upstream scores against the whole buffer.
         return getattr(layer, "max_cache_len", None)
     if not hasattr(layer, "idx_keys"):
         return None
@@ -246,8 +230,7 @@ def _minimax_indexer_forward(self, hidden_states, position_embeddings, past_key_
                 )
                 past_key_values.layers[self.layer_idx].update_index(idx_k)
             record_sparse_attn("skip_full", "minimax_m3_vl")
-            # A block has a non-future key iff it starts at or before the query position, and top-k
-            # keeps every such block; upstream orders them by score, `build_block_mask` reads a set.
+            # Exactly the blocks with a non-future key; `build_block_mask` reads them as a set.
             num_key_blocks = -(-k_len // self.block_size)
             blocks = torch.arange(num_key_blocks, device=hidden_states.device)
             q_block = position_ids // self.block_size
@@ -257,7 +240,7 @@ def _minimax_indexer_forward(self, hidden_states, position_embeddings, past_key_
 
 
 def minimax_m3_indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids):
-    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
+    # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _minimax_indexer_forward
     with torch.no_grad():
         return _minimax_indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids)
@@ -275,7 +258,6 @@ def patch_minimax_m3_sparse_skip():
     forward, build = indexer_cls.forward, getattr(indexer_cls, "build_block_mask", None)
     if build is None or not _is_transformers_function(forward, "minimax_m3_vl"):
         return
-    # The selection is read as a set of block ids with -1 padding by upstream's mask builder.
     if not (
         all(line in _source(forward) for line in _MINIMAX_SOURCE)
         and all(line in _source(build) for line in _MINIMAX_MASK_SOURCE)
@@ -308,7 +290,7 @@ def _deepseek_v4_indexer_forward(self, hidden_states, q_residual, position_ids, 
 
 
 def deepseek_v4_indexer_forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx):
-    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
+    # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _deepseek_v4_indexer_forward
     with torch.no_grad():
         return _deepseek_v4_indexer_forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx)
@@ -320,15 +302,14 @@ def _deepseek_v4_scorer_forward(self, q, compressed_kv, hidden_states):
     index_topk = getattr(self, "_unsloth_index_topk", None)
     compressed_len = compressed_kv.shape[1]
     if index_topk is not None and compressed_len <= index_topk and sparse_skip_full_enabled():
-        # top-k then keeps all `compressed_len` entries whatever the scores; the indexer still
-        # turns the future ones into -1, so the selection matches upstream as a set.
+        # top-k keeps every entry; the indexer still marks future ones -1.
         record_sparse_attn("skip_full", "deepseek_v4")
         return torch.zeros((q.shape[0], q.shape[1], compressed_len), dtype=torch.float32, device=q.device)
     return _REFERENCE["deepseek_v4.scorer"](self, q, compressed_kv, hidden_states)
 
 
 def deepseek_v4_indexer_scorer_forward(self, q, compressed_kv, hidden_states):
-    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
+    # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _deepseek_v4_scorer_forward
     return _deepseek_v4_scorer_forward(self, q, compressed_kv, hidden_states)
 
