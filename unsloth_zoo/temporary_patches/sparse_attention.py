@@ -43,8 +43,21 @@ _DSA_KEY_ROPE = {}
 _DSA_CACHE_OK = {}
 
 
+def _transformers_tested():
+    """Checked on transformers 5.17-5.20; older 5.x indexers differ (no mask for unpadded SDPA,
+    per-query MiniMax blocks), so those keep upstream."""
+    try:
+        import transformers
+        from packaging.version import Version
+        return Version(transformers.__version__).release >= (5, 17)
+    except Exception:
+        return False
+
+
 def _modeling_module(model_type):
     name = f"transformers.models.{model_type}.modeling_{model_type}"
+    if not _transformers_tested():
+        return None
     try:
         if importlib.util.find_spec(name) is None:
             return None

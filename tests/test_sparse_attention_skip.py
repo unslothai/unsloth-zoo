@@ -34,7 +34,10 @@ DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
 def _has(model_type):
-    return importlib.util.find_spec(f"transformers.models.{model_type}") is not None
+    return (
+        importlib.util.find_spec(f"transformers.models.{model_type}") is not None
+        and sparse_attention._transformers_tested()
+    )
 
 
 def _deepseek_v32():
@@ -161,7 +164,7 @@ def _patched(monkeypatch):
 @pytest.mark.parametrize("family", list(FAMILIES))
 def test_skip_is_exact_and_engaged(family, attn_implementation, device, monkeypatch):
     if not _has(family):
-        pytest.skip(f"transformers without {family}")
+        pytest.skip(f"transformers without {family}, or older than 5.17")
     if family == "deepseek_v4" and attn_implementation == "sdpa":
         pytest.skip("upstream DeepSeek-V4 is eager-only")
     model, short_len, long_len = _build(family, device, attn_implementation)
@@ -183,7 +186,7 @@ def test_skip_is_exact_and_engaged(family, attn_implementation, device, monkeypa
 @pytest.mark.parametrize("family", list(FAMILIES))
 def test_padded_and_packed_batches_are_exact(family, layout, device, monkeypatch):
     if not _has(family):
-        pytest.skip(f"transformers without {family}")
+        pytest.skip(f"transformers without {family}, or older than 5.17")
     model, short_len, _ = _build(family, device, "sdpa")
     input_ids = torch.randint(3, 97, (3, short_len), generator=torch.Generator().manual_seed(2)).to(device)
     attention_mask = torch.ones_like(input_ids)
@@ -253,7 +256,7 @@ def _cache_tensors(cache):
 def test_decode_across_the_budget(family, device, monkeypatch):
     """Prefill under the budget (skip engaged), then decode past it: the indexer cache must be complete."""
     if not _has(family):
-        pytest.skip(f"transformers without {family}")
+        pytest.skip(f"transformers without {family}, or older than 5.17")
     model, short_len, long_len = _build(family, device, "sdpa")
     model.eval()
     prompt = torch.randint(3, 97, (2, short_len - 1), generator=torch.Generator().manual_seed(3)).to(device)
@@ -297,7 +300,7 @@ def test_no_grad_indexers_match_unpatched_upstream(family, device, monkeypatch):
     """Upstream runs these two indexers with autograd on; their integer output carries no gradient,
     so running them under no_grad must leave logits and every gradient unchanged."""
     if not _has(family):
-        pytest.skip(f"transformers without {family}")
+        pytest.skip(f"transformers without {family}, or older than 5.17")
     modeling = importlib.import_module(f"transformers.models.{family}.modeling_{family}")
     model, _, long_len = _build(family, device, "eager")
     input_ids = torch.randint(3, 97, (2, long_len), generator=torch.Generator().manual_seed(4)).to(device)
@@ -312,3 +315,13 @@ def test_no_grad_indexers_match_unpatched_upstream(family, device, monkeypatch):
         )
     upstream = _run(model, input_ids)
     _assert_same(upstream, patched)
+
+
+def test_older_transformers_keeps_upstream(monkeypatch):
+    import transformers
+
+    monkeypatch.setattr(transformers, "__version__", "5.16.1")
+    assert not sparse_attention._transformers_tested()
+    assert sparse_attention._modeling_module("deepseek_v32") is None
+    monkeypatch.setattr(transformers, "__version__", "5.21.0.dev0")
+    assert sparse_attention._transformers_tested()
