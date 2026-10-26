@@ -299,18 +299,21 @@ def _clear_compiled(kernel):
             v.clear()
 
 
-def test_scan_kernel_compiles_once_across_token_counts():
-    # The scan tile must not follow the block count: training steps with different token counts
-    # (here 9 NB values from 16 to 512 blocks) reuse one compiled scan kernel.
+# Bounds are Triton's own 16-byte pointer-alignment specializations of the scratch slices: scatter
+# reads two of them, whose alignment follows the block count mod 4 and mod 2.
+@pytest.mark.parametrize("name, bound", [("_route_scan_kernel", 2), ("_route_hist_kernel", 2), ("_route_scatter_kernel", 4)])
+def test_kernels_compile_once_across_token_counts(name, bound):
+    # Token counts change every training step (here 9 NB values from 16 to 512 blocks); only
+    # per-model values (top-k, experts) are constexpr, so one compiled kernel serves them all.
+    kernel = getattr(mrt, name)
     E, k = 64, 8
-    _clear_compiled(mrt._route_scan_kernel)
-    before = _compiled_variants(mrt._route_scan_kernel)
+    _clear_compiled(kernel)
+    before = _compiled_variants(kernel)
     seen = set()
     for T in (520, 1100, 2100, 3300, 4300, 6000, 8200, 12000, 16384):
         ids = torch.randint(0, E, (T, k), device = "cuda")
         got = mrt._launch(ids, E)
         ref = mrt.torch_moe_routing_sort(ids, E)
         assert all(torch.equal(a, b) for a, b in zip(got, ref))
-        seen.add(_compiled_variants(mrt._route_scan_kernel) - before)
-    # <= 2: Triton's own 16-byte pointer-alignment specialization of the scratch slices.
-    assert _compiled_variants(mrt._route_scan_kernel) - before <= 2, seen
+        seen.add(_compiled_variants(kernel) - before)
+    assert _compiled_variants(kernel) - before <= bound, seen

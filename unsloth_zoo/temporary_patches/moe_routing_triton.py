@@ -74,7 +74,7 @@ if triton is not None:
 
     @triton.jit(do_not_specialize = ["N"])
     def _route_single_kernel(
-        ids_ptr, N, K_COLS, stride_row, stride_col, E,
+        ids_ptr, N, K_COLS: tl.constexpr, stride_row: tl.constexpr, stride_col, E: tl.constexpr,  # top-k, top-k, n_experts
         counts_ptr, offsets_ptr, out_ptr,
         BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,
     ):
@@ -90,7 +90,8 @@ if triton is not None:
 
     @triton.jit(do_not_specialize = ["N"])
     def _route_hist_kernel(
-        ids_ptr, N, K_COLS, stride_row, stride_col, E, hist_ptr, below_ptr,
+        ids_ptr, N, K_COLS: tl.constexpr, stride_row: tl.constexpr, stride_col, E: tl.constexpr,  # top-k, top-k, n_experts
+        hist_ptr, below_ptr,
         BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,
     ):
         # Block-major [NB, E + 1]: hist = rows of each expert in this block, below = rows of
@@ -106,7 +107,7 @@ if triton is not None:
 
     @triton.jit(do_not_specialize = ["NB"])
     def _route_scan_kernel(
-        hist_ptr, below_ptr, counts_ptr, NB, E,
+        hist_ptr, below_ptr, counts_ptr, NB, E: tl.constexpr,  # n_experts
         EC: tl.constexpr, BB: tl.constexpr,
     ):
         # One program per EC experts, carry over the blocks. Rewrites below[b, e] in place to
@@ -125,7 +126,7 @@ if triton is not None:
         tl.store(counts_ptr + e, carry, mask = e < E)
 
     @triton.jit
-    def _route_starts_kernel(counts_ptr, starts_ptr, offsets_ptr, E, EP: tl.constexpr):
+    def _route_starts_kernel(counts_ptr, starts_ptr, offsets_ptr, E: tl.constexpr, EP: tl.constexpr):
         e = tl.arange(0, EP)
         c = tl.load(counts_ptr + e, mask = e < E, other = 0)
         ends = tl.cumsum(c, 0)
@@ -134,7 +135,8 @@ if triton is not None:
 
     @triton.jit(do_not_specialize = ["N"])
     def _route_scatter_kernel(
-        ids_ptr, N, K_COLS, stride_row, stride_col, E, rank_base_ptr, starts_ptr, out_ptr,
+        ids_ptr, N, K_COLS: tl.constexpr, stride_row: tl.constexpr, stride_col, E: tl.constexpr,  # top-k, top-k, n_experts
+        rank_base_ptr, starts_ptr, out_ptr,
         BLOCK: tl.constexpr,
     ):
         b = tl.program_id(0)

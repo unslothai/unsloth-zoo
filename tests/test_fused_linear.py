@@ -470,7 +470,7 @@ def test_opcheck():
     t[0] = -100
     f32 = torch.ones(())
     torch.library.opcheck(
-        torch.ops.unsloth_zoo.fused_linear_ce.default,
+        getattr(torch.ops.unsloth_zoo, fl._CE_OP).default,
         (h, w, b, t, f32 * 9, f32, -100, 0.0, 0.0, 3.0, 0.0, None, torch.float32, True, True, True, False, 4),
     )
     mask = t != -100
@@ -611,7 +611,7 @@ def test_opcheck_with_disabled_outputs():
     h, w, b, t = _make("cpu", torch.float32, 10, 8, 33, with_bias = True)
     f32 = torch.ones(())
     torch.library.opcheck(
-        torch.ops.unsloth_zoo.fused_linear_ce.default,
+        getattr(torch.ops.unsloth_zoo, fl._CE_OP).default,
         (h, w, b, t, f32 * 9, f32, -100, 0.0, 0.0, 0.0, 0.0, None, torch.float32, True, False, False, False, 4),
         test_utils = ("test_faketensor",),
     )
@@ -712,6 +712,8 @@ def test_ce_rejects_out_of_range_targets(bad):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA only")
+@pytest.mark.skipif(os.name == "nt" and torch.version.hip is not None,
+                    reason = "a device-side assert hangs the Windows ROCm driver and takes the host down with it")
 @pytest.mark.parametrize("bad", [-1, 64])
 def test_ce_out_of_range_target_is_a_device_assert_on_cuda(bad):
     # The device-side assert poisons the CUDA context, so run it in a subprocess.
