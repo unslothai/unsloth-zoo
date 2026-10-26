@@ -29,7 +29,7 @@ from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_ce_loss, u
 from unsloth_zoo import rl_replacements as rl
 
 V = 257
-MARGINS = [5.0, 17.0, 25.0, 40.0, 80.0]
+MARGINS = [5.0, 17.0, 25.0, 40.0, 80.0]  # past ~87 nats float32 results are subnormal
 
 
 def _logits(margin, rows = 3):
@@ -217,3 +217,17 @@ def test_rows_ce_offset_logits_and_float64():
     assert nll.dtype == torch.float64 and torch.allclose(nll, ref, rtol = 1e-12)
     nll.sum().backward()
     assert torch.allclose(z.grad, torch.softmax(z.detach(), -1) - torch.tensor([[1.0, 0.0]], dtype = torch.float64))
+
+
+def test_smoothed_nll_offset_and_negative_tail():
+    from unsloth_zoo.fused_losses.stable_softmax import smoothed_nll
+
+    z = torch.full((1, 3), 1e8, requires_grad = True)
+    nll = smoothed_nll(z, torch.tensor([0]))
+    nll.sum().backward()
+    assert torch.allclose(nll, torch.tensor([math.log(3.0)]))
+    assert torch.allclose(z.grad, torch.tensor([[-2 / 3, 1 / 3, 1 / 3]]))
+    # Margin 90: the non-target gradient e^-90 is a float32 subnormal, still nonzero.
+    z = torch.tensor([[90.0, 0.0]], requires_grad = True)
+    smoothed_nll(z, torch.tensor([0])).sum().backward()
+    assert z.grad[0, 1] > 0 and z.grad[0, 0] < 0

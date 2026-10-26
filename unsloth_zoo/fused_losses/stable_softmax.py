@@ -29,20 +29,28 @@ __all__ = [
 
 
 def _softplus(x):
-    # Exact log(1 + exp(x)) with gradient sigmoid(x) at 0 too: F.softplus returns x past its threshold of 20,
-    # and clamp_min(x, 0) + log1p(exp(-|x|)) has derivative 1 at x = 0.
-    return torch.logaddexp(x, torch.zeros_like(x))
+    # Exact log(1 + exp(x)) with derivative sigmoid(x) everywhere: F.softplus returns x past 20, the clamp_min
+    # form has derivative 1 at 0, and logaddexp's backward underflows in the negative tail. The clamps keep
+    # the branch not taken finite (no inf * 0 in the backward).
+    positive = x > 0
+    return torch.where(
+        positive, x + torch.log1p(torch.exp(-x.clamp_min(0))), torch.log1p(torch.exp(x.clamp_max(0))),
+    )
 
 
 def target_logprob(z, target):
     """(log softmax(z)[..., target], logsumexp(z)), traceable. ``target`` must be a valid column of every row."""
     # Raw logits masked and the target taken by a masked sum (not gather): the backward is elementwise and
     # recomputes from z. finfo.min, not -inf, keeps a row whose only finite logit is the target NaN free.
+    # Centred first: with a large shared offset, logsumexp(others) - z_t would round away the normaliser.
+    m = z.detach().amax(-1, keepdim = True)
+    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+    z = z - m
     is_target = torch.arange(z.shape[-1], device = z.device) == target.unsqueeze(-1)
     z_t = torch.where(is_target, z, 0.0).sum(-1)
     others = torch.where(is_target, torch.finfo(z.dtype).min, z)
     logp = -_softplus(torch.logsumexp(others, -1) - z_t)
-    return logp, z_t - logp
+    return logp, (z_t - logp) + m.squeeze(-1)
 
 
 def _others_lse(s_others, m):
