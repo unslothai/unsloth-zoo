@@ -202,8 +202,7 @@ def compute_fused_ce_loss(
         logits = torch.tanh(logits)
         logits = logits * logit_softcapping
 
-    # sum / n_items, else sum / labelled tokens (the stock mean). F.cross_entropy's value with the target
-    # excluded from the normaliser: its own log_softmax drops confident targets' loss and gradient.
+    # sum / n_items, else sum / labelled tokens (the stock mean); not F.cross_entropy, which collapses.
     target = labels.view(-1).to(device).contiguous()
     keep = target != ignore_index
     nll = smoothed_nll(

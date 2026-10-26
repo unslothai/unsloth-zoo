@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Target log-probabilities without softmax collapse (arXiv 2610.31642, Section 2).
-
-``z_t - logsumexp(z)`` rounds to 0 once the target leads the logsumexp of the others by ~16.6 nats in
-float32: the denominator is 1 + exp(-margin) and the small term is lost, so the loss and the target gradient
-become exactly 0 while every other class keeps its gradient. Excluding the target *before* the reduction keeps
-both: ``log p_t = -softplus(logsumexp_{j != t}(z_j) - z_t)`` and ``d log p_t / d z_t = -expm1(log p_t)``.
-"""
+"""Target log-probabilities without softmax collapse (arXiv 2610.31642, Section 2): ``z_t - logsumexp(z)``
+rounds to 0 past a ~16.6 nat margin in float32, so ``log p_t = -softplus(logsumexp_{j != t}(z_j) - z_t)``."""
 
 import torch
 
@@ -39,19 +34,14 @@ def _softplus(x):
 
 
 def _others_lse(s_others, m):
-    # log(s) with a zero-safe argument: an empty support (only the target kept) gives -inf, and log's
-    # backward at 0 would turn the zero upstream gradient into NaN.
+    # Empty support (only the target kept) gives -inf without log(0) in the graph (NaN backward).
     nonzero = s_others > 0
     safe = torch.where(nonzero, s_others, torch.ones_like(s_others))
     return torch.where(nonzero, m + torch.log(safe), torch.full_like(m, -float("inf")))
 
 
 def target_logprob(z, target):
-    """(log softmax(z)[..., target], logsumexp(z)) over the last dim, traceable and autograd exact.
-
-    ``target`` must index a column of every row (map ignored labels to 0 first and mask the result); columns
-    set to -inf (a truncated support) drop out. One masked reduction, the same work as logsumexp.
-    """
+    """(log softmax(z)[..., target], logsumexp(z)), traceable. ``target`` must be a valid column of every row."""
     m = z.detach().amax(-1, keepdim = True)
     m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
     index = target.unsqueeze(-1)
@@ -64,8 +54,7 @@ def target_logprob(z, target):
 
 @torch.no_grad()
 def target_logprob_(z, target):
-    """``target_logprob`` for hand-written forwards: overwrites ``z`` (a local float chunk) in place, so take
-    every other statistic of ``z`` first. Returns (logp, lse) in z's dtype."""
+    """``target_logprob`` that overwrites ``z`` (a local float chunk): take every other statistic of ``z`` first."""
     m = z.amax(-1, keepdim = True)
     m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
     index = target.unsqueeze(-1)
@@ -78,12 +67,12 @@ def target_logprob_(z, target):
 
 
 def target_grad(logp):
-    """d log p_t / d z_t = 1 - p_t, from an accurate log p_t (``1 - exp(logp)`` cancels to 0)."""
+    """d log p_t / d z_t; ``1 - exp(logp)`` would cancel to 0."""
     return -torch.expm1(logp)
 
 
 def smoothed_nll(z, target, label_smoothing = 0.0):
-    """Per row F.cross_entropy(z, target, label_smoothing) (uniform mass over all V classes), collapse free."""
+    """Per row F.cross_entropy(z, target, label_smoothing = label_smoothing)."""
     logp, lse = target_logprob(z, target)
     nll = -logp
     if label_smoothing:
@@ -91,7 +80,7 @@ def smoothed_nll(z, target, label_smoothing = 0.0):
     return nll
 
 
-# float32 bytes per chunk of the eager row loop: bounds the transient upcast of half precision logits.
+# Bounds the float32 upcast of half precision logits in the eager row loop.
 _ROWS_CHUNK_BYTES = 256 * 1024 * 1024
 
 
@@ -102,8 +91,7 @@ def _row_chunks(n_rows, vocab_size):
 
 
 class _CrossEntropyRows(torch.autograd.Function):
-    """Per row cross entropy of logits [N, V] in any dtype, collapse free, saving only the logits and two
-    row vectors (stock F.cross_entropy saves a same sized log_softmax), float32 math one chunk at a time."""
+    """Saves the logits and two row vectors; stock F.cross_entropy saves a same sized log_softmax."""
 
     @staticmethod
     def forward(ctx, logits, target):
@@ -126,7 +114,6 @@ class _CrossEntropyRows(torch.autograd.Function):
         grad = torch.empty_like(logits)
         for start in range(0, n_rows, rows):
             end = min(start + rows, n_rows)
-            # d nll / dz = p - onehot; the target entry p_t - 1 = expm1(logp) keeps a confident target.
             p = torch.exp(logits[start:end].to(torch.float32) - lse[start:end].unsqueeze(-1))
             p.scatter_(-1, target[start:end].unsqueeze(-1), torch.expm1(logp[start:end]).unsqueeze(-1))
             grad[start:end] = p.mul_(grad_nll[start:end].to(torch.float32).unsqueeze(-1))
@@ -134,8 +121,7 @@ class _CrossEntropyRows(torch.autograd.Function):
 
 
 def cross_entropy_rows(logits, target, ignore_index = -100):
-    """Per row float32 nll of logits [N, V] (0 on ignored rows), F.cross_entropy(reduction = "none") without
-    softmax collapse and without a float32 copy of the logits."""
+    """Per row float32 nll of logits [N, V], 0 on ignored rows (F.cross_entropy(reduction = "none"))."""
     keep = target != ignore_index
     safe = torch.where(keep, target, torch.zeros_like(target))
     nll = _CrossEntropyRows.apply(logits, safe)
