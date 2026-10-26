@@ -25,6 +25,11 @@ MODEL = "mlx-community/Qwen3.5-0.8B-bf16"
 QUANTIZED = "mlx-community/Qwen3.5-0.8B-4bit"
 MTP_MODEL = "Qwen/Qwen3.5-0.8B"
 GEMMA, GEMMA_ASSISTANT = "mlx-community/gemma-4-e4b-it-bf16", "mlx-community/gemma-4-E4B-it-assistant-bf16"
+QWEN4_TEXT = dict(model_type = "qwen4_exp_text", hidden_size = 512, num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 2,
+                  head_dim = 128, linear_num_key_heads = 2, linear_num_value_heads = 6, linear_key_head_dim = 128, linear_value_head_dim = 128,
+                  linear_conv_kernel_dim = 4, num_experts = 64, num_experts_per_tok = 10, moe_intermediate_size = 640,
+                  shared_expert_intermediate_size = 640, hc_lowrank = 320, rms_norm_eps = 1e-6, vocab_size = 1024, max_position_embeddings = 4096,
+                  ple_layer_ids = [2], ngram_vocab_size_base = 4096, split_ngram_parts = 4, eos_token_id = 1)
 CODE = (
     "def merge_sort(values):\n    if len(values) <= 1:\n        return values\n    middle = len(values) // 2\n"
     "    left = merge_sort(values[:middle])\n    right = merge_sort(values[middle:])\n    return merge(left, right)\n"
@@ -129,13 +134,8 @@ def qwen4():
     from mlx_vlm.models import qwen4_exp
     from unsloth_zoo.mlx.loader import _ensure_exact_verify_sums_promoted
     _ensure_exact_verify_sums_promoted()  # as FastMLXModel's VLM load does
-    text = dict(model_type = "qwen4_exp_text", hidden_size = 512, num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 2,
-                head_dim = 128, linear_num_key_heads = 2, linear_num_value_heads = 6, linear_key_head_dim = 128, linear_value_head_dim = 128,
-                linear_conv_kernel_dim = 4, num_experts = 64, num_experts_per_tok = 10, moe_intermediate_size = 640,
-                shared_expert_intermediate_size = 640, hc_lowrank = 320, rms_norm_eps = 1e-6, vocab_size = 1024, max_position_embeddings = 4096,
-                ple_layer_ids = [2], ngram_vocab_size_base = 4096, split_ngram_parts = 4, eos_token_id = 1)
     vision = dict(depth = 1, hidden_size = 64, num_heads = 2, intermediate_size = 128, out_hidden_size = 512)
-    model = qwen4_exp.Model(qwen4_exp.ModelConfig.from_dict(dict(model_type = "qwen4_exp", text_config = text, vision_config = vision)))
+    model = qwen4_exp.Model(qwen4_exp.ModelConfig.from_dict(dict(model_type = "qwen4_exp", text_config = QWEN4_TEXT, vision_config = vision)))
     # Constructors zero gates and residual scales, which would cut the paths under test.
     model.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05
                           if mx.issubdtype(a.dtype, mx.floating) and not mx.any(a).item() else a, model.parameters()))
@@ -1238,6 +1238,30 @@ def test_a_head_kept_under_the_language_model_of_an_mlx_conversion_is_built_with
     assert type(drafter) is MTPDrafter and drafter.model.layers[0].self_attn.q_proj.bits == 8 and drafter.model.layers[0].mlp.up_proj.bits == 4
     assert built.keys() == {key.removeprefix("language_model.mtp.") for key in tensors if ".mtp." in key}
     assert all(mx.array_equal(built[key.removeprefix("language_model.mtp.")], value) for key, value in tensors.items() if ".mtp." in key)
+
+
+def test_a_head_whose_overrides_name_its_checkpoint_paths_is_built_at_its_stored_widths(qwen4, tmp_path):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_vlm.speculative.drafters import qwen4_exp_mtp
+    from unsloth_zoo.mlx.speculative import native_mtp_drafter
+    # As mixed-precision releases store it: some head projections wider than the default, keyed by checkpoint path.
+    default = {"group_size": 64, "bits": 4, "mode": "affine"}
+    wide = {"fc_hidden": {**default, "bits": 8}, "layers.0.self_attn.q_proj": {**default, "bits": 8},
+            "layers.0.mlp.shared_expert.down_proj": {**default, "bits": 8, "group_size": 128}}
+    head = qwen4_exp_mtp.Model(qwen4_exp_mtp.ModelConfig.from_dict({"text_config": QWEN4_TEXT}))
+    nn.quantize(head, class_predicate = lambda name, layer: hasattr(layer, "to_quantized") and not name.endswith("mlp.gate") and wide.get(name, default))
+    tensors = {f"mtp.{key}": value for key, value in tree_flatten(head.parameters())}
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors, metadata = {"format": "mlx"})
+    quantization = {**default, **{f"mtp.{name}": spec for name, spec in wide.items()}}
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen4_exp", "text_config": QWEN4_TEXT, "quantization": quantization}))
+    drafter = native_mtp_drafter(tmp_path, qwen4[0])
+    model, built = drafter.model, dict(tree_flatten(drafter.model.parameters()))
+    layer = model.layers[0]
+    modules = (model.fc_embedding, model.fc_hidden, layer.self_attn.q_proj, layer.self_attn.k_proj, layer.mlp.shared_expert.down_proj, layer.mlp.switch_mlp.up_proj)
+    assert [(module.bits, module.group_size) for module in modules] == [(4, 64), (8, 64), (8, 64), (4, 64), (8, 128), (4, 64)]
+    assert built.keys() == {key.removeprefix("mtp.") for key in tensors}
+    assert all(mx.array_equal(built[key.removeprefix("mtp.")], value) for key, value in tensors.items())
 
 
 def test_a_separate_mtp_head_checkpoint_is_wrapped_as_the_built_in_head(qwen_mtp, tmp_path):

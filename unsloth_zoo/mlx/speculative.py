@@ -1996,17 +1996,22 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool 
         **splitter.extra_config(text_config),
     }
     model = module.Model(module.ModelConfig.from_dict(config))
+
+    def stored(name, layer):
+        # Overrides can name checkpoint paths the splitter renamed (``mtp.fc_embedding``); the packed tensors carry their own widths.
+        if isinstance(quantization.get(name), dict):
+            return quantization[name]
+        if not (hasattr(layer, "to_quantized") and f"{name}.scales" in weights):
+            return False
+        in_dims = layer.weight.shape[-1]
+        return {
+            "group_size": in_dims // weights[f"{name}.scales"].shape[-1],
+            "bits": weights[f"{name}.weight"].shape[-1] * 32 // in_dims,
+            "mode": quantization.get("mode", "affine"),
+        }
+
     if quantization is not None:
-        nn.quantize(
-            model,
-            group_size = quantization["group_size"],
-            bits = quantization["bits"],
-            mode = quantization.get("mode", "affine"),
-            # Some splitters give per-module settings (DeepSeek-V4: MXFP4 experts, MXFP8 projections).
-            class_predicate = lambda name, layer: (
-                quantization[name] if isinstance(quantization.get(name), dict) else hasattr(layer, "to_quantized") and f"{name}.scales" in weights
-            ),
-        )
+        nn.quantize(model, class_predicate = stored)
     model.load_weights(list(weights.items()), strict = True)
     from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
 
