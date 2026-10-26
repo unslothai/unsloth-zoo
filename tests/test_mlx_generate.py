@@ -1,5 +1,6 @@
 import concurrent.futures
 import contextlib
+import contextvars
 import importlib
 import importlib.util
 import inspect
@@ -585,6 +586,82 @@ def test_vision_text_engine_is_the_language_model_only_for_verified_types_with_p
         language = types.SimpleNamespace(named_modules=lambda rope=rope: [("rope", type(rope, (), {})())])
         config = {"model_type": model_type} if rope == "RoPE" else types.SimpleNamespace(model_type=model_type)
         assert (engine.text_engine_model(types.SimpleNamespace(_is_vlm_model=True, language_model=language, config=config)) is not None) == routed
+
+
+def test_prompt_progress_is_taken_only_by_a_vision_stream_row():
+    from unsloth_zoo.mlx.generate import BatchRowRefused, _SpeculativeBatchSession, _stream_batch
+    with pytest.raises(TypeError, match="must be callable"):
+        GenerationRequest(prompt="a", prompt_progress=object())
+    request = GenerationRequest(prompt="a", prompt_progress=lambda processed, total: None)
+    with pytest.raises(ValueError, match="carries a prompt_progress"):
+        _validate_text_requests([request], GenerationDefaults())
+    vlm = types.SimpleNamespace(_is_vlm_model=True, language_model=None)
+    with pytest.raises(ValueError, match="prompt_progress is taken only by a BatchStream row"):
+        list(_stream_batch(vlm, object(), [request]))
+    with pytest.raises(BatchRowRefused, match="reports no prompt progress"):
+        _SpeculativeBatchSession.add(types.SimpleNamespace(adapter=None), request)
+
+
+def test_a_prefill_bar_tells_the_open_callback_each_chunk(monkeypatch):
+    from unsloth_zoo.mlx import generate
+
+    class Bar:  # the tqdm surface generate_step uses
+        def __init__(self, *args, **kwargs): self.n = 0
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+        def update(self, n): self.n += n
+
+    module = types.SimpleNamespace(generate_step=object(), tqdm=Bar)
+    monkeypatch.setattr(generate, "_resolve_module_attr", lambda names, attribute: module)
+
+    def prefill(desc="Prefill"):
+        with module.tqdm(total=10, desc=desc, unit="tok") as bar:
+            bar.update(4)
+            bar.update(5)
+        return bar.n
+
+    heard = []
+    with generate.vlm_prefill_progress(lambda *progress: heard.append(progress)):
+        assert prefill() == 9 and prefill("Decode") == 9
+        installed = module.tqdm
+    assert prefill() == 9 and heard == [(4, 10), (9, 10)]
+    with generate.vlm_prefill_progress(print):
+        assert module.tqdm is installed
+
+    def held(sink=heard):  # a reply generator closed from another context than the one that opened it
+        with generate.vlm_prefill_progress(lambda *progress: sink.append(progress)):
+            yield
+    opened, reply = contextvars.copy_context(), held()
+    opened.run(next, reply)
+    contextvars.copy_context().run(reply.close)
+    assert opened.run(prefill) == 9 and heard == [(4, 10), (9, 10)]
+    outer = []
+    with generate.vlm_prefill_progress(lambda *progress: outer.append(progress)):
+        reply = held()
+        next(reply)
+        with module.tqdm(total=10, desc="Prefill") as bar:
+            bar.update(1)
+            contextvars.copy_context().run(reply.close)
+            bar.update(1)
+        assert prefill() == 9 and outer == [(4, 10), (9, 10)] and heard[2:] == [(1, 10)]
+    inner = []
+    first, second = held(), held(inner)  # closed out of order in one context
+    next(first), next(second), first.close()
+    assert prefill() == 9 and inner == [(4, 10), (9, 10)] and len(heard) == 3
+    second.close()
+    for _ in range(3):
+        reply = held()
+        opened.run(next, reply)
+        contextvars.copy_context().run(reply.close)
+    assert opened.run(generate._PREFILL_PROGRESS.get)[1] is None
+    replies = [held() for _ in range(4)]  # each opened before the one before it closes
+    for previous, reply in zip([None, *replies], replies):
+        opened.run(next, reply)
+        if previous is not None:
+            contextvars.copy_context().run(previous.close)
+    assert opened.run(generate._PREFILL_PROGRESS.get)[1][1] is None
+    with pytest.raises(TypeError, match="callback must be callable"):
+        generate.vlm_prefill_progress(None).__enter__()
 
 
 def test_vlm_adapter_reports_admission_stall_without_counting_polls():
@@ -1958,6 +2035,76 @@ def test_a_batch_s_last_leaving_row_is_handed_views_of_its_own_buffers(monkeypat
     batch.left_padding = np.array([2, 0])
     with pytest.raises(AssertionError, match="extract copies"):
         _row_cache([batch], 0)
+
+
+def test_a_vision_row_hears_each_prefill_chunk_once_it_has_run(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import generate
+
+    class Prompt:  # mlx-vlm's PromptProcessingBatch: one async chunk per prompt_step
+        def __init__(self, uids, columns):
+            self.uids, self.prompt_cache = uids, [types.SimpleNamespace(state=f"cache {uids}")]
+            self._inputs_embeds = types.SimpleNamespace(shape=(1, columns, 4))
+        def prompt_step(self):
+            left = self._inputs_embeds.shape[1]
+            n = min(4, left - 1)
+            self._inputs_embeds = types.SimpleNamespace(shape=(1, left - n, 4))
+            return n
+
+    public = types.SimpleNamespace(PromptProcessingBatch=Prompt)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", public)
+    order = []
+    monkeypatch.setattr(mx, "eval", lambda states: order.append(("eval", states[0])))
+
+    class Generator(_OpenVLMGenerator):
+        @property
+        def has_work(self):
+            return True
+        def next(self):  # decodes the rows past their prompt, then runs one chunk of the next
+            events = [types.SimpleNamespace(uid=uid, token=1, finish_reason=None if left else "length",
+                                            token_logprob=-0.1) for uid, left in self.left.items()]
+            self.left = {uid: left - 1 for uid, left in self.left.items() if left}
+            batch = self._prompt_batch
+            if batch is None and len(self.built) < len(self.inserted):
+                uid = len(self.built)
+                batch = self._prompt_batch = public.PromptProcessingBatch(uids=[uid], columns=(6, 14, 9)[uid])
+                self.built.append(batch)
+            if batch is not None and batch._inputs_embeds.shape[1] > 1:
+                batch.prompt_step()
+            elif batch is not None:
+                self._prompt_batch, self.left[batch.uids[0]] = None, 2
+            return [], events
+
+    session = _vlm_session(Generator, prefill_batch_size=1)
+    session.generator.built, session.generator.left, session.generator.completion_batch_size = [], {}, 4
+    session.generator._generation_batch = type("Decoding", (), {"uids": [], "__len__": lambda self: len(self.uids)})()
+    session.adapter.batch_module = public
+
+    def loud(*progress):
+        order.append(("loud", progress))
+        if progress[0] == 8:
+            raise OSError("the reply's client went away")
+    quiet = session.add(GenerationRequest(prompt="ab"))
+    loud = session.add(GenerationRequest(prompt="cd", prompt_progress=loud))
+    finished = []
+    with pytest.warns(UserWarning, match="its row reports no more progress"):
+        while session.rows_in_flight:
+            for event in list(session.step()):  # as BatchStream.step collects them
+                order.append(("token", event.index))
+                finished += [event.index] if event.result else []
+    assert finished == [quiet, loud]
+    # Each chunk is waited for, then told once, after the step's tokens; a failing reporter stops alone.
+    assert order == [
+        ("token", quiet), ("eval", "cache [1]"), ("loud", (4, 14, 0)),
+        ("token", quiet), ("eval", "cache [1]"), ("loud", (8, 14, 0)),
+        ("token", quiet), *[("token", loud)] * 3,
+    ]
+    assert session._progress == {} and session._prefilling == ()
+    cancelled = session.add(GenerationRequest(prompt="ef", prompt_progress=print))
+    assert list(session.step()) == [] and session._prefilling
+    assert session.cancel(cancelled) and session._prefilling == ()
+    session.add(GenerationRequest(prompt="gh"))
+    assert list(session.step()) == [] and session._prefilling == ()
 
 
 def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():

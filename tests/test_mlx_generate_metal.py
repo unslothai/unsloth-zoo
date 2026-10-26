@@ -428,6 +428,49 @@ class _SharedPrefixState(_RowCacheState):
 
 
 @metal_only
+def test_vlm_prefill_reports_each_chunk_past_the_reused_prefix():
+    from mlx_vlm import load, stream_generate
+    from mlx_vlm.models.cache import make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import (
+        BatchStream, GenerationDefaults, GenerationRequest, vlm_prefill_progress,
+    )
+    model, processor = load(QWEN_VLM_MODEL)
+    model._is_vlm_model = True
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(150))
+    prompt = apply_chat_template(processor, model.config, f"Name a colour. {rules}", num_images=0)
+    chunks = lambda total, *cached: [(n, total, *cached) for n in [*range(256, total - 1, 256), total - 1]]
+
+    def batched(request):
+        heard, order = [], []
+        defaults = GenerationDefaults(max_tokens=2, prefill_batch_size=1, completion_batch_size=4, prefill_step_size=256)
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            stream.add(GenerationRequest(
+                prompt=prompt, prompt_cache_state=request,
+                prompt_progress=lambda *progress: (heard.append(progress), order.append("prefill"))))
+            result = None
+            while result is None:
+                for event in stream.step():
+                    order.append("token")
+                    result = event.result or result
+        assert order[:len(heard)] == ["prefill"] * len(heard)
+        return heard, result
+
+    heard, cold = batched(None)
+    length = cold.prompt_token_count
+    assert length > 1024 and heard == chunks(length, 0)
+    single = []
+    with vlm_prefill_progress(lambda *progress: single.append(progress)):
+        list(stream_generate(model, processor, prompt, None, max_tokens=1, prefill_step_size=256))
+    assert single == chunks(length)
+    # A row resuming its own cache counts only the columns past it.
+    banked = _RowCacheState(make_prompt_cache(model.language_model), {512})
+    batched(banked)
+    heard, warm = batched(_RowCacheState(_own_copy(banked.kept[512])))
+    assert warm.cached_token_count == 512 and heard == chunks(length - 512, 512)
+
+
+@metal_only
 def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
     from mlx_vlm import load
     from mlx_vlm.models.cache import make_prompt_cache
@@ -487,9 +530,12 @@ def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
     (cold,) = run(GenerationRequest(prompt=long, prompt_cache_state=_SharedPrefixState(seed, make)))
     # Both rows are added resuming 2048 tokens; the later one takes the 4096 the earlier banks.
     banked = {ids: cache for ids, cache in seed.items() if len(ids) == 2048}
-    rows = run(*(GenerationRequest(prompt=p, prompt_cache_state=_SharedPrefixState(banked, make))
-                 for p in (long, short)))
+    heard = []
+    rows = run(*(GenerationRequest(prompt=p, prompt_cache_state=_SharedPrefixState(banked, make),
+                                   prompt_progress=report)
+                 for p, report in ((long, lambda *progress: heard.append(progress)), (short, None))))
     assert [row.cached_token_count for row in rows] == [4096, 2048]
+    assert heard and {cached for *_, cached in heard} == {4096}  # reported past the reopened prefix
     # Its prefill, which yields the first token, is the cold row's; decode depends on neighbours.
     assert (rows[0].token_ids[0], rows[0].logprobs[0]) == (cold.token_ids[0], cold.logprobs[0])
     # Rows merge by cache class and keep the receiving cache's window.
