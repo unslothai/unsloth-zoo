@@ -240,6 +240,59 @@ def test_sampler_backend_env_override(sampler, monkeypatch):
     assert rr.grpo_truncated_support_kwargs(_trainer(top_k = 20))["support_triton_sampler"] is True
 
 
+def _colocated_trainer(rows, steps = 1, tp = 1, max_num_seqs = 256, speculative = None, **args):
+    trainer = _trainer(
+        vllm_mode = "colocate", per_device_train_batch_size = rows, steps_per_generation = steps,
+        vllm_tensor_parallel_size = tp, **args,
+    )
+    vllm_config = types.SimpleNamespace(
+        speculative_config = speculative,
+        scheduler_config = types.SimpleNamespace(max_num_seqs = max_num_seqs),
+        model_config = types.SimpleNamespace(logprobs_mode = "processed_logprobs"),
+    )
+    trainer.llm = types.SimpleNamespace(llm_engine = types.SimpleNamespace(vllm_config = vllm_config))
+    return trainer
+
+
+@pytest.mark.parametrize("version, kwargs, triton", [
+    # vLLM 0.17 - 0.29 masks fewer than 8 rows with the PyTorch sort: rollouts below 8 sequences.
+    ("0.27.0", dict(rows = 4), False),
+    ("0.17.0", dict(rows = 1, steps = 7), False),
+    ("0.29.0", dict(rows = 16, max_num_seqs = 4), False),
+    # 8 or more rows reach the Triton kernel; unknown row counts keep the previous choice.
+    ("0.27.0", dict(rows = 4, steps = 2), True),
+    ("0.27.0", dict(rows = 4, tp = 2), True),
+    ("0.27.0", dict(rows = 4, speculative = object()), True),
+    ("0.27.0", dict(rows = 4, vllm_mode_server = True), True),
+    # vLLM >= 0.30 uses Triton at every batch size; < 0.17 never does.
+    ("0.30.0", dict(rows = 4), True),
+    ("0.16.0", dict(rows = 16), False),
+])
+def test_sampler_backend_follows_rollout_batch_rows(sampler, version, kwargs, triton):
+    sampler(version)
+    server = kwargs.pop("vllm_mode_server", False)
+    trainer = _colocated_trainer(top_k = 16, top_p = 1.0, **kwargs)
+    if server:
+        trainer.args.vllm_mode = "server"
+    assert rr.grpo_truncated_support_kwargs(trainer).get("support_triton_sampler", False) is triton
+
+
+def test_small_rollout_batch_scores_vllm_pytorch_kept_set(sampler):
+    # One row: 8 logits of 3, 32 of 2, 24 of 1, top_k = 16. vLLM 0.27 samples it with the PyTorch
+    # sort (fewer than 8 rows), which keeps all 40 logits >= the 16th; Triton would keep 16.
+    sampler("0.27.0")
+    logits = torch.tensor([[3.0] * 8 + [2.0] * 32 + [1.0] * 24])
+    kwargs = rr.grpo_truncated_support_kwargs(_colocated_trainer(rows = 4, top_k = 16, top_p = 1.0))
+    expected = apply_top_k_top_p_pytorch(logits.clone(), torch.tensor([16]), None)
+    assert torch.isfinite(expected).sum().item() == 40
+    index = torch.tensor([0])
+    got = rr._truncated_support_logps(
+        logits, index, kwargs["support_top_k"], kwargs["support_top_p"], kwargs["support_min_p"],
+        kwargs.get("support_triton_sampler", False),
+    )
+    torch.testing.assert_close(got, torch.log_softmax(expected, dim = -1)[:, 0])
+
+
 class _VLLMGeneration:
     def generate(self, *args, **kwargs):
         pass

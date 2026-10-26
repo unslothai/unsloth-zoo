@@ -1857,11 +1857,42 @@ def _vllm_has_triton():
 pass
 
 
+def _grpo_rollout_sampler_rows(trainer):
+    """Most rows any single vLLM sampler call can hold while generating the rollouts, or None when
+    unknown. Colocated TRL (0.22 - 1.x) gives each engine one generate call with n = 1 over the
+    process's per_device_train_batch_size * steps_per_generation prompts, gathered across the
+    vllm_tensor_parallel_size group, and the scheduler never runs more than max_num_seqs of them.
+    Server mode (shared, batched across processes) and speculative decoding (several rows per
+    request) are unknown."""
+    args = getattr(trainer, "args", None)
+    if args is None or getattr(args, "vllm_mode", "colocate") != "colocate":
+        return None
+    llm = getattr(trainer, "llm", None)
+    if llm is None:
+        llm = getattr(getattr(trainer, "vllm_generation", None), "llm", None)
+    engine = getattr(llm, "llm_engine", None) if llm is not None else None
+    vllm_config = getattr(engine, "vllm_config", None)
+    if vllm_config is None or getattr(vllm_config, "speculative_config", None) is not None:
+        return None
+    try:
+        rows = int(args.per_device_train_batch_size)
+        steps = getattr(args, "steps_per_generation", None) or getattr(args, "gradient_accumulation_steps", 1)
+        rows = rows * int(steps) * max(1, int(getattr(args, "vllm_tensor_parallel_size", 1) or 1))
+    except Exception:
+        return None
+    max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
+    if isinstance(max_num_seqs, int) and max_num_seqs > 0:
+        rows = min(rows, max_num_seqs)
+    return rows if rows > 0 else None
+pass
+
+
 def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
     """Whether vLLM's apply_top_k_top_p masks the rollouts with its Triton kernel (True) or its
     PyTorch sort (False); the two keep different tokens when logits tie at the cutoff.
     vllm/v1/sample/ops/topk_topp_sampler.py: < 0.17 PyTorch only; 0.17 - 0.29 Triton when the
-    decode batch has >= 8 rows (PyTorch below); >= 0.30 Triton whenever vllm.triton_utils.HAS_TRITON.
+    decode batch has >= 8 rows (PyTorch below, so PyTorch when the rollouts never reach 8 rows,
+    _grpo_rollout_sampler_rows); >= 0.30 Triton whenever vllm.triton_utils.HAS_TRITON.
     UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER=triton|pytorch overrides the guess (e.g. server mode, where
     the serving vLLM is not the one installed here). Warns once where the trainer cannot reproduce
     every tie the sampler breaks."""
@@ -1878,6 +1909,10 @@ def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
             uses_triton = False
             caveats.append("vLLM is not installed here, so its sampler is assumed to be the PyTorch one")
         elif version < Version("0.17.0") or not _vllm_has_triton():
+            uses_triton = False
+        elif version < Version("0.30.0") and (_grpo_rollout_sampler_rows(trainer) or 8) < 8:
+            # apply_top_k_top_p sends accelerator batches of fewer than 8 rows to the PyTorch sort
+            # (0.17 - 0.29); a rollout that never reaches 8 sequences is masked by it on every step.
             uses_triton = False
         else:
             uses_triton = True
