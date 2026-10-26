@@ -203,6 +203,36 @@ def test_tie_gradient_and_empty_rows():
     assert compiled(torch.zeros(0, 5), torch.zeros(0, dtype = torch.long)).shape == (0,)
 
 
+@pytest.mark.parametrize("backend", [None, "aot_eager", "inductor"])
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
+def test_tie_gradient_independent_of_clamp_boundary_derivative(backend, label_smoothing):
+    # torch 2.14 made d clamp_min / d clamp_max zero at the bound (was 1), which zeroed the softplus
+    # gradient at x = 0 and with it the whole row gradient at a tie. fp64 oracle: (1 - eps) (p - onehot)
+    # + eps (p - 1 / V).
+    from unsloth_zoo.fused_losses.stable_softmax import _softplus, smoothed_nll
+
+    x = torch.zeros(1, dtype = torch.float64, requires_grad = True)
+    _softplus(x).sum().backward()
+    assert x.grad.item() == 0.5
+    fn = lambda z: smoothed_nll(z, torch.tensor([0, 1]), label_smoothing).sum()
+    if backend is not None:
+        if backend == "inductor" and not _has_inductor_cpu():
+            pytest.skip("no CPU C++ compiler for Inductor")
+        torch._dynamo.reset()
+        fn = torch.compile(fn, backend = backend, fullgraph = True)
+    z = torch.tensor([[0.0, 0.0], [3.0, 3.0]], requires_grad = True)
+    fn(z).backward()
+    p = torch.full((2, 2), 0.5, dtype = torch.float64)
+    onehot = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype = torch.float64)
+    oracle = (1 - label_smoothing) * (p - onehot) + label_smoothing * (p - 0.5)
+    assert torch.allclose(z.grad.double(), oracle, rtol = 0, atol = 1e-7)
+
+
+def _has_inductor_cpu():
+    import shutil
+    return shutil.which("c++") is not None or shutil.which("g++") is not None or shutil.which("clang++") is not None
+
+
 def test_rows_ce_offset_logits_and_float64():
     from unsloth_zoo.fused_losses.stable_softmax import cross_entropy_rows
 
