@@ -30,15 +30,13 @@ backward transposes the kv order into q order and silently miscomputes on unsort
 """
 
 __all__ = [
-    "SPARSE_FLEX_STATS",
-    "sparse_flex_enabled",
-    "chunked_indexer_enabled",
     "sparse_flex_device_ok",
     "tile_block_mask",
     "minimax_m3_flex_attention",
     "minimax_m3_select_blocks",
     "dsa_flex_attention",
     "dsa_select_topk",
+    "masked_sdpa_picks_cudnn",
 ]
 
 import functools
@@ -47,34 +45,17 @@ import os
 import torch
 import torch.nn.functional as F
 
-SPARSE_FLEX_STATS = {
-    "minimax_m3_flex": 0,
-    "dsa_flex": 0,
-    "dsa_flex_reused": 0,
-    "minimax_m3_indexer_chunked": 0,
-    "dsa_indexer_chunked": 0,
-    "fallback": 0,
-}
+from .sparse import record_sparse_attn, sparse_flex_enabled
+
 _TILE = 128
 # (kind, device index, dtype, head dims) -> repr of the first failure; later calls skip flex.
 _FAILED = {}
-
-
-def _count(key):
-    if not torch.compiler.is_compiling():
-        SPARSE_FLEX_STATS[key] += 1
-
-
-def sparse_flex_enabled():
-    return os.environ.get("UNSLOTH_SPARSE_ATTN_FLEX", "1") != "0"
-
-
-def chunked_indexer_enabled():
-    return os.environ.get("UNSLOTH_SPARSE_INDEXER_CHUNKED", "1") != "0"
-
-
 # fp32 elements per indexer score chunk (1 GiB); smaller problems run in one shot like upstream.
 _SCORE_BUDGET = 1 << 28
+
+
+def _count(kind, model_type):
+    record_sparse_attn(kind, model_type)
 
 
 def _q_chunk(per_row = 1):
@@ -236,7 +217,7 @@ def minimax_m3_select_blocks(indexer, hidden_states, position_embeddings, past_k
         topk_scores, topk_indices = block_scores.topk(topk, dim = -1)
         out.append(topk_indices.masked_fill(topk_scores == float("-inf"), -1))
     if len(out) > 1:
-        _count("minimax_m3_indexer_chunked")
+        _count("indexer_chunked", "minimax_m3_vl")
     return torch.cat(out, dim = 2) if len(out) > 1 else out[0]
 
 
@@ -293,7 +274,7 @@ def minimax_m3_flex_attention(query, key, value, block_indices, attention_mask, 
 
     block_mask = tile_block_mask(any_tiles, all_tiles, mask_mod, q_len, kv_len)
     out = _flex(query, key, value, block_mask, scaling)
-    _count("minimax_m3_flex")
+    _count("flex", "minimax_m3_vl")
     return out.transpose(1, 2).contiguous()
 
 
@@ -318,7 +299,7 @@ def minimax_m3_flex_eligible(module, query, key, attention_mask, kwargs):
 # DSA (DeepSeek V3.2, GLM-MoE-DSA): token-level top-k
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
-def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attention_mask, past_key_values, apply_rope):
+def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attention_mask, past_key_values, apply_rope, model_type = "dsa"):
     """DeepseekV32Indexer / GlmMoeDsaIndexer forward with query-chunked scoring: [B, S, topk] int32.
 
     Upstream materialises [B, S, H_idx, T] fp32 scores (16 GiB at S = T = 8192). Each query row's
@@ -352,11 +333,11 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
             index_scores = index_scores + mask
         out.append(index_scores.topk(topk, dim = -1).indices.to(torch.int32))
     if len(out) > 1:
-        _count("dsa_indexer_chunked")
+        _count("indexer_chunked", model_type)
     return torch.cat(out, dim = 1) if len(out) > 1 else out[0]
 
 
-def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling):
+def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling, model_type = "dsa"):
     """Flex attention over the indexer's selected keys; returns [B, S, H, D_v].
 
     Keeps exactly the pairs of upstream's eager / SDPA path: selected by top-k AND allowed by
@@ -364,7 +345,7 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling)
     layers, which receive the producer's tensor object, reuse them within the step."""
     cached = getattr(topk_indices, "_unsloth_dsa_flex", None)
     if cached is not None and cached[0] is attention_mask and cached[1] == key.shape[2]:
-        _count("dsa_flex_reused")
+        _count("flex_reused", model_type)
         block_mask = cached[2]
     else:
         batch, _, q_len, _ = query.shape
@@ -386,7 +367,7 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling)
         except Exception:
             pass
     out = _flex(query, key, value, block_mask, scaling)
-    _count("dsa_flex")
+    _count("flex", model_type)
     return out.transpose(1, 2).contiguous()
 
 
@@ -453,4 +434,4 @@ def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_key
 def record_failure(kind, query, key, value, error):
     """Latch a flex failure for this shape class; the caller falls back to the dense path."""
     _FAILED[_failure_key(kind, query, key, value)] = repr(error)[:500]
-    _count("fallback")
+    _count("fallback", kind)

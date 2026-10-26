@@ -36,7 +36,6 @@ __all__ = [
     "patch_dsa_sparse_flex",
 ]
 
-import importlib.util
 import inspect
 import os
 
@@ -44,23 +43,33 @@ import torch
 
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, publish_to_modeling_module
 from .utils import logger
+from . import sparse_attention as _skip
+from .sparse_attention import _transformers_tested
 from ..flex_attention import sparse_blocks as _sb
+from ..flex_attention.sparse import sparse_indexer_chunked_enabled
 
 # family -> modeling module, bound at patch time
 _MODELING = {}
 
 
 def _modeling(name):
-    path = f"transformers.models.{name}.modeling_{name}"
-    try:
-        if importlib.util.find_spec(path) is None:
-            return None
-    except Exception:
-        return None
-    try:
-        return importlib.import_module(path)
-    except Exception:
-        return None
+    return _skip._modeling_module(name)
+
+
+def _indexer_base(cls, model_type, skip_forward, skip_installer):
+    """(upstream forward, forward to delegate within-budget calls to), or None.
+
+    The exact skip (sparse_attention.py) is installed first, so within the budget its
+    bitwise-identical path runs whichever patch set loads first; above the budget this module
+    takes over. Its installer only patches an upstream forward, so it no-ops on ours later."""
+    skip_installer()
+    current = cls.forward
+    if current is skip_forward:
+        upstream = _skip._REFERENCE.get(f"{model_type}.indexer")
+        return (upstream, current) if upstream is not None else None
+    if _skip._is_transformers_function(current, model_type):
+        return current, current
+    return None
 
 
 def _source_has(function, needles):
@@ -82,17 +91,6 @@ def _dsa_min_keys():
     return None
 
 
-def _transformers_tested():
-    """These forwards reimplement transformers >= 5.17. 5.12 - 5.16 indexers differ (no mask
-    for unpadded SDPA, per-query MiniMax blocks), so older releases keep their own path."""
-    try:
-        import transformers
-        from packaging.version import Version
-        return Version(transformers.__version__.split("+")[0]) >= Version("5.17.0")
-    except Exception:
-        return False
-
-
 # --------------------------------------------------------------------------------------
 # MiniMax M3
 # --------------------------------------------------------------------------------------
@@ -109,13 +107,15 @@ _MINIMAX_INDEXER_NEEDLES = (
 
 
 def unsloth_minimax_m3_indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids):
-    m = _MODELING["minimax_m3_vl"]
-    if _sb.chunked_indexer_enabled():
-        return _sb.minimax_m3_select_blocks(
-            self, hidden_states, position_embeddings, past_key_values, position_ids, m.apply_rotary_pos_emb,
-        )
-    with torch.no_grad():
-        return self._unsloth_original_forward(hidden_states, position_embeddings, past_key_values, position_ids)
+    if sparse_indexer_chunked_enabled():
+        k_len = _skip._minimax_index_key_len(self, hidden_states.shape[1], past_key_values)
+        if k_len is not None and -(-k_len // self.block_size) > self.topk_blocks:
+            m = _MODELING["minimax_m3_vl"]
+            return _sb.minimax_m3_select_blocks(
+                self, hidden_states, position_embeddings, past_key_values, position_ids, m.apply_rotary_pos_emb,
+            )
+    # Within the budget: the exact skip (or upstream when the skip is off / not installed).
+    return self._unsloth_inner_forward(hidden_states, position_embeddings, past_key_values, position_ids)
 
 
 def unsloth_minimax_m3_sparse_attention_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, **kwargs):
@@ -193,7 +193,8 @@ def patch_minimax_m3_sparse_flex():
     indexer = getattr(m, "MiniMaxM3VLIndexer", None)
     if attn is None or indexer is None or getattr(attn.forward, "_unsloth_sparse_flex", False):
         return
-    if not _source_has(attn.forward, _MINIMAX_ATTN_NEEDLES) or not _source_has(indexer.forward, _MINIMAX_INDEXER_NEEDLES):
+    base = _indexer_base(indexer, "minimax_m3_vl", _skip.minimax_m3_indexer_forward, _skip.patch_minimax_m3_sparse_skip)
+    if base is None or not _source_has(attn.forward, _MINIMAX_ATTN_NEEDLES) or not _source_has(base[0], _MINIMAX_INDEXER_NEEDLES):
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("Unsloth: MiniMax M3 attention source differs from the supported layout; sparse flex not installed.")
         return
@@ -212,7 +213,7 @@ def patch_minimax_m3_sparse_flex():
     def indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids):
         return unsloth_minimax_m3_indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids)
 
-    indexer._unsloth_original_forward = indexer.forward
+    indexer._unsloth_original_forward, indexer._unsloth_inner_forward = base
     forward._unsloth_sparse_flex = True
     indexer_forward._unsloth_sparse_flex = True
     attn.forward = forward
@@ -245,14 +246,15 @@ _DSA_INDEXER_NEEDLES = (
 _DSA_INDEXER_ROPE = {"deepseek_v32": "apply_rotary_pos_emb", "glm_moe_dsa": "apply_rotary_pos_emb_interleave"}
 
 
-def unsloth_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values = None):
+def unsloth_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids = None, past_key_values = None):
     family = self._unsloth_dsa_family
-    if _sb.chunked_indexer_enabled():
+    if sparse_indexer_chunked_enabled() and attention_mask.shape[-1] > self.index_topk:
         rope = getattr(_MODELING[family], _DSA_INDEXER_ROPE[family])
         return _sb.dsa_select_topk(
-            self, hidden_states, q_resid, position_embeddings, attention_mask, past_key_values, rope,
+            self, hidden_states, q_resid, position_embeddings, attention_mask, past_key_values, rope, family,
         )
-    return self._unsloth_original_forward(
+    # Within the budget: the exact skip (or upstream when the skip is off / not installed).
+    return self._unsloth_inner_forward(
         hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values = past_key_values,
     )
 
@@ -300,7 +302,7 @@ def _dsa_attention(self, family, hidden_states, position_embeddings, attention_m
     if _sb.dsa_flex_eligible(self, query_states, key_states, value_states, attention_mask, kwargs, _dsa_min_keys()):
         try:
             attn_output = _sb.dsa_flex_attention(
-                query_states, key_states, value_states, topk_indices, attention_mask, self.scaling,
+                query_states, key_states, value_states, topk_indices, attention_mask, self.scaling, family,
             )
             attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
             return self.o_proj(attn_output), None, topk_indices
@@ -364,13 +366,19 @@ def _patch_dsa_family(family, attn_name, indexer_name, attention_forward):
     indexer = getattr(m, indexer_name, None)
     if attn is None or indexer is None or getattr(attn.forward, "_unsloth_sparse_flex", False):
         return False
+    skip_forward, skip_installer = {
+        "deepseek_v32": (_skip.deepseek_v32_indexer_forward, _skip.patch_deepseek_v32_sparse_skip),
+        "glm_moe_dsa": (_skip.glm_moe_dsa_indexer_forward, _skip.patch_glm_moe_dsa_sparse_skip),
+    }[family]
+    base = _indexer_base(indexer, family, skip_forward, skip_installer)
     rope = getattr(m, _DSA_INDEXER_ROPE[family], None)
     if (
-        rope is None
+        base is None
+        or rope is None
         or not hasattr(m, "apply_rotary_pos_emb_interleave")
         or not _source_has(attn.forward, _DSA_ATTN_NEEDLES)
-        or not _source_has(indexer.forward, _DSA_INDEXER_NEEDLES)
-        or _DSA_INDEXER_ROPE[family] + "(q_rot, k_rot, cos, sin, unsqueeze_dim=2)" not in inspect.getsource(indexer.forward)
+        or not _source_has(base[0], _DSA_INDEXER_NEEDLES)
+        or _DSA_INDEXER_ROPE[family] + "(q_rot, k_rot, cos, sin, unsqueeze_dim=2)" not in inspect.getsource(base[0])
     ):
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: {family} attention source differs from the supported layout; sparse flex not installed.")
@@ -397,10 +405,10 @@ def _patch_dsa_family(family, attn_name, indexer_name, attention_forward):
                 self, hidden_states, position_embeddings, attention_mask, past_key_values, position_ids, prev_topk_indices, **kwargs
             )
 
-    def indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values = None):
+    def indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids = None, past_key_values = None):
         return unsloth_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values)
 
-    indexer._unsloth_original_forward = indexer.forward
+    indexer._unsloth_original_forward, indexer._unsloth_inner_forward = base
     attn._unsloth_upstream_forward = attn.forward
     indexer._unsloth_dsa_family = family
     forward._unsloth_sparse_flex = True

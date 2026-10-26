@@ -22,6 +22,7 @@ and Q / K / V gradients match upstream's dense masked attention, and whole tiny 
 with flex on vs off."""
 
 import importlib
+import os
 
 import pytest
 import torch
@@ -47,6 +48,11 @@ gpu = pytest.mark.skipif(
 )
 
 from unsloth_zoo.flex_attention import sparse_blocks as sb  # noqa: E402
+from unsloth_zoo.flex_attention import sparse as sparse_gates  # noqa: E402
+
+
+def _stat(kind, model_type):
+    return sparse_gates.SPARSE_ATTN_STATS.get(kind, {}).get(model_type, 0)
 
 
 @pytest.fixture(autouse = True)
@@ -140,7 +146,7 @@ def test_patches_install_and_are_idempotent():
 
 
 @needs_models
-@pytest.mark.parametrize("seq", [200, 333])
+@pytest.mark.parametrize("seq", [300, 333])  # above the 2 x 128 budget; within it the exact skip runs
 def test_minimax_chunked_indexer_selects_like_upstream(monkeypatch, seq):
     _patched()
     torch.manual_seed(0)
@@ -151,9 +157,9 @@ def test_minimax_chunked_indexer_selects_like_upstream(monkeypatch, seq):
     pos = pos.expand(2, -1)
     ref = indexer._unsloth_original_forward(h, (cos, sin), None, pos)
     monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_Q_CHUNK", "64")
-    before = sb.SPARSE_FLEX_STATS["minimax_m3_indexer_chunked"]
+    before = _stat("indexer_chunked", "minimax_m3_vl")
     got = indexer(h, (cos, sin), None, pos)
-    assert sb.SPARSE_FLEX_STATS["minimax_m3_indexer_chunked"] == before + 1
+    assert _stat("indexer_chunked", "minimax_m3_vl") == before + 1
     assert got.shape == ref.shape
     assert torch.equal(got.sort(dim = -1).values, ref.sort(dim = -1).values)
 
@@ -186,7 +192,7 @@ def test_flex_not_engaged_on_cpu_or_when_disabled(monkeypatch):
     q = torch.randn(1, 4, 32, 16)
     assert not sb.sparse_flex_device_ok(q)
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0")
-    assert not sb.sparse_flex_enabled()
+    assert not sparse_gates.sparse_flex_enabled()
 
 
 @needs_models
@@ -299,10 +305,10 @@ def test_dsa_flex_reuses_block_mask_for_shared_layers():
     q, k, v = (torch.randn(B, H, S, D, device = dev, dtype = dt) for _ in range(3))
     keep = torch.ones(S, S, dtype = torch.bool, device = dev).tril()[None, None]
     topk_idx = torch.randn(B, S, S, device = dev).masked_fill(~keep[:, 0], float("-inf")).topk(128, dim = -1).indices.int()
-    before = sb.SPARSE_FLEX_STATS["dsa_flex_reused"]
+    before = _stat("flex_reused", "dsa")
     a = sb.dsa_flex_attention(q, k, v, topk_idx, keep, D ** -0.5)
     b = sb.dsa_flex_attention(q, k, v, topk_idx, keep, D ** -0.5)
-    assert sb.SPARSE_FLEX_STATS["dsa_flex_reused"] == before + 1
+    assert _stat("flex_reused", "dsa") == before + 1
     assert torch.equal(a, b)
 
 
@@ -335,19 +341,17 @@ def test_tiny_model_flex_on_vs_off(monkeypatch, family):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS", "65")
     if family == "minimax_m3_vl":
         config = _minimax_config(num_attention_heads = 8, num_key_value_heads = 2, head_dim = 64, hidden_size = 128)
-        key = "minimax_m3_flex"
     else:
         config = _dsa_config(family, qk_nope_head_dim = 32, qk_rope_head_dim = 32, v_head_dim = 64)
-        key = "dsa_flex"
     model = _model(family, config)
     S = 512
     ids = torch.randint(0, config.vocab_size, (2, S), device = "cuda")
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0")
     _, dense_loss, dense_grads = _step(model, ids, ids)
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1")
-    before = sb.SPARSE_FLEX_STATS[key]
+    before = _stat("flex", family)
     _, flex_loss, flex_grads = _step(model, ids, ids)
-    assert sb.SPARSE_FLEX_STATS[key] >= before + 2, sb.SPARSE_FLEX_STATS
+    assert _stat("flex", family) >= before + 2, sparse_gates.SPARSE_ATTN_STATS
     assert not sb._FAILED, sb._FAILED
     model.float()
     _, ref_loss, ref_grads = _step(model, ids, ids)  # fp32: flex gated off, dense path
@@ -416,8 +420,20 @@ def test_tiny_model_cached_decode_after_flex_prefill(monkeypatch, family):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0")
     ref = run()
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1")
-    key = "minimax_m3_flex" if family == "minimax_m3_vl" else "dsa_flex"
-    before = sb.SPARSE_FLEX_STATS[key]
+    before = _stat("flex", family)
     got = run()
-    assert sb.SPARSE_FLEX_STATS[key] > before
+    assert _stat("flex", family) > before
     assert _rel(got, ref) < 5e-2, _rel(got, ref)
+
+
+@needs_models
+@pytest.mark.parametrize("family", ["deepseek_v32", "glm_moe_dsa", "minimax_m3_vl"])
+@pytest.mark.parametrize("order", ["skip_first", "flex_first"])
+def test_skip_and_flex_compose(order, family):
+    """Both patch sets in either order: exact skip within the budget, chunked / flex above it."""
+    import subprocess
+    import sys
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_sparse_compose_worker.py")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("UNSLOTH_SPARSE_")}
+    proc = subprocess.run([sys.executable, worker, order, family], capture_output = True, text = True, env = env, timeout = 600)
+    assert "COMPOSE_OK" in proc.stdout, proc.stdout[-3000:] + proc.stderr[-3000:]
