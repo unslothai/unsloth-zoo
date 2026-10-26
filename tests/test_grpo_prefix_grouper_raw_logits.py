@@ -122,7 +122,7 @@ def _run_pg_forward(hidden_states):
         "chunked_hidden_states_selective_log_softmax":
             rr.chunked_hidden_states_selective_log_softmax,
         "chunked_selective_log_softmax": rr.chunked_selective_log_softmax,
-        "_refresh_lm_head": lambda: None, "lm_head_bias": None,
+        "_refresh_lm_head": lambda: None, "_fp32_bind": lambda: None, "lm_head_bias": None,
         "device_synchronize": lambda *a, **k: None,
         "unwrapped_model": model,
         "lm_head": model.head.weight,          # [vocab, hidden]

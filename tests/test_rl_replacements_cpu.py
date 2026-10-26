@@ -22,7 +22,8 @@ Covers:
   - `_warn_unsupported_grpo_options` (warn-once for ignored TRL GRPO options:
     top_entropy_quantile; use_bias_correction_kl is supported so it must not warn)
   - the GRPO k3 KL clamp (log-ratio to [-20, 20], k3 to [-10, 10]) matches verl
-    `low_var_kl` / SkyRL `k3` in loss, mean_kl and gradient, before bias correction and beta
+    `low_var_kl` / SkyRL `k3` in loss, mean_kl and gradient; with bias correction the
+    [-10, 10] clamp applies to the weighted term, so a saturated KL never pushes away from ref
   - `grpo_compute_loss` with `use_bias_correction_kl=True` (KL x importance-sampling
     ratio, TRL GRPOConfig.use_bias_correction_kl) matches an inline TRL-mirror
     reference in loss, gradient and mean_kl for token and sequence IS levels
@@ -101,7 +102,7 @@ def test_grpo_kl_is_clamped_like_verl_low_var_kl(dtype):
 
 
 @pytest.mark.parametrize("use_bias_correction_kl", [False, True])
-def test_grpo_kl_clamp_precedes_bias_correction_and_beta(use_bias_correction_kl):
+def test_grpo_kl_clamp_follows_bias_correction_before_beta(use_bias_correction_kl):
     beta = 0.04
     new = torch.tensor([[-1.0, -2.0, -3.0]], dtype=torch.float64)
     old = new - torch.tensor([[0.1, -0.2, 0.0]], dtype=torch.float64)
@@ -112,11 +113,39 @@ def test_grpo_kl_clamp_precedes_bias_correction_and_beta(use_bias_correction_kl)
         mask, beta, torch.zeros(1, dtype=torch.float64),
         use_bias_correction_kl=use_bias_correction_kl,
     )
-    kl = _verl_low_var_kl(new, ref)
+    log_ratio = torch.clamp(ref - new, min=-20, max=20)
+    kl = torch.expm1(log_ratio) - log_ratio
     if use_bias_correction_kl:
         kl = kl * torch.exp(new - old)
+    kl = torch.clamp(kl, min=-10, max=10)
     torch.testing.assert_close(mean_kl, kl.mean())
     torch.testing.assert_close(loss, beta * kl.mean())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_grpo_saturated_bias_corrected_kl_descends_true_reverse_kl(dtype):
+    # Two outcomes, on-policy: the expected gradient must point the same way as the exact
+    # reverse KL's. Clamping k3 before the ratio left 10 * grad(ratio) on the saturated outcome.
+    beta, p_ref, p_pol = 0.01, [0.8, 0.2], [0.04, 0.96]
+    logits = torch.tensor(p_pol, dtype=dtype).log().requires_grad_()
+    grad = torch.zeros_like(logits)
+    for a in range(2):
+        new = torch.log_softmax(logits, -1)[a].view(1, 1)
+        ref = torch.tensor([[math.log(p_ref[a])]], dtype=dtype)
+        loss, *_ = rr.grpo_compute_loss(
+            ref, new, None, None, torch.zeros(1, 1, dtype=torch.long),
+            torch.ones(1, 1, dtype=dtype), beta, torch.zeros(1, dtype=dtype),
+            use_bias_correction_kl=True,
+        )
+        grad += p_pol[a] * torch.autograd.grad(loss, logits)[0]
+    exact = torch.tensor(p_pol, dtype=torch.float64).log().requires_grad_()
+    p = torch.softmax(exact, -1)
+    kl = beta * (p * (p.log() - torch.tensor(p_ref, dtype=torch.float64).log())).sum()
+    assert torch.autograd.grad(kl, exact)[0][0] < 0
+    # Only the unsaturated outcome contributes: grad(k3 * ratio) = 1 - r + k3 = -log r on-policy.
+    expected = p_pol[1] * beta * -math.log(p_ref[1] / p_pol[1]) * (-p_pol[0])
+    torch.testing.assert_close(grad[0].double(), torch.tensor(expected, dtype=torch.float64), rtol=1e-4, atol=1e-9)
+
 
 @pytest.mark.parametrize("width", [1, 2])
 def test_grpo_mean_kl_skips_masked_rows_for_one_token_completions(width):

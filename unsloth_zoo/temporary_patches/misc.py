@@ -22,6 +22,7 @@ import warnings
 from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import functools
+import contextlib
 # Guarded because tests load this file by path rather than as
 # `unsloth_zoo.temporary_patches.misc`, where a two-level relative import
 # raises "attempted relative import beyond top-level package".
@@ -1022,7 +1023,7 @@ def patch_transformers_masks():
         masking_utils.create_sliding_window_causal_mask,
     )
 
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial"):
         # `_torch_compile` is `noop` here, i.e. torch.compiler.disable: a fullgraph user compile would refuse it.
         compiled_create_causal_mask = original_create_causal_mask
         compiled_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
@@ -1201,8 +1202,7 @@ def patch_sdpa_bool_causal_mask():
     Drop pure causal bool masks (is_causal=True); convert non-pure bool masks to
     float additive bias. Skipped below 2**16 where the bug cannot fire.
     """
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
-        return
+    # No UNSLOTH_COMPILE_DISABLE early return: a correctness fix that compiles nothing.
     try:
         import transformers.integrations.sdpa_attention as sdpa_mod
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -3828,6 +3828,49 @@ def patch_output_collector_for_compiled_submodules():
     cls._unsloth_eager_mirror = True
 pass
 TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
+
+
+@contextlib.contextmanager
+def output_capture_scratch():
+    """Eager wrapper around one compiled decoder-layer call: capture hooks append into empty scratch lists.
+
+    A capture hook traced inside the compiled layer (router_logits for the MoE aux loss) appends to the
+    collector's list, and Dynamo guards on that list's length, which is the layer index: every layer
+    recompiled once and deep MoE models ran into the recompile limit. Inside this context the compiled
+    code reads a mirror whose lists start empty on every call; their items are moved to the real lists
+    afterwards, in call order. hidden_states keeps the real list (its hook reads the length)."""
+    try:
+        from transformers.utils import output_capturing
+        var = output_capturing._active_collector
+    except Exception:
+        yield
+        return
+    state = getattr(var, "__dict__", {})
+    value = state.get("_unsloth_eager_value")
+    if not isinstance(value, dict) or not state.get("_unsloth_eager_single", True) or \
+            getattr(state.get("_unsloth_eager_tls"), "depth", 0) <= 0:
+        yield
+        return
+    keys = [k for k, v in value.items() if type(v) is list and k != "hidden_states"]
+    if not keys:
+        yield
+        return
+    scratch = dict(value)
+    starts = {k: len(value[k]) for k in keys}
+    for k in keys:
+        scratch[k] = []
+    var._unsloth_eager_value = scratch
+    try:
+        yield
+    finally:
+        # A nested set / reset inside the call replaced the mirror: leave theirs.
+        if var.__dict__.get("_unsloth_eager_value") is scratch:
+            var._unsloth_eager_value = value
+        # Inserted where the context began: after a nested reset, later hooks append straight to
+        # value, and the scratch items were captured before them.
+        for k in keys:
+            value[k][starts[k]:starts[k]] = scratch[k]
+pass
 
 
 def patch_HiggsAudioV2Embeddings_autocast_dtype():

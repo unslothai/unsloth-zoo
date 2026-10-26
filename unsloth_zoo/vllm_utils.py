@@ -43,6 +43,7 @@ import os
 import ast
 import sys
 import traceback
+import warnings
 import shutil
 import torch
 from torch import __version__ as torch_version
@@ -104,10 +105,126 @@ def _return_nothing(*args, **kwargs): return None
 def _return_self(self, *args, **kwargs): return self
 def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
 
-def get_target_device(index = 0):
+def _current_device_index():
+    """The caller's current device: a torchrun rank has set_device(LOCAL_RANK) by now, a single process is on 0."""
+    try:
+        module = torch.cuda if DEVICE_TYPE in ("cuda", "hip") else getattr(torch, DEVICE_TYPE)
+        if module.is_available():
+            return module.current_device()
+    except Exception:
+        pass
+    return 0
+pass
+
+def get_target_device(index = None):
+    # None = the current device, not 0: under torchrun, rank 1 has set_device(1), and a
+    # hardcoded 0 put its vLLM engine and the converted HF weights on rank 0's GPU.
+    if index is None:
+        index = _current_device_index()
     if DEVICE_TYPE == "hip":
         return torch.device("cuda", index)
     return torch.device(DEVICE_TYPE, index)
+
+_TORCHRUN_ENV_KEYS = ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+
+def _torchrun_launch_info(environ = None):
+    """(rank, local_rank, world_size) when a torchrun-style launcher started this process, else None.
+
+    A single process with the five variables set by hand (the DeepSpeed-in-a-notebook recipe) keeps
+    vLLM's own executor: only a multi-process world or torchrun itself (TORCHELASTIC_RUN_ID, also
+    for --nproc-per-node 1, whose agent store hangs the private group) takes the external launcher."""
+    environ = os.environ if environ is None else environ
+    if not all(environ.get(key) for key in _TORCHRUN_ENV_KEYS):
+        return None
+    try:
+        rank, local_rank, world_size = (
+            int(environ["RANK"]), int(environ["LOCAL_RANK"]), int(environ["WORLD_SIZE"])
+        )
+    except ValueError:
+        return None
+    if world_size < 1 or not (0 <= rank < world_size) or local_rank < 0:
+        return None
+    if world_size == 1 and not environ.get("TORCHELASTIC_RUN_ID"):
+        return None
+    return rank, local_rank, world_size
+pass
+
+def _process_group_timeout():
+    """HF's ddp_timeout default (1800 s). The group is created at model load, before TrainingArguments
+    exist, and the Trainer reuses it: UNSLOTH_DDP_TIMEOUT (seconds) sets it instead."""
+    try:
+        seconds = int(os.environ.get("UNSLOTH_DDP_TIMEOUT", "1800"))
+    except ValueError:
+        seconds = 1800
+    return max(seconds, 1)
+pass
+
+def _setup_vllm_external_launcher(engine_args, launch_info):
+    """One vLLM engine per torchrun rank, inside the job's own process group.
+
+    vLLM's default single-process executor starts a private world_size = 1 group on a
+    fresh `tcp://ip:port`. torchrun exports TORCHELASTIC_USE_AGENT_STORE=True, which makes
+    torch's tcp:// rendezvous a TCPStore *client* of an agent store that only exists on
+    MASTER_PORT, so engine init blocks until the store timeout (torch
+    distributed/rendezvous.py `_create_c10d_store`). Flipping that variable is not enough:
+    vLLM's private group then becomes the default WORLD of size 1 and the Trainer's DDP
+    silently runs with one process per group. So create the real torchrun group first
+    (env://, what accelerate would create) and let vLLM join it with the
+    `external_launcher` executor: each rank is an independent data-parallel engine on
+    cuda:LOCAL_RANK (vLLM parallel_state.initialize_model_parallel: "ExternalDP ...
+    every dp rank can generate independently"), as TRL's colocate mode does.
+
+    Returns the device index vLLM must see as LOCAL_RANK, or None if unchanged.
+    """
+    import torch.distributed as dist
+    from datetime import timedelta
+    rank, local_rank, world_size = launch_info
+    local_index = None
+    if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
+        count = torch.cuda.device_count()
+        # A per-rank CUDA_VISIBLE_DEVICES leaves one card visible while LOCAL_RANK still counts ranks.
+        local_index = local_rank if local_rank < count else local_rank % max(count, 1)
+        torch.cuda.set_device(local_index)
+    if not dist.is_initialized():
+        # Same defaults accelerate uses for a torchrun job (HF ddp_timeout = 1800 s); the
+        # Trainer reuses an initialized group. backend None = nccl for cuda + gloo for cpu.
+        dist.init_process_group(
+            backend = None, init_method = "env://", timeout = timedelta(seconds = _process_group_timeout())
+        )
+    elif dist.get_world_size() != world_size:
+        logger.warning(
+            f"Unsloth: torch.distributed world size {dist.get_world_size()} != WORLD_SIZE {world_size}; "
+            "vLLM joins the initialized group."
+        )
+    engine_args["distributed_executor_backend"] = "external_launcher"
+    # vLLM requires a seed with external_launcher. Offset it per rank as TRL colocate does
+    # (seed = process_index // tp): GRPO puts copies of one prompt on several ranks, and
+    # equal engine seeds would sample identical completions for them.
+    engine_args["seed"] = int(engine_args.get("seed") or 0) + dist.get_rank()
+    if local_index is not None and local_index == local_rank:
+        local_index = None
+    print(
+        f"Unsloth: torchrun rank {dist.get_rank()}/{dist.get_world_size()}: vLLM engine on "
+        f"{get_target_device()} with the external_launcher executor."
+    )
+    return local_index
+pass
+
+@contextlib.contextmanager
+def _scoped_environ(updates):
+    """Set os.environ keys for the block and restore the previous values (or absence) after."""
+    saved = {key: os.environ.get(key) for key in updates}
+    try:
+        for key, value in updates.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+pass
 
 def _device_empty_cache():
     if DEVICE_TYPE == "npu":
@@ -3987,6 +4104,115 @@ def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
     return None
 
 
+# True while VLLM_USE_V2_MODEL_RUNNER=0 was set by load_vllm for ReplaySSM, so it may be undone.
+_UNSLOTH_SET_V1_RUNNER = False
+
+
+def _vllm_disable_envs_cache():
+    # vLLM caches env reads (envs.enable_envs_cache); the next engine must see the change.
+    try:
+        import vllm.envs as vllm_envs
+        disable = getattr(vllm_envs, "disable_envs_cache", None)
+        if disable is not None:
+            disable()
+    except Exception:
+        pass
+
+
+# Speculative methods vLLM 0.31 MRV2 cannot run (_get_v2_model_runner_unsupported_features).
+_MRV2_UNSUPPORTED_SPECULATIVE_METHODS = frozenset((
+    "ngram", "ngram_gpu", "suffix", "medusa", "mlp_speculator", "custom_class",
+))
+
+# vLLM 0.31 ROCM_DEFAULT_MRV1_ARCHITECTURES: V1 on ROCm when the runner is unset; gone in 0.32 (#56360).
+_ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset((
+    "DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM",
+))
+
+
+def _vllm_rocm_default_v1_architectures():
+    try:
+        import importlib
+        module = importlib.import_module("vllm.config.vllm")
+    except Exception:
+        module = None
+    if module is not None:
+        return frozenset(getattr(module, "ROCM_DEFAULT_MRV1_ARCHITECTURES", None) or ())
+    from .routing_replay import _vllm_at_least
+    return frozenset() if _vllm_at_least(0, 32) else _ROCM_DEFAULT_MRV1_ARCHITECTURES
+
+
+def _routing_replay_model_runner(engine_args, config = None):
+    """vLLM 0.31+ captures routed experts only on MRV2 with prefix caching
+    (_verify_aux_output_compatibility). Takes back a V1 runner left by ReplaySSM, drops suffix
+    decoding, else turns routing replay off. Returns None, "restored_v2", "replay_off" or
+    "speculation_off"."""
+    global _UNSLOTH_SET_V1_RUNNER
+    if not engine_args.get("enable_return_routed_experts"):
+        return None
+    from .routing_replay import _vllm_at_least, ROUTING_REPLAY_ENV
+    if not _vllm_at_least(0, 31):
+        return None
+    if engine_args.get("enable_prefix_caching", True) is False:
+        engine_args.pop("enable_return_routed_experts", None)
+        engine_args.pop("async_scheduling", None)
+        warnings.warn(
+            f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: prefix caching is off (on "
+            "request, or on a GPU below compute capability 7.5), and this vLLM captures routed "
+            "experts only with prefix caching on.",
+            stacklevel = 2,
+        )
+        return "replay_off"
+    action = None
+    value = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", None)
+    try:
+        forced = None if value is None else bool(int(value.strip()))
+    except ValueError:
+        forced = None
+    v1 = forced is False
+    if forced is not True and not (v1 and not _UNSLOTH_SET_V1_RUNNER) and is_hip():
+        default_v1 = _vllm_rocm_default_v1_architectures()
+        architectures = [a for a in (getattr(config, "architectures", None) or ()) if a in default_v1]
+        if architectures:
+            engine_args.pop("enable_return_routed_experts", None)
+            engine_args.pop("async_scheduling", None)
+            warnings.warn(
+                f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: on ROCm vLLM runs "
+                f"{', '.join(architectures)} on Model Runner V1, and this vLLM captures routed "
+                "experts only on V2. Set VLLM_USE_V2_MODEL_RUNNER=1 to use routing replay.",
+                stacklevel = 2,
+            )
+            return "replay_off"
+    if v1:
+        if not _UNSLOTH_SET_V1_RUNNER:
+            engine_args.pop("enable_return_routed_experts", None)
+            engine_args.pop("async_scheduling", None)
+            warnings.warn(
+                f"Unsloth: {ROUTING_REPLAY_ENV}=1 is off for this engine: VLLM_USE_V2_MODEL_RUNNER=0 selects "
+                "Model Runner V1, and this vLLM captures routed experts only on V2. Unset "
+                "VLLM_USE_V2_MODEL_RUNNER to use routing replay.",
+                stacklevel = 2,
+            )
+            return "replay_off"
+        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+        _UNSLOTH_SET_V1_RUNNER = False
+        _vllm_disable_envs_cache()
+        print("Unsloth: routing replay needs vLLM Model Runner V2; dropping the V1 runner an earlier ReplaySSM load set.")
+        action = "restored_v2"
+    speculative_config = engine_args.get("speculative_config", None)
+    method = speculative_config.get("method", None) if isinstance(speculative_config, dict) \
+        else getattr(speculative_config, "method", None)
+    if method in _MRV2_UNSUPPORTED_SPECULATIVE_METHODS:
+        engine_args.pop("speculative_config", None)
+        what = "suffix decoding" if method == "suffix" else f"speculative method {method!r}"
+        print(
+            f"Unsloth: {what} is off for this engine: vLLM Model Runner V2 does not run it, and "
+            f"routing replay ({ROUTING_REPLAY_ENV}=1) needs V2 on this vLLM."
+        )
+        action = action or "speculation_off"
+    return action
+
+
 def _is_vllm_replayssm_refusal(error_text):
     # vLLM's config validation refuses the combination (e.g. a forced Model Runner V2). With
     # speculative decoding vLLM 0.29 turns ReplaySSM into RecoverSSM, which only Kimi KDA supports.
@@ -4194,7 +4420,7 @@ def load_vllm(
             "vLLM state at import, so installing into a live session is not enough."
         )
 
-    global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS
+    global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS, _UNSLOTH_SET_V1_RUNNER
     _UNSLOTH_FLASHINFER_UNUSABLE = False
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
@@ -4817,12 +5043,18 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
-        if not use_async and not use_engine:
+        # Not for return_args (`vllm serve`): its CLI drops False values such as async_scheduling.
+        # True while moe_backend = "triton" is only for routing replay's capture hook.
+        replay_moe_pin = False
+        if not use_async and not use_engine and not return_args:
             from .routing_replay import routing_replay_engine_args
-            engine_args.update(routing_replay_engine_args(config))
+            replay_engine_args = routing_replay_engine_args(config)
+            engine_args.update(replay_engine_args)
+            replay_moe_pin = "moe_backend" in replay_engine_args
         if fp8_moe is not None:
             # Only the Triton FP8 MoE kernel keeps the expert layout training aliases.
             engine_args["moe_backend"] = "triton"
+            replay_moe_pin = False
         if (enable_lora and not use_async and not use_engine and not use_bitsandbytes and not is_fp8
                 and _merged_rollout_mode() == "attention"):
             # Attention is folded, so vLLM wraps only the rest: no punica kernels on attention.
@@ -4900,7 +5132,12 @@ def load_vllm(
         # return_args callers (SyntheticDataKit's `vllm serve`) turn every value into a CLI flag with
         # str(), and vLLM parses --speculative-config as JSON, so a dict here kills the server.
         suffix_config = None if return_args else _vllm_suffix_decoding_config()
+        pre_speculation_sizes = None
         if suffix_config is not None:
+            pre_speculation_sizes = (
+                approx_max_num_seqs, max_num_batched_tokens,
+                engine_args.get("max_num_seqs"), engine_args.get("max_num_batched_tokens"),
+            )
             engine_args["speculative_config"] = suffix_config
             if enable_lora:
                 fitted_max_num_seqs = _fit_max_num_seqs_to_speculation(
@@ -4960,6 +5197,13 @@ def load_vllm(
             elif _flash_attn_is_selectable():
                 engine_args["attention_backend"] = "FLASH_ATTN"
 
+        # torchrun / DDP: one engine per rank in the job's process group (see the helper).
+        # The async engine always runs its core in a subprocess, which external_launcher refuses.
+        torchrun_info = None if (return_args or use_async) else _torchrun_launch_info()
+        vllm_local_rank = None
+        if torchrun_info is not None:
+            vllm_local_rank = _setup_vllm_external_launcher(engine_args, torchrun_info)
+
         # Older vLLM has no such arg; the filter below drops unknown keys, so this is a
         # no-op there rather than a TypeError.
         good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
@@ -5007,6 +5251,17 @@ def load_vllm(
 
         # Only for engines built here: return_args callers (e.g. `vllm serve`) start
         # their own process without the runner setting below.
+        # Before the ReplaySSM conflict test: a user V1 runner turns routing replay off, ReplaySSM stays.
+        replay_runner_action = _routing_replay_model_runner(engine_args, config)
+        if replay_runner_action == "replay_off" and replay_moe_pin:
+            engine_args.pop("moe_backend", None)
+        if pre_speculation_sizes is not None and "speculative_config" not in engine_args:
+            approx_max_num_seqs, max_num_batched_tokens, seqs, tokens = pre_speculation_sizes
+            for key, value in (("max_num_seqs", seqs), ("max_num_batched_tokens", tokens)):
+                if value is None:
+                    engine_args.pop(key, None)
+                else:
+                    engine_args[key] = value
         replayssm_set_runner = False
         replayssm_mode = _vllm_replayssm_mode()
         # A runner the user forced to V2 would only get the engine refused and rebuilt.
@@ -5018,6 +5273,11 @@ def load_vllm(
             replayssm_mode = "off"
         if replayssm_mode != "off":
             replayssm_skip = _vllm_replayssm_skip_reason(config, good_keys, DEVICE_TYPE)
+            if replayssm_skip is None and engine_args.get("enable_return_routed_experts"):
+                # vLLM 0.31 refuses capture on V1, which ReplaySSM pins: routing replay wins.
+                from .routing_replay import _vllm_at_least
+                if _vllm_at_least(0, 31):
+                    replayssm_skip = "routing replay needs Model Runner V2 on this vLLM, ReplaySSM needs V1"
             if replayssm_skip is None and not (
                 _patch_vllm_replayssm_mamba2(replayssm_type) if replayssm_type in _REPLAYSSM_MAMBA2_MODELS
                 else _patch_vllm_replayssm_gdn() if replayssm_type in _REPLAYSSM_GDN_MODEL_TYPES
@@ -5035,6 +5295,7 @@ def load_vllm(
                 if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
                     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
                     replayssm_set_runner = True
+                    _UNSLOTH_SET_V1_RUNNER = True
             elif replayssm_mode == "on":
                 print(f"Unsloth: UNSLOTH_VLLM_REPLAYSSM=1 ignored: {replayssm_skip}.")
         pass
@@ -5048,10 +5309,15 @@ def load_vllm(
             try:
                 if use_async:
                     llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_args))
-                elif use_engine:
-                    llm = LLMEngine.from_engine_args(EngineArgs(**engine_args))
                 else:
-                    llm = LLM(**engine_args)
+                    # external_launcher reads LOCAL_RANK as the device index: remap it only
+                    # while the engine starts when the launcher masked one card per rank.
+                    scoped = {} if vllm_local_rank is None else {"LOCAL_RANK": str(vllm_local_rank)}
+                    with _scoped_environ(scoped):
+                        if use_engine:
+                            llm = LLMEngine.from_engine_args(EngineArgs(**engine_args))
+                        else:
+                            llm = LLM(**engine_args)
                 pass
                 loaded = True
                 break
@@ -5072,6 +5338,7 @@ def load_vllm(
                     engine_args.pop("use_replayssm")
                     if replayssm_set_runner:
                         os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                        _UNSLOTH_SET_V1_RUNNER = False
                     print(f"Unsloth: vLLM refused ReplaySSM, loading without it.\nError:\n{error}")
                     continue
                 # A transient race: retry the *identical* load rather than fall
@@ -5163,7 +5430,9 @@ def load_vllm(
             suppress_vllm_padded_vocab(
                 llm, padded_ids, speculative = engine_args.get("speculative_config", None) is not None,
             )
-        if _merged_rollout_enabled():
+        if _merged_rollout_enabled() and _merged_rollout_auto_engine_ok(
+            enable_lora, use_async, use_engine, use_bitsandbytes, is_fp8, engine_args, is_vision_model,
+        ):
             llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)
         if _UNSLOTH_FLASHINFER_UNUSABLE:
@@ -5220,7 +5489,55 @@ def save_lora(model, save_directory, *args, **kwargs):
     # Cast LoRA to float16 / bfloat16
     state_dict = {k:v.to(dtype) for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
     kwargs["state_dict"] = state_dict
-    model.save_pretrained(save_directory = save_directory, *args, **kwargs)
+    rank, world_size = _distributed_rank_and_world()
+    if world_size <= 1 or kwargs.get("push_to_hub", False):
+        # push_to_hub names the repo after save_directory, so a push keeps the real path, on whichever
+        # rank the user calls it from (as before).
+        model.save_pretrained(save_directory = save_directory, *args, **kwargs)
+        return
+    # DDP: every rank holds the same adapter and usually load_lora's this folder next.
+    # Rank 0 alone would leave the others reading a missing or half-written folder, and a
+    # barrier would deadlock a save the user gated on rank 0. So each rank writes its own
+    # copy and swaps the files in atomically.
+    kwargs["push_to_hub"] = False
+    _save_dir_atomically(
+        lambda tmp: model.save_pretrained(save_directory = tmp, *args, **kwargs),
+        save_directory, rank,
+    )
+pass
+
+
+def _distributed_rank_and_world():
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+    except Exception:
+        pass
+    return 0, 1
+pass
+
+
+def _save_dir_atomically(save_fn, save_directory, rank):
+    """save_fn(tmp_dir) into a private folder, then os.replace each file into save_directory.
+
+    os.replace is atomic on one filesystem, so a rank reading the folder sees a whole old or a
+    whole new file, never one another rank is still writing (all ranks write the same bytes).
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    save_directory = os.fspath(save_directory)
+    tmp = f"{save_directory.rstrip(os.sep)}.unsloth_tmp_rank{rank}_{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors = True)
+    try:
+        save_fn(tmp)
+        for root, _, files in os.walk(tmp):
+            rel = os.path.relpath(root, tmp)
+            target = save_directory if rel == "." else os.path.join(save_directory, rel)
+            os.makedirs(target, exist_ok = True)
+            for name in files:
+                os.replace(os.path.join(root, name), os.path.join(target, name))
+    finally:
+        shutil.rmtree(tmp, ignore_errors = True)
 pass
 
 
@@ -5240,7 +5557,12 @@ def _live_lora_config(model, save_directory):
     # Raw path key: os.path.abspath would cost a getcwd syscall per GRPO step.
     cached = _LIVE_LORA_CONFIGS.get(save_directory)
     if cached is None or cached[0] is not config:
-        config.save_pretrained(save_directory)
+        rank, world_size = _distributed_rank_and_world()
+        if world_size <= 1:
+            config.save_pretrained(save_directory)
+        else:
+            # Every DDP rank writes this file and another rank's vLLM may be reading it.
+            _save_dir_atomically(config.save_pretrained, save_directory, rank)
         cached = (config, get_peft_config(save_directory))
         _LIVE_LORA_CONFIGS[save_directory] = cached
     return cached[1]
@@ -5978,12 +6300,52 @@ _MERGED_ROLLOUT_PUNICA_MODULES = (
 _MERGED_ROLLOUT_LOCK = threading.RLock()
 
 
-def _merged_rollout_mode():
-    """"all" (=1): fold every LoRA layer. "attention": fold attention only, the rest stays on vLLM LoRA."""
+# Counts for tests and benchmarks: outermost folds, and calls that fell back to vLLM LoRA.
+_MERGED_ROLLOUT_STATS = {"folds": 0, "fallbacks": 0}
+
+
+def _merged_rollout_automatic():
+    """True when UNSLOTH_VLLM_MERGED_ROLLOUT is unset (or "auto"): the measured default decides.
+    "0" (or any other value) is off, "1" forces every eligible layer, "attention" folds attention only."""
     # All Unsloth Zoo code licensed under LGPLv3
-    value = os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "0").strip().lower()
+    return os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "").strip().lower() in ("", "auto")
+pass
+
+
+@functools.lru_cache(maxsize = 1)
+def _merged_rollout_auto_platform():
+    """None when the automatic default may fold on this machine, else why not. Measured only on
+    NVIDIA CUDA under Linux with the exact Triton fold (merged_rollout_exact) and vLLM >= 0.11.2;
+    ROCm, XPU, Windows / WSL and older vLLM keep vLLM LoRA unless UNSLOTH_VLLM_MERGED_ROLLOUT=1."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not sys.platform.startswith("linux"): return f"the platform is {sys.platform}"
+    try:
+        if "microsoft" in os.uname().release.lower(): return "this is WSL"
+    except Exception:
+        pass
+    if getattr(torch.version, "hip", None) is not None: return "this is ROCm"
+    if not torch.cuda.is_available(): return "CUDA is not available"
+    try:
+        from .merged_rollout_exact import triton as _triton
+    except Exception:
+        _triton = None
+    if _triton is None: return "Triton is not available for the exact fold"
+    try:
+        if Version(vllm_version) < Version("0.11.2"): return f"vLLM {vllm_version} is older than 0.11.2"
+    except Exception:
+        return "the vLLM version is unknown"
+    return None
+pass
+
+
+def _merged_rollout_mode():
+    """"all": fold every LoRA layer (=1, or the automatic default where it applies). "attention": fold
+    attention only, the rest stays on vLLM LoRA. None: off (=0, or the automatic default does not apply)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    value = os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "").strip().lower()
     if value == "1": return "all"
     if value in ("attention", "attn"): return "attention"
+    if value in ("", "auto"): return "all" if _merged_rollout_auto_platform() is None else None
     return None
 pass
 
@@ -5991,6 +6353,20 @@ pass
 def _merged_rollout_enabled():
     # All Unsloth Zoo code licensed under LGPLv3
     return _merged_rollout_mode() is not None
+pass
+
+
+def _merged_rollout_auto_engine_ok(enable_lora, use_async, use_engine, use_bitsandbytes, is_fp8, engine_args,
+                                   is_vision_model = False):
+    """The automatic default wraps only the engine shape it was measured on: one synchronous text LLM
+    serving 16-bit LoRA, no bitsandbytes / FP8 / other quantization, one GPU. "1" wraps every engine as before."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not _merged_rollout_automatic(): return True
+    if not enable_lora or use_async or use_engine or use_bitsandbytes or is_fp8 or is_vision_model: return False
+    if engine_args.get("quantization", None) is not None: return False
+    if int(engine_args.get("tensor_parallel_size", 1) or 1) != 1: return False
+    if int(engine_args.get("pipeline_parallel_size", 1) or 1) != 1: return False
+    return True
 pass
 
 
@@ -6271,23 +6647,38 @@ def _prepare_merged_rollout_locked(model):
     model._unsloth_merged_rollout_state = cached = None
 
     targets, reason, entries = None, None, None
+    automatic = _merged_rollout_automatic()
+    quiet = False
     if not getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
         reason = "the vLLM engine was not wrapped (set UNSLOTH_VLLM_MERGED_ROLLOUT before loading the model)"
+        # The automatic default declined this engine at load (quantized, async, ...): nothing to say.
+        quiet = automatic
     else:
         targets, reason = _merged_rollout_targets(model)
+    if reason is None and automatic and any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
+        reason = "the automatic default does not fold MoE expert LoRA (set UNSLOTH_VLLM_MERGED_ROLLOUT=1 to force it)"
     if reason is None:
         if _merged_rollout_use_exact(targets):
             entries = ([(module, W, None) for _, module, W in targets], None)
         elif any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
             reason = "MoE expert LoRA folds only with the exact fold, which needs every folded weight on one CUDA device"
+        elif automatic:
+            # The pinned copy costs a full host copy of the folded weights: opt-in only.
+            reason = (
+                "the exact in-place fold is unavailable and the automatic default does not pin a host copy "
+                "(set UNSLOTH_VLLM_MERGED_ROLLOUT=1 to use the pinned copy)"
+            )
         else:
             entries, reason = _merged_rollout_host_copies(targets)
     if reason is not None:
         modules = _merged_rollout_lora_layers(model)
         model._unsloth_merged_rollout_state = _MergedRolloutVerdict(model, modules, reason)
-        _merged_rollout_log_once(
-            f"Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT is on but falling back to vLLM LoRA (punica) because {reason}."
-        )
+        if not quiet:
+            _merged_rollout_log_once(
+                f"Unsloth: merged-weight rollouts (automatic) are not used because {reason}; generating with vLLM LoRA."
+                if automatic else
+                f"Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT is on but falling back to vLLM LoRA (punica) because {reason}."
+            )
         return None
     entries, host = entries
     state = _MergedRolloutState(model, entries)
@@ -6304,7 +6695,7 @@ def _prepare_merged_rollout_locked(model):
         pinned = "pinned" if getattr(entries[0][2], "is_pinned", lambda: False)() else "pageable"
         how = f"pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)"
     _merged_rollout_log_once(
-        f"Unsloth: Merged-weight rollouts on ({_merged_rollout_mode()}): folding the adapter into {len(entries)} "
+        f"Unsloth: Merged-weight rollouts on ({_merged_rollout_mode()}{', automatic' if _merged_rollout_automatic() else ''}): folding the adapter into {len(entries)} "
         f"shared weights{rest}; {how}."
     )
     return state
@@ -6593,6 +6984,7 @@ def merged_rollout(state):
                         for module, W, P in state.entries:
                             _merged_rollout_fold(W, module, adapter)
                 _merged_rollout_synchronize(state)
+                _MERGED_ROLLOUT_STATS["folds"] += 1
             yield
         finally:
             state.depth -= 1
@@ -6655,6 +7047,7 @@ def _merged_rollout_lora_fallback(request, reason):
     model = request.state.model_ref()
     if model is None:
         raise RuntimeError("Unsloth: the model behind this merged-rollout LoRA request was freed.")
+    _MERGED_ROLLOUT_STATS["fallbacks"] += 1
     _merged_rollout_log_once(
         f"Unsloth: merged-weight rollout used vLLM LoRA (punica) for a call because {reason}."
     )

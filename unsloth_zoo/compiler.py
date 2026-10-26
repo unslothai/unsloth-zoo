@@ -56,12 +56,17 @@ from .utils import (
     get_lock,
 )
 from .log import logger
-import triton
+try:
+    import triton
+except ImportError:  # AMD Windows / CPU wheels ship no Triton
+    triton = None
 import regex
 from .peft_utils import get_lora_layer_modules
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_SOURCE,
     MHC_SINKHORN_REPLACEMENT,
+    MHC_PROJECTION_SOURCE,
+    MHC_PROJECTION_REPLACEMENT,
     mhc_fast_mode,
 )
 from importlib.metadata import version as importlib_version
@@ -100,15 +105,27 @@ minor = None
 # Bound before the branches: DEVICE_TYPE == "cpu" takes none of them, and
 # `fuse_lm_head` then read this global and raised NameError.
 OLD_CUDA_ARCH_VERSION = False
+# Visible pre-Turing (or unreadable) card indices. The rewrite is installed before placement,
+# so a head a device_map puts on one skips Inductor and CCE per forward (lm_head_on_old_cuda_arch).
+OLD_CUDA_ARCH_INDICES = frozenset()
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
-        # Any visible pre-Turing card, not just the current one: a device_map can place
-        # layers on it, and Inductor fails there.
-        from .device_type import _visible_cuda_capabilities
-        OLD_CUDA_ARCH_VERSION = any(
-            (_major <= 7) and (_minor < 5) for _major, _minor in _visible_cuda_capabilities()
-        )
+        # Current device only, as torch decides: an idle older card must not disable the fusion.
+        OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+        _old_indices = set()
+        try:
+            for _index in range(torch.cuda.device_count()):
+                try:
+                    _major, _minor = torch.cuda.get_device_capability(_index)
+                except Exception:
+                    _old_indices.add(_index)
+                    continue
+                if (_major <= 7) and (_minor < 5):
+                    _old_indices.add(_index)
+        except Exception:
+            pass
+        OLD_CUDA_ARCH_INDICES = frozenset(_old_indices)
     else:
         # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
         # ask whether a device is present before asking what it can do. There is
@@ -121,7 +138,22 @@ elif DEVICE_TYPE == "xpu":
     OLD_CUDA_ARCH_VERSION = False
 pass
 
-OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
+
+def lm_head_on_old_cuda_arch(weight):
+    """True when the LM head weight sits on a visible pre-Turing card. A frozenset read, so the
+    generated forward stays traceable."""
+    if not OLD_CUDA_ARCH_INDICES:
+        return False
+    device = getattr(weight, "device", None)
+    return device is not None and device.type == "cuda" and device.index in OLD_CUDA_ARCH_INDICES
+pass
+
+# AST-rewritten forwards and the import hook use the shared adapter; fused_losses never imports this module.
+from unsloth_zoo.fused_losses import forward_adapter as _forward_adapter
+_forward_adapter.lm_head_on_old_cuda_arch = lm_head_on_old_cuda_arch
+del _forward_adapter
+
+OLD_TRITON_VERSION = triton is None or Version(triton.__version__) < Version("3.0.0")
 
 # Check if Unsloth Studio is allowed
 import importlib.util
@@ -250,11 +282,46 @@ MODULE_FORWARD_SOURCE_REWRITES = {
     "deepseek_v41": {
         "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
+    # GLM-5.3-Flash carries the V4 Sinkhorn chain verbatim (transformers 5.17 - 5.20).
+    "glm5_next": {
+        "Glm5NextTextHyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
 }
+
+
+# {model_type: {class: (old, new)}}: forward rewrites that apply whether or not the class compiles
+# (the eager mixer saves its FP32 upcast for backward; compiled blocks do not, and the helper
+# keeps the stock math under torch.compile).
+MODULE_FORWARD_EAGER_REWRITES = {
+    "deepseek_v4": {"DeepseekV4HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
+    "deepseek_v41": {"DeepseekV41HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
+    "glm5_next": {"Glm5NextTextHyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
+}
+
+
+def module_forward_eager_rewrites(modeling_file, model_type):
+    """{class: rewritten forward source} for MODULE_FORWARD_EAGER_REWRITES that match exactly once."""
+    applicable = {}
+    for name, (old, new) in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}).items():
+        try:
+            cls = getattr(modeling_file, name)
+            source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = source.replace(old, new)
+            if "unsloth_mhc_projection" in new:
+                # Same reason as unsloth_sinkhorn_knopp below: block compile rebinds the forward
+                # to the modeling module's globals.
+                from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection
+
+                modeling_file.unsloth_mhc_projection = unsloth_mhc_projection
+    return applicable
 
 
 def module_forward_source_rewrites(modeling_file, model_type):
     applicable = {}
+    eager_rewrites = module_forward_eager_rewrites(modeling_file, model_type)
     for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
         try:
             mode = mode()
@@ -264,8 +331,16 @@ def module_forward_source_rewrites(modeling_file, model_type):
             source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
         except Exception:
             continue
+        source = eager_rewrites.get(name, source)
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
+            if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
+                # Block compile rebinds a layer's forward to its modeling module's globals, so the
+                # helper the rewritten forward calls must resolve there too, not only in the
+                # generated module that imports it.
+                from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
+
+                modeling_file.unsloth_sinkhorn_knopp = unsloth_sinkhorn_knopp
     return applicable
 
 
@@ -603,6 +678,7 @@ from unsloth_zoo.loss_utils import (
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
 from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
@@ -1098,6 +1174,16 @@ def _all_attention_functions_has_sdpa():
 pass
 
 
+def _is_single_operand(expression):
+    # `.to(<expression>.dtype)` only reads right for one operand: `a + b` becomes `a + (b.dtype)`.
+    try:
+        node = ast.parse(expression.strip(), mode = "eval").body
+    except SyntaxError:
+        return False
+    return isinstance(node, (ast.Name, ast.Attribute, ast.Call, ast.Subscript))
+pass
+
+
 # Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
 def higher_precision_softmax(source):
     """
@@ -1125,6 +1211,8 @@ def higher_precision_softmax(source):
     for item in softmax_objects:
         full_match, matches = item.group(0), item.groups()
         softmax, variable, dim, dtype = matches
+        if not _is_single_operand(variable):
+            continue
         new = (
             f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
         )
@@ -2190,6 +2278,8 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
     if "unsloth_sinkhorn_knopp" in new_source:
         imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp\n"
+    if "unsloth_mhc_projection" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -2237,6 +2327,17 @@ def create_new_function(
     if "_bnb4bit_experts_forward_or_none" in new_source:
         # The patched Qwen3-VL-MoE expert forwards call it first, before any weight check.
         imports += "from unsloth_zoo.temporary_patches.qwen3_vl_moe import _bnb4bit_experts_forward_or_none\n"
+    if "_fused_route_or_none" in new_source:
+        # The zoo gpt-oss / Qwen3-MoE / Qwen3-VL-MoE / grouped ModuleList routers call it on
+        # every forward (it returns None unless UNSLOTH_MOE_FUSED_ROUTER=1), and their source
+        # is copied here without the patch module's globals. Same fallback as those modules.
+        imports += (
+            "try:\n"
+            "    from unsloth_zoo.temporary_patches.moe_router_triton import fused_route_or_none as _fused_route_or_none\n"
+            "except Exception:\n"
+            "    def _fused_route_or_none(*args, **kwargs):\n"
+            "        return None\n"
+        )
     imports += (
         "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     )
@@ -2842,9 +2943,13 @@ def _unwrap_undecorated_method(func, owner_qualname):
     standalone function from that emits `return wrapped(self, *args, **kwargs)`
     under the real named signature, which is a `NameError` at the first forward.
 
-    Walk `__wrapped__` and then single function closure cells until we land on a
-    function that really belongs to `owner_qualname`. If no such function is
-    found, return `func` unchanged so nothing else changes behaviour.
+    A wrapper can also bind the original through a default argument (Jamba /
+    Zamba `_slow_only` in `temporary_patches/misc.py`); its default names a patch
+    local, so re-emitting it raises `NameError`. Such defaults are walked too.
+
+    Walk `__wrapped__` and then single function closure cells or defaults until
+    we land on a function that really belongs to `owner_qualname`. If no such
+    function is found, return `func` unchanged so nothing else changes behaviour.
     """
     prefix = owner_qualname + "."
     if getattr(func, "__qualname__", "").startswith(prefix):
@@ -2854,17 +2959,22 @@ def _unwrap_undecorated_method(func, owner_qualname):
     for _ in range(10):
         candidate = getattr(current, "__wrapped__", None)
         if candidate is None:
-            cells = getattr(current, "__closure__", None)
-            if getattr(current, "__code__", None) is None or not cells:
+            if getattr(current, "__code__", None) is None:
                 break
             inner = []
-            for cell in cells:
+            for cell in getattr(current, "__closure__", None) or ():
                 try:
                     value = cell.cell_contents
                 except ValueError:
                     continue
                 if inspect.isfunction(value):
                     inner.append(value)
+            # Defaults only when no closure cell holds a function, so every
+            # wrapper the closure walk already resolved keeps its answer.
+            if not inner:
+                defaults = list(getattr(current, "__defaults__", None) or ())
+                defaults += list((getattr(current, "__kwdefaults__", None) or {}).values())
+                inner = [value for value in defaults if inspect.isfunction(value)]
             # More than one candidate is ambiguous, so leave `func` alone.
             if len(inner) != 1:
                 break
@@ -3428,7 +3538,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3454,7 +3564,7 @@ else:
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
-        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -3529,7 +3639,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3556,7 +3666,7 @@ elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LO
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
-        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -3680,7 +3790,7 @@ else:
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
-        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -5694,6 +5804,8 @@ DISABLE_COMPILE_MODULES = [
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",
+    # GLM-5.3-Flash: same Sinkhorn mixer. Its HyperHead is an unweighted mean and stays compiled.
+    "Glm5NextTextHyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -6023,10 +6135,9 @@ def unsloth_compile_transformers(
     except:
         return
     # All Unsloth Zoo code licensed under LGPLv3
-    full_disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
-    disable = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
-    if full_disable:
-        disable = True
+    # UNSLOTH_COMPILE_DISABLE only drops torch.compile; rewritten forwards still run eagerly.
+    full_disable = disable
+    disable = full_disable or os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial")
     if fast_residual_stream:
         raise NotImplementedError(
             "Unsloth: Fast residual stream optimization makes things slower!"
@@ -6063,6 +6174,7 @@ def unsloth_compile_transformers(
     function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
     disable_compile_functions.difference_update(function_source_rewrites)
     module_forward_rewrites = module_forward_source_rewrites(modeling_file, model_type)
+    module_eager_rewrites = module_forward_eager_rewrites(modeling_file, model_type)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -6194,7 +6306,7 @@ def unsloth_compile_transformers(
     pass
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
-    # Gated on full disable only: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
+    # Not gated on UNSLOTH_COMPILE_DISABLE: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
     if (not full_disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)
@@ -6787,6 +6899,7 @@ def unsloth_compile_transformers(
                     functions,
                     fullgraph=False,
                     disable=True,
+                    forward_source=module_eager_rewrites.get(module),
                 )
                 all_standalone_classes[module] = new_module
             except Exception as e:

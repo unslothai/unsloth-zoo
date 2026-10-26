@@ -283,6 +283,50 @@ def _restore_hidden_states_flag():
         _os.environ[_HIDDEN_STATES_FLAG] = before
 
 
+# UNSLOTH_COMPILE_DISABLE only switches off torch.compile, and since #1866 the fused losses and
+# maybe_compile honour it, so a test of the compile path itself sees no compiled call and no
+# fallback wrapper under it. Unsloth's Core zoo legs run this suite with the switch set, which is
+# the only place these tests run. Tests of the compile machinery opt in with
+# `pytestmark = pytest.mark.usefixtures("compile_enabled")`: the switch is cleared for the test and
+# every flag the modules froze from it at import is turned back on, then restored.
+# Modules copy the switch with `from ...common import UNSLOTH_COMPILE_DISABLE`, so every loaded
+# unsloth_zoo module carrying one of these names is patched, not a hand-kept list.
+_COMPILE_SWITCH_FLAGS = {
+    "UNSLOTH_COMPILE_DISABLE": False,
+    "UNSLOTH_COMPILE_DISABLE_PARTIAL": False,
+    "_COMPILE": True,  # fused_losses.chunked_logprob keeps the inverse
+}
+_COMPILE_SWITCH_MODULES = (
+    "unsloth_zoo.temporary_patches.common",
+    "unsloth_zoo.temporary_patches.utils",
+    "unsloth_zoo.compiler",
+    "unsloth_zoo.fused_losses.cross_entropy_loss",
+    "unsloth_zoo.fused_losses.chunked_logprob",
+)
+
+
+@_pytest.fixture
+def compile_enabled(monkeypatch):
+    _enable_compile(monkeypatch)
+
+
+def _enable_compile(monkeypatch):
+    import importlib
+    import sys
+
+    # Import first, under the caller's environment: a module first imported after the switch is
+    # cleared would freeze its flags compile-on, and monkeypatch would restore those values.
+    for name in _COMPILE_SWITCH_MODULES:
+        importlib.import_module(name)
+    monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == "unsloth_zoo" or name.startswith("unsloth_zoo.")):
+            continue
+        for flag, enabled in _COMPILE_SWITCH_FLAGS.items():
+            if isinstance(getattr(module, flag, None), bool):
+                monkeypatch.setattr(module, flag, enabled)
+
+
 # A test that swaps a module into sys.modules and does not swap it back breaks whatever
 # imports that name later IN THE SAME PROCESS. Serially that is often invisible, because
 # the victim happens to sort before the polluter and never sees it; under pytest-xdist a

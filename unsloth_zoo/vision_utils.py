@@ -2110,8 +2110,16 @@ class UnslothVisionDataCollator:
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
         # LLaVA IMAGE_TOKEN_INDEX (-200) sentinel is never a target.
         labels[labels < 0] = self.ignore_index
+        self._mask_targets_after_padding(labels, batch.get("attention_mask"))
         batch["labels"] = labels
         return batch
+
+    def _mask_targets_after_padding(self, labels, attention_mask):
+        """Mask targets predicted from a pad position: unpadded rows lose them at the loss shift,
+        so left padding would make batch size 2 differ from 2 accumulation steps."""
+        if not torch.is_tensor(attention_mask) or attention_mask.dim() != 2 or attention_mask.shape != labels.shape:
+            return
+        labels[:, 1:].masked_fill_(attention_mask[:, :-1].to(labels.device) == 0, self.ignore_index)
 
     def _check_supervised(self, labels, attention_mask = None):
         """All labels masked means zero loss: raise on an untruncated first batch, else warn once."""
@@ -2824,6 +2832,7 @@ class UnslothVisionDataCollator:
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
         labels[labels < 0] = self.ignore_index
+        self._mask_targets_after_padding(labels, attention_mask)
         if self.completion_only_loss:
             labels[completion_mask == 0] = self.ignore_index
 

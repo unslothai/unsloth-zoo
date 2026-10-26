@@ -125,8 +125,9 @@ def test_fused_ce_explicit_budget_stays_cached(monkeypatch):
     assert fake.queried == []
 
 
-def test_fused_ce_budgets_the_lm_head_device(monkeypatch):
-    ce, _ = _modules()
+@pytest.mark.parametrize("route", ["torch_func", "fused_linear"])
+def test_fused_ce_budgets_the_lm_head_device(monkeypatch, route):
+    ce, tiled = _modules()
     import torch
     seen = []
     sentinel = object()
@@ -135,8 +136,15 @@ def test_fused_ce_budgets_the_lm_head_device(monkeypatch):
         seen.append(device)
         return 4.0
 
-    monkeypatch.setattr(ce, "_free_target_gb", record)
-    ce._get_chunk_multiplier.cache_clear()
+    if route == "torch_func":
+        monkeypatch.setattr(ce, "_CHUNKED_CE", False)
+        monkeypatch.setattr(ce, "_free_target_gb", record)
+        ce._get_chunk_multiplier.cache_clear()
+    else:
+        fl = importlib.import_module("unsloth_zoo.fused_losses.fused_linear")
+        monkeypatch.setattr(tiled, "_default_target_gb", record)
+        fl._budget_bytes.cache_clear()
+        monkeypatch.setattr(fl, "_budget_bytes", fl._budget_bytes)
     torch.manual_seed(0)
     hidden = torch.randn(2, 6, 16, requires_grad = True)
     weight = torch.randn(64, 16, requires_grad = True)
@@ -146,6 +154,8 @@ def test_fused_ce_budgets_the_lm_head_device(monkeypatch):
         lm_head_bias = None, labels = labels,
     )
     loss.backward()
+    if route == "fused_linear":
+        fl._budget_bytes.cache_clear()
     assert seen and all(isinstance(d, torch.device) and d == weight.device for d in seen), seen
 
 
