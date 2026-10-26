@@ -91,7 +91,7 @@ def _device_supported(index):
 @functools.lru_cache(maxsize = None)
 def _flex_available():
     try:
-        from ..flex_attention.utils import HAS_FLEX_ATTENTION
+        from unsloth_zoo.flex_attention.utils import HAS_FLEX_ATTENTION
         import triton  # noqa: F401
     except Exception:
         return False
@@ -130,7 +130,7 @@ def _flex(query, key, value, block_mask, scale, score_mod = None):
     key, value = _virtual_kv_heads(query, key, value)
     # Shared dynamic=None compile: the first length keeps a static kernel, much faster than the dynamic one
     # for fixed-length (packed / padded) training; varying lengths settle on the dynamic kernel.
-    from ..flex_attention.utils import flex_attention
+    from unsloth_zoo.flex_attention.utils import flex_attention
     return flex_attention(
         query, key, value, score_mod = score_mod, block_mask = block_mask, scale = scale,
         enable_gqa = query.shape[1] != key.shape[1],

@@ -44,8 +44,8 @@ from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, publish_to_modeli
 from .utils import logger
 from . import sparse_attention as _skip
 from .sparse_attention import _transformers_tested
-from ..flex_attention import sparse_blocks as _sb
-from ..flex_attention.sparse import sparse_indexer_chunked_enabled
+from unsloth_zoo.flex_attention import sparse_blocks as _sb
+from unsloth_zoo.flex_attention.sparse import sparse_indexer_chunked_enabled
 
 # family -> modeling module, bound at patch time
 _MODELING = {}
