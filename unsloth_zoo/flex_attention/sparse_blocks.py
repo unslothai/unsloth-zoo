@@ -390,10 +390,52 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling)
     return out.transpose(1, 2).contiguous()
 
 
+_SDPA_PICKS_CUDNN = {}
+
+
+def masked_sdpa_picks_cudnn(query, key, value):
+    """Whether torch's own SDPA choice for a bool-masked call of this shape class is cuDNN.
+
+    Where it is (H100 on torch 2.14), dense masked SDPA beats flex on DSA's scattered selections
+    (GLM-5 4K keys 25 vs 34 ms, 8K 95 vs 136 ms); elsewhere flex wins (A100 on 2.10 / 2.14,
+    H100 on 2.10). Probed once per (device, dtype, heads, head dims, grad, cuDNN enabled)."""
+    needs_grad = torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad)
+    cache_key = (
+        query.device.index, query.dtype, query.shape[1], key.shape[1], query.shape[-1], value.shape[-1],
+        needs_grad, torch.backends.cuda.cudnn_sdp_enabled(),
+    )
+    picks = _SDPA_PICKS_CUDNN.get(cache_key)
+    if picks is None:
+        picks = False
+        try:
+            from torch.nn.attention import SDPBackend
+            cudnn = int(SDPBackend.CUDNN_ATTENTION)
+            dev, dt = query.device, query.dtype
+            q = torch.empty(1, query.shape[1], 128, query.shape[-1], device = dev, dtype = dt)
+            k = torch.empty(1, query.shape[1], 128, key.shape[-1], device = dev, dtype = dt)
+            v = torch.empty(1, query.shape[1], 128, value.shape[-1], device = dev, dtype = dt)
+            if needs_grad:
+                q, k, v = (t.requires_grad_() for t in (q, k, v))
+            mask = torch.ones(1, 1, 128, 128, device = dev, dtype = torch.bool)
+            with torch.set_grad_enabled(needs_grad):
+                picks = int(torch._fused_sdp_choice(q, k, v, attn_mask = mask, dropout_p = 0.0, is_causal = False)) == cudnn
+        except Exception:
+            picks = False
+        _SDPA_PICKS_CUDNN[cache_key] = picks
+    return picks
+
+
 def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_keys):
+    """Flex above the selection budget, unless torch would run this masked call on cuDNN.
+
+    `min_keys` is UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS when set (forces flex at or above it),
+    else None: the budget plus the cuDNN probe decide."""
     if module.config._attn_implementation not in ("eager", "sdpa"):
         return False
-    if key.shape[2] < min_keys or query.shape[2] < 16 or kwargs.get("output_attentions"):
+    budget = int(module.config.index_topk)
+    if key.shape[2] <= budget or query.shape[2] < 16 or kwargs.get("output_attentions"):
+        return False
+    if min_keys is not None and key.shape[2] < min_keys:
         return False
     if module.training and module.attention_dropout:
         return False
@@ -401,7 +443,11 @@ def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_key
         return False
     if not sparse_flex_device_ok(query):
         return False
-    return _failure_key("dsa", query, key, value) not in _FAILED
+    if _failure_key("dsa", query, key, value) in _FAILED:
+        return False
+    if min_keys is None and module.config._attn_implementation == "sdpa" and masked_sdpa_picks_cudnn(query, key, value):
+        return False
+    return True
 
 
 def record_failure(kind, query, key, value, error):

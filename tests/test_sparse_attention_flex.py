@@ -31,8 +31,15 @@ transformers = pytest.importorskip("transformers")
 minimax = importlib.util.find_spec("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
 dsa = importlib.util.find_spec("transformers.models.deepseek_v32.modeling_deepseek_v32")
 glm = importlib.util.find_spec("transformers.models.glm_moe_dsa.modeling_glm_moe_dsa")
+def _tested_transformers():
+    from packaging.version import Version
+    return Version(transformers.__version__.split("+")[0]) >= Version("5.17.0")
+
+
+# The patches install only on transformers >= 5.17 (older indexers differ).
 needs_models = pytest.mark.skipif(
-    minimax is None or dsa is None or glm is None, reason = "transformers without MiniMax M3 / DSA models",
+    minimax is None or dsa is None or glm is None or not _tested_transformers(),
+    reason = "transformers older than 5.17 or without MiniMax M3 / DSA models",
 )
 gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None or torch.cuda.get_device_capability() < (8, 0),
@@ -351,3 +358,66 @@ def test_tiny_model_flex_on_vs_off(monkeypatch, family):
           f"max grad rel vs fp32: dense {dense_err:.4f} flex {flex_err:.4f}")
     assert abs(flex_loss - ref_loss) <= abs(dense_loss - ref_loss) + 5e-3
     assert flex_err <= 1.5 * dense_err + 1e-2, (flex_err, dense_err)
+
+
+@needs_models
+def test_dsa_cache_layout_matches_installed_source():
+    s = _patched()
+    import inspect
+    from transformers.models.deepseek_v32 import modeling_deepseek_v32 as a
+    source = inspect.getsource(a.DeepseekV32Attention._unsloth_upstream_forward)
+    assert s._DSA_LATENT_CACHE["deepseek_v32"] == (s._DSA_CACHE_LATENT in source)
+
+
+def test_cudnn_probe_routes_dsa_to_dense(monkeypatch):
+    from types import SimpleNamespace
+    q = torch.randn(1, 4, 32, 16)
+    mod = SimpleNamespace(config = SimpleNamespace(_attn_implementation = "sdpa", index_topk = 8), training = False, attention_dropout = 0.0)
+    mask = torch.ones(1, 1, 32, 32, dtype = torch.bool)
+    monkeypatch.setattr(sb, "sparse_flex_device_ok", lambda query: True)
+    monkeypatch.setattr(sb, "masked_sdpa_picks_cudnn", lambda *a: True)
+    assert not sb.dsa_flex_eligible(mod, q, q, q, mask, {}, None)
+    assert sb.dsa_flex_eligible(mod, q, q, q, mask, {}, 16)  # the override forces flex
+    monkeypatch.setattr(sb, "masked_sdpa_picks_cudnn", lambda *a: False)
+    assert sb.dsa_flex_eligible(mod, q, q, q, mask, {}, None)
+    k_short = torch.randn(1, 4, 8, 16)
+    assert not sb.dsa_flex_eligible(mod, q, k_short, k_short, mask[..., :8], {}, None)  # within budget
+
+
+@needs_models
+@gpu
+@pytest.mark.parametrize("family", ["deepseek_v32", "glm_moe_dsa", "minimax_m3_vl"])
+def test_tiny_model_cached_decode_after_flex_prefill(monkeypatch, family):
+    """Prefill above the budget (flex), then decode with the cache: same logits as flex off.
+
+    MiniMax uses one layer: a second layer's indexer reselects blocks from bf16 hidden states,
+    and near-tie block scores flip between any two attention backends."""
+    _patched()
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS", "65")
+    if family == "minimax_m3_vl":
+        config = _minimax_config(num_attention_heads = 8, num_key_value_heads = 2, head_dim = 64, hidden_size = 128,
+                                 num_hidden_layers = 1, layer_types = ["minimax_m3_sparse"], mlp_layer_types = ["dense"])
+    else:
+        config = _dsa_config(family, qk_nope_head_dim = 32, qk_rope_head_dim = 32, v_head_dim = 64)
+    model = _model(family, config).eval()
+    ids = torch.randint(0, config.vocab_size, (2, 512), device = "cuda")
+    nxt = torch.randint(0, config.vocab_size, (2, 3), device = "cuda")
+
+    def run():
+        with torch.no_grad():
+            out = model(input_ids = ids, use_cache = True)
+            past, logits = out.past_key_values, [out.logits[:, -1].float()]
+            for i in range(nxt.shape[1]):
+                out = model(input_ids = nxt[:, i : i + 1], past_key_values = past, use_cache = True)
+                past = out.past_key_values
+                logits.append(out.logits[:, -1].float())
+        return torch.stack(logits)
+
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0")
+    ref = run()
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1")
+    key = "minimax_m3_flex" if family == "minimax_m3_vl" else "dsa_flex"
+    before = sb.SPARSE_FLEX_STATS[key]
+    got = run()
+    assert sb.SPARSE_FLEX_STATS[key] > before
+    assert _rel(got, ref) < 5e-2, _rel(got, ref)

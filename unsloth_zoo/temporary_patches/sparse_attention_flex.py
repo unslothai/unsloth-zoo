@@ -23,10 +23,12 @@ the budget and run flex attention over a BlockMask built from the selection abov
 their fp32 score buffers stay bounded.
 
 Engaged automatically on CUDA sm80+ / ROCm with Triton, bf16 / fp16, no attention dropout,
-no output_attentions, q_len >= 16. A flex failure latches that shape class back to the
+no output_attentions, q_len >= 16. DSA keeps dense masked SDPA (still with the chunked
+indexer) where torch picks cuDNN for that masked call, which beats flex there (H100, torch 2.14). A flex failure latches that shape class back to the
 dense path. Kill switches: UNSLOTH_SPARSE_ATTN_FLEX=0, UNSLOTH_SPARSE_INDEXER_CHUNKED=0.
-The patched forwards are installed only when the installed transformers source matches the
-layout they reimplement (transformers 5.17); otherwise the model is left untouched.
+The patched forwards are installed on transformers >= 5.17 when the installed source matches
+the layout they reimplement (DSA caches expanded K / V on 5.17, the latent on 5.18+);
+otherwise the model is left untouched.
 """
 
 __all__ = [
@@ -69,17 +71,26 @@ def _source_has(function, needles):
     return all(n in source for n in needles)
 
 
-def _dsa_min_keys(module, family):
-    topk = int(module.config.index_topk)
+def _dsa_min_keys():
+    """UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS override, else None (budget + cuDNN probe decide)."""
     env = os.environ.get("UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS")
     if env:
         try:
-            return max(topk + 1, int(env))
+            return int(env)
         except ValueError:
             pass
-    # Scattered token selections touch nearly every 128 x 128 tile until keys >> top-k, so flex
-    # only skips work well past the budget; below that masked SDPA is as fast (B200, 4K keys).
-    return max(topk + 1, 4 * topk)
+    return None
+
+
+def _transformers_tested():
+    """These forwards reimplement transformers >= 5.17. 5.12 - 5.16 indexers differ (no mask
+    for unpadded SDPA, per-query MiniMax blocks), so older releases keep their own path."""
+    try:
+        import transformers
+        from packaging.version import Version
+        return Version(transformers.__version__.split("+")[0]) >= Version("5.17.0")
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------------------
@@ -173,6 +184,8 @@ def unsloth_minimax_m3_sparse_attention_forward(self, hidden_states, position_em
 
 
 def patch_minimax_m3_sparse_flex():
+    if not _transformers_tested():
+        return
     m = _modeling("minimax_m3_vl")
     if m is None:
         return
@@ -216,10 +229,13 @@ TEMPORARY_PATCHES.append(patch_minimax_m3_sparse_flex)
 # --------------------------------------------------------------------------------------
 _DSA_ATTN_NEEDLES = (
     "key_states, value_states = self.expand_kv(k_pass, k_rot)",
-    "key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)",
     "attention_mask[:, 0, :, :],",
     ".scatter(-1, topk_indices.long(), False)",
 )
+# Where the KV cache is written: expanded K / V (5.17) or the latent before expand_kv (5.18+).
+_DSA_CACHE_EXPANDED = "key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)"
+_DSA_CACHE_LATENT = "k_pass, k_rot = past_key_values.update(k_pass, k_rot, self.layer_idx)"
+_DSA_LATENT_CACHE = {}
 _DSA_INDEXER_NEEDLES = (
     "k = past_key_values.update_indexer(k, self.layer_idx)",
     "index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)",
@@ -257,10 +273,14 @@ def _dsa_attention(self, family, hidden_states, position_embeddings, attention_m
     cos, sin = position_embeddings
     q_rot, k_rot = m.apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
 
+    latent_cache = _DSA_LATENT_CACHE[family]
+    if past_key_values is not None and latent_cache:
+        k_pass, k_rot = past_key_values.update(k_pass, k_rot, self.layer_idx)
+
     query_states = torch.cat((q_pass, q_rot), dim = -1)
     key_states, value_states = self.expand_kv(k_pass, k_rot)
 
-    if past_key_values is not None:
+    if past_key_values is not None and not latent_cache:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
     if getattr(self, "indexer", None) is not None:
@@ -277,7 +297,7 @@ def _dsa_attention(self, family, hidden_states, position_embeddings, attention_m
             raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
         topk_indices = prev_topk_indices
 
-    if _sb.dsa_flex_eligible(self, query_states, key_states, value_states, attention_mask, kwargs, _dsa_min_keys(self, family)):
+    if _sb.dsa_flex_eligible(self, query_states, key_states, value_states, attention_mask, kwargs, _dsa_min_keys()):
         try:
             attn_output = _sb.dsa_flex_attention(
                 query_states, key_states, value_states, topk_indices, attention_mask, self.scaling,
@@ -335,6 +355,8 @@ def unsloth_glm_moe_dsa_sparse_attention_forward(self, hidden_states, position_e
 
 
 def _patch_dsa_family(family, attn_name, indexer_name, attention_forward):
+    if not _transformers_tested():
+        return False
     m = _modeling(family)
     if m is None:
         return False
@@ -353,6 +375,11 @@ def _patch_dsa_family(family, attn_name, indexer_name, attention_forward):
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: {family} attention source differs from the supported layout; sparse flex not installed.")
         return False
+    source = inspect.getsource(attn.forward)
+    expanded, latent = _DSA_CACHE_EXPANDED in source, _DSA_CACHE_LATENT in source
+    if expanded == latent:
+        return False
+    _DSA_LATENT_CACHE[family] = latent
     _MODELING[family] = m
     publish_to_modeling_module(
         m,
@@ -374,6 +401,7 @@ def _patch_dsa_family(family, attn_name, indexer_name, attention_forward):
         return unsloth_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values)
 
     indexer._unsloth_original_forward = indexer.forward
+    attn._unsloth_upstream_forward = attn.forward
     indexer._unsloth_dsa_family = family
     forward._unsloth_sparse_flex = True
     indexer_forward._unsloth_sparse_flex = True
