@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import sys
 
+import numpy as np
 import pytest
 
 
@@ -1030,6 +1031,71 @@ def test_smoothed_finite_logits_past_the_cap_match_the_saturated_loss(ratio):
     lse = math.log(vocab / 2 * (1.0 + math.exp(-cap))) + cap
     expected = rows * (lse - (1 - eps) * cap - eps * (cap / 2))
     assert losses.item() == pytest.approx(expected, rel=1e-4)
+
+
+@pytest.mark.parametrize("kind, dtype, rows", [
+    ("trainable", mx.float32, 64),
+    ("trainable", mx.bfloat16, 256),  # the single-SIMD forward
+    ("frozen", mx.float32, 64),
+    ("quantized", mx.float32, 64),
+    ("lora", mx.float32, 64),
+    ("fallback", mx.float32, 64),
+])
+def test_confident_rows_keep_their_loss_and_gradient(monkeypatch, kind, dtype, rows):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    # Logits near 20, so fp32 spacing rounds lse - z_t to 0 past ~14 nats of margin.
+    vocab, margins = 1024, (-20.0, -5.0, 0.0, 5.0, 10.0, 14.0, 17.0, 25.0, 40.0, 60.0)
+    rng = np.random.default_rng(0)
+    logits = rng.standard_normal((rows, vocab)) * 2.0 + 20.0
+    targets = np.arange(rows) * 131 % vocab
+    for row, target in enumerate(targets):
+        others = np.delete(logits[row], target)
+        logits[row, target] = np.logaddexp.reduce(others) + margins[row % len(margins)]
+    targets[-1] = -100
+    hidden = mx.array(logits.astype(np.float32)).astype(dtype)
+    targets = mx.array(targets.astype(np.int32))
+    weight = mx.eye(vocab, dtype=dtype)
+    head = (weight,)
+    if kind == "fallback":
+        monkeypatch.setattr(runtime_cce, "_build_kernel_set", lambda *args, **kwargs: (None,) * 3)
+    if kind == "lora":
+        lora = runtime_cce.make_lora_head_cce(chunk_size=256)
+        adapter = (mx.zeros((rows, 4), dtype=dtype), mx.zeros((4, vocab), dtype=dtype), None)
+        call = lambda h: lora(h, weight, None, None, *adapter, targets)
+    else:
+        if kind == "quantized":
+            head = mx.quantize(weight, group_size=64, bits=8)
+        runtime, _ = runtime_cce.make_chunked_cross_entropy_loss(
+            chunk_size=256, quantized=kind == "quantized",
+            group_size=64 if kind == "quantized" else None, bits=8 if kind == "quantized" else None,
+            weight_is_frozen=kind != "trainable", precompute_hidden_gradient=kind == "frozen",
+        )
+        call = lambda h: runtime(h, *head, targets)
+    losses = np.array(call(hidden), dtype=np.float64)
+    grad = np.array(mx.grad(lambda h: call(h).sum())(hidden).astype(mx.float32), dtype=np.float64)
+
+    head64 = np.array((mx.dequantize(*head, group_size=64, bits=8) if kind == "quantized" else weight)
+                      .astype(mx.float32), dtype=np.float64)
+    z = np.array(hidden.astype(mx.float32), dtype=np.float64) @ head64.T
+    scored, safe = np.arange(rows - 1), np.array(targets)[:-1]
+    z, z_t = z[:-1], z[:-1][scored, safe]
+    others = z.copy()
+    others[scored, safe] = -np.inf
+    lse_others = np.logaddexp.reduce(others, axis=1)
+    expected = np.logaddexp(0.0, lse_others - z_t)
+    expected_dz = np.exp(z - np.logaddexp(lse_others, z_t)[:, None])
+    expected_dz[scored, safe] = np.expm1(-expected)
+    expected_grad = expected_dz @ head64
+
+    assert losses[-1] == 0 and not grad[-1].any()
+    assert np.max(np.abs(losses[:-1] - expected) / expected) < 1e-4
+    error = np.linalg.norm(grad[:-1] - expected_grad, axis=1) / np.linalg.norm(expected_grad, axis=1)
+    # A bfloat16 hidden gradient carries bfloat16 rounding.
+    assert error.max() < (1e-2 if dtype == mx.bfloat16 else 1e-4)
 
 
 @pytest.mark.parametrize("quantized", [False, True])
