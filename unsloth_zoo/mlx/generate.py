@@ -253,7 +253,9 @@ class GenerationRequest:
     str/os.PathLike filesystem path or URL, decoded once before grouping; raw
     bytes and file-like objects are rejected. ``audio`` (vision models only) is
     accepted but decodes one request at a time, since no supported mlx-vlm
-    release batches it. At most one of ``image`` and ``audio`` per request.
+    release batches it, and takes no other medium beside it. ``videos`` (vision models
+    only) are clip paths the processor samples at ``fps`` (its own rate when None); rows
+    batch together only with rows of the same clips and rate.
 
     A vision prompt given as ``prompt_token_ids`` to ``generate_batch`` or
     ``stream_batch`` may carry its media prepared: ``vision_inputs`` holds the
@@ -284,6 +286,8 @@ class GenerationRequest:
     logits_processors: Sequence[Callable[[Any, Any], Any]] | None = None
     prompt_cache_state: Any | None = None
     vision_inputs: Mapping[str, Any] | None = None
+    videos: Sequence[str | os.PathLike] | None = None
+    fps: float | None = None
 
     def __post_init__(self):
         state = self.prompt_cache_state
@@ -401,7 +405,7 @@ def _validate_text_requests(
             request.sampling, SamplingParams
         ):
             raise TypeError(f"requests[{index}].sampling must be SamplingParams.")
-        if request.audio is not None or (request.image is not None and not takes_images) or request.vision_inputs is not None:
+        if request.audio is not None or request.videos or (request.image is not None and not takes_images) or request.vision_inputs is not None:
             raise ValueError(
                 f"requests[{index}] includes media, but text models accept "
                 "text prompts only."
@@ -620,7 +624,7 @@ def _validate_vlm_requests(
                     "outputs other than input_ids and attention_mask."
                 )
         if has_ids:
-            if request.image is not None or request.audio is not None:
+            if request.image is not None or request.audio is not None or request.videos:
                 raise ValueError(
                     f"requests[{index}] gives token ids with media; only the "
                     "processor can place media tokens, so send a rendered prompt"
@@ -634,10 +638,10 @@ def _validate_vlm_requests(
             raise TypeError(f"requests[{index}].prompt must be a string.")
         elif not request.prompt:
             raise ValueError(f"requests[{index}].prompt must not be empty.")
-        if request.image is not None and request.audio is not None:
+        if request.audio is not None and (request.image is not None or request.videos):
             raise ValueError(
-                f"requests[{index}] carries both an image and audio; batched "
-                "vision generation takes at most one medium per request."
+                f"requests[{index}] carries audio with other media; batched "
+                "vision generation decodes audio on its own."
             )
         if request.audio is not None and defaults.stop_token_ids is not None:
             raise ValueError(
@@ -653,6 +657,14 @@ def _validate_vlm_requests(
         if isinstance(request.image, os.PathLike):
             # mlx-vlm's loader opens str paths only.
             validated[index] = replace(request, image=os.fspath(request.image))
+        if isinstance(request.videos, (str, bytes, os.PathLike)):
+            raise TypeError(f"requests[{index}].videos must be a sequence of clip paths.")
+        if request.fps is not None and not request.fps > 0:
+            raise ValueError(f"requests[{index}].fps must be positive.")
+        if request.videos:
+            validated[index] = replace(
+                validated[index], videos=tuple(os.fspath(clip) for clip in request.videos)
+            )
     _validate_vlm_defaults(defaults)
     return validated
 
@@ -3005,7 +3017,9 @@ class _VLMBatchAdapter:
         else:
             shape = self._image_shape(request.image)
             tokenizer = getattr(self.processor, "tokenizer", self.processor)
-            key = (request.image is None, shape, len(tokenizer.encode(request.prompt)))
+            # Clips set a row's frame count, so only rows of the same clips and rate stack.
+            clips = (tuple(request.videos), request.fps) if request.videos else None
+            key = (request.image is None, shape, len(tokenizer.encode(request.prompt)), clips)
         if self.batches_observable:
             return key
         sampling = request.sampling or self.defaults.sampling
@@ -3016,10 +3030,17 @@ class _VLMBatchAdapter:
         if requests[0].prompt_token_ids is not None:
             return _prepared_vlm_inputs(requests)
         images = [request.image for request in requests if request.image is not None]
+        videos = [clip for request in requests for clip in request.videos or ()]
+        media = {}
+        if videos:
+            media["videos"] = videos
+            if requests[0].fps is not None:
+                media["fps"] = requests[0].fps
         return self.prepare_inputs(
             self.processor,
             images=images or None,
             audio=None,
+            **media,
             prompts=[request.prompt for request in requests],
             image_token_index=getattr(getattr(self.model, "config", None), "image_token_index", None),
             resize_shape=None,
