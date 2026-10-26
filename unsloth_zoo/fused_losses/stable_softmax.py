@@ -37,19 +37,25 @@ def _softplus(x):
     )
 
 
-def target_logprob(z, target):
-    """(log softmax(z)[..., target], logsumexp(z)), traceable. ``target`` must be a valid column of every row."""
-    # Centred on the detached target logit, a gather rather than a row max pass (a large shared offset rounds
-    # the normaliser away); target by masked sum, not gather (elementwise backward, no saved float32 copy);
-    # finfo.min, not -inf, keeps a target-only support NaN free.
-    m = z.detach().gather(-1, target.unsqueeze(-1))
+def _centred(z, target):
+    """(log p_t, logsumexp(z) - m, m, z - m) with m the detached row max. Centred so a shared offset cannot
+    round the normaliser away; the normaliser is logaddexp(lse_others, z_t), never z_t - logp (cancels when
+    the target trails); target by masked sum, not gather (elementwise backward, no saved float32 copy);
+    finfo.min, not -inf, keeps a target-only support NaN free."""
+    m = z.detach().amax(-1, keepdim = True)
     m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
     z = z - m
     is_target = torch.arange(z.shape[-1], device = z.device) == target.unsqueeze(-1)
     z_t = torch.where(is_target, z, 0.0).sum(-1)
-    others = torch.where(is_target, torch.finfo(z.dtype).min, z)
-    logp = -_softplus(torch.logsumexp(others, -1) - z_t)
-    return logp, (z_t - logp) + m.squeeze(-1)
+    lse_others = torch.logsumexp(torch.where(is_target, torch.finfo(z.dtype).min, z), -1)
+    logp = -_softplus(lse_others - z_t)
+    return logp, torch.logaddexp(lse_others, z_t), m.squeeze(-1), z
+
+
+def target_logprob(z, target):
+    """(log softmax(z)[..., target], logsumexp(z)), traceable. ``target`` must be a valid column of every row."""
+    logp, lse_c, m, _ = _centred(z, target)
+    return logp, lse_c + m
 
 
 def _others_lse(s_others, m):
@@ -69,8 +75,9 @@ def target_logprob_(z, target):
     z.sub_(m).exp_()
     z.scatter_(-1, index, 0.0)
     s_others = z.sum(-1, keepdim = True)
-    logp = -_softplus(_others_lse(s_others, m) - z_t)
-    return logp.squeeze(-1), (z_t - logp).squeeze(-1)
+    lse_others = _others_lse(s_others, m)
+    logp = -_softplus(lse_others - z_t)
+    return logp.squeeze(-1), torch.logaddexp(lse_others, z_t).squeeze(-1)
 
 
 def target_grad(logp):
@@ -80,10 +87,10 @@ def target_grad(logp):
 
 def smoothed_nll(z, target, label_smoothing = 0.0):
     """Per row F.cross_entropy(z, target, label_smoothing = label_smoothing)."""
-    logp, lse = target_logprob(z, target)
+    logp, lse_c, _, z_c = _centred(z, target)
     nll = -logp
     if label_smoothing:
-        nll = (1.0 - label_smoothing) * nll + label_smoothing * (lse - z.mean(-1))
+        nll = (1.0 - label_smoothing) * nll + label_smoothing * (lse_c - z_c.mean(-1))
     return nll
 
 
@@ -104,9 +111,7 @@ def _acc(dtype):
 def _rows_forward(chunk, target):
     # Saves the row max and the logsumexp relative to it: an absolute lse rounds away the normaliser once
     # the logits share a large offset, and exp(z - lse) would then disagree with the forward.
-    z = chunk.to(_acc(chunk.dtype))
-    m = z.detach().amax(-1)
-    logp, lse_c = target_logprob(z - m.unsqueeze(-1), target)
+    logp, lse_c, m, _ = _centred(chunk.to(_acc(chunk.dtype)), target)
     return logp, lse_c, m
 
 

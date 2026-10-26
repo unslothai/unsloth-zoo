@@ -231,3 +231,21 @@ def test_smoothed_nll_offset_and_negative_tail():
     z = torch.tensor([[90.0, 0.0]], requires_grad = True)
     smoothed_nll(z, torch.tensor([0])).sum().backward()
     assert z.grad[0, 1] > 0 and z.grad[0, 0] < 0
+
+
+def test_trailing_target_and_smoothing_offset():
+    from unsloth_zoo.fused_losses.stable_softmax import cross_entropy_rows, smoothed_nll
+
+    # Target 1e8 below 256 equal others: logsumexp = log 256, gradients sum to 0 (z_t - logp cancels).
+    z = torch.zeros(1, 257)
+    z[0, 0] = -1e8
+    x = z.clone().requires_grad_()
+    nll = cross_entropy_rows(x, torch.tensor([0]))
+    nll.sum().backward()
+    assert torch.allclose(x.grad[0, 1:], torch.full((256,), 1 / 256)) and abs(x.grad.sum().item()) < 1e-6
+    x = z.clone().requires_grad_()
+    smoothed_nll(x, torch.tensor([0])).sum().backward()
+    assert torch.allclose(x.grad[0, 1:], torch.full((256,), 1 / 256))
+    # Label smoothing is offset invariant: three equal 1e8 logits give log 3.
+    s = smoothed_nll(torch.full((1, 3), 1e8), torch.tensor([0]), label_smoothing = 0.1)
+    assert torch.allclose(s, torch.tensor([math.log(3.0)]))
