@@ -101,7 +101,7 @@ def _run_packed_block(hidden_states = False, need_entropy = False):
         "chunked_hidden_states_selective_log_softmax":
             rr.chunked_hidden_states_selective_log_softmax,
         "chunked_selective_log_softmax": rr.chunked_selective_log_softmax,
-        "_refresh_lm_head": lambda: None, "_fp32_bind": lambda: None, "lm_head_bias": None,
+        "_refresh_lm_head": lambda: None, "_fp32_bind": lambda entropy = False: None, "lm_head_bias": None,
         "create_completion_attention_mask": rr.create_completion_attention_mask,
         "device_synchronize": lambda *a, **k: None,
         # On: the block swallows its own exceptions, so its log line is the
