@@ -6062,9 +6062,19 @@ def _patch_torch_dtype_modules(
                     body_lines = lines[1:]
                     first_body = next((l for l in body_lines if l.strip()), "")
                     body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                    cast_if = "self.weight is not None"
+                    if not disable:
+                        # A float16 / bfloat16 input against float32 parameters is native mixed
+                        # precision BatchNorm (fp32 statistics, output in the input dtype): casting
+                        # it would save an extra float32 copy of every BatchNorm input for backward.
+                        cast_if += (
+                            f" and {param_name}.dtype != self.weight.dtype and not ("
+                            f"self.weight.dtype == torch.float32 and "
+                            f"{param_name}.dtype in (torch.float16, torch.bfloat16))"
+                        )
                     prologue = [
                         body_indent + f"original_dtype = {param_name}.dtype",
-                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
+                        body_indent + f"if {cast_if}: {param_name} = {param_name}.to(self.weight.dtype)",
                     ]
                     source = "\n".join([def_line] + prologue + body_lines)
                     append_str = ".to(original_dtype)\n"

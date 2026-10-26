@@ -72,3 +72,54 @@ def test_compiled_batchnorm_casts_mismatched_input(tmp_path):
     assert "error" not in out, out
     assert out["dtype"] == "torch.float32", out
     assert out["same_dtype_identical"], out
+
+
+def test_compiled_batchnorm_keeps_native_mixed_precision(tmp_path):
+    # bfloat16 / float16 activations against float32 BatchNorm parameters (AMP over float32 weights) are
+    # native mixed precision BatchNorm: no float32 copy of the input may be saved for backward.
+    script = textwrap.dedent(
+        f"""
+        import importlib, json, sys, torch
+        sys.path.insert(0, {str(ROOT)!r})
+        import unsloth_zoo.compiler as compiler
+        importlib.import_module("transformers.models.llama.modeling_llama")
+        compiler.unsloth_compile_transformers("llama", disable=False)
+        out = {{"patched": bool(getattr(torch.nn.BatchNorm1d.forward, "__unsloth_dtype_wrapped__", False))}}
+        for dtype in (torch.bfloat16, torch.float16):
+            for training in (True, False):
+                torch.manual_seed(0)
+                bn = torch.nn.BatchNorm1d(8).train(training)
+                ref = torch.nn.BatchNorm1d(8).train(training)
+                ref.load_state_dict(bn.state_dict())
+                x = torch.randn(4, 8, 16, dtype=dtype, requires_grad=True)
+                saved = []
+                with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append((t.dtype, tuple(t.shape))) or t, lambda t: t):
+                    y = bn(x)
+                y.float().square().sum().backward()
+                xr = x.detach().clone().requires_grad_(True)
+                yr = torch.nn.functional.batch_norm(xr, ref.running_mean, ref.running_var, ref.weight, ref.bias,
+                                                    training, ref.momentum, ref.eps)
+                yr.float().square().sum().backward()
+                key = str(dtype) + ("_train" if training else "_eval")
+                out[key] = dict(
+                    out_dtype=str(y.dtype),
+                    fp32_input_copies=sum(1 for d, s in saved if d == torch.float32 and s == tuple(x.shape)),
+                    identical=bool(torch.equal(y, yr) and torch.equal(x.grad, xr.grad)
+                                   and torch.equal(bn.weight.grad, ref.weight.grad)
+                                   and torch.equal(bn.running_mean, ref.running_mean)),
+                )
+        print("RESULT " + json.dumps(out))
+        """
+    )
+    env = dict(os.environ, UNSLOTH_COMPILE_LOCATION=str(tmp_path / "cache"))
+    env.pop("UNSLOTH_COMPILE_DISABLE", None)
+    env.setdefault("UNSLOTH_ALLOW_CPU", "1")
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=900, env=env)
+    line = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+    assert line, proc.stdout[-2000:] + proc.stderr[-3000:]
+    out = json.loads(line[-1][len("RESULT "):])
+    assert out.pop("patched"), out
+    for key, row in out.items():
+        assert row["out_dtype"] == key.split("_")[0], (key, row)
+        assert row["fp32_input_copies"] == 0, (key, row)
+        assert row["identical"], (key, row)
