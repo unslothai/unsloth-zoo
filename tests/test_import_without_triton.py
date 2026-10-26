@@ -22,6 +22,8 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 # Triton made unfindable for the child, as on a host where the package is not installed.
 _NO_TRITON = textwrap.dedent('''
     import importlib.machinery, sys
@@ -62,7 +64,13 @@ _CHECK = textwrap.dedent('''
 
 
 def test_zoo_imports_and_fused_losses_run_without_triton():
+    import unsloth_zoo
+
+    if getattr(unsloth_zoo, "DEVICE_TYPE", None) == "mlx":
+        pytest.skip("Apple Silicon / MLX stubs Triton for every importer by design")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
+    # That variable also installs the global stub (download-only child), which this test must not see.
+    env.pop("UNSLOTH_ZOO_DISABLE_GPU_INIT", None)
     out = subprocess.run([sys.executable, "-c", _NO_TRITON + _CHECK], env = env, capture_output = True,
                          text = True, timeout = 600)
     assert out.returncode == 0 and "NO_TRITON_OK" in out.stdout, (out.stdout[-2000:], out.stderr[-4000:])
