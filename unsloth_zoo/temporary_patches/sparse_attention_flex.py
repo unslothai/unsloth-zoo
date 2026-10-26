@@ -50,6 +50,10 @@ from ..flex_attention.sparse import sparse_indexer_chunked_enabled
 
 # family -> modeling module, bound at patch time
 _MODELING = {}
+# family -> indexer forward for calls within the budget (the exact skip, else upstream), and indexer class
+# name -> family. Module level, not class attributes: Unsloth's compiler rebuilds the classes from source.
+_INNER_INDEXER = {}
+_DSA_FAMILY = {"DeepseekV32Indexer": "deepseek_v32", "GlmMoeDsaIndexer": "glm_moe_dsa"}
 
 
 def _modeling(name):
@@ -115,7 +119,7 @@ def unsloth_minimax_m3_indexer_forward(self, hidden_states, position_embeddings,
                 self, hidden_states, position_embeddings, past_key_values, position_ids, m.apply_rotary_pos_emb,
             )
     # Within the budget: the exact skip (or upstream when the skip is off / not installed).
-    return self._unsloth_inner_forward(hidden_states, position_embeddings, past_key_values, position_ids)
+    return _INNER_INDEXER["minimax_m3_vl"](self, hidden_states, position_embeddings, past_key_values, position_ids)
 
 
 def unsloth_minimax_m3_sparse_attention_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, **kwargs):
@@ -214,6 +218,7 @@ def patch_minimax_m3_sparse_flex():
         return unsloth_minimax_m3_indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids)
 
     indexer._unsloth_original_forward, indexer._unsloth_inner_forward = base
+    _INNER_INDEXER["minimax_m3_vl"] = base[1]
     forward._unsloth_sparse_flex = True
     indexer_forward._unsloth_sparse_flex = True
     attn.forward = forward
@@ -247,15 +252,15 @@ _DSA_INDEXER_ROPE = {"deepseek_v32": "apply_rotary_pos_emb", "glm_moe_dsa": "app
 
 
 def unsloth_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids = None, past_key_values = None):
-    family = self._unsloth_dsa_family
+    family = _DSA_FAMILY[type(self).__name__]
     if sparse_indexer_chunked_enabled() and attention_mask.shape[-1] > self.index_topk:
         rope = getattr(_MODELING[family], _DSA_INDEXER_ROPE[family])
         return _sb.dsa_select_topk(
             self, hidden_states, q_resid, position_embeddings, attention_mask, past_key_values, rope, family,
         )
     # Within the budget: the exact skip (or upstream when the skip is off / not installed).
-    return self._unsloth_inner_forward(
-        hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values = past_key_values,
+    return _INNER_INDEXER[family](
+        self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values = past_key_values,
     )
 
 
@@ -409,8 +414,8 @@ def _patch_dsa_family(family, attn_name, indexer_name, attention_forward):
         return unsloth_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values)
 
     indexer._unsloth_original_forward, indexer._unsloth_inner_forward = base
+    _INNER_INDEXER[family] = base[1]
     attn._unsloth_upstream_forward = attn.forward
-    indexer._unsloth_dsa_family = family
     forward._unsloth_sparse_flex = True
     indexer_forward._unsloth_sparse_flex = True
     attn.forward = forward

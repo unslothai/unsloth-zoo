@@ -512,3 +512,26 @@ def test_packed_sequences(monkeypatch, family):
     assert _stat("flex", family) >= before + 2, sparse_gates.SPARSE_ATTN_STATS
     err = ((got - upstream).norm() / upstream.norm()).item()
     assert err < 3e-2, err
+
+
+@needs_models
+@pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32", "glm_moe_dsa"])
+def test_indexer_forward_without_class_attributes(monkeypatch, family):
+    """Unsloth's compiler rebuilds the classes from source, dropping attributes set on them at patch time:
+    the patched indexer forwards must not read them."""
+    _patched()
+    config = _minimax_config() if family == "minimax_m3_vl" else _dsa_config(family)
+    m, indexer = _indexer_module(family, config)
+    cls = type(indexer)
+    for name in ("_unsloth_inner_forward", "_unsloth_dsa_family"):
+        monkeypatch.delattr(cls, name, raising = False)
+    S = 128 if family == "minimax_m3_vl" else 48  # within the budget: the exact skip / upstream forward
+    (cos, sin), pos = _rope(config, family, S)
+    x = torch.randn(1, S, config.hidden_size)
+    with torch.no_grad():
+        if family == "minimax_m3_vl":
+            out = indexer(x, (cos, sin), None, pos)
+        else:
+            mask = torch.zeros(1, S, S).masked_fill(~torch.ones(S, S, dtype = torch.bool).tril(), float("-inf"))
+            out = indexer(x, torch.randn(1, S, config.q_lora_rank), (cos, sin), mask, pos)
+    assert out.shape[1] == (S if family != "minimax_m3_vl" else config.index_n_heads)
