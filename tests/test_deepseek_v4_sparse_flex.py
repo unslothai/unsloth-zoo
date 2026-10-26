@@ -23,6 +23,11 @@ import pytest
 import torch
 
 modeling = pytest.importorskip("transformers.models.deepseek_v4.modeling_deepseek_v4")
+import transformers  # noqa: E402
+from packaging.version import Version  # noqa: E402
+
+if Version(transformers.__version__).release < (5, 17):
+    pytest.skip("the patch installs on transformers >= 5.17 only", allow_module_level = True)
 
 from unsloth_zoo.temporary_patches import deepseek_v4_sparse_flex as F4  # noqa: E402
 
@@ -41,8 +46,8 @@ def _reset(monkeypatch):
     monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_FLEX", raising = False)
     F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
     F4._DEVICE_OK.clear()
-    # Small shapes keep the tests fast; the default threshold is checked on its own below.
-    monkeypatch.setattr(F4, "_MIN_Q_LEN", 16)
+    # Small shapes keep the tests fast; the default policy is checked on its own below.
+    monkeypatch.setattr(F4, "_MIN_KEYS", {8: {None: 16}, 9: {None: 16}, 10: {None: 16}})
     yield
 
 
@@ -109,24 +114,55 @@ def test_gpu_gates_fall_back_to_eager(monkeypatch, case):
     assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
 
 
-@needs_flex_gpu
-def test_default_threshold_keeps_short_prompts_eager(monkeypatch):
+class _Props:
+    def __init__(self, major, minor, smem):
+        self.major, self.minor, self.shared_memory_per_block_optin = major, minor, smem
+
+
+@pytest.mark.parametrize("major, minor, smem, forced, layer, expected", [
+    (10, 0, 232448, False, "compressed_sparse_attention", 4096),
+    (10, 0, 232448, False, "sliding_attention", 4096),
+    (9, 0, 232448, False, "compressed_sparse_attention", 4096),
+    (9, 0, 232448, False, "heavily_compressed_attention", 4096),
+    (8, 0, 166912, False, "compressed_sparse_attention", 8192),
+    (8, 0, 166912, False, "heavily_compressed_attention", 4096),
+    (8, 0, 166912, False, "sliding_attention", 4096),
+    (8, 9, 101376, False, "sliding_attention", None),  # L4 / RTX 4090
+    (8, 9, 101376, True, "sliding_attention", None),  # too little shared memory even when forced
+    (8, 6, 101376, False, "sliding_attention", None),
+    (12, 0, 101376, True, "sliding_attention", None),
+    (7, 5, 65536, True, "sliding_attention", None),  # T4
+    (12, 1, 232448, False, "sliding_attention", None),  # unmeasured generation
+    (12, 1, 232448, True, "sliding_attention", 4096),
+])
+def test_default_policy_table(monkeypatch, major, minor, smem, forced, layer, expected):
     monkeypatch.undo()
-    assert F4._MIN_Q_LEN >= 1024
+    F4._DEVICE_OK.clear()
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: _Props(major, minor, smem))
+    module = type("M", (), {"layer_type": layer})()
+    assert F4._min_keys(module, torch.device("cuda", 0), forced) == expected
+    if expected is not None:
+        monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX_MIN_KEYS", "1234")
+        assert F4._min_keys(module, torch.device("cuda", 0), forced) == 1234
+    F4._DEVICE_OK.clear()
+
+
+def test_rocm_stays_eager(monkeypatch):
+    monkeypatch.undo()
+    F4._DEVICE_OK.clear()
+    monkeypatch.setattr(torch.version, "hip", "6.4")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: _Props(9, 4, 65536 * 4))
+    assert F4._min_keys(type("M", (), {})(), torch.device("cuda", 0), True) is None
+    F4._DEVICE_OK.clear()
+
+
+@needs_flex_gpu
+def test_default_policy_keeps_short_prompts_eager(monkeypatch):
+    monkeypatch.undo()
     attn, q, kv, mask = _gate_inputs("cuda", q_len = 300)
     modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
     assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
-
-
-@needs_flex_gpu
-def test_unmeasured_gpu_needs_the_force_switch(monkeypatch):
-    attn, q, kv, mask = _gate_inputs("cuda")
-    monkeypatch.setattr(F4, "_MEASURED_CAPABILITIES", ())
-    modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
-    assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == 0
-    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1")
-    modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
-    assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == (1 if F4._device_ok(q.device, True) else 0)
 
 
 @needs_flex_gpu

@@ -21,9 +21,9 @@ learned per-head sink, so every layer materialises [B, 64, S, S + C] logits. The
 attention receives (sliding window + padding, then the compressor's block_bias of causal / indexer
 selection over the compressed entries) is turned into a block-sparse BlockMask, and the sink is applied
 exactly afterwards from the logsumexp: softmax([l, s]) @ v == (softmax(l) @ v) * sigmoid(lse(l) - s).
-Prefill and training only (q_len >= 2048); decode, short prompts and anything else stay eager.
-UNSLOTH_SPARSE_ATTN_FLEX (read per call): 0 = always eager, 1 = flex on any sm80+ part with enough shared
-memory, unset = flex only on the GPU generations the tiles were measured on.
+Prefill and training only, from a per-GPU-generation key length (see _MIN_KEYS); decode and short
+prompts stay eager. UNSLOTH_SPARSE_ATTN_FLEX (read per call): 0 = always eager, 1 = also on other
+sm80+ parts with >= 160 KB shared memory, unset = the measured generations only.
 """
 
 __all__ = ["patch_deepseek_v4_sparse_flex", "DEEPSEEK_V4_FLEX_STATS"]
@@ -39,14 +39,12 @@ from .utils import logger
 DEEPSEEK_V4_FLEX_STATS = {"flex": 0, "eager": 0}
 
 _BLOCK = 128
-# Below about 2048 query tokens eager is as fast (one V4-Flash attention layer, fwd + bwd, B200:
-# 1024 tokens eager 7-11 ms vs flex 9-15 ms; 2048 tokens 19-25 vs 16-26 ms; 4096 tokens 60-76 vs
-# 28-63 ms with 2.5x less memory), and decode (one query) never benefits.
-_MIN_Q_LEN = 2048
+# Decode (one query) never benefits; chunked prefill of a few queries over a long cache does.
+_MIN_Q_LEN = 16
 # head_dim 512 needs small tiles. Measured fwd + bwd at the V4-Flash attention shape (64 heads, S 4096,
 # B200, bf16): 32 x 32 tiles with 8 warps and 1 stage take 35 ms, the same tiles with 4 warps 205 ms,
 # eager 55 ms. 64-row forward tiles and 64-wide backward tiles fault (misaligned address) at this head
-# dim, so they are not used.
+# dim, so they are not used. No faults with these tiles on A100 / H100 / B200.
 _KERNEL_OPTIONS = {
     "BLOCK_M": 32,
     "BLOCK_N": 32,
@@ -59,13 +57,35 @@ _KERNEL_OPTIONS = {
 }
 # The single KV head is expanded (stride 0, no copy) to one per query head: with grouped-query packing
 # (64 query heads per KV head) the same call took 180-210 ms. Autograd sums the expanded gradient back.
-# Capabilities the tiles above were run on; UNSLOTH_SPARSE_ATTN_FLEX=1 forces flex on any sm80+ part
-# with enough shared memory.
-_MEASURED_CAPABILITIES = ((10, 0),)
+_CSA = "compressed_sparse_attention"
+# Minimum key length (sliding tokens + compressed entries) per GPU generation, from one V4-Flash
+# attention layer fwd + bwd, eager vs flex, torch 2.10 and 2.14:
+#   H100 / B200: flex faster for every layer type from 4096 keys (2048: slower on torch 2.10).
+#   A100: HCA / sliding faster from 4096; CSA 8-14% slower at 2048 / 4096, and eager runs out of
+#   memory at 8192 on a 40 GB card, so CSA starts at 8192.
+# Other parts (sm86 / sm89 / sm120 with ~101 KB shared memory per block, T4, ROCm) stay eager unless
+# UNSLOTH_SPARSE_ATTN_FLEX=1. UNSLOTH_SPARSE_ATTN_FLEX_MIN_KEYS=N replaces every threshold.
+_MIN_KEYS = {
+    9: {None: 4096},
+    10: {None: 4096},
+    8: {None: 4096, _CSA: 8192},
+}
+_FORCED_MIN_KEYS = 4096
 _MIN_SHARED_MEMORY = 160 * 1024
 
 _FLEX = None
 _DEVICE_OK = {}
+
+
+def _transformers_tested():
+    """Checked on transformers 5.17-5.20; the V4 attention / compressor contract is newer than 5.x's first
+    DeepSeek-V4 release."""
+    try:
+        import transformers
+        from packaging.version import Version
+        return Version(transformers.__version__).release >= (5, 17)
+    except Exception:
+        return False
 
 
 def _flex_setting():
@@ -87,25 +107,35 @@ def _compiled_flex():
     return _FLEX
 
 
-def _device_ok(device, forced):
+def _device_thresholds(device, forced):
+    """{layer_type or None: minimum key length} for this device, or None when flex is off there."""
     index = device.index if device.index is not None else torch.cuda.current_device()
     key = (index, forced)
-    ok = _DEVICE_OK.get(key)
-    if ok is None:
-        ok = False
+    if key not in _DEVICE_OK:
+        thresholds = None
         try:
             if torch.version.hip is None and importlib.util.find_spec("triton") is not None:
                 props = torch.cuda.get_device_properties(index)
-                capability = (props.major, props.minor)
                 smem = getattr(props, "shared_memory_per_block_optin", 0)
-                if forced:
-                    ok = capability >= (8, 0) and smem >= _MIN_SHARED_MEMORY
-                else:
-                    ok = capability in _MEASURED_CAPABILITIES
+                # sm86 / sm89 report major 8 but have ~101 KB: the shared memory check keeps them out.
+                if smem >= _MIN_SHARED_MEMORY:
+                    thresholds = _MIN_KEYS.get(props.major)
+                    if thresholds is None and forced and props.major >= 8:
+                        thresholds = {None: _FORCED_MIN_KEYS}
         except Exception:
-            ok = False
-        _DEVICE_OK[key] = ok
-    return ok
+            thresholds = None
+        _DEVICE_OK[key] = thresholds
+    return _DEVICE_OK[key]
+
+
+def _min_keys(module, device, forced):
+    thresholds = _device_thresholds(device, forced)
+    if thresholds is None:
+        return None
+    override = os.environ.get("UNSLOTH_SPARSE_ATTN_FLEX_MIN_KEYS", "").strip()
+    if override.isdigit():
+        return int(override)
+    return thresholds.get(getattr(module, "layer_type", None), thresholds[None])
 
 
 def _flex_applies(module, query, key, value, attention_mask, dropout, kwargs):
@@ -130,7 +160,8 @@ def _flex_applies(module, query, key, value, attention_mask, dropout, kwargs):
         return False
     if attention_mask.shape[0] not in (1, bsz):
         return False
-    return _device_ok(query.device, setting == "1")
+    min_keys = _min_keys(module, query.device, setting == "1")
+    return min_keys is not None and key.shape[2] >= min_keys
 
 
 def _pack(selected, num_blocks):
@@ -208,7 +239,7 @@ def _make_attention_forward(original):
 
 
 def patch_deepseek_v4_sparse_flex():
-    if importlib.util.find_spec("transformers.models.deepseek_v4") is None:
+    if not _transformers_tested() or importlib.util.find_spec("transformers.models.deepseek_v4") is None:
         return
     try:
         from transformers.models.deepseek_v4 import modeling_deepseek_v4 as modeling
