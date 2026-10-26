@@ -114,8 +114,7 @@ def _inductor_builds():
 
 @pytest.mark.parametrize("train_head", [False, True])
 def test_default_scorer_keeps_sharing_the_head_parameter(monkeypatch, train_head):
-    # Without recompute or entropy, the default scorer saves the bf16 head parameter itself; handing it a
-    # pre-cast fp32 head made every mini-batch save its own bf16 head-sized copy instead.
+    # A pre-cast fp32 head made the compiled scorer save a bf16 head copy per mini-batch.
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0")
@@ -157,7 +156,6 @@ def test_default_scorer_keeps_sharing_the_head_parameter(monkeypatch, train_head
     if not UNSLOTH_COMPILE_DISABLE and not _inductor_builds():
         pytest.skip("Inductor cannot build here, so the compiled scorer ran its eager fallback")
     if UNSLOTH_COMPILE_DISABLE:
-        # The eager scorer saves the fp32 head it is given, so there the one shared pre-cast copy is the win.
         assert list(heads.values()) == [torch.float32], heads
     else:
         assert heads == {model.head.weight.untyped_storage().data_ptr(): torch.bfloat16}, heads

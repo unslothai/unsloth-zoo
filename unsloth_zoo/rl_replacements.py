@@ -2848,9 +2848,7 @@ def grpo_accumulated_loss(
             lm_head, lm_head_bias = _zero3_head
 
         # UNSLOTH_VLLM_FP32_LM_HEAD: one fp32 head copy per call, shared by every mini-batch kept for the loss.
-        # Not for the compiled default scorer: its backward runs under the outer autocast, so given the bf16
-        # parameter it saves that shared tensor, but given an fp32 copy it saves a fresh bf16 cast per call.
-        # Its eager fallbacks (compile off, ZeRO-3, bf16 without native support) save the fp32 head as given.
+        # Skipped for the compiled scorer: given an fp32 copy it saves a fresh bf16 cast per call (eager paths don't).
         import inspect as _inspect
         from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as _projector
         from unsloth_zoo.temporary_patches.common import UNSLOTH_COMPILE_DISABLE as _scorer_eager
