@@ -75,9 +75,11 @@ def target_logprob_(z, target):
     z.sub_(m).exp_()
     z.scatter_(-1, index, 0.0)
     s_others = z.sum(-1, keepdim = True)
-    lse_others = _others_lse(s_others, m)
+    # Centred throughout: adding m back before subtracting z_t rounds the normaliser away at large offsets.
+    z_t = z_t - m
+    lse_others = _others_lse(s_others, torch.zeros_like(m))
     logp = -_softplus(lse_others - z_t)
-    return logp.squeeze(-1), torch.logaddexp(lse_others, z_t).squeeze(-1)
+    return logp.squeeze(-1), (torch.logaddexp(lse_others, z_t) + m).squeeze(-1)
 
 
 def target_grad(logp):
@@ -99,8 +101,6 @@ _ROWS_CHUNK_BYTES = 256 * 1024 * 1024
 
 
 def _row_chunks(n_rows, vocab_size):
-    if torch.compiler.is_compiling():
-        return max(n_rows, 1)  # one chunk: Inductor fuses the upcast instead of materialising it
     return max(1, min(n_rows, _ROWS_CHUNK_BYTES // max(4 * vocab_size, 1)))
 
 
@@ -144,8 +144,6 @@ _COMPILED_ROWS = {}
 def _rows_impl(logits):
     """(forward, backward) per chunk: one fused Inductor kernel each on GPUs (eager here reads the chunk ~6
     times, 1.9x stock's time on an A100), the in place eager pair elsewhere or when compiling fails."""
-    if torch.compiler.is_compiling():
-        return _rows_forward, _rows_backward
     if logits.device.type not in ("cuda", "xpu") or _COMPILED_ROWS.get("failed") or _compile_disabled():
         return _rows_forward_eager, _rows_backward_eager
     if not _COMPILED_ROWS:
@@ -168,7 +166,7 @@ def _run_rows(step, eager_step, *args):
     except torch.cuda.OutOfMemoryError:
         raise
     except Exception:
-        if step is eager_step or torch.compiler.is_compiling():
+        if step is eager_step:
             raise
         _COMPILED_ROWS["failed"] = True  # no Triton / compiler on this host: stay eager from now on
         return eager_step(*args)
@@ -179,6 +177,12 @@ class _CrossEntropyRows(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, logits, target):
+        if torch.compiler.is_compiling():
+            # No Python row loop when traced: range() over a symbolic row count specialises it (a recompile
+            # per length, ConstraintViolationError under mark_dynamic); Inductor fuses the upcast anyway.
+            logp, lse_c, m = _rows_forward(logits, target)
+            ctx.save_for_backward(logits, target, logp, lse_c, m)
+            return -logp
         n_rows, vocab_size = logits.shape
         rows = _row_chunks(n_rows, vocab_size)
         forward, _ = _rows_impl(logits)
@@ -193,6 +197,8 @@ class _CrossEntropyRows(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_nll):
         logits, target, logp, lse_c, m = ctx.saved_tensors
+        if torch.compiler.is_compiling():
+            return _rows_backward(logits, target, logp, lse_c, m, grad_nll), None
         n_rows, vocab_size = logits.shape
         rows = _row_chunks(n_rows, vocab_size)
         _, backward = _rows_impl(logits)
