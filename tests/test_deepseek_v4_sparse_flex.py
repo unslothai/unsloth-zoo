@@ -1,0 +1,320 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""DeepSeek-V4 attention on flex attention: routing, block mask, and parity with transformers' eager
+attention (fp32 exact-math check, bf16 layers against an fp32 oracle, prefill + decode through the cache)."""
+
+import copy
+
+import pytest
+import torch
+
+modeling = pytest.importorskip("transformers.models.deepseek_v4.modeling_deepseek_v4")
+
+from unsloth_zoo.temporary_patches import deepseek_v4_sparse_flex as F4  # noqa: E402
+
+F4.patch_deepseek_v4_sparse_flex()
+ORIGINAL = modeling.eager_attention_forward._unsloth_original
+
+CUDA = torch.cuda.is_available()
+needs_flex_gpu = pytest.mark.skipif(
+    not CUDA or torch.version.hip is not None or torch.cuda.get_device_capability() < (8, 0),
+    reason = "flex attention path needs an sm80+ NVIDIA GPU",
+)
+
+
+@pytest.fixture(autouse = True)
+def _reset(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_FLEX", raising = False)
+    F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
+    F4._DEVICE_OK.clear()
+    # Small shapes keep the tests fast; the default threshold is checked on its own below.
+    monkeypatch.setattr(F4, "_MIN_Q_LEN", 16)
+    yield
+
+
+class _Attn(torch.nn.Module):
+    def __init__(self, heads, device):
+        super().__init__()
+        self.sinks = torch.nn.Parameter(torch.randn(heads, device = device))
+        self.num_key_value_groups = heads
+
+
+def _mask(bsz, q_len, window, compressed, rate, topk, dtype, device, pad = 0, seed = 0):
+    """Additive [B, 1, S, S + C] mask like V4's: sliding window + left padding over tokens, then causal
+    top-k over compressed entries (0 = attend, finfo.min / -inf = masked)."""
+    g = torch.Generator(device = "cpu").manual_seed(seed)
+    q = torch.arange(q_len)[:, None]
+    k = torch.arange(q_len)[None]
+    tokens = ((q - k) >= 0) & ((q - k) < window)
+    tokens = tokens[None].expand(bsz, -1, -1).clone()
+    if pad:
+        tokens[1, :, :pad] = False
+    visible = torch.arange(compressed)[None] < ((torch.arange(q_len) + 1) // rate)[:, None]
+    scores = torch.rand(bsz, q_len, compressed, generator = g).masked_fill(~visible, -1)
+    picked = torch.zeros(bsz, q_len, compressed, dtype = torch.bool)
+    picked.scatter_(-1, scores.topk(min(topk, compressed), -1).indices, True)
+    picked &= visible
+    token_bias = torch.zeros(bsz, 1, q_len, q_len, dtype = dtype).masked_fill(~tokens[:, None], torch.finfo(dtype).min)
+    comp_bias = torch.zeros(bsz, 1, q_len, compressed, dtype = dtype).masked_fill(~picked[:, None], float("-inf"))
+    return torch.cat([token_bias, comp_bias], -1).to(device)
+
+
+def test_patch_is_installed_and_idempotent():
+    forward = modeling.eager_attention_forward
+    assert forward._unsloth_deepseek_v4_flex
+    F4.patch_deepseek_v4_sparse_flex()
+    assert modeling.eager_attention_forward is forward
+    assert forward._unsloth_original is ORIGINAL
+
+
+def _gate_inputs(device, q_len = 32, dtype = torch.bfloat16):
+    q = torch.randn(1, 4, q_len, 64, device = device, dtype = dtype)
+    kv = torch.randn(1, 1, q_len + 8, 64, device = device, dtype = dtype)
+    mask = _mask(1, q_len, 16, 8, 4, 4, dtype, device)
+    return _Attn(4, device).to(dtype), q, kv, mask
+
+
+def test_cpu_and_gates_fall_back_to_eager(monkeypatch):
+    attn, q, kv, mask = _gate_inputs("cpu")
+    out, weights = modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    ref, ref_weights = ORIGINAL(attn, q, kv, kv, mask, 0.125)
+    assert torch.equal(out, ref) and torch.equal(weights, ref_weights)
+    assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
+
+
+@needs_flex_gpu
+@pytest.mark.parametrize("case", ["env_off", "dropout", "output_attentions", "short_query", "k_not_v", "no_mask", "fp32"])
+def test_gpu_gates_fall_back_to_eager(monkeypatch, case):
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0" if case == "env_off" else "1")
+    attn, q, kv, mask = _gate_inputs("cuda", q_len = 8 if case == "short_query" else 32,
+                                     dtype = torch.float32 if case == "fp32" else torch.bfloat16)
+    value = kv.clone() if case == "k_not_v" else kv
+    kwargs = {"output_attentions": True} if case == "output_attentions" else {}
+    modeling.eager_attention_forward(attn, q, kv, value, None if case == "no_mask" else mask, 0.125,
+                                     dropout = 0.1 if case == "dropout" else 0.0, **kwargs)
+    assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
+
+
+@needs_flex_gpu
+def test_default_threshold_keeps_short_prompts_eager(monkeypatch):
+    monkeypatch.undo()
+    assert F4._MIN_Q_LEN >= 1024
+    attn, q, kv, mask = _gate_inputs("cuda", q_len = 300)
+    modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
+
+
+@needs_flex_gpu
+def test_unmeasured_gpu_needs_the_force_switch(monkeypatch):
+    attn, q, kv, mask = _gate_inputs("cuda")
+    monkeypatch.setattr(F4, "_MEASURED_CAPABILITIES", ())
+    modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == 0
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1")
+    modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+    assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == (1 if F4._device_ok(q.device, True) else 0)
+
+
+@needs_flex_gpu
+def test_block_mask_matches_the_additive_mask():
+    mask = _mask(2, 300, 64, 75, 4, 16, torch.bfloat16, "cuda", pad = 50)
+    block_mask = F4.deepseek_v4_block_mask(mask, 2)
+    dense = block_mask.to_dense()  # [B, 1, nq, nk] tiles that are visited
+    allowed = mask[:, 0] == 0
+    nq, nk = dense.shape[-2:]
+    padded = torch.zeros(2, nq * 128, nk * 128, dtype = torch.bool, device = "cuda")
+    padded[:, : allowed.shape[1], : allowed.shape[2]] = allowed
+    needed = padded.view(2, nq, 128, nk, 128).any(4).any(2)
+    assert torch.equal(dense[:, 0].bool(), needed)
+    for count, index in ((block_mask.kv_num_blocks, block_mask.kv_indices),
+                         (block_mask.full_kv_num_blocks, block_mask.full_kv_indices)):
+        for b in range(2):
+            for row in range(nq):
+                used = index[b, 0, row, : count[b, 0, row]]
+                assert torch.all(used[1:] > used[:-1])
+
+
+def _function_case(dtype, seed = 0):
+    torch.manual_seed(seed)
+    bsz, heads, q_len, head_dim, comp = 2, 8, 300, 128, 75
+    mask = _mask(bsz, q_len, 64, comp, 4, 16, dtype, "cuda", pad = 60, seed = seed)
+    q = (torch.randn(bsz, heads, q_len, head_dim, device = "cuda") * 2).to(dtype).requires_grad_(True)
+    kv = torch.randn(bsz, 1, q_len + comp, head_dim, device = "cuda").to(dtype).requires_grad_(True)
+    attn = _Attn(heads, "cuda").to(dtype)
+    grad = torch.randn(bsz, q_len, heads, head_dim, device = "cuda").to(dtype)
+    return attn, q, kv, mask, grad
+
+
+def _run(fn, attn, q, kv, mask, grad):
+    attn.zero_grad(set_to_none = True)
+    q.grad = kv.grad = None
+    out = fn()
+    (out.float() * grad.float()).sum().backward()
+    return out.detach().float(), q.grad.float(), kv.grad.float(), attn.sinks.grad.float()
+
+
+@needs_flex_gpu
+def test_flex_equals_eager_in_float32():
+    """Same math in fp32 (sliding window + padding + top-k compressed entries + sink): only the
+    reduction order differs, including the fully masked rows of the left-padded batch row."""
+    attn, q, kv, mask, grad = _function_case(torch.float32)
+    scale = q.shape[-1] ** -0.5
+    ref = _run(lambda: ORIGINAL(attn, q, kv, kv, mask, scale)[0], attn, q, kv, mask, grad)
+    got = _run(lambda: F4.deepseek_v4_flex_attention(attn, q, kv, mask, scale), attn, q, kv, mask, grad)
+    for name, a, b in zip(("out", "dq", "dkv", "dsinks"), got, ref):
+        err = ((a - b).norm() / b.norm()).item()
+        assert err < 2e-5, (name, err)
+
+
+def _rel(a, b):
+    return ((a.float() - b.float()).norm() / (b.float().norm() + 1e-12)).item()
+
+
+def _tiny_config(topk = 16):
+    from transformers import DeepseekV4Config
+    config = DeepseekV4Config(
+        hidden_size = 256, num_attention_heads = 64, num_key_value_heads = 1, head_dim = 512,
+        q_lora_rank = 64, o_groups = 8, o_lora_rank = 32, index_n_heads = 4, index_head_dim = 128,
+        index_topk = topk, sliding_window = 128, num_hidden_layers = 4, vocab_size = 512,
+        moe_intermediate_size = 64, n_routed_experts = 4, num_experts_per_tok = 2,
+        num_nextn_predict_layers = 0,
+        layer_types = ["sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention", "sliding_attention"],
+    )
+    config._attn_implementation = "eager"
+    return config
+
+
+def _tiny_model():
+    torch.manual_seed(0)
+    model = modeling.DeepseekV4ForCausalLM(_tiny_config()).cuda().float()
+    for name, param in model.named_parameters():
+        if "sinks" in name:
+            torch.nn.init.normal_(param, 0, 1.0)
+    return model
+
+
+def _to(x, dtype):
+    if isinstance(x, torch.Tensor):
+        return x.to(dtype) if x.is_floating_point() else x
+    if isinstance(x, dict):
+        return {k: _to(v, dtype) for k, v in x.items()}
+    if isinstance(x, (tuple, list)):
+        return type(x)(_to(v, dtype) for v in x)
+    return x
+
+
+def _captured_layers(monkeypatch):
+    """Inputs every attention layer of the shrunk model receives on a left-padded batch."""
+    model = _tiny_model()
+    bsz, q_len, pad = 2, 1280, 200
+    ids = torch.randint(0, 512, (bsz, q_len), device = "cuda")
+    mask = torch.ones(bsz, q_len, dtype = torch.long, device = "cuda")
+    mask[1, :pad] = 0
+    seen = {}
+    hooks = [
+        layer.self_attn.register_forward_pre_hook(
+            (lambda i: lambda mod, args, kwargs: seen.__setitem__(i, (args, kwargs)))(i), with_kwargs = True)
+        for i, layer in enumerate(model.model.layers)
+    ]
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "0")
+    with torch.no_grad():
+        model(input_ids = ids, attention_mask = mask, use_cache = False)
+    for hook in hooks:
+        hook.remove()
+    weight = torch.randn(bsz, q_len, 256, device = "cuda", generator = torch.Generator("cuda").manual_seed(1))
+    return model, seen, mask, weight * mask.float()[..., None]
+
+
+def _run_layer(monkeypatch, attn, args, kwargs, dtype, flex, weight):
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1" if flex else "0")
+    attn.zero_grad(set_to_none = True)
+    hidden = _to(args[0] if args else kwargs["hidden_states"], dtype).detach().requires_grad_(True)
+    kw = {k: _to(v, dtype) for k, v in kwargs.items() if k != "hidden_states"}
+    kw["past_key_values"] = None  # training: no cache
+    out = attn(hidden, **kw)[0]
+    (out.float() * weight).sum().backward()
+    grads = {n: p.grad.float() for n, p in attn.named_parameters() if p.grad is not None}
+    grads["hidden"] = hidden.grad.float()
+    return out.detach().float(), grads
+
+
+@needs_flex_gpu
+def test_layers_equal_eager_in_float32(monkeypatch):
+    """Sliding, CSA and HCA layers at the real head count / head dim on a left-padded batch: with the
+    dtype gate opened to fp32, flex and eager agree on the output and every gradient up to reduction
+    order, so the block mask, compressed entries and sink are the same math."""
+    model, seen, _, weight = _captured_layers(monkeypatch)
+    real_applies = F4._flex_applies
+    monkeypatch.setattr(F4, "_flex_applies", lambda module, query, *a: query.is_cuda and real_applies(
+        module, query.to(torch.bfloat16), *a))
+    for idx, layer in enumerate(model.model.layers):
+        args, kwargs = seen[idx]
+        F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
+        o_eager, g_eager = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, False, weight)
+        o_flex, g_flex = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, True, weight)
+        assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 1, "eager": 1}, layer.self_attn.layer_type
+        assert _rel(o_flex, o_eager) < 1e-5
+        for name in g_eager:
+            assert _rel(g_flex[name], g_eager[name]) < 1e-5, (layer.self_attn.layer_type, name)
+
+
+@needs_flex_gpu
+def test_layers_in_bf16_stay_close_to_an_fp32_oracle(monkeypatch):
+    """The bf16 flex layer is about as far from an fp32 eager oracle as transformers' own bf16 eager
+    layer (a wrong mask or sink would be off by O(1))."""
+    model, seen, mask, weight = _captured_layers(monkeypatch)
+    keep = mask.bool()
+    for idx, layer in enumerate(model.model.layers):
+        args, kwargs = seen[idx]
+        attn32 = layer.self_attn
+        attn16 = copy.deepcopy(attn32).to(torch.bfloat16)
+        o_ref, g_ref = _run_layer(monkeypatch, attn32, args, kwargs, torch.float32, False, weight)
+        F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
+        o_eager, g_eager = _run_layer(monkeypatch, attn16, args, kwargs, torch.bfloat16, False, weight)
+        o_flex, g_flex = _run_layer(monkeypatch, attn16, args, kwargs, torch.bfloat16, True, weight)
+        assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 1, "eager": 1}, attn32.layer_type
+        assert _rel(o_flex[keep], o_ref[keep]) <= 2 * _rel(o_eager[keep], o_ref[keep]) + 2e-3
+        for name in g_ref:
+            assert _rel(g_flex[name], g_ref[name]) <= 2 * _rel(g_eager[name], g_ref[name]) + 2e-3, (attn32.layer_type, name)
+
+
+@needs_flex_gpu
+def test_prefill_on_flex_then_decode_through_the_cache(monkeypatch):
+    """Prefill with a cache engages flex; the following decode steps (q_len 1) stay eager and see the
+    same cache, so logits track the all-eager run."""
+    model = _tiny_model().to(torch.bfloat16)
+    ids = torch.randint(0, 512, (1, 600), device = "cuda")
+
+    def run(flex):
+        monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1" if flex else "0")
+        with torch.no_grad():
+            out = model(input_ids = ids, use_cache = True)
+            logits = [out.logits[:, -1].float()]
+            cache, token = out.past_key_values, out.logits[:, -1:].argmax(-1)
+            for _ in range(5):
+                out = model(input_ids = token, past_key_values = cache, use_cache = True)
+                logits.append(out.logits[:, -1].float())
+                cache = out.past_key_values
+                token = torch.randint(0, 512, (1, 1), device = "cuda", generator = torch.Generator("cuda").manual_seed(len(logits)))
+        return torch.stack(logits)
+
+    eager = run(False)
+    F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
+    flex = run(True)
+    assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == 4  # one prefill call per layer
+    assert F4.DEEPSEEK_V4_FLEX_STATS["eager"] == 4 * 5  # every decode step stays eager
+    assert _rel(flex, eager) < 0.02
