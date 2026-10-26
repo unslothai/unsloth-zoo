@@ -161,6 +161,13 @@ def _process_group_timeout():
     return max(seconds, 1)
 pass
 
+def _vllm_split_group_requested():
+    try:
+        return int(os.environ.get("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", "0") or "0") != 0
+    except ValueError:
+        return False
+pass
+
 def _setup_vllm_external_launcher(engine_args, launch_info):
     """One vLLM engine per torchrun rank, inside the job's own process group.
 
@@ -190,8 +197,14 @@ def _setup_vllm_external_launcher(engine_args, launch_info):
     if not dist.is_initialized():
         # Same defaults accelerate uses for a torchrun job (HF ddp_timeout = 1800 s); the
         # Trainer reuses an initialized group. backend None = nccl for cuda + gloo for cpu.
+        kwargs = dict(backend = None)
+        if local_index is not None and _vllm_split_group_requested():
+            # vLLM's split_group (VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1) needs a device-bound default group
+            # with a gloo backend too (parallel_state._validate_default_pg_for_split_group); with
+            # device_id set, backend None would create nccl only.
+            kwargs = dict(backend = "cpu:gloo,cuda:nccl", device_id = torch.device("cuda", local_index))
         dist.init_process_group(
-            backend = None, init_method = "env://", timeout = timedelta(seconds = _process_group_timeout())
+            init_method = "env://", timeout = timedelta(seconds = _process_group_timeout()), **kwargs
         )
     elif dist.get_world_size() != world_size:
         logger.warning(

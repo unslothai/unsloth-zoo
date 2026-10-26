@@ -205,3 +205,32 @@ def test_save_lora_under_ddp_writes_through_a_private_folder(tmp_path, monkeypat
     monkeypatch.setattr(vu, "_distributed_rank_and_world", lambda: (0, 1))
     vu.save_lora(FakeModel(), target)
     assert calls[-1][0] == target
+
+
+@pytest.mark.parametrize("split_group", [None, "0", "1"])
+def test_split_group_gets_a_device_bound_default_group(monkeypatch, split_group):
+    """vLLM's VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1 needs init_process_group(device_id = ...); without
+    it the default group stays unbound, as before."""
+    import torch.distributed as dist
+
+    calls = []
+    monkeypatch.setattr(vu, "DEVICE_TYPE", "cuda")
+    monkeypatch.setattr(vu.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(vu.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(vu.torch.cuda, "set_device", lambda index: None)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(vu, "get_target_device", lambda index = None: "cuda:1")
+    if split_group is None:
+        monkeypatch.delenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", raising = False)
+    else:
+        monkeypatch.setenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", split_group)
+    vu._setup_vllm_external_launcher({}, (1, 1, 2))
+    assert len(calls) == 1
+    if split_group == "1":
+        assert calls[0]["device_id"] == vu.torch.device("cuda", 1)
+        assert calls[0]["backend"] == "cpu:gloo,cuda:nccl"
+    else:
+        assert "device_id" not in calls[0] and calls[0]["backend"] is None
