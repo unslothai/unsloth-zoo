@@ -63,8 +63,19 @@ def _modeling_module(model_type):
             return None
     except Exception:
         return None
+    # Written-out imports: the risky-loader lint rejects import_module on a composed name.
     try:
-        return importlib.import_module(name)
+        if model_type == "deepseek_v32":
+            from transformers.models.deepseek_v32 import modeling_deepseek_v32 as modeling
+        elif model_type == "glm_moe_dsa":
+            from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as modeling
+        elif model_type == "minimax_m3_vl":
+            from transformers.models.minimax_m3_vl import modeling_minimax_m3_vl as modeling
+        elif model_type == "deepseek_v4":
+            from transformers.models.deepseek_v4 import modeling_deepseek_v4 as modeling
+        else:
+            return None
+        return modeling
     except Exception:
         return None
 
