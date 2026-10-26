@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A rollout-rejected token must not reach the policy ratio either.
-
-verl compute_rollout_correction_and_rejection_mask returns response_mask * keep and the trainer
-replaces batch["response_mask"] with it before the policy loss, so the GSPO sequence ratio is the
-mean over surviving tokens only. Selecting the rejected token's loss out afterwards is not enough:
-(1) at sequence level the rejected token's log ratio still sits in the shared ratio and so shapes
-the survivors' gradient, and (2) its trainable pi_theta / pi_old gap is exponentiated before the
-select, so a large gap overflows and backprops inf * 0 = nan although the loss is finite.
-"""
+"""A rollout-rejected token must not reach the policy ratio (verl: response_mask *= keep)."""
 import math
 
 import pytest
@@ -58,8 +50,7 @@ def _loss(ref, new, old, sampling, mask, adv, beta, parsed, level = "sequence", 
 
 
 def _oracle(ref, new, old, sampling, mask, adv, beta, keep, level, bias_kl, bypass, loss_type):
-    """float64 verl objective: response_mask <- response_mask * keep before the policy ratio;
-    the loss normaliser keeps every completion token (documented TRL *_mask convention)."""
+    """float64 verl oracle; the loss normaliser still counts every completion token."""
     m = mask.double()
     k = keep.double() * m
     new = new.double()
@@ -96,8 +87,7 @@ def _keep(new, old, sampling, mask, parsed, bypass):
 
 
 def test_sequence_ratio_leaves_out_rejected_token():
-    # Review repro: new = old = [-1, -1], rollout [-1, -2], advantage 1, token_k3 0.1. Token 2 is
-    # rejected (k3(1) = e - 2 > 0.1). Main gave both tokens -0.25 through the shared GSPO ratio.
+    # Token 2 rejected; main leaked it into the shared GSPO ratio.
     new = torch.tensor([[-1.0, -1.0]], requires_grad = True)
     old = torch.tensor([[-1.0, -1.0]])
     sampling = torch.tensor([[-1.0, -2.0]])
@@ -111,8 +101,7 @@ def test_sequence_ratio_leaves_out_rejected_token():
 @pytest.mark.parametrize("level", ["token", "sequence"])
 @pytest.mark.parametrize("gap", [100.0, 1e4])
 def test_trainable_gap_on_rejected_token_has_finite_grad(level, gap):
-    # Review repro: new = [-1, -1], old = [-1, -1 - gap], rollout [-1, -2 - gap]. exp(new - old) on
-    # the rejected token overflows float32; main kept the finite loss -0.5 but gave grad [-0.5, nan].
+    # exp(new - old) on the rejected token overflows float32; main gave grad nan.
     new = torch.tensor([[-1.0, -1.0]], requires_grad = True)
     old = torch.tensor([[-1.0, -1.0 - gap]])
     sampling = torch.tensor([[-1.0, -2.0 - gap]])
@@ -132,7 +121,7 @@ def _data(seed, rows = 6, cols = 9):
     sampling = old + torch.randn(rows, cols, generator = g, dtype = torch.float64) * 0.2
     mask = (torch.rand(rows, cols, generator = g) > 0.2).long()
     mask[1, 1:] = 0
-    mask[2, 0] = 0  # left padding
+    mask[2, 0] = 0
     adv = torch.randn(rows, generator = g, dtype = torch.float64)
     return ref, new.requires_grad_(True), old, sampling, mask, adv
 
@@ -174,7 +163,6 @@ def test_rejection_gradcheck_fp64(level):
 @pytest.mark.parametrize("level", ["token", "sequence"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float64])
 def test_without_rejection_is_bitwise_unchanged(level, dtype):
-    # rollout_rs off (the default) and a keep-everything threshold must give the same loss and grads.
     ref, new, old, sampling, mask, adv = _data(13)
     ref, old, sampling, adv = (t.to(dtype) for t in (ref, old, sampling, adv))
     a_new = new.detach().to(dtype).requires_grad_(True)
