@@ -1926,10 +1926,22 @@ def _checkpoint_keys(path: Path) -> dict[str, Path]:
     return keys
 
 
+def _omlx_nextn_key(key: str, text_config: dict) -> str | None:
+    """The source name of a nextn MTP tensor omlx stores as ``mtp.<i>.block.*`` (the decoder layer) or ``mtp.<i>.<fusion>``
+    (``eh_proj``/``enorm``/``hnorm``, and ``norm`` for ``shared_head.norm``), for checkpoints whose MTP layers follow the
+    last decoder layer."""
+    match = re.fullmatch(r"mtp\.(\d+)\.(.+)", key)
+    if match is None or not isinstance(text_config.get("num_hidden_layers"), int):
+        return None
+    rest = "shared_head.norm.weight" if match[2] == "norm.weight" else match[2].removeprefix("block.")
+    return f"layers.{text_config['num_hidden_layers'] + int(match[1])}.{rest}"
+
+
 def _native_mtp_head(path: Path) -> tuple | None:
-    """``(splitter, source_config, text_config, prefix, [(file, keys)])`` for a checkpoint's own MTP head, or None. The head
+    """``(splitter, source_config, text_config, rename, [(file, keys)])`` for a checkpoint's own MTP head, or None. The head
     is the splitter's own layout, at the top level or under one ``model.``/``language_model.`` wrapper, where MLX
-    conversions of vision-language checkpoints keep it (``language_model.mtp.*``); ``prefix`` is that wrapper."""
+    conversions of vision-language checkpoints keep it (``language_model.mtp.*``), or the layout omlx converts nextn layers
+    to (``_omlx_nextn_key``), already sanitized; ``rename`` maps a stored key to the splitter's layout."""
     from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
 
     try:
@@ -1941,23 +1953,31 @@ def _native_mtp_head(path: Path) -> tuple | None:
         return None
     text_config = splitter.read_text_config(source_config)
     if selected := list(splitter.iter_selected(path, text_config)):
-        return splitter, source_config, text_config, "", selected
+        return splitter, source_config, text_config, lambda key: key, selected
     nested = {}
     for key, file in _checkpoint_keys(path).items():
         wrapper = re.match(r"(?:(?:model|language_model)\.)+", key)
         parts = wrapper.group().split(".")[:-1] if wrapper else []
-        for prefix in (".".join(parts[:end]) + "." for end in range(1, len(parts) + 1)):
-            if splitter.select_keys(key[len(prefix) :], text_config):
-                nested.setdefault(prefix, {}).setdefault(file, []).append(key)
+        prefixes = [".".join(parts[:end]) + "." for end in range(1, len(parts) + 1)]
+        # The splitter's own layout at the top level is the case ``iter_selected`` covered.
+        for prefix, omlx in [(prefix, omlx) for prefix in (*prefixes, "") for omlx in (False, True) if prefix or omlx]:
+            name = key[len(prefix) :]
+            if (name := _omlx_nextn_key(name, text_config) if omlx else name) and splitter.select_keys(name, text_config):
+                nested.setdefault((prefix, omlx), {}).setdefault(file, []).append(key)
                 break
     if len(nested) != 1:
         return None
-    [(prefix, files)] = nested.items()
+    [((prefix, omlx), files)] = nested.items()
+
+    def rename(key):
+        key = key.removeprefix(prefix)
+        return _omlx_nextn_key(key, text_config) if omlx else key
+
     for name in ("quantization", "quantization_config"):
         if isinstance(source_config.get(name), dict):
             # Per-module overrides name the head's modules under the wrapper too.
             source_config[name] = {key.removeprefix(prefix): value for key, value in source_config[name].items()}
-    return splitter, source_config, text_config, prefix, list(files.items())
+    return splitter, source_config, text_config, rename, list(files.items())
 
 
 def has_native_mtp_head(model_path: str | Path) -> bool:
@@ -1974,14 +1994,14 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool 
     head = _native_mtp_head(Path(model_path))
     if head is None:
         return None
-    splitter, source_config, text_config, prefix, selected = head
+    splitter, source_config, text_config, rename, selected = head
     module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
     if not hasattr(module, "Model"):
         raise ValueError(f"mlx-vlm has no drafter for {splitter.output_model_type} MTP heads")
     tensors, source_is_mlx = {}, False
     for file, keys in selected:
         source_is_mlx = source_is_mlx or (splitter.supports_mlx_source and _is_mlx_safetensors(file))
-        tensors.update((key.removeprefix(prefix), value) for key, value in splitter.load_shard(file, keys).items())
+        tensors.update((rename(key), value) for key, value in splitter.load_shard(file, keys).items())
     tensors, fp8_quantization = transform_fp8_weights(tensors, source_config)
     if fp8_quantization is not None:
         source_config = {**source_config, "quantization": fp8_quantization}

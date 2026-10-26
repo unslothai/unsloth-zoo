@@ -1264,6 +1264,50 @@ def test_a_head_whose_overrides_name_its_checkpoint_paths_is_built_at_its_stored
     assert all(mx.array_equal(built[key.removeprefix("mtp.")], value) for key, value in tensors.items())
 
 
+GLM5_TEXT = dict(model_type = "glm5_next_text", hidden_size = 256, num_hidden_layers = 4, num_nextn_predict_layers = 1, vocab_size = 512,
+                 num_attention_heads = 2, num_key_value_heads = 2, q_lora_rank = 128, kv_lora_rank = 64, qk_head_dim = 64, qk_nope_head_dim = 64,
+                 qk_rope_head_dim = 0, v_head_dim = 64, head_dim = 0, intermediate_size = 256, moe_intermediate_size = 64, n_routed_experts = 4,
+                 n_shared_experts = 1, num_experts_per_tok = 2, first_k_dense_replace = 1, index_head_dim = 32, index_n_heads = 2, index_topk = 16,
+                 index_kpool = 4, n_group = 1, topk_group = 1, routed_scaling_factor = 2.5, rms_norm_eps = 1e-5, hc_mult = 4, hc_eps = 1e-6,
+                 hc_sinkhorn_iters = 4, swiglu_limit = 10.0, max_position_embeddings = 4096, layer_types = ["linear_attention"] * 3 + ["deepseek_sparse_attention"],
+                 indexer_types = ["full"] * 4, mlp_layer_types = ["dense"] + ["sparse"] * 3,
+                 linear_attn_config = {"num_heads": 2, "gate_lower_bound": -5.0, "head_dim": 64, "short_conv_kernel_size": 4, "kda_layers": [0, 1, 2], "full_attn_layers": [3]})
+
+
+def test_a_nextn_head_omlx_stores_as_mtp_blocks_is_built_as_from_its_source_layout(monkeypatch, tmp_path):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten, tree_unflatten
+    from mlx_vlm.speculative.drafters import glm5_next_mtp
+    from unsloth_zoo.mlx import speculative
+    head = glm5_next_mtp.Model(glm5_next_mtp.ModelConfig.from_dict({"model_type": "glm5_next_mtp", "text_config": GLM5_TEXT, "block_size": 2}))
+    # Distinct values per tensor, so a mapping that swaps two same-shaped tensors (enorm, hnorm) shows.
+    head.update(tree_unflatten([(key, mx.random.normal(value.shape, key = mx.random.key(i)) * 0.05) for i, (key, value) in enumerate(tree_flatten(head.parameters()))]))
+    default, wide = {"group_size": 64, "bits": 4, "mode": "affine"}, {"group_size": 64, "bits": 8, "mode": "affine"}
+    nn.quantize(head, class_predicate = lambda name, layer: hasattr(layer, "to_quantized") and not name.endswith("mlp.gate")
+                and layer.weight.shape[-1] % 64 == 0 and (wide if ".self_attn." in name or "shared_experts" in name else default))
+    expected = dict(tree_flatten(head.parameters()))
+    # As omlx converts the nextn layer: the decoder layer as the target's own sanitize leaves it, the fusion tensors beside it.
+    stored, split = {}, {"mlp.shared_experts.gate_up_proj": (("gate_proj", "up_proj"), 2), "self_attn.qkv_a_proj": (("q_a_proj", "kv_a_proj_with_mqa"), [GLM5_TEXT["q_lora_rank"]])}
+    for key, value in expected.items():
+        module, leaf = key.rsplit(".", 1)
+        name = f"mtp.0.block.{module.removeprefix('mtp_block.')}" if module.startswith("mtp_block.") else "mtp.0.norm" if module == "shared_head_norm" else f"mtp.0.{module}"
+        fused = next((part for part in split if module.endswith(part)), None)
+        if fused is None:
+            stored[f"language_model.{name}.{leaf}"] = value
+            continue
+        (first, second), at = split[fused]
+        base = name.removesuffix(fused.split(".")[-1])
+        stored.update(zip((f"language_model.{base}{first}.{leaf}", f"language_model.{base}{second}.{leaf}"), mx.split(value, at, axis = 0)))
+    stored["language_model.model.norm.weight"] = mx.ones(8)  # a trunk tensor the head must not take
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), stored, metadata = {"format": "mlx"})
+    overrides = {key.rsplit(".", 1)[0]: wide for key in stored if key.endswith(".scales") and (".self_attn." in key or "shared_experts" in key)}
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm5_next", "text_config": GLM5_TEXT, "quantization": {**default, **overrides}}))
+    monkeypatch.setattr(speculative, "_built", lambda wrapper, model, target, **kwargs: model)
+    assert speculative.has_native_mtp_head(tmp_path)
+    built = dict(tree_flatten(speculative.native_mtp_drafter(tmp_path, None).parameters()))
+    assert built.keys() == expected.keys() and all(mx.array_equal(built[key], value) for key, value in expected.items())
+
+
 def test_a_separate_mtp_head_checkpoint_is_wrapped_as_the_built_in_head(qwen_mtp, tmp_path):
     from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
     from unsloth_zoo.mlx.speculative import MTPDrafter, companion_drafter
