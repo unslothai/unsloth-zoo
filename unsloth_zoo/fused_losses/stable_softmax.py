@@ -29,8 +29,9 @@ __all__ = [
 
 
 def _softplus(x):
-    # Exact log(1 + exp(x)): F.softplus returns x itself past its threshold of 20, off by up to 2e-9.
-    return x.clamp_min(0) + torch.log1p(torch.exp(-x.abs()))
+    # Exact log(1 + exp(x)) with gradient sigmoid(x) at 0 too: F.softplus returns x past its threshold of 20,
+    # and clamp_min(x, 0) + log1p(exp(-|x|)) has derivative 1 at x = 0.
+    return torch.logaddexp(x, torch.zeros_like(x))
 
 
 def _others_lse(s_others, m):
@@ -86,7 +87,7 @@ _ROWS_CHUNK_BYTES = 256 * 1024 * 1024
 
 def _row_chunks(n_rows, vocab_size):
     if torch.compiler.is_compiling():
-        return n_rows  # one chunk: Inductor fuses the upcast instead of materialising it
+        return max(n_rows, 1)  # one chunk: Inductor fuses the upcast instead of materialising it
     return max(1, min(n_rows, _ROWS_CHUNK_BYTES // max(4 * vocab_size, 1)))
 
 

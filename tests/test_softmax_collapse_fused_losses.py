@@ -185,3 +185,19 @@ def test_ordinary_logits_match_stock():
     loss, _ = compute_fused_ce_loss(z[None], torch.eye(V), None, t[None], shift_labels = False, label_smoothing = 0.1)
     ref = F.cross_entropy(z, t, label_smoothing = 0.1)
     assert abs(loss.item() - ref.item()) < 1e-5 * ref.item()
+
+
+def test_tie_gradient_and_empty_rows():
+    from unsloth_zoo.fused_losses.stable_softmax import cross_entropy_rows, smoothed_nll
+
+    # Target logit equal to the logsumexp of the others: d nll / dz = p - onehot = [-0.5, 0.5].
+    for fn in (lambda z, t: smoothed_nll(z, t), lambda z, t: cross_entropy_rows(z, t)):
+        z = torch.zeros(1, 2, requires_grad = True)
+        fn(z, torch.tensor([0])).sum().backward()
+        assert torch.allclose(z.grad, torch.tensor([[-0.5, 0.5]]))
+    x = torch.tensor([-100.0, -30.0, 0.0, 1e-8, 20.0, 30.0, 100.0], dtype = torch.float64)
+    ref = torch.log1p(torch.exp(x))
+    assert torch.allclose(smoothed_nll(torch.stack([x, torch.zeros_like(x)], -1), torch.ones(7, dtype = torch.long)),
+                          ref, rtol = 1e-12, atol = 0)
+    compiled = torch.compile(cross_entropy_rows, backend = "eager", fullgraph = True)
+    assert compiled(torch.zeros(0, 5), torch.zeros(0, dtype = torch.long)).shape == (0,)
