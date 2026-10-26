@@ -14,19 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Long-context sparse attention on flex attention for indexer-selected models.
+"""Indexer-selected sparse attention as a flex BlockMask instead of a dense [B, H, S, T] mask.
 
-Upstream eager / SDPA paths expand an indexer's selection into a dense [B, H, S, T] mask and
-run dense masked attention over it. Here the selection becomes a flex BlockMask instead:
-128 x 128 tiles no query row selects are skipped, tiles every row keeps run without a
-mask_mod, and boundary tiles read the exact per-row selection. Outputs match the dense path
-up to floating-point reduction order.
-
-- MiniMax M3: block-sparse selection, [B, H_idx, S, topk_blocks] block ids (-1 = none).
-- DSA (DeepSeek V3.2, GLM-MoE-DSA): token selection, [B, S, topk] key ids.
-
-Block indices are always passed to BlockMask.from_kv_blocks in ascending order: flex's
-backward transposes the kv order into q order and silently miscomputes on unsorted lists.
+Block indices must reach BlockMask.from_kv_blocks ascending: flex's backward silently
+miscomputes on unsorted lists.
 """
 
 __all__ = [
@@ -48,7 +39,6 @@ import torch.nn.functional as F
 from .sparse import record_sparse_attn, sparse_flex_enabled
 
 _TILE = 128
-# (kind, device index, dtype, head dims) -> repr of the first failure; later calls skip flex.
 _FAILED = {}
 # fp32 elements per indexer score chunk (1 GiB); smaller problems run in one shot like upstream.
 _SCORE_BUDGET = 1 << 28
@@ -102,9 +92,7 @@ def _failure_key(kind, query, key, value):
 
 
 def _virtual_kv_heads(query, key, value):
-    """Repeat KV heads so each holds at most 4 query heads: flex's GQA kernels lose most of their
-    parallelism at high group counts (one K/V head per 16+ query heads). Exact: query head h still
-    reads original KV head h // (H_q / H_kv)."""
+    """Repeat KV heads to at most 4 query heads each: flex's GQA kernels lose parallelism at 16+."""
     n_q, n_kv = query.shape[1], key.shape[1]
     if os.environ.get("UNSLOTH_SPARSE_FLEX_VIRTUAL_KV", "1") == "0" or n_q // n_kv <= 4:
         return key, value
@@ -125,7 +113,6 @@ def _flex(query, key, value, block_mask, scale):
 
 
 def _pack_ascending(selected):
-    """(num, ids) for BlockMask.from_kv_blocks: active block ids first, ascending."""
     n_kv = selected.shape[-1]
     ar = torch.arange(n_kv, device = selected.device, dtype = torch.int32)
     num = selected.sum(dim = -1, dtype = torch.int32)
@@ -134,7 +121,6 @@ def _pack_ascending(selected):
 
 
 def tile_block_mask(any_tiles, all_tiles, mask_mod, q_len, kv_len):
-    """BlockMask from per-tile flags [B, H, n_q_tiles, n_kv_tiles]: all -> full, any -> partial."""
     from torch.nn.attention.flex_attention import BlockMask
     full = all_tiles
     partial = any_tiles & ~all_tiles
@@ -155,7 +141,6 @@ def _pad_to(x, dim, size, value):
 
 
 def _base_keep(attention_mask, q_pad, kv_pad):
-    """Padded bool keep mask [B or 1, 1, q_pad, kv_pad] from a 4D bool / additive mask."""
     keep = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
     if keep.shape[1] != 1:
         keep = keep[:, :1]  # head-shared masks only (callers check)
@@ -164,21 +149,14 @@ def _base_keep(attention_mask, q_pad, kv_pad):
 
 
 def _tiles_any_all(keep, n_q, n_kv):
-    """[..., q_pad, kv_pad] bool -> any / all over each 128 x 128 tile."""
     shape = keep.shape[:-2]
     t = keep.reshape(*shape, n_q, _TILE, n_kv, _TILE)
     return t.any(dim = -1).any(dim = -2), t.all(dim = -1).all(dim = -2)
 
 
-# --------------------------------------------------------------------------------------
-# MiniMax M3 (block-sparse)
-# --------------------------------------------------------------------------------------
 @torch.no_grad()
 def minimax_m3_select_blocks(indexer, hidden_states, position_embeddings, past_key_values, position_ids, apply_rotary_pos_emb):
-    """MiniMaxM3VLIndexer.forward with query-chunked scoring: [B, H_idx, S_q, topk] block ids, -1 padded.
-
-    Same arithmetic per query row as upstream; only the [B, H_idx, S_q, S_k] fp32 score buffer
-    is bounded to one chunk of queries."""
+    """MiniMaxM3VLIndexer.forward with query-chunked scoring: [B, H_idx, S_q, topk] block ids, -1 padded."""
     batch, q_len, _ = hidden_states.shape
     idx_q = indexer.q_proj(hidden_states).view(batch, q_len, -1, indexer.head_dim)
     idx_q = indexer.q_norm(idx_q).transpose(1, 2)
@@ -222,11 +200,7 @@ def minimax_m3_select_blocks(indexer, hidden_states, position_embeddings, past_k
 
 
 def minimax_m3_flex_attention(query, key, value, block_indices, attention_mask, position_ids, scaling, block_size):
-    """Flex attention under MiniMax M3's block selection; returns [B, S, H, D] like sdpa_attention_forward.
-
-    Keeps exactly the (query, key) pairs of MiniMaxM3VLIndexer.build_block_mask: the query's
-    selected key blocks for its indexer head (h // (H_q / H_idx)), intersected with the base mask
-    (or key slot <= position id when the base mask is None)."""
+    """Flex attention keeping exactly MiniMaxM3VLIndexer.build_block_mask's pairs; returns [B, S, H, D]."""
     batch, n_heads, q_len, _ = query.shape
     kv_len = key.shape[2]
     n_idx = block_indices.shape[1]
@@ -237,7 +211,7 @@ def minimax_m3_flex_attention(query, key, value, block_indices, attention_mask, 
     num_key_blocks = -(-kv_len // block_size)
     per_block = block_size // _TILE
 
-    # Per-row selection, one spare column absorbing the -1 slots.
+    # Spare last column absorbs the -1 slots.
     safe = block_indices.masked_fill(block_indices < 0, num_key_blocks).long()
     sel = torch.zeros(batch, n_idx, q_pad, num_key_blocks + 1, dtype = torch.bool, device = query.device)
     sel[:, :, :q_len].scatter_(-1, safe, True)
@@ -295,15 +269,9 @@ def minimax_m3_flex_eligible(module, query, key, attention_mask, kwargs):
     return _failure_key("minimax_m3", query, key, key) not in _FAILED
 
 
-# --------------------------------------------------------------------------------------
-# DSA (DeepSeek V3.2, GLM-MoE-DSA): token-level top-k
-# --------------------------------------------------------------------------------------
 @torch.no_grad()
 def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attention_mask, past_key_values, apply_rope, model_type = "dsa"):
-    """DeepseekV32Indexer / GlmMoeDsaIndexer forward with query-chunked scoring: [B, S, topk] int32.
-
-    Upstream materialises [B, S, H_idx, T] fp32 scores (16 GiB at S = T = 8192). Each query row's
-    arithmetic is unchanged; the scores exist one chunk of queries at a time."""
+    """DSA indexer forward with query-chunked scoring (upstream: 16 GiB fp32 at S = T = 8192): [B, S, topk] int32."""
     batch_size, seq_len, _ = hidden_states.shape
     cos, sin = position_embeddings
     q = indexer.wq_b(q_resid).view(batch_size, seq_len, indexer.n_heads, indexer.head_dim)
@@ -338,11 +306,9 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
 
 
 def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling, model_type = "dsa"):
-    """Flex attention over the indexer's selected keys; returns [B, S, H, D_v].
+    """Flex attention over top-k AND base mask; returns [B, S, H, D_v].
 
-    Keeps exactly the pairs of upstream's eager / SDPA path: selected by top-k AND allowed by
-    the 4D base mask. The bitmap and BlockMask are stored on `topk_indices`, so GLM's shared
-    layers, which receive the producer's tensor object, reuse them within the step."""
+    The BlockMask is cached on `topk_indices` so GLM's shared layers reuse it within the step."""
     cached = getattr(topk_indices, "_unsloth_dsa_flex", None)
     if cached is not None and cached[0] is attention_mask and cached[1] == key.shape[2]:
         _count("flex_reused", model_type)
@@ -375,11 +341,9 @@ _SDPA_PICKS_CUDNN = {}
 
 
 def masked_sdpa_picks_cudnn(query, key, value):
-    """Whether torch's own SDPA choice for a bool-masked call of this shape class is cuDNN.
+    """Whether torch picks cuDNN for this bool-masked SDPA shape class.
 
-    Where it is (H100 on torch 2.14), dense masked SDPA beats flex on DSA's scattered selections
-    (GLM-5 4K keys 25 vs 34 ms, 8K 95 vs 136 ms); elsewhere flex wins (A100 on 2.10 / 2.14,
-    H100 on 2.10). Probed once per (device, dtype, heads, head dims, grad, cuDNN enabled)."""
+    cuDNN (H100, torch 2.14) beats flex on DSA (GLM-5 4K keys 25 vs 34 ms, 8K 95 vs 136 ms); elsewhere flex wins."""
     needs_grad = torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad)
     cache_key = (
         query.device.index, query.dtype, query.shape[1], key.shape[1], query.shape[-1], value.shape[-1],
@@ -407,10 +371,7 @@ def masked_sdpa_picks_cudnn(query, key, value):
 
 
 def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_keys):
-    """Flex above the selection budget, unless torch would run this masked call on cuDNN.
-
-    `min_keys` is UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS when set (forces flex at or above it),
-    else None: the budget plus the cuDNN probe decide."""
+    """Flex above the budget unless SDPA would pick cuDNN; `min_keys` (UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS) forces flex."""
     if module.config._attn_implementation not in ("eager", "sdpa"):
         return False
     budget = int(module.config.index_topk)
@@ -432,6 +393,5 @@ def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_key
 
 
 def record_failure(kind, query, key, value, error):
-    """Latch a flex failure for this shape class; the caller falls back to the dense path."""
     _FAILED[_failure_key(kind, query, key, value)] = repr(error)[:500]
     _count("fallback", kind)

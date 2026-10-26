@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Subprocess worker for test_sparse_attention_flex.test_skip_and_flex_compose.
-
-python _sparse_compose_worker.py {skip_first|flex_first} {deepseek_v32|glm_moe_dsa|minimax_m3_vl}
-Installs the exact-skip and sparse-flex patch sets in the given order (both twice), then checks
-on a tiny model: within the budget the skip engages and logits equal the skip-off run bitwise;
-above the budget the chunked indexer (and on sm80+ CUDA, flex) engages; the two kill switches
-act independently. Prints COMPOSE_OK on success."""
+"""python _sparse_compose_worker.py {skip_first|flex_first} {model_type}: checks skip and flex patches compose."""
 
 import os
 import sys
