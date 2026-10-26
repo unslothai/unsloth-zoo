@@ -30,7 +30,9 @@ import torch
 from unsloth_zoo.flex_attention.sparse import SPARSE_ATTN_STATS, reset_sparse_attn_stats
 import unsloth_zoo.temporary_patches.sparse_attention as sparse_attention
 
-DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+# The consolidated CUDA spoof makes is_available() True on CPU-only runners.
+_REAL_CUDA = torch.cuda.is_available() and not getattr(torch.cuda, "_unsloth_consolidated_spoof", False)
+DEVICES = ["cpu"] + (["cuda"] if _REAL_CUDA else [])
 
 
 def _has(model_type):

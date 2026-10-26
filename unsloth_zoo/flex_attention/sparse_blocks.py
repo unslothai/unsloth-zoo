@@ -335,7 +335,10 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
     if past_key_values is not None:
         k = past_key_values.update_indexer(k, indexer.layer_idx)
     k_t = k.transpose(-1, -2).float().unsqueeze(1)  # [B, 1, D, T]
-    weights = indexer.weights_proj(hidden_states.to(indexer.weights_proj.weight.dtype)).float() * (indexer.n_heads ** -0.5)
+    w_dtype = indexer.weights_proj.weight.dtype
+    # Cast only when needed: on macOS unsloth wraps Tensor.to, which fullgraph compile cannot trace.
+    x = hidden_states if hidden_states.dtype == w_dtype else hidden_states.to(w_dtype)
+    weights = indexer.weights_proj(x).float() * (indexer.n_heads ** -0.5)
     topk = min(indexer.index_topk, k.shape[1])
     attention_mask = _broadcast_mask(attention_mask, batch_size, seq_len, k.shape[1])
     out = []
