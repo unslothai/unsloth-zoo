@@ -179,15 +179,24 @@ def _pack(selected, num_blocks):
 
 
 def deepseek_v4_block_mask(attention_mask, batch):
-    """BlockMask over the additive [B|1, 1, S, KV] mask (0 = attend). Keys a row may not see stay
-    masked at token level; whole 128 x 128 tiles with nothing visible are skipped."""
+    """(BlockMask, bias or None) over the additive [B|1, 1, S, KV] mask. Entries at or below half the dtype minimum
+    (and -inf) are hard-masked; every other value is added to the score like eager does, so finite custom
+    biases are kept. Whole 128 x 128 tiles with nothing visible are skipped."""
     from torch.nn.attention.flex_attention import BlockMask
 
     q_len, kv_len = attention_mask.shape[-2], attention_mask.shape[-1]
     nq, nk = -(-q_len // _BLOCK), -(-kv_len // _BLOCK)
-    # Lookup padded to whole tiles with False: mask_mod may be evaluated on any index of a tile.
+    # Padded to whole tiles: mask_mod / score_mod may be evaluated on any index of a tile.
+    visible = attention_mask[:, 0] > torch.finfo(attention_mask.dtype).min / 2
     table = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK), dtype = torch.bool)
-    table[:, :q_len, :kv_len] = attention_mask[:, 0] == 0
+    table[:, :q_len, :kv_len] = visible
+    # transformers' own masks are 0 / min only; reading a bias per score costs 5-15%, so only when present.
+    bias = None
+    if bool((visible & (attention_mask[:, 0] != 0)).any()):
+        bias = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK))
+        bias[:, :q_len, :kv_len] = torch.where(visible, attention_mask[:, 0], 0)
+        if bias.shape[0] != batch:
+            bias = bias.expand(batch, -1, -1)
     if table.shape[0] != batch:
         table = table.expand(batch, -1, -1)
     tiles = table.view(batch, nq, _BLOCK, nk, _BLOCK)
@@ -199,7 +208,7 @@ def deepseek_v4_block_mask(attention_mask, batch):
     def mask_mod(b, h, q_idx, kv_idx):
         return table[b, q_idx, kv_idx]
 
-    return BlockMask.from_kv_blocks(
+    block_mask = BlockMask.from_kv_blocks(
         partial_count,
         partial_index,
         full_count,
@@ -208,6 +217,7 @@ def deepseek_v4_block_mask(attention_mask, batch):
         mask_mod = mask_mod,
         seq_lengths = (q_len, kv_len),
     )
+    return block_mask, bias
 
 
 def deepseek_v4_flex_attention(module, query, key, attention_mask, scaling):
@@ -215,12 +225,19 @@ def deepseek_v4_flex_attention(module, query, key, attention_mask, scaling):
     from unsloth_zoo.flex_attention.utils import FLEX_LSE_KWARGS, flex_output_and_lse
 
     bsz, n_heads, _, head_dim = query.shape
-    block_mask = deepseek_v4_block_mask(attention_mask, bsz)
+    block_mask, bias = deepseek_v4_block_mask(attention_mask, bsz)
     kv = key.expand(bsz, n_heads, key.shape[2], head_dim)
+
+    score_mod = None
+    if bias is not None:
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return score + bias[b, q_idx, kv_idx]
+
     out, lse = flex_output_and_lse(_compiled_flex()(
         query,
         kv,
         kv,
+        score_mod = score_mod,
         block_mask = block_mask,
         scale = scaling,
         kernel_options = _KERNEL_OPTIONS,

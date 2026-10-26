@@ -172,7 +172,7 @@ def test_default_policy_keeps_short_prompts_eager(monkeypatch):
 @needs_flex_gpu
 def test_block_mask_matches_the_additive_mask():
     mask = _mask(2, 300, 64, 75, 4, 16, torch.bfloat16, "cuda", pad = 50)
-    block_mask = F4.deepseek_v4_block_mask(mask, 2)
+    block_mask, _ = F4.deepseek_v4_block_mask(mask, 2)
     dense = block_mask.to_dense()  # [B, 1, nq, nk] tiles that are visited
     allowed = mask[:, 0] == 0
     nq, nk = dense.shape[-2:]
@@ -212,6 +212,22 @@ def test_flex_equals_eager_in_float32():
     """Same math in fp32 (sliding window + padding + top-k compressed entries + sink): only the
     reduction order differs, including the fully masked rows of the left-padded batch row."""
     attn, q, kv, mask, grad = _function_case(torch.float32)
+    scale = q.shape[-1] ** -0.5
+    ref = _run(lambda: ORIGINAL(attn, q, kv, kv, mask, scale)[0], attn, q, kv, mask, grad)
+    got = _run(lambda: F4.deepseek_v4_flex_attention(attn, q, kv, mask, scale), attn, q, kv, mask, grad)
+    for name, a, b in zip(("out", "dq", "dkv", "dsinks"), got, ref):
+        err = ((a - b).norm() / b.norm()).item()
+        assert err < 2e-5, (name, err)
+
+
+@needs_flex_gpu
+def test_flex_keeps_finite_mask_biases_in_float32():
+    """A custom additive mask with finite biases (here -1 and +0.5 on visible keys) adds to the logits like eager."""
+    attn, q, kv, mask, grad = _function_case(torch.float32)
+    torch.manual_seed(1)
+    visible = mask > torch.finfo(mask.dtype).min / 2
+    bias = torch.where(torch.rand_like(mask) < 0.5, -1.0, 0.5)
+    mask = torch.where(visible, mask + bias, mask)
     scale = q.shape[-1] ** -0.5
     ref = _run(lambda: ORIGINAL(attn, q, kv, kv, mask, scale)[0], attn, q, kv, mask, grad)
     got = _run(lambda: F4.deepseek_v4_flex_attention(attn, q, kv, mask, scale), attn, q, kv, mask, grad)
