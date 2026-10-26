@@ -166,8 +166,7 @@ def _tracing_or_capturing(device = None):
         return False
     if torch.cuda.is_current_stream_capturing():
         return True
-    # The query only sees the current device: ask the operand's device too, a split-device model
-    # can be capturing on a GPU that is not current.
+    # The query only sees the current device; a split-device model may capture on another GPU.
     if device is None or device.type != "cuda" or device.index in (None, torch.cuda.current_device()):
         return False
     with torch.cuda.device(device):

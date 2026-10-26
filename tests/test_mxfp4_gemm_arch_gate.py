@@ -159,9 +159,6 @@ def test_sm80_and_newer_route_the_same_traced_or_not(gpu, monkeypatch, capabilit
 
 @pytest.mark.parametrize("operand,current", [(1, 0), (0, 1), (1, 1)])
 def test_stacked_experts_on_sm75_see_a_capture_on_the_operand_gpu(gpu, monkeypatch, operand, current):
-    # torch.cuda.is_current_stream_capturing() only sees the current device. A split-device model can run
-    # experts on a GPU that is capturing while another one is current; the host-reading fallback
-    # (.tolist()) would then abort the capture, so the operand's device must be asked as well.
     gpu((7, 5))
     monkeypatch.setattr(mg, "_AVAILABLE_DTYPE", {
         (str(torch.device("cuda", i)), dtype): True for i in (0, 1) for dtype in (torch.float16, torch.bfloat16)
@@ -188,7 +185,6 @@ def test_stacked_experts_on_sm75_see_a_capture_on_the_operand_gpu(gpu, monkeypat
     assert mse._fused(inputs, param, True)
     assert mse._fused(inputs, param, False)
     assert state["current"] == current
-    # No capture anywhere: training-size rows still dequantize.
     state["capturing"] = set()
     assert not mse._fused(inputs, param, True)
     assert not mse._fused(inputs, param, False)
