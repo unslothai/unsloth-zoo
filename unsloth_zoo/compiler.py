@@ -56,7 +56,10 @@ from .utils import (
     get_lock,
 )
 from .log import logger
-import triton
+try:
+    import triton
+except ImportError:  # AMD Windows / CPU wheels ship no Triton
+    triton = None
 import regex
 from .peft_utils import get_lora_layer_modules
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
@@ -150,7 +153,7 @@ from unsloth_zoo.fused_losses import forward_adapter as _forward_adapter
 _forward_adapter.lm_head_on_old_cuda_arch = lm_head_on_old_cuda_arch
 del _forward_adapter
 
-OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
+OLD_TRITON_VERSION = triton is None or Version(triton.__version__) < Version("3.0.0")
 
 # Check if Unsloth Studio is allowed
 import importlib.util

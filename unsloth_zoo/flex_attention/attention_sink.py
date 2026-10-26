@@ -34,6 +34,7 @@ from .utils import (
     reused_compiled_create_block_mask,
     _flex_attention as uncompiled_flex_attention,
     flex_attention,
+    PREFILL_KERNEL_OPTIONS,
     FlexAttentionCache,
     FLEX_LSE_KWARGS,
     flex_output_and_lse,
@@ -131,6 +132,7 @@ def old_flex_attention_with_sink(
         score_mod = score_mod,
         enable_gqa = enable_gqa,
         scale = scale,
+        kernel_options = PREFILL_KERNEL_OPTIONS,
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
@@ -236,6 +238,7 @@ def flex_attention_with_sink(
         score_mod = None, # None needed
         enable_gqa = enable_gqa,
         scale = scale,
+        kernel_options = PREFILL_KERNEL_OPTIONS,
         **FLEX_LSE_KWARGS, # log(sum(exp(xi)))
     ))
 

@@ -268,9 +268,13 @@ def test_helper_keeps_the_stock_dtype_and_sums_in_float32():
     assert mean.dtype == torch.bfloat16 and torch.equal(mean, stock)
     per_token = F.cross_entropy(half[..., :-1, :].reshape(-1, 13), labels[..., 1:].reshape(-1),
                                 reduction = "none").float().sum()
+    exact = F.cross_entropy(half[..., :-1, :].float().reshape(-1, 13), labels[..., 1:].reshape(-1),
+                            reduction = "sum")
     counted = unsloth_count_aware_cross_entropy(half, labels, torch.tensor(29))
     assert counted.dtype == torch.float32
-    torch.testing.assert_close(counted, per_token / 29)
+    # float32 per token losses: the exact value, and stock's bf16-rounded per token sum to bf16 precision.
+    torch.testing.assert_close(counted, exact / 29)
+    torch.testing.assert_close(counted, per_token / 29, rtol = 2 ** -8, atol = 0)
     big = torch.zeros(1, 6001, 4, dtype = torch.float16)
     big_labels = torch.zeros(1, 6001, dtype = torch.long)
     big[..., 0] = -12.0
@@ -425,3 +429,15 @@ def test_count_kwargs_read_a_module_loss_forward():
     assert unsloth_loss_count_kwargs(Strict(), count) == {}
     assert unsloth_loss_count_kwargs(positional_only, count) == {}
     assert unsloth_loss_count_kwargs(Counted(), count) == {"num_items_in_batch": count}
+
+
+def test_mean_under_autocast_matches_stock_dtype_and_scaled_backward():
+    # Stock cross_entropy runs in float32 under autocast; a half mean would overflow GradScaler's 65536.
+    logits = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype = torch.bfloat16, requires_grad = True)
+    labels = torch.tensor([0, 1])
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        got = unsloth_count_aware_cross_entropy(logits[None], labels[None], shift = False)
+        ref = torch.nn.functional.cross_entropy(logits, labels)
+    assert got.dtype == ref.dtype == torch.float32
+    (got * 65536.0).backward()
+    assert torch.isfinite(logits.grad).all()
