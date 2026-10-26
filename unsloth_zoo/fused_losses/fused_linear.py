@@ -109,6 +109,7 @@ _IS_HIP = torch.version.hip is not None
 # Bump the suffix on any schema / backward change: Inductor / AOTAutograd caches key on neither.
 _LP_OP = "fused_linear_logprobs_v6"
 _LP_BWD_OP = "fused_linear_logprobs_bwd_v4"
+_CE_OP = "fused_linear_ce_v2"
 
 CALLS = {"ce": 0, "logprobs": 0, "logprobs_bwd": 0, "triton": 0, "torch": 0, "tiled": 0, "exact_top": 0,
          "bwd_single": 0, "flash": 0}
@@ -1666,7 +1667,7 @@ _OPS = getattr(torch, "_unsloth_fused_linear_ops", None)
 if _OPS is None:
     from torch.library import custom_op
 
-    @custom_op("unsloth_zoo::fused_linear_ce", mutates_args = ())
+    @custom_op(f"unsloth_zoo::{_CE_OP}", mutates_args = ())
     def _ce_op(
         hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], targets: torch.Tensor,
         divisor: torch.Tensor, scaling: torch.Tensor, ignore_index: int, mul: float, div: float, cap: float,
@@ -1691,10 +1692,14 @@ if _OPS is None:
     def _ce_setup(ctx, inputs, output):
         loss, grad_h, grad_w, grad_b = output
         ctx.mark_non_differentiable(grad_h, grad_w, grad_b)
+        # Else autograd materializes zero gradients for the stored-gradient outputs: [N, H] (and [V, H]) per backward.
+        ctx.set_materialize_grads(False)
         ctx.need = inputs[13:16]
         ctx.save_for_backward(grad_h, grad_w, grad_b, inputs[5])
 
     def _ce_backward(ctx, grad_loss, *_):
+        if grad_loss is None:
+            return (None,) * 18
         grad_h, grad_w, grad_b, scaling = ctx.saved_tensors
         # fp32 factor, not rounded to half.
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
@@ -1904,7 +1909,7 @@ CALLS.setdefault("jsd", 0)
 
 
 # Generalized JSD between a trained student head and a frozen teacher head (TRL GKDTrainer.generalized_jsd_loss).
-_JSD_OP = "fused_linear_jsd_v1"
+_JSD_OP = "fused_linear_jsd_v2"
 # Live [rows, vocab] buffers per eager chunk in the statistic dtype; the chunk is sized to this budget.
 _JSD_BUFFERS = 4
 _JSD_CHUNK_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB", 1024) * 1024**2), 1)
@@ -2261,10 +2266,13 @@ if not _OPS.get("jsd_registered", False):
     def _jsd_setup(ctx, inputs, output):
         loss, grad_h, grad_w, grad_b = output
         ctx.mark_non_differentiable(grad_h, grad_w, grad_b)
+        ctx.set_materialize_grads(False)  # as the CE op
         ctx.need = inputs[17:20]
         ctx.save_for_backward(grad_h, grad_w, grad_b, inputs[8])
 
     def _jsd_backward(ctx, grad_loss, *_):
+        if grad_loss is None:
+            return (None,) * 21
         grad_h, grad_w, grad_b, scaling = ctx.saved_tensors
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
         s = grad_loss.to(acc) / scaling.to(acc)
@@ -2338,7 +2346,7 @@ def fused_linear_cross_entropy(
     if logits_bias is not None:
         # Bart's final_logits_bias is [1, vocab]; a split model may keep it off the head's device.
         logits_bias = logits_bias.reshape(-1).to(device)
-    loss = torch.ops.unsloth_zoo.fused_linear_ce(
+    loss = getattr(torch.ops.unsloth_zoo, _CE_OP)(
         hidden2, weight, bias, targets2, divisor, scaling, int(ignore_index),
         float(logit_scale_multiply or 0.0), float(logit_scale_divide or 0.0), float(logit_softcapping or 0.0),
         float(label_smoothing or 0.0), logits_bias, _compute_dtype(hidden, weight),
