@@ -14,16 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`higher_precision_softmax` appends `.to(<first argument>.dtype)`, so the first
-argument has to be one operand.
-
-Falcon's eager path calls `F.softmax(attention_scores + attention_mask, dim=-1,
-dtype=hidden_states.dtype)`. The rewrite produced
-`.to(attention_scores + attention_mask.dtype)`, which is `Tensor + torch.dtype`:
-a TypeError on the first eager forward of the compiled Falcon module. SLANet's
-`F.softmax(torch.stack(xs, dim=1), dim=-1, ...)` is cut at the comma inside
-`stack(...)` and came out as a SyntaxError.
-"""
+"""`higher_precision_softmax` appends `.to(<first argument>.dtype)`: a compound first argument
+(Falcon's `scores + mask`, SLANet's `torch.stack(xs, dim=1)`) must be left as written."""
 
 import ast
 

@@ -1208,8 +1208,6 @@ def higher_precision_softmax(source):
     for item in softmax_objects:
         full_match, matches = item.group(0), item.groups()
         softmax, variable, dim, dtype = matches
-        # Falcon's `softmax(scores + mask, dim=-1, dtype=hidden_states.dtype)` and a call cut at
-        # its first comma (`torch.stack(xs, dim=1)`) have no `.dtype` to read: leave them as written.
         if not _is_single_operand(variable):
             continue
         new = (
