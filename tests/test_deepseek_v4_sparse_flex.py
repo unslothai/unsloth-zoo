@@ -358,3 +358,10 @@ def test_prefill_on_flex_then_decode_through_the_cache(monkeypatch):
     assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == 4  # one prefill call per layer
     assert F4.DEEPSEEK_V4_FLEX_STATS["eager"] == 4 * 5  # every decode step stays eager
     assert _rel(flex, eager) < 0.02
+
+
+def test_older_torch_keeps_eager(monkeypatch):
+    monkeypatch.setattr(torch, "__version__", "2.9.1+cu128")
+    assert not F4._torch_tested()
+    monkeypatch.setattr(torch, "__version__", "2.10.0+cu128")
+    assert F4._torch_tested()

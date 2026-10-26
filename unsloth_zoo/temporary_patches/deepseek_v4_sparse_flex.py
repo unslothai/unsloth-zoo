@@ -82,6 +82,17 @@ def _transformers_tested():
         return False
 
 
+def _torch_tested():
+    """Measured on torch 2.10-2.14; older releases lack `BlockMask.from_kv_blocks(seq_lengths=)`."""
+    try:
+        import inspect
+        from torch.nn.attention.flex_attention import BlockMask
+        release = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+        return release >= (2, 10) and "seq_lengths" in inspect.signature(BlockMask.from_kv_blocks).parameters
+    except Exception:
+        return False
+
+
 def _flex_setting():
     return os.environ.get("UNSLOTH_SPARSE_ATTN_FLEX", "").strip()
 
@@ -237,7 +248,7 @@ def _make_attention_forward(original):
 
 
 def patch_deepseek_v4_sparse_flex():
-    if not _transformers_tested() or importlib.util.find_spec("transformers.models.deepseek_v4") is None:
+    if not (_transformers_tested() and _torch_tested()) or importlib.util.find_spec("transformers.models.deepseek_v4") is None:
         return
     try:
         from transformers.models.deepseek_v4 import modeling_deepseek_v4 as modeling
