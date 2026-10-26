@@ -418,3 +418,95 @@ def test_older_torch_keeps_eager(monkeypatch):
     assert not F4._torch_tested()
     monkeypatch.setattr(torch, "__version__", "2.10.0+cu128")
     assert F4._torch_tested()
+
+
+@needs_flex_gpu
+@pytest.mark.parametrize("rate", [0, 4, 128])
+def test_flex_graphs_stay_bounded_over_lengths(rate):
+    """Sliding (rate 0), CSA (4), HCA (128) masks over varying lengths (incl. non multiples of 128) and
+    batch 1 / 2, fwd + bwd: two graphs (batch 1 vs > 1), none added per new length. Compressed layers can take
+    a third: the first call here has as many query as key tiles, and duck sizing ties the two until they differ."""
+    import torch._dynamo
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+
+    def call(S, B):
+        comp = S // rate if rate else 0
+        q = torch.randn(B, 8, S, 128, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+        kv = torch.randn(B, 1, S + comp, 128, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+        mask = _mask(B, S, 128, comp, max(rate, 1), 16, torch.bfloat16, "cuda")
+        F4.deepseek_v4_flex_attention(_Attn(8, "cuda").to(torch.bfloat16), q, kv, mask, 128 ** -0.5).float().sum().backward()
+
+    for B in (1, 2):
+        for S in (300, 384, 513, 777):
+            call(S, B)
+    graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    for S in (260, 640, 1000, 1025):
+        call(S, 2)
+        call(S, 1)
+    assert graphs <= (2 if rate == 0 else 3), graphs
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
+
+
+@needs_flex_gpu
+def test_packed_sequences_match_upstream(monkeypatch):
+    """Padding-free packing (position_ids reset per document, no attention_mask). The compressor windows and
+    the compressed-entry causality follow absolute slots, so upstream itself mixes documents: flex must
+    match upstream's packed result (the additive mask is read as is). Then each document alone, fwd + bwd."""
+    model = _tiny_model().to(torch.bfloat16)
+    docs = [300, 100, 250]
+    ids = torch.randint(0, 512, (1, sum(docs)), device = "cuda", generator = torch.Generator("cuda").manual_seed(0))
+    pos = torch.cat([torch.arange(n, device = "cuda") for n in docs])[None]
+    starts = [0, 300, 400, 650]
+
+    def run(flex, packed):
+        monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1" if flex else "0")
+        model.zero_grad(set_to_none = True)
+        pieces = [(0, 650)] if packed else list(zip(starts[:-1], starts[1:]))
+        logits = []
+        for a, b in pieces:
+            out = model(input_ids = ids[:, a:b], position_ids = pos[:, a:b] if packed else None, use_cache = False).logits
+            out.float().square().mean().backward()
+            logits.append(out.detach().float())
+        return torch.cat(logits, 1)
+
+    F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
+    flex = run(True, True)
+    assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == 4
+    eager = run(False, True)
+    assert _rel(flex, eager) < 0.02, _rel(flex, eager)
+    flex_docs = run(True, False)
+    assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == 4 + 12
+    eager_docs = run(False, False)
+    assert _rel(flex_docs, eager_docs) < 0.02, _rel(flex_docs, eager_docs)
+
+
+_SHORT_DOC_WORKER = """
+import sys, torch
+sys.path.insert(0, sys.argv[1])
+import unsloth_zoo.temporary_patches
+import test_deepseek_v4_sparse_flex as T
+T.F4._MIN_KEYS = {8: {None: 16}, 9: {None: 16}, 10: {None: 16}}
+model = T._tiny_model().to(torch.bfloat16)
+ids = torch.randint(0, 512, (1, 650), device = "cuda", generator = torch.Generator("cuda").manual_seed(0))
+pos = torch.cat([torch.arange(n, device = "cuda") for n in (300, 100, 250)])[None]
+model(input_ids = ids, position_ids = pos, use_cache = False).logits.float().square().mean().backward()
+for a, b in ((0, 300), (300, 400), (400, 650)):
+    model(input_ids = ids[:, a:b], use_cache = False).logits.float().square().mean().backward()
+assert T.F4.DEEPSEEK_V4_FLEX_STATS["flex"] == 16, T.F4.DEEPSEEK_V4_FLEX_STATS
+print("SHORT_DOC_OK")
+"""
+
+
+@needs_flex_gpu
+def test_short_document_after_longer_ones():
+    """A 100 token document (under one 128 tile) after longer ones, fwd + bwd, fresh process: torch 2.10 sent
+    it to the flex decoding kernel once the compiled flex had gone dynamic, and that failed to lower
+    (S <= BLOCK_M on the 32-wide tiles)."""
+    import os
+    import subprocess
+    import sys
+    env = {k: v for k, v in os.environ.items() if not k.startswith("UNSLOTH_SPARSE_")}
+    here = os.path.dirname(os.path.abspath(__file__))
+    proc = subprocess.run([sys.executable, "-c", _SHORT_DOC_WORKER, here], capture_output = True, text = True, env = env, timeout = 600)
+    assert "SHORT_DOC_OK" in proc.stdout, proc.stdout[-2000:] + proc.stderr[-3000:]

@@ -49,6 +49,8 @@ _KERNEL_OPTIONS = {
     "BLOCK_N2": 32,
     "num_warps": 8,
     "num_stages": 1,
+    # torch 2.10 sends queries under 128 to the decoding kernel, which asserts S * groups <= BLOCK_M (32).
+    "FORCE_USE_FLEX_ATTENTION": True,
 }
 # Stride-0 expansion of the single KV head: grouped-query packing (64:1) took 180-210 ms.
 _CSA = "compressed_sparse_attention"
@@ -103,9 +105,9 @@ def _compiled_flex():
     global _FLEX
     if _FLEX is None:
         from torch.nn.attention.flex_attention import flex_attention
-        # dynamic=None: the first length compiles static, the next one recompiles with dynamic shapes, so
-        # varying training lengths do not recompile per step.
-        _FLEX = torch.compile(flex_attention)
+        # dynamic=True: under dynamic=None each length-dependent input (key length, tile counts, the mask
+        # table) went dynamic on its own recompile, 4 graphs over varying lengths; now batch 1 vs > 1 only.
+        _FLEX = torch.compile(flex_attention, dynamic = True)
     return _FLEX
 
 
