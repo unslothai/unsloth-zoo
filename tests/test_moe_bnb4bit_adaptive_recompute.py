@@ -1,5 +1,6 @@
-"""The bnb4bit grouped-mm dispatcher follows the pin-vs-recompute policy, biased to
-recompute for the 4-bit base; it never pre-dequantizes and then re-holds the stack."""
+"""The bnb4bit grouped-mm dispatcher follows the pin-vs-recompute policy for the 4-bit base:
+recompute outside a gradient-checkpoint replay; inside one, pin the replay's stack when it fits
+and (by default) is above the size floor."""
 import os
 
 import pytest
@@ -63,9 +64,42 @@ def test_default_non_gc_uses_recompute_provider(monkeypatch):
 
 
 def test_gc_recompute_pass_recomputes_for_4bit_by_default(monkeypatch):
+    # These test stacks (4 x 32 x 64) are far below _REPLAY_PIN_MIN_BYTES: a tiny MoE keeps the recompute.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     monkeypatch.delenv("UNSLOTH_MOE_GC_REPLAY_PIN", raising=False)
     monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: True)
+    with _gradient_checkpoint_recompute_marker():
+        assert _run_and_record(monkeypatch) == ["provider"]
+
+
+def test_gc_recompute_pass_pins_for_4bit_by_default_at_the_size_floor(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
+    monkeypatch.delenv("UNSLOTH_MOE_GC_REPLAY_PIN", raising=False)
+    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: True)
+    stack = 4 * 32 * 64 * 2                              # the gate_up stack of _FakeExperts in bf16
+    monkeypatch.setattr(mu, "_REPLAY_PIN_MIN_BYTES", stack, raising=False)
+    with _gradient_checkpoint_recompute_marker():
+        assert _run_and_record(monkeypatch) == ["swap"]       # stack == floor -> pin
+    monkeypatch.setattr(mu, "_REPLAY_PIN_MIN_BYTES", stack + 1, raising=False)
+    with _gradient_checkpoint_recompute_marker():
+        assert _run_and_record(monkeypatch) == ["provider"]   # one byte under -> recompute
+
+
+@pytest.mark.parametrize("value", ["0", "false", "off", "no", " OFF "])
+def test_gc_replay_pin_opt_out_recomputes(monkeypatch, value):
+    monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
+    monkeypatch.setenv("UNSLOTH_MOE_GC_REPLAY_PIN", value)
+    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: True)
+    monkeypatch.setattr(mu, "_REPLAY_PIN_MIN_BYTES", 0, raising=False)
+    with _gradient_checkpoint_recompute_marker():
+        assert _run_and_record(monkeypatch) == ["provider"]
+
+
+def test_gc_replay_pin_default_still_needs_the_stack_to_fit(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
+    monkeypatch.delenv("UNSLOTH_MOE_GC_REPLAY_PIN", raising=False)
+    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: False)
+    monkeypatch.setattr(mu, "_REPLAY_PIN_MIN_BYTES", 0, raising=False)
     with _gradient_checkpoint_recompute_marker():
         assert _run_and_record(monkeypatch) == ["provider"]
 

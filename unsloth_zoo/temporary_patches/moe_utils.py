@@ -1023,8 +1023,9 @@ def _moe_recompute_default(prefer_memory: bool = False) -> bool:
     recompute pass. It is set for bases whose pinned form is a large dense dequant of
     a compressed weight (bnb 4-bit MoE experts): there the "momentary" pin still
     materializes the full bf16 expert stack the 4-bit storage exists to avoid, which
-    can be several GiB per layer on large MoEs, so recompute is the better default
-    when the model is already memory-constrained (4-bit + gradient checkpointing).
+    can be several GiB per layer on large MoEs. (The bnb 4-bit branch of
+    _moe_recompute_enabled does not call this: it recomputes outside a replay and
+    pins inside one only when the stack fits and passes the size floor.)
 
     The GC branch reads a thread-local; under torch.compile of the MoE forward that
     read can be traced away and frozen at the first trace, so the adaptive choice may
@@ -1048,9 +1049,9 @@ def _moe_recompute_default(prefer_memory: bool = False) -> bool:
 def _source_pins_large_dequant(source) -> bool:
     """True iff pinning this base means holding a large dense dequant of a compressed
     weight (a frozen bnb 4-bit MoE expert). For these the pinned path materializes the
-    full bf16 expert stack, so recompute is the memory-preserving default under
-    gradient checkpointing; a plain bf16/fp16/fp32 base pins its own storage (no
-    extra dequant) and keeps the speed-oriented adaptive policy."""
+    full bf16 expert stack, so they recompute except for the momentary replay pin,
+    which `_moe_recompute_enabled` takes only when the stack fits; a plain bf16/fp16/fp32
+    base pins its own storage (no extra dequant) and keeps the speed-oriented adaptive policy."""
     if not (HAS_BNB and Params4bit is not None):
         return False
     try:
@@ -1073,6 +1074,35 @@ def _in_gc_recompute() -> bool:
 _MOMENTARY_PIN_HEADROOM = 2.0   # free memory must cover this many copies of one layer's stack
 
 
+# The default replay pin skips stacks smaller than this: on a tiny MoE the dequant it saves is
+# cheap and the held stack is a large share of peak memory (#1331 measured 1.744 -> 1.961 GiB
+# peak with no step-time gain). UNSLOTH_MOE_GC_REPLAY_PIN=1 ignores the floor.
+_REPLAY_PIN_MIN_BYTES = 512 << 20
+
+
+def _dense_stack_bytes(source, dtype = None):
+    """Bytes of one layer's dequantized stack; None if its shape is unknown."""
+    param = source
+    while hasattr(param, "base_layer"):
+        param = param.base_layer
+    shape = _logical_expert_shape(param)
+    if not shape:
+        return None
+    dtype = dtype or getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
+    return math.prod(int(d) for d in shape) * dtype.itemsize
+
+
+def _gc_replay_pin_mode() -> str:
+    """UNSLOTH_MOE_GC_REPLAY_PIN: 0 / false / off / no -> "off"; 1 / true / on / yes -> "on" (no size
+    floor, the previous opt-in); unset, empty or anything else -> "auto" (on from _REPLAY_PIN_MIN_BYTES)."""
+    value = os.environ.get("UNSLOTH_MOE_GC_REPLAY_PIN", "").strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return "off"
+    if value in ("1", "true", "on", "yes"):
+        return "on"
+    return "auto"
+
+
 def _momentary_pin_fits(source, dtype = None) -> bool:
     """Whether one layer's dequantized stack fits in free + cached-unused memory; unmeasurable means False."""
     try:
@@ -1083,11 +1113,9 @@ def _momentary_pin_fits(source, dtype = None) -> bool:
         backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
         if backend is None or not callable(getattr(backend, "mem_get_info", None)):
             return False
-        shape = _logical_expert_shape(param)
-        if not shape:
+        need = _dense_stack_bytes(param, dtype)
+        if not need:
             return False
-        dtype = dtype or getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
-        need = math.prod(int(d) for d in shape) * dtype.itemsize
         # Cached briefly: mem_get_info per source per replay costs more than the dequant it saves.
         key = (device.type, device.index, need, _MOMENTARY_PIN_HEADROOM)
         now = time.monotonic()
@@ -1110,9 +1138,12 @@ _MOMENTARY_PIN_FITS_TTL_S = 0.5
 def _moe_recompute_enabled(source, dtype = None) -> bool:
     """Whether to recompute the dequantized base stack in backward (True) or pin it
     for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
-    everything else the pinned eager path is used. A bnb 4-bit base recomputes unless
-    UNSLOTH_MOE_GC_REPLAY_PIN=1 and, inside a gradient-checkpoint replay, the stack fits:
-    the pin then saves a dequant for the same layer's backward but raises peak memory."""
+    everything else the pinned eager path is used. A bnb 4-bit base recomputes outside a
+    gradient-checkpoint replay. Inside one it pins the replay's stack for the same layer's
+    backward (one dequant fewer per layer per step, one layer's stack of extra peak memory)
+    when it fits (`_momentary_pin_fits`) and, by default, is at least _REPLAY_PIN_MIN_BYTES;
+    UNSLOTH_MOE_GC_REPLAY_PIN=1 drops that size floor and =0 turns the pin off.
+    UNSLOTH_MOE_RECOMPUTE overrides everything."""
     if not _base_is_recomputable(source):
         return False
     override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
@@ -1121,9 +1152,11 @@ def _moe_recompute_enabled(source, dtype = None) -> bool:
     if override == "0":
         return False
     if _source_pins_large_dequant(source):
+        mode = _gc_replay_pin_mode()
         if (
-            os.environ.get("UNSLOTH_MOE_GC_REPLAY_PIN") == "1"
+            mode != "off"
             and _in_gc_recompute()
+            and (mode == "on" or (_dense_stack_bytes(source, dtype) or 0) >= _REPLAY_PIN_MIN_BYTES)
             and _momentary_pin_fits(source, dtype = dtype)
         ):
             return False
