@@ -1181,15 +1181,51 @@ class _ExpertBiasGather(torch.autograd.Function):
                 return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
             # GEMMs only (no index_add_ atomics) for reproducibility; fp32 partials, since 16-bit chunk sums can overflow to inf.
             if torch.compiler.is_compiling():
+                if _EXPERT_BIAS_GRAD_OP is not None and grad.dtype in (torch.float16, torch.bfloat16) \
+                        and not _mm_fp32_out_ok(grad):
+                    # The fallback would upcast all of grad to fp32 (rows x width): run the eager row chunks
+                    # as an opaque op, which keeps that copy capped without specializing the row count.
+                    return _EXPERT_BIAS_GRAD_OP(expert_ids, grad, ctx.num_experts), None
                 # A loop over symbolic rows would specialize them: one uncapped GEMM instead.
                 return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
-            if not _mm_fp32_out_ok(grad):
-                # The fallback upcasts each grad chunk to fp32: cap that copy too.
-                chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(ctx.num_experts, grad.shape[1]))
-            out = torch.zeros(ctx.num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
-            for start in range(0, rows, chunk):
-                out += _one_hot_mm_fp32(expert_ids[start : start + chunk].unsqueeze(0) == experts, grad[start : start + chunk])
-            return out.to(grad.dtype), None
+            return _expert_bias_grad_chunked(expert_ids, grad, ctx.num_experts), None
+
+
+def _expert_bias_grad_chunked(expert_ids, grad, num_experts):
+    """one_hot(expert_ids) @ grad in row chunks, summed in fp32; the one-hot and any fp32 grad copy stay capped."""
+    experts = torch.arange(num_experts, device = expert_ids.device, dtype = expert_ids.dtype).unsqueeze(1)
+    chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // num_experts)
+    if not _mm_fp32_out_ok(grad):
+        # The fallback upcasts each grad chunk to fp32: cap that copy too.
+        chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(num_experts, grad.shape[1]))
+    out = torch.zeros(num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
+    with torch.autocast(device_type = grad.device.type, enabled = False):
+        for start in range(0, grad.shape[0], chunk):
+            out += _one_hot_mm_fp32(expert_ids[start : start + chunk].unsqueeze(0) == experts, grad[start : start + chunk])
+    return out.to(grad.dtype)
+
+
+def _register_expert_bias_grad_op():
+    """_expert_bias_grad_chunked as an opaque op for compiled backwards: Python chunking over the real row count,
+    so the trace neither specializes rows nor materializes a full fp32 copy of grad. Registered once per process."""
+    if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
+        return None
+    try:
+        return torch.ops.unsloth_zoo.expert_bias_grad.default
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        @torch.library.custom_op("unsloth_zoo::expert_bias_grad", mutates_args = ())
+        def expert_bias_grad(expert_ids: torch.Tensor, grad: torch.Tensor, num_experts: int) -> torch.Tensor:
+            return _expert_bias_grad_chunked(expert_ids, grad, num_experts)
+
+        @expert_bias_grad.register_fake
+        def _(expert_ids, grad, num_experts):
+            return grad.new_empty((num_experts, grad.shape[1]))
+
+        return torch.ops.unsloth_zoo.expert_bias_grad.default
+    except Exception:
+        return None
 
 
 # torch.mm(..., out_dtype = torch.float32): 16-bit inputs, fp32 output (aten::mm.dtype, CUDA only, torch 2.9+).
@@ -1207,6 +1243,9 @@ def _one_hot_mm_fp32(one_hot, grad):
     if _mm_fp32_out_ok(grad):
         return torch.mm(one_hot.to(grad.dtype), grad, out_dtype = torch.float32)
     return one_hot.to(torch.float32) @ grad.float()
+
+
+_EXPERT_BIAS_GRAD_OP = _register_expert_bias_grad_op()
 
 
 def _gather_expert_bias(bias, expert_ids):
