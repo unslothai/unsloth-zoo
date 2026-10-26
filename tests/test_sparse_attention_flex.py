@@ -440,8 +440,8 @@ def test_skip_and_flex_compose(order, family):
 @gpu
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "glm_moe_dsa"])
 def test_flex_graphs_stay_bounded_over_lengths(family):
-    """Varying lengths (incl. non multiples of 128) and batch 1 / 2, fwd + bwd: two graphs (batch 1 vs > 1),
-    none added per new length."""
+    """Varying lengths (incl. non multiples of 128) and batch 1 / 2, fwd + bwd: at most four graphs (static
+    first length, then dynamic, batch 1 vs > 1), none added per new length after that."""
     import torch._dynamo
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()
@@ -472,7 +472,7 @@ def test_flex_graphs_stay_bounded_over_lengths(family):
     for S in (260, 640, 1000, 1025):
         call(S, 2)
         call(S, 1)
-    assert graphs <= 2, graphs
+    assert graphs <= 4, graphs
     assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
 
 

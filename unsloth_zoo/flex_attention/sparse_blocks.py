@@ -126,24 +126,12 @@ def _virtual_kv_heads(query, key, value):
     return key.repeat_interleave(rep, dim = 1), value.repeat_interleave(rep, dim = 1)
 
 
-_DYNAMIC_FLEX = None
-
-
-def _dynamic_flex():
-    """flex_attention compiled with dynamic=True. Under the shared dynamic=None compile, automatic dynamic
-    relaxes one length-dependent input per recompile (key length, padded tiles, tile counts, the mask_mod
-    tables), so a run over varying lengths built 4-5 graphs; here batch 1 vs > 1 are the only two."""
-    global _DYNAMIC_FLEX
-    if _DYNAMIC_FLEX is None:
-        from ..flex_attention import utils
-        from ..temporary_patches.common import _torch_compile
-        _DYNAMIC_FLEX = _torch_compile(utils._flex_attention, dynamic = True)
-    return _DYNAMIC_FLEX
-
-
 def _flex(query, key, value, block_mask, scale, score_mod = None):
     key, value = _virtual_kv_heads(query, key, value)
-    return _dynamic_flex()(
+    # Shared dynamic=None compile: the first length keeps a static kernel, much faster than the dynamic one
+    # for fixed-length (packed / padded) training; varying lengths settle on the dynamic kernel.
+    from ..flex_attention.utils import flex_attention
+    return flex_attention(
         query, key, value, score_mod = score_mod, block_mask = block_mask, scale = scale,
         enable_gqa = query.shape[1] != key.shape[1],
     )
