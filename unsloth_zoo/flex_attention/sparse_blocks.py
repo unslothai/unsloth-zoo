@@ -84,7 +84,9 @@ def _q_chunk(per_row = 1):
 @functools.lru_cache(maxsize = None)
 def _device_supported(index):
     if torch.version.hip is not None:
-        return True  # first failure latches the fallback
+        # ROCm runs the flex paths (checked on gfx1151: parity with the model's path); a failing call
+        # latches the fallback per shape.
+        return True
     return torch.cuda.get_device_capability(index) >= (8, 0)
 
 
