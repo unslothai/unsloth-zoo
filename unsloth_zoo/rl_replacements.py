@@ -121,7 +121,8 @@ pass
 def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False, excluded_ids = None,
                              full_vocab_grad = False):
     index = chunk_index.unsqueeze(-1)
-    if full_vocab_grad:
+    # Without autograd (old / ref logps) the value is all that is used: skip the full-vocabulary pass.
+    if full_vocab_grad and torch.is_grad_enabled() and chunk_logits.requires_grad:
         kept = _truncated_support_logps(chunk_logits.detach(), chunk_index, top_k, top_p, min_p, triton_sampler, excluded_ids)
         is_target = torch.arange(chunk_logits.shape[-1], device = chunk_logits.device) == index
         selected = torch.where(is_target, chunk_logits, 0.0).sum(-1)

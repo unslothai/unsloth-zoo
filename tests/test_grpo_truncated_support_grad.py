@@ -169,3 +169,35 @@ def test_compiled_full_vocab_grad_matches_eager():
     assert len(graphs) == 1
     torch.testing.assert_close(compiled[0], eager[0], rtol = 0, atol = 0)
     torch.testing.assert_close(compiled[1], eager[1], rtol = 1e-6, atol = 1e-7)
+
+# Under no_grad (old / ref logps) the full-vocabulary term carries no gradient: it must not run.
+from torch.utils._python_dispatch import TorchDispatchMode  # noqa: E402
+import unsloth_zoo.rl_replacements as _rr  # noqa: E402
+
+_fn = getattr(_rr.chunked_selective_log_softmax, "__wrapped__", _rr.chunked_selective_log_softmax)
+
+
+class _Count(TorchDispatchMode):
+    def __init__(self): super().__init__(); self.n = 0
+    def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+        self.n += 1
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("support", [dict(support_top_k = 5), dict(support_min_p = 0.1), dict(support_top_p = 0.9)])
+def test_no_grad_full_vocab_flag_runs_no_extra_ops(support):
+    z = torch.randn(2, 6, 97, generator = torch.Generator().manual_seed(0))
+    ids = z.argmax(-1)
+    with torch.no_grad():
+        with _Count() as kept: a = _fn(z, ids, 1.0, 2, **support)
+        with _Count() as auto: b = _fn(z, ids, 1.0, 2, support_full_vocab_grad = True, **support)
+    assert torch.equal(a, b)
+    assert auto.n == kept.n, f"{auto.n - kept.n} extra aten ops under no_grad"
+
+
+def test_grad_still_full_vocabulary():
+    z = torch.randn(2, 6, 97, generator = torch.Generator().manual_seed(1)).requires_grad_(True)
+    ids = z.detach().argmax(-1)
+    _fn(z, ids, 1.0, 2, support_top_k = 1, support_full_vocab_grad = True).sum().backward()
+    want = torch.nn.functional.one_hot(ids, 97) - torch.softmax(z.detach(), -1)
+    torch.testing.assert_close(z.grad, want, rtol = 1e-5, atol = 1e-6)
