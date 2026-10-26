@@ -6067,10 +6067,15 @@ def _patch_torch_dtype_modules(
                         # A float16 / bfloat16 input against float32 parameters is native mixed
                         # precision BatchNorm (fp32 statistics, output in the input dtype): casting
                         # it would save an extra float32 copy of every BatchNorm input for backward.
+                        # Only while the affine parameters are frozen: on CUDA the native kernel
+                        # returns weight / bias gradients at input-dtype precision (bf16: ~4e-3
+                        # relative vs ~1e-7 after the cast), so trainable parameters keep the cast.
                         cast_if += (
                             f" and {param_name}.dtype != self.weight.dtype and not ("
                             f"self.weight.dtype == torch.float32 and "
-                            f"{param_name}.dtype in (torch.float16, torch.bfloat16))"
+                            f"{param_name}.dtype in (torch.float16, torch.bfloat16) and "
+                            f"not self.weight.requires_grad and "
+                            f"(self.bias is None or not self.bias.requires_grad))"
                         )
                     prologue = [
                         body_indent + f"original_dtype = {param_name}.dtype",
