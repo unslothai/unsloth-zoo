@@ -699,6 +699,20 @@ def test_broadcast_masks_match_their_expansion(monkeypatch, shape):
     assert torch.equal(got.sort(dim = -1).values, ref.sort(dim = -1).values)
 
 
+@gpu  # without CUDA flex is unavailable anyway, so the check would pass vacuously
+@pytest.mark.parametrize("value, expected", [("1", False), ("partial", False), ("0", None)])
+def test_compile_disable_turns_sparse_flex_off(monkeypatch, value, expected):
+    """UNSLOTH_COMPILE_DISABLE=1 and =partial both leave flex uncompiled (dense score math): stay on the model path."""
+    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", value)
+    sb._flex_available.cache_clear()
+    try:
+        got = sb._flex_available()
+    finally:
+        sb._flex_available.cache_clear()
+    if expected is not None:
+        assert got is expected
+
+
 @needs_models
 @gpu
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])

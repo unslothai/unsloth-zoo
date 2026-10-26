@@ -95,8 +95,8 @@ def _flex_available():
         import triton  # noqa: F401
     except Exception:
         return False
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
-        return False  # uncompiled flex is the dense math fallback
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial"):
+        return False  # both make temporary_patches' compile a no-op: uncompiled flex is the dense math fallback
     return bool(HAS_FLEX_ATTENTION)
 
 
