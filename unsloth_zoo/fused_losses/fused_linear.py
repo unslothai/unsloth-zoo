@@ -2429,7 +2429,9 @@ def fused_linear_jsd(
     beta 0 is forward KL(teacher || student), 1 reverse KL, else the generalized JSD with mixture
     ``(1 - beta) p_student + beta p_teacher``. Rows are kept where ``mask`` is non zero and ``labels != ignore_index``
     (either may be omitted). The sum is divided by ``num_items_in_batch`` when given (TRL >= 1.x), else by the kept
-    row count (``reduction = "batchmean"``); a zero divisor counts as 1. The transform is ``* logit_scale`` then
+    row count (``reduction = "batchmean"``); a zero divisor counts as 1. Without labels, mask or count TRL differs by
+    release on 3D logits (0.x divides by batch * sequence like here, 1.x by batch size): pass ``num_items_in_batch``
+    to pin one. The transform is ``* logit_scale`` then
     softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
     taken in forward; teacher inputs are never differentiated and may have their own hidden size and device.
     ``scaling`` (fp16 GradScaler) multiplies stored gradients; backward divides it out."""
@@ -2437,7 +2439,9 @@ def fused_linear_jsd(
     temperature = float(temperature)
     if not 0.0 <= beta <= 1.0:
         raise ValueError(f"Unsloth: GKD beta must be in [0, 1], got {beta}.")
-    if not (temperature > 0.0 and math.isfinite(temperature)):
+    # Comparisons, not math.isfinite: under torch.compile(dynamic = True) temperature is a SymFloat and
+    # math.isfinite on it breaks the graph. NaN fails both comparisons, inf fails the upper one.
+    if not (0.0 < temperature < math.inf):
         raise ValueError(f"Unsloth: GKD temperature must be finite and > 0, got {temperature}.")
     if teacher_weight.shape[0] != student_weight.shape[0]:
         raise ValueError(f"Unsloth: GKD student vocabulary {student_weight.shape[0]} != teacher vocabulary "

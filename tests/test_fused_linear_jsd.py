@@ -217,6 +217,34 @@ def test_compiles_without_graph_breaks():
     torch.testing.assert_close(h.grad.double(), 2 * gh, rtol = 2e-4, atol = 1e-6)
 
 
+@pytest.mark.parametrize("temperature", [None, 1.0, 0.9])
+def test_compiles_dynamic_fullgraph(temperature):
+    """dynamic = True turns temperature into a SymFloat; its validation must not break the graph (torch >= 2.10)."""
+    kw = {} if temperature is None else {"temperature": temperature}
+
+    def f(h, w, t, wt, labels):
+        return fl.fused_linear_jsd(h, w, t, wt, labels = labels, beta = 0.5, **kw)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(f, fullgraph = True, dynamic = True, backend = "aot_eager")
+    hs, ws, _, ht, wt, _, labels = _case(6)
+    for n in (5, 9, 13):
+        h = hs[:, :n].detach().clone().requires_grad_(True)
+        out = compiled(h, ws, ht[:, :n], wt, labels[:, :n])
+        out.backward()
+        ref, gh, _, _ = _oracle(h, ws, None, ht[:, :n], wt, None, labels[:, :n], 0.5, temperature or 1.0)
+        torch.testing.assert_close(out.double(), ref, rtol = 2e-5, atol = 1e-6)
+        torch.testing.assert_close(h.grad.double(), gh, rtol = 2e-4, atol = 1e-6)
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_rejects_bad_temperature(temperature):
+    hs, ws, _, ht, wt, _, labels = _case(7)
+    with pytest.raises(ValueError, match = "temperature must be finite"):
+        fl.fused_linear_jsd(hs, ws, ht, wt, labels = labels, temperature = temperature)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA")
 @pytest.mark.parametrize("tf", [(1.0, 0.0, 1.0, 0.0), (1.3, 4.0, 0.8, 3.0)])
 @pytest.mark.parametrize("beta", [0.0, 0.3, 1.0])
