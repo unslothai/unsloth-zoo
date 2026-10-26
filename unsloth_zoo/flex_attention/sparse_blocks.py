@@ -165,6 +165,13 @@ def _pad_to(x, dim, size, value):
     return F.pad(x, pad, value = value)
 
 
+def _expand_queries(mask, q_len):
+    """A caller's [B, 1, 1, T] mask broadcasts over queries upstream; padding or chunking it would not."""
+    if mask is not None and mask.shape[-2] == 1 and q_len > 1:
+        return mask.expand(*mask.shape[:-2], q_len, mask.shape[-1])
+    return mask
+
+
 def _visible(attention_mask):
     """Additive float mask -> keep: entries at or below half the dtype minimum (and -inf) are masked."""
     return attention_mask > torch.finfo(attention_mask.dtype).min / 2
@@ -265,7 +272,7 @@ def minimax_m3_flex_attention(query, key, value, block_indices, attention_mask, 
         base_all = ((tile_end[None, None, :] <= q_min[..., None]) & (tile_end < kv_len)[None, None, :]).unsqueeze(1)
         base = None
     else:
-        base = _base_keep(attention_mask, q_pad, kv_pad)
+        base = _base_keep(_expand_queries(attention_mask, q_len), q_pad, kv_pad)
         base_any, base_all = _tiles_any_all(base, n_q, n_kv)
         pos = None
 
@@ -322,6 +329,7 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
     k_t = k.transpose(-1, -2).float().unsqueeze(1)  # [B, 1, D, T]
     weights = indexer.weights_proj(hidden_states.to(indexer.weights_proj.weight.dtype)).float() * (indexer.n_heads ** -0.5)
     topk = min(indexer.index_topk, k.shape[1])
+    attention_mask = _expand_queries(attention_mask, seq_len)
     out = []
     for start, end in _q_ranges(seq_len, batch_size * indexer.n_heads * k.shape[1]):
         scores = torch.matmul(q[:, start:end].float(), k_t) * indexer.softmax_scale
@@ -357,12 +365,13 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling,
         q_pad, kv_pad = n_q * _TILE, n_kv * _TILE
         keep = torch.zeros(batch, q_pad, kv_pad, dtype = torch.bool, device = query.device)
         keep[:, :q_len].scatter_(-1, topk_indices.long(), True)
-        base = _base_keep(attention_mask, q_pad, kv_pad, additive = True)[:, 0]
+        mask = _expand_queries(attention_mask, q_len)
+        base = _base_keep(mask, q_pad, kv_pad, additive = True)[:, 0]
         keep &= base
         any_tiles, all_tiles = _tiles_any_all(keep, n_q, n_kv)
         bias = None
-        if attention_mask.dtype != torch.bool:
-            values = attention_mask[:, 0]
+        if mask.dtype != torch.bool:
+            values = mask[:, 0]
             if bool((_visible(values) & (values != 0)).any()):
                 # Finite biases (not just 0 / masked): added through score_mod like upstream's additive mask.
                 bias = _pad_to(_pad_to(torch.where(_visible(values), values, 0), 1, q_pad, 0), 2, kv_pad, 0)

@@ -653,6 +653,44 @@ def test_dsa_flex_keeps_finite_mask_biases_in_float32():
 
 @needs_models
 @gpu
+def test_query_broadcast_masks_match_their_expansion(monkeypatch):
+    """A caller's [B, 1, 1, T] mask broadcasts over queries upstream. Padding its query dim hid every key
+    from later queries, and the chunked DSA indexer failed slicing it on the second chunk."""
+    torch.manual_seed(0)
+    dev, dt = "cuda", torch.bfloat16
+    B, H, S, D = 2, 4, 512, 64
+    pad = torch.ones(B, 1, 1, S, dtype = torch.bool, device = dev)
+    pad[1, ..., S - 100:] = False  # right padding on row 1
+    for base in (pad, torch.zeros(B, 1, 1, S, device = dev, dtype = dt).masked_fill(~pad, torch.finfo(dt).min)):
+        full = base.expand(B, 1, S, S).contiguous()
+        q, k, v = (torch.randn(B, H, S, D, device = dev, dtype = dt) for _ in range(3))
+        topk_idx = torch.randn(B, S, S, device = dev).topk(128, dim = -1).indices.int()
+        got = sb.dsa_flex_attention(q, k, v, topk_idx, base, D ** -0.5)
+        ref = sb.dsa_flex_attention(q, k, v, topk_idx.clone(), full, D ** -0.5)
+        assert _rel(got, ref) < 1e-3, _rel(got, ref)
+        blocks = torch.arange(S // 128, device = dev).expand(B, H, S, S // 128).clone()
+        pos = torch.arange(S, device = dev)[None].expand(B, -1)
+        got = sb.minimax_m3_flex_attention(q, k, v, blocks, base, pos, D ** -0.5, 128)
+        ref = sb.minimax_m3_flex_attention(q, k, v, blocks, full, pos, D ** -0.5, 128)
+        assert _rel(got, ref) < 1e-3, _rel(got, ref)
+
+    _patched()
+    config = _dsa_config("deepseek_v32")
+    m, indexer = _indexer_module("deepseek_v32", config)
+    seq = 300
+    (cos, sin), pos = _rope(config, "deepseek_v32", seq)
+    h = torch.randn(2, seq, config.hidden_size)
+    q_resid = torch.randn(2, seq, config.q_lora_rank)
+    mask = torch.ones(2, 1, seq, dtype = torch.bool)
+    mask[1, :, seq - 60:] = False
+    monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_Q_CHUNK", "64")
+    got = indexer(h, q_resid, (cos, sin), mask, pos)
+    ref = indexer(h, q_resid, (cos, sin), mask.expand(2, seq, seq).contiguous(), pos)
+    assert torch.equal(got.sort(dim = -1).values, ref.sort(dim = -1).values)
+
+
+@needs_models
+@gpu
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
 def test_config_output_attentions_keeps_the_model_path(family):
     """transformers records attention weights when config.output_attentions is set, without the kwarg."""
