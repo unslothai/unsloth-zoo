@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The routing replay layer input op registers on every supported torch (>= 2.4) and is owned by one
-module copy: a second copy loaded under another name gets its own op, never the first copy's."""
+"""Layer input op registers on torch >= 2.4; each module copy owns its own op."""
 
 import importlib.util
 import sys

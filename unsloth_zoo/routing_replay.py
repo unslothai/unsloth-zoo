@@ -672,9 +672,7 @@ def _router_hook(layer_index, compact = None):
         signature = None
         if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
             signature = _input_signature(args, ids2.shape[0])
-        # This call's layer input addresses, read once. Cleared here so a compiled layer whose pre
-        # hook op writes them while this read was traced into the same graph sees None, never an
-        # earlier call's addresses (the traced clear lands after the op's write).
+        # Read once and clear: a compiled layer's traced read then sees None, never a stale call's.
         layer_input = _STATE.layer_inputs.get(layer_index)
         _STATE.layer_inputs[layer_index] = None
         recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature, layer_input)
@@ -779,17 +777,13 @@ _LAYER_INPUTS_OP = None
 
 
 def _layer_inputs_op():
-    # data_ptr() cannot be traced (Dynamo sees fake tensors), and a graph break there fails
-    # fullgraph compiles. An opaque custom op instead runs on the real tensors of every compiled
-    # call. Registered eagerly from install_routing_replay: registration cannot be traced.
+    # data_ptr() is untraceable and a graph break fails fullgraph, so use an opaque op; register eagerly.
     global _LAYER_INPUTS_OP
     if _LAYER_INPUTS_OP is not None:
         return _LAYER_INPUTS_OP
     for i in range(64):
-        # Another copy of this module (a reload) owns the plain name and its own _STATE.
         name = "routing_replay_layer_inputs" + (f"_{i}" if i else "")
-        # custom_op silently re-registers an existing name (the other copy's hooks would then
-        # write into this copy's state, and torch 2.10 segfaults calling it), so probe first.
+        # A reloaded module copy may own the name; custom_op silently re-registers (torch 2.10 segfaults).
         if hasattr(torch.ops.unsloth_zoo, name):
             continue
         try:
@@ -799,7 +793,7 @@ def _layer_inputs_op():
         op.register_fake(_layer_inputs_fake)
         _LAYER_INPUTS_OP = getattr(torch.ops.unsloth_zoo, name).default
         if hasattr(torch.fx.node, "has_side_effect"):
-            # No outputs: without this, graph dead code elimination may drop the call.
+            # No outputs: else DCE may drop it.
             torch.fx.node.has_side_effect(_LAYER_INPUTS_OP)
         return _LAYER_INPUTS_OP
     raise RuntimeError("Unsloth: could not register the routing replay layer input op.")

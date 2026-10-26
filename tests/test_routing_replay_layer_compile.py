@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MoE routing replay: a compiled region holding a hooked decoder layer (default, fullgraph,
-dynamic) traces, still records the layer's real input addresses and still replays. CPU only."""
+"""A compiled hooked decoder layer traces, records real input addresses and replays. CPU only."""
 
 import pytest
 import torch
@@ -50,8 +49,7 @@ class _Layer(torch.nn.Module):
 
     def forward(self, x):
         if self.graph_break:
-            # Unsloth's MoE blocks run eagerly (compiler disabled): the router hook is not in the
-            # graph that holds the layer pre hook.
+            # Unsloth MoE blocks run eagerly: router hook outside the pre hook's graph.
             torch._dynamo.graph_break()
         _, weights, ids = self.router(x)
         return x.sin() * weights.sum(-1, keepdim = True), ids
@@ -87,7 +85,6 @@ def test_compiled_layer_with_pre_hook_traces_and_never_sees_old_inputs(replay, m
         seen.append(None if layer_input is None else tuple(sorted(layer_input)))
         return None
 
-    # A checkpoint recompute: the router hook hands the layer input addresses to the matcher.
     monkeypatch.setattr(replay, "_recomputed_routes", recomputed_routes)
     monkeypatch.setattr(replay, "_input_signature", lambda args, tokens: None)
     model = _Model(graph_break)
@@ -107,10 +104,9 @@ def test_compiled_layer_with_pre_hook_traces_and_never_sees_old_inputs(replay, m
     assert len(seen) == len(xs)
     for x, addresses in zip(xs, seen):
         if graph_break:
-            # The pre hook ran before the router's graph: the matcher gets this call's input.
             assert addresses == (x.data_ptr(),)
         else:
-            # One graph: the pre hook's op writes at run time, after the router hook was traced.
+            # One graph: the op writes after the router hook's traced read.
             assert addresses in (None, (x.data_ptr(),))
 
 
@@ -124,7 +120,7 @@ def test_compiled_layer_still_replays_forced_experts(replay, fullgraph):
     forced = (natural + 3) % 8
     replay._STATE.in_forward = True
     replay._STATE.current = forced.unsqueeze(1)  # [tokens, layers, top_k]
-    _, ids = layer(x)  # the eager call picks and caches the weight formula
+    _, ids = layer(x)  # eager call caches the weight formula
     assert torch.equal(ids.sort(-1).values, forced.sort(-1).values)
     fn = torch.compile(lambda x: layer(x), backend = "eager", fullgraph = fullgraph)
     _, ids = fn(x)

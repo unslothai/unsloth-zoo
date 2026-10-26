@@ -365,8 +365,7 @@ def runner_env(monkeypatch):
     monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", False)
     versions = {"vllm": "0.32.0"}
     monkeypatch.setattr(importlib.metadata, "version", lambda name: versions[name])
-    # Hermetic: an installed vLLM's own constants and env cache would override the mocked version.
-    # A test needing vllm.config.vllm plants its own.
+    # Hermetic: an installed vLLM would override the mocked version.
     monkeypatch.setitem(sys.modules, "vllm.config.vllm", None)
     monkeypatch.setattr(vu, "_vllm_disable_envs_cache", lambda: None)
     return vu, versions
