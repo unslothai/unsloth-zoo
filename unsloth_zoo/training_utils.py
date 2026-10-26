@@ -324,6 +324,34 @@ def restore_use_cache(model):
             cfg.use_cache = value
 
 
+_FP8_PARAM_DTYPES = tuple(
+    getattr(torch, n)
+    for n in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu")
+    if hasattr(torch, n)
+)
+
+
+def _refuse_scaled_fp8_cast(model, name, param):
+    """Casting a block / per-tensor scaled FP8 weight to the training dtype drops its scale, so the
+    trained weight is wrong by the scale. Refuse instead: the loader must dequantize it first."""
+    if param.dtype not in _FP8_PARAM_DTYPES:
+        return
+    prefix, _, leaf = name.rpartition(".")
+    try:
+        module = model.get_submodule(prefix) if prefix else model
+    except Exception:
+        return
+    scale_names = (leaf + "_scale_inv", leaf + "_scale")
+    if not any(getattr(module, n, None) is not None for n in scale_names):
+        return
+    raise RuntimeError(
+        f"Unsloth: `{name}` is a scaled {param.dtype} weight. Training it needs it dequantized first: "
+        "casting it to the training dtype would drop its scale. Load the checkpoint dequantized "
+        "(for full finetuning, a transformers FineGrainedFP8Config with dequantize = True), "
+        "or use the BF16 version of the model."
+    )
+
+
 @torch.no_grad
 def prepare_model_for_training(
     model                      : Any,
@@ -452,6 +480,7 @@ def prepare_model_for_training(
                 and id(param) not in _externally_managed_param_ids):
             dtype = torch.float32 if upcast else mixed_precision_dtype
             if param.dtype != dtype:
+                _refuse_scaled_fp8_cast(model, name, param)
                 param.data = param.data.to(dtype)
         pass
 
