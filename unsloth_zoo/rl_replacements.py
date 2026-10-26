@@ -2860,6 +2860,8 @@ def grpo_accumulated_loss(
         _fp32_precast = _fp32_lm_head and (
             os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1"
             or _scorer_eager or _zero3_training()
+            # Without autocast the compiled scorer keeps its fp32 head as given: share one pre-cast copy.
+            or trainer._autocast_dtype is None or not getattr(trainer, "_autocast_enabled", True)
             or (lm_head.dtype == torch.bfloat16 and (lm_head.device.type, lm_head.device.index) in _no_native_bf16())
         )
         _fp32_cache = {}
