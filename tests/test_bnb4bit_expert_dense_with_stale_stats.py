@@ -87,6 +87,17 @@ def test_a_packed_expert_still_deserializes(monkeypatch):
     assert recorded[0][1] == sorted(f"gate_up_proj.{k}" for k in STALE_STATS)
 
 
+@pytest.mark.parametrize("storage", [torch.bfloat16, torch.float16, torch.float32])
+def test_a_packed_expert_in_float_quant_storage_still_deserializes(monkeypatch, storage):
+    # bnb_4bit_quant_storage may be a float dtype: the payload is floating point
+    # but flattened to [n, 1], so it is packed, not dense.
+    recorded = []
+    op = _deserializer(monkeypatch, recorded)
+    packed = torch.zeros(512, 1, dtype = storage)
+    op.convert(_inputs(packed), model = torch.nn.Module(), full_layer_name = LAYER)
+    assert recorded and recorded[0][0] == storage, "a float-storage packed expert was kept as dense"
+
+
 def test_a_lone_weight_passes_through(monkeypatch):
     recorded = []
     op = _deserializer(monkeypatch, recorded)

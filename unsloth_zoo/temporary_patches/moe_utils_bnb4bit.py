@@ -991,9 +991,10 @@ def _bnb4bit_expert_weight_conversions(hf_quantizer):
                 if isinstance(value, list):
                     input_dict[key] = value[0]
             weight = input_dict.pop(self.param_name)
-            # A floating-point expert is dense: stale stats beside it would make
-            # from_prequantized read its bf16 bytes as packed nf4 (garbage experts).
-            if weight.is_floating_point():
+            # A floating-point expert in its logical 3-D shape is dense: stale stats
+            # beside it would make from_prequantized read its bytes as packed nf4.
+            # Packed payloads are flattened to [n, 1], also under a float quant_storage.
+            if weight.is_floating_point() and weight.dim() == 3:
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.info(
                         f"Unsloth: {full_layer_name} is stored dense ({weight.dtype}); "
