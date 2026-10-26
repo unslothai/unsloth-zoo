@@ -45,6 +45,7 @@ import functools
 import inspect
 import os
 import re
+import typing
 import warnings
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -787,6 +788,10 @@ def _layer_inputs_op():
     for i in range(64):
         # Another copy of this module (a reload) owns the plain name and its own _STATE.
         name = "routing_replay_layer_inputs" + (f"_{i}" if i else "")
+        # custom_op silently re-registers an existing name (the other copy's hooks would then
+        # write into this copy's state, and torch 2.10 segfaults calling it), so probe first.
+        if hasattr(torch.ops.unsloth_zoo, name):
+            continue
         try:
             op = torch.library.custom_op(f"unsloth_zoo::{name}", mutates_args = ())(_layer_inputs_impl)
         except RuntimeError:
@@ -800,7 +805,8 @@ def _layer_inputs_op():
     raise RuntimeError("Unsloth: could not register the routing replay layer input op.")
 
 
-def _layer_inputs_impl(layer_index: int, tensors: list[torch.Tensor]) -> None:
+# typing.List, not list[...]: torch < 2.7 infer_schema rejects the builtin generic.
+def _layer_inputs_impl(layer_index: int, tensors: typing.List[torch.Tensor]) -> None:
     _record_layer_inputs(layer_index, tensors)
 
 
