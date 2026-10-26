@@ -133,10 +133,10 @@ def _dynamic_flex():
     return _DYNAMIC_FLEX
 
 
-def _flex(query, key, value, block_mask, scale):
+def _flex(query, key, value, block_mask, scale, score_mod = None):
     key, value = _virtual_kv_heads(query, key, value)
     return _dynamic_flex()(
-        query, key, value, block_mask = block_mask, scale = scale,
+        query, key, value, score_mod = score_mod, block_mask = block_mask, scale = scale,
         enable_gqa = query.shape[1] != key.shape[1],
     )
 
@@ -169,8 +169,17 @@ def _pad_to(x, dim, size, value):
     return F.pad(x, pad, value = value)
 
 
-def _base_keep(attention_mask, q_pad, kv_pad):
-    keep = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
+def _visible(attention_mask):
+    """Additive float mask -> keep: entries at or below half the dtype minimum (and -inf) are masked."""
+    return attention_mask > torch.finfo(attention_mask.dtype).min / 2
+
+
+def _base_keep(attention_mask, q_pad, kv_pad, additive = False):
+    # MiniMax's build_block_mask keeps only zeros of a float mask; DSA adds the mask to the scores.
+    if attention_mask.dtype == torch.bool:
+        keep = attention_mask
+    else:
+        keep = _visible(attention_mask) if additive else attention_mask == 0
     if keep.shape[1] != 1:
         keep = keep[:, :1]  # head-shared masks only (callers check)
     keep = _pad_to(_pad_to(keep, 2, q_pad, False), 3, kv_pad, False)
@@ -337,12 +346,14 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
 def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling, model_type = "dsa"):
     """Flex attention over top-k AND base mask; returns [B, S, H, D_v].
 
-    The BlockMask is cached on `topk_indices` so GLM's shared layers reuse it within the step."""
+    The BlockMask is cached on `topk_indices` so GLM's shared layers reuse it within the step. A float mask
+    is additive like upstream's: entries at or below half the dtype minimum (and -inf) are masked, any other
+    nonzero value is added to the score."""
     _eager_only("dsa_flex_attention")
     cached = getattr(topk_indices, "_unsloth_dsa_flex", None)
     if cached is not None and cached[0] is attention_mask and cached[1] == key.shape[2]:
         _count("flex_reused", model_type)
-        block_mask = cached[2]
+        block_mask, bias = cached[2], cached[3]
     else:
         batch, _, q_len, _ = query.shape
         kv_len = key.shape[2]
@@ -350,19 +361,30 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling,
         q_pad, kv_pad = n_q * _TILE, n_kv * _TILE
         keep = torch.zeros(batch, q_pad, kv_pad, dtype = torch.bool, device = query.device)
         keep[:, :q_len].scatter_(-1, topk_indices.long(), True)
-        base = _base_keep(attention_mask, q_pad, kv_pad)[:, 0]
+        base = _base_keep(attention_mask, q_pad, kv_pad, additive = True)[:, 0]
         keep &= base
         any_tiles, all_tiles = _tiles_any_all(keep, n_q, n_kv)
+        bias = None
+        if attention_mask.dtype != torch.bool:
+            values = attention_mask[:, 0]
+            if bool((_visible(values) & (values != 0)).any()):
+                # Finite biases (not just 0 / masked): added through score_mod like upstream's additive mask.
+                bias = _pad_to(_pad_to(torch.where(_visible(values), values, 0), 1, q_pad, 0), 2, kv_pad, 0)
+                bias = bias.expand(batch, -1, -1)
 
         def mask_mod(b, h, q_idx, kv_idx):
             return keep[b, q_idx, kv_idx]
 
         block_mask = tile_block_mask(any_tiles.unsqueeze(1), all_tiles.unsqueeze(1), mask_mod, q_len, kv_len)
         try:
-            topk_indices._unsloth_dsa_flex = (attention_mask, kv_len, block_mask)
+            topk_indices._unsloth_dsa_flex = (attention_mask, kv_len, block_mask, bias)
         except Exception:
             pass
-    out = _flex(query, key, value, block_mask, scaling)
+    score_mod = None
+    if bias is not None:
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return score + bias[b, q_idx, kv_idx]
+    out = _flex(query, key, value, block_mask, scaling, score_mod)
     _count("flex", model_type)
     return out.transpose(1, 2).contiguous()
 

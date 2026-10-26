@@ -627,3 +627,24 @@ def test_chunked_indexer_compiles_once_over_lengths(monkeypatch, family):
         got = compiled(x, qr, cos, sin, mask, pos)
         assert torch.equal(got, fn(x, qr, cos, sin, mask, pos))
     assert len(graphs) == 1, len(graphs)
+
+
+@needs_models
+@gpu
+def test_dsa_flex_keeps_finite_mask_biases_in_float32():
+    """A float DSA mask is additive upstream: finite entries (here -0.5 / +0.25 on visible keys) shift the
+    scores. They were read as hard exclusions (output ~59% off)."""
+    torch.manual_seed(0)
+    B, H, S, D, topk = 2, 4, 384, 64, 96
+    keep = torch.ones(S, S, dtype = torch.bool, device = "cuda").tril()[None, None].expand(B, 1, S, S)
+    bias = torch.where(torch.rand(B, 1, S, S, device = "cuda") < 0.5, -0.5, 0.25)
+    mask = torch.where(keep, bias, torch.finfo(torch.float32).min)
+    topk_idx = torch.randn(B, S, S, device = "cuda").masked_fill(~keep[:, 0], float("-inf")).topk(topk, -1).indices.int()
+    index_mask = torch.ones(B, S, S, dtype = torch.bool, device = "cuda").scatter(-1, topk_idx.long(), False).unsqueeze(1)
+    dense = mask.masked_fill(index_mask, torch.finfo(torch.float32).min)
+    q, k, v = (torch.randn(B, H, S, D, device = "cuda") for _ in range(3))
+    ref, ref_g = _grads(lambda a, b, c: _dense(a, b, c, dense, 0.125), q, k, v)
+    got, got_g = _grads(lambda a, b, c: sb.dsa_flex_attention(a, b, c, topk_idx, mask, 0.125), q, k, v)
+    assert _rel(got, ref) < 1e-4, _rel(got, ref)
+    for name, a, b in zip("qkv", got_g, ref_g):
+        assert _rel(a, b) < 1e-3, (name, _rel(a, b))
