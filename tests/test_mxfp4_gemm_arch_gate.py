@@ -14,6 +14,13 @@ import unsloth_zoo.mxfp4_stacked_experts as mse
 from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam
 
 
+@pytest.fixture(autouse = True)
+def _fresh_trace_answers(monkeypatch):
+    # A traced test on a real GPU caches a passing in-trace probe that a later test's eager call would reuse.
+    if hasattr(mg, "_TRACE_AVAILABLE"):
+        monkeypatch.setattr(mg, "_TRACE_AVAILABLE", {})
+
+
 @pytest.fixture
 def gpu(monkeypatch):
     """A verified CUDA device 0 of a chosen capability, no GPU needed."""
