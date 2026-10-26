@@ -273,6 +273,9 @@ class GenerationRequest:
     token_count, cache)`` is called with the live cache. A checkpoint fires only where a
     prefill chunk ends; no chunk is reshaped to reach one. Rows decoding together merge
     by cache class, so every row of one batch needs a state building the same layout.
+
+    ``drafts=False`` keeps a row of a speculative batch off the draft: its tokens are the
+    target's own, as a reply decoded without speculation draws them. Other batches ignore it.
     """
 
     prompt: str | None = None
@@ -284,6 +287,7 @@ class GenerationRequest:
     logits_processors: Sequence[Callable[[Any, Any], Any]] | None = None
     prompt_cache_state: Any | None = None
     vision_inputs: Mapping[str, Any] | None = None
+    drafts: bool = True
 
     def __post_init__(self):
         state = self.prompt_cache_state
@@ -3998,7 +4002,7 @@ class _SpeculativeBatchSession:
         pending = EngineRow(
             cache = None, pending = 0, prompt = input_ids[0].tolist(), sampling = request.sampling or adapter.defaults.sampling,
             max_tokens = int(request.max_tokens or adapter.defaults.max_tokens), stop_tokens = self.stop_tokens,
-            processors = _row_processors(request), uid = row,
+            processors = _row_processors(request), uid = row, drafts = request.drafts,
         )
         prefix = self._resume(request.prompt_cache_state, pending.prompt, input_ids, mask, extra)
         state = _PendingResult(
