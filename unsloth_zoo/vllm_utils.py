@@ -105,10 +105,103 @@ def _return_nothing(*args, **kwargs): return None
 def _return_self(self, *args, **kwargs): return self
 def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
 
-def get_target_device(index = 0):
+def _current_device_index():
+    """The caller's current device: a torchrun rank has set_device(LOCAL_RANK) by now, a single process is on 0."""
+    try:
+        module = torch.cuda if DEVICE_TYPE in ("cuda", "hip") else getattr(torch, DEVICE_TYPE)
+        if module.is_available():
+            return module.current_device()
+    except Exception:
+        pass
+    return 0
+pass
+
+def get_target_device(index = None):
+    # None = the current device, not 0: under torchrun, rank 1 has set_device(1), and a
+    # hardcoded 0 put its vLLM engine and the converted HF weights on rank 0's GPU.
+    if index is None:
+        index = _current_device_index()
     if DEVICE_TYPE == "hip":
         return torch.device("cuda", index)
     return torch.device(DEVICE_TYPE, index)
+
+_TORCHRUN_ENV_KEYS = ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+
+def _torchrun_launch_info(environ = None):
+    """(rank, local_rank, world_size) when a torchrun-style launcher started this process, else None."""
+    environ = os.environ if environ is None else environ
+    if not all(environ.get(key) for key in _TORCHRUN_ENV_KEYS):
+        return None
+    try:
+        return int(environ["RANK"]), int(environ["LOCAL_RANK"]), int(environ["WORLD_SIZE"])
+    except ValueError:
+        return None
+pass
+
+def _setup_vllm_external_launcher(engine_args, launch_info):
+    """One vLLM engine per torchrun rank, inside the job's own process group.
+
+    vLLM's default single-process executor starts a private world_size = 1 group on a
+    fresh `tcp://ip:port`. torchrun exports TORCHELASTIC_USE_AGENT_STORE=True, which makes
+    torch's tcp:// rendezvous a TCPStore *client* of an agent store that only exists on
+    MASTER_PORT, so engine init blocks until the store timeout (torch
+    distributed/rendezvous.py `_create_c10d_store`). Flipping that variable is not enough:
+    vLLM's private group then becomes the default WORLD of size 1 and the Trainer's DDP
+    silently runs with one process per group. So create the real torchrun group first
+    (env://, what accelerate would create) and let vLLM join it with the
+    `external_launcher` executor: each rank is an independent data-parallel engine on
+    cuda:LOCAL_RANK (vLLM parallel_state.initialize_model_parallel: "ExternalDP ...
+    every dp rank can generate independently"), as TRL's colocate mode does.
+
+    Returns the device index vLLM must see as LOCAL_RANK, or None if unchanged.
+    """
+    import torch.distributed as dist
+    from datetime import timedelta
+    rank, local_rank, world_size = launch_info
+    local_index = None
+    if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
+        count = torch.cuda.device_count()
+        # A per-rank CUDA_VISIBLE_DEVICES leaves one card visible while LOCAL_RANK still counts ranks.
+        local_index = local_rank if local_rank < count else local_rank % max(count, 1)
+        torch.cuda.set_device(local_index)
+    if not dist.is_initialized():
+        # Same defaults accelerate uses for a torchrun job (HF ddp_timeout = 1800 s); the
+        # Trainer reuses an initialized group. backend None = nccl for cuda + gloo for cpu.
+        dist.init_process_group(backend = None, init_method = "env://", timeout = timedelta(seconds = 1800))
+    elif dist.get_world_size() != world_size:
+        logger.warning(
+            f"Unsloth: torch.distributed world size {dist.get_world_size()} != WORLD_SIZE {world_size}; "
+            "vLLM joins the initialized group."
+        )
+    engine_args["distributed_executor_backend"] = "external_launcher"
+    # vLLM requires a seed with external_launcher. Offset it per rank as TRL colocate does
+    # (seed = process_index // tp): GRPO puts copies of one prompt on several ranks, and
+    # equal engine seeds would sample identical completions for them.
+    engine_args["seed"] = int(engine_args.get("seed") or 0) + dist.get_rank()
+    if local_index is not None and local_index == local_rank:
+        local_index = None
+    print(
+        f"Unsloth: torchrun rank {dist.get_rank()}/{dist.get_world_size()}: vLLM engine on "
+        f"{get_target_device()} with the external_launcher executor."
+    )
+    return local_index
+pass
+
+@contextlib.contextmanager
+def _scoped_environ(updates):
+    """Set os.environ keys for the block and restore the previous values (or absence) after."""
+    saved = {key: os.environ.get(key) for key in updates}
+    try:
+        for key, value in updates.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+pass
 
 def _device_empty_cache():
     if DEVICE_TYPE == "npu":
@@ -5081,6 +5174,13 @@ def load_vllm(
             elif _flash_attn_is_selectable():
                 engine_args["attention_backend"] = "FLASH_ATTN"
 
+        # torchrun / DDP: one engine per rank in the job's process group (see the helper).
+        # The async engine always runs its core in a subprocess, which external_launcher refuses.
+        torchrun_info = None if (return_args or use_async) else _torchrun_launch_info()
+        vllm_local_rank = None
+        if torchrun_info is not None:
+            vllm_local_rank = _setup_vllm_external_launcher(engine_args, torchrun_info)
+
         # Older vLLM has no such arg; the filter below drops unknown keys, so this is a
         # no-op there rather than a TypeError.
         good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
@@ -5186,10 +5286,15 @@ def load_vllm(
             try:
                 if use_async:
                     llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_args))
-                elif use_engine:
-                    llm = LLMEngine.from_engine_args(EngineArgs(**engine_args))
                 else:
-                    llm = LLM(**engine_args)
+                    # external_launcher reads LOCAL_RANK as the device index: remap it only
+                    # while the engine starts when the launcher masked one card per rank.
+                    scoped = {} if vllm_local_rank is None else {"LOCAL_RANK": str(vllm_local_rank)}
+                    with _scoped_environ(scoped):
+                        if use_engine:
+                            llm = LLMEngine.from_engine_args(EngineArgs(**engine_args))
+                        else:
+                            llm = LLM(**engine_args)
                 pass
                 loaded = True
                 break
@@ -5361,7 +5466,54 @@ def save_lora(model, save_directory, *args, **kwargs):
     # Cast LoRA to float16 / bfloat16
     state_dict = {k:v.to(dtype) for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
     kwargs["state_dict"] = state_dict
-    model.save_pretrained(save_directory = save_directory, *args, **kwargs)
+    rank, world_size = _distributed_rank_and_world()
+    if world_size <= 1 or (rank == 0 and kwargs.get("push_to_hub", False)):
+        # push_to_hub names the repo after save_directory, so the rank 0 push keeps the real path.
+        model.save_pretrained(save_directory = save_directory, *args, **kwargs)
+        return
+    # DDP: every rank holds the same adapter and usually load_lora's this folder next.
+    # Rank 0 alone would leave the others reading a missing or half-written folder, and a
+    # barrier would deadlock a save the user gated on rank 0. So each rank writes its own
+    # copy and swaps the files in atomically.
+    kwargs["push_to_hub"] = False
+    _save_dir_atomically(
+        lambda tmp: model.save_pretrained(save_directory = tmp, *args, **kwargs),
+        save_directory, rank,
+    )
+pass
+
+
+def _distributed_rank_and_world():
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+    except Exception:
+        pass
+    return 0, 1
+pass
+
+
+def _save_dir_atomically(save_fn, save_directory, rank):
+    """save_fn(tmp_dir) into a private folder, then os.replace each file into save_directory.
+
+    os.replace is atomic on one filesystem, so a rank reading the folder sees a whole old or a
+    whole new file, never one another rank is still writing (all ranks write the same bytes).
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    save_directory = os.fspath(save_directory)
+    tmp = f"{save_directory.rstrip(os.sep)}.unsloth_tmp_rank{rank}_{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors = True)
+    try:
+        save_fn(tmp)
+        for root, _, files in os.walk(tmp):
+            rel = os.path.relpath(root, tmp)
+            target = save_directory if rel == "." else os.path.join(save_directory, rel)
+            os.makedirs(target, exist_ok = True)
+            for name in files:
+                os.replace(os.path.join(root, name), os.path.join(target, name))
+    finally:
+        shutil.rmtree(tmp, ignore_errors = True)
 pass
 
 
@@ -5381,7 +5533,12 @@ def _live_lora_config(model, save_directory):
     # Raw path key: os.path.abspath would cost a getcwd syscall per GRPO step.
     cached = _LIVE_LORA_CONFIGS.get(save_directory)
     if cached is None or cached[0] is not config:
-        config.save_pretrained(save_directory)
+        rank, world_size = _distributed_rank_and_world()
+        if world_size <= 1:
+            config.save_pretrained(save_directory)
+        else:
+            # Every DDP rank writes this file and another rank's vLLM may be reading it.
+            _save_dir_atomically(config.save_pretrained, save_directory, rank)
         cached = (config, get_peft_config(save_directory))
         _LIVE_LORA_CONFIGS[save_directory] = cached
     return cached[1]
