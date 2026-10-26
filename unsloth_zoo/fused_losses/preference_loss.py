@@ -33,7 +33,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from unsloth_zoo.fused_losses.stable_softmax import target_grad
+from unsloth_zoo.fused_losses.stable_softmax import target_grad, target_logprob_
 
 
 def _target_chunk_bytes():
@@ -117,26 +117,6 @@ _HALF_DTYPES = (torch.float16, torch.bfloat16)
 
 
 @torch.no_grad()
-def _target_logprob_(z, target):
-    # stable_softmax.target_logprob_ with an exact softplus: F.softplus returns x itself past its
-    # threshold of 20, an e^-20 error a float64 head sees. Overwrites z; returns (logp, lse).
-    m = z.amax(-1, keepdim = True)
-    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
-    index = target.unsqueeze(-1)
-    z_t = z.gather(-1, index)
-    z.sub_(m).exp_()
-    z.scatter_(-1, index, 0.0)
-    s_others = z.sum(-1, keepdim = True)
-    nonzero = s_others > 0
-    lse_others = torch.where(
-        nonzero, m + torch.log(torch.where(nonzero, s_others, torch.ones_like(s_others))),
-        torch.full_like(m, -float("inf")),
-    )
-    x = lse_others - z_t
-    logp = -(x.clamp_min(0) + torch.log1p(torch.exp(-x.abs())))
-    return logp.squeeze(-1), (z_t - logp).squeeze(-1)
-
-
 def _sliced_backward(ctx, hidden, weight, bias, labels, lse, logps, grad_logps):
     # A trainable half precision head: a float32 vocab x hidden accumulator plus per chunk GEMM and
     # cast copies cost about 10 x vocab x hidden bytes, and summing chunks in the head dtype loses
@@ -237,7 +217,7 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
                 if want_lssp:
                     lse_sq = (2.0 * logits).logsumexp(-1)
                 # Overwrites logits: every other statistic of the chunk is taken above.
-                logp, lse = _target_logprob_(logits, labels[start:end].to(logits.device))
+                logp, lse = target_logprob_(logits, labels[start:end].to(logits.device))
                 del logits
                 logps[start:end] = logp.to(device)
                 if sliced:
@@ -366,7 +346,7 @@ def _compact_forward(hidden, weight, bias, labels, mask, chunk_size, transforms,
             if want_lssp:
                 lse_sq = (2.0 * logits).logsumexp(-1)
             # Overwrites logits: every other statistic of the chunk is taken above.
-            logp, lse = _target_logprob_(logits, selected_labels[start:end].to(logits.device))
+            logp, lse = target_logprob_(logits, selected_labels[start:end].to(logits.device))
             del logits
             logps[start:end] = logp.to(device)
             if sliced:
