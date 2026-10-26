@@ -26,7 +26,6 @@ import torch.nn.functional as F
 
 from unsloth_zoo.fused_losses import chunked_logprob
 from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_ce_loss, unsloth_count_aware_cross_entropy
-from unsloth_zoo.fused_losses.stable_softmax import target_logprob
 from unsloth_zoo import rl_replacements as rl
 
 V = 257
@@ -64,6 +63,8 @@ def _check(logp, grad_t, z, target, sign = 1.0, tol = 1e-5):
 
 @pytest.mark.parametrize("margin", MARGINS)
 def test_target_logprob_helper(margin):
+    from unsloth_zoo.fused_losses.stable_softmax import target_logprob
+
     z, t = _logits(margin)
     x = z.float().requires_grad_()
     logp, _ = target_logprob(x, t)
@@ -173,6 +174,8 @@ def test_grpo_hidden_states_scorers(monkeypatch, margin, recompute, fused_linear
 
 
 def test_ordinary_logits_match_stock():
+    from unsloth_zoo.fused_losses.stable_softmax import target_logprob
+
     torch.manual_seed(0)
     z = torch.randn(32, V) * 3
     t = torch.randint(0, V, (32,))

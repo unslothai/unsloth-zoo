@@ -22,7 +22,6 @@ gradient, which collapses to 0 with the loss once the margin passes ~16.6 nats i
 import pytest
 import torch
 
-import unsloth_zoo.fused_losses.fused_linear as fl
 from unsloth_zoo.fused_losses.fused_linear import fused_linear_cross_entropy, fused_linear_logprobs
 
 H = 64
