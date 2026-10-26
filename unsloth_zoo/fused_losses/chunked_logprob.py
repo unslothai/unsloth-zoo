@@ -31,6 +31,7 @@ __all__ = [
 import functools
 import os
 import torch
+from unsloth_zoo.fused_losses.stable_softmax import target_logprob, target_grad
 from typing import Optional
 
 from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, torch_compile_options
@@ -88,13 +89,11 @@ def _transform(z, scalars, has_mul: bool, has_div: bool, has_cap: bool):
 def _forward_stats(logits, targets, scalars, has_mul: bool, has_div: bool, has_cap: bool, want_mean: bool):
     z = _transform(logits.float(), scalars, has_mul, has_div, has_cap)
     mean_logits = z.mean(-1) if want_mean else None
-    z = z * scalars[0]
-    lse = torch.logsumexp(z, dim = -1)
-    selected = z.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    return selected - lse, lse, mean_logits
+    logp, lse = target_logprob(z * scalars[0], targets)
+    return logp, lse, mean_logits
 
 
-def _logits_grad(logits, targets, lse, grad, scalars, has_mul: bool, has_div: bool, has_cap: bool, out_dtype):
+def _logits_grad(logits, targets, lse, logp, grad, scalars, has_mul: bool, has_div: bool, has_cap: bool, out_dtype):
     x = logits.float()
     if has_mul:
         x = x * scalars[1]
@@ -107,7 +106,8 @@ def _logits_grad(logits, targets, lse, grad, scalars, has_mul: bool, has_div: bo
         z = x
     p = torch.exp(z * scalars[0] - lse.unsqueeze(-1))
     onehot = torch.arange(z.shape[-1], device = z.device).unsqueeze(0) == targets.unsqueeze(-1)
-    dz = (onehot.to(p.dtype) - p) * (grad.unsqueeze(-1) * scalars[0])
+    # Target entry 1 - p_t from the accurate logp: onehot - p rounds it to 0 for a confident target.
+    dz = torch.where(onehot, target_grad(logp).unsqueeze(-1), -p) * (grad.unsqueeze(-1) * scalars[0])
     if has_cap:
         dz = dz * (1.0 - t * t)
     if has_mul:
@@ -215,7 +215,7 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
                 if want_mean:
                     mean_logits[a:b] = mean
                 del logits
-        ctx.save_for_backward(hidden, weight, bias, targets, lse, scalars)
+        ctx.save_for_backward(hidden, weight, bias, targets, lse, logps, scalars)
         ctx.rows_per_chunk = rows_per_chunk
         ctx.flags = flags
         ctx.compute_dtype = compute_dtype
@@ -225,7 +225,7 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_logps, grad_mean):
-        hidden, weight, bias, targets, lse, scalars = ctx.saved_tensors
+        hidden, weight, bias, targets, lse, logps, scalars = ctx.saved_tensors
         need_h, need_w, need_b = ctx.needs_input_grad[0], ctx.needs_input_grad[1], ctx.needs_input_grad[2]
         if grad_logps is None or not (need_h or need_w or need_b):
             return (None,) * 10
@@ -244,7 +244,7 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
                 logits = _project(h, w, bias, compute_dtype, fp32_out = True)
                 dz = _run(
                     "bwd", _logits_grad,
-                    logits, targets[a:b], lse[a:b], grad_logps[a:b], scalars, *ctx.flags, compute_dtype,
+                    logits, targets[a:b], lse[a:b], logps[a:b], grad_logps[a:b], scalars, *ctx.flags, compute_dtype,
                 )
                 del logits
                 if need_h:
@@ -376,7 +376,7 @@ class UnslothChunkedCE(torch.autograd.Function):
                 lp, lse, _ = _run("fwd", _forward_stats, logits, targets[a:b], scalars, *flags, False)
                 loss -= lp.sum()
                 if need_h or need_w or need_b:
-                    dz = _run("bwd", _logits_grad, logits, targets[a:b], lse, g_row[: b - a], scalars, *flags, compute_dtype)
+                    dz = _run("bwd", _logits_grad, logits, targets[a:b], lse, lp, g_row[: b - a], scalars, *flags, compute_dtype)
                     del logits
                     if need_h:
                         grad_hidden[a:b] = _mm_fp32(dz, w).to(grad_hidden.dtype)

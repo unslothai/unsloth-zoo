@@ -37,6 +37,7 @@ from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, UNSLOTH
 from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bounds
 from unsloth_zoo.device_type import DEVICE_TYPE
 from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+from unsloth_zoo.fused_losses.stable_softmax import smoothed_nll, cross_entropy_rows
         
 
 # Not F.linear: ZeRO-3 patches it process wide, giving a zero lm_head grad under compile + grad_and_value.
@@ -201,15 +202,15 @@ def compute_fused_ce_loss(
         logits = torch.tanh(logits)
         logits = logits * logit_softcapping
 
-    # sum / n_items, else sum / labelled tokens (the stock mean)
+    # sum / n_items, else sum / labelled tokens (the stock mean); not F.cross_entropy, which collapses.
     target = labels.view(-1).to(device).contiguous()
-    loss = torch.nn.functional.cross_entropy(
-        input  = logits.view(-1, vocab_size).float().contiguous(),
-        target = target,
-        reduction = "sum",
-        ignore_index = ignore_index,
-        label_smoothing = label_smoothing,
+    keep = target != ignore_index
+    nll = smoothed_nll(
+        logits.view(-1, vocab_size).float().contiguous(),
+        torch.where(keep, target, torch.zeros_like(target)),
+        label_smoothing,
     )
+    loss = torch.where(keep, nll, torch.zeros_like(nll)).sum()
     loss = loss / _nonzero_count(n_items if n_items is not None else (target != ignore_index).sum())
     # Scale loss if needed for mixed precision training
     scaled_loss = loss * scaling if scaling is not None else loss
@@ -883,6 +884,13 @@ def unsloth_fused_ce_loss(
 pass
 
 
+def _autocast_enabled(device_type):
+    try:
+        return torch.is_autocast_enabled(device_type)
+    except TypeError:  # torch < 2.4 takes no device argument
+        return torch.is_autocast_cpu_enabled() if device_type == "cpu" else torch.is_autocast_enabled()
+
+
 def unsloth_count_aware_cross_entropy(
     logits,
     labels,
@@ -910,11 +918,14 @@ def unsloth_count_aware_cross_entropy(
         vocab_size = logits.shape[-1]
     logits = logits.reshape(-1, vocab_size)
     labels = labels.reshape(-1).to(logits.device)
+    # float32 per token losses without a float32 copy of the logits (stock rounds each to the logits' dtype).
+    nll = cross_entropy_rows(logits, labels, ignore_index = ignore_index)
     if n_items is None:
-        return torch.nn.functional.cross_entropy(logits, labels, ignore_index = ignore_index)
-    loss = torch.nn.functional.cross_entropy(
-        logits, labels, ignore_index = ignore_index, reduction = "none",
-    ).float().sum()
+        # The stock mean over labelled tokens (NaN when every label is ignored), in stock's dtype: autocast
+        # runs cross_entropy in float32, so a half mean there would overflow GradScaler's scaled gradient.
+        mean = nll.sum() / (labels != ignore_index).sum()
+        return mean if _autocast_enabled(logits.device.type) else mean.to(logits.dtype)
+    loss = nll.sum()
     if torch.is_tensor(n_items):
         # A DataParallel replica gets a one-element slice of the repeated count: keep the loss 0-dim.
         n_items = n_items.to(loss.device)
