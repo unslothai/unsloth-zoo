@@ -24,6 +24,8 @@ import torch
 __all__ = [
     "SPARSE_ATTN_STATS",
     "sparse_skip_full_enabled",
+    "sparse_flex_enabled",
+    "sparse_indexer_chunked_enabled",
     "record_sparse_attn",
     "reset_sparse_attn_stats",
 ]
@@ -35,6 +37,16 @@ SPARSE_ATTN_STATS = {}
 def sparse_skip_full_enabled():
     """UNSLOTH_SPARSE_ATTN_SKIP_FULL=0 restores the indexer when every key is selected anyway."""
     return os.environ.get("UNSLOTH_SPARSE_ATTN_SKIP_FULL", "1") != "0"
+
+
+def sparse_flex_enabled():
+    """UNSLOTH_SPARSE_ATTN_FLEX=0 keeps upstream dense attention above the selection budget."""
+    return os.environ.get("UNSLOTH_SPARSE_ATTN_FLEX", "1") != "0"
+
+
+def sparse_indexer_chunked_enabled():
+    """UNSLOTH_SPARSE_INDEXER_CHUNKED=0 keeps upstream's unchunked indexer scoring above the budget."""
+    return os.environ.get("UNSLOTH_SPARSE_INDEXER_CHUNKED", "1") != "0"
 
 
 def record_sparse_attn(kind, model_type):

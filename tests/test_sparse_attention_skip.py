@@ -282,7 +282,11 @@ def test_patch_is_idempotent_and_keeps_the_reference():
     reference = sparse_attention._REFERENCE["deepseek_v32.indexer"]
     _patch_all()
     _patch_all()
-    assert DeepseekV32Indexer.forward is sparse_attention.deepseek_v32_indexer_forward
+    # The sparse flex patch (sparse_attention_flex.py) wraps this forward and delegates to it.
+    forward = DeepseekV32Indexer.forward
+    if getattr(forward, "_unsloth_sparse_flex", False):
+        forward = DeepseekV32Indexer._unsloth_inner_forward
+    assert forward is sparse_attention.deepseek_v32_indexer_forward
     assert sparse_attention._REFERENCE["deepseek_v32.indexer"] is reference
     assert sparse_attention._is_transformers_function(reference, "deepseek_v32")
 
