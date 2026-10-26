@@ -119,9 +119,8 @@ def _current_device_index():
 pass
 
 def get_target_device(index = None):
-    # None = the engine's device. Under torchrun each rank's external_launcher engine runs on the
-    # rank's own (current) device; a hardcoded 0 put rank 1's engine and weights on rank 0's GPU.
-    # A single process keeps vLLM's own executor, which takes local device 0 whatever is current.
+    # None = the engine's device: the rank's current device under torchrun (external_launcher),
+    # else 0, which vLLM's own executor takes whatever is current.
     if index is None:
         index = _current_device_index() if _torchrun_launch_info() is not None else 0
     if DEVICE_TYPE == "hip":

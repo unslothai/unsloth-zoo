@@ -55,9 +55,7 @@ def test_launch_info_needs_every_torchrun_variable():
 
 
 def test_target_device_is_device_0_outside_torchrun(monkeypatch):
-    """A single process keeps vLLM's own executor, which takes local device 0 whatever is current:
-    a mixed-GPU host with set_device(1) must judge and place the engine on device 0. Under torchrun
-    each rank's external_launcher engine runs on its own current device."""
+    """vLLM's own executor takes device 0 whatever is current; a torchrun rank uses its own."""
     for key in vu._TORCHRUN_ENV_KEYS + ("TORCHELASTIC_RUN_ID",):
         monkeypatch.delenv(key, raising = False)
     monkeypatch.setattr(vu, "_current_device_index", lambda: 1)
@@ -72,7 +70,6 @@ def test_target_device_is_device_0_outside_torchrun(monkeypatch):
 
 
 def test_current_device_index_is_an_int_on_cpu(monkeypatch):
-    """torch.cpu.current_device() is the string "cpu": a CPU torchrun rank gets index 0, not a TypeError."""
     monkeypatch.setattr(vu, "DEVICE_TYPE", "cpu")
     assert vu._current_device_index() == 0
 
