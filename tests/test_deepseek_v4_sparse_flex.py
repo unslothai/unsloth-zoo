@@ -510,3 +510,19 @@ def test_short_document_after_longer_ones():
     here = os.path.dirname(os.path.abspath(__file__))
     proc = subprocess.run([sys.executable, "-c", _SHORT_DOC_WORKER, here], capture_output = True, text = True, env = env, timeout = 600)
     assert "SHORT_DOC_OK" in proc.stdout, proc.stdout[-2000:] + proc.stderr[-3000:]
+
+
+@needs_flex_gpu
+def test_device_probe_traces_without_graph_break():
+    """The first flex check can run inside a compiled graph (empty device cache): the probe must trace
+    whole. importlib's find_spec is skipped by dynamo and broke the graph on torch 2.10."""
+    import torch._dynamo
+    torch._dynamo.reset()
+    F4._DEVICE_OK.clear()
+    attn = _Attn(4, "cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def probe(x):
+        return x + F4._min_keys(attn, device, True)
+
+    assert torch.compile(probe, fullgraph = True)(torch.zeros(1, device = "cuda")).item() == 16

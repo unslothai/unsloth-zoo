@@ -68,6 +68,8 @@ _MIN_SHARED_MEMORY = 160 * 1024
 
 _FLEX = None
 _DEVICE_OK = {}
+# Looked up once: find_spec is skipped by dynamo, and the first call can come from inside a compiled graph.
+_HAS_TRITON = importlib.util.find_spec("triton") is not None
 
 
 def _transformers_tested():
@@ -118,7 +120,7 @@ def _device_thresholds(device, forced):
     if key not in _DEVICE_OK:
         thresholds = None
         try:
-            if torch.version.hip is None and importlib.util.find_spec("triton") is not None:
+            if torch.version.hip is None and _HAS_TRITON:
                 props = torch.cuda.get_device_properties(index)
                 smem = getattr(props, "shared_memory_per_block_optin", 0)
                 # sm86 / sm89 report major 8 but have ~101 KB: the shared memory check keeps them out.
