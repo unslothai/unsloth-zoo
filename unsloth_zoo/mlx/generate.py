@@ -1418,7 +1418,10 @@ class GenerationEvent:
 
     ``prompt_tokens`` and ``generated_tokens`` are the row's counts so far, carried on
     every event so a caller that stops a batch early can still report usage. ``result``
-    arrives only when the row ends on its own.
+    arrives only when the row ends on its own. ``token_ids`` are the ids sampled since
+    the row's previous event, for a caller that decodes them itself: each id once,
+    including a stop id that ended the row (which ``result.token_ids`` leaves out), and
+    without a stop string's trim.
     """
 
     index: int
@@ -1426,6 +1429,7 @@ class GenerationEvent:
     result: GenerationResult | None = None
     prompt_tokens: int = 0
     generated_tokens: int = 0
+    token_ids: tuple[int, ...] = ()
 
 
 class BatchRowRefused(ValueError):
@@ -1442,6 +1446,7 @@ def _text_events(index: int, state: "_PendingResult") -> Iterator[GenerationEven
         delta=state.release(),
         prompt_tokens=state.prompt_token_count,
         generated_tokens=len(state.token_ids),
+        token_ids=state.release_sampled(),
     )
 
 
@@ -1456,6 +1461,7 @@ def _finished_events(
         result=state.result(tokenizer),
         prompt_tokens=state.prompt_token_count,
         generated_tokens=len(state.token_ids),
+        token_ids=state.release_sampled(),
     )
 
 
@@ -1589,11 +1595,16 @@ class _PendingResult:
     stop_match: str | None = None
     draft_tokens: int = 0
     accepted_draft_tokens: int = 0
+    sampled: list[int] = field(default_factory=list)
 
     def release(self) -> str:
         delta = self.text[self.released :]
         self.released = len(self.text)
         return delta
+
+    def release_sampled(self) -> tuple[int, ...]:
+        sampled, self.sampled = tuple(self.sampled), []
+        return sampled
 
     def _apply_stop_match(
         self,
@@ -1621,6 +1632,7 @@ class _PendingResult:
     def add_terminal(self, token: int, logprob: float):
         self.token_ids.append(token)
         self.logprobs.append(logprob)
+        self.sampled.append(token)
         self.detokenizer.add_token(token)
 
     def append(self, tokenizer, token: int, logprob: float) -> bool:
@@ -1632,7 +1644,10 @@ class _PendingResult:
         self._apply_stop_match(tokenizer, match)
         return True
 
-    def finish(self, tokenizer, reason: Literal["stop", "length"]):
+    def finish(self, tokenizer, reason: Literal["stop", "length"], token: int | None = None):
+        # On "length" the caller already added the last token as text.
+        if reason == "stop" and token is not None:
+            self.sampled.append(token)
         self.detokenizer.finalize()
         self.text += self.detokenizer.last_segment
         match = self.scanner.feed(self.text)
@@ -1941,7 +1956,7 @@ class _TextBatchSession:
             )
         if finish_reason == "length":
             state.add_terminal(int(response.token), _sampled_logprob(response))
-        state.finish(self.adapter.tokenizer, finish_reason)
+        state.finish(self.adapter.tokenizer, finish_reason, int(response.token))
         yield from _finished_events(row, state, self.adapter.tokenizer)
         self._retire(response.uid)
 
@@ -3171,7 +3186,12 @@ class _VLMBatchAdapter:
             raise RuntimeError(
                 "mlx-vlm produced no events for an audio request."
             )
-        state.finish(tokenizer, self._terminal_reason(previous, tokenizer))
+        last = getattr(previous, "token", None)
+        state.finish(
+            tokenizer,
+            self._terminal_reason(previous, tokenizer),
+            None if last is None else int(last),
+        )
         yield from _finished_events(index, state, tokenizer)
 
     @staticmethod
@@ -3401,7 +3421,7 @@ class _VLMBatchAdapter:
                     )
                 if finish_reason == "length":
                     state.add_terminal(int(event.token), _event_logprob(event))
-                state.finish(tokenizer, finish_reason)
+                state.finish(tokenizer, finish_reason, int(event.token))
                 yield from _finished_events(row_of[event.uid], state, tokenizer)
                 del pending[event.uid]
 
@@ -3930,7 +3950,7 @@ class _VLMBatchSession:
             )
         if finish_reason == "length":
             state.add_terminal(int(event.token), _event_logprob(event))
-        state.finish(tokenizer, finish_reason)
+        state.finish(tokenizer, finish_reason, int(event.token))
         yield from _finished_events(row, state, tokenizer)
         self._retire(event.uid)
 
@@ -4105,7 +4125,7 @@ class _SpeculativeBatchSession:
                 # The last token of a finished row ends it as mlx-vlm's batch reports it: a stop token is not text.
                 if token not in self.stop_tokens:
                     state.add_terminal(token, logprob)
-                state.finish(self.tokenizer, "stop" if token in self.stop_tokens else "length")
+                state.finish(self.tokenizer, "stop" if token in self.stop_tokens else "length", token)
                 yield from _finished_events(row, state, self.tokenizer)
                 del self._pending[row]
                 return

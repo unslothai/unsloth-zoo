@@ -1613,6 +1613,18 @@ def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     assert session.add(GenerationRequest(prompt = "fg")) == 1
 
 
+@pytest.mark.parametrize("last, reason, kept", [(2, "stop", [1, 3]), (4, "length", [1, 3, 4])])
+def test_a_vision_row_s_events_report_each_sampled_id_once(last, reason, kept):
+    """Including a stop id, which can close the reply's markup for a caller decoding ids itself."""
+    session = _vlm_session()
+    session.add(GenerationRequest(prompt = "ab"))
+    sampled = [(1, None), (3, None), (last, reason)]
+    events = [event for token, finish in sampled for event in session._consume(
+        types.SimpleNamespace(uid = 0, token = token, finish_reason = finish, token_logprob = -0.5))]
+    assert [event.token_ids for event in events] == [(1,), (3,), (last,)]
+    assert events[-1].result.token_ids == kept
+
+
 def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
     session = _vlm_session()
