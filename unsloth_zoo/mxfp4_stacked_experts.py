@@ -153,16 +153,24 @@ def _fused(inputs, param, transpose = True):
     # sm_75: only decode rows, which take the GEMV; the tile kernel loses to dequantize + grouped GEMM there.
     # Except under torch.compile or CUDA graph capture: the fallback reads routing offsets on the host.
     return (
-        (_gemv_rows(inputs.shape[0], param.shape[0], transpose) or _tracing_or_capturing())
+        (_gemv_rows(inputs.shape[0], param.shape[0], transpose) or _tracing_or_capturing(inputs.device))
         and mxfp4_grouped_gemv_available(inputs.device, inputs.dtype)
     )
 
 
-def _tracing_or_capturing():
+def _tracing_or_capturing(device = None):
     if torch.compiler.is_compiling():
         return True
     # A capture needs an initialized CUDA context; this also keeps the check free where CUDA never started.
-    return torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+    if not torch.cuda.is_initialized():
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return True
+    # The query only sees the current device; a split-device model may capture on another GPU.
+    if device is None or device.type != "cuda" or device.index in (None, torch.cuda.current_device()):
+        return False
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
 
 
 def _scales(param):

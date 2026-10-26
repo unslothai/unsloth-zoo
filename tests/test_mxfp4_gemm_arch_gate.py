@@ -14,6 +14,13 @@ import unsloth_zoo.mxfp4_stacked_experts as mse
 from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam
 
 
+@pytest.fixture(autouse = True)
+def _fresh_trace_answers(monkeypatch):
+    # A traced test on a real GPU caches a passing in-trace probe that a later test's eager call would reuse.
+    if hasattr(mg, "_TRACE_AVAILABLE"):
+        monkeypatch.setattr(mg, "_TRACE_AVAILABLE", {})
+
+
 @pytest.fixture
 def gpu(monkeypatch):
     """A verified CUDA device 0 of a chosen capability, no GPU needed."""
@@ -155,3 +162,36 @@ def test_sm80_and_newer_route_the_same_traced_or_not(gpu, monkeypatch, capabilit
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: traced)
     for transpose in (True, False):
         assert mse._fused(_rows(rows, device), _expert_param(E = 32), transpose)
+
+
+@pytest.mark.parametrize("operand,current", [(1, 0), (0, 1), (1, 1)])
+def test_stacked_experts_on_sm75_see_a_capture_on_the_operand_gpu(gpu, monkeypatch, operand, current):
+    gpu((7, 5))
+    monkeypatch.setattr(mg, "_AVAILABLE_DTYPE", {
+        (str(torch.device("cuda", i)), dtype): True for i in (0, 1) for dtype in (torch.float16, torch.bfloat16)
+    })
+    state = {"current": current, "capturing": {operand}}
+
+    class _device:
+        def __init__(self, device):
+            self.index = torch.device(device).index
+
+        def __enter__(self):
+            self.prev, state["current"] = state["current"], self.index
+
+        def __exit__(self, *exc):
+            state["current"] = self.prev
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device", _device)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: state["current"])
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: state["current"] in state["capturing"])
+    param = _expert_param(E = 32)
+    inputs = _rows(2048, torch.device("cuda", operand))
+    assert mse._fused(inputs, param, True)
+    assert mse._fused(inputs, param, False)
+    assert state["current"] == current
+    state["capturing"] = set()
+    assert not mse._fused(inputs, param, True)
+    assert not mse._fused(inputs, param, False)
