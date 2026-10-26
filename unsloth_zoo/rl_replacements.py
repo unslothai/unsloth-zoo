@@ -113,8 +113,22 @@ pass
 # A scored token tied with the smallest kept logit but dropped by the sort counts as one of the kept
 # tokens (vLLM keeps an arbitrary subset of a tied run): it takes the place of one kept tied token,
 # so both the value and its gradient are those of a kept token.
-def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False, excluded_ids = None):
+#
+# full_vocab_grad (the automatic default): the value stays the kept-set logprob, so the IS ratio against
+# vLLM's processed logprobs is ~1, but the gradient is the full-vocabulary d log p(y), as TRL and verl
+# train. The kept-set gradient d log (p(y) / p(S)) is zero wherever the kept set is one token (top_k = 1,
+# or any confident token under min_p / top_p), so a negative advantage could never push that token down.
+def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False, excluded_ids = None,
+                             full_vocab_grad = False):
     index = chunk_index.unsqueeze(-1)
+    if full_vocab_grad:
+        kept = _truncated_support_logps(chunk_logits.detach(), chunk_index, top_k, top_p, min_p, triton_sampler, excluded_ids)
+        is_target = torch.arange(chunk_logits.shape[-1], device = chunk_logits.device) == index
+        selected = torch.where(is_target, chunk_logits, 0.0).sum(-1)
+        others_all = torch.where(is_target, torch.finfo(chunk_logits.dtype).min, chunk_logits)
+        full = -torch.nn.functional.softplus(torch.logsumexp(others_all, dim = -1) - selected)
+        # x - x.detach() is exactly 0 for finite x: the value is bitwise the kept-set logprob.
+        return kept + (full - full.detach())
     selected_logits = torch.gather(chunk_logits, dim = -1, index = index)
     detached = chunk_logits.detach()
     if excluded_ids is not None:
@@ -145,6 +159,7 @@ def chunked_selective_log_softmax(
     support_min_p: float = 0.0,
     support_triton_sampler: bool = False,
     support_excluded_ids: Optional[torch.Tensor] = None,
+    support_full_vocab_grad: bool = False,
 ):
     # Fixed `chunks` row ranges; see chunked_hidden_states_selective_log_softmax.
     flat_logits = logits.reshape(-1, logits.shape[-1])
@@ -163,7 +178,7 @@ def chunked_selective_log_softmax(
         if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0 or support_excluded_ids is not None:
             all_per_token_logps.append(_truncated_support_logps(
                 chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
-                support_triton_sampler, support_excluded_ids,
+                support_triton_sampler, support_excluded_ids, support_full_vocab_grad,
             ))
             continue
         # Target excluded from the normaliser: x_i - logsumexp(x) drops confident tokens (softmax collapse).
@@ -213,6 +228,7 @@ def chunked_hidden_states_selective_log_softmax(
     support_min_p: float = 0.0,
     support_triton_sampler: bool = False,
     support_excluded_ids: Optional[torch.Tensor] = None,
+    support_full_vocab_grad: bool = False,
     # Read in the default for the same Dynamo reason as max_rows_per_chunk. Pairs with vLLM's
     # head_dtype=float32 that load_vllm requests under the same flag.
     fp32_lm_head: bool = (
@@ -318,7 +334,7 @@ def chunked_hidden_states_selective_log_softmax(
         if support_top_k > 0 or support_top_p < 1.0 or support_min_p > 0.0 or support_excluded_ids is not None:
             per_token_logps = _truncated_support_logps(
                 chunk_logits, chunk_index, support_top_k, support_top_p, support_min_p,
-                support_triton_sampler, support_excluded_ids,
+                support_triton_sampler, support_excluded_ids, support_full_vocab_grad,
             )
         else:
             # Target excluded from the normaliser: x_i - logsumexp(x) drops confident tokens (softmax collapse).
@@ -1775,6 +1791,10 @@ def grpo_truncated_support_kwargs(trainer):
         kwargs["support_triton_sampler"] = True
     if excluded is not None:
         kwargs["support_excluded_ids"] = excluded
+    if setting != "on":
+        # Automatic: the kept set corrects the IS ratio only; the policy keeps TRL's full-vocabulary
+        # gradient. =1 opts into the support-conditioned objective (SkyRL sample-support replay).
+        kwargs["support_full_vocab_grad"] = True
     return kwargs
 pass
 RL_REPLACEMENTS["grpo_truncated_support_kwargs"] = grpo_truncated_support_kwargs
@@ -1801,7 +1821,8 @@ def _grpo_rollout_logprobs_processed(trainer):
     ):
         mode = getattr(config, "logprobs_mode", None)
         if mode is not None:
-            return str(getattr(mode, "value", mode)).startswith("processed")
+            # processed_logits are vLLM's processed but unnormalised logits, not logprobs.
+            return str(getattr(mode, "value", mode)) == "processed_logprobs"
     return None
 pass
 
