@@ -41,8 +41,12 @@ ORIGINAL = modeling.eager_attention_forward._unsloth_original
 
 CUDA = torch.cuda.is_available()
 needs_flex_gpu = pytest.mark.skipif(
-    not CUDA or torch.version.hip is not None or torch.cuda.get_device_capability() < (8, 0),
-    reason = "flex attention path needs an sm80+ NVIDIA GPU",
+    not CUDA
+    or torch.version.hip is not None
+    or torch.cuda.get_device_capability() < (8, 0)
+    # L4 / A10 / RTX 30-40 (~101 KB) are sm80+ but the patch keeps them on eager.
+    or getattr(torch.cuda.get_device_properties(0), "shared_memory_per_block_optin", 0) < F4._MIN_SHARED_MEMORY,
+    reason = "flex attention path needs an sm80+ NVIDIA GPU with enough shared memory",
 )
 
 
@@ -237,6 +241,36 @@ def test_flex_keeps_finite_mask_biases_in_float32():
     for name, a, b in zip(("out", "dq", "dkv", "dsinks"), got, ref):
         err = ((a - b).norm() / b.norm()).item()
         assert err < 2e-5, (name, err)
+
+
+@needs_flex_gpu
+def test_flex_compiles_fullgraph_with_a_biased_mask():
+    """Inside an enclosing fullgraph compile the bias check must not branch on data; output and dq match
+    eager-called flex. Compiled inference (no_grad) goes to eager instead of failing to lower."""
+    attn, q, kv, mask, _ = _function_case(torch.bfloat16)
+    visible = mask > torch.finfo(mask.dtype).min / 2
+    mask = torch.where(visible, mask - 0.5, mask)
+    scale = q.shape[-1] ** -0.5
+
+    def fn(q, kv, mask):
+        return F4.deepseek_v4_flex_attention(attn, q, kv, mask, scale)
+
+    def dispatch(q, kv, mask):
+        return modeling.eager_attention_forward(attn, q, kv, kv, mask, scale)[0]
+
+    torch._dynamo.reset()
+    outs = []
+    for f in (fn, torch.compile(fn, fullgraph = True, dynamic = True)):
+        qq = q.detach().requires_grad_(True)
+        y = f(qq, kv.detach(), mask)
+        y.float().square().mean().backward()
+        outs.append((y.detach().float(), qq.grad.float()))
+    for got, ref in zip(outs[1], outs[0]):
+        assert (got - ref).norm() / ref.norm() < 2e-2
+    with torch.no_grad():
+        ref = ORIGINAL(attn, q, kv, kv, mask, scale)[0].float()
+        got = torch.compile(dispatch, fullgraph = True, dynamic = True)(q, kv, mask).float()
+    assert (got - ref).norm() / ref.norm() < 2e-2
 
 
 def _rel(a, b):

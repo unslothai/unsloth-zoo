@@ -151,6 +151,9 @@ def _flex_applies(module, query, key, value, attention_mask, dropout, kwargs):
         return False
     if key is not value or dropout:
         return False
+    # Flex under no_grad inside an enclosing compiled graph fails to lower (torch 2.14); eager is correct there.
+    if torch.compiler.is_compiling() and not torch.is_grad_enabled():
+        return False
     if not (query.is_cuda and query.dtype in (torch.bfloat16, torch.float16)):
         return False
     if query.dim() != 4 or key.dim() != 4 or key.shape[1] != 1 or query.shape[2] < _MIN_Q_LEN:
@@ -191,8 +194,9 @@ def deepseek_v4_block_mask(attention_mask, batch):
     table = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK), dtype = torch.bool)
     table[:, :q_len, :kv_len] = visible
     # transformers' own masks are 0 / min only; reading a bias per score costs 5-15%, so only when present.
+    # Inside a compiled graph the check would be a data-dependent branch, so the bias is always kept there.
     bias = None
-    if bool((visible & (attention_mask[:, 0] != 0)).any()):
+    if torch.compiler.is_compiling() or bool((visible & (attention_mask[:, 0] != 0)).any()):
         bias = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK))
         bias[:, :q_len, :kv_len] = torch.where(visible, attention_mask[:, 0], 0)
         if bias.shape[0] != batch:
