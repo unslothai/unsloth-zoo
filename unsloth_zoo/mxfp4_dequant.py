@@ -230,12 +230,26 @@ def _kernel_fail(exception):
     warnings.warn(f"Unsloth: fused MXFP4 dequant unavailable ({exception}); using the torch path.")
 
 
+def _tracing():
+    try:
+        if torch.compiler.is_compiling():
+            return True
+        from torch._guards import detect_fake_mode
+        return detect_fake_mode() is not None
+    except Exception:
+        return False
+
+
 def _kernel_verified(device, dtype, transpose):
     """Once per (device, dtype, layout, rounding path): kernel must match the torch reference bit for bit, else torch is used."""
     key = (str(device), dtype, bool(transpose), _exact_round())
     verified = _KERNEL_VERIFIED.get(key)
     if verified is not None:
         return verified
+    if _tracing():
+        # The probe's torch.equal is data dependent (fullgraph refuses it, e.g. a cold compiled backward):
+        # trace the bit-identical torch reference and leave the verdict to the first eager call.
+        return False
     try:
         E, N, G = 2, 131, 9
         blocks = ((torch.arange(E * N * G * 16, device = device) * 7) % 256).to(torch.uint8).reshape(E, N, G, 16)

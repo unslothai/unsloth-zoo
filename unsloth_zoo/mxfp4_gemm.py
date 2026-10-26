@@ -836,6 +836,10 @@ def _available(device, dtype, tiles):
     ok = _AVAILABLE_DTYPE.get(key)
     if ok is not None:
         return ok
+    from unsloth_zoo.mxfp4_dequant import _tracing
+    if _tracing():
+        # The self-check is data dependent (torch.allclose): a cold trace dequantizes, eager calls decide.
+        return False
     if len(key) == 3:
         ok = _available(device, dtype, False) and (
             torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)
