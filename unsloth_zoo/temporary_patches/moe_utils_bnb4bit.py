@@ -343,6 +343,10 @@ _LOGGED_BACKENDS = set()
 
 
 def _log_moe_bnb4bit_backend_once(experts_module, message: str):
+    # Not while tracing: Dynamo guards on the set, so the first traced call adding to it makes the
+    # gradient checkpoint recompute select a different graph (CheckpointError on the first backward).
+    if torch.compiler.is_compiling():
+        return
     key = (id(type(experts_module)), message)
     if key in _LOGGED_BACKENDS:
         return
