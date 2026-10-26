@@ -280,6 +280,8 @@ def test_fused_body_matches_eager_chunk():
 @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
 def test_bf16_error_not_worse_than_trl_bf16(beta, temperature, compiled, monkeypatch):
     calls = []
+    if compiled != "eager" and not fl._HAS_TRITON:
+        pytest.skip("no Triton installed (AMD Windows wheels): Triton and Inductor bodies cannot run")
     if compiled == "triton":
         assert fl._use_triton(torch.device("cuda")), "Triton JSD path unavailable"
         real = fl._jsd_triton
