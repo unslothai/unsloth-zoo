@@ -346,3 +346,35 @@ def test_bf16_error_not_worse_than_trl_bf16(beta, temperature, compiled, monkeyp
     assert ours_l <= max(trl_l, 1e-6 * abs(ref.item()))
     assert ours_g <= trl_g
     assert compiled != "triton" or calls, "Triton JSD path did not run"
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason = "two CUDA devices")
+@pytest.mark.parametrize("teacher_device", ["cuda:1", "cuda:0"])
+def test_triton_runs_on_the_operand_device_not_the_current_one(teacher_device):
+    """Student head on cuda:1 while cuda:0 is current: the Triton body must launch there, not fall back to eager
+    and mark cuda:1 broken for every fused-linear kernel."""
+    import warnings
+    dev = torch.device("cuda:1")
+    if not fl._use_triton(dev):
+        pytest.skip("Triton JSD path unavailable on cuda:1")
+    g = torch.Generator().manual_seed(0)
+    h = torch.randn(8, 16, generator = g)
+    w = torch.randn(65, 16, generator = g)
+    t = torch.randn(8, 12, generator = g)
+    wt = torch.randn(65, 12, generator = g)
+    with torch.cuda.device(1):
+        hr = h.to(dev).requires_grad_()
+        ref = fl.fused_linear_jsd(hr, w.to(dev), t.to(teacher_device), wt.to(teacher_device), beta = 0.5)
+        ref.backward()
+    torch.cuda.set_device(0)
+    fl._TRITON_BROKEN.discard(dev)
+    hx = h.to(dev).requires_grad_()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the eager fallback warns
+        loss = fl.fused_linear_jsd(hx, w.to(dev), t.to(teacher_device), wt.to(teacher_device), beta = 0.5)
+        loss.backward()
+    torch.cuda.synchronize(dev)
+    assert dev not in fl._TRITON_BROKEN
+    assert torch.cuda.current_device() == 0
+    torch.testing.assert_close(loss.detach(), ref.detach())
+    torch.testing.assert_close(hx.grad, hr.grad)

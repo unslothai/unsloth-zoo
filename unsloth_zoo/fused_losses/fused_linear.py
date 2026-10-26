@@ -2043,6 +2043,13 @@ _JSD_TRITON_ROWS = os.environ.get("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB") is None
 
 def _jsd_triton(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
     """_jsd_body on CUDA with Triton: two (beta = 0) or three passes over the raw fp32 logits, dz written once."""
+    # Triton launches on the current device and stream: a head on another card than the current one would
+    # be refused there and, through the fallback, mark that card broken for every fused-linear kernel.
+    return _launch(s.device, lambda: _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap,
+                                                         want_grad, grad_dtype))
+
+
+def _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
     R, V = s.shape
     NB = triton.cdiv(V, _JSD_BLOCK)
     flags = dict(S_SCALE = s_scale != 1.0, S_CAP = s_cap != 0.0, T_SCALE = t_scale != 1.0, T_CAP = t_cap != 0.0,
