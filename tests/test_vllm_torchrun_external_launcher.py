@@ -71,6 +71,12 @@ def test_target_device_is_device_0_outside_torchrun(monkeypatch):
     assert vu.get_target_device().index == 1
 
 
+def test_current_device_index_is_an_int_on_cpu(monkeypatch):
+    """torch.cpu.current_device() is the string "cpu": a CPU torchrun rank gets index 0, not a TypeError."""
+    monkeypatch.setattr(vu, "DEVICE_TYPE", "cpu")
+    assert vu._current_device_index() == 0
+
+
 def test_process_group_timeout_env(monkeypatch):
     monkeypatch.delenv("UNSLOTH_DDP_TIMEOUT", raising = False)
     assert vu._process_group_timeout() == 1800

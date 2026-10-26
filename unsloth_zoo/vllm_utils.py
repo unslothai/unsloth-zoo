@@ -110,7 +110,9 @@ def _current_device_index():
     try:
         module = torch.cuda if DEVICE_TYPE in ("cuda", "hip") else getattr(torch, DEVICE_TYPE)
         if module.is_available():
-            return module.current_device()
+            index = module.current_device()
+            # torch.cpu.current_device() is the string "cpu", not an index.
+            if isinstance(index, int): return index
     except Exception:
         pass
     return 0
