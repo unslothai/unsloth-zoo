@@ -86,3 +86,11 @@ def test_lora_leaves_frozen_scaled_fp8_weight_alone():
     model = _Model(_FP8Linear("weight_scale_inv"))
     _prepare(model, full_finetuning = False)
     assert model.layers[0].proj.weight.dtype == torch.float8_e4m3fn
+
+
+def test_full_finetuning_refuses_real_transformers_fp8_layers():
+    # Drift guard: the scale attribute names come from the installed transformers, not this file.
+    fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
+    model = _Model(fp8.FP8Linear(256, 256, block_size = (128, 128)))
+    with pytest.raises(RuntimeError, match = "drop its scale"):
+        _prepare(model)

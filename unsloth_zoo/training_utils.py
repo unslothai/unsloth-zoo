@@ -345,10 +345,12 @@ def _refuse_scaled_fp8_cast(model, name, param):
     if not any(getattr(module, n, None) is not None for n in scale_names):
         return
     raise RuntimeError(
-        f"Unsloth: `{name}` is a scaled {param.dtype} weight. Training it needs it dequantized first: "
-        "casting it to the training dtype would drop its scale. Load the checkpoint dequantized "
-        "(for full finetuning, a transformers FineGrainedFP8Config with dequantize = True), "
-        "or use the BF16 version of the model."
+        f"Unsloth: `{name}` is a scaled {param.dtype} weight, and casting it to the training dtype "
+        "would drop its scale and train wrong weights. Full finetuning needs it dequantized on load: "
+        "for an `fp8` checkpoint pass `quantization_config = FineGrainedFP8Config(dequantize = True)` "
+        "(transformers 5.x; 4.x has no `dequantize`), "
+        "for `compressed-tensors` pass `CompressedTensorsConfig(run_compressed = False)`, "
+        "or use the BF16 version of the model, or train LoRA instead."
     )
 
 
