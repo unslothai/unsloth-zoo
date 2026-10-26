@@ -23,14 +23,19 @@ both: ``log p_t = -softplus(logsumexp_{j != t}(z_j) - z_t)`` and ``d log p_t / d
 """
 
 import torch
-import torch.nn.functional as F
 
 __all__ = [
     "target_logprob",
     "target_logprob_",
     "target_grad",
     "smoothed_nll",
+    "cross_entropy_rows",
 ]
+
+
+def _softplus(x):
+    # Exact log(1 + exp(x)): F.softplus returns x itself past its threshold of 20, off by up to 2e-9.
+    return x.clamp_min(0) + torch.log1p(torch.exp(-x.abs()))
 
 
 def _others_lse(s_others, m):
@@ -53,7 +58,7 @@ def target_logprob(z, target):
     z_t = z.gather(-1, index)
     is_target = torch.arange(z.shape[-1], device = z.device) == index
     s_others = torch.exp(z - m).masked_fill(is_target, 0.0).sum(-1, keepdim = True)
-    logp = -F.softplus(_others_lse(s_others, m) - z_t)
+    logp = -_softplus(_others_lse(s_others, m) - z_t)
     return logp.squeeze(-1), (z_t - logp).squeeze(-1)
 
 
@@ -68,7 +73,7 @@ def target_logprob_(z, target):
     z.sub_(m).exp_()
     z.scatter_(-1, index, 0.0)
     s_others = z.sum(-1, keepdim = True)
-    logp = -F.softplus(_others_lse(s_others, m) - z_t)
+    logp = -_softplus(_others_lse(s_others, m) - z_t)
     return logp.squeeze(-1), (z_t - logp).squeeze(-1)
 
 
@@ -84,3 +89,54 @@ def smoothed_nll(z, target, label_smoothing = 0.0):
     if label_smoothing:
         nll = (1.0 - label_smoothing) * nll + label_smoothing * (lse - z.mean(-1))
     return nll
+
+
+# float32 bytes per chunk of the eager row loop: bounds the transient upcast of half precision logits.
+_ROWS_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+def _row_chunks(n_rows, vocab_size):
+    if torch.compiler.is_compiling():
+        return n_rows  # one chunk: Inductor fuses the upcast instead of materialising it
+    return max(1, min(n_rows, _ROWS_CHUNK_BYTES // max(4 * vocab_size, 1)))
+
+
+class _CrossEntropyRows(torch.autograd.Function):
+    """Per row cross entropy of logits [N, V] in any dtype, collapse free, saving only the logits and two
+    row vectors (stock F.cross_entropy saves a same sized log_softmax), float32 math one chunk at a time."""
+
+    @staticmethod
+    def forward(ctx, logits, target):
+        n_rows, vocab_size = logits.shape
+        rows = _row_chunks(n_rows, vocab_size)
+        logp = torch.empty(n_rows, dtype = torch.float32, device = logits.device)
+        lse = torch.empty(n_rows, dtype = torch.float32, device = logits.device)
+        for start in range(0, n_rows, rows):
+            end = min(start + rows, n_rows)
+            chunk = logits[start:end].to(torch.float32, copy = True)
+            logp[start:end], lse[start:end] = target_logprob_(chunk, target[start:end])
+        ctx.save_for_backward(logits, target, logp, lse)
+        return -logp
+
+    @staticmethod
+    def backward(ctx, grad_nll):
+        logits, target, logp, lse = ctx.saved_tensors
+        n_rows, vocab_size = logits.shape
+        rows = _row_chunks(n_rows, vocab_size)
+        grad = torch.empty_like(logits)
+        for start in range(0, n_rows, rows):
+            end = min(start + rows, n_rows)
+            # d nll / dz = p - onehot; the target entry p_t - 1 = expm1(logp) keeps a confident target.
+            p = torch.exp(logits[start:end].to(torch.float32) - lse[start:end].unsqueeze(-1))
+            p.scatter_(-1, target[start:end].unsqueeze(-1), torch.expm1(logp[start:end]).unsqueeze(-1))
+            grad[start:end] = p.mul_(grad_nll[start:end].to(torch.float32).unsqueeze(-1))
+        return grad, None
+
+
+def cross_entropy_rows(logits, target, ignore_index = -100):
+    """Per row float32 nll of logits [N, V] (0 on ignored rows), F.cross_entropy(reduction = "none") without
+    softmax collapse and without a float32 copy of the logits."""
+    keep = target != ignore_index
+    safe = torch.where(keep, target, torch.zeros_like(target))
+    nll = _CrossEntropyRows.apply(logits, safe)
+    return torch.where(keep, nll, torch.zeros_like(nll))

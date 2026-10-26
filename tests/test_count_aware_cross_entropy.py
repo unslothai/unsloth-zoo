@@ -268,9 +268,13 @@ def test_helper_keeps_the_stock_dtype_and_sums_in_float32():
     assert mean.dtype == torch.bfloat16 and torch.equal(mean, stock)
     per_token = F.cross_entropy(half[..., :-1, :].reshape(-1, 13), labels[..., 1:].reshape(-1),
                                 reduction = "none").float().sum()
+    exact = F.cross_entropy(half[..., :-1, :].float().reshape(-1, 13), labels[..., 1:].reshape(-1),
+                            reduction = "sum")
     counted = unsloth_count_aware_cross_entropy(half, labels, torch.tensor(29))
     assert counted.dtype == torch.float32
-    torch.testing.assert_close(counted, per_token / 29)
+    # float32 per token losses: the exact value, and stock's bf16-rounded per token sum to bf16 precision.
+    torch.testing.assert_close(counted, exact / 29)
+    torch.testing.assert_close(counted, per_token / 29, rtol = 2 ** -8, atol = 0)
     big = torch.zeros(1, 6001, 4, dtype = torch.float16)
     big_labels = torch.zeros(1, 6001, dtype = torch.long)
     big[..., 0] = -12.0

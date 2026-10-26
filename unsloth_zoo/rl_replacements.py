@@ -40,9 +40,13 @@ RL_REPLACEMENTS = dict()
 @_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
-    selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
-    logsumexp_values = torch.logsumexp(logits, dim = -1)
-    per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+    # log_softmax(x)[i] = -softplus(logsumexp_{j != i}(x_j - x_i)): x_i - logsumexp(x) rounds to 0 for a
+    # confident token and drops its gradient (softmax collapse, arXiv 2610.31642).
+    selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1))
+    others = (logits - selected_logits).masked_fill(
+        torch.arange(logits.shape[-1], device = logits.device) == index.unsqueeze(-1), torch.finfo(logits.dtype).min,
+    )
+    per_token_logps = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1))
     return per_token_logps
 pass
 
@@ -122,8 +126,10 @@ def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, tri
     boundary = (keep & (detached == smallest_kept)).to(torch.int32).argmax(dim = -1, keepdim = True)
     keep = keep.scatter(-1, boundary, torch.gather(keep, dim = -1, index = boundary) & ~tied)
     keep = keep.scatter(-1, index, torch.ones_like(selected_kept))
-    kept = chunk_logits.masked_fill(~keep, float("-inf"))
-    return (selected_logits - torch.logsumexp(kept, dim = -1, keepdim = True)).squeeze(-1)
+    # Target excluded from the normaliser (softmax collapse); finfo.min, not -inf, keeps a lone kept target finite.
+    others = (chunk_logits - selected_logits).masked_fill(~keep, float("-inf"))
+    others = others.scatter(-1, index, torch.full_like(selected_logits, torch.finfo(others.dtype).min))
+    return -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1))
 pass
 
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
@@ -159,9 +165,13 @@ def chunked_selective_log_softmax(
                 support_triton_sampler, support_excluded_ids,
             ))
             continue
-        selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
-        per_token_logps = selected_logits - logsumexp_values
+        # Target excluded from the normaliser: x_i - logsumexp(x) drops confident tokens (softmax collapse).
+        selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1))
+        others = (chunk_logits - selected_logits).masked_fill(
+            torch.arange(chunk_logits.shape[-1], device = chunk_logits.device) == chunk_index.unsqueeze(-1),
+            torch.finfo(chunk_logits.dtype).min,
+        )
+        per_token_logps = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1))
         all_per_token_logps.append(per_token_logps)
     pass
     all_per_token_logps = torch.concat(all_per_token_logps)
@@ -312,9 +322,13 @@ def chunked_hidden_states_selective_log_softmax(
                 support_triton_sampler, support_excluded_ids,
             )
         else:
-            selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
-            logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
-            per_token_logps = selected_logits - logsumexp_values
+            # Target excluded from the normaliser: x_i - logsumexp(x) drops confident tokens (softmax collapse).
+            selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1))
+            others = (chunk_logits - selected_logits).masked_fill(
+                torch.arange(chunk_logits.shape[-1], device = chunk_logits.device) == chunk_index.unsqueeze(-1),
+                torch.finfo(chunk_logits.dtype).min,
+            )
+            per_token_logps = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1))
         # Return to the caller's device so the concatenation below and every
         # downstream consumer see the device they started on.
         all_per_token_logps.append(per_token_logps.to(hidden_states.device))
@@ -383,18 +397,25 @@ def chunked_hidden_states_selective_log_softmax_recompute(
             logits = logits.to(torch.float32)
             if temperature != 1.0:
                 logits = logits / temperature
-            logsumexp = torch.logsumexp(logits, dim = -1)
-            selected = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
+            # Target excluded from the normaliser (softmax collapse); plain logsumexp = selected - logp.
+            selected = torch.gather(logits, dim = -1, index = index.unsqueeze(-1))
+            others = (logits - selected).masked_fill(
+                torch.arange(logits.shape[-1], device = logits.device) == index.unsqueeze(-1),
+                torch.finfo(logits.dtype).min,
+            )
+            logp = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1))
+            selected = selected.squeeze(-1)
+            logsumexp = selected - logp
             if with_entropy:
                 # -sum(p * log p) on log p = z - logsumexp: logsumexp - sum(p * z) cancels badly.
                 log_p = logits - logsumexp.unsqueeze(-1)
                 entropy = -(torch.exp(log_p) * log_p).sum(-1)
             else:
                 entropy = torch.zeros_like(logsumexp)
-            return selected - logsumexp, logsumexp, entropy
+            return logp, logsumexp, entropy
 
         def post_backward(
-            logits, index, logsumexp, entropy, grad_logps, grad_entropy,
+            logits, index, logsumexp, logp, entropy, grad_logps, grad_entropy,
             scale_multiply, scale_divide, softcapping, temperature, with_entropy,
         ):
             # z exactly as the forward made it, so p matches the saved logsumexp; the softcap
@@ -417,14 +438,12 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                 z = z / temperature
             log_p = z - logsumexp.unsqueeze(-1)
             p = torch.exp(log_p)
-            # d logp / dz = onehot - p, d H / dz = -p * (log p + H)
-            if with_entropy:
-                grad_z = -p * (grad_logps.unsqueeze(-1) + grad_entropy.unsqueeze(-1) * (log_p + entropy.unsqueeze(-1)))
-            else:
-                grad_z = -p * grad_logps.unsqueeze(-1)
-            # A fused one-hot rather than scatter_add, which would materialise grad_z in float32.
+            # d logp / dz = onehot - p with the target's 1 - p_t = -expm1(logp) (onehot - p rounds it to 0 for a
+            # confident target), d H / dz = -p * (log p + H). A fused one-hot, not scatter_add.
             onehot = torch.arange(z.shape[-1], device = z.device) == index.unsqueeze(-1)
-            grad_z = grad_z + onehot * grad_logps.unsqueeze(-1)
+            grad_z = torch.where(onehot, -torch.expm1(logp).unsqueeze(-1), -p) * grad_logps.unsqueeze(-1)
+            if with_entropy:
+                grad_z = grad_z - p * grad_entropy.unsqueeze(-1) * (log_p + entropy.unsqueeze(-1))
             if temperature != 1.0:
                 grad_z = grad_z / temperature
             if softcapping != 0.0:
@@ -493,14 +512,14 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                     entropies.append(entropy)
                 logps = torch.cat(logps).to(hidden_states.device)
                 entropies = torch.cat(entropies).to(hidden_states.device)
-                ctx.save_for_backward(hidden_states, lm_head, lm_head_bias, index, torch.cat(logsumexps), entropies)
+                ctx.save_for_backward(hidden_states, lm_head, lm_head_bias, index, torch.cat(logsumexps), logps, entropies)
                 ctx.bounds = bounds
                 ctx.transforms = transforms
                 return logps, entropies
 
             @staticmethod
             def backward(ctx, grad_logps, grad_entropies):
-                hidden_states, lm_head, lm_head_bias, index, logsumexps, entropies = ctx.saved_tensors
+                hidden_states, lm_head, lm_head_bias, index, logsumexps, logps, entropies = ctx.saved_tensors
                 need_hidden, need_head, need_bias = ctx.needs_input_grad[:3]
                 device = lm_head.device
                 if grad_logps is None:
@@ -520,7 +539,7 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                         logits = chunk_logits(chunk_hidden_states, lm_head, lm_head_bias)
                     grad_logits = run(
                         compiled_backward, post_backward,
-                        logits, index[a:b].to(device), logsumexps[a:b], entropies[a:b],
+                        logits, index[a:b].to(device), logsumexps[a:b], logps[a:b].to(device), entropies[a:b],
                         grad_logps[a:b], grad_entropies[a:b], *ctx.transforms,
                     )
                     del logits
