@@ -261,3 +261,34 @@ def test_recompute_trailing_target(monkeypatch):
     logp.sum().backward()
     assert torch.allclose(ent.reshape(-1), torch.tensor([math.log(2.0)]))
     assert torch.allclose(h.grad, torch.tensor([[-0.5, 1.0, -0.5]]))
+
+
+def test_rows_ce_one_graph_across_lengths():
+    import torch._dynamo as dynamo
+    from torch._dynamo.utils import counters
+
+    dynamo.reset()
+    counters.clear()
+    compiled = torch.compile(unsloth_count_aware_cross_entropy, backend = "eager", fullgraph = True, dynamic = True)
+    for n in (3, 5, 9, 5):
+        x = torch.randn(1, n, 11, requires_grad = True)
+        torch._dynamo.mark_dynamic(x, 1)
+        y = torch.randint(0, 11, (1, n))
+        loss = compiled(x, y, torch.tensor(n), shift = False)
+        loss.backward()
+        ref = F.cross_entropy(x.detach()[0], y[0], reduction = "sum") / n
+        assert torch.allclose(loss, ref, rtol = 1e-5)
+    assert counters["stats"]["unique_graphs"] == 1
+
+
+def test_preference_in_place_path_offset_invariant(monkeypatch):
+    import unsloth_zoo.fused_losses.preference_loss as preference
+
+    monkeypatch.setattr(preference, "_FUSED_LINEAR", False)
+    h = torch.full((1, 1, 3), 1e8, requires_grad = True)
+    out = preference.fused_linear_token_logps(
+        h, torch.eye(3), None, torch.tensor([[0]]), torch.ones(1, 1, dtype = torch.bool),
+    )["per_token_logps"]
+    out.sum().backward()
+    assert torch.allclose(out.detach(), torch.tensor([[-math.log(3.0)]]))
+    assert torch.allclose(h.grad, torch.tensor([[[2 / 3, -1 / 3, -1 / 3]]]))

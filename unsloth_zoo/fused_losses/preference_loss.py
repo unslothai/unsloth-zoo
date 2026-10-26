@@ -399,7 +399,9 @@ def _compact_backward(grad_logps, hidden, weight, bias, labels, mask, logps, sav
     return grad_hidden, grad_weight, grad_bias
 
 
-_OP_NAMESPACE = "unsloth_zoo_fused_preference"
+# Versioned: a saved compile cache keys a custom op by name, so a schema change under the old name replays the
+# old calling convention after an upgrade (the backward gained `logps`). Bump on every schema change.
+_OP_NAMESPACE = "unsloth_zoo_fused_preference_v2"
 _HAS_CUSTOM_OP = hasattr(torch, "library") and hasattr(torch.library, "custom_op") \
     and hasattr(torch.library, "register_fake")
 
