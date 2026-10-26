@@ -88,10 +88,8 @@ try:
         _flex_attention = functools.partial(_flex_attention, kernel_options = kernel_options)
     pass
     flex_attention = _torch_compile(_flex_attention)
-    # Prefill / training calls: AUTO lowers a query under 128 rows to flex_decoding, whose BLOCK_M =
-    # next_pow2(q_len * GQA group) can exceed the 128-row sparse block and leave no valid config. Dynamo then
-    # skips flex_attention for good, so a checkpointed layer recomputes through another kernel and its saved
-    # tensors stop matching the forward's (CheckpointError).
+    # Prefill / training: AUTO sends queries under 128 rows to flex_decoding, which has no valid config once
+    # q_len * GQA group > 128; Dynamo then runs flex eagerly and checkpoint recompute raises CheckpointError.
     PREFILL_KERNEL_OPTIONS = {**(kernel_options or {}), "FORCE_USE_FLEX_ATTENTION": True}
 
     # torch >= 2.9: return_lse's deprecation warning is a graph break on 2.10; use AuxRequest.

@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Sink attention on a short query (under 128 rows) with GQA must compile without Inductor's flex_decoding kernel.
-
-AUTO picks flex_decoding there and its BLOCK_M = next_pow2(q_len * GQA group) can exceed the 128-row sparse block,
-leaving no valid config. Dynamo then skips flex_attention for the rest of the process, so a gradient-checkpointed
-GPT-OSS layer recomputes through another kernel than its forward used and backward raises CheckpointError.
-"""
+"""Short GQA sink-attention queries must not lower to flex_decoding (no valid config, then CheckpointError)."""
 
 import types
 
