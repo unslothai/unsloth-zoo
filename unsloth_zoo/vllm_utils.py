@@ -128,14 +128,35 @@ def get_target_device(index = None):
 _TORCHRUN_ENV_KEYS = ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
 
 def _torchrun_launch_info(environ = None):
-    """(rank, local_rank, world_size) when a torchrun-style launcher started this process, else None."""
+    """(rank, local_rank, world_size) when a torchrun-style launcher started this process, else None.
+
+    A single process with the five variables set by hand (the DeepSpeed-in-a-notebook recipe) keeps
+    vLLM's own executor: only a multi-process world or torchrun itself (TORCHELASTIC_RUN_ID, also
+    for --nproc-per-node 1, whose agent store hangs the private group) takes the external launcher."""
     environ = os.environ if environ is None else environ
     if not all(environ.get(key) for key in _TORCHRUN_ENV_KEYS):
         return None
     try:
-        return int(environ["RANK"]), int(environ["LOCAL_RANK"]), int(environ["WORLD_SIZE"])
+        rank, local_rank, world_size = (
+            int(environ["RANK"]), int(environ["LOCAL_RANK"]), int(environ["WORLD_SIZE"])
+        )
     except ValueError:
         return None
+    if world_size < 1 or not (0 <= rank < world_size) or local_rank < 0:
+        return None
+    if world_size == 1 and not environ.get("TORCHELASTIC_RUN_ID"):
+        return None
+    return rank, local_rank, world_size
+pass
+
+def _process_group_timeout():
+    """HF's ddp_timeout default (1800 s). The group is created at model load, before TrainingArguments
+    exist, and the Trainer reuses it: UNSLOTH_DDP_TIMEOUT (seconds) sets it instead."""
+    try:
+        seconds = int(os.environ.get("UNSLOTH_DDP_TIMEOUT", "1800"))
+    except ValueError:
+        seconds = 1800
+    return max(seconds, 1)
 pass
 
 def _setup_vllm_external_launcher(engine_args, launch_info):
@@ -167,7 +188,9 @@ def _setup_vllm_external_launcher(engine_args, launch_info):
     if not dist.is_initialized():
         # Same defaults accelerate uses for a torchrun job (HF ddp_timeout = 1800 s); the
         # Trainer reuses an initialized group. backend None = nccl for cuda + gloo for cpu.
-        dist.init_process_group(backend = None, init_method = "env://", timeout = timedelta(seconds = 1800))
+        dist.init_process_group(
+            backend = None, init_method = "env://", timeout = timedelta(seconds = _process_group_timeout())
+        )
     elif dist.get_world_size() != world_size:
         logger.warning(
             f"Unsloth: torch.distributed world size {dist.get_world_size()} != WORLD_SIZE {world_size}; "
@@ -5467,8 +5490,9 @@ def save_lora(model, save_directory, *args, **kwargs):
     state_dict = {k:v.to(dtype) for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
     kwargs["state_dict"] = state_dict
     rank, world_size = _distributed_rank_and_world()
-    if world_size <= 1 or (rank == 0 and kwargs.get("push_to_hub", False)):
-        # push_to_hub names the repo after save_directory, so the rank 0 push keeps the real path.
+    if world_size <= 1 or kwargs.get("push_to_hub", False):
+        # push_to_hub names the repo after save_directory, so a push keeps the real path, on whichever
+        # rank the user calls it from (as before).
         model.save_pretrained(save_directory = save_directory, *args, **kwargs)
         return
     # DDP: every rank holds the same adapter and usually load_lora's this folder next.

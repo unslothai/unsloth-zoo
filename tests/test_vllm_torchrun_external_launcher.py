@@ -46,6 +46,21 @@ def test_launch_info_needs_every_torchrun_variable():
         assert vu._torchrun_launch_info(partial) is None, key
     assert vu._torchrun_launch_info({**_TORCHRUN_ENV, "RANK": "x"}) is None
     assert vu._torchrun_launch_info({}) is None
+    # A hand-set single process (no torchrun) keeps vLLM's executor; torchrun --nproc-per-node 1 does not.
+    single = {**_TORCHRUN_ENV, "RANK": "0", "LOCAL_RANK": "0", "WORLD_SIZE": "1"}
+    assert vu._torchrun_launch_info(single) is None
+    assert vu._torchrun_launch_info({**single, "TORCHELASTIC_RUN_ID": "abc"}) == (0, 0, 1)
+    for bad in ({"LOCAL_RANK": "-1"}, {"WORLD_SIZE": "0"}, {"RANK": "2"}):
+        assert vu._torchrun_launch_info({**_TORCHRUN_ENV, **bad}) is None, bad
+
+
+def test_process_group_timeout_env(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_DDP_TIMEOUT", raising = False)
+    assert vu._process_group_timeout() == 1800
+    monkeypatch.setenv("UNSLOTH_DDP_TIMEOUT", "77")
+    assert vu._process_group_timeout() == 77
+    monkeypatch.setenv("UNSLOTH_DDP_TIMEOUT", "x")
+    assert vu._process_group_timeout() == 1800
 
 
 def test_scoped_environ_restores_set_and_absent_keys(monkeypatch):
@@ -158,10 +173,14 @@ def test_save_lora_under_ddp_writes_through_a_private_folder(tmp_path, monkeypat
 
     target = str(tmp_path / "grpo_saved_lora")
     monkeypatch.setattr(vu, "_distributed_rank_and_world", lambda: (1, 2))
-    vu.save_lora(FakeModel(), target, push_to_hub = True)
-    assert calls[-1][0] != target and calls[-1][1] is False and calls[-1][2] == ["a.lora_A.weight"]
+    vu.save_lora(FakeModel(), target)
+    assert calls[-1][0] != target and not calls[-1][1] and calls[-1][2] == ["a.lora_A.weight"]
     assert os.path.exists(os.path.join(target, "adapter_config.json"))
     assert sorted(os.listdir(tmp_path)) == ["grpo_saved_lora"]
+
+    # A push still goes out from whichever rank the user calls it on, under the real path.
+    vu.save_lora(FakeModel(), target, push_to_hub = True)
+    assert calls[-1][0] == target and calls[-1][1] is True
 
     monkeypatch.setattr(vu, "_distributed_rank_and_world", lambda: (0, 1))
     vu.save_lora(FakeModel(), target)
