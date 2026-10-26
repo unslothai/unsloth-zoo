@@ -224,7 +224,9 @@ def test_peaked_rows_match_the_oracle(monkeypatch, accuracy, V, T, cap, triton_o
     for dtype in _dtypes():
         if accuracy != "1" and dtype == torch.float32:
             continue
-        _check(measure(V, dtype, T, cap), dtype, accuracy == "1" or dtype == torch.float32)
+        # Mode "1" still rounds logits to half where _logits_mode refuses an fp32-out GEMM (ROCm).
+        fp32_logits = dtype == torch.float32 or fl._logits_mode(torch.device("cuda"), dtype)[0]
+        _check(measure(V, dtype, T, cap), dtype, fp32_logits)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -235,7 +237,8 @@ def test_collapsed_logprob_is_negative_not_zero(dtype):
     ref = _oracle(h, w, t, 1.0, 0.0)["lp"]
     peaked = slice(0, 2 * len(GAPS))
     assert (lp[peaked] < 0).all(), lp[peaked]
-    assert float(((lp - ref).abs() / ref.abs())[peaked].max()) < 1e-3
+    fp32_logits = dtype == torch.float32 or fl._logits_mode(h.device, dtype)[0]
+    assert float(((lp - ref).abs() / ref.abs())[peaked].max()) < (1e-3 if fp32_logits else _HALF_TOL[dtype])
 
 
 def test_ordinary_rows_unchanged_vs_logsumexp():
