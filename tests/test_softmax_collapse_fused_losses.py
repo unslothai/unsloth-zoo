@@ -249,3 +249,15 @@ def test_trailing_target_and_smoothing_offset():
     # Label smoothing is offset invariant: three equal 1e8 logits give log 3.
     s = smoothed_nll(torch.full((1, 3), 1e8), torch.tensor([0]), label_smoothing = 0.1)
     assert torch.allclose(s, torch.tensor([math.log(3.0)]))
+
+
+def test_recompute_trailing_target(monkeypatch):
+    monkeypatch.setattr(chunked_logprob, "_FUSED_LINEAR", False)
+    z = torch.tensor([[0.0, -1e8, 0.0]])
+    h = z.clone().requires_grad_()
+    logp, ent = rl.chunked_hidden_states_selective_log_softmax_recompute(
+        h[None], torch.eye(3), torch.tensor([[1]]), chunks = 1, return_entropy = True, fused_linear = False,
+    )
+    logp.sum().backward()
+    assert torch.allclose(ent.reshape(-1), torch.tensor([math.log(2.0)]))
+    assert torch.allclose(h.grad, torch.tensor([[-0.5, 1.0, -0.5]]))

@@ -394,12 +394,13 @@ def chunked_hidden_states_selective_log_softmax_recompute(
             logits = logits.to(torch.float32)
             if temperature != 1.0:
                 logits = logits / temperature
-            # Target excluded from the normaliser (softmax collapse); plain logsumexp = selected - logp.
+            # Target excluded from the normaliser (softmax collapse); the plain logsumexp as logaddexp, not
+            # selected - logp (cancels when the target trails).
             is_target = torch.arange(logits.shape[-1], device = logits.device) == index.unsqueeze(-1)
             selected = torch.where(is_target, logits, 0.0).sum(-1)
-            others = torch.where(is_target, torch.finfo(logits.dtype).min, logits)
-            logp = -torch.nn.functional.softplus(torch.logsumexp(others, dim = -1) - selected)
-            logsumexp = selected - logp
+            lse_others = torch.logsumexp(torch.where(is_target, torch.finfo(logits.dtype).min, logits), dim = -1)
+            logp = -torch.nn.functional.softplus(lse_others - selected)
+            logsumexp = torch.logaddexp(lse_others, selected)
             if with_entropy:
                 # -sum(p * log p) on log p = z - logsumexp: logsumexp - sum(p * z) cancels badly.
                 log_p = logits - logsumexp.unsqueeze(-1)
