@@ -55,6 +55,14 @@ _LDEXP_EXACT = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[
 
 def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False, out = None, max_rows = None):
     """Reference: transformers' convert_moe_packed_tensors arithmetic, in row chunks."""
+    from unsloth_zoo.utils import device_guard
+
+    # torch.ldexp launches on the current device: operands on another GPU fault without this.
+    with device_guard(blocks):
+        return _mxfp4_dequantize_torch(blocks, scales, dtype, transpose, out, max_rows)
+
+
+def _mxfp4_dequantize_torch(blocks, scales, dtype, transpose, out, max_rows):
     # float64 holds 2^128; routing it through fp32 would overflow.
     work = dtype if _LDEXP_EXACT or dtype == torch.float64 else torch.float32
     lut = torch.tensor(_FP4_VALUES, dtype = work, device = blocks.device)
