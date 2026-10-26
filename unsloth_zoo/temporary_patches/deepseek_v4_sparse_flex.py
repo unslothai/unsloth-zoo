@@ -14,16 +14,13 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4 attention on flex attention instead of eager.
+"""DeepSeek-V4 attention on flex attention instead of eager (transformers runs V4 eager only).
 
-transformers runs V4 eager only: one softmax over [sliding-window tokens | compressed entries] plus a
-learned per-head sink, so every layer materialises [B, 64, S, S + C] logits. The additive mask the
-attention receives (sliding window + padding, then the compressor's block_bias of causal / indexer
-selection over the compressed entries) is turned into a block-sparse BlockMask, and the sink is applied
-exactly afterwards from the logsumexp: softmax([l, s]) @ v == (softmax(l) @ v) * sigmoid(lse(l) - s).
-Prefill and training only, from a per-GPU-generation key length (see _MIN_KEYS); decode and short
-prompts stay eager. UNSLOTH_SPARSE_ATTN_FLEX (read per call): 0 = always eager, 1 = also on other
-sm80+ parts with >= 160 KB shared memory, unset = the measured generations only.
+The additive mask (sliding window + padding, then the compressor's block_bias) becomes a block-sparse
+BlockMask; the sink is applied exactly from the logsumexp:
+softmax([l, s]) @ v == (softmax(l) @ v) * sigmoid(lse(l) - s). Prefill / training only, from a measured
+per-GPU key length (_MIN_KEYS). UNSLOTH_SPARSE_ATTN_FLEX: 0 = eager, 1 = also other sm80+ parts with
+>= 160 KB shared memory, unset = measured generations only.
 """
 
 __all__ = ["patch_deepseek_v4_sparse_flex", "DEEPSEEK_V4_FLEX_STATS"]
