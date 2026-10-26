@@ -168,23 +168,10 @@ def _vllm_split_group_requested():
         return False
 pass
 
-def _setup_vllm_external_launcher(engine_args, launch_info):
-    """One vLLM engine per torchrun rank, inside the job's own process group.
+def _init_torchrun_process_group(launch_info):
+    """Bind this rank to its card and create the job's env:// group if nothing has yet.
 
-    vLLM's default single-process executor starts a private world_size = 1 group on a
-    fresh `tcp://ip:port`. torchrun exports TORCHELASTIC_USE_AGENT_STORE=True, which makes
-    torch's tcp:// rendezvous a TCPStore *client* of an agent store that only exists on
-    MASTER_PORT, so engine init blocks until the store timeout (torch
-    distributed/rendezvous.py `_create_c10d_store`). Flipping that variable is not enough:
-    vLLM's private group then becomes the default WORLD of size 1 and the Trainer's DDP
-    silently runs with one process per group. So create the real torchrun group first
-    (env://, what accelerate would create) and let vLLM join it with the
-    `external_launcher` executor: each rank is an independent data-parallel engine on
-    cuda:LOCAL_RANK (vLLM parallel_state.initialize_model_parallel: "ExternalDP ...
-    every dp rank can generate independently"), as TRL's colocate mode does.
-
-    Returns the device index vLLM must see as LOCAL_RANK, or None if unchanged.
-    """
+    Returns the device index the rank was bound to, or None off CUDA / ROCm."""
     import torch.distributed as dist
     from datetime import timedelta
     rank, local_rank, world_size = launch_info
@@ -211,6 +198,118 @@ def _setup_vllm_external_launcher(engine_args, launch_info):
             f"Unsloth: torch.distributed world size {dist.get_world_size()} != WORLD_SIZE {world_size}; "
             "vLLM joins the initialized group."
         )
+    return local_index
+pass
+
+def _all_reduce_int(value, op, group = None):
+    """One int reduced over `group` (default: the job's group) on a backend that takes it."""
+    import torch.distributed as dist
+    tensor = torch.tensor([int(value)], dtype = torch.int64)
+    # backend None (ours, accelerate's) has gloo for CPU tensors and reports "undefined" or
+    # "cpu:gloo,cuda:nccl"; only a device-only group the caller created takes none.
+    if str(dist.get_backend(group)).lower() in ("nccl", "xccl", "hccl"):
+        tensor = tensor.to(get_target_device())
+    dist.all_reduce(tensor, op = op, group = group)
+    return int(tensor.item())
+pass
+
+def torchrun_ranks_agree(local_ok):
+    """True when every torchrun rank passes its own check, else False on every rank.
+
+    A per-card gate (an old GPU, a missing feature) can keep vLLM on one rank and drop it
+    on another; external_launcher then has one rank in vLLM's world-group creation while
+    the other is already in the Trainer's collectives, and both wait out the group
+    timeout. Outside torchrun this returns `local_ok` without touching torch.distributed."""
+    launch_info = _torchrun_launch_info()
+    if launch_info is None:
+        return bool(local_ok)
+    import torch.distributed as dist
+    _init_torchrun_process_group(launch_info)
+    return _all_reduce_int(1 if local_ok else 0, dist.ReduceOp.MIN) == 1
+pass
+
+# Times vLLM's external_launcher executor finished its cross-rank MIN of free memory.
+_EXTERNAL_LAUNCHER_MEMORY_REDUCES = 0
+
+def _count_external_launcher_memory_reduces():
+    """Count ExecutorWithExternalLauncher.determine_available_memory returns (vLLM 0.11+).
+
+    That MIN all_reduce is the one cross-rank collective in an external_launcher engine's
+    start: a rank failing before it leaves its peers waiting there, so a lone retry meets
+    them again, but a rank failing after it is alone, since its peers have finished. False
+    when this vLLM has no such executor, which keeps load_vllm's retries as they were."""
+    try:
+        from vllm.v1.executor.uniproc_executor import ExecutorWithExternalLauncher
+    except Exception:
+        return False
+    original = ExecutorWithExternalLauncher.__dict__.get("determine_available_memory")
+    if original is None:
+        return False
+    if getattr(original, "_unsloth_counts_reduces", False):
+        return True
+    @functools.wraps(original)
+    def determine_available_memory(self, *args, **kwargs):
+        global _EXTERNAL_LAUNCHER_MEMORY_REDUCES
+        result = original(self, *args, **kwargs)
+        _EXTERNAL_LAUNCHER_MEMORY_REDUCES += 1
+        return result
+    determine_available_memory._unsloth_counts_reduces = True
+    ExecutorWithExternalLauncher.determine_available_memory = determine_available_memory
+    return True
+pass
+
+def _external_launcher_world_group():
+    try:
+        from vllm.distributed.parallel_state import get_world_group
+        return get_world_group().cpu_group
+    except Exception:
+        return None
+pass
+
+def _external_launcher_attempt_agreed(failed, error = None):
+    """After an engine attempt that got past vLLM's cross-rank memory check, every rank reports.
+
+    All succeeded: returns. All failed: returns, so each takes load_vllm's usual retry or raise
+    (the failures are symmetric, so the retries meet again in the same collective). Some
+    failed: raises on every rank, since the ranks that started their engine cannot redo it
+    and a rank retrying alone would wait in that collective for the rest of the group timeout."""
+    import torch.distributed as dist
+    group = _external_launcher_world_group()
+    world = dist.get_world_size(group)
+    failed_ranks = _all_reduce_int(1 if failed else 0, dist.ReduceOp.SUM, group)
+    if failed_ranks == 0 or failed_ranks == world:
+        return
+    message = (
+        f"Unsloth: vLLM failed to start on {failed_ranks} of {world} torchrun ranks after vLLM's "
+        "cross-rank memory check, so every rank stops here together: one rank retrying alone "
+        "would wait for the others until the process group times out. Lower "
+        "gpu_memory_utilization (or free the busier GPUs) and relaunch."
+    )
+    if error is not None:
+        message += f"\nThis rank's error:\n{error}"
+    raise RuntimeError(message)
+pass
+
+def _setup_vllm_external_launcher(engine_args, launch_info):
+    """One vLLM engine per torchrun rank, inside the job's own process group.
+
+    vLLM's default single-process executor starts a private world_size = 1 group on a
+    fresh `tcp://ip:port`. torchrun exports TORCHELASTIC_USE_AGENT_STORE=True, which makes
+    torch's tcp:// rendezvous a TCPStore *client* of an agent store that only exists on
+    MASTER_PORT, so engine init blocks until the store timeout (torch
+    distributed/rendezvous.py `_create_c10d_store`). Flipping that variable is not enough:
+    vLLM's private group then becomes the default WORLD of size 1 and the Trainer's DDP
+    silently runs with one process per group. So create the real torchrun group first
+    (env://, what accelerate would create) and let vLLM join it with the
+    `external_launcher` executor: each rank is an independent data-parallel engine on
+    cuda:LOCAL_RANK (vLLM parallel_state.initialize_model_parallel: "ExternalDP ...
+    every dp rank can generate independently"), as TRL's colocate mode does.
+
+    Returns the device index vLLM must see as LOCAL_RANK, or None if unchanged.
+    """
+    import torch.distributed as dist
+    rank, local_rank, world_size = launch_info
+    local_index = _init_torchrun_process_group(launch_info)
     engine_args["distributed_executor_backend"] = "external_launcher"
     # vLLM requires a seed with external_launcher. Offset it per rank as TRL colocate does
     # (seed = process_index // tp): GRPO puts copies of one prompt on several ranks, and
@@ -5318,8 +5417,11 @@ def load_vllm(
         # Keep trying until success (2 times)
         trials = 0
         race_trials = 0
+        # torchrun: a retry decision taken after vLLM's cross-rank memory check must be the same on every rank.
+        count_reduces = torchrun_info is not None and _count_external_launcher_memory_reduces()
         while True:
             registries_before = _snapshot_dynamo_engine_registries()
+            reduces_before = _EXTERNAL_LAUNCHER_MEMORY_REDUCES
             loaded = False
             try:
                 if use_async:
@@ -5340,6 +5442,8 @@ def load_vllm(
                 # A terminal raise chains this traceback as __context__: free the engine's frames.
                 traceback.clear_frames(error.__traceback__)
                 error = str(error)
+                if count_reduces and _EXTERNAL_LAUNCHER_MEMORY_REDUCES > reduces_before:
+                    _external_launcher_attempt_agreed(failed = True, error = error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
                 # config clash raised by CuMemAllocator.__init__, not an OOM, and
                 # retrying with a smaller gpu_memory_utilization can never clear it.
@@ -5435,6 +5539,8 @@ def load_vllm(
                 if not loaded: _release_failed_vllm_engine(registries_before)
             pass
         pass
+        if count_reduces and _EXTERNAL_LAUNCHER_MEMORY_REDUCES > reduces_before:
+            _external_launcher_attempt_agreed(failed = False)
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
         llm.approx_max_num_seqs = approx_max_num_seqs
         if engine_args.get("enable_return_routed_experts", False):
