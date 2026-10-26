@@ -898,6 +898,74 @@ def _patch_glm5_next_quantization_aliases(model_type):
     model.quantization_path_aliases = quantization_path_aliases
 
 
+# DeepSeek's reference names for the expert projections, which omlx's converted DeepSeek-V4.1 checkpoints keep.
+_DEEPSEEK_REFERENCE_PROJECTIONS = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+
+
+def _omlx_deepseek_v41_name(key):
+    """mlx-vlm's name for a tensor of a DeepSeek-V4.1 oQ quant (omlx's converted format), which keeps the source's
+    names under ``language_model.``, stacks routed experts under the reference names and names vision MLPs ``ffn``."""
+    key = re.sub(r"^language_model\.embed\.", "language_model.embed_tokens.", key)
+    key = re.sub(
+        r"^(language_model\.layers\.\d+\.ffn\.experts)\.(w[123])\.",
+        lambda match: f"{match[1]}.{_DEEPSEEK_REFERENCE_PROJECTIONS[match[2]]}.", key,
+    )
+    return re.sub(r"^(vision\.blocks\.\d+)\.ffn\.", r"\1.mlp.", key)
+
+
+def _omlx_deepseek_v41_quantization(config_data):
+    """The per-module ``quantization`` of a DeepSeek-V4.1 oQ quant, which omlx records instead in
+    ``omlx_deepseek_v41.quantized_modules`` under its own names; None for any other checkpoint."""
+    converted = config_data.get("omlx_deepseek_v41")
+    if (
+        config_data.get("model_type") != "deepseek_v41" or "quantization" in config_data
+        or not isinstance(converted, dict) or converted.get("version") != 1
+    ):
+        return None
+    modules = {}
+    for name, spec in (converted.get("quantized_modules") or {}).items():
+        path = _omlx_deepseek_v41_name(f"{name}.weight").removesuffix(".weight").replace(".ffn.experts.", ".ffn.switch_mlp.")
+        path = re.sub(r"\.shared_experts\.(w[123])$", lambda match: f".shared_experts.{_DEEPSEEK_REFERENCE_PROJECTIONS[match[1]]}", path)
+        # quantize_input is left out: it marks the source's FP8 projections, whose inputs mlx-vlm already rounds to FP8.
+        modules[path] = {"group_size": spec.get("group_size", 32), "bits": spec["bits"], "mode": spec["mode"]}
+    if not modules:
+        return None
+    # The routed experts hold the bytes, so their most common format reads as the checkpoint's.
+    specs = [spec for path, spec in modules.items() if ".switch_mlp." in path] or list(modules.values())
+    base = max(specs, key = specs.count)
+    return {**base, **modules}
+
+
+def _ensure_deepseek_v41_omlx_layout(model_type):
+    """Let mlx-vlm's deepseek_v41 sanitize read DeepSeek-V4.1 oQ quants, dropping their DSpark stages as it does a source's."""
+    if model_type != "deepseek_v41":
+        return
+    try:
+        from mlx_vlm.models.deepseek_v41.deepseek_v41 import Model as model
+    except Exception:
+        return
+    if getattr(model.sanitize, "_unsloth_omlx_layout", False):
+        return
+    original = model.sanitize
+
+    def sanitize(self, weights):
+        weights = {
+            _omlx_deepseek_v41_name(key): value for key, value in weights.items()
+            if not key.startswith("language_model.mtp.")
+        }
+        import mlx.core as mx
+
+        # An Engram table kept at source precision (FP8 bytes, E8M0 block scales), which sanitize packs under the source's name.
+        for key in [key for key in weights if key.endswith(".engram.embed.scales")]:
+            weight = weights.get(key.removesuffix("scales") + "weight")
+            if weight is not None and weight.dtype == mx.uint8:
+                weights[key.removesuffix("s")] = weights.pop(key)
+        return original(self, weights)
+
+    sanitize._unsloth_omlx_layout = True
+    model.sanitize = sanitize
+
+
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
     """Let DeepSeek-OCR remote config imports survive newer Transformers.
 
@@ -1009,6 +1077,9 @@ def _normalize_tokenizer_config_extra_special_tokens(
 
 
 def _mlx_vlm_config_override_data(config_data):
+    quantization = _omlx_deepseek_v41_quantization(config_data)
+    if quantization is not None:
+        return {**config_data, "quantization": quantization}
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     if (
         corrected_model_type is None
@@ -10449,6 +10520,7 @@ class FastMLXModel:
             _ensure_minicpmv4_7_text_positions(model_type)
             _ensure_audio_conv_sanitize(model_type)
             _ensure_qwen3_omni_audio_per_clip(model_type)
+            _ensure_deepseek_v41_omlx_layout(model_type)
             _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(

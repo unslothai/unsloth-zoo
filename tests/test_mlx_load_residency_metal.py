@@ -8,6 +8,7 @@ import gc
 import inspect
 import json
 import os
+import re
 import sys
 import threading
 import warnings
@@ -119,6 +120,83 @@ def test_glm5_next_fused_layers_take_their_checkpoint_bits(monkeypatch):
     model = glm.Model.__new__(glm.Model)
     load = lambda *_, **__: [_quantization_for_module_path(quantization, f"language_model.model.layers.3.{p}", model) for p in fused]
     assert _load_mlx_vlm_with_extra_weight_filter("glm", "glm5_next", load, {}) == bits
+
+
+# oQ2e's layout (affine, a requantized Engram table) and oQ4e-ngram's (the source's MXFP4/FP8, its FP8 Engram table).
+@pytest.mark.parametrize("layout", ["oQ2e", "oQ4e-ngram"])
+def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
+    v41 = pytest.importorskip("mlx_vlm.models.deepseek_v41.deepseek_v41")
+    from mlx_vlm.models.deepseek_v41.config import ModelConfig
+    from mlx_vlm.utils import load_model
+    from unsloth_zoo.mlx.loader import (
+        _ensure_deepseek_v41_omlx_layout, _ensure_native_vlm_weight_names, _global_quant_params, _mlx_vlm_config_override_data,
+    )
+
+    text = dict(vocab_size = 512, hidden_size = 256, moe_intermediate_size = 128, num_hidden_layers = 4, num_attention_heads = 4,
+                head_dim = 64, qk_rope_head_dim = 32, q_lora_rank = 128, o_lora_rank = 64, o_groups = 2, n_routed_experts = 8,
+                num_experts_per_tok = 2, sliding_window = 16, compress_ratios = [0, 2, 1, 1], kv_source_layer_ids = [1, 2],
+                index_source_layer_ids = [1, 2, 3], index_n_heads = 2, index_head_dim = 64, candidate_source_layer_id = 2,
+                engram_layer_ids = [1], engram_num_embeddings = [1024], engram_n_heads = 2, engram_head_dim = 64)
+    config = {"model_type": "deepseek_v41", "text_config": text, "vision_config": {"num_hidden_layers": 1, "hidden_size": 64}}
+    model = v41.Model(ModelConfig.from_dict(json.loads(json.dumps(config))))
+    mx.random.seed(0)
+    model.update(tree_map(lambda value: mx.random.normal(value.shape) * 0.05, model.parameters()))
+    mxfp = layout == "oQ4e-ngram"
+    mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    source_fp8 = lambda path: ".compressor." not in path and not path.endswith(("indexer.wk", "weights_proj"))
+
+    def quantized_as(path, module):
+        if not hasattr(module, "to_quantized") or path.startswith(("vision", "aligner")) or path.endswith(
+            ("head", "embed_tokens", "ffn.gate", "engram.embed", "wo_a")
+        ):
+            return False
+        if ".switch_mlp." in path:  # 2-bit, one layer 3-bit, as oQ2.5e's
+            return {"group_size": 32, "bits": 4, "mode": "mxfp4"} if mxfp else {"group_size": 64, "bits": 3 if ".layers.3." in path else 2, "mode": "affine"}
+        if path.endswith("engram.wkv"):
+            return mxfp8
+        # oQ4e keeps the source's FP8 projections and its bf16 compressor and indexer keys; oQ2e takes all to 8-bit.
+        if mxfp:
+            return mxfp8 if source_fp8(path) else False
+        return {"group_size": 64, "bits": 8, "mode": "affine"}
+
+    specs = {}
+    nn.quantize(model, class_predicate = lambda path, module: specs.setdefault(path, quantized_as(path, module)))
+    params = dict(tree_flatten(model.parameters()))
+    names = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+
+    def omlx(key):  # its source's names under language_model.: embed, routed (stacked) and shared experts' w1/w2/w3, vision ffn
+        key = key.replace("language_model.embed_tokens.", "language_model.embed.").replace(".switch_mlp.", ".experts.")
+        key = re.sub(r"(\.experts|\.shared_experts)\.(\w+_proj)\.", lambda match: f"{match[1]}.{names[match[2]]}.", key)
+        return re.sub(r"^(vision\.blocks\.\d+)\.mlp\.", r"\1.ffn.", key)
+
+    floats = lambda key, value: value.astype(mx.bfloat16) if value.dtype == mx.float32 and "hc_" not in key and "gate.bias" not in key else value
+    stored = {omlx(key): floats(key, value.reshape(-1, value.shape[-1]) if key.endswith("wo_a.weight") else value) for key, value in params.items()}
+    table = "language_model.layers.1.engram.embed."
+    packed = dict(zip(("weight", "scales", "biases"), mx.quantize(stored[table + "weight"], 32, 8 if mxfp else 4, mode = "mxfp8" if mxfp else "affine")))
+    stored.update({table + name: value.view(mx.uint8) if mxfp and name == "weight" else value for name, value in packed.items()})
+    stored["language_model.mtp.0.ffn.experts.w1.weight"] = mx.zeros((8, 128, 64), mx.uint32)  # a DSpark stage, not built
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), stored)
+    # As omlx records them: under its own module names, an affine entry marking the source's FP8 inputs, an MXFP entry
+    # with no group size.
+    quantized = {
+        omlx(f"{path}.weight").removesuffix(".weight"):
+            {**spec, "quantize_input": source_fp8(path)} if spec["mode"] == "affine" else {"bits": spec["bits"], "mode": spec["mode"]}
+        for path, spec in specs.items() if spec
+    }
+    quantized["language_model.mtp.0.ffn.experts.w1"] = {"bits": 4, "mode": "mxfp4"}
+    config = _mlx_vlm_config_override_data({**config, "omlx_deepseek_v41": {"version": 1, "quantized_modules": quantized}})
+    # The experts' format reads as the checkpoint's, so a load_in_4bit request takes it as it is.
+    experts = {"group_size": 32, "bits": 4, "mode": "mxfp4"} if mxfp else {"group_size": 64, "bits": 2, "mode": "affine"}
+    assert _global_quant_params(config["quantization"]) == experts
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    _ensure_deepseek_v41_omlx_layout("deepseek_v41")
+    _ensure_native_vlm_weight_names("deepseek_v41")
+    loaded = dict(tree_flatten(load_model(tmp_path).parameters()))
+    assert loaded.keys() == params.keys() | {table + name for name in packed}
+    for key, value in loaded.items():  # values too: w1 and w3 share a shape
+        want = packed[key.removeprefix(table)] if key.startswith(table) else floats(key, params[key])
+        want = want.astype(mx.float32) if key.endswith(("ffn.gate.weight", "head.weight")) else want
+        assert value.dtype == want.dtype and mx.array_equal(value, want), key
 
 
 def test_lazy_weights_env_leaves_the_load_lazy(tmp_path, monkeypatch):
