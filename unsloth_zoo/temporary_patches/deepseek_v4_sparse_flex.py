@@ -41,10 +41,8 @@ DEEPSEEK_V4_FLEX_STATS = {"flex": 0, "eager": 0}
 _BLOCK = 128
 # Decode (one query) never benefits; chunked prefill of a few queries over a long cache does.
 _MIN_Q_LEN = 16
-# head_dim 512 needs small tiles. Measured fwd + bwd at the V4-Flash attention shape (64 heads, S 4096,
-# B200, bf16): 32 x 32 tiles with 8 warps and 1 stage take 35 ms, the same tiles with 4 warps 205 ms,
-# eager 55 ms. 64-row forward tiles and 64-wide backward tiles fault (misaligned address) at this head
-# dim, so they are not used. No faults with these tiles on A100 / H100 / B200.
+# head_dim 512: 32 x 32 tiles, 8 warps, 1 stage (B200 S 4096: 35 ms vs 205 ms with 4 warps, eager 55 ms);
+# 64-wide tiles fault (misaligned address) at this head dim.
 _KERNEL_OPTIONS = {
     "BLOCK_M": 32,
     "BLOCK_N": 32,
@@ -55,16 +53,12 @@ _KERNEL_OPTIONS = {
     "num_warps": 8,
     "num_stages": 1,
 }
-# The single KV head is expanded (stride 0, no copy) to one per query head: with grouped-query packing
-# (64 query heads per KV head) the same call took 180-210 ms. Autograd sums the expanded gradient back.
+# Stride-0 expansion of the single KV head: grouped-query packing (64:1) took 180-210 ms.
 _CSA = "compressed_sparse_attention"
-# Minimum key length (sliding tokens + compressed entries) per GPU generation, from one V4-Flash
-# attention layer fwd + bwd, eager vs flex, torch 2.10 and 2.14:
-#   H100 / B200: flex faster for every layer type from 4096 keys (2048: slower on torch 2.10).
-#   A100: HCA / sliding faster from 4096; CSA 8-14% slower at 2048 / 4096, and eager runs out of
-#   memory at 8192 on a 40 GB card, so CSA starts at 8192.
-# Other parts (sm86 / sm89 / sm120 with ~101 KB shared memory per block, T4, ROCm) stay eager unless
-# UNSLOTH_SPARSE_ATTN_FLEX=1. UNSLOTH_SPARSE_ATTN_FLEX_MIN_KEYS=N replaces every threshold.
+# Minimum key length (sliding + compressed) from one V4-Flash layer fwd + bwd, eager vs flex:
+# H100 / B200 4096 for every layer type; A100 4096 for HCA / sliding, 8192 for CSA (8-14% slower
+# below). ~101 KB shared-memory cards, T4 and ROCm stay eager. UNSLOTH_SPARSE_ATTN_FLEX_MIN_KEYS=N
+# replaces every threshold.
 _MIN_KEYS = {
     9: {None: 4096},
     10: {None: 4096},
