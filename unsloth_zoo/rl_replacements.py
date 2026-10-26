@@ -1119,10 +1119,22 @@ def grpo_compute_loss(
         # compute_policy_loss_vanilla clamps the log ratio to [-20, 20] too.
         log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
 
+    # verl replaces response_mask with response_mask * keep before the policy loss, so a rejected
+    # token is not part of the objective at all. Zero its log ratio before the exp (select, so its
+    # gradient is exactly 0 and an overflowing pi_theta / pi_old gap cannot backprop inf * 0 = nan,
+    # cf. SkyRL safe_exp_delta) and drop it from the sequence mean, else it still scales the
+    # surviving tokens' gradient through the shared GSPO ratio. vespo keeps the raw log ratio: its
+    # gamma weight is detached and clamps on its own.
+    ratio_log_ratio = log_ratio
+    ratio_mask = mask
+    if rs_keep is not None:
+        ratio_log_ratio = torch.where(rs_keep, log_ratio, 0.0)
+        ratio_mask = mask * rs_keep.to(mask.dtype)
+
     if importance_sampling_level == "token":
-        log_importance_weights = log_ratio
+        log_importance_weights = ratio_log_ratio
     elif importance_sampling_level == "sequence":
-        log_importance_weights = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+        log_importance_weights = (ratio_log_ratio * ratio_mask).sum(-1) / ratio_mask.sum(-1).clamp(min=1.0)
         log_importance_weights = log_importance_weights.unsqueeze(-1)
     else:
         raise ValueError(
