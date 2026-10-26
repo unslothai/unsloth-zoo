@@ -712,6 +712,8 @@ def test_ce_rejects_out_of_range_targets(bad):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA only")
+@pytest.mark.skipif(os.name == "nt" and torch.version.hip is not None,
+                    reason = "a device-side assert hangs the Windows ROCm driver and takes the host down with it")
 @pytest.mark.parametrize("bad", [-1, 64])
 def test_ce_out_of_range_target_is_a_device_assert_on_cuda(bad):
     # The device-side assert poisons the CUDA context, so run it in a subprocess.
