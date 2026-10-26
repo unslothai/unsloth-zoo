@@ -54,6 +54,26 @@ def test_launch_info_needs_every_torchrun_variable():
         assert vu._torchrun_launch_info({**_TORCHRUN_ENV, **bad}) is None, bad
 
 
+def test_target_device_is_device_0_outside_torchrun(monkeypatch):
+    """vLLM's own executor takes device 0 whatever is current; a torchrun rank uses its own."""
+    for key in vu._TORCHRUN_ENV_KEYS + ("TORCHELASTIC_RUN_ID",):
+        monkeypatch.delenv(key, raising = False)
+    monkeypatch.setattr(vu, "_current_device_index", lambda: 1)
+    assert vu.get_target_device().index == 0
+    assert vu.get_target_device(3).index == 3
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    assert vu.get_target_device().index == 1
+
+
+def test_current_device_index_is_an_int_on_cpu(monkeypatch):
+    monkeypatch.setattr(vu, "DEVICE_TYPE", "cpu")
+    assert vu._current_device_index() == 0
+
+
 def test_process_group_timeout_env(monkeypatch):
     monkeypatch.delenv("UNSLOTH_DDP_TIMEOUT", raising = False)
     assert vu._process_group_timeout() == 1800
