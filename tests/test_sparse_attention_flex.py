@@ -29,9 +29,22 @@ import torch
 import torch.nn.functional as F
 
 transformers = pytest.importorskip("transformers")
-minimax = importlib.util.find_spec("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
-dsa = importlib.util.find_spec("transformers.models.deepseek_v32.modeling_deepseek_v32")
-glm = importlib.util.find_spec("transformers.models.glm_moe_dsa.modeling_glm_moe_dsa")
+
+
+def _find_spec(name):
+    # find_spec on a dotted name imports the parent package, which raises on transformers
+    # releases that do not ship it (4.57.6 has no minimax_m3_vl).
+    try:
+        return importlib.util.find_spec(name)
+    except ModuleNotFoundError:
+        return None
+
+
+minimax = _find_spec("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+dsa = _find_spec("transformers.models.deepseek_v32.modeling_deepseek_v32")
+glm = _find_spec("transformers.models.glm_moe_dsa.modeling_glm_moe_dsa")
+
+
 def _tested_transformers():
     from packaging.version import Version
     return Version(transformers.__version__.split("+")[0]) >= Version("5.17.0")
