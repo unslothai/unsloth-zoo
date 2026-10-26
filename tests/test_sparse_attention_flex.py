@@ -645,9 +645,10 @@ def test_dsa_flex_keeps_finite_mask_biases_in_float32():
     q, k, v = (torch.randn(B, H, S, D, device = "cuda") for _ in range(3))
     ref, ref_g = _grads(lambda a, b, c: _dense(a, b, c, dense, 0.125), q, k, v)
     got, got_g = _grads(lambda a, b, c: sb.dsa_flex_attention(a, b, c, topk_idx, mask, 0.125), q, k, v)
-    assert _rel(got, ref) < 1e-4, _rel(got, ref)
+    # fp32 flex runs its dots in TF32 on torch 2.10 (7e-4 here); dropping the biases was 0.59.
+    assert _rel(got, ref) < 2e-3, _rel(got, ref)
     for name, a, b in zip("qkv", got_g, ref_g):
-        assert _rel(a, b) < 1e-3, (name, _rel(a, b))
+        assert _rel(a, b) < 5e-3, (name, _rel(a, b))
 
 
 @needs_models
