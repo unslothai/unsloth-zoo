@@ -1315,6 +1315,31 @@ def test_a_separate_mtp_head_checkpoint_is_wrapped_as_the_built_in_head(qwen_mtp
 
 
 
+def test_an_assistant_merged_into_its_target_checkpoint_is_built_as_its_own_checkpoint_would_be(gemma, tmp_path):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.utils import get_model_path
+    from unsloth_zoo.mlx.speculative import AssistantDrafter, has_native_mtp_head, native_mtp_drafter
+    model, _, companion = gemma
+    assistant, target = get_model_path(GEMMA_ASSISTANT), json.loads((get_model_path(GEMMA) / "config.json").read_text())
+    # As omlx merges it: the assistant's config inside the target's, its weights under language_model.mtp.
+    target["text_config"]["mtp_assistant_config"] = json.loads((assistant / "config.json").read_text())
+    tensors = {f"language_model.mtp.{key}": value for key, value in mx.load(str(assistant / "model.safetensors")).items()}
+    # Beside a target tensor, which the build must leave out.
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {**tensors, "language_model.model.norm.weight": mx.ones(8)}, metadata = {"format": "mlx"})
+    (tmp_path / "config.json").write_text(json.dumps(target))
+    assert has_native_mtp_head(tmp_path) and not has_native_mtp_head(get_model_path(GEMMA))
+    drafter = native_mtp_drafter(tmp_path, model)
+    built, expected = dict(tree_flatten(drafter.model.parameters())), dict(tree_flatten(companion.model.parameters()))
+    assert type(drafter) is AssistantDrafter and built.keys() == expected.keys()
+    # Dtypes too: the stored int64 token ordering is the assistant's int32 only after its own sanitize.
+    assert all(built[key].dtype == value.dtype and mx.array_equal(built[key], value) for key, value in expected.items())
+    # Only a Gemma 4 assistant drafts against its target's KV, so neither another family's nor another Gemma 4 drafter kind is a head.
+    for model_type in ("muse_glimmer_assistant", "gemma4_dflash"):
+        target["text_config"]["mtp_assistant_config"]["model_type"] = model_type
+        (tmp_path / "config.json").write_text(json.dumps(target))
+        assert not has_native_mtp_head(tmp_path)
+
+
 def test_assistant_drafts_from_the_target_kv_alone_and_in_batches(gemma, monkeypatch):
     from unsloth_zoo.mlx.generate import SamplingParams
     model, ids, drafter = gemma

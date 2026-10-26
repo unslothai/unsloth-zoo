@@ -1980,20 +1980,56 @@ def _native_mtp_head(path: Path) -> tuple | None:
     return splitter, source_config, text_config, rename, list(files.items())
 
 
+_MERGED_ASSISTANT_PREFIX = "language_model.mtp."
+
+
+def _merged_assistant(path: Path) -> tuple | None:
+    """``(config, [(file, keys)])`` of a Gemma 4 assistant omlx merges into its target's checkpoint: the assistant's own
+    config at ``text_config.mtp_assistant_config``, its weights under ``language_model.mtp.``; or None."""
+    try:
+        config = (json.loads((path / "config.json").read_text()).get("text_config") or {}).get("mtp_assistant_config")
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(config, dict) and re.fullmatch(r"gemma4\w*_assistant", str(config.get("model_type")))):
+        return None
+    files = {}
+    for key, file in _checkpoint_keys(path).items():
+        if key.startswith(_MERGED_ASSISTANT_PREFIX):
+            files.setdefault(file, []).append(key)
+    return (config, list(files.items())) if files else None
+
+
 def has_native_mtp_head(model_path: str | Path) -> bool:
-    """Whether ``native_mtp_drafter`` finds an MTP head in the checkpoint at ``model_path``."""
-    return _native_mtp_head(Path(model_path)) is not None
+    """Whether ``native_mtp_drafter`` finds an MTP head, or a merged Gemma 4 assistant, in the checkpoint at ``model_path``."""
+    return _native_mtp_head(Path(model_path)) is not None or _merged_assistant(Path(model_path)) is not None
 
 
-def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
+def _merged_assistant_drafter(path: Path, target: nn.Module, *, lazy: bool) -> AssistantDrafter | None:
+    merged = _merged_assistant(path)
+    if merged is None:
+        return None
+    config, selected = merged
+    module = importlib.import_module(f"mlx_vlm.speculative.drafters.{config['model_type']}")
+    model = module.Model(module.ModelConfig.from_dict(config))
+    weights = {}
+    for file, keys in selected:
+        shard = mx.load(str(file))
+        weights.update((key.removeprefix(_MERGED_ASSISTANT_PREFIX), shard[key]) for key in keys)
+    # omlx keeps the merged assistant unquantized.
+    model.load_weights(list(model.sanitize(weights).items()), strict = True)
+    return _built(AssistantDrafter, model, target, lazy = lazy)
+
+
+def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | AssistantDrafter | None:
     """A drafter for the target's own MTP head, built in memory from only the MTP tensors of its
-    checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
+    checkpoint as mlx-vlm's MTP splitter would write it, or from a Gemma 4 assistant merged into it
+    (``_merged_assistant``); None when the checkpoint has neither."""
     from mlx_vlm.fp8 import transform_fp8_weights
     from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors
 
     head = _native_mtp_head(Path(model_path))
     if head is None:
-        return None
+        return _merged_assistant_drafter(Path(model_path), target, lazy = lazy)
     splitter, source_config, text_config, rename, selected = head
     module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
     if not hasattr(module, "Model"):
