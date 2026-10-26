@@ -201,3 +201,19 @@ def test_tie_gradient_and_empty_rows():
                           ref, rtol = 1e-12, atol = 0)
     compiled = torch.compile(cross_entropy_rows, backend = "eager", fullgraph = True)
     assert compiled(torch.zeros(0, 5), torch.zeros(0, dtype = torch.long)).shape == (0,)
+
+
+def test_rows_ce_offset_logits_and_float64():
+    from unsloth_zoo.fused_losses.stable_softmax import cross_entropy_rows
+
+    # A large shared offset: the backward must normalise like the forward ([-0.5, 0.5], as stock).
+    z = torch.tensor([[1e8, 1e8]], requires_grad = True)
+    cross_entropy_rows(z, torch.tensor([0])).sum().backward()
+    assert torch.equal(z.grad, torch.tensor([[-0.5, 0.5]]))
+    # float64 logits keep float64 math: 1e8 and 1e8 + 1 are equal in float32.
+    z = torch.tensor([[1e8, 1e8 + 1]], dtype = torch.float64, requires_grad = True)
+    nll = cross_entropy_rows(z, torch.tensor([0]))
+    ref = F.cross_entropy(z.detach(), torch.tensor([0]), reduction = "none")
+    assert nll.dtype == torch.float64 and torch.allclose(nll, ref, rtol = 1e-12)
+    nll.sum().backward()
+    assert torch.allclose(z.grad, torch.softmax(z.detach(), -1) - torch.tensor([[1.0, 0.0]], dtype = torch.float64))

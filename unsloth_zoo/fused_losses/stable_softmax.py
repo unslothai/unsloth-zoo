@@ -90,27 +90,40 @@ def _row_chunks(n_rows, vocab_size):
     return max(1, min(n_rows, _ROWS_CHUNK_BYTES // max(4 * vocab_size, 1)))
 
 
+def _acc(dtype):
+    return torch.promote_types(dtype, torch.float32)  # half -> float32, float64 stays float64
+
+
 def _rows_forward(chunk, target):
-    return target_logprob(chunk.float(), target)
+    # Saves the row max and the logsumexp relative to it: an absolute lse rounds away the normaliser once
+    # the logits share a large offset, and exp(z - lse) would then disagree with the forward.
+    z = chunk.to(_acc(chunk.dtype))
+    m = z.detach().amax(-1)
+    logp, lse_c = target_logprob(z - m.unsqueeze(-1), target)
+    return logp, lse_c, m
 
 
-def _rows_backward(chunk, target, logp, lse, grad_nll):
+def _rows_backward(chunk, target, logp, lse_c, m, grad_nll):
     # d nll / dz = p - onehot, with p_t - 1 = expm1(logp) for the target.
-    z = chunk.float()
-    p = torch.exp(z - lse.unsqueeze(-1))
+    z = chunk.to(logp.dtype)
+    p = torch.exp((z - m.unsqueeze(-1)) - lse_c.unsqueeze(-1))
     is_target = torch.arange(z.shape[-1], device = z.device) == target.unsqueeze(-1)
-    return (torch.where(is_target, torch.expm1(logp).unsqueeze(-1), p) * grad_nll.float().unsqueeze(-1)).to(chunk.dtype)
+    grad = torch.where(is_target, torch.expm1(logp).unsqueeze(-1), p) * grad_nll.to(logp.dtype).unsqueeze(-1)
+    return grad.to(chunk.dtype)
 
 
 @torch.no_grad()
 def _rows_forward_eager(chunk, target):
-    return target_logprob_(chunk.to(torch.float32, copy = True), target)
+    z = chunk.to(_acc(chunk.dtype), copy = True)
+    m = z.amax(-1)
+    logp, lse_c = target_logprob_(z.sub_(m.unsqueeze(-1)), target)
+    return logp, lse_c, m
 
 
-def _rows_backward_eager(chunk, target, logp, lse, grad_nll):
-    p = torch.exp(chunk.to(torch.float32) - lse.unsqueeze(-1))
+def _rows_backward_eager(chunk, target, logp, lse_c, m, grad_nll):
+    p = torch.exp((chunk.to(logp.dtype) - m.unsqueeze(-1)) - lse_c.unsqueeze(-1))
     p.scatter_(-1, target.unsqueeze(-1), torch.expm1(logp).unsqueeze(-1))
-    return p.mul_(grad_nll.to(torch.float32).unsqueeze(-1))
+    return p.mul_(grad_nll.to(logp.dtype).unsqueeze(-1)).to(chunk.dtype)
 
 
 _COMPILED_ROWS = {}
@@ -157,18 +170,17 @@ class _CrossEntropyRows(torch.autograd.Function):
         n_rows, vocab_size = logits.shape
         rows = _row_chunks(n_rows, vocab_size)
         forward, _ = _rows_impl(logits)
-        logp = torch.empty(n_rows, dtype = torch.float32, device = logits.device)
-        lse = torch.empty(n_rows, dtype = torch.float32, device = logits.device)
+        logp, lse_c, m = (torch.empty(n_rows, dtype = _acc(logits.dtype), device = logits.device) for _ in range(3))
         for start in range(0, n_rows, rows):
             end = min(start + rows, n_rows)
-            logp[start:end], lse[start:end] = _run_rows(
+            logp[start:end], lse_c[start:end], m[start:end] = _run_rows(
                 forward, _rows_forward_eager, logits[start:end], target[start:end])
-        ctx.save_for_backward(logits, target, logp, lse)
+        ctx.save_for_backward(logits, target, logp, lse_c, m)
         return -logp
 
     @staticmethod
     def backward(ctx, grad_nll):
-        logits, target, logp, lse = ctx.saved_tensors
+        logits, target, logp, lse_c, m = ctx.saved_tensors
         n_rows, vocab_size = logits.shape
         rows = _row_chunks(n_rows, vocab_size)
         _, backward = _rows_impl(logits)
@@ -177,12 +189,13 @@ class _CrossEntropyRows(torch.autograd.Function):
             end = min(start + rows, n_rows)
             grad[start:end] = _run_rows(
                 backward, _rows_backward_eager,
-                logits[start:end], target[start:end], logp[start:end], lse[start:end], grad_nll[start:end])
+                logits[start:end], target[start:end], logp[start:end], lse_c[start:end], m[start:end],
+                grad_nll[start:end])
         return grad, None
 
 
 def cross_entropy_rows(logits, target, ignore_index = -100):
-    """Per row float32 nll of logits [N, V], 0 on ignored rows (F.cross_entropy(reduction = "none"))."""
+    """Per row nll of logits [N, V] (float32, float64 for float64 logits), 0 on ignored rows."""
     keep = target != ignore_index
     safe = torch.where(keep, target, torch.zeros_like(target))
     nll = _CrossEntropyRows.apply(logits, safe)
