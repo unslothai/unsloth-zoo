@@ -549,16 +549,22 @@ def test_a_request_threads_lazy_output_does_not_fail_the_next(tmp_path):
         np.testing.assert_array_equal(got, _bits(want))
 
 
-@pytest.mark.parametrize("v41", [False, True])
-def test_experts_a_checkpoint_stores_apart(tmp_path, v41):
-    # As GLM-5's: one tensor per expert, which mlx-vlm stacks at load; DeepSeek V4.1's, under reference names.
+# As GLM-5's: one tensor per expert, which mlx-vlm stacks at load; DeepSeek V4.1's, under reference names, apart or
+# stacked (as omlx converts it, beside DSpark draft stages no load holds); stacked under experts. by projection name.
+@pytest.mark.parametrize("v41, apart", [(False, True), (True, True), (True, False), (False, False)])
+def test_experts_a_checkpoint_stores_under_other_names(tmp_path, v41, apart):
     stock = _moe("vlm" if v41 else "lm", v41 = v41)
     stacked = dict(tree_flatten(stock.parameters()))
     names = {p: (p, n) for p, n in (("gate_proj", "w1"), ("down_proj", "w2"), ("up_proj", "w3"))} if v41 else {}
-    for shard in range(2):  # an expert's tensors may sit in any shard
+    for shard in range(2 if apart else 0):  # an expert's tensors may sit in any shard
         mx.save_safetensors(str(tmp_path / f"model-{shard}.safetensors"), {
             name.replace("switch_mlp.", f"experts.{expert}.").replace(*names.get(name.split(".")[-2], ("", ""))): value[expert]
             for name, value in stacked.items() for expert in range(shard, value.shape[0], 2)
+        })
+    if not apart:
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), {
+            prefix + name.replace("switch_mlp.", "experts.").replace(*names.get(name.split(".")[-2], ("", ""))): value
+            for name, value in stacked.items() for prefix in ("", "language_model.mtp.0.")
         })
     (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 4}))
     model = _moe("vlm" if v41 else "lm", v41 = v41).load_weights(list(stacked.items()))
