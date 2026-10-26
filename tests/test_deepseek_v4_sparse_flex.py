@@ -34,6 +34,9 @@ if Version(transformers.__version__).release < (5, 17):
 from unsloth_zoo.temporary_patches import deepseek_v4_sparse_flex as F4  # noqa: E402
 
 F4.patch_deepseek_v4_sparse_flex()
+# The patch declines (torch < 2.10, no flex BlockMask, changed upstream source); then there is nothing to test.
+if not hasattr(modeling.eager_attention_forward, "_unsloth_original"):
+    pytest.skip("the DeepSeek-V4 flex patch did not install here", allow_module_level = True)
 ORIGINAL = modeling.eager_attention_forward._unsloth_original
 
 CUDA = torch.cuda.is_available()
