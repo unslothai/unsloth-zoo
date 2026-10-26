@@ -23,9 +23,8 @@ the budget and run flex attention over a BlockMask built from the selection abov
 their fp32 score buffers stay bounded.
 
 Engaged automatically on CUDA sm80+ / ROCm with Triton, bf16 / fp16, no attention dropout,
-no output_attentions, q_len >= 16. DSA keeps dense masked SDPA (still with the chunked
-indexer) where torch picks cuDNN for that masked call, which beats flex there (H100, torch 2.14). A flex failure latches that shape class back to the
-dense path. Kill switches: UNSLOTH_SPARSE_ATTN_FLEX=0, UNSLOTH_SPARSE_INDEXER_CHUNKED=0.
+no output_attentions, q_len >= 16, outside an enclosing torch.compile (there the model's own
+path runs). A flex failure latches that shape class back to the dense path. Kill switches: UNSLOTH_SPARSE_ATTN_FLEX=0, UNSLOTH_SPARSE_INDEXER_CHUNKED=0.
 The patched forwards are installed on transformers >= 5.17 when the installed source matches
 the layout they reimplement (DSA caches expanded K / V on 5.17, the latent on 5.18+);
 otherwise the model is left untouched.

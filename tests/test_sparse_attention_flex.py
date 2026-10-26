@@ -535,3 +535,95 @@ def test_indexer_forward_without_class_attributes(monkeypatch, family):
             mask = torch.zeros(1, S, S).masked_fill(~torch.ones(S, S, dtype = torch.bool).tril(), float("-inf"))
             out = indexer(x, torch.randn(1, S, config.q_lora_rank), (cos, sin), mask, pos)
     assert out.shape[1] == (S if family != "minimax_m3_vl" else config.index_n_heads)
+
+
+@needs_models
+@gpu
+@pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
+def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
+    """An attention layer under an enclosing torch.compile (fullgraph, dynamic): the BlockMask build plus
+    flex call miscompiled there (MiniMax output 95% off, silently), so the model's own path runs inside a
+    compiled graph. Compiled with flex on == compiled upstream, and eager flex stays close to eager upstream."""
+    import torch._dynamo
+    _patched()
+    torch.manual_seed(0)
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS", "65")
+    S = 512
+    if family == "minimax_m3_vl":
+        config = _minimax_config(hidden_size = 128, head_dim = 64)
+        m = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+        attn = m.MiniMaxM3VLAttention(config, 0)
+    else:
+        config = _dsa_config(family, qk_nope_head_dim = 32, qk_rope_head_dim = 32, v_head_dim = 64)
+        m = importlib.import_module("transformers.models.deepseek_v32.modeling_deepseek_v32")
+        attn = m.DeepseekV32Attention(config, 0)
+    attn = attn.cuda().bfloat16()
+    (cos, sin), pos = _rope(config, family, S, "cuda")
+    rope = (cos.bfloat16(), sin.bfloat16())
+    x = torch.randn(1, S, config.hidden_size, device = "cuda", dtype = torch.bfloat16)
+    mask = torch.zeros(1, 1, S, S, device = "cuda", dtype = torch.bfloat16).masked_fill(
+        ~torch.ones(S, S, dtype = torch.bool, device = "cuda").tril(), float("-inf"))
+
+    def run(flex, compiled):
+        monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_FLEX", "1" if flex else "0")
+        torch._dynamo.reset()
+        attn.zero_grad(set_to_none = True)
+        xx = x.detach().clone().requires_grad_()
+
+        def fn(t):
+            return attn(t, rope, mask, position_ids = pos)[0]
+
+        if compiled:
+            fn = torch.compile(fn, fullgraph = True, dynamic = True)
+        out = fn(xx)
+        out.float().square().mean().backward()
+        return out.detach().float(), xx.grad.float()
+
+    def nrel(a, b):
+        return ((a - b).norm() / b.norm()).item()
+
+    ref, ref_g = run(False, False)
+    before = _stat("flex", family)
+    flex, flex_g = run(True, False)
+    assert _stat("flex", family) == before + 1
+    compiled_ref, compiled_ref_g = run(False, True)
+    got, got_g = run(True, True)
+    # Inside the compiled graph the patch keeps the model's path: same result as compiling upstream.
+    assert nrel(got, compiled_ref) < 1e-3 and nrel(got_g, compiled_ref_g) < 1e-3, (nrel(got, compiled_ref), nrel(got_g, compiled_ref_g))
+    # (Compiled upstream vs eager upstream is not compared: Inductor's fp32 indexer scores can reorder the
+    # DSA top-k, ~5% here, which is upstream's own behaviour.)
+    assert nrel(flex, ref) < 3e-2 and nrel(flex_g, ref_g) < 3e-2, (nrel(flex, ref), nrel(flex_g, ref_g))
+    assert not sb._FAILED, sb._FAILED
+
+
+@needs_models
+@pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
+def test_chunked_indexer_compiles_once_over_lengths(monkeypatch, family):
+    """Inside torch.compile (dynamic) the chunk loop's trip count specialised the graph on the length:
+    one graph per length. One graph now, same selection as eager."""
+    import torch._dynamo
+    monkeypatch.setenv("UNSLOTH_SPARSE_INDEXER_Q_CHUNK", "64")
+    torch.manual_seed(0)
+    config = _minimax_config() if family == "minimax_m3_vl" else _dsa_config(family)
+    m, indexer = _indexer_module(family, config)
+    graphs = []
+
+    def backend(gm, example):
+        graphs.append(gm)
+        return gm.forward
+
+    def fn(x, qr, cos, sin, mask, pos):
+        if family == "minimax_m3_vl":
+            return sb.minimax_m3_select_blocks(indexer, x, (cos, sin), None, pos, m.apply_rotary_pos_emb)
+        return sb.dsa_select_topk(indexer, x, qr, (cos, sin), mask, None, m.apply_rotary_pos_emb)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(fn, backend = backend, fullgraph = True, dynamic = True)
+    for S in (257, 289, 321, 353, 385):
+        (cos, sin), pos = _rope(config, family, S)
+        x = torch.randn(1, S, config.hidden_size)
+        qr = torch.randn(1, S, config.q_lora_rank if family != "minimax_m3_vl" else 32)
+        mask = torch.zeros(1, S, S).masked_fill(~torch.ones(S, S, dtype = torch.bool).tril(), float("-inf"))
+        got = compiled(x, qr, cos, sin, mask, pos)
+        assert torch.equal(got, fn(x, qr, cos, sin, mask, pos))
+    assert len(graphs) == 1, len(graphs)

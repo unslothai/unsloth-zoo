@@ -47,6 +47,22 @@ def _count(kind, model_type):
     record_sparse_attn(kind, model_type)
 
 
+def _q_ranges(q_len, per_row):
+    """Query chunks for the indexers. One chunk inside torch.compile: a loop whose trip count comes from
+    the sequence length specialises the graph on it (one graph per length, and mark_dynamic fails)."""
+    if torch.compiler.is_compiling():
+        return [(0, q_len)]
+    chunk = _q_chunk(per_row)
+    return [(start, min(start + chunk, q_len)) for start in range(0, q_len, chunk)]
+
+
+def _eager_only(name):
+    # Built inside an enclosing compiled graph, the BlockMask tables and the flex call miscompile
+    # (MiniMax: output 95% off, silently). The patched forwards keep the model's own path there.
+    if torch.compiler.is_compiling():
+        raise RuntimeError(f"Unsloth: {name} runs outside torch.compile only.")
+
+
 def _q_chunk(per_row = 1):
     env = os.environ.get("UNSLOTH_SPARSE_INDEXER_Q_CHUNK")
     if env:
@@ -187,10 +203,8 @@ def minimax_m3_select_blocks(indexer, hidden_states, position_embeddings, past_k
     topk = min(indexer.topk_blocks, num_key_blocks)
     k_positions = torch.arange(k_len, device = idx_q.device)
     idx_k_t = idx_k.float().transpose(-1, -2)
-    chunk = _q_chunk(batch * indexer.num_heads * num_key_blocks * block)
     out = []
-    for start in range(0, q_len, chunk):
-        end = min(start + chunk, q_len)
+    for start, end in _q_ranges(q_len, batch * indexer.num_heads * num_key_blocks * block):
         pos = position_ids[:, start:end]
         scores = torch.matmul(idx_q[:, :, start:end].float(), idx_k_t)
         token_future = k_positions[None, None, None, :] > pos[:, None, :, None]
@@ -214,6 +228,7 @@ def minimax_m3_select_blocks(indexer, hidden_states, position_embeddings, past_k
 
 def minimax_m3_flex_attention(query, key, value, block_indices, attention_mask, position_ids, scaling, block_size):
     """Flex attention keeping exactly MiniMaxM3VLIndexer.build_block_mask's pairs; returns [B, S, H, D]."""
+    _eager_only("minimax_m3_flex_attention")
     batch, n_heads, q_len, _ = query.shape
     kv_len = key.shape[2]
     n_idx = block_indices.shape[1]
@@ -274,7 +289,7 @@ def minimax_m3_flex_eligible(module, query, key, attention_mask, kwargs):
         return False
     if key.shape[2] <= indexer.topk_blocks * indexer.block_size or query.shape[2] < 16:
         return False
-    if indexer.block_size % _TILE or kwargs.get("output_attentions"):
+    if indexer.block_size % _TILE or kwargs.get("output_attentions") or torch.compiler.is_compiling():
         return False
     if module.training and module.attention_dropout:
         return False
@@ -302,10 +317,8 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
     k_t = k.transpose(-1, -2).float().unsqueeze(1)  # [B, 1, D, T]
     weights = indexer.weights_proj(hidden_states.to(indexer.weights_proj.weight.dtype)).float() * (indexer.n_heads ** -0.5)
     topk = min(indexer.index_topk, k.shape[1])
-    chunk = _q_chunk(batch_size * indexer.n_heads * k.shape[1])
     out = []
-    for start in range(0, seq_len, chunk):
-        end = min(start + chunk, seq_len)
+    for start, end in _q_ranges(seq_len, batch_size * indexer.n_heads * k.shape[1]):
         scores = torch.matmul(q[:, start:end].float(), k_t) * indexer.softmax_scale
         scores = F.relu(scores)
         index_scores = torch.matmul(weights[:, start:end].unsqueeze(-2), scores).squeeze(-2)
@@ -325,6 +338,7 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling,
     """Flex attention over top-k AND base mask; returns [B, S, H, D_v].
 
     The BlockMask is cached on `topk_indices` so GLM's shared layers reuse it within the step."""
+    _eager_only("dsa_flex_attention")
     cached = getattr(topk_indices, "_unsloth_dsa_flex", None)
     if cached is not None and cached[0] is attention_mask and cached[1] == key.shape[2]:
         _count("flex_reused", model_type)
@@ -360,6 +374,8 @@ def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_key
         return False
     budget = int(module.config.index_topk)
     if key.shape[2] <= budget or query.shape[2] < 16 or kwargs.get("output_attentions"):
+        return False
+    if torch.compiler.is_compiling():
         return False
     if min_keys is not None and key.shape[2] < min_keys:
         return False
