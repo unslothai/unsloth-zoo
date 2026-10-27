@@ -2043,6 +2043,12 @@ _JSD_TRITON_ROWS = os.environ.get("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB") is None
 
 def _jsd_triton(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
     """_jsd_body on CUDA with Triton: two (beta = 0) or three passes over the raw fp32 logits, dz written once."""
+    # Triton launches on the current device: else a head on another card falls back and marks it broken.
+    return _launch(s.device, lambda: _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap,
+                                                         want_grad, grad_dtype))
+
+
+def _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
     R, V = s.shape
     NB = triton.cdiv(V, _JSD_BLOCK)
     flags = dict(S_SCALE = s_scale != 1.0, S_CAP = s_cap != 0.0, T_SCALE = t_scale != 1.0, T_CAP = t_cap != 0.0,
@@ -2429,15 +2435,17 @@ def fused_linear_jsd(
     beta 0 is forward KL(teacher || student), 1 reverse KL, else the generalized JSD with mixture
     ``(1 - beta) p_student + beta p_teacher``. Rows are kept where ``mask`` is non zero and ``labels != ignore_index``
     (either may be omitted). The sum is divided by ``num_items_in_batch`` when given (TRL >= 1.x), else by the kept
-    row count (``reduction = "batchmean"``); a zero divisor counts as 1. The transform is ``* logit_scale`` then
-    softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
+    row count (``reduction = "batchmean"``); a zero divisor counts as 1. With neither labels, mask nor count, TRL 0.x
+    divides 3D logits by batch * sequence (as here), 1.x by batch: pass ``num_items_in_batch`` to pin one. The
+    transform is ``* logit_scale`` then softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
     taken in forward; teacher inputs are never differentiated and may have their own hidden size and device.
     ``scaling`` (fp16 GradScaler) multiplies stored gradients; backward divides it out."""
     beta = float(beta)
     temperature = float(temperature)
     if not 0.0 <= beta <= 1.0:
         raise ValueError(f"Unsloth: GKD beta must be in [0, 1], got {beta}.")
-    if not (temperature > 0.0 and math.isfinite(temperature)):
+    # Not math.isfinite: it graph-breaks on a SymFloat (dynamic = True); NaN / inf fail these comparisons.
+    if not (0.0 < temperature < math.inf):
         raise ValueError(f"Unsloth: GKD temperature must be finite and > 0, got {temperature}.")
     if teacher_weight.shape[0] != student_weight.shape[0]:
         raise ValueError(f"Unsloth: GKD student vocabulary {student_weight.shape[0]} != teacher vocabulary "
