@@ -45,6 +45,7 @@ import functools
 import inspect
 import os
 import re
+import typing
 import warnings
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -671,9 +672,10 @@ def _router_hook(layer_index, compact = None):
         signature = None
         if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
             signature = _input_signature(args, ids2.shape[0])
-        recomputed = None if _STATE.in_forward else _recomputed_routes(
-            layer_index, ids2, signature, _STATE.layer_inputs.get(layer_index),
-        )
+        # Read once and clear: a compiled layer's traced read then sees None, never a stale call's.
+        layer_input = _STATE.layer_inputs.get(layer_index)
+        _STATE.layer_inputs[layer_index] = None
+        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature, layer_input)
         if recomputed is not None:
             _count("router_calls_recomputed")
         if recomputed is _NATURAL:
@@ -727,7 +729,7 @@ def _router_hook(layer_index, compact = None):
             if _STATE.record is not None:
                 # A copy: the output ids may alias forced, and MoE blocks can reuse them in place.
                 _STATE.record[layer_index] = (
-                    _fingerprint(ids2), forced.clone(), valid, signature, _STATE.layer_inputs.get(layer_index),
+                    _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
                 )
         else:
             forced, valid = recomputed
@@ -767,10 +769,57 @@ def _tensor_addresses(values):
     return out
 
 
+def _record_layer_inputs(layer_index, tensors):
+    _STATE.layer_inputs[layer_index] = frozenset(_tensor_addresses(tensors)) or None
+
+
+_LAYER_INPUTS_OP = None
+
+
+def _layer_inputs_op():
+    # data_ptr() is untraceable and a graph break fails fullgraph, so use an opaque op; register eagerly.
+    global _LAYER_INPUTS_OP
+    if _LAYER_INPUTS_OP is not None:
+        return _LAYER_INPUTS_OP
+    for i in range(64):
+        name = "routing_replay_layer_inputs" + (f"_{i}" if i else "")
+        # A reloaded module copy may own the name; custom_op silently re-registers (torch 2.10 segfaults).
+        if hasattr(torch.ops.unsloth_zoo, name):
+            continue
+        try:
+            op = torch.library.custom_op(f"unsloth_zoo::{name}", mutates_args = ())(_layer_inputs_impl)
+        except RuntimeError:
+            continue
+        op.register_fake(_layer_inputs_fake)
+        _LAYER_INPUTS_OP = getattr(torch.ops.unsloth_zoo, name).default
+        if hasattr(torch.fx.node, "has_side_effect"):
+            # No outputs: else DCE may drop it.
+            torch.fx.node.has_side_effect(_LAYER_INPUTS_OP)
+        return _LAYER_INPUTS_OP
+    raise RuntimeError("Unsloth: could not register the routing replay layer input op.")
+
+
+# typing.List, not list[...]: torch < 2.7 infer_schema rejects the builtin generic.
+def _layer_inputs_impl(layer_index: int, tensors: typing.List[torch.Tensor]) -> None:
+    _record_layer_inputs(layer_index, tensors)
+
+
+def _layer_inputs_fake(layer_index, tensors):
+    return None
+
+
 def _layer_pre_hook(layer_index):
     def hook(module, args, kwargs):
         # Read in compiled layers too: dropping these leaves identical forwards ambiguous.
-        _STATE.layer_inputs[layer_index] = frozenset(_tensor_addresses(list(args) + list(kwargs.values()))) or None
+        tensors = [
+            x for value in list(args) + list(kwargs.values())
+            for x in (value if isinstance(value, (tuple, list)) else (value,))
+            if torch.is_tensor(x)
+        ]
+        if torch.compiler.is_compiling():
+            _LAYER_INPUTS_OP(layer_index, tensors)
+        else:
+            _record_layer_inputs(layer_index, tensors)
         return None
 
     return hook
@@ -815,6 +864,7 @@ def install_routing_replay(model, llm = None, tokenizer = None):
     for layer_index, module in routers:
         compact = (moe_layers.index(layer_index), len(moe_layers)) if dense else None
         module.register_forward_hook(_router_hook(layer_index, compact))
+    _layer_inputs_op()
     for layer_index in moe_layers:
         if layer_index < len(decoder.layers):
             decoder.layers[layer_index].register_forward_pre_hook(_layer_pre_hook(layer_index), with_kwargs = True)
