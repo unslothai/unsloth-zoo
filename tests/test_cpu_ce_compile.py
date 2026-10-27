@@ -101,6 +101,11 @@ def _overflow_loss(hidden, weight, labels):
 
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
 def test_ignored_fp16_row_cannot_overflow_compiled_loss(backend):
+    if backend == "inductor":
+        from unsloth_zoo.cpu.loader import _cpu_compile_unavailable
+        reason = _cpu_compile_unavailable()
+        if reason is not None:
+            pytest.skip(f"Inductor cannot build CPU kernels here: {reason}")
     # Row 0 is ignored but its fp16 logits (2.4e5) overflow: traced code keeps the row, so it must be zeroed first.
     def run(fn):
         hidden = torch.tensor([[60000.0, 60000.0], [0.1, 0.2]], dtype = torch.float16, requires_grad = True)
