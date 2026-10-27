@@ -294,15 +294,17 @@ def flex_attention_with_sink_inference(self_attn, query, key, value, block_mask,
     """Eval / generate attention with sinks on a BlockMask built from absolute positions: padding, unwritten
     cache slots and the window live in the mask, so Q, K, V and the cache are never written."""
     enable_gqa = getattr(self_attn, "num_key_value_groups", 1) != 1
-    scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None) or scale
+    if scale is None:
+        scale = getattr(self_attn, "scaling", None) or getattr(self_attn, "scale", None)
     q_len, kv_len = block_mask.seq_lengths
     if key.shape[-2] > kv_len:
-        # Static caches can hold slots past the mask's KV length; they are invisible anyway.
+        # Pre-allocated cache slots past the mask (transformers 5.x on torch < 2.11): the eager path trims the same.
         key, value = key[:, :, :kv_len], value[:, :, :kv_len]
     elif key.shape[-2] < kv_len:
         block_mask = block_mask._adjust(q_len, key.shape[-2])
-    # One query row: flex_decoding (AUTO). Longer queries can have no valid flex_decoding config (#2100).
-    kwargs = {} if query.shape[-2] == 1 else {"kernel_options": PREFILL_KERNEL_OPTIONS}
+    # One query row: flex_decoding with its own tiles (the per-VRAM training tiles would pad its 8 GQA rows to
+    # BLOCK_M). Longer queries can have no valid flex_decoding config (#2100), so they force the main kernel.
+    kwargs = {"kernel_options": {} if query.shape[-2] == 1 else PREFILL_KERNEL_OPTIONS}
     attn_output, logsumexp = flex_output_and_lse(flex_attention(
         query,
         key,
