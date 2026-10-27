@@ -705,7 +705,8 @@ if _HAS_TRITON:
                                S_SCALE, S_CAP, T_SCALE, T_CAP)
         s = tl.where(ok, s, -float("inf"))
         t = tl.where(ok, t, -float("inf"))
-        ms = tl.max(s, 0)
+        # The block's first student argmax comes with its max (one reduction), for the top token j.
+        ms, js = tl.max(s, 0, return_indices = True, return_indices_tie_break_left = True)
         mt = tl.max(t, 0)
         ls = tl.sum(tl.exp(s - ms), 0)
         lt = tl.sum(tl.exp(t - mt), 0)
@@ -714,7 +715,15 @@ if _HAS_TRITON:
         tl.store(o + 1, ls)
         tl.store(o + 2, mt)
         tl.store(o + 3, lt)
-        tl.store(o + 4, (blk * BLOCK + tl.argmax(s, 0)).to(tl.float32))
+        tl.store(o + 4, (blk * BLOCK + js).to(tl.float32))
+
+    @triton.jit
+    def _fl_add3(a0, a1, a2, b0, b1, b2):
+        return a0 + b0, a1 + b1, a2 + b2
+
+    @triton.jit
+    def _fl_add4(a0, a1, a2, a3, b0, b1, b2, b3):
+        return a0 + b0, a1 + b1, a2 + b2, a3 + b3
 
     @triton.jit
     def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, lse_ptr, c_ptr, j_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
@@ -736,22 +745,27 @@ if _HAS_TRITON:
         q = tl.exp(lt)
         o = part_ptr + (row.to(tl.int64) * NB + blk) * 4
         off = ok & (cols != tl.load(j_ptr + row))
-        tl.store(o + 2, tl.sum(tl.where(off, p, 0.0), 0))
-        tl.store(o + 3, tl.sum(tl.where(off, q, 0.0), 0))
+        p_off = tl.where(off, p, 0.0)
+        q_off = tl.where(off, q, 0.0)
+        # One tuple reduction per block (a reduction each costs a block-wide sync).
         if MODE == 0:
-            tl.store(o, tl.sum(tl.where(off, q * (lt - ls), 0.0), 0))
+            r0, r2, r3 = tl.reduce((q_off * (lt - ls), p_off, q_off), 0, _fl_add3)
             if WRITE_DZ:
                 dz = (p - q) * (tl.load(coef_ptr) * inv_t) * ds
                 tl.store(dz_ptr + row.to(tl.int64) * dz_stride + cols, dz.to(dz_ptr.dtype.element_ty), mask = ok)
         elif MODE == 1:
-            tl.store(o, tl.sum(tl.where(off, p * (ls - lt - tl.load(c_ptr + row)), 0.0), 0))
+            r0, r2, r3 = tl.reduce((p_off * (ls - lt - tl.load(c_ptr + row)), p_off, q_off), 0, _fl_add3)
         else:
             a = ls + log1mb
             b = lt + logb
             mx = tl.maximum(a, b)
             m = mx + tl.log(tl.exp(a - mx) + tl.exp(b - mx))
-            tl.store(o, tl.sum(tl.where(off, q * (lt - m), 0.0), 0))
-            tl.store(o + 1, tl.sum(tl.where(off, p * (ls - m - tl.load(c_ptr + row)), 0.0), 0))
+            r0, r1, r2, r3 = tl.reduce((q_off * (lt - m), p_off * (ls - m - tl.load(c_ptr + row)), p_off, q_off), 0,
+                                       _fl_add4)
+            tl.store(o + 1, r1)
+        tl.store(o, r0)
+        tl.store(o + 2, r2)
+        tl.store(o + 3, r3)
 
     @triton.jit
     def _fl_jsd_dz_kernel(s_ptr, t_ptr, stride, V, lse_ptr, c_ptr, j_ptr, rs_ptr, dz_ptr, dz_stride, coef_ptr, scale_g,
