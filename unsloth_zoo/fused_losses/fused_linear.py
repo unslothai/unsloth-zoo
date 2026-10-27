@@ -1705,9 +1705,7 @@ if _OPS is None:
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
         s = grad_loss.to(acc) / scaling.to(acc)
         need_h, need_w, need_b = ctx.need
-        def scale(x):
-            return torch.ops.unsloth_zoo.fused_linear_scale_rows(x, s, x.dtype)
-
+        scale = _stored_grad_scaler(s, (grad_h, grad_w, grad_b))
         out_h = scale(grad_h) if need_h else None
         out_w = scale(grad_w) if need_w else None
         out_b = scale(grad_b) if need_b else None
@@ -1861,12 +1859,13 @@ _OPS["lp_impl"] = _logprobs_impl
 _OPS["lp_bwd_impl"] = _logprobs_bwd_impl
 
 
-def _scale_rows_impl(u, g, dtype):
+def _scale_rows_impl(u, g, dtype, out = None):
     # half * 0-dim fp32 would round g to half (0.2% off).
     sd = _stat_dtype(u.dtype)
     g = g.reshape(-1, 1).to(device = u.device, dtype = sd)
     one = g.shape[0] == 1
-    out = torch.empty(u.shape, device = u.device, dtype = dtype)
+    if out is None:
+        out = torch.empty(u.shape, device = u.device, dtype = dtype)
     if sd == torch.float32 and u.is_contiguous() and u.numel() > 0 and _use_triton(u.device):
         n = u.numel()
         block = 4096
@@ -1900,7 +1899,31 @@ def _scale_rows_impl(u, g, dtype):
     return out
 
 
+def _scale_rows_inplace_impl(u, g):
+    # Triton retry is safe in place: a launch that raises wrote nothing.
+    return _scale_rows_impl(u, g, u.dtype, out = u)
+
+
+_KEEP_GRAPH = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)
+
+
+def _stored_grad_scaler(s, saved):
+    """In place only in eager backward without retain_graph (else a second [V, H] grad coexists with .grad)."""
+    inplace = _OPS.get("scale_rows_inplace")
+    if inplace is not None and _KEEP_GRAPH is not None and all(
+        type(x) is torch.Tensor and not x.requires_grad for x in saved
+    ):
+        try:
+            keep = _KEEP_GRAPH()
+        except RuntimeError:  # not inside a backward pass
+            keep = True
+        if not keep:
+            return lambda x: inplace(x, s)
+    return lambda x: torch.ops.unsloth_zoo.fused_linear_scale_rows(x, s, x.dtype)
+
+
 _OPS["scale_rows_impl"] = _scale_rows_impl
+_OPS["scale_rows_inplace"] = _scale_rows_inplace_impl
 if "calls" in _OPS:
     CALLS = _OPS["calls"]
 else:
@@ -2283,10 +2306,7 @@ if not _OPS.get("jsd_registered", False):
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
         s = grad_loss.to(acc) / scaling.to(acc)
         need_h, need_w, need_b = ctx.need
-
-        def scale(x):
-            return torch.ops.unsloth_zoo.fused_linear_scale_rows(x, s, x.dtype)
-
+        scale = _stored_grad_scaler(s, (grad_h, grad_w, grad_b))
         return ((scale(grad_h) if need_h else None, scale(grad_w) if need_w else None,
                  scale(grad_b) if need_b else None) + (None,) * 18)
 
