@@ -2315,6 +2315,15 @@ def _head_bias(bias, weight):
     return bias.reshape(-1).to(weight.device)
 
 
+def _f32_scalar(x, device):
+    """A count / scale as a float32 0-dim tensor on ``device``. A Python or symbolic number (``labels.numel()`` under a
+    dynamic compile) goes through ``scalar_tensor``: ``as_tensor`` would specialize it into the graph and recompile
+    for every token count."""
+    if isinstance(x, (bool, int, float, torch.SymInt, torch.SymFloat)):
+        return torch.scalar_tensor(x, dtype = torch.float32, device = device)
+    return torch.as_tensor(x).to(device = device, dtype = torch.float32).reshape(-1)[:1].reshape(())
+
+
 def fused_linear_cross_entropy(
     hidden, weight, bias, targets, *,
     divisor,
@@ -2342,12 +2351,12 @@ def fused_linear_cross_entropy(
     if not 0.0 <= label_smoothing <= 1.0:
         raise ValueError(f"Unsloth: label_smoothing must be between 0.0 and 1.0, got {label_smoothing}.")
     f32 = dict(device = device, dtype = torch.float32)
-    divisor = torch.as_tensor(divisor).to(**f32).reshape(-1)[:1].reshape(())
+    divisor = _f32_scalar(divisor, device)
     divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
     if scaling is None:
         scaling = torch.ones((), **f32)
     else:
-        scaling = torch.as_tensor(scaling).to(**f32).reshape(())
+        scaling = _f32_scalar(scaling, device)
         scaling = torch.where(scaling == 0, torch.ones_like(scaling), scaling)
     if logits_bias is not None:
         # Bart's final_logits_bias is [1, vocab]; a split model may keep it off the head's device.
@@ -2471,12 +2480,12 @@ def fused_linear_jsd(
     if num_items_in_batch is None:
         divisor = keep.sum().to(**f32)
     else:
-        divisor = torch.as_tensor(num_items_in_batch).to(**f32).reshape(-1)[:1].reshape(())
+        divisor = _f32_scalar(num_items_in_batch, device)
     divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
     if scaling is None:
         scaling = torch.ones((), **f32)
     else:
-        scaling = torch.as_tensor(scaling).to(**f32).reshape(())
+        scaling = _f32_scalar(scaling, device)
         scaling = torch.where(scaling == 0, torch.ones_like(scaling), scaling)
     loss = getattr(torch.ops.unsloth_zoo, _JSD_OP)(
         hidden2, student_weight, student_bias, t_hidden2, teacher_weight, teacher_bias, keep, divisor, scaling,
