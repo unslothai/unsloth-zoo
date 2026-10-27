@@ -362,6 +362,12 @@ def test_layers_equal_eager_in_float32(monkeypatch):
         F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
         o_eager, g_eager = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, False, weight)
         o_flex, g_flex = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, True, weight)
+        # fp32 at head_dim 512: flex's backward needs ~200 KB of shared memory (A100: 163 KB). The backward probe
+        # latches eager there instead of crashing loss.backward(); the parity check needs a card it fits (H100 / B200).
+        oor = [e for e in F4._FAILED.values() if "out of resource" in e]
+        if oor:
+            assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 2}
+            pytest.skip(f"fp32 flex backward does not fit this card's shared memory: {oor[0][:300]}")
         assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 1, "eager": 1}, layer.self_attn.layer_type
         assert _rel(o_flex, o_eager) < 1e-5
         for name in g_eager:
