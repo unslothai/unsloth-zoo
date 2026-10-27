@@ -55,6 +55,14 @@ _LDEXP_EXACT = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[
 
 def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False, out = None, max_rows = None):
     """Reference: transformers' convert_moe_packed_tensors arithmetic, in row chunks."""
+    from unsloth_zoo.utils import device_guard
+
+    # torch.ldexp launches on the current device: operands on another GPU fault without this.
+    with device_guard(blocks):
+        return _mxfp4_dequantize_torch(blocks, scales, dtype, transpose, out, max_rows)
+
+
+def _mxfp4_dequantize_torch(blocks, scales, dtype, transpose, out, max_rows):
     # float64 holds 2^128; routing it through fp32 would overflow.
     work = dtype if _LDEXP_EXACT or dtype == torch.float64 else torch.float32
     lut = torch.tensor(_FP4_VALUES, dtype = work, device = blocks.device)
@@ -230,25 +238,77 @@ def _kernel_fail(exception):
     warnings.warn(f"Unsloth: fused MXFP4 dequant unavailable ({exception}); using the torch path.")
 
 
+def _tracing():
+    try:
+        if torch.compiler.is_compiling():
+            return True
+        from torch._guards import detect_fake_mode
+        return detect_fake_mode() is not None
+    except Exception:
+        return False
+
+
+def _outside_trace(fn):
+    """``fn`` run for real while a graph is traced: dynamo calls an ``assume_constant_result`` function eagerly and
+    bakes in its result; fake mode is lifted so the self-check's own tensors are real."""
+    def run(*args):
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+        with unset_fake_temporarily():
+            return fn(*args)
+    try:
+        return torch._dynamo.assume_constant_result(run)
+    except Exception:
+        return run
+
+
+# Verdicts reached inside a trace. Never read while tracing (a dict the traced frame read must not change under
+# it), only by the next eager call, which moves them into _KERNEL_VERIFIED.
+_TRACE_VERIFIED = {}
+
+
+def _kernel_verified_in_trace(device, dtype, transpose, exact_round):
+    key = (device, dtype, transpose, exact_round)
+    try:
+        verified = _probe_kernel(device, dtype, transpose)
+    except Exception:
+        verified = False  # the eager call repeats the probe and records the failure
+    _TRACE_VERIFIED[key] = verified
+    return verified
+
+
+_kernel_verified_outside_trace = _outside_trace(_kernel_verified_in_trace)
+
+
+def _probe_kernel(device, dtype, transpose):
+    E, N, G = 2, 131, 9
+    blocks = ((torch.arange(E * N * G * 16, device = device) * 7) % 256).to(torch.uint8).reshape(E, N, G, 16)
+    if dtype == torch.float16:
+        scales = 112 + (torch.arange(E * N * G, device = device) * 5) % 24
+    else:
+        scales = (torch.arange(E * N * G, device = device) * 37) % 255
+    scales = scales.to(torch.uint8).reshape(E, N, G)
+    edges = [0, 127, 254, 255] if dtype != torch.float16 else [0, 127, 135, 255]
+    scales.view(-1)[: len(edges)] = torch.tensor(edges, dtype = torch.uint8)
+    want = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
+    got = _kernel_dequantize(blocks, scales, dtype, transpose, None, None, None)
+    return bool(torch.equal(got.view(torch.uint8), want.view(torch.uint8)))
+
+
 def _kernel_verified(device, dtype, transpose):
     """Once per (device, dtype, layout, rounding path): kernel must match the torch reference bit for bit, else torch is used."""
     key = (str(device), dtype, bool(transpose), _exact_round())
     verified = _KERNEL_VERIFIED.get(key)
     if verified is not None:
         return verified
+    if _tracing():
+        # The probe's torch.equal is data dependent (fullgraph refuses it, e.g. a cold compiled backward): run it
+        # outside the trace, so the traced graph already gets the verdict (the kernel) instead of the reference.
+        return _kernel_verified_outside_trace(*key)
+    if _TRACE_VERIFIED.get(key) is True:
+        _KERNEL_VERIFIED[key] = True
+        return True
     try:
-        E, N, G = 2, 131, 9
-        blocks = ((torch.arange(E * N * G * 16, device = device) * 7) % 256).to(torch.uint8).reshape(E, N, G, 16)
-        if dtype == torch.float16:
-            scales = 112 + (torch.arange(E * N * G, device = device) * 5) % 24
-        else:
-            scales = (torch.arange(E * N * G, device = device) * 37) % 255
-        scales = scales.to(torch.uint8).reshape(E, N, G)
-        edges = [0, 127, 254, 255] if dtype != torch.float16 else [0, 127, 135, 255]
-        scales.view(-1)[: len(edges)] = torch.tensor(edges, dtype = torch.uint8)
-        want = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
-        got = _kernel_dequantize(blocks, scales, dtype, transpose, None, None, None)
-        verified = bool(torch.equal(got.view(torch.uint8), want.view(torch.uint8)))
+        verified = _probe_kernel(device, dtype, transpose)
     except torch.cuda.OutOfMemoryError:
         raise  # a full GPU says nothing about the kernel: decide on a later call
     except Exception as exception:

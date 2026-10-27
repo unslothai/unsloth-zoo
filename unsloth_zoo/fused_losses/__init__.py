@@ -24,3 +24,11 @@ from .forward_install import (
     audit,
     is_enabled,
 )
+from .chunked_logprob import (
+    UnslothChunkedLogProbs,
+    UnslothChunkedCE,
+    unsloth_chunked_ce_loss,
+    unsloth_chunked_logprobs,
+    unsloth_masked_logprobs,
+    chunked_logprob_rows,
+)

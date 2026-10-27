@@ -22,6 +22,8 @@ import torch
 
 from unsloth_zoo.temporary_patches import utils as U
 
+pytestmark = pytest.mark.usefixtures("compile_enabled")
+
 
 def _region(calls):
     def swiglu_like(a):

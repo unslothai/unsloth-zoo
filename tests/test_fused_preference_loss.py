@@ -131,6 +131,8 @@ def test_out_of_memory_does_not_disable_float32_gemm(monkeypatch):
     import unsloth_zoo.fused_losses.preference_loss as module
 
     monkeypatch.setattr(module, "_MM_OUT_DTYPE_OK", {})
+    # ROCm torch skips the float32-output GEMM on purpose; the OOM path under test is the CUDA one.
+    monkeypatch.setattr(module.torch.version, "hip", None)
 
     def oom(*args, **kwargs):
         raise torch.cuda.OutOfMemoryError("CUDA out of memory")

@@ -21,6 +21,7 @@ The behaviour mirrors TRL 0.24's ``GRPOTrainer`` as Unsloth patches it on CUDA
 """
 
 import copy
+import sys
 import warnings
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -965,15 +966,83 @@ def grpo_objective(config):
     )
 
 
-def grpo_reward_funcs(reward_funcs):
+def _is_torch_module(func):
+    torch = sys.modules.get("torch")  # a caller holding a torch module has imported torch
+    return torch is not None and isinstance(func, torch.nn.Module)
+
+
+class _RewardModel:
+    """A Hugging Face sequence-classification reward model, scored as TRL scores one:
+    logit 0 of each rendered prompt + completion. It runs on the device it was given on."""
+
+    def __init__(self, model, tokenizer):
+        if tokenizer is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(model.config._name_or_path)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.pad_token_id
+        self.model, self.tokenizer = model, tokenizer
+        self.__name__ = model.config._name_or_path.split("/")[-1]
+
+    def __call__(self, prompts, completions, **_):
+        import torch
+        # The completion, not the prompt: an assistant-only prompt is empty once its turn moves into the completion.
+        if _is_conversational_prompt(completions[0]):
+            texts = [
+                self.tokenizer.apply_chat_template(prompt + completion, tools=None, tokenize=False)
+                for prompt, completion in zip(prompts, completions)
+            ]
+        else:
+            texts = [prompt + completion for prompt, completion in zip(prompts, completions)]
+        inputs = self.tokenizer(
+            text=texts, return_tensors="pt", padding=True, padding_side="right",
+            add_special_tokens=False,
+        )
+        device = next(self.model.parameters()).device
+        with torch.inference_mode():
+            logits = self.model(**{key: value.to(device) for key, value in inputs.items()}).logits
+        return logits[:, 0].float().tolist()
+
+
+def _load_reward_model(name):
+    try:
+        from transformers import AutoModelForSequenceClassification
+        return AutoModelForSequenceClassification.from_pretrained(name, num_labels=1)
+    except ImportError as error:
+        raise ImportError(
+            f"Unsloth MLX GRPO: reward function {name!r} names a Hugging Face "
+            "sequence-classification model, which needs torch and transformers."
+        ) from error
+
+
+def grpo_reward_funcs(reward_funcs, reward_processing_classes=None):
+    """TRL's ``reward_funcs``: callables, torch reward models, or the ids of such models,
+    each model paired with its entry of ``reward_processing_classes``."""
     funcs = list(reward_funcs) if isinstance(reward_funcs, (list, tuple)) else [reward_funcs]
     if not funcs:
         raise ValueError("Unsloth MLX GRPO: reward_funcs needs at least one reward function.")
-    for func in funcs:
-        if not callable(func) or hasattr(func, "parameters"):
+    if reward_processing_classes is None:
+        tokenizers = [None] * len(funcs)
+    elif isinstance(reward_processing_classes, (list, tuple)):
+        tokenizers = list(reward_processing_classes)
+    else:
+        tokenizers = [reward_processing_classes]
+    if len(tokenizers) != len(funcs):
+        raise ValueError(
+            f"Unsloth MLX GRPO: {len(tokenizers)} reward_processing_classes for "
+            f"{len(funcs)} reward functions."
+        )
+    for index, func in enumerate(funcs):
+        if isinstance(func, str):
+            func = _load_reward_model(func)
+        if _is_torch_module(func):
+            funcs[index] = _RewardModel(func, tokenizers[index])
+        elif not callable(func) or hasattr(func, "parameters"):
             raise ValueError(
-                f"Unsloth MLX GRPO: reward function {func!r} is not a plain callable; "
-                "reward models are not supported."
+                f"Unsloth MLX GRPO: reward function {func!r} is neither a callable nor a "
+                "torch reward model. Wrap an MLX model in a function that returns one "
+                "reward per completion."
             )
     return funcs
 

@@ -56,7 +56,10 @@ from .utils import (
     get_lock,
 )
 from .log import logger
-import triton
+try:
+    import triton
+except ImportError:  # AMD Windows / CPU wheels ship no Triton
+    triton = None
 import regex
 from .peft_utils import get_lora_layer_modules
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
@@ -102,15 +105,27 @@ minor = None
 # Bound before the branches: DEVICE_TYPE == "cpu" takes none of them, and
 # `fuse_lm_head` then read this global and raised NameError.
 OLD_CUDA_ARCH_VERSION = False
+# Visible pre-Turing (or unreadable) card indices. The rewrite is installed before placement,
+# so a head a device_map puts on one skips Inductor and CCE per forward (lm_head_on_old_cuda_arch).
+OLD_CUDA_ARCH_INDICES = frozenset()
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
-        # Any visible pre-Turing card, not just the current one: a device_map can place
-        # layers on it, and Inductor fails there.
-        from .device_type import _visible_cuda_capabilities
-        OLD_CUDA_ARCH_VERSION = any(
-            (_major <= 7) and (_minor < 5) for _major, _minor in _visible_cuda_capabilities()
-        )
+        # Current device only, as torch decides: an idle older card must not disable the fusion.
+        OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+        _old_indices = set()
+        try:
+            for _index in range(torch.cuda.device_count()):
+                try:
+                    _major, _minor = torch.cuda.get_device_capability(_index)
+                except Exception:
+                    _old_indices.add(_index)
+                    continue
+                if (_major <= 7) and (_minor < 5):
+                    _old_indices.add(_index)
+        except Exception:
+            pass
+        OLD_CUDA_ARCH_INDICES = frozenset(_old_indices)
     else:
         # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
         # ask whether a device is present before asking what it can do. There is
@@ -123,7 +138,22 @@ elif DEVICE_TYPE == "xpu":
     OLD_CUDA_ARCH_VERSION = False
 pass
 
-OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
+
+def lm_head_on_old_cuda_arch(weight):
+    """True when the LM head weight sits on a visible pre-Turing card. A frozenset read, so the
+    generated forward stays traceable."""
+    if not OLD_CUDA_ARCH_INDICES:
+        return False
+    device = getattr(weight, "device", None)
+    return device is not None and device.type == "cuda" and device.index in OLD_CUDA_ARCH_INDICES
+pass
+
+# AST-rewritten forwards and the import hook use the shared adapter; fused_losses never imports this module.
+from unsloth_zoo.fused_losses import forward_adapter as _forward_adapter
+_forward_adapter.lm_head_on_old_cuda_arch = lm_head_on_old_cuda_arch
+del _forward_adapter
+
+OLD_TRITON_VERSION = triton is None or Version(triton.__version__) < Version("3.0.0")
 
 # Check if Unsloth Studio is allowed
 import importlib.util
@@ -648,6 +678,7 @@ from unsloth_zoo.loss_utils import (
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
 from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
@@ -1143,6 +1174,16 @@ def _all_attention_functions_has_sdpa():
 pass
 
 
+def _is_single_operand(expression):
+    # `.to(<expression>.dtype)` only reads right for one operand: `a + b` becomes `a + (b.dtype)`.
+    try:
+        node = ast.parse(expression.strip(), mode = "eval").body
+    except SyntaxError:
+        return False
+    return isinstance(node, (ast.Name, ast.Attribute, ast.Call, ast.Subscript))
+pass
+
+
 # Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
 def higher_precision_softmax(source):
     """
@@ -1170,6 +1211,8 @@ def higher_precision_softmax(source):
     for item in softmax_objects:
         full_match, matches = item.group(0), item.groups()
         softmax, variable, dim, dtype = matches
+        if not _is_single_operand(variable):
+            continue
         new = (
             f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
         )
@@ -3495,7 +3538,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3521,7 +3564,7 @@ else:
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
-        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -3596,7 +3639,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3623,7 +3666,7 @@ elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LO
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
-        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -3747,7 +3790,7 @@ else:
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
-        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -5852,7 +5895,22 @@ def _install_patched_forward(model_location, module, forward, combined_module):
     pass
 
 
-def _dtype_safe_forward(original_forward, is_conv, disable):
+def _batchnorm_input_needs_cast(module, tensor):
+    """Mirrors the disable=False source rewrite cast in _patch_torch_dtype_modules."""
+    weight = getattr(module, "weight", None)
+    if weight is None or tensor.dtype == weight.dtype:
+        return False
+    bias = getattr(module, "bias", None)
+    native = (
+        weight.dtype == torch.float32
+        and tensor.dtype in (torch.float16, torch.bfloat16)
+        and not weight.requires_grad
+        and (bias is None or not bias.requires_grad)
+    )
+    return not native
+
+
+def _dtype_safe_forward(original_forward, is_conv, disable, is_batchnorm = False):
     """The dtype casts of the source rewrite, without needing the source.
 
     Same three shapes: a conv casts its input to the weight dtype and the
@@ -5863,6 +5921,9 @@ def _dtype_safe_forward(original_forward, is_conv, disable):
     The tensor is taken by whatever name the original declares, because these
     are public forwards: `RMSNorm.forward(self, x)` and `rms_norm(x = t)` both
     work today and a hard-coded `input` would start raising TypeError.
+
+    BatchNorm casts in both modes: F.batch_norm has no autocast rule, so a
+    float32 input into a bfloat16 weight raises even compiled.
     """
     try:
         first = list(inspect.signature(original_forward).parameters)[1]
@@ -5881,6 +5942,8 @@ def _dtype_safe_forward(original_forward, is_conv, disable):
         if is_conv:
             tensor = tensor.to(self.weight.dtype)
         elif disable and getattr(self, "weight", None) is not None:
+            tensor = tensor.to(self.weight.dtype)
+        elif is_batchnorm and _batchnorm_input_needs_cast(self, tensor):
             tensor = tensor.to(self.weight.dtype)
         return original_forward(self, tensor, *rest, **kwargs).to(original_dtype)
 
@@ -5947,6 +6010,7 @@ def _patch_torch_dtype_modules(
                         function.forward.__unsloth_dtype_original__,
                         module in _conv_modules,
                         disable,
+                        is_batchnorm = module.startswith("BatchNorm"),
                     ),
                     combined_module,
                 )
@@ -5981,7 +6045,10 @@ def _patch_torch_dtype_modules(
                     model_location,
                     module,
                     _dtype_safe_forward(
-                        original_forward, module in _conv_modules, disable
+                        original_forward,
+                        module in _conv_modules,
+                        disable,
+                        is_batchnorm = module.startswith("BatchNorm"),
                     ),
                     combined_module,
                 )
@@ -6019,9 +6086,20 @@ def _patch_torch_dtype_modules(
                     body_lines = lines[1:]
                     first_body = next((l for l in body_lines if l.strip()), "")
                     body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                    cast_if = "self.weight is not None"
+                    if not disable:
+                        # fp16/bf16 into frozen fp32 params is native mixed precision (no fp32 input copy).
+                        # Trainable params keep the cast: CUDA returns their grads at input-dtype precision.
+                        cast_if += (
+                            f" and {param_name}.dtype != self.weight.dtype and not ("
+                            f"self.weight.dtype == torch.float32 and "
+                            f"{param_name}.dtype in (torch.float16, torch.bfloat16) and "
+                            f"not self.weight.requires_grad and "
+                            f"(self.bias is None or not self.bias.requires_grad))"
+                        )
                     prologue = [
                         body_indent + f"original_dtype = {param_name}.dtype",
-                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
+                        body_indent + f"if {cast_if}: {param_name} = {param_name}.to(self.weight.dtype)",
                     ]
                     source = "\n".join([def_line] + prologue + body_lines)
                     append_str = ".to(original_dtype)\n"
@@ -6092,10 +6170,9 @@ def unsloth_compile_transformers(
     except:
         return
     # All Unsloth Zoo code licensed under LGPLv3
-    full_disable = disable or (os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1")
-    disable = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
-    if full_disable:
-        disable = True
+    # UNSLOTH_COMPILE_DISABLE only drops torch.compile; rewritten forwards still run eagerly.
+    full_disable = disable
+    disable = full_disable or os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial")
     if fast_residual_stream:
         raise NotImplementedError(
             "Unsloth: Fast residual stream optimization makes things slower!"
@@ -6264,7 +6341,7 @@ def unsloth_compile_transformers(
     pass
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
-    # Gated on full disable only: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
+    # Not gated on UNSLOTH_COMPILE_DISABLE: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
     if (not full_disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)

@@ -806,6 +806,35 @@ def _probe_dense(device, dtype):
     return True
 
 
+# Answers reached inside a trace: read only by the next eager call (see mxfp4_dequant._TRACE_VERIFIED).
+_TRACE_AVAILABLE = {}
+
+
+def _available_in_trace(name, dtype, tiles, mode):
+    """``_available``'s answer without touching the caches a traced frame reads."""
+    key = (name, dtype) + (("tiles",) if tiles and mode != "1" else ())
+    try:
+        device = torch.device(name) if name is not None else torch.device("cuda", torch.cuda.current_device())
+        ok = mxfp4_grouped_mm_available(device)
+        if ok:
+            with torch.autocast(device.type, enabled = False), torch.no_grad():
+                ok = _probe_dense(device, dtype)
+        if ok and len(key) == 3:
+            ok = torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)
+    except Exception:
+        ok = False  # the eager call repeats the check and warns
+    _TRACE_AVAILABLE[key] = ok
+    return ok
+
+
+def _make_available_outside_trace():
+    from unsloth_zoo.mxfp4_dequant import _outside_trace
+    return _outside_trace(_available_in_trace)
+
+
+_available_outside_trace = _make_available_outside_trace()
+
+
 def mxfp4_gemm_available(device = None, dtype = torch.bfloat16) -> bool:
     """Self-checked once per (device, dtype), bf16 / fp16, sm_80+ (``UNSLOTH_MXFP4_FUSED_GEMM=1`` also below);
     ``UNSLOTH_MXFP4_FUSED_GEMM=0`` turns it off."""
@@ -836,6 +865,13 @@ def _available(device, dtype, tiles):
     ok = _AVAILABLE_DTYPE.get(key)
     if ok is not None:
         return ok
+    from unsloth_zoo.mxfp4_dequant import _tracing
+    if _tracing():
+        # The self-check is data dependent (torch.allclose): run it outside the trace, the graph gets the verdict.
+        return _available_outside_trace(name, dtype, tiles, mode)
+    if _TRACE_AVAILABLE.get(key) is True:
+        _AVAILABLE_DTYPE[key] = True
+        return True
     if len(key) == 3:
         ok = _available(device, dtype, False) and (
             torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)

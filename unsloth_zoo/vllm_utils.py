@@ -105,10 +105,238 @@ def _return_nothing(*args, **kwargs): return None
 def _return_self(self, *args, **kwargs): return self
 def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
 
-def get_target_device(index = 0):
+def _current_device_index():
+    """The caller's current device: a torchrun rank has set_device(LOCAL_RANK) by now, a single process is on 0."""
+    try:
+        module = torch.cuda if DEVICE_TYPE in ("cuda", "hip") else getattr(torch, DEVICE_TYPE)
+        if module.is_available():
+            index = module.current_device()
+            # torch.cpu.current_device() is the string "cpu", not an index.
+            if isinstance(index, int): return index
+    except Exception:
+        pass
+    return 0
+pass
+
+def get_target_device(index = None):
+    # None = the engine's device: the rank's current device under torchrun (external_launcher),
+    # else 0, which vLLM's own executor takes whatever is current.
+    if index is None:
+        index = _current_device_index() if _torchrun_launch_info() is not None else 0
     if DEVICE_TYPE == "hip":
         return torch.device("cuda", index)
     return torch.device(DEVICE_TYPE, index)
+
+_TORCHRUN_ENV_KEYS = ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+
+def _torchrun_launch_info(environ = None):
+    """(rank, local_rank, world_size) when a torchrun-style launcher started this process, else None.
+
+    A single process with the five variables set by hand (the DeepSpeed-in-a-notebook recipe) keeps
+    vLLM's own executor: only a multi-process world or torchrun itself (TORCHELASTIC_RUN_ID, also
+    for --nproc-per-node 1, whose agent store hangs the private group) takes the external launcher."""
+    environ = os.environ if environ is None else environ
+    if not all(environ.get(key) for key in _TORCHRUN_ENV_KEYS):
+        return None
+    try:
+        rank, local_rank, world_size = (
+            int(environ["RANK"]), int(environ["LOCAL_RANK"]), int(environ["WORLD_SIZE"])
+        )
+    except ValueError:
+        return None
+    if world_size < 1 or not (0 <= rank < world_size) or local_rank < 0:
+        return None
+    if world_size == 1 and not environ.get("TORCHELASTIC_RUN_ID"):
+        return None
+    return rank, local_rank, world_size
+pass
+
+def _process_group_timeout():
+    """HF's ddp_timeout default (1800 s). The group is created at model load, before TrainingArguments
+    exist, and the Trainer reuses it: UNSLOTH_DDP_TIMEOUT (seconds) sets it instead."""
+    try:
+        seconds = int(os.environ.get("UNSLOTH_DDP_TIMEOUT", "1800"))
+    except ValueError:
+        seconds = 1800
+    return max(seconds, 1)
+pass
+
+def _vllm_split_group_requested():
+    try:
+        return int(os.environ.get("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", "0") or "0") != 0
+    except ValueError:
+        return False
+pass
+
+def _init_torchrun_process_group(launch_info):
+    """Bind this rank to its card and create the job's env:// group if nothing has yet.
+
+    Returns the device index the rank was bound to, or None off CUDA / ROCm."""
+    import torch.distributed as dist
+    from datetime import timedelta
+    rank, local_rank, world_size = launch_info
+    local_index = None
+    if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
+        count = torch.cuda.device_count()
+        # A per-rank CUDA_VISIBLE_DEVICES leaves one card visible while LOCAL_RANK still counts ranks.
+        local_index = local_rank if local_rank < count else local_rank % max(count, 1)
+        torch.cuda.set_device(local_index)
+    if not dist.is_initialized():
+        # Same defaults accelerate uses for a torchrun job (HF ddp_timeout = 1800 s); the
+        # Trainer reuses an initialized group. backend None = nccl for cuda + gloo for cpu.
+        kwargs = dict(backend = None)
+        if local_index is not None and _vllm_split_group_requested():
+            # vLLM split_group needs a device-bound default group with gloo too; backend None would be nccl only.
+            kwargs = dict(backend = "cpu:gloo,cuda:nccl", device_id = torch.device("cuda", local_index))
+        dist.init_process_group(
+            init_method = "env://", timeout = timedelta(seconds = _process_group_timeout()), **kwargs
+        )
+    elif dist.get_world_size() != world_size:
+        logger.warning(
+            f"Unsloth: torch.distributed world size {dist.get_world_size()} != WORLD_SIZE {world_size}; "
+            "vLLM joins the initialized group."
+        )
+    return local_index
+pass
+
+def _all_reduce_int(value, op, group = None):
+    """One int reduced over `group` (default: the job's group) on a backend that takes it."""
+    import torch.distributed as dist
+    tensor = torch.tensor([int(value)], dtype = torch.int64)
+    # backend None (ours, accelerate's) has gloo for CPU tensors and reports "undefined" or
+    # "cpu:gloo,cuda:nccl"; only a device-only group the caller created takes none.
+    if str(dist.get_backend(group)).lower() in ("nccl", "xccl", "hccl"):
+        tensor = tensor.to(get_target_device())
+    dist.all_reduce(tensor, op = op, group = group)
+    return int(tensor.item())
+pass
+
+def torchrun_ranks_agree(local_ok):
+    """True when every torchrun rank passes its own check, else False on every rank.
+
+    A per-card gate (an old GPU, a missing feature) can keep vLLM on one rank and drop it
+    on another; external_launcher then has one rank in vLLM's world-group creation while
+    the other is already in the Trainer's collectives, and both wait out the group
+    timeout. Outside torchrun this returns `local_ok` without touching torch.distributed."""
+    launch_info = _torchrun_launch_info()
+    if launch_info is None:
+        return bool(local_ok)
+    import torch.distributed as dist
+    _init_torchrun_process_group(launch_info)
+    return _all_reduce_int(1 if local_ok else 0, dist.ReduceOp.MIN) == 1
+pass
+
+# Times vLLM's external_launcher executor finished its cross-rank MIN of free memory.
+_EXTERNAL_LAUNCHER_MEMORY_REDUCES = 0
+
+def _count_external_launcher_memory_reduces():
+    """Count ExecutorWithExternalLauncher.determine_available_memory returns (vLLM 0.11+).
+
+    That MIN all_reduce is the one cross-rank collective in an external_launcher engine's
+    start: a rank failing before it leaves its peers waiting there, so a lone retry meets
+    them again, but a rank failing after it is alone, since its peers have finished. False
+    when this vLLM has no such executor, which keeps load_vllm's retries as they were."""
+    try:
+        from vllm.v1.executor.uniproc_executor import ExecutorWithExternalLauncher
+    except Exception:
+        return False
+    original = ExecutorWithExternalLauncher.__dict__.get("determine_available_memory")
+    if original is None:
+        return False
+    if getattr(original, "_unsloth_counts_reduces", False):
+        return True
+    @functools.wraps(original)
+    def determine_available_memory(self, *args, **kwargs):
+        global _EXTERNAL_LAUNCHER_MEMORY_REDUCES
+        result = original(self, *args, **kwargs)
+        _EXTERNAL_LAUNCHER_MEMORY_REDUCES += 1
+        return result
+    determine_available_memory._unsloth_counts_reduces = True
+    ExecutorWithExternalLauncher.determine_available_memory = determine_available_memory
+    return True
+pass
+
+def _external_launcher_world_group():
+    try:
+        from vllm.distributed.parallel_state import get_world_group
+        return get_world_group().cpu_group
+    except Exception:
+        return None
+pass
+
+def _external_launcher_attempt_agreed(failed, error = None):
+    """After an engine attempt that got past vLLM's cross-rank memory check, every rank reports.
+
+    All succeeded: returns. All failed: returns, so each takes load_vllm's usual retry or raise
+    (the failures are symmetric, so the retries meet again in the same collective). Some
+    failed: raises on every rank, since the ranks that started their engine cannot redo it
+    and a rank retrying alone would wait in that collective for the rest of the group timeout."""
+    import torch.distributed as dist
+    group = _external_launcher_world_group()
+    world = dist.get_world_size(group)
+    failed_ranks = _all_reduce_int(1 if failed else 0, dist.ReduceOp.SUM, group)
+    if failed_ranks == 0 or failed_ranks == world:
+        return
+    message = (
+        f"Unsloth: vLLM failed to start on {failed_ranks} of {world} torchrun ranks after vLLM's "
+        "cross-rank memory check, so every rank stops here together: one rank retrying alone "
+        "would wait for the others until the process group times out. Lower "
+        "gpu_memory_utilization (or free the busier GPUs) and relaunch."
+    )
+    if error is not None:
+        message += f"\nThis rank's error:\n{error}"
+    raise RuntimeError(message)
+pass
+
+def _setup_vllm_external_launcher(engine_args, launch_info):
+    """One vLLM engine per torchrun rank, inside the job's own process group.
+
+    vLLM's default single-process executor starts a private world_size = 1 group on a
+    fresh `tcp://ip:port`. torchrun exports TORCHELASTIC_USE_AGENT_STORE=True, which makes
+    torch's tcp:// rendezvous a TCPStore *client* of an agent store that only exists on
+    MASTER_PORT, so engine init blocks until the store timeout (torch
+    distributed/rendezvous.py `_create_c10d_store`). Flipping that variable is not enough:
+    vLLM's private group then becomes the default WORLD of size 1 and the Trainer's DDP
+    silently runs with one process per group. So create the real torchrun group first
+    (env://, what accelerate would create) and let vLLM join it with the
+    `external_launcher` executor: each rank is an independent data-parallel engine on
+    cuda:LOCAL_RANK (vLLM parallel_state.initialize_model_parallel: "ExternalDP ...
+    every dp rank can generate independently"), as TRL's colocate mode does.
+
+    Returns the device index vLLM must see as LOCAL_RANK, or None if unchanged.
+    """
+    import torch.distributed as dist
+    rank, local_rank, world_size = launch_info
+    local_index = _init_torchrun_process_group(launch_info)
+    engine_args["distributed_executor_backend"] = "external_launcher"
+    # vLLM requires a seed with external_launcher. Offset it per rank as TRL colocate does
+    # (seed = process_index // tp): GRPO puts copies of one prompt on several ranks, and
+    # equal engine seeds would sample identical completions for them.
+    engine_args["seed"] = int(engine_args.get("seed") or 0) + dist.get_rank()
+    if local_index is not None and local_index == local_rank:
+        local_index = None
+    print(
+        f"Unsloth: torchrun rank {dist.get_rank()}/{dist.get_world_size()}: vLLM engine on "
+        f"{get_target_device()} with the external_launcher executor."
+    )
+    return local_index
+pass
+
+@contextlib.contextmanager
+def _scoped_environ(updates):
+    """Set os.environ keys for the block and restore the previous values (or absence) after."""
+    saved = {key: os.environ.get(key) for key in updates}
+    try:
+        for key, value in updates.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+pass
 
 def _device_empty_cache():
     if DEVICE_TYPE == "npu":
@@ -5081,6 +5309,13 @@ def load_vllm(
             elif _flash_attn_is_selectable():
                 engine_args["attention_backend"] = "FLASH_ATTN"
 
+        # torchrun / DDP: one engine per rank in the job's process group (see the helper).
+        # The async engine always runs its core in a subprocess, which external_launcher refuses.
+        torchrun_info = None if (return_args or use_async) else _torchrun_launch_info()
+        vllm_local_rank = None
+        if torchrun_info is not None:
+            vllm_local_rank = _setup_vllm_external_launcher(engine_args, torchrun_info)
+
         # Older vLLM has no such arg; the filter below drops unknown keys, so this is a
         # no-op there rather than a TypeError.
         good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
@@ -5180,16 +5415,24 @@ def load_vllm(
         # Keep trying until success (2 times)
         trials = 0
         race_trials = 0
+        # torchrun: a retry decision taken after vLLM's cross-rank memory check must be the same on every rank.
+        count_reduces = torchrun_info is not None and _count_external_launcher_memory_reduces()
         while True:
             registries_before = _snapshot_dynamo_engine_registries()
+            reduces_before = _EXTERNAL_LAUNCHER_MEMORY_REDUCES
             loaded = False
             try:
                 if use_async:
                     llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_args))
-                elif use_engine:
-                    llm = LLMEngine.from_engine_args(EngineArgs(**engine_args))
                 else:
-                    llm = LLM(**engine_args)
+                    # external_launcher reads LOCAL_RANK as the device index: remap it only
+                    # while the engine starts when the launcher masked one card per rank.
+                    scoped = {} if vllm_local_rank is None else {"LOCAL_RANK": str(vllm_local_rank)}
+                    with _scoped_environ(scoped):
+                        if use_engine:
+                            llm = LLMEngine.from_engine_args(EngineArgs(**engine_args))
+                        else:
+                            llm = LLM(**engine_args)
                 pass
                 loaded = True
                 break
@@ -5197,6 +5440,8 @@ def load_vllm(
                 # A terminal raise chains this traceback as __context__: free the engine's frames.
                 traceback.clear_frames(error.__traceback__)
                 error = str(error)
+                if count_reduces and _EXTERNAL_LAUNCHER_MEMORY_REDUCES > reduces_before:
+                    _external_launcher_attempt_agreed(failed = True, error = error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
                 # config clash raised by CuMemAllocator.__init__, not an OOM, and
                 # retrying with a smaller gpu_memory_utilization can never clear it.
@@ -5292,6 +5537,8 @@ def load_vllm(
                 if not loaded: _release_failed_vllm_engine(registries_before)
             pass
         pass
+        if count_reduces and _EXTERNAL_LAUNCHER_MEMORY_REDUCES > reduces_before:
+            _external_launcher_attempt_agreed(failed = False)
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
         llm.approx_max_num_seqs = approx_max_num_seqs
         if engine_args.get("enable_return_routed_experts", False):
@@ -5302,7 +5549,9 @@ def load_vllm(
             suppress_vllm_padded_vocab(
                 llm, padded_ids, speculative = engine_args.get("speculative_config", None) is not None,
             )
-        if _merged_rollout_enabled():
+        if _merged_rollout_enabled() and _merged_rollout_auto_engine_ok(
+            enable_lora, use_async, use_engine, use_bitsandbytes, is_fp8, engine_args, is_vision_model,
+        ):
             llm._unsloth_lora_without_attention = "lora_target_modules" in engine_args
             install_merged_rollout_engine_wrapper(llm)
         if _UNSLOTH_FLASHINFER_UNUSABLE:
@@ -5359,7 +5608,55 @@ def save_lora(model, save_directory, *args, **kwargs):
     # Cast LoRA to float16 / bfloat16
     state_dict = {k:v.to(dtype) for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
     kwargs["state_dict"] = state_dict
-    model.save_pretrained(save_directory = save_directory, *args, **kwargs)
+    rank, world_size = _distributed_rank_and_world()
+    if world_size <= 1 or kwargs.get("push_to_hub", False):
+        # push_to_hub names the repo after save_directory, so a push keeps the real path, on whichever
+        # rank the user calls it from (as before).
+        model.save_pretrained(save_directory = save_directory, *args, **kwargs)
+        return
+    # DDP: every rank holds the same adapter and usually load_lora's this folder next.
+    # Rank 0 alone would leave the others reading a missing or half-written folder, and a
+    # barrier would deadlock a save the user gated on rank 0. So each rank writes its own
+    # copy and swaps the files in atomically.
+    kwargs["push_to_hub"] = False
+    _save_dir_atomically(
+        lambda tmp: model.save_pretrained(save_directory = tmp, *args, **kwargs),
+        save_directory, rank,
+    )
+pass
+
+
+def _distributed_rank_and_world():
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+    except Exception:
+        pass
+    return 0, 1
+pass
+
+
+def _save_dir_atomically(save_fn, save_directory, rank):
+    """save_fn(tmp_dir) into a private folder, then os.replace each file into save_directory.
+
+    os.replace is atomic on one filesystem, so a rank reading the folder sees a whole old or a
+    whole new file, never one another rank is still writing (all ranks write the same bytes).
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    save_directory = os.fspath(save_directory)
+    tmp = f"{save_directory.rstrip(os.sep)}.unsloth_tmp_rank{rank}_{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors = True)
+    try:
+        save_fn(tmp)
+        for root, _, files in os.walk(tmp):
+            rel = os.path.relpath(root, tmp)
+            target = save_directory if rel == "." else os.path.join(save_directory, rel)
+            os.makedirs(target, exist_ok = True)
+            for name in files:
+                os.replace(os.path.join(root, name), os.path.join(target, name))
+    finally:
+        shutil.rmtree(tmp, ignore_errors = True)
 pass
 
 
@@ -5379,7 +5676,12 @@ def _live_lora_config(model, save_directory):
     # Raw path key: os.path.abspath would cost a getcwd syscall per GRPO step.
     cached = _LIVE_LORA_CONFIGS.get(save_directory)
     if cached is None or cached[0] is not config:
-        config.save_pretrained(save_directory)
+        rank, world_size = _distributed_rank_and_world()
+        if world_size <= 1:
+            config.save_pretrained(save_directory)
+        else:
+            # Every DDP rank writes this file and another rank's vLLM may be reading it.
+            _save_dir_atomically(config.save_pretrained, save_directory, rank)
         cached = (config, get_peft_config(save_directory))
         _LIVE_LORA_CONFIGS[save_directory] = cached
     return cached[1]
@@ -6117,12 +6419,52 @@ _MERGED_ROLLOUT_PUNICA_MODULES = (
 _MERGED_ROLLOUT_LOCK = threading.RLock()
 
 
-def _merged_rollout_mode():
-    """"all" (=1): fold every LoRA layer. "attention": fold attention only, the rest stays on vLLM LoRA."""
+# Counts for tests and benchmarks: outermost folds, and calls that fell back to vLLM LoRA.
+_MERGED_ROLLOUT_STATS = {"folds": 0, "fallbacks": 0}
+
+
+def _merged_rollout_automatic():
+    """True when UNSLOTH_VLLM_MERGED_ROLLOUT is unset (or "auto"): the measured default decides.
+    "0" (or any other value) is off, "1" forces every eligible layer, "attention" folds attention only."""
     # All Unsloth Zoo code licensed under LGPLv3
-    value = os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "0").strip().lower()
+    return os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "").strip().lower() in ("", "auto")
+pass
+
+
+@functools.lru_cache(maxsize = 1)
+def _merged_rollout_auto_platform():
+    """None when the automatic default may fold on this machine, else why not. Measured only on
+    NVIDIA CUDA under Linux with the exact Triton fold (merged_rollout_exact) and vLLM >= 0.11.2;
+    ROCm, XPU, Windows / WSL and older vLLM keep vLLM LoRA unless UNSLOTH_VLLM_MERGED_ROLLOUT=1."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not sys.platform.startswith("linux"): return f"the platform is {sys.platform}"
+    try:
+        if "microsoft" in os.uname().release.lower(): return "this is WSL"
+    except Exception:
+        pass
+    if getattr(torch.version, "hip", None) is not None: return "this is ROCm"
+    if not torch.cuda.is_available(): return "CUDA is not available"
+    try:
+        from .merged_rollout_exact import triton as _triton
+    except Exception:
+        _triton = None
+    if _triton is None: return "Triton is not available for the exact fold"
+    try:
+        if Version(vllm_version) < Version("0.11.2"): return f"vLLM {vllm_version} is older than 0.11.2"
+    except Exception:
+        return "the vLLM version is unknown"
+    return None
+pass
+
+
+def _merged_rollout_mode():
+    """"all": fold every LoRA layer (=1, or the automatic default where it applies). "attention": fold
+    attention only, the rest stays on vLLM LoRA. None: off (=0, or the automatic default does not apply)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    value = os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "").strip().lower()
     if value == "1": return "all"
     if value in ("attention", "attn"): return "attention"
+    if value in ("", "auto"): return "all" if _merged_rollout_auto_platform() is None else None
     return None
 pass
 
@@ -6130,6 +6472,20 @@ pass
 def _merged_rollout_enabled():
     # All Unsloth Zoo code licensed under LGPLv3
     return _merged_rollout_mode() is not None
+pass
+
+
+def _merged_rollout_auto_engine_ok(enable_lora, use_async, use_engine, use_bitsandbytes, is_fp8, engine_args,
+                                   is_vision_model = False):
+    """The automatic default wraps only the engine shape it was measured on: one synchronous text LLM
+    serving 16-bit LoRA, no bitsandbytes / FP8 / other quantization, one GPU. "1" wraps every engine as before."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not _merged_rollout_automatic(): return True
+    if not enable_lora or use_async or use_engine or use_bitsandbytes or is_fp8 or is_vision_model: return False
+    if engine_args.get("quantization", None) is not None: return False
+    if int(engine_args.get("tensor_parallel_size", 1) or 1) != 1: return False
+    if int(engine_args.get("pipeline_parallel_size", 1) or 1) != 1: return False
+    return True
 pass
 
 
@@ -6410,23 +6766,38 @@ def _prepare_merged_rollout_locked(model):
     model._unsloth_merged_rollout_state = cached = None
 
     targets, reason, entries = None, None, None
+    automatic = _merged_rollout_automatic()
+    quiet = False
     if not getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
         reason = "the vLLM engine was not wrapped (set UNSLOTH_VLLM_MERGED_ROLLOUT before loading the model)"
+        # The automatic default declined this engine at load (quantized, async, ...): nothing to say.
+        quiet = automatic
     else:
         targets, reason = _merged_rollout_targets(model)
+    if reason is None and automatic and any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
+        reason = "the automatic default does not fold MoE expert LoRA (set UNSLOTH_VLLM_MERGED_ROLLOUT=1 to force it)"
     if reason is None:
         if _merged_rollout_use_exact(targets):
             entries = ([(module, W, None) for _, module, W in targets], None)
         elif any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
             reason = "MoE expert LoRA folds only with the exact fold, which needs every folded weight on one CUDA device"
+        elif automatic:
+            # The pinned copy costs a full host copy of the folded weights: opt-in only.
+            reason = (
+                "the exact in-place fold is unavailable and the automatic default does not pin a host copy "
+                "(set UNSLOTH_VLLM_MERGED_ROLLOUT=1 to use the pinned copy)"
+            )
         else:
             entries, reason = _merged_rollout_host_copies(targets)
     if reason is not None:
         modules = _merged_rollout_lora_layers(model)
         model._unsloth_merged_rollout_state = _MergedRolloutVerdict(model, modules, reason)
-        _merged_rollout_log_once(
-            f"Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT is on but falling back to vLLM LoRA (punica) because {reason}."
-        )
+        if not quiet:
+            _merged_rollout_log_once(
+                f"Unsloth: merged-weight rollouts (automatic) are not used because {reason}; generating with vLLM LoRA."
+                if automatic else
+                f"Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT is on but falling back to vLLM LoRA (punica) because {reason}."
+            )
         return None
     entries, host = entries
     state = _MergedRolloutState(model, entries)
@@ -6443,7 +6814,7 @@ def _prepare_merged_rollout_locked(model):
         pinned = "pinned" if getattr(entries[0][2], "is_pinned", lambda: False)() else "pageable"
         how = f"pristine copy is {nbytes / 1024**3:.2f} GB of {pinned} host memory (no extra GPU memory)"
     _merged_rollout_log_once(
-        f"Unsloth: Merged-weight rollouts on ({_merged_rollout_mode()}): folding the adapter into {len(entries)} "
+        f"Unsloth: Merged-weight rollouts on ({_merged_rollout_mode()}{', automatic' if _merged_rollout_automatic() else ''}): folding the adapter into {len(entries)} "
         f"shared weights{rest}; {how}."
     )
     return state
@@ -6732,6 +7103,7 @@ def merged_rollout(state):
                         for module, W, P in state.entries:
                             _merged_rollout_fold(W, module, adapter)
                 _merged_rollout_synchronize(state)
+                _MERGED_ROLLOUT_STATS["folds"] += 1
             yield
         finally:
             state.depth -= 1
@@ -6794,6 +7166,7 @@ def _merged_rollout_lora_fallback(request, reason):
     model = request.state.model_ref()
     if model is None:
         raise RuntimeError("Unsloth: the model behind this merged-rollout LoRA request was freed.")
+    _MERGED_ROLLOUT_STATS["fallbacks"] += 1
     _merged_rollout_log_once(
         f"Unsloth: merged-weight rollout used vLLM LoRA (punica) for a call because {reason}."
     )

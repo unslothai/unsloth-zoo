@@ -343,6 +343,10 @@ _LOGGED_BACKENDS = set()
 
 
 def _log_moe_bnb4bit_backend_once(experts_module, message: str):
+    # Not while tracing: Dynamo guards on the set, so the first traced call adding to it makes the
+    # gradient checkpoint recompute select a different graph (CheckpointError on the first backward).
+    if torch.compiler.is_compiling():
+        return
     key = (id(type(experts_module)), message)
     if key in _LOGGED_BACKENDS:
         return
@@ -1090,7 +1094,9 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     from copy import deepcopy
 
     class _PerExpertStackDeserialize(ConversionOps):
-        def __init__(self, base_sources, anchored_sources, original_ops):
+        def __init__(self, base_sources, anchored_sources, original_ops, hf_quantizer = None):
+            # transformers >= 5.21 keeps checkpoint dtypes only for converters whose op has `hf_quantizer`.
+            self.hf_quantizer = hf_quantizer
             self.base_sources = base_sources          # e.g. ["mlp.experts.*.gate_proj.weight", ...]
             self.anchored_sources = anchored_sources  # same, "$"-anchored (collection keys)
             self.original_ops = original_ops          # model's ops, for unquantized fallback
@@ -1251,7 +1257,8 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
         them, replicate the model's ops so unquantized checkpoints are untouched.
         """
 
-        def __init__(self, base_source, anchored_source, original_ops):
+        def __init__(self, base_source, anchored_source, original_ops, hf_quantizer = None):
+            self.hf_quantizer = hf_quantizer
             self.base_source = base_source
             self.anchored_source = anchored_source
             self.original_ops = original_ops
@@ -1338,7 +1345,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     target_patterns=target,
                     operations=[
                         _PerExpertStackDeserialize(
-                            base_sources, anchored_sources, deepcopy(conv.operations)
+                            base_sources, anchored_sources, deepcopy(conv.operations), hf_quantizer,
                         )
                     ],
                 )
@@ -1359,7 +1366,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     source_patterns=aux_sources + [anchored],
                     target_patterns=target,
                     operations=[
-                        _FusedExpertDeserialize(base, anchored, deepcopy(conv.operations))
+                        _FusedExpertDeserialize(base, anchored, deepcopy(conv.operations), hf_quantizer)
                     ],
                 )
             )
@@ -1498,7 +1505,7 @@ def patch_bnb4bit_keep_fused_experts():
 pass
 
 
-def _bnb4bit_split_fused_expert_conversions():
+def _bnb4bit_split_fused_expert_conversions(hf_quantizer = None):
     """Block-aligned `inter` splices packed bytes + absmax (bit-exact); else dequantize, concatenate, requantize."""
     from transformers.core_model_loading import WeightConverter, ConversionOps
     from transformers.quantizers.quantizers_utils import get_module_from_name
@@ -1526,7 +1533,9 @@ def _bnb4bit_split_fused_expert_conversions():
         return new_param
 
     class _SplitFusedExpertDeserialize(ConversionOps):
-        def __init__(self, bases, anchored):
+        def __init__(self, bases, anchored, hf_quantizer = None):
+            # Else transformers >= 5.21 (`HfQuantizer.get_new_dtype`) casts the fp32 quant_map / nested_absmax to the model dtype.
+            self.hf_quantizer = hf_quantizer
             self.bases = bases
             self.anchored = anchored
 
@@ -1630,7 +1639,7 @@ def _bnb4bit_split_fused_expert_conversions():
         converters.append(WeightConverter(
             source_patterns = aux + anchored,
             target_patterns = f"experts.{target}",
-            operations = [_SplitFusedExpertDeserialize(bases, anchored)],
+            operations = [_SplitFusedExpertDeserialize(bases, anchored, hf_quantizer)],
         ))
     return converters
 
@@ -1660,7 +1669,7 @@ def patch_bnb4bit_model_conversion_mapping():
                     logger.info(f"Unsloth: per-expert bnb4bit converters unavailable: {e}")
             # Unguarded: a failure must surface, not fall back to initialising packed stacks.
             if _model_keeps_swappable_fused_experts(model):
-                conversions = _bnb4bit_split_fused_expert_conversions() + conversions
+                conversions = _bnb4bit_split_fused_expert_conversions(hf_quantizer) + conversions
         return conversions
 
     patched_get_model_conversion_mapping._unsloth_moe_patched = True

@@ -22,9 +22,12 @@ import functools
 from collections.abc import Mapping
 from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
-from triton import __version__ as triton_version
+try:
+    from triton import __version__ as triton_version
+except ImportError:  # AMD Windows / CPU wheels ship no Triton
+    triton_version = None
 from . import DEVICE_TYPE
-from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
 import inspect
 import re
 
@@ -108,6 +111,7 @@ elif DEVICE_TYPE == "cuda":
     _miscompiling_devices = _triton_miscompiles_cce_on_any_visible_device()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
+        triton_version is not None and \
         (not (Version(triton_version) < Version("3.0.0"))) and \
         (not _miscompiling_devices):
         try:
@@ -225,7 +229,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     if (Version(torch.__version__) < Version("2.4.0")):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
     
-    elif torch_compile:
+    elif torch_compile and not UNSLOTH_COMPILE_DISABLE:
         UnslothForCausalLMLoss = torch.compile(
             UnslothForCausalLMLoss,
             dynamic = True,

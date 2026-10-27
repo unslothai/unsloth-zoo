@@ -88,3 +88,39 @@ def test_matching_dtypes_are_bitwise_unchanged(dtype):
     out = moe_utils._grouped_mm_with_backward_fix(x, w.detach(), offsets)
     assert out.dtype == dtype
     assert torch.equal(out, expected)
+
+
+def _compile_counters():
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+    torch._dynamo.reset()
+    counters.clear()
+    return counters
+
+
+@pytest.mark.parametrize("fullgraph", [True, False])
+def test_fp16_activation_meets_fp32_master_compiles(fullgraph):
+    """Compiled fp16 x fp32-master grouped_mm: one graph, no breaks, bitwise equal to eager."""
+    _cpu_half_autocast_or_skip()
+    if moe_utils._GROUPED_MM_FP16_OP is None:
+        pytest.skip("torch.library.custom_op unavailable")
+
+    def step(x, w, offsets):
+        with torch.autocast("cpu", dtype = torch.float16):
+            return moe_utils._grouped_mm_with_backward_fix(x, w, offsets)
+
+    x, w_eager, offsets = _case(torch.float16, torch.float32)
+    ref = step(x, w_eager, offsets)
+    ref.float().sum().backward()
+
+    counters = _compile_counters()
+    _, w, _ = _case(torch.float16, torch.float32)
+    out = torch.compile(step, fullgraph = fullgraph, dynamic = True)(x, w, offsets)
+    out.float().sum().backward()
+    # torch 2.14 reports a failed fp16 trace as "unimplemented", not a graph break.
+    assert sum(counters["graph_break"].values()) == 0
+    assert sum(counters["unimplemented"].values()) == 0
+    assert counters["frames"]["total"] == counters["frames"]["ok"]
+    assert counters["stats"]["unique_graphs"] == 1
+    assert out.dtype == torch.float16 and torch.equal(out, ref)
+    assert w.grad.dtype == torch.float32 and torch.equal(w.grad, w_eager.grad)

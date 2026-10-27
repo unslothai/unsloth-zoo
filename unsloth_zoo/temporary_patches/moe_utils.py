@@ -345,14 +345,26 @@ def _load_cached_moe_utils_module():
         return None
 
 
+def _select_moe_backend_eagerly(module):
+    # Selecting inside a trace sets a guarded global and recompiles the graph once.
+    if torch.compiler.is_compiling():
+        return
+    try:
+        module.select_moe_backend()
+    except Exception:
+        pass
+
+
 def get_forward_moe_backend():
     """Resolve forward_moe_backend from the compiled cache copy, else the local def."""
     global _CACHED_FORWARD_MOE_BACKEND
     module = _load_cached_moe_utils_module()
     if module is not None and hasattr(module, "forward_moe_backend"):
+        _select_moe_backend_eagerly(module)
         _CACHED_FORWARD_MOE_BACKEND = module.forward_moe_backend
         return _CACHED_FORWARD_MOE_BACKEND
 
+    _select_moe_backend_eagerly(sys.modules[__name__])
     _CACHED_FORWARD_MOE_BACKEND = forward_moe_backend
     return _CACHED_FORWARD_MOE_BACKEND
 
@@ -401,6 +413,9 @@ def _grouped_mm_with_backward_fix(
     """
     if _triton_grouped_mm_wanted(inputs, weight):
         return _triton_grouped_mm(inputs, weight, offsets)
+    if inputs.dtype != weight.dtype:
+        # Cast first so fp16 x fp32 masters reaches the compile-safe fp16 op below.
+        inputs, weight = _match_grouped_mm_dtypes(inputs, weight)
     if (
         inputs.dtype == torch.float16
         and weight.dtype == torch.float16
@@ -412,7 +427,6 @@ def _grouped_mm_with_backward_fix(
 
 
 def _grouped_mm_eager(inputs, weight, offsets):
-    # Mixed dtypes always land here: the Triton and compiled fp16 routes need equal dtypes.
     if inputs.dtype != weight.dtype:
         inputs, weight = _match_grouped_mm_dtypes(inputs, weight)
     inputs = inputs.contiguous()
@@ -1162,19 +1176,58 @@ class _ExpertBiasGather(torch.autograd.Function):
         # The one-hot is at most _EXPERT_BIAS_ONE_HOT_ELEMENTS: long contexts go in row chunks, summed in fp32.
         chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // ctx.num_experts)
         rows = grad.shape[0]
-        if rows <= chunk:
-            return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
-        # GEMMs only (no index_add_ atomics) for reproducibility; fp32 partials, since 16-bit chunk sums can overflow to inf.
-        if torch.compiler.is_compiling():
-            # A loop over symbolic rows would specialize them: one uncapped GEMM instead.
-            return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
-        if not _mm_fp32_out_ok(grad):
-            # The fallback upcasts each grad chunk to fp32: cap that copy too.
-            chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(ctx.num_experts, grad.shape[1]))
-        out = torch.zeros(ctx.num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
-        for start in range(0, rows, chunk):
+        # Autocast off: under fp16 autocast (incl. compiled backward's "same_as_forward") `mm` rounds the
+        # per-expert sum of fp32 grads to fp16 and overflows past 65504.
+        with torch.autocast(device_type = grad.device.type, enabled = False):
+            if rows <= chunk:
+                return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
+            # GEMMs only (no index_add_ atomics) for reproducibility; fp32 partials, since 16-bit chunk sums can overflow to inf.
+            if torch.compiler.is_compiling():
+                if _EXPERT_BIAS_GRAD_OP is not None and grad.dtype in (torch.float16, torch.bfloat16) \
+                        and not _mm_fp32_out_ok(grad):
+                    # The fallback would upcast all of grad to fp32 (rows x width): run the eager row chunks
+                    # as an opaque op, which keeps that copy capped without specializing the row count.
+                    return _EXPERT_BIAS_GRAD_OP(expert_ids, grad, ctx.num_experts), None
+                # A loop over symbolic rows would specialize them: one uncapped GEMM instead.
+                return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
+            return _expert_bias_grad_chunked(expert_ids, grad, ctx.num_experts), None
+
+
+def _expert_bias_grad_chunked(expert_ids, grad, num_experts):
+    """one_hot(expert_ids) @ grad in row chunks, summed in fp32; the one-hot and any fp32 grad copy stay capped."""
+    experts = torch.arange(num_experts, device = expert_ids.device, dtype = expert_ids.dtype).unsqueeze(1)
+    chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // num_experts)
+    if not _mm_fp32_out_ok(grad):
+        # The fallback upcasts each grad chunk to fp32: cap that copy too.
+        chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // max(num_experts, grad.shape[1]))
+    out = torch.zeros(num_experts, grad.shape[1], dtype = torch.float32, device = grad.device)
+    with torch.autocast(device_type = grad.device.type, enabled = False):
+        for start in range(0, grad.shape[0], chunk):
             out += _one_hot_mm_fp32(expert_ids[start : start + chunk].unsqueeze(0) == experts, grad[start : start + chunk])
-        return out.to(grad.dtype), None
+    return out.to(grad.dtype)
+
+
+def _register_expert_bias_grad_op():
+    """_expert_bias_grad_chunked as an opaque op for compiled backwards: Python chunking over the real row count,
+    so the trace neither specializes rows nor materializes a full fp32 copy of grad. Registered once per process."""
+    if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
+        return None
+    try:
+        return torch.ops.unsloth_zoo.expert_bias_grad.default
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        @torch.library.custom_op("unsloth_zoo::expert_bias_grad", mutates_args = ())
+        def expert_bias_grad(expert_ids: torch.Tensor, grad: torch.Tensor, num_experts: int) -> torch.Tensor:
+            return _expert_bias_grad_chunked(expert_ids, grad, num_experts)
+
+        @expert_bias_grad.register_fake
+        def _(expert_ids, grad, num_experts):
+            return grad.new_empty((num_experts, grad.shape[1]))
+
+        return torch.ops.unsloth_zoo.expert_bias_grad.default
+    except Exception:
+        return None
 
 
 # torch.mm(..., out_dtype = torch.float32): 16-bit inputs, fp32 output (aten::mm.dtype, CUDA only, torch 2.9+).
@@ -1192,6 +1245,9 @@ def _one_hot_mm_fp32(one_hot, grad):
     if _mm_fp32_out_ok(grad):
         return torch.mm(one_hot.to(grad.dtype), grad, out_dtype = torch.float32)
     return one_hot.to(torch.float32) @ grad.float()
+
+
+_EXPERT_BIAS_GRAD_OP = _register_expert_bias_grad_op()
 
 
 def _gather_expert_bias(bias, expert_ids):
@@ -1423,23 +1479,46 @@ def _capped_dequant_plan(sources, num_tokens_per_expert, num_rows):
     return _SelectiveDequantPlan(E, num_rows, [(experts, 0, num_rows, offsets)])
 
 
-def _grouped_mm_slice(inputs, weight, offsets, plan):
-    """_grouped_mm_with_backward_fix for a slice of a planned problem: the Triton choice and
-    its tiles follow the whole (rows, experts) problem, so each group's result matches it."""
+def _slice_takes_triton(inputs, weight, plan):
     E, K, N = weight.shape
-    if (
+    if not (
         _GROUPED_MM_TRITON_OP is not None
         and inputs.device.type == "cuda"
         and inputs.dtype in (torch.bfloat16, torch.float16)
         and weight.dtype == inputs.dtype
         and _triton_grouped_mm_rows_ok(inputs.device, plan.num_rows, plan.num_experts, K, N)
     ):
+        return False
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+    return mg.triton_grouped_available(inputs.device)
+
+
+def _grouped_mm_slice(inputs, weight, offsets, plan):
+    """_grouped_mm_with_backward_fix for a slice of a planned problem: the Triton choice and
+    its tiles follow the whole (rows, experts) problem, so each group's result matches it."""
+    if _slice_takes_triton(inputs, weight, plan):
         from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
-        if mg.triton_grouped_available(inputs.device):
-            return mg.generic_grouped_mm(
-                inputs.contiguous(), weight, offsets, config_rows = (plan.num_rows, plan.num_experts),
-            )
+        return mg.generic_grouped_mm(
+            inputs.contiguous(), weight, offsets, config_rows = (plan.num_rows, plan.num_experts),
+        )
     return _grouped_mm_eager(inputs, weight, offsets)
+
+
+def _slice_reads_views(inputs, weight, plan):
+    # Triton and the sm90 / sm100 grouped GEMMs (behind the view probe) give the copy's bits. A per-expert cuBLAS
+    # loop (torch._grouped_mm elsewhere, our fallback) does not: a transposed operand takes another kernel (T4 fp16, K 5760: 3x max error).
+    if _slice_takes_triton(inputs, weight, plan):
+        return True
+    device = inputs.device
+    if device.type != "cuda" or torch.version.hip is not None:
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _triton_grouped_mm_capability(index)[0] in (9, 10) and _grouped_mm_supported_on(device)
+
+
+def _transposed_for_slice(weight, inputs, plan):
+    weight = weight.transpose(-2, -1)
+    return weight if _slice_reads_views(inputs, weight, plan) else weight.contiguous()
 
 
 def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
@@ -1447,13 +1526,13 @@ def _selective_grouped_mm(inputs, weight_provider, plan, transpose):
         experts, _, _, offsets = plan.chunks[0]
         weight = weight_provider(experts)
         if transpose:
-            weight = weight.transpose(-2, -1).contiguous()
+            weight = _transposed_for_slice(weight, inputs, plan)
         return _grouped_mm_slice(inputs, weight, offsets, plan)
     out = None
     for experts, row_lo, row_hi, offsets in plan.chunks:
         weight = weight_provider(experts)
         if transpose:
-            weight = weight.transpose(-2, -1).contiguous()
+            weight = _transposed_for_slice(weight, inputs, plan)
         rows = inputs[row_lo : row_hi]
         if rows.data_ptr() % 16:
             rows = rows.clone()   # grouped GEMMs want 16-byte aligned operands
@@ -1582,11 +1661,13 @@ _GROUPED_MM_FOREIGN = {}   # (type, index) -> None if same GPU model as the prob
 # (type, index) the process-wide flags were probed on; a later current-device switch must not move it.
 _GROUPED_MM_HOME = None
 _GROUPED_MM_HOME_LOCK = threading.Lock()
+# Every visible accelerator is the home card's model: per-call gates read the process-wide flags.
+_GROUPED_MM_HOMOGENEOUS = False
 
 
 def _grouped_mm_home():
     """Card the process-wide flags describe; locked so concurrent first callers on different cards agree."""
-    global _GROUPED_MM_HOME
+    global _GROUPED_MM_HOME, _GROUPED_MM_HOMOGENEOUS
     if _GROUPED_MM_HOME is None:
         device = _grouped_mm_probe_device()
         anchored = False
@@ -1605,7 +1686,26 @@ def _grouped_mm_home():
             for i in range(count):
                 if (device.type, i) not in _GROUPED_MM_FOREIGN:
                     _resolve_grouped_mm_foreign_kind(torch.device(device.type, i), (device.type, i))
+            _GROUPED_MM_HOMOGENEOUS = _grouped_mm_all_cards_alike(device.type, count)
     return torch.device(*_GROUPED_MM_HOME) if _GROUPED_MM_HOME is not None else _grouped_mm_probe_device()
+
+
+def _grouped_mm_all_cards_alike(home_type, count):
+    """Every visible card of the home's type is its model, and no other accelerator type has cards."""
+    if count < 1 or any(_GROUPED_MM_FOREIGN.get((home_type, i), 0) is not None for i in range(count)):
+        return False
+    other = "xpu" if home_type == "cuda" else "cuda"
+    try:
+        backend = getattr(torch, other, None)
+        return not (backend is not None and backend.is_available() and backend.device_count() > 0)
+    except Exception:
+        return False
+
+
+def _grouped_mm_traced_kind(device):
+    # Trace-time lookup, never resolves: None = the home model (or not a GPU), False = never seen eagerly.
+    if device is None or device.type not in ("cuda", "xpu") or device.index is None: return None
+    return _GROUPED_MM_FOREIGN.get((device.type, device.index), False)
 
 
 def _grouped_mm_foreign_kind(device):
@@ -1627,7 +1727,7 @@ def _resolve_grouped_mm_foreign_kind(device, key):
     return kind
 
 
-# Per GPU model other than the current device's: a card the model never uses is never probed.
+# Per GPU model other than the home card's.
 _TORCH_GROUPED_MM_SUPPORTED_BY_KIND = {}
 
 
@@ -1649,11 +1749,50 @@ def _check_torch_grouped_mm_supported(device = None):
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
 
+def _torch_version_tuple():
+    try:
+        return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    except Exception:
+        return (0, 0)
+
+
+# CUDA (not ROCm) torch 2.8 hard-raises unless `dprops->major == 9` (Blas.cpp, sm90_only). 2.9+ sends
+# any other arch to _grouped_mm_fallback instead of raising (GroupedBlas.cpp, `_grouped_mm_cuda`).
+_TORCH_IS_CUDA_BUILD = getattr(torch.version, "hip", None) is None
+_TORCH_GROUPED_MM_SM90_ONLY = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() == (2, 8)
+_TORCH_GROUPED_MM_FALLS_BACK = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() >= (2, 9)
+
+
+def _grouped_mm_falls_back_internally(device_type, kind):
+    """torch itself serves grouped_mm on a card no probe reached: CUDA 2.9+ (natively or through its
+    fallback), 2.8 only on sm90. ROCm (some cards crash, unsloth#12391) and XPU make no such promise."""
+    if device_type != "cuda": return False
+    if _TORCH_GROUPED_MM_FALLS_BACK: return True
+    info = kind[1] if isinstance(kind, tuple) and len(kind) == 2 else None
+    return _TORCH_GROUPED_MM_SM90_ONLY and isinstance(info, tuple) and info[1] == 9
+
+
 def _grouped_mm_supported_on(device):
     # Absent symbol (torch 2.6/2.7): the traceable definitive negative, no classification.
-    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_foreign_kind(device) is None:
+    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE:
+        return _check_torch_grouped_mm_supported()
+    if torch.compiler.is_compiling():
+        return _grouped_mm_supported_while_tracing(device)
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is None:
         return _check_torch_grouped_mm_supported()
     return _check_torch_grouped_mm_supported(device)
+
+
+def _grouped_mm_supported_while_tracing(device):
+    # Never probes (graph break; fullgraph error). An unwarmed card takes the home answer only where torch
+    # falls back internally, else the manual loop (safe, but breaks a fullgraph trace).
+    home = _check_torch_grouped_mm_supported()
+    kind = _grouped_mm_traced_kind(device)
+    if kind is None or _GROUPED_MM_HOMOGENEOUS: return home
+    known = None if kind is False else _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
+    if known is not None: return known
+    return home and _grouped_mm_falls_back_internally(device.type, kind)
 
 
 # Some ROCm GPUs segfault in grouped_mm instead of raising (unsloth#12391): run the kernels in a throwaway interpreter first.
@@ -1761,8 +1900,8 @@ def _probe_torch_grouped_mm_supported(device = None):
             supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
             _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
             # Same eager region: a traced first use of this model must not break again on the view check.
-            if supported and kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
-                _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = _transposed_view_probe(device)
+            if kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
+                _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = supported and _transposed_view_probe(device)
         return supported
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
@@ -1770,10 +1909,27 @@ def _probe_torch_grouped_mm_supported(device = None):
     device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else None
     if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
-        return False
-
-    _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
+    else:
+        _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
     return _TORCH_GROUPED_MM_SUPPORTED
+
+
+def _warm_grouped_mm_devices(devices):
+    """Mixed host only, eagerly: probe one card of each other GPU model among `devices` (the cards
+    holding this process's expert weights), so a later trace there reads its own answers. Never a
+    card the process does not use: torchrun ranks see every GPU, and probing foreign ones would put
+    a CUDA context and a grouped_mm call from every rank on one representative card."""
+    if _GROUPED_MM_HOMOGENEOUS or torch.compiler.is_compiling(): return
+    seen = set()
+    for device in devices:
+        try:
+            if device is None or device.type not in ("cuda", "xpu") or device.index is None: continue
+            kind = _grouped_mm_foreign_kind(device)
+            if kind is None or kind in seen: continue
+            seen.add(kind)
+            _check_torch_grouped_mm_supported(device)
+        except Exception:
+            pass
 
 
 # One-time check that torch._grouped_mm on a transposed bf16 view matches the contiguous copy. Insurance
@@ -1796,7 +1952,12 @@ _TRANSPOSED_VIEW_SAFE_BY_KIND = {}
 
 def _transposed_view_safe_on(device):
     """View probe on `device`'s GPU model; the home model keeps the process-wide flag."""
-    if not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
+    if _GROUPED_MM_HOMOGENEOUS or not _TORCH_GROUPED_MM_AVAILABLE: return _transposed_view_grouped_mm_is_safe()
+    if torch.compiler.is_compiling():
+        kind = _grouped_mm_traced_kind(device)
+        if kind is None: return _transposed_view_grouped_mm_is_safe()
+        # Unprobed card: the contiguous copy (correct, traceable), never the home card's verdict.
+        return False if kind is False else bool(_TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind, False))
     kind = _grouped_mm_foreign_kind(device)
     if kind is None: return _transposed_view_grouped_mm_is_safe()
     safe = _TRANSPOSED_VIEW_SAFE_BY_KIND.get(kind)
@@ -1979,7 +2140,7 @@ def select_moe_backend_without_sonic(device = None):
     backend = select_moe_backend()
     if backend == "sonic_moe":
         # sonic_moe was selected on a card with torch._grouped_mm; on a mixed host the expert's card may lack it.
-        if getattr(device, "type", None) == "cuda" and not _check_torch_grouped_mm_supported(device):
+        if getattr(device, "type", None) == "cuda" and not _grouped_mm_supported_on(device):
             return "native_torch"
         return "grouped_mm"
     return backend
@@ -5736,7 +5897,7 @@ def forward_triton_grouped_gemm(
 
     if not _triton_grouped_gemm_dims_supported(self, hidden_states.shape[-1]):
         # Toy shapes (hidden_size 8): the same routing on grouped_mm, else the eager loop; neither has the tile limit.
-        if _check_torch_grouped_mm_supported(hidden_states.device):
+        if _grouped_mm_supported_on(hidden_states.device):
             return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
         return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 

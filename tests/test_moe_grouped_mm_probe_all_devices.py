@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""grouped_mm and ROCm crash probes answer per GPU model, probing only the cards experts actually run on."""
+"""grouped_mm and ROCm crash probes answer per GPU model: one probe on a homogeneous host, one per model the experts use on a mixed one."""
 import subprocess
 import sys
 import types
@@ -41,9 +41,10 @@ def _fresh_dynamo_rules():
 
 @pytest.fixture
 def spoof(monkeypatch):
-    def make(count, failing = (), hip = None, current = 0, models = None):
+    def make(count, failing = (), hip = None, current = 0, models = None, caps = None):
         models = models or [f"GPU{i}" for i in range(count)]
-        def props(i): return types.SimpleNamespace(name = models[i], major = 9, minor = 0, gcnArchName = models[i])
+        caps = caps or [(9, 0)] * count
+        def props(i): return types.SimpleNamespace(name = models[i], major = caps[i][0], minor = caps[i][1], gcnArchName = models[i])
         monkeypatch.setattr(torch.cuda, "get_device_properties", props)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
@@ -53,7 +54,11 @@ def spoof(monkeypatch):
         monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", None)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", None)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOME", None, raising = False)
+        monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOMOGENEOUS", False, raising = False)
         monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
+        # A warm-up on the spoofed host selects grouped_mm; restored on teardown so later tests on this
+        # CPU worker do not inherit a backend chosen for cards that do not exist.
+        monkeypatch.setattr(moe_utils, "_SELECTED_MOE_BACKEND", None, raising = False)
         for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND",
                      "_TRANSPOSED_VIEW_SAFE_BY_KIND"):
             monkeypatch.setattr(moe_utils, name, {}, raising = False)
@@ -80,9 +85,9 @@ def spoof(monkeypatch):
         monkeypatch.setattr(torch, "tensor", tensor)
         monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
         # The view probe builds real tensors (torch.Generator / randn on the card): on a GPU host that ran
-        # on the real device and logged extra _grouped_mm calls; on a CPU host it raised and gave False.
-        # Pin that False everywhere; tests of the view probe override it.
-        monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda device: False)
+        # on the real device and logged extra _grouped_mm calls. Answer from `failing` instead; tests of
+        # the view probe override it.
+        monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: d is not None and d.index not in failing)
         return probed
     return make
 
@@ -93,7 +98,8 @@ def cuda(i): return torch.device("cuda", i)
 @pytest.mark.parametrize("count, failing, expected", [
     (1, (), True), (1, (0,), False), (2, (), True), (2, (1,), True), (3, (2,), True), (3, (0,), False),
 ])
-def test_default_probe_touches_only_the_current_card(spoof, count, failing, expected):
+def test_default_probe_answers_for_the_current_card(spoof, count, failing, expected):
+    # Distinct models: the home probe runs on the home card only; another card is probed only once used.
     seen = spoof(count, failing)
     assert moe_utils._probe_torch_grouped_mm_supported() is expected
     assert moe_utils._check_torch_grouped_mm_supported() is expected
@@ -105,7 +111,7 @@ def test_default_probe_touches_only_the_current_card(spoof, count, failing, expe
 def test_mixed_host_each_card_answers_for_itself(spoof):
     seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
     assert moe_utils._check_torch_grouped_mm_supported(cuda(0)) is True   # unused 4090 never disables the H100
-    assert seen == [0]
+    assert seen == [0]   # an unused card is never probed
     assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is False  # experts spilled onto the 4090
     assert moe_utils._check_torch_grouped_mm_supported(cuda(0)) is True
     assert moe_utils._check_torch_grouped_mm_supported() is True
@@ -176,7 +182,7 @@ def test_unreadable_properties_probe_the_card_when_used(spoof, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_properties", props)
     assert moe_utils._check_torch_grouped_mm_supported() is True
     assert seen == [0]
-    assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is False
+    assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is False   # unclassifiable: a model of its own
     assert seen == [0, 1]
 
 
@@ -193,7 +199,7 @@ def test_cpu_or_indexless_device_uses_the_default_answer(spoof):
     seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
     assert moe_utils._check_torch_grouped_mm_supported(torch.device("cpu")) is True
     assert moe_utils._check_torch_grouped_mm_supported(torch.device("cuda")) is True
-    assert seen == [0]
+    assert seen == [0]   # the unused RTX4090 is never probed; its failure could not leak into the default answer
 
 
 def test_grouped_mm_eager_asks_for_the_input_device(spoof, monkeypatch):
@@ -232,15 +238,16 @@ def test_rocm_homogeneous_host_one_child(spoof, monkeypatch):
     assert len(children) == 1
 
 
-def test_rocm_crash_probe_one_child_per_used_model(spoof, monkeypatch):
+def test_rocm_crash_probe_one_child_per_model(spoof, monkeypatch):
     spoof(3, hip = "7.1.0")
     children = _record_children(monkeypatch)
     assert moe_utils._probe_torch_grouped_mm_supported() is True
     assert children == [("0", ("0", "0"))]
+    moe_utils._warm_grouped_mm_devices([cuda(0), cuda(1), cuda(2)])   # experts on all three models
+    assert children == [("0", ("0", "0")), ("0", ("1", "1")), ("0", ("2", "2"))]
     assert moe_utils._check_torch_grouped_mm_supported(cuda(2)) is True
-    assert children == [("0", ("0", "0")), ("0", ("2", "2"))]
     assert moe_utils._grouped_mm_survives_out_of_process(cuda(2)) is True
-    assert len(children) == 2
+    assert len(children) == 3
 
 
 def test_rocm_crash_on_unused_card_keeps_grouped_mm(spoof, monkeypatch):
@@ -387,6 +394,204 @@ def test_rocm_mask_rewritten_only_when_token_order_is_logical_order(spoof, monke
         assert children == [("0", (tokens[0],) * 2), ("0", (tokens[1],) * 2)]
     else:
         assert children == [("0", None), ("1", None)]
+
+
+def test_identical_cards_read_the_global_flags_without_classifying_each_call(spoof, monkeypatch):
+    # One GPU model on the host: after the eager anchor, a GEMM's gates cost a flag read, as before #1928.
+    seen = spoof(2, models = ["B200", "B200"])
+    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
+    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+    assert moe_utils._GROUPED_MM_HOMOGENEOUS is True
+    lookups = []
+    real = moe_utils._grouped_mm_foreign_kind
+    monkeypatch.setattr(moe_utils, "_grouped_mm_foreign_kind", lambda d: lookups.append(d) or real(d))
+    for _ in range(5):
+        for i in (0, 1):
+            assert moe_utils._grouped_mm_supported_on(cuda(i)) is True
+            assert moe_utils._transposed_view_safe_on(cuda(i)) is True
+    assert lookups == []
+    assert seen == [0]
+
+
+def test_a_mixed_host_keeps_per_card_answers(spoof):
+    seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
+    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+    assert moe_utils._GROUPED_MM_HOMOGENEOUS is False
+    assert moe_utils._grouped_mm_supported_on(cuda(1)) is False
+    assert seen == [0, 1]
+
+
+def _no_probe_while_tracing(monkeypatch):
+    def no_probe(_probe): raise AssertionError("probe ran while tracing")
+    monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_probe)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+
+@pytest.mark.parametrize("hip, crash_masks, failing", [("7.1.0", ("1",), ()), (None, (), (1,))])
+def test_eager_warmup_lets_a_trace_on_the_other_model_read_its_own_answer(spoof, monkeypatch, hip, crash_masks, failing):
+    # Mixed host: the second model cannot run grouped_mm (ROCm: the kernel crashes the process, unsloth#12391).
+    seen = spoof(2, failing = failing, hip = hip, models = ["gfx942", "gfx1100"])
+    children = _record_children(monkeypatch, crash_masks = crash_masks)
+    views = []
+    monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: views.append(d.index) or True)
+    # Even where torch would fall back internally, a warmed card answers for itself.
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", True, raising = False)
+    # The eager warm-up with the experts split across both models (device_map).
+    _warm_moe_backend(monkeypatch, [cuda(0), cuda(1)])
+    assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is True
+    assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is True
+    if hip:
+        assert [c[1] for c in children] == [("0", "0"), ("1", "1")]   # each model's crash probe, once
+        assert seen == [0]                                             # the crashing kernel never ran in-process
+    else:
+        assert seen == [0, 1]
+    assert views == [0]   # unsupported card: its view verdict is the copy, no probe
+    _no_probe_while_tracing(monkeypatch)
+    assert moe_utils._grouped_mm_supported_on(cuda(1)) is False
+    assert moe_utils._transposed_view_safe_on(cuda(1)) is False
+    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+    assert moe_utils._transposed_view_safe_on(cuda(0)) is True
+
+
+def _warm_moe_backend(monkeypatch, expert_devices):
+    # The real eager entry point on a model whose stacked expert weights sit on `expert_devices`.
+    from unsloth_zoo.temporary_patches import moe_experts_interface as mei
+    monkeypatch.setattr(moe_utils, "get_forward_moe_backend", lambda: moe_utils.forward_moe_backend)
+    experts = [types.SimpleNamespace(_parameters = {"gate_up_proj": types.SimpleNamespace(device = d)}) for d in expert_devices]
+
+    class Model:
+        @classmethod
+        def _can_set_experts_implementation(cls): return True
+        def modules(self): return iter([types.SimpleNamespace(_parameters = {})] + experts)
+
+    mei._warm_moe_backend(Model())
+
+
+def _distributed(monkeypatch):
+    # torchrun on one node: every rank sees every GPU, rank 0 uses cuda:0.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("RANK", "0")
+
+
+def test_a_rank_never_probes_a_card_its_experts_do_not_use(spoof, monkeypatch):
+    # Only the home card and the experts' cards are probed, never another rank's card.
+    seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
+    _distributed(monkeypatch)
+    views = []
+    monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: views.append(d.index) or True)
+    _warm_moe_backend(monkeypatch, [cuda(0)])
+    assert seen == [0] and views == [0]
+    assert moe_utils._TORCH_GROUPED_MM_SUPPORTED_BY_KIND == {} and moe_utils._TRANSPOSED_VIEW_SAFE_BY_KIND == {}
+
+
+@pytest.mark.parametrize("hip", [None, "7.1.0"])
+def test_a_rocm_rank_spawns_no_crash_probe_for_a_card_it_does_not_use(spoof, monkeypatch, hip):
+    spoof(3, hip = hip, models = ["gfx942", "gfx1100", "gfx1100"])
+    _distributed(monkeypatch)
+    children = _record_children(monkeypatch)
+    _warm_moe_backend(monkeypatch, [cuda(0)])
+    assert children == ([] if hip is None else [("0", ("0", "0"))])
+
+
+def test_a_device_map_split_across_two_models_warms_both(spoof, monkeypatch):
+    seen = spoof(4, failing = (2,), models = ["H100", "H100", "RTX4090", "A100"])
+    _warm_moe_backend(monkeypatch, [cuda(0), cuda(1), cuda(2)])   # cuda:3 holds no experts
+    assert seen == [0, 2]   # one probe per model the experts use, the same-model cuda:1 shares the home's
+    _no_probe_while_tracing(monkeypatch)
+    assert [moe_utils._grouped_mm_supported_on(cuda(i)) for i in range(3)] == [True, True, False]
+    assert ("cuda", 3) in moe_utils._GROUPED_MM_FOREIGN   # classified, never probed
+
+
+def test_expert_devices_skip_meta_cpu_and_dense_weights():
+    from unsloth_zoo.temporary_patches import moe_experts_interface as mei
+    dense = torch.nn.Linear(2, 2)   # a dense MLP's down_proj is a submodule, not a stacked parameter
+    stacks = [types.SimpleNamespace(_parameters = {"down_proj": types.SimpleNamespace(device = d)})
+              for d in (torch.device("meta"), torch.device("cpu"), cuda(1), cuda(1), torch.device("xpu", 0))]
+    model = types.SimpleNamespace(modules = lambda: iter([dense] + stacks))
+    assert mei._expert_devices(model) == [cuda(1), torch.device("xpu", 0)]
+
+
+def _never_warmed(spoof, monkeypatch, **kwargs):
+    # Home probed and every card classified, no other model probed: experts moved after the warm-up.
+    seen = spoof(**kwargs)
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", True)
+    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
+    moe_utils._grouped_mm_home()
+    return seen
+
+
+@pytest.mark.parametrize("falls_back, sm90_only, hip, expected", [
+    (True, False, None, [True, True, True]),           # CUDA torch 2.9+: torch's fallback serves any arch
+    (False, True, None, [False, True, False]),         # CUDA torch 2.8: sm90 only
+    (False, False, "7.1.0", [False, False, False]),    # ROCm: no such promise, the manual loop
+])
+def test_tracing_a_never_warmed_card_takes_the_conservative_answers(spoof, monkeypatch, falls_back, sm90_only, hip, expected):
+    seen = _never_warmed(spoof, monkeypatch, count = 4, hip = hip, models = ["H100", "A100", "H200", "B200"],
+                         caps = [(9, 0), (8, 0), (9, 0), (10, 0)])
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", falls_back, raising = False)
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SM90_ONLY", sm90_only)
+    _no_probe_while_tracing(monkeypatch)
+    assert [moe_utils._grouped_mm_supported_on(cuda(i)) for i in (1, 2, 3)] == expected
+    assert [moe_utils._transposed_view_safe_on(cuda(i)) for i in (1, 2, 3)] == [False] * 3   # the copy
+    assert moe_utils._grouped_mm_supported_on(cuda(0)) is True
+    assert moe_utils._transposed_view_safe_on(cuda(0)) is True
+    assert seen == []
+
+
+def test_tracing_a_card_of_another_accelerator_type_never_resolves_it(spoof, monkeypatch):
+    # Mixed CUDA/XPU host whose XPU card no eager probe reached: the trace must not reach the
+    # compiler-disabled resolver, and an XPU has no torch-side fallback, so the manual loop and the copy.
+    _never_warmed(spoof, monkeypatch, count = 2, models = ["H100", "RTX4090"])
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", True, raising = False)
+    _no_probe_while_tracing(monkeypatch)
+    xpu = types.SimpleNamespace(type = "xpu", index = 0)
+    assert moe_utils._grouped_mm_supported_on(xpu) is False
+    assert moe_utils._transposed_view_safe_on(xpu) is False
+    assert ("xpu", 0) not in moe_utils._GROUPED_MM_FOREIGN
+
+
+@pytest.mark.parametrize("warmed, index, expected", [
+    (True, 0, 11.0),    # home card on a mixed host: its own verdicts
+    (True, 1, 0.0),     # warmed RTX4090: its own "no" (support and view)
+    (False, 1, 10.0),   # never warmed, CUDA 2.9+: torch's fallback, the contiguous copy
+])
+def test_a_fullgraph_compile_on_a_mixed_host_traces(spoof, monkeypatch, warmed, index, expected):
+    if warmed:
+        spoof(2, failing = (1,), models = ["H100", "RTX4090"])
+        _warm_moe_backend(monkeypatch, [cuda(0), cuda(1)])
+    else:
+        _never_warmed(spoof, monkeypatch, count = 2, failing = (1,), models = ["H100", "RTX4090"])
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", True, raising = False)
+    # Not a real torch.device: tracing one would initialise CUDA on a runner without a GPU.
+    card = types.SimpleNamespace(type = "cuda", index = index)
+
+    def gate(x):
+        view = moe_utils._transposed_view_safe_on(card)
+        supported = moe_utils._grouped_mm_supported_on(card)
+        return x + (1 if view else 0) + (10 if supported else 0)
+
+    def no_probe(_probe): raise AssertionError("probe ran while tracing")
+    monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_probe)
+    # The cards are spoofed: keep Dynamo from saving a CUDA RNG state no runner without a GPU has.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    out = torch.compile(gate, fullgraph = True, backend = "eager")(torch.zeros(2))
+    assert out.tolist() == [expected] * 2
+
+
+def test_the_modulelist_forward_declines_a_card_without_grouped_mm(monkeypatch):
+    # A block moved after enable onto a GPU model without torch._grouped_mm runs its original loop.
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ml
+    from unsloth_zoo.temporary_patches import moe_utils as mu
+
+    monkeypatch.setattr(mu, "_grouped_mm_supported_on", lambda device: False)
+    sentinel = object()
+    block = SimpleNamespace(
+        _unsloth_moe_spec = None, experts = [], _orig_moe_forward = lambda hs: sentinel
+    )
+    hidden = SimpleNamespace(device = torch.device("cuda", 1), dtype = torch.bfloat16)
+    assert ml.grouped_moe_forward(block, hidden) is sentinel
 
 
 class _OnCard(torch.Tensor):

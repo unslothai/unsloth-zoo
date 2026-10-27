@@ -45,8 +45,10 @@ import functools
 import inspect
 import os
 import re
+import typing
 import warnings
 from collections import OrderedDict
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -55,7 +57,8 @@ ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 _MAX_ROLLOUTS = 2
 _MAX_CALLS_PER_ROLLOUT = 64
-_MAX_PENDING = 64
+# Leak guard only: evicting a forward awaiting its recompute makes that recompute route naturally.
+_MAX_PENDING = 1024
 
 
 def routing_replay_requested():
@@ -166,6 +169,7 @@ class _ReplayState:
         )
         self.changed = None
         self.warned_invalid = False
+        self.warned_evicted = False
 
 
 _STATE = _ReplayState()
@@ -206,6 +210,33 @@ def _count_conflicts(a, b):
         _STATE.stats["conflicting_routes"] = _STATE.stats.get("conflicting_routes", 0) + conflicts
 
 
+def _fill_prefix(rows, full, start, store):
+    """Fill rows [0, start) from this rollout's captures sharing that prefix; disagreeing captures leave -1."""
+    prefix = tuple(full[:start])
+    stores = [store]
+    if not _STATE.forwarded_since_record and _STATE.generations:
+        # Earlier rollouts ran on older weights: their routes are not this policy's.
+        stores += [call[0] for call in reversed(next(reversed(_STATE.generations.values())))]
+    merged = rows[:start].clone()
+    seen = torch.zeros(rows.shape[:-1], dtype = torch.bool)[:start]
+    conflict = seen.clone()
+    for candidate in stores:
+        for key, earlier in candidate.items():
+            m = min(start, len(key))
+            if m == 0 or earlier.shape[1:] != rows.shape[1:] or key[:m] != prefix[:m]:
+                continue
+            part = earlier[:m]
+            routed = ~(part < 0).all(dim = -1)
+            same = (part.sort(dim = -1).values == merged[:m].sort(dim = -1).values).all(dim = -1)
+            conflict[:m] |= routed & seen[:m] & ~same
+            new = routed & ~seen[:m]
+            if bool(new.any()):
+                merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
+                seen[:m] |= new
+    keep = seen & ~conflict
+    rows[:start] = torch.where(keep.unsqueeze(-1), merged, rows[:start])
+
+
 def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = None):
     """Store vLLM's per-token expert ids per finished completion. prompt_starts: per-request
     `SamplingParams.routed_experts_prompt_start` (prompt position of the first returned row)."""
@@ -241,6 +272,8 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
             for offset, part in parts:
                 n = max(0, min(len(full) - offset, part.shape[0]))
                 rows[offset : offset + n] = part[:n]
+            if start > 0 and not split:
+                _fill_prefix(rows, full, start, store)
             if rows.shape[-1] > 1:
                 # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.
                 ordered = rows.sort(dim = -1).values
@@ -306,7 +339,8 @@ def _lookup(key, exact = False):
 
 def _prompt_starts(args, kwargs, count):
     params = kwargs.get("sampling_params", args[1] if len(args) > 1 else None)
-    if isinstance(params, (list, tuple)):
+    # Same per-prompt test as vLLM's offline _params_to_seq; a SamplingParams is no Sequence.
+    if isinstance(params, Sequence):
         starts = [getattr(p, "routed_experts_prompt_start", 0) or 0 for p in params]
         if len(starts) != count:
             if any(starts):
@@ -415,7 +449,15 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
             _STATE.recomputed = False
         _STATE.record = {}
         _STATE.pending.append(_STATE.record)
-        del _STATE.pending[:-_MAX_PENDING]
+        if len(_STATE.pending) > _MAX_PENDING:
+            del _STATE.pending[:-_MAX_PENDING]
+            if not _STATE.warned_evicted:
+                _STATE.warned_evicted = True
+                warnings.warn(
+                    f"Unsloth: routing replay kept {_MAX_PENDING} checkpointed forwards without a backward; "
+                    "the oldest ones recompute with the trainer's own routing, so their gradients no longer "
+                    "match their forward. Run backward more often (fewer chunks per backward)."
+                )
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
         return None
@@ -499,25 +541,29 @@ def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
         # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
         return _NATURAL
     fp = _fingerprint(ids2)
-    match = torch.stack([(c[0] == fp).all() for c in candidates])
+    match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
     if signature is not None:
         # Narrow the natural matches to the forwards whose router input was the same too. Only a
         # refinement: when no input matches exactly, the natural matches stand as before.
-        same = [
-            (c[3] == signature).all() if len(c) > 3 and c[3] is not None and c[3].shape == signature.shape
-            else torch.zeros((), dtype = torch.bool, device = match.device)
-            for c in candidates
-        ]
-        exact = match & torch.stack(same).to(match.device)
+        has = [len(c) > 3 and c[3] is not None and c[3].shape == signature.shape for c in candidates]
+        if all(has):
+            same = (torch.stack([c[3] for c in candidates]) == signature).flatten(1).all(-1)
+        else:
+            same = torch.stack([
+                (c[3] == signature).all() if h else torch.zeros((), dtype = torch.bool, device = match.device)
+                for c, h in zip(candidates, has)
+            ])
+        exact = match & same.to(match.device)
         match = torch.where(exact.any(), exact, match)
-    pick = match.to(torch.int32).argmax()
+    # index_select, not forced_all[pick]: a 0-dim CUDA index is read back to the host.
+    pick = match.to(torch.int32).argmax().reshape(1)
     forced_all = torch.stack([c[1] for c in candidates])
-    forced = forced_all[pick]
+    forced = forced_all.index_select(0, pick)[0]
     # Several forwards with the same natural routing but different replays cannot be told
     # apart, so keep the natural routing there rather than guess. Only the expert set counts:
     # the same experts in another order route and weight every token identically.
     agree = ((forced_all.sort(-1).values == forced.sort(-1).values).flatten(1).all(-1) | ~match).all()
-    valid = torch.stack([c[2] for c in candidates])[pick] & match.any() & agree
+    valid = torch.stack([c[2] for c in candidates]).index_select(0, pick)[0] & match.any() & agree
     return forced, valid
 
 
@@ -626,9 +672,10 @@ def _router_hook(layer_index, compact = None):
         signature = None
         if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
             signature = _input_signature(args, ids2.shape[0])
-        recomputed = None if _STATE.in_forward else _recomputed_routes(
-            layer_index, ids2, signature, _STATE.layer_inputs.get(layer_index),
-        )
+        # Read once and clear: a compiled layer's traced read then sees None, never a stale call's.
+        layer_input = _STATE.layer_inputs.get(layer_index)
+        _STATE.layer_inputs[layer_index] = None
+        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature, layer_input)
         if recomputed is not None:
             _count("router_calls_recomputed")
         if recomputed is _NATURAL:
@@ -682,7 +729,7 @@ def _router_hook(layer_index, compact = None):
             if _STATE.record is not None:
                 # A copy: the output ids may alias forced, and MoE blocks can reuse them in place.
                 _STATE.record[layer_index] = (
-                    _fingerprint(ids2), forced.clone(), valid, signature, _STATE.layer_inputs.get(layer_index),
+                    _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
                 )
         else:
             forced, valid = recomputed
@@ -722,10 +769,57 @@ def _tensor_addresses(values):
     return out
 
 
+def _record_layer_inputs(layer_index, tensors):
+    _STATE.layer_inputs[layer_index] = frozenset(_tensor_addresses(tensors)) or None
+
+
+_LAYER_INPUTS_OP = None
+
+
+def _layer_inputs_op():
+    # data_ptr() is untraceable and a graph break fails fullgraph, so use an opaque op; register eagerly.
+    global _LAYER_INPUTS_OP
+    if _LAYER_INPUTS_OP is not None:
+        return _LAYER_INPUTS_OP
+    for i in range(64):
+        name = "routing_replay_layer_inputs" + (f"_{i}" if i else "")
+        # A reloaded module copy may own the name; custom_op silently re-registers (torch 2.10 segfaults).
+        if hasattr(torch.ops.unsloth_zoo, name):
+            continue
+        try:
+            op = torch.library.custom_op(f"unsloth_zoo::{name}", mutates_args = ())(_layer_inputs_impl)
+        except RuntimeError:
+            continue
+        op.register_fake(_layer_inputs_fake)
+        _LAYER_INPUTS_OP = getattr(torch.ops.unsloth_zoo, name).default
+        if hasattr(torch.fx.node, "has_side_effect"):
+            # No outputs: else DCE may drop it.
+            torch.fx.node.has_side_effect(_LAYER_INPUTS_OP)
+        return _LAYER_INPUTS_OP
+    raise RuntimeError("Unsloth: could not register the routing replay layer input op.")
+
+
+# typing.List, not list[...]: torch < 2.7 infer_schema rejects the builtin generic.
+def _layer_inputs_impl(layer_index: int, tensors: typing.List[torch.Tensor]) -> None:
+    _record_layer_inputs(layer_index, tensors)
+
+
+def _layer_inputs_fake(layer_index, tensors):
+    return None
+
+
 def _layer_pre_hook(layer_index):
     def hook(module, args, kwargs):
         # Read in compiled layers too: dropping these leaves identical forwards ambiguous.
-        _STATE.layer_inputs[layer_index] = frozenset(_tensor_addresses(list(args) + list(kwargs.values()))) or None
+        tensors = [
+            x for value in list(args) + list(kwargs.values())
+            for x in (value if isinstance(value, (tuple, list)) else (value,))
+            if torch.is_tensor(x)
+        ]
+        if torch.compiler.is_compiling():
+            _LAYER_INPUTS_OP(layer_index, tensors)
+        else:
+            _record_layer_inputs(layer_index, tensors)
         return None
 
     return hook
@@ -770,6 +864,7 @@ def install_routing_replay(model, llm = None, tokenizer = None):
     for layer_index, module in routers:
         compact = (moe_layers.index(layer_index), len(moe_layers)) if dense else None
         module.register_forward_hook(_router_hook(layer_index, compact))
+    _layer_inputs_op()
     for layer_index in moe_layers:
         if layer_index < len(decoder.layers):
             decoder.layers[layer_index].register_forward_pre_hook(_layer_pre_hook(layer_index), with_kwargs = True)

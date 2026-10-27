@@ -15,11 +15,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-Triton stub for Apple Silicon / MLX.
+Triton stub for hosts without Triton (Apple Silicon / MLX, AMD Windows).
 
 Any `import triton.X.Y.Z` auto-resolves to a permissive stub module.
 Attribute access on unknown attrs returns a safe no-op.
-Only injected on macOS ARM64 with MLX (gated in unsloth_zoo/__init__.py).
+Injected globally only on macOS ARM64 with MLX (gated in unsloth_zoo/__init__.py); with no Triton package,
+Unsloth resolves its own kernel modules' triton imports to it.
 """
 
 import types
@@ -46,15 +47,15 @@ class _Noop:
     needs at module-load time (``triton.jit``, ``cdiv``, ``autotune``,
     decorators, dtypes) is defined explicitly elsewhere in this file and
     won't hit ``_Noop``. A call landing here means an unexpected CUDA
-    code path was reached on Apple Silicon — fail loudly instead of
+    code path was reached without Triton — fail loudly instead of
     returning ``None``.
     """
     def __init__(self, name="stub"):
         self._name = name
     def __call__(self, *a, **kw):
         raise NotImplementedError(
-            f"Unsloth: '{self._name}' was called on Apple Silicon / MLX, "
-            f"where triton is stubbed out. The caller likely hit a CUDA-only "
+            f"Unsloth: '{self._name}' was called where triton is stubbed out "
+            f"(Apple Silicon / MLX, or no Triton installed). The caller likely hit a CUDA-only "
             f"kernel path that should be guarded before reaching here."
         )
     def __getattr__(self, name):
@@ -243,6 +244,10 @@ language = _make_module("triton.language", _language_attrs)
 language.math = language
 language.core = _make_module("triton.language.core", _language_attrs)
 
+# Inductor keys every compile (CPU and MPS too) on triton_key(); a raising _Noop there breaks torch.compile.
+def triton_key():
+    return f"unsloth-triton-stub-{__version__}"
+
 # triton.runtime — needs driver.active for target detection
 class _CurrentTarget:
     arch = 0; backend = "stub"
@@ -253,6 +258,7 @@ class _ActiveDriver:
     utils = _Noop("driver.utils")
 
 runtime = _make_module("triton.runtime", {
+    "cache": _make_module("triton.runtime.cache", {"triton_key": triton_key}),
     "driver": _make_module("triton.runtime.driver", {"active": _ActiveDriver()}),
     "errors": _make_module("triton.runtime.errors", {
         "TritonError": TritonError, "InterpreterError": InterpreterError,
@@ -289,7 +295,7 @@ compiler = _make_module("triton.compiler", {
 })
 compiler.compiler = _make_module("triton.compiler.compiler", {
     "CompiledKernel": CompiledKernel, "ASTSource": ASTSource,
-    "IRSource": IRSource, "LazyDict": LazyDict,
+    "IRSource": IRSource, "LazyDict": LazyDict, "triton_key": triton_key,
 })
 compiler.errors = _make_module("triton.compiler.errors", {
     "CompilationError": CompilationError,
@@ -321,6 +327,7 @@ def inject_into_sys_modules():
         "triton.language":               language,
         "triton.language.core":          language.core,
         "triton.runtime":                runtime,
+        "triton.runtime.cache":          runtime.cache,
         "triton.runtime.driver":         runtime.driver,
         "triton.runtime.errors":         runtime.errors,
         "triton.runtime.jit":            runtime.jit,
