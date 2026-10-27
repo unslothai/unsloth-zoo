@@ -267,9 +267,10 @@ def _environment_fingerprint():
             capability = torch.cuda.get_device_capability(device)
             fingerprint["gpu_capability"] = f"sm_{capability[0]}{capability[1]}"
             # ROCm reports one capability for several ISAs (gfx1100/gfx1101).
-            fingerprint["gpu_arch"] = getattr(
-                torch.cuda.get_device_properties(device), "gcnArchName", None
-            )
+            if getattr(torch.version, "hip", None):
+                fingerprint["gpu_arch"] = getattr(
+                    torch.cuda.get_device_properties(device), "gcnArchName", None
+                )
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
             fingerprint["xpu_name"] = torch.xpu.get_device_name(torch.xpu.current_device())
     except Exception:
