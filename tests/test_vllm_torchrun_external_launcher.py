@@ -233,5 +233,5 @@ def test_split_group_gets_a_device_bound_default_group(monkeypatch, split_group)
         assert calls[0]["device_id"] == vu.torch.device("cuda", 1)
         assert calls[0]["backend"] == "cpu:gloo,cuda:nccl"
     else:
-        # Not device bound, but gloo beside nccl: the job's CPU collectives need a CPU backend.
+        # Not device bound, but CPU collectives still need gloo.
         assert "device_id" not in calls[0] and calls[0]["backend"] == "cpu:gloo,cuda:nccl"

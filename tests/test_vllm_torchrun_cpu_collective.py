@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference = True under torchrun: the cross-rank int reduces on a group with no CPU backend.
-
-On a CUDA host init_process_group(backend = None) registers nccl only (torch maps "undefined"
-to the detected accelerator), and get_backend() says "undefined". _all_reduce_int kept its int on
-the CPU for that group, so every torchrun load with fast_inference = True raised "No backend type
-associated with device type cpu" before vLLM started. A "cuda:gloo" group is the same shape on a
-CPU-only host: a backend for one device type, none for CPU tensors.
-"""
+"""fast_inference = True under torchrun: init_process_group(backend = None) on CUDA registers nccl only,
+so _all_reduce_int on a CPU int raised "No backend type associated with device type cpu"."""
 
 import json
 import os
