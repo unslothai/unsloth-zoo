@@ -176,7 +176,8 @@ def _init_torchrun_process_group(launch_info):
         torch.cuda.set_device(local_index)
     if not dist.is_initialized():
         # Same defaults accelerate uses for a torchrun job (HF ddp_timeout = 1800 s); the
-        # Trainer reuses an initialized group. backend None = nccl for cuda + gloo for cpu.
+        # Trainer reuses an initialized group. backend None = the accelerator's backend only
+        # (nccl on CUDA, no CPU backend), so _all_reduce_int reduces its CPU ints over gloo.
         dist.init_process_group(
             backend = None, init_method = "env://", timeout = timedelta(seconds = _process_group_timeout())
         )
@@ -188,14 +189,48 @@ def _init_torchrun_process_group(launch_info):
     return local_index
 pass
 
+def _group_takes_cpu_tensors(group = None):
+    """True when `group` has a backend for CPU tensors (gloo, or "cpu:gloo,cuda:nccl").
+
+    init_process_group(backend = None) on a CUDA host registers only nccl (torch's
+    BackendConfig maps "undefined" to the detected accelerator), and so does "nccl"."""
+    import torch.distributed as dist
+    try:
+        config = str(dist.get_backend_config(group)).lower()
+    except Exception:
+        config = str(dist.get_backend(group)).lower()
+    if ":" in config:
+        return any(part.split(":", 1)[0].strip() == "cpu" for part in config.split(","))
+    return config not in ("nccl", "xccl", "hccl", "undefined")
+pass
+
+# (default group, its gloo twin): one gloo group per default group, made on first use.
+_CPU_REDUCE_GROUP = [None, None]
+
+def _cpu_reduce_group(group = None):
+    """A gloo group over the same ranks as the default group, or None (another group, no gloo).
+
+    new_group is collective over the default group: _all_reduce_int's callers run on every rank."""
+    import torch.distributed as dist
+    if group is not None or not dist.is_gloo_available():
+        return None
+    from torch.distributed.distributed_c10d import _get_default_group
+    default = _get_default_group()
+    if _CPU_REDUCE_GROUP[0] is not default:
+        _CPU_REDUCE_GROUP[:] = [default, dist.new_group(backend = "gloo")]
+    return _CPU_REDUCE_GROUP[1]
+pass
+
 def _all_reduce_int(value, op, group = None):
     """One int reduced over `group` (default: the job's group) on a backend that takes it."""
     import torch.distributed as dist
     tensor = torch.tensor([int(value)], dtype = torch.int64)
-    # backend None (ours, accelerate's) has gloo for CPU tensors and reports "undefined" or
-    # "cpu:gloo,cuda:nccl"; only a device-only group the caller created takes none.
-    if str(dist.get_backend(group)).lower() in ("nccl", "xccl", "hccl"):
-        tensor = tensor.to(get_target_device())
+    if not _group_takes_cpu_tensors(group):
+        cpu_group = _cpu_reduce_group(group)
+        if cpu_group is not None:
+            group = cpu_group
+        else:
+            tensor = tensor.to(get_target_device())
     dist.all_reduce(tensor, op = op, group = group)
     return int(tensor.item())
 pass
