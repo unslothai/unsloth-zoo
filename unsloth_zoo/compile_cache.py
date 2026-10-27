@@ -58,10 +58,12 @@ __all__ = [
 ]
 
 import atexit
+import contextlib
 import hashlib
 import json
 import os
 import stat
+import sys
 import time
 
 _UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
@@ -69,9 +71,19 @@ _UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 _FORMAT_VERSION = 1
 _BUNDLE_NAME = "megacache.bin"
 _MANIFEST_NAME = "manifest.json"
+_LOCK_NAME = ".lock"
+# Bounded so a wedged writer can never hang interpreter exit; on timeout the
+# save proceeds unlocked (the pre-lock behaviour), never skipped.
+_LOCK_TIMEOUT = 60
 
 # One fingerprint accumulates every model loaded in this process; each
-# unsloth_compile_transformers call extends the key.
+# unsloth_compile_transformers call extends the key. The key is the SET of
+# distinct model entries (deduplicated, canonically ordered), not the call
+# history: torch's cache entries are content-addressed (graph + config +
+# system), so a bundle can only be hit by the exact graphs it was built from
+# and the key merely groups artifacts. Reloading a model, or loading the same
+# models in another order, therefore reuses one bundle instead of minting a
+# fresh key that never hits.
 _STATE = {
     "armed": False,
     "loaded_key": None,
@@ -232,16 +244,21 @@ def _environment_fingerprint():
         "format": _FORMAT_VERSION,
         "torch": None,
         "cuda": None,
+        "hip": None,
+        "python": "%d.%d" % sys.version_info[:2],
         "triton": None,
         "transformers": None,
         "unsloth_zoo": None,
         "gpu_name": None,
         "gpu_capability": None,
+        "gpu_arch": None,
+        "xpu_name": None,
     }
     try:
         import torch
         fingerprint["torch"] = str(torch.__version__)
         fingerprint["cuda"] = str(torch.version.cuda)
+        fingerprint["hip"] = str(getattr(torch.version, "hip", None))
         if torch.cuda.is_available():
             # The bound device, not device 0: mixed-arch hosts must not save
             # one GPU's kernels under another's key.
@@ -249,6 +266,12 @@ def _environment_fingerprint():
             fingerprint["gpu_name"] = torch.cuda.get_device_name(device)
             capability = torch.cuda.get_device_capability(device)
             fingerprint["gpu_capability"] = f"sm_{capability[0]}{capability[1]}"
+            # ROCm reports one capability for several ISAs (gfx1100/gfx1101).
+            fingerprint["gpu_arch"] = getattr(
+                torch.cuda.get_device_properties(device), "gcnArchName", None
+            )
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            fingerprint["xpu_name"] = torch.xpu.get_device_name(torch.xpu.current_device())
     except Exception:
         pass
     try:
@@ -284,6 +307,19 @@ def _model_key(model_type, compile_kwargs, torch_compile_options):
         "torch_compile_options": {k: torch_compile_options[k] for k in sorted(torch_compile_options)},
     }
     return payload
+pass
+
+
+def _register_model_key(entry):
+    """Add one model entry to the process key: exact repeats are dropped and
+    entries kept in canonical order, so the key is a function of the model SET.
+    Returns whether the set changed."""
+    model_keys = _STATE["model_keys"]
+    if entry in model_keys:
+        return False
+    model_keys.append(entry)
+    model_keys.sort(key = lambda item: json.dumps(item, sort_keys = True, default = str))
+    return True
 pass
 
 
@@ -377,12 +413,23 @@ def _merge_recorded_artifacts(data):
     loaded-and-hit or compiled, so without this a run that exercises a subset
     of a warm bundle (a different shape, one of several cached models) would
     replace the bundle with that subset and silently drop the rest.
-    Best-effort: a failure just means this save may narrow the bundle."""
+    Best-effort: a failure just means this save may narrow the bundle.
+
+    Returns True when the bundle already holds every artifact this process
+    recorded, i.e. the union IS the bundle and there is nothing to save. The
+    byte comparison alone misses that: serialization follows this run's
+    recording order, so a warm run that only re-hit the bundle would rewrite
+    it with the same artifacts in another order on every exit."""
     try:
         from torch.compiler._cache import CacheArtifactManager
         artifacts = CacheArtifactManager.deserialize(data)
         if not artifacts:
-            return
+            return False
+        on_disk = set()
+        for items in artifacts.values():
+            on_disk.update(items)
+        if all(artifact in on_disk for artifact in CacheArtifactManager._seen_artifacts):
+            return True
         merged = 0
         for artifact_type, items in artifacts.items():
             for artifact in items:
@@ -397,6 +444,35 @@ def _merge_recorded_artifacts(data):
             _log(f"merged {merged} artifact(s) from the existing bundle")
     except Exception as error:
         _log(f"bundle merge skipped ({error})")
+    return False
+pass
+
+
+@contextlib.contextmanager
+def _key_lock(directory):
+    """Serialize savers of one key across processes: read-merge-publish-collect
+    must not interleave, or one writer collects the bundle another's manifest
+    is about to name (a dangling manifest) and concurrent unions drop each
+    other's artifacts. filelock (a zoo dependency) uses flock / msvcrt, which
+    the OS releases if the holder dies, so a crashed writer leaves no stale
+    lock. Any failure (missing package, a filesystem without locking, timeout)
+    falls back to the unlocked save, which is still crash-safe on its own."""
+    lock = None
+    try:
+        from filelock import FileLock
+        lock = FileLock(os.path.join(directory, _LOCK_NAME), timeout = _LOCK_TIMEOUT)
+        lock.acquire()
+    except Exception as error:
+        lock = None
+        _log(f"save lock unavailable ({error}); saving unlocked")
+    try:
+        yield
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
 pass
 
 
@@ -416,10 +492,15 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
         _log("unavailable (needs torch >= 2.7); skipping")
         return False
 
-    _STATE["model_keys"].append(
+    _register_model_key(
         _model_key(model_type, compile_kwargs or {}, torch_compile_options or {})
     )
     key = _bundle_key()
+    # Same set as the bundle already loaded (a model reloaded in this
+    # process): its artifacts are in torch's caches; do not re-read them.
+    if _STATE["hit"] and key == _STATE["loaded_key"]:
+        _log(f"bundle for key {key} already loaded")
+        return True
     directory, manifest_path = _bundle_paths(key)
     if manifest_path is None:
         _log("no trusted cache root; skipping")
@@ -443,6 +524,10 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
         return False
 
     manifest, data = _read_disk_bundle(directory, manifest_path)
+    if manifest is None and os.path.exists(manifest_path):
+        # A concurrent save may have replaced the manifest and collected the
+        # bundle it named between our two reads; the new manifest is complete.
+        manifest, data = _read_disk_bundle(directory, manifest_path)
     if manifest is None:
         _log(f"no bundle for key {key} (will compile locally and save on exit)")
         return False
@@ -492,78 +577,91 @@ def megacache_save():
         if not _ensure_private_directory(directory):
             _log("cache directory is not trusted; skipping save")
             return False
-        # Fold the on-disk bundle back into the manager before serializing so a
-        # run that exercised only part of a warm bundle cannot narrow it (union
-        # semantics; see _merge_recorded_artifacts).
-        _, existing = _read_disk_bundle(directory, manifest_path)
-        if existing is not None:
-            _merge_recorded_artifacts(existing)
-        result = torch.compiler.save_cache_artifacts()
-        if not result or not result[0]:
-            _log("nothing to save (no compile artifacts recorded)")
-            return False
-        data = result[0]
-        new_sha = hashlib.sha256(data).hexdigest()
-        # Skip rewriting a byte-identical bundle so a no-op run doesn't churn
-        # the cache (and its mtime) every exit.
-        if existing is not None and hashlib.sha256(existing).hexdigest() == new_sha:
-            _log("bundle unchanged; skipping save")
-            return False
-        # The bundle is content-addressed and the manifest names it, so the
-        # pair is consistent without a cross-file lock: concurrent writers
-        # produce differently named bundles, the manifest replace is atomic, and
-        # the last manifest to land points at its own complete file. Same name
-        # always implies same bytes.
-        bundle_name = f"megacache-{new_sha[:16]}.bin"
-        bundle_path = os.path.join(directory, bundle_name)
-        # Content-addressing means a trusted file of this name already holds
-        # these bytes, but a leftover from an older writer could be group-
-        # writable; skipping the write would leave the manifest pointing at an
-        # untrusted bundle that every load rejects. (Re)write unless the
-        # existing file already passes the trusted-file checks.
-        if _read_trusted_file(bundle_path, binary = True) is None:
-            temporary_path = f"{bundle_path}.tmp.{os.getpid()}"
-            with open(temporary_path, "wb") as file:
-                file.write(data)
-            # Owner-only so a same-group user cannot rewrite the bytes later.
-            if os.name == "posix":
-                os.chmod(temporary_path, 0o600)
-            os.replace(temporary_path, bundle_path)
-        manifest = {
-            "format": _FORMAT_VERSION,
-            "key": key,
-            "created": time.time(),
-            "bytes": len(data),
-            "sha256": new_sha,
-            "bundle": bundle_name,
-            "env": _environment_fingerprint(),
-            "models": _STATE["model_keys"],
-        }
-        temporary_manifest = f"{manifest_path}.tmp.{os.getpid()}"
-        with open(temporary_manifest, "w") as file:
-            json.dump(manifest, file, indent = 2, sort_keys = True, default = str)
-        if os.name == "posix":
-            os.chmod(temporary_manifest, 0o600)
-        os.replace(temporary_manifest, manifest_path)
-        _log(f"saved bundle for key {key} ({len(data)} bytes)")
-        # Best-effort GC of superseded bundle files (including the legacy
-        # fixed-name one). A reader that already opened one keeps its handle;
-        # a later reader re-reads the manifest and finds the new name.
-        try:
-            for name in os.listdir(directory):
-                is_stale_bundle = (
-                    name == _BUNDLE_NAME
-                    or (name.startswith("megacache-") and name.endswith(".bin"))
-                    or ".bin.tmp." in name
-                )
-                if is_stale_bundle and name != bundle_name:
-                    os.unlink(os.path.join(directory, name))
-        except Exception:
-            pass
-        return True
+        with _key_lock(directory):
+            return _save_locked(torch, key, directory, manifest_path)
     except Exception as error:
         _log(f"save failed ({error})")
         return False
+pass
+
+
+def _save_locked(torch, key, directory, manifest_path):
+    """Body of ``megacache_save`` run under the per-key lock."""
+    # Fold the on-disk bundle back into the manager before serializing so a
+    # run that exercised only part of a warm bundle cannot narrow it (union
+    # semantics; see _merge_recorded_artifacts).
+    _, existing = _read_disk_bundle(directory, manifest_path)
+    if existing is not None and _merge_recorded_artifacts(existing):
+        _log("bundle already holds every recorded artifact; skipping save")
+        return False
+    result = torch.compiler.save_cache_artifacts()
+    if not result or not result[0]:
+        _log("nothing to save (no compile artifacts recorded)")
+        return False
+    data = result[0]
+    new_sha = hashlib.sha256(data).hexdigest()
+    # Skip rewriting a byte-identical bundle so a no-op run doesn't churn
+    # the cache (and its mtime) every exit.
+    if existing is not None and hashlib.sha256(existing).hexdigest() == new_sha:
+        _log("bundle unchanged; skipping save")
+        return False
+    # The bundle is content-addressed and the manifest names it, so the
+    # pair stays consistent even for an unlocked (fallback) writer: bundles
+    # are differently named, the manifest replace is atomic, and the last
+    # manifest to land points at its own complete file. Same name always
+    # implies same bytes.
+    bundle_name = f"megacache-{new_sha[:16]}.bin"
+    bundle_path = os.path.join(directory, bundle_name)
+    # Content-addressing means a trusted file of this name already holds
+    # these bytes, but a leftover from an older writer could be group-
+    # writable; skipping the write would leave the manifest pointing at an
+    # untrusted bundle that every load rejects. (Re)write unless the
+    # existing file already passes the trusted-file checks.
+    if _read_trusted_file(bundle_path, binary = True) is None:
+        temporary_path = f"{bundle_path}.tmp.{os.getpid()}"
+        with open(temporary_path, "wb") as file:
+            file.write(data)
+        # Owner-only so a same-group user cannot rewrite the bytes later.
+        if os.name == "posix":
+            os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, bundle_path)
+    manifest = {
+        "format": _FORMAT_VERSION,
+        "key": key,
+        "created": time.time(),
+        "bytes": len(data),
+        "sha256": new_sha,
+        "bundle": bundle_name,
+        "env": _environment_fingerprint(),
+        "models": _STATE["model_keys"],
+    }
+    temporary_manifest = f"{manifest_path}.tmp.{os.getpid()}"
+    with open(temporary_manifest, "w") as file:
+        json.dump(manifest, file, indent = 2, sort_keys = True, default = str)
+    if os.name == "posix":
+        os.chmod(temporary_manifest, 0o600)
+    os.replace(temporary_manifest, manifest_path)
+    _log(f"saved bundle for key {key} ({len(data)} bytes)")
+    # Best-effort GC of superseded bundle files (including the legacy
+    # fixed-name one). A reader that already opened one keeps its handle;
+    # a later reader re-reads the manifest and finds the new name. Per file:
+    # Windows refuses to unlink a bundle a reader holds open.
+    try:
+        names = os.listdir(directory)
+    except Exception:
+        names = ()
+    for name in names:
+        is_stale_bundle = (
+            name == _BUNDLE_NAME
+            or (name.startswith("megacache-") and name.endswith(".bin"))
+            or ".bin.tmp." in name
+        )
+        if is_stale_bundle and name != bundle_name:
+            try:
+                os.unlink(os.path.join(directory, name))
+            except Exception:
+                pass
+    return True
 pass
 
 
