@@ -76,6 +76,7 @@ def _env(monkeypatch):
                  "UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS"):
         monkeypatch.delenv(name, raising = False)
     sb._FAILED.clear()
+    getattr(sparse_gates, "_BACKWARD_OK", set()).clear()
 
 
 def _patched():
@@ -950,3 +951,122 @@ def test_flex_failure_under_capture_is_raised_not_latched(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     assert s._flex_or_none("dsa", "DSA", fail, query, query, query) is None
     assert len(sb._FAILED) == 1
+
+
+class _BackwardFails(torch.autograd.Function):
+    """Stands in for a flex kernel whose forward runs and whose backward fails (shared-memory OutOfResources)."""
+
+    @staticmethod
+    def forward(ctx, query):
+        return query * 2
+
+    @staticmethod
+    def backward(ctx, grad):
+        raise RuntimeError("out of resource: shared memory, Required: 262144, Hardware limit: 101376")
+
+
+def _qkv(requires_grad = True):
+    g = torch.Generator().manual_seed(0)
+    return [torch.randn(1, 4, 32, 16, generator = g).requires_grad_(requires_grad) for _ in range(3)]
+
+
+def test_flex_backward_failure_is_latched_before_the_step():
+    """flex's backward runs in loss.backward(), past _flex_or_none's try / except: the first training call of a shape
+    class probes it, so a failing backward latches the dense path for this call instead of ending training."""
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    q, k, v = _qkv()
+
+    def flex(query, key, value):
+        sb._count("flex", "dsa")
+        return _BackwardFails.apply(query) + key * value
+
+    flex_before, fallback_before = _stat("flex", "dsa"), _stat("fallback", "dsa")
+    out = s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v)
+    assert out is None, "a flex call whose backward fails was returned to autograd"
+    assert len(sb._FAILED) == 1 and "out of resource" in next(iter(sb._FAILED.values()))
+    # The probe's own call is not counted.
+    assert _stat("flex", "dsa") == flex_before and _stat("fallback", "dsa") == fallback_before + 1
+    assert q.grad is None and k.grad is None
+    # Latched: the shape class is no longer eligible, the next call goes straight to the dense path.
+    assert sb._failure_key("dsa", q, k, v) in sb._FAILED
+
+
+def test_flex_backward_probe_runs_once_and_matches():
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    q, k, v = _qkv()
+    calls = []
+
+    def flex(query, key, value):
+        calls.append(query.requires_grad)
+        sb._count("flex", "dsa")
+        return query * key + value
+
+    before = _stat("flex", "dsa")
+    out = s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v)
+    assert calls == [True, True] and _stat("flex", "dsa") == before + 1  # probe + real call, the probe uncounted
+    assert out.grad_fn is not None
+    out.sum().backward()
+    torch.testing.assert_close(q.grad, k.detach())
+    torch.testing.assert_close(v.grad, torch.ones_like(v))
+    assert s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v) is not None
+    assert len(calls) == 3  # probed once per shape class
+    assert not sb._FAILED
+
+
+def test_flex_backward_probe_skipped_without_autograd():
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    calls = []
+
+    def flex(query, key, value):
+        calls.append(1)
+        return _BackwardFails.apply(query) + key + value
+
+    q, k, v = _qkv(requires_grad = False)
+    assert s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v) is not None  # no backward will run
+    q, k, v = _qkv()
+    with torch.no_grad():
+        assert s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v) is not None
+    assert len(calls) == 2 and not sb._FAILED and not sparse_gates._BACKWARD_OK
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_flex_backward_probe_under_gradient_checkpointing(use_reentrant):
+    """The probe's saved tensors bypass the checkpoint's hooks: recompute sees the same saved tensors as the forward."""
+    from torch.utils.checkpoint import checkpoint
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    w = torch.randn(16, 16, requires_grad = True)
+
+    def flex(query, key, value):
+        return torch.softmax(query @ key.transpose(-1, -2), -1) @ value
+
+    def layer(x):
+        q, k, v = (x @ w).sin(), (x @ w).cos(), x @ w
+        out = s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v)
+        return (out @ w).sin()  # like o_proj: flex is not the region's last saved tensor (checkpoint early stop)
+
+    x = torch.randn(1, 4, 32, 16, requires_grad = True)
+    checkpoint(layer, x, use_reentrant = use_reentrant).sum().backward()
+    got = (x.grad.clone(), w.grad.clone())
+    assert len(sparse_gates._BACKWARD_OK) == 1
+    x.grad, w.grad = None, None
+    layer(x).sum().backward()
+    torch.testing.assert_close(got[0], x.grad)
+    torch.testing.assert_close(got[1], w.grad)
+
+
+def test_flex_backward_probe_traces_without_graph_break():
+    """Inside a compiled region the probe is a no-op (the flex call there is already outside the graph)."""
+    calls = []
+
+    def flex(query, key, value):
+        calls.append(1)
+        return query + key + value
+
+    @torch.compile(backend = "eager", fullgraph = True)
+    def f(q, k, v):
+        sparse_gates.probe_flex_backward(("dsa", None), flex, (q, k, v))
+        return q * 2
+
+    q, k, v = _qkv()
+    f(q, k, v)
+    assert not calls and not sparse_gates._BACKWARD_OK

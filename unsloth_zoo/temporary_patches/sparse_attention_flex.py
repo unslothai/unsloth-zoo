@@ -24,7 +24,8 @@ their fp32 score buffers stay bounded.
 
 Engaged automatically on CUDA sm80+ / ROCm with Triton, bf16 / fp16, no attention dropout,
 no output_attentions, q_len >= 16, outside an enclosing torch.compile (there the model's own
-path runs). A flex failure latches that shape class back to the dense path. Kill switches: UNSLOTH_SPARSE_ATTN_FLEX=0, UNSLOTH_SPARSE_INDEXER_CHUNKED=0.
+path runs). A flex failure, forward or (probed once per shape class) backward, latches that shape class back to
+the dense path. Kill switches: UNSLOTH_SPARSE_ATTN_FLEX=0, UNSLOTH_SPARSE_INDEXER_CHUNKED=0.
 The patched forwards are installed on transformers >= 5.17 when the installed source matches
 the layout they reimplement (DSA caches expanded K / V on 5.17, the latent on 5.18+);
 otherwise the model is left untouched.
@@ -45,7 +46,7 @@ from .utils import logger
 from . import sparse_attention as _skip
 from .sparse_attention import _transformers_tested
 from unsloth_zoo.flex_attention import sparse_blocks as _sb
-from unsloth_zoo.flex_attention.sparse import sparse_indexer_chunked_enabled
+from unsloth_zoo.flex_attention.sparse import probe_flex_backward, sparse_indexer_chunked_enabled
 
 # family -> modeling module, bound at patch time
 _MODELING = {}
@@ -110,8 +111,11 @@ _MINIMAX_INDEXER_NEEDLES = (
 
 
 def _flex_or_none(kind, label, fn, query, key, value, *args):
-    """The flex attention call, or None after a failure (latched per shape) so the caller takes the dense path."""
+    """The flex attention call, or None after a failure (latched per shape) so the caller takes the dense path.
+    The first call per shape class that autograd will backpropagate first probes flex's backward, which would
+    otherwise fail later in loss.backward(), past this fallback."""
     try:
+        probe_flex_backward(_sb._failure_key(kind, query, key, value), fn, args)
         return fn(*args)
     except Exception as error:
         # A failure under CUDA graph capture has already invalidated it: the dense path cannot rescue the
