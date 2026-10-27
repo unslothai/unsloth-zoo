@@ -36,7 +36,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from .sparse import record_sparse_attn, sparse_flex_enabled
+from .sparse import additive_bias_present, record_sparse_attn, sparse_flex_enabled
 
 _TILE = 128
 _FAILED = {}
@@ -398,7 +398,7 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling,
         bias = None
         if mask.dtype != torch.bool:
             values = mask[:, 0]
-            if bool((_visible(values) & (values != 0)).any()):
+            if additive_bias_present(values, _visible(values)):
                 # Finite biases (not just 0 / masked): added through score_mod like upstream's additive mask.
                 bias = _pad_to(_pad_to(torch.where(_visible(values), values, 0), 1, q_pad, 0), 2, kv_pad, 0)
                 bias = bias.expand(batch, -1, -1)

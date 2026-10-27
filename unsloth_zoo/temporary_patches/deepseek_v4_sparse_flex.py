@@ -104,6 +104,7 @@ def _count(key):
 
 
 def _compiled_flex():
+    # Built at install: set lazily inside a trace, the `_FLEX is None` guard recompiled the next call.
     global _FLEX
     if _FLEX is None:
         from torch.nn.attention.flex_attention import flex_attention
@@ -130,6 +131,9 @@ def _device_thresholds(device, forced):
                         thresholds = {None: _FORCED_MIN_KEYS}
         except Exception:
             thresholds = None
+        # Cached from eager calls only: filled inside a trace, the dict guard recompiled the next call.
+        if torch.compiler.is_compiling():
+            return thresholds
         _DEVICE_OK[key] = thresholds
     return _DEVICE_OK[key]
 
@@ -190,6 +194,7 @@ def deepseek_v4_block_mask(attention_mask, batch):
     (and -inf) are hard-masked; every other value is added to the score like eager does, so finite custom
     biases are kept. Whole 128 x 128 tiles with nothing visible are skipped."""
     from torch.nn.attention.flex_attention import BlockMask
+    from unsloth_zoo.flex_attention.sparse import additive_bias_present
 
     q_len, kv_len = attention_mask.shape[-2], attention_mask.shape[-1]
     nq, nk = -(-q_len // _BLOCK), -(-kv_len // _BLOCK)
@@ -200,7 +205,7 @@ def deepseek_v4_block_mask(attention_mask, batch):
     # transformers' own masks are 0 / min only; reading a bias per score costs 5-15%, so only when present.
     # Inside a compiled graph the check would be a data-dependent branch, so the bias is always kept there.
     bias = None
-    if torch.compiler.is_compiling() or bool((visible & (attention_mask[:, 0] != 0)).any()):
+    if torch.compiler.is_compiling() or additive_bias_present(attention_mask[:, 0], visible):
         bias = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK))
         bias[:, :q_len, :kv_len] = torch.where(visible, attention_mask[:, 0], 0)
         if bias.shape[0] != batch:
@@ -283,6 +288,7 @@ def patch_deepseek_v4_sparse_flex():
     # DeepseekV4Attention resolves the module global per call, so the dispatcher sees every call that
     # transformers would have sent to eager.
     modeling.eager_attention_forward = _make_attention_forward(original)
+    _compiled_flex()
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: DeepSeek-V4 prefill / training attention runs on flex attention.")
 pass

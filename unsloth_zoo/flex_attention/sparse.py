@@ -28,10 +28,13 @@ __all__ = [
     "sparse_indexer_chunked_enabled",
     "record_sparse_attn",
     "reset_sparse_attn_stats",
+    "additive_bias_present",
 ]
 
 # {kind: {model_type: count}}; not updated while torch.compile traces (no guard on the int).
 SPARSE_ATTN_STATS = {}
+# (device, dtype, shape) -> whether the last eager additive mask of that shape carried finite biases.
+_BIAS_SEEN = {}
 
 
 def sparse_skip_full_enabled():
@@ -58,3 +61,21 @@ def record_sparse_attn(kind, model_type):
 
 def reset_sparse_attn_stats():
     SPARSE_ATTN_STATS.clear()
+
+
+def additive_bias_present(mask, visible):
+    """Whether an additive float mask holds finite nonzero entries (not just 0 / masked), which flex adds
+    through a score_mod (5-15% slower). Eager this is a host sync. Under CUDA graph capture a sync invalidates
+    the capture, and flipping the answer would need a kernel compiled during capture, so the eager warm-up's
+    answer for the same shape is reused: no bias is then asserted on device at every replay (a finite bias
+    raises instead of being dropped); a shape never run eagerly keeps the bias."""
+    key = (mask.device, mask.dtype, tuple(mask.shape))
+    if mask.is_cuda and torch.cuda.is_current_stream_capturing():
+        if _BIAS_SEEN.get(key) is False:
+            torch._assert_async(
+                ~(visible & (mask != 0)).any(), "Unsloth: finite attention-mask bias in a CUDA graph captured without one",
+            )
+            return False
+        return True
+    _BIAS_SEEN[key] = found = bool((visible & (mask != 0)).any())
+    return found

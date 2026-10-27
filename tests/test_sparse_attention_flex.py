@@ -824,3 +824,62 @@ def test_config_output_attentions_keeps_the_model_path(family):
         assert not sb.dsa_flex_eligible(module, q, q, q, mask, {}, None)
         config.output_attentions = False
         assert sb.dsa_flex_eligible(module, q, q, q, mask, {}, None)
+
+
+@needs_models
+@gpu
+@pytest.mark.parametrize("finite_bias", [False, True])
+def test_dsa_flex_cuda_graph_capture_matches_eager(finite_bias):
+    """The finite-bias check is a host sync; under stream capture it invalidated the capture
+    (cudaErrorStreamCaptureInvalidated). Capturing keeps the bias instead: the replay matches the eager call."""
+    torch.manual_seed(0)
+    dev, dt = "cuda", torch.bfloat16
+    B, H, S, T, D = 1, 4, 64, 1024, 64
+    q = torch.randn(B, H, S, D, device = dev, dtype = dt)
+    k = torch.randn(B, H, T, D, device = dev, dtype = dt)
+    topk_idx = torch.randperm(T, device = dev)[:256].sort().values.int().expand(B, S, -1)
+    mask = torch.zeros(B, 1, S, T, device = dev, dtype = dt)
+    mask[..., -64:] = torch.finfo(dt).min
+    if finite_bias:
+        mask = mask + torch.rand_like(mask).mul(0.5)
+
+    def fn():
+        if hasattr(topk_idx, "_unsloth_dsa_flex"):
+            del topk_idx._unsloth_dsa_flex  # rebuild the block mask (and run the bias check) every call
+        return sb.dsa_flex_attention(q, k, k, topk_idx, mask, D ** -0.5)
+
+    eager = fn().clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            fn()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream = stream):
+        out = fn()
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _rel(out, eager) < 1e-2, _rel(out, eager)
+
+
+def test_flex_failure_under_capture_is_raised_not_latched(monkeypatch):
+    """A failure while a CUDA graph is being captured has invalidated the capture, so the dense fallback cannot
+    run either: it is raised, and the shape class stays on flex."""
+    import types
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    query = types.SimpleNamespace(
+        is_cuda = True, device = types.SimpleNamespace(index = 0), dtype = torch.bfloat16, shape = (1, 4, 64, 64),
+    )
+
+    def fail():
+        raise RuntimeError("operation not permitted when stream is capturing")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match = "capturing"):
+        s._flex_or_none("dsa", "DSA", fail, query, query, query)
+    assert not sb._FAILED
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert s._flex_or_none("dsa", "DSA", fail, query, query, query) is None
+    assert len(sb._FAILED) == 1
