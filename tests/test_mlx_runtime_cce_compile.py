@@ -1043,7 +1043,7 @@ def test_smoothed_finite_logits_past_the_cap_match_the_saturated_loss(ratio):
 ])
 def test_confident_rows_keep_their_loss_and_gradient(monkeypatch, kind, dtype, rows):
     _skip_torch_shim()
-    if not mx.metal.is_available():
+    if kind != "fallback" and not mx.metal.is_available():
         pytest.skip("requires Metal kernels")
     from unsloth_zoo.mlx.cce import runtime_cce
 
