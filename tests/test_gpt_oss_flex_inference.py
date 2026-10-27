@@ -89,6 +89,50 @@ def test_mask_positions_cpu(monkeypatch, form, window, q_len, q_offset, kv_offse
     assert torch.equal(dense, _allowed(window, q_len, q_offset, kv_offset, kv_len, padding))
 
 
+def test_row_dependent_mask_keeps_per_row_blocks_cpu(monkeypatch):
+    # Packed documents (transformers derives them from position_ids) make mask_function depend on the row; with no
+    # padding mask the block layout must still be per row, or a block fully visible in row 0 skips mask_mod in row 1.
+    from torch.nn.attention.flex_attention import create_block_mask, create_mask
+    import unsloth_zoo.flex_attention.utils as U
+    monkeypatch.setattr(U, "compiled_create_block_mask",
+                        lambda m, b, h, M, N, device = "cpu": create_block_mask(m, b, h, M, N, device = device),
+                        raising = False)
+    from unsloth_zoo.temporary_patches.gpt_oss import _gpt_oss_flex_mask
+    T = 256
+    doc = torch.zeros(2, T, dtype = torch.long)
+    doc[1, 128:] = 1
+    def mask_function(b, h, q, kv):
+        return (kv <= q) & (doc[b, q] == doc[b, kv])
+    block_mask = _gpt_oss_flex_mask(batch_size = 2, q_length = T, kv_length = T, mask_function = mask_function,
+                                    attention_mask = None, device = "cpu")
+    # What the kernel sees: full blocks are visible without mask_mod, partial blocks go through it.
+    dense_mod = create_mask(block_mask.mask_mod, 2, 1, T, T, device = "cpu")[:, 0]
+    partial, full = _block_layout(block_mask, T)
+    effective = full | (partial & dense_mod)
+    q = torch.arange(T)[:, None]; kv = torch.arange(T)[None]
+    want = torch.stack([(kv <= q) & (doc[b][:, None] == doc[b][None]) for b in range(2)])
+    assert torch.equal(effective, want)
+
+
+def _block_layout(block_mask, T):
+    # [B, T, T] booleans of the partial and full blocks a BlockMask lists.
+    B = block_mask.BLOCK_SIZE[0]
+    def expand(num, idx):
+        out = torch.zeros(num.shape[0], T, T, dtype = torch.bool)
+        if num is None:
+            return out
+        for b in range(num.shape[0]):
+            for qb in range(num.shape[2]):
+                for j in range(int(num[b, 0, qb])):
+                    kb = int(idx[b, 0, qb, j])
+                    out[b, qb * B:(qb + 1) * B, kb * B:(kb + 1) * B] = True
+        return out
+    partial = expand(block_mask.kv_num_blocks, block_mask.kv_indices)
+    full = (expand(block_mask.full_kv_num_blocks, block_mask.full_kv_indices)
+            if block_mask.full_kv_num_blocks is not None else torch.zeros_like(partial))
+    return partial, full
+
+
 def _oracle(q, k, v, allowed, sinks, scale):
     # fp32 dense reference: softmax over [visible keys, sink], rows with no visible key give 0.
     groups = q.shape[1] // k.shape[1]
@@ -358,3 +402,17 @@ def two_gpu(tmp_path_factory):
 def test_layers_split_across_two_gpus(runs, two_gpu, cache):
     assert two_gpu["calls"]["q1"] > 0
     assert two_gpu["tokens_" + cache] == runs["stock"]["tokens_" + cache]
+
+
+def test_inference_gates_cpu(monkeypatch):
+    # torch < 2.6 BlockMasks (no seq_lengths) keep eager inference; transformers >= 5.21 calls .contiguous() on masks.
+    import unsloth_zoo.temporary_patches.gpt_oss as G
+    from torch.nn.attention.flex_attention import BlockMask
+    monkeypatch.setattr(G, "_GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED", True)
+    monkeypatch.delenv("UNSLOTH_GPT_OSS_EAGER_INFERENCE", raising = False)
+    assert G._gpt_oss_flex_inference("cuda") == G._HAS_INFERENCE_BLOCK_MASK
+    monkeypatch.setattr(G, "_HAS_INFERENCE_BLOCK_MASK", False)
+    assert not G._gpt_oss_flex_inference("cuda")
+    assert G._register_gpt_oss_flex_mask()
+    block_mask = BlockMask.from_kv_blocks(torch.ones(1, 1, 1, dtype = torch.int32), torch.zeros(1, 1, 1, 1, dtype = torch.int32))
+    assert block_mask.contiguous() is block_mask

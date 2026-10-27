@@ -98,11 +98,16 @@ def _gpt_oss_select_mask(attention_mask, attention_type):
 # Eval / generate masks are built under this mask interface name: BlockMasks for flex attention with sinks.
 _GPT_OSS_FLEX_MASK = "unsloth_gpt_oss_flex"
 # Decode masks skip the query-side block indices without grad (only backward reads them) where torch lets them.
+# torch < 2.6 BlockMasks have no seq_lengths, which the inference masks need: eager inference there.
 try:
     from torch.nn.attention.flex_attention import BlockMask as _FlexBlockMask
-    _HAS_COMPUTE_Q_BLOCKS = "compute_q_blocks" in inspect.signature(_FlexBlockMask.from_kv_blocks).parameters
+    _from_kv_blocks_args = inspect.signature(_FlexBlockMask.from_kv_blocks).parameters
+    _HAS_COMPUTE_Q_BLOCKS = "compute_q_blocks" in _from_kv_blocks_args
+    _HAS_INFERENCE_BLOCK_MASK = "seq_lengths" in _from_kv_blocks_args
+    del _from_kv_blocks_args
 except Exception:
-    _HAS_COMPUTE_Q_BLOCKS = False
+    _FlexBlockMask = None
+    _HAS_COMPUTE_Q_BLOCKS = _HAS_INFERENCE_BLOCK_MASK = False
 
 
 def _gpt_oss_flex_inference(device):
@@ -110,6 +115,7 @@ def _gpt_oss_flex_inference(device):
     flex cannot return the LSE the sinks need on CPU)."""
     return (
         _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
+        and _HAS_INFERENCE_BLOCK_MASK
         and os.environ.get("UNSLOTH_GPT_OSS_EAGER_INFERENCE", "0") != "1"
         and torch.device(device).type == "cuda"
     )
@@ -154,7 +160,9 @@ def _gpt_oss_flex_mask(
         if missing > 0:
             padding = torch.nn.functional.pad(padding, (0, missing))
     q_length, kv_length = int(q_length), int(kv_length)
-    bsz = batch_size if padding is not None else None
+    # Per row even without padding: mask_function can depend on the row (packed documents from position_ids), and
+    # a broadcast row-0 block layout would let fully visible blocks skip mask_mod for the other rows.
+    bsz = batch_size
     masks = {}
 
     def build(device):
@@ -211,6 +219,9 @@ def _register_gpt_oss_flex_mask():
         return False
     if _GPT_OSS_FLEX_MASK not in ALL_MASK_ATTENTION_FUNCTIONS._global_mapping:
         ALL_MASK_ATTENTION_FUNCTIONS.register(_GPT_OSS_FLEX_MASK, _gpt_oss_flex_mask)
+    if not hasattr(_FlexBlockMask, "contiguous"):
+        # transformers >= 5.21 generate calls .contiguous() on every mask it builds.
+        _FlexBlockMask.contiguous = lambda self, *args, **kwargs: self
     return True
 
 
