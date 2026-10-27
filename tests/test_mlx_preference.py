@@ -3934,6 +3934,12 @@ class _VisionLanguageModel(TinyModel):
         return logits if pixel_values is None else logits * (1 + pixel_values.sum() / 100)
 
 
+class _NegativeIdsModel(_VisionLanguageModel):
+    def __call__(self, tokens, pixel_values, mask, **kwargs):
+        import mlx.core as mx
+        return super().__call__(mx.where(tokens < 0, 60, tokens), pixel_values, mask, **kwargs)
+
+
 def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
     import numpy as np
     import mlx.core as mx
@@ -3982,6 +3988,21 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
     blank = build([{"prompt": user("yo"), "images": []}] * 3)
     assert blank.vision is False and blank._prompt_ids[0] == tuple(encode("<user>!yo<assistant>"))
     assert completion_logps(model, {"input_ids": mx.array([[1, 64, 2]])}, 1.0).shape == (1, 2)  # a placeholder past the head
+    # Phi-3 Vision's processor places images as negative ids, which a tokenizer cannot decode.
+    phi3 = _grpo_vision_processor()
+    phi3.__class__ = type("Phi3Processor", (VisionProcessor,), {"__call__": lambda self, *args, **kwargs: (
+        lambda out: {**out, "input_ids": np.where(np.asarray(out["input_ids"]) == 60, -1, out["input_ids"])})(
+        VisionProcessor.__call__(self, *args, **kwargs))})
+    phi3.tokenizer.decode = lambda ids, **_: "".join(chr(97 + token) for token in ids if token >= 0 or 1 / 0)
+    negative = create_grpo_batch_plan(
+        [data[0], data[1], data[0]], None, num_generations=2, batch_size=2, steps_per_generation=3, num_iterations=1,
+        grad_accum=1, sampling=GRPOSampling(max_tokens=3), max_seq_length=64, shuffle=False, num_batches=3,
+        processor=phi3, model_config={})
+    assert -1 in negative._prompt_ids[0]
+    negative.bind(_NegativeIdsModel(), [lambda completions, **_: [0.0] * len(completions)], keep_completions=True,
+                  trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))
+    negative.materialize(0)
+    assert negative.completions["prompt"][0] == phi3.tokenizer.decode(i for i in negative._prompt_ids[0] if i >= 0)
     index = next(index for index, micro in enumerate(micros) if micro[0].get("pixel_values") is not None)
     shifted = np.array(micros[index][0]["input_ids"])
     shifted[1] += 1  # only the second row

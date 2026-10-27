@@ -845,7 +845,8 @@ class GRPOBatchPlan:
         self._record_generation(lengths, truncated, rewards, reward_stats)
         if self._keep_completions:
             self.completions = {
-                "prompt": [self._decode(self._prompt_ids[prompt]) for prompt in prompts],
+                # Phi-3 Vision's image placeholders are negative ids, which no tokenizer decodes.
+                "prompt": [self._decode(i for i in self._prompt_ids[prompt] if i >= 0) for prompt in prompts],
                 "completion": texts,
                 "rewards": {
                     reward_function_name(reward_func): rewards[:, column].tolist()
