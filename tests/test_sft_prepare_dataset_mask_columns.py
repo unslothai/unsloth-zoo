@@ -18,6 +18,7 @@
 (collator applies masks) and >= 1.7 (_prepare_dataset builds labels). CPU-only, offline."""
 
 import pytest
+import torch
 from datasets import Dataset
 from transformers import DataCollatorForLanguageModeling
 
@@ -101,3 +102,42 @@ def test_plain_input_ids_still_get_the_lm_collator():
     out = sft_prepare_dataset(trainer, dataset, Tokenizer(), Args(), False, None, "train")
     assert type(trainer.data_collator) is DataCollatorForLanguageModeling
     assert "labels" not in out.column_names
+
+
+class Trl018Collator:
+    """TRL 0.18's DataCollatorForLanguageModeling: labels are the input_ids, only completion_mask is applied, and a
+    "labels" column is never read."""
+
+    def __init__(self, pad_token_id, completion_only_loss = True, pad_to_multiple_of = None):
+        self.pad_token_id = pad_token_id
+        self.completion_only_loss = completion_only_loss
+
+    def __call__(self, examples):
+        def pad(rows, value):
+            return torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(r) for r in rows], batch_first = True, padding_value = value
+            )
+
+        labels = pad([e["input_ids"] for e in examples], -100)
+        if self.completion_only_loss and "completion_mask" in examples[0]:
+            labels[pad([e["completion_mask"] for e in examples], 0) == 0] = -100
+        return {"input_ids": pad([e["input_ids"] for e in examples], self.pad_token_id), "labels": labels}
+
+
+@pytest.fixture
+def trl_018_collator(monkeypatch):
+    monkeypatch.setattr(trl_sft, "DataCollatorForLanguageModeling", Trl018Collator)
+    monkeypatch.setattr(dataset_utils, "_TRL_COLLATOR_APPLIES_MASKS", None)
+    yield
+    dataset_utils._TRL_COLLATOR_APPLIES_MASKS = None
+
+
+def test_trl_018_collator_applies_masks_itself(trl_018_collator):
+    assert dataset_utils.trl_collator_applies_masks() is True
+
+
+def test_trl_018_completion_mask_reaches_its_collator(trl_018_collator):
+    dataset = Dataset.from_list([{"input_ids": r["input_ids"], "completion_mask": r["completion_mask"]} for r in ROWS])
+    out = sft_prepare_dataset(Trainer(), dataset, Tokenizer(), Args(), False, None, "train")
+    labels = Trl018Collator(pad_token_id = 0)([out[i] for i in range(len(out))])["labels"]
+    assert sorted(x for x in labels.flatten().tolist() if x != -100) == [13, 14, 21, 22]

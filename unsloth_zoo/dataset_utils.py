@@ -2646,12 +2646,17 @@ except:
 _TRL_COLLATOR_APPLIES_MASKS = None
 def trl_collator_applies_masks():
     # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
+    # TRL 0.18 applies completion_mask but reads no "labels" column, so labels built here would be dropped.
     global _TRL_COLLATOR_APPLIES_MASKS
     if _TRL_COLLATOR_APPLIES_MASKS is None:
         try:
             from trl.trainer.sft_trainer import DataCollatorForLanguageModeling as _TRLCollator
-            labels = _TRLCollator(pad_token_id = 0)([{"input_ids": [1, 2], "assistant_masks": [0, 1]}])["labels"]
-            _TRL_COLLATOR_APPLIES_MASKS = bool(labels[0, 0] == -100)
+            collator = _TRLCollator(pad_token_id = 0)
+            def masked(**row):
+                return bool(collator([{"input_ids": [1, 2], **row}])["labels"][0, 0] == -100)
+            _TRL_COLLATOR_APPLIES_MASKS = masked(assistant_masks = [0, 1]) or (
+                masked(completion_mask = [0, 1]) and not masked(labels = [-100, 2])
+            )
         except Exception:
             _TRL_COLLATOR_APPLIES_MASKS = True
     return _TRL_COLLATOR_APPLIES_MASKS
