@@ -1545,6 +1545,7 @@ TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
 # Kaggle T4, mamba_ssm 2.3.1: Triton 3.2 fails (`map::at`), 3.3 fails (`PassManager::run failed`), 3.4-3.6 train.
+# V100 (sm_70), Triton 3.6: Granite-4.0-H and Falcon-H1 train with matching losses (unsloth-zoo#2090).
 _MAMBA_SM75_MIN_TRITON = (3, 4)
 
 
@@ -1565,8 +1566,8 @@ def _mamba_ssm_fast_path_blocker(capability):
         return None
     if forced == "0":
         return "UNSLOTH_MAMBA_PRE_AMPERE_FAST=0 is set"
-    if tuple(capability) < (7, 5):
-        return f"they need compute capability 7.5+ (this GPU is {major}.{minor})"
+    if tuple(capability) < (7, 0):
+        return f"they need compute capability 7.0+ (this GPU is {major}.{minor})"
     try:
         import re as _re
         import triton
@@ -1629,6 +1630,107 @@ def _retrim_mamba_ssm_autotune():
         return _single_mamba_ssm_autotune_config()
     except Exception:
         return 0
+pass
+
+
+def _resolves_to_mamba_ssm(fn):
+    """Whether a transformers 5.15+ `use_kernel_func_from_hub_with_fallback` function is bound to a mamba_ssm callable."""
+    _stack, _seen = [(fn, 0)], set()
+    while _stack:
+        _g, _depth = _stack.pop()
+        if id(_g) in _seen or _depth > 6:
+            continue
+        _seen.add(id(_g))
+        _inner = [getattr(_g, "__wrapped__", None)]
+        for _cell in (getattr(_g, "__closure__", None) or ()):
+            try:
+                _inner.append(_cell.cell_contents)
+            except ValueError:
+                pass
+        for _c in _inner:
+            if not callable(_c):
+                continue
+            if str(getattr(_c, "__module__", None) or "").startswith("mamba_ssm"):
+                return True
+            _stack.append((_c, _depth + 1))
+    return False
+pass
+
+
+def _hub_func_factory_patched(factory, flag):
+    """Whether `flag` is set anywhere along the `__wrapped__` chain of Unsloth's factory wrappers."""
+    for _ in range(8):
+        if factory is None:
+            return False
+        if getattr(factory, flag, False):
+            return True
+        factory = getattr(factory, "__wrapped__", None)
+    return False
+pass
+
+
+def _bind_mamba_ssm_to_torch_reference():
+    """Make transformers 5.15+ take the PyTorch reference for every mamba_ssm function.
+
+    Those versions bind mamba_ssm in `use_kernel_func_from_hub_with_fallback`
+    when the modeling module is imported, asking neither `is_mamba_ssm_available`
+    nor `lazy_load_kernel`, so steps 0 and 1 of the guard never reach them.
+    """
+    import sys
+    try:
+        import transformers.integrations as _integrations
+        from transformers.integrations import hub_kernels as _hk
+    except Exception:
+        return
+    _original = getattr(_hk, "use_kernel_func_from_hub_with_fallback", None)
+    if _original is None:
+        return  # transformers < 5.15: gated by is_fast_path_available instead
+
+    if not _hub_func_factory_patched(_original, "_unsloth_mamba_ssm_torch"):
+        def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
+            if package != "mamba_ssm":
+                return _original(func_name, package, internal_path)
+            def decorator(torch_function):
+                try:
+                    return _hk.use_kernel_forward_from_hub(func_name)(torch_function)
+                except Exception:
+                    return torch_function
+            return decorator
+        use_kernel_func_from_hub_with_fallback._unsloth_mamba_ssm_torch = True
+        use_kernel_func_from_hub_with_fallback.__wrapped__ = _original
+        _hk.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
+        try:
+            setattr(_integrations, "use_kernel_func_from_hub_with_fallback", use_kernel_func_from_hub_with_fallback)
+        except Exception:
+            pass
+    pass
+
+    # Modules imported before this ran already hold the kernel: rebind to the reference it wraps.
+    for _module_name, _module in list(sys.modules.items()):
+        if _module is None:
+            continue
+        if not (_module_name.startswith("transformers.models.") or "unsloth_compiled_module" in _module_name):
+            continue
+        try:
+            _items = list(_module.__dict__.items())
+        except Exception:
+            continue
+        for _name, _fn in _items:
+            if not callable(_fn) or isinstance(_fn, type) or getattr(_fn, "__wrapped__", None) is None:
+                continue
+            try:
+                if not _resolves_to_mamba_ssm(_fn):
+                    continue
+                _reference = _fn
+                while getattr(_reference, "__wrapped__", None) is not None:
+                    _reference = _reference.__wrapped__
+                if _reference is _fn or str(getattr(_reference, "__module__", "")).startswith("mamba_ssm"):
+                    continue
+                setattr(_module, _name, _reference)
+            except Exception:
+                pass
+        pass
+    pass
 pass
 
 
@@ -1799,6 +1901,9 @@ def patch_mamba_ssm_pre_ampere_fallback():
     # 0b / 0c. Jamba and Zamba raise instead of taking the slow path.
     _force_slow_path_on_raising_mamba_mixers()
 
+    # 0d. transformers 5.15+ binds mamba_ssm at modeling import, past steps 0 and 1.
+    _bind_mamba_ssm_to_torch_reference()
+
     try:
         import mamba_ssm  # noqa: F401
     except Exception:
@@ -1942,7 +2047,7 @@ def patch_mamba_fused_split_without_causal_conv1d():
 
     import sys
 
-    if not getattr(_original, "_unsloth_no_causal_conv1d", False):
+    if not _hub_func_factory_patched(_original, "_unsloth_no_causal_conv1d"):
         def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
             if func_name != "mamba_split_conv1d_scan_combined" or package != "mamba_ssm":
                 return _original(func_name, package, internal_path)
@@ -1973,27 +2078,7 @@ def patch_mamba_fused_split_without_causal_conv1d():
             continue
         if _fn is None or getattr(_fn, "_unsloth_no_causal_conv1d", False):
             continue
-        _resolves_to_mamba_ssm = False
-        _stack, _seen = [(_fn, 0)], set()
-        while _stack and not _resolves_to_mamba_ssm:
-            _g, _depth = _stack.pop()
-            if id(_g) in _seen or _depth > 6:
-                continue
-            _seen.add(id(_g))
-            _inner = [getattr(_g, "__wrapped__", None)]
-            for _cell in (getattr(_g, "__closure__", None) or ()):
-                try:
-                    _inner.append(_cell.cell_contents)
-                except ValueError:
-                    pass
-            for _c in _inner:
-                if not callable(_c):
-                    continue
-                if str(getattr(_c, "__module__", None) or "").startswith("mamba_ssm"):
-                    _resolves_to_mamba_ssm = True
-                    break
-                _stack.append((_c, _depth + 1))
-        if not _resolves_to_mamba_ssm:
+        if not _resolves_to_mamba_ssm(_fn):
             continue
         _stub = functools.wraps(_fn)(lambda *a, **k: None)
         _stub._unsloth_no_causal_conv1d = True

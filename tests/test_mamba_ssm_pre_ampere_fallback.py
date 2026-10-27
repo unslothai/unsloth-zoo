@@ -40,6 +40,7 @@ _SRC = MISC.read_text(encoding = "utf-8")
 _NAMES = (
     "_MAMBA_SM75_MIN_TRITON", "_weakest_cuda_capability", "_mamba_ssm_fast_path_blocker",
     "_single_mamba_ssm_autotune_config", "_retrim_mamba_ssm_autotune",
+    "_resolves_to_mamba_ssm", "_hub_func_factory_patched", "_bind_mamba_ssm_to_torch_reference",
     "_force_slow_path_on_raising_mamba_mixers", "patch_mamba_ssm_pre_ampere_fallback",
     "_mamba_fast_kernels_missing", "patch_mamba_kernels_missing_fallback",
 )
@@ -637,14 +638,41 @@ def test_t4_with_an_old_or_missing_triton_falls_back(env, monkeypatch, capsys, v
     assert ("is missing" if version is None else version) in out
 
 
-@pytest.mark.parametrize("capability", [(7, 0), (6, 1)])
-def test_older_than_t4_falls_back_whatever_the_triton(env, monkeypatch, capsys, capability):
+@pytest.mark.parametrize("capability", [(6, 1), (6, 0), (5, 2)])
+def test_older_than_v100_falls_back_whatever_the_triton(env, monkeypatch, capsys, capability):
     model_mod, _iu, _hk = env
     monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = capability), raising = False)
     _set_triton(monkeypatch, "3.6.0")
     patch()
     assert model_mod.is_fast_path_available is False
-    assert "compute capability 7.5+" in capsys.readouterr().out
+    assert "compute capability 7.0+" in capsys.readouterr().out
+
+
+# V100 (sm_70) on Triton 3.6 trains Granite-4.0-H and Falcon-H1 like the T4 (unsloth-zoo#2090).
+
+@pytest.mark.parametrize("version", ["3.4.0", "3.6.0"])
+def test_v100_with_a_new_triton_keeps_fast_path_and_trims(env, monkeypatch, capsys, version):
+    model_mod, iu, hk = env
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (7, 0)), raising = False)
+    kernel, cheapest = _autotuned_mamba_module(monkeypatch)
+    sys.modules["triton"].__version__ = version
+    assert patch() is None
+    assert model_mod.is_fast_path_available is True
+    assert iu.is_mamba_ssm_available() is True
+    assert "mamba-ssm" not in hk._HUB_KERNEL_MAPPING
+    assert kernel.configs == [cheapest]
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("version", ["3.3.1", None])
+def test_v100_with_an_old_or_missing_triton_falls_back(env, monkeypatch, capsys, version):
+    model_mod, _iu, _hk = env
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (7, 0)), raising = False)
+    _set_triton(monkeypatch, version)
+    patch()
+    assert model_mod.is_fast_path_available is False
+    out = capsys.readouterr().out
+    assert "Triton 3.4+" in out and "7.0" in out
 
 
 def test_env_forces_the_fast_path_on(env, monkeypatch):
