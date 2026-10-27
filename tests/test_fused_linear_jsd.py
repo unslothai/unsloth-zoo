@@ -182,8 +182,7 @@ def test_peaked_rows_match_fp64(beta):
 
 @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
 def test_unlabelled_3d_divides_by_batch_as_trl(beta):
-    """No labels, mask or count: TRL >= 0.24 batchmean divides [batch, seq, vocab] by batch (0.18 - 0.23 by batch *
-    seq); 2D rows by the row count either way. A mask or labels keep the kept-row count."""
+    """No labels, mask or count: divide by batch (TRL >= 0.24 batchmean); a mask keeps the kept-row count."""
     g = torch.Generator().manual_seed(21)
     w = torch.randn(V, H, generator = g) / 3
     wt = torch.randn(V, HT, generator = g) / 3

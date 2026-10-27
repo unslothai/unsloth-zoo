@@ -2456,8 +2456,7 @@ def fused_linear_jsd(
     ``(1 - beta) p_student + beta p_teacher``. Rows are kept where ``mask`` is non zero and ``labels != ignore_index``
     (either may be omitted). The sum is divided by ``num_items_in_batch`` when given (TRL >= 1.x), else by the kept
     row count (``reduction = "batchmean"``); a zero divisor counts as 1. With neither labels, mask nor count the
-    divisor is the batch size (the leading dimension), as TRL >= 0.24 (0.18 - 0.23 divided 3D logits by batch *
-    sequence): pass ``num_items_in_batch`` to pin another. The
+    divisor is the batch size, as TRL >= 0.24 (0.18 - 0.23 used batch * sequence). The
     transform is ``* logit_scale`` then softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
     taken in forward; teacher inputs are never differentiated and may have their own hidden size and device.
     ``scaling`` (fp16 GradScaler) multiplies stored gradients; backward divides it out."""
