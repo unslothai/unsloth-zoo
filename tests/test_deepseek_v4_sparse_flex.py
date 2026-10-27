@@ -526,3 +526,64 @@ def test_device_probe_traces_without_graph_break():
         return x + F4._min_keys(attn, device, True)
 
     assert torch.compile(probe, fullgraph = True)(torch.zeros(1, device = "cuda")).item() == 16
+
+
+def _capture(fn):
+    """fn() warmed up on a side stream, captured into a CUDA graph and replayed: (replayed output, eager output)."""
+    eager = fn().clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            fn()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream = stream):
+        out = fn()
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    return out, eager
+
+
+@needs_flex_gpu
+@pytest.mark.parametrize("finite_bias", [False, True])
+def test_cuda_graph_capture_matches_eager(finite_bias):
+    """The finite-bias check is a host sync; under stream capture it invalidated the capture
+    (cudaErrorStreamCaptureInvalidated). Capturing keeps the bias instead: the replay matches the eager call."""
+    torch.manual_seed(0)
+    attn = _Attn(4, "cuda").to(torch.bfloat16)
+    q = torch.randn(1, 4, 256, 64, device = "cuda", dtype = torch.bfloat16)
+    kv = torch.randn(1, 1, 256 + 64, 64, device = "cuda", dtype = torch.bfloat16)
+    mask = _mask(1, 256, 128, 64, 4, 16, torch.bfloat16, "cuda")
+    if finite_bias:
+        mask = mask + torch.rand_like(mask).mul(0.5)
+    with torch.no_grad():
+        out, eager = _capture(lambda: modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)[0])
+    assert F4.DEEPSEEK_V4_FLEX_STATS["flex"] == 4 and F4.DEEPSEEK_V4_FLEX_STATS["eager"] == 0
+    assert _rel(out, eager) < 1e-2, _rel(out, eager)
+
+
+@needs_flex_gpu
+def test_cold_fullgraph_compile_is_one_graph(monkeypatch):
+    """Right after install, a fullgraph dynamic compile of the dispatcher is one graph: the compiled flex
+    callable used to be set lazily inside the trace, and its `_FLEX is None` guard recompiled the next call."""
+    import torch._dynamo
+    monkeypatch.setattr(modeling, "eager_attention_forward", ORIGINAL)
+    monkeypatch.setattr(F4, "_FLEX", None)
+    F4.patch_deepseek_v4_sparse_flex()
+    attn = _Attn(4, "cuda").to(torch.bfloat16)
+    q = torch.randn(1, 4, 256, 64, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+    kv = torch.randn(1, 1, 320, 64, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+    mask = _mask(1, 256, 128, 64, 4, 16, torch.bfloat16, "cuda")
+    forward = modeling.eager_attention_forward
+
+    def fn(q, kv, mask):
+        return forward(attn, q, kv, kv, mask, 0.125)[0]
+
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    compiled = torch.compile(fn, fullgraph = True, dynamic = True)
+    for _ in range(2):
+        compiled(q, kv, mask).float().sum().backward()
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 1, dict(torch._dynamo.utils.counters["stats"])

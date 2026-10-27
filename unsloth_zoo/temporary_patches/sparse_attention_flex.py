@@ -114,6 +114,10 @@ def _flex_or_none(kind, label, fn, query, key, value, *args):
     try:
         return fn(*args)
     except Exception as error:
+        # A failure under CUDA graph capture has already invalidated it: the dense path cannot rescue the
+        # capture, and the shape class is not at fault, so nothing is latched.
+        if query.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise
         _sb.record_failure(kind, query, key, value, error)
         logger.warning(f"Unsloth: {label} sparse flex attention failed, using the dense path: {error}")
         return None
