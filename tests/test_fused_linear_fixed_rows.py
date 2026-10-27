@@ -75,6 +75,23 @@ def test_fixed_rows_equal_compaction(dtype, head, ent, lazy, monkeypatch):
     assert (got[0][dropped] == 0).all() and (got[len(got) - (3 if head else 1)][dropped] == 0).all()
 
 
+@pytest.mark.parametrize("head", [False, True])
+def test_fixed_rows_dropped_row_keeps_its_normalizer(head, monkeypatch):
+    # A dropped row still computes exp(z - lse) in the backward (times a zero gradient): its saved lse must stay its
+    # real one, or a large bias / low temperature turns that into 0 * inf.
+    h, w = torch.randn(2, 4), torch.randn(4, 4)
+    b, t, mask = torch.tensor([0.0, 10.0, 0.0, 0.0]), torch.tensor([1, 2]), torch.tensor([True, False])
+    def run(fixed):
+        monkeypatch.setattr(fl, "_FIXED_ROWS", fixed)
+        hh, ww, bb = h.clone().requires_grad_(), w.clone().requires_grad_(head), b.clone().requires_grad_(head)
+        lp = fl.fused_linear_logprobs(hh, ww, t, bias = bb, mask = mask, temperature = 0.1)
+        lp.sum().backward()
+        return (lp, hh.grad) + ((ww.grad, bb.grad) if head else ())
+    for r, x in zip(run(False), run(True)):
+        assert torch.isfinite(x).all()
+        torch.testing.assert_close(x, r, rtol = 1e-5, atol = 1e-6)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA")
 @pytest.mark.parametrize("head", [False, True])
 def test_logprobs_capture_in_a_cuda_graph(head):

@@ -1521,9 +1521,10 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
 def _lp_outputs(marks, idx, n_keep, N, logps, ent, mean, lssp, top1, u, lse, block_top, lpt):
     if marks is None:
         return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + (lpt,)
-    # Fixed rows: dropped rows read 0 as compaction leaves them; the backward gets the marks and count -1.
+    # Fixed rows: dropped rows read 0 as compaction leaves them; the backward gets the marks and count -1. lse (internal,
+    # saved for the backward) keeps its real value: a zeroed one makes exp(z - lse) overflow there (0 * inf = NaN).
     drop = marks < 0
-    for x in (logps, ent, mean, lssp, top1, u, lse, lpt):
+    for x in (logps, ent, mean, lssp, top1, u, lpt):
         if x.numel() > 0:
             x.masked_fill_(drop.view(-1, *([1] * (x.dim() - 1))), 0)
     return (logps, ent, mean, lssp, top1, u, lse, block_top, marks, torch.tensor([-1], dtype = torch.long), lpt)
