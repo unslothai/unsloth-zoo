@@ -414,8 +414,7 @@ def _grouped_mm_with_backward_fix(
     if _triton_grouped_mm_wanted(inputs, weight):
         return _triton_grouped_mm(inputs, weight, offsets)
     if inputs.dtype != weight.dtype:
-        # Cast before the route check: fp16 activations meeting fp32 masters (fp16 full finetuning) become
-        # fp16 / fp16, which only the compiled fp16 op below can trace. Eager does the same cast either way.
+        # Cast first so fp16 x fp32 masters reaches the compile-safe fp16 op below.
         inputs, weight = _match_grouped_mm_dtypes(inputs, weight)
     if (
         inputs.dtype == torch.float16
@@ -428,7 +427,6 @@ def _grouped_mm_with_backward_fix(
 
 
 def _grouped_mm_eager(inputs, weight, offsets):
-    # Direct callers may still pass mixed dtypes; _grouped_mm_with_backward_fix casts before routing.
     if inputs.dtype != weight.dtype:
         inputs, weight = _match_grouped_mm_dtypes(inputs, weight)
     inputs = inputs.contiguous()

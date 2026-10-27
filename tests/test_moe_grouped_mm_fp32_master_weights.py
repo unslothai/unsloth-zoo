@@ -100,8 +100,7 @@ def _compile_counters():
 
 @pytest.mark.parametrize("fullgraph", [True, False])
 def test_fp16_activation_meets_fp32_master_compiles(fullgraph):
-    """Compiled fp16 full finetuning: the mixed call must take the compile-safe fp16 op after the cast
-    (torch._grouped_mm's fake impl rejects fp16), with no graph break, matching eager bitwise."""
+    """Compiled fp16 x fp32-master grouped_mm: one graph, no breaks, bitwise equal to eager."""
     _cpu_half_autocast_or_skip()
     if moe_utils._GROUPED_MM_FP16_OP is None:
         pytest.skip("torch.library.custom_op unavailable")
@@ -118,7 +117,7 @@ def test_fp16_activation_meets_fp32_master_compiles(fullgraph):
     _, w, _ = _case(torch.float16, torch.float32)
     out = torch.compile(step, fullgraph = fullgraph, dynamic = True)(x, w, offsets)
     out.float().sum().backward()
-    # One frame, fully captured: torch 2.14 escapes the failed fp16 trace as "unimplemented" frames instead.
+    # torch 2.14 reports a failed fp16 trace as "unimplemented", not a graph break.
     assert sum(counters["graph_break"].values()) == 0
     assert sum(counters["unimplemented"].values()) == 0
     assert counters["frames"]["total"] == counters["frames"]["ok"]
