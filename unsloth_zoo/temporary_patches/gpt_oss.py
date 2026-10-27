@@ -130,39 +130,62 @@ def _gpt_oss_flex_mask(
         # transformers 4.x: queries sit at cache_position.
         q_length = cache_position.shape[0]
         q_offset = cache_position[0]
-    device = torch.device(device)
     # Copies: StaticLayer's query offset is its live cumulative_length, which update() bumps in place before the
     # attention reads this mask, so an alias lets chunked prefill queries see later keys.
-    q_off = torch.as_tensor(q_offset, device = device).to(torch.int64).reshape(()).clone()
-    kv_off = torch.as_tensor(kv_offset, device = device).to(torch.int64).reshape(()).clone()
+    q_off = torch.as_tensor(q_offset).to(torch.int64).reshape(()).clone()
+    kv_off = torch.as_tensor(kv_offset).to(torch.int64).reshape(()).clone()
+    padding = None
     if attention_mask is not None and attention_mask.dim() == 2:
-        padding = attention_mask.to(device = device, dtype = torch.bool)
+        padding = attention_mask.to(dtype = torch.bool)
         # Slots past the 2D mask (unwritten static cache slots) stay invisible.
-        missing = int(kv_length) + int(kv_offset) - padding.shape[-1]
+        missing = int(kv_length) + int(kv_off) - padding.shape[-1]
         if missing > 0:
             padding = torch.nn.functional.pad(padding, (0, missing))
-        def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
-            kv_pos = kv_idx + kv_off
-            return mask_function(batch_idx, head_idx, q_idx + q_off, kv_pos) & padding[batch_idx, kv_pos]
-        bsz = batch_size
-    else:
-        def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
-            return mask_function(batch_idx, head_idx, q_idx + q_off, kv_idx + kv_off)
-        bsz = None
     q_length, kv_length = int(q_length), int(kv_length)
-    if q_length == 1:
-        # Decode: one query row, so block sparsity saves nothing; mark every KV block partial and let mask_mod
-        # decide per key instead of evaluating the mask over the whole cache each step.
-        from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
-        n = (kv_length + BLOCK - 1) // BLOCK
-        rows = bsz or 1
-        kv_num_blocks = torch.full((rows, 1, 1), n, dtype = torch.int32, device = device)
-        kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
-        return BlockMask.from_kv_blocks(
-            kv_num_blocks, kv_indices.contiguous(), BLOCK_SIZE = BLOCK, mask_mod = mask_mod,
-            seq_lengths = (1, kv_length),
-        )
-    return compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
+    bsz = batch_size if padding is not None else None
+    masks = {}
+
+    def build(device):
+        # mask_mod's captured tensors must sit on the device the attention runs on, which BlockMask.to() does not
+        # move: a layer on another GPU (device_map, block swap) gets its own mask from _gpt_oss_block_mask_on.
+        device = torch.device(device)
+        if device in masks:
+            return masks[device]
+        q_o, kv_o = q_off.to(device), kv_off.to(device)
+        if padding is not None:
+            pad = padding.to(device)
+            def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+                kv_pos = kv_idx + kv_o
+                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_pos) & pad[batch_idx, kv_pos]
+        else:
+            def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o)
+        if q_length == 1:
+            # Decode: one query row, so block sparsity saves nothing; mark every KV block partial and let mask_mod
+            # decide per key instead of evaluating the mask over the whole cache each step.
+            from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
+            n = (kv_length + BLOCK - 1) // BLOCK
+            rows = bsz or 1
+            kv_num_blocks = torch.full((rows, 1, 1), n, dtype = torch.int32, device = device)
+            kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
+            block_mask = BlockMask.from_kv_blocks(
+                kv_num_blocks, kv_indices.contiguous(), BLOCK_SIZE = BLOCK, mask_mod = mask_mod,
+                seq_lengths = (1, kv_length),
+            )
+        else:
+            block_mask = compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
+        block_mask._unsloth_on_device = build
+        masks[device] = block_mask
+        return block_mask
+
+    return build(device)
+
+
+@torch.compiler.disable
+def _gpt_oss_block_mask_on(block_mask, device):
+    """The BlockMask for a layer on another device (see _gpt_oss_flex_mask's build); built once per device per forward."""
+    on_device = getattr(block_mask, "_unsloth_on_device", None)
+    return on_device(device) if on_device is not None else block_mask.to(device)
 
 
 def _register_gpt_oss_flex_mask():
@@ -3456,6 +3479,8 @@ def patch_GptOssAttention():
             attn_weights = None
         elif _BlockMask is not None and isinstance(attention_mask, _BlockMask):
             # Eval / generate: GptOssModel.forward built this mask from absolute positions (_gpt_oss_flex_mask).
+            if attention_mask.kv_num_blocks.device != query_states.device:
+                attention_mask = _gpt_oss_block_mask_on(attention_mask, query_states.device)
             attn_output = flex_attention_with_sink_inference(
                 self,
                 query_states,

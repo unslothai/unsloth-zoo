@@ -174,7 +174,14 @@ _SCRIPT = textwrap.dedent('''
     with torch.no_grad():
         for n, p in model.named_parameters():
             p.normal_(0, 0.5 if "sinks" in n else 0.06)
-    model = model.to("cuda", dtype).eval()
+    if mode == "flex_2gpu":
+        # Layers split across two GPUs (device_map): accelerate moves tensors between cards, not BlockMasks.
+        from accelerate import dispatch_model
+        device_map = {"model.embed_tokens": 0, "model.rotary_emb": 0, "model.norm": 1, "lm_head": 1}
+        device_map.update({f"model.layers.{i}": int(i >= L // 2) for i in range(L)})
+        model = dispatch_model(model.to(dtype), device_map = device_map).eval()
+    else:
+        model = model.to("cuda", dtype).eval()
 
     g = torch.Generator().manual_seed(1)
     B, T = 3, 16
@@ -204,6 +211,13 @@ _SCRIPT = textwrap.dedent('''
         return model.generate(input_ids, attention_mask = attention_mask, max_new_tokens = n, do_sample = False,
                               pad_token_id = 0, cache_implementation = None if cache == "dynamic" else "static",
                               output_scores = True, return_dict_in_generate = True)
+    if mode == "flex_2gpu":
+        with torch.no_grad():
+            for cache in ("dynamic", "static"):
+                res["tokens_" + cache] = gen(cache, ids, pad, new_tokens).sequences.tolist()
+        res["calls"] = dict(CALLS)
+        print("RESULT " + json.dumps(res))
+        sys.exit(0)
     with torch.no_grad():
         res["prefill"] = (model(input_ids = ids, attention_mask = pad, use_cache = False).logits.float()
                           * pad[:, :, None]).tolist()
@@ -321,3 +335,15 @@ def test_train_generate_train(runs):
     l1, l2 = runs["flex"]["train_losses"]
     assert l1 == l2 and l1 == l1
     assert runs["flex"]["short_nograd_finite"]
+
+
+@pytest.fixture(scope = "module")
+def two_gpu(tmp_path_factory):
+    return _run(tmp_path_factory.mktemp("gpt_oss_flex_2gpu"), "flex_2gpu")
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason = "needs two GPUs")
+@pytest.mark.parametrize("cache", ["dynamic", "static"])
+def test_layers_split_across_two_gpus(runs, two_gpu, cache):
+    assert two_gpu["calls"]["q1"] > 0
+    assert two_gpu["tokens_" + cache] == runs["stock"]["tokens_" + cache]
