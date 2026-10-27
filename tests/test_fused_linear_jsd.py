@@ -197,7 +197,6 @@ def _confident_same_token(dtype):
     # A top logit of exactly 0 makes x_j - lse exactly 0 on some devices; shifted rows round it to an ulp instead.
     shift = (torch.rand(n, 1, generator = g) * 10 - 5).round(decimals = 2)
     rows = [(zs.to(dtype), zt.to(dtype)), ((zs + shift).to(dtype), (zt + shift).to(dtype))]
-    # Two tokens, student margin 20, teacher 30: forward KL 2.06e-9 read -9.4e-13 with a zero top-token gradient.
     rows.append((torch.tensor([[0.0, -20.0]], dtype = dtype), torch.tensor([[0.0, -30.0]], dtype = dtype)))
     return rows
 
@@ -219,8 +218,7 @@ def _jsd_route(path, monkeypatch):
 
 
 def _exact_jsd(s_row, t_row, beta):
-    """80-digit loss and d loss / d student logits of one row: the closed forms of TRL's generalized_jsd_loss. fp64
-    collapses too past a margin of ~37 (e^-37 < its epsilon), so it cannot referee the e^-50 rows."""
+    """80-digit loss and dz of TRL's generalized_jsd_loss; fp64 collapses past margin ~37, so it cannot referee e^-50."""
     import mpmath  # a torch dependency (through sympy)
     mp = mpmath.mp.clone()
     mp.dps = 80
@@ -267,8 +265,7 @@ def test_exact_jsd_oracle_is_trls_loss(beta):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
 def test_confident_same_token_rows_match_exact(beta, dtype, path, monkeypatch):
-    """Both heads confident on one token: x_j - lse rounds to 0 there in fp32, which cancelled KL(q || p),
-    KL(p || q) and the JSD to rounding noise (negative or 1e4x off) and dropped the top-token gradient."""
+    """Both heads confident on one token: fp32 x_j - lse rounds to 0, which collapsed KL / JSD and the top-token dz."""
     device = _jsd_route(path, monkeypatch)
     for zs, zt in _confident_same_token(dtype):
         w = torch.eye(zs.shape[1], dtype = dtype, device = device)  # logits == hidden
@@ -296,8 +293,7 @@ def test_confident_same_token_body_matches_exact(beta):
 
 @pytest.mark.parametrize("path", ["body", "chunk", "triton"])
 def test_diffuse_rows_keep_the_direct_beta0_gradient(path):
-    """The beta 0 top-token dz from the masses off it (q_o - p_o) is only for confident rows: on diffuse rows both
-    masses are near 1 and cancel, so p_j - q_j stays direct there."""
+    """beta 0 top-token dz = q_o - p_o only on confident rows; on diffuse rows both are near 1 and cancel."""
     torch.manual_seed(123)
     s = torch.randn(2, 150000)
     t = s + 0.001 * torch.randn_like(s)

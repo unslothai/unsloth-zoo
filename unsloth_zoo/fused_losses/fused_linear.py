@@ -697,8 +697,7 @@ if _HAS_TRITON:
     def _fl_jsd_stats_kernel(s_ptr, t_ptr, stride, V, stat_ptr, NB, s_scale, s_cap, t_scale, t_cap, inv_t,
                              S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,
                              T_CAP: tl.constexpr, BLOCK: tl.constexpr):
-        # Per block: both maxima and sums of exp(x - max), the block's first student argmax js, and both sums
-        # without column js (the mass of the other tokens, exact where one token holds almost all of it).
+        # Per block: maxima, sums of exp(x - max), first student argmax js, and both sums without column js.
         row = tl.program_id(0)
         blk = tl.program_id(1)
         cols = blk * BLOCK + tl.arange(0, BLOCK)
@@ -750,10 +749,8 @@ if _HAS_TRITON:
     def _fl_jsd_pre_kernel(s_ptr, t_ptr, stride, stat_ptr, NB, aux_ptr, beta, log1mb, logb,
                            s_scale, s_cap, t_scale, t_cap, inv_t, MODE: tl.constexpr, S_SCALE: tl.constexpr,
                            S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK_NB: tl.constexpr):
-        # One program per row, from the block stats: lse of both heads, the student's top token j, c = d_j (the
-        # shift of the beta 1 / interior gradient), and j's exact loss terms and beta 0 dz. With both heads
-        # confident on j, x_j - lse rounds to 0 (or an ulp) and those cancel to noise; log1p(-mass of the others)
-        # keeps them. aux row: lse_s, lse_t, j, c, loss term(s) of j, dz_j / (coef inv_t ds).
+        # Per row: confident x_j - lse rounds to 0 in fp32, so j's terms use log1p(-mass of the others).
+        # aux row: lse_s, lse_t, j, c = d_j, loss term(s) of j, dz_j / (coef inv_t ds).
         row = tl.program_id(0)
         b = tl.arange(0, BLOCK_NB)
         okb = b < NB
@@ -777,8 +774,7 @@ if _HAS_TRITON:
         y, _ = _fl_transform(y, t_scale, t_cap, T_SCALE, T_CAP)
         x = x * inv_t
         y = y * inv_t
-        # Mass off j (block jb without column j, every other block whole), then the totals as that plus j's own
-        # term (exactly 1 at the max): no 1 + tiny sum inside a block decides p_o / q_o or lse.
+        # Totals = mass off j + j's exact 1, so no 1 + tiny in-block sum decides p_o / q_o or lse.
         r_s = tl.sum(tl.where(at_j, s_off, ls) * ws, 0)
         r_t = tl.sum(tl.where(at_j, t_off, lt) * wt, 0)
         sum_s = r_s + tl.exp(x - top_s)
@@ -816,9 +812,8 @@ if _HAS_TRITON:
                            beta, log1mb, logb, s_scale, s_cap, t_scale, t_cap, inv_t,
                            MODE: tl.constexpr, WRITE_DZ: tl.constexpr, S_SCALE: tl.constexpr,
                            S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr):
-        # Partial sums without the student's top token j (the pre kernel has j's exact terms). MODE 0: beta = 0,
-        # sum q (lt - ls) and (WRITE_DZ) dz = p - q, j's from aux, in one pass. MODE 1: beta = 1, sum p (d - c),
-        # d = ls - lt. MODE 2: interior, sum q (lt - m) and sum p (d - c), d = ls - m.
+        # Sums without j (aux has j's terms). MODE 0: beta 0, sum q (lt - ls), dz = p - q. MODE 1: beta 1,
+        # sum p (d - c), d = ls - lt. MODE 2: interior, sum q (lt - m), sum p (d - c), d = ls - m.
         row = tl.program_id(0)
         blk = tl.program_id(1)
         cols = blk * BLOCK + tl.arange(0, BLOCK)
@@ -864,8 +859,7 @@ if _HAS_TRITON:
             d = ls - lt
         else:
             d = ls - _fl_logaddexp(ls + log1mb, lt + logb)
-        # d shifted by its value c at the student's top token j: the softmax-collapse-safe d - sum p d, with sum p
-        # (d - c) = rs. j's own shifted term is 0 by definition (not this d_j - c, which is an ulp off).
+        # d shifted by c = d_j (collapse-safe d - sum p d); j's term is exactly 0, not this d_j - c (an ulp off).
         g = p * (tl.where(cols == tl.load(a + 2).to(tl.int32), 0.0, d - tl.load(a + 3)) - tl.load(rs_ptr + row))
         dz = g * (tl.load(coef_ptr) * (scale_g * inv_t)) * ds
         tl.store(dz_ptr + row.to(tl.int64) * dz_stride + cols, dz.to(dz_ptr.dtype.element_ty), mask = ok)
@@ -2078,10 +2072,7 @@ def _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, ne
 
 
 def _jsd_peak(l_j, others):
-    """Log-prob of a row's top token from the mass of the others. When both heads are confident on it, x_j - lse
-    rounds to 0 (or one ulp of 1) in fp32 and KL(q || p) / KL(p || q) / the JSD, and the beta = 0 dz (p - q),
-    collapse to rounding noise (negative KL, a lost gradient component); log1p(-others) keeps them. Rows whose top
-    token holds under half the mass keep l_j."""
+    """Top-token log-prob as log1p(-others): confident fp32 x_j - lse rounds to 0 and collapses KL / dz. Else l_j."""
     return torch.where(others < 0.5, torch.log1p(-others), l_j)
 
 
@@ -2093,8 +2084,7 @@ def _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta):
 
 
 def _jsd_peak_dz(ls_j, lt_j, p_o, q_o):
-    """beta 0 dz of the top token, p_j - q_j: q_o - p_o when both heads are confident on it (p_j - q_j cancels), the
-    direct difference otherwise (q_o - p_o cancels when both masses off j are near 1)."""
+    """beta 0 top-token dz: q_o - p_o if both confident (p_j - q_j cancels), else direct (q_o - p_o cancels)."""
     return torch.where((p_o < 0.5) & (q_o < 0.5), q_o - p_o, ls_j.exp() - lt_j.exp())
 
 
@@ -2118,8 +2108,7 @@ def _jsd_chunk(ls, lt, beta, want_grad):
         if not want_grad:
             return row, None
         return row, p.sub_(q).scatter_(1, j, dz_j)
-    # beta 1 / interior: d (ls - lt, or ls - m) is shifted by its value c at j, so j's own term is exactly 0 and
-    # dz = p (d - c - sum p (d - c)) keeps the gradient a confident row's d - sum p d rounds away (the Triton form).
+    # beta 1 / interior: d shifted by c = d_j keeps the gradient a confident d - sum p d rounds away.
     j = ls.argmax(-1, keepdim = True)
     if beta == 1.0:
         ls_j, lt_j = ls.gather(1, j), lt.gather(1, j)
@@ -2221,8 +2210,7 @@ _JSD_TRITON_ROWS = os.environ.get("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB") is None
 
 
 def _jsd_triton(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap, want_grad, grad_dtype):
-    """_jsd_body on CUDA with Triton: two (beta = 0) or three passes over the raw fp32 logits, dz written once; a
-    one-program-per-row kernel between the first two turns the block stats into lse and the top token's terms."""
+    """_jsd_body on CUDA with Triton: two (beta 0) or three passes over raw fp32 logits, dz written once."""
     # Triton launches on the current device: else a head on another card falls back and marks it broken.
     return _launch(s.device, lambda: _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap,
                                                          want_grad, grad_dtype))
