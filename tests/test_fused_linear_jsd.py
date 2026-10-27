@@ -191,9 +191,12 @@ def _confident_same_token(dtype):
     def logits(m):
         z = -torch.rand(n, V, generator = g) * 2 - torch.tensor(m)[:, None]
         z[torch.arange(n), peak] = 0.0
-        return z.to(dtype)
+        return z
 
-    rows = [(logits([a for a, _ in pairs]), logits([b for _, b in pairs]))]
+    zs, zt = logits([a for a, _ in pairs]), logits([b for _, b in pairs])
+    # A top logit of exactly 0 makes x_j - lse exactly 0 on some devices; shifted rows round it to an ulp instead.
+    shift = (torch.rand(n, 1, generator = g) * 10 - 5).round(decimals = 2)
+    rows = [(zs.to(dtype), zt.to(dtype)), ((zs + shift).to(dtype), (zt + shift).to(dtype))]
     # Two tokens, student margin 20, teacher 30: forward KL 2.06e-9 read -9.4e-13 with a zero top-token gradient.
     rows.append((torch.tensor([[0.0, -20.0]], dtype = dtype), torch.tensor([[0.0, -30.0]], dtype = dtype)))
     return rows
@@ -245,10 +248,10 @@ def _exact_jsd(s_row, t_row, beta):
     return torch.tensor(float(loss), dtype = torch.float64), torch.tensor([float(x) for x in grad], dtype = torch.float64)
 
 
-@pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
 def test_exact_jsd_oracle_is_trls_loss(beta):
     """The 80-digit oracle against TRL's formula in fp64 where fp64 still resolves the rows (margin <= 20)."""
-    zs, zt = _confident_same_token(torch.float64)[0]
+    zs, zt = _confident_same_token(torch.float64)[1]
     for i in range(zs.shape[0]):
         if max(-zs[i].topk(2).values[1].item(), -zt[i].topk(2).values[1].item()) > 23:
             continue
@@ -262,10 +265,10 @@ def test_exact_jsd_oracle_is_trls_loss(beta):
 
 @pytest.mark.parametrize("path", ["cpu"] + (["triton", "inductor", "eager"] if torch.cuda.is_available() else []))
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
 def test_confident_same_token_rows_match_exact(beta, dtype, path, monkeypatch):
-    """Both heads confident on one token: x_j - lse rounds to 0 there in fp32, which cancelled KL(q || p) and
-    KL(p || q) to rounding noise (negative loss) and dropped the top-token gradient (p_j - q_j, d_j - sum p d)."""
+    """Both heads confident on one token: x_j - lse rounds to 0 there in fp32, which cancelled KL(q || p),
+    KL(p || q) and the JSD to rounding noise (negative or 1e4x off) and dropped the top-token gradient."""
     device = _jsd_route(path, monkeypatch)
     for zs, zt in _confident_same_token(dtype):
         w = torch.eye(zs.shape[1], dtype = dtype, device = device)  # logits == hidden
@@ -280,7 +283,7 @@ def test_confident_same_token_rows_match_exact(beta, dtype, path, monkeypatch):
             assert err < (1e-4 if dtype == torch.float32 else 1e-2), (i, err)
 
 
-@pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
 def test_confident_same_token_body_matches_exact(beta):
     """_jsd_body (the compiled CUDA form, run eagerly here) on the same rows, fp32 logits."""
     for zs, zt in _confident_same_token(torch.float32):
