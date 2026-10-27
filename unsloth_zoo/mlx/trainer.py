@@ -641,6 +641,7 @@ from .preference import (
     build_reference_policy,
     create_kto_batch_plan,
     create_preference_batch_plan,
+    kto_dataset_is_vision,
     encode_generation_prompt_text,
     make_cpo_loss_fn,
     make_cpo_cce_loss_fn,
@@ -2778,16 +2779,19 @@ class MLXTrainer:
         """
         policy = getattr(self, "_resolved_preference_length_policy", None)
         if policy is None:
-            tokenizer = None
+            tokenizer, vision = None, False
             if self.preference_kind == "kto":
                 # The tokenizer the plan encodes with, whose special tokens KTO adds.
                 tokenizer = (
                     _get_processor_tokenizer(self._resolve_vlm_processor())
                     if self._is_vlm else self.tokenizer
                 )
+                vision = self._is_vlm and self.train_dataset is not None and kto_dataset_is_vision(
+                    self.train_dataset, self.formatting_func, getattr(args, "image_size", None),
+                )
             policy = resolve_preference_length_policy(
                 self.preference_kind, args, max_seq_length=args.max_seq_length,
-                tokenizer=tokenizer,
+                tokenizer=tokenizer, vision=vision,
             )
             self._resolved_preference_length_policy = policy
         return policy

@@ -192,7 +192,7 @@ def _token_budget(value, name):
     return value
 
 
-def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=None):
+def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=None, vision=False):
     """Resolve the four length bounds the way the matching TRL trainer does.
 
     max_seq_length has no TRL counterpart: it is the width a batch can hold, so
@@ -248,7 +248,7 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
             )
             max_completion_length = None
     carry = 0
-    if kind == "kto":
+    if kind == "kto" and not vision:  # TRL's vision KTO collator adds no special tokens
         if tokenizer is None:
             raise ValueError(
                 "Unsloth MLX KTO: resolving the length budget needs the tokenizer."
@@ -1711,6 +1711,20 @@ def _kto_row_images(row, image_size):
     return _vision_prompt_images(_with_trl_image_parts(row), image_size)
 
 
+def _kto_row_is_vision(row, image_size):
+    return "image" in row or "images" in row or bool(_kto_row_images(row, image_size))
+
+
+def kto_dataset_is_vision(dataset, formatting_func=None, image_size=None):
+    """Whether a vision-language model's KTO plan follows TRL's vision collator for
+    ``dataset``, which its first unpaired row decides."""
+    first = next(iter(_unpaired_kto_rows(dataset, formatting_func)), None)
+    try:
+        return first is not None and _kto_row_is_vision(first[1], image_size)
+    except ValueError:  # the plan reports the row
+        return False
+
+
 def _encode_vision_kto_row(processor, row, *, extracted, image_size, image_reader):
     """TRL's vision KTO collator: the prompt through the processor with its
     images, the completion as plain text, neither adding special tokens."""
@@ -1834,13 +1848,18 @@ def create_kto_batch_plan(
     eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
     eos_id = None if eos_id is None else int(eos_id)
     carry = _kto_carry(tokenizer, append_eos)
-    if length_policy.max_length + carry > length_policy.max_seq_length:
-        raise ValueError(
-            f"Unsloth MLX KTO: max_length={length_policy.max_length} leaves no "
-            f"room inside max_seq_length={length_policy.max_seq_length} for the "
-            f"{carry} special token(s) a row can carry past it; resolve the "
-            "length policy with this tokenizer and append_eos."
-        )
+
+    def require_carry_room():
+        if length_policy.max_length + carry > length_policy.max_seq_length:
+            raise ValueError(
+                f"Unsloth MLX KTO: max_length={length_policy.max_length} leaves no "
+                f"room inside max_seq_length={length_policy.max_seq_length} for the "
+                f"{carry} special token(s) a row can carry past it; resolve the "
+                "length policy with this tokenizer and append_eos."
+            )
+
+    if processor is None:
+        require_carry_room()
     vision = None
     max_length = length_policy.max_length
     tokenized = []
@@ -1849,10 +1868,9 @@ def create_kto_batch_plan(
         try:
             label = _kto_label(row)
             if vision is None:
-                vision = processor is not None and (
-                    "image" in row or "images" in row
-                    or bool(_kto_row_images(row, image_size))
-                )
+                vision = processor is not None and _kto_row_is_vision(row, image_size)
+                if not vision:
+                    require_carry_room()
             if vision:
                 prompt_text, prompt, answer_ids, images, arrays = _encode_vision_kto_row(
                     processor, row, extracted=extracted, image_size=image_size,
