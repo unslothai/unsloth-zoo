@@ -118,7 +118,7 @@ def _gpt_oss_flex_mask(
     kv_offset = 0,
     mask_function = None,
     attention_mask = None,
-    device = "cpu",
+    device = None,
     cache_position = None,
     **kwargs,
 ):
@@ -130,6 +130,9 @@ def _gpt_oss_flex_mask(
         # transformers 4.x: queries sit at cache_position.
         q_length = cache_position.shape[0]
         q_offset = cache_position[0]
+    if device is None:
+        # transformers 4.x does not pass the device.
+        device = cache_position.device if cache_position is not None else attention_mask.device
     # Copies: StaticLayer's query offset is its live cumulative_length, which update() bumps in place before the
     # attention reads this mask, so an alias lets chunked prefill queries see later keys.
     q_off = torch.as_tensor(q_offset).to(torch.int64).reshape(()).clone()

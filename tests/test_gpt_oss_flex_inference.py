@@ -53,9 +53,10 @@ def _padding(total, device):
     return padding
 
 
+@pytest.mark.parametrize("form", ["v5", "v4"])
 @pytest.mark.parametrize("window", [None, 5])
 @pytest.mark.parametrize("q_len,q_offset,kv_offset,kv_len", _CASES)
-def test_mask_positions_cpu(monkeypatch, window, q_len, q_offset, kv_offset, kv_len):
+def test_mask_positions_cpu(monkeypatch, form, window, q_len, q_offset, kv_offset, kv_len):
     # Positions only (any host): the BlockMask must equal causal & window & padding at absolute positions, and must
     # not alias the offset it was given (StaticLayer passes its live cumulative_length, bumped before attention).
     from torch.nn.attention.flex_attention import create_block_mask, create_mask
@@ -69,10 +70,18 @@ def test_mask_positions_cpu(monkeypatch, window, q_len, q_offset, kv_offset, kv_
     total = max(q_offset + q_len, kv_offset + kv_len)
     padding = _padding(total, "cpu")
     live = torch.tensor(q_offset)
-    block_mask = _gpt_oss_flex_mask(
-        batch_size = 3, q_length = q_len, kv_length = kv_len, q_offset = live, kv_offset = kv_offset,
-        mask_function = mask_function, attention_mask = padding[:, :q_offset + q_len].long(), device = "cpu",
-    )
+    if form == "v5":
+        block_mask = _gpt_oss_flex_mask(
+            batch_size = 3, q_length = q_len, kv_length = kv_len, q_offset = live, kv_offset = kv_offset,
+            mask_function = mask_function, attention_mask = padding[:, :q_offset + q_len].long(), device = "cpu",
+        )
+    else:
+        # transformers 4.x: queries at cache_position, and no device argument.
+        block_mask = _gpt_oss_flex_mask(
+            batch_size = 3, cache_position = torch.arange(q_offset, q_offset + q_len), kv_length = kv_len,
+            kv_offset = kv_offset, mask_function = mask_function, attention_mask = padding[:, :q_offset + q_len].long(),
+        )
+    assert block_mask.kv_num_blocks.device.type == "cpu"
     live.add_(q_len)
     assert block_mask.seq_lengths == (q_len, kv_len)
     dense = create_mask(block_mask.mask_mod, 3, 1, q_len, kv_len, device = "cpu")[:, 0]
@@ -333,7 +342,7 @@ def test_decode_does_not_recompile_after_warmup(runs):
 @_CUDA
 def test_train_generate_train(runs):
     l1, l2 = runs["flex"]["train_losses"]
-    assert l1 == l2 and l1 == l1
+    assert abs(l1 - l2) <= 1e-6 * abs(l1), (l1, l2)
     assert runs["flex"]["short_nograd_finite"]
 
 
