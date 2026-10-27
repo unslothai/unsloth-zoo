@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The trainable-head backward turns cuBLAS reduced-precision split-K reductions off around its half GEMM. The switch
-is process-wide: two threads in that backward used to restore over each other, leaving it off for good and running
-one GEMM with it on (one save / restore per call)."""
+"""Overlapping threads must keep the process-wide reduced-precision switch off and restore it after."""
 
 import threading
 
@@ -29,7 +27,7 @@ FLAGS = torch.backends.cuda.matmul
 
 
 def _overlapping(enter, observe, dtype):
-    """Thread A enters, B enters, A leaves, B reads the switch, B leaves (the reviewer's schedule)."""
+    """A enters, B enters, A leaves, B reads, B leaves."""
     name = "allow_bf16_reduced_precision_reduction" if dtype == torch.bfloat16 else "allow_fp16_reduced_precision_reduction"
     a_in, b_in, a_out = threading.Event(), threading.Event(), threading.Event()
     seen, errors = {}, []
@@ -75,7 +73,6 @@ def test_overlapping_callers_keep_the_switch_off_and_restore_it(dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_mm_into_overlapping_threads_cuda(dtype, monkeypatch):
-    """The real _mm_into on two threads, torch.mm held until both are inside (as the reviewer's repro)."""
     if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         pytest.skip("no bf16 GEMM on this card")
     name = "allow_bf16_reduced_precision_reduction" if dtype == torch.bfloat16 else "allow_fp16_reduced_precision_reduction"

@@ -1499,10 +1499,8 @@ _FULL_REDUCTION_USERS = {}  # flag name -> [calls inside, value saved by the fir
 
 
 class _full_precision_reduction:
-    """cuBLAS split-K reductions in fp32 for half GEMMs inside the block. The switch is process-wide (cuBLAS reads it
-    per call), so it is reference counted: the first caller saves the setting, the last restores it, and concurrent
-    callers (threads sharing the backward) all run with it off; a save / restore per call let one call restore over
-    another's and leave it off for good (or run a call with it on)."""
+    """fp32 split-K reductions for half GEMMs. The switch is process-wide, so it is reference counted: a per-call
+    save / restore let concurrent backward threads restore over each other."""
 
     def __init__(self, dtype):
         self.name = "allow_bf16_reduced_precision_reduction" if dtype == torch.bfloat16 else \
@@ -1529,9 +1527,7 @@ class _full_precision_reduction:
 
 def _mm_into(out, a, b):
     """out = a @ b accumulated in fp32 and rounded once to out's dtype (no reduced-precision split-K reduction).
-
-    No fp32 [rows, H] result: on a wide tile (up to the whole vocabulary) that buffer and its copy would cost more
-    traffic than the GEMM's own output."""
+    Not out_dtype=fp32: a [rows, vocab-wide] fp32 buffer + copy costs more traffic than the GEMM."""
     if out.dtype == torch.float32:
         _mm_fp32(a, b, out = out)
         return
