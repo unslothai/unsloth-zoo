@@ -14,22 +14,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-Backport of pytorch/pytorch#190965 (commit 93879b11) to torch 2.13.
+"""Backport of pytorch/pytorch#190965 (commit 93879b11) to torch 2.13.
 
-torch 2.13 added `Layout._stride_expr_ge_or_false`, whose last check is
-`guard_or_false(Eq(left % right, 0))`. With compound symbolic strides, Python `%`
-on SymPy expressions rewrites the modulo through a reciprocal power (`x**-1`),
-and value-range analysis then dies with
-`ValueError: Exponent must be non-negative.` (or `ValueRangeError: Invalid
-ranges [0:-1]`). Any `torch.compile(dynamic=True)` whose layouts hit
-`is_stride_ordered` with such strides fails to compile, e.g. MiniMax-M3 attention
-on CUDA (pytorch/pytorch#188323, #188422).
-
-torch 2.14 fixed it by trying `statically_known_multiple_of` first and building the
-guard with PyTorch's non-simplifying integer `Mod`. This module installs exactly
-that body, and only when the installed function still has the `left % right`
-form, so torch 2.12 and older (no such function) and 2.14+ (fixed) are untouched.
+Gated on the body still containing `left % right`: SymPy `%` on compound symbolic strides
+emits `x**-1`, so value ranges raise "Exponent must be non-negative." (fixed in 2.14).
 """
 
 import inspect
@@ -46,7 +34,6 @@ def _needs_patch(fn):
 
 
 def patch_inductor_stride_guard():
-    """Returns True if the backport is installed (now or earlier), else False."""
     try:
         import sympy
         from torch._inductor import ir
@@ -82,7 +69,6 @@ def patch_inductor_stride_guard():
     return True
 
 
-# Apply at import time so it is active before any compilation.
 try:
     patch_inductor_stride_guard()
 except Exception:
