@@ -932,6 +932,16 @@ def test_no_placement_table_is_never_packed_into_a_slot(monkeypatch):
     assert _mod._layer_signature(_mod._swappable(layers[1])) == _mod._layer_signature(_mod._swappable(layers[0]))
 
 
+def test_no_placement_table_stays_out_after_the_load_replaces_its_parameter(monkeypatch):
+    # from_pretrained(offload_layers = N) finds the layers on meta; each weight then lands as a new Parameter.
+    monkeypatch.delenv("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", raising = False)
+    model = _PleModel()
+    layers = find_decoder_layers(model)
+    emb = model.layers[1].ple.ple_embedding.ngram_embedding
+    emb.weight = nn.Parameter(torch.zeros_like(emb.weight), requires_grad = False)
+    assert [n for n, _ in _mod._swappable(layers[1])] == ["mlp.weight"]
+
+
 def test_placing_no_placement_params_makes_them_swappable_again(monkeypatch):
     monkeypatch.setenv("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "1")
     layers = find_decoder_layers(_PleModel())

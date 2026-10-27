@@ -147,9 +147,10 @@ def _autograd_keeps_weights():
 
 
 def _swappable(module):
+    kept = {id(p) for m in module.modules() if getattr(m, "_unsloth_host_kept", False) for p in m.parameters()}
     out = []
     for name, p in module.named_parameters(recurse = True):
-        if p.requires_grad or "lora_" in name or getattr(p, "_unsloth_host_kept", False):
+        if p.requires_grad or "lora_" in name or id(p) in kept:
             continue
         out.append((name, p))
     return out
@@ -685,10 +686,9 @@ def _mark_host_kept(model):
         return
     params = list(model.named_parameters(remove_duplicate = False))
     # The whole owning module, as the loader keeps it: FP8Embedding's weight_scale sits beside the table.
-    owners = {n.rsplit(".", 1)[0] for n, _ in params if any(n == x or n.endswith("." + x) for x in names)}
-    for n, p in params:
-        if any(n.startswith(o + ".") for o in owners):
-            p._unsloth_host_kept = True
+    # Marked on the module, not the Parameter: a load to host replaces the Parameter as its weight lands.
+    for owner in {n.rsplit(".", 1)[0] for n, _ in params if any(n == x or n.endswith("." + x) for x in names)}:
+        model.get_submodule(owner)._unsloth_host_kept = True
 
 
 def find_decoder_layers(model):
