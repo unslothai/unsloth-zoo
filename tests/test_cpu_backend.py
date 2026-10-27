@@ -1311,3 +1311,125 @@ def test_confident_rows_keep_their_gradient(path):
     if log_probs is not None:
         assert bool((log_probs < 0).all())
         assert torch.allclose(log_probs.double(), reference.detach(), rtol = 1e-4, atol = 0)
+
+
+@pytest.mark.parametrize("name, resolved", [("org/model", "org/model"), ("org/model-bnb-4bit", "org/model")])
+def test_on_model_resolved_is_reported_and_not_passed_to_the_model(monkeypatch, name, resolved):
+    """Studio passes on_model_resolved (progress + stall watchdog) as on GPU; the model __init__ rejects it."""
+    import transformers
+    from unsloth_zoo.cpu import loader
+    seen, reported = {}, []
+    monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
+
+    def fake_load(model_name, **k):
+        seen.update(k, name = model_name)
+        return _tiny_llama()
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_load)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
+    loader.FastCPUModel.from_pretrained(name, load_in_4bit = False, on_model_resolved = reported.append)
+    assert "on_model_resolved" not in seen
+    assert reported == [resolved] == [seen["name"]]
+
+
+def test_sft_config_takes_max_seq_length_as_max_length(monkeypatch, tmp_path):
+    """TRL 0.20 dropped SFTConfig(max_seq_length); Unsloth's GPU SFTConfig, notebooks and Studio still pass it."""
+    import dataclasses
+    from trl import SFTConfig
+    from unsloth_zoo.cpu.trainer import _patch_max_seq_length_alias
+    monkeypatch.setattr(SFTConfig, "__init__", SFTConfig.__init__)
+    _patch_max_seq_length_alias(SFTConfig)
+    fields = SFTConfig.__dataclass_fields__
+    if "max_seq_length" in fields:
+        # TRL < 0.20 still has the field (and maps it itself): left alone.
+        assert not getattr(SFTConfig.__init__, "_unsloth_cpu", False)
+        return
+    default = fields["max_length"].default
+    common = dict(output_dir = str(tmp_path), report_to = [], use_cpu = True, bf16 = False)
+    assert SFTConfig(max_seq_length = 77, **common).max_length == 77
+    assert SFTConfig(max_seq_length = None, **common).max_length == default
+    assert SFTConfig(max_length = 33, **common).max_length == 33
+    # As TRL's own alias did (< 0.20): max_seq_length wins over max_length.
+    assert SFTConfig(max_seq_length = 77, max_length = 33, **common).max_length == 77
+
+    class Subclass(SFTConfig):  # the CPU UnslothTrainingArguments shape
+        def __init__(self, extra = None, *args, **kwargs):
+            self.extra = extra
+            super().__init__(*args, **kwargs)
+    assert Subclass(extra = 1, max_seq_length = 55, **common).max_length == 55
+    _patch_max_seq_length_alias(SFTConfig)  # idempotent
+    assert SFTConfig.__init__.__wrapped__.__qualname__.startswith("SFTConfig.")
+
+    @dataclasses.dataclass
+    class HasField:  # a config that still declares max_seq_length is never touched
+        max_seq_length: int = None
+        max_length: int = None
+    init = HasField.__init__
+    _patch_max_seq_length_alias(HasField)
+    assert HasField.__init__ is init
+
+
+def test_cpu_sft_trainer_pickles_by_reference(monkeypatch):
+    """TRL 0.24 - 1.7's tokenize map closes over the trainer; with dataset_num_proc > 1 the class must pickle by name."""
+    import pickle
+    import dill
+    from trl.trainer import sft_trainer
+    from unsloth_zoo.cpu.trainer import _make_cpu_sft_trainer
+    base = sft_trainer.SFTTrainer
+    base = base.__mro__[1] if getattr(base, "_unsloth_cpu", False) else base
+    cls = _make_cpu_sft_trainer(base)
+    monkeypatch.setattr(sft_trainer, "SFTTrainer", cls)
+    assert pickle.loads(pickle.dumps(cls)) is cls
+    assert dill.loads(dill.dumps(cls)) is cls
+    assert len(dill.dumps(cls)) < 200  # a reference, not the class and its globals by value
+
+
+_CPU_SFT_SCRIPT = r'''
+import math, os, sys
+import torch
+from datasets import Dataset
+from unsloth_zoo.cpu import FastCPUModel, install_cpu_training_defaults
+install_cpu_training_defaults()
+from trl import SFTConfig, SFTTrainer
+model_dir, out_dir = sys.argv[1], sys.argv[2]
+resolved = []
+model, tokenizer = FastCPUModel.from_pretrained(model_dir, max_seq_length = 32, load_in_4bit = False,
+                                                dtype = torch.float32, on_model_resolved = resolved.append)
+model = FastCPUModel.get_peft_model(model, r = 4, lora_alpha = 4)
+words = ["add", "one", "two", "three", "is", "the", "sum"]
+rows = [" ".join(words[(i + j) % len(words)] for j in range(8)) for i in range(16)]
+trainer = SFTTrainer(
+    model = model, tokenizer = tokenizer, train_dataset = Dataset.from_dict({"text": rows}),
+    args = SFTConfig(output_dir = out_dir, max_seq_length = 16, dataset_num_proc = 2, max_steps = 3,
+                     per_device_train_batch_size = 4, learning_rate = 5e-3, logging_steps = 1,
+                     report_to = [], save_strategy = "no", optim = "adamw_8bit"),
+)
+assert trainer.args.max_length == 16
+trainer.train()
+losses = [h["loss"] for h in trainer.state.log_history if "loss" in h]
+model.save_pretrained(out_dir)
+assert resolved == [model_dir], resolved
+assert len(losses) == 3 and all(math.isfinite(x) for x in losses), losses
+assert os.path.isfile(os.path.join(out_dir, "adapter_model.safetensors"))
+print("CPU_SFT_OK", losses)
+'''
+
+
+def test_cpu_lora_sft_end_to_end(tmp_path):
+    """FastCPUModel + stock TRL SFTTrainer, as notebooks and Studio call them: on_model_resolved,
+    SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name; trains and saves the adapter."""
+    import subprocess
+    import sys
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    words = ["add", "one", "two", "three", "is", "the", "sum"]
+    vocab = {"<pad>": 0, "</s>": 1, "<unk>": 2, **{w: i + 3 for i, w in enumerate(words)}}
+    backend = Tokenizer(models.WordLevel(vocab, unk_token = "<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    model_dir = tmp_path / "model"
+    PreTrainedTokenizerFast(tokenizer_object = backend, pad_token = "<pad>", eos_token = "</s>",
+                            unk_token = "<unk>").save_pretrained(model_dir)
+    _tiny_llama().save_pretrained(model_dir)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", OMP_NUM_THREADS = "2", HF_HUB_OFFLINE = "1")
+    done = subprocess.run([sys.executable, "-c", _CPU_SFT_SCRIPT, str(model_dir), str(tmp_path / "out")],
+                          capture_output = True, text = True, timeout = 600, env = env, cwd = str(tmp_path))
+    assert done.returncode == 0 and "CPU_SFT_OK" in done.stdout, (done.stdout[-3000:], done.stderr[-5000:])

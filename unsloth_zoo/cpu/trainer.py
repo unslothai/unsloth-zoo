@@ -195,6 +195,29 @@ _LEGACY_SFT_KWARGS = {
 }
 
 
+def _patch_max_seq_length_alias(config_cls):
+    """TRL 0.20 removed SFTConfig(max_seq_length) for max_length; Unsloth's GPU SFTConfig still takes it, and
+    notebooks and Studio pass it. Accept it here too, with TRL's own former alias semantics (it sets max_length).
+    Feature-detected from the dataclass fields, so a TRL that still has the field is left alone."""
+    fields = getattr(config_cls, "__dataclass_fields__", {})
+    if "max_seq_length" in fields or "max_length" not in fields:
+        return
+    original = config_cls.__init__
+    if getattr(original, "_unsloth_cpu", False):
+        return
+
+    @functools.wraps(original)
+    def __init__(self, *args, **kwargs):
+        if "max_seq_length" in kwargs:
+            max_seq_length = kwargs.pop("max_seq_length")
+            if max_seq_length is not None:
+                kwargs["max_length"] = max_seq_length
+        return original(self, *args, **kwargs)
+
+    __init__._unsloth_cpu = True
+    config_cls.__init__ = __init__
+
+
 def _make_cpu_sft_trainer(base):
     if getattr(base, "_unsloth_cpu", False):
         return base
@@ -228,7 +251,11 @@ def _make_cpu_sft_trainer(base):
                 normalize_cpu_training_arguments(training_args)
             super().__init__(*args, **kwargs)
 
+    # Importable as trl.trainer.sft_trainer.SFTTrainer (installed there below), so pickle / dill store the
+    # class by reference. TRL's tokenize map closes over the trainer; with dataset_num_proc > 1 dill would
+    # otherwise serialise this class and TRL's by value, globals included, and fail on torch's config modules.
     SFTTrainer.__module__ = base.__module__
+    SFTTrainer.__qualname__ = base.__qualname__
     return SFTTrainer
 
 
@@ -248,6 +275,8 @@ def install_cpu_training_defaults():
         cls = getattr(trl, name, None)
         if cls is not None and "__post_init__" in vars(cls):
             _patch_post_init(cls)
+    if getattr(trl, "SFTConfig", None) is not None:
+        _patch_max_seq_length_alias(trl.SFTConfig)
     _patch_sft_compute_loss(sft_trainer.SFTTrainer)
     from .ops import patch_trl_fused_lm_head
     patch_trl_fused_lm_head()

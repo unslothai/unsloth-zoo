@@ -229,6 +229,11 @@ class FastCPUModel:
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
             _print(f"{model_name} is pre-quantized; loading {base} for 16-bit training.")
             model_name = base
+        # As on GPU: a loader callback (Studio's progress / stall watchdog) told which repo is fetched, never
+        # a from_pretrained kwarg (the model's __init__ rejects it).
+        on_model_resolved = kwargs.pop("on_model_resolved", None)
+        if on_model_resolved is not None:
+            on_model_resolved(model_name)
 
         quantization_config = None
         if use_4bit and not _PREQUANTIZED_SUFFIX.search(model_name):
