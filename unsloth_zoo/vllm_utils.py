@@ -186,9 +186,7 @@ def _init_torchrun_process_group(launch_info):
         # Trainer reuses an initialized group. backend None = nccl for cuda + gloo for cpu.
         kwargs = dict(backend = None)
         if local_index is not None and _vllm_split_group_requested():
-            # vLLM's split_group (VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1) needs a device-bound default group
-            # with a gloo backend too (parallel_state._validate_default_pg_for_split_group); with
-            # device_id set, backend None would create nccl only.
+            # vLLM split_group needs a device-bound default group with gloo too; backend None would be nccl only.
             kwargs = dict(backend = "cpu:gloo,cuda:nccl", device_id = torch.device("cuda", local_index))
         dist.init_process_group(
             init_method = "env://", timeout = timedelta(seconds = _process_group_timeout()), **kwargs

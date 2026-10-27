@@ -209,8 +209,6 @@ def test_save_lora_under_ddp_writes_through_a_private_folder(tmp_path, monkeypat
 
 @pytest.mark.parametrize("split_group", [None, "0", "1"])
 def test_split_group_gets_a_device_bound_default_group(monkeypatch, split_group):
-    """vLLM's VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1 needs init_process_group(device_id = ...); without
-    it the default group stays unbound, as before."""
     import torch.distributed as dist
 
     calls = []
