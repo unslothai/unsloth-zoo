@@ -1119,10 +1119,18 @@ def grpo_compute_loss(
         # compute_policy_loss_vanilla clamps the log ratio to [-20, 20] too.
         log_ratio = torch.clamp(log_ratio, min = -20.0, max = 20.0)
 
+    # verl: response_mask *= keep before the policy loss. Zero rejected log ratios via select (an
+    # overflowing exp would backprop inf * 0 = nan) and drop them from the GSPO sequence mean.
+    ratio_log_ratio = log_ratio
+    ratio_mask = mask
+    if rs_keep is not None:
+        ratio_log_ratio = torch.where(rs_keep, log_ratio, 0.0)
+        ratio_mask = mask * rs_keep.to(mask.dtype)
+
     if importance_sampling_level == "token":
-        log_importance_weights = log_ratio
+        log_importance_weights = ratio_log_ratio
     elif importance_sampling_level == "sequence":
-        log_importance_weights = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+        log_importance_weights = (ratio_log_ratio * ratio_mask).sum(-1) / ratio_mask.sum(-1).clamp(min=1.0)
         log_importance_weights = log_importance_weights.unsqueeze(-1)
     else:
         raise ValueError(
