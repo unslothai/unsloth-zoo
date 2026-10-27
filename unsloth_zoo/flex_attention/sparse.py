@@ -34,9 +34,9 @@ __all__ = [
 
 # {kind: {model_type: count}}; not updated while torch.compile traces (no guard on the int).
 SPARSE_ATTN_STATS = {}
-# (kind, device, dtype, shape) -> whether an eager additive mask of that caller kind and shape carried finite biases.
+# (kind, device, dtype, shape) -> whether an eager additive mask carried finite biases.
 _BIAS_SEEN = {}
-# Shape classes (the callers' failure keys) whose flex backward ran in a probe; nonzero while one runs.
+# Failure keys whose flex backward probe passed; _PROBING is nonzero while one runs.
 _BACKWARD_OK = set()
 _PROBING = [0]
 
@@ -94,13 +94,9 @@ def _same(tensor):
 
 
 def probe_flex_backward(key, fn, args):
-    """Run `fn(*args)` once per shape class `key` on detached aliases and backpropagate it, before the first call
-    autograd will backpropagate. The flex forward is guarded by its caller's try / except, but its backward runs in
-    loss.backward(), where a failing kernel (shared-memory OutOfResources on an unusual card, a Triton compile error)
-    would end training; raised here instead, the caller latches the shape class to the dense path for this call on.
-    The aliases share storage, strides and requires_grad with the real inputs, so the real call reuses the graph and
-    backward kernels compiled here (no extra compile). Costs one extra fwd + bwd per shape class, then a set lookup.
-    Skipped without autograd, inside torch.compile and under CUDA graph capture (the eager warm-up probes)."""
+    """Run fwd + bwd of `fn(*args)` once per `key` on detached aliases so a failing flex backward raises
+    inside the caller's try / except (latching the dense path) instead of in loss.backward().
+    Aliases share storage / strides, so the real call reuses the compiled kernels."""
     if torch.compiler.is_compiling() or not torch.is_grad_enabled() or key in _BACKWARD_OK:
         return
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
@@ -114,7 +110,7 @@ def probe_flex_backward(key, fn, args):
     inputs = [t for t in aliases.values() if t.requires_grad]
     _PROBING[0] += 1
     try:
-        # Identity hooks on top: an active checkpoint's pack hook would count the probe's saved tensors as the layer's.
+        # Shield the probe's saved tensors from an active checkpoint's pack hook.
         with torch.autograd.graph.saved_tensors_hooks(_same, _same):
             out = fn(*probe)
             torch.autograd.grad(out, inputs, torch.zeros_like(out), allow_unused = True)

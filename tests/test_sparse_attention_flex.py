@@ -954,7 +954,7 @@ def test_flex_failure_under_capture_is_raised_not_latched(monkeypatch):
 
 
 class _BackwardFails(torch.autograd.Function):
-    """Stands in for a flex kernel whose forward runs and whose backward fails (shared-memory OutOfResources)."""
+    """Flex kernel whose forward runs and backward fails."""
 
     @staticmethod
     def forward(ctx, query):
@@ -971,8 +971,7 @@ def _qkv(requires_grad = True):
 
 
 def test_flex_backward_failure_is_latched_before_the_step():
-    """flex's backward runs in loss.backward(), past _flex_or_none's try / except: the first training call of a shape
-    class probes it, so a failing backward latches the dense path for this call instead of ending training."""
+    """A failing flex backward is caught by the probe and latches the dense path."""
     from unsloth_zoo.temporary_patches import sparse_attention_flex as s
     q, k, v = _qkv()
 
@@ -984,10 +983,8 @@ def test_flex_backward_failure_is_latched_before_the_step():
     out = s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v)
     assert out is None, "a flex call whose backward fails was returned to autograd"
     assert len(sb._FAILED) == 1 and "out of resource" in next(iter(sb._FAILED.values()))
-    # The probe's own call is not counted.
     assert _stat("flex", "dsa") == flex_before and _stat("fallback", "dsa") == fallback_before + 1
     assert q.grad is None and k.grad is None
-    # Latched: the shape class is no longer eligible, the next call goes straight to the dense path.
     assert sb._failure_key("dsa", q, k, v) in sb._FAILED
 
 

@@ -24,8 +24,8 @@ their fp32 score buffers stay bounded.
 
 Engaged automatically on CUDA sm80+ / ROCm with Triton, bf16 / fp16, no attention dropout,
 no output_attentions, q_len >= 16, outside an enclosing torch.compile (there the model's own
-path runs). A flex failure, forward or (probed once per shape class) backward, latches that shape class back to
-the dense path. Kill switches: UNSLOTH_SPARSE_ATTN_FLEX=0, UNSLOTH_SPARSE_INDEXER_CHUNKED=0.
+path runs). A flex failure (forward or probed backward) latches that shape class to the dense path.
+Kill switches: UNSLOTH_SPARSE_ATTN_FLEX=0, UNSLOTH_SPARSE_INDEXER_CHUNKED=0.
 The patched forwards are installed on transformers >= 5.17 when the installed source matches
 the layout they reimplement (DSA caches expanded K / V on 5.17, the latent on 5.18+);
 otherwise the model is left untouched.
@@ -111,9 +111,7 @@ _MINIMAX_INDEXER_NEEDLES = (
 
 
 def _flex_or_none(kind, label, fn, query, key, value, *args):
-    """The flex attention call, or None after a failure (latched per shape) so the caller takes the dense path.
-    The first call per shape class that autograd will backpropagate first probes flex's backward, which would
-    otherwise fail later in loss.backward(), past this fallback."""
+    """The flex attention call (backward probed once per shape), or None after a latched failure."""
     try:
         probe_flex_backward(_sb._failure_key(kind, query, key, value), fn, args)
         return fn(*args)

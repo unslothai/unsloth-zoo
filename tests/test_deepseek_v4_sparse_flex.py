@@ -362,8 +362,7 @@ def test_layers_equal_eager_in_float32(monkeypatch):
         F4.DEEPSEEK_V4_FLEX_STATS.update(flex = 0, eager = 0)
         o_eager, g_eager = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, False, weight)
         o_flex, g_flex = _run_layer(monkeypatch, layer.self_attn, args, kwargs, torch.float32, True, weight)
-        # fp32 at head_dim 512: flex's backward needs ~200 KB of shared memory (A100: 163 KB). The backward probe
-        # latches eager there instead of crashing loss.backward(); the parity check needs a card it fits (H100 / B200).
+        # fp32 head_dim 512 flex backward needs ~200 KB smem (A100 has 163 KB): needs H100 / B200.
         oor = [e for e in F4._FAILED.values() if "out of resource" in e]
         if oor:
             assert F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 2}
@@ -599,7 +598,7 @@ def test_cold_fullgraph_compile_is_one_graph(monkeypatch):
 
 
 class _BackwardFails(torch.autograd.Function):
-    """Stands in for a flex kernel whose forward runs and whose backward fails (shared-memory OutOfResources)."""
+    """Flex kernel whose forward runs and backward fails."""
 
     @staticmethod
     def forward(ctx, query):
@@ -611,21 +610,19 @@ class _BackwardFails(torch.autograd.Function):
 
 
 def test_flex_backward_failure_latches_eager(monkeypatch):
-    """flex's backward runs in loss.backward(): the first training call of a shape class probes it, so a failing
-    backward latches eager for this call on instead of ending training."""
+    """A failing flex backward is caught by the probe and latches eager."""
     calls = []
 
     def flex(module, query, key, attention_mask, scaling):
         calls.append(1)
         return _BackwardFails.apply(query)
 
-    # Every gate open on CPU except the latch.
     monkeypatch.setattr(F4, "_flex_applies", lambda *args: not getattr(F4, "_FAILED", {}))
     monkeypatch.setattr(F4, "deepseek_v4_flex_attention", flex)
     attn, q, kv, mask = _gate_inputs("cpu", dtype = torch.float32)
     q.requires_grad_()
     out, _ = modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
-    out.sum().backward()  # eager's backward
+    out.sum().backward()
     ref, _ = ORIGINAL(attn, q.detach(), kv, kv, mask, 0.125)
     torch.testing.assert_close(out.detach(), ref)
     assert len(F4._FAILED) == 1 and F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
