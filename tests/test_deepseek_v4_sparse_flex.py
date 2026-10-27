@@ -39,7 +39,7 @@ if not hasattr(modeling.eager_attention_forward, "_unsloth_original"):
     pytest.skip("the DeepSeek-V4 flex patch did not install here", allow_module_level = True)
 ORIGINAL = modeling.eager_attention_forward._unsloth_original
 
-CUDA = torch.cuda.is_available()
+CUDA = torch.cuda.is_available() and not getattr(torch.cuda, "_unsloth_consolidated_spoof", False)
 needs_flex_gpu = pytest.mark.skipif(
     not CUDA
     or torch.version.hip is not None

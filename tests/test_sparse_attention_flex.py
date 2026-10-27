@@ -56,8 +56,10 @@ needs_models = pytest.mark.skipif(
     reason = "transformers older than 5.17 or without MiniMax M3 / DSA models",
 )
 gpu = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None or torch.cuda.get_device_capability() < (8, 0),
-    reason = "flex attention parity needs CUDA sm80+",
+    not torch.cuda.is_available()
+    or getattr(torch.cuda, "_unsloth_consolidated_spoof", False)  # CPU runner with the CUDA spoof
+    or torch.cuda.get_device_capability() < (8, 0),  # ROCm reports its gfx major (gfx1151: 11), and runs flex
+    reason = "flex attention parity needs CUDA sm80+ or ROCm",
 )
 
 from unsloth_zoo.flex_attention import sparse_blocks as sb  # noqa: E402
@@ -552,6 +554,10 @@ def test_indexer_forward_without_class_attributes(monkeypatch, family):
 
 @needs_models
 @gpu
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason = "ROCm compiled-vs-compiled DSA differs by ~5% with flex off too (Inductor reorders the top-k)",
+)
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
 def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
     """An attention layer under an enclosing torch.compile (fullgraph, dynamic): the BlockMask build plus
@@ -610,6 +616,10 @@ def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
 
 
 @needs_models
+@pytest.mark.skipif(
+    getattr(torch.cuda, "_unsloth_consolidated_spoof", False),
+    reason = "Inductor initialises the spoofed CUDA device",
+)
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
 def test_chunked_indexer_compiles_once_over_lengths(monkeypatch, family):
     """Inside torch.compile (dynamic) the chunk loop's trip count specialised the graph on the length:
