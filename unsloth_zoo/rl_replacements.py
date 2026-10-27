@@ -1704,19 +1704,21 @@ pass
 
 
 def grpo_truncated_support_setting():
-    """"on" (=1), "off" (=0) or "auto" (unset / anything else): UNSLOTH_GRPO_TRUNCATED_SUPPORT."""
+    """"on" (=1), "off" (=0) or "default" (unset / anything else): UNSLOTH_GRPO_TRUNCATED_SUPPORT.
+    Only "on" scores over the kept set; "off" also silences the default's warning."""
     value = os.environ.get("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "").strip().lower()
     if value in ("1", "true", "yes", "on"): return "on"
     if value in ("0", "false", "no", "off"): return "off"
-    return "auto"
+    return "default"
 pass
 
 
 def grpo_truncated_support_kwargs(trainer):
-    """support_* kwargs for the chunked logprob helpers when the trainer must score over the vLLM
-    rollouts' kept set, else {}. =1 always, =0 never; unset when the rollouts were truncated and their
-    (kept-set renormalised) logprobs feed the IS correction or off-policy mask, since a full-vocabulary
-    score would bias every IS ratio by log(kept mass). Warns once when that bias is left in (not under =0)."""
+    """support_* kwargs for the chunked logprob helpers when UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 and
+    the vLLM rollouts were truncated, else {}. Opt-in: by default the trainer scores the full vocabulary,
+    as TRL and verl do, so the policy gradient is that of the full-vocabulary log-probability. The kept-set
+    score differentiates log(p(token) / p(kept set)) instead, which is zero where one token is kept.
+    Unset, warns once if the truncated vLLM logprobs feed the IS correction or the off-policy mask."""
     if not getattr(trainer, "use_vllm", False):
         return {}
     support = grpo_sampling_support(trainer)
@@ -1725,21 +1727,12 @@ def grpo_truncated_support_kwargs(trainer):
         return {}
     top_k, top_p, min_p = support if support is not None else (0, 1.0, 0.0)
     setting = grpo_truncated_support_setting()
-    args = getattr(trainer, "args", None)
-    consumed = bool(
-        getattr(trainer, "vllm_importance_sampling_correction", False)
-        or getattr(args, "off_policy_mask_threshold", None) is not None
-    )
-    # Only where the engine is known to return processed (kept-set renormalised) logprobs: against
-    # raw_logprobs a kept-set trainer score would bias the ratio the other way. Server mode: unknown.
-    # Measured on NVIDIA CUDA only: ROCm / XPU keep the full vocabulary unless =1.
-    automatic = (
-        setting == "auto" and support is not None and consumed
-        and _grpo_truncated_support_auto_platform()
-        and _grpo_rollout_logprobs_processed(trainer) is True
-    )
-    enabled = setting == "on" or automatic
-    if not enabled:
+    if setting != "on":
+        args = getattr(trainer, "args", None)
+        consumed = (
+            getattr(trainer, "vllm_importance_sampling_correction", False)
+            or getattr(args, "off_policy_mask_threshold", None) is not None
+        )
         if setting != "off" and consumed and not getattr(trainer, "_unsloth_truncated_support_warned", False):
             truncation = (
                 f"top_k={top_k}, top_p={top_p}, min_p={min_p}" if support is not None else ""
@@ -1751,9 +1744,11 @@ def grpo_truncated_support_kwargs(trainer):
             logger.warning(
                 f"Unsloth: rollouts sample with {truncation}, so "
                 "vLLM's logprobs are renormalised over the kept tokens while the trainer scores the "
-                "full vocabulary. The importance sampling ratio / off-policy mask then sees a "
+                "full vocabulary, as TRL does. The importance sampling ratio / off-policy mask then sees a "
                 "systematic gap of log(kept probability mass) per token. Set "
-                "UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 to score the trainer over the same kept set."
+                "UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 to score the trainer over the same kept set (this also "
+                "trains the kept-set renormalised policy, whose gradient is zero where one token is kept), "
+                "or =0 to silence this."
             )
             trainer._unsloth_truncated_support_warned = True
         return {}
@@ -1761,11 +1756,8 @@ def grpo_truncated_support_kwargs(trainer):
     if blockers:
         if not getattr(trainer, "_unsloth_truncated_support_blocked_warned", False):
             logger.warning(
-                ("Unsloth: ignoring UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 because the rollouts use "
-                 if setting == "on" else
-                 "Unsloth: not scoring the trainer over the rollouts' top_k / top_p / min_p kept set "
-                 "(UNSLOTH_GRPO_TRUNCATED_SUPPORT, automatic) because the rollouts use ")
-                + f"{', '.join(blockers)}, which vLLM applies before truncating, so the trainer cannot "
+                "Unsloth: ignoring UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 because the rollouts use "
+                f"{', '.join(blockers)}, which vLLM applies before truncating, so the trainer cannot "
                 "rebuild the same kept set. Scoring over the full vocabulary instead."
             )
             trainer._unsloth_truncated_support_blocked_warned = True
@@ -1778,32 +1770,8 @@ def grpo_truncated_support_kwargs(trainer):
     return kwargs
 pass
 RL_REPLACEMENTS["grpo_truncated_support_kwargs"] = grpo_truncated_support_kwargs
-# GRPO loss calls that scored the policy over the kept set, by setting: engagement counter.
-_GRPO_TRUNCATED_SUPPORT_STATS = {"auto": 0, "on": 0}
-
-
-def _grpo_truncated_support_auto_platform():
-    """The automatic default is measured on NVIDIA CUDA only (not ROCm, XPU or CPU)."""
-    return getattr(torch.version, "hip", None) is None and torch.cuda.is_available()
-pass
-
-
-def _grpo_rollout_logprobs_processed(trainer):
-    """True / False when the colocated vLLM engine's logprobs_mode is known (processed_* or raw_*),
-    None when it is not (server mode, a stub engine, an unexpected vLLM layout)."""
-    llm = getattr(trainer, "llm", None)
-    if llm is None:
-        llm = getattr(getattr(trainer, "vllm_generation", None), "llm", None)
-    engine = getattr(llm, "llm_engine", None) if llm is not None else None
-    for config in (
-        getattr(engine, "model_config", None),
-        getattr(getattr(engine, "vllm_config", None), "model_config", None),
-    ):
-        mode = getattr(config, "logprobs_mode", None)
-        if mode is not None:
-            return str(getattr(mode, "value", mode)).startswith("processed")
-    return None
-pass
+# GRPO loss calls that scored the current policy over the kept set (=1): engagement counter.
+_GRPO_TRUNCATED_SUPPORT_STATS = {"on": 0}
 
 
 def _grpo_engine_excluded_ids(trainer):
@@ -1862,6 +1830,9 @@ def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
     PyTorch sort (False); the two keep different tokens when logits tie at the cutoff.
     vllm/v1/sample/ops/topk_topp_sampler.py: < 0.17 PyTorch only; 0.17 - 0.29 Triton when the
     decode batch has >= 8 rows (PyTorch below); >= 0.30 Triton whenever vllm.triton_utils.HAS_TRITON.
+    For 0.17 - 0.29 the batch a token was sampled in (it shrinks as sequences finish) is not known
+    here, so the PyTorch rule is used: it is the only one for any generate call of fewer than 8
+    sequences and for every batch's tail, and it keeps every tie at the top_k cutoff.
     UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER=triton|pytorch overrides the guess (e.g. server mode, where
     the serving vLLM is not the one installed here). Warns once where the trainer cannot reproduce
     every tie the sampler breaks."""
@@ -1879,18 +1850,18 @@ def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
             caveats.append("vLLM is not installed here, so its sampler is assumed to be the PyTorch one")
         elif version < Version("0.17.0") or not _vllm_has_triton():
             uses_triton = False
+        elif version < Version("0.30.0"):
+            # Chosen per decode step by its row count, which the trainer cannot know: follow PyTorch.
+            # The two differ on ties at the top_k cutoff (and on rows of all-equal logits).
+            uses_triton = False
+            if top_k > 0:
+                caveats.append(
+                    f"vLLM {version} masks decode batches of 8 or more sequences with its Triton kernel, "
+                    "which keeps exactly top_k of the logits tied at the cutoff (PyTorch keeps them all), "
+                    "and fewer than 8 with its PyTorch sampler, so the trainer follows the PyTorch one"
+                )
         else:
             uses_triton = True
-            if version < Version("0.30.0"):
-                caveats.append(
-                    f"vLLM {version} masks decode batches of fewer than 8 sequences with its PyTorch "
-                    "sampler, which keeps every token tied with the top_k-th logit"
-                )
-            if version < Version("0.24.0") and top_k > 0:
-                caveats.append(
-                    f"vLLM {version}'s Triton top-k can keep one token more or fewer than top_k "
-                    "when logits tie at the cutoff"
-                )
         args = getattr(trainer, "args", None)
         if getattr(args, "vllm_mode", None) == "server":
             caveats.append(
@@ -1903,12 +1874,9 @@ def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
             "cutoff is not reproducible"
         )
     if caveats and not getattr(trainer, "_unsloth_truncated_support_sampler_warned", False):
-        # Forced (=1): a warning. Automatic: only ties exactly at the cutoff differ, so info.
-        forced = grpo_truncated_support_setting() == "on"
-        (logger.warning if forced else logger.info)(
-            ("Unsloth: UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 scores the kept set of vLLM's "
-             if forced else "Unsloth: GRPO scores the trainer over the kept set of vLLM's ")
-            + f"{'Triton' if uses_triton else 'PyTorch'} top-k / top-p sampler, but "
+        logger.warning(
+            "Unsloth: UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 scores the kept set of vLLM's "
+            f"{'Triton' if uses_triton else 'PyTorch'} top-k / top-p sampler, but "
             + "; ".join(caveats)
             + ". Rows whose cutoff falls inside a run of equal logits can then be renormalised "
             "over a slightly different set than the rollout's; all other rows match exactly."
@@ -2897,9 +2865,8 @@ def grpo_accumulated_loss(
             if not getattr(trainer, "_unsloth_truncated_support_refused", False):
                 from unsloth_zoo.log import logger as _zoo_logger
                 _zoo_logger.warning(
-                    "Unsloth: UNSLOTH_GRPO_TRUNCATED_SUPPORT (scoring over the rollouts' kept set) needs an "
-                    "unsloth build that scores the old / reference logprobs over the same kept set. "
-                    "Scoring the full vocabulary instead: pip install -U unsloth"
+                    "Unsloth: UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 needs an unsloth build that scores the "
+                    "old / reference logprobs over the same kept set. Ignoring it: pip install -U unsloth"
                 )
                 trainer._unsloth_truncated_support_refused = True
             _support_kwargs = {}
@@ -2909,11 +2876,8 @@ def grpo_accumulated_loss(
             _support_kwargs = {}
         if _support_kwargs:
             from functools import partial
-            from unsloth_zoo.rl_replacements import (
-                _GRPO_TRUNCATED_SUPPORT_STATS as _support_stats,
-                grpo_truncated_support_setting as _support_setting,
-            )
-            _support_stats["on" if _support_setting() == "on" else "auto"] += 1
+            from unsloth_zoo.rl_replacements import _GRPO_TRUNCATED_SUPPORT_STATS as _support_stats
+            _support_stats["on"] += 1
             if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
                 # The recompute helper scores the full vocabulary only, so the kept set uses the plain helper
                 from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax
