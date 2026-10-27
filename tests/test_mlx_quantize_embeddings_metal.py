@@ -126,11 +126,10 @@ def test_bitsandbytes_checkpoint_keeps_quantize_embeddings(monkeypatch, tmp_path
         **config, "architectures": ["LlamaForCausalLM"],
         "quantization_config": {"quant_method": "bitsandbytes", "load_in_4bit": True},
     }))
-    copies = iter(range(2))
     monkeypatch.setattr(mlx_lm_utils, "_download", lambda path, *a, **k: Path(path))
     monkeypatch.setattr(
         loader, "_dequantize_bnb_to_tempdir",
-        lambda *a, **k: str(shutil.copytree(dense, tmp_path / f"scratch{next(copies)}")),
+        lambda *a, **k: str(shutil.copytree(dense, tmp_path / "scratch")),
     )
     model, _ = loader.FastMLXModel.from_pretrained(
         str(repo), load_in_4bit = True, quantize_embeddings = True, text_only = True,
