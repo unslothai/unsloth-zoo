@@ -10236,19 +10236,15 @@ class MLXGRPOTrainer(MLXTrainer):
     TRL's GRPOTrainer trains one on CUDA Unsloth. ``reward_funcs`` are callables
     TRL's way: called with ``prompts``, ``completions``, ``completion_ids``,
     every other dataset column and ``trainer_state``, returning one reward (or
-    None) per completion. The reference for ``beta != 0`` is the model with its
-    adapters disabled, or its starting weights for a full fine-tune."""
+    None) per completion. An entry may also be a torch sequence-classification
+    model or its model id, tokenized by its ``reward_processing_classes`` entry.
+    The reference for ``beta != 0`` is the model with its adapters disabled, or its starting weights for a full fine-tune."""
 
     config_class = MLXGRPOConfig
     preference_kind = "grpo"
 
     def __init__(self, *args, reward_funcs, reward_processing_classes=None, **kwargs):
-        if reward_processing_classes is not None:
-            raise ValueError(
-                "Unsloth MLX GRPO: reward_processing_classes tokenize for reward "
-                "models, which are not supported."
-            )
-        self.reward_funcs = grpo_reward_funcs(reward_funcs)
+        self.reward_funcs = grpo_reward_funcs(reward_funcs, reward_processing_classes)
         super().__init__(*args, **kwargs)
         args = self.args
         eval_batch_size = args.per_device_eval_batch_size or args.per_device_train_batch_size
