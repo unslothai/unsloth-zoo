@@ -250,6 +250,32 @@ inline float cce_softcap_tanh(float ratio) {
 }
 """
 
+# p_t of a confident row rounds to 1 in float32, so lse - z_t and p_t - 1 read 0. The sum
+# leaves the target out: loss = softplus(lse_others - z_t), target gradient expm1(-loss).
+_TARGET_NLL_HEADER = """
+inline float cce_log1p(float x) {
+    float u = 1.0f + x;
+    return u == 1.0f ? x : metal::precise::log(u) * (x / (u - 1.0f));
+}
+
+inline float cce_expm1(float x) {
+    float u = metal::precise::exp(x);
+    if (u == 1.0f) {
+        return x;
+    }
+    float um1 = u - 1.0f;
+    return um1 == -1.0f ? -1.0f : um1 * (x / metal::precise::log(u));
+}
+
+// (logsumexp of every class, -log p_t) from the sum over the other classes.
+inline float2 cce_target_nll(float max_value, float others_sum, float target) {
+    float lse_others = max_value + metal::precise::log(others_sum);
+    float margin = lse_others - target;
+    float tail = cce_log1p(metal::precise::exp(-metal::abs(margin)));
+    return float2(metal::max(lse_others, target) + tail, metal::max(margin, 0.0f) + tail);
+}
+"""
+
 
 def _build_forward_update_kernel() -> Callable:
     source = """
@@ -303,11 +329,12 @@ def _build_forward_update_kernel() -> Callable:
             if (softcap > 0.0f) {
                 val = softcap * cce_softcap_tanh(raw / softcap);
             }
-            local_sum += fast::exp(val - chunk_max);
             int global_v = v_start + int(col);
             if (global_v == target) {
                 local_target = val;
                 found_target = 1;
+            } else {
+                local_sum += fast::exp(val - chunk_max);
             }
         }
 
@@ -417,11 +444,12 @@ def _build_forward_update_finalize_kernel() -> Callable:
             if (softcap > 0.0f) {
                 val = softcap * cce_softcap_tanh(raw / softcap);
             }
-            local_sum += fast::exp(val - chunk_max);
             int global_v = v_start + int(col);
             if (global_v == target) {
                 local_target = val;
                 found_target = 1;
+            } else {
+                local_sum += fast::exp(val - chunk_max);
             }
         }
 
@@ -455,12 +483,13 @@ def _build_forward_update_finalize_kernel() -> Callable:
             running_sum_out[row] = new_sum;
             target_out[row] = new_target;
 
-            float lse = new_max + fast::log(new_sum + 1e-9f);
-            lse_out[row] = lse;
             if (target == ignore_index) {
+                lse_out[row] = new_max + fast::log(new_sum + 1e-9f);
                 loss_out[row] = 0.0f;
             } else {
-                loss_out[row] = lse - new_target;
+                float2 lse_loss = cce_target_nll(new_max, new_sum, new_target);
+                lse_out[row] = lse_loss.x;
+                loss_out[row] = lse_loss.y;
             }
         }
     """
@@ -479,7 +508,7 @@ def _build_forward_update_finalize_kernel() -> Callable:
         ],
         output_names=["running_max_out", "running_sum_out", "target_out", "loss_out", "lse_out"],
         source=source,
-        header=_SOFTCAP_HEADER,
+        header=_SOFTCAP_HEADER + _TARGET_NLL_HEADER,
         ensure_row_contiguous=True,
     )
 
@@ -530,8 +559,9 @@ def _build_dlogits_kernel() -> Callable:
                 capped = softcap * cce_softcap_tanh(raw / softcap);
             }
 
-            float prob = fast::exp(capped - lse[row]);
-            float grad = (prob - float(global_v == target)) * grad_output[row];
+            float grad = global_v == target ? cce_expm1(-loss[row])
+                                            : fast::exp(capped - lse[row]);
+            grad *= grad_output[row];
             if (softcap > 0.0f) {
                 float t = cce_softcap_tanh(raw / softcap);
                 grad *= (1.0f - t * t);
@@ -545,6 +575,7 @@ def _build_dlogits_kernel() -> Callable:
         input_names=[
             "logits",
             "lse",
+            "loss",
             "targets",
             "grad_output",
             "v_start_arr",
@@ -553,7 +584,7 @@ def _build_dlogits_kernel() -> Callable:
         ],
         output_names=["d_logits"],
         source=source,
-        header=_SOFTCAP_HEADER,
+        header=_SOFTCAP_HEADER + _TARGET_NLL_HEADER,
         ensure_row_contiguous=True,
     )
 
@@ -582,8 +613,9 @@ def _with_single_simd_forward(fallback: Callable, finalize: bool) -> Callable:
         float chunk_max = simd_max(local_max);
         float local_sum = 0.0f;
         for (uint col = lid; col < chunk_v; col += tpg) {
-            float raw = logits[base + int(col)];
-            local_sum += fast::exp(raw - chunk_max);
+            if (v_start + int(col) != target) {
+                local_sum += fast::exp(logits[base + int(col)] - chunk_max);
+            }
         }
         float chunk_sum = simd_sum(local_sum);
         bool found_target = target >= v_start && target < v_start + int(chunk_v);
@@ -608,12 +640,13 @@ def _with_single_simd_forward(fallback: Callable, finalize: bool) -> Callable:
     """
     if finalize:
         source += """
-            float lse = new_max + fast::log(new_sum + 1e-9f);
-            lse_out[row] = lse;
             if (target == ignore_index) {
+                lse_out[row] = new_max + fast::log(new_sum + 1e-9f);
                 loss_out[row] = 0.0f;
             } else {
-                loss_out[row] = lse - new_target;
+                float2 lse_loss = cce_target_nll(new_max, new_sum, new_target);
+                lse_out[row] = lse_loss.x;
+                loss_out[row] = lse_loss.y;
             }
     """
     source += "    }\n"
@@ -624,7 +657,8 @@ def _with_single_simd_forward(fallback: Callable, finalize: bool) -> Callable:
         name="cce_runtime_forward_single_simd_" + str(finalize),
         input_names=["logits", "targets", "running_max_in", "running_sum_in",
                      "target_in", "v_start_arr", "ignore_index_arr", "softcap_arr"],
-        output_names=output_names, source=source, ensure_row_contiguous=True,
+        output_names=output_names, source=source, header=_TARGET_NLL_HEADER,
+        ensure_row_contiguous=True,
     )
 
     def call(**kwargs):
@@ -892,30 +926,44 @@ def _forward_chunked_fused_finalize(
                 # Match the Metal kernels' float32 LSE accumulation.
                 logits = logits.astype(mx.float32)
 
+            in_chunk = (targets >= v_start) & (targets < v_end)
+            local_targets = mx.clip(targets - v_start, 0, v_end - v_start - 1)
             chunk_max = mx.max(logits, axis=-1)
-            chunk_sum_exp = mx.sum(mx.exp(logits - mx.expand_dims(chunk_max, -1)), axis=-1)
+            chunk_exp = mx.exp(logits - mx.expand_dims(chunk_max, -1))
+            if sum_capped is None:
+                # Leave the target out, as the Metal kernels do.
+                chunk_exp = chunk_exp.at[mx.arange(n), local_targets].multiply(
+                    mx.where(in_chunk, 0.0, 1.0).astype(chunk_exp.dtype)
+                )
+            chunk_sum_exp = mx.sum(chunk_exp, axis=-1)
 
             new_max = mx.maximum(running_max, chunk_max)
             running_sum_exp = running_sum_exp * mx.exp(running_max - new_max)
             running_sum_exp = running_sum_exp + chunk_sum_exp * mx.exp(chunk_max - new_max)
             running_max = new_max
 
-            in_chunk = (targets >= v_start) & (targets < v_end)
-            local_targets = mx.clip(targets - v_start, 0, v_end - v_start - 1)
             chunk_target = mx.take_along_axis(logits, mx.expand_dims(local_targets, -1), axis=1).squeeze(-1)
             target_logit = mx.where(in_chunk, chunk_target, target_logit)
             if sum_capped is not None:
                 # logits is already float32 here (cast above under the same guard)
                 sum_capped = sum_capped + logits.sum(axis=-1)
 
-        lse = running_max + mx.log(running_sum_exp + 1e-9)
         if sum_capped is not None:
+            lse = running_max + mx.log(running_sum_exp + 1e-9)
             # loss = lse - (1-eps)*target - eps*mean_v(logits): equals
             # (1-eps)*NLL + eps*uniform smoothing (HF LabelSmoother form).
             eps = label_smoothing
             token_loss = lse - (1.0 - eps) * target_logit - eps * (sum_capped / vocab_size)
         else:
-            token_loss = lse - target_logit
+            lse_others = running_max + mx.log(running_sum_exp)
+            margin = lse_others - target_logit
+            tail = mx.log1p(mx.exp(-mx.abs(margin)))
+            lse = mx.where(
+                valid_pre,
+                mx.maximum(lse_others, target_logit) + tail,
+                running_max + mx.log(running_sum_exp + 1e-9),
+            )
+            token_loss = mx.maximum(margin, 0.0) + tail
         loss = mx.where(valid_pre, token_loss, mx.zeros_like(lse))
         loss = _poison_invalid_targets(loss, invalid_pre)
         lse = _poison_invalid_targets(lse, invalid_pre)
@@ -1032,8 +1080,8 @@ def _forward_with_hidden_gradient(
 
     With a frozen head the hidden gradient is ``cotangent * (sum_v p_v s'_v w_v -
     s'_y w_y)``, and the bracket does not depend on the cotangent. It is built here
-    one vocabulary chunk at a time: each chunk's softmax weights are taken against
-    the logsumexp so far, and the running sum is rescaled as that logsumexp grows.
+    one vocabulary chunk at a time: each chunk's non-target softmax weights are taken
+    against the running normaliser, and the running sum is rescaled as it grows.
     No vocabulary-wide buffer outlives its chunk, and the backward is a product.
     """
     n, dim = hidden.shape
@@ -1050,8 +1098,9 @@ def _forward_with_hidden_gradient(
     targets = targets.astype(mx.int32)
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
-    # A start no target can reach leaves only the softmax term of the derivative.
-    unreachable_start = mx.array([-(1 << 30)], dtype=mx.int32)
+    # A zero loss makes the target column expm1(0) = 0: the target term is added
+    # after the sweep, where p_t - 1 does not cancel.
+    zero_loss = mx.zeros((n,), dtype=mx.float32)
     unit_cotangent = mx.ones((n,), dtype=mx.float32)
     quantization = dict(group_size=group_size, bits=bits, mode=mode)
 
@@ -1066,9 +1115,10 @@ def _forward_with_hidden_gradient(
         scales_chunk = None if scales is None else scales[v_start:v_end]
         biases_chunk = None if biases is None else biases[v_start:v_end]
         logits = _chunk_matmul(hidden, w_chunk, scales=scales_chunk, biases=biases_chunk, **quantization)
+        start = mx.array([v_start], dtype=mx.int32)
         inputs = [
             logits, targets, running_max, running_sum_exp, target_logit,
-            mx.array([v_start], dtype=mx.int32), ignore_arr, softcap_arr,
+            start, ignore_arr, softcap_arr,
         ]
         previous_lse = lse
         if v_end == vocab_size:
@@ -1091,7 +1141,7 @@ def _forward_with_hidden_gradient(
             lse = running_max + mx.log(running_sum_exp + 1e-9)
         n_reads = 4
         probs = dlogits_kernel(
-            inputs=[logits, lse, targets, unit_cotangent, unreachable_start, ignore_arr, softcap_arr],
+            inputs=[logits, lse, zero_loss, targets, unit_cotangent, start, ignore_arr, softcap_arr],
             output_shapes=[logits.shape],
             output_dtypes=[logits.dtype],
             template=[("O", logits.dtype)],
@@ -1118,8 +1168,9 @@ def _forward_with_hidden_gradient(
         # target_logit is capped, so its tanh is target_logit / softcap.
         target_rows = target_rows * (1.0 - mx.square(target_logit / logit_softcap))[:, None]
     loss = mx.where(valid, loss, 0.0)
+    target_rows = mx.expm1(-loss)[:, None] * target_rows
     # Held until the backward, so store it at the precision the hidden gradient gets.
-    gradient = mx.where(valid[:, None], weighted_rows - target_rows, 0.0).astype(hidden.dtype)
+    gradient = mx.where(valid[:, None], weighted_rows + target_rows, 0.0).astype(hidden.dtype)
     return _poison_invalid_targets(loss, invalid), _poison_invalid_targets(gradient, invalid[:, None])
 
 
@@ -1128,6 +1179,7 @@ def _forward_with_hidden_gradient(
 def _fallback_dlogits(
     logits: mx.array,
     lse: mx.array,
+    loss: mx.array,
     targets: mx.array,
     grad_output: mx.array,
     *,
@@ -1156,7 +1208,7 @@ def _fallback_dlogits(
             - label_smoothing / vocab_size
         )
     else:
-        d_capped = probs - target_mask.astype(mx.float32)
+        d_capped = mx.where(target_mask, mx.expm1(-mx.expand_dims(loss, -1)), probs)
     d_capped = d_capped * mx.expand_dims(grad_output, -1)
 
     if logit_softcap > 0.0:
@@ -1377,6 +1429,7 @@ def make_runtime_cce_loss_fused_finalize(
             resolved_chunk_size, chunk_starts_int, chunk_starts_arr, _ = get_chunk_plan(hidden, weight)
             vocab_size = weight_compute.shape[0]
             lse = outputs[1].astype(mx.float32)
+            loss = outputs[0].astype(mx.float32)
 
             grad_hidden = mx.zeros_like(hidden_compute)
             n_reads = 4
@@ -1384,6 +1437,7 @@ def make_runtime_cce_loss_fused_finalize(
                 mx.array([1.0 - label_smoothing, label_smoothing / vocab_size], dtype=mx.float32)
                 if label_smoothing > 0.0 else None
             )
+            row_stats = [lse] if smoothing_arr is not None else [lse, loss]
 
             for chunk_idx, v_start in enumerate(chunk_starts_int):
                 v_end = min(v_start + resolved_chunk_size, vocab_size)
@@ -1407,7 +1461,7 @@ def make_runtime_cce_loss_fused_finalize(
                     d_logits = dlogits_kernel(
                         inputs=[
                             logits,
-                            lse,
+                            *row_stats,
                             targets32,
                             grad_output32,
                             chunk_starts_arr[chunk_idx],
@@ -1424,6 +1478,7 @@ def make_runtime_cce_loss_fused_finalize(
                     d_logits = _fallback_dlogits(
                         logits,
                         lse,
+                        loss,
                         targets32,
                         grad_output32,
                         v_start=v_start,
@@ -1510,6 +1565,7 @@ def make_runtime_cce_loss_fused_finalize(
             grad_output = mx.zeros_like(outputs[0])
         grad_output32 = grad_output.astype(mx.float32)
         lse = outputs[1].astype(mx.float32)
+        loss = outputs[0].astype(mx.float32)
 
         resolved_chunk_size, chunk_starts_int, chunk_starts_arr, weight_chunk_starts = get_chunk_plan(
             hidden,
@@ -1526,6 +1582,7 @@ def make_runtime_cce_loss_fused_finalize(
             mx.array([1.0 - label_smoothing, label_smoothing / vocab_size], dtype=mx.float32)
             if label_smoothing > 0.0 else None
         )
+        row_stats = [lse] if smoothing_arr is not None else [lse, loss]
         logits_dtype = mx.result_type(hidden_compute, weight_compute)
         d_logits_bytes = (4 if dlogits_kernel is not None and logits_dtype == mx.bfloat16
                           else logits_dtype.size)
@@ -1547,7 +1604,7 @@ def make_runtime_cce_loss_fused_finalize(
                 d_logits = dlogits_kernel(
                     inputs=[
                         logits,
-                        lse,
+                        *row_stats,
                         targets32,
                         grad_output32,
                         chunk_starts_arr[chunk_idx],
@@ -1564,6 +1621,7 @@ def make_runtime_cce_loss_fused_finalize(
                 d_logits = _fallback_dlogits(
                     logits,
                     lse,
+                    loss,
                     targets32,
                     grad_output32,
                     v_start=v_start,
@@ -1759,7 +1817,7 @@ def make_lora_head_cce(*, chunk_size=2048, adapter_scale=20.0,
             else:
                 logits = project(h, projection_weight, sc, qb, rank_h, b, bias, start, end)
             dg = dlogits(
-                inputs=[logits, outputs[1], targets32, grad_output,
+                inputs=[logits, outputs[1], outputs[0], targets32, grad_output,
                         mx.array([start], dtype=mx.int32), ignore_arr, softcap_arr],
                 output_shapes=[logits.shape], output_dtypes=[logits.dtype],
                 template=[("O", logits.dtype)],
