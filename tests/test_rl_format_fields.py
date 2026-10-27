@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# str.format resolves `.name` / `[key]` fields with getattr / getitem from a
-# runtime string, so generated code must not reach os.environ through it.
+# Generated code must not reach os.environ via str.format field traversal.
 import os
 import pytest
 from unsloth_zoo.rl_environments import create_locked_down_function

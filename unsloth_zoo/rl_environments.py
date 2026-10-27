@@ -495,8 +495,7 @@ pass
 # whose whole module has to go:
 #   string -- Formatter.get_field resolves a dotted runtime string and returns
 #     the object, reaching the real builtins with nothing in the source to
-#     match. str.format resolves the same way and returns the text, which is
-#     enough to read os.environ; _reject_dunder_access checks its fields.
+#     match. str.format fields are checked in _reject_dunder_access instead.
 #   dataclasses -- resolves annotations via sys.modules[cls.__module__], which
 #     cannot work for synthetic globals.
 _SAFE_IMPORT_MODULES = frozenset({
@@ -787,9 +786,7 @@ _FORMAT_METHODS = frozenset({"format", "format_map"})
 
 
 def _format_fields_are_safe(text, depth = 0):
-    # str.format does getattr / getitem for every `.name` / `[key]` in a field,
-    # from a runtime string the Attribute check never sees. Apply the same
-    # rule to those names, including fields nested in a format spec.
+    # str.format resolves `.name` / `[key]` fields via getattr / getitem, unseen by the Attribute check.
     import _string
     if depth > 2:
         return False
@@ -835,8 +832,7 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )
-        # Only a literal template can be checked, so `.format` on anything else
-        # (a variable, `str.format`, a built string) is refused.
+        # Only a literal template can be checked; refuse `.format` on anything else.
         if isinstance(node, ast.Attribute) and node.attr in _FORMAT_METHODS:
             template = node.value
             if not (
