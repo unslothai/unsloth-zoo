@@ -163,14 +163,8 @@ def _gpt_oss_flex_mask(
     # Per row even without padding: mask_function can depend on the row (packed documents from position_ids), and
     # a broadcast row-0 block layout would let fully visible blocks skip mask_mod for the other rows.
     bsz = batch_size
-    masks = {}
 
     def build(device):
-        # mask_mod's captured tensors must sit on the device the attention runs on, which BlockMask.to() does not
-        # move: a layer on another GPU (device_map, block swap) gets its own mask from _gpt_oss_block_mask_on.
-        device = torch.device(device)
-        if device in masks:
-            return masks[device]
         q_o, kv_o = (
             x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
             for x in (q_off, kv_off)
@@ -198,11 +192,23 @@ def _gpt_oss_flex_mask(
             )
         else:
             block_mask = compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
-        block_mask._unsloth_on_device = build
-        masks[device] = block_mask
         return block_mask
 
-    return build(device)
+    # mask_mod's captured tensors must sit on the device the attention runs on, which BlockMask.to() does not move:
+    # a layer on another GPU (device_map, block swap) gets a mask built there, once per device per forward. Only the
+    # returned mask refers to this cache, and the cache refers to it weakly, so dropping it frees everything.
+    device = torch.device(device)
+    block_mask = build(device)
+    this, masks = weakref.ref(block_mask), {}
+    def on_device(target):
+        target = torch.device(target)
+        if target == device:
+            return this()
+        if target not in masks:
+            masks[target] = build(target)
+        return masks[target]
+    block_mask._unsloth_on_device = on_device
+    return block_mask
 
 
 @torch.compiler.disable

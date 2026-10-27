@@ -424,3 +424,14 @@ def test_inference_gates_cpu(monkeypatch):
     ours = G._gpt_oss_flex_mask(batch_size = 1, q_length = 1, kv_length = 8, q_offset = 7, mask_function = causal_mask_function,
                                 attention_mask = torch.ones(1, 8, dtype = torch.long), device = "cpu")
     assert ours.to("cpu") is ours and ours.to(torch.device("cpu")) is ours
+    # The per-device cache must not keep the mask alive: dropping it frees it without the cyclic collector.
+    import gc, weakref
+    other = ours.to("meta")
+    assert other.kv_num_blocks.device.type == "meta" and ours.to("meta") is other
+    alive, alive_other = weakref.ref(ours), weakref.ref(other)
+    gc.disable()
+    try:
+        del ours, other
+        assert alive() is None and alive_other() is None
+    finally:
+        gc.enable()
