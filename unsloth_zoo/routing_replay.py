@@ -779,14 +779,21 @@ def _identity_mask(layer_input, recorded):
     return torch.tensor([not unique or n == best for n in shared], dtype = torch.bool)
 
 
+_CUSTOM_OP_PARAMS = frozenset(inspect.signature(torch.library.custom_op).parameters)
+
+
 def _register_op(name, impl, fake):
     for i in range(64):
         full = name + (f"_{i}" if i else "")
         # A reloaded module copy may own the name; custom_op silently re-registers (torch 2.10 segfaults).
         if hasattr(torch.ops.unsloth_zoo, full):
             continue
+        # Opaque host ops: a CUDA graph replay would skip them and reuse the captured CPU output,
+        # so tag them cudagraph unsafe and Inductor keeps the graph out of CUDA graphs.
+        tag = getattr(torch.Tag, "cudagraph_unsafe", None)
+        kwargs = dict(tags = (tag,)) if tag is not None and "tags" in _CUSTOM_OP_PARAMS else {}
         try:
-            op = torch.library.custom_op(f"unsloth_zoo::{full}", mutates_args = ())(impl)
+            op = torch.library.custom_op(f"unsloth_zoo::{full}", mutates_args = (), **kwargs)(impl)
         except RuntimeError:
             continue
         op.register_fake(fake)

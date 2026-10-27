@@ -48,6 +48,21 @@ def test_layer_inputs_op_survives_a_compiled_graph(backend):
     torch._dynamo.reset()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA graphs need a CUDA device")
+def test_reduce_overhead_records_each_calls_addresses():
+    # Under mode = "reduce-overhead" an untagged op either broke CUDA graph recording (CPU output)
+    # or, replayed from the graph, kept the first call's addresses. Each call must see its own.
+    op = rr._layer_inputs_op()
+    torch._dynamo.reset()
+    fn = torch.compile(lambda x: (x.sin(), op([x])), mode = "reduce-overhead", fullgraph = True)
+    for _ in range(5):
+        x = torch.randn(4, device = "cuda")
+        out, addresses = fn(x)
+        assert addresses.tolist() == [x.data_ptr()]
+        out.clone()
+    torch._dynamo.reset()
+
+
 def test_second_module_copy_gets_its_own_op():
     first = rr._layer_inputs_op()
     spec = importlib.util.spec_from_file_location("_rr_second_copy", rr.__file__)
