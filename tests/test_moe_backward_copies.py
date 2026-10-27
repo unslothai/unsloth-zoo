@@ -509,3 +509,49 @@ def test_expert_bias_gather_long_backward_is_reproducible(path, dtype, monkeypat
         torch._dynamo.reset()
     assert all(torch.equal(grads[0], x) for x in grads[1:])
     assert _rel(grads[0], want) < (1e-3 if dtype == torch.float16 else 5e-3), _rel(grads[0], want)
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids = ["static", "dynamic"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_expert_bias_gather_compiled_upcast_caps_the_fp32_copy(dtype, dynamic, monkeypatch):
+    """Compiled backward on the upcast fallback (CPU, ROCm, XPU, CUDA torch < 2.9): each fp32 copy of grad stays
+    within one chunk instead of all rows x width, and the bias grad is bitwise the eager chunked one."""
+    if not hasattr(torch.library, "custom_op"):
+        pytest.skip("torch.library.custom_op unavailable")
+    monkeypatch.setattr(mu, "_MM_OUT_DTYPE", False, raising = False)
+    E, D = 16, 96
+    monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", 1 << 12)
+    cap = (1 << 12) // max(E, D)
+    upcast_rows = []
+    real_one_hot_mm = mu._one_hot_mm_fp32
+
+    def recording_one_hot_mm(one_hot, grad):
+        # Only real (eager) upcasts count: an in-graph upcast is the uncapped rows x width copy.
+        if grad.dtype != torch.float32 and not torch.compiler.is_compiling():
+            upcast_rows.append(grad.shape[0])
+        return real_one_hot_mm(one_hot, grad)
+
+    monkeypatch.setattr(mu, "_one_hot_mm_fp32", recording_one_hot_mm)
+
+    def f(bias, ids, base):
+        return base + mu._gather_expert_bias(bias, ids)
+
+    def run(fn, M, seed):
+        gen = torch.Generator().manual_seed(seed)
+        ids = torch.randint(0, E, (M,), generator = gen).sort().values
+        g = (torch.randn(M, D, generator = gen) * 64).to(dtype)
+        base = torch.zeros(M, D, dtype = dtype)
+        bias = torch.zeros(E, D, dtype = dtype, requires_grad = True)
+        fn(bias, ids, base).backward(g)
+        return bias.grad
+
+    torch._dynamo.reset()
+    compiled = torch.compile(f, fullgraph = True, dynamic = dynamic)
+    try:
+        for M, seed in ((40 * cap + 7, 0), (23 * cap + 3, 1)):
+            upcast_rows.clear()
+            got = run(compiled, M, seed)
+            assert upcast_rows and max(upcast_rows) <= cap, (cap, upcast_rows[:4])
+            assert torch.equal(got, run(f, M, seed))
+    finally:
+        torch._dynamo.reset()
