@@ -843,9 +843,11 @@ def patch_model_and_tokenizer(
 
     # Clear deleted GPU items
     for _ in range(3):
-        gc.collect()
+        collected = gc.collect()
         if DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
         else: torch.cuda.empty_cache()
+        # Nothing found: another full pass right away cannot find anything either.
+        if collected == 0: break
     return model, tokenizer
 pass
 
