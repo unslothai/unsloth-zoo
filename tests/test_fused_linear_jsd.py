@@ -217,6 +217,34 @@ def test_compiles_without_graph_breaks():
     torch.testing.assert_close(h.grad.double(), 2 * gh, rtol = 2e-4, atol = 1e-6)
 
 
+@pytest.mark.parametrize("temperature", [None, 1.0, 0.9])
+def test_compiles_dynamic_fullgraph(temperature):
+    """dynamic = True makes temperature a SymFloat; validating it must not break the graph."""
+    kw = {} if temperature is None else {"temperature": temperature}
+
+    def f(h, w, t, wt, labels):
+        return fl.fused_linear_jsd(h, w, t, wt, labels = labels, beta = 0.5, **kw)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(f, fullgraph = True, dynamic = True, backend = "aot_eager")
+    hs, ws, _, ht, wt, _, labels = _case(6)
+    for n in (5, 9, 13):
+        h = hs[:, :n].detach().clone().requires_grad_(True)
+        out = compiled(h, ws, ht[:, :n], wt, labels[:, :n])
+        out.backward()
+        ref, gh, _, _ = _oracle(h, ws, None, ht[:, :n], wt, None, labels[:, :n], 0.5, temperature or 1.0)
+        torch.testing.assert_close(out.double(), ref, rtol = 2e-5, atol = 1e-6)
+        torch.testing.assert_close(h.grad.double(), gh, rtol = 2e-4, atol = 1e-6)
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_rejects_bad_temperature(temperature):
+    hs, ws, _, ht, wt, _, labels = _case(7)
+    with pytest.raises(ValueError, match = "temperature must be finite"):
+        fl.fused_linear_jsd(hs, ws, ht, wt, labels = labels, temperature = temperature)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA")
 @pytest.mark.parametrize("tf", [(1.0, 0.0, 1.0, 0.0), (1.3, 4.0, 0.8, 3.0)])
 @pytest.mark.parametrize("beta", [0.0, 0.3, 1.0])
@@ -318,3 +346,34 @@ def test_bf16_error_not_worse_than_trl_bf16(beta, temperature, compiled, monkeyp
     assert ours_l <= max(trl_l, 1e-6 * abs(ref.item()))
     assert ours_g <= trl_g
     assert compiled != "triton" or calls, "Triton JSD path did not run"
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason = "two CUDA devices")
+@pytest.mark.parametrize("teacher_device", ["cuda:1", "cuda:0"])
+def test_triton_runs_on_the_operand_device_not_the_current_one(teacher_device):
+    """Student head on cuda:1 while cuda:0 is current: Triton must launch there, not fall back to eager."""
+    import warnings
+    dev = torch.device("cuda:1")
+    if not fl._use_triton(dev):
+        pytest.skip("Triton JSD path unavailable on cuda:1")
+    g = torch.Generator().manual_seed(0)
+    h = torch.randn(8, 16, generator = g)
+    w = torch.randn(65, 16, generator = g)
+    t = torch.randn(8, 12, generator = g)
+    wt = torch.randn(65, 12, generator = g)
+    with torch.cuda.device(1):
+        hr = h.to(dev).requires_grad_()
+        ref = fl.fused_linear_jsd(hr, w.to(dev), t.to(teacher_device), wt.to(teacher_device), beta = 0.5)
+        ref.backward()
+    torch.cuda.set_device(0)
+    fl._TRITON_BROKEN.discard(dev)
+    hx = h.to(dev).requires_grad_()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the eager fallback warns
+        loss = fl.fused_linear_jsd(hx, w.to(dev), t.to(teacher_device), wt.to(teacher_device), beta = 0.5)
+        loss.backward()
+    torch.cuda.synchronize(dev)
+    assert dev not in fl._TRITON_BROKEN
+    assert torch.cuda.current_device() == 0
+    torch.testing.assert_close(loss.detach(), ref.detach())
+    torch.testing.assert_close(hx.grad, hr.grad)
