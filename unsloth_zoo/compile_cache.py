@@ -59,6 +59,7 @@ __all__ = [
 
 import atexit
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -72,8 +73,8 @@ _FORMAT_VERSION = 1
 _BUNDLE_NAME = "megacache.bin"
 _MANIFEST_NAME = "manifest.json"
 _LOCK_NAME = ".lock"
-# Bounded so a wedged writer can never hang interpreter exit; on timeout the
-# save proceeds unlocked (the pre-lock behaviour), never skipped.
+# Bounded so a wedged writer can never hang interpreter exit; on timeout another
+# live writer owns the key, so this save is skipped (its union lands next run).
 _LOCK_TIMEOUT = 60
 
 # One fingerprint accumulates every model loaded in this process; each
@@ -315,11 +316,12 @@ def _register_model_key(entry):
     """Add one model entry to the process key: exact repeats are dropped and
     entries kept in canonical order, so the key is a function of the model SET.
     Returns whether the set changed."""
-    model_keys = _STATE["model_keys"]
-    if entry in model_keys:
+    if entry in _STATE["model_keys"]:
         return False
-    model_keys.append(entry)
-    model_keys.sort(key = lambda item: json.dumps(item, sort_keys = True, default = str))
+    _STATE["model_keys"] = sorted(
+        [*_STATE["model_keys"], entry],
+        key = lambda item: json.dumps(item, sort_keys = True, default = str),
+    )
     return True
 pass
 
@@ -421,28 +423,25 @@ def _merge_recorded_artifacts(data):
     bundle and this process' artifacts. torch only records what this run
     loaded-and-hit or compiled, so without this a run that exercises a subset
     of a warm bundle (a different shape, one of several cached models) would
-    replace the bundle with that subset and silently drop the rest.
-    Best-effort: a failure just means this save may narrow the bundle.
+    replace the bundle with that subset and silently drop the rest. One copy
+    per identity: this run's copy wins over the disk's, and duplicate disk
+    copies collapse.
 
-    Returns True when the bundle already holds every key this process
-    recorded, i.e. there is nothing new to save. The byte comparison alone
-    misses that: serialization follows this run's recording order, and
-    autotune entries come back with new timings, so a warm run that only
-    re-hit the bundle would rewrite it on every exit."""
+    Returns the set of identities in the on-disk bundle (None if it could not
+    be read) so the caller can skip a write that would add nothing.
+    Best-effort: a failure just means this save may narrow the bundle."""
     try:
         from torch.compiler._cache import CacheArtifactManager
         artifacts = CacheArtifactManager.deserialize(data)
         if not artifacts:
-            return False
-        seen_ids = {_artifact_identity(a) for a in CacheArtifactManager._seen_artifacts}
-        disk_ids = {_artifact_identity(a) for items in artifacts.values() for a in items}
-        if seen_ids <= disk_ids:
-            return True
+            return None
+        disk_ids = set()
+        seen_ids = {_artifact_identity(a) for a in list(CacheArtifactManager._seen_artifacts)}
         merged = 0
-        for artifact_type, items in artifacts.items():
-            for artifact in items:
-                # This run's copy of a key wins; one copy per key from disk.
+        for artifact_type, items in list(artifacts.items()):
+            for artifact in list(items):
                 identity = _artifact_identity(artifact)
+                disk_ids.add(identity)
                 if identity in seen_ids:
                     continue
                 seen_ids.add(identity)
@@ -451,9 +450,67 @@ def _merge_recorded_artifacts(data):
                 merged += 1
         if merged:
             _log(f"merged {merged} artifact(s) from the existing bundle")
+        return disk_ids
     except Exception as error:
         _log(f"bundle merge skipped ({error})")
-    return False
+    return None
+pass
+
+
+def _recorded_identities():
+    """Identities of everything torch's artifact manager holds now (this run's
+    plus merged), or None if it cannot be inspected."""
+    try:
+        from torch.compiler._cache import CacheArtifactManager
+        return {_artifact_identity(a) for a in list(CacheArtifactManager._seen_artifacts)}
+    except Exception:
+        return None
+pass
+
+
+def _prepare_lock_file(path):
+    """Create (or open) the lock file ourselves, owner-only, and refuse
+    anything that is not a plain single-link regular file we own, so the lock
+    can never be redirected through a symlink or hard link."""
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        return False
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            return False
+        if os.name == "posix" and (
+            file_stat.st_uid != os.geteuid() or file_stat.st_mode & 0o022
+        ):
+            return False
+        return True
+    finally:
+        os.close(fd)
+pass
+
+
+def _platform_lock(path):
+    """The OS lock class itself, never filelock's SoftFileLock: an existence
+    lock left by a killed writer would block every later save until it times
+    out. ``fallback_to_soft`` / ``mode`` are absent on older filelock."""
+    import filelock
+    lock_class = filelock.WindowsFileLock if os.name == "nt" else filelock.UnixFileLock
+    for kwargs in ({"mode": 0o600, "fallback_to_soft": False}, {"mode": 0o600}, {}):
+        try:
+            return lock_class(path, timeout = _LOCK_TIMEOUT, **kwargs)
+        except TypeError:
+            continue
+    return lock_class(path, timeout = _LOCK_TIMEOUT)
+pass
+
+
+def _locking_unsupported(error):
+    if isinstance(error, (ImportError, NotImplementedError)):
+        return True
+    unsupported = {getattr(errno, name) for name in ("ENOSYS", "ENOLCK", "EOPNOTSUPP", "ENOTSUP") if hasattr(errno, name)}
+    return isinstance(error, OSError) and error.errno in unsupported
 pass
 
 
@@ -462,20 +519,34 @@ def _key_lock(directory):
     """Serialize savers of one key across processes: read-merge-publish-collect
     must not interleave, or one writer collects the bundle another's manifest
     is about to name (a dangling manifest) and concurrent unions drop each
-    other's artifacts. filelock (a zoo dependency) uses flock / msvcrt, which
-    the OS releases if the holder dies, so a crashed writer leaves no stale
-    lock. Any failure (missing package, a filesystem without locking, timeout)
-    falls back to the unlocked save, which is still crash-safe on its own."""
+    other's artifacts. flock / msvcrt locks are released by the OS if the
+    holder dies, so a crashed writer leaves no stale lock.
+
+    Yields True when the save may proceed. Only where locking is genuinely
+    unsupported (filelock missing, a filesystem without flock, a platform with
+    neither lock) does it proceed unlocked, exactly as before the lock existed;
+    a timeout (another live writer) or an untrustworthy lock file skips it."""
     lock = None
+    may_save = True
     try:
-        from filelock import FileLock
-        lock = FileLock(os.path.join(directory, _LOCK_NAME), timeout = _LOCK_TIMEOUT)
-        lock.acquire()
+        if os.name not in ("posix", "nt"):
+            raise NotImplementedError(os.name)
+        path = os.path.join(directory, _LOCK_NAME)
+        if _prepare_lock_file(path):
+            lock = _platform_lock(path)
+            lock.acquire()
+        else:
+            _log("lock file is not a private regular file; skipping save")
+            may_save = False
     except Exception as error:
         lock = None
-        _log(f"save lock unavailable ({error}); saving unlocked")
+        may_save = _locking_unsupported(error)
+        if may_save:
+            _log(f"save lock unsupported ({error!r}); saving unlocked")
+        else:
+            _log(f"save lock not acquired ({error!r}); skipping save")
     try:
-        yield
+        yield may_save
     finally:
         if lock is not None:
             try:
@@ -505,11 +576,6 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
         _model_key(model_type, compile_kwargs or {}, torch_compile_options or {})
     )
     key = _bundle_key()
-    # Same set as the bundle already loaded (a model reloaded in this
-    # process): its artifacts are in torch's caches; do not re-read them.
-    if _STATE["hit"] and key == _STATE["loaded_key"]:
-        _log(f"bundle for key {key} already loaded")
-        return True
     directory, manifest_path = _bundle_paths(key)
     if manifest_path is None:
         _log("no trusted cache root; skipping")
@@ -586,7 +652,9 @@ def megacache_save():
         if not _ensure_private_directory(directory):
             _log("cache directory is not trusted; skipping save")
             return False
-        with _key_lock(directory):
+        with _key_lock(directory) as may_save:
+            if not may_save:
+                return False
             return _save_locked(torch, key, directory, manifest_path)
     except Exception as error:
         _log(f"save failed ({error})")
@@ -600,20 +668,28 @@ def _save_locked(torch, key, directory, manifest_path):
     # run that exercised only part of a warm bundle cannot narrow it (union
     # semantics; see _merge_recorded_artifacts).
     _, existing = _read_disk_bundle(directory, manifest_path)
-    if existing is not None and _merge_recorded_artifacts(existing):
-        _log("bundle already holds every recorded artifact; skipping save")
-        return False
+    disk_ids = _merge_recorded_artifacts(existing) if existing is not None else None
+    # Always serialize: save_cache_artifacts also records deferred Dynamo
+    # precompile entries, which a skipped call would never capture.
     result = torch.compiler.save_cache_artifacts()
     if not result or not result[0]:
         _log("nothing to save (no compile artifacts recorded)")
         return False
     data = result[0]
     new_sha = hashlib.sha256(data).hexdigest()
-    # Skip rewriting a byte-identical bundle so a no-op run doesn't churn
-    # the cache (and its mtime) every exit.
+    # Skip rewriting a bundle that already holds everything, so a no-op run
+    # doesn't churn the cache (and its mtime) every exit. Bytes alone miss
+    # it: serialization follows this run's recording order and autotune
+    # entries come back re-timed, so compare identities recorded after the
+    # save call as well.
     if existing is not None and hashlib.sha256(existing).hexdigest() == new_sha:
         _log("bundle unchanged; skipping save")
         return False
+    if disk_ids is not None:
+        recorded = _recorded_identities()
+        if recorded is not None and recorded <= disk_ids:
+            _log("bundle already holds every recorded artifact; skipping save")
+            return False
     # The bundle is content-addressed and the manifest names it, so the
     # pair stays consistent even for an unlocked (fallback) writer: bundles
     # are differently named, the manifest replace is atomic, and the last

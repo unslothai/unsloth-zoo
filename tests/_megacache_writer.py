@@ -22,6 +22,7 @@ module_path, root, artifacts, pause, sync = sys.argv[1:6]
 class CacheArtifactManager:
     _new_cache_artifacts = defaultdict(list)
     _seen_artifacts = set()
+    _serialized = []
 
     @staticmethod
     def deserialize(data):
@@ -32,11 +33,17 @@ class CacheArtifactManager:
 
 
 def save_cache_artifacts():
-    seen = CacheArtifactManager._seen_artifacts
-    return (json.dumps(sorted(seen)).encode(), {}) if seen else None
+    # Like torch: move what was recorded (incl. merged) into the appending
+    # serializer and return everything serialized so far.
+    manager = CacheArtifactManager
+    for items in manager._new_cache_artifacts.values():
+        manager._serialized.extend(items)
+    manager._new_cache_artifacts.clear()
+    return (json.dumps(sorted(manager._serialized)).encode(), {}) if manager._serialized else None
 
 
 for key in artifacts.split(","):
+    CacheArtifactManager._new_cache_artifacts["inductor"].append(("inductor", key))
     CacheArtifactManager._seen_artifacts.add(("inductor", key))
 
 cache_module = types.ModuleType("torch.compiler._cache")

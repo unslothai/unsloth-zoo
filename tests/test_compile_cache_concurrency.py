@@ -105,50 +105,181 @@ def _seed(module, artifacts):
     return directory, data
 
 
-def test_reloading_the_same_model_does_not_reread_the_bundle(cache):
+def test_reloading_the_same_model_repopulates_torch_caches(cache):
+    # No "already loaded" shortcut: a cleared FX cache or a changed
+    # TORCHINDUCTOR_CACHE_DIR must be refilled, not reported as a hit.
     cache._STATE["model_keys"] = []
     cache._register_model_key(cache._model_key("llama", {}, {}))
     _, data = _seed(cache, [("inductor", "a")])
     cache._STATE["model_keys"] = []
     assert cache.megacache_load("llama") is True
     assert cache.megacache_load("llama") is True
-    assert cache.loaded == [data]
+    assert cache.loaded == [data, data]
 
 
-def test_warm_run_that_adds_nothing_does_not_rewrite_the_bundle(cache, monkeypatch):
-    from collections import defaultdict
+class _Artifact(tuple):
+    """Stand-in for torch's frozen (key, content) CacheArtifact."""
 
-    seen = {("inductor", "b"), ("inductor", "a")}
-    manager = types.SimpleNamespace(
-        _seen_artifacts = seen,
-        _new_cache_artifacts = defaultdict(list),
-        deserialize = lambda data: {"inductor": [tuple(item) for item in json.loads(data)]},
-    )
-    serialized = []
-    fake_cache_module = types.SimpleNamespace(CacheArtifactManager = manager)
-    fake_compiler = types.SimpleNamespace(
-        _cache = fake_cache_module,
+    def __new__(cls, key, content):
+        return super().__new__(cls, (key, content))
+
+    key = property(lambda self: self[0])
+    content = property(lambda self: self[1])
+
+
+class _FakeRecorder:
+    """torch.compiler._cache.CacheArtifactManager semantics that matter here:
+    record_artifact dedupes by value into _new_cache_artifacts/_seen_artifacts,
+    serialize moves _new into an appending serializer and returns all of it."""
+
+    def __init__(self):
+        from collections import defaultdict
+
+        self._new_cache_artifacts = defaultdict(list)
+        self._seen_artifacts = set()
+        self.serialized = []
+        self.calls = 0
+
+    def record(self, key, content):
+        artifact = _Artifact(key, content)
+        if artifact not in self._seen_artifacts:
+            self._new_cache_artifacts["autotune"].append(artifact)
+            self._seen_artifacts.add(artifact)
+
+    @staticmethod
+    def encode(artifacts):
+        return json.dumps([[a.key, a.content] for a in artifacts]).encode()
+
+    @staticmethod
+    def deserialize(data):
+        return {"autotune": [_Artifact(key, content) for key, content in json.loads(data)]}
+
+    def save_cache_artifacts(self):
+        self.calls += 1
+        for items in self._new_cache_artifacts.values():
+            self.serialized.extend(items)
+        self._new_cache_artifacts.clear()
+        return (self.encode(self.serialized), {}) if self.serialized else None
+
+
+@pytest.fixture
+def recorder(cache, monkeypatch):
+    fake = _FakeRecorder()
+    cache_module = types.SimpleNamespace(CacheArtifactManager = fake)
+    compiler = types.SimpleNamespace(
+        _cache = cache_module,
         load_cache_artifacts = lambda bundle: {},
-        # This run's recording order differs from the bundle's.
-        save_cache_artifacts = lambda: serialized.append(1) or (json.dumps([["inductor", "b"], ["inductor", "a"]]).encode(), {}),
+        save_cache_artifacts = fake.save_cache_artifacts,
     )
-    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(compiler = fake_compiler))
-    monkeypatch.setitem(sys.modules, "torch.compiler", fake_compiler)
-    monkeypatch.setitem(sys.modules, "torch.compiler._cache", fake_cache_module)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(compiler = compiler))
+    monkeypatch.setitem(sys.modules, "torch.compiler", compiler)
+    monkeypatch.setitem(sys.modules, "torch.compiler._cache", cache_module)
     cache._STATE["model_keys"] = []
     cache._register_model_key(cache._model_key("llama", {}, {}))
-    directory, data = _seed(cache, seen)
     cache._STATE["armed"] = True
     cache._STATE["loaded_key"] = cache._bundle_key()
+    return fake
+
+
+def _seed_bundle(cache, data):
+    directory = Path(os.environ["UNSLOTH_MEGA_CACHE_DIR"]) / cache._STATE["loaded_key"]
+    directory.mkdir(parents = True, exist_ok = True)
+    name = "megacache-seed.bin"
+    (directory / name).write_bytes(data)
+    (directory / "manifest.json").write_text(
+        json.dumps({"bundle": name, "sha256": hashlib.sha256(data).hexdigest()})
+    )
+    if os.name == "posix":
+        os.chmod(directory / name, 0o600)
+        os.chmod(directory / "manifest.json", 0o600)
+    return directory
+
+
+def _published(directory):
+    manifest = json.loads((directory / "manifest.json").read_text())
+    return sorted(map(tuple, json.loads((directory / manifest["bundle"]).read_bytes())))
+
+
+def test_warm_run_that_adds_nothing_still_serializes_but_does_not_rewrite(cache, recorder):
+    directory = _seed_bundle(cache, _FakeRecorder.encode([_Artifact("a", "1"), _Artifact("b", "old")]))
+    # This run re-hit both, b re-timed under the same key, in another order.
+    recorder.record("b", "new")
+    recorder.record("a", "1")
     before = sorted(os.listdir(directory))
 
     assert cache.megacache_save() is False
-    assert serialized == []
+    assert recorder.calls == 1  # deferred precompile entries still get recorded
     assert sorted(set(os.listdir(directory)) - {".lock"}) == before
 
-    seen.add(("inductor", "c"))  # a genuinely new artifact is still saved
+    recorder.record("c", "2")  # a genuinely new artifact is saved with the union
     assert cache.megacache_save() is True
-    assert serialized == [1]
+    assert recorder.calls == 2
+    assert _published(directory) == [("a", "1"), ("b", "new"), ("c", "2")]
+
+
+def test_cold_save_merges_the_disk_union(cache, recorder):
+    directory = _seed_bundle(cache, _FakeRecorder.encode([_Artifact("a", "1"), _Artifact("x", "9")]))
+    recorder.record("b", "2")
+    assert cache.megacache_save() is True
+    assert _published(directory) == [("a", "1"), ("b", "2"), ("x", "9")]
+
+
+def test_save_is_skipped_while_another_live_writer_holds_the_lock(cache, recorder, monkeypatch):
+    directory = Path(os.environ["UNSLOTH_MEGA_CACHE_DIR"]) / cache._STATE["loaded_key"]
+    directory.mkdir(parents = True)
+    assert cache._prepare_lock_file(str(directory / ".lock"))
+    holder = cache._platform_lock(str(directory / ".lock"))
+    holder.acquire()
+    monkeypatch.setattr(cache, "_LOCK_TIMEOUT", 0.2)
+    recorder.record("a", "1")
+    try:
+        assert cache.megacache_save() is False
+    finally:
+        holder.release()
+    assert not (directory / "manifest.json").exists()
+    assert cache.megacache_save() is True
+
+
+def test_unsupported_locking_keeps_the_unlocked_save(cache, recorder, monkeypatch):
+    class _NoFlock:
+        def acquire(self):
+            raise NotImplementedError("FileSystem does not appear to support flock")
+
+    monkeypatch.setattr(cache, "_platform_lock", lambda path: _NoFlock())
+    recorder.record("a", "1")
+    assert cache.megacache_save() is True
+
+
+def test_platform_lock_never_downgrades_to_a_soft_lock(cache):
+    import filelock
+
+    lock = cache._platform_lock(os.path.join(os.environ["UNSLOTH_MEGA_CACHE_DIR"], ".lock"))
+    expected = filelock.WindowsFileLock if os.name == "nt" else filelock.UnixFileLock
+    assert isinstance(lock, expected)
+    assert not isinstance(lock, filelock.SoftFileLock)
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX symlink / hard-link semantics")
+@pytest.mark.parametrize("kind", ("symlink", "hardlink"))
+def test_save_refuses_a_redirected_lock_file(cache, recorder, tmp_path, kind):
+    directory = Path(os.environ["UNSLOTH_MEGA_CACHE_DIR"]) / cache._STATE["loaded_key"]
+    directory.mkdir(parents = True)
+    target = tmp_path / "elsewhere"
+    target.write_bytes(b"keep")
+    target.chmod(0o600)
+    (directory / ".lock").symlink_to(target) if kind == "symlink" else os.link(target, directory / ".lock")
+    recorder.record("a", "1")
+    assert cache.megacache_save() is False
+    assert target.read_bytes() == b"keep"
+    assert not (directory / "manifest.json").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX modes")
+def test_lock_file_is_created_owner_only(cache, recorder):
+    recorder.record("a", "1")
+    assert cache.megacache_save() is True
+    directory = Path(os.environ["UNSLOTH_MEGA_CACHE_DIR"]) / cache._STATE["loaded_key"]
+    assert (directory / ".lock").stat().st_mode & 0o777 == 0o600
 
 
 def _spawn(root, artifacts, pause, sync):
@@ -231,7 +362,7 @@ def autotune_artifact():
     return AutotuneCacheArtifact
 
 
-def test_warm_run_with_retimed_autotune_entries_skips_the_save(monkeypatch, autotune_artifact):
+def test_retimed_autotune_entries_are_not_new_identities(monkeypatch, autotune_artifact):
     # Triton re-records best_config entries with new timings under the same key.
     module = _load_module()
     manager = _fake_artifact_manager(
@@ -239,8 +370,11 @@ def test_warm_run_with_retimed_autotune_entries_skips_the_save(monkeypatch, auto
         disk = [autotune_artifact("k1", b"old"), autotune_artifact("k2", b"x")],
         seen = [autotune_artifact("k1", b"new")],
     )
-    assert module._merge_recorded_artifacts(b"bundle") is True
-    assert not manager._new_cache_artifacts
+    disk_ids = module._merge_recorded_artifacts(b"bundle")
+    assert disk_ids == {("AutotuneCacheArtifact", "k1"), ("AutotuneCacheArtifact", "k2")}
+    # The disk-only key is folded in; the re-timed one keeps this run's copy.
+    assert [a.key for a in manager._new_cache_artifacts["autotune"]] == ["k2"]
+    assert module._recorded_identities() <= disk_ids
 
 
 def test_merge_keeps_one_copy_per_key_and_this_runs_copy_wins(monkeypatch, autotune_artifact):
@@ -251,7 +385,9 @@ def test_merge_keeps_one_copy_per_key_and_this_runs_copy_wins(monkeypatch, autot
         disk = [autotune_artifact("k1", b"old"), autotune_artifact("k3", b"a"), autotune_artifact("k3", b"b")],
         seen = [mine, autotune_artifact("k2", b"x")],
     )
-    assert module._merge_recorded_artifacts(b"bundle") is False
+    assert module._merge_recorded_artifacts(b"bundle") == {
+        ("AutotuneCacheArtifact", "k1"), ("AutotuneCacheArtifact", "k3"),
+    }
     merged = manager._new_cache_artifacts["autotune"]
     assert [a.key for a in merged] == ["k3"]
     assert mine in manager._seen_artifacts
