@@ -66,10 +66,12 @@ def _wants_attentions(module, kwargs):
 
 
 def in_unsloth_block():
-    """Inside Unsloth's per-decoder-layer compile region (fullgraph=False), where a graph break is legal."""
+    """Inside Unsloth's per-decoder-layer compile region (fullgraph=False), where a graph break is legal.
+    _IN_BLOCK is also set while a user's torch.compile (maybe fullgraph=True) inlines the block, so only
+    _IN_COMPILED_REGION counts; an Unsloth without it keeps the model's path in every compile."""
     block = sys.modules.get("unsloth.models._block_compile")
-    flag = getattr(block, "_IN_BLOCK", None)
-    return bool(flag) and flag[0] != 0
+    flag = getattr(block, "_IN_COMPILED_REGION", None)
+    return bool(flag) and bool(flag[0])
 
 
 def _compiled_without_break():

@@ -91,6 +91,7 @@ def test_stop_scanner_trims_to_token_boundary():
         (GenerationRequest(prompt_token_ids=[]), "must not be empty"),
         (GenerationRequest(prompt=""), "must not be empty"),
         (GenerationRequest(prompt="x", image=object()), "text prompts only"),
+        (GenerationRequest(prompt="x", vision_inputs={}), "text prompts only"),
         (GenerationRequest(prompt="x", max_tokens=0), "must be positive"),
     ],
 )
@@ -513,6 +514,8 @@ def test_vlm_requests_reject_token_ids_with_media_and_unsupported_controls():
     assert _validate_vlm_requests([GenerationRequest(prompt_token_ids=iter((1, 2)))], GenerationDefaults())[0].prompt_token_ids == (1, 2)  # noqa: E501
     cases = ((GenerationRequest(prompt_token_ids=[1], image="i.png"), GenerationDefaults(), "token ids with media"),
         (GenerationRequest(prompt="a", prompt_token_ids=[1]), GenerationDefaults(), "exactly one"),
+        (GenerationRequest(prompt_token_ids=[1], vision_inputs={}), GenerationDefaults(), "generate_batch or stream_batch only"),
+        (GenerationRequest(prompt="a", vision_inputs={}), GenerationDefaults(), "given as prompt_token_ids"),
         (GenerationRequest(prompt=""), GenerationDefaults(), "must not be empty"),
         (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
         # One mlx-vlm would drop rather than apply is refused: an inert start or bogus scheme,
@@ -528,6 +531,27 @@ def test_vlm_requests_reject_token_ids_with_media_and_unsupported_controls():
     # Path images normalize to str once: mlx-vlm's loader opens str only, and
     # grouping and preprocessing must see the same value.
     assert _validate_vlm_requests([GenerationRequest(prompt="a", image=pathlib.Path("/tmp/i.png"))], GenerationDefaults())[0].image == "/tmp/i.png"  # noqa: E501
+    # A prepared prompt (generate_batch / stream_batch) groups only with rows its vision inputs concatenate with.
+    import numpy as np
+    from dataclasses import replace
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _stream_batch
+    prepared = GenerationRequest(prompt_token_ids=[1, 2], vision_inputs={"pixel_values": np.zeros((2, 3))})
+    assert _validate_vlm_requests([prepared], GenerationDefaults(), prepared=True)[0].prompt_token_ids == (1, 2)
+    for request, message in ((replace(prepared, image="i.png"), "token ids with media"), (replace(prepared, vision_inputs={"input_ids": 1}), "other than input_ids")):
+        with pytest.raises(ValueError, match=message):
+            _validate_vlm_requests([request], GenerationDefaults(), prepared=True)
+    adapter = types.SimpleNamespace(batches_observable=True)
+    key = lambda **change: _VLMBatchAdapter._group_key(adapter, replace(prepared, **change))
+    assert key() == key(vision_inputs={"pixel_values": np.ones((2, 3))}) != key(vision_inputs={"pixel_values": np.ones((4, 3))})
+    assert key() != key(prompt_token_ids=(1, 2, 3))
+    assert key() not in (key(vision_inputs={"images": np.zeros((2, 3))}), key(vision_inputs={"pixel_values": np.zeros((2, 3), np.float16)}))
+    assert key(vision_inputs={"token": 9}) == key(vision_inputs={"token": np.int64(9)}) != key(vision_inputs={"token": 8})
+    listed = [replace(prepared, vision_inputs={"grid": [(1,)]}) for _ in range(2)]
+    assert len({_VLMBatchAdapter._group_key(adapter, request) for request in listed}) == 2
+    with pytest.raises(ValueError, match="no vision path"):
+        list(_stream_batch(types.SimpleNamespace(_is_vlm_model=True, language_model=None, _unsloth_supports_images=False), object(), [prepared]))  # noqa: E501
+    with pytest.raises(TypeError, match="model with eval"):
+        list(_stream_batch(types.SimpleNamespace(_is_vlm_model=True, language_model=None, _unsloth_supports_images=False), object(), [replace(prepared, vision_inputs={"mm_token_type_ids": np.zeros((1, 2)), "pixel_values": None})]))  # noqa: E501
 
 
 def test_a_prompt_cache_state_is_taken_only_by_a_vision_stream_row():
@@ -632,9 +656,9 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     ids, embeds = (types.SimpleNamespace(tolist=lambda: [[1], [2]]),
                    types.SimpleNamespace(to_dict=lambda: {"inputs_embeds": "E", "position_ids": None}))
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
-    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant", prefill_step_size=8192)
+    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant", prefill_step_size=8192, stop_token_ids=(5,))
     adapter.per_row_prompt_kwargs = True
-    adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
+    adapter.processor = types.SimpleNamespace(tokenizer=_CriteriaTokenizer())
     adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens", "kv_bits", "kv_quant_scheme", "quantized_kv_start", "prefill_step_size"}  # noqa: E501
     adapter.prepare_inputs = lambda *a, **k: {"input_ids": ids, "extra": "D", "position_ids": "P"}  # noqa: E501
     adapter.make_sampler = lambda **k: object()
@@ -651,7 +675,7 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
         config=types.SimpleNamespace(image_token_index=None), language_model=object(),
         get_input_embeddings=lambda *a, **k: (order.append("embed"), embeds)[1])
     adapter.generator_type = lambda *a, **k: (order.append("construct"),
-        seen.update(ctor=k), _vlm_stub(True, events=[[(0, 1, "stop")]])(*a[:2]))[2]
+        seen.update(ctor=k, stops=a[1].tokenizer.stopping_criteria), _vlm_stub(True, events=[[(0, 1, "stop")]])(*a[:2]))[2]
     assert [event.result for event in
             adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])] == [1, 1]
     assert order == ["wired", "embed", "policy", "construct"]
@@ -664,11 +688,20 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     # Per-row keeps configured sizes; EOS stays with the processor.
     assert (seen["ctor"]["prefill_batch_size"], seen["ctor"]["completion_batch_size"]) == (8, 32)
     assert "stop_tokens" not in seen["ctor"]
+    assert [seen["stops"](token) for token in (3, 5)] == [False, True] and adapter.processor.tokenizer.stopping_criteria(3)
     assert seen["ctor"]["prefill_step_size"] == 8192
     # A model that must not chunk its prefill still prefills whole.
     adapter._chunked_prefill_kwargs = lambda **kw: {"prefill_step_size": None}
     list(adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1]))
     assert seen["ctor"]["prefill_step_size"] is None
+    # A prepared chunk prefills its own ids and vision inputs, never re-encoded.
+    import numpy as np
+    adapter.prepare_inputs = None
+    adapter.model.get_input_embeddings = lambda ids, pixels, mask, **k: (seen.update(embed=(ids.tolist(), pixels.tolist(), mask.tolist(), k)), embeds)[1]
+    list(adapter._run_chunk([GenerationRequest(prompt_token_ids=(1, i), vision_inputs={"pixel_values": np.full((1, 2), i), "token": 9}) for i in (7, 8)], [0, 1]))
+    assert seen["embed"] == ([[1, 7], [1, 8]], [[7, 7], [8, 8]], [[1, 1]] * 2, {"token": 9})
+    list(adapter._run_chunk([GenerationRequest(prompt_token_ids=(1, 7), vision_inputs={"images": np.full((1, 2), 7), "grid": [(7,), (8,)]})], [0]))
+    assert seen["embed"] == ([[1, 7]], [[7, 7]], [[1, 1]], {"grid": [(7,), (8,)]})
 
 
 @pytest.mark.parametrize("nested", (True, False))
@@ -1337,7 +1370,7 @@ class _OpenVLMGenerator:
     """mlx-vlm's open-batch surface: insert answers with uids, next reports."""
 
     def __init__(self, *args, **kwargs):
-        self.kwargs = kwargs
+        self.args, self.kwargs = args, kwargs
         self.inserted, self.removed, self.events = [], [], []
         self.closed = False
         self._next_uid = 0
@@ -1426,6 +1459,8 @@ def test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given():
         assert session.generator.kwargs["quantized_kv_start"] == 0  # from the first token, not mlx-vlm's 5000
     with contextlib.closing(_vlm_session(prefill_step_size = 8192)) as session:
         assert session.generator.kwargs["prefill_step_size"] == 8192
+    with contextlib.closing(_vlm_session(stop_token_ids = ())) as session:  # stops on nothing, not the EOS
+        assert session.generator.args[1].tokenizer.stopping_criteria.eos_token_ids == []
 
 
 def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
@@ -1670,7 +1705,16 @@ def test_kv_quant_controls_and_processor_rows_are_refused_before_they_reach_a_ca
 
 def test_the_preflight_refuses_defaults_every_add_would():
     from unsloth_zoo.mlx.generate import stream_unavailable_reason
-    assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed"), ({"_is_vlm_model": True, "language_model": object()}, {"stop_token_ids": (5,)}, "stop_token_ids")))  # noqa: E501
+    assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed")))  # noqa: E501
+
+
+def test_speculative_vision_rows_stop_on_the_callers_ids_and_audio_refuses_them(monkeypatch):
+    from unsloth_zoo.mlx import generate, speculative
+    monkeypatch.setattr(speculative, "install_speculative_seam", lambda: None)
+    monkeypatch.setattr(speculative, "SpeculativeEngine", lambda *a, **k: None)
+    adapter = dict(processor=types.SimpleNamespace(tokenizer=_CriteriaTokenizer()), model=None, _wired_limit=contextlib.nullcontext)
+    assert [generate._SpeculativeBatchSession(types.SimpleNamespace(**adapter, defaults=GenerationDefaults(stop_token_ids=stops)), types.SimpleNamespace(controller=None, drafter=None)).stop_tokens for stops in ((5, 7), ())] == [{5, 7}, set()]
+    assert pytest.raises(ValueError, generate._validate_vlm_requests, [GenerationRequest(prompt="p", audio="a.wav")], GenerationDefaults(stop_token_ids=(5,))).match("omit stop_token_ids")
 
 
 def test_a_cache_with_model_specific_state_refuses_a_quantized_batch_before_it_starts():
