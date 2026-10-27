@@ -205,7 +205,7 @@ def deepseek_v4_block_mask(attention_mask, batch):
     # transformers' own masks are 0 / min only; reading a bias per score costs 5-15%, so only when present.
     # Inside a compiled graph the check would be a data-dependent branch, so the bias is always kept there.
     bias = None
-    if torch.compiler.is_compiling() or additive_bias_present(attention_mask[:, 0], visible):
+    if torch.compiler.is_compiling() or additive_bias_present(attention_mask[:, 0], visible, "deepseek_v4"):
         bias = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK))
         bias[:, :q_len, :kv_len] = torch.where(visible, attention_mask[:, 0], 0)
         if bias.shape[0] != batch:

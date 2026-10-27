@@ -905,6 +905,32 @@ def test_dsa_flex_capture_same_shape_mixed_bias():
         assert _rel(o, e) < 1e-2, _rel(o, e)
 
 
+@gpu
+def test_capture_bias_answer_is_per_caller_kind():
+    """V4 and DSA compile separate flex kernels: a biased V4 warm-up must not make a captured DSA call of the
+    same mask shape ask for a bias kernel that DSA never compiled (and the reverse)."""
+    from unsloth_zoo.flex_attention import sparse as sp
+    dev, dt = "cuda", torch.bfloat16
+    plain = torch.zeros(1, 64, 1024, device = dev, dtype = dt)
+    plain[..., -64:] = torch.finfo(dt).min
+    biased = plain + torch.rand_like(plain).mul(0.5)
+    visible = plain > torch.finfo(dt).min / 2
+    sp._BIAS_SEEN.clear()
+    assert sp.additive_bias_present(biased, visible, "deepseek_v4")
+    assert not sp.additive_bias_present(plain, visible, "dsa")
+    answers = {}
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream = stream):
+        answers["dsa"] = sp.additive_bias_present(plain, visible, "dsa")
+        answers["deepseek_v4"] = sp.additive_bias_present(biased, visible, "deepseek_v4")
+    graph.replay()
+    torch.cuda.synchronize()
+    sp._BIAS_SEEN.clear()
+    assert answers == {"dsa": False, "deepseek_v4": True}
+
+
 def test_flex_failure_under_capture_is_raised_not_latched(monkeypatch):
     """A failure while a CUDA graph is being captured has invalidated the capture, so the dense fallback cannot
     run either: it is raised, and the shape class stays on flex."""

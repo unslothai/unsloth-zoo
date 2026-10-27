@@ -398,7 +398,7 @@ def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling,
         bias = None
         if mask.dtype != torch.bool:
             values = mask[:, 0]
-            if additive_bias_present(values, _visible(values)):
+            if additive_bias_present(values, _visible(values), "dsa"):
                 # Finite biases (not just 0 / masked): added through score_mod like upstream's additive mask.
                 bias = _pad_to(_pad_to(torch.where(_visible(values), values, 0), 1, q_pad, 0), 2, kv_pad, 0)
                 bias = bias.expand(batch, -1, -1)
