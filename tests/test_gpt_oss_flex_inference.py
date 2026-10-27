@@ -130,6 +130,40 @@ def _block_layout(block_mask, T):
     return partial, full
 
 
+@pytest.mark.parametrize("window", [None, 5])
+@pytest.mark.parametrize("q_pos,kv_offset,kv_len", [(0, 0, 600), (127, 0, 600), (128, 0, 600), (130, 0, 600),
+                                                    (599, 0, 600), (300, 296, 5), (40, 0, 41)])
+def test_decode_lists_only_reachable_blocks_cpu(monkeypatch, window, q_pos, kv_offset, kv_len):
+    # Decode on a static cache: kv_length is the cache size, but only blocks up to the query's own slot can hold a
+    # visible key. The listed blocks must cover every visible key (mask_mod only runs inside listed blocks).
+    from torch.nn.attention.flex_attention import create_mask
+    from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
+    import unsloth_zoo.flex_attention.utils as U
+    monkeypatch.setattr(U, "compiled_create_block_mask", None, raising = False)
+    from unsloth_zoo.temporary_patches.gpt_oss import _gpt_oss_flex_mask
+    mask_function = causal_mask_function if window is None else sliding_window_causal_mask_function(window)
+    padding = torch.ones(2, kv_offset + kv_len, dtype = torch.long)
+    padding[1, :3] = 0
+    block_mask = _gpt_oss_flex_mask(batch_size = 2, q_length = 1, kv_length = kv_len, q_offset = torch.tensor(q_pos),
+                                    kv_offset = kv_offset, mask_function = mask_function,
+                                    attention_mask = padding[:, :q_pos + 1], device = "cpu")
+    B = block_mask.BLOCK_SIZE[1]
+    listed = torch.zeros(2, kv_len, dtype = torch.bool)
+    for b in range(2):
+        for i in range(int(block_mask.kv_num_blocks[b, 0, 0])):
+            kb = int(block_mask.kv_indices[b, 0, 0, i])
+            listed[b, kb * B:(kb + 1) * B] = True
+    effective = listed & create_mask(block_mask.mask_mod, 2, 1, 1, kv_len, device = "cpu")[:, 0, 0]
+    pos = torch.arange(kv_len) + kv_offset
+    want = (pos <= q_pos) & (pos >= 0)
+    if window is not None:
+        want &= pos > q_pos - window
+    want = want[None].expand(2, -1).clone()
+    want[1] &= pos >= 3
+    assert torch.equal(effective, want)
+    assert int(block_mask.kv_num_blocks.max()) == min((q_pos - kv_offset) // B + 1, (kv_len + B - 1) // B)
+
+
 def _oracle(q, k, v, allowed, sinks, scale):
     # fp32 dense reference: softmax over [visible keys, sink], rows with no visible key give 0.
     groups = q.shape[1] // k.shape[1]

@@ -169,11 +169,13 @@ def _gpt_oss_flex_mask(
             def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
                 return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o)
         if q_length == 1:
-            # Decode: every KV block partial, mask_mod decides per key.
+            # Decode: blocks partial, mask_mod decides per key. Causal: only blocks up to the query's own slot can hold a
+            # visible key, so a static cache's unwritten tail is not listed (counted on device, no host sync).
             from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
             n = (kv_length + BLOCK - 1) // BLOCK
             rows = bsz or 1
-            kv_num_blocks = torch.full((rows, 1, 1), n, dtype = torch.int32, device = device)
+            kv_num_blocks = torch.div(q_o - kv_o, BLOCK, rounding_mode = "floor").add_(1).clamp_(1, n)
+            kv_num_blocks = kv_num_blocks.to(torch.int32).expand(rows, 1, 1).contiguous()
             kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
             block_mask = BlockMask.from_kv_blocks(
                 kv_num_blocks, kv_indices.contiguous(), BLOCK_SIZE = BLOCK, mask_mod = mask_mod,
