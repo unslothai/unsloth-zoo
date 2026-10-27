@@ -1860,7 +1860,7 @@ _OPS["lp_bwd_impl"] = _logprobs_bwd_impl
 
 
 def _scale_rows_impl(u, g, dtype, out = None):
-    # half * 0-dim fp32 would round g to half (0.2% off). out = u scales in place (elementwise, same math).
+    # half * 0-dim fp32 would round g to half (0.2% off).
     sd = _stat_dtype(u.dtype)
     g = g.reshape(-1, 1).to(device = u.device, dtype = sd)
     one = g.shape[0] == 1
@@ -1900,7 +1900,7 @@ def _scale_rows_impl(u, g, dtype, out = None):
 
 
 def _scale_rows_inplace_impl(u, g):
-    # The Triton retry is still safe in place: a launch that raises (compile, resources) wrote nothing.
+    # Triton retry is safe in place: a launch that raises wrote nothing.
     return _scale_rows_impl(u, g, u.dtype, out = u)
 
 
@@ -1908,9 +1908,7 @@ _KEEP_GRAPH = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", 
 
 
 def _stored_grad_scaler(s, saved):
-    """Scale for the gradients a forward stored. In eager autograd without retain_graph they are read once, so
-    scale them in place: autograd then takes the buffer as .grad (or adds it to one) instead of holding a second
-    [V, H] head gradient beside it. Traced (fake / functional), subclassed or retained tensors: a new tensor."""
+    """In place only in eager backward without retain_graph (else a second [V, H] grad coexists with .grad)."""
     inplace = _OPS.get("scale_rows_inplace")
     if inplace is not None and _KEEP_GRAPH is not None and all(
         type(x) is torch.Tensor and not x.requires_grad for x in saved

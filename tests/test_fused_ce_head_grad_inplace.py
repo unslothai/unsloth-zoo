@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A trainable head's gradient, stored by the fused CE forward, becomes .grad without a second [V, H] copy.
-
-The backward scales the stored gradient in place (eager, no retain_graph), so autograd adopts that buffer as
-weight.grad. Gradient accumulation, retain_graph, hooks, loss scaling and torch.compile keep their results."""
+"""The fused CE backward scales the stored head gradient in place, so it becomes .grad without a second copy."""
 
 import pytest
 import torch
@@ -45,7 +42,6 @@ def _loss(h, w, t, scaling = None):
 
 @pytest.fixture
 def stored_head_grad(monkeypatch):
-    """data_ptr of every head gradient the CE forward stores."""
     ptrs = []
     impl = fl._OPS["ce_impl"]
 
@@ -66,7 +62,6 @@ def test_head_grad_buffer_becomes_param_grad(stored_head_grad, dtype):
     w = weight.clone().requires_grad_()
     (_loss(h, w, targets) * 0.75).backward()
     assert len(stored_head_grad) == 1
-    # Before: the backward wrote a fresh [V, H] tensor, so the stored one and .grad coexisted.
     assert w.grad.data_ptr() == stored_head_grad[0]
 
 
