@@ -1860,7 +1860,8 @@ pass
 def _grpo_rollout_sampler_rows(trainer):
     """Most rows any single vLLM sampler call can hold while generating the rollouts, or None when
     unknown. Colocated TRL (0.22 - 1.x) gives each engine one generate call with n = 1 over the
-    process's per_device_train_batch_size * steps_per_generation prompts, gathered across the
+    process's per_device_train_batch_size * steps_per_generation prompts (evaluation: the whole
+    per_device_eval_batch_size), gathered across the
     vllm_tensor_parallel_size group, and the scheduler never runs more than max_num_seqs of them.
     Server mode (shared, batched across processes) and speculative decoding (several rows per
     request) are unknown."""
@@ -1875,9 +1876,14 @@ def _grpo_rollout_sampler_rows(trainer):
     if vllm_config is None or getattr(vllm_config, "speculative_config", None) is not None:
         return None
     try:
-        rows = int(args.per_device_train_batch_size)
-        steps = getattr(args, "steps_per_generation", None) or getattr(args, "gradient_accumulation_steps", 1)
-        rows = rows * int(steps) * max(1, int(getattr(args, "vllm_tensor_parallel_size", 1) or 1))
+        if getattr(getattr(trainer, "model", None), "training", True):
+            rows = int(args.per_device_train_batch_size)
+            steps = getattr(args, "steps_per_generation", None) or getattr(args, "gradient_accumulation_steps", 1)
+            rows = rows * int(steps)
+        else:
+            # TRL's eval branch generates the whole local eval batch at once (no steps_per_generation split).
+            rows = int(getattr(args, "per_device_eval_batch_size", None) or args.per_device_train_batch_size)
+        rows = rows * max(1, int(getattr(args, "vllm_tensor_parallel_size", 1) or 1))
     except Exception:
         return None
     max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)

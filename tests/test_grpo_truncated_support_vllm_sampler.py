@@ -277,6 +277,18 @@ def test_sampler_backend_follows_rollout_batch_rows(sampler, version, kwargs, tr
     assert rr.grpo_truncated_support_kwargs(trainer).get("support_triton_sampler", False) is triton
 
 
+@pytest.mark.parametrize("training, eval_rows, triton", [
+    (True, 8, False),  # training: 4 rows x 1 step < 8
+    (False, 8, True),  # TRL evaluates the whole local eval batch in one generate call
+    (False, 4, False),
+])
+def test_evaluation_rollouts_use_the_eval_batch_size(sampler, training, eval_rows, triton):
+    sampler("0.27.0")
+    trainer = _colocated_trainer(rows = 4, top_k = 16, top_p = 1.0, per_device_eval_batch_size = eval_rows)
+    trainer.model = types.SimpleNamespace(training = training)
+    assert rr.grpo_truncated_support_kwargs(trainer).get("support_triton_sampler", False) is triton
+
+
 def test_small_rollout_batch_scores_vllm_pytorch_kept_set(sampler):
     # One row: 8 logits of 3, 32 of 2, 24 of 1, top_k = 16. vLLM 0.27 samples it with the PyTorch
     # sort (fewer than 8 rows), which keeps all 40 logits >= the 16th; Triton would keep 16.
