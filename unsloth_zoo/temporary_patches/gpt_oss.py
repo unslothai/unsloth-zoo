@@ -217,6 +217,16 @@ def _gpt_oss_block_mask_on(block_mask, device):
     return block_mask.to(device)
 
 
+def _gpt_oss_layers_span_devices(layers, device):
+    """A device_map split (accelerate hooks move each layer's inputs): the decode loop that calls the layers' parts
+    directly would run every layer on the embedding's device. First and last layer cover a contiguous split."""
+    for layer in (layers[0], layers[-1]):
+        param = next(iter(layer.parameters()), None)
+        if param is not None and param.device.type != "meta" and param.device != device:
+            return True
+    return False
+
+
 def _register_gpt_oss_flex_mask():
     try:
         from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
@@ -3993,7 +4003,7 @@ def patch_GptOssModel():
         _swap_device = getattr(block_swap, "layer_device", None)
         _cross_card = getattr(block_swap, "spans_devices", False) or (
             _swap_device is not None and hidden_states.device != _swap_device
-        )
+        ) or _gpt_oss_layers_span_devices(self.layers, hidden_states.device)
         if not self.training and qlen == 1 and isinstance(attention_mask, dict) and not _cross_card:
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
