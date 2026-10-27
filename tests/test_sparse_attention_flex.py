@@ -558,7 +558,7 @@ def test_indexer_forward_without_class_attributes(monkeypatch, family):
 def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
     """Unsloth compiles each decoder layer (fullgraph=False). Above the budget the flex call leaves that graph
     (one break) and engages, matching eager flex; within the budget nothing breaks the graph. Without the
-    block flag a compiled call keeps the model's path."""
+    region flag a compiled call keeps the model's path, including the block traced in a user's fullgraph=True."""
     import sys
     import types
     import torch._dynamo
@@ -579,9 +579,10 @@ def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
     attn = attn.cuda().bfloat16()
     block = types.ModuleType("unsloth.models._block_compile")
     block._IN_BLOCK = [0]
+    block._IN_COMPILED_REGION = [False]
     monkeypatch.setitem(sys.modules, "unsloth.models._block_compile", block)
 
-    def run(S, compiled, in_block):
+    def run(S, compiled, in_block, fullgraph = False):
         (cos, sin), pos = _rope(config, family, S, "cuda")
         torch.manual_seed(1)
         x = torch.randn(1, S, config.hidden_size, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
@@ -589,17 +590,27 @@ def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
             ~torch.ones(S, S, dtype = torch.bool, device = "cuda").tril(), float("-inf"))
 
         def fn(t):
-            return attn(t, (cos.bfloat16(), sin.bfloat16()), mask, position_ids = pos)[0]
+            if in_block != "inline":
+                return attn(t, (cos.bfloat16(), sin.bfloat16()), mask, position_ids = pos)[0]
+            # The block wrapper traced inside a user's compile (_inline): _IN_BLOCK is set, the region flag not.
+            block._IN_BLOCK[0] = 1
+            try:
+                return attn(t, (cos.bfloat16(), sin.bfloat16()), mask, position_ids = pos)[0]
+            finally:
+                block._IN_BLOCK[0] = 0
 
         torch._dynamo.reset()
         counters.clear()
         if compiled:
-            fn = torch.compile(fn, fullgraph = False)
-        block._IN_BLOCK[0] = 1 if in_block else 0
+            fn = torch.compile(fn, fullgraph = fullgraph)
+        # Unsloth's own compiled block (run): both flags set around the compiled call.
+        block._IN_BLOCK[0] = 1 if in_block is True else 0
+        block._IN_COMPILED_REGION[0] = in_block is True
         try:
             out = fn(x)
         finally:
             block._IN_BLOCK[0] = 0
+            block._IN_COMPILED_REGION[0] = False
         out.float().square().mean().backward()
         return out.detach().float(), x.grad.float(), sum(counters["graph_break"].values())
 
@@ -615,6 +626,17 @@ def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
     before = _stat("flex", family)
     run(512, True, False)
     assert _stat("flex", family) == before  # any other compile: the model's path, as before
+    # A user's fullgraph=True compile over a block-wrapped layer: no break allowed, the model's path.
+    _, _, breaks = run(512, True, "inline", fullgraph = True)
+    assert _stat("flex", family) == before and breaks == 0
+    # An Unsloth without the region flag: the model's path in its block compile too (no fullgraph failure).
+    del block._IN_COMPILED_REGION
+    block._IN_BLOCK[0] = 1
+    try:
+        assert not sb.in_unsloth_block()
+    finally:
+        block._IN_BLOCK[0] = 0
+    block._IN_COMPILED_REGION = [False]
     _, _, breaks = run(within, True, True)
     assert breaks == 0, breaks
     assert not sb._FAILED, sb._FAILED
