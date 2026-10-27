@@ -5896,10 +5896,7 @@ def _install_patched_forward(model_location, module, forward, combined_module):
 
 
 def _batchnorm_input_needs_cast(module, tensor):
-    """The compiled (disable=False) BatchNorm cast predicate, as the source rewrite
-    in _patch_torch_dtype_modules spells it: cast a mismatched input to the weight
-    dtype, except float16 / bfloat16 into FROZEN float32 parameters, which native
-    mixed precision BatchNorm handles without an extra float32 copy."""
+    """Mirrors the disable=False source rewrite cast in _patch_torch_dtype_modules."""
     weight = getattr(module, "weight", None)
     if weight is None or tensor.dtype == weight.dtype:
         return False
@@ -5925,10 +5922,8 @@ def _dtype_safe_forward(original_forward, is_conv, disable, is_batchnorm = False
     are public forwards: `RMSNorm.forward(self, x)` and `rms_norm(x = t)` both
     work today and a hard-coded `input` would start raising TypeError.
 
-    BatchNorm casts in both modes, as the source rewrite does: F.batch_norm has
-    no autocast rule, so a float32 input against a bfloat16 weight raises even
-    compiled. A rebuild after a mode change lands here, so without this the
-    Canary case breaks once a disable=True load precedes a disable=False one.
+    BatchNorm casts in both modes: F.batch_norm has no autocast rule, so a
+    float32 input into a bfloat16 weight raises even compiled.
     """
     try:
         first = list(inspect.signature(original_forward).parameters)[1]
@@ -6093,12 +6088,8 @@ def _patch_torch_dtype_modules(
                     body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
                     cast_if = "self.weight is not None"
                     if not disable:
-                        # A float16 / bfloat16 input against float32 parameters is native mixed
-                        # precision BatchNorm (fp32 statistics, output in the input dtype): casting
-                        # it would save an extra float32 copy of every BatchNorm input for backward.
-                        # Only while the affine parameters are frozen: on CUDA the native kernel
-                        # returns weight / bias gradients at input-dtype precision (bf16: ~4e-3
-                        # relative vs ~1e-7 after the cast), so trainable parameters keep the cast.
+                        # fp16/bf16 into frozen fp32 params is native mixed precision (no fp32 input copy).
+                        # Trainable params keep the cast: CUDA returns their grads at input-dtype precision.
                         cast_if += (
                             f" and {param_name}.dtype != self.weight.dtype and not ("
                             f"self.weight.dtype == torch.float32 and "

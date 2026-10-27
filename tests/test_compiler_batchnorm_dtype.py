@@ -75,8 +75,6 @@ def test_compiled_batchnorm_casts_mismatched_input(tmp_path):
 
 
 def test_compiled_batchnorm_keeps_native_mixed_precision(tmp_path):
-    # bfloat16 / float16 activations against FROZEN float32 BatchNorm parameters (AMP over float32 weights,
-    # LoRA) are native mixed precision BatchNorm: no float32 copy of the input may be saved for backward.
     script = textwrap.dedent(
         f"""
         import importlib, json, sys, torch
@@ -126,8 +124,6 @@ def test_compiled_batchnorm_keeps_native_mixed_precision(tmp_path):
 
 
 def test_compiled_batchnorm_trainable_params_keep_float32_cast(tmp_path):
-    # Trainable float32 BatchNorm parameters keep the input cast: on CUDA the native mixed kernel returns
-    # weight / bias gradients at input-dtype precision, so skipping it would cost full fine-tuning accuracy.
     script = textwrap.dedent(
         f"""
         import importlib, json, sys, torch
@@ -176,9 +172,7 @@ def test_compiled_batchnorm_trainable_params_keep_float32_cast(tmp_path):
 
 
 def test_batchnorm_cast_survives_compile_mode_changes(tmp_path):
-    # A disable=True load between two disable=False loads rebuilds the forward through the source-free
-    # wrapper; it must cast exactly as the source rewrite does, or a float32 input into a bfloat16
-    # BatchNorm (Canary's conformer under QLoRA) raises once the mode flips back.
+    # disable=True between disable=False loads rebuilds via the source-free wrapper; it must cast the same.
     script = textwrap.dedent(
         f"""
         import importlib, json, sys, torch
@@ -219,5 +213,4 @@ def test_batchnorm_cast_survives_compile_mode_changes(tmp_path):
     for row in rows:
         assert row["canary"].get("out") == "torch.float32", row
         assert row["trainable"] == {"out": "torch.bfloat16", "copies": 1}, row
-        # disable=True casts every affine BatchNorm input; the compiled mode keeps native mixed precision.
         assert row["frozen"] == {"out": "torch.bfloat16", "copies": 1 if row["step"] == "bert" else 0}, row
