@@ -72,8 +72,7 @@ def test_chunked_ce_compiles_fullgraph_without_breaks(masked, dynamic):
         out.backward()
         _check_against_fp64(out, hidden, weight, labels)
     assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
-    # At most one graph per distinct length (the chunk loop specialises on the row count, as before
-    # masked-row skipping existed); the skipping path used to add graphs and breaks on top.
+    # Chunk loop specialises on row count: at most one graph per length.
     assert counters["stats"]["unique_graphs"] <= len(set(lengths))
 
 

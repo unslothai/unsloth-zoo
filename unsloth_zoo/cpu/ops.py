@@ -412,9 +412,7 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
             divisor = float("nan")
     else:
         divisor = num_items_in_batch.item() if torch.is_tensor(num_items_in_batch) else num_items_in_batch
-    # Ignored rows add no loss: skip their share of the LM head. Eager only: the host sync and the
-    # data-dependent row count break torch.compile graphs (fullgraph=True fails); the chunk loop
-    # already zeroes ignored rows, so the traced path gives the same loss and gradients.
+    # Skip ignored rows' LM head work. Eager only: the sync breaks compile; chunk loop zeroes them anyway.
     if not torch.compiler.is_compiling():
         valid = shift_labels != ignore_index
         if bool(valid.any()) and not bool(valid.all()):
