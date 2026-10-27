@@ -86,11 +86,47 @@ def _dequantized_targets(model):
     return names
 
 
+def _single_weight_key(op, Fp8Dequantize):
+    """Key the stock single-tensor path reads: `weight$` up to 5.20, `weight` from 5.21."""
+    key = Fp8Dequantize.__dict__.get("_unsloth_single_weight_key")
+    if key is not None:
+        return key
+    key = "weight$"
+    try:
+        probe = Fp8Dequantize.convert(op, {"weight$": [torch.zeros(1, 1, device = "cpu")]}, full_layer_name = "probe.weight", model = None)
+        # The chain path passes an unknown key through unchanged; the single-tensor path renames it.
+        if list(probe) == ["weight$"]:
+            key = "weight"
+    except Exception:
+        pass
+    try:
+        Fp8Dequantize._unsloth_single_weight_key = key
+    except Exception:
+        pass
+    return key
+
+
+_LEGACY_SOURCE_PATTERNS = ["weight$", "weight_scale_inv", "activation_scale"]
+
+
+def _fallback_source_patterns(quantizer):
+    """5.21 dropped `$` handling from reverse patterns (a save writes `x.weight$`) and anchors names itself."""
+    names = getattr(quantizer, "serialized_names", None)
+    names = names.get("weight") if isinstance(names, dict) else None
+    if isinstance(names, (list, tuple)) and names and names[0] == "weight":
+        return list(names)
+    return list(_LEGACY_SOURCE_PATTERNS)
+
+
 def _make_op(Fp8Dequantize):
     class Fp8DequantizeWithoutContainer(Fp8Dequantize):
         def convert(self, input_dict, full_layer_name = None, model = None, **kwargs):
             if _target_owns_scale(model, full_layer_name):
                 return self._pass_through(input_dict, full_layer_name, model)
+            wanted = _single_weight_key(self, Fp8Dequantize)
+            other = "weight" if wanted == "weight$" else "weight$"
+            if other in input_dict and wanted not in input_dict:
+                input_dict = {(wanted if k == other else k): v for k, v in input_dict.items()}
             out = super().convert(input_dict, full_layer_name = full_layer_name, model = model, **kwargs)
             has_scale = any("scale_inv" in (k[:-1] if k.endswith("$") else k) for k in input_dict)
             if has_scale:
@@ -201,13 +237,14 @@ def patch_fp8_dequantize_weights_without_container():
             return False  # transformers appends its own converter in this mode
         return True
 
-    def patched_update_weight_conversions(self, weight_conversions):
-        conversions = original(self, weight_conversions)
+    # transformers 5.21 added a `model` argument; forward whatever the caller passes.
+    def patched_update_weight_conversions(self, weight_conversions, *args, **kwargs):
+        conversions = original(self, weight_conversions, *args, **kwargs)
         if not _wants_fallback(self):
             return conversions
         return list(conversions) + [
             WeightConverter(
-                source_patterns = ["weight$", "weight_scale_inv", "activation_scale"],
+                source_patterns = _fallback_source_patterns(self),
                 target_patterns = "weight",
                 operations = [Op(self)],
             )
