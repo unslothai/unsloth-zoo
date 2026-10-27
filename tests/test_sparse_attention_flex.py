@@ -554,6 +554,74 @@ def test_indexer_forward_without_class_attributes(monkeypatch, family):
 
 @needs_models
 @gpu
+@pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
+def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
+    """Unsloth compiles each decoder layer (fullgraph=False). Above the budget the flex call leaves that graph
+    (one break) and engages, matching eager flex; within the budget nothing breaks the graph. Without the
+    block flag a compiled call keeps the model's path."""
+    import sys
+    import types
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+    _patched()
+    torch.manual_seed(0)
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_DSA_MIN_KEYS", "65")
+    if family == "minimax_m3_vl":
+        config = _minimax_config(hidden_size = 128, head_dim = 64)
+        m = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+        attn = m.MiniMaxM3VLAttention(config, 0)
+        within = 200  # budget 2 x 128 keys
+    else:
+        config = _dsa_config(family, qk_nope_head_dim = 32, qk_rope_head_dim = 32, v_head_dim = 64)
+        m = importlib.import_module("transformers.models.deepseek_v32.modeling_deepseek_v32")
+        attn = m.DeepseekV32Attention(config, 0)
+        within = 48  # budget 64 keys
+    attn = attn.cuda().bfloat16()
+    block = types.ModuleType("unsloth.models._block_compile")
+    block._IN_BLOCK = [0]
+    monkeypatch.setitem(sys.modules, "unsloth.models._block_compile", block)
+
+    def run(S, compiled, in_block):
+        (cos, sin), pos = _rope(config, family, S, "cuda")
+        torch.manual_seed(1)
+        x = torch.randn(1, S, config.hidden_size, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+        mask = torch.zeros(1, 1, S, S, device = "cuda", dtype = torch.bfloat16).masked_fill(
+            ~torch.ones(S, S, dtype = torch.bool, device = "cuda").tril(), float("-inf"))
+
+        def fn(t):
+            return attn(t, (cos.bfloat16(), sin.bfloat16()), mask, position_ids = pos)[0]
+
+        torch._dynamo.reset()
+        counters.clear()
+        if compiled:
+            fn = torch.compile(fn, fullgraph = False)
+        block._IN_BLOCK[0] = 1 if in_block else 0
+        try:
+            out = fn(x)
+        finally:
+            block._IN_BLOCK[0] = 0
+        out.float().square().mean().backward()
+        return out.detach().float(), x.grad.float(), sum(counters["graph_break"].values())
+
+    def nrel(a, b):
+        return ((a - b).norm() / b.norm()).item()
+
+    eager, eager_g, _ = run(512, False, False)
+    before = _stat("flex", family)
+    got, got_g, breaks = run(512, True, True)
+    assert _stat("flex", family) == before + 1
+    assert breaks >= 1
+    assert nrel(got, eager) < 2e-2 and nrel(got_g, eager_g) < 2e-2, (nrel(got, eager), nrel(got_g, eager_g))
+    before = _stat("flex", family)
+    run(512, True, False)
+    assert _stat("flex", family) == before  # any other compile: the model's path, as before
+    _, _, breaks = run(within, True, True)
+    assert breaks == 0, breaks
+    assert not sb._FAILED, sb._FAILED
+
+
+@needs_models
+@gpu
 @pytest.mark.skipif(
     torch.version.hip is not None,
     reason = "ROCm compiled-vs-compiled DSA differs by ~5% with flex off too (Inductor reorders the top-k)",

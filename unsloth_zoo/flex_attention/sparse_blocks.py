@@ -31,6 +31,7 @@ __all__ = [
 
 import functools
 import os
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -62,6 +63,18 @@ def _wants_attentions(module, kwargs):
     if wanted is None:
         wanted = getattr(getattr(module, "config", None), "output_attentions", False)
     return bool(wanted)
+
+
+def in_unsloth_block():
+    """Inside Unsloth's per-decoder-layer compile region (fullgraph=False), where a graph break is legal."""
+    block = sys.modules.get("unsloth.models._block_compile")
+    flag = getattr(block, "_IN_BLOCK", None)
+    return bool(flag) and flag[0] != 0
+
+
+def _compiled_without_break():
+    """Compiling where the sparse paths cannot leave the graph (any compile but Unsloth's blocks)."""
+    return torch.compiler.is_compiling() and not in_unsloth_block()
 
 
 def _eager_only(name):
@@ -311,7 +324,7 @@ def minimax_m3_flex_eligible(module, query, key, attention_mask, kwargs):
         return False
     if key.shape[2] <= indexer.topk_blocks * indexer.block_size or query.shape[2] < 16:
         return False
-    if indexer.block_size % _TILE or _wants_attentions(module, kwargs) or torch.compiler.is_compiling():
+    if indexer.block_size % _TILE or _wants_attentions(module, kwargs) or _compiled_without_break():
         return False
     if module.training and module.attention_dropout:
         return False
@@ -415,7 +428,7 @@ def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_key
     budget = int(module.config.index_topk)
     if key.shape[2] <= budget or query.shape[2] < 16 or _wants_attentions(module, kwargs):
         return False
-    if torch.compiler.is_compiling():
+    if _compiled_without_break():
         return False
     if min_keys is not None and key.shape[2] < min_keys:
         return False
