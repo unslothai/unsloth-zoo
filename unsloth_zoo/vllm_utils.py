@@ -169,6 +169,13 @@ def _torchrun_group_backend(local_index):
     return "cpu:gloo,cuda:nccl"
 pass
 
+def _vllm_split_group_requested():
+    try:
+        return int(os.environ.get("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", "0") or "0") != 0
+    except ValueError:
+        return False
+pass
+
 def _init_torchrun_process_group(launch_info):
     """Bind this rank to its card and create the job's env:// group if nothing has yet.
 
@@ -187,9 +194,12 @@ def _init_torchrun_process_group(launch_info):
         # reuses an initialized group. backend None would register the accelerator's backend only
         # (nccl on CUDA), and the CPU collectives later code runs on this group (the gates here,
         # unsloth's FSDP2 rank agreements) need gloo beside it.
+        kwargs = dict(backend = _torchrun_group_backend(local_index))
+        if local_index is not None and _vllm_split_group_requested():
+            # vLLM split_group also needs the default group bound to this rank's device.
+            kwargs = dict(backend = "cpu:gloo,cuda:nccl", device_id = torch.device("cuda", local_index))
         dist.init_process_group(
-            backend = _torchrun_group_backend(local_index), init_method = "env://",
-            timeout = timedelta(seconds = _process_group_timeout()),
+            init_method = "env://", timeout = timedelta(seconds = _process_group_timeout()), **kwargs
         )
     elif dist.get_world_size() != world_size:
         logger.warning(

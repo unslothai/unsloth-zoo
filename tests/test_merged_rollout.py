@@ -1524,8 +1524,10 @@ def test_automatic_folds_with_the_exact_fold(_automatic, _isolate, monkeypatch):
 @_cuda
 def test_cuda_automatic_default_engages_exact_fold_and_kill_switch_stops_it(monkeypatch, _isolate):
     # The real platform gate (Linux, NVIDIA CUDA, Triton); only a missing vLLM is stood in for.
-    if torch.version.hip is not None:
-        pytest.skip("the automatic default is off on ROCm")
+    uname = getattr(vllm_utils.os, "uname", None)  # not on native Windows
+    if torch.version.hip is not None or not sys.platform.startswith("linux") \
+            or (uname is not None and "microsoft" in uname().release.lower()):
+        pytest.skip("the automatic default is off on ROCm, Windows and WSL")
     if "vllm_version" not in vars(vllm_utils):
         monkeypatch.setattr(vllm_utils, "vllm_version", "0.19.1", raising = False)
     vllm_utils._merged_rollout_auto_platform.cache_clear()
