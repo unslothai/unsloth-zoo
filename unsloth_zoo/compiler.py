@@ -6583,15 +6583,20 @@ def unsloth_compile_transformers(
     # Get functions which are called
     called_functions = []
     for function in functions:
+        # `called` needs `<function>(` and both must match; one match of each is enough.
+        if function + "(" not in full_source:
+            continue
         # Start of text
-        defined = re.findall(
+        defined = re.search(
             r"\bdef[\s]{1,}" + re.escape(function), full_source, flags=re.DOTALL
         )
+        if defined is None:
+            continue
         # Disable self.
-        called = re.findall(
+        called = re.search(
             r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags=re.DOTALL
         )
-        if len(defined) != 0 and len(called) != 0:
+        if called is not None:
             if function_defined_elsewhere(modeling_file, function):
                 continue
             called_functions.append(function)
