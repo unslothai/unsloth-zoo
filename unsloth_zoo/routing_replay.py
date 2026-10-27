@@ -536,9 +536,8 @@ def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
     fp = _fingerprint(ids2)
     match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
     if torch.is_tensor(layer_input):
-        # Checkpoint recompute reuses the forward's input tensors (offloaded checkpointing only
-        # rebuilds hidden states), so the forward sharing the most addresses is the one recomputed.
-        # A mask, not a narrowed list: in a compiled layer the addresses are only known at run time.
+        # Recompute reuses the forward's input tensors, so the forward sharing the most addresses
+        # is the one recomputed. A mask, not a narrowed list: in a compiled layer the addresses are only known at run time.
         recorded = [c[4] if len(c) > 4 and torch.is_tensor(c[4]) else layer_input[:0] for c in candidates]
         mask = _IDENTITY_MASK_OP(layer_input, recorded) if torch.compiler.is_compiling() \
             else _identity_mask(layer_input, recorded)
@@ -673,8 +672,7 @@ def _router_hook(layer_index, compact = None):
         signature = None
         if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
             signature = _input_signature(args, ids2.shape[0])
-        # Read once and clear, so a later call never sees this call's addresses. Traced with the
-        # pre hook, this reads the op's output in the same graph: this call's runtime addresses.
+        # Read once and clear; traced with the pre hook, this is the op's runtime output.
         layer_input = _STATE.layer_inputs.get(layer_index)
         _STATE.layer_inputs[layer_index] = None
         recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature, layer_input)
@@ -763,15 +761,13 @@ def _router_hook(layer_index, compact = None):
 
 
 def _input_addresses(tensors):
-    # Distinct data_ptr()s of the non-empty tensors, zero padded to one slot per tensor so the
-    # shape is known when tracing. A CPU int64 tensor, not a set: it flows through a compiled graph.
+    # Zero padded to one slot per tensor (static shape); a tensor, not a set, to flow through a graph.
     out = sorted({x.data_ptr() for x in tensors if x.numel() > 0})
     return torch.tensor(out + [0] * (len(tensors) - len(out)), dtype = torch.int64)
 
 
 def _identity_mask(layer_input, recorded):
-    # The recorded forwards sharing the most input addresses with this call, or all when that is
-    # not exactly one. Zero is padding, never an address.
+    # Forwards sharing the most addresses, or all when not exactly one. Zero is padding.
     now = set(layer_input.tolist()) - {0}
     shared = [len(now.intersection(r.tolist())) for r in recorded]
     best = max(shared, default = 0)
@@ -806,10 +802,9 @@ _IDENTITY_MASK_OP = None
 
 
 def _layer_inputs_op():
-    # data_ptr() is untraceable and a graph break fails fullgraph, so use opaque ops; register eagerly.
-    # The op returns the addresses, so the router hook reads them from the graph, not from Python
-    # state frozen at trace time, and no backend drops it while its output is used. Matching them
-    # is a second op: no CPU kernels for Inductor to compile inside a GPU graph.
+    # data_ptr() is untraceable and fullgraph forbids breaks: opaque ops, registered eagerly. Returning
+    # the addresses lets the router hook read them in-graph (not frozen at trace time) and keeps the op
+    # alive. Matching is a second op: no CPU kernels for Inductor to compile inside a GPU graph.
     global _LAYER_INPUTS_OP, _IDENTITY_MASK_OP
     if _LAYER_INPUTS_OP is None:
         _LAYER_INPUTS_OP = _register_op("routing_replay_input_addresses", _layer_inputs_impl, _layer_inputs_fake)

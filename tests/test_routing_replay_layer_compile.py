@@ -75,7 +75,6 @@ class _Model(torch.nn.Module):
 
 
 def _addresses(layer_input):
-    # The recorded identity: nonzero input addresses (an int64 tensor; a set before it).
     if layer_input is None:
         return None
     values = layer_input.tolist() if torch.is_tensor(layer_input) else layer_input
@@ -111,7 +110,7 @@ def test_compiled_layer_with_pre_hook_traces_and_never_sees_old_inputs(replay, m
         out.sum().backward()
     assert len(seen) == len(xs)
     for x, addresses in zip(xs, seen):
-        # With or without a graph break: this call's runtime addresses, never None or a stale call's.
+        # This call's runtime addresses, never None or a stale call's.
         assert _addresses(addresses) == (x.data_ptr(),)
 
 
@@ -145,8 +144,7 @@ def _hooked_layer(replay, graph_break = False):
 @pytest.mark.parametrize("backend", ["eager", "aot_eager", "inductor"])
 @pytest.mark.parametrize("graph_break", [False, True])
 def test_compiled_layer_records_this_calls_input_addresses(replay, backend, graph_break):
-    # The forward record must carry the runtime input addresses: traced together with the router
-    # hook (one graph) and on Inductor, which drops an op whose output nothing uses.
+    # Runtime addresses must survive tracing with the router hook and Inductor's dead-op removal.
     layer = _hooked_layer(replay, graph_break)
     fn = torch.compile(lambda x: layer(x), backend = backend, fullgraph = not graph_break)
     replay._STATE.in_forward = True
@@ -165,8 +163,7 @@ def test_compiled_layer_records_this_calls_input_addresses(replay, backend, grap
 @pytest.mark.parametrize("backend", [None, "eager", "aot_eager", "inductor"])
 @pytest.mark.parametrize("graph_break", [False, True])
 def test_reentrant_recompute_of_identical_inputs_keeps_forced_experts(replay, backend, graph_break):
-    # Two separately allocated, numerically identical inputs forced to different experts: only
-    # their addresses tell the recomputes apart. Natural routing there changes the gradients.
+    # Identical inputs forced to different experts: only their addresses tell the recomputes apart.
     from torch.utils.checkpoint import checkpoint
 
     def run(checkpointing):

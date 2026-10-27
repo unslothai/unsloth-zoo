@@ -28,7 +28,6 @@ import unsloth_zoo.routing_replay as rr
 def test_layer_inputs_op_registers_and_returns_addresses():
     op = rr._layer_inputs_op()  # torch < 2.7: ValueError from infer_schema on list[torch.Tensor]
     x, y = torch.randn(3), torch.randn(2)
-    # Distinct non-empty addresses, sorted, zero padded to one slot per tensor.
     out = op([x, torch.empty(0), x, y])
     assert out.dtype == torch.int64 and out.shape == (4,)
     assert out.tolist() == sorted([x.data_ptr(), y.data_ptr()]) + [0, 0]
@@ -50,8 +49,7 @@ def test_layer_inputs_op_survives_a_compiled_graph(backend):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA graphs need a CUDA device")
 def test_reduce_overhead_records_each_calls_addresses():
-    # Under mode = "reduce-overhead" an untagged op either broke CUDA graph recording (CPU output)
-    # or, replayed from the graph, kept the first call's addresses. Each call must see its own.
+    # reduce-overhead: an untagged op broke CUDA graph recording or replayed stale addresses.
     op = rr._layer_inputs_op()
     torch._dynamo.reset()
     fn = torch.compile(lambda x: (x.sin(), op([x])), mode = "reduce-overhead", fullgraph = True)
