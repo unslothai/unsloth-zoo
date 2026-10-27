@@ -2455,8 +2455,9 @@ def fused_linear_jsd(
     beta 0 is forward KL(teacher || student), 1 reverse KL, else the generalized JSD with mixture
     ``(1 - beta) p_student + beta p_teacher``. Rows are kept where ``mask`` is non zero and ``labels != ignore_index``
     (either may be omitted). The sum is divided by ``num_items_in_batch`` when given (TRL >= 1.x), else by the kept
-    row count (``reduction = "batchmean"``); a zero divisor counts as 1. With neither labels, mask nor count, TRL 0.x
-    divides 3D logits by batch * sequence (as here), 1.x by batch: pass ``num_items_in_batch`` to pin one. The
+    row count (``reduction = "batchmean"``); a zero divisor counts as 1. With neither labels, mask nor count the
+    divisor is the batch size (the leading dimension), as TRL >= 0.24 (0.18 - 0.23 divided 3D logits by batch *
+    sequence): pass ``num_items_in_batch`` to pin another. The
     transform is ``* logit_scale`` then softcapping, as each model's forward. The student gradient (hidden, and head / bias when they require grad) is
     taken in forward; teacher inputs are never differentiated and may have their own hidden size and device.
     ``scaling`` (fp16 GradScaler) multiplies stored gradients; backward divides it out."""
@@ -2488,7 +2489,10 @@ def fused_linear_jsd(
     teacher_weight = teacher_weight.detach()
     teacher_bias = _head_bias(teacher_bias.detach(), teacher_weight) if teacher_bias is not None else None
     f32 = dict(device = device, dtype = torch.float32)
-    if num_items_in_batch is None:
+    if num_items_in_batch is None and labels is None and mask is None:
+        # TRL batchmean without labels: jsd.sum() / jsd.size(0), the batch of [batch, seq, vocab] logits.
+        divisor = torch.scalar_tensor(student_hidden.shape[0] if student_hidden.dim() > 2 else hidden2.shape[0], **f32)
+    elif num_items_in_batch is None:
         divisor = keep.sum().to(**f32)
     else:
         divisor = torch.as_tensor(num_items_in_batch).to(**f32).reshape(-1)[:1].reshape(())

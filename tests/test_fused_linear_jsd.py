@@ -180,6 +180,29 @@ def test_peaked_rows_match_fp64(beta):
     assert h.grad.double().sum(-1).abs().max().item() < 1e-6
 
 
+@pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
+def test_unlabelled_3d_divides_by_batch_as_trl(beta):
+    """No labels, mask or count: TRL >= 0.24 batchmean divides [batch, seq, vocab] by batch (0.18 - 0.23 by batch *
+    seq); 2D rows by the row count either way. A mask or labels keep the kept-row count."""
+    g = torch.Generator().manual_seed(21)
+    w = torch.randn(V, H, generator = g) / 3
+    wt = torch.randn(V, HT, generator = g) / 3
+    hs = torch.randn(2, 3, H, generator = g)
+    ht = torch.randn(2, 3, HT, generator = g)
+    fns = [trl_generalized_jsd_loss] + ([_real_trl_jsd()] if _real_trl_jsd() is not None else [])
+    for fn in fns:
+        zs, zt = hs.double() @ w.double().t(), ht.double() @ wt.double().t()
+        ref3 = fn(zs, zt, beta = beta)
+        ref2 = fn(zs.reshape(6, V), zt.reshape(6, V), beta = beta)
+        torch.testing.assert_close(fl.fused_linear_jsd(hs, w, ht, wt, beta = beta).double(), ref3, rtol = 1e-5, atol = 1e-7)
+        torch.testing.assert_close(fl.fused_linear_jsd(hs.reshape(6, H), w, ht.reshape(6, HT), wt, beta = beta).double(),
+                                   ref2, rtol = 1e-5, atol = 1e-7)
+    mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
+    masked = fl.fused_linear_jsd(hs, w, ht, wt, beta = beta, mask = mask)
+    summed = fl.fused_linear_jsd(hs, w, ht, wt, beta = beta, mask = mask, num_items_in_batch = 1)
+    torch.testing.assert_close(masked, summed / 3)
+
+
 def test_fully_masked_is_finite_zero():
     hs, ws, _, ht, wt, _, labels = _case(3)
     h = hs.clone().requires_grad_(True)
