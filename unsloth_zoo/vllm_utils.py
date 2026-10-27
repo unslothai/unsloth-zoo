@@ -5635,12 +5635,28 @@ pass
 
 
 @torch.inference_mode
+def _gather_lora_tensors(state_dict):
+    """Whole LoRA tensors from a state dict whose adapters native FSDP2 sharded (DTensor shards).
+
+    vLLM and the adapter files need each lora_A / lora_B whole. full_tensor() is a collective over
+    the FSDP2 group, so every rank gathers the same keys in the same (state dict) order.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:
+        return state_dict
+    return {k: (v.full_tensor() if isinstance(v, DTensor) else v) for k, v in state_dict.items()}
+pass
+
+
 def save_lora(model, save_directory, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     state_dict = model.state_dict()
     dtype = model.get_input_embeddings().weight.dtype
     # Cast LoRA to float16 / bfloat16
-    state_dict = {k:v.to(dtype) for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+    state_dict = {k:v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+    state_dict = {k:v.to(dtype) for k, v in _gather_lora_tensors(state_dict).items()}
     kwargs["state_dict"] = state_dict
     rank, world_size = _distributed_rank_and_world()
     if world_size <= 1 or kwargs.get("push_to_hub", False):
@@ -6776,9 +6792,35 @@ def _merged_rollout_targets(model):
 pass
 
 
+def _lora_is_sharded(model):
+    """True when native FSDP2 holds the adapters as DTensor shards (checked once per model)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    cached = model.__dict__.get("_unsloth_lora_is_sharded")
+    if cached is not None: return cached
+    try:
+        from torch.distributed.tensor import DTensor
+        sharded = any(
+            isinstance(p, DTensor) for n, p in model.named_parameters() if ".lora_A." in n or ".lora_B." in n
+        )
+    except Exception:
+        sharded = False
+    model.__dict__["_unsloth_lora_is_sharded"] = sharded
+    return sharded
+pass
+
+
 def prepare_merged_rollout(model):
     # All Unsloth Zoo code licensed under LGPLv3
     if not _merged_rollout_enabled(): return None
+    if _lora_is_sharded(model):
+        # The fold writes each rank's whole delta into the engine's weights; sharded adapters would
+        # need a gather per layer first. vLLM LoRA serves the gathered adapters instead (load_lora).
+        if getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
+            _merged_rollout_log_once(
+                "Unsloth: merged-weight vLLM rollouts are off under native FSDP2 (sharded adapters); "
+                "vLLM LoRA serves the gathered adapters instead."
+            )
+        return None
     with _MERGED_ROLLOUT_LOCK:
         return _prepare_merged_rollout_locked(model)
 pass
@@ -7371,6 +7413,7 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
         state_dict = model.state_dict()
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
+        state_dict = _gather_lora_tensors(state_dict)
         if exclude:
             # Folded into the base weights already: sending them too would apply the delta twice.
             state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}
