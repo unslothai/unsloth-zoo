@@ -407,6 +407,14 @@ def _read_disk_bundle(directory, manifest_path):
 pass
 
 
+def _artifact_identity(artifact):
+    """(kind, cache key), not value: Triton re-records autotune best_config
+    entries on every run with new timings under the same key, so value
+    equality kept one more copy per warm run and the bundle grew forever."""
+    return (type(artifact).__name__, getattr(artifact, "key", artifact))
+pass
+
+
 def _merge_recorded_artifacts(data):
     """Re-record an existing bundle's artifacts into torch's artifact manager
     so the next ``save_cache_artifacts`` serializes the UNION of the on-disk
@@ -416,28 +424,28 @@ def _merge_recorded_artifacts(data):
     replace the bundle with that subset and silently drop the rest.
     Best-effort: a failure just means this save may narrow the bundle.
 
-    Returns True when the bundle already holds every artifact this process
-    recorded, i.e. the union IS the bundle and there is nothing to save. The
-    byte comparison alone misses that: serialization follows this run's
-    recording order, so a warm run that only re-hit the bundle would rewrite
-    it with the same artifacts in another order on every exit."""
+    Returns True when the bundle already holds every key this process
+    recorded, i.e. there is nothing new to save. The byte comparison alone
+    misses that: serialization follows this run's recording order, and
+    autotune entries come back with new timings, so a warm run that only
+    re-hit the bundle would rewrite it on every exit."""
     try:
         from torch.compiler._cache import CacheArtifactManager
         artifacts = CacheArtifactManager.deserialize(data)
         if not artifacts:
             return False
-        on_disk = set()
-        for items in artifacts.values():
-            on_disk.update(items)
-        if all(artifact in on_disk for artifact in CacheArtifactManager._seen_artifacts):
+        seen_ids = {_artifact_identity(a) for a in CacheArtifactManager._seen_artifacts}
+        disk_ids = {_artifact_identity(a) for items in artifacts.values() for a in items}
+        if seen_ids <= disk_ids:
             return True
         merged = 0
         for artifact_type, items in artifacts.items():
             for artifact in items:
-                # Skip artifacts already present from this run's own hits
-                # (value-equality dedup).
-                if artifact in CacheArtifactManager._seen_artifacts:
+                # This run's copy of a key wins; one copy per key from disk.
+                identity = _artifact_identity(artifact)
+                if identity in seen_ids:
                     continue
+                seen_ids.add(identity)
                 CacheArtifactManager._new_cache_artifacts[artifact_type].append(artifact)
                 CacheArtifactManager._seen_artifacts.add(artifact)
                 merged += 1

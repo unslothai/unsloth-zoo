@@ -202,3 +202,57 @@ def test_concurrent_saves_publish_a_loadable_union(tmp_path, pause):
     assert hashlib.sha256(data).hexdigest() == manifest["sha256"]
     assert sorted(key for _, key in json.loads(data)) == ["a1", "a2", "shared"]
     assert [name for name in os.listdir(directory) if name.endswith(".bin")] == [bundle.name]
+
+
+def _fake_artifact_manager(monkeypatch, disk, seen):
+    """torch.compiler._cache stand-in: frozen (key, content) artifacts like torch's."""
+    import collections
+
+    manager = types.SimpleNamespace(
+        deserialize = lambda data: {"autotune": list(disk)},
+        _seen_artifacts = set(seen),
+        _new_cache_artifacts = collections.defaultdict(list),
+    )
+    module = types.ModuleType("torch.compiler._cache")
+    module.CacheArtifactManager = manager
+    monkeypatch.setitem(sys.modules, "torch.compiler._cache", module)
+    return manager
+
+
+@pytest.fixture
+def autotune_artifact():
+    import dataclasses
+
+    @dataclasses.dataclass(frozen = True)
+    class AutotuneCacheArtifact:
+        key: str
+        content: bytes
+
+    return AutotuneCacheArtifact
+
+
+def test_warm_run_with_retimed_autotune_entries_skips_the_save(monkeypatch, autotune_artifact):
+    # Triton re-records best_config entries with new timings under the same key.
+    module = _load_module()
+    manager = _fake_artifact_manager(
+        monkeypatch,
+        disk = [autotune_artifact("k1", b"old"), autotune_artifact("k2", b"x")],
+        seen = [autotune_artifact("k1", b"new")],
+    )
+    assert module._merge_recorded_artifacts(b"bundle") is True
+    assert not manager._new_cache_artifacts
+
+
+def test_merge_keeps_one_copy_per_key_and_this_runs_copy_wins(monkeypatch, autotune_artifact):
+    module = _load_module()
+    mine = autotune_artifact("k1", b"new")
+    manager = _fake_artifact_manager(
+        monkeypatch,
+        disk = [autotune_artifact("k1", b"old"), autotune_artifact("k3", b"a"), autotune_artifact("k3", b"b")],
+        seen = [mine, autotune_artifact("k2", b"x")],
+    )
+    assert module._merge_recorded_artifacts(b"bundle") is False
+    merged = manager._new_cache_artifacts["autotune"]
+    assert [a.key for a in merged] == ["k3"]
+    assert mine in manager._seen_artifacts
+    assert autotune_artifact("k1", b"old") not in manager._seen_artifacts
