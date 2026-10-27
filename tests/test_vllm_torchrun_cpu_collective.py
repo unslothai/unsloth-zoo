@@ -99,3 +99,24 @@ def test_takes_cpu_tensors_reads_the_backend_config(monkeypatch):
     for name, expected in (("nccl", False), ("undefined", False), ("gloo", True)):
         monkeypatch.setattr(dist, "get_backend", lambda group = None, n = name: n)
         assert vu._group_takes_cpu_tensors() is expected, name
+
+
+def test_torchrun_group_keeps_a_cpu_backend_on_cuda(monkeypatch):
+    """The group load_vllm creates under torchrun: gloo beside nccl on a CUDA rank, torch's pick elsewhere."""
+    calls = []
+    monkeypatch.setattr(vu, "DEVICE_TYPE", "cuda")
+    monkeypatch.setattr(vu.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(vu.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(vu.torch.cuda, "set_device", lambda index: None)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "is_nccl_available", lambda: True)
+    monkeypatch.setattr(dist, "init_process_group", lambda **kwargs: calls.append(kwargs))
+    assert vu._init_torchrun_process_group((1, 1, 2)) == 1
+    assert calls[-1]["backend"] == "cpu:gloo,cuda:nccl", calls[-1]
+    monkeypatch.setattr(dist, "is_nccl_available", lambda: False)
+    vu._init_torchrun_process_group((1, 1, 2))
+    assert calls[-1]["backend"] is None
+    monkeypatch.setattr(vu.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(dist, "is_nccl_available", lambda: True)
+    vu._init_torchrun_process_group((0, 0, 2))
+    assert calls[-1]["backend"] is None

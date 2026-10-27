@@ -161,6 +161,14 @@ def _process_group_timeout():
     return max(seconds, 1)
 pass
 
+def _torchrun_group_backend(local_index):
+    """"cpu:gloo,cuda:nccl" on a CUDA / ROCm rank (CPU tensors keep a backend), else None (torch's pick)."""
+    import torch.distributed as dist
+    if local_index is None or not dist.is_gloo_available() or not dist.is_nccl_available():
+        return None
+    return "cpu:gloo,cuda:nccl"
+pass
+
 def _init_torchrun_process_group(launch_info):
     """Bind this rank to its card and create the job's env:// group if nothing has yet.
 
@@ -175,11 +183,13 @@ def _init_torchrun_process_group(launch_info):
         local_index = local_rank if local_rank < count else local_rank % max(count, 1)
         torch.cuda.set_device(local_index)
     if not dist.is_initialized():
-        # Same defaults accelerate uses for a torchrun job (HF ddp_timeout = 1800 s); the
-        # Trainer reuses an initialized group. backend None = the accelerator's backend only
-        # (nccl on CUDA, no CPU backend), so _all_reduce_int reduces its CPU ints over gloo.
+        # Same timeout accelerate uses for a torchrun job (HF ddp_timeout = 1800 s); the Trainer
+        # reuses an initialized group. backend None would register the accelerator's backend only
+        # (nccl on CUDA), and the CPU collectives later code runs on this group (the gates here,
+        # unsloth's FSDP2 rank agreements) need gloo beside it.
         dist.init_process_group(
-            backend = None, init_method = "env://", timeout = timedelta(seconds = _process_group_timeout())
+            backend = _torchrun_group_backend(local_index), init_method = "env://",
+            timeout = timedelta(seconds = _process_group_timeout()),
         )
     elif dist.get_world_size() != world_size:
         logger.warning(
