@@ -9851,6 +9851,7 @@ class FastMLXModel:
                     quant_predicate=quant_predicate,
                     quantize_modules=quantize_modules,
                     force_requantize=force_requantize,
+                    quantize_embeddings=quantize_embeddings,
                     **(
                         {"mlx_quantization_config": mlx_quantization_config}
                         if mlx_quantization_config is not None
@@ -10190,6 +10191,7 @@ class FastMLXModel:
                             "load_in_fp8": False,
                             "load_in_mxfp4": False,
                             "load_in_nvfp4": False,
+                            "quantize_embeddings": bool(adapter_quant_policy.get("quantize_embeddings")),
                         }
                     )
                     if (
