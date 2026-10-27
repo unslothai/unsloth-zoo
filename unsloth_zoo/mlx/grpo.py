@@ -50,6 +50,7 @@ from .utils import (
     _normalize_seed,
     _prepare_vlm_batch_for_compile,
     _processor_vlm_inputs,
+    _right_pad_vlm_rows,
     _to_mx_vlm_batch,
     _vlm_token_aligned_sidecars,
     encode_mlx_text,
@@ -452,10 +453,11 @@ def _grpo_vision_batch(processor, model_config, batch, lengths, media):
     some vision models take no bare ids."""
     outputs = {"input_ids": batch}
     if media is not None and any(images for _, images in media):
-        outputs = _processor_vlm_inputs(
+        # Some processors (falcon, deepseek_vl_v2) left-pad whatever side is asked for.
+        outputs = _right_pad_vlm_rows(_processor_vlm_inputs(
             processor, [text for text, _ in media], [list(images) for _, images in media], None,
             truncation=False, padding_side="right",
-        )
+        ), processor)
     ids = _as_numpy_vlm_field(outputs, "input_ids")
     width = batch.shape[1]
     if any(
@@ -987,6 +989,12 @@ def _encode_grpo_prompts(
         if not isinstance(row, Mapping) or "prompt" not in row:
             raise ValueError(
                 f"Unsloth MLX GRPO: dataset row {index} has no prompt column."
+            )
+        if processor is not None and not vision and _grpo_images(row):
+            raise ValueError(
+                f"Unsloth MLX GRPO: dataset row {index} carries images, but the first row has no "
+                "`image` or `images` field, which decides whether a dataset is text or vision. "
+                "Give the first row an `images` field, empty if it has none."
             )
         # TRL tokenizes prompts with add_special_tokens=False: a chat template supplies its own BOS.
         ids, _, images, _ = _encode_grpo_prompt(tokenizer, row, processor, vision)

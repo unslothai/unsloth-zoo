@@ -4003,6 +4003,25 @@ def test_grpo_image_prompts_roll_out_and_score_with_their_pixels(monkeypatch):
                   trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))
     negative.materialize(0)
     assert negative.completions["prompt"][0] == phi3.tokenizer.decode(i for i in negative._prompt_ids[0] if i >= 0)
+    with pytest.raises(ValueError, match="row 1 carries images, but the first row has no"):
+        build([{"prompt": user("yo")}, {"prompt": user("hi"), "image": image(4)}, {"prompt": user("ok")}])
+
+    def left_padded(self, *args, **kwargs):  # falcon / deepseek_vl_v2 left-pad whatever side is asked for
+        out = VisionProcessor.__call__(self, *args, **kwargs)
+        shift = (out["attention_mask"] == 0).sum(axis=1)
+        return {**out, **{key: np.stack([np.roll(row, n) for row, n in zip(out[key], shift)])
+                          for key in ("input_ids", "attention_mask", "token_type_ids")}}
+    falcon = _grpo_vision_processor()
+    falcon.__class__ = type("FalconProcessor", (VisionProcessor,), {"__call__": left_padded})
+    padded = create_grpo_batch_plan(
+        data[:2] + [data[0]], None, num_generations=2, batch_size=6, steps_per_generation=1, num_iterations=1,
+        grad_accum=1, sampling=GRPOSampling(max_tokens=3), max_seq_length=64, shuffle=False, num_batches=1,
+        processor=falcon, model_config={})
+    padded.bind(model, [lambda completions, **_: [0.0] * len(completions)],
+                trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))
+    batch, lengths = padded.materialize(0)[:2]
+    assert len({start for start, _ in lengths.tolist()}) == 2  # prompts of two lengths share the batch
+    assert batch["token_type_ids"].tolist() == (np.array(batch["input_ids"]) >= 60).astype(int).tolist()
     index = next(index for index, micro in enumerate(micros) if micro[0].get("pixel_values") is not None)
     shifted = np.array(micros[index][0]["input_ids"])
     shifted[1] += 1  # only the second row
