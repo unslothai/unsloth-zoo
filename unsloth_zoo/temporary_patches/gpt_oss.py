@@ -131,8 +131,10 @@ def _gpt_oss_flex_mask(
         q_length = cache_position.shape[0]
         q_offset = cache_position[0]
     device = torch.device(device)
-    q_off = torch.as_tensor(q_offset, device = device).to(torch.int64).reshape(())
-    kv_off = torch.as_tensor(kv_offset, device = device).to(torch.int64).reshape(())
+    # Copies: StaticLayer's query offset is its live cumulative_length, which update() bumps in place before the
+    # attention reads this mask, so an alias lets chunked prefill queries see later keys.
+    q_off = torch.as_tensor(q_offset, device = device).to(torch.int64).reshape(()).clone()
+    kv_off = torch.as_tensor(kv_offset, device = device).to(torch.int64).reshape(()).clone()
     if attention_mask is not None and attention_mask.dim() == 2:
         padding = attention_mask.to(device = device, dtype = torch.bool)
         # Slots past the 2D mask (unwritten static cache slots) stay invisible.
@@ -147,7 +149,20 @@ def _gpt_oss_flex_mask(
         def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
             return mask_function(batch_idx, head_idx, q_idx + q_off, kv_idx + kv_off)
         bsz = None
-    return compiled_create_block_mask(mask_mod, bsz, None, int(q_length), int(kv_length), device = device)
+    q_length, kv_length = int(q_length), int(kv_length)
+    if q_length == 1:
+        # Decode: one query row, so block sparsity saves nothing; mark every KV block partial and let mask_mod
+        # decide per key instead of evaluating the mask over the whole cache each step.
+        from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
+        n = (kv_length + BLOCK - 1) // BLOCK
+        rows = bsz or 1
+        kv_num_blocks = torch.full((rows, 1, 1), n, dtype = torch.int32, device = device)
+        kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
+        return BlockMask.from_kv_blocks(
+            kv_num_blocks, kv_indices.contiguous(), BLOCK_SIZE = BLOCK, mask_mod = mask_mod,
+            seq_lengths = (1, kv_length),
+        )
+    return compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
 
 
 def _register_gpt_oss_flex_mask():

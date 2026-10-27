@@ -26,7 +26,58 @@ import textwrap
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "flex inference path is CUDA only")
+_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason = "flex inference path is CUDA only")
+_CASES = [
+    (13, 0, 0, 13),     # prefill
+    (1, 12, 0, 16),     # decode into a static cache: slots 13..15 not written yet
+    (1, 20, 16, 5),     # decode on a rolled sliding layer
+    (4, 13, 0, 17),     # multi-token continuation
+    (1, 0, 0, 1),       # fresh one-token prompt
+    (5, 8, 0, 32),      # chunked prefill into a static cache
+]
+
+
+def _allowed(window, q_len, q_offset, kv_offset, kv_len, padding):
+    qp = torch.arange(q_len, device = padding.device)[:, None] + q_offset
+    kp = torch.arange(kv_len, device = padding.device)[None, :] + kv_offset
+    allowed = kp <= qp
+    if window is not None:
+        allowed = allowed & (kp > qp - window)
+    return allowed[None] & padding[:, kp[0]][:, None, :]
+
+
+def _padding(total, device):
+    padding = torch.ones(3, total, dtype = torch.bool, device = device)
+    for b, n in enumerate([0, 4, 9]):
+        padding[b, :n] = False
+    return padding
+
+
+@pytest.mark.parametrize("window", [None, 5])
+@pytest.mark.parametrize("q_len,q_offset,kv_offset,kv_len", _CASES)
+def test_mask_positions_cpu(monkeypatch, window, q_len, q_offset, kv_offset, kv_len):
+    # Positions only (any host): the BlockMask must equal causal & window & padding at absolute positions, and must
+    # not alias the offset it was given (StaticLayer passes its live cumulative_length, bumped before attention).
+    from torch.nn.attention.flex_attention import create_block_mask, create_mask
+    from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
+    import unsloth_zoo.flex_attention.utils as U
+    monkeypatch.setattr(U, "compiled_create_block_mask",
+                        lambda m, b, h, M, N, device = "cpu": create_block_mask(m, b, h, M, N, device = device),
+                        raising = False)
+    from unsloth_zoo.temporary_patches.gpt_oss import _gpt_oss_flex_mask
+    mask_function = causal_mask_function if window is None else sliding_window_causal_mask_function(window)
+    total = max(q_offset + q_len, kv_offset + kv_len)
+    padding = _padding(total, "cpu")
+    live = torch.tensor(q_offset)
+    block_mask = _gpt_oss_flex_mask(
+        batch_size = 3, q_length = q_len, kv_length = kv_len, q_offset = live, kv_offset = kv_offset,
+        mask_function = mask_function, attention_mask = padding[:, :q_offset + q_len].long(), device = "cpu",
+    )
+    live.add_(q_len)
+    assert block_mask.seq_lengths == (q_len, kv_len)
+    dense = create_mask(block_mask.mask_mod, 3, 1, q_len, kv_len, device = "cpu")[:, 0]
+    padding[:, q_offset + q_len:] = False
+    assert torch.equal(dense, _allowed(window, q_len, q_offset, kv_offset, kv_len, padding))
 
 
 def _oracle(q, k, v, allowed, sinks, scale):
@@ -50,14 +101,9 @@ class _Attn(torch.nn.Module):
         self.sinks = torch.nn.Parameter(torch.linspace(-2.0, 3.0, heads))
 
 
+@_CUDA
 @pytest.mark.parametrize("window", [None, 5])
-@pytest.mark.parametrize("q_len,q_offset,kv_offset,kv_len", [
-    (13, 0, 0, 13),     # prefill
-    (1, 12, 0, 16),     # decode into a static cache: slots 13..15 not written yet
-    (1, 20, 16, 5),     # decode on a rolled sliding layer
-    (4, 13, 0, 17),     # multi-token continuation
-    (1, 0, 0, 1),       # fresh one-token prompt
-])
+@pytest.mark.parametrize("q_len,q_offset,kv_offset,kv_len", _CASES)
 def test_inference_matches_fp32_sink_oracle(window, q_len, q_offset, kv_offset, kv_len):
     from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
     from unsloth_zoo.flex_attention import flex_attention_with_sink_inference
@@ -79,10 +125,12 @@ def test_inference_matches_fp32_sink_oracle(window, q_len, q_offset, kv_offset, 
     v[:, :, unwritten:] = 1e4
     k_before, v_before, q_before = k.clone(), v.clone(), q.clone()
 
+    live = torch.tensor(q_offset, device = "cuda")
     block_mask = _gpt_oss_flex_mask(
-        batch_size = B, q_length = q_len, kv_length = kv_len, q_offset = torch.tensor(q_offset),
+        batch_size = B, q_length = q_len, kv_length = kv_len, q_offset = live,
         kv_offset = kv_offset, mask_function = mask_function, attention_mask = padding.long(), device = "cuda",
     )
+    live.add_(q_len)      # the cache's own counter moves on before attention runs
     attn = _Attn(H, KVH, D).cuda()
     out = flex_attention_with_sink_inference(attn, q, k, v, block_mask)
 
@@ -139,11 +187,13 @@ _SCRIPT = textwrap.dedent('''
     CALLS = {"q1": 0, "qN": 0}
     if mode != "stock":
         import unsloth_zoo.flex_attention as FA
-        _real = FA.flex_attention_with_sink_inference
-        def _count(self_attn, q, *a, **k):
-            CALLS["q1" if q.shape[-2] == 1 else "qN"] += 1
-            return _real(self_attn, q, *a, **k)
-        FA.flex_attention_with_sink_inference = _count
+        if mode != "flex_rc":
+            # Counting runs inside the compiled decoder layer (its guards recompile), so flex_rc runs without it.
+            _real = FA.flex_attention_with_sink_inference
+            def _count(self_attn, q, *a, **k):
+                CALLS["q1" if q.shape[-2] == 1 else "qN"] += 1
+                return _real(self_attn, q, *a, **k)
+            FA.flex_attention_with_sink_inference = _count
         from unsloth_zoo.temporary_patches import gpt_oss as G
         G.patch_GptOssAttention(); G.patch_GptOssModel()
         assert G._GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
@@ -175,14 +225,15 @@ _SCRIPT = textwrap.dedent('''
             res["chunked_maxdiff_" + cache] = float(((torch.cat(parts, 1) - full) * pad[:, :, None]).abs().max())
         res["calls"] = dict(CALLS)
 
-        if mode == "flex":
-            # Recompiles: a second same-shape generation and longer decodes inside the same 128 block add no graphs.
+        if mode == "flex_rc":
+            # After the warm-up above (both caches, batch 3 and 1, chunked): a repeated same-shape generation and
+            # longer decodes inside the same 128-token block add no graphs, so decode steps do not recompile.
             counters = torch._dynamo.utils.counters
+            gen("dynamic", ids, pad, 100)
             before = counters["stats"]["unique_graphs"]
             gen("dynamic", ids, pad, new_tokens)
             gen("static", ids, pad, new_tokens)
             res["graphs_same_shape"] = counters["stats"]["unique_graphs"] - before
-            gen("dynamic", ids, pad, 100)
             mid = counters["stats"]["unique_graphs"]
             gen("dynamic", ids, pad, 110)
             res["graphs_longer_decode"] = counters["stats"]["unique_graphs"] - mid
@@ -216,6 +267,7 @@ def _run(tmp_path, mode, dtype = "float32", new_tokens = 64):
     script.write_text(_SCRIPT)
     env = dict(os.environ)
     env.pop("UNSLOTH_GPT_OSS_EAGER_INFERENCE", None)
+    env.setdefault("UNSLOTH_IS_PRESENT", "1")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join(x for x in (root, env.get("PYTHONPATH")) if x)
     env.setdefault("UNSLOTH_COMPILE_LOCATION", str(tmp_path / "unsloth_compiled_cache"))
@@ -229,14 +281,16 @@ def _run(tmp_path, mode, dtype = "float32", new_tokens = 64):
 @pytest.fixture(scope = "module")
 def runs(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("gpt_oss_flex")
-    return {mode: _run(tmp, mode) for mode in ("stock", "eager", "flex")}
+    return {mode: _run(tmp, mode) for mode in ("stock", "eager", "flex", "flex_rc")}
 
 
+@_CUDA
 def test_generate_engages_flex_and_kill_switch_restores_eager(runs):
     assert runs["flex"]["calls"]["q1"] > 0 and runs["flex"]["calls"]["qN"] > 0
     assert runs["eager"]["calls"] == {"q1": 0, "qN": 0}
 
 
+@_CUDA
 @pytest.mark.parametrize("cache", ["dynamic", "static"])
 def test_greedy_tokens_match_eager_and_stock_hf(runs, cache):
     flex, eager, stock = runs["flex"], runs["eager"], runs["stock"]
@@ -247,6 +301,7 @@ def test_greedy_tokens_match_eager_and_stock_hf(runs, cache):
     assert diff < 1e-3, diff
 
 
+@_CUDA
 def test_prefill_and_chunked_prefill_match(runs):
     flex, stock = runs["flex"], runs["stock"]
     assert (torch.tensor(flex["prefill"]) - torch.tensor(stock["prefill"])).abs().max() < 1e-3
@@ -255,11 +310,13 @@ def test_prefill_and_chunked_prefill_match(runs):
         assert abs(flex["chunked_maxdiff_" + cache] - stock["chunked_maxdiff_" + cache]) < 1e-3
 
 
+@_CUDA
 def test_decode_does_not_recompile_after_warmup(runs):
-    assert runs["flex"]["graphs_same_shape"] == 0
-    assert runs["flex"]["graphs_longer_decode"] == 0
+    assert runs["flex_rc"]["graphs_same_shape"] == 0
+    assert runs["flex_rc"]["graphs_longer_decode"] == 0
 
 
+@_CUDA
 def test_train_generate_train(runs):
     l1, l2 = runs["flex"]["train_losses"]
     assert l1 == l2 and l1 == l1
