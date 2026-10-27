@@ -90,8 +90,7 @@ def test_mask_positions_cpu(monkeypatch, form, window, q_len, q_offset, kv_offse
 
 
 def test_row_dependent_mask_keeps_per_row_blocks_cpu(monkeypatch):
-    # Packed documents (transformers derives them from position_ids) make mask_function depend on the row; with no
-    # padding mask the block layout must still be per row, or a block fully visible in row 0 skips mask_mod in row 1.
+    # Packed documents make mask_function row dependent: block layout must be per row even without padding.
     from torch.nn.attention.flex_attention import create_block_mask, create_mask
     import unsloth_zoo.flex_attention.utils as U
     monkeypatch.setattr(U, "compiled_create_block_mask",
@@ -105,7 +104,6 @@ def test_row_dependent_mask_keeps_per_row_blocks_cpu(monkeypatch):
         return (kv <= q) & (doc[b, q] == doc[b, kv])
     block_mask = _gpt_oss_flex_mask(batch_size = 2, q_length = T, kv_length = T, mask_function = mask_function,
                                     attention_mask = None, device = "cpu")
-    # What the kernel sees: full blocks are visible without mask_mod, partial blocks go through it.
     dense_mod = create_mask(block_mask.mask_mod, 2, 1, T, T, device = "cpu")[:, 0]
     partial, full = _block_layout(block_mask, T)
     effective = full | (partial & dense_mod)
@@ -115,7 +113,6 @@ def test_row_dependent_mask_keeps_per_row_blocks_cpu(monkeypatch):
 
 
 def _block_layout(block_mask, T):
-    # [B, T, T] booleans of the partial and full blocks a BlockMask lists.
     B = block_mask.BLOCK_SIZE[0]
     def expand(num, idx):
         out = torch.zeros(num.shape[0], T, T, dtype = torch.bool)
