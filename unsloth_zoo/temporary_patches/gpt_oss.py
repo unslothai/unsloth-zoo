@@ -18,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import contextlib
 import functools
+import inspect
 import os
 import stat
 import threading
@@ -92,6 +93,147 @@ def _gpt_oss_select_mask(attention_mask, attention_type):
     if "full_attention" in attention_mask:
         return attention_mask["full_attention"]
     return next(iter(attention_mask.values()), None)
+
+
+_GPT_OSS_FLEX_MASK = "unsloth_gpt_oss_flex"
+# torch < 2.6 BlockMasks have no seq_lengths: eager inference there.
+try:
+    from torch.nn.attention.flex_attention import BlockMask as _FlexBlockMask
+    _from_kv_blocks_args = inspect.signature(_FlexBlockMask.from_kv_blocks).parameters
+    _HAS_COMPUTE_Q_BLOCKS = "compute_q_blocks" in _from_kv_blocks_args
+    _HAS_INFERENCE_BLOCK_MASK = "seq_lengths" in _from_kv_blocks_args
+    del _from_kv_blocks_args
+except Exception:
+    _FlexBlockMask = None
+    _HAS_COMPUTE_Q_BLOCKS = _HAS_INFERENCE_BLOCK_MASK = False
+
+
+def _gpt_oss_flex_inference(device):
+    """CUDA / ROCm only: flex cannot return the LSE the sinks need on CPU."""
+    return (
+        _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
+        and _HAS_INFERENCE_BLOCK_MASK
+        and os.environ.get("UNSLOTH_GPT_OSS_EAGER_INFERENCE", "0") != "1"
+        and torch.device(device).type == "cuda"
+    )
+
+
+@torch.compiler.disable
+def _gpt_oss_flex_mask(
+    batch_size,
+    q_length = None,
+    kv_length = None,
+    q_offset = 0,
+    kv_offset = 0,
+    mask_function = None,
+    attention_mask = None,
+    device = None,
+    cache_position = None,
+    **kwargs,
+):
+    """transformers' mask interface as a BlockMask (KV slot j is position kv_offset + j). Offsets are 0-d tensors so
+    the compiled build does not specialise on the decode step."""
+    from unsloth_zoo.flex_attention.utils import compiled_create_block_mask
+    if q_length is None:
+        # transformers 4.x: no q_length / device.
+        q_length = cache_position.shape[0]
+        q_offset = cache_position[0]
+    if device is None:
+        device = cache_position.device if cache_position is not None else attention_mask.device
+    # Copy: StaticLayer passes its live cumulative_length, bumped in place before attention reads this mask.
+    def offset(x):
+        return int(x) if not isinstance(x, torch.Tensor) else x.to(torch.int64).reshape(()).clone()
+    q_off, kv_off = offset(q_offset), offset(kv_offset)
+    padding = None
+    if attention_mask is not None and attention_mask.dim() == 2:
+        padding = attention_mask.to(dtype = torch.bool)
+        # Slots past the 2D mask (unwritten static cache slots) stay invisible.
+        missing = int(kv_length) + int(kv_off) - padding.shape[-1]
+        if missing > 0:
+            padding = torch.nn.functional.pad(padding, (0, missing))
+    q_length, kv_length = int(q_length), int(kv_length)
+    # Per-row blocks even without padding: packed documents make mask_function row dependent.
+    bsz = batch_size
+
+    def build(device):
+        q_o, kv_o = (
+            x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
+            for x in (q_off, kv_off)
+        )
+        if padding is not None:
+            pad = padding.to(device)
+            def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+                kv_pos = kv_idx + kv_o
+                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_pos) & pad[batch_idx, kv_pos]
+        else:
+            def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o)
+        if q_length == 1:
+            # Decode: every KV block partial, mask_mod decides per key.
+            from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
+            n = (kv_length + BLOCK - 1) // BLOCK
+            rows = bsz or 1
+            kv_num_blocks = torch.full((rows, 1, 1), n, dtype = torch.int32, device = device)
+            kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
+            block_mask = BlockMask.from_kv_blocks(
+                kv_num_blocks, kv_indices.contiguous(), BLOCK_SIZE = BLOCK, mask_mod = mask_mod,
+                seq_lengths = (1, kv_length),
+                **({"compute_q_blocks": torch.is_grad_enabled()} if _HAS_COMPUTE_Q_BLOCKS else {}),
+            )
+        else:
+            block_mask = compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
+        return block_mask
+
+    # BlockMask.to() does not move mask_mod's captured tensors: rebuild per device. Weakref avoids a cycle.
+    device = torch.device(device)
+    block_mask = build(device)
+    this, masks = weakref.ref(block_mask), {}
+    def on_device(target):
+        target = torch.device(target)
+        if target == device:
+            return this()
+        if target not in masks:
+            masks[target] = build(target)
+        return masks[target]
+    block_mask._unsloth_on_device = on_device
+    return block_mask
+
+
+@torch.compiler.disable
+def _gpt_oss_block_mask_on(block_mask, device):
+    return block_mask.to(device)
+
+
+def _gpt_oss_layers_span_devices(layers, device):
+    """device_map split: the decode loop calling layer parts directly would run all on the embedding's device."""
+    for layer in (layers[0], layers[-1]):
+        param = next(iter(layer.parameters()), None)
+        if param is not None and param.device.type != "meta" and param.device != device:
+            return True
+    return False
+
+
+def _register_gpt_oss_flex_mask():
+    try:
+        from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+    except Exception:
+        return False
+    if _GPT_OSS_FLEX_MASK not in ALL_MASK_ATTENTION_FUNCTIONS._global_mapping:
+        ALL_MASK_ATTENTION_FUNCTIONS.register(_GPT_OSS_FLEX_MASK, _gpt_oss_flex_mask)
+    if not hasattr(_FlexBlockMask, "contiguous"):
+        # transformers >= 5.21 generate calls .contiguous() on every mask it builds.
+        _FlexBlockMask.contiguous = lambda self, *args, **kwargs: self
+    if not getattr(_FlexBlockMask.to, "_unsloth_gpt_oss", False):
+        # accelerate moves masks with .to(), which leaves captured tensors behind.
+        _block_mask_to = _FlexBlockMask.to
+        def to(self, device, *args, **kwargs):
+            on_device = getattr(self, "_unsloth_on_device", None)
+            if on_device is not None and isinstance(device, (str, int, torch.device)):
+                return on_device(device)
+            return _block_mask_to(self, device, *args, **kwargs)
+        to._unsloth_gpt_oss = True
+        _FlexBlockMask.to = to
+    return True
 
 
 def _top_level_triton_kernels_backend():
@@ -3125,12 +3267,17 @@ def patch_GptOssAttention():
     try:
         from unsloth_zoo.flex_attention import (
             flex_attention_with_sink,
+            flex_attention_with_sink_inference,
             is_flex_attention_decoding,
             flex_attention_with_sink_decoding,
             flex_attention_add_sinks,
         )
 
         assert flex_attention_with_sink is not None
+        try:
+            from torch.nn.attention.flex_attention import BlockMask as _BlockMask
+        except Exception:
+            _BlockMask = None
     except Exception as e:
         return raise_error("flex_attention_with_sink", e)
     try:
@@ -3336,30 +3483,6 @@ def patch_GptOssAttention():
             key_states = key_states.to(query_states.dtype)
             value_states = value_states.to(query_states.dtype)
 
-        # flex_attention_with_sink only works for training since KV cache is wrong
-        # switch to flex_attention_with_sink which allows all to work
-        # if is_flex_attention_decoding(self, query_states) and has_static_cache:
-        #     attn_output, logsumexp = flex_attention_with_sink_decoding(
-        #         self,
-        #         query_states,
-        #         key_states,
-        #         value_states,
-        #     )
-        #     attn_output = flex_attention_add_sinks(
-        #         self,
-        #         attn_output,
-        #         logsumexp,
-        #     )
-        # else:
-        #     attn_output = flex_attention_with_sink(
-        #         self,
-        #         query_states,
-        #         key_states,
-        #         value_states,
-        #         attention_mask,
-        #         has_static_cache = has_static_cache,
-        #     )
-        # attn_weights = None
         if self.training:
             attn_output = flex_attention_with_sink(
                 self,
@@ -3368,9 +3491,19 @@ def patch_GptOssAttention():
                 value_states,
             )
             attn_weights = None
+        elif _BlockMask is not None and isinstance(attention_mask, _BlockMask):
+            if attention_mask.kv_num_blocks.device != query_states.device:
+                attention_mask = _gpt_oss_block_mask_on(attention_mask, query_states.device)
+            attn_output = flex_attention_with_sink_inference(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+            )
+            attn_weights = None
         else:
-            # Weirdly for inference, flex attention returns gibberish
-            # Most likely due to left padding
+            # Dense mask: UNSLOTH_GPT_OSS_EAGER_INFERENCE=1, CPU, or a caller-built 4D mask.
             attn_output, attn_weights = eager_attention_forward(
                 self,
                 query_states,
@@ -3546,19 +3679,20 @@ def patch_GptOssModel():
                         return arg
                 return f(*args, **kwargs)
             else:
-                # Eager inference path. The config may still have
-                # _attn_implementation="flex_attention" (set for training), in
-                # which case the underlying mask factory returns a BlockMask.
-                # Unsloth uses eager attention for inference (flex with KV
-                # cache returns gibberish, see forward_function above), and
-                # the eager forward cannot index a BlockMask, raising
-                #   TypeError: unsupported operand type(s) for +=:
-                #       'Tensor' and 'BlockMask'
-                # Temporarily swap to eager so the factory returns a dense
-                # 4D float mask (0 / -inf) the eager path can consume.
-                if _is_flex:
+                # generate builds static-cache masks here. Eager inference needs a dense mask, not a BlockMask.
+                target = None
+                if (
+                    getattr(_config, "model_type", None) == "gpt_oss"
+                    and input_embeds is not None
+                    and _gpt_oss_flex_inference(input_embeds.device)
+                    and _register_gpt_oss_flex_mask()
+                ):
+                    target = _GPT_OSS_FLEX_MASK
+                elif _is_flex:
+                    target = "eager"
+                if target is not None and target != _config._attn_implementation:
                     original_impl = _config._attn_implementation
-                    _config._attn_implementation = "eager"
+                    _config._attn_implementation = target
                     try:
                         return f(*args, **kwargs)
                     finally:
@@ -3810,14 +3944,17 @@ def patch_GptOssModel():
         # flex_attention_with_sink training windows its own BlockMask; all else needs the per-type mapping.
         _flex_sink_training = self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
         if not _flex_sink_training and not isinstance(attention_mask, dict):
-            # Inference uses eager attention. If the config still has
-            # _attn_implementation="flex_attention" (set for training), the
-            # mask factory returns a BlockMask which eager cannot consume.
-            # Temporarily swap to "eager" so a dense 4D float mask is built.
+            # Eager inference: a training "flex_attention" config is swapped to "eager" for a dense mask.
             _orig_attn_impl = getattr(self.config, "_attn_implementation", None)
-            _swap_attn_impl = (not self.training) and _orig_attn_impl == "flex_attention"
+            _swap_target = None
+            if not self.training:
+                if _gpt_oss_flex_inference(inputs_embeds.device) and _register_gpt_oss_flex_mask():
+                    _swap_target = _GPT_OSS_FLEX_MASK
+                elif _orig_attn_impl == "flex_attention":
+                    _swap_target = "eager"
+            _swap_attn_impl = _swap_target is not None and _swap_target != _orig_attn_impl
             if _swap_attn_impl:
-                self.config._attn_implementation = "eager"
+                self.config._attn_implementation = _swap_target
             try:
                 mask_kwargs = _build_mask_kwargs(
                     config=self.config,
@@ -3845,7 +3982,7 @@ def patch_GptOssModel():
         _swap_device = getattr(block_swap, "layer_device", None)
         _cross_card = getattr(block_swap, "spans_devices", False) or (
             _swap_device is not None and hidden_states.device != _swap_device
-        )
+        ) or _gpt_oss_layers_span_devices(self.layers, hidden_states.device)
         if not self.training and qlen == 1 and isinstance(attention_mask, dict) and not _cross_card:
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
