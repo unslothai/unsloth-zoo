@@ -2869,9 +2869,8 @@ def _fix_gemma3_text_rmsnorm_fp32(model=None):
 
 
 def _fix_gemma4_vision_pooler_fp32(model=None):
-    """Match HF Gemma4VisionPooler: pool and scale by sqrt(hidden_size) in fp32, cast back after
-    standardizing. In fp16 (the M1/M2 default) the scale passes 65,504 on towers without clipped
-    linears (26B-A4B, 31B), and the inf becomes a NaN soft token (unsloth#15473). bf16 is untouched."""
+    """fp16 only: pool and scale by sqrt(hidden_size) in fp32 as HF does, else 26B-A4B / 31B towers
+    overflow to inf and NaN soft tokens (unsloth#15473, torch path #931). bf16 / fp32 untouched."""
 
     try:
         import mlx.core as mx

@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Gemma 4 vision pooling in fp16 (the default on Apple M1/M2): the sqrt(hidden_size) scale passes
-65,504 on towers without clipped linears, and the inf becomes a NaN soft token, so the reply is the
-last vocabulary id over and over (unsloth#15473). HF computes that step in fp32; so must we."""
+"""Gemma 4 vision pooling in fp16 (M1/M2 default) must not overflow to NaN soft tokens (unsloth#15473)."""
 
 import pytest
 
