@@ -118,6 +118,14 @@ def _gpt_oss_flex_inference(device):
     )
 
 
+@functools.lru_cache(maxsize = 64)
+def _gpt_oss_decode_block_starts(n, block, device):
+    """[min, block, 2 * block, ...]: bucketize(d, right = True) counts the starts <= d, so it is clamp(d // block + 1, 1, n)."""
+    starts = torch.arange(n, dtype = torch.int64, device = device) * block
+    starts[0] = torch.iinfo(torch.int64).min
+    return starts
+
+
 @torch.compiler.disable
 def _gpt_oss_flex_mask(
     batch_size,
@@ -175,8 +183,10 @@ def _gpt_oss_flex_mask(
             n = (kv_length + BLOCK - 1) // BLOCK
             rows = bsz or 1
             if isinstance(q_off, torch.Tensor) or isinstance(kv_off, torch.Tensor):
-                kv_num_blocks = torch.div(q_o - kv_o, BLOCK, rounding_mode = "floor").add_(1).clamp_(1, n)
-                kv_num_blocks = kv_num_blocks.to(torch.int32).expand(rows, 1, 1).contiguous()
+                # One kernel: clamp((q - kv_off) // BLOCK + 1, 1, n) as a bucket count, written contiguous int32.
+                d = q_o if isinstance(kv_off, int) and kv_off == 0 else q_o - kv_o
+                kv_num_blocks = torch.bucketize(d.expand(rows, 1, 1), _gpt_oss_decode_block_starts(n, BLOCK, device),
+                                                out_int32 = True, right = True)
             else:
                 # Integer offsets (dynamic caches): count on the host, one fill as before.
                 kv_num_blocks = torch.full((rows, 1, 1), min(max((q_off - kv_off) // BLOCK + 1, 1), n),
