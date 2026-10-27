@@ -898,13 +898,11 @@ def _patch_glm5_next_quantization_aliases(model_type):
     model.quantization_path_aliases = quantization_path_aliases
 
 
-# DeepSeek's reference names for the expert projections, which omlx's converted DeepSeek-V4.1 checkpoints keep.
 _DEEPSEEK_REFERENCE_PROJECTIONS = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 
 
 def _omlx_deepseek_v41_name(key):
-    """mlx-vlm's name for a tensor of a DeepSeek-V4.1 oQ quant (omlx's converted format), which keeps the source's
-    names under ``language_model.``, stacks routed experts under the reference names and names vision MLPs ``ffn``."""
+    """mlx-vlm's name for a tensor of a DeepSeek-V4.1 oQ quant (omlx keeps the source's names)."""
     key = re.sub(r"^language_model\.embed\.", "language_model.embed_tokens.", key)
     key = re.sub(
         r"^(language_model\.layers\.\d+\.ffn\.experts)\.(w[123])\.",
@@ -914,8 +912,7 @@ def _omlx_deepseek_v41_name(key):
 
 
 def _omlx_deepseek_v41_quantization(config_data):
-    """The per-module ``quantization`` of a DeepSeek-V4.1 oQ quant, which omlx records instead in
-    ``omlx_deepseek_v41.quantized_modules`` under its own names; None for any other checkpoint."""
+    """``quantization`` from omlx's ``omlx_deepseek_v41.quantized_modules``; None for any other checkpoint."""
     converted = config_data.get("omlx_deepseek_v41")
     if (
         config_data.get("model_type") != "deepseek_v41" or "quantization" in config_data
@@ -926,18 +923,18 @@ def _omlx_deepseek_v41_quantization(config_data):
     for name, spec in (converted.get("quantized_modules") or {}).items():
         path = _omlx_deepseek_v41_name(f"{name}.weight").removesuffix(".weight").replace(".ffn.experts.", ".ffn.switch_mlp.")
         path = re.sub(r"\.shared_experts\.(w[123])$", lambda match: f".shared_experts.{_DEEPSEEK_REFERENCE_PROJECTIONS[match[1]]}", path)
-        # quantize_input is left out: it marks the source's FP8 projections, whose inputs mlx-vlm already rounds to FP8.
+        # Not quantize_input: it marks source FP8 projections, whose inputs mlx-vlm already fake-quantizes.
         modules[path] = {"group_size": spec.get("group_size", 32), "bits": spec["bits"], "mode": spec["mode"]}
     if not modules:
         return None
-    # The routed experts hold the bytes, so their most common format reads as the checkpoint's.
+    # Routed experts hold the bytes: their format is the checkpoint's, so load_in_4bit keeps it.
     specs = [spec for path, spec in modules.items() if ".switch_mlp." in path] or list(modules.values())
     base = max(specs, key = specs.count)
     return {**base, **modules}
 
 
 def _ensure_deepseek_v41_omlx_layout(model_type):
-    """Let mlx-vlm's deepseek_v41 sanitize read DeepSeek-V4.1 oQ quants, dropping their DSpark stages as it does a source's."""
+    """Wrap mlx-vlm's deepseek_v41 sanitize to read oQ quants (DSpark stages dropped)."""
     if model_type != "deepseek_v41":
         return
     try:
@@ -955,7 +952,7 @@ def _ensure_deepseek_v41_omlx_layout(model_type):
         }
         import mlx.core as mx
 
-        # An Engram table kept at source precision (FP8 bytes, E8M0 block scales), which sanitize packs under the source's name.
+        # FP8 Engram table: sanitize packs it only under the source's ``.scale`` name.
         for key in [key for key in weights if key.endswith(".engram.embed.scales")]:
             weight = weights.get(key.removesuffix("scales") + "weight")
             if weight is not None and weight.dtype == mx.uint8:

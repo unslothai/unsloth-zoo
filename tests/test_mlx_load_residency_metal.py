@@ -122,7 +122,6 @@ def test_glm5_next_fused_layers_take_their_checkpoint_bits(monkeypatch):
     assert _load_mlx_vlm_with_extra_weight_filter("glm", "glm5_next", load, {}) == bits
 
 
-# oQ2e's layout (affine, a requantized Engram table) and oQ4e-ngram's (the source's MXFP4/FP8, its FP8 Engram table).
 @pytest.mark.parametrize("layout", ["oQ2e", "oQ4e-ngram"])
 def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
     v41 = pytest.importorskip("mlx_vlm.models.deepseek_v41.deepseek_v41")
@@ -150,11 +149,10 @@ def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
             ("head", "embed_tokens", "ffn.gate", "engram.embed", "wo_a")
         ):
             return False
-        if ".switch_mlp." in path:  # 2-bit, one layer 3-bit, as oQ2.5e's
+        if ".switch_mlp." in path:
             return {"group_size": 32, "bits": 4, "mode": "mxfp4"} if mxfp else {"group_size": 64, "bits": 3 if ".layers.3." in path else 2, "mode": "affine"}
         if path.endswith("engram.wkv"):
             return mxfp8
-        # oQ4e keeps the source's FP8 projections and its bf16 compressor and indexer keys; oQ2e takes all to 8-bit.
         if mxfp:
             return mxfp8 if source_fp8(path) else False
         return {"group_size": 64, "bits": 8, "mode": "affine"}
@@ -164,7 +162,7 @@ def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
     params = dict(tree_flatten(model.parameters()))
     names = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
 
-    def omlx(key):  # its source's names under language_model.: embed, routed (stacked) and shared experts' w1/w2/w3, vision ffn
+    def omlx(key):
         key = key.replace("language_model.embed_tokens.", "language_model.embed.").replace(".switch_mlp.", ".experts.")
         key = re.sub(r"(\.experts|\.shared_experts)\.(\w+_proj)\.", lambda match: f"{match[1]}.{names[match[2]]}.", key)
         return re.sub(r"^(vision\.blocks\.\d+)\.mlp\.", r"\1.ffn.", key)
@@ -174,10 +172,8 @@ def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
     table = "language_model.layers.1.engram.embed."
     packed = dict(zip(("weight", "scales", "biases"), mx.quantize(stored[table + "weight"], 32, 8 if mxfp else 4, mode = "mxfp8" if mxfp else "affine")))
     stored.update({table + name: value.view(mx.uint8) if mxfp and name == "weight" else value for name, value in packed.items()})
-    stored["language_model.mtp.0.ffn.experts.w1.weight"] = mx.zeros((8, 128, 64), mx.uint32)  # a DSpark stage, not built
+    stored["language_model.mtp.0.ffn.experts.w1.weight"] = mx.zeros((8, 128, 64), mx.uint32)  # DSpark stage
     mx.save_safetensors(str(tmp_path / "model.safetensors"), stored)
-    # As omlx records them: under its own module names, an affine entry marking the source's FP8 inputs, an MXFP entry
-    # with no group size.
     quantized = {
         omlx(f"{path}.weight").removesuffix(".weight"):
             {**spec, "quantize_input": source_fp8(path)} if spec["mode"] == "affine" else {"bits": spec["bits"], "mode": spec["mode"]}
@@ -185,7 +181,6 @@ def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
     }
     quantized["language_model.mtp.0.ffn.experts.w1"] = {"bits": 4, "mode": "mxfp4"}
     config = _mlx_vlm_config_override_data({**config, "omlx_deepseek_v41": {"version": 1, "quantized_modules": quantized}})
-    # The experts' format reads as the checkpoint's, so a load_in_4bit request takes it as it is.
     experts = {"group_size": 32, "bits": 4, "mode": "mxfp4"} if mxfp else {"group_size": 64, "bits": 2, "mode": "affine"}
     assert _global_quant_params(config["quantization"]) == experts
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -549,8 +544,6 @@ def test_a_request_threads_lazy_output_does_not_fail_the_next(tmp_path):
         np.testing.assert_array_equal(got, _bits(want))
 
 
-# As GLM-5's: one tensor per expert, which mlx-vlm stacks at load; DeepSeek V4.1's, under reference names, apart or
-# stacked (as omlx converts it, beside DSpark draft stages no load holds); stacked under experts. by projection name.
 @pytest.mark.parametrize("v41, apart", [(False, True), (True, True), (True, False), (False, False)])
 def test_experts_a_checkpoint_stores_under_other_names(tmp_path, v41, apart):
     stock = _moe("vlm" if v41 else "lm", v41 = v41)

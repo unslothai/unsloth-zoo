@@ -397,8 +397,7 @@ def ple_sites(model):
 
 def _checkpoint_name(store, name):
     """The checkpoint's name for a parameter: its MLX name, the Hugging Face layout of it, for a text
-    checkpoint mlx-vlm wraps as its language model the text layout, or, for routed experts a checkpoint
-    stacks under ``experts.`` by projection or reference name (as omlx's DeepSeek-V4.1), that stack."""
+    checkpoint mlx-vlm wraps as its language model the text layout, or an ``experts.`` stack (omlx)."""
     if name in store.specs:
         return name
     prefix = "language_model.model."
@@ -1377,7 +1376,7 @@ def _tensors(model_dir, dtype_bytes):
 def offload_inventory(model_dir, dtype_bytes = None):
     """``offload.offloadable``'s sizes plus ``total_bytes``, from the safetensors headers alone (floats
     at ``dtype_bytes`` an element), to price a load before it is made. It counts every quantized
-    expert stack, so it can count experts a loaded model keeps; never an MTP head's (``mtp.``, ``language_model.mtp.``)."""
+    expert stack, so it can count experts a loaded model keeps; never an MTP head's."""
     total = ple = 0
     layers = {}  # prefix -> [bytes, experts, quantized projections, global scales]
     for name, shape, size in _tensors(model_dir, dtype_bytes):
