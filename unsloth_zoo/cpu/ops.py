@@ -73,8 +73,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             end = min(start + chunk_rows, rows)
             y = labels[start:end]
             valid = y != ignore_index
-            # Zero ignored rows before the projection: finite fp16 can overflow to inf there, and NaN * 0 stays NaN.
-            # Eager drops them beforehand, so this only matters when traced or when every label is ignored.
+            # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
             h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
             logits = (h @ weight.t()).float()
             safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
@@ -98,7 +97,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         )
         # num_items_in_batch == 0 (a fully masked accumulation group): a finite 0, as TRL's clamped divisor gives.
         if torch.is_tensor(divisor):
-            # A tensor count (the HF Trainer's) stays a tensor: no .item() host sync, so fullgraph traces it.
+            # Keep tensor counts as tensors: .item() breaks fullgraph tracing.
             loss = total / torch.where(divisor == 0, torch.ones_like(divisor), divisor)
             ctx.divisor = None
             saved = saved + (divisor,)
@@ -420,7 +419,6 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
         shift_labels = labels[..., 1:]
     hidden = hidden.reshape(-1, hidden.shape[-1])
     shift_labels = shift_labels.reshape(-1).to(hidden.device)
-    # Tensor divisors avoid .item(), which would break a torch.compile(fullgraph = True) graph.
     if num_items_in_batch is None:
         count = (shift_labels != ignore_index).sum().to(torch.float32)
         # Matches F.cross_entropy(reduction="mean"): NaN when every label is ignored.
