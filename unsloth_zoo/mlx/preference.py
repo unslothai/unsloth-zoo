@@ -179,6 +179,8 @@ class PreferenceLengthPolicy:
     truncation_mode: str
     # The width every row must fit; max_length is the budget spent inside it.
     max_seq_length: int
+    # KTO's max_length before its special-token reserve, which TRL's vision collator never adds.
+    vision_max_length: int | None = None
 
 
 def _token_budget(value, name):
@@ -192,7 +194,7 @@ def _token_budget(value, name):
     return value
 
 
-def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=None, vision=False):
+def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=None):
     """Resolve the four length bounds the way the matching TRL trainer does.
 
     max_seq_length has no TRL counterpart: it is the width a batch can hold, so
@@ -248,7 +250,9 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
             )
             max_completion_length = None
     carry = 0
-    if kind == "kto" and not vision:  # TRL's vision KTO collator adds no special tokens
+    vision_max_length = None
+    if kind == "kto":
+        vision_max_length = max_seq_length if max_length is None else min(max_length, max_seq_length)
         if tokenizer is None:
             raise ValueError(
                 "Unsloth MLX KTO: resolving the length budget needs the tokenizer."
@@ -304,7 +308,7 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
     # DPO's prompt bound is a cap, not reserved room, so it may exceed max_length.
     return PreferenceLengthPolicy(
         kind, max_length, max_prompt_length, max_completion_length,
-        truncation_mode, max_seq_length,
+        truncation_mode, max_seq_length, vision_max_length,
     )
 
 
@@ -1715,16 +1719,6 @@ def _kto_row_is_vision(row, image_size):
     return "image" in row or "images" in row or bool(_kto_row_images(row, image_size))
 
 
-def kto_dataset_is_vision(dataset, formatting_func=None, image_size=None):
-    """Whether a vision-language model's KTO plan follows TRL's vision collator for
-    ``dataset``, which its first unpaired row decides."""
-    first = next(iter(_unpaired_kto_rows(dataset, formatting_func)), None)
-    try:
-        return first is not None and _kto_row_is_vision(first[1], image_size)
-    except ValueError:  # the plan reports the row
-        return False
-
-
 def _encode_vision_kto_row(processor, row, *, extracted, image_size, image_reader):
     """TRL's vision KTO collator: the prompt through the processor with its
     images, the completion as plain text, neither adding special tokens."""
@@ -1869,7 +1863,9 @@ def create_kto_batch_plan(
             label = _kto_label(row)
             if vision is None:
                 vision = processor is not None and _kto_row_is_vision(row, image_size)
-                if not vision:
+                if vision:
+                    max_length = length_policy.vision_max_length or max_length
+                else:
                     require_carry_room()
             if vision:
                 prompt_text, prompt, answer_ids, images, arrays = _encode_vision_kto_row(

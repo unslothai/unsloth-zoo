@@ -3549,20 +3549,23 @@ def test_a_vision_kto_plan_follows_trls_vision_collator():
 
 
 def test_a_vision_kto_row_keeps_the_whole_length_budget():
-    from unsloth_zoo.mlx.preference import create_kto_batch_plan, kto_dataset_is_vision, resolve_preference_length_policy
+    from unsloth_zoo.mlx.preference import create_kto_batch_plan, resolve_preference_length_policy
 
     encode = lambda text: tuple(Tokenizer().encode(text))
     prompt = (*encode("<user>"), 60, 61, *encode("hi<assistant>"))
-    assert kto_dataset_is_vision([kto_vision_row("yes")]) and not kto_dataset_is_vision([{"prompt": "q", "completion": "a", "label": True}])
-    # TRL's vision collator adds no special token past max_length, so none is reserved.
     args = types.SimpleNamespace(max_length=None, max_prompt_length=4, append_eos=True)
-    tokenizer = VisionProcessor().tokenizer
-    assert resolve_preference_length_policy("kto", args, max_seq_length=len(prompt) + 1, tokenizer=tokenizer, vision=True).max_length == len(prompt) + 1
-    made = create_kto_batch_plan(
-        [kto_vision_row("yes")], None, batch_size=1, kl_batch_size=1, num_epochs=1, grad_accum=1, with_kl=False,
-        length_policy=policy("kto", max_length=len(prompt) + 1, max_prompt_length=4, max_seq_length=len(prompt) + 1),
-        processor=VisionProcessor(), model_config={})
-    assert made.rows[0].completion_ids == encode("yes")[:1]
+    with pytest.warns(RuntimeWarning, match="special token"):
+        length_policy = resolve_preference_length_policy(
+            "kto", args, max_seq_length=len(prompt) + 1, tokenizer=VisionProcessor().tokenizer)
+
+    def build(rows):
+        return create_kto_batch_plan(
+            rows, None, batch_size=1, kl_batch_size=1, num_epochs=1, grad_accum=1, with_kl=False,
+            length_policy=length_policy, processor=VisionProcessor(), model_config={})
+    # TRL's vision collator adds no special token past max_length, so none is reserved for it.
+    assert build([kto_vision_row("yes")]).rows[0].completion_ids == encode("yes")[:1]
+    # A text split under the same policy (an eval set, say) keeps the reserve.
+    assert build([{"prompt": "q", "completion": "a", "label": True}]).rows[0].completion_ids
 
 
 def test_a_vision_kto_batch_scores_its_kl_rows_in_the_same_forward():
