@@ -625,6 +625,7 @@ from .utils import (
     restore_mlx_norm_output_cast_state,
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
+    _get_processor_tokenizer,
     _get_text_model,
     _neftune_embed_scale,
     _probe_vlm_embedding_module,
@@ -635,8 +636,8 @@ from .utils import (
 )
 from .preference import (
     FinitePreferenceBatchPlan,
-    FiniteVisionPreferenceBatchPlan,
     PreferenceRunContext,
+    VisionPreferenceBatches,
     build_reference_policy,
     create_kto_batch_plan,
     create_preference_batch_plan,
@@ -715,7 +716,7 @@ _EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan,
 def _eager_refetchable(batches):
     # A vision preference plan reruns the processor like the VLM plan.
     return isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES) and not isinstance(
-        batches, FiniteVisionPreferenceBatchPlan,
+        batches, VisionPreferenceBatches,
     )
 
 
@@ -2482,7 +2483,7 @@ def _plan_single_process_text_shapes(
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
-    vision_preference = isinstance(batches, FiniteVisionPreferenceBatchPlan)
+    vision_preference = isinstance(batches, VisionPreferenceBatches)
     strict = compile_policy.mode == "strict"
     if vision_preference:
         # The vision SFT planner's gates; the trainer reports an unqualified arch.
@@ -2504,6 +2505,11 @@ def _plan_single_process_text_shapes(
             return None, _shape_guard_report(
                 "not_applicable", "compile_ineligible_global_norm", cap,
             ), False, None
+    elif is_vlm and isinstance(batches, GRPOBatchPlan):
+        # Its vision inputs come only with each rollout, so no family is named ahead.
+        return None, _shape_guard_report(
+            "not_applicable", "grpo_vision_eager", cap,
+        ), False, None
     elif is_vlm:
         return _plan_single_process_vlm_shapes(
             batches,
@@ -2772,9 +2778,15 @@ class MLXTrainer:
         """
         policy = getattr(self, "_resolved_preference_length_policy", None)
         if policy is None:
+            tokenizer = None
+            if self.preference_kind == "kto":
+                tokenizer = (
+                    _get_processor_tokenizer(self._resolve_vlm_processor())
+                    if self._is_vlm else self.tokenizer
+                )
             policy = resolve_preference_length_policy(
                 self.preference_kind, args, max_seq_length=args.max_seq_length,
-                tokenizer=self.tokenizer if self.preference_kind == "kto" else None,
+                tokenizer=tokenizer,
             )
             self._resolved_preference_length_policy = policy
         return policy
@@ -7359,6 +7371,7 @@ class MLXTrainer:
                             mask_truncated_completions=args.mask_truncated_completions,
                             with_reference=self._uses_reference(args),
                             max_prompt_length=args.max_prompt_length, seed=args.seed,
+                            **self._grpo_vision_options(),
                         )
                         plan.bind(
                             model, self.reward_funcs, trainer_state=self.state,
@@ -7386,6 +7399,8 @@ class MLXTrainer:
                             grad_accum=1,
                             append_eos=bool(args.append_eos),
                             prompt_sink=prompt_sink,
+                            images_from=(eval_dataset, self.formatting_func),
+                            **self._preference_vision_options(),
                         )
                     if self.preference_kind:
                         # Sequential, so every evaluation scores the same
@@ -7403,6 +7418,7 @@ class MLXTrainer:
                             append_eos=bool(args.append_eos),
                             formatting_func=None,
                             prompt_sink=prompt_sink,
+                            images_from=(eval_dataset, self.formatting_func),
                             **self._preference_vision_options(),
                         )
                     if is_vlm:
@@ -9470,12 +9486,6 @@ class MLXTrainer:
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
 
-        if self.preference_kind in ("kto", "cpo") and is_vlm:
-            raise ValueError(
-                f"Unsloth MLX {self.preference_kind.upper()}: vision-language "
-                "models are not supported."
-            )
-
         if is_vlm:
             processor = self._resolve_vlm_processor()
         else:
@@ -9715,6 +9725,7 @@ class MLXTrainer:
                     dataset_order=args.dataset_order,
                     preserve_dataset_order=args.preserve_dataset_order,
                     seed=args.seed,
+                    **self._preference_vision_options(),
                 ), None
             return create_preference_batch_plan(
                 train_dataset,
@@ -10281,6 +10292,11 @@ class MLXGRPOTrainer(MLXTrainer):
         adapted = next(iter_mlx_lora_modules(self.model), None) is not None
         return super()._syncs_reference(args) and not adapted
 
+    def _grpo_vision_options(self):
+        options = self._preference_vision_options()
+        options.pop("image_size", None)  # TRL's GRPO hands the processor its images as given
+        return options
+
     def _create_grpo_plan(self, dataset, num_batches, num_epochs):
         args = self.args
         if args.dataset_order != "default" or args.preserve_dataset_order:
@@ -10300,6 +10316,7 @@ class MLXGRPOTrainer(MLXTrainer):
             with_reference=self._uses_reference(args),
             max_prompt_length=args.max_prompt_length, shuffle=args.shuffle_dataset,
             seed=args.seed, num_batches=num_batches, num_epochs=num_epochs,
+            **self._grpo_vision_options(),
         )
         # A resumed run generates at once, so its widths are planned from there.
         resume = getattr(self, "_resume_from_checkpoint", None)
