@@ -987,7 +987,8 @@ class _RewardModel:
 
     def __call__(self, prompts, completions, **_):
         import torch
-        if _is_conversational_prompt(prompts[0]):
+        # The completion, not the prompt: an assistant-only prompt is empty once its turn moves into the completion.
+        if _is_conversational_prompt(completions[0]):
             texts = [
                 self.tokenizer.apply_chat_template(prompt + completion, tools=None, tokenize=False)
                 for prompt, completion in zip(prompts, completions)

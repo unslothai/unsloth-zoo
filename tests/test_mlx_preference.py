@@ -3492,6 +3492,7 @@ def test_grpo_reward_models_are_scored_as_trl_scores_them(monkeypatch):
     chat = [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "It is "}]
     for raw, texts in (
         ([chat, chat], ["user:2+2?|assistant:It is 4", "user:2+2?|assistant:It is seven"]),
+        ([chat[1:], chat[1:]], ["assistant:It is 4", "assistant:It is seven"]),
         (["2+2?", "1+1 is"], ["2+2?4", "1+1 isseven"]),
     ):
         prompts, completions = reward_prompts_and_completions(raw, ["4", "seven"])
