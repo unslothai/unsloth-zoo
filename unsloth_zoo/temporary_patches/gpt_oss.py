@@ -174,8 +174,13 @@ def _gpt_oss_flex_mask(
             from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
             n = (kv_length + BLOCK - 1) // BLOCK
             rows = bsz or 1
-            kv_num_blocks = torch.div(q_o - kv_o, BLOCK, rounding_mode = "floor").add_(1).clamp_(1, n)
-            kv_num_blocks = kv_num_blocks.to(torch.int32).expand(rows, 1, 1).contiguous()
+            if isinstance(q_off, torch.Tensor) or isinstance(kv_off, torch.Tensor):
+                kv_num_blocks = torch.div(q_o - kv_o, BLOCK, rounding_mode = "floor").add_(1).clamp_(1, n)
+                kv_num_blocks = kv_num_blocks.to(torch.int32).expand(rows, 1, 1).contiguous()
+            else:
+                # Integer offsets (dynamic caches): count on the host, one fill as before.
+                kv_num_blocks = torch.full((rows, 1, 1), min(max((q_off - kv_off) // BLOCK + 1, 1), n),
+                                           dtype = torch.int32, device = device)
             kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
             block_mask = BlockMask.from_kv_blocks(
                 kv_num_blocks, kv_indices.contiguous(), BLOCK_SIZE = BLOCK, mask_mod = mask_mod,
