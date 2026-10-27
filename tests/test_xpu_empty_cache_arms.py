@@ -67,6 +67,19 @@ def test_patch_model_and_tokenizer_releases_through_the_active_backend(device_ty
         cuda = SimpleNamespace(empty_cache = lambda: seen.append("cuda")),
         xpu = SimpleNamespace(empty_cache = lambda: seen.append("xpu")),
     )
-    exec(_patch_model_final_release(), {"gc": SimpleNamespace(collect = lambda: 0), "torch": fake_torch,
+    exec(_patch_model_final_release(), {"gc": SimpleNamespace(collect = lambda: 1), "torch": fake_torch,
                                         "DEVICE_TYPE": device_type})
     assert seen == [expected] * 3
+
+
+@pytest.mark.parametrize("found", [[5, 0, 7], [0, 9, 9], [4, 2, 1]])
+def test_patch_model_and_tokenizer_stops_once_a_pass_finds_nothing(found):
+    # A full pass that found nothing changed nothing, so the next one cannot find anything either.
+    seen = []
+    results = iter(found)
+    fake_torch = SimpleNamespace(cuda = SimpleNamespace(empty_cache = lambda: seen.append("cuda")))
+    exec(_patch_model_final_release(), {"gc": SimpleNamespace(collect = lambda: next(results)), "torch": fake_torch,
+                                        "DEVICE_TYPE": "cuda"})
+    expected = found.index(0) + 1 if 0 in found else len(found)
+    # empty_cache still follows every collect that ran.
+    assert seen == ["cuda"] * expected
