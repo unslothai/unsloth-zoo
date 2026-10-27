@@ -926,7 +926,9 @@ def check_conversion_mappings(model, current_key_name_str, skip_modules):
         for pattern, replacement in reverse_conversion_mappings.items():
             try:
                 replacement = replacement.lstrip("^")  # strip unneeded chars/patterns
-                replacement = re.sub(r"\(.*?\)", "", replacement)
+                # Innermost groups first, so a nested lookahead (Qwen2-VL's `model(?!\.(language_model|visual))`) goes whole.
+                while (stripped := re.sub(r"\([^()]*\)", "", replacement)) != replacement:
+                    replacement = stripped
                 key, n_replace = re.subn(pattern, replacement, current_key_name_str)
                 if n_replace > 0:
                     new_current_key_names_str = key
