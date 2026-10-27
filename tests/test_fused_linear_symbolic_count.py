@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A shape-derived count (``labels.numel()``, a SymInt under a dynamic compile) passed as the fused CE divisor or the
-fused JSD ``num_items_in_batch`` must stay symbolic: one graph for every row count, no specialization error under
-``mark_dynamic``, and the same loss and gradients as eager."""
+"""A SymInt divisor / num_items_in_batch must stay symbolic: one graph for all row counts, matching eager."""
 
 import pytest
 import torch

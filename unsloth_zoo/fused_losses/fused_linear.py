@@ -2336,9 +2336,7 @@ def _head_bias(bias, weight):
 
 
 def _f32_scalar(x, device):
-    """A count / scale as a float32 0-dim tensor on ``device``. A Python or symbolic number (``labels.numel()`` under a
-    dynamic compile) goes through ``scalar_tensor``: ``as_tensor`` would specialize it into the graph and recompile
-    for every token count."""
+    """``as_tensor`` would specialize a SymInt count into the graph and recompile per token count."""
     if isinstance(x, (bool, int, float, torch.SymInt, torch.SymFloat)):
         return torch.scalar_tensor(x, dtype = torch.float32, device = device)
     return torch.as_tensor(x).to(device = device, dtype = torch.float32).reshape(-1)[:1].reshape(())
