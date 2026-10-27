@@ -107,3 +107,31 @@ def test_prefill_batch_may_go_dynamic(monkeypatch, S, traced_caller):
     # Prefill keeps the main kernel either way, so it keeps Dynamo's automatic dynamic batch (no extra recompiles).
     seen = _run(monkeypatch, S, q_len = 7, traced_caller = traced_caller)
     assert len(seen) == 2 and any(seen[1]), seen
+
+
+def test_dynamic_cache_decode_static_batch_no_per_step_recompile(monkeypatch, S):
+    # DynamicCache (the fallback when a static cache does not fit): kv length grows every step. The batch stays
+    # static, the kv length goes dynamic once, and later steps reuse that graph.
+    seen = []
+    def fake_flex(query, key, value, block_mask = None, **kwargs):
+        return query * 1, query.float().sum(-1) + key.float().mean()
+    def backend(gm, example_inputs):
+        values = [node.meta.get("example_value") for node in gm.graph.nodes if node.op == "placeholder"]
+        seen.append([_dynamic(x.shape[0]) for x in values if isinstance(x, torch.Tensor) and x.dim() == 4])
+        return gm
+    torch._dynamo.reset()
+    monkeypatch.setattr(S, "flex_attention", torch.compile(fake_flex, backend = backend))
+    monkeypatch.setattr(S, "flex_output_and_lse", lambda output: output)
+    attn = _Attn(8)
+    for batch in (1, 4):
+        for kv_len in range(128, 136):
+            q, k = torch.randn(batch, 8, 1, 16), torch.randn(batch, 4, kv_len, 16)
+            S.flex_attention_with_sink_inference(attn, q, k, k.clone(), _block_mask(1, kv_len))
+        graphs_after_batch = len(seen)
+        for kv_len in range(136, 140):
+            q, k = torch.randn(batch, 8, 1, 16), torch.randn(batch, 4, kv_len, 16)
+            S.flex_attention_with_sink_inference(attn, q, k, k.clone(), _block_mask(1, kv_len))
+        assert len(seen) == graphs_after_batch, seen
+    torch._dynamo.reset()
+    assert seen and not any(any(graph) for graph in seen), seen
+    assert len(seen) <= 4, seen
