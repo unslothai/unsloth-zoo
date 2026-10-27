@@ -67,7 +67,7 @@ def test_patch_model_and_tokenizer_releases_through_the_active_backend(device_ty
         cuda = SimpleNamespace(empty_cache = lambda: seen.append("cuda")),
         xpu = SimpleNamespace(empty_cache = lambda: seen.append("xpu")),
     )
-    exec(_patch_model_final_release(), {"gc": SimpleNamespace(collect = lambda: 1), "torch": fake_torch,
+    exec(_patch_model_final_release(), {"gc": SimpleNamespace(collect = lambda: 1, callbacks = []), "torch": fake_torch,
                                         "DEVICE_TYPE": device_type})
     assert seen == [expected] * 3
 
@@ -78,8 +78,18 @@ def test_patch_model_and_tokenizer_stops_once_a_pass_finds_nothing(found):
     seen = []
     results = iter(found)
     fake_torch = SimpleNamespace(cuda = SimpleNamespace(empty_cache = lambda: seen.append("cuda")))
-    exec(_patch_model_final_release(), {"gc": SimpleNamespace(collect = lambda: next(results)), "torch": fake_torch,
+    exec(_patch_model_final_release(), {"gc": SimpleNamespace(collect = lambda: next(results), callbacks = []), "torch": fake_torch,
                                         "DEVICE_TYPE": "cuda"})
     expected = found.index(0) + 1 if 0 in found else len(found)
     # empty_cache still follows every collect that ran.
     assert seen == ["cuda"] * expected
+
+
+def test_patch_model_and_tokenizer_keeps_every_pass_when_gc_callbacks_are_registered():
+    # A gc callback runs around each pass and may drop references, so a 0 no longer proves the heap is quiet.
+    seen = []
+    results = iter([0, 0, 0])
+    fake_torch = SimpleNamespace(cuda = SimpleNamespace(empty_cache = lambda: seen.append("cuda")))
+    exec(_patch_model_final_release(), {"gc": SimpleNamespace(collect = lambda: next(results), callbacks = [print]),
+                                        "torch": fake_torch, "DEVICE_TYPE": "cuda"})
+    assert seen == ["cuda"] * 3

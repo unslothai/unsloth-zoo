@@ -846,8 +846,8 @@ def patch_model_and_tokenizer(
         collected = gc.collect()
         if DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
         else: torch.cuda.empty_cache()
-        # Nothing found: another full pass right away cannot find anything either.
-        if collected == 0: break
+        # Nothing found and no gc.callbacks (which run around every pass): the next pass cannot find anything either.
+        if collected == 0 and not gc.callbacks: break
     return model, tokenizer
 pass
 
