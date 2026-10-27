@@ -14,22 +14,38 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Layer input op registers on torch >= 2.4; each module copy owns its own op."""
+"""Layer input address op registers on torch >= 2.4, survives compilation; one op per module copy."""
 
 import importlib.util
 import sys
 
+import pytest
 import torch
 
 import unsloth_zoo.routing_replay as rr
 
 
-def test_layer_inputs_op_registers_and_records():
+def test_layer_inputs_op_registers_and_returns_addresses():
     op = rr._layer_inputs_op()  # torch < 2.7: ValueError from infer_schema on list[torch.Tensor]
-    x = torch.randn(3)
-    op(5, [x])
-    assert rr._STATE.layer_inputs[5] == frozenset({x.data_ptr()})
-    rr._STATE.layer_inputs.pop(5, None)
+    x, y = torch.randn(3), torch.randn(2)
+    # Distinct non-empty addresses, sorted, zero padded to one slot per tensor.
+    out = op([x, torch.empty(0), x, y])
+    assert out.dtype == torch.int64 and out.shape == (4,)
+    assert out.tolist() == sorted([x.data_ptr(), y.data_ptr()]) + [0, 0]
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_layer_inputs_op_survives_a_compiled_graph(backend):
+    # torch 2.4 Inductor dropped the earlier output-less op even when marked side effecting.
+    op = rr._layer_inputs_op()
+    torch._dynamo.reset()
+    fn = torch.compile(lambda x: (x.sin(), op([x])), backend = backend, fullgraph = True)
+    for n in (3, 3, 5):
+        x = torch.randn(n, requires_grad = True)
+        out, addresses = fn(x)
+        out.sum().backward()
+        assert addresses.tolist() == [x.data_ptr()]
+    torch._dynamo.reset()
 
 
 def test_second_module_copy_gets_its_own_op():
@@ -42,8 +58,6 @@ def test_second_module_copy_gets_its_own_op():
         second = copy._layer_inputs_op()
         assert str(second) != str(first)
         x = torch.randn(2)
-        first(7, [x])
-        assert rr._STATE.layer_inputs.pop(7) == frozenset({x.data_ptr()})
-        assert 7 not in copy._STATE.layer_inputs
+        assert first([x]).tolist() == second([x]).tolist() == [x.data_ptr()]
     finally:
         sys.modules.pop(spec.name, None)

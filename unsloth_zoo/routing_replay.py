@@ -529,19 +529,20 @@ def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
         return None
     _STATE.recomputed = True
     candidates = [r[layer_index] for r in _STATE.pending if layer_index in r and r[layer_index][1].shape == ids2.shape]
-    if layer_input:
-        # Checkpoint recompute reuses the forward's input tensors (offloaded checkpointing only
-        # rebuilds hidden states), so the forward sharing the most addresses is the one recomputed.
-        shared = [len(c[4] & layer_input) if len(c) > 4 and isinstance(c[4], frozenset) else 0 for c in candidates]
-        best = max(shared, default = 0)
-        if best > 0 and shared.count(best) == 1:
-            candidates = [candidates[shared.index(best)]]
     if not candidates:
         # No forward replayed this layer: recompute it exactly as it ran, with no extra ops
         # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
         return _NATURAL
     fp = _fingerprint(ids2)
     match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
+    if torch.is_tensor(layer_input):
+        # Checkpoint recompute reuses the forward's input tensors (offloaded checkpointing only
+        # rebuilds hidden states), so the forward sharing the most addresses is the one recomputed.
+        # A mask, not a narrowed list: in a compiled layer the addresses are only known at run time.
+        recorded = [c[4] if len(c) > 4 and torch.is_tensor(c[4]) else layer_input[:0] for c in candidates]
+        mask = _IDENTITY_MASK_OP(layer_input, recorded) if torch.compiler.is_compiling() \
+            else _identity_mask(layer_input, recorded)
+        match = match & mask.to(match.device, non_blocking = True)
     if signature is not None:
         # Narrow the natural matches to the forwards whose router input was the same too. Only a
         # refinement: when no input matches exactly, the natural matches stand as before.
@@ -672,7 +673,8 @@ def _router_hook(layer_index, compact = None):
         signature = None
         if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
             signature = _input_signature(args, ids2.shape[0])
-        # Read once and clear: a compiled layer's traced read then sees None, never a stale call's.
+        # Read once and clear, so a later call never sees this call's addresses. Traced with the
+        # pre hook, this reads the op's output in the same graph: this call's runtime addresses.
         layer_input = _STATE.layer_inputs.get(layer_index)
         _STATE.layer_inputs[layer_index] = None
         recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature, layer_input)
@@ -760,52 +762,70 @@ def _router_hook(layer_index, compact = None):
     return hook
 
 
-def _tensor_addresses(values):
-    out = set()
-    for value in values:
-        for x in (value if isinstance(value, (tuple, list)) else (value,)):
-            if torch.is_tensor(x) and x.numel() > 0:
-                out.add(x.data_ptr())
-    return out
+def _input_addresses(tensors):
+    # Distinct data_ptr()s of the non-empty tensors, zero padded to one slot per tensor so the
+    # shape is known when tracing. A CPU int64 tensor, not a set: it flows through a compiled graph.
+    out = sorted({x.data_ptr() for x in tensors if x.numel() > 0})
+    return torch.tensor(out + [0] * (len(tensors) - len(out)), dtype = torch.int64)
 
 
-def _record_layer_inputs(layer_index, tensors):
-    _STATE.layer_inputs[layer_index] = frozenset(_tensor_addresses(tensors)) or None
+def _identity_mask(layer_input, recorded):
+    # The recorded forwards sharing the most input addresses with this call, or all when that is
+    # not exactly one. Zero is padding, never an address.
+    now = set(layer_input.tolist()) - {0}
+    shared = [len(now.intersection(r.tolist())) for r in recorded]
+    best = max(shared, default = 0)
+    unique = best > 0 and shared.count(best) == 1
+    return torch.tensor([not unique or n == best for n in shared], dtype = torch.bool)
+
+
+def _register_op(name, impl, fake):
+    for i in range(64):
+        full = name + (f"_{i}" if i else "")
+        # A reloaded module copy may own the name; custom_op silently re-registers (torch 2.10 segfaults).
+        if hasattr(torch.ops.unsloth_zoo, full):
+            continue
+        try:
+            op = torch.library.custom_op(f"unsloth_zoo::{full}", mutates_args = ())(impl)
+        except RuntimeError:
+            continue
+        op.register_fake(fake)
+        return getattr(torch.ops.unsloth_zoo, full).default
+    raise RuntimeError(f"Unsloth: could not register the routing replay op {name}.")
 
 
 _LAYER_INPUTS_OP = None
+_IDENTITY_MASK_OP = None
 
 
 def _layer_inputs_op():
-    # data_ptr() is untraceable and a graph break fails fullgraph, so use an opaque op; register eagerly.
-    global _LAYER_INPUTS_OP
-    if _LAYER_INPUTS_OP is not None:
-        return _LAYER_INPUTS_OP
-    for i in range(64):
-        name = "routing_replay_layer_inputs" + (f"_{i}" if i else "")
-        # A reloaded module copy may own the name; custom_op silently re-registers (torch 2.10 segfaults).
-        if hasattr(torch.ops.unsloth_zoo, name):
-            continue
-        try:
-            op = torch.library.custom_op(f"unsloth_zoo::{name}", mutates_args = ())(_layer_inputs_impl)
-        except RuntimeError:
-            continue
-        op.register_fake(_layer_inputs_fake)
-        _LAYER_INPUTS_OP = getattr(torch.ops.unsloth_zoo, name).default
-        if hasattr(torch.fx.node, "has_side_effect"):
-            # No outputs: else DCE may drop it.
-            torch.fx.node.has_side_effect(_LAYER_INPUTS_OP)
-        return _LAYER_INPUTS_OP
-    raise RuntimeError("Unsloth: could not register the routing replay layer input op.")
+    # data_ptr() is untraceable and a graph break fails fullgraph, so use opaque ops; register eagerly.
+    # The op returns the addresses, so the router hook reads them from the graph, not from Python
+    # state frozen at trace time, and no backend drops it while its output is used. Matching them
+    # is a second op: no CPU kernels for Inductor to compile inside a GPU graph.
+    global _LAYER_INPUTS_OP, _IDENTITY_MASK_OP
+    if _LAYER_INPUTS_OP is None:
+        _LAYER_INPUTS_OP = _register_op("routing_replay_input_addresses", _layer_inputs_impl, _layer_inputs_fake)
+    if _IDENTITY_MASK_OP is None:
+        _IDENTITY_MASK_OP = _register_op("routing_replay_identity_mask", _identity_mask_impl, _identity_mask_fake)
+    return _LAYER_INPUTS_OP
 
 
 # typing.List, not list[...]: torch < 2.7 infer_schema rejects the builtin generic.
-def _layer_inputs_impl(layer_index: int, tensors: typing.List[torch.Tensor]) -> None:
-    _record_layer_inputs(layer_index, tensors)
+def _layer_inputs_impl(tensors: typing.List[torch.Tensor]) -> torch.Tensor:
+    return _input_addresses(tensors)
 
 
-def _layer_inputs_fake(layer_index, tensors):
-    return None
+def _layer_inputs_fake(tensors):
+    return torch.empty(len(tensors), dtype = torch.int64)
+
+
+def _identity_mask_impl(layer_input: torch.Tensor, recorded: typing.List[torch.Tensor]) -> torch.Tensor:
+    return _identity_mask(layer_input, recorded)
+
+
+def _identity_mask_fake(layer_input, recorded):
+    return torch.empty(len(recorded), dtype = torch.bool)
 
 
 def _layer_pre_hook(layer_index):
@@ -816,10 +836,13 @@ def _layer_pre_hook(layer_index):
             for x in (value if isinstance(value, (tuple, list)) else (value,))
             if torch.is_tensor(x)
         ]
-        if torch.compiler.is_compiling():
-            _LAYER_INPUTS_OP(layer_index, tensors)
+        if not tensors:
+            addresses = None
+        elif torch.compiler.is_compiling():
+            addresses = _LAYER_INPUTS_OP(tensors)
         else:
-            _record_layer_inputs(layer_index, tensors)
+            addresses = _input_addresses(tensors)
+        _STATE.layer_inputs[layer_index] = addresses
         return None
 
     return hook
