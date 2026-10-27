@@ -208,8 +208,7 @@ def _gpt_oss_flex_mask(
 @torch.compiler.disable
 def _gpt_oss_block_mask_on(block_mask, device):
     """The BlockMask for a layer on another device (see _gpt_oss_flex_mask's build); built once per device per forward."""
-    on_device = getattr(block_mask, "_unsloth_on_device", None)
-    return on_device(device) if on_device is not None else block_mask.to(device)
+    return block_mask.to(device)
 
 
 def _register_gpt_oss_flex_mask():
@@ -222,6 +221,17 @@ def _register_gpt_oss_flex_mask():
     if not hasattr(_FlexBlockMask, "contiguous"):
         # transformers >= 5.21 generate calls .contiguous() on every mask it builds.
         _FlexBlockMask.contiguous = lambda self, *args, **kwargs: self
+    if not getattr(_FlexBlockMask.to, "_unsloth_gpt_oss", False):
+        # accelerate's device_map hooks move a BlockMask with .to(), which leaves mask_mod's captured tensors behind:
+        # GPT-OSS inference masks rebuild themselves on the new device instead.
+        _block_mask_to = _FlexBlockMask.to
+        def to(self, device, *args, **kwargs):
+            on_device = getattr(self, "_unsloth_on_device", None)
+            if on_device is not None and isinstance(device, (str, int, torch.device)):
+                return on_device(device)
+            return _block_mask_to(self, device, *args, **kwargs)
+        to._unsloth_gpt_oss = True
+        _FlexBlockMask.to = to
     return True
 
 

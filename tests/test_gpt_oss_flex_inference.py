@@ -416,3 +416,11 @@ def test_inference_gates_cpu(monkeypatch):
     assert G._register_gpt_oss_flex_mask()
     block_mask = BlockMask.from_kv_blocks(torch.ones(1, 1, 1, dtype = torch.int32), torch.zeros(1, 1, 1, 1, dtype = torch.int32))
     assert block_mask.contiguous() is block_mask
+    assert block_mask.to("cpu").kv_num_blocks.device.type == "cpu"
+    # accelerate moves masks with .to(): GPT-OSS masks rebuild themselves (captured tensors included) per device.
+    from transformers.masking_utils import causal_mask_function
+    import unsloth_zoo.flex_attention.utils as U
+    monkeypatch.setattr(U, "compiled_create_block_mask", None, raising = False)
+    ours = G._gpt_oss_flex_mask(batch_size = 1, q_length = 1, kv_length = 8, q_offset = 7, mask_function = causal_mask_function,
+                                attention_mask = torch.ones(1, 8, dtype = torch.long), device = "cpu")
+    assert ours.to("cpu") is ours and ours.to(torch.device("cpu")) is ours
