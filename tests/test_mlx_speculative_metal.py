@@ -1245,7 +1245,6 @@ def test_a_head_whose_overrides_name_its_checkpoint_paths_is_built_at_its_stored
     from mlx.utils import tree_flatten
     from mlx_vlm.speculative.drafters import qwen4_exp_mtp
     from unsloth_zoo.mlx.speculative import native_mtp_drafter
-    # As mixed-precision releases store it: some head projections wider than the default, keyed by checkpoint path.
     default = {"group_size": 64, "bits": 4, "mode": "affine"}
     wide = {"fc_hidden": {**default, "bits": 8}, "layers.0.self_attn.q_proj": {**default, "bits": 8},
             "layers.0.mlp.shared_expert.down_proj": {**default, "bits": 8, "group_size": 128}}
