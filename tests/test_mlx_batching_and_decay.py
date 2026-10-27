@@ -3092,10 +3092,11 @@ def test_cce_only_compile_family_is_refused_on_the_standard_loss():
 def test_vision_preference_plan_is_excluded_from_eager_fallback_refetch():
     from unsloth_zoo.mlx import trainer as trainer_module
     from unsloth_zoo.mlx.preference import (
-        FinitePreferenceBatchPlan, FiniteVisionPreferenceBatchPlan,
+        FinitePreferenceBatchPlan, FiniteVisionKTOBatchPlan, FiniteVisionPreferenceBatchPlan,
     )
 
     text = FinitePreferenceBatchPlan.__new__(FinitePreferenceBatchPlan)
     vision = FiniteVisionPreferenceBatchPlan.__new__(FiniteVisionPreferenceBatchPlan)
     assert trainer_module._eager_refetchable(text)
     assert not trainer_module._eager_refetchable(vision)
+    assert not trainer_module._eager_refetchable(FiniteVisionKTOBatchPlan.__new__(FiniteVisionKTOBatchPlan))
