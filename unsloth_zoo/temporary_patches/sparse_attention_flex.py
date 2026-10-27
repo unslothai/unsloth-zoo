@@ -109,12 +109,39 @@ _MINIMAX_INDEXER_NEEDLES = (
 )
 
 
+def _flex_or_none(kind, label, fn, query, key, value, *args):
+    """The flex attention call, or None after a failure (latched per shape) so the caller takes the dense path."""
+    try:
+        return fn(*args)
+    except Exception as error:
+        _sb.record_failure(kind, query, key, value, error)
+        logger.warning(f"Unsloth: {label} sparse flex attention failed, using the dense path: {error}")
+        return None
+
+
+# Inside Unsloth's decoder-layer compile the mask build + flex call run outside the graph (one break per
+# layer, like its flex split mode): built inside a larger graph they miscompiled. Within the budget nothing
+# leaves the graph.
+_flex_or_none_outside = torch.compiler.disable(_flex_or_none)
+_minimax_select_outside = torch.compiler.disable(_sb.minimax_m3_select_blocks)
+_dsa_select_outside = torch.compiler.disable(_sb.dsa_select_topk)
+
+
+def _run_flex(*args):
+    return (_flex_or_none_outside if torch.compiler.is_compiling() else _flex_or_none)(*args)
+
+
+def _chunked(eager, outside):
+    # Inside a block the chunked indexer runs eagerly; compiled, it would score in one chunk (full memory).
+    return outside if torch.compiler.is_compiling() and _sb.in_unsloth_block() else eager
+
+
 def unsloth_minimax_m3_indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids):
     if sparse_indexer_chunked_enabled():
         k_len = _skip._minimax_index_key_len(self, hidden_states.shape[1], past_key_values)
         if k_len is not None and -(-k_len // self.block_size) > self.topk_blocks:
             m = _MODELING["minimax_m3_vl"]
-            return _sb.minimax_m3_select_blocks(
+            return _chunked(_sb.minimax_m3_select_blocks, _minimax_select_outside)(
                 self, hidden_states, position_embeddings, past_key_values, position_ids, m.apply_rotary_pos_emb,
             )
     # Within the budget: the exact skip (or upstream when the skip is off / not installed).
@@ -151,16 +178,13 @@ def unsloth_minimax_m3_sparse_attention_forward(self, hidden_states, position_em
         )
         block_indices = self.indexer(hidden_states, position_embeddings, past_key_values, position_ids)
         if _sb.minimax_m3_flex_eligible(self, query_states, key_states, attention_mask, kwargs):
-            try:
-                attn_output = _sb.minimax_m3_flex_attention(
-                    query_states, key_states, value_states, block_indices, attention_mask,
-                    position_ids, self.scaling, self.indexer.block_size,
-                )
-                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-                return self.o_proj(attn_output), None
-            except Exception as error:
-                _sb.record_failure("minimax_m3", query_states, key_states, key_states, error)
-                logger.warning(f"Unsloth: MiniMax M3 sparse flex attention failed, using the dense path: {error}")
+            attn_output = _run_flex(
+                "minimax_m3", "MiniMax M3", _sb.minimax_m3_flex_attention, query_states, key_states, key_states,
+                query_states, key_states, value_states, block_indices, attention_mask,
+                position_ids, self.scaling, self.indexer.block_size,
+            )
+            if attn_output is not None:
+                return self.o_proj(attn_output.reshape(*input_shape, -1).contiguous()), None
         if self.config._attn_implementation in ("eager", "sdpa"):
             attention_mask = self.indexer.build_block_mask(
                 block_indices,
@@ -254,7 +278,7 @@ def unsloth_dsa_indexer_forward(self, hidden_states, q_resid, position_embedding
     family = _DSA_FAMILY[type(self).__name__]
     if sparse_indexer_chunked_enabled() and attention_mask.shape[-1] > self.index_topk:
         rope = getattr(_MODELING[family], _DSA_INDEXER_ROPE[family])
-        return _sb.dsa_select_topk(
+        return _chunked(_sb.dsa_select_topk, _dsa_select_outside)(
             self, hidden_states, q_resid, position_embeddings, attention_mask, past_key_values, rope, family,
         )
     # Within the budget: the exact skip (or upstream when the skip is off / not installed).
@@ -304,15 +328,12 @@ def _dsa_attention(self, family, hidden_states, position_embeddings, attention_m
         topk_indices = prev_topk_indices
 
     if _sb.dsa_flex_eligible(self, query_states, key_states, value_states, attention_mask, kwargs, _dsa_min_keys()):
-        try:
-            attn_output = _sb.dsa_flex_attention(
-                query_states, key_states, value_states, topk_indices, attention_mask, self.scaling, family,
-            )
-            attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
-            return self.o_proj(attn_output), None, topk_indices
-        except Exception as error:
-            _sb.record_failure("dsa", query_states, key_states, value_states, error)
-            logger.warning(f"Unsloth: {family} sparse flex attention failed, using the dense path: {error}")
+        attn_output = _run_flex(
+            "dsa", family, _sb.dsa_flex_attention, query_states, key_states, value_states,
+            query_states, key_states, value_states, topk_indices, attention_mask, self.scaling, family,
+        )
+        if attn_output is not None:
+            return self.o_proj(attn_output.reshape(batch_size, seq_length, -1).contiguous()), None, topk_indices
 
     sparse_indices = None
     if self.config._attn_implementation in ("eager", "sdpa"):
