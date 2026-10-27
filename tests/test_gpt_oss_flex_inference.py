@@ -183,14 +183,6 @@ _SCRIPT = textwrap.dedent('''
     with torch.no_grad():
         for n, p in model.named_parameters():
             p.normal_(0, 0.5 if "sinks" in n else 0.06)
-    if mode == "flex_2gpu":
-        # Layers split across two GPUs (device_map): accelerate moves tensors between cards, not BlockMasks.
-        from accelerate import dispatch_model
-        device_map = {"model.embed_tokens": 0, "model.rotary_emb": 0, "model.norm": 1, "lm_head": 1}
-        device_map.update({f"model.layers.{i}": int(i >= L // 2) for i in range(L)})
-        model = dispatch_model(model.to(dtype), device_map = device_map).eval()
-    else:
-        model = model.to("cuda", dtype).eval()
 
     g = torch.Generator().manual_seed(1)
     B, T = 3, 16
@@ -214,6 +206,16 @@ _SCRIPT = textwrap.dedent('''
         G.patch_GptOssAttention(); G.patch_GptOssModel()
         assert G._GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
         os.environ["UNSLOTH_GPT_OSS_EAGER_INFERENCE"] = "1" if mode == "eager" else "0"
+
+    if mode == "flex_2gpu":
+        # Layers split across two GPUs (device_map): accelerate moves tensors between cards, not BlockMasks.
+        # After the patches: its hooks keep the forward they wrap.
+        from accelerate import dispatch_model
+        device_map = {"model.embed_tokens": 0, "model.rotary_emb": 0, "model.norm": 1, "lm_head": 1}
+        device_map.update({f"model.layers.{i}": int(i >= L // 2) for i in range(L)})
+        model = dispatch_model(model.to(dtype), device_map = device_map).eval()
+    else:
+        model = model.to("cuda", dtype).eval()
 
     res = {}
     def gen(cache, input_ids, attention_mask, n):
