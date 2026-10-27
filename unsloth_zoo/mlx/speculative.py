@@ -1981,6 +1981,11 @@ def _native_mtp_head(path: Path) -> tuple | None:
 
 
 _MERGED_ASSISTANT_PREFIX = "language_model.mtp."
+# The assistants omlx merges, each with the mlx-vlm module that builds it; a checkpoint's config never names a module.
+_MERGED_ASSISTANT_MODULES = {
+    "gemma4_assistant": "mlx_vlm.speculative.drafters.gemma4_assistant",
+    "gemma4_unified_assistant": "mlx_vlm.speculative.drafters.gemma4_unified_assistant",
+}
 
 
 def _merged_assistant(path: Path) -> tuple | None:
@@ -1990,7 +1995,7 @@ def _merged_assistant(path: Path) -> tuple | None:
         config = (json.loads((path / "config.json").read_text()).get("text_config") or {}).get("mtp_assistant_config")
     except (OSError, ValueError):
         return None
-    if not (isinstance(config, dict) and re.fullmatch(r"gemma4\w*_assistant", str(config.get("model_type")))):
+    if not (isinstance(config, dict) and config.get("model_type") in _MERGED_ASSISTANT_MODULES):
         return None
     files = {}
     for key, file in _checkpoint_keys(path).items():
@@ -2009,7 +2014,7 @@ def _merged_assistant_drafter(path: Path, target: nn.Module, *, lazy: bool) -> A
     if merged is None:
         return None
     config, selected = merged
-    module = importlib.import_module(f"mlx_vlm.speculative.drafters.{config['model_type']}")
+    module = importlib.import_module(_MERGED_ASSISTANT_MODULES[config["model_type"]])
     model = module.Model(module.ModelConfig.from_dict(config))
     weights = {}
     for file, keys in selected:
