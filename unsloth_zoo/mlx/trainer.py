@@ -10237,8 +10237,8 @@ class MLXGRPOTrainer(MLXTrainer):
     TRL's way: called with ``prompts``, ``completions``, ``completion_ids``,
     every other dataset column and ``trainer_state``, returning one reward (or
     None) per completion. An entry may also be a torch sequence-classification
-    model or its model id, tokenized by its ``reward_processing_classes`` entry. The reference for ``beta != 0`` is the model with its
-    adapters disabled, or its starting weights for a full fine-tune."""
+    model or its model id, tokenized by its ``reward_processing_classes`` entry.
+    The reference for ``beta != 0`` is the model with its adapters disabled, or its starting weights for a full fine-tune."""
 
     config_class = MLXGRPOConfig
     preference_kind = "grpo"
