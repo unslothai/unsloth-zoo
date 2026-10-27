@@ -1229,14 +1229,34 @@ def _scalars(temperature, mul, div, cap):
     return 1.0 / temperature, scale, cap
 
 
-def _keep_index(targets, mask, vocab_size, ignore_index):
+# Every row, no compaction (no nonzero, no host sync): forced on, else only while a CUDA graph is captured.
+_FIXED_ROWS = os.environ.get("UNSLOTH_FUSED_LINEAR_FIXED_ROWS", "0") == "1"
+
+
+def _fixed_rows(device):
+    return _FIXED_ROWS or (device.type == "cuda" and torch.cuda.is_current_stream_capturing())
+
+
+def _keep_index(targets, mask, vocab_size, ignore_index, fixed_ok = False):
+    """Kept rows' indices and count. With fixed_ok on a fixed-row device: every row's index, -1 on dropped rows,
+    and count -1 (the shapes do not depend on the data; see _fixed_inputs)."""
     keep = (targets >= 0) & (targets < vocab_size)
     if ignore_index is not None:
         keep &= targets != ignore_index
     if mask is not None:
         keep &= mask.to(torch.bool)
+    if fixed_ok and _fixed_rows(targets.device):
+        return torch.where(keep, torch.arange(keep.shape[0], device = keep.device), -1), -1
     idx = keep.nonzero().squeeze(-1)
     return idx, int(idx.numel())
+
+
+def _fixed_inputs(marks, hidden, targets):
+    """Fixed rows: dropped rows (marks -1) get a zero hidden row and target 0, so every row computes finite values the
+    caller zeroes (a huge or non-finite padding row would turn 0 * inf into NaN in the head gradient)."""
+    keep = marks >= 0
+    hidden = torch.where(keep[:, None], hidden, torch.zeros((), device = hidden.device, dtype = hidden.dtype))
+    return keep, hidden, torch.where(keep, targets, torch.zeros_like(targets))
 
 
 def _saved_index(idx, n_keep, n_all):
@@ -1393,7 +1413,12 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
     V = weight.shape[0]
     targets = targets.contiguous()
     bias = bias.contiguous() if bias is not None else None
-    idx, n_keep = _keep_index(targets, mask, V, None)
+    idx, n_keep = _keep_index(targets, mask, V, None, fixed_ok = True)
+    marks = None
+    if n_keep < 0:
+        marks = idx
+        keep, hidden, targets = _fixed_inputs(marks, hidden, targets)
+        idx, n_keep = torch.arange(N, device = targets.device), N
     f32 = dict(device = device, dtype = torch.float32)
     logps = torch.zeros(N, **f32)
     lse = torch.zeros(N, **f32)
@@ -1451,8 +1476,8 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                         out.index_copy_(0, idx, dst[key])
                 if top is not None:
                     block_top.index_copy_(0, idx, top)
-            return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + \
-                (lpt if exact_lpt else logps.clone(),)
+            return _lp_outputs(marks, idx, n_keep, N, logps, ent, mean, lssp, top1, u, lse, block_top,
+                               lpt if exact_lpt else logps.clone())
         R = _chunk_rows(rows, n_keep, H, V, _bytes_per_logit(fp32_logits, compute_dtype), device)
         R = min(R, n_keep)
         buf = _Buffers(R, V, device, fp32_logits, compute_dtype)
@@ -1489,8 +1514,19 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                         put(dst, st[key] / V if key == "sum" else st[key])
                 if want_u:
                     put(u, _dz_w(dz, w) if u_scale == 1.0 else _dz_w(dz, w).div_(u_scale))
-    return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + \
-        (lpt if exact_lpt else logps.clone(),)
+    return _lp_outputs(marks, idx, n_keep, N, logps, ent, mean, lssp, top1, u, lse, block_top,
+                       lpt if exact_lpt else logps.clone())
+
+
+def _lp_outputs(marks, idx, n_keep, N, logps, ent, mean, lssp, top1, u, lse, block_top, lpt):
+    if marks is None:
+        return (logps, ent, mean, lssp, top1, u, lse, block_top) + _saved_index(idx, n_keep, N) + (lpt,)
+    # Fixed rows: dropped rows read 0 as compaction leaves them; the backward gets the marks and count -1.
+    drop = marks < 0
+    for x in (logps, ent, mean, lssp, top1, u, lse, lpt):
+        if x.numel() > 0:
+            x.masked_fill_(drop.view(-1, *([1] * (x.dim() - 1))), 0)
+    return (logps, ent, mean, lssp, top1, u, lse, block_top, marks, torch.tensor([-1], dtype = torch.long), lpt)
 
 
 def _mm_into(out, a, b):
@@ -1541,12 +1577,20 @@ def _logprobs_bwd_impl(hidden, weight, bias, targets, idx, n_keep, lse, ent, g, 
     N, H = hidden.shape
     V = weight.shape[0]
     n_keep = int(n_keep[0])
-    idx = idx[:n_keep]
     f32 = dict(device = device, dtype = torch.float32)
     inv_t, scale, cap = _scalars(temperature, mul, div, cap)
     has_ge = ge.numel() > 0
     # Autograd hands in stride-0 gradients (from .sum()).
     g, ge, lse, ent, targets = g.contiguous(), ge.contiguous(), lse.contiguous(), ent.contiguous(), targets.contiguous()
+    if n_keep < 0:
+        # Fixed rows (forward ran on every row): dropped rows get no gradient, as compaction never saw them.
+        keep, hidden, targets = _fixed_inputs(idx, hidden, targets)
+        g = torch.where(keep, g, torch.zeros((), device = g.device, dtype = g.dtype))
+        if has_ge:
+            ge = torch.where(keep, ge, torch.zeros((), device = ge.device, dtype = ge.dtype))
+        idx, n_keep = torch.arange(N, device = idx.device), N
+    else:
+        idx = idx[:n_keep]
     lpt = lpt.contiguous()
     bias = bias.contiguous() if bias is not None else None
     if n_keep == 0:
