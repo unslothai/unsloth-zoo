@@ -67,8 +67,9 @@ def additive_bias_present(mask, visible):
     """Whether an additive float mask holds finite nonzero entries (not just 0 / masked), which flex adds
     through a score_mod (5-15% slower). Eager this is a host sync. Under CUDA graph capture a sync invalidates
     the capture, and flipping the answer would need a kernel compiled during capture, so the eager warm-up's
-    answer for the same shape is reused: no bias is then asserted on device at every replay (a finite bias
-    raises instead of being dropped); a shape never run eagerly keeps the bias."""
+    answer for the same shape is reused: a bias in any warm-up call of that shape keeps the bias; with none,
+    no bias is asserted on device at every replay (a finite bias raises instead of being dropped); a shape
+    never run eagerly keeps the bias."""
     key = (mask.device, mask.dtype, tuple(mask.shape))
     if mask.is_cuda and torch.cuda.is_current_stream_capturing():
         if _BIAS_SEEN.get(key) is False:
@@ -77,5 +78,7 @@ def additive_bias_present(mask, visible):
             )
             return False
         return True
-    _BIAS_SEEN[key] = found = bool((visible & (mask != 0)).any())
+    found = bool((visible & (mask != 0)).any())
+    # Sticky: one same-shape call with a bias keeps every captured call of that shape on the bias kernel.
+    _BIAS_SEEN[key] = found or _BIAS_SEEN.get(key, False)
     return found

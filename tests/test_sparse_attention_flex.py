@@ -864,6 +864,47 @@ def test_dsa_flex_cuda_graph_capture_matches_eager(finite_bias):
     assert _rel(out, eager) < 1e-2, _rel(out, eager)
 
 
+@needs_models
+@gpu
+def test_dsa_flex_capture_same_shape_mixed_bias():
+    """Two same-shape calls in one capture, one with a finite bias and one 0 / min only: the warm-up of the
+    biased call must not be overwritten by the plain one (a stale no-bias answer asserted on replay)."""
+    torch.manual_seed(0)
+    dev, dt = "cuda", torch.bfloat16
+    B, H, S, T, D = 1, 4, 64, 1024, 64
+    q = torch.randn(B, H, S, D, device = dev, dtype = dt)
+    k = torch.randn(B, H, T, D, device = dev, dtype = dt)
+    topk_idx = torch.randperm(T, device = dev)[:256].sort().values.int().expand(B, S, -1)
+    plain = torch.zeros(B, 1, S, T, device = dev, dtype = dt)
+    plain[..., -64:] = torch.finfo(dt).min
+    biased = plain + torch.rand_like(plain).mul(0.5)
+
+    def fn():
+        outs = []
+        for mask in (biased, plain):
+            if hasattr(topk_idx, "_unsloth_dsa_flex"):
+                del topk_idx._unsloth_dsa_flex
+            outs.append(sb.dsa_flex_attention(q, k, k, topk_idx, mask, D ** -0.5))
+        return outs
+
+    eager = [o.clone() for o in fn()]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            fn()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream = stream):
+        outs = fn()
+    for o in outs:
+        o.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    for o, e in zip(outs, eager):
+        assert _rel(o, e) < 1e-2, _rel(o, e)
+
+
 def test_flex_failure_under_capture_is_raised_not_latched(monkeypatch):
     """A failure while a CUDA graph is being captured has invalidated the capture, so the dense fallback cannot
     run either: it is raised, and the shape class stays on flex."""
