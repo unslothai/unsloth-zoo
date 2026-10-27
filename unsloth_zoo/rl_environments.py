@@ -495,8 +495,8 @@ pass
 # whose whole module has to go:
 #   string -- Formatter.get_field resolves a dotted runtime string and returns
 #     the object, reaching the real builtins with nothing in the source to
-#     match. str.format resolves the same way but only returns text, never the
-#     object, so it is not an execution path and stays.
+#     match. str.format resolves the same way and returns the text, which is
+#     enough to read os.environ; _reject_dunder_access checks its fields.
 #   dataclasses -- resolves annotations via sys.modules[cls.__module__], which
 #     cannot work for synthetic globals.
 _SAFE_IMPORT_MODULES = frozenset({
@@ -783,6 +783,32 @@ def _annotation_strings(annotation, literal_names, typing_names):
         stack.extend(ast.iter_child_nodes(sub))
 
 
+_FORMAT_METHODS = frozenset({"format", "format_map"})
+
+
+def _format_fields_are_safe(text, depth = 0):
+    # str.format does getattr / getitem for every `.name` / `[key]` in a field,
+    # from a runtime string the Attribute check never sees. Apply the same
+    # rule to those names, including fields nested in a format spec.
+    import _string
+    if depth > 2:
+        return False
+    try:
+        for _, field, spec, _ in _string.formatter_parser(text):
+            if field is not None:
+                _, rest = _string.formatter_field_name_split(field)
+                for _, name in rest:
+                    if isinstance(name, str) and (
+                        name.startswith("_") or name in _DENIED_ATTR_NAMES
+                    ):
+                        return False
+            if spec and not _format_fields_are_safe(spec, depth + 1):
+                return False
+    except ValueError:
+        return False
+    return True
+
+
 def _reject_dunder_access(tree):
     """
     Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
@@ -809,6 +835,18 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )
+        # Only a literal template can be checked, so `.format` on anything else
+        # (a variable, `str.format`, a built string) is refused.
+        if isinstance(node, ast.Attribute) and node.attr in _FORMAT_METHODS:
+            template = node.value
+            if not (
+                isinstance(template, ast.Constant) and isinstance(template.value, str)
+                and _format_fields_are_safe(template.value)
+            ):
+                raise RuntimeError(
+                    f"'.{node.attr}' is only allowed on a string literal without "
+                    "private or dunder fields in generated code."
+                )
         # Annotations are strings here; anything evaluating them runs text the walk saw as a literal.
         for annotation in _annotation_nodes(node):
             if bindings is None:
@@ -838,7 +876,7 @@ def _reject_dunder_access(tree):
                     "Positional class patterns are only allowed on builtin types in generated code."
                 )
             for attr in (node.kwd_attrs or []):
-                if attr.startswith("_") or attr in _DENIED_ATTR_NAMES:
+                if attr.startswith("_") or attr in _DENIED_ATTR_NAMES or attr in _FORMAT_METHODS:
                     raise RuntimeError(
                         f"Attribute '{attr}' is not allowed in generated code."
                     )
