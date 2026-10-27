@@ -524,11 +524,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             f"embedding."
         )
         return
-    # Ignore some model checks for now. Normalize both the model name and caller-
-    # provided entries so the comparison is case-insensitive in either direction.
-    # Checked before the ZeRO-3 / DTensor gathers below, which would otherwise materialise full
-    # embedding and lm_head copies on every rank only to return. The name is the same on every
-    # rank, so all ranks skip the collectives together.
+    # Case-insensitive; before the gathers below so every rank skips the collectives together.
     model_name = model.config._name_or_path
     ignored_tokenizer_names = {
         name.lower() for name in IGNORED_TOKENIZER_NAMES

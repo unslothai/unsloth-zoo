@@ -91,8 +91,7 @@ def _worker(rank, init_file, out):
                 model.embed_tokens.weight.full_tensor().detach().clone(),
                 model.lm_head.weight.full_tensor().detach().clone(),
             )
-        # A model on the ignore list returns untouched, so it must not all-gather the full embedding
-        # and lm_head onto every rank first (only to drop them again).
+        # An ignored model must return before any all-gather.
         from torch.distributed.tensor import DTensor
 
         gathers = []
