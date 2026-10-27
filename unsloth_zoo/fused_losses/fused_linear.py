@@ -709,19 +709,21 @@ if _HAS_TRITON:
         mt = tl.max(t, 0)
         ls = tl.sum(tl.exp(s - ms), 0)
         lt = tl.sum(tl.exp(t - mt), 0)
-        o = stat_ptr + (row.to(tl.int64) * NB + blk) * 4
+        o = stat_ptr + (row.to(tl.int64) * NB + blk) * 5
         tl.store(o, ms)
         tl.store(o + 1, ls)
         tl.store(o + 2, mt)
         tl.store(o + 3, lt)
+        tl.store(o + 4, (blk * BLOCK + tl.argmax(s, 0)).to(tl.float32))
 
     @triton.jit
-    def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, lse_ptr, c_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
+    def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, lse_ptr, c_ptr, j_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
                            beta, log1mb, logb, s_scale, s_cap, t_scale, t_cap, inv_t,
                            MODE: tl.constexpr, WRITE_DZ: tl.constexpr, S_SCALE: tl.constexpr,
                            S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr):
-        # MODE 0: beta = 0, partial loss and (WRITE_DZ) dz = p - q in one pass. MODE 1: beta = 1, partial
-        # sum p (ls - lt). MODE 2: interior, partial sum q (lt - m) and sum p (ls - m).
+        # MODE 0: beta = 0, partial loss without the student's top token j and (WRITE_DZ) dz = p - q in one pass.
+        # MODE 1: beta = 1, partial sum p (ls - lt). Both also sum p and q off j (_jsd_peak). MODE 2: interior,
+        # partial sum q (lt - m) and sum p (ls - m).
         row = tl.program_id(0)
         blk = tl.program_id(1)
         cols = blk * BLOCK + tl.arange(0, BLOCK)
@@ -732,9 +734,13 @@ if _HAS_TRITON:
         lt = t - tl.load(lse_ptr + row * 2 + 1)
         p = tl.exp(ls)
         q = tl.exp(lt)
-        o = part_ptr + (row.to(tl.int64) * NB + blk) * 2
+        o = part_ptr + (row.to(tl.int64) * NB + blk) * 4
+        off = ok & (cols != tl.load(j_ptr + row))
+        if MODE != 2:
+            tl.store(o + 2, tl.sum(tl.where(off, p, 0.0), 0))
+            tl.store(o + 3, tl.sum(tl.where(off, q, 0.0), 0))
         if MODE == 0:
-            tl.store(o, tl.sum(tl.where(ok, q * (lt - ls), 0.0), 0))
+            tl.store(o, tl.sum(tl.where(off, q * (lt - ls), 0.0), 0))
             if WRITE_DZ:
                 dz = (p - q) * (tl.load(coef_ptr) * inv_t) * ds
                 tl.store(dz_ptr + row.to(tl.int64) * dz_stride + cols, dz.to(dz_ptr.dtype.element_ty), mask = ok)
@@ -1909,7 +1915,7 @@ CALLS.setdefault("jsd", 0)
 
 
 # Generalized JSD between a trained student head and a frozen teacher head (TRL GKDTrainer.generalized_jsd_loss).
-_JSD_OP = "fused_linear_jsd_v2"
+_JSD_OP = "fused_linear_jsd_v3"
 # Live [rows, vocab] buffers per eager chunk in the statistic dtype; the chunk is sized to this budget.
 _JSD_BUFFERS = 4
 _JSD_CHUNK_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_JSD_CHUNK_MB", 1024) * 1024**2), 1)
@@ -1959,26 +1965,53 @@ def _jsd_apply(dzc, h, w, grad_h, acc_w, idx, a, b, n_keep, N, ratio, need_h, ne
         _dz_t_h(acc_w, dzc, h)
 
 
+def _jsd_peak(l_j, others):
+    """Log-prob of a row's top token from the mass of the others. When both heads are confident on it, x_j - lse
+    rounds to 0 in fp32 and KL(q || p) / KL(p || q) and the beta = 0 dz (p - q) all collapse to rounding noise
+    (negative KL, a lost gradient component); log1p(-others) keeps them. Rows whose top token holds under half the
+    mass keep l_j. The interior JSD needs neither: its two first-order peak terms cancel."""
+    return torch.where(others < 0.5, torch.log1p(-others), l_j)
+
+
 def _jsd_chunk(ls, lt, beta, want_grad):
     """Per-row generalized JSD of log-probs ls (student) / lt (teacher), and d loss / d student logits.
 
     Buffers ls / lt are consumed. Interior beta: m = log((1 - b) p + b q),
-    loss = b KL(q || M) + (1 - b) KL(p || M), dz = (1 - b) (g - p sum g) with g = p (ls - m)."""
+    loss = b KL(q || M) + (1 - b) KL(p || M), dz = (1 - b) (g - p sum g) with g = p (ls - m).
+    beta 0 / 1 take the student's top token j from the mass of the others (_jsd_peak); beta 0 has dz_j = q_o - p_o."""
     if beta == 0.0:
-        q = lt.exp()
+        j = ls.argmax(-1, keepdim = True)
+        ls_j, lt_j = ls.gather(1, j), lt.gather(1, j)
+        q = lt.exp().scatter_(1, j, 0.0)
+        q_o = q.sum(-1, keepdim = True)
         lt.sub_(ls).mul_(q)
-        row = lt.sum(-1)
+        p = ls.exp_().scatter_(1, j, 0.0)
+        p_o = p.sum(-1, keepdim = True)
+        ls_j, lt_j = _jsd_peak(ls_j, p_o), _jsd_peak(lt_j, q_o)
+        row = lt.sum(-1) + (lt_j.exp() * (lt_j - ls_j)).squeeze(-1)
         if not want_grad:
             return row, None
-        return row, ls.exp_().sub_(q)
+        return row, p.sub_(q).scatter_(1, j, q_o - p_o)
+    # beta 1 / interior: d (ls - lt, or ls - m) is shifted by its value c at j, so j's own term is exactly 0 and
+    # dz = p (d - c - sum p (d - c)) keeps the gradient a confident row's d - sum p d rounds away (the Triton form).
+    j = ls.argmax(-1, keepdim = True)
     if beta == 1.0:
+        ls_j, lt_j = ls.gather(1, j), lt.gather(1, j)
         p = ls.exp()
+        p_j = p.gather(1, j)
+        p_o = p.scatter_(1, j, 0.0).sum(-1, keepdim = True)
+        p.scatter_(1, j, p_j)
         ls.sub_(lt)
+        c = ls.gather(1, j)
+        ls.sub_(c)
+        q_o = lt.exp_().scatter_(1, j, 0.0).sum(-1, keepdim = True)
         g = torch.mul(p, ls, out = lt)
-        row = g.sum(-1)
+        rs = g.sum(-1, keepdim = True)
+        ls_j, lt_j = _jsd_peak(ls_j, p_o), _jsd_peak(lt_j, q_o)
+        row = (rs + (ls_j - lt_j)).squeeze(-1)
         if not want_grad:
             return row, None
-        p.mul_(row.unsqueeze(-1))
+        p.mul_(rs)
         return row, g.sub_(p)
     m = torch.add(ls, math.log1p(-beta))
     q = torch.add(lt, math.log(beta))
@@ -1987,13 +2020,16 @@ def _jsd_chunk(ls, lt, beta, want_grad):
     lt.sub_(m).mul_(q)
     row_t = lt.sum(-1)
     m.neg_().add_(ls)
+    # The interior loss keeps the computed c: its two first-order peak terms (in row_t and row_s) cancel.
+    c = m.gather(1, j)
+    m.sub_(c)
     p = torch.exp(ls, out = lt)
     g = torch.mul(p, m, out = q)
-    row_s = g.sum(-1)
-    row = beta * row_t + (1.0 - beta) * row_s
+    rs = g.sum(-1, keepdim = True)
+    row = beta * row_t + (1.0 - beta) * (rs + c).squeeze(-1)
     if not want_grad:
         return row, None
-    p.mul_(row_s.unsqueeze(-1))
+    p.mul_(rs)
     return row, g.sub_(p).mul_(1.0 - beta)
 
 
@@ -2013,21 +2049,32 @@ def _jsd_body(s, t, factor, beta: float, inv_t: float, s_scale: float, s_cap: fl
     ls = s - torch.logsumexp(s, dim = -1, keepdim = True)
     lt = t - torch.logsumexp(t, dim = -1, keepdim = True)
     p = torch.exp(ls)
-    if beta == 0.0:
+    # The student's top token j, as _jsd_chunk: its log-probs from the mass of the others, d shifted by d_j.
+    j = ls.argmax(-1, keepdim = True)
+    if beta == 0.0 or beta == 1.0:
+        top = torch.arange(ls.shape[-1], device = ls.device) == j
         q = torch.exp(lt)
-        row = (q * (lt - ls)).sum(-1)
-        dz = p - q
+        p_o = torch.where(top, 0.0, p).sum(-1, keepdim = True)
+        q_o = torch.where(top, 0.0, q).sum(-1, keepdim = True)
+        ls_j, lt_j = _jsd_peak(ls.gather(1, j), p_o), _jsd_peak(lt.gather(1, j), q_o)
+    if beta == 0.0:
+        row = torch.where(top, 0.0, q * (lt - ls)).sum(-1) + (lt_j.exp() * (lt_j - ls_j)).squeeze(-1)
+        dz = torch.where(top, q_o - p_o, p - q)
     elif beta == 1.0:
-        g = p * (ls - lt)
-        row = g.sum(-1)
-        dz = g - p * row.unsqueeze(-1)
+        d = ls - lt
+        g = p * (d - d.gather(1, j))
+        rs = g.sum(-1, keepdim = True)
+        row = (rs + (ls_j - lt_j)).squeeze(-1)
+        dz = g - p * rs
     else:
         m = torch.logaddexp(ls + math.log1p(-beta), lt + math.log(beta))
         row_t = (torch.exp(lt) * (lt - m)).sum(-1)
-        g = p * (ls - m)
-        row_s = g.sum(-1)
-        row = beta * row_t + (1.0 - beta) * row_s
-        dz = (1.0 - beta) * (g - p * row_s.unsqueeze(-1))
+        d = ls - m
+        c = d.gather(1, j)
+        g = p * (d - c)
+        rs = g.sum(-1, keepdim = True)
+        row = beta * row_t + (1.0 - beta) * (rs + c).squeeze(-1)
+        dz = (1.0 - beta) * (g - p * rs)
     if not want_grad:
         return row, None
     dz = dz * (factor * (inv_t * s_scale))
@@ -2054,37 +2101,48 @@ def _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap
     flags = dict(S_SCALE = s_scale != 1.0, S_CAP = s_cap != 0.0, T_SCALE = t_scale != 1.0, T_CAP = t_cap != 0.0,
                  BLOCK = _JSD_BLOCK, num_warps = 8, enable_fp_fusion = True)
     sc = (float(s_scale), float(s_cap) or 1.0, float(t_scale), float(t_cap) or 1.0, float(inv_t))
-    stats = torch.empty((R, NB, 4), device = s.device, dtype = torch.float32)
+    stats = torch.empty((R, NB, 5), device = s.device, dtype = torch.float32)
     grid = (R, NB)
     _fl_jsd_stats_kernel[grid](s, t, s.stride(0), V, stats, NB, *sc, **flags)
-    m = stats[..., 0::2]
-    sums = stats[..., 1::2]
+    m = stats[..., 0:4:2]
+    sums = stats[..., 1:4:2]
     top = m.amax(1, keepdim = True)
     lse = (top.squeeze(1) + torch.log((sums * torch.exp(m - top)).sum(1))).contiguous()  # [R, 2] student, teacher
     mode = 0 if beta == 0.0 else (1 if beta == 1.0 else 2)
     log1mb = math.log1p(-beta) if mode == 2 else 0.0
     logb = math.log(beta) if mode == 2 else 0.0
-    part = torch.empty((R, NB, 2), device = s.device, dtype = torch.float32)
+    part = torch.empty((R, NB, 4), device = s.device, dtype = torch.float32)
+    # j = the student's (first) top token, from the block maxima: no extra pass over s.
+    j = stats[..., 4].gather(1, m[..., 0].argmax(1, keepdim = True)).long()
+    s_j, ds_j = _torch_transform(s.gather(1, j).squeeze(1), s_scale, s_cap)
+    sj = s_j * inv_t - lse[:, 0]
+    tj = _torch_transform(t.gather(1, j).squeeze(1), t_scale, t_cap)[0] * inv_t - lse[:, 1]
     # c = d at the student's argmax. With p ~ 1 there, d - sum_k p_k d_k cancels to rounding noise in fp32 (the
     # softmax-collapse failure); written as (d - c) - sum_k p_k (d_k - c) the peak's own term drops out exactly.
     c = torch.zeros(R, device = s.device, dtype = torch.float32)
-    if mode != 0:
-        j = s.argmax(-1, keepdim = True)
-        sj = _torch_transform(s.gather(1, j).squeeze(1), s_scale, s_cap)[0] * inv_t - lse[:, 0]
-        tj = _torch_transform(t.gather(1, j).squeeze(1), t_scale, t_cap)[0] * inv_t - lse[:, 1]
-        if mode == 1:
-            c = sj - tj
-        else:
-            c = sj - torch.logaddexp(sj + log1mb, tj + logb)
+    if mode == 1:
+        c = sj - tj
+    elif mode == 2:
+        c = sj - torch.logaddexp(sj + log1mb, tj + logb)
     dz = torch.empty((R, V), device = s.device, dtype = grad_dtype) if want_grad else s.new_empty((1, 1))
     factor = factor.reshape(1).to(torch.float32)
-    _fl_jsd_row_kernel[grid](s, t, s.stride(0), V, lse, c, part, NB, dz, dz.stride(0), factor, float(beta), log1mb, logb,
-                             *sc, MODE = mode, WRITE_DZ = want_grad and mode == 0, **flags)
+    _fl_jsd_row_kernel[grid](s, t, s.stride(0), V, lse, c, j.reshape(-1).to(torch.int32), part, NB, dz, dz.stride(0),
+                             factor, float(beta), log1mb, logb, *sc, MODE = mode, WRITE_DZ = want_grad and mode == 0,
+                             **flags)
+    if mode != 2:
+        p_o, q_o = part[..., 2].sum(1), part[..., 3].sum(1)
+        ls_j, lt_j = _jsd_peak(sj, p_o), _jsd_peak(tj, q_o)
     if mode == 0:
-        row = part[..., 0].sum(1)
+        row = part[..., 0].sum(1) + lt_j.exp() * (lt_j - ls_j)
+        if want_grad:
+            # dz_j = p_j - q_j = q_o - p_o: the kernel's p - q there is rounding noise on a confident row.
+            dz_j = (q_o - p_o) * (factor * inv_t)
+            if s_scale != 1.0 or ds_j is not None:
+                dz_j = dz_j * (s_scale * (ds_j if ds_j is not None else 1.0))
+            dz.scatter_(1, j, dz_j.unsqueeze(1).to(dz.dtype))
     elif mode == 1:
         rs = part[..., 0].sum(1)
-        row = rs + c
+        row = rs + (ls_j - lt_j)
     else:
         row_t = part[..., 0].sum(1)
         rs = part[..., 1].sum(1)
