@@ -294,6 +294,26 @@ def test_confident_same_token_body_matches_exact(beta):
             assert ((dz[i].double() - gref).norm() / gref.norm()).item() < 1e-4, i
 
 
+@pytest.mark.parametrize("path", ["body", "chunk", "triton"])
+def test_diffuse_rows_keep_the_direct_beta0_gradient(path):
+    """The beta 0 top-token dz from the masses off it (q_o - p_o) is only for confident rows: on diffuse rows both
+    masses are near 1 and cancel, so p_j - q_j stays direct there."""
+    torch.manual_seed(123)
+    s = torch.randn(2, 150000)
+    t = s + 0.001 * torch.randn_like(s)
+    one = torch.tensor(1.0)
+    _, ref = fl._jsd_body(s.double(), t.double(), one.double(), 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float64)
+    if path == "body":
+        _, dz = fl._jsd_body(s, t, one, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    elif path == "chunk":
+        _, dz = fl._jsd_chunk(torch.log_softmax(s, -1), torch.log_softmax(t, -1), 0.0, True)
+    else:
+        if not torch.cuda.is_available() or not fl._use_triton(torch.device("cuda")):
+            pytest.skip("Triton on CUDA")
+        _, dz = fl._jsd_triton(s.cuda(), t.cuda(), one.cuda(), 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    assert (dz.cpu().double() - ref).norm() / ref.norm() < 5e-3
+
+
 def test_fully_masked_is_finite_zero():
     hs, ws, _, ht, wt, _, labels = _case(3)
     h = hs.clone().requires_grad_(True)

@@ -798,7 +798,8 @@ if _HAS_TRITON:
         if MODE == 0:
             tl.store(a + 3, 0.0)
             tl.store(a + 4, tl.exp(lt_j) * (lt_j - ls_j))
-            tl.store(a + 6, q_o - p_o)  # p_j - q_j
+            # p_j - q_j: from the masses off j only when both are confident (else they cancel near 1).
+            tl.store(a + 6, tl.where((p_o < 0.5) & (q_o < 0.5), q_o - p_o, tl.exp(sj) - tl.exp(tj)))
         elif MODE == 1:
             tl.store(a + 3, sj - tj)
             tl.store(a + 4, ls_j - lt_j)
@@ -2091,6 +2092,12 @@ def _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta):
                        torch.logaddexp(ls_j + math.log1p(-beta), lt_j + math.log(beta)))
 
 
+def _jsd_peak_dz(ls_j, lt_j, p_o, q_o):
+    """beta 0 dz of the top token, p_j - q_j: q_o - p_o when both heads are confident on it (p_j - q_j cancels), the
+    direct difference otherwise (q_o - p_o cancels when both masses off j are near 1)."""
+    return torch.where((p_o < 0.5) & (q_o < 0.5), q_o - p_o, ls_j.exp() - lt_j.exp())
+
+
 def _jsd_chunk(ls, lt, beta, want_grad):
     """Per-row generalized JSD of log-probs ls (student) / lt (teacher), and d loss / d student logits.
 
@@ -2105,11 +2112,12 @@ def _jsd_chunk(ls, lt, beta, want_grad):
         lt.sub_(ls).mul_(q)
         p = ls.exp_().scatter_(1, j, 0.0)
         p_o = p.sum(-1, keepdim = True)
+        dz_j = _jsd_peak_dz(ls_j, lt_j, p_o, q_o)
         ls_j, lt_j = _jsd_peak(ls_j, p_o), _jsd_peak(lt_j, q_o)
         row = lt.sum(-1) + (lt_j.exp() * (lt_j - ls_j)).squeeze(-1)
         if not want_grad:
             return row, None
-        return row, p.sub_(q).scatter_(1, j, q_o - p_o)
+        return row, p.sub_(q).scatter_(1, j, dz_j)
     # beta 1 / interior: d (ls - lt, or ls - m) is shifted by its value c at j, so j's own term is exactly 0 and
     # dz = p (d - c - sum p (d - c)) keeps the gradient a confident row's d - sum p d rounds away (the Triton form).
     j = ls.argmax(-1, keepdim = True)
@@ -2183,7 +2191,7 @@ def _jsd_body(s, t, factor, beta: float, inv_t: float, s_scale: float, s_cap: fl
     ls_j, lt_j = _jsd_peak(ls.gather(1, j), p_o), _jsd_peak(lt.gather(1, j), q_o)
     if beta == 0.0:
         row = torch.where(top, 0.0, q * (lt - ls)).sum(-1) + (lt_j.exp() * (lt_j - ls_j)).squeeze(-1)
-        dz = torch.where(top, q_o - p_o, p - q)
+        dz = torch.where(top & (p_o < 0.5) & (q_o < 0.5), q_o - p_o, p - q)
     elif beta == 1.0:
         d = ls - lt
         g = p * torch.where(top, 0.0, d - d.gather(1, j))
