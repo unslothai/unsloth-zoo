@@ -2780,7 +2780,6 @@ class MLXTrainer:
         if policy is None:
             tokenizer = None
             if self.preference_kind == "kto":
-                # The tokenizer the plan encodes with, whose special tokens KTO adds.
                 tokenizer = (
                     _get_processor_tokenizer(self._resolve_vlm_processor())
                     if self._is_vlm else self.tokenizer

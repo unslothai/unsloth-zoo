@@ -556,7 +556,7 @@ def hf_logits_warper(sampling, prompt_ids):
         if penalty != 1.0:
             vocab = logits.shape[-1]
             seen = mx.concatenate([context, tokens.astype(mx.int32)])
-            # An image placeholder outside the head (Mllama's, Phi-3 Vision's negatives) is no token: it lands on a dropped column.
+            # Placeholders outside the head land on a dropped column.
             seen = mx.where((seen >= 0) & (seen < vocab), seen, vocab)
             logits = mx.concatenate([logits, mx.zeros_like(logits[:, :1])], axis=-1)
             picked = logits[:, seen]
@@ -636,7 +636,7 @@ class _Generation:
     old: list | None
     ref: list | None
     generation_tokens: int
-    media: list | None = None  # each row's (prompt text, images) on a vision dataset
+    media: list | None = None  # (prompt text, images) per row
 
 
 class GRPOBatchPlan:
@@ -847,7 +847,7 @@ class GRPOBatchPlan:
         self._record_generation(lengths, truncated, rewards, reward_stats)
         if self._keep_completions:
             self.completions = {
-                # Phi-3 Vision's image placeholders are negative ids, which no tokenizer decodes.
+                # Phi-3 Vision's negative placeholder ids do not decode.
                 "prompt": [self._decode(i for i in self._prompt_ids[prompt] if i >= 0) for prompt in prompts],
                 "completion": texts,
                 "rewards": {

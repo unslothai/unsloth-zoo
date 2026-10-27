@@ -662,7 +662,7 @@ def _vision_inputs_layout(inputs):
         if isinstance(value, (list, tuple)):
             return "list"
         shape = tuple(getattr(value, "shape", ()))
-        if not shape:  # batch-wide metadata, such as an image token id: rows batch only when it agrees
+        if not shape:  # batch-wide metadata (an image token id): rows batch only when it agrees
             return (), value.item() if hasattr(value, "item") else value
         return shape, str(getattr(value, "dtype", type(value).__name__))
 
@@ -2999,7 +2999,6 @@ class _VLMBatchAdapter:
         # length keeps varied batches working, at the cost of smaller groups.
         ids = request.prompt_token_ids
         if ids is not None:
-            # Rows join only when their inputs concatenate as one processor call; processors batch lists by their own conventions.
             inputs = request.vision_inputs or {}
             alone = id(request) if any(isinstance(value, (list, tuple)) for value in inputs.values()) else None
             key = ("ids", _vision_inputs_layout(inputs), len(ids), alone)
