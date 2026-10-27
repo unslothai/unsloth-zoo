@@ -88,12 +88,12 @@ def _dequantized_targets(model):
 
 def _single_weight_key(op, Fp8Dequantize):
     """Key the stock single-tensor path reads: `weight$` up to 5.20, `weight` from 5.21."""
-    key = getattr(Fp8Dequantize, "_unsloth_single_weight_key", None)
+    key = Fp8Dequantize.__dict__.get("_unsloth_single_weight_key")
     if key is not None:
         return key
     key = "weight$"
     try:
-        probe = Fp8Dequantize.convert(op, {"weight$": [torch.zeros(1, 1)]}, full_layer_name = "probe.weight", model = None)
+        probe = Fp8Dequantize.convert(op, {"weight$": [torch.zeros(1, 1, device = "cpu")]}, full_layer_name = "probe.weight", model = None)
         # The chain path passes an unknown key through unchanged; the single-tensor path renames it.
         if list(probe) == ["weight$"]:
             key = "weight"
