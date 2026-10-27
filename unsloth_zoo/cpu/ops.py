@@ -412,11 +412,12 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
             divisor = float("nan")
     else:
         divisor = num_items_in_batch.item() if torch.is_tensor(num_items_in_batch) else num_items_in_batch
-    valid = shift_labels != ignore_index
-    if bool(valid.any()) and not bool(valid.all()):
-        # Ignored rows add no loss: skip their share of the LM head.
-        rows = valid.nonzero().squeeze(-1)
-        hidden, shift_labels = hidden.index_select(0, rows), shift_labels.index_select(0, rows)
+    # Skip ignored rows' LM head work. Eager only: the sync breaks compile; chunk loop zeroes them anyway.
+    if not torch.compiler.is_compiling():
+        valid = shift_labels != ignore_index
+        if bool(valid.any()) and not bool(valid.all()):
+            rows = valid.nonzero().squeeze(-1)
+            hidden, shift_labels = hidden.index_select(0, rows), shift_labels.index_select(0, rows)
     if chunk_rows is None:
         # ~64 MB of fp32 logits per chunk.
         chunk_rows = max(16, int(os.environ.get("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", 16 * 1024 * 1024)) // weight.shape[0])
