@@ -32,6 +32,7 @@ __all__ = [
 import functools
 import math
 import os
+import threading
 import warnings
 import torch
 from typing import Optional
@@ -1493,21 +1494,50 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
         (lpt if exact_lpt else logps.clone(),)
 
 
+_FULL_REDUCTION_LOCK = threading.Lock()
+_FULL_REDUCTION_USERS = {}  # flag name -> [calls inside, value saved by the first]
+
+
+class _full_precision_reduction:
+    """cuBLAS split-K reductions in fp32 for half GEMMs inside the block. The switch is process-wide (cuBLAS reads it
+    per call), so it is reference counted: the first caller saves the setting, the last restores it, and concurrent
+    callers (threads sharing the backward) all run with it off; a save / restore per call let one call restore over
+    another's and leave it off for good (or run a call with it on)."""
+
+    def __init__(self, dtype):
+        self.name = "allow_bf16_reduced_precision_reduction" if dtype == torch.bfloat16 else \
+            "allow_fp16_reduced_precision_reduction"
+
+    def __enter__(self):
+        flags = torch.backends.cuda.matmul
+        with _FULL_REDUCTION_LOCK:
+            users = _FULL_REDUCTION_USERS.setdefault(self.name, [0, None])
+            if users[0] == 0:
+                users[1] = getattr(flags, self.name)
+                setattr(flags, self.name, False)
+            users[0] += 1
+        return self
+
+    def __exit__(self, *exc):
+        with _FULL_REDUCTION_LOCK:
+            users = _FULL_REDUCTION_USERS[self.name]
+            users[0] -= 1
+            if users[0] == 0:
+                setattr(torch.backends.cuda.matmul, self.name, users[1])
+        return False
+
+
 def _mm_into(out, a, b):
-    """out = a @ b accumulated in fp32 and rounded once to out's dtype (no reduced-precision split-K reduction)."""
+    """out = a @ b accumulated in fp32 and rounded once to out's dtype (no reduced-precision split-K reduction).
+
+    No fp32 [rows, H] result: on a wide tile (up to the whole vocabulary) that buffer and its copy would cost more
+    traffic than the GEMM's own output."""
     if out.dtype == torch.float32:
         _mm_fp32(a, b, out = out)
         return
     if a.is_cuda and a.dtype == out.dtype == b.dtype and a.dtype in _HALF:
-        flags = torch.backends.cuda.matmul
-        name = "allow_bf16_reduced_precision_reduction" if a.dtype == torch.bfloat16 else \
-            "allow_fp16_reduced_precision_reduction"
-        old = getattr(flags, name)
-        setattr(flags, name, False)
-        try:
+        with _full_precision_reduction(a.dtype):
             torch.mm(a, b, out = out)
-        finally:
-            setattr(flags, name, old)
         return
     out.copy_(_mm_fp32(a, b))
 
