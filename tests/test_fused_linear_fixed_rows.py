@@ -62,8 +62,7 @@ def test_fixed_rows_equal_compaction(dtype, head, ent, lazy, monkeypatch):
     case = _case(0, dtype)
     ref = _run(False, monkeypatch, *case, head, ent, lazy)
     got = _run(True, monkeypatch, *case, head, ent, lazy)
-    # bf16 bit for bit; fp32 to summation order (GEMMs / head-gradient sums over all rows instead of the kept ones
-    # block, so round, differently).
+    # bf16 bit for bit; fp32 only to summation order (sums over all rows, not the kept ones).
     tol = dict(rtol = 0, atol = 0) if dtype != torch.float32 else dict(rtol = 1e-5, atol = 1e-7)
     for r, x in zip(ref, got):
         assert torch.isfinite(x.float()).all()
@@ -77,8 +76,7 @@ def test_fixed_rows_equal_compaction(dtype, head, ent, lazy, monkeypatch):
 
 @pytest.mark.parametrize("head", [False, True])
 def test_fixed_rows_dropped_row_keeps_its_normalizer(head, monkeypatch):
-    # A dropped row still computes exp(z - lse) in the backward (times a zero gradient): its saved lse must stay its
-    # real one, or a large bias / low temperature turns that into 0 * inf.
+    # Dropped rows still compute exp(z - lse) in the backward: a non-real saved lse gives 0 * inf.
     h, w = torch.randn(2, 4), torch.randn(4, 4)
     b, t, mask = torch.tensor([0.0, 10.0, 0.0, 0.0]), torch.tensor([1, 2]), torch.tensor([True, False])
     def run(fixed):
@@ -145,7 +143,7 @@ def test_fixed_rows_never_sync_the_host(monkeypatch):
     h0, w0, _, t, m = _case(4, dtype, "cuda")
     h = h0.clone().requires_grad_()
     w = w0.clone().requires_grad_()
-    for _ in range(2):  # warm (Triton JIT, cached device queries) before checking
+    for _ in range(2):  # warm up before checking
         lp, e = fl.fused_linear_logprobs(h, w, t, mask = m, return_entropy = True)
         torch.autograd.grad(lp.sum() + e.sum(), [h, w])
     torch.cuda.synchronize()
