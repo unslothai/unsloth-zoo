@@ -2776,6 +2776,36 @@ pass
 RL_REPLACEMENTS["grpo_fused_policy_loss"] = grpo_fused_policy_loss
 
 
+def grpo_nonzero_static(mask, count):
+    """mask.nonzero() when the True count is already known on the host: same [count, mask.dim()] rows in the
+    same order, without the device-to-host read nonzero needs to size its output."""
+    nonzero_static = getattr(torch, "nonzero_static", None)
+    if nonzero_static is not None:
+        try:
+            return nonzero_static(mask, size = int(count))
+        except (RuntimeError, NotImplementedError):
+            pass
+    return mask.nonzero(as_tuple = False)
+pass
+
+
+def grpo_host_lengths_to_device(lengths, device):
+    """int32 packed_seq_lengths built from host ints via one pinned non_blocking copy (a pageable
+    torch.tensor(..., device = cuda) blocks the host). The ints ride along as `_unsloth_lengths_tuple`, so
+    Unsloth's packing helpers need not read them back."""
+    host = torch.tensor(lengths, dtype = torch.int32)
+    if torch.device(device).type == "cpu":
+        out = host
+    else:
+        try:
+            out = host.pin_memory().to(device, non_blocking = True)
+        except RuntimeError:
+            out = host.to(device)
+    out._unsloth_lengths_tuple = tuple(int(n) for n in lengths)
+    return out
+pass
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -3392,13 +3422,31 @@ def grpo_accumulated_loss(
         if (_pack_enabled and not _pg_skip_pack and pixel_values is None
                 and token_type_ids is None and mm_token_type_ids is None and _pack_ok is not False):
             try:
+                # Bound here: this body is copied into the generated trainer without this module's names.
+                from unsloth_zoo.rl_replacements import grpo_nonzero_static, grpo_host_lengths_to_device
                 _pack_pad_id = trainer.processing_class.pad_token_id
                 _pack_keep = input_ids != _pack_pad_id
                 _pack_lengths = _pack_keep.sum(dim = 1)
-                _pack_lengths_cpu = _pack_lengths.tolist()                 # single GPU->CPU sync, reused below
+                _pack_L = input_ids.shape[1]
+                _pack_csum = _pack_keep.cumsum(dim = 1)
+                # completion start is per-row after left-packing: (L - logits_to_keep) minus that
+                # row's left-pad (matches create_completion_attention_mask exactly)
+                _pack_cstart = (_pack_L - logits_to_keep) - left_pad_tokens_per_prompt  # [rows]
+                # Loss targets: real tokens past their row's first real token, in the completion. The count
+                # sizes the index below without a boolean-mask sync.
+                _pack_ctgt_2d = (_pack_keep & (_pack_csum > 1)) & (
+                    torch.arange(_pack_L, device = input_ids.device) >= _pack_cstart.to(input_ids.device).unsqueeze(1)
+                )
+                # single GPU->CPU sync: row lengths, active completion rows and the target count, reused below
+                _pack_meta_cpu = torch.cat([
+                    _pack_lengths.to(torch.long),
+                    (completion_mask.sum(dim = 1) > 0).sum().to(device = _pack_lengths.device, dtype = torch.long).reshape(1),
+                    _pack_ctgt_2d.sum().to(torch.long).reshape(1),
+                ]).tolist()
+                _pack_lengths_cpu = _pack_meta_cpu[:-2]
+                _pack_active_cpu, _pack_ntgt = _pack_meta_cpu[-2], _pack_meta_cpu[-1]
                 _pack_nz_cpu = [_n for _n in _pack_lengths_cpu if _n > 0]
                 _pack_T = sum(_pack_nz_cpu)
-                _pack_L = input_ids.shape[1]
                 _pack_W = logits_to_keep + max_left_pad
                 _pack_maxseg = max(_pack_nz_cpu) if _pack_nz_cpu else 0
                 # sliding-window models lose the per-sequence local window in a packed stream
@@ -3409,20 +3457,19 @@ def grpo_accumulated_loss(
                 # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
                 _pack_capped = _pack_unsafe is not None and _pack_T >= _pack_unsafe
                 if not _pack_capped:
-                    _pack_flat_ids = input_ids[_pack_keep].unsqueeze(0)
-                    _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
+                    # Sizes are known on the host, so no boolean-mask / nonzero sync: same rows, same order.
+                    _pack_nz_idx = grpo_nonzero_static(_pack_keep, _pack_T)     # [T, 2] = (row, col)
+                    _pack_flat_ids = input_ids[_pack_nz_idx[:, 0], _pack_nz_idx[:, 1]].unsqueeze(0)
+                    _pack_active = _pack_active_cpu
                 if (not _pack_capped) and _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok \
                         and (_pack_ok is True or _pack_active >= 2):
-                    _pack_psl = torch.tensor(_pack_nz_cpu, dtype = torch.int32, device = input_ids.device)
+                    _pack_psl = grpo_host_lengths_to_device(_pack_nz_cpu, input_ids.device)
                     # reset 0-based position_ids per segment
-                    _pack_pos = (_pack_keep.cumsum(dim = 1) - 1)[_pack_keep].unsqueeze(0)
+                    _pack_pos = (_pack_csum - 1)[_pack_nz_idx[:, 0], _pack_nz_idx[:, 1]].unsqueeze(0)
                     _pack_chunks = max(1, total_rows * multiplier)
-                    _pack_nz_idx = _pack_keep.nonzero(as_tuple = False)            # [T, 2] = (row, col)
                     _pack_within = _pack_nz_idx[1:, 0] == _pack_nz_idx[:-1, 0]     # [T-1]
-                    # completion start is per-row after left-packing: (L - logits_to_keep) minus that
-                    # row's left-pad (matches create_completion_attention_mask exactly)
-                    _pack_cstart = (_pack_L - logits_to_keep) - left_pad_tokens_per_prompt  # [rows]
                     _pack_ctgt = (_pack_nz_idx[1:, 1] >= _pack_cstart[_pack_nz_idx[1:, 0]]) & _pack_within
+                    _pack_ctgt_idx = grpo_nonzero_static(_pack_ctgt, _pack_ntgt).squeeze(1)
                     _pack_in_packed = True
                     _pack_defer = (
                         _fused_route and _pg_layout is None and _pack_ok is True
@@ -3443,8 +3490,8 @@ def grpo_accumulated_loss(
                         # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
                         # otherwise it is real [T, vocab] logits and the lm_head matmul
                         # dies. Dispatch on width, as the padded path already does.
-                        _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0)
-                        _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0)
+                        _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt_idx].unsqueeze(0)
+                        _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt_idx].unsqueeze(0)
                         if _pack_h.shape[-1] == lm_head.shape[1]:
                             _fp32_bind(_need_entropy)
                             if _pack_defer:
@@ -3472,7 +3519,7 @@ def grpo_accumulated_loss(
                     # GPT-OSS offload race guard (matches the padded loop)
                     device_synchronize()
                     # scatter each completion logprob back to its (row, col) so [:, -_pack_W:] matches padded
-                    _pack_tgt = (_pack_nz_idx[1:, 0] * _pack_L + _pack_nz_idx[1:, 1])[_pack_ctgt]
+                    _pack_tgt = (_pack_nz_idx[1:, 0] * _pack_L + _pack_nz_idx[1:, 1])[_pack_ctgt_idx]
                     if _fused_pack is not None:
                         _fused_pack = _fused_pack + (_fused_slots(_pack_tgt // _pack_L, _pack_tgt % _pack_L, _pack_L),)
                     _pack_result = torch.zeros(
@@ -3716,6 +3763,7 @@ def grpo_accumulated_loss(
             if _pack_T is not None:
                 _pack_keep = _pack_lengths = _pack_flat_ids = _pack_pos = _pack_psl = None
                 _pack_nz_idx = _pack_within = _pack_cstart = _pack_ctgt = _pack_tgt = None
+                _pack_csum = _pack_ctgt_2d = _pack_ctgt_idx = None
                 _pack_h = _pack_tid = _pack_ref = _pack_cm = None
 
         def to_device(tensor, device, non_blocking=True):
