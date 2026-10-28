@@ -424,3 +424,62 @@ def test_concurrent_releases_keep_the_cap_bookkeeping_consistent(gc_module, monk
         sys.setswitchinterval(old)
     assert errors == 0
     assert leaked == 0
+
+
+# torch 2.13+ counted path, against test_gc_pinned_counted's model of torch's CachingHostAllocator.
+from test_gc_pinned_counted import allocator, pin, unpin  # noqa: E402,F401
+
+
+@pytest.fixture
+def counted(monkeypatch, gc_module, allocator):
+    monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_RELEASED", 0, raising = False)
+    monkeypatch.setattr(gc_module, "_WARNED_ABOUT_PINNED_CAP", True, raising = False)
+    return allocator
+
+
+def test_freed_baseline_pin_cannot_hide_our_cached_blocks(gc_module, counted):
+    # A 6 MiB foreign pin sets the baseline, one of our two 4 MiB blocks is released (cached), then the
+    # foreign block goes back to the OS: held is 8 MiB, all ours. A 5 MiB block must not pin to 13 MiB.
+    fake = counted("pinned_max_cached_size_mb:4", cap_bytes = 10 * MIB)
+    foreign = fake.allocate(6 * MIB)
+    a = pin(gc_module, fake, 3 * MIB)
+    b = pin(gc_module, fake, 3 * MIB)
+    assert a and b and fake.held() == 14 * MIB
+    unpin(gc_module, fake, 3 * MIB, b)
+    fake.release(foreign)                        # above the cached max: returned to the OS
+    assert fake.held() == 8 * MIB
+    pin(gc_module, fake, 5 * MIB)
+    assert fake.held() <= 10 * MIB
+
+
+def test_concurrent_reservations_cannot_spend_the_same_headroom(monkeypatch, gc_module, counted):
+    # Cap 11 MiB, 3 MiB of ours live, 5 MiB pinned by another user since the baseline. A reserves 2 MiB and
+    # stalls before torch pins it; B's 3 MiB must not pass the cap check on the stale count (13 MiB).
+    import threading
+    fake = counted("pinned_max_round_threshold_mb:1", cap_bytes = 11 * MIB)
+    live = gc_module._new_host_buffer(3 * MIB, torch.uint8)
+    fake.allocate(5 * MIB)
+    assert fake.held() == 8 * MIB
+    real_empty = torch.empty                    # the model's pinned allocation
+    inside, go = threading.Event(), threading.Event()
+
+    def stalled_empty(*args, pin_memory = False, **kwargs):
+        if pin_memory and threading.current_thread().name == "A":
+            inside.set()
+            go.wait(10)
+        return real_empty(*args, pin_memory = pin_memory, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", stalled_empty)
+    out = {}
+    a = threading.Thread(target = lambda: out.update(a = gc_module._new_host_buffer(2 * MIB, torch.uint8)), name = "A")
+    b = threading.Thread(target = lambda: out.update(b = gc_module._new_host_buffer(3 * MIB, torch.uint8)), name = "B")
+    a.start()
+    assert inside.wait(10)
+    b.start()
+    b.join(1)                                    # unfixed: B passes the check and pins while A stalls
+    go.set()
+    a.join(10)
+    b.join(10)
+    assert "a" in out and "b" in out and live is not None
+    assert fake.peak <= 11 * MIB

@@ -140,15 +140,16 @@ def _mark_host_buffer(buffer):
 
 def _new_host_buffer(numel, dtype):
     nbytes = numel * dtype.itemsize
-    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled() and _reserve_pinned(nbytes)):
-        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
-    try:
-        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True))
-    except RuntimeError as e:
-        _release_pinned(nbytes)
-        if not _is_host_alloc_oom(e): raise
-        _warn_pinned_unavailable(e)
-        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
+    if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled():
+        with _PINNED_LOCK:  # reserve and pin as one step: the next reservation sees this block held
+            if _reserve_pinned(nbytes):
+                try:
+                    return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True))
+                except RuntimeError as e:
+                    _release_pinned(nbytes)
+                    if not _is_host_alloc_oom(e): raise
+                    _warn_pinned_unavailable(e)
+    return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
 
 
 def _grow_host_buffer(buffer, new_size):
@@ -166,30 +167,31 @@ def _grow_host_buffer(buffer, new_size):
         # pinned again once RAM allows, instead of staying pageable after one low-RAM moment.
         return _new_host_buffer(new_size, buffer.dtype)
     # resize_ takes a new pinned block and hands the old one back to the host cache.
-    if pinned and not _reserve_pinned(new_bytes):
-        _release_pinned(old_bytes)
-        replacement = _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
-        if GC_PINNED_CAP == _PIN_PER_BLOCK:
-            # Host RAM is short and the flush inside _reserve_pinned ran while this slot still held
-            # its old block. The caller replaces the slot (its contents are rewritten before every
-            # read), so free the old block now instead of leaving it cached beside the pageable copy.
-            try:
-                buffer.resize_(0)
-                buffer.untyped_storage().resize_(0)  # Tensor.resize_ alone never shrinks a storage
-            except Exception: pass
-            else: _empty_host_cache()
-        return replacement
-    try:
-        buffer.resize_(new_size)
-        if pinned: _release_pinned(old_bytes)
-        return _mark_host_buffer(buffer)
-    except RuntimeError as e:
-        if pinned: _release_pinned(new_bytes)
-        if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
-        _release_pinned(old_bytes)
-        _warn_pinned_unavailable(e)
-        # Pinning is gone for this slot, so the cached flag has to flip with it.
-        return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+    with _PINNED_LOCK:  # reserve and pin as one step: the next reservation sees this block held
+        if pinned and not _reserve_pinned(new_bytes):
+            _release_pinned(old_bytes)
+            replacement = _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+            if GC_PINNED_CAP == _PIN_PER_BLOCK:
+                # Host RAM is short and the flush inside _reserve_pinned ran while this slot still held
+                # its old block. The caller replaces the slot (its contents are rewritten before every
+                # read), so free the old block now instead of leaving it cached beside the pageable copy.
+                try:
+                    buffer.resize_(0)
+                    buffer.untyped_storage().resize_(0)  # Tensor.resize_ alone never shrinks a storage
+                except Exception: pass
+                else: _empty_host_cache()
+            return replacement
+        try:
+            buffer.resize_(new_size)
+            if pinned: _release_pinned(old_bytes)
+            return _mark_host_buffer(buffer)
+        except RuntimeError as e:
+            if pinned: _release_pinned(new_bytes)
+            if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
+            _release_pinned(old_bytes)
+            _warn_pinned_unavailable(e)
+            # Pinning is gone for this slot, so the cached flag has to flip with it.
+            return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
 
 
 # Pinned pages cannot be swapped and every local rank pins its own pool (Arctic ALST), so
@@ -210,7 +212,7 @@ _WARNED_ABOUT_PINNED_CAP = False
 _PINNED_CACHED = {}         # rounded block bytes -> count released but still cached
 _PINNED_LIVE = {}           # requested bytes -> blocks charged at allocation, still live
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
-_PINNED_RELEASED = 0        # settings mode: blocks released since the last flush (may wait on events)
+_PINNED_RELEASED = 0        # settings mode: bytes released since the last flush (may be cached or wait on events)
 
 
 # torch 2.13+ host allocator settings (c10/core/AllocatorConfig.h): above pinned_max_round_threshold_mb
@@ -504,9 +506,12 @@ def _reserve_pinned_counted(nbytes, block):
 
 
 def _counted_used(held):
-    # Our live blocks are a floor: a pinned user present when the baseline was taken may since have
-    # returned its blocks to the OS (our own cap flush empties the host cache), which lowers held - baseline.
-    return max(held - _HOST_HELD_BASELINE, GC_PINNED_BYTES)
+    # Our live and released (maybe still cached) blocks are a floor: a pinned user present when the baseline
+    # was taken may since have returned its blocks to the OS, which lowers held - baseline. Released bytes
+    # past what the allocator holds beyond our live blocks are gone, so drop those for good.
+    global _PINNED_RELEASED
+    _PINNED_RELEASED = min(_PINNED_RELEASED, max(0, held - GC_PINNED_BYTES))
+    return max(held - _HOST_HELD_BASELINE, GC_PINNED_BYTES + _PINNED_RELEASED)
 
 
 def _counted_slow_path_fits(block):
@@ -557,9 +562,9 @@ def _release_pinned_unlocked(nbytes):
         block = _pinned_block_bytes(nbytes)
     if not block: return
     if block < 0:
-        # Reserved against the allocator's count: remember only that a block may wait on its events.
+        # Reserved against the allocator's count: it may stay cached or wait on its events.
         GC_PINNED_BYTES = max(0, GC_PINNED_BYTES + block)
-        _PINNED_RELEASED += 1
+        _PINNED_RELEASED -= block
         return
     if _pinned_block_cached(block):
         _PINNED_CACHED[block] = _PINNED_CACHED.get(block, 0) + 1
@@ -570,6 +575,7 @@ def _release_pinned_unlocked(nbytes):
 
 # Releases can run on autograd worker threads (split-model backward) while the main thread reserves, and the
 # cap bookkeeping is a read-modify-write over several globals: serialise both (re-entrant for flushes).
+# Allocation sites also hold it through the pinned allocation, so the next counted reservation sees it held.
 _PINNED_LOCK = threading.RLock()
 
 
@@ -2020,51 +2026,55 @@ class NonReentrantActivationOffloader:
 
     def _to_host(self, record, x):
         nbytes = x.numel() * x.element_size()
-        if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled() and _reserve_pinned(nbytes):
-            device_index = x.device.index
-            if self.max_inflight == 0:
-                try:
-                    host = x.to("cpu", non_blocking = True)
-                except RuntimeError as e:
-                    _release_pinned(nbytes)
-                    if not _is_host_alloc_oom(e): raise
-                    _warn_pinned_unavailable(e)
-                else:
-                    record.host, record.pinned_bytes = host, nbytes
-                    self.stats["pinned"] += 1
-                    return
-                record.host = x.to("cpu")
-                self.stats["pageable"] += 1
-                return
-            inflight = self.inflight.get(device_index)
-            if inflight is None:
-                inflight = self.inflight[device_index] = collections.deque()
-            compute = torch.cuda.current_stream(device_index)
-            self._retire(inflight, compute, self.max_inflight - 1)
-            side = self._stream(self.d2h_streams, device_index)
-            side.wait_stream(compute)
+        if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled():
+            with _PINNED_LOCK:  # reserve and pin as one step: the next reservation sees this block held
+                if _reserve_pinned(nbytes) and self._to_pinned(record, x, nbytes): return
+        record.host = x.to("cpu")
+        self.stats["pageable"] += 1
+    pass
+
+    def _to_pinned(self, record, x, nbytes):
+        """Non_blocking D2H into a pinned block already reserved; False (released) if pinning failed."""
+        device_index = x.device.index
+        if self.max_inflight == 0:
             try:
-                with torch.cuda.stream(side):
-                    # A non_blocking D2H allocates its destination pinned.
-                    host = x.to("cpu", non_blocking = True)
-                    copied = torch.cuda.Event()
-                    copied.record(side)
+                host = x.to("cpu", non_blocking = True)
             except RuntimeError as e:
                 _release_pinned(nbytes)
                 if not _is_host_alloc_oom(e): raise
                 _warn_pinned_unavailable(e)
-            else:
-                # Keepalive: x's block must outlive the copy, and is released after `compute` waits on
-                # it. Allocated on another stream, that stream must also wait: record_stream is a
-                # no-op on the allocation stream, so the usual case pays nothing.
-                x.record_stream(compute)
-                entry = [x, copied, compute]
-                inflight.append(entry)
-                record.host, record.copied, record.pinned_bytes, record.keepalive = host, copied, nbytes, entry
-                self.stats["pinned"] += 1
-                return
-        record.host = x.to("cpu")
-        self.stats["pageable"] += 1
+                return False
+            record.host, record.pinned_bytes = host, nbytes
+            self.stats["pinned"] += 1
+            return True
+        inflight = self.inflight.get(device_index)
+        if inflight is None:
+            inflight = self.inflight[device_index] = collections.deque()
+        compute = torch.cuda.current_stream(device_index)
+        self._retire(inflight, compute, self.max_inflight - 1)
+        side = self._stream(self.d2h_streams, device_index)
+        side.wait_stream(compute)
+        try:
+            with torch.cuda.stream(side):
+                # A non_blocking D2H allocates its destination pinned.
+                host = x.to("cpu", non_blocking = True)
+                copied = torch.cuda.Event()
+                copied.record(side)
+        except RuntimeError as e:
+            _release_pinned(nbytes)
+            if not _is_host_alloc_oom(e): raise
+            _warn_pinned_unavailable(e)
+            return False
+        else:
+            # Keepalive: x's block must outlive the copy, and is released after `compute` waits on
+            # it. Allocated on another stream, that stream must also wait: record_stream is a
+            # no-op on the allocation stream, so the usual case pays nothing.
+            x.record_stream(compute)
+            entry = [x, copied, compute]
+            inflight.append(entry)
+            record.host, record.copied, record.pinned_bytes, record.keepalive = host, copied, nbytes, entry
+            self.stats["pinned"] += 1
+            return True
     pass
 
     @staticmethod
