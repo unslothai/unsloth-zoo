@@ -2644,17 +2644,36 @@ except:
 
 
 _TRL_COLLATOR_APPLIES_MASKS = None
-def trl_collator_applies_masks():
-    # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
+def _trl_collator_mask_probe():
     global _TRL_COLLATOR_APPLIES_MASKS
     if _TRL_COLLATOR_APPLIES_MASKS is None:
         try:
             from trl.trainer.sft_trainer import DataCollatorForLanguageModeling as _TRLCollator
-            labels = _TRLCollator(pad_token_id = 0)([{"input_ids": [1, 2], "assistant_masks": [0, 1]}])["labels"]
-            _TRL_COLLATOR_APPLIES_MASKS = bool(labels[0, 0] == -100)
+            collator = _TRLCollator(pad_token_id = 0)
+            def masked(**row):
+                return bool(collator([{"input_ids": [1, 2], **row}])["labels"][0, 0] == -100)
+            _TRL_COLLATOR_APPLIES_MASKS = (
+                masked(assistant_masks = [0, 1]),
+                masked(completion_mask = [0, 1]) and not masked(labels = [-100, 2]),
+            )
         except Exception:
-            _TRL_COLLATOR_APPLIES_MASKS = True
+            _TRL_COLLATOR_APPLIES_MASKS = (True, False)
     return _TRL_COLLATOR_APPLIES_MASKS
+pass
+
+
+def trl_collator_applies_masks():
+    # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
+    return _trl_collator_mask_probe()[0]
+pass
+
+
+def trl_collator_ignores_labels(collator = None):
+    # TRL 0.18: its collator applies completion_mask, never "labels"; other collators read only "labels".
+    if not _trl_collator_mask_probe()[1]:
+        return False
+    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling as _TRLCollator
+    return collator is None or isinstance(collator, _TRLCollator)
 pass
 
 # Faster SFTTrainer prepare_dataset
@@ -3029,7 +3048,7 @@ def sft_prepare_dataset(
     pass
 
     # Imported here: this function's source is copied into the compiled trainer module.
-    from unsloth_zoo.dataset_utils import trl_collator_applies_masks
+    from unsloth_zoo.dataset_utils import trl_collator_applies_masks, trl_collator_ignores_labels
     column_names = set(next(iter(dataset)).keys())
     if "labels" not in column_names and not trl_collator_applies_masks():
         completion_only_loss = getattr(self, "completion_only_loss", None)
@@ -3048,8 +3067,22 @@ def sft_prepare_dataset(
             if isinstance(dataset, Dataset):
                 label_kwargs["num_proc"] = map_kwargs.get("num_proc", None)
                 label_kwargs["desc"] = f"Unsloth: Building labels for {dataset_name} dataset"
-            dataset = dataset.map(_build_labels, remove_columns = mask_columns, **label_kwargs)
-            used_column_names = [x for x in used_column_names if x not in mask_columns] + ["labels"]
+            keep_masks = trl_collator_ignores_labels()
+            collator = getattr(self, "data_collator", None)
+            if keep_masks and collator is None:
+                # TRL 0.18 stores its collator only in super().__init__; read __init__'s (dict eval comprehensions add a frame).
+                import sys as _sys
+                frame = _sys._getframe(1)
+                while frame is not None and not (frame.f_locals.get("self") is self and "data_collator" in frame.f_locals):
+                    frame = frame.f_back
+                if frame is not None:
+                    collator = frame.f_locals.get("data_collator")
+                del frame
+            keep_masks = keep_masks and trl_collator_ignores_labels(collator)
+            dataset = dataset.map(_build_labels, remove_columns = [] if keep_masks else mask_columns, **label_kwargs)
+            if not keep_masks:
+                used_column_names = [x for x in used_column_names if x not in mask_columns]
+            used_column_names = used_column_names + ["labels"]
     pass
     if packing:
         # Use TRL's pack_dataset if available
