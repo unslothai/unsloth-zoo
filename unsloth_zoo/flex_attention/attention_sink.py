@@ -303,6 +303,13 @@ def flex_attention_with_sink_inference(self_attn, query, key, value, block_mask,
         block_mask = block_mask._adjust(q_len, key.shape[-2])
     # Longer queries can have no valid flex_decoding config (#2100), so they force the main kernel.
     kwargs = {"kernel_options": {} if query.shape[-2] == 1 else PREFILL_KERNEL_OPTIONS}
+    if query.shape[-2] == 1:
+        # Inductor only picks flex_decoding for a static batch. Generating at a second batch size
+        # makes Dynamo's batch dim dynamic, and the main kernel then pads every 1-row query to
+        # BLOCK_M (3x slower decode on T4). One recompile per batch size, never per step.
+        # Marked here, eager or traced, since the compiled flex_attention is what specializes.
+        for x in (query, key, value):
+            torch._dynamo.mark_static(x, 0)
     attn_output, logsumexp = flex_output_and_lse(flex_attention(
         query,
         key,
