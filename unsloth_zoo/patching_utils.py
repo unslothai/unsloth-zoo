@@ -187,7 +187,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     import os, logging
     patch_dynamo_cleanup_hook_shutdown()
     # config.memory_planning = True below: keep CI runs from failing on Inductor's own pool op.
-    from .temporary_patches.common import allow_inductor_pool_aliasing
+    from unsloth_zoo.temporary_patches.common import allow_inductor_pool_aliasing
     allow_inductor_pool_aliasing()
 
     if debug:
