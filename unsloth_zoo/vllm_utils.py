@@ -58,6 +58,7 @@ import weakref
 import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
+from ._gc_passes import collect_garbage
 from .empty_model import *
 from .empty_model import (
     FP8_MOE_SHARED_BLOCK,
@@ -1172,10 +1173,7 @@ def patch_vllm_graph_capture():
                 "Unsloth: Patched vLLM v1 graph capture finished in %.0f secs.",
                 end_time - start_time
             )
-            for _ in range(2):
-                collected = gc.collect()
-                _device_empty_cache()
-                if collected == 0 and not gc.callbacks: break
+            collect_garbage(passes = 2, after = _device_empty_cache)
             return result
         pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
@@ -1202,10 +1200,7 @@ def patch_vllm_graph_capture():
                     "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
                     end_time - start_time
                 )
-                for _ in range(2):
-                    collected = gc.collect()
-                    _device_empty_cache()
-                    if collected == 0 and not gc.callbacks: break
+                collect_garbage(passes = 2, after = _device_empty_cache)
                 return result
             pass
             GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
@@ -2489,10 +2484,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     new_model.eval()
 
     # Cleanup
-    for _ in range(3):
-        collected = gc.collect()
-        _device_empty_cache()
-        if collected == 0 and not gc.callbacks: break
+    collect_garbage(after = _device_empty_cache)
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
@@ -4519,10 +4511,7 @@ def _release_failed_vllm_engine(snapshot):
                 if _is_vllm_registry_entry(registry[key]): registry.pop(key, None)
             except Exception:
                 pass
-    for _ in range(3):
-        collected = gc.collect()
-        _device_empty_cache()
-        if collected == 0 and not gc.callbacks: break
+    collect_garbage(after = _device_empty_cache)
 pass
 
 
@@ -5621,10 +5610,7 @@ def load_vllm(
     #     llm.sleep(os.environ.get('VLLM_SLEEP_MODE', "1"))
 
     # Cleanup
-    for _ in range(3):
-        collected = gc.collect()
-        _device_empty_cache()
-        if collected == 0 and not gc.callbacks: break
+    collect_garbage(after = _device_empty_cache)
     return llm
 pass
 
@@ -8047,10 +8033,7 @@ def _test_get_vllm_state_dict(
     del model
     del new_model
     print(f'Test passed!')
-    for _ in range(3):
-        collected = gc.collect()
-        _device_empty_cache()
-        if collected == 0 and not gc.callbacks: break
+    collect_garbage(after = _device_empty_cache)
 pass
 
 

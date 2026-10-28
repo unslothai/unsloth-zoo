@@ -33,6 +33,7 @@ import datasets
 import re
 
 from .log import logger
+from ._gc_passes import collect_garbage
 
 __all__ = [
     "mean_of_trained_tokens",
@@ -368,10 +369,7 @@ def add_new_tokens(
     if is_tied: model.tie_weights()
 
     # Clear deleted GPU items
-    for _ in range(3):
-        collected = gc.collect()
-        torch.cuda.empty_cache()
-        if collected == 0 and not gc.callbacks: break
+    collect_garbage(after = torch.cuda.empty_cache)
     return
 pass
 
@@ -790,10 +788,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     lm_head_matrix  [where_untrained] = mean_lm_head  .to(lm_head_matrix  .dtype)
 
     # Clean up
-    for _ in range(3):
-        collected = gc.collect()
-        torch.cuda.empty_cache()
-        if collected == 0 and not gc.callbacks: break
+    collect_garbage(after = torch.cuda.empty_cache)
     pass
     return
 pass
