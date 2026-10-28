@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""patch_torch_compile keeps a user / Studio TORCHINDUCTOR_CACHE_DIR, drops only the compiled cache folder. CPU only."""
-
 from __future__ import annotations
 
 import os
