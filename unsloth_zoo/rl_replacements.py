@@ -1177,11 +1177,17 @@ def grpo_compute_loss(
     elif loss_type == "vespo":
         if get_gamma_weights is None:
             raise Exception("vespo is only available in TRL 0.26.0+")
+        # TRL sums every completion token's log ratio and log IS factor into the sequence weight.
+        # A rollout_rs rejected token leaves the sequence instead (verl response_mask *= keep): drop
+        # its log ratio and make its IS factor neutral (log 1 = 0), else it still moves kept tokens.
+        vespo_is_ratio = importance_sampling_ratio
+        if rs_keep is not None and importance_sampling_ratio is not None and importance_sampling_ratio.shape == rs_keep.shape:
+            vespo_is_ratio = torch.where(rs_keep, importance_sampling_ratio, 1.0)
         phi_seq = get_gamma_weights(
             advantages=advantages,
-            log_ratio_per_token=log_ratio,
-            mask=mask,
-            importance_sampling_ratio=importance_sampling_ratio,
+            log_ratio_per_token=ratio_log_ratio,
+            mask=ratio_mask,
+            importance_sampling_ratio=vespo_is_ratio,
             k_pos=vespo_k_pos,
             lambda_pos=vespo_lambda_pos,
             k_neg=vespo_k_neg,
