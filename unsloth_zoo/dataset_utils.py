@@ -2154,34 +2154,23 @@ def train_on_responses_only(
         _refuse_packing_that_will_not_happen(trainer.data_collator, None)
 
     def _mask_split(dataset, dataset_name):
-        # Under with_format("arrow") rows and batches are pyarrow Tables, which the
-        # tokenize / mask / fully-masked scan below read as python lists. Run the split
-        # through the default (python) format and hand it back as arrow, so it keeps
-        # and drops exactly the rows the default format does.
+        # Arrow-format rows are pyarrow Tables, which neither the steps below nor a torch
+        # DataLoader can read, so the split comes back in the default (python) format.
         fmt = None if isinstance(dataset, IterableDataset) else getattr(dataset, "format", None)
-        arrow_format = fmt if isinstance(fmt, dict) and fmt.get("type") == "arrow" else None
-        if arrow_format is not None:
+        if isinstance(fmt, dict) and fmt.get("type") == "arrow":
             # `_format_columns`, not format["columns"]: the latter lists every column
             # when no selection was made, which would pin today's columns.
             dataset = dataset.with_format(
                 None,
-                columns = getattr(dataset, "_format_columns", arrow_format.get("columns")),
-                output_all_columns = arrow_format.get("output_all_columns", False),
+                columns = getattr(dataset, "_format_columns", fmt.get("columns")),
+                output_all_columns = fmt.get("output_all_columns", False),
             )
         dataset = _maybe_tokenize_dataset(dataset)
         if isinstance(dataset, IterableDataset):
             dataset = dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(dataset), batched = True)
         else:
             dataset = dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(dataset))
-        dataset = _filter_fully_masked(dataset, dataset_name)
-        if arrow_format is not None:
-            dataset = dataset.with_format(
-                "arrow",
-                columns = getattr(dataset, "_format_columns", dataset.format.get("columns")),
-                output_all_columns = dataset.format.get("output_all_columns", False),
-                **(arrow_format.get("format_kwargs") or {}),
-            )
-        return dataset
+        return _filter_fully_masked(dataset, dataset_name)
     pass
 
     # Map both splits before assigning: a raise on eval must not leave train half-masked for a retry.

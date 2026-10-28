@@ -16,11 +16,10 @@
 
 """`train_on_responses_only` on a `with_format("arrow")` split.
 
-Under the arrow format rows and batches are pyarrow Tables, so the pretokenized
-check, the masking map and the fully-masked label scan all misread them: the run
-either crashed or kept rows with no response, while every other format drops
-those rows. The arrow split must keep and drop exactly what the default format
-does, print the same messages, and still come back as arrow. CPU-pure, offline.
+Arrow-format rows are pyarrow Tables: the masking crashed on them, and a torch
+DataLoader cannot index them either. The split must keep and drop exactly what
+the default format does, print the same messages, and come back in the default
+format so a trainer can batch it. CPU-pure, offline.
 """
 
 import contextlib
@@ -28,6 +27,7 @@ import io
 
 import pytest
 from datasets import Dataset
+from torch.utils.data import DataLoader
 
 from unsloth_zoo.dataset_utils import train_on_responses_only
 
@@ -78,7 +78,9 @@ def test_arrow_drops_the_same_rows_as_the_default_format():
     assert not isinstance(arrow, tuple), arrow
     assert len(base.train_dataset) == 3
     assert _plain(arrow.train_dataset) == _plain(base.train_dataset)
-    assert arrow.train_dataset.format["type"] == "arrow"
+    assert arrow.train_dataset.format["type"] is None
+    batch = next(iter(DataLoader(arrow.train_dataset, batch_size = 2, collate_fn = list)))
+    assert [row["labels"] for row in batch] == base.train_dataset[:2]["labels"]
     assert _unsloth_lines(arrow_log) == _unsloth_lines(base_log)
     assert any("Removed 2 out of 5" in line for line in _unsloth_lines(arrow_log))
 
@@ -92,13 +94,13 @@ def test_arrow_eval_splits_match_the_default_format():
     assert not isinstance(arrow, tuple), arrow
     for key in ("a", "b"):
         assert _plain(arrow.eval_dataset[key]) == _plain(base.eval_dataset[key]), key
-        assert arrow.eval_dataset[key].format["type"] == "arrow"
+        assert arrow.eval_dataset[key].format["type"] is None
     assert _unsloth_lines(arrow_log) == _unsloth_lines(base_log)
 
     base, _ = _run(_rows(MIXED), _rows(MIXED))
     arrow, _ = _run(_rows(MIXED).with_format("arrow"), _rows(MIXED).with_format("arrow"))
     assert _plain(arrow.eval_dataset) == _plain(base.eval_dataset)
-    assert arrow.eval_dataset.format["type"] == "arrow"
+    assert arrow.eval_dataset.format["type"] is None
 
 
 @pytest.mark.parametrize("columns", [None, ["input_ids", "attention_mask"]])
