@@ -28,6 +28,7 @@ Not closed in one pass (the caller keeps the log-prob op + a torch loss): sequen
 token's log-prob / entropy before any coefficient is known).
 """
 
+import math
 import os
 from typing import Optional
 
@@ -52,7 +53,7 @@ def _token_terms(lp, adv, old, ref, isr, kind, eps_low, eps_high, delta, beta, s
     r = torch.exp(lp - (old if old is not None else lp.detach()))
     if kind == 0:
         r1, d1 = r, r
-        if delta > 0.0:
+        if delta < math.inf:  # None (no upper clip) arrives as inf
             r1, d1 = torch.clamp(r, max = delta), r * (r <= delta)
         lo, hi = 1.0 - eps_low, 1.0 + eps_high
         r2, d2 = torch.clamp(r, lo, hi), r * ((r >= lo) & (r <= hi))
@@ -316,10 +317,12 @@ def fused_linear_grpo_loss(
         e_tok = entropy_weights.to(device = device, dtype = torch.float32).reshape(B, T)
     old = old_logps.to(device = device, dtype = torch.float32).reshape(B, T) if old_logps is not None else None
     ref = ref_logps.to(device = device, dtype = torch.float32).reshape(B, T) if beta != 0.0 else None
-    isr = importance_sampling_ratio.to(device = device, dtype = torch.float32).expand(B, T) \
-        if importance_sampling_ratio is not None else None
+    isr = None
+    if importance_sampling_ratio is not None:
+        isr = importance_sampling_ratio.to(device = device, dtype = torch.float32)
+        isr = (isr.reshape(B, 1) if isr.numel() == B else isr.reshape(B, T)).expand(B, T)
     kind = _KIND[loss_type]
-    args = (float(epsilon_low), float(epsilon_high), float(delta or 0.0), float(beta), float(sapo_temperature_pos),
+    args = (float(epsilon_low), float(epsilon_high), float(delta) if delta is not None else math.inf, float(beta), float(sapo_temperature_pos),
             float(sapo_temperature_neg), bool(use_bias_correction_kl))
     if not GRPO_FWD_GRAD:
         lp, en = fl.fused_linear_logprobs(hidden, weight, targets, bias = bias, temperature = temperature,
@@ -329,7 +332,11 @@ def fused_linear_grpo_loss(
                                           entropy_requires_grad = bool(entropy_coef) or entropy_weights is not None,
                                           rows_per_chunk = rows_per_chunk)
         lp, en = lp.reshape(B, T).float(), en.reshape(B, T).float()
-        ell, _ = _token_terms(lp, adv, old, ref, isr, kind, *args)
+        # Masked tokens may hold any old / ref / ratio (padding): zero them before the ratio, as the op skips them,
+        # so an overflowed exp cannot turn the weighted sum (or its gradient) into NaN.
+        live = mask.to(device = device, dtype = torch.bool).reshape(B, T)
+        z = lambda x: torch.where(live, x, torch.zeros_like(x)) if x is not None else None  # noqa: E731
+        ell, _ = _token_terms(z(lp), adv, z(old), z(ref), z(isr), kind, *args)
         loss = (ell * w_tok).sum() + (en * e_tok).sum()
         return loss, lp.detach(), en.detach()
     f32 = dict(device = device, dtype = torch.float32)

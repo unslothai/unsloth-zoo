@@ -230,3 +230,35 @@ def test_opcheck(kind, monkeypatch):
          flat(old), flat(ref), flat(isr), flat(w_tok), flat(e_tok), torch.ones(()), fg._KIND[kind], 0.2, 0.28, 0.0,
          0.04, 1.0, 1.05, False, 0.9, 0.0, 0.0, 0.0, torch.float32, True, True, True, 8, True),
     )
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_masked_tokens_with_garbage_side_inputs_stay_finite(monkeypatch, on):
+    # Padding positions may carry any old / ref log-prob; neither path may turn them into NaN.
+    monkeypatch.setattr(fg, "GRPO_FWD_GRAD", on)
+    cfg = CFGS[2]
+    h, W, bias, tgt, mask, adv, old, ref, isr = _case(2, 1.0, False)
+    old, ref = old.clone(), ref.clone()
+    old[~mask], ref[~mask] = -1e4, 1e4
+    hh = h.clone().requires_grad_()
+    loss, _, _ = _run_op(hh, W, None, tgt, mask, adv, old, ref, isr, cfg, 1.0, 0)
+    (g,) = torch.autograd.grad(loss, [hh])
+    assert torch.isfinite(loss) and torch.isfinite(g).all()
+
+
+def test_zero_delta_is_a_bound_not_none():
+    h, W, bias, tgt, mask, adv, old, ref, isr = _case(3, 1.0, False)
+    cfg = dict(CFGS[0], delta = None)
+    a = _run_op(h, W, None, tgt, mask, adv, old, ref, isr, cfg, 1.0, 0)[0]
+    b = _run_op(h, W, None, tgt, mask, adv, old, ref, isr, dict(cfg, delta = 0.0), 1.0, 0)[0]
+    # delta = 0 clips the unclipped term to 0, so min(0 * adv, clip(r) * adv) differs from no delta
+    assert not torch.allclose(a, b)
+
+
+def test_per_sequence_importance_ratio():
+    h, W, bias, tgt, mask, adv, old, ref, isr = _case(4, 1.0, False)
+    cfg = dict(CFGS[0], isr = True)
+    seq = torch.rand(B) + 0.5
+    a = _run_op(h, W, None, tgt, mask, adv, old, ref, seq, cfg, 1.0, 0)[0]
+    b = _run_op(h, W, None, tgt, mask, adv, old, ref, seq[:, None].expand(B, T), cfg, 1.0, 0)[0]
+    torch.testing.assert_close(a, b)

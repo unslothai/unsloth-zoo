@@ -2688,6 +2688,12 @@ class _GRPOFusedUpstream(torch.autograd.Function):
 pass
 
 
+def _grpo_max_rows_per_chunk():
+    """UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK (0 = automatic), the cap on logits rows per chunk the log-prob route honours."""
+    rows = os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip()
+    return int(rows) if rows.isdigit() else 0
+
+
 def grpo_fused_policy_loss(
     items, lm_head, lm_head_bias, total_rows, width,
     old_logps, ref_logps, sampling_per_token_logps, completion_input_ids, completion_mask, advantages,
@@ -2739,7 +2745,7 @@ def grpo_fused_policy_loss(
         importance_sampling_ratio = importance_sampling_ratio,
         temperature = temperature, logit_scale_multiply = logit_scale_multiply,
         logit_scale_divide = logit_scale_divide, logit_softcapping = logit_softcapping,
-        scaling = scaling, token_weights = token_weights,
+        scaling = scaling, token_weights = token_weights, rows_per_chunk = -_grpo_max_rows_per_chunk(),
         entropy_weights = gather(entropy_weights) if entropy_weights is not None else torch.zeros_like(token_weights),
     )
     loss = _GRPOFusedUpstream.apply(loss, scaling, upstream_scale)

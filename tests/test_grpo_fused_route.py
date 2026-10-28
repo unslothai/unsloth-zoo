@@ -17,6 +17,7 @@
 """grpo_accumulated_loss routed through fused_linear_grpo_loss against the log-prob route (fused_linear_logprobs +
 UnslothEfficientGRPO + UnslothGRPOEntropyBonus): loss, metrics and every parameter gradient, on the padded and the
 sequence-packed forward, plus the routing decisions."""
+import math
 import os
 import types
 
@@ -433,7 +434,7 @@ def test_unsloth_kl_clamps_match_grpo_compute_loss():
         want = rr.grpo_compute_loss(ref[None], lp[None], old[None], None, torch.zeros(1, 5, dtype = torch.long),
                                     mask, 0.1, adv[None], **kw)[0]
         (gw,) = torch.autograd.grad(want, [lp])
-        ell, dl = fg._token_terms(lp.detach(), adv, old, ref, None, 0, 0.2, 0.2, 0.0, 0.1, 1.0, 1.05, bias_kl)
+        ell, dl = fg._token_terms(lp.detach(), adv, old, ref, None, 0, 0.2, 0.2, math.inf, 0.1, 1.0, 1.05, bias_kl)
         torch.testing.assert_close(ell.mean(), want.detach())
         torch.testing.assert_close(dl / 5, gw)
 
@@ -447,7 +448,7 @@ def test_on_policy_without_old_logps():
                                     torch.ones(1, 3), 0.05, adv[None], loss_type = lt, epsilon_high = 4.0 if kind == 1 else 0.2,
                                     sapo_temperature_pos = 1.0, sapo_temperature_neg = 1.05, num_items_in_batch = 3.0)[0]
         (gw,) = torch.autograd.grad(want, [lp])
-        ell, dl = fg._token_terms(lp.detach(), adv, None, ref, None, kind, 0.2, 4.0 if kind == 1 else 0.2, 0.0, 0.05,
+        ell, dl = fg._token_terms(lp.detach(), adv, None, ref, None, kind, 0.2, 4.0 if kind == 1 else 0.2, math.inf, 0.05,
                                   1.0, 1.05, False)
         torch.testing.assert_close(ell.mean(), want.detach())
         torch.testing.assert_close(dl / 3, gw)
@@ -478,3 +479,17 @@ def test_fused_route_loss_compiles_without_graph_breaks():
     for x, y in zip(got, eager):
         torch.testing.assert_close(x, y)
     assert sum(counters["graph_break"].values()) == 0
+
+
+def test_fused_route_keeps_the_logits_row_cap(monkeypatch):
+    seen = []
+    real = fg.fused_linear_grpo_loss
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("rows_per_chunk"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fg, "fused_linear_grpo_loss", spy)
+    monkeypatch.setenv("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "3")
+    _compare(monkeypatch, loss_type = "dapo", old = OLD, adv = ADV)
+    assert seen and all(r == -3 for r in seen)
