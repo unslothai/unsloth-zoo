@@ -2936,6 +2936,50 @@ def _fix_gemma3_text_rmsnorm_fp32(model=None):
     return True
 
 
+def _fix_gemma4_vision_pooler_fp32(model=None):
+    """fp16 only: pool and scale by sqrt(hidden_size) in fp32 as HF does, else 26B-A4B / 31B towers
+    overflow to inf and NaN soft tokens (unsloth#15473, torch path #931). bf16 / fp32 untouched."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma4.vision")
+    except Exception:
+        return False
+
+    pooler_cls = getattr(vision_module, "VisionPooler", None)
+    tower_cls = getattr(vision_module, "VisionModel", None)
+    if not isinstance(pooler_cls, type) or not isinstance(tower_cls, type):
+        return False
+    if getattr(pooler_cls, "_unsloth_fp32_pooler_patched", False):
+        return True
+    original_pool = pooler_cls.__call__
+    original_tower = tower_cls.__call__
+
+    @wraps(original_pool)
+    def pool(self, hidden_states, *args, **kwargs):
+        if hidden_states.dtype == mx.float16:
+            hidden_states = hidden_states.astype(mx.float32)
+        return original_pool(self, hidden_states, *args, **kwargs)
+
+    @wraps(original_tower)
+    def tower(self, *args, **kwargs):
+        out = original_tower(self, *args, **kwargs)
+        table = getattr(self.patch_embedder, "position_embedding_table", None)
+        if out.dtype == mx.float32 and getattr(table, "dtype", None) == mx.float16:
+            out = out.astype(mx.float16)
+        return out
+
+    try:
+        pooler_cls.__call__ = pool
+        tower_cls.__call__ = tower
+        pooler_cls._unsloth_fp32_pooler_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma4_vision_pooler_fp32 = True
+    return True
+
+
 def _fix_gemma3_vision_attention_fp32_sdpa(model=None):
     """Run Gemma3 vision SDPA in fp32, then cast back before the output proj."""
 
@@ -3414,6 +3458,7 @@ def _fix_paligemma_multimodal_causal_mask(model=None):
 # Upstream corrections applied to every VLM as it loads, in order.
 _VLM_MODEL_FIXUPS = (
     _fix_gemma4_kv_sharing,
+    _fix_gemma4_vision_pooler_fp32,
     _fix_gemma3_vision_post_layernorm_eps,
     _fix_gemma3_vision_attention_fp32_sdpa,
     _fix_gemma3_vision_encoder_fp32_layernorm,
