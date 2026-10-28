@@ -229,9 +229,7 @@ class FastCPUModel:
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
             _print(f"{model_name} is pre-quantized; loading {base} for 16-bit training.")
             model_name = base
-        # As on GPU: a loader callback (Studio's progress / stall watchdog) told which repo is fetched, never
-        # a from_pretrained kwarg (the model's __init__ rejects it).
-        # A Hub adapter is reported before its base, in the GPU loader's order.
+        # Studio's progress / stall-watchdog callback, never a model kwarg; adapter before base, as on GPU.
         on_model_resolved = kwargs.pop("on_model_resolved", None)
         if on_model_resolved is not None:
             if adapter_name is not None and adapter_name != model_name:
