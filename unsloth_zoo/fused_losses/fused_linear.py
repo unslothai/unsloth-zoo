@@ -2398,6 +2398,15 @@ def _requires_grad(x):
     return x is not None and x.requires_grad
 
 
+def _f32_scalar(x, f32, first = True):
+    """x (its first element with first) as a 0-dim fp32 tensor on the head's device. A Python number is filled on the
+    device: a CPU tensor copied over is a host sync and cannot be captured in a CUDA graph."""
+    if isinstance(x, (int, float)):
+        return torch.full((), float(x), **f32)
+    x = torch.as_tensor(x).to(**f32)
+    return x.reshape(-1)[:1].reshape(()) if first else x.reshape(())
+
+
 def _head_bias(bias, weight):
     if bias is None:
         return None
@@ -2433,12 +2442,12 @@ def fused_linear_cross_entropy(
     if not 0.0 <= label_smoothing <= 1.0:
         raise ValueError(f"Unsloth: label_smoothing must be between 0.0 and 1.0, got {label_smoothing}.")
     f32 = dict(device = device, dtype = torch.float32)
-    divisor = torch.as_tensor(divisor).to(**f32).reshape(-1)[:1].reshape(())
+    divisor = _f32_scalar(divisor, f32)
     divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
     if scaling is None:
         scaling = torch.ones((), **f32)
     else:
-        scaling = torch.as_tensor(scaling).to(**f32).reshape(())
+        scaling = _f32_scalar(scaling, f32, first = False)
         scaling = torch.where(scaling == 0, torch.ones_like(scaling), scaling)
     if logits_bias is not None:
         # Bart's final_logits_bias is [1, vocab]; a split model may keep it off the head's device.
@@ -2562,12 +2571,12 @@ def fused_linear_jsd(
     if num_items_in_batch is None:
         divisor = keep.sum().to(**f32)
     else:
-        divisor = torch.as_tensor(num_items_in_batch).to(**f32).reshape(-1)[:1].reshape(())
+        divisor = _f32_scalar(num_items_in_batch, f32)
     divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
     if scaling is None:
         scaling = torch.ones((), **f32)
     else:
-        scaling = torch.as_tensor(scaling).to(**f32).reshape(())
+        scaling = _f32_scalar(scaling, f32, first = False)
         scaling = torch.where(scaling == 0, torch.ones_like(scaling), scaling)
     loss = getattr(torch.ops.unsloth_zoo, _JSD_OP)(
         hidden2, student_weight, student_bias, t_hidden2, teacher_weight, teacher_bias, keep, divisor, scaling,

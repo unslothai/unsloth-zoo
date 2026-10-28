@@ -166,7 +166,8 @@ def test_jsd_fixed_rows_all_dropped(head, monkeypatch):
 
 
 def _cuda_dtype():
-    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # is_bf16_supported() is True on a T4 (emulated): fp16 below sm80, as Unsloth picks.
+    return torch.bfloat16 if torch.cuda.get_device_capability() >= (8, 0) else torch.float16
 
 
 def _ce_step(h, w, b, t):
