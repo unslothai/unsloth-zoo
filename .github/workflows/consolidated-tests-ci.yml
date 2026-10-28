@@ -1218,6 +1218,7 @@ jobs:
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_compiler_getsource_tokenerror.py \
+                  tests/test_compiled_module_hash_seed_stable.py \
                   tests/test_fused_ce_coverage.py \
                   tests/test_deepseek_v3_grpo_hidden_states.py \
                   tests/test_moe_hidden_states_wrapper.py \
