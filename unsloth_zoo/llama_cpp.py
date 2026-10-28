@@ -7066,22 +7066,14 @@ def _model_block_count(shapes):
     return highest + 1 if highest >= 0 else None
 
 
-# Arrays longer than this (the vocabulary: tokens, merges, scores, token types) are
-# not split into one numpy view per entry when the verifier reads a GGUF back.
 _GGUF_VERIFY_BULK_ARRAY_MIN = 1024
 
 
 def _open_gguf_reader(path):
-    """A `GGUFReader`, imported at the call site, for the verifier only.
-
-    A previous `Partial_GGUFReader` (an exec'd rewrite of `GGUFReader.__init__`
-    building only the last tensor) bought nothing: the cost is `_build_fields`
-    parsing the vocabulary, two numpy views per token, while `_build_tensors` only
-    makes lazy memmap views. So a long array is walked without those views: a
-    numeric one becomes a single view (`contents()` unchanged), and a string one
-    keeps only its first entry (`field.data` is still non-empty). The verifier never
-    reads array entries. Anything out of bounds goes to the stock parser, so a
-    truncated or corrupt file fails exactly as before.
+    """A `GGUFReader` for the verifier only: arrays past 1024 entries skip the stock
+    two-views-per-token parse (numeric -> one view, string -> first entry only), since
+    the verifier never reads array entries. Anything out of bounds goes to the stock
+    parser, so a corrupt file fails exactly as before.
     """
     import struct
     import sys
@@ -7091,8 +7083,7 @@ def _open_gguf_reader(path):
     from gguf.gguf_reader import GGUFReader  # type: ignore
 
     def _stock_limit(name):
-        # gguf-py releases that bound array and string lengths check them inside the
-        # per-entry parser this skips; past either bound the stock parser decides.
+        # Newer gguf-py checks these bounds inside the per-entry parser skipped here.
         try:
             return int(getattr(_stock_reader_module, name, 1 << 30))
         except Exception:

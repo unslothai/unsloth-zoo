@@ -1,12 +1,5 @@
-"""The verifier's GGUF reader must read a file exactly as the stock GGUFReader does,
-for everything the verifier looks at, without one numpy view per vocabulary entry.
-
-The stock reader splits every array into per-entry views (two per token string), which
-is what made reading a 262k-vocabulary GGUF back take seconds. Long arrays now come back
-as one view (numeric) or their first entry (strings). Field names, offsets, types,
-numeric contents, string-array emptiness and tensors must match the stock reader, and
-a truncated or corrupt file must fail with the same exception type and text.
-"""
+"""The verifier's GGUF reader matches stock GGUFReader on everything the verifier reads
+(or fails with the same error), without one numpy view per vocabulary entry."""
 import struct
 
 import pytest
@@ -57,8 +50,7 @@ def _summary(reader):
         if string_array:
             record.append(bytes(field.parts[field.data[0]]) if field.data else None)
         else:
-            # Raw bytes of the value: the same whether an array is one view or many,
-            # and available on gguf releases older than ReaderField.contents().
+            # Raw bytes: same for one view or many, and works before ReaderField.contents().
             record.append(b"".join(field.parts[i].tobytes() for i in field.data))
         fields.append(record)
     tensors = [
@@ -86,8 +78,7 @@ def test_reader_matches_stock_without_per_entry_views(llama_cpp, tmp_path, endia
     stock_outcome = _outcome(_stock, path)
     assert _outcome(llama_cpp._open_gguf_reader, str(path)) == stock_outcome
     if stock_outcome[0] == "error":
-        # An old gguf on numpy 2 cannot read the file either way; the same error is the contract.
-        pytest.skip(f"the installed gguf cannot read this file: {stock_outcome[1]}")
+        pytest.skip(reason = f"old gguf on numpy 2 cannot read this file either way (same error asserted above): {stock_outcome[1]}")
     fast = llama_cpp._open_gguf_reader(str(path))
     stock = _stock(path)
     assert _summary(fast) == _summary(stock)
@@ -96,7 +87,6 @@ def test_reader_matches_stock_without_per_entry_views(llama_cpp, tmp_path, endia
         assert tokens.contents(0) == stock.fields["tokenizer.ggml.tokens"].contents(0)
         for key in ("tokenizer.ggml.scores", "tokenizer.ggml.token_type"):
             assert fast.fields[key].contents() == stock.fields[key].contents()
-    # The point: the vocabulary is not split into one view per entry.
     fast_parts = sum(len(field.parts) for field in fast.fields.values())
     stock_parts = sum(len(field.parts) for field in stock.fields.values())
     assert stock_parts > 4 * VOCAB
@@ -145,9 +135,7 @@ def test_corrupt_files_fail_like_stock(llama_cpp, tmp_path):
     ("GGUF_MAX_STRING_LENGTH", 100),
 ])
 def test_stock_length_limits_are_left_to_the_stock_parser(llama_cpp, tmp_path, monkeypatch, limit, value):
-    # Newer gguf-py rejects arrays and strings past module-level bounds inside the
-    # per-entry parser. Past a bound the fast path must step aside, so the stock
-    # parser raises (or, on releases without the check, reads) exactly as before.
+    # Past a gguf-py length bound the fast path steps aside and the stock parser decides.
     import gguf.gguf_reader as stock_module
 
     path = tmp_path / "long_token.gguf"
