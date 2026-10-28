@@ -1298,15 +1298,20 @@ def _torch_reference_chunk_gated_delta_rule():
     """transformers' pure-torch ``torch_chunk_gated_delta_rule`` (the kernel-hub fallback), unwrapped."""
     if _rocm_fp32_state["reference"] is not None:
         return _rocm_fp32_state["reference"]
-    for pkg in ("qwen3_next", "qwen3_5", "qwen3_5_moe"):
+    fn = None
+    try:
+        from transformers.models.qwen3_next.modeling_qwen3_next import torch_chunk_gated_delta_rule as fn
+    except Exception:
         try:
-            mod = importlib.import_module(f"transformers.models.{pkg}.modeling_{pkg}")
+            from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule as fn
         except Exception:
-            continue
-        fn = getattr(mod, "torch_chunk_gated_delta_rule", None)
-        if fn is not None:
-            _rocm_fp32_state["reference"] = inspect.unwrap(fn)
-            return _rocm_fp32_state["reference"]
+            try:
+                from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_chunk_gated_delta_rule as fn
+            except Exception:
+                fn = None
+    if fn is not None:
+        _rocm_fp32_state["reference"] = inspect.unwrap(fn)
+        return _rocm_fp32_state["reference"]
     raise RuntimeError("Unsloth: transformers has no torch_chunk_gated_delta_rule to run float32 gated delta on ROCm gfx11.")
 
 
@@ -1317,6 +1322,11 @@ def _rocm_fp32_chunk_gated_delta_rule(
 ):
     """fla's ``chunk_gated_delta_rule`` contract computed by transformers' torch reference."""
     import torch
+    if "transpose_state_layout" in kwargs:
+        # fla's deprecated name for state_v_first, with fla's conflict check.
+        if state_v_first:
+            raise ValueError("Cannot pass both `state_v_first` and the deprecated `transpose_state_layout`.")
+        state_v_first = kwargs.pop("transpose_state_layout")
     if cp_context is not None or kwargs.get("use_gate_in_kernel") or kwargs.get("head_first"):
         raise RuntimeError(
             "Unsloth: float32 gated delta on ROCm gfx11 runs in pure torch, which does not support "

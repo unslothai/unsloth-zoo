@@ -143,6 +143,29 @@ def test_torch_path_varlen_and_state_v_first():
         torch.testing.assert_close(ht[i : i + 1].transpose(-1, -2).double(), ht_ref, atol = 2e-5, rtol = 1e-4)
 
 
+def test_torch_path_honours_the_deprecated_transpose_state_layout():
+    """fla's deprecated `transpose_state_layout` means `state_v_first`; passing both is an error."""
+    pytest.importorskip("transformers.models.qwen3_next.modeling_qwen3_next")
+    H, K, V = 2, 16, 8
+    q, k, v, g, beta = _inputs(1, 37, H, H, K, V, seed = 2)
+    h0 = torch.randn(1, H, K, V, generator = torch.Generator().manual_seed(5)) * 0.1
+    common = dict(output_final_state = True, use_qk_l2norm_in_kernel = True)
+    o_new, ht_new = fla_vendor._rocm_fp32_chunk_gated_delta_rule(
+        q, k, v, g, beta, initial_state = h0.transpose(-1, -2), state_v_first = True, **common
+    )
+    o_old, ht_old = fla_vendor._rocm_fp32_chunk_gated_delta_rule(
+        q, k, v, g, beta, initial_state = h0.transpose(-1, -2), transpose_state_layout = True, **common
+    )
+    assert ht_old.shape == (1, H, V, K)
+    torch.testing.assert_close(o_old, o_new)
+    torch.testing.assert_close(ht_old, ht_new)
+    with pytest.raises(ValueError):
+        fla_vendor._rocm_fp32_chunk_gated_delta_rule(
+            q, k, v, g, beta, initial_state = h0.transpose(-1, -2), state_v_first = True,
+            transpose_state_layout = True, **common
+        )
+
+
 def _install_fake_fla(monkeypatch):
     """A live fla with the three names the installer touches, plus a modeling module bound to it."""
     calls = []
