@@ -340,6 +340,33 @@ def test_float16_without_a_grad_scaler_keeps_the_log_prob_route():
     assert rr.grpo_fused_route_ok(ok, fp16_unscaled = False)
 
 
+class _Routed(Exception):
+    pass
+
+
+@pytest.mark.parametrize("scale,unscaled", [(None, True), (64.0, True), (128.0, False), (65536.0, False)])
+def test_float16_grad_scaler_scale_gates_the_route(monkeypatch, scale, unscaled):
+    # A float16 head: no scaler, or one backed off below 2^7, keeps the log-prob op.
+    seen = {}
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        raise _Routed
+
+    monkeypatch.setattr(rr, "grpo_fused_route_ok", spy)
+    scaler = None if scale is None else types.SimpleNamespace(get_scale = lambda: scale)
+    model = _Model().half()
+    model.device = torch.device("cpu")
+    ids = INPUT_IDS
+    with pytest.raises(_Routed):
+        rr.grpo_accumulated_loss(
+            _trainer(model, scaler = scaler), ids, (ids != 0).long(), LTK, (ids[:, -LTK:] != 0).long(),
+            torch.zeros(ids.shape[0]), None, None, loss_type = "dapo", num_items_in_batch = torch.tensor(4.0),
+            current_gradient_accumulation_steps = 1, num_processes = 1, max_completion_length = LTK,
+        )
+    assert seen["fp16_unscaled"] is unscaled
+
+
 def test_route_switches(monkeypatch):
     ok = dict(loss_type = "grpo")
     monkeypatch.setattr(fg, "GRPO_FWD_GRAD", False)

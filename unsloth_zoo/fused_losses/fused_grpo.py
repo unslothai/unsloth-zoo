@@ -125,12 +125,15 @@ def grpo_loss_token_weights(mask, loss_kwargs):
 
 
 def grpo_token_weights(mask, loss_type, *, num_items_in_batch = None, max_completion_length = None,
-                       gradient_accumulation_steps = 1, steps_per_generation = 1, num_processes = 1,
+                       gradient_accumulation_steps = 1, steps_per_generation = None, num_processes = 1,
                        entropy_coef = 0.0, training = True):
-    """(w, e): per-token weights of the policy loss and the entropy term for a [B, T] completion mask (TRL 1.15)."""
+    """(w, e): per-token weights of the policy loss and the entropy term for a [B, T] completion mask (TRL 1.15;
+    steps_per_generation defaults to gradient_accumulation_steps as in GRPOConfig)."""
+    if steps_per_generation is None:
+        steps_per_generation = gradient_accumulation_steps
     kw = dict(loss_type = loss_type, num_items_in_batch = num_items_in_batch, num_processes = num_processes,
-              current_gradient_accumulation_steps = gradient_accumulation_steps if training else 1,
-              steps_per_generation = steps_per_generation if training else None)
+              current_gradient_accumulation_steps = gradient_accumulation_steps,
+              steps_per_generation = steps_per_generation)
     if max_completion_length is not None:
         kw["max_completion_length"] = max_completion_length
     w = grpo_loss_token_weights(mask, kw)
@@ -281,7 +284,7 @@ def fused_linear_grpo_loss(
     importance_sampling_ratio = None,
     entropy_coef = 0.0,
     num_items_in_batch = None, max_completion_length = None,
-    gradient_accumulation_steps = 1, steps_per_generation = 1, num_processes = 1, training = True,
+    gradient_accumulation_steps = 1, steps_per_generation = None, num_processes = 1, training = True,
     temperature = 1.0,
     logit_scale_multiply = 0.0, logit_scale_divide = 0.0, logit_softcapping = 0.0,
     scaling = None,

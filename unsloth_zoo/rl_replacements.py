@@ -3152,9 +3152,11 @@ def grpo_accumulated_loss(
         _fused_route = _grpo_fused_route_ok(
             kwargs, entropy_mask_on = _entropy_mask_on, rollout_logps_as_old = _rollout_logps_as_old,
             support_kwargs = _support_kwargs, pixel_values = pixel_values, zero3_head = _zero3_head, lm_head = lm_head,
-            fp16_unscaled = trainer.accelerator.scaler is None and (
+            # A GradScaler backed off below 2^7 counts as unscaled: the op's float16 gradients lose to the log-prob op
+            # there (fp64 check: 7.6e-2 vs 2.6e-2 relative grad error at scale 1, level from 128 up).
+            fp16_unscaled = (
                 trainer._autocast_dtype == torch.float16 if _autocast_on else lm_head.dtype == torch.float16
-            ),
+            ) and (trainer.accelerator.scaler is None or trainer.accelerator.scaler.get_scale() < 128.0),
         )
         _fused_W = logits_to_keep + max_left_pad if pixel_values is None else logits_to_keep
         _fused_pad = []
