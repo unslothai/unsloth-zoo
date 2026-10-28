@@ -1130,6 +1130,11 @@ def patch_vllm_reset_caches_on_sleep():
 pass
 
 
+class _AlreadyPatched(Exception):
+    pass
+pass
+
+
 def patch_vllm_graph_capture():
     """Temporarily disable gc.collect to speed up CUDA graph capture with torch.compile."""
     from contextlib import contextmanager
@@ -1157,8 +1162,12 @@ def patch_vllm_graph_capture():
     # Patch vLLM v1
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
-        logger.info('Unsloth: Patching vLLM v1 graph capture')
         original_capture_model_v1 = GPUModelRunner.capture_model
+        # patch_vllm() runs on every fast_inference load: wrap once, or each later load
+        # nests another wrapper and every capture repeats the cleanup and the log lines.
+        if getattr(original_capture_model_v1, "_unsloth_graph_capture", False):
+            raise _AlreadyPatched
+        logger.info('Unsloth: Patching vLLM v1 graph capture')
 
         @wraps(original_capture_model_v1)
         def capture_model_wrapper_v1(self, *args, **kwargs):
@@ -1176,7 +1185,10 @@ def patch_vllm_graph_capture():
             collect_garbage(passes = 2, after = _device_empty_cache)
             return result
         pass
+        capture_model_wrapper_v1._unsloth_graph_capture = True
         GPUModelRunner.capture_model = capture_model_wrapper_v1
+    except _AlreadyPatched:
+        pass
     except Exception as e:
         print(f"Unsloth: Could not patch vLLM V1 graph capture: {e}")
 
@@ -1184,8 +1196,10 @@ def patch_vllm_graph_capture():
         # Also patch vLLM v0. vLLM v0 is deprecated in vLLM v0.11.0 so only do when appropriate.
         try:
             from vllm.worker.model_runner import GPUModelRunnerBase, logger
-            logger.info('Unsloth: Patching vLLM v0 graph capture')
             original_capture_model_v0 = GPUModelRunnerBase.capture_model
+            if getattr(original_capture_model_v0, "_unsloth_graph_capture", False):
+                raise _AlreadyPatched
+            logger.info('Unsloth: Patching vLLM v0 graph capture')
 
             @wraps(original_capture_model_v0)
             def capture_model_wrapper_v0(self, *args, **kwargs):
@@ -1203,7 +1217,10 @@ def patch_vllm_graph_capture():
                 collect_garbage(passes = 2, after = _device_empty_cache)
                 return result
             pass
+            capture_model_wrapper_v0._unsloth_graph_capture = True
             GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
+        except _AlreadyPatched:
+            pass
         except Exception as e:
             print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
 pass
