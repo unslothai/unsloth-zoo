@@ -2663,6 +2663,14 @@ def trl_collator_ignores_labels(collator = None):
     return collator is None or isinstance(collator, _TRLCollator)
 pass
 
+def _batched_columns(dataset):
+    # Mask filters and label building read whole columns a batch at a time: same rows, same values, one
+    # Python call per batch. Only for a map-style Dataset with no output format, where a batch column holds
+    # the same Python values as one-row reads; an IterableDataset stays row by row (it runs lazily in training).
+    return isinstance(dataset, Dataset) and getattr(dataset, "format", {}).get("type", None) is None
+pass
+
+
 # Faster SFTTrainer prepare_dataset
 def sft_prepare_dataset(
     self,
@@ -2681,6 +2689,8 @@ def sft_prepare_dataset(
 
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
+    # Imported here: this function's source is copied into the compiled trainer module.
+    from unsloth_zoo.dataset_utils import _batched_columns
     is_vlm = hasattr(processing_class, "tokenizer")
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
@@ -2952,8 +2962,22 @@ def sft_prepare_dataset(
                 if pc_completion_only is None:
                     pc_completion_only = getattr(args, "completion_only_loss", None)
                 if pc_completion_only is None or pc_completion_only:
+                    if _batched_columns(dataset):
+                        dataset = dataset.filter(
+                            lambda assistant_masks, completion_mask: [
+                                any(a and c for a, c in zip(row_a, row_c))
+                                for row_a, row_c in zip(assistant_masks, completion_mask)
+                            ],
+                            batched = True, input_columns = ["assistant_masks", "completion_mask"],
+                        )
+                    else:
+                        dataset = dataset.filter(
+                            lambda row: any(a and c for a, c in zip(row["assistant_masks"], row["completion_mask"]))
+                        )
+                elif _batched_columns(dataset):
                     dataset = dataset.filter(
-                        lambda row: any(a and c for a, c in zip(row["assistant_masks"], row["completion_mask"]))
+                        lambda assistant_masks: [any(row) for row in assistant_masks],
+                        batched = True, input_columns = ["assistant_masks"],
                     )
                 else:
                     dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
@@ -3018,7 +3042,13 @@ def sft_prepare_dataset(
                 )
             if assistant_only_loss:
                 # Truncation can drop every assistant token; such a row has no target.
-                dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
+                if _batched_columns(dataset):
+                    dataset = dataset.filter(
+                        lambda assistant_masks: [any(row) for row in assistant_masks],
+                        batched = True, input_columns = ["assistant_masks"],
+                    )
+                else:
+                    dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
         else:
             if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
             import warnings as _w
@@ -3050,7 +3080,14 @@ def sft_prepare_dataset(
             def _build_labels(example):
                 masks = [example[x] for x in mask_columns]
                 return {"labels": [t if all(m) else -100 for t, *m in zip(example["input_ids"], *masks)]}
+            def _build_labels_batched(batch):
+                return {"labels": [
+                    [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
+                    for input_ids, *masks in zip(batch["input_ids"], *(batch[x] for x in mask_columns))
+                ]}
             label_kwargs = {}
+            if _batched_columns(dataset):
+                label_kwargs["batched"] = True
             if isinstance(dataset, Dataset):
                 label_kwargs["num_proc"] = map_kwargs.get("num_proc", None)
                 label_kwargs["desc"] = f"Unsloth: Building labels for {dataset_name} dataset"
@@ -3066,7 +3103,10 @@ def sft_prepare_dataset(
                     collator = frame.f_locals.get("data_collator")
                 del frame
             keep_masks = keep_masks and trl_collator_ignores_labels(collator)
-            dataset = dataset.map(_build_labels, remove_columns = [] if keep_masks else mask_columns, **label_kwargs)
+            dataset = dataset.map(
+                _build_labels_batched if label_kwargs.get("batched") else _build_labels,
+                remove_columns = [] if keep_masks else mask_columns, **label_kwargs,
+            )
             if not keep_masks:
                 used_column_names = [x for x in used_column_names if x not in mask_columns]
             used_column_names = used_column_names + ["labels"]
