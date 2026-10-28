@@ -124,3 +124,49 @@ def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path):
         assert res["helper"] and "gather_error" not in res and res["gather_equal"], res
         assert res["early_sharded"] is False, res
         assert res["sharded"] is True and res["merged_rollout"] is True, res
+
+
+_SCAN_WORKER = """
+import json, sys
+import torch
+import unsloth_zoo.vllm_utils as vu
+
+class Lora(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base_layer = torch.nn.Linear(4, 4, bias = False)
+        self.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(4, 2, bias = False)})
+        self.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(2, 4, bias = False)})
+
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([Lora() for _ in range(400)])
+
+model = Model()
+seen = []
+orig = model.named_parameters
+def counting(*args, **kwargs):
+    for item in orig(*args, **kwargs):
+        seen.append(item[0])
+        yield item
+model.named_parameters = counting
+res = {"sharded": vu._lora_is_sharded(model), "params_walked": len(seen), "params_total": len(list(orig()))}
+json.dump(res, open(sys.argv[1], "w"))
+"""
+
+
+def test_unsharded_check_stops_at_the_first_adapter(tmp_path):
+    # load_lora runs this every GRPO step on single GPU / DDP: it must not walk every parameter.
+    script = tmp_path / "scan.py"
+    script.write_text(textwrap.dedent(_SCAN_WORKER))
+    out = tmp_path / "scan.json"
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_ALLOW_CPU = "1",
+               PYTHONPATH = os.pathsep.join([str(_ROOT), os.environ.get("PYTHONPATH", "")]))
+    r = subprocess.run([sys.executable, str(script), str(out)], env = env, capture_output = True, text = True,
+                       timeout = 300, cwd = tmp_path)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    res = json.loads(out.read_text())
+    assert res["sharded"] is False, res
+    assert res["params_total"] == 1200, res
+    assert res["params_walked"] <= 3, res

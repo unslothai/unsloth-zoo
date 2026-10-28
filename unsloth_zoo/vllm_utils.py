@@ -6784,11 +6784,15 @@ def _lora_is_sharded(model):
     if model.__dict__.get("_unsloth_lora_is_sharded"): return True
     try:
         from torch.distributed.tensor import DTensor
-        sharded = any(
-            isinstance(p, DTensor) for n, p in model.named_parameters() if ".lora_A." in n or ".lora_B." in n
-        )
     except Exception:
-        sharded = False
+        return False
+    # fully_shard shards every unit's adapters together, so the first lora_A / lora_B decides. Stopping
+    # there keeps the unsharded case (single GPU, DDP: every load_lora) from walking every parameter.
+    sharded = False
+    for n, p in model.named_parameters():
+        if ".lora_A." in n or ".lora_B." in n:
+            sharded = isinstance(p, DTensor)
+            break
     if sharded: model.__dict__["_unsloth_lora_is_sharded"] = True
     return sharded
 pass
@@ -6808,6 +6812,11 @@ def _lora_state_dict(model):
     if not _lora_is_sharded(model):
         return lora_items(model.state_dict())
     from torch.distributed.tensor import DTensor
+    # A save gated on rank 0 (fine under DDP) would wait here forever for the other ranks' gather.
+    _merged_rollout_log_once(
+        "Unsloth: native FSDP2 gathers the LoRA adapters across ranks for save_lora / load_lora, "
+        "so every rank must call them (a call on rank 0 alone waits for the others)."
+    )
     with torch.inference_mode(False), torch.no_grad():
         return {
             k: (v.full_tensor() if isinstance(v, DTensor) else v).detach()
