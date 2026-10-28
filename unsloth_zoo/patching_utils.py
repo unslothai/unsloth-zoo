@@ -192,8 +192,9 @@ def _drop_inductor_cache_dir_in_compile_location():
         return
     candidates = (UNSLOTH_COMPILE_LOCATION, os.environ.get("UNSLOTH_COMPILE_LOCATION"))
     try:
-        current = os.path.realpath(value)
-        compile_folders = {os.path.realpath(x) for x in candidates if x}
+        # normcase: Windows paths compare case-insensitively.
+        current = os.path.normcase(os.path.realpath(value))
+        compile_folders = {os.path.normcase(os.path.realpath(x)) for x in candidates if x}
     except Exception:
         return
     if current in compile_folders:

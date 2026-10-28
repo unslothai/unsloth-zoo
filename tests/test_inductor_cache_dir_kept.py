@@ -58,6 +58,17 @@ def test_compiled_cache_folder_from_env_is_dropped(monkeypatch, tmp_path):
     assert os.path.realpath(os.environ.get("TORCHINDUCTOR_CACHE_DIR", "")) != os.path.realpath(folder)
 
 
+def test_compiled_cache_folder_differing_in_case_is_dropped(monkeypatch, tmp_path):
+    # Windows compares paths case-insensitively and realpath keeps the spelling of
+    # a folder that does not exist yet. Simulated here through a case-folding normcase.
+    folder = str(tmp_path / "UCC_missing")
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", folder)
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", folder.lower())
+    monkeypatch.setattr(os.path, "normcase", lambda p: p.lower())
+    _run_patch_torch_compile()
+    assert "TORCHINDUCTOR_CACHE_DIR" not in os.environ
+
+
 def test_unset_stays_unset(monkeypatch):
     monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising = False)
     _run_patch_torch_compile()
