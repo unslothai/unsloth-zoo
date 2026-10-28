@@ -20,8 +20,8 @@ Decode at batch 1 is host bound (the GPU is busy 16-45% of a step): every aten o
                     clone + bf16 add + 9-op fp32 RMSNorm (rms_layernorm_forward) with one kernel.
   sink_scale_output attention * sigmoid(lse - sink), transposed to [B, Q, H, D]: replaces 6 ops.
 Same math and rounding points as the eager code (the residual sum is rounded to the input dtype
-before the norm, the sink scale is rounded to the output dtype before the multiply); only the
-fp32 reduction order and exp / rsqrt may differ by an ulp. Inference only: callers check
+before the norm, the sink scale is rounded to the output dtype before the multiply). The sink
+epilogue is bit-identical on CUDA; the norm differs only in the order of its fp32 sum. Inference only: callers check
 fused_decode_ok() (CUDA / HIP tensors, Triton present, no autograd, not tracing).
 Kill switch: UNSLOTH_GPT_OSS_FUSED_DECODE=0, read at import.
 """
@@ -44,11 +44,22 @@ try:
     HAS_TRITON = True
 except Exception:
     HAS_TRITON = False
+# The device math library's exp / rsqrt (what aten's CUDA kernels call), not Triton's approximations:
+# with an IEEE division the sink scale is bit-identical to torch.sigmoid.
+_libdevice = None
+_INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"  # CPU tests: no libdevice there
+if HAS_TRITON and not _INTERPRET:
+    try:
+        from triton.language.extra import libdevice as _libdevice
+    except Exception:
+        _libdevice = None
 
 _ENABLED = HAS_TRITON and os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
 # Engagement counters (tests and benchmarks read them).
 FUSED_DECODE_CALLS = {"add_rms_norm": 0, "sink_scale_output": 0}
 _MAX_COLS = 32768
+# aten rounds every multiply before the add that follows it; contracting them into FMAs would not.
+_NO_FMA = {} if _INTERPRET else {"enable_fp_fusion": False}
 
 
 def _on_device(t):
@@ -71,8 +82,8 @@ def fused_decode_ok(x):
 if HAS_TRITON:
     @triton.jit
     def _add_rms_norm_kernel(
-        X, R, W, Y, N, stride_x, stride_r, stride_y, eps,
-        HAS_RES: tl.constexpr, BLOCK: tl.constexpr,
+        X, R, W, Y, N, stride_x, stride_r, stride_y, eps, inv_n,
+        HAS_RES: tl.constexpr, BLOCK: tl.constexpr, EXACT: tl.constexpr,
     ):
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK)
@@ -84,8 +95,12 @@ if HAS_TRITON:
             x = (x.to(tl.float32) + r.to(tl.float32)).to(X.dtype.element_ty)
             tl.store(X + row * stride_x + cols, x, mask = ok)
         xf = x.to(tl.float32)
-        var = tl.sum(xf * xf, axis = 0) / N + eps
-        y = xf * tl.rsqrt(var)
+        # aten's mean is sum * (1 / N); only the order of the fp32 sum differs from it.
+        var = tl.sum(xf * xf, axis = 0) * inv_n + eps
+        if EXACT:
+            y = xf * _libdevice.rsqrt(var)
+        else:
+            y = xf * tl.rsqrt(var)
         w = tl.load(W + cols, mask = ok, other = 0.0).to(tl.float32)
         tl.store(Y + row * stride_y + cols, (y * w).to(Y.dtype.element_ty), mask = ok)
 
@@ -93,7 +108,7 @@ if HAS_TRITON:
     def _sink_scale_kernel(
         A, LSE, SINK, OUT, H, Q, D,
         sa_b, sa_h, sa_q, sl_b, sl_h, sl_q, so_b, so_q, so_h,
-        BLOCK_D: tl.constexpr,
+        BLOCK_D: tl.constexpr, EXACT: tl.constexpr,
     ):
         pid = tl.program_id(0)
         q = pid % Q
@@ -103,7 +118,10 @@ if HAS_TRITON:
         lse = tl.load(LSE + b * sl_b + h * sl_h + q * sl_q).to(tl.float32)
         sink = tl.load(SINK + h).to(tl.float32)
         # Eager: sigmoid in fp32, then the scale is cast to the output dtype before the multiply.
-        scale = 1.0 / (1.0 + tl.exp(sink - lse))
+        if EXACT:
+            scale = tl.math.div_rn(1.0, 1.0 + _libdevice.exp(sink - lse))
+        else:
+            scale = 1.0 / (1.0 + tl.exp(sink - lse))
         scale = scale.to(OUT.dtype.element_ty).to(tl.float32)
         cols = tl.arange(0, BLOCK_D)
         ok = cols < D
@@ -133,8 +151,10 @@ def add_rms_norm(x, residual, weight, eps):
     BLOCK = triton.next_power_of_2(N)
     with _on_device(x):
         _add_rms_norm_kernel[(rows,)](
-            x, x if residual is None else residual, weight, y, N, N, N, N, float(eps),
-            HAS_RES = residual is not None, BLOCK = BLOCK, num_warps = 8 if BLOCK >= 4096 else 4,
+            x, x if residual is None else residual, weight, y, N, N, N, N, float(eps), 1.0 / N,
+            HAS_RES = residual is not None, BLOCK = BLOCK, EXACT = _libdevice is not None,
+            num_warps = 8 if BLOCK >= 4096 else 4,
+            **_NO_FMA,
         )
     FUSED_DECODE_CALLS["add_rms_norm"] += 1
     return y
@@ -163,7 +183,8 @@ def sink_scale_output(attn_output, lse, sinks):
             attn_output.stride(0), attn_output.stride(1), attn_output.stride(2),
             lse.stride(0), lse.stride(1), lse.stride(2),
             out.stride(0), out.stride(1), out.stride(2),
-            BLOCK_D = triton.next_power_of_2(D), num_warps = 1 if D <= 128 else 4,
+            BLOCK_D = triton.next_power_of_2(D), EXACT = _libdevice is not None, num_warps = 1 if D <= 128 else 4,
+            **_NO_FMA,
         )
     FUSED_DECODE_CALLS["sink_scale_output"] += 1
     return out

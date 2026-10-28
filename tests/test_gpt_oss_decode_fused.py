@@ -158,6 +158,9 @@ def test_sink_epilogue_matches_eager(kernels):
     assert keys
     for key in keys:
         assert kernels["sink_shape_" + key], key
+        if torch.cuda.is_available() and torch.version.cuda:
+            # libdevice exp + an IEEE division: the same scale torch.sigmoid computes, bit for bit.
+            assert kernels["sink_mismatch_frac_" + key] == 0, (key, kernels["sink_mismatch_frac_" + key])
         assert kernels["sink_ulps_" + key] <= 1.01, (key, kernels["sink_ulps_" + key])
         assert kernels["sink_mismatch_frac_" + key] <= 0.02, (key, kernels["sink_mismatch_frac_" + key])
         assert kernels["sink_empty_row_zero_" + key], key
