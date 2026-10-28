@@ -7104,8 +7104,7 @@ def _open_gguf_reader(path):
             return super()._get_field_parts(orig_offs, raw_type)
 
         def _check_array_count(self, orig_offs):
-            # Stock reads numeric entries past EOF as zero-byte views, so a corrupt count spins
-            # while memory grows; raise the IndexError stock gives on a truncated read.
+            # Stock spins on a corrupt count (zero-byte views past EOF); fail like a truncated read.
             raw_itype = self._get(orig_offs, np.uint32)
             alen = self._get(orig_offs + 4, np.uint64)
             if len(raw_itype) != 1 or len(alen) != 1:
