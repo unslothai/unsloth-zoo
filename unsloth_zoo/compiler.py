@@ -2200,7 +2200,6 @@ _COMPILE_VERSIONS_SCOPE = contextvars.ContextVar(
 
 
 def _resolve_compile_versions():
-    # Versions written into every generated file's header, in header order.
     versions = []
     for package in ("unsloth_zoo", "unsloth", "transformers", "trl"):
         try:
@@ -2211,8 +2210,6 @@ def _resolve_compile_versions():
 
 
 def _get_compile_versions():
-    # Inside one compile operation the versions are resolved once; outside one
-    # (or in a fresh operation) they are read from the installed metadata again.
     versions = _COMPILE_VERSIONS_SCOPE.get()
     if versions is None:
         versions = _resolve_compile_versions()
@@ -2220,9 +2217,7 @@ def _get_compile_versions():
 
 
 def _compile_versions_scope(function):
-    # Resolve the package versions once per call of `function` and reuse them for
-    # every generated file it writes. Scoped to the call, not the process, so a
-    # package upgraded between two compile calls is still seen by the second one.
+    # Per call, not per process: a package upgraded between two compile calls must reach the header.
     @functools.wraps(function)
     def wrapper(*args, **kwargs):
         if _COMPILE_VERSIONS_SCOPE.get() is not None:

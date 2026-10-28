@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Package versions for the generated-file header are read once per compile call.
-
-Every generated file starts with the unsloth_zoo / unsloth / transformers / trl versions.
-They used to be read from the installed metadata four times per generated file. One
-`unsloth_compile_transformers` call now reads them once, and the next call reads them
-again, so a package upgraded between two calls is still stamped correctly.
-"""
+"""Header versions are read once per compile call, and again on the next call."""
 import json
 import os
 import subprocess
@@ -29,8 +23,6 @@ import textwrap
 
 import pytest
 
-# The child imports unsloth_zoo.compiler, which needs torch and transformers. CI legs that
-# install neither (the macOS staging leg) skip here instead of failing in the child.
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
@@ -95,11 +87,9 @@ def _run(tmp_path):
 
 def test_versions_read_once_per_compile_call_and_again_on_the_next(tmp_path):
     out = _run(tmp_path)
-    # Several generated files in one call, but only one read of each of the four packages.
     assert out["first"]["made"] > 1, out
     for key in ("first", "second"):
         assert out[key]["made"] >= 1, out
         assert out[key]["calls"] == 4, out
-    # The second call sees the "upgraded" trl, so its header changes with it.
     assert out["first"]["header"][-1] == "0.0.1", out
     assert out["second"]["header"][-1] == "0.0.2", out
