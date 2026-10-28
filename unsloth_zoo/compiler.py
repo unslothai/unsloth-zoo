@@ -6915,7 +6915,6 @@ def unsloth_compile_transformers(
     # Definition order, not set order: set order follows PYTHONHASHSEED and the
     # cache file would be rewritten by every new process.
     functions += [module for module in torch_modules if module in bad_torch_modules]
-    functions += sorted(bad_torch_modules.difference(torch_modules))
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
