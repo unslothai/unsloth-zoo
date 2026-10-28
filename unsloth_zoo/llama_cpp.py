@@ -7104,27 +7104,24 @@ def _open_gguf_reader(path):
             return super()._get_field_parts(orig_offs, raw_type)
 
         def _check_array_count(self, orig_offs):
-            # Stock reads numeric entries past EOF as zero-byte views and keeps going, so a
-            # corrupt count loops while memory grows (string and nested entries already fail
-            # on the first read past EOF). Fail a count the rest of the file cannot hold now,
-            # with the IndexError stock raises at the next read past EOF.
+            # Stock reads numeric entries past EOF as zero-byte views, so a corrupt count spins
+            # while memory grows; raise the IndexError stock gives on a truncated read.
             raw_itype = self._get(orig_offs, np.uint32)
             alen = self._get(orig_offs + 4, np.uint64)
             if len(raw_itype) != 1 or len(alen) != 1:
-                return  # stock fails on the short header itself
+                return
             try:
                 nptype = self.gguf_scalar_to_np.get(GGUFValueType(int(raw_itype[0])))
             except ValueError:
-                return  # unknown entry type: stock raises its own error
+                return
             if nptype is None:
-                return  # string / nested array entries
+                return  # string / nested entries fail on the first read past EOF
             count = int(alen[0])
             if hasattr(_stock_reader_module, "GGUF_MAX_ARRAY_ELEMENTS") and count > _stock_limit("GGUF_MAX_ARRAY_ELEMENTS"):
-                return  # stock rejects this count itself
+                return
             itemsize = np.dtype(nptype).itemsize
             remaining = len(self.data) - (orig_offs + 12)
-            # A partial last entry already fails fast in stock (dtype view error); only
-            # whole-entry overruns read zero-byte views forever.
+            # A partial last entry already fails fast in stock (dtype view error).
             if count * itemsize > remaining and remaining % itemsize == 0:
                 raise IndexError(
                     f"GGUF array of {count} entries exceeds the remaining file size {remaining}"

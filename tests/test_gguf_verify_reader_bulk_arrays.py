@@ -192,15 +192,13 @@ def _write_with_bytes_array(path, entries, nested = False):
 
 @pytest.mark.parametrize("entries, nested", [(10, False), (2000, False), (0, True)])
 def test_corrupt_numeric_array_count_fails_fast(llama_cpp, tmp_path, monkeypatch, entries, nested):
-    # Stock reads numeric entries past EOF as zero-byte views and never stops on a huge
-    # count, growing memory; the verifier reader must fail like a truncated read instead.
     path = _write_with_bytes_array(tmp_path / "ok.gguf", entries, nested)
     assert _outcome(llama_cpp._open_gguf_reader, str(path)) == _outcome(_stock, path)
     raw = bytearray(path.read_bytes())
     key = raw.find(b"x.bytes")
     count_at = key + len(b"x.bytes") + 8
     if nested:
-        # First inner array: skip the outer count and the inner element type.
+        # first inner array's count
         count_at += 8 + 4
     struct.pack_into("<Q", raw, count_at, 1 << 29)  # under gguf-py's own 2**30 array limit
     bad = tmp_path / "bad.gguf"
