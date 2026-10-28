@@ -114,9 +114,26 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
     log_dir = Path(log_dir).expanduser()
     if not log_dir.is_dir():
         return False
+    # Streamed in 1 MiB blocks instead of read_bytes(): hf_xet writes one log per process, so a cache
+    # holds thousands of them (hundreds of MB) and every import would load each file whole. Blocks
+    # overlap by len(marker) - 1 bytes, so a marker split across two reads still matches.
+    marker = b"429 Too Many Requests"
+    keep = len(marker) - 1
     for log_file in log_dir.glob("*.log"):
         try:
-            if b"429 Too Many Requests" in log_file.read_bytes():
+            with open(log_file, "rb", buffering = 0) as f:
+                found = False
+                tail = b""
+                while True:
+                    block = f.read(1 << 20)
+                    if not block:
+                        break
+                    if not found:
+                        found = marker in block or marker in tail + block[:keep]
+                        tail = block[-keep:] if len(block) >= keep else (tail + block)[-keep:]
+                # Read to EOF even after a match, as read_bytes() did: a read error later in the
+                # file still skips the file, so the verdict is the same as the whole-file read.
+            if found:
                 return True
         except OSError:
             continue
