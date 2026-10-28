@@ -131,8 +131,9 @@ def trl_018_collator(monkeypatch):
     dataset_utils._TRL_COLLATOR_APPLIES_MASKS = None
 
 
-def test_trl_018_collator_applies_masks_itself(trl_018_collator):
-    assert dataset_utils.trl_collator_applies_masks() is True
+def test_trl_018_collator_is_detected(trl_018_collator):
+    assert dataset_utils.trl_collator_applies_masks() is False
+    assert dataset_utils.trl_collator_ignores_labels() is True
 
 
 def test_trl_018_completion_mask_reaches_its_collator(trl_018_collator):
@@ -142,14 +143,11 @@ def test_trl_018_completion_mask_reaches_its_collator(trl_018_collator):
     assert sorted(x for x in labels.flatten().tolist() if x != -100) == [13, 14, 21, 22]
 
 
-def test_trl_018_padding_free_builds_labels_for_flattening_collator(trl_018_collator):
+def test_trl_018_flattening_collator_reads_built_labels(trl_018_collator):
     from transformers import DataCollatorWithFlattening
 
-    class PaddingFreeArgs(Args):
-        padding_free = True
-
     dataset = Dataset.from_list([{"input_ids": r["input_ids"], "completion_mask": r["completion_mask"]} for r in ROWS])
-    out = sft_prepare_dataset(Trainer(), dataset, Tokenizer(), PaddingFreeArgs(), False, None, "train")
+    out = sft_prepare_dataset(Trainer(), dataset, Tokenizer(), Args(), False, None, "train")
     batch = DataCollatorWithFlattening(return_tensors = "pt")([out[i] for i in range(len(out))])
     ids, labels = batch["input_ids"].flatten().tolist(), batch["labels"].flatten().tolist()
     assert sorted(t for t, y in zip(ids, labels) if y != -100) == [13, 14, 21, 22]

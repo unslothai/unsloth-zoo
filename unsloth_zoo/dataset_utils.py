@@ -2644,10 +2644,7 @@ except:
 
 
 _TRL_COLLATOR_APPLIES_MASKS = None
-def trl_collator_applies_masks(padding_free = False):
-    # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
-    # TRL 0.18 applies completion_mask but never reads a "labels" column, except padding-free,
-    # where it swaps in transformers' DataCollatorWithFlattening, which reads only "labels".
+def _trl_collator_mask_probe():
     global _TRL_COLLATOR_APPLIES_MASKS
     if _TRL_COLLATOR_APPLIES_MASKS is None:
         try:
@@ -2661,8 +2658,20 @@ def trl_collator_applies_masks(padding_free = False):
             )
         except Exception:
             _TRL_COLLATOR_APPLIES_MASKS = (True, False)
-    applies_masks, ignores_labels = _TRL_COLLATOR_APPLIES_MASKS
-    return applies_masks or (ignores_labels and not padding_free)
+    return _TRL_COLLATOR_APPLIES_MASKS
+pass
+
+
+def trl_collator_applies_masks():
+    # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
+    return _trl_collator_mask_probe()[0]
+pass
+
+
+def trl_collator_ignores_labels():
+    # TRL 0.18: its collator applies completion_mask but never reads "labels", while the padding-free
+    # (or user-supplied) DataCollatorWithFlattening reads only "labels", so both columns must reach it.
+    return _trl_collator_mask_probe()[1]
 pass
 
 # Faster SFTTrainer prepare_dataset
@@ -3037,9 +3046,9 @@ def sft_prepare_dataset(
     pass
 
     # Imported here: this function's source is copied into the compiled trainer module.
-    from unsloth_zoo.dataset_utils import trl_collator_applies_masks
+    from unsloth_zoo.dataset_utils import trl_collator_applies_masks, trl_collator_ignores_labels
     column_names = set(next(iter(dataset)).keys())
-    if "labels" not in column_names and not trl_collator_applies_masks(bool(getattr(args, "padding_free", False))):
+    if "labels" not in column_names and not trl_collator_applies_masks():
         completion_only_loss = getattr(self, "completion_only_loss", None)
         if completion_only_loss is None:
             completion_only_loss = getattr(args, "completion_only_loss", None)
@@ -3056,8 +3065,11 @@ def sft_prepare_dataset(
             if isinstance(dataset, Dataset):
                 label_kwargs["num_proc"] = map_kwargs.get("num_proc", None)
                 label_kwargs["desc"] = f"Unsloth: Building labels for {dataset_name} dataset"
-            dataset = dataset.map(_build_labels, remove_columns = mask_columns, **label_kwargs)
-            used_column_names = [x for x in used_column_names if x not in mask_columns] + ["labels"]
+            keep_masks = trl_collator_ignores_labels()
+            dataset = dataset.map(_build_labels, remove_columns = [] if keep_masks else mask_columns, **label_kwargs)
+            if not keep_masks:
+                used_column_names = [x for x in used_column_names if x not in mask_columns]
+            used_column_names = used_column_names + ["labels"]
     pass
     if packing:
         # Use TRL's pack_dataset if available
