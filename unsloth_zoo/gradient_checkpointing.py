@@ -198,9 +198,8 @@ def _grow_host_buffer(buffer, new_size):
 # freed blocks page-locked in per-size free lists until empty_host_cache (aten/src/ATen/
 # core/CachingHostAllocator.h: PowerOf2Ceil in allocate, free_list_ in free, torch 2.6
 # through 2.14; 2.13+ settings turn both off above a size, see _host_alloc_policy). So
-# GC_PINNED_BYTES charges rounded blocks, a release only moves a block into _PINNED_CACHED
-# (reusable by the next reservation of that size), and it drops only when
-# torch.cuda.host_memory_stats() shows the allocator holding less.
+# GC_PINNED_BYTES charges rounded blocks; a release moves one into _PINNED_CACHED, and it drops
+# only when torch.cuda.host_memory_stats() shows the allocator holding less.
 # A single local rank has no other ranks to leave RAM for, and a refused pin still stores the
 # same bytes pageable, so it only refuses a block that would not fit in the RAM available now.
 GC_PINNED_BYTES = 0
@@ -214,11 +213,9 @@ _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
 _PINNED_RELEASED = 0        # settings mode: blocks released since the last flush (may wait on events)
 
 
-# torch 2.13+ host allocator settings (c10/core/AllocatorConfig.h, set through PYTORCH_ALLOC_CONF /
-# PYTORCH_CUDA_ALLOC_CONF or torch._C._accelerator_setAllocatorSettings): a request above
-# pinned_max_round_threshold_mb or pinned_max_cached_size_mb is not rounded to a power of two, and
-# a freed block above pinned_max_cached_size_mb is returned to the OS instead of cached. torch 2.12
-# accepts the keys but ignores them. Keyed on the settings string, so the hot path is one call.
+# torch 2.13+ host allocator settings (c10/core/AllocatorConfig.h): above pinned_max_round_threshold_mb
+# or pinned_max_cached_size_mb a request is not rounded, and a freed block above the latter goes back
+# to the OS. torch 2.12 accepts the keys but ignores them.
 _HOST_ALLOC_POLICY = (None, None, None)  # (settings string, round threshold bytes, max cached bytes)
 _TORCH_MINOR = Version(torch.__version__).release[:2]  # nightlies (2.13.0a0) included
 _HOST_ALLOC_KNOBS = _TORCH_MINOR >= (2, 13)
@@ -260,8 +257,7 @@ def _host_alloc_policy():
 
 _WARNED_SHORT_BLOCK = False
 def _warn_short_block_reuse():
-    # torch 2.13's get_free_block returns any cached block in the Log2 bucket; with unrounded
-    # blocks there it can hand out a block shorter than the request (fixed in 2.14).
+    # torch 2.13 get_free_block can hand out a shorter unrounded block (fixed in 2.14).
     global _WARNED_SHORT_BLOCK
     if _WARNED_SHORT_BLOCK or _TORCH_MINOR >= (2, 14): return
     _WARNED_SHORT_BLOCK = True
@@ -427,8 +423,7 @@ def _reserve_pinned(nbytes):
         GC_PINNED_CAP = _compute_pinned_cap()
         _HOST_HELD_BASELINE = None if held is None else max(0, held - GC_PINNED_BYTES)
     elif _HOST_HELD_BASELINE is None and held is not None:
-        # host_memory_stats() is empty before CUDA initialises, so a cap computed first has no
-        # baseline yet: take it at the first reading instead of never.
+        # host_memory_stats() is empty before CUDA init: take the baseline at the first reading.
         _HOST_HELD_BASELINE = max(0, held - GC_PINNED_BYTES)
     used = GC_PINNED_BYTES
     if held is not None:
@@ -445,9 +440,7 @@ def _reserve_pinned(nbytes):
             _warn_host_ram_full()
             return False
     elif GC_PINNED_CAP >= 0 and used + block > GC_PINNED_CAP and not (
-        # Our released blocks (old blocks of grown slots) still count against the cap: return
-        # them to the OS once and retry before going pageable for good. Only when some exist,
-        # so a full cap with nothing of ours cached costs no device sync.
+        # Our released blocks still count: flush them once (only if any, to avoid a sync) and retry.
         _PINNED_CACHED and any(_PINNED_CACHED.values()) and _flushed_cached_fits(block, used)
     ):
         _warn_pinned_cap()
@@ -480,11 +473,8 @@ def _warn_pinned_cap():
     )
 
 
-# torch 2.13+ with pinned_max_round_threshold_mb / pinned_max_cached_size_mb set: one Log2 bucket holds
-# unrounded blocks, a request takes any cached block in its bucket at least as large, and a block above
-# pinned_max_cached_size_mb stays pinned until its copy events are processed. Simulating that drifts, so
-# the cap reads the allocator's own byte count (host_memory_stats allocated_bytes, live + cached +
-# event-pending) instead; _pinned_block_bytes only bounds what the next request can add.
+# With torch 2.13+ settings, bucket reuse and event-pending releases make simulation drift, so the
+# allocator's own count (allocated_bytes: live + cached + event-pending) is the ground truth.
 def _host_alloc_settings_active():
     if not _HOST_ALLOC_KNOBS: return False
     round_max, cached_max = _host_alloc_policy()
@@ -494,9 +484,7 @@ def _host_alloc_settings_active():
 def _reserve_pinned_counted(nbytes, block):
     """None if the allocator cannot be read (the simulated path then decides)."""
     global GC_PINNED_BYTES, GC_PINNED_CAP, _HOST_HELD_BASELINE
-    # Read the allocator on every reservation (~10-25 us): other pinned users (pin_memory DataLoaders,
-    # training_utils.py's input_ids / labels) allocate between ours, and whether torch serves this
-    # request from a cached block (any one in its Log2 bucket at least as large) cannot be known first.
+    # Read on every reservation: other pinned users allocate between ours, and cache reuse is unknowable.
     held = _host_allocator_held_bytes()
     if held is None: return None
     if _HOST_HELD_BASELINE is None: _HOST_HELD_BASELINE = max(0, held - GC_PINNED_BYTES)
@@ -516,10 +504,8 @@ def _reserve_pinned_counted(nbytes, block):
 
 
 def _counted_slow_path_fits(block):
-    """Over the cap by the allocator's count. Blocks released after a non_blocking copy are freed or
-    cached only once their copy events are processed: process the completed ones, then return cached
-    blocks to the OS (after a device sync) and re-read. No trial allocation of `block`: one that the
-    cache cannot serve would itself pin past the cap."""
+    """Over the cap: process pending copy events, then flush the cache and re-read. Never trial-allocate
+    `block`: an uncached one would itself pin past the cap."""
     free = _host_allocator_free_bytes() or 0
     if not (_PINNED_RELEASED or free > 0):
         return False  # nothing cached or pending: cheap, and a full cap costs no device sync
@@ -536,8 +522,7 @@ def _counted_slow_path_fits(block):
 
 
 def _charge_live(nbytes, block):
-    # The block size depends on the allocator settings at allocation: release must use this one,
-    # not one re-derived from settings that may have changed while the buffer was live.
+    # Release must use the allocation-time block size; settings may change while live.
     blocks = _PINNED_LIVE.get(nbytes)
     if blocks is None: _PINNED_LIVE[nbytes] = [block]
     else: blocks.append(block)
@@ -550,8 +535,7 @@ def _flushed_cached_fits(block, used):
     held = _host_allocator_held_bytes()
     if held is None or _HOST_HELD_BASELINE is None:
         return max(0, used - ours) + block <= GC_PINNED_CAP
-    # Re-read the allocator: a released block another pinned user took is still held after the
-    # flush, so only what was really returned to the OS makes room under the cap.
+    # Re-read: a released block another pinned user took is still held after the flush.
     return max(GC_PINNED_BYTES, held - _HOST_HELD_BASELINE) + block <= GC_PINNED_CAP
 
 

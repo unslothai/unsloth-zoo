@@ -2,11 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""With torch 2.13+ host allocator settings (pinned_max_round_threshold_mb / pinned_max_cached_size_mb)
-the pinned cap reads the allocator's own byte count. CPU only: a small model of torch 2.14's
-CachingHostAllocator (aten/src/ATen/core/CachingHostAllocator.h: Log2 buckets, a request takes any
-cached block in its bucket at least as large, blocks above pinned_max_cached_size_mb are destroyed
-once their copy events are processed) stands in for host_memory_stats / pinned allocations."""
+"""torch 2.13+ host allocator settings: the pinned cap reads the allocator's own count. CPU only, with a
+small model of torch 2.14's CachingHostAllocator standing in for host_memory_stats / pinned allocs."""
 import weakref
 
 import pytest
@@ -150,7 +147,7 @@ def test_same_bucket_reuse_of_a_larger_block_cannot_bypass_the_cap(gc_module, al
     unpin(gc_module, fake, 2 * MIB, b)
     unpin(gc_module, fake, 2 * MIB, c)
     e = pin(gc_module, fake, int(3.5 * MIB))      # no 3.5 MiB block is cached any more
-    # Real pinned bytes stay under the cap at every allocation (the simulation reached 11 MiB).
+    # Real pinned bytes stay under the cap (the old simulation reached 11 MiB).
     assert fake.peak <= 10.5 * MIB + 64
     assert e is not None and fake.held() == pytest.approx(7 * MIB, abs = 64)  # the flush returned the two 2 MiB blocks
 

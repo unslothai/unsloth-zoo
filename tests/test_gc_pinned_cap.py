@@ -392,7 +392,6 @@ def test_release_uses_the_block_charged_at_allocation(monkeypatch, host_alloc_co
     gc_module._release_pinned(MIB)
     assert gc_module._PINNED_CACHED == {3 * MIB: 1, MIB: 1}
     assert gc_module.GC_PINNED_BYTES == 4 * MIB and not gc_module._PINNED_LIVE
-    # No cached 4 MiB block exists, so a 4 MiB request is new and over the cap: it must not take
-    # the cached-block shortcut and pin another 4 MiB past the cap.
+    # No cached 4 MiB block: the request must not take the cached-block shortcut past the cap.
     assert not gc_module._reserve_pinned(4 * MIB)
     assert flushes and gc_module.GC_PINNED_BYTES == 4 * MIB
