@@ -7108,6 +7108,13 @@ def unsloth_compile_transformers(
             )
             continue
 
+        # Only SDPA turns a missing mask into is_causal. Eager attention (T5, Bloom, GPT-J) would see the future.
+        if not getattr(source, "_supports_sdpa", False):
+            print(
+                f"Unsloth: Will not remove causal mask for {module} since it does not use SDPA!"
+            )
+            continue
+
         exec(
             f"{model_location}.{module}._update_causal_mask = no_update_causal_mask",
             globals(),
