@@ -38,6 +38,8 @@ import os
 
 import torch
 
+from .log import logger
+
 try:
     import triton
     import triton.language as tl
@@ -67,6 +69,16 @@ def _on_device(t):
     if t.is_cuda and t.device.index != torch.cuda.current_device():
         return torch.cuda.device(t.device)
     return contextlib.nullcontext()
+
+
+def _disable(error):
+    """A Triton build that cannot compile or launch these kernels: eager ops from now on (the launch
+    failed before writing anything, so the caller's eager path still sees the original inputs)."""
+    global _ENABLED
+    if _ENABLED:
+        _ENABLED = False
+        logger.warning(f"Unsloth: gpt-oss fused decode kernels disabled, using the eager ops ({type(error).__name__}: {error})")
+    return None
 
 
 def fused_decode_ok(x):
@@ -149,13 +161,16 @@ def add_rms_norm(x, residual, weight, eps):
     if rows == 0:
         return y
     BLOCK = triton.next_power_of_2(N)
-    with _on_device(x):
-        _add_rms_norm_kernel[(rows,)](
-            x, x if residual is None else residual, weight, y, N, N, N, N, float(eps), 1.0 / N,
-            HAS_RES = residual is not None, BLOCK = BLOCK, EXACT = _libdevice is not None,
-            num_warps = 8 if BLOCK >= 4096 else 4,
-            **_NO_FMA,
-        )
+    try:
+        with _on_device(x):
+            _add_rms_norm_kernel[(rows,)](
+                x, x if residual is None else residual, weight, y, N, N, N, N, float(eps), 1.0 / N,
+                HAS_RES = residual is not None, BLOCK = BLOCK, EXACT = _libdevice is not None,
+                num_warps = 8 if BLOCK >= 4096 else 4,
+                **_NO_FMA,
+            )
+    except Exception as e:
+        return _disable(e)
     FUSED_DECODE_CALLS["add_rms_norm"] += 1
     return y
 
@@ -177,14 +192,17 @@ def sink_scale_output(attn_output, lse, sinks):
         return out
     if not sinks.is_contiguous():
         sinks = sinks.contiguous()
-    with _on_device(attn_output):
-        _sink_scale_kernel[(n,)](
-            attn_output, lse, sinks, out, H, Q, D,
-            attn_output.stride(0), attn_output.stride(1), attn_output.stride(2),
-            lse.stride(0), lse.stride(1), lse.stride(2),
-            out.stride(0), out.stride(1), out.stride(2),
-            BLOCK_D = triton.next_power_of_2(D), EXACT = _libdevice is not None, num_warps = 1 if D <= 128 else 4,
-            **_NO_FMA,
-        )
+    try:
+        with _on_device(attn_output):
+            _sink_scale_kernel[(n,)](
+                attn_output, lse, sinks, out, H, Q, D,
+                attn_output.stride(0), attn_output.stride(1), attn_output.stride(2),
+                lse.stride(0), lse.stride(1), lse.stride(2),
+                out.stride(0), out.stride(1), out.stride(2),
+                BLOCK_D = triton.next_power_of_2(D), EXACT = _libdevice is not None, num_warps = 1 if D <= 128 else 4,
+                **_NO_FMA,
+            )
+    except Exception as e:
+        return _disable(e)
     FUSED_DECODE_CALLS["sink_scale_output"] += 1
     return out

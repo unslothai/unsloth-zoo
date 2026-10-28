@@ -261,3 +261,27 @@ def test_decode_loop_tokens_and_scores_match_eager(loop_runs):
     diff = (torch.tensor(fused["scores"]) - torch.tensor(eager["scores"])).abs().max()
     tol = 1e-4 if not torch.cuda.is_available() else 0.06
     assert diff <= tol, diff
+
+
+def test_launch_failure_falls_back_and_disables(monkeypatch):
+    # A Triton build that cannot compile the kernels must not break decoding: None (the caller runs the
+    # eager ops on untouched inputs) and the fused path switches off.
+    from unsloth_zoo import gpt_oss_decode_fused as F
+
+    class _Broken:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                raise RuntimeError("no compiler")
+            return launch
+
+    monkeypatch.setattr(F, "_ENABLED", True)
+    monkeypatch.setattr(F, "_add_rms_norm_kernel", _Broken())
+    monkeypatch.setattr(F, "_sink_scale_kernel", _Broken())
+    x, r = torch.randn(2, 8), torch.randn(2, 8)
+    x0 = x.clone()
+    assert F.add_rms_norm(x, r, torch.ones(8), 1e-5) is None
+    assert torch.equal(x, x0)
+    assert not F._ENABLED
+    monkeypatch.setattr(F, "_ENABLED", True)
+    assert F.sink_scale_output(torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1), torch.randn(2)) is None
+    assert not F._ENABLED
